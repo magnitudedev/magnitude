@@ -1,9 +1,13 @@
 //! Conditional independence from the complete residual factor scopes.
 use crate::model::{Factor, VarId};
 use crate::Domain;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-pub(crate) fn components(factors: &[Factor], ids: &[usize], domains: &[Domain]) -> Vec<Vec<usize>> {
+pub(crate) fn components(
+    factor_scopes: &[Vec<VarId>],
+    ids: &[usize],
+    domains: &[Domain],
+) -> Vec<Vec<usize>> {
     let mut parent: Vec<usize> = (0..domains.len()).collect();
     fn root(parent: &mut [usize], mut v: usize) -> usize {
         while parent[v] != v {
@@ -12,43 +16,44 @@ pub(crate) fn components(factors: &[Factor], ids: &[usize], domains: &[Domain]) 
         }
         v
     }
-    let mut scopes = Vec::with_capacity(ids.len());
+    let mut first_active = Vec::with_capacity(ids.len());
     for &id in ids {
-        let vars: Vec<_> = factors[id]
-            .scope()
-            .into_iter()
-            .filter(|v| !domains[v.0].is_singleton())
-            .collect();
-        if let Some(first) = vars.first() {
-            for v in &vars[1..] {
+        let mut active_vars = factor_scopes[id]
+            .iter()
+            .copied()
+            .filter(|v| !domains[v.0].is_singleton());
+        let first = active_vars.next();
+        if let Some(first) = first {
+            for v in active_vars {
                 let a = root(&mut parent, first.0);
                 let b = root(&mut parent, v.0);
                 parent[b] = a;
             }
         }
-        scopes.push(vars);
+        first_active.push(first);
     }
     let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (&id, scope) in ids.iter().zip(scopes) {
+    for (&id, first) in ids.iter().zip(first_active) {
         // A zero-scope coverage obligation is its own child, not erased.
-        let group = scope
-            .first()
-            .map_or(domains.len() + id, |v| root(&mut parent, v.0));
+        let group = first.map_or(domains.len() + id, |v| root(&mut parent, v.0));
         groups.entry(group).or_default().push(id);
     }
     groups.into_values().collect()
 }
 
-pub(crate) fn scope(factors: &[Factor], ids: &[usize]) -> Vec<VarId> {
-    ids.iter()
-        .flat_map(|&id| factors[id].scope())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+pub(crate) fn scope(factor_scopes: &[Vec<VarId>], ids: &[usize]) -> Vec<VarId> {
+    let mut scope = Vec::new();
+    for &id in ids {
+        scope.extend_from_slice(&factor_scopes[id]);
+    }
+    scope.sort_unstable();
+    scope.dedup();
+    scope
 }
 
 pub(crate) fn branch_variable(
     factors: &[Factor],
+    factor_scopes: &[Vec<VarId>],
     ids: &[usize],
     domains: &[Domain],
 ) -> Option<VarId> {
@@ -78,7 +83,7 @@ pub(crate) fn branch_variable(
     }
     let mut degree = BTreeMap::<VarId, usize>::new();
     for &id in ids {
-        for v in factors[id].scope() {
+        for &v in &factor_scopes[id] {
             if !domains[v.0].is_singleton() {
                 *degree.entry(v).or_default() += 1;
             }

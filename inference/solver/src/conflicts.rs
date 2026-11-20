@@ -179,7 +179,7 @@ impl ConflictStore {
         if self.facts.is_empty() {
             return Ok(false);
         }
-        self.validate_region(factors, region, context)?;
+        debug_assert!(self.validate_region(factors, region, context).is_ok());
         let found = self.matches(factors, region, context)?;
         if found {
             self.stats.hits += 1;
@@ -430,7 +430,7 @@ mod tests {
             )
             .unwrap());
         assert!(store
-            .excludes(&factors, &[0], &[(x, Domain::boolean())])
+            .record_infeasible(&factors, &[0], &[(x, Domain::boolean())])
             .is_err());
         let mut changed = factors.clone();
         changed[0].kind = FactorKind::Constraint(Constraint::Equal { left: x, right: x });

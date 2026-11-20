@@ -2,7 +2,6 @@
 use crate::model::{
     self, Constraint, Domain, Error, Factor, FactorKind, Literal, Propagation, Result, VarId,
 };
-use std::collections::BTreeMap;
 
 pub fn propagate_factor(factor: &Factor, domains: &mut [Domain]) -> Result<Propagation> {
     factor.validate(domains)?;
@@ -12,22 +11,43 @@ pub(crate) fn propagate_factor_validated(
     factor: &Factor,
     domains: &mut [Domain],
 ) -> Result<Propagation> {
-    let mut unknown = BTreeMap::new();
-    for guard in &factor.guards {
-        if let Some(old) = unknown.get(&guard.variable) {
-            if *old != guard.value {
-                return Ok(Propagation::default());
-            }
+    propagate_factor_with_scope(factor, &factor.scope(), domains)
+}
+pub(crate) fn propagate_factor_with_scope(
+    factor: &Factor,
+    scope: &[VarId],
+    domains: &mut [Domain],
+) -> Result<Propagation> {
+    let sorted = factor
+        .guards
+        .windows(2)
+        .all(|pair| pair[0].variable <= pair[1].variable);
+    let mut single_unknown: Option<Literal> = None;
+    let mut multiple_unknown = false;
+    for (index, guard) in factor.guards.iter().enumerate() {
+        let conflict = if sorted {
+            index > 0
+                && factor.guards[index - 1].variable == guard.variable
+                && factor.guards[index - 1].value != guard.value
+        } else {
+            factor.guards[..index]
+                .iter()
+                .any(|prev| prev.variable == guard.variable && prev.value != guard.value)
+        };
+        if conflict {
+            return Ok(Propagation::default());
         }
         match guard.state(domains)? {
             Some(false) => return Ok(Propagation::default()),
-            None => {
-                unknown.insert(guard.variable, guard.value);
-            }
+            None => match single_unknown {
+                None => single_unknown = Some(*guard),
+                Some(prev) if prev == *guard => (),
+                Some(_) => multiple_unknown = true,
+            },
             Some(true) => (),
         }
     }
-    if factor.scope().iter().any(|v| domains[v.0].is_empty()) {
+    if scope.iter().any(|v| domains[v.0].is_empty()) {
         return Ok(Propagation {
             changed: false,
             infeasible: true,
@@ -36,23 +56,22 @@ pub(crate) fn propagate_factor_validated(
     let FactorKind::Constraint(constraint) = &factor.kind else {
         return Ok(Propagation::default());
     };
-    if !unknown.is_empty() {
+    if let Some(literal) = single_unknown {
         // Reification: if the body is impossible assuming its guards, reject the
         // last possible activating literal; never constrain an inactive body.
-        if unknown.len() == 1 {
+        if !multiple_unknown {
             let mut active = domains.to_vec();
             for guard in &factor.guards {
                 active[guard.variable.0] = Domain::singleton(guard.value);
             }
             if constraint.assess(&active)?.infeasible {
-                let (variable, value) = unknown.into_iter().next().expect("one unknown");
-                let next = domains[variable.0].without(value);
-                return replace(domains, variable, next);
+                let next = domains[literal.variable.0].without(literal.value);
+                return replace(domains, literal.variable, next);
             }
         }
         return Ok(Propagation::default());
     }
-    propagate_constraint(constraint, domains)
+    propagate_constraint_validated(constraint, domains)
 }
 
 pub fn propagate_constraint(
@@ -60,6 +79,16 @@ pub fn propagate_constraint(
     domains: &mut [Domain],
 ) -> Result<Propagation> {
     constraint.validate(domains)?;
+    propagate_constraint_validated(constraint, domains)
+}
+
+pub(crate) fn propagate_constraint_validated(
+    constraint: &Constraint,
+    domains: &mut [Domain],
+) -> Result<Propagation> {
+    if let Constraint::Schedule(schedule) = constraint {
+        return schedule.propagate_validated(domains);
+    }
     let assessment = constraint.assess(domains)?;
     if assessment.infeasible {
         return Ok(Propagation {
@@ -278,7 +307,7 @@ pub fn propagate_constraint(
                 merge(&mut result, assign(domains, active.variable, active.value)?);
             }
         }
-        Constraint::Schedule(schedule) => merge(&mut result, schedule.propagate(domains)?),
+        Constraint::Schedule(_) => unreachable!("schedule constraints return above"),
         Constraint::Arithmetic(arithmetic) => merge(&mut result, arithmetic.propagate(domains)?),
     }
     Ok(result)

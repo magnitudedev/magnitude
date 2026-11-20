@@ -10,7 +10,7 @@ use crate::{
     Domain, Error, Result,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
     time::Instant,
 };
@@ -97,6 +97,7 @@ pub struct Search {
     domains: Vec<Domain>,
     active: Option<usize>,
     factors: Arc<Vec<Factor>>,
+    factor_scopes: Vec<Vec<VarId>>,
     knowledge: SharedKnowledge,
     expanded: HashMap<usize, Vec<usize>>,
     failure: Option<Error>,
@@ -105,6 +106,9 @@ pub struct Search {
     preferred: Option<Vec<i64>>,
     reported_cost: Option<u64>,
     advance_peak_retained_bytes: usize,
+    sticky_pending: Option<usize>,
+    visit_marks: Vec<u32>,
+    visit_epoch: u32,
 }
 impl Search {
     pub fn new(model: Arc<Model>, options: Options) -> Result<Self> {
@@ -160,9 +164,11 @@ impl Search {
             .expect("solver knowledge lock poisoned")
             .factors
             .clone();
+        let factor_scopes = factors.iter().map(Factor::scope).collect();
         let reported_cost = incumbent.as_ref().map(FeasibleSolution::cost);
         let mut search = Self {
             factors,
+            factor_scopes,
             knowledge,
             expanded: HashMap::new(),
             failure: None,
@@ -178,6 +184,9 @@ impl Search {
             preferred,
             reported_cost,
             advance_peak_retained_bytes: 0,
+            sticky_pending: None,
+            visit_marks: Vec::new(),
+            visit_epoch: 0,
             root: 0,
         };
         search.root = search.intern((0..search.factors.len()).collect());
@@ -203,7 +212,7 @@ impl Search {
     }
     fn intern(&mut self, mut factors: Vec<usize>) -> usize {
         factors.sort_unstable();
-        let scope = decomposition::scope(&self.factors, &factors);
+        let scope = decomposition::scope(&self.factor_scopes, &factors);
         let key = Key {
             factors: factors.clone(),
             context: scope
@@ -284,6 +293,7 @@ impl Search {
             .ok_or_else(|| Error::Overflow("objective sum".into()))
     }
     fn refresh(&mut self, initial: usize) -> Result<()> {
+        self.sticky_pending = None;
         let mut queue = VecDeque::from([initial]);
         while let Some(id) = queue.pop_front() {
             let mut next = match &self.nodes[id].state {
@@ -441,7 +451,7 @@ impl Search {
             };
             return self.refresh(id);
         }
-        let residual_scope = decomposition::scope(&self.factors, &p.residual);
+        let residual_scope = decomposition::scope(&self.factor_scopes, &p.residual);
         // Discharged factors may be the only users of a narrowed, non-singleton
         // variable. Retain a valid value before its domain leaves the residual.
         let fixed = self.nodes[id]
@@ -458,7 +468,7 @@ impl Search {
             })
             .collect();
         let groups = if self.options.decompose {
-            decomposition::components(&self.factors, &p.residual, &self.domains)
+            decomposition::components(&self.factor_scopes, &p.residual, &self.domains)
         } else {
             vec![p.residual.clone()]
         };
@@ -480,8 +490,12 @@ impl Search {
             };
             return self.refresh(id);
         }
-        if let Some(var) = decomposition::branch_variable(&self.factors, &p.residual, &self.domains)
-        {
+        if let Some(var) = decomposition::branch_variable(
+            &self.factors,
+            &self.factor_scopes,
+            &p.residual,
+            &self.domains,
+        ) {
             let domain = &self.domains[var.0];
             let partition = self
                 .preferred
@@ -505,7 +519,10 @@ impl Search {
         } else {
             let mut reasons = Vec::new();
             for &f in &p.residual {
-                if let Some(reason) = self.factors[f].assess_validated(&self.domains)?.unresolved {
+                if let Some(reason) = self.factors[f]
+                    .assess_with_scope(&self.factor_scopes[f], &self.domains)?
+                    .unresolved
+                {
                     reasons.push(reason);
                 }
             }
@@ -535,8 +552,10 @@ impl Search {
             child.guards.extend_from_slice(&factor.guards);
             child.guards.sort_by_key(|g| (g.variable, g.value));
             child.guards.dedup();
+            let child_scope = child.scope();
             let child_id = self.factors.len();
             Arc::make_mut(&mut self.factors).push(child);
+            self.factor_scopes.push(child_scope);
             self.expanded.entry(fid).or_default().push(child_id);
             self.stats.materializations += 1;
             self.early_cost_bound(id, p, child_id)?;
@@ -551,7 +570,7 @@ impl Search {
         if !matches!(self.factors[fid].kind, FactorKind::Cost(_)) {
             return Ok(());
         }
-        let a = self.factors[fid].assess_validated(&self.domains)?;
+        let a = self.factors[fid].assess_with_scope(&self.factor_scopes[fid], &self.domains)?;
         self.stats.assessments += 1;
         let lower = if self.options.bounds {
             a.lower_bound
@@ -613,8 +632,9 @@ impl Search {
                 }
                 let fid = p.factors[p.cursor];
                 self.early_cost_bound(id, &mut p, fid)?;
-                let result = propagation::propagate_factor_validated(
-                    &self.factors[p.factors[p.cursor]],
+                let result = propagation::propagate_factor_with_scope(
+                    &self.factors[fid],
+                    &self.factor_scopes[fid],
                     &mut self.domains,
                 )?;
                 self.stats.propagations += 1;
@@ -637,7 +657,7 @@ impl Search {
             }
         } else if p.cursor < p.factors.len() {
             let fid = p.factors[p.cursor];
-            let a = self.factors[fid].assess_validated(&self.domains)?;
+            let a = self.factors[fid].assess_with_scope(&self.factor_scopes[fid], &self.domains)?;
             self.stats.assessments += 1;
             if a.infeasible {
                 self.nodes[id].summary = Summary {
@@ -672,68 +692,155 @@ impl Search {
         Ok(())
     }
     fn next(&mut self) -> (Option<usize>, Vec<Obligation>) {
-        let mut stack = vec![(self.root, Vec::<bool>::new())];
-        let mut candidates = Vec::new();
+        if self.visit_marks.len() < self.nodes.len() {
+            self.visit_marks.resize(self.nodes.len(), 0);
+        }
+        self.visit_epoch = self.visit_epoch.wrapping_add(1);
+        if self.visit_epoch == 0 {
+            self.visit_marks.fill(0);
+            self.visit_epoch = 1;
+        }
+        let epoch = self.visit_epoch;
         let mut blocked = Vec::new();
-        let mut visited = HashSet::new();
+        if self.options.policy == Policy::DepthFirst || self.preferred.is_none() {
+            let mut stack = vec![self.root];
+            let mut best: Option<(u64, usize)> = None;
+            while let Some(id) = stack.pop() {
+                if self.visit_marks[id] == epoch {
+                    continue;
+                }
+                self.visit_marks[id] = epoch;
+                let node = &self.nodes[id];
+                if node.summary.solved || node.summary.infeasible {
+                    continue;
+                }
+                match &node.state {
+                    State::Pending(_) => {
+                        if self.options.policy == Policy::DepthFirst {
+                            return (Some(id), Vec::new());
+                        }
+                        let candidate = (node.summary.lower, id);
+                        if best.is_none_or(|current| candidate < current) {
+                            best = Some(candidate);
+                        }
+                    }
+                    State::Or(children) => {
+                        let upper = node.summary.witness.as_ref().map(|w| w.cost);
+                        if children.len() == 2 {
+                            let c0 = children[0];
+                            let c1 = children[1];
+                            let s0 = &self.nodes[c0].summary;
+                            let s1 = &self.nodes[c1].summary;
+                            let live0 =
+                                !s0.infeasible && !s0.solved && upper.is_none_or(|u| s0.lower < u);
+                            let live1 =
+                                !s1.infeasible && !s1.solved && upper.is_none_or(|u| s1.lower < u);
+                            match (live0, live1) {
+                                (true, true) => {
+                                    let first_before_second = self.preferred.is_some()
+                                        || (s0.lower, c0) <= (s1.lower, c1);
+                                    if first_before_second {
+                                        stack.push(c1);
+                                        stack.push(c0);
+                                    } else {
+                                        stack.push(c0);
+                                        stack.push(c1);
+                                    }
+                                }
+                                (true, false) => stack.push(c0),
+                                (false, true) => stack.push(c1),
+                                (false, false) => {}
+                            }
+                        } else {
+                            let mut ordered: Vec<_> = children
+                                .iter()
+                                .copied()
+                                .filter(|&c| {
+                                    let s = &self.nodes[c].summary;
+                                    !s.infeasible && !s.solved && upper.is_none_or(|u| s.lower < u)
+                                })
+                                .collect();
+                            if self.preferred.is_none() {
+                                ordered.sort_by_key(|&c| (self.nodes[c].summary.lower, c));
+                            }
+                            stack.extend(ordered.into_iter().rev());
+                        }
+                    }
+                    State::And { children, .. } => {
+                        stack.extend(children.iter().rev().copied());
+                    }
+                    State::Blocked(reasons) => blocked.extend_from_slice(reasons),
+                    _ => {}
+                }
+            }
+            blocked.sort();
+            blocked.dedup();
+            return (best.map(|(_, id)| id), blocked);
+        }
+        let mut stack = vec![(self.root, Vec::<bool>::new())];
+        let mut best: Option<(Vec<bool>, u64, usize)> = None;
         while let Some((id, preference_path)) = stack.pop() {
-            if !visited.insert(id) {
+            if self.visit_marks[id] == epoch {
                 continue;
             }
+            self.visit_marks[id] = epoch;
             let node = &self.nodes[id];
             if node.summary.solved || node.summary.infeasible {
                 continue;
             }
             match &node.state {
                 State::Pending(_) => {
-                    if self.options.policy == Policy::DepthFirst {
-                        return (Some(id), Vec::new());
+                    let candidate = (preference_path, node.summary.lower, id);
+                    if best.as_ref().is_none_or(|current| candidate < *current) {
+                        best = Some(candidate);
                     }
-                    candidates.push((preference_path, node.summary.lower, id));
                 }
                 State::Or(children) => {
                     // Only an actual preferred-value partition introduces a
                     // priority. Once that value is absent, ordinary BestFirst
                     // bound ordering applies within the remaining region.
-                    let preferred_partition = self.options.policy == Policy::BestFirst
-                        && self.preferred.as_ref().is_some_and(|values| {
-                            self.nodes[children[0]]
-                                .key
-                                .context
-                                .iter()
-                                .zip(&self.nodes[children[1]].key.context)
-                                .any(|((left_var, left), (right_var, right))| {
-                                    left_var == right_var
-                                        && left != right
-                                        && left.contains(values[left_var.0])
-                                        && !right.contains(values[left_var.0])
-                                })
-                        });
+                    let preferred_partition = self.preferred.as_ref().is_some_and(|values| {
+                        self.nodes[children[0]]
+                            .key
+                            .context
+                            .iter()
+                            .zip(&self.nodes[children[1]].key.context)
+                            .any(|((left_var, left), (right_var, right))| {
+                                left_var == right_var
+                                    && left != right
+                                    && left.contains(values[left_var.0])
+                                    && !right.contains(values[left_var.0])
+                            })
+                    });
                     let upper = node.summary.witness.as_ref().map(|w| w.cost);
-                    let mut ordered: Vec<_> = children
-                        .iter()
-                        .copied()
-                        .filter(|&c| {
-                            let s = &self.nodes[c].summary;
-                            !s.infeasible && !s.solved && upper.is_none_or(|u| s.lower < u)
-                        })
-                        .collect();
-                    // Repair contexts deliberately try preferred assignments
-                    // first. Reordering them by cost bounds can explore all
-                    // siblings before finishing even the first feasible leaf.
-                    if self.preferred.is_none() {
-                        ordered.sort_by_key(|&c| (self.nodes[c].summary.lower, c));
-                    }
-                    stack.extend(ordered.into_iter().rev().map(|c| {
-                        let mut path = preference_path.clone();
-                        if preferred_partition {
-                            path.push(c != children[0]);
+                    let mut live = children.iter().copied().rev().filter(|&c| {
+                        let s = &self.nodes[c].summary;
+                        !s.infeasible && !s.solved && upper.is_none_or(|u| s.lower < u)
+                    });
+                    if let Some(first) = live.next() {
+                        let mut prev = first;
+                        for next in live {
+                            let mut path = preference_path.clone();
+                            if preferred_partition {
+                                path.push(prev != children[0]);
+                            }
+                            stack.push((prev, path));
+                            prev = next;
                         }
-                        (c, path)
-                    }));
+                        let mut path = preference_path;
+                        if preferred_partition {
+                            path.push(prev != children[0]);
+                        }
+                        stack.push((prev, path));
+                    }
                 }
                 State::And { children, .. } => {
-                    stack.extend(children.iter().rev().map(|&c| (c, preference_path.clone())))
+                    if let Some((&last, rest)) = children.split_first() {
+                        for &c in rest.iter().rev() {
+                            stack.push((c, preference_path.clone()));
+                        }
+                        stack.push((last, preference_path));
+                    }
                 }
                 State::Blocked(reasons) => blocked.extend_from_slice(reasons),
                 _ => {}
@@ -741,7 +848,7 @@ impl Search {
         }
         blocked.sort();
         blocked.dedup();
-        (candidates.into_iter().min().map(|(_, _, id)| id), blocked)
+        (best.map(|(_, _, id)| id), blocked)
     }
     fn update_incumbent(&mut self, elapsed: f64) -> Result<()> {
         if let Some(w) = self.nodes[self.root].summary.witness.as_ref() {
@@ -808,6 +915,13 @@ impl Search {
                     .map(|f| f.retained_bytes() - std::mem::size_of::<Factor>())
                     .sum::<usize>();
         }
+        bytes += self.factor_scopes.capacity() * std::mem::size_of::<Vec<VarId>>()
+            + self
+                .factor_scopes
+                .iter()
+                .map(|s| s.capacity() * std::mem::size_of::<VarId>())
+                .sum::<usize>()
+            + self.visit_marks.capacity() * std::mem::size_of::<u32>();
         bytes += self.expanded.capacity() * std::mem::size_of::<(usize, Vec<usize>)>()
             + self
                 .expanded
@@ -888,6 +1002,9 @@ impl Search {
     /// parent remain reachable. A later request for an evicted memo key starts
     /// the exact region again, rather than interpreting absence as completion.
     fn evict_reclaimable(&mut self) -> bool {
+        self.sticky_pending = None;
+        self.visit_marks.clear();
+        self.visit_marks.shrink_to_fit();
         self.update_memory();
         let before = self.stats.retained_bytes;
         self.knowledge
@@ -990,6 +1107,7 @@ impl Search {
                 .get_or_insert(self.stats.solve_seconds);
             self.stats.winner_found_seconds = Some(self.stats.solve_seconds);
             self.incumbent = Some(incumbent);
+            self.sticky_pending = None;
             self.update_memory();
             return Ok(true);
         }
@@ -1014,6 +1132,7 @@ impl Search {
             }
         }
         self.preferred = Some(values.to_vec());
+        self.sticky_pending = None;
         Ok(())
     }
     /// One budgeted solve advance. The budget limits optimization only:
@@ -1127,7 +1246,16 @@ impl Search {
                     break StopReason::Memory;
                 }
             }
-            let (pending, reasons) = self.next();
+            let (pending, reasons) = match self.sticky_pending {
+                Some(id) if matches!(self.nodes[id].state, State::Pending(_)) => {
+                    (Some(id), Vec::new())
+                }
+                _ => {
+                    let result = self.next();
+                    self.sticky_pending = result.0;
+                    result
+                }
+            };
             let Some(id) = pending else {
                 if reasons.is_empty() {
                     return Err(Error::Invariant("unfinished root has neither pending work nor a competitive coverage obligation".into()));
@@ -1153,7 +1281,11 @@ impl Search {
                         }
                     } else if p.analyzing && p.cursor == p.factors.len() && !p.residual.is_empty() {
                         let groups = if self.options.decompose {
-                            decomposition::components(&self.factors, &p.residual, &self.domains)
+                            decomposition::components(
+                                &self.factor_scopes,
+                                &p.residual,
+                                &self.domains,
+                            )
                         } else {
                             vec![p.residual.clone()]
                         };
@@ -1161,7 +1293,7 @@ impl Search {
                         groups
                             .iter()
                             .map(|g| {
-                                let context = decomposition::scope(&self.factors, g)
+                                let context = decomposition::scope(&self.factor_scopes, g)
                                     .iter()
                                     .map(|v| {
                                         self.domains[v.0].retained_bytes()
