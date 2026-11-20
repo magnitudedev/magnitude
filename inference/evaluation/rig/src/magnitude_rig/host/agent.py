@@ -2242,6 +2242,7 @@ def report(root: str, sides: list, ahead_of: str | None = None, env: dict | None
                 "name": name, "source": _read(os.path.join(base, name, SOURCE)),
                 "size": _recorded(os.path.join(base, name, "size")),
                 "warmth": SAME if shared is not None else warmth_of(base, name, source),
+                "same_tree": shared is not None or _read(os.path.join(base, name, TREE)) == tree,
                 "commit": _read(os.path.join(base, name, COMMIT)),
                 "built": build in _references(os.path.join(base, name)), "shared": shared is not None,
             })
