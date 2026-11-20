@@ -70,6 +70,17 @@ impl DType {
         matches!(self, DType::I32 | DType::U32 | DType::U64)
     }
 
+    /// Inclusive mathematical range of an integer word dtype; `None` for
+    /// non-integer dtypes.
+    pub fn integer_bounds(self) -> Option<(i128, i128)> {
+        Some(match self {
+            DType::I32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
+            DType::U32 => (0, i128::from(u32::MAX)),
+            DType::U64 => (0, i128::from(u64::MAX)),
+            DType::F32 | DType::BF16 | DType::F16 | DType::Bool => return None,
+        })
+    }
+
     pub fn is_numeric(self) -> bool {
         self.is_float() || self.is_int()
     }

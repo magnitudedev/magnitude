@@ -246,3 +246,65 @@ fn overlapping_definitions_agree_on_awaited_ports() {
         check(&(awaited.clone() + &awaited)).unwrap();
     }
 }
+
+#[test]
+fn immutable_shared_views_cannot_be_written_or_passed_as_mut() {
+    let helper = "fn mutate(dst: &mut tensor[2] f32):\n    dst[0] = 1.0\n\n";
+    for source in [
+        "fn probe(x: &mut tensor[4] f32):\n    let v1 = x[0:2]\n    v1[0] = 1.0\n".to_string(),
+        format!("{helper}fn probe(x: &mut tensor[4] f32):\n    let v1 = x[0:2]\n    mutate(v1)\n"),
+        format!(
+            "{helper}fn probe(x: &mut tensor[4] f32):\n    let v1 = x[0:4]\n    mutate(v1[0:2])\n"
+        ),
+        format!(
+            "fn mutate(dst: &mut tensor[2, 2] f32):\n    dst[0, 0] = 1.0\n\nfn probe(x: &mut tensor[4, 4] f32):\n    let v = x[0:2, 0:2]\n    mutate(v.T)\n"
+        ),
+    ] {
+        assert!(check(&source).is_err(), "{source}");
+    }
+    // An exclusive view local (`let mut`) remains writable.
+    check("fn probe(x: &mut tensor[4] f32):\n    let mut v1 = x[0:2]\n    v1[0] = 1.0\n").unwrap();
+}
+
+#[test]
+fn live_borrow_blocks_aliased_writes_through_storage_or_views() {
+    for source in [
+        "fn probe(x: &mut tensor[4] f32):\n    let v2 = x[2:4]\n    x[0] = 1.0\n",
+        "fn probe(x: &mut tensor[4] f32):\n    let mut v1 = x[0:2]\n    let v2 = x[2:4]\n    v1[0] = 1.0\n",
+        "fn probe(x: &mut tensor[4] f32):\n    let v2 = x[2:4]\n    let mut v1 = x[0:2]\n    v1[0] = 1.0\n",
+    ] {
+        assert!(check(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn nested_tuple_destructuring_tracks_owned_tensor_moves() {
+    for source in [
+        "fn probe() -> f32:\n    let mut x = tensor[2] f32\n    x[:] = zeros_like(x)\n    let mut y = tensor[2] f32\n    y[:] = zeros_like(y)\n    let (a, b) = (x, y)\n    return x[0]\n",
+        "fn probe() -> f32:\n    let mut x = tensor[2] f32\n    x[:] = zeros_like(x)\n    let mut y = tensor[2] f32\n    y[:] = zeros_like(y)\n    let ((a, b), n) = ((x, y), 1)\n    return y[0]\n",
+    ] {
+        assert!(check(source).unwrap_err().contains("moved"), "{source}");
+    }
+}
+
+#[test]
+fn nested_views_of_mutable_storage_are_accepted_for_mut_parameters() {
+    let helper = "fn mutate(dst: &mut tensor[2, 2] f32):\n    dst[0, 0] = 1.0\n\n";
+    check(&format!(
+        "{helper}fn probe(x: &mut tensor[4, 4] f32):\n    mutate(x[0:2, 0:2].T)\n"
+    ))
+    .unwrap();
+    check(&format!(
+        "{helper}fn probe() -> f32:\n    let mut x = tensor[4, 4] f32\n    x[:] = zeros_like(x)\n    mutate(x[0:2, 0:2].T)\n    return x[0, 0]\n"
+    ))
+    .unwrap();
+    check(
+        "fn mutate(dst: &mut tensor[4] f32):\n    dst[0] = 1.0\n\nfn probe(x: &mut tensor[4, 4] f32):\n    mutate(reshape(x[0:2, 0:2].T, (4,)))\n",
+    )
+    .unwrap();
+    // Same nested view on a shared `&tensor` parameter is still rejected.
+    assert!(check(&format!(
+        "{helper}fn probe(x: &tensor[4, 4] f32):\n    mutate(x[0:2, 0:2].T)\n"
+    ))
+    .is_err());
+}

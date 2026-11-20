@@ -361,7 +361,13 @@ impl Poly {
         }
         if let (Some(a), Some(b)) = (self.as_constant(), den.as_constant()) {
             if b != 0 {
-                return Poly::constant(a.div_euclid(b));
+                return match a.checked_div_euclid(b) {
+                    Some(q) => Poly::constant(q),
+                    None => Poly {
+                        terms: BTreeMap::new(),
+                        valid: false,
+                    },
+                };
             }
         }
         if den.as_constant() == Some(1) {
@@ -445,7 +451,7 @@ impl Poly {
         if den.terms.len() == 1 {
             let mut out = Poly::default();
             for (m, c) in &self.terms {
-                if c % dc != 0 {
+                if c.checked_rem(*dc) != Some(0) {
                     return None;
                 }
                 let mut reduced = m.clone();
@@ -460,14 +466,14 @@ impl Poly {
                         _ => return None,
                     }
                 }
-                out.insert(reduced, c / dc);
+                out.insert(reduced, c.checked_div(*dc)?);
             }
             return Some(out);
         }
         // Multi-term denominator: a single-monomial quotient covers the cases
         // that arise (`(H*R + H*S) / (R + S)` is `H`).
         for (m, c) in &self.terms {
-            if c % dc != 0 {
+            if c.checked_rem(*dc) != Some(0) {
                 continue;
             }
             let mut q_mono = m.clone();
@@ -486,8 +492,11 @@ impl Poly {
             if !ok {
                 continue;
             }
+            let Some(coeff) = c.checked_div(*dc) else {
+                continue;
+            };
             let mut q = Poly::default();
-            q.insert(q_mono, c / dc);
+            q.insert(q_mono, coeff);
             if q.mul(den) == *self {
                 return Some(q);
             }
@@ -521,7 +530,13 @@ impl Poly {
         }
         if let (Some(a), Some(b)) = (self.as_constant(), den.as_constant()) {
             if b != 0 {
-                return Poly::constant(a.rem_euclid(b));
+                return match a.checked_rem_euclid(b) {
+                    Some(r) => Poly::constant(r),
+                    None => Poly {
+                        terms: BTreeMap::new(),
+                        valid: false,
+                    },
+                };
             }
         }
         if den.as_constant() == Some(1) {
@@ -1034,5 +1049,26 @@ mod tests {
         let one = arena.int(1);
         let shifted = arena.int_add(g, one);
         assert_eq!(arena.int_sub(shifted, one), g);
+    }
+
+    #[test]
+    fn i64_min_div_neg_one_invalidates_without_panicking() {
+        use super::Poly;
+        let min = Poly::constant(i64::MIN);
+        let neg_one = Poly::constant(-1);
+        assert!(!min.quot(&neg_one).valid);
+        assert!(!min.rem(&neg_one).valid);
+        assert!(min.divide_exactly(&neg_one).is_none());
+
+        let mut arena = ExprArena::new();
+        let (_, x) = arena.target_constant(SymbolSort::Int);
+        let (_, y) = arena.target_constant(SymbolSort::Int);
+        let px = Poly::symbol(x);
+        let py = Poly::symbol(y);
+        let scaled_x = min.mul(&px);
+        assert!(scaled_x.divide_exactly(&neg_one).is_none());
+        let scaled_sum = min.mul(&px).add(&min.mul(&py));
+        let neg_sum = neg_one.mul(&px).add(&neg_one.mul(&py));
+        assert!(scaled_sum.divide_exactly(&neg_sum).is_none());
     }
 }
