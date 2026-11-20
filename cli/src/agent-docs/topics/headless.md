@@ -259,7 +259,7 @@ running until the app is first opened; then `~/.magnitude/bin/magnitude` points 
    ```sh
    rm -rf ~/.magnitude/cli ~/.magnitude/bin/magnitude && rmdir ~/.magnitude/bin 2>/dev/null
    for f in "${ZDOTDIR:-$HOME}/.zprofile" "${ZDOTDIR:-$HOME}/.zshrc" ~/.bash_profile ~/.bash_login ~/.profile ~/.bashrc "${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"; do
-     [ -f "$f" ] && sed -i.bak '/# >>> Magnitude CLI PATH >>>/,/# <<< Magnitude CLI PATH <<</d' "$f"
+     if [ -f "$f" ]; then sed -i.bak '/# >>> Magnitude CLI PATH >>>/,/# <<< Magnitude CLI PATH <<</d' "$f"; fi
    done
    ```
 
