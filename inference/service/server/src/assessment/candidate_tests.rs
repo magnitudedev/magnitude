@@ -4417,7 +4417,7 @@ async fn a_projector_appearing_beside_a_model_never_shows_its_drafter_as_none() 
         if fixture
             ._candidates
             .enrichment
-            .knows_key(&(now.model_id.clone(), target))
+            .knows_key(&now.model_id, &target)
         {
             break;
         }

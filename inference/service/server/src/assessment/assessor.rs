@@ -4,9 +4,8 @@
 //! Assessment reads only GGUF headers (the release catalog's header bundle before download,
 //! installed files after), opens no device and loads no model.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 
@@ -88,7 +87,7 @@ pub(crate) fn preparation_error(error: ModelAssessmentError) -> InventoryError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AssessmentWorkKey(pub String);
 
 impl AssessmentWorkKey {
@@ -109,6 +108,8 @@ pub struct AssessmentOutcome {
     pub result: Result<CachedModelAssessment, ModelFailure>,
 }
 
+const MAX_PREPARATION_CACHE_ENTRIES: usize = 256;
+
 /// Assesses resolved targets in the current environment: one structure, under whatever the
 /// measurement job has stored of the machine.
 pub struct ModelAssessor {
@@ -116,11 +117,11 @@ pub struct ModelAssessor {
     model_domains: Arc<ModelDomainResolver>,
     release_catalog: Arc<ReleaseCatalog>,
     environment: std::sync::RwLock<Arc<AssessmentEnvironment>>,
-    work_gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    work_gates: super::KeyedGate<String>,
     /// Shared per-(structure, bundle) preparation cache so the assessment pool, candidate drafter
     /// checks and post-measurement refinishes never prepare the same bundle twice.
     preparations: std::sync::Mutex<
-        BTreeMap<
+        super::BoundedMap<
             (Arc<str>, ServableModelBundleKey),
             Arc<tokio::sync::OnceCell<Arc<PreparedModelAssessment>>>,
         >,
@@ -140,8 +141,10 @@ impl ModelAssessor {
             model_domains,
             release_catalog,
             environment: std::sync::RwLock::new(environment),
-            work_gates: tokio::sync::Mutex::new(BTreeMap::new()),
-            preparations: std::sync::Mutex::new(BTreeMap::new()),
+            work_gates: super::KeyedGate::new(),
+            preparations: std::sync::Mutex::new(super::BoundedMap::new(
+                MAX_PREPARATION_CACHE_ENTRIES,
+            )),
         }
     }
 
@@ -225,18 +228,14 @@ impl ModelAssessor {
 
     fn preparation_cell(
         &self,
-        structure_id: &Arc<str>,
-        bundle_key: &ServableModelBundleKey,
+        key: &(Arc<str>, ServableModelBundleKey),
     ) -> Arc<tokio::sync::OnceCell<Arc<PreparedModelAssessment>>> {
-        let key = (Arc::clone(structure_id), bundle_key.clone());
         let mut cells = self
             .preparations
             .lock()
             .expect("assessment preparations lock poisoned");
         Arc::clone(
-            cells
-                .entry(key)
-                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            cells.get_or_insert_with(key.clone(), || Arc::new(tokio::sync::OnceCell::new())),
         )
     }
 
@@ -248,11 +247,26 @@ impl ModelAssessor {
         bundle: ServableModelBundle,
     ) -> PreparationResult {
         let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
-        let cell = self.preparation_cell(&environment.structure_id, &bundle_key);
+        let cache_key = (Arc::clone(&environment.structure_id), bundle_key.clone());
+        let cell = self.preparation_cell(&cache_key);
         let structure = Arc::clone(&environment.setup.structure);
-        cell.get_or_try_init(|| self.prepare_bundle_uncached(structure, bundle_key, bundle))
+        let result = cell
+            .get_or_try_init(|| self.prepare_bundle_uncached(structure, bundle_key, bundle))
             .await
-            .map(Arc::clone)
+            .map(Arc::clone);
+        if result.is_err() {
+            let mut cells = self
+                .preparations
+                .lock()
+                .expect("assessment preparations lock poisoned");
+            if cells
+                .get(&cache_key)
+                .is_some_and(|cached| Arc::ptr_eq(cached, &cell))
+            {
+                cells.remove(&cache_key);
+            }
+        }
+        result
     }
 
     /// Resolve and prepare one bundle from its headers on `structure`, all a preparation reads
@@ -344,7 +358,7 @@ impl ModelAssessor {
         let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
         // The exact work identity is the assessment's identity, so it keys the cache.
         let evidence = key.0.clone();
-        if let Some(cached) = self.models.read_model_assessment(&evidence) {
+        if let Some(cached) = self.read_cached_assessment(&evidence).await {
             return Ok(AssessmentOutcome {
                 key,
                 result: Ok(cached),
@@ -354,8 +368,8 @@ impl ModelAssessor {
         // after admission so overlapping equivalent work reuses the owner's result.
         let gate_key = serde_json::to_string(&(&bundle_key.0, &environment.id.0))
             .expect("assessment gate identity is serializable");
-        let _gate = self.work_gate(&gate_key).await.lock_owned().await;
-        if let Some(cached) = self.models.read_model_assessment(&evidence) {
+        let _gate = self.work_gates.lock(gate_key).await;
+        if let Some(cached) = self.read_cached_assessment(&evidence).await {
             return Ok(AssessmentOutcome {
                 key,
                 result: Ok(cached),
@@ -374,22 +388,30 @@ impl ModelAssessor {
             }
         };
         let assessed = assess_prepared(prepared, &bundle_key, profile, environment).await?;
-        self.models.write_model_assessment(&evidence, &assessed);
+        let assessed = self.write_cached_assessment(evidence, assessed).await;
         Ok(AssessmentOutcome {
             key,
             result: Ok(assessed),
         })
     }
 
-    async fn work_gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut gates = self.work_gates.lock().await;
-        gates.retain(|_, gate| gate.strong_count() > 0);
-        if let Some(gate) = gates.get(key).and_then(Weak::upgrade) {
-            return gate;
-        }
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        gates.insert(key.to_owned(), Arc::downgrade(&gate));
-        gate
+    async fn read_cached_assessment(&self, evidence: &str) -> Option<CachedModelAssessment> {
+        let models = Arc::clone(&self.models);
+        let evidence = evidence.to_owned();
+        magnitude_service_utils::blocking::run(move || models.read_model_assessment(&evidence)).await
+    }
+
+    async fn write_cached_assessment(
+        &self,
+        evidence: String,
+        assessed: CachedModelAssessment,
+    ) -> CachedModelAssessment {
+        let models = Arc::clone(&self.models);
+        magnitude_service_utils::blocking::run(move || {
+            models.write_model_assessment(&evidence, &assessed);
+            assessed
+        })
+        .await
     }
 
     /// The bundle's exact material: the release catalog's header bundle for catalog bundles,

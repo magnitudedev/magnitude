@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
@@ -71,6 +71,8 @@ const DRAFTER_SCAN_DEPTH: usize = 1;
 const MAX_LOCAL_SCAN_FILES: usize = 512;
 /// How long a custom model whose enrichment failed waits before it is tried again.
 const ENRICHMENT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
+const MAX_WEIGHT_SAMPLE_CACHE_ENTRIES: usize = 256;
+const MAX_DRAFTER_CONTENT_CACHE_ENTRIES: usize = 512;
 
 type Guard = Arc<dyn Send + Sync>;
 
@@ -303,49 +305,64 @@ enum Reach {
     Hub,
 }
 
-/// Computed lineage hints and automatic drafters, keyed by model and exact target package, each
-/// with the custom-model inputs revision it was computed at and what it read, and the bytes of
-/// every drafter reference whose header has been read, keyed by reference.
-#[derive(Default)]
+/// Computed lineage hints and automatic drafters, keyed by model (carrying its exact target
+/// package, the custom-model inputs revision it was computed at and what it read), and the bytes
+/// of every drafter reference whose header has been read, keyed by reference.
 struct CandidateEnrichment {
-    results:
-        std::sync::RwLock<BTreeMap<(ModelId, String), (u64, Reach, CustomModelEnrichmentResult)>>,
-    drafter_contents: std::sync::RwLock<BTreeMap<String, DrafterContent>>,
+    results: std::sync::RwLock<
+        BTreeMap<ModelId, (String, u64, Reach, CustomModelEnrichmentResult)>,
+    >,
+    drafter_contents: std::sync::RwLock<super::BoundedMap<String, DrafterContent>>,
     catalog_drafter_fits: std::sync::RwLock<BTreeMap<ModelId, CatalogDrafterFit>>,
     catalog_drafter_fits_unreachable: std::sync::atomic::AtomicBool,
+}
+
+impl Default for CandidateEnrichment {
+    fn default() -> Self {
+        Self {
+            results: std::sync::RwLock::new(BTreeMap::new()),
+            drafter_contents: std::sync::RwLock::new(super::BoundedMap::new(
+                MAX_DRAFTER_CONTENT_CACHE_ENTRIES,
+            )),
+            catalog_drafter_fits: std::sync::RwLock::new(BTreeMap::new()),
+            catalog_drafter_fits_unreachable: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 impl CandidateEnrichment {
     /// Whether the Hub-reaching result for `key` is known: the model's automatic drafter is
     /// worked out, not only from what is on this computer.
-    fn knows_key(&self, key: &(ModelId, String)) -> bool {
-        self.results.read().is_ok_and(|results| {
-            results
-                .get(key)
-                .is_some_and(|(_, reach, _)| *reach == Reach::Hub)
-        })
+    fn knows_key(&self, model_id: &ModelId, target_id: &str) -> bool {
+        self.results
+            .read()
+            .expect("candidate enrichment results lock poisoned")
+            .get(model_id)
+            .is_some_and(|(target, _, reach, _)| target == target_id && *reach == Reach::Hub)
     }
 
     /// Whether any result of `reach` is known for the model, for whichever target.
     fn knows_model(&self, model_id: &ModelId, reach: Reach) -> bool {
-        self.results.read().is_ok_and(|results| {
-            results
-                .iter()
-                .any(|((known, _), (_, known_reach, _))| known == model_id && *known_reach == reach)
-        })
+        self.results
+            .read()
+            .expect("candidate enrichment results lock poisoned")
+            .get(model_id)
+            .is_some_and(|(_, _, known_reach, _)| *known_reach == reach)
     }
 
     /// Whether `key` needs no computing with `reach` at `revision`: its result of that reach was
     /// computed from the inputs at `revision`, or, for a local result, the model already has a
     /// Hub-reaching one, which keeps answering until it is recomputed.
     fn is_current(&self, key: &(ModelId, String), revision: u64, reach: Reach) -> bool {
-        (reach == Reach::Local && self.knows_model(&key.0, Reach::Hub))
-            || self.results.read().is_ok_and(|results| {
-                results
-                    .get(key)
-                    .is_some_and(|(computed_at, known_reach, _)| {
-                        *computed_at == revision && *known_reach == reach
-                    })
+        let results = self
+            .results
+            .read()
+            .expect("candidate enrichment results lock poisoned");
+        results
+            .get(&key.0)
+            .is_some_and(|(target, computed_at, known_reach, _)| {
+                (reach == Reach::Local && *known_reach == Reach::Hub)
+                    || (target == &key.1 && *computed_at == revision && *known_reach == reach)
             })
     }
 
@@ -359,38 +376,47 @@ impl CandidateEnrichment {
         reach: Reach,
         result: CustomModelEnrichmentResult,
     ) -> bool {
-        let Ok(mut results) = self.results.write() else {
-            return false;
-        };
-        let previous = results
-            .iter()
-            .find(|((model_id, _), _)| model_id == &key.0)
-            .map(|(_, (_, reach, previous))| (*reach, previous.clone()));
+        let mut results = self
+            .results
+            .write()
+            .expect("candidate enrichment results lock poisoned");
         if reach == Reach::Local
-            && previous
-                .as_ref()
-                .is_some_and(|(previous, _)| *previous == Reach::Hub)
+            && results
+                .get(&key.0)
+                .is_some_and(|(_, _, previous_reach, _)| *previous_reach == Reach::Hub)
         {
             return false;
         }
-        results.retain(|(model_id, _), _| model_id != &key.0);
-        results.insert(key, (revision, reach, result.clone()));
-        previous.map(|(_, previous)| previous).unwrap_or_default() != result
+        let previous = results.insert(key.0, (key.1, revision, reach, result.clone()));
+        previous
+            .map(|(_, _, _, previous)| previous)
+            .unwrap_or_default()
+            != result
+    }
+
+    /// Drop cached enrichment results for models no longer present in the local listing.
+    fn retain_models(&self, active_models: &BTreeSet<&ModelId>) {
+        self.results
+            .write()
+            .expect("candidate enrichment results lock poisoned")
+            .retain(|model_id, _| active_models.contains(model_id));
     }
 
     /// Whether how a catalog model serves without its drafter is worked out.
     fn has_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
         self.catalog_drafter_fits
             .read()
-            .is_ok_and(|fits| fits.contains_key(model_id))
+            .expect("catalog drafter fits lock poisoned")
+            .contains_key(model_id)
     }
 
     /// Record how a catalog model serves without its drafter; whether that is new: it was not
     /// known before, or it changed what the model serves.
     fn record_catalog_drafter_fit(&self, model_id: ModelId, fit: CatalogDrafterFit) -> bool {
-        let Ok(mut known) = self.catalog_drafter_fits.write() else {
-            return false;
-        };
+        let mut known = self
+            .catalog_drafter_fits
+            .write()
+            .expect("catalog drafter fits lock poisoned");
         known.insert(model_id, fit) != Some(fit)
     }
 
@@ -410,9 +436,10 @@ impl CandidateEnrichment {
         reference: &DrafterReference,
         content: DrafterContent,
     ) -> bool {
-        let Ok(mut contents) = self.drafter_contents.write() else {
-            return false;
-        };
+        let mut contents = self
+            .drafter_contents
+            .write()
+            .expect("drafter contents lock poisoned");
         contents.insert(reference_key(reference), content.clone()) != Some(content)
     }
 }
@@ -425,37 +452,30 @@ impl CustomModelEnrichment for CandidateEnrichment {
     fn enrich(&self, model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
         self.results
             .read()
-            .ok()
-            .and_then(|results| {
-                results
-                    .get(&(model.model_id.clone(), model.target.id.0.clone()))
-                    .or_else(|| {
-                        results
-                            .iter()
-                            .find(|((model_id, _), _)| model_id == model.model_id)
-                            .map(|(_, result)| result)
-                    })
-                    .map(|(_, _, result)| result.clone())
-            })
+            .expect("candidate enrichment results lock poisoned")
+            .get(model.model_id)
+            .map(|(_, _, _, result)| result.clone())
             .unwrap_or_default()
     }
 
     fn knows(&self, model: &CustomModelFacts<'_>) -> bool {
-        self.knows_key(&(model.model_id.clone(), model.target.id.0.clone()))
+        self.knows_key(model.model_id, &model.target.id.0)
     }
 
     fn drafter_content(&self, reference: &DrafterReference) -> Option<DrafterContent> {
         self.drafter_contents
             .read()
-            .ok()
-            .and_then(|contents| contents.get(&reference_key(reference)).cloned())
+            .expect("drafter contents lock poisoned")
+            .get(&reference_key(reference))
+            .cloned()
     }
 
     fn catalog_drafter_fit(&self, model_id: &ModelId) -> CatalogDrafterFit {
         self.catalog_drafter_fits
             .read()
-            .ok()
-            .and_then(|fits| fits.get(model_id).copied())
+            .expect("catalog drafter fits lock poisoned")
+            .get(model_id)
+            .copied()
             .unwrap_or_default()
     }
 
@@ -474,10 +494,10 @@ pub struct ManagedModelCandidates {
     catalog: Arc<dyn CatalogModels>,
     local: Arc<dyn LocalModels>,
     catalog_facts: tokio::sync::OnceCell<CatalogFacts>,
-    gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    gates: super::KeyedGate<String>,
     enrichment: Arc<CandidateEnrichment>,
     resolver: std::sync::OnceLock<Arc<ModelDomainResolver>>,
-    weight_samples: std::sync::RwLock<BTreeMap<String, Option<WeightSample>>>,
+    weight_samples: std::sync::RwLock<super::BoundedMap<String, Option<WeightSample>>>,
     host: super::HostDevice,
 }
 
@@ -505,34 +525,18 @@ impl ManagedModelCandidates {
             catalog,
             local,
             catalog_facts: tokio::sync::OnceCell::new(),
-            gates: tokio::sync::Mutex::new(BTreeMap::new()),
+            gates: super::KeyedGate::new(),
             enrichment: Arc::new(CandidateEnrichment::default()),
             resolver: std::sync::OnceLock::new(),
-            weight_samples: std::sync::RwLock::new(BTreeMap::new()),
+            weight_samples: std::sync::RwLock::new(super::BoundedMap::new(
+                MAX_WEIGHT_SAMPLE_CACHE_ENTRIES,
+            )),
             host,
         })
     }
 
     fn models(&self) -> &Arc<ManagedModelStore> {
         self.assessor.models()
-    }
-
-    /// Remember the inspected version before ACN can declare it. The list can then show the
-    /// same identity while downloading, including after the service or desktop restarts.
-    fn remember_presentation(
-        &self,
-        model_id: &ModelId,
-        commit: &str,
-        presentation: CachedModelPresentation,
-    ) -> bool {
-        let cache = self.models().derived_cache();
-        if cache.read_model_presentation(model_id, commit).as_ref() == Some(&presentation) {
-            return false;
-        }
-        cache.write_model_presentation(model_id, commit, &presentation);
-        // Cache writes are best effort. Publishing a change after a failed write would wake
-        // the restoration pass again with the same miss, creating an endless refresh loop.
-        cache.read_model_presentation(model_id, commit).as_ref() == Some(&presentation)
     }
 
     /// Rebuild a missing presentation from the exact version's cached header; the Hub pass may
@@ -545,48 +549,116 @@ impl ManagedModelCandidates {
         let CustomModelOrigin::Added { repository, commit } = &model.origin else {
             return Ok(false);
         };
-        if !matches!(model.state, CustomModelState::NotInstalled)
-            || self.models().derived_cache().read_model_presentation(&model.model_id, commit).is_some()
-        {
+        if !matches!(model.state, CustomModelState::NotInstalled) {
             return Ok(false);
         }
         let ParsedModelId::HuggingFace { artifact_selector, .. } = model.model_id.parsed() else {
             return Ok(false);
         };
-        let request = HuggingFaceRepositoryRequest {
-            repository: repository.as_str().to_owned(),
-            revision: commit.clone(),
+        let (shape, variant_label, license) = match reach {
+            Reach::Local => {
+                let store = Arc::clone(self.models());
+                let model_id = model.model_id.clone();
+                let repository = repository.as_str().to_owned();
+                let commit = commit.clone();
+                let artifact_selector = artifact_selector.as_str().to_owned();
+                let Some(extracted) = magnitude_service_utils::blocking::run(move || {
+                    if store
+                        .derived_cache()
+                        .read_model_presentation(&model_id, &commit)
+                        .is_some()
+                    {
+                        return Ok(None);
+                    }
+                    let request = HuggingFaceRepositoryRequest {
+                        repository: repository.clone(),
+                        revision: commit.clone(),
+                    };
+                    let Some(snapshot) =
+                        magnitude_service_models::cached_hugging_face_repository(&store, &request)
+                    else {
+                        return Ok(None);
+                    };
+                    let file = snapshot_file(&snapshot, Path::new(&artifact_selector))?;
+                    let Some(header) = store
+                        .cached_hugging_face_header_digest(&repository, &commit, file)
+                        .and_then(|digest| store.cached_header(&digest))
+                    else {
+                        return Ok(None);
+                    };
+                    let (directory, classified) = header_inspection(header)?;
+                    Ok::<_, InventoryError>(Some((
+                        ModelShape::from_header_directory(&directory),
+                        version_label(&file.path, classified.quantization.as_deref()),
+                        snapshot.license,
+                    )))
+                })
+                .await?
+                else {
+                    return Ok(false);
+                };
+                extracted
+            }
+            Reach::Hub => {
+                let store = Arc::clone(self.models());
+                let model_id = model.model_id.clone();
+                let commit_check = commit.clone();
+                let already_present = magnitude_service_utils::blocking::run(move || {
+                    store
+                        .derived_cache()
+                        .read_model_presentation(&model_id, &commit_check)
+                        .is_some()
+                })
+                .await;
+                if already_present {
+                    return Ok(false);
+                }
+                let snapshot = self.snapshot(repository.as_str(), commit).await?;
+                let file = snapshot_file(&snapshot, Path::new(artifact_selector.as_str()))?;
+                let header = self
+                    .models()
+                    .hugging_face_gguf_header(repository.as_str(), commit, file, &[])
+                    .await?
+                    .bytes;
+                let file_path = file.path.clone();
+                let (shape, variant_label) = magnitude_service_utils::blocking::run(move || {
+                    let (directory, classified) = header_inspection(header)?;
+                    Ok::<_, InventoryError>((
+                        ModelShape::from_header_directory(&directory),
+                        version_label(&file_path, classified.quantization.as_deref()),
+                    ))
+                })
+                .await?;
+                (shape, variant_label, snapshot.license)
+            }
         };
-        let snapshot = match reach {
-            Reach::Local => match magnitude_service_models::cached_hugging_face_repository(self.models(), &request) {
-                Some(snapshot) => snapshot,
-                None => return Ok(false),
-            },
-            Reach::Hub => self.snapshot(repository.as_str(), commit).await?,
-        };
-        let file = snapshot_file(&snapshot, Path::new(artifact_selector.as_str()))?;
-        let header = match reach {
-            Reach::Local => match self.models()
-                .cached_hugging_face_header_digest(repository.as_str(), commit, file)
-                .and_then(|digest| self.models().cached_header(&digest))
-            {
-                Some(bytes) => bytes,
-                None => return Ok(false),
-            },
-            Reach::Hub => self.models()
-                .hugging_face_gguf_header(repository.as_str(), commit, file, &[]).await?.bytes,
-        };
-        let (directory, classified) = header_inspection(header)?;
-        let variant_of = match ModelShape::from_header_directory(&directory) {
+        let variant_of = match shape {
             Some(shape) => shape.variant_of(&self.catalog_facts().await.fingerprints),
             None => None,
         };
-        Ok(self.remember_presentation(&model.model_id, commit, CachedModelPresentation {
+        let store = Arc::clone(self.models());
+        let model_id = model.model_id.clone();
+        let commit = commit.clone();
+        let presentation = CachedModelPresentation {
             display_name: display_name(repository.as_str()),
-            variant_label: version_label(&file.path, classified.quantization.as_deref()),
+            variant_label,
             variant_of,
-            license: snapshot.license,
-        }))
+            license,
+        };
+        Ok(magnitude_service_utils::blocking::run(move || {
+            remember_presentation_in_store(&store, &model_id, &commit, presentation)
+        })
+        .await)
+    }
+
+    #[cfg(test)]
+    fn remember_presentation(
+        &self,
+        model_id: &ModelId,
+        commit: &str,
+        presentation: CachedModelPresentation,
+    ) -> bool {
+        remember_presentation_in_store(self.models(), model_id, commit, presentation)
     }
 
     /// The drafter a model is recommended: the first candidate the engine binds.
@@ -784,18 +856,29 @@ impl ManagedModelCandidates {
             let Ok(revision) = resolver.custom_model_inputs_revision() else {
                 return;
             };
-            let models = self
-                .local
-                .list_local()
-                .await
-                .map(|response| {
+            let (models, listed) = match self.local.list_local().await {
+                Ok(response) => (
                     response
                         .models
                         .into_iter()
                         .chain(response.hidden)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+                        .collect::<Vec<_>>(),
+                    true,
+                ),
+                Err(_) => (Vec::new(), false),
+            };
+            if listed {
+                let active_models = models
+                    .iter()
+                    .map(|model| &model.model_id)
+                    .collect::<BTreeSet<_>>();
+                enrichment.retain_models(&active_models);
+                failed.retain(|(model_id, _), (failed_at, _)| {
+                    *failed_at == revision && active_models.contains(model_id)
+                });
+            } else {
+                failed.retain(|_, (failed_at, _)| *failed_at == revision);
+            }
             for model in &models {
                 let key = (model.model_id.clone(), "presentation".to_owned());
                 if failed.get(&key).is_some_and(|(failed_at, at)| {
@@ -1003,12 +1086,11 @@ impl ManagedModelCandidates {
             drafter.map(|drafter| drafter.identity.as_str()),
             &method,
         );
-        if let Some(cached) = self.models().read_model_assessment(&evidence) {
+        if let Some(cached) = self.read_cached_assessment(&evidence).await {
             return Ok(cached);
         }
-        let gate = self.gate(&evidence).await;
-        let _admitted = gate.lock().await;
-        if let Some(cached) = self.models().read_model_assessment(&evidence) {
+        let _admitted = self.gates.lock(evidence.clone()).await;
+        if let Some(cached) = self.read_cached_assessment(&evidence).await {
             return Ok(cached);
         }
         let _share = self.host.share().await;
@@ -1064,9 +1146,20 @@ impl ManagedModelCandidates {
             Sha256::digest(evidence.as_bytes())
         ));
         let cached = model_assessment(assessed, &key, profile, &environment)?;
-        self.models().write_model_assessment(&evidence, &cached);
+        let store = Arc::clone(self.models());
+        let cached = magnitude_service_utils::blocking::run(move || {
+            store.write_model_assessment(&evidence, &cached);
+            cached
+        })
+        .await;
         Ok(cached)
         })
+    }
+
+    async fn read_cached_assessment(&self, evidence: &str) -> Option<CachedModelAssessment> {
+        let store = Arc::clone(self.models());
+        let evidence = evidence.to_owned();
+        magnitude_service_utils::blocking::run(move || store.read_model_assessment(&evidence)).await
     }
 
     fn candidate_header_source(
@@ -1115,7 +1208,7 @@ impl ManagedModelCandidates {
     }
 
     /// The assessment cached in this service's environment, while it is current there.
-    fn cached_assessment(
+    async fn cached_assessment(
         &self,
         target: &str,
         drafter: Option<&str>,
@@ -1123,44 +1216,25 @@ impl ManagedModelCandidates {
     ) -> Option<CachedModelAssessment> {
         let environment = self.assessor.environment();
         let evidence = assessment_evidence(&environment.id, target, drafter, method);
-        self.models().read_model_assessment(&evidence)
+        self.read_cached_assessment(&evidence).await
     }
 
     /// The identity `hugging_face_target` would give a version's material, from cached header
     /// digests alone, or `None` when a header was never fetched.
-    fn cached_hugging_face_identity(
+    async fn cached_hugging_face_identity(
         &self,
         snapshot: &HuggingFaceRepositorySnapshot,
         group: &GgufGroup,
         projector: Option<&Path>,
     ) -> Option<String> {
-        let mut headers = Vec::new();
-        for path in group
-            .files
-            .iter()
-            .map(|file| file.path.as_path())
-            .chain(projector)
-        {
-            let file = snapshot_file(snapshot, path).ok()?;
-            let digest = self.models().cached_hugging_face_header_digest(
-                &snapshot.repository,
-                &snapshot.commit,
-                file,
-            )?;
-            headers.push((path_string(path), digest));
-        }
-        Some(header_identity(headers))
-    }
-
-    async fn gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut gates = self.gates.lock().await;
-        gates.retain(|_, gate| gate.strong_count() > 0);
-        if let Some(gate) = gates.get(key).and_then(Weak::upgrade) {
-            return gate;
-        }
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        gates.insert(key.to_owned(), Arc::downgrade(&gate));
-        gate
+        let store = Arc::clone(self.models());
+        let snapshot = snapshot.clone();
+        let group = group.clone();
+        let projector = projector.map(Path::to_path_buf);
+        magnitude_service_utils::blocking::run(move || {
+            cached_hugging_face_identity_in_store(&store, &snapshot, &group, projector.as_deref())
+        })
+        .await
     }
 
     // Material -------------------------------------------------------------------------------
@@ -1262,21 +1336,7 @@ impl ManagedModelCandidates {
         target_shards: Vec<PathBuf>,
         projector: Option<PathBuf>,
     ) -> Result<TargetMaterial, InventoryError> {
-        let mut identity = Vec::new();
-        let mut headers = BTreeMap::new();
-        for path in target_shards.iter().chain(projector.iter()) {
-            let digest = self.models().local_gguf(path)?.inspection.header_digest;
-            identity.push(digest.clone());
-            headers.insert(path.clone(), digest);
-        }
-        Ok(TargetMaterial {
-            target_shards,
-            projector,
-            identity: identity.join(","),
-            headers,
-            package: None,
-            _guards: Vec::new(),
-        })
+        local_target_in_store(self.models(), target_shards, projector)
     }
 
     fn local_drafter(&self, path: PathBuf) -> Result<DrafterMaterial, InventoryError> {
@@ -1314,10 +1374,7 @@ impl ManagedModelCandidates {
     /// assessment reads it ([`StoredHeaders::read`]), so a payload that fails to read discards
     /// the entry and the header counts as not cached.
     fn read_cached<T>(&self, digest: &str, read: impl Fn(&Directory) -> Option<T>) -> Option<T> {
-        StoredHeaders::read(self.models(), BTreeMap::new(), |headers| {
-            let directory = magnitude_service_models::gguf::known_tensors(headers.cached(digest)?);
-            read(&directory.ok()?)
-        })
+        read_cached_in_store(self.models(), digest, read)
     }
 
     /// A bundle's target (and projector) as material, resolved and identified by its exact
@@ -1537,24 +1594,52 @@ impl ManagedModelCandidates {
             0,
             groups.len(),
         );
-        let mut cached = Vec::new();
-        let mut uncached = Vec::new();
-        for group in groups {
-            let file = snapshot_file(snapshot, &group.primary().path)?;
-            match self.models().cached_hugging_face_classification(
-                &snapshot.repository,
-                &snapshot.commit,
-                file,
-                &self.architectures,
-            ) {
-                Some((digest, classification)) => {
-                    cached.push(classified_group(group, digest, classification));
-                    progress.header_read();
+        let store = Arc::clone(self.models());
+        let architectures = self.architectures.clone();
+        let snapshot_for_cache = snapshot.clone();
+        let (mut classified, mut uncached, mut reference) =
+            magnitude_service_utils::blocking::run(move || {
+                let mut cached = Vec::new();
+                let mut uncached = Vec::new();
+                for group in groups {
+                    let file = snapshot_file(&snapshot_for_cache, &group.primary().path)?;
+                    match store.cached_hugging_face_classification(
+                        &snapshot_for_cache.repository,
+                        &snapshot_for_cache.commit,
+                        file,
+                        &architectures,
+                    ) {
+                        Some((digest, classification)) => {
+                            cached.push(classified_group(group, digest, classification));
+                        }
+                        None => uncached.push(group),
+                    }
                 }
-                None => uncached.push(group),
-            }
+                let reference = if uncached.is_empty() {
+                    None
+                } else {
+                    cached
+                        .iter()
+                        .map(|classified| &classified.group)
+                        .max_by_key(|group| {
+                            (!is_projector_name(&group.primary().path), group.size_bytes())
+                        })
+                        .and_then(|group| {
+                            let file =
+                                snapshot_file(&snapshot_for_cache, &group.primary().path).ok()?;
+                            store.hugging_face_reference_header(
+                                &snapshot_for_cache.repository,
+                                &snapshot_for_cache.commit,
+                                file,
+                            )
+                        })
+                };
+                Ok::<_, InventoryError>((cached, uncached, reference))
+            })
+            .await?;
+        for _ in 0..classified.len() {
+            progress.header_read();
         }
-        let mut classified = cached;
         if uncached.is_empty() {
             return Ok(classified);
         }
@@ -1565,18 +1650,6 @@ impl ManagedModelCandidates {
         // or can't be read at all leaves the next largest file to be read whole.
         let probe_order =
             |group: &GgufGroup| (!is_projector_name(&group.primary().path), group.size_bytes());
-        let mut reference = classified
-            .iter()
-            .map(|classified| &classified.group)
-            .max_by_key(|group| probe_order(group))
-            .and_then(|group| {
-                let file = snapshot_file(snapshot, &group.primary().path).ok()?;
-                self.models().hugging_face_reference_header(
-                    &snapshot.repository,
-                    &snapshot.commit,
-                    file,
-                )
-            });
         while reference.is_none() && !uncached.is_empty() {
             let probe = uncached
                 .iter()
@@ -1584,17 +1657,19 @@ impl ManagedModelCandidates {
                 .max_by_key(|(_, group)| probe_order(group))
                 .map_or(0, |(index, _)| index);
             let probe = uncached.remove(probe);
-            let probe_file = snapshot_file(snapshot, &probe.primary().path)?;
+            let probe_file = snapshot_file(snapshot, &probe.primary().path)?.clone();
             classified.push(
                 self.classify_hugging_face_group(snapshot, probe, &[])
                     .await?,
             );
             progress.header_read();
-            reference = self.models().hugging_face_reference_header(
-                &snapshot.repository,
-                &snapshot.commit,
-                probe_file,
-            );
+            let store = Arc::clone(self.models());
+            let repository = snapshot.repository.clone();
+            let commit = snapshot.commit.clone();
+            reference = magnitude_service_utils::blocking::run(move || {
+                store.hugging_face_reference_header(&repository, &commit, &probe_file)
+            })
+            .await;
         }
         let references = reference.as_deref().into_iter().collect::<Vec<_>>();
         let rest = futures_util::stream::iter(
@@ -1663,8 +1738,10 @@ impl ManagedModelCandidates {
         // Every readable version gets the engine's plain verdict, an architecture it doesn't
         // recognize included, so its reasons are the engine's own. Its drafter (built-in heads
         // among them) is composed only for the recommended version; see `compose_recommended`.
-        if let Some(cached) = identity
-            .and_then(|identity| self.cached_assessment(&identity, None, &ModelMethod::Plain))
+        if let Some(identity) = identity
+            && let Some(cached) = self
+                .cached_assessment(&identity, None, &ModelMethod::Plain)
+                .await
         {
             return Some(cached);
         }
@@ -1848,10 +1925,13 @@ impl ManagedModelCandidates {
                     .iter()
                     .map(|file| file.path.clone())
                     .collect::<Vec<_>>();
+                let identity = self
+                    .cached_hugging_face_identity(&snapshot, &classified.group, None)
+                    .await;
                 let assessment = self
                     .version_assessment(
                         &classified,
-                        self.cached_hugging_face_identity(&snapshot, &classified.group, None),
+                        identity,
                         self.hugging_face_target(&snapshot, shard_paths, None),
                     )
                     .await;
@@ -1964,8 +2044,31 @@ impl ManagedModelCandidates {
             let catalog_installed = self.installed_catalog_models().await;
             let projector_path = projector.map(|projector| projector.group.primary().path.clone());
             progress.checking_versions(version_rows(&targets));
-            let mut pending = Vec::new();
-            for group in &targets {
+            let identities = {
+                let store = Arc::clone(self.models());
+                let snapshot = snapshot.clone();
+                let projector_path = projector_path.clone();
+                let target_groups = targets
+                    .iter()
+                    .map(|group| group.group.clone())
+                    .collect::<Vec<_>>();
+                magnitude_service_utils::blocking::run(move || {
+                    target_groups
+                        .iter()
+                        .map(|group| {
+                            cached_hugging_face_identity_in_store(
+                                &store,
+                                &snapshot,
+                                group,
+                                projector_path.as_deref(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+            };
+            let mut pending = Vec::with_capacity(targets.len());
+            for (group, identity) in targets.iter().zip(identities) {
                 let shard_paths = group
                     .group
                     .files
@@ -1974,11 +2077,7 @@ impl ManagedModelCandidates {
                     .collect::<Vec<_>>();
                 pending.push(self.version_assessment(
                     group,
-                    self.cached_hugging_face_identity(
-                        &snapshot,
-                        &group.group,
-                        projector_path.as_deref(),
-                    ),
+                    identity,
                     self.hugging_face_target(&snapshot, shard_paths, projector_path.as_deref()),
                 ));
             }
@@ -2037,13 +2136,41 @@ impl ManagedModelCandidates {
                 .collect::<Vec<_>>();
             let variant_of = self.inspection_variant_of(&versions).await;
             let catalog = &self.catalog_facts().await.fingerprints;
-            let families = versions.iter().map(|version| {
-                let shape = self
-                    .read_cached(&version.group.header_digest, ModelShape::from_header_directory)
-                    .or_else(|| version.assessment.as_ref()?.fingerprint.as_ref().map(ModelShape::of));
-                let family = version.catalog_model.clone().or_else(|| shape.and_then(|shape| shape.variant_of(catalog)));
-                (version.model_id.clone(), family)
-            }).collect::<BTreeMap<_, _>>();
+            let header_shapes = {
+                let store = Arc::clone(self.models());
+                let digests = versions
+                    .iter()
+                    .map(|version| version.group.header_digest.clone())
+                    .collect::<Vec<_>>();
+                magnitude_service_utils::blocking::run(move || {
+                    digests
+                        .into_iter()
+                        .map(|digest| {
+                            read_cached_in_store(&store, &digest, ModelShape::from_header_directory)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+            };
+            let families = versions
+                .iter()
+                .zip(header_shapes)
+                .map(|(version, header_shape)| {
+                    let shape = header_shape.or_else(|| {
+                        version
+                            .assessment
+                            .as_ref()?
+                            .fingerprint
+                            .as_ref()
+                            .map(ModelShape::of)
+                    });
+                    let family = version
+                        .catalog_model
+                        .clone()
+                        .or_else(|| shape.and_then(|shape| shape.variant_of(catalog)));
+                    (version.model_id.clone(), family)
+                })
+                .collect::<BTreeMap<_, _>>();
             let projector_bytes = projector.map_or(0, |projector| projector.group.size_bytes());
             let inspection = CandidateInspection {
                 source: CandidateSource::HuggingFace {
@@ -2063,15 +2190,32 @@ impl ManagedModelCandidates {
                 projector: projector.map(|projector| candidate_file(projector.group.primary())),
                 unsupported_architecture,
             };
-            let mut changed = false;
-            for version in &inspection.versions {
-                changed |= self.remember_presentation(&version.model_id, &snapshot.commit, CachedModelPresentation {
-                    display_name: inspection.display_name.clone(),
-                    variant_label: version.label.clone(),
-                    variant_of: families.get(&version.model_id).cloned().flatten(),
-                    license: inspection.license.clone(),
-                });
-            }
+            let presentations = inspection
+                .versions
+                .iter()
+                .map(|version| {
+                    (
+                        version.model_id.clone(),
+                        CachedModelPresentation {
+                            display_name: inspection.display_name.clone(),
+                            variant_label: version.label.clone(),
+                            variant_of: families.get(&version.model_id).cloned().flatten(),
+                            license: inspection.license.clone(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let store = Arc::clone(self.models());
+            let commit = snapshot.commit.clone();
+            let changed = magnitude_service_utils::blocking::run(move || {
+                let mut changed = false;
+                for (model_id, presentation) in presentations {
+                    changed |=
+                        remember_presentation_in_store(&store, &model_id, &commit, presentation);
+                }
+                changed
+            })
+            .await;
             if changed && let Some(resolver) = self.resolver.get() {
                 resolver.custom_model_enrichment_changed();
             }
@@ -2084,8 +2228,12 @@ impl ManagedModelCandidates {
         path: PathBuf,
         progress: &InspectionProgress,
     ) -> Result<CandidateInspection, InventoryError> {
-        let metadata = std::fs::metadata(&path)
-            .map_err(|error| InventoryError::NotFound(format!("{}: {error}", path.display())))?;
+        let metadata_path = path.clone();
+        let metadata = magnitude_service_utils::blocking::run(move || {
+            std::fs::metadata(&metadata_path)
+                .map_err(|error| InventoryError::NotFound(format!("{}: {error}", metadata_path.display())))
+        })
+        .await?;
         let (root, selected) = if metadata.is_file() {
             let root = path.parent().map(Path::to_path_buf).ok_or_else(|| {
                 InventoryError::InvalidRequest("a file needs a folder".to_owned())
@@ -2115,7 +2263,11 @@ impl ManagedModelCandidates {
             })
             .collect::<Vec<_>>();
         if selected.is_some() && targets.is_empty() {
-            if let Err(error) = local_directory(&path) {
+            let inspect_path = path.clone();
+            let read_result =
+                magnitude_service_utils::blocking::run(move || local_directory(&inspect_path))
+                    .await;
+            if let Err(error) = read_result {
                 return Err(InventoryError::InvalidRequest(format!(
                     "{} can't be read as a GGUF model: {error}",
                     path.display()
@@ -2130,16 +2282,34 @@ impl ManagedModelCandidates {
         let custom = self.custom_models().await;
         let projector_path = projector.map(|projector| root.join(&projector.group.primary().path));
         progress.checking_versions(version_rows(&targets));
-        let mut pending = Vec::new();
-        for group in &targets {
-            let shard_paths = group
-                .group
-                .files
+        let local_targets = {
+            let store = Arc::clone(self.models());
+            let root = root.clone();
+            let projector_path = projector_path.clone();
+            let target_groups = targets
                 .iter()
-                .map(|file| root.join(&file.path))
+                .map(|group| group.group.clone())
                 .collect::<Vec<_>>();
-            let material = self.local_target(shard_paths, projector_path.clone());
-            let unreadable = unreadable_local_group(self.models(), &root, &group.group);
+            magnitude_service_utils::blocking::run(move || {
+                target_groups
+                    .into_iter()
+                    .map(|group| {
+                        let shard_paths = group
+                            .files
+                            .iter()
+                            .map(|file| root.join(&file.path))
+                            .collect::<Vec<_>>();
+                        let material =
+                            local_target_in_store(&store, shard_paths, projector_path.clone());
+                        let unreadable = unreadable_local_group(&store, &root, &group);
+                        (unreadable, material)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+        };
+        let mut pending = Vec::with_capacity(targets.len());
+        for (group, (unreadable, material)) in targets.iter().zip(local_targets) {
             pending.push(async move {
                 match unreadable {
                     Some(assessment) => Some(assessment),
@@ -2381,9 +2551,17 @@ impl ManagedModelCandidates {
         if let Some(catalog_model) = versions.iter().find_map(|version| version.catalog_model.clone()) {
             return Some(catalog_model);
         }
-        let header_shape = versions.iter().find_map(|version| {
-            self.read_cached(&version.group.header_digest, ModelShape::from_header_directory)
-        });
+        let store = Arc::clone(self.models());
+        let digests = versions
+            .iter()
+            .map(|version| version.group.header_digest.clone())
+            .collect::<Vec<_>>();
+        let header_shape = magnitude_service_utils::blocking::run(move || {
+            digests.iter().find_map(|digest| {
+                read_cached_in_store(&store, digest, ModelShape::from_header_directory)
+            })
+        })
+        .await;
         match header_shape {
             Some(shape) => shape.variant_of(&self.catalog_facts().await.fingerprints),
             None => {
@@ -2500,18 +2678,18 @@ impl ManagedModelCandidates {
     async fn target_weight_sample(&self, target: &DrafterTarget) -> Option<WeightSample> {
         match target.weights.as_ref()? {
             WeightSource::Files(shards) => {
-                let primary = shards.first()?;
-                let content = self
-                    .models()
-                    .local_gguf(primary)
-                    .ok()?
-                    .inspection
-                    .content_sample?;
+                let primary = shards.first()?.clone();
+                let models = Arc::clone(self.models());
+                let content = magnitude_service_utils::blocking::run(move || {
+                    models.local_gguf(&primary).ok()?.inspection.content_sample
+                })
+                .await?;
                 if let Some(known) = self
                     .weight_samples
                     .read()
-                    .ok()
-                    .and_then(|samples| samples.get(&content).cloned())
+                    .expect("weight samples lock poisoned")
+                    .get(&content)
+                    .cloned()
                 {
                     return known;
                 }
@@ -2523,9 +2701,10 @@ impl ManagedModelCandidates {
                 .await
                 .map_err(|error| tracing::warn!(%error, "weight sample unavailable"))
                 .ok()?;
-                if let Ok(mut samples) = self.weight_samples.write() {
-                    samples.insert(content, sample.clone());
-                }
+                self.weight_samples
+                    .write()
+                    .expect("weight samples lock poisoned")
+                    .insert(content, sample.clone());
                 sample
             }
             WeightSource::Hub { snapshot, shards } => {
@@ -5062,6 +5241,78 @@ fn parse_hugging_face_reference(
     Ok((repository.to_owned(), revision, path))
 }
 
+/// Remember the inspected version before ACN can declare it. The list can then show the
+/// same identity while downloading, including after the service or desktop restarts.
+fn remember_presentation_in_store(
+    store: &ManagedModelStore,
+    model_id: &ModelId,
+    commit: &str,
+    presentation: CachedModelPresentation,
+) -> bool {
+    let cache = store.derived_cache();
+    if cache.read_model_presentation(model_id, commit).as_ref() == Some(&presentation) {
+        return false;
+    }
+    cache.write_model_presentation(model_id, commit, &presentation);
+    // Cache writes are best effort. Publishing a change after a failed write would wake
+    // the restoration pass again with the same miss, creating an endless refresh loop.
+    cache.read_model_presentation(model_id, commit).as_ref() == Some(&presentation)
+}
+
+fn cached_hugging_face_identity_in_store(
+    store: &ManagedModelStore,
+    snapshot: &HuggingFaceRepositorySnapshot,
+    group: &GgufGroup,
+    projector: Option<&Path>,
+) -> Option<String> {
+    let mut headers = Vec::new();
+    for path in group
+        .files
+        .iter()
+        .map(|file| file.path.as_path())
+        .chain(projector)
+    {
+        let file = snapshot_file(snapshot, path).ok()?;
+        let digest =
+            store.cached_hugging_face_header_digest(&snapshot.repository, &snapshot.commit, file)?;
+        headers.push((path_string(path), digest));
+    }
+    Some(header_identity(headers))
+}
+
+fn local_target_in_store(
+    store: &ManagedModelStore,
+    target_shards: Vec<PathBuf>,
+    projector: Option<PathBuf>,
+) -> Result<TargetMaterial, InventoryError> {
+    let mut identity = Vec::new();
+    let mut headers = BTreeMap::new();
+    for path in target_shards.iter().chain(projector.iter()) {
+        let digest = store.local_gguf(path)?.inspection.header_digest;
+        identity.push(digest.clone());
+        headers.insert(path.clone(), digest);
+    }
+    Ok(TargetMaterial {
+        target_shards,
+        projector,
+        identity: identity.join(","),
+        headers,
+        package: None,
+        _guards: Vec::new(),
+    })
+}
+
+fn read_cached_in_store<T>(
+    store: &Arc<ManagedModelStore>,
+    digest: &str,
+    read: impl Fn(&Directory) -> Option<T>,
+) -> Option<T> {
+    StoredHeaders::read(store, BTreeMap::new(), |headers| {
+        let directory = magnitude_service_models::gguf::known_tensors(headers.cached(digest)?);
+        read(&directory.ok()?)
+    })
+}
+
 #[cfg(test)]
 #[path = "candidate_tests.rs"]
 mod hub_tests;
@@ -5491,5 +5742,72 @@ mod tests {
             here,
         ]);
         assert_eq!(names(&ordered), ["here", "remote"]);
+    }
+
+    #[test]
+    fn candidate_enrichment_keeps_a_single_entry_per_model() {
+        let base = magnitude_service_contracts::models::CatalogBaseId::new("enrichment-model")
+            .expect("catalog base ID");
+        let variant = magnitude_service_contracts::models::CatalogVariantId::new("gguf:q4")
+            .expect("catalog variant ID");
+        let model_id = ModelId::catalog(&base, &variant);
+        let enrichment = CandidateEnrichment::default();
+        let first = CustomModelEnrichmentResult {
+            license: Some("apache-2.0".to_owned()),
+            ..CustomModelEnrichmentResult::default()
+        };
+        let second = CustomModelEnrichmentResult {
+            license: Some("mit".to_owned()),
+            ..CustomModelEnrichmentResult::default()
+        };
+
+        assert!(enrichment.record(
+            (model_id.clone(), "target-a".to_owned()),
+            1,
+            Reach::Local,
+            first.clone(),
+        ));
+        assert!(enrichment.knows_model(&model_id, Reach::Local));
+        assert!(!enrichment.knows_key(&model_id, "target-a"));
+
+        // Recording a Hub result for a new target replaces the model's single entry.
+        assert!(enrichment.record(
+            (model_id.clone(), "target-b".to_owned()),
+            2,
+            Reach::Hub,
+            second.clone(),
+        ));
+        assert_eq!(
+            enrichment
+                .results
+                .read()
+                .expect("candidate enrichment results lock poisoned")
+                .len(),
+            1
+        );
+        assert!(enrichment.knows_key(&model_id, "target-b"));
+        assert!(!enrichment.knows_key(&model_id, "target-a"));
+        assert!(enrichment.is_current(&(model_id.clone(), "target-b".to_owned()), 2, Reach::Hub));
+
+        // A later local result never overwrites a Hub result for the same model.
+        assert!(!enrichment.record(
+            (model_id.clone(), "target-c".to_owned()),
+            3,
+            Reach::Local,
+            first,
+        ));
+        assert!(enrichment.knows_key(&model_id, "target-b"));
+        assert!(enrichment.is_current(&(model_id.clone(), "target-c".to_owned()), 3, Reach::Local));
+
+        // Pruning drops models no longer in the active set.
+        enrichment.retain_models(&BTreeSet::new());
+        assert!(!enrichment.knows_model(&model_id, Reach::Hub));
+        assert!(
+            enrichment
+                .results
+                .read()
+                .expect("candidate enrichment results lock poisoned")
+                .is_empty()
+        );
     }
 }
