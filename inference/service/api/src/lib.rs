@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -97,6 +97,7 @@ pub struct AppState {
     authorization: Option<Arc<str>>,
     resource_revision: Arc<AtomicU64>,
     resource_changes: tokio::sync::broadcast::Sender<InferenceResourceInvalidation>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -232,6 +233,7 @@ impl AppState {
             authorization: None,
             resource_revision: Arc::new(AtomicU64::new(0)),
             resource_changes,
+            shutdown: None,
         }
     }
 
@@ -284,6 +286,11 @@ impl AppState {
 
     pub fn with_authorization(mut self, capability: impl Into<Arc<str>>) -> Self {
         self.authorization = Some(capability.into());
+        self
+    }
+
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
         self
     }
 
@@ -437,10 +444,49 @@ async fn authorize(State(capability): State<Arc<str>>, request: Request, next: N
     }
 }
 
-async fn serve_openapi() -> Result<Json<OpenApiDocument>, ApiError> {
-    openapi()
-        .map(Json)
-        .map_err(|error| ApiError::server(format!("OpenAPI export failed: {error}")))
+async fn serve_openapi() -> Result<Response, ApiError> {
+    static JSON: OnceLock<String> = OnceLock::new();
+    let body: &'static str = if let Some(cached) = JSON.get() {
+        cached.as_str()
+    } else {
+        let document = openapi()
+            .map_err(|error| ApiError::server(format!("OpenAPI export failed: {error}")))?;
+        let serialized = serde_json::to_string(&document)
+            .map_err(|error| ApiError::server(format!("OpenAPI export failed: {error}")))?;
+        JSON.get_or_init(|| serialized).as_str()
+    };
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response())
+}
+
+async fn shutdown_triggered(shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match shutdown {
+        Some(receiver) => {
+            let _ = receiver.wait_for(|shutdown| *shutdown).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+fn until_shutdown<S: futures_util::Stream + Send + 'static>(
+    stream: S,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> impl futures_util::Stream<Item = S::Item> + Send + 'static {
+    futures_util::stream::unfold(
+        (Box::pin(stream), shutdown),
+        |(mut stream, mut shutdown)| async move {
+            tokio::select! {
+                biased;
+                () = shutdown_triggered(&mut shutdown) => None,
+                item = futures_util::StreamExt::next(&mut stream) => {
+                    item.map(|item| (item, (stream, shutdown)))
+                }
+            }
+        },
+    )
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -894,7 +940,7 @@ async fn watch_inference_events(
             serde_json::to_string(&invalidation).expect("inference invalidation is serializable"),
         ))
     });
-    Ok(Sse::new(framed).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(until_shutdown(framed, state.shutdown)).keep_alive(KeepAlive::default()))
 }
 
 #[utoipa::path(get, path = "/api/v1/hardware", operation_id = "getHardware", tag = "system", responses(
@@ -1433,6 +1479,7 @@ async fn stream_model_candidate_inspection(
     Json(request): Json<CandidateInspectionRequest>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let candidates = Arc::clone(model_candidates_domain(&state)?);
+    let mut shutdown = state.shutdown;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let progress = CandidateInspectionProgressSink::new(move |progress| {
         let _ = sender.send(progress);
@@ -1443,6 +1490,7 @@ async fn stream_model_candidate_inspection(
     // the response's own status, as the request/response inspection reports it.
     let stage = tokio::select! {
         biased;
+        () = shutdown_triggered(&mut shutdown) => InspectionStage::Done,
         Some(progress) = receiver.recv() => InspectionStage::Running { first: Some(progress), receiver, inspection },
         result = &mut inspection => match receiver.try_recv() {
             Ok(progress) => InspectionStage::Draining { first: Some(progress), receiver, result },
@@ -1506,7 +1554,7 @@ async fn stream_model_candidate_inspection(
             InspectionStage::Done => None,
         }
     });
-    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(until_shutdown(events, shutdown)).keep_alive(KeepAlive::default()))
 }
 
 /// The stream's progress through an inspection: running, then any progress still buffered once
@@ -2218,6 +2266,15 @@ pub enum OpenApiExportError {
 }
 
 pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
+    static CACHED: OnceLock<OpenApiDocument> = OnceLock::new();
+    if let Some(document) = CACHED.get() {
+        return Ok(document.clone());
+    }
+    let document = build_openapi()?;
+    Ok(CACHED.get_or_init(|| document).clone())
+}
+
+fn build_openapi() -> Result<OpenApiDocument, OpenApiExportError> {
     let mut document = IcnOpenApi::openapi();
     preserve_typed_request_client_contract(&mut document);
     attach_stream_contract::<ChatCompletionStream>(

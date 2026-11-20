@@ -11,14 +11,14 @@
 //! every backend's report of it ([`device_memory`]); every executor of the
 //! device then places by that one decision.
 
-use crate::kind::{KindMemory, KindReport};
+use crate::kind::{KindMemory, KindReport, Reach};
 use crate::model::{
     AllocationLimit, Availability, Builder, CacheSize, DeviceMemory, DeviceTopology, Diagnostic,
     ExecutorBuilder, ExecutorKind, ExecutorReport, Grant, GrantKind, GrantSource, Host, Limits,
     NativeAllocations, OwnKind, OwnPath, PhysicalDeviceId, PhysicalIdentity, Reported, ReportedBy,
     Revision, StoreId, StoreKind, VolumeId,
 };
-use crate::placement::{place, Contract};
+use crate::placement::{place, Contract, WINDOW_BYTES};
 use crate::processors::{HostNode, Processors};
 use crate::selector::ExecutorSelector;
 use crate::system::SystemIdentity;
@@ -593,9 +593,10 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
         // total, split across heaps only as a presentation; the heaps'
         // live budget is attributed along the placement, which every kind is
         // charged along. A device whose memory is its own: one access path
-        // per device-local heap its kinds lie on, to its own memory, granted
-        // the heap's size; one to host RAM, ungranted, for every kind on
-        // another heap and for imported host pages.
+        // per non-window device-local heap its kinds lie on, to its own memory,
+        // granted the heap's size; one to host RAM, ungranted, for every kind
+        // on a host heap, on a small BAR window (<= WINDOW_BYTES), and for
+        // imported host pages.
         let alike = match placement {
             Ok(Decided::Host) => {
                 let total = heaps.heaps.iter().map(|heap| heap.bytes).sum::<u64>();
@@ -627,7 +628,9 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             |executor, kind| {
                 let along = match (&alike, kind.memory) {
                     (Some(paths), _) => paths.clone(),
-                    (None, KindMemory::Heap { index, device_local: true, bytes }) => {
+                    (None, KindMemory::Heap { index, device_local: true, bytes })
+                        if !is_window_heap(kind) =>
+                    {
                         vec![*local.entry(index).or_insert_with(|| {
                             executor.granted(
                                 own.expect("a device-local heap is its own memory").0,
@@ -643,7 +646,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                             )
                         })]
                     }
-                    (None, KindMemory::Heap { device_local: false, .. } | KindMemory::HostRam) => {
+                    (None, KindMemory::Heap { .. } | KindMemory::HostRam) => {
                         vec![executor.ungranted(host_ram)]
                     }
                     (None, KindMemory::DeviceMemory) => {
@@ -815,6 +818,20 @@ fn host_class_paths(
     paths
 }
 
+/// Whether `kind` lies in a small host-visible device-local BAR window
+/// (`placement::Lies::Window`), which counts as host RAM rather than the
+/// device's own memory.
+fn is_window_heap(kind: &KindReport) -> bool {
+    matches!(
+        kind.memory,
+        KindMemory::Heap {
+            device_local: true,
+            bytes,
+            ..
+        } if kind.reach != Reach::Device && bytes <= WINDOW_BYTES
+    )
+}
+
 /// The dedicated memory the OS reports for the adapter of `luid`, when it
 /// reports some.
 fn dedicated(adapters: &[AdapterReport], luid: Option<[u8; 8]>) -> Option<u64> {
@@ -824,4 +841,73 @@ fn dedicated(adapters: &[AdapterReport], luid: Option<[u8; 8]>) -> Option<u64> {
         .find(|adapter| adapter.luid == luid)
         .map(|adapter| adapter.dedicated)
         .filter(|bytes| *bytes > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kind::HostReads;
+
+    #[test]
+    fn vulkan_window_only_device_routes_window_heap_to_host_ram_without_panicking() {
+        let mut reports = crate::fixtures::rtx3090_host();
+        let uuid = [0x42; 16];
+        reports.vulkan.push(VulkanReport {
+            uuid,
+            kind: ExecutorKind::DiscreteGpu,
+            memory_is_host: Some(false),
+            name: "Window-only discrete GPU".into(),
+            floor: Ok(()),
+            driver: "vulkan driver 1".into(),
+            max_allocation: WINDOW_BYTES,
+            least_object: Ok(4096),
+            host_node: HostNode::Any,
+            memory: VulkanMemory {
+                luid: None,
+                heaps: vec![VulkanHeap {
+                    bytes: WINDOW_BYTES,
+                    device_local: true,
+                }],
+            },
+            kinds: vec![KindReport {
+                id: 0,
+                name: "bar window".into(),
+                reach: Reach::Mapped {
+                    reads: HostReads::Uncached,
+                },
+                memory: KindMemory::Heap {
+                    index: 0,
+                    device_local: true,
+                    bytes: WINDOW_BYTES,
+                },
+            }],
+        });
+
+        let topology = build(Revision::next(), &reports);
+        let executor = topology
+            .resolve(ExecutorSelector::Vulkan { uuid })
+            .expect("window-only Vulkan executor should be present");
+        assert_eq!(executor.availability(), &Availability::Available);
+        assert!(
+            topology
+                .stores()
+                .iter()
+                .all(|store| !matches!(store.kind(), StoreKind::DeviceMemory(id) if *id == executor.physical())),
+            "a device whose only device-local heap is a BAR window has no own DeviceMemory store"
+        );
+        let host_ram = topology.host_ram().id();
+        let placed_kinds: Vec<_> = topology
+            .kinds()
+            .iter()
+            .filter(|kind| kind.executor() == executor.id())
+            .collect();
+        assert_eq!(placed_kinds.len(), 1, "BAR window kind is placed for Upload");
+        for kind in placed_kinds {
+            for &path_id in kind.paths() {
+                let path = topology.access_path(path_id).expect("path belongs to topology");
+                assert_eq!(path.store(), host_ram, "window kind routes to host_ram");
+                assert!(path.grant().is_none(), "host_ram fallback path is ungranted");
+            }
+        }
+    }
 }

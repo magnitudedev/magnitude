@@ -249,10 +249,26 @@ fn process(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= limit => {
-                // A child not yet waited for can always be killed: one that
-                // has ended meanwhile is killed as a no-op.
-                child.kill().expect("a probe process not yet waited for is killed");
-                return match child.wait() {
+                // If the child exited between `try_wait` and `kill`, Unix
+                // reports `InvalidInput` and Windows may report `PermissionDenied`.
+                match child.kill() {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::PermissionDenied
+                        ) => {}
+                    Err(error) => {
+                        let _ = child.wait();
+                        let _ = output.join();
+                        let _ = report.join();
+                        return Err(failed(format!("stopping its hung process: {error}")));
+                    }
+                }
+                let waited = child.wait();
+                let _ = output.join();
+                let _ = report.join();
+                return match waited {
                     Ok(_) => Err(ProbeFailure::Stopped { probe, after: started.elapsed() }),
                     Err(error) => Err(failed(format!("waiting for its stopped process: {error}"))),
                 };
@@ -269,8 +285,7 @@ fn process(
     };
     let (output, report) = (joined(output, "output")?, joined(report, "error")?);
     // A crash's report can hold a whole compiler log: its end is kept.
-    let report = report.trim();
-    let report = report.get(report.len().saturating_sub(4096)..).unwrap_or(report).to_owned();
+    let report = truncate_report_tail(report.trim(), MAX_REPORT_BYTES).to_owned();
     let mut lines = output.lines();
     let began = lines.next() == Some(PROBING);
     match status.code() {
@@ -287,6 +302,23 @@ fn process(
             None => Err(failed(format!("its process ended with {status}, which is no crash: {report}"))),
         },
     }
+}
+
+/// Maximum bytes retained from the tail of a probe process's stderr report.
+const MAX_REPORT_BYTES: usize = 4096;
+
+/// Retain at most `max_bytes` from the end of `text`, advancing past any
+/// split multi-byte UTF-8 sequence so the result always begins on a character
+/// boundary and never falls back to returning an untruncated log.
+fn truncate_report_tail(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut start = text.len() - max_bytes;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 /// The crash that ended a process of `status`, which a probe keeps as its
@@ -454,5 +486,36 @@ mod tests {
         assert_eq!(reprobed.kept.len(), 3, "and what they keep is stored over the damage");
         assert_eq!(stored::<Probed>(&store, &identity, 1).unrun(), ["thread_registers"]);
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod report_truncation_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_report_tail_handles_utf8_boundaries() {
+        assert_eq!(truncate_report_tail("short", 4096), "short");
+        assert_eq!(truncate_report_tail("abcdef", 4), "cdef");
+
+        // 4-byte UTF-8 characters ('🦀' = 4 bytes) with a 1-byte ASCII suffix so
+        // `len - MAX_REPORT_BYTES` lands inside a multi-byte character.
+        let mut log = String::new();
+        while log.len() <= MAX_REPORT_BYTES + 20 {
+            log.push('🦀');
+        }
+        log.push('y');
+        assert!(!log.is_char_boundary(log.len() - MAX_REPORT_BYTES));
+
+        let truncated = truncate_report_tail(&log, MAX_REPORT_BYTES);
+        assert!(truncated.len() <= MAX_REPORT_BYTES);
+        assert!(truncated.len() > MAX_REPORT_BYTES - 4);
+        assert!(log.ends_with(truncated));
+        assert!(truncated.ends_with('y'));
+        assert!(truncated[..truncated.len() - 1].chars().all(|c| c == '🦀'));
+
+        // Edge case: max_bytes smaller than the final character.
+        assert_eq!(truncate_report_tail("🦀", 2), "");
+        assert_eq!(truncate_report_tail("🦀", 0), "");
     }
 }

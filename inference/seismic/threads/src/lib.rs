@@ -393,9 +393,10 @@ fn install() {
     });
 }
 
-/// A multi-threaded Tokio runtime whose workers and blocking threads have
-/// [`STACK_BYTES`] of stack: every runtime of the process is built here, so
-/// work that blocks on one runs on the owner's stack too. Its threads work
+/// A multi-threaded Tokio runtime whose worker count is [`share`] and whose
+/// workers and blocking threads have [`STACK_BYTES`] of stack: every runtime
+/// of the process is built here, so work that blocks on one runs on the
+/// owner's stack too and respects the process's thread share. Its threads work
 /// for the thread that builds it, which blocks on it: a panic on them ends
 /// as one there would, so within [`main`] a task's panic ends the process
 /// at the panic.
@@ -404,6 +405,7 @@ pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     install();
     let panics = Panics::here();
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(share().get())
         .enable_all()
         .thread_stack_size(STACK_BYTES)
         .on_thread_start(move || PANICS.with(|thread| thread.set(panics)))

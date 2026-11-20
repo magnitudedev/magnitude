@@ -58,7 +58,11 @@ pub fn install() -> anyhow::Result<watch::Receiver<bool>> {
             libc::_exit(91);
         }
         #[cfg(windows)]
-        std::process::exit(91);
+        unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+            TerminateProcess(GetCurrentProcess(), 91);
+            std::process::abort();
+        }
     })
     .context("cannot start ICN parent-channel watchdog")?;
     Ok(receiver)
