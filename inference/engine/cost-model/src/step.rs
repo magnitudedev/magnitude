@@ -42,7 +42,7 @@
 //! read bytes, wrong hints' among them; nor the link's, `K_s` the step's
 //! reads in place and its moves on it.
 
-use crate::expert_lines::{ExpertLines, Hits, Miss, Pass, Site};
+use crate::expert_lines::ExpertLines;
 use crate::lines::ReadLine;
 use std::collections::HashMap;
 
@@ -177,18 +177,45 @@ impl StepInputs<'_> {
         let Some(memory) = lines.host.memory else {
             return (0., 0.);
         };
-        let misses = std::iter::repeat_n(0., load.tier as usize)
-            .chain(std::iter::repeat_n(ready, load.file as usize))
-            .map(|ready_seconds| Miss { rows: load.rows, ready_seconds })
-            .collect::<Vec<_>>();
-        let hits = Hits { experts: (load.routed - misses.len() as f64).max(0.), rows: load.rows };
-        let served = lines.serve(Pass::Decode, &[hits], &misses);
+        let total_misses = load.tier + load.file;
+        let hits_experts = (load.routed - total_misses as f64).max(0.);
+        let hit_ns = hits_experts * lines.gpu.resident.nanoseconds(load.rows);
+        let (mut gpu, mut cpu) = (hit_ns, 0f64);
+        let mut served_cpu = false;
+        let mut link_count = 0u64;
+        if total_misses > 0 {
+            let link_busy = lines.gpu.moves.link.get();
+            let link_ns = lines.gpu.link.nanoseconds(load.rows);
+            let cpu_params = lines.host.cpu.map(|c| (c.expert.nanoseconds(load.rows), c.handshake.get()));
+            // Identical to `ExpertLines::serve(Pass::Decode, ...)` for uniform `load.rows`:
+            // `load.tier` misses ready at 0.0, followed by `load.file` misses ready at `ready`.
+            for (count, ready_ns) in [(load.tier, 0.0), (load.file, ready * 1e9)] {
+                for _ in 0..count {
+                    let on_cpu = cpu_params.map(|(expert_ns, handshake)| {
+                        let h = if served_cpu { 0. } else { handshake };
+                        cpu.max(ready_ns) + expert_ns + h
+                    });
+                    let in_place = gpu.max(ready_ns).max(link_busy) + link_ns;
+                    match on_cpu {
+                        Some(end) if end <= in_place => {
+                            cpu = end;
+                            served_cpu = true;
+                        }
+                        _ => {
+                            gpu = in_place;
+                            link_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let end_seconds = gpu.max(cpu) * 1e-9;
         // Host memory bounds the CPU, the link and the moves together:
         // every miss and every moved record leaves it at `t_ram`.
-        let leave = ((load.tier + load.file) as f64 + lines.gpu.moves.records) * memory.get() * 1e-9;
-        let hit = hits.experts * lines.gpu.resident.nanoseconds(load.rows) * 1e-9;
-        let in_place = served.sites.iter().filter(|&&site| site == Site::Link).count() as f64 * lines.gpu.link.nanoseconds(load.rows);
-        ((served.end_seconds.max(leave) - hit).max(0.), (in_place + lines.gpu.moves.link.get()) * 1e-9)
+        let leave = (total_misses as f64 + lines.gpu.moves.records) * memory.get() * 1e-9;
+        let hit = hit_ns * 1e-9;
+        let in_place = link_count as f64 * lines.gpu.link.nanoseconds(load.rows);
+        ((end_seconds.max(leave) - hit).max(0.), (in_place + lines.gpu.moves.link.get()) * 1e-9)
     }
 
     /// When a layer of `lines` routed at `route` ends: beside a host tier
@@ -369,6 +396,48 @@ impl StepInputs<'_> {
         (self.advance(end, self.head, busy), served_sum, bytes, link_sum)
     }
 
+    /// Allocation-free fast path of [`Self::step`] when nothing reads ahead
+    /// (`self.ahead == ReadAhead::NONE` and every run has `hinted == 0`).
+    fn step_no_ahead(&self, runs: &[LayerRun]) -> (f64, f64, f64, f64) {
+        let layers = runs.iter().map(|run| run.layers).sum::<usize>();
+        assert_eq!(layers, self.lines.len(), "invariant violated: a step's runs are its layers");
+        let tau = (self.compute - self.head) / layers as f64;
+        let mut device = Device::new(self.read);
+        let (mut end, mut served_sum, mut link_sum, mut bytes) = (0f64, 0f64, 0f64, 0f64);
+        let mut first = 0;
+        for run in runs {
+            let lines = &self.lines[first];
+            assert!(self.lines[first..first + run.layers].iter().all(|layer| layer == lines), "invariant violated: a run's layers have one line");
+            first += run.layers;
+            bytes += run.layers as f64 * lines.host.record_bytes as f64 * run.load.file as f64;
+            let mut left = run.layers;
+            while left > 0 {
+                let (route, queued) = (end, device.free - end);
+                let (layer_end, service, link) = self.layer(lines, run.load, route, 0., run.load.file, tau, &mut device, |_| {});
+                (end, left) = (layer_end, left - 1);
+                served_sum += service;
+                link_sum += link;
+                let settled = match run.load.file {
+                    0 => queued <= 0.,
+                    _ => ((device.free - end) - queued).abs() <= SETTLED * end.abs().max(tau),
+                };
+                if settled && left > 0 {
+                    let repeated = left as f64;
+                    let queue = device.free - end;
+                    end += repeated * (layer_end - route);
+                    served_sum += repeated * service;
+                    link_sum += repeated * link;
+                    if run.load.file > 0 {
+                        device.free = end + queue;
+                    }
+                    left = 0;
+                }
+            }
+        }
+        let busy = device.free;
+        (self.advance(end, self.head, busy), served_sum, bytes, link_sum)
+    }
+
     /// A run of `steps`, each its runs of layers run its count of times in a
     /// row: `T`, the slowest of its schedule's, the drive's sustained rate's
     /// and the link's means.
@@ -383,13 +452,25 @@ impl StepInputs<'_> {
     pub fn run<'s>(&self, steps: impl IntoIterator<Item = (&'s [LayerRun], usize)>) -> StepTime {
         let steps = steps.into_iter().collect::<Vec<_>>();
         let ahead = self.ahead != ReadAhead::NONE || steps.iter().any(|(runs, _)| runs.iter().any(|run| run.load.recall != 0.));
+        if !ahead {
+            let mut seen = HashMap::<RunKey<'s>, usize>::with_capacity(steps.len());
+            let mut unique = Vec::<(&'s [LayerRun], usize)>::with_capacity(steps.len());
+            for (runs, count) in steps {
+                let key = RunKey(runs);
+                match seen.get(&key) {
+                    Some(&at) => unique[at].1 += count,
+                    None => {
+                        seen.insert(key, unique.len());
+                        unique.push((runs, count));
+                    }
+                }
+            }
+            return self.mean(unique.into_iter().map(|(runs, count)| (self.step_no_ahead(runs), count)));
+        }
         let steps = steps
             .into_iter()
             .map(|(runs, count)| {
-                let runs = match ahead {
-                    true => runs.iter().flat_map(|run| std::iter::repeat_n(LayerRun { load: run.load, layers: 1 }, run.layers)).collect(),
-                    false => runs.to_vec(),
-                };
+                let runs = runs.iter().flat_map(|run| std::iter::repeat_n(LayerRun { load: run.load, layers: 1 }, run.layers)).collect::<Vec<_>>();
                 (runs, count)
             })
             .collect::<Vec<_>>();
@@ -401,10 +482,7 @@ impl StepInputs<'_> {
                 false => (*count, 1),
             };
             for _ in 0..rounds {
-                let hinted = match ahead {
-                    true => Self::hinted(runs, &mut carried),
-                    false => vec![0; runs.len()],
-                };
+                let hinted = Self::hinted(runs, &mut carried);
                 let key = (runs.iter().zip(&hinted))
                     .map(|(run, &hinted)| [run.load.routed.to_bits(), run.load.rows.to_bits(), run.load.tier, run.load.file, run.load.recall.to_bits(), run.layers as u64, hinted])
                     .collect::<Vec<_>>();
@@ -441,6 +519,41 @@ impl StepInputs<'_> {
     }
 }
 
+/// Zero-allocation hash/equality key over a step's `&[LayerRun]` when nothing
+/// reads ahead (bit-exact match to the `[u64; 7]` key with `hinted = 0`).
+#[derive(Clone, Copy)]
+struct RunKey<'a>(&'a [LayerRun]);
+
+impl PartialEq for RunKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().zip(other.0).all(|(a, b)| {
+                a.layers == b.layers
+                    && a.load.tier == b.load.tier
+                    && a.load.file == b.load.file
+                    && a.load.routed.to_bits() == b.load.routed.to_bits()
+                    && a.load.rows.to_bits() == b.load.rows.to_bits()
+                    && a.load.recall.to_bits() == b.load.recall.to_bits()
+            })
+    }
+}
+
+impl Eq for RunKey<'_> {}
+
+impl std::hash::Hash for RunKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for run in self.0 {
+            run.load.routed.to_bits().hash(state);
+            run.load.rows.to_bits().hash(state);
+            run.load.tier.hash(state);
+            run.load.file.hash(state);
+            run.load.recall.to_bits().hash(state);
+            run.layers.hash(state);
+        }
+    }
+}
+
 /// `items`' distinct ones by their key, each with its counts summed, in the
 /// order first seen: what a run prices each of once.
 fn distinct<K: std::hash::Hash + Eq, T>(items: impl IntoIterator<Item = (K, T, usize)>) -> Vec<(T, usize)> {
@@ -461,7 +574,7 @@ fn distinct<K: std::hash::Hash + Eq, T>(items: impl IntoIterator<Item = (K, T, u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expert_lines::{GpuLines, HostLines, LandingLine, Moves, Nanoseconds, PassLine};
+    use crate::expert_lines::{GpuLines, Hits, HostLines, LandingLine, Miss, Moves, Nanoseconds, Pass, PassLine, Site};
     use crate::lines::{FileLine, RecordLine};
 
     /// A record alone in 1 ms at 2 GB/s: 2 MB records, `λ` 0.

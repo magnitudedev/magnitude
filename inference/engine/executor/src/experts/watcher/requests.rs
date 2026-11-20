@@ -340,11 +340,11 @@ impl Requests {
 
     /// Whether the device's words are polled while a step runs: where kernels
     /// wait in place, while a step runs that may ask anything (with every
-    /// layer whole a decode step asks nothing, no miss and no hint, but a
+    /// layer resolved a decode step asks nothing, no miss and no hint, but a
     /// prompt group's requests may come).
     fn polls(&self, residency: &Residency) -> bool {
         let steps = &self.shared.steps;
-        !self.shared.parks.kept && steps.in_flight() > 0 && (!residency.whole() || steps.scratch_running())
+        !self.shared.parks.kept && steps.in_flight() > 0 && (!residency.resolved() || steps.scratch_running())
     }
 
     /// One pass: the misses waiting resumed, the conveyor carried, then

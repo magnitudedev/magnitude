@@ -762,13 +762,15 @@ impl TierCopyCosts {
 
     /// The batches of one `bytes`-byte record each the transfer queue keeps
     /// in flight so it never idles between them: one running, and enough
-    /// behind it to cover a batch's latency at the queue's rate,
-    /// `1 + ⌈λ / (b · s)⌉` ([`Self::transfer`]). A due copy then waits
-    /// behind at most that many records.
+    /// behind it to cover a batch's latency at the queue's rate, at least 2
+    /// so double-buffering always keeps a batch queued behind the running DMA
+    /// transfer to hide host wakeup latency,
+    /// `max(2, 1 + ⌈λ / (b · s)⌉)` ([`Self::transfer`]). A due copy then
+    /// waits behind at most that many records.
     pub fn depth(&self, bytes: u64) -> usize {
         let record = self.transfer.transfer_seconds(bytes as f64);
         assert!(record > 0., "a record of {bytes} bytes crosses the transfer queue in no time");
-        1 + (self.transfer.latency_seconds() / record).ceil() as usize
+        (1 + (self.transfer.latency_seconds() / record).ceil() as usize).max(2)
     }
 }
 
@@ -1723,7 +1725,7 @@ mod tests {
     fn the_transfer_queues_depth_covers_its_latency() {
         let costs = |latency: f64| TierCopyCosts { blocks: 2, whole_seconds: 1e-3, stall_share: 0., transfer: ReadLine::new(latency, 1. / 12e9).unwrap(), back: ReadLine::new(latency, 1. / 12e9).unwrap() };
         assert_eq!(costs(90e-6).depth(3_000_000), 2);
-        assert_eq!(costs(0.).depth(3_000_000), 1, "no latency to cover: one at a time keeps it busy");
+        assert_eq!(costs(0.).depth(3_000_000), 2, "always keeps at least one queued behind the running transfer");
         assert_eq!(costs(300e-6).depth(3_000_000), 3);
     }
 

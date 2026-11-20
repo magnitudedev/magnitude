@@ -348,18 +348,34 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// A kind whose figures are not priced yet keeps the ledger's value of a
     /// new entry.
     pub fn value_cache(&mut self, prefix: Option<(u64, u64)>) -> Result<(), DomainError> {
-        let price = self.decode_price()?;
-        if let (Some(bank), Some(price), Some(held), Some(plan)) = (self.family.expert_bank(), price.as_ref(), self.held_slots()?, self.expert_bank_plan()) {
-            let floor = usize::try_from(plan.floor()).expect("invariant violated: a bank's slots exceed the host's");
-            let saved = price.step(magnitude_cost_model::HeldSlots { slots: floor.min(held.slots), ..held }).total_seconds - price.step(held).total_seconds;
-            // A bank at its floor holds no cache to value.
-            if let Some(bytes) = std::num::NonZeroU64::new(self.resources.ledgers().device().estimate().cache_of(CacheKind::Bank)) {
+        // A bank at its floor holds no cache to value; check before pricing the step.
+        let mut held_step_seconds = None;
+        if let (Some(bytes), Some(bank), Some(plan)) = (
+            std::num::NonZeroU64::new(self.resources.ledgers().device().estimate().cache_of(CacheKind::Bank)),
+            self.family.expert_bank(),
+            self.expert_bank_plan(),
+        ) {
+            if let (Some(price), Some(held)) = (self.decode_price()?, self.held_slots()?) {
+                let floor = usize::try_from(plan.floor()).expect("invariant violated: a bank's slots exceed the host's");
+                let saved = if floor.min(held.slots) == held.slots {
+                    0.0
+                } else {
+                    let at_held = price.step(held).total_seconds;
+                    held_step_seconds = Some(at_held);
+                    price.step(magnitude_cost_model::HeldSlots { slots: floor, ..held }).total_seconds - at_held
+                };
                 bank.value(Value::recompute(saved.max(0.0), self.served.decode_steps, bytes));
             }
         }
-        if let (Some(rates), Some((tokens, hits)), Some(bytes)) = (self.serving_prior()?, prefix, std::num::NonZeroU64::new(self.retained_entry_bytes())) {
-            let seconds = tokens as f64 / rates.prefill_tokens_per_s;
-            self.state_slabs.value_prefix(Value::recompute(seconds, hits, bytes));
+        if let (Some((tokens, hits)), Some(bytes)) = (prefix, std::num::NonZeroU64::new(self.retained_entry_bytes())) {
+            let rates = match held_step_seconds {
+                Some(seconds) => self.serving_prior_at(Some(seconds))?,
+                None => self.serving_prior()?,
+            };
+            if let Some(rates) = rates {
+                let seconds = tokens as f64 / rates.prefill_tokens_per_s;
+                self.state_slabs.value_prefix(Value::recompute(seconds, hits, bytes));
+            }
         }
         if let Some(read) = self.expert_measures().and_then(|measures| measures.read.measured().copied()) {
             let served = self.served;
@@ -541,6 +557,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// step until the load serves its own. None before the load's step is
     /// measured.
     pub fn serving_prior(&self) -> Result<Option<WorkloadRates>, DomainError> {
+        if self.launch_prices().is_none() {
+            return Ok(None);
+        }
+        let priced = match self.family.expert_bank() {
+            Some(_) => self.decode_price()?.zip(self.held_slots()?).map(|(price, held)| price.step(held).total_seconds),
+            None => None,
+        };
+        self.serving_prior_at(priced)
+    }
+
+    fn serving_prior_at(&self, priced: Option<f64>) -> Result<Option<WorkloadRates>, DomainError> {
         let Some(prices) = self.launch_prices() else {
             return Ok(None);
         };
@@ -550,10 +577,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .launch(rows, depth)
                 .map(|forms| forms.resident)
                 .map_err(|error| DomainError::invariant(format!("the decode step: {error}")))
-        };
-        let priced = match self.family.expert_bank() {
-            Some(_) => self.decode_price()?.zip(self.held_slots()?).map(|(price, held)| price.step(held).total_seconds),
-            None => None,
         };
         let step_seconds = match priced {
             Some(seconds) => seconds,
@@ -603,6 +626,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .filter(|queued| queued.iter().map(|(request, _)| request).collect::<std::collections::BTreeSet<_>>() == launched)
         {
             return Ok(crate::FrontPass::Claim(queued.into_iter().collect()));
+        }
+        if fronted.is_empty() {
+            return Ok(crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() });
         }
         Ok(match self.two_row_pricing()? {
             Some(pricing) => pricing.built(requests, fronted)?,

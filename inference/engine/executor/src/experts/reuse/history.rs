@@ -109,10 +109,15 @@ struct Measure {
     pools: Vec<Pool>,
     pooled: Vec<Vec<bool>>,
     pooled_misses: u64,
+    /// Pre-allocated scratch buffers (fixed capacity `max_experts`, zero per-call allocs).
+    scratch_held: Vec<usize>,
+    scratch_lacked: Vec<usize>,
+    scratch_entering: Vec<usize>,
 }
 
 impl Measure {
     fn new(half_life: f64, experts: &[usize], groups: &[usize], records: &[usize]) -> Self {
+        let max_experts = experts.iter().copied().max().unwrap_or(0);
         Self {
             half_life,
             layers: experts.iter().map(|&n| vec![Logged::NONE; n]).collect(),
@@ -124,6 +129,9 @@ impl Measure {
             pools: records.iter().map(|&cap| Pool { records: cap, held: BTreeSet::new() }).collect(),
             pooled: experts.iter().map(|&n| vec![false; n]).collect(),
             pooled_misses: 0,
+            scratch_held: Vec::with_capacity(max_experts),
+            scratch_lacked: Vec::with_capacity(max_experts),
+            scratch_entering: Vec::with_capacity(max_experts),
         }
     }
 
@@ -152,25 +160,42 @@ impl Measure {
         stack.iter().position(|&above| above == expert).unwrap_or(self.layers[layer].len())
     }
 
-    fn entering(&self, layer: usize, experts: &[usize]) -> Vec<usize> {
-        let mut entering = experts.to_vec();
-        entering.sort_by_key(|&expert| self.rank(layer, expert));
-        entering
+    fn fill_entering(&mut self, layer: usize, experts: &[usize]) {
+        self.scratch_entering.clear();
+        self.scratch_entering.extend_from_slice(experts);
+        let layer_logged = &self.layers[layer];
+        self.scratch_entering.sort_by_key(|&expert| {
+            let Logged { score, last, order } = layer_logged[expert];
+            HistoryRank { score, last, order }
+        });
     }
 
     fn read_decode(&mut self, layer: usize, step: Step, experts: &[usize], slots: usize) {
         let group = self.groups[layer];
-        let depths: Vec<usize> = experts.iter().map(|&expert| self.depth(layer, expert)).collect();
-        let (held, lacked): (Vec<usize>, Vec<usize>) =
-            experts.iter().partition(|&&expert| self.pooled[layer][expert]);
-        self.misses += depths.iter().filter(|&&depth| depth >= slots).count() as u64;
-        self.pooled_misses += lacked.len() as u64;
+        let mut misses = 0u64;
+        self.scratch_held.clear();
+        self.scratch_lacked.clear();
+        for &expert in experts {
+            if self.depth(layer, expert) >= slots {
+                misses += 1;
+            }
+            if self.pooled[layer][expert] {
+                self.scratch_held.push(expert);
+            } else {
+                self.scratch_lacked.push(expert);
+            }
+        }
+        self.misses += misses;
+        self.pooled_misses += self.scratch_lacked.len() as u64;
 
-        for &expert in &held {
+        for i in 0..self.scratch_held.len() {
+            let expert = self.scratch_held[i];
             let place = self.pooled_rank(layer, expert);
             self.pools[group].held.remove(&place);
         }
-        for expert in self.entering(layer, experts) {
+        self.fill_entering(layer, experts);
+        for i in 0..self.scratch_entering.len() {
+            let expert = self.scratch_entering[i];
             self.logged += 1;
             self.layers[layer][expert].order = self.logged;
         }
@@ -181,15 +206,21 @@ impl Measure {
             logged.score = logged.score.sum(now, self.half_life);
             logged.last = logged.last.max(Some(step));
         }
-        for &expert in &held {
+        for i in 0..self.scratch_held.len() {
+            let expert = self.scratch_held[i];
             let place = self.pooled_rank(layer, expert);
             self.pools[group].held.insert(place);
         }
-        let entering = self.entering(layer, experts);
-        for &expert in &entering {
+        self.fill_entering(layer, experts);
+        for i in 0..self.scratch_entering.len() {
+            let expert = self.scratch_entering[i];
             self.promote(layer, expert);
         }
-        for expert in entering.into_iter().filter(|expert| lacked.contains(expert)) {
+        for i in 0..self.scratch_entering.len() {
+            let expert = self.scratch_entering[i];
+            if !self.scratch_lacked.contains(&expert) {
+                continue;
+            }
             let pool = &mut self.pools[group];
             if pool.held.len() >= pool.records {
                 let Some((.., of, victim)) = pool.held.pop_first() else {
@@ -261,7 +292,8 @@ impl Measure {
         let groups = self.groups.capacity() * size_of::<usize>();
         let pools: usize = self.pools.iter().map(|p| p.records * size_of::<Pooled>()).sum();
         let pooled: usize = self.pooled.iter().map(|p| p.capacity() * size_of::<bool>()).sum();
-        (size_of::<Self>() + layers + steps + stacks + groups + pools + pooled) as u64
+        let scratch = (self.scratch_held.capacity() + self.scratch_lacked.capacity() + self.scratch_entering.capacity()) * size_of::<usize>();
+        (size_of::<Self>() + layers + steps + stacks + groups + pools + pooled + scratch) as u64
     }
 }
 

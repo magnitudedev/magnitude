@@ -20,7 +20,7 @@ use super::super::directory::RoutedRead;
 use super::super::horizon::{self, Advance, Horizon, Reader, Tier, Tokens};
 use super::super::watcher::Step;
 use super::super::DEPTHS;
-use super::calibration::Calibration;
+use super::calibration::{Calibration, ShadowScratch};
 use super::history::History;
 use super::{Evidence, Pools, Rows};
 
@@ -277,12 +277,15 @@ pub(crate) struct Shadows {
     /// Pending and latest completed A9 re-entry comparison per `(form, depth)`.
     pending_reentry: [[Option<PendingReentry>; DEPTHS]; 2],
     reentries: [[Option<Reentry>; DEPTHS]; 2],
+    /// Fixed-size scratch buffers reused across layers/steps in `prepare_shadow`.
+    scratch: ShadowScratch,
 }
 
 impl Shadows {
     pub(crate) fn new(experts: &[usize], groups: &[usize], records: &[usize]) -> Self {
         assert_eq!(experts.len(), groups.len(), "each layer has a group");
         assert!(groups.iter().all(|&group| group < records.len()), "group out of range");
+        let max_experts = experts.iter().copied().max().unwrap_or(0);
         Self {
             layers: experts.iter().map(|&count| Calibration::new_shadow(count, 1, 0)).collect(),
             history: History::new(experts, groups, records),
@@ -293,6 +296,7 @@ impl Shadows {
             last_executed: None,
             pending_reentry: [[None; DEPTHS]; 2],
             reentries: [[None; DEPTHS]; 2],
+            scratch: ShadowScratch::new(max_experts),
         }
     }
 
@@ -392,7 +396,7 @@ impl Shadows {
     pub(super) fn bytes(&self) -> u64 {
         let calibration: u64 = self.layers.iter().map(Calibration::bytes).sum();
         let pools: u64 = self.depths.iter().map(|shadow| shadow.pools.bytes()).sum();
-        std::mem::size_of::<Self>() as u64 + calibration + self.history.bytes() + pools
+        std::mem::size_of::<Self>() as u64 + calibration + self.history.bytes() + pools + self.scratch.bytes()
     }
 
     fn finalize_reentry(&mut self, form: usize, depth: usize) {
@@ -569,7 +573,7 @@ impl Shadows {
                 })
                 .collect();
 
-            let prepared = self.layers[layer].prepare_shadow(&truths, cal_epoch, &self.history, layer);
+            let prepared = self.layers[layer].prepare_shadow(&mut self.scratch, &truths, cal_epoch, &self.history, layer);
             for (depth, shadow) in self.depths.iter_mut().enumerate() {
                 let (horizon, a_bar) = step_params[depth][group];
                 let lacked = if shadow.pools.records[group] == 0 {
@@ -615,7 +619,7 @@ impl Shadows {
                 &self.history,
                 layer,
             );
-            let prepared = self.layers[layer].prepare_shadow(&[], cal_epoch, &self.history, layer);
+            let prepared = self.layers[layer].prepare_shadow(&mut self.scratch, &[], cal_epoch, &self.history, layer);
             for (depth, shadow) in self.depths.iter_mut().enumerate() {
                 if shadow.pools.records[group] == 0 {
                     continue;

@@ -671,6 +671,12 @@ pub(super) fn lending_windowed(
     // discrete load's do: one record at a time, its latency none.
     let transfer = magnitude_cost_model::ReadLine::new(0., 1e-10).unwrap();
     watcher.shared().price_copy(&crate::assessment::TierCopyCosts { blocks: 1, whole_seconds: 1e-3, stall_share: 0., transfer, back: transfer });
+    {
+        let mut state = residency::lock(&watcher.state);
+        for layer in 0..state.core.layers.len() {
+            state.core.directory.price_copies(layer, Some(0.));
+        }
+    }
     Harness {
         _pool: (!ALONE.get()).then(|| POOL.read().unwrap_or_else(std::sync::PoisonError::into_inner)),
         watcher,

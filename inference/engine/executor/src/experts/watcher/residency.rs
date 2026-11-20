@@ -724,10 +724,12 @@ impl Residency {
         )
     }
 
-    /// Whether every layer is whole as last published: nothing a decode
-    /// step runs then asks anything (no miss, no hint).
-    pub(super) fn whole(&self) -> bool {
-        (0..self.core.layers.len()).all(|layer| self.shared.telemetry.is_whole(layer))
+    /// Whether every layer is resolved as last published: every expert is
+    /// held in the bank or settled in the host tier, so nothing a decode
+    /// step runs then asks anything (no miss, no hint). Reads the single
+    /// published `POLICY_RESOLVED` word directly.
+    pub(super) fn resolved(&self) -> bool {
+        self.core.layers.iter().all(|layer| layer.policy.load(constants::POLICY_RESOLVED as usize) != 0)
     }
 
     /// Each group's host tier records `views` address from now (a shrink's,

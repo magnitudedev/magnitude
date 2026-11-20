@@ -14,7 +14,7 @@ use crate::experts::Words;
 use crate::experts::directory::{CountedLaunch, Point, RoutedRead, Stack};
 use crate::experts::horizon::Time;
 use crate::experts::interest::{Accepted, Basis, Chosen, Cohort, Judged, Resolved, Source, Spent, Stands};
-use crate::experts::reuse::{Ranking, Shadows, StepKeys};
+use crate::experts::reuse::{Gap, Ranking, Shadows, StepKeys};
 use crate::planning::RegionWords;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1074,6 +1074,35 @@ struct Recorded {
     records: Vec<usize>,
 }
 
+/// One completed decode step's measured misses per token queued for
+/// `Shadows::executed` on `expert-residenc` without blocking `magnitude-main`.
+struct ExecutedStep {
+    verifies: bool,
+    depth: usize,
+    real: f64,
+    epoch: u64,
+    now: crate::experts::horizon::Tokens,
+}
+
+/// Short-locked bridge between `magnitude-main` and `Shadows` on
+/// `expert-residenc`: never held during `Shadows::step()`, so `complete_step`,
+/// `verify_executed`, and `measured` never block behind shadow stepping.
+struct ShadowState {
+    pending_verify: Option<(Step, usize, f64)>,
+    pending_executed: Vec<ExecutedStep>,
+    gaps: [[Option<Gap>; DEPTHS]; 2],
+}
+
+impl Default for ShadowState {
+    fn default() -> Self {
+        Self {
+            pending_verify: None,
+            pending_executed: Vec::new(),
+            gaps: [[None; DEPTHS]; 2],
+        }
+    }
+}
+
 /// What serving and steps record of the load, and the routing they read.
 pub(super) struct Telemetry {
     routing: Routing,
@@ -1101,12 +1130,17 @@ pub(super) struct Telemetry {
     /// readers read what each feed publishes (`Recorded::ranked`), not the
     /// stack. Taken before `recorded`, never while holding it.
     stack: Mutex<Stack>,
-    /// The ranking's shadows at every depth of foresight, plus any completed
-    /// verify step `(step, depth, missed_total)` waiting on its verdicts'
-    /// emitted token count ([`Self::verify_executed`]), under a lock of their
-    /// own, never held with another but the ranking's as they take the log
-    /// ([`Self::shadow`]).
-    shadows: Mutex<(Shadows, Option<(Step, usize, f64)>)>,
+    /// The ranking's shadows at every depth of foresight, lazily allocated on
+    /// `expert-residenc` once a caller asks for regime pricing (`measured`),
+    /// under a lock only `Telemetry::shadow` ever acquires.
+    shadows: Mutex<Option<Shadows>>,
+    /// Whether any caller has asked for regime pricing (`measured`): while
+    /// false (e.g. plain decode with no fronting), shadows neither allocate
+    /// nor step.
+    shadows_needed: AtomicBool,
+    /// Short-locked queue of executed-step observations and latest published
+    /// shadow gaps, decoupling `magnitude-main` from `self.shadows`.
+    shadow_state: Mutex<ShadowState>,
     /// Per layer, whether it is whole: every expert held at its home, so
     /// it has no reads of a decode step (its routing record, which its
     /// route writes beside its keys, is a trace's alone)
@@ -1250,11 +1284,10 @@ impl Telemetry {
     ) -> Self {
         let groups = layers.iter().map(|layer| layer.group + 1).max().unwrap_or(0);
         let looked = vec![seismic_io::Totals::default(); volumes.len()];
-        let (shadows, (horizon, stands)) = {
-            let mut reuse = crate::experts::reuse::Reuse::of(&ranking);
-            (reuse.shadows(), reuse.rates())
-        };
-        let shadows = Mutex::new((shadows, None));
+        let (horizon, stands) = crate::experts::reuse::Reuse::of(&ranking).rates();
+        let shadows = Mutex::new(None);
+        let shadows_needed = AtomicBool::new(false);
+        let shadow_state = Mutex::new(ShadowState::default());
         let stack = Stack::new(ranking.clone(), layers.len(), extents.widest);
         Self {
             keys: super::routes::KeyRecords::of(layers, extents.words, extents.selected),
@@ -1320,6 +1353,8 @@ impl Telemetry {
             slots,
             stack: Mutex::new(stack),
             shadows,
+            shadows_needed,
+            shadow_state,
             whole: layers.iter().map(|_| AtomicBool::new(false)).collect(),
             feedable: AtomicU64::new(0),
             #[cfg(test)]
@@ -1913,9 +1948,9 @@ impl Telemetry {
                         served,
                         routed,
                     });
-                    if depth < DEPTHS && pass_rows > 0 {
+                    if depth < DEPTHS && pass_rows > 0 && self.shadows_needed.load(Ordering::Acquire) {
                         if launch.verifies() {
-                            self.shadows.lock().expect("watcher telemetry shadows").1 = Some((sequence, depth, missed_total));
+                            self.shadow_state.lock().expect("watcher telemetry shadow state").pending_verify = Some((sequence, depth, missed_total));
                         } else {
                             let (epoch, now) = {
                                 let times = self.horizon.lock();
@@ -1924,7 +1959,13 @@ impl Telemetry {
                             // Plain and front passes emit 1.0 token per step on
                             // the clock (`Advance::Known(1.0)`), matching
                             // `Shadows::step`'s denominator.
-                            self.record_executed(false, depth, missed_total, epoch, now);
+                            self.shadow_state.lock().expect("watcher telemetry shadow state").pending_executed.push(ExecutedStep {
+                                verifies: false,
+                                depth,
+                                real: missed_total,
+                                epoch,
+                                now,
+                            });
                         }
                     }
                     if launch.front != 0 {
@@ -2372,11 +2413,10 @@ impl Telemetry {
     /// guesses' stand rates as their one owner holds them; none before a
     /// decode pass is timed.
     pub(super) fn measured(&self) -> Option<Measured> {
-        let (epoch, now) = {
-            let times = self.horizon.lock();
-            (times.bank_epoch(), times.clock.through_latest())
-        };
-        let gaps = self.shadows.lock().expect("watcher telemetry shadows").0.gaps(epoch, now);
+        if !self.shadows_needed.swap(true, Ordering::AcqRel) {
+            crate::experts::reuse::Reuse::of(&self.ranking).enable_shadows();
+        }
+        let gaps = self.shadow_state.lock().expect("watcher telemetry shadow state").gaps;
         let needed = gaps.map(|form| {
             form.map(|gap| {
                 gap.map(|gap| match gap.delta {
@@ -2400,35 +2440,32 @@ impl Telemetry {
         measured
     }
 
-    /// Record a completed step's measured misses a token into its `(form, depth)`'s
-    /// shadow gap `Δ_{form, depth}`, and log any completed A9 re-entry comparison.
-    fn record_executed(&self, verifies: bool, depth: usize, real: f64, epoch: u64, now: crate::experts::horizon::Tokens) {
-        let reentries = {
-            let mut shadowing = self.shadows.lock().expect("watcher telemetry shadows");
-            shadowing.0.executed(verifies, depth, real, epoch, now);
-            shadowing.0.take_reentries()
-        };
-        for reentry in reentries {
-            tracing::info!("{reentry}");
-        }
-    }
-
     /// A verify step's verdicts are all in (`emitted`: mean tokens emitted per
-    /// request, `1 + accepted / requests`): count its `Δ_{verify, depth}` with
-    /// the same per-token denominator as `Shadows::step`.
+    /// request, `1 + accepted / requests`): queue its `Δ_{verify, depth}` with
+    /// the same per-token denominator as `Shadows::step`, without blocking on
+    /// `self.shadows`.
     pub(super) fn verify_executed(&self, step: Step, emitted: f64) {
+        if !self.shadows_needed.load(Ordering::Acquire) {
+            return;
+        }
         let pending = self
-            .shadows
+            .shadow_state
             .lock()
-            .expect("watcher telemetry shadows")
-            .1
+            .expect("watcher telemetry shadow state")
+            .pending_verify
             .take_if(|(pending_step, ..)| *pending_step == step);
         if let Some((_, depth, missed_total)) = pending {
             let (epoch, now) = {
                 let times = self.horizon.lock();
                 (times.bank_epoch(), times.clock.through_latest())
             };
-            self.record_executed(true, depth, missed_total / emitted, epoch, now);
+            self.shadow_state.lock().expect("watcher telemetry shadow state").pending_executed.push(ExecutedStep {
+                verifies: true,
+                depth,
+                real: missed_total / emitted,
+                epoch,
+                now,
+            });
         }
     }
 
@@ -2452,13 +2489,44 @@ impl Telemetry {
     }
 
     /// The ranking's shadows read what it logged for them
-    /// (`Shadows::read_log`): a step's reads at every depth of foresight,
-    /// its front rows' among them, on the thread that calls it, holding the
-    /// ranking only to take them.
+    /// (`Shadows::read_log`) and drain any executed-step observations queued
+    /// by `magnitude-main`, publishing the updated shadow gaps snapshot into
+    /// `shadow_state` so `magnitude-main` never blocks on `self.shadows`.
+    /// No-op until a caller asks for regime pricing (`measured`).
     pub(super) fn shadow(&self) {
-        let mut shadowing = self.shadows.lock().expect("watcher telemetry shadows");
-        let fed = crate::experts::reuse::Reuse::of(&self.ranking).take_shadowed();
-        shadowing.0.read_log(fed);
+        if !self.shadows_needed.load(Ordering::Acquire) {
+            return;
+        }
+        let reentries = {
+            let mut guard = self.shadows.lock().expect("watcher telemetry shadows");
+            let fed = {
+                let mut reuse = crate::experts::reuse::Reuse::of(&self.ranking);
+                if guard.is_none() {
+                    *guard = Some(reuse.build_shadows());
+                }
+                reuse.take_shadowed()
+            };
+            let executed = std::mem::take(&mut self.shadow_state.lock().expect("watcher telemetry shadow state").pending_executed);
+            if fed.is_empty() && executed.is_empty() {
+                return;
+            }
+            let shadows = guard.as_mut().expect("shadows initialized");
+            shadows.read_log(fed);
+            for ev in executed {
+                shadows.executed(ev.verifies, ev.depth, ev.real, ev.epoch, ev.now);
+            }
+            let reentries = shadows.take_reentries();
+            let (epoch, now) = {
+                let times = self.horizon.lock();
+                (times.bank_epoch(), times.clock.through_latest())
+            };
+            let gaps = shadows.gaps(epoch, now);
+            self.shadow_state.lock().expect("watcher telemetry shadow state").gaps = gaps;
+            reentries
+        };
+        for reentry in reentries {
+            tracing::info!("{reentry}");
+        }
     }
 
     /// The predicted interests a completed decode step resolved

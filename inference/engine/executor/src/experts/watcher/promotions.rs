@@ -182,10 +182,10 @@ impl Promotions {
         if let Some(decoded) = decoded {
             self.size(core, decoded);
         }
-        if line(core, shared).is_none() {
+        let Some(copy) = line(core, shared) else {
             return false;
-        }
-        let asked = !held && self.ask(core, shared);
+        };
+        let asked = !held && self.ask(core, shared, copier, &copy);
         asked | carry(core, shared, copier, prefetch.reached())
     }
 
@@ -220,13 +220,25 @@ impl Promotions {
         }
     }
 
-    /// What the ranking asks now (`Directory::promotions`): each promotion
+    /// What the ranking asks now (`Directory::promotions`), capped to the
+    /// copy engine's remaining in-flight headroom: each promotion
     /// to copy, and each release's expert unmapped from the first step not
     /// yet begun, its wait in steps measured. Whether it asked any. The
     /// ranking's changes settle first, outside the steps' lock, and a turn
     /// that stirred nothing (no want, record or lease changed) takes no
     /// steps' lock.
-    fn ask(&mut self, core: &mut Core, shared: &Shared) -> bool {
+    fn ask(&mut self, core: &mut Core, shared: &Shared, copier: &Copier, copy: &TierCopyCosts) -> bool {
+        let max_depth = record_bytes(core)
+            .into_iter()
+            .filter(|&bytes| bytes > 0)
+            .map(|bytes| copy.depth(bytes))
+            .max()
+            .unwrap_or(0);
+        let pending = copier.copies.flight() + core.directory.queued().len() + core.directory.backs_queued().len();
+        let budget = max_depth.saturating_sub(pending);
+        if budget == 0 && !core.directory.has_surrenders() {
+            return false;
+        }
         if !core.directory.settle_changes() {
             return false;
         }
@@ -235,7 +247,7 @@ impl Promotions {
         // the first step not yet begun.
         let (directory, drained) = (&mut core.directory, &mut self.drained);
         let asked = core.steps.unbegun_beside_frontier(|frontier, at| {
-            let asked = directory.promotions(at);
+            let asked = directory.promotions(at, budget);
             if decoding {
                 let releases = asked.releases.len() as u64;
                 *drained = (drained.0 + releases * (at.next() - frontier), drained.1 + releases);
@@ -325,9 +337,10 @@ pub(super) fn carry(core: &mut Core, shared: &Shared, copier: &Copier, progress:
     // The releases no step still reads.
     moved |= core.directory.drain(progress, &core.steps);
     let mut queued = core.directory.queued();
-    // A queued promotion whose tier record is gone copies nothing.
+    // A queued promotion whose tier record is gone, or whose expert dropped
+    // out of the ranking's pool meanwhile, copies nothing.
     queued.retain(|&(group, record, (layer, expert))| {
-        let kept = core.directory.tier_record(layer, expert).is_some();
+        let kept = core.directory.tier_record(layer, expert).is_some() && core.directory.reuse_now().in_top(layer, expert);
         if !kept {
             core.directory.unpromoted(group, record);
             moved = true;

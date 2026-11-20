@@ -1044,9 +1044,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     fn at_chain_depths(&self, operations: Vec<Operation>) -> Result<Option<Vec<Operation>>, DomainError> {
         let requests = operations.len();
         let reaching = operations.iter().filter(|operation| operation.front_rows() > 0).count();
-        let regime = match self.two_row_pricing()? {
-            Some(pricing) => pricing.regime(requests, reaching)?,
-            None => None,
+        let regime = if reaching == 0 {
+            None
+        } else {
+            match self.two_row_pricing()? {
+                Some(pricing) => pricing.regime(requests, reaching)?,
+                None => None,
+            }
         };
         let depth = match regime {
             Some(FrontRegime { pass: magnitude_cost_model::Form::Verify(_), .. }) => return Ok(None),
