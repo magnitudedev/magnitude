@@ -5,8 +5,8 @@
 //! Launch costs are a table. The controller and each fixed width decode the
 //! same stream, so their total times compare directly.
 
-use super::{DraftController, DraftLoad, RoundChoice, TimedLaunch};
-use magnitude_executor::{LaunchDuration, TokenId};
+use super::{DraftController, DraftLoad, RoundChoice, RoundCosts, TimedLaunch};
+use magnitude_executor::{LaunchDuration, StreamedVerifyPrior, TokenId};
 use std::{sync::Arc, time::Duration};
 
 /// `duration`, measured with no cover read beside it.
@@ -1065,6 +1065,8 @@ fn a_width_held_up_on_its_first_launch_is_taken_again() {
             look_seconds: std::sync::Mutex::new(*warm.look_seconds.lock().unwrap()),
             plain_seconds: std::sync::Mutex::new(*warm.plain_seconds.lock().unwrap()),
             beside_cover: std::sync::Mutex::new(*warm.beside_cover.lock().unwrap()),
+            bank_epoch: std::sync::Mutex::new(*warm.bank_epoch.lock().unwrap()),
+            verify_prior: std::sync::Mutex::new(warm.verify_prior.lock().unwrap().clone()),
         });
         let round = std::cell::Cell::new(0usize);
         let run = adaptive_on(&stream, SHORT, &load, class - 50, |position| {
@@ -1603,4 +1605,110 @@ fn draft_load_costs_stays_bounded_across_many_context_and_sequence_buckets() {
     );
     // Most recently measured bucket is still retained.
     assert!(load.costs.lock().unwrap().contains_key(&(1 << 9, 20)));
+}
+
+#[test]
+fn streamed_verify_prior_avoids_blind_widest_first_probing_and_larger_clamp() {
+    // Without a streamed prior, cold-start picks the widest width.
+    let unbanked = Arc::new(DraftLoad::default());
+    let mut plain_ctrl = DraftController::new(WIDEST, unbanked);
+    assert_eq!(plain_ctrl.generate(WIDEST, CONTEXT, true), WIDEST);
+
+    // Under a steep streamed verify prior (plain 50ms = 20 tok/s; k=1 120ms = 16.7 tok/s;
+    // k=3 280ms = 14.3 tok/s; wider linearly extrapolated at +80ms/row), cold-start
+    // chooses plain decode (0) rather than blindly probing WIDEST.
+    let steep = Arc::new(DraftLoad::default());
+    steep.observe_streamed(Some(StreamedVerifyPrior {
+        bank_epoch: 1,
+        verify_seconds: vec![0.050, 0.120, 0.200, 0.280],
+    }));
+    let mut steep_ctrl = DraftController::new(WIDEST, steep.clone());
+    assert_eq!(steep_ctrl.generate(WIDEST, CONTEXT, true), 0);
+
+    // Linear extrapolation beyond the prior's table uses the last two points' slope.
+    let ctx = CONTEXT.max(1).next_power_of_two();
+    {
+        let costs = RoundCosts::of(&steep, ctx, 1, None);
+        assert!((costs.verify(1) - 0.050).abs() < 1e-12);
+        assert!((costs.verify(4) - 0.280).abs() < 1e-12);
+        // k = 7 => 0.280 + (7 - 3) * (0.280 - 0.200) = 0.600
+        assert!((costs.verify(8) - 0.600).abs() < 1e-12);
+    }
+
+    // Proving a larger width (rows = 8 at 70ms) must not drag an unmeasured smaller
+    // width (rows = 4) below its streamed prior (280ms).
+    {
+        let mut map = steep.costs.lock().unwrap();
+        let bucket = map.entry((ctx, 1)).or_default();
+        bucket.verify.insert(8, super::Durations::settled(&[(1, 0.070), (2, 0.070), (3, 0.070)]));
+    }
+    {
+        let costs = RoundCosts::of(&steep, ctx, 1, None);
+        assert!((costs.verify(8) - 0.070).abs() < 1e-12, "proven width uses its measurement");
+        assert!((costs.verify(4) - 0.280).abs() < 1e-12, "unmeasured width keeps prior without larger clamp");
+    }
+
+    // Under a moderate prior where k=1 (80ms -> 25 tok/s) beats plain (50ms -> 20 tok/s)
+    // and deeper widths (k=2 200ms -> 15 tok/s), cold-start selects width 1, not WIDEST.
+    let moderate = Arc::new(DraftLoad::default());
+    moderate.observe_streamed(Some(StreamedVerifyPrior {
+        bank_epoch: 1,
+        verify_seconds: vec![0.050, 0.080, 0.200, 0.320],
+    }));
+    let mut mod_ctrl = DraftController::new(WIDEST, moderate);
+    assert_eq!(mod_ctrl.generate(WIDEST, CONTEXT, true), 1);
+}
+
+#[test]
+fn observe_streamed_invalidates_target_costs_on_bank_epoch_change_preserving_draft() {
+    let load = Arc::new(DraftLoad::default());
+    let prior_e1 = StreamedVerifyPrior {
+        bank_epoch: 1,
+        verify_seconds: vec![0.050, 0.100],
+    };
+    load.observe_streamed(Some(prior_e1.clone()));
+
+    let ctx_a = 1024usize;
+    let ctx_b = 2048usize;
+    {
+        let mut map = load.costs.lock().unwrap();
+        let a = map.entry((ctx_a, 1)).or_default();
+        a.draft.insert(4, super::Durations::settled(&[(1, 0.005)]));
+        a.verify.insert(2, super::Durations::settled(&[(1, 0.090)]));
+        a.enter = super::Durations::settled(&[(1, 0.002)]);
+        a.leave = super::Durations::settled(&[(1, 0.003)]);
+
+        // Bucket with only verify durations (should be pruned when cleared).
+        let b = map.entry((ctx_b, 1)).or_default();
+        b.verify.insert(1, super::Durations::settled(&[(1, 0.045)]));
+    }
+
+    // Same epoch leaves every measured duration untouched.
+    load.observe_streamed(Some(prior_e1));
+    {
+        let map = load.costs.lock().unwrap();
+        assert!(map[&(ctx_a, 1)].verify.contains_key(&2));
+        assert!(map[&(ctx_a, 1)].draft.contains_key(&4));
+        assert!(map[&(ctx_a, 1)].enter.measured());
+        assert!(map[&(ctx_a, 1)].leave.measured());
+        assert!(map.contains_key(&(ctx_b, 1)));
+    }
+
+    // New bank_epoch clears verify/enter/leave, prunes empty buckets, and preserves draft.
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        bank_epoch: 2,
+        verify_seconds: vec![0.040, 0.075],
+    }));
+    {
+        let map = load.costs.lock().unwrap();
+        let a = &map[&(ctx_a, 1)];
+        assert!(a.draft.contains_key(&4), "draft durations must survive bank_epoch change");
+        assert!((a.draft[&4].cost() - 0.005).abs() < 1e-12);
+        assert!(a.verify.is_empty(), "verify durations must be cleared on bank_epoch change");
+        assert!(!a.enter.measured(), "enter durations must be cleared on bank_epoch change");
+        assert!(!a.leave.measured(), "leave durations must be cleared on bank_epoch change");
+        assert!(!map.contains_key(&(ctx_b, 1)), "buckets emptied by invalidation must be pruned");
+    }
+    let costs = RoundCosts::of(&load, ctx_a, 1, None);
+    assert!((costs.verify(2) - 0.075).abs() < 1e-12, "new epoch prior takes effect immediately");
 }

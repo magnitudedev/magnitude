@@ -32,7 +32,7 @@ mod features;
 mod head;
 mod reader;
 mod serving_heap;
-pub use serving_heap::{Followed, FrontRegime, TwoRowPricing, Yielded};
+pub use serving_heap::{Followed, FrontRegime, StreamedVerifyPrior, TwoRowPricing, Yielded};
 mod in_flight;
 mod input;
 mod ownership;

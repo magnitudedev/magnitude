@@ -52,6 +52,21 @@ pub struct FrontRegime {
     pub pass: magnitude_cost_model::Form,
 }
 
+/// Prior target-launch durations for streamed decode verification at a
+/// bank epoch ([`ExecutorDomain::streamed_verify_prior`]): the cost model's
+/// regime prices plain decode (`index 0`) and `1 + k`-row verify passes
+/// (`index k >= 1`) so an adaptive draft controller does not probe wide
+/// verify widths blindly when streaming makes them expensive, and
+/// invalidates stale target verify measurements when `bank_epoch` changes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamedVerifyPrior {
+    pub bank_epoch: u64,
+    /// Prior target-launch seconds for `1 + k` rows per sequence:
+    /// index 0 = plain decode `regime.time(0)`,
+    /// index `k >= 1` = `regime.verify_pass_time(k)`.
+    pub verify_seconds: Vec<f64>,
+}
+
 impl TwoRowPricing {
     /// Of a pass the host builds of `requests`, each decoding a row,
     /// `fronted` of them able to run guessed rows (`crate::TwoRowDecode`)
@@ -648,6 +663,35 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             verifies: self.execution.policy().method().draft_rows(),
             whole: price.whole(held),
             overhead: self.verify_turns.mean(bank.bank_epoch()),
+        }))
+    }
+
+    /// Prior target-launch durations for a streamed decode launch of
+    /// `sequences` requests, tagged with the expert bank's live epoch.
+    /// Returns `Ok(None)` for unbanked or whole-bank loads (or before the
+    /// regime has measured a miss), leaving fully-resident loads untouched.
+    pub fn streamed_verify_prior(&self, sequences: usize) -> Result<Option<StreamedVerifyPrior>, DomainError> {
+        if sequences == 0 {
+            return Ok(None);
+        }
+        let Some(bank) = self.family.expert_bank() else {
+            return Ok(None);
+        };
+        let Some(pricing) = self.two_row_pricing()? else {
+            return Ok(None);
+        };
+        let Some(FrontRegime { regime, .. }) = pricing.regime(sequences, sequences)? else {
+            return Ok(None);
+        };
+        let verifies = regime.accepts.len().min(regime.resident.len().saturating_sub(1));
+        let mut verify_seconds = Vec::with_capacity(1 + verifies);
+        verify_seconds.push(regime.time(0));
+        for k in 1..=verifies {
+            verify_seconds.push(regime.verify_pass_time(k));
+        }
+        Ok(Some(StreamedVerifyPrior {
+            bank_epoch: bank.bank_epoch(),
+            verify_seconds,
         }))
     }
 

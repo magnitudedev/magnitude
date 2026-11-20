@@ -27,7 +27,7 @@ pub use magnitude_executor::{
     Demand, FeatureReader, FeatureRef, FrontGrant, LaunchDuration, Operation, Priming, RequestId, Sampling,
     SelectSpec, Shaping, TokenId, WorkKind,
 };
-use magnitude_executor::{AheadVerdict, ChainEntry, Guess, GuessKind, PhysicalDecision, Rows, TwoRowDecode};
+use magnitude_executor::{AheadVerdict, ChainEntry, Guess, GuessKind, PhysicalDecision, Rows, StreamedVerifyPrior, TwoRowDecode};
 pub use method::{
     CheckpointCompatibility, DraftCheckpoint, FrontEntry, Method, MethodCheckpoint, MethodCheckpointError,
     MethodChoice, MethodEffects, MethodRequirements, MethodState, Propose, Verification,
@@ -1159,6 +1159,12 @@ impl Generation {
     /// launch share its rows by these ([`share_rows`]).
     pub fn draft_outlook(&self) -> Option<DraftOutlook> {
         self.method.outlook()
+    }
+
+    /// Observe the streamed target verify prior for the upcoming decode
+    /// round, forwarding to this generation's method.
+    pub fn observe_streamed_prior(&self, prior: Option<StreamedVerifyPrior>) {
+        self.method_factory.observe_streamed_prior(prior);
     }
 
     pub fn commit_method_transition(&mut self, transition: PreparedMethodTransition) {

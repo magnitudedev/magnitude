@@ -1,7 +1,7 @@
 use crate::{DraftOutlook, TimedLaunch};
 use magnitude_executor::{
     ChainEntry, Demand, FeatureReader, FeatureRef, FeatureRows, FrontGrant, LaunchDuration, Operation, Outcome,
-    RequestId, SelectSpec, TokenId, WeakFeatureRef,
+    RequestId, SelectSpec, StreamedVerifyPrior, TokenId, WeakFeatureRef,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -371,6 +371,10 @@ pub trait Method: Send + Sync {
     fn decodes_two_rows(&self) -> bool {
         false
     }
+    /// Observe the streamed target verify prior for the upcoming decode
+    /// round. Drafting methods with an adaptive controller forward this to
+    /// their shared [`crate::DraftLoad`].
+    fn observe_streamed_prior(&self, _prior: Option<StreamedVerifyPrior>) {}
 }
 
 /// Per-request method state remains confined to its owner thread.

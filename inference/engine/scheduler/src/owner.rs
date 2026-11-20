@@ -2678,6 +2678,15 @@ impl<F: ProgramFamily> Service<F> {
         // builds.
         let mut reserved = Vec::new();
         let mut attempted = 0;
+        if !chaining && matches!(selection.phase(), Phase::Decode) {
+            let prior = self
+                .domain
+                .streamed_verify_prior(requests.len())
+                .map_err(|error| (None, classify_domain_error(error)))?;
+            for id in &requests {
+                self.requests[id].state.generation().observe_streamed_prior(prior.clone());
+            }
+        }
         // Requests whose drafted blocks await verification share the launch
         // that verifies them: its rows go to the proposals most often right,
         // whichever request drafted them.

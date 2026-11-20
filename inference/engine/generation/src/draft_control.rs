@@ -29,7 +29,7 @@
 //!
 //! Requests verified in one launch share its rows ([`share_rows`]).
 
-use magnitude_executor::{draft_ladder, LaunchDuration, TokenId};
+use magnitude_executor::{draft_ladder, LaunchDuration, StreamedVerifyPrior, TokenId};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -451,6 +451,7 @@ fn prune_costs(costs: &mut BTreeMap<(usize, usize), LaunchCosts>, keep: (usize, 
 /// being measured again.
 struct RoundCosts<'a> {
     costs: std::sync::MutexGuard<'a, BTreeMap<(usize, usize), LaunchCosts>>,
+    verify_prior: Option<StreamedVerifyPrior>,
     context_class: usize,
     /// Requests sharing each launch.
     sequences: usize,
@@ -465,8 +466,10 @@ impl<'a> RoundCosts<'a> {
         sequences: usize,
         after_drafting: Option<bool>,
     ) -> Self {
+        let verify_prior = load.verify_prior.lock().expect("draft load verify prior").clone();
         Self {
             costs: load.costs.lock().expect("draft load costs"),
+            verify_prior,
             context_class,
             sequences,
             after_drafting,
@@ -543,7 +546,34 @@ impl<'a> RoundCosts<'a> {
         }
     }
 
+    fn prior_verify_seconds(prior: &StreamedVerifyPrior, sequences: usize, rows: usize) -> Option<f64> {
+        if prior.verify_seconds.is_empty() {
+            return None;
+        }
+        let k = (rows / sequences.max(1)).saturating_sub(1);
+        if let Some(&seconds) = prior.verify_seconds.get(k) {
+            return Some(seconds);
+        }
+        let last_idx = prior.verify_seconds.len() - 1;
+        let last = prior.verify_seconds[last_idx];
+        let slope = if last_idx > 0 {
+            (last - prior.verify_seconds[last_idx - 1]).max(0.0)
+        } else {
+            0.0
+        };
+        Some(last + (k - last_idx) as f64 * slope)
+    }
+
     fn verify(&self, rows: usize) -> f64 {
+        if self.own().is_none_or(|own| !own.verify.contains_key(&rows)) {
+            if let Some(prior) = self
+                .verify_prior
+                .as_ref()
+                .and_then(|prior| Self::prior_verify_seconds(prior, self.sequences, rows))
+            {
+                return prior;
+            }
+        }
         self.seconds(|costs| &costs.verify, rows)
     }
 
@@ -700,9 +730,35 @@ pub struct DraftLoad {
     /// Whether `costs` holds a duration measured beside the expert bank's
     /// cover read ([`Self::settle`]).
     beside_cover: Mutex<bool>,
+    /// Expert bank epoch of the currently observed streamed verify prior.
+    bank_epoch: Mutex<Option<u64>>,
+    /// Latest streamed verify prior from the cost model's regime.
+    verify_prior: Mutex<Option<StreamedVerifyPrior>>,
 }
 
 impl DraftLoad {
+    /// Observe the streamed target verify prior for the current round.
+    /// When `bank_epoch` changes, invalidates target verify/enter/leave
+    /// durations across every bucket (preserving `draft` durations, which
+    /// do not stream from the target expert bank) and prunes empty buckets.
+    pub fn observe_streamed(&self, prior: Option<StreamedVerifyPrior>) {
+        let epoch = prior.as_ref().map(|p| p.bank_epoch);
+        {
+            let mut bank_epoch = self.bank_epoch.lock().expect("draft load bank epoch");
+            if *bank_epoch != epoch {
+                let mut costs = self.costs.lock().expect("draft load costs");
+                costs.retain(|_, bucket| {
+                    bucket.verify.clear();
+                    bucket.enter = Durations::default();
+                    bucket.leave = Durations::default();
+                    !bucket.is_empty()
+                });
+                *bank_epoch = epoch;
+            }
+        }
+        *self.verify_prior.lock().expect("draft load verify prior") = prior;
+    }
+
     /// Drop every duration measured beside the bank's cover read, which a
     /// launch measured with none beside it shows ended ([`LaunchCosts::settle`]).
     fn settle(&self) {

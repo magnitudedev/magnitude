@@ -227,20 +227,17 @@ impl Regime {
         paths.fold(self.resident[k], f64::max) + needed * unnamed * self.stall.unwrap_or(0.)
     }
 
-    /// `V(k)`: the time a token of a verify pass at depth `k ≥ 1` takes,
-    /// its pass's over the tokens it emits.
-    pub fn verify_time(&self, k: usize) -> f64 {
-        let depths = self.priced(k);
+    /// Expected tokens emitted by a verify pass at depth `k ≥ 1`: its exact
+    /// row's, and each row's whose guess stands with every guess before it.
+    /// An unmeasured deeper row carries forward the last measured shallower
+    /// conditional stand rate (1 before any depth is measured), since
+    /// conditional acceptance decays with depth rather than jumping back to 1.
+    fn verify_emitted(&self, k: usize) -> f64 {
         assert!(
-            (1..=self.accepts.len()).contains(&k) && self.overhead.is_none_or(|overhead| overhead >= 0.),
+            (1..=self.accepts.len()).contains(&k),
             "a regime prices verify rows at a depth its load verifies: {k} of {self:?}"
         );
-        // The tokens it emits: its exact row's, and each row's whose guess
-        // stands with every guess before it. An unmeasured deeper row carries
-        // forward the last measured shallower conditional stand rate (1 before
-        // any depth is measured), since conditional acceptance decays with
-        // depth rather than jumping back to 1.
-        let emitted = 1. + self.accepts[..k]
+        1. + self.accepts[..k]
             .iter()
             .scan((1., 1.), |(standing, bound), &accepts| {
                 let row = match accepts {
@@ -254,7 +251,18 @@ impl Regime {
                 *standing *= row;
                 Some(*standing)
             })
-            .sum::<f64>();
+            .sum::<f64>()
+    }
+
+    /// The target verify pass duration at depth `k ≥ 1` (`max(C(1 + k), read)`),
+    /// without host turn `overhead` or dividing by `emitted`.
+    pub fn verify_pass_time(&self, k: usize) -> f64 {
+        self.verify_pass_and_emitted(k).0
+    }
+
+    fn verify_pass_and_emitted(&self, k: usize) -> (f64, f64) {
+        let depths = self.priced(k);
+        let emitted = self.verify_emitted(k);
         // An unexecuted shadow measures misses per true row, whereas a verify
         // pass runs and reads all `1 + k` rows (including discarded rows past
         // the first fall). Once executed, `needed.verify[k]` already divides
@@ -264,10 +272,21 @@ impl Regime {
             Needed::Executed(u) => (emitted, u),
         };
         let read = self.paths.iter().map(|path| rows * path.read(needed, depths) + sum(&path.wasted.verify[..=k])).fold(0., f64::max);
+        (self.resident[k].max(read), emitted)
+    }
+
+    /// `V(k)`: the time a token of a verify pass at depth `k ≥ 1` takes,
+    /// its pass's over the tokens it emits.
+    pub fn verify_time(&self, k: usize) -> f64 {
+        assert!(
+            self.overhead.is_none_or(|overhead| overhead >= 0.),
+            "a regime prices verify rows with non-negative overhead: {k} of {self:?}"
+        );
+        let (pass, emitted) = self.verify_pass_and_emitted(k);
         // Before the host turn is measured, 0 is its lower bound: verify
         // is tried once at that bound, after which the measured host turn
         // replaces it.
-        (self.resident[k].max(read) + self.overhead.unwrap_or(0.)) / emitted
+        (pass + self.overhead.unwrap_or(0.)) / emitted
     }
 
     /// The decode form's depths, once `k` is checked among those the
@@ -579,5 +598,45 @@ mod tests {
         };
         assert!(reg.time(1) < reg.verify_time(1), "front(1) {} must beat verify(1) {}", reg.time(1), reg.verify_time(1));
         assert_eq!(reg.pass(), Form::Front(1));
+    }
+
+    /// `verify_pass_time(k)` is the exact numerator pass duration used by
+    /// `verify_time(k)`, without host turn `overhead` or dividing by `emitted`.
+    #[test]
+    fn verify_pass_time_matches_verify_time_without_overhead_or_emitted_division() {
+        let mut needed = vec![Needed::Shadow(80.); 8];
+        needed[0] = Needed::Executed(90.);
+        needed[1] = Needed::Executed(85.);
+        let accepts = vec![Some(0.8), Some(0.5), None, None, None, None, None];
+        let reg = Regime {
+            resident: CODE.to_vec(),
+            needed: NeededByForm::both(needed),
+            stand: Some(0.8),
+            accepts,
+            stall: Some(1e-3),
+            overhead: Some(0.012),
+            paths: vec![PathTerm {
+                seconds: 1e-3,
+                wasted: Waste {
+                    front: vec![Some(0.002); 8],
+                    verify: vec![Some(0.), Some(0.004), Some(0.003), None, None, None, None, None],
+                },
+            }],
+        };
+        for k in 1..=7 {
+            let emitted = reg.verify_emitted(k);
+            let pass = reg.verify_pass_time(k);
+            let expected = (pass + 0.012) / emitted;
+            assert!(
+                (reg.verify_time(k) - expected).abs() < 1e-12,
+                "k={k}: verify_time {} vs (verify_pass_time {pass} + overhead) / emitted {emitted}",
+                reg.verify_time(k)
+            );
+        }
+        // Compute-bound regime: verify_pass_time(k) == resident[k].
+        let compute = verifying(regime(|_| 1.3, Some(0.8), vec![path(1e-3, |_| Some(0.))]), Some(0.8), Some(5e-3));
+        for k in 1..=7 {
+            assert!((compute.verify_pass_time(k) - CODE[k]).abs() < 1e-12);
+        }
     }
 }
