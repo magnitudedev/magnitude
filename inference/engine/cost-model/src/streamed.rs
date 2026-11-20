@@ -299,6 +299,30 @@ impl StreamedLayers {
     pub(crate) fn pass_reads(&self, read: ReadLine, held: HeldSlots, rows: f64) -> f64 {
         self.step_seconds(None, read, held, rows, FormSeconds { resident: 0., streamed: 0. }).total_seconds
     }
+
+    /// The free path records needed for moves of `bytes` stored bytes along
+    /// `read`, the bank holding `held` with `hint_leads` lookahead layers
+    /// across `num_layers` routed layers and decode compute time `compute`.
+    /// Single owner shared by [`crate::BankPrices::paths`] and assessment's
+    /// path pricer.
+    pub fn path_records(
+        &self,
+        read: ReadLine,
+        compute: FormSeconds,
+        bytes: u64,
+        held: HeldSlots,
+        hint_leads: u64,
+        num_layers: u64,
+    ) -> Option<crate::PathRecords> {
+        let step = self.step_seconds(None, read, held, 1.0, compute).total_seconds;
+        let reads = self.pass_reads(read, held, 1.0);
+        let queue = if num_layers == 0 {
+            0.0
+        } else {
+            hint_leads as f64 * (reads / num_layers as f64)
+        };
+        crate::PathRecords::of(read, bytes, queue, crate::PathRecords::release(step, reads))
+    }
 }
 
 /// The deduplicated step patterns of a [`StreamedLayers`] over one period at a

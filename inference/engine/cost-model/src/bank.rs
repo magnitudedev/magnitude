@@ -260,11 +260,8 @@ impl BankPrices {
     /// the mean release's records and leaves that trade to the running
     /// load.
     pub fn paths(&self, bytes: u64, held: HeldSlots, hint_leads: u64) -> Option<PathRecords> {
-        let step = self.step_seconds(held);
-        let reads = self.layers.pass_reads(self.read, held, 1.0);
         let layers: u64 = self.routed.iter().map(|kind| kind.layers).sum();
-        let queue = if layers == 0 { 0.0 } else { hint_leads as f64 * (reads / layers as f64) };
-        PathRecords::of(self.read, bytes, queue, PathRecords::release(step, reads))
+        self.layers.path_records(self.read, self.compute, bytes, held, hint_leads, layers)
     }
 }
 

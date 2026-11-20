@@ -196,26 +196,37 @@ impl crate::SettleRoom for PlanningRoom<'_> {
         Ok(self.net())
     }
 
-    fn room(&self, _: &crate::ExecutionPlanDraft, _: &crate::AssessmentMemoryCharge, bytes: u64) -> Result<crate::PlanRoom, crate::PlanError> {
-        let left = self.at().device.room().saturating_add(self.held).saturating_sub(bytes);
+    fn room(&self, draft: &crate::ExecutionPlanDraft, mandatory: &crate::AssessmentMemoryCharge) -> Result<crate::PlanRoom, crate::PlanError> {
+        let needed = mandatory
+            .store_demands(draft.device().topology(), draft.device().executor())
+            .map_err(crate::PlanError::ResourcePlanning)?
+            .allocation_bytes();
+        let left = self.at().device.room().saturating_add(self.held).saturating_sub(needed);
         Ok(crate::PlanRoom { free: left, ceiling: left })
     }
 
-    /// `charge` against the stores' rooms: its device storage in the
-    /// device's own store; its host RAM (the tables, the staging window and
-    /// a host tier's floor) in host RAM's, where that is a store of its own,
-    /// else in the device's.
-    fn fit_whole(&self, _: &crate::ExecutionPlanDraft, charge: &crate::AssessmentMemoryCharge) -> Result<crate::WholeFit, crate::PlanError> {
+    /// `charge` against the stores' rooms via the single [`StoreDemands`]
+    /// decomposition: on unified memory everything (including host-side bytes
+    /// and a single `staging_bytes`) sits in the device store; on discrete
+    /// GPUs `weight_demand.host` and `weight_demand.shared` sit in host RAM
+    /// alongside `host_bytes()` and `staging_bytes`.
+    fn fit_whole(&self, draft: &crate::ExecutionPlanDraft, charge: &crate::AssessmentMemoryCharge) -> Result<crate::WholeFit, crate::PlanError> {
         let at = self.at();
-        let device = crate::ExecutionPlanDraft::allocated(charge)?;
-        let host = charge.host_demand().map_err(crate::PlanError::ResourcePlanning)?;
+        let demands = charge
+            .store_demands(draft.device().topology(), draft.device().executor())
+            .map_err(crate::PlanError::ResourcePlanning)?;
         let device_room = at.device.room().saturating_add(self.held);
-        let (host_room, needed) = match &at.host {
-            Some(store) => (Some(store.room()), device),
-            None => (None, device.saturating_add(host)),
+        let (needed, device_short, host_short) = match demands {
+            crate::StoreDemands::Unified { total } => (total, total.saturating_sub(device_room), 0),
+            crate::StoreDemands::Split { device, host } => {
+                let host_room = at
+                    .host
+                    .as_ref()
+                    .expect("invariant violated: split store demands require a host room reading")
+                    .room();
+                (device, device.saturating_sub(device_room), host.saturating_sub(host_room))
+            }
         };
-        let device_short = needed.saturating_sub(device_room);
-        let host_short = host_room.map_or(0, |room| host.saturating_sub(room));
         let limiting = if device_short >= host_short { crate::platform::DomainRole::Allocation } else { crate::platform::DomainRole::Staging };
         let short = std::num::NonZeroU64::new(device_short.max(host_short));
         Ok(crate::WholeFit {
@@ -226,16 +237,18 @@ impl crate::SettleRoom for PlanningRoom<'_> {
         })
     }
 
-    /// Host RAM's room the load's claims read, less `charge`'s host demand
-    /// and the tier's `growth`: the one room a host tier's floor and size
-    /// are decided in. A linked host tier is host RAM's store apart from the
-    /// device's.
-    fn host_left(&self, _: &crate::ExecutionPlanDraft, charge: &crate::AssessmentMemoryCharge, growth: u64) -> Result<i64, crate::PlanError> {
+    /// Host RAM's room the load's claims read, less `charge`'s host store
+    /// demand and the tier's `growth`: the one room a host tier's floor and
+    /// size are decided in.
+    fn host_left(&self, draft: &crate::ExecutionPlanDraft, charge: &crate::AssessmentMemoryCharge, growth: u64) -> Result<i64, crate::PlanError> {
         let at = self.at();
         let host = at.host.as_ref().expect("invariant violated: a linked host tier's device reads host RAM as a store of its own");
-        let demand = charge
-            .host_demand()
+        let host_demand = charge
+            .store_demands(draft.device().topology(), draft.device().executor())
             .map_err(crate::PlanError::ResourcePlanning)?
+            .host_store_bytes()
+            .expect("invariant violated: a linked host tier requires split device and host stores");
+        let demand = host_demand
             .checked_add(growth)
             .ok_or(crate::PlanError::Arithmetic("a load's host charge overflows"))?;
         i64::try_from(host.room()).and_then(|room| i64::try_from(demand).map(|demand| room - demand)).map_err(|_| crate::PlanError::Arithmetic("a host tier's room exceeds i64"))

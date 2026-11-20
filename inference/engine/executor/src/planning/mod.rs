@@ -22,7 +22,7 @@ mod weights;
 pub use assessment::{
     AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, CONVERSATION_CHECKPOINTS,
-    DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes, TargetGraphBounds, UndraftedBounds, VisionGraphBounds, measurement_process_bytes,
+    DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes, StoreDemands, TargetGraphBounds, UndraftedBounds, VisionGraphBounds, measurement_process_bytes,
 };
 pub(crate) use assessment::fit_depth;
 pub(crate) use resources::{DomainRows, HeadHistoryGeometry};
@@ -46,7 +46,7 @@ pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, Co
 pub(crate) use execution_plan::bank_substrate;
 pub use execution_plan::{
     BackendPlan, BankForm, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FloorForms, HeldForm, HeldBound, HeldCharge, NoBank, Placed, Unplaced, WeightBound, WholeFit, PlanRoom, PlannedDevice, SettleRoom, StableRoom,
-    ResolvedPolicy,
+    ResolvedPolicy, prompt_places_at,
 };
 pub use programs::{
     BankedFeedForward, ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,

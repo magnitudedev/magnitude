@@ -84,6 +84,21 @@ impl PlannedDevice {
     pub fn graph_pricing(&self) -> crate::platform::GraphPricing {
         self.graph_pricing
     }
+
+    pub fn topology(&self) -> &seismic::DeviceTopology {
+        &self.reading.topology
+    }
+
+    pub fn executor(&self) -> &seismic::Executor {
+        &self.executor
+    }
+}
+
+/// The most launches a prompt group chains for `context_limit` under `limits`:
+/// every chunk of a whole-context prompt. Single owner shared by execution
+/// planning, assessment tier sizing, and group-class reservation.
+pub fn prompt_places_at(limits: ResourceLimits, context_limit: u64) -> u64 {
+    context_limit.div_ceil(limits.max_launch_rows as u64)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -290,19 +305,12 @@ impl ExecutionPlanDraft {
     }
 
     /// What the draft allocates in the device's allocation domain at the
-    /// model's context, as its assessment charges it ([`Self::allocated`]).
+    /// model's context, derived from the single [`StoreDemands`] owner.
     pub(crate) fn allocation_bytes(&self, definition: &ModelDefinition) -> Result<u64, PlanError> {
-        Self::allocated(&self.memory_charge(definition)?)
-    }
-
-    /// What `charge` allocates in the device's allocation domain: all but a
-    /// linked host tier's records, which lie in host storage
-    /// ([`Self::with_host_tier`] sizes them against host RAM).
-    pub(crate) fn allocated(charge: &AssessmentMemoryCharge) -> Result<u64, PlanError> {
-        charge
-            .allocation_bytes
-            .checked_sub(charge.weight_demand.host)
-            .ok_or(PlanError::Arithmetic("a host tier's records exceed the allocation charge"))
+        self.memory_charge(definition)?
+            .store_demands(self.device.topology(), self.device.executor())
+            .map(|demands| demands.allocation_bytes())
+            .map_err(PlanError::ResourcePlanning)
     }
 
     /// The draft with its linked host tier (its records in host storage)
@@ -1184,8 +1192,11 @@ impl ExecutionPlanDraft {
         let host = count(bank.host_ceiling().unwrap_or(0))?;
         // The room beside the smallest pass's mandatory part, which a larger
         // pass's mandatory part must fit in.
-        let floor_bytes = Self::allocated(&floor_charge)?;
-        let floor_room = room.room(&mandatory, &floor_charge, floor_bytes)?;
+        let floor_bytes = floor_charge
+            .store_demands(mandatory.device.topology(), mandatory.device.executor())
+            .map_err(PlanError::ResourcePlanning)?
+            .allocation_bytes();
+        let floor_room = room.room(&mandatory, &floor_charge)?;
         let fits_within = floor_bytes.saturating_add(floor_room.free.min(floor_room.ceiling));
         let mut most = None;
         let mut chosen: Option<(PassLaunches, u64, f64)> = None;
@@ -1198,12 +1209,15 @@ impl ExecutionPlanDraft {
                     .and_then(|structure| structure.charge(definition, &mandatory))
                     .map_err(charge_error)?,
             };
-            let mandatory_bytes = Self::allocated(&charge)?;
+            let mandatory_bytes = charge
+                .store_demands(mandatory.device.topology(), mandatory.device.executor())
+                .map_err(PlanError::ResourcePlanning)?
+                .allocation_bytes();
             // A larger pass leaves no more room.
             if mandatory_bytes > fits_within {
                 break;
             }
-            let free = room.room(&mandatory, &charge, mandatory_bytes)?;
+            let free = room.room(&mandatory, &charge)?;
             let slots = count(slots_within(free.free.min(free.ceiling), (points[0], *ceiling), &reserved)?)?;
             // The smallest pass leaves the most slots.
             let most = *most.get_or_insert(magnitude_cost_model::HeldSlots { slots, host });
@@ -1256,16 +1270,24 @@ impl ExecutionPlanDraft {
         if let Some(reason) = mandatory.untiered(&floor_charge, room)? {
             return Ok(Err(NoBank::Unstreamed(reason)));
         }
-        let mandatory_bytes = Self::allocated(&floor_charge)?;
+        let mandatory_bytes = floor_charge
+            .store_demands(mandatory.device.topology(), mandatory.device.executor())
+            .map_err(PlanError::ResourcePlanning)?
+            .allocation_bytes();
         assert_eq!(mandatory_bytes, priced, "invariant violated: a pass of {pass:?} certifies to other bytes than it is priced at");
-        let room = room.room(&mandatory, &floor_charge, mandatory_bytes)?;
+        let room = room.room(&mandatory, &floor_charge)?;
         let room = room.free.min(room.ceiling);
         // A draft of `slots` under `ceiling`, its charge, and what it leaves
         // of the room (`Ok`) or how far it exceeds it (`Err`).
         let charged = |held: &mut HeldCharges<C>, slots: u64, ceiling: u64| -> Result<_, E> {
             let draft = whole.resized(slots, ceiling, pass)?;
             let charge = held.charge(definition, &draft)?;
-            let grown = Self::allocated(charge.charge())?.saturating_sub(mandatory_bytes);
+            let grown = charge
+                .charge()
+                .store_demands(draft.device.topology(), draft.device.executor())
+                .map_err(PlanError::ResourcePlanning)?
+                .allocation_bytes()
+                .saturating_sub(mandatory_bytes);
             let left = match room.checked_sub(grown) {
                 Some(left) => Ok(left),
                 None => Err(grown - room),
@@ -1944,9 +1966,9 @@ pub trait SettleRoom {
     /// The most bytes the room could hold of a plan's weights, beside
     /// nothing: what bounds the experts a plan holds.
     fn capacity(&self) -> Result<u64, PlanError>;
-    /// What is left of the room beside `bytes` of `draft`'s mandatory part,
-    /// whose charge is `mandatory`.
-    fn room(&self, draft: &ExecutionPlanDraft, mandatory: &AssessmentMemoryCharge, bytes: u64) -> Result<PlanRoom, PlanError>;
+    /// What is left of the room beside `draft`'s mandatory part, whose charge
+    /// is `mandatory`.
+    fn room(&self, draft: &ExecutionPlanDraft, mandatory: &AssessmentMemoryCharge) -> Result<PlanRoom, PlanError>;
     /// The room's fit of `draft`, charged `charge`, beside nothing else, as
     /// a whole plan is placed ([`ExecutionPlanDraft::place`]).
     fn fit_whole(&self, draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge) -> Result<WholeFit, PlanError>;
@@ -1975,14 +1997,22 @@ impl<F: Fn(u64) -> PlanRoom> SettleRoom for F {
         Ok(room.free.min(room.ceiling))
     }
 
-    fn room(&self, _: &ExecutionPlanDraft, _: &AssessmentMemoryCharge, bytes: u64) -> Result<PlanRoom, PlanError> {
+    fn room(&self, draft: &ExecutionPlanDraft, mandatory: &AssessmentMemoryCharge) -> Result<PlanRoom, PlanError> {
+        let bytes = mandatory
+            .store_demands(draft.device.topology(), draft.device.executor())
+            .map_err(PlanError::ResourcePlanning)?
+            .allocation_bytes();
         Ok(self(bytes))
     }
 
     /// The room beside nothing, against what the draft allocates as
     /// admission fits it.
-    fn fit_whole(&self, _: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge) -> Result<WholeFit, PlanError> {
-        let (room, needed) = (self(0), ExecutionPlanDraft::allocated(charge)?);
+    fn fit_whole(&self, draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge) -> Result<WholeFit, PlanError> {
+        let room = self(0);
+        let needed = charge
+            .store_demands(draft.device.topology(), draft.device.executor())
+            .map_err(PlanError::ResourcePlanning)?
+            .allocation_bytes();
         let short = NonZeroU64::new(needed.saturating_sub(room.free.min(room.ceiling)));
         Ok(WholeFit { room, needed, short, limiting: short.map(|_| crate::platform::DomainRole::Allocation) })
     }
@@ -2064,12 +2094,15 @@ impl SettleRoom for StableRoom<'_> {
         Ok(WholeFit { room: PlanRoom { free: bound, ceiling: bound }, needed: allocation.required_bytes, short, limiting })
     }
 
-    fn room(&self, _: &ExecutionPlanDraft, mandatory: &AssessmentMemoryCharge, bytes: u64) -> Result<PlanRoom, PlanError> {
-        let bound = mandatory
-            .assess_fit(self.topology, self.executor, self.status)
-            .and_then(|fit| fit.settle_bound())
-            .map_err(PlanError::ResourcePlanning)?;
-        let left = bound.saturating_sub(bytes);
+    fn room(&self, _: &ExecutionPlanDraft, mandatory: &AssessmentMemoryCharge) -> Result<PlanRoom, PlanError> {
+        let fit = self.fit(mandatory)?;
+        let allocation = fit
+            .domains
+            .iter()
+            .find(|domain| domain.role == crate::platform::DomainRole::Allocation)
+            .ok_or_else(|| PlanError::ResourcePlanning("the fit reaches no allocation domain".into()))?;
+        let left = u64::try_from(allocation.remaining_bytes.max(0))
+            .map_err(|_| PlanError::Arithmetic("fit remainder exceeds u64"))?;
         Ok(PlanRoom { free: left, ceiling: left })
     }
 
@@ -2160,7 +2193,10 @@ struct NeedTerms {
 impl NeedTerms {
     fn of(draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge) -> Result<Self, PlanError> {
         let bounds = &charge.bounds;
-        let allocation = ExecutionPlanDraft::allocated(charge)?;
+        let allocation = charge
+            .store_demands(draft.device.topology(), draft.device.executor())
+            .map_err(PlanError::ResourcePlanning)?
+            .allocation_bytes();
         let resource = |result: Result<u64, String>| result.map_err(PlanError::ResourcePlanning);
         Ok(Self {
             weights: charge.weight_demand.checked_bytes().ok_or(PlanError::Arithmetic("weight demand overflows"))?,
@@ -3258,7 +3294,7 @@ mod tests {
             let draft = planned.draft().resized(bank.slots, bank.ceiling, pass).unwrap();
             let charge = crate::assessment::execution_memory_charge(&definition, &draft).unwrap();
             assert!(charge.held_pass <= pass, "{:?} holds a pass above its budget {pass:?}", charge.held_pass);
-            ExecutionPlanDraft::allocated(&charge).unwrap()
+            charge.store_demands(&topology, executor).unwrap().allocation_bytes()
         };
         assert!(committed_at(bank.pass) <= bound, "{:?} and its arena fit beside the whole bank", bank.pass);
         let ladder = super::super::pass_ladder(PassLaunches::new(NonZeroUsize::new(bank.places as usize).unwrap()));
@@ -3625,10 +3661,10 @@ mod tests {
             let beside_mandatory = |grant: u64, (bank, charge, floor_charge, grown): &WholeBank| {
                 let (topology, status, device) = granted(Some(grant));
                 let room = StableRoom { topology: &topology, executor: &device.info, status: &status };
-                let mandatory = ExecutionPlanDraft::allocated(floor_charge).unwrap();
-                let beside = room.room(bank, floor_charge, mandatory).unwrap();
+                let mandatory = floor_charge.store_demands(&topology, &device.info).unwrap().allocation_bytes();
+                let beside = room.room(bank, floor_charge).unwrap();
                 let left = beside.free.min(beside.ceiling);
-                let needed = ExecutionPlanDraft::allocated(charge).unwrap();
+                let needed = charge.store_demands(&topology, &device.info).unwrap().allocation_bytes();
                 *grown <= left && needed.saturating_sub(mandatory) <= left && matches!(room.fit(charge).unwrap().verdict, Fits)
             };
             // The least grant that holds the bank so.
@@ -3645,17 +3681,19 @@ mod tests {
                 held
             };
             let bank = whole_bank(&prepare(&granted(None).2));
-            let (admitted, old) = (least(&|grant| admits(grant, &bank)), least(&|grant| beside_mandatory(grant, &bank)));
-            assert!(
-                admitted < old,
-                "{backend:?}: admission holds the bank from {admitted} bytes, the room beside its mandatory part from {old}"
+            let (admitted, beside) = (least(&|grant| admits(grant, &bank)), least(&|grant| beside_mandatory(grant, &bank)));
+            assert_eq!(
+                admitted, beside,
+                "{backend:?}: admission ({admitted}) and StableRoom::room beside mandatory ({beside}) must agree"
             );
-            let grant = admitted + (old - admitted) / 2;
-            // The setup's precondition, of the draft planned at the grant.
+            // Re-preparing at a tighter grant can shift state slab rounding slightly;
+            // verify at a grant just above `admitted` (still well below full card grant)
+            // that both unpriced `with_bank` and `assessed_bank` hold the bank whole.
+            let grant = admitted.saturating_add(64 << 20).min(seismic::fixtures::rtx3090_most_granted(backend));
             let draft = prepare(&granted(Some(grant)).2);
             let bank = whole_bank(&draft);
             assert!(admits(grant, &bank), "{backend:?}: admission holds the bank at {grant} bytes");
-            assert!(!beside_mandatory(grant, &bank), "{backend:?}: the room beside its mandatory part does not at {grant} bytes");
+            assert!(beside_mandatory(grant, &bank), "{backend:?}: the room beside its mandatory part also holds it at {grant} bytes");
             let whole = |planned: &ExecutionPlanDraft| planned.load().expert_bank().map(|bank| (bank.slots, bank.ceiling, bank.host_slots));
             let planned = draft
                 .clone()
@@ -4138,12 +4176,20 @@ mod tests {
         .unwrap();
         assert!(min_floor_alloc < full_floor_alloc, "smaller W reduces floor allocation: {min_floor_alloc} < {full_floor_alloc}");
 
-        // Place a cap halfway between W_min's floor and W_widest's floor.
+        // Place a device memory cap halfway between W_min's floor and W_widest's floor,
+        // with a weight cap at W_widest's floor weights so the unbanked resident plan
+        // is excluded and the bank must settle by shrinking W.
         let cap = min_floor_alloc + (full_floor_alloc - min_floor_alloc) / 2;
-        let bound = HeldBound::of(Some(WeightBound::Cap(cap)), room.capacity().unwrap());
+        let weight_cap = full_floor_draft
+            .memory_charge(&definition)
+            .unwrap()
+            .weight_demand
+            .checked_bytes()
+            .unwrap();
+        let bound = HeldBound::of(Some(WeightBound::Cap(weight_cap)), room.capacity().unwrap());
         let (settled, _) = draft
             .with_held_experts(&definition, bound, &synthetic(), room, |_, charge| {
-                let bytes = ExecutionPlanDraft::allocated(charge).unwrap();
+                let bytes = charge.store_demands(room.topology, room.executor).unwrap().allocation_bytes();
                 Ok::<_, PlanError>(if bytes <= cap { Ok(()) } else { Err(NonZeroU64::new(bytes - cap).unwrap()) })
             })
             .unwrap()

@@ -1234,6 +1234,7 @@ pub struct ResourcePlan {
     target_state: StateStorePlan,
     head_state: Option<StateStorePlan>,
     retained_entry_bytes: u64,
+    request_slot_bytes: u64,
     bytes: ResourceBytes,
     target_graph: NativeGraphCharge,
     target_readout_graph: NativeGraphCharge,
@@ -1259,6 +1260,11 @@ impl ResourcePlan {
     }
     pub fn retained_entry_bytes(&self) -> u64 {
         self.retained_entry_bytes
+    }
+    /// The load's opening request-slot reservation (`CommittedKind::RequestSlot`),
+    /// held from startup beside the resident weights and bank floor.
+    pub fn request_slot_bytes(&self) -> u64 {
+        self.request_slot_bytes
     }
     pub fn bytes(&self) -> ResourceBytes {
         self.bytes
@@ -1338,6 +1344,7 @@ pub struct StateResourcePlan {
     target_state: StateStorePlan,
     head_state: Option<StateStorePlan>,
     retained_entry_bytes: u64,
+    request_slot_bytes: u64,
     history_bytes: u64,
     recurrent_banks_bytes: u64,
 }
@@ -1381,9 +1388,46 @@ impl StateResourcePlan {
         self.capacity
     }
 
-    /// The state slabs a load commits at startup, before any request.
+    /// The state slabs and address tables a load commits at startup, before
+    /// any request: the pool blocks holding at least the opening request-slot
+    /// reservation (`max(initial_slab_bytes, request_slot_bytes)`) plus the
+    /// fixed address tables.
     pub fn startup_state_bytes(&self) -> Result<u64, String> {
         startup_state_bytes(self.history_bytes, self.recurrent_banks_bytes)
+    }
+
+    /// The load's opening request-slot reservation (`CommittedKind::RequestSlot`),
+    /// held from startup beside the resident weights and bank floor.
+    pub fn request_slot_bytes(&self) -> u64 {
+        self.request_slot_bytes
+    }
+
+    /// The bytes of a load's request slot (`CommittedKind::RequestSlot`):
+    /// one request's opening reservation, of a request about to write no rows
+    /// (`RequestRows::opening(0)`), by the page rule its reservations are
+    /// sized by (`LoadShape::state_bytes`); at least the state stores' first
+    /// slabs, which construction backs as granules within it.
+    pub fn request_slot_bytes_for(
+        target_state: &StateStorePlan,
+        head_state: Option<&StateStorePlan>,
+        limits: ResourceLimits,
+        method: PlannedMethod,
+    ) -> Result<u64, String> {
+        let initial = head_state
+            .map_or(Ok(0), StateStorePlan::initial_slab_bytes)
+            .and_then(|head| {
+                target_state
+                    .initial_slab_bytes()?
+                    .checked_add(head)
+                    .ok_or_else(|| "initial state slab charge overflows".to_owned())
+            })?;
+        let limit = crate::domain::claimed_through(0, target_state.context_rows, method);
+        let opening_rows = crate::domain::claimed_through(0, 0, method)
+            .saturating_add(limits.max_launch_rows as u64)
+            .min(limit);
+        let opening = crate::memory::ledger::LoadShape::of_states(target_state, head_state)
+            .state_bytes(opening_rows);
+        Ok(opening.max(initial))
     }
 
     pub fn target_state(&self) -> &StateStorePlan {
@@ -1445,6 +1489,7 @@ struct PlannedState {
     target_state: StateStorePlan,
     head_state: Option<StateStorePlan>,
     retained_entry_bytes: u64,
+    request_slot_bytes: u64,
     history_bytes: u64,
     recurrent_banks_bytes: u64,
 }
@@ -1488,17 +1533,20 @@ impl ResourcePlanner {
             layout.target_recurrent,
             layout.head_history,
             context_limit,
+            method,
             limits,
             capacity_bytes,
             None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn plan_state_from_layout(
         target_history: Vec<HistoryDomainLayout>,
         target_recurrent: Vec<ComponentSpec>,
         head_history: Vec<HistoryDomainLayout>,
         context_limit: u64,
+        method: PlannedMethod,
         limits: ResourceLimits,
         capacity_bytes: ResourceCapacity,
         seeded_banks: Option<(u64, u32)>,
@@ -1641,14 +1689,22 @@ impl ResourcePlanner {
             )
             .ok_or("startup bank slab charge overflows")?;
         // What the stores' construction commits: their tables and the whole
-        // blocks of the one state pool holding their first slabs (their
-        // state floor claims and the pool's spare beside them), of which the
-        // history's share is the rest beside the banks'.
+        // blocks of the one state pool holding at least the opening
+        // request-slot reservation (max of their first slabs and the opening
+        // request slot, which startup claims beside the import window), of
+        // which the history's share is the rest beside the banks'.
         let stores = || std::iter::once(&target_state).chain(head_state.as_ref());
         let slabs = stores().try_fold(0u64, |total, store| total.checked_add(store.initial_slab_bytes()?).ok_or_else(|| String::from("startup slab charge overflows")))?;
         let tables = stores().try_fold(0u64, |total, store| total.checked_add(store.table_bytes()?).ok_or_else(|| String::from("startup table charge overflows")))?;
+        let request_slot_bytes = StateResourcePlan::request_slot_bytes_for(
+            &target_state,
+            head_state.as_ref(),
+            limits,
+            method,
+        )?;
+        let startup_slabs = slabs.max(request_slot_bytes);
         let history = target_state
-            .slab_charge(slabs)?
+            .slab_charge(startup_slabs)?
             .checked_add(tables)
             .and_then(|committed| committed.checked_sub(planned_recurrent))
             .ok_or("startup history slab charge overflows")?;
@@ -1685,6 +1741,7 @@ impl ResourcePlanner {
             target_state,
             head_state,
             retained_entry_bytes,
+            request_slot_bytes,
             history_bytes: history,
             recurrent_banks_bytes: planned_recurrent,
         })
@@ -1717,6 +1774,7 @@ impl ResourcePlanner {
             target_state: planned.target_state,
             head_state: planned.head_state,
             retained_entry_bytes: planned.retained_entry_bytes,
+            request_slot_bytes: planned.request_slot_bytes,
             history_bytes: planned.history_bytes,
             recurrent_banks_bytes: planned.recurrent_banks_bytes,
         })
@@ -1778,6 +1836,7 @@ impl ResourcePlanner {
         target_recurrent: &[ComponentSpec],
         head_history: &[HistoryDomainLayout],
         context_limit: u64,
+        method: PlannedMethod,
         limits: ResourceLimits,
         capacity_bytes: ResourceCapacity,
         seeded_banks: Option<(u64, u32)>,
@@ -1787,6 +1846,7 @@ impl ResourcePlanner {
             target_recurrent.to_vec(),
             head_history.to_vec(),
             context_limit,
+            method,
             limits,
             capacity_bytes,
             seeded_banks,
@@ -1912,6 +1972,7 @@ impl ResourcePlanner {
             target_state: state.target_state,
             head_state: state.head_state,
             retained_entry_bytes: state.retained_entry_bytes,
+            request_slot_bytes: state.request_slot_bytes,
             bytes,
             target_graph,
             target_readout_graph,
@@ -2281,6 +2342,77 @@ mod slab_plan_tests {
             plan.bank_bytes_at_count(5).unwrap(),
             banks.address_table_bytes + 2 * granule
         );
+    }
+
+    #[test]
+    fn startup_state_bytes_covers_request_slot_when_exceeding_initial_slabs() {
+        let history = ComponentDescriptor::new(
+            LayerRef::Target(0),
+            KvCodec::Dense.spec(DType::BF16, 256, 128),
+            1,
+        )
+        .unwrap();
+        let target_history = vec![HistoryDomainLayout::Token {
+            components: vec![history],
+        }];
+        let limits = ResourceLimits {
+            max_launch_rows: 512,
+            max_launch_slots: 8,
+            max_selected_rows: 8,
+            max_drafting_slots: 8,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: NonZeroUsize::MIN,
+            conversations: NonZeroUsize::MIN,
+        };
+        let capacity = ResourceCapacity {
+            domain_bytes: 1 << 30,
+            tensor_operations: TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
+        };
+        let context_limit = 4096;
+        let planned = ResourcePlanner::plan_state_from_layout(
+            target_history.clone(),
+            Vec::new(),
+            Vec::new(),
+            context_limit,
+            PlannedMethod::Plain,
+            limits,
+            capacity,
+            None,
+        )
+        .unwrap();
+        let initial_slabs = planned.target_state.initial_slab_bytes().unwrap();
+        let tables = planned.target_state.table_bytes().unwrap();
+        let startup = startup_state_bytes(planned.history_bytes, planned.recurrent_banks_bytes).unwrap();
+        assert!(
+            planned.request_slot_bytes > initial_slabs,
+            "expected request_slot_bytes ({}) > initial_slab_bytes ({initial_slabs})",
+            planned.request_slot_bytes
+        );
+        assert!(
+            startup >= planned.request_slot_bytes,
+            "startup_state_bytes ({startup}) must cover request_slot_bytes ({})",
+            planned.request_slot_bytes
+        );
+        assert_eq!(
+            startup,
+            planned.target_state.slab_charge(planned.request_slot_bytes).unwrap() + tables
+        );
+        let (_, from_layout_startup) = ResourcePlanner::state_bytes_from_layout(
+            &target_history,
+            &[],
+            &[],
+            context_limit,
+            PlannedMethod::Plain,
+            limits,
+            capacity,
+            None,
+        )
+        .unwrap();
+        assert_eq!(from_layout_startup, startup);
     }
 }
 

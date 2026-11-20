@@ -7,7 +7,6 @@
 use crate::error::{classify_plan, classify_platform, PlanOutcome, PreviewError};
 use crate::options::ExecutionManifest;
 use crate::planning::{plan_execution, ExecutionPlanningError};
-use magnitude_executor::{AssessmentMemoryTerms, ResourceCapacity, ResourcePlanner};
 use seismic::{BackendName, Devices, ExecutorSelector};
 use serde::{Deserialize, Serialize};
 
@@ -88,60 +87,12 @@ impl ExecutionManifest {
             ExecutionPlanningError::Plan(error) => classify_plan(error, backend).into(),
             error => PreviewError::from(PlanOutcome::Internal(error.to_string())),
         })?;
-        let (draft, bounds) = (planned.draft(), planned.charge().bounds);
-        let definition = &manifest.definition;
-        let policy = draft.policy();
-        let terms = AssessmentMemoryTerms::derive(
-            definition,
-            draft.load(),
-            policy.selection(),
-            policy.codec(),
-            policy.method(),
-            policy.limits(),
-        )
-        .map_err(internal)?;
-        let state = ResourcePlanner::state_plan(
-            definition,
-            draft.load(),
-            policy.method(),
-            policy.codec(),
-            policy.limits(),
-            ResourceCapacity {
-                domain_bytes: magnitude_executor::StableRoom::of_selected(&selected).capacity().map_err(|error| internal(error.to_string()))?,
-                tensor_operations: magnitude_executor::TensorOperations::of(
-                    selected.info.forms_tensor_operations(),
-                ),
-                allocations: selected.info.limits().allocations(),
-            },
-        )
-        .map_err(|error| internal(error.to_string()))?;
-        let initial_state = state
-            .target_state()
-            .initial_committed_bytes()
-            .and_then(|target| {
-                let head = state
-                    .head_state()
-                    .map(|head| head.initial_committed_bytes())
-                    .transpose()?
-                    .unwrap_or(0);
-                target
-                    .checked_add(head)
-                    .ok_or_else(|| "initial state byte count overflow".to_owned())
-            })
+        let required_bytes = planned
+            .charge()
+            .startup_required_bytes(&selected.reading.topology, &selected.info)
             .map_err(internal)?;
-        let required_bytes = [
-            terms.target_weights,
-            terms.head_weights,
-            terms.vision_weights,
-            initial_state,
-            bounds.prepared_resource_bytes().map_err(internal)?,
-            bounds.startup_additional_bytes,
-        ]
-        .into_iter()
-        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
-        .ok_or_else(|| internal("startup byte count overflow"))?;
         Ok(LoadPreview {
-            context_tokens: definition.decoder.context_limit,
+            context_tokens: manifest.definition.decoder.context_limit,
             device: selected.info.selector(),
             backend,
             required_bytes,
@@ -225,5 +176,36 @@ mod tests {
             || std::future::ready(Err("never measured")),
         ));
         assert_eq!(unsupported, Ok(Err(PreviewError::Internal { reason: "no plan".into() })));
+    }
+
+    /// `LoadPreview::required_bytes` delegates directly to the planned
+    /// charge's `startup_required_bytes` for the selected device.
+    #[test]
+    fn preview_required_bytes_matches_planned_charge_startup_required_bytes() {
+        let cache = tempfile::tempdir().unwrap();
+        let definition = fixtures::tiny_definition();
+        let model = crate::options::ModelPolicy::default().resolve(&definition).unwrap();
+        let manifest = ExecutionManifest::new(
+            fixtures::tiny_manifest(&definition),
+            definition,
+            model,
+            crate::options::standard_service_limits(),
+            ExecutionPath::Native,
+            DeviceRequest::Backend(BackendName::Cpu),
+            Some(cache.path().to_owned()),
+            Some(cache.path().to_owned()),
+            ReleaseRate::of_machine(None),
+        )
+        .unwrap();
+        let catalog = Devices::discover(&[]).unwrap();
+        let selected = crate::planning::select_load_device(&catalog, &manifest).unwrap();
+        crate::execution::store_fixed_costs(&catalog.topology(), &selected.info, cache.path());
+        let preview = manifest.preview(&catalog).unwrap();
+        let planned = plan_execution::<magnitude_executor::AssessmentMemoryCharge>(&manifest, &selected).unwrap();
+        let expected = planned
+            .charge()
+            .startup_required_bytes(&selected.reading.topology, &selected.info)
+            .unwrap();
+        assert_eq!(preview.required_bytes, expected);
     }
 }

@@ -611,6 +611,14 @@ pub fn finish_model_assessment(
     let definition = execution.definition();
     let structure = &setup.structure;
     let pricing = structure.selected.graph_cost;
+    let bank_prices = match &setup.measurements {
+        Measurements::Measured {
+            costs,
+            streamed: Priced::Measured(figures),
+            ..
+        } => Some((&**costs, figures)),
+        _ => None,
+    };
     let served = served_tier(tiers.len(), |index| {
         let tier = tiers[index];
         let fit = assess_execution_fit_at_context(
@@ -619,6 +627,7 @@ pub fn finish_model_assessment(
             pricing,
             &structure.topology,
             &structure.status,
+            bank_prices,
         )
         .map_err(ModelAssessmentError::Assessment)?;
         Ok::<_, ModelAssessmentError>(match fit {

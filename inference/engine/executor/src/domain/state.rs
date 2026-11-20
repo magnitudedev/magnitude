@@ -1282,13 +1282,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 /// the state stores' first slabs, which construction backs as granules
 /// within it.
 pub fn request_slot_bytes(execution: &ExecutionPlan) -> Result<u64, String> {
-    let resources = execution.resources();
-    let initial = resources
-        .head_state()
-        .map_or(Ok(0), |state| state.initial_slab_bytes())
-        .and_then(|head| resources.target_state().initial_slab_bytes().map(|target| target + head))?;
-    let opening = crate::memory::ledger::LoadShape::of(execution).state_bytes(crate::memory::ledger::RequestRows::of(execution).opening(0));
-    Ok(opening.max(initial))
+    Ok(execution.resources().request_slot_bytes())
 }
 
 /// The row a sequence's state claim reaches through a group that advances

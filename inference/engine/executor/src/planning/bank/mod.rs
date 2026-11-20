@@ -1218,6 +1218,146 @@ impl ExpertBankPlan {
         let kind = RoutedTensor::of(role.kind)?;
         self.layer(role.scope).and_then(|(_, layer)| layer.resident.get(kind))
     }
+
+    /// Group `group`'s least records ([`Self::least_records`]) with `reserve`
+    /// tier-reserve records instead of `self.tier_reserve()`.
+    fn least_records_with_reserve(&self, group: usize, reserve: u64) -> u64 {
+        let decode = match self.placer() {
+            Placer::Tier => 0,
+            Placer::Bank => decode_set(self.selected(), self.widest_member(group)) + reserve,
+        };
+        let prompt = if group != self.lender_group() {
+            0
+        } else {
+            let lent = self.scratch().lender.records;
+            match self.placer() {
+                Placer::Bank => lent + reserve,
+                Placer::Tier => lent,
+            }
+        };
+        decode.max(prompt).max(1)
+    }
+
+    /// Group `group`'s records (`BANK`, [`Self::records`]) at `paths`.
+    pub(super) fn records_with_paths(&self, group: usize, paths: BankPaths) -> u64 {
+        let reserve = paths.records().reserve;
+        let experts = self.member_experts(group).sum::<u64>();
+        let records = match self.placer() {
+            Placer::Tier => experts,
+            Placer::Bank => experts + reserve,
+        };
+        records.max(self.least_records_with_reserve(group, reserve))
+    }
+
+    /// Group `group`'s committed records ([`Self::records_at`]) at `slots`
+    /// and `paths`.
+    pub fn records_at_with_paths(&self, group: usize, slots: u64, paths: BankPaths) -> u64 {
+        let reserve = paths.records().reserve;
+        let held = self.member_experts(group).map(|experts| Self::layer_slots(slots, experts)).sum::<u64>();
+        let landing = match self.placer() {
+            Placer::Tier => 0,
+            Placer::Bank => reserve,
+        };
+        (held + landing).max(self.least_records_with_reserve(group, reserve))
+    }
+
+    /// The least `slots` ([`Self::floor`]) at `paths`.
+    pub fn floor_with_paths(&self, paths: BankPaths) -> u64 {
+        let reserve = paths.records().reserve;
+        let least = |slots: u64| {
+            (0..self.groups().len())
+                .all(|group| self.records_at_with_paths(group, slots, paths) == self.least_records_with_reserve(group, reserve))
+        };
+        let (mut needed, mut past) = (0, self.widest().get() + 1);
+        while past - needed > 1 {
+            let middle = needed + (past - needed) / 2;
+            match least(middle) {
+                true => needed = middle,
+                false => past = middle,
+            }
+        }
+        needed
+    }
+
+    /// What the bank's pool is charged for its records at `slots` and `paths`
+    /// (matching [`Self::resident_charge`] with `self.paths = paths`).
+    pub fn resident_charge_with_paths(&self, slots: u64, paths: BankPaths) -> Result<u64, String> {
+        let granules = (0..self.groups().len()).try_fold(0u64, |total, group| {
+            let pooled = self
+                .records_at_with_paths(group, slots, paths)
+                .checked_sub(self.lent(group))
+                .expect("a group's committed records hold its lent ones");
+            total.checked_add(pooled).ok_or_else(|| "bank record count overflows".to_owned())
+        })?;
+        self.pooled_charge(granules).ok_or_else(|| "bank record charge overflows".to_owned())
+    }
+
+    /// Group `group`'s committed host tier records ([`Self::host_records`])
+    /// at `host_slots` and `paths`.
+    pub fn host_records_with_paths(&self, group: usize, host_slots: u64, paths: BankPaths) -> u64 {
+        match self.tiered() {
+            true => (self
+                .member_experts(group)
+                .map(|experts| Self::layer_slots(host_slots, experts))
+                .sum::<u64>()
+                .max(self.choices() + paths.records().ahead)
+                + self.host_lent(group))
+            .min(self.host_extent(group)),
+            false => 0,
+        }
+    }
+
+    /// What the host tier's pool is charged ([`Self::host_charge`]) at
+    /// `host_slots` and `paths`.
+    pub fn host_charge_with_paths(&self, host_slots: u64, paths: BankPaths) -> Result<u64, String> {
+        if self.host_granule().is_none() {
+            return Ok(0);
+        }
+        let granules = (0..self.groups().len()).try_fold(0u64, |total, group| {
+            let pooled = self
+                .host_records_with_paths(group, host_slots, paths)
+                .checked_sub(self.host_lent(group))
+                .expect("a group's host records hold its lent ones");
+            total.checked_add(pooled).ok_or_else(|| "host tier records overflow".to_owned())
+        })?;
+        self.pooled_charge(granules).ok_or_else(|| "host tier bytes overflow".to_owned())
+    }
+
+    /// The pools' granules demanded at `slots` and `paths` (matching
+    /// [`Self::pooled_demand`] with `self.slots = slots` and `self.paths = paths`).
+    pub fn pooled_demand_at(&self, slots: u64, paths: BankPaths) -> Result<ClaimDemand, String> {
+        let mut demand = ClaimDemand::pooled(BankTier::Bank, self.resident_charge_with_paths(slots, paths)?);
+        if !self.tables.is_empty() {
+            demand = demand
+                .checked_plus(ClaimDemand::pooled(BankTier::Bank, self.tables_charge()?))
+                .ok_or_else(|| "bank storage demand overflows".to_owned())?;
+        }
+        if self.tiered() {
+            demand = demand
+                .checked_plus(ClaimDemand::pooled(BankTier::Host, self.host_charge_with_paths(0, paths)?))
+                .ok_or_else(|| "bank storage demand overflows".to_owned())?;
+        }
+        Ok(demand)
+    }
+
+    /// Exact physical storage demanded by this bank at `(slots, places, paths)`,
+    /// matching [`Self::storage_demand`] of a bank built with those parameters.
+    pub fn storage_demand_at(&self, slots: u64, places: u64, paths: BankPaths) -> Result<ClaimDemand, String> {
+        let sub = |a: ClaimDemand, b: ClaimDemand| -> Result<ClaimDemand, String> {
+            a.checked_minus(b).ok_or_else(|| "bank storage demand underflows".to_owned())
+        };
+        let demand = sub(self.storage_demand()?, self.places_storage_demand(self.places)?)?;
+        let demand = sub(demand, self.paths_layout_demand(self.paths)?)?;
+        let demand = sub(demand, self.pooled_demand_at(self.slots, self.paths)?)?;
+        let places_demand = self.places_storage_demand(places)?;
+        let paths_demand = self.paths_layout_demand(paths)?;
+        let pooled_demand = self.pooled_demand_at(slots, paths)?;
+        demand
+            .checked_plus(places_demand)
+            .and_then(|d| d.checked_plus(paths_demand))
+            .and_then(|d| d.checked_plus(pooled_demand))
+            .ok_or_else(|| "bank storage demand overflows".to_owned())
+    }
 }
 
 #[cfg(test)]
