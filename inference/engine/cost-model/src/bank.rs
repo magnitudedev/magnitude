@@ -89,7 +89,12 @@ impl Prior {
     /// The prior of a load planning `context` rows of context in launches
     /// of at most `launch_rows` rows, the widest row class of which is
     /// `region_rows`.
+    ///
+    /// # Panics
+    /// Where `launch_rows` or `region_rows` is zero.
     pub fn of(context: u64, launch_rows: u64, region_rows: u64) -> Result<Self, PriorOverflow> {
+        assert!(launch_rows > 0, "invariant violated: a prior's launch has at least one row");
+        assert!(region_rows > 0, "invariant violated: a prior's region has at least one row");
         let narrow = |figure: u64| u32::try_from(figure).map_err(|_| PriorOverflow);
         let context = context.max(2);
         let prefill_tokens = context / 2;
@@ -158,6 +163,9 @@ impl PassLayers {
 /// a pass's seconds by its rows; none where the bank holds every expert).
 /// Fewer, longer passes read each expert fewer times, from the device's
 /// memory and from storage alike.
+///
+/// # Panics
+/// Where `region_rows` or `launches` is zero, or their product overflows `u64`.
 pub(crate) fn routed_prompt_seconds(
     passes: &ExpertPass,
     routed: &[PassLayers],
@@ -167,7 +175,9 @@ pub(crate) fn routed_prompt_seconds(
     launches: u64,
     reads: &dyn Fn(u64) -> f64,
 ) -> f64 {
-    let pass_rows = region_rows * launches;
+    assert!(region_rows > 0, "invariant violated: a prompt pass's region has at least one row");
+    assert!(launches > 0, "invariant violated: a prompt pass runs at least one launch");
+    let pass_rows = region_rows.checked_mul(launches).expect("invariant violated: a prompt pass's rows overflow u64");
     let windows = windows.max(1) as f64;
     let one = |rows: u64| -> f64 {
         routed
@@ -204,6 +214,9 @@ impl BankPrices {
     /// `windows` windows, its file reads along `read`, its step `compute`
     /// in each form, under `rates`, its passes' regions `region_rows` rows
     /// and its prompts `prompt_rows`.
+    ///
+    /// # Panics
+    /// Where `region_rows` is zero.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         layers: StreamedLayers,
@@ -216,6 +229,7 @@ impl BankPrices {
         region_rows: u64,
         prompt_rows: u64,
     ) -> Self {
+        assert!(region_rows > 0, "invariant violated: a bank's prompt region has at least one row");
         Self { layers, pass, routed, windows, read, compute, rates, region_rows, prompt_rows }
     }
 
@@ -317,5 +331,50 @@ impl PathRecords {
     /// releases each victim as its move is issued.
     pub fn release(step: f64, reads: f64) -> f64 {
         (step - reads).max(0.) / 2.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compute::HostReads;
+    use seismic_measure::pricing::{Format, Rates};
+
+    fn empty_pass() -> ExpertPass {
+        let rates = Rates {
+            activation: Format("bf16"),
+            weights: Vec::new(),
+            flops: Vec::new(),
+            history: Vec::new(),
+            launch: 0.,
+            decode: None,
+        };
+        ExpertPass::new(rates, Vec::new(), HostReads::Read)
+    }
+
+    #[test]
+    #[should_panic(expected = "invariant violated")]
+    fn prior_rejects_zero_launch_rows() {
+        let _ = Prior::of(1024, 0, 16);
+    }
+
+    #[test]
+    #[should_panic(expected = "invariant violated")]
+    fn prior_rejects_zero_region_rows() {
+        let _ = Prior::of(1024, 16, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "invariant violated")]
+    fn routed_prompt_seconds_rejects_zero_region_rows() {
+        let pass = empty_pass();
+        let _ = routed_prompt_seconds(&pass, &[], 1, 0, 128, 1, &|_| 0.);
+    }
+
+    #[test]
+    #[should_panic(expected = "invariant violated")]
+    fn routed_prompt_seconds_rejects_zero_launches() {
+        let pass = empty_pass();
+        let _ = routed_prompt_seconds(&pass, &[], 1, 16, 128, 0, &|_| 0.);
     }
 }

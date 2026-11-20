@@ -42,7 +42,7 @@
 //! read bytes, wrong hints' among them; nor the link's, `K_s` the step's
 //! reads in place and its moves on it.
 
-use crate::expert_lines::ExpertLines;
+use crate::expert_lines::{ExpertLines, Miss};
 use crate::lines::ReadLine;
 use std::collections::HashMap;
 
@@ -180,41 +180,17 @@ impl StepInputs<'_> {
         let total_misses = load.tier + load.file;
         let hits_experts = (load.routed - total_misses as f64).max(0.);
         let hit_ns = hits_experts * lines.gpu.resident.nanoseconds(load.rows);
-        let (mut gpu, mut cpu) = (hit_ns, 0f64);
-        let mut served_cpu = false;
-        let mut link_count = 0u64;
-        if total_misses > 0 {
-            let link_busy = lines.gpu.moves.link.get();
-            let link_ns = lines.gpu.link.nanoseconds(load.rows);
-            let cpu_params = lines.host.cpu.map(|c| (c.expert.nanoseconds(load.rows), c.handshake.get()));
-            // Identical to `ExpertLines::serve(Pass::Decode, ...)` for uniform `load.rows`:
-            // `load.tier` misses ready at 0.0, followed by `load.file` misses ready at `ready`.
-            for (count, ready_ns) in [(load.tier, 0.0), (load.file, ready * 1e9)] {
-                for _ in 0..count {
-                    let on_cpu = cpu_params.map(|(expert_ns, handshake)| {
-                        let h = if served_cpu { 0. } else { handshake };
-                        cpu.max(ready_ns) + expert_ns + h
-                    });
-                    let in_place = gpu.max(ready_ns).max(link_busy) + link_ns;
-                    match on_cpu {
-                        Some(end) if end <= in_place => {
-                            cpu = end;
-                            served_cpu = true;
-                        }
-                        _ => {
-                            gpu = in_place;
-                            link_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-        let end_seconds = gpu.max(cpu) * 1e-9;
+        // `load.tier` misses ready at 0.0, followed by `load.file` misses ready at `ready`.
+        let misses = (0..load.tier)
+            .map(|_| ((), Miss { rows: load.rows, ready_seconds: 0.0 }))
+            .chain((0..load.file).map(|_| ((), Miss { rows: load.rows, ready_seconds: ready })));
+        let schedule = lines.serve_decode(hit_ns, misses, |(), _| {});
+        let end_seconds = schedule.gpu_ns.max(schedule.cpu_ns) * 1e-9;
         // Host memory bounds the CPU, the link and the moves together:
         // every miss and every moved record leaves it at `t_ram`.
         let leave = (total_misses as f64 + lines.gpu.moves.records) * memory.get() * 1e-9;
         let hit = hit_ns * 1e-9;
-        let in_place = link_count as f64 * lines.gpu.link.nanoseconds(load.rows);
+        let in_place = schedule.link_count as f64 * lines.gpu.link.nanoseconds(load.rows);
         ((end_seconds.max(leave) - hit).max(0.), (in_place + lines.gpu.moves.link.get()) * 1e-9)
     }
 
@@ -324,7 +300,11 @@ impl StepInputs<'_> {
                 let lines = &self.lines[first];
                 assert!(self.lines[first..first + run.layers].iter().all(|layer| layer == lines), "invariant violated: a run's layers have one line");
                 first += run.layers;
-                let wrong = hinted as f64 * (1. / self.ahead.precision - 1.);
+                let wrong = if hinted == 0 || self.ahead.precision <= 0. {
+                    0.
+                } else {
+                    hinted as f64 * (1. / self.ahead.precision - 1.)
+                };
                 (lines, hinted, wrong, run.load.file - hinted)
             })
             .collect::<Vec<_>>();
@@ -505,6 +485,9 @@ impl StepInputs<'_> {
             bytes += read * times;
             link += moved * times;
         }
+        if count == 0. {
+            return StepTime { compute: self.compute, ..StepTime::default() };
+        }
         let (scheduled, served, bytes, link) = (scheduled / count, served / count, bytes / count, link / count);
         let sustained = bytes * self.sustained;
         StepTime {
@@ -574,7 +557,7 @@ fn distinct<K: std::hash::Hash + Eq, T>(items: impl IntoIterator<Item = (K, T, u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expert_lines::{GpuLines, Hits, HostLines, LandingLine, Miss, Moves, Nanoseconds, Pass, PassLine, Site};
+    use crate::expert_lines::{GpuLines, Hits, HostLines, LandingLine, Moves, Nanoseconds, Pass, PassLine, Site};
     use crate::lines::{FileLine, RecordLine};
 
     /// A record alone in 1 ms at 2 GB/s: 2 MB records, `λ` 0.
@@ -817,6 +800,72 @@ mod tests {
                 .collect::<Vec<_>>();
             let total = step.run(steps.iter().map(|runs| (runs.as_slice(), 1))).total;
             assert!((total / cell.measured - 1.).abs() < 0.1, "{:.1} ms ≠ {:.1} ms", total * 1e3, cell.measured * 1e3);
+        }
+    }
+
+    /// Zero hinted reads with zero precision never produces NaN from
+    /// `0.0 * (1.0 / 0.0 - 1.0)`.
+    #[test]
+    fn hinted_zero_with_zero_precision_does_not_produce_nan() {
+        let lines = [unified(); 4];
+        let zero_prec = StepInputs { ahead: ReadAhead { precision: 0., lead: Lead::Layers(1.) }, ..inputs(&lines, Lead::Layers(1.), 1.) };
+        let loads = [load(0, 0.), load(2, 0.), load(0, 0.), load(0, 0.)];
+        let (step, served, bytes, link) = one(&zero_prec, &loads);
+        assert!(step.is_finite() && served.is_finite() && bytes.is_finite() && link.is_finite());
+        close(step, 1e-3 + 2e-3 + 3e-3);
+        close(bytes, 2. * 2e6);
+
+        let token_zero = StepInputs { ahead: ReadAhead { precision: 0., lead: Lead::Token }, ..zero_prec };
+        let (step, served, bytes, link) = one(&token_zero, &[load(0, 0.); 4]);
+        assert!(step.is_finite() && served.is_finite() && bytes.is_finite() && link.is_finite());
+        close(step, 4e-3);
+        close(bytes, 0.);
+    }
+
+    /// Averaging an empty run (or zero-weight steps) returns zeroed means with
+    /// `compute` preserved rather than dividing by zero into NaN.
+    #[test]
+    fn empty_run_mean_does_not_produce_nan() {
+        let lines = [unified(); 4];
+        let demand = inputs(&lines, Lead::Layers(0.), 1.);
+        let empty = demand.run(std::iter::empty::<(&[LayerRun], usize)>());
+        assert_eq!(empty, StepTime { compute: demand.compute, ..StepTime::default() });
+        let zero_count = runs(&[load(1, 0.); 4]);
+        let zeroed = demand.run([(&zero_count[..], 0)]);
+        assert_eq!(zeroed, StepTime { compute: demand.compute, ..StepTime::default() });
+    }
+
+    /// `StepInputs::service` and `ExpertLines::serve(Pass::Decode, ...)` share
+    /// the same decode assignment schedule: exposed time and link-served count
+    /// match across tier/file readiness, CPU/link tie-breaking, link moves and
+    /// unsited lines.
+    #[test]
+    fn service_matches_expert_lines_serve_for_uniform_misses() {
+        let base = ExpertLines::reference(ExpertLines::REFERENCE_RECORD);
+        let moving = base.moving(Some((100e-6, 0.5)));
+        let unsited = ExpertLines { host: HostLines { cpu: None, ..base.host }, ..base };
+        for lines in [base, moving, unsited] {
+            let layer_lines = [lines];
+            let step_in = inputs(&layer_lines, Lead::Layers(0.), 1.);
+            for (tier, file, ready) in [(0, 0, 0.), (3, 0, 0.), (4, 0, 0.), (2, 3, 250e-6), (0, 2, 50e-6)] {
+                let layer_load = LayerLoad { routed: 12., rows: 1., tier, file, recall: 0. };
+                let (service, link) = step_in.service(&lines, layer_load, ready);
+
+                let total_misses = tier + file;
+                let hits_experts = (layer_load.routed - total_misses as f64).max(0.);
+                let mut misses = vec![Miss { rows: layer_load.rows, ready_seconds: 0. }; tier as usize];
+                misses.extend(std::iter::repeat_n(Miss { rows: layer_load.rows, ready_seconds: ready }, file as usize));
+                let served = lines.serve(Pass::Decode, &[Hits { experts: hits_experts, rows: layer_load.rows }], &misses);
+
+                let memory = lines.host.memory.unwrap().get();
+                let hit = hits_experts * lines.gpu.resident.nanoseconds(layer_load.rows) * 1e-9;
+                let leave = (total_misses as f64 + lines.gpu.moves.records) * memory * 1e-9;
+                let expected_service = (served.end_seconds.max(leave) - hit).max(0.);
+                let expected_link = (served.at(Site::Link) as f64 * lines.gpu.link.nanoseconds(layer_load.rows) + lines.gpu.moves.link.get()) * 1e-9;
+
+                close(service, expected_service);
+                close(link, expected_link);
+            }
         }
     }
 }

@@ -116,7 +116,7 @@ impl LiveDecode {
     fn shares(&self, layer: usize, slots: usize, model: Shares) -> Shares {
         let reads = &self.layers[layer];
         let all = reads.misses[0];
-        if all == 0 {
+        if all == 0 || self.steps == 0 || !self.rows.is_finite() || self.rows <= 0. {
             return model;
         }
         let at = slots.min(reads.misses.len() - 1);
@@ -128,6 +128,9 @@ impl LiveDecode {
     /// counted steps (each read counted once, at its depth); none where it
     /// read nothing, where the generic model's `D(r)` stands.
     fn routed(&self, layer: usize) -> Option<f64> {
+        if self.steps == 0 {
+            return None;
+        }
         match self.layers[layer].misses[0] {
             0 => None,
             all => Some(all as f64 / self.steps as f64),
@@ -647,5 +650,23 @@ mod tests {
         assert!((group_reads - more_rows).abs() < 1e-12, "group_reads ({group_reads}) must stay independent of row count ({more_rows})");
         // Whole bank has zero prompt miss reads.
         assert_eq!(layers.pass_reads(READ, HeldSlots::bank(32), rows), 0.);
+    }
+
+    /// A `LiveDecode` with zero counted steps or non-positive/non-finite rows
+    /// falls back cleanly to the generic model without dividing by zero or
+    /// producing NaN/infinite shares.
+    #[test]
+    fn live_decode_guards_zero_steps_and_non_positive_rows() {
+        let reads = LayerReads::of_depths(&[2, 1, 0, 0, 1], &[1, 1, 0, 0, 1]);
+        let model = Shares { misses: 0.5, requests: 0.75 };
+
+        let zero_steps = LiveDecode { layers: vec![reads.clone()], steps: 0, rows: 1., depth: 100 };
+        assert_eq!(zero_steps.shares(0, 1, model), model);
+        assert_eq!(zero_steps.routed(0), None);
+
+        for bad_rows in [0., -1., f64::NAN, f64::INFINITY] {
+            let bad = LiveDecode { layers: vec![reads.clone()], steps: 1, rows: bad_rows, depth: 100 };
+            assert_eq!(bad.shares(0, 1, model), model);
+        }
     }
 }
