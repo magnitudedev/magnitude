@@ -521,6 +521,10 @@ impl DirectGraphBuilder {
             exec.set_enabled(self.graph.node(node), false).map_err(refused)?;
         }
         exec.upload(self.device.stream()).map_err(refused)?;
+        // `cuGraphUpload` enqueues asynchronous work on the device stream;
+        // finish it before returning so back-to-back graph recordings
+        // (`cuda::record_run`) still observe an idle device.
+        self.device.stream().synchronize().map_err(refused)?;
         let launched = Event::new(self.device.context()).map_err(refused)?;
         self.device.graphs().instantiated(&change, &self.device, census)?;
         Ok(DirectGraph {
