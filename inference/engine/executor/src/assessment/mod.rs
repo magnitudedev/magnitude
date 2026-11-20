@@ -46,10 +46,11 @@ mod vision_traces;
 pub mod synthetic;
 
 pub use assess::{
-    assess_execution_fit, decode_demand, estimate_execution, launch_prices, lookahead, execution_memory_charge,
-    StructuralCharge, TargetLayoutCache,
-    prepare_execution_assessment, AssessmentRequest, ColdSource, DomainFit, ExecutionAssessment,
-    ExecutionFit, ExecutionShortfall, ExpertShares, FileOnly, MemoryBreakdown, ModelPlacement, PreparedExecutionAssessment, Residency,
+    assess_execution_fit, assess_execution_fit_with_priced_bank, decode_demand, estimate_execution,
+    launch_prices, lookahead, execution_memory_charge, PricedBankContext, StructuralCharge,
+    TargetLayoutCache, prepare_execution_assessment, AssessmentRequest, ColdSource, DomainFit,
+    ExecutionAssessment, ExecutionFit, ExecutionShortfall, ExpertShares, FileOnly, MemoryBreakdown,
+    ModelPlacement, PreparedExecutionAssessment, Residency,
 };
 pub use crate::programs::graph::sizing::SizingScope;
 pub use demand::{format_of, layout_of, Call, DecodeDemand};

@@ -970,6 +970,12 @@ impl ManagedModelAssessments {
     /// host's device where it is measured; `None` when the pool is closing.
     async fn attempt(&self, item: AssessmentWork) -> Option<AssessmentOutcome> {
         let _permit = Arc::clone(&self.concurrency).acquire_owned().await.ok()?;
+        self.run_attempt(item).await
+    }
+
+    /// Execute one assessment attempt (after admission / concurrency control), sharing the host's
+    /// device where it is measured.
+    async fn run_attempt(&self, item: AssessmentWork) -> Option<AssessmentOutcome> {
         let _share = self.host.share().await;
         let key = item.key.clone();
         Some(
@@ -1038,18 +1044,17 @@ impl ManagedModelAssessments {
             (rekeyed, assessed)
         };
         self.cancel_unreferenced();
-        self.schedule(
-            rekeyed
-                .iter()
-                .filter(|(old, _)| !assessed.contains(*old))
-                .map(|(_, work)| work.clone())
-                .collect(),
-        );
+        let unassessed = rekeyed
+            .iter()
+            .filter(|(old, _)| !assessed.contains(*old))
+            .map(|(_, work)| work.clone())
+            .collect();
         let refinished = rekeyed
             .into_iter()
             .filter(|(old, _)| assessed.contains(old))
             .collect::<std::collections::BTreeMap<_, _>>();
         self.refinish(environment, refinished, measurement);
+        self.schedule(unassessed);
     }
 
     /// Finish each assessed model's work in `environment` again (`refinished`, by the key its
@@ -1064,12 +1069,17 @@ impl ManagedModelAssessments {
     ) {
         let service = Arc::clone(self);
         let handle = magnitude_service_utils::owner::spawn("an assessment refinish", async move {
-            let outcomes = futures_util::future::join_all(
-                refinished
-                    .values()
-                    .map(|work| service.attempt(work.clone())),
-            )
-            .await;
+            // Refinish runs over already-prepared bundles (pure CPU arithmetic), so it uses its
+            // own bounded concurrency rather than queueing behind unassessed preparations on
+            // `self.concurrency`.
+            let outcomes = futures_util::stream::iter(refinished.values().cloned())
+                .map(|work| {
+                    let service = Arc::clone(&service);
+                    async move { service.run_attempt(work).await }
+                })
+                .buffer_unordered(assessment_concurrency())
+                .collect::<Vec<_>>()
+                .await;
             let Some(outcomes) = outcomes.into_iter().collect::<Option<Vec<_>>>() else {
                 return;
             };

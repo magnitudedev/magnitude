@@ -1473,10 +1473,21 @@ impl AttestedPrograms {
     /// and allocator alignment. The programs' own storage
     /// ([`Self::DEVICE_BYTES`]) is charged separately.
     pub fn qualification_peak_bytes(load: &crate::ModelLoadPlan) -> Result<u64, String> {
+        let model = Self::qualification_peak_model(load)?;
+        match load.expert_bank() {
+            Some(bank) => model.peak_bytes(bank),
+            None => model.peak_bytes_unbanked(),
+        }
+    }
+
+    /// Precomputed O(routed_layers) qualification peak evaluator for a load
+    /// plan: separates slot-invariant scope bytes (including any head draft
+    /// projection fixture) from banked layer scopes so any bank slot count is
+    /// evaluated without cloning `ModelLoadPlan` or scanning all weights.
+    pub(crate) fn qualification_peak_model(
+        load: &crate::ModelLoadPlan,
+    ) -> Result<QualificationPeakModel, String> {
         use magnitude_family_contracts::{WeightKind, WeightScope};
-        const FIXTURES: u64 = 16 * 1024 * 1024;
-        /// The fixture set a weight belongs to: one per block (every
-        /// sublayer of it), head block, or other weight scope.
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         enum FixtureScope {
             Block(u32),
@@ -1497,7 +1508,7 @@ impl AttestedPrograms {
         };
         let mut scopes = HashMap::<FixtureScope, u64>::new();
         for weight in load.weights() {
-            if weight.role.kind == WeightKind::Embedding {
+            if weight.role.kind == WeightKind::Embedding || weight.banked().is_some() {
                 continue;
             }
             let scope = scopes.entry(fixture_scope(weight.role.scope)).or_default();
@@ -1555,9 +1566,25 @@ impl AttestedPrograms {
                 }
             }
         }
-        FIXTURES
-            .checked_add(scopes.into_values().max().unwrap_or(0))
-            .ok_or_else(|| "qualification peak byte count overflows".into())
+        let mut banked_by_scope = HashMap::<FixtureScope, Vec<usize>>::new();
+        if let Some(bank) = load.expert_bank() {
+            for (index, layer) in bank.layers().iter().enumerate() {
+                banked_by_scope
+                    .entry(fixture_scope(layer.scope))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut banked_scopes = Vec::with_capacity(banked_by_scope.len());
+        for (scope, layers) in banked_by_scope {
+            let base = scopes.remove(&scope).unwrap_or(0);
+            banked_scopes.push((base, layers));
+        }
+        let non_banked_peak = scopes.into_values().max().unwrap_or(0);
+        Ok(QualificationPeakModel {
+            non_banked_peak,
+            banked_scopes,
+        })
     }
     pub(crate) fn bind_target(
         &self,
@@ -1803,5 +1830,54 @@ impl AttestedPrograms {
     /// because no record was stored for them.
     pub fn unprepared(&self) -> usize {
         self.unprepared
+    }
+}
+
+/// Precomputed qualification peak evaluator for a load plan
+/// ([`AttestedPrograms::qualification_peak_model`]).
+#[derive(Clone, Debug)]
+pub(crate) struct QualificationPeakModel {
+    non_banked_peak: u64,
+    banked_scopes: Vec<(u64, Vec<usize>)>,
+}
+
+impl QualificationPeakModel {
+    const FIXTURES: u64 = 16 * 1024 * 1024;
+
+    pub(crate) fn peak_bytes_unbanked(&self) -> Result<u64, String> {
+        Self::FIXTURES
+            .checked_add(self.non_banked_peak)
+            .ok_or_else(|| "qualification peak byte count overflows".into())
+    }
+
+    pub(crate) fn peak_bytes(&self, bank: &crate::planning::ExpertBankPlan) -> Result<u64, String> {
+        let mut layer_bytes = Vec::with_capacity(bank.layers().len());
+        for index in 0..bank.layers().len() {
+            let banked = bank.banked_bytes(index)?;
+            let sum = banked
+                .iter()
+                .try_fold(0u64, |acc, (_, &bytes)| acc.checked_add(bytes))
+                .ok_or("qualification scope byte count overflows")?;
+            layer_bytes.push(sum);
+        }
+        self.peak_bytes_from_layers(&layer_bytes)
+    }
+
+    pub(crate) fn peak_bytes_from_layers(&self, layer_bytes: &[u64]) -> Result<u64, String> {
+        let mut peak = self.non_banked_peak;
+        for (base, layers) in &self.banked_scopes {
+            let mut scope_bytes = *base;
+            for &index in layers {
+                scope_bytes = scope_bytes
+                    .checked_add(layer_bytes[index])
+                    .ok_or("qualification scope byte count overflows")?;
+            }
+            if scope_bytes > peak {
+                peak = scope_bytes;
+            }
+        }
+        Self::FIXTURES
+            .checked_add(peak)
+            .ok_or_else(|| "qualification peak byte count overflows".into())
     }
 }

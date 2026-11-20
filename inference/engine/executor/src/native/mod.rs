@@ -14,6 +14,7 @@ mod vision;
 
 pub(crate) use attestation::{AttestedImport, AttestedLanding};
 pub use attestation::AttestedPrograms;
+pub(crate) use attestation::QualificationPeakModel;
 pub(crate) use attestation::{
     AttestedDraft, AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedMixer,
     AttestedSharedHead, AttestedState, AttestedTarget, AttestedTargetBlock, AttestedVision,

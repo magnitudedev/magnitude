@@ -340,8 +340,9 @@ impl StreamedLayers {
         hint_leads: u64,
         num_layers: u64,
     ) -> Option<crate::PathRecords> {
-        let step = self.step_seconds(None, read, held, 1.0, compute).total_seconds;
-        let reads = self.step_seconds(None, read, held, 1.0, FormSeconds { resident: 0., streamed: 0. }).total_seconds;
+        let period = self.prepare(None, held, 1.0);
+        let step = period.step_seconds(read, compute).total_seconds;
+        let reads = period.step_seconds(read, FormSeconds { resident: 0., streamed: 0. }).total_seconds;
         let queue = if num_layers == 0 {
             0.0
         } else {
