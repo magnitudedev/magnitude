@@ -103,6 +103,7 @@ struct Ends {
     spans: Vec<Span>,
     parent: Vec<usize>,
     parity: Vec<u8>,
+    size: Vec<u32>,
     /// Previously coloured buffer IDs whose `end` is still `>=` the current
     /// span's `start`. Because `colour` is called in birth order (`start`
     /// non-decreasing), any span with `end < span.start` can never overlap or
@@ -116,6 +117,7 @@ impl Ends {
             spans: Vec::with_capacity(cap),
             parent: Vec::with_capacity(cap),
             parity: Vec::with_capacity(cap),
+            size: Vec::with_capacity(cap),
             active: Vec::new(),
         }
     }
@@ -125,6 +127,7 @@ impl Ends {
         self.spans.push(span);
         self.parent.push(id);
         self.parity.push(0);
+        self.size.push(1);
         id
     }
 
@@ -137,7 +140,8 @@ impl Ends {
         }
         self.active.retain(|&id| self.spans[id].end >= span.start);
         let mut required: Vec<(usize, u8)> = Vec::new();
-        for &other in &self.active {
+        for index in 0..self.active.len() {
+            let other = self.active[index];
             if !span.crosses(self.spans[other]) {
                 continue;
             }
@@ -151,17 +155,40 @@ impl Ends {
         }
         let id = self.seed(span);
         self.active.push(id);
-        // The latest joiner is its block's root.
         for (root, want) in required {
-            self.parent[root] = id;
-            self.parity[root] = want;
+            self.union(id, root, want);
         }
         Some(id)
     }
 
-    fn find(&self, mut id: usize) -> (usize, u8) {
+    fn union(&mut self, a: usize, b: usize, diff: u8) {
+        let (ra, pa) = self.find(a);
+        let (rb, pb) = self.find(b);
+        if ra == rb {
+            debug_assert_eq!(pa ^ pb, diff, "invariant violated: conflicting parity in union");
+            return;
+        }
+        let root_diff = pa ^ pb ^ diff;
+        if self.size[ra] < self.size[rb] {
+            self.parent[ra] = rb;
+            self.parity[ra] = root_diff;
+            self.size[rb] += self.size[ra];
+        } else {
+            self.parent[rb] = ra;
+            self.parity[rb] = root_diff;
+            self.size[ra] += self.size[rb];
+        }
+    }
+
+    fn find(&mut self, mut id: usize) -> (usize, u8) {
         let mut relative = 0u8;
         while self.parent[id] != id {
+            let p = self.parent[id];
+            let gp = self.parent[p];
+            if gp != p {
+                self.parity[id] ^= self.parity[p];
+                self.parent[id] = gp;
+            }
             relative ^= self.parity[id];
             id = self.parent[id];
         }
@@ -610,5 +637,35 @@ mod tests {
                 &[256, 4096, 512, 2048, 256, 1024],
             ],
         );
+    }
+
+    #[test]
+    fn deep_chain_of_crossing_spans_colours_in_near_linear_time() {
+        let count = 10_000usize;
+        // Each span [2i, 2i + 3] crosses only its immediate neighbours (i - 1, i + 1):
+        // a pure bipartite chain of length 10,000 with no odd cycles.
+        let spans = (0..count)
+            .map(|i| Span {
+                start: 2 * i,
+                end: 2 * i + 3,
+            })
+            .collect::<Vec<_>>();
+        let scratch = vec![false; count];
+        let colours = colour_ends(&spans, &scratch);
+        assert_eq!(colours.len(), count);
+        for (i, &colour) in colours.iter().enumerate() {
+            assert!(
+                matches!(colour, Colour::End(_)),
+                "span {i} in a bipartite chain must be placed on an end, got {colour:?}"
+            );
+            if i > 0 {
+                assert_ne!(
+                    colours[i - 1],
+                    colour,
+                    "crossing neighbours {prev} and {i} must lie on opposite ends",
+                    prev = i - 1
+                );
+            }
+        }
     }
 }

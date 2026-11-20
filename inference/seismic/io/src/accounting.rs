@@ -85,8 +85,9 @@ pub struct Class {
     /// flight integrated over time.
     pub busy: f64,
     pub depth: f64,
-    /// The waits of the requests that ended, each counted by whether its
-    /// last piece was due when taken.
+    /// The waits of the requests that ran at least one piece and ended,
+    /// counted as due if any piece was taken as due (with `device` covering
+    /// only that class's pieces).
     pub waits: Waits,
 }
 
@@ -305,8 +306,16 @@ pub(crate) struct Wait {
     ahead: f64,
     queued: usize,
     in_flight: usize,
-    /// Whether its last piece taken was due.
-    due: bool,
+    /// Whether at least one piece of this request was ever taken.
+    taken: bool,
+    /// Whether the currently in-flight piece(s) were taken as due.
+    current_due: bool,
+    /// Whether any piece of this request was taken as due.
+    ever_due: bool,
+    /// Device time in flight split by piece class (`[due, ahead]`), so
+    /// `due.waits.device` and `due.bytes` always cover the exact same pieces
+    /// even when a request is repriced from ahead to due mid-flight.
+    device: [f64; 2],
     waits: Waits,
 }
 
@@ -314,7 +323,17 @@ impl Wait {
     /// A request of `pieces` pieces, due or not, of the volume `book`
     /// counts, submitted at `now`.
     pub(crate) fn new(pieces: usize, due: bool, book: &mut Book, now: Instant) -> Self {
-        Self { since: now, ahead: book.ahead(now), queued: pieces, in_flight: 0, due, waits: Waits::default() }
+        Self {
+            since: now,
+            ahead: book.ahead(now),
+            queued: pieces,
+            in_flight: 0,
+            taken: false,
+            current_due: due,
+            ever_due: false,
+            device: [0.; 2],
+            waits: Waits::default(),
+        }
     }
 
     /// The time waiting since it last was served (or submitted), to `now`.
@@ -331,10 +350,19 @@ impl Wait {
     pub(crate) fn taken(&mut self, due: bool, book: &mut Book, now: Instant) {
         if self.in_flight == 0 {
             self.waited(book, now);
+            self.current_due = due;
+        } else if self.current_due != due {
+            // Repriced while a piece of the previous class is still in flight:
+            // close out the previous class's elapsed device window before
+            // attributing subsequent flight time to the new class.
+            self.device[usize::from(!self.current_due)] += now.saturating_duration_since(self.since).as_secs_f64();
+            self.since = now;
+            self.current_due = due;
         }
         self.queued -= 1;
         self.in_flight += 1;
-        self.due = due;
+        self.taken = true;
+        self.ever_due |= due;
     }
 
     /// One of its pieces in flight ended at `now`: whether that ended the
@@ -344,29 +372,34 @@ impl Wait {
         if self.in_flight > 0 {
             return false;
         }
-        self.waits.device += now.saturating_duration_since(self.since).as_secs_f64();
+        self.device[usize::from(!self.current_due)] += now.saturating_duration_since(self.since).as_secs_f64();
         self.since = now;
         self.ahead = book.ahead(now);
         self.counted(book)
     }
 
     /// Its queued pieces were cancelled at `now`: whether that ended the
-    /// request (none was in flight), its wait now counted in `book`.
+    /// request (none was in flight), its wait now counted in `book` if any
+    /// piece ran.
     pub(crate) fn cancelled(&mut self, book: &mut Book, now: Instant) -> bool {
         self.queued = 0;
         if self.in_flight > 0 {
             return false;
         }
-        self.waited(book, now);
+        if self.taken {
+            self.waited(book, now);
+        }
         self.counted(book)
     }
 
     /// Count it in `book` once no piece is queued or in flight: whether it
-    /// was.
+    /// was. A request cancelled before any piece was taken never ran on the
+    /// volume and does not dilute `waits.requests`.
     fn counted(&self, book: &mut Book) -> bool {
         let ended = self.queued == 0;
-        if ended {
-            book.waited(self.due, self.waits);
+        if ended && self.taken {
+            let device = self.device[usize::from(!self.ever_due)];
+            book.waited(self.ever_due, Waits { device, ..self.waits });
         }
         ended
     }
@@ -375,6 +408,7 @@ impl Wait {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// The line's rate is the volume's busy rate, and its latency what the
     /// due requests' time in flight took beyond their bytes at it, their
@@ -393,5 +427,77 @@ mod tests {
         assert!((line.seconds(1_000_000) - 0.45e-3).abs() < 1e-12);
         assert_eq!(Totals { due: Class { waits: Waits::default(), ..due }, ..totals }.line(), None);
         assert_eq!([totals, totals].into_iter().sum::<Totals>().line(), Some(line), "two like volumes read as one");
+    }
+
+    /// A due request cancelled before any piece is taken must not increment
+    /// `due.waits.requests` or dilute `Totals::line().latency` toward zero.
+    #[test]
+    fn zero_piece_cancelled_due_request_does_not_dilute_line() {
+        let at = Instant::now();
+        let ms = |ms: u64| at + Duration::from_millis(ms);
+        let mut book = Book::new(at);
+
+        // One ahead piece + one due piece in flight together for 1 ms:
+        // 2 MB in 1 ms busy => rate 2 GB/s (byte_seconds = 0.5e-9),
+        // due.bytes = 1 MB, due.waits.device = 1 ms => latency = 0.5 ms.
+        book.began(false, ms(0));
+        let mut due_wait = Wait::new(1, true, &mut book, ms(0));
+        book.began(true, ms(0));
+        due_wait.taken(true, &mut book, ms(0));
+        book.ended(false, 1_000_000, ms(1));
+        book.ended(true, 1_000_000, ms(1));
+        assert!(due_wait.ended(&mut book, ms(1)));
+
+        let before = book.totals_at(ms(1));
+        let before_line = before.line().expect("a line");
+        assert_eq!(before.due.waits.requests, 1);
+        assert!((before_line.latency - 0.5e-3).abs() < 1e-12, "{before_line:?}");
+
+        // Cancel 9 due requests before any piece is taken.
+        for _ in 0..9 {
+            let mut cancelled = Wait::new(2, true, &mut book, ms(1));
+            assert!(cancelled.cancelled(&mut book, ms(2)));
+        }
+
+        let after = book.totals_at(ms(2));
+        let after_line = after.line().expect("a line");
+        assert_eq!(after.due.waits.requests, 1, "zero-piece cancelled requests must not be counted");
+        assert!((after_line.latency - before_line.latency).abs() < 1e-12, "{after_line:?} vs {before_line:?}");
+    }
+
+    /// A request whose first piece runs as `Ahead` and is then repriced to
+    /// `Due` for its second piece must not attribute the ahead piece's device
+    /// time to `due.waits.device` (which would inflate `Totals::line().latency`).
+    #[test]
+    fn ahead_then_repriced_to_due_does_not_inflate_due_device_wait() {
+        let at = Instant::now();
+        let ms = |ms: u64| at + Duration::from_millis(ms);
+        let mut book = Book::new(at);
+
+        // Sequential repricing: piece 1 runs as Ahead (1 MB in 1 ms),
+        // piece 2 runs as Due (1 MB in 1 ms).
+        let mut wait = Wait::new(2, false, &mut book, ms(0));
+        book.began(false, ms(0));
+        wait.taken(false, &mut book, ms(0));
+        book.ended(false, 1_000_000, ms(1));
+        assert!(!wait.ended(&mut book, ms(1)));
+
+        book.began(true, ms(1));
+        wait.taken(true, &mut book, ms(1));
+        book.ended(true, 1_000_000, ms(2));
+        assert!(wait.ended(&mut book, ms(2)));
+
+        let totals = book.totals_at(ms(2));
+        assert_eq!(totals.ahead.bytes, 1_000_000);
+        assert_eq!(totals.due.bytes, 1_000_000);
+        assert_eq!(totals.due.waits.requests, 1);
+        assert!(
+            (totals.due.waits.device - 1e-3).abs() < 1e-12,
+            "due.waits.device should count only the due piece (1 ms), got {:?}",
+            totals.due.waits.device
+        );
+        let line = totals.line().expect("a line");
+        assert!((line.byte_seconds - 1e-9).abs() < 1e-18, "{line:?}");
+        assert!(line.latency.abs() < 1e-12, "ahead piece must not inflate latency: {line:?}");
     }
 }
