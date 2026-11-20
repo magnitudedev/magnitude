@@ -204,6 +204,11 @@ private:
             expect(token::close_statement, "Expected %}");
             result = mk_stmt<filter_statement>(start_pos, std::move(filter_node), std::move(body));
 
+        } else if (name == "do") {
+            auto expr = parse_expression();
+            expect(token::close_statement, "Expected %}");
+            result = mk_stmt<do_statement>(start_pos, std::move(expr));
+
         } else if (name == "generation" || name == "endgeneration") {
             // Ignore generation blocks (transformers-specific)
             // See https://github.com/huggingface/transformers/pull/30650 for more information.

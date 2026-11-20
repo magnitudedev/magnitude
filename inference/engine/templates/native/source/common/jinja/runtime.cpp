@@ -325,62 +325,67 @@ static value try_builtin_func(context & ctx, const std::string & name, value & i
     throw std::runtime_error("Unknown (built-in) filter '" + name + "' for type " + input->type());
 }
 
+static value try_filter_func(context & ctx, const std::string & name, value & input) {
+    JJ_DEBUG("Trying built-in filter '%s' for type %s", name.c_str(), input->type().c_str());
+    if (ctx.is_get_stats) {
+        value_t::stats_t::mark_used(input);
+        input->stats.record_op(name);
+    }
+    const auto & filters = input->get_filters();
+    auto it = filters.find(name);
+    if (it != filters.end()) {
+        JJ_DEBUG("Binding built-in filter '%s'", name.c_str());
+        return mk_val<value_func>(name, it->second, input);
+    }
+    throw std::runtime_error("Unknown (built-in) filter '" + name + "' for type " + input->type());
+}
+
 value filter_expression::execute_impl(context & ctx) {
     value input = operand ? operand->execute(ctx) : val;
 
     JJ_DEBUG("Applying filter to %s", input->type().c_str());
 
-    auto set_filter_alias = [](auto & filter_id) {
-        if (filter_id == "count") {
-            filter_id = "length";
-        } else if (filter_id == "d") {
-            filter_id = "default";
-        } else if (filter_id == "e") {
-            filter_id = "escape";
-        } else if (filter_id == "trim") {
-            filter_id = "strip";
-        }
-    };
-
+    std::string filter_id;
+    func_args args(ctx);
     if (is_stmt<identifier>(filter)) {
-        auto filter_id = cast_stmt<identifier>(filter)->val;
-
-        set_filter_alias(filter_id);
-        JJ_DEBUG("Applying filter '%s' to %s", filter_id.c_str(), input->type().c_str());
-        // TODO: Refactor filters so this coercion can be done automatically
-        if (!input->is_undefined() && !is_val<value_string>(input) && (
-            filter_id == "capitalize" ||
-            filter_id == "lower" ||
-            filter_id == "replace" ||
-            filter_id == "strip" ||
-            filter_id == "title" ||
-            filter_id == "upper" ||
-            filter_id == "wordcount"
-        )) {
-            JJ_DEBUG("Coercing %s to String for '%s' filter", input->type().c_str(), filter_id.c_str());
-            input = mk_val<value_string>(input->as_string());
-        }
-        return try_builtin_func(ctx, filter_id, input)->invoke(func_args(ctx));
-
+        filter_id = cast_stmt<identifier>(filter)->val;
     } else if (is_stmt<call_expression>(filter)) {
         auto call = cast_stmt<call_expression>(filter);
         if (!is_stmt<identifier>(call->callee)) {
             throw std::runtime_error("Filter callee must be an identifier");
         }
-        auto filter_id = cast_stmt<identifier>(call->callee)->val;
-
-        set_filter_alias(filter_id);
-        JJ_DEBUG("Applying filter '%s' with arguments to %s", filter_id.c_str(), input->type().c_str());
-        func_args args(ctx);
+        filter_id = cast_stmt<identifier>(call->callee)->val;
         for (const auto & arg_expr : call->args) {
             args.push_back(arg_expr->execute(ctx));
         }
-
-        return try_builtin_func(ctx, filter_id, input)->invoke(args);
-
     } else {
         throw std::runtime_error("Invalid filter expression");
     }
+
+    if (filter_id == "count") {
+        filter_id = "length";
+    } else if (filter_id == "d") {
+        filter_id = "default";
+    } else if (filter_id == "e") {
+        filter_id = "escape";
+    } else if (filter_id == "trim") {
+        filter_id = "strip";
+    }
+
+    JJ_DEBUG("Applying filter '%s' to %s", filter_id.c_str(), input->type().c_str());
+    if (!input->is_undefined() && !is_val<value_string>(input) && (
+        filter_id == "capitalize" ||
+        filter_id == "lower" ||
+        filter_id == "replace" ||
+        filter_id == "strip" ||
+        filter_id == "title" ||
+        filter_id == "upper" ||
+        filter_id == "wordcount"
+    )) {
+        JJ_DEBUG("Coercing %s to String for '%s' filter", input->type().c_str(), filter_id.c_str());
+        input = mk_val<value_string>(input->as_string());
+    }
+    return try_filter_func(ctx, filter_id, input)->invoke(args);
 }
 
 value filter_statement::execute_impl(context & ctx) {
@@ -514,7 +519,7 @@ value for_statement::execute_impl(context & ctx) {
         iterable_val = mk_val<value_array>();
     }
 
-    if (!is_val<value_array>(iterable_val) && !is_val<value_object>(iterable_val)) {
+    if (!is_val<value_array>(iterable_val) && !is_val<value_object>(iterable_val) && !is_val<value_string>(iterable_val)) {
         throw std::runtime_error("Expected iterable or object type in for loop: got " + iterable_val->type());
     }
 
@@ -526,6 +531,19 @@ value for_statement::execute_impl(context & ctx) {
         for (auto & p : obj) {
             auto tuple = mk_val<value_tuple>(p);
             items.push_back(std::move(tuple));
+        }
+        if (ctx.is_get_stats) {
+            value_t::stats_t::mark_used(iterable_val);
+        }
+    } else if (is_val<value_string>(iterable_val)) {
+        JJ_DEBUG("%s", "For loop over string characters");
+        const auto & jstr = iterable_val->as_string();
+        const std::string s = jstr.str();
+        items.reserve(s.size());
+        for (char ch : s) {
+            auto c = mk_val<value_string>(std::string(1, ch));
+            c->val_str.mark_input_based_on(jstr);
+            items.push_back(std::move(c));
         }
         if (ctx.is_get_stats) {
             value_t::stats_t::mark_used(iterable_val);
@@ -932,8 +950,13 @@ value member_expression::execute_impl(context & ctx) {
                 }
             } else { // value_string
                 auto str = object->as_string().str();
+                if (index < 0) {
+                    index += static_cast<int64_t>(str.size());
+                }
                 if (index >= 0 && index < static_cast<int64_t>(str.size())) {
-                    val = mk_val<value_string>(std::string(1, str[index]));
+                    auto ch = mk_val<value_string>(std::string(1, str[index]));
+                    ch->val_str.mark_input_based_on(object->as_string());
+                    val = std::move(ch);
                 }
             }
             if (!val) {

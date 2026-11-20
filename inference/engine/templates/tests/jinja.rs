@@ -149,3 +149,135 @@ fn dictsort_min_and_max_fold_case_unless_case_sensitive() {
         "abB Bab yzx aC Cb 5"
     );
 }
+
+#[test]
+fn global_builtins_cover_dict_and_standard_python_helpers() {
+    assert_eq!(
+        render(
+            "{{ dict() | tojson }} \
+             {{ dict(a=1, b='x') | tojson }} \
+             {{ dict({'a': 1, 'b': 2}, b=3, c=4) | tojson }} \
+             {{ dict([('k', 1), ('m', 2)]) | tojson }}"
+        ),
+        r#"{} {"a": 1, "b": "x"} {"a": 1, "b": 3, "c": 4} {"k": 1, "m": 2}"#
+    );
+    assert_eq!(
+        render(
+            "{% for a, b in zip([1, 2, 3], ['x', 'y']) %}{{ a }}{{ b }}{% endfor %} \
+             {% for i, v in enumerate(['a', 'b'], start=1) %}{{ i }}:{{ v }},{% endfor %} \
+             {{ len([1, 2, 3]) }} {{ len('abcd') }} {{ len({'a': 1, 'b': 2}) }} \
+             {{ str(42) }} {{ int('ff', 16) }} {{ int(3.9) }} {{ float('1.5') }} \
+             {{ bool(0) }} {{ bool('hi') }} {{ list('ab') | join('-') }} {{ list({'x': 1, 'y': 2}) | join(',') }}"
+        ),
+        "1x2y 1:a,2:b, 3 4 2 42 255 3 1.5 False True a-b x,y"
+    );
+    assert_eq!(
+        render(
+            "{{ min(3, 1, 2) }} {{ max([3, 9, 2]) }} {{ min([], default=7) }} \
+             {{ sum([1, 2, 3]) }} {{ sum([1, 2.5], 10) }} {{ sum([[1], [2]], []) | join(',') }} \
+             {{ abs(-5) }} {{ abs(-2.5) }} {{ round(3.6) }} {{ round(3.14159, 2) }} \
+             {{ sorted([3, 1, 2]) | join(',') }} {{ sorted([3, 1, 2], reverse=true) | join(',') }} \
+             {{ reversed([1, 2, 3]) | join(',') }} \
+             {{ any([0, '', 1]) }} {{ any([0, '']) }} {{ all([1, 'a']) }} {{ all([1, 0]) }}"
+        ),
+        "1 9 7 6 13.5 1,2 5 2.5 4 3.14 1,2,3 3,2,1 3,2,1 True False True False"
+    );
+}
+
+#[test]
+fn object_filters_do_not_shadow_object_keys() {
+    assert_eq!(
+        render(
+            "{% set schema = {'default': 'fallback', 'length': 8, 'string': 'ok'} %}\
+             {{ schema.default }} {{ schema.length }} {{ schema.string }} \
+             {{ (schema | default({})).default }} {{ (missing | default({'k': 1})).k }} \
+             {{ ({} | d({'k': 2}, boolean=true)).k }} {{ schema | length }} {{ schema | list | join(',') }}"
+        ),
+        "fallback 8 ok fallback 1 2 3 default,length,string"
+    );
+}
+
+#[test]
+fn tojson_sort_keys_and_from_json_roundtrip() {
+    assert_eq!(
+        render(
+            "{{ {'b': 1, 'a': {'d': 2, 'c': 3}} | tojson(sort_keys=true) }} \
+             {% set parsed = '{\"x\": 42, \"y\": [1, 2]}' | from_json %}\
+             {{ parsed.x }}:{{ parsed.y | sum }}"
+        ),
+        r#"{"a": {"c": 3, "d": 2}, "b": 1} 42:3"#
+    );
+}
+
+#[test]
+fn select_reject_tests_and_array_filters() {
+    assert_eq!(
+        render(
+            "{{ [0, 1, '', 'a'] | select | join(',') }} \
+             {{ [0, 1, '', 'a'] | reject | length }} \
+             {{ [1, 2, 3, 4] | select('odd') | join(',') }} \
+             {{ [1, 2, 3, 4] | select('le', 2) | join(',') }} \
+             {{ [1, 2, 3, 4] | reject('equalto', 3) | join(',') }} \
+             {{ [{'a': 1}, {'b': 2}] | selectattr('a', 'defined') | map(attribute='a') | join(',') }} \
+             {{ [{'k': 'x'}, {'k': 'y'}] | rejectattr('k', 'equalto', 'x') | map(attribute='k') | join(',') }} \
+             {{ 2 is le(2) }} {{ 3 is le(2) }} {{ {} is iterable }} \
+             {{ [{'n': 2}, {'n': 5}] | sum(attribute='n', start=1) }}"
+        ),
+        "1,a 2 1,3 1,2 1,2,4 1 y True False True 8"
+    );
+}
+
+#[test]
+fn do_statement_and_mutating_dict_and_list_methods() {
+    assert_eq!(
+        render(
+            "{% set d = {'a': 1} %}\
+             {% do d.update({'b': 2}, c=3) %}\
+             {% set popped = d.pop('b') %}\
+             {% set missing = d.pop('z', 9) %}\
+             {% set s1 = d.setdefault('a', 99) %}\
+             {% set s2 = d.setdefault('d', 4) %}\
+             {% set d2 = d.copy() %}\
+             {% do d.clear() %}\
+             {{ popped }},{{ missing }},{{ s1 }},{{ s2 }},{{ d | length }},{{ d2 | tojson(sort_keys=true) }}"
+        ),
+        r#"2,9,1,4,0,{"a": 1, "c": 3, "d": 4}"#
+    );
+    assert_eq!(
+        render(
+            "{% set xs = [1, 2] %}\
+             {% do xs.extend([3, 2]) %}\
+             {% do xs.insert(1, 9) %}\
+             {% do xs.remove(2) %}\
+             {% set ys = xs.copy() %}\
+             {% set idx = xs.index(2) %}\
+             {% set cnt = xs.count(2) %}\
+             {% set total = xs | count %}\
+             {% do xs.clear() %}\
+             {{ idx }},{{ cnt }},{{ total }},{{ xs | length }},{{ ys | join(',') }}"
+        ),
+        "3,1,4,0,1,9,3,2"
+    );
+}
+
+#[test]
+fn string_methods_negative_indexing_and_char_loops() {
+    assert_eq!(
+        render(
+            "{{ 'hello'[-1] }}{{ 'hello'[-5] }} \
+             {{ 'banana'.find('na') }},{{ 'banana'.rfind('na') }},{{ 'banana'.count('na') }} \
+             {{ 'a\\nb\\r\\nc\\n'.splitlines() | join('|') }} \
+             {{ 'a\\nb'.splitlines(true) | length }} \
+             {{ 'prefix_val'.removeprefix('prefix_') }},{{ 'val_suffix'.removesuffix('_suffix') }} \
+             {{ 'foo.py'.endswith(('.rs', '.py')) }},{{ 'foo.py'.startswith(['bar', 'foo']) }} \
+             {{ '  a  b\\tc  '.split() | join('|') }} \
+             [{{ '  a  b  c  '.split(none, 1) | join('|') }}] \
+             [{{ '  a  b  c  '.rsplit(none, 1) | join('|') }}] \
+             {{ 'aaa'.replace('a', 'b', 2) }},{{ 'aaa'.replace('a', 'b', 0) }} \
+             {{ ','.join(['x', 'y', 'z']) }} \
+             {{ 'abc' | list | join('-') }} \
+             {% for ch in 'xyz' %}[{{ ch }}]{% endfor %}"
+        ),
+        "oh 2,4,2 a|b|c 2 val,val True,True a|b|c [a|b  c  ] [  a  b|c] bba,aaa x,y,z a-b-c [x][y][z]"
+    );
+}
