@@ -315,26 +315,7 @@ pub fn local_model_digest(shards: &[PathBuf]) -> Result<String, InventoryError> 
 /// `qwen/qwen3.5-4b`), lowercased for lineage comparison.
 #[must_use]
 pub fn header_base_repositories(directory: &Directory) -> BTreeSet<String> {
-    let count = directory
-        .value("general.base_model.count")
-        .and_then(Value::unsigned)
-        .unwrap_or(0)
-        .min(64);
-    let field = |index: u64, name: &str| {
-        directory
-            .value(&format!("general.base_model.{index}.{name}"))
-            .and_then(Value::string)
-            .map(ToOwned::to_owned)
-    };
-    base_model_repositories(
-        &(0..count)
-            .map(|index| crate::gguf::GgufBaseModel {
-                name: field(index, "name"),
-                organization: field(index, "organization"),
-                repo_url: field(index, "repo_url"),
-            })
-            .collect::<Vec<_>>(),
-    )
+    base_model_repositories(&crate::gguf::base_models(directory))
 }
 
 /// The repositories `general.base_model.N.*` entries name, lowercased: each one's repository URL,

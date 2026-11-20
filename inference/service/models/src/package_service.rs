@@ -677,11 +677,8 @@ fn hub_model_id(package: &ModelPackage) -> Option<ModelId> {
         return None;
     };
     let selector = package
-        .files
-        .iter()
-        .filter(|file| file.role == ModelFileRole::Weights)
-        .map(|file| &file.path)
-        .min()?
+        .primary_weights()?
+        .path
         .components()
         .map(|component| component.as_os_str().to_str())
         .collect::<Option<Vec<_>>>()?
@@ -1368,36 +1365,31 @@ impl ManagedModelStore {
                     else {
                         return Err(InventoryError::NotReady(package.id.0));
                     };
-                    let shard_index_of = |file_id: &magnitude_service_contracts::models::ModelFileId| {
-                        package.relationships.iter().find_map(|relationship| {
-                            if let ModelFileRelationship::Shard {
-                                file_id: id, index, ..
-                            } = relationship
-                                && id == file_id
-                            {
-                                Some(*index)
-                            } else {
-                                None
-                            }
-                        })
-                    };
+                    let primary = package.primary_weights().ok_or_else(|| {
+                        InventoryError::InvalidRequest(format!(
+                            "package {} has no weights",
+                            package.id.0
+                        ))
+                    })?;
                     let mut weight_files = package
                         .files
                         .iter()
                         .filter(|file| file.role == ModelFileRole::Weights)
                         .collect::<Vec<_>>();
                     weight_files.sort_by(|left, right| {
-                        shard_index_of(&left.id)
-                            .unwrap_or(0)
-                            .cmp(&shard_index_of(&right.id).unwrap_or(0))
-                            .then_with(|| left.path.cmp(&right.path))
+                        let left_shard = package.shard_index(&left.id);
+                        let right_shard = package.shard_index(&right.id);
+                        (
+                            left_shard != Some(1),
+                            left_shard.unwrap_or(u32::MAX),
+                            left.path.as_path(),
+                        )
+                            .cmp(&(
+                                right_shard != Some(1),
+                                right_shard.unwrap_or(u32::MAX),
+                                right.path.as_path(),
+                            ))
                     });
-                    let primary = *weight_files.first().ok_or_else(|| {
-                        InventoryError::InvalidRequest(format!(
-                            "package {} has no weights",
-                            package.id.0
-                        ))
-                    })?;
                     let shards = weight_files
                         .iter()
                         .map(|file| file.path.clone())

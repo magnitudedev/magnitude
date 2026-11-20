@@ -755,13 +755,7 @@ fn occurrence<'a>(
     record: &'a InstalledPackageRecord,
 ) -> Option<Occurrence<'a>> {
     let base = record_base(managed_root, record)?;
-    let primary_file = record
-        .installed
-        .package
-        .files
-        .iter()
-        .filter(|file| file.role == ModelFileRole::Weights)
-        .min_by(|left, right| left.path.cmp(&right.path))?;
+    let primary_file = record.installed.package.primary_weights()?;
     let selector = primary_file
         .path
         .components()

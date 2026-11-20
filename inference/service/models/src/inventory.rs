@@ -350,22 +350,29 @@ impl InventoryConfig {
             .map_err(io_error)
     }
 
+    fn user_home_dir() -> Option<PathBuf> {
+        std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+            .map(PathBuf::from)
+    }
+
     pub fn default_root() -> Result<PathBuf, InventoryError> {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
+        let home = Self::user_home_dir().ok_or_else(|| {
             InventoryError::InvalidRequest(
                 "cannot determine the user home directory for the model store".to_owned(),
             )
         })?;
-        Ok(PathBuf::from(home).join(".magnitude/models"))
+        Ok(home.join(".magnitude").join("models"))
     }
 
     pub fn default_cache_root() -> Result<PathBuf, InventoryError> {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
+        let home = Self::user_home_dir().ok_or_else(|| {
             InventoryError::InvalidRequest(
                 "cannot determine the user home directory for the cache".to_owned(),
             )
         })?;
-        Ok(PathBuf::from(home).join(".magnitude/cache"))
+        Ok(home.join(".magnitude").join("cache"))
     }
 
     /// Adds enabled Hugging Face cache locations to the initial configuration.
@@ -660,11 +667,8 @@ impl ManagedModelStore {
         let mut components = resolve(&weights)?;
         let weights_path = composed
             .package
-            .files
-            .iter()
-            .filter(|file| file.role == ModelFileRole::Weights)
+            .primary_weights()
             .map(|file| file.path.clone())
-            .min()
             .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))?;
         for projector in resolve(&stored)? {
             let declared = stored
@@ -2635,12 +2639,14 @@ pub(crate) fn components_for_group(
 ) -> Result<Vec<ModelComponent>, InventoryError> {
     let mut components = Vec::new();
     for (offset, path) in group.paths.iter().enumerate() {
-        let relative = path.strip_prefix(root).map_err(|_| {
-            InventoryError::Io("discovered model escaped its configured root".to_owned())
-        })?;
+        let relative = PathBuf::from(crate::identity::normalize_relative_posix(
+            path.strip_prefix(root).map_err(|_| {
+                InventoryError::Io("discovered model escaped its configured root".to_owned())
+            })?,
+        ));
         let metadata = path.metadata().map_err(io_error)?;
         components.push(ModelComponent {
-            path: relative.to_path_buf(),
+            path: relative,
             role: if group.paths.len() == 1 {
                 ComponentRole::Weights
             } else {
@@ -2653,19 +2659,21 @@ pub(crate) fn components_for_group(
         });
     }
     if let Some(projector) = group.projector.as_ref() {
-        let relative = projector.strip_prefix(root).map_err(|_| {
-            InventoryError::Io("discovered projector escaped its configured root".to_owned())
-        })?;
+        let relative = PathBuf::from(crate::identity::normalize_relative_posix(
+            projector.strip_prefix(root).map_err(|_| {
+                InventoryError::Io("discovered projector escaped its configured root".to_owned())
+            })?,
+        ));
         let metadata = projector.metadata().map_err(io_error)?;
         components.push(ModelComponent {
-            path: relative.to_path_buf(),
+            path: relative.clone(),
             role: ComponentRole::Projector,
             size_bytes: metadata.len(),
             content: content_identity_for_file(projector, &metadata, blobs),
             shard_index: None,
             relationship: components.first().map(|model| {
                 magnitude_service_contracts::ComponentRelationship::ProjectorFor {
-                    projector: relative.to_path_buf(),
+                    projector: relative,
                     model: model.path.clone(),
                 }
             }),

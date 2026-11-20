@@ -363,12 +363,7 @@ pub fn catalog_target(model: &RecommendableModel) -> &ModelPackage {
 /// A package's primary weights file: its only weights file, or a split file's first shard.
 #[must_use]
 pub fn primary_weights(package: &ModelPackage) -> Option<PathBuf> {
-    package
-        .files
-        .iter()
-        .filter(|file| file.role == ModelFileRole::Weights)
-        .map(|file| file.path.clone())
-        .min()
+    package.primary_weights().map(|file| file.path.clone())
 }
 
 fn bundle_packages(bundle: &ServableModelBundle) -> Vec<&ModelPackage> {

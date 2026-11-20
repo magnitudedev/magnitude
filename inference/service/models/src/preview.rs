@@ -2612,15 +2612,7 @@ impl ManagedModelStore {
             else {
                 return None;
             };
-            let primary = record
-                .installed
-                .package
-                .files
-                .iter()
-                .filter(|file| {
-                    file.role == magnitude_service_contracts::models::ModelFileRole::Weights
-                })
-                .min_by(|left, right| left.path.cmp(&right.path))?;
+            let primary = record.installed.package.primary_weights()?;
             (primary.size_bytes == primary_size
                 && record
                     .primary

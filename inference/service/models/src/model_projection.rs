@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use magnitude_service_contracts::models::{
-    EffectiveModel, InstalledModelPackage, ModelFailure, ModelFileRole, ModelInstallationOwnership,
+    EffectiveModel, InstalledModelPackage, ModelFailure, ModelInstallationOwnership,
     ModelMetadata, ModelPackage, ModelPackageId, ModelPackageInstallationOrigin,
     ModelServingConfiguration, PackageValidation, ReadyModel, ResolvedModelInstallation,
     ServableModelBundle, ServingProfile,
@@ -38,12 +38,8 @@ pub(crate) fn primary_model_path(installed: &InstalledModelPackage) -> std::path
     }
     installed
         .package
-        .files
-        .iter()
-        .filter(|file| file.role == ModelFileRole::Weights)
-        .map(|file| &file.path)
-        .min()
-        .map_or_else(|| installed.path.clone(), |path| installed.path.join(path))
+        .primary_weights()
+        .map_or_else(|| installed.path.clone(), |file| installed.path.join(&file.path))
 }
 
 pub(crate) fn effective_configuration_model(

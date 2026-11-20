@@ -496,6 +496,47 @@ mod schema {
         pub properties: ModelPackageProperties,
     }
 
+    impl ModelPackage {
+        /// The 1-based shard index declared for `file_id`, if any.
+        #[must_use]
+        pub fn shard_index(&self, file_id: &ModelFileId) -> Option<u32> {
+            self.relationships.iter().find_map(|relationship| {
+                if let ModelFileRelationship::Shard {
+                    file_id: id, index, ..
+                } = relationship
+                    && id == file_id
+                {
+                    Some(*index)
+                } else {
+                    None
+                }
+            })
+        }
+
+        /// The package's primary weights file: the `Weights` file with `Shard { index: 1, .. }`,
+        /// or the sole `Weights` file if unsharded, falling back to minimum shard index then path.
+        #[must_use]
+        pub fn primary_weights(&self) -> Option<&ModelFile> {
+            self.files
+                .iter()
+                .filter(|file| file.role == ModelFileRole::Weights)
+                .min_by(|left, right| {
+                    let left_shard = self.shard_index(&left.id);
+                    let right_shard = self.shard_index(&right.id);
+                    (
+                        left_shard != Some(1),
+                        left_shard.unwrap_or(u32::MAX),
+                        left.path.as_path(),
+                    )
+                        .cmp(&(
+                            right_shard != Some(1),
+                            right_shard.unwrap_or(u32::MAX),
+                            right.path.as_path(),
+                        ))
+                })
+        }
+    }
+
     #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]

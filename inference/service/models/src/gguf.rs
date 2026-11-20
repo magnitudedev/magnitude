@@ -635,11 +635,15 @@ fn is_nextn_tensor(name: &str) -> bool {
         })
 }
 
+const MAX_BASE_MODELS: u64 = 64;
+
 /// The `general.base_model.N.*` lineage a header declares: each entry naming a model or its
 /// repository.
 #[must_use]
 pub fn base_models(directory: &Directory) -> Vec<GgufBaseModel> {
-    let base_model_count = u32_value(directory, "general.base_model.count").unwrap_or(0);
+    let base_model_count = u64_value(directory, "general.base_model.count")
+        .unwrap_or(0)
+        .min(MAX_BASE_MODELS);
     (0..base_model_count)
         .map(|index| {
             let field = |field: &str| {
@@ -1673,6 +1677,28 @@ mod tests {
         assert_eq!(
             GgufTensors::of(&directory, Some("glm5-next")),
             GgufTensors::Model { embedded_mtp: true }
+        );
+    }
+
+    #[test]
+    fn base_models_bounds_unbounded_header_count() {
+        let bytes = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", crate::test_gguf::Meta::Str("llama")),
+                ("general.base_model.count", crate::test_gguf::Meta::U32(u32::MAX)),
+                (
+                    "general.base_model.0.repo_url",
+                    crate::test_gguf::Meta::Str("https://huggingface.co/meta-llama/Llama-3.1-8B"),
+                ),
+            ],
+            &[],
+        );
+        let directory = magnitude_artifacts::gguf::read_header(bytes).unwrap();
+        let bases = base_models(&directory);
+        assert_eq!(bases.len(), 1);
+        assert_eq!(
+            bases[0].repo_url.as_deref(),
+            Some("https://huggingface.co/meta-llama/Llama-3.1-8B")
         );
     }
 }

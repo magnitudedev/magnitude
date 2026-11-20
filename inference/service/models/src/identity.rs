@@ -44,13 +44,28 @@ pub fn inventory_entry_id(
     InventoryEntryId(format!("mdl_{:x}", digest.finalize()))
 }
 
+/// Normalizes a relative path into canonical POSIX `/`-joined UTF-8 form so Windows and Unix
+/// produce identical component paths and content identities.
+pub(crate) fn normalize_relative_posix(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::CurDir => None,
+            other => Some(other.as_os_str().to_string_lossy().replace('\\', "/")),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 pub fn content_id(components: &[ModelComponent]) -> ContentId {
-    let mut ordered = components.iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut ordered = components
+        .iter()
+        .map(|component| (normalize_relative_posix(&component.path), component))
+        .collect::<Vec<_>>();
+    ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
     let mut digest = Sha256::new();
     digest.update(b"magnitude-content-id-v1\0");
-    for component in ordered {
-        digest.update(component.path.to_string_lossy().as_bytes());
+    for (normalized_path, component) in ordered {
+        digest.update(normalized_path.as_bytes());
         digest.update(b"\0");
         digest.update(format!("{:?}", component.role).as_bytes());
         digest.update(b"\0");
@@ -119,6 +134,14 @@ mod tests {
             content_id(&[a, b]),
             content_id(&[component("a.gguf", "different")])
         );
+    }
+
+    #[test]
+    fn content_identity_normalizes_windows_and_posix_separators() {
+        let posix = component("q4/model.gguf", "a");
+        let windows = component(r"q4\model.gguf", "a");
+        assert_eq!(normalize_relative_posix(&windows.path), "q4/model.gguf");
+        assert_eq!(content_id(&[posix]), content_id(&[windows]));
     }
 
     #[test]

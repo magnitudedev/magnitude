@@ -267,9 +267,13 @@ fn require_role(
 
 pub fn validate_relative_path(path: &Path) -> Result<(), InventoryError> {
     let rendered = path.to_string_lossy();
-    if rendered.is_empty() || rendered.len() > MAX_PATH_BYTES || rendered.contains('\0') {
+    if rendered.is_empty()
+        || rendered.len() > MAX_PATH_BYTES
+        || rendered.contains(['\0', '\\'])
+    {
         return Err(InventoryError::InvalidRequest(
-            "component path must be non-empty, bounded, and contain no NUL byte".to_owned(),
+            "component path must be non-empty, bounded, and contain no NUL byte or backslash"
+                .to_owned(),
         ));
     }
     if path.components().any(|component| {
@@ -354,7 +358,36 @@ mod tests {
     fn rejects_traversal_and_absolute_package_paths() {
         assert!(ValidatedDownloadPackage::new(package("../model.gguf")).is_err());
         assert!(ValidatedDownloadPackage::new(package("/tmp/model.gguf")).is_err());
+        assert!(ValidatedDownloadPackage::new(package(r"models\model.gguf")).is_err());
         assert!(ValidatedDownloadPackage::new(package("models/model.gguf")).is_ok());
+    }
+
+    #[test]
+    fn primary_weights_selects_shard_one_over_lexicographically_earlier_shard_two() {
+        let mut sharded = package("engram.gguf");
+        let shard2_id = sharded.files[0].id.clone();
+        let shard1_id = ModelFileId(format!("file_{}", "d".repeat(64)));
+        let mut shard1 = sharded.files[0].clone();
+        shard1.id = shard1_id.clone();
+        shard1.path = "q4/model-00001-of-00002.gguf".into();
+        shard1.sha256 = "d".repeat(64);
+        sharded.files.push(shard1);
+        sharded.relationships = vec![
+            ModelFileRelationship::Shard {
+                file_id: shard2_id,
+                index: 2,
+                count: 2,
+            },
+            ModelFileRelationship::Shard {
+                file_id: shard1_id.clone(),
+                index: 1,
+                count: 2,
+            },
+        ];
+
+        let primary = sharded.primary_weights().expect("primary weights");
+        assert_eq!(primary.id, shard1_id);
+        assert_eq!(primary.path, std::path::Path::new("q4/model-00001-of-00002.gguf"));
     }
 
     #[test]
