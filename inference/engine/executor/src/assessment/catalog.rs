@@ -111,7 +111,7 @@ pub(super) fn served_targets() -> Vec<(String, magnitude_family_contracts::Model
         if crate::operators::admit(&definition, false).is_err() {
             continue;
         }
-        targets.push((name.to_owned(), definition, target_manifest(&component.path, &target, identity)));
+        targets.push((name.to_owned(), definition, target_manifest(component.file(), &target, identity)));
     }
     targets
 }
@@ -234,7 +234,7 @@ fn derive_target(component: &CatalogComponent, backend: BackendName, required: b
         refused.push(format!("{name}: {error}"));
         return derived;
     }
-    let manifest = target_manifest(&component.path, &target, identity);
+    let manifest = target_manifest(component.file(), &target, identity);
     let load = match plain_load(&manifest, &definition, backend) {
         Ok(load) => load,
         // A required target derives its load on every backend; another
@@ -400,7 +400,7 @@ fn every_streamed_record_converts_on_the_host_as_its_reference() {
         if !routes {
             continue;
         }
-        let manifest = target_manifest(&component.path, &target, identity);
+        let manifest = target_manifest(component.file(), &target, identity);
         for backend in BackendName::ALL {
             let load = plain_load(&manifest, &definition, backend)
                 .unwrap_or_else(|error| panic!("{name}: its plain load plans on {}: {error}", backend.as_str()));
@@ -904,7 +904,7 @@ pub(super) fn served_drafted_targets() -> Vec<(String, magnitude_family_contract
             let manifest = PackageManifest {
                 draft: Some(ComponentManifest {
                     files: vec![ComponentFile {
-                        path: component.path.clone(),
+                        path: component.file().to_path_buf(),
                         size: draft.tensors.iter().map(|tensor| tensor.nbytes).sum(),
                     }],
                     identity: ArtifactIdentity([9; 32]),
@@ -988,7 +988,7 @@ fn every_catalog_variant_lists_kernels_over_every_finalized_readout() {
             components
                 .iter()
                 .find(|component| component.role == role)
-                .map(|component| (component.path.clone(), headers::component(component)))
+                .map(|component| (component.file().to_path_buf(), headers::component(component)))
         };
         let projector = file(ComponentRole::Projector);
         let draft = file(ComponentRole::Draft);
@@ -1000,7 +1000,7 @@ fn every_catalog_variant_lists_kernels_over_every_finalized_readout() {
             if target_component.role != ComponentRole::Target {
                 continue;
             }
-            let target_file = &target_component.path;
+            let target_file = target_component.file();
             let target = headers::component(target_component);
             let context = &target_component.model;
             let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&target)) else {

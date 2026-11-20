@@ -1350,27 +1350,22 @@ impl ReleaseCatalog {
             let target = (
                 HeaderRole::Target,
                 &input.target,
-                input.target.primary_gguf.clone(),
                 &[ComponentRole::Weights, ComponentRole::Shard] as &[ComponentRole],
             );
             let projector = input
                 .target
                 .components
                 .iter()
-                .find(|component| component.component.role == ComponentRole::Projector)
-                .map(|projector| {
-                    (
-                        HeaderRole::Projector,
-                        &input.target,
-                        projector.component.path.clone(),
-                        &[ComponentRole::Projector] as &[ComponentRole],
-                    )
-                });
+                .any(|component| component.component.role == ComponentRole::Projector)
+                .then_some((
+                    HeaderRole::Projector,
+                    &input.target,
+                    &[ComponentRole::Projector] as &[ComponentRole],
+                ));
             let draft = input.draft.as_ref().map(|draft| {
                 (
                     HeaderRole::Draft,
                     draft,
-                    draft.primary_gguf.clone(),
                     &[
                         ComponentRole::Weights,
                         ComponentRole::Shard,
@@ -1379,7 +1374,7 @@ impl ReleaseCatalog {
                     ] as &[ComponentRole],
                 )
             });
-            for (role, package, path, roles) in
+            for (role, package, roles) in
                 std::iter::once(target).chain(projector).chain(draft)
             {
                 let ModelPackageSource::HuggingFace {
@@ -1392,18 +1387,13 @@ impl ReleaseCatalog {
                             .to_owned(),
                     ));
                 };
-                let component = CatalogComponent {
-                    model: model.as_str().to_owned(),
-                    role,
-                    repository: repository.clone(),
-                    revision: revision.clone(),
-                    path,
-                };
+                let mut shards = Vec::new();
                 for file in package
                     .components
                     .iter()
                     .filter(|file| roles.contains(&file.component.role))
                 {
+                    shards.push(file.component.path.clone());
                     let path = root
                         .join(repository)
                         .join(revision)
@@ -1416,6 +1406,18 @@ impl ReleaseCatalog {
                         write_component_header(file, &header, &path)?;
                     }
                 }
+                if shards.is_empty() {
+                    return Err(InventoryError::Integrity(format!(
+                        "release catalog component {model} {role} has no shard files"
+                    )));
+                }
+                let component = CatalogComponent {
+                    model: model.as_str().to_owned(),
+                    role,
+                    repository: repository.clone(),
+                    revision: revision.clone(),
+                    shards,
+                };
                 components.push(component);
             }
         }

@@ -54,7 +54,7 @@ fn every_served_projector_outlines_its_vision_graphs_from_traces(backend: Backen
             identity,
             projector: Some(ComponentManifest {
                 files: vec![ComponentFile {
-                    path: projector_component.path.clone(),
+                    path: projector_component.file().to_path_buf(),
                     size: projector.tensors.iter().map(|tensor| tensor.nbytes).sum(),
                 }],
                 identity: identity.projector.expect("a projector identity"),
