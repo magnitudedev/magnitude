@@ -3,12 +3,13 @@
 //! without generating, and `previous_response_id` continues from the most
 //! recent concluded response's input and output with new input.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::future::{Future, ready};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
+use std::future::{Future, ready};
 use std::num::NonZeroU32;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -30,7 +31,6 @@ use magnitude_chat::{ChatInput, EndOfGeneration, GenerationRequest, ReasoningInt
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::ReceiverStream;
 use utoipa::openapi::Ref;
 use utoipa::openapi::schema::AnyOfBuilder;
 use utoipa::{PartialSchema, ToSchema};
@@ -586,7 +586,6 @@ pub(crate) struct StreamProjector {
     created_at: u64,
     model: String,
     sender: mpsc::Sender<Value>,
-    sequence: Arc<AtomicU64>,
     next_output_index: usize,
     message_output_index: Option<usize>,
     reasoning_output_index: Option<usize>,
@@ -606,7 +605,6 @@ impl StreamProjector {
         created_at: u64,
         model: String,
         sender: mpsc::Sender<Value>,
-        sequence: Arc<AtomicU64>,
         projection: ResponseProjection,
         concluded: oneshot::Sender<Vec<Value>>,
     ) -> Self {
@@ -617,7 +615,6 @@ impl StreamProjector {
             created_at,
             model,
             sender,
-            sequence,
             next_output_index: 0,
             message_output_index: None,
             reasoning_output_index: None,
@@ -643,10 +640,6 @@ impl StreamProjector {
     async fn send(&self, event_type: &'static str, value: Value) -> Result<(), Disconnected> {
         let mut data = object(value);
         data.insert("type".into(), Value::String(event_type.into()));
-        data.insert(
-            "sequence_number".into(),
-            Value::from(self.sequence.fetch_add(1, Ordering::Relaxed)),
-        );
         self.sender
             .send(Value::Object(data))
             .await
@@ -931,13 +924,11 @@ impl From<Disconnected> for ProjectionError {
 
 fn send_loading_progress(
     sender: &mpsc::Sender<Value>,
-    sequence: &AtomicU64,
     response_id: &str,
     load: ModelLoadProgress,
 ) {
     let value = serde_json::json!({
         "type": "response.magnitude_progress",
-        "sequence_number": sequence.fetch_add(1, Ordering::Relaxed),
         "response_id": response_id,
         "progress": ChatCompletionProgress::model_loading(load),
     });
@@ -1340,6 +1331,7 @@ fn context(instructions: Option<String>, input: ResponseInput) -> Result<Convers
             }
             ResponseInputItem::FunctionCall(_) => {
                 let mut calls = Vec::new();
+                let mut call_ids = BTreeSet::new();
                 while let Some(ResponseInputItem::FunctionCall(ResponseFunctionCall {
                     call_id,
                     name,
@@ -1355,6 +1347,11 @@ fn context(instructions: Option<String>, input: ResponseInput) -> Result<Convers
                         })?;
                     crate::chat::require_non_empty(call_id, "function_call call_id")?;
                     crate::chat::require_non_empty(name, "function_call name")?;
+                    if !call_ids.insert(call_id.as_str()) {
+                        return Err(ApiError::invalid(format!(
+                            "duplicate function_call call_id: {call_id}",
+                        )));
+                    }
                     calls.push(ToolCall {
                         id: call_id.clone(),
                         name: name.clone(),
@@ -1544,7 +1541,7 @@ pub async fn responses(
     if request.stream {
         let stream = start_response_stream(state, &headers, request).await?;
         let request_id = stream.id;
-        let receiver = ReceiverStream::new(stream.events).map(|value| {
+        let receiver = stream.events.map(|value| {
             let event_type = value
                 .get("type")
                 .and_then(Value::as_str)
@@ -1580,10 +1577,49 @@ pub async fn responses(
     Ok(with_request_id(response, &id))
 }
 
+/// Receives response stream events and stamps strictly monotonic, gap-free
+/// `sequence_number` values at emission time.
+pub(crate) struct ResponseEvents {
+    receiver: mpsc::Receiver<Value>,
+    next_sequence: u64,
+}
+
+impl ResponseEvents {
+    fn new(receiver: mpsc::Receiver<Value>) -> Self {
+        Self {
+            receiver,
+            next_sequence: 0,
+        }
+    }
+
+    fn stamp(&mut self, value: Value) -> Value {
+        let mut data = object(value);
+        let sequence_number = self.next_sequence;
+        self.next_sequence += 1;
+        data.insert("sequence_number".into(), Value::from(sequence_number));
+        Value::Object(data)
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<Value> {
+        self.receiver.recv().await.map(|value| self.stamp(value))
+    }
+}
+
+impl Stream for ResponseEvents {
+    type Item = Value;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        this.receiver
+            .poll_recv(cx)
+            .map(|item| item.map(|value| this.stamp(value)))
+    }
+}
+
 /// A started streamed response.
 pub(crate) struct ResponseStream {
     pub(crate) id: String,
-    pub(crate) events: mpsc::Receiver<Value>,
+    pub(crate) events: ResponseEvents,
     /// The response's output items, in `output` order, once it completes or
     /// is incomplete; closed without a value when it fails or is abandoned.
     pub(crate) concluded: oneshot::Receiver<Vec<Value>>,
@@ -1603,25 +1639,23 @@ pub(crate) async fn start_response_stream(
     let include_progress = include_progress(headers);
     let (sender, events) = mpsc::channel::<Value>(32);
     let (concluded_sender, concluded) = oneshot::channel();
-    let sequence = Arc::new(AtomicU64::new(0));
     let projector = StreamProjector::new(
         id.clone(),
         created_at,
         adapted.model.clone(),
         sender.clone(),
-        sequence.clone(),
         adapted.projection,
         concluded_sender,
     );
     let response = ResponseStream {
         id: id.clone(),
-        events,
+        events: ResponseEvents::new(events),
         concluded,
     };
     if include_progress {
         let progress_id = id.clone();
         let progress: LoadProgress = Arc::new(move |load| {
-            send_loading_progress(&sender, &sequence, &progress_id, load);
+            send_loading_progress(&sender, &progress_id, load);
         });
         tokio::spawn(async move {
             if projector.created().await.is_err() {
@@ -1735,10 +1769,8 @@ pub(crate) fn websocket_error_event(error: &ApiError, sequence_number: u64) -> V
 async fn send_websocket_error(
     socket: &mut SplitSink<WebSocket, Message>,
     error: &ApiError,
-    sequence: &AtomicU64,
 ) -> bool {
-    let sequence_number = sequence.fetch_add(1, Ordering::Relaxed);
-    send_websocket_value(socket, websocket_error_event(error, sequence_number)).await
+    send_websocket_value(socket, websocket_error_event(error, 0)).await
 }
 
 /// One WebSocket message resolved against the connection's history.
@@ -1947,19 +1979,18 @@ async fn websocket_turn(
     history: &mut WebsocketHistory,
     data: Bytes,
 ) -> bool {
-    let sequence = AtomicU64::new(0);
     let request = serde_json::from_slice::<Value>(&data);
     let request = match request {
         Ok(request) => request,
         Err(error) => {
             let error = ApiError::invalid(format!("Invalid JSON: {error}"));
-            return send_websocket_error(socket, &error, &sequence).await;
+            return send_websocket_error(socket, &error).await;
         }
     };
     let logical = match history.resolve(request) {
         Ok(logical) => logical,
         Err(error) => {
-            return send_websocket_error(socket, &error, &sequence).await;
+            return send_websocket_error(socket, &error).await;
         }
     };
     let request = serde_json::from_value::<ResponseCreateRequest>(logical.request)
@@ -1969,7 +2000,7 @@ async fn websocket_turn(
         // A warmup is refused exactly as its generation would be.
         if let Err(error) = request.and_then(adapt) {
             history.evict(previous);
-            return send_websocket_error(socket, &error, &sequence).await;
+            return send_websocket_error(socket, &error).await;
         }
         let id = state.next_id("resp_icn_");
         for event in warmup_events(&id) {
@@ -1988,7 +2019,7 @@ async fn websocket_turn(
         Ok(stream) => stream,
         Err(error) => {
             history.evict(previous);
-            return send_websocket_error(socket, &error, &sequence).await;
+            return send_websocket_error(socket, &error).await;
         }
     };
     while let Some(event) = stream.events.recv().await {
@@ -2232,5 +2263,86 @@ mod websocket_tests {
         assert_eq!(turn.reasoning.as_deref(), Some("run ls"));
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].call.id, "call-1");
+    }
+
+    #[tokio::test]
+    async fn sequence_numbers_stay_monotonic_and_gap_free_under_progress_backpressure() {
+        use crate::source::ModelLoadStage;
+
+        let load = |fraction| ModelLoadProgress {
+            stage: ModelLoadStage::LoadingWeights,
+            fraction,
+            details: None,
+        };
+
+        // Channel capacity 2: 3 of 5 progress sends are dropped by try_send.
+        let (tx, rx) = mpsc::channel(2);
+        let mut events = ResponseEvents::new(rx);
+        for step in 0..5 {
+            send_loading_progress(&tx, "resp_icn_1", load(step as f32 / 5.0));
+        }
+        let first = events.recv().await.expect("first progress event");
+        assert_eq!(first["sequence_number"], 0);
+        tx.send(serde_json::json!({ "type": "response.in_progress" }))
+            .await
+            .expect("send after draining one slot");
+        drop(tx);
+
+        let mut sequences = vec![first["sequence_number"].as_u64().unwrap()];
+        while let Some(event) = events.recv().await {
+            sequences.push(event["sequence_number"].as_u64().unwrap());
+        }
+        assert_eq!(sequences, vec![0, 1, 2]);
+
+        // Stream polling (SSE path) assigns the same gap-free sequence numbers.
+        let (tx, rx) = mpsc::channel(2);
+        let events = ResponseEvents::new(rx);
+        for step in 0..4 {
+            send_loading_progress(&tx, "resp_icn_2", load(step as f32 / 4.0));
+        }
+        drop(tx);
+        let streamed: Vec<u64> = events
+            .map(|event| event["sequence_number"].as_u64().unwrap())
+            .collect()
+            .await;
+        assert_eq!(streamed, vec![0, 1]);
+    }
+
+    #[test]
+    fn context_rejects_duplicate_function_call_ids() {
+        let request: ResponseCreateRequest = serde_json::from_value(serde_json::json!({
+            "model": "local-model",
+            "tools": [tool()],
+            "input": [
+                { "role": "user", "content": "run" },
+                {
+                    "type": "function_call",
+                    "call_id": "call-dup",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"ls\"}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-dup",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"pwd\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-dup",
+                    "output": "ok"
+                }
+            ]
+        }))
+        .unwrap();
+        let Err(error) = adapt(request) else {
+            panic!("duplicate function_call call_id must be rejected");
+        };
+        assert_eq!(error.status.as_u16(), 400);
+        assert!(
+            error.body.message.contains("duplicate function_call call_id"),
+            "unexpected error: {}",
+            error.body.message
+        );
     }
 }

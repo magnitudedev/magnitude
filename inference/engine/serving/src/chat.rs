@@ -1549,11 +1549,11 @@ pub async fn chat_completions(
     span.record("completion.id", id.as_str());
     span.record("model.id", adapted.model.as_str());
     let options = ChatStreamOptions {
-        include_progress: include_progress(&headers),
+        include_progress: adapted.stream && include_progress(&headers),
         timings_per_token: adapted.timings_per_token,
         include_usage: adapted.include_usage,
     };
-    if options.include_progress {
+    if adapted.stream && options.include_progress {
         // The stream commits before the model is bound so loading progress
         // reaches the client; every later failure is an in-stream error.
         let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
@@ -1803,4 +1803,119 @@ pub async fn apply_template(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(apply_template_response(applied)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use axum::http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
+    use axum::http::StatusCode;
+    use futures_util::future::BoxFuture;
+    use http_body_util::BodyExt;
+    use magnitude_chat::output::{GenerationTimings, TokenUsage};
+
+    use crate::source::{HostChat, ModelInvocation, ServedModels};
+
+    struct NonStreamingInvocation;
+
+    impl ModelInvocation for NonStreamingInvocation {
+        fn generate(self: Box<Self>, _request: GenerationRequest) -> GenerationStream {
+            let (tx, rx) = mpsc::channel(4);
+            tokio::spawn(async move {
+                let _ = tx.send(GenerationEvent::Admitted { prompt_tokens: 3 }).await;
+                let _ = tx
+                    .send(GenerationEvent::Output {
+                        event: OutputEvent::Started,
+                        snapshot: None,
+                    })
+                    .await;
+                let _ = tx
+                    .send(GenerationEvent::Output {
+                        event: OutputEvent::TextDelta("hello".into()),
+                        snapshot: None,
+                    })
+                    .await;
+                let _ = tx
+                    .send(GenerationEvent::Completed(Completion {
+                        usage: TokenUsage {
+                            input_tokens: 3,
+                            cached_input_tokens: 0,
+                            output_tokens: 1,
+                            reasoning_output_tokens: 0,
+                        },
+                        termination: Termination::Natural,
+                        timings: GenerationTimings {
+                            prompt_ms: 1.0,
+                            decode_ms: 1.0,
+                            time_to_first_token_ms: 1.0,
+                            sampler_ms: 0.0,
+                            parser_ms: 0.0,
+                            draft_tokens: 0,
+                            accepted_draft_tokens: 0,
+                        },
+                    }))
+                    .await;
+            });
+            GenerationStream::new(rx)
+        }
+    }
+
+    struct AssertNoProgressSource;
+
+    impl ServedModels for AssertNoProgressSource {
+        fn invoke(
+            &self,
+            _model: &str,
+            progress: Option<LoadProgress>,
+        ) -> BoxFuture<'_, Result<Box<dyn ModelInvocation>, ServingError>> {
+            assert!(
+                progress.is_none(),
+                "non-streaming chat completion must not attach a load-progress callback"
+            );
+            Box::pin(async { Ok(Box::new(NonStreamingInvocation) as Box<dyn ModelInvocation>) })
+        }
+
+        fn host(&self, _model: &str) -> BoxFuture<'_, Result<Arc<dyn HostChat>, ServingError>> {
+            Box::pin(async { Err(ServingError::Internal("unused".into())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_chat_with_progress_header_returns_json() {
+        let state = Serving::new(Arc::new(AssertNoProgressSource));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("magnitude-include-progress"),
+            HeaderValue::from_static("true"),
+        );
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+        }))
+        .expect("request must decode");
+
+        let response = chat_completions(State(state), headers, Ok(Json(request)))
+            .await
+            .expect("non-streaming request must succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body must collect")
+            .to_bytes();
+        let json: JsonValue = serde_json::from_slice(&body).expect("body must be JSON");
+        assert_eq!(json["choices"][0]["message"]["content"], "hello");
+    }
 }
