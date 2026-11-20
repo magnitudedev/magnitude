@@ -284,16 +284,9 @@ pub fn inspect_components(
 ) -> Result<ModelDefinition, Error> {
     recognize(directory)?;
     let m = Metadata::new(directory, FAMILY_ID);
-    let block_count = m.integer("block_count")?;
+    let block_count = m.bounded_block_count("block_count")?;
     let predictions = prediction_blocks(&m, block_count)?;
     let layer_count = block_count - predictions;
-    // Each real layer requires distinct stored weights. Reject impossible counts
-    // before allocating architecture vectors from untrusted metadata.
-    if layer_count > directory.tensors.len() as u64 {
-        return Err(invalid(
-            "qwen4exp layer count exceeds available weight roles",
-        ));
-    }
     let layers = mixer_kinds(&m, layer_count, predictions)?;
     let extensions = Extensions::read(&m, &layers, predictions)?;
     let geometry = Geometry::read(&m, true)?;

@@ -92,12 +92,7 @@ pub fn inspect_components(
         return Err(invalid("not a Muse Glimmer artifact"));
     }
     let m = Metadata::new(directory, ARCHITECTURE);
-    let layers = m.integer("block_count")?;
-    // Every layer binds distinct stored weights; reject impossible counts
-    // before allocating per-layer vectors from untrusted metadata.
-    if layers > directory.tensors.len() as u64 {
-        return Err(invalid("Muse Glimmer layer count exceeds its stored weights"));
-    }
+    let layers = m.bounded_block_count("block_count")?;
     let hidden = m.integer("embedding_length")?;
     let intermediate = m.integer("feed_forward_length")?;
     let heads = m.integer("attention.head_count")?;

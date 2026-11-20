@@ -246,7 +246,7 @@ pub fn inspect_components(
         let kind = scaling.string().unwrap_or("unspecified").to_owned();
         return Err(Error::Unadmitted(vec![Feature::RopeScaling(kind)]));
     }
-    let block_count = m.integer("block_count")?;
+    let block_count = m.bounded_block_count("block_count")?;
     let context_limit = m.integer("context_length")?;
     let hidden = m.integer("embedding_length")?;
     let intermediate = m.integer("feed_forward_length")?;
@@ -275,13 +275,6 @@ pub fn inspect_components(
     {
         return Err(Error::Geometry(
             "rotary must cover the whole even head width".into(),
-        ));
-    }
-    // Each block binds distinct stored weights; reject impossible counts
-    // before allocating from untrusted metadata.
-    if block_count > directory.tensors.len() as u64 {
-        return Err(Error::Geometry(
-            "block count exceeds the stored weight roles".into(),
         ));
     }
     let query_rows = product(&[heads, width])?;

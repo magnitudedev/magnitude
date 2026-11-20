@@ -307,7 +307,7 @@ pub fn inspect(
     recognize(directory)?;
     let m = Metadata::new(directory, ARCHITECTURE);
     let decoder = &target.decoder;
-    let block_count = m.integer("block_count")?;
+    let block_count = m.bounded_block_count("block_count")?;
     // The longest sequence the draft was trained on: no layer reads further
     // back than it (a full layer's history is a window of that length).
     let context_length = m.integer("context_length")?;
@@ -340,13 +340,6 @@ pub fn inspect(
     if !width.is_multiple_of(2) || block_size < 2 {
         return Err(Error::Geometry(
             "draft heads need an even width and blocks two slots".into(),
-        ));
-    }
-    // Each layer binds distinct stored weights; reject impossible counts
-    // before allocating from untrusted metadata.
-    if block_count > directory.tensors.len() as u64 {
-        return Err(Error::Geometry(
-            "block count exceeds the stored weight roles".into(),
         ));
     }
     let mask_token = directory
@@ -667,7 +660,7 @@ fn candidate_corrector(
     let width = m.integer("hidden_size")?;
     let top_k = m.integer("candidate_topk")?;
     let heads = m.integer("num_heads")?;
-    let layers = m.integer("num_layers")?;
+    let layers = m.bounded_block_count("num_layers")?;
     let factor = m.integer("factor_dim")?;
     let mlp = m.integer("mlp_hidden_size")?;
     let vector_epsilon = m.positive_number("vector_eps")?;
@@ -677,11 +670,9 @@ fn candidate_corrector(
         || top_k == 0
         || heads == 0
         || !width.is_multiple_of(heads)
-        || layers == 0
         || factor == 0
         || mlp == 0
         || block_size < 2
-        || layers > directory.tensors.len() as u64
     {
         return Err(Error::Geometry("corrector geometry".into()));
     }

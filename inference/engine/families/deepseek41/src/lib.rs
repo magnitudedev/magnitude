@@ -798,14 +798,7 @@ pub fn inspect_components(
     // Uninterpreted sibling DSpark drafter metadata carried on target GGUFs;
     // any stray drafter tensors are still rejected by `Tensors::finish`.
     m.ignore_prefix("dspark.");
-    let layers = m.integer("block_count")?;
-    // Each layer requires distinct stored weights. Reject impossible counts
-    // before allocating per-layer vectors from untrusted metadata.
-    if layers > directory.tensors.len() as u64 {
-        return Err(FamilyError::invalid(format!(
-            "{FAMILY_ID} layer count exceeds available weight roles"
-        )));
-    }
+    let layers = m.bounded_block_count("block_count")?;
     let compressions = compressions(&m, layers)?;
     let engram = Engram::read(&m, layers)?;
     if compressions.iter().all(|layer| *layer == Compression::None) {

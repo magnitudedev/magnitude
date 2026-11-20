@@ -2,14 +2,14 @@
 //! processor supplies pixels and grids; this adapter assigns numerical meaning.
 
 use magnitude_artifacts::{
-    BoundaryRule, ImageProcessor, InputLayout, InputSpan, TokenId,
-    media::{DType, MAX_PREPARED_BYTES, PreparedMedia, PreparedTensor},
+    BoundaryRule, InputLayout, InputSpan, MAX_IMAGES_PER_REQUEST, TokenId,
+    media::{MAX_PREPARED_BYTES, PreparedMedia},
 };
 use magnitude_family_contracts::{
     InputPreparationError, ModelDefinition, ModelInputAdapter, PositionSampling, PreparedModelInput,
     PreparedVisionInput, TokenPlan, VisionPositionBlend, VisionSpatialControls,
+    image_crop_identity, image_crops,
 };
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, btree_map::Entry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,20 +95,10 @@ impl ModelInputAdapter for QwenInputAdapter {
         let [prepared] = media else {
             return Err(InputPreparationError::UnsupportedMedia);
         };
-        let processor = ImageProcessor::new(
-            vision
-                .image_processor_config()
-                .map_err(|_| InputPreparationError::VisionGeometry)?,
-        )
-        .map_err(|_| InputPreparationError::VisionGeometry)?;
-        if prepared.processor() != processor.identity() || prepared.tensors().len() != 2 {
-            return Err(InputPreparationError::UnsupportedMedia);
+        let (processor, images) = image_crops(definition, prepared)?;
+        if images.len() > MAX_IMAGES_PER_REQUEST {
+            return Err(InputPreparationError::VisionGeometry);
         }
-        let width = vision
-            .patch_row_width()
-            .ok()
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or(InputPreparationError::VisionGeometry)?;
         let merge = usize::try_from(vision.preprocessing.merge)
             .ok()
             .filter(|value| *value > 0)
@@ -125,58 +115,6 @@ impl ModelInputAdapter for QwenInputAdapter {
             .ok()
             .filter(|value| *value > 0)
             .ok_or(InputPreparationError::VisionGeometry)?;
-        let pixels = prepared
-            .tensors()
-            .iter()
-            .find(|tensor| tensor.name() == "pixel_values")
-            .ok_or(InputPreparationError::VisionGeometry)?;
-        let grids = prepared
-            .tensors()
-            .iter()
-            .find(|tensor| tensor.name() == "image_grid_thw")
-            .ok_or(InputPreparationError::VisionGeometry)?;
-        if pixels.dtype() != DType::F32
-            || pixels.shape().len() != 2
-            || pixels.shape()[1] != width
-            || grids.dtype() != DType::I64
-            || grids.shape().len() != 2
-            || grids.shape()[1] != 3
-            || grids.shape()[0] > 16
-            || pixels
-                .data()
-                .chunks_exact(4)
-                .any(|bytes| !f32::from_le_bytes(bytes.try_into().expect("f32 chunk")).is_finite())
-        {
-            return Err(InputPreparationError::VisionGeometry);
-        }
-        let sizes = grids
-            .data()
-            .chunks_exact(24)
-            .map(|row| {
-                let mut grid = [0usize; 3];
-                for (index, bytes) in row.chunks_exact(8).enumerate() {
-                    grid[index] =
-                        usize::try_from(i64::from_le_bytes(bytes.try_into().expect("i64 chunk")))
-                            .map_err(|_| InputPreparationError::VisionGeometry)?;
-                }
-                let [t, h, w] = grid;
-                if t != 1 || h < merge || w < merge || h % merge != 0 || w % merge != 0 {
-                    return Err(InputPreparationError::VisionGeometry);
-                }
-                Ok(grid)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let total = sizes
-            .iter()
-            .try_fold(0usize, |count, &[t, h, w]| {
-                t.checked_mul(h)
-                    .and_then(|rows| rows.checked_mul(w))
-                    .and_then(|rows| count.checked_add(rows))
-            })
-            .ok_or(InputPreparationError::VisionGeometry)?;
-        if total != pixels.shape()[0] {
-            return Err(InputPreparationError::VisionGeometry);
-        }
         let merge_area = merge
             .checked_mul(merge)
             .ok_or(InputPreparationError::VisionGeometry)?;
@@ -186,9 +124,10 @@ impl ModelInputAdapter for QwenInputAdapter {
         while source < tokens.len() {
             let token = tokens[source];
             if token == markers.start {
-                let [t, h, w] = *sizes
+                let [t, h, w] = images
                     .get(image)
-                    .ok_or(InputPreparationError::InputAlignment)?;
+                    .ok_or(InputPreparationError::InputAlignment)?
+                    .grid;
                 if tokens.get(source + 1) != Some(&markers.image)
                     || tokens.get(source + 2) != Some(&markers.end)
                 {
@@ -216,15 +155,15 @@ impl ModelInputAdapter for QwenInputAdapter {
             }
         }
         source_boundaries.push(expanded.len());
-        if image != sizes.len() || expanded.len() > i32::MAX as usize {
+        if image != images.len() || expanded.len() > i32::MAX as usize {
             return Err(InputPreparationError::InputAlignment);
         }
         let mut coordinates = Vec::with_capacity(expanded.len());
         let mut vision_inputs = BTreeMap::new();
-        let mut spans = Vec::with_capacity(sizes.len());
-        let (mut cursor, mut pixel_start, mut rotary) = (0usize, 0usize, 0usize);
-        for grid in sizes {
-            let [t, h, w] = grid;
+        let mut spans = Vec::with_capacity(images.len());
+        let (mut cursor, mut rotary) = (0usize, 0usize);
+        for crop in images {
+            let [t, h, w] = crop.grid;
             let patches = t
                 .checked_mul(h)
                 .and_then(|value| value.checked_mul(w))
@@ -261,37 +200,7 @@ impl ModelInputAdapter for QwenInputAdapter {
                     coordinates.push([base as i32, (base + row) as i32, (base + col) as i32]);
                 }
             }
-            let byte_start = pixel_start
-                .checked_mul(width)
-                .and_then(|value| value.checked_mul(4))
-                .ok_or(InputPreparationError::VisionGeometry)?;
-            let byte_end = pixel_start
-                .checked_add(patches)
-                .and_then(|value| value.checked_mul(width))
-                .and_then(|value| value.checked_mul(4))
-                .ok_or(InputPreparationError::VisionGeometry)?;
-            let values = PreparedTensor::new(
-                "pixel_values".into(),
-                DType::F32,
-                vec![patches, width],
-                pixels
-                    .data()
-                    .get(byte_start..byte_end)
-                    .ok_or(InputPreparationError::VisionGeometry)?
-                    .to_vec(),
-            )
-            .map_err(|_| InputPreparationError::VisionGeometry)?;
-            let mut digest = Sha256::new();
-            digest.update(processor.identity().as_bytes());
-            for value in grid {
-                digest.update((value as i64).to_le_bytes());
-            }
-            digest.update(values.data());
-            let identity: String = digest
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
+            let identity = image_crop_identity(&processor, &crop);
             spans.push(InputSpan {
                 start,
                 end,
@@ -302,14 +211,13 @@ impl ModelInputAdapter for QwenInputAdapter {
             if let Entry::Vacant(entry) = vision_inputs.entry(identity) {
                 entry.insert(PreparedVisionInput::new(
                     definition,
-                    grid,
-                    values,
-                    spatial_controls(grid, merge, table_side)?,
+                    crop.grid,
+                    crop.pixels,
+                    spatial_controls(crop.grid, merge, table_side)?,
                 )?);
             }
             rotary = next_rotary;
             cursor = end;
-            pixel_start += patches;
         }
         if expanded[cursor..].contains(&markers.image) {
             return Err(InputPreparationError::InputAlignment);
@@ -366,11 +274,11 @@ pub fn spatial_controls(
         } else {
             (position as f64 * ((table_side - 1) as f64 / (extent - 1) as f64)) as f32
         };
-        let low = value as usize;
+        let low = (value as usize).min(table_side - 1);
         (
             low,
             (low + 1).min(table_side - 1),
-            value as f64 - low as f64,
+            (value as f64 - low as f64).clamp(0.0, 1.0),
         )
     };
     for block_row in 0..h / merge {
@@ -407,4 +315,36 @@ pub fn spatial_controls(
         }),
         Vec::new(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spatial_controls;
+
+    #[test]
+    fn spatial_controls_clamps_boundary_indices_within_table() {
+        for (grid, merge, table_side) in [
+            ([1, 2, 2], 2, 1),
+            ([1, 4, 6], 2, 2),
+            ([1, 50, 98], 2, 48),
+        ] {
+            let controls = spatial_controls(grid, merge, table_side).unwrap();
+            let blend = controls.position_blend().expect("aligned-corners blend");
+            let limit = (table_side * table_side) as i32;
+            let rows = grid[1] * grid[2];
+            for corner in 0..4 {
+                assert_eq!(blend.indices[corner].len(), rows);
+                assert!(blend.indices[corner].iter().all(|&index| (0..limit).contains(&index)));
+            }
+            // The last raster patch in the last merge cell is (h - 1, w - 1) and must
+            // land on the bottom-right table entry without exceeding `limit - 1`.
+            let last = rows - 1;
+            let expected_corner = limit - 1;
+            for corner in 0..4 {
+                assert_eq!(blend.indices[corner][last], expected_corner);
+            }
+            let sum: f32 = (0..4).map(|corner| blend.coefficients[corner][last]).sum();
+            assert!((sum - 1.0).abs() < 1e-6);
+        }
+    }
 }

@@ -218,12 +218,7 @@ pub fn inspect_components(
 ) -> Result<ModelDefinition, Error> {
     recognize(directory)?;
     let m = Metadata::new(directory, ARCHITECTURE);
-    let layers = m.integer("block_count")?;
-    // Each layer binds distinct stored weights; reject impossible counts
-    // before allocating per-layer vectors from untrusted metadata.
-    if layers > directory.tensors.len() as u64 {
-        return Err(invalid("Gemma layer count exceeds available weight roles"));
-    }
+    let layers = m.bounded_block_count("block_count")?;
     let shape = Shape {
         hidden: m.integer("embedding_length")?,
         heads: m.integer("attention.head_count")?,

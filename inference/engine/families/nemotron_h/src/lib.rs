@@ -497,17 +497,12 @@ pub fn inspect_components(
     m.ignore("rope.dimension_count");
     m.ignore("rope.freq_base");
     m.ignore("rope.scaling.finetuned");
-    let block_count = m.integer("block_count")?;
+    let block_count = m.bounded_block_count("block_count")?;
     let head_layers = m.optional_count("nextn_predict_layers")?.unwrap_or(0);
     if head_layers >= block_count {
         return Err(metadata_error(
             "nextn_predict_layers must be below block count",
         ));
-    }
-    // Every layer binds distinct stored weights; reject impossible counts
-    // before allocating per-layer vectors from untrusted metadata.
-    if block_count > directory.tensors.len() as u64 {
-        return Err(metadata_error("Nemotron-H block count exceeds its weights"));
     }
     let kv_heads = m.layer_counts("attention.head_count_kv", block_count)?;
     let intermediates = m.layer_counts("feed_forward_length", block_count)?;

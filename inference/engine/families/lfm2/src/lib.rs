@@ -319,12 +319,7 @@ pub fn inspect_components(
     let family_id = architecture.family_id();
     let m = Metadata::new(directory, family_id);
 
-    let layer_count = m.integer("block_count")?;
-    // Each layer requires distinct stored weights. Reject impossible counts
-    // before allocating per-layer vectors from untrusted metadata.
-    if layer_count > directory.tensors.len() as u64 {
-        return Err(invalid("LFM2 layer count exceeds available weight roles"));
-    }
+    let layer_count = m.bounded_block_count("block_count")?;
     // A layer without key heads is a short-convolution layer; the per-layer
     // array is the only source of the pattern.
     let kv_heads = m.layer_counts("attention.head_count_kv", layer_count)?;

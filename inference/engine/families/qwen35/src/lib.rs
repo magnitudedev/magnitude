@@ -133,14 +133,9 @@ pub fn inspect_components(
         let key = m.key("rope.section_order");
         return Err(Error::metadata(&key, format!("{key} must be \"zyxt\"")));
     }
-    let block_count = m.integer("block_count")?;
+    let block_count = m.bounded_block_count("block_count")?;
     let speculative = prediction_blocks(&m, block_count)?;
     let layer_count = block_count - speculative;
-    // Each real layer requires distinct stored weights. Reject impossible counts
-    // before allocating architecture vectors from untrusted metadata.
-    if layer_count > directory.tensors.len() as u64 {
-        return Err(invalid("Qwen layer count exceeds available weight roles"));
-    }
     let layers = mixer_kinds(&m, layer_count, speculative)?;
     let embedding = directory
         .tensor("token_embd.weight")

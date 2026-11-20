@@ -64,12 +64,7 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
     }
     let decoder = &target.decoder;
     let m = Metadata::new(draft, ASSISTANT_ARCHITECTURE);
-    let layers = m.integer("block_count")?;
-    if layers > draft.tensors.len() as u64 {
-        return Err(invalid(
-            "Gemma assistant layer count exceeds its stored weights",
-        ));
-    }
+    let layers = m.bounded_block_count("block_count")?;
     if m.integer("nextn_predict_layers")? != layers
         || m.count("attention.shared_kv_layers")? != layers
         || m.count("embedding_length_per_layer_input")? != 0

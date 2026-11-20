@@ -557,14 +557,7 @@ pub fn inspect_components(
 ) -> Result<ModelDefinition, FamilyError> {
     recognize(directory)?;
     let m = Metadata::new(directory, FAMILY_ID);
-    let blocks = m.integer("block_count")?;
-    // Each block requires distinct stored weights. Reject impossible counts
-    // before allocating per-block vectors from untrusted metadata.
-    if blocks > directory.tensors.len() as u64 {
-        return Err(FamilyError::invalid(format!(
-            "{FAMILY_ID} block count exceeds available weight roles"
-        )));
-    }
+    let blocks = m.bounded_block_count("block_count")?;
     let predicted = m.optional_count("nextn_predict_layers")?.unwrap_or(0);
     let trunk = blocks.checked_sub(predicted).filter(|trunk| *trunk > 0).ok_or_else(|| {
         let key = m.key("nextn_predict_layers");

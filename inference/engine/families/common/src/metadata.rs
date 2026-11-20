@@ -216,6 +216,12 @@ impl<'a> Metadata<'a> {
         layers: u64,
         read: impl Fn(Element<'a>) -> Option<T>,
     ) -> Result<Option<Vec<T>>, HeaderError> {
+        if layers > self.directory.tensors.len() as u64 {
+            return Err(self.malformed(
+                key,
+                "a layer count not exceeding the stored tensor count",
+            ));
+        }
         match self.value(key) {
             Some(Value::Array(_)) => self.array(key, expected, Some(layers), read),
             _ => self.typed(key, expected, |value| match value {
@@ -354,9 +360,13 @@ fn element_number(element: Element) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_artifacts::gguf::{ByteOrder, Metadata as Entry};
+    use magnitude_artifacts::gguf::{ByteOrder, Encoding, Metadata as Entry, TensorDescriptor};
 
     fn directory(entries: &[(&str, Value)]) -> Directory {
+        directory_with_tensors(entries, 0)
+    }
+
+    fn directory_with_tensors(entries: &[(&str, Value)], tensor_count: usize) -> Directory {
         Directory {
             version: 3,
             byte_order: ByteOrder::Little,
@@ -369,7 +379,15 @@ mod tests {
                     value: value.clone(),
                 })
                 .collect(),
-            tensors: Vec::new(),
+            tensors: (0..tensor_count)
+                .map(|index| TensorDescriptor {
+                    name: format!("blk.{index}.attn_norm.weight"),
+                    shape: vec![4],
+                    encoding: Encoding::F32,
+                    offset: 0,
+                    nbytes: 16,
+                })
+                .collect(),
         }
     }
 
@@ -401,5 +419,47 @@ mod tests {
         m.ignore_prefix("sibling.");
         assert_eq!(m.optional_flag("unknown_switch"), Ok(Some(true)));
         assert_eq!(m.finish(), Ok(()));
+    }
+
+    #[test]
+    fn bounded_block_count_and_uniform_or_array_reject_inflated_layers_without_allocating() {
+        let valid = directory_with_tensors(
+            &[
+                ("arch.block_count", Value::Scalar(Scalar::Unsigned(2))),
+                ("arch.feed_forward_length", Value::Scalar(Scalar::Unsigned(8))),
+                ("arch.expert_used_count", Value::Scalar(Scalar::Unsigned(0))),
+            ],
+            2,
+        );
+        let m = Metadata::new(&valid, "arch");
+        assert_eq!(m.bounded_block_count("block_count"), Ok(2));
+        assert_eq!(m.per_layer("feed_forward_length", 2), Ok(vec![8, 8]));
+        assert_eq!(
+            m.uniform_or_layer_counts("expert_used_count", 2),
+            Ok(vec![0, 0])
+        );
+        assert_eq!(m.finish(), Ok(()));
+
+        let inflated = directory_with_tensors(
+            &[
+                ("arch.block_count", Value::Scalar(Scalar::Unsigned(u64::MAX))),
+                ("arch.feed_forward_length", Value::Scalar(Scalar::Unsigned(8))),
+                ("arch.expert_used_count", Value::Scalar(Scalar::Unsigned(1))),
+            ],
+            2,
+        );
+        let m = Metadata::new(&inflated, "arch");
+        assert!(matches!(
+            m.bounded_block_count("block_count"),
+            Err(HeaderError::MetadataType { key, .. }) if key == "arch.block_count"
+        ));
+        assert!(matches!(
+            m.per_layer("feed_forward_length", u64::MAX),
+            Err(HeaderError::MetadataType { key, .. }) if key == "arch.feed_forward_length"
+        ));
+        assert!(matches!(
+            m.uniform_or_layer_counts("expert_used_count", 3),
+            Err(HeaderError::MetadataType { key, .. }) if key == "arch.expert_used_count"
+        ));
     }
 }
