@@ -219,12 +219,12 @@ pub(crate) struct LocalModelsContext {
     enrichment: RwLock<Arc<dyn CustomModelEnrichment>>,
     generation: AtomicU64,
     configuration_generation: AtomicU64,
-    changes: tokio::sync::broadcast::Sender<ModelDomainInvalidation>,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl LocalModelsContext {
     pub(crate) fn new() -> Self {
-        let (changes, _) = tokio::sync::broadcast::channel(32);
+        let (changes, _) = tokio::sync::watch::channel(0);
         Self {
             enrichment: RwLock::new(Arc::new(NoEnrichment)),
             generation: AtomicU64::new(0),
@@ -274,10 +274,7 @@ impl ModelDomainResolver {
 
     fn publish_local_change(&self) {
         if let Ok(revision) = self.local_revision() {
-            let _ = self
-                .local
-                .changes
-                .send(ModelDomainInvalidation { revision });
+            self.local.changes.send_replace(revision);
         }
     }
 
@@ -2065,10 +2062,9 @@ impl LocalModels for ManagedLocalModels {
     }
 
     fn watch_local(&self) -> BoxStream<'static, ModelDomainInvalidation> {
-        domain_changes(
-            self.resolver.local_revision().unwrap_or_default(),
-            self.resolver.local.changes.subscribe(),
-        )
+        let receiver = self.resolver.local.changes.subscribe();
+        let initial = self.resolver.local_revision().unwrap_or_default();
+        domain_changes(initial, receiver)
     }
 }
 

@@ -266,10 +266,7 @@ impl ModelDomainResolver {
 
     pub(crate) fn publish_catalog_change(&self) {
         if let Ok(revision) = self.revision() {
-            let _ = self
-                .catalog_changes
-                .changes
-                .send(ModelDomainInvalidation { revision });
+            self.catalog_changes.changes.send_replace(revision);
         }
     }
 
@@ -809,10 +806,9 @@ impl CatalogModels for ManagedCatalogModels {
     }
 
     fn watch_catalog(&self) -> BoxStream<'static, ModelDomainInvalidation> {
-        domain_changes(
-            self.resolver.revision().unwrap_or_default(),
-            self.resolver.catalog_changes.changes.subscribe(),
-        )
+        let receiver = self.resolver.catalog_changes.changes.subscribe();
+        let initial = self.resolver.revision().unwrap_or_default();
+        domain_changes(initial, receiver)
     }
 }
 

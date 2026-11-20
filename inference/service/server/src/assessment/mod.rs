@@ -580,7 +580,7 @@ pub struct ManagedModelAssessments {
     catalog: Arc<dyn CatalogModels>,
     local: Arc<dyn LocalModels>,
     current: std::sync::RwLock<AssessmentPoolCurrent>,
-    changes: tokio::sync::broadcast::Sender<ModelAssessmentsInvalidation>,
+    changes: tokio::sync::watch::Sender<u64>,
     active: Mutex<ActiveAssessments>,
     concurrency: Arc<tokio::sync::Semaphore>,
     host: HostDevice,
@@ -713,7 +713,7 @@ impl ManagedModelAssessments {
         measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
         host: HostDevice,
     ) -> Arc<Self> {
-        let (changes, _) = tokio::sync::broadcast::channel(64);
+        let (changes, _) = tokio::sync::watch::channel(0);
         let concurrency = assessment_concurrency();
         let environment_id = assessor.environment().id.clone();
         let state = measurement.borrow().state.clone();
@@ -756,7 +756,7 @@ impl ManagedModelAssessments {
         let revision = current.snapshot.revision;
         self.host.observe(&current);
         drop(current);
-        let _ = self.changes.send(ModelAssessmentsInvalidation { revision });
+        self.changes.send_replace(revision);
         true
     }
 
@@ -1098,9 +1098,7 @@ impl ManagedModelAssessments {
             service.host.observe(&current);
             drop(current);
             log_dropped_catalog_models(applied.dropped_catalog_models);
-            let _ = service
-                .changes
-                .send(ModelAssessmentsInvalidation { revision });
+            service.changes.send_replace(revision);
         });
         self.active
             .lock()
@@ -1122,7 +1120,7 @@ impl ManagedModelAssessments {
         self.host.observe(&current);
         drop(current);
         log_dropped_catalog_models(applied.dropped_catalog_models);
-        let _ = self.changes.send(ModelAssessmentsInvalidation { revision });
+        self.changes.send_replace(revision);
     }
 
     fn cancel_unreferenced(&self) {
@@ -1197,20 +1195,16 @@ impl ModelAssessments for ManagedModelAssessments {
     }
 
     fn watch(&self) -> BoxStream<'static, ModelAssessmentsInvalidation> {
+        let receiver = self.changes.subscribe();
         let initial = self
             .current
             .read()
             .map(|state| state.snapshot.revision)
             .unwrap_or_default();
-        let receiver = self.changes.subscribe();
         let changes = futures_util::stream::unfold(receiver, |mut receiver| async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(event) => return Some((event, receiver)),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                }
-            }
+            receiver.changed().await.ok()?;
+            let revision = *receiver.borrow_and_update();
+            Some((ModelAssessmentsInvalidation { revision }, receiver))
         });
         Box::pin(
             futures_util::stream::once(async move {

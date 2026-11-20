@@ -8,24 +8,84 @@
 //! [`par_for_results`], and [`par_for_results_with`] calls without deadlock
 //! and preserving [`crate::Submitter`] panic semantics.
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+/// Stack-allocated node linking a `join` / `par_for` scope to its enclosing
+/// scope on the call tree.
+///
+/// Every `ScopeNode` lives on its submitter's stack and is kept alive by
+/// `JoinGuard` / `ParForGuard` until every job pushed under it — and every
+/// nested descendant job whose `parent` chain reaches it — has completed.
+struct ScopeNode {
+    id: u64,
+    parent: *const ScopeNode,
+}
+
+static NEXT_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_scope_id() -> u64 {
+    NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+thread_local! {
+    static CURRENT_SCOPE: Cell<*const ScopeNode> = const { Cell::new(std::ptr::null()) };
+}
+
+fn current_scope() -> *const ScopeNode {
+    CURRENT_SCOPE.with(Cell::get)
+}
+
+struct ScopeGuard {
+    previous: *const ScopeNode,
+}
+
+impl ScopeGuard {
+    fn enter(scope: *const ScopeNode) -> Self {
+        let previous = CURRENT_SCOPE.with(|cell| cell.replace(scope));
+        Self { previous }
+    }
+}
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        CURRENT_SCOPE.with(|cell| cell.set(self.previous));
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Job {
     run: unsafe fn(*const ()),
     data: *const (),
+    scope: *const ScopeNode,
 }
 
-// SAFETY: Every `Job` pushed to the pool points to a `Sync` task state whose
-// stack frame is guaranteed by a drop-safe completion barrier to outlive
-// `Job::run`, and `run` only performs synchronized accesses through `data`.
+// SAFETY: Every `Job` pushed to the pool points to a `Sync` task state and an
+// immutable `ScopeNode` chain whose stack frames are guaranteed by drop-safe
+// completion barriers to outlive `Job::run`, and `run` only performs
+// synchronized accesses through `data`.
 unsafe impl Send for Job {}
 
 impl Job {
+    fn is_descendant_of(&self, target_scope_id: u64) -> bool {
+        let mut cursor = self.scope;
+        while !cursor.is_null() {
+            // SAFETY: Every `ScopeNode` along the `parent` chain of a queued
+            // `Job` is kept alive and immutable on its submitter's stack by
+            // `JoinGuard` / `ParForGuard` until all descendant jobs finish.
+            let node = unsafe { &*cursor };
+            if node.id == target_scope_id {
+                return true;
+            }
+            cursor = node.parent;
+        }
+        false
+    }
+
     fn run(self) {
+        let _scope = ScopeGuard::enter(self.scope);
         // SAFETY: Guaranteed by the submitter's drop-safe completion barrier
         // before pushing this `Job` to the pool queue.
         unsafe { (self.run)(self.data) };
@@ -87,7 +147,7 @@ impl WorkPool {
             .expect("work pool queue mutex poisoned");
         state.jobs.push_back(job);
         if state.waiters > 0 {
-            self.shared.waiter_wake.notify_one();
+            self.shared.waiter_wake.notify_all();
         }
         self.shared.worker_wake.notify_one();
     }
@@ -102,15 +162,12 @@ impl WorkPool {
         for _ in 0..count {
             state.jobs.push_back(job);
         }
+        if state.waiters > 0 {
+            self.shared.waiter_wake.notify_all();
+        }
         if count == 1 {
-            if state.waiters > 0 {
-                self.shared.waiter_wake.notify_one();
-            }
             self.shared.worker_wake.notify_one();
         } else {
-            if state.waiters > 0 {
-                self.shared.waiter_wake.notify_all();
-            }
             self.shared.worker_wake.notify_all();
         }
     }
@@ -155,10 +212,16 @@ impl WorkPool {
         }
     }
 
-    /// Help run queued work until `is_done()` returns true, parking on
-    /// `waiter_wake` whenever the queue is empty and waking immediately on
-    /// either task completion or newly pushed nested work.
-    fn wait_until(&self, is_done: impl Fn() -> bool) {
+    /// Help run queued descendant work of `scope_id` until `is_done()` returns
+    /// true, parking on `waiter_wake` whenever no descendant job is queued and
+    /// waking immediately on either task completion or newly pushed nested
+    /// work.
+    ///
+    /// Restricting stealing to descendants of `scope_id` prevents a waiting
+    /// thread from executing unrelated foreign work on top of its own call
+    /// stack, eliminating re-entrant and ABBA deadlocks when callers hold
+    /// `OnceLock`, `Mutex`, or `RwLock` across `join` / `par_for`.
+    fn wait_until(&self, scope_id: u64, is_done: impl Fn() -> bool) {
         loop {
             if is_done() {
                 return;
@@ -173,8 +236,12 @@ impl WorkPool {
                     if is_done() {
                         return;
                     }
-                    if let Some(job) = state.jobs.pop_back() {
-                        break job;
+                    if let Some(pos) = state
+                        .jobs
+                        .iter()
+                        .rposition(|job| job.is_descendant_of(scope_id))
+                    {
+                        break state.jobs.remove(pos).expect("queued job position valid");
                     }
                     state.waiters += 1;
                     state = self
@@ -253,13 +320,14 @@ struct JoinGuard<'a, F: Send, A: Send> {
     pool: &'static WorkPool,
     task: &'a JoinTask<F, A>,
     task_ptr: *const (),
+    scope_id: u64,
     active: bool,
 }
 
 impl<F: Send, A: Send> JoinGuard<'_, F, A> {
     fn wait_remote(&self) {
         self.pool
-            .wait_until(|| self.task.done.load(Ordering::Acquire));
+            .wait_until(self.scope_id, || self.task.done.load(Ordering::Acquire));
     }
 }
 
@@ -315,6 +383,13 @@ where
     if pool.workers == 0 {
         return (a(), b());
     }
+    let scope_id = next_scope_id();
+    let scope_node = ScopeNode {
+        id: scope_id,
+        parent: current_scope(),
+    };
+    let scope_ptr: *const ScopeNode = &scope_node;
+    let _scope_guard = ScopeGuard::enter(scope_ptr);
     let task = JoinTask {
         submitter: crate::Submitter::here(),
         func: UnsafeCell::new(Some(a)),
@@ -325,11 +400,13 @@ where
     pool.push(Job {
         run: run_join_task::<FA, A>,
         data: task_ptr,
+        scope: scope_ptr,
     });
     let guard = JoinGuard {
         pool,
         task: &task,
         task_ptr,
+        scope_id,
         active: true,
     };
     let b_val = b();
@@ -404,6 +481,7 @@ struct ParForGuard<'s, 'a, T: Sync, Init: Sync, F: Sync, R: Send, E: Send> {
     pool: &'static WorkPool,
     state: &'s ParForState<'a, T, Init, F, R, E>,
     state_ptr: *const (),
+    scope_id: u64,
     active: bool,
 }
 
@@ -416,7 +494,7 @@ impl<T: Sync, Init: Sync, F: Sync, R: Send, E: Send> ParForGuard<'_, '_, T, Init
             return;
         }
         self.pool
-            .wait_until(|| self.state.remaining.load(Ordering::Acquire) == 0);
+            .wait_until(self.scope_id, || self.state.remaining.load(Ordering::Acquire) == 0);
     }
 
     fn finish(mut self) {
@@ -466,6 +544,13 @@ where
         return items.iter().map(work).collect();
     }
     let helpers = (n - 1).min(pool.workers);
+    let scope_id = next_scope_id();
+    let scope_node = ScopeNode {
+        id: scope_id,
+        parent: current_scope(),
+    };
+    let scope_ptr: *const ScopeNode = &scope_node;
+    let _scope_guard = ScopeGuard::enter(scope_ptr);
     let state = ParForState {
         submitter: crate::Submitter::here(),
         items,
@@ -482,12 +567,14 @@ where
         Job {
             run: run_par_for_helper::<T, Init, S, F, R, E>,
             data: state_ptr,
+            scope: scope_ptr,
         },
     );
     let guard = ParForGuard {
         pool,
         state: &state,
         state_ptr,
+        scope_id,
         active: true,
     };
     {
@@ -637,5 +724,113 @@ mod tests {
             });
         });
         assert!(caught.is_err());
+    }
+
+    /// Regression test for the re-entrant work-stealing deadlock: multiple
+    /// concurrent callers enter `OnceLock::get_or_init` on the same cell while
+    /// the initializer uses `pool::join` and `pool::par_for_results` (the exact
+    /// pattern of `TemplateBundle::inspect_cached` and `target_census`).
+    /// Previously, `wait_until` stole a foreign caller's job that re-entered
+    /// the same `OnceLock` on the initializing thread, permanently deadlocking
+    /// in `futex_wait_queue_me`.
+    #[test]
+    fn once_lock_across_join_and_par_for_never_deadlocks() {
+        use std::sync::Barrier;
+
+        for _ in 0..16 {
+            let cell = Arc::new(OnceLock::<usize>::new());
+            let barrier = Arc::new(Barrier::new(8));
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let cell = Arc::clone(&cell);
+                let barrier = Arc::clone(&barrier);
+                handles.push(
+                    crate::spawn("test-once-lock-pool", move || {
+                        barrier.wait();
+                        let (v, _) = join(
+                            || {
+                                *cell.get_or_init(|| {
+                                    let (a, b) = join(
+                                        || {
+                                            std::thread::sleep(
+                                                std::time::Duration::from_millis(2),
+                                            );
+                                            let items = [1usize, 2, 3, 4, 5, 6, 7, 8];
+                                            par_for_results(&items, |&x| -> Result<usize, ()> {
+                                                Ok(x * 2)
+                                            })
+                                            .unwrap()
+                                            .into_iter()
+                                            .sum::<usize>()
+                                        },
+                                        || {
+                                            let (x, y) = join(|| 10usize, || 20usize);
+                                            x + y
+                                        },
+                                    );
+                                    a + b
+                                })
+                            },
+                            || 0usize,
+                        );
+                        assert_eq!(v, 102);
+                    })
+                    .expect("spawn test thread"),
+                );
+            }
+            for h in handles {
+                h.join().expect("thread completed without deadlock");
+            }
+        }
+    }
+
+    /// Regression test for cross-caller ABBA work-stealing deadlock: callers
+    /// holding distinct locks across `pool::join` must never steal each other's
+    /// foreign jobs.
+    #[test]
+    fn distinct_locks_across_join_never_steal_foreign_jobs() {
+        use std::sync::Barrier;
+
+        for _ in 0..16 {
+            let lock_a = Arc::new(Mutex::new(0usize));
+            let lock_b = Arc::new(Mutex::new(0usize));
+            let barrier = Arc::new(Barrier::new(4));
+            let mut handles = Vec::new();
+            for idx in 0..4 {
+                let first = if idx % 2 == 0 {
+                    Arc::clone(&lock_a)
+                } else {
+                    Arc::clone(&lock_b)
+                };
+                let barrier = Arc::clone(&barrier);
+                handles.push(
+                    crate::spawn("test-distinct-locks-pool", move || {
+                        barrier.wait();
+                        let _ = join(
+                            || {
+                                let mut g = first.lock().unwrap();
+                                let (x, y) = join(
+                                    || {
+                                        std::thread::sleep(std::time::Duration::from_millis(1));
+                                        1usize
+                                    },
+                                    || 2usize,
+                                );
+                                *g += x + y;
+                            },
+                            || {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            },
+                        );
+                    })
+                    .expect("spawn test thread"),
+                );
+            }
+            for h in handles {
+                h.join().expect("thread completed without deadlock");
+            }
+            assert_eq!(*lock_a.lock().unwrap(), 6);
+            assert_eq!(*lock_b.lock().unwrap(), 6);
+        }
     }
 }
