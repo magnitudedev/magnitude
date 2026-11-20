@@ -653,6 +653,29 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
         self.free.extend(free);
     }
 
+    /// Like [`Self::vacated`], but returns `Err(vacating)` unchanged when a
+    /// holder still holds a granule of the block (for example, a detached view
+    /// pinning a granule whose store or slot already left), so the caller can
+    /// [`Self::unvacate`] it instead of panicking.
+    ///
+    /// # Panics
+    /// Where `vacating`'s block is not held or not vacating.
+    pub fn try_vacated(&mut self, vacating: Vacating<H>) -> Result<u64, Vacating<H>> {
+        let block = vacating.block;
+        let of = self.held.get_mut(&block).unwrap_or_else(|| panic!("invariant violated: block {block:?} is not held"));
+        let BlockState::Vacating { moves } = of.state else {
+            panic!("invariant violated: block {block:?} is {:?}, not Vacating", of.state);
+        };
+        if of.granules.iter().any(|state| matches!(state, Granule::Held(_))) {
+            return Err(vacating);
+        }
+        assert_eq!(moves, 0, "invariant violated: vacated block {block:?} still has {moves} in-flight moves");
+        of.state = BlockState::Returning;
+        let held = of.held;
+        self.owed -= self.owed.min(held);
+        Ok(held)
+    }
+
     /// Every live granule of `vacating` was copied out and its source
     /// released ([`Self::release`], behind the flight that copies it): the
     /// block is returning. No claim takes it back; it returns as its
@@ -664,20 +687,9 @@ impl<B: Blocks, H: Copy + std::fmt::Debug> GranulePool<B, H> {
     /// Where `vacating`'s block is not held, not vacating, or a holder still
     /// holds a granule of it.
     pub fn vacated(&mut self, vacating: Vacating<H>) -> u64 {
-        let block = vacating.block;
-        let of = self.held.get_mut(&block).unwrap_or_else(|| panic!("invariant violated: block {block:?} is not held"));
-        let BlockState::Vacating { moves } = of.state else {
-            panic!("invariant violated: block {block:?} is {:?}, not Vacating", of.state);
-        };
-        assert!(
-            !of.granules.iter().any(|state| matches!(state, Granule::Held(_))),
-            "invariant violated: a holder still holds a granule of vacated block {block:?}"
-        );
-        assert_eq!(moves, 0, "invariant violated: vacated block {block:?} still has {moves} in-flight moves");
-        of.state = BlockState::Returning;
-        let held = of.held;
-        self.owed -= self.owed.min(held);
-        held
+        self.try_vacated(vacating).unwrap_or_else(|vacating| {
+            panic!("invariant violated: a holder still holds a granule of vacated block {:?}", vacating.block)
+        })
     }
 
     /// `bytes` its holders freed for outside demand are owed to the OS
