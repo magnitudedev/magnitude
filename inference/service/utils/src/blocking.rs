@@ -6,9 +6,10 @@ use std::future::Future;
 /// to what it returns.
 ///
 /// The task starts at once; dropping the returned future detaches it to run to completion. A
-/// panic in `operation` is a defect and continues in the awaiting task. The task is never aborted,
-/// and the runtime cancels a blocking task only while shutting down, when the awaiting task is
-/// dropped with it: a cancelled join is an invariant violation.
+/// panic in `operation` is a defect and continues in the awaiting task. Because the `JoinHandle`
+/// is never exposed to `abort()`, cancellation occurs only when the Tokio runtime is shutting down
+/// and cancels queued blocking work before dropping the awaiting task; in that case the future
+/// parks pending until the runtime drops it.
 pub fn run<F, R>(operation: F) -> impl Future<Output = R> + Send + 'static
 where
     F: FnOnce() -> R + Send + 'static,
@@ -21,7 +22,7 @@ where
             Ok(value) => value,
             Err(join) => match join.try_into_panic() {
                 Ok(panic) => std::panic::resume_unwind(panic),
-                Err(join) => panic!("a blocking task was cancelled while awaited: {join}"),
+                Err(_) => std::future::pending().await,
             },
         }
     }
