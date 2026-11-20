@@ -392,19 +392,18 @@ impl Requests {
         let parked = self.shared.parks.parked();
         let layers = residency.core.layers.len();
         let mut progressed = false;
-        let mut served_decode = false;
         let mut posted = posted.into_iter().peekable();
         for layer in 0..layers {
             // The look's requests, by layer: their reads already run, and
             // what decides their landings follows (the device's progress to
-            // the request, `Residency::advance_retired`, and a tier record
-            // each; reserve refill runs after serving so it never sits on a
-            // parked request's critical path).
+            // the request, `Residency::advance` — including reserve refill so
+            // newly settled landings unmapped into the reserve are restamped
+            // and readied by this park before the request is answered — and a
+            // tier record each).
             while let Some(request) = posted.next_if(|request| request.layer == layer) {
                 let at = self.shared.steps.at(request.sequence, layer, layers);
-                residency.advance_retired(at.point);
+                residency.advance(at.point);
                 service.decode.serve(request, at, residency.serving());
-                served_decode = true;
                 progressed = true;
             }
             if parked {
@@ -416,8 +415,6 @@ impl Requests {
         assert!(posted.next().is_none(), "the look takes requests of the load's layers, in order");
         if self.shared.parks.settled() {
             progressed |= residency.rings(&self.shared, service.look.served(), freed | progressed);
-        } else if served_decode {
-            residency.refill_tier();
         }
         progressed
     }

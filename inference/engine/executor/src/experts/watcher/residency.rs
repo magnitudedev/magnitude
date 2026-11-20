@@ -422,10 +422,10 @@ impl Residency {
     }
 
     /// Advance device progress to `progress` and retire completed landings,
-    /// seeds, and tier graces without refilling the reserve: used on a
-    /// parked decode request's critical path so demand claims see every
-    /// newly-freed record before `refill_tier` runs after serving.
-    pub(super) fn advance_retired(&mut self, progress: Point) {
+    /// seeds, and tier graces without refilling the reserve: shared by
+    /// [`Self::advance`] and [`Self::rings`], where `refill_tier` runs once
+    /// after settling.
+    fn advance_retired(&mut self, progress: Point) {
         self.prefetch.past(progress);
         self.prefetch.settle(&mut self.core.directory);
         for listed in self.core.take_past(progress) {
