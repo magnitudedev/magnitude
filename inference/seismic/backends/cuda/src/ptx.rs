@@ -1731,27 +1731,35 @@ impl<'a> Emitter<'a> {
     }
 
     fn source_bits(&mut self, source_packet: &str, bit: u32, width: u8) -> String {
+        assert!(
+            (1..=32).contains(&width),
+            "closed CUDA repack bit width {width} outside 1..=32"
+        );
         let byte = bit / 8;
         let shift = bit % 8;
         let bytes = (u32::from(width) + shift).div_ceil(8);
-        let raw = self.t32();
-        self.line(format!("mov.u32 {raw}, 0;"));
+        let raw = self.t64();
+        let loaded = self.t32();
+        let wide = self.t64();
+        self.line(format!("mov.u64 {raw}, 0;"));
         for index in 0..bytes {
-            let loaded = self.t32();
             self.line(format!(
                 "ld.global.u8 {loaded}, [{source_packet}+{}];",
                 byte + index
             ));
-            let shifted = self.t32();
-            self.line(format!("shl.b32 {shifted}, {loaded}, {};", index * 8));
-            self.line(format!("or.b32 {raw}, {raw}, {shifted};"));
+            self.line(format!("cvt.u64.u32 {wide}, {loaded};"));
+            if index > 0 {
+                self.line(format!("shl.b64 {wide}, {wide}, {};", index * 8));
+            }
+            self.line(format!("or.b64 {raw}, {raw}, {wide};"));
         }
-        let shifted = self.t32();
-        self.line(format!("shr.u32 {shifted}, {raw}, {shift};"));
-        let output = self.t32();
-        let mask = (1u32 << width) - 1;
-        self.line(format!("and.b32 {output}, {shifted}, {mask};"));
-        output
+        if shift > 0 {
+            self.line(format!("shr.u64 {raw}, {raw}, {shift};"));
+        }
+        self.line(format!("cvt.u32.u64 {loaded}, {raw};"));
+        let mask = u32::MAX >> (32 - u32::from(width));
+        self.line(format!("and.b32 {loaded}, {loaded}, {mask};"));
+        loaded
     }
 
     fn repack_expression(&mut self, source_packet: &str, expression: &RepackExpr) -> RepackValue {
@@ -2931,6 +2939,17 @@ impl<'a> Emitter<'a> {
         self.line(format!("bra {k_loop};"));
         self.raw(format!("{k_done}:"));
 
+        let accumulators = (0..8).map(|_| self.f32()).collect::<Vec<_>>();
+        let inner_empty = self.pred();
+        self.line(format!("setp.eq.u64 {inner_empty}, {inner}, 0;"));
+        let load_tmem = self.label("nvfp4_load_tmem");
+        let after_load = self.label("nvfp4_after_load");
+        self.line(format!("@!{inner_empty} bra {load_tmem};"));
+        for acc in &accumulators {
+            self.line(format!("mov.f32 {acc}, 0f00000000;"));
+        }
+        self.line(format!("bra {after_load};"));
+        self.raw(format!("{load_tmem}:"));
         let warp = self.t32();
         let lane_base = self.t32();
         let load_address = self.t32();
@@ -2943,7 +2962,16 @@ impl<'a> Emitter<'a> {
             loaded.join(", ")
         ));
         self.line("tcgen05.wait::ld.sync.aligned;");
-        for (column_offset, bits) in loaded.into_iter().enumerate() {
+        let global_scale = self.f32();
+        self.line(format!(
+            "mul.rn.f32 {global_scale}, {left_scale}, {right_scale};"
+        ));
+        for (acc, bits) in accumulators.iter().zip(&loaded) {
+            self.line(format!("mov.b32 {acc}, {bits};"));
+            self.line(format!("mul.rn.f32 {acc}, {acc}, {global_scale};"));
+        }
+        self.raw(format!("{after_load}:"));
+        for (column_offset, value) in accumulators.into_iter().enumerate() {
             let row = self.t64();
             let column = self.t64();
             self.line(format!("add.u64 {row}, {tile_m}, {thread};"));
@@ -2956,13 +2984,6 @@ impl<'a> Emitter<'a> {
             self.line(format!("and.pred {valid}, {row_ok}, {column_ok};"));
             let skip = self.label("nvfp4_store_skip");
             self.line(format!("@!{valid} bra {skip};"));
-            let value = self.f32();
-            self.line(format!("mov.b32 {value}, {bits};"));
-            let global_scale = self.f32();
-            self.line(format!(
-                "mul.rn.f32 {global_scale}, {left_scale}, {right_scale};"
-            ));
-            self.line(format!("mul.rn.f32 {value}, {value}, {global_scale};"));
             if let (Some(c_map), Some(c)) = (c_map, c.as_ref()) {
                 let initial = self.matrix_load_f32(c_map, c, &row, &column, &rows, &columns);
                 self.line(format!("add.rn.f32 {value}, {value}, {initial};"));
@@ -4370,5 +4391,77 @@ mod tests {
         assert!(source.contains("@!{in_n_tile} mov.u32 {value}, 0"));
         assert!(source.contains("seismic_nvfp4_a[4096]"));
         assert!(source.contains("seismic_nvfp4_b[256]"));
+    }
+
+    #[test]
+    fn source_bits_accumulates_in_64_bit_and_handles_full_32_bit_width() {
+        let full_unaligned = fixture(|emitter, _| {
+            let before = emitter.temp;
+            let result = emitter.source_bits("%pkt", 5, 32);
+            assert!(result.starts_with("%t"));
+            assert_eq!(emitter.temp - before, 3);
+        });
+        let section = full_unaligned
+            .rsplit_once("mov.u64 ")
+            .expect("64-bit accumulator initialization")
+            .1;
+        assert!(section.contains("ld.global.u8"));
+        assert!(section.contains("[%pkt+4]"));
+        assert!(section.contains("cvt.u64.u32"));
+        assert!(section.contains("shl.b64"));
+        assert!(section.contains(", 32;"));
+        assert!(section.contains("or.b64"));
+        assert!(section.contains("shr.u64"));
+        assert!(section.contains(", 5;"));
+        assert!(section.contains("cvt.u32.u64"));
+        assert!(section.contains("and.b32"));
+        assert!(section.contains(&format!(", {};", u32::MAX)));
+        assert!(!section.contains("shl.b32"));
+
+        let full_aligned = fixture(|emitter, _| {
+            emitter.source_bits("%pkt", 8, 32);
+        });
+        let section = full_aligned
+            .rsplit_once("mov.u64 ")
+            .expect("64-bit accumulator initialization")
+            .1;
+        assert!(section.contains("[%pkt+1]"));
+        assert!(section.contains("[%pkt+4]"));
+        assert!(!section.contains("shr.u64"));
+        assert!(section.contains(&format!(", {};", u32::MAX)));
+    }
+
+    #[test]
+    fn nvfp4_emitter_guards_empty_inner_before_tmem_load_and_scale() {
+        let source = include_str!("ptx.rs");
+        let start = source.find("fn matrix_nvfp4(").expect("NVFP4 emitter");
+        let end = source[start..]
+            .find("fn nvfp4_epilogue(")
+            .map(|offset| start + offset)
+            .expect("end of matrix_nvfp4");
+        let emitter = &source[start..end];
+        let guard = emitter
+            .find("setp.eq.u64 {inner_empty}, {inner}, 0;")
+            .expect("inner == 0 guard");
+        let zero_init = emitter
+            .find("mov.f32 {acc}, 0f00000000;")
+            .expect("zero-initialized accumulator for empty inner");
+        let tmem_load = emitter
+            .find("tcgen05.ld.sync.aligned.32x32b.x8.b32")
+            .expect("TMEM load");
+        let scale = emitter
+            .find("mul.rn.f32 {global_scale}, {left_scale}, {right_scale};")
+            .expect("global scale");
+        let merge = emitter
+            .find("self.raw(format!(\"{after_load}:\"));")
+            .expect("post-load merge label");
+        let add_c = emitter
+            .find("add.rn.f32 {value}, {value}, {initial};")
+            .expect("accumulator + c");
+        assert!(guard < zero_init);
+        assert!(zero_init < tmem_load);
+        assert!(tmem_load < scale);
+        assert!(scale < merge);
+        assert!(merge < add_c);
     }
 }

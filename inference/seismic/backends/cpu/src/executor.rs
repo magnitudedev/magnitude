@@ -8,9 +8,9 @@ use seismic_compiler::executable::{
     CompiledBufferView, CompiledLocalClassTotals, CompiledLocalLayout, DeviceService,
     ExecutableCommand, ExecutionEnvironment, NativeExecution, NativeExecutor, NativeSubmission,
 };
+use seismic_ir::physical_target::{KernelWordValues, LocalWordValues};
 use seismic_ir::schedule::FillValue;
 use seismic_lang::expr::compiled::InvocationValues;
-use seismic_lang::expr::SymbolValue;
 use seismic_memory::entry::Entry;
 use std::sync::Arc;
 
@@ -322,47 +322,44 @@ impl Submission {
                 ))
             })
             .collect::<Vec<_>>();
-        let mut words = vec![0u64; kernel.layout.words.total as usize];
-        for (index, value) in nat_args.iter().enumerate() {
-            words[kernel.layout.words.nat_first as usize + index] = evaluate(value, env.values());
-        }
-        for (index, symbol) in scalar_args.iter().copied().enumerate() {
-            let value = env
-                .values()
-                .get(symbol)
-                .unwrap_or_else(|| panic!("prepared kernel scalar argument is unbound"));
-            words[kernel.layout.words.scalar_first as usize + index] = encode_symbol(value)?;
-        }
-        for (position, binding) in resolved_bindings.iter().enumerate() {
-            let layout = kernel.layout.words.bindings[position];
-            for (axis, extent) in binding.extents.iter().copied().enumerate() {
-                words[layout.first as usize + axis] = extent;
-            }
-            for (axis, stride) in binding.strides.iter().copied().enumerate() {
-                words[layout.first as usize + layout.rank as usize + axis] = stride;
-            }
-        }
-
-        let workgroup_bytes = evaluate(&local_totals.workgroup_bytes, env.values());
-        let participant_bytes = evaluate(&local_totals.participant_bytes, env.values());
-        let register_bytes = evaluate(&local_totals.register_bytes, env.values());
-        for (position, compiled) in locals.iter().enumerate() {
-            let words_layout = kernel.layout.words.locals[position];
-            let offset = evaluate(&compiled.byte_offset, env.values());
-            words[words_layout.first as usize] = offset;
-            for (axis, extent) in compiled.extents.iter().enumerate() {
-                words[words_layout.first as usize + 1 + axis] = evaluate(extent, env.values());
-            }
-            for (axis, stride) in compiled.strides.iter().enumerate() {
-                words[words_layout.first as usize + 1 + words_layout.rank as usize + axis] =
-                    evaluate(stride, env.values());
-            }
-        }
-        words[kernel.layout.words.grid_first as usize..kernel.layout.words.grid_first as usize + 3]
-            .copy_from_slice(&grid);
-        words[kernel.layout.words.workgroup_first as usize
-            ..kernel.layout.words.workgroup_first as usize + 3]
-            .copy_from_slice(&workgroup);
+        let values = env.values();
+        let workgroup_bytes = evaluate(&local_totals.workgroup_bytes, values);
+        let participant_bytes = evaluate(&local_totals.participant_bytes, values);
+        let register_bytes = evaluate(&local_totals.register_bytes, values);
+        let words = kernel
+            .layout
+            .words
+            .populate(KernelWordValues {
+                nat_args: nat_args.iter().map(|value| evaluate(value, values)),
+                scalar_args: scalar_args.iter().copied().map(|symbol| {
+                    values
+                        .get(symbol)
+                        .unwrap_or_else(|| panic!("prepared kernel scalar argument is unbound"))
+                }),
+                bindings: resolved_bindings
+                    .iter()
+                    .map(|binding| (binding.extents.as_slice(), binding.strides.as_slice())),
+                locals: locals.iter().map(|compiled| LocalWordValues {
+                    byte_offset: evaluate(&compiled.byte_offset, values),
+                    extents: compiled
+                        .extents
+                        .iter()
+                        .map(move |extent| evaluate(extent, values)),
+                    strides: compiled
+                        .strides
+                        .iter()
+                        .map(move |stride| evaluate(stride, values)),
+                }),
+                addressable_resources: std::iter::empty(),
+                grid,
+                workgroup,
+                local_totals: [workgroup_bytes, participant_bytes, register_bytes],
+            })
+            .map_err(|error| {
+                ExecutionError::ConstructionContradiction(format!(
+                    "native scalar ABI quantity does not fit its planned word: {error:?}"
+                ))
+            })?;
 
         let mut results = vec![0u64; result_slots.len()];
         let frame = LaunchFrame {
@@ -440,14 +437,6 @@ fn fill(destination: *mut u8, bytes: u64, value: FillValue) {
             std::ptr::copy_nonoverlapping(value.pattern().as_ptr(), destination.add(offset), width)
         };
     }
-}
-
-fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
-    value.try_word64().map_err(|error| {
-        ExecutionError::ConstructionContradiction(format!(
-            "native scalar ABI quantity does not fit its planned word: {error:?}"
-        ))
-    })
 }
 
 fn launch_error(error: LaunchFailure) -> ExecutionError {

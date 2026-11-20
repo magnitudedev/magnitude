@@ -12,10 +12,9 @@ use seismic_compiler::executable::{
     ExecutableAllocationId, ExecutableCommand, ExecutableKernelId, ExecutionEnvironment,
     KernelAbiBindings, NativeExecution, NativeExecutor, NativeSubmission, RuntimeBuffer,
 };
-use seismic_ir::physical_target::KernelAbiAllocationRole;
+use seismic_ir::physical_target::{KernelAbiAllocationRole, KernelWordValues, LocalWordValues};
 use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_ir::storage::LaunchLocalKind;
-use seismic_lang::expr::SymbolValue;
 
 pub struct MetalExecutor {
     device: MetalDevice,
@@ -275,46 +274,46 @@ impl MetalSubmission {
         if grid.contains(&0) || workgroup.contains(&0) {
             return Ok(());
         }
-        let mut words = vec![0u64; kernel.words.total as usize];
-        let mut resolved = Vec::with_capacity(bindings.len());
-        for (position, binding) in bindings.iter().enumerate() {
-            let view = env.resolve_view(binding)?;
-            let layout = kernel.words.bindings[position];
-            words[layout.first as usize..layout.first as usize + layout.rank as usize]
-                .copy_from_slice(&view.extents);
-            words[layout.first as usize + layout.rank as usize
-                ..layout.first as usize + 2 * layout.rank as usize]
-                .copy_from_slice(&view.strides);
-            resolved.push((view.buffer.clone(), view.byte_offset));
+        let mut resolved_views = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            resolved_views.push(env.resolve_view(binding)?);
         }
-        for (index, value) in nat_args.iter().enumerate() {
-            words[kernel.words.nat_first as usize + index] = env.nat(value);
-        }
-        for (index, symbol) in scalar_args.iter().copied().enumerate() {
-            words[kernel.words.scalar_first as usize + index] = encode_symbol(env.symbol(symbol))?;
-        }
+        let resolved = resolved_views
+            .iter()
+            .map(|view| (view.buffer.clone(), view.byte_offset))
+            .collect::<Vec<_>>();
         let total_values = [
             env.nat(&totals.workgroup_bytes),
             env.nat(&totals.participant_bytes),
             env.nat(&totals.register_bytes),
         ];
-        for (position, local) in locals.iter().enumerate() {
-            let layout = kernel.words.locals[position];
-            let offset = env.nat(&local.byte_offset);
-            words[layout.first as usize] = offset;
-            for (axis, value) in local.extents.iter().enumerate() {
-                words[layout.first as usize + 1 + axis] = env.nat(value);
-            }
-            for (axis, value) in local.strides.iter().enumerate() {
-                words[layout.first as usize + 1 + layout.rank as usize + axis] = env.nat(value);
-            }
-        }
-        words[kernel.words.grid_first as usize..kernel.words.grid_first as usize + 3]
-            .copy_from_slice(&grid);
-        words[kernel.words.workgroup_first as usize..kernel.words.workgroup_first as usize + 3]
-            .copy_from_slice(&workgroup);
-        words[kernel.words.local_total_first as usize..kernel.words.local_total_first as usize + 3]
-            .copy_from_slice(&total_values);
+        let env_ref = &*env;
+        let words = kernel
+            .words
+            .populate(KernelWordValues {
+                nat_args: nat_args.iter().map(|value| env_ref.nat(value)),
+                scalar_args: scalar_args
+                    .iter()
+                    .copied()
+                    .map(|symbol| env_ref.symbol(symbol)),
+                bindings: resolved_views
+                    .iter()
+                    .map(|view| (view.extents.as_slice(), view.strides.as_slice())),
+                locals: locals.iter().map(|local| LocalWordValues {
+                    byte_offset: env_ref.nat(&local.byte_offset),
+                    extents: local.extents.iter().map(move |value| env_ref.nat(value)),
+                    strides: local.strides.iter().map(move |value| env_ref.nat(value)),
+                }),
+                addressable_resources: std::iter::empty(),
+                grid,
+                workgroup,
+                local_totals: total_values,
+            })
+            .map_err(|error| {
+                ExecutionError::ConstructionContradiction(format!(
+                    "native scalar ABI quantity does not fit its planned word: {error:?}"
+                ))
+            })?;
         let word_table = self.write_words(
             abi_buffer(abi, KernelAbiAllocationRole::WordTable, env),
             &words,
@@ -728,11 +727,4 @@ fn abi_buffer<'a>(
     env: &'a ExecutionEnvironment<'_, Metal, Pipeline, MetalDevice>,
 ) -> &'a RuntimeBuffer<MetalBuffer> {
     env.buffer(abi.allocation(role))
-}
-fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
-    value.try_word64().map_err(|error| {
-        ExecutionError::ConstructionContradiction(format!(
-            "native scalar ABI quantity does not fit its planned word: {error:?}"
-        ))
-    })
 }

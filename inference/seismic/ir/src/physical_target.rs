@@ -135,6 +135,32 @@ pub struct AddressableResourceWordLayout {
     pub units: u32,
 }
 
+/// Encodes a runtime scalar symbol into its canonical 64-bit ABI word.
+pub fn encode_symbol(
+    value: seismic_lang::expr::SymbolValue,
+) -> Result<u64, seismic_lang::expr::EvalError> {
+    value.try_word64()
+}
+
+/// Runtime values for one launch-local tensor's word-table slice.
+pub struct LocalWordValues<E, S> {
+    pub byte_offset: u64,
+    pub extents: E,
+    pub strides: S,
+}
+
+/// Runtime values that populate one [`KernelWordLayout`].
+pub struct KernelWordValues<N, S, B, L, R> {
+    pub nat_args: N,
+    pub scalar_args: S,
+    pub bindings: B,
+    pub locals: L,
+    pub addressable_resources: R,
+    pub grid: [u64; 3],
+    pub workgroup: [u64; 3],
+    pub local_totals: [u64; 3],
+}
+
 /// The one word-table schema consumed by every native emitter/executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelWordLayout {
@@ -230,6 +256,141 @@ impl KernelWordLayout {
             local_total_first,
             total: next,
         }
+    }
+
+    /// Populates the canonical ABI word table for one launch.
+    pub fn populate<'a, N, S, B, L, LE, LS, R>(
+        &self,
+        values: KernelWordValues<N, S, B, L, R>,
+    ) -> Result<Vec<u64>, seismic_lang::expr::EvalError>
+    where
+        N: IntoIterator<Item = u64>,
+        S: IntoIterator<Item = seismic_lang::expr::SymbolValue>,
+        B: IntoIterator<Item = (&'a [u64], &'a [u64])>,
+        L: IntoIterator<Item = LocalWordValues<LE, LS>>,
+        LE: IntoIterator<Item = u64>,
+        LS: IntoIterator<Item = u64>,
+        R: IntoIterator<Item = (u64, u64)>,
+    {
+        let mut words = vec![0u64; self.total as usize];
+        let expected_nats = (self.scalar_first - self.nat_first) as usize;
+        let mut nat_count = 0usize;
+        for (index, value) in values.nat_args.into_iter().enumerate() {
+            assert!(
+                index < expected_nats,
+                "nat argument count exceeds KernelWordLayout"
+            );
+            words[self.nat_first as usize + index] = value;
+            nat_count += 1;
+        }
+        assert_eq!(
+            nat_count, expected_nats,
+            "nat argument count disagrees with KernelWordLayout"
+        );
+        let expected_scalars = (self
+            .bindings
+            .first()
+            .map(|b| b.first)
+            .or_else(|| self.locals.first().map(|l| l.first))
+            .or_else(|| self.addressable_resources.first().map(|r| r.offset_units))
+            .unwrap_or(self.grid_first)
+            - self.scalar_first) as usize;
+        let mut scalar_count = 0usize;
+        for (index, value) in values.scalar_args.into_iter().enumerate() {
+            assert!(
+                index < expected_scalars,
+                "scalar argument count exceeds KernelWordLayout"
+            );
+            words[self.scalar_first as usize + index] = encode_symbol(value)?;
+            scalar_count += 1;
+        }
+        assert_eq!(
+            scalar_count, expected_scalars,
+            "scalar argument count disagrees with KernelWordLayout"
+        );
+        let mut binding_count = 0usize;
+        for (position, (extents, strides)) in values.bindings.into_iter().enumerate() {
+            let layout = self.bindings[position];
+            let first = layout.first as usize;
+            let rank = layout.rank as usize;
+            assert_eq!(
+                extents.len(),
+                rank,
+                "binding {position} extent rank disagrees with KernelWordLayout"
+            );
+            assert_eq!(
+                strides.len(),
+                rank,
+                "binding {position} stride rank disagrees with KernelWordLayout"
+            );
+            words[first..first + rank].copy_from_slice(extents);
+            words[first + rank..first + 2 * rank].copy_from_slice(strides);
+            binding_count += 1;
+        }
+        assert_eq!(
+            binding_count,
+            self.bindings.len(),
+            "binding count disagrees with KernelWordLayout"
+        );
+        let mut local_count = 0usize;
+        for (position, local) in values.locals.into_iter().enumerate() {
+            let layout = self.locals[position];
+            let first = layout.first as usize;
+            let rank = layout.rank as usize;
+            words[first] = local.byte_offset;
+            let mut extent_count = 0usize;
+            for (axis, extent) in local.extents.into_iter().enumerate() {
+                assert!(
+                    axis < rank,
+                    "local {position} extent rank exceeds KernelWordLayout"
+                );
+                words[first + 1 + axis] = extent;
+                extent_count += 1;
+            }
+            assert_eq!(
+                extent_count, rank,
+                "local {position} extent rank disagrees with KernelWordLayout"
+            );
+            let mut stride_count = 0usize;
+            for (axis, stride) in local.strides.into_iter().enumerate() {
+                assert!(
+                    axis < rank,
+                    "local {position} stride rank exceeds KernelWordLayout"
+                );
+                words[first + 1 + rank + axis] = stride;
+                stride_count += 1;
+            }
+            assert_eq!(
+                stride_count, rank,
+                "local {position} stride rank disagrees with KernelWordLayout"
+            );
+            local_count += 1;
+        }
+        assert_eq!(
+            local_count,
+            self.locals.len(),
+            "local count disagrees with KernelWordLayout"
+        );
+        let mut resource_count = 0usize;
+        for (position, (offset_units, units)) in
+            values.addressable_resources.into_iter().enumerate()
+        {
+            let layout = self.addressable_resources[position];
+            words[layout.offset_units as usize] = offset_units;
+            words[layout.units as usize] = units;
+            resource_count += 1;
+        }
+        assert_eq!(
+            resource_count,
+            self.addressable_resources.len(),
+            "addressable resource count disagrees with KernelWordLayout"
+        );
+        words[self.grid_first as usize..self.grid_first as usize + 3].copy_from_slice(&values.grid);
+        words[self.workgroup_first as usize..self.workgroup_first as usize + 3]
+            .copy_from_slice(&values.workgroup);
+        words[self.local_total_first as usize..self.local_total_first as usize + 3]
+            .copy_from_slice(&values.local_totals);
+        Ok(words)
     }
 }
 
@@ -478,4 +639,104 @@ pub struct NumericalEnvironment {
     pub flush_to_zero_available: bool,
     pub approximate_transcendentals: BTreeSet<&'static str>,
     pub denormals_preserved: bool,
+}
+
+#[cfg(test)]
+mod word_layout_tests {
+    use super::{
+        encode_symbol, AddressableResourceWordLayout, BindingWordLayout, KernelWordLayout,
+        KernelWordValues, LocalWordLayout, LocalWordValues,
+    };
+    use seismic_lang::expr::{BigUint, EvalError, SymbolValue};
+
+    #[test]
+    fn populate_writes_every_canonical_section_at_exact_offsets() {
+        let layout = KernelWordLayout {
+            nat_first: 0,
+            scalar_first: 2,
+            bindings: vec![
+                BindingWordLayout { first: 5, rank: 2 },
+                BindingWordLayout { first: 9, rank: 0 },
+            ],
+            locals: vec![LocalWordLayout { first: 9, rank: 2 }],
+            addressable_resources: vec![AddressableResourceWordLayout {
+                offset_units: 14,
+                units: 15,
+            }],
+            grid_first: 16,
+            workgroup_first: 19,
+            local_total_first: 22,
+            total: 25,
+        };
+        let b0_extents = [4u64, 8];
+        let b0_strides = [8u64, 1];
+        let empty: [u64; 0] = [];
+        let words = layout
+            .populate(KernelWordValues {
+                nat_args: [11u64, 22],
+                scalar_args: [
+                    SymbolValue::F32(1.5),
+                    SymbolValue::I32(-3),
+                    SymbolValue::Bool(true),
+                ],
+                bindings: [
+                    (b0_extents.as_slice(), b0_strides.as_slice()),
+                    (empty.as_slice(), empty.as_slice()),
+                ],
+                locals: [LocalWordValues {
+                    byte_offset: 64,
+                    extents: [16u64, 32],
+                    strides: [32u64, 1],
+                }],
+                addressable_resources: [(128u64, 256u64)],
+                grid: [3, 2, 1],
+                workgroup: [32, 4, 1],
+                local_totals: [1024, 512, 256],
+            })
+            .expect("all scalars fit in 64-bit ABI words");
+        assert_eq!(words.len(), layout.total as usize);
+        assert_eq!(&words[0..2], &[11, 22]);
+        assert_eq!(
+            &words[2..5],
+            &[
+                u64::from(1.5f32.to_bits()),
+                u64::from((-3i32) as u32),
+                1,
+            ]
+        );
+        assert_eq!(&words[5..9], &[4, 8, 8, 1]);
+        assert_eq!(&words[9..14], &[64, 16, 32, 32, 1]);
+        assert_eq!(&words[14..16], &[128, 256]);
+        assert_eq!(&words[16..19], &[3, 2, 1]);
+        assert_eq!(&words[19..22], &[32, 4, 1]);
+        assert_eq!(&words[22..25], &[1024, 512, 256]);
+    }
+
+    #[test]
+    fn encode_symbol_and_populate_reject_unrepresentable_scalar_word() {
+        let too_wide = SymbolValue::Nat(BigUint::from(u128::MAX));
+        assert_eq!(encode_symbol(too_wide.clone()), Err(EvalError::Unrepresentable));
+        let layout = KernelWordLayout {
+            nat_first: 0,
+            scalar_first: 0,
+            bindings: vec![],
+            locals: vec![],
+            addressable_resources: vec![],
+            grid_first: 1,
+            workgroup_first: 4,
+            local_total_first: 7,
+            total: 10,
+        };
+        let result = layout.populate(KernelWordValues {
+            nat_args: std::iter::empty(),
+            scalar_args: [too_wide],
+            bindings: std::iter::empty(),
+            locals: std::iter::empty::<LocalWordValues<[u64; 0], [u64; 0]>>(),
+            addressable_resources: std::iter::empty(),
+            grid: [1, 1, 1],
+            workgroup: [1, 1, 1],
+            local_totals: [0, 0, 0],
+        });
+        assert_eq!(result, Err(EvalError::Unrepresentable));
+    }
 }

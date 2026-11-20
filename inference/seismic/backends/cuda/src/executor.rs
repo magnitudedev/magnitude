@@ -11,10 +11,9 @@ use seismic_compiler::executable::{
     ExecutableAllocationId, ExecutableCommand, ExecutableKernelId, ExecutionEnvironment,
     KernelAbiBindings, NativeExecution, NativeExecutor, NativeSubmission, RuntimeBuffer,
 };
-use seismic_ir::physical_target::KernelAbiAllocationRole;
+use seismic_ir::physical_target::{KernelAbiAllocationRole, KernelWordValues, LocalWordValues};
 use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_lang::expr::compiled::InvocationValues;
-use seismic_lang::expr::SymbolValue;
 use seismic_memory::entry::{Entry, Store};
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -509,62 +508,63 @@ impl Submission {
         if grid.contains(&0) || workgroup.contains(&0) {
             return Ok(());
         }
-        let mut buffer_words = Vec::with_capacity(bindings.len());
-        let mut words = vec![0u64; kernel.layout.words.total as usize];
-        for (position, binding) in bindings.iter().enumerate() {
-            let resolved = env.resolve_view(binding)?;
-            buffer_words.push(
+        let mut resolved_views = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            resolved_views.push(env.resolve_view(binding)?);
+        }
+        let buffer_words = resolved_views
+            .iter()
+            .map(|resolved| {
                 resolved
                     .buffer
                     .pointer()
                     .checked_add(resolved.byte_offset)
-                    .unwrap_or_else(|| panic!("prepared CUDA buffer address overflows")),
-            );
-            let layout = kernel.layout.words.bindings[position];
-            words[layout.first as usize..layout.first as usize + layout.rank as usize]
-                .copy_from_slice(&resolved.extents);
-            words[layout.first as usize + layout.rank as usize
-                ..layout.first as usize + 2 * layout.rank as usize]
-                .copy_from_slice(&resolved.strides);
-        }
-        for (index, value) in nat_args.iter().enumerate() {
-            words[kernel.layout.words.nat_first as usize + index] = evaluate(value, env.values());
-        }
-        for (index, symbol) in scalar_args.iter().copied().enumerate() {
-            words[kernel.layout.words.scalar_first as usize + index] = encode_symbol(
-                env.values()
-                    .get(symbol)
-                    .unwrap_or_else(|| panic!("prepared CUDA scalar argument is unbound")),
-            )?;
-        }
-        let workgroup_bytes = evaluate(&totals.workgroup_bytes, env.values());
-        let participant_bytes = evaluate(&totals.participant_bytes, env.values());
-        let register_bytes = evaluate(&totals.register_bytes, env.values());
-        for (position, local) in locals.iter().enumerate() {
-            let layout = kernel.layout.words.locals[position];
-            let offset = evaluate(&local.byte_offset, env.values());
-            words[layout.first as usize] = offset;
-            for (axis, value) in local.extents.iter().enumerate() {
-                words[layout.first as usize + 1 + axis] = evaluate(value, env.values());
-            }
-            for (axis, value) in local.strides.iter().enumerate() {
-                words[layout.first as usize + 1 + layout.rank as usize + axis] =
-                    evaluate(value, env.values());
-            }
-        }
-        for (position, resource) in addressable_resources.iter().enumerate() {
-            let layout = kernel.layout.words.addressable_resources[position];
-            words[layout.offset_units as usize] = evaluate(&resource.offset_units, env.values());
-            words[layout.units as usize] = evaluate(&resource.units, env.values());
-        }
-        words[kernel.layout.words.grid_first as usize..kernel.layout.words.grid_first as usize + 3]
-            .copy_from_slice(&grid);
-        words[kernel.layout.words.workgroup_first as usize
-            ..kernel.layout.words.workgroup_first as usize + 3]
-            .copy_from_slice(&workgroup);
-        words[kernel.layout.words.local_total_first as usize
-            ..kernel.layout.words.local_total_first as usize + 3]
-            .copy_from_slice(&[workgroup_bytes, participant_bytes, register_bytes]);
+                    .unwrap_or_else(|| panic!("prepared CUDA buffer address overflows"))
+            })
+            .collect::<Vec<_>>();
+        let values = env.values();
+        let workgroup_bytes = evaluate(&totals.workgroup_bytes, values);
+        let participant_bytes = evaluate(&totals.participant_bytes, values);
+        let register_bytes = evaluate(&totals.register_bytes, values);
+        let words = kernel
+            .layout
+            .words
+            .populate(KernelWordValues {
+                nat_args: nat_args.iter().map(|value| evaluate(value, values)),
+                scalar_args: scalar_args.iter().copied().map(|symbol| {
+                    values
+                        .get(symbol)
+                        .unwrap_or_else(|| panic!("prepared CUDA scalar argument is unbound"))
+                }),
+                bindings: resolved_views
+                    .iter()
+                    .map(|view| (view.extents.as_slice(), view.strides.as_slice())),
+                locals: locals.iter().map(|local| LocalWordValues {
+                    byte_offset: evaluate(&local.byte_offset, values),
+                    extents: local
+                        .extents
+                        .iter()
+                        .map(move |value| evaluate(value, values)),
+                    strides: local
+                        .strides
+                        .iter()
+                        .map(move |value| evaluate(value, values)),
+                }),
+                addressable_resources: addressable_resources.iter().map(|resource| {
+                    (
+                        evaluate(&resource.offset_units, values),
+                        evaluate(&resource.units, values),
+                    )
+                }),
+                grid,
+                workgroup,
+                local_totals: [workgroup_bytes, participant_bytes, register_bytes],
+            })
+            .map_err(|error| {
+                ExecutionError::ConstructionContradiction(format!(
+                    "native scalar ABI quantity does not fit its planned word: {error:?}"
+                ))
+            })?;
 
         let buffers = abi_buffer(abi, KernelAbiAllocationRole::BufferTable, env);
         let word_table = abi_buffer(abi, KernelAbiAllocationRole::WordTable, env);
@@ -845,13 +845,6 @@ fn evaluate(value: &seismic_lang::expr::compiled::CompiledNat, values: &Invocati
     value
         .evaluate_u64(values)
         .unwrap_or_else(|error| panic!("prepared CUDA expression failed evaluation: {error:?}"))
-}
-fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
-    value.try_word64().map_err(|error| {
-        ExecutionError::ConstructionContradiction(format!(
-            "native scalar ABI quantity does not fit its planned word: {error:?}"
-        ))
-    })
 }
 /// The error of an allocation of `bytes` the driver failed: a device loss,
 /// a capacity refusal where the driver is out of memory

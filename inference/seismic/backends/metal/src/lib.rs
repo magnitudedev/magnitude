@@ -103,6 +103,20 @@ pub(crate) fn checked_threadgroup_memory_bytes(bytes: u64) -> Option<u64> {
     bytes.checked_next_multiple_of(THREADGROUP_MEMORY_ALIGNMENT)
 }
 
+/// Maximum dynamic threadgroup memory bytes available for a pipeline whose
+/// static threadgroup memory is `static_local` on a device with
+/// `max_workgroup_bytes`. Rounded down to a multiple of
+/// [`THREADGROUP_MEMORY_ALIGNMENT`] so any request `<= max_dynamic_local_bytes`
+/// stays within `max_workgroup_bytes` after [`checked_threadgroup_memory_bytes`]
+/// rounds it up at launch.
+pub(crate) fn checked_max_dynamic_local_bytes(
+    max_workgroup_bytes: u64,
+    static_local: u64,
+) -> Option<u64> {
+    let remaining = max_workgroup_bytes.checked_sub(static_local)?;
+    Some(remaining - (remaining % THREADGROUP_MEMORY_ALIGNMENT))
+}
+
 /// Bind dynamic threadgroup memory on `encoder` at `index`, rounding `bytes`
 /// up to Metal's required 16-byte multiple. No-op when `bytes == 0`.
 pub(crate) unsafe fn set_threadgroup_memory_length(
@@ -286,16 +300,15 @@ impl seismic_native_target::NativeCompiler<Metal> for MetalNativeCompiler {
                 max_grid: target.limits().max_grid,
                 max_workgroup_size: target.limits().max_workgroup_size,
                 max_workgroup_threads: pipeline_threads,
-                max_dynamic_local_bytes: target
-                    .limits()
-                    .max_workgroup_bytes
-                    .checked_sub(static_local)
-                    .ok_or_else(|| {
-                        NativeCompilationError::MalformedToolchainOutput(
-                            "Metal pipeline static threadgroup memory exceeds the device limit"
-                                .into(),
-                        )
-                    })?,
+                max_dynamic_local_bytes: checked_max_dynamic_local_bytes(
+                    target.limits().max_workgroup_bytes,
+                    static_local,
+                )
+                .ok_or_else(|| {
+                    NativeCompilationError::MalformedToolchainOutput(
+                        "Metal pipeline static threadgroup memory exceeds the device limit".into(),
+                    )
+                })?,
             },
             resources: NativeResources {
                 registers_per_participant: NativeResourceUsage::NotApplicable,
@@ -341,7 +354,10 @@ mod intrinsic_plane_tests;
 
 #[cfg(test)]
 mod threadgroup_memory_tests {
-    use super::checked_threadgroup_memory_bytes;
+    use super::{
+        checked_max_dynamic_local_bytes, checked_threadgroup_memory_bytes,
+        THREADGROUP_MEMORY_ALIGNMENT,
+    };
 
     #[test]
     fn rounds_up_to_16_byte_multiple_and_detects_overflow() {
@@ -356,5 +372,29 @@ mod threadgroup_memory_tests {
         assert_eq!(checked_threadgroup_memory_bytes(max_aligned), Some(max_aligned));
         assert_eq!(checked_threadgroup_memory_bytes(max_aligned + 1), None);
         assert_eq!(checked_threadgroup_memory_bytes(u64::MAX), None);
+    }
+
+    #[test]
+    fn max_dynamic_local_bytes_rounds_down_so_launch_alignment_stays_in_budget() {
+        let max_workgroup = 32_768;
+        assert_eq!(checked_max_dynamic_local_bytes(max_workgroup, 0), Some(32_768));
+        assert_eq!(checked_max_dynamic_local_bytes(max_workgroup, 1), Some(32_752));
+        assert_eq!(checked_max_dynamic_local_bytes(max_workgroup, 15), Some(32_752));
+        assert_eq!(checked_max_dynamic_local_bytes(max_workgroup, 16), Some(32_752));
+        assert_eq!(checked_max_dynamic_local_bytes(max_workgroup, 20), Some(32_736));
+        assert_eq!(checked_max_dynamic_local_bytes(max_workgroup, 32_760), Some(0));
+        assert_eq!(checked_max_dynamic_local_bytes(max_workgroup, 32_768), Some(0));
+        assert_eq!(checked_max_dynamic_local_bytes(max_workgroup, 32_769), None);
+
+        for static_local in [0, 1, 7, 15, 16, 17, 20, 32_753, 32_760, 32_768] {
+            let cap = checked_max_dynamic_local_bytes(max_workgroup, static_local).unwrap();
+            assert_eq!(cap % THREADGROUP_MEMORY_ALIGNMENT, 0);
+            assert!(
+                static_local + checked_threadgroup_memory_bytes(cap).unwrap() <= max_workgroup
+            );
+            assert!(
+                static_local + checked_threadgroup_memory_bytes(cap + 1).unwrap() > max_workgroup
+            );
+        }
     }
 }
