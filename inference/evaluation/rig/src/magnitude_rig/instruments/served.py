@@ -18,6 +18,8 @@ Scenarios, each from an empty kernel cache of the run's own:
   stop: the queued load loads and answers, and no two inference workers ever run at once, by the
   service's own records of each worker's start and of its exit once shown reaped.
 - `repeat`: two prompts answered in turn on one load, where each parts from its first answer.
+- `turns`: a conversation's next turn, resuming the prefix its first turn decoded past the depth a
+  cancelled request is retained at.
 - `failure`: a stretch of the model file read as EIO under two answers: those that named it
   fail, the load serves on, and where its answer parts from the one before.
 
