@@ -525,9 +525,21 @@ pub fn device_count() -> Result<u32, TargetError> {
         .map_err(|_| TargetError::DeviceUnavailable(format!("driver reports {count} devices")))
 }
 
+/// Decode a fixed-size C buffer filled by `cuDeviceGetName`, forcing a
+/// trailing NUL byte before calling `CStr::from_ptr`.
+fn decode_device_name(buffer: &mut [std::ffi::c_char]) -> String {
+    let Some(last) = buffer.last_mut() else {
+        return String::new();
+    };
+    *last = 0;
+    unsafe { CStr::from_ptr(buffer.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
     let driver = Driver::load().map_err(TargetError::DeviceUnavailable)?;
-    let device = c_int::try_from(ordinal).map_err(|_| {
+    let ordinal_c = c_int::try_from(ordinal).map_err(|_| {
         TargetError::DeviceUnavailable(format!("ordinal {ordinal} exceeds the driver ABI"))
     })?;
     let device_uuid_v2 = driver.device_uuid_v2.ok_or_else(|| {
@@ -543,56 +555,54 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
     let mut version = 0;
     unsafe {
         driver
-            .check((driver.device_get)(&mut handle, device), "device selection")
+            .check((driver.device_get)(&mut handle, ordinal_c), "device selection")
             .map_err(unavailable)?;
         driver
             .check((driver.driver_version)(&mut version), "driver version")
             .map_err(unavailable)?;
         driver
             .check(
-                (driver.device_name)(name.as_mut_ptr(), name.len() as c_int, device),
+                (driver.device_name)(name.as_mut_ptr(), name.len() as c_int, handle),
                 "device name",
             )
             .map_err(unavailable)?;
         driver
             .check(
-                (driver.device_total_memory)(&mut memory, device),
+                (driver.device_total_memory)(&mut memory, handle),
                 "total device memory",
             )
             .map_err(unavailable)?;
         driver
-            .check(device_uuid_v2(&mut uuid, device), "device UUID")
+            .check(device_uuid_v2(&mut uuid, handle), "device UUID")
             .map_err(unavailable)?;
     }
     let integrated = driver
-        .attribute(attr::INTEGRATED, device)
+        .attribute(attr::INTEGRATED, handle)
         .map_err(unavailable)?
         != 0;
     let pci = |key: c_int| {
-        let value = driver.attribute(key, device).map_err(unavailable)?;
+        let value = driver.attribute(key, handle).map_err(unavailable)?;
         u32::try_from(value).map_err(|_| TargetError::DeviceUnavailable(format!("PCI attribute {key} of {value}")))
     };
     Ok(DeviceDescriptor {
         ordinal,
         uuid,
-        name: unsafe { CStr::from_ptr(name.as_ptr()) }
-            .to_string_lossy()
-            .into_owned(),
+        name: decode_device_name(&mut name),
         total_memory_bytes: memory as u64,
-        allocation_granularity: crate::driver::device_granularity(&driver, device).map_err(unavailable)?,
+        allocation_granularity: crate::driver::device_granularity(&driver, handle).map_err(unavailable)?,
         integrated,
         l2_cache_bytes: u64::try_from(
             driver
-                .attribute(attr::L2_CACHE_SIZE, device)
+                .attribute(attr::L2_CACHE_SIZE, handle)
                 .map_err(unavailable)?,
         )
         .map_err(|_| TargetError::DeviceUnavailable("negative L2 cache size".into()))?,
         driver_api: DriverApiVersion(u32::try_from(version).map_err(|_| {
             TargetError::UnsupportedDriver(format!("driver API version {version}"))
         })?),
-        compute_capability: read_compute_capability(&driver, device)?,
-        numa_node: numa_node(&driver, device)?,
-        luid: luid(&driver, device)?,
+        compute_capability: read_compute_capability(&driver, handle)?,
+        numa_node: numa_node(&driver, handle)?,
+        luid: luid(&driver, handle)?,
         pci: [pci(attr::PCI_DOMAIN_ID)?, pci(attr::PCI_BUS_ID)?, pci(attr::PCI_DEVICE_ID)?],
     })
 }
@@ -643,17 +653,17 @@ fn luid(driver: &Driver, device: c_int) -> Result<Option<[u8; 8]>, TargetError> 
 /// Gathers the complete profile parts of one device ordinal.
 pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetError> {
     let driver = Driver::load().map_err(TargetError::DeviceUnavailable)?;
-    let device = c_int::try_from(ordinal).map_err(|_| {
+    let ordinal_c = c_int::try_from(ordinal).map_err(|_| {
         TargetError::DeviceUnavailable(format!("ordinal {ordinal} exceeds the driver ABI"))
     })?;
+    let mut handle = 0;
     unsafe {
-        let mut handle = 0;
         driver
-            .check((driver.device_get)(&mut handle, device), "device selection")
+            .check((driver.device_get)(&mut handle, ordinal_c), "device selection")
             .map_err(unavailable)?;
     }
     let unsigned = |key: i32| -> Result<u32, TargetError> {
-        let value = driver.attribute(key, device).map_err(unavailable)?;
+        let value = driver.attribute(key, handle).map_err(unavailable)?;
         u32::try_from(value).map_err(|_| {
             TargetError::UnsupportedDevice(format!("device attribute {key} reports {value}"))
         })
@@ -664,7 +674,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
     unsafe {
         driver
             .check(
-                (driver.device_name)(name.as_mut_ptr(), name.len() as c_int, device),
+                (driver.device_name)(name.as_mut_ptr(), name.len() as c_int, handle),
                 "device name",
             )
             .map_err(unavailable)?;
@@ -673,15 +683,13 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
             .map_err(unavailable)?;
         driver
             .check(
-                (driver.device_total_memory)(&mut memory, device),
+                (driver.device_total_memory)(&mut memory, handle),
                 "total device memory",
             )
             .map_err(unavailable)?;
     }
-    let hardware = unsafe { CStr::from_ptr(name.as_ptr()) }
-        .to_string_lossy()
-        .into_owned();
-    let compute_capability = read_compute_capability(&driver, device)?;
+    let hardware = decode_device_name(&mut name);
+    let compute_capability = read_compute_capability(&driver, handle)?;
     let driver_api =
         DriverApiVersion(u32::try_from(version).map_err(|_| {
             TargetError::UnsupportedDriver(format!("driver API version {version}"))
@@ -2575,5 +2583,23 @@ mod floor_tests {
             },
             driver
         ));
+    }
+
+    #[test]
+    fn decode_device_name_forces_nul_termination_and_handles_empty() {
+        let mut normal = [0 as std::ffi::c_char; 16];
+        for (slot, byte) in normal.iter_mut().zip(b"RTX 4090") {
+            *slot = *byte as std::ffi::c_char;
+        }
+        assert_eq!(decode_device_name(&mut normal), "RTX 4090");
+
+        // Completely filled buffer with no NUL byte must be NUL-terminated at
+        // the last byte before reading.
+        let mut unterminated = [b'A' as std::ffi::c_char; 8];
+        assert_eq!(decode_device_name(&mut unterminated), "AAAAAAA");
+        assert_eq!(unterminated[7], 0);
+
+        let mut empty: [std::ffi::c_char; 0] = [];
+        assert_eq!(decode_device_name(&mut empty), "");
     }
 }

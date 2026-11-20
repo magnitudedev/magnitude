@@ -302,46 +302,64 @@ impl NativeExecutor<Cuda> for Executor {
     fn begin_submission(&self) -> Result<Self::Submission, ExecutionError> {
         Ok(Submission {
             device: self.device.clone(),
-            in_flight_uploads: InFlightUploads::new(self.device.clone()),
+            in_flight_uploads: InFlightUploads::new(self.device.stream.clone()),
         })
     }
 }
 
-struct InFlightUploads {
-    device: Device,
-    uploads: Vec<PinnedUpload>,
+trait PendingStream {
+    fn synchronize(&self) -> Result<(), DriverError>;
 }
 
-impl InFlightUploads {
-    fn new(device: Device) -> Self {
+impl PendingStream for Arc<Stream> {
+    fn synchronize(&self) -> Result<(), DriverError> {
+        Stream::synchronize(self)
+    }
+}
+
+struct InFlightUploads<S: PendingStream = Arc<Stream>, U = PinnedUpload> {
+    stream: S,
+    uploads: Vec<U>,
+    enqueued: bool,
+}
+
+impl<S: PendingStream, U> InFlightUploads<S, U> {
+    fn new(stream: S) -> Self {
         Self {
-            device,
+            stream,
             uploads: Vec::new(),
+            enqueued: false,
         }
     }
 
-    fn push(&mut self, upload: PinnedUpload) {
+    fn mark_enqueued(&mut self) {
+        self.enqueued = true;
+    }
+
+    fn push(&mut self, upload: U) {
+        self.enqueued = true;
         self.uploads.push(upload);
     }
 
     fn complete(&mut self) -> Result<(), ExecutionError> {
-        self.device
-            .stream
+        self.stream
             .synchronize()
             .map_err(synchronization_error)?;
         self.uploads.clear();
+        self.enqueued = false;
         Ok(())
     }
 }
 
-impl Drop for InFlightUploads {
+impl<S: PendingStream, U> Drop for InFlightUploads<S, U> {
     fn drop(&mut self) {
-        if self.uploads.is_empty() {
+        if !self.enqueued && self.uploads.is_empty() {
             return;
         }
-        if self.device.stream.synchronize().is_ok() {
+        if self.stream.synchronize().is_ok() {
             self.uploads.clear();
-        } else {
+            self.enqueued = false;
+        } else if !self.uploads.is_empty() {
             // Never free pinned memory that a live DMA may still read. On a
             // lost device/context this is a bounded process-lifetime leak;
             // it is safer than violating the CUDA async-copy contract.
@@ -448,7 +466,8 @@ impl Submission {
     /// One fill of `bytes` bytes at device address `pointer`
     /// ([`Submission::fill`]).
     fn fill_piece(
-        &self,
+        device: &Device,
+        in_flight: &mut InFlightUploads,
         issue: &crate::enqueue::Enqueue,
         pointer: u64,
         value: FillValue,
@@ -456,64 +475,89 @@ impl Submission {
     ) -> Result<(), ExecutionError> {
         let count = usize::try_from(bytes / value.width())
             .unwrap_or_else(|_| panic!("prepared CUDA fill exceeds usize"));
-        let driver = &self.device.context.driver;
+        let driver = &device.context.driver;
         unsafe {
             match value {
-                FillValue::U8(pattern) => driver.check(
-                    issue.memset_d8_async(pointer, pattern[0], count, self.device.stream.raw()),
-                    "device fill",
-                ),
-                FillValue::U16(pattern) => driver.check(
-                    issue.memset_d16_async(
-                        pointer,
-                        u16::from_le_bytes(pattern),
-                        count,
-                        self.device.stream.raw(),
-                    ),
-                    "device fill",
-                ),
-                FillValue::U32(pattern) => driver.check(
-                    issue.memset_d32_async(
-                        pointer,
-                        u32::from_le_bytes(pattern),
-                        count,
-                        self.device.stream.raw(),
-                    ),
-                    "device fill",
-                ),
+                FillValue::U8(pattern) => {
+                    driver
+                        .check(
+                            issue.memset_d8_async(pointer, pattern[0], count, device.stream.raw()),
+                            "device fill",
+                        )
+                        .map_err(submission_error)?;
+                    in_flight.mark_enqueued();
+                    Ok(())
+                }
+                FillValue::U16(pattern) => {
+                    driver
+                        .check(
+                            issue.memset_d16_async(
+                                pointer,
+                                u16::from_le_bytes(pattern),
+                                count,
+                                device.stream.raw(),
+                            ),
+                            "device fill",
+                        )
+                        .map_err(submission_error)?;
+                    in_flight.mark_enqueued();
+                    Ok(())
+                }
+                FillValue::U32(pattern) => {
+                    driver
+                        .check(
+                            issue.memset_d32_async(
+                                pointer,
+                                u32::from_le_bytes(pattern),
+                                count,
+                                device.stream.raw(),
+                            ),
+                            "device fill",
+                        )
+                        .map_err(submission_error)?;
+                    in_flight.mark_enqueued();
+                    Ok(())
+                }
                 // Each 32-bit half of every element: one strided pass per half,
                 // or a single pass when the halves agree.
                 FillValue::U64(pattern) => {
                     let low = u32::from_le_bytes([pattern[0], pattern[1], pattern[2], pattern[3]]);
                     let high = u32::from_le_bytes([pattern[4], pattern[5], pattern[6], pattern[7]]);
                     if low == high {
-                        driver.check(
-                            issue.memset_d32_async(
-                                pointer,
-                                low,
-                                count * 2,
-                                self.device.stream.raw(),
-                            ),
-                            "device fill",
-                        )
-                    } else {
-                        [(0, low), (4, high)].into_iter().try_for_each(|(offset, half)| {
-                            driver.check(
-                                issue.memset_d2d32_async(
-                                    pointer + offset,
-                                    8,
-                                    half,
-                                    1,
-                                    count,
-                                    self.device.stream.raw(),
+                        driver
+                            .check(
+                                issue.memset_d32_async(
+                                    pointer,
+                                    low,
+                                    count * 2,
+                                    device.stream.raw(),
                                 ),
                                 "device fill",
                             )
-                        })
+                            .map_err(submission_error)?;
+                        in_flight.mark_enqueued();
+                        Ok(())
+                    } else {
+                        for (offset, half) in [(0, low), (4, high)] {
+                            driver
+                                .check(
+                                    issue.memset_d2d32_async(
+                                        pointer + offset,
+                                        8,
+                                        half,
+                                        1,
+                                        count,
+                                        device.stream.raw(),
+                                    ),
+                                    "device fill",
+                                )
+                                .map_err(submission_error)?;
+                            in_flight.mark_enqueued();
+                        }
+                        Ok(())
                     }
                 }
             }
-            .map_err(submission_error)
         }
     }
 
@@ -654,6 +698,7 @@ impl Submission {
             workgroup,
             workgroup_bytes,
         )?;
+        self.in_flight_uploads.mark_enqueued();
         // Ordinary launches remain asynchronous in the opened device's
         // production stream. A
         // schedule scalar is a host-side dependency for subsequent command
@@ -721,7 +766,7 @@ impl Submission {
     }
 
     fn copy(
-        &self,
+        &mut self,
         source: &CompiledBufferView,
         destination: &CompiledBufferView,
         bytes: u64,
@@ -746,11 +791,13 @@ impl Submission {
                     ),
                     "device copy",
                 )
-                .map_err(submission_error)
+                .map_err(submission_error)?;
         }
+        self.in_flight_uploads.mark_enqueued();
+        Ok(())
     }
     fn fill(
-        &self,
+        &mut self,
         destination: &CompiledBufferView,
         value: FillValue,
         bytes: u64,
@@ -762,7 +809,14 @@ impl Submission {
         }
         let _current = self.device.context.enter().map_err(submission_error)?;
         let issue = self.device.context.enqueue();
-        self.fill_piece(issue, destination.buffer.pointer() + destination.byte_offset, value, bytes)
+        Self::fill_piece(
+            &self.device,
+            &mut self.in_flight_uploads,
+            issue,
+            destination.buffer.pointer() + destination.byte_offset,
+            value,
+            bytes,
+        )
     }
     fn scalar_read(
         &mut self,
@@ -952,5 +1006,111 @@ fn synchronization_error(error: DriverError) -> ExecutionError {
         ExecutionError::DeviceLost(error.to_string())
     } else {
         ExecutionError::SynchronizationFailed(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InFlightUploads, PendingStream};
+    use crate::driver::DriverError;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct MockStream {
+        syncs: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl MockStream {
+        fn new(fail: bool) -> Self {
+            Self {
+                syncs: Arc::new(AtomicUsize::new(0)),
+                fail: Arc::new(AtomicBool::new(fail)),
+            }
+        }
+    }
+
+    impl PendingStream for MockStream {
+        fn synchronize(&self) -> Result<(), DriverError> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err(DriverError {
+                    operation: "stream synchronization",
+                    code: 700,
+                    description: "illegal address".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn empty_in_flight_does_not_synchronize_on_drop() {
+        let stream = MockStream::new(false);
+        let in_flight = InFlightUploads::<MockStream, DropCounter>::new(stream.clone());
+        drop(in_flight);
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn enqueued_work_without_uploads_synchronizes_on_early_drop() {
+        let stream = MockStream::new(false);
+        let mut in_flight = InFlightUploads::<MockStream, DropCounter>::new(stream.clone());
+        in_flight.mark_enqueued();
+        drop(in_flight);
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn completed_work_does_not_synchronize_again_on_drop() {
+        let stream = MockStream::new(false);
+        let mut in_flight = InFlightUploads::<MockStream, DropCounter>::new(stream.clone());
+        in_flight.mark_enqueued();
+        in_flight.complete().unwrap();
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 1);
+        drop(in_flight);
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_frees_uploads_when_sync_succeeds_and_leaks_when_sync_fails() {
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        let ok_stream = MockStream::new(false);
+        let mut ok_in_flight = InFlightUploads::new(ok_stream.clone());
+        ok_in_flight.push(DropCounter(drops.clone()));
+        drop(ok_in_flight);
+        assert_eq!(ok_stream.syncs.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let err_stream = MockStream::new(true);
+        let mut err_in_flight = InFlightUploads::new(err_stream.clone());
+        err_in_flight.push(DropCounter(drops.clone()));
+        drop(err_in_flight);
+        assert_eq!(err_stream.syncs.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_complete_retains_enqueued_flag_so_drop_retries_sync_and_leaks_uploads() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let stream = MockStream::new(true);
+        let mut in_flight = InFlightUploads::new(stream.clone());
+        in_flight.push(DropCounter(drops.clone()));
+        assert!(in_flight.complete().is_err());
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 1);
+        drop(in_flight);
+        assert_eq!(stream.syncs.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
     }
 }

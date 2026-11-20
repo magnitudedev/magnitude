@@ -95,6 +95,7 @@ driver! {
     stream_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuStreamCreate",
     stream_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamDestroy_v2",
     stream_query: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamQuery",
+    stream_synchronize: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamSynchronize",
     event_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuEventCreate",
     event_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuEventDestroy_v2",
     event_synchronize: unsafe extern "system" fn(Handle) -> ResultCode => "cuEventSynchronize",
@@ -1289,6 +1290,69 @@ fn granularity(driver: &Driver, location: MemoryLocation) -> Result<u64, DriverE
     Ok(granularity as u64)
 }
 
+/// Sequence for a synchronous transfer on `context.transfer`: create the
+/// synchronization event *before* enqueueing the async DMA, record and wait on
+/// it after enqueueing, and fall back to synchronous stream drain if recording
+/// fails after the DMA is already in flight so a borrowed host slice is never
+/// returned while DMA still references it.
+fn run_transfer_and_sync<E, Ev>(
+    create_event: impl FnOnce() -> Result<Ev, E>,
+    enqueue: impl FnOnce() -> Result<(), E>,
+    record_event: impl FnOnce(&Ev) -> Result<(), E>,
+    sync_event: impl FnOnce(&Ev) -> Result<(), E>,
+    sync_stream: impl FnOnce(),
+    destroy_event: impl FnOnce(Ev),
+) -> Result<(), E> {
+    let event = create_event()?;
+    let result = match enqueue() {
+        Err(error) => Err(error),
+        Ok(()) => match record_event(&event) {
+            Ok(()) => sync_event(&event),
+            Err(error) => {
+                sync_stream();
+                Err(error)
+            }
+        },
+    };
+    destroy_event(event);
+    result
+}
+
+/// Enqueues a single transfer on `context.transfer` and waits for it to
+/// complete before returning, even on synchronization-setup errors.
+fn transfer_and_sync(
+    context: &Context,
+    operation: &'static str,
+    sync_operation: &'static str,
+    enqueue: impl FnOnce() -> ResultCode,
+) -> Result<(), DriverError> {
+    let _current = context.enter()?;
+    let driver = &context.driver;
+    run_transfer_and_sync(
+        || {
+            let mut event = std::ptr::null_mut();
+            unsafe {
+                driver.check((driver.event_create)(&mut event, EVENT_BLOCKING_SYNC), sync_operation)?;
+            }
+            Ok(event)
+        },
+        || driver.check(enqueue(), operation),
+        |&event| {
+            driver.check(
+                unsafe { context.enqueue().event_record(event, context.transfer) },
+                sync_operation,
+            )
+        },
+        |&event| driver.check(unsafe { (driver.event_synchronize)(event) }, sync_operation),
+        || unsafe {
+            (driver.stream_synchronize)(context.transfer);
+        },
+        |event| unsafe {
+            (driver.event_destroy)(event);
+        },
+    )
+}
+
 /// Synchronous host copy into device memory at `pointer`, on the context's
 /// non-blocking transfer stream: it waits for nothing but itself (callers
 /// hold the destination's access fence, so no queued launch still reads or
@@ -1297,14 +1361,11 @@ pub(crate) fn upload(context: &Context, pointer: u64, bytes: &[u8]) -> Result<()
     if bytes.is_empty() {
         return Ok(());
     }
-    let _current = context.enter()?;
-    unsafe {
-        context.driver.check(
-            context.enqueue().upload_async(pointer, bytes.as_ptr().cast(), bytes.len(), context.transfer),
-            "upload",
-        )?;
-    }
-    context.synchronize(context.transfer, "upload synchronization")
+    transfer_and_sync(context, "upload", "upload synchronization", || unsafe {
+        context
+            .enqueue()
+            .upload_async(pointer, bytes.as_ptr().cast(), bytes.len(), context.transfer)
+    })
 }
 
 /// Synchronous zero fill of `bytes` of device memory at `pointer`, on the
@@ -1314,13 +1375,11 @@ pub(crate) fn zero(context: &Context, pointer: u64, bytes: usize) -> Result<(), 
     if bytes == 0 {
         return Ok(());
     }
-    let _current = context.enter()?;
-    unsafe {
+    transfer_and_sync(context, "zero fill", "zero fill synchronization", || unsafe {
         context
-            .driver
-            .check(context.enqueue().memset_d8_async(pointer, 0, bytes, context.transfer), "zero fill")?;
-    }
-    context.synchronize(context.transfer, "zero fill synchronization")
+            .enqueue()
+            .memset_d8_async(pointer, 0, bytes, context.transfer)
+    })
 }
 
 /// Synchronous device-to-host copy from `pointer`, on the context's
@@ -1334,14 +1393,11 @@ pub(crate) fn download(
     if bytes.is_empty() {
         return Ok(());
     }
-    let _current = context.enter()?;
-    unsafe {
-        context.driver.check(
-            context.enqueue().download_async(bytes.as_mut_ptr().cast(), pointer, bytes.len(), context.transfer),
-            "download",
-        )?;
-    }
-    context.synchronize(context.transfer, "download synchronization")
+    transfer_and_sync(context, "download", "download synchronization", || unsafe {
+        context
+            .enqueue()
+            .download_async(bytes.as_mut_ptr().cast(), pointer, bytes.len(), context.transfer)
+    })
 }
 
 /// `CUDA_KERNEL_NODE_PARAMS_v2`.
@@ -2581,5 +2637,117 @@ mod tests {
 
         dag.commit_barrier(e2, false);
         assert_eq!(dag.barrier_dependencies(), &[e2]);
+    }
+
+    #[test]
+    fn transfer_and_sync_creates_event_first_and_drains_stream_on_record_failure() {
+        let log = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let push = |step: &'static str| log.borrow_mut().push(step);
+
+        // Event creation failure aborts before enqueueing any async DMA.
+        let err = run_transfer_and_sync::<&'static str, ()>(
+            || {
+                push("create");
+                Err("oom")
+            },
+            || {
+                push("enqueue");
+                Ok(())
+            },
+            |_| {
+                push("record");
+                Ok(())
+            },
+            |_| {
+                push("sync_event");
+                Ok(())
+            },
+            || push("sync_stream"),
+            |_| push("destroy"),
+        );
+        assert_eq!(err, Err("oom"));
+        assert_eq!(*log.borrow(), vec!["create"]);
+
+        // Enqueue failure destroys the pre-created event without synchronizing.
+        log.borrow_mut().clear();
+        let err = run_transfer_and_sync::<&'static str, ()>(
+            || {
+                push("create");
+                Ok(())
+            },
+            || {
+                push("enqueue");
+                Err("invalid")
+            },
+            |_| {
+                push("record");
+                Ok(())
+            },
+            |_| {
+                push("sync_event");
+                Ok(())
+            },
+            || push("sync_stream"),
+            |_| push("destroy"),
+        );
+        assert_eq!(err, Err("invalid"));
+        assert_eq!(*log.borrow(), vec!["create", "enqueue", "destroy"]);
+
+        // Record failure after enqueue falls back to synchronous stream drain
+        // before returning to the caller.
+        log.borrow_mut().clear();
+        let err = run_transfer_and_sync::<&'static str, ()>(
+            || {
+                push("create");
+                Ok(())
+            },
+            || {
+                push("enqueue");
+                Ok(())
+            },
+            |_| {
+                push("record");
+                Err("record_failed")
+            },
+            |_| {
+                push("sync_event");
+                Ok(())
+            },
+            || push("sync_stream"),
+            |_| push("destroy"),
+        );
+        assert_eq!(err, Err("record_failed"));
+        assert_eq!(
+            *log.borrow(),
+            vec!["create", "enqueue", "record", "sync_stream", "destroy"]
+        );
+
+        // Happy path uses the blocking event without calling sync_stream.
+        log.borrow_mut().clear();
+        let ok = run_transfer_and_sync::<&'static str, ()>(
+            || {
+                push("create");
+                Ok(())
+            },
+            || {
+                push("enqueue");
+                Ok(())
+            },
+            |_| {
+                push("record");
+                Ok(())
+            },
+            |_| {
+                push("sync_event");
+                Ok(())
+            },
+            || push("sync_stream"),
+            |_| push("destroy"),
+        );
+        assert_eq!(ok, Ok(()));
+        assert_eq!(
+            *log.borrow(),
+            vec!["create", "enqueue", "record", "sync_event", "destroy"]
+        );
     }
 }
