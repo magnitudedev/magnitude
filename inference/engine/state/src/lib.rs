@@ -206,6 +206,9 @@ struct Arena {
     runs: BTreeMap<usize, Run>,
     referenced: usize,
     entries: BTreeMap<u64, Entry>,
+    /// Reference counts of live entries ending at each row address, so
+    /// [`Self::tail_blocked`] runs in O(log N) without scanning every entry.
+    live_ends: BTreeMap<usize, usize>,
     next_entry: u64,
 }
 
@@ -230,7 +233,27 @@ impl Arena {
             runs: BTreeMap::new(),
             referenced: 0,
             entries: BTreeMap::new(),
+            live_ends: BTreeMap::new(),
             next_entry: 0,
+        }
+    }
+
+    fn add_live_end(&mut self, end: Option<usize>) {
+        if let Some(end) = end {
+            *self.live_ends.entry(end).or_insert(0) += 1;
+        }
+    }
+
+    fn remove_live_end(&mut self, end: Option<usize>) {
+        if let Some(end) = end {
+            let count = self
+                .live_ends
+                .get_mut(&end)
+                .expect("invariant violated: live history end missing from live_ends");
+            *count -= 1;
+            if *count == 0 {
+                self.live_ends.remove(&end);
+            }
         }
     }
 
@@ -239,14 +262,55 @@ impl Arena {
         self.next_entry += 1;
         let mut joined = Vec::with_capacity(ranges.len());
         append_ranges(&mut joined, ranges, self.slab_rows);
-        self.entries.insert(
-            id,
-            Entry {
-                ranges: joined,
-                live,
-            },
-        );
+        let entry = Entry {
+            ranges: joined,
+            live,
+        };
+        if live {
+            self.add_live_end(entry.end());
+        }
+        self.entries.insert(id, entry);
         id
+    }
+
+    fn set_entry_live(&mut self, id: u64, live: bool) {
+        let entry = self.entries.get_mut(&id).expect("registered history");
+        if entry.live == live {
+            return;
+        }
+        let end = entry.end();
+        entry.live = live;
+        if live {
+            self.add_live_end(end);
+        } else {
+            self.remove_live_end(end);
+        }
+    }
+
+    fn remove_entry(&mut self, id: u64) -> Option<Entry> {
+        let entry = self.entries.remove(&id)?;
+        if entry.live {
+            self.remove_live_end(entry.end());
+        }
+        Some(entry)
+    }
+
+    fn mutate_entry_ranges<T>(
+        &mut self,
+        id: u64,
+        mutate: impl FnOnce(&mut Vec<(usize, usize)>, usize) -> T,
+    ) -> T {
+        let slab_rows = self.slab_rows;
+        let entry = self.entries.get_mut(&id).expect("registered history");
+        let live = entry.live;
+        let old_end = entry.end();
+        let result = mutate(&mut entry.ranges, slab_rows);
+        let new_end = entry.end();
+        if live && old_end != new_end {
+            self.remove_live_end(old_end);
+            self.add_live_end(new_end);
+        }
+        result
     }
 
     /// One past the last row of the page holding `row`.
@@ -254,24 +318,42 @@ impl Arena {
         row / self.page_rows * self.page_rows + self.page_rows
     }
 
-    /// The start of every free page, in address order: pages without a
-    /// referenced row. A page lies within one slab, so within one hole.
-    fn free_pages(&self) -> Vec<usize> {
-        let mut pages = Vec::new();
-        for &(start, count) in &self.free {
-            let end = start + count;
-            let mut page = start.next_multiple_of(self.page_rows);
-            while page < end && self.page_end(page) <= end {
-                pages.push(page);
-                page += self.page_rows;
+    /// Number of free pages (pages without a referenced row). A page lies
+    /// within one slab, so within one hole.
+    fn free_page_count(&self) -> usize {
+        let mut count = 0;
+        for &(start, len) in &self.free {
+            let end = start + len;
+            let first = start.next_multiple_of(self.page_rows);
+            if first < end {
+                count += (end - first) / self.page_rows;
             }
         }
-        pages
+        count
+    }
+
+    /// Number of free pages lying in `slab`.
+    fn free_pages_in_slab(&self, slab: usize) -> usize {
+        let slab_start = slab * self.slab_rows;
+        let slab_end = slab_start + self.slab_rows;
+        let first_hole = self.free.partition_point(|&(start, _)| start < slab_start);
+        let mut count = 0;
+        for &(start, len) in &self.free[first_hole..] {
+            if start >= slab_end {
+                break;
+            }
+            let end = start + len;
+            let first = start.next_multiple_of(self.page_rows);
+            if first < end {
+                count += (end - first) / self.page_rows;
+            }
+        }
+        count
     }
 
     /// Rows a fresh history can take: the rows of every free page.
     fn available(&self) -> usize {
-        self.free_pages().len() * self.page_rows
+        self.free_page_count() * self.page_rows
     }
 
     /// Rows a history ending at `end` can take in place: the free rows that
@@ -281,9 +363,10 @@ impl Arena {
             return 0;
         };
         self.free
-            .iter()
-            .find(|(start, _)| *start == end)
-            .map_or(0, |&(start, count)| {
+            .binary_search_by_key(&end, |&(start, _)| start)
+            .ok()
+            .map_or(0, |hole| {
+                let (start, count) = self.free[hole];
                 let rest = self.page_end(start) - start;
                 if count >= rest { rest } else { 0 }
             })
@@ -307,10 +390,16 @@ impl Arena {
     fn tail_blocked(&self, tail: Tail) -> bool {
         self.tail_taken(tail.end)
             || tail.end.is_some_and(|end| {
-                end % self.page_rows != 0
-                    && self.entries.iter().any(|(&other, entry)| {
-                        Some(other) != tail.history && entry.live && entry.end() == Some(end)
-                    })
+                if end % self.page_rows == 0 {
+                    return false;
+                }
+                let total = self.live_ends.get(&end).copied().unwrap_or(0);
+                let self_counts = tail.history.is_some_and(|id| {
+                    self.entries
+                        .get(&id)
+                        .is_some_and(|entry| entry.live && entry.end() == Some(end))
+                });
+                total > usize::from(self_counts)
             })
     }
 
@@ -319,34 +408,36 @@ impl Arena {
         self.in_place(end) + self.available()
     }
 
-    /// The free page a history ending at `end` takes next, given the free
-    /// pages (see the placement rule above).
-    fn next_page(&self, end: Option<usize>, pages: &[usize]) -> usize {
-        if let Some(end) = end {
-            if pages.binary_search(&end).is_ok() {
-                return end;
+    /// The free page a history ending at `end` takes next (see the placement
+    /// rule above). Every maximal contiguous run of free pages within one slab
+    /// lies inside a single coalesced hole in `self.free`.
+    fn next_page(&self, end: Option<usize>) -> usize {
+        if let Some(end) = end.filter(|end| end % self.page_rows == 0) {
+            let idx = self.free.partition_point(|&(start, _)| start <= end);
+            if idx > 0 {
+                let (start, count) = self.free[idx - 1];
+                if end + self.page_rows <= start + count {
+                    return end;
+                }
             }
         }
         let mut largest: Option<(usize, usize)> = None;
-        let mut first = 0;
-        while first < pages.len() {
-            let mut next = first + 1;
-            while next < pages.len()
-                && pages[next] == pages[next - 1] + self.page_rows
-                && pages[next] / self.slab_rows == pages[first] / self.slab_rows
-            {
-                next += 1;
+        for &(start, len) in &self.free {
+            let end = start + len;
+            let first = start.next_multiple_of(self.page_rows);
+            if first >= end {
+                continue;
             }
-            if largest.is_none_or(|(_, count)| next - first > count) {
-                largest = Some((first, next - first));
+            let pages = (end - first) / self.page_rows;
+            if pages > 0 && largest.is_none_or(|(_, count)| pages > count) {
+                largest = Some((first, pages));
             }
-            first = next;
         }
         let (first, count) = largest.expect("claimed rows never exceed the available rows");
-        if pages[first] == 0 {
-            pages[first]
+        if first == 0 {
+            0
         } else {
-            pages[first + (count - 1) / 2]
+            first + ((count - 1) / 2) * self.page_rows
         }
     }
 
@@ -364,19 +455,56 @@ impl Arena {
             let (start, taken) = if in_place > 0 {
                 (end.expect("in-place rows follow a history end"), in_place)
             } else {
-                (self.next_page(end, &self.free_pages()), self.page_rows)
+                (self.next_page(end), self.page_rows)
             };
             let hole = self
                 .free
-                .iter()
-                .position(|&(hole, size)| hole <= start && start < hole + size)
+                .partition_point(|&(hole, _)| hole <= start)
+                .checked_sub(1)
                 .expect("the rows taken are free");
+            debug_assert!(
+                self.free[hole].0 <= start && start < self.free[hole].0 + self.free[hole].1
+            );
             let piece = self.take(hole, start - self.free[hole].0, taken.min(remaining));
             claimed.push(piece);
             end = Some(piece.0 + piece.1);
             remaining -= piece.1;
         }
         claimed
+    }
+
+    /// Insert a free hole lying within a single slab into `self.free`, merging
+    /// in place with adjacent holes in the same slab.
+    fn insert_free(&mut self, start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let pos = self.free.partition_point(|&(hole, _)| hole < start);
+        let slab = start / self.slab_rows;
+        let merge_prev = pos > 0 && {
+            let (prev_start, prev_count) = self.free[pos - 1];
+            prev_start + prev_count == start && prev_start / self.slab_rows == slab
+        };
+        let merge_next = pos < self.free.len() && {
+            let (next_start, _) = self.free[pos];
+            start + count == next_start && next_start / self.slab_rows == slab
+        };
+        match (merge_prev, merge_next) {
+            (true, true) => {
+                let next_count = self.free.remove(pos).1;
+                self.free[pos - 1].1 += count + next_count;
+            }
+            (true, false) => {
+                self.free[pos - 1].1 += count;
+            }
+            (false, true) => {
+                let (_, next_count) = self.free[pos];
+                self.free[pos] = (start, count + next_count);
+            }
+            (false, false) => {
+                self.free.insert(pos, (start, count));
+            }
+        }
     }
 
     /// Back `slab`, held in reserve until a demand admits it.
@@ -397,10 +525,7 @@ impl Arena {
         assert!(self.reserve.remove(&slab));
         let start = slab * self.slab_rows;
         let end = (start + self.slab_rows).min(logical_rows);
-        let mut free = std::mem::take(&mut self.free);
-        free.push((start, end - start));
-        free.sort_unstable_by_key(|&(start, _)| start);
-        append_ranges(&mut self.free, free, self.slab_rows);
+        self.insert_free(start, end - start);
     }
 
     /// Return an admitted slab without referenced rows to reserve. A slab
@@ -499,7 +624,6 @@ impl Arena {
             .range(start..end)
             .map(|(&row, _)| row)
             .collect::<Vec<_>>();
-        let mut freed = false;
         for row in starts {
             let run = self.runs.get_mut(&row).expect("run listed above");
             run.references -= 1;
@@ -507,24 +631,8 @@ impl Arena {
                 let count = run.count;
                 self.runs.remove(&row);
                 self.referenced -= count;
-                self.free.push((row, count));
-                freed = true;
+                self.insert_free(row, count);
             }
-        }
-        if freed {
-            self.free.sort_unstable();
-            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.free.len());
-            for (start, count) in self.free.drain(..) {
-                match merged.last_mut() {
-                    Some((s, n))
-                        if *s + *n == start && *s / self.slab_rows == start / self.slab_rows =>
-                    {
-                        *n += count
-                    }
-                    _ => merged.push((start, count)),
-                }
-            }
-            self.free = merged;
         }
         self.coalesce(start, end);
     }
@@ -622,7 +730,7 @@ pub fn fresh_history_ranges(
     let pages = rows.div_ceil(geometry.page_rows);
     (0..histories)
         .map(|_| {
-            while arena.free_pages().len() < pages {
+            while arena.free_page_count() < pages {
                 arena.back_admitted(arena.backed.len(), usize::MAX);
             }
             let mut ranges = Vec::new();
@@ -697,12 +805,7 @@ impl Claims {
     }
 
     fn set_live(&self, live: bool) {
-        self.arena
-            .borrow_mut()
-            .entries
-            .get_mut(&self.id)
-            .expect("registered history")
-            .live = live;
+        self.arena.borrow_mut().set_entry_live(self.id, live);
     }
 
     /// Unregister without releasing: the caller takes the references.
@@ -710,8 +813,7 @@ impl Claims {
         let entry = self
             .arena
             .borrow_mut()
-            .entries
-            .remove(&self.id)
+            .remove_entry(self.id)
             .expect("registered history");
         entry.ranges
     }
@@ -720,33 +822,36 @@ impl Claims {
     fn append(&mut self, next: Claims) {
         debug_assert!(Rc::ptr_eq(&self.arena, &next.arena));
         let ranges = next.into_ranges();
-        let mut arena = self.arena.borrow_mut();
-        let slab_rows = arena.slab_rows;
-        let entry = arena.entries.get_mut(&self.id).expect("registered history");
-        append_ranges(&mut entry.ranges, ranges, slab_rows);
+        self.arena
+            .borrow_mut()
+            .mutate_entry_ranges(self.id, |entry_ranges, slab_rows| {
+                append_ranges(entry_ranges, ranges, slab_rows);
+            });
     }
 
     /// Keep the first `keep` rows; return the remainder as a frozen history.
     fn split_off(&mut self, keep: usize) -> Claims {
-        let tail = {
-            let mut arena = self.arena.borrow_mut();
-            let entry = arena.entries.get_mut(&self.id).expect("registered history");
-            let (head, tail) = split_ranges(&entry.ranges, keep);
-            entry.ranges = head;
-            tail
-        };
+        let tail = self
+            .arena
+            .borrow_mut()
+            .mutate_entry_ranges(self.id, |entry_ranges, _| {
+                let (head, tail) = split_ranges(entry_ranges, keep);
+                *entry_ranges = head;
+                tail
+            });
         Claims::new(&self.arena, tail)
     }
 
     /// Release the first `rows` rows.
     fn drop_front(&mut self, rows: usize) {
-        let head = {
-            let mut arena = self.arena.borrow_mut();
-            let entry = arena.entries.get_mut(&self.id).expect("registered history");
-            let (head, tail) = split_ranges(&entry.ranges, rows);
-            entry.ranges = tail;
-            head
-        };
+        let head = self
+            .arena
+            .borrow_mut()
+            .mutate_entry_ranges(self.id, |entry_ranges, _| {
+                let (head, tail) = split_ranges(entry_ranges, rows);
+                *entry_ranges = tail;
+                head
+            });
         drop(Claims::new(&self.arena, head));
     }
 }
@@ -792,7 +897,7 @@ impl Clone for Claims {
 impl Drop for Claims {
     fn drop(&mut self) {
         let mut arena = self.arena.borrow_mut();
-        if let Some(entry) = arena.entries.remove(&self.id) {
+        if let Some(entry) = arena.remove_entry(self.id) {
             for (start, count) in entry.ranges {
                 arena.release(start, count);
             }
@@ -1034,7 +1139,7 @@ impl HistoryDomain {
         }
         let arena = self.arena.borrow();
         let pages = rows.div_ceil(self.page_rows);
-        let free = arena.free_pages().len();
+        let free = arena.free_page_count();
         let shortage = pages.saturating_sub(free);
         let mut slabs = Vec::new();
         let mut added_pages = 0;
@@ -1050,9 +1155,16 @@ impl HistoryDomain {
             }
         }
         if added_pages < shortage {
+            let required = (rows as u64)
+                .checked_mul(self.row_bytes)
+                .ok_or(LayoutError::ArithmeticOverflow("required history bytes"))?;
+            let available_bytes = (added_pages + free)
+                .checked_mul(self.page_rows)
+                .and_then(|rows| (rows as u64).checked_mul(self.row_bytes))
+                .ok_or(LayoutError::ArithmeticOverflow("available history bytes"))?;
             return Err(Error::Capacity {
-                required: rows as u64 * self.row_bytes,
-                available_bytes: ((added_pages + free) * self.page_rows) as u64 * self.row_bytes,
+                required,
+                available_bytes,
             });
         }
         Ok(slabs)
@@ -1080,10 +1192,11 @@ impl HistoryDomain {
 
     /// The first row a history at `position`, trimmed at `floor`,
     /// references, in the domain's rows: a position, or for Block the first
-    /// block with no trimmed position.
+    /// block with no trimmed position, clamped to the completed blocks
+    /// (`position / rate`).
     fn history_start(&self, position: usize, floor: usize) -> usize {
         match self.kind {
-            HistoryDomainKind::Block { rate } => floor.div_ceil(rate),
+            HistoryDomainKind::Block { rate } => floor.div_ceil(rate).min(position / rate),
             kind => kind.retained_from(position).max(floor),
         }
     }
@@ -1099,17 +1212,15 @@ impl HistoryDomain {
         for slab in arena.reserve.clone() {
             arena.admit_slab(slab, self.capacity);
         }
-        let free_pages = arena.free_pages();
-        let pages_in = |slab: usize| free_pages.iter().filter(|page| **page / self.slab_rows == slab).count();
         let mut keep = arena.backed.iter().copied().filter(|&slab| !arena.empty_slab(slab)).collect::<BTreeSet<_>>();
-        let mut room = keep.iter().map(|&slab| pages_in(slab)).sum::<usize>();
+        let mut room = keep.iter().map(|&slab| arena.free_pages_in_slab(slab)).sum::<usize>();
         let pages = rows.div_ceil(self.page_rows);
         for &slab in &arena.backed {
             if room >= pages {
                 break;
             }
             if keep.insert(slab) {
-                room += pages_in(slab);
+                room += arena.free_pages_in_slab(slab);
             }
         }
         keep
@@ -1803,24 +1914,19 @@ impl StateStore {
 
     /// Each stored domain's total of `demands`.
     fn domain_demands(&self, demands: &[RowDemand]) -> Result<Vec<usize>, Error> {
-        if let Some(demand) = demands
-            .iter()
-            .find(|demand| demand.domain.0 >= self.domains.len())
-        {
-            return Err(Error::Request(format!(
-                "row demand names absent history domain {:?}",
-                demand.domain
-            )));
+        let mut totals = vec![0usize; self.domains.len()];
+        for demand in demands {
+            let Some(total) = totals.get_mut(demand.domain.0) else {
+                return Err(Error::Request(format!(
+                    "row demand names absent history domain {:?}",
+                    demand.domain
+                )));
+            };
+            *total = total
+                .checked_add(demand.rows)
+                .ok_or(LayoutError::ArithmeticOverflow("domain row demand"))?;
         }
-        Ok((0..self.domains.len())
-            .map(|index| {
-                demands
-                    .iter()
-                    .filter(|demand| demand.domain.0 == index)
-                    .map(|demand| demand.rows)
-                    .sum()
-            })
-            .collect())
+        Ok(totals)
     }
 
     /// Admit the slabs one step's `demands` need to placement
@@ -1876,7 +1982,12 @@ impl StateStore {
         let backing = &mut *backing;
         for (index, (domain, history)) in self.domains.iter().zip(&mut backing.history).enumerate() {
             let id = HistoryDomainId(index);
-            let rows = next.rows.iter().filter(|demand| demand.domain == id).map(|demand| demand.rows).sum::<usize>();
+            let rows = next
+                .rows
+                .iter()
+                .filter(|demand| demand.domain == id)
+                .try_fold(0usize, |total, demand| total.checked_add(demand.rows))
+                .ok_or(LayoutError::ArithmeticOverflow("shrink row demand"))?;
             let keep = domain.retained_slabs(rows);
             let victims = history.slabs.backed().into_iter().filter(|slab| !keep.contains(slab)).collect::<Vec<_>>();
             if victims.is_empty() {
@@ -2128,6 +2239,7 @@ impl StateStore {
     fn page_demand(&self, domain: HistoryDomainId, end: Option<usize>, count: usize) -> usize {
         let domain = &self.domains[domain.0];
         layout::page_demand_rows(domain.page_rows, domain.arena.borrow().in_place(end), count)
+            .unwrap_or(usize::MAX)
     }
 
     /// Reserve `counts[domain]` rows in every stored domain (see
@@ -2155,9 +2267,15 @@ impl StateStore {
             let mut arena = domain.arena.borrow_mut();
             let claimable = arena.claimable(after);
             if claimable < count {
+                let required = (count as u64)
+                    .checked_mul(domain.row_bytes)
+                    .ok_or(LayoutError::ArithmeticOverflow("required history bytes"))?;
+                let available_bytes = (claimable as u64)
+                    .checked_mul(domain.row_bytes)
+                    .ok_or(LayoutError::ArithmeticOverflow("available history bytes"))?;
                 return Err(Error::Capacity {
-                    required: count as u64 * domain.row_bytes,
-                    available_bytes: claimable as u64 * domain.row_bytes,
+                    required,
+                    available_bytes,
                 });
             }
             let ranges = arena.claim(after, count);
@@ -2256,12 +2374,12 @@ impl SequenceState {
     /// steps queued behind it: what appending both needs beyond
     /// [`Self::demands`] of `rows`.
     pub fn queued_demands(&self, rows: usize, queued: usize) -> Vec<RowDemand> {
-        self.demands(rows + queued)
+        self.demands(rows.saturating_add(queued))
             .into_iter()
             .zip(self.demands(rows))
             .map(|(both, step)| RowDemand {
                 domain: both.domain,
-                rows: both.rows - step.rows,
+                rows: both.rows.saturating_sub(step.rows),
             })
             .collect()
     }
@@ -5499,5 +5617,145 @@ mod tests {
             );
             assert!(run.released_to <= reserved);
         }
+    }
+
+    #[test]
+    fn block_domain_trim_history_preserves_claim_count_across_partial_block() {
+        const BLOCKS: HistoryDomainId = HistoryDomainId(0);
+        let device = OwnDevice::cpu();
+        let component = ComponentDescriptor::produced(
+            LayerRef::IndexKeys { block: 0, part: 0 },
+            DType::F32,
+            4,
+            false,
+        )
+        .unwrap();
+        let (store, mut bindings) = device
+            .store(
+                128,
+                8,
+                vec![HistoryDomainPlan {
+                    layout: HistoryDomainLayout::Block {
+                        rate: 4,
+                        components: vec![component],
+                    },
+                    logical_rows: 512,
+                }],
+                vec![],
+                BankCapacity {
+                    active: 1,
+                    in_flight: 2,
+                    retained: 0,
+                },
+            )
+            .unwrap();
+        bindings
+            .provision_with_growth(
+                &[RowDemand { domain: BLOCKS, rows: 16 }],
+                &[RowDemand { domain: BLOCKS, rows: 256 }],
+                3,
+                GrowthChoice::Preferred,
+            )
+            .unwrap();
+        let state = store.create().unwrap();
+        let advance = OwnedStateAdvance::begin(state, 6).ok().unwrap();
+        let OwnedAdvanceResolution::Committed(mut state) = advance.commit_all().ok().unwrap() else {
+            panic!("advance to position 6 must commit");
+        };
+        assert_eq!(state.position(), 6);
+        assert_eq!(state.history_start(BLOCKS), 0);
+        assert_eq!(state.claims[BLOCKS.0].rows(), 6 / 4 - state.history_start(BLOCKS));
+
+        // Trimming at position 5 lies inside incomplete block 1 ([4, 8)):
+        // history_start must clamp to 6 / 4 = 1 rather than 5.div_ceil(4) = 2.
+        state.trim_history(5).unwrap();
+        assert_eq!(state.history_start(BLOCKS), 1);
+        assert_eq!(state.claims[BLOCKS.0].rows(), 0);
+        assert_eq!(state.claims[BLOCKS.0].rows(), 6 / 4 - state.history_start(BLOCKS));
+        assert!(state.history_ranges(BLOCKS).is_empty());
+
+        // Advancing by 2 completes block 1 (position 8), which contains
+        // trimmed position 4 < 5 and must be dropped so starts advances to 2
+        // and claims stays empty. Both following_history (via successor) and
+        // SequenceState::trim must agree.
+        let advance = OwnedStateAdvance::begin(state, 2).ok().unwrap();
+        let successor = advance.successor(4).unwrap();
+        assert_eq!(successor.history_start(BLOCKS), 2);
+        assert!(successor.history_ranges(BLOCKS).is_empty());
+
+        let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap() else {
+            panic!("advance to position 8 must commit");
+        };
+        assert_eq!(state.position(), 8);
+        assert_eq!(state.history_start(BLOCKS), 2);
+        assert_eq!(state.claims[BLOCKS.0].rows(), 0);
+        assert_eq!(state.claims[BLOCKS.0].rows(), 8 / 4 - state.history_start(BLOCKS));
+
+        // Attaching the successor advances to position 12 (completing block 2,
+        // tokens 8..12, all >= 5), which is retained.
+        let second = successor.attach(state).ok().unwrap();
+        let OwnedAdvanceResolution::Committed(state) = second.commit_all().ok().unwrap() else {
+            panic!("advance to position 12 must commit");
+        };
+        assert_eq!(state.position(), 12);
+        assert_eq!(state.history_start(BLOCKS), 2);
+        assert_eq!(state.claims[BLOCKS.0].rows(), 1);
+        assert_eq!(state.claims[BLOCKS.0].rows(), 12 / 4 - state.history_start(BLOCKS));
+    }
+
+    #[test]
+    fn checked_arithmetic_rejects_overflow_without_panicking() {
+        let rate = 4usize;
+        let position = usize::MAX - 2;
+        let count = 10usize;
+        let expected = ((position as u128 + count as u128) / rate as u128
+            - position as u128 / rate as u128) as usize;
+        assert_eq!(
+            HistoryDomainKind::Block { rate }.advance_rows(position, count),
+            expected
+        );
+
+        let pages = history_pages(usize::MAX, usize::MAX);
+        assert!(pages.span_limit <= MAX_HISTORY_SPANS);
+        assert_eq!(layout::page_demand_rows(256, 0, usize::MAX), None);
+
+        let device = OwnDevice::cpu();
+        let store = token_store(
+            device,
+            8,
+            256,
+            vec![ComponentDescriptor::new(
+                LayerRef::Target(0),
+                CodecSpec::dense(DType::F32, 1, 1),
+                1,
+            )
+            .unwrap()],
+            vec![],
+            BankCapacity {
+                active: 1,
+                in_flight: 1,
+                retained: 0,
+            },
+        )
+        .unwrap();
+        let state = store.create().unwrap();
+        let (_, error) = OwnedStateAdvance::begin_rows(state, usize::MAX, 1, 0)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::Layout(LayoutError::ArithmeticOverflow(_))));
+
+        assert!(matches!(
+            store.domain_demands(&[
+                RowDemand {
+                    domain: TOKEN,
+                    rows: usize::MAX,
+                },
+                RowDemand {
+                    domain: TOKEN,
+                    rows: 1,
+                },
+            ]),
+            Err(Error::Layout(LayoutError::ArithmeticOverflow(_)))
+        ));
     }
 }

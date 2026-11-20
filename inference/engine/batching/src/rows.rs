@@ -161,7 +161,7 @@ pub struct HistoryTables {
 /// `previous_tape`): the bank's state advanced by that many of its tape rows.
 /// They publish the state after the first `stop` rows to bank
 /// `following_bank` and record the rows after `stop` on its tape. A
-/// successor is never the zero seed (bank 0), the slot's own bank, or another
+/// successor is never the zero seed (bank 0), any slot's bank, or another
 /// slot's successor.
 ///
 /// A slot's last `front` rows are front rows, a pass's rows that only run
@@ -319,7 +319,7 @@ impl fmt::Display for PackError {
                 following_bank,
             } => write!(
                 f,
-                "slot {slot} successor bank {following_bank} is the zero seed, its own bank {bank}, or another slot's successor"
+                "slot {slot} successor bank {following_bank} is the zero seed, a slot's bank (own bank {bank}), or another slot's successor"
             ),
             Self::InvalidRecurrentVersion {
                 slot,
@@ -452,7 +452,7 @@ impl PackedRowTables {
                 });
             }
             if slot.following_bank <= 0
-                || slot.following_bank == slot.bank
+                || slots.iter().any(|other| other.bank == slot.following_bank)
                 || slots[..slot_index]
                     .iter()
                     .any(|other| other.following_bank == slot.following_bank)
@@ -476,7 +476,7 @@ impl PackedRowTables {
                 });
             }
             for (offset, row) in slot.rows.iter().enumerate() {
-                if row.token < 0 {
+                if row.token < 0 || (row.token as usize) >= vocabulary_size {
                     return Err(PackError::InvalidToken {
                         row: index,
                         token: row.token,
@@ -623,7 +623,7 @@ impl PackedRowTables {
                     packed.out_rows.push(as_i32(row_index, "output row")?);
                     if let Some(select) = &row.select {
                         packed.select_rows.push(as_i32(out_index, "select row")?);
-                        append_select(&mut packed, row_index, select)?;
+                        append_select(&mut packed, row_index, select, vocabulary_size)?;
                     }
                 }
                 row_index += 1;
@@ -671,10 +671,19 @@ pub fn history_tiles(spans: impl IntoIterator<Item = [i32; 2]>, count: usize) ->
 }
 
 fn validate_visible(row: usize, ranges: &[[i32; 2]]) -> Result<(), PackError> {
-    for &range in ranges {
+    let mut ascending_disjoint = true;
+    let mut prev_end = 0i32;
+    for (index, &range) in ranges.iter().enumerate() {
         if range[0] < 0 || range[0] >= range[1] {
             return Err(PackError::InvalidVisibleRange { row, range });
         }
+        if index > 0 && range[0] < prev_end {
+            ascending_disjoint = false;
+        }
+        prev_end = range[1];
+    }
+    if ascending_disjoint {
+        return Ok(());
     }
     let mut ordered = ranges.to_vec();
     ordered.sort_unstable();
@@ -688,6 +697,7 @@ fn append_select(
     packed: &mut PackedRowTables,
     row: usize,
     select: &Select,
+    vocabulary_size: usize,
 ) -> Result<(), PackError> {
     if select.draw.domain > 3 {
         return Err(PackError::InvalidDrawDomain {
@@ -726,6 +736,11 @@ fn append_select(
             row,
             actual: select.history.len(),
         });
+    }
+    for &token in &select.history {
+        if token < -1 || (token >= 0 && (token as usize) >= vocabulary_size) {
+            return Err(PackError::InvalidToken { row, token });
+        }
     }
     let mut history = [-1; HISTORY_WIDTH];
     history[..select.history.len()].copy_from_slice(&select.history);
@@ -1098,11 +1113,54 @@ mod tests {
             (&[(2, 2)][..], 0),
             (&[(0, -1)][..], 0),
             (&[(0, 3), (5, 3)][..], 1),
+            (&[(2, 3), (3, 4)][..], 0),
+            (&[(3, 4), (2, 3)][..], 1),
         ] {
             assert!(matches!(
                 pack(slots),
                 Err(PackError::InvalidFollowingBank { slot: actual, .. }) if actual == slot
             ));
+        }
+    }
+
+    #[test]
+    fn tokens_and_selection_history_are_bounded_by_vocabulary() {
+        let pack_row = |entry: Row| {
+            PackedRowTables::pack(
+                &[Slot {
+                    rows: vec![entry],
+                    bank: 0,
+                    previous_tape: 0,
+                    following_bank: 1,
+                    stop: 1,
+                    front: 0,
+                }],
+                16,
+                LIMITS,
+            )
+        };
+        assert_eq!(
+            pack_row(row(16, Demand::NONE)).unwrap_err(),
+            PackError::InvalidToken { row: 0, token: 16 }
+        );
+        let mut valid_hist = row(15, Demand::SELECT);
+        let mut select = selection(None);
+        select.history = vec![-1, 0, 15];
+        valid_hist.select = Some(select);
+        assert!(pack_row(valid_hist).is_ok());
+
+        for bad_token in [-2, 16] {
+            let mut bad_hist = row(1, Demand::SELECT);
+            let mut select = selection(None);
+            select.history = vec![0, bad_token];
+            bad_hist.select = Some(select);
+            assert_eq!(
+                pack_row(bad_hist).unwrap_err(),
+                PackError::InvalidToken {
+                    row: 0,
+                    token: bad_token,
+                }
+            );
         }
     }
 

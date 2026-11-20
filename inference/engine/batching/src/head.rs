@@ -254,7 +254,9 @@ impl ValidatedHeadBatch {
         limits: ClassLimits,
     ) -> Result<Self, PackError> {
         for (index, slot) in slots.iter().enumerate() {
-            if slot.selects.len() != slot.entry.rows.len() || slot.entry.front + 1 != slot.entry.rows.len() {
+            if slot.selects.len() != slot.entry.rows.len()
+                || slot.entry.front.checked_add(1) != Some(slot.entry.rows.len())
+            {
                 return Err(PackError::FrontSlot { slot: index });
             }
             for (row, entry) in slot.entry.rows.iter().enumerate() {
@@ -266,10 +268,13 @@ impl ValidatedHeadBatch {
                 }
             }
         }
-        if let Some(row) = continuing
-            .iter()
-            .position(|row| row.is_some_and(|row| row.slot >= slots.len()))
-        {
+        if let Some(row) = continuing.iter().position(|row| {
+            row.is_some_and(|row| {
+                slots
+                    .get(row.slot)
+                    .is_none_or(|slot| row.depth >= slot.entry.rows.len())
+            })
+        }) {
             return Err(PackError::FrontContinuation { row });
         }
         let entry = slots
@@ -477,6 +482,43 @@ mod tests {
         assert!(matches!(
             ValidatedHeadBatch::from_block_slots(&[slot(2, 3, 2), slot(4, 1, 3)], 16, LIMITS),
             Err(PackError::HeadSteps { slot: 1 })
+        ));
+    }
+
+    #[test]
+    fn front_slots_reject_overflowing_front_count_and_out_of_range_continuation_depth() {
+        let front_slot = |front: usize| FrontSlot {
+            entry: Slot {
+                rows: vec![row(1, 0, None), row(2, 1, None)],
+                bank: 0,
+                previous_tape: 0,
+                following_bank: 1,
+                stop: 1,
+                front,
+            },
+            selects: vec![select(0), select(1)],
+        };
+        assert!(matches!(
+            ValidatedHeadBatch::from_front_slots(&[front_slot(usize::MAX)], &[], 16, LIMITS),
+            Err(PackError::FrontSlot { slot: 0 })
+        ));
+        assert!(matches!(
+            ValidatedHeadBatch::from_front_slots(
+                &[front_slot(1)],
+                &[Some(FrontContinuation { slot: 0, depth: 1 })],
+                16,
+                LIMITS,
+            ),
+            Ok(_)
+        ));
+        assert!(matches!(
+            ValidatedHeadBatch::from_front_slots(
+                &[front_slot(1)],
+                &[Some(FrontContinuation { slot: 0, depth: 2 })],
+                16,
+                LIMITS,
+            ),
+            Err(PackError::FrontContinuation { row: 0 })
         ));
     }
 }

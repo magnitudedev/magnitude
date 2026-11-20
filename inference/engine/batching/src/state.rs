@@ -68,36 +68,34 @@ impl ValidatedStateBatch {
         source: KvCodec,
         destination: KvCodec,
         steps: Vec<CodecConversionStep>,
-        source_row_capacity: usize,
-        destination_row_capacity: usize,
+        source_row_capacities: &[usize],
+        destination_row_capacities: &[usize],
         class_rows: usize,
     ) -> Result<Self, StateBatchError> {
         if source == destination {
             return Err(StateBatchError::InvalidCodec);
         }
-        let actual_rows = steps.first().map_or(0, |step| step.from.len());
-        if actual_rows == 0 || steps.is_empty() {
+        if steps.is_empty() || steps.iter().all(|step| step.from.is_empty()) {
             return Err(StateBatchError::Empty);
         }
-        if actual_rows > class_rows {
-            return Err(StateBatchError::Capacity {
-                required: actual_rows,
-                available: class_rows,
-            });
+        if source_row_capacities.len() != destination_row_capacities.len() {
+            return Err(StateBatchError::InvalidMapping);
         }
-        let mut vectors = HashSet::new();
+        let mut vectors = HashSet::with_capacity(steps.len());
         let mut source_planes = HashSet::new();
         let mut destination_planes = HashSet::new();
-        if steps.iter().any(|step| {
-            step.from.len() != actual_rows
-                || step.to.len() != actual_rows
-                || step.source_planes.is_empty()
+        let mut domain_maps: Vec<Option<(&[usize], &[usize])>> =
+            vec![None; source_row_capacities.len()];
+        let mut actual_rows = 0usize;
+        for step in &steps {
+            let domain = step.domain.0;
+            let Some(&source_capacity) = source_row_capacities.get(domain) else {
+                return Err(StateBatchError::InvalidMapping);
+            };
+            let destination_capacity = destination_row_capacities[domain];
+            if step.source_planes.is_empty()
                 || step.destination_planes.is_empty()
-                || !vectors.insert((step.layer, step.vector))
-                || step.from.iter().any(|row| *row >= source_row_capacity)
-                || step.to.iter().any(|row| *row >= destination_row_capacity)
-                || step.from.iter().copied().collect::<HashSet<_>>().len() != actual_rows
-                || step.to.iter().copied().collect::<HashSet<_>>().len() != actual_rows
+                || !vectors.insert((step.domain, step.layer, step.vector))
                 || step
                     .source_planes
                     .iter()
@@ -106,16 +104,37 @@ impl ValidatedStateBatch {
                     .destination_planes
                     .iter()
                     .any(|plane| !destination_planes.insert(*plane))
-        }) {
-            return Err(StateBatchError::InvalidMapping);
+            {
+                return Err(StateBatchError::InvalidMapping);
+            }
+            match domain_maps[domain] {
+                Some((first_from, first_to)) => {
+                    if step.from.as_slice() != first_from || step.to.as_slice() != first_to {
+                        return Err(StateBatchError::InvalidMapping);
+                    }
+                }
+                None => {
+                    if step.from.is_empty()
+                        || step.from.len() != step.to.len()
+                        || step.from.iter().any(|&row| row >= source_capacity)
+                        || step.to.iter().any(|&row| row >= destination_capacity)
+                        || !unique_rows(&step.from)
+                        || !unique_rows(&step.to)
+                    {
+                        return Err(StateBatchError::InvalidMapping);
+                    }
+                    domain_maps[domain] = Some((step.from.as_slice(), step.to.as_slice()));
+                    actual_rows = actual_rows
+                        .checked_add(step.from.len())
+                        .ok_or(StateBatchError::InvalidMapping)?;
+                }
+            }
         }
-        let first_from = &steps[0].from;
-        let first_to = &steps[0].to;
-        if steps
-            .iter()
-            .any(|step| &step.from != first_from || &step.to != first_to)
-        {
-            return Err(StateBatchError::InvalidMapping);
+        if actual_rows > class_rows {
+            return Err(StateBatchError::Capacity {
+                required: actual_rows,
+                available: class_rows,
+            });
         }
         Ok(Self {
             kind: StateBatchKind::CodecConversion {
@@ -144,27 +163,24 @@ impl ValidatedStateBatch {
                 available: class_rows,
             });
         }
-        let mut planes = HashSet::new();
-        if copies.iter().any(|copy| {
-            copy.from.len() != actual_rows
-                || copy.to.len() != actual_rows
-                || !planes.insert(copy.plane_index)
-                || copy
-                    .from
-                    .iter()
-                    .chain(&copy.to)
-                    .any(|row| *row >= row_capacity)
-                || copy.from.iter().copied().collect::<HashSet<_>>().len() != actual_rows
-                || copy.to.iter().copied().collect::<HashSet<_>>().len() != actual_rows
-        }) {
-            return Err(StateBatchError::InvalidMapping);
-        }
         let first_from = &copies[0].from;
         let first_to = &copies[0].to;
-        if copies
-            .iter()
-            .any(|copy| &copy.from != first_from || &copy.to != first_to)
+        if first_to.len() != actual_rows
+            || first_from
+                .iter()
+                .chain(first_to)
+                .any(|&row| row >= row_capacity)
+            || !unique_rows(first_from)
+            || !unique_rows(first_to)
         {
+            return Err(StateBatchError::InvalidMapping);
+        }
+        let mut planes = HashSet::with_capacity(copies.len());
+        if copies.iter().any(|copy| {
+            !planes.insert(copy.plane_index)
+                || &copy.from != first_from
+                || &copy.to != first_to
+        }) {
             return Err(StateBatchError::InvalidMapping);
         }
         Ok(Self {
@@ -195,5 +211,51 @@ impl ValidatedStateBatch {
             StateRows::Conversions(steps) => Some(steps),
             StateRows::Copies(_) => None,
         }
+    }
+}
+
+fn unique_rows(rows: &[usize]) -> bool {
+    if rows.windows(2).all(|pair| pair[0] < pair[1]) {
+        return true;
+    }
+    let mut seen = HashSet::with_capacity(rows.len());
+    rows.iter().all(|&row| seen.insert(row))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_rejects_duplicate_rows_and_accepts_out_of_order_unique_rows() {
+        let ok = ValidatedStateBatch::copy(
+            vec![
+                PlaneCopy {
+                    plane_index: 0,
+                    from: vec![5, 2, 7],
+                    to: vec![3, 1, 0],
+                },
+                PlaneCopy {
+                    plane_index: 1,
+                    from: vec![5, 2, 7],
+                    to: vec![3, 1, 0],
+                },
+            ],
+            8,
+            4,
+        )
+        .unwrap();
+        assert_eq!(ok.actual_rows(), 3);
+
+        let dup = ValidatedStateBatch::copy(
+            vec![PlaneCopy {
+                plane_index: 0,
+                from: vec![5, 2, 5],
+                to: vec![3, 1, 0],
+            }],
+            8,
+            4,
+        );
+        assert_eq!(dup.unwrap_err(), StateBatchError::InvalidMapping);
     }
 }

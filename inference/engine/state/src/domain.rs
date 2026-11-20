@@ -61,7 +61,10 @@ impl HistoryDomainKind {
     /// one per row, or for Block one per block it completes.
     pub fn advance_rows(self, position: usize, count: usize) -> usize {
         match self {
-            Self::Block { rate } => (position + count) / rate - position / rate,
+            Self::Block { rate } => {
+                let end = position as u128 + count as u128;
+                (end / rate as u128 - position as u128 / rate as u128) as usize
+            }
             Self::Token | Self::Window { .. } | Self::Shared { .. } => count,
         }
     }
@@ -237,10 +240,14 @@ pub fn state_bytes(
         .try_fold(0u64, |total, domain| {
             let page_rows = domain.pages(domains, context, max_advance)?.page_rows;
             let kind = domain.kind();
-            let taken = crate::layout::page_demand_rows(page_rows, 0, kind.most_advance_rows(rows));
+            let taken = crate::layout::page_demand_rows(page_rows, 0, kind.most_advance_rows(rows))
+                .ok_or_else(overflow)?;
             let taken = match kind {
                 HistoryDomainKind::Window { .. } => {
-                    taken.min(crate::layout::window_pages(page_rows, kind.row_limit(context, max_advance)?) * page_rows)
+                    let cap = crate::layout::window_pages(page_rows, kind.row_limit(context, max_advance)?)
+                        .checked_mul(page_rows)
+                        .ok_or_else(overflow)?;
+                    taken.min(cap)
                 }
                 HistoryDomainKind::Token | HistoryDomainKind::Shared { .. } | HistoryDomainKind::Block { .. } => taken,
             };
