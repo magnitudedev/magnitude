@@ -222,6 +222,18 @@ impl Reading {
         self.total
     }
 
+    /// The store's structural capacity: the most bytes it could grant the
+    /// process beside nothing else, bounding a load's growth ceiling
+    /// (`PlanningRoom::capacity`) independently of momentary free supply.
+    pub fn capacity(&self) -> u64 {
+        match self.grant {
+            Some(HostGrant::Wired(ceiling)) => self.total.min(ceiling.limit),
+            Some(HostGrant::Limit(limit)) => self.total.min(limit),
+            Some(HostGrant::Budget { capacity, .. }) => self.total.min(capacity),
+            None => self.total,
+        }
+    }
+
     pub(crate) fn supply(&self) -> seismic::Supply {
         self.supply
     }

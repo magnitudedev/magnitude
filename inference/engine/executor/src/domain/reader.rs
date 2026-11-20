@@ -193,7 +193,7 @@ impl<'a> PlanningRoom<'a> {
 
 impl crate::SettleRoom for PlanningRoom<'_> {
     fn capacity(&self) -> Result<u64, crate::PlanError> {
-        Ok(self.net())
+        Ok(self.at().device.capacity())
     }
 
     fn room(&self, draft: &crate::ExecutionPlanDraft, mandatory: &crate::AssessmentMemoryCharge) -> Result<crate::PlanRoom, crate::PlanError> {

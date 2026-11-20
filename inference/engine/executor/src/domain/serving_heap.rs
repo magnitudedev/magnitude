@@ -339,7 +339,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 self.resize_held.begin(tier, started);
                 self.shrink_step = true;
                 let block = bank
-                    .targets(self.decode_price()?.as_ref())?
+                    .targets()?
                     .into_iter()
                     .find(|t| t.holding == holding)
                     .map_or(0, |t| t.shape.block_bytes());
