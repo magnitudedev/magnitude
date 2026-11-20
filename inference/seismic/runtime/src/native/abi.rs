@@ -2813,6 +2813,7 @@ void probe() {
                 denorm_preserve_32: true,
                 subgroup_uniform_control_flow: true,
                 maximal_reconvergence: true,
+                merge_maximal_reconvergence_returns: false,
             };
             let module = seismic_vulkan::formation::compile(&source, "probe", environment)
                 .unwrap_or_else(|error| panic!("{representation}: {error:?}"));
@@ -2867,6 +2868,7 @@ void probe() {{
                 denorm_preserve_32: true,
                 subgroup_uniform_control_flow: true,
                 maximal_reconvergence: true,
+                merge_maximal_reconvergence_returns: false,
             };
             seismic_vulkan::formation::compile(&source, "probe", environment).unwrap_or_else(
                 |error| {

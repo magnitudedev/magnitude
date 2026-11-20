@@ -58,6 +58,14 @@ pub struct FormationTarget {
     /// subgroup operation after a lane-varying loop, and the seal pass
     /// declares `MaximallyReconvergesKHR` on every module that relies on it.
     pub maximal_reconvergence: bool,
+    /// Merge early returns in modules declaring `MaximallyReconvergesKHR`
+    /// (`DeadBranchElim` + `MergeReturn`): set on `vk::DriverId::AMD_PROPRIETARY`
+    /// (Windows `amdvlk64.dll` 32.0.31019.6049 / driver `26.10.19.06 (LLPC)`)
+    /// where `spirv-val`-valid modules with early returns and maximal
+    /// reconvergence crash `vkCreateComputePipelines`, and false elsewhere
+    /// (including `AMD_OPEN_SOURCE` and NVIDIA, where `MergeReturn` regressed
+    /// `attention_decode_k8v4` by +17.67%).
+    pub merge_maximal_reconvergence_returns: bool,
 }
 
 impl FormationTarget {
@@ -80,15 +88,17 @@ impl FormationTarget {
         denorm_preserve_32: false,
         subgroup_uniform_control_flow: true,
         maximal_reconvergence: false,
+        merge_maximal_reconvergence_returns: false,
     };
 
     /// The target a device with `properties` forms in. The cooperative-
     /// matrix path needs fp16 arithmetic and 32-lane hardware subgroups, and
     /// is formed only where `matrix_path` ([`DeviceInfo::matrix_path`]).
-    pub fn of(properties: &Properties, matrix_path: bool) -> Self {
+    pub fn of(properties: &Properties, matrix_path: bool, merge_maximal_reconvergence_returns: bool) -> Self {
         let subgroup_lanes = u32::try_from(properties.subgroup_width.get()).expect("a subgroup's lanes fit u32");
         let float16 = properties.float16.holds();
         let matrix_hardware = properties.matrix.holds() && float16 && subgroup_lanes == SUBGROUP_WIDTH;
+        let maximal_reconvergence = properties.maximal_reconvergence.holds();
         Self {
             subgroup_lanes,
             float16,
@@ -101,7 +111,8 @@ impl FormationTarget {
             rounding_rte_32: properties.rounding_rte_32.holds(),
             denorm_preserve_32: properties.denorm_preserve_32.holds(),
             subgroup_uniform_control_flow: properties.subgroup_uniform_control_flow.holds(),
-            maximal_reconvergence: properties.maximal_reconvergence.holds(),
+            maximal_reconvergence,
+            merge_maximal_reconvergence_returns: maximal_reconvergence && merge_maximal_reconvergence_returns,
         }
     }
 
@@ -112,6 +123,7 @@ impl FormationTarget {
         matches!(self.subgroup_lanes, 32 | 64)
             && (!self.matrix_hardware || (self.float16 && self.subgroup_lanes == SUBGROUP_WIDTH))
             && (!self.matrix || self.matrix_hardware)
+            && (!self.merge_maximal_reconvergence_returns || self.maximal_reconvergence)
     }
 
     /// The target as it enters the formation identity: every field by name
@@ -131,12 +143,14 @@ impl FormationTarget {
             denorm_preserve_32,
             subgroup_uniform_control_flow,
             maximal_reconvergence,
+            merge_maximal_reconvergence_returns,
         } = *self;
         format!(
             "subgroup_lanes={subgroup_lanes};float16={float16};matrix={matrix};matrix_hardware={matrix_hardware};wide_accumulators={wide_accumulators};\
              mixed_dot={mixed_dot};f32_atomic_add={f32_atomic_add};shared_int64_atomics={shared_int64_atomics};\
              rounding_rte_32={rounding_rte_32};denorm_preserve_32={denorm_preserve_32};\
-             subgroup_uniform_control_flow={subgroup_uniform_control_flow};maximal_reconvergence={maximal_reconvergence}"
+             subgroup_uniform_control_flow={subgroup_uniform_control_flow};maximal_reconvergence={maximal_reconvergence};\
+             merge_maximal_reconvergence_returns={merge_maximal_reconvergence_returns}"
         )
     }
 
@@ -148,6 +162,7 @@ impl FormationTarget {
             denorm_preserve_32: self.denorm_preserve_32,
             subgroup_uniform_control_flow: self.subgroup_uniform_control_flow,
             maximal_reconvergence: self.maximal_reconvergence,
+            merge_maximal_reconvergence_returns: self.merge_maximal_reconvergence_returns,
         }
     }
 
@@ -167,6 +182,7 @@ impl FormationTarget {
             denorm_preserve_32,
             subgroup_uniform_control_flow,
             maximal_reconvergence,
+            merge_maximal_reconvergence_returns,
         } = *self;
         let other_lanes = if subgroup_lanes == SUBGROUP_WIDTH {
             2 * SUBGROUP_WIDTH
@@ -220,6 +236,10 @@ impl FormationTarget {
             },
             Self {
                 maximal_reconvergence: !maximal_reconvergence,
+                ..*self
+            },
+            Self {
+                merge_maximal_reconvergence_returns: !merge_maximal_reconvergence_returns,
                 ..*self
             },
         ]
@@ -526,7 +546,8 @@ impl DeviceInfo {
 
     /// The target this device, of `properties`, forms in.
     pub fn formation(&self, properties: &Properties) -> FormationTarget {
-        let target = FormationTarget::of(properties, self.matrix_path);
+        let merge_returns = self.driver_id == vk::DriverId::AMD_PROPRIETARY.as_raw();
+        let target = FormationTarget::of(properties, self.matrix_path, merge_returns);
         assert!(
             target.consistent(),
             "device properties produced an inconsistent formation target: {target:?}"
