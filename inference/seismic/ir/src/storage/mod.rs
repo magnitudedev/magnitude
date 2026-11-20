@@ -11,9 +11,8 @@
 mod layout;
 mod local;
 
-pub use layout::{
-    addressed_span_u64, concrete_storage_units, representation_alignment, valid_concrete_view,
-};
+pub use layout::{addressed_span_u64, concrete_storage_units, valid_concrete_view};
+pub use seismic_lang::registry::representation_alignment;
 pub use local::{
     derive_launch_local_layout, LaunchAbiRequirement, LaunchLocalKind, LaunchLocalLayout,
     LaunchScratchRequirements, LocalAllocation, LocalLayout, ScratchRequirement,
@@ -445,6 +444,30 @@ impl GlobalAllocationTopology {
 // Construction (W4)
 // ---------------------------------------------------------------------------
 
+/// Symbolic per-axis storage units and the byte width of one unit
+/// (the symbolic counterpart of `concrete_storage_units`).
+pub fn symbolic_storage_units(
+    arena: &mut ExprArena,
+    representation: RepresentationId,
+    extents: &[NatExpr],
+) -> (Vec<NatExpr>, NatExpr) {
+    match &registry::representation_info(representation).kind {
+        RepresentationKind::Dense(dtype) => (extents.to_vec(), arena.nat(dtype.bytes() as u64)),
+        RepresentationKind::Packed(layout) => (
+            packed_extents(arena, extents, layout.group),
+            arena.nat(u64::from(layout.packet_size)),
+        ),
+        RepresentationKind::External(layout) if layout.planes.is_some() => {
+            planar_units(arena, layout, extents)
+        }
+        RepresentationKind::External(layout) => (
+            packed_extents(arena, extents, layout.logical_group),
+            arena.nat(u64::from(layout.packet_size)),
+        ),
+        RepresentationKind::PackedRows(_) => panic!("{}", registry::ROW_LAYOUT_IS_NATIVE_ONLY),
+    }
+}
+
 /// Byte size of a dense row-major tensor of `representation` over
 /// `extents`. Packed representations pack along the last axis in groups;
 /// a partial trailing group occupies a whole packet.
@@ -453,42 +476,20 @@ pub fn tensor_bytes(
     representation: RepresentationId,
     extents: &[NatExpr],
 ) -> NatExpr {
-    match &registry::representation_info(representation).kind {
-        RepresentationKind::Dense(dtype) => {
-            let elements = arena.nat_product(extents);
-            let bytes = arena.nat(dtype.bytes() as u64);
-            arena.nat_mul(elements, bytes)
-        }
-        RepresentationKind::Packed(layout) => {
-            let packets = packed_extents(arena, extents, layout.group);
-            let count = arena.nat_product(&packets);
-            let bytes = arena.nat(u64::from(layout.packet_size));
-            arena.nat_mul(count, bytes)
-        }
-        RepresentationKind::External(layout) if layout.planes.is_some() => {
-            let (bytes, units) = planar_units(arena, layout, extents);
-            let count = arena.nat_product(&units);
-            arena.nat_mul(count, bytes)
-        }
-        RepresentationKind::External(layout) => {
-            let packets = packed_extents(arena, extents, layout.logical_group);
-            let count = arena.nat_product(&packets);
-            let bytes = arena.nat(u64::from(layout.packet_size));
-            arena.nat_mul(count, bytes)
-        }
-        RepresentationKind::PackedRows(_) => panic!("{}", registry::ROW_LAYOUT_IS_NATIVE_ONLY),
-    }
+    let (units, unit_bytes) = symbolic_storage_units(arena, representation, extents);
+    let count = arena.nat_product(&units);
+    arena.nat_mul(count, unit_bytes)
 }
 
 /// A source under a companion grid, as storage counts it
-/// (`concrete_storage_units`): a matrix's bytes (its rows' packets' codes,
-/// then its grid of scales) and the units, the leading axes and then the
-/// matrix itself as one.
+/// (`concrete_storage_units`): the units (the leading axes and then the
+/// matrix itself as one) and a matrix's bytes (its rows' packets' codes,
+/// then its grid of scales).
 fn planar_units(
     arena: &mut ExprArena,
     layout: &registry::ExternalPacketLayout,
     extents: &[NatExpr],
-) -> (NatExpr, Vec<NatExpr>) {
+) -> (Vec<NatExpr>, NatExpr) {
     let planes = layout.planes.expect("a planar source has its grid");
     let [leading @ .., rows, columns] = extents else {
         panic!("a planar source is a matrix or a stack of them");
@@ -506,7 +507,7 @@ fn planar_units(
     let one = arena.nat(1);
     let mut units = leading.to_vec();
     units.extend([one, one]);
-    (bytes, units)
+    (units, bytes)
 }
 
 /// Extents in packets: the packing axis (last) is divided into groups.
@@ -519,21 +520,14 @@ fn packed_extents(arena: &mut ExprArena, extents: &[NatExpr], group: u32) -> Vec
     packets
 }
 
-/// Row-major element strides (in packets along the packing axis of a packed
-/// representation).
+/// Row-major storage-unit strides (in packets along the packing axis of a
+/// packed representation, and in matrices for a planar external source).
 pub fn dense_strides(
     arena: &mut ExprArena,
     representation: RepresentationId,
     extents: &[NatExpr],
 ) -> Vec<NatExpr> {
-    let units = match &registry::representation_info(representation).kind {
-        RepresentationKind::Dense(_) => extents.to_vec(),
-        RepresentationKind::Packed(layout) => packed_extents(arena, extents, layout.group),
-        RepresentationKind::External(layout) => {
-            packed_extents(arena, extents, layout.logical_group)
-        }
-        RepresentationKind::PackedRows(_) => panic!("{}", registry::ROW_LAYOUT_IS_NATIVE_ONLY),
-    };
+    let (units, _) = symbolic_storage_units(arena, representation, extents);
     let mut strides = vec![arena.nat(1); units.len()];
     let mut acc = arena.nat(1);
     for axis in (0..units.len()).rev() {
@@ -1320,34 +1314,8 @@ pub fn addressed_bytes(arena: &mut ExprArena, layout: &BufferViewLayout) -> NatE
         layout.strides.len(),
         "closed view rank and stride count differ"
     );
-    let (unit_bytes, logical_extents) =
-        match &registry::representation_info(layout.representation).kind {
-            registry::RepresentationKind::Dense(dtype) => {
-                (arena.nat(dtype.bytes() as u64), layout.extents.clone())
-            }
-            registry::RepresentationKind::Packed(packet) => {
-                let mut extents = layout.extents.clone();
-                if let Some(last) = extents.last_mut() {
-                    let group = arena.nat(u64::from(packet.group));
-                    *last = arena.nat_ceil_div(*last, group);
-                }
-                (arena.nat(u64::from(packet.packet_size)), extents)
-            }
-            registry::RepresentationKind::External(packet) if packet.planes.is_some() => {
-                planar_units(arena, packet, &layout.extents)
-            }
-            registry::RepresentationKind::External(packet) => {
-                let mut extents = layout.extents.clone();
-                if let Some(last) = extents.last_mut() {
-                    let group = arena.nat(u64::from(packet.logical_group));
-                    *last = arena.nat_ceil_div(*last, group);
-                }
-                (arena.nat(u64::from(packet.packet_size)), extents)
-            }
-            registry::RepresentationKind::PackedRows(_) => {
-                panic!("{}", registry::ROW_LAYOUT_IS_NATIVE_ONLY)
-            }
-        };
+    let (logical_extents, unit_bytes) =
+        symbolic_storage_units(arena, layout.representation, &layout.extents);
     let zero = arena.nat(0);
     let one = arena.nat(1);
     let mut span = zero;
@@ -1651,5 +1619,47 @@ mod tests {
         let transposed = parent.view_layout(remap[transpose as usize]);
         assert!(!transposed.contiguous);
         assert_eq!(transposed.strides, vec![one, four]);
+    }
+
+    #[test]
+    fn planar_external_3d_dense_strides_match_tensor_and_addressed_bytes() {
+        let planar: Vec<_> = registry::representations()
+            .iter()
+            .filter(|info| {
+                matches!(&info.kind, RepresentationKind::External(layout) if layout.planes.is_some())
+            })
+            .collect();
+        assert!(
+            !planar.is_empty(),
+            "registry must contain at least one planar external representation"
+        );
+        let mut arena = ExprArena::default();
+        let one = arena.nat(1);
+        let e = arena.nat(4);
+        let r = arena.nat(256);
+        let c = arena.nat(128);
+        let extents = vec![e, r, c];
+        for info in planar {
+            let strides = dense_strides(&mut arena, info.id, &extents);
+            assert_eq!(
+                strides,
+                vec![one, one, one],
+                "{} 3D planar dense_strides must count whole matrices",
+                info.name
+            );
+            let expected = tensor_bytes(&mut arena, info.id, &extents);
+            let mut builder = TopologyBuilder::new(OwnerToken::fresh(), vec![], false);
+            let (_, view) = builder.tensor(
+                &mut arena,
+                GlobalBufferKind::Persistent,
+                info.id,
+                extents.clone(),
+            );
+            let layout = builder.views[view as usize].clone();
+            assert_eq!(layout.strides, vec![one, one, one]);
+            assert_eq!(addressed_bytes(&mut arena, &layout), expected);
+            let canonical = registry::canonical_bytes(info.id, &[4, 256, 128]).unwrap();
+            assert_eq!(expected, arena.nat(canonical));
+        }
     }
 }

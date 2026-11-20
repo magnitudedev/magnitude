@@ -74,16 +74,14 @@ pub fn scalar_comparison_emission_family(ty: &ValueType) -> Option<ScalarEmissio
     }
 }
 
+fn is_integer_value(ty: &ValueType) -> bool {
+    matches!(ty, ValueType::Index) || matches!(ty, ValueType::Scalar(dtype) if dtype.is_int())
+}
+
 pub fn scalar_conversion_emission_family(
     from: &ValueType,
     to: &ValueType,
 ) -> Option<ScalarEmissionFamily> {
-    let integer = |ty: &ValueType| {
-        matches!(
-            ty,
-            ValueType::Scalar(DType::I32 | DType::U32) | ValueType::Index
-        )
-    };
     match (from, to) {
         (ValueType::Scalar(DType::F32), ValueType::Scalar(DType::F16)) => {
             Some(ScalarEmissionFamily::F32ToF16)
@@ -97,10 +95,10 @@ pub fn scalar_conversion_emission_family(
         (ValueType::Scalar(DType::BF16), ValueType::Scalar(DType::F32)) => {
             Some(ScalarEmissionFamily::BF16ToF32)
         }
-        (ValueType::Scalar(DType::F32), destination) if integer(destination) => {
+        (ValueType::Scalar(DType::F32), destination) if is_integer_value(destination) => {
             Some(ScalarEmissionFamily::F32ToInteger)
         }
-        (source, ValueType::Scalar(DType::F32)) if integer(source) => {
+        (source, ValueType::Scalar(DType::F32)) if is_integer_value(source) => {
             Some(ScalarEmissionFamily::IntegerToF32)
         }
         _ if matches!(from, ValueType::Bool | ValueType::Scalar(DType::Bool))
@@ -108,7 +106,9 @@ pub fn scalar_conversion_emission_family(
         {
             Some(ScalarEmissionFamily::NativeControl)
         }
-        _ if integer(from) && integer(to) => Some(ScalarEmissionFamily::NativeIntegerBit),
+        _ if is_integer_value(from) && is_integer_value(to) => {
+            Some(ScalarEmissionFamily::NativeIntegerBit)
+        }
         _ => None,
     }
 }
@@ -118,11 +118,7 @@ pub const fn scalar_control_emission_family() -> ScalarEmissionFamily {
 }
 
 pub fn scalar_integer_bit_emission_family(ty: &ValueType) -> Option<ScalarEmissionFamily> {
-    matches!(
-        ty,
-        ValueType::Scalar(DType::I32 | DType::U32) | ValueType::Index
-    )
-    .then_some(ScalarEmissionFamily::NativeIntegerBit)
+    is_integer_value(ty).then_some(ScalarEmissionFamily::NativeIntegerBit)
 }
 
 fn scalar_native_emission_family(ty: &ValueType) -> Option<ScalarEmissionFamily> {
@@ -167,13 +163,17 @@ mod tests {
         let bf16_ty = ValueType::Scalar(DType::BF16);
         let i32_ty = ValueType::Scalar(DType::I32);
         let u32_ty = ValueType::Scalar(DType::U32);
+        let u64_ty = ValueType::Scalar(DType::U64);
         for (from, to, family) in [
             (&f32_ty, &f16_ty, ScalarEmissionFamily::F32ToF16),
             (&f16_ty, &f32_ty, ScalarEmissionFamily::F16ToF32),
             (&f32_ty, &bf16_ty, ScalarEmissionFamily::F32ToBF16),
             (&bf16_ty, &f32_ty, ScalarEmissionFamily::BF16ToF32),
             (&f32_ty, &i32_ty, ScalarEmissionFamily::F32ToInteger),
+            (&f32_ty, &u64_ty, ScalarEmissionFamily::F32ToInteger),
             (&u32_ty, &f32_ty, ScalarEmissionFamily::IntegerToF32),
+            (&u64_ty, &f32_ty, ScalarEmissionFamily::IntegerToF32),
+            (&u64_ty, &u32_ty, ScalarEmissionFamily::NativeIntegerBit),
         ] {
             assert_eq!(scalar_conversion_emission_family(from, to), Some(family));
         }
@@ -183,6 +183,10 @@ mod tests {
         );
         assert_eq!(
             scalar_integer_bit_emission_family(&u32_ty),
+            Some(ScalarEmissionFamily::NativeIntegerBit)
+        );
+        assert_eq!(
+            scalar_integer_bit_emission_family(&u64_ty),
             Some(ScalarEmissionFamily::NativeIntegerBit)
         );
         assert_eq!(

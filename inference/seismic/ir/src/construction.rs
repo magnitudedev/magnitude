@@ -738,15 +738,13 @@ impl<B: PhysicalDialect> NormalizedConstruction<B> {
                     && instances[id.index() as usize] == 1
             })
             .collect();
-        for candidate in &candidates {
-            assert!(
-                !liveness[candidate.index() as usize].uses().is_empty(),
-                "arena allocation has no structured schedule use"
-            );
-        }
+        let intervals: Vec<_> = candidates
+            .iter()
+            .map(|candidate| schedule_interval(&liveness[candidate.index() as usize]))
+            .collect();
         let mut relations = Vec::new();
         for (right_ordinal, &right) in candidates.iter().enumerate() {
-            for &left in &candidates[..right_ordinal] {
+            for (left_ordinal, &left) in candidates[..right_ordinal].iter().enumerate() {
                 relations.push(AllocationRelation {
                     left,
                     right,
@@ -757,7 +755,9 @@ impl<B: PhysicalDialect> NormalizedConstruction<B> {
                         || published.contains(&right.index())
                         || lifetimes_interfere(
                             &liveness[left.index() as usize],
+                            &intervals[left_ordinal],
                             &liveness[right.index() as usize],
+                            &intervals[right_ordinal],
                         ),
                 });
             }
@@ -1133,19 +1133,41 @@ fn reuse_compatible(
     };
     representations(left_id) == representations(right_id)
 }
-fn lifetimes_interfere(left: &AllocationLiveness, right: &AllocationLiveness) -> bool {
-    if left
+struct ScheduleInterval {
+    min: Vec<u32>,
+    max: Vec<u32>,
+}
+
+fn schedule_interval(liveness: &AllocationLiveness) -> ScheduleInterval {
+    let mut points = liveness.uses().iter().map(schedule_point);
+    let first = points
+        .next()
+        .expect("arena allocation has no structured schedule use");
+    let mut min = first.clone();
+    let mut max = first;
+    for point in points {
+        if point < min {
+            min = point;
+        } else if point > max {
+            max = point;
+        }
+    }
+    ScheduleInterval { min, max }
+}
+
+fn lifetimes_interfere(
+    left: &AllocationLiveness,
+    left_interval: &ScheduleInterval,
+    right: &AllocationLiveness,
+    right_interval: &ScheduleInterval,
+) -> bool {
+    if left_interval.max < right_interval.min || right_interval.max < left_interval.min {
+        return false;
+    }
+    !left
         .uses()
         .iter()
         .all(|a| right.uses().iter().all(|b| mutually_exclusive(a, b)))
-    {
-        return false;
-    }
-    let mut left_points: Vec<_> = left.uses().iter().map(schedule_point).collect();
-    let mut right_points: Vec<_> = right.uses().iter().map(schedule_point).collect();
-    left_points.sort();
-    right_points.sort();
-    !(left_points.last() < right_points.first() || right_points.last() < left_points.first())
 }
 
 fn schedule_point(at: &crate::storage::ScheduleUse) -> Vec<u32> {

@@ -252,11 +252,7 @@ mod tests {
                         fields += 1;
                         let schema = &layout.planes[*plane as usize];
                         assert!(*field < schema.fields);
-                        let dtype = match schema.encoding {
-                            registry::PlaneEncoding::Dense(dtype) => dtype,
-                            _ => DType::U32,
-                        };
-                        assert_eq!(kernel.value_type(*out), ValueType::Scalar(dtype));
+                        assert_eq!(kernel.value_type(*out), ValueType::Scalar(schema.dtype()));
                     }
                     Op::Read { .. } | Op::VectorRead { .. } => {
                         panic!("{} retained an implicit decoder", info.name)
