@@ -376,7 +376,7 @@ projection dense for metal:
 # parameter, tuned; same bits at every value) is the large band's blocks an
 # SM: 2 halves its registers (128 a thread) and declares the int8 GEMM's own
 # layout bound (INT8_LAYOUT, below) as its shared bytes, admitted for the
-# int8 GEMM of single or segmented weights whose bound fits half an SM's
+# int8 GEMM of unpaired (SERVED == 1) weights whose bound fits half an SM's
 # shared memory (HALF_SM_SHARED: 100 KB an SM on sm_86 and sm_89, less 1 KB
 # reserved a block). Its loop stalls with 8 warps an SM: on an RTX 3090 at
 # 512 rows a third stage was no faster, and 2 blocks cut the int8 GEMM of
@@ -490,8 +490,7 @@ projection dense for cuda:
     where (OPERAND == 0 or (INT8 == 0 and PARTED == 0))
     where (INT8 == 0 or (each(W, form(W, INT8) == 1) and agree(W, form(W, S8_ENTRIES)))) for paired | single
     where (INT8 == 0 or (PARTED == 0 and each(W, N == 0 or form(W, INT8) == 1) and agree(W, form(W, S8_ENTRIES)))) for segmented
-    where (BLOCKS == 1 or (INT8 == 1 and INT8_LAYOUT <= HALF_SM_SHARED)) for single | segmented
-    where BLOCKS == 1 for paired
+    where (BLOCKS == 1 or (SERVED == 1 and INT8 == 1 and INT8_LAYOUT <= HALF_SM_SHARED))
     where (STAGING == 0 or PARTED == 0)
     where (RESIDENCY != 2 or each(W, form(W, GEMV_RECORDS) == 0)) for paired | single
     where (G == 1 or (N % 16 == 0 and INT8 == 0 and OPERAND == 0 and each(W, operands(W) == 0))) for single
