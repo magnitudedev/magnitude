@@ -2224,6 +2224,18 @@ impl<'a> Checker<'a> {
             let binding_local = self
                 .value_place(strip_views(&arg))
                 .map(|place| place.local);
+            let record = match &arg.kind {
+                CheckedExprKind::Local(_) => true,
+                CheckedExprKind::Primitive {
+                    id: PrimitiveId::SliceView { indices },
+                    operands,
+                    ..
+                } => operands
+                    .first()
+                    .and_then(|o| o.ty.shaped())
+                    .is_some_and(|shaped| super::ir::whole_record_slots(indices, shaped.rank())),
+                _ => false,
+            };
             let Some(binding_local) = binding_local else {
                 self.error(
                     DiagnosticRule::Ownership,
@@ -2232,7 +2244,7 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             };
-            self.write(binding_local, false, arg.span)?;
+            self.write(binding_local, record, arg.span)?;
         }
 
         // The members that apply at this call: the contract, then every

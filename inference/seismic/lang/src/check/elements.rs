@@ -41,11 +41,19 @@ impl ElementUseSet {
         }
     }
 
-    /// A scalar/elementwise write, `tensor[...]` allocation, or writable
-    /// intrinsic operand of `T` storage (requires `ReadWrite` dense float).
+    /// A same-element sub-record store, `tensor[...]` allocation, or writable
+    /// intrinsic operand of `T` storage (requires `ReadWrite` dense storage).
     pub(crate) fn stored(&mut self, element: &Elem) {
         if let Elem::Param(parameter) = element {
             self.entry(parameter).stored = true;
+        }
+    }
+
+    /// A scalar/elementwise float store of `T` storage (requires `ReadWrite`
+    /// dense float storage: `f32`, `f16`, `bf16`).
+    pub(crate) fn float_stored(&mut self, element: &Elem) {
+        if let Elem::Param(parameter) = element {
+            self.entry(parameter).float_stored = true;
         }
     }
 
@@ -187,6 +195,7 @@ mod tests {
         callee.decoded_read(&own);
         callee.component_read(&own, crate::registry::QuantizedComponent::Code);
         callee.stored(&own);
+        callee.float_stored(&own);
         callee.record_stored(&own);
         callee.partial_copy(&own);
         callee.conversion(&own, crate::checked::ElementTarget::Parameter("U".into()));
@@ -432,6 +441,200 @@ fn call_repack[B, N, K](source: &tensor[B, N, K] E) -> tensor[B, N, K] U:
                 source: gguf_q4_k,
                 target: q2k_rows16,
             })
+        );
+    }
+
+    #[test]
+    fn routed_land_wrapper_chain_admits_packed_resident_targets_and_rejects_external() {
+        use crate::checked::ElementBindingError;
+        use crate::entry::ElementBindings;
+        use crate::registry;
+
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "routed_land_pattern.seismic".into(),
+            text: "\
+fn land_tensor[L, V, S, N, K](from_idx: &tensor[L] i32, to_idx: &tensor[L] i32, source: &tensor[V, N, K] ST, destination: &mut tensor[S, N, K] U):
+    for entry in 0..L:
+        let from = from_idx[entry]
+        let to = to_idx[entry]
+        destination[to, :, :] = repack[U = U](source[from, :, :])
+
+fn land[L, V, S, N, K](from_idx: &tensor[L] i32, to_idx: &tensor[L] i32, source: &tensor[V, N, K] SU, dst: &mut tensor[S, N, K] UU):
+    land_tensor[L = L](from_idx, to_idx, source, dst)
+
+fn routed_land_wrapper[L, V, S, N, K](from_idx: &tensor[L] i32, to_idx: &tensor[L] i32, source: &tensor[V, N, K] SU, dst: &mut tensor[S, N, K] UU):
+    land[L = L](from_idx, to_idx, source, dst)
+"
+            .into(),
+        }]))
+        .unwrap();
+
+        let id = module.entry_named("routed_land_wrapper").unwrap();
+        let domain = &module.entries()[id.index()].element_domain;
+        let uu_uses = domain
+            .parameters()
+            .iter()
+            .find(|p| p.name == "UU")
+            .unwrap()
+            .uses;
+        assert!(uu_uses.record_stored);
+        assert!(!uu_uses.stored);
+        assert!(!uu_uses.float_stored);
+
+        let gguf_q2_k = registry::representation("gguf_q2_k").unwrap();
+        let q2k_rows16 = registry::representation("q2k@rows16").unwrap();
+        let bind = |su, uu| ElementBindings::new().bind("SU", su).bind("UU", uu);
+
+        assert_eq!(domain.admit(&bind(gguf_q2_k, q2k_rows16)), Ok(()));
+        assert!(matches!(
+            domain.admit(&bind(gguf_q2_k, gguf_q2_k)),
+            Err(ElementBindingError::Inadmissible {
+                ref parameter,
+                representation,
+                ..
+            }) if parameter == "UU" && representation == gguf_q2_k
+        ));
+    }
+
+    #[test]
+    fn copy_rows_and_routed_copy_and_scalar_float_writes_admit_exact_domains() {
+        use crate::checked::ElementBindingError;
+        use crate::entry::ElementBindings;
+        use crate::registry;
+        use crate::types::DType;
+
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "store_domains.seismic".into(),
+            text: "\
+fn copy_rows_pattern[N, T, KV, W](rows: &mut tensor[T, KV, W] A, from: &tensor[N] i32, to: &tensor[N] i32):
+    for item in 0..N:
+        parallel for head in 0..KV:
+            rows[to[item], head, :] = rows[from[item], head, :]
+
+fn routed_copy_pattern[S, D, L, N, K](src: &tensor[S, N, K] U, from_idx: &tensor[L] i32, to_idx: &tensor[L] i32, dst: &mut tensor[D, N, K] U):
+    for entry in 0..L:
+        let from = from_idx[entry]
+        let to = to_idx[entry]
+        dst[to, :, :] = src[from, :, :]
+
+fn scalar_float_write[N](x: &tensor[N] f32, out: &mut tensor[N] U):
+    parallel for i in 0..N:
+        out[i] = x[i]
+
+fn whole_var_packed[N, K](src: &tensor[N, K] E, dst: &mut tensor[N, K] U):
+    dst = repack[U = U](src)
+"
+            .into(),
+        }]))
+        .unwrap();
+
+        let dense = registry::dense;
+        let q4k_rows16 = registry::representation("q4k@rows16").unwrap();
+        let gguf_q4_k = registry::representation("gguf_q4_k").unwrap();
+        let q2k_rows16 = registry::representation("q2k@rows16").unwrap();
+        let gguf_q2_k = registry::representation("gguf_q2_k").unwrap();
+
+        // copy_rows: stored = true, float_stored = false -> admits u32/i32/bf16/f32, rejects packed/external.
+        let copy_rows_id = module.entry_named("copy_rows_pattern").unwrap();
+        let copy_rows_domain = &module.entries()[copy_rows_id.index()].element_domain;
+        let a_uses = copy_rows_domain
+            .parameters()
+            .iter()
+            .find(|p| p.name == "A")
+            .unwrap()
+            .uses;
+        assert!(a_uses.stored);
+        assert!(!a_uses.float_stored);
+        for dtype in [DType::U32, DType::I32, DType::BF16, DType::F32] {
+            assert_eq!(
+                copy_rows_domain.admit(&ElementBindings::new().bind("A", dense(dtype))),
+                Ok(())
+            );
+        }
+        for repr in [q4k_rows16, gguf_q4_k] {
+            assert!(matches!(
+                copy_rows_domain.admit(&ElementBindings::new().bind("A", repr)),
+                Err(ElementBindingError::Inadmissible {
+                    ref parameter,
+                    representation,
+                    ..
+                }) if parameter == "A" && representation == repr
+            ));
+        }
+
+        // routed_copy: record_stored = true, stored = false, float_stored = false -> admits bool/q2k@rows16/bf16, rejects external.
+        let routed_copy_id = module.entry_named("routed_copy_pattern").unwrap();
+        let routed_copy_domain = &module.entries()[routed_copy_id.index()].element_domain;
+        let u_uses = routed_copy_domain
+            .parameters()
+            .iter()
+            .find(|p| p.name == "U")
+            .unwrap()
+            .uses;
+        assert!(u_uses.record_stored);
+        assert!(!u_uses.stored);
+        assert!(!u_uses.float_stored);
+        for repr in [dense(DType::Bool), q2k_rows16, dense(DType::BF16)] {
+            assert_eq!(
+                routed_copy_domain.admit(&ElementBindings::new().bind("U", repr)),
+                Ok(())
+            );
+        }
+        assert!(matches!(
+            routed_copy_domain.admit(&ElementBindings::new().bind("U", gguf_q2_k)),
+            Err(ElementBindingError::Inadmissible {
+                ref parameter,
+                representation,
+                ..
+            }) if parameter == "U" && representation == gguf_q2_k
+        ));
+
+        // scalar_float_write: float_stored = true -> admits f32/bf16, rejects u32/i32/bool/q4k@rows16.
+        let scalar_id = module.entry_named("scalar_float_write").unwrap();
+        let scalar_domain = &module.entries()[scalar_id.index()].element_domain;
+        let scalar_u = scalar_domain
+            .parameters()
+            .iter()
+            .find(|p| p.name == "U")
+            .unwrap()
+            .uses;
+        assert!(scalar_u.float_stored);
+        for dtype in [DType::F32, DType::BF16] {
+            assert_eq!(
+                scalar_domain.admit(&ElementBindings::new().bind("U", dense(dtype))),
+                Ok(())
+            );
+        }
+        for repr in [
+            dense(DType::U32),
+            dense(DType::I32),
+            dense(DType::Bool),
+            q4k_rows16,
+        ] {
+            assert!(matches!(
+                scalar_domain.admit(&ElementBindings::new().bind("U", repr)),
+                Err(ElementBindingError::Inadmissible {
+                    ref parameter,
+                    representation,
+                    ..
+                }) if parameter == "U" && representation == repr
+            ));
+        }
+
+        // whole_var_packed: record_stored = true, stored = false -> admits (gguf_q2_k, q2k@rows16).
+        let whole_id = module.entry_named("whole_var_packed").unwrap();
+        let whole_domain = &module.entries()[whole_id.index()].element_domain;
+        let whole_u = whole_domain
+            .parameters()
+            .iter()
+            .find(|p| p.name == "U")
+            .unwrap()
+            .uses;
+        assert!(whole_u.record_stored);
+        assert!(!whole_u.stored);
+        assert_eq!(
+            whole_domain.admit(&ElementBindings::new().bind("E", gguf_q2_k).bind("U", q2k_rows16)),
+            Ok(())
         );
     }
 }

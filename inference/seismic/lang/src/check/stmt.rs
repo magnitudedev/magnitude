@@ -763,6 +763,11 @@ impl<'a> Checker<'a> {
                     )?,
                 };
                 let storage_root = self.write(binding, record, target.span)?;
+                if matches!(selected, ValueType::Scalar(_)) {
+                    if let Some(shaped) = &shaped {
+                        self.elements.float_stored(&shaped.elem);
+                    }
+                }
                 let checked_place = CheckedPlace::Element {
                     root: super::ownership::LocalPlace::root(root),
                     indices,
@@ -802,9 +807,13 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                self.write(root.local, false, span)
+                let record = self.locals[root.local.index()]
+                    .ty
+                    .shaped()
+                    .is_some_and(|shaped| super::ir::whole_records(&[], shaped.rank()));
+                self.write(root.local, record, span)
             }
-            CheckedPlace::Element { root, .. } => {
+            CheckedPlace::Element { root, indices } => {
                 if !self.writable_place(root) {
                     self.error(
                         DiagnosticRule::Ownership,
@@ -813,7 +822,11 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                self.write(root.local, false, span)
+                let record = self.locals[root.local.index()]
+                    .ty
+                    .shaped()
+                    .is_some_and(|shaped| super::ir::whole_records(indices, shaped.rank()));
+                self.write(root.local, record, span)
             }
             CheckedPlace::Tuple(places) => {
                 let mut last = None;

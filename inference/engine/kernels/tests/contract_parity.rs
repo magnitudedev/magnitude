@@ -491,6 +491,114 @@ fn repack_and_elementwise_parity_all_backends() {
 }
 
 #[test]
+fn packed_and_non_float_element_admission_parity() {
+    let gguf_q2_k = Element::named("gguf_q2_k").expect("gguf_q2_k registered");
+    let q2k_rows16 = Element::named("q2k@rows16").expect("q2k@rows16 registered");
+
+    fn assert_admits<E: EntryContract>(
+        label: &str,
+        backends: &[BackendName],
+        elements: &[(&str, Element)],
+        dims: &[(&str, u64)],
+    ) {
+        assert_contract_parity::<E>(label, elements, dims);
+        for &backend in backends {
+            let params = E::contract_default_params(backend, elements, dims).unwrap_or_else(|err| {
+                panic!("{label} ({backend:?}): contract_default_params failed: {err:?}")
+            });
+            assert_eq!(
+                E::contract_admit(backend, elements, dims, &params),
+                Ok(()),
+                "{label} ({backend:?}): contract_admit should succeed"
+            );
+        }
+    }
+
+    let routed_land_elems = [
+        ("SG", gguf_q2_k),
+        ("SU", gguf_q2_k),
+        ("SD", gguf_q2_k),
+        ("UG", q2k_rows16),
+        ("UU", q2k_rows16),
+        ("UD", q2k_rows16),
+    ];
+    let routed_land_dims = [
+        ("M", 1),
+        ("K", 8),
+        ("FW", 64),
+        ("FLIGHT", 4),
+        ("L", 8),
+        ("V", 4),
+        ("GV", 4),
+        ("S", 8),
+        ("GS", 8),
+        ("F", 512),
+        ("H", 256),
+    ];
+    assert_admits::<magnitude_kernels::routed_land::Entry>(
+        "routed_land/q2k",
+        &[BackendName::Cuda, BackendName::Metal],
+        &routed_land_elems,
+        &routed_land_dims,
+    );
+
+    let routed_round_dims = [
+        ("FLIGHT", 4),
+        ("LANES", 16),
+        ("L", 8),
+        ("V", 4),
+        ("GV", 4),
+        ("S", 8),
+        ("GS", 8),
+        ("F", 512),
+        ("H", 256),
+        ("E", 8),
+        ("EL", 64),
+    ];
+    assert_admits::<magnitude_kernels::routed_round::Entry>(
+        "routed_round/q2k",
+        &[BackendName::Cuda, BackendName::Metal],
+        &routed_land_elems,
+        &routed_round_dims,
+    );
+
+    let routed_copy_dims = [("S", 8), ("D", 8), ("L", 4), ("N", 512), ("K", 256)];
+    assert_admits::<magnitude_kernels::routed_copy::Entry>(
+        "routed_copy/bool",
+        &[BackendName::Cuda, BackendName::Metal],
+        &[("U", Element::bool())],
+        &routed_copy_dims,
+    );
+    assert_admits::<magnitude_kernels::routed_copy::Entry>(
+        "routed_copy/q2k_rows16",
+        &[BackendName::Cuda, BackendName::Metal],
+        &[("U", q2k_rows16)],
+        &routed_copy_dims,
+    );
+
+    let copy_rows_dims = [("N", 4), ("T", 64), ("KV", 8), ("W", 128)];
+    assert_admits::<magnitude_kernels::copy_rows::Entry>(
+        "copy_rows/u32",
+        &[BackendName::Cuda, BackendName::Metal, BackendName::Cpu],
+        &[("A", Element::u32())],
+        &copy_rows_dims,
+    );
+    assert_admits::<magnitude_kernels::copy_rows::Entry>(
+        "copy_rows/i32",
+        &[BackendName::Cuda, BackendName::Metal, BackendName::Cpu],
+        &[("A", Element::i32())],
+        &copy_rows_dims,
+    );
+
+    assert_admits::<magnitude_kernels::repack_weight::Entry>(
+        "repack_weight/q2k_rows16",
+        &[BackendName::Cuda, BackendName::Metal, BackendName::Cpu],
+        &[("E", gguf_q2_k), ("U", q2k_rows16)],
+        &[("B", 2), ("N", 512), ("K", 256)],
+    );
+}
+
+#[test]
 fn contract_node_shape_presence_matches_native_implementation_all_entries() {
     use std::collections::BTreeSet;
 

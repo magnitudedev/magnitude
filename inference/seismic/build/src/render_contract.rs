@@ -919,13 +919,14 @@ fn emit_element_binding(out: &mut String, entry: &EntryInfo, indent: &str) {
             component_read,
             integer_code_read,
             stored,
+            float_stored,
             record_stored,
             conversion_source,
             partial_copy,
         } = param.uses;
         let _ = writeln!(
             out,
-            "{indent}seismic::contract::rt::admits_uses(seismic::contract::rt::ElementUses {{ decoded_read: {decoded_read}, component_read: {component_read}, integer_code_read: {integer_code_read}, stored: {stored}, record_stored: {record_stored}, conversion_source: {conversion_source}, partial_copy: {partial_copy} }}, __e_{idx})?;"
+            "{indent}seismic::contract::rt::admits_uses(seismic::contract::rt::ElementUses {{ decoded_read: {decoded_read}, component_read: {component_read}, integer_code_read: {integer_code_read}, stored: {stored}, float_stored: {float_stored}, record_stored: {record_stored}, conversion_source: {conversion_source}, partial_copy: {partial_copy} }}, __e_{idx})?;"
         );
     }
 

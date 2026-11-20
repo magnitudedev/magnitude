@@ -1764,7 +1764,10 @@ fn check_native(
                 continue;
             }
             Some(parameter)
-                if !(parameter.uses.stored || parameter.uses.partial_copy) || converted =>
+                if !(parameter.uses.stored
+                    || parameter.uses.float_stored
+                    || parameter.uses.partial_copy)
+                    || converted =>
             {
                 errors.push((
                     coverage.name.span,

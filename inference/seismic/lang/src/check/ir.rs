@@ -532,6 +532,36 @@ pub(crate) fn whole_records(indices: &[Index], rank: usize) -> bool {
     indices.len() <= rank && (run..rank).all(whole)
 }
 
+/// Exact [`crate::intrinsics::IndexSlot`] mirror of [`whole_records`], for
+/// checked `SliceView` projections passed to `&mut` parameters.
+pub(crate) fn whole_record_slots(indices: &[crate::intrinsics::IndexSlot], rank: usize) -> bool {
+    use crate::intrinsics::IndexSlot;
+    let Some(leading) = rank.checked_sub(2) else {
+        return false;
+    };
+    let whole = |axis: usize| {
+        matches!(
+            indices.get(axis),
+            None | Some(IndexSlot::Full)
+                | Some(IndexSlot::Range {
+                    start: false,
+                    end: false,
+                    ..
+                })
+        )
+    };
+    let points = indices
+        .iter()
+        .take(leading)
+        .take_while(|index| matches!(index, IndexSlot::Point { .. }))
+        .count();
+    let run = match indices.get(points) {
+        Some(IndexSlot::Range { .. }) if points < leading => points + 1,
+        _ => points,
+    };
+    indices.len() <= rank && (run..rank).all(whole)
+}
+
 /// Exact meaning and its dominating source publication are distinct owners.
 /// Mathematical/header quantities need no executable publication; words and
 /// floating/Boolean source values always name their actual occurrence.
