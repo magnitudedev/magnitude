@@ -1,4 +1,4 @@
-"""One run: fixtures and catalog artifacts in, sequential engines serving concurrent
+"""One run: template files and catalog artifacts in, sequential engines serving concurrent
 simulated sessions, evidence and the result record out.
 
 Every launch's evidence is persisted as it is observed. A failed, cancelled or interrupted
@@ -8,8 +8,10 @@ run still writes its summary, report and result record with what it measured.
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -17,8 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
-import magnitude_fixtures
-from magnitude_fixtures import Family, write_set
+from magnitude_fixtures import TemplateFile
 
 from . import record, report
 from .adapters import ADAPTERS
@@ -27,12 +28,13 @@ from .client import Observation, measure
 from .harness import HarnessRenderer, rendered_digest
 from .models import Acquisition, Artifact, Target, file_hash
 from .options import EngineOptions
-from .plan import compile_plan
-from .policy import CONTEXT_ALIGNMENT, LANES
+from .plan import Sized, checked, compile_plan, requested
+from .policy import CONTEXT_ALIGNMENT
 from .requests import Plan, Request
+from .sizing import size
 from .store import RunStore, atomic_json
 
-FIXTURES = "fixtures.jsonl"
+TEMPLATES = "templates"
 BUILD = "build.json"
 
 
@@ -104,15 +106,17 @@ async def execute(
             "block": block,
             "phase": phase,
             "section": request.section,
-            "family": request.family,
+            "template": request.template,
+            "lane": request.lane,
+            "key": request.key,
+            "prompt_sha256": request.prompt_sha256,
             "checkpoint": request.checkpoint,
             "concurrency": request.concurrency,
             "session": request.session,
-            "fixture_id": request.fixture_id,
             "timing_basis": adapter.timing_basis,
             "observation": observation.model_dump(mode="json", exclude_none=True),
         }
-        if request.family == "retrieval":
+        if request.key == "retrieve":
             row["retrieval_total"] = len(request.generation.expected["values"])
         records.append(row)
         store.append("results.jsonl", row)
@@ -224,12 +228,28 @@ async def prepare_artifact(target: Target, store: RunStore) -> Artifact:
     return Artifact.model_validate_json(path.read_text())
 
 
+def kept(store: RunStore, paths: list[Path]) -> tuple[list[tuple[TemplateFile, Path]], list[dict]]:
+    """The run's template files, each kept in the run directory by its digest (the paths the
+    harness renders), with their record entries (``templates`` of the result record)."""
+    directory = store.path / TEMPLATES
+    directory.mkdir(parents=True, exist_ok=True)
+    files, entries = [], []
+    for path in paths:
+        file = TemplateFile.read(path)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        copy = directory / f"{digest[:16]}.json"
+        shutil.copyfile(path, copy)
+        files.append((file, copy))
+        entries.append({"template": file.template, "context": file.context,
+                        "path": str(copy.relative_to(store.path)), "digest": digest})
+    return files, entries
+
+
 async def run(
     store: RunStore,
-    mode: Family,
+    templates: list[Path],
     targets: list[Target],
     sections: tuple[str, ...],
-    contexts: tuple[int, ...],
     acquisition: Acquisition,
     artifacts: Path,
     build: dict,
@@ -238,30 +258,29 @@ async def run(
     progress: Callable[[str], None],
 ) -> dict:
     started_at = record.utc()
-    atomic_json(
-        store.path / "selection.json",
-        {
-            "mode": mode,
-            "targets": [target.model_dump(mode="json") for target in targets],
-            "sections": sections,
-            "contexts": contexts,
-            "engine_options": options.model_dump(mode="json"),
-        },
-    )
     atomic_json(store.path / BUILD, build)
     records: list[dict] = []
     planned = 0
-    fixture_set: dict | None = None
+    entries: list[dict] = []
+    ordered: list[TemplateFile] = []
     status, error = "failed", None
     adapters = {}  # by target id, as each is prepared
     try:
+        files, entries = kept(store, templates)
+        ordered = checked([file for file, _ in files])
+        paths = {file.template: path for file, path in files}
+        atomic_json(
+            store.path / "selection.json",
+            {
+                "templates": [file.template for file in ordered],
+                "targets": [target.model_dump(mode="json") for target in targets],
+                "sections": sections,
+                "engine_options": options.model_dump(mode="json"),
+            },
+        )
         with machine_lock():
-            progress(f"Building {mode} fixtures ({LANES} lanes and a qualification lane)")
-            fixtures = await asyncio.to_thread(magnitude_fixtures.build, mode, count=LANES + 1)
-            fixture_set = {"path": FIXTURES, "digest": write_set(store.path / FIXTURES, fixtures)}
             renderer = HarnessRenderer(
-                options.magnitude.harness, artifacts, store.path / BUILD, fixtures[0],
-                store.path / "logs",
+                options.magnitude.harness, artifacts, store.path / BUILD, store.path / "logs"
             )
             limits = []
             for target in targets:
@@ -276,18 +295,29 @@ async def run(
             # engine's prompts; engines serving another form count with their own renderer.
             rendered = [adapter for adapter in adapters.values() if adapter.host_rendered]
             rendering = None
+            lines: dict[tuple[str, int], dict] = {}
             if rendered:
                 harness = options.magnitude.harness
                 if not harness.is_file() or not os.access(harness, os.X_OK):
                     raise ValueError(f"magnitude-harness is unavailable: {harness}")
                 rendering = {"harness": str(harness), "harness_sha256": file_hash(harness)}
             sizing = "magnitude-harness" if rendered else targets[0].engine
-            progress(f"Sizing fixtures to {contexts} with {sizing}'s rendering")
+            names = ", ".join(file.template for file in ordered)
+            progress(f"Sizing {names} with {sizing}'s rendering")
+            pairs = requested(ordered, sections)
             if rendered:
-                plan = await compile_plan(fixtures, sections, contexts, renderer.lengths)
+                lines = await renderer.render([(file, paths[file.template]) for file in ordered],
+                                              store.path)
+                sized = {(file.template, lane): renderer.sized(file, lane, lines[(file.template, lane)])
+                         for file, lane in pairs}
             else:
                 async with adapters[targets[0].id].counter() as lengths:
-                    plan = await compile_plan(fixtures, sections, contexts, lengths)
+                    conversations = await size(
+                        [(file.sessions[lane], file.context) for file, lane in pairs], lengths
+                    )
+                sized = {(file.template, lane): Sized(conversation, None)
+                         for (file, lane), conversation in zip(pairs, conversations, strict=True)}
+            plan = compile_plan(ordered, sections, sized)
             for request in plan.prepared_requests:
                 store.append("requests.jsonl", request.model_dump(mode="json"))
             blocks = options.schedule.blocks(len(targets))
@@ -295,7 +325,11 @@ async def run(
                 targets[i % len(targets) :] + targets[: i % len(targets)] for i in range(blocks)
             ]
             planned = len(plan.requests) * len(targets) * blocks
-            host_counts = await renderer.prompt_counts(plan, store.path) if rendered else None
+            host_counts = (
+                {request.id: lines[(request.template, request.lane)]["generation_prefix_tokens"]
+                 for request in plan.prepared_requests}
+                if rendered else None
+            )
             counts = []
             for target in targets:
                 adapter = adapters[target.id]
@@ -353,13 +387,14 @@ async def run(
             [json.loads(line) for line in allocation_path.read_text().splitlines()],
             {target: adapter.expert_bank for target, adapter in adapters.items()},
         )
-    summary["mode"] = mode
+    summary["templates"] = [file.template for file in ordered]
+    summary["key"] = ordered[0].sessions[0].key if ordered else None
     summary["path"] = str(store.path)
     host = store.path / "host.json"
     if host.is_file():
         summary["host"] = json.loads(host.read_text())
     store.complete(summary, report.markdown(summary))
-    write_result(store, started_at, build, acquisition, artifacts, fixture_set, records, options,
+    write_result(store, started_at, build, acquisition, artifacts, entries, records, options,
                  any(target.engine == "magnitude" for target in targets), command)
     return summary
 
@@ -411,7 +446,7 @@ def write_result(
     build: dict,
     acquisition: Acquisition,
     artifacts: Path,
-    fixture_set: dict | None,
+    templates: list[dict],
     records: list[dict],
     options: EngineOptions,
     magnitude: bool,
@@ -448,7 +483,7 @@ def write_result(
             "build": build,
             "model": acquisition.model,
             "artifacts": json.loads(artifacts.read_text()),
-            "fixture_set": fixture_set,
+            "templates": templates,
             "rendered_digest": rendered_digest(store.path),
             "host": {},
             "command": command,

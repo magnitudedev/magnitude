@@ -347,29 +347,108 @@ fn a_park_readies_the_reserve_for_the_hints_behind_it() {
     behind.complete().unwrap();
 }
 
-/// A record answered for a parked request is read by the request's
-/// entries after the park: its other miss never takes it, under either
-/// placer, though the reserve unmaps it once it lands. With one record,
-/// the second miss waits.
+/// Every decode step's clock position `c(s)` is final and readable once
+/// `Steps::decoding` returns, before its launch is queued (design §3.1,
+/// §6); reading a step that has left the clock's ring panics as an
+/// invariant violation.
 #[test]
-fn a_parked_requests_answered_record_is_never_taken_by_its_other_miss() {
-    for placer in [Placer::Tier, Placer::Bank] {
-        let harness = lending("answered", EXPERTS, 1, 1, STAGING, DECODE, 1, placer, false);
-        let file = &harness.layers[0].1;
-        let step = harness.step();
-        // A choice's record word, -1 until its landing writes it.
-        let record = |choice: u64| file.load(step.sequence(), 0, record_word(choice));
-        // As serving sets them, before the request: no zero word of a slot
-        // never served reads as a record.
-        for choice in 0..2 {
-            file.store(step.sequence(), 0, record_word(choice), -1);
-        }
-        assert!(harness.ask_at(&step, 0, &[5, 6]));
-        eventually("neither miss was answered", || (0..2).any(|choice| record(choice) != -1));
-        std::thread::sleep(Duration::from_millis(50));
-        let answered = (0..2).map(record).filter(|&record| record != -1).collect::<Vec<_>>();
-        assert_eq!(answered.len(), 1, "{placer:?}: both misses answered with {answered:?}, one record between them");
-        assert_eq!(harness.verdict(0, step.sequence()), None, "{placer:?}: the slot waits for its other miss");
-        step.complete().unwrap();
+fn a_step_is_placed_before_its_launch() {
+    use crate::experts::horizon::{Advance, Time, Tokens};
+
+    let harness = layered("clock-launch", EXPERTS, 4, 1, STAGING);
+    let shared = harness.watcher.shared();
+
+    let first = harness.begun().decoding([row(1000, None)].into_iter(), 0);
+    {
+        let times = shared.time().lock();
+        assert_eq!(times.clock.at(first.sequence()), Tokens::ZERO, "first decode step placed at 0 before launch");
+        assert_eq!(times.clock.through_latest(), Tokens::new(1.0), "through_latest counts the begun step");
     }
+    harness.route_at(&first, 0, &[]);
+    first.complete().unwrap();
+
+    let second = harness.begun().decoding([row(1001, None), row(1002, front_row())].into_iter(), 0);
+    {
+        let times = shared.time().lock();
+        assert_eq!(times.clock.at(second.sequence()), Tokens::new(1.0), "second decode step placed at 1 before launch");
+        assert_eq!(times.clock.through_latest(), Tokens::new(2.0));
+    }
+    harness.route_at(&second, 0, &[]);
+    second.complete().unwrap();
+
+    // Reading a step that has left the clock's ring panics.
+    let small = Time::new(&[vec![1]], 2);
+    {
+        let mut times = small.lock();
+        times.register(1, Advance::Known(Tokens::new(1.0)));
+        times.register(2, Advance::Known(Tokens::new(1.0)));
+        times.register(3, Advance::Known(Tokens::new(1.0)));
+        assert_eq!(times.clock.at(2), Tokens::new(1.0));
+        assert_eq!(times.clock.at(3), Tokens::new(2.0));
+    }
+    let past_ring = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        small.lock().clock.at(1);
+    }));
+    assert!(past_ring.is_err(), "reading a step past the clock's ring must panic");
+}
+
+/// A verify launch that batches a verifying request (with acceptable rows)
+/// beside an exact-row-only request registers only the verifying request as
+/// awaiting a verdict: once that request's verdict arrives, the clock
+/// settles and the next step registers without hanging or panicking. An
+/// off-step verdict while a verify step is pending panics as an invariant
+/// violation.
+#[test]
+fn batched_verify_with_exact_only_request_advances_the_clock() {
+    use crate::experts::horizon::Tokens;
+    use crate::operation::{RequestId, Rows, TokenId};
+    use crate::AheadVerdict;
+
+    let harness = layered("batched-verify", EXPERTS, 4, 1, STAGING);
+    let shared = harness.watcher.shared();
+
+    let req_a = RequestId(1);
+    let req_b = RequestId(2);
+    let verify = harness.begun().decoding(
+        [
+            DecodeRow { position: 10, request: req_a, ahead: None },
+            DecodeRow { position: 11, request: req_a, ahead: Some(AheadOf::new(1, 1, 0)) },
+            DecodeRow { position: 20, request: req_b, ahead: None },
+        ]
+        .into_iter(),
+        0,
+    );
+    let verify_step = verify.sequence();
+    harness.route_at(&verify, 0, &[]);
+    verify.complete().unwrap();
+
+    // Only request A awaits a verdict (`rows > committed_rows`); request B
+    // (exact row only) never calls `decided` or `discarded`.
+    let pass = Rows::Exact { acceptable: vec![TokenId(7)] };
+    shared.decided(verify_step, req_a, &AheadVerdict::new(&pass, &[TokenId(7), TokenId(8)]));
+    assert_eq!(shared.time().lock().clock.through_latest(), Tokens::new(2.0), "1 exact + 1 accepted");
+
+    // The next decode step registers cleanly.
+    let next = harness.begun().decoding([DecodeRow { position: 12, request: req_a, ahead: None }].into_iter(), 0);
+    assert_eq!(shared.time().lock().clock.at(next.sequence()), Tokens::new(2.0));
+    harness.route_at(&next, 0, &[]);
+    next.complete().unwrap();
+
+    // An off-step verdict while a verify step is pending must panic rather
+    // than be silently dropped.
+    let pending = harness.begun().decoding(
+        [
+            DecodeRow { position: 13, request: req_a, ahead: None },
+            DecodeRow { position: 14, request: req_a, ahead: Some(AheadOf::new(1, 1, 0)) },
+        ]
+        .into_iter(),
+        0,
+    );
+    let pending_step = pending.sequence();
+    harness.route_at(&pending, 0, &[]);
+    pending.complete().unwrap();
+    let off_step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        shared.decided(pending_step + 99, req_a, &AheadVerdict::new(&pass, &[TokenId(7), TokenId(8)]));
+    }));
+    assert!(off_step.is_err(), "an off-step verdict while a verify step is pending must panic");
 }

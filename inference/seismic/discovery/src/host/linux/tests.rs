@@ -1,12 +1,13 @@
-use super::super::{Limit, OwnCold, PressureLevel, ProcessLimitKind};
+use super::super::{ColdPages, Limit, PressureLevel, ProcessLimitKind};
 use super::limits::{diagnostics, limits, own_cgroup};
 use super::memory::{host_total, sample};
 use super::*;
+use seismic_topology::ReportedBy;
 use std::time::Duration;
 
 const GB: u64 = 1 << 30;
 
-/// A machine's facts over a fixture tree of its own, removed on drop.
+/// A machine's OS readings over a fixture tree of its own, removed on drop.
 struct Machine(Tree);
 
 impl Machine {
@@ -51,7 +52,12 @@ impl Drop for Machine {
 }
 
 fn cgroup_v2(cgroup: &str, limit_bytes: u64, used_bytes: u64) -> Limit {
-    Limit { kind: ProcessLimitKind::CgroupV2 { cgroup: cgroup.into() }, limit_bytes, used_bytes, reclaimable_bytes: 0 }
+    Limit {
+        kind: ProcessLimitKind::CgroupV2 { cgroup: cgroup.into() },
+        limit_bytes,
+        used_bytes,
+        reclaimable_bytes: 0,
+    }
 }
 
 /// The v1 page counter's maximum as `hierarchical_memory_limit` shows it
@@ -70,7 +76,7 @@ const V1_MOUNTS: &str = "\
 /// 16 GiB with 8 GiB free, as `/proc/meminfo` writes it.
 const MEMINFO: &str = "MemTotal:       16777216 kB\nMemFree:         8388608 kB\n";
 
-// Fallbacks: each fact past its last source is its documented value.
+// Fallbacks: each reading past its last source is its documented value.
 
 /// The floor is the zones' low watermarks summed, in pages.
 #[test]
@@ -104,7 +110,9 @@ fn the_floor_is_the_kernels_formula_where_zoneinfo_is_refused() {
 /// KiB, scale factor 10.
 #[test]
 fn the_floor_takes_the_kernels_defaults_where_the_tunables_are_refused() {
-    let machine = Machine::new("floor-defaults").refuse("/proc/zoneinfo").refuse("/proc/sys/vm");
+    let machine = Machine::new("floor-defaults")
+        .refuse("/proc/zoneinfo")
+        .refuse("/proc/sys/vm");
     machine.file("/proc/meminfo", MEMINFO);
     machine.file("/proc/sys/vm/min_free_kbytes", "67584\n");
     let floor = 16384 * 1024 + 16 * GB * 10 / 10_000;
@@ -112,13 +120,14 @@ fn the_floor_takes_the_kernels_defaults_where_the_tunables_are_refused() {
 }
 
 /// Where `/proc/meminfo` is missing, `MemTotal` and `MemFree` are
-/// `sysinfo`'s.
+/// `sysinfo`'s, tagged with `ReportedBy::LinuxSysinfo`.
 #[test]
 fn total_and_free_are_sysinfos_where_meminfo_is_missing() {
     let mut machine = Machine::new("sysinfo");
     machine.sysinfo = (32 * GB, 20 * GB);
     machine.file("/proc/zoneinfo", "Node 0, zone   Normal\n        low      1\n");
-    assert_eq!(host_total(&*machine).value, 32 * GB);
+    let total = host_total(&*machine);
+    assert_eq!((total.value, total.by), (32 * GB, ReportedBy::LinuxSysinfo));
     let sample = sample(&*machine);
     assert_eq!(sample.total, 32 * GB);
     assert_eq!(sample.supply.free_beyond_target, (20 * GB - 4096) as i64);
@@ -135,18 +144,33 @@ fn clean_cache_cold_and_swap_are_zero_where_meminfo_has_none() {
         sample(&*machine)
     };
     let bare = sample_of(MEMINFO);
-    assert_eq!((bare.supply.clean_cache, bare.cold, bare.supply.cold_reclaimable), (0, 0, 0));
-    let no_dirty = sample_of(&format!("{MEMINFO}Active(file): 100 kB\nInactive(file): 100 kB\nWriteback: 0 kB\nInactive(anon): 50 kB\n"));
-    assert_eq!((no_dirty.supply.clean_cache, no_dirty.cold, no_dirty.supply.cold_reclaimable), (0, 50 * 1024, 0));
-    let whole = sample_of(&format!("{MEMINFO}Active(file): 100 kB\nInactive(file): 100 kB\nDirty: 20 kB\nWriteback: 10 kB\nInactive(anon): 50 kB\nSwapFree: 30 kB\n"));
-    assert_eq!((whole.supply.clean_cache, whole.cold, whole.supply.cold_reclaimable), (170 * 1024, 50 * 1024, 30 * 1024));
+    assert_eq!(
+        (bare.supply.clean_cache, bare.cold.machine, bare.supply.cold_reclaimable),
+        (0, 0, 0)
+    );
+    let no_dirty = sample_of(&format!(
+        "{MEMINFO}Active(file): 100 kB\nInactive(file): 100 kB\nWriteback: 0 kB\nInactive(anon): 50 kB\n"
+    ));
+    assert_eq!(
+        (no_dirty.supply.clean_cache, no_dirty.cold.machine, no_dirty.supply.cold_reclaimable),
+        (0, 50 * 1024, 0)
+    );
+    let whole = sample_of(&format!(
+        "{MEMINFO}Active(file): 100 kB\nInactive(file): 100 kB\nDirty: 20 kB\nWriteback: 10 kB\nInactive(anon): 50 kB\nSwapFree: 30 kB\n"
+    ));
+    assert_eq!(
+        (whole.supply.clean_cache, whole.cold.machine, whole.supply.cold_reclaimable),
+        (170 * 1024, 50 * 1024, 30 * 1024)
+    );
 }
 
 /// With no PSI anywhere there is no pressure level; with the machine's
 /// refused, the cgroup's is it; with both, the higher.
 #[test]
 fn pressure_is_none_without_psi_and_the_cgroups_without_the_machines() {
-    let psi = |some: &str, full: &str| format!("some avg10={some} avg60=0.00 avg300=0.00 total=1\nfull avg10={full} avg60=0.00 avg300=0.00 total=0\n");
+    let psi = |some: &str, full: &str| {
+        format!("some avg10={some} avg60=0.00 avg300=0.00 total=1\nfull avg10={full} avg60=0.00 avg300=0.00 total=0\n")
+    };
     let machine = Machine::in_cgroup("pressure", "0::/app\n", V2_MOUNT);
     machine.file("/proc/meminfo", MEMINFO);
     assert_eq!(sample(&*machine).pressure, None);
@@ -164,12 +188,24 @@ fn pressure_is_none_without_psi_and_the_cgroups_without_the_machines() {
 fn harm_is_none_without_vmstat() {
     let machine = Machine::in_cgroup("no-harm", "0::/app.scope\n", V2_MOUNT);
     machine.file("/proc/meminfo", MEMINFO);
-    machine.file("/sys/fs/cgroup/app.scope/memory.stat", "workingset_refault_anon 5\nworkingset_refault_file 6\n");
-    machine.file("/sys/fs/cgroup/app.scope/cgroup.procs", &format!("{}\n", std::process::id()));
+    machine.file(
+        "/sys/fs/cgroup/app.scope/memory.stat",
+        "workingset_refault_anon 5\nworkingset_refault_file 6\n",
+    );
+    machine.file(
+        "/sys/fs/cgroup/app.scope/cgroup.procs",
+        &format!("{}\n", std::process::id()),
+    );
     machine.file("/sys/fs/cgroup/app.scope/cgroup.stat", "nr_descendants 0\n");
     assert_eq!(sample(&*machine).harm, None);
-    machine.file("/proc/vmstat", "workingset_refault_anon 30\nworkingset_refault_file 40\n");
-    assert_eq!(sample(&*machine).harm, Some(super::super::Harm { machine: 70, own: 11 }));
+    machine.file(
+        "/proc/vmstat",
+        "workingset_refault_anon 30\nworkingset_refault_file 40\n",
+    );
+    assert_eq!(
+        sample(&*machine).harm,
+        Some(super::super::Harm { machine: 70, own: 11 })
+    );
 }
 
 /// Where `vm.stat_interval` is missing it is the kernel's default, 1 s:
@@ -200,7 +236,11 @@ fn no_cgroup_mount_gives_no_limit() {
 /// (no `memory.max`) none.
 #[test]
 fn v2_reports_every_limited_level_up_to_the_root() {
-    let machine = Machine::in_cgroup("v2-levels", "0::/user.slice/user-1.slice/app.scope\n", V2_MOUNT);
+    let machine = Machine::in_cgroup(
+        "v2-levels",
+        "0::/user.slice/user-1.slice/app.scope\n",
+        V2_MOUNT,
+    );
     let level = |path: &str, max: &str, high: &str, current: &str| {
         machine.file(&format!("/sys/fs/cgroup{path}/memory.max"), max);
         machine.file(&format!("/sys/fs/cgroup{path}/memory.high"), high);
@@ -211,7 +251,10 @@ fn v2_reports_every_limited_level_up_to_the_root() {
     level("/user.slice", "8000\n", "max\n", "1200\n");
     assert_eq!(
         limits(&*machine),
-        [cgroup_v2("/user.slice/user-1.slice", 4000, 900), cgroup_v2("/user.slice", 8000, 1200)]
+        [
+            cgroup_v2("/user.slice/user-1.slice", 4000, 900),
+            cgroup_v2("/user.slice", 8000, 1200)
+        ]
     );
 }
 
@@ -238,7 +281,10 @@ fn v1_reads_the_hierarchical_limit_below_the_own_levels() {
     let slice = "/sys/fs/cgroup/memory/system.slice";
     machine.file(&format!("{own}/memory.limit_in_bytes"), &v1_unlimited().to_string());
     machine.file(&format!("{own}/memory.usage_in_bytes"), "1000\n");
-    machine.file(&format!("{own}/memory.stat"), "hierarchical_memory_limit 3000\ntotal_active_file 1\n");
+    machine.file(
+        &format!("{own}/memory.stat"),
+        "hierarchical_memory_limit 3000\ntotal_active_file 1\n",
+    );
     machine.file(&format!("{slice}/memory.limit_in_bytes"), "3000\n");
     machine.file(&format!("{slice}/memory.usage_in_bytes"), "2500\n");
     machine.file(
@@ -248,13 +294,18 @@ fn v1_reads_the_hierarchical_limit_below_the_own_levels() {
     assert_eq!(
         limits(&*machine),
         [Limit {
-            kind: ProcessLimitKind::CgroupV1 { cgroup: "/system.slice".into() },
+            kind: ProcessLimitKind::CgroupV1 {
+                cgroup: "/system.slice".into()
+            },
             limit_bytes: 3000,
             used_bytes: 2500,
             reclaimable_bytes: 450,
         }]
     );
-    machine.file(&format!("{own}/memory.stat"), &format!("hierarchical_memory_limit {}\n", v1_unlimited()));
+    machine.file(
+        &format!("{own}/memory.stat"),
+        &format!("hierarchical_memory_limit {}\n", v1_unlimited()),
+    );
     assert!(limits(&*machine).is_empty(), "no limit up the hierarchy");
 }
 
@@ -272,7 +323,12 @@ fn a_hybrid_container_reads_its_v1_cgroup() {
     machine.file("/sys/fs/cgroup/memory/memory.stat", "hierarchical_memory_limit 4000\n");
     assert_eq!(
         limits(&*machine),
-        [Limit { kind: ProcessLimitKind::CgroupV1 { cgroup: "/".into() }, limit_bytes: 4000, used_bytes: 1500, reclaimable_bytes: 0 }]
+        [Limit {
+            kind: ProcessLimitKind::CgroupV1 { cgroup: "/".into() },
+            limit_bytes: 4000,
+            used_bytes: 1500,
+            reclaimable_bytes: 0,
+        }]
     );
 }
 
@@ -304,7 +360,12 @@ fn rlimit_as_is_a_limit_against_vmsize() {
     machine.file("/proc/self/status", "VmPeak:\t 2097152 kB\nVmSize:\t 1048576 kB\n");
     assert_eq!(
         limits(&*machine),
-        [Limit { kind: ProcessLimitKind::AddressSpace, limit_bytes: 8 * GB, used_bytes: GB, reclaimable_bytes: 0 }]
+        [Limit {
+            kind: ProcessLimitKind::AddressSpace,
+            limit_bytes: 8 * GB,
+            used_bytes: GB,
+            reclaimable_bytes: 0,
+        }]
     );
     machine.address_space_limit = None;
     assert!(limits(&*machine).is_empty());
@@ -376,16 +437,37 @@ fn the_hosts_root_cgroup_is_not_reported() {
 fn a_cgroup_of_this_process_alone_counts_its_own_paging_and_cold_pages() {
     let machine = Machine::in_cgroup("own", "0::/app.scope\n", V2_MOUNT);
     machine.file("/proc/meminfo", MEMINFO);
-    machine.file("/proc/vmstat", "workingset_refault_anon 30\nworkingset_refault_file 40\n");
+    machine.file(
+        "/proc/vmstat",
+        "workingset_refault_anon 30\nworkingset_refault_file 40\n",
+    );
     machine.file("/proc/self/status", "VmSwap:\t     100 kB\n");
-    machine.file("/sys/fs/cgroup/app.scope/memory.stat", "inactive_anon 300\nzswap 70\nworkingset_refault_anon 5\nworkingset_refault_file 6\n");
-    machine.file("/sys/fs/cgroup/app.scope/cgroup.procs", &format!("{}\n", std::process::id()));
-    machine.file("/sys/fs/cgroup/app.scope/cgroup.stat", "nr_descendants 0\nnr_dying_descendants 0\n");
-    assert_eq!(own_cgroup(&*machine), Some(PathBuf::from("/sys/fs/cgroup/app.scope")));
+    machine.file(
+        "/sys/fs/cgroup/app.scope/memory.stat",
+        "inactive_anon 300\nzswap 70\nworkingset_refault_anon 5\nworkingset_refault_file 6\n",
+    );
+    machine.file(
+        "/sys/fs/cgroup/app.scope/cgroup.procs",
+        &format!("{}\n", std::process::id()),
+    );
+    machine.file(
+        "/sys/fs/cgroup/app.scope/cgroup.stat",
+        "nr_descendants 0\nnr_dying_descendants 0\n",
+    );
+    assert_eq!(
+        own_cgroup(&*machine),
+        Some(PathBuf::from("/sys/fs/cgroup/app.scope"))
+    );
     let sample = sample(&*machine);
-    assert_eq!(sample.harm, Some(super::super::Harm { machine: 70, own: 11 }));
-    assert_eq!(sample.own_cold, OwnCold::Bytes(300));
-    assert_eq!(sample.own_reclaimed.map(|own| (own.bytes, own.stored)), Some((100 * 1024, 70)));
+    assert_eq!(
+        sample.harm,
+        Some(super::super::Harm { machine: 70, own: 11 })
+    );
+    assert_eq!(sample.cold, ColdPages { machine: 0, own: Some(300) });
+    assert_eq!(
+        sample.own_reclaimed.map(|own| (own.bytes, own.stored)),
+        Some((100 * 1024, 70))
+    );
 }
 
 /// A cgroup this process shares, by another member or a descendant, or
@@ -397,13 +479,40 @@ fn a_shared_cgroup_is_not_the_processs_own() {
     let own = |name: &str, procs: String, descendants: u32| {
         let machine = Machine::in_cgroup(name, "0::/session-2.scope\n", V2_MOUNT);
         machine.file("/sys/fs/cgroup/session-2.scope/cgroup.procs", &procs);
-        machine.file("/sys/fs/cgroup/session-2.scope/cgroup.stat", &format!("nr_descendants {descendants}\n"));
+        machine.file(
+            "/sys/fs/cgroup/session-2.scope/cgroup.stat",
+            &format!("nr_descendants {descendants}\n"),
+        );
         own_cgroup(&*machine)
     };
     assert!(own("shared-sole", format!("{pid}\n"), 0).is_some());
-    assert_eq!(own("shared-member", format!("{pid}\n1\n"), 0), None, "another process in the cgroup");
-    assert_eq!(own("shared-descendant", format!("{pid}\n"), 1), None, "a descendant's counts in the cgroup's");
+    assert_eq!(
+        own("shared-member", format!("{pid}\n1\n"), 0),
+        None,
+        "another process in the cgroup"
+    );
+    assert_eq!(
+        own("shared-descendant", format!("{pid}\n"), 1),
+        None,
+        "a descendant's counts in the cgroup's"
+    );
     let v1 = Machine::in_cgroup("shared-v1", "4:memory:/svc\n", V1_MOUNTS);
     v1.file("/sys/fs/cgroup/memory/svc/cgroup.procs", &format!("{pid}\n"));
     assert_eq!(own_cgroup(&*v1), None);
+}
+
+/// `cpu_model` reads `/proc/cpuinfo`'s `model name`, falling back to `CPU (<arch>)`.
+#[test]
+fn cpu_model_reads_cpuinfo_or_falls_back() {
+    let machine = Machine::new("cpu-model");
+    assert_eq!(cpu_model(&*machine), format!("CPU ({})", std::env::consts::ARCH));
+    machine.file("/proc/cpuinfo", "processor\t: 0\nmodel name\t: AMD EPYC 7763 64-Core Processor\n");
+    assert_eq!(cpu_model(&*machine), "AMD EPYC 7763 64-Core Processor");
+}
+
+/// `last_level_cache` returns `CacheSize::UNREPORTED` when cacheinfo is absent.
+#[test]
+fn last_level_cache_is_unreported_without_sysfs() {
+    let machine = Machine::new("no-cacheinfo");
+    assert_eq!(last_level_cache(&*machine), CacheSize::UNREPORTED);
 }

@@ -1,14 +1,16 @@
-//! `time`: prefill and decode throughput at context lengths and concurrency,
-//! on fixtures sized to each context, without drafting (the drafter's
-//! acceptance is `draft`'s; served drafting is the serving benchmark's).
+//! `time`: prefill and decode throughput at each template's context and
+//! concurrency, without drafting (the drafter's acceptance is `draft`'s;
+//! served drafting is the serving benchmark's).
 //!
-//! Cells, at each context N and concurrency C:
-//! - `prefill`: C fresh sequences take their fixtures' tokens in prefill
+//! Cells, for each template (its lanes sized to its context N) and
+//! concurrency C, of lanes 0 … C − 1 (a template with fewer lanes fails the
+//! run: a cell never repeats a request):
+//! - `prefill`: C fresh sequences take their lanes' tokens in prefill
 //!   steps of at most `PREFILL_ROWS` rows packed across sequences, as the
 //!   service bounds them; one cold sample, then warm samples (median). With
 //!   `--prefill-attribution`, one further sample runs each launch in its own
 //!   timed unit and decomposes the prefill's device time by entry;
-//! - `decode`: C sequences hold their fixtures' tokens as history, then
+//! - `decode`: C sequences hold their lanes' tokens as history, then
 //!   decode together, each step feeding back its greedy selections: warm
 //!   steps, then measured steps (median).
 //!
@@ -36,10 +38,9 @@
 use crate::rest::{BankRest, Progress, decode_context_rows, steady_window};
 use crate::artifacts::Artifacts;
 use crate::engine::{self, Checkpoint, Engine, EngineOptions, Load, PREFILL_ROWS, Sequence, Step};
-use crate::fixture::FixtureSet;
+use crate::template::TemplateFile;
 use crate::render::{Rendered, Renderer};
 use crate::steps::{self, attribution, device_end, median, medians, summary, window};
-use magnitude_executor::assessment::RequestReads;
 use magnitude_executor::{Demand, Operation, WorkKind};
 use seismic::{SubmissionTrace, TraceDetail, host_seconds};
 use serde_json::{Value, json};
@@ -47,7 +48,6 @@ use serde_json::{Value, json};
 const MS: f64 = 1e3;
 
 pub struct TimeOptions {
-    pub contexts: Vec<usize>,
     pub concurrency: Vec<usize>,
     pub warm: usize,
     pub steps: usize,
@@ -62,6 +62,34 @@ pub struct TimeOptions {
     pub resident_decode: Option<std::path::PathBuf>,
     /// The run counts rather than times: no overlap efficiency is measured.
     pub untimed: bool,
+    /// The decode cells of each context and concurrency, in order, each
+    /// from its own fresh sequences in the one loaded process: so modes
+    /// alternate under the same load, file cache and bank.
+    pub modes: Vec<DecodeMode>,
+    /// Where each decode cell writes the routes its load recorded
+    /// (`routes::write`), in a directory of the cell's context, concurrency
+    /// and mode: its load records them. A diagnostic of one sequence's
+    /// streamed decode.
+    pub routes: Option<std::path::PathBuf>,
+}
+
+/// How a decode cell steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum DecodeMode {
+    /// One row a sequence a step.
+    Plain,
+    /// Two-row passes (`Engine::two_row_step`): a step is one pass, which
+    /// emits its exact row's token.
+    TwoRow,
+}
+
+impl DecodeMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::TwoRow => "two-row",
+        }
+    }
 }
 
 pub struct Timed {
@@ -74,7 +102,7 @@ pub struct Timed {
 
 pub fn run(
     artifacts: &Artifacts,
-    set: &FixtureSet,
+    templates: &[TemplateFile],
     renderer: &Renderer<'_>,
     options: &EngineOptions,
     time: &TimeOptions,
@@ -86,22 +114,46 @@ pub fn run(
     {
         return Err(format!("{}: the resident result does not exist", resident.display()));
     }
-    let mut by_context = Vec::with_capacity(time.contexts.len());
-    for &context in &time.contexts {
-        let rendered = set
-            .fixtures
+    let widest = time.concurrency.iter().copied().max().expect("a run has a concurrency");
+    let mut by_template = Vec::with_capacity(templates.len());
+    for file in templates {
+        if file.sessions.len() < widest {
+            return Err(format!(
+                "{}: {} holds {} lanes; concurrency {widest} needs {widest}",
+                file.path.display(),
+                file.name,
+                file.sessions.len()
+            ));
+        }
+        // Only the lanes a cell decodes are rendered.
+        let file_lanes = &file.sessions[..widest];
+        let rendered = file_lanes
             .iter()
-            .map(|fixture| renderer.render(fixture, Some(context)))
+            .enumerate()
+            .map(|(lane, session)| {
+                renderer
+                    .render_lane(&file.name, lane, session, file.context)
+                    .map_err(|error| format!("{} lane {lane}: {error}", file.name))
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        by_context.push((context, rendered));
+        by_template.push((file.context, rendered));
     }
 
-    let longest = by_context
+    let longest = by_template
         .iter()
-        .flat_map(|(_, rendered)| rendered.iter().map(|fixture| fixture.tokens.len()))
+        .flat_map(|(_, rendered)| rendered.iter().map(|lane| lane.tokens.len()))
         .max()
-        .expect("a fixture set is nonempty");
-    let widest = time.concurrency.iter().copied().max().expect("a run has a concurrency");
+        .expect("a run reads at least one template");
+    let two_row = time.modes.contains(&DecodeMode::TwoRow);
+    if two_row && widest != 1 {
+        return Err("a two-row decode is timed at concurrency 1".into());
+    }
+    // A front pass runs as many front rows as the regime chooses, at most
+    // the decode form's rows past its exact row.
+    let front_rows = match two_row {
+        true => magnitude_kernels::constants::VERIFY_ROWS as usize - 1,
+        false => 0,
+    };
     let assessment = assessment(artifacts, options);
     // The CPU's own lines, as the measurement job stores them (it runs here
     // where they are missing): a streamed decode's bar prices a CPU-computed
@@ -116,14 +168,20 @@ pub fn run(
         artifacts,
         options,
         &Load {
-            method: magnitude_engine::options::ModelMethod::Plain,
+            method: match two_row {
+                true => magnitude_engine::options::ModelMethod::Auto,
+                false => magnitude_engine::options::ModelMethod::Plain,
+            },
             proposals: None,
-            context_tokens: longest + decode_context_rows(time.warm, time.steps, time.attribution_steps),
+            // A front pass's front rows are tokens past its exact row, as
+            // many as the decode form holds beside it.
+            context_tokens: longest + decode_context_rows(time.warm, time.steps, time.attribution_steps) + front_rows,
             // A cell's sequences are held together.
             sequences: std::num::NonZeroUsize::new(widest).expect("a concurrency is positive"),
-            decode_rows: widest,
+            decode_rows: widest + front_rows,
             exported_logits_rows: 0,
             lookahead: time.lookahead,
+            record_routes: time.routes.is_some(),
         },
     )?;
     // The whole load as this process ran it: a load that finds tuning units
@@ -155,15 +213,13 @@ pub fn run(
     };
     let devices = vec![engine.device().info().name().to_owned()];
     let mut speed = Vec::new();
-    for (context, rendered) in &by_context {
+    for (context, rendered) in &by_template {
         for &concurrency in &time.concurrency {
-            let histories = (0..concurrency)
-                .map(|index| &rendered[index % rendered.len()])
-                .collect::<Vec<_>>();
+            let histories = rendered[..concurrency].iter().collect::<Vec<_>>();
             eprintln!("magnitude-harness: prefill context={context} concurrency={concurrency}");
             // The last timed sample's prompt groups, judged once the decode
             // cell has given the run its read line.
-            let (cell, group) = prefill_cell(&mut engine, time, &histories)?;
+            let (cell, mut group) = prefill_cell(&mut engine, time, &histories)?;
             eprintln!(
                 "  {:.1} tok/s",
                 cell["tokens_per_second"].as_f64().unwrap_or(f64::NAN)
@@ -176,57 +232,62 @@ pub fn run(
                 concurrency,
                 &histories,
             ));
-            eprintln!("magnitude-harness: decode context={context} concurrency={concurrency}");
-            let mut cell = decode_cell(&mut engine, time, &histories, peak.as_ref().map(|peak| (artifacts.target.as_path(), peak)))?;
-            eprintln!(
-                "  {:.1} tok/s",
-                cell["tokens_per_second"].as_f64().unwrap_or(f64::NAN)
-            );
-            if !cell["detail"]["experts"].is_null() {
-                // A streamed load reads its experts past the file cache: a
-                // page of its expert stacks the cache holds before its decode
-                // or after served reads from it, and voids them.
-                let pages = &cell["detail"]["expert_pages"];
-                let cached = ["cached_before", "cached_after"]
-                    .map(|moment| pages[moment].as_u64().ok_or("the expert stacks' cached pages"));
-                let [before, after] = cached;
-                cell["cache_served"] = json!(before? + after? > 0);
-                let model = streamed_model(&engine, time, *context, concurrency, &cell);
-                let priced = model.as_ref().ok().map(|&(_, step)| step);
-                cell["model"] = judged(model.map(|(model, _)| model))?;
-                let bar = resident_decode(time, *context, concurrency).and_then(|(_, resident, resident_ms)| {
-                    let link = ceilings.as_ref().and_then(|ceilings| ceilings.link.clone());
-                    let inputs = BarInputs::of(&engine, &machine, &storage, link, options.weight_bound, &resident)?;
-                    streamed_bar(&cell, &resident, resident_ms, concurrency, &inputs, priced)
-                });
-                cell["bar"] = judged(bar)?;
-                let estimate = assessment
-                    .as_ref()
-                    .map_err(Clone::clone)
-                    .and_then(|assessment| estimated(assessment, &engine, *context, concurrency, &cell));
-                cell["estimate"] = judged(estimate)?;
+            for &mode in &time.modes {
+                eprintln!("magnitude-harness: decode context={context} concurrency={concurrency} mode={}", mode.name());
+                let routes = time.routes.as_ref().map(|routes| routes.join(format!("{context}-{concurrency}-{}", mode.name())));
+                let mut cell = decode_cell(&mut engine, time, mode, &histories, routes.as_deref(), peak.as_ref().map(|peak| (artifacts.target.as_path(), peak)))?;
+                cell["mode"] = json!(mode.name());
+                eprintln!(
+                    "  {:.1} tok/s",
+                    cell["tokens_per_second"].as_f64().unwrap_or(f64::NAN)
+                );
+                if !cell["detail"]["experts"].is_null() {
+                    // A streamed load reads its experts past the file cache: a
+                    // page of its expert stacks the cache holds before its decode
+                    // or after served reads from it, and voids them.
+                    let pages = &cell["detail"]["expert_pages"];
+                    let cached = ["cached_before", "cached_after"]
+                        .map(|moment| pages[moment].as_u64().ok_or("the expert stacks' cached pages"));
+                    let [before, after] = cached;
+                    cell["cache_served"] = json!(before? + after? > 0);
+                    let model = streamed_model(&engine, time, *context, concurrency, &cell);
+                    let priced = model.as_ref().ok().map(|&(_, step)| step);
+                    cell["model"] = judged(model.map(|(model, _)| model))?;
+                    let bar = resident_decode(time, *context, concurrency).and_then(|(_, resident, resident_ms)| {
+                        let link = ceilings.as_ref().and_then(|ceilings| ceilings.link.clone());
+                        let inputs = BarInputs::of(&engine, &machine, &storage, link, options.weight_bound, &resident)?;
+                        streamed_bar(&cell, &resident, resident_ms, &inputs, priced)
+                    });
+                    cell["bar"] = judged(bar)?;
+                    let estimate = assessment
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|assessment| estimated(assessment, &engine, *context, concurrency, &cell));
+                    cell["estimate"] = judged(estimate)?;
+                }
+                // The first decode cell gives the run its read line.
+                if let Some(sample) = group.take() {
+                    // What the storage device holds over a read that long.
+                    let read_rate = match &storage {
+                        Some(Ok(storage)) => Ok(crate::bar::ReadRate { peak: storage.peak_bytes_per_second, sustained: storage.sustained_bytes_per_second, burst: storage.burst_bytes }),
+                        Some(Err(reason)) => Err(format!("the storage device's lines: {reason}")),
+                        None => Err("the load streams nothing from storage".to_owned()),
+                    };
+                    let resident_seconds = resident_cell(time, "prefill", *context, concurrency)
+                        .map(|(_, cell)| cell["detail"]["median_ms"].as_f64())
+                        .map_err(|unjudged| match unjudged {
+                            Unjudged::Unavailable(reason) | Unjudged::Failed(reason) => reason,
+                        })
+                        .and_then(|ms| ms.map(|ms| ms / MS).ok_or_else(|| "the resident prefill records no median".to_owned()));
+                    let ceilings = ceilings.as_ref().expect("a load that runs prompt groups streams, and its ceilings are measured");
+                    speed[prefill]["detail"]["group"] = prompt_groups(&sample, read_rate, resident_seconds, ceilings);
+                }
+                speed.push(with_cell(cell, "decode", *context, concurrency, &histories));
             }
-            if let Some(sample) = group {
-                // What the storage device holds over a read that long.
-                let read_rate = match &storage {
-                    Some(Ok(storage)) => Ok(crate::bar::ReadRate { peak: storage.peak_bytes_per_second, sustained: storage.sustained_bytes_per_second, burst: storage.burst_bytes }),
-                    Some(Err(reason)) => Err(format!("the storage device's lines: {reason}")),
-                    None => Err("the load streams nothing from storage".to_owned()),
-                };
-                let resident_seconds = resident_cell(time, "prefill", *context, concurrency)
-                    .map(|(_, cell)| cell["detail"]["median_ms"].as_f64())
-                    .map_err(|unjudged| match unjudged {
-                        Unjudged::Unavailable(reason) | Unjudged::Failed(reason) => reason,
-                    })
-                    .and_then(|ms| ms.map(|ms| ms / MS).ok_or_else(|| "the resident prefill records no median".to_owned()));
-                let ceilings = ceilings.as_ref().expect("a load that runs prompt groups streams, and its ceilings are measured");
-                speed[prefill]["detail"]["group"] = prompt_groups(&sample, read_rate, resident_seconds, ceilings);
-            }
-            speed.push(with_cell(cell, "decode", *context, concurrency, &histories));
         }
     }
     drop(engine);
-    let rendered = by_context
+    let rendered = by_template
         .into_iter()
         .flat_map(|(_, rendered)| rendered)
         .collect::<Vec<_>>();
@@ -285,10 +346,11 @@ fn with_cell(
     cell["phase"] = json!(phase);
     cell["context"] = json!(context);
     cell["concurrency"] = json!(concurrency);
-    cell["fixtures"] = json!(
+    cell["template"] = json!(histories[0].template);
+    cell["prompt_sha256"] = json!(
         histories
             .iter()
-            .map(|history| &history.fixture_id)
+            .map(|history| history.prompt_sha256())
             .collect::<Vec<_>>()
     );
     cell["history_tokens"] = json!(
@@ -420,14 +482,14 @@ impl Ceilings {
     /// The link's ceiling, a byte's seconds: a tier copy on the whole grid
     /// (`TierCopyCosts::link_byte_seconds`), the job's point of copying from
     /// pinned host memory into device memory, measured first where `store`
-    /// holds none ([`measure_requested`]). A route's rate is a kernel's
+    /// holds none ([`magnitude_engine::worker::measure::measure_in_process`]). A route's rate is a kernel's
     /// reading weights, which the link's peak is not.
     fn link(
         charges: &seismic::Charges,
         store: &dyn seismic::measure::RecordStore<seismic::PointKey>,
     ) -> Result<f64, String> {
         use magnitude_executor::assessment::{PointRequest, TierCopyCosts};
-        measure_requested(charges, store, &[PointRequest::TierCopy])?;
+        magnitude_engine::worker::measure::measure_in_process(charges, store, &[PointRequest::TierCopy])?;
         let device = &charges.device();
         let costs = TierCopyCosts::stored(device.topology(), device.info(), store).map_err(|error| error.to_string())?;
         Ok(costs.link_byte_seconds())
@@ -435,7 +497,7 @@ impl Ceilings {
 
     /// Each streamed layer's convert ceiling (`ConvertCosts::of_bank`), its
     /// points measured first where `store` holds none, as the measurement
-    /// job measures requested points ([`measure_requested`]).
+    /// job measures requested points ([`magnitude_engine::worker::measure::measure_in_process`]).
     fn convert(
         charges: &seismic::Charges,
         plan: &magnitude_executor::ExpertBankPlan,
@@ -443,56 +505,9 @@ impl Ceilings {
     ) -> Result<Vec<f64>, String> {
         use magnitude_executor::assessment::{ConvertCosts, PointRequest};
         let requests = ConvertCosts::forms(plan).map(PointRequest::Convert).collect::<Vec<_>>();
-        measure_requested(charges, store, &requests)?;
+        magnitude_engine::worker::measure::measure_in_process(charges, store, &requests)?;
         let device = &charges.device();
         ConvertCosts::of_bank(device.topology(), device.info(), plan, store).map_err(|error| error.to_string())
-    }
-}
-
-/// Measure `requests` (a load's) on the device of `charges`, which its
-/// points allocate through, in this process, as the measurement job
-/// measures them (`assessment::requests::measure`), each job given its
-/// time (`worker::measure::job_time`), into `store`, until no point is
-/// left unbegun: the harness is a tool, which may measure in its own
-/// process. Each job begins a point at least, formed and timed to its
-/// end, so the jobs go on only while each measures something.
-/// Why the walks could not run, or a job measured nothing.
-fn measure_requested(
-    charges: &seismic::Charges,
-    store: &dyn seismic::measure::RecordStore<seismic::PointKey>,
-    requests: &[magnitude_executor::assessment::PointRequest],
-) -> Result<(), String> {
-    use magnitude_executor::assessment::requests;
-    use seismic::measure::Outcome;
-    loop {
-        let mut measurer = seismic::Measurer::new(magnitude_executor::SEARCH_SETTINGS.error_rate, magnitude_executor::MIN_SAMPLE_SECONDS);
-        let deadline = requests::JobDeadlines::new(std::time::Instant::now(), magnitude_engine::worker::measure::job_time());
-        let (mut measured, mut expired) = (false, false);
-        let walked = requests::measure(
-            &mut measurer,
-            charges,
-            store,
-            &magnitude_executor::assessment::Outstanding { standing: Vec::new(), loads: requests.to_vec() },
-            deadline,
-            &mut |_| seismic::measure::Attempt::Proceed,
-            &mut |_, outcome| match outcome {
-                Outcome::Measured(_) | Outcome::Skipped(_) | Outcome::Unformed(_) => measured = true,
-                Outcome::Expired => expired = true,
-                Outcome::Loaded(_) | Outcome::Unmade(_) | Outcome::Failed(_) | Outcome::Store(_) => {}
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        if let Some(error) = walked.ended.into_iter().chain(walked.failures).next() {
-            return Err(error.to_string());
-        }
-        // A point left unrecorded otherwise is the caller's to report, from
-        // what is stored.
-        if !expired {
-            return Ok(());
-        }
-        if !measured {
-            return Err("a measurement job measured nothing: every point it began failed".into());
-        }
     }
 }
 
@@ -778,13 +793,27 @@ fn timeline(timeline: &magnitude_executor::PromptLayerTimeline) -> Value {
 fn decode_cell(
     engine: &mut Engine,
     time: &TimeOptions,
+    mode: DecodeMode,
     histories: &[&Rendered],
+    routes: Option<&std::path::Path>,
     peak: Option<(&std::path::Path, &Result<crate::machine::PeakStream, String>)>,
 ) -> Result<Value, String> {
+    if routes.is_some() && histories.len() != 1 {
+        return Err(format!("routes are recorded of one sequence's decode, not {}", histories.len()));
+    }
     let mut sequences = Vec::with_capacity(histories.len());
     for history in histories {
-        let mut sequence = engine.open_sequence()?;
-        engine.prefill(&mut sequence, &engine::tokens(&history.tokens), true)?;
+        // A two-row cell's sequence chains through the head where the load
+        // fronts, from its prompt on.
+        let prompt = engine::tokens(&history.tokens);
+        let sequence = match mode {
+            DecodeMode::TwoRow => engine.open_two_row_sequence(&prompt)?,
+            DecodeMode::Plain => {
+                let mut sequence = engine.open_sequence()?;
+                engine.prefill(&mut sequence, &prompt, true)?;
+                sequence
+            }
+        };
         sequences.push(sequence);
     }
     let decode = |sequences: &[Sequence]| -> Result<Vec<Operation>, String> {
@@ -807,12 +836,27 @@ fn decode_cell(
     // residuals, which take a queued step's time from its submission).
     let streamed = engine.domain.expert_costs().is_some();
     let pages_before = streamed.then(|| engine.cached_expert_pages()).transpose()?;
-    let mut detail = measure(engine, &mut sequences, time, &decode)?;
+    // A recording load's routes of its decode alone: what its prefills
+    // recorded is dropped.
+    if routes.is_some() {
+        engine.domain.take_routes().expect("a recording load streams its experts, so records its routes");
+    }
+    let (mut detail, selected) = measure(engine, &mut sequences, time, mode, &decode)?;
+    if let Some(directory) = routes {
+        let recorded = engine.domain.take_routes().expect("a recording load records its routes");
+        detail["routes"] = json!({
+            "directory": directory.file_name().map(|name| name.to_string_lossy()),
+            "steps": crate::routes::write(directory, recorded, &histories[0].tokens, &selected)?,
+        });
+    }
     let step_ms = detail["median_ms"].as_f64().expect("a median");
-    let concurrency = sequences.len() as f64;
+    let tokens = window_tokens(&detail)?;
     let samples = window_steps(&detail)?
         .iter()
-        .map(|step| Ok(concurrency / (step["interval_ms"].as_f64().ok_or("a step's interval")? / MS)))
+        .map(|step| {
+            let tokens = step["tokens"].as_f64().ok_or("a step's tokens")?;
+            Ok(tokens / (step["interval_ms"].as_f64().ok_or("a step's interval")? / MS))
+        })
         .collect::<Result<Vec<_>, String>>()?;
     for sequence in sequences {
         engine.close(sequence)?;
@@ -831,10 +875,34 @@ fn decode_cell(
         json!({ "pages": pages, "cached_before": before, "cached_after": after })
     }));
     Ok(json!({
-        "tokens_per_second": concurrency / (step_ms / MS),
+        "tokens_per_second": tokens / (step_ms / MS),
         "samples": samples,
         "detail": detail,
     }))
+}
+
+/// What makes a decode step's operations of its sequences.
+type MakeStep = dyn Fn(&[Sequence]) -> Result<Vec<Operation>, String>;
+
+/// One decode step of `sequences`: the operations `make` makes, or, where
+/// the cell decodes in two rows, one token of its one sequence
+/// ([`Engine::two_row_step`]).
+fn decode_step(
+    engine: &mut Engine,
+    mode: DecodeMode,
+    sequences: &mut [Sequence],
+    make: &MakeStep,
+    trace: Option<&SubmissionTrace>,
+) -> Result<Step, String> {
+    match (mode, sequences) {
+        (DecodeMode::TwoRow, [sequence]) => engine.two_row_step(sequence, trace),
+        (DecodeMode::TwoRow, _) => unreachable!("a two-row run is refused at any concurrency but 1"),
+        (DecodeMode::Plain, sequences) => {
+            let operations = make(sequences)?;
+            let mut refs = sequences.iter_mut().collect::<Vec<_>>();
+            Ok(engine.step(operations, &mut refs, trace)?.0)
+        }
+    }
 }
 
 /// `count` steps made by `make`: the mean seconds a step, each from the
@@ -843,7 +911,7 @@ fn decode_steps(
     engine: &mut Engine,
     sequences: &mut [Sequence],
     count: usize,
-    make: &dyn Fn(&[Sequence]) -> Result<Vec<Operation>, String>,
+    make: &MakeStep,
 ) -> Result<f64, String> {
     let mut ends = Vec::with_capacity(count);
     for _ in 0..count {
@@ -879,7 +947,7 @@ fn overlap(
     engine: &mut Engine,
     histories: &[&Rendered],
     count: usize,
-    make: &dyn Fn(&[Sequence]) -> Result<Vec<Operation>, String>,
+    make: &MakeStep,
     target: &std::path::Path,
     peak: crate::machine::PeakStream,
 ) -> Result<Value, String> {
@@ -927,8 +995,10 @@ fn measure(
     engine: &mut Engine,
     sequences: &mut Vec<Sequence>,
     time: &TimeOptions,
-    make: &dyn Fn(&[Sequence]) -> Result<Vec<Operation>, String>,
-) -> Result<Value, String> {
+    mode: DecodeMode,
+    make: &MakeStep,
+) -> Result<(Value, Vec<u32>), String> {
+    let passes_before = front_passes(engine);
     // Every step's selections, per sequence in order, its digest of the
     // first ones ([`selections_digest`]).
     let selected = std::cell::RefCell::new(Vec::<u8>::new());
@@ -936,12 +1006,10 @@ fn measure(
                sequences: &mut [Sequence],
                trace: &SubmissionTrace|
      -> Result<Step, String> {
-        let operations = make(sequences)?;
-        let mut refs = sequences.iter_mut().collect::<Vec<_>>();
         // Under lookahead the trace is collected once per window: a per-step
         // collect would wait for the step queued behind this one.
         let per_step = (!engine.lookahead).then_some(trace);
-        let (step, _) = engine.step(operations, &mut refs, per_step)?;
+        let step = decode_step(engine, mode, sequences, make, per_step)?;
         selected.borrow_mut().extend(
             sequences
                 .iter()
@@ -954,6 +1022,9 @@ fn measure(
     // What the bank holds as decode begins: where a replay of its routing
     // starts.
     let held = engine.domain.experts_held();
+    // Each group's lend and decode capacity as decode begins: a prompt
+    // group's lend returned leaves none claimed.
+    let lend = engine.domain.expert_lend();
     // The decode as it begins, each sequence at its history: where a
     // discarded attempt's decode begins again.
     let checkpoints = sequences.iter().map(|sequence| engine.checkpoint(sequence)).collect::<Result<Vec<_>, _>>()?;
@@ -1018,7 +1089,13 @@ fn measure(
                 drop(seismic_io::timeline::take());
             }
             for index in 0..time.steps {
+                let position = |sequences: &[Sequence]| sequences.iter().map(|sequence| sequence.position).sum::<usize>();
+                let before = position(decode.sequences);
                 let step = run(decode.engine, decode.sequences, &trace)?;
+                // The tokens the step emitted, every committed row's
+                // successor: a row a sequence, but for a verify pass's,
+                // which emits one past each guess that stood too.
+                let emitted = position(decode.sequences) - before;
                 if let Some(last) = phases.last_mut() {
                     last.next = step.start;
                 }
@@ -1053,6 +1130,7 @@ fn measure(
                 if index > 0 {
                     summary["interval_ms"] = json!((step.end - span.1) * MS);
                 }
+                summary["tokens"] = json!(emitted);
                 // The domain's host timing of the step (`TargetHostTiming`): its
                 // launch to its first commit, the previous selection read to
                 // that commit (none or zero for a step queued before it), and
@@ -1062,6 +1140,17 @@ fn measure(
                     summary["target_finish_ms"] = json!(timing.finish.as_secs_f64() * MS);
                     summary["target_selection_to_commit_ms"] =
                         json!(timing.selection_to_commit.map(|gap| gap.as_secs_f64() * MS));
+                }
+                // A two-row step's form and depth: the guessed rows, front or
+                // verify, its pricing gave its pass (its one sequence's, a
+                // two-row cell's concurrency).
+                if mode == DecodeMode::TwoRow {
+                    let grant = decode.sequences[0].grant;
+                    summary["front_depth"] = json!(grant.depth());
+                    summary["form"] = json!(match grant {
+                        magnitude_executor::FrontGrant::UpTo(_) | magnitude_executor::FrontGrant::Exactly(_) => "front",
+                        magnitude_executor::FrontGrant::Verify(_) => "verify",
+                    });
                 }
                 span.1 = step.end;
                 // The window's end, read together where the process time always
@@ -1121,9 +1210,9 @@ fn measure(
     // how long its reads took; and the window's effective read bandwidth,
     // its missed bytes over the summed time of their reads (none when it
     // read nothing).
-    // Also the window's demand requests, and every request of the served
-    // file the load has timed (its probe at load, then each decode step's):
-    // the sums of the served file's read line (`RequestReads::line`).
+    // Also the window's demand requests, every request of the served file
+    // the load has timed (its probe at load, then each decode step's), and
+    // the drive's line as the load measured it (`ExpertCosts::line`).
     let (experts, read_bytes_per_second, demand_reads, site) = match (experts, engine.domain.expert_costs()) {
         (Some(start), Some(end)) => {
             let reads = end.reads.since(&start.reads);
@@ -1146,24 +1235,115 @@ fn measure(
                         "led": end.led - start.led,
                         "parked_ms": (end.parked - start.parked).as_secs_f64() * MS,
                         "read_ms": (end.read - start.read).as_secs_f64() * MS,
+                        // The window's decode steps by whether its hints ran.
+                        "hints_off": end.hints[0] - start.hints[0],
+                        "hints_on": end.hints[1] - start.hints[1],
                     })
                 })
                 .collect::<Vec<_>>();
-            // The window's hints, judged by their one recall and precision
-            // (`HintCost::recall`, `HintCost::precision`).
+            // The window's hints.
             let window = end.hints.since(&start.hints);
+            let ahead_window = end.ahead.since(&start.ahead);
             let hints = json!({
                 "reads": window.reads,
-                "bytes": window.bytes,
+                "bytes": ahead_window.hints_issued(),
                 "candidates": window.candidates,
                 "named": window.named,
                 "early": window.early,
                 "hintable": window.hintable,
                 "unhintable": window.unhintable,
-                "recall": window.recall(),
-                "precision": window.precision(),
                 "layer_steps": window.layer_steps,
             });
+            let front_window = end.front.since(&start.front);
+            // The window's passes with front rows, their routes' reads, and
+            // their guesses judged and those that stood, by kind.
+            let kinds = |counts: [u64; magnitude_executor::GuessKind::ALL.len()]| {
+                magnitude_executor::GuessKind::ALL
+                    .into_iter()
+                    .map(|kind| (format!("{kind:?}"), json!(counts[kind.index()])))
+                    .collect::<serde_json::Map<_, _>>()
+            };
+            // And by depth: a depth's rows judged only where every
+            // shallower row of their pass stood, so its rate is the stand
+            // a name of that depth is priced by; a depth no row reached is
+            // left out.
+            let depths = front_window
+                .judged_at
+                .iter()
+                .zip(front_window.stood_at)
+                .take_while(|&(&judged, _)| judged > 0)
+                .map(|(&judged, stood)| json!({ "judged": judged, "stood": stood, "rate": stood as f64 / judged as f64 }))
+                .collect::<Vec<_>>();
+            // The regime as the window ends (`FrontRegime`), of one
+            // sequence's pass: what its form and depth are decided on (each
+            // depth's resident compute and the ranking's misses a step at
+            // it, the first front row's stand rate, each verify row's stand
+            // rate given the rows before it stood, the stall a miss held a
+            // plain pass, a verify pass's overhead before the next pass, and
+            // every term besides the GPU's: its seconds a miss and the
+            // seconds of the moves nothing used each depth's rows led), each
+            // depth's priced time a token of a front pass (`T`) and of a
+            // verify pass (`V`, none at a depth the load verifies not), the
+            // depth the latest pass ran, the front depth it wants and the
+            // pass it builds next; none before a pass counted a miss and the
+            // ranking's shadows read a step, or of a whole bank.
+            let ms = |seconds: f64| seconds * MS;
+            let regime = engine
+                .domain
+                .two_row_pricing()
+                .and_then(|pricing| pricing.map(|pricing| pricing.regime(1, 1)).transpose())
+                .map_err(|error| format!("the front regime: {error}"))?
+                .flatten()
+                .map(|front| {
+                    let regime = &front.regime;
+                    let paths = regime
+                        .paths
+                        .iter()
+                        .map(|path| json!({ "miss_ms": ms(path.seconds), "wasted_ms": { "front": path.wasted.front.iter().map(|wasted| wasted.map(ms)).collect::<Vec<_>>(), "verify": path.wasted.verify.iter().map(|wasted| wasted.map(ms)).collect::<Vec<_>>() } }))
+                        .collect::<Vec<_>>();
+                    let verifies = |k: usize| (1..=regime.accepts.len()).contains(&k);
+                    let (form, depth) = match front.pass {
+                        magnitude_cost_model::Form::Front(depth) => ("front", depth),
+                        magnitude_cost_model::Form::Verify(depth) => ("verify", depth),
+                    };
+                    json!({
+                        "running": front.running,
+                        "depth": front.depth,
+                        "form": { "form": form, "depth": depth },
+                        "time_ms": (0..regime.resident.len()).map(|k| ms(regime.time(k))).collect::<Vec<_>>(),
+                        "verify_ms": (0..regime.resident.len()).map(|k| verifies(k).then(|| ms(regime.verify_time(k)))).collect::<Vec<_>>(),
+                        "resident_ms": regime.resident.iter().copied().map(ms).collect::<Vec<_>>(),
+                        "needed": regime.needed.front.iter().copied().map(magnitude_cost_model::Needed::misses).collect::<Vec<_>>(),
+                        "verify_needed": regime.needed.verify.iter().copied().map(magnitude_cost_model::Needed::misses).collect::<Vec<_>>(),
+                        "stand": regime.stand,
+                        "accepts": regime.accepts,
+                        "stall_ms": regime.stall.map(ms),
+                        "overhead_ms": regime.overhead.map(ms),
+                        "paths": paths,
+                    })
+                });
+            // The rate the chain falls, a front pass's first fallen row: the
+            // rate at which a pass rebuilds its chain from the verified token.
+            let falls = front_window.judged_at.iter().zip(front_window.stood_at).map(|(&judged, stood)| judged - stood).sum::<u64>();
+            let front = json!({
+                "passes": front_window.passes,
+                "reads": front_window.reads,
+                "bytes": ahead_window.front_issued(),
+                "judged": kinds(front_window.judged),
+                "stood": kinds(front_window.stood),
+                "depths": depths,
+                "falls_per_pass": (front_window.passes > 0).then(|| falls as f64 / front_window.passes as f64),
+                "regime": regime,
+            });
+            // The window's reads ahead by what they were issued for (a front
+            // row's route, an ahead row's hint, of a guess that stood or
+            // fell; an exact row's hint): the bytes the drive read, those a
+            // later exact row used before they were evicted, and the rest.
+            let ahead = ahead_window
+                .classes()
+                .into_iter()
+                .map(|(class, bytes)| (class.to_string(), json!({ "read": bytes.read, "used": bytes.used, "unused": bytes.unused() })))
+                .collect::<serde_json::Map<_, _>>();
             // The CPU site's serving over the window: the misses it served,
             // the rest of the tier's the device read over the link, and each
             // term of its requests' path, per step and per request.
@@ -1194,7 +1374,10 @@ fn measure(
                 json!({
                     "demand": demand_reads,
                     "served": served_reads,
+                    "line": end.line,
                     "hints": hints,
+                    "front": front,
+                    "ahead": ahead,
                 }),
                 site,
             )
@@ -1217,9 +1400,7 @@ fn measure(
         // steps' launches. Attributed steps are untimed, so each collects
         // its own launches even under lookahead.
         let mut attributed_step = || {
-            let operations = make(sequences)?;
-            let mut refs = sequences.iter_mut().collect::<Vec<_>>();
-            let (step, _) = engine.step(operations, &mut refs, Some(&trace))?;
+            let step = decode_step(engine, mode, sequences, make, Some(&trace))?;
             attributed.extend(step.submissions);
             Ok::<_, String>(step.end)
         };
@@ -1254,13 +1435,30 @@ fn measure(
         }),
         None => Value::Null,
     };
-    Ok(json!({
+    // The passes with front rows the cell ran from its first step through
+    // its last attributed one.
+    let two_row_passes = front_passes(engine) - passes_before;
+    if mode == DecodeMode::TwoRow
+        && two_row_passes == 0
+        && !summaries[1..].iter().any(|summary| summary["front_depth"].as_u64().unwrap_or(0) > 0)
+    {
+        return Err("two-row decode mode executed 0 multi-row passes".into());
+    }
+    let two_row = json!({ "passes": two_row_passes });
+    // Every step's selection of each sequence, in order: a recording
+    // cell's tokens.
+    let selections = selected.borrow().chunks_exact(size_of::<u32>()).map(|token| u32::from_le_bytes(token.try_into().expect("a selection's word"))).collect();
+    Ok((json!({
         "warm_steps": time.warm,
         "lookahead": engine.lookahead,
         "median_ms": median(&mut intervals),
+        // The tokens a step of the window emits, on average.
+        "tokens_per_step": summaries[1..].iter().map(|summary| summary["tokens"].as_u64().expect("each step's tokens")).sum::<u64>() as f64
+            / (summaries.len() - 1) as f64,
         "median_step": medians(&summaries),
         "window": window,
         "selected_sha256": selections_digest(&selected.borrow(), time.warm + time.steps, sequences.len()),
+        "two_row": two_row,
         "experts": experts,
         "read_bytes_per_second": read_bytes_per_second,
         "reads": demand_reads,
@@ -1278,12 +1476,16 @@ fn measure(
             "layer_groups": costs.layer_groups,
             "experts": costs.experts,
             "held": held,
+            // Each group's records a prompt group holds claimed and the
+            // records decode keeps experts in, as decode began and as it
+            // ended.
+            "lend": json!({ "begun": lend, "ended": engine.domain.expert_lend() }),
             "residency": residency,
         })),
         "warm_expert_steps": warm_expert_steps,
         "steps": summaries,
         "attribution": attributed,
-    }))
+    }), selections))
 }
 
 /// The digest of the first `steps` steps' selections of `sequences`
@@ -1384,6 +1586,33 @@ fn expert_step(costs: Option<magnitude_executor::ExpertCosts>, host_slots: Optio
             })
         })
         .collect::<Vec<_>>();
+    // What the drive did for the step: idle, the device parked on demand,
+    // the time reads ahead a parked read found in flight shared the drive
+    // with it, and the reads ahead's bytes issued, read and used since the
+    // step before (the rest of those read wasted).
+    let (issued, ahead) = cost.ahead.total();
+    // Each streamed layer's exact rows' hints for the step, lead by lead:
+    // the candidates named and admitted, the reads they led, used and
+    // wasted, and whether the layer's hint launch ran.
+    let hints = cost
+        .hints
+        .iter()
+        .map(|leads| {
+            leads
+                .iter()
+                .map(|lead| {
+                    json!({
+                        "published": lead.published,
+                        "admitted": lead.admitted,
+                        "read": lead.read,
+                        "used": lead.used,
+                        "wasted": lead.wasted(),
+                        "on": lead.on,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     Ok(Some(json!({
         "sequence": sequence,
         "misses": cost.misses,
@@ -1391,6 +1620,17 @@ fn expert_step(costs: Option<magnitude_executor::ExpertCosts>, host_slots: Optio
         "layers": layers,
         "experts": experts,
         "host_slots": host_slots,
+        "step_ms": cost.seconds * MS,
+        "drive_idle_ms": cost.drive_idle() * MS,
+        "parked_ms": cost.parked.as_secs_f64() * MS,
+        "ahead_stall_ms": cost.ahead_stall() * MS,
+        "ahead_bytes": {
+            "issued": issued,
+            "read": ahead.read,
+            "used": ahead.used,
+            "wasted": ahead.unused(),
+        },
+        "hints": hints,
     })))
 }
 
@@ -1399,9 +1639,9 @@ fn expert_step(costs: Option<magnitude_executor::ExpertCosts>, host_slots: Optio
 /// inputs, each listed with where it came from:
 /// - `C`: the resident load's decode at the same context and concurrency
 ///   (`time.resident_decode`), its window's mean step;
-/// - `D`, `λ`: the read line of the load's own requests of the file
-///   actually served (`RequestReads::line`): its demand reads and what its
-///   volume delivered;
+/// - `D`, `λ`: the drive's read line as the load measured it serving
+///   (`ExpertCosts::line`): its volume's busy rate and its demand reads'
+///   waits beyond it;
 /// - each layer's lines (`ExpertLines`): the load's host lines and the
 ///   GPU's its kernels' costs price, of this executor;
 /// - each step's streamed layers (`LayerStep`), as the watcher counted
@@ -1462,8 +1702,11 @@ fn streamed_model(
     let measured_ms = detail["window"]["wall_ms_per_step"]
         .as_f64()
         .ok_or("the window's mean step")?;
-    let measured = concurrency as f64 / (measured_ms / MS);
-    let predicted = concurrency as f64 / step_seconds;
+    // The model prices the same steps the window ran, so each emits the
+    // window's tokens a step.
+    let tokens = window_tokens(detail)?;
+    let measured = tokens / (measured_ms / MS);
+    let predicted = tokens / step_seconds;
     let model = json!({
         "measured_tok_s": measured,
         "predicted_tok_s": predicted,
@@ -1538,17 +1781,22 @@ fn resident_decode(time: &TimeOptions, context: usize, concurrency: usize) -> Re
     Ok((path, cell, step_ms))
 }
 
-/// The read line of a decode cell's own requests of the file served
-/// (`RequestReads::line`); why it has none.
-fn served_line(detail: &Value) -> Result<magnitude_executor::assessment::ReadLine, Unjudged> {
-    serde_json::from_value::<RequestReads>(detail["reads"]["served"].clone())
-        .map_err(|error| format!("the served file's reads: {error}"))?
-        .line()
-        .map_err(|error| unavailable(format!("the served file's read line: {error}")))
+/// The drive's read line a decode cell's load measured
+/// (`ExpertCosts::line`); why it has none.
+fn served_line(detail: &Value) -> Result<magnitude_cost_model::ReadLine, Unjudged> {
+    serde_json::from_value::<Option<magnitude_cost_model::ReadLine>>(detail["reads"]["line"].clone())
+        .map_err(|error| format!("the served file's read line: {error}"))?
+        .ok_or_else(|| unavailable("the drive's read line is unmeasured".to_string()))
+}
+
+/// The passes with front rows the load's streamed decode has run; none of a
+/// load that streams no experts.
+fn front_passes(engine: &Engine) -> u64 {
+    engine.domain.expert_costs().map_or(0, |costs| costs.front.passes)
 }
 
 /// Each streamed layer's lines the load measured, in decoder order.
-fn expert_lines(engine: &Engine) -> Result<std::sync::Arc<[magnitude_executor::assessment::ExpertLines]>, Unjudged> {
+fn expert_lines(engine: &Engine) -> Result<std::sync::Arc<[magnitude_cost_model::ExpertLines]>, Unjudged> {
     match engine.domain.expert_lines() {
         Some(magnitude_executor::assessment::Priced::Measured(lines)) => {
             let costs = engine.domain.expert_costs().ok_or("a streamed cell's load streams no experts")?;
@@ -1566,6 +1814,14 @@ fn expert_lines(engine: &Engine) -> Result<std::sync::Arc<[magnitude_executor::a
 fn window_steps(detail: &Value) -> Result<&[Value], String> {
     let steps = detail["steps"].as_array().ok_or("measured steps")?;
     steps.get(1..).ok_or_else(|| "a window of no step".into())
+}
+
+/// The tokens a step of a decode cell's window emits, on average: each
+/// step's recorded `tokens`, every committed row's successor over its
+/// sequences, so a verify step counts its guesses that stood beside the
+/// row it emits for each sequence.
+fn window_tokens(detail: &Value) -> Result<f64, String> {
+    detail["tokens_per_step"].as_f64().ok_or_else(|| "the tokens a step emits".into())
 }
 
 /// The window's steps' streamed layers, each step's as the watcher counted
@@ -1651,7 +1907,7 @@ fn routers(cell: &Value, resident: &Value) -> Value {
 /// storage device's ([`crate::machine`]). The bar's record keeps them.
 #[derive(Debug, serde::Serialize)]
 pub struct BarInputs {
-    pub lines: Vec<magnitude_executor::assessment::ExpertLines>,
+    pub lines: Vec<magnitude_cost_model::ExpertLines>,
     pub experts: Option<Vec<(u64, u64)>>,
     pub machine: crate::machine::CpuMachine,
     pub storage: Option<Result<crate::machine::StorageMachine, String>>,
@@ -1704,18 +1960,18 @@ impl BarInputs {
     /// Each streamed layer's lines at machine peak ([`crate::bar::peak_lines`]);
     /// unified memory's, without a host tier, as measured but for its
     /// landing, our own code's. Why a line the bar needs is unmeasured.
-    fn bar_lines(&self) -> Result<Vec<magnitude_executor::assessment::ExpertLines>, String> {
+    fn bar_lines(&self) -> Result<Vec<magnitude_cost_model::ExpertLines>, String> {
         let mut peak = Vec::with_capacity(self.lines.len());
         for (layer, lines) in self.lines.iter().enumerate() {
             if lines.host.memory.is_none() {
-                peak.push(magnitude_executor::assessment::ExpertLines { host: magnitude_executor::assessment::HostLines { landing: None, ..lines.host }, ..*lines });
+                peak.push(magnitude_cost_model::ExpertLines { host: magnitude_cost_model::HostLines { landing: None, ..lines.host }, ..*lines });
                 continue;
             }
             let of = |reason: &str| format!("streamed layer {layer}: {reason}");
             let handshake = lines.host.cpu.ok_or_else(|| of("no handshake: the layer has no CPU site, or its pool's lines are unmeasured"))?.handshake;
             let (bytes, flops) = self.experts.as_ref().ok_or_else(|| of("no expert's bytes and FLOPs: the executor's costs are unmeasured"))?[layer];
             let byte = self.link_ceiling().map_err(|reason| of(&reason))?;
-            let link = magnitude_executor::assessment::Nanoseconds::of(bytes as f64 * byte).map_err(|error| of(&error.to_string()))?;
+            let link = magnitude_cost_model::Nanoseconds::of(bytes as f64 * byte).map_err(|error| of(&error.to_string()))?;
             let unmeasured = |what: &str, reason: &String| of(&format!("the CPU's {what}: {reason}"));
             let rate = self.machine.int8_ops_per_second.as_ref().map_err(|reason| unmeasured("int8 rate", reason))?;
             peak.push(crate::bar::peak_lines(lines, flops as f64 / rate, handshake, link).map_err(|error| of(&error.to_string()))?);
@@ -1734,10 +1990,10 @@ fn overlap_of(resident: &Value) -> Option<f64> {
 /// The storage device's raw read line at its peak `P`: one read of a record
 /// alone (`StorageMachine::first_seconds`, nothing of our read path) less its
 /// bytes at `P` (`λ = t₁ − b/P`).
-fn raw_read(storage: &crate::machine::StorageMachine) -> Result<magnitude_executor::assessment::ReadLine, String> {
+fn raw_read(storage: &crate::machine::StorageMachine) -> Result<magnitude_cost_model::ReadLine, String> {
     let byte_seconds = 1. / storage.peak_bytes_per_second;
     let latency = (storage.first_seconds - storage.bytes as f64 * byte_seconds).max(0.);
-    magnitude_executor::assessment::ReadLine::new(latency, byte_seconds).map_err(|error| error.to_string())
+    magnitude_cost_model::ReadLine::new(latency, byte_seconds).map_err(|error| error.to_string())
 }
 
 /// The storage device's sustained seconds a byte, `1/S`: what it holds once
@@ -1799,7 +2055,6 @@ fn streamed_bar(
     cell: &Value,
     resident: &Value,
     resident_ms: f64,
-    concurrency: usize,
     inputs: &BarInputs,
     model: Option<ModelStep>,
 ) -> Result<Value, Unjudged> {
@@ -1825,9 +2080,9 @@ fn streamed_bar(
     let head = readout_head(resident).map_err(unavailable)?;
     // The frontier's prediction: every route of a token known once it exists,
     // none wasted.
-    let full = magnitude_executor::assessment::ReadAhead { precision: 1., lead: magnitude_executor::assessment::Lead::Token };
+    let full = magnitude_cost_model::ReadAhead { precision: 1., lead: magnitude_cost_model::Lead::Token };
     let priced_ahead = |ahead, read, steps: &[Vec<OracleLayer>]| {
-        let inputs = magnitude_executor::assessment::StepInputs { compute: resident_ms / MS, head, overlap, read, sustained, ahead, lines: &bar_lines };
+        let inputs = magnitude_cost_model::StepInputs { compute: resident_ms / MS, head, overlap, read, sustained, ahead, lines: &bar_lines };
         crate::bar::step(&inputs, steps)
     };
     let priced = |read, steps: &[Vec<OracleLayer>]| priced_ahead(full, read, steps);
@@ -1972,8 +2227,8 @@ fn streamed_bar(
             // Each line by one record's time alone, so no latency fitted
             // under load is charged beside its bytes.
             let record_bytes = inputs.lines[0].host.record_bytes as f64;
-            let per_record = |line: magnitude_executor::assessment::ReadLine| {
-                magnitude_executor::assessment::ReadLine::new(0., (line.latency_seconds() + line.transfer_seconds(record_bytes)) / record_bytes).map_err(|error| unavailable(error.to_string()))
+            let per_record = |line: magnitude_cost_model::ReadLine| {
+                magnitude_cost_model::ReadLine::new(0., (line.latency_seconds() + line.transfer_seconds(record_bytes)) / record_bytes).map_err(|error| unavailable(error.to_string()))
             };
             let at_actual_record = priced(per_record(raw)?, &actual).total;
             let at_served = priced(per_record(read)?, &actual).total;
@@ -1994,15 +2249,17 @@ fn streamed_bar(
             })
         }
     };
-    let tok_s = |ms: f64| concurrency as f64 / (ms / MS);
+    // Every step priced here emits the window's tokens a step.
+    let tokens = window_tokens(detail)?;
+    let tok_s = |ms: f64| tokens / (ms / MS);
     // Each distinct value of a line over the streamed layers, in µs.
-    let distinct_of = |lines: &[magnitude_executor::assessment::ExpertLines], of: fn(&magnitude_executor::assessment::ExpertLines) -> Option<f64>| {
+    let distinct_of = |lines: &[magnitude_cost_model::ExpertLines], of: fn(&magnitude_cost_model::ExpertLines) -> Option<f64>| {
         let mut values = lines.iter().filter_map(of).map(|ns| ns * 1e-3).collect::<Vec<_>>();
         values.sort_by(|a, b| a.partial_cmp(b).expect("a line is a number"));
         values.dedup();
         values
     };
-    let distinct = |of: fn(&magnitude_executor::assessment::ExpertLines) -> Option<f64>| distinct_of(&inputs.lines, of);
+    let distinct = |of: fn(&magnitude_cost_model::ExpertLines) -> Option<f64>| distinct_of(&inputs.lines, of);
     // The tier's wait: the host's notice to acknowledgement of the
     // window's requests, a step.
     let tier_wait_ms = detail["experts"].as_array().map(|layers| {
@@ -2132,7 +2389,7 @@ fn estimated(
     cell: &Value,
 ) -> Result<Value, Unjudged> {
     use magnitude_engine::assessment::{Measurements, Performance, PreparedModelAssessment, streamed_estimate};
-    use magnitude_executor::assessment::{decode_pricing, step_seconds, Priced};
+    use magnitude_executor::assessment::{lookahead, Priced};
     let Assessment {
         structure,
         measurements,
@@ -2166,7 +2423,7 @@ fn estimated(
     let bank = execution.draft().load().expert_bank().filter(|bank| !bank.whole()).ok_or_else(|| unavailable("the plan holds its experts whole"))?;
     let mut by_slots = Vec::new();
     for slots in 1..=costs.experts {
-        let held = magnitude_executor::assessment::HeldSlots { slots, host };
+        let held = magnitude_cost_model::HeldSlots { slots, host };
         let performance = streamed_estimate(machine, figures, execution, bank, &request, held)
             .map_err(|error| error.to_string())?;
         let Performance::Estimated(estimates) = performance else {
@@ -2180,14 +2437,16 @@ fn estimated(
         .find(|&&(slots, _)| slots == own)
         .map(|&(_, tok_s)| tok_s)
         .ok_or("no estimate at the load's slots")?;
-    let measured = MS
+    let measured = window_tokens(&cell["detail"])? / concurrency as f64 * MS
         / cell["detail"]["window"]["wall_ms_per_step"]
             .as_f64()
             .ok_or("the window's mean step")?;
     // The resident step as the estimate prices it: at the request's rows and
     // the context.
-    let pricing = decode_pricing(execution.draft(), machine);
-    let resident = step_seconds(execution.demand(), &pricing, u64::from(request.sequences), context)
+    let census = execution.demand().census();
+    let priced = machine.figures(&[&census]);
+    let pricing = seismic::measure::pricing::Pricing { figures: &priced, lookahead: lookahead(execution.draft()) };
+    let resident = magnitude_cost_model::step_seconds(&census, &pricing, u64::from(request.sequences), context)
         .map_err(|error| error.to_string())?
         .total();
     Ok(json!({

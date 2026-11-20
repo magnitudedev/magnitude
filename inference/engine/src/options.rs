@@ -188,6 +188,11 @@ pub struct ModelPolicy {
     /// a device room bounds only what the device holds, a discrete GPU's host
     /// tier sized by host memory alone (`ExecutionPlanDraft::bank_ceiling`).
     pub weight_bound: Option<magnitude_executor::WeightBound>,
+    /// Record every decode-form step's choices and every row's selection key
+    /// of every expert at each streamed layer, and its front rows' verdicts
+    /// (`ExecutorDomain::take_routes`): a diagnostic, which only a streamed
+    /// load serves; none for serving.
+    pub record_routes: bool,
 }
 
 impl Default for ModelPolicy {
@@ -201,6 +206,7 @@ impl Default for ModelPolicy {
             exported_logits_rows: 0,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         }
     }
 }
@@ -290,6 +296,8 @@ pub struct ResolvedModelPolicy {
     pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
     /// The caller's bound on the load's weights (`ModelPolicy::weight_bound`).
     pub weight_bound: Option<magnitude_executor::WeightBound>,
+    /// Whether the load records its routing (`ModelPolicy::record_routes`).
+    pub record_routes: bool,
 }
 
 impl ResolvedModelPolicy {
@@ -317,7 +325,18 @@ impl ResolvedModelPolicy {
         }
     }
 
-    pub fn factory(&self, artifact_identity: &str) -> Result<Arc<dyn Method>, String> {
+    /// The method a load of this policy serves with, of a load that
+    /// `fronts` where it does (`magnitude_executor::ExecutorDomain::fronts`):
+    /// there its MTP head of its own history drafts nothing, its
+    /// generations decoding in front passes (`Mtp::fronting`), whatever the
+    /// draft policy.
+    pub fn factory(&self, artifact_identity: &str, fronts: bool) -> Result<Arc<dyn Method>, String> {
+        if fronts {
+            let ResolvedMethod::Mtp { history, .. } = self.method else {
+                return Err("a load fronts only through its MTP head".into());
+            };
+            return Ok(Arc::new(mtp(history, artifact_identity, self.method.proposals())?.fronting()?));
+        }
         match (self.method, self.draft_policy) {
             (ResolvedMethod::Mtp { history, .. }, Some(policy)) => {
                 let method = mtp(history, artifact_identity, self.method.proposals())?;
@@ -403,6 +422,7 @@ impl ModelPolicy {
             exported_logits_rows: self.exported_logits_rows,
             numerical_profile: self.numerical_profile.clone(),
             weight_bound: self.weight_bound,
+            record_routes: self.record_routes,
         })
     }
 }
@@ -831,17 +851,17 @@ pub(crate) mod tests {
             }
             .resolve(&model)
             .unwrap()
-            .factory("test")
+            .factory("test", false)
             .unwrap();
             assert!(adaptive.identity().ends_with(":adaptive"));
-            let configured = resolved.factory("test").unwrap();
+            let configured = resolved.factory("test", false).unwrap();
             let default = ModelPolicy {
                 method,
                 ..ModelPolicy::default()
             }
             .resolve(&model)
             .unwrap()
-            .factory("test")
+            .factory("test", false)
             .unwrap();
             assert_ne!(configured.identity(), default.identity());
             let encoded = serde_json::to_vec(&resolved).unwrap();

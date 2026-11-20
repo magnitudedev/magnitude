@@ -14,16 +14,16 @@ def runtimes(inference: Path) -> Path:
     return bench(inference) / "runtimes"
 
 
-MODES = ("prose-repeat", "prose-continue", "prose-shift", "tools", "retrieval")
 ENGINES = ("magnitude", "llama.cpp", "ollama", "ollama-mlx", "ollama-registry", "mlx-vlm", "omlx")
 
-#: Independent sessions a run can offer at once (the concurrency section's widest point).
+#: Independent sessions a run can offer at once (the concurrency section's widest point): a
+#: run's template files hold these lanes and, last, the qualification lane.
 LANES = 8
 #: Sampling seed wherever an engine supports one.
 SEED = 42
 REQUEST_TIMEOUT_SECONDS = 1_800
 STARTUP_TIMEOUT_SECONDS = 900
-#: MLX-VLM prefill step and the most output any fixture family asks for (tools).
+#: MLX-VLM prefill step and the most output any response kind asks for (tools).
 PREFILL_TOKENS = 2048
 SERVER_MAX_OUTPUT_TOKENS = 32_768
 #: Shared capacity alignment accommodates upstream KV allocation granularity.

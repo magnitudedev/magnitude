@@ -22,7 +22,7 @@ use crate::programs::native_target_graph::{PlannedWeights, WeightPort, packed_we
 use crate::{GeneralRoutedShape, ModelLoadPlan, ParallelBinding};
 use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{dense_expand, moe_tail, project_rows};
-use seismic::{Argument, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Argument, Dim, Element, NativeGraph, NativePort, WorkflowTensor};
 
 /// What decides a parallel sublayer's graph beside its numbers: its dense
 /// branch's expansion and its routed branch's topology.
@@ -125,12 +125,14 @@ impl CheckedParallelEntries {
         }
     }
 
-    pub(crate) fn entries(&self) -> ParallelGraphEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> ParallelGraphEntries<'_, G> {
         ParallelGraphEntries {
-            expand: &self.expand,
-            down: &self.down,
+            expand: G::bind_ranged(&self.expand),
+            down: G::bind_ranged(&self.down),
             routed: self.routed.entries(),
-            tail: &self.tail,
+            tail: G::bind(&self.tail),
         }
     }
 }
@@ -154,7 +156,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     rows: &Dim,
     epsilon: Argument<f32>,
     split: Option<Split<'_>>,
-) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
+) -> Result<(WorkflowTensor, Option<crate::operators::routed::streamed::StepInputs>), GraphError> {
     let [dense_scope, routed_scope] = DenseBesideRouted::scopes(sublayer);
     let front = matches!(split, Some(Split::Front(_)));
     let (routed, sequence) = general_routed(

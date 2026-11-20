@@ -91,7 +91,7 @@
       "sources": [
         {
           "repository": "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF",
-          "variants": [{"variantId": "gguf:iq2", "format": "IQ2_S", "path": "Qwen3.8-27B-GSQ-RCO-IQ2_S.gguf", "variantLabel": "IQ2", "quantizationAware": false}, {"variantId": "gguf:iq3-xxs", "format": "IQ3_XXS", "path": "Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf", "variantLabel": "IQ3 XXS", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "IQ3_S", "path": "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf", "variantLabel": "IQ3", "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:iq2", "format": "IQ2_S", "path": "Qwen3.8-27B-GSQ-RCO-IQ2_S.gguf", "variantLabel": "IQ2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "IQ3_S", "path": "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf", "variantLabel": "IQ3", "quantizationAware": false}],
           "projector": { "path": "mmproj-Qwen3.8-27B-BF16.gguf" },
           "license": "apache-2.0"
         },
@@ -133,12 +133,12 @@
       "sources": [
         {
           "repository": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
-          "variants": [{"variantId": "gguf:q2", "format": "Q2_0", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3-xxs", "format": "IQ3_XXS", "variantLabel": "IQ3 XXS", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "IQ3_S", "variantLabel": "IQ3", "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q2", "format": "Q2_0", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "IQ3_S", "variantLabel": "IQ3", "quantizationAware": false}],
           "license": "apache-2.0"
         },
         {
           "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "qwen-community-1.0"
         },
@@ -618,7 +618,7 @@
         },
         {
           "repository": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
-          "variants": [{"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "UD-IQ3_XXS", "variantLabel": "IQ3", "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:iq3", "format": "UD-IQ3_XXS", "variantLabel": "IQ3", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "mit"
         },
@@ -649,7 +649,7 @@
       "sources": [
         {
           "repository": "unsloth/GLM-5.3-Flash-GGUF",
-          "variants": [{"variantId": "gguf:iq2", "format": "UD-IQ2_XXS", "variantLabel": "IQ2", "quantizationAware": false}, {"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "UD-IQ3_XXS", "variantLabel": "IQ3", "quantizationAware": false}, {"variantId": "gguf:q3", "format": "UD-Q3_K_XL", "variantLabel": "Q3", "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:iq2", "format": "UD-IQ2_XXS", "variantLabel": "IQ2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "UD-IQ3_XXS", "variantLabel": "IQ3", "quantizationAware": false}, {"variantId": "gguf:q3", "format": "UD-Q3_K_XL", "variantLabel": "Q3", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "mit"
         },

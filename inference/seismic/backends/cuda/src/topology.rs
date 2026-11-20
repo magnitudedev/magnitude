@@ -3,7 +3,8 @@
 
 use seismic_lang::registry::BackendName;
 use seismic_topology::{
-    CudaMemory, CudaReport, Diagnostic, DiagnosticSource, HostReads, KindMemory, KindReport, Reach,
+    CudaMemory, CudaReport, Diagnostic, DiagnosticSource, HostNode, HostReads, KindMemory,
+    KindReport, PciLocation, Reach,
 };
 
 /// Device memory (`cuMemAlloc`).
@@ -24,9 +25,9 @@ pub fn kinds() -> Vec<KindReport> {
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// Every CUDA device's report, and which of the others each reads directly;
-/// what cannot be read, as `diagnostics`.
-pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<CudaReport> {
+/// Every CUDA device's report, paired with its PCI bus location; what cannot
+/// be read, as `diagnostics`.
+pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<(CudaReport, Option<PciLocation>)> {
     let diagnostic = |message: String| Diagnostic {
         source: DiagnosticSource::Backend(BackendName::Cuda),
         message,
@@ -53,45 +54,41 @@ pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<CudaReport> {
     }
     let mut reports = Vec::new();
     for descriptor in &described {
-        let mut peers = Vec::new();
-        for peer in &described {
-            if peer.ordinal == descriptor.ordinal {
-                continue;
-            }
-            match crate::can_access_peer(descriptor.ordinal, peer.ordinal) {
-                Ok(true) => peers.push(peer.uuid),
-                Ok(false) => {}
-                Err(error) => diagnostics.push(diagnostic(format!(
-                    "peer access of ordinal {} to {}: {error}",
-                    descriptor.ordinal, peer.ordinal
-                ))),
-            }
-        }
         let (ordinal, uuid) = (descriptor.ordinal, descriptor.uuid);
-        reports.push(CudaReport {
-            uuid,
-            luid: descriptor.luid,
-            name: descriptor.name.clone(),
-            driver: format!("cuda driver {}", descriptor.driver_api),
-            admission: descriptor.admission().map_err(|error| error.to_string()),
-            total: descriptor.total_memory_bytes,
-            max_allocation: crate::max_allocation_bytes(descriptor.total_memory_bytes),
-            allocation_granularity: descriptor.allocation_granularity,
-            integrated: descriptor.integrated,
-            l2: (descriptor.l2_cache_bytes > 0).then_some(descriptor.l2_cache_bytes),
-            memory: if descriptor.memory_is_host() {
-                CudaMemory::Host
-            } else {
-                CudaMemory::Own {
-                    usable: usable_at_first_read(uuid, || {
-                        crate::usable_memory_bytes(ordinal, uuid)
-                            .map_err(|error| error.to_string())
-                    }),
+        let [domain, bus, device] = descriptor.pci;
+        let memory = if descriptor.memory_is_host() {
+            CudaMemory::Host
+        } else {
+            let usable = usable_at_first_read(uuid, || {
+                crate::open::usable_memory_report(ordinal, uuid)
+                    .map_err(|error| error.to_string())
+            })
+            .map(|(bytes, warning)| {
+                if let Some(message) = warning {
+                    diagnostics.push(diagnostic(format!("device ordinal {ordinal}: {message}")));
                 }
+                bytes
+            });
+            CudaMemory::Own { usable }
+        };
+        reports.push((
+            CudaReport {
+                uuid,
+                luid: descriptor.luid,
+                name: descriptor.name.clone(),
+                driver: format!("cuda driver {}", descriptor.driver_api),
+                admission: descriptor.admission().map_err(|error| error.to_string()),
+                total: descriptor.total_memory_bytes,
+                max_allocation: crate::max_allocation_bytes(descriptor.total_memory_bytes),
+                allocation_granularity: descriptor.allocation_granularity,
+                integrated: descriptor.integrated,
+                l2: (descriptor.l2_cache_bytes > 0).then_some(descriptor.l2_cache_bytes),
+                host_node: HostNode::Any,
+                memory,
+                kinds: kinds(),
             },
-            peers,
-            kinds: kinds(),
-        });
+            Some(PciLocation { domain, bus, device }),
+        ));
     }
     reports
 }
@@ -104,19 +101,19 @@ pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<CudaReport> {
 /// reading the process's own holdings. A failed read is not kept.
 fn usable_at_first_read(
     uuid: [u8; 16],
-    read: impl FnOnce() -> Result<u64, String>,
-) -> Result<u64, String> {
-    static USABLE: OnceLock<Mutex<HashMap<[u8; 16], u64>>> = OnceLock::new();
+    read: impl FnOnce() -> Result<(u64, Option<String>), String>,
+) -> Result<(u64, Option<String>), String> {
+    static USABLE: OnceLock<Mutex<HashMap<[u8; 16], (u64, Option<String>)>>> = OnceLock::new();
     let mut usable = USABLE
         .get_or_init(Mutex::default)
         .lock()
         .expect("the usable-memory registry lock is never poisoned");
-    if let Some(bytes) = usable.get(&uuid) {
-        return Ok(*bytes);
+    if let Some(entry) = usable.get(&uuid) {
+        return Ok(entry.clone());
     }
-    let bytes = read()?;
-    usable.insert(uuid, bytes);
-    Ok(bytes)
+    let entry = read()?;
+    usable.insert(uuid, entry.clone());
+    Ok(entry)
 }
 
 #[cfg(test)]
@@ -130,14 +127,20 @@ mod tests {
         let uuid = [0xa5; 16];
         let busy = || Err("busy".to_owned());
         assert_eq!(usable_at_first_read(uuid, busy), Err("busy".to_owned()));
-        assert_eq!(usable_at_first_read(uuid, || Ok(6 << 30)), Ok(6 << 30));
-        assert_eq!(usable_at_first_read(uuid, || Ok(1 << 30)), Ok(6 << 30));
+        assert_eq!(
+            usable_at_first_read(uuid, || Ok((6 << 30, None))),
+            Ok((6 << 30, None))
+        );
+        assert_eq!(
+            usable_at_first_read(uuid, || Ok((1 << 30, None))),
+            Ok((6 << 30, None))
+        );
     }
 
     /// The recorded fixtures' CUDA kinds are the ones this backend declares.
     #[test]
     fn the_fixtures_kinds_are_the_backends() {
-        let rtx3090 = seismic_topology::fixtures::rtx3090_cuda(seismic_topology::fixtures::rtx3090_uuid(), Vec::new());
+        let rtx3090 = seismic_topology::fixtures::rtx3090_cuda(seismic_topology::fixtures::rtx3090_uuid());
         assert_eq!(super::kinds(), rtx3090.kinds);
         let gb10 = seismic_topology::fixtures::gb10().cuda.remove(0);
         assert_eq!(super::kinds(), gb10.kinds);

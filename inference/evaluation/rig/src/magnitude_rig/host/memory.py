@@ -40,8 +40,9 @@ streamed, and the same comparison says whether the plan charges everything a
 streamed load holds; the storage the load held is shown beside its plan's,
 term by term: the plan's storage terms beside Seismic's charge at load end in
 each (the engine's `MemoryChargeReconciliation`), with what no term holds.
-With `--residency` the load also reads how many pages of its expert stacks
-the file cache holds once loaded and once it has decoded a fixture (it must hold none);
+With `--residency` the load is at a template's context plus the tokens it decodes after it
+(lane 0 of the template file, which the harness renders), and also reads how many pages of
+its expert stacks the file cache holds once loaded and once decoded (it must hold none);
 with `--pressure-store STORE` too, another process takes what that store gives past the
 guarantee the load's ledger keeps free there over the middle half of that decode, and the
 owner's resizes and releases are reported in order with the decode's tokens against the same
@@ -50,7 +51,7 @@ reading and term that caused it, and each shrink returning memory to the OS.
 
   python3 memory.py --bin DIR --backend cuda|vulkan|metal|cpu --memory dedicated|unified \\
       --scratch DIR [--weight-cap BYTES] [--context TOKENS] \\
-      [--residency HARNESS FIXTURES TOKENS [--pressure-store host|device]] \\
+      [--residency TEMPLATE TOKENS [--pressure-store host|device]] \\
       [--artifacts ACQUISITION.json] [TARGET.gguf[,PROJECTOR.gguf[,DRAFT.gguf]] ...]
 
 DIR holds magnitude-engine and magnitude-assess (an unpacked engine
@@ -718,11 +719,10 @@ def parser() -> argparse.ArgumentParser:
                              "costs price the bank's growth)")
     parser.add_argument("--context", type=int, metavar="TOKENS",
                         help="load at this context; dedicated memory requires --pressure-store")
-    parser.add_argument("--residency", nargs=3, metavar=("HARNESS", "FIXTURES", "TOKENS"),
-                        help="under --weight-cap: read the expert pages and drive the requested decode; "
-                             "stacks the file cache holds once loaded and once the load has decoded "
-                             "TOKENS tokens of the first of FIXTURES (rendered by the harness "
-                             "executable HARNESS)")
+    parser.add_argument("--residency", nargs=2, metavar=("TEMPLATE", "TOKENS"),
+                        help="under --weight-cap: load at the context of the template file TEMPLATE plus TOKENS, "
+                             "decode TOKENS tokens after its lane 0, and read the pages of the expert stacks the "
+                             "file cache holds once loaded and once decoded")
     parser.add_argument("--pressure-store", choices=("host", "device"),
                         help="under --residency: another process takes what this physical store gives past the "
                              "guarantee the load's ledger keeps free there, from a quarter of the decode to three "
@@ -749,8 +749,10 @@ def refusal(options) -> str | None:
         return "a measurement takes --bin, --backend, --memory and --scratch"
     if (options.weight_cap or options.context) and options.memory == "dedicated" and not options.pressure_store:
         return "--weight-cap and --context measure a unified-memory load"
-    if options.residency and not (options.weight_cap and options.context and options.artifacts):
-        return "--residency reads a streamed load's experts: it takes --weight-cap, --context and --artifacts"
+    if options.residency and not options.weight_cap:
+        return "--residency reads a streamed load's experts: it takes --weight-cap"
+    if options.residency and options.context:
+        return "--residency loads at its template's context plus the tokens it decodes: it takes no --context"
     if not (options.models or options.artifacts):
         return "give models or --artifacts"
     return None
@@ -776,7 +778,7 @@ def main():
 
 def host_costs(options, models, scratch):
     """Each model's target loaded plain: its own memory at load end against its charge. A load, a
-    rendering or a resident decode that failed fails the measurement once every model is reported:
+    or a resident decode that failed fails the measurement once every model is reported:
     what it would have tested is untested. So does every check that failed: expert pages in the
     file cache, and the forced-pressure gate (`report_pressure`)."""
     results, failed, failures = [], [], []
@@ -788,18 +790,9 @@ def host_costs(options, models, scratch):
         log = scratch / f"{index}-{name}.log"
         decode = ()
         if options.residency:
-            harness, fixtures, tokens = options.residency
-            # The prompt leaves room in the context for the tokens decoded after it.
-            render = subprocess.run([harness, "render", "--artifacts", options.artifacts, "--fixtures", fixtures,
-                                     "--context", str(options.context - int(tokens)),
-                                     "--output", str(scratch / f"{index}-render")],
-                                    capture_output=True, text=True, check=False)  # a failure is reported below
-            if render.returncode != 0:
-                log.write_text(render.stderr)
-                print(f"{name}: rendering the fixtures failed (exit {render.returncode}); see {log}", file=sys.stderr)
-                failed.append(name)
-                continue
-            decode = ("--decode", str(scratch / f"{index}-render" / "rendered.jsonl"), "--decode-tokens", tokens)
+            template, tokens = options.residency
+            # The harness renders the template's lane 0 and loads at its context plus the tokens.
+            decode = ("--template", template, "--decode-tokens", tokens)
         # The pressured decode is held to the resident one's tokens, so it approves no CPU site: a
         # site's admitted arithmetic differs from the device's within the precision system, and a
         # shrink moves misses to it. The site's arithmetic is judged by its own instrument (kl).
@@ -847,10 +840,10 @@ def host_costs(options, models, scratch):
             # The same decode resident, after the streamed load, so its cached reads never serve the
             # streamed one: from the prompt the pressured decode was sized to, as many tokens as it
             # decoded, the tokens it must equal.
-            same = ("--decode", decode[1], "--decode-tokens", str(len(charge["decoded_tokens"])),
+            same = ("--template", decode[1], "--decode-tokens", str(len(charge["decoded_tokens"])),
                     "--decode-prompt-tokens", str(charge["decode_prompt_tokens"]))
             resident = subprocess.run([exe(options.bin, "magnitude-harness"), "memory", "--device", options.backend,
-                                       *context, *same, *kernels, target],
+                                       *same, *kernels, target],
                                       capture_output=True, text=True, check=False)  # a failure is reported below
             (scratch / f"{index}-{name}-resident.log").write_text(resident.stderr)
             if resident.returncode != 0:

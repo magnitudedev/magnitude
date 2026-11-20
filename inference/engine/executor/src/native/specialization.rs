@@ -675,13 +675,14 @@ fn unit_of<T: EntryTuning>(
 mod tests {
     use super::*;
     use magnitude_kernels::{
-        routed_output, routed_route_shared, routed_route_streamed, routed_select,
+        routed_down, routed_down_project, routed_gate_up, routed_gate_up_part, routed_output,
+        routed_output_project, routed_route_shared, routed_route_streamed, routed_select,
         routed_select_streamed,
     };
     use seismic::BackendName;
 
-    /// A streamed layer's route and selection follow their resident entry:
-    /// on every backend that declares both, a dependant is fixed at
+    /// A streamed layer's route, selection, gate/up passes and sited
+    /// projections follow their resident entry: on every backend that declares both, a dependant is fixed at
     /// exactly its arithmetic parameters, each at the resident choice's
     /// value, which the resident declares arithmetic over the same values;
     /// each other parameter, its launch shape, is left to its search with
@@ -737,6 +738,9 @@ mod tests {
         for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
             follows::<routed_route_shared::Entry, routed_route_streamed::Entry>(backend);
             follows::<routed_select::Entry, routed_select_streamed::Entry>(backend);
+            follows::<routed_gate_up::Entry, routed_gate_up_part::Entry>(backend);
+            follows::<routed_output::Entry, routed_output_project::Entry>(backend);
+            follows::<routed_down::Entry, routed_down_project::Entry>(backend);
         }
     }
 

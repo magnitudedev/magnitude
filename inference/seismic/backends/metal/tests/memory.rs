@@ -24,7 +24,7 @@ fn opened() -> (MetalDevice, MetalToolchain) {
         std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam)),
     ).unwrap();
     let description = seismic_metal::profile::open_device(&device, &seismic_native_target::MemoryStore::default()).unwrap();
-    let toolchain = MetalToolchain::new(device.clone(), description.facts());
+    let toolchain = MetalToolchain::new(device.clone(), description.device_info());
     (device, toolchain)
 }
 

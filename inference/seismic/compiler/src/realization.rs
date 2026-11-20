@@ -238,7 +238,7 @@ pub(crate) mod demand_driven_tests {
         }
 
         const NAME: BackendName = BackendName::Cpu;
-        type Facts = ();
+        type DeviceInfo = ();
         type Intrinsic = NoIntrinsic;
 
         fn write_intrinsic_identity(op: &NoIntrinsic, _: &mut IntrinsicIdentityBuilder) {
@@ -473,7 +473,7 @@ pub(crate) mod demand_driven_tests {
             },
             capabilities: BTreeSet::new(),
             intrinsics: BTreeSet::new(),
-            facts: (),
+            device_info: (),
             kernel_abi: FakeAbi,
             local_realization: LocalRealizationPolicy {
                 workgroup: LocalRealization::NativeDynamic,

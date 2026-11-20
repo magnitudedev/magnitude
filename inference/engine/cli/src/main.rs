@@ -366,6 +366,7 @@ fn run() -> Result<(), String> {
             exported_logits_rows: 0,
             numerical_profile: options.numerical_profile,
             weight_bound: options.weight_bound,
+            record_routes: false,
         },
         context_tokens: options.context_tokens,
         service,

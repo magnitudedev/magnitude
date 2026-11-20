@@ -83,8 +83,6 @@ driver! {
     device_name: unsafe extern "system" fn(*mut c_char, c_int, c_int) -> ResultCode => "cuDeviceGetName",
     device_attribute: unsafe extern "system" fn(*mut c_int, c_int, c_int) -> ResultCode => "cuDeviceGetAttribute",
     device_total_memory: unsafe extern "system" fn(*mut usize, c_int) -> ResultCode => "cuDeviceTotalMem_v2",
-    device_can_access_peer: unsafe extern "system" fn(*mut c_int, c_int, c_int) -> ResultCode
-        => "cuDeviceCanAccessPeer",
     memory_info: unsafe extern "system" fn(*mut usize, *mut usize) -> ResultCode => "cuMemGetInfo_v2",
     driver_version: unsafe extern "system" fn(*mut c_int) -> ResultCode => "cuDriverGetVersion",
     primary_context_retain: unsafe extern "system" fn(*mut Handle, c_int) -> ResultCode => "cuDevicePrimaryCtxRetain",
@@ -994,7 +992,13 @@ fn device_memory_granularity(
     virtual_memory: bool,
     query: impl FnOnce() -> Result<u64, DriverError>,
 ) -> Result<u64, DriverError> {
-    if virtual_memory { query() } else { Ok(LINEAR_PAGE) }
+    let queried = if virtual_memory { Some(query()?) } else { None };
+    Ok(seismic_topology::resolve(
+        &[("cuMemGetAllocationGranularity", &|| queried)],
+        "default",
+        || LINEAR_PAGE,
+    )
+    .0)
 }
 
 /// `CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED` of device
@@ -2187,7 +2191,7 @@ pub(crate) fn module_defines(module: &Module, name: &str) -> Result<bool, Driver
 }
 
 /// Authoritative `cuFuncGetAttribute` reflection on one loaded function.
-/// Native reconciliation consumes these facts before planning admission.
+/// Native reconciliation consumes these attributes before planning admission.
 pub(crate) fn function_attribute(
     context: &Arc<Context>,
     function: Handle,

@@ -1,7 +1,7 @@
 """The registry: every instrument, the one thing it observes and the question it answers.
 
 An instrument is defined by its observable; what it is applied to (a backend, a model, an
-entry, a shape, a context, a fixture, a build) is a selector. A question whose observable an
+entry, a shape, a template, a build) is a selector. A question whose observable an
 instrument already owns becomes a selector, an option or a case of that instrument, never a
 second instrument. Every instrument is a thin front end over the shared cores: the engine
 (placement, holds, build, records), the selectors, and the measurement code it runs on the

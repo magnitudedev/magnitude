@@ -145,7 +145,7 @@ class EngineOptions(Record):
     inference: Path
     #: Serve with the catalog drafter where the engine supports its method.
     drafting: bool = True
-    #: Bind the catalog projector for image-bearing fixture requests.
+    #: Bind the catalog projector for image-bearing requests (the vision check).
     vision: bool = False
     magnitude: MagnitudeOptions = Field(default_factory=lambda data: MagnitudeOptions.of(data["inference"]))
     llama: LlamaOptions = Field(default_factory=LlamaOptions)

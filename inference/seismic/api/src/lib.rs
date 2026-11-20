@@ -359,13 +359,42 @@ pub use seismic_runtime::api::{
 /// The largest block a dedicated device's allocator takes from its driver
 /// for an ordinary allocation (blocks grow from 64 MiB to it).
 pub use seismic_compiler::blocks::BLOCK_CAP_BYTES as DEVICE_BLOCK_CAP_BYTES;
+pub mod contract;
+pub use contract::{
+    ContractError, ContractNodeShape, ContractScratchMeta, EntryContract, EntrySizing,
+    NativeOperandNorm, OperandFormSpec, OperandRole, ScratchMeta, ScratchSpec, TensorParamSpec,
+    TensorResultSpec,
+};
+/// Primitives for direct graph sizing without bundle decoding or device handles.
+pub mod sizing {
+    pub use seismic_lang::cpu::CPU_Q8_VALUES;
+    pub use seismic_lang::ids::RepresentationId;
+    pub use seismic_memory::placement::{
+        aligned, colour_ends, liveness_floor, padded, place, Buffer, CompiledPlacement, Placed,
+        Span,
+    };
+    pub use seismic_memory::BUFFER_ALIGNMENT;
+    pub use seismic_runtime::api::kernel::{
+        EncodedScalar, EncodedWorkflowArgs, EncodedWorkflowArgument, PendingWorkflowResults,
+        WorkflowResultRef, WorkflowTensorArgument,
+    };
+    pub use seismic_runtime::native::graph::{
+        argument_reference, bindings_heap, cuda_recorded_census, make_native_port,
+        make_timeline_port, operand_carry_ports, plan_heap_of, plan_storage_sizes,
+        plan_storage_with_links, recorded_census_of, resolve_operand_links, CarriedBuffer,
+        CompiledStoragePlan, OperandCarrySide, OperandCarrySpec, OperandLinks, OperandNode,
+        OperandPair, PlanHeapNode, PlannedStorage, StorageNode, StoragePlacement, StoragePort,
+        StorageSizes, INPUT_NODE,
+    };
+    pub use seismic_runtime::native::timeline::TimelineNode;
+    pub use seismic_runtime::native::{
+        ScratchNeed, ScratchOperand, MINIMUM_SCRATCH_BYTES, OPERAND_ACTIVATION,
+    };
+}
 mod flight;
 pub use flight::{FlightCompletion, FlightRing};
-pub mod trace;
-pub use trace::{
-    Argument, ArgumentWord, ClassFact, Dim, DimensionExpr, GraphRecorder, NativeGraphTraces, Reals, Table, TableExpr,
-    TraceOutput,
-};
+pub mod dim;
+pub use dim::{Argument, ArgumentWord, Dim, Reals, Table};
 
 pub use seismic_compiler::blocks::Packing as DeviceBlockPacking;
 
@@ -384,10 +413,12 @@ pub fn device_block_packing(backend: BackendName) -> Option<DeviceBlockPacking> 
 }
 mod slab;
 pub use seismic_discovery::{
-    device_node, host_sample, pin, place_process, volume_available, volume_identity, Core, DeviceNode, DiscoveryError,
-    Counted, Harm, HostSample, Inventory, Lag, Machine, MachineFormFactor, MachineIdentity, MemoryNode, ObservationError, OwnCold, OwnReclaimed, PciLocation,
-    PressureEvents, PressureLevel, PressureWaker, ProcessPlacement, Processors, ProcessorsReportedBy, RuntimeStatus,
-    Sample, Status, Supply, Wake, WiredFigures, WiredLimit,
+    device_node, discover_processors, host_sample, pin, place_process,
+    volume_available, volume_identity, ColdPages, Core, Counted, DiscoveryError, FormFactor,
+    HardwareIdentity, Harm, HostNode, HostSample, Inventory, Lag, MemoryNode, ObservationError,
+    OwnReclaimed, PciLocation, PressureEvents, PressureLevel, PressureWaker, ProcessPlacement,
+    Processors, RuntimeStatus, Sample, Status, Supply, SystemIdentity, Wake,
+    WiredFigures, WiredLimit,
 };
 pub use seismic_lang::forms::MetalPacking;
 /// The threads this process may run at once (`seismic-threads`): its share
@@ -403,12 +434,12 @@ pub use seismic_runtime::native::{
     GraphPending, GraphPoint, GraphTiming, KernelPoint, NativeSpans, Point, PointPending,
 };
 pub use seismic_topology::{
-    AccessPath, AccessPathId, AllocationLimit, Availability, DeviceAllocationBound, Contract, DeviceMemory, DeviceTopology,
-    Diagnostic, DiagnosticSource, Executor, ExecutorId, ExecutorKind, ExecutorSelector, HostReads, Identity,
-    Kind, KindId, KindMemory, Limits, NativeKind, PhysicalDevice,
-    PhysicalDeviceId, PhysicalIdentity, Reach, Reported, ReportedBy,
-    Revision, Store, StoreId,
-    StoreIdentity, StoreKind, TransferPath, TransferPathId, VolumeId,
+    AccessPath, AccessPathId, AllocationLimit, Availability, CacheSize, Contract, DeviceMemory,
+    DeviceTopology, Diagnostic, DiagnosticSource, Executor, ExecutorId, ExecutorKind,
+    ExecutorSelector, Grant, GrantKind, Host, HostReads, Identity, Kind, KindId, KindMemory,
+    Limits, NativeKind, PhysicalDevice, PhysicalDeviceId, PhysicalIdentity, Reach, Reported,
+    ReportedBy, Revision, Store, StoreId, StoreIdentity, StoreKind, TransferPath, TransferPathId,
+    VolumeId,
 };
 mod measurer;
 pub use measurer::{KernelIdentity, Measurer, PointKey};
@@ -733,7 +764,7 @@ impl Device {
         self.inner.host_threads()
     }
     /// The host memory node the device is attached to.
-    pub fn host_node(&self) -> Result<DeviceNode, String> {
+    pub fn host_node(&self) -> HostNode {
         self.inner.host_node()
     }
     /// Stable key of this device's model and configuration for native
@@ -752,6 +783,13 @@ impl Device {
     /// every other backend).
     pub fn forms_tensor_operations(&self) -> bool {
         self.inner.forms_tensor_operations()
+    }
+    /// Ensure the device's command queue can hold at least `count` uncompleted
+    /// command buffers at once. On Metal, sizes or grows the idle
+    /// `MTLCommandQueue` when its capacity is unset or below `count`; no-op on
+    /// backends without a fixed command-buffer ceiling.
+    pub fn ensure_command_buffer_capacity(&self, count: usize) -> Result<(), ExecutionError> {
+        self.inner.ensure_command_buffer_capacity(count)
     }
     /// Record every native submission on this device until the returned
     /// trace is dropped (measurement only; see `TraceDetail`).
@@ -1144,8 +1182,11 @@ impl Element {
         let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
         ScaledCodeRows::admit(conversion, columns)
     }
-    fn id(&self) -> RepresentationId {
+    pub fn id(&self) -> RepresentationId {
         self.0
+    }
+    pub fn from_id(id: RepresentationId) -> Self {
+        Self(id)
     }
     pub fn dense(dtype: DType) -> Element {
         Element(seismic_lang::registry::dense(dtype))
@@ -2098,6 +2139,10 @@ pub struct WorkflowTensorView {
 }
 
 impl WorkflowTensor {
+    /// Raw workflow result reference for direct graph sizing.
+    pub fn raw_ref(&self) -> seismic_runtime::api::kernel::WorkflowResultRef {
+        self.inner
+    }
     /// A symbolic contiguous view of the leading axis. Bounds and packet
     /// alignment are validated during whole-workflow admission, once the
     /// producer's exact result descriptor exists.
@@ -2133,48 +2178,23 @@ impl WorkflowTensorView {
         Dim: From<S> + From<E>,
     {
         let (start, end) = (Dim::from(start), Dim::from(end));
-        self.then(
-            seismic_runtime::api::kernel::ViewOperation::LeadingSlice { start: start.recorded(), end: end.recorded() },
-            seismic_runtime::native::dimension::ViewExpr::LeadingSlice {
-                start: start.expression(),
-                end: end.expression(),
-            },
-        )
+        let mut operations = self.operations.clone();
+        operations.push(seismic_runtime::api::kernel::ViewOperation::LeadingSlice {
+            start: start.recorded(),
+            end: end.recorded(),
+        });
+        Self { inner: self.inner, operations, expressions: None }
     }
     pub fn reshape<D: Clone>(&self, extents: &[D]) -> Self
     where
         Dim: From<D>,
     {
         let extents = extents.iter().cloned().map(Dim::from).collect::<Vec<_>>();
-        self.then(
-            seismic_runtime::api::kernel::ViewOperation::Reshape { extents: extents.iter().map(Dim::recorded).collect() },
-            seismic_runtime::native::dimension::ViewExpr::Reshape {
-                extents: extents.iter().map(Dim::expression).collect(),
-            },
-        )
-    }
-
-    /// It followed by `operation`, which is `expression` at the recording's
-    /// facts. Expressions are kept only once a fact reaches one.
-    fn then(
-        &self,
-        operation: seismic_runtime::api::kernel::ViewOperation,
-        expression: seismic_runtime::native::dimension::ViewExpr,
-    ) -> Self {
-        let expressions = match (&self.expressions, expression.is_constant()) {
-            (None, true) => None,
-            (Some(expressions), _) => Some(expressions.iter().cloned().chain([expression]).collect()),
-            (None, false) => Some(
-                self.operations
-                    .iter()
-                    .map(seismic_runtime::native::dimension::ViewExpr::constant)
-                    .chain([expression])
-                    .collect(),
-            ),
-        };
         let mut operations = self.operations.clone();
-        operations.push(operation);
-        Self { inner: self.inner, operations, expressions }
+        operations.push(seismic_runtime::api::kernel::ViewOperation::Reshape {
+            extents: extents.iter().map(Dim::recorded).collect(),
+        });
+        Self { inner: self.inner, operations, expressions: None }
     }
 }
 
@@ -2777,6 +2797,7 @@ struct CheckedNode {
     parameters: Vec<Option<(RepresentationId, Vec<u64>)>>,
     results: Vec<Option<(RepresentationId, Vec<u64>)>>,
     scratch: Vec<seismic_runtime::native::ScratchNeed>,
+    cuda_launches: Option<u64>,
 }
 
 struct MetadataTemplateRecorder {
@@ -2802,10 +2823,10 @@ enum TemplatePort<N> {
     },
 }
 
-/// A template port as its recording keeps it.
-type MetadataPortSource = TemplatePort<trace::Expr>;
+/// A template port at its recorded dimensions.
+type MetadataPortSource = TemplatePort<u64>;
 
-/// A template port at a model's facts.
+/// A template port at its recorded dimensions.
 type PortPoint = TemplatePort<u64>;
 
 /// What a checked port is apart from its dimensions.
@@ -2817,18 +2838,18 @@ struct CheckedPortSource {
 }
 
 impl MetadataPortSource {
-    /// It at `facts`, `None` where a number does not evaluate there.
-    fn at(&self, facts: &[u64]) -> Option<PortPoint> {
-        Some(match self {
+    fn clone_point(&self) -> PortPoint {
+        match self {
             Self::Direct { element, extents, class_extent } => TemplatePort::Direct {
                 element: *element,
-                extents: extents.iter().map(|extent| extent.evaluate(facts)).collect::<Option<_>>()?,
+                extents: extents.clone(),
                 class_extent: *class_extent,
             },
-            Self::Checked { port, dimensions } => {
-                TemplatePort::Checked { port: Arc::clone(port), dimensions: evaluated(dimensions, facts)? }
-            }
-        })
+            Self::Checked { port, dimensions } => TemplatePort::Checked {
+                port: Arc::clone(port),
+                dimensions: dimensions.clone(),
+            },
+        }
     }
 }
 
@@ -2836,23 +2857,15 @@ struct MetadataNodeSource {
     checked: generated::NativeGraphCheckedEntry,
     entry_name: &'static str,
     class_scope: Option<&'static str>,
-    dimensions: Vec<(String, trace::Expr)>,
+    dimensions: Vec<(String, u64)>,
 }
 
-/// A template's ports and nodes with every dimension evaluated: at its
-/// recording, or at a trace's facts ([`NativeGraphResourceTemplate::points`]).
+/// A template's ports and nodes with every dimension evaluated.
 struct TemplatePoints {
-    /// Each port at the facts.
+    /// Each port at the recorded dimensions.
     ports: Vec<PortPoint>,
     /// Each node's dimensions.
     nodes: Vec<Vec<(String, u64)>>,
-}
-
-fn evaluated(dimensions: &[(String, trace::Expr)], facts: &[u64]) -> Option<Vec<(String, u64)>> {
-    dimensions
-        .iter()
-        .map(|(name, expr)| Some((name.clone(), expr.evaluate(facts)?)))
-        .collect()
 }
 
 fn borrowed(dimensions: &[(String, u64)]) -> Vec<(&str, u64)> {
@@ -2911,17 +2924,6 @@ impl NativeGraphClassSlice {
         self
     }
 
-    /// The slice without the dimensions of `fixed`.
-    fn without(&self, fixed: &[ClassFact]) -> Self {
-        let fixes = |scope: Option<&str>, name: &str| {
-            fixed.iter().any(|class| class.scope == scope && class.dimension == name)
-        };
-        Self {
-            dimensions: self.dimensions.iter().filter(|(name, _)| !fixes(None, name)).cloned().collect(),
-            scoped: self.scoped.iter().filter(|(scope, name, _)| !fixes(Some(scope), name)).cloned().collect(),
-        }
-    }
-
     fn names(&self) -> Vec<(Option<&'static str>, &'static str)> {
         let mut names = self
             .dimensions
@@ -2938,7 +2940,7 @@ impl NativeGraphClassSlice {
     }
 
     /// The values of class dimension `name` of scope `scope`, or unscoped.
-    fn class_values(&self, scope: Option<&str>, name: &str) -> Option<&[u64]> {
+    pub fn class_values(&self, scope: Option<&str>, name: &str) -> Option<&[u64]> {
         match scope {
             None => self.global(name),
             Some(scope) => self
@@ -2949,14 +2951,14 @@ impl NativeGraphClassSlice {
         }
     }
 
-    fn global(&self, name: &str) -> Option<&[u64]> {
+    pub fn global(&self, name: &str) -> Option<&[u64]> {
         self.dimensions
             .iter()
             .find(|(candidate, _)| *candidate == name)
             .map(|(_, values)| values.as_slice())
     }
 
-    fn values(&self, entry_name: &str, class_scope: Option<&str>, name: &str) -> Option<&[u64]> {
+    pub fn values(&self, entry_name: &str, class_scope: Option<&str>, name: &str) -> Option<&[u64]> {
         let scoped = |scope: &str| {
             self.scoped
                 .iter()
@@ -3074,12 +3076,11 @@ fn recorded_dimensions<'n>(dimensions: &[(&'n str, Dim)]) -> Vec<(&'n str, u64)>
         .collect()
 }
 
-/// Each dimension's expression over the recording's facts: what a template
-/// keeps.
-fn dimension_exprs(dimensions: &[(&str, Dim)]) -> Vec<(String, trace::Expr)> {
+/// Each dimension's owned `(name, value)` pair: what a template keeps.
+fn owned_recorded_dimensions(dimensions: &[(&str, Dim)]) -> Vec<(String, u64)> {
     dimensions
         .iter()
-        .map(|(name, dimension)| ((*name).to_owned(), dimension.expression()))
+        .map(|(name, dimension)| ((*name).to_owned(), dimension.recorded()))
         .collect()
 }
 
@@ -3113,6 +3114,7 @@ pub(crate) struct Capacities {
     ports: Vec<u64>,
     results: Vec<Vec<u64>>,
     scratch: Vec<Vec<seismic_runtime::native::ScratchNeed>>,
+    cuda_launches: Option<Vec<LaunchMasks>>,
 }
 
 impl Capacities {
@@ -3134,6 +3136,16 @@ impl Capacities {
                         .collect()
                 })
                 .collect(),
+            cuda_launches: match (self.cuda_launches, other.cuda_launches) {
+                (Some(left), Some(right)) => Some(
+                    left.into_iter()
+                        .zip(right)
+                        .map(|(l, r)| l.cover(r))
+                        .collect(),
+                ),
+                (None, None) => None,
+                _ => unreachable!("capacities of the same template have the same backend"),
+            },
         }
     }
 }
@@ -3159,7 +3171,7 @@ impl NativeGraphResourceTemplate {
         let Some(first) = slices.first() else {
             return Err(NativeGraphMetadataError::Unsupported("graph regime has no admitted classes".into()));
         };
-        self.certify_with(&self.capacity_program(points, first, &[])?, slices)
+        self.certify_with(&self.capacity_program(points, first)?, slices)
     }
 
     /// [`Self::certify`] with its buffers compiled into `program`
@@ -3177,9 +3189,15 @@ impl NativeGraphResourceTemplate {
         &self,
         capacities: Capacities,
     ) -> Result<NativeGraphLayout, NativeGraphMetadataError> {
-        let Capacities { ports, results, scratch } = capacities;
+        let Capacities { ports, results, scratch, cuda_launches } = capacities;
+        let node_launches: Option<Vec<u64>> = cuda_launches.map(|masks| {
+            masks
+                .iter()
+                .map(|node| node.0.iter().map(|m| u64::from(m.count_ones())).max().unwrap_or(0))
+                .collect()
+        });
         self.inner
-            .capacity_layout(&ports, &results, scratch)
+            .capacity_layout(&ports, &results, scratch, node_launches.as_deref())
             .map(|inner| NativeGraphLayout {
                 inner: Arc::new(inner),
             })
@@ -3196,83 +3214,12 @@ impl NativeGraphResourceTemplate {
         self.outline_of(&self.recorded(), slices)
     }
 
-    /// Its points at its recording: a template recorded outside a trace has
-    /// constant dimensions alone.
+    /// Its points at its recording.
     fn recorded(&self) -> TemplatePoints {
-        self.points(&[])
-            .expect("a template's constant dimensions are its recording's values")
-    }
-
-    /// Every port's and node's dimensions at `facts`, `None` where one does
-    /// not evaluate there.
-    pub(crate) fn points(&self, facts: &[u64]) -> Option<TemplatePoints> {
-        let ports = self.recorder.ports.iter().map(|source| source.at(facts)).collect::<Option<_>>()?;
-        let nodes = self
-            .recorder
-            .nodes
-            .iter()
-            .map(|source| evaluated(&source.dimensions, facts))
-            .collect::<Option<_>>()?;
-        Some(TemplatePoints { ports, nodes })
-    }
-
-    /// A node static dimension `a` and `b`, two class points' dimensions,
-    /// give different values, as the node's entry and the dimension: every
-    /// class calls a node's entry at the statics it was enqueued and
-    /// domain-checked at, so classes vary only dynamic dimensions.
-    pub(crate) fn varied_static(&self, a: &TemplatePoints, b: &TemplatePoints) -> Option<(&'static str, String)> {
-        self.recorder.nodes.iter().zip(a.nodes.iter().zip(&b.nodes)).find_map(|(source, (a, b))| {
-            let value = |dimensions: &[(String, u64)], name: &str| {
-                dimensions.iter().find(|(candidate, _)| candidate == name).map(|&(_, value)| value)
-            };
-            source
-                .checked
-                .implementation()
-                .statics
-                .iter()
-                .find(|name| value(a, name) != value(b, name))
-                .map(|name| (source.entry_name, name.clone()))
-        })
-    }
-
-    /// Whether every check the recording made of a shape holds at `points`:
-    /// each checked port's parameter and each node's call admitted at its
-    /// dimensions ([`checked_call`]: contract, domain, scratch), and each
-    /// argument, stored and shared result matching where it is wired
-    /// (`NativeGraphMetadataDraft::validate_at`). Topology is the
-    /// recording's. A refusal is a trace that does not answer: the family
-    /// records again at the model's facts, which reports the refusal itself.
-    fn admitted_at(&self, facts: &[u64], points: &TemplatePoints) -> bool {
-        let ports = points
-            .ports
-            .iter()
-            .map(|point| match point {
-                TemplatePort::Direct { extents, .. } => Some(extents.clone()),
-                TemplatePort::Checked { port, dimensions } => port
-                    .checked
-                    .parameter(&port.parameter, &borrowed(dimensions))
-                    .ok()
-                    .map(|metadata| metadata.extents),
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(ports) = ports else {
-            return false;
-        };
-        let nodes = self
-            .recorder
-            .nodes
-            .iter()
-            .zip(&points.nodes)
-            .map(|(source, dimensions)| {
-                checked_call(&source.checked, source.entry_name, self.backend, dimensions).ok()
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(nodes) = nodes else {
-            return false;
-        };
-        let (parameters, results): (Vec<_>, Vec<_>) =
-            nodes.iter().map(|node| (node.parameters.clone(), node.results.clone())).unzip();
-        self.inner.validate_at(facts, &ports, &parameters, &results).is_ok()
+        TemplatePoints {
+            ports: self.recorder.ports.iter().map(MetadataPortSource::clone_point).collect(),
+            nodes: self.recorder.nodes.iter().map(|source| source.dimensions.clone()).collect(),
+        }
     }
 
     /// What the template holds over `slices` at `points`
@@ -3285,7 +3232,7 @@ impl NativeGraphResourceTemplate {
         let Some(first) = slices.first() else {
             return Err(NativeGraphMetadataError::Unsupported("graph regime has no admitted classes".into()));
         };
-        self.outline_with(&self.capacity_program(points, first, &[])?, slices)
+        self.outline_with(&self.capacity_program(points, first)?, slices)
     }
 
     /// What the template holds over `slices` with its buffers compiled into
@@ -3303,10 +3250,16 @@ impl NativeGraphResourceTemplate {
         &self,
         capacities: Capacities,
     ) -> Result<NativeGraphOutline, NativeGraphMetadataError> {
-        let Capacities { ports, results, scratch } = capacities;
+        let Capacities { ports, results, scratch, cuda_launches } = capacities;
+        let node_launches: Option<Vec<u64>> = cuda_launches.map(|masks| {
+            masks
+                .iter()
+                .map(|node| node.0.iter().map(|m| u64::from(m.count_ones())).max().unwrap_or(0))
+                .collect()
+        });
         let storage = self
             .inner
-            .capacity_storage(&ports, &results, scratch)
+            .capacity_storage(&ports, &results, scratch, node_launches.as_deref())
             .map_err(NativeGraphMetadataError::Workflow)?;
         Ok(NativeGraphOutline {
             storage,
@@ -3316,28 +3269,14 @@ impl NativeGraphResourceTemplate {
     }
 
     /// Its buffers' sizes at `points` as functions of the class dimensions
-    /// the slices named like `namer` vary: a buffer no class dimension
-    /// reaches is evaluated here, once; any other is bound to its contract's
-    /// compiled shape (or its scratch bound) over the class dimensions it
-    /// reads alone, so a regime's slices evaluate it at their class points
-    /// with no lookup by name and no contract walk ([`CapacityProgram::at`]).
-    /// A dimension varies where the slices name it and `points` do not fix
-    /// it: `fixed` are the class facts `points` are evaluated at (one class
-    /// point's, every dimension that follows them evaluated there), and a
-    /// name the slices give such a fact says nothing of a node's own
-    /// dimension of that name (a routed feed-forward's `R` against an
-    /// attention block's segments). A family naming no class facts fixes
-    /// none, at the model's own points. A port's class extent varies where
-    /// the slices name it.
+    /// the slices named like `namer` vary.
     pub(crate) fn capacity_program(
         &self,
         points: &TemplatePoints,
         namer: &NativeGraphClassSlice,
-        fixed: &[ClassFact],
     ) -> Result<CapacityProgram, NativeGraphMetadataError> {
         let unsupported = NativeGraphMetadataError::Unsupported;
-        let unfixed = namer.without(fixed);
-        let named = &unfixed;
+        let named = namer;
         let ports = points
             .ports
             .iter()
@@ -3463,16 +3402,57 @@ impl NativeGraphResourceTemplate {
                     size: Box::new(bound),
                 },
             };
+            let cuda_launches = if self.backend == BackendName::Cuda {
+                let launch_reads = implementation
+                    .launch_dimensions()
+                    .into_iter()
+                    .filter(|name| named.values(entry, source.class_scope, name).is_some())
+                    .fold(Vec::<String>::new(), |mut reads, name| {
+                        if !reads.contains(&name) {
+                            reads.push(name);
+                        }
+                        reads
+                    });
+                let (reads, fixed) = (launch_reads.clone(), dimensions.clone());
+                let masks = move |values: &[u64]| {
+                    let dimension = |name: &str| {
+                        reads
+                            .iter()
+                            .position(|read| read == name)
+                            .map(|index| values[index])
+                            .or_else(|| {
+                                fixed
+                                    .iter()
+                                    .find(|(candidate, _)| candidate == name)
+                                    .map(|(_, value)| *value)
+                            })
+                    };
+                    launch_masks_bound(implementation, &dimension).map(LaunchMasks)
+                };
+                Some(match launch_reads.is_empty() {
+                    true => Capacity::Fixed(masks(&[]).map_err(|error| unsupported(format!("`{entry}`: {error}")))?),
+                    false => Capacity::Varying {
+                        reads: launch_reads
+                            .into_iter()
+                            .map(|name| ClassRead::Node { entry, scope: source.class_scope, name })
+                            .collect(),
+                        size: Box::new(masks),
+                    },
+                })
+            } else {
+                None
+            };
             distinct.insert(key, programs.len());
             nodes.push(programs.len());
             programs.push(NodeProgram {
                 entry,
                 results,
                 scratch,
+                cuda_launches,
                 buffers: &implementation.scratch,
             });
         }
-        Ok(CapacityProgram { names: namer.names(), ports, programs, nodes })
+        Ok(CapacityProgram { backend: self.backend, names: namer.names(), ports, programs, nodes })
     }
 }
 
@@ -3526,6 +3506,23 @@ impl Covers for Vec<u64> {
     }
 }
 
+/// Per-configuration active-launch bitmasks on CUDA, covered across classes
+/// by element-wise bitwise OR (`cuda::launch_structure` union in a layout).
+#[derive(Clone)]
+struct LaunchMasks(Vec<u64>);
+
+impl Covers for LaunchMasks {
+    fn cover(self, other: Self) -> Self {
+        Self(
+            self.0
+                .into_iter()
+                .zip(other.0)
+                .map(|(left, right)| left | right)
+                .collect(),
+        )
+    }
+}
+
 impl<T: Covers> Capacity<T> {
     /// Its largest size over every class of `slices`: at each combination
     /// of the values each slice gives the dimensions it reads.
@@ -3574,6 +3571,7 @@ struct NodeProgram {
     entry: &'static str,
     results: Vec<Capacity<u64>>,
     scratch: Capacity<Vec<u64>>,
+    cuda_launches: Option<Capacity<LaunchMasks>>,
     /// Its declared buffers, which `scratch` sizes.
     buffers: &'static [seismic_lang::checked::NativeScratch],
 }
@@ -3581,6 +3579,7 @@ struct NodeProgram {
 /// A template's buffers at a model's points, compiled for the slices of a
 /// regime that name `names` ([`NativeGraphResourceTemplate::capacity_program`]).
 pub(crate) struct CapacityProgram {
+    backend: BackendName,
     names: Vec<(Option<&'static str>, &'static str)>,
     ports: Vec<Capacity<u64>>,
     /// Each distinct call's buffers, once however many nodes make it.
@@ -3632,15 +3631,31 @@ impl CapacityProgram {
                     .zip(program.buffers)
                     .map(|(bytes, buffer)| seismic_runtime::native::ScratchNeed::of(buffer, bytes))
                     .collect::<Vec<_>>();
-                Ok((results, scratch))
+                let launches = program
+                    .cuda_launches
+                    .as_ref()
+                    .map(|cap| cap.over(slices).map_err(|error| unsupported(format!("`{entry}`: {error}"))))
+                    .transpose()?;
+                Ok((results, scratch, launches))
             })
             .collect::<Result<Vec<_>, NativeGraphMetadataError>>()?;
-        let (results, scratch) = self
-            .nodes
-            .iter()
-            .map(|&index| programs[index].clone())
-            .unzip();
-        Ok(Capacities { ports, results, scratch })
+        let mut results = Vec::with_capacity(self.nodes.len());
+        let mut scratch = Vec::with_capacity(self.nodes.len());
+        let mut cuda_launches = (self.backend == BackendName::Cuda)
+            .then(|| Vec::with_capacity(self.nodes.len()));
+        for &index in &self.nodes {
+            let (node_results, node_scratch, node_launches) = &programs[index];
+            results.push(node_results.clone());
+            scratch.push(node_scratch.clone());
+            if let Some(launches) = &mut cuda_launches {
+                launches.push(
+                    node_launches
+                        .clone()
+                        .expect("CUDA capacity program computes launch masks for every node"),
+                );
+            }
+        }
+        Ok(Capacities { ports, results, scratch, cuda_launches })
     }
 }
 
@@ -3950,7 +3965,7 @@ impl NativeGraphMetadata {
         if let Some(template) = &mut self.template {
             template.ports.push(MetadataPortSource::Direct {
                 element,
-                extents: extents.iter().map(Dim::expression).collect(),
+                extents: values,
                 class_extent: None,
             });
         }
@@ -4045,7 +4060,7 @@ impl NativeGraphMetadata {
                     class_scope: self.class_scope,
                     parameter: parameter.to_owned(),
                 }),
-                dimensions: dimension_exprs(dimensions),
+                dimensions: owned_recorded_dimensions(dimensions),
             });
         }
         Ok(NativePort {
@@ -4150,12 +4165,27 @@ impl NativeGraphMetadata {
             .find(|(name, _)| *name == seismic_runtime::native::OPERAND_ACTIVATION)
             .map(|(_, element)| element.id());
         let pending = match condition {
-            Some(condition) => self
-                .inner
-                .enqueue_under(E::NAME, encoded, parameters, results, scratch, activation, sealed, condition),
-            None => self
-                .inner
-                .enqueue(E::NAME, encoded, parameters, results, scratch, activation, sealed),
+            Some(condition) => self.inner.enqueue_under(
+                E::NAME,
+                encoded,
+                parameters,
+                results,
+                scratch,
+                activation,
+                sealed,
+                node.cuda_launches,
+                condition,
+            ),
+            None => self.inner.enqueue(
+                E::NAME,
+                encoded,
+                parameters,
+                results,
+                scratch,
+                activation,
+                sealed,
+                node.cuda_launches,
+            ),
         }
         .map_err(NativeGraphMetadataError::Call)?;
         if let Some(template) = &mut self.template {
@@ -4163,7 +4193,7 @@ impl NativeGraphMetadata {
                 checked: node.checked.clone(),
                 entry_name: E::NAME,
                 class_scope: self.class_scope,
-                dimensions: dimension_exprs(dimensions),
+                dimensions: owned_recorded_dimensions(dimensions),
             });
         }
         Ok(E::decode_workflow(pending))
@@ -4219,13 +4249,14 @@ impl NativeGraphMetadata {
         width: Dim,
         activation: Element,
     ) -> Result<OperandCarry, NativeGraphMetadataError> {
-        let blocks = width.ceil_div(seismic_lang::cpu::CPU_Q8_VALUES)
-            * seismic_runtime::native::graph::OPERAND_CARRY_BLOCK_WORDS;
         let shape = [rows.recorded(), width.recorded()];
+        let [(rows_repr, rows_extents), (quantized_repr, quantized_extents)] =
+            seismic_runtime::native::graph::operand_carry_ports(self.backend, rows, width);
         Ok(OperandCarry {
-            rows: self.port(Element::f32(), &[rows.clone(), width])?,
-            quantized: self.port(Element::u32(), &[rows, blocks])?,
+            rows: self.port(Element(rows_repr), &rows_extents)?,
+            quantized: self.port(Element(quantized_repr), &quantized_extents)?,
             activation,
+            backend: self.backend,
             shape,
         })
     }
@@ -4329,6 +4360,46 @@ fn scratch_bound(
         .map_err(|error| error.to_string())
 }
 
+/// Active-launch bitmasks per admitted launch-guard configuration at `dimension`
+/// ([`NativeImplementation::launch_masks_over`]), with the declaration's
+/// admitted configurations walked once per process for each value of its statics
+/// ([`NativeImplementation::launch_configurations`]).
+fn launch_masks_bound(
+    implementation: &'static NativeImplementation,
+    dimension: &impl Fn(&str) -> Option<u64>,
+) -> Result<Vec<u64>, String> {
+    type Walked = std::collections::HashMap<(usize, Vec<u64>), Arc<Vec<NativeSpecialization>>>;
+    static WALKED: std::sync::OnceLock<std::sync::RwLock<Walked>> = std::sync::OnceLock::new();
+    let statics = implementation
+        .statics
+        .iter()
+        .map(|name| dimension(name).ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()).to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let key = (std::ptr::from_ref(implementation) as usize, statics);
+    let walked = WALKED.get_or_init(Default::default);
+    let known = walked.read().expect("walked launch configurations are never poisoned").get(&key).cloned();
+    let configurations = match known {
+        Some(configurations) => configurations,
+        None => {
+            let statics = implementation
+                .statics
+                .iter()
+                .zip(&key.1)
+                .fold(NativeSpecialization::new(), |statics, (name, &value)| statics.with_static(name.clone(), value));
+            let configurations =
+                Arc::new(implementation.launch_configurations(&statics).map_err(|error| error.to_string())?);
+            walked
+                .write()
+                .expect("walked launch configurations are never poisoned")
+                .insert(key, Arc::clone(&configurations));
+            configurations
+        }
+    };
+    implementation
+        .launch_masks_over(&configurations, dimension)
+        .map_err(|error| error.to_string())
+}
+
 /// What a call of `checked` (entry `entry` on `backend`) at `dimensions`
 /// checks to: its shapes, its domain (a call at statics outside it is
 /// refused) and its scratch at those dimensions. What a recording checks of
@@ -4382,12 +4453,13 @@ fn check_node(
             )));
         }
     }
-    let scratch = scratch_bound(implementation, &|name| {
-            dimensions
-                .iter()
-                .find(|(candidate, _)| *candidate == name)
-                .map(|(_, value)| *value)
-        })
+    let dim_lookup = |name: &str| {
+        dimensions
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .map(|(_, value)| *value)
+    };
+    let scratch = scratch_bound(implementation, &dim_lookup)
         .map_err(|reason| {
             NativeGraphMetadataError::Unsupported(format!(
                 "`{}` scratch bound at {dimensions:?}: {reason}",
@@ -4398,6 +4470,23 @@ fn check_node(
         .zip(&implementation.scratch)
         .map(|(bytes, buffer)| seismic_runtime::native::ScratchNeed::of(buffer, bytes))
         .collect();
+    let cuda_launches = if backend == BackendName::Cuda {
+        let masks = launch_masks_bound(implementation, &dim_lookup).map_err(|reason| {
+            NativeGraphMetadataError::Unsupported(format!(
+                "`{}` launch masks at {dimensions:?}: {reason}",
+                entry
+            ))
+        })?;
+        Some(
+            masks
+                .into_iter()
+                .map(|m| u64::from(m.count_ones()))
+                .max()
+                .unwrap_or(0),
+        )
+    } else {
+        None
+    };
     Ok(CheckedNode {
         parameters: parameters
             .into_iter()
@@ -4410,6 +4499,7 @@ fn check_node(
             .map(|result| result.map(|metadata| (metadata.element.id(), metadata.extents)))
             .collect(),
         scratch,
+        cuda_launches,
         checked,
     })
 }
@@ -4421,6 +4511,20 @@ pub struct NativePort {
 }
 
 impl NativePort {
+    /// Construct a [`NativePort`] for direct graph sizing.
+    pub fn from_raw(workflow: u64, result: u32) -> Self {
+        let inner = seismic_runtime::native::graph::make_native_port(workflow, result);
+        Self {
+            tensor: WorkflowTensor {
+                inner: inner.reference(),
+            },
+            inner,
+        }
+    }
+    /// Port ordinal within its graph.
+    pub fn ordinal(&self) -> u32 {
+        self.inner.reference().result
+    }
     pub fn tensor(&self) -> &WorkflowTensor {
         &self.tensor
     }
@@ -4429,7 +4533,13 @@ impl NativePort {
     }
 }
 
-pub use seismic_runtime::native::graph::OperandForms;
+impl seismic_runtime::native::graph::CarryExtent for Dim {
+    fn ceil_div_mul(&self, divisor: u64, factor: u64) -> Self {
+        self.ceil_div(divisor) * factor
+    }
+}
+
+pub use seismic_runtime::native::graph::{cuda_recorded_census, OperandForms};
 
 /// An operand carried from one graph to the next
 /// ([`NativeGraph::operand_carry`]): a graph's producer of a tensor writes
@@ -4444,11 +4554,14 @@ pub use seismic_runtime::native::graph::OperandForms;
 pub struct OperandCarry {
     /// F32 `[ROWS, WIDTH]`: the formed rows.
     pub rows: NativePort,
-    /// U32 words `[ROWS, ceil(WIDTH / 256) * Q8_BYTES / 4]`: the rows' Q8
-    /// blocks.
+    /// U32 words `[q_rows, ceil(WIDTH / 256) * Q8_BYTES / 4]`: the rows' Q8
+    /// blocks, where `q_rows` is `ROWS` rounded up to the backend's Q8 row
+    /// tile (`operand_carry_row_tile`).
     pub quantized: NativePort,
     /// The activation element both ends bind, which the rows are rounded to.
     pub activation: Element,
+    /// The backend whose carry port layout this carry was declared for.
+    backend: BackendName,
     /// Its rows and width, which its tensors take.
     shape: [u64; 2],
 }
@@ -4460,11 +4573,28 @@ impl std::fmt::Debug for NativePort {
 }
 
 impl OperandCarry {
+    /// Construct an [`OperandCarry`] from already-declared ports (for direct graph sizing).
+    pub fn from_ports(
+        rows: NativePort,
+        quantized: NativePort,
+        activation: Element,
+        backend: BackendName,
+        shape: [u64; 2],
+    ) -> Self {
+        Self {
+            rows,
+            quantized,
+            activation,
+            backend,
+            shape,
+        }
+    }
+
     /// Tensors to bind to its ports, one run's carry: its rows, then its Q8
     /// blocks.
     pub fn allocate(&self, charges: &Charges) -> Result<[Tensor; 2], TensorError> {
         let [(rows, rows_extents), (quantized, quantized_extents)] =
-            seismic_runtime::native::graph::operand_carry_ports(self.shape[0], self.shape[1]);
+            seismic_runtime::native::graph::operand_carry_ports(self.backend, self.shape[0], self.shape[1]);
         Ok([
             Tensor::zeros(charges, Element(rows), &rows_extents)?,
             Tensor::zeros(charges, Element(quantized), &quantized_extents)?,
@@ -4643,6 +4773,7 @@ impl NativeGraph {
         width: u64,
         activation: Element,
     ) -> Result<OperandCarry, TensorError> {
+        let backend = self.inner.backend();
         let inner = self.inner.operand_carry(rows, width, activation.id())?;
         let port = |inner: seismic_runtime::native::graph::NativePort| NativePort {
             tensor: WorkflowTensor { inner: inner.reference() },
@@ -4652,6 +4783,7 @@ impl NativeGraph {
             rows: port(inner.rows),
             quantized: port(inner.quantized),
             activation,
+            backend,
             shape: [rows, width],
         })
     }

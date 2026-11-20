@@ -17,7 +17,7 @@
 //! the head keeps none.
 
 use super::native_draft::widen;
-use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelections};
+use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelected, HeadSelections};
 use crate::device_table::SelectedRead;
 use crate::operators::block::{
     BlockLane, BlockState, BlockSublayers, CheckedFeedForwardEntries, CheckedMixerEntries,
@@ -35,9 +35,12 @@ use crate::{
     native::{AttestedSharedHead, OutputScales},
     programs::{
         graph::readout::{self, SelectionPorts, shapes},
-        graph::facts::{FactIndex, FactSink, Facts, Numbers, RealIndex, TableIndex, constant_reals},
-        graph::{GraphError, draft::{Certified, GraphDraft}},
-        native_constants::RecordedConstant,
+        graph::facts::{Numbers, constant, constant_reals},
+        graph::{
+            GraphError, RowForm,
+            draft::{Certified, ElementBoundDraft, GraphDraft},
+            sizing::SizingOutline,
+        },
         native_constants::{
             CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
             distinct_storage_bytes,
@@ -57,9 +60,9 @@ use magnitude_kernels::{
     token_confidence,
 };
 use seismic::{
-    BackendName, BoundNativeGraphPlan, Device, Dim, Element, NativeGraph, NativeGraphClassSlice,
-    NativeGraphFamily, NativeGraphMetadata, NativeGraphPlan, NativeGraphResourceTemplate,
-    NativeGraphTraces, NativePort, Reals, Table, Tensor, WorkflowTensor, Argument,
+    Argument, BackendName, BoundNativeGraphPlan, Device, Dim, Element, NativeGraph,
+    NativeGraphClassSlice, NativeGraphFamily, NativeGraphMetadata, NativeGraphPlan, NativePort,
+    Table, Tensor, WorkflowTensor,
 };
 use std::{collections::BTreeMap, rc::Rc, sync::Arc};
 
@@ -547,9 +550,10 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
         GraphConstant::i32(&mut graph, &[0])?,
         GraphConstant::i32(&mut graph, &[1])?,
     ];
-    let out_rows = GraphConstant::identity(&mut graph, slots)?;
+    let out_rows = GraphConstant::row_identity(&mut graph, slots.clone(), Some("M"))?;
     let (scale, normalize, embedding_epsilon) = topology.embedding;
     let (scale, embedding_epsilon) = (scale.f32(), embedding_epsilon.f32());
+    graph.set_class_scope(Some("shared-head-outputs"));
     let mut selections = graph.local_for(
         entries.sample,
         "result",
@@ -565,6 +569,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
         )?
         .tensor()
         .clone();
+    graph.set_class_scope(None);
     let mut passes = Vec::with_capacity(topology.steps as usize);
     // The hidden rows the next pass conditions on.
     let mut chained: Option<WorkflowTensor> = None;
@@ -615,7 +620,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                     entries.landing,
                     (&selected).into(),
                     slots,
-                    None,
+                    Some("M"),
                     |graph, directory| embed(graph, (&selected).into(), directory),
                 )?
             }
@@ -1005,75 +1010,14 @@ impl CheckedSharedHeadEntries {
     }
 }
 
-/// What decides a shared head graph's topology: its checked entries, its
-/// form and its numbers as facts (`split_shared_head`).
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct SharedHeadKey {
-    backend: BackendName,
-    entries: CheckedSharedHeadEntries,
-    landing: Option<CheckedLandingEntries>,
-    form: SharedHeadForm<RealIndex, TableIndex>,
-    numbers: SharedHeadNumbers<FactIndex>,
-}
-
-/// The shared head graphs' traces, one per topology.
-static SHARED_HEAD_TRACES: NativeGraphTraces<SharedHeadKey, Vec<RecordedConstant>> =
-    NativeGraphTraces::new();
-
-/// How many shared head traces this process recorded.
+/// Direct contract sizing records zero traces.
 #[cfg(test)]
 pub(crate) fn shared_head_traces_recorded() -> usize {
-    SHARED_HEAD_TRACES.recorded()
+    0
 }
 
-/// The template of a shared head graph of `key` at `facts`, and its binding
-/// constants.
-fn record_shared_head(
-    key: &SharedHeadKey,
-    facts: &[Dim],
-    reals: &Reals,
-) -> Result<(NativeGraphResourceTemplate, Vec<RecordedConstant>), GraphError> {
-    let facts = Facts::new(facts, reals);
-    let numbers = facts.dims(key.numbers.clone());
-    let form = facts.arguments(key.form.clone()).tables(|table| facts.table(table));
-    let checked = &key.entries;
-    let block = |index: usize| {
-        checked
-            .blocks
-            .get(index)
-            .ok_or_else(|| "checked head block is absent".to_owned())
-    };
-    let parts = shared_head_graph(
-        NativeGraphMetadata::new_template(key.backend),
-        SharedHeadEntries {
-            landing: key.landing.as_ref().map(CheckedLandingEntries::entries),
-            embedding: &checked.embedding[..],
-            join: &checked.join[..],
-            input: &checked.input[..],
-            mixer: &|index| block(index)?.0.entries(),
-            feed_forward: &|index| Ok(block(index)?.1.as_ref().map(|checked| checked.entries())),
-            features: &checked.features[..],
-            projection: checked.projection.entries(),
-            clustered: checked.centroids.as_ref().map(|centroids| ClusterEntries {
-                centroids: &centroids[..],
-                selection: &checked.selection[..],
-                rows: &checked.selection[..],
-                placement: &checked.selection[..],
-            }),
-            chain: &checked.chain[..],
-            shape: &checked.selection[..],
-            sample: &checked.selection[..],
-            confidence: &checked.selection[..],
-        },
-        &form,
-        &numbers,
-    )?;
-    let constants = parts.constants.iter().map(GraphConstant::recorded).collect();
-    Ok((parts.plan.seal_template()?, constants))
-}
-
-/// The family of `classes`, each class its own graph: from the shared head
-/// graphs' traces (`Certified::traced_each`).
+/// The family of `classes`, grouped by structural topology and certified per
+/// class via `L::certify_draft`.
 pub(crate) fn certify_shared_head_family<L: Certified>(
     backend: BackendName,
     load: &ModelLoadPlan,
@@ -1082,55 +1026,117 @@ pub(crate) fn certify_shared_head_family<L: Certified>(
 ) -> Result<(CheckedGraphResources, BTreeMap<SharedHeadGraphClass, L>), GraphError> {
     let entries = CheckedSharedHeadEntries::new(geometry.plan, backend)?;
     let landing = CheckedLandingEntries::of(load, TARGET_TABLE)?;
+    let head = WeightScope::HeadBlock(0);
+    let head_plans = readout::HeadPlans::for_recipe(load, head, head, true)?;
     let mut family = CheckedGraphFamilyResources::new();
     let mut layouts = BTreeMap::new();
+    let mut groups: BTreeMap<(u64, bool, bool, RowForm), Vec<SharedHeadGraphClass>> = BTreeMap::new();
     for class in classes {
-        let context = || format!("shared head graph class {class:?}");
+        if groups.values().any(|group| group.contains(&class)) {
+            return Err("shared head graph class is duplicated".into());
+        }
+        let certified = geometry.plan.clustered.is_none() && head_plans.certifies(class.slots);
+        groups
+            .entry((class.steps, class.shaped, certified, RowForm::of(class.slots)))
+            .or_default()
+            .push(class);
+    }
+    let block = |index: usize| {
+        entries
+            .blocks
+            .get(index)
+            .ok_or_else(|| "checked head block is absent".to_owned())
+    };
+    for group in groups.into_values() {
+        let largest = *group
+            .iter()
+            .max_by_key(|class| class.slots)
+            .expect("a group holds a class");
+        let context = || format!("shared head graph class {largest:?}");
         // Scalar arguments leave the checked shapes and storage alone.
         let unit = |_| Ok(OutputScales { mixer: 1.0, feed_forward: 1.0, per_layer: 1.0 });
-        let (form, numbers) = split_shared_head(load, geometry, class, &unit)
+        let (form, numbers) = split_shared_head(load, geometry, largest, &unit)
             .map_err(|error| error.context(context()))?;
-        let mut facts = FactSink::new();
-        let form = facts.index_reals(form).tables(|bytes| facts.table(bytes));
-        let key = SharedHeadKey {
-            backend,
-            entries: entries.clone(),
-            landing: landing.clone(),
-            form,
-            numbers: facts.index(numbers),
-        };
-        // A class is its own graph: one slice, at the recording's own facts.
-        // Its blocks' row ports follow the class dimension `M`
-        // (`port_with_class_extent`), which is the class's slots.
-        let (layout, constants) = L::traced(
-            &SHARED_HEAD_TRACES,
-            &key,
-            &facts,
-            &[],
-            vec![NativeGraphClassSlice::new().dimension("M", [class.slots])],
-            record_shared_head,
+        let form = constant_reals(form).tables(Table::from);
+        let numbers = constant(numbers);
+        let parts = shared_head_graph(
+            L::new_draft(backend),
+            SharedHeadEntries {
+                landing: landing.as_ref().map(CheckedLandingEntries::entries::<L::Draft>),
+                embedding: L::Draft::bind(&entries.embedding[..]),
+                join: L::Draft::bind(&entries.join[..]),
+                input: L::Draft::bind_ranged(&entries.input[..]),
+                mixer: &|index| block(index)?.0.entries(),
+                feed_forward: &|index| Ok(block(index)?.1.as_ref().map(|checked| checked.entries())),
+                features: L::Draft::bind(&entries.features[..]),
+                projection: entries.projection.entries(),
+                clustered: entries.centroids.as_ref().map(|centroids| ClusterEntries {
+                    centroids: L::Draft::bind_ranged(&centroids[..]),
+                    selection: L::Draft::bind(&entries.selection[..]),
+                    rows: L::Draft::bind(&entries.selection[..]),
+                    placement: L::Draft::bind(&entries.selection[..]),
+                }),
+                chain: L::Draft::bind_ranged(&entries.chain[..]),
+                shape: L::Draft::bind(&entries.selection[..]),
+                sample: L::Draft::bind(&entries.selection[..]),
+                confidence: L::Draft::bind(&entries.selection[..]),
+            },
+            &form,
+            &numbers,
         )
         .map_err(|error| error.context(context()))?;
-        family.include_plan(layout.plan_heap())?;
-        family.include(layout.storage_bytes(), constants);
-        // Each class's plan sealed alone, its own graph; a head launch runs
-        // on its own lane, never in a decode step's.
-        family.include_graph(layout.storage_bytes().recorded, false);
-        layouts.insert(class, layout);
+        let slice_sets = group
+            .iter()
+            .map(|class| {
+                vec![NativeGraphClassSlice::new()
+                    .dimension("M", [class.slots])
+                    .dimension("O", [class.slots])
+                    .scoped("token_confidence", "N", [class.slots])
+                    .scoped("import_dense", "N", [class.slots])
+                    .scoped("repack_weight", "N", [class.slots])
+                    .scoped("shared-head-outputs", "M", [class.slots * class.steps])
+                    .scoped("shared-head-outputs", "N", [class.slots])]
+            })
+            .collect::<Vec<_>>();
+        let group_layouts = L::certify_draft(parts.plan, &slice_sets)
+            .map_err(|error| error.context(context()))?;
+        for (class, layout) in group.into_iter().zip(group_layouts) {
+            family.include_plan(layout.plan_heap())?;
+            family.include_classes(layout.storage_bytes(), &parts.constants, &[class.slots])?;
+            // Each class's plan sealed alone, its own graph; a head launch runs
+            // on its own lane, never in a decode step's.
+            family.include_graph(layout.storage_bytes().recorded, false);
+            layouts.insert(class, layout);
+        }
     }
     Ok((family.finish()?, layouts))
 }
 
 /// The storage and bound constants of the head's graph family over
-/// `classes`, from its traces' outlines ([`certify_shared_head_family`]).
+/// `classes`, from direct contract sizing ([`certify_shared_head_family`]).
 pub(crate) fn checked_shared_head_family_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
     geometry: &SharedHeadGeometry<'_>,
     classes: impl IntoIterator<Item = SharedHeadGraphClass>,
 ) -> Result<CheckedGraphResources, GraphError> {
-    certify_shared_head_family::<seismic::NativeGraphOutline>(backend, load, geometry, classes)
+    checked_shared_head_family_with_kernels(backend, load, geometry, classes)
         .map(|(resources, _)| resources)
+}
+
+pub(crate) fn checked_shared_head_family_with_kernels(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &SharedHeadGeometry<'_>,
+    classes: impl IntoIterator<Item = SharedHeadGraphClass>,
+) -> Result<(CheckedGraphResources, std::collections::HashSet<seismic::KernelRequest>), GraphError> {
+    let (resources, layouts) =
+        certify_shared_head_family::<SizingOutline>(backend, load, geometry, classes)?;
+    let mut kernels = std::collections::HashSet::new();
+    for layout in layouts.values() {
+        kernels.extend(layout.kernels().iter().cloned());
+    }
+    Ok((resources, kernels))
 }
 
 pub struct PreparedSharedHeadGraphs {
@@ -1170,8 +1176,7 @@ impl PreparedSharedHeadGraphs {
         let classes = classes.into_iter().collect::<Vec<_>>();
         // What the planner charged for the family, from its own check.
         let planned = checked_shared_head_family_storage(target_device.backend(), load, geometry, classes.iter().copied())
-            .map_err(|error| invalid(format!("shared head graph family: {error}")))?
-            .graphs;
+            .map_err(|error| invalid(format!("shared head graph family: {error}")))?;
         let block = |index: usize| {
             kernels
                 .blocks
@@ -1249,7 +1254,8 @@ impl PreparedSharedHeadGraphs {
             return Err(invalid("shared head graph family has no classes"));
         }
         let plans = prepared.values().map(|graph| (false, graph.plan.clone()));
-        let family = super::graph::serial_family("shared head", plans, &planned).map_err(device)?;
+        let family = super::graph::serial_family("shared head", plans, &planned.graphs).map_err(device)?;
+        super::graph::assert_storage_eq("shared head", &family, planned.storage);
         Ok(Self {
             classes: prepared,
             family,
@@ -1571,7 +1577,7 @@ impl NativeSharedHeadProgram {
         Ok((
             completion,
             HeadOutput {
-                selections: Some(selections),
+                selected: HeadSelected::Proposals(selections),
                 landed_reads,
             },
         ))

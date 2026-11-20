@@ -9,7 +9,7 @@
 //! program's artifact ([`DirectModule::compile`]).
 
 use crate::device::Device;
-use crate::facts::SUBGROUP_WIDTH;
+use crate::device_info::SUBGROUP_WIDTH;
 use crate::numbering;
 use crate::seal::{self, SEAL_VERSION};
 use crate::uniformity;
@@ -24,14 +24,14 @@ use spirv_tools::val::Validator;
 pub const GLSLANG_RELEASE: &str = "glslang 0.8.1+275822a";
 
 /// Everything besides the source that determines a formed module: the
-/// compiler, target, seal passes and the device facts they and the driver
+/// compiler, target, seal passes and the device info they and the driver
 /// consume (§7.5), and what every pipeline on the device is created with
 /// ([`created_with`]).
 pub(crate) fn formation(device: &Device) -> String {
     format!(
         "{};{};create {}",
         compiler(),
-        device.facts().formation_identity(device.properties()),
+        device.info().formation_identity(device.properties()),
         created_with(device).as_raw()
     )
 }
@@ -51,7 +51,7 @@ fn created_with(device: &Device) -> vk::PipelineCreateFlags {
 
 /// The part of every formation identity the compiler determines: glslang,
 /// the SPIR-V target and the seal passes. Offline formation, which forms no
-/// pipeline on a device, is identified by this and the formation facts.
+/// pipeline on a device, is identified by this and the formation target.
 pub fn compiler() -> String {
     format!("vulkan;{GLSLANG_RELEASE};spirv 1.6;seal {SEAL_VERSION}")
 }
@@ -290,7 +290,7 @@ struct Analysed {
 /// it is already held (an operation of the same operands, or a load of
 /// read-only memory, dominated by its first) replaced by that, so the
 /// checks run over SSA values and one value is one id. A pure function is
-/// analysed once per call's argument facts instead of once per inlined
+/// analysed once per call's argument state instead of once per inlined
 /// copy: a helper unrolled callers call many times is one function, not
 /// one body per call. None of these passes is held back by a module's
 /// extensions, so the copies are the same in every environment.
@@ -1276,7 +1276,7 @@ pub struct DirectModule {
     device: Device,
     pipelines: Vec<vk::Pipeline>,
     /// Each pipeline's executables' statistics, as the driver names them;
-    /// empty where the device reports none (`Facts::pipeline_statistics`).
+    /// empty where the device reports none (`DeviceInfo::pipeline_statistics`).
     /// Read once every pipeline is held ([`DirectModule::read_statistics`]).
     statistics: Vec<Vec<ProgramStatistic>>,
 }
@@ -1432,7 +1432,7 @@ impl DirectModule {
             .module(shader)
             .name(c"main")
             .specialization_info(&specialization);
-        let stage = if self.device.facts().requires_subgroup_size() {
+        let stage = if self.device.info().requires_subgroup_size() {
             stage.push_next(&mut subgroup)
         } else {
             stage

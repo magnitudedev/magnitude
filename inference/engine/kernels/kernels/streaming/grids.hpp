@@ -18,7 +18,7 @@ STREAMING_FN void streaming_scratch_grids(u64 q, STREAMING_SYSTEM_READ scratch, 
     STREAMING_DEVICE_WORDS grids STREAMING_WORDS_PARAM) {
     const u64 w = u64(u32(streaming_device_load(window)));
     STREAMING_SYSTEM_READ first = STREAMING_AT(scratch,
-        streaming_scratch_lane(q, u64(SEISMIC_CONST_SCRATCH_ROUND) + w * SEISMIC_DIM_RW STREAMING_WORDS_ARG));
+        streaming_scratch_lane(q, SEISMIC_CONST_ROUND_LANE(w * SEISMIC_DIM_RW) STREAMING_WORDS_ARG));
     const u64 answer = streaming_load_u64_acquire(STREAMING_AT(first, SEISMIC_CONST_SLOT_ANSWER * SEISMIC_SCRATCH_STRIDE_1));
     const bool unanswered = answer != q && answer != (q | (u64(u32(SEISMIC_CONST_SLOT_FAILED)) << 32));
     const int count = answer == q ? streaming_load(STREAMING_AT(first, SEISMIC_CONST_SCRATCH_STAGED * SEISMIC_SCRATCH_STRIDE_1)) : 0;

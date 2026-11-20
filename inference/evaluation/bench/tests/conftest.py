@@ -1,14 +1,14 @@
 import json
 
 import pytest
-from bench_support import tools_fixture
+from bench_support import tools_session
 from magnitude_bench.models import Acquisition
 from magnitude_bench.policy import LANES
 
 
 @pytest.fixture
-def fixtures():
-    return [tools_fixture(lane) for lane in range(LANES + 1)]
+def sessions():
+    return [tools_session(lane) for lane in range(LANES + 1)]
 
 
 @pytest.fixture

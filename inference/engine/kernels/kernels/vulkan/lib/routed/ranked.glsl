@@ -27,6 +27,14 @@ bool selection_precedes(float value, int expert, float best, int best_expert) {
     return value > best || (value == best && expert > best_expert);
 }
 
+// Where a selection's keys go (`SELECTION_KEY(row, expert, key)`, each held
+// expert's ranked value, before its rounds): nowhere, unless its entry
+// defines it before including this file (a recording load's streamed route,
+// `streamed.glsl`).
+#ifndef SELECTION_KEY
+#define SELECTION_KEY(row, expert, key)
+#endif
+
 #define ROUTE_DEFINE_RANK_AT \
 void route_rank_at(uint64_t logits_base, uint64_t row, out float chosen[ROUTE_K], out int winners[ROUTE_K]) { \
     const uint lane = SEISMIC_LANE; \
@@ -53,6 +61,9 @@ void route_rank_at(uint64_t logits_base, uint64_t row, out float chosen[ROUTE_K]
     [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i) \
         if (i < held) \
             probability[i] = selection_ranked(seismic_div_rn(probability[i], total)); \
+    [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i) \
+        if (i < held) \
+            SELECTION_KEY(row, uint(expert[i]), probability[i]); \
     for (uint rank = 0u; rank < ROUTE_K; ++rank) { \
         float best = -uintBitsToFloat(0x7f800000u); \
         int best_expert = -1; \

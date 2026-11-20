@@ -40,7 +40,7 @@ pub const UNMEASURED: GraphCost = GraphCost::Chunked { launch: 1 << 10, chunk: A
 pub fn graph_cost(device: &Device, programs: &VulkanPrograms) -> Result<GraphCost, ExecutionError> {
     static COSTS: Mutex<BTreeMap<[u8; 16], GraphCost>> = Mutex::new(BTreeMap::new());
     let mut costs = COSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let uuid = device.facts().uuid;
+    let uuid = device.info().uuid;
     if let Some(cost) = costs.get(&uuid) {
         return Ok(*cost);
     }

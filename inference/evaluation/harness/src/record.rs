@@ -16,12 +16,22 @@ pub struct Run {
     command: Vec<String>,
 }
 
+/// A template file a run read: its template's name and context, its path
+/// and digest (SHA-256 of its bytes).
+pub struct Template {
+    pub name: String,
+    pub context: usize,
+    pub path: PathBuf,
+    pub digest: String,
+}
+
 /// What a finished run records besides its timing and reproduction command.
 pub struct RunRecord {
     pub build: Value,
     pub model: String,
     pub artifacts: Value,
-    pub fixture_set: (PathBuf, String),
+    /// The template files the run read, in order.
+    pub templates: Vec<Template>,
     pub rendered_digest: String,
     pub host: Value,
     pub measurements: Map<String, Value>,
@@ -49,7 +59,18 @@ impl Run {
     }
 
     pub fn finish(self, record: RunRecord) -> Result<(), String> {
-        let (fixture_path, fixture_digest) = record.fixture_set;
+        let templates = record
+            .templates
+            .iter()
+            .map(|template| {
+                json!({
+                    "template": template.name,
+                    "context": template.context,
+                    "path": template.path,
+                    "digest": template.digest,
+                })
+            })
+            .collect::<Vec<_>>();
         let result = json!({
             "schema": SCHEMA,
             "tool": self.tool,
@@ -58,7 +79,7 @@ impl Run {
             "build": record.build,
             "model": record.model,
             "artifacts": record.artifacts,
-            "fixture_set": { "path": fixture_path, "digest": fixture_digest },
+            "templates": templates,
             "rendered_digest": record.rendered_digest,
             "host": record.host,
             "command": self.command,
@@ -183,7 +204,7 @@ pub fn host(gpus: Option<Vec<String>>) -> Value {
         "cpu_cores": if macos {
             run("sysctl", &["-n", "hw.physicalcpu"]).and_then(|cores| cores.parse::<u64>().ok())
         } else {
-            std::thread::available_parallelism().ok().map(|cores| cores.get() as u64)
+            Some(seismic::threads::quota().get() as u64)
         },
         "memory_bytes": if macos {
             run("sysctl", &["-n", "hw.memsize"]).and_then(|bytes| bytes.parse::<u64>().ok())

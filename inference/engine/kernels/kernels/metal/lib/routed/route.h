@@ -18,19 +18,20 @@ inline ulong logit_index(ulong row, ulong expert) {
 
 using Ranked = selection::Ranked<uint(SEISMIC_DIM_K)>;
 
-template <uint EXPERTS = uint(SEISMIC_DIM_E), typename LogitOf>
-inline Ranked rank_row(LogitOf logit_of, uint lane) {
-    return selection::rank_row<EXPERTS, uint(SEISMIC_DIM_K)>(logit_of, lane);
+template <uint EXPERTS = uint(SEISMIC_DIM_E), typename LogitOf, typename Keys = selection::NoKeys>
+inline Ranked rank_row(LogitOf logit_of, uint lane, Keys keys = Keys{}) {
+    return selection::rank_row<EXPERTS, uint(SEISMIC_DIM_K)>(logit_of, lane, keys);
 }
 
-// One row's selection by one simdgroup (`rank_row`), optional renormalization,
-// `expert_scale` where present, and the shared-expert coefficient from column E.
-template <typename LogitOf>
+// One row's selection by one simdgroup (`rank_row`, its keys to `keys`),
+// optional renormalization, `expert_scale` where present, and the
+// shared-expert coefficient from column E.
+template <typename LogitOf, typename Keys = selection::NoKeys>
 inline void select_row(ulong row, LogitOf logit_of, device const float *expert_scale, device int *routes,
     element::Out<element::F32> scores, element::Out<element::F32> coefficient, constant ulong *seismic_words,
-    uint lane) {
+    uint lane, Keys keys = Keys{}) {
     constexpr uint K = SEISMIC_DIM_K;
-    const Ranked ranked = rank_row<uint(SEISMIC_DIM_E)>(logit_of, lane);
+    const Ranked ranked = rank_row<uint(SEISMIC_DIM_E)>(logit_of, lane, keys);
     float denominator = 0.0f;
     PROJECTION_UNROLL
     for (uint slot = 0; slot < K; ++slot)

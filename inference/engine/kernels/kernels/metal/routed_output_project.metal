@@ -54,7 +54,8 @@ kernel void routed_output_project_gathered(ROUTED_OUTPUT_PROJECT_PORTS) {
         element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(published_cells),
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2};
     routed::project_gathered<TILE, uint(SEISMIC_DIM_K), SLOTS, H>(routes, SEISMIC_ROUTES_STRIDE_0,
-        SEISMIC_ROUTES_STRIDE_1, uint(SEISMIC_DIM_M), group.y, sg, first, lane, projected[sg], published,
+        SEISMIC_ROUTES_STRIDE_1, sources, ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2,
+        uint(SEISMIC_DIM_M), group.y, sg, first, lane, projected[sg], published,
         [&](ulong m, uint slot, threadgroup float *region) {
             routed::output_project<ROWS, LANES>(expert_product, shared_product, routes, sources, expert_down,
                 tier_down, shared_down, m, first, slot, lane, region, seismic_words);

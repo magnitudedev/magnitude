@@ -14,10 +14,11 @@ use common::bound::{self, Float, Form, Library, Products};
 use seismic::BackendName;
 
 use magnitude_kernels::{
-    SlotTable, constants, landing_extent, list_extent, routed_combine, routed_copy, routed_down, routed_expand,
-    routed_experts, routed_experts_up, routed_gate_up, routed_group, routed_land, routed_list_grid, routed_output,
-    routed_pass_map, routed_round, routed_route, routed_route_shared, routed_scratch_grids, routed_scratch_request,
-    gated_delta_project, routed_seed_commit, routed_select, routed_select_streamed, routed_step, routed_up,
+    SlotTable, constants, routed_combine, routed_copy, routed_down, routed_expand,
+    gated_delta_project, routed_experts, routed_experts_up, routed_gate_up, routed_gate_up_part, routed_group,
+    routed_hint_route, routed_hint_select, routed_land, routed_list_grid, routed_output, routed_pass_map, routed_round,
+    routed_route, routed_route_shared, routed_route_streamed, routed_scratch_grids, routed_scratch_request,
+    routed_seed_commit, routed_select, routed_select_streamed, routed_step, routed_up,
 };
 use seismic_lang::{
     checked::CheckedModule,
@@ -382,6 +383,12 @@ fn group_blocks(choices: u64, receivers: u64, tile: u64) -> u64 {
 /// The first row of a grouping of every row: row 0.
 fn first_row(device: &seismic::Device) -> seismic::Tensor {
     i32_tensor(device, &[1], &[0])
+}
+
+/// A streamed layer's key records over its `experts` experts, zeroed, which
+/// its every route writes.
+fn key_records(device: &seismic::Device, experts: u64) -> seismic::Tensor {
+    i32_tensor(device, &[FLIGHT, constants::VERIFY_ROWS, experts], &vec![0; (FLIGHT * constants::VERIFY_ROWS * experts) as usize])
 }
 
 fn i32_tensor(device: &seismic::Device, shape: &[u64], values: &[i32]) -> seismic::Tensor {
@@ -2538,12 +2545,30 @@ fn output_mapping(
     }
 }
 
+/// `statics` beside those of the single residual stream that `declared`
+/// (an entry's statics) holds and `statics` does not name: the streams'
+/// join (`SN` 1, `IN` 0), the input's one normalized part (`PT` 1, `NM` the
+/// hidden width `H`), and absent per-expert scales and limit (`ES`, `GS`,
+/// `US`, `LB` 0).
+fn single_stream_statics<'a>(declared: &[String], statics: &[(&'a str, u64)]) -> Vec<(&'a str, u64)> {
+    let hidden = statics.iter().find(|(name, _)| *name == "H").map_or(0, |(_, value)| *value);
+    let defaults = [("SN", 1), ("IN", 0), ("PT", 1), ("NM", hidden), ("ES", 0), ("GS", 0), ("US", 0), ("LB", 0)];
+    statics
+        .iter()
+        .copied()
+        .chain(defaults.into_iter().filter(|(name, _)| {
+            declared.iter().any(|declared| declared == name) && !statics.iter().any(|(given, _)| given == name)
+        }))
+        .collect()
+}
+
 /// `mapping` where entry `E` declares each name on `device`'s backend: as an
 /// entry parameter, or in every launch that scopes it. The statics are E's
 /// over the single residual stream: with those of the streams' join (`SN` 1,
 /// `IN` 0) and input form (`PT` 1, `NM` the hidden width) that E declares,
 /// and the per-choice form of an entry with a gathered one (`GATHERED` 0)
-/// where `mapping` does not name it.
+/// where `mapping` does not name it; every launch parameter `mapping` does
+/// not name at its declared default.
 fn decode_specialization<E: seismic::Entry>(
     device: &seismic::Device,
     statics: &[(&str, u64)],
@@ -2552,40 +2577,14 @@ fn decode_specialization<E: seismic::Entry>(
     let implementation = seismic::generated::native_implementation::<E>(device)
         .unwrap()
         .unwrap();
-    let hidden = statics
-        .iter()
-        .find(|(name, _)| *name == "H")
-        .map_or(0, |(_, value)| *value);
-    // The single stream, its one normalized part and absent per-expert
-    // scales, for the statics E declares that `statics` does not name.
-    let defaults = [
-        ("SN", 1),
-        ("IN", 0),
-        ("PT", 1),
-        ("NM", hidden),
-        ("ES", 0),
-        ("GS", 0),
-        ("US", 0),
-        ("LB", 0),
-    ];
-    let statics = statics
-        .iter()
-        .copied()
-        .chain(defaults.into_iter().filter(|(name, _)| {
-            implementation
-                .statics
-                .iter()
-                .any(|declared| declared == name)
-                && !statics.iter().any(|(given, _)| given == name)
-        }))
-        .collect::<Vec<_>>();
+    let statics = single_stream_statics(&implementation.statics, statics);
     // The per-choice decode expansion, for an entry with a gathered form
     // the mapping does not name (`GATHERED`).
     let forms = [("GATHERED", 0)].into_iter().filter(|(name, _)| {
         implementation.params.iter().any(|parameter| parameter.name == *name)
             && !mapping.iter().any(|(given, _)| given == name)
     });
-    mapping.iter().copied().chain(forms).collect::<Vec<_>>().iter().fold(
+    let mapped = mapping.iter().copied().chain(forms).collect::<Vec<_>>().iter().fold(
         specialization_on(device, &statics, &[]),
         |choice, (name, value)| {
             if implementation
@@ -2615,7 +2614,22 @@ fn decode_specialization<E: seismic::Entry>(
                 choice.with_launch_param(launch, *name, *value)
             })
         },
-    )
+    );
+    // Each launch parameter `mapping` leaves unvalued at its declared
+    // default: those of Metal's two-row and several-row launches, which
+    // their row counts tune apart from the one-row launch `mapping` names.
+    let dimension = |name: &str| statics.iter().find(|(given, _)| *given == name).map(|(_, value)| *value);
+    let mut defaults = implementation.parameter_defaults(&dimension).unwrap().into_iter().skip(implementation.params.len());
+    let mut specialization = mapped;
+    for (launch, declaration) in implementation.launches.iter().enumerate() {
+        for parameter in &declaration.params {
+            let default = defaults.next().expect("a default for every launch parameter");
+            if specialization.launch_param(launch, &parameter.name).is_none() {
+                specialization = specialization.with_launch_param(launch, parameter.name.as_str(), default);
+            }
+        }
+    }
+    specialization
 }
 
 /// `mapping` of decode entry `E` at mapping `index`: where its native
@@ -3399,23 +3413,40 @@ fn cpu_decode_carries_operands_across_block_graphs() {
 }
 
 fn native_decode_expand_and_output_match_reference_on(device: &seismic::Device, int8: bool) {
-    native_decode_expand_and_output_match_reference_rows(
+    let ran = native_decode_expand_and_output_match_reference_rows(
         device,
         PackedBlock::new(device, Experts::Packed),
         int8,
-        &[1, 3, 8],
+        &[1, 2, 3, 8],
         decode_mappings(device),
     );
+    // Every value of the Metal output's one top-level LANES, which every
+    // launch reads, is checked: the decode mappings value each.
+    if device.backend() == seismic::BackendName::Metal {
+        let implementation = routed_output::native_implementation(device).unwrap().unwrap();
+        let lanes = implementation
+            .params
+            .iter()
+            .find(|parameter| parameter.name == "LANES")
+            .expect("the output declares LANES at the top");
+        let mut declared = lanes.values.clone();
+        declared.sort_unstable();
+        assert_eq!(ran, declared, "the decode mappings run every declared LANES");
+    }
 }
 
+/// Checks the native decode expansion and output against the host reference
+/// at each of `row_counts` rows and each of `mappings`, and returns the
+/// output's LANES values the checks ran, sorted and distinct.
 fn native_decode_expand_and_output_match_reference_rows(
     device: &seismic::Device,
     block: PackedBlock,
     int8: bool,
     row_counts: &[usize],
     mappings: Vec<Vec<(&'static str, u64)>>,
-) {
+) -> Vec<u64> {
     let charges = seismic::Charges::tally(device);
+    let mut ran = Vec::new();
     let (h, k, f, s) = (
         PackedBlock::HIDDEN as u64,
         PackedBlock::CHOICES as u64,
@@ -3474,6 +3505,7 @@ fn native_decode_expand_and_output_match_reference_rows(
             if declared::declared_at(&device, &routed_output::native_entry_with(output_elements()), &output_specialization).is_err() {
                 continue;
             }
+            ran.extend(output_mapping.iter().filter(|(name, _)| *name == "LANES").map(|(_, value)| *value));
             let expanded = declared::prepared(
                 &device,
                 &routed_expand::native_entry_with(routed_expand::Elements {
@@ -3546,41 +3578,42 @@ fn native_decode_expand_and_output_match_reference_rows(
             // in reverse, the output keeps its bits, but for the choices of
             // the expert the sources name no record for (row 0's first),
             // which contribute nothing: the output whose scores for them
-            // are zero. The record a choice reads is one rule of every
-            // mapping, so the first stands for them.
-            if index == 0 {
-                let experts = PackedBlock::EXPERTS;
-                let unmapped = routing.routes[0];
-                let stacked = block.expert_down.read_to_host().unwrap();
-                let reversed =
-                    stacked.chunks_exact(stacked.len() / experts).rev().flatten().copied().collect::<Vec<_>>();
-                let bank = seismic::Tensor::from_host(
-                    &charges,
-                    block.expert_down.element(),
-                    &block.expert_down.extents(),
-                    &reversed,
-                )
-                .unwrap();
-                let records = routing
-                    .routes
-                    .iter()
-                    .map(|&expert| if expert == unmapped { -1 } else { experts as i32 - 1 - expert })
-                    .collect::<Vec<_>>();
-                let unscored = routing
-                    .routes
-                    .iter()
-                    .zip(&routing.scores)
-                    .map(|(&expert, &score)| if expert == unmapped { 0.0 } else { score })
-                    .collect::<Vec<_>>();
-                let bits = |values: Vec<f32>| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
-                assert_eq!(
-                    bits(output(&decode_sources(device, m, k, &records), &scores, &bank)),
-                    bits(output(&no_sources(device, m, k), &f32_tensor(device, &[m, k], &unscored), &block.expert_down)),
-                    "{label} output where its sources name"
-                );
-            }
+            // are zero. At every mapping, as the streamed launches (several
+            // rows' among them) are the mapping's own.
+            let experts = PackedBlock::EXPERTS;
+            let unmapped = routing.routes[0];
+            let stacked = block.expert_down.read_to_host().unwrap();
+            let reversed =
+                stacked.chunks_exact(stacked.len() / experts).rev().flatten().copied().collect::<Vec<_>>();
+            let bank = seismic::Tensor::from_host(
+                &charges,
+                block.expert_down.element(),
+                &block.expert_down.extents(),
+                &reversed,
+            )
+            .unwrap();
+            let records = routing
+                .routes
+                .iter()
+                .map(|&expert| if expert == unmapped { -1 } else { experts as i32 - 1 - expert })
+                .collect::<Vec<_>>();
+            let unscored = routing
+                .routes
+                .iter()
+                .zip(&routing.scores)
+                .map(|(&expert, &score)| if expert == unmapped { 0.0 } else { score })
+                .collect::<Vec<_>>();
+            let bits = |values: Vec<f32>| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(output(&decode_sources(device, m, k, &records), &scores, &bank)),
+                bits(output(&no_sources(device, m, k), &f32_tensor(device, &[m, k], &unscored), &block.expert_down)),
+                "{label} output where its sources name"
+            );
         }
     }
+    ran.sort_unstable();
+    ran.dedup();
+    ran
 }
 
 #[test]
@@ -4698,6 +4731,70 @@ impl Qwen35b {
             .collect()
     }
 
+    /// A residual row normalized as the router's norm does, in f64: the one
+    /// host reference of `routed_route`'s normalization.
+    fn host_normalized(&self, values: &[f32]) -> Vec<f64> {
+        let squares = values.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>();
+        let inverse = 1.0 / (squares / Self::HIDDEN as f64 + 1e-6).sqrt();
+        values.iter().zip(&self.norm).map(|(value, norm)| f64::from(*value) * inverse * f64::from(*norm)).collect()
+    }
+
+    /// The host reference's routing of a normalized row, the one place the
+    /// 35B's routing lives on the host: each expert's probability (the
+    /// softmax of its logit, an expert without router weights at
+    /// `UNUSED_ROUTER` of the row's total) and the experts ranked by it,
+    /// ties to the higher expert.
+    fn host_ranking(&self, normalized: &[f64]) -> (Vec<f64>, Vec<usize>) {
+        let (h, e) = (Self::HIDDEN, Self::EXPERTS);
+        let total = normalized.iter().sum::<f64>();
+        let logits = (0..e)
+            .map(|expert| match self.slot[expert] {
+                Some(_) => normalized
+                    .iter()
+                    .zip(&self.router[expert * h..(expert + 1) * h])
+                    .map(|(x, w)| x * f64::from(*w))
+                    .sum::<f64>(),
+                None => f64::from(bf16_round(UNUSED_ROUTER)) * total,
+            })
+            .collect::<Vec<_>>();
+        let probability = softmax(&logits);
+        let ranked = ranked_choices(&probability, e);
+        (probability, ranked)
+    }
+
+    /// The `CHOICES` experts a row of `values` routes to, ascending, by the
+    /// host reference, and the margin of the last choice's probability over
+    /// the next expert's, relative to it.
+    fn selection(&self, values: &[f32]) -> (Vec<usize>, f64) {
+        let k = Self::CHOICES;
+        let (probability, ranked) = self.host_ranking(&self.host_normalized(values));
+        let margin = (probability[ranked[k - 1]] - probability[ranked[k]]) / probability[ranked[k - 1]];
+        let mut chosen = ranked[..k].to_vec();
+        chosen.sort_unstable();
+        (chosen, margin)
+    }
+
+    /// Two residual rows that route to different experts, so a front row has
+    /// skips beside its exact row: `residual(2)`'s first row, and the first
+    /// of its candidate rows (positive, as `residual`'s) whose host-reference
+    /// routing has an absent expert (not the held expert 1) the first lacks,
+    /// by a clear margin at the boundary, which no backend's rounding can flip.
+    fn diverging_residual_rows(&self) -> Vec<f32> {
+        let h = Self::HIDDEN;
+        let first = Self::residual(2)[..h].to_vec();
+        let (routes, margin) = self.selection(&first);
+        assert!(margin > 1e-3, "the first row routes at a near tie");
+        let second = (0..256u32)
+            .map(|seed| pattern(h, 1000 + seed, 1.0).into_iter().map(|v| v + 1.5).collect::<Vec<f32>>())
+            .find(|candidate| {
+                let (other, margin) = self.selection(candidate);
+                // An absent expert (every one but the held expert 1) only the second row routes to.
+                margin > 1e-3 && other.iter().any(|expert| *expert != 1 && !routes.contains(expert))
+            })
+            .expect("a candidate row routes differently from the first");
+        first.into_iter().chain(second).collect()
+    }
+
     /// Native routing of `residual`, checked against the host reference;
     /// every SIMDGROUPS mapping must give the same bits (at the backend's
     /// first split).
@@ -4779,43 +4876,16 @@ impl Qwen35b {
         for row in 0..rows {
             let label = format!("rows {rows} row {row}");
             let values = &residual[row * h..(row + 1) * h];
-            let squares = values
-                .iter()
-                .map(|v| f64::from(*v) * f64::from(*v))
-                .sum::<f64>();
-            let inverse = 1.0 / (squares / h as f64 + 1e-6).sqrt();
             let normalized = &native.normalized_values[row * h..(row + 1) * h];
-            for (index, (value, actual)) in values.iter().zip(normalized).enumerate() {
-                let expected = f64::from(*value) * inverse * f64::from(self.norm[index]);
+            for (index, (expected, actual)) in self.host_normalized(values).into_iter().zip(normalized).enumerate() {
                 assert!(
                     (f64::from(*actual) - expected).abs() <= 8e-3 * expected.abs(),
                     "{label} normalized[{index}]: native {actual}, reference {expected}"
                 );
             }
-            // Logits from the native normalized row, in f64.
-            let total = normalized.iter().map(|v| f64::from(*v)).sum::<f64>();
-            let logits = (0..e)
-                .map(|expert| match self.slot[expert] {
-                    Some(_) => normalized
-                        .iter()
-                        .zip(&self.router[expert * h..(expert + 1) * h])
-                        .map(|(x, w)| f64::from(*x) * f64::from(*w))
-                        .sum::<f64>(),
-                    None => f64::from(bf16_round(UNUSED_ROUTER)) * total,
-                })
-                .collect::<Vec<_>>();
-            let maximum = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let exponentials = logits
-                .iter()
-                .map(|logit| (logit - maximum).exp())
-                .collect::<Vec<_>>();
-            let sum = exponentials.iter().sum::<f64>();
-            let probability = exponentials
-                .iter()
-                .map(|value| value / sum)
-                .collect::<Vec<_>>();
-            let mut ranked = (0..e).collect::<Vec<_>>();
-            ranked.sort_by(|a, b| probability[*b].total_cmp(&probability[*a]).then(b.cmp(a)));
+            // Probabilities from the native normalized row, in f64.
+            let native_row = normalized.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
+            let (probability, ranked) = self.host_ranking(&native_row);
             let routes = &native.routes_values[row * k..(row + 1) * k];
             let scores = &native.scores_values[row * k..(row + 1) * k];
             let mut chosen = routes
@@ -5701,11 +5771,11 @@ fn file_words(choices: u64, q: u64, requested: &[i32], records: &[(u64, i32)], a
     let slot = table.lane(q, 0);
     words[(slot + constants::FILE_COUNT) as usize] = requested.len() as i32;
     for (choice, &word) in requested.iter().enumerate() {
-        words[(slot + SlotTable::file_entry(choice as u64) + constants::FILE_CHOICE) as usize] = word;
+        words[(slot + constants::FILE_ENTRY(choice as u64) + constants::FILE_CHOICE) as usize] = word;
     }
     set_pair(&mut words, slot + constants::SLOT_REQUEST, q);
     for &(choice, record) in records {
-        words[(slot + SlotTable::file_entry(choice) + constants::FILE_RECORD) as usize] = record;
+        words[(slot + constants::FILE_ENTRY(choice) + constants::FILE_RECORD) as usize] = record;
     }
     if let Some(answer) = answer {
         set_pair(&mut words, slot + constants::SLOT_ANSWER, answer);
@@ -5960,15 +6030,14 @@ fn record_layout(element: seismic::Element, shape: &[u64]) -> seismic::SlabLayou
 /// every record holding `bytes`: the records as a kernel's record port
 /// binds them, and the store, which must outlive them.
 fn record_store(charges: &seismic::Charges, pool: &seismic::Pool, element: seismic::Element, shape: &[u64], bytes: &[u8]) -> (seismic::Tensor, seismic::SlabTensor) {
-    let store = seismic::SlabTensor::in_pool(charges, pool, 1, shape[0], &record_regions(element, shape)).unwrap();
-    for _ in 0..shape[0] {
+    let records = shape[0];
+    let store = seismic::SlabTensor::in_pool(charges, pool, 1, records, &record_regions(element, shape)).unwrap();
+    let per = bytes.len().checked_div(records as usize).unwrap_or(0);
+    assert_eq!(per * records as usize, bytes.len(), "record bytes must divide evenly across {records} records");
+    for record in 0..records {
         store.add_slab(seismic::SlabFill::Zeroed).unwrap();
-    }
-    if shape[0] > 0 {
-        let row_bytes = bytes.len() / shape[0] as usize;
-        for (row, chunk) in bytes.chunks_exact(row_bytes).enumerate() {
-            store.region_rows(0, row as u64, 1).unwrap().write_from_host(chunk).unwrap();
-        }
+        let start = record as usize * per;
+        store.region_rows(0, record, 1).unwrap().write_from_host(&bytes[start..start + per]).unwrap();
     }
     (store.logical_region(0).unwrap(), store)
 }
@@ -6077,6 +6146,188 @@ impl TierServing {
             _ => (bank, tier),
         }
     }
+}
+
+/// A streamed layer's gate/up in two passes (`routed_gate_up_part`: the early
+/// pass before the tier wait, the late pass after it) forms, bit for bit, the
+/// product `routed_gate_up` forms in one pass over the same rows with the
+/// sources the wait left, for M = 1 to VERIFY_ROWS rows (Metal's two-row and
+/// several-row launches), whichever choices the route left absent (none,
+/// alternate experts, all). The rows share experts, and the odd rows are
+/// front rows ([`front_sharing_routes`]): a front row's absent choice of an
+/// expert an exact row also chose is sourced by the wait, its record shared,
+/// as resolve loads it; any other absent choice of it no wait sources (-1
+/// after it too), so it holds a zero product. Where the backend declares a
+/// gathered form (`GATHERED`), both entries run each form.
+#[test]
+fn gate_up_in_two_passes_forms_the_one_pass_product() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let charges = seismic::Charges::tally(&device);
+    // The gathered form, where the passes declare it as the gate/up does.
+    let declared = [
+        routed_gate_up::native_implementation(&device).unwrap().expect("every backend implements the gate/up"),
+        routed_gate_up_part::native_implementation(&device).unwrap().expect("a streaming backend implements the gate/up passes"),
+    ]
+    .map(|implementation| implementation.params.iter().any(|parameter| parameter.name == "GATHERED"));
+    assert_eq!(declared[0], declared[1], "the gate/up passes declare the gathered form as the gate/up does");
+    let decode = decode_mappings(&device);
+    // Each case's mapping, shared by the one-pass gate/up and the passes, in
+    // each declared form.
+    let forms: &[u64] = if declared[0] { &[0, 1] } else { &[0] };
+    let mappings = [&decode[0], &decode[decode.len() - 1]]
+        .into_iter()
+        .flat_map(|mapping| {
+            forms.iter().map(move |&form| {
+                let mut mapping = mapping.clone();
+                if declared[0] {
+                    mapping.push(("GATHERED", form));
+                }
+                mapping
+            })
+        })
+        .collect::<Vec<_>>();
+    let bf16 = seismic::Element::bf16();
+    let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+    let kinds = StreamedKind::qwen35b(&device);
+    let (h, f, k, e) = (Qwen35b::HIDDEN as u64, Qwen35b::FEATURES as u64, Qwen35b::CHOICES as u64, 16u64);
+    let (ku, fu) = (k as usize, f as usize);
+    let serving = TierServing::new(&device, &kinds, e);
+    let (gate, tier_gate) = serving.stores(0, Served::Bank);
+    let (up, tier_up) = serving.stores(1, Served::Bank);
+    let (limit, gate_scale, up_scale) = (no_limit(&device), absent(&device), absent(&device));
+    let mut cases = 0usize;
+    // A front row's absent choices: skipped, and sourced by the wait as an
+    // exact row chose the same expert.
+    let mut fronts = [0usize; 2];
+    for mapping in &mappings {
+        let one = routed_gate_up::native_for_device_with(
+            &device,
+            routed_gate_up::Elements { A: bf16, EGW: kinds[0].resident, EUW: kinds[1].resident },
+            &decode_specialization::<routed_gate_up::Entry>(&device, &[("H", h), ("K", k), ("F", f)], mapping),
+        )
+        .unwrap();
+        let part = routed_gate_up_part::native_for_device_with(
+            &device,
+            routed_gate_up_part::Elements { A: bf16, EGW: kinds[0].resident, EUW: kinds[1].resident },
+            &decode_specialization::<routed_gate_up_part::Entry>(&device, &[("H", h), ("K", k), ("F", f)], mapping),
+        )
+        .unwrap();
+        for m in 1..=constants::VERIFY_ROWS {
+            let routes_values = front_sharing_routes(m, k, e);
+            let routes = i32_tensor(&device, &[m, k], &routes_values);
+            let normalized_values = pattern((m * h) as usize, 73, 1.0);
+            let normalized = bf16_tensor(&device, &[m, h], &normalized_values);
+            let choices = (m * k) as usize;
+            let records = routes_values.iter().map(|&expert| serving.bank_record(expert as u64) as i32).collect::<Vec<_>>();
+            // The experts the route left absent (every choice of one is, as the route copies an
+            // expert's first source): none, every other one, all.
+            for (label, absent_expert) in [
+                ("none absent", (|_: i32| false) as fn(i32) -> bool),
+                ("alternate experts absent", |expert| expert % 2 == 1),
+                ("all absent", |_| true),
+            ] {
+                let label = format!("rows {m} {mapping:?} {label}");
+                let front = |choice: usize| (choice / ku) % 2 == 1;
+                // An exact row's choice of an expert, which its wait sources.
+                let exact_chose = |expert: i32| (0..choices).any(|other| !front(other) && routes_values[other] == expert);
+                let early_records = (0..choices)
+                    .map(|choice| if absent_expert(routes_values[choice]) { -1 } else { records[choice] })
+                    .collect::<Vec<_>>();
+                // The wait sources every absent choice of an expert an exact
+                // row chose, a front row's among them (its record shared),
+                // and no other: a front row skips those.
+                let waited = (0..choices)
+                    .map(|choice| match front(choice) && !exact_chose(routes_values[choice]) {
+                        true => early_records[choice],
+                        false => records[choice],
+                    })
+                    .collect::<Vec<_>>();
+                for choice in (0..choices).filter(|&choice| front(choice) && early_records[choice] == -1) {
+                    fronts[usize::from(waited[choice] != -1)] += 1;
+                }
+                let (early, full) = (decode_sources(&device, m, k, &early_records), decode_sources(&device, m, k, &waited));
+                let flight = 2u64;
+                let sequence = 3u64;
+                let width = constants::ROUTING_WORDS(choices as u64) as usize;
+                let mut ring = vec![0; flight as usize * width];
+                let slot = (sequence % flight) as usize;
+                for choice in 0..choices {
+                    ring[slot * width + constants::ROUTING_SOURCE(choices as u64, choice as u64) as usize] = early_records[choice];
+                }
+                let routing = shared_i32(&device, &[flight, width as u64], &ring);
+                let step = shared_i32(&device, &[constants::STEP_WORDS], &step_words(sequence));
+                // The product starts as another step's leftovers: the early pass writes every row of it.
+                let mut product = bf16_tensor(&device, &[m, k, f], &vec![0.375; (m * k * f) as usize]);
+                for (late, sources) in [(0, &early), (1, &full)] {
+                    part.call(&charges, routed_gate_up_part::Args {
+                        normalized: &normalized,
+                        routes: &routes,
+                        sources,
+                        expert_gate: gate,
+                        expert_up: up,
+                        tier_gate,
+                        tier_up,
+                        activation: 0,
+                        glu_limit: &limit,
+                        gate_scale: &gate_scale,
+                        up_scale: &up_scale,
+                        routing: &routing,
+                        step: &step,
+                        late,
+                        product: &mut product,
+                    })
+                    .unwrap();
+                }
+                let product = bits(&read_bf16(&product));
+                let one_pass = one
+                    .call(&charges, routed_gate_up::Args {
+                        normalized: &normalized,
+                        routes: &routes,
+                        sources: &full,
+                        expert_gate: gate,
+                        expert_up: up,
+                        tier_gate,
+                        tier_up,
+                        activation: 0,
+                        glu_limit: &limit,
+                        gate_scale: &gate_scale,
+                        up_scale: &up_scale,
+                    })
+                    .unwrap()
+                    .value;
+                let one_pass = bits(&read_bf16(&one_pass));
+                for row in (0..m as usize).filter(|&row| waited[row * ku..(row + 1) * ku].iter().any(|&source| source != -1)) {
+                    assert!(one_pass[row * ku * fu..(row + 1) * ku * fu].iter().any(|&value| value != 0), "{label}: row {row} has a product");
+                }
+                assert_eq!(product, one_pass, "{label}: the two passes against one");
+                cases += 1;
+            }
+        }
+    }
+    assert!(fronts.iter().all(|&count| count > 0), "a front row's absent choices were skipped and waited for {fronts:?} times");
+    println!("gate/up passes on {:?}: {cases} cases against one pass", device.backend());
+}
+
+/// Decode rows `rows` of `choices` choices over `experts` experts (at least
+/// 4 `choices`), each exact (even) row choosing even experts, row m's choice
+/// k (4 m + 2 k) mod E, rows sharing them; each front (odd) row choosing
+/// its even choices as the exact row before it does and its odd ones odd
+/// experts no exact row chooses ((2 (k + m) + 1) mod E).
+fn front_sharing_routes(rows: u64, choices: u64, experts: u64) -> Vec<i32> {
+    (0..rows)
+        .flat_map(|row| {
+            (0..choices).map(move |choice| {
+                let expert = match (row % 2, choice % 2) {
+                    (0, _) => 4 * row + 2 * choice,
+                    (_, 0) => 4 * (row - 1) + 2 * choice,
+                    _ => 2 * (choice + row) + 1,
+                };
+                (expert % experts) as i32
+            })
+        })
+        .collect()
 }
 
 /// Decode rows `rows` of `choices` choices over `experts` experts, choice k
@@ -6297,7 +6548,7 @@ fn a_scratch_request_counts_every_choice_of_every_row() {
 /// as serving encodes it: `routed_step` sets the step's sequence;
 /// `routed_scratch_request` publishes each expert's choice count and the
 /// sequence; the window's round 0 landing launch arrives at lane
-/// `SCRATCH_ROUND + w * rounds`, and its host, having written the count of
+/// `ROUND_LANE(w * rounds)`, and its host, having written the count of
 /// records the window's rounds convert (`SCRATCH_STAGED` in that round-0
 /// lane), appends round 0's records to its landing list and answers it;
 /// `routed_scratch_grids` then writes every round's park grid of the window,
@@ -6337,12 +6588,13 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
     let mut scratch = form.records(&device, true, experts, |tensor, slot| (slot == lent_slot).then(|| lent(tensor)));
 
     // The step's sequence.
-    let mut step = i32_tensor(&device, &[constants::STEP_WORDS], &[0, 0]);
+    let mut step = i32_tensor(&device, &[constants::STEP_WORDS], &[0; constants::STEP_WORDS as usize]);
     declared::prepared(&device, &routed_step::native_entry(), &seismic::NativeSpecialization::new())
         .unwrap()
         .call(&charges, routed_step::Args {
             step: &mut step,
             sequence: &i32_tensor(&device, &[constants::STEP_WORDS], &step_words(sequence as u64)),
+            guesses: &no_tokens(&device),
         })
         .unwrap();
     assert_eq!(read_i32(&step), step_words(sequence as u64), "step");
@@ -6354,7 +6606,7 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
     let q = sequence as u64;
     let lane = |lane: u64| table.lane(q, lane);
     let ask = lane(constants::SCRATCH_ASK);
-    let first = lane(constants::SCRATCH_ROUND + w * rounds);
+    let first = lane(constants::ROUND_LANE(w * rounds));
     let mut scratch_table = shared_i32(&device, &table.extents(), &vec![0; table.words() as usize]);
     let _pulse = pulse(&scratch_table, table);
     let k = 4u64;
@@ -6382,7 +6634,7 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
     assert_eq!(unpulsed(read_i32(&scratch_table), table), expected, "the request in its lane");
 
     let kernel = form.round_kernel(&device);
-    let extent = landing_extent(round_records as u64);
+    let extent = constants::LANDING_ENTRY(round_records as u64);
     let landings = (0..rounds).map(|_| shared_i32(&device, &[extent], &vec![0; extent as usize])).collect::<Vec<_>>();
     // Round `round`'s launch of window `w` on `grid`. Where kernels park
     // themselves, the launch arrives and spins, and the host serves once the
@@ -6397,7 +6649,7 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
     // u64 is whole at its low word.
     let in_kernels = device.backend().parks_in_kernels();
     let park = |table: &mut seismic::Tensor, scratch: &mut [seismic::Tensor; 3], round: u64, grid: &seismic::Tensor| {
-        let at = lane(constants::SCRATCH_ROUND + w * rounds + round);
+        let at = lane(constants::ROUND_LANE(w * rounds + round));
         let mut landing = landings[round as usize].clone();
         let serve = |served: &seismic::Tensor, landing: &seismic::Tensor| {
             if let Some(pairs) = lists.get(round as usize) {
@@ -6417,8 +6669,8 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
             }
         };
         let (served, appended) = (table.clone(), landing.clone());
-        let tiered = host_words(&device, &[list_extent(experts)]);
-        let seeds = host_words(&device, &[list_extent(experts)]);
+        let tiered = host_words(&device, &[constants::LIST_ENTRY(experts)]);
+        let seeds = host_words(&device, &[constants::LIST_ENTRY(experts)]);
         let map = host_words(&device, &[experts, constants::MAP_WORDS]);
         let [gate, up, down] = scratch.each_mut();
         let args = routed_round::Args {
@@ -6482,7 +6734,7 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
     set_pair(&mut expected, ask + constants::SLOT_ANSWER, q);
     expected[(first + constants::SCRATCH_STAGED) as usize] = records as i32;
     for round in 0..=lists.len() as u64 {
-        let at = lane(constants::SCRATCH_ROUND + w * rounds + round);
+        let at = lane(constants::ROUND_LANE(w * rounds + round));
         set_pair(&mut expected, at + constants::SLOT_REQUEST, q);
         set_pair(&mut expected, at + constants::SLOT_ANSWER, q);
     }
@@ -6544,7 +6796,7 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
 
 /// On every backend that streams, `routed_seed_commit` commits a window's
 /// listed bank records with the step's low word iff that window's last round
-/// lane (`SCRATCH_ROUND + window[0] * rounds + rounds - 1`) holds the step's
+/// lane (`ROUND_LANE(window[0] * rounds + rounds - 1)`) holds the step's
 /// answer and the list names the step: answering another window's last round,
 /// only the window's earlier round, failing the lane, or naming another step
 /// commits nothing.
@@ -6559,7 +6811,7 @@ fn streaming_seed_commit_commits_a_completed_windows_records() {
     let (windows, w, rounds, capacity, bank) = (2u64, 1u64, 2u64, 4usize, 8u64);
     let window = i32_tensor(&device, &[1], &[w as i32]);
     let table = SlotTable::scratch(FLIGHT, windows * rounds);
-    let lane = |index: u64| table.lane(q, constants::SCRATCH_ROUND + index);
+    let lane = |index: u64| table.lane(q, constants::ROUND_LANE(index));
     let pairs = [(0, 6), (2, 1), (3, 4)];
     let count = 2usize;
     let kernel = declared::prepared(&device, &routed_seed_commit::native_entry(), &specialize(&[("X", capacity as u64)], &[])).unwrap();
@@ -6573,7 +6825,7 @@ fn streaming_seed_commit_commits_a_completed_windows_records() {
     ] {
         let mut scratch = vec![0; table.words() as usize];
         set_pair(&mut scratch, lane(answered_lane) + constants::SLOT_ANSWER, answer);
-        let list = shared_i32(&device, &[list_extent(capacity as u64)], &list_words(list_seq, count, &pairs, capacity));
+        let list = shared_i32(&device, &[constants::LIST_ENTRY(capacity as u64)], &list_words(list_seq, count, &pairs, capacity));
         let mut commits = shared_i32(&device, &[bank], &vec![-5; bank as usize]);
         kernel
             .call(&charges, routed_seed_commit::Args {
@@ -6605,14 +6857,14 @@ const RESIDENT_LAYOUTS: [registry::Layout; 3] = [
     registry::Layout::Rows16,
 ];
 
-/// A list's words (`list[list_extent(capacity)]`): the step it was written
+/// A list's words (`list[constants::LIST_ENTRY(capacity)]`): the step it was written
 /// for, the count, then the pairs, zero past them.
 fn list_words(sequence: i32, count: usize, pairs: &[(i32, i32)], capacity: usize) -> Vec<i32> {
-    let mut words = vec![0; list_extent(capacity as u64) as usize];
+    let mut words = vec![0; constants::LIST_ENTRY(capacity as u64) as usize];
     words[constants::LIST_SEQUENCE as usize] = sequence;
     words[constants::LIST_COUNT as usize] = count as i32;
     for (index, &(from, to)) in pairs.iter().enumerate() {
-        let entry = list_extent(index as u64) as usize;
+        let entry = constants::LIST_ENTRY(index as u64) as usize;
         words[entry + constants::LIST_FROM as usize] = from;
         words[entry + constants::LIST_TO as usize] = to;
     }
@@ -6622,15 +6874,15 @@ fn list_words(sequence: i32, count: usize, pairs: &[(i32, i32)], capacity: usize
 /// The 35B's two record forms: gate (and up, the same form) and down.
 const RECORD_FORMS: [usize; 2] = [0, 2];
 
-/// A landing list's words (`landing[landing_extent(capacity)]`): its head,
+/// A landing list's words (`landing[constants::LANDING_ENTRY(capacity)]`): its head,
 /// the step's low word `low` and the count `count` landed, then each (from,
 /// to) pair, its DONE word zero, zero past them.
 fn landing_words(low: i32, count: usize, pairs: &[(i32, i32)], capacity: usize) -> Vec<i32> {
-    let mut words = vec![0; landing_extent(capacity as u64) as usize];
+    let mut words = vec![0; constants::LANDING_ENTRY(capacity as u64) as usize];
     words[constants::LANDING_HEAD as usize] = low;
     words[constants::LANDING_HEAD as usize + 1] = count as i32;
     for (index, &(from, to)) in pairs.iter().enumerate() {
-        let entry = landing_extent(index as u64) as usize;
+        let entry = constants::LANDING_ENTRY(index as u64) as usize;
         words[entry + constants::LANDING_FROM as usize] = from;
         words[entry + constants::LANDING_TO as usize] = to;
     }
@@ -6639,14 +6891,14 @@ fn landing_words(low: i32, count: usize, pairs: &[(i32, i32)], capacity: usize) 
 
 /// The word of entry `entry`'s DONE in a landing list.
 fn landing_done(entry: usize) -> usize {
-    landing_extent(entry as u64) as usize + constants::LANDING_DONE as usize
+    constants::LANDING_ENTRY(entry as u64) as usize + constants::LANDING_DONE as usize
 }
 
 /// A host appending entry `index` (from, to) to a running launch's landing
 /// list of step low word `low`, as its read lands: the entry's words, then
 /// the head (the step's low word, the count) by one 64-bit release store.
 fn append_landing(landing: &seismic::Tensor, low: i32, index: usize, from: i32, to: i32) {
-    let entry = landing_extent(index as u64);
+    let entry = constants::LANDING_ENTRY(index as u64);
     landing.store_release(4 * (entry + constants::LANDING_FROM), from as u32).unwrap();
     landing.store_release(4 * (entry + constants::LANDING_TO), to as u32).unwrap();
     landing
@@ -6806,7 +7058,7 @@ fn served_round(
     let q = STREAMING_SEQUENCE as u64;
     let table = SlotTable::scratch(FLIGHT, 1);
     let mut words = vec![0; table.words() as usize];
-    set_pair(&mut words, table.lane(q, constants::SCRATCH_ROUND) + constants::SLOT_ANSWER, q);
+    set_pair(&mut words, table.lane(q, constants::ROUND_LANE(0)) + constants::SLOT_ANSWER, q);
     let [gate, up, down] = scratch.each_mut();
     kernel
         .call_answered(&charges, routed_round::Args {
@@ -6816,14 +7068,14 @@ fn served_round(
             rounds: 1,
             round: 0,
             landing,
-            tiered: &host_words(device, &[list_extent(1)]),
+            tiered: &host_words(device, &[constants::LIST_ENTRY(1)]),
             conveyor_gate: &conveyor[0],
             conveyor_up: &conveyor[1],
             conveyor_down: &conveyor[2],
             gate,
             up,
             down,
-            seeds: &host_words(device, &[list_extent(1)]),
+            seeds: &host_words(device, &[constants::LIST_ENTRY(1)]),
             map: &host_words(device, &[1, constants::MAP_WORDS]),
             grid: &i32_tensor(device, &[3], &[constants::LAND_GROUPS as i32, 1, 1]),
         })
@@ -6893,9 +7145,9 @@ fn streaming_list_grid_has_a_row_an_entry_of_the_steps_list() {
         let (grid, staged) = list_grid(&device, &list, &step);
         assert_eq!(read_i32(&grid), [blocks, expected, 1], "{count} entries of step {sequence}");
         let staged = read_i32(&staged);
-        let entries = constants::LIST_ENTRIES as usize + constants::LIST_ENTRY_WORDS as usize * staged_count;
+        let entries = constants::LIST_ENTRY(staged_count as u64) as usize;
         let mut expected = words[..entries].to_vec();
-        expected[constants::LIST_COUNT as usize] = staged_count as i32;
+        expected[constants::LIST_COUNT as usize] = staged_count;
         assert_eq!(&staged[..entries], expected.as_slice(), "the staged list of {count} entries of step {sequence}");
     }
 }
@@ -6941,7 +7193,7 @@ fn streaming_pass_map_resolves_each_experts_record_for_the_step() {
     let map = shared_i32(&device, &[experts, words as u64], &(0..experts).flat_map(row).collect::<Vec<_>>());
     let window = shared_i32(&device, &[experts], &(0..experts).map(place).collect::<Vec<_>>());
     let mut resolved = i32_tensor(&device, &[experts, words as u64], &vec![0; experts as usize * words]);
-    let mut pass_step = i32_tensor(&device, &[constants::STEP_WORDS], &[0, 0]);
+    let mut pass_step = i32_tensor(&device, &[constants::STEP_WORDS], &[0; constants::STEP_WORDS as usize]);
     declared::prepared(&device, &routed_pass_map::native_entry(), &seismic::NativeSpecialization::new())
         .unwrap()
         .call(&charges, routed_pass_map::Args { map: &map, window: &window, step: &step, resolved: &mut resolved, pass_step: &mut pass_step })
@@ -6955,7 +7207,7 @@ fn streaming_pass_map_resolves_each_experts_record_for_the_step() {
             3 | 4 => -2 - (expert % 17) as i32,
             _ => -1,
         };
-        assert_eq!(&resolved[at + from..at + from + 2], &step_words(q)[..], "expert {expert} from the step");
+        assert_eq!(&resolved[at + from..at + from + 2], &step_words(q)[..2], "expert {expert} from the step");
         assert_eq!(&resolved[at + until..at + until + 2], &[-1, -1], "expert {expert} while mapped");
         assert_eq!(resolved[at + record], expected, "expert {expert}'s record for the step");
     }
@@ -7019,7 +7271,7 @@ impl TierFill {
         let destination = seismic::Tensor::zeros(&charges, byte, &shape).unwrap();
         let step = streaming_step(device);
         let pairs = (0..copied as i32).map(|record| (record, record)).collect::<Vec<_>>();
-        let list = shared_i32(device, &[list_extent(records)], &list_words(STREAMING_SEQUENCE, copied, &pairs, records as usize));
+        let list = shared_i32(device, &[constants::LIST_ENTRY(records)], &list_words(STREAMING_SEQUENCE, copied, &pairs, records as usize));
         let (grid, staged) = list_grid(device, &list, &step);
         let grid = match blocks {
             None => grid,
@@ -7090,7 +7342,7 @@ fn compute_reading_a_fills_slots_follows_the_fill() {
     let mut read = seismic::Tensor::zeros(&charges, byte, &[records, 1, per]).unwrap();
     let step = &fill.tensors[2];
     let pairs = (0..records as i32).map(|record| (record, record)).collect::<Vec<_>>();
-    let list = shared_i32(&device, &[list_extent(records)], &list_words(STREAMING_SEQUENCE, records as usize, &pairs, records as usize));
+    let list = shared_i32(&device, &[constants::LIST_ENTRY(records)], &list_words(STREAMING_SEQUENCE, records as usize, &pairs, records as usize));
     let (grid, staged) = list_grid(&device, &list, step);
     let copy = declared::prepared(&device, &routed_copy::native_entry_with(routed_copy::Elements { U: byte }), &seismic::NativeSpecialization::new()).unwrap();
     let mut slot = fill.plan.new_slot(&charges).unwrap();
@@ -7130,13 +7382,14 @@ fn a_fronts_step_words_wait_for_no_other_places_fill() {
     let step = declared::prepared(&device, &routed_step::native_entry(), &seismic::NativeSpecialization::new()).unwrap();
     let words = step_words(STREAMING_SEQUENCE as u64);
     let sequence = i32_tensor(&device, &[constants::STEP_WORDS], &words);
-    let mut other = i32_tensor(&device, &[constants::STEP_WORDS], &[0, 0]);
+    let mut other = i32_tensor(&device, &[constants::STEP_WORDS], &[0; constants::STEP_WORDS as usize]);
+    let none = no_tokens(&device);
     let gate = seismic::Timeline::new(&device).unwrap();
     let filled = fill.submit(&device, &mut slot, seismic::NativeQueue::Fill, &gate, 1);
     // A call that waited for the fill would return only once the window
     // passed and the gate opened: the window bounds the failure, not the pass.
     let returned = returned_while_held(&gate, 1, std::time::Duration::from_secs(10), || {
-        step.call(&charges, routed_step::Args { step: &mut other, sequence: &sequence }).unwrap();
+        step.call(&charges, routed_step::Args { step: &mut other, sequence: &sequence, guesses: &none }).unwrap();
         assert!(!filled.is_complete(), "the fill ran before its gate opened");
     });
     assert!(returned, "another place's step words waited for the fill");
@@ -7147,7 +7400,7 @@ fn a_fronts_step_words_wait_for_no_other_places_fill() {
     // An ordered call cannot return while the gate is held, whatever the
     // window; one that did not wait returns within it.
     let returned = returned_while_held(&gate, 2, std::time::Duration::from_millis(200), || {
-        step.call(&charges, routed_step::Args { step: &mut own, sequence: &sequence }).unwrap();
+        step.call(&charges, routed_step::Args { step: &mut own, sequence: &sequence, guesses: &none }).unwrap();
     });
     assert!(!returned, "the fill's own step words were written while its gate held it");
     assert!(filled.is_complete(), "the fill's own step words were written while it read them");
@@ -7172,16 +7425,30 @@ fn returned_while_held(gate: &seismic::Timeline<seismic::timeline::Gate>, value:
     })
 }
 
+/// The guesses of a step whose graph runs no front row (`routed_step`'s
+/// `guesses` at T = 0).
+fn no_tokens(device: &seismic::Device) -> seismic::Tensor {
+    seismic::Tensor::zeros(&seismic::Charges::tally(device), seismic::Element::i32(), &[0, 2]).unwrap()
+}
+
+/// The grid a route writes of a step that requested its file slot
+/// (`resolve`'s `land_grid`): every landing group where the bank places
+/// (`placed`), the one where the host tier places.
+fn land_grid(device: &seismic::Device, placed: bool) -> seismic::Tensor {
+    i32_tensor(device, &[3], &[magnitude_kernels::land_groups(placed), 1, 1])
+}
+
 /// The step word `routed_step` sets from `STREAMING_SEQUENCE`, which it
 /// holds once the launch returns.
 fn streaming_step(device: &seismic::Device) -> seismic::Tensor {
     let charges = seismic::Charges::tally(device);
-    let mut step = i32_tensor(device, &[constants::STEP_WORDS], &[0, 0]);
+    let mut step = i32_tensor(device, &[constants::STEP_WORDS], &[0; constants::STEP_WORDS as usize]);
     declared::prepared(device, &routed_step::native_entry(), &seismic::NativeSpecialization::new())
         .unwrap()
         .call(&charges, routed_step::Args {
             step: &mut step,
             sequence: &i32_tensor(device, &[constants::STEP_WORDS], &step_words(STREAMING_SEQUENCE as u64)),
+            guesses: &no_tokens(device),
         })
         .unwrap();
     assert_eq!(read_i32(&step), step_words(STREAMING_SEQUENCE as u64), "step");
@@ -7268,7 +7535,7 @@ fn streaming_a_record_store_conveyor_lands_as_a_host_shared_one() {
     });
     let landed = |conveyor: &[seismic::Tensor; 3]| {
         let pairs = [(0, 0), (1, 1), (2, 2), (3, 3)];
-        let mut landing = shared_i32(&device, &[landing_extent(4)], &landing_words(STREAMING_SEQUENCE, 4, &pairs, 4));
+        let mut landing = shared_i32(&device, &[constants::LANDING_ENTRY(4)], &landing_words(STREAMING_SEQUENCE, 4, &pairs, 4));
         let mut scratch = form.records(&device, true, experts, |_, _| None);
         served_round(&device, &kernel, &step, &mut landing, conveyor, &mut scratch);
         scratch.map(|slots| slots.read_to_host().unwrap())
@@ -7354,7 +7621,7 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_tier() {
     };
     let map = shared_i32(&device, &[experts, words as u64], &(0..experts).flat_map(row).collect::<Vec<_>>());
     let mut resolved = i32_tensor(&device, &[experts, words as u64], &vec![0; experts as usize * words]);
-    let mut pass_step = i32_tensor(&device, &[constants::STEP_WORDS], &[0, 0]);
+    let mut pass_step = i32_tensor(&device, &[constants::STEP_WORDS], &[0; constants::STEP_WORDS as usize]);
     let pass_map = declared::prepared(&device, &routed_pass_map::native_entry(), &seismic::NativeSpecialization::new()).unwrap();
     let round_kernel = ServedForm::qwen35b(&device).round_kernel(&device);
 
@@ -7440,7 +7707,7 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_tier() {
         let base = w * window_slots as usize;
         let pairs = (0..batch.len()).map(|slot| ((base + slot) as i32, slot as i32)).collect::<Vec<_>>();
         let mut landing =
-            shared_i32(&device, &[landing_extent(pairs.len() as u64)], &landing_words(STREAMING_SEQUENCE, pairs.len(), &pairs, pairs.len()));
+            shared_i32(&device, &[constants::LANDING_ENTRY(pairs.len() as u64)], &landing_words(STREAMING_SEQUENCE, pairs.len(), &pairs, pairs.len()));
         served_round(&device, &round_kernel, &step, &mut landing, &conveyor, &mut scratch);
 
         let mut window_row = vec![-1i32; experts as usize];
@@ -7551,7 +7818,7 @@ fn assert_round_lands(device: &seismic::Device, form: &ServedForm, name: &str) {
     for (low, landed) in [(STREAMING_SEQUENCE, true), (STREAMING_SEQUENCE - 1, false)] {
         let label = format!("{name}, landed {landed}");
         let mut landing =
-            shared_i32(device, &[landing_extent(pairs.len() as u64)], &landing_words(low, count, &pairs, pairs.len()));
+            shared_i32(device, &[constants::LANDING_ENTRY(pairs.len() as u64)], &landing_words(low, count, &pairs, pairs.len()));
         let mut scratch = form.records(device, true, s, |tensor, slot| (lends && slot == 3).then(|| lent(tensor)));
         served_round(device, &kernel, &step, &mut landing, &conveyor, &mut scratch);
         for (tensor, slots) in scratch.iter().enumerate() {
@@ -7626,7 +7893,7 @@ fn streaming_a_landing_converts_records_appended_late_out_of_order() {
         let (table, words) = file_words(k, q, &requested, &[], None);
         let mut file = shared_i32(&device, &table.extents(), &words);
         let _pulse = pulse(&file, table);
-        let mut landing = shared_i32(&device, &[landing_extent(3)], &landing_words(low - FLIGHT as i32, 3, &[], 3));
+        let mut landing = shared_i32(&device, &[constants::LANDING_ENTRY(3)], &landing_words(low - FLIGHT as i32, 3, &[], 3));
         let mut sources = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
         let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
         let slot = table.lane(q, 0);
@@ -7636,12 +7903,13 @@ fn streaming_a_landing_converts_records_appended_late_out_of_order() {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 append_landing(landing, low, index, staged, record);
-                file.store_release(4 * (slot + SlotTable::file_entry(choice) + constants::FILE_RECORD), record as u32).unwrap();
+                file.store_release(4 * (slot + constants::FILE_ENTRY(choice) + constants::FILE_RECORD), record as u32).unwrap();
             }
             file.store_release_u64(4 * (slot + constants::SLOT_ANSWER), q).unwrap();
         };
         let (served, appended) = (file.clone(), landing.clone());
         let [gate, up, down] = bank.each_mut();
+        let grid = land_grid(&device, true);
         let args = routed_land::Args {
             step: &step,
             file: &mut file,
@@ -7654,6 +7922,7 @@ fn streaming_a_landing_converts_records_appended_late_out_of_order() {
             gate,
             up,
             down,
+            grid: &grid,
         };
         if in_kernels {
             std::thread::scope(|scope| {
@@ -7714,7 +7983,7 @@ fn streaming_a_landing_stops_once_its_slot_is_answered_or_failed() {
             let label = format!("{case}, run {run}");
             let (table, words) = file_words(k, q, &requested, &[(1, 1), (2, -1), (3, -1)], Some(answer));
             let mut file = shared_i32(&device, &table.extents(), &words);
-            let mut landing = shared_i32(&device, &[landing_extent(3)], &landing_words(low, 1, &[(0, 1)], 3));
+            let mut landing = shared_i32(&device, &[constants::LANDING_ENTRY(3)], &landing_words(low, 1, &[(0, 1)], 3));
             let mut sources = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
             let mut bank = form.records(&device, true, 6, |_, _| None);
             let [gate, up, down] = bank.each_mut();
@@ -7731,6 +8000,7 @@ fn streaming_a_landing_stops_once_its_slot_is_answered_or_failed() {
                     gate,
                     up,
                     down,
+                    grid: &land_grid(&device, true),
                 })
                 .unwrap();
             for (tensor, stack) in bank.iter().enumerate() {
@@ -7776,8 +8046,9 @@ fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {
     let file_proto = shared_i32(&device, &table.extents(), &proto_words);
     let sources_proto = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
     let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
-    let landing_proto = shared_i32(&device, &[landing_extent(3)], &landing_words(0, 0, &[], 3));
+    let landing_proto = shared_i32(&device, &[constants::LANDING_ENTRY(3)], &landing_words(0, 0, &[], 3));
     let bank_proto = form.records(&device, true, 6, |_, _| None);
+    let grid = land_grid(&device, true);
 
     let mut graph = device.native_graph();
     let park_port = graph.timeline(seismic::timeline::Park);
@@ -7787,6 +8058,7 @@ fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {
     let mut sources_port = port(&sources_proto);
     let policy_port = port(&policy);
     let mut landing_port = port(&landing_proto);
+    let grid_port = port(&grid);
     let staging_ports = [&staging[0], &staging[1], &staging[2]].map(&mut port);
     let bank_ports = [&bank_proto[0], &bank_proto[1], &bank_proto[2]].map(&mut port);
     let [mut gate_port, mut up_port, mut down_port] = bank_ports.clone();
@@ -7805,6 +8077,7 @@ fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {
                 gate: gate_port.tensor_mut().into(),
                 up: up_port.tensor_mut().into(),
                 down: down_port.tensor_mut().into(),
+                grid: grid_port.tensor().into(),
             },
         )
         .unwrap();
@@ -7826,8 +8099,8 @@ fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {
         let file1 = shared_i32(&device, &table.extents(), &words1);
         let _pulse0 = pulse(&file0, table);
         let _pulse1 = pulse(&file1, table);
-        let landing0 = shared_i32(&device, &[landing_extent(3)], &landing_words((q0 - FLIGHT) as i32, 3, &[], 3));
-        let landing1 = shared_i32(&device, &[landing_extent(3)], &landing_words((q1 - FLIGHT) as i32, 3, &[], 3));
+        let landing0 = shared_i32(&device, &[constants::LANDING_ENTRY(3)], &landing_words((q0 - FLIGHT) as i32, 3, &[], 3));
+        let landing1 = shared_i32(&device, &[constants::LANDING_ENTRY(3)], &landing_words((q1 - FLIGHT) as i32, 3, &[], 3));
         let sources0 = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
         let sources1 = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
         let bank0 = form.records(&device, true, 6, |_, _| None);
@@ -7838,7 +8111,7 @@ fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {
             let slot = table.lane(q, 0);
             for (index, &(staged, record, choice)) in LANDED.iter().enumerate() {
                 append_landing(landing, low, index, staged, record);
-                file.store_release(4 * (slot + SlotTable::file_entry(choice) + constants::FILE_RECORD), record as u32)
+                file.store_release(4 * (slot + constants::FILE_ENTRY(choice) + constants::FILE_RECORD), record as u32)
                     .unwrap();
             }
             file.store_release_u64(4 * (slot + constants::SLOT_ANSWER), q).unwrap();
@@ -7868,6 +8141,7 @@ fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {
                 (&bank_ports[0], &bank[0]),
                 (&bank_ports[1], &bank[1]),
                 (&bank_ports[2], &bank[2]),
+                (&grid_port, &grid),
             ] {
                 bindings.set(&charges, port, tensor).unwrap();
             }
@@ -7999,6 +8273,8 @@ fn native_landings_match_the_portable_body() {
         ];
         inputs.extend(staging.iter().map(|tensor| dense(tensor, DType::BF16)));
         inputs.extend(bank.iter().map(|tensor| dense(tensor, DType::F32)));
+        let groups = magnitude_kernels::land_groups(placed);
+        inputs.push(ints(&[3], &[groups, 1, 1]));
         let outcome = interpret(&module, "routed_land", &DENSE_LANDING, inputs);
 
         let mut sources = i32_tensor(&device, &[constants::SOURCE_ROWS, 1, k as u64], &source_words);
@@ -8017,6 +8293,7 @@ fn native_landings_match_the_portable_body() {
                 gate,
                 up,
                 down,
+                grid: &land_grid(&device, placed),
             })
             .unwrap();
         assert_eq!(read_i32(&sources), as_i32(input(&outcome, 2)), "{label}: sources");
@@ -8033,10 +8310,10 @@ fn native_landings_match_the_portable_body() {
         let (w, rounds, round) = (1i32, 2i32, 1i32);
         let table = SlotTable::scratch(FLIGHT, 4);
         let mut words = vec![0; table.words() as usize];
-        let lane = constants::SCRATCH_ROUND + (w * rounds + round) as u64;
+        let lane = constants::ROUND_LANE((w * rounds + round) as u64);
         set_pair(&mut words, table.lane(q, lane) + constants::SLOT_ANSWER, q);
         let landing = landing_words(low, 2, &pairs, 3);
-        let list = list_extent(1) as usize;
+        let list = constants::LIST_ENTRY(1) as usize;
         let [slots, width] = table.extents().map(|extent| extent as usize);
         let mut inputs = vec![
             ints(&[constants::STEP_WORDS as usize], &step_words(q)),
@@ -8067,14 +8344,14 @@ fn native_landings_match_the_portable_body() {
                 rounds,
                 round,
                 landing: &mut landing_tensor,
-                tiered: &host_words(&device, &[list_extent(1)]),
+                tiered: &host_words(&device, &[constants::LIST_ENTRY(1)]),
                 conveyor_gate: &conveyor[0],
                 conveyor_up: &conveyor[1],
                 conveyor_down: &conveyor[2],
                 gate,
                 up,
                 down,
-                seeds: &host_words(&device, &[list_extent(1)]),
+                seeds: &host_words(&device, &[constants::LIST_ENTRY(1)]),
                 map: &host_words(&device, &[1, constants::MAP_WORDS]),
                 grid: &i32_tensor(&device, &[3], &[constants::LAND_GROUPS as i32, 1, 1]),
             })
@@ -8111,6 +8388,304 @@ fn the_landing_is_encoded_only_while_an_expert_can_be_absent() {
         let conditions = native.launches.iter().map(|launch| launch.conditions.clone()).collect::<Vec<_>>();
         assert_eq!(conditions, [vec![resolved.clone()]], "{backend:?}");
     }
+}
+
+/// `routed_hint_route` and `routed_hint_select` write each lead's hint ring
+/// as `publish_hints` defines it, against a host reference: the lead's
+/// router ranks each row's experts (`rank_experts`: best first, routes stored
+/// worst first), and the ring names every predicted expert once, at its
+/// first appearance in rank order (every row's best, then every row's
+/// second, ...), with its rank, its row and its weight's word (the softmax
+/// probability for the route; for the selection, the score it ranked on less
+/// its bias), after its header (the count, and the step's words the ring
+/// carries). Lead 0 reads the `next_*` router, lead 1 the `after_*` one;
+/// with the next layer's POLICY_RESOLVED set no ring is written.
+/// Words no entry writes keep their sentinel. Every M = 1 to VERIFY_ROWS
+/// (the launch's capacity), AHEAD 1 and 2, and every admissible
+/// configuration. The routers' logits are exact in every backend's
+/// arithmetic and never tie ([`hint_router`]), so experts, ranks, rows and
+/// the header compare exactly; weights, the routing's floats, compare
+/// within a relative 1e-3.
+#[test]
+fn hint_rings_publish_each_leads_ranked_experts() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let charges = seismic::Charges::tally(&device);
+    let (h, e, k) = (Qwen35b::HIDDEN as u64, Qwen35b::EXPERTS as u64, Qwen35b::CHOICES as u64);
+    let (hu, eu, ku) = (h as usize, e as usize, k as usize);
+    let bf16 = seismic::Element::bf16();
+    // Each lead's router (`hint_router`) and its selection bias, which
+    // favours one expert past every score.
+    let classes: [fn(usize) -> i32; 2] = [
+        |expert| match expert % 21 {
+            5 => 1,
+            9 => -1,
+            _ => 0,
+        },
+        |expert| match expert % 19 {
+            3 => 1,
+            7 => -1,
+            _ => 0,
+        },
+    ];
+    let favoured = [17usize, 40];
+    let routers = classes.map(|class| bf16_tensor(&device, &[e, h], &hint_router(eu, hu, class)));
+    let biases = favoured.map(|favoured| (0..eu).map(|expert| if expert == favoured { 8.0 } else { 0.0 }).collect::<Vec<f32>>());
+    let bias_tensors = biases.clone().map(|bias| f32_tensor(&device, &[e], &bias));
+    let norm = bf16_tensor(&device, &[h], &vec![1.0; hu]);
+    let activation = bf16_tensor(&device, &[0, k], &[]);
+    let residual = hint_residual(constants::VERIFY_ROWS as usize, hu);
+    let mut unresolved = policy_words(0, 0, [0; 3]);
+    unresolved[constants::POLICY_RESOLVED as usize] = 0;
+    let mut resolved = unresolved.clone();
+    resolved[constants::POLICY_RESOLVED as usize] = 1;
+    // An entry's declared statics, from `given` and the single stream's.
+    let statics_of = |names: &[String], given: &[(&str, u64)]| {
+        let given = single_stream_statics(names, given);
+        names.iter().fold(seismic::NativeSpecialization::new(), |specialization, name| {
+            let (_, value) = given
+                .iter()
+                .find(|(candidate, _)| *candidate == name.as_str())
+                .unwrap_or_else(|| panic!("the case gives no static `{name}`"));
+            specialization.with_static(name.clone(), *value)
+        })
+    };
+    // The rings of one call over `m` rows: each case's step, policy and
+    // rings, the kernel run by `call`.
+    let case = |label: &str, m: u64, ahead: u64, scored: &dyn Fn(usize, usize) -> Vec<(usize, f64)>, call: &dyn Fn(&seismic::Tensor, &seismic::Tensor, &mut seismic::Tensor)| {
+        let ring = constants::HINT_ENTRY(m * k) as usize;
+        let step = guessed_step(0b1010_1010 & ((1 << m) - 1));
+        for (policy, written) in [(&unresolved, true), (&resolved, false)] {
+            let mut rings = shared_i32(&device, &[ahead, ring as u64], &vec![HINT_SENTINEL; ahead as usize * ring]);
+            call(
+                &i32_tensor(&device, &[constants::STEP_WORDS], &step),
+                &shared_i32(&device, &[constants::POLICY_WORDS], policy),
+                &mut rings,
+            );
+            let got = read_i32(&rings);
+            for lead in 0..ahead as usize {
+                let label = format!("{label} rows {m} AHEAD {ahead} lead {lead} written {written}");
+                let ring_words = &got[lead * ring..(lead + 1) * ring];
+                match written {
+                    true => {
+                        let ranked = (0..m as usize).map(|row| scored(lead, row)).collect::<Vec<_>>();
+                        assert_hint_ring(&label, ring_words, &expected_hint_ring(&step, &ranked, ku, ring));
+                    }
+                    false => assert!(ring_words.iter().all(|&word| word == HINT_SENTINEL), "{label}: a resolved layer's ring is untouched: {ring_words:?}"),
+                }
+            }
+        }
+    };
+    let mut cases = 0usize;
+    for ahead in [1u64, 2] {
+        let entry = routed_hint_route::native_entry_with(routed_hint_route::Elements { NW: bf16, RW: bf16, A: bf16 });
+        let implementation = entry.offered(&device).unwrap().unwrap();
+        let statics = statics_of(&implementation.statics, &[("H", h), ("NM", h), ("K", k), ("AHEAD", ahead), ("EN", e)]);
+        let mut configurations = Vec::new();
+        implementation
+            .implementation()
+            .walk_admissible(&implementation.implementation().with_owned_defaults(statics), |configuration| {
+                configurations.push(configuration.clone());
+                true
+            })
+            .unwrap();
+        for configuration in configurations {
+            let kernel = entry.prepare(&device, &configuration).unwrap();
+            let label = format!("routed_hint_route {:?}", configuration.params());
+            for m in 1..=constants::VERIFY_ROWS {
+                let scored = |lead: usize, row: usize| {
+                    let logits = (0..eu).map(|expert| hint_logit(row, expert, classes[lead])).collect::<Vec<_>>();
+                    let probabilities = softmax(&logits);
+                    ranked_choices(&logits, ku).into_iter().map(|expert| (expert, probabilities[expert])).collect::<Vec<_>>()
+                };
+                case(&label, m, ahead, &scored, &|step, policy, rings| {
+                    kernel
+                        .call(&charges, routed_hint_route::Args {
+                            residual: &f32_tensor(&device, &[m, h], &residual[..m as usize * hu]),
+                            activation: &activation,
+                            next_norm: &norm,
+                            next_router: &routers[0],
+                            after_norm: &norm,
+                            after_router: &routers[1],
+                            eps: 1e-6,
+                            step,
+                            next_policy: policy,
+                            rings,
+                        })
+                        .unwrap();
+                });
+                cases += 1;
+            }
+        }
+        let entry = routed_hint_select::native_entry_with(routed_hint_select::Elements { RNW: bf16, RW: bf16, A: bf16 });
+        let implementation = entry.offered(&device).unwrap().unwrap();
+        let statics = statics_of(&implementation.statics, &[("H", h), ("K", k), ("AHEAD", ahead), ("EN", e)]);
+        let mut configurations = Vec::new();
+        implementation
+            .implementation()
+            .walk_admissible(&implementation.implementation().with_owned_defaults(statics), |configuration| {
+                configurations.push(configuration.clone());
+                true
+            })
+            .unwrap();
+        for configuration in configurations {
+            let kernel = entry.prepare(&device, &configuration).unwrap();
+            for score in 0..3 {
+                let label = format!("routed_hint_select score {score} {:?}", configuration.params());
+                for m in 1..=constants::VERIFY_ROWS {
+                    let scored = |lead: usize, row: usize| {
+                        let logits = (0..eu).map(|expert| hint_logit(row, expert, classes[lead])).collect::<Vec<_>>();
+                        let scores = selection_scores(&logits, score);
+                        let ranked = scores.iter().zip(&biases[lead]).map(|(score, &bias)| score + bias as f64).collect::<Vec<_>>();
+                        ranked_choices(&ranked, ku).into_iter().map(|expert| (expert, scores[expert])).collect::<Vec<_>>()
+                    };
+                    case(&label, m, ahead, &scored, &|step, policy, rings| {
+                        kernel
+                            .call(&charges, routed_hint_select::Args {
+                                residual: &f32_tensor(&device, &[m, h], &residual[..m as usize * hu]),
+                                activation: &activation,
+                                next_router_norm: &norm,
+                                next_router: &routers[0],
+                                next_bias: &bias_tensors[0],
+                                after_router_norm: &norm,
+                                after_router: &routers[1],
+                                after_bias: &bias_tensors[1],
+                                score: score as i32,
+                                epsilon: 1e-6,
+                                step,
+                                next_policy: policy,
+                                rings,
+                            })
+                            .unwrap();
+                    });
+                    cases += 1;
+                }
+            }
+        }
+    }
+    println!("hint rings on {:?}: {cases} cases", device.backend());
+}
+
+/// A hint ring word no launch writes, which every word past the entries
+/// keeps.
+const HINT_SENTINEL: i32 = -9;
+
+/// Row `row`'s signs of the low and high halves of the hidden width
+/// ([`hint_residual`]), taking turns over the rows: + +, - +, + -, - -.
+fn hint_signs(row: usize) -> (f32, f32) {
+    ([1.0, -1.0, 1.0, -1.0][row % 4], [1.0, 1.0, -1.0, -1.0][row % 4])
+}
+
+/// `rows` residual rows of `hidden` columns, each +1 or -1 on each half
+/// ([`hint_signs`]): every row's norm is 1, so its normalized row is its
+/// residual exactly.
+fn hint_residual(rows: usize, hidden: usize) -> Vec<f32> {
+    (0..rows)
+        .flat_map(|row| {
+            let (low, high) = hint_signs(row);
+            (0..hidden).map(move |column| if column < hidden / 2 { low } else { high })
+        })
+        .collect()
+}
+
+/// A router of `experts` (at most 256) over `hidden` columns under which a
+/// row of [`hint_residual`] has logit [`hint_logit`]: expert e weighs the low
+/// half e / (64 H) and the high half 4 class(e) / H, both exact in bf16 and
+/// summed exactly in f32 in any order.
+fn hint_router(experts: usize, hidden: usize, class: fn(usize) -> i32) -> Vec<f32> {
+    assert!(experts <= 256, "the low half's weights are exact for at most 256 experts");
+    (0..experts)
+        .flat_map(|expert| {
+            (0..hidden).map(move |column| match column < hidden / 2 {
+                true => expert as f32 / (64 * hidden) as f32,
+                false => 4.0 * class(expert) as f32 / hidden as f32,
+            })
+        })
+        .collect()
+}
+
+/// Row `row`'s logit of `expert` under [`hint_router`]: s_low e / 128 +
+/// 2 s_high class(e). Distinct across experts (128 times it is e plus a
+/// multiple of 256, up to sign), and at least 1/128 apart.
+fn hint_logit(row: usize, expert: usize, class: fn(usize) -> i32) -> f64 {
+    let (low, high) = hint_signs(row);
+    low as f64 * expert as f64 / 128.0 + 2.0 * high as f64 * class(expert) as f64
+}
+
+/// The softmax of `logits`.
+fn softmax(logits: &[f64]) -> Vec<f64> {
+    let maximum = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let exponentials = logits.iter().map(|logit| (logit - maximum).exp()).collect::<Vec<_>>();
+    let total = exponentials.iter().sum::<f64>();
+    exponentials.iter().map(|value| value / total).collect()
+}
+
+/// `select_experts`' scores of `logits` under score function `score`: 0
+/// the softmax, 1 the sigmoid, 2 sqrt(softplus).
+fn selection_scores(logits: &[f64], score: usize) -> Vec<f64> {
+    match score {
+        0 => softmax(logits),
+        1 => logits.iter().map(|logit| 1.0 / (1.0 + (-logit).exp())).collect(),
+        _ => logits.iter().map(|logit| (logit.max(0.0) + (-logit.abs()).exp().ln_1p()).sqrt()).collect(),
+    }
+}
+
+/// The `k` best experts of `values`, best first, ties to the higher expert
+/// (`rank_experts`).
+fn ranked_choices(values: &[f64], k: usize) -> Vec<usize> {
+    let mut experts = (0..values.len()).collect::<Vec<_>>();
+    experts.sort_by(|&a, &b| values[b].total_cmp(&values[a]).then(b.cmp(&a)));
+    experts.truncate(k);
+    experts
+}
+
+/// The hint ring `publish_hints` writes for `ranked` (each row's choices,
+/// best first, with their weights) under step words `step`: the header,
+/// then each expert once, at its first appearance in rank order (rank-major,
+/// then row), as (expert, rank, row, weight word); [`HINT_SENTINEL`] past
+/// them.
+fn expected_hint_ring(step: &[i32], ranked: &[Vec<(usize, f64)>], k: usize, ring: usize) -> Vec<i32> {
+    let mut words = vec![HINT_SENTINEL; ring];
+    let mut named = Vec::new();
+    for rank in 0..k {
+        for (row, choices) in ranked.iter().enumerate() {
+            let (expert, weight) = choices[rank];
+            if !named.contains(&expert) {
+                let at = constants::HINT_ENTRY(named.len() as u64) as usize;
+                words[at + constants::HINT_EXPERT as usize] = expert as i32;
+                words[at + constants::HINT_RANK as usize] = rank as i32;
+                words[at + constants::HINT_ROW as usize] = row as i32;
+                words[at + constants::HINT_WEIGHT as usize] = ((weight as f32).to_bits() & 0x7fff_ffff) as i32;
+                named.push(expert);
+            }
+        }
+    }
+    words[constants::RING_SEQUENCE as usize] = step[constants::STEP_LOW as usize];
+    words[constants::RING_COUNT as usize] = named.len() as i32;
+    words[constants::RING_GUESSES as usize] = step[constants::STEP_GUESSES as usize];
+    words
+}
+
+/// `got` against `expected` ([`expected_hint_ring`]): every word exactly
+/// but the entries' weight words, which hold a non-negative f32 within a
+/// relative 1e-3 of the reference's.
+fn assert_hint_ring(label: &str, got: &[i32], expected: &[i32]) {
+    let count = expected[constants::RING_COUNT as usize] as u64;
+    let weight_word = |index: usize| {
+        (0..count).any(|entry| index == (constants::HINT_ENTRY(entry) + constants::HINT_WEIGHT) as usize)
+    };
+    let unlike = (0..expected.len())
+        .filter(|&index| match weight_word(index) {
+            true => {
+                let (weight, reference) = (f32::from_bits(got[index] as u32), f32::from_bits(expected[index] as u32));
+                got[index] < 0 || (weight - reference).abs() > 1e-3 * reference + 1e-6
+            }
+            false => got[index] != expected[index],
+        })
+        .map(|index| format!("word {index}: {} against {}", got[index], expected[index]))
+        .collect::<Vec<_>>();
+    assert!(unlike.is_empty(), "{label}: hint ring unlike its reference:\n{}", unlike.join("\n"));
 }
 
 /// A layer's policy words: whole, home, then the assignment's lines priced
@@ -8178,15 +8753,27 @@ fn portable_held_holds_a_record_within_its_steps() {
 /// function's (whose own test runs this body against it,
 /// `assessment::cost`): the CPU takes every miss that ends there no later
 /// than in place, the link the rest; every choice of an expert goes to its
-/// expert's side.
+/// expert's side; an expert only front rows choose and the step lacks is
+/// skipped, served by neither side. Front rows are no part of the assignment:
+/// the exact rows' choices come out as the same rows routed alone at one row,
+/// whatever the policy lines (a row term that a front row's choices of an
+/// expert would double, a hit only a front row has).
 #[test]
 fn portable_assign_splits_the_misses_by_the_policy_lines() {
     let module = crate::common::kernels();
-    // (rows, routes, records, policy, expected records, expected sites)
-    let cases: [(&str, usize, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>); 3] = [
+    // `policy_words` with the CPU's row term.
+    let cpu_row = |lines: [i32; 3], cpu_row_ns: i32| {
+        let mut words = policy_words(0, 0, lines);
+        words[constants::POLICY_CPU_ROW_NS as usize] = cpu_row_ns;
+        words
+    };
+    // (rows, front rows, routes, records, policy, expected records,
+    // expected sites)
+    let cases: [(&str, usize, i32, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>); 7] = [
         (
             "the CPU takes every miss",
             1,
+            0,
             vec![10, 11, 12, 13],
             vec![5, -2, -3, -1],
             policy_words(0, 0, [10, 100, 40]),
@@ -8196,6 +8783,7 @@ fn portable_assign_splits_the_misses_by_the_policy_lines() {
         (
             "each miss to the side it ends on first: CPU, link, CPU",
             1,
+            0,
             vec![10, 11, 12, 13],
             vec![5, -2, -3, -1],
             policy_words(0, 0, [20, 30, 0]),
@@ -8205,35 +8793,93 @@ fn portable_assign_splits_the_misses_by_the_policy_lines() {
         (
             "an expert's choices share its side",
             2,
+            0,
             vec![11, 12, 11, 10],
             vec![-2, -3, -2, 5],
             policy_words(0, 0, [10, 100, 0]),
             vec![-1, -1, -1, 5],
             vec![0, 1, 0, -1],
         ),
+        (
+            "a front row's absent expert no exact row chooses is no miss",
+            2,
+            0b10,
+            vec![10, 13, 13, 14],
+            vec![5, -1, -1, -1],
+            policy_words(0, 0, [10, 100, 40]),
+            vec![5, -1, -1, -1],
+            vec![-1, -2, -2, -1],
+        ),
+        (
+            "a front row's choice of an exact row's expert adds no row to it",
+            2,
+            0b10,
+            vec![10, 11, 10, 12],
+            vec![-2, -3, -2, -4],
+            cpu_row([10, 100, 0], 1000),
+            vec![-1, -1, -1, -4],
+            vec![0, 1, 0, -1],
+        ),
+        (
+            "a hit only a front row has queues nothing on the GPU",
+            2,
+            0b10,
+            vec![10, 11, 14, 15],
+            vec![-2, -3, 7, 8],
+            policy_words(0, 0, [60, 50, 500]),
+            vec![-2, -1, 7, 8],
+            vec![-1, 1, -1, -1],
+        ),
+        (
+            "a front row before the exact row changes nothing for it",
+            2,
+            0b01,
+            vec![10, 12, 10, 11],
+            vec![-2, -4, -2, -3],
+            cpu_row([10, 100, 0], 1000),
+            vec![-1, -4, -1, -1],
+            vec![0, -1, 0, 1],
+        ),
     ];
-    for (case, m, routes, records, policy, expected_records, expected_sites) in cases {
+    for (case, m, front, routes, records, policy, expected_records, expected_sites) in cases {
         let k = routes.len() / m;
         let inputs = vec![
             ints(&[m, k], &routes),
             ints(&[constants::POLICY_WORDS as usize], &policy),
+            Input::I32(front),
             ints(&[constants::SOURCE_ROWS as usize, m, k], &magnitude_kernels::source_words(&records, &vec![-1; records.len()])),
         ];
         let outcome = interpret(&module, "assign", &[], inputs);
-        let sources = as_i32(input(&outcome, 2));
+        let sources = as_i32(input(&outcome, 3));
         let count = routes.len();
         assert_eq!(
             sources,
             magnitude_kernels::source_words(&expected_records, &expected_sites),
             "{case}: records then sites ({count} choices)"
         );
+        // The first exact row, routed alone at one row, is sourced and sited
+        // as it is beside the front rows.
+        if let Some(row) = (0..m).find(|row| front != 0 && (front >> row) & 1 == 0) {
+            let at = row * k;
+            let alone = vec![
+                ints(&[1, k], &routes[at..at + k]),
+                ints(&[constants::POLICY_WORDS as usize], &policy),
+                Input::I32(0),
+                ints(&[constants::SOURCE_ROWS as usize, 1, k], &magnitude_kernels::source_words(&records[at..at + k], &vec![-1; k])),
+            ];
+            let alone = as_i32(input(&interpret(&module, "assign", &[], alone), 3));
+            assert_eq!(alone[..k], sources[at..at + k], "{case}: the exact row's records as at one row");
+            assert_eq!(alone[k..2 * k], sources[count + at..count + at + k], "{case}: the exact row's sites as at one row");
+        }
     }
 }
 
 /// A sited layer's route assigns misses by its policy's lines only once they
 /// are priced (`POLICY_PRICED`): until then every miss stays the GPU's in
 /// place and the CPU's site is off, however cheap the CPU looks. Every expert
-/// is a miss the host tier holds, record t for expert t.
+/// is a miss the host tier holds, record t for expert t. Priced, an expert
+/// only a front row chooses and the step lacks is skipped: no side serves
+/// it.
 #[test]
 fn a_streamed_route_assigns_its_misses_only_once_priced() {
     let Some(device) = streaming_device() else {
@@ -8293,7 +8939,11 @@ fn a_streamed_route_assigns_its_misses_only_once_priced() {
                 step: &i32_tensor(&device, &[constants::STEP_WORDS], &step_words(STREAMING_SEQUENCE as u64)),
                 file: &mut words(&table.extents()),
                 sources: &mut sources,
-                routing: &mut words(&[FLIGHT, constants::RING_EXPERTS + 2 * k]),
+                routing: &mut words(&[FLIGHT, constants::ROUTING_WORDS(k)]),
+                keys: &mut key_records(&device, e),
+                front: &mut words(&[constants::HINT_ENTRY(k)]),
+                land_grid: &mut words(&[3]),
+                land_groups: 1,
             })
             .unwrap();
         let routes = read_i32(&routes);
@@ -8301,6 +8951,67 @@ fn a_streamed_route_assigns_its_misses_only_once_priced() {
             routes.iter().map(|&expert| if sited { (-1, expert) } else { (-2 - expert, -1) }).unzip();
         assert_eq!(read_i32(&sources), magnitude_kernels::source_words(&records, &sites), "{:?}, sited {sited}", device.backend());
     }
+    // Priced, with a front row (STEP_FRONT): row 0 (exact) routes to
+    // experts 1, 6, 2, 3 and row 1 (front) to 5, 6, 1, 4, best first (each
+    // row's residual names its own router column). Expert 5 is absent, the
+    // tier holding every other (7 stays unrouted here): the front row skips
+    // 5, which neither side serves. The assignment runs over the exact row
+    // alone, as at one row: its experts are the CPU's, the front row's
+    // choices of them too, and expert 4, which only the front row chose, is
+    // no part of it and stays in place across the link.
+    let m = 2u64;
+    let preferred: [[i32; 4]; 2] = [[1, 6, 2, 3], [5, 6, 1, 4]];
+    let mut residual = vec![0.0; (m * h) as usize];
+    let mut router = vec![0.0; (e * h) as usize];
+    for (row, experts) in preferred.iter().enumerate() {
+        residual[row * h as usize + row] = 1.0;
+        for (rank, &expert) in experts.iter().enumerate() {
+            router[expert as usize * h as usize + row] = (k as usize - rank) as f32;
+        }
+    }
+    let tier = (0..e as i32).map(|expert| if expert == 5 || expert == 7 { -1 } else { expert }).collect::<Vec<_>>();
+    let step = magnitude_kernels::step_words(STREAMING_SEQUENCE as u64, 0b10).to_vec();
+    let mut routes = zeros(seismic::Element::i32(), &[m, k]);
+    let mut sources = zeros(seismic::Element::i32(), &[constants::SOURCE_ROWS, m, k]);
+    kernel
+        .call(&charges, routed_select_streamed::Args {
+            residual: &f32_tensor(&device, &[m, h], &residual),
+            norm: &f32_tensor(&device, &[h], &vec![1.0; h as usize]),
+            router_norm: &f32_tensor(&device, &[h], &vec![1.0; h as usize]),
+            router: &f32_tensor(&device, &[e, h], &router),
+            bias: &zeros(f32, &[e]),
+            expert_scale: &zeros(f32, &[0]),
+            routes: &mut routes,
+            weights: &mut zeros(f32, &[m, k]),
+            epsilon: 1e-6,
+            score: 0,
+            normalization: 0,
+            normalization_epsilon: 1e-6,
+            scale: 1.0,
+            map: &shared_i32(&device, &[e, constants::MAP_WORDS], &unmapped),
+            tier: &shared_i32(&device, &[e], &tier),
+            policy: &shared_i32(&device, &[constants::POLICY_WORDS], &policy_words(0, 0, [1, 100, 0])),
+            sited: 1,
+            step: &i32_tensor(&device, &[constants::STEP_WORDS], &step),
+            file: &mut words(&SlotTable::file(FLIGHT, m * k).extents()),
+            sources: &mut sources,
+            routing: &mut words(&[FLIGHT, constants::ROUTING_WORDS(m * k)]),
+            keys: &mut key_records(&device, e),
+            front: &mut words(&[constants::HINT_ENTRY(m * k)]),
+            land_grid: &mut words(&[3]),
+            land_groups: 1,
+        })
+        .unwrap();
+    let routes = read_i32(&routes);
+    let row_experts = |row: usize| {
+        let mut experts = routes[row * k as usize..][..k as usize].to_vec();
+        experts.sort_unstable();
+        experts
+    };
+    assert_eq!((row_experts(0), row_experts(1)), (vec![1, 2, 3, 6], vec![1, 4, 5, 6]), "{:?}: routes", device.backend());
+    let (records, sites): (Vec<i32>, Vec<i32>) =
+        routes.iter().map(|&expert| match expert { 5 => (-1, -1), 4 => (-2 - expert, -1), _ => (-1, expert) }).unzip();
+    assert_eq!(read_i32(&sources), magnitude_kernels::source_words(&records, &sites), "{:?}, a front row", device.backend());
 }
 
 /// Every choice of an expert has its expert's one source while the host
@@ -8317,7 +9028,7 @@ fn a_streamed_route_sources_every_choice_of_an_expert_alike_under_tier_flips() {
         return;
     };
     let charges = seismic::Charges::tally(&device);
-    let (h, e, k, m) = (64u64, 32u64, 8u64, constants::VERIFY_ROWS as u64);
+    let (h, e, k, m) = (64u64, 32u64, 8u64, constants::VERIFY_ROWS);
     let choices = m * k;
     let table = SlotTable::file(FLIGHT, choices);
     let statics = [("H", h), ("E", e), ("K", k), ("ES", 0), ("TM", e)];
@@ -8383,7 +9094,11 @@ fn a_streamed_route_sources_every_choice_of_an_expert_alike_under_tier_flips() {
                     step: &step,
                     file: &mut words(&table.extents()),
                     sources: &mut sources,
-                    routing: &mut words(&[FLIGHT, constants::RING_EXPERTS + 2 * choices]),
+                    routing: &mut words(&[FLIGHT, constants::ROUTING_WORDS(choices)]),
+                    keys: &mut key_records(&device, e),
+                    front: &mut words(&[constants::HINT_ENTRY(choices)]),
+                    land_grid: &mut words(&[3]),
+                    land_groups: 1,
                 })
                 .inspect_err(|_| finish())
                 .unwrap();
@@ -8404,6 +9119,759 @@ fn a_streamed_route_sources_every_choice_of_an_expert_alike_under_tier_flips() {
         }
         finish();
     });
+}
+
+/// The landing groups a route is given, which its grid holds where it
+/// requests.
+const LANDING: i32 = 5;
+
+/// A step's front row (STEP_FRONT) computes only the experts the step holds
+/// or an exact row chooses. Any other choice stays unsourced (its
+/// routing record keeps its source as resolved), and an absent expert no
+/// exact row chooses is skipped: its request words name
+/// it held, so neither the wait nor the host reads it now, and the layer's
+/// front ring, which names every choice of every front row (rank first,
+/// then row, each with its rank and row, an expert two front rows chose
+/// named by both), names it for the next step. An absent expert an exact
+/// row chooses is requested for every row, and a held one serves all.
+/// Without a front row every absent expert is requested, and the front ring
+/// is not written. Both streamed routes resolve so
+/// ([`assert_front_resolve`]): `routed_select_streamed` over three rows,
+/// the last two front rows, whose row 0 routes to experts 1, 6, 2, 3, row 1
+/// to 5, 6, 1, 7 and row 2 to 6, 5, 4, 1, best first (each row's residual
+/// names its own router column), and `routed_route_streamed` over the
+/// 35B's first two decode rows, the second a front row. Expert 1 is held
+/// (record 4) and every other is absent, the tier holding none.
+#[test]
+fn a_streamed_route_skips_what_only_a_front_row_lacks() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let charges = seismic::Charges::tally(&device);
+    let zeros = |element, shape: &[u64]| seismic::Tensor::zeros(&charges, element, shape).unwrap();
+    let words = |shape: &[u64]| shared_i32(&device, shape, &vec![0; shape.iter().product::<u64>() as usize]);
+    let prepare = |entry_statics: &[String], given: &[(&str, u64)]| {
+        entry_statics.iter().fold(seismic::NativeSpecialization::new(), |specialization, name| {
+            let (_, value) = given.iter().find(|(candidate, _)| *candidate == name.as_str()).unwrap();
+            specialization.with_static(name.clone(), *value)
+        })
+    };
+    let step = |front: i32| i32_tensor(&device, &[constants::STEP_WORDS], &guessed_step(front));
+    let policy = shared_i32(&device, &[constants::POLICY_WORDS], &policy_words(0, 0, [0; 3]));
+    let held = |e: u64| shared_i32(&device, &[e, constants::MAP_WORDS], &map_words(&one_held(e)));
+    // The bank's ports of a route of `m` rows of `k` choices over `e`
+    // experts: the file table, sources, routing record, front ring, tier
+    // map and landing grid.
+    let ports = |m: u64, e: u64, k: u64| {
+        let choices = m * k;
+        (
+            SlotTable::file(FLIGHT, choices),
+            words(&SlotTable::file(FLIGHT, choices).extents()),
+            zeros(seismic::Element::i32(), &[constants::SOURCE_ROWS, m, k]),
+            words(&[FLIGHT, constants::ROUTING_WORDS(choices)]),
+            words(&[constants::HINT_ENTRY(choices)]),
+            shared_i32(&device, &[e], &vec![-1; e as usize]),
+            words(&[3]),
+        )
+    };
+
+    // routed_select_streamed.
+    let (m, h, e, k) = THREE_ROWS;
+    let (residual, router) = three_rows();
+    for front in [0b110, 0b000] {
+        let ThreeRowResolve { table, routes, weights, sources, file, routing, front: front_ring, land_grid } =
+            resolve_three_rows(&device, &policy_words(0, 0, [0; 3]), front, &one_held(e));
+        let case = format!("routed_select_streamed on {:?}, front rows {front:#b}", device.backend());
+        let routes = read_i32(&routes);
+        let skipped = assert_front_resolve(
+            &case,
+            front,
+            k,
+            &routes,
+            &read_f32(&weights),
+            &table,
+            [&sources, &file, &routing, &front_ring, &land_grid],
+        );
+        assert_eq!(skipped, if front != 0 { vec![4, 5, 7] } else { vec![] }, "{case}: skipped");
+        // The reference resolves the same words (`resolve` in
+        // routed.seismic), its front ring's weights aside (the reference's
+        // own float arithmetic).
+        let reference = reference_select_resolve(m, h, e, k, &residual, &router, front, &table);
+        let weightless = |ring: Vec<i32>| {
+            ring.into_iter()
+                .enumerate()
+                .map(|(word, value)| {
+                    let entry = word.checked_sub(constants::HINT_ENTRY(0) as usize);
+                    match entry.map(|at| at % constants::HINT_ENTRY_WORDS as usize) {
+                        Some(at) if at == constants::HINT_WEIGHT as usize => 0,
+                        _ => value,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(reference.routes, routes, "{case}: reference routes");
+        assert_eq!(reference.sources, read_i32(&sources), "{case}: reference sources");
+        assert_eq!(reference.file, read_i32(&file), "{case}: reference file table");
+        assert_eq!(reference.routing, read_i32(&routing), "{case}: reference routing record");
+        assert_eq!(weightless(reference.front), weightless(read_i32(&front_ring)), "{case}: reference front ring");
+        assert_eq!(reference.land_grid, read_i32(&land_grid), "{case}: reference landing grid");
+    }
+
+    // routed_route_streamed, over the 35B's geometry and weights.
+    let m = 2u64;
+    let block = Qwen35b::new(&device);
+    let (h, e, k, s) = (Qwen35b::HIDDEN as u64, Qwen35b::EXPERTS as u64, Qwen35b::CHOICES as u64, Qwen35b::SHARED as u64);
+    let (f32, bf16, q8) = (seismic::Element::f32(), seismic::Element::bf16(), element(&device, "q8g32s"));
+    let entry = routed_route_streamed::native_entry_with(routed_route_streamed::Elements { NW: bf16, RW: bf16, SRW: f32, SGW: q8, SUW: q8, A: bf16 });
+    let implementation = entry.offered(&device).unwrap().unwrap();
+    let statics = prepare(
+        &implementation.statics,
+        &[("H", h), ("PT", 1), ("NM", h), ("E", e), ("K", k), ("S", s), ("ES", 0), ("AHEAD", 0), ("EN", e), ("TM", e)],
+    );
+    let kernel = entry.prepare(&device, &implementation.default_specialization(&statics).unwrap()).unwrap();
+    let norm = bf16_tensor(&device, &[h], &block.norm);
+    let router = bf16_tensor(&device, &[e, h], &block.router);
+    // Two rows that route differently: the same pattern's rows are positive and normalize alike.
+    let rows = block.diverging_residual_rows();
+    let mut skips = 0;
+    for front in [0b10, 0b00] {
+        let (table, mut file, mut sources, mut routing, mut front_ring, tier, mut land_grid) = ports(m, e, k);
+        let mut routes = zeros(seismic::Element::i32(), &[m, k]);
+        let mut scores = zeros(f32, &[m, k]);
+        kernel
+            .call(&charges, routed_route_streamed::Args {
+                residual: &f32_tensor(&device, &[m, h], &rows),
+                norm: &norm,
+                router: &router,
+                shared_router: &f32_tensor(&device, &[h], &block.shared_router),
+                shared_gate: &block.shared_gate,
+                shared_up: &block.shared_up,
+                routes: &mut routes,
+                scores: &mut scores,
+                eps: 1e-6,
+                normalize: 1,
+                expert_scale: &absent(&device),
+                map: &held(e),
+                tier: &tier,
+                policy: &policy,
+                sited: 0,
+                step: &step(front),
+                file: &mut file,
+                sources: &mut sources,
+                routing: &mut routing,
+                keys: &mut key_records(&device, e),
+                front: &mut front_ring,
+                land_grid: &mut land_grid,
+                land_groups: LANDING,
+            })
+            .unwrap();
+        let case = format!("routed_route_streamed on {:?}, front rows {front:#b}", device.backend());
+        let routes = read_i32(&routes);
+        skips += assert_front_resolve(
+            &case,
+            front,
+            k,
+            &routes,
+            &read_f32(&scores),
+            &table,
+            [&sources, &file, &routing, &front_ring, &land_grid],
+        )
+        .len();
+    }
+    assert!(skips > 0, "the 35B's front row skipped nothing: its rows route alike despite `diverging_residual_rows`");
+}
+
+/// The three rows [`a_streamed_route_skips_what_only_a_front_row_lacks`]'s
+/// general route resolves (rows, hidden, experts, choices): row 0 routes to
+/// experts 1, 6, 2, 3, row 1 to 5, 6, 1, 7 and row 2 to 6, 5, 4, 1, best
+/// first.
+const THREE_ROWS: (u64, u64, u64, u64) = (3, 64, 32, 4);
+const THREE_ROW_ROUTES: [[i32; 4]; 3] = [[1, 6, 2, 3], [5, 6, 1, 7], [6, 5, 4, 1]];
+
+/// [`THREE_ROWS`]' residual and router: each row's residual names its own
+/// router column, which ranks the row's experts.
+fn three_rows() -> (Vec<f32>, Vec<f32>) {
+    let (m, h, e, k) = THREE_ROWS;
+    let mut residual = vec![0.0; (m * h) as usize];
+    let mut router = vec![0.0; (e * h) as usize];
+    for (row, experts) in THREE_ROW_ROUTES.iter().enumerate() {
+        residual[row * h as usize + row] = 1.0;
+        for (rank, &expert) in experts.iter().enumerate() {
+            router[expert as usize * h as usize + row] = (k as usize - rank) as f32;
+        }
+    }
+    (residual, router)
+}
+
+/// Step `STREAMING_SEQUENCE`'s words with front rows `front`, each front
+/// row's guess's kind too ([`front_kinds`]): they change nothing the route
+/// computes, and every ring it writes carries them.
+fn guessed_step(front: i32) -> [i32; constants::STEP_WORDS as usize] {
+    let mut words = magnitude_kernels::step_words(STREAMING_SEQUENCE as u64, front as u32);
+    words[constants::STEP_GUESSES as usize] = front_kinds(front);
+    words
+}
+
+/// The STEP_GUESSES word of front rows `front`, each front row's guess the
+/// head's.
+fn front_kinds(front: i32) -> i32 {
+    magnitude_kernels::step_guesses(
+        (0..constants::VERIFY_ROWS as usize).filter(|&row| (front >> row) & 1 != 0).map(|row| (row, constants::GUESS_HEAD as i32)),
+    )
+}
+
+/// The map rows of `e` experts of which the step holds expert 1 alone, in
+/// record 4.
+fn one_held(e: u64) -> Vec<(i32, u64, u64)> {
+    let mut map = vec![(-1, 0, 0); e as usize];
+    map[1] = (4, 0, u64::MAX);
+    map
+}
+
+/// What `routed_select_streamed` resolved of [`three_rows`] at step
+/// [`guessed_step`]`(front)` under the layer's `policy`, its map rows `map`
+/// and a tier holding none, from zeroed words and a landing grid each of
+/// whose words is 7: the file table's slots, and the words it wrote.
+struct ThreeRowResolve {
+    table: SlotTable,
+    routes: seismic::Tensor,
+    weights: seismic::Tensor,
+    sources: seismic::Tensor,
+    file: seismic::Tensor,
+    routing: seismic::Tensor,
+    front: seismic::Tensor,
+    land_grid: seismic::Tensor,
+}
+
+fn resolve_three_rows(device: &seismic::Device, policy: &[i32], front: i32, map: &[(i32, u64, u64)]) -> ThreeRowResolve {
+    let charges = seismic::Charges::tally(device);
+    let (m, h, e, k) = THREE_ROWS;
+    let (residual, router) = three_rows();
+    let (f32, i32) = (seismic::Element::f32(), seismic::Element::i32());
+    let zeros = |element, shape: &[u64]| seismic::Tensor::zeros(&charges, element, shape).unwrap();
+    let words = |shape: &[u64]| shared_i32(device, shape, &vec![0; shape.iter().product::<u64>() as usize]);
+    let entry = routed_select_streamed::native_entry_with(routed_select_streamed::Elements {
+        NW: f32,
+        RNW: f32,
+        RW: f32,
+        A: seismic::Element::bf16(),
+    });
+    let implementation = entry.offered(device).unwrap().unwrap();
+    let given = [("H", h), ("E", e), ("K", k), ("ES", 0), ("AHEAD", 0), ("EN", e), ("TM", e)];
+    let statics = implementation.statics.iter().fold(seismic::NativeSpecialization::new(), |specialization, name| {
+        let (_, value) = given.iter().find(|(candidate, _)| *candidate == name.as_str()).unwrap();
+        specialization.with_static(name.clone(), *value)
+    });
+    let kernel = entry.prepare(device, &implementation.default_specialization(&statics).unwrap()).unwrap();
+    let choices = m * k;
+    let table = SlotTable::file(FLIGHT, choices);
+    let mut resolved = ThreeRowResolve {
+        file: words(&table.extents()),
+        table,
+        routes: zeros(i32, &[m, k]),
+        weights: zeros(f32, &[m, k]),
+        sources: zeros(i32, &[constants::SOURCE_ROWS, m, k]),
+        routing: words(&[FLIGHT, constants::ROUTING_WORDS(choices)]),
+        front: words(&[constants::HINT_ENTRY(choices)]),
+        land_grid: shared_i32(device, &[3], &[7; 3]),
+    };
+    kernel
+        .call(&charges, routed_select_streamed::Args {
+            residual: &f32_tensor(device, &[m, h], &residual),
+            norm: &f32_tensor(device, &[h], &vec![1.0; h as usize]),
+            router_norm: &f32_tensor(device, &[h], &vec![1.0; h as usize]),
+            router: &f32_tensor(device, &[e, h], &router),
+            bias: &zeros(f32, &[e]),
+            expert_scale: &zeros(f32, &[0]),
+            routes: &mut resolved.routes,
+            weights: &mut resolved.weights,
+            epsilon: 1e-6,
+            score: 0,
+            normalization: 0,
+            normalization_epsilon: 1e-6,
+            scale: 1.0,
+            map: &shared_i32(device, &[e, constants::MAP_WORDS], &map_words(map)),
+            tier: &shared_i32(device, &[e], &vec![-1; e as usize]),
+            policy: &shared_i32(device, &[constants::POLICY_WORDS], policy),
+            sited: 0,
+            step: &i32_tensor(device, &[constants::STEP_WORDS], &guessed_step(front)),
+            file: &mut resolved.file,
+            sources: &mut resolved.sources,
+            routing: &mut resolved.routing,
+            keys: &mut key_records(device, e),
+            front: &mut resolved.front,
+            land_grid: &mut resolved.land_grid,
+            land_groups: LANDING,
+        })
+        .unwrap();
+    let routes = read_i32(&resolved.routes);
+    let row_experts = |row: usize| {
+        let mut experts = routes[row * k as usize..][..k as usize].to_vec();
+        experts.sort_unstable();
+        experts
+    };
+    let expected = |row: usize| {
+        let mut experts = THREE_ROW_ROUTES[row].to_vec();
+        experts.sort_unstable();
+        experts
+    };
+    assert_eq!((0..m as usize).map(row_experts).collect::<Vec<_>>(), (0..m as usize).map(expected).collect::<Vec<_>>(), "routes");
+    resolved
+}
+
+/// A whole layer (POLICY_WHOLE) holds every expert at home (POLICY_HOME +
+/// expert), and its route sources every choice from there, a front row's
+/// too (each expert held), none with a CPU site. Nothing misses: it requests nothing
+/// and its landing grid is empty, `[0, 1, 1]` (its routing record, which names
+/// its home records, is `a_streamed_route_keys_every_expert_as_it_ranks_them`'s).
+/// `routed_select_streamed` over [`three_rows`], the last two front rows.
+#[test]
+fn a_whole_layers_front_rows_compute_every_choice() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    const HOME: i32 = 100;
+    let (_, _, e, _) = THREE_ROWS;
+    let resolved = resolve_three_rows(&device, &policy_words(1, HOME, [0; 3]), 0b110, &vec![(-1, 0, 0); e as usize]);
+    let case = format!("routed_select_streamed on {:?}", device.backend());
+    let routes = read_i32(&resolved.routes);
+    let records = routes.iter().map(|&expert| HOME + expert).collect::<Vec<_>>();
+    let sites = vec![-1; routes.len()];
+    assert_eq!(read_i32(&resolved.sources), magnitude_kernels::source_words(&records, &sites), "{case}: sources");
+    assert!(read_i32(&resolved.file).iter().all(|&word| word == 0), "{case}: file table");
+    assert_eq!(read_i32(&resolved.land_grid), [0, 1, 1], "{case}: landing grid");
+}
+
+/// A streamed route writes each row's selection
+/// key of every expert into the step's key record as the reference resolve
+/// keys them (the ranked softmax probability of the fused form, score plus
+/// bias of the general form), and its routing record names, row by row and
+/// rank by rank, the top K of the keys it recorded (descending, ties to the
+/// higher expert). At a decode pass of an exact row and a front row over
+/// Qwen3.8 Flash Next's experts and choices (E 512, K 10), at a streamed
+/// layer and at a whole one, which writes its routing record too, each
+/// choice's source its home record.
+#[test]
+fn a_streamed_route_keys_every_expert_as_it_ranks_them() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let charges = seismic::Charges::tally(&device);
+    const HOME: i32 = 100;
+    let (m, h, e, k, s) = (2u64, 64u64, 512u64, 10u64, 64u64);
+    let (mu, hu, eu, ku, su) = (m as usize, h as usize, e as usize, k as usize, s as usize);
+    let (choices, rows) = (m * k, constants::VERIFY_ROWS);
+    let front = 0b10;
+    let (f32, bf16, i32) = (seismic::Element::f32(), seismic::Element::bf16(), seismic::Element::i32());
+    let zeros = |element, shape: &[u64]| seismic::Tensor::zeros(&charges, element, shape).unwrap();
+    let words = |shape: &[u64]| shared_i32(&device, shape, &vec![0; shape.iter().product::<u64>() as usize]);
+    // Rows of signs (rms 1, so their bf16 normal form is themselves) and
+    // weights of multiples of 1/512: every logit is exact on every side, so
+    // a tie is one everywhere and every other key differs past rounding.
+    let residual = (0..mu * hu)
+        .map(|i| if i < hu || (i * 7 + i / hu) % 3 != 0 { 1.0 } else { -1.0 })
+        .collect::<Vec<f32>>();
+    let router = (0..eu * hu).map(|i| ((i * 37 + (i / hu) * (i % hu) * 11) % 33) as f32 / 512.0 - 16.0 / 512.0).collect::<Vec<f32>>();
+    let bias = (0..eu).map(|x| (x % 5) as f32 / 1024.0).collect::<Vec<f32>>();
+    let shared_router = (0..hu).map(|i| (i % 9) as f32 / 64.0 - 4.0 / 64.0).collect::<Vec<f32>>();
+    let shared = (0..su * hu).map(|i| (i % 17) as f32 / 64.0 - 8.0 / 64.0).collect::<Vec<f32>>();
+    let ones = vec![1.0f32; hu];
+    let step = guessed_step(front);
+    let keys_words = (FLIGHT * rows * e) as usize;
+    let slot = STREAMING_SEQUENCE as u64 % FLIGHT;
+    let routing_words = constants::ROUTING_WORDS(choices);
+    let held = map_words(&one_held(e));
+    let bf16s = |shape: &[usize], values: &[f32]| Input::Tensor(DType::BF16, shape.to_vec(), values.iter().map(|&v| f64::from(v)).collect());
+
+    for (whole, home) in [(0, 0), (1, HOME)] {
+        let policy = policy_words(whole, home, [0; 3]);
+        for general in [false, true] {
+            let case = format!(
+                "{} on {:?}, {}",
+                if general { "routed_select_streamed" } else { "routed_route_streamed" },
+                device.backend(),
+                if whole != 0 { "whole" } else { "streamed" }
+            );
+            let table = SlotTable::file(FLIGHT, choices);
+            let (mut file, mut sources, mut routing, mut keys, mut front_ring, mut land_grid) = (
+                words(&table.extents()),
+                zeros(i32, &[constants::SOURCE_ROWS, m, k]),
+                words(&[FLIGHT, routing_words]),
+                words(&[FLIGHT, rows, e]),
+                words(&[constants::HINT_ENTRY(choices)]),
+                words(&[3]),
+            );
+            let mut routes = zeros(i32, &[m, k]);
+            let mut weights = zeros(f32, &[m, k]);
+            let (map, tier, policy_tensor) = (
+                shared_i32(&device, &[e, constants::MAP_WORDS], &held),
+                shared_i32(&device, &[e], &vec![-1; eu]),
+                shared_i32(&device, &[constants::POLICY_WORDS], &policy),
+            );
+            let step_tensor = i32_tensor(&device, &[constants::STEP_WORDS], &step);
+            // The reference's key record: the entry's keys port, its final
+            // contents (`input`, by the port's ordinal).
+            let (reference_routes, reference_keys) = if general {
+                let entry = routed_select_streamed::native_entry_with(routed_select_streamed::Elements { NW: f32, RNW: f32, RW: f32, A: bf16 });
+                let implementation = entry.offered(&device).unwrap().unwrap();
+                let given = [("H", h), ("E", e), ("K", k), ("ES", 0), ("TM", e)];
+                let statics = implementation.statics.iter().fold(seismic::NativeSpecialization::new(), |specialization, name| {
+                    let (_, value) = given.iter().find(|(candidate, _)| *candidate == name.as_str()).unwrap();
+                    specialization.with_static(name.clone(), *value)
+                });
+                let kernel = entry.prepare(&device, &implementation.default_specialization(&statics).unwrap()).unwrap();
+                kernel
+                    .call(&charges, routed_select_streamed::Args {
+                        residual: &f32_tensor(&device, &[m, h], &residual),
+                        norm: &f32_tensor(&device, &[h], &ones),
+                        router_norm: &f32_tensor(&device, &[h], &ones),
+                        router: &f32_tensor(&device, &[e, h], &router),
+                        bias: &f32_tensor(&device, &[e], &bias),
+                        expert_scale: &zeros(f32, &[0]),
+                        routes: &mut routes,
+                        weights: &mut weights,
+                        epsilon: 1e-6,
+                        score: 0,
+                        normalization: 1,
+                        normalization_epsilon: 1e-6,
+                        scale: 1.0,
+                        map: &map,
+                        tier: &tier,
+                        policy: &policy_tensor,
+                        sited: 0,
+                        step: &step_tensor,
+                        file: &mut file,
+                        sources: &mut sources,
+                        routing: &mut routing,
+                        keys: &mut keys,
+                        front: &mut front_ring,
+                        land_grid: &mut land_grid,
+                        land_groups: LANDING,
+                    })
+                    .unwrap();
+                let [slots, width] = table.extents().map(|extent| extent as usize);
+                let inputs = vec![
+                    floats(&[mu, hu], &residual),
+                    floats(&[hu], &ones),
+                    floats(&[hu], &ones),
+                    floats(&[eu, hu], &router),
+                    floats(&[eu], &bias),
+                    floats(&[0], &[]),
+                    ints(&[mu, ku], &vec![0; mu * ku]),
+                    floats(&[mu, ku], &vec![0.0; mu * ku]),
+                    Input::F32(1e-6),
+                    Input::I32(0),
+                    Input::I32(1),
+                    Input::F32(1e-6),
+                    Input::F32(1.0),
+                    ints(&[eu, constants::MAP_WORDS as usize], &held),
+                    ints(&[eu], &vec![-1; eu]),
+                    ints(&[constants::POLICY_WORDS as usize], &policy),
+                    Input::I32(0),
+                    ints(&[constants::STEP_WORDS as usize], &step),
+                    ints(&[slots, width], &vec![0; slots * width]),
+                    ints(&[constants::SOURCE_ROWS as usize, mu, ku], &vec![0; constants::SOURCE_ROWS as usize * mu * ku]),
+                    ints(&[FLIGHT as usize, routing_words as usize], &vec![0; FLIGHT as usize * routing_words as usize]),
+                    ints(&[FLIGHT as usize, rows as usize, eu], &vec![0; keys_words]),
+                    ints(&[constants::HINT_ENTRY(choices) as usize], &vec![0; constants::HINT_ENTRY(choices) as usize]),
+                    ints(&[3], &[0; 3]),
+                    Input::I32(LANDING),
+                ];
+                let bindings = [("NW", DType::F32), ("RNW", DType::F32), ("RW", DType::F32), ("A", DType::BF16)];
+                let outcome = interpret(crate::common::kernels(), "routed_select_streamed", &bindings, inputs);
+                (as_i32(input(&outcome, 6)), as_i32(input(&outcome, 21)))
+            } else {
+                let entry = routed_route_streamed::native_entry_with(routed_route_streamed::Elements { NW: bf16, RW: bf16, SRW: f32, SGW: bf16, SUW: bf16, A: bf16 });
+                let implementation = entry.offered(&device).unwrap().unwrap();
+                let given = [("H", h), ("PT", 1), ("NM", h), ("E", e), ("K", k), ("S", s), ("ES", 0), ("TM", e)];
+                let statics = implementation.statics.iter().fold(seismic::NativeSpecialization::new(), |specialization, name| {
+                    let (_, value) = given.iter().find(|(candidate, _)| *candidate == name.as_str()).unwrap();
+                    specialization.with_static(name.clone(), *value)
+                });
+                let kernel = entry.prepare(&device, &implementation.default_specialization(&statics).unwrap()).unwrap();
+                kernel
+                    .call(&charges, routed_route_streamed::Args {
+                        residual: &f32_tensor(&device, &[m, h], &residual),
+                        norm: &bf16_tensor(&device, &[h], &ones),
+                        router: &bf16_tensor(&device, &[e, h], &router),
+                        shared_router: &f32_tensor(&device, &[h], &shared_router),
+                        shared_gate: &bf16_tensor(&device, &[s, h], &shared),
+                        shared_up: &bf16_tensor(&device, &[s, h], &shared),
+                        routes: &mut routes,
+                        scores: &mut weights,
+                        eps: 1e-6,
+                        normalize: 1,
+                        expert_scale: &absent(&device),
+                        map: &map,
+                        tier: &tier,
+                        policy: &policy_tensor,
+                        sited: 0,
+                        step: &step_tensor,
+                        file: &mut file,
+                        sources: &mut sources,
+                        routing: &mut routing,
+                        keys: &mut keys,
+                        front: &mut front_ring,
+                        land_grid: &mut land_grid,
+                        land_groups: LANDING,
+                    })
+                    .unwrap();
+                let [slots, width] = table.extents().map(|extent| extent as usize);
+                let inputs = vec![
+                    floats(&[mu, hu], &residual),
+                    bf16s(&[hu], &ones),
+                    bf16s(&[eu, hu], &router),
+                    floats(&[hu], &shared_router),
+                    bf16s(&[su, hu], &shared),
+                    bf16s(&[su, hu], &shared),
+                    ints(&[mu, ku], &vec![0; mu * ku]),
+                    floats(&[mu, ku], &vec![0.0; mu * ku]),
+                    Input::F32(1e-6),
+                    Input::I32(1),
+                    floats(&[0], &[]),
+                    ints(&[eu, constants::MAP_WORDS as usize], &held),
+                    ints(&[eu], &vec![-1; eu]),
+                    ints(&[constants::POLICY_WORDS as usize], &policy),
+                    Input::I32(0),
+                    ints(&[constants::STEP_WORDS as usize], &step),
+                    ints(&[slots, width], &vec![0; slots * width]),
+                    ints(&[constants::SOURCE_ROWS as usize, mu, ku], &vec![0; constants::SOURCE_ROWS as usize * mu * ku]),
+                    ints(&[FLIGHT as usize, routing_words as usize], &vec![0; FLIGHT as usize * routing_words as usize]),
+                    ints(&[FLIGHT as usize, rows as usize, eu], &vec![0; keys_words]),
+                    ints(&[constants::HINT_ENTRY(choices) as usize], &vec![0; constants::HINT_ENTRY(choices) as usize]),
+                    ints(&[3], &[0; 3]),
+                    Input::I32(LANDING),
+                ];
+                let bindings = [
+                    ("NW", DType::BF16),
+                    ("RW", DType::BF16),
+                    ("SRW", DType::F32),
+                    ("SGW", DType::BF16),
+                    ("SUW", DType::BF16),
+                    ("A", DType::BF16),
+                ];
+                let outcome = interpret(crate::common::kernels(), "routed_route_streamed", &bindings, inputs);
+                (as_i32(input(&outcome, 6)), as_i32(input(&outcome, 19)))
+            };
+            let routes = read_i32(&routes);
+            assert_eq!(routes, reference_routes, "{case}: routes against the reference");
+            let key = |words: &[i32], row: usize, expert: usize| {
+                f32::from_bits(words[(slot as usize * rows as usize + row) * eu + expert] as u32)
+            };
+            let keyed = read_i32(&keys);
+            let record = read_i32(&routing);
+            let record = &record[slot as usize * routing_words as usize..][..routing_words as usize];
+            assert_eq!(record[constants::RING_SEQUENCE as usize], STREAMING_SEQUENCE, "{case}: the record's step");
+            assert_eq!(record[constants::RING_COUNT as usize], choices as i32, "{case}: the record's count");
+            for row in 0..mu {
+                for expert in 0..eu {
+                    let (device_key, reference_key) = (key(&keyed, row, expert), key(&reference_keys, row, expert));
+                    assert!(
+                        (device_key - reference_key).abs() <= 1e-4 * reference_key.abs(),
+                        "{case}: row {row}'s key of expert {expert}: {device_key} against the reference's {reference_key}"
+                    );
+                }
+                // The record's choices of the row, best first (rank r at
+                // slot K - 1 - r), and the top K of the row's recorded keys.
+                let chosen = (0..ku)
+                    .map(|rank| record[constants::ROUTING_EXPERT((row * ku + ku - 1 - rank) as u64) as usize])
+                    .collect::<Vec<_>>();
+                let mut ranked = (0..eu).collect::<Vec<_>>();
+                ranked.sort_by(|&a, &b| key(&keyed, row, b).total_cmp(&key(&keyed, row, a)).then(b.cmp(&a)));
+                let top = ranked[..ku].iter().map(|&expert| expert as i32).collect::<Vec<_>>();
+                assert_eq!(chosen, top, "{case}: row {row}'s recorded choices against its keys' top {k}");
+                assert_eq!(chosen, (0..ku).map(|rank| routes[row * ku + ku - 1 - rank]).collect::<Vec<_>>(), "{case}: row {row}'s routes");
+                if whole != 0 {
+                    for choice in 0..ku {
+                        let c = (row * ku + choice) as u64;
+                        assert_eq!(
+                            record[constants::ROUTING_SOURCE(choices, c) as usize],
+                            HOME + record[constants::ROUTING_EXPERT(c) as usize],
+                            "{case}: a whole layer's source of choice {c}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A streamed step whose every choice is held requests nothing, with or
+/// without front rows: its file slot is not requested, and its route writes
+/// its landing grid empty, `[0, 1, 1]`, over whatever the grid held, so
+/// its landing launch dispatches nothing. `routed_select_streamed` over
+/// [`three_rows`].
+#[test]
+fn a_streamed_step_that_requests_nothing_lands_nothing() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let (_, _, e, _) = THREE_ROWS;
+    let held = (0..e).map(|expert| (expert as i32, 0, u64::MAX)).collect::<Vec<_>>();
+    for front in [0b000, 0b110] {
+        let resolved = resolve_three_rows(&device, &policy_words(0, 0, [0; 3]), front, &held);
+        let case = format!("routed_select_streamed on {:?}, front rows {front:#b}", device.backend());
+        assert!(read_i32(&resolved.file).iter().all(|&word| word == 0), "{case}: file table");
+        assert_eq!(read_i32(&resolved.land_grid), [0, 1, 1], "{case}: landing grid");
+    }
+}
+
+/// What the reference `routed_select_streamed` wrote of the words
+/// [`a_streamed_route_skips_what_only_a_front_row_lacks`]'s general route
+/// resolves (its `m` rows of `residual` over `e` experts of `router`, front
+/// rows `front`, its guesses' kinds too), from the same zeroed words.
+struct ReferenceResolve {
+    routes: Vec<i32>,
+    sources: Vec<i32>,
+    file: Vec<i32>,
+    routing: Vec<i32>,
+    front: Vec<i32>,
+    land_grid: Vec<i32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reference_select_resolve(
+    m: u64,
+    h: u64,
+    e: u64,
+    k: u64,
+    residual: &[f32],
+    router: &[f32],
+    front: i32,
+    table: &SlotTable,
+) -> ReferenceResolve {
+    let (mu, hu, eu, ku) = (m as usize, h as usize, e as usize, k as usize);
+    let choices = mu * ku;
+    let map = one_held(e);
+    let step = guessed_step(front);
+    let policy = policy_words(0, 0, [0; 3]);
+    let [slots, width] = table.extents().map(|extent| extent as usize);
+    let routing_words = constants::ROUTING_WORDS(choices as u64) as usize;
+    let ring = constants::HINT_ENTRY(choices as u64) as usize;
+    let inputs = vec![
+        floats(&[mu, hu], residual),
+        floats(&[hu], &vec![1.0; hu]),
+        floats(&[hu], &vec![1.0; hu]),
+        floats(&[eu, hu], router),
+        floats(&[eu], &vec![0.0; eu]),
+        floats(&[0], &[]),
+        ints(&[mu, ku], &vec![0; choices]),
+        floats(&[mu, ku], &vec![0.0; choices]),
+        Input::F32(1e-6),
+        Input::I32(0),
+        Input::I32(0),
+        Input::F32(1e-6),
+        Input::F32(1.0),
+        ints(&[eu, constants::MAP_WORDS as usize], &map_words(&map)),
+        ints(&[eu], &vec![-1; eu]),
+        ints(&[constants::POLICY_WORDS as usize], &policy),
+        Input::I32(0),
+        ints(&[constants::STEP_WORDS as usize], &step),
+        ints(&[slots, width], &vec![0; slots * width]),
+        ints(&[constants::SOURCE_ROWS as usize, mu, ku], &vec![0; constants::SOURCE_ROWS as usize * choices]),
+        ints(&[FLIGHT as usize, routing_words], &vec![0; FLIGHT as usize * routing_words]),
+        ints(&[FLIGHT as usize, constants::VERIFY_ROWS as usize, eu], &vec![0; FLIGHT as usize * constants::VERIFY_ROWS as usize * eu]),
+        ints(&[ring], &vec![0; ring]),
+        ints(&[3], &[0; 3]),
+        Input::I32(LANDING),
+    ];
+    let bindings = [("NW", DType::F32), ("RNW", DType::F32), ("RW", DType::F32), ("A", DType::BF16)];
+    let outcome = interpret(crate::common::kernels(), "routed_select_streamed", &bindings, inputs);
+    ReferenceResolve {
+        routes: as_i32(input(&outcome, 6)),
+        file: as_i32(input(&outcome, 18)),
+        sources: as_i32(input(&outcome, 19)),
+        routing: as_i32(input(&outcome, 20)),
+        front: as_i32(input(&outcome, 22)),
+        land_grid: as_i32(input(&outcome, 23)),
+    }
+}
+
+/// What a streamed route of `routes` (rows of `k` choices) and their routing
+/// `weights` (the weights it wrote, which its front ring names by their
+/// magnitudes' bits) resolved with front rows `front` (STEP_FRONT's bits,
+/// its guesses' kinds too), expert 1 held in record 4 and every other absent: the `[sources, file, routing record,
+/// front ring, landing grid]` it wrote at step `STREAMING_SEQUENCE` of
+/// `table`, as [`a_streamed_route_skips_what_only_a_front_row_lacks`]
+/// states. The experts the front rows skipped, ascending.
+fn assert_front_resolve(
+    case: &str,
+    front: i32,
+    k: u64,
+    routes: &[i32],
+    weights: &[f32],
+    table: &SlotTable,
+    [sources, file, routing, front_ring, land_grid]: [&seismic::Tensor; 5],
+) -> Vec<i32> {
+    let (ku, choices) = (k as usize, routes.len());
+    let rows = choices / ku;
+    let sequence = STREAMING_SEQUENCE as u64;
+    let held = |expert: i32| -1 - expert;
+    let is_front = |row: usize| front >> row & 1 == 1;
+    let exact_chooses = |expert: i32| (0..rows).any(|row| !is_front(row) && routes[row * ku..][..ku].contains(&expert));
+    // Expert 1's source as resolved, record 4; any other's none.
+    let resolved = |expert: i32| if expert == 1 { 4 } else { -1 };
+    // Whether a choice is computed (`resolve`'s `computes`).
+    let computes = |row: usize, expert: i32| !is_front(row) || expert == 1 || exact_chooses(expert);
+    let expected_sources = (0..choices)
+        .map(|choice| if computes(choice / ku, routes[choice]) { resolved(routes[choice]) } else { -1 })
+        .collect::<Vec<_>>();
+    assert_eq!(&read_i32(sources)[..choices], &expected_sources, "{case}: sources");
+    let requested = (0..choices)
+        .map(|choice| {
+            let expert = routes[choice];
+            if expert != 1 && computes(choice / ku, expert) { expert } else { held(expert) }
+        })
+        .collect::<Vec<_>>();
+    let file = read_i32(file);
+    let slot = table.lane(sequence, 0) as usize;
+    let words = (0..choices as u64)
+        .map(|choice| file[slot + (constants::FILE_ENTRY(choice) + constants::FILE_CHOICE) as usize])
+        .collect::<Vec<_>>();
+    assert_eq!(words, requested, "{case}: request words");
+    let routing_words = constants::ROUTING_WORDS(choices as u64) as usize;
+    let record = (sequence % FLIGHT) as usize * routing_words;
+    let routing = read_i32(routing);
+    assert_eq!(&routing[record + constants::ROUTING_EXPERT(0) as usize..][..choices], routes, "{case}: routing record");
+    // Every choice's source as resolved, whatever the front rows compute.
+    assert_eq!(
+        &routing[record + constants::ROUTING_SOURCE(choices as u64, 0) as usize..][..choices],
+        &routes.iter().map(|&expert| resolved(expert)).collect::<Vec<_>>(),
+        "{case}: routing record sources"
+    );
+    assert_eq!(routing[record + constants::RING_GUESSES as usize], front_kinds(front), "{case}: routing record's guesses' kinds");
+    // Row 0, exact, always routes to an absent expert: the step requests,
+    // so its landing launch lands.
+    assert_eq!(read_i32(land_grid), [LANDING, 1, 1], "{case}: landing grid");
+    // Rank-major, then row: every front row's choice, with its rank, row
+    // and weight's word.
+    let entries = (0..ku)
+        .flat_map(|rank| (0..rows).map(move |row| (rank, row)))
+        .filter(|&(_, row)| is_front(row))
+        .map(|(rank, row)| {
+            let choice = row * ku + ku - 1 - rank;
+            (routes[choice], rank, row, (weights[choice].to_bits() & 0x7fff_ffff) as i32)
+        })
+        .collect::<Vec<_>>();
+    let ring = constants::HINT_ENTRY(choices as u64) as usize;
+    let mut expected = vec![0; ring];
+    if front != 0 {
+        expected[constants::RING_SEQUENCE as usize] = sequence as u32 as i32;
+        expected[constants::RING_COUNT as usize] = entries.len() as i32;
+        expected[constants::RING_GUESSES as usize] = front_kinds(front);
+        for (index, &(expert, rank, row, weight)) in entries.iter().enumerate() {
+            let entry = constants::HINT_ENTRY(index as u64) as usize;
+            expected[entry + constants::HINT_EXPERT as usize] = expert;
+            expected[entry + constants::HINT_RANK as usize] = rank as i32;
+            expected[entry + constants::HINT_ROW as usize] = row as i32;
+            expected[entry + constants::HINT_WEIGHT as usize] = weight;
+        }
+    }
+    assert_eq!(read_i32(front_ring), expected, "{case}: front ring");
+    let mut skipped = entries.into_iter().map(|(expert, ..)| expert).filter(|&expert| expert != 1 && !exact_chooses(expert)).collect::<Vec<_>>();
+    skipped.sort_unstable();
+    skipped.dedup();
+    skipped
 }
 
 /// A landing sources each landed choice where the route assigned its
@@ -8436,6 +9904,7 @@ fn portable_landing_routes_a_landed_record_to_its_side() {
             ints(&[landing.len()], &landing),
         ];
         inputs.extend(DENSE_LANDING.map(|(_, dtype)| Input::Tensor(dtype, vec![0, 1, 1], vec![])));
+        inputs.push(ints(&[3], &[1, 1, 1]));
         let outcome = interpret(&module, "routed_land", &DENSE_LANDING, inputs);
         assert_eq!(
             as_i32(input(&outcome, 2)),
@@ -8480,7 +9949,7 @@ fn portable_site_request_writes_its_slot() {
             request[at + constants::SLOT_VIOLATED as usize] = 0;
             request[at + constants::SITE_COUNT as usize] = 2;
             for (entry, (row, record, expert, weight)) in [(0, 4, 10, 0.5f32), (1, 9, 13, 0.75)].into_iter().enumerate() {
-                let entry = at + constants::SITE_ENTRIES as usize + constants::SITE_ENTRY_WORDS as usize * entry;
+                let entry = at + constants::SITE_ENTRY(entry as u64) as usize;
                 request[entry + constants::SITE_ROW as usize] = row;
                 request[entry + constants::SITE_TIER_RECORD as usize] = record;
                 request[entry + constants::SITE_EXPERT as usize] = expert;
@@ -8615,7 +10084,7 @@ fn a_live_hosts_long_wait_is_answered() {
         scope.spawn(move || {
             std::thread::sleep(late);
             // Bank record 5 for choice 0, then the answer.
-            answerer.store_release(4 * (slot + SlotTable::file_entry(0) + constants::FILE_RECORD), 5).unwrap();
+            answerer.store_release(4 * (slot + constants::FILE_ENTRY(0) + constants::FILE_RECORD), 5).unwrap();
             answerer.store_release(4 * (slot + constants::SLOT_ANSWER), q as u32).unwrap();
         });
         wait.call(&mut file, &mut sources).unwrap();
@@ -8804,6 +10273,7 @@ struct TierLanding {
     landing: seismic::Tensor,
     staging: [seismic::Tensor; 3],
     bank: [seismic::Tensor; 3],
+    grid: seismic::Tensor,
 }
 
 impl TierLanding {
@@ -8814,9 +10284,10 @@ impl TierLanding {
             charges: seismic::Charges::tally(device),
             step: streaming_step(device),
             policy: shared_i32(device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]),
-            landing: shared_i32(device, &[landing_extent(1)], &landing_words(STREAMING_SEQUENCE, 0, &[], 1)),
+            landing: shared_i32(device, &[constants::LANDING_ENTRY(1)], &landing_words(STREAMING_SEQUENCE, 0, &[], 1)),
             staging: form.records(device, false, 0, |_, _| None),
             bank: form.records(device, true, 0, |_, _| None),
+            grid: land_grid(device, false),
         }
     }
 
@@ -8835,6 +10306,7 @@ impl TierLanding {
                 gate,
                 up,
                 down,
+                grid: &self.grid,
             })
             .map(|_| ())
     }
@@ -8945,7 +10417,10 @@ fn routed_select_streamed_at_deepseek_v41_decode_shape_times() {
         let mut weights = zeros(f32, &[m, k]);
         let mut file = words(&table.extents());
         let mut sources = zeros(seismic::Element::i32(), &[constants::SOURCE_ROWS, m, k]);
-        let mut routing = words(&[FLIGHT, constants::RING_EXPERTS + 2 * choices]);
+        let mut front = words(&[constants::HINT_ENTRY(choices)]);
+        let mut routing = words(&[FLIGHT, constants::ROUTING_WORDS(choices)]);
+        let mut keys = key_records(&device, e);
+        let mut land_grid = words(&[3]);
         let bias = zeros(f32, &[e]);
         let expert_scale = zeros(f32, &[0]);
         let point = seismic::TuningPoint {
@@ -8974,8 +10449,12 @@ fn routed_select_streamed_at_deepseek_v41_decode_shape_times() {
                 sited: 0,
                 step: &step,
                 file: &mut file,
+                front: &mut front,
                 sources: &mut sources,
                 routing: &mut routing,
+                keys: &mut keys,
+                land_grid: &mut land_grid,
+                land_groups: 1,
             }],
             initialize: None,
             written: Default::default(),

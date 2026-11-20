@@ -7,15 +7,17 @@
 //! measured kernel costs).
 
 use super::demand::DecodeDemand;
-use super::estimate::{estimate_decode, form_seconds, launch_seconds, performance_depths, PerformanceEstimate, Pricing};
+use super::estimate::{estimate_decode, performance_depths, PerformanceEstimate};
+use magnitude_cost_model::{LaunchPrices, TargetCensus};
+use seismic::measure::pricing::Pricing;
 use super::executor_costs::ExecutorCosts;
-use super::launches::Declarations;
-use super::misses::HeldSlots;
+use magnitude_cost_model::HeldSlots;
 use super::AssessmentError;
+use crate::memory::ClaimDemand;
 use crate::platform::{DomainRole, ReleaseRate};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryCharge, AssessmentMemoryTerms, DeviceProcessBytes, ExecutionPlanDraft,
+    AssessmentMemoryCharge, AttestedPrograms, DeviceProcessBytes, ExecutionPlanDraft,
     HostProcessBytes, ResourceCapacity, ResourcePlanner, UndraftedBounds,
 };
 use magnitude_family_contracts::ModelDefinition;
@@ -89,6 +91,33 @@ impl ModelPlacement {
     /// unified memory), else on disk.
     pub fn of(load: &crate::ModelLoadPlan, domains: &[DomainFit], topology: &DeviceTopology) -> Result<Self, String> {
         let crate::WeightPlacement { held, host, streamed, tables } = load.weight_placement()?;
+        Self::from_parts(held, host, streamed, tables, domains, topology)
+    }
+
+    pub(crate) fn of_bank(
+        stored: u64,
+        tables: u64,
+        bank: Option<&crate::planning::ExpertBankPlan>,
+        domains: &[DomainFit],
+        topology: &DeviceTopology,
+    ) -> Result<Self, String> {
+        let host = bank.map_or(Ok(0), crate::planning::ExpertBankPlan::host_only_bytes)?;
+        let streamed = bank.map_or(Ok(0), crate::planning::ExpertBankPlan::unheld_bytes)?;
+        let held = [host, streamed, tables]
+            .into_iter()
+            .try_fold(stored, u64::checked_sub)
+            .ok_or("a plan's tiers hold more than its weights")?;
+        Self::from_parts(held, host, streamed, tables, domains, topology)
+    }
+
+    fn from_parts(
+        held: u64,
+        host: u64,
+        streamed: u64,
+        tables: u64,
+        domains: &[DomainFit],
+        topology: &DeviceTopology,
+    ) -> Result<Self, String> {
         let host_ram = domains.iter().find(|domain| {
             topology.store(domain.domain).is_some_and(|store| matches!(store.kind(), seismic::StoreKind::HostRam))
         });
@@ -125,6 +154,12 @@ pub struct ExecutionFit {
 }
 
 impl ExecutionFit {
+    /// The streamed expert bank if this fit streams its routed experts,
+    /// without cloning the bank.
+    pub fn streamed_bank(&self) -> Option<&crate::planning::ExpertBankPlan> {
+        self.bank.as_ref().filter(|bank| !bank.whole())
+    }
+
     /// How the fit holds its routed experts ([`Residency::of_bank`]).
     pub fn residency(&self) -> Residency {
         Residency::of_bank(self.bank.as_ref())
@@ -304,6 +339,7 @@ pub struct PreparedExecutionAssessment {
     /// of a plan that holds them whole, whose own demand is that form.
     whole: Option<DecodeDemand>,
     forms: crate::FloorForms,
+    target_census: std::sync::OnceLock<TargetCensus>,
 }
 
 impl PreparedExecutionAssessment {
@@ -328,11 +364,25 @@ impl PreparedExecutionAssessment {
         &self.primary().draft
     }
 
-    /// The plan's decode step at `depth` over `sequences` sequences in each
-    /// form ([`form_seconds`]): its experts held whole, and as the plan holds
-    /// them.
-    pub fn form_seconds(&self, pricing: &Pricing<'_>, sequences: u64, depth: u32) -> Result<super::FormSeconds, AssessmentError> {
-        form_seconds(self.whole.as_ref().unwrap_or(&self.demand), &self.demand, pricing, sequences, depth)
+    /// Cached [`Self::censuses`], computed once per prepared execution.
+    pub fn target_census(&self) -> &TargetCensus {
+        self.target_census.get_or_init(|| match &self.whole {
+            Some(whole) => {
+                let (resident, streamed) = crate::assessment::pool::join(
+                    || whole.census(),
+                    || self.demand.census(),
+                );
+                TargetCensus::of(resident, Some(streamed))
+            }
+            None => TargetCensus::of(self.demand.census(), None),
+        })
+    }
+
+    /// The plan's censuses as they pair ([`TargetCensus::of`]): of a plan
+    /// banking its experts, its census holding them whole beside its own;
+    /// of one holding them whole, its own.
+    pub fn censuses(&self) -> TargetCensus {
+        self.target_census().clone()
     }
 
     /// The charge of the primary plan at `definition`'s context, its
@@ -345,7 +395,48 @@ impl PreparedExecutionAssessment {
         pricing: crate::platform::GraphPricing,
     ) -> Result<AssessmentMemoryCharge, AssessmentError> {
         let primary = self.primary();
-        primary.structure.charge(definition, &primary.draft.clone().with_graph_pricing(pricing))
+        primary.structure.charge_with_pricing(definition, &primary.draft, pricing)
+    }
+    /// Compute the plain and whole-bank decode demands from `definition` and
+    /// `primary` without consuming `FloorForms`, so callers can overlap this
+    /// with independent work such as `target_alone`.
+    pub fn compute_decode_demands<T>(
+        definition: &ModelDefinition,
+        primary: &crate::HeldForm<T>,
+    ) -> Result<(DecodeDemand, Option<DecodeDemand>), AssessmentError> {
+        let draft = &primary.draft;
+        let codec = draft.policy().codec();
+        let load = draft.load();
+        let graph = primary.structure.graph();
+        if load.expert_bank().is_some() {
+            let (whole, demand) = crate::assessment::pool::join(
+                || DecodeDemand::from_census(definition, load, codec, graph, true),
+                || DecodeDemand::from_census(definition, load, codec, graph, false),
+            );
+            let whole = whole?;
+            let demand = demand?;
+            Ok((demand, Some(whole)))
+        } else {
+            let demand = DecodeDemand::from_census(definition, load, codec, graph, false)?;
+            Ok((demand, None))
+        }
+    }
+
+    /// Assemble a [`PreparedExecutionAssessment`] from precomputed decode
+    /// demands ([`Self::compute_decode_demands`]).
+    pub fn from_demands(
+        definition: ModelDefinition,
+        forms: crate::FloorForms,
+        demand: DecodeDemand,
+        whole: Option<DecodeDemand>,
+    ) -> Box<Self> {
+        Box::new(Self {
+            definition,
+            demand,
+            whole,
+            forms,
+            target_census: std::sync::OnceLock::new(),
+        })
     }
 }
 
@@ -360,13 +451,8 @@ pub fn prepare_execution_assessment(
     definition: ModelDefinition,
     forms: crate::FloorForms,
 ) -> Result<Box<PreparedExecutionAssessment>, AssessmentError> {
-    let draft = &forms.primary().draft;
-    let whole = match draft.load().expert_bank() {
-        Some(_) => Some(decode_demand(&definition, &draft.held_whole(&definition)?)?),
-        None => None,
-    };
-    let demand = decode_demand(&definition, draft)?;
-    Ok(Box::new(PreparedExecutionAssessment { definition, demand, whole, forms }))
+    let (demand, whole) = PreparedExecutionAssessment::compute_decode_demands(&definition, forms.primary())?;
+    Ok(PreparedExecutionAssessment::from_demands(definition, forms, demand, whole))
 }
 
 /// The standard workload's checked memory charge of `definition` planned
@@ -399,23 +485,376 @@ pub struct StructuralCharge {
     graph: AssessmentGraphResourceBounds,
     host_process: HostProcessBytes,
     device_process: DeviceProcessBytes,
+    /// Context limit at which `prepared_state_bytes` was planned.
+    prepared_context: u64,
+    /// `(workload_state_bytes, startup_state_bytes)` at `prepared_context`.
+    prepared_state_bytes: (u64, u64),
+    /// Precomputed context-invariant state layout for sizing state at any
+    /// served tier without cloning `ModelDefinition` or re-deriving
+    /// `ModelStateLayout`.
+    state_sizer: std::sync::Arc<StateSizer>,
+    /// Host-resident gathered tables (`load.host_table_bytes()`).
+    host_table_bytes: u64,
+    /// Upload windows invariant with bank slots and context.
+    component_upload_bytes: u64,
+    staging_upload_bytes: u64,
+    /// Bank `(slots, host_slots)` for which `prepared_weight_demand` and
+    /// `prepared_startup_additional_bytes` were derived.
+    prepared_bank_slots: Option<(u64, u64)>,
+    prepared_weight_demand: ClaimDemand,
+    prepared_startup_additional_bytes: u64,
+    /// Precomputed O(layers) slot-scaling model for banked plans so `assess_execution_fit`
+    /// can evaluate any bank slot count without cloning `ExecutionPlanDraft` / `ModelLoadPlan`
+    /// or re-scanning all weights.
+    bank_slot_model: Option<BankSlotModel>,
+    /// Precomputed `(stored_weight_bytes, unheld_table_bytes)` so `assess_execution_fit`
+    /// can derive `ModelPlacement` at any bank `(slots, host_slots)` without cloning
+    /// `ExecutionPlanDraft` or re-scanning all weights.
+    base_weight_placement: Option<(u64, u64)>,
+    /// Shared target-family layout cache (`Mutex<FamilyLayouts<SizingOutline>>`)
+    /// threaded across `bank`, `resident`, `WindowedBankForm`, and `at_pass`
+    /// so invariant entry, per-layer, and block-shape layouts are certified once.
+    target_cache: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
+#[derive(Clone, Debug)]
+struct StateSizer {
+    target_history: Vec<magnitude_state::HistoryDomainLayout>,
+    target_recurrent: Vec<magnitude_state::ComponentSpec>,
+    head_history: Vec<magnitude_state::HistoryDomainLayout>,
+    limits: crate::ResourceLimits,
+    capacity_bytes: ResourceCapacity,
+    seeded_banks: Option<(u64, u32)>,
+}
+
+impl StateSizer {
+    fn from_state(state: crate::StateResourcePlan) -> Self {
+        let (
+            target_history,
+            target_recurrent,
+            head_history,
+            limits,
+            capacity_bytes,
+            seeded_banks,
+        ) = state.into_layout_parts();
+        Self {
+            target_history,
+            target_recurrent,
+            head_history,
+            limits,
+            capacity_bytes,
+            seeded_banks,
+        }
+    }
+
+    fn state_bytes_at_context(&self, context_limit: u64) -> Result<(u64, u64), AssessmentError> {
+        ResourcePlanner::state_bytes_from_layout(
+            &self.target_history,
+            &self.target_recurrent,
+            &self.head_history,
+            context_limit,
+            self.limits,
+            self.capacity_bytes,
+            self.seeded_banks,
+        )
+        .map_err(AssessmentError::Plan)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BankSlotModel {
+    base_demand: ClaimDemand,
+    device_only: bool,
+    layers: Vec<(u64, u64)>,
+    non_banked_qual_max: u64,
+    banked_block_qual: Vec<(u64, usize, usize)>,
+}
+
+impl BankSlotModel {
+    fn of(
+        load: &crate::ModelLoadPlan,
+        bank: &crate::planning::ExpertBankPlan,
+        prepared_weight_demand: ClaimDemand,
+    ) -> Result<Self, String> {
+        use magnitude_family_contracts::{ProgressivePlane, WeightKind, WeightScope};
+        use std::collections::HashMap;
+
+        let group_slot_bytes: Vec<u64> = bank
+            .groups()
+            .iter()
+            .map(|group| {
+                group.record.iter().try_fold(0u64, |sum, (_, tensor)| {
+                    sum.checked_add(tensor.record_bytes()?)
+                        .ok_or_else(|| "a record's bytes overflow".to_owned())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut layer_entries: Vec<(u32, u64, u64)> = Vec::with_capacity(bank.layers().len());
+        for layer in bank.layers() {
+            let block = match layer.scope {
+                WeightScope::TargetSublayer(index)
+                | WeightScope::TargetBranch { sublayer: index, .. } => index.block,
+                other => return Err(format!("banked layer scope {other:?} is not a target block")),
+            };
+            layer_entries.push((block, group_slot_bytes[layer.group], layer.experts));
+        }
+        layer_entries.sort_by_key(|&(block, _, _)| block);
+
+        let mut layers: Vec<(u64, u64)> = Vec::with_capacity(layer_entries.len());
+        let mut block_ranges: Vec<(u32, usize, usize)> = Vec::new();
+        for (block, slot_bytes, experts) in layer_entries {
+            let idx = layers.len();
+            layers.push((slot_bytes, experts));
+            if let Some(last) = block_ranges.last_mut().filter(|last| last.0 == block) {
+                last.2 = idx + 1;
+            } else {
+                block_ranges.push((block, idx, idx + 1));
+            }
+        }
+
+        let res_0 = bank.resident_charge(bank.slots)?;
+        let device_only =
+            bank.host().contract(crate::planning::BankTier::Bank) == seismic::Contract::DeviceOnly;
+        let base_demand = if device_only {
+            ClaimDemand {
+                device: prepared_weight_demand
+                    .device
+                    .checked_sub(res_0)
+                    .ok_or_else(|| "bank weight demand underflows".to_owned())?,
+                ..prepared_weight_demand
+            }
+        } else {
+            let mut rec_0 = 0u64;
+            for &(slot_bytes, experts) in &layers {
+                let bytes = slot_bytes
+                    .checked_mul(bank.slots.min(experts))
+                    .ok_or_else(|| "banked expert bytes overflow".to_owned())?;
+                rec_0 = rec_0
+                    .checked_add(bytes)
+                    .ok_or_else(|| "banked record bytes overflow".to_owned())?;
+            }
+            let lent_0 = rec_0.saturating_sub(res_0);
+            ClaimDemand {
+                device: prepared_weight_demand
+                    .device
+                    .checked_sub(res_0)
+                    .and_then(|d| d.checked_sub(lent_0))
+                    .ok_or_else(|| "bank weight demand underflows".to_owned())?,
+                shared: prepared_weight_demand
+                    .shared
+                    .checked_add(lent_0)
+                    .ok_or_else(|| "bank weight demand overflows".to_owned())?,
+                ..prepared_weight_demand
+            }
+        };
+
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum FixtureScope {
+            Block(u32),
+            Head(u32),
+            Other(WeightScope),
+        }
+        let fixture_scope = |scope| match scope {
+            WeightScope::TargetSublayer(index)
+            | WeightScope::TargetBranch { sublayer: index, .. } => FixtureScope::Block(index.block),
+            WeightScope::HeadBlock(block) => FixtureScope::Head(block),
+            WeightScope::HeadSublayer(index)
+            | WeightScope::HeadBranch { sublayer: index, .. } => FixtureScope::Head(index.block),
+            other => FixtureScope::Other(other),
+        };
+        let mut scopes = HashMap::<FixtureScope, u64>::new();
+        for weight in load.weights() {
+            if weight.role.kind == WeightKind::Embedding || weight.banked().is_some() {
+                continue;
+            }
+            let scope = scopes.entry(fixture_scope(weight.role.scope)).or_default();
+            *scope = scope
+                .checked_add(weight.resident_bytes)
+                .ok_or("qualification scope byte count overflows")?;
+        }
+        if load.head().is_some() {
+            let target = |kind| {
+                load.weight_by_role(magnitude_family_contracts::WeightRole {
+                    scope: WeightScope::Target,
+                    kind,
+                })
+            };
+            let fixture = |element: seismic::Element, shape: &[u64]| {
+                element
+                    .canonical_byte_len(shape)
+                    .map_err(|error| format!("draft projection fixture: {error}"))
+            };
+            let projection = match target(WeightKind::Output) {
+                Some(output) => {
+                    let [vocabulary, hidden] = output.shape[..] else {
+                        return Err("target output is not a matrix".into());
+                    };
+                    fixture(output.resident, &[vocabulary, hidden])?
+                }
+                None => {
+                    let top = target(WeightKind::OutputPlane(ProgressivePlane::Top))
+                        .ok_or("head qualification requires the target output")?;
+                    let [vocabulary, groups, _] = top.shape[..] else {
+                        return Err("target top plane is not a matrix".into());
+                    };
+                    let depth = top
+                        .progressive_depth()
+                        .ok_or("target top plane has no code depth")?;
+                    let hidden = groups * 32;
+                    ProgressivePlane::ALL.into_iter().try_fold(0u64, |bytes, plane| {
+                        let element = crate::progressive::element(plane);
+                        let plane_bytes =
+                            fixture(element, &plane.shape(vocabulary, hidden, depth))?;
+                        bytes
+                            .checked_add(plane_bytes)
+                            .ok_or_else(|| "draft projection fixture overflows".to_owned())
+                    })?
+                }
+            };
+            for (scope, bytes) in &mut scopes {
+                if matches!(scope, FixtureScope::Head(_)) {
+                    *bytes = bytes
+                        .checked_add(projection)
+                        .ok_or("qualification scope byte count overflows")?;
+                }
+            }
+        }
+        let mut banked_block_qual = Vec::with_capacity(block_ranges.len());
+        for (block, start, end) in block_ranges {
+            let non_banked = scopes.remove(&FixtureScope::Block(block)).unwrap_or(0);
+            banked_block_qual.push((non_banked, start, end));
+        }
+        let non_banked_qual_max = scopes.into_values().max().unwrap_or(0);
+
+        let model = Self {
+            base_demand,
+            device_only,
+            layers,
+            non_banked_qual_max,
+            banked_block_qual,
+        };
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(
+                model.weight_demand(bank, bank.slots).expect("bank slot model demand"),
+                prepared_weight_demand,
+                "BankSlotModel weight_demand diverged at prepared slots"
+            );
+            debug_assert_eq!(
+                model.qualification_peak(bank.slots).expect("bank slot model qual"),
+                AttestedPrograms::qualification_peak_bytes(load).expect("reference qual"),
+                "BankSlotModel qualification_peak diverged at prepared slots"
+            );
+        }
+        Ok(model)
+    }
+
+    fn weight_demand(
+        &self,
+        bank: &crate::planning::ExpertBankPlan,
+        slots: u64,
+    ) -> Result<ClaimDemand, String> {
+        let res = bank.resident_charge(slots)?;
+        let mut demand = self.base_demand;
+        if self.device_only {
+            demand.device = demand
+                .device
+                .checked_add(res)
+                .ok_or_else(|| "weight demand overflows".to_owned())?;
+        } else {
+            let mut rec = 0u64;
+            for &(slot_bytes, experts) in &self.layers {
+                let bytes = slot_bytes
+                    .checked_mul(slots.min(experts))
+                    .ok_or_else(|| "banked expert bytes overflow".to_owned())?;
+                rec = rec
+                    .checked_add(bytes)
+                    .ok_or_else(|| "banked record bytes overflow".to_owned())?;
+            }
+            let lent = rec.saturating_sub(res);
+            demand.device = demand
+                .device
+                .checked_add(res)
+                .and_then(|d| d.checked_add(lent))
+                .ok_or_else(|| "weight demand overflows".to_owned())?;
+            demand.shared = demand
+                .shared
+                .checked_sub(lent)
+                .ok_or_else(|| "weight demand underflows".to_owned())?;
+        }
+        Ok(demand)
+    }
+
+    fn qualification_peak(&self, slots: u64) -> Result<u64, String> {
+        const FIXTURES: u64 = 16 * 1024 * 1024;
+        let mut peak = self.non_banked_qual_max;
+        for &(non_banked, start, end) in &self.banked_block_qual {
+            let mut scope = non_banked;
+            for &(slot_bytes, experts) in &self.layers[start..end] {
+                let bytes = slot_bytes
+                    .checked_mul(slots.min(experts))
+                    .ok_or_else(|| "banked expert bytes overflow".to_owned())?;
+                scope = scope
+                    .checked_add(bytes)
+                    .ok_or_else(|| "qualification scope byte count overflows".to_owned())?;
+            }
+            if scope > peak {
+                peak = scope;
+            }
+        }
+        FIXTURES
+            .checked_add(peak)
+            .ok_or_else(|| "qualification peak byte count overflows".to_owned())
+    }
+}
+
+fn bank_slots_key(load: &crate::ModelLoadPlan) -> Option<(u64, u64)> {
+    load.expert_bank().map(|bank| (bank.slots, bank.host_slots))
+}
+
+/// Opaque handle to a certified target-family layout cache, reusable across
+/// plain and drafted plans of the same target.
+#[derive(Clone)]
+pub struct TargetLayoutCache(std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
 impl StructuralCharge {
+    pub(crate) fn graph(&self) -> &AssessmentGraphResourceBounds {
+        &self.graph
+    }
+
+    /// Shared target-family layout cache populated during certification, if any.
+    pub fn target_cache(&self) -> Option<TargetLayoutCache> {
+        self.target_cache
+            .as_ref()
+            .map(|cache| TargetLayoutCache(std::sync::Arc::clone(cache)))
+    }
+
     /// The structure of `draft`'s charge.
     pub fn of(definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<Self, AssessmentError> {
-        Self::with_graph(definition, draft, |state| {
+        Self::of_with_cache(definition, draft, None)
+    }
+
+    /// [`Self::of`], optionally reusing a target-family layout cache from
+    /// another plan of the same target (e.g., a pre-planned plain target).
+    pub fn of_with_cache(
+        definition: &ModelDefinition,
+        draft: &ExecutionPlanDraft,
+        cache: Option<&TargetLayoutCache>,
+    ) -> Result<Self, AssessmentError> {
+        Self::with_graph(definition, draft, true, |state| {
             let policy = draft.policy();
-            AssessmentGraphResourceBounds::derive(
+            AssessmentGraphResourceBounds::derive_with_cache(
                 definition,
                 draft.load(),
+                draft.programs(),
                 state,
                 policy.method(),
-                policy.codec(),
                 policy.limits(),
                 draft.device().backend(),
+                cache.map(|c| &c.0),
             )
-            .map(|graph| (graph, ()))
+            .map(|(graph, cache)| (graph, Some(cache), ()))
         })
         .map(|(structure, ())| structure)
     }
@@ -427,17 +866,29 @@ impl StructuralCharge {
         definition: &ModelDefinition,
         draft: &ExecutionPlanDraft,
     ) -> Result<(Self, UndraftedBounds), AssessmentError> {
-        Self::with_graph(definition, draft, |state| {
+        Self::with_undrafted_with_cache(definition, draft, None)
+    }
+
+    /// [`Self::with_undrafted`], optionally reusing a target-family layout cache
+    /// from another plan of the same target.
+    pub fn with_undrafted_with_cache(
+        definition: &ModelDefinition,
+        draft: &ExecutionPlanDraft,
+        cache: Option<&TargetLayoutCache>,
+    ) -> Result<(Self, UndraftedBounds), AssessmentError> {
+        Self::with_graph(definition, draft, true, |state| {
             let policy = draft.policy();
-            AssessmentGraphResourceBounds::derive_with_undrafted(
+            AssessmentGraphResourceBounds::derive_with_undrafted_and_cache(
                 definition,
                 draft.load(),
+                draft.programs(),
                 state,
                 policy.method(),
-                policy.codec(),
                 policy.limits(),
                 draft.device().backend(),
+                cache.map(|c| &c.0),
             )
+            .map(|(graph, undrafted, cache)| (graph, Some(cache), undrafted))
         })
     }
 
@@ -451,7 +902,7 @@ impl StructuralCharge {
         plain: &ExecutionPlanDraft,
         undrafted: UndraftedBounds,
     ) -> Result<Self, AssessmentError> {
-        Self::with_graph(definition, plain, |state| {
+        Self::with_graph(definition, plain, false, |state| {
             let policy = plain.policy();
             AssessmentGraphResourceBounds::of_target(
                 definition,
@@ -463,8 +914,39 @@ impl StructuralCharge {
                 plain.device().backend(),
                 undrafted.target,
                 undrafted.vision,
+                undrafted.readout,
             )
-            .map(|graph| (graph, ()))
+            .map(|graph| (graph, None, ()))
+        })
+        .map(|(structure, ())| structure)
+    }
+
+    /// The structure of `draft`'s charge, a draft that differs from this
+    /// structure's only in how its target routed experts are held (banked vs
+    /// resident, scratch window size, or pass): certifies only `draft`'s
+    /// target family (reusing this structure's target-family layout cache,
+    /// and its state copy family only if its recurrent bank capacity
+    /// changed), reusing `readout`, `head`/`drafter`, and `vision` from
+    /// `self`.
+    pub fn reusing_non_target(
+        &self,
+        definition: &ModelDefinition,
+        draft: &ExecutionPlanDraft,
+    ) -> Result<Self, AssessmentError> {
+        Self::with_graph(definition, draft, true, |state| {
+            let policy = draft.policy();
+            self.graph
+                .derive_reusing_non_target_with_cache(
+                    definition,
+                    draft.load(),
+                    draft.programs(),
+                    state,
+                    policy.method(),
+                    policy.limits(),
+                    draft.device().backend(),
+                    self.target_cache.as_ref(),
+                )
+                .map(|(graph, cache)| (graph, Some(cache), ()))
         })
         .map(|(structure, ())| structure)
     }
@@ -472,22 +954,40 @@ impl StructuralCharge {
     /// The structure of `draft`'s charge, a draft that differs from this
     /// structure's only in its pass (`ModelLoadPlan::pass`): its target
     /// family certified at that pass beside everything else as it is
-    /// (`AssessmentGraphResourceBounds::at_pass`), which no pass moves.
+    /// (`AssessmentGraphResourceBounds::at_pass_with_cache`), which no pass moves.
     pub fn at_pass(&self, definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<Self, AssessmentError> {
+        let _scope = crate::programs::graph::sizing::SizingScope::enter();
         let policy = draft.policy();
-        let graph = self
+        let (graph, cache) = self
             .graph
-            .at_pass(
+            .at_pass_with_cache(
                 definition,
                 draft.load(),
+                draft.programs(),
                 &state_plan(definition, draft)?,
                 policy.method(),
-                policy.codec(),
                 policy.limits(),
                 draft.device().backend(),
+                self.target_cache.as_ref(),
             )
             .map_err(AssessmentError::Graph)?;
-        Ok(Self { graph, host_process: self.host_process, device_process: self.device_process })
+        Ok(Self {
+            graph,
+            host_process: self.host_process,
+            device_process: self.device_process,
+            prepared_context: self.prepared_context,
+            prepared_state_bytes: self.prepared_state_bytes,
+            state_sizer: std::sync::Arc::clone(&self.state_sizer),
+            host_table_bytes: self.host_table_bytes,
+            component_upload_bytes: self.component_upload_bytes,
+            staging_upload_bytes: self.staging_upload_bytes,
+            prepared_bank_slots: self.prepared_bank_slots,
+            prepared_weight_demand: self.prepared_weight_demand,
+            prepared_startup_additional_bytes: self.prepared_startup_additional_bytes,
+            bank_slot_model: self.bank_slot_model.clone(),
+            base_weight_placement: self.base_weight_placement,
+            target_cache: Some(cache),
+        })
     }
 
     /// The structure of `draft`'s charge with the graph bounds `graph`
@@ -495,65 +995,241 @@ impl StructuralCharge {
     fn with_graph<T>(
         definition: &ModelDefinition,
         draft: &ExecutionPlanDraft,
-        graph: impl FnOnce(&crate::StateResourcePlan) -> Result<(AssessmentGraphResourceBounds, T), crate::GraphError>,
+        build_fit_models: bool,
+        graph: impl FnOnce(
+            &crate::StateResourcePlan,
+        ) -> Result<
+            (
+                AssessmentGraphResourceBounds,
+                Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+                T,
+            ),
+            crate::GraphError,
+        >,
     ) -> Result<(Self, T), AssessmentError> {
+        let _scope = crate::programs::graph::sizing::SizingScope::enter();
         let policy = draft.policy();
         let backend = draft.device().backend();
-        let (graph, more) = graph(&state_plan(definition, draft)?).map_err(AssessmentError::Graph)?;
+        let load = draft.load();
+        if policy.selection().head != policy.method().drafts() {
+            return Err(AssessmentError::Memory(
+                "assessment method and head selection disagree".into(),
+            ));
+        }
+        if policy.selection().head != load.head().is_some()
+            || policy.selection().vision != load.vision().is_some()
+        {
+            return Err(AssessmentError::Memory(
+                "assessment selection disagrees with the load plan".into(),
+            ));
+        }
+        let state = state_plan(definition, draft)?;
+        let prepared_state_bytes = (
+            state.capacity().workload_state_bytes,
+            state.startup_state_bytes().map_err(AssessmentError::Memory)?,
+        );
+        let (graph, target_cache, more) = graph(&state).map_err(AssessmentError::Graph)?;
+        let state_sizer = std::sync::Arc::new(StateSizer::from_state(state));
         let host_process =
-            HostProcessBytes::derive(definition, draft.load(), draft.programs(), policy.limits(), backend)
+            HostProcessBytes::from_graph_bounds(definition, draft.programs(), &graph, backend)
                 .map_err(AssessmentError::Memory)?;
-        let device_process = draft
-            .load()
+        let device_process = load
             .device_allocations()
             .and_then(|allocations| DeviceProcessBytes::derive(backend, host_process.kernels, allocations))
             .map_err(AssessmentError::Memory)?;
-        Ok((Self { graph, host_process, device_process }, more))
+        let host_table_bytes = load.host_table_bytes().map_err(AssessmentError::Memory)?;
+        let header = AssessmentHeaderBounds::derive(load).map_err(AssessmentError::Memory)?;
+        let prepared_weight_demand = load
+            .weight_demands()
+            .and_then(|demands| {
+                ClaimDemand::checked_sum(demands).ok_or_else(|| "weight demand overflows".to_owned())
+            })
+            .map_err(AssessmentError::Memory)?;
+        let bank_slot_model = if build_fit_models {
+            load.expert_bank()
+                .map(|bank| BankSlotModel::of(load, bank, prepared_weight_demand))
+                .transpose()
+                .map_err(AssessmentError::Memory)?
+        } else {
+            None
+        };
+        let base_weight_placement = if build_fit_models {
+            let crate::WeightPlacement { held, host, streamed, tables } =
+                load.weight_placement().map_err(AssessmentError::Memory)?;
+            let stored = held
+                .checked_add(host)
+                .and_then(|v| v.checked_add(streamed))
+                .and_then(|v| v.checked_add(tables))
+                .ok_or_else(|| AssessmentError::Memory("weight placement bytes overflow".to_owned()))?;
+            Some((stored, tables))
+        } else {
+            None
+        };
+        Ok((
+            Self {
+                graph,
+                host_process,
+                device_process,
+                prepared_context: definition.decoder.context_limit,
+                prepared_state_bytes,
+                state_sizer,
+                host_table_bytes,
+                component_upload_bytes: header.component_upload_bytes,
+                staging_upload_bytes: header.staging_upload_bytes,
+                prepared_bank_slots: bank_slots_key(load),
+                prepared_weight_demand,
+                prepared_startup_additional_bytes: header.startup_additional_bytes,
+                bank_slot_model,
+                base_weight_placement,
+                target_cache,
+            },
+            more,
+        ))
+    }
+
+    fn state_bytes_at_context(&self, context_limit: u64) -> Result<(u64, u64), AssessmentError> {
+        if context_limit == self.prepared_context {
+            Ok(self.prepared_state_bytes)
+        } else {
+            self.state_sizer.state_bytes_at_context(context_limit)
+        }
+    }
+
+    fn compose_charge(
+        &self,
+        state_bytes: (u64, u64),
+        weight_demand: ClaimDemand,
+        startup_additional_bytes: u64,
+        graph_cost: seismic::GraphCost,
+    ) -> Result<AssessmentMemoryCharge, AssessmentError> {
+        let header = AssessmentHeaderBounds {
+            startup_additional_bytes,
+            component_upload_bytes: self.component_upload_bytes,
+            staging_upload_bytes: self.staging_upload_bytes,
+        };
+        let bounds = header
+            .with_graph_resource_bound(
+                &self.graph,
+                graph_cost,
+                self.host_process,
+                self.device_process,
+            )
+            .map_err(AssessmentError::Memory)?;
+        let weight_bytes = weight_demand
+            .checked_bytes()
+            .ok_or_else(|| AssessmentError::Memory("weight demand overflows".to_owned()))?;
+        AssessmentMemoryCharge::compose(
+            weight_bytes,
+            weight_demand,
+            bounds,
+            state_bytes.0,
+            state_bytes.1,
+            self.host_table_bytes,
+            self.graph.target.group_bytes.most(),
+        )
+        .map_err(AssessmentError::Memory)
     }
 
     /// The charge of `draft`, a draft of this structure, at `definition`'s
-    /// context: its weights' terms, its state planned there and its header
-    /// bounds beside the structure's.
+    /// context: reuses all form-invariant terms hoisted in [`Self::with_graph`]
+    /// and only recomputes what varies with context or bank slots.
     pub fn charge(
         &self,
         definition: &ModelDefinition,
         draft: &ExecutionPlanDraft,
     ) -> Result<AssessmentMemoryCharge, AssessmentError> {
-        let policy = draft.policy();
-        let state = state_plan(definition, draft)?;
-        let state_bytes = || -> Result<_, String> {
-            Ok((state.capacity().workload_state_bytes, state.startup_state_bytes()?))
-        };
-        let (workload_state_bytes, startup_state_bytes) =
-            state_bytes().map_err(AssessmentError::Memory)?;
-        let terms = AssessmentMemoryTerms::derive(
-            definition,
-            draft.load(),
-            policy.selection(),
-            policy.codec(),
-            policy.method(),
-            policy.limits(),
-        )
-        .map_err(AssessmentError::Memory)?;
-        AssessmentHeaderBounds::derive(draft.load())
-            .and_then(|header| {
-                header.with_graph_resource_bound(
-                    &self.graph,
-                    draft.device().graph_cost(),
-                    self.host_process,
-                    self.device_process,
-                )
-            })
-            .and_then(|bounds| {
-                terms.charge(
-                    bounds,
-                    workload_state_bytes,
-                    startup_state_bytes,
-                    self.graph.target.group_bytes.most(),
-                )
-            })
-            .map_err(AssessmentError::Memory)
+        self.charge_with_pricing(definition, draft, draft.device().graph_pricing())
     }
+
+    /// [`Self::charge`] priced at `pricing` without cloning `draft`.
+    pub fn charge_with_pricing(
+        &self,
+        definition: &ModelDefinition,
+        draft: &ExecutionPlanDraft,
+        pricing: crate::platform::GraphPricing,
+    ) -> Result<AssessmentMemoryCharge, AssessmentError> {
+        self.charge_at_context_with_pricing(definition.decoder.context_limit, draft, pricing)
+    }
+
+    /// [`Self::charge_with_pricing`] evaluated at `context_limit` without
+    /// mutating or cloning `ModelDefinition`.
+    pub fn charge_at_context_with_pricing(
+        &self,
+        context_limit: u64,
+        draft: &ExecutionPlanDraft,
+        pricing: crate::platform::GraphPricing,
+    ) -> Result<AssessmentMemoryCharge, AssessmentError> {
+        let state_bytes = self.state_bytes_at_context(context_limit)?;
+        self.charge_with_state_and_pricing(state_bytes, draft, pricing)
+    }
+
+    fn charge_with_state_and_pricing(
+        &self,
+        state_bytes: (u64, u64),
+        draft: &ExecutionPlanDraft,
+        pricing: crate::platform::GraphPricing,
+    ) -> Result<AssessmentMemoryCharge, AssessmentError> {
+        let load = draft.load();
+        let (weight_demand, startup_additional_bytes) =
+            if bank_slots_key(load) == self.prepared_bank_slots {
+                (self.prepared_weight_demand, self.prepared_startup_additional_bytes)
+            } else if let (Some(model), Some(bank)) = (&self.bank_slot_model, load.expert_bank()) {
+                let weight_demand = model
+                    .weight_demand(bank, bank.slots)
+                    .map_err(AssessmentError::Memory)?;
+                let startup_additional_bytes = model
+                    .qualification_peak(bank.slots)
+                    .map_err(AssessmentError::Memory)?
+                    .max(self.staging_upload_bytes);
+                (weight_demand, startup_additional_bytes)
+            } else {
+                let weight_demand = load
+                    .weight_demands()
+                    .and_then(|demands| {
+                        ClaimDemand::checked_sum(demands)
+                            .ok_or_else(|| "weight demand overflows".to_owned())
+                    })
+                    .map_err(AssessmentError::Memory)?;
+                let startup_additional_bytes = AttestedPrograms::qualification_peak_bytes(load)
+                    .map_err(AssessmentError::Memory)?
+                    .max(self.staging_upload_bytes);
+                (weight_demand, startup_additional_bytes)
+            };
+        self.compose_charge(state_bytes, weight_demand, startup_additional_bytes, pricing.cost())
+    }
+
+    /// The charge of this banked structure at `slots` and `pricing`, using
+    /// precomputed `state_bytes` and `BankSlotModel` without cloning `draft`.
+    fn charge_at_slots(
+        &self,
+        state_bytes: (u64, u64),
+        bank: &crate::planning::ExpertBankPlan,
+        slots: u64,
+        pricing: crate::platform::GraphPricing,
+    ) -> Result<AssessmentMemoryCharge, AssessmentError> {
+        let model = self
+            .bank_slot_model
+            .as_ref()
+            .expect("invariant violated: charge_at_slots requires a banked StructuralCharge");
+        let weight_demand = model
+            .weight_demand(bank, slots)
+            .map_err(AssessmentError::Memory)?;
+        let startup_additional_bytes = model
+            .qualification_peak(slots)
+            .map_err(AssessmentError::Memory)?
+            .max(self.staging_upload_bytes);
+        self.compose_charge(state_bytes, weight_demand, startup_additional_bytes, pricing.cost())
+    }
+}
+
+fn resource_capacity(draft: &ExecutionPlanDraft) -> Result<ResourceCapacity, AssessmentError> {
+    Ok(ResourceCapacity {
+        domain_bytes: crate::StableRoom::of(draft.device())
+            .capacity()
+            .map_err(|error| AssessmentError::Plan(error.to_string()))?,
+        tensor_operations: crate::TensorOperations::of(draft.device().tensor_operations()),
+        allocations: draft.device().allocations(),
+    })
 }
 
 /// The state plan of `definition` planned as `draft`, at its context.
@@ -565,31 +1241,27 @@ fn state_plan(definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Resul
         policy.method(),
         policy.codec(),
         policy.limits(),
-        ResourceCapacity {
-            domain_bytes: crate::StableRoom::of(draft.device())
-                .capacity()
-                .map_err(|error| AssessmentError::Plan(error.to_string()))?,
-            tensor_operations: crate::TensorOperations::of(draft.device().tensor_operations()),
-            allocations: draft.device().allocations(),
-        },
+        resource_capacity(draft)?,
     )
     .map_err(AssessmentError::Plan)
 }
 
 /// The plain decode step's demand of `definition` planned as `draft`,
-/// under its planned history codec: over the kernels a load prepares, at
-/// the statics it prepares them with, which each call's launches are
-/// declared over.
+/// under its planned history codec, derived directly from `SizingDraft`'s
+/// decode-regime launch census.
 pub fn decode_demand(definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<DecodeDemand, AssessmentError> {
     let policy = draft.policy();
-    let declarations = Declarations::of_load(
-        draft.device().backend(),
-        draft.programs(),
+    let capacity = resource_capacity(draft)?;
+    super::demand::decode_demand_direct(
         definition,
         draft.load(),
-        crate::native::TuningLimits::of(policy.limits(), definition),
-    )?;
-    DecodeDemand::from_model(definition, draft.load(), policy.codec(), &declarations)
+        policy.codec(),
+        policy.method(),
+        policy.limits(),
+        capacity,
+        draft.device().backend(),
+        false,
+    )
 }
 
 /// The executor the draft plans on.
@@ -622,40 +1294,90 @@ pub fn assess_execution_fit(
     topology: &DeviceTopology,
     status: &Status,
 ) -> Result<ExecutionAssessment, AssessmentError> {
+    assess_execution_fit_at_context(
+        crate::planning::fit_depth(definition),
+        prepared,
+        pricing,
+        topology,
+        status,
+    )
+}
+
+/// [`assess_execution_fit`] evaluated at `context_limit` without mutating or
+/// cloning `ModelDefinition`.
+pub fn assess_execution_fit_at_context(
+    context_limit: u64,
+    prepared: &PreparedExecutionAssessment,
+    pricing: crate::platform::GraphPricing,
+    topology: &DeviceTopology,
+    status: &Status,
+) -> Result<ExecutionAssessment, AssessmentError> {
     let forms = &prepared.forms;
     let device = planned_executor(prepared.draft(), topology)?;
     let room = crate::planning::StableRoom { topology, executor: device, status };
-    let fit_context_tokens = u32::try_from(crate::planning::fit_depth(definition))
+    let fit_context_tokens = u32::try_from(context_limit)
         .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
-    // The charge of `draft` of `form`'s structure and its fit.
-    let charged = |form: &crate::HeldForm, draft: ExecutionPlanDraft| -> Result<_, AssessmentError> {
-        let draft = draft.with_graph_pricing(pricing);
-        let charge = form.structure.charge(definition, &draft)?;
-        let fit = room.fit(&charge)?;
-        Ok((draft, charge, fit))
-    };
-    let fits = |draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge, fit: crate::AssessmentFit| -> Result<_, AssessmentError> {
+    let fits_with_bank = |structure: &StructuralCharge,
+                          load: &crate::ModelLoadPlan,
+                          bank: Option<crate::planning::ExpertBankPlan>,
+                          charge: &AssessmentMemoryCharge,
+                          fit: crate::AssessmentFit|
+     -> Result<_, AssessmentError> {
+        let placement = match structure.base_weight_placement {
+            Some((stored, tables)) => {
+                ModelPlacement::of_bank(stored, tables, bank.as_ref(), &fit.domains, topology)
+                    .map_err(AssessmentError::Memory)?
+            }
+            None => ModelPlacement::of(load, &fit.domains, topology)
+                .map_err(AssessmentError::Memory)?,
+        };
         Ok(ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             breakdown: charge.breakdown(&fit.domains).map_err(AssessmentError::Memory)?,
-            placement: ModelPlacement::of(draft.load(), &fit.domains, topology).map_err(AssessmentError::Memory)?,
+            placement,
             domains: fit.domains,
-            bank: draft.load().expert_bank().cloned(),
+            bank,
         }))
     };
     let holds = |fit: &crate::AssessmentFit| matches!(fit.verdict, AssessmentFitVerdict::Fits);
+    // `state_plan` depends only on `definition.decoder`, `load.head.is_some()`,
+    // policy, and device — identical across bank, resident, and windowed forms.
+    let primary_form = forms.primary();
+    let state_bytes = primary_form
+        .structure
+        .state_bytes_at_context(context_limit)?;
     // Whole: a bank of every expert, else the experts' own allocations.
     if let Some(bank) = forms.bank().filter(|bank| bank.points.last() == Some(&bank.experts)) {
-        let (draft, charge, fit) = charged(&bank.form, bank.at_slots(bank.experts)?)?;
+        let bank_plan = bank
+            .form
+            .draft
+            .load()
+            .expert_bank()
+            .expect("a bank form holds an expert bank");
+        let charge = bank.form.structure.charge_at_slots(
+            state_bytes,
+            bank_plan,
+            bank.experts,
+            pricing,
+        )?;
+        let fit = room.fit(&charge)?;
         if holds(&fit) {
-            return fits(&draft, &charge, fit);
+            let sized = bank
+                .form
+                .draft
+                .bank_at_slots_with_host_tier(bank.experts, &charge, &room)?
+                .expect("a whole bank needs no host tier");
+            return fits_with_bank(&bank.form.structure, bank.form.draft.load(), Some(sized), &charge, fit);
         }
     }
     let resident = match forms.resident() {
         Some(resident) => {
-            let (draft, charge, fit) = charged(resident, resident.draft.clone())?;
+            let charge = resident
+                .structure
+                .charge_with_state_and_pricing(state_bytes, &resident.draft, pricing)?;
+            let fit = room.fit(&charge)?;
             if holds(&fit) {
-                return fits(&draft, &charge, fit);
+                return fits_with_bank(&resident.structure, resident.draft.load(), None, &charge, fit);
             }
             Some(fit)
         }
@@ -681,15 +1403,39 @@ pub fn assess_execution_fit(
     };
     let least = match forms.bank() {
         Some(bank) => {
-            let at = |slots: u64| -> Result<_, AssessmentError> {
-                let (_, charge, fit) = charged(&bank.form, bank.at_slots(slots)?)?;
-                Ok((charge, fit))
-            };
-            let (floor_charge, mut least_fit) = at(bank.points[0])?;
+            let bank_plan = bank
+                .form
+                .draft
+                .load()
+                .expert_bank()
+                .expect("a bank form holds an expert bank");
+            let floor_charge = bank.form.structure.charge_at_slots(
+                state_bytes,
+                bank_plan,
+                bank.points[0],
+                pricing,
+            )?;
+            let mut least_fit = room.fit(&floor_charge)?;
             if holds(&least_fit) {
+                let at = |slots: u64| -> Result<_, AssessmentError> {
+                    let charge = bank
+                        .form
+                        .structure
+                        .charge_at_slots(state_bytes, bank_plan, slots, pricing)?;
+                    let fit = room.fit(&charge)?;
+                    Ok((charge, fit))
+                };
                 let (slots, charge, fit) = settle_points(&bank.points, &at, (floor_charge, least_fit))?;
-                match bank.with_host_tier(slots, &charge, &room)? {
-                    Ok(draft) => return fits(&draft.with_graph_pricing(pricing), &charge, fit),
+                match bank.form.draft.bank_at_slots_with_host_tier(slots, &charge, &room)? {
+                    Ok(sized) => {
+                        return fits_with_bank(
+                            &bank.form.structure,
+                            bank.form.draft.load(),
+                            Some(sized),
+                            &charge,
+                            fit,
+                        );
+                    }
                     Err(reason) => {
                         return Err(AssessmentError::Plan(format!(
                             "the bank's floor fits, yet its experts cannot stream beside it: {reason}"
@@ -697,19 +1443,36 @@ pub fn assess_execution_fit(
                     }
                 }
             }
+            let _scope = crate::programs::graph::sizing::SizingScope::enter();
             for win in &bank.windowed {
-                let structure = win.structure(&prepared.definition)?;
-                let at_win = |slots: u64| -> Result<_, AssessmentError> {
-                    let draft = win.at_slots(slots)?.with_graph_pricing(pricing);
-                    let charge = structure.charge(definition, &draft)?;
-                    let fit = room.fit(&charge)?;
-                    Ok((charge, fit))
+                let Some((rung, structure)) = win.structure(
+                    &bank.form.draft,
+                    bank.experts,
+                    &prepared.definition,
+                    &bank.form.structure,
+                )? else {
+                    continue;
                 };
-                let (win_charge, win_fit) = at_win(win.points[0])?;
+                let win_bank = rung
+                    .draft
+                    .load()
+                    .expert_bank()
+                    .expect("a windowed bank rung holds an expert bank");
+                let win_charge =
+                    structure.charge_at_slots(state_bytes, win_bank, rung.points[0], pricing)?;
+                let win_fit = room.fit(&win_charge)?;
                 if holds(&win_fit) {
-                    let (slots, charge, fit) = settle_points(&win.points, &at_win, (win_charge, win_fit))?;
-                    match win.with_host_tier(slots, &charge, &room)? {
-                        Ok(draft) => return fits(&draft.with_graph_pricing(pricing), &charge, fit),
+                    let at_win = |slots: u64| -> Result<_, AssessmentError> {
+                        let charge =
+                            structure.charge_at_slots(state_bytes, win_bank, slots, pricing)?;
+                        let fit = room.fit(&charge)?;
+                        Ok((charge, fit))
+                    };
+                    let (slots, charge, fit) = settle_points(&rung.points, &at_win, (win_charge, win_fit))?;
+                    match rung.draft.bank_at_slots_with_host_tier(slots, &charge, &room)? {
+                        Ok(sized) => {
+                            return fits_with_bank(structure, rung.draft.load(), Some(sized), &charge, fit);
+                        }
                         Err(reason) => {
                             return Err(AssessmentError::Plan(format!(
                                 "the bank's floor fits, yet its experts cannot stream beside it: {reason}"
@@ -742,43 +1505,30 @@ pub fn assess_execution_fit(
     }
 }
 
-/// A banked plan's launch of some rows at some depth in each form
-/// ([`crate::DecodeStep`]): `resident`'s demand, the plan holding its
-/// experts whole, and `banked`'s, the plan as it banks them, whose streamed
-/// layers decode in their streamed form ([`decode_demand`]), each on
-/// `costs` under `resident`'s lookahead, which the two share; a decode step
-/// within the decode row classes, a prefill launch beyond
-/// ([`launch_seconds`]). Each launch is priced once: the step is a function
-/// of its rows and depth alone, so a launch priced again reads what it
-/// priced the first time.
-pub fn decode_step(
+/// The prices of every launch of a load of `definition` planned as
+/// `planned`, `resident` its plan holding its experts whole
+/// ([`LaunchPrices`]): each plan's decode census ([`decode_demand`]), on
+/// `costs`' figures under `resident`'s lookahead, which the two share; at
+/// the point `planned` runs, its bank's slots where it banks its experts,
+/// up to `definition`'s context. No drafter is censused.
+pub fn launch_prices(
     definition: &ModelDefinition,
     resident: &ExecutionPlanDraft,
-    banked: &ExecutionPlanDraft,
-    costs: ExecutorCosts,
-) -> Result<Box<crate::DecodeStep>, AssessmentError> {
-    let (whole, streamed) = (decode_demand(definition, resident)?, decode_demand(definition, banked)?);
-    let lookahead = decode_pricing(resident, &costs).lookahead;
-    let priced = std::cell::RefCell::new(std::collections::HashMap::new());
-    Ok(Box::new(move |rows, depth| {
-        if let Some(&seconds) = priced.borrow().get(&(rows, depth)) {
-            return Ok(seconds);
-        }
-        let pricing = Pricing { costs: &costs, lookahead };
-        let launch = |demand| launch_seconds(demand, &pricing, u64::from(rows), depth).map(|launch| launch.total());
-        let seconds = super::FormSeconds { resident: launch(&whole)?, streamed: launch(&streamed)? };
-        priced.borrow_mut().insert((rows, depth), seconds);
-        Ok(seconds)
-    }))
+    planned: &ExecutionPlanDraft,
+    costs: &ExecutorCosts,
+) -> Result<LaunchPrices, AssessmentError> {
+    let streamed = match planned.load().expert_bank() {
+        Some(_) => Some(decode_demand(definition, planned)?.census()),
+        None => None,
+    };
+    let target = TargetCensus::of(decode_demand(definition, resident)?.census(), streamed);
+    let figures = costs.figures(&target.censuses());
+    Ok(LaunchPrices::new(target, figures, lookahead(resident)))
 }
 
-/// What the draft's decode is priced with on `costs`: its resolved
-/// lookahead policy.
-pub fn decode_pricing<'a>(draft: &ExecutionPlanDraft, costs: &'a ExecutorCosts) -> Pricing<'a> {
-    Pricing {
-        costs,
-        lookahead: draft.policy().limits().flights().pipelines(),
-    }
+/// Whether the draft's decode runs with lookahead: its resolved policy's.
+pub fn lookahead(draft: &ExecutionPlanDraft) -> bool {
+    draft.policy().limits().flights().pipelines()
 }
 
 /// One prepared model's decode speed at each requested depth, from the
@@ -788,9 +1538,14 @@ pub fn estimate_execution(
     costs: &ExecutorCosts,
     request: &AssessmentRequest,
 ) -> Result<Vec<PerformanceEstimate>, AssessmentError> {
+    let census = match prepared.target_census() {
+        TargetCensus::Resident(census) => census,
+        TargetCensus::Banked { streamed, .. } => streamed,
+    };
+    let figures = costs.figures(&[census]);
     estimate_decode(
-        &prepared.demand,
-        &decode_pricing(prepared.draft(), costs),
+        census,
+        &Pricing { figures: &figures, lookahead: lookahead(prepared.draft()) },
         u64::from(request.sequences),
         &performance_depths(request.context_limit, &request.performance_depths),
     )

@@ -14,8 +14,8 @@
 )]
 
 mod device;
+mod device_info;
 pub mod direct;
-mod facts;
 pub mod formation;
 mod graph_cost;
 mod instance;
@@ -29,8 +29,8 @@ pub mod transfer;
 mod uniformity;
 
 pub use device::{Device, DeviceHandle, HeapBudget, MemoryBudget, OpenError};
-pub use facts::{
-    Allocation, Calibration, Description, DeviceType, Facts, FormationTarget, Limits, MemoryHeap,
+pub use device_info::{
+    Allocation, Description, DeviceInfo, DeviceType, FormationTarget, Limits, MemoryHeap,
     MemoryLayout, MemoryType, Probed, Properties, SUBGROUP_WIDTH,
 };
 pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
@@ -50,19 +50,19 @@ pub fn discover() -> Result<Vec<Description>, LoaderError> {
     let mut descriptions = instance
         .physical_devices()?
         .into_iter()
-        .map(|physical| facts::describe(&instance, physical))
-        .collect::<Vec<_>>();
-    descriptions.sort_by_key(|description| !description.facts.is_gpu());
+        .map(|physical| device_info::describe(&instance, physical))
+        .collect::<Result<Vec<_>, _>>()?;
+    descriptions.sort_by_key(|description| !description.info.is_gpu());
     Ok(descriptions)
 }
 
-/// One tally, bounding nothing, as every store of a device of `facts`: a
+/// One tally, bounding nothing, as every store of a device of `info`: a
 /// test's, and the probe process's, which allocates only its probes' few
 /// buffers and keeps no count of its stores apart.
-pub fn unbounded_stores(facts: &Facts) -> MemoryStores {
+pub fn unbounded_stores(info: &DeviceInfo) -> MemoryStores {
     let tally: std::sync::Arc<dyn seismic_memory::entry::Store> =
         std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam));
-    let kinds = (0..facts.memory.types.len() as u32).map(|kind| (kind, tally.clone())).collect();
+    let kinds = (0..info.memory.types.len() as u32).map(|kind| (kind, tally.clone())).collect();
     MemoryStores { kinds, host: tally }
 }
 
@@ -110,17 +110,17 @@ mod tests {
         for description in devices {
             eprintln!(
                 "{} ({}, {}): unprobed properties {:?}, subgroup size required {:?}, matrix path {}, shader fma {:?}, uuid {}",
-                description.facts.name,
-                description.facts.driver_name,
-                description.facts.driver_info,
+                description.info.name,
+                description.info.driver_name,
+                description.info.driver_info,
                 description.properties(&Probed::default()).as_ref().map(Properties::identity),
-                description.floor.is_ok().then(|| description.facts.requires_subgroup_size()),
-                description.facts.matrix_path,
-                description.facts.shader_fma(),
-                facts::hex(&description.facts.uuid)
+                description.floor.is_ok().then(|| description.info.requires_subgroup_size()),
+                description.info.matrix_path,
+                description.info.shader_fma(),
+                device_info::hex(&description.info.uuid)
             );
             if let Err(reason) = &description.floor {
-                let error = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default())
+                let error = Device::open(description.info.uuid, crate::unbounded_stores(&description.info), &Default::default())
                     .err()
                     .expect("a device discovery reports unavailable does not open");
                 eprintln!("  {error}");
@@ -129,7 +129,7 @@ mod tests {
                 }
                 continue;
             }
-            let device = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).unwrap_or_else(|error| {
+            let device = Device::open(description.info.uuid, crate::unbounded_stores(&description.info), &Default::default()).unwrap_or_else(|error| {
                 panic!("a device discovery reports available opens: {error}")
             });
             let buffer = device.allocate(1 << 20, 256, &device.own()).expect("allocation");

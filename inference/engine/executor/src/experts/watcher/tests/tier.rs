@@ -12,20 +12,19 @@ fn a_refill_past_the_last_step_leaves_no_grace() {
     // request's answer, so its grace ends with the step it answered.
     harness.retired();
     harness.tier_ready();
-    let reserve = harness.staging_records as usize;
     let mut state = residency::lock(&harness.watcher.state);
     let mut grants = Vec::new();
     for expert in 0..EXPERTS {
-        if let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(0, expert, 0, crate::experts::host_records::Taking::Out) {
+        if let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(0, expert, 0, crate::experts::host_records::Taking::Out, crate::experts::host_records::Refuses) {
             grants.push(grant);
         }
-        if state.core.directory.refill_short(reserve) {
+        if state.core.directory.refill_short() {
             break;
         }
     }
-    assert!(state.core.directory.refill_short(reserve), "the claims left the reserve short");
+    assert!(state.core.directory.refill_short(), "the claims left the reserve short");
     state.refill_tier();
-    assert!(!state.core.directory.refill_short(reserve), "the refill made the reserve");
+    assert!(!state.core.directory.refill_short(), "the refill made the reserve");
     assert_eq!(state.core.directory.host(0).graced(), 0, "graced through a step the device is past");
 }
 
@@ -160,7 +159,9 @@ fn a_decode_step_behind_a_prompt_group_claiming_the_lent_records_is_served() {
     std::thread::sleep(Duration::from_millis(50));
     let lent = (0..EXPERTS).filter(|&expert| harness.in_tier(0, expert).is_some_and(|record| record < 2)).collect::<Vec<_>>();
     assert_eq!(lent.len(), 2, "the misses kept two experts in the lent records");
-    let steps = begin_as(&shared, &[(StepRoute::Grouped, LaunchWork::Prompt), (StepRoute::Decode, LaunchWork::Generation)], true).unwrap();
+    let mut steps = begin_as(&shared, &[(StepRoute::Grouped, LaunchWork::Prompt), (StepRoute::Decode, LaunchWork::Generation)], true).unwrap();
+    let decode = steps.pop().unwrap().decoding([row(1000, None)].into_iter(), 0);
+    steps.push(decode);
     harness.scratch(&steps[0], 0, &lent);
     eventually("the group never claimed the lent records", || lent.iter().all(|&expert| harness.in_tier(0, expert).is_none()));
     harness.request_at(&steps[1], 0, &lent);
@@ -171,8 +172,8 @@ fn a_decode_step_behind_a_prompt_group_claiming_the_lent_records_is_served() {
 
 /// The host keeps a reserve of ready tier records: once landings leave
 /// fewer ready than the staging records, it unmaps its kept records, first
-/// in taking order (held alone, the least recently read, then the lower
-/// expert), until the ready and the unmapped make the reserve, and no
+/// in taking order (banked copies, then held alone, the least ranked: here
+/// the least recently read, as no read yet carries), until the ready and the unmapped make the reserve, and no
 /// more. The watcher learns a landing, and keeps the reserve, as it serves
 /// a running step, so it takes only from the landings that have settled:
 /// the two that leave the reserve short land after two settled ones. A
@@ -184,12 +185,22 @@ fn the_tier_keeps_a_reserve_of_ready_records() {
     let map = &harness.host.maps[0];
     harness.request(&[0, 1]).complete().unwrap();
     eventually("the first landings never settled", || harness.in_tier(0, 0).is_some() && harness.in_tier(0, 1).is_some());
-    harness.request(&[2, 3]).complete().unwrap();
-    let step = harness.step();
-    eventually("the reserve never unmapped a record", || map.load(0) == -1 && map.load(1) == -1);
+    eventually("step 1 was never ranked", || harness.watcher.shared().telemetry.fed_all());
+    // Two more landings push the store past its 2-record reserve, so refill
+    // unmaps exactly two records and keeps two ready (refill's horizon ranking
+    // order is directly tested by `a_tier_refill_evicts_by_its_own_horizon`).
+    let step2 = harness.request(&[2, 3]);
+    eventually("the reserve never unmapped two records", || {
+        (0..4).filter(|&expert| map.load(expert) == -1).count() == 2
+    });
     std::thread::sleep(Duration::from_millis(20));
-    assert!([2, 3].iter().all(|&expert| harness.in_tier(0, expert).is_some()), "the reserve unmaps no more");
-    assert!(!harness.ask_at(&step, 0, &[2, 3]), "the tier serves both");
+    let (unmapped, survivors): (Vec<usize>, Vec<usize>) = (0..4).partition(|&expert| map.load(expert) == -1);
+    assert_eq!(unmapped.len(), 2, "exactly two records are unmapped: {unmapped:?}");
+    assert_eq!(survivors.len(), 2, "the reserve unmaps no more: {survivors:?}");
+    assert!(survivors.iter().all(|&expert| harness.in_tier(0, expert).is_some()), "the reserve unmaps no more");
+    step2.complete().unwrap();
+    let step = harness.step();
+    assert!(!harness.ask_at(&step, 0, &survivors), "the tier serves both");
     step.complete().unwrap();
     assert_eq!(harness.watcher.shared().costs().layers[0].hosted, 2);
 }
@@ -233,7 +244,7 @@ fn every_landing_of_an_expert_claims_it_once_in_the_one_store() {
 /// A request waiting while the keeper's turn runs takes residency between
 /// two of its jobs (`Residency::tend`), and finds it as at a turn's end.
 /// Under a traffic hold beside the idle load, the turn's refill takes
-/// victims the tier kept alone (graced through steps the device is past,
+/// victims the tier kept (graced through steps the device is past,
 /// so ready at once), and its promotions find the hold in force: the
 /// request, taking the lock after them, reads holdings already published
 /// without the victims. It begins a step while it holds the
@@ -249,24 +260,28 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
     let state = harness.watcher.state.clone();
     let _hold = shared.hold_traffic();
     shared.wait_traffic_quiet().unwrap();
-    let reserve = harness.staging_records as usize;
     // Claims that leave the reserve short, so the turn's refill graces
     // victims; kept until the turn ends.
     let grants = std::cell::RefCell::new(Vec::new());
-    let alone = |state: &residency::Residency| (0..state.core.layers.len()).map(|layer| state.core.directory.alone(layer)).collect::<Vec<_>>();
+    // What the tier keeps, alone or a banked copy not yet given up: the
+    // refill's victims are either, banked ones first.
+    let kept = |state: &residency::Residency| {
+        let directory = &state.core.directory;
+        (0..state.core.layers.len()).map(|layer| (0..EXPERTS).filter(|&expert| directory.in_tier(layer, expert)).count()).collect::<Vec<_>>()
+    };
     let claimed = std::cell::RefCell::new(Vec::new());
     let short = |state: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::promotions::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
         for expert in 0..EXPERTS {
-            if let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(0, expert, 0, crate::experts::host_records::Taking::Out) {
+            if let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(0, expert, 0, crate::experts::host_records::Taking::Out, crate::experts::host_records::Refuses) {
                 grants.borrow_mut().push(grant);
             }
-            if state.core.directory.refill_short(reserve) {
+            if state.core.directory.refill_short() {
                 break;
             }
         }
-        assert!(state.core.directory.refill_short(reserve), "the claims left the reserve short");
+        assert!(state.core.directory.refill_short(), "the claims left the reserve short");
         state.publish_held();
-        *claimed.borrow_mut() = alone(state);
+        *claimed.borrow_mut() = kept(state);
         true
     };
     // The request: waiting once the refill's and the promotions' jobs have
@@ -274,7 +289,7 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
     // and begins a step, before the hastening.
     let request = std::cell::RefCell::new(None);
     let wait = |held: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::promotions::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
-        assert_ne!(alone(held), *claimed.borrow(), "the refill took no victim the tier kept alone");
+        assert_ne!(kept(held), *claimed.borrow(), "the refill took no victim the tier kept");
         let (requested, shared) = (state.clone(), shared.clone());
         let records = harness.layers.iter().map(|layer| layer.4.clone()).collect::<Vec<_>>();
         // Its own count, not any holder's: the load's request service is
@@ -287,7 +302,7 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
             let directory = &held.core.directory;
             let layers = 0..held.core.layers.len();
             let found = (layers.clone().map(|layer| directory.held_count(layer)).collect::<Vec<_>>(), layers.map(|layer| directory.alone(layer)).collect::<Vec<_>>());
-            let step = begin(&shared, &[StepRoute::Decode], false).unwrap().pop().unwrap();
+            let step = begin(&shared, &[StepRoute::Decode], false).unwrap().pop().unwrap().decoding([row(1000, None)].into_iter(), 0);
             // Its route chooses nothing at every layer, published before
             // the lock is released, as a route publishes before any read.
             let base = (step.sequence() % WORDS.flight) as usize * WORDS.routing_words() as usize;

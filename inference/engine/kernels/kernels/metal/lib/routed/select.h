@@ -102,10 +102,11 @@ struct Selected {
 // The selection order of the general routed form (`select_experts`,
 // functions.seismic), shared by `routed_select` and its hints: the scores of
 // this lane's candidates from their logits (`logit(expert)`) by `function`,
-// ranked on score + `bias(expert)`, sorted, then K argmax rounds over the
-// lane heads. Every lane of the simdgroup calls it.
-template <uint E, uint K, typename Logit, typename Bias>
-inline Selected<K> rank(int function, Logit logit, Bias bias, uint lane) {
+// ranked on score + `bias(expert)` (each held expert's ranked value given to
+// `keys`), sorted, then K argmax rounds over the lane heads. Every lane of
+// the simdgroup calls it.
+template <uint E, uint K, typename Logit, typename Bias, typename Keys = selection::NoKeys>
+inline Selected<K> rank(int function, Logit logit, Bias bias, uint lane, Keys keys = Keys{}) {
     constexpr uint P = (E + 31) / 32;
     // P when 32 divides E (a constant: no excluded entries).
     const uint held = selection::candidates<E>(lane);
@@ -122,6 +123,10 @@ inline Selected<K> rank(int function, Logit logit, Bias bias, uint lane) {
     _Pragma("clang loop unroll(full)")
     for (uint i = 0; i < P; ++i)
         ranked[i] = i < held ? selection::ranked(score[i] + bias(expert[i])) : -INFINITY;
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < P; ++i)
+        if (i < held)
+            keys(uint(expert[i]), ranked[i]);
     sort<P>(ranked, score, expert);
 
     Selected<K> selected;

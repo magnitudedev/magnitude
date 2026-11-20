@@ -1,0 +1,7 @@
+{
+  "repository": "https://huggingface.co/datasets/bigcode/bigcodebench",
+  "commit": "b74c0d0bf70d2c0bc459be537895cca163007f1a",
+  "file": "data/v0.1.4-00000-of-00001.parquet",
+  "license": "Apache-2.0",
+  "sha256": "d9a4965821c9507ebdfb551c288656b2d5fe553234f5183044333ca8a4018267"
+}

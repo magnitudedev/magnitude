@@ -377,7 +377,7 @@ class Adapter:
 
     def counter(self) -> contextlib.AbstractAsyncContextManager[Lengths]:
         """The engine's own rendering, for engines that are not host-rendered: prompt token
-        counts of chat bodies, in order. Sizes fixtures when no GGUF engine is measured, and
+        counts of chat bodies, in order. Sizes sessions when no GGUF engine is measured, and
         counts every request's prompt for the launched context."""
         raise NotImplementedError(f"{self.target.engine} is counted by magnitude-harness")
 

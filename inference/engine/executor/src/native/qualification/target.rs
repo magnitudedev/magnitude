@@ -1011,7 +1011,7 @@ impl ExpertReads {
 
     /// The decode entries' host tier records: the bank's (`Self::tier`),
     /// else none (`TR` 0), views of no records of `records`.
-    fn tier_records(&self, label: &str) -> Result<RecordTensors<Tensor>, CatalogFailure> {
+    pub(super) fn tier_records(&self, label: &str) -> Result<RecordTensors<Tensor>, CatalogFailure> {
         if let Some(tier) = &self.tier {
             return Ok(tier.clone());
         }

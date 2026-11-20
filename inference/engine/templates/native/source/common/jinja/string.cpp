@@ -43,14 +43,18 @@ void string::mark_input() {
 }
 
 std::string string::str() const {
+    if (parts.empty()) {
+        return {};
+    }
     if (parts.size() == 1) {
         return parts[0].val;
     }
-    std::ostringstream oss;
+    std::string out;
+    out.reserve(length());
     for (const auto & part : parts) {
-        oss << part.val;
+        out += part.val;
     }
-    return oss.str();
+    return out;
 }
 
 size_t string::length() const {
@@ -131,7 +135,11 @@ void string::mark_input_based_on(const string & other) {
 
 string & string::append(const string & other) {
     for (const auto & part : other.parts) {
-        parts.push_back(part);
+        if (!parts.empty() && parts.back().is_input == part.is_input) {
+            parts.back().val += part.val;
+        } else {
+            parts.push_back(part);
+        }
     }
     return *this;
 }

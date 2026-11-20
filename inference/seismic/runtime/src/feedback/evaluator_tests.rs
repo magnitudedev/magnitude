@@ -249,7 +249,7 @@ fn authored_failure_before_subgroup_preserves_prefix_and_reconverges_after_if() 
     let store = crate::artifacts::ProgramStore::user();
     let target = seismic_metal::profile::open_device(&device, &*store).unwrap();
     let programs: seismic_metal::MetalPrograms = std::sync::Arc::new(crate::formation::ProgramFormer::new(
-        seismic_metal::toolchain::MetalToolchain::new(device.clone(), target.facts()),
+        seismic_metal::toolchain::MetalToolchain::new(device.clone(), target.device_info()),
         store,
     ));
     let registry = seismic_metal::profile::registry();

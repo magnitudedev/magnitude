@@ -25,14 +25,21 @@ fn a_failed_read_answers_no_record_and_fails_only_the_rows_that_named_it() {
 }
 
 /// A kernel that found a state the protocol never reaches (SLOT_VIOLATED)
-/// is no wait that outlasted a pulse: the host panics where the step ends,
-/// and does not re-run it.
+/// is no wait that outlasted a pulse: the exchange's watchdog reports it at
+/// once (the kernel abandoned its claim, so the host's wait for it may
+/// never end), and the host panics where the step ends, and does not re-run
+/// it. The step's end checks too because the watchdog looks only every
+/// tenth of its bound, and only at steps not ended: alone, it would let a
+/// violated step complete between two looks.
 #[test]
 #[should_panic(expected = "never reaches")]
 fn a_state_the_protocol_never_reaches_panics_the_host() {
     let harness = prompted("violated", EXPERTS, 4);
     let step = harness.request(&[1]);
     harness.violate(&step, 0);
+    let report = harness.tripped();
+    let violation = format!("magnitude-engine: a kernel found a state the exchange protocol never reaches at step {} ", step.sequence());
+    assert!(report.starts_with(&violation), "the watchdog reported other than the step's violation");
     let _ = step.complete();
 }
 

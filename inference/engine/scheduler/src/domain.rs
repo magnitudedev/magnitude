@@ -259,6 +259,8 @@ mod tests {
             select: Vec::new(),
             committed: 1,
             prime: None,
+            front: Vec::new(),
+            chain: None,
         };
         let group = OperationGroup {
             lane: DomainLane::Target,

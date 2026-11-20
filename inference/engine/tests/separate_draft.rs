@@ -122,6 +122,8 @@ fn prefill(
         select: Vec::new(),
         committed: tokens.len(),
         prime: None,
+        front: Vec::new(),
+        chain: None,
     };
     let operations = [operation];
     let ReservedResources::Target(reservation) = domain
@@ -137,16 +139,14 @@ fn prefill(
     let (pending, bindings) = domain.finish_target(flight).unwrap();
     let mut features = None;
     for pending in pending {
-        let Outcome::Forward { rows } = pending.outcome().clone() else {
+        let Outcome::Forward { rows, .. } = pending.outcome().clone() else {
             panic!("a prefill returns forward rows")
         };
         features = rows.iter().find_map(|row| row.features.clone());
         domain
             .reconcile(
                 pending,
-                PhysicalDecision {
-                    accepted_rows: tokens.len(),
-                },
+                PhysicalDecision::rows(tokens.len()),
             )
             .unwrap();
     }
@@ -235,9 +235,7 @@ fn transact(
         domain
             .reconcile(
                 pending,
-                PhysicalDecision {
-                    accepted_rows: entered,
-                },
+                PhysicalDecision::rows(entered),
             )
             .unwrap();
     }

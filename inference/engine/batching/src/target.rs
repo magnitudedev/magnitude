@@ -70,6 +70,7 @@ impl ValidatedTargetBatch {
             previous_tape: &packed.previous_tape,
             following_bank: &packed.following_bank,
             stop: &packed.stop,
+            front: &packed.front,
             plane_base: &packed.plane_base,
             out_rows: &packed.out_rows,
             select_rows: &packed.select_rows,
@@ -122,6 +123,8 @@ pub struct TargetBatchUpload<'a> {
     pub previous_tape: &'a [i32],
     pub following_bank: &'a [i32],
     pub stop: &'a [i32],
+    /// Per row, whether it is a front row (`Slot::front`).
+    pub front: &'a [bool],
     pub plane_base: &'a [i32],
     pub out_rows: &'a [i32],
     pub select_rows: &'a [i32],
@@ -206,6 +209,7 @@ mod tests {
                     demand: Demand::NONE,
                     select: None,
                 }],
+                front: 0,
             }],
             16,
             ClassLimits {

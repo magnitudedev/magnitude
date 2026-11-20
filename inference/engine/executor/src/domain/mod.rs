@@ -11,7 +11,7 @@ use crate::programs::{Chain, ProgramSubmission};
 use crate::programs::graph::readout;
 use crate::{
     AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader, ExecutionPlan,
-    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GroupKey, HeadConditioning,
+    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GroupKey, Guess, HeadConditioning,
     HeadLaunchInputs, ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation,
     Outcome, PoolClass, Priming, ProgramIdentity, RequestId, ResidentHead, ResidentVision,
     ResourceDomain, ResourceDomainId, ResourceKind, RowResult, SelectSpec, Selected,
@@ -21,7 +21,7 @@ use crate::{
 };
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{
-    OwnedAdvanceResolution, OwnedChainAdvance, OwnedStateAdvance,
+    OwnedAdvanceResolution, OwnedChainAdvance, OwnedStateAdvance, OwnedSuccessorAdvance,
     OwnedTailRelocation, RowDemand, SequenceState, StateCheckpoint, StateStore, StoreBindings,
     TentativeAdvance,
 };
@@ -32,7 +32,7 @@ mod features;
 mod head;
 mod reader;
 mod serving_heap;
-pub use serving_heap::{Followed, Yielded};
+pub use serving_heap::{Followed, FrontRegime, TwoRowPricing, Yielded};
 mod in_flight;
 mod input;
 mod ownership;
@@ -59,7 +59,10 @@ pub use reader::{DeviceReader, LoadRoom, MachineReading, PlanningRoom, StatusRea
 pub use in_flight::{
     HeadFlight, PrimingCompletionFlight, TargetContinuation, TargetFlight, VisionFlight,
 };
-use in_flight::{PrimingFlight, Source, TargetWork, decode_selected};
+use in_flight::{
+    DueFront, FrontFlight, FrontHead, FrontJoins, HeldFront, PrimingFlight, SecuredFrontSlot, Source,
+    TargetWork, decode_selected,
+};
 pub use ownership::OpenRequirements;
 pub use state::{LoadCharge, StateBytes, StoreAllocation, StoreStateBytes};
 #[cfg(any(test, feature = "fixtures"))]
@@ -76,10 +79,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The logical owner chooses this only after inspecting every completed row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The logical owner chooses this only after inspecting every completed row:
+/// the rows it accepts, and how the pass's guessed rows fared, which the
+/// expert bank's reads ahead follow (`ElasticBank::decided`).
+#[derive(Debug, PartialEq, Eq)]
 pub struct PhysicalDecision {
     pub accepted_rows: usize,
+    pub ahead: crate::AheadVerdict,
+}
+
+impl PhysicalDecision {
+    /// A decision accepting `accepted_rows` of work that guessed nothing.
+    pub fn rows(accepted_rows: usize) -> Self {
+        Self { accepted_rows, ahead: crate::AheadVerdict::default() }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -262,6 +275,14 @@ enum Unsubmitted {
     Failed(DomainError),
 }
 
+/// The advance of `operation`'s rows from `state`, the `lane`'s, whose
+/// capacity its reservation already established: its committed rows, then
+/// its acceptable rows, then its front rows, which are never accepted.
+fn begin_rows(state: SequenceState, operation: &Operation, lane: &str) -> OwnedStateAdvance {
+    OwnedStateAdvance::begin_rows(state, operation.committed_rows(), operation.acceptable_rows(), operation.front_rows())
+        .unwrap_or_else(|(_, error)| panic!("invariant violated: {lane} state capacity changed after availability check: {error}"))
+}
+
 impl Unsubmitted {
     fn with(self, bindings: StateBindings) -> SubmitFailure {
         match self {
@@ -301,6 +322,9 @@ pub struct PendingOperationOutcome {
     advance: Option<Advance>,
     /// A prompt chunk's drafter entry, committed whole with the chunk.
     primed: Option<OwnedStateAdvance>,
+    /// The head advance of the front head launch behind a chained forward,
+    /// committing its entry row with the forward's accepted row.
+    front: Option<FrontAdvance>,
     rows: usize,
     committed_rows: usize,
     kind: WorkKind,
@@ -311,6 +335,11 @@ pub struct PendingOperationOutcome {
     /// it.
     timed: Timed,
     image: Option<ImageRef>,
+    /// Of a pass that ran rows ahead in an expert bank's step, that step:
+    /// the interest ledger awaits the pass's verdict by it, told as it is
+    /// reconciled (`ElasticBank::decided`), or its discard, as it is
+    /// aborted (`ElasticBank::discarded`).
+    awaited: Option<crate::experts::Step>,
 }
 
 /// What a launch's duration is its own across: the graphs recorded on the
@@ -375,6 +404,19 @@ enum Advance {
     },
 }
 
+/// A chained forward's head advance in its front head launch
+/// (`crate::two_row`), as its outcome holds it: it commits its one committed
+/// entry row with the forward's accepted row, and its scratch rows (the
+/// front rows' entries) never.
+enum FrontAdvance {
+    /// A decode pass's: over the request's accepted head state.
+    Step(OwnedStateAdvance),
+    /// The prompt's closing chunk's: following its drafter entry
+    /// (`PendingOperationOutcome::primed`), which it joins once that
+    /// commits.
+    Entry(OwnedSuccessorAdvance),
+}
+
 impl PendingOperationOutcome {
     pub fn request(&self) -> RequestId {
         self.request
@@ -429,10 +471,16 @@ pub struct DomainRequirements {
     /// `SequenceState::demands`): rows a history appends in place need none.
     state_demand: Vec<RowDemand>,
     successor_banks: usize,
-    /// Head page demand (and one successor bank each) of the drafter entries
-    /// the target group's prompt chunks prime.
-    priming_demand: Vec<RowDemand>,
-    priming_banks: usize,
+    /// The head launches behind a target group: its prompt chunk's drafter
+    /// entry, and the front head launch behind its chained forwards
+    /// (`crate::two_row`). Each takes a head graph's workspace and output.
+    head_launches: usize,
+    /// Their head page demand, and one successor bank per advance: the
+    /// drafter entry's, and each chained forward's head advance (one
+    /// committed entry row and a scratch row per front row, following the
+    /// drafter entry where its chunk primes one).
+    head_demand: Vec<RowDemand>,
+    head_banks: usize,
     /// The logits rows a target launch projects (`projected_rows`): the
     /// readout slot class it takes.
     projected: usize,
@@ -472,18 +520,29 @@ pub(super) fn projected_rows(operations: &[Operation]) -> usize {
                 kind,
                 tokens,
                 demand,
-                select,
                 ..
             } => match demand.contains(Demand::LOGITS) {
                 true => match kind {
                     WorkKind::Decode | WorkKind::Verify => tokens.len(),
                     WorkKind::Prefill | WorkKind::Replay => 1,
                 },
-                false => select.len(),
+                false => operation.selected_rows(),
             },
             Operation::Head { .. } | Operation::Encode { .. } => 0,
         })
         .sum()
+}
+
+/// The selections of a chained forward's entry rows in its front head
+/// launch, one per row it selects, in row order: the head's prediction of
+/// the token after that row's selection, drawn as the request draws that
+/// token, one position later. A grammar's mask names the row's own
+/// position, never the next: the head selects unmasked.
+pub(super) fn front_selects(operation: &Operation) -> Vec<SelectSpec> {
+    (0..operation.row_count())
+        .filter_map(|row| operation.selection_for_row(row))
+        .map(|spec| SelectSpec { position: spec.position + 1, mask: None, ..spec.clone() })
+        .collect()
 }
 
 /// The patch rows of the class a vision reservation encodes in.
@@ -540,6 +599,8 @@ pub struct TargetLaunchReservation {
     readout_workspace: NativeGraphWorkspaceLease,
     readout_output: NativeGraphOutputLease,
     priming: Option<PrimingReservation>,
+    /// The front head launch behind the group's chained forwards.
+    front: Option<HeldFront>,
 }
 
 /// A lone prompt chunk's drafter entry: its head advance and draft launch
@@ -695,10 +756,16 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// Identity of the next target flight.
     next_flight: u64,
     host_turn: Option<in_flight::HostTurn>,
-    /// Requests whose drafter proposed since their last target launch: that
-    /// launch is their round's verification, however many proposals it
-    /// verifies, and queues no decode behind it (`queue::continuations`).
-    proposed: BTreeSet<RequestId>,
+    /// The host's turns after verify passes, whose mean the regime prices a
+    /// verify pass by ([`in_flight::VerifyTurns`]).
+    verify_turns: in_flight::VerifyTurns,
+    /// Requests whose next target launch is their round's verification:
+    /// their drafter proposed since their last target launch, or that
+    /// launch is a verify pass (`Self::verify_pass`, marked as it launches).
+    /// That launch,
+    /// however many rows it verifies (none, of a chain cut empty), queues no
+    /// decode behind it (`queue::continuations`).
+    verifying: BTreeSet<RequestId>,
     /// Requests whose next round prepares to draft from a separate draft's
     /// fused taps: their next target launch's decode continuation publishes
     /// its feature (`queue::continuations`, `Self::publish_behind`).
@@ -759,14 +826,6 @@ impl<F: ProgramFamily> Drop for ExecutorDomain<F> {
     }
 }
 
-/// A load's launch of a number of rows at a depth, `(rows, depth)`, in
-/// each form it decodes in, as the load's assessment estimates it on this
-/// executor (`assessment::decode_step`): a decode step of a row a sequence
-/// within the decode row classes, a prefill launch beyond them
-/// (`estimate::launch_seconds`). A load without a bank decodes in one form,
-/// both the same.
-pub type DecodeStep = dyn Fn(u32, u32) -> Result<crate::assessment::FormSeconds, crate::assessment::AssessmentError>;
-
 /// What every load prices its memory's decisions on
 /// ([`ExecutorDomain::measure_load`]).
 pub struct LoadMeasures {
@@ -783,16 +842,17 @@ pub struct LoadMeasures {
 
 /// What a load's own decisions are priced on of its executor's costs.
 pub struct LoadCosts {
-    /// The launch in each form ([`DecodeStep`]): what the load's workload
-    /// prior is priced on (`ExecutorDomain::serving_prior`), and a bank's
-    /// growth and the drafter's worth.
-    pub step: Box<DecodeStep>,
+    /// The price of every launch of the load
+    /// ([`magnitude_cost_model::LaunchPrices`]): what the load's workload
+    /// prior is priced on (`ExecutorDomain::serving_prior`), a bank's growth
+    /// and the drafter's worth, and the drafting controller's prices.
+    pub prices: magnitude_cost_model::LaunchPrices,
 }
 
 impl LoadCosts {
     /// The costs of a load of `definition` planned as `planned`, as
-    /// `resident` before any bank, on `costs`: its launch in each form
-    /// (`assessment::decode_step`). The one derivation every load is
+    /// `resident` before any bank, on `costs`: its launch prices
+    /// (`assessment::launch_prices`). The one derivation every load is
     /// priced by.
     pub fn of(
         definition: &magnitude_family_contracts::ModelDefinition,
@@ -800,9 +860,7 @@ impl LoadCosts {
         planned: &crate::ExecutionPlanDraft,
         costs: &crate::assessment::ExecutorCosts,
     ) -> Result<Self, crate::assessment::AssessmentError> {
-        Ok(Self {
-            step: crate::assessment::decode_step(definition, resident, planned, costs.clone())?,
-        })
+        Ok(Self { prices: crate::assessment::launch_prices(definition, resident, planned, costs)? })
     }
 }
 
@@ -815,20 +873,20 @@ impl LoadCosts {
 pub struct ExpertMeasures {
     /// Each streamed layer's lines on this executor, the host's the bank
     /// holds and the GPU's its kernels' costs price
-    /// (`assessment::ExpertLines::priced`): the decode is priced along them,
+    /// (`assessment::expert_lines`): the decode is priced along them,
     /// and the route's policy words are written from them. Until measured,
     /// every miss is served on the GPU's path, and the experts' slots target
     /// their ceiling (`ElasticBank::targets`).
-    pub lines: crate::assessment::Priced<std::sync::Arc<[crate::assessment::ExpertLines]>>,
+    pub lines: crate::assessment::Priced<std::sync::Arc<[magnitude_cost_model::ExpertLines]>>,
     /// The model store's read line the decode's file misses take, the
     /// measurement job's (`assessment::StreamedFigures`), which also prices
     /// a stored table's records.
-    pub read: crate::assessment::Priced<crate::assessment::ReadLine>,
+    pub read: crate::assessment::Priced<magnitude_cost_model::ReadLine>,
     /// What a routed pass over each streamed layer's experts costs on this
     /// executor, which prices a prompt group's compute by its size and the
     /// passes its launches merge (`Stages::merge_sets`): until measured, a
     /// group merges by its reads alone.
-    pub pass: crate::assessment::Priced<crate::assessment::ExpertPass>,
+    pub pass: crate::assessment::Priced<magnitude_cost_model::ExpertPass>,
     /// What a host tier's copy costs (`assessment::TierCopyCosts`): the
     /// blocks it takes over the link, the link's rate, and the device time
     /// it takes from work beside it; none without a host tier. Until
@@ -838,7 +896,7 @@ pub struct ExpertMeasures {
     /// Each bank group's convert line in a decode barrier
     /// (`assessment::ConvertCosts`), none beside a host tier: until
     /// measured, the host lands every miss.
-    pub convert: crate::assessment::Priced<Option<std::sync::Arc<[crate::assessment::RecordLine]>>>,
+    pub convert: crate::assessment::Priced<Option<std::sync::Arc<[magnitude_cost_model::RecordLine]>>>,
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
@@ -994,7 +1052,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 if let Some(Some(costs)) = experts.tier_copy.measured() {
                     bank.tier_copy(costs)?;
                 }
-                bank.price(experts.lines.measured().cloned(), experts.pass.measured().cloned());
+                let prices = measures.costs.as_ref().ok().map(|costs| costs.prices.clone());
+                bank.price(experts.lines.measured().cloned(), experts.pass.measured().cloned(), prices);
                 if let Some(Some(lines)) = experts.convert.measured() {
                     bank.device_convert(lines);
                 }
@@ -1011,6 +1070,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// nothing keeps them.
     fn load_costs(&self) -> Option<&LoadCosts> {
         self.measures.as_ref().and_then(|measures| measures.costs.as_ref().ok())
+    }
+
+    /// The price of every launch of the load, the one snapshot every price
+    /// of it reads; none before [`Self::measure_load`], or where nothing
+    /// keeps its costs.
+    pub fn launch_prices(&self) -> Option<&magnitude_cost_model::LaunchPrices> {
+        self.load_costs().map(|costs| &costs.prices)
     }
 
     /// The measures of the load's experts; none before
@@ -1049,45 +1115,45 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Each streamed layer's lines in their state; none before
     /// [`Self::measure_load`].
-    pub fn expert_lines(&self) -> Option<&crate::assessment::Priced<std::sync::Arc<[crate::assessment::ExpertLines]>>> {
+    pub fn expert_lines(&self) -> Option<&crate::assessment::Priced<std::sync::Arc<[magnitude_cost_model::ExpertLines]>>> {
         self.expert_measures().map(|measures| &measures.lines)
     }
 
     /// The load's decode step as its experts' decisions price it now
-    /// ([`crate::assessment::DecodePrice`]): its variant's routing
+    /// ([`magnitude_cost_model::DecodePrice`]): its variant's routing
     /// calibrated by the decode it counted, at that decode's mean rows and
     /// context, on the step of those rows there in each form; before it
     /// counted a step, the generic model's routing alone, at one row at the
     /// start of its context (`DecodePrice::prior`), so every decision is
     /// priced from the load's first boundary. None before its lines, read
     /// line and step are measured.
-    pub(crate) fn decode_price(&self) -> Result<Option<crate::assessment::DecodePrice>, DomainError> {
+    pub(crate) fn decode_price(&self) -> Result<Option<magnitude_cost_model::DecodePrice>, DomainError> {
         let (Some(measures), Some(bank)) = (self.measures.as_ref(), self.family.expert_bank()) else {
             return Ok(None);
         };
         let Some(experts) = measures.experts.as_ref() else {
             return Ok(None);
         };
-        let measured = (experts.lines.measured(), experts.read.measured(), measures.costs.as_ref().ok().map(|costs| &costs.step));
-        let (Some(lines), Some(&read), Some(step)) = measured else {
+        let measured = (experts.lines.measured(), experts.read.measured(), measures.costs.as_ref().ok().map(|costs| &costs.prices));
+        let (Some(lines), Some(&read), Some(prices)) = measured else {
             return Ok(None);
         };
         let step = |rows: u32, depth: u32| {
-            step(rows, depth).map_err(|error| DomainError::invariant(format!("the decode step: {error}")))
+            prices.launch(rows, depth).map_err(|error| DomainError::invariant(format!("the decode step: {error}")))
         };
         let layers = bank.streamed_layers(lines.clone());
         Ok(Some(match bank.live() {
             Some(live) => {
                 let compute = step(live.rows.round() as u32, live.depth)?;
-                crate::assessment::DecodePrice::new(layers, live, read, compute)
+                magnitude_cost_model::DecodePrice::new(layers, live, read, compute)
             }
-            None => crate::assessment::DecodePrice::prior(layers, 1., read, step(1, 0)?),
+            None => magnitude_cost_model::DecodePrice::prior(layers, 1., read, step(1, 0)?),
         }))
     }
 
     /// What a routed pass over each streamed layer's experts costs, in its
     /// state; none before [`Self::measure_load`], or without a bank.
-    pub fn expert_pass(&self) -> Option<&crate::assessment::Priced<crate::assessment::ExpertPass>> {
+    pub fn expert_pass(&self) -> Option<&crate::assessment::Priced<magnitude_cost_model::ExpertPass>> {
         self.expert_measures().map(|measures| &measures.pass)
     }
 
@@ -1623,6 +1689,21 @@ impl ExecutorDomain<NativeFamily> {
         self.family.experts_held()
     }
 
+    /// What a load recording its routes (`ModelPolicy::record_routes`)
+    /// recorded since last taken: every decode-form step's choices and
+    /// selection keys at each streamed layer, and its front rows' verdicts;
+    /// `None` of a load that records none.
+    pub fn take_routes(&self) -> Option<crate::experts::RecordedRoutes> {
+        self.family.take_routes()
+    }
+
+    /// Each expert group's records a prompt group holds claimed and its
+    /// decode capacity, as residency last published them; `None` of a load
+    /// whose experts are held whole.
+    pub fn expert_lend(&self) -> Option<Vec<crate::experts::GroupLend>> {
+        self.family.expert_lend()
+    }
+
     /// The domain over the load's native family. Its holdings of what the
     /// load allocated as it started (`recorded`, and `constants`, the
     /// target's binding constants it binds now, claimed as
@@ -1663,6 +1744,9 @@ impl ExecutorDomain<NativeFamily> {
         // The family binds the target's constants, the arena's: one change
         // with their record.
         let device = resident.embedding.tensor().device();
+        device
+            .ensure_command_buffer_capacity(execution.command_buffer_capacity())
+            .map_err(|error| DomainError::Device(crate::DeviceError::Execution(error.to_string())))?;
         let family = constants.allocate(&device, |charges| {
             NativeFamily::new(charges, programs, resident, definition.decoder.clone(), resources.ledgers(), &mut recorded)
         })?;
@@ -1708,6 +1792,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             rows: self.execution.policy().limits().max_launch_rows,
             segments: store.max_span_limit(),
         }
+    }
+
+    /// Whether its decode passes run front rows, each entering the MTP head
+    /// behind it (`ModelLoadPlan::fronts`): a load whose experts stream and
+    /// whose drafter is an embedded head of its own history.
+    pub fn fronts(&self) -> bool {
+        self.execution.load().fronts()
+    }
+
+    /// The most rows a launch of chained decode passes holds
+    /// (`crate::ResourceLimits::chained_rows`): the row budget of every
+    /// such launch, the owner's and the pass queued behind the last alike.
+    pub fn chained_rows(&self) -> usize {
+        self.execution.policy().limits().chained_rows()
     }
 
     /// Whether the load's drafter is a head that keeps no history and reads
@@ -1992,14 +2090,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         tokens,
                         demand,
                         select,
+                        front,
                         ..
-                    } => Some((kind, tokens, demand, select)),
+                    } => Some((kind, tokens, demand, select.iter().chain(front.iter().map(|front| &front.select)))),
                     Operation::Head { .. } | Operation::Encode { .. } => None,
                 });
-                let selected = forwards
-                    .clone()
-                    .map(|(_, _, _, select)| select.len())
-                    .sum::<usize>();
+                let selected = operations.iter().map(Operation::selected_rows).sum::<usize>();
                 if selected > limits.max_selected_rows {
                     return Err(DomainError::Input(format!(
                         "launch selects {selected} rows; the selection bound is {}",
@@ -2064,8 +2160,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 pool: PoolClass::Target(class),
                 state_demand: Vec::new(),
                 successor_banks: 0,
-                priming_demand: Vec::new(),
-                priming_banks: 0,
+                head_launches: 0,
+                head_demand: Vec::new(),
+                head_banks: 0,
                 projected: projected_rows(operations),
                 claim: true,
             });
@@ -2084,9 +2181,38 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }) {
             panic!("invariant violated: a reserved group crosses numerical lanes");
         }
-        let mut priming_demand = Vec::new();
-        let mut priming_banks = 0usize;
+        let mut head_launches = 0usize;
+        let mut head_demand = Vec::new();
+        let mut head_banks = 0usize;
+        // A step whose forwards chain runs one front head launch behind it,
+        // whose entry rows are the forwards' selected rows
+        // (`Operation::entry_rows`, `HeadPasses::Front`): every forward
+        // chains or none, within a front head launch's rows.
+        let chained = operations.iter().filter(|operation| operation.chain().is_some()).count();
+        if chained > 0 {
+            if !self.fronts() {
+                return Err(DomainError::Input("a chained forward on a load that does not front".into()));
+            }
+            let entries = operations.iter().map(Operation::entry_rows).sum::<usize>();
+            if chained != operations.len() || entries > self.chained_rows() {
+                return Err(DomainError::Input(
+                    "a launch of chained forwards chains every forward within a chained launch's rows".into(),
+                ));
+            }
+            head_launches += 1;
+        }
         for operation in operations {
+            if let (Operation::Forward { request, kind: WorkKind::Decode, .. }, Some(chain)) = (operation, operation.chain()) {
+                let state = self
+                    .head
+                    .get(request)
+                    .ok_or_else(|| DomainError::Input("a chained forward's head is not idle".into()))?;
+                if state.position() != chain.position {
+                    return Err(DomainError::Input("chain entry position differs from accepted head state".into()));
+                }
+                head_demand.extend(state.demands(operation.entry_rows()));
+                head_banks += 1;
+            }
             if let Operation::Forward {
                 request,
                 prime: Some(prime),
@@ -2109,34 +2235,36 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         "drafter entry position differs from accepted drafter state".into(),
                     ));
                 }
+                // A successor-dependent entry's pairs are its chunk's
+                // (`Operation::validate`); the domain holds the boundary
+                // feature of every accepted target prefix, which an entry
+                // pairing its first token across it reads.
                 if prime.boundary {
-                    let Operation::Forward {
-                        position, tokens, ..
-                    } = operation
-                    else {
+                    let Operation::Forward { position, .. } = operation else {
                         unreachable!()
                     };
-                    if prime.position != position.saturating_sub(1)
-                        || prime.tokens.as_slice()
-                            != if *position == 0 {
-                                &tokens[1..]
-                            } else {
-                                &tokens[..]
-                            }
-                        || self
-                            .input
-                            .get(request)
-                            .and_then(|input| input.boundary.as_ref())
-                            .is_some()
-                            != (*position > 0)
+                    if self
+                        .input
+                        .get(request)
+                        .and_then(|input| input.boundary.as_ref())
+                        .is_some()
+                        != (*position > 0)
                     {
                         return Err(DomainError::Input(
                             "boundary priming differs from the accepted target prefix".into(),
                         ));
                     }
                 }
-                priming_demand.extend(state.demands(prime.tokens.len()));
-                priming_banks += usize::from(!prime.tokens.is_empty());
+                // The closing chunk's front head launch enters its row right
+                // past the drafter entry's.
+                if operation.chain().is_some_and(|chain| chain.position != prime.position + prime.tokens.len()) {
+                    return Err(DomainError::Input(
+                        "chain entry position differs from the end of the drafter entry".into(),
+                    ));
+                }
+                head_demand.extend(state.demands(prime.tokens.len() + operation.entry_rows()));
+                head_banks += usize::from(!prime.tokens.is_empty()) + usize::from(operation.chain().is_some());
+                head_launches += usize::from(!prime.tokens.is_empty());
             }
         }
         // A head that keeps no history reads each request's accepted target
@@ -2219,8 +2347,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     // Speculative target rows are recorded on the recurrent
                     // tape, which holds the planned draft rows.
                     if lane == ReservationLane::Target
-                        && operation.row_count() - operation.committed_rows()
-                            > self.execution.policy().method().draft_rows()
+                        && operation.acceptable_rows() > self.execution.policy().method().draft_rows()
                     {
                         return Err(DomainError::Input(
                             "speculative target rows exceed the planned draft rows".into(),
@@ -2313,8 +2440,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             pool,
             state_demand,
             successor_banks,
-            priming_demand,
-            priming_banks,
+            head_launches,
+            head_demand,
+            head_banks,
             projected: projected_rows(operations),
             claim: false,
         })
@@ -2393,30 +2521,35 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 )?;
             }
         }
-        if requirements.priming_banks != 0 {
+        if requirements.head_launches != 0 {
+            let launches = requirements.head_launches;
             let graph = self.resources.head_graph().ok_or(CapacityError {
                 resource: ResourceKind::Workspace,
-                required: 1,
+                required: launches as u64,
                 available: 0,
             })?;
-            available(
-                Some(graph.available_workspace()),
-                Some(graph.available_output()),
-            )?;
+            for (resource, available) in [
+                (ResourceKind::Workspace, graph.available_workspace()),
+                (ResourceKind::Output, graph.available_output()),
+            ] {
+                if available < launches {
+                    return Err(CapacityError { resource, required: launches as u64, available: available as u64 });
+                }
+            }
             let store = self.head_store.as_ref().ok_or(CapacityError {
                 resource: ResourceKind::StateRows,
                 required: requirements
-                    .priming_demand
+                    .head_demand
                     .iter()
                     .map(|demand| demand.rows as u64)
                     .sum(),
                 available: 0,
             })?;
-            holds(store, &requirements.priming_demand)?;
-            if store.available_banks() < requirements.priming_banks {
+            holds(store, &requirements.head_demand)?;
+            if store.available_banks() < requirements.head_banks {
                 return Err(CapacityError {
                     resource: ResourceKind::RecurrentBanks,
-                    required: requirements.priming_banks as u64,
+                    required: requirements.head_banks as u64,
                     available: store.available_banks() as u64,
                 });
             }
@@ -2582,6 +2715,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     readout_workspace,
                     readout_output,
                     priming: None,
+                    front: None,
                     boundary,
                 }))
             }
@@ -2618,7 +2752,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         match &mut resources {
             ReservedResources::Target(TargetGraphReservation::Launch(
                 TargetLaunchReservation {
-                    advances, priming, ..
+                    advances, priming, front, ..
                 },
             )) => {
                 if let [
@@ -2642,7 +2776,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             .remove(request)
                             .expect("reservation preflight established drafter ownership");
                         let rows = prime.tokens.len();
-                        match OwnedStateAdvance::begin_speculative(state, rows, rows) {
+                        match OwnedStateAdvance::begin(state, rows) {
                             Ok(advance) => {
                                 *priming = Some(PrimingReservation {
                                     advance,
@@ -2660,13 +2794,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .target
                         .remove(&request)
                         .expect("reservation preflight established target ownership");
-                    match OwnedStateAdvance::begin_speculative(
-                        state,
-                        operation.row_count(),
-                        operation.committed_rows(),
-                    ) {
-                        Ok(advance) => advances.push(advance),
-                        Err((_, error)) => panic!("invariant violated: target state capacity changed after availability check: {error}"),
+                    advances.push(begin_rows(state, operation, "target"));
+                }
+                if operations.iter().any(|operation| operation.chain().is_some()) {
+                    match self.reserve_front(operations, priming.as_ref()) {
+                        Ok(head) => *front = Some(head),
+                        Err(error) => {
+                            for (operation, advance) in operations.iter().zip(advances.drain(..)) {
+                                self.target.insert(operation.request(), advance.abort());
+                            }
+                            if let (Some(priming), [operation]) = (priming.take(), operations) {
+                                self.head.insert(operation.request(), priming.advance.abort());
+                            }
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -2686,14 +2827,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .head
                         .remove(&request)
                         .expect("reservation preflight established head ownership");
-                    match OwnedStateAdvance::begin_speculative(
-                        state,
-                        operation.row_count(),
-                        operation.committed_rows(),
-                    ) {
-                        Ok(advance) => advances.push(advance),
-                        Err((_, error)) => panic!("invariant violated: head state capacity changed after availability check: {error}"),
-                    }
+                    advances.push(begin_rows(state, operation, "head"));
                 }
             }
             _ => {}
@@ -2703,6 +2837,62 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             resources,
         })
     }
+    /// The front head launch behind the chained forwards `operations`,
+    /// secured as they are reserved, and its launch leases: of the prompt's
+    /// closing chunk entering rows by its drafter entry `priming`, its one
+    /// head advance following that entry; otherwise, per forward, its head
+    /// advance of one committed entry row and a scratch row per front row
+    /// over the request's accepted head state, taken out of `head`.
+    /// Reservation checked what it takes, so a refusal is a broken
+    /// invariant, and returns every state it took.
+    fn reserve_front(
+        &mut self,
+        operations: &[Operation],
+        priming: Option<&PrimingReservation>,
+    ) -> Result<HeldFront, DomainError> {
+        let graph = self.resources.head_graph().expect("checked head graph");
+        let changed = |detail: &str, error: String| {
+            DomainError::invariant(format!("{detail} changed after availability check: {error}"))
+        };
+        let graph_workspace = graph
+            .acquire_workspace()
+            .map_err(|error| changed("front head workspace", error.to_string()))?;
+        let graph_output = graph
+            .acquire_output()
+            .map_err(|error| changed("front head output", error.to_string()))?;
+        if let Some(priming) = priming {
+            let [operation] = operations else {
+                return Err(DomainError::invariant("a drafter entry primes a launch of more than its prompt chunk"));
+            };
+            let advance = priming
+                .advance
+                .successor(1)
+                .map_err(|error| changed("head state capacity", error.to_string()))?;
+            let slots = vec![SecuredFrontSlot { request: operation.request(), advance, selects: front_selects(operation) }];
+            return Ok(HeldFront::Entry(FrontHead { slots, graph_workspace, graph_output }));
+        }
+        let mut head = FrontHead { slots: Vec::with_capacity(operations.len()), graph_workspace, graph_output };
+        for operation in operations {
+            let request = operation.request();
+            // Take-out: the request's accepted head state, returned by its
+            // outcome's reconcile or abort (`FrontAdvance`), or here on
+            // refusal (`HeldFront::release`).
+            let state = self
+                .head
+                .remove(&request)
+                .expect("reservation preflight established head ownership");
+            match OwnedStateAdvance::begin_rows(state, 1, 0, operation.front_rows()) {
+                Ok(advance) => head.slots.push(SecuredFrontSlot { request, advance, selects: front_selects(operation) }),
+                Err((state, error)) => {
+                    self.head.insert(request, state);
+                    HeldFront::Accepted(head).release(&mut self.head);
+                    return Err(changed("head state capacity", error.to_string()));
+                }
+            }
+        }
+        Ok(HeldFront::Accepted(head))
+    }
+
     /// The domain over `family`, and the one [`StateBindings`] of its stores.
     /// Boxed from its making: a domain is twelve kilobytes, which every
     /// frame that moves one on to its owner would otherwise hold.
@@ -2784,7 +2974,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             answered: RefCell::default(),
             next_flight: 0,
             host_turn: None,
-            proposed: BTreeSet::new(),
+            verify_turns: in_flight::VerifyTurns::default(),
+            verifying: BTreeSet::new(),
             publishing: BTreeSet::new(),
             poisoned: BTreeMap::new(),
             measures: None,

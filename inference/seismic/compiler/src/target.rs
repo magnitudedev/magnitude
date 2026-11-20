@@ -46,7 +46,7 @@ pub struct DiscoveredTarget<T: seismic_native_target::TargetFamily> {
     pub dtypes: DataTypeSupport,
     pub vectors: VectorSupport,
     pub numerics: NumericalEnvironment,
-    pub facts: T::Facts,
+    pub device_info: T::DeviceInfo,
     pub kernel_abi: T::KernelAbi,
     pub local_realization: LocalRealizationPolicy,
 }
@@ -214,7 +214,7 @@ pub struct CapabilityRegistration<T: seismic_native_target::TargetFamily> {
     /// Which implementation ids this target profile supports, given the facts.
     /// May only narrow `implementations`; an empty result means the capability
     /// is not advertised on this target.
-    pub supported: fn(&T::Facts, &TargetLimits, &DataTypeSupport) -> BTreeSet<IntrinsicId>,
+    pub supported: fn(&T::DeviceInfo, &TargetLimits, &DataTypeSupport) -> BTreeSet<IntrinsicId>,
 }
 
 impl<T: seismic_native_target::TargetFamily> fmt::Debug for CapabilityRegistration<T> {
@@ -239,7 +239,7 @@ pub struct CompilerRegistryParts<T: seismic_native_target::TargetFamily> {
         &seismic_ir::kernel::Kernel<T>,
         &seismic_native_target::NativeKernelDescription<T>,
     ) -> Vec<seismic_lang::expr::BoolExpr>,
-    pub addressable_resources: fn(&T::Facts) -> Vec<AddressableResourceClass>,
+    pub addressable_resources: fn(&T::DeviceInfo) -> Vec<AddressableResourceClass>,
     pub emitted_intrinsics: BTreeSet<IntrinsicId>,
 }
 
@@ -306,7 +306,7 @@ mod internals {
             &seismic_ir::kernel::Kernel<T>,
             &seismic_native_target::NativeKernelDescription<T>,
         ) -> Vec<seismic_lang::expr::BoolExpr>,
-        addressable_resources: fn(&T::Facts) -> Vec<AddressableResourceClass>,
+        addressable_resources: fn(&T::DeviceInfo) -> Vec<AddressableResourceClass>,
     }
 
     impl<T: seismic_native_target::TargetFamily> Registry<T> {
@@ -515,7 +515,7 @@ mod internals {
         let mut capabilities = BTreeSet::new();
         let mut intrinsics = BTreeSet::new();
         for registration in &registry.inner.capabilities {
-            let supported = (registration.supported)(&parts.facts, &parts.limits, &parts.dtypes);
+            let supported = (registration.supported)(&parts.device_info, &parts.limits, &parts.dtypes);
             for intrinsic in &supported {
                 if !registration
                     .implementations
@@ -534,7 +534,7 @@ mod internals {
                 intrinsics.extend(supported);
             }
         }
-        let addressable_resources = (registry.inner.addressable_resources)(&parts.facts);
+        let addressable_resources = (registry.inner.addressable_resources)(&parts.device_info);
         let mut names = BTreeSet::new();
         for class in &addressable_resources {
             assert!(
@@ -611,7 +611,7 @@ mod internals {
             numerics: parts.numerics,
             capabilities,
             intrinsics,
-            facts: parts.facts,
+            device_info: parts.device_info,
             kernel_abi: parts.kernel_abi,
             local_realization: parts.local_realization,
             addressable_resources,

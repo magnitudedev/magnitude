@@ -22,7 +22,7 @@ use crate::stored_table::{NoticeStep, StepRows, StoredTable};
 use crate::operators::attention::pooled::ListPorts;
 use crate::operators::block::{BankPorts, HistoryPorts};
 use crate::operators::streams::ResidualCarry;
-use crate::experts::StepRoute;
+use crate::experts::{AheadOf, DecodeRow, StepRoute};
 use crate::operators::routed::split::{RunStage, SplitPorts, SplitValues};
 use crate::{
     ConditioningRef, ConditioningSlice, DeviceError, GraphOutputTensor, InvariantError,
@@ -84,14 +84,9 @@ fn i32_bytes(values: &[i32]) -> Vec<u8> {
         .collect()
 }
 
-/// Step `sequence`'s words (`routed_step`'s `sequence`): the u64 sequence
-/// as its pair, STEP_LOW and STEP_HIGH.
-fn step_bytes(step: u64) -> Vec<u8> {
-    use magnitude_kernels::constants::{STEP_HIGH, STEP_LOW, STEP_WORDS};
-    let mut words = [0u32; STEP_WORDS as usize];
-    words[STEP_LOW as usize] = step as u32;
-    words[STEP_HIGH as usize] = (step >> 32) as u32;
-    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+/// Step `sequence`'s words (`routed_step`'s `sequence`) as bytes.
+fn step_bytes(step: u64, front: u32) -> Vec<u8> {
+    magnitude_kernels::step_words(step, front).iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
 /// Observe every run, even after a failure, so none is still executing when
@@ -102,21 +97,66 @@ fn wait_all(completions: Vec<NativeGraphCompletion>) -> Result<(), SubmitError> 
     })
 }
 
-/// Submits a step's runs in sequences of doubling length (1, 2, 4, … runs):
-/// the device starts on the first run as soon as it is queued, and each
-/// sequence is queued while the device executes the previous ones, so a step
-/// of N runs has about log2(N) submission boundaries instead of N. Every
-/// run replays one of the graphs its family's slots hold
-/// (`seismic::NativeGraphFamily::launch`), so a sequence of any length and
-/// mix of places and classes records nothing once each shape has run. A
-/// scratch-served chain's submissions are its release's boundaries
+/// Growing submission-chunk schedule (`1, 1, 2, 3, 4, …` runs per queue
+/// submission): the single owner used both by [`StepSubmitter`] at execution
+/// time and by [`crate::ExecutionPlan::command_buffer_capacity`] when sizing
+/// the command queue at load time.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SubmissionChunks {
+    limit: usize,
+    held_first: bool,
+}
+
+impl SubmissionChunks {
+    pub(crate) const fn new() -> Self {
+        Self {
+            limit: 1,
+            held_first: false,
+        }
+    }
+
+    const fn limit(self) -> usize {
+        self.limit
+    }
+
+    fn advance(&mut self) {
+        if self.held_first {
+            self.limit += 1;
+        } else {
+            self.held_first = true;
+        }
+    }
+
+    /// Number of queue submissions required for `runs` queued runs.
+    pub(crate) fn count(mut runs: usize) -> usize {
+        let mut schedule = Self::new();
+        let mut chunks = 0;
+        while runs > 0 {
+            chunks += 1;
+            runs = runs.saturating_sub(schedule.limit());
+            schedule.advance();
+        }
+        chunks
+    }
+}
+
+/// Submits a step's runs in sequences of growing length (1, 1, 2, 3, 4, …
+/// runs): the entry run and the first block run each submit at once so the
+/// device begins the first block without waiting on a second block's encoding,
+/// and each later sequence grows by one run instead of doubling so host
+/// encoding never outlasts the GPU work already queued when per-run encode and
+/// execute times are comparable, while a chain of N runs still takes only
+/// O(sqrt(N)) submission boundaries. Every run replays one of the graphs its
+/// family's slots hold (`seismic::NativeGraphFamily::launch`), so a sequence
+/// of any length and mix of places and classes records nothing once each shape
+/// has run. A scratch-served chain's submissions are its release's boundaries
 /// ([`RunningRelease`]).
 struct StepSubmitter<'p> {
     device: Device,
     release: Option<RunningRelease<'p>>,
     sequence: NativeGraphSequence,
     queued: usize,
-    limit: usize,
+    schedule: SubmissionChunks,
     completions: Vec<NativeGraphCompletion>,
     /// The stored-table reads of the runs since the last submission, the
     /// first `queued_reads` of them the queued runs', then of the submitted
@@ -134,7 +174,7 @@ struct StepSubmitter<'p> {
 
 /// A scratch-served chain's release of its load's expert bank beside its
 /// running steps (`ExpertBank::release_running`), taken at each submission
-/// of its runs: the bank, the chain's first and last steps, what reads
+/// of its runs: the bank, the chain's prompt group, what reads
 /// memory, the last block every pass of which is queued and the last
 /// submitted, and the block a cut's install awaits the submission of. A
 /// chain's encoding is throttled by the device, so its submissions come at
@@ -144,7 +184,7 @@ struct StepSubmitter<'p> {
 /// the chain's end.
 struct RunningRelease<'p> {
     bank: Arc<crate::experts::ExpertBank>,
-    chain: (u64, u64),
+    chain: crate::experts::ScratchGroup,
     pressure: &'p dyn Fn() -> Option<crate::domain::RunningPressure>,
     queued: Option<usize>,
     submitted: Option<usize>,
@@ -172,7 +212,7 @@ impl<'p> StepSubmitter<'p> {
             release,
             sequence: device.native_sequence(NativeQueue::Compute),
             queued: 0,
-            limit: 1,
+            schedule: SubmissionChunks::new(),
             completions: Vec::new(),
             pending_reads: Vec::new(),
             queued_reads: 0,
@@ -228,9 +268,9 @@ impl<'p> StepSubmitter<'p> {
         register(&outputs);
         (self.queued_reads, self.queued_landed) = (self.pending_reads.len(), self.pending_landed.len());
         self.queued += 1;
-        if self.queued == self.limit {
+        if self.queued == self.schedule.limit() {
             self.flush()?;
-            self.limit *= 2;
+            self.schedule.advance();
         }
         Ok((outputs, spans))
     }
@@ -354,6 +394,13 @@ pub struct TargetReadoutGraphResult {
     pub features: GraphOutputTensor,
     pub logits: Option<GraphOutputTensor>,
     pub selected: Option<GraphOutputTensor>,
+    /// The step's `[rows, 2]` (token, status) token rows in the readout's
+    /// window, of a selecting readout of a fronting load
+    /// (`TokenRowPorts`): the token row each selection was made on.
+    pub token_rows: Option<GraphOutputTensor>,
+    /// The batch row the readout's window starts at (`RowWindow`): batch
+    /// row `r` is row `r - window` of `token_rows`.
+    pub window: usize,
     /// Indices into the feature output rows, in projected logits order.
     pub projected_output_rows: Vec<usize>,
 }
@@ -393,6 +440,9 @@ pub(crate) struct CompletedTargetOutput {
     pub failures: Vec<Option<crate::WeightReadError>>,
     /// How the step's expert bank's step ended.
     pub(crate) experts: ExpertStepEnd,
+    /// The expert bank's step it ran in, of a streamed load: what the
+    /// interest ledger knows its passes by (`ElasticBank::decided`).
+    pub(crate) expert_step: Option<crate::experts::Step>,
 }
 
 /// How a step's expert bank's step ended.
@@ -431,6 +481,7 @@ impl TargetOutput {
             Some(recording) => step.recorded(recording),
             None => step,
         });
+        let expert_step = step.as_ref().map(crate::experts::ExpertStep::sequence);
         let (experts, unread) = match step.map(crate::experts::ExpertStep::complete) {
             None | Some(Ok(())) => (ExpertStepEnd::Ran, None),
             Some(Err(
@@ -465,7 +516,7 @@ impl TargetOutput {
             read.table.retire(read.value);
         }
         let Self { boundary, readout, commits, .. } = self;
-        Ok(CompletedTargetOutput { boundary, readout, commits, failures, experts })
+        Ok(CompletedTargetOutput { boundary, readout, commits, failures, experts, expert_step })
     }
 }
 
@@ -637,6 +688,9 @@ impl RowState<'_> {
     }
     fn preceding(&self) -> &[Vec<u64>] {
         self.0.preceding()
+    }
+    fn host_guesses(&self) -> Vec<[i32; 2]> {
+        self.0.host_guesses()
     }
     /// The state store's recurrent arenas, one per component. Every slot's
     /// advance belongs to the same store; the batch's bank columns select
@@ -960,6 +1014,16 @@ impl NativeTargetProgram {
         if let Some(ports) = &graph.selection {
             write_selection(batch, &mut active, ports, selected_class, batch.mask_words)?;
         }
+        // The step's token rows in the readout's window: the kept host rows,
+        // or the selection the step read.
+        if let Some(ports) = &graph.token_rows {
+            let rows = u64::try_from(batch.class.rows()).map_err(|_| invalid("row class exceeds u64"))?;
+            let tokens = match run.launch.state.tokens() {
+                TargetTokens::Host => self.kept_token_rows(region, rows)?,
+                TargetTokens::Selected { selected, .. } => selected.tensor().clone(),
+            };
+            bindings.set(&self.unallocating(), &ports.tokens, &window.slice(&tokens)?).map_err(device)?;
+        }
         let ready = active
             .attach(
                 bindings,
@@ -991,10 +1055,17 @@ impl NativeTargetProgram {
                     .ok_or_else(|| invalid("readout selection was not exported"))
             })
             .transpose()?;
+        let token_rows = graph
+            .token_rows
+            .as_ref()
+            .map(|ports| owner.tensor(&ports.rows).ok_or_else(|| invalid("readout token rows were not exported")))
+            .transpose()?;
         Ok(Some(TargetReadoutGraphResult {
             features,
             logits,
             selected,
+            token_rows,
+            window: usize::try_from(window.first).map_err(|_| invalid("readout window exceeds usize"))?,
             projected_output_rows,
         }))
     }
@@ -1229,22 +1300,29 @@ impl NativeTargetProgram {
                 }
                 Ok(StepRows::Known(rows))
             }
-            TargetTokens::Selected(_) => {
+            TargetTokens::Selected { .. } => {
                 let notice = notice
                     .cloned()
                     .ok_or_else(|| invalid("selected tokens without their notice"))?;
                 let preceding = preceding.to_vec();
+                let segments = batch.segments[..preceding.len()].to_vec();
                 Ok(StepRows::Selected(Box::new(move || {
-                    // A slot's one row is its selection row; a failed
-                    // selection's slot names none, as its step is never
-                    // used.
+                    // A slot's rows are its segment's selection rows (a
+                    // front pass's exact token and guesses); a slot a
+                    // selection of which failed names none, as its step is
+                    // never used.
                     let selected = notice.read()?;
                     Ok(preceding
                         .iter()
-                        .zip(selected)
-                        .map(|(preceding, [token, status])| match (u64::try_from(token), status) {
-                            (Ok(token), 0) => hash.rows(preceding, &[token]),
-                            _ => Vec::new(),
+                        .zip(&segments)
+                        .map(|(preceding, &[start, end])| {
+                            let rows = usize::try_from(start).ok().zip(usize::try_from(end).ok()).and_then(|(start, end)| selected.get(start..end));
+                            let tokens = rows.and_then(|rows| {
+                                rows.iter()
+                                    .map(|&[token, status]| u64::try_from(token).ok().filter(|_| status == 0))
+                                    .collect::<Option<Vec<_>>>()
+                            });
+                            tokens.map_or_else(Vec::new, |tokens| hash.rows(preceding, &tokens))
                         })
                         .collect())
                 })))
@@ -1262,6 +1340,19 @@ impl NativeTargetProgram {
                 .token_rows
                 .as_ref()
                 .ok_or_else(|| invalid("the model keeps no token rows"))?,
+            rows,
+        )
+    }
+
+    /// The leading `rows` in `region` of the host's guesses a load that
+    /// fronts keeps (`GroupBuffers::kept_guesses`).
+    fn kept_guess_rows(&self, region: &ChainRegion, rows: u64) -> Result<Tensor, SubmitError> {
+        region.rows(
+            region
+                .group
+                .kept_guesses
+                .as_ref()
+                .ok_or_else(|| invalid("the load keeps no guesses"))?,
             rows,
         )
     }
@@ -1369,9 +1460,20 @@ impl NativeTargetProgram {
                     let upload = launch.batch().upload();
                     let step = match route(&launch) {
                         StepRoute::Decode => {
-                            step.decoding(upload.coordinates[..upload.actual_rows].iter().map(|row| row[0] as u64))
+                            let rows = upload.actual_rows;
+                            let (slots, front) = (&upload.row_slots[..rows], &upload.front[..rows]);
+                            let positions = upload.coordinates[..rows].iter().map(|row| row[0] as u64);
+                            step.decoding(decode_rows(positions, slots, front, upload.stop, launch.requests()).into_iter(), upload.class.rows() - rows)
                         }
-                        StepRoute::Grouped => step,
+                        // Its slots of more rows than they commit run
+                        // rows ahead (a verification wider than the decode
+                        // form), each awaiting its verdict.
+                        StepRoute::Grouped => {
+                            let rows = &upload.row_slots[..upload.actual_rows];
+                            let ahead = |slot: usize| rows.iter().filter(|&&of| of as usize == slot).count() > upload.stop[slot] as usize;
+                            let requests = launch.requests();
+                            step.guessing((0..requests.len()).filter(|&slot| ahead(slot)).map(|slot| requests[slot]))
+                        }
                     };
                     (launch, Some((bank.clone(), step)))
                 });
@@ -1394,9 +1496,12 @@ impl NativeTargetProgram {
         // the bank released between its submissions.
         let release = match (&self.graphs.bank, serving) {
             (Some(bank), Some(serving)) if serving.scratch() => {
-                let sequences = steps.iter().filter_map(|(_, banked)| banked.as_ref().map(|(_, step)| step.sequence()));
-                let (first, last) = sequences.fold((u64::MAX, 0), |(first, last), sequence| (first.min(sequence), last.max(sequence)));
-                Some(RunningRelease { bank: bank.clone(), chain: (first, last), pressure, queued: None, submitted: None, awaits: None })
+                let chain = steps
+                    .iter()
+                    .find_map(|(_, banked)| banked.as_ref())
+                    .and_then(|(_, step)| step.scratch_group())
+                    .expect("a scratch-served chain's steps are a prompt group's");
+                Some(RunningRelease { bank: bank.clone(), chain, pressure, queued: None, submitted: None, awaits: None })
             }
             _ => None,
         };
@@ -1481,7 +1586,7 @@ impl NativeTargetProgram {
             .map(|(launch, banked)| {
                 let bank = banked
                     .as_ref()
-                    .map(|(bank, step)| BankRun { bank: bank.clone(), sequence: step.sequence(), sampled: step.samples(), resident });
+                    .map(|(bank, step)| BankRun { bank: bank.clone(), sequence: step.sequence(), front: step.front(), sampled: step.samples(), resident });
                 let (core, graph_workspace, graph_output, workspace, output) = launch.submission_parts_mut();
                 ((core, graph_workspace, (workspace, output), bank), graph_output)
             })
@@ -1494,7 +1599,7 @@ impl NativeTargetProgram {
             |(core, graph_workspace, readout, bank)| {
                 // A later launch's entry runs before the chain's readouts,
                 // so it cannot read a selection the chain makes.
-                if place > 0 && matches!(core.tokens(), TargetTokens::Selected(_)) {
+                if place > 0 && matches!(core.tokens(), TargetTokens::Selected { .. }) {
                     return Err(invalid("a chained launch reads selected tokens"));
                 }
                 let region = ChainRegion {
@@ -1558,7 +1663,7 @@ impl NativeTargetProgram {
         let tokens = state.tokens();
         let source = match tokens {
             TargetTokens::Host => EntryTokens::Uploaded,
-            TargetTokens::Selected(_) => EntryTokens::Selected,
+            TargetTokens::Selected { .. } => EntryTokens::Selected,
         };
         let (entry, entry_bound) = self.graphs.entry(rows, source).map_err(invalid)?;
         // A step reading selected tokens in a model with a stored table
@@ -1595,9 +1700,16 @@ impl NativeTargetProgram {
                             .map_err(device)?;
                     }
                 }
-                TargetTokens::Selected(selected) => bindings
+                TargetTokens::Selected { selected, .. } => bindings
                     .set(&self.unallocating(), &entry.tokens, selected.tensor())
                     .map_err(device)?,
+            }
+            // Of host tokens, the host's guesses are kept for the step words.
+            if let Some(kept) = &entry.kept_guesses {
+                active
+                    .write_input(&kept.uploaded, &i32_bytes(state.host_guesses().as_flattened()))
+                    .map_err(device)?;
+                bindings.set(&self.unallocating(), &kept.rows, &self.kept_guess_rows(&region, rows)?).map_err(device)?;
             }
             // Selected tokens are copied for the host, which learns from
             // them the stored tables' rows the step names.
@@ -2158,9 +2270,38 @@ impl NativeTargetProgram {
                     }
                 }
             }
-            // A graph that sets the run's step words writes its sequence.
-            if let (Some(port), Some(bank)) = (&graph.sequence, bank) {
-                active.write_input(port, &step_bytes(bank.sequence)).map_err(device)?;
+            // A graph that sets the run's step words writes its sequence,
+            // and a decode graph's binds the guesses its front rows run on:
+            // the previous step's, or the host's kept rows.
+            if let (Some(inputs), Some(bank)) = (&graph.step_inputs, bank) {
+                // STEP_FRONT's bits are front rows, each run of them
+                // following its exact row (`decode_rows`): never row 0, each
+                // below VERIFY_ROWS (its STEP_GUESSES field fits) and the
+                // graph's rows, and none in a graph of no token rows (a
+                // prompt's front). `routed_step` reads them unchecked.
+                assert!(
+                    bank.front & 1 == 0 && u64::from(bank.front) < 1 << magnitude_kernels::constants::VERIFY_ROWS.min(rows),
+                    "step {}'s front rows {:#b} do not each follow an exact row below VERIFY_ROWS and its {rows} rows",
+                    bank.sequence,
+                    bank.front
+                );
+                active.write_input(&inputs.sequence, &step_bytes(bank.sequence, bank.front)).map_err(device)?;
+                match &inputs.guesses {
+                    Some(port) => {
+                        let guesses = match state.tokens() {
+                            TargetTokens::Host => &self.kept_guess_rows(&run.region, rows)?,
+                            TargetTokens::Selected { guesses: Some(guesses), .. } => guesses.tensor(),
+                            TargetTokens::Selected { guesses: None, .. } if bank.front == 0 => {
+                                &self.kept_guess_rows(&run.region, rows)?
+                            }
+                            TargetTokens::Selected { guesses: None, .. } => {
+                                return Err(invalid("a step of selected tokens on a load that fronts has no guesses"));
+                            }
+                        };
+                        bindings.set(&self.unallocating(), port, guesses).map_err(device)?;
+                    }
+                    None => assert_eq!(bank.front, 0, "step {}'s graph of no token rows runs front rows", bank.sequence),
+                }
             }
             match (&graph.per_layer, &run.per_layer_rows) {
                 (None, _) => {}
@@ -2176,7 +2317,7 @@ impl NativeTargetProgram {
                     TargetTokens::Host => bindings
                         .set(&self.unallocating(), &ports.tokens, &self.kept_token_rows(&run.region, rows)?)
                         .map_err(device)?,
-                    TargetTokens::Selected(selected) => bindings
+                    TargetTokens::Selected { selected, .. } => bindings
                         .set(&self.unallocating(), &ports.tokens, selected.tensor())
                         .map_err(device)?,
                 }
@@ -2727,6 +2868,102 @@ impl TargetProgram for NativeTargetProgram {
                 },
             )
         }))
+    }
+}
+
+/// A decode launch's batch rows ([`ExpertStep::decoding`]), each at its
+/// position (`positions`) and of the request of its slot (`requests`, per
+/// slot), by the operation's counts. A slot's rows run in order: its
+/// committed rows (`stop`, per slot) are exact rows, then its acceptable
+/// rows, or else its front rows (`front`, per row), which trail them. A row
+/// past the committed ones is an ahead row: its index among the slot's ahead
+/// rows, and the slot's acceptable rows.
+fn decode_rows(positions: impl Iterator<Item = u64>, slots: &[i32], front: &[bool], stop: &[i32], requests: &[crate::operation::RequestId]) -> Vec<DecodeRow> {
+    positions
+        .enumerate()
+        .map(|(row, position)| {
+            let slot = usize::try_from(slots[row]).expect("a row's slot is nonnegative");
+            let exact = usize::try_from(stop[slot]).expect("a slot's committed rows are nonnegative");
+            let of_slot = || (0..slots.len()).filter(|&other| slots[other] == slots[row]);
+            let offset = of_slot().take_while(|&other| other < row).count();
+            let ahead = offset.checked_sub(exact).map(|index| {
+                let acceptable = of_slot().filter(|&other| !front[other]).count().saturating_sub(exact);
+                AheadOf::new(exact, acceptable, index)
+            });
+            DecodeRow { position, request: requests[slot], ahead }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod decode_rows_tests {
+    use super::{AheadOf, DecodeRow, decode_rows};
+    use crate::operation::RequestId;
+
+    fn rows(slots: &[i32], front: &[bool], stop: &[i32]) -> Vec<Option<AheadOf>> {
+        let requests = [RequestId(10), RequestId(11)];
+        let decoded = decode_rows((0..slots.len() as u64).map(|row| 100 + row), slots, front, stop, &requests);
+        assert!(decoded.iter().enumerate().all(|(row, decoded)| decoded.position == 100 + row as u64 && decoded.request == requests[slots[row] as usize]));
+        decoded.into_iter().map(|DecodeRow { ahead, .. }| ahead).collect()
+    }
+
+    /// Plain decode and a prompt chunk have no ahead row.
+    #[test]
+    fn exact_rows_are_no_ahead_rows() {
+        assert_eq!(rows(&[0], &[false], &[1]), [None]);
+        assert_eq!(rows(&[0, 0, 0], &[false; 3], &[3]), [None; 3]);
+    }
+
+    /// An exact row beside a front row: the front row is the first guessed
+    /// row, exact one pass on.
+    #[test]
+    fn a_two_row_passs_front_row_is_its_first_guess() {
+        let front = AheadOf::new(1, 0, 0);
+        assert_eq!(rows(&[0, 0], &[false, true], &[1]), [None, Some(front)]);
+        assert!(front.front() && front.exact_in() == 1 && front.guessed().get() == 1);
+    }
+
+    /// An exact row before three front rows: front row `d` is the `d`-th
+    /// guessed row, exact `d` passes on.
+    #[test]
+    fn a_front_passs_rows_are_exact_their_depth_passes_on() {
+        let rows = rows(&[0, 0, 0, 0], &[false, true, true, true], &[1]);
+        assert_eq!(rows, [None, Some(AheadOf::new(1, 0, 0)), Some(AheadOf::new(1, 0, 1)), Some(AheadOf::new(1, 0, 2))]);
+        let ahead = rows.iter().flatten().map(|ahead| (ahead.front(), ahead.exact_in(), ahead.guessed().get())).collect::<Vec<_>>();
+        assert_eq!(ahead, [(true, 1, 1), (true, 2, 2), (true, 3, 3)]);
+    }
+
+    /// A verification of k drafts: acceptable rows, each guessed, exact in
+    /// their own pass.
+    #[test]
+    fn a_verifications_proposals_are_acceptable_guesses() {
+        let rows = rows(&[0, 0, 0], &[false; 3], &[1]);
+        assert_eq!(rows, [None, Some(AheadOf::new(1, 2, 0)), Some(AheadOf::new(1, 2, 1))]);
+        let ahead = rows.iter().flatten().map(|ahead| (ahead.row(), ahead.acceptable(), ahead.guessed().get())).collect::<Vec<_>>();
+        assert_eq!(ahead, [(0, 2, 1), (1, 2, 2)]);
+        assert!(rows.iter().flatten().all(|ahead| !ahead.front() && ahead.exact_in() == 0));
+    }
+
+    /// A front row behind acceptable rows is no pass's (`Rows`).
+    #[test]
+    #[should_panic(expected = "front rows of a pass of none")]
+    fn a_front_row_behind_acceptable_rows_is_no_pass() {
+        rows(&[0, 0, 0], &[false, false, true], &[1]);
+    }
+
+    /// A front row with no exact row before it is no pass's (`Rows`).
+    #[test]
+    #[should_panic(expected = "front rows of a pass of none")]
+    fn a_front_row_alone_is_no_pass() {
+        rows(&[0], &[true], &[0]);
+    }
+
+    /// Slots are counted apart, each with its own request and its own
+    /// committed rows.
+    #[test]
+    fn slots_are_counted_apart() {
+        let rows = rows(&[0, 1, 0, 1, 1], &[false, false, true, false, true], &[1, 2]);
+        assert_eq!(rows, [None, None, Some(AheadOf::new(1, 0, 0)), None, Some(AheadOf::new(2, 0, 0))]);
     }
 }
 

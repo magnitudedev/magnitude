@@ -1,4 +1,4 @@
-use super::{decode_set, BankTier, ExpertBankPlan, Placer};
+use super::{decode_set, ExpertBankPlan, Placer};
 use crate::memory::ClaimDemand;
 use std::num::NonZeroU64;
 

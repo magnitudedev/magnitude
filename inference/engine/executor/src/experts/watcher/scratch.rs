@@ -20,9 +20,9 @@
 //! scratch lie in the bottom records of their lender (`planning::ScratchPlan`,
 //! `planning::ConveyorCarrier`): on unified memory both in the one store's,
 //! beside a discrete device the conveyor in the host tier's and the scratch
-//! in the lender's bank records, the pass's. The group claims them all as
-//! its first request is taken (`Directory::claim_lent`, `Directory::lend`)
-//! and returns them empty, so it takes no other layer's records: every
+//! in the lender's bank records, the pass's. They are the group's lease,
+//! granted from its first request on (`Directory::lease`) and returned
+//! empty, so it takes no other layer's records: every
 //! layer keeps its decode experts through it. Its last step seeds where the
 //! device reads, the bank beside a host tier and the one store on unified
 //! memory alike, copying its experts' slots into records the ranking gives
@@ -120,18 +120,18 @@ struct Tier {
 
 /// The record step `step`'s pass reads `layer`'s `expert` in, as the device
 /// resolves its map: a hit, none where it reads it from its scratch slot.
-/// Never a record lent to the step's group (`lending`, the conveyor's): a
-/// group takes its lent records before it takes a hit, unmapping what they
-/// held from its first step, and nothing maps into one while it holds it;
-/// beside a host tier the bank's records assert it
+/// Never a record lent to the step's group (its lease, `HostRecords::lent`):
+/// a group's lease takes its lent records before it takes a hit, unmapping
+/// what they held from its first step, and nothing maps into one while it
+/// holds it; beside a host tier the bank's records assert it
 /// (`BankRecords::resolve`), on the one store its lent host records.
-fn hit(core: &Core, lending: &crate::experts::conveyor::Lending, layer: usize, expert: usize, step: Step) -> Option<usize> {
+fn hit(core: &Core, layer: usize, expert: usize, step: Step) -> Option<usize> {
     match core.extents.placer {
         crate::planning::Placer::Tier => core.directory.resolve(layer, expert, step).map(BankRecord::index),
         crate::planning::Placer::Bank => {
             let record = core.layers[layer].map.resolve(expert, step)?;
             assert!(
-                core.layers[layer].group != lending.group || record >= lending.records,
+                record >= core.directory.host(core.layers[layer].group).lent() as usize,
                 "step {step} resolves expert {expert} of layer {layer} in lent record {record}"
             );
             Some(record)
@@ -274,22 +274,25 @@ pub(super) fn conveyor_forms(pools: usize, layers: &[Vec<usize>]) -> Vec<usize> 
         .collect()
 }
 
-/// Fail step `sequence`'s scratch request of `layer`: the failure is
-/// recorded, then published in every lane of its slot not yet answered,
-/// the request's and each round's (the last round's among them, which its
-/// seed commit reads).
-pub(super) fn fail(core: &Core, shared: &Shared, layer: usize, sequence: Step, reason: String) {
+/// Fail step `sequence`'s scratch requests: the failure is recorded, then
+/// published in every lane of its slot not yet answered at every streamed
+/// layer, the request's and each round's (the last round's among them,
+/// which its seed commit reads). A failed step runs on unparked, so every
+/// wait of it is over: its round at a later layer may arrive after the
+/// device is past that layer for the group's other steps, when the layer's
+/// tier, and the request it held, have gone (`Scratch::advance`), and only
+/// this answer, given before the request, ends that wait. An answer only
+/// moves forward and a failure is final, so a later serve of the step's
+/// request changes none.
+pub(super) fn fail(core: &Core, shared: &Shared, sequence: Step, reason: String) {
     shared.steps.fail(sequence, reason);
-    let scratch = &core.layers[layer].scratch;
-    for lane in 0..scratch.table().lanes() {
-        scratch.answer(sequence, lane, true);
+    for layer in &core.layers {
+        let scratch = &layer.scratch;
+        for lane in 0..scratch.table().lanes() {
+            scratch.answer(sequence, lane, true);
+        }
     }
     shared.parks.settle();
-}
-
-/// The lane of round `round` of a step's slot of a layer's scratch table.
-pub(super) fn round_lane(round: u64) -> u64 {
-    constants::SCRATCH_ROUND + round
 }
 
 /// The scratch requests taken and served, the tiers and the conveyor.
@@ -568,7 +571,7 @@ impl Scratch {
         }
         let (mut hits, mut cold) = (Vec::new(), Vec::new());
         for expert in first {
-            match hit(core, self.conveyor.lending(), layer, expert, sequence) {
+            match hit(core, layer, expert, sequence) {
                 Some(record) => hits.push((expert, record)),
                 None => cold.push(expert),
             }
@@ -597,22 +600,22 @@ impl Scratch {
             return;
         };
         let steps = &core.steps;
-        if progress >= steps.after(serving.group) {
+        if progress >= steps.after(serving.group.first()) {
             serving.past = true;
         }
         let serving = *serving;
         for tier in &self.tiers {
-            if progress > steps.point(tier.group, tier.layer, serving.last) {
+            if progress > steps.point(tier.group, tier.layer, serving.group.last()) {
                 core.layers[tier.layer].reset_windows();
             }
         }
         // A tier the device is past holds nothing: its slots are the
         // scratch's, which the group returns as it clears.
-        self.tiers.retain(|tier| progress <= steps.point(tier.group, tier.layer, serving.last));
+        self.tiers.retain(|tier| progress <= steps.point(tier.group, tier.layer, serving.group.last()));
         if !serving.past {
             // A layer every step of the group is past lists none of the
             // records carrying its experts.
-            self.conveyor.release_past(|layer| progress > steps.point(serving.group, layer, serving.last));
+            self.conveyor.release_past(|layer| progress > steps.point(serving.group.first(), layer, serving.group.last()));
             return;
         }
         self.clear_past(core);
@@ -654,7 +657,7 @@ impl Scratch {
     /// (`Telemetry::mark`).
     fn mark_at(&self, shared: &Shared, layer: usize, mark: Mark, at: Instant) {
         let serving = self.conveyor.serving.expect("a group's event comes while the conveyor serves it");
-        shared.telemetry.mark(serving.group, serving.last, layer, mark, at);
+        shared.telemetry.mark(serving.group.first(), serving.group.last(), layer, mark, at);
     }
 
     /// `mark` came now at `layer` of the group the conveyor serves.
@@ -663,25 +666,20 @@ impl Scratch {
     }
 
     /// Serve group `group`'s scratch requests from the conveyor, from its
-    /// first: beside a host tier the bank's lent records are the group's
-    /// from now (`Directory::lend`), before any hit is taken, and its
-    /// conveyor claims the lender's host records as it takes them
-    /// ([`Self::claim_lent`]); every one returns once the device is past
-    /// the group.
-    fn serve_group(&mut self, group: Step, core: &mut Core, shared: &Shared) {
+    /// first: the group is scratch-served, as the steps that began it read it
+    /// (`Steps::scratch_group`; any other is an invariant violation); its
+    /// lease of the lender's records is granted as they free
+    /// ([`Self::lease`]), before any hit is taken, and returns once the
+    /// device is past the group.
+    fn serve_group(&mut self, group: Step, shared: &Shared) {
         match self.conveyor.serving {
-            Some(serving) if serving.group == group => return,
-            Some(serving) => panic!("the conveyor serves group {} past it", serving.group),
+            Some(serving) if serving.group.first() == group => return,
+            Some(serving) => panic!("the conveyor serves group {} past it", serving.group.first()),
             None => {}
         }
-        core.directory.lend(group, &shared.lent.lock());
-        let (_, steps) = shared.steps.group_of(group);
-        self.conveyor.serving = Some(Serving {
-            group,
-            last: group + steps - 1,
-            past: false,
-            claimed: false,
-        });
+        let scratch_group = shared.steps.scratch_group(group).unwrap_or_else(|| panic!("the conveyor serves group {group}, which is not scratch-served"));
+        assert_eq!(scratch_group.first(), group, "the conveyor serves group {group} from its first step");
+        self.conveyor.serving = Some(Serving { group: scratch_group, past: false });
     }
 
     /// Take the request `at` its point from chain place `place`, as its
@@ -694,15 +692,15 @@ impl Scratch {
         let Point { group, layer, sequence, .. } = at.point;
         let experts = core.layers[layer].experts;
         self.published[layer] = sequence;
-        self.serve_group(group, core, shared);
+        self.serve_group(group, shared);
         self.mark(shared, layer, Mark::Requested(sequence));
-        // The conveyor's records are the group's before any hit is taken,
-        // so no tier pins one.
-        self.claim_lent(core);
+        // The lease is granted before any hit is taken, so no tier pins a
+        // lent record.
+        self.lease(core);
         let index = match self.tiers.iter().position(|tier| (tier.group, tier.layer) == (group, layer)) {
             Some(index) => index,
             None => {
-                let (_, steps) = shared.steps.group_of(group);
+                let steps = self.conveyor.serving.expect("the conveyor serves the group").group.steps();
                 let merged = shared.steps.merges_of(group, layer);
                 let sets: Vec<std::ops::Range<usize>> = crate::programs::native_target_graph::Passes::with_launches(core.extents.pass_launches)
                     .sets(steps as usize, merged)
@@ -748,12 +746,12 @@ impl Scratch {
             }
             // The group routes these experts at this step, which the ranking
             // logs once the group ends: until then every taking ranks each beside
-            // this read and the choices the group has routed to it so far, so the
-            // landings and seeds rank the layer's experts by the prompt's use as
-            // its pass resolves, never by index.
+            // this read, a use at this step, so the landings and seeds rank the
+            // layer's experts by the prompt's use as its pass resolves, never by
+            // index.
             for (expert, &flag) in flags.iter().enumerate() {
                 if flag > 0 {
-                    core.directory.read_pending(layer, expert, sequence, tier.routed[expert]);
+                    core.directory.read_pending(layer, expert, sequence);
                 }
             }
             tier.taken += 1;
@@ -811,7 +809,7 @@ impl Scratch {
         let ended = freed || settled.ended + landed > 0;
         self.land_conveyed(core, shared, settled.landed);
         let mut failed = settled.failed;
-        self.claim_lent(core);
+        self.lease(core);
         let knee = core.table.source().knee();
         for index in 0..self.tiers.len() {
             let layer = self.tiers[index].layer;
@@ -823,7 +821,7 @@ impl Scratch {
                 .map(|tier| tier.deferred.iter().filter(|&&expert| !self.waits(core, tier, expert)).count())
                 .sum::<usize>();
             // The conveyor records free of the layer's form whose lent
-            // records the group holds claimed.
+            // records the group's lease holds.
             let admits = |conveyor: &Conveyor, core: &Core, record: u32| {
                 let lending = conveyor.lending();
                 core.layers[layer].stored.iter().flat_map(|stored| lending.records(stored.pool, record)).all(|lent| {
@@ -933,10 +931,10 @@ impl Scratch {
         let tier = &self.tiers[index];
         let reader = tier.reader[expert]?;
         let serving = self.conveyor.serving?;
-        if core.layers[tier.layer].slots.is_none() || !self.scratch_claimed(core) {
+        if core.layers[tier.layer].slots.is_none() || !self.leased(core) {
             return None;
         }
-        let steps = (serving.last - serving.group + 1) as usize;
+        let steps = (serving.group.last() - serving.group.first() + 1) as usize;
         let form = &core.layers[tier.layer].scratch_form;
         let before = || self.tiers.iter().filter(|other| (other.group, other.layer) < (tier.group, tier.layer));
         if before().any(|other| other.taken < steps || core.layers[other.layer].scratch_form != *form) {
@@ -1007,7 +1005,7 @@ impl Scratch {
     /// twice.
     fn waits(&self, core: &Core, tier: &Tier, expert: usize) -> bool {
         copies_from_tier(core)
-            && self.conveyor.serving.is_some_and(|serving| core.directory.tier_serves(tier.layer, expert, serving.last))
+            && self.conveyor.serving.is_some_and(|serving| core.directory.tier_serves(tier.layer, expert, serving.group.last()))
     }
 
     /// Whether the conveyor carries `staged`: a read of it, or its record,
@@ -1053,7 +1051,7 @@ impl Scratch {
         };
         let grants = landed
             .into_iter()
-            .filter_map(|(layer, expert, record)| match core.directory.claim_landing(layer, expert, 0, crate::experts::host_records::Taking::Out) {
+            .filter_map(|(layer, expert, record)| match core.directory.claim_landing(layer, expert, 0, crate::experts::host_records::Taking::Out, (|_, _| (), |_, _| false)) {
                 crate::experts::host_records::Claim::Taken(grant) => Some((layer, expert, record, grant)),
                 _ => None,
             })
@@ -1115,50 +1113,36 @@ impl Scratch {
         }
     }
 
-    /// Claim, for the group served, each host record the conveyor's
-    /// lending lends it that it may claim now (`Directory::claim_lent`):
-    /// the conveyor takes a record only once every lent record it lies
-    /// across is the group's. Its first request's claim comes before any
-    /// hit is taken, and what lands after is mapped past the group, so no
-    /// hit lies in a lent record ([`hit`]). A record still held (a copy
-    /// reading it or a landing into it) is claimed on a later pass. Each
-    /// expert a claim unmaps is unmapped for every step of the group on,
-    /// which the device runs after every step that read its record, before
-    /// any read lands in it. The bank's lent records beside a host tier
-    /// are the group's from its service's start (`Directory::lend`).
-    fn claim_lent(&mut self, core: &mut Core) {
-        let serving = self.conveyor.serving.expect("the conveyor claims for the group it serves");
-        if serving.claimed {
-            return;
-        }
-        let lending = self.conveyor.lending();
-        let lent = u32::try_from(lending.records).expect("lent records fit u32");
-        // Every record claimed now, each a claim of its own.
-        let claims = (0..lent).map(|record| core.directory.claim_lent(lending.group, HostRecord(record), serving.group)).collect::<Vec<_>>();
-        if claims.iter().all(|&claimed| claimed) {
-            self.conveyor.serving = Some(Serving { claimed: true, ..serving });
-        }
+    /// Grant the group served its lease of what frees now
+    /// (`Directory::lease`): the conveyor takes a record only once every
+    /// lent record it lies across is the group's, and the scratch takes a
+    /// convert only once the whole of it is ([`Self::leased`]). Its first
+    /// request's grant comes before any hit is taken, and what lands after
+    /// is mapped past the group, so no hit lies in a lent record ([`hit`]).
+    /// A record still held (a copy reading or writing it, or a landing into
+    /// it) is granted on a later pass, as what held it ends. Each expert the
+    /// lease unmaps is unmapped for every step of the group on, which the
+    /// device runs after every step that read its record, before any read
+    /// lands in it.
+    fn lease(&mut self, core: &mut Core) {
+        let serving = self.conveyor.serving.expect("the conveyor leases for the group it serves");
+        core.directory.lease(self.conveyor.lending().group, serving.group);
     }
 
-    /// Whether the group served holds every record the scratch lies in: its
-    /// slots take no convert before. Beside a host tier they are the bank's
-    /// lent records, the group's from its service's start
-    /// ([`Self::serve_group`]); on the one store the lent host records,
-    /// once every one is claimed.
-    fn scratch_claimed(&self, core: &Core) -> bool {
-        match core.extents.placer {
-            crate::planning::Placer::Tier => self.conveyor.serving.is_some(),
-            crate::planning::Placer::Bank => self.conveyor.serving.is_some_and(|serving| serving.claimed),
-        }
+    /// Whether the group served holds every record the scratch lies in (on
+    /// the one store the lent host records, beside a host tier the bank's,
+    /// `Directory::leased`): its slots take no convert before.
+    fn leased(&self, core: &Core) -> bool {
+        self.conveyor.serving.is_some() && core.directory.leased(self.conveyor.lending().group)
     }
 
     /// Give each of `experts` of tier `index` its scratch slot, slot `e`
     /// for expert `e` of the scratch the lender lends the group, once the
     /// group holds every record it lies in: whether every one has its slot.
     fn claim_scratch(&mut self, index: usize, experts: &[usize], core: &mut Core) -> bool {
-        if !self.scratch_claimed(core) {
-            self.claim_lent(core);
-            if !self.scratch_claimed(core) {
+        if !self.leased(core) {
+            self.lease(core);
+            if !self.leased(core) {
                 return false;
             }
         }
@@ -1222,7 +1206,7 @@ impl Scratch {
                 self.forfeit(index, place, forfeited, core);
             }
         }
-        fail(core, shared, layer, sequence, format!("step {sequence} ended before its scratch round 0"));
+        fail(core, shared, sequence, format!("step {sequence} ended before its scratch round 0"));
     }
 
     /// Carry `serve` as far as it goes without waiting, each stage on its
@@ -1357,7 +1341,7 @@ impl Scratch {
         for &expert in &routed {
             if expert / lw == window as usize {
                 assert!(
-                    tier.scratch[expert] || hit(core, self.conveyor.lending(), layer, expert, sequence).is_some(),
+                    tier.scratch[expert] || hit(core, layer, expert, sequence).is_some(),
                     "step {sequence} routes expert {expert} at layer {layer} window {window} with neither a held record nor a scratch slot"
                 );
             }
@@ -1369,7 +1353,8 @@ impl Scratch {
         // borrower's stored bytes is converted by a round, which
         // `compose_rounds` puts after the borrower's (or `Self::reclaim_slots`
         // holds), as the copy would overwrite them.
-        let last = self.conveyor.serving.expect("a scratch request's group is served").last;
+        let scratch_group = self.conveyor.serving.expect("a scratch request's group is served").group;
+        let last = scratch_group.last();
         let mut tiered = Vec::new();
         let mut listed = Vec::new();
         let mut cold = cold
@@ -1410,11 +1395,11 @@ impl Scratch {
                 let failed = |expert: usize| tier.failed.iter().any(|&(of, _)| of == expert);
                 let tier_routed = (0..tier.routed.len())
                     .filter(|&expert| tier.routed[expert] > 0)
-                    .map(|expert| (expert, tier.last[expert]))
+                    .map(|expert| (expert, tier.routed[expert], tier.last[expert]))
                     .collect::<Vec<_>>();
-                let read = tier_routed.iter().map(|&(expert, _)| expert).collect::<Vec<_>>();
+                let read = tier_routed.iter().map(|&(expert, ..)| expert).collect::<Vec<_>>();
                 let filled = |expert: usize| (tier.scratch[expert] || tier.reader[expert].is_some()) && !failed(expert);
-                let (seeds, evicted) = core.directory.seed(at.point, layer, &tier_routed, &read, filled, core.extents.reserve);
+                let (seeds, evicted) = core.directory.seed(at.point, scratch_group, layer, &tier_routed, &read, filled);
                 for (owner, expert) in evicted {
                     self.demote(owner, expert);
                 }
@@ -1454,7 +1439,7 @@ impl Scratch {
         // `routed_scratch_grids` reads after round 0's answer, and at window 0
         // the request lane's answer.
         let table = &core.layers[layer].scratch;
-        let base_lane = round_lane(window * core.extents.window_rounds);
+        let base_lane = constants::ROUND_LANE(window * core.extents.window_rounds);
         table.store(sequence, base_lane, constants::SCRATCH_STAGED, cold.len() as i32);
         if window == 0 {
             table.store(sequence, constants::SCRATCH_ASK, constants::SCRATCH_STAGED, cold.len() as i32);
@@ -1542,15 +1527,15 @@ impl Scratch {
                 // set's).
                 let mut after = Vec::with_capacity(2);
                 if round + 1 < window_rounds {
-                    after.push((sequence, round_lane(base + round + 1)));
+                    after.push((sequence, constants::ROUND_LANE(base + round + 1)));
                 }
                 if round + 1 == rounds.rounds {
                     if place + 1 < set.end {
-                        after.push((group + (place + 1) as u64, round_lane(base)));
+                        after.push((group + (place + 1) as u64, constants::ROUND_LANE(base)));
                     } else if window + 1 < core.extents.windows {
-                        after.push((group + set.start as u64, round_lane((window + 1) * window_rounds)));
+                        after.push((group + set.start as u64, constants::ROUND_LANE((window + 1) * window_rounds)));
                     } else if let Some(next_start) = next_set_start {
-                        after.push((group + next_start as u64, round_lane(0)));
+                        after.push((group + next_start as u64, constants::ROUND_LANE(0)));
                     }
                 }
                 core.taken.push(Taken {
@@ -1569,7 +1554,7 @@ impl Scratch {
             rounds.served.bytes += chunk.len() as u64 * expert_bytes;
             rounds.took.conveyed += chunk.len() as u64;
             if round != last_round {
-                table.answer(sequence, round_lane(base + round), false);
+                table.answer(sequence, constants::ROUND_LANE(base + round), false);
                 shared.parks.settle();
             }
             rounds.round += 1;
@@ -1621,7 +1606,7 @@ impl Scratch {
         served.parked = arrived.elapsed();
         took.parked = served.parked;
         shared.telemetry.serve(layer, sequence, served);
-        let last = self.conveyor.serving.expect("a scratch request's group is served").last;
+        let last = self.conveyor.serving.expect("a scratch request's group is served").group.last();
         let tier = &mut self.tiers[index];
         took.union = tier.routed.iter().filter(|&&count| count > 0).count() as u64;
         took.hits = hits.len() as u64;
@@ -1643,7 +1628,7 @@ impl Scratch {
                     .chain(remaining);
                 self.forfeit(index, place, forfeited, core);
                 shared.telemetry.served_whole(None);
-                fail(core, shared, layer, sequence, reason);
+                fail(core, shared, sequence, reason);
             }
             None => {
                 if window == 0 {
@@ -1663,7 +1648,7 @@ impl Scratch {
                 // the pass or seed commit).
                 let table = &core.layers[layer].scratch;
                 for round in (last_round..window_rounds).rev() {
-                    table.answer(sequence, round_lane(base + round), false);
+                    table.answer(sequence, constants::ROUND_LANE(base + round), false);
                     shared.parks.settle();
                 }
             }
@@ -1713,8 +1698,7 @@ impl Scratch {
             let later = (place + 1 < end)
                 .then(|| tier.requests[place + 1..end].iter_mut().flatten().find(|later| later.routed.contains(&expert)))
                 .flatten();
-            let lending = self.conveyor.lending();
-            let held = |later: &Request| hit(core, lending, layer, expert, later.sequence);
+            let held = |later: &Request| hit(core, layer, expert, later.sequence);
             let reader = match later.map(|later| (held(later), later)) {
                 Some((Some(record), later)) => {
                     later.hits.push((expert, record));

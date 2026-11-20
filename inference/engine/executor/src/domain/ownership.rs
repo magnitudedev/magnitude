@@ -261,12 +261,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         self.release_prefetches(&[request])?;
         self.head.remove(&request);
-        self.proposed.remove(&request);
+        self.verifying.remove(&request);
         self.publishing.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
         self.change_state(|this, _| this.drop_state_claim(request));
         self.poisoned.remove(&request);
+        if let Some(bank) = self.family.expert_bank() {
+            bank.closed(request);
+        }
         Ok(())
     }
 
@@ -302,6 +305,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.head.remove(request);
         }
         self.change_state(|this, _| requests.iter().for_each(|request| this.drop_state_claim(*request)));
+        if let Some(bank) = self.family.expert_bank() {
+            for &request in requests {
+                bank.closed(request);
+            }
+        }
         Ok(())
     }
 }

@@ -676,6 +676,20 @@ pub fn banked_chain(backend: seismic::BackendName, rows: u64, committed: u64) ->
     with_bank(fixture, backend, rows, committed)
 }
 
+/// [`fixture_on`]'s model drafted by an MTP head of one proposal, on
+/// `device_request`'s device: its passes may run an acceptable row.
+pub fn drafted_on(device_request: platform::DeviceRequest) -> Fixture {
+    let definition = crate::planning::fixtures::with_mtp_head(tiny_definition());
+    let manifest = tiny_manifest(&definition);
+    let method = PlannedMethod::Mtp { greedy_proposals: 1, sampled_proposals: 1, widths: crate::DraftWidths::Adaptive };
+    fixture_over(definition, manifest, limits(2, 1, false), method, None, false, device_request)
+}
+
+/// [`banked`] on [`drafted_on`]'s load.
+pub fn banked_drafted(backend: seismic::BackendName, rows: u64, committed: u64) -> Fixture {
+    with_bank(drafted_on(platform::DeviceRequest::Backend(backend)), backend, rows, committed)
+}
+
 /// `fixture`, its family holding a fake bank of `rows` rows, `committed`
 /// of them backed ([`banked`]).
 fn with_bank((mut domain, bindings): Fixture, backend: seismic::BackendName, rows: u64, committed: u64) -> Fixture {
@@ -696,22 +710,22 @@ fn with_bank((mut domain, bindings): Fixture, backend: seismic::BackendName, row
 /// bank's stack: a bank of `depth` slots misses them, one of `depth + 1`
 /// none, beside the generic model counted as one step. Reads take 0.4 ms and 0.5 ms a MB ([`READ`]); an
 /// all-hit step 15 ms.
-pub fn misses_at(depth: usize, steps: u64) -> crate::assessment::LiveDecode {
+pub fn misses_at(depth: usize, steps: u64) -> magnitude_cost_model::LiveDecode {
     misses_by(steps, &[(depth, 4)])
 }
 
 /// [`misses_at`] with each step's reads spread over the stack: `reads` of
 /// each `(depth, reads)`, which a bank of `depth` slots misses and one of
 /// `depth + 1` hits. The misses stop falling past the deepest.
-pub fn misses_by(steps: u64, reads: &[(usize, u64)]) -> crate::assessment::LiveDecode {
+pub fn misses_by(steps: u64, reads: &[(usize, u64)]) -> magnitude_cost_model::LiveDecode {
     let mut misses = [0; 5];
     let mut requests = [0; 5];
     for &(depth, count) in reads {
         misses[depth] = steps * count;
         requests[depth] = steps;
     }
-    crate::assessment::LiveDecode {
-        layers: vec![crate::assessment::LayerReads::of_depths(&misses, &requests)],
+    magnitude_cost_model::LiveDecode {
+        layers: vec![magnitude_cost_model::LayerReads::of_depths(&misses, &requests)],
         steps,
         rows: 1.,
         depth: 100,
@@ -719,7 +733,7 @@ pub fn misses_by(steps: u64, reads: &[(usize, u64)]) -> crate::assessment::LiveD
 }
 
 /// The fake decode's read line: 0.4 ms and 0.5 ms a MB.
-pub const READ: crate::assessment::ReadLine = match crate::assessment::ReadLine::new(4e-4, 1. / 2e9) {
+pub const READ: magnitude_cost_model::ReadLine = match magnitude_cost_model::ReadLine::new(4e-4, 1. / 2e9) {
     Ok(line) => line,
     Err(_) => panic!("the fixtures' read line"),
 };
@@ -754,7 +768,7 @@ pub fn take_all_cache<F: ProgramFamily>(domain: &ExecutorDomain<F>) -> crate::me
 /// The growth rule's inputs: the decode the fake bank counted, the
 /// fixtures' read line, and the resident step it is priced on: 15 ms at every depth, its all-hit
 /// steps' time.
-pub fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings, decode: crate::assessment::LiveDecode) {
+pub fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings, decode: magnitude_cost_model::LiveDecode) {
     count_decode(domain, decode);
     measure_load(domain, bindings);
 }
@@ -771,12 +785,41 @@ pub fn measure_load(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut Stat
         tier_copy: crate::assessment::Priced::Measured(None),
         convert: crate::assessment::Priced::Measured(None),
     });
-    domain.measure_load(crate::LoadMeasures { costs: Ok(load_costs()), experts }, bindings).unwrap();
+    let costs = load_costs(domain.expert_bank_plan());
+    domain.measure_load(crate::LoadMeasures { costs: Ok(costs), experts }, bindings).unwrap();
 }
 
-/// A fixture's costs: a step of 15 ms in either form at every depth.
-pub fn load_costs() -> crate::LoadCosts {
-    crate::LoadCosts { step: Box::new(|_, _| Ok(crate::assessment::FormSeconds { resident: 0.015, streamed: 0.015 })) }
+/// A fixture's costs of a load banking `bank`'s experts, or none: a step of
+/// 15 ms in either form at every depth, a launch whose step is all it
+/// costs (the synthetic costs' rates, none of which it reads), up to the
+/// fixtures' 8 tokens of context. A banked load's streamed launch makes
+/// each streamed layer's routed call, of its routed kind
+/// (`ExpertBankPlan::routed_kinds`), and each hinting layer's hint launch
+/// (`ExpertBankPlan::ahead`), which read and compute nothing in no native
+/// launch: its launches cost their step alone too, its front gates price
+/// every value alike, and its hints cost nothing.
+pub fn load_costs(bank: Option<&crate::ExpertBankPlan>) -> crate::LoadCosts {
+    use magnitude_cost_model::{Census, Kind, LaunchCounts, LayerCall, RoutedCall, TargetCensus};
+    use seismic::measure::pricing::{Experts, Work};
+    let decode_rows = magnitude_kernels::constants::VERIFY_ROWS;
+    let launches = || LaunchCounts::new(vec![Ok(0); decode_rows as usize]);
+    let routed = |(layer, kind)| {
+        let work = Work { experts: Some(Experts { experts: 1, selected: 1, slab_bytes: Vec::new(), slab_flops: Vec::new() }), ..Work::default() };
+        (Kind { work, launches: launches() }, Some(LayerCall::Routed(RoutedCall { kind, layer })))
+    };
+    let resident = Census::new(std::iter::empty(), 0, decode_rows);
+    let streamed = bank.map(|bank| {
+        let hints = (0..bank.layers().len()).filter(|&layer| bank.ahead(layer) > 0).map(|layer| (Kind { work: Work::default(), launches: launches() }, Some(LayerCall::Hint(layer))));
+        Census::new(bank.routed_kinds().into_iter().enumerate().map(routed).chain(hints), 0, decode_rows)
+    });
+    let figures = seismic::measure::pricing::Figures {
+        composition: Ok(1.),
+        step_pipelined: 0.015,
+        step_round_trip: 0.015,
+        ..crate::assessment::synthetic::costs().figures(&[&resident])
+    };
+    let prices = magnitude_cost_model::LaunchPrices::new(TargetCensus::of(resident, streamed), figures, true);
+    crate::LoadCosts { prices }
 }
 
 /// A domain launching one-row prompt chunks in chains of up to three on
@@ -818,6 +861,8 @@ pub fn group_opening<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, bindings:
         select: Vec::new(),
         committed: 1,
         prime: None,
+        front: Vec::new(),
+        chain: None,
     };
     domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
     assert!(domain.open_served(bindings, request, None).unwrap().is_empty());
@@ -832,7 +877,7 @@ pub fn bank_row(domain: &ExecutorDomain<TestFamily>) -> u64 {
 
 /// The fake bank of `domain` counted `decode`, which its growth is priced
 /// on.
-pub fn count_decode(domain: &mut ExecutorDomain<TestFamily>, decode: crate::assessment::LiveDecode) {
+pub fn count_decode(domain: &mut ExecutorDomain<TestFamily>, decode: magnitude_cost_model::LiveDecode) {
     domain.family.bank.as_mut().expect("a banked fixture").decode = Some(decode);
 }
 
@@ -840,6 +885,12 @@ pub fn count_decode(domain: &mut ExecutorDomain<TestFamily>, decode: crate::asse
 /// slots, as a discrete device's does.
 pub fn host_tier(domain: &mut ExecutorDomain<TestFamily>, ceiling: u64) {
     domain.family.bank.as_mut().expect("a banked fixture").host_ceiling = ceiling;
+}
+
+/// The fake bank of `domain` ([`banked`]).
+#[cfg(test)]
+pub(crate) fn fake_bank_mut(domain: &mut ExecutorDomain<TestFamily>) -> &mut FakeBank {
+    domain.family.bank.as_mut().expect("a banked fixture")
 }
 
 /// The planning fixture's streamed model: a domain over it plans an expert
@@ -985,6 +1036,12 @@ impl crate::programs::SubmittedHead for ControlledHeadSubmission {
             Self::Work(work) => &work.core,
         }
     }
+    fn output(&self) -> &crate::programs::HeadOutput {
+        match self {
+            Self::Failure(_) => panic!("failure-only head has no output"),
+            Self::Work(work) => &work.output,
+        }
+    }
 }
 
 pub enum TestSubmission<L, W, O> {
@@ -1051,7 +1108,7 @@ pub struct TestFamily {
 pub struct FakeBank {
     slots: seismic::SlabTensor,
     resize: std::sync::Mutex<FakeResize>,
-    pub(crate) decode: Option<crate::assessment::LiveDecode>,
+    pub(crate) decode: Option<magnitude_cost_model::LiveDecode>,
     steps: std::sync::atomic::AtomicUsize,
     /// A host tier's slots and the most it holds (none without a tier),
     /// each a byte of upload storage, and its growth's outcome until an
@@ -1082,6 +1139,17 @@ pub struct FakeBank {
     /// it charges their bytes as the backend charges a pool's blocks
     /// ([`Self::hold_cache`]).
     pools: std::sync::OnceLock<Vec<std::sync::Arc<dyn seismic::memory::Entry>>>,
+    /// The verdicts it was told, in order ([`ElasticBank::decided`]).
+    pub(crate) decided: std::sync::Mutex<Vec<(crate::experts::Step, crate::operation::RequestId, crate::AheadVerdict)>>,
+    /// The passes it was told were discarded, in order
+    /// ([`ElasticBank::discarded`]).
+    pub(crate) discarded: std::sync::Mutex<Vec<(crate::experts::Step, crate::operation::RequestId)>>,
+    /// The requests whose ahead names it was told to drop, in order
+    /// ([`ElasticBank::closed`]).
+    pub(crate) closed: std::sync::Mutex<Vec<crate::operation::RequestId>>,
+    /// The hook a test attaches to drive a live watcher through the
+    /// domain's close path.
+    pub(crate) on_closed: Option<Box<dyn Fn(crate::operation::RequestId) + Send + Sync>>,
 }
 
 enum FakeResize {
@@ -1119,6 +1187,10 @@ impl FakeBank {
             covers: std::sync::atomic::AtomicU64::new(1),
             cache: crate::experts::cache::BankCache::new(changes),
             pools: std::sync::OnceLock::new(),
+            decided: std::sync::Mutex::new(Vec::new()),
+            discarded: std::sync::Mutex::new(Vec::new()),
+            closed: std::sync::Mutex::new(Vec::new()),
+            on_closed: None,
         }
     }
 
@@ -1234,6 +1306,10 @@ impl FakeBank {
         self.steps.load(std::sync::atomic::Ordering::Relaxed) == 0
     }
 
+    fn wants_gap(&self) -> bool {
+        false
+    }
+
     fn running(&self) -> bool {
         !matches!(*self.resize.lock().unwrap(), FakeResize::Idle) || self.host_grown.lock().unwrap().is_some()
     }
@@ -1270,7 +1346,7 @@ impl ElasticBank for FakeBank {
     }
 
     /// The fake streams no layer, so no route reads a policy.
-    fn device_convert(&self, _lines: &[crate::assessment::RecordLine]) {}
+    fn device_convert(&self, _lines: &[magnitude_cost_model::RecordLine]) {}
 
     #[cfg(test)]
     fn device_landed(&self) -> u64 {
@@ -1315,7 +1391,25 @@ impl ElasticBank for FakeBank {
         Ok(())
     }
 
-    fn price(&self, _lines: Option<std::sync::Arc<[crate::assessment::ExpertLines]>>, _pass: Option<crate::assessment::ExpertPass>) {}
+    fn price(&self, _lines: Option<std::sync::Arc<[magnitude_cost_model::ExpertLines]>>, _pass: Option<magnitude_cost_model::ExpertPass>, _prices: Option<magnitude_cost_model::LaunchPrices>) {}
+
+    /// The fake reads nothing ahead; it keeps the verdict for its test.
+    fn decided(&self, step: crate::experts::Step, request: crate::operation::RequestId, verdict: &crate::AheadVerdict) {
+        self.decided.lock().expect("the fake bank's verdicts").push((step, request, verdict.clone()));
+    }
+
+    /// Keeps the discarded pass for its test.
+    fn discarded(&self, step: crate::experts::Step, request: crate::operation::RequestId) {
+        self.discarded.lock().expect("the fake bank's discarded passes").push((step, request));
+    }
+
+    /// Keeps the closed request for its test, and forwards it when wired.
+    fn closed(&self, request: crate::operation::RequestId) {
+        self.closed.lock().expect("the fake bank's closed requests").push(request);
+        if let Some(on_closed) = &self.on_closed {
+            on_closed(request);
+        }
+    }
 
     /// Its slots shrink to `to`, at least one; its host tier releases
     /// nothing.
@@ -1348,10 +1442,10 @@ impl ElasticBank for FakeBank {
     /// misses stop falling on `price` (every row before the load is
     /// priced), and its host tier's, a byte of upload storage each, to its
     /// ceiling: derived from the domain's ledgers as the served bank's are.
-    fn targets(&self, price: Option<&crate::assessment::DecodePrice>) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, DomainError> {
+    fn targets(&self, price: Option<&magnitude_cost_model::DecodePrice>) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, DomainError> {
         use crate::experts::derived::{BankShape, HoldingTarget};
         let (rows, unit) = (self.experts(), self.row());
-        let (curve, at) = (price.and_then(crate::assessment::DecodePrice::saturation), self.slots());
+        let (curve, at) = (price.and_then(magnitude_cost_model::DecodePrice::saturation), self.slots());
         let mut targets = vec![HoldingTarget {
             holding: crate::BankHolding::Experts,
             tier: crate::planning::BankTier::Bank,
@@ -1381,14 +1475,24 @@ impl ElasticBank for FakeBank {
         Ok((at > 1).then(|| at.saturating_sub(bytes.div_ceil(unit).max(1)).max(1)))
     }
 
-    fn live(&self) -> Option<crate::assessment::LiveDecode> {
+    fn live(&self) -> Option<magnitude_cost_model::LiveDecode> {
         self.decode.clone()
+    }
+
+    /// No pass is timed: nothing pairs.
+    fn measured(&self) -> Option<crate::experts::Measured> {
+        None
+    }
+
+    /// No step is begun: stays at epoch 0.
+    fn bank_epoch(&self) -> u64 {
+        0
     }
 
     /// Its one streamed layer of 4 experts, each step routing 4, on the
     /// reference lines of 1 MB records, whatever lines the load priced.
-    fn streamed_layers(&self, _lines: std::sync::Arc<[crate::assessment::ExpertLines]>) -> crate::assessment::StreamedLayers {
-        crate::assessment::StreamedLayers::new(vec![4], 4, std::sync::Arc::from([crate::assessment::ExpertLines::reference(1_000_000)]))
+    fn streamed_layers(&self, _lines: std::sync::Arc<[magnitude_cost_model::ExpertLines]>) -> magnitude_cost_model::StreamedLayers {
+        magnitude_cost_model::StreamedLayers::new(vec![4], 4, std::sync::Arc::from([magnitude_cost_model::ExpertLines::reference(1_000_000)]))
     }
 
     /// Its slots' growth takes its cache on `ledgers` first, as the served
@@ -1523,6 +1627,10 @@ impl ElasticBank for FakeBank {
     /// One layer of one-byte experts, each a row, held in host RAM.
     fn in_gap(&self) -> bool {
         FakeBank::in_gap(self)
+    }
+
+    fn wants_gap(&self) -> bool {
+        FakeBank::wants_gap(self)
     }
 
     /// Its chains' encoding never cuts it.

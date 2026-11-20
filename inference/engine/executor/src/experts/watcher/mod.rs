@@ -96,14 +96,16 @@
 
 mod core;
 mod decode;
-mod lent;
+mod gate;
 mod liveness;
 mod parks;
+mod passes;
 mod prefetch;
 mod promotions;
 mod requests;
 mod residency;
 mod resize;
+mod routes;
 mod scratch;
 mod steps;
 mod telemetry;
@@ -111,19 +113,30 @@ mod telemetry;
 mod tests;
 
 pub(in crate::experts) use self::core::{
-    Extents, Group, Layer, ListRecords, LoadWords, PlacedLayerWords, PlacedWords, Pool, StoredPart, StoredTensor,
+    At, Extents, Group, Layer, ListRecords, LoadWords, PlacedLayerWords, PlacedWords, Pool, StoredPart, StoredTensor,
 };
 pub(crate) use parks::{ParkKind, ParkSite, Parks};
+pub(crate) use passes::{DEPTHS, Measured};
 pub(in crate::experts) use promotions::{BankRecordViews, Copier};
 pub(crate) use resize::{Candidates, Evicted, Evicting, Join};
-pub(crate) use steps::{ExpertStep, Recording, Step, StepFailure, StepRoute, low_word};
+pub(crate) use steps::{AheadOf, DecodeRow, ExpertStep, ScratchGroup, Recording, Step, StepFailure, StepRoute, low_word};
+pub use routes::{RecordedRoutes, RoutedStep};
 pub use telemetry::{ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, StepCost, STEP_TRACE};
+
+/// A group's host records as a prompt group's lend leaves them: the lent
+/// records it holds claimed, and the records decode keeps experts in
+/// (`HostRecords::capacity`: those outside the reserve, less the claimed).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct GroupLend {
+    pub claimed: usize,
+    pub capacity: usize,
+}
 
 use self::core::{Core, ReadTable};
 use super::conveyor::{Carrier, Conveyor};
 use super::directory::{Directory, HostTier};
 use super::source::ExpertSource;
-use crate::assessment::ExpertLines;
+use magnitude_cost_model::ExpertLines;
 use liveness::Life;
 use prefetch::Prefetch;
 use promotions::Promotions;
@@ -134,8 +147,7 @@ use scratch::{Scratch, conveyor_forms};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
-pub(in crate::experts) use steps::{Steps, Unbegun};
-pub(in crate::experts) use lent::{Lending, LentRecords};
+pub(in crate::experts) use steps::{MapFrom, MapStep, ParkFrom, Steps, Unbegun, UnmapStep};
 use telemetry::Telemetry;
 
 /// The threads serving keeps busy while a flight runs, by their measured
@@ -151,7 +163,18 @@ pub(super) struct Shared {
     /// Shared with every answer, which writes under its step's ownership of
     /// its slot (`Steps::while_owned`).
     steps: Arc<Steps>,
+    /// The load's token clock and turnovers (`Directory::time`).
+    time: crate::experts::horizon::Time,
+    /// The verify decode step whose verdicts are still pending on the clock,
+    /// with `(step, total_requests, remaining_requests, accepted_rows)`: only
+    /// its verdicts (or discards, as 0 accepted) call `Times::decided`, and
+    /// the last verdict reports the step's actual emitted tokens to telemetry.
+    pending_verify: Mutex<Option<(Step, u32, u32, u64)>>,
     telemetry: Telemetry,
+    /// What other threads tell the interest ledger, which `Prefetch` owns
+    /// on the request service's thread and drains before it reads the
+    /// rings (`experts::interest::Told`): no thread waits on the ledger.
+    told: std::sync::mpsc::Sender<crate::experts::interest::Told>,
     resizing: ResizeHandoff,
     /// The holds of the load's own traffic standing (`Shared::hold_traffic`,
     /// each a [`TrafficHold`]): while any stands no promotion or read ahead
@@ -189,9 +212,9 @@ pub(super) struct Shared {
     /// What a copy over the link costs, once measured
     /// (`assessment::TierCopyCosts`): what a promotion's copy is priced at.
     copy: Mutex<Option<crate::assessment::TierCopyCosts>>,
-    /// The lender's lent bank records' reservation, beside a host tier
-    /// (`lent`).
-    lent: lent::LentRecords,
+    /// Each group's lend and decode capacity as residency last published
+    /// them ([`Self::lend`]).
+    lend: Mutex<Vec<GroupLend>>,
     /// The cover's changes as residency published them
     /// (`Residency::hasten`): each start and each end of its reads counts
     /// one, from reading as the bank opens ([`Self::cover`]).
@@ -199,10 +222,29 @@ pub(super) struct Shared {
     /// What a routed pass over each streamed layer's experts costs, once
     /// priced (`Self::price`): what a scratch-served group's merge sets are
     /// chosen by (`Shared::begin`).
-    passes: Mutex<Option<Arc<crate::assessment::ExpertPass>>>,
+    passes: Mutex<Option<Arc<magnitude_cost_model::ExpertPass>>>,
+    /// The load's launch prices once priced (`Self::price`): what the front
+    /// gates price their values by (`Residency::publish_policy`).
+    prices: Mutex<Option<magnitude_cost_model::LaunchPrices>>,
     /// Whether the load's account was given as it settled.
     settled: crate::settle::Once,
+    /// The policy words a run's encoding reads, as last written, and the
+    /// write residency staged since ([`Self::stage_policy`]), written only
+    /// while no step runs.
+    policy: Mutex<Policy>,
 }
+
+/// The policy words a run's encoding reads ([`Shared::stage_policy`]): the
+/// words last written, and a write staged since of words that differ from
+/// them, none once written.
+#[derive(Default)]
+struct Policy {
+    written: Option<residency::PolicyWords>,
+    staged: Option<(residency::PolicyWords, PolicyWrite)>,
+}
+
+/// The write of policy words a run's encoding reads ([`Shared::stage_policy`]).
+pub(super) type PolicyWrite = Box<dyn FnOnce(&residency::PolicyWords) + Send>;
 
 /// A growth's slot being backed ([`Shared::backing_slot`]), until it drops:
 /// then the load is told, as a hold waits on it.
@@ -216,6 +258,14 @@ impl Drop for BackingSlot<'_> {
 }
 
 impl Shared {
+    /// Tell the interest ledger `told`, and wake the service that drains
+    /// it. Once residency is gone nothing drains it, and what is told is
+    /// dropped.
+    pub(super) fn tell(&self, told: crate::experts::interest::Told) {
+        let _ = self.told.send(told);
+        self.events().notify();
+    }
+
     /// Hold the load's own traffic until the returned hold drops: while any
     /// hold stands, and while no step runs, no promotion is asked nor any
     /// read ahead begun, so a measurement beside the idle load reads none
@@ -308,13 +358,115 @@ impl Shared {
         self.traffic_held.load(std::sync::atomic::Ordering::Acquire) > 0
     }
 
-    /// Each streamed layer's lines and its pass's price from now on, the
-    /// GPU's priced, or none where they are not: the route's line words
-    /// follow at the next turn (`Residency::publish_lines`), this an event.
-    pub fn price(&self, lines: Option<Arc<[ExpertLines]>>, passes: Option<crate::assessment::ExpertPass>) {
+    /// Each streamed layer's lines, its pass's price and the load's launch
+    /// prices from now on, the GPU's priced, or none where they are not: the
+    /// route's line words and the gates follow at the next turn
+    /// (`Residency::publish_lines`, `Residency::publish_policy`), this an
+    /// event.
+    pub fn price(&self, lines: Option<Arc<[ExpertLines]>>, passes: Option<magnitude_cost_model::ExpertPass>, prices: Option<magnitude_cost_model::LaunchPrices>) {
         *self.priced.lock().expect("the priced lines") = lines;
         *self.passes.lock().expect("the priced passes") = passes.map(Arc::new);
+        *self.prices.lock().expect("the launch prices") = prices;
         self.events().notify();
+    }
+
+    /// The load's launch prices; none before they are priced.
+    pub(super) fn launch_prices(&self) -> Option<magnitude_cost_model::LaunchPrices> {
+        self.prices.lock().expect("the launch prices").clone()
+    }
+
+    /// Request `request`'s pass of step `step` was decided: its guessed
+    /// rows fared as `verdict` says (it judged none and learned no truth,
+    /// where empty). Each guess it checked is noted on the read timeline
+    /// (`guess`: its depth, token and the selection it was checked against,
+    /// then `stood`), the key a pass's record joins its `ahead_row`s by. A
+    /// guess stood where the selection it was checked against is its
+    /// token, a guessed stop among them, whether or not the round committed
+    /// it. The ledger counts its acceptable rows' guesses into their stands
+    /// and drops the names of its rows past a wrong one, and judges by the
+    /// truths it learned every front row of the request's passes whose
+    /// token they decide, its own and its earlier passes' deeper ones
+    /// (`interest::Verdict`); a fallen front row's pass drops its names
+    /// from that row on, whose unbegun reads its next derivation cancels.
+    pub fn decided(&self, step: Step, request: crate::operation::RequestId, verdict: &crate::AheadVerdict) {
+        let checked = verdict.checked();
+        if seismic_io::timeline::recording() {
+            for (depth, &(guess, truth)) in checked.iter().enumerate() {
+                seismic_io::timeline::note(
+                    seismic_io::timeline::Kind::Noted("guess"),
+                    request.0,
+                    (depth as i64 + 1, i64::from(guess.0), i64::from(truth.0)),
+                );
+            }
+            seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("stood"), request.0, (verdict.stood() as i64, 0, 0));
+        }
+        let acceptable: Vec<bool> = checked[..verdict.acceptable().min(checked.len())].iter().map(|(guess, truth)| guess == truth).collect();
+        let accepted = acceptable.iter().take_while(|&&stood| stood).count() as u32;
+        self.decide_verify(step, accepted);
+        let verdict = crate::experts::interest::Verdict { acceptable, front: verdict.front().to_vec(), truths: verdict.truths().to_vec() };
+        self.tell(crate::experts::interest::Told::Decided { step, request, verdict });
+    }
+
+    /// Request `request`'s pass of step `step` was discarded: it completed,
+    /// but its outputs are no sequence's, so no verdict will judge it. The
+    /// names its rows published drop, and their unbegun reads cancel.
+    pub fn discarded(&self, step: Step, request: crate::operation::RequestId) {
+        self.decide_verify(step, 0);
+        self.tell(crate::experts::interest::Told::Discarded { step, request });
+    }
+
+    /// The load's token clock and turnovers (`experts::horizon::Time`).
+    pub(crate) fn time(&self) -> &crate::experts::horizon::Time {
+        &self.time
+    }
+
+    /// Register decode step `step` on the load's clock before its launch is
+    /// queued (design §3.1): `Advance::Pending` remembers its verify
+    /// request count so only its verdicts/discards call `Times::decided`.
+    pub(super) fn register_step(&self, step: Step, advance: crate::experts::horizon::Advance) {
+        if let crate::experts::horizon::Advance::Pending { requests } = advance {
+            let mut pending = self.pending_verify.lock().expect("pending verify step");
+            assert!(pending.is_none(), "verify step {step} registered while {:?} is pending", *pending);
+            *pending = Some((step, requests, requests, 0));
+        }
+        self.time.lock().register(step, advance);
+    }
+
+    /// Count one request's verdict (or discard, with 0 accepted) where
+    /// `step` is the pending verify step on the clock. Panics where a
+    /// verdict for another step arrives while a verify step is pending, or
+    /// where no request remains.
+    fn decide_verify(&self, step: Step, accepted: u32) {
+        let emitted = {
+            let mut pending = self.pending_verify.lock().expect("pending verify step");
+            let Some((pending_step, total, remaining, rows)) = *pending else {
+                return;
+            };
+            assert_eq!(
+                pending_step, step,
+                "verdict for step {step} arrived while verify step {pending_step} is pending"
+            );
+            assert!(remaining > 0, "verify step {step} decided with no requests remaining");
+            self.time.lock().decided(step, accepted);
+            let rows = rows + u64::from(accepted);
+            let left = remaining - 1;
+            if left > 0 {
+                *pending = Some((pending_step, total, left, rows));
+                None
+            } else {
+                *pending = None;
+                Some(1.0 + rows as f64 / f64::from(total))
+            }
+        };
+        if let Some(emitted) = emitted {
+            self.telemetry.verify_executed(step, emitted);
+        }
+    }
+
+    /// Request `request` closed: none of its passes will come, so the
+    /// names its rows published drop, and their unbegun reads cancel.
+    pub fn closed(&self, request: crate::operation::RequestId) {
+        self.tell(crate::experts::interest::Told::Closed(request));
     }
 
     /// When the host reads a step's request: at a park where parks are
@@ -327,7 +479,7 @@ impl Shared {
     }
 
     /// What a routed pass costs once priced ([`Self::price`]); none before.
-    pub(super) fn passes(&self) -> Option<Arc<crate::assessment::ExpertPass>> {
+    pub(super) fn passes(&self) -> Option<Arc<magnitude_cost_model::ExpertPass>> {
         self.passes.lock().expect("the priced passes").clone()
     }
 
@@ -341,7 +493,7 @@ impl Shared {
     pub fn price_copy(&self, costs: &crate::assessment::TierCopyCosts) {
         tracing::info!(
             "a promotion's copy costs its link time at {:.2} GB/s, and {:.0}% of that in device time beside it",
-            1e-9 / costs.link_byte_seconds(),
+            1e-9 / costs.transfer.seconds_per_byte(),
             costs.stall_share * 100.
         );
         *self.copy.lock().expect("a copy's price") = Some(costs.clone());
@@ -402,7 +554,7 @@ impl Shared {
     }
 
     /// Each bank group's device convert takes its `lines` from now on.
-    pub(in crate::experts) fn device_convert(&self, lines: &[crate::assessment::RecordLine]) {
+    pub(in crate::experts) fn device_convert(&self, lines: &[magnitude_cost_model::RecordLine]) {
         self.telemetry.device_convert(lines);
     }
 
@@ -431,6 +583,45 @@ impl Shared {
         self.steps.in_flight() == 0
     }
 
+    /// Stage residency's `words`, the policy words a run's encoding reads,
+    /// written by the write `writer` makes, in place of any staged before:
+    /// written at the first point no step runs ([`Self::write_staged`]),
+    /// whether residency's next turn or the next step's begin. While a
+    /// write is staged no step is queued behind another
+    /// (`ElasticBank::wants_gap`), so a pipeline of queued steps breaks for
+    /// it at the next step boundary. Only words that differ from those
+    /// written are staged: words equal to them drop any write staged
+    /// instead, so a change undone before it is written breaks nothing, and
+    /// a break stays rare.
+    pub(super) fn stage_policy(&self, words: residency::PolicyWords, writer: impl FnOnce() -> PolicyWrite) {
+        let mut policy = self.policy.lock().expect("staged policy");
+        if policy.written.as_ref() == Some(&words) {
+            policy.staged = None;
+        } else if policy.staged.as_ref().is_none_or(|(staged, _)| *staged != words) {
+            policy.staged = Some((words, writer()));
+        }
+    }
+
+    /// Whether policy words are staged and not yet written.
+    pub fn policy_staged(&self) -> bool {
+        self.policy.lock().expect("staged policy").staged.is_some()
+    }
+
+    /// Write the staged policy words where no step runs, under the lock
+    /// every step begins under ([`Steps::while_idle`]): every run encoded
+    /// after it reads them, and they are the words written. Nothing while
+    /// steps run, or none is staged. The policy's lock is held across the
+    /// write, so a stage compares against the words written.
+    pub(super) fn write_staged(&self) {
+        self.steps.while_idle(|| {
+            let mut policy = self.policy.lock().expect("staged policy");
+            if let Some((words, write)) = policy.staged.take() {
+                write(&words);
+                policy.written = Some(words);
+            }
+        });
+    }
+
     /// Step `sequence`'s runs serve its streamed layers from `layer` on over
     /// a window of its rows starting at batch row `first` (a stateless
     /// tail's): their requests name rows within it.
@@ -441,13 +632,44 @@ impl Shared {
     /// What the load's counted decode read and ran so far
     /// (`Stack::live`), which prices its experts' decisions; none before it
     /// counted a step.
-    pub fn live(&self) -> Option<crate::assessment::LiveDecode> {
+    pub fn live(&self) -> Option<magnitude_cost_model::LiveDecode> {
         self.telemetry.live()
+    }
+
+    /// What the decode's passes measured, which the regime bit is decided
+    /// on (`passes::Measured`); none before a pass is timed.
+    pub fn measured(&self) -> Option<Measured> {
+        self.telemetry.measured()
+    }
+
+    /// The bank-wide turnover's current epoch (`horizon::Times::bank_epoch`):
+    /// what a live rate measured outside the watcher rolls on.
+    pub fn bank_epoch(&self) -> u64 {
+        self.time.lock().bank_epoch()
     }
 
     /// The experts each streamed layer's slot map names held, ascending.
     pub fn held(&self) -> Vec<Vec<usize>> {
         self.telemetry.held()
+    }
+
+    /// What a load recording its routes recorded since last taken
+    /// (`RouteRecorder::take`); none of a load that records none.
+    pub fn take_routes(&self) -> Option<RecordedRoutes> {
+        self.telemetry.take_routes()
+    }
+
+    /// Each group's records a prompt group holds claimed and the records
+    /// decode keeps experts in, as residency last published them
+    /// (`HostRecords::capacity`): a lend that returned leaves none claimed
+    /// and the whole capacity.
+    pub fn lend(&self) -> Vec<GroupLend> {
+        self.lend.lock().expect("the lend's publication").clone()
+    }
+
+    /// Publish each group's lend ([`Self::lend`]).
+    pub(super) fn publish_lend(&self, lend: &[GroupLend]) {
+        lend.clone_into(&mut self.lend.lock().expect("the lend's publication"));
     }
 
     /// Per streamed layer, the experts its bank holds and those its group's
@@ -497,11 +719,34 @@ pub(super) struct WatcherParts {
     /// Whether the device's backend times spans of a graph run, where
     /// sampled decode steps time their blocks (`Telemetry::samples`).
     pub spans: bool,
+    /// What the exchange's watchdog does with its report of a wait past its
+    /// bound or a kernel's violation ([`crate::experts::exchange::Trip`]).
+    pub trip: crate::experts::exchange::Trip,
+    /// The model store's read line the load's plan was priced on
+    /// (`BankPaths::line`): what bounds the exchange's waits until the
+    /// load's own reads measure the drive; none for a plan priced before the
+    /// machine's figures were measured.
+    pub line: Option<magnitude_cost_model::ReadLine>,
 }
 
 impl Watcher {
     pub fn start(parts: WatcherParts) -> Result<Self, String> {
-        let WatcherParts { layers, group_reads, groups, load, pools, extents, slots, whole, staging, host, carrier, source, compute, copier, steps, spans } = parts;
+        Self::start_inner(parts, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn start_with_bounds(
+        parts: WatcherParts,
+        bounds: Box<dyn Fn() -> crate::experts::exchange::Bounds + Send>,
+    ) -> Result<Self, String> {
+        Self::start_inner(parts, Some(bounds))
+    }
+
+    fn start_inner(
+        parts: WatcherParts,
+        bounds: Option<Box<dyn Fn() -> crate::experts::exchange::Bounds + Send>>,
+    ) -> Result<Self, String> {
+        let WatcherParts { layers, group_reads, groups, load, pools, extents, slots, whole, staging, host, carrier, source, compute, copier, steps, spans, trip, line } = parts;
         // The geometry every read lands by, checked once: each pool's
         // staging holds the staging records, and the conveyor lies in each
         // pool, at most a record of every expert of the widest layer.
@@ -596,12 +841,15 @@ impl Watcher {
                 .collect::<Option<Vec<_>>>(),
             crate::planning::Placer::Bank => None,
         };
+        // Each group's decode capacity, told telemetry now and by residency
+        // as it changes (`Residency::publish_held`).
+        let capacities = core.directory.capacities();
         let telemetry = Telemetry::new(
             &core.layers,
             reads,
             extents,
             slots,
-            core.bank_records(),
+            capacities.clone(),
             resident,
             core.directory.ranking(),
             core.table.source().volumes(),
@@ -632,10 +880,17 @@ impl Watcher {
                     (site.layer(), rows as f64, (rows * choices).min(experts) as f64)
                 })
                 .collect(),
+            planned: line,
         };
+        // The ledger's queue: told from any thread, drained by `Prefetch`.
+        let (told, inbox) = std::sync::mpsc::channel();
+        let time = core.directory.time().clone();
         let shared = Arc::new(Shared {
             steps,
+            time: time.clone(),
+            pending_verify: Mutex::new(None),
             telemetry,
+            told,
             resizing: ResizeHandoff::new(),
             traffic_held: Default::default(),
             traffic_quiet: Default::default(),
@@ -649,21 +904,26 @@ impl Watcher {
             priced: Mutex::new(None),
             promoted: Default::default(),
             copy: Mutex::new(None),
-            lent: lent::LentRecords::new(),
+            lend: Mutex::default(),
             covers: Default::default(),
             passes: Mutex::new(None),
+            prices: Mutex::new(None),
             settled: Default::default(),
+            policy: Mutex::default(),
         });
         crate::settle::owe_shared(Arc::downgrade(&shared));
         // The transfer queue the promotions queue on, whose completions its
         // watch announces.
         let copies = copier.as_ref().map(|copier| copier.copies.clone());
+        // The ledger's rates are the ranking's (`Reuse::rates`).
+        let ranking = core.directory.ranking();
+        let groups = core.directory.layer_groups();
+        let ranks = core.extents.selected;
         let mut residency = Residency {
-            whole: vec![false; count],
             homes,
             shared: shared.clone(),
             core,
-            prefetch: Prefetch::new(staging, count),
+            prefetch: Prefetch::new(staging, groups, ranks, time, inbox, &ranking),
             scratch: Scratch::new(
                 count,
                 flags,
@@ -673,14 +933,15 @@ impl Watcher {
             asked: None,
             opened: Instant::now(),
             complete: false,
-            site_opened: shared.compute.site_served(),
-            site_share: Default::default(),
             lines: None,
-            published: residency::Published::new(count),
+            published: residency::Published::new(count, capacities),
             owed: resize::Owed::default(),
         };
         residency.publish_held();
         residency.publish_policy();
+        // No step runs yet: the open's words are written now, as every
+        // later gap writes what it staged.
+        shared.write_staged();
         residency.publish_lines();
         let residency = Arc::new(crate::experts::yielding::Yielding::new(residency));
         // From here a thread that cannot start drops the watcher, which
@@ -699,7 +960,7 @@ impl Watcher {
         let requests = Requests::new(residency.clone(), shared.clone());
         watcher.watchdog = Some({
             let held = residency::lock(&residency);
-            liveness::watch(&held.core, &shared, residency.clone(), requests.service(), copies.clone(), answers, crate::experts::exchange::abort())?
+            liveness::watch(&held.core, &shared, residency.clone(), requests.service(), copies.clone(), answers, bounds, trip)?
         });
         watcher.requests = Some(
             seismic::threads::spawn("expert-requests", move || {
@@ -749,6 +1010,9 @@ impl crate::settle::Owed for Shared {
         if self.settled.first() {
             tracing::info!("expert {}", self.landings.line());
             tracing::info!("expert {}", self.steps.interruptions());
+            if let Some(a1) = self.telemetry.far_deciles_line() {
+                tracing::info!("expert {a1}");
+            }
         }
     }
 }
@@ -768,7 +1032,6 @@ impl Drop for Watcher {
         // The watchdog stops first.
         drop(self.watchdog.take());
         self.shared.life.stop();
-        self.shared.lent.wake();
         self.shared.events().notify();
         for thread in [self.requests.take(), self.residency.take()].into_iter().flatten().chain(self.copies.drain(..)) {
             thread.join().expect("a serving thread's panic ends the process");

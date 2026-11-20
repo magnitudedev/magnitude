@@ -59,6 +59,8 @@ fn chunk(position: usize) -> crate::Operation {
         conditioning: None,
         demand: crate::batching::Demand::NONE,
         select: Vec::new(),
+        front: Vec::new(),
+        chain: None,
         committed: 1,
         prime: None,
     }
@@ -332,6 +334,8 @@ fn a_drafted_domains_provision_claims_through_its_draft_depth_in_both_stores() {
         conditioning: None,
         demand: crate::batching::Demand::NONE,
         select: Vec::new(),
+        front: Vec::new(),
+        chain: None,
         committed: rows,
         prime: None,
     };

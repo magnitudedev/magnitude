@@ -99,6 +99,9 @@ void SELECT_FN(select_rank_at)(uint64_t logits_base, uint64_t bias_base, uint64_
         ranked[i] = i < held \
             ? selection_ranked(score[i] + element_f32_at(bias_base + uint64_t(expert[i]) * bias_stride * 4ul)) \
             : -uintBitsToFloat(0x7f800000u); \
+    [[unroll]] for (uint i = 0u; i < SELECT_P; ++i) \
+        if (i < held) \
+            SELECTION_KEY(row, uint(expert[i]), ranked[i]); \
     SELECT_FN(select_sort)(ranked, score, expert); \
     for (uint rank = 0u; rank < SELECT_K; ++rank) { \
         float best; \

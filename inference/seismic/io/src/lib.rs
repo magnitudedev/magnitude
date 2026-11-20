@@ -50,35 +50,44 @@
 //! request's own, "A volume's curve"). An uncached piece that lies within
 //! one range is read straight into its destination where that meets the
 //! reader's buffer alignment; any other piece is read into the worker's own
-//! aligned buffer and copied into the destinations of the ranges it serves.
-//! A [`Handle`] owns the request: [`Handle::reprice`] reorders its pieces
-//! not yet taken, and dropping it cancels them (they read nothing, the
-//! ranges they serve fail [`Error::Cancelled`], and it ends with the pieces
-//! in flight). Its [`Ending`] observes the end, and may outlive it. A failed piece fails only the ranges whose own bytes fail to
+//! aligned buffer and copied into the destinations of the ranges it serves,
+//! once the piece has left its link's flight: the copy is the host's time,
+//! not the volume's, so the room the read frees admits the next piece
+//! while it runs. A [`Handle`] owns the request: [`Handle::reprice`]
+//! reorders its pieces not yet taken, and dropping it cancels them (they
+//! read nothing, the ranges they serve fail [`Error::Cancelled`], and it
+//! ends with the pieces in flight). Its [`Ending`] observes the end, and may
+//! outlive it. A failed piece fails only the ranges whose own bytes fail to
 //! read: a piece serving several is read again range by range.
 //!
 //! # Order and depth
 //!
-//! A link orders its requests by want: due before read ahead, the earlier
-//! deadline, then the greater value, then submission. A request is due
+//! A link orders its requests by want: due before read ahead, of those due
+//! the earlier deadline; of those read ahead the dated before the undated,
+//! a dated one by the step expected to park on it, the soonest first, then
+//! the greater value (the likelier used); then submission. A request is due
 //! while a consumer waits on it, in one of two ways: a step **parks** on it
 //! (a decode step's miss, a hint it comes to wait on, repriced so), or a
 //! **stream** consumes it at the link's rate (a prompt group's conveyor,
 //! which keeps the link at its due depth and parks on no single read). A
-//! request read ahead orders by the instant a step is expected to park on
-//! it (a hint's), before those wanted at none (a load, a fill); that
-//! instant passing makes it due no more than a wrong prediction would: a
-//! parked read never queues behind a prediction. Its depths come from the volume's curve ("A volume's
+//! request read ahead orders by the step expected to park on it (a
+//! prediction's), before those wanted at none (a load, a fill): a read
+//! ahead saves its step's park only if it lands before it, so the soonest
+//! wanted is read first. That step arriving makes it due no more than a
+//! wrong prediction would: a parked read never queues behind a prediction. Its depths come from the volume's curve ("A volume's
 //! curve"), in bytes in flight:
 //!
 //! 1. A due piece, parked or streamed, starts whenever the due bytes in
 //!    flight leave it room under the due depth.
 //! 2. A piece not due starts only while no parked piece is queued, and only
 //!    while the parked bytes in flight and those read ahead leave it room
-//!    under the knee: below the knee depth still adds rate, so the read
-//!    ahead runs on throughput the parked reads leave unused; past it every
-//!    byte more in flight would delay a parked byte, so the read ahead
-//!    waits. A stream's bytes are not counted against the knee: it takes
+//!    under the knee: below the knee depth still adds rate, so a read ahead
+//!    beside parked pieces already in flight runs on throughput they leave
+//!    unused, and the knee bounds what a parked read arriving finds in
+//!    flight ("A volume's curve"). Holding reads ahead to time no parked
+//!    piece is in flight loses that throughput: simulated, a drive-bound
+//!    decode took 111 ms a token so against 104 overlapping, a GPU-bound
+//!    one 46.9 against 44.2. A stream's bytes are not counted: it takes
 //!    the rate it takes, and a read ahead beside it (a bank's fill during a
 //!    prompt) shares the device as the stream's own reads do.
 //! 3. A request held back at one depth holds back only the requests counted
@@ -92,8 +101,11 @@
 //! parked on. One in flight when a parked read arrives shares the device
 //! with it: the parked read's pieces start at once (rule 1), and its extra
 //! time is at most the bytes read ahead in flight over the rate, at most
-//! the knee's, which nothing later adds to (rules 1 and 2). Where no stream
-//! runs (decode), these are the rules of a link with one kind of due read.
+//! the knee's, which a read ahead adds to only while the parked bytes leave
+//! it room under the knee (rule 2): the volume counts that time
+//! ([`accounting`], `Totals::shared`). Where no
+//! stream runs (decode), these are the rules of a link with one kind of
+//! due read.
 //!
 //! # How reads share the engine
 //!
@@ -131,7 +143,7 @@ pub mod store;
 pub mod timeline;
 mod waited;
 
-pub use accounting::{Class, Totals, Waits};
+pub use accounting::{Class, Line, Totals, Waits};
 pub use destination::{Buffer, Destination};
 pub use disk::{adopt_earlier, adopt_volume, cached_pages, link_shape, probe_volume, read_cores, CachePolicy, Curve, EarlierChoice, Lone, OpenError, OpenFile, Point, Reader, Shape, Urgent, Volume, ALIGNMENT};
 pub use error::Error;

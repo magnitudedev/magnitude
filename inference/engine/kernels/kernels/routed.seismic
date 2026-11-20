@@ -608,9 +608,10 @@ fn routed_route[M, H, PT, NM, E, K, ES](residual: &tensor[M, PT * H] f32, norm: 
     let mut normalized = tensor[M, H] A
     let mut logits = tensor[M, E] f32
     let mut coefficient = tensor[M] f32
+    let mut keys = tensor[M, E] f32
     form_input(residual, norm, normalized, eps)
     linear(normalized, router, logits)
-    rank_choices(logits, routes, scores)
+    rank_choices(logits, routes, scores, keys)
     for row in 0..M:
         if normalize != 0:
             let denominator = reduce(f32(scores[row]), 0, sum)
@@ -693,8 +694,9 @@ fn routed_route_shared[M, H, PT, NM, E, K, S, ES](residual: &tensor[M, PT * H] f
     let mut normalized = tensor[M, H] A
     let mut coefficient = tensor[M] f32
     let mut shared_product = tensor[M, S] A
+    let mut keys = tensor[M, E] f32
     route_shared(residual, norm, router, shared_router, shared_gate, shared_up, eps,
-        normalize, expert_scale, routes, scores, normalized, coefficient, shared_product)
+        normalize, expert_scale, routes, scores, normalized, coefficient, shared_product, keys)
     return (normalized, coefficient, shared_product)
 
 native routed_route_shared for metal from "metal/routed_route_shared.metal":
@@ -1319,6 +1321,18 @@ fn routed_select[M, H, E, K, ES](residual: &tensor[M, H] f32, norm: &tensor[H] N
     weights: &mut tensor[M, K] f32, epsilon: f32, score: i32, normalization: i32,
     normalization_epsilon: f32, scale: f32) -> tensor[M, H] A
     where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0:
+    let mut keys = tensor[M, E] f32
+    return select_route(residual, norm, router_norm, router, bias, expert_scale, routes, weights,
+        epsilon, score, normalization, normalization_epsilon, scale, keys)
+
+# `routed_select`'s body, `keys` each row's ranked value of every expert
+# (`select_experts`).
+fn select_route[M, H, E, K, ES](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+    router_norm: &tensor[H] RNW, router: &tensor[E, H] RW, bias: &tensor[E] f32,
+    expert_scale: &tensor[ES] f32, routes: &mut tensor[M, K] i32,
+    weights: &mut tensor[M, K] f32, epsilon: f32, score: i32, normalization: i32,
+    normalization_epsilon: f32, scale: f32, keys: &mut tensor[M, E] f32) -> tensor[M, H] A
+    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0:
     let mut normalized = tensor[M, H] A
     let mut router_input = tensor[M, H] A
     let mut logits = tensor[M, E] f32
@@ -1326,7 +1340,7 @@ fn routed_select[M, H, E, K, ES](residual: &tensor[M, H] f32, norm: &tensor[H] N
     rms_norm(residual, router_norm, router_input, epsilon)
     linear(router_input, router, logits)
     let mut scores = tensor[M, E] f32
-    select_experts(logits, bias, score, routes, scores)
+    select_experts(logits, bias, score, routes, scores, keys)
     for row in 0..M:
         for choice in 0..K:
             weights[row, choice] = scores[row, routes[row, choice]]
@@ -1443,42 +1457,95 @@ fn routed_gate_up[M, H, E, K, F, GS, US, XS, TR, LB](normalized: &tensor[M, H] A
     let mut up_rows = tensor[M, H] f32
     operand_rows(normalized, operands(expert_gate), gate_rows)
     operand_rows(normalized, operands(expert_up), up_rows)
+    let mut limit = f32(inf)
+    if LB > 0:
+        limit = bitcast_f32(u32(LB))
     for row in 0..M:
         for choice in 0..K:
             let expert = routes[row, choice]
             let record = decode_source(sources, i32(row), i32(choice), expert)
-            let mut gate_factor = f32(1.0)
-            let mut up_factor = f32(1.0)
-            if GS > 0:
-                gate_factor = gate_scale[expert]
-            if US > 0:
-                up_factor = up_scale[expert]
-            if record == -1:
-                for feature in 0..F:
-                    product[row, choice, feature] = 0.0
-            else:
-                let mut gate = tensor[1, F] A
-                let mut up = tensor[1, F] A
+            let mut gated = tensor[1, F] A
+            gate_up_choice(gate_rows, up_rows, expert_gate, expert_up, tier_gate, tier_up, activation, gate_scale,
+                up_scale, limit, i32(row), expert, record, gated)
+            for feature in 0..F:
+                product[row, choice, feature] = gated[0, feature]
+    return product
+
+# A decode choice's `routed_gate_up` product into `gated`, of operand row
+# `row` and expert `expert`: zero for record -1 (`decode_source`), else the
+# `glu` of its gate and up projections, read from `record`.
+fn gate_up_choice[M, H, E, F, GS, US, TR](gate_rows: &tensor[M, H] f32, up_rows: &tensor[M, H] f32,
+    expert_gate: &tensor[E, F, H] EGW, expert_up: &tensor[E, F, H] EUW, tier_gate: &tensor[TR, F, H] EGW,
+    tier_up: &tensor[TR, F, H] EUW, activation: i32, gate_scale: &tensor[GS] f32, up_scale: &tensor[US] f32,
+    limit: f32, row: i32, expert: i32, record: i32, gated: &mut tensor[1, F] A)
+    where GS >= 0 and US >= 0 and TR >= 0:
+    let mut gate_factor = f32(1.0)
+    let mut up_factor = f32(1.0)
+    if GS > 0:
+        gate_factor = gate_scale[expert]
+    if US > 0:
+        up_factor = up_scale[expert]
+    if record == -1:
+        for feature in 0..F:
+            gated[0, feature] = 0.0
+    else:
+        let mut gate = tensor[1, F] A
+        let mut up = tensor[1, F] A
+        for feature in 0..F:
+            let mut g = f32(0.0)
+            let mut u = f32(0.0)
+            for source in 0..H:
+                if record >= 0:
+                    g = fma(gate_rows[row, source], f32(expert_gate[record, feature, source]), g)
+                    u = fma(up_rows[row, source], f32(expert_up[record, feature, source]), u)
+                else:
+                    g = fma(gate_rows[row, source], f32(tier_gate[-2 - record, feature, source]), g)
+                    u = fma(up_rows[row, source], f32(tier_up[-2 - record, feature, source]), u)
+            gate[0, feature] = g * gate_factor
+            up[0, feature] = u * up_factor
+        glu(gate, up, gated, activation, limit)
+
+
+# `routed_gate_up` of a streamed layer in two passes over one `product`, so
+# the experts the layer holds run while its host lands the absent ones. The
+# early pass (`late` 0, before `routed_land`) is `routed_gate_up`'s
+# rows into `product`: a choice the route resolved computes, any other zero.
+# The late pass (`late` 1, after the wait) computes only the choices the
+# route left absent (the routing record's source -1, `resolve`) that the wait
+# has since sourced, and leaves every other row as the early pass wrote it, so
+# each choice's product is computed once, by the same arithmetic as in one
+# pass, and the sum that follows reads the same bits. A layer whose group
+# resolves every choice at its route (`POLICY_RESOLVED`) has no late choice:
+# its graph encodes no late pass (`StreamedLayer::gate_up`).
+fn routed_gate_up_part[M, H, E, K, F, GS, US, TR, LB, FLIGHT, P](normalized: &tensor[M, H] A,
+    routes: &tensor[M, K] i32, sources: &tensor[SOURCE_ROWS, M, K] i32, expert_gate: &tensor[E, F, H] EGW,
+    expert_up: &tensor[E, F, H] EUW, tier_gate: &tensor[TR, F, H] EGW, tier_up: &tensor[TR, F, H] EUW,
+    activation: i32, gate_scale: &tensor[GS] f32, up_scale: &tensor[US] f32, glu_limit: &host tensor[0, LB] i32,
+    routing: &tensor[FLIGHT, ROUTING_WORDS(P)] i32, step: &tensor[STEP_WORDS] i32, late: i32,
+    product: &mut tensor[M, K, F] A)
+    where LB >= 0 and GS >= 0 and US >= 0 and TR >= 0 and operands(EGW) == operands(EUW) and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and M <= VERIFY_ROWS:
+    let mut gate_rows = tensor[M, H] f32
+    let mut up_rows = tensor[M, H] f32
+    operand_rows(normalized, operands(expert_gate), gate_rows)
+    operand_rows(normalized, operands(expert_up), up_rows)
+    let mut limit = f32(inf)
+    if LB > 0:
+        limit = bitcast_f32(u32(LB))
+    let slot = flight_slot[FLIGHT = FLIGHT](step_sequence(step))
+    for row in 0..M:
+        for choice in 0..K:
+            let expert = routes[row, choice]
+            let record = decode_source(sources, i32(row), i32(choice), expert)
+            let absent = routing[slot, ROUTING_SOURCE(P, row * K + choice)] == -1
+            let mut mine = true
+            if late != 0:
+                mine = absent and record != -1
+            if mine:
                 let mut gated = tensor[1, F] A
-                for feature in 0..F:
-                    let mut g = f32(0.0)
-                    let mut u = f32(0.0)
-                    for source in 0..H:
-                        if record >= 0:
-                            g = fma(gate_rows[row, source], f32(expert_gate[record, feature, source]), g)
-                            u = fma(up_rows[row, source], f32(expert_up[record, feature, source]), u)
-                        else:
-                            g = fma(gate_rows[row, source], f32(tier_gate[-2 - record, feature, source]), g)
-                            u = fma(up_rows[row, source], f32(tier_up[-2 - record, feature, source]), u)
-                    gate[0, feature] = g * gate_factor
-                    up[0, feature] = u * up_factor
-                let mut limit = f32(inf)
-                if LB > 0:
-                    limit = bitcast_f32(u32(LB))
-                glu(gate, up, gated, activation, limit)
+                gate_up_choice(gate_rows, up_rows, expert_gate, expert_up, tier_gate, tier_up, activation,
+                    gate_scale, up_scale, limit, i32(row), expert, record, gated)
                 for feature in 0..F:
                     product[row, choice, feature] = gated[0, feature]
-    return product
 
 
 # Decode expansion (M <= VERIFY_ROWS), up-only experts: per choice,
@@ -1680,12 +1747,34 @@ native routed_gate_up for metal from "metal/routed_gate_up.metal":
     restate SIMDGROUPS in [2, 4, 8, 16] default 8
     restate arithmetic LANES in [32, 16] default 16
 
+# Metal: `routed_gate_up_part` projects in `routed_gate_up`'s streamed forms
+# (`project routed choice`), tuned following the resident gate/up, as the early
+# or the late pass of one shared body (`metal/lib/routed/gate_up.h`).
+native routed_gate_up_part for metal from "metal/routed_gate_up_part.metal":
+    static (H, K, F, GS, US, LB)
+    records (expert_gate, expert_up, tier_gate, tier_up)
+    project routed choice (expert_gate, expert_up)
+    restate SIMDGROUPS in [2, 4, 8, 16] default 8
+    restate arithmetic LANES in [32, 16] default 16
+
 native routed_gate_up for cuda from "cuda/routed_gate_up.cu":
     static (H, K, F, GS, US, LB)
     records (expert_gate, expert_up, tier_gate, tier_up)
     project routed choice (expert_gate, expert_up)
 
+# CUDA: `routed_gate_up`'s forms over the in/out `product` of the early and late passes.
+native routed_gate_up_part for cuda from "cuda/routed_gate_up_part.cu":
+    static (H, K, F, GS, US, LB)
+    records (expert_gate, expert_up, tier_gate, tier_up)
+    project routed choice (expert_gate, expert_up)
+
 native routed_gate_up for vulkan from "vulkan/routed_gate_up.comp":
+    static (H, K, F, GS, US, LB)
+    records (expert_gate, expert_up, tier_gate, tier_up)
+    project routed choice (expert_gate, expert_up)
+
+# Vulkan: `routed_gate_up`'s forms over the in/out `product` of the early and late passes.
+native routed_gate_up_part for vulkan from "vulkan/routed_gate_up_part.comp":
     static (H, K, F, GS, US, LB)
     records (expert_gate, expert_up, tier_gate, tier_up)
     project routed choice (expert_gate, expert_up)
@@ -1877,12 +1966,12 @@ native routed_scatter for cpu from "cpu/routed_scatter.rs":
 #                 `site_output`.
 #   scratch[FLIGHT, SCRATCH_SLOT LANES]  a scratch-served
 #                 step's request (lane SCRATCH_ASK) and its rounds (lane
-#                 SCRATCH_ROUND + r).
-# A list `list[LIST_ENTRIES + LIST_ENTRY_WORDS L]` (host): LIST_SEQUENCE the
+#                 ROUND_LANE(r)).
+# A list `list[LIST_ENTRY(L)]` (host): LIST_SEQUENCE the
 # sequence it was written for, LIST_COUNT the count n, then from
-# LIST_ENTRIES n entries of LIST_ENTRY_WORDS words, (from, to) record pairs
+# LIST_ENTRY(0) n entries of LIST_ENTRY_WORDS words, (from, to) record pairs
 # at LIST_FROM and LIST_TO. A landing list
-# `landing[LANDING_ENTRIES + LANDING_ENTRY_WORDS L]` (host, the device's
+# `landing[LANDING_ENTRY(L)]` (host, the device's
 # DONE words aside): the step and the count of entries landed in one u64
 # (LANDING_HEAD), then (from, to, done) entries in landing order.
 #
@@ -1986,7 +2075,7 @@ fn request_slot[S, W](slots: &mut tensor[S, W] i32, slot: i32, lane: i32, q: u64
 fn hint[M, H, PT, NM, E, K, RING](residual: &tensor[M, PT * H] f32, norm: &tensor[NM] NW,
     router: &tensor[E, H] RW, eps: f32, step: &tensor[STEP_WORDS] i32,
     input: &mut tensor[M, H] A, logits: &mut tensor[M, E] f32,
-    ring: &mut tensor[RING] i32) where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K:
+    ring: &mut tensor[RING] i32) where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and RING >= HINT_ENTRY(M * K):
     let mut routes = tensor[M, K] i32
     let mut scores = tensor[M, K] f32
     # `rank_choices` writes every route, but a `&mut` argument is read as
@@ -1995,9 +2084,10 @@ fn hint[M, H, PT, NM, E, K, RING](residual: &tensor[M, PT * H] f32, norm: &tenso
         for choice in 0..K:
             routes[row, choice] = -1
     form_input(residual, norm, input, eps)
+    let mut keys = tensor[M, E] f32
     linear(input, router, logits)
-    rank_choices(logits, routes, scores)
-    publish_hints(routes, step, ring)
+    rank_choices(logits, routes, scores, keys)
+    publish_hints(routes, scores, step, ring)
 
 # A general-form layer ahead's hints: layer j's choices for these rows,
 # predicted from this layer's residual through j's router input
@@ -2008,24 +2098,31 @@ fn hint[M, H, PT, NM, E, K, RING](residual: &tensor[M, PT * H] f32, norm: &tenso
 fn hint_selected[M, H, E, K, RING](residual: &tensor[M, H] f32, router_norm: &tensor[H] RNW,
     router: &tensor[E, H] RW, bias: &tensor[E] f32, score: i32, eps: f32,
     step: &tensor[STEP_WORDS] i32, input: &mut tensor[M, H] A, logits: &mut tensor[M, E] f32,
-    routes: &mut tensor[M, K] i32, ring: &mut tensor[RING] i32) where RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K:
+    routes: &mut tensor[M, K] i32, ring: &mut tensor[RING] i32) where RING >= HINT_ENTRY(M * K):
     let mut scores = tensor[M, E] f32
+    let mut keys = tensor[M, E] f32
     rms_norm(residual, router_norm, input, eps)
     linear(input, router, logits)
-    select_experts(logits, bias, score, routes, scores)
-    publish_hints(routes, step, ring)
+    select_experts(logits, bias, score, routes, scores, keys)
+    # Each choice's score, as its ranking gave it.
+    let mut chosen = tensor[M, K] f32
+    for row in 0..M:
+        for choice in 0..K:
+            chosen[row, choice] = scores[row, routes[row, choice]]
+    publish_hints(routes, chosen, step, ring)
 
 # Each predicted expert of `routes` not named before written to `ring`
-# after its header (the step's sequence and the count), with the rank of the
-# choice it was predicted as (HINT_EXPERT, HINT_RANK), in rank order: every
-# row's first choice, then every row's second, and so on, so the ring is
-# best first, the order its readers read ahead in. Its readers keep only
-# the experts the layer lacks: the host's hint admission and the prefetch's
-# takes each skip one the layer holds, so the route reads no map of the
-# layer ahead (which, the group's own, its route writes).
-fn publish_hints[M, K, RING](routes: &tensor[M, K] i32,
-    step: &tensor[STEP_WORDS] i32, ring: &mut tensor[RING] i32) where RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K:
-    let mut count = 0
+# after its header (the step's sequence and the count), as the choice it was
+# first predicted as (`name_entry`, its weight the probability its ranking
+# gave it, `weights`), in rank order: every row's first
+# choice, then every row's second, and so on, so the ring is best first, the
+# order its readers read ahead in. Its readers keep only the experts the
+# layer lacks: the host's hint admission and the prefetch's takes each skip
+# one the layer holds, so the route reads no map of the layer ahead (which,
+# the group's own, its route writes).
+fn publish_hints[M, K, RING](routes: &tensor[M, K] i32, weights: &tensor[M, K] f32,
+    step: &tensor[STEP_WORDS] i32, ring: &mut tensor[RING] i32) where RING >= HINT_ENTRY(M * K):
+    let mut count = i32(0)
     for rank in 0..K:
         for row in 0..M:
             let expert = routes[row, K - 1 - rank]
@@ -2037,11 +2134,26 @@ fn publish_hints[M, K, RING](routes: &tensor[M, K] i32,
                             if routes[earlier_row, K - 1 - earlier_rank] == expert:
                                 seen = 1
                 if seen == 0:
-                    ring[RING_EXPERTS + HINT_ENTRY_WORDS * count + HINT_EXPERT] = expert
-                    ring[RING_EXPERTS + HINT_ENTRY_WORDS * count + HINT_RANK] = i32(rank)
+                    name_entry(ring, count, expert, i32(rank), i32(row), weights[row, K - 1 - rank])
                     count = count + 1
     ring[RING_COUNT] = count
+    ring[RING_GUESSES] = step[STEP_GUESSES]
     ring[RING_SEQUENCE] = step[STEP_LOW]
+
+# Entry `entry` of a hint or front ring (streaming_words.seismic's ring): a
+# choice of the pass, its expert, its rank (0 a row's best), its row and its
+# weight's word (`weight_word`).
+fn name_entry[RING](ring: &mut tensor[RING] i32, entry: i32, expert: i32, rank: i32, row: i32, weight: f32):
+    ring[HINT_ENTRY(entry) + HINT_EXPERT] = expert
+    ring[HINT_ENTRY(entry) + HINT_RANK] = rank
+    ring[HINT_ENTRY(entry) + HINT_ROW] = row
+    ring[HINT_ENTRY(entry) + HINT_WEIGHT] = weight_word(weight)
+
+# A routing weight's word (streaming_words.seismic): its magnitude's f32
+# bits, the sign cleared, so the word is never negative and orders as the
+# weights' magnitudes do.
+fn weight_word(weight: f32) -> i32:
+    return i32(bitcast_u32(weight) & u32(2147483647))
 
 # A streamed decode route's resolve and assignment, after its selection:
 # each choice's source, resolved once into the step's snapshot `sources`,
@@ -2062,42 +2174,80 @@ fn publish_hints[M, K, RING](routes: &tensor[M, K] i32,
 #   Across a link (TM = E) an absent expert is a miss too, assigned with
 #   the rest, its record pending (SOURCE_SITE -2 where the CPU's; the
 #   landing names it). The route does not wait; with no choice absent the
-#   host is not involved.
+#   host is not involved. The landing launch's grid (`land_grid`,
+#   `routed_land`'s) is a row of `land_groups` threadgroups where the step
+#   requested its slot, else none.
 # Every choice of an expert has its expert's source, read once, on its
 # first choice: the host maps and unmaps while a step runs, so two reads of
 # an expert's map or tier words may differ. A layer whose policy's
 # POLICY_WHOLE word is set (its group holds every expert at its home record)
-# sources each choice from `home + expert`: nothing misses, nothing is
-# published, and the routing record is not written.
+# sources each choice it computes from `home + expert`: nothing misses,
+# nothing is published and the landing grid is empty; its routing record
+# names each choice's source as its home record.
 #
 # Routing record: `routing[q mod FLIGHT]`, a ring's words over P choices,
-# takes every choice as routed (`routes`, M K of them), then the count, then
-# the sequence, then from RING_EXPERTS + P each choice's source as resolved,
+# takes every choice as routed (`routes`, M K of them), then the count, the
+# step's guesses' kinds and the sequence, then at ROUTING_SOURCE(P, c) each
+# choice c's source as resolved,
 # before its assignment (a hit's record, a miss's -2 - t, an absent one's
 # -1). The host reads the row at the step's park, after its request (the
 # records the step's entries may still read, `decode::parked_reads`), and
 # once the step has completed: a host-shared write, published before the
 # request, rewritten only by the step FLIGHT on, which the host begins only
-# once this one has ended.
+# once this one has ended. The key record, the step's slot of `keys`, takes
+# each row's selection key of every expert (as the selection ranked them,
+# `ranked`), which placement ranks every expert by, and a whole layer writes
+# its routing record too, each choice's source its home record, so the host
+# reads every layer's routing of every step.
 #
 # `sited` is nonzero where the layer has a CPU site, as its graph encodes
 # it (the graph is formed after the precision system admitted the site's
 # arithmetic). Only a layer with a site whose policy is priced assigns
 # misses to the CPU: any other reads every tier-held miss in place.
-fn resolve[M, K, E, FW, FLIGHT, P, GM, TM](routes: &tensor[M, K] i32, map: &tensor[GM, MAP_WORDS] i32,
+#
+# Front rows (the step's STEP_FRONT bits): a two-row decode pass's
+# provisional row never waits, and computes only the choices of an expert
+# the step holds or an exact row chooses (`computes`), whose bytes are on
+# the device or read anyway. Any other choice of it takes source -1
+# in the snapshot alone (the routing record keeps its source as resolved),
+# so it contributes nothing (`decode_source`), and its request word names it
+# held (-1 - expert), so the tier wait leaves it. Every choice of a front
+# row is published to the layer's front ring `front`
+# with its routing weight (`weights`, `publish_front`), which the host reads
+# ahead where absent for the step the front row's token is exact in. An
+# absent expert an exact row chooses is requested and waited for as any, its
+# front choices served with it. A step with no front row writes no front
+# ring.
+fn resolve[M, K, E, FW, FLIGHT, P, GM, TM, RING](routes: &tensor[M, K] i32, weights: &tensor[M, K] f32,
+    ranked: &tensor[M, E] f32, map: &tensor[GM, MAP_WORDS] i32,
     tier: &tensor[TM] i32, policy: &tensor[POLICY_WORDS] i32, sited: i32,
     step: &tensor[STEP_WORDS] i32, file: &mut tensor[FLIGHT, FW] i32,
-    routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32)
-    where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E):
+    routing: &mut tensor[FLIGHT, ROUTING_WORDS(P)] i32, keys: &mut tensor[FLIGHT, VERIFY_ROWS, E] i32,
+    sources: &mut tensor[SOURCE_ROWS, M, K] i32,
+    front: &mut tensor[RING] i32, land_grid: &mut tensor[3] i32, land_groups: i32)
+    where FW >= FILE_ENTRY(P) and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E) and RING >= HINT_ENTRY(M * K) and M <= VERIFY_ROWS:
     let home = policy[POLICY_HOME]
+    let q = step_sequence(step)
+    let record = flight_slot[FLIGHT = FLIGHT](q)
+    land_grid[0] = 0
+    land_grid[1] = 1
+    land_grid[2] = 1
     if policy[POLICY_WHOLE] != 0:
         for row in 0..M:
             for choice in 0..K:
-                sources[SOURCE_RECORD, row, choice] = home + routes[row, choice]
+                sources[SOURCE_RECORD, row, choice] = -1
+                if computes(routes, step[STEP_FRONT], i32(row), i32(choice), home + routes[row, choice]):
+                    sources[SOURCE_RECORD, row, choice] = home + routes[row, choice]
                 sources[SOURCE_SITE, row, choice] = -1
+                routing[record, ROUTING_SOURCE(P, row * K + choice)] = home + routes[row, choice]
+                routing[record, ROUTING_EXPERT(row * K + choice)] = routes[row, choice]
+        routing[record, RING_COUNT] = i32(M * K)
+        routing[record, RING_GUESSES] = step[STEP_GUESSES]
+        routing[record, RING_SEQUENCE] = step[STEP_LOW]
+    for row in 0..M:
+        for expert in 0..E:
+            keys[record, row, expert] = i32(bitcast_u32(ranked[row, expert]))
     if policy[POLICY_WHOLE] == 0:
-        let q = step_sequence(step)
-        let record = flight_slot[FLIGHT = FLIGHT](q)
         let mut absent = i32(0)
         for row in 0..M:
             for choice in 0..K:
@@ -2112,25 +2262,81 @@ fn resolve[M, K, E, FW, FLIGHT, P, GM, TM](routes: &tensor[M, K] i32, map: &tens
                             source = -2 - tiered
                 else:
                     source = sources[SOURCE_RECORD, first / i32(K), first % i32(K)]
-                if source == -1:
+                if source == -1 and computes(routes, step[STEP_FRONT], i32(row), i32(choice), source):
                     absent = 1
                 sources[SOURCE_RECORD, row, choice] = source
                 sources[SOURCE_SITE, row, choice] = -1
-                routing[record, RING_EXPERTS + P + row * K + choice] = source
-                routing[record, RING_EXPERTS + row * K + choice] = expert
+                routing[record, ROUTING_SOURCE(P, row * K + choice)] = source
+                routing[record, ROUTING_EXPERT(row * K + choice)] = expert
         routing[record, RING_COUNT] = i32(M * K)
+        routing[record, RING_GUESSES] = step[STEP_GUESSES]
         routing[record, RING_SEQUENCE] = step[STEP_LOW]
         if TM > 0 and sited != 0 and policy[POLICY_PRICED] != 0:
-            assign(routes, policy, sources)
+            assign(routes, policy, step[STEP_FRONT], sources)
+        for row in 0..M:
+            for choice in 0..K:
+                if not computes(routes, step[STEP_FRONT], i32(row), i32(choice), routing[record, ROUTING_SOURCE(P, row * K + choice)]):
+                    sources[SOURCE_RECORD, row, choice] = -1
+                    sources[SOURCE_SITE, row, choice] = -1
         if absent != 0:
             for row in 0..M:
                 for choice in 0..K:
-                    let entry = FILE_ENTRIES + FILE_ENTRY_WORDS * (row * K + choice)
-                    file[record, entry + FILE_CHOICE] = -1 - routes[row, choice]
-                    if routing[record, RING_EXPERTS + P + row * K + choice] == -1:
-                        file[record, entry + FILE_CHOICE] = routes[row, choice]
+                    let expert = routes[row, choice]
+                    let source = routing[record, ROUTING_SOURCE(P, row * K + choice)]
+                    let entry = FILE_ENTRY(row * K + choice)
+                    file[record, entry + FILE_CHOICE] = -1 - expert
+                    if source == -1 and computes(routes, step[STEP_FRONT], i32(row), i32(choice), source):
+                        file[record, entry + FILE_CHOICE] = expert
             file[record, FILE_COUNT] = i32(M * K)
             request_slot(file, record, 0, q)
+            land_grid[0] = land_groups
+        if step[STEP_FRONT] != 0:
+            publish_front(routes, weights, step, front)
+
+# Whether choice (row, choice) of `routes`, its expert of source `source`
+# as resolved (-1 absent), is computed: any choice of a row that is not a
+# front row (bit `row` of `rows_front`, STEP_FRONT's); a front row's where
+# the step holds its expert (`source` not -1) or an exact row chooses it.
+fn computes[M, K](routes: &tensor[M, K] i32, rows_front: i32, row: i32, choice: i32, source: i32) -> bool:
+    let mut computed = ((rows_front >> row) & 1) == 0
+    if not computed and source != -1:
+        computed = true
+    if not computed:
+        computed = exact_chooses(routes, rows_front, routes[row, choice])
+    return computed
+
+# Whether a row of `routes` that is not a front row (bit `row` of
+# `rows_front`, STEP_FRONT's) chooses `expert`.
+fn exact_chooses[M, K](routes: &tensor[M, K] i32, rows_front: i32, expert: i32) -> bool:
+    let mut chosen = false
+    for row in 0..M:
+        if ((rows_front >> i32(row)) & 1) == 0:
+            for choice in 0..K:
+                if routes[row, choice] == expert:
+                    chosen = true
+    return chosen
+
+# A layer's front ring (`resolve`): every choice of the step's front rows,
+# in `publish_hints`'s order (every row's first choice, then every row's
+# second, and so on), each as its expert, rank, row and routing weight
+# (`name_entry`): each
+# front row is its own source, so an expert two front rows chose is named by
+# both; then the count and the step's low word. The host's interest ledger
+# publishes every one as an interest of the step its token is exact in: it
+# reads the absent ones that pay, and the bank's ranking holds the ones it
+# wants until that step has logged its own read of the layer.
+fn publish_front[M, K, RING](routes: &tensor[M, K] i32, weights: &tensor[M, K] f32, step: &tensor[STEP_WORDS] i32,
+    ring: &mut tensor[RING] i32) where RING >= HINT_ENTRY(M * K):
+    let rows_front = step[STEP_FRONT]
+    let mut count = i32(0)
+    for rank in 0..K:
+        for row in 0..M:
+            if ((rows_front >> i32(row)) & 1) != 0:
+                name_entry(ring, count, routes[row, K - 1 - rank], i32(rank), i32(row), weights[row, K - 1 - rank])
+                count = count + 1
+    ring[RING_COUNT] = count
+    ring[RING_GUESSES] = step[STEP_GUESSES]
+    ring[RING_SEQUENCE] = step[STEP_LOW]
 
 # The first choice in choice order (row-major) of choice (row, choice)'s
 # expert, as row * K + choice: the one that stands for the expert.
@@ -2143,18 +2349,28 @@ fn first_of[M, K](routes: &tensor[M, K] i32, row: i32, choice: i32) -> i32:
                 first = earlier
     return first
 
-# Whether choice (row, choice) is its expert's first (`first_of`).
-fn first_choice[M, K](routes: &tensor[M, K] i32, row: i32, choice: i32) -> bool:
-    return first_of(routes, row, choice) == row * i32(K) + choice
-
-# The rows naming expert `expert`: its choices, one a row at most.
-fn expert_rows[M, K](routes: &tensor[M, K] i32, expert: i32) -> i32:
+# The exact rows (not of `rows_front`) naming expert `expert`: its choices,
+# one a row at most.
+fn exact_rows[M, K](routes: &tensor[M, K] i32, rows_front: i32, expert: i32) -> i32:
     let mut rows = i32(0)
     for row in 0..M:
-        for choice in 0..K:
-            if routes[row, choice] == expert:
-                rows = rows + 1
+        if ((rows_front >> i32(row)) & 1) == 0:
+            for choice in 0..K:
+                if routes[row, choice] == expert:
+                    rows = rows + 1
     return rows
+
+# Whether choice (row, choice) is its expert's first among the exact rows'
+# choices (`rows_front`'s complement): the one that stands for the expert in
+# the assignment. A front row's choice never does.
+fn stands[M, K](routes: &tensor[M, K] i32, rows_front: i32, row: i32, choice: i32) -> bool:
+    let mut stands = ((rows_front >> row) & 1) == 0
+    for earlier_row in 0..M:
+        if ((rows_front >> i32(earlier_row)) & 1) == 0:
+            for earlier_choice in 0..K:
+                if i32(earlier_row * K + earlier_choice) < row * i32(K) + choice and routes[earlier_row, earlier_choice] == routes[row, choice]:
+                    stands = false
+    return stands
 
 # The layer's misses split between the GPU in place and the CPU by the one
 # cost function (streaming_words.seismic's assignment), over the sources
@@ -2163,19 +2379,24 @@ fn expert_rows[M, K](routes: &tensor[M, K] i32, expert: i32) -> i32:
 # resident lines, the CPU's at zero; the distinct missed experts, by rows,
 # most first, ties in choice order, each go to the CPU where it ends there
 # no later than in place (the CPU's first pays the handshake), else to the
-# GPU in place. It runs only once POLICY_PRICED is set; until then every
+# GPU in place, a read in place no sooner than the link is free of the
+# step's moves (POLICY_LINK_BUSY_NS). It runs only once POLICY_PRICED is set; until then every
 # miss is the GPU's in place. Every choice of a CPU expert is the CPU's:
 # SOURCE_SITE its tier record (-2 while absent, its landing names it),
-# SOURCE_RECORD -1; a link expert's keeps its source.
-fn assign[M, K](routes: &tensor[M, K] i32, policy: &tensor[POLICY_WORDS] i32,
+# SOURCE_RECORD -1; a link expert's keeps its source. The assignment is of
+# the exact rows alone (the rows not of `rows_front`, `resolve`), as at one
+# row: their experts' rows, their hits and their order of choices. An expert
+# only front rows choose is no part of it: an absent one is skipped, which
+# neither side serves, and a tier-held one keeps its source in place.
+fn assign[M, K](routes: &tensor[M, K] i32, policy: &tensor[POLICY_WORDS] i32, rows_front: i32,
     sources: &mut tensor[SOURCE_ROWS, M, K] i32):
     # The lines are whole nanoseconds; the queues are u64, so no sum of
     # them wraps.
     let mut gpu = u64(0)
     for row in 0..M:
         for choice in 0..K:
-            if sources[SOURCE_RECORD, row, choice] >= 0 and first_choice(routes, i32(row), i32(choice)):
-                let rows = u64(expert_rows(routes, routes[row, choice]))
+            if sources[SOURCE_RECORD, row, choice] >= 0 and stands(routes, rows_front, i32(row), i32(choice)):
+                let rows = u64(exact_rows(routes, rows_front, routes[row, choice]))
                 gpu = gpu + max(u64(policy[POLICY_HIT_NS]), rows * u64(policy[POLICY_HIT_ROW_NS]))
     let mut cpu = u64(0)
     let mut served = i32(0)
@@ -2185,12 +2406,12 @@ fn assign[M, K](routes: &tensor[M, K] i32, policy: &tensor[POLICY_WORDS] i32,
             for choice in 0..K:
                 let source = sources[SOURCE_RECORD, row, choice]
                 let expert = routes[row, choice]
-                if source < 0 and first_choice(routes, i32(row), i32(choice)) and expert_rows(routes, expert) == wanted:
+                if source < 0 and stands(routes, rows_front, i32(row), i32(choice)) and exact_rows(routes, rows_front, expert) == wanted:
                     let rows = u64(wanted)
                     let mut on_cpu = cpu + u64(policy[POLICY_CPU_NS]) + (rows - u64(1)) * u64(policy[POLICY_CPU_ROW_NS])
                     if served == 0:
                         on_cpu = on_cpu + u64(policy[POLICY_HANDSHAKE_NS])
-                    let in_place = gpu + max(u64(policy[POLICY_LINK_NS]), rows * u64(policy[POLICY_LINK_ROW_NS]))
+                    let in_place = max(gpu, u64(policy[POLICY_LINK_BUSY_NS])) + max(u64(policy[POLICY_LINK_NS]), rows * u64(policy[POLICY_LINK_ROW_NS]))
                     if on_cpu <= in_place:
                         cpu = on_cpu
                         served = 1
@@ -2212,22 +2433,23 @@ fn assign[M, K](routes: &tensor[M, K] i32, policy: &tensor[POLICY_WORDS] i32,
 # Gate-ahead prediction: the hints (`hint`) of the next two streamed
 # layers, each over its norm and router (`next_*` one layer ahead,
 # `after_*` two), from this layer's residual, into the rings' rows
-# `rings[0]` and `rings[1]` (`RING >= RING_EXPERTS + HINT_ENTRY_WORDS M K`
+# `rings[0]` and `rings[1]` (`RING >= HINT_ENTRY(M K)`
 # each), which the
 # host's read-ahead reads while the step runs, at a lead of one layer and of
 # two, while the next layer may lack an expert the read-ahead could read (its
 # policy's POLICY_RESOLVED word, `next_policy`, clear: neither its group
 # whole nor its host tier keeping every expert); with it set nothing reads
 # the hints, so none are computed. AHEAD, the rings' rows, is fixed per
-# block: the leads its route has (2; 1 for the layer before the last, or
+# block: the leads its route has (HINT_LEADS; 1 for the layer before the last, or
 # where the layer two ahead routes over other experts; 0 for the last
 # streamed layer), the ports of a lead past them binding the next layer's
 # tensors (the last layer's its own), which are not read. Both layers ahead share this layer's input
 # form (NM, PT): a norm each, or none; each routes over EN experts.
 #
 # Its host answers the step's slot of the layer's `file` table as it lands
-# the absent experts (`routed_land` awaits it).
-fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, FLIGHT, P, GM, TM](residual: &tensor[M, PT * H] f32,
+# the absent experts (`routed_land` awaits it), and reads the experts
+# its front rows skip from the layer's front ring `front` (`resolve`).
+fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, FLIGHT, RING, P, GM, TM](residual: &tensor[M, PT * H] f32,
     norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] SRW,
     shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
@@ -2235,26 +2457,29 @@ fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, FLIGHT, P, GM, TM](resid
     map: &tensor[GM, MAP_WORDS] i32, tier: &tensor[TM] i32, policy: &tensor[POLICY_WORDS] i32,
     sited: i32, step: &tensor[STEP_WORDS] i32,
     file: &mut tensor[FLIGHT, FW] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
-    routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
+    routing: &mut tensor[FLIGHT, ROUTING_WORDS(P)] i32, keys: &mut tensor[FLIGHT, VERIFY_ROWS, E] i32,
+    front: &mut tensor[RING] i32, land_grid: &mut tensor[3] i32, land_groups: i32)
     -> (tensor[M, H] A, tensor[M] f32, tensor[M, S] A)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SRW) == 0 and operands(SGW) == operands(SUW) and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SRW) == 0 and operands(SGW) == operands(SUW) and M <= VERIFY_ROWS and FW >= FILE_ENTRY(P) and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E) and RING >= HINT_ENTRY(M * K):
     let mut normalized = tensor[M, H] A
     let mut coefficient = tensor[M] f32
     let mut shared_product = tensor[M, S] A
+    let mut ranked = tensor[M, E] f32
     route_shared(residual, norm, router, shared_router, shared_gate, shared_up, eps,
-        normalize, expert_scale, routes, scores, normalized, coefficient, shared_product)
-    resolve[P = P, E = E](routes, map, tier, policy, sited, step, file, routing, sources)
+        normalize, expert_scale, routes, scores, normalized, coefficient, shared_product, ranked)
+    resolve[P = P, E = E](routes, scores, ranked, map, tier, policy, sited, step, file, routing, keys, sources,
+        front, land_grid, land_groups)
     return (normalized, coefficient, shared_product)
 
 # Gate-ahead hints (`hint`) for the next one or two streamed fused layers
-# (`AHEAD` in 1..=2), guarded by `next_policy[POLICY_RESOLVED]`.
+# (`AHEAD` in 1..=HINT_LEADS), guarded by `next_policy[POLICY_RESOLVED]`.
 fn routed_hint_route[M, H, PT, NM, K, AHEAD, RING, EN](residual: &tensor[M, PT * H] f32,
     activation: &host tensor[0, K] A,
     next_norm: &tensor[NM] NW, next_router: &tensor[EN, H] RW,
     after_norm: &tensor[NM] NW, after_router: &tensor[EN, H] RW,
     eps: f32, step: &tensor[STEP_WORDS] i32, next_policy: &tensor[POLICY_WORDS] i32,
     rings: &mut tensor[AHEAD, RING] i32)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and operands(RW) == 0 and M <= VERIFY_ROWS and AHEAD >= 1 and AHEAD <= 2 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and EN > 0 and K > 0 and K <= EN:
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and operands(RW) == 0 and M <= VERIFY_ROWS and AHEAD >= 1 and AHEAD <= HINT_LEADS and RING >= HINT_ENTRY(M * K) and EN > 0 and K > 0 and K <= EN:
     let mut predicted = tensor[M, H] A
     let mut predicted_logits = tensor[M, EN] f32
     let mut after = tensor[M, H] A
@@ -2268,8 +2493,9 @@ fn routed_hint_route[M, H, PT, NM, K, AHEAD, RING, EN](residual: &tensor[M, PT *
 
 # Decode selection of a streamed layer of the general form: `routed_select`'s
 # ports and results, bit for bit, then `resolve` (a layer whose POLICY_WHOLE
-# word is set resolves only its hits).
-fn routed_select_streamed[M, H, E, K, ES, FW, FLIGHT, P, GM, TM](residual: &tensor[M, H] f32,
+# word is set resolves only its hits, and reads the experts its front rows skip
+# from the layer's front ring `front`).
+fn routed_select_streamed[M, H, E, K, ES, FW, FLIGHT, RING, P, GM, TM](residual: &tensor[M, H] f32,
     norm: &tensor[H] NW, router_norm: &tensor[H] RNW, router: &tensor[E, H] RW, bias: &tensor[E] f32,
     expert_scale: &tensor[ES] f32, routes: &mut tensor[M, K] i32,
     weights: &mut tensor[M, K] f32, epsilon: f32, score: i32, normalization: i32,
@@ -2277,23 +2503,26 @@ fn routed_select_streamed[M, H, E, K, ES, FW, FLIGHT, P, GM, TM](residual: &tens
     map: &tensor[GM, MAP_WORDS] i32, tier: &tensor[TM] i32, policy: &tensor[POLICY_WORDS] i32,
     sited: i32, step: &tensor[STEP_WORDS] i32,
     file: &mut tensor[FLIGHT, FW] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
-    routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
+    routing: &mut tensor[FLIGHT, ROUTING_WORDS(P)] i32, keys: &mut tensor[FLIGHT, VERIFY_ROWS, E] i32,
+    front: &mut tensor[RING] i32, land_grid: &mut tensor[3] i32, land_groups: i32)
     -> tensor[M, H] A
-    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E):
-    let normalized = routed_select(residual, norm, router_norm, router, bias, expert_scale, routes,
-        weights, epsilon, score, normalization, normalization_epsilon, scale)
-    resolve[P = P, E = E](routes, map, tier, policy, sited, step, file, routing, sources)
+    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and M <= VERIFY_ROWS and FW >= FILE_ENTRY(P) and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E) and RING >= HINT_ENTRY(M * K):
+    let mut ranked = tensor[M, E] f32
+    let normalized = select_route(residual, norm, router_norm, router, bias, expert_scale, routes,
+        weights, epsilon, score, normalization, normalization_epsilon, scale, ranked)
+    resolve[P = P, E = E](routes, weights, ranked, map, tier, policy, sited, step, file, routing, keys, sources,
+        front, land_grid, land_groups)
     return normalized
 
 # Gate-ahead hints (`hint_selected`) for the next one or two streamed general
-# layers (`AHEAD` in 1..=2), guarded by `next_policy[POLICY_RESOLVED]`.
+# layers (`AHEAD` in 1..=HINT_LEADS), guarded by `next_policy[POLICY_RESOLVED]`.
 fn routed_hint_select[M, H, K, AHEAD, RING, EN](residual: &tensor[M, H] f32,
     activation: &host tensor[0, K] A,
     next_router_norm: &tensor[H] RNW, next_router: &tensor[EN, H] RW, next_bias: &tensor[EN] f32,
     after_router_norm: &tensor[H] RNW, after_router: &tensor[EN, H] RW, after_bias: &tensor[EN] f32,
     score: i32, epsilon: f32, step: &tensor[STEP_WORDS] i32, next_policy: &tensor[POLICY_WORDS] i32,
     rings: &mut tensor[AHEAD, RING] i32)
-    where operands(RW) == 0 and M <= VERIFY_ROWS and AHEAD >= 1 and AHEAD <= 2 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and EN > 0 and K > 0 and K <= EN:
+    where operands(RW) == 0 and M <= VERIFY_ROWS and AHEAD >= 1 and AHEAD <= HINT_LEADS and RING >= HINT_ENTRY(M * K) and EN > 0 and K > 0 and K <= EN:
     let mut predicted = tensor[M, H] A
     let mut predicted_logits = tensor[M, EN] f32
     let mut predicted_routes = tensor[M, K] i32
@@ -2313,7 +2542,6 @@ fn routed_hint_select[M, H, K, AHEAD, RING, EN](residual: &tensor[M, H] f32,
             hint_selected(residual, after_router_norm, after_router, after_bias, score, epsilon, step,
                 after, after_logits, after_routes, rings[lead, :])
 
-
 # A streamed decode layer's site request (streaming_words.seismic's site
 # kind), after its route (or its landing, when one runs), before its
 # gate/up: when any choice is the CPU's (SOURCE_SITE >= 0), into the step's
@@ -2330,7 +2558,7 @@ fn routed_site_request[M, H, K, FLIGHT, R](step: &tensor[STEP_WORDS] i32,
     routes: &tensor[M, K] i32, sources: &tensor[SOURCE_ROWS, M, K] i32, weights: &tensor[M, K] f32,
     normalized: &tensor[M, H] A, site: &mut tensor[FLIGHT, R] i32,
     site_rows: &mut tensor[FLIGHT, VERIFY_ROWS, H] f32)
-    where FLIGHT > 0 and FLIGHT < 65536 and M <= VERIFY_ROWS and R >= SITE_ENTRIES + SITE_ENTRY_WORDS * M * K and R % 2 == 0:
+    where FLIGHT > 0 and FLIGHT < 65536 and M <= VERIFY_ROWS and R >= SITE_ENTRY(M * K) and R % 2 == 0:
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
     if any_sited(sources):
@@ -2341,7 +2569,7 @@ fn routed_site_request[M, H, K, FLIGHT, R](step: &tensor[STEP_WORDS] i32,
         for row in 0..M:
             for choice in 0..K:
                 if sources[SOURCE_SITE, row, choice] >= 0:
-                    let entry = SITE_ENTRIES + SITE_ENTRY_WORDS * count
+                    let entry = SITE_ENTRY(count)
                     site[slot, entry + SITE_ROW] = i32(row)
                     site[slot, entry + SITE_TIER_RECORD] = sources[SOURCE_SITE, row, choice]
                     site[slot, entry + SITE_EXPERT] = routes[row, choice]
@@ -2432,6 +2660,16 @@ fn routed_output_sited[M, H, SN, IN, K, FLIGHT, SW](residual: &tensor[M, SN * H]
 # across two items, every other row's share off 16-byte alignment).
 const WINDOW_BYTES = 20480
 
+# The threads of a threadgroup that converts by windows (a landing launch's,
+# every backend's), which the window libraries size their per-thread state
+# by: on CUDA eight warps, each placing two tiles at once, a half warp each
+# from its own stage words (`cuda/lib/streaming/window.cuh`, `Shared`, which
+# asserts that a warp's stages fit CUDA's 48 KB of static shared memory
+# beside the window and the block's words); on Metal each thread holding its
+# share of the next window's loads in registers while the window before is
+# placed (`metal/lib/streaming/window.h`, `Held`).
+const WINDOW_THREADS = 256
+
 # A landing launch's group words (`streaming/land.hpp`): the claim its
 # threadgroup took and the from and to of the claim's entry, four words,
 # so a window after them starts 16-byte aligned.
@@ -2446,7 +2684,7 @@ const LAND_WINDOW_AT = 16
 # The entries of landing list `landing` (streaming_words.seismic) landed
 # for step `step`: its head's count where its head names the step, else
 # none.
-fn landed_entries[L](landing: &tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32,
+fn landed_entries[L](landing: &tensor[LANDING_ENTRY(L)] i32,
     step: &tensor[STEP_WORDS] i32) -> i32:
     let mut entries = i32(0)
     if landing[LANDING_HEAD] == step[STEP_LOW]:
@@ -2459,12 +2697,12 @@ fn landed_entries[L](landing: &tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L]
 # `repack_weight` imports them). A round's negative `from` (scratch slot -1
 # - from, holding the stored bytes in bytes its view types as the resident
 # form) is the natives' alone: this body states a source record's case.
-fn land_tensor[L, V, S, N, K](landing: &tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32, entries: i32,
+fn land_tensor[L, V, S, N, K](landing: &tensor[LANDING_ENTRY(L)] i32, entries: i32,
     source: &tensor[V, N, K] ST, destination: &mut tensor[S, N, K] U)
     where V >= 0 and S >= 0:
     for entry in 0..L:
-        let from = landing[LANDING_ENTRIES + LANDING_ENTRY_WORDS * entry + LANDING_FROM]
-        let to = landing[LANDING_ENTRIES + LANDING_ENTRY_WORDS * entry + LANDING_TO]
+        let from = landing[LANDING_ENTRY(entry) + LANDING_FROM]
+        let to = landing[LANDING_ENTRY(entry) + LANDING_TO]
         if entry < entries and from >= 0:
             destination[to, :, :] = repack[U = U](source[from, :, :])
 
@@ -2473,7 +2711,7 @@ fn land_tensor[L, V, S, N, K](landing: &tensor[LANDING_ENTRIES + LANDING_ENTRY_W
 # `from` record converted into its `to` record (`land_tensor`: gate, where
 # the record has one, GV > 0; up; down), then each entry's DONE the step's
 # low word. The natives convert each entry as it lands (`streaming/land.hpp`).
-fn land[L, V, GV, S, GS, F, H](landing: &mut tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32,
+fn land[L, V, GV, S, GS, F, H](landing: &mut tensor[LANDING_ENTRY(L)] i32,
     step: &tensor[STEP_WORDS] i32, source_gate: &tensor[GV, F, H] SG, source_up: &tensor[V, F, H] SU,
     source_down: &tensor[V, H, F] SD, gate: &mut tensor[GS, F, H] UG, up: &mut tensor[S, F, H] UU,
     down: &mut tensor[S, H, F] UD)
@@ -2486,7 +2724,7 @@ fn land[L, V, GV, S, GS, F, H](landing: &mut tensor[LANDING_ENTRIES + LANDING_EN
         land_tensor[L = L](landing, entries, source_down, down)
     for entry in 0..L:
         if entry < entries:
-            landing[LANDING_ENTRIES + LANDING_ENTRY_WORDS * entry + LANDING_DONE] = step[STEP_LOW]
+            landing[LANDING_ENTRY(entry) + LANDING_DONE] = step[STEP_LOW]
 
 # The sources of step `q`'s absent choices, from its answer in slot `slot`
 # of the layer's file table: each choice the slot names absent (an entry c
@@ -2498,12 +2736,12 @@ fn land[L, V, GV, S, GS, F, H](landing: &mut tensor[LANDING_ENTRIES + LANDING_EN
 # whose entries then read nothing for it (`decode_source`).
 fn source_landed[M, K, FLIGHT, FW](file: &tensor[FLIGHT, FW] i32, slot: i32, q: u64,
     sources: &mut tensor[SOURCE_ROWS, M, K] i32)
-    where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * M * K:
+    where FW >= FILE_ENTRY(M * K):
     let answered = slot_succeeded(file, slot, q)
     for row in 0..M:
         for choice in 0..K:
             let c = row * K + choice
-            let entry = FILE_ENTRIES + FILE_ENTRY_WORDS * c
+            let entry = FILE_ENTRY(c)
             let expert = file[slot, entry + FILE_CHOICE]
             if i32(c) < file[slot, FILE_COUNT] and expert >= 0:
                 let mut source = -1
@@ -2544,33 +2782,62 @@ fn source_landed[M, K, FLIGHT, FW](file: &tensor[FLIGHT, FW] i32, slot: i32, q: 
 # writes the sources (`source_landed`). Every write of the sources and the
 # records completes before `routed_site_request` and `routed_gate_up` read
 # them (they follow in submission order). Its host maps each bank record
-# once the device is past the launch. This body states the conversions
-# with no host: the entries landed when it runs.
+# once the device is past the launch. It launches on the grid its route
+# wrote (`grid`, `resolve`'s `land_grid`): its threadgroups where the step
+# requested its slot, else none, so a step with no absent choice dispatches
+# nothing. This body states the conversions with no host: the entries
+# landed when it runs. A slot not this step's request on a grid that runs
+# is no state the protocol reaches: the slot's SLOT_VIOLATED is stored
+# (`streaming/tier_wait.hpp`), and nothing is written.
 fn routed_land[M, K, FW, FLIGHT, L, V, GV, S, GS, F, H](step: &tensor[STEP_WORDS] i32,
     file: &await mut tensor[FLIGHT, FW] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
     policy: &tensor[POLICY_WORDS] i32,
-    landing: &await mut tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32,
+    landing: &await mut tensor[LANDING_ENTRY(L)] i32,
     staging_gate: &tensor[GV, F, H] SG, staging_up: &tensor[V, F, H] SU, staging_down: &tensor[V, H, F] SD,
-    gate: &mut tensor[GS, F, H] UG, up: &mut tensor[S, F, H] UU, down: &mut tensor[S, H, F] UD)
-    where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * M * K and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and ((V > 0 and S > 0) or (V == 0 and S == 0)) and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
+    gate: &mut tensor[GS, F, H] UG, up: &mut tensor[S, F, H] UU, down: &mut tensor[S, H, F] UD,
+    grid: &tensor[3] i32)
+    where FW >= FILE_ENTRY(M * K) and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and ((V > 0 and S > 0) or (V == 0 and S == 0)) and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
-    if policy[POLICY_RESOLVED] == 0 and pair_at(file, slot, SLOT_REQUEST) == q:
-        land[L = L](landing, step, staging_gate, staging_up, staging_down, gate, up, down)
-        source_landed(file, slot, q, sources)
+    if policy[POLICY_RESOLVED] == 0 and grid[0] > 0:
+        if pair_at(file, slot, SLOT_REQUEST) == q:
+            land[L = L](landing, step, staging_gate, staging_up, staging_down, gate, up, down)
+            source_landed(file, slot, q, sources)
+        else:
+            file[slot, SLOT_VIOLATED] = i32(u32(q & u64(4294967295)) | u32(VIOLATED_STAMP))
 
 
-# Expert streaming, a step's sequence: `sequence[STEP_WORDS]`, the pair the
-# host wrote before submitting the step, into its chain place's `step`, at
-# its first streamed layer, before any streamed entry of the step reads it.
-fn routed_step(step: &mut tensor[STEP_WORDS] i32, sequence: &tensor[STEP_WORDS] i32):
+# Expert streaming, a step's words: `sequence[STEP_WORDS]`, its pair and
+# front rows the host wrote before submitting the step, into its chain
+# place's `step`, at its first streamed layer, before any streamed entry of
+# the step reads it; then its guesses' kinds (STEP_GUESSES, the device's
+# alone): for each front row r (bit r of STEP_FRONT, paired with exact row
+# r - 1; the host sets bit 0 never, nor a bit at or past VERIFY_ROWS or the
+# graph's T rows, which `NativeTargetProgram` asserts as it writes the
+# step), the kind `guesses[r - 1]` gives the guess it runs on, a GUESS_*
+# word, as `guess_chain` wrote it at the tail of the step before (that
+# step's head launch's next guesses, which this step's token rows follow),
+# or the host where it holds the guess (a (guess, kind) row at each front
+# row's exact row). A graph whose steps never run a front row (a prompt's)
+# binds none (T = 0) and its host sets no STEP_FRONT bit.
+fn routed_step[T](step: &mut tensor[STEP_WORDS] i32, sequence: &tensor[STEP_WORDS] i32,
+    guesses: &tensor[T, 2] i32)
+    where T >= 0 and T <= 32:
+    let front = sequence[STEP_FRONT]
+    let mut kinds = i32(0)
+    if T >= 1:
+        for row in 1..T:
+            if ((front >> i32(row)) & 1) != 0:
+                kinds = kinds | (guesses[row - 1, 1] << i32(STEP_GUESS_SHIFT(row)))
     step[STEP_LOW] = sequence[STEP_LOW]
     step[STEP_HIGH] = sequence[STEP_HIGH]
+    step[STEP_FRONT] = front
+    step[STEP_GUESSES] = kinds
 
 
 # The first word of lane `lane` in its slot's row of a layer's scratch
 # table, `scratch[FLIGHT, SCRATCH_SLOT LANES]` (streaming_words.seismic's
-# scratch kind, LANES = SCRATCH_ROUND + the rounds), step q's row
+# scratch kind, LANES = ROUND_LANE(the rounds)), step q's row
 # `flight_slot(q)`.
 fn scratch_lane(lane: i32) -> i32:
     return lane * SCRATCH_SLOT
@@ -2585,7 +2852,7 @@ fn scratch_lane(lane: i32) -> i32:
 fn routed_scratch_request[M, K, E, FLIGHT, LANES](routes: &tensor[M, K] i32,
     step: &tensor[STEP_WORDS] i32, flags: &mut tensor[E] i32, scratch: &mut tensor[FLIGHT, SCRATCH_SLOT * LANES] i32,
     resident: &tensor[1] i32)
-    where FLIGHT > 0 and FLIGHT < 65536 and LANES > SCRATCH_ROUND:
+    where FLIGHT > 0 and FLIGHT < 65536 and LANES > ROUND_LANE(0):
     if resident[0] == 0:
         for expert in 0..E:
             flags[expert] = 0
@@ -2598,7 +2865,7 @@ fn routed_scratch_request[M, K, E, FLIGHT, LANES](routes: &tensor[M, K] i32,
 
 
 # One scratch round's landing launch: it requests the step's lane
-# SCRATCH_ROUND + `window[0]` * `rounds` + `round` of its slot (the device's
+# ROUND_LANE(`window[0]` * `rounds` + `round`) of its slot (the device's
 # arrival at the window's round), then converts each of the round's records as
 # its read lands, until the lane is answered (`slot_answered`) and every entry
 # below the round's landing list's count is converted.
@@ -2632,16 +2899,16 @@ fn routed_scratch_request[M, K, E, FLIGHT, LANES](routes: &tensor[M, K] i32,
 fn routed_round[FLIGHT, LANES, L, V, GV, S, GS, F, H, E, EL](step: &tensor[STEP_WORDS] i32,
     scratch: &await mut tensor[FLIGHT, SCRATCH_SLOT * LANES] i32, window: &tensor[1] i32,
     rounds: i32, round: i32,
-    landing: &await mut tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32,
-    tiered: &host mut tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * E] i32,
+    landing: &await mut tensor[LANDING_ENTRY(L)] i32,
+    tiered: &host mut tensor[LIST_ENTRY(E)] i32,
     conveyor_gate: &tensor[GV, F, H] SG, conveyor_up: &tensor[V, F, H] SU,
     conveyor_down: &tensor[V, H, F] SD,
     gate: &mut tensor[GS, F, H] UG, up: &mut tensor[S, F, H] UU, down: &mut tensor[S, H, F] UD,
-    seeds: &host mut tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * E] i32,
+    seeds: &host mut tensor[LIST_ENTRY(E)] i32,
     map: &host mut tensor[EL, MAP_WORDS] i32, grid: &tensor[3] i32)
-    where FLIGHT > 0 and FLIGHT < 65536 and LANES > SCRATCH_ROUND and V > 0 and S > 0 and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
+    where FLIGHT > 0 and FLIGHT < 65536 and LANES > ROUND_LANE(0) and V > 0 and S > 0 and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
     let q = step_sequence(step)
-    request_slot(scratch, flight_slot[FLIGHT = FLIGHT](q), scratch_lane(SCRATCH_ROUND + window[0] * rounds + round), q)
+    request_slot(scratch, flight_slot[FLIGHT = FLIGHT](q), scratch_lane(ROUND_LANE(window[0] * rounds + round)), q)
     land[L = L](landing, step, conveyor_gate, conveyor_up, conveyor_down, gate, up, down)
 
 
@@ -2666,10 +2933,10 @@ fn routed_round[FLIGHT, LANES, L, V, GV, S, GS, F, H, E, EL](step: &tensor[STEP_
 fn routed_scratch_grids[FLIGHT, LANES, RW](step: &tensor[STEP_WORDS] i32,
     scratch: &tensor[FLIGHT, SCRATCH_SLOT * LANES] i32, window: &tensor[1] i32,
     grids: &mut tensor[RW, 3] i32, round_records: i32)
-    where FLIGHT > 0 and FLIGHT < 65536 and RW > 0 and LANES >= SCRATCH_ROUND + RW:
+    where FLIGHT > 0 and FLIGHT < 65536 and RW > 0 and LANES >= ROUND_LANE(RW):
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
-    let first = scratch_lane(SCRATCH_ROUND + window[0] * i32(RW))
+    let first = scratch_lane(ROUND_LANE(window[0] * i32(RW)))
     let answer = pair_at(scratch, slot, first + SLOT_ANSWER)
     let failed = q | (u64(u32(SLOT_FAILED)) << u64(32))
     let mut count = i32(0)
@@ -2693,8 +2960,8 @@ fn routed_scratch_grids[FLIGHT, LANES, RW](step: &tensor[STEP_WORDS] i32,
 # Stage host-written `list` into `staged`: its sequence, its count of step
 # `step`'s entries (none for a list written for another step) and
 # those entries. The count staged.
-fn stage_list[L](list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32, step: &tensor[STEP_WORDS] i32,
-    staged: &mut tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32) -> i32:
+fn stage_list[L](list: &tensor[LIST_ENTRY(L)] i32, step: &tensor[STEP_WORDS] i32,
+    staged: &mut tensor[LIST_ENTRY(L)] i32) -> i32:
     let mut entries = 0
     if list[LIST_SEQUENCE] == step[STEP_LOW]:
         entries = list[LIST_COUNT]
@@ -2702,8 +2969,8 @@ fn stage_list[L](list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32, step: &
     staged[LIST_COUNT] = entries
     for entry in 0..L:
         if entry < entries:
-            staged[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_FROM] = list[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_FROM]
-            staged[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_TO] = list[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_TO]
+            staged[LIST_ENTRY(entry) + LIST_FROM] = list[LIST_ENTRY(entry) + LIST_FROM]
+            staged[LIST_ENTRY(entry) + LIST_TO] = list[LIST_ENTRY(entry) + LIST_TO]
     return entries
 
 # A host-written list's launch grid: its row of `grid[0]` threadgroups,
@@ -2714,8 +2981,8 @@ fn stage_list[L](list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32, step: &
 # stages the list into device memory too (`staged`: its sequence, its
 # count of the step's entries, and those entries), which the copy on the
 # grid reads in place of the host's (streaming/list.hpp).
-fn routed_list_grid[L](list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32, step: &tensor[STEP_WORDS] i32,
-    grid: &mut tensor[3] i32, staged: &mut tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32):
+fn routed_list_grid[L](list: &tensor[LIST_ENTRY(L)] i32, step: &tensor[STEP_WORDS] i32,
+    grid: &mut tensor[3] i32, staged: &mut tensor[LIST_ENTRY(L)] i32):
     let entries = stage_list[L = L](list, step, staged)
     grid[1] = 0
     if entries > 0:
@@ -2759,12 +3026,12 @@ fn routed_pass_map[E](map: &tensor[E, MAP_WORDS] i32, window: &tensor[E] i32, st
 # conveyor's landed staging records into its lent records, as bytes). It
 # launches on its list's grid (`routed_list_grid`). A list written for
 # another step copies nothing.
-fn routed_copy[S, D, L, N, K](source: &tensor[S, N, K] U, list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32,
+fn routed_copy[S, D, L, N, K](source: &tensor[S, N, K] U, list: &tensor[LIST_ENTRY(L)] i32,
     step: &tensor[STEP_WORDS] i32, destination: &mut tensor[D, N, K] U, grid: &tensor[3] i32):
     if list[LIST_SEQUENCE] == step[STEP_LOW]:
         for entry in 0..L:
-            let from = list[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_FROM]
-            let to = list[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_TO]
+            let from = list[LIST_ENTRY(entry) + LIST_FROM]
+            let to = list[LIST_ENTRY(entry) + LIST_TO]
             if entry < list[LIST_COUNT]:
                 destination[to, :, :] = source[from, :, :]
 
@@ -2775,19 +3042,19 @@ fn routed_copy[S, D, L, N, K](source: &tensor[S, N, K] U, list: &tensor[LIST_ENT
 # committed with the step (`commits[record]`), which the host reads once the
 # step has completed and then maps the seed (streaming_words.seismic: the
 # host is the map's one writer). `scratch` is the layer's scratch table: a
-# window whose last round's lane (SCRATCH_ROUND + `window[0]` * `rounds` +
-# `rounds` - 1, which the host answers before the last round the device waits
+# window whose last round's lane (ROUND_LANE(`window[0]` * `rounds` +
+# `rounds` - 1), which the host answers before the last round the device waits
 # on, and fails whenever it fails the fill) does not hold the step's answer
 # commits nothing, nor does a list written for another step (the host maps
 # only the experts it listed).
-fn routed_seed_commit[X, BANK, FLIGHT, LANES](list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * X] i32,
+fn routed_seed_commit[X, BANK, FLIGHT, LANES](list: &tensor[LIST_ENTRY(X)] i32,
     step: &tensor[STEP_WORDS] i32, scratch: &tensor[FLIGHT, SCRATCH_SLOT * LANES] i32,
     window: &tensor[1] i32, rounds: i32, commits: &mut tensor[BANK] i32)
-    where BANK > 0 and FLIGHT > 0 and FLIGHT < 65536 and LANES > SCRATCH_ROUND:
+    where BANK > 0 and FLIGHT > 0 and FLIGHT < 65536 and LANES > ROUND_LANE(0):
     let q = step_sequence(step)
-    let last = scratch_lane(SCRATCH_ROUND + window[0] * rounds + rounds - 1)
+    let last = scratch_lane(ROUND_LANE(window[0] * rounds + rounds - 1))
     if list[LIST_SEQUENCE] == step[STEP_LOW] and pair_at(scratch, flight_slot[FLIGHT = FLIGHT](q), last + SLOT_ANSWER) == q:
         for entry in 0..X:
-            let record = list[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_TO]
+            let record = list[LIST_ENTRY(entry) + LIST_TO]
             if entry < list[LIST_COUNT]:
                 commits[record] = step[STEP_LOW]

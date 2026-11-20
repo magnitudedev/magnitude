@@ -29,20 +29,36 @@ use super::prefetch::Prefetch;
 use super::promotions::{Copier, Promotions};
 use super::resize::{Asked, Owed};
 use super::scratch::Scratch;
-use super::Shared;
-use crate::assessment::{ExpertLines, SiteLines};
+use super::{Shared, Step};
+use magnitude_cost_model::{ExpertLines, SiteLines};
 use crate::experts::directory::{MissCurve, Point};
 use crate::experts::yielding::Yielding;
 use magnitude_kernels::constants;
 use std::sync::{Arc, MutexGuard};
 use std::time::Instant;
 
+/// The policy words a run's encoding reads, as residency stages them
+/// ([`Residency::publish_policy`]): each streamed layer's, and whether a
+/// CPU site serves any layer.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::experts) struct PolicyWords {
+    layers: Vec<LayerPolicy>,
+    served: bool,
+}
+
+/// A streamed layer's policy words: whole, resolved, its home, and whether
+/// its hint launches run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LayerPolicy {
+    whole: bool,
+    resolved: bool,
+    home: i32,
+    hints: bool,
+}
+
 /// Where experts live and what moves them, behind one lock
 /// ([`lock`]).
 pub(super) struct Residency {
-    /// Per layer, whether its group was whole when the words were last
-    /// published (`Residency::publish_policy`).
-    pub(super) whole: Vec<bool>,
     /// Per layer, its home as its policy names it (`policy[POLICY_HOME]`),
     /// the directory's ([`Directory::home`](crate::experts::directory::Directory::home)).
     pub(super) homes: Vec<i32>,
@@ -58,11 +74,6 @@ pub(super) struct Residency {
     /// (`Directory::tier_complete`), as last published.
     pub(super) opened: Instant,
     pub(super) complete: bool,
-    /// The CPU site's answered requests and their path time when residency
-    /// opened, and the site's share of the time over the load as its last
-    /// answered request left it ([`Self::site_share`]).
-    pub(super) site_opened: crate::experts::SiteServed,
-    pub(super) site_share: SiteShare,
     /// Each layer's line words as last published ([`Self::publish_lines`]);
     /// none before the first.
     pub(super) lines: Option<Vec<Vec<(usize, i32)>>>,
@@ -80,12 +91,15 @@ pub(super) struct Published {
     holdings: Option<u64>,
     held: Vec<usize>,
     alone: Vec<usize>,
+    lend: Vec<super::GroupLend>,
+    capacities: Vec<usize>,
 }
 
 impl Published {
-    /// None published yet, of `layers` layers.
-    pub(super) fn new(layers: usize) -> Self {
-        Self { holdings: None, held: vec![0; layers], alone: vec![0; layers] }
+    /// None published yet, of `layers` layers, telemetry told each group's
+    /// `capacities` at the load (`Directory::capacities`).
+    pub(super) fn new(layers: usize, capacities: Vec<usize>) -> Self {
+        Self { holdings: None, held: vec![0; layers], alone: vec![0; layers], lend: Vec::new(), capacities }
     }
 }
 
@@ -198,6 +212,9 @@ impl Residency {
                 shared.telemetry.feed();
                 let decoded = copier.as_ref().and_then(|_| shared.telemetry.decoded_since(&mut decoded_steps));
                 Self::tend(&residency, copier.as_ref(), decoded.as_ref());
+                // Then the ranking's shadows read what it logged, after the
+                // turn: no request, read ahead or promotion waits on them.
+                shared.telemetry.shadow();
             }
             events.wait(seen);
         }
@@ -254,8 +271,8 @@ impl Residency {
         let joined = self.join();
         let retired = self.retire();
         let landed = self.prefetch.settle(&mut self.core.directory);
-        self.refill_tier();
-        turn.changed = joined || retired || landed;
+        let refilled = self.refill_tier();
+        turn.changed = joined || retired || landed || refilled;
         if let Some(asked) = self.asked.take().or_else(|| self.shared.resizing.asked().map(Asked::taken)) {
             self.asked = self.resize(asked, copier);
             return false;
@@ -270,7 +287,7 @@ impl Residency {
     /// it here until it has).
     fn promote(&mut self, turn: &mut Turn, copier: Option<&Copier>, decoded: Option<&MissCurve>) -> bool {
         let held = self.traffic_held();
-        let promoted = copier.is_some_and(|copier| self.promotions.advance(&mut self.core, &self.shared, copier, decoded, held, self.prefetch.reached()));
+        let promoted = copier.is_some_and(|copier| self.promotions.advance(&mut self.core, &self.shared, copier, decoded, held, &self.prefetch));
         turn.changed |= promoted;
         true
     }
@@ -289,11 +306,15 @@ impl Residency {
     /// hold waits on. Whether it is held is read here, not
     /// carried from the promotions: a request served between them means a
     /// step runs, which ends the hold at once.
-    fn hasten(&mut self, _: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
+    fn hasten(&mut self, turn: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
         let held = self.traffic_held();
         if held {
             self.prefetch.cancel_cover();
         } else {
+            let told = self.prefetch.learn(&self.shared);
+            if told || turn.changed {
+                self.prefetch.drive(&mut self.core, &self.shared);
+            }
             let scratch = &self.scratch;
             self.prefetch.cover(&mut self.core, &self.shared, |staged| scratch.carries(staged));
             for staged in self.scratch.awaited(&self.core) {
@@ -312,8 +333,8 @@ impl Residency {
     /// The words a run's encoding reads, only while no step runs; the
     /// lines at every turn; and the turn's change announced.
     fn publish_turn(&mut self, turn: &mut Turn, _: Option<&Copier>, _: Option<&MissCurve>) -> bool {
-        let steps = self.shared.steps.clone();
-        steps.while_idle(|| self.publish_policy());
+        self.publish_policy();
+        self.shared.write_staged();
         self.publish_lines();
         if turn.changed {
             self.shared.events().notify();
@@ -335,12 +356,8 @@ impl Residency {
             return false;
         }
         self.core.retired = frontier;
-        let (past, reserving) = self.shared.steps.retire_groups(frontier);
-        if let Some(past) = past {
+        if let Some(past) = self.shared.steps.retire_groups(frontier) {
             self.advance(past);
-        }
-        for _ in 0..reserving {
-            self.shared.lent.release();
         }
         true
     }
@@ -353,7 +370,40 @@ impl Residency {
     /// request at `progress` sees follows from this alone, so every request
     /// is taken or served only after it: none acts on what its own position
     /// proves past, however late residency learned of it.
+    /// Read live hint and front rings, advancing device progress to the
+    /// latest ring seen so graced tier records of earlier layers retire
+    /// even on passes that never park on a demand miss, before admitting
+    /// and driving reads ahead.
+    pub(super) fn rings(&mut self, shared: &Arc<Shared>, served: &[Step], mut freed: bool) -> bool {
+        if self.core.directory.tier_complete() {
+            return self.prefetch.learn(shared);
+        }
+        let read = self.prefetch.begin_rings(&self.core, shared);
+        if let Some(latest) = read.latest {
+            if latest > self.prefetch.reached() {
+                self.advance_retired(latest);
+                freed = true;
+            }
+        }
+        if read.any {
+            self.prefetch.pass(&mut self.core, shared, None);
+        }
+        let settled = self.prefetch.settle(&mut self.core.directory);
+        let refilled = self.refill_tier();
+        freed |= settled || refilled;
+        self.prefetch.finish_rings(&mut self.core, shared, read, freed, served)
+    }
+
     pub(super) fn advance(&mut self, progress: Point) {
+        self.advance_retired(progress);
+        self.refill_tier();
+    }
+
+    /// Advance device progress to `progress` and retire completed landings,
+    /// seeds, and tier graces without refilling the reserve: used on a
+    /// parked decode request's critical path so demand claims see every
+    /// newly-freed record before `refill_tier` runs after serving.
+    pub(super) fn advance_retired(&mut self, progress: Point) {
         self.prefetch.past(progress);
         self.prefetch.settle(&mut self.core.directory);
         for listed in self.core.take_past(progress) {
@@ -362,7 +412,6 @@ impl Residency {
         // The tiers it is past place their seeds, which it is past too.
         self.scratch.advance(progress, &mut self.core);
         self.core.retire(progress);
-        self.refill_tier();
     }
 
     /// A later scratch window's round 0 arrived: settle finished landings and
@@ -381,28 +430,28 @@ impl Residency {
     /// no lock of the steps' held
     /// (`Directory::refill_victims`), then, where no step begins, each
     /// unmapped, unchanged since (`Directory::refill`), graced for the
-    /// steps begun; a lent record only while no prompt group holds or
-    /// awaits the lent records (which a group reserves as it begins,
-    /// `lent`), so none is graced for a group's own step. Under the
-    /// steps' lock: a check, a map store and a state change a victim.
-    pub(super) fn refill_tier(&mut self) {
-        let (steps, lending) = (&self.shared.steps, &self.shared.lent);
-        let reserve = self.core.extents.reserve;
+    /// steps begun; a lent record only while no scratch-served group's
+    /// lease is out (from its begin until it retires, `Steps::lending`,
+    /// read again under the steps' lock), so none is graced for a group's
+    /// own step. Under the steps' lock: a check, a map store and a state
+    /// change a victim.
+    pub(super) fn refill_tier(&mut self) -> bool {
+        let steps = &self.shared.steps;
         let directory = &mut self.core.directory;
-        if !directory.refill_short(reserve) {
-            return;
+        if !directory.refill_short() {
+            return false;
         }
-        let victims = directory.refill_victims(reserve, !lending.lock().reserved());
+        let victims = directory.refill_victims(steps.lending());
         if victims.iter().all(Vec::is_empty) {
-            return;
+            return false;
         }
+        let mut unmapped = false;
         steps.unbegun(|at| {
-            let lent = !lending.lock().reserved();
-            directory.refill(victims, lent, at);
+            unmapped = directory.refill(victims, at);
         });
         // A grace for steps the device is already past frees now: no
         // frontier's move would come for it until the next step.
-        directory.retire_graces(self.prefetch.reached(), steps);
+        unmapped | directory.retire_graces(self.prefetch.reached(), steps)
     }
 
     /// Take `layer`'s scratch requests published since, in step order,
@@ -452,6 +501,19 @@ impl Residency {
             self.shared.telemetry.publish_held(held, alone);
             self.published.holdings = Some(holdings);
         }
+        // Each group's lend and capacity, published only as a resize, a
+        // claim or a return changes them.
+        let lend = self.core.directory.hosts().iter().map(|host| super::GroupLend { claimed: host.claimed(), capacity: host.capacity() });
+        if !lend.clone().eq(self.published.lend.iter().copied()) {
+            self.published.lend = lend.collect();
+            self.shared.publish_lend(&self.published.lend);
+        }
+        let directory = &self.core.directory;
+        let capacities = (0..self.published.capacities.len()).map(|group| directory.capacity(group));
+        if !capacities.clone().eq(self.published.capacities.iter().copied()) {
+            self.published.capacities = capacities.collect();
+            self.shared.telemetry.capacity(self.published.capacities.clone());
+        }
         // The moment the records misses land into first keep every expert:
         // from then no decode miss reads the file. They are a host tier's
         // where the device places, the bank's own (the one store) where the
@@ -476,26 +538,9 @@ impl Residency {
         }
     }
 
-    /// The CPU site's share of the time over the load: its answered
-    /// requests' path time since residency opened over the time from then
-    /// to the turn that reads them, at most all of it (requests of several
-    /// layers overlap); none of it before any is answered. It moves only as
-    /// requests are answered, so a turn with none answered since prices the
-    /// copies as the turn before did and asks no promotions again. No time
-    /// since residency opened holds no share: the share stands as it was,
-    /// and the first turn after reads the requests.
-    fn site_share(&mut self) -> f64 {
-        let served = self.shared.compute.site_served().since(&self.site_opened);
-        let elapsed = self.opened.elapsed();
-        if served.requests != self.site_share.requests && !elapsed.is_zero() {
-            let path = served.terms.iter().sum::<std::time::Duration>();
-            self.site_share = SiteShare { requests: served.requests, share: (path.as_secs_f64() / elapsed.as_secs_f64()).min(1.) };
-        }
-        self.site_share.share
-    }
-
-    /// Between flights, write each layer's policy words a run's encoding
-    /// reads (`BankPart::Policy`, this their one writer; its line words are
+    /// Stage the write of each layer's policy words a run's encoding reads
+    /// where they changed, written between flights (`Shared::stage_policy`)
+    /// (`BankPart::Policy`, this their one writer; its line words are
     /// [`Self::publish_lines`]'): its home (`Directory::home`, the same every
     /// flight, which a graph shared by blocks reads through each block's
     /// own policy port), its whole word, set
@@ -510,12 +555,14 @@ impl Residency {
     /// the group that lends the conveyor its records only while every group
     /// is (a partial group's prompt demand claims the lender's records
     /// mid-flight,
-    /// `Directory::claim_lent`). Nothing misses in a whole group, so no
+    /// `Directory::lease`). Nothing misses in a whole group, so no
     /// placement, seed or claim takes its records before the next flight
     /// ends, and every run encoded and launched until then reads the word
-    /// alike. Called only while no step runs, under the lock every step
-    /// begins under (`Steps::while_idle`), and a step begins before its
-    /// runs are encoded, so no encoding overlaps a publication. A placement
+    /// alike. The write runs only while no step runs, under the lock every
+    /// step begins under (`Shared::write_staged`), and a step begins before
+    /// its runs are encoded, so no encoding overlaps a publication; what the
+    /// load reads of the words (which layers are whole, the gates in effect)
+    /// changes with the write. A placement
     /// counts once it holds its record: a group's word turns on a flight
     /// late, never early. Its resolved word is set while it is whole or its
     /// group's host tier keeps every expert outside the conveyor's lent
@@ -525,32 +572,60 @@ impl Residency {
     /// tier never does, or to a prompt group's claim of a lent record,
     /// which a settled tier keeps none in; otherwise only in a shrink
     /// between flights, after which this publishes.
+    ///
+    /// Then each layer's hints word, whether its hint launches run
+    /// (`policy[POLICY_HINTS]`, read where a run is queued), priced on the
+    /// load's evidence now (`gate::HintGate::decide`). Each change of any
+    /// word breaks the pipeline of queued steps once, so the hint gate moves
+    /// only where that pays, and words equal to those written stage nothing,
+    /// dropping any write staged before (`Shared::stage_policy`): a change
+    /// undone before it is written breaks nothing.
     pub(super) fn publish_policy(&mut self) {
         let full = (0..self.core.groups.len()).map(|group| self.core.group_resident(group)).collect::<Vec<_>>();
         let every = full.iter().all(|&full| full);
         let lender = self.scratch.conveyor.lending().group;
         let served = self.core.layers.iter().any(|layer| layer.site.is_some() && !(full[layer.group] && (every || lender != layer.group)));
-        self.shared.sites_served.store(served, std::sync::atomic::Ordering::Release);
-        for (index, layer) in self.core.layers.iter().enumerate() {
-            let whole = full[layer.group] && (every || lender != layer.group);
-            self.whole[index] = whole;
-            self.shared.telemetry.whole(index, whole);
-            layer.policy.store(constants::POLICY_WHOLE as usize, i32::from(whole));
-            let resolved = whole || self.core.directory.group_tier_settled(layer.group);
-            layer.policy.store(constants::POLICY_RESOLVED as usize, i32::from(resolved));
-            layer.policy.store(constants::POLICY_HOME as usize, self.homes[index]);
-        }
+        let whole = self.core.layers.iter().map(|layer| full[layer.group] && (every || lender != layer.group)).collect::<Vec<_>>();
+        let resolved = self.core.layers.iter().zip(&whole).map(|(layer, &whole)| whole || self.core.directory.group_tier_settled(layer.group)).collect::<Vec<_>>();
+        let hints = self.shared.telemetry.hint_gates(&resolved, self.shared.launch_prices().as_ref());
+        let layers = (0..self.core.layers.len())
+            .map(|index| LayerPolicy {
+                whole: whole[index],
+                resolved: resolved[index],
+                home: self.homes[index],
+                hints: hints[index],
+            })
+            .collect();
+        let words = PolicyWords { layers, served };
+        let (shared, layers) = (Arc::downgrade(&self.shared), &self.core.layers);
+        self.shared.stage_policy(words, || {
+            let policies = layers.iter().map(|layer| layer.policy.clone()).collect::<Vec<_>>();
+            Box::new(move |words: &PolicyWords| {
+                let shared = shared.upgrade().expect("a load's staged policy is written while it serves");
+                shared.sites_served.store(words.served, std::sync::atomic::Ordering::Release);
+                for (index, (policy, layer)) in policies.iter().zip(&words.layers).enumerate() {
+                    shared.telemetry.whole(index, layer.whole);
+                    policy.store(constants::POLICY_WHOLE as usize, i32::from(layer.whole));
+                    policy.store(constants::POLICY_RESOLVED as usize, i32::from(layer.resolved));
+                    policy.store(constants::POLICY_HOME as usize, layer.home);
+                    policy.store(constants::POLICY_HINTS as usize, i32::from(layer.hints));
+                }
+                shared.telemetry.publish_hints(&words.layers.iter().map(|layer| layer.hints).collect::<Vec<_>>());
+            })
+        });
     }
 
     /// Write each layer's line words (`ExpertLines::policy`, this the one
     /// writer) from its lines as the load's own work refines them (its
-    /// landings, what its CPU site's requests take and what its sampled
-    /// steps' blocks take on the device, `Telemetry::refined`), and price
-    /// the promotions' copies on the same lines at the site's share of the
-    /// time now (`Directory::price_copies` asks them again only where a
-    /// price moved). The words are stored only where they differ from those
-    /// last published, so a turn that moved none of them takes no steps'
-    /// lock. Unlike the words a run's encoding reads (whole, resolved, home:
+    /// landings, what its CPU site's requests take, what its sampled steps'
+    /// blocks take on the device and the moves beside its reads,
+    /// `Telemetry::refined`), and price the promotions' copies on the same
+    /// lines beside the decode's CPU site and reads in place as its passes
+    /// measure them now (`Telemetry::beside`; `Directory::price_copies`
+    /// asks them again only where a price moved), and the releases'
+    /// write-backs on the passes' terms (`Directory::price_write_backs`). The words are stored
+    /// only where they differ from those last published, so a turn that
+    /// moved none of them takes no steps' lock. Unlike the words a run's encoding reads (whole, resolved, home:
     /// [`Self::publish_policy`]), the lines decide
     /// only the route's choice of a miss's site, and any value of each word
     /// is a valid one for any step: so they are stored under the lock every
@@ -564,9 +639,15 @@ impl Residency {
         let priced = self.shared.priced().map(|lines| self.shared.telemetry.refined(&lines));
         let copy = self.shared.copy.lock().expect("a copy's price").clone();
         if let (Some(lines), Some(copy)) = (&priced, &copy) {
-            let site_share = self.site_share();
+            let beside = self.shared.telemetry.beside();
+            let terms = self.shared.telemetry.terms();
             for (layer, lines) in lines.iter().enumerate() {
-                self.core.directory.price_copies(layer, lines.copy_hits(copy, site_share));
+                self.core.directory.price_copies(layer, crate::assessment::copy_hits(lines, copy, beside));
+                // A write-back holds the link its record's transfer out of
+                // the device, on the transfer queue's line that way.
+                let link = copy.back.transfer_seconds(lines.host.record_bytes as f64);
+                let price = terms.map(|(terms, drive)| crate::experts::directory::WriteBack { terms, drive, link });
+                self.core.directory.price_write_backs(layer, price);
             }
         }
         let words = self
@@ -583,7 +664,7 @@ impl Residency {
                     (Some(_), None) => SiteLines::Pending,
                     (Some(_), Some(cpu)) => SiteLines::Measured(cpu),
                 };
-                ExpertLines::policy(site, priced.as_ref().map(|lines| &lines[index]))
+                ExpertLines::policy(&crate::assessment::POLICY_LAYOUT, site, priced.as_ref().map(|lines| &lines[index]))
             })
             .collect::<Vec<_>>();
         if self.lines.as_ref() == Some(&words) {
@@ -624,7 +705,7 @@ impl Residency {
     /// Whether every layer is whole as last published: nothing a decode
     /// step runs then asks anything (no miss, no hint).
     pub(super) fn whole(&self) -> bool {
-        self.whole.iter().all(|&whole| whole)
+        (0..self.core.layers.len()).all(|layer| self.shared.telemetry.is_whole(layer))
     }
 
     /// Each group's host tier records `views` address from now (a shrink's,
@@ -639,12 +720,4 @@ impl Residency {
     pub(super) fn serving(&mut self) -> decode::Serving<'_> {
         decode::Serving { core: &mut self.core, prefetch: &mut self.prefetch, shared: &self.shared }
     }
-}
-
-/// The CPU site's share of the time over the load ([`Residency::site_share`]),
-/// as of its answered requests since residency opened.
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct SiteShare {
-    requests: u64,
-    share: f64,
 }

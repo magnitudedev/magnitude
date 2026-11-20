@@ -106,6 +106,14 @@ impl HeaderComponent {
             tensors: self.directory.tensors.clone(),
         }
     }
+
+    fn into_manifest(self, identity: ArtifactIdentity) -> ComponentManifest {
+        ComponentManifest {
+            files: self.files,
+            identity,
+            tensors: self.directory.tensors,
+        }
+    }
 }
 
 impl PackageHeaders {
@@ -144,10 +152,10 @@ impl PackageHeaders {
         if target_shards.is_empty() {
             return Err(Error::Invalid("split GGUF has no shards".into()));
         }
-        let canonical_projector = projector.map(Path::canonicalize).transpose()?;
-        if let Some(canonical_projector) = &canonical_projector {
+        let projector_identity = projector.map(FileIdentity::of).transpose()?;
+        if let (Some(projector_path), Some(projector_id)) = (projector, &projector_identity) {
             for shard in target_shards {
-                if shard.canonicalize()? == *canonical_projector {
+                if shard.as_path() == projector_path || FileIdentity::of(shard)? == *projector_id {
                     return Err(Error::Invalid(
                         "target and projector must be distinct package components".into(),
                     ));
@@ -155,9 +163,11 @@ impl PackageHeaders {
             }
         }
         let target = HeaderComponent::inspect_shards(target_shards, headers)?;
-        if let Some(canonical_projector) = &canonical_projector {
+        if let (Some(projector_path), Some(projector_id)) = (projector, &projector_identity) {
             for file in &target.files {
-                if file.path.canonicalize()? == *canonical_projector {
+                if file.path.as_path() == projector_path
+                    || FileIdentity::of(&file.path)? == *projector_id
+                {
                     return Err(Error::Invalid(
                         "target and projector must be distinct package components".into(),
                     ));
@@ -179,6 +189,14 @@ impl PackageHeaders {
         })
     }
 
+    /// Inspect one component's headers from disk without attaching it to a
+    /// package yet, so a caller can overlap draft inspection with target
+    /// inspection and attach the result via [`Self::add_preopened_draft`].
+    pub fn inspect_component(path: &Path) -> Result<(Directory, Vec<ComponentFile>), Error> {
+        let component = HeaderComponent::inspect(path, &FileHeaders)?;
+        Ok((component.directory, component.files))
+    }
+
     /// Add a separate draft model's header as a component of the package.
     /// On failure the package keeps its target and projector.
     pub fn add_draft(&mut self, draft: &Path) -> Result<(), Error> {
@@ -188,19 +206,32 @@ impl PackageHeaders {
     /// [`Self::add_draft`] with the draft's header from `headers`.
     pub fn add_draft_from(&mut self, draft: &Path, headers: &dyn HeaderSource) -> Result<(), Error> {
         let component = HeaderComponent::inspect(draft, headers)?;
+        self.add_preopened_draft(draft, component.directory, component.files)
+    }
+
+    /// Attach a previously inspected draft component ([`Self::inspect_component`])
+    /// to this package after verifying it is distinct from the target and
+    /// projector.
+    pub fn add_preopened_draft(
+        &mut self,
+        draft: &Path,
+        directory: Directory,
+        files: Vec<ComponentFile>,
+    ) -> Result<(), Error> {
+        let draft_id = FileIdentity::of(draft)?;
         let others = self
             .target
             .files
             .iter()
             .chain(self.projector.iter().flat_map(|projector| &projector.files));
         for file in others {
-            if file.path.canonicalize()? == draft.canonicalize()? {
+            if file.path == draft || FileIdentity::of(&file.path)? == draft_id {
                 return Err(Error::Invalid(
                     "the draft must be a distinct package component".into(),
                 ));
             }
         }
-        self.draft = Some((component, ArtifactIdentity::for_open()));
+        self.draft = Some((HeaderComponent { directory, files }, ArtifactIdentity::for_open()));
         Ok(())
     }
 
@@ -238,6 +269,22 @@ impl PackageHeaders {
                 .draft
                 .as_ref()
                 .map(|(draft, identity)| draft.manifest(*identity)),
+        }
+    }
+
+    /// Consume these headers into a [`PackageManifest`] without cloning the
+    /// component tensor directories.
+    pub fn into_manifest(self) -> PackageManifest {
+        PackageManifest {
+            identity: self.identity,
+            target: self.target.into_manifest(self.identity.target),
+            projector: self
+                .projector
+                .zip(self.identity.projector)
+                .map(|(projector, identity)| projector.into_manifest(identity)),
+            draft: self
+                .draft
+                .map(|(draft, identity)| draft.into_manifest(identity)),
         }
     }
 }
@@ -450,6 +497,29 @@ impl Package {
             target: component_manifest(&self.target),
             projector: self.projector.as_ref().map(component_manifest),
             draft: self.draft.as_ref().map(component_manifest),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum FileIdentity {
+    #[cfg(unix)]
+    Inode(u64, u64),
+    #[cfg(not(unix))]
+    Canonical(PathBuf),
+}
+
+impl FileIdentity {
+    fn of(path: &Path) -> Result<Self, Error> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(path)?;
+            Ok(Self::Inode(metadata.dev(), metadata.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self::Canonical(path.canonicalize()?))
         }
     }
 }
@@ -688,7 +758,8 @@ mod tests {
         let link = snapshot.join("model.gguf");
         std::os::unix::fs::symlink(blobs.join("sha256-model"), &link).unwrap();
         let stored = super::model_store(&link);
+        let expected = blobs.canonicalize().unwrap();
         std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(stored.unwrap(), blobs.canonicalize().unwrap_or(blobs));
+        assert_eq!(stored.unwrap(), expected);
     }
 }

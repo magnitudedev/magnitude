@@ -259,6 +259,7 @@ impl ProfileCache {
     pub fn inspect(
         &mut self,
         template: &Template,
+        source: &str,
         arguments: &Map<String, Value>,
     ) -> Result<Arc<ReasoningProfile>, String> {
         let context = option_context(arguments)?;
@@ -273,7 +274,7 @@ impl ProfileCache {
             self.hits += 1;
             return Ok(profile);
         }
-        let profile = Arc::new(inspect_reasoning(template, arguments)?);
+        let profile = Arc::new(inspect_reasoning(template, source, arguments)?);
         let charge = serde_json::to_vec(profile.as_ref())
             .map_err(|e| e.to_string())?
             .len();
@@ -297,8 +298,8 @@ fn option_context(arguments: &Map<String, Value>) -> Result<String, String> {
 struct Signature {
     prompt: String,
     prefix: String,
-    parser: String,
-    grammar: String,
+    parser_hash: String,
+    grammar_hash: String,
     thinking: bool,
     start: String,
     ends: Vec<String>,
@@ -373,46 +374,90 @@ fn canonical(value: &Value) -> Value {
         _ => value.clone(),
     }
 }
+fn probe_shape(
+    template: &Template,
+    arguments: &Map<String, Value>,
+    shape: &Request,
+    controls: &Controls,
+) -> Result<Signature, String> {
+    let mut request = shape.clone();
+    request.template_arguments = arguments.clone();
+    request.template_arguments.extend(controls.clone());
+    template
+        .prepare_probe(&request)
+        .map(|probe| Signature {
+            prompt: probe.prompt,
+            prefix: probe.generation_prefix,
+            parser_hash: probe.parser_hash,
+            grammar_hash: probe.grammar_hash,
+            thinking: probe.supports_thinking,
+            start: probe.thinking_start,
+            ends: probe.thinking_ends,
+        })
+        .map_err(|error| error.to_string())
+}
+fn eval_shapes(
+    template: &Template,
+    arguments: &Map<String, Value>,
+    shapes: &[Request],
+    controls: &Controls,
+    first_error: &mut Option<String>,
+) -> Outcomes {
+    let results: Vec<Result<Signature, String>> = if shapes.len() > 1 {
+        seismic_threads::pool::par_for_results::<_, _, std::convert::Infallible, _>(
+            shapes,
+            |shape| Ok(probe_shape(template, arguments, shape, controls)),
+        )
+        .unwrap_or_else(|never| match never {})
+    } else {
+        shapes
+            .iter()
+            .map(|shape| probe_shape(template, arguments, shape, controls))
+            .collect()
+    };
+    results
+        .into_iter()
+        .map(|res| match res {
+            Ok(sig) => Some(sig),
+            Err(error) => {
+                first_error.get_or_insert(error);
+                None
+            }
+        })
+        .collect()
+}
 struct Probe<'a> {
     template: &'a Template,
     arguments: &'a Map<String, Value>,
-    shapes: Vec<Request>,
+    shapes: &'a [Request],
     cache: BTreeMap<String, Outcomes>,
     first_error: Option<String>,
+    pruned: bool,
 }
 impl Probe<'_> {
+    fn cache_key(&self, controls: &Controls) -> String {
+        // The native ABI defaults `enable_thinking` to `true` when omitted, so
+        // `{"enable_thinking": true, ...}` renders identically to `{...}`.
+        if self.pruned && controls.get("enable_thinking") == Some(&Value::Bool(true)) {
+            let mut normalized = controls.clone();
+            normalized.remove("enable_thinking");
+            serde_json::to_string(&normalized).unwrap()
+        } else {
+            serde_json::to_string(controls).unwrap()
+        }
+    }
     fn render(&mut self, controls: &Controls) -> Outcomes {
-        let key = serde_json::to_string(controls).unwrap();
+        let key = self.cache_key(controls);
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
         }
-        let outcomes = self
-            .shapes
-            .iter()
-            .map(|shape| {
-                let mut request = shape.clone();
-                request.template_arguments = self.arguments.clone();
-                request.template_arguments.extend(controls.clone());
-                match self.template.prepare(&request) {
-                    Ok(plan) => {
-                        let d = plan.description();
-                        Some(Signature {
-                            prompt: d.prompt.clone(),
-                            prefix: d.generation_prefix.clone(),
-                            parser: d.parser.clone(),
-                            grammar: d.grammar.clone(),
-                            thinking: d.supports_thinking,
-                            start: d.thinking_start.clone(),
-                            ends: d.thinking_ends.clone(),
-                        })
-                    }
-                    Err(error) => {
-                        self.first_error.get_or_insert_with(|| error.to_string());
-                        None
-                    }
-                }
-            })
-            .collect::<Outcomes>();
+        let outcomes = eval_shapes(
+            self.template,
+            self.arguments,
+            self.shapes,
+            controls,
+            &mut self.first_error,
+        );
         self.cache.insert(key, outcomes.clone());
         outcomes
     }
@@ -474,17 +519,94 @@ fn shapes() -> Vec<Request> {
 /// invoke discovery or insert the informational default into the actual prompt.
 pub fn inspect_reasoning(
     template: &Template,
+    _source: &str,
+    arguments: &Map<String, Value>,
+) -> Result<ReasoningProfile, String> {
+    inspect_reasoning_impl(template, true, arguments)
+}
+
+/// Unpruned discovery without identifier-based skipping, used by parity tests to
+/// verify [`inspect_reasoning`] produces identical profiles.
+#[doc(hidden)]
+pub fn inspect_reasoning_unpruned(
+    template: &Template,
+    arguments: &Map<String, Value>,
+) -> Result<ReasoningProfile, String> {
+    inspect_reasoning_impl(template, false, arguments)
+}
+
+fn inspect_reasoning_impl(
+    template: &Template,
+    pruned: bool,
     arguments: &Map<String, Value>,
 ) -> Result<ReasoningProfile, String> {
     let option_context = option_context(arguments)?;
+    let shapes = shapes();
     let mut probe = Probe {
         template,
         arguments,
-        shapes: shapes(),
+        shapes: &shapes,
         cache: BTreeMap::new(),
         first_error: None,
+        pruned,
     };
-    let baseline = probe.render(&Controls::new());
+    let metadata = template.inspect_metadata().map_err(|e| e.to_string())?;
+    let capabilities = &metadata.capabilities;
+    let reads_var = |name: &str| {
+        metadata
+            .template_reasoning_identifiers
+            .iter()
+            .any(|var| var == name)
+            || metadata
+                .handler_context_variables
+                .iter()
+                .any(|var| var == name)
+    };
+    let toggle_candidates = [
+        ("enable_thinking", json!(false), json!(true)),
+        ("thinking", json!(false), json!(true)),
+        ("thinking_mode", json!("chat"), json!("thinking")),
+        ("thinking_mode", json!("disabled"), json!("enabled")),
+    ];
+    let baseline = if let Some((name, off_val, on_val)) = pruned
+        .then(|| toggle_candidates.iter().find(|(name, _, _)| reads_var(name)))
+        .flatten()
+    {
+        let base_controls = Controls::new();
+        let disabled = control(name, off_val.clone());
+        let enabled = control(name, on_val.clone());
+        let base_key = probe.cache_key(&base_controls);
+        let disabled_key = probe.cache_key(&disabled);
+        let enabled_key = probe.cache_key(&enabled);
+        let mut first_error = None;
+        let (baseline, off, on) = if enabled_key == base_key {
+            let (baseline, off) = seismic_threads::pool::join(
+                || eval_shapes(template, arguments, &shapes, &base_controls, &mut first_error),
+                || eval_shapes(template, arguments, &shapes, &disabled, &mut None),
+            );
+            (baseline, off, None)
+        } else {
+            let (baseline, (off, on)) = seismic_threads::pool::join(
+                || eval_shapes(template, arguments, &shapes, &base_controls, &mut first_error),
+                || {
+                    seismic_threads::pool::join(
+                        || eval_shapes(template, arguments, &shapes, &disabled, &mut None),
+                        || eval_shapes(template, arguments, &shapes, &enabled, &mut None),
+                    )
+                },
+            );
+            (baseline, off, Some(on))
+        };
+        probe.first_error = first_error;
+        probe.cache.insert(base_key, baseline.clone());
+        probe.cache.insert(disabled_key, off);
+        if let Some(on) = on {
+            probe.cache.insert(enabled_key, on);
+        }
+        baseline
+    } else {
+        probe.render(&Controls::new())
+    };
     if !baseline.iter().any(Option::is_some) {
         return Err(format!(
             "reasoning inspection rejected every conversation probe: {}",
@@ -492,21 +614,20 @@ pub fn inspect_reasoning(
         ));
     }
     let mut toggle = None;
-    for (name, off, on) in [
-        ("enable_thinking", json!(false), json!(true)),
-        ("thinking", json!(false), json!(true)),
-        ("thinking_mode", json!("chat"), json!("thinking")),
-        ("thinking_mode", json!("disabled"), json!("enabled")),
-    ] {
+    for (name, off, on) in toggle_candidates {
+        // Skip probing any toggle variable read by neither Jinja identifiers
+        // nor the matched native handler (`handler_context_variables`).
+        if pruned && !reads_var(name) {
+            continue;
+        }
         let disabled = control(name, off);
         let enabled = control(name, on);
         let off = probe.render(&disabled);
+        if !comparable(&baseline, &off) || opens_reasoning(&off) {
+            continue;
+        }
         let on = probe.render(&enabled);
-        if comparable(&baseline, &off)
-            && comparable(&baseline, &on)
-            && off != on
-            && !opens_reasoning(&off)
-        {
+        if comparable(&baseline, &on) && off != on {
             toggle = Some((disabled, enabled, off, on));
             break;
         }
@@ -521,75 +642,125 @@ pub fn inspect_reasoning(
         )
     });
     let adaptive_controls = control("thinking_mode", json!("adaptive"));
-    let adaptive = probe.render(&adaptive_controls);
-    let has_adaptive =
-        has_toggle && comparable(&baseline, &adaptive) && adaptive != off && adaptive != on;
-    let effort_base = probe.render(&enabled);
-    // Unique invalid spellings distinguish arbitrary value echoes from a shared
-    // fallback. These are probe values, not security tokens.
-    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nonce = format!(
-        "{:?}-{}",
-        std::time::SystemTime::now(),
-        NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    let invalid = ["a", "b"].map(|suffix| {
-        let mut c = enabled.clone();
-        c.insert(
-            "reasoning_effort".into(),
-            json!(format!("magnitude-invalid-{nonce}-{suffix}")),
-        );
-        probe.render(&c)
-    });
-    let rejected = effort_base
-        .iter()
-        .zip(&invalid[0])
-        .zip(&invalid[1])
-        .all(|((base, a), b)| base.is_none() || (a.is_none() && b.is_none()));
-    let fallback = comparable(&effort_base, &invalid[0])
-        && comparable(&effort_base, &invalid[1])
-        && invalid[0] == invalid[1];
-    let effort_policy = EffortPolicy { rejected, fallback };
-    let disabled_effort = if rejected || fallback {
-        probe
-            .effort(
-                "none",
-                &["none", "off", "no_think", "disabled"],
-                &enabled,
-                &effort_base,
-                &invalid[0],
-                effort_policy,
-            )?
-            .filter(|(_, outcomes)| !opens_reasoning(outcomes))
+    let (adaptive, has_adaptive) = if has_toggle && (!pruned || reads_var("thinking_mode")) {
+        let adaptive = probe.render(&adaptive_controls);
+        let has_adaptive = comparable(&baseline, &adaptive) && adaptive != off && adaptive != on;
+        (adaptive, has_adaptive)
     } else {
-        None
+        (Vec::new(), false)
     };
-    let mut options: Vec<Observed> = vec![];
-    if rejected || fallback {
-        for (effort, spellings) in EFFORTS {
-            let Some(mut option) = probe.effort(
-                effort,
-                spellings,
-                &enabled,
-                &effort_base,
-                &invalid[0],
-                effort_policy,
-            )?
-            else {
-                continue;
-            };
-            if let Some(index) = options.iter().position(|existing| existing.1 == option.1) {
-                if names(&option.1, &options[index].0.effort) && !names(&option.1, effort) {
-                    options[index].0.aliases.push((*effort).into());
+    let effort_base = probe.render(&enabled);
+    let supports_reasoning_effort = capabilities
+        .get("supports_reasoning_effort")
+        .copied()
+        .unwrap_or(false);
+    let preserve = capabilities
+        .get("supports_preserve_reasoning")
+        .copied()
+        .unwrap_or(false);
+    // If neither Jinja identifiers (including `caps_apply_reasoning_effort`'s
+    // `reasoning_strength` alias) nor the matched native handler reads
+    // `reasoning_effort`, every probe with `reasoning_effort` renders
+    // identically to `effort_base` (`rejected == false`, `fallback == true`).
+    // When `effort_base` also names none of `EFFORTS` or `"none"`, both invalid
+    // probes and every effort probe are provably no-ops yielding
+    // `disabled_effort = None` and `options = []`.
+    let skip_effort_probes = pruned
+        && !reads_var("reasoning_effort")
+        && !reads_var("reasoning_strength")
+        && !supports_reasoning_effort
+        && !EFFORTS
+            .iter()
+            .any(|(effort, _)| names(&effort_base, effort))
+        && !names(&effort_base, "none");
+    let (rejected, fallback, disabled_effort, mut options) = if skip_effort_probes {
+        (false, true, None, vec![])
+    } else {
+        // Unique invalid spellings distinguish arbitrary value echoes from a shared
+        // fallback. These are probe values, not security tokens.
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = format!(
+            "{:?}-{}",
+            std::time::SystemTime::now(),
+            NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let invalid_controls = ["a", "b"].map(|suffix| {
+            let mut c = enabled.clone();
+            c.insert(
+                "reasoning_effort".into(),
+                json!(format!("magnitude-invalid-{nonce}-{suffix}")),
+            );
+            c
+        });
+        let (invalid_a, invalid_b) = seismic_threads::pool::join(
+            || eval_shapes(template, arguments, &shapes, &invalid_controls[0], &mut None),
+            || eval_shapes(template, arguments, &shapes, &invalid_controls[1], &mut None),
+        );
+        let invalid = [invalid_a, invalid_b];
+        let rejected = effort_base
+            .iter()
+            .zip(&invalid[0])
+            .zip(&invalid[1])
+            .all(|((base, a), b)| base.is_none() || (a.is_none() && b.is_none()));
+        let fallback = comparable(&effort_base, &invalid[0])
+            && comparable(&effort_base, &invalid[1])
+            && invalid[0] == invalid[1];
+        let effort_policy = EffortPolicy { rejected, fallback };
+        let probe_efforts = rejected || fallback;
+        // When a toggle already supplies the disabled `"none"` option,
+        // `disabled_effort` is never used.
+        let disabled_effort = if probe_efforts && (!pruned || !has_toggle) {
+            probe
+                .effort(
+                    "none",
+                    &["none", "off", "no_think", "disabled"],
+                    &enabled,
+                    &effort_base,
+                    &invalid[0],
+                    effort_policy,
+                )?
+                .filter(|(_, outcomes)| !opens_reasoning(outcomes))
+        } else {
+            None
+        };
+        let mut options: Vec<Observed> = vec![];
+        if probe_efforts {
+            let probed = seismic_threads::pool::par_for_results(EFFORTS, |&(effort, spellings)| {
+                let mut local = Probe {
+                    template,
+                    arguments,
+                    shapes: &shapes,
+                    cache: BTreeMap::new(),
+                    first_error: None,
+                    pruned,
+                };
+                local.effort(
+                    effort,
+                    spellings,
+                    &enabled,
+                    &effort_base,
+                    &invalid[0],
+                    effort_policy,
+                )
+            })?;
+            for ((effort, _), maybe_option) in EFFORTS.iter().zip(probed) {
+                let Some(mut option) = maybe_option else {
                     continue;
+                };
+                if let Some(index) = options.iter().position(|existing| existing.1 == option.1) {
+                    if names(&option.1, &options[index].0.effort) && !names(&option.1, effort) {
+                        options[index].0.aliases.push((*effort).into());
+                        continue;
+                    }
+                    let existing = options.remove(index);
+                    option.0.aliases = existing.0.aliases;
+                    option.0.aliases.push(existing.0.effort);
                 }
-                let existing = options.remove(index);
-                option.0.aliases = existing.0.aliases;
-                option.0.aliases.push(existing.0.effort);
+                options.push(option);
             }
-            options.push(option);
         }
-    }
+        (rejected, fallback, disabled_effort, options)
+    };
     if options.is_empty() && has_toggle {
         options.push(observed("none", disabled, off));
         if has_adaptive {
@@ -608,12 +779,6 @@ pub fn inspect_reasoning(
     } else if let Some(disabled) = disabled_effort {
         options.insert(0, disabled);
     }
-    let preserve = template
-        .capabilities()
-        .map_err(|e| e.to_string())?
-        .get("supports_preserve_reasoning")
-        .copied()
-        .unwrap_or(false);
     if options.is_empty() {
         let thinking = preserve
             || baseline.iter().chain(&on).flatten().any(|s| {

@@ -5,7 +5,8 @@ answers a second time becomes an instrument, or a case or option of one.
 
 The file runs by its `#!` line (`sh` without one), from the checkout's source root, with
 `MRIG_SRC`, `MRIG_TARGET`, `MRIG_VENV`, `MRIG_RUN` (its run directory, fetched back),
-`MRIG_MODELS`, `MRIG_ROOT` and, with `--model`, `MRIG_ARTIFACTS` (the acquired model's paths).
+`MRIG_MODELS`, `MRIG_ROOT`, with `--model`, `MRIG_ARTIFACTS` (the acquired model's paths), and, with
+`--template NAME`, `MRIG_TEMPLATE` (the template's file, built with `--lanes` lanes, one by default).
 Only executables built from the staged source are left in `MRIG_TARGET`: one a `--prepare`
 did not build and that an earlier source produced is withdrawn before the script runs
 (`host/provenance.py`), so a script finds it missing, never stale.
@@ -15,7 +16,7 @@ import argparse
 import shlex
 from pathlib import Path
 
-from .. import selectors
+from .. import selectors, templates
 from ..engine import Step, Weights
 from . import Answer, Instrument, JobResult, Plan
 
@@ -38,6 +39,9 @@ def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hold", choices=("device", "timed", "build"), default="device",
                         help="what the script needs from the host (default device)")
     parser.add_argument("--model", type=selectors.model, help="catalog model to acquire first")
+    parser.add_argument("--template", type=templates.name,
+                        help="the request the script measures, <fixture>-<responsekind>:<context>")
+    parser.add_argument("--lanes", type=int, default=1, help="lanes of the template file (default 1)")
     parser.add_argument("--prepare", action="append", default=[], type=shlex.split,
                         help="a build command to run first under the build hold (repeatable), "
                              "e.g. 'cargo build --release -p magnitude-harness'")
@@ -47,11 +51,13 @@ def plan(arguments, source, host) -> Plan:
     if not arguments.file.is_file():
         raise SystemExit(f"script: {arguments.file} is not a file")
     builds = tuple(Step("prepare", tuple(argv)) for argv in arguments.prepare)
-    job = Step("script", ("{python}", "-c", RUNNER, "{inputs}/" + arguments.file.name), ENV, checkout=True)
+    template = None if arguments.template is None else templates.file(arguments.template, arguments.lanes)
+    env = ENV if template is None else (*ENV, ("MRIG_TEMPLATE", templates.argument(template)))
+    job = Step("script", ("{python}", "-c", RUNNER, "{inputs}/" + arguments.file.name), env, checkout=True)
     device = None if arguments.hold == "build" else arguments.hold
     acquires = None if arguments.model is None else Weights(arguments.model)
     return Plan(builds=builds, jobs=(("script", job),), device=device, acquires=acquires,
-                files=(arguments.file,))
+                files=(arguments.file, *(() if template is None else (template,))))
 
 
 def answer(arguments, results: dict[str, JobResult]) -> Answer:

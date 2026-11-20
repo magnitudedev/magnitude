@@ -38,7 +38,7 @@ STREAMING_FN void streaming_site_publish(u64 q, STREAMING_DEVICE_READ routes, u6
         if (!streaming_site_choice(sources, sources0, sources1, sources2, c))
             continue;
         const u64 at = u64(c / K) * sources1 + u64(c % K) * sources2;
-        const u64 entry = SEISMIC_CONST_SITE_ENTRIES + SEISMIC_CONST_SITE_ENTRY_WORDS * u64(count);
+        const u64 entry = SEISMIC_CONST_SITE_ENTRY(u64(count));
         streaming_store(STREAMING_AT(slot, (entry + SEISMIC_CONST_SITE_ROW) * slot1), int(c / K));
         streaming_store(STREAMING_AT(slot, (entry + SEISMIC_CONST_SITE_TIER_RECORD) * slot1),
             streaming_device_load(STREAMING_AT(sources, SEISMIC_CONST_SOURCE_SITE * sources0 + at)));

@@ -71,10 +71,14 @@ impl ModelFingerprint {
             .and_then(Value::string)
             .ok_or_else(|| FingerprintError::Missing("general.architecture".into()))?
             .to_owned();
-        let key = |name: &str| format!("{architecture}.{name}");
-        let count = |name: &str| -> Result<Option<u64>, FingerprintError> {
-            let key = key(name);
-            match directory.value(&key) {
+        let mut key_buf = String::with_capacity(architecture.len() + 32);
+        key_buf.push_str(&architecture);
+        key_buf.push('.');
+        let prefix_len = key_buf.len();
+        let mut count = |name: &str| -> Result<Option<u64>, FingerprintError> {
+            key_buf.truncate(prefix_len);
+            key_buf.push_str(name);
+            match directory.value(&key_buf) {
                 None => Ok(None),
                 Some(Value::Array(values)) => values
                     .elements()
@@ -83,7 +87,7 @@ impl ModelFingerprint {
                     .map(|value| {
                         value
                             .unsigned()
-                            .ok_or_else(|| FingerprintError::Invalid(key.clone()))
+                            .ok_or_else(|| FingerprintError::Invalid(key_buf.clone()))
                     })
                     .try_fold(None, |largest: Option<u64>, value| {
                         Ok(Some(largest.unwrap_or(0).max(value?)))
@@ -91,13 +95,8 @@ impl ModelFingerprint {
                 Some(value) => value
                     .unsigned()
                     .map(Some)
-                    .ok_or_else(|| FingerprintError::Invalid(key.clone())),
+                    .ok_or_else(|| FingerprintError::Invalid(key_buf.clone())),
             }
-        };
-        let required = |name: &str| {
-            count(name)?
-                .filter(|value| *value > 0)
-                .ok_or_else(|| FingerprintError::Missing(key(name)))
         };
         let narrow = |name: &str, value: u64| {
             u32::try_from(value).map_err(|_| FingerprintError::Invalid(name.to_owned()))
@@ -105,12 +104,22 @@ impl ModelFingerprint {
         // A file carrying MTP heads counts them as extra blocks; the decoder is the same with or
         // without them, so a conversion that dropped the heads keeps the fingerprint.
         let prediction_layers = count("nextn_predict_layers")?.unwrap_or(0);
-        let block_count = required("block_count")?
+        let block_count = count("block_count")?
+            .filter(|value| *value > 0)
+            .ok_or_else(|| FingerprintError::Missing(format!("{architecture}.block_count")))?
             .checked_sub(prediction_layers)
             .filter(|blocks| *blocks > 0)
-            .ok_or_else(|| FingerprintError::Invalid(key("nextn_predict_layers")))?;
-        let embedding_length = required("embedding_length")?;
-        let head_count = required("attention.head_count")?;
+            .ok_or_else(|| {
+                FingerprintError::Invalid(format!("{architecture}.nextn_predict_layers"))
+            })?;
+        let embedding_length = count("embedding_length")?
+            .filter(|value| *value > 0)
+            .ok_or_else(|| FingerprintError::Missing(format!("{architecture}.embedding_length")))?;
+        let head_count = count("attention.head_count")?
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                FingerprintError::Missing(format!("{architecture}.attention.head_count"))
+            })?;
         let head_count_kv = count("attention.head_count_kv")?
             .filter(|value| *value > 0)
             .unwrap_or(head_count);
@@ -157,11 +166,16 @@ fn tokenizer_digest(directory: &Directory) -> Result<String, FingerprintError> {
     let mut digest = Sha256::new();
     length_prefixed(&mut digest, TOKENIZER_DIGEST_TAG);
     digest.update(payload);
-    Ok(digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hash = digest.finalize();
+    let mut encoded = [0u8; 64];
+    for (i, &byte) in hash.iter().enumerate() {
+        encoded[i * 2] = HEX[(byte >> 4) as usize];
+        encoded[i * 2 + 1] = HEX[(byte & 0x0f) as usize];
+    }
+    Ok(std::str::from_utf8(&encoded)
+        .expect("hex digits are ASCII")
+        .to_owned())
 }
 
 fn length_prefixed(digest: &mut Sha256, bytes: &[u8]) {

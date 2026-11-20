@@ -1,5 +1,5 @@
 use super::{ExpertBank, HeldTable};
-use crate::assessment::{DecodePrice, LiveDecode};
+use magnitude_cost_model::{DecodePrice, LiveDecode};
 use crate::planning::BankTier;
 use crate::domain::{BankHolding, BankResize, BankResized, BankStep, DomainError, ElasticBank, ExpertResidency, ResizeTimes, TableResidency};
 use crate::experts::derived::{BankShape, HoldingTarget};
@@ -224,12 +224,24 @@ impl ElasticBank for ServedBank {
         self.bank.lines()
     }
 
-    fn price(&self, lines: Option<std::sync::Arc<[crate::assessment::ExpertLines]>>, pass: Option<crate::assessment::ExpertPass>) {
-        self.bank.watcher.shared().price(lines, pass);
+    fn price(&self, lines: Option<std::sync::Arc<[magnitude_cost_model::ExpertLines]>>, pass: Option<magnitude_cost_model::ExpertPass>, prices: Option<magnitude_cost_model::LaunchPrices>) {
+        self.bank.watcher.shared().price(lines, pass, prices);
     }
 
     fn value(&self, value: crate::memory::ledger::Value) {
         self.bank.cache.value(value);
+    }
+
+    fn decided(&self, step: crate::experts::Step, request: crate::operation::RequestId, verdict: &crate::AheadVerdict) {
+        self.bank.watcher.shared().decided(step, request, verdict);
+    }
+
+    fn discarded(&self, step: crate::experts::Step, request: crate::operation::RequestId) {
+        self.bank.watcher.shared().discarded(step, request);
+    }
+
+    fn closed(&self, request: crate::operation::RequestId) {
+        self.bank.watcher.shared().closed(request);
     }
 
     fn stop_growths(&self) {
@@ -258,7 +270,7 @@ impl ElasticBank for ServedBank {
         Ok(())
     }
 
-    fn device_convert(&self, lines: &[crate::assessment::RecordLine]) {
+    fn device_convert(&self, lines: &[magnitude_cost_model::RecordLine]) {
         self.bank.device_convert(lines);
     }
 
@@ -389,9 +401,17 @@ impl ElasticBank for ServedBank {
         self.bank.watcher.shared().live()
     }
 
-    fn streamed_layers(&self, lines: Arc<[crate::assessment::ExpertLines]>) -> crate::assessment::StreamedLayers {
+    fn measured(&self) -> Option<crate::experts::Measured> {
+        self.bank.watcher.shared().measured()
+    }
+
+    fn bank_epoch(&self) -> u64 {
+        self.bank.watcher.shared().bank_epoch()
+    }
+
+    fn streamed_layers(&self, lines: Arc<[magnitude_cost_model::ExpertLines]>) -> magnitude_cost_model::StreamedLayers {
         let plan = &self.bank.plan;
-        crate::assessment::StreamedLayers::new(plan.layers().iter().map(|layer| layer.experts).collect(), plan.selected(), lines)
+        magnitude_cost_model::StreamedLayers::new(plan.layers().iter().map(|layer| layer.experts).collect(), plan.selected(), lines)
     }
 
     fn grow(&self, ledgers: &DeviceLedgers, holding: BankHolding, to: u64, wake: CompletionWake) -> Result<BankStep, DomainError> {
@@ -458,6 +478,10 @@ impl ElasticBank for ServedBank {
 
     fn in_gap(&self) -> bool {
         self.bank.watcher.shared().in_gap()
+    }
+
+    fn wants_gap(&self) -> bool {
+        self.bank.watcher.shared().policy_staged()
     }
 
     fn cover(&self) -> crate::ExpertCover {

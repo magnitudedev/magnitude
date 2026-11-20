@@ -11,7 +11,7 @@ use magnitude_artifacts::{
     gguf::{Encoding, TensorDescriptor},
 };
 use magnitude_family_contracts::{
-    ActivationDType, BlockElement, BlockScale, HeadComponent, ImportTransform, ModelDefinition,
+    ActivationDType, BlockElement, BlockScale, HeadComponent, HeadHistory, ImportTransform, ModelDefinition,
     ProgressiveCodeDepth, ProgressivePlane, RowRounding, ScaleCodes, ScaledActivations, VisionDescription,
     WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
@@ -20,7 +20,116 @@ use crate::operators::{code, scalar};
 use crate::programs::graph::GraphError;
 use crate::programs::graph::facts::{Numbers, constant};
 use seismic::{Argument, BackendName, DType, Dim, Element, GgufScales, Grid, Layout, MetalPacking, OperandRecipe};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
+
+#[derive(Clone, Copy, Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    const K: u64 = 0x517cc1b727220a95;
+
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(Self::K);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let mut h = self.hash;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51afd7ed558ccd);
+        h ^= h >> 33;
+        h
+    }
+
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        while bytes.len() >= 8 {
+            let word = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+            self.mix(word);
+            bytes = &bytes[8..];
+        }
+        if bytes.len() >= 4 {
+            let word = u32::from_ne_bytes(bytes[..4].try_into().unwrap());
+            self.mix(u64::from(word));
+            bytes = &bytes[4..];
+        }
+        if bytes.len() >= 2 {
+            let word = u16::from_ne_bytes(bytes[..2].try_into().unwrap());
+            self.mix(u64::from(word));
+            bytes = &bytes[2..];
+        }
+        if let Some(&byte) = bytes.first() {
+            self.mix(u64::from(byte));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.mix(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.mix(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.mix(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.mix(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.mix(i as u64);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FxBuildHasher;
+
+impl BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher::default()
+    }
+}
+
+type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
+type FxHashSet<T> = HashSet<T, FxBuildHasher>;
+
+#[inline]
+fn fx_map<K, V>() -> FxHashMap<K, V> {
+    HashMap::with_hasher(FxBuildHasher)
+}
+
+#[inline]
+fn fx_map_with_capacity<K, V>(capacity: usize) -> FxHashMap<K, V> {
+    HashMap::with_capacity_and_hasher(capacity, FxBuildHasher)
+}
+
+#[inline]
+fn fx_set<T>() -> FxHashSet<T> {
+    HashSet::with_hasher(FxBuildHasher)
+}
+
+#[inline]
+fn fx_set_with_capacity<T>(capacity: usize) -> FxHashSet<T> {
+    HashSet::with_capacity_and_hasher(capacity, FxBuildHasher)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WeightPlan {
@@ -109,6 +218,10 @@ pub struct StreamedRows {
 pub struct TableFlights {
     pub flights: super::FlightDepth,
     pub lanes: usize,
+    /// Whether the load fronts (`ModelLoadPlan::fronts`): its closing prompt
+    /// chunk runs its front head launch beside its drafter entry, one
+    /// launch beyond the lanes' own.
+    pub fronts: bool,
 }
 
 impl TableFlights {
@@ -121,7 +234,7 @@ impl TableFlights {
     /// The stagings a held class of `places` places has in flight
     /// ([`super::FlightDepth::capacity`]).
     pub fn stagings(self, places: usize) -> usize {
-        self.flights.capacity(places, self.lanes, Self::BRINGS)
+        self.flights.capacity(places, self.lanes, Self::BRINGS) + usize::from(self.fronts) * Self::BRINGS
     }
 }
 
@@ -1644,12 +1757,23 @@ impl HostPeak {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeightSlot {
+    Target(usize),
+    Head(usize),
+    Vision(usize),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelLoadPlan {
     /// Width of raw F32 residual conditioning requested by the selected head.
     pub(super) residual_conditioning: Option<u64>,
     pub(super) target: Vec<WeightPlan>,
     pub(super) head: Option<Vec<WeightPlan>>,
+    /// Whether the selected drafter is a draft head that keeps its own
+    /// history (`HeadHistory::Own`): an embedded head a front pass's chain
+    /// runs on (`Self::fronts`).
+    pub(super) own_history_head: bool,
     pub(super) vision: Option<Vec<WeightPlan>>,
     /// The target's host-resident gathered tables.
     pub(super) host_tables: Vec<HostTablePlan>,
@@ -1671,6 +1795,15 @@ pub struct ModelLoadPlan {
     /// (`WeightPlan::record_table_entries`); none of a load no native
     /// entry imports.
     pub(super) record_ports: Option<seismic::BackendName>,
+    /// Whether the load traces its routes: any expert bank it streams
+    /// through records them (`ExpertBankPlan::recording`), whatever bank a
+    /// plan builds of it.
+    pub(super) recorded_routes: bool,
+    /// O(1) role lookup over `target`, `head`, and `vision` in `weights()`
+    /// order; rebuilt whenever those vectors change shape or roles.
+    role_index: FxHashMap<WeightRole, WeightSlot>,
+    /// O(1) lookup from `WeightRole` to index in `bank.tables`.
+    bank_table_index: FxHashMap<WeightRole, usize>,
 }
 
 /// Whether a readout scope's weights are planned with the head component's.
@@ -1709,9 +1842,13 @@ impl ModelLoadPlan {
     /// cache. None of a load that holds every table whole.
     pub fn unheld_table_bytes(&self) -> Result<u64, String> {
         let overflow = || "unheld table bytes overflow".to_owned();
-        let streamed = weight_storages(self)?
-            .into_iter()
-            .try_fold(0u64, |total, (_, weight)| total.checked_add(weight.unheld_bytes()?).ok_or_else(overflow))?;
+        let mut streamed = 0u64;
+        visit_weight_storages(self, |_, weight| {
+            streamed = streamed
+                .checked_add(weight.unheld_bytes()?)
+                .ok_or_else(overflow)?;
+            Ok(())
+        })?;
         self.host_tables.iter().try_fold(streamed, |total, table| {
             let rows = table.shape[0];
             representation_bytes(table.source, &[1, table.columns()])?
@@ -1734,8 +1871,10 @@ impl ModelLoadPlan {
 
     /// The plan of the load's components other than its target, which hold
     /// no routed experts: without the expert bank.
-    pub fn without_expert_bank(self) -> Self {
-        Self { bank: None, ..self }
+    pub fn without_expert_bank(mut self) -> Self {
+        self.bank = None;
+        self.bank_table_index.clear();
+        self
     }
 
     /// The launches one merged-expert prompt pass of the load covers: its
@@ -1750,10 +1889,20 @@ impl ModelLoadPlan {
     /// tier's slots. The tier's landing reserve (the tier at no slots) is
     /// staging, as the import's is, and counts none.
     pub fn weight_bytes(&self) -> Result<u64, String> {
-        self.weight_owners()?
+        let total = |demand: ClaimDemand| {
+            demand
+                .device
+                .checked_add(demand.upload)?
+                .checked_add(demand.shared)
+        };
+        let overflow = || "resident weight byte count overflow".to_owned();
+        let [target, head, vision] = self.weight_demands()?;
+        [target, head, vision]
             .into_iter()
-            .try_fold(0u64, |total, (_, bytes)| total.checked_add(bytes))
-            .ok_or_else(|| "resident weight byte count overflow".to_owned())
+            .try_fold(self.host_tier_bytes()?, |acc, demand| {
+                acc.checked_add(total(demand)?)
+            })
+            .ok_or_else(overflow)
     }
 
     /// The model's weights as its files store them, by where the load holds
@@ -1762,17 +1911,26 @@ impl ModelLoadPlan {
         let overflow = || "weight placement bytes overflow".to_owned();
         // Each stored tensor once, however many roles or representations
         // the load gives it (a tied embedding is a table and a head).
-        let mut counted = HashSet::new();
+        let capacity = self.target.len()
+            + self.head.as_ref().map_or(0, Vec::len)
+            + self.vision.as_ref().map_or(0, Vec::len)
+            + self.host_tables.len();
+        let mut counted = fx_set_with_capacity::<(ArtifactComponent, &str)>(capacity);
         let mut stored = 0u64;
         let weights = [self.target.as_slice(), self.head.as_deref().unwrap_or_default(), self.vision.as_deref().unwrap_or_default()];
         for weight in weights.into_iter().flatten() {
-            if counted.insert((weight.component, weight.descriptor.name.clone())) {
-                stored = stored.checked_add(representation_bytes(weight.source, &weight.stored_shape())?).ok_or_else(overflow)?;
+            if counted.insert((weight.component, weight.descriptor.name.as_str())) {
+                let bytes = match weight.holding {
+                    Holding::Whole => representation_bytes(weight.source, &weight.shape)?,
+                    Holding::Streamed(streamed) => representation_bytes(weight.source, &[streamed.table_rows, weight.table_width()])?,
+                    Holding::Banked { .. } => representation_bytes(weight.source, &weight.descriptor.shape)?,
+                };
+                stored = stored.checked_add(bytes).ok_or_else(overflow)?;
             }
         }
         let host = self.bank.as_ref().map_or(Ok(0), super::ExpertBankPlan::host_only_bytes)?;
         for table in &self.host_tables {
-            if counted.insert((table.component, table.descriptor.name.clone())) {
+            if counted.insert((table.component, table.descriptor.name.as_str())) {
                 let rows = table.shape[0];
                 stored = representation_bytes(table.source, &[rows, table.columns()])?.checked_add(stored).ok_or_else(overflow)?;
             }
@@ -1910,12 +2068,39 @@ pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3]
     Ok([bytes(target)?, bytes(head)?, bytes(vision)?])
 }
 
-/// Each weight of `load` whose storage it holds, once (tied roles share one
-/// storage, `WeightPlan::storage_identity`), with its component's index
+/// Visit each weight of `load` whose storage it holds, once (tied roles share
+/// one storage, `WeightPlan::storage_identity`), with its component's index
 /// (target, head, vision), in the order the load imports them.
-fn weight_storages(load: &ModelLoadPlan) -> Result<Vec<(usize, &WeightPlan)>, String> {
-    let mut seen = HashMap::new();
-    let mut stored = Vec::new();
+fn visit_weight_storages(
+    load: &ModelLoadPlan,
+    mut visit: impl FnMut(usize, &WeightPlan) -> Result<(), String>,
+) -> Result<(), String> {
+    let capacity = load.target.len()
+        + load.head.as_ref().map_or(0, Vec::len)
+        + load.vision.as_ref().map_or(0, Vec::len);
+    // Map each distinct `ArtifactComponent` (at most 3 in a load) to a small
+    // integer so `seen` does not hash or store 32-byte identities per weight.
+    let mut fixed_components: [Option<ArtifactComponent>; 4] = [None; 4];
+    let mut extra_components: Vec<ArtifactComponent> = Vec::new();
+    let mut component_id = |component: ArtifactComponent| -> u32 {
+        for (i, slot) in fixed_components.iter_mut().enumerate() {
+            match *slot {
+                Some(existing) if existing == component => return i as u32,
+                None => {
+                    *slot = Some(component);
+                    return i as u32;
+                }
+                _ => {}
+            }
+        }
+        if let Some(pos) = extra_components.iter().position(|&c| c == component) {
+            return (4 + pos) as u32;
+        }
+        extra_components.push(component);
+        (4 + extra_components.len() - 1) as u32
+    };
+    let mut seen: FxHashMap<(u32, &str, &[ImportTransform], Element), &WeightPlan> =
+        fx_map_with_capacity(capacity);
     for (index, weights) in [
         load.target.as_slice(),
         load.head.as_deref().unwrap_or_default(),
@@ -1925,35 +2110,42 @@ fn weight_storages(load: &ModelLoadPlan) -> Result<Vec<(usize, &WeightPlan)>, St
     .enumerate()
     {
         for weight in weights {
-            let storage = (
-                weight.upload,
-                weight.shape.clone(),
-                weight.source_bytes,
-                weight.resident_bytes,
-                weight.scale.clone(),
+            let key = (
+                component_id(weight.component),
+                weight.descriptor.name.as_str(),
+                weight.descriptor.transforms.as_slice(),
+                weight.resident,
             );
-            match seen.entry(weight.storage_identity()) {
+            match seen.entry(key) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(storage);
-                    stored.push((index, weight));
+                    entry.insert(weight);
+                    visit(index, weight)?;
                 }
-                std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &storage => {
-                    return Err("tied weight roles disagree on their physical storage".into());
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let prev = *entry.get();
+                    if prev.upload != weight.upload
+                        || prev.shape != weight.shape
+                        || prev.source_bytes != weight.source_bytes
+                        || prev.resident_bytes != weight.resident_bytes
+                        || prev.scale != weight.scale
+                    {
+                        return Err("tied weight roles disagree on their physical storage".into());
+                    }
                 }
-                std::collections::hash_map::Entry::Occupied(_) => {}
             }
         }
     }
-    Ok(stored)
+    Ok(())
 }
 
 fn weight_demands_by_component(load: &ModelLoadPlan) -> Result<[ClaimDemand; 3], String> {
     let mut demands = [ClaimDemand::default(); 3];
-    for (index, weight) in weight_storages(load)? {
+    visit_weight_storages(load, |index, weight| {
         demands[index] = demands[index]
             .checked_plus(load.weight_storage_demand(weight)?)
             .ok_or("resident weight byte count overflow")?;
-    }
+        Ok(())
+    })?;
     // The bank's committed records are charged by its banked weights; what
     // it is charged beyond them is the target's weights' too (a cap bounds
     // every weight byte the plan holds).
@@ -1978,6 +2170,85 @@ impl ModelLoadPlan {
         self.vision.as_deref()
     }
 
+    pub(super) fn rebuild_role_index(&mut self) {
+        let capacity = self.target.len()
+            + self.head.as_ref().map_or(0, Vec::len)
+            + self.vision.as_ref().map_or(0, Vec::len);
+        let mut index = fx_map_with_capacity(capacity);
+        for (i, weight) in self.target.iter().enumerate() {
+            index.entry(weight.role).or_insert(WeightSlot::Target(i));
+        }
+        if let Some(head) = &self.head {
+            for (i, weight) in head.iter().enumerate() {
+                index.entry(weight.role).or_insert(WeightSlot::Head(i));
+            }
+        }
+        if let Some(vision) = &self.vision {
+            for (i, weight) in vision.iter().enumerate() {
+                index.entry(weight.role).or_insert(WeightSlot::Vision(i));
+            }
+        }
+        self.role_index = index;
+    }
+
+    pub(super) fn rebuild_bank_table_index(&mut self) {
+        self.bank_table_index.clear();
+        if let Some(bank) = &self.bank {
+            self.bank_table_index.reserve(bank.tables.len());
+            for (i, table) in bank.tables.iter().enumerate() {
+                self.bank_table_index.entry(table.role).or_insert(i);
+            }
+        }
+    }
+
+    /// The placed weight of `role`, matching the first-match order of
+    /// [`Self::weights`].
+    pub fn weight_by_role(&self, role: WeightRole) -> Option<&WeightPlan> {
+        match *self.role_index.get(&role)? {
+            WeightSlot::Target(index) => self.target.get(index),
+            WeightSlot::Head(index) => self.head.as_deref()?.get(index),
+            WeightSlot::Vision(index) => self.vision.as_deref()?.get(index),
+        }
+    }
+
+    /// The placed target weight of `role`.
+    pub(super) fn target_weight(&self, role: WeightRole) -> Option<&WeightPlan> {
+        match *self.role_index.get(&role)? {
+            WeightSlot::Target(index) => self.target.get(index),
+            WeightSlot::Head(_) | WeightSlot::Vision(_) => None,
+        }
+    }
+
+    /// Mutable access to the placed target weight of `role`.
+    pub(super) fn target_weight_mut(&mut self, role: WeightRole) -> Option<&mut WeightPlan> {
+        match *self.role_index.get(&role)? {
+            WeightSlot::Target(index) => self.target.get_mut(index),
+            WeightSlot::Head(_) | WeightSlot::Vision(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_vision(vision: Vec<WeightPlan>) -> Self {
+        let mut load = Self {
+            residual_conditioning: None,
+            target: Vec::new(),
+            head: None,
+            own_history_head: false,
+            vision: Some(vision),
+            host_tables: Vec::new(),
+            readout_candidates: Vec::new(),
+            readout_choices: Vec::new(),
+            unplaced_output: Vec::new(),
+            bank: None,
+            record_ports: None,
+            recorded_routes: false,
+            role_index: fx_map(),
+            bank_table_index: fx_map(),
+        };
+        load.rebuild_role_index();
+        load
+    }
+
     /// The separate draft's fusion, where the target's features are its
     /// fused taps (the fusion planned with the target, and no residual
     /// conditioning): publishing them costs a step the fusion and the
@@ -1985,7 +2256,7 @@ impl ModelLoadPlan {
     /// output row.
     pub(crate) fn draft_fusion(&self) -> Option<&WeightPlan> {
         let role = WeightRole { scope: WeightScope::Draft, kind: WeightKind::DraftFusion };
-        self.residual_conditioning.is_none().then(|| self.target.iter().find(|weight| weight.role == role)).flatten()
+        self.residual_conditioning.is_none().then(|| self.target_weight(role)).flatten()
     }
 
     /// Resolve the ordered checked-entry topology from the same weight facts
@@ -1996,27 +2267,46 @@ impl ModelLoadPlan {
         history: KvCodec,
     ) -> Result<ProgramPlan, PlanError> {
         // Bindings name an output projection whether or not it is placed.
-        let planned = |placed: &[WeightPlan], head: bool| {
-            placed
-                .iter()
-                .chain(
-                    self.unplaced_output
-                        .iter()
-                        .filter(|weight| head_component_scope(weight.role.scope) == Ok(head)),
-                )
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        let target = planned(&self.target, false);
-        let head = self.head.as_deref().map(|head| planned(head, true));
+        // Avoid cloning the entire weight list when `unplaced_output` adds no
+        // matching entries (always true before `finalize_readout`).
+        fn combine_planned<'a>(
+            placed: &'a [WeightPlan],
+            unplaced: &[WeightPlan],
+            head: bool,
+        ) -> std::borrow::Cow<'a, [WeightPlan]> {
+            if unplaced.is_empty()
+                || !unplaced
+                    .iter()
+                    .any(|weight| head_component_scope(weight.role.scope) == Ok(head))
+            {
+                return std::borrow::Cow::Borrowed(placed);
+            }
+            let mut combined = Vec::with_capacity(placed.len() + unplaced.len());
+            combined.extend_from_slice(placed);
+            combined.extend(
+                unplaced
+                    .iter()
+                    .filter(|weight| head_component_scope(weight.role.scope) == Ok(head))
+                    .cloned(),
+            );
+            std::borrow::Cow::Owned(combined)
+        }
+        let target = combine_planned(&self.target, &self.unplaced_output, false);
+        let head = self
+            .head
+            .as_deref()
+            .map(|head| combine_planned(head, &self.unplaced_output, true));
+        let vision = self.vision.as_deref();
+        let _guard = ProgramPlanLookupGuard::enter(self, &target, head.as_deref(), vision);
         super::programs::derive_program_plan(
             definition,
             &target,
             head.as_deref(),
-            self.vision.as_deref(),
+            vision,
             &self.host_tables,
             &self.readout_choices,
             self.bank.as_ref(),
+            self.copies_token_rows(),
             history,
         )
     }
@@ -2111,7 +2401,7 @@ impl ModelLoadPlan {
         // target's, and a drafter head's, whose embedding may be the
         // target's.
         let reads = TableReads {
-            flights: TableFlights { flights: limits.flights(), lanes: 1 + usize::from(selection.head) },
+            flights: TableFlights { flights: limits.flights(), lanes: 1 + usize::from(selection.head), fronts: false },
             selected_rows: selected_read_rows(definition, method, limits)?,
         };
         let target_component = ArtifactComponent {
@@ -2146,6 +2436,7 @@ impl ModelLoadPlan {
         // most its launch's row class of its rows.
         let step_rows = magnitude_batching::row_class(limits.max_launch_rows)
             .ok_or("the launch rows have no row class")? as u64;
+        let target_index = TensorIndex::new(target_tensors);
         let host_tables = decoder
             .entry
             .per_layer
@@ -2153,7 +2444,7 @@ impl ModelLoadPlan {
             .map(|entry| (target_role(WeightKind::PerLayerTable), &entry.table))
             .map(|(role, descriptor)| {
                 host_table(
-                    target_tensors,
+                    &target_index,
                     target_component,
                     role,
                     descriptor,
@@ -2162,16 +2453,23 @@ impl ModelLoadPlan {
                 )
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let decoder_weights = operators::decoder_weights(decoder);
+        let exit_weights = operators::exit_weights(decoder);
+        let mut target_weights = Vec::with_capacity(
+            2 + decoder.entry.per_layer.as_ref().map_or(0, |_| 2)
+                + decoder_weights.len()
+                + exit_weights.len(),
+        );
+        target_weights.push((target_role(WeightKind::Embedding), &decoder.entry.embedding));
+        target_weights.extend(per_layer_weights);
+        target_weights.extend(decoder_weights);
+        target_weights.extend(exit_weights);
+        target_weights.push((target_role(WeightKind::Output), &decoder.exit.output));
         push_weights(
             &mut target,
-            target_tensors,
+            &target_index,
             target_component,
-            std::iter::once((target_role(WeightKind::Embedding), &decoder.entry.embedding))
-                .chain(per_layer_weights)
-                .chain(operators::decoder_weights(decoder))
-                .chain(operators::exit_weights(decoder))
-                .chain([(target_role(WeightKind::Output), &decoder.exit.output)])
-                .collect(),
+            target_weights,
             target_form,
             reads,
         )?;
@@ -2200,7 +2498,7 @@ impl ModelLoadPlan {
             return Err("vision execution was selected without a vision definition".into());
         }
         let push_all = |plans: &mut Vec<WeightPlan>,
-                        tensors: &[TensorDescriptor],
+                        tensors: &TensorIndex<'_>,
                         component: ArtifactComponent,
                         weights: Vec<(WeightRole, &WeightDescriptor)>| {
             push_weights(plans, tensors, component, weights, target_form, reads)
@@ -2208,15 +2506,19 @@ impl ModelLoadPlan {
         let head = match (selection.head, &definition.head, &definition.draft, draft) {
             (false, ..) => None,
             (true, Some(head), None, draft) => {
+                let draft_index;
                 let (tensors, component) = match (head.component, draft) {
-                    (HeadComponent::Target, _) => (target_tensors, target_component),
-                    (HeadComponent::Draft, Some((identity, tensors))) => (
-                        tensors,
-                        ArtifactComponent {
-                            kind: ArtifactComponentKind::Draft,
-                            identity,
-                        },
-                    ),
+                    (HeadComponent::Target, _) => (&target_index, target_component),
+                    (HeadComponent::Draft, Some((identity, tensors))) => {
+                        draft_index = TensorIndex::new(tensors);
+                        (
+                            &draft_index,
+                            ArtifactComponent {
+                                kind: ArtifactComponentKind::Draft,
+                                identity,
+                            },
+                        )
+                    }
                     (HeadComponent::Draft, None) => {
                         return Err("the selected drafter has no component".into());
                     }
@@ -2235,18 +2537,19 @@ impl ModelLoadPlan {
                     kind: ArtifactComponentKind::Draft,
                     identity,
                 };
+                let draft_index = TensorIndex::new(tensors);
                 // The fusion is read by every target step, so it is resident
                 // with the target; the drafter's own weights load with it.
                 push_all(
                     &mut target,
-                    tensors,
+                    &draft_index,
                     component,
                     operators::draft::fusion_weights(separate).to_vec(),
                 )?;
                 let mut plans = Vec::new();
                 push_all(
                     &mut plans,
-                    tensors,
+                    &draft_index,
                     component,
                     operators::draft::draft_weights(separate).map_err(|error| error.to_string())?,
                 )?;
@@ -2269,14 +2572,70 @@ impl ModelLoadPlan {
                 plan_vision(projector_tensors, component, vision, layout)
             })
             .transpose()?;
-        validate_unique_roles(
-            target
-                .iter()
-                .chain(head.as_deref().unwrap_or_default())
-                .chain(vision.as_deref().unwrap_or_default()),
-        )?;
+        let capacity = target.len()
+            + head.as_ref().map_or(0, Vec::len)
+            + vision.as_ref().map_or(0, Vec::len);
+        let mut role_index = fx_map_with_capacity(capacity);
+        let dup_err = |plan: &WeightPlan| {
+            format!(
+                "load plan contains duplicate semantic role {:?}/{:?}",
+                plan.component, plan.role
+            )
+        };
+        for (i, plan) in target.iter().enumerate() {
+            match role_index.entry(plan.role) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(WeightSlot::Target(i));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    if target[..i]
+                        .iter()
+                        .any(|prev| prev.component == plan.component && prev.role == plan.role)
+                    {
+                        return Err(dup_err(plan));
+                    }
+                }
+            }
+        }
+        if let Some(head) = &head {
+            for (i, plan) in head.iter().enumerate() {
+                match role_index.entry(plan.role) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(WeightSlot::Head(i));
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        if target
+                            .iter()
+                            .chain(&head[..i])
+                            .any(|prev| prev.component == plan.component && prev.role == plan.role)
+                        {
+                            return Err(dup_err(plan));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(vision) = &vision {
+            for (i, plan) in vision.iter().enumerate() {
+                match role_index.entry(plan.role) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(WeightSlot::Vision(i));
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        if target
+                            .iter()
+                            .chain(head.as_deref().unwrap_or_default())
+                            .chain(&vision[..i])
+                            .any(|prev| prev.component == plan.component && prev.role == plan.role)
+                        {
+                            return Err(dup_err(plan));
+                        }
+                    }
+                }
+            }
+        }
 
-        Ok(Self {
+        let load = Self {
             residual_conditioning: definition
                 .head
                 .as_ref()
@@ -2284,6 +2643,8 @@ impl ModelLoadPlan {
                 .map(|head| head.conditioning_width(&definition.decoder)),
             target,
             head,
+            own_history_head: selection.head
+                && definition.head.as_ref().is_some_and(|head| head.history == HeadHistory::Own),
             vision,
             host_tables,
             readout_candidates: Vec::new(),
@@ -2291,7 +2652,11 @@ impl ModelLoadPlan {
             unplaced_output: Vec::new(),
             bank: None,
             record_ports: None,
-        })
+            recorded_routes: false,
+            role_index,
+            bank_table_index: fx_map(),
+        };
+        Ok(load)
     }
 
     /// The load as `backend`'s native import entries import it: through
@@ -2318,7 +2683,7 @@ impl ModelLoadPlan {
     fn weight_storage_demand(&self, weight: &WeightPlan) -> Result<ClaimDemand, String> {
         let bytes = weight.storage_bytes()?;
         let device = self
-            .weight_device_allocations(weight)?
+            .weight_device_allocation_sizes(weight)?
             .into_iter()
             .try_fold(0u64, u64::checked_add)
             .ok_or("device weight storage overflows")?;
@@ -2352,7 +2717,10 @@ impl ModelLoadPlan {
     /// The bank's own table of `weight`, a table whose slots the host fills
     /// (`WeightPlan::stored_in_slots`), where the bank holds it.
     fn bank_table(&self, weight: &WeightPlan) -> Option<&super::bank::BankTable> {
-        self.bank.as_ref().and_then(|bank| bank.tables.iter().find(|table| table.role == weight.role))
+        let bank = self.bank.as_ref()?;
+        self.bank_table_index
+            .get(&weight.role)
+            .and_then(|&index| bank.tables.get(index))
     }
 
     /// The device storage `weight`, one of this load's, allocates from the
@@ -2367,25 +2735,32 @@ impl ModelLoadPlan {
     /// table's slots and every table's directory, landing staging and
     /// notice in host-shared storage, outside these. Their sum is the
     /// weight's device demand.
-    pub fn weight_device_allocations(&self, weight: &WeightPlan) -> Result<Vec<u64>, String> {
+    fn weight_device_allocation_sizes(&self, weight: &WeightPlan) -> Result<[u64; 5], String> {
         let tables = match self.record_ports {
             Some(_) => seismic::record_table_bytes(weight.record_table_entries()?)
                 .ok_or_else(|| "record table byte count overflows".to_owned())?,
             None => 0,
         };
-        let allocations = if weight.stored_in_slots() {
+        if weight.stored_in_slots() {
             // The bank's own table replaces the ordinary record table.
-            vec![if self.bank_table(weight).is_some() { 0 } else { tables }]
+            Ok([if self.bank_table(weight).is_some() { 0 } else { tables }, 0, 0, 0, 0])
         } else {
-            vec![
+            Ok([
                 if weight.banked().is_some() { 0 } else { weight.resident_bytes },
                 weight.bound.checked_mul(4).ok_or("packing bound byte count overflows")?,
                 weight.scale.as_ref().map_or(0, |scale| scale.resident_bytes),
                 tables,
                 weight.streamed_bytes()?[1],
-            ]
-        };
-        Ok(allocations.into_iter().filter(|bytes| *bytes > 0).collect())
+            ])
+        }
+    }
+
+    pub fn weight_device_allocations(&self, weight: &WeightPlan) -> Result<Vec<u64>, String> {
+        Ok(self
+            .weight_device_allocation_sizes(weight)?
+            .into_iter()
+            .filter(|bytes| *bytes > 0)
+            .collect())
     }
 
     /// Every device allocation of the load's weights
@@ -2393,10 +2768,18 @@ impl ModelLoadPlan {
     /// them, each storage once: what a replay of the device's block
     /// allocator places.
     pub fn device_allocations(&self) -> Result<Vec<u64>, String> {
-        let mut allocations = Vec::new();
-        for (_, weight) in weight_storages(self)? {
-            allocations.extend(self.weight_device_allocations(weight)?);
-        }
+        let capacity = self.target.len()
+            + self.head.as_ref().map_or(0, Vec::len)
+            + self.vision.as_ref().map_or(0, Vec::len);
+        let mut allocations = Vec::with_capacity(capacity * 2);
+        visit_weight_storages(self, |_, weight| {
+            for bytes in self.weight_device_allocation_sizes(weight)? {
+                if bytes > 0 {
+                    allocations.push(bytes);
+                }
+            }
+            Ok(())
+        })?;
         Ok(allocations)
     }
 
@@ -2410,7 +2793,7 @@ impl ModelLoadPlan {
     /// does. A view becomes resident, in place of the packed projection, only
     /// after whole-recipe class-cost qualification.
     pub fn with_readout_candidates(mut self, definition: &ModelDefinition) -> Result<Self, String> {
-        let mut indexed = HashSet::new();
+        let mut indexed = fx_set();
         if let Some(head) = &definition.head {
             for (index, block) in head.blocks.iter().enumerate() {
                 if matches!(
@@ -2432,7 +2815,7 @@ impl ModelLoadPlan {
             }
         }
         let select = |weights: &[WeightPlan]| -> Result<Vec<WeightPlan>, String> {
-            let mut views = Vec::with_capacity(weights.len());
+            let mut views = Vec::new();
             for weight in weights {
                 // The views' full pass serves every row the bounded levels
                 // do not. It is measured against the packed projection's
@@ -2446,13 +2829,16 @@ impl ModelLoadPlan {
                     && weight.scale.is_none()
                     && weight.descriptor.transforms.is_empty()
                     && weight.upload == weight.source;
+                if !admitted {
+                    continue;
+                }
                 let placed = crate::import_transforms::progressive_matrix(
                     depth,
                     &weight.shape,
                     weight.source,
                 )
                 .is_some();
-                if !(admitted && placed) {
+                if !placed {
                     continue;
                 }
                 for plane in ProgressivePlane::ALL {
@@ -2502,8 +2888,8 @@ impl ModelLoadPlan {
         if !self.readout_choices.is_empty() && self.readout_choices == choices {
             return Ok(self);
         }
-        let mut scopes = HashSet::new();
-        let mut recipes = HashSet::new();
+        let mut scopes = fx_set();
+        let mut recipes = fx_set();
         for choice in choices {
             if choice.rows.contains(&0) {
                 return Err("a certified readout class needs nonzero selected rows".into());
@@ -2558,6 +2944,7 @@ impl ModelLoadPlan {
             self.unplaced_output.push(placed.remove(index));
         }
         self.readout_choices = choices.to_vec();
+        self.rebuild_role_index();
         Ok(self)
     }
 
@@ -2567,7 +2954,9 @@ impl ModelLoadPlan {
             scope,
             kind: WeightKind::Output,
         };
-        self.planned_weights().find(|weight| weight.role == role)
+        self.weight_by_role(role)
+            .or_else(|| self.unplaced_output.iter().find(|weight| weight.role == role))
+            .or_else(|| self.readout_candidates.iter().find(|weight| weight.role == role))
     }
 
     pub fn readout_choices(&self) -> &[ReadoutClassChoice] {
@@ -2596,12 +2985,61 @@ impl ModelLoadPlan {
             .chain(self.head.iter().flatten())
             .chain(self.vision.iter().flatten())
     }
+
+    /// Whether its steps that read selected tokens notify the host of them
+    /// (`EntryNotice`): it has a stored table, whose filler learns from them
+    /// the rows a step names.
+    pub(crate) fn notifies_selection(&self) -> bool {
+        self.weights().any(WeightPlan::stored_in_slots)
+    }
+
+    /// Whether its steps of host tokens keep them in the bound token rows,
+    /// so a graph past the entry reads the step's token rows as a device
+    /// tensor whatever their source: an n-gram input's, or the chain's
+    /// (`Self::fronts`), whose head launch behind each pass reads the pass's
+    /// token rows (`guess_chain`).
+    pub(crate) fn keeps_token_rows(&self) -> bool {
+        self.weights().any(|weight| weight.role.kind == WeightKind::NGramTable) || self.fronts()
+    }
+
+    /// Whether its decode passes run front rows (two-row decode,
+    /// `crate::TwoRowDecode`): a load whose experts stream (a front row
+    /// names the experts of the pass a guess will be exact in) and whose
+    /// drafter is an embedded head of its own history, whose launch behind
+    /// each pass makes the next pass's chain (`guess_chain`). A host-token
+    /// step's front rows run on the host's guesses, whose kinds its step
+    /// words read (`routed_step`).
+    pub(crate) fn fronts(&self) -> bool {
+        self.bank.is_some() && self.own_history_head
+    }
+
+    /// The plan with each streamed table's stagings counting the front head
+    /// launch where it fronts (`TableFlights::fronts`): what attaching or
+    /// removing the expert bank decides.
+    pub(super) fn with_front_stagings(mut self) -> Self {
+        let fronts = self.fronts();
+        let weights = self.target.iter_mut().chain(self.head.iter_mut().flatten()).chain(self.vision.iter_mut().flatten());
+        for weight in weights {
+            if let Holding::Streamed(StreamedRows { fill: TableFill::Imported(flights), .. }) = &mut weight.holding {
+                flights.fronts = fronts;
+            }
+        }
+        self
+    }
+
+    /// Whether its steps' entries hold the token row copy
+    /// (`selection_notice`): it notifies selections
+    /// ([`Self::notifies_selection`]) or keeps host token rows
+    /// ([`Self::keeps_token_rows`]).
+    pub(crate) fn copies_token_rows(&self) -> bool {
+        self.notifies_selection() || self.keeps_token_rows()
+    }
 }
 
 pub(super) fn validate_unique_roles<'a>(
     plans: impl Iterator<Item = &'a WeightPlan>,
 ) -> Result<(), String> {
-    let mut roles = HashSet::new();
+    let mut roles = fx_set_with_capacity(plans.size_hint().0);
     for plan in plans {
         if !roles.insert((plan.component, plan.role)) {
             return Err(format!(
@@ -2789,26 +3227,41 @@ impl HostTablePlan {
     }
 }
 
+/// Name-indexed view over a component's stored tensors, preserving
+/// first-match lookup semantics.
+struct TensorIndex<'a>(FxHashMap<&'a str, &'a TensorDescriptor>);
+
+impl<'a> TensorIndex<'a> {
+    fn new(tensors: &'a [TensorDescriptor]) -> Self {
+        let mut by_name = fx_map_with_capacity(tensors.len());
+        for tensor in tensors {
+            by_name.entry(tensor.name.as_str()).or_insert(tensor);
+        }
+        Self(by_name)
+    }
+
+    fn get(&self, name: &str) -> Option<&'a TensorDescriptor> {
+        self.0.get(name).copied()
+    }
+}
+
 /// Plan the host table `descriptor` names: a stored `[rows, columns]`
 /// matrix without import transforms, in a source encoding whose rows the
 /// backend layout can convert on the device.
 fn host_table(
-    inventory: &[TensorDescriptor],
+    inventory: &TensorIndex<'_>,
     component: ArtifactComponent,
     role: WeightRole,
     descriptor: &WeightDescriptor,
     form: ResidentForm,
     step_rows: u64,
 ) -> Result<HostTablePlan, String> {
-    let stored = inventory
-        .iter()
-        .find(|tensor| tensor.name == descriptor.name)
-        .ok_or_else(|| {
-            format!(
-                "host table {:?} is absent from its component",
-                descriptor.name
-            )
-        })?;
+    let stored = inventory.get(&descriptor.name).ok_or_else(|| {
+        format!(
+            "host table {:?} is absent from its component",
+            descriptor.name
+        )
+    })?;
     if !descriptor.transforms.is_empty() || stored.shape != descriptor.shape {
         return Err(format!(
             "host table {:?} must be the stored matrix itself",
@@ -2864,12 +3317,13 @@ fn gathered_table(kind: WeightKind) -> bool {
 /// (`push_gathered_table`); a tied output projection reads the whole table.
 fn push_weights(
     out: &mut Vec<WeightPlan>,
-    inventory: &[TensorDescriptor],
+    inventory: &TensorIndex<'_>,
     component: ArtifactComponent,
     weights: Vec<(WeightRole, &WeightDescriptor)>,
     form: ResidentForm,
     reads: TableReads,
 ) -> Result<(), String> {
+    out.reserve(weights.len());
     for (role, descriptor) in &weights {
         if gathered_table(role.kind) {
             let read_whole = weights
@@ -2904,7 +3358,7 @@ fn push_weights(
 #[allow(clippy::too_many_arguments)]
 fn push_gathered_table(
     out: &mut Vec<WeightPlan>,
-    inventory: &[TensorDescriptor],
+    inventory: &TensorIndex<'_>,
     component: ArtifactComponent,
     role: WeightRole,
     descriptor: &WeightDescriptor,
@@ -3027,7 +3481,7 @@ pub const NGRAM_TABLE_STORED_ROWS: u64 = 180 * 16_384;
 /// uploads nothing.
 fn push_stored_table(
     out: &mut Vec<WeightPlan>,
-    inventory: &[TensorDescriptor],
+    inventory: &TensorIndex<'_>,
     component: ArtifactComponent,
     role: WeightRole,
     descriptor: &WeightDescriptor,
@@ -3039,15 +3493,12 @@ fn push_stored_table(
             descriptor.name
         )
     };
-    let stored = inventory
-        .iter()
-        .find(|tensor| tensor.name == descriptor.name)
-        .ok_or_else(|| {
-            format!(
-                "n-gram table {:?} is absent from its component",
-                descriptor.name
-            )
-        })?;
+    let stored = inventory.get(&descriptor.name).ok_or_else(|| {
+        format!(
+            "n-gram table {:?} is absent from its component",
+            descriptor.name
+        )
+    })?;
     let [table_rows, width] = stored.shape[..] else {
         return Err(refused("it is not a matrix"));
     };
@@ -3089,8 +3540,7 @@ fn push_stored_table(
         .into_iter()
         .map(|name| {
             inventory
-                .iter()
-                .find(|tensor| tensor.name == name)
+                .get(name)
                 .map(|tensor| (tensor.name.as_str(), tensor.nbytes))
                 .ok_or_else(|| refused(&format!("its row tensor {name:?} is absent from its component")))
         })
@@ -3137,22 +3587,19 @@ pub(crate) fn stored_row_ranges(tensors: &[(&str, u64)], rows: u64, row_bytes: u
 
 fn push_weight(
     out: &mut Vec<WeightPlan>,
-    inventory: &[TensorDescriptor],
+    inventory: &TensorIndex<'_>,
     component: ArtifactComponent,
     scope: WeightScope,
     kind: WeightKind,
     descriptor: &WeightDescriptor,
     form: ResidentForm,
 ) -> Result<(), String> {
-    let stored = inventory
-        .iter()
-        .find(|tensor| tensor.name == descriptor.name)
-        .ok_or_else(|| {
-            format!(
-                "planned weight {:?} is absent from its component",
-                descriptor.name
-            )
-        })?;
+    let stored = inventory.get(&descriptor.name).ok_or_else(|| {
+        format!(
+            "planned weight {:?} is absent from its component",
+            descriptor.name
+        )
+    })?;
     let width = stored.shape.last().copied().unwrap_or(1);
     let scales = crate::import_transforms::stored_scales(descriptor);
     let source = scaled_source_element(stored.encoding, scales, width).ok_or_else(|| match scales {
@@ -3195,10 +3642,8 @@ fn push_weight(
         (WeightKind::Vision(_), None) => (Element::f32(), Element::dense(form.activation)),
         _ => (
             source,
-            held_storage(
-                stored.encoding,
-                scales,
-                width,
+            resident_storage(
+                source,
                 crate::import_transforms::scaled_activations(descriptor),
                 dense_resident,
                 form.layout,
@@ -3232,8 +3677,7 @@ fn push_weight(
         }
         if let Some(name) = grid {
             let grid = inventory
-                .iter()
-                .find(|stored| stored.name == name)
+                .get(name)
                 .ok_or_else(|| format!("weight {:?}: its scale grid {name:?} is absent from its component", tensor.name))?;
             let planar = representation_bytes(source, &tensor.shape)?;
             if tensor.nbytes.checked_add(grid.nbytes) != Some(planar) {
@@ -3259,8 +3703,7 @@ fn push_weight(
         let mut read = crate::import_transforms::read_part(descriptor, &stored.shape)?;
         for part in appended {
             let tensor = inventory
-                .iter()
-                .find(|tensor| tensor.name == part.tensor)
+                .get(&part.tensor)
                 .ok_or_else(|| format!("part {:?} of {:?} is absent from its component", part.tensor, descriptor.name))?;
             read[0] = part.rows;
             let part_read = crate::import_transforms::read_part(descriptor, &tensor.shape);
@@ -3273,7 +3716,12 @@ fn push_weight(
             stores(tensor, part.grid.as_deref())?;
         }
     }
-    let resident_bytes = representation_bytes(resident, &logical)?;
+    let own_stored_shape = scales == GgufScales::Own && logical == stored.shape;
+    let resident_bytes = if own_stored_shape && resident == source {
+        stored.nbytes
+    } else {
+        representation_bytes(resident, &logical)?
+    };
     let scale = weight_scale(inventory, descriptor, &logical)?;
     if scale.is_some() && upload != source {
         return Err(format!(
@@ -3282,27 +3730,35 @@ fn push_weight(
             descriptor.name
         ));
     }
-    let mut plan = WeightPlan {
+    // The bytes the importer uploads: the transformed source, in the
+    // upload representation.
+    let source_bytes = if upload == resident {
+        resident_bytes
+    } else if own_stored_shape && upload == source {
+        stored.nbytes
+    } else {
+        representation_bytes(upload, &logical)?
+    };
+    // The import makes the bound: a weight the host places has none.
+    let bound = if descriptor.progressive().is_none() {
+        packing_bound(resident, &logical)
+    } else {
+        0
+    };
+    out.push(WeightPlan {
         role,
         component,
         source,
         upload,
         resident,
-        shape: logical.clone(),
+        shape: logical,
         descriptor: descriptor.clone(),
-        // The bytes the importer uploads: the transformed source, in the
-        // upload representation.
-        source_bytes: representation_bytes(upload, &logical)?,
+        source_bytes,
         resident_bytes,
         scale,
-        bound: 0,
+        bound,
         holding: Holding::Whole,
-    };
-    // The import makes the bound: a weight the host places has none.
-    if !plan.placed_on_host() {
-        plan.bound = packing_bound(resident, &logical);
-    }
-    out.push(plan);
+    });
     Ok(())
 }
 
@@ -3310,22 +3766,19 @@ fn push_weight(
 /// (`import_transforms::admit` allows at most one): a stored F32 tensor of
 /// one value, or one per matrix of a stacked `logical` weight.
 fn weight_scale(
-    inventory: &[TensorDescriptor],
+    inventory: &TensorIndex<'_>,
     descriptor: &WeightDescriptor,
     logical: &[u64],
 ) -> Result<Option<WeightScalePlan>, String> {
     let Some(tensor) = crate::import_transforms::scale_tensor(descriptor) else {
         return Ok(None);
     };
-    let stored = inventory
-        .iter()
-        .find(|stored| stored.name == tensor)
-        .ok_or_else(|| {
-            format!(
-                "second-level scale {tensor:?} of {:?} is absent from its component",
-                descriptor.name
-            )
-        })?;
+    let stored = inventory.get(tensor).ok_or_else(|| {
+        format!(
+            "second-level scale {tensor:?} of {:?} is absent from its component",
+            descriptor.name
+        )
+    })?;
     let matrices = match logical {
         [stack, _, _] => *stack,
         [_, _] => 1,
@@ -3378,10 +3831,11 @@ fn plan_vision(
         activation: activation_dtype(vision.activation_dtype),
         layout,
     };
+    let index = TensorIndex::new(inventory);
     let mut out = Vec::new();
     for (role, descriptor) in vision.weights() {
         push_weight(
-            &mut out, inventory, component, role.scope, role.kind, descriptor, form,
+            &mut out, &index, component, role.scope, role.kind, descriptor, form,
         )?;
     }
     Ok(out)
@@ -3443,21 +3897,136 @@ pub(super) fn planned_readout_recipe(
     })
 }
 
+#[derive(Clone, Copy)]
+struct ProgramPlanLookup {
+    load: *const ModelLoadPlan,
+    target_ptr: *const WeightPlan,
+    target_len: usize,
+    head_ptr: *const WeightPlan,
+    head_len: usize,
+    vision_ptr: *const WeightPlan,
+    vision_len: usize,
+}
+
+thread_local! {
+    static PROGRAM_PLAN_LOOKUP: Cell<Option<ProgramPlanLookup>> = const { Cell::new(None) };
+}
+
+struct ProgramPlanLookupGuard {
+    prev: Option<ProgramPlanLookup>,
+}
+
+impl ProgramPlanLookupGuard {
+    fn enter(
+        load: &ModelLoadPlan,
+        target: &[WeightPlan],
+        head: Option<&[WeightPlan]>,
+        vision: Option<&[WeightPlan]>,
+    ) -> Self {
+        let (head_ptr, head_len) = head.map_or((std::ptr::null(), 0), |s| (s.as_ptr(), s.len()));
+        let (vision_ptr, vision_len) = vision.map_or((std::ptr::null(), 0), |s| (s.as_ptr(), s.len()));
+        let prev = PROGRAM_PLAN_LOOKUP.with(|cell| {
+            cell.replace(Some(ProgramPlanLookup {
+                load: load as *const ModelLoadPlan,
+                target_ptr: target.as_ptr(),
+                target_len: target.len(),
+                head_ptr,
+                head_len,
+                vision_ptr,
+                vision_len,
+            }))
+        });
+        Self { prev }
+    }
+}
+
+impl Drop for ProgramPlanLookupGuard {
+    fn drop(&mut self) {
+        PROGRAM_PLAN_LOOKUP.with(|cell| cell.set(self.prev));
+    }
+}
+
 pub(super) fn planned_scalable(
     plans: &[WeightPlan],
     scope: WeightScope,
     kind: WeightKind,
 ) -> Result<ScalableWeight, PlanError> {
+    let role = WeightRole { scope, kind };
+    let missing = || PlanError::InvalidDefinition(format!("load plan is missing {scope:?}/{kind:?}"));
+    if plans.is_empty() {
+        return Err(missing());
+    }
+    let ptr = plans.as_ptr();
+    let len = plans.len();
+    let indexed = PROGRAM_PLAN_LOOKUP.with(|cell| {
+        let ctx = cell.get()?;
+        // SAFETY: `ProgramPlanLookupGuard` is stack-scoped inside `ModelLoadPlan::program_plan`,
+        // where `load` is borrowed immutably for the entire call.
+        let load = unsafe { &*ctx.load };
+        let to_scalable = |plan: &WeightPlan| ScalableWeight {
+            element: plan.resident,
+            scale: plan.scale_extent(),
+        };
+        if ptr == ctx.target_ptr && len == ctx.target_len {
+            match load.role_index.get(&role) {
+                Some(&WeightSlot::Target(i)) => return Some(Ok(to_scalable(&load.target[i]))),
+                None => {
+                    if let Some(plan) = load
+                        .unplaced_output
+                        .iter()
+                        .find(|w| w.role == role && head_component_scope(w.role.scope) == Ok(false))
+                    {
+                        return Some(Ok(to_scalable(plan)));
+                    }
+                    return Some(Err(missing()));
+                }
+                Some(_) => return None,
+            }
+        }
+        if ctx.head_len > 0 && ptr == ctx.head_ptr && len == ctx.head_len {
+            match load.role_index.get(&role) {
+                Some(&WeightSlot::Head(i)) => {
+                    if let Some(head) = load.head.as_deref() {
+                        return Some(Ok(to_scalable(&head[i])));
+                    }
+                }
+                None => {
+                    if let Some(plan) = load
+                        .unplaced_output
+                        .iter()
+                        .find(|w| w.role == role && head_component_scope(w.role.scope) == Ok(true))
+                    {
+                        return Some(Ok(to_scalable(plan)));
+                    }
+                    return Some(Err(missing()));
+                }
+                Some(_) => return None,
+            }
+        }
+        if ctx.vision_len > 0 && ptr == ctx.vision_ptr && len == ctx.vision_len {
+            match load.role_index.get(&role) {
+                Some(&WeightSlot::Vision(i)) => {
+                    if let Some(vision) = load.vision.as_deref() {
+                        return Some(Ok(to_scalable(&vision[i])));
+                    }
+                }
+                None => return Some(Err(missing())),
+                Some(_) => return None,
+            }
+        }
+        None
+    });
+    if let Some(result) = indexed {
+        return result;
+    }
     plans
         .iter()
-        .find(|plan| plan.role == WeightRole { scope, kind })
+        .find(|plan| plan.role == role)
         .map(|plan| ScalableWeight {
             element: plan.resident,
             scale: plan.scale_extent(),
         })
-        .ok_or_else(|| {
-            PlanError::InvalidDefinition(format!("load plan is missing {scope:?}/{kind:?}"))
-        })
+        .ok_or_else(missing)
 }
 
 /// How the weights of one component become resident: the activation dtype
@@ -3563,20 +4132,18 @@ pub fn stored_weights(
     tensors: &[TensorDescriptor],
 ) -> impl Iterator<Item = (&TensorDescriptor, Option<GgufScales>)> {
     let grid = |tensor: &TensorDescriptor| ImportTransform::scale_grid(&tensor.name, tensor.encoding);
-    let grids = tensors.iter().filter_map(grid).collect::<HashSet<_>>();
+    let grids = tensors.iter().filter_map(grid).collect::<FxHashSet<_>>();
+    let by_name = TensorIndex::new(tensors);
     tensors
         .iter()
         .filter(move |tensor| !grids.contains(&tensor.name))
         .map(move |tensor| {
             let scales = match grid(tensor) {
-                Some(name) => tensors
-                    .iter()
-                    .find(|stored| stored.name == name)
-                    .and_then(|stored| {
-                        let codes = ScaleCodes::of_stored(stored.encoding)?;
-                        let tile = ImportTransform::grid_tile(&tensor.shape, &stored.shape)?;
-                        Some(GgufScales::Grid(crate::import_transforms::scale_grid(codes, tile)))
-                    }),
+                Some(name) => by_name.get(&name).and_then(|stored| {
+                    let codes = ScaleCodes::of_stored(stored.encoding)?;
+                    let tile = ImportTransform::grid_tile(&tensor.shape, &stored.shape)?;
+                    Some(GgufScales::Grid(crate::import_transforms::scale_grid(codes, tile)))
+                }),
                 None => Some(GgufScales::Own),
             };
             (tensor, scales)
@@ -3703,9 +4270,10 @@ mod vision_residency_tests {
             nbytes: 128,
         }];
         let mut out = Vec::new();
+        let index = TensorIndex::new(&inventory);
         push_weight(
             &mut out,
-            &inventory,
+            &index,
             ArtifactComponent {
                 kind: ArtifactComponentKind::Projector,
                 identity: ArtifactIdentity([0; 32]),
@@ -3879,12 +4447,14 @@ mod stored_table_tests {
             encoding: Encoding::F16, offset: 0, nbytes: rows * 128 * 2 }];
         let component = load.target[0].component;
         load.target.clear();
-        push_gathered_table(&mut load.target, &inventory, component,
+        let index = TensorIndex::new(&inventory);
+        push_gathered_table(&mut load.target, &index, component,
             WeightRole { scope: WeightScope::Target, kind: WeightKind::Embedding }, &descriptor,
             ResidentForm { activation: DType::F16, layout: Layout::Rows16 }, false, TableReads {
-                flights: TableFlights { flights: limits.flights(), lanes: 1 },
+                flights: TableFlights { flights: limits.flights(), lanes: 1, fronts: false },
                 selected_rows: selected_read_rows(&definition, super::super::PlannedMethod::Plain, limits).unwrap(),
             }).unwrap();
+        load.rebuild_role_index();
         let load = load.with_record_ports(BackendName::Vulkan);
         let table = &load.target[0];
         assert!(table.lands_selected_rows());
@@ -3936,12 +4506,13 @@ mod stored_table_tests {
                 offset: 0,
                 nbytes: ROWS * stored_row,
             }];
+            let index = TensorIndex::new(&inventory);
             let descriptor = WeightDescriptor::stored("ngram", [ROWS, 160]);
             for backend in BackendName::ALL {
                 let mut out = Vec::new();
                 push_stored_table(
                     &mut out,
-                    &inventory,
+                    &index,
                     component,
                     ngram_role(),
                     &descriptor,
@@ -3986,9 +4557,10 @@ mod stored_table_tests {
             offset: 0,
             nbytes: 64 * 160 * 2,
         }];
+        let index = TensorIndex::new(&inventory);
         let error = push_stored_table(
             &mut Vec::new(),
-            &inventory,
+            &index,
             ArtifactComponent {
                 kind: ArtifactComponentKind::Target,
                 identity: ArtifactIdentity([0; 32]),
@@ -4034,7 +4606,7 @@ mod stored_table_tests {
         let plan = |inventory: &[TensorDescriptor], tile| {
             let mut out = Vec::new();
             let form = ResidentForm { activation: DType::BF16, layout: Layout::Rows16 };
-            push_stored_table(&mut out, inventory, component, ngram_role(), &descriptor(tile), form).map(|()| out.remove(0))
+            push_stored_table(&mut out, &TensorIndex::new(inventory), component, ngram_role(), &descriptor(tile), form).map(|()| out.remove(0))
         };
         let table = plan(&inventory, [1, 32]).unwrap();
         assert_eq!(table.upload, Element::named("gguf_f8_e4m3_e8m0_1x32").unwrap());
@@ -4221,9 +4793,10 @@ mod scale_grid_tests {
         layout: Layout,
     ) -> Result<WeightPlan, String> {
         let mut out = Vec::new();
+        let index = TensorIndex::new(inventory);
         push_weight(
             &mut out,
-            inventory,
+            &index,
             ArtifactComponent {
                 kind: ArtifactComponentKind::Target,
                 identity: ArtifactIdentity([0; 32]),

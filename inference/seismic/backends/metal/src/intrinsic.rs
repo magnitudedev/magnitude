@@ -4,7 +4,7 @@
 //! walker through `lower_semantic`; there is no second backend-local typed
 //! lowering path.
 
-use crate::facts::MetalFacts;
+use crate::device_info::MetalDeviceInfo;
 use crate::Metal;
 use seismic_compiler::target::{CapabilityRegistration, IntrinsicImplementation};
 use seismic_ir::kernel::ops::IntrinsicResources;
@@ -369,7 +369,7 @@ pub fn registrations() -> Vec<CapabilityRegistration<Metal>> {
 }
 
 pub(crate) fn matrix_supported(
-    facts: &MetalFacts,
+    specs: &MetalDeviceInfo,
     _limits: &TargetLimits,
     dtypes: &DataTypeSupport,
 ) -> BTreeSet<IntrinsicId> {
@@ -409,9 +409,9 @@ pub(crate) fn matrix_supported(
                     };
             (matrix_implemented(signature)
                 && representations_supported
-                && facts
+                && specs
                     .matrix_combinations
-                    .contains(&crate::facts::MatrixCombination {
+                    .contains(&crate::device_info::MatrixCombination {
                         accumulator,
                         left,
                         right,
@@ -425,7 +425,7 @@ pub(crate) fn matrix_supported(
 /// A subgroup signature is supported when the target has SIMD groups and
 /// the compiler accepted its dtype in the collective probe.
 pub(crate) fn subgroup_supported(
-    facts: &MetalFacts,
+    specs: &MetalDeviceInfo,
     _limits: &TargetLimits,
     _dtypes: &DataTypeSupport,
 ) -> BTreeSet<IntrinsicId> {
@@ -436,7 +436,7 @@ pub(crate) fn subgroup_supported(
         })
         .filter(|signature| match collective_dtype(signature) {
             None => true,
-            Some(dtype) => facts.scalar_collective_dtypes.contains(&dtype),
+            Some(dtype) => specs.scalar_collective_dtypes.contains(&dtype),
         })
         .map(|signature| signature.id)
         .collect()

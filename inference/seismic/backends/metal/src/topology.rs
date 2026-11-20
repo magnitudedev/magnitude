@@ -60,6 +60,15 @@ pub fn describe(
     handles
         .into_iter()
         .map(|handle| {
+            if !handle.supports_residency_sets() {
+                diagnostics.push(Diagnostic {
+                    source: seismic_topology::DiagnosticSource::Backend(BackendName::Metal),
+                    message: format!(
+                        "Metal device `{}` has no residency sets; using per-encoder resource declarations",
+                        handle.name()
+                    ),
+                });
+            }
             let answers = crate::profile::probe_answers(&handle, store);
             let report = MetalReport {
                 registry_id: handle.registry_id(),

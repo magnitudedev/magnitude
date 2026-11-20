@@ -243,17 +243,20 @@ fn a_conveyor_reads_experts_in_the_order_the_device_converts_them() {
     harness.publish(&steps[0], 0, &[4, 5]);
     harness.publish(&steps[1], 0, &[0, 1]);
     std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(harness.from_conveyor(&harness.rounds(&steps[0], 0).concat()), [4, 5]);
-    assert_eq!(harness.from_conveyor(&harness.rounds(&steps[1], 0).concat()), [0, 1]);
+    // Each round is checked whole as it is answered: the device's arrival
+    // at the next frees its records for the other step's reads.
+    assert_eq!(Harness::experts(&harness.rounds_checked(&steps[0], 0).concat()), [4, 5]);
+    assert_eq!(Harness::experts(&harness.rounds_checked(&steps[1], 0).concat()), [0, 1]);
     for step in steps {
         step.complete().unwrap();
     }
 }
 
 /// A group's steps request a layer before any round of it there, each from
-/// its own chain place (every step's front there precedes its first back): each
-/// request is served in step order once its own first round arrives, and every
-/// request of the group had been published when the first was.
+/// its own chain place (every step's front there precedes its first back): no
+/// request is served before its own first round arrives, each is served as it
+/// does, in step order (the order the device reaches them), and every request
+/// of the group had been published when the first was.
 #[test]
 fn a_groups_requests_of_a_layer_are_served_in_order_once_their_rounds_arrive() {
     let harness = prompted("fronts", EXPERTS, 4);
@@ -266,9 +269,7 @@ fn a_groups_requests_of_a_layer_are_served_in_order_once_their_rounds_arrive() {
     for step in &steps {
         scratch.request(step.sequence(), constants::SCRATCH_ASK);
     }
-    // The later step's first round arrives first: neither is served until the
-    // earlier step's does.
-    scratch.request(steps[1].sequence(), round(0));
+    // Requested, but no round has arrived: neither is served.
     std::thread::sleep(Duration::from_millis(50));
     for step in &steps {
         assert_eq!(scratch.answer_of(step.sequence(), round(0)), None);
@@ -339,7 +340,8 @@ fn a_scratch_request_awaiting_its_arrival_holds_back_no_decode_request() {
 #[test]
 fn a_wavefront_reads_the_next_layers_experts_as_their_records_free() {
     for (name, conveying) in [("wavefront", WHOLE), ("wavefront-five", Conveying::of(5))] {
-        let harness = lending(name, EXPERTS, 12, 2, STAGING, conveying, TIER, Placer::Tier, false);
+        // A record past TIER: the 5 the group lands and the reserve of 4.
+        let harness = lending(name, EXPERTS, 12, 2, STAGING, conveying, TIER + 1, Placer::Tier, false);
         let steps = harness.group(&[StepRoute::Grouped; 2]);
         harness.publish(&steps[0], 0, &[0, 1]);
         harness.publish(&steps[1], 0, &[1, 3]);
@@ -356,9 +358,10 @@ fn a_wavefront_reads_the_next_layers_experts_as_their_records_free() {
             step.complete().unwrap();
         }
         // Each read lands into the host tier too, its bytes the file's: no
-        // later miss reads it again. The tier's reserve of 4 counts the lent
-        // records the group holds, which it returns ready, so the 5 stay:
-        // none is unmapped for records a group only borrows.
+        // later miss reads it again. The tier's reserve of 4 refills beside
+        // the lent records the group holds (its lend takes them out of the
+        // capacity, not into the reserve), and the tier keeps the 5 and the
+        // reserve: none is unmapped.
         for (layer, expert) in [(0, 0), (0, 1), (0, 3), (1, 3), (1, 4)] {
             eventually("a prompt's read never landed into the tier", || harness.in_tier(layer, expert).is_some());
         }
@@ -509,29 +512,24 @@ fn a_last_step_expiring_before_its_request_is_taken_seeds_nothing_there() {
 }
 
 /// Beside a host tier a prompt group's scratch lies in its lender's bottom
-/// bank records: the group claims them, each expert they held leaving the
-/// bank and unmapped from the group's first step; no seed takes one (the
-/// bank otherwise holds only shares, so the group seeds nothing); once the
-/// device is past the group they return free, so a shrink after the group
-/// evicts past them and the next group claims them again.
+/// bank records, which no promotion takes: the group's lease takes them at
+/// once; no seed takes one (the bank otherwise holds only its pool, so the
+/// group seeds nothing); once the device is past the group they return
+/// free, so a shrink after the group evicts past them, decode's capacity is
+/// the records past them, and the next group is leased them again.
 #[test]
-fn a_discrete_groups_scratch_claims_its_bank_records_and_returns_them_free() {
+fn a_discrete_groups_scratch_leases_its_bank_records_and_returns_them_free() {
     let harness = lending_bank("bank-lent", EXPERTS, 4, 1, STAGING, WHOLE, TIER, Placer::Tier, true, 2, false);
     let map = &harness.layer.0;
     let lent = |record: u32| harness.watcher.bank_lent(0, record);
-    // Promotions take the free records in order: 0 to 3 records 0 to 3,
-    // every one in the layer's share of four.
-    harness.promoted(0, &[0, 1, 2, 3]);
-    assert_eq!((0..4).map(|expert| map.held(expert)).collect::<Vec<_>>(), [Some(0), Some(1), Some(2), Some(3)]);
+    // Promotions take the free records past the lent ones in order: 2 and
+    // 3 records 2 and 3, the pool of two.
+    harness.promoted(0, &[2, 3]);
+    assert_eq!((0..4).map(|expert| map.held(expert)).collect::<Vec<_>>(), [None, None, Some(2), Some(3)]);
     let step = harness.prompt_step();
-    let first = step.sequence();
     harness.scratch(&step, 0, &[5]);
-    // The bank was settled, every record held: the claims took them at once.
     assert!(lent(0) && lent(1) && !lent(2) && !lent(3), "the group holds the lent records alone");
-    for expert in [0, 1] {
-        assert_eq!((map.held(expert), map.resolve(expert, first)), (None, None), "{expert} left the bank from the group's first step");
-    }
-    assert_eq!(harness.commit_seeds(&step, 0), [], "no seed takes a lent record or a share's");
+    assert_eq!(harness.commit_seeds(&step, 0), [], "no seed takes a lent record or the pool's");
     // A step the load interrupts fails here; its seeds are none anyway.
     drop(step.complete());
     eventually("the lent records never returned free", || !lent(0) && !lent(1));
@@ -539,12 +537,10 @@ fn a_discrete_groups_scratch_claims_its_bank_records_and_returns_them_free() {
     eventually("the group's reads were never ranked", || shared.telemetry.fed_all());
     let evicted = shared.shrink(super::super::resize::Evicting::Bank, Candidates::one(3, vec![3]), None).unwrap().expect("the shrink evicts beside no step");
     assert!(evicted.records[0].iter().all(|&record| record >= 2), "a shrink never evicts a lent record");
-    assert_eq!(shared.costs().records, [3]);
+    assert_eq!(shared.costs().records, [1], "decode's capacity: the records past the lent ones");
     let step = harness.prompt_step();
     harness.scratch(&step, 0, &[6]);
-    // The group began once every promotion's copy into one had completed;
-    // its lend drops one yet to copy.
-    eventually("the next group was never lent the records again", || lent(0) && lent(1));
+    assert!(lent(0) && lent(1), "the next group is leased the records again");
     harness.commit_seeds(&step, 0);
     drop(step.complete());
 }
@@ -565,11 +561,31 @@ fn a_hit_the_layer_befores_seeding_evicts_is_read() {
         // unmaps one the group read.
         let harness = lending(name, EXPERTS, 4, 2, STAGING, conveying, 2 * EXPERTS as u32 + STAGING, Placer::Tier, true);
         harness.seeded(1, &[5]);
-        // Layer 1's decode reads of 6 and 7 take its share, promoted beside
-        // 5, which lies outside it: one record is left free.
+        // Layer 1's decode reads of 6 and 7 and layer 0's of 6 fill the
+        // group's 4 records beside `(1, 5)`; two decode steps routing
+        // `(0, [6, 7])` and `(1, [6, 7])` give layer 0 measured decode uses
+        // so `(1, 5)` falls out of the top 4 by rank while all 4 records
+        // stay full (no free record may take the seed, so seeding must
+        // evict `(1, 5)`).
         harness.promoted(1, &[6, 7]);
+        harness.promoted(0, &[6]);
+        // Give `(0, 3)` one decode use so it strictly outranks `(1, 5)` (0
+        // decode uses) without entering the 4-record `in_top` pool (held by
+        // `(0, 6), (0, 7), (1, 6), (1, 7)` with 2+ uses each), so seeding
+        // evicts `(1, 5)` while promotions never touch `(0, 3)`.
+        let once = harness.step();
+        harness.route_at(&once, 0, &[3]);
+        harness.route_at(&once, 1, &[]);
+        once.complete().unwrap();
+        for _ in 0..2 {
+            let decode = harness.step();
+            harness.route_at(&decode, 0, &[6, 7]);
+            harness.route_at(&decode, 1, &[6, 7]);
+            decode.complete().unwrap();
+        }
         let telemetry = &harness.watcher.shared().telemetry;
         eventually("the decode reads were never ranked", || telemetry.fed_all() && !telemetry.in_top()(1, 5));
+        assert!(harness.layers[1].0.held(5).is_some(), "(1, 5) stays held in the full bank before the prompt group");
         // The refill past the step, which decides what the group finds in
         // the tier.
         harness.tier_ready();
@@ -581,11 +597,10 @@ fn a_hit_the_layer_befores_seeding_evicts_is_read() {
         // (expert 4 read); step 1 routes layer 0's seeds after it.
         harness.publish(&steps[0], 1, &[4, 5]);
         harness.conveying(4);
-        // Step 1, the group's last at layer 0, seeds two of experts 0 to 3,
-        // its share: into the free record, and the one outside every share,
-        // evicting layer 1's 5.
+        // Step 1, the group's last at layer 0, seeds into the full bank,
+        // evicting layer 1's 5 (the one kept record outside the top 4).
         harness.rounds(&steps[1], 0);
-        assert_eq!(listed(&harness.seeds[0]).len(), 2);
+        assert_eq!(listed(&harness.seeds[0]).len(), 1);
         let first = steps[0].sequence();
         assert_eq!(harness.layers[1].0.held(5), None, "the evicted hit is unmapped");
         assert_eq!(harness.layers[1].0.resolve(5, first), None, "for every step of the group");
@@ -634,8 +649,8 @@ fn layers_sharing_a_pool_share_conveyor_records() {
 /// measured and its lines priced.
 #[test]
 fn a_group_is_the_fewest_steps_covering_each_layers_stage() {
-    let line = crate::assessment::ReadLine::new(0.001, 1e-9).unwrap();
-    let lines = vec![crate::assessment::ExpertLines::reference(1_000_000); 2];
+    let line = magnitude_cost_model::ReadLine::new(0.001, 1e-9).unwrap();
+    let lines = vec![magnitude_cost_model::ExpertLines::reference(1_000_000); 2];
     let ms = Duration::from_millis;
     let mut facts = GroupFacts {
         compute: vec![Some(ms(10)), None],
@@ -977,11 +992,12 @@ fn a_prompt_seeds_the_one_store_with_every_expert_it_routed() {
 /// group's last step, and a decode step after it still feeds the stack.
 #[test]
 fn a_resident_prompt_groups_reads_reach_the_stack() {
+    use crate::experts::horizon::{Reader, Tier};
+
     let harness = layered("group-reads", EXPERTS, 12, 2, STAGING);
     let steps = begin(harness.watcher.shared(), &[StepRoute::Grouped; 2], false).unwrap();
     let record = steps[0].group_reads().unwrap();
     assert_eq!(steps[1].group_reads(), Some(record), "one record a group");
-    let last = steps[1].sequence();
     // Play the passes' counts: layer 0's single set at place 0, then its
     // merged set at place 1; layer 1's one set at place 0.
     let count = |layer: usize, place: usize, expert: usize, choices: i32| {
@@ -990,15 +1006,23 @@ fn a_resident_prompt_groups_reads_reach_the_stack() {
     count(0, 0, 1, 3);
     count(0, 1, 4, 2);
     count(1, 0, 6, 1);
-    let read = harness.watcher.shared().telemetry.last_read();
-    assert_eq!(read(0, 1), None, "fed only once the group ends");
-    drop(read);
+    let shared = harness.watcher.shared();
+    assert!(!shared.telemetry.group_union(0) && !shared.telemetry.group_union(1), "fed only once the group ends");
     for step in steps {
         step.complete().unwrap();
     }
-    let read = harness.watcher.shared().telemetry.last_read();
-    assert_eq!([read(0, 1), read(0, 4), read(1, 6)], [Some(last); 3]);
-    assert_eq!([read(0, 6), read(1, 1)], [None, None], "only what each layer grouped");
+    assert!(shared.telemetry.group_union(0) && shared.telemetry.group_union(1), "prompt group unions reached the stack");
+    {
+        let state = residency::lock(&harness.watcher.state);
+        let reuse = state.core.directory.reuse_now();
+        assert!(reuse.has_read(0) && reuse.has_read(1), "both layers logged the prompt union");
+        let rank = |layer: usize, expert: usize| reuse.rank(layer, expert, Tier::Compute, Reader::Move, None);
+        assert!(rank(0, 1) > rank(0, 4) && rank(0, 4) > rank(0, 6), "layer 0 ranked both places' counts above unrouted experts");
+        assert!(rank(1, 6) > rank(1, 1), "layer 1 ranked only what it grouped");
+    }
+    // Prompt evidence never enters decode last_read.
+    let read = shared.telemetry.last_read();
+    assert_eq!([read(0, 1), read(0, 4), read(1, 6)], [None; 3]);
     drop(read);
     // A decode step after the group feeds its routing records.
     let decode = harness.step();
@@ -1007,8 +1031,8 @@ fn a_resident_prompt_groups_reads_reach_the_stack() {
     }
     let sequence = decode.sequence();
     decode.complete().unwrap();
-    let read = harness.watcher.shared().telemetry.last_read();
-    assert_eq!([read(0, 2), read(1, 5), read(0, 1)], [Some(sequence), Some(sequence), Some(last)]);
+    let read = shared.telemetry.last_read();
+    assert_eq!([read(0, 2), read(1, 5), read(0, 1)], [Some(sequence), Some(sequence), None]);
 }
 
 /// A generation group in the grouped form (a verify wider than the decode
@@ -1042,9 +1066,11 @@ fn a_generation_group_in_the_grouped_form_prices_no_prompt() {
     assert!(shared.telemetry.group_union(0));
 }
 
-/// A prompt group routing every expert of every layer leaves each layer at
-/// its ranked share as decode starts: the experts the ranking's share of it
-/// names once the group's reads are logged (`Reuse::in_top`). On the one
+/// A prompt group routing every expert of every layer, each layer's share
+/// chosen three times as often as the rest, leaves each layer at its ranked
+/// share as decode starts: the experts the ranking's share of it names once
+/// the group's reads are logged (`Reuse::in_top`), the union's choice counts
+/// its prior. On the one
 /// store the group takes only its lent records, so the first decode step
 /// after it finds each layer's decode share held wherever it lay outside
 /// them. Beside a host tier that keeps every expert, no seed takes
@@ -1103,7 +1129,8 @@ fn ranked_share(placer: Placer) {
         harness.scratch(&step, layer, &every);
         harness.commit_seeds(&step, layer);
         for expert in 0..EXPERTS {
-            harness.reads[layer].store(record * 2 * EXPERTS + expert, 1);
+            let choices = if share(layer).contains(&expert) { 3 } else { 1 };
+            harness.reads[layer].store(record * 2 * EXPERTS + expert, choices);
         }
     }
     step.complete().unwrap();

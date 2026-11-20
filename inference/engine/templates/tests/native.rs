@@ -1,12 +1,15 @@
 use magnitude_templates::{
-    build_info, Event, Relaxation, RelaxationReason, RelaxationSubject, Request, Template,
-    TerminalCause, ToolChoice,
+    build_info, Event, Relaxation, RelaxationReason, RelaxationSubject, Request, SpecialTokens,
+    Template, TerminalCause, ToolChoice,
 };
 use serde_json::json;
 
 const QWEN: &str = include_str!("assets/Qwen-Qwen3-0.6B.jinja");
 const QWEN35: &str = include_str!("assets/Qwen3.5-4B.jinja");
 const QWEN36: &str = include_str!("assets/Qwen3.6-35B-A3B.jinja");
+const DEEPSEEK: &str = include_str!("assets/DeepSeek-V3.2.jinja");
+const GEMMA4: &str = include_str!("assets/gemma-4-12B-it.jinja");
+const LLAMA32: &str = include_str!("assets/Llama-3.2-3B-Instruct.jinja");
 
 fn request() -> Request {
     let mut request = Request::new(vec![json!({"role":"user","content":"Hello"})], 946684800);
@@ -316,4 +319,138 @@ fn templates_without_preserve_thinking_render_unchanged() {
         two_task_prompts(QWEN35, json!({"preserve_thinking": false}))
     );
     assert!(!defaults.1.contains("I should search first."));
+}
+
+#[test]
+fn peg_parser_save_and_grammar_match_expected_across_families() {
+    struct OrderedRuleEntries(Vec<(String, usize)>);
+
+    impl<'de> serde::Deserialize<'de> for OrderedRuleEntries {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct EntriesVisitor;
+            impl<'de> serde::de::Visitor<'de> for EntriesVisitor {
+                type Value = OrderedRuleEntries;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a JSON object mapping rule names to parser IDs")
+                }
+                fn visit_map<M: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: M,
+                ) -> Result<Self::Value, M::Error> {
+                    let mut entries = Vec::new();
+                    while let Some((key, value)) = map.next_entry::<String, usize>()? {
+                        entries.push((key, value));
+                    }
+                    Ok(OrderedRuleEntries(entries))
+                }
+            }
+            deserializer.deserialize_map(EntriesVisitor)
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SavedPegArena {
+        parsers: Vec<serde_json::Value>,
+        root: usize,
+        rules: OrderedRuleEntries,
+    }
+
+    let special = |bos: &str, eos: &str| -> SpecialTokens {
+        [
+            ("bos_token".to_string(), bos.to_string()),
+            ("eos_token".to_string(), eos.to_string()),
+        ]
+        .into()
+    };
+
+    let mut req = request();
+    req.template_arguments
+        .insert("enable_thinking".into(), json!(true));
+
+    let cases = [
+        (
+            "deepseek",
+            DEEPSEEK,
+            special("<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>"),
+            true,
+        ),
+        ("qwen3_coder", QWEN35, special("", "<|im_end|>"), true),
+        ("gemma4", GEMMA4, special("<bos>", "<eos>"), true),
+        (
+            "llama",
+            LLAMA32,
+            special("<|begin_of_text|>", "<|eot_id|>"),
+            false,
+        ),
+    ];
+
+    for (family, source, tokens, expect_grammar) in cases {
+        let plan = Template::new(source, &tokens)
+            .unwrap_or_else(|e| panic!("{family}: template init failed: {e}"))
+            .prepare(&req)
+            .unwrap_or_else(|e| panic!("{family}: prepare failed: {e}"));
+        let desc = plan.description();
+        assert_eq!(desc.grammar_dialect, "gbnf", "{family}");
+
+        let saved: SavedPegArena = serde_json::from_str(&desc.parser)
+            .unwrap_or_else(|e| panic!("{family}: invalid saved PEG parser JSON: {e}"));
+        assert!(
+            !saved.parsers.is_empty(),
+            "{family}: saved PEG parser has no parsers"
+        );
+        assert!(
+            saved.parsers.iter().all(|p| p.get("type").and_then(|v| v.as_str()).is_some()),
+            "{family}: every parser variant must have a string type"
+        );
+        assert!(
+            saved.root < saved.parsers.len(),
+            "{family}: root {} out of bounds for {} parsers",
+            saved.root,
+            saved.parsers.len()
+        );
+        assert!(
+            saved.rules.0.windows(2).all(|w| w[0].0 < w[1].0),
+            "{family}: rule keys are not strictly sorted in serialized JSON"
+        );
+        assert!(
+            saved.rules.0.iter().all(|(_, id)| *id < saved.parsers.len()),
+            "{family}: rule parser ID out of bounds"
+        );
+
+        let mut stream = plan
+            .stream(4096)
+            .unwrap_or_else(|e| panic!("{family}: open stream failed: {e}"));
+        let mut transcript = Transcript::default();
+        transcript.accept(
+            stream
+                .feed(b"hello")
+                .unwrap_or_else(|e| panic!("{family}: stream feed failed: {e}")),
+        );
+        transcript.accept(
+            stream
+                .finish(TerminalCause::Length)
+                .unwrap_or_else(|e| panic!("{family}: stream finish failed: {e}")),
+        );
+        assert_eq!(transcript.finish, Some(TerminalCause::Length), "{family}");
+
+        if expect_grammar {
+            let grammar = &desc.grammar;
+            assert!(!grammar.is_empty(), "{family}: expected non-empty grammar");
+            assert!(
+                grammar.lines().any(|line| {
+                    line.strip_prefix("root ::= ")
+                        .is_some_and(|rhs| !rhs.is_empty())
+                }),
+                "{family}: grammar missing non-empty root rule"
+            );
+            assert!(
+                grammar.lines().all(|line| {
+                    line.split_once(" ::= ")
+                        .is_some_and(|(name, _)| !name.is_empty())
+                }),
+                "{family}: malformed GBNF rule line in grammar"
+            );
+        }
+    }
 }

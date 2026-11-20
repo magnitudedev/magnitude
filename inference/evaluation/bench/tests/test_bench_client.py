@@ -3,15 +3,18 @@ import json
 
 import httpx
 import pytest
-from bench_support import tools_fixture
+from bench_support import template_file
 from magnitude_bench.client import measure
+from magnitude_bench.plan import Sized
 from magnitude_bench.plan import request as serving_request
 from magnitude_bench.validation import terminal
 
 
-def single(fixture=None):
-    fixture = fixture or tools_fixture(0)
-    return serving_request(fixture, fixture.conversation_with(0), "single", "single", 0)
+def single():
+    """Lane 0 of a tools template, its head and probe only."""
+    file = template_file(2)
+    sized = Sized(file.sessions[0].conversation_with(0), None)
+    return serving_request(file, 0, sized, "single", "context")
 
 
 def terminal_event():

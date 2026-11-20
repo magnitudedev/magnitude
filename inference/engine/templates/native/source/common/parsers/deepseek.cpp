@@ -144,7 +144,15 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
 
     bool require_tools   = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
     bool has_tool_calls = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+    const bool thinking = extract_reasoning && inputs.enable_thinking.value_or(true);
+    const bool opened   = thinking &&
+        data.generation_prompt.compare(opener.size(), THINK_START.size(), THINK_START) == 0;
 
+    std::string parser_key_prompt = opener;
+    parser_key_prompt.push_back('\0');
+    parser_key_prompt.push_back(opened ? '1' : '0');
+
+    common_chat_apply_cached_parser(tmpl, inputs, parser_key_prompt, data, [&](common_chat_params & data) {
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.literal(opener);
         auto end               = p.end();
@@ -225,9 +233,6 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
 
         // Reasoning the generation prompt opens is only reasoning: it ends at
         // `</think>`, or at the calls block, which it may open directly.
-        const bool thinking = extract_reasoning && inputs.enable_thinking.value_or(true);
-        const bool opened = thinking &&
-            data.generation_prompt.compare(opener.size(), THINK_START.size(), THINK_START) == 0;
         auto thought_text = p.eps();
         if (thinking) {
             thought_text = p.reasoning(p.until(THINK_END));
@@ -289,6 +294,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
             { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
         };
     }
+    });
 
     return data;
 }

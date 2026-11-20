@@ -289,6 +289,14 @@ impl ResourceLimits {
             .expect("a launch takes a row and no more than a class holds") as u64
     }
 
+    /// The most rows a launch of chained decode passes holds, exact and
+    /// front: the decode form's rows ([`crate::CHAINED_ROWS`]) within the
+    /// selection bound, as each of its rows selects. A pass the host builds
+    /// and the pass queued behind its predecessor are both held to it.
+    pub fn chained_rows(&self) -> usize {
+        self.max_selected_rows.min(crate::CHAINED_ROWS)
+    }
+
     /// The in-flight depth these limits plan for: the one authority every
     /// per-step copy count reads.
     pub const fn flights(&self) -> FlightDepth {
@@ -309,11 +317,12 @@ impl ResourceLimits {
         self.flights().groups().max(self.chain_capacity.get().min(2))
     }
 
-    /// The graph slots a load commits at startup: its prompt groups' floor
-    /// of one place (`class_slots`). Nothing below it is ever released, so
-    /// a group always runs, in Reclaim too, without allocating.
-    pub fn startup_slots(&self) -> StartupSlots {
-        self.class_slots(1)
+    /// The graph slots a load commits at startup, `fronts` where it does
+    /// (`ModelLoadPlan::fronts`): its prompt groups' floor of one place
+    /// (`class_slots`). Nothing below it is ever released, so a group always
+    /// runs, in Reclaim too, without allocating.
+    pub fn startup_slots(&self, fronts: bool) -> StartupSlots {
+        self.class_slots(1, fronts)
     }
 
     /// The graph slots prompt groups of `places` launches hold: what one
@@ -327,9 +336,15 @@ impl ResourceLimits {
     /// after it, so the longest chain's rotation serves every launch.
     /// Outputs a request retains after its launch completes (readout
     /// features, head drafts, encoded images) start at one request's need
-    /// and grow one slot at a time under a heap claim.
-    pub fn class_slots(&self, places: usize) -> StartupSlots {
+    /// and grow one slot at a time under a heap claim. A load that `fronts`
+    /// (`ModelLoadPlan::fronts`) runs a front head launch behind each
+    /// chained step, which its step's head launch slots cover, but the
+    /// prompt's closing chunk runs its drafter entry's and its front one at
+    /// once: one launch more than its target launches, as only the chain's
+    /// holder closes its prompt in flight.
+    pub fn class_slots(&self, places: usize, fronts: bool) -> StartupSlots {
         let launches = self.flights().launches(places);
+        let head = launches + usize::from(fronts);
         StartupSlots {
             target: GraphSlots {
                 activations: launches,
@@ -339,11 +354,12 @@ impl ResourceLimits {
                 activations: launches,
                 output: 1 + launches,
             },
-            // A prompt chunk's drafter entry rides with each target launch
-            // in flight.
+            // A prompt chunk's drafter entry, or a chained step's front head
+            // launch, rides with each target launch in flight, and the
+            // closing chunk's front launch beside its drafter entry.
             head: GraphSlots {
-                activations: launches,
-                output: 1 + launches,
+                activations: head,
+                output: 1 + head,
             },
             // Vision holds nothing until an image arrives: a text-only
             // session never uses it. An encode claims storage of its image's
@@ -737,6 +753,39 @@ pub(crate) fn graph_scratch_bytes(charges: &[&NativeGraphCharge]) -> Result<u64,
         .ok_or_else(|| "graph scratch byte count overflows".into())
 }
 
+#[derive(Default)]
+pub(crate) struct BankSlabCache {
+    banks: std::sync::OnceLock<Result<u32, String>>,
+    layout: std::sync::OnceLock<Result<Option<SlabLayout>, String>>,
+}
+
+impl Clone for BankSlabCache {
+    fn clone(&self) -> Self {
+        let cloned = Self::default();
+        if let Some(v) = self.banks.get() {
+            let _ = cloned.banks.set(v.clone());
+        }
+        if let Some(v) = self.layout.get() {
+            let _ = cloned.layout.set(v.clone());
+        }
+        cloned
+    }
+}
+
+impl std::fmt::Debug for BankSlabCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BankSlabCache").finish()
+    }
+}
+
+impl PartialEq for BankSlabCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for BankSlabCache {}
+
 /// Exact projection used to construct one numerical state arena. The planner
 /// owns every capacity and byte fact; construction only materializes it.
 /// `history` is the store's history domains as `StateStore::new` takes them;
@@ -760,6 +809,7 @@ pub struct StateStorePlan {
     /// what a load opens it at: its slabs are charged in whole blocks
     /// ([`Self::slab_charge`]).
     pub block: seismic::BlockSize,
+    pub(crate) cached_bank_slab: BankSlabCache,
 }
 
 /// One stored history domain of a store plan: exactly what the store derives
@@ -1004,27 +1054,37 @@ impl StateStorePlan {
     }
 
     pub fn bank_slab_banks(&self) -> Result<u32, String> {
-        let regions = magnitude_state::bank_regions(&self.recurrent_components);
-        u32::try_from(magnitude_state::banks_per_slab(&regions, self.granule)?)
-            .map_err(|_| "bank slab count exceeds u32".into())
+        self.cached_bank_slab
+            .banks
+            .get_or_init(|| {
+                let regions = magnitude_state::bank_regions(&self.recurrent_components);
+                u32::try_from(magnitude_state::banks_per_slab(&regions, self.granule)?)
+                    .map_err(|_| "bank slab count exceeds u32".into())
+            })
+            .clone()
     }
 
     pub fn bank_slab_layout(&self) -> Result<Option<SlabLayout>, String> {
-        if self.recurrent_components.is_empty() {
-            return Ok(None);
-        }
-        let regions = magnitude_state::bank_regions(&self.recurrent_components);
-        let logical_banks = self
-            .bank_capacity
-            .storage_total()
-            .map_err(|error| error.to_string())?;
-        SlabLayout::for_regions(
-            u64::from(self.bank_slab_banks()?),
-            logical_banks as u64,
-            &regions,
-        )
-        .map(Some)
-        .map_err(|error| error.to_string())
+        self.cached_bank_slab
+            .layout
+            .get_or_init(|| {
+                if self.recurrent_components.is_empty() {
+                    return Ok(None);
+                }
+                let regions = magnitude_state::bank_regions(&self.recurrent_components);
+                let logical_banks = self
+                    .bank_capacity
+                    .storage_total()
+                    .map_err(|error| error.to_string())?;
+                SlabLayout::for_regions(
+                    u64::from(self.bank_slab_banks()?),
+                    logical_banks as u64,
+                    &regions,
+                )
+                .map(Some)
+                .map_err(|error| error.to_string())
+            })
+            .clone()
     }
 
     /// Every stored domain's address table and first slab, a granule.
@@ -1323,9 +1383,7 @@ impl StateResourcePlan {
 
     /// The state slabs a load commits at startup, before any request.
     pub fn startup_state_bytes(&self) -> Result<u64, String> {
-        self.history_bytes
-            .checked_add(self.recurrent_banks_bytes)
-            .ok_or_else(|| "startup state bytes overflow".into())
+        startup_state_bytes(self.history_bytes, self.recurrent_banks_bytes)
     }
 
     pub fn target_state(&self) -> &StateStorePlan {
@@ -1335,44 +1393,125 @@ impl StateResourcePlan {
     pub fn head_state(&self) -> Option<&StateStorePlan> {
         self.head_state.as_ref()
     }
+
+    /// Consume this plan into its context-invariant layout parts for sizing
+    /// state at other context limits via [`ResourcePlanner::state_bytes_from_layout`].
+    pub(crate) fn into_layout_parts(
+        self,
+    ) -> (
+        Vec<HistoryDomainLayout>,
+        Vec<ComponentSpec>,
+        Vec<HistoryDomainLayout>,
+        ResourceLimits,
+        ResourceCapacity,
+        Option<(u64, u32)>,
+    ) {
+        let seeded_banks = self
+            .target_state
+            .cached_bank_slab
+            .banks
+            .get()
+            .and_then(|res| res.as_ref().ok().copied())
+            .map(|banks| (self.target_state.granule, banks));
+        let target_history = self
+            .target_state
+            .history
+            .into_iter()
+            .map(|plan| plan.layout)
+            .collect();
+        let head_history = self
+            .head_state
+            .map(|state| state.history.into_iter().map(|plan| plan.layout).collect())
+            .unwrap_or_default();
+        (
+            target_history,
+            self.target_state.recurrent_components,
+            head_history,
+            self.limits,
+            self.capacity_bytes,
+            seeded_banks,
+        )
+    }
+}
+
+fn startup_state_bytes(history_bytes: u64, recurrent_banks_bytes: u64) -> Result<u64, String> {
+    history_bytes
+        .checked_add(recurrent_banks_bytes)
+        .ok_or_else(|| "startup state bytes overflow".into())
+}
+
+struct PlannedState {
+    capacity: StateCapacityPlan,
+    target_state: StateStorePlan,
+    head_state: Option<StateStorePlan>,
+    retained_entry_bytes: u64,
+    history_bytes: u64,
+    recurrent_banks_bytes: u64,
+}
+
+fn validate_state_inputs(limits: ResourceLimits, capacity_bytes: ResourceCapacity) -> Result<(), String> {
+    if limits.max_launch_slots == 0
+        || limits.max_launch_slots > limits.max_launch_rows
+        || limits.max_launch_rows == 0
+        || limits.max_selected_rows == 0
+        || limits.max_selected_rows > limits.max_launch_rows
+        || limits.max_drafting_slots == 0
+        || limits.max_drafting_slots > limits.max_launch_slots
+        || limits.exported_logits_rows > limits.max_launch_rows
+        || limits.max_images_per_request == 0
+    {
+        return Err("resource limits must be positive".into());
+    }
+    if limits.max_images_per_request > magnitude_artifacts::MAX_IMAGES_PER_REQUEST {
+        return Err("planned image limit exceeds preprocessing capacity".into());
+    }
+    if capacity_bytes.domain_bytes == 0 {
+        return Err("device domain has zero capacity".into());
+    }
+    Ok(())
 }
 
 impl ResourcePlanner {
-    pub fn state_plan(
+    fn plan_state(
         definition: &ModelDefinition,
+        context_limit: u64,
         load: &ModelLoadPlan,
         method: PlannedMethod,
         codec: KvCodec,
         limits: ResourceLimits,
         capacity_bytes: ResourceCapacity,
-    ) -> Result<StateResourcePlan, String> {
-        if limits.max_launch_slots == 0
-            || limits.max_launch_slots > limits.max_launch_rows
-            || limits.max_launch_rows == 0
-            || limits.max_selected_rows == 0
-            || limits.max_selected_rows > limits.max_launch_rows
-            || limits.max_drafting_slots == 0
-            || limits.max_drafting_slots > limits.max_launch_slots
-            || limits.exported_logits_rows > limits.max_launch_rows
-            || limits.max_images_per_request == 0
-        {
-            return Err("resource limits must be positive".into());
-        }
-        if limits.max_images_per_request > magnitude_artifacts::MAX_IMAGES_PER_REQUEST {
-            return Err("planned image limit exceeds preprocessing capacity".into());
-        }
-        if capacity_bytes.domain_bytes == 0 {
-            return Err("device domain has zero capacity".into());
-        }
+    ) -> Result<PlannedState, String> {
+        validate_state_inputs(limits, capacity_bytes)?;
         let layout = state_layout(definition, load, method, codec)?;
-        let history_domains = || layout.target_history.iter().chain(&layout.head_history);
-        let checkpoint_history_row_bytes = history_row_bytes(&layout.target_history)?
-            .checked_add(history_row_bytes(&layout.head_history)?)
+        Self::plan_state_from_layout(
+            layout.target_history,
+            layout.target_recurrent,
+            layout.head_history,
+            context_limit,
+            limits,
+            capacity_bytes,
+            None,
+        )
+    }
+
+    fn plan_state_from_layout(
+        target_history: Vec<HistoryDomainLayout>,
+        target_recurrent: Vec<ComponentSpec>,
+        head_history: Vec<HistoryDomainLayout>,
+        context_limit: u64,
+        limits: ResourceLimits,
+        capacity_bytes: ResourceCapacity,
+        seeded_banks: Option<(u64, u32)>,
+    ) -> Result<PlannedState, String> {
+        validate_state_inputs(limits, capacity_bytes)?;
+        let history_domains = || target_history.iter().chain(&head_history);
+        let checkpoint_history_row_bytes = history_row_bytes(&target_history)?
+            .checked_add(history_row_bytes(&head_history)?)
             .ok_or("history row byte count overflow")?;
-        let recurrent_bank_bytes = recurrent_bank_bytes(&layout.target_recurrent)?;
-        let context = state_context(definition)?;
+        let recurrent_bank_bytes = recurrent_bank_bytes(&target_recurrent)?;
+        let context = state_context(context_limit)?;
         let max_advance = limits.max_launch_rows;
-        let granule = state_granule(&layout, context, max_advance)?;
+        let granule = state_granule_parts(&target_history, &target_recurrent, &head_history, context, max_advance)?;
         // The state pool's block, by the rule a load opens it by
         // (`memory::ledger::Ledgers::open_pool`).
         let block = seismic::block_bytes(seismic::BlockSizing { granule, allocations: capacity_bytes.allocations })
@@ -1400,7 +1539,7 @@ impl ResourcePlanner {
             recurrent_bank_bytes
         } else {
             checkpoint_history_row_bytes
-                .checked_mul(definition.decoder.context_limit)
+                .checked_mul(context_limit)
                 .and_then(|bytes| bytes.checked_add(checkpoint_window_bytes))
                 .ok_or("checkpoint state byte count overflow")?
         };
@@ -1464,14 +1603,19 @@ impl ResourcePlanner {
         };
         let target_state = state_store_plan(
             rows,
-            layout.target_history,
-            layout.target_recurrent,
+            target_history,
+            target_recurrent,
             bank_capacity,
             granule,
             block,
         )?;
-        let head_state = (!layout.head_history.is_empty())
-            .then(|| state_store_plan(rows, layout.head_history, Vec::new(), bank_capacity, granule, block))
+        if let Some((seeded_granule, banks)) = seeded_banks {
+            if granule == seeded_granule {
+                let _ = target_state.cached_bank_slab.banks.set(Ok(banks));
+            }
+        }
+        let head_state = (!head_history.is_empty())
+            .then(|| state_store_plan(rows, head_history, Vec::new(), bank_capacity, granule, block))
             .transpose()?;
         let planned_recurrent = target_state
             .recurrent_pool_bytes
@@ -1514,7 +1658,7 @@ impl ResourcePlanner {
         // (`magnitude_state::state_bytes`, the one state-size estimator), plus
         // each stored domain's address table, which a slab count leaves out
         // and `StateStore::new` commits.
-        let fit_depth = assessment::fit_depth(definition);
+        let fit_depth = context_limit;
         let conversations = limits.conversations.get() as u64;
         let mut workload_slabs = 0u64;
         for store in std::iter::once(&target_state).chain(head_state.as_ref()) {
@@ -1536,12 +1680,7 @@ impl ResourcePlanner {
             history_rows,
             workload_state_bytes,
         };
-        Ok(StateResourcePlan {
-            definition: definition.clone(),
-            load: load.clone(),
-            codec,
-            limits,
-            capacity_bytes,
+        Ok(PlannedState {
             capacity,
             target_state,
             head_state,
@@ -1549,6 +1688,113 @@ impl ResourcePlanner {
             history_bytes: history,
             recurrent_banks_bytes: planned_recurrent,
         })
+    }
+
+    pub fn state_plan(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        method: PlannedMethod,
+        codec: KvCodec,
+        limits: ResourceLimits,
+        capacity_bytes: ResourceCapacity,
+    ) -> Result<StateResourcePlan, String> {
+        let planned = Self::plan_state(
+            definition,
+            definition.decoder.context_limit,
+            load,
+            method,
+            codec,
+            limits,
+            capacity_bytes,
+        )?;
+        Ok(StateResourcePlan {
+            definition: definition.clone(),
+            load: load.clone(),
+            codec,
+            limits,
+            capacity_bytes,
+            capacity: planned.capacity,
+            target_state: planned.target_state,
+            head_state: planned.head_state,
+            retained_entry_bytes: planned.retained_entry_bytes,
+            history_bytes: planned.history_bytes,
+            recurrent_banks_bytes: planned.recurrent_banks_bytes,
+        })
+    }
+
+    /// `(workload_state_bytes, startup_state_bytes)` for `definition` planned
+    /// as `load`, `method`, `codec`, `limits`, and `capacity_bytes`, without
+    /// cloning `definition` or `load`.
+    pub fn state_bytes(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        method: PlannedMethod,
+        codec: KvCodec,
+        limits: ResourceLimits,
+        capacity_bytes: ResourceCapacity,
+    ) -> Result<(u64, u64), String> {
+        Self::state_bytes_at_context(
+            definition,
+            definition.decoder.context_limit,
+            load,
+            method,
+            codec,
+            limits,
+            capacity_bytes,
+        )
+    }
+
+    /// [`Self::state_bytes`] evaluated at `context_limit` without mutating or
+    /// cloning `definition`.
+    pub fn state_bytes_at_context(
+        definition: &ModelDefinition,
+        context_limit: u64,
+        load: &ModelLoadPlan,
+        method: PlannedMethod,
+        codec: KvCodec,
+        limits: ResourceLimits,
+        capacity_bytes: ResourceCapacity,
+    ) -> Result<(u64, u64), String> {
+        let planned = Self::plan_state(
+            definition,
+            context_limit,
+            load,
+            method,
+            codec,
+            limits,
+            capacity_bytes,
+        )?;
+        Ok((
+            planned.capacity.workload_state_bytes,
+            startup_state_bytes(planned.history_bytes, planned.recurrent_banks_bytes)?,
+        ))
+    }
+
+    /// `(workload_state_bytes, startup_state_bytes)` for pre-derived state
+    /// layouts at `context_limit`, avoiding `ModelDefinition` cloning and
+    /// `ModelStateLayout::derive`.
+    pub(crate) fn state_bytes_from_layout(
+        target_history: &[HistoryDomainLayout],
+        target_recurrent: &[ComponentSpec],
+        head_history: &[HistoryDomainLayout],
+        context_limit: u64,
+        limits: ResourceLimits,
+        capacity_bytes: ResourceCapacity,
+        seeded_banks: Option<(u64, u32)>,
+    ) -> Result<(u64, u64), String> {
+        let planned = Self::plan_state_from_layout(
+            target_history.to_vec(),
+            target_recurrent.to_vec(),
+            head_history.to_vec(),
+            context_limit,
+            limits,
+            capacity_bytes,
+            seeded_banks,
+        )?;
+        Ok((
+            planned.capacity.workload_state_bytes,
+            startup_state_bytes(planned.history_bytes, planned.recurrent_banks_bytes)?,
+        ))
     }
 
     pub fn plan_with_state(
@@ -1561,7 +1807,7 @@ impl ResourcePlanner {
     ) -> Result<ResourcePlan, String> {
         let load = &state.load;
         let limits = state.limits;
-        let slots = limits.startup_slots();
+        let slots = limits.startup_slots(load.fronts());
         let target_graph = NativeGraphCharge::from_prepared(target_graphs, slots.target)?;
         let target_readout_graph = NativeGraphCharge::from_footprint(
             FamilyFootprint::serial(target_readout_graphs.family()),
@@ -1728,8 +1974,8 @@ fn state_layout(
 }
 
 /// The context a load's state stores hold for a request.
-fn state_context(definition: &ModelDefinition) -> Result<usize, String> {
-    usize::try_from(definition.decoder.context_limit).map_err(|_| "context limit exceeds host domain".into())
+fn state_context(context_limit: u64) -> Result<usize, String> {
+    usize::try_from(context_limit).map_err(|_| "context limit exceeds host domain".into())
 }
 
 /// The granule of the pool `layout`'s state slabs lie in, its histories at
@@ -1737,7 +1983,17 @@ fn state_context(definition: &ModelDefinition) -> Result<usize, String> {
 /// class (§4.7), whatever bank lies beside it, of its smallest slabs
 /// ([`state_pool_granule`]).
 pub(crate) fn state_granule(layout: &ModelStateLayout, context: usize, max_advance: usize) -> Result<u64, String> {
-    state_pool_granule(smallest_slab(layout, context, max_advance)?)
+    state_granule_parts(&layout.target_history, &layout.target_recurrent, &layout.head_history, context, max_advance)
+}
+
+fn state_granule_parts(
+    target_history: &[HistoryDomainLayout],
+    target_recurrent: &[ComponentSpec],
+    head_history: &[HistoryDomainLayout],
+    context: usize,
+    max_advance: usize,
+) -> Result<u64, String> {
+    state_pool_granule(smallest_slab_parts(target_history, target_recurrent, head_history, context, max_advance)?)
 }
 
 /// The granule of a state pool whose slab stores each fit `slab`: `slab`'s
@@ -1754,8 +2010,14 @@ pub(crate) fn state_pool_granule(slab: Option<super::PoolSlab>) -> Result<u64, S
 /// The slab every slab store of `layout`'s state stores fits: the largest
 /// of their smallest slabs, at a multiple of every one's alignment; none
 /// without state slabs.
-fn smallest_slab(layout: &ModelStateLayout, context: usize, max_advance: usize) -> Result<Option<super::PoolSlab>, String> {
-    let stores = [(&layout.target_history, &layout.target_recurrent[..]), (&layout.head_history, &[][..])];
+fn smallest_slab_parts(
+    target_history: &[HistoryDomainLayout],
+    target_recurrent: &[ComponentSpec],
+    head_history: &[HistoryDomainLayout],
+    context: usize,
+    max_advance: usize,
+) -> Result<Option<super::PoolSlab>, String> {
+    let stores = [(target_history, target_recurrent), (head_history, &[][..])];
     stores.into_iter().try_fold(None, |slab: Option<super::PoolSlab>, (history, recurrent)| {
         magnitude_state::smallest_slabs(history, recurrent, context, max_advance)
             .map_err(|error| error.to_string())?
@@ -1838,6 +2100,7 @@ fn state_store_plan(
         recurrent_pool_bytes,
         granule,
         block,
+        cached_bank_slab: BankSlabCache::default(),
     })
 }
 
@@ -1899,10 +2162,17 @@ mod slab_plan_tests {
             conversations: NonZeroUsize::MIN,
         };
         let slots = |lookahead, places| {
-            let slots = limits(lookahead, 128).class_slots(places);
+            let slots = limits(lookahead, 128).class_slots(places, false);
             (slots.target, slots.readout.activations)
         };
-        assert_eq!(limits(true, 128).startup_slots(), limits(true, 128).class_slots(1));
+        assert_eq!(limits(true, 128).startup_slots(false), limits(true, 128).class_slots(1, false));
+        // A load that fronts holds one head launch more: the closing chunk's
+        // front launch beside its drafter entry.
+        for (lookahead, places) in [(false, 1), (true, 1), (true, 4)] {
+            let (plain, fronting) = (limits(lookahead, 128).class_slots(places, false), limits(lookahead, 128).class_slots(places, true));
+            assert_eq!((fronting.head.activations, fronting.head.output), (plain.head.activations + 1, plain.head.output + 1));
+            assert_eq!((fronting.target, fronting.readout), (plain.target, plain.readout));
+        }
         let target = |activations, output| GraphSlots {
             activations,
             output,

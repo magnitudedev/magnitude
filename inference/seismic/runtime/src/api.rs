@@ -836,18 +836,12 @@ pub mod device {
             }
         }
         /// The host memory node the device is attached to
-        /// (`seismic_discovery::DeviceNode`): a CUDA device's, from its PCI
-        /// location; none a device without a bus location reports (a CPU
-        /// device, Metal, Vulkan).
-        pub fn host_node(&self) -> Result<seismic_discovery::DeviceNode, String> {
-            match &self.kind {
-                OpenedKind::Cuda(opened) => {
-                    let [domain, bus, device] = seismic_cuda::describe(opened.executor().device().ordinal()).map_err(|error| error.to_string())?.pci;
-                    Ok(seismic_discovery::device_node(seismic_discovery::PciLocation { domain, bus, device }))
-                }
-                #[allow(unreachable_patterns)]
-                _ => Ok(seismic_discovery::DeviceNode::Unknown),
-            }
+        /// ([`seismic_topology::HostNode`]).
+        pub fn host_node(&self) -> seismic_topology::HostNode {
+            self.topology
+                .physical_device(self.info.physical())
+                .expect("an executor's device is of its revision")
+                .host_node()
         }
         /// The native programs this device has formed, and the time it took.
         pub fn programs_formed(&self) -> crate::formation::FormedPrograms {
@@ -958,6 +952,19 @@ pub mod device {
                     None
                 }
                 _ => None,
+            }
+        }
+        /// Ensure the device's command queue can hold at least `count`
+        /// uncompleted command buffers at once. On Metal, sizes or grows the
+        /// idle `MTLCommandQueue` with
+        /// `newCommandQueueWithMaxCommandBufferCount:`; no-op on backends
+        /// whose queues have no fixed command-buffer ceiling.
+        pub fn ensure_command_buffer_capacity(&self, count: usize) -> Result<(), super::ExecutionError> {
+            let _ = count;
+            match &self.kind {
+                #[cfg(target_os = "macos")]
+                OpenedKind::Metal(opened) => opened.service().ensure_command_buffer_capacity(count),
+                _ => Ok(()),
             }
         }
         /// The most [`Self::allocated`] has been since the last
@@ -3123,13 +3130,13 @@ pub mod kernel {
     /// prevents a result from being wired into another draft.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct WorkflowResultRef {
-        pub(crate) workflow: u64,
-        pub(crate) node: u32,
-        pub(crate) result: u32,
+        pub workflow: u64,
+        pub node: u32,
+        pub result: u32,
     }
 
     #[derive(Clone)]
-    pub(crate) enum EncodedWorkflowArgument {
+    pub enum EncodedWorkflowArgument {
         Tensor(WorkflowTensorArgument),
         Scalar(EncodedScalar),
         ScalarResult(WorkflowResultRef),
@@ -3142,7 +3149,7 @@ pub mod kernel {
     }
 
     #[derive(Clone)]
-    pub(crate) enum WorkflowTensorArgument {
+    pub enum WorkflowTensorArgument {
         External(Arc<TensorInner>),
         Result(WorkflowResultRef),
         ResultView {
@@ -3207,7 +3214,7 @@ pub mod kernel {
         pub(crate) fn into_arguments(self) -> Vec<EncodedWorkflowArgument> {
             self.arguments
         }
-        pub(crate) fn arguments(&self) -> &[EncodedWorkflowArgument] {
+        pub fn arguments(&self) -> &[EncodedWorkflowArgument] {
             &self.arguments
         }
     }
@@ -3220,7 +3227,8 @@ pub mod kernel {
     }
 
     impl PendingWorkflowResults {
-        pub(crate) fn new(workflow: u64, node: u32, count: u32) -> Self {
+        #[doc(hidden)]
+        pub fn new(workflow: u64, node: u32, count: u32) -> Self {
             Self {
                 workflow,
                 node,

@@ -1,4 +1,4 @@
-"""Synthetic logits outputs for the KL tests: rendered fixtures, the true logits a reference
+"""Synthetic logits outputs for the KL tests: rendered sessions, the true logits a reference
 would produce for them, and contract logits files."""
 
 import hashlib
@@ -10,7 +10,8 @@ import numpy as np
 VOCABULARY = 64
 MODEL = "fake:gguf:q4"
 TARGET_SHA = "0" * 64
-TEMPLATE_SHA = "1" * 64
+CHAT_TEMPLATE_SHA = "1" * 64
+TEMPLATE = "repeat:4k"
 SCORED = 12
 
 
@@ -32,26 +33,28 @@ def write_target(path: Path) -> Path:
     return path
 
 
-def rendered_lines(fixtures: Path, context: int, shift: bool) -> list[dict]:
+def rendered_lines(lanes: int, context: int, shift: bool) -> list[dict]:
     lines = []
-    for number, line in enumerate(fixtures.read_text().splitlines()):
-        fixture_id = json.loads(line)["id"]
-        length = 40 + number
+    for lane in range(lanes):
+        length = 40 + lane
         tokens = [
-            (index * 7 + number + (1 if shift and index == 5 else 0)) % VOCABULARY
+            (index * 7 + lane + (1 if shift and index == 5 else 0)) % VOCABULARY
             for index in range(length)
         ]
         lines.append(
             {
-                "fixture_id": fixture_id,
-                "fixture_set_digest": hashlib.sha256(fixtures.read_bytes()).hexdigest(),
+                "template": TEMPLATE,
+                "lane": lane,
                 "model": MODEL,
                 "target_sha256": TARGET_SHA,
-                "template_sha256": TEMPLATE_SHA,
-                "context_target": context,
+                "chat_template_sha256": CHAT_TEMPLATE_SHA,
+                "request_options": {},
+                "context": context,
+                "history": 0,
                 "tokens": tokens,
+                "prompt_sha256": hashlib.sha256(np.asarray(tokens, dtype="<u4").tobytes()).hexdigest(),
                 "scored_spans": [[length - SCORED, length]],
-                "generation_prefix_tokens": None,
+                "generation_prefix_tokens": length - SCORED,
             }
         )
     return lines
@@ -59,7 +62,7 @@ def rendered_lines(fixtures: Path, context: int, shift: bool) -> list[dict]:
 
 def rows_of(lines: list[dict]) -> list[dict]:
     return [
-        {"fixture_id": line["fixture_id"], "position": position}
+        {"template": line["template"], "lane": line["lane"], "position": position}
         for line in lines
         for start, end in line["scored_spans"]
         for position in range(start - 1, end - 1)
@@ -67,11 +70,11 @@ def rows_of(lines: list[dict]) -> list[dict]:
 
 
 def truth(rows: list[dict]) -> np.ndarray:
-    """The true logits of rows, deterministic per (fixture, position)."""
+    """The true logits of rows, deterministic per (session, position)."""
     values = np.empty((len(rows), VOCABULARY), dtype="<f4")
     for index, row in enumerate(rows):
         seed = int(
-            hashlib.sha256(f"{row['fixture_id']}/{row['position']}".encode()).hexdigest()[:8], 16
+            hashlib.sha256(f"{row['template']}/{row['lane']}/{row['position']}".encode()).hexdigest()[:8], 16
         )
         values[index] = np.random.default_rng(seed).normal(0, 3, VOCABULARY)
     return values

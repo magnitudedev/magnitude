@@ -204,7 +204,7 @@ impl<'a> QualificationView<'a> {
     }
 
     /// The selection notice copies (token, status) rows as they are, of a
-    /// load that has one (`ProgramPlan::notices_selection`).
+    /// load that has one (`ProgramPlan::copies_token_rows`).
     pub(super) fn qualify_selection_notice(&self, charges: &seismic::Charges) -> Result<(), CatalogFailure> {
         let Some(notice) = &self.programs.notice else {
             return Ok(());

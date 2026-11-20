@@ -12,7 +12,7 @@
 //! scan rendered them, in one pass.
 
 use super::abi::{
-    constant_macros, native_macro, render_source, vulkan::VulkanFeatures, CudaFeatures, Dialect,
+    constant_function_macro, constant_macros, native_macro, render_source, vulkan::VulkanFeatures, CudaFeatures, Dialect,
     MetalFeatures,
 };
 use seismic_lang::bundle::{decode_checked_bundle, encode_checked_bundle};
@@ -264,13 +264,20 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
 }
 
 /// The constant block as rendered before it was rendered in one pass: each
-/// module constant the asset names as a whole identifier, found by a scan of
-/// the asset for each constant. The oracle [`constant_macros`] must equal.
+/// module constant, then constant function, the asset names as a whole
+/// identifier, found by a scan of the asset for each. The oracle
+/// [`constant_macros`] must equal.
 fn reference_constant_macros(prefix: &mut String, asset: NativeAsset<'_>) {
     for (name, value) in asset.constants {
         let symbol = format!("SEISMIC_CONST_{}", native_macro(name));
         if reference_names_symbol(asset.text, &symbol) {
             prefix.push_str(&format!("#define {symbol} {value}\n"));
+        }
+    }
+    for function in asset.functions {
+        let symbol = format!("SEISMIC_CONST_{}", native_macro(function.name()));
+        if reference_names_symbol(asset.text, &symbol) {
+            prefix.push_str(&constant_function_macro(&symbol, function));
         }
     }
 }

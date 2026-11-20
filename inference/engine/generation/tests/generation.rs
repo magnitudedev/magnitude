@@ -1,6 +1,6 @@
 use magnitude_executor::{
-    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, LaunchDuration, Operation, Outcome, ResourceDomainId,
-    Selected,
+    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, FrontGrant, LaunchDuration, Operation, Outcome,
+    ResourceDomainId, Selected,
 };
 use magnitude_generation::{
     BoundaryRule, Constraint, DFlash, Demand, EndOfGeneration, FinishReason, Generation,
@@ -105,7 +105,7 @@ fn generation(constraint: Option<Box<dyn Constraint>>) -> Generation {
 /// started.
 fn start(generation: Generation, allowance: usize) -> StartedRound {
     let bound = generation.publication_bound(allowance).unwrap();
-    match generation.start_round(RequestId(1), allowance) {
+    match generation.start_round(RequestId(1), allowance, FrontGrant::UpTo(0)) {
         Ok(RoundStart::Target(round)) => {
             assert!(round.round_publication_bound() <= bound);
             round
@@ -117,7 +117,7 @@ fn start(generation: Generation, allowance: usize) -> StartedRound {
 
 /// Start a round that returns method (drafter) work.
 fn draft(generation: Generation, allowance: usize) -> (Generation, Vec<Operation>) {
-    match generation.start_round(RequestId(1), allowance) {
+    match generation.start_round(RequestId(1), allowance, FrontGrant::UpTo(0)) {
         Ok(RoundStart::Method(generation, operations)) => (generation, operations),
         Ok(RoundStart::Target(_)) => panic!("expected method work"),
         Err((_, error)) => panic!("{error}"),
@@ -138,7 +138,7 @@ fn resolve(
     });
     let samples = samples.iter().copied().map(TokenId).collect::<Vec<_>>();
     let transition = round
-        .prepare_round_transition(RequestId(1), &samples, features, &mut Rows)
+        .prepare_round_transition(RequestId(1), &samples, Vec::new(), features, &mut Rows)
         .unwrap();
     let (generation, effects) = round.commit(transition);
     (generation, effects.operations)
@@ -299,14 +299,14 @@ fn output_credit_and_stop_refuse_the_next_round() {
     }
     // Full output refuses a round, and the refusal returns the generation.
     assert!(generation.publication_bound(1).is_err());
-    let Err((mut generation, _)) = generation.start_round(RequestId(1), 1) else {
+    let Err((mut generation, _)) = generation.start_round(RequestId(1), 1, FrontGrant::UpTo(0)) else {
         panic!("full output refuses a round")
     };
     assert_eq!(generation.take(4).unwrap().len(), 4);
     let (generation, _) = resolve(start(generation, 1), &[99], None);
     assert_eq!(generation.finish_reason(), Some(FinishReason::Stop));
     assert!(generation.publication_bound(1).is_err());
-    assert!(generation.start_round(RequestId(1), 1).is_err());
+    assert!(generation.start_round(RequestId(1), 1, FrontGrant::UpTo(0)).is_err());
 }
 
 #[test]
@@ -319,14 +319,14 @@ fn prepared_transition_does_not_change_live_generation_until_commit() {
     let round = start(generation, 2);
     assert!(
         round
-            .prepare_round_transition(RequestId(1), &[TokenId(12)], None, &mut Rows)
+            .prepare_round_transition(RequestId(1), &[TokenId(12)], Vec::new(), None, &mut Rows)
             .is_err()
     );
     assert_eq!(round.generation().finish_reason(), None);
     assert_eq!(round.generation().resident_position(), 0);
 
     let prepared = round
-        .prepare_round_transition(RequestId(1), &[TokenId(10)], None, &mut Rows)
+        .prepare_round_transition(RequestId(1), &[TokenId(10)], Vec::new(), None, &mut Rows)
         .unwrap();
     assert_eq!(prepared.decision().accepted_rows, 2);
     drop(prepared);
@@ -334,7 +334,7 @@ fn prepared_transition_does_not_change_live_generation_until_commit() {
     assert!(round.generation().generated().is_empty());
 
     let prepared = round
-        .prepare_round_transition(RequestId(1), &[TokenId(10)], None, &mut Rows)
+        .prepare_round_transition(RequestId(1), &[TokenId(10)], Vec::new(), None, &mut Rows)
         .unwrap();
     let (generation, effects) = round.commit(prepared);
     assert!(effects.operations.is_empty());
@@ -349,7 +349,7 @@ fn a_started_round_commits_back_into_its_generation() {
     let round = start(generation(None), 2);
     assert_eq!(round.generation().resident_position(), 0);
     let prepared = round
-        .prepare_round_transition(RequestId(1), &[TokenId(10)], None, &mut Rows)
+        .prepare_round_transition(RequestId(1), &[TokenId(10)], Vec::new(), None, &mut Rows)
         .unwrap();
     let (generation, effects) = round.commit(prepared);
     assert!(effects.operations.is_empty());
@@ -369,7 +369,7 @@ fn cancellation_reconciles_the_round_without_committing_or_publishing_it() {
     assert_eq!(generation.resident_position(), 0);
     assert!(generation.generated().is_empty());
     assert_eq!(generation.finish_reason(), Some(FinishReason::Cancelled));
-    assert!(generation.start_round(RequestId(1), 1).is_err());
+    assert!(generation.start_round(RequestId(1), 1, FrontGrant::UpTo(0)).is_err());
 }
 
 #[test]
@@ -386,7 +386,7 @@ fn eviction_discards_suspended_work_and_replays_through_rounds() {
     generation.take(4).unwrap();
     let generation = start(generation, 1).evicted().unwrap();
     assert!(!generation.is_resident());
-    let Err((mut generation, _)) = generation.start_round(RequestId(1), 1) else {
+    let Err((mut generation, _)) = generation.start_round(RequestId(1), 1, FrontGrant::UpTo(0)) else {
         panic!("a non-resident generation starts no round")
     };
     generation.resume_at(None).unwrap();
@@ -1017,7 +1017,7 @@ fn staged_causal_reconciliation_advances_after_finished_prefill() {
     generation.resume_at(None).unwrap();
     let round = start(generation, 64);
     let transition = round
-        .prepare_round_transition(RequestId(1), &[TokenId(70)], None, &mut Rows)
+        .prepare_round_transition(RequestId(1), &[TokenId(70)], Vec::new(), None, &mut Rows)
         .unwrap();
     assert_eq!(transition.decision().accepted_rows, 64);
     let (generation, _) = round.commit(transition);
@@ -1032,7 +1032,7 @@ fn staged_causal_reconciliation_advances_after_finished_prefill() {
     assert!(forward.selects.is_empty());
     assert_eq!(reconciliation.round_publication_bound(), 0);
     let transition = reconciliation
-        .prepare_round_transition(RequestId(1), &[], None, &mut Rows)
+        .prepare_round_transition(RequestId(1), &[], Vec::new(), None, &mut Rows)
         .unwrap();
     assert_eq!(transition.decision().accepted_rows, 1);
     let (generation, _) = reconciliation.commit(transition);
@@ -1088,7 +1088,7 @@ fn ignored_end_of_generation_masks_stop_tokens_from_every_selection() {
     assert_ne!(mask[98 / 32] & (1 << (98 % 32)), 0);
     assert!(
         round
-            .prepare_round_transition(RequestId(1), &[TokenId(99)], None, &mut Rows)
+            .prepare_round_transition(RequestId(1), &[TokenId(99)], Vec::new(), None, &mut Rows)
             .is_err()
     );
 }
@@ -1494,7 +1494,7 @@ fn continuing_mtp_chunks_never_read_features_on_the_host() {
         let features = feature(id);
         let boundary = FeatureRef::logical(features.domain().clone(), 1, 4).unwrap();
         numerical_owners.push(boundary.clone());
-        let transition = round.prepare_round_transition(RequestId(1), &[],
+        let transition = round.prepare_round_transition(RequestId(1), &[], Vec::new(),
             Some(features.with_boundary(boundary).unwrap()), &mut NoRead).unwrap();
         let (next, effects) = round.commit(transition);
         assert!(effects.operations.is_empty());
@@ -1730,9 +1730,9 @@ fn mtp_reading_target_checkpoints_retain_no_feature_rows() {
     assert_eq!((state.position(), state.target_rows()), (4, 4));
     assert_eq!(checkpoint.retained_bytes(), 0);
     // Only a drafting request of the same method resumes it.
-    assert!(checkpoint.resumes(MethodChoice::Mtp { proposals: 2 }));
-    assert!(!checkpoint.resumes(MethodChoice::Plain));
-    assert!(!checkpoint.resumes(MethodChoice::DFlash { proposals: 2 }));
+    assert!(checkpoint.resumes(MethodChoice::Mtp { proposals: 2 }, 4, None));
+    assert!(!checkpoint.resumes(MethodChoice::Plain, 4, None));
+    assert!(!checkpoint.resumes(MethodChoice::DFlash { proposals: 2 }, 4, None));
     let mut resumed = reading_fresh(&[1, 2, 3, 4, 7], InputLayout::new(5, vec![]).unwrap(), 2);
     resumed.resume_at(Some((4, &checkpoint))).unwrap();
     let closing = start(resumed, 1);
@@ -1991,7 +1991,7 @@ fn adaptive_drafting_stops_where_no_draft_is_accepted() {
     let mut last = 21;
     for round in 0.. {
         assert!(round < 8, "drafting did not stop");
-        generation = match generation.start_round(RequestId(1), 4) {
+        generation = match generation.start_round(RequestId(1), 4, FrontGrant::UpTo(0)) {
             Ok(RoundStart::Target(round)) => {
                 assert_eq!(round.round_forward().tokens, [TokenId(last)]);
                 break;
@@ -2092,7 +2092,7 @@ fn every_draft_policy_commits_the_targets_own_tokens() {
         while generation.finish_reason().is_none() {
             rounds += 1;
             assert!(rounds < 4 * TOKENS, "{} did not finish", method.identity());
-            generation = match generation.start_round(RequestId(1), 4) {
+            generation = match generation.start_round(RequestId(1), 4, FrontGrant::UpTo(0)) {
                 Ok(RoundStart::Method(mut generation, operations)) => {
                     reconcile(&mut generation, &operations);
                     generation
@@ -2127,4 +2127,189 @@ fn every_draft_policy_commits_the_targets_own_tokens() {
     // The drafter's confidences keep its wrong proposals out of the target's
     // launches.
     assert!(launched_rows[4] < launched_rows[3], "{launched_rows:?}");
+}
+
+/// MTP on a load that fronts decodes in front passes and never proposes.
+/// The chunk closing its prompt enters the head right past its drafter
+/// entry, and every decode round is a pass entering the head from the
+/// position after it, one row a pass: as many front rows as its grant and
+/// its rows hold of the chain the head launch behind the pass before made,
+/// idle past the chain where granted exactly. Every pass emits its exact
+/// row's token alone, whether its guesses held or not, and demands the
+/// features its head entry reads, though none crosses to the host. Its
+/// checkpoint holds the successor its head entered, which only a path
+/// holding that token there resumes.
+#[test]
+fn mtp_on_a_fronting_load_decodes_in_front_passes_entering_the_head() {
+    use magnitude_executor::{ChainEntry, FrontKind, Guess, GuessKind};
+    let options = Options {
+        max_tokens: 16,
+        output_capacity: 16,
+        context_limit: 64,
+        method: MethodChoice::Mtp { proposals: 3 },
+        ..options()
+    };
+    let prompt = (1..=17).map(TokenId).collect::<Vec<_>>();
+    let layout = InputLayout::new(17, vec![]).unwrap();
+    let method = Arc::new(Mtp::new("fixture", 3).unwrap().fronting().unwrap());
+    assert!(method.decodes_two_rows());
+    let generation = resident(Generation::new_with_method(prompt, layout, options, None, method).unwrap());
+    let started = |generation: Generation, allowance: usize, grant: FrontGrant| match generation.start_round(RequestId(1), allowance, grant) {
+        Ok(RoundStart::Target(round)) => round,
+        _ => panic!("expected a target round"),
+    };
+    // Its rows' selections, the chain the head launch behind it made, and
+    // the guesses that stood.
+    let complete = |round: StartedRound, samples: &[u32], chain: Vec<Guess>, stood: usize| {
+        let samples = samples.iter().copied().map(TokenId).collect::<Vec<_>>();
+        let transition = round.prepare_round_transition(RequestId(1), &samples, chain, Some(feature(1)), &mut Rows).unwrap();
+        assert_eq!(transition.decision().ahead.stood(), stood);
+        let (generation, effects) = round.commit(transition);
+        assert!(effects.operations.is_empty(), "no feature crosses to the host");
+        generation
+    };
+    let guess = |token, kind| Guess { token: TokenId(token), kind };
+    let kinds = |forward: &RoundForward| forward.front.iter().map(|front| (front.select.position, front.kind)).collect::<Vec<_>>();
+    // The closing chunk primes the head across its boundary, then enters
+    // its selection right past that entry.
+    let closing = started(generation, 32, FrontGrant::UpTo(0));
+    let prime = forward(&closing).prime.expect("the head enters the prompt on the device");
+    assert!(prime.boundary && prime.position == 0 && prime.tokens.len() == 16);
+    assert_eq!(forward(&closing).chain, Some(ChainEntry { position: 16 }));
+    assert!(forward(&closing).demand.contains(Demand::SELECT | Demand::FEATURES));
+    let generation = complete(closing, &[10], vec![guess(11, GuessKind::Head)], 0);
+    assert_eq!((generation.generated(), generation.resident_position()), (&[TokenId(10)][..], 17));
+    assert!(generation.chains());
+    // A decode emits its exact row's token, and as many guesses as a
+    // verify pass its allowance holds verifies.
+    assert_eq!(generation.publication_bound(4).unwrap(), 4);
+    // Granted one front row, it runs the head's guess.
+    let round = started(generation, 4, FrontGrant::UpTo(1));
+    let paired = forward(&round);
+    assert_eq!((paired.tokens.clone(), paired.chain), (vec![TokenId(10), TokenId(11)], Some(ChainEntry { position: 17 })));
+    assert!(paired.demand.contains(Demand::SELECT | Demand::FEATURES));
+    assert_eq!(kinds(&paired), [(2, FrontKind::Host(GuessKind::Head))]);
+    let operation = paired.into_operation(RequestId(1), 17, None).unwrap();
+    assert_eq!(
+        (operation.row_count(), operation.selected_rows(), operation.acceptable_rows(), operation.front_rows()),
+        (2, 2, 0, 1)
+    );
+    assert!(round.prepare_round_transition(RequestId(1), &[], Vec::new(), None, &mut Rows).is_err(), "its exact row's sample");
+    // The guess held; the next chain is two deep.
+    let generation = complete(round, &[11], vec![guess(12, GuessKind::Chained), guess(13, GuessKind::Head)], 1);
+    assert_eq!(generation.generated().last(), Some(&TokenId(11)));
+    // As deep as its rows hold, its exact row alone where none does.
+    let round = started(generation, 1, FrontGrant::UpTo(3));
+    assert_eq!((forward(&round).tokens, forward(&round).chain), (vec![TokenId(11)], Some(ChainEntry { position: 18 })));
+    let round = started(round.abandon(), 4, FrontGrant::UpTo(3));
+    assert_eq!(forward(&round).tokens, tokens(&[11, 12, 13]), "no deeper than its chain");
+    assert_eq!(kinds(&forward(&round)), [(3, FrontKind::Host(GuessKind::Chained)), (4, FrontKind::Host(GuessKind::Head))]);
+    // Claiming a pass queued three deep, idle past the chain.
+    let round = started(round.abandon(), 4, FrontGrant::Exactly(3));
+    assert_eq!(forward(&round).tokens, tokens(&[11, 12, 13, 11]));
+    assert_eq!(kinds(&forward(&round)).last(), Some(&(5, FrontKind::Idle)));
+    // Its guess fell: 5 is emitted all the same, and a chain of none
+    // leaves the next pass its exact row.
+    let generation = complete(round, &[5], Vec::new(), 0);
+    let round = started(generation, 4, FrontGrant::UpTo(2));
+    assert_eq!((forward(&round).tokens, forward(&round).chain), (vec![TokenId(5)], Some(ChainEntry { position: 19 })));
+    let generation = round.abandon();
+    // Its head entered the pending token past the target's rows.
+    let checkpoint = generation.method_checkpoint().unwrap();
+    let MethodCheckpoint::Mtp(state) = &checkpoint else { panic!("an MTP checkpoint") };
+    assert_eq!((state.position(), state.target_rows()), (19, 19));
+    assert!(checkpoint.resumes(MethodChoice::Mtp { proposals: 3 }, 19, Some(TokenId(5))));
+    assert!(!checkpoint.resumes(MethodChoice::Mtp { proposals: 3 }, 19, Some(TokenId(6))), "another successor");
+    assert!(!checkpoint.resumes(MethodChoice::Mtp { proposals: 3 }, 19, None), "a path ending there");
+}
+
+/// MTP on a load that fronts runs a pass granted verify rows on its chain
+/// as acceptable rows, entering nothing behind it: it emits its exact row's
+/// token and every guess that stood, and its accepted rows' pairs, their
+/// features read to the host, trail the head, which a checkpoint exports
+/// with the successor's pair open. The next round, whatever its grant, is
+/// the host head transaction entering them and drafting as deep as that
+/// grant holds, at most the head's width; its proposals are the next
+/// pass's chain, the head's guesses, and that pass enters the head on the
+/// device again, from the position past every pair.
+#[test]
+fn mtp_on_a_fronting_load_verifies_its_chain_and_drafts_the_next_on_the_host() {
+    use magnitude_executor::{ChainEntry, DraftForm, FrontKind, Guess, GuessKind, HeadPhase};
+    let options = Options {
+        max_tokens: 16,
+        output_capacity: 16,
+        context_limit: 64,
+        method: MethodChoice::Mtp { proposals: 3 },
+        ..options()
+    };
+    let prompt = (1..=17).map(TokenId).collect::<Vec<_>>();
+    let layout = InputLayout::new(17, vec![]).unwrap();
+    let method = Arc::new(Mtp::new("fixture", 3).unwrap().fronting().unwrap());
+    let generation = resident(Generation::new_with_method(prompt, layout, options, None, method).unwrap());
+    let started = |generation: Generation, allowance: usize, grant: FrontGrant| match generation.start_round(RequestId(1), allowance, grant) {
+        Ok(RoundStart::Target(round)) => round,
+        _ => panic!("expected a target round"),
+    };
+    let complete = |round: StartedRound, samples: &[u32], chain: Vec<Guess>| {
+        let samples = samples.iter().copied().map(TokenId).collect::<Vec<_>>();
+        let transition = round.prepare_round_transition(RequestId(1), &samples, chain, Some(feature(1)), &mut Rows).unwrap();
+        let (generation, effects) = round.commit(transition);
+        assert!(effects.operations.is_empty(), "a pass submits no head transaction behind it");
+        generation
+    };
+    let guess = |token, kind| Guess { token: TokenId(token), kind };
+    // The closing chunk enters its selection, 10, and a front pass the
+    // head's guess 11, which stood: the chain is 12, 13.
+    let generation = complete(started(generation, 32, FrontGrant::UpTo(0)), &[10], vec![guess(11, GuessKind::Head)]);
+    let generation = complete(
+        started(generation, 4, FrontGrant::UpTo(1)),
+        &[11],
+        vec![guess(12, GuessKind::Chained), guess(13, GuessKind::Head)],
+    );
+    assert_eq!((generation.resident_position(), generation.front_guess()), (18, Some(GuessKind::Chained)));
+    // Granted three verify rows, it verifies the chain's two, entering
+    // nothing behind it.
+    let round = started(generation, 4, FrontGrant::Verify(3));
+    let verify = forward(&round);
+    assert_eq!((verify.kind, verify.tokens.clone(), verify.chain), (WorkKind::Verify, tokens(&[11, 12, 13]), None));
+    assert!(verify.demand.contains(Demand::SELECT | Demand::FEATURES) && verify.front.is_empty());
+    assert_eq!((verify.committed, verify.selects.len(), round.round_publication_bound()), (1, 3, 3));
+    // Both guesses stood: it emits them and its successor.
+    let generation = complete(round, &[12, 13, 14], Vec::new());
+    assert_eq!((generation.generated(), generation.resident_position()), (&tokens(&[10, 11, 12, 13, 14])[..], 21));
+    // The head trails by the three pairs; a checkpoint holds the
+    // successor's open.
+    let checkpoint = generation.method_checkpoint().unwrap();
+    let MethodCheckpoint::Mtp(state) = &checkpoint else { panic!("an MTP checkpoint") };
+    assert_eq!((state.position(), state.target_rows()), (18, 21));
+    assert!(checkpoint.resumes(MethodChoice::Mtp { proposals: 3 }, 21, Some(TokenId(7))), "any successor");
+    assert_eq!(generation.front_guess(), Some(GuessKind::Head), "it drafts its chain first");
+    // Granted two front rows, it first enters the pairs and drafts two.
+    let (generation, operations) = match generation.start_round(RequestId(1), 4, FrontGrant::UpTo(2)) {
+        Ok(RoundStart::Method(generation, operations)) => (generation, operations),
+        _ => panic!("expected the head transaction"),
+    };
+    let [operation @ Operation::Head { phase: HeadPhase::Generation, tokens: entered, conditioning, position: 18, proposals, form: DraftForm::Chained, .. }] = operations.as_slice() else {
+        panic!("one head transaction from the head's position: {operations:?}");
+    };
+    assert_eq!((entered.clone(), row_ids(conditioning), proposals.len()), (tokens(&[12, 13, 14]), vec![(1, 0), (1, 1), (1, 2)], 2));
+    let selected = |token| Selected { token: TokenId(token), status: 0 };
+    let outcome = Outcome::Head { proposals: vec![selected(15), selected(16)], confidence: None };
+    let transition = generation.prepare_method_transition(operation, &outcome).unwrap();
+    assert_eq!(transition.decision().accepted_rows, 3, "it commits the pairs it entered");
+    let mut generation = generation;
+    generation.commit_method_transition(transition);
+    // Its proposals are the pass's chain, and the pass enters the head
+    // past every pair.
+    let round = started(generation, 4, FrontGrant::UpTo(2));
+    let front = forward(&round);
+    assert_eq!((front.tokens.clone(), front.chain), (tokens(&[14, 15, 16]), Some(ChainEntry { position: 21 })));
+    assert_eq!(front.front.iter().map(|row| row.kind).collect::<Vec<_>>(), [FrontKind::Host(GuessKind::Head); 2]);
+    let generation = complete(round, &[15], vec![guess(16, GuessKind::Chained)]);
+    let MethodCheckpoint::Mtp(state) = generation.method_checkpoint().unwrap() else { panic!("an MTP checkpoint") };
+    assert_eq!((state.position(), state.target_rows()), (22, 22));
+}
+
+fn tokens(tokens: &[u32]) -> Vec<TokenId> {
+    tokens.iter().copied().map(TokenId).collect()
 }

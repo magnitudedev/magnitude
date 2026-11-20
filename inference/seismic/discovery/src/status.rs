@@ -7,12 +7,34 @@
 //! here counts it.
 
 use crate::gather::Natives;
-use crate::host::{HostSample, ObservationError};
+use crate::host::HostSample;
 use seismic_topology::{
     AccessPath, AccessPathId, DeviceTopology, ExecutorId, GrantSource, Reported, ReportedBy, StoreId, StoreKind,
 };
 use std::collections::HashMap;
+use std::fmt;
 use std::time::SystemTime;
+
+/// Why a live status observation could not be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservationError {
+    /// This platform or configuration offers no qualified facility for the
+    /// observation.
+    Unsupported(String),
+    /// The native query failed.
+    Failed(String),
+}
+
+impl fmt::Display for ObservationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported(message) => write!(f, "observation unsupported: {message}"),
+            Self::Failed(message) => write!(f, "observation failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ObservationError {}
 
 /// One timestamped reading of what needs no opened executor.
 #[derive(Clone, Debug, PartialEq, Eq)]

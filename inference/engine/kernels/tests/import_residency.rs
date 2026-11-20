@@ -1,5 +1,5 @@
 mod declared;
-use magnitude_kernels::{constants, import_dense, landing_extent, repack_weight, routed_round, routed_step, SlotTable};
+use magnitude_kernels::{constants, import_dense, repack_weight, routed_round, routed_step, SlotTable};
 
 mod e4m3;
 
@@ -667,17 +667,19 @@ fn streamed_conversion(
         tensor
     };
     let zeros = |element: seismic::Element, shape: &[u64]| seismic::Tensor::zeros(&charges, element, shape).unwrap();
-    let mut step = words(&[0, 0]);
+    let mut step = words(&[0; constants::STEP_WORDS as usize]);
+    let none = zeros(seismic::Element::i32(), &[0, 2]);
     declared::prepared(device, &routed_step::native_entry(), &seismic::NativeSpecialization::new())
         .unwrap()
         .call(&charges, routed_step::Args {
             step: &mut step,
-            sequence: &words(&[SEQUENCE, 0]),
+            sequence: &words(&magnitude_kernels::step_words(SEQUENCE as u64, 0)),
+            guesses: &none,
         })
         .unwrap();
     // Every record into its own slot, all landed.
     let records = shape[0];
-    let entry = |index: u64| landing_extent(index) as usize;
+    let entry = |index: u64| constants::LANDING_ENTRY(index) as usize;
     let mut landing = vec![0; entry(records)];
     landing[constants::LANDING_HEAD as usize] = SEQUENCE;
     landing[constants::LANDING_HEAD as usize + 1] = records as i32;
@@ -688,13 +690,13 @@ fn streamed_conversion(
     // The round's lane answered for the step.
     let table = SlotTable::scratch(1, 1);
     let mut scratch = vec![0; table.words() as usize];
-    scratch[(table.lane(SEQUENCE as u64, constants::SCRATCH_ROUND) + constants::SLOT_ANSWER) as usize] = SEQUENCE;
+    scratch[(table.lane(SEQUENCE as u64, constants::ROUND_LANE(0)) + constants::SLOT_ANSWER) as usize] = SEQUENCE;
     let bf16 = seismic::Element::bf16();
     let down = [records, shape[2], shape[1]];
     let mut gate = zeros(destination, &[0, shape[1], shape[2]]);
     let mut slots = zeros(destination, shape);
     let mut down_slots = zeros(bf16, &down);
-    let list = magnitude_kernels::list_extent(1);
+    let list = magnitude_kernels::constants::LIST_ENTRY(1);
     let native = declared::prepared(
         device,
         &routed_round::native_entry_with(routed_round::Elements {

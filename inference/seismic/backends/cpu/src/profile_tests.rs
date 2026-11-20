@@ -110,7 +110,7 @@ fn stated_rows_equal_the_design_table() {
     );
 }
 
-/// The CPU target has no subgroup: one owner of that fact (C4a-1 (a)), and no
+/// The CPU target has no subgroup: one owner of that invariant (C4a-1 (a)), and no
 /// fragment format can exist without one.
 #[test]
 fn the_cpu_target_has_no_subgroup() {

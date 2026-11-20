@@ -33,30 +33,43 @@ const COALESCE_GAP: u64 = 128 * 1024;
 /// How a request's consumer waits on it: a step parked on it since an
 /// instant; a stream consuming it at the link's rate since an instant (a
 /// prompt group's conveyor, which keeps the link at its due depth and parks
-/// on no single read); none yet, a step expected to park on it from an
-/// instant (a hint, whose instant is a prediction: passing it parks
-/// nothing, and a step that comes to wait on it reprices it parked); or
-/// none at any instant (a load, a fill). The first two are due and order
-/// before every request read ahead, of one instant a parked one first; of
-/// those read ahead, an expected one orders by its instant, before every
-/// undated one.
+/// on no single read); none yet, the step expected to park on it, by the
+/// caller's count of steps (a read ahead: a step that comes to wait on it
+/// reprices it parked); or none at all (a load, a fill). The first two are
+/// due and order before every request read ahead, of one instant a parked
+/// one first; of those read ahead, an expected one orders before every
+/// undated one, an expected one by its step, the soonest first, and within
+/// a step, as an undated one, by its [`Want`]'s value. A read ahead carries
+/// no instant: its step is the caller's own count, so no estimate of when a
+/// step reaches it enters the order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Deadline {
     Parked(Instant),
     Streamed(Instant),
-    Expected(Instant),
+    Expected(u64),
     None,
 }
 
 impl Deadline {
-    /// What it orders by: due before an expected instant before none, then
-    /// its instant, then a parked wait before a stream's.
-    fn key(&self) -> (u8, Option<Instant>, bool) {
+    /// Its class: due, expected, or undated.
+    fn class(&self) -> u8 {
+        self.key().0
+    }
+
+    /// The step an expected one is wanted by; none other has one.
+    fn step(&self) -> u64 {
+        self.key().2
+    }
+
+    /// What it orders by: due before expected before none, then a due
+    /// one's instant, then an expected one's step, then a parked wait
+    /// before a stream's.
+    fn key(&self) -> (u8, Option<Instant>, u64, bool) {
         match *self {
-            Self::Parked(at) => (0, Some(at), false),
-            Self::Streamed(at) => (0, Some(at), true),
-            Self::Expected(at) => (1, Some(at), false),
-            Self::None => (2, None, false),
+            Self::Parked(at) => (0, Some(at), 0, false),
+            Self::Streamed(at) => (0, Some(at), 0, true),
+            Self::Expected(step) => (1, None, step, false),
+            Self::None => (2, None, 0, false),
         }
     }
 }
@@ -91,14 +104,18 @@ impl Standing {
 }
 
 /// What a request is for, as its link orders it ("Order and depth"): its
-/// deadline, and its value, the step time it is expected to save, in
-/// seconds (a read ahead right with probability `p` saves its bytes' time
-/// at the volume's rate, `p · b/R`), which only orders requests of one
-/// deadline. A request is **due** while a consumer waits on it, a step
-/// parked or a stream at the link's rate; an expected deadline's passing
-/// makes none due, since only a step's own wait says one waits. More
-/// urgent orders first: due before read ahead, the earlier deadline, then
-/// the greater value.
+/// deadline, and its value, the probability its consumer uses it (one
+/// wanted at no instant, a load's or a fill's, is worth what its caller
+/// says). A request is **due** while a consumer waits on it, a step parked
+/// or a stream at the link's rate; an expected deadline's passing makes
+/// none due, since only a step's own wait says one waits. More urgent
+/// orders first: due before read ahead, by its instant; of those read
+/// ahead, expected before undated, an expected one wanted by a sooner step
+/// first, then the greater value. A read ahead takes drive time no queued
+/// parked read waits for ("Order and depth"), where a right one saves its
+/// consumer's wait only if it lands before that step parks on it and a
+/// wrong one spends its bytes' time: so the soonest wanted take it first,
+/// and of one step the likeliest.
 #[derive(Clone, Copy, Debug)]
 pub struct Want {
     deadline: Deadline,
@@ -111,10 +128,10 @@ impl Want {
         Self::new(Deadline::Parked(Instant::now()), 0.)
     }
 
-    /// Read ahead, a step expected to park on it from `deadline`; worth
-    /// `value`.
-    pub fn expected(deadline: Instant, value: f64) -> Self {
-        Self::new(Deadline::Expected(deadline), value)
+    /// Read ahead, step `step` (the caller's count) expected to park on
+    /// it, used with probability `value`.
+    pub fn expected(step: u64, value: f64) -> Self {
+        Self::new(Deadline::Expected(step), value)
     }
 
     /// Due now, consumed by a stream at the link's rate: a prompt group's
@@ -129,7 +146,7 @@ impl Want {
     }
 
     fn new(deadline: Deadline, value: f64) -> Self {
-        assert!(value.is_finite() && value >= 0., "a want's value is seconds saved, {value}");
+        assert!(value.is_finite() && value >= 0., "a want's value is a probability of use, {value}");
         Self { deadline, value }
     }
 
@@ -158,7 +175,14 @@ impl Want {
 
 impl Ord for Want {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.deadline.cmp(&other.deadline).then_with(|| other.value.total_cmp(&self.value))
+        // A due request is worth nothing (`Self::now`, `Self::streamed`):
+        // its instant orders it. An expected one's step leads its value.
+        self.deadline
+            .class()
+            .cmp(&other.deadline.class())
+            .then_with(|| self.deadline.step().cmp(&other.deadline.step()))
+            .then_with(|| other.value.total_cmp(&self.value))
+            .then_with(|| self.deadline.cmp(&other.deadline))
     }
 }
 

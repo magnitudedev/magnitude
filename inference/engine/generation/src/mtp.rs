@@ -24,17 +24,23 @@
 //! feature, then each verification's last accepted row's. The head chains
 //! its proposals on the device over the target's committed history and
 //! writes nothing.
+//!
+//! On a load that fronts, MTP with a head of its own history proposes
+//! nothing on its own: its generations decode in front passes on the chain
+//! its head makes, on the device behind a front pass, or in the host head
+//! transaction ([`HeadTransaction`]) that enters a verify pass's accepted
+//! pairs (`front.rs`).
 
 use crate::{
-    method::{OpenFeature, PendingRows},
+    method::{DraftTail, OpenFeature, PendingRows},
     DraftBudget, DraftCheckpoint, DraftController, DraftLoad, DraftOutlook, Method, MethodCheckpoint,
     MethodCheckpointError, MethodEffects, MethodRequirements, MethodState, Propose, TimedLaunch,
     Verification,
 };
-use crate::{DraftHistory, DraftRoundState};
+use crate::{front::FrontState, DraftHistory, DraftRoundState};
 use magnitude_executor::{
     Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, HeadPhase, LaunchDuration,
-    Operation, Outcome, RequestId, SelectSpec, TokenId,
+    Guess, GuessKind, Operation, Outcome, RequestId, SelectSpec, Selected, TokenId,
 };
 use std::sync::Arc;
 
@@ -45,6 +51,8 @@ pub struct Mtp {
     drafter: Drafter,
     budget: DraftBudget,
     adaptive: Option<Arc<DraftLoad>>,
+    /// Whether its generations decode in front passes ([`Self::fronting`]).
+    fronting: bool,
 }
 
 impl Mtp {
@@ -74,6 +82,7 @@ impl Mtp {
                 verified: proposals,
             },
             adaptive: None,
+            fronting: false,
         })
     }
     /// Draft and verify `budget` each round; its generated width must fit
@@ -90,6 +99,19 @@ impl Mtp {
         self.identity.push_str(":adaptive");
         self.adaptive = Some(Arc::default());
         self
+    }
+
+    /// MTP on a load that fronts (`magnitude_executor::TwoRowDecode`): its
+    /// generations never propose on their own, and decode in passes of the
+    /// form their launches grant on the chain the head makes
+    /// (`FrontState`). Only a head of its own history fronts.
+    pub fn fronting(mut self) -> Result<Self, String> {
+        if self.drafter != Drafter::Mtp {
+            return Err("only a head of its own history decodes in front passes".into());
+        }
+        self.identity.push_str(":front");
+        self.fronting = true;
+        Ok(self)
     }
 }
 
@@ -126,6 +148,9 @@ impl Method for Mtp {
         &self,
         checkpoint: Option<&MethodCheckpoint>,
     ) -> Result<Box<dyn MethodState>, String> {
+        if self.fronting {
+            return Ok(Box::new(FrontState::restore(checkpoint)?));
+        }
         Ok(Box::new(DrafterState::restore(
             self.drafter,
             self.proposals,
@@ -133,6 +158,9 @@ impl Method for Mtp {
             self.adaptive.clone(),
             checkpoint,
         )?))
+    }
+    fn decodes_two_rows(&self) -> bool {
+        self.fronting
     }
 }
 
@@ -197,6 +225,111 @@ impl Drafter {
     }
 }
 
+/// A host head transaction, until its outcome reconciles: the drafter
+/// enters complete pairs, each token with the target feature of the row
+/// before it, from its position, then drafts one proposal per select from
+/// the last pair (none of a transaction that only enters). Every head
+/// transaction a target-conditioned drafter submits from the host is one,
+/// a drafting state's and a head decoding in front passes' alike.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HeadTransaction {
+    operation: Operation,
+}
+
+/// What a head transaction did, once reconciled: the pairs it entered,
+/// the proposals it was asked for, and its proposal ([`proposal`]) with the
+/// drafter's confidence in each where it gave one.
+pub(crate) struct Drafted {
+    pub(crate) entered: usize,
+    pub(crate) requested: usize,
+    pub(crate) proposal: Vec<TokenId>,
+    pub(crate) confidence: Option<Vec<f32>>,
+}
+
+/// A head transaction's proposal: its selections up to the first it
+/// selected nothing at, since each drafted proposal conditions on the one
+/// before it.
+pub(crate) fn proposal(selected: &[Selected]) -> Vec<TokenId> {
+    selected
+        .iter()
+        .take_while(|selected| selected.status == 0)
+        .map(|selected| selected.token)
+        .collect()
+}
+
+/// The chain a head transaction drafted for a head decoding in front
+/// passes, from its selections (`Outcome::Head`'s): its proposal, each the
+/// head's guess. The one reading of a drafted chain, generation's and the
+/// evaluation harness's alike.
+pub fn drafted_chain(selected: &[Selected]) -> Vec<Guess> {
+    proposal(selected)
+        .into_iter()
+        .map(|token| Guess { token, kind: GuessKind::Head })
+        .collect()
+}
+
+impl HeadTransaction {
+    /// Enter `pairs` at `position`, drafting a proposal per `proposals`.
+    pub(crate) fn new(
+        request: RequestId,
+        phase: HeadPhase,
+        pairs: PendingRows,
+        position: usize,
+        proposals: Vec<SelectSpec>,
+        form: DraftForm,
+    ) -> Result<Self, String> {
+        let operation = Operation::Head {
+            request,
+            phase,
+            tokens: pairs.tokens,
+            conditioning: pairs.features,
+            position,
+            proposals,
+            form,
+        };
+        operation.validate().map_err(|error| error.to_string())?;
+        Ok(Self { operation })
+    }
+
+    pub(crate) fn operation(&self) -> &Operation {
+        &self.operation
+    }
+
+    /// Its outcome, of exactly this transaction.
+    pub(crate) fn reconcile(self, operation: &Operation, outcome: Outcome) -> Result<Drafted, String> {
+        let (
+            Operation::Head {
+                tokens, proposals, ..
+            },
+            Outcome::Head {
+                proposals: selected,
+                confidence,
+            },
+        ) = (&self.operation, outcome)
+        else {
+            return Err("head transaction outcome has the wrong kind".into());
+        };
+        if self.operation != *operation
+            || selected.len() != proposals.len()
+            || confidence
+                .as_ref()
+                .is_some_and(|confidence| confidence.len() != selected.len())
+        {
+            return Err("head transaction outcome differs from its transaction".into());
+        }
+        let proposal = proposal(&selected);
+        Ok(Drafted {
+            entered: tokens.len(),
+            requested: proposals.len(),
+            confidence: confidence.map(|mut confidence| {
+                confidence.truncate(proposal.len());
+                confidence
+            }),
+            proposal,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DrafterState {
     drafter: Drafter,
@@ -208,7 +341,7 @@ pub(crate) struct DrafterState {
     /// A committed feature whose successor token is not known yet.
     open: Option<OpenFeature>,
     /// The drafter transaction `propose` returned, until it reconciles.
-    head: Option<Operation>,
+    head: Option<HeadTransaction>,
     /// Reconciled proposals awaiting their verification.
     proposal: Option<Vec<TokenId>>,
     budget: DraftBudget,
@@ -240,8 +373,7 @@ impl DrafterState {
         let checkpoint = match checkpoint {
             None => DraftCheckpoint {
                 position: 0,
-                pending: None,
-                open: None,
+                tail: DraftTail::EMPTY,
                 skipped: 0,
             },
             Some(checkpoint) => drafter.restored(checkpoint).cloned().ok_or_else(|| {
@@ -251,17 +383,21 @@ impl DrafterState {
                 )
             })?,
         };
+        // Only a head decoding in front passes enters past the target.
+        let DraftTail::Trailing { pending, open } = checkpoint.tail else {
+            return Err(format!("a drafting {} state enters no successor", drafter.name()));
+        };
         // A head reading the target's history retains nothing at a
         // boundary: the next chunk's closing feature selects its anchor.
-        if !drafter.keeps_history() && (checkpoint.pending.is_some() || checkpoint.open.is_some()) {
+        if !drafter.keeps_history() && (pending.is_some() || open.is_some()) {
             return Err("a head reading the target's history restores no feature rows".into());
         }
         Ok(Self {
             drafter,
             proposals,
             position: checkpoint.position,
-            pending: checkpoint.pending,
-            open: checkpoint.open,
+            pending,
+            open,
             head: None,
             proposal: None,
             budget,
@@ -346,23 +482,7 @@ impl DrafterState {
     }
 
     fn append(&mut self, tokens: Vec<TokenId>, features: FeatureRows) -> Result<(), String> {
-        if tokens.len() != features.rows() {
-            return Err(format!(
-                "{} pairs differ from their feature rows",
-                self.drafter.name()
-            ));
-        }
-        self.pending = Some(match self.pending.take() {
-            None => PendingRows { tokens, features },
-            Some(mut pending) => {
-                pending.features = pending
-                    .features
-                    .concat(&features)
-                    .map_err(|error| error.to_string())?;
-                pending.tokens.extend(tokens);
-                pending
-            }
-        });
+        self.pending = Some(PendingRows::joined(self.pending.take(), tokens, features)?);
         Ok(())
     }
 
@@ -395,23 +515,25 @@ impl DrafterState {
                     .map_err(|error| error.to_string())?,
             });
         }
-        let operation = Operation::Head {
+        let transaction = HeadTransaction::new(
             request,
             phase,
-            tokens: pending.tokens[..entered].to_vec(),
-            conditioning,
-            position: call.position,
-            proposals: Vec::new(),
-            form: self.drafter.form(),
-        };
-        operation.validate().map_err(|error| error.to_string())?;
-        self.head = Some(operation.clone());
+            PendingRows {
+                tokens: pending.tokens[..entered].to_vec(),
+                features: conditioning,
+            },
+            call.position,
+            Vec::new(),
+            self.drafter.form(),
+        )?;
+        let operation = transaction.operation().clone();
+        self.head = Some(transaction);
         Ok(MethodEffects {
             operations: vec![operation],
         })
     }
 
-    fn open_rows(reader: &mut dyn FeatureReader, open: OpenFeature) -> Result<FeatureRows, String> {
+    pub(crate) fn open_rows(reader: &mut dyn FeatureReader, open: OpenFeature) -> Result<FeatureRows, String> {
         match open {
             OpenFeature::Host(rows) => Ok(rows),
             OpenFeature::Device(feature) => Self::read(
@@ -425,7 +547,7 @@ impl DrafterState {
         }
     }
 
-    fn read(
+    pub(crate) fn read(
         reader: &mut dyn FeatureReader,
         features: FeatureRef,
         start: usize,
@@ -604,19 +726,18 @@ impl MethodState for DrafterState {
         else {
             unreachable!("positive proposal describes a head transaction");
         };
-        let operation = Operation::Head {
+        let Ok(transaction) = HeadTransaction::new(
             request,
-            phase: HeadPhase::Generation,
-            tokens: pending.tokens.clone(),
-            conditioning: pending.features.clone(),
-            position: call.position,
-            proposals: selects[..generated].to_vec(),
-            form: self.drafter.form(),
-        };
-        if operation.validate().is_err() {
+            HeadPhase::Generation,
+            pending.clone(),
+            call.position,
+            selects[..generated].to_vec(),
+            self.drafter.form(),
+        ) else {
             return Propose::Tokens(Vec::new());
-        }
-        self.head = Some(operation.clone());
+        };
+        let operation = transaction.operation().clone();
+        self.head = Some(transaction);
         Propose::Pending(vec![operation])
     }
 
@@ -735,54 +856,23 @@ impl MethodState for DrafterState {
 
     fn reconcile(&mut self, operation: &Operation, outcome: Outcome) -> Result<(), String> {
         let name = self.drafter.name();
-        let head = self
+        let drafted = self
             .head
             .take()
-            .ok_or_else(|| format!("{name} has no pending drafter transaction"))?;
-        let (
-            Operation::Head {
-                tokens, proposals, ..
-            },
-            Outcome::Head {
-                proposals: selected,
-                confidence,
-            },
-        ) = (&head, outcome)
-        else {
-            return Err(format!("{name} drafter outcome has the wrong kind"));
-        };
-        if head != *operation
-            || selected.len() != proposals.len()
-            || confidence
-                .as_ref()
-                .is_some_and(|confidence| confidence.len() != selected.len())
-        {
-            return Err(format!(
-                "{name} drafter outcome differs from its transaction"
-            ));
-        }
+            .ok_or_else(|| format!("{name} has no pending drafter transaction"))?
+            .reconcile(operation, outcome)
+            .map_err(|error| format!("{name}: {error}"))?;
         // A drafter without history entered nothing: its position is the
         // target's, which only committed target rows move.
         if self.drafter.keeps_history() {
-            self.position = self.round_state().entered(tokens.len())?.position();
+            self.position = self.round_state().entered(drafted.entered)?.position();
         }
-        if !proposals.is_empty() {
+        if drafted.requested > 0 {
             self.pending = None;
-            let proposal = selected
-                .iter()
-                .take_while(|selected| selected.status == 0)
-                .map(|selected| selected.token)
-                .collect::<Vec<_>>();
             if let Some(control) = &mut self.control {
-                control.drafted(
-                    proposals.len(),
-                    &proposal,
-                    confidence
-                        .as_ref()
-                        .map(|confidence| &confidence[..proposal.len()]),
-                );
+                control.drafted(drafted.requested, &drafted.proposal, drafted.confidence.as_deref());
             }
-            self.proposal = Some(proposal);
+            self.proposal = Some(drafted.proposal);
         }
         Ok(())
     }
@@ -815,8 +905,7 @@ impl MethodState for DrafterState {
             // retained prefix; its request's next chunk selects its own.
             return Ok(self.drafter.checkpoint(DraftCheckpoint {
                 position: self.position,
-                pending: None,
-                open: None,
+                tail: DraftTail::EMPTY,
                 skipped: 0,
             }));
         }
@@ -829,22 +918,14 @@ impl MethodState for DrafterState {
         // inside the prefix.
         if open.is_none() && self.anchored {
             if let Some(rows) = pending.take() {
-                let last = rows.tokens.len() - 1;
-                open = Some(OpenFeature::Host(
-                    rows.features.slice(last, 1).expect("pending row shape"),
-                ));
-                if last > 0 {
-                    pending = Some(PendingRows {
-                        tokens: rows.tokens[..last].to_vec(),
-                        features: rows.features.slice(0, last).expect("pending row shape"),
-                    });
-                }
+                let (rest, last) = rows.opened();
+                pending = rest;
+                open = Some(OpenFeature::Host(last));
             }
         }
         Ok(self.drafter.checkpoint(DraftCheckpoint {
             position: self.position,
-            pending,
-            open,
+            tail: DraftTail::Trailing { pending, open },
             skipped: self.skipped,
         }))
     }

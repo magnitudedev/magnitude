@@ -5,7 +5,7 @@ edition = "2024"
 license.workspace = true
 
 # The evaluation harness: the only in-process driver of the engine. It runs
-# fixture sets (specs/26-10-08/evaluation-contracts.md) through the serving
+# benchmark templates (specs/26-11-17/benchmark-templates.md) through the serving
 # chat path and the executor, and writes evaluation result records.
 [[bin]]
 name = "magnitude-harness"
@@ -19,6 +19,7 @@ magnitude-chat = { path = "../../engine/chat" }
 # The engine's development tuning tools (pins and the survey), which only the
 # harness enables; a served engine is built without them.
 magnitude-engine = { path = "../../engine", features = ["tuning-survey", "expert-routing", "machine-line"] }
+magnitude-cost-model = { path = "../../engine/cost-model" }
 magnitude-executor = { path = "../../engine/executor" }
 magnitude-family-contracts = { path = "../../engine/families/contracts" }
 magnitude-generation = { path = "../../engine/generation" }
@@ -30,7 +31,7 @@ magnitude-state = { path = "../../engine/state" }
 seismic.workspace = true
 seismic-io.workspace = true
 serde.workspace = true
-# Fixture key order is rendered: chat templates print tool schemas in it.
+# Session key order is rendered: chat templates print tool schemas in it.
 serde_json = { workspace = true, features = ["preserve_order"] }
 sha2.workspace = true
 # `memory`'s worker prints the scheduler's events.
@@ -41,6 +42,8 @@ tracing-subscriber.workspace = true
 # The controlled execution domain (`magnitude_executor::fixtures`) the
 # harness's step boundary is tested over.
 magnitude-executor = { path = "../../engine/executor", features = ["fixtures"] }
+# The reference expert lines the bar's tests are measured against.
+magnitude-cost-model = { path = "../../engine/cost-model", features = ["fixtures"] }
 
 [lints]
 workspace = true

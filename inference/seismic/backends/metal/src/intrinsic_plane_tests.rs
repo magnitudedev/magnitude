@@ -67,7 +67,7 @@ fn matrix_operand_preserves_pre_and_post_plane_views() {
     let output_view = construction.view(output_view, registry::dense(DType::F32));
     let mut builder = construction.portable_kernel(
         &mut arena,
-        target.facts(),
+        target.device_info(),
         target.addressable_resources(),
         target.vectors(),
     );

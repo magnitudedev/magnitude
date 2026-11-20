@@ -1,56 +1,31 @@
-"""Fixtures: the only model inputs of evaluation, as deterministic chat conversations."""
+"""Fixtures: the only model inputs of evaluation. A template (``<key>:<context>``, e.g.
+``repeat:8k``) names one benchmark request built from a pinned, checksummed source as
+deterministic chat sessions: ``repeat`` and ``twist`` (Moby Dick), ``retrieve`` (RULER),
+``code`` (BigCodeBench), and ``tools`` (BFCL v4)."""
 
-from . import code, prose, retrieval, tools, validation, vision
-from .fixture import (
-    FAMILIES,
+from . import bfcl, bigcodebench, moby, ruler, validation
+from .session import (
+    KEYS,
     Conversation,
-    Family,
-    FixedSizing,
-    Fixture,
     Generation,
+    Key,
+    Session,
     Source,
-    TurnSizing,
-    encode_set,
-    read_set,
-    write_set,
 )
-
-
-def build(family: Family, *, count: int = 8, queries: int = 4) -> list[Fixture]:
-    """Build one family's default fixture set from its pinned sources.
-
-    ``count`` is the number of independent sessions (lanes); ``queries`` is the number of
-    keys a ``retrieval`` probe asks for.
-    """
-    if family == "tools":
-        return tools.build(*tools.load(), count=count)
-    if family in ("prose-continue", "prose-repeat", "prose-shift"):
-        return prose.build(*prose.load(), family, count=count)
-    if family == "retrieval":
-        return retrieval.build(count=count, queries=queries)
-    if family == "vision":
-        return list(vision.fixtures())
-    if family == "code":
-        return code.build(*code.load(), count=count)
-    raise ValueError(f"unknown fixture family: {family}")
-
+from .template import Template, TemplateFile
 
 __all__ = [
-    "FAMILIES",
+    "KEYS",
     "Conversation",
-    "Family",
-    "FixedSizing",
-    "Fixture",
     "Generation",
+    "Key",
+    "Session",
     "Source",
-    "TurnSizing",
-    "build",
-    "code",
-    "encode_set",
-    "prose",
-    "read_set",
-    "retrieval",
-    "tools",
+    "Template",
+    "TemplateFile",
+    "bfcl",
+    "bigcodebench",
+    "moby",
+    "ruler",
     "validation",
-    "write_set",
 ]

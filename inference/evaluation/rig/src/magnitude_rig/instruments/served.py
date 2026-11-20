@@ -6,7 +6,7 @@ answers and what the service logged (`host/served.py`).
 The service runs its own measurement job beside the load, under its own device lock, so this is
 the one instrument on which nothing has measured before a load. `--weight-cap` and `--context` are
 the service's evaluation bounds: without them a load is the product's, at the model's declared
-context, if assessment admits it.
+context, if assessment admits it (a `--context` holds the template's context and its answers).
 
 Scenarios, each from an empty kernel cache of the run's own:
 
@@ -21,10 +21,13 @@ Scenarios, each from an empty kernel cache of the run's own:
 - `failure`: a stretch of the model file read as EIO under two answers: those that named it
   fail, the load serves on, and where its answer parts from the one before.
 
-Every complete answer is then judged against the model's own distributions: the harness loads
-the model whole on the same device and teacher-forces each answer as the scored reply of its
-conversation, rendered as the service rendered it, so every row is the reference fed the served
-tokens before it. The service exposes no logits, so the served tokens, not their distributions,
+The prompts are `--template`'s lanes 0 and 1, each sized to the template's context as the harness
+renders it, asked up to the probe's question, and each answer is held to at most the tokens of
+the probe's canonical answer, so the answered conversation fits the context. Every complete
+answer then becomes its conversation's final assistant turn, and the answers a template file of
+the same name (`answers.json`), which the harness's `logits` reads: it loads the model whole on
+the same device and teacher-forces each answer as the scored reply of its conversation, rendered
+as the service rendered it, so every row is the reference fed the served tokens before it. The service exposes no logits, so the served tokens, not their distributions,
 are held to the reference, by a bound on how far the service's arithmetic can move a margin.
 
 The bound is measured in the run. The service computes what the reference computes but in other
@@ -58,6 +61,9 @@ import json
 import re
 from pathlib import Path
 
+from magnitude_fixtures import TemplateFile
+
+from .. import templates
 from ..engine import Step, Weights
 from ..host import served
 from . import Answer, Instrument, JobResult, Plan, harness, kl
@@ -77,7 +83,7 @@ JUDGE = (
     "reference, decoded, output = sys.argv[1:4]\n"
     "header = json.load(open(os.path.join(reference, 'logits.json')))\n"
     "assert json.load(open(os.path.join(decoded, 'logits.json')))['rows'] == header['rows'], 'the two computations scored other rows'\n"
-    "tokens = {line['fixture_id']: line['tokens'] for line in map(json.loads, open(os.path.join(reference, 'rendered.jsonl')))}\n"
+    "tokens = {line['lane']: line['tokens'] for line in map(json.loads, open(os.path.join(reference, 'rendered.jsonl')))}\n"
     "rows = lambda run: numpy.memmap(os.path.join(run, 'logits.f32'), dtype='<f4', mode='r').reshape(-1, header['vocabulary'])\n"
     "a, b = rows(reference), rows(decoded)\n"
     "finite = [bool(numpy.isfinite(a[index]).all() and numpy.isfinite(b[index]).all()) for index in range(len(a))]\n"
@@ -96,13 +102,13 @@ JUDGE = (
     "                                              'decoded': float(decoded_row[top] - decoded_row[token])}\n"
     "judged = {}\n"
     "for index, row in enumerate(header['rows']):\n"
-    "    entry = judged.setdefault(row['fixture_id'], {'rows': 0, 'top': 0, 'worst': 0.0, 'worst_row': None, 'over': 0, 'nonfinite': 0})\n"
+    "    entry = judged.setdefault(str(row['lane']), {'rows': 0, 'top': 0, 'worst': 0.0, 'worst_row': None, 'over': 0, 'nonfinite': 0})\n"
     "    entry['rows'] += 1\n"
     "    if not finite[index]:\n"
     "        entry['nonfinite'] += 1\n"
     "        continue\n"
     "    logits = numpy.asarray(a[index], dtype=numpy.float64)\n"
-    "    margin = float(logits.max() - logits[tokens[row['fixture_id']][row['position'] + 1]])\n"
+    "    margin = float(logits.max() - logits[tokens[row['lane']][row['position'] + 1]])\n"
     "    entry['top'] += margin == 0.0\n"
     "    entry['over'] += margin >= bound and margin > 0.0\n"
     "    if margin > entry['worst']:\n"
@@ -126,37 +132,67 @@ def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--plain", action="store_true", help="decode plainly, the model's drafter left out")
 
 
+# Lanes asked: one prompt, and another for the scenarios that alternate two.
+LANES = 2
+# What the service is asked, on the host, from the harness's rendering of the template: `prompts`.
+PROMPTS = ("from pathlib import Path; import sys; from magnitude_rig.instruments.served import prompts; "
+           "prompts(*map(Path, sys.argv[1:4]))")
+
+
+def prompts(template: Path, rendered: Path, output: Path) -> None:
+    """Each rendered lane of `template` as the service is asked it: the conversation the harness
+    sized (its kept history) up to the probe's question, its offered tools, and the most tokens its
+    answer may take, at most its canonical answer's (the last scored span), so the conversation
+    answered fits the template's context as the canonical one does."""
+    sessions = TemplateFile.read(template).sessions
+    asked = []
+    for line in map(json.loads, rendered.read_text().splitlines()):
+        conversation = sessions[line["lane"]].conversation_with(line["history"])
+        start, end = line["scored_spans"][-1]
+        asked.append({"lane": line["lane"], "messages": conversation.messages[:conversation.prefix],
+                      "tools": conversation.tools, "answer_tokens": min(served.ANSWER_TOKENS, end - start)})
+    output.write_text(json.dumps(asked))
+
+
 def plan(arguments, source, host) -> Plan:
+    template = templates.file(arguments.template, LANES)
     bounds = (*(("--context", str(arguments.context)) if arguments.context else ()),
               *(("--weight-cap", str(arguments.weight_cap)) if arguments.weight_cap else ()),
               *(("--plain",) if arguments.plain else ()))
+    # The template's lanes as the harness sizes them: what the service is asked.
+    render = Step("render", (harness.EXECUTABLE, "render", "--artifacts", "{artifacts}",
+                             "--template", templates.argument(template), "--output", "{run_dir}"))
+    asked = Step("prompts", ("{venv}/bin/python", "-c", PROMPTS, templates.argument(template),
+                             "{runs}/render/rendered.jsonl", "{run_dir}/prompts.json"))
     job = Step("served", (
         "{python}", "-m", "magnitude_rig.host.served", "--service", SERVICE, "--bundle", "{catalog}/model-planner-inputs.bundle",
-        "--models", "{models}", "--artifacts", "{artifacts}", "--fixtures", f"{{inputs}}/{arguments.fixture.name}", "--scratch", "{root}/served",
+        "--models", "{models}", "--artifacts", "{artifacts}", "--template", templates.argument(template),
+        "--prompts", "{runs}/prompts/prompts.json", "--scratch", "{root}/served",
         "--run-dir", "{run_dir}", "--model", arguments.model, "--scenario", arguments.scenario, *bounds,
     ), HIDDEN.get(arguments.backend, ()), fresh=True)
     # The reference: the model whole, at its declared defaults, on the answers the service gave;
     # then the same rows computed as the service computes them: one sequence a row at a time,
-    # with the kernels a tuning search chooses, on the reference's exact tokens.
-    logits = (harness.EXECUTABLE, "logits", "--artifacts", "{artifacts}", "--fixtures", f"{{runs}}/served/{served.ANSWERS}",
+    # with the kernels a tuning search chooses, on the same rendering of the answers.
+    logits = (harness.EXECUTABLE, "logits", "--artifacts", "{artifacts}", "--template", f"{{runs}}/served/{served.ANSWERS}",
               "--output", "{run_dir}", "--build-identity", "{build_file}", "--cache-dir", "{engine_cache}/kernels",
               "--device", arguments.backend)
     answers = Step("logits", (*logits, "--tuning-defaults"))
-    decoded = Step("logits", (*logits, "--rendered", "{runs}/answers/rendered.jsonl", "--batch", "1"))
+    decoded = Step("logits", (*logits, "--batch", "1"))
     judge = Step("judge", ("{venv}/bin/python", "-c", JUDGE, "{runs}/answers", "{runs}/decoded", "{run_dir}/judged.json"))
-    return Plan(builds=(BUILD, *kl.BUILDS), jobs=(("served", job), ("answers", answers), ("decoded", decoded), ("judge", judge)),
+    return Plan(builds=(BUILD, *kl.BUILDS),
+                jobs=(("render", render), ("prompts", asked), ("served", job), ("answers", answers), ("decoded", decoded), ("judge", judge)),
                 device="device",
-                acquires=Weights(arguments.model, headers=True), files=(arguments.fixture,))
+                acquires=Weights(arguments.model, headers=True), files=(template,))
 
 
 def judged(served_run: Path, judge_run: Path) -> tuple[list[str], bool]:
     """Each answer's judgement, and whether every answer was judged and passed."""
-    answers = [json.loads(line) for line in (served_run / served.ANSWERS).read_text().splitlines()]
-    unjudged = json.loads((served_run / served.RESULTS).read_text()).get("unjudged", [])
+    record = json.loads((served_run / served.RESULTS).read_text())
+    answers, unjudged = record["answers"], record.get("unjudged", [])
     judgement = json.loads((judge_run / "judged.json").read_text())
     verdicts, bound = judgement["answers"], judgement["bound"]
     at = judgement["at"]
-    where = (f" (at {at['fixture_id']} position {at['position']}, token {at['token']}: {at['reference']:.4f} below its "
+    where = (f" (at answer {answers[at['lane']]['name']} position {at['position']}, token {at['token']}: {at['reference']:.4f} below its "
              f"row's top against {at['decoded']:.4f})") if at else ""
     lines = [f"largest move between the reference and the service-shaped computation of a margin below a row's top, "
              f"among the tokens competing with it, {bound:.4f}{where}: an answered token may sit under {bound:.4f} "
@@ -168,8 +204,8 @@ def judged(served_run: Path, judge_run: Path) -> tuple[list[str], bool]:
                         "so nothing is judged")
         failed.add("bound")
     for answer in answers:
-        name, given = answer["id"], answer["served"]
-        verdict = verdicts.get(name)
+        name, given = answer["name"], answer["served"]
+        verdict = verdicts.get(str(answer["lane"]))
         if given["tokens"] is None:
             lines.append(f"{name}: unjudged, the service reported no token count for it ({given['finish']})")
             failed.add(name)
@@ -205,6 +241,9 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
     report = tuple(json.loads(written.read_text())["report"])
     if wrong:
         return Answer((f"the service did not select {arguments.backend}: {strip(wrong[0])[-120:]}", *report), False)
+    for name in ("render", "prompts"):
+        if name in results and results[name].code != 0:
+            return Answer((f"asking the template: {name} exited {results[name].code}", *results[name].output()[-15:]), False)
     for name in ("answers", "decoded", "judge"):
         if name not in results or results[name].code != 0:
             ended = f"exited {results[name].code}" if name in results else "did not run"
@@ -219,7 +258,7 @@ INSTRUMENT = Instrument(
     kind="correctness",
     question="Does a load work through the real service, its measurement job beside it?",
     observable="the service's API answers and logs",
-    selectors=("backend", "host", "build", "model", "fixture", "purpose", "estimate"),
+    selectors=("backend", "host", "build", "model", "template", "purpose", "estimate"),
     configure=configure,
     plan=plan,
     answer=answer,

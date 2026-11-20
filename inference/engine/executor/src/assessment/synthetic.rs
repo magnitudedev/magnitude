@@ -112,7 +112,7 @@ pub fn costs() -> super::ExecutorCosts {
         chain: super::executor_costs::ChainCost {
             timing: seismic::measure::Timing { median: 1.2 * 8. * 5e-6, interval: None, samples: 8 },
             layers: 8,
-            calls: vec![super::demand::Work::default()],
+            calls: vec![seismic::measure::pricing::Work::default()],
         },
         launch_seconds: cost(5e-6),
         step_pipelined_seconds: cost(50e-6),
@@ -131,7 +131,7 @@ pub fn kind(id: u32) -> seismic::NativeKind {
 /// host memory at 50 GB/s, no CPU site, a convert at 100 GB/s.
 pub fn streamed_figures() -> super::StreamedFigures {
     super::StreamedFigures {
-        read: super::ReadLine::new(100e-6, 1.0 / 5e9).expect("a synthetic read line is valid"),
+        read: magnitude_cost_model::ReadLine::new(100e-6, 1.0 / 5e9).expect("a synthetic read line is valid"),
         memory: Some(1.0 / 50e9),
         site: None,
         convert: 1.0 / 100e9,
@@ -141,7 +141,7 @@ pub fn streamed_figures() -> super::StreamedFigures {
 /// Synthetic plan prices: [`costs`], [`streamed_figures`], and a resident
 /// step of 10 ms, 100 µs a row and 10 ns a token of depth, its streamed
 /// form's what the banked plan's streamed form adds to its experts held
-/// whole on [`costs`] (`assessment::decode_step`).
+/// whole on [`costs`] (`assessment::launch_prices`).
 pub fn plan_prices() -> crate::PlanPrices {
     plan_prices_on(costs())
 }
@@ -153,11 +153,11 @@ pub fn plan_prices_on(costs: super::ExecutorCosts) -> crate::PlanPrices {
         costs,
         streamed_figures(),
         Box::new(move |definition, banked| {
-            let forms = super::decode_step(definition, &banked.held_whole(definition)?, banked, steps.clone())?;
+            let prices = super::launch_prices(definition, &banked.held_whole(definition)?, banked, &steps)?;
             Ok(Box::new(move |rows, depth| {
-                let forms = forms(rows, depth)?;
+                let forms = prices.launch(rows, depth)?;
                 let resident = 10e-3 + f64::from(rows) * 100e-6 + f64::from(depth) * 10e-9;
-                Ok(super::FormSeconds { resident, streamed: resident + forms.streamed - forms.resident })
+                Ok(magnitude_cost_model::FormSeconds { resident, streamed: resident + forms.streamed - forms.resident })
             }))
         }),
     )

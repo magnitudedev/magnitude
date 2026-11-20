@@ -55,7 +55,7 @@ def test_summary_trims_the_top_tenth_of_a_percent():
 
 
 def positions(kl, agree=None) -> quality.Positions:
-    rows = tuple({"fixture_id": "f", "position": index} for index in range(len(kl)))
+    rows = tuple({"template": "t", "lane": 0, "position": index} for index in range(len(kl)))
     return quality.Positions(
         rows,
         np.asarray(kl, dtype=float),
@@ -120,10 +120,10 @@ def test_judge_compares_at_the_candidates_positions_the_base_measured():
 
 
 def test_compare_outputs_matches_a_named_samples_rows_by_position(tmp_path):
-    rows = [{"fixture_id": fixture, "position": position} for fixture in "fg" for position in range(4)]
+    rows = [{"template": "t", "lane": lane, "position": position} for lane in range(2) for position in range(4)]
     values = logits_fake.truth(rows)
     sampled = [rows[6], rows[2], rows[1]]
-    foreign = [rows[0], {"fixture_id": "f", "position": 9}]
+    foreign = [rows[0], {"template": "t", "lane": 0, "position": 9}]
     sample = {"windows": 3, "steps": 1}
     for name, digest, written, chosen in (
         ("a", "d1", rows, None),
@@ -157,6 +157,6 @@ def test_compare_outputs_matches_a_named_samples_rows_by_position(tmp_path):
 def test_worst_positions_are_diagnostic():
     found = quality.worst(positions([0.1, 0.5, 0.3], [True, False, True]), count=2)
     assert found == [
-        {"fixture_id": "f", "position": 1, "kl": 0.5, "agree": False},
-        {"fixture_id": "f", "position": 2, "kl": 0.3, "agree": True},
+        {"template": "t", "lane": 0, "position": 1, "kl": 0.5, "agree": False},
+        {"template": "t", "lane": 0, "position": 2, "kl": 0.3, "agree": True},
     ]

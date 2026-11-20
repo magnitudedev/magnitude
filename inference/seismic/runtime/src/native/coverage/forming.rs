@@ -16,7 +16,7 @@ pub enum Target {
     },
     #[cfg(target_os = "macos")]
     Metal {
-        language: seismic_metal::facts::LanguageVersion,
+        language: seismic_metal::device_info::LanguageVersion,
     },
 }
 

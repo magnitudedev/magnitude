@@ -8,7 +8,8 @@
 // is present (static US), else one. Two forms, which tuning admits between
 // (GATHERED), as `routed_gate_up`'s: per choice (`routed_up`), or gathered
 // (`routed_up_gather`, then `routed_up_gathered*`: each chosen expert's
-// first choice over the activation rows of every choice of the expert).
+// first choice reading a record over the activation rows of every choice
+// reading it).
 #if SEISMIC_STATIC_US != 0
 #define PROJECTION_SCALED
 #endif
@@ -71,12 +72,14 @@ void routed_up_choice() { routed_up_rows(gl_WorkGroupID.y, 0ul, 0ul, 1u, 1u); }
 
 void routed_up_gather() {
     routed_gather(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_DIM_XS,
+        SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2,
         uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GATHERED));
 }
 
-// Choice y's GEMV over its expert's rows where it is the expert's first
-// choice (`routed_gather`'s table), at activation-row bound `maxm`.
+// Choice y's GEMV over its record's rows where it is the first choice
+// reading it (`routed_gather`'s table), at activation-row bound `maxm`.
 void routed_up_gathered_bounded(const uint maxm) {
     const routed_gathered_rows gathered = routed_gathered(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GATHERED),
         gl_WorkGroupID.y);

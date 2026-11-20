@@ -108,43 +108,6 @@ fn a_shallow_curve_bounds_growth_and_shrinks_nothing() {
     assert_eq!(BankShape::curved(SLOT, 8, 226, None, 126).saturation_slots(), 226, "no curve: the ceiling");
 }
 
-/// Today's floor of a bank whose layers fall in `groups` record forms: each
-/// group its own least records (`ExpertBankPlan::least_records`), the
-/// decode step's parked layer and the hint window in every group, the lent
-/// scratch in the lender's.
-fn per_group(k: u64, e: u64, lent: u64, forms: u64) -> u64 {
-    let decode = (magnitude_kernels::constants::VERIFY_ROWS * k).min(e);
-    let reserve = 2 * k;
-    let lender = decode.max(lent) + reserve;
-    lender + (forms - 1) * (decode + reserve)
-}
-
-/// The pooled floor is one step's working set for the whole bank: the
-/// parked layer or the lent scratch once, beside each staging pool's hint
-/// window, never a group's decode records again in every other group.
-#[test]
-fn the_pooled_floor_is_one_steps_working_set() {
-    let decode = |k: u64, e: u64| (magnitude_kernels::constants::VERIFY_ROWS * k).min(e);
-    for (k, e, lent, forms) in [(8, 256, 64, 1), (8, 256, 64, 3), (6, 384, 400, 4), (8, 32, 16, 2)] {
-        let set = WorkingSet::new(k, e, lent, forms);
-        let pooled = decode(k, e).max(lent) + 2 * k * forms;
-        assert_eq!(set.floor_records(), pooled, "{set:?}");
-        assert!(set.floor_records() <= per_group(k, e, lent, forms), "{set:?}: never more than each group's own");
-        assert_eq!(per_group(k, e, lent, forms) - set.floor_records(), (forms - 1) * decode(k, e), "{set:?}: the decode records once, not per group");
-    }
-}
-
-/// The prompt's scratch is what the ledger grants, never less than one
-/// decode step's set: a scratch of a few records holds the floor at the
-/// decode set, and the prompt converts its layer in more rounds.
-#[test]
-fn the_scratch_is_never_below_the_decode_set() {
-    let set = WorkingSet::new(6, 384, 0, 1);
-    assert_eq!(set.lent(), 48);
-    assert_eq!(set.floor_records(), 48 + 12, "V4.1's decode set at K = 6");
-    assert_eq!(WorkingSet::new(6, 384, 430, 1).floor_records(), 442, "today's whole-layer scratch");
-}
-
 /// One store's holdings, each at its floor, share its room in their order:
 /// the first takes what its slots fit, the next what is left, each at least
 /// its floor.

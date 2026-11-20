@@ -4,7 +4,9 @@
 
 use crate::host;
 use seismic_native_target::ArtifactStore;
-use seismic_topology::{Availability, CpuReport, Reported, Reports, VolumeReport};
+use seismic_topology::{
+    Availability, CpuReport, HostNode, Processors, Reported, Reports, SystemIdentity, VolumeReport,
+};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -57,9 +59,16 @@ pub(crate) struct Natives {
 /// are read from `store` and run only where it lacks them, and a discrete
 /// CUDA device's usable memory, which needs its context (once per process).
 pub(crate) fn gather(paths: &[PathBuf], store: &dyn ArtifactStore) -> Result<Gathered, DiscoveryError> {
-    let HostReports { host, os_build, cpu } = host_reports(&host::Os);
+    let HostReports {
+        host,
+        cpu_model,
+        os_build,
+        processors,
+        system,
+        cpu,
+    } = host_reports(&host::LiveSys);
     let page = seismic_memory::host_page().map_err(|error| DiscoveryError::HostPage(error.to_string()))?;
-    let mut diagnostics = host::diagnostics(&host::Os);
+    let mut diagnostics = host::diagnostics(&host::LiveSys);
 
     #[cfg(target_os = "macos")]
     let (metal, natives) = {
@@ -75,16 +84,32 @@ pub(crate) fn gather(paths: &[PathBuf], store: &dyn ArtifactStore) -> Result<Gat
     #[cfg(not(target_os = "macos"))]
     let metal = Vec::new();
 
-    let cuda = seismic_cuda::topology::describe(&mut diagnostics);
+    let cuda = seismic_cuda::topology::describe(&mut diagnostics)
+        .into_iter()
+        .map(|(mut report, pci)| {
+            report.host_node = pci.map_or(HostNode::Any, |location| {
+                host::device_node(&host::LiveSys, location)
+            });
+            report
+        })
+        .collect();
 
     #[cfg(not(target_os = "macos"))]
     let vulkan = {
         let described = seismic_vulkan::topology::describe(&mut diagnostics);
         natives.vulkan = described
             .iter()
-            .map(|(report, handle)| (report.uuid, handle.clone()))
+            .map(|(report, handle, _)| (report.uuid, handle.clone()))
             .collect();
-        described.into_iter().map(|(report, _)| report).collect()
+        described
+            .into_iter()
+            .map(|(mut report, _, pci)| {
+                report.host_node = pci.map_or(HostNode::Any, |location| {
+                    host::device_node(&host::LiveSys, location)
+                });
+                report
+            })
+            .collect()
     };
     // Vulkan is not built on macOS (MoltenVK is not supported).
     #[cfg(target_os = "macos")]
@@ -130,8 +155,11 @@ pub(crate) fn gather(paths: &[PathBuf], store: &dyn ArtifactStore) -> Result<Gat
     Ok(Gathered {
         reports: Reports {
             host,
+            cpu_model,
             os_build,
             page,
+            processors,
+            system,
             cpu,
             metal,
             cuda,
@@ -144,25 +172,32 @@ pub(crate) fn gather(paths: &[PathBuf], store: &dyn ArtifactStore) -> Result<Gat
     })
 }
 
-/// What discovery reads of the host itself, from the OS's facts.
+/// What discovery reads of the host itself, from the OS's readings.
 pub(crate) struct HostReports {
     pub(crate) host: Reported<u64>,
+    pub(crate) cpu_model: String,
     pub(crate) os_build: String,
+    pub(crate) processors: Processors,
+    pub(crate) system: SystemIdentity,
     pub(crate) cpu: CpuReport,
 }
 
-/// The host's reports from `facts`: host RAM's capacity, the OS build (the
-/// CPU's and Metal's driver, which compiled programs are kept by), the CPU's
-/// identity (which measurements are kept by) and its last-level caches,
-/// each from its sources in order or its documented value.
-pub(crate) fn host_reports(facts: &impl host::Facts) -> HostReports {
-    let cache = host::last_level_cache(facts);
+/// The host's reports from `sys`: host RAM's capacity, the CPU brand string,
+/// the OS build (the CPU's and Metal's driver, which compiled programs are
+/// kept by), the host's processors and firmware identity, the CPU's identity
+/// (which measurements are kept by) and its last-level caches, each from its
+/// sources in order or its documented value.
+pub(crate) fn host_reports(sys: &impl host::Sys) -> HostReports {
+    let cache = host::last_level_cache(sys);
     HostReports {
-        host: host::capacity(facts),
-        os_build: host::os_build(facts),
+        host: host::capacity(sys),
+        cpu_model: host::cpu_model(sys),
+        os_build: host::os_build(sys),
+        processors: host::processors(sys),
+        system: SystemIdentity::from_firmware(host::firmware(sys)),
         cpu: CpuReport {
             name: format!("Host CPU ({})", std::env::consts::ARCH),
-            identity: host::cpu_identity(facts, cache.map(|cache| cache.value)),
+            identity: host::cpu_identity(sys, cache),
             cache,
             availability: cpu_availability(seismic_native_cpu::Tier::detected()),
             max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,

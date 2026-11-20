@@ -18,24 +18,19 @@ use windows as platform;
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::pressure_files;
-pub(crate) use platform::{Facts, Os};
+pub(crate) use platform::{LiveSys, Sys};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use linux::Tree;
 
-use seismic_topology::Reported;
+use seismic_topology::{CacheSize, Firmware, HostNode, PciLocation, Processors, Reported};
 use std::fmt;
+#[cfg(any(not(target_os = "linux"), test))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// One OS read inside a reader: the value, or none where the source is
-/// missing or refused ([`seismic_memory::unanswered`]): either way the
-/// reader goes to the fact's next source, and past its last to the fact's
-/// one documented value. No read's failure crosses the discovery boundary:
-/// every fact there is a plain value.
-///
-/// # Panics
-/// Where the read failed in any other way (`EIO`, text that is not UTF-8):
-/// an invariant violation.
+/// One OS read: the value, or `None` when the source is missing or refused
+/// ([`seismic_memory::unanswered`]). Any other error (`EIO`, invalid UTF-8)
+/// is an invariant violation and panics.
 pub(crate) fn read<T>(what: impl fmt::Display, result: std::io::Result<T>) -> Option<T> {
     match result {
         Ok(value) => Some(value),
@@ -44,66 +39,64 @@ pub(crate) fn read<T>(what: impl fmt::Display, result: std::io::Result<T>) -> Op
     }
 }
 
+pub(crate) use seismic_topology::resolve;
+
 /// The host's diagnostics for the hardware report: on Linux, a container
 /// whose own cgroup sets no memory limit, so limits above it are not
 /// visible (the one line of its kind).
-pub(crate) fn diagnostics(facts: &impl Facts) -> Vec<seismic_topology::Diagnostic> {
-    platform::diagnostics(facts)
+pub(crate) fn diagnostics(sys: &impl Sys) -> Vec<seismic_topology::Diagnostic> {
+    platform::diagnostics(sys)
 }
 
 /// Host RAM capacity: RAM the OS can use.
-pub(crate) fn capacity(facts: &impl Facts) -> Reported<u64> {
-    platform::capacity(facts)
+pub(crate) fn capacity(sys: &impl Sys) -> Reported<u64> {
+    platform::capacity(sys)
 }
 
 /// The OS version and build, as the OS reports it: the driver of the CPU
 /// executor and of Metal.
-pub(crate) fn os_build(facts: &impl Facts) -> String {
-    platform::os_build(facts)
+pub(crate) fn os_build(sys: &impl Sys) -> String {
+    platform::os_build(sys)
 }
 
-/// The CPU as the OS reports it: the platform's identifying CPU fields
-/// (Linux `/proc/cpuinfo`'s model, feature and revision fields for every
-/// processor; macOS `sysctl`'s brand string, model and CPU counts;
-/// Windows' processor architecture, count, level and revision with its
-/// CPUID vendor, signature and feature, and brand leaves), then
-/// `;isa=<tier>` for the highest native tier it supports, where it supports
-/// one, and `;cache=<bytes>` for its last-level `cache`
-/// ([`last_level_cache`]), where the OS reports one.
-pub(crate) fn cpu_identity(facts: &impl Facts, cache: Option<u64>) -> String {
-    let mut identity = platform::cpu_identity(facts);
+/// Human-readable CPU brand string (e.g. `"Apple M4 Pro"`, `"AMD EPYC 7763"`),
+/// falling back to `"CPU (<arch>)"` when no source answers.
+pub(crate) fn cpu_model(sys: &impl Sys) -> String {
+    platform::cpu_model(sys)
+}
+
+/// The CPU as the OS reports it: the platform's identifying CPU fields,
+/// then `;isa=<tier>` for the highest native tier it supports, and
+/// `;cache=<bytes>` for its reported cache when non-zero.
+pub(crate) fn cpu_identity(sys: &impl Sys, cache: CacheSize) -> String {
+    let mut identity = platform::cpu_identity(sys);
     if let Some(tier) = seismic_native_cpu::Tier::detected() {
         identity.push_str(&format!(";isa={}", tier.name()));
     }
-    if let Some(cache) = cache {
-        identity.push_str(&format!(";cache={cache}"));
+    if cache.bytes > 0 {
+        identity.push_str(&format!(";cache={}", cache.bytes));
     }
     identity
 }
 
-/// The CPU's last-level caches: the highest-level data or unified caches the
-/// OS reports, each instance's size as the OS reports it summed over the
-/// instances (no memory-side cache, which no OS reports): part of the CPU's
-/// identity, and the host's reported cache. `None` where the OS reports no
-/// such cache, or no size or sharing for one: then the largest L2, or none.
-pub(crate) fn last_level_cache(facts: &impl Facts) -> Option<Reported<u64>> {
-    platform::last_level_cache(facts)
+/// The CPU's last-level cache size and whether it is the full LLC before RAM.
+pub(crate) fn last_level_cache(sys: &impl Sys) -> CacheSize {
+    platform::last_level_cache(sys)
 }
 
-/// The machine's names as its firmware writes them (`crate::machine`).
-pub(crate) fn machine() -> crate::machine::Firmware {
-    platform::machine()
+/// The system's firmware strings (`seismic_topology::SystemIdentity`).
+pub(crate) fn firmware(sys: &impl Sys) -> Firmware {
+    platform::firmware(sys)
 }
 
-/// The host's processors (`crate::processors`).
-pub(crate) fn processors(facts: &impl Facts) -> crate::Processors {
-    platform::processors(facts)
+/// The host's processors (`seismic_topology::Processors`).
+pub(crate) fn processors(sys: &impl Sys) -> Processors {
+    platform::processors(sys)
 }
 
-/// The memory node of the PCI device at `location`
-/// (`crate::processors::device_node`).
-pub(crate) fn device_node(facts: &impl Facts, location: crate::PciLocation) -> crate::DeviceNode {
-    platform::device_node(facts, location)
+/// The memory node of the PCI device at `location`.
+pub(crate) fn device_node(sys: &impl Sys, location: PciLocation) -> HostNode {
+    platform::device_node(sys, location)
 }
 
 /// Place every thread of the process on `cpus`
@@ -120,12 +113,12 @@ pub(crate) fn pin(cpus: &[usize]) -> Result<(), String> {
 /// Host RAM at one instant ([`HostSample`]), read now: every figure from
 /// its sources in order, or its documented value where none answers.
 pub fn host_sample() -> HostSample {
-    sample(&Os)
+    sample(&LiveSys)
 }
 
-/// Host RAM at one instant from `facts` ([`host_sample`]).
-pub(crate) fn sample(facts: &impl Facts) -> HostSample {
-    platform::sample(facts)
+/// Host RAM at one instant from `sys` ([`host_sample`]).
+pub(crate) fn sample(sys: &impl Sys) -> HostSample {
+    platform::sample(sys)
 }
 
 /// Host RAM at one instant: what the OS can give a taker without writing
@@ -153,15 +146,9 @@ pub struct HostSample {
     pub supply: Supply,
     /// When the counters below show the machine.
     pub counted: Counted,
-    /// Cold anonymous bytes machine-wide, ours included, which the OS
-    /// compresses or swaps first: Linux `Inactive(anon)`; macOS its inactive
-    /// pages less every file-backed page (a lower bound: no count splits the
-    /// inactive queue); none on Windows, whose working-set manager trims
-    /// cold pages into the standby list `supply.clean_cache` counts. A
-    /// counter ([`Counted`]).
-    pub cold: u64,
-    /// This process's own share of `cold` ([`OwnCold`]), counted with it.
-    pub own_cold: OwnCold,
+    /// Cold anonymous pages machine-wide and, where the OS isolates it
+    /// (Linux solo cgroup v2), this process's own share. A counter ([`Counted`]).
+    pub cold: ColdPages,
     /// This process's own anonymous memory the OS holds outside RAM at the
     /// sample, compressed or swapped ([`OwnReclaimed`]): what of the
     /// process's allocations `total − supply` no longer shows. Read live
@@ -316,17 +303,17 @@ impl OwnReclaimed {
     pub const NONE: Self = Self { bytes: 0, stored: 0, exact: true };
 }
 
-/// This process's own cold anonymous bytes, where the OS reports them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OwnCold {
-    /// Read from the OS: Linux's `inactive_anon` of this process's own
-    /// cgroup v2 (`memory.stat`), by [`Harm`]'s rule for when a cgroup's
-    /// counts are this process's.
-    Bytes(u64),
-    /// The OS reports no figure for this process alone: macOS and Windows
-    /// (neither splits a process's pages by age), and Linux in a cgroup
-    /// shared with other processes or under cgroup v1.
-    Unobserved,
+/// Cold anonymous bytes machine-wide and this process's own share where the
+/// OS isolates it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColdPages {
+    /// Machine-wide cold anonymous bytes (0 where the OS has no cold queue,
+    /// e.g. Windows).
+    pub machine: u64,
+    /// This process's own share of `machine`: Linux's `inactive_anon` of this
+    /// process's own cgroup v2 (`memory.stat`); `None` on macOS, Windows, and
+    /// Linux in a shared cgroup or cgroup v1.
+    pub own: Option<u64>,
 }
 
 /// macOS's wired figures: the system's GPU wired ceiling and what is wired.
@@ -414,10 +401,10 @@ pub struct Lag {
 /// A 32-bit cumulative OS count widened to 64 bits across its wraps: every
 /// reading of the count goes through one, so no wrap is missed while a
 /// reading is taken more often than the count can wrap (4.3 billion events).
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) struct Widened(Mutex<Option<(u32, u64)>>);
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg(any(not(target_os = "linux"), test))]
 impl Widened {
     pub(crate) const fn new() -> Self {
         Self(Mutex::new(None))
@@ -436,6 +423,7 @@ impl Widened {
 }
 
 /// A scope's total and supply: the host's, or a limit's.
+#[cfg(any(not(target_os = "macos"), test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Scope {
     pub(crate) total: u64,
@@ -444,8 +432,8 @@ pub(crate) struct Scope {
 
 /// The binding scope of a sample ([`binding`]), and which scope its supply
 /// is.
+#[cfg(any(not(target_os = "macos"), test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) struct Binding {
     pub(crate) scope: Scope,
     /// The index in `limits` of the limit whose supply binds; none where the
@@ -461,7 +449,7 @@ pub(crate) struct Binding {
 /// Each bounds what this process may take, so both are bound by every one
 /// at once: whichever leaves the least supply, the total never moves with
 /// it, and the supply moves only as the scopes' own figures move.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn binding(host: Scope, limits: &[Limit]) -> Binding {
     limits.iter().map(|limit| limit.scope(host.total)).enumerate().fold(
         Binding { scope: host, supplier: None },
@@ -475,32 +463,11 @@ pub(crate) fn binding(host: Scope, limits: &[Limit]) -> Binding {
     )
 }
 
-/// Why a reading of a volume or a grant could not be taken.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ObservationError {
-    /// This platform or configuration offers no qualified facility for the
-    /// observation.
-    Unsupported(String),
-    /// The native query failed.
-    Failed(String),
-}
-
-impl fmt::Display for ObservationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported(message) => write!(f, "observation unsupported: {message}"),
-            Self::Failed(message) => write!(f, "observation failed: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for ObservationError {}
-
 /// A limit on this process's memory, read, with the usage it is enforced
 /// against. A limit no source shows is no limit: the host's figures and the
 /// process's rlimits bound it.
+#[cfg(any(not(target_os = "macos"), test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) struct Limit {
     /// Which limit it is.
     pub(crate) kind: ProcessLimitKind,
@@ -514,7 +481,7 @@ pub(crate) struct Limit {
     pub(crate) reclaimable_bytes: u64,
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(any(not(target_os = "macos"), test))]
 impl Limit {
     /// The limit as a scope of host RAM of `capacity` bytes: its room
     /// beyond its usage, negative where the usage overran it (cgroup v2's
@@ -534,6 +501,7 @@ impl Limit {
 }
 
 /// An OS limit on this process's memory.
+#[cfg(any(not(target_os = "macos"), test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // each OS builds only its own kinds; a cgroup is named for Debug
 pub(crate) enum ProcessLimitKind {

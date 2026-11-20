@@ -10,7 +10,7 @@ mod served;
 pub(crate) mod derived;
 pub(crate) mod cache;
 
-pub use super::watcher::{ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, StepCost, STEP_TRACE};
+pub use super::watcher::{GroupLend, ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, RecordedRoutes, RoutedStep, StepCost, STEP_TRACE};
 pub(crate) use super::watcher::{ExpertStep, Recording, StepFailure, StepRoute};
 use super::watcher::{PlacedLayerWords, PlacedWords, Watcher};
 use super::Words;
@@ -222,7 +222,7 @@ impl ExpertBank {
     /// Each bank group's device convert takes its `lines` from now on
     /// (`assessment::ConvertCosts`, which the job measured): where the bank
     /// places, what a request's landing adds past its last read.
-    pub fn device_convert(&self, lines: &[crate::assessment::RecordLine]) {
+    pub fn device_convert(&self, lines: &[magnitude_cost_model::RecordLine]) {
         self.watcher.shared().device_convert(lines);
     }
 
@@ -512,7 +512,7 @@ impl ExpertBank {
     /// step owns its slot (a slot's last step ended before this one began);
     /// the device reads it after the window's round 0 answer.
     pub(crate) fn fill_followed(&self, sequence: u64, layer: usize, window: u64, followed: bool) {
-        let lane = magnitude_kernels::constants::SCRATCH_ROUND + window * self.plan.window_rounds();
+        let lane = magnitude_kernels::constants::ROUND_LANE(window * self.plan.window_rounds());
         self.scratch_tables[layer].store(sequence, lane, magnitude_kernels::constants::SCRATCH_FOLLOWED, i32::from(followed));
     }
 
@@ -598,6 +598,8 @@ impl ExpertBank {
             BankPart::ScratchTable => &layer.scratch,
             BankPart::Rings => &layer.rings,
             BankPart::Routing => &layer.routing,
+            BankPart::Keys => &layer.keys,
+            BankPart::Front => &layer.front,
             BankPart::Policy => &layer.policy,
             BankPart::SiteTable | BankPart::SiteRows | BankPart::SiteOutput => {
                 let sited = layer.sited.as_ref().ok_or_else(|| format!("bank part {part:?} of a layer without a CPU site"))?;
@@ -618,6 +620,7 @@ impl ExpertBank {
                 &self.layout.staging[*pool]
             }
             BankPart::LandingList => &layer.landing,
+            BankPart::LandGrid => &layer.land_grid,
             BankPart::TierList => &layer.tiered,
             BankPart::TierGrid => &load.tier_grid,
             BankPart::TierStaged => &load.tier_staged,
@@ -715,6 +718,17 @@ impl ExpertBank {
     /// names them.
     pub fn held(&self) -> Vec<Vec<usize>> {
         self.watcher.shared().held()
+    }
+
+    /// Each group's lend and decode capacity (`Shared::lend`).
+    pub fn lend(&self) -> Vec<GroupLend> {
+        self.watcher.shared().lend()
+    }
+
+    /// What a load recording its routes recorded since last taken; none of
+    /// a load that records none (`Shared::take_routes`).
+    pub fn take_routes(&self) -> Option<RecordedRoutes> {
+        self.watcher.shared().take_routes()
     }
 }
 

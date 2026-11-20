@@ -16,7 +16,7 @@ use magnitude_executor::{
     BackendPlan, ComponentSelection,
     DraftWidths,
     ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, HeldCharge, PlanError, PlanPrices, Placed, PlannedMethod, ResourceLimits, SettleRoom, StableRoom,
-    assessment::{decode_step, ExecutorCosts, Priced},
+    assessment::{launch_prices, ExecutorCosts, Priced},
 };
 use magnitude_scheduler::ServiceLimits;
 use seismic::Devices;
@@ -98,7 +98,7 @@ pub fn plan_resident(
     selected: &SelectedDevice,
 ) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
     let (selection, method, limits) = planner_inputs(manifest, selected.info.backend())?;
-    ExecutionPlanner::prepare(
+    let resident = ExecutionPlanner::prepare(
         selected,
         &manifest.package,
         &manifest.definition,
@@ -108,7 +108,11 @@ pub fn plan_resident(
         manifest.model.kv_codec,
         limits,
     )
-    .map_err(ExecutionPlanningError::Plan)
+    .map_err(ExecutionPlanningError::Plan)?;
+    Ok(match manifest.model.record_routes {
+        true => resident.recording_routes(),
+        false => resident,
+    })
 }
 
 /// [`plan_execution`]'s plan from its `resident` plan, in two stages: its
@@ -147,8 +151,16 @@ pub fn plan_banked<C: HeldCharge>(
             reason: "the executor's costs are not measured yet".into(),
         }));
     }
+    let prices = plan_prices(&measurements, &resident);
     let short = match holding {
-        Holding::Placed => match resident.placed(&manifest.definition, manifest.model.weight_bound, room).map_err(ExecutionPlanningError::Plan)? {
+        Holding::Placed => match resident.placed(&manifest.definition, manifest.model.weight_bound, &prices, room).map_err(ExecutionPlanningError::Plan)? {
+            // A recording load reads its routing from its bank's routing
+            // records, which a load of no bank keeps none of.
+            Placed::Whole(whole) if manifest.model.record_routes && whole.draft().load().expert_bank().is_none() => {
+                return Err(ExecutionPlanningError::Plan(PlanError::Topology(
+                    "a load recording its routes holds its experts in a bank: it reads them from the bank's routing records",
+                )));
+            }
             Placed::Whole(whole) => return Ok(whole),
             Placed::Short(short) => short,
         },
@@ -156,7 +168,6 @@ pub fn plan_banked<C: HeldCharge>(
             .streaming(&manifest.definition, manifest.model.weight_bound, room)
             .map_err(ExecutionPlanningError::Plan)?,
     };
-    let prices = plan_prices(&measurements, short.draft());
     short.streamed(&manifest.definition, &prices, room).map_err(ExecutionPlanningError::Plan)
 }
 
@@ -164,7 +175,7 @@ pub fn plan_banked<C: HeldCharge>(
 /// settles its held pass on (`PlanPrices`): the executor's costs and the
 /// streamed figures `measurements` hold, and its decode on those costs in
 /// each form, `plan`'s and the banked plan's streamed form's
-/// (`assessment::decode_step`). Pending or unavailable as the measurements
+/// (`assessment::launch_prices`, `LaunchPrices::launch`). Pending or unavailable as the measurements
 /// or their streamed figures are: a plan that holds a bank waits for them.
 pub fn plan_prices(measurements: &Measurements, plan: &ExecutionPlanDraft) -> Priced<PlanPrices> {
     match measurements {
@@ -175,7 +186,10 @@ pub fn plan_prices(measurements: &Measurements, plan: &ExecutionPlanDraft) -> Pr
             Priced::Measured(PlanPrices::new(
                 ExecutorCosts::clone(costs),
                 *figures,
-                Box::new(move |definition, banked| decode_step(definition, &resident, banked, steps.clone())),
+                Box::new(move |definition, banked| {
+                    let prices = launch_prices(definition, &resident, banked, &steps)?;
+                    Ok(Box::new(move |rows, depth| Ok(prices.launch(rows, depth)?)))
+                }),
             ))
         }),
     }
@@ -302,6 +316,7 @@ mod tests {
             exported_logits_rows,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         }
     }
 

@@ -2982,7 +2982,7 @@ mod tests {
         let lock = model_catalog_lock().unwrap();
         let shared_draft = "unsloth/Qwen3.8-Flash-Next-GGUF";
         for (id, repository, license) in [
-            ("qwen3.8-flash-next:gguf:q4", shared_draft, "qwen-community-1.0"),
+            ("qwen3.8-flash-next:gguf:q6", shared_draft, "qwen-community-1.0"),
             (
                 "qwen3.8-flash-next:gguf:q2",
                 "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",

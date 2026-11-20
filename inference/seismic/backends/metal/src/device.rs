@@ -10,15 +10,17 @@ use objc2::Message;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePassDescriptor,
-    MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLResidencySet, MTLResidencySetDescriptor,
-    MTLBlitCommandEncoder, MTLResource, MTLResourceOptions, MTLResourceUsage,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
+    MTLCopyAllDevices, MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice,
+    MTLDevice, MTLDispatchType, MTLResidencySet, MTLResidencySetDescriptor, MTLResource,
+    MTLResourceOptions, MTLResourceUsage,
 };
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::DeviceService;
 use std::fmt;
 use seismic_memory::entry::{Backed, DropScope, Entry, Store, Wiring};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::{any::Any, ptr::NonNull};
 
 /// A retained `MTLDevice`. `MTLDevice` is `Send + Sync`; identity is the
@@ -73,6 +75,17 @@ impl DeviceHandle {
     /// not implied by this flag alone.
     pub fn has_unified_memory(&self) -> bool {
         self.device.hasUnifiedMemory()
+    }
+
+    /// Whether this device supports Metal residency sets (`MTLResidencySet`).
+    /// Devices without them (e.g. Intel Mac GPUs) run with per-encoder
+    /// resource declarations (`Keeping::Declared`).
+    pub(crate) fn supports_residency_sets(&self) -> bool {
+        crate::pooled(|| {
+            self.device
+                .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+                .is_ok()
+        })
     }
 
     /// `MTLDevice.recommendedMaxWorkingSetSize`: Metal's advisory ceiling for
@@ -386,7 +399,11 @@ impl Drop for Mapping {
 /// `wiring`: no-copy, so Metal takes exactly the mapping's bytes. A refusal allocates and
 /// charges nothing.
 fn mapped_buffer(handle: &DeviceHandle, length: usize, entry: &Arc<dyn Entry>, wiring: Wiring) -> Result<(ChargedBuffer, Mapping), ExecutionError> {
-    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("a host page size is positive");
+    let page = seismic_memory::host_page()
+        .map_err(|error| ExecutionError::AllocationFailed(error.to_string()))?;
+    let page = usize::try_from(page).map_err(|_| {
+        ExecutionError::AllocationFailed("host page size exceeds the host address space".into())
+    })?;
     let length = length.checked_next_multiple_of(page).ok_or_else(|| ExecutionError::AllocationFailed(format!("{length} bytes exceed the host address space")))?;
     let mut mapping = None;
     let buffer = Backed::take(entry, length as u64, wiring, |_| {
@@ -484,13 +501,26 @@ enum Storage {
 /// this beside the bytes its caller holds.
 const STAGING_CHUNK: usize = 16 << 20;
 
+/// The device's single ordered command queue and the explicit
+/// `maxCommandBufferCount` it was created with (`None` for Metal's default
+/// `newCommandQueue()`).
+struct CommandQueue {
+    raw: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    capacity: Option<usize>,
+}
+
+// `MTLCommandQueue` is thread-safe; reads take a shared lock to create
+// command buffers, and capacity growth takes an exclusive lock.
+unsafe impl Send for CommandQueue {}
+unsafe impl Sync for CommandQueue {}
+
 /// The host's way to a private buffer's bytes: a blit on the device's
 /// queue between it and a shared buffer of the bytes, completed before the
 /// access returns, so it follows every command buffer committed before it
 /// in the queue's order.
 struct Staging {
     handle: DeviceHandle,
-    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    queue: Arc<RwLock<CommandQueue>>,
 }
 
 // Metal's device and queue are thread-safe; a staging copy holds nothing
@@ -503,10 +533,11 @@ impl Staging {
     /// for it.
     fn blit(&self, copy: impl FnOnce(&ProtocolObject<dyn MTLBlitCommandEncoder>)) -> Result<(), ExecutionError> {
         crate::pooled(|| {
-            let command = self
-                .queue
-                .commandBuffer()
-                .ok_or_else(|| ExecutionError::SubmissionFailed("Metal could not create a staging command buffer".into()))?;
+            let command = {
+                let queue = self.queue.read().expect("Metal command queue lock poisoned");
+                queue.raw.commandBuffer()
+            }
+            .ok_or_else(|| ExecutionError::SubmissionFailed("Metal could not create a staging command buffer".into()))?;
             let blit = command
                 .blitCommandEncoder()
                 .ok_or_else(|| ExecutionError::SubmissionFailed("Metal could not create a staging blit encoder".into()))?;
@@ -698,11 +729,23 @@ unsafe fn host_read(base: *mut u8, length: u64, offset: u64, into: &mut [u8]) {
     unsafe { std::ptr::copy_nonoverlapping(source, into.as_mut_ptr(), into.len()) };
 }
 
+/// `handle`'s timestamp counter set, when it samples counters at stage
+/// boundaries.
+fn timestamp_counters(handle: &DeviceHandle) -> Option<Retained<ProtocolObject<dyn MTLCounterSet>>> {
+    let raw = handle.raw();
+    if !raw.supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary) {
+        return None;
+    }
+    // SAFETY: a static Metal string constant.
+    let wanted = unsafe { MTLCommonCounterSetTimestamp };
+    raw.counterSets()?.iter().find(|set| &*set.name() == wanted)
+}
+
 /// The device service: device plus one command queue.
 #[derive(Clone)]
 pub struct MetalDevice {
     handle: DeviceHandle,
-    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    queue: Arc<RwLock<CommandQueue>>,
     /// What keeps every buffer this device allocates resident
     /// ([`Residency`]).
     residency: Arc<Residency>,
@@ -712,6 +755,11 @@ pub struct MetalDevice {
     /// Its bytes are charged to the store's own entry, freed with it as the
     /// last clone of the device drops.
     order: Arc<ChargedBuffer>,
+    /// The device's timestamp counter set, sampled at stage boundaries:
+    /// every observed and timed batch, and every service probe, times its
+    /// work by it (`direct::LaunchTimestamps`), so a device without it is
+    /// refused at open.
+    timestamps: Retained<ProtocolObject<dyn MTLCounterSet>>,
     /// The store the device's own memory lies in
     /// ([`crate::topology::own_kind`]): the embedder's ledger of it, whose own entry holds what the device
     /// allocates that no caller names.
@@ -736,14 +784,21 @@ impl MetalDevice {
         // Metal defaults to a small compiler pool; allow the system to scale
         // compilation concurrency to the machine before forming any kernels.
         handle.raw().setShouldMaximizeConcurrentCompilation(true);
-        let queue = handle.raw().newCommandQueue().ok_or_else(|| {
+        let timestamps = timestamp_counters(&handle).ok_or_else(|| {
+            TargetError::DeviceUnavailable(format!(
+                "Metal device `{}` cannot sample GPU timestamps at stage boundaries, which every timed \
+                 and observed batch requires",
+                handle.name()
+            ))
+        })?;
+        let raw_queue = handle.raw().newCommandQueue().ok_or_else(|| {
             TargetError::DeviceUnavailable("could not create a Metal command queue".into())
         })?;
         // A GPU that cannot create a residency set runs all the same, its
         // buffers declared to each encoder instead ([`Keeping::Declared`]).
         let keeping = match handle.raw().newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()) {
             Ok(set) => {
-                queue.addResidencySet(&set);
+                raw_queue.addResidencySet(&set);
                 Keeping::Set(set)
             }
             Err(_) => Keeping::Declared(Vec::new()),
@@ -754,15 +809,85 @@ impl MetalDevice {
             charged_buffer(&handle, 1, MTLResourceOptions::StorageModePrivate, &store.own(), Wiring::Pageable).map_err(|error| {
                 TargetError::DeviceUnavailable(format!("could not create the Metal order buffer: {error}"))
             })?;
+        let queue = Arc::new(RwLock::new(CommandQueue { raw: raw_queue, capacity: None }));
         let staging = Arc::new(Staging { handle: handle.clone(), queue: queue.clone() });
         Ok(Self {
             handle,
             queue,
             residency: Residency::new(keeping),
             order: Arc::new(order),
+            timestamps,
             store,
             staging,
         })
+    }
+
+    /// Ensure the device's command queue can hold at least `count` uncompleted
+    /// command buffers at once (`newCommandQueueWithMaxCommandBufferCount:`).
+    ///
+    /// Metal's default `newCommandQueue()` caps uncompleted command buffers,
+    /// after which `commandBuffer()` blocks until an earlier buffer completes
+    /// (deadlocking behind an unopened host gate). Called at load time while
+    /// the queue is idle: when no explicit capacity is set yet or the current
+    /// capacity is below `count`, drains the current queue, opens a
+    /// replacement sized to `count`, and reattaches the residency set so every
+    /// already-allocated buffer remains resident.
+    pub fn ensure_command_buffer_capacity(&self, count: usize) -> Result<(), ExecutionError> {
+        if count == 0 {
+            return Ok(());
+        }
+        if self
+            .queue
+            .read()
+            .expect("Metal command queue lock poisoned")
+            .capacity
+            .is_some_and(|current| current >= count)
+        {
+            return Ok(());
+        }
+        let mut queue = self
+            .queue
+            .write()
+            .expect("Metal command queue lock poisoned");
+        if queue.capacity.is_some_and(|current| current >= count) {
+            return Ok(());
+        }
+        crate::pooled(|| {
+            let replacement = self
+                .handle
+                .raw()
+                .newCommandQueueWithMaxCommandBufferCount(count)
+                .ok_or_else(|| {
+                    ExecutionError::AllocationFailed(format!(
+                        "Metal could not create a command queue for {count} command buffers"
+                    ))
+                })?;
+            if let Some(drain) = queue.raw.commandBuffer() {
+                drain.commit();
+                drain.waitUntilCompleted();
+            }
+            let wired = self.residency.lock();
+            if let Keeping::Set(set) = &wired.keeping {
+                replacement.addResidencySet(set);
+            }
+            queue.raw = replacement;
+            queue.capacity = Some(count);
+            Ok(())
+        })
+    }
+
+    /// The explicit `maxCommandBufferCount` the queue was sized to, or `None`
+    /// while using Metal's default `newCommandQueue()`.
+    pub fn command_buffer_capacity(&self) -> Option<usize> {
+        self.queue
+            .read()
+            .expect("Metal command queue lock poisoned")
+            .capacity
+    }
+
+    /// The device's timestamp counter set, sampled at stage boundaries.
+    pub(crate) fn timestamp_counters(&self) -> &Retained<ProtocolObject<dyn MTLCounterSet>> {
+        &self.timestamps
     }
 
     pub(crate) fn order(&self) -> &ProtocolObject<dyn MTLBuffer> {
@@ -781,7 +906,13 @@ impl MetalDevice {
     /// A new command buffer on the device's queue: the one way GPU work
     /// begins on the device. None where Metal creates none.
     pub(crate) fn command_buffer(&self) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
-        crate::pooled(|| self.queue.commandBuffer())
+        crate::pooled(|| {
+            self.queue
+                .read()
+                .expect("Metal command queue lock poisoned")
+                .raw
+                .commandBuffer()
+        })
     }
 
     /// A new compute encoder of `command`, of `kind`, with every buffer the
@@ -928,9 +1059,10 @@ impl MetalDevice {
         length: usize,
         owner: Arc<dyn Any + Send + Sync>,
     ) -> Result<MetalBuffer, ExecutionError> {
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = seismic_memory::host_page()
+            .map_err(|error| ExecutionError::AllocationFailed(error.to_string()))?;
         let page = usize::try_from(page).map_err(|_| {
-            ExecutionError::AllocationFailed("host page size is unavailable".into())
+            ExecutionError::AllocationFailed("host page size exceeds the host address space".into())
         })?;
         if length == 0 || pointer.as_ptr() as usize % page != 0 || length % page != 0 {
             return Err(ExecutionError::AllocationFailed(

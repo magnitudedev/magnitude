@@ -33,11 +33,12 @@ use magnitude_engine::{
 use magnitude_engine::worker::measure::measure_line;
 use magnitude_executor::{
     assessment::{
-        decode_pricing, step_seconds, Derived, DomainFit, ExecutionFit, ExecutionShortfall, ExecutorCosts, FormatRates,
+        lookahead, Derived, DomainFit, ExecutionFit, ExecutionShortfall, ExecutorCosts, FormatRates,
         HistoryCosts, MatrixCosts, MeasuredCost, WeightRate, MEASUREMENT_SECONDS,
     },
     platform::{DeviceRequest, ReleaseRate},
 };
+use seismic::measure::pricing::{CallSeconds, Pricing, Storage};
 use seismic::{Devices, DiagnosticSource, Element, ExecutorSelector, StoreId, StoreIdentity};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -714,47 +715,45 @@ fn print_breakdown(
     );
     let failed = magnitude_engine::assessment::ModelAssessmentError::Assessment;
     let sequences = u64::from(options.sequences);
-    let pricing = decode_pricing(execution.draft(), costs);
-    let demand = execution.demand();
+    let census = execution.demand().census();
+    let figures = costs.figures(&[&census]);
+    let pricing = Pricing { figures: &figures, lookahead: lookahead(execution.draft()) };
     eprintln!(
-        "magnitude-assess: {}: {} calls, {sequences} sequences, lookahead {}, activations at \
+        "magnitude-assess: {}: {} calls of {} kinds, {sequences} sequences, lookahead {}, activations at \
          {:.1} GB/s, uploads at {:.1} GB/s",
         model.target().display(),
-        demand.calls.len(),
+        (0..census.kinds().len()).map(|kind| census.multiplicity(kind)).sum::<u64>(),
+        census.kinds().len(),
         pricing.lookahead,
-        pricing.activations(magnitude_executor::assessment::OperandStorage::Device) / 1e9,
-        pricing.activations(magnitude_executor::assessment::OperandStorage::Upload) / 1e9,
+        figures.rates.activations(Storage::Device) / 1e9,
+        figures.rates.activations(Storage::Upload) / 1e9,
     );
     for &depth in &options.depths {
-        let step = step_seconds(demand, &pricing, sequences, depth).map_err(failed)?;
-        let bound = |compute: bool| {
-            step.calls
-                .iter()
-                .filter(|call| call.compute_bound() == compute)
-                .map(|call| call.bytes.max(call.compute))
-                .sum::<f64>()
-        };
+        let step = magnitude_cost_model::step_seconds(&census, &pricing, sequences, depth).map_err(|error| failed(error.into()))?;
+        let sum = |part: &dyn Fn(&CallSeconds) -> f64| step.calls.iter().map(|call| call.multiplicity as f64 * part(&call.seconds)).sum::<f64>();
+        let bound = |compute: bool| sum(&|call| if call.compute_bound() == compute { call.bytes.max(call.compute) } else { 0. });
         eprintln!(
             "magnitude-assess:   at {depth}: {:.1} µs per step = {:.3} × (bytes-bound {:.1} + \
-             compute-bound {:.1} + attention fixed {:.1} + {} launches {:.1}) + step {:.1}",
+             compute-bound {:.1} + attention fixed {:.1} + {} launches {:.1}) + step {:.1} + boundaries {:.1}",
             step.total() * 1e6,
             step.composition,
             bound(false) * 1e6,
             bound(true) * 1e6,
-            step.calls.iter().map(|call| call.fixed).sum::<f64>() * 1e6,
-            step.calls.iter().map(|call| call.launches).sum::<u64>(),
-            step.calls.iter().map(|call| call.launch).sum::<f64>() * 1e6,
+            sum(&|call| call.fixed) * 1e6,
+            step.calls.iter().map(|call| call.multiplicity * call.seconds.launches).sum::<u64>(),
+            sum(&|call| call.launch) * 1e6,
             step.step * 1e6,
+            step.boundaries * 1e6,
         );
-        for (call, seconds) in demand.calls.iter().zip(&step.calls) {
+        for (kind, call) in step.calls.iter().enumerate() {
             eprintln!(
-                "magnitude-assess:     {:<32} {:>9.2} µs bytes {:>9.2} µs compute \
+                "magnitude-assess:     kind {kind:<3} × {:<4} {:>9.2} µs bytes {:>9.2} µs compute \
                  {:>7.2} µs fixed {} launches",
-                call.launches.kernel().name(),
-                seconds.bytes * 1e6,
-                seconds.compute * 1e6,
-                seconds.fixed * 1e6,
-                seconds.launches,
+                call.multiplicity,
+                call.seconds.bytes * 1e6,
+                call.seconds.compute * 1e6,
+                call.seconds.fixed * 1e6,
+                call.seconds.launches,
             );
         }
     }

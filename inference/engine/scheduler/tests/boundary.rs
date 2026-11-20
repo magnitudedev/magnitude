@@ -63,6 +63,16 @@ fn sources(directory: &Path) -> Vec<(std::path::PathBuf, String)> {
     found
 }
 
+/// Whether `source` names the path `name` whole, not as part of a longer
+/// identifier: `seismic` is the forbidden crate, `seismic_threads` an
+/// allowed one ([`direct_dependencies_preserve_the_service_boundary`]).
+fn names(source: &str, name: &str) -> bool {
+    let identifier = |character: Option<char>| character.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    source.match_indices(name).any(|(start, _)| {
+        !identifier(source[..start].chars().next_back()) && !identifier(source[start + name.len()..].chars().next())
+    })
+}
+
 #[test]
 fn service_sources_do_not_import_forbidden_implementation_layers() {
     let sources = sources(&manifest_dir().join("src"));
@@ -75,11 +85,7 @@ fn service_sources_do_not_import_forbidden_implementation_layers() {
             "crate::chat",
             "crate::templates",
         ] {
-            assert!(
-                !source.contains(forbidden),
-                "{} imported {forbidden}",
-                path.display()
-            );
+            assert!(!names(source, forbidden), "{} imported {forbidden}", path.display());
         }
     }
 }

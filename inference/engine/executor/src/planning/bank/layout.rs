@@ -49,6 +49,16 @@ pub enum BankPart {
     /// step in flight (`RegionWords::flight`), ring words each.
     Rings,
     Routing,
+    /// The layer's key records, `[FLIGHT, VERIFY_ROWS, E]` (`RegionWords::flight`):
+    /// each row's selection key of every expert, as f32 bits, beside its
+    /// routing record (streaming_words.seismic's keys), which placement
+    /// ranks by.
+    Keys,
+    /// The layer's front ring, ring words (streaming_words.seismic): every
+    /// choice of the step's front rows there (`resolve`), protected where
+    /// held and read ahead where absent for the step the front row's token
+    /// is exact in.
+    Front,
     /// The layer's policy words (`POLICY_WORDS`), the host's between
     /// flights (the watcher's `publish_policy`): its POLICY_WHOLE word,
     /// nonzero while the layer's group is whole (nothing misses there, so
@@ -86,6 +96,11 @@ pub enum BankPart {
     /// the list for every layer, which every landing launch declares.
     Staging { kind: RoutedTensor },
     LandingList,
+    /// The decode landing launch's grid (`routed_land`'s), which the
+    /// layer's route writes each step (`resolve`'s `land_grid`): the
+    /// device's own, the layer's, read by the landing launch that follows
+    /// the route in the step's queue.
+    LandGrid,
     /// The scratch tier's view of routed tensor `kind` in the layer's form:
     /// slot `e` holding expert `e`, a view of the scratch the lender lends
     /// every prompt group ([`ScratchPlan`]), which the rounds convert cold
@@ -174,7 +189,9 @@ impl BankPart {
             | Self::FileTable
             | Self::ScratchTable
             | Self::Rings
+            | Self::Front
             | Self::Routing
+            | Self::Keys
             | Self::Policy
             | Self::SiteTable
             | Self::SiteRows
@@ -183,6 +200,7 @@ impl BankPart {
             | Self::Conveyor { .. }
             | Self::Staging { .. }
             | Self::LandingList
+            | Self::LandGrid
             | Self::Scratch { .. }
             | Self::ScratchFlags
             | Self::RoundList { .. }
@@ -210,13 +228,16 @@ impl BankPart {
             Self::FileTable,
             Self::ScratchTable,
             Self::Rings,
+            Self::Front,
             Self::Routing,
+            Self::Keys,
             Self::Policy,
             Self::SiteTable,
             Self::SiteRows,
             Self::SiteOutput,
             Self::Commits,
             Self::LandingList,
+            Self::LandGrid,
             Self::ScratchFlags,
             Self::TierList,
             Self::SeedList,
@@ -282,6 +303,15 @@ pub enum Placer {
     /// Unified memory: there is no tier, and the host lands a file miss
     /// straight into a bank record, which the device reads where it lies.
     Bank,
+}
+
+impl Placer {
+    /// A decode landing launch's threadgroups while it lands
+    /// (`magnitude_kernels::land_groups`): where the bank places, the launch
+    /// binds staging records; where the host tier places, none.
+    pub fn land_groups(self) -> i32 {
+        magnitude_kernels::land_groups(matches!(self, Self::Bank))
+    }
 }
 
 /// Which of a bank's tiers (each its own granule pool) a holding lies in.
@@ -535,6 +565,10 @@ pub struct LayerAllocations<T> {
     pub scratch: T,
     pub rings: T,
     pub routing: T,
+    /// The key records (`BankPart::Keys`).
+    pub keys: T,
+    /// The front ring (`BankPart::Front`).
+    pub front: T,
     /// The policy words (`BankPart::Policy`).
     pub policy: T,
     /// The CPU site's words and buffers, where the layer has a CPU site
@@ -545,6 +579,8 @@ pub struct LayerAllocations<T> {
     /// a step's round at the next layer, which launches before the host
     /// appends for it there, finds no entry of this layer's under its head.
     pub landing: T,
+    /// Its decode landing launch's grid (`BankPart::LandGrid`).
+    pub land_grid: T,
     pub rounds: Vec<T>,
     /// Its scratch request's tier and seed lists (`BankPart::TierList`,
     /// `SeedList`): each layer's own, so a list a step's copy at the layer
@@ -615,18 +651,20 @@ impl<T> BankLayout<T> {
             owned.extend(records.iter().map(|(_, records)| ("group: records", records)));
             owned.extend([("group: map", map), ("group: commits", commits)]);
         }
-        for LayerAllocations { expert_scales, tier, file, scratch, rings, routing, policy, sited, landing, rounds, tiered, seeds, windows } in layers {
+        for LayerAllocations { expert_scales, tier, file, scratch, rings, front, routing, keys, policy, sited, landing, land_grid, rounds, tiered, seeds, windows } in layers {
             owned.extend(expert_scales.iter().filter_map(|(_, scale)| scale.as_ref()).map(|scale| ("layer: expert scales", scale)));
             owned.extend(tier.iter().map(|tier| ("layer: tier words", tier)));
             owned.extend([
                 ("layer: file words", file),
                 ("layer: scratch words", scratch),
                 ("layer: hint rings", rings),
+                ("layer: front ring", front),
                 ("layer: routing records", routing),
                 ("layer: policy", policy),
+                ("layer: key records", keys),
             ]);
             owned.extend(sited.iter().flat_map(SiteAllocations::iter).map(|site| ("layer: CPU site", site)));
-            owned.push(("layer: landing list", landing));
+            owned.extend([("layer: landing list", landing), ("layer: landing grid", land_grid)]);
             owned.extend(rounds.iter().map(|list| ("layer: round landing lists", list)));
             owned.extend([("layer: tier list", tiered), ("layer: seeds", seeds)]);
             owned.extend(windows.iter().map(|w| ("layer: window table", w)));
@@ -675,9 +713,12 @@ impl<T> BankLayout<T> {
                 scratch: make(&layer.scratch)?,
                 rings: make(&layer.rings)?,
                 routing: make(&layer.routing)?,
+                keys: make(&layer.keys)?,
+                front: make(&layer.front)?,
                 policy: make(&layer.policy)?,
                 sited: layer.sited.as_ref().map(|sited| sited.try_map(&mut make)).transpose()?,
                 landing: make(&layer.landing)?,
+                land_grid: make(&layer.land_grid)?,
                 rounds: layer.rounds.iter().map(&mut make).collect::<Result<Vec<_>, E>>()?,
                 tiered: make(&layer.tiered)?,
                 seeds: make(&layer.seeds)?,
@@ -761,9 +802,14 @@ impl ExpertBankPlan {
             BankPart::FileTable => Ok(Some((Element::i32(), binding()?.words.file().extents().to_vec()))),
             BankPart::ScratchTable => Ok(Some((Element::i32(), binding()?.words.scratch().extents().to_vec()))),
             BankPart::Rings => Ok(Some((Element::i32(), vec![self.ahead(layer), binding()?.words.ring_words()]))),
+            BankPart::Front => Ok(Some((Element::i32(), vec![binding()?.words.ring_words()]))),
             BankPart::Routing => {
                 let words = binding()?.words;
                 Ok(Some((Element::i32(), vec![words.flight, words.routing_words()])))
+            }
+            BankPart::Keys => {
+                let binding = binding()?;
+                Ok(Some((Element::i32(), vec![binding.words.flight, constants::VERIFY_ROWS, binding.experts])))
             }
             BankPart::Map => Ok(Some((Element::i32(), vec![self.group_experts(self.layers()[layer].group), constants::MAP_WORDS]))),
             BankPart::TierMap | BankPart::Tier { .. } if !self.tiered() => Ok(None),
@@ -801,7 +847,8 @@ impl ExpertBankPlan {
                 let binding = binding()?;
                 Ok(binding.record.get(kind).map(|tensor| tensor.stored_tensor(binding.staging)).map(|(element, extents)| (element, extents.to_vec())))
             }
-            BankPart::LandingList => words(magnitude_kernels::landing_extent(self.choices())),
+            BankPart::LandingList => words(magnitude_kernels::constants::LANDING_ENTRY(self.choices())),
+            BankPart::LandGrid => words(3),
             BankPart::RoundList { round } if u64::from(round) < self.window_rounds() => words(self.round_list_words()),
             BankPart::RoundList { .. } => Ok(None),
             BankPart::TierList | BankPart::SeedList | BankPart::TierStaged | BankPart::SeedStaged => words(self.expert_list_words()),
@@ -876,6 +923,8 @@ impl ExpertBankPlan {
                     },
                     rings: words(index, BankPart::Rings)?,
                     routing: words(index, BankPart::Routing)?,
+                    keys: words(index, BankPart::Keys)?,
+                    front: words(index, BankPart::Front)?,
                     policy: words(index, BankPart::Policy)?,
                     sited: self
                         .sited(index)
@@ -888,6 +937,7 @@ impl ExpertBankPlan {
                         })
                         .transpose()?,
                     landing: words(index, BankPart::LandingList)?,
+                    land_grid: device(index, BankPart::LandGrid)?,
                     rounds: (0..self.rounds())
                         .map(|lane| {
                             let round = u8::try_from(lane % self.window_rounds()).map_err(|_| "scratch rounds exceed u8")?;

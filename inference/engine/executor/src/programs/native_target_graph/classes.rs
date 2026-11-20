@@ -1,16 +1,13 @@
 use super::block::{BlockCarries, CARRIED_ROWS, CarrySide};
 use super::prepared::{
-    BlockGraphShape, BlockTaps, block_graph_shapes, block_scopes, block_taps, chain_rows, stateless_tail,
+    BlockGraphShape, BlockTaps, block_graph_shapes, block_taps, chain_rows, stateless_tail,
 };
 use crate::{
     MixerProgramSlot, ModelLoadPlan, ResourceLimits, StateResourcePlan, TargetBlockProgramSlot, TargetProgramPlan,
     native::OutputScales,
     operators::{
         BlockKeeps, PairedBlock, paired_block,
-        routed::{
-            split::{Extents, OnceStage, RunStage, SplitValues, Stage},
-            streamed,
-        },
+        routed::split::{Extents, OnceStage, RunStage, SplitValues, Stage},
     },
     programs::graph::RowForm,
 };
@@ -50,37 +47,42 @@ pub(super) fn decode_launch(class: BlockClass, limits: ResourceLimits) -> bool {
 /// The routed feed-forward of block `index`'s feed-forward sublayer (a
 /// parallel sublayer's routed branch's), if it has one.
 pub(super) fn block_routed(geometry: &Decoder, index: usize) -> Result<Option<&RoutedFfn>, String> {
-    let scope = block_scopes(index)?[1];
+    let _ = u32::try_from(index).map_err(|_| "target block index exceeds u32")?;
     Ok(geometry
-        .sublayers()
-        .find(|&(at, _)| WeightScope::TargetSublayer(at) == scope)
-        .and_then(|(_, sublayer)| crate::operators::routed::routed_ffn(&sublayer.op)))
+        .blocks
+        .get(index)
+        .and_then(|block| block.sublayers.get(1))
+        .and_then(|sublayer| crate::operators::routed::routed_ffn(&sublayer.op)))
 }
 
-/// The routed feed-forward block `index`'s prompt rows split at: a layer
-/// whose experts stream, or any routed layer of a chain, whose launches
-/// merge their experts in a pass. A lone launch of resident experts has
-/// nothing to merge, so its block stays whole; so does every block of a
-/// load whose launches all decode, which run blocks whole
-/// (`RunStage::served`).
-pub(super) fn block_split<'g>(
-    load: &ModelLoadPlan,
-    geometry: &'g Decoder,
-    index: usize,
-    limits: ResourceLimits,
-) -> Result<Option<&'g RoutedFfn>, String> {
-    let merges = limits.chain_capacity.get() > 1 || streamed::streams(load, block_scopes(index)?[1]);
-    let prompts = magnitude_batching::row_classes(limits.max_launch_rows)
-        .last()
-        .is_some_and(|&rows| !crate::operators::routed::fused_graph::decodes(rows as u64));
-    Ok(block_routed(geometry, index)?.filter(|_| merges && prompts))
+/// Per target block, the index of its feed-forward sublayer in
+/// `load.expert_bank().layers()`, if that block's experts stream.
+pub(super) fn bank_layer_by_block(load: &ModelLoadPlan, block_count: usize) -> Vec<Option<usize>> {
+    let mut by_block = vec![None; block_count];
+    let Some(bank) = load.expert_bank() else {
+        return by_block;
+    };
+    for (layer_idx, layer) in bank.layers().iter().enumerate() {
+        let sublayer = match layer.scope {
+            WeightScope::TargetSublayer(sublayer)
+            | WeightScope::TargetBranch { sublayer, .. } => sublayer,
+            _ => continue,
+        };
+        if sublayer.sublayer == 1 {
+            if let Some(slot) = by_block.get_mut(sublayer.block as usize) {
+                if slot.is_none() {
+                    *slot = Some(layer_idx);
+                }
+            }
+        }
+    }
+    by_block
 }
 
 /// How a block is served, which decides its stages (`RunStage::served`,
 /// `RunStage::sealed`): whether the load streams its routed layer's experts
 /// and whether that layer has a resident form (`streamed::resident_form`),
-/// and the values a split layer (`block_split`) crosses and merges over the
-/// chain's rows.
+/// and the values a split layer crosses and merges over the chain's rows.
 #[derive(Clone, Debug)]
 pub(super) struct BlockServed {
     pub(super) streams: bool,
@@ -97,14 +99,27 @@ pub(super) fn block_served(
     chain_rows: u64,
     passes: Passes,
 ) -> Result<Vec<BlockServed>, String> {
-    (0..geometry.blocks.len())
+    let block_count = geometry.blocks.len();
+    let bank_layers = bank_layer_by_block(load, block_count);
+    let bank_resident = load.expert_bank().is_some_and(|bank| bank.resident);
+    let chain_merges = limits.chain_capacity.get() > 1;
+    let prompts = magnitude_batching::row_classes(limits.max_launch_rows)
+        .last()
+        .is_some_and(|&rows| !crate::operators::routed::fused_graph::decodes(rows as u64));
+    (0..block_count)
         .map(|index| {
-            Ok(BlockServed {
-                streams: streamed::streams(load, block_scopes(index)?[1]),
-                resident: streamed::resident_form(load, block_scopes(index)?[1]),
-                split: block_split(load, geometry, index, limits)?
+            let streams = bank_layers[index].is_some();
+            let split = if prompts && (chain_merges || streams) {
+                block_routed(geometry, index)?
                     .map(|routed| SplitValues::of(routed, geometry, chain_rows, passes.rows()))
-                    .transpose()?,
+                    .transpose()?
+            } else {
+                None
+            };
+            Ok(BlockServed {
+                streams,
+                resident: streams && bank_resident,
+                split,
             })
         })
         .collect()
@@ -146,23 +161,30 @@ fn block_splits(served: &[BlockServed], index: usize, rows: u64) -> bool {
 pub(super) struct LaunchRuns<'s, T> {
     served: &'s [BlockServed],
     /// The runs, by their class.
-    runs: std::collections::BTreeMap<BlockClass, Vec<T>>,
-    /// The graphs run once a group (per window for a streamed block), by their block.
-    once: std::collections::BTreeMap<usize, Vec<(OnceStage, u64, T)>>,
+    runs: std::collections::HashMap<BlockClass, Vec<T>>,
+    /// The graphs run once a group (per window for a streamed block), by their
+    /// block in ascending block order (only blocks with once graphs).
+    once: Vec<(usize, Vec<(OnceStage, u64, T)>)>,
 }
 
 impl<'s, T> LaunchRuns<'s, T> {
     /// The index of `graphs`, each its block, its staged class and what it
     /// holds, of blocks served as `served` (`block_served`).
     pub(super) fn of(served: &'s [BlockServed], graphs: impl IntoIterator<Item = (usize, StagedClass, T)>) -> Self {
-        let mut index = Self { served, runs: Default::default(), once: Default::default() };
+        let mut runs: std::collections::HashMap<BlockClass, Vec<T>> = Default::default();
+        let mut once_by_block: Vec<Vec<(OnceStage, u64, T)>> = (0..served.len()).map(|_| Vec::new()).collect();
         for (block, (class, stage), graph) in graphs {
             match stage {
-                Stage::Run(_) => index.runs.entry(class).or_default().push(graph),
-                Stage::Once(once) => index.once.entry(block).or_default().push((once, class.0, graph)),
+                Stage::Run(_) => runs.entry(class).or_default().push(graph),
+                Stage::Once(once) => once_by_block[block].push((once, class.0, graph)),
             }
         }
-        index
+        let once = once_by_block
+            .into_iter()
+            .enumerate()
+            .filter(|(_, graphs)| !graphs.is_empty())
+            .collect();
+        Self { served, runs, once }
     }
 
     /// The graphs a launch of `class` runs, repeating a streamed block's
@@ -172,8 +194,8 @@ impl<'s, T> LaunchRuns<'s, T> {
         let once = self
             .once
             .iter()
-            .filter(move |&(&block, _)| block_splits(self.served, block, class.0))
-            .flat_map(move |(&block, graphs)| {
+            .filter(move |&(block, _)| block_splits(self.served, *block, class.0))
+            .flat_map(move |&(block, ref graphs)| {
                 let streams = self.served[block].streams;
                 graphs.iter().flat_map(move |(once, rows, graph)| {
                     let repeat = if streams && (*once == OnceStage::Fill || *rows == single_pass) {
@@ -454,7 +476,7 @@ impl LaunchControlLayout {
 
 /// The history segment classes of a launch of at most `max_segments`
 /// segments, ascending: powers of two.
-fn segment_classes(max_segments: u64) -> impl Iterator<Item = u64> {
+pub(super) fn segment_classes(max_segments: u64) -> impl Iterator<Item = u64> {
     std::iter::successors(Some(1u64), move |segments| {
         segments.checked_mul(2).filter(|segments| *segments <= max_segments)
     })
@@ -614,7 +636,7 @@ pub(super) struct BlockListings {
     pub(super) tiles: Vec<u64>,
     /// Whether each is sealed for every history segment count, or for the
     /// most alone (`DecodedHistoryForm::lists_every_segment_count`).
-    every_segment_count: bool,
+    pub(super) every_segment_count: bool,
 }
 
 impl BlockListings {
@@ -678,32 +700,33 @@ pub(super) fn block_classes(
     listings: &BlockListings,
     scores: bool,
 ) -> Vec<BlockClass> {
-    let slots = match keeps.bank() {
-        true => 1..=rows.min(max_slots),
-        false => 1..=1,
+    let max_slot = match keeps.bank() {
+        true => rows.min(max_slots),
+        false => 1,
     };
-    let topologies: Vec<(u64, u64, u64)> = match keeps.history() {
-        true => segment_classes(max_segments)
-            .flat_map(|segments| {
-                let listed = listings
-                    .tiles
-                    .iter()
-                    .copied()
-                    .filter(move |_| listings.segments(segments, max_segments) == segments);
-                std::iter::once(0)
-                    .chain(listed)
-                    .map(move |listed| (segments, listed, 0))
-                    .chain(scores.then_some((segments, 0, 1)))
-            })
-            .collect(),
-        false => vec![(1, 0, 0)],
-    };
-    topologies
-        .into_iter()
-        .flat_map(|(segments, listed, scored)| {
-            slots.clone().map(move |slots| (rows, segments, slots, listed, scored))
-        })
-        .collect()
+    let mut classes = Vec::new();
+    if keeps.history() {
+        for segments in segment_classes(max_segments) {
+            let lists = listings.segments(segments, max_segments) == segments;
+            for slots in 1..=max_slot {
+                classes.push((rows, segments, slots, 0, 0));
+                if scores {
+                    classes.push((rows, segments, slots, 0, 1));
+                }
+                if lists {
+                    for &listed in &listings.tiles {
+                        classes.push((rows, segments, slots, listed, 0));
+                    }
+                }
+            }
+        }
+    } else {
+        classes.reserve(max_slot as usize);
+        for slots in 1..=max_slot {
+            classes.push((rows, 1, slots, 0, 0));
+        }
+    }
+    classes
 }
 
 /// The class of a block's graph serving a launch of `rows` rows over
@@ -783,10 +806,17 @@ pub(super) fn block_class_slice(
     // A recurrent mixer's slots are its own `B` (`RECURRENT_SLOTS`); an
     // attention block's are its n-gram input's (`NGRAM_SLOTS`).
     let slots = classes.iter().map(|&(_, _, slots, ..)| slots);
-    match keeps {
+    let slice = match keeps {
         BlockKeeps::History => slice,
         BlockKeeps::Bank => slice.scoped(crate::operators::block::RECURRENT_SLOTS, "B", slots),
         BlockKeeps::HistoryAndBank => slice.scoped(crate::operators::ngram::graph::NGRAM_SLOTS, "B", slots),
+    };
+    match block.ngram {
+        Some(ngram) => {
+            let heads = ngram.op.hash.heads().expect("validated n-gram hash heads");
+            slice.scoped("stored_rows", "M", [rows * heads])
+        }
+        None => slice,
     }
 }
 
@@ -950,7 +980,7 @@ pub(super) struct BlockGraphEnumeration {
 /// Which of a target's block graphs holds another's plan: a block's own
 /// graphs (`BlockGraphs::runs`), or a tapped block's untapped ones
 /// (`BlockGraphs::untapped`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Holder {
     Block(usize),
     Untapped(usize),
@@ -1024,8 +1054,17 @@ impl FamilyOutline {
         let keeps = block_keeps(geometry)?;
         let stateless_tail = stateless_tail(state, &keeps, &tapped);
         let carries = block_carries(backend, geometry, plan, stateless_tail)?;
-        let undrafted_tail = super::prepared::stateless_tail(state, &keeps, &vec![BlockTaps::default(); keeps.len()]);
-        let undrafted = (undrafted_tail, block_carries(backend, geometry, plan, undrafted_tail)?);
+        let undrafted_tail = if tap_width.is_none() {
+            stateless_tail
+        } else {
+            super::prepared::stateless_tail(state, &keeps, &vec![BlockTaps::default(); keeps.len()])
+        };
+        let undrafted_carries = if undrafted_tail == stateless_tail {
+            carries.clone()
+        } else {
+            block_carries(backend, geometry, plan, undrafted_tail)?
+        };
+        let undrafted = (undrafted_tail, undrafted_carries);
         let shapes = block_graph_shapes(load, geometry, state, &tapped, &carries, residual)?;
         Ok(Self {
             backend,
@@ -1093,19 +1132,48 @@ impl FamilyOutline {
         self.tapped[index].positions().any().then(|| self.shapes[index].undrafted())
     }
 
-    /// Where tapped block `index`'s untapped graphs take their layouts
+    /// Per block, where a tapped block's untapped graphs take their layouts
     /// from: the first block of their shape, else the first tapped block's
-    /// untapped graphs of it.
-    pub(super) fn untapped_layouts(&self, index: usize) -> Option<Holder> {
-        let shape = self.untapped(index)?;
-        Some(match self.shapes.iter().position(|other| *other == shape) {
-            Some(block) => Holder::Block(block),
-            None => Holder::Untapped(
-                (0..=index)
-                    .find(|&first| self.untapped(first).as_ref() == Some(&shape))
-                    .expect("a tapped block's untapped shape is its own"),
-            ),
-        })
+    /// untapped graphs of it; `None` for blocks that tap nothing.
+    pub(super) fn all_untapped_holders(&self) -> Vec<Option<Holder>> {
+        let block_count = self.shapes.len();
+        if self.tap_width.is_none() {
+            return vec![None; block_count];
+        }
+        let mut block_buckets: super::certify::FxHashMap<u64, Vec<usize>> = super::certify::fx_map();
+        for index in 0..block_count {
+            if self.firsts[index] == index {
+                block_buckets
+                    .entry(self.shapes[index].fx_hash())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut untapped_buckets: super::certify::FxHashMap<u64, Vec<(usize, BlockGraphShape)>> =
+            super::certify::fx_map();
+        let mut holders = Vec::with_capacity(block_count);
+        for index in 0..block_count {
+            let Some(shape) = self.untapped(index) else {
+                holders.push(None);
+                continue;
+            };
+            let hash = shape.fx_hash();
+            if let Some(&block) = block_buckets
+                .get(&hash)
+                .and_then(|bucket| bucket.iter().find(|&&b| self.shapes[b] == shape))
+            {
+                holders.push(Some(Holder::Block(block)));
+                continue;
+            }
+            let bucket = untapped_buckets.entry(hash).or_default();
+            if let Some(&(first, _)) = bucket.iter().find(|(_, existing)| *existing == shape) {
+                holders.push(Some(Holder::Untapped(first)));
+            } else {
+                bucket.push((index, shape));
+                holders.push(Some(Holder::Untapped(index)));
+            }
+        }
+        holders
     }
 
     /// Whether block `index`'s graphs export its output residual.
@@ -1116,91 +1184,44 @@ impl FamilyOutline {
 
 /// Per block, the first block of its shape.
 fn firsts(shapes: &[BlockGraphShape]) -> Vec<usize> {
-    (0..shapes.len())
-        .map(|index| (0..index).find(|&first| shapes[first] == shapes[index]).unwrap_or(index))
-        .collect()
-}
-
-/// Enumerate the block graphs of `plan` over `outline`'s row classes: the one
-/// enumeration of the sealer (`PreparedTargetGraphs::prepare`, with the
-/// scales it read) and of the planner (`certify_target_family`, with the
-/// planned ones), so the planned sealed graphs are the sealed ones. The
-/// blocks' groups run `passes`.
-pub(super) fn enumerate_block_graphs(
-    outline: &FamilyOutline,
-    served: &[BlockServed],
-    passes: Passes,
-    state: &StateResourcePlan,
-    plan: &TargetProgramPlan,
-    scales: BlockOutputScales<'_>,
-) -> Result<BlockGraphEnumeration, String> {
-    let FamilyOutline { backend, ref row_classes, max_slots, max_segments, ref keeps, ref shapes, .. } = *outline;
-    let blocks = plan.blocks();
-    let unit = |index: usize| {
-        !crate::native::output_tails(blocks[index])
-            .into_iter()
-            .any(crate::native::reads_layer_scale)
-    };
-    let equal_scales = |first: usize, index: usize| match scales {
-        BlockOutputScales::Read(scales) => scales[first] == scales[index],
-        BlockOutputScales::Planned(UnreadScales::Distinct) => unit(first) && unit(index),
-        // Blocks of one shape read the same scales or none.
-        BlockOutputScales::Planned(UnreadScales::Equal) => true,
-    };
-    let shared = (0..blocks.len())
-        .map(|index| {
-            (0..index).find(|&first| shapes[first] == shapes[index] && equal_scales(first, index))
-        })
-        .collect::<Vec<_>>();
-    let untapped = (0..blocks.len()).map(|index| outline.untapped(index)).collect::<Vec<_>>();
-    // A tapped block's untapped graph shares the plan of a block's own
-    // graph of its shape, else of an earlier tapped block's untapped one.
-    let untapped_shared = (0..blocks.len())
-        .map(|index| {
-            let shape = untapped[index].as_ref()?;
-            Some(
-                (0..blocks.len())
-                    .find(|&other| shapes[other] == *shape && equal_scales(other, index))
-                    .map(Holder::Block)
-                    .or_else(|| {
-                        (0..index)
-                            .find(|&first| untapped[first].as_ref() == Some(shape) && equal_scales(first, index))
-                            .map(Holder::Untapped)
-                    }),
-            )
-        })
-        .collect::<Vec<_>>();
-    let exact = match scales {
-        BlockOutputScales::Read(_) => true,
-        BlockOutputScales::Planned(_) => (0..blocks.len()).all(|index| {
-            (0..index).all(|first| shapes[first] != shapes[index] || (unit(first) && unit(index)))
-                && untapped[index].as_ref().is_none_or(|shape| {
-                    (0..blocks.len())
-                        .filter(|&other| shapes[other] == *shape || (other < index && untapped[other].as_ref() == Some(shape)))
-                        .all(|other| unit(other) && unit(index))
-                })
-        }),
-    };
-    // Per row class, each block's listing classes; per block, those of the
-    // largest row class that has any.
-    let listings_at = row_classes
-        .iter()
-        .map(|&rows| {
-            blocks
-                .iter()
-                .enumerate()
-                .map(|(index, &slot)| block_listings(state, backend, slot, index, rows))
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut block_listed = vec![BlockListings::default(); blocks.len()];
-    for listings in &listings_at {
-        for (index, listings) in listings.iter().enumerate() {
-            if !listings.tiles.is_empty() {
-                block_listed[index] = listings.clone();
-            }
+    let mut buckets: super::certify::FxHashMap<u64, Vec<usize>> = super::certify::fx_map();
+    let mut out = Vec::with_capacity(shapes.len());
+    for (index, shape) in shapes.iter().enumerate() {
+        let hash = shape.fx_hash();
+        let bucket = buckets.entry(hash).or_default();
+        if let Some(&first) = bucket.iter().find(|&&first| shapes[first] == *shape) {
+            out.push(first);
+        } else {
+            bucket.push(index);
+            out.push(index);
         }
     }
+    out
+}
+
+/// Per block, its prefill rows' listing classes (`block_listings`) and the
+/// launch control layout derived from them, the picked pooled sources and the
+/// selected reads: shared by `TargetFamilyComposition` and
+/// `enumerate_block_graphs`.
+pub(super) fn block_listings_and_controls(
+    outline: &FamilyOutline,
+    state: &StateResourcePlan,
+    plan: &TargetProgramPlan,
+) -> Result<(Vec<BlockListings>, LaunchControlLayout), String> {
+    let blocks = plan.blocks();
+    let has_prefill = outline
+        .row_classes
+        .iter()
+        .any(|&rows| !crate::operators::attention::graph::decodes(rows));
+    let block_listed = if has_prefill {
+        blocks
+            .iter()
+            .enumerate()
+            .map(|(index, &slot)| block_listings(state, outline.backend, slot, index, outline.largest_rows))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        vec![BlockListings::default(); blocks.len()]
+    };
     // Each picked pooled source's Block read, the picks per row of every
     // indexer over it (each storing to one picks table, so all alike) and
     // the blocks of the candidate pool its own indexer produces.
@@ -1257,65 +1278,206 @@ pub(super) fn enumerate_block_graphs(
             );
         }
     }
+    let controls = LaunchControlLayout::of(
+        &state.target_state().history_reads()?,
+        &block_listed,
+        &picked,
+        &selected,
+        outline.largest_rows,
+        outline.max_segments,
+        outline.max_slots,
+    )?;
+    Ok((block_listed, controls))
+}
+
+/// Enumerate the block graphs of `plan` over `outline`'s row classes: the one
+/// enumeration of the sealer (`PreparedTargetGraphs::prepare`, with the
+/// scales it read) and of the planner (`certify_target_family`, with the
+/// planned ones), so the planned sealed graphs are the sealed ones. The
+/// blocks' groups run `passes`.
+pub(super) fn enumerate_block_graphs(
+    outline: &FamilyOutline,
+    served: &[BlockServed],
+    passes: Passes,
+    state: &StateResourcePlan,
+    plan: &TargetProgramPlan,
+    scales: BlockOutputScales<'_>,
+) -> Result<BlockGraphEnumeration, String> {
+    let FamilyOutline { ref row_classes, max_slots, max_segments, ref keeps, ref shapes, .. } = *outline;
+    let blocks = plan.blocks();
+    let units = (0..blocks.len())
+        .map(|index| {
+            !crate::native::output_tails(blocks[index])
+                .into_iter()
+                .any(crate::native::reads_layer_scale)
+        })
+        .collect::<Vec<_>>();
+    let equal_scales = |first: usize, index: usize| match scales {
+        BlockOutputScales::Read(scales) => scales[first] == scales[index],
+        BlockOutputScales::Planned(UnreadScales::Distinct) => units[first] && units[index],
+        // Blocks of one shape read the same scales or none.
+        BlockOutputScales::Planned(UnreadScales::Equal) => true,
+    };
+    let shared = (0..blocks.len())
+        .map(|index| {
+            (0..index).find(|&first| shapes[first] == shapes[index] && equal_scales(first, index))
+        })
+        .collect::<Vec<_>>();
+    let untapped = (0..blocks.len()).map(|index| outline.untapped(index)).collect::<Vec<_>>();
+    // A tapped block's untapped graph shares the plan of a block's own
+    // graph of its shape, else of an earlier tapped block's untapped one.
+    let untapped_shared = (0..blocks.len())
+        .map(|index| {
+            let shape = untapped[index].as_ref()?;
+            Some(
+                (0..blocks.len())
+                    .find(|&other| shapes[other] == *shape && equal_scales(other, index))
+                    .map(Holder::Block)
+                    .or_else(|| {
+                        (0..index)
+                            .find(|&first| untapped[first].as_ref() == Some(shape) && equal_scales(first, index))
+                            .map(Holder::Untapped)
+                    }),
+            )
+        })
+        .collect::<Vec<_>>();
+    let exact = match scales {
+        BlockOutputScales::Read(_) => true,
+        BlockOutputScales::Planned(_) => (0..blocks.len()).all(|index| {
+            (0..index).all(|first| shapes[first] != shapes[index] || (units[first] && units[index]))
+                && untapped[index].as_ref().is_none_or(|shape| {
+                    (0..blocks.len())
+                        .filter(|&other| shapes[other] == *shape || (other < index && untapped[other].as_ref() == Some(shape)))
+                        .all(|other| units[other] && units[index])
+                })
+        }),
+    };
+    let (block_listed, controls) = block_listings_and_controls(outline, state, plan)?;
+    let empty_listings = BlockListings::default();
     let mut enumeration = BlockGraphEnumeration {
         sealing: Vec::new(),
         sharing: Vec::new(),
-        controls: LaunchControlLayout::of(
-            &state.target_state().history_reads()?,
-            &block_listed,
-            &picked,
-            &selected,
-            outline.largest_rows,
-            max_segments,
-            max_slots,
-        )?,
+        controls,
         listings: block_listed,
         launch_classes: std::collections::BTreeSet::new(),
         untapped_sealing: Vec::new(),
         untapped_sharing: Vec::new(),
         exact,
     };
-    for (&rows, listings) in row_classes.iter().zip(&listings_at) {
-        for (index, &slot) in blocks.iter().enumerate() {
-            for class in block_classes(
-                keeps[index],
-                rows,
-                max_slots,
-                max_segments,
-                &listings[index],
-                slot_scores(slot),
-            ) {
-                enumeration.launch_classes.insert(class);
-                for &stage in block_sealed_stages(served, index, rows) {
+    let scores = blocks.iter().map(|&slot| slot_scores(slot)).collect::<Vec<_>>();
+    // Blocks of the same (keeps, listings, scores) share identical class lists
+    // for a row class: build each unique list once and insert into
+    // `launch_classes` once rather than once per block.
+    let mut unique_classes: Vec<Vec<BlockClass>> = Vec::new();
+    let mut block_row_class_id = vec![0usize; blocks.len() * row_classes.len()];
+    for (row_idx, &rows) in row_classes.iter().enumerate() {
+        let is_decode = crate::operators::attention::graph::decodes(rows);
+        let mut seen_for_row: Vec<((BlockKeeps, &BlockListings, bool), usize)> = Vec::new();
+        for index in 0..blocks.len() {
+            let listing = if is_decode { &empty_listings } else { &enumeration.listings[index] };
+            let key = (keeps[index], listing, scores[index]);
+            let id = match seen_for_row.iter().find(|&&(other, _)| other == key) {
+                Some(&(_, id)) => id,
+                None => {
+                    let id = unique_classes.len();
+                    let classes = block_classes(
+                        keeps[index],
+                        rows,
+                        max_slots,
+                        max_segments,
+                        listing,
+                        scores[index],
+                    );
+                    enumeration.launch_classes.extend(classes.iter().copied());
+                    unique_classes.push(classes);
+                    seen_for_row.push((key, id));
+                    id
+                }
+            };
+            block_row_class_id[index * row_classes.len() + row_idx] = id;
+        }
+    }
+    // Emit every block's run and once graphs in ascending `(index, class, stage)`
+    // order directly (by construction, without post-hoc sorting).
+    let mut sealing_cap = 0usize;
+    let mut sharing_cap = 0usize;
+    let mut untapped_sealing_cap = 0usize;
+    let mut untapped_sharing_cap = 0usize;
+    for index in 0..blocks.len() {
+        let mut run_count = 0usize;
+        let mut untapped_count = 0usize;
+        for (row_idx, &rows) in row_classes.iter().enumerate() {
+            let n = unique_classes[block_row_class_id[index * row_classes.len() + row_idx]].len()
+                * block_sealed_stages(served, index, rows).len();
+            run_count += n;
+            if rows <= outline.untapped_rows {
+                untapped_count += n;
+            }
+        }
+        let once_count = once_graphs(served[index].streams, served[index].split.is_some(), passes).len();
+        match shared[index] {
+            Some(_) => sharing_cap += run_count + once_count,
+            None => sealing_cap += run_count + once_count,
+        }
+        match untapped_shared[index] {
+            None => {}
+            Some(Some(_)) => untapped_sharing_cap += untapped_count,
+            Some(None) => untapped_sealing_cap += untapped_count,
+        }
+    }
+    enumeration.sealing.reserve(sealing_cap);
+    enumeration.sharing.reserve(sharing_cap);
+    enumeration.untapped_sealing.reserve(untapped_sealing_cap);
+    enumeration.untapped_sharing.reserve(untapped_sharing_cap);
+    for index in 0..blocks.len() {
+        let mut once = once_graphs(served[index].streams, served[index].split.is_some(), passes);
+        once.sort_unstable_by_key(|&(stage, rows)| once_class(rows, stage));
+        let mut once_at = 0usize;
+        let emit_once = |staged: StagedClass, sealing: &mut Vec<_>, sharing: &mut Vec<_>| match shared[index] {
+            Some(first) => sharing.push((index, staged, first)),
+            None => sealing.push((index, staged)),
+        };
+        for (row_idx, &rows) in row_classes.iter().enumerate() {
+            while once_at < once.len() && once[once_at].1 < rows {
+                let (stage, pass_rows) = once[once_at];
+                emit_once(once_class(pass_rows, stage), &mut enumeration.sealing, &mut enumeration.sharing);
+                once_at += 1;
+            }
+            let stages = block_sealed_stages(served, index, rows);
+            let classes = &unique_classes[block_row_class_id[index * row_classes.len() + row_idx]];
+            let untapped_entry = if rows <= outline.untapped_rows { untapped_shared[index] } else { None };
+            for (class_pos, &class) in classes.iter().enumerate() {
+                for &stage in stages {
                     let staged = (class, Stage::Run(stage));
                     match shared[index] {
                         Some(first) => enumeration.sharing.push((index, staged, first)),
                         None => enumeration.sealing.push((index, staged)),
                     }
-                    match untapped_shared[index] {
-                        _ if rows > outline.untapped_rows => {}
+                    match untapped_entry {
                         None => {}
                         Some(Some(holder)) => enumeration.untapped_sharing.push((index, staged, holder)),
                         Some(None) => enumeration.untapped_sealing.push((index, staged)),
                     }
                 }
+                if class_pos == 0 {
+                    while once_at < once.len() && once[once_at].1 == rows {
+                        let (stage, pass_rows) = once[once_at];
+                        emit_once(once_class(pass_rows, stage), &mut enumeration.sealing, &mut enumeration.sharing);
+                        once_at += 1;
+                    }
+                }
             }
         }
-    }
-    // Each block's graphs sealed once; then every block's classes in
-    // ascending order, as the sealer holds them.
-    for (index, block) in served.iter().enumerate() {
-        for (stage, rows) in once_graphs(block.streams, block.split.is_some(), passes) {
-            match shared[index] {
-                Some(first) => enumeration.sharing.push((index, once_class(rows, stage), first)),
-                None => enumeration.sealing.push((index, once_class(rows, stage))),
-            }
+        while once_at < once.len() {
+            let (stage, pass_rows) = once[once_at];
+            emit_once(once_class(pass_rows, stage), &mut enumeration.sealing, &mut enumeration.sharing);
+            once_at += 1;
         }
     }
-    enumeration.sealing.sort_unstable();
-    enumeration.sharing.sort_unstable();
-    enumeration.untapped_sealing.sort_unstable();
-    enumeration.untapped_sharing.sort_unstable();
+    debug_assert!(enumeration.sealing.windows(2).all(|w| w[0] <= w[1]));
+    debug_assert!(enumeration.sharing.windows(2).all(|w| w[0] <= w[1]));
+    debug_assert!(enumeration.untapped_sealing.windows(2).all(|w| w[0] <= w[1]));
+    debug_assert!(enumeration.untapped_sharing.windows(2).all(|w| w[0] <= w[1]));
     Ok(enumeration)
 }
 

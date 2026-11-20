@@ -13,7 +13,7 @@ pub use classes::{
     PREFILL_ROW_QUANTUM, SMALL_CLASS_ROWS,
 };
 pub use demand::Demand;
-pub use head::{BlockSlot, HeadPasses, HeadSlot, ValidatedHeadBatch};
+pub use head::{BlockSlot, FrontContinuation, FrontSlot, HeadPasses, HeadSlot, ValidatedHeadBatch};
 pub use rows::{
     coalesce_spans, history_tiles, Draw, DrawKind, HistoryTables, PackError, PackedRowTables, Row, RowHistory,
     Select, Shaping, Slot, HISTORY_WIDTH, SHAPING_WIDTH,

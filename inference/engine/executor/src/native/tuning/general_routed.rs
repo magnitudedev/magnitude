@@ -8,7 +8,7 @@
 
 use super::cases::scale_extent;
 use super::routed::{
-    BankOperands, ExpansionScales, GroupedTables, RoutedShape, bank_sources, bank_statics,
+    BankOperands, ExpansionScales, GroupedTables, ResidentGateUp, RoutedShape, bank_sources, bank_statics,
     decode_points, group, grouped_points, lead_ports, no_sources, no_tier, routes, streamed_hint,
     words, written,
 };
@@ -19,7 +19,7 @@ use crate::GeneralRoutedBinding;
 use crate::operators::routed::fused_graph::TILE_ROWS;
 use crate::planning::{BankBinding, HINT_LEADS};
 use magnitude_family_contracts::{GluLimit, WeightKind, WeightScope};
-use magnitude_kernels::constants::{POLICY_WORDS, STEP_LOW, STEP_WORDS};
+use magnitude_kernels::constants::{POLICY_WORDS, STEP_WORDS};
 use magnitude_kernels::{
     routed_down, routed_down_project, routed_experts, routed_experts_up, routed_gate_up,
     routed_hint_select, routed_scatter, routed_select, routed_select_streamed, routed_up,
@@ -274,6 +274,10 @@ impl EntryTuning for RoutedSelectStreamedTuning {
             file: bank.file.tensor_mut(),
             sources: bank.sources.tensor_mut(),
             routing: bank.routing.tensor_mut(),
+            keys: bank.keys.tensor_mut(),
+            front: bank.front.tensor_mut(),
+            land_grid: bank.land_grid.tensor_mut(),
+            land_groups: bank.land_groups,
         }
     }
 
@@ -359,7 +363,9 @@ impl EntryTuning for RoutedHintSelectTuning {
                     [&select.router_norm, &select.router, &select.bias],
                 )?;
                 let step = words(inputs, &[STEP_WORDS])?;
-                step.store_release(4 * STEP_LOW, 1)?;
+                for (word, value) in magnitude_kernels::step_words(1, 0).into_iter().enumerate() {
+                    step.store_release(4 * word as u64, u32::from_ne_bytes(value.to_ne_bytes()))?;
+                }
                 Ok(RoutedHintSelectCase {
                     residual: select.residual,
                     activation: inputs.scratch(self.resident.binding.activation, &[0, self.resident.binding.shape.selected])?,
@@ -555,11 +561,26 @@ impl EntryTuning for RoutedGateUpTuning {
         }
     }
 
-    generated_entry!(routed_gate_up, this => routed_gate_up::Elements {
-        EGW: this.0.binding.expert_gate.unwrap_or(this.0.binding.expert_up),
-        EUW: this.0.binding.expert_up,
-        A: this.0.binding.activation,
-    });
+    generated_entry!(routed_gate_up, this => this.elements());
+}
+
+impl ResidentGateUp for RoutedGateUpTuning {
+    fn over(&self, layers: &[WeightScope]) -> Self {
+        Self(RoutedExpandDecodeTuning { scopes: layers.to_vec(), ..self.0.clone() })
+    }
+
+    fn routing(&self) -> RoutedShape {
+        RoutedShape { experts: self.0.experts, ..routing_shape(&self.0.binding) }
+    }
+
+    fn elements(&self) -> routed_gate_up::Elements {
+        let b = self.0.binding;
+        routed_gate_up::Elements {
+            EGW: b.expert_gate.unwrap_or(b.expert_up),
+            EUW: b.expert_up,
+            A: b.activation,
+        }
+    }
 }
 
 impl EntryTuning for RoutedUpTuning {

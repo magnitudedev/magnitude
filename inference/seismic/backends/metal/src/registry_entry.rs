@@ -47,7 +47,12 @@ pub(crate) const UNSTATED_GPU_CORES: u64 = 1;
 /// no entry states one (an Intel or AMD GPU, which is no AGX accelerator,
 /// or a macOS VM's paravirtual GPU), [`UNSTATED_GPU_CORES`].
 pub(crate) fn gpu_cores(registry_id: u64) -> u64 {
-    stated_gpu_cores(registry_id).unwrap_or(UNSTATED_GPU_CORES)
+    seismic_topology::resolve(
+        &[("IORegistry gpu-core-count", &|| stated_gpu_cores(registry_id))],
+        "default",
+        || UNSTATED_GPU_CORES,
+    )
+    .0
 }
 
 /// The positive `gpu-core-count` the registry entry `registry_id` states.

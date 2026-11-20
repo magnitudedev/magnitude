@@ -1158,7 +1158,12 @@ fn assemble_domain(
             BankPricing::new(manifest, bank, lines, site_requests)
         })
         .transpose()?;
+    let tiered = planned.load().expert_bank().is_some_and(magnitude_executor::ExpertBankPlan::tiered);
     let pricing = LoadPricing::new(manifest, resident, planned, (*device).clone(), bank)?;
+    if tiered {
+        phase.enter("measuring the transfer queue a host tier's promotions copy on");
+        measure_tier_copy(&domain, &pricing).map_err(internal)?;
+    }
     domain
         .measure_load(load_measures(&pricing).map_err(internal)?, &mut bindings)
         .map_err(|error| internal(error.to_string()))?;
@@ -1275,6 +1280,32 @@ fn report_sealed_graphs(
             })
         );
     }
+}
+
+/// A host tier's copies' points (`PointRequest::TierCopy`: the transfer
+/// queue's line, which every promotion is priced and paced by), measured
+/// on the load's own device before it streams where its kernel cache holds
+/// none yet, its expert traffic held and drained first as the measurement
+/// job's room beside a load holds it. A promotion is never priced without
+/// the line, so no tiered load streams before it is stored; it takes
+/// milliseconds, once a machine. Without a kernel cache the load is unpriced
+/// and promotes nothing. A point the device cannot take (no transfer queue)
+/// is stored unobtainable, and the load's tier copy prices as unavailable.
+fn measure_tier_copy(domain: &ExecutorDomain, pricing: &LoadPricing) -> Result<(), String> {
+    use magnitude_executor::assessment::{PointRequest, TierCopyCosts, TierCopyError};
+    let Some(root) = &pricing.kernel_cache else {
+        return Ok(());
+    };
+    let store = KernelCache::measurement_records(root);
+    let (topology, info) = (pricing.device.topology(), pricing.device.info());
+    if !matches!(TierCopyCosts::stored(topology, info, &store), Err(TierCopyError::Unrecorded { .. })) {
+        return Ok(());
+    }
+    // Held until this returns, by whichever exit.
+    let _traffic = domain.hold_expert_traffic();
+    domain.wait_expert_traffic_quiet().map_err(|error| error.to_string())?;
+    crate::worker::measure::measure_in_process(&domain.measurement_charges(), &store, &[PointRequest::TierCopy])
+        .map_err(|error| format!("the transfer queue's line: {error}"))
 }
 
 /// What a load unpriced without a kernel cache lacks: where the executor's
@@ -1536,7 +1567,7 @@ pub(crate) fn load_measures(pricing: &LoadPricing) -> Result<magnitude_executor:
 /// the bank's lines beside the host memory line, the link line and the move
 /// lines the job stored under `root`; its store's read line; and, on the
 /// executor's stored `costs`, the routed pass each streamed layer's prompt
-/// groups and GPU lines are priced on (`ExpertLines::priced`, beside the
+/// groups and GPU lines are priced on (`assessment::expert_lines`, beside the
 /// load's host lines). It touches the points the load still waits on, so
 /// the job measures them first, the costs' as `costs_outstanding` reads
 /// them (`PointRequest::outstanding`).
@@ -1549,7 +1580,7 @@ fn expert_measures(
     costs_outstanding: Option<magnitude_executor::assessment::CostWalk>,
 ) -> magnitude_executor::ExpertMeasures {
     use magnitude_executor::assessment::{
-        BankLines, CeilingError, ConvertCosts, ExpertLines, ExpertPass, HostLines, MemoryCosts, MemoryError, Priced,
+        expert_lines, expert_pass, host_lines, BankLines, CeilingError, ConvertCosts, MemoryCosts, MemoryError, Priced,
         StorageCosts, StorageError, TierCopyCosts, TierCopyError,
     };
     let (topology, info) = (load.device.topology(), load.device.info());
@@ -1560,7 +1591,7 @@ fn expert_measures(
         Err(error @ StorageError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
         Err(error) => Priced::Unavailable(error.to_string()),
     };
-    let pass = costs.clone().derive(|costs| ExpertPass::of_bank(bank, costs));
+    let pass = costs.as_ref().derive(|costs| expert_pass(bank, costs));
     // A host tier's record read from host memory, at its memory line.
     let memory = match bank.tiered() {
         false => Priced::Measured(None),
@@ -1585,10 +1616,10 @@ fn expert_measures(
         })
         .collect::<Result<Vec<_>, String>>();
     let host = match bank_lines {
-        Ok(bank_lines) => memory.derive(|byte_seconds| HostLines::of_bank(bank, &bank_lines, byte_seconds)),
+        Ok(bank_lines) => memory.derive(|byte_seconds| host_lines(bank, &bank_lines, byte_seconds)),
         Err(reason) => Priced::Unavailable(reason),
     };
-    let lines = host.and_then(|host| pass.as_ref().and_then(|pass| ExpertLines::priced(&host, pass)));
+    let lines = host.and_then(|host| pass.as_ref().and_then(|pass| expert_lines(&host, pass)));
     // A host tier's copy on the blocks the job measured: until then a list's
     // whole grid, as the bank opened.
     let tier_copy = match bank.tiered() {
@@ -1639,7 +1670,7 @@ fn expert_requests(
     sites: &[Option<magnitude_executor::assessment::SiteRequest>],
 ) -> Result<(Vec<magnitude_executor::assessment::PointRequest>, u64), LoadError> {
     use magnitude_executor::assessment::{ConvertCosts, PointRequest};
-    let readers = std::thread::available_parallelism().map_err(|error| internal(error.to_string()))?.get() as u64;
+    let readers = seismic::threads::quota().get() as u64;
     let tier = bank.tiered().then_some(PointRequest::TierCopy).into_iter();
     let sites = sites.iter().flatten().cloned().map(PointRequest::Site);
     let converts = (!bank.tiered()).then(|| ConvertCosts::forms(bank).map(PointRequest::Convert)).into_iter().flatten();
@@ -2077,8 +2108,12 @@ fn refused(purpose: &str, Short { store, required, over }: Short) -> LoadError {
 /// own history also receives one state-only priming row (`primes_drafter`),
 /// so its component import and binding complete before readiness; a draft
 /// head reading the target's history keeps none, and its component was
-/// imported and bound at load. The request's state advances are aborted, so
-/// no state survives it.
+/// imported and bound at load. On a load that fronts
+/// (`ExecutorDomain::fronts`) the row closes its prompt instead: it
+/// selects, and the head's front launch behind it enters its selection with
+/// its boundary feature and makes a chain (`ChainEntry`), so that path too
+/// runs before readiness. The request's state advances are aborted, so no
+/// state survives it.
 /// The bindings travel with the forward and return with it.
 fn warm_up(
     domain: &mut ExecutorDomain,
@@ -2111,6 +2146,7 @@ fn warm_up(
     {
         prefetched.wait();
     }
+    let closes = primes_drafter && domain.fronts();
     let operations = [Operation::Forward {
         request,
         kind: if primes_drafter {
@@ -2121,19 +2157,37 @@ fn warm_up(
         tokens: vec![TokenId(0)],
         position: 0,
         conditioning: None,
-        demand: if primes_drafter {
-            Demand::FEATURES
-        } else {
-            Demand::NONE
+        demand: match (primes_drafter, closes) {
+            (_, true) => Demand::SELECT | Demand::FEATURES,
+            (true, false) => Demand::FEATURES,
+            (false, false) => Demand::NONE,
         },
-        select: Vec::new(),
+        select: closes
+            .then(|| magnitude_executor::SelectSpec {
+                sampling: magnitude_executor::Sampling::Greedy,
+                seed: 0,
+                position: 0,
+                domain: 0,
+                mask: None,
+                shaping: magnitude_executor::Shaping { temperature: 0.0, ..Default::default() },
+                history: None,
+            })
+            .into_iter()
+            .collect(),
         committed: 1,
+        // A closing row primes across its boundary: its one row's feature
+        // is the boundary its selection enters the head with.
         prime: primes_drafter.then(|| magnitude_executor::Priming {
-            boundary: false,
-            tokens: vec![TokenId(0)],
+            boundary: closes,
+            tokens: match closes {
+                true => Vec::new(),
+                false => vec![TokenId(0)],
+            },
             position: 0,
             draft_from: 1,
         }),
+        front: Vec::new(),
+        chain: closes.then_some(magnitude_executor::ChainEntry { position: 0 }),
     }];
     let resources = domain
         .reserve(&mut bindings, &operations)

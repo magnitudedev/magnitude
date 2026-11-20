@@ -74,7 +74,7 @@ use magnitude_family_contracts::{
 };
 use magnitude_state::LayerRef;
 use seismic::{
-    BackendName, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort,
+    BackendName, Dim, Element, NativeGraph, NativePort,
     WorkflowTensor,
 };
 
@@ -261,7 +261,9 @@ impl CheckedMixerEntries {
         })
     }
 
-    pub(crate) fn entries(&self) -> Result<MixerEntries<'_, NativeGraphMetadata>, String> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> Result<MixerEntries<'_, G>, String> {
         Ok(match self {
             Self::Attention(checked) => MixerEntries::Attention(checked.entries()?),
             Self::Recurrent(checked) => MixerEntries::Recurrent(checked.entries()),
@@ -299,7 +301,9 @@ impl CheckedFeedForwardEntries {
         })
     }
 
-    pub(crate) fn entries(&self) -> FeedForwardEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> FeedForwardEntries<'_, G> {
         match self {
             Self::Dense(checked) => FeedForwardEntries::Dense(checked.entries()),
             Self::Routed(checked) => FeedForwardEntries::Routed(checked.entries()),
@@ -1235,7 +1239,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
         constants: &mut Vec<GraphConstant>,
         split: Option<Split<'_>>,
         operand: Option<routed_graph::OperandOut<'_, G::Forms>>,
-    ) -> Result<(ResidualCarry<WorkflowTensor>, Option<NativePort>), GraphError> {
+    ) -> Result<(ResidualCarry<WorkflowTensor>, Option<crate::operators::routed::streamed::StepInputs>), GraphError> {
         let FeedForwardGraph { entries, bank } = feed_forward;
         let (planned, rows, scope) = (self.weights, &self.numbers.rows, self.scope(1));
         let epsilon = self.topology.epsilon.f32();

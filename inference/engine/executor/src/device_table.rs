@@ -1179,7 +1179,7 @@ mod tests {
             4,
             2,
             4,
-            crate::planning::TableFlights { flights: crate::FlightDepth::SERIAL, lanes: 1 },
+            crate::planning::TableFlights { flights: crate::FlightDepth::SERIAL, lanes: 1, fronts: false },
             DirectoryForm::Dense,
             Box::new(Rows),
             kept.map(|directory| KeptRows::of(directory, "table")),

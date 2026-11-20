@@ -3,11 +3,36 @@ use crate::scheduler::Flight;
 use super::platform::{drop_pages, refuses_direct, reopen};
 use super::ALIGNMENT;
 use crate::scheduler::{Buffers, Piece};
-use crate::Error;
+use crate::{Buffer, Error};
 use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+
+/// A piece's bytes as its read from the volume left them
+/// ([`SourceFile::fetch`]): landed in its one sink, or held in a buffer of
+/// the pool's until they land in its parts' sinks ([`Self::land`]).
+pub(crate) enum Fetched {
+    Landed,
+    Held(Buffer),
+}
+
+impl Fetched {
+    /// Land `piece`'s parts: each one's bytes copied out of the buffer that
+    /// holds them, which goes back to `buffers`.
+    pub(crate) fn land(self, piece: &Piece, buffers: &Buffers) {
+        let Self::Held(mut buffer) = self else {
+            return;
+        };
+        let bytes = buffer.bytes_mut();
+        for part in &piece.parts {
+            // SAFETY: `part.length` bytes of the part's sink, which the pool
+            // writes alone until the job ends (`Reader::submit`).
+            unsafe { std::ptr::copy_nonoverlapping(bytes[part.from..].as_ptr(), part.sink.as_ptr(), part.length) };
+        }
+        buffers.give(buffer);
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct SourceFile {
@@ -62,31 +87,31 @@ impl SourceFile {
     /// uncached piece that lies within one range where the sink meets the
     /// reader's alignment, otherwise through a buffer of `buffers`.
     pub(crate) fn read_piece(&self, piece: &Piece, buffers: &Buffers) -> Result<(), Error> {
+        let fetched = self.fetch(piece, buffers)?;
+        fetched.land(piece, buffers);
+        Ok(())
+    }
+
+    /// Read `piece` from the volume: straight into its one sink where it
+    /// lands straight ([`Self::lands_straight`]), otherwise into a buffer of
+    /// `buffers`, its parts still to land ([`Fetched::land`]).
+    pub(crate) fn fetch(&self, piece: &Piece, buffers: &Buffers) -> Result<Fetched, Error> {
         let span = (piece.end - piece.start) as usize;
         if self.lands_straight(piece) {
             // SAFETY: the piece's one part's sink is `span` bytes the pool
             // writes alone until the job ends (`Reader::submit`).
             let sink =
                 unsafe { std::slice::from_raw_parts_mut(piece.parts[0].sink.as_ptr(), span) };
-            return self.read_block(piece.start, sink);
+            return self.read_block(piece.start, sink).map(|()| Fetched::Landed);
         }
         let mut buffer = buffers.take(span);
-        let bytes = &mut buffer.bytes_mut()[..span];
-        let read = self.read_block(piece.start, bytes);
-        if read.is_ok() {
-            for part in &piece.parts {
-                // SAFETY: as above, `part.length` bytes of the sink.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes[part.from..].as_ptr(),
-                        part.sink.as_ptr(),
-                        part.length,
-                    )
-                };
+        match self.read_block(piece.start, &mut buffer.bytes_mut()[..span]) {
+            Ok(()) => Ok(Fetched::Held(buffer)),
+            Err(error) => {
+                buffers.give(buffer);
+                Err(error)
             }
         }
-        buffers.give(buffer);
-        read
     }
 
     /// Whether `piece` is read straight into its sink: an uncached piece

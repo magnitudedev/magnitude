@@ -16,10 +16,14 @@
 using Raw = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 using Pro = projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4, Raw>;
 
-#define DOWN_WEIGHTS(m, k, expert)                                                                                 \
-    (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN)}                 \
-         .matrix(routed::decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), ROUTED_SOURCE_ROWS,                    \
-                                       SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, (m), (k), (expert))))
+// Where choice (m, k) of `expert` reads its down weights: a bank record, or
+// its tier record in place. In the kernel's own scope, where its ports are.
+#define DOWN_SOURCE(m, k, expert)                                                                          \
+    routed::decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1, \
+                          SEISMIC_SOURCES_STRIDE_2, (m), (k), (expert))
+#define DOWN_WEIGHTS(m, k, expert)                                                                         \
+    (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN)}         \
+         .matrix(DOWN_SOURCE(m, k, expert)))
 
 struct ProjectedEpi {
     element::Out<activation::Act> projected;
@@ -60,7 +64,7 @@ struct ChoiceProjectedEpi {
     }                                                                                                              \
     const projection::u64 group = Shape::tile_group();                                                             \
     projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_F / 64, group, SEISMIC_DIM_H,                     \
-                                    PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{},             \
+                                    PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{},                       \
                                     ProjectedEpi{projected, s2});
 
 #define ROUTED_DOWN_STAGE_BODY                                                                                     \
@@ -76,14 +80,17 @@ struct ChoiceProjectedEpi {
     __shared__ projection::GemvShared<Shape, Raw> shared;                                                          \
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                         \
     const unsigned choice = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;                                           \
-    if (!routed::first_choice(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, choice))            \
+    const auto record = [&](unsigned c) {                                                                          \
+        const int ex = routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, c);          \
+        return routed::ChoiceKey{ex, DOWN_SOURCE(c / slots, c % slots, ex).code, true};                            \
+    };                                                                                                             \
+    if (!routed::first_choice(record, choice))                                                                     \
         return;                                                                                                    \
     __shared__ projection::u64 rows_at[SEISMIC_CONST_VERIFY_ROWS], offsets_at[SEISMIC_CONST_VERIFY_ROWS];          \
     __shared__ unsigned count;                                                                                     \
     if (threadIdx.x == 0) {                                                                                        \
         projection::u32 chosen[SEISMIC_CONST_VERIFY_ROWS];                                                         \
-        count = routed::expert_choices(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,                   \
-                                       (unsigned)SEISMIC_DIM_M, slots, choice, chosen);                            \
+        count = routed::record_choices(record, (unsigned)SEISMIC_DIM_M * slots, choice, chosen);                   \
         for (unsigned r = 0; r < count; ++r) {                                                                     \
             const projection::u64 m = chosen[r] / slots, k = chosen[r] % slots;                                    \
             rows_at[r] = NVFP4 ? chosen[r] * SEISMIC_DIM_F                                                         \
@@ -107,5 +114,5 @@ struct ChoiceProjectedEpi {
     const projection::u8 *rows =                                                                                   \
         NVFP4 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_EXPERT_DOWN_OPERANDS) : SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT);    \
     projection::gemv_segment<Shape>(shared, routed::GatheredRows{rows, rows_at}, count, SEISMIC_DIM_F / 64, group, \
-                                    SEISMIC_DIM_H, PACKETS_MATRIX(KERNEL_W0, down),                      \
+                                    SEISMIC_DIM_H, PACKETS_MATRIX(KERNEL_W0, down),                                \
                                     projection::NoWeight{}, ChoiceProjectedEpi{projected, offsets_at, s2});

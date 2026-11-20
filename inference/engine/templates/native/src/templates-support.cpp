@@ -22,14 +22,22 @@ void string_replace_all(std::string & s, const std::string & search, const std::
 }
 
 std::string string_join(const std::vector<std::string> & values, const std::string & separator) {
-    std::ostringstream result;
+    if (values.empty()) {
+        return {};
+    }
+    size_t total = separator.size() * (values.size() - 1);
+    for (const auto & value : values) {
+        total += value.size();
+    }
+    std::string result;
+    result.reserve(total);
     for (size_t i = 0; i < values.size(); ++i) {
         if (i > 0) {
-            result << separator;
+            result.append(separator);
         }
-        result << values[i];
+        result.append(values[i]);
     }
-    return result.str();
+    return result;
 }
 
 std::vector<std::string> string_split(const std::string & str, const std::string & delimiter) {

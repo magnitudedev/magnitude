@@ -375,13 +375,14 @@ pub fn check_source_with<E>(
     Ok(checked)
 }
 
-/// A native implementation's source, includes expanded, and the constants of
-/// its module: a rendered source defines `SEISMIC_CONST_NAME` for each it
-/// names.
+/// A native implementation's source, includes expanded, and the constants and
+/// constant functions of its module: a rendered source defines
+/// `SEISMIC_CONST_NAME` for each it names.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeAsset<'a> {
     pub text: &'a str,
     pub constants: &'a [(String, u64)],
+    pub functions: &'a [ConstantFunction],
 }
 
 /// An opaque checked semantic object: source semantics, types, effects,
@@ -457,6 +458,14 @@ impl CheckedModule {
     /// exports them.
     pub fn constants(&self) -> &[(String, u64)] {
         &self.inner.constants
+    }
+
+    /// The module constant functions (`const NAME(P, ..) = EXPR`), in
+    /// source order: any expression of the module calls each, every native
+    /// reads each as `SEISMIC_CONST_NAME(ARG, ..)`, and the generated Rust
+    /// API exports them.
+    pub fn constant_functions(&self) -> &[ConstantFunction] {
+        &self.inner.constant_functions
     }
 
     /// Every exported entry, in declaration order.
@@ -563,6 +572,7 @@ impl CheckedModule {
         self.assets.get(&(entry, backend)).map(|source| NativeAsset {
             text: source,
             constants: self.constants(),
+            functions: self.constant_functions(),
         })
     }
 
@@ -2063,6 +2073,130 @@ impl Encoded {
     }
 }
 
+/// A module constant function (`const NAME(P, ..) = EXPR`): its body reads
+/// its parameters and nothing else but literals, so it has a value wherever
+/// its arguments do. A call of it in any expression of the module is its
+/// body at the call's arguments, and a native reads it as a preprocessor
+/// macro of every dialect (`SEISMIC_CONST_NAME(..)`), which substitutes each
+/// argument where its parameter is read and leaves each operation to the
+/// native's own arithmetic. So it is made only by [`Self::new`] (the
+/// checker's and the bundle decode's), which admits a body only where that
+/// substitution means what the declarations and the host compute: each
+/// parameter read at most once (an argument is evaluated once), and only the
+/// operations every dialect spells and types alike ([`ConstantBody`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ConstantFunctionParts")]
+pub struct ConstantFunction {
+    name: String,
+    parameters: Vec<String>,
+    body: ConstantBody,
+}
+
+/// A constant function's body: integers, its parameters' reads and the
+/// operations every dialect's arithmetic has one meaning of over any
+/// integer types. `ceil_div` (whose divisor its expansion reads twice),
+/// `min` and `max` (which a Metal integer call needs both arguments of one
+/// type for) have no representation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConstantBody {
+    Constant(u64),
+    Parameter(String),
+    Add(Box<Self>, Box<Self>),
+    Sub(Box<Self>, Box<Self>),
+    Mul(Box<Self>, Box<Self>),
+    Div(Box<Self>, Box<Self>),
+    Rem(Box<Self>, Box<Self>),
+}
+
+impl ConstantBody {
+    /// The body in the native integer language, each parameter read a
+    /// [`NativeNatExpr::Dimension`], as a host evaluates and renders it.
+    pub fn nat(&self) -> NativeNatExpr {
+        let binary = |left: &Self, right: &Self, make: fn(Box<NativeNatExpr>, Box<NativeNatExpr>) -> NativeNatExpr| {
+            make(Box::new(left.nat()), Box::new(right.nat()))
+        };
+        match self {
+            Self::Constant(value) => NativeNatExpr::Constant(*value),
+            Self::Parameter(name) => NativeNatExpr::Dimension(name.clone()),
+            Self::Add(left, right) => binary(left, right, NativeNatExpr::Add),
+            Self::Sub(left, right) => binary(left, right, NativeNatExpr::Sub),
+            Self::Mul(left, right) => binary(left, right, NativeNatExpr::Mul),
+            Self::Div(left, right) => binary(left, right, NativeNatExpr::Div),
+            Self::Rem(left, right) => binary(left, right, NativeNatExpr::Rem),
+        }
+    }
+
+    /// Each parameter read, in order, as often as it is read.
+    fn reads<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Self::Constant(_) => {}
+            Self::Parameter(name) => out.push(name),
+            Self::Add(left, right)
+            | Self::Sub(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Rem(left, right) => {
+                left.reads(out);
+                right.reads(out);
+            }
+        }
+    }
+}
+
+/// [`ConstantFunction`] as a bundle stores it, admitted by
+/// [`ConstantFunction::new`].
+#[derive(Deserialize)]
+struct ConstantFunctionParts {
+    name: String,
+    parameters: Vec<String>,
+    body: ConstantBody,
+}
+
+impl TryFrom<ConstantFunctionParts> for ConstantFunction {
+    type Error = String;
+
+    fn try_from(parts: ConstantFunctionParts) -> Result<Self, String> {
+        Self::new(parts.name, parts.parameters, parts.body)
+    }
+}
+
+impl ConstantFunction {
+    /// Function `name` of `parameters` (each named once) and `body`, which
+    /// reads only those parameters, each at most once.
+    pub fn new(name: String, parameters: Vec<String>, body: ConstantBody) -> Result<Self, String> {
+        for (at, parameter) in parameters.iter().enumerate() {
+            if parameters[..at].contains(parameter) {
+                return Err(format!("`{parameter}` is a parameter of `{name}` twice"));
+            }
+        }
+        let mut reads = Vec::new();
+        body.reads(&mut reads);
+        for (at, read) in reads.iter().enumerate() {
+            if !parameters.iter().any(|parameter| parameter == read) {
+                return Err(format!("`{name}` reads `{read}`, which is none of its parameters"));
+            }
+            if reads[..at].contains(read) {
+                return Err(format!(
+                    "`{name}` reads its parameter `{read}` twice: a native's macro would evaluate its argument twice"
+                ));
+            }
+        }
+        Ok(Self { name, parameters, body })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn parameters(&self) -> &[String] {
+        &self.parameters
+    }
+
+    pub fn body(&self) -> &ConstantBody {
+        &self.body
+    }
+}
+
 /// Closed integer language used by native declarations.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeNatExpr {
@@ -3381,6 +3515,127 @@ impl NativeImplementation {
         Ok(bound)
     }
 
+    /// Every dimension name referenced in any launch's `when` guard.
+    pub fn launch_dimensions(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for launch in &self.launches {
+            if let Some(when) = &launch.when {
+                when.dimensions(&mut names);
+            }
+        }
+        names
+    }
+
+    /// The configurations [`Self::launch_masks_over`] evaluates at `statics`:
+    /// one admitted configuration for each admitted assignment of the
+    /// parameters any launch's `when` guard reads (entry-wide or
+    /// launch-scoped), in the walk's order. A function of the statics alone,
+    /// so a caller may keep it for every call at them; `Inadmissible` where
+    /// none is admitted.
+    pub fn launch_configurations(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> Result<Vec<NativeSpecialization>, NativeSpecializationError> {
+        let mut entry_read = Vec::new();
+        let mut launch_read: Vec<(usize, String)> = Vec::new();
+        for (ordinal, launch) in self.launches.iter().enumerate() {
+            if let Some(when) = &launch.when {
+                let mut names = Vec::new();
+                when.parameters(&mut names);
+                for name in names {
+                    if launch.params.iter().any(|p| p.name == name) {
+                        if !launch_read.iter().any(|(o, n)| *o == ordinal && n == &name) {
+                            launch_read.push((ordinal, name));
+                        }
+                    } else if !entry_read.contains(&name) {
+                        entry_read.push(name);
+                    }
+                }
+            }
+        }
+        let launch_read = launch_read.as_slice();
+        let first = self
+            .params
+            .iter()
+            .filter(|parameter| entry_read.contains(&parameter.name))
+            .map(|parameter| (None, parameter.name.as_str()))
+            .chain(
+                self.launches
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(ordinal, launch)| {
+                        launch
+                            .params
+                            .iter()
+                            .filter(move |parameter| {
+                                launch_read
+                                    .iter()
+                                    .any(|(o, n)| *o == ordinal && n == &parameter.name)
+                            })
+                            .map(move |parameter| (Some(ordinal), parameter.name.as_str()))
+                    }),
+            )
+            .collect::<Vec<_>>();
+        let mut configurations = Vec::new();
+        self.walk(
+            statics,
+            &first,
+            true,
+            &entry_held(statics),
+            None,
+            None,
+            || true,
+            |configuration| {
+                configurations.push(configuration.clone());
+                true
+            },
+        )?;
+        if configurations.is_empty() {
+            return Err(NativeSpecializationError::Inadmissible);
+        }
+        Ok(configurations)
+    }
+
+    /// For each configuration in `configurations`
+    /// ([`Self::launch_configurations`] at the statics `dimension` holds), the
+    /// active-launch bitmask at `dimension`: bit `i` is set iff launch `i` has
+    /// no `when` guard or its guard holds at `(dimension, configuration)`.
+    pub fn launch_masks_over(
+        &self,
+        configurations: &[NativeSpecialization],
+        dimension: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<Vec<u64>, NativeScratchBoundError> {
+        assert!(
+            self.launches.len() <= 64,
+            "a call declares at most 64 launches"
+        );
+        let mut masks = Vec::with_capacity(configurations.len());
+        for configuration in configurations {
+            let mut mask = 0u64;
+            for (ordinal, launch) in self.launches.iter().enumerate() {
+                let active = match &launch.when {
+                    None => true,
+                    Some(when) => when
+                        .holds(dimension, &|name| {
+                            configuration
+                                .launch_param(ordinal, name)
+                                .or_else(|| configuration.param(name))
+                        })
+                        .map_err(|error| NativeScratchBoundError::Charge {
+                            scratch: launch.kernel.clone(),
+                            params: configuration.params().clone(),
+                            error,
+                        })?,
+                };
+                if active {
+                    mask |= 1u64 << ordinal;
+                }
+            }
+            masks.push(mask);
+        }
+        Ok(masks)
+    }
+
     /// The declaration with each parameter's values reordered so its
     /// default at `statics` comes first, the others keeping their declared
     /// order: the declaration itself where every default is its first value.
@@ -4347,6 +4602,9 @@ pub(crate) mod internals {
         pub(crate) families: Vec<crate::check::ir::Family>,
         /// The module constants (`const NAME = INTEGER`), in source order.
         pub(crate) constants: Vec<(String, u64)>,
+        /// The module constant functions (`const NAME(P, ..) = EXPR`), in
+        /// source order.
+        pub(crate) constant_functions: Vec<super::ConstantFunction>,
     }
 
     pub(crate) fn check<E>(
@@ -5258,6 +5516,50 @@ mod native_tests {
                 "N".into()
             )))
         );
+    }
+
+    #[test]
+    fn launch_masks_over_tracks_conditional_launches() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "ops.seismic".to_owned(),
+            text: "fn scale[M, N](x: &tensor[M, N] f32, factor: f32, output: &mut tensor[M, N] f32):\n\
+                   \x20\x20\x20\x20parallel for i in 0..M:\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20parallel for j in 0..N:\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20output[i, j] = x[i, j] * factor\n\n\
+                   native scale for cuda from \"scale.cu\":\n\
+                   \x20\x20\x20\x20static (N)\n\
+                   \x20\x20\x20\x20params (arithmetic MODE in [0, 1] default 0, arithmetic UNUSED in [1, 2] default 1)\n\
+                   \x20\x20\x20\x20where N >= 16\n\
+                   \x20\x20\x20\x20launch always_on:\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20threadgroups (1, 1, 1)\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20threads_per_threadgroup (32, 1, 1)\n\
+                   \x20\x20\x20\x20launch mode_one when MODE == 1:\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20threadgroups (1, 1, 1)\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20threads_per_threadgroup (32, 1, 1)\n\
+                   \x20\x20\x20\x20launch multi_row when M > 1:\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20threadgroups (1, 1, 1)\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20threads_per_threadgroup (32, 1, 1)\n"
+                .to_owned(),
+        });
+        let module = check_source(sources).expect("conditional launches check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Cuda)
+            .unwrap();
+        assert_eq!(native.launch_dimensions(), vec!["M".to_owned()]);
+        let statics = NativeSpecialization::new().with_static("N", 32);
+        // Only MODE is read by `launch.when`, so UNUSED is not cross-producted.
+        let configs = native.launch_configurations(&statics).unwrap();
+        assert_eq!(configs.len(), 2);
+        let at = |m: u64| move |name: &str| match name {
+            "N" => Some(32),
+            "M" => Some(m),
+            _ => None,
+        };
+        // At M = 1: bit 0 always set, bit 1 set for MODE == 1, bit 2 clear.
+        assert_eq!(native.launch_masks_over(&configs, &at(1)), Ok(vec![0b001, 0b011]));
+        // At M = 4: bit 2 also set.
+        assert_eq!(native.launch_masks_over(&configs, &at(4)), Ok(vec![0b101, 0b111]));
     }
 
     /// Each buffer's largest charge over every configuration of the full

@@ -2,14 +2,14 @@
 // `metal/routed_up.metal`, with the activated epilogue A(act(A(up))).
 // Two forms of one entry (GATHERED, a tuning form both valid at every M,
 // which the tuning admits between):
-// - `routed_up` (GATHERED 0): block row y = choice (m, k), the K1 GEMV over
-//   choice's up rows where its source names (`routed::decode_source`: a
+// - `routed_up_choice` (GATHERED 0): block row y = choice (m, k), the K1 GEMV
+//   over choice's up rows where its source names (`routed::decode_source`: a
 //   bank record, or a host tier record read in place); both forms read an
 //   expert's weights there, its scale by expert, and give a choice with no
 //   record a zero product.
 // - `routed_up_gathered` (GATHERED 1): a choice computes
-//   only when it is its expert's first choice, the K1 GEMV over that
-//   expert's up rows for the activation row of every choice of the expert
+//   only when it is the first choice reading its record, the K1 GEMV over
+//   that record's up rows for the activation row of every choice reading it
 //   (`routed::gather`), so each chosen expert streams once. A GEMV
 //   row's result does not depend on the other rows, so every choice gets its
 //   one-row bits.
@@ -25,10 +25,12 @@ using Epi = projection::Activated<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
 // Where choice (m, k) of `expert` reads its up weights: a bank record, or
 // its tier record in place. In the kernel's own scope, where its ports are.
+#define UP_SOURCE(m, k, expert)                                                                            \
+    routed::decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_DIM_XS, SEISMIC_SOURCES_STRIDE_1,   \
+                          SEISMIC_SOURCES_STRIDE_2, (m), (k), (expert))
 #define UP_WEIGHTS(m, k, expert)                                                                           \
-    (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), SEISMIC_PTR(SEISMIC_BUFFER_TIER_UP)}                  \
-         .matrix(routed::decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_DIM_XS, SEISMIC_SOURCES_STRIDE_1, \
-                                       SEISMIC_SOURCES_STRIDE_2, (m), (k), (expert))))
+    (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), SEISMIC_PTR(SEISMIC_BUFFER_TIER_UP)}             \
+         .matrix(UP_SOURCE(m, k, expert)))
 
 #ifdef SEISMIC_FORMING_ROUTED_UP_CHOICE
 template <int TPW, int KSPLIT>
@@ -86,14 +88,17 @@ __global__ void routed_up_gathered(SEISMIC_KERNEL_PARAMS) {
     __shared__ routed::Gathered table;
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const unsigned choice = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;
-    if (!routed::gather(table, routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
+    const auto record = [&](unsigned c) {
+        const int ex = routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, c);
+        return routed::ChoiceKey{ex, UP_SOURCE(c / slots, c % slots, ex).code, true};
+    };
+    if (!routed::gather(table, record, routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
                         (unsigned)SEISMIC_DIM_M, slots, choice, GATHERED_STRIDE, SEISMIC_RESULT_0_STRIDE_0,
                         SEISMIC_RESULT_0_STRIDE_1))
         return;
     const projection::u64 expert = (projection::u64)table.expert;
     const slab::Matrix weights = UP_WEIGHTS(choice / slots, choice % slots, (int)expert);
-    // An expert with no record (every choice of an expert has its one
-    // source) has a zero product for each of its choices.
+    // A choice with no record has a zero product.
     if (weights.stack == nullptr) {
         for (unsigned r = 0; r < table.count; ++r)
             routed::zero_block_rows<Shape>(SEISMIC_DIM_F, [&](projection::u64 n) {

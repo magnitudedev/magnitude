@@ -1,5 +1,5 @@
-"""References for rendered fixture sets, built on demand by `magnitude-references run` and cached
-on the host by their identity: model, rendered digest and reference implementation.
+"""References for a template's rendered sessions, built on demand by `magnitude-references run` and
+cached on the host by their identity: model, template, prompt digest and reference implementation.
 
 A reference is built on the CPU alone and admitted to the cache when its logits are finite
 (`admit`). The CPU reference is deterministic, so a second CPU build would repeat its bytes and
@@ -7,7 +7,7 @@ prove nothing. An accelerator build is not used: it could be admitted only by a 
 same reference, which takes the time of building on the CPU, and it may differ from that build by
 more than rounding wherever the reference makes a discrete choice (a routed expert, a selected row
 or proposal token, a trained code: `Reference.continuous`). A near tie that another summation order
-flips moves every later row of the fixture by far more than any rounding bound.
+flips moves every later row of the session by far more than any rounding bound.
 A build that is refused (non-finite logits) is named, and its directory is kept for inspection (the
 rig reclaims it as it does cached references); an admitted build is cached with its admission in its
 record. A build that fails, or is interrupted, is stopped and removed.
@@ -73,10 +73,11 @@ class Reference:
         }
 
 
-def location(cache: Path, model: str, rendered_digest: str, implementation_digest: str) -> Path:
-    return (
-        cache / model.replace(":", "_").replace("/", "_") / rendered_digest / implementation_digest
-    )
+def location(cache: Path, model: str, template: str, prompt_sha256: str, implementation_digest: str) -> Path:
+    def segment(name: str) -> str:
+        return name.replace(":", "_").replace("/", "_")
+
+    return cache / segment(model) / segment(template) / prompt_sha256 / implementation_digest
 
 
 def check(reference: Reference) -> Reference:
@@ -85,7 +86,7 @@ def check(reference: Reference) -> Reference:
     if not sanity["passed"]:
         raise ReferenceRefused(
             f"reference {reference.directory} failed its sanity gate (perplexity "
-            f"{sanity['perplexity']:.3g}, top-1 {sanity['top1_accuracy']:.3f}; failing fixtures "
+            f"{sanity['perplexity']:.3g}, top-1 {sanity['top1_accuracy']:.3f}; failing sessions "
             f"{', '.join(Gate.failing(sanity))}): it must not be used for comparison"
         )
     return reference
@@ -138,10 +139,11 @@ def admit(directory: Path) -> dict:
 
 def exact(cache: Path, rendered_set, family: type, variant: str | None) -> Reference:
     """The reference of `rendered_set` a platform that makes rows exact computed from these sources, wherever it
-    was computed and staged from: the admitted record in the model's directory of the rendered digest whose
+    was computed and staged from: the admitted record in the directory of its model, template and prompt digest whose
     identity is this implementation's on the platform it recorded. `ReferenceUnavailable` where the cache holds
     none, naming what to compute and where."""
-    for record_path in sorted(location(cache, rendered_set.model, rendered_set.digest, "").glob(f"*/{RECORD}")):
+    where = location(cache, rendered_set.model, rendered_set.template, rendered_set.prompt_sha256, "")
+    for record_path in sorted(where.glob(f"*/{RECORD}")):
         record = json.loads(record_path.read_text())
         # A record written before records named their platform says nothing of whether its rows are exact.
         platform = record.get("platform")
@@ -149,7 +151,8 @@ def exact(cache: Path, rendered_set, family: type, variant: str | None) -> Refer
                 and record["implementation_digest"] == implementation(family, variant, "cpu", platform)):
             return Reference(record_path.parent, record, True)
     raise ReferenceUnavailable(
-        f"no reference of {rendered_set.model} on rendered {rendered_set.digest} of these sources is in "
+        f"no reference of {rendered_set.model} on {rendered_set.template} (prompts {rendered_set.prompt_sha256}) of "
+        f"these sources is in "
         f"{cache}, and this host does not make rows exact: compute it on a CPU with one of "
         f"{', '.join(ROWS_EXACT)} and stage it here"
     )
@@ -165,7 +168,8 @@ def obtain(
     implementation_digest = implementation(family, variant, "cpu")
     if not digest.platform("cpu")["rows_exact"]:
         return exact(cache, rendered_set, family, variant)
-    directory = location(cache, rendered_set.model, rendered_set.digest, implementation_digest)
+    directory = location(cache, rendered_set.model, rendered_set.template, rendered_set.prompt_sha256,
+                         implementation_digest)
     # Only a reference admitted as a CPU build is cached: a directory there with any other record is
     # replaced.
     stored = json.loads((directory / RECORD).read_text()) if (directory / RECORD).is_file() else {}
@@ -183,6 +187,8 @@ def obtain(
     record = json.loads((directory / RECORD).read_text())
     expected = {
         "model": rendered_set.model,
+        "template": rendered_set.template,
+        "prompt_sha256": rendered_set.prompt_sha256,
         "rendered_digest": rendered_set.digest,
         "implementation_digest": implementation_digest,
     }

@@ -27,7 +27,7 @@
 //! Selections are step-major: proposal `k` of slot `s` is result row
 //! `k · slots + s`.
 
-use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelections};
+use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelected, HeadSelections};
 use crate::device_table::SelectedRead;
 use crate::operators::{self, InputForm, Join, Mixer, SublayerInput};
 use crate::{
@@ -42,14 +42,19 @@ use crate::{
     programs::{
         graph::facts::{constant, constant_reals, FactIndex, FactSink, Facts, Numbers, RealIndex, TableIndex},
         graph::readout::{self, shapes, write_selection_rows, SelectionPorts},
-        graph::{draft::{Certified, GraphDraft}, GraphError, RowForm},
+        graph::{
+            draft::{Certified, ElementBoundDraft, GraphDraft},
+            sizing::SizingOutline,
+            GraphError, RowForm,
+        },
         native_constants::{
             distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
-            ConstantTensors, GraphConstant, RecordedConstant,
+            ConstantTensors, GraphConstant,
         },
         native_target_graph::{
             weight, weight_scale_port, CheckedLandingEntries, GatheredTable, GraphWeights, LandedReadPorts,
             LandingEntries, PackingBound, PlannedWeights, RowDirectory, WeightOperands, WeightPort,
+            WeightView,
         },
     },
     DeviceError, DraftProgramPlan, HeadLaunchCore, InvariantError,
@@ -69,10 +74,12 @@ use magnitude_kernels::{
     token_confidence, widen_rows,
 };
 use magnitude_state::LayerRef;
+#[cfg(test)]
+use seismic::NativeGraphMetadata;
 use seismic::{
-    Argument, BackendName, BoundNativeGraphPlan, ClassFact, Device, Dim, Element, NativeGraph, NativeGraphClassSlice,
-    NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan, NativeGraphResourceTemplate,
-    NativeGraphTraces, NativePort, Reals, Table, Tensor, WorkflowTensor,
+    Argument, BackendName, BoundNativeGraphPlan, Device, Dim, Element, NativeGraph,
+    NativeGraphClassSlice, NativeGraphFamily, NativeGraphLayout, NativeGraphPlan, NativePort,
+    Table, Tensor, WorkflowTensor,
 };
 use std::{collections::BTreeMap, rc::Rc, sync::Arc};
 
@@ -559,28 +566,28 @@ impl CheckedConvolvedEntries {
         }
     }
 
-    fn entries(&self) -> ConvolvedEntries<'_, NativeGraphMetadata> {
+    fn entries<G: ElementBoundDraft>(&self) -> ConvolvedEntries<'_, G> {
         ConvolvedEntries {
             layers: self
                 .layers
                 .iter()
                 .map(|layer| ConvolvedLayerEntries {
-                    attention_norm: &layer.attention_norm[..],
-                    attention_coefficients: &layer.attention_coefficients[..],
-                    query: &layer.query[..],
-                    key: &layer.key[..],
-                    value: &layer.value[..],
-                    output: &layer.output[..],
-                    feed_forward_norm: &layer.feed_forward_norm[..],
-                    feed_forward_coefficients: &layer.feed_forward_coefficients[..],
-                    gate: &layer.gate[..],
-                    up: &layer.up[..],
-                    down: &layer.down[..],
+                    attention_norm: G::bind(&layer.attention_norm[..]),
+                    attention_coefficients: G::bind_ranged(&layer.attention_coefficients[..]),
+                    query: G::bind_ranged(&layer.query[..]),
+                    key: G::bind_ranged(&layer.key[..]),
+                    value: G::bind_ranged(&layer.value[..]),
+                    output: G::bind_ranged(&layer.output[..]),
+                    feed_forward_norm: G::bind(&layer.feed_forward_norm[..]),
+                    feed_forward_coefficients: G::bind_ranged(&layer.feed_forward_coefficients[..]),
+                    gate: G::bind_ranged(&layer.gate[..]),
+                    up: G::bind_ranged(&layer.up[..]),
+                    down: G::bind_ranged(&layer.down[..]),
                 })
                 .collect(),
-            convolve_input: &self.activation[..],
-            convolve_residual: &self.none[..],
-            gated: &self.activation[..],
+            convolve_input: G::bind(&self.activation[..]),
+            convolve_residual: G::bind(&self.none[..]),
+            gated: G::bind(&self.activation[..]),
         }
     }
 }
@@ -608,14 +615,14 @@ impl CheckedSelectorEntries {
         }
     }
 
-    fn entries(&self) -> SelectorEntries<'_, NativeGraphMetadata> {
+    fn entries<G: ElementBoundDraft>(&self) -> SelectorEntries<'_, G> {
         SelectorEntries {
-            features: &self.features[..],
-            hidden: &self.hidden[..],
-            top_k: &self.none[..],
-            predecessor: &self.predecessor[..],
-            successor: &self.successor[..],
-            path: &self.activation[..],
+            features: G::bind(&self.features[..]),
+            hidden: G::bind_ranged(&self.hidden[..]),
+            top_k: G::bind(&self.none[..]),
+            predecessor: G::bind(&self.predecessor[..]),
+            successor: G::bind(&self.successor[..]),
+            path: G::bind(&self.activation[..]),
         }
     }
 }
@@ -687,44 +694,44 @@ impl CheckedCorrectorEntries {
         }
     }
 
-    fn entries(&self) -> CorrectorEntries<'_, NativeGraphMetadata> {
+    fn entries<G: ElementBoundDraft>(&self) -> CorrectorEntries<'_, G> {
         CorrectorEntries {
-            pass_norm: &self.pass_norm[..],
-            anchor_rows: &self.anchor_rows[..],
-            top_k: &self.none[..],
-            features: &self.activation[..],
-            feature_down: &self.feature_down[..],
-            token: self.token.as_ref().map(|token| &token[..]),
-            pass: &self.pass[..],
-            nodes: &self.none[..],
-            context: &self.context[..],
-            context_bias: &self.f32_rows[..],
-            anchor_norm: &self.anchor_norm[..],
-            attention: &self.activation[..],
+            pass_norm: G::bind(&self.pass_norm[..]),
+            anchor_rows: G::bind(&self.anchor_rows[..]),
+            top_k: G::bind(&self.none[..]),
+            features: G::bind(&self.activation[..]),
+            feature_down: G::bind_ranged(&self.feature_down[..]),
+            token: self.token.as_ref().map(|token| G::bind_ranged(&token[..])),
+            pass: G::bind_ranged(&self.pass[..]),
+            nodes: G::bind(&self.none[..]),
+            context: G::bind_ranged(&self.context[..]),
+            context_bias: G::bind(&self.f32_rows[..]),
+            anchor_norm: G::bind(&self.anchor_norm[..]),
+            attention: G::bind(&self.activation[..]),
             layers: self
                 .layers
                 .iter()
                 .map(|layer| CorrectorLayerEntries {
-                    attention_norm: &layer.attention_norm[..],
-                    attention_input: &layer.attention_input[..],
-                    attention_output: &layer.attention_output[..],
-                    attention_residual: &self.f32_rows[..],
-                    mlp_norm: &layer.mlp_norm[..],
-                    up: &layer.up[..],
-                    activated: &self.activated_rows[..],
-                    down: &layer.down[..],
-                    down_residual: &self.f32_rows[..],
+                    attention_norm: G::bind(&layer.attention_norm[..]),
+                    attention_input: G::bind_ranged(&layer.attention_input[..]),
+                    attention_output: G::bind_ranged(&layer.attention_output[..]),
+                    attention_residual: G::bind(&self.f32_rows[..]),
+                    mlp_norm: G::bind(&layer.mlp_norm[..]),
+                    up: G::bind_ranged(&layer.up[..]),
+                    activated: G::bind(&self.activated_rows[..]),
+                    down: G::bind_ranged(&layer.down[..]),
+                    down_residual: G::bind(&self.f32_rows[..]),
                 })
                 .collect(),
-            output_norm: &self.output_norm[..],
-            factors: &self.activation[..],
-            factor_input: &self.factor_input[..],
-            factor_activated: &self.activated_rows[..],
-            outgoing: &self.outgoing[..],
-            incoming: &self.incoming[..],
-            anchor: &self.anchor[..],
-            unit: &self.f32_rows[..],
-            path: &self.none[..],
+            output_norm: G::bind(&self.output_norm[..]),
+            factors: G::bind(&self.activation[..]),
+            factor_input: G::bind_ranged(&self.factor_input[..]),
+            factor_activated: G::bind(&self.activated_rows[..]),
+            outgoing: G::bind_ranged(&self.outgoing[..]),
+            incoming: G::bind_ranged(&self.incoming[..]),
+            anchor: G::bind_ranged(&self.anchor[..]),
+            unit: G::bind(&self.f32_rows[..]),
+            path: G::bind(&self.none[..]),
         }
     }
 }
@@ -781,7 +788,7 @@ impl CheckedDraftEntries {
         })
     }
 
-    fn entries(&self) -> Result<DraftGraphEntries<'_, NativeGraphMetadata>, String> {
+    fn entries<G: ElementBoundDraft + 'static>(&self) -> Result<DraftGraphEntries<'_, G>, String> {
         Ok(DraftGraphEntries {
             layers: self
                 .layers
@@ -794,20 +801,20 @@ impl CheckedDraftEntries {
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
-            embedding: &self.embedding[..],
-            landing: self.landing.as_ref().map(CheckedLandingEntries::entries),
+            embedding: G::bind(&self.embedding[..]),
+            landing: self.landing.as_ref().map(CheckedLandingEntries::entries::<G>),
             head: self.head.entries(),
-            shape: &self.selection[..],
-            sample: &self.selection[..],
-            confidence: &self.selection[..],
-            widen: &self.widen[..],
+            shape: G::bind(&self.selection[..]),
+            sample: G::bind(&self.selection[..]),
+            confidence: G::bind(&self.selection[..]),
+            widen: G::bind(&self.widen[..]),
             markov: self.markov.as_ref().map(|markov| MarkovEntries {
-                embedding: &markov.embedding[..],
-                projection: &markov.projection[..],
+                embedding: G::bind(&markov.embedding[..]),
+                projection: G::bind_ranged(&markov.projection[..]),
             }),
-            convolved: self.convolved.as_ref().map(CheckedConvolvedEntries::entries),
-            selector: self.selector.as_ref().map(CheckedSelectorEntries::entries),
-            corrector: self.corrector.as_ref().map(CheckedCorrectorEntries::entries),
+            convolved: self.convolved.as_ref().map(CheckedConvolvedEntries::entries::<G>),
+            selector: self.selector.as_ref().map(CheckedSelectorEntries::entries::<G>),
+            corrector: self.corrector.as_ref().map(CheckedCorrectorEntries::entries::<G>),
         })
     }
 }
@@ -890,6 +897,7 @@ impl<D> Numbers<D> for DraftModelNumbers<D> {
 struct DraftClass<D, A = AttentionTopology<RealIndex, TableIndex>> {
     topology: ClassTopology,
     entry_rows: D,
+    slots: u64,
     passes: ClassPasses<AttentionPass<D, A>>,
 }
 
@@ -899,6 +907,7 @@ impl<D, A> DraftClass<D, A> {
         DraftClass {
             topology: self.topology,
             entry_rows: self.entry_rows,
+            slots: self.slots,
             passes: self.passes.map(|pass| AttentionPass { topology: f(pass.topology), numbers: pass.numbers }),
         }
     }
@@ -974,6 +983,7 @@ impl<D, A> Numbers<D> for DraftClass<D, A> {
         DraftClass {
             topology: self.topology,
             entry_rows: f(self.entry_rows),
+            slots: self.slots,
             passes: self
                 .passes
                 .map(|pass| AttentionPass { topology: pass.topology, numbers: pass.numbers.map(&mut *f) }),
@@ -982,11 +992,10 @@ impl<D, A> Numbers<D> for DraftClass<D, A> {
 }
 
 /// What decides a draft class's graph beside its model's: the classes a
-/// topology's template certifies differ only in their entry rows, whose
-/// attention form (`RowForm`) it fixes.
+/// topology's template certifies differ only in their entry rows and drafting
+/// slots, whose attention forms (`RowForm`) it fixes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct ClassTopology {
-    slots: u64,
     proposals: u64,
     /// Rows of each slot's block (`DraftDefinition::block_rows`).
     block_rows: u64,
@@ -994,18 +1003,22 @@ struct ClassTopology {
     windowed: bool,
     device: bool,
     rows: RowForm,
+    /// The block pass's attention form (`RowForm::of(slots * block_rows)`),
+    /// `None` for an injection-only class (`slots == 0`).
+    block_form: Option<RowForm>,
 }
 
 impl ClassTopology {
     fn of(class: DraftGraphClass, draft: &DraftDefinition) -> Self {
+        let block_rows = draft.block_rows(class.proposals);
         Self {
-            slots: class.slots,
             proposals: class.proposals,
-            block_rows: draft.block_rows(class.proposals),
+            block_rows,
             shaped: class.shaped,
             windowed: class.windowed,
             device: class.device,
             rows: RowForm::of(class.entry_rows),
+            block_form: (class.slots > 0).then(|| RowForm::of(class.slots * block_rows)),
         }
     }
 }
@@ -1119,6 +1132,9 @@ struct DraftSplit<'d> {
     /// Each layer's attention operator and shape, and whether an injection
     /// may skip it (`skippable_layers`).
     attentions: Vec<(&'d magnitude_family_contracts::Attention, crate::AttentionShape, bool)>,
+    /// Per draft layer, its sublayers' weight views normalized to block 0,
+    /// used to prove two layers have identical weight plans.
+    layer_weights: Vec<Vec<WeightView<u64>>>,
 }
 
 impl<'d> DraftSplit<'d> {
@@ -1207,6 +1223,21 @@ impl<'d> DraftSplit<'d> {
                 softcap: draft.logit_softcap.unwrap_or(0.0),
             }),
         };
+        let mut layer_weights = vec![Vec::new(); draft.blocks.len()];
+        for weight_plan in load.weights() {
+            if let WeightScope::DraftSublayer(SublayerIndex { block, sublayer }) =
+                weight_plan.role.scope
+            {
+                if let Some(slot) = layer_weights.get_mut(block as usize) {
+                    let mut view = WeightView::of(load, weight_plan);
+                    view.role.scope = WeightScope::DraftSublayer(SublayerIndex {
+                        block: 0,
+                        sublayer,
+                    });
+                    slot.push(view);
+                }
+            }
+        }
         Ok(Self {
             draft,
             histories: &geometry.layers,
@@ -1214,6 +1245,7 @@ impl<'d> DraftSplit<'d> {
             model: Arc::new(DraftModel { numbers: facts.index(numbers), topology }),
             facts,
             attentions,
+            layer_weights,
         })
     }
 
@@ -1291,7 +1323,29 @@ impl<'d> DraftSplit<'d> {
     /// Class `class`'s key and facts: the model's, its entry rows and each
     /// layer's attention in each pass the class runs.
     fn class(&self, class: DraftGraphClass) -> Result<(DraftKey, FactSink), GraphError> {
+        let (key, facts, _) = self.class_with_passes(class)?;
+        Ok((key, facts))
+    }
+
+    /// Like [`Self::class`], also returning whether every active layer's raw
+    /// attention passes are identical (avoiding a second [`Self::split_class`]).
+    fn class_with_passes(
+        &self,
+        class: DraftGraphClass,
+    ) -> Result<(DraftKey, FactSink, bool), GraphError> {
         let (topology, passes) = self.split_class(class)?;
+        let raw_passes_identical = match &passes {
+            ClassPasses::Injection(layers) => {
+                let mut active = layers.iter().flatten();
+                match active.next() {
+                    Some(first) => active.all(|layer| layer == first),
+                    None => true,
+                }
+            }
+            ClassPasses::Drafting(layers) => {
+                layers.first().is_none_or(|first| layers[1..].iter().all(|layer| layer == first))
+            }
+        };
         let mut facts = self.facts.clone();
         let entry_rows = facts.fact(class.entry_rows);
         let passes = passes.map_passes(|pass, injection| {
@@ -1307,47 +1361,23 @@ impl<'d> DraftSplit<'d> {
             };
             AttentionPass { topology, numbers }
         });
-        let key = DraftKey { model: Arc::clone(&self.model), class: DraftClass { topology, entry_rows, passes } };
-        Ok((key, facts))
+        let key = DraftKey {
+            model: Arc::clone(&self.model),
+            class: DraftClass { topology, entry_rows, slots: class.slots, passes },
+        };
+        Ok((key, facts, raw_passes_identical))
     }
 }
 
-/// The draft graphs' traces, one per topology, each with its graph's
-/// binding constants.
-static DRAFT_TRACES: NativeGraphTraces<DraftKey, Vec<RecordedConstant>> = NativeGraphTraces::new();
-
-/// How many draft graph traces this process recorded.
+/// Direct contract sizing records zero traces.
 #[cfg(test)]
 pub(crate) fn draft_traces_recorded() -> usize {
-    DRAFT_TRACES.recorded()
-}
-
-/// The template of the draft graph of `key` at `facts`, and its binding
-/// constants.
-fn record_draft_graph(
-    key: &DraftKey,
-    facts: &[Dim],
-    reals: &Reals,
-) -> Result<(NativeGraphResourceTemplate, Vec<RecordedConstant>), GraphError> {
-    let facts = Facts::new(facts, reals);
-    let model = &key.model.topology;
-    // Each pass's reals as arguments, its tables as the model's (which the
-    // trace reads at every model's own).
-    let class = facts
-        .dims(key.class.clone())
-        .resolve(|topology| facts.arguments(topology).tables(|table| facts.table(table)));
-    let parts = draft_graph(
-        NativeGraphMetadata::new_template(model.backend),
-        model.entries.entries()?,
-        model,
-        (&facts.dims(key.model.numbers.clone()), &class),
-        &facts,
-    )?;
-    Ok((parts.plan.seal_template()?, parts.constants.iter().map(GraphConstant::recorded).collect()))
+    0
 }
 
 /// The storage and bound constants of the draft's graph family over
-/// `classes`, from metadata alone (`certify_draft_family`).
+/// `classes`, from direct contract sizing (`certify_draft_family`).
+#[cfg(test)]
 pub(crate) fn checked_draft_family_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
@@ -1355,20 +1385,1281 @@ pub(crate) fn checked_draft_family_storage(
     geometry: &DraftGeometry<'_>,
     classes: impl IntoIterator<Item = DraftGraphClass>,
 ) -> Result<CheckedGraphResources, GraphError> {
-    let classes = classes.into_iter().collect::<Vec<_>>();
-    let split = DraftSplit::of(backend, load, plan, geometry)?;
-    certify_draft_family::<seismic::NativeGraphOutline>(&split, &classes).map(|(resources, _)| resources)
+    checked_draft_family_with_kernels(backend, load, plan, geometry, classes)
+        .map(|(resources, _)| resources)
 }
 
-/// The family's storage and each class's layout. Every class field but the
-/// entry rows fixes a graph's topology ([`ClassTopology`]), as does the
-/// attention form those rows take (`RowForm`): only the injection pass
-/// follows them, the block pass's rows being its slots' and proposals'. So
-/// each topology is one template, recorded at its largest entry rows (whose
-/// constants hold every smaller class's) and certified over every class's, and each class seals into its
-/// topology's layout (`PreparedDraftGraphs::prepare`). The injection pass's
-/// only constants that follow its rows are empty (an attention prefill's
-/// `[rows, 0]` bitmap), so the template's constants are every class's.
+pub(crate) fn checked_draft_family_with_kernels(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    plan: &DraftProgramPlan,
+    geometry: &DraftGeometry<'_>,
+    classes: impl IntoIterator<Item = DraftGraphClass>,
+) -> Result<(CheckedGraphResources, std::collections::HashSet<seismic::KernelRequest>), GraphError> {
+    let classes = classes.into_iter().collect::<Vec<_>>();
+    let split = DraftSplit::of(backend, load, plan, geometry)?;
+    DraftFamilyComposition::evaluate(&split, &classes)
+}
+
+#[derive(Clone, Copy)]
+struct DraftMeasuredPort {
+    rank: usize,
+    local: bool,
+    owned_input: bool,
+    upload_bytes: u64,
+    is_shape: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DraftMeasuredNode {
+    heap: seismic::sizing::PlanHeapNode,
+    census: (usize, usize, usize),
+    result_ranks: &'static [Option<usize>],
+    disjoint: usize,
+    sync_start: usize,
+    sync_len: usize,
+    is_shape: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DraftBoundary {
+    ports: usize,
+    nodes: usize,
+    timelines: usize,
+}
+
+#[derive(Default)]
+struct DraftSectionBounds {
+    before_lw: DraftBoundary,
+    after_lw: Vec<DraftBoundary>,
+    after_cond: DraftBoundary,
+    after_inj: Vec<DraftBoundary>,
+    before_blk: Option<DraftBoundary>,
+    after_blk: Vec<DraftBoundary>,
+    before_sel: Option<DraftBoundary>,
+    after_sel: Vec<DraftBoundary>,
+}
+
+impl DraftSectionBounds {
+    fn record(&mut self, mark: DraftSectionMark, boundary: DraftBoundary) {
+        match mark {
+            DraftSectionMark::BeforeLayerWeights => self.before_lw = boundary,
+            DraftSectionMark::AfterLayerWeight => self.after_lw.push(boundary),
+            DraftSectionMark::AfterConditioning => self.after_cond = boundary,
+            DraftSectionMark::AfterInjectLayer => self.after_inj.push(boundary),
+            DraftSectionMark::BeforeBackboneLayers => self.before_blk = Some(boundary),
+            DraftSectionMark::AfterBackboneLayer => self.after_blk.push(boundary),
+            DraftSectionMark::BeforeSelectorSteps => self.before_sel = Some(boundary),
+            DraftSectionMark::AfterSelectorStep => self.after_sel.push(boundary),
+        }
+    }
+}
+
+/// Lightweight topology recorder for composing exact `plan_heap`,
+/// `GraphCensus`, `upload`, and `sync` across identical backbone layers and
+/// `shaped` variants without running full contract sizing or `R_b` placement.
+struct DraftMeasureDraft {
+    backend: BackendName,
+    identity: u64,
+    ports: Vec<DraftMeasuredPort>,
+    nodes: Vec<DraftMeasuredNode>,
+    sync_scratch: Vec<u64>,
+    exports: Vec<seismic::sizing::WorkflowResultRef>,
+    timelines: Vec<seismic::sizing::TimelineNode>,
+    marks: usize,
+}
+
+impl DraftMeasureDraft {
+    const BUFFER_ALIGNMENT: u64 = 256;
+
+    fn new(backend: BackendName) -> Self {
+        static NEXT_IDENTITY: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(2 << 48);
+        Self {
+            backend,
+            identity: NEXT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ports: Vec::new(),
+            nodes: Vec::new(),
+            sync_scratch: Vec::new(),
+            exports: Vec::new(),
+            timelines: Vec::new(),
+            marks: 0,
+        }
+    }
+
+    fn boundary(&self) -> DraftBoundary {
+        DraftBoundary {
+            ports: self.ports.len(),
+            nodes: self.nodes.len(),
+            timelines: self.timelines.len(),
+        }
+    }
+
+    fn push_port(&mut self, port: DraftMeasuredPort) -> NativePort {
+        let ordinal = u32::try_from(self.ports.len()).expect("native port ordinal exhausted");
+        self.ports.push(port);
+        NativePort::from_raw(self.identity, ordinal)
+    }
+
+    fn checked_port<E: seismic::EntryContract>(
+        &mut self,
+        elements: &[(&str, Element)],
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        local: bool,
+        owned_input: bool,
+    ) -> Result<NativePort, GraphError> {
+        let mut stack = [("", 0u64); 16];
+        let mut overflow = Vec::new();
+        let dims: &[(&str, u64)] = if dimensions.len() <= stack.len() {
+            for (slot, (name, d)) in stack.iter_mut().zip(dimensions.iter()) {
+                *slot = (*name, d.clone().into().fixed());
+            }
+            &stack[..dimensions.len()]
+        } else {
+            overflow.extend(dimensions.iter().map(|(name, d)| (*name, d.clone().into().fixed())));
+            &overflow
+        };
+        let spec = E::contract_param_spec(self.backend, elements, parameter, dims)
+            .map_err(|error| GraphError::Invalid(error.to_string()))?;
+        let upload_bytes = if owned_input { spec.bytes } else { 0 };
+        Ok(self.push_port(DraftMeasuredPort {
+            rank: spec.extents.len(),
+            local,
+            owned_input,
+            upload_bytes,
+            is_shape: E::NAME == <shape_rows::Entry as seismic::Entry>::NAME,
+        }))
+    }
+
+    fn enqueue_node<E: seismic::EntryContract>(
+        &mut self,
+        elements: &[(&str, Element)],
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        let shape = E::contract_node_shape(self.backend)
+            .map_err(|error| GraphError::Invalid(error.to_string()))?;
+        let scratch_meta = E::contract_scratch_meta(self.backend)
+            .map_err(|error| GraphError::Invalid(error.to_string()))?;
+        let sync_start = self.sync_scratch.len();
+        if scratch_meta.scratch.iter().any(|s| s.sync) {
+            let mut stack = [("", 0u64); 24];
+            let mut overflow = Vec::new();
+            let dims: &[(&str, u64)] = if dimensions.len() <= stack.len() {
+                for (slot, (name, d)) in stack.iter_mut().zip(dimensions.iter()) {
+                    *slot = (*name, d.clone().into().fixed());
+                }
+                &stack[..dimensions.len()]
+            } else {
+                overflow
+                    .extend(dimensions.iter().map(|(name, d)| (*name, d.clone().into().fixed())));
+                &overflow
+            };
+            let sizing = E::contract_sizing_bound(self.backend, elements, dims)
+                .map_err(|error| GraphError::Invalid(error.to_string()))?;
+            for spec in &sizing.scratch {
+                if spec.sync {
+                    self.sync_scratch.push(spec.bytes);
+                }
+            }
+        }
+        let sync_len = self.sync_scratch.len() - sync_start;
+        let encoded = E::encode_workflow(args);
+        let mut disjoint = 0usize;
+        let external = |ordinal: usize| {
+            seismic::sizing::argument_reference(&encoded.arguments()[ordinal])
+                .filter(|reference| {
+                    reference.node == seismic::sizing::INPUT_NODE
+                        && !self.ports[reference.result as usize].local
+                })
+                .map(|reference| reference.result)
+        };
+        for &[first, second] in shape.disjoint {
+            if let (Some(first), Some(second)) = (external(first), external(second)) {
+                if first != second {
+                    disjoint += 1;
+                }
+            }
+        }
+        let node_ordinal =
+            u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
+        let result_count =
+            u32::try_from(shape.result_ranks.len()).expect("node result count fits u32");
+        let pending =
+            seismic::sizing::PendingWorkflowResults::new(self.identity, node_ordinal, result_count);
+        self.nodes.push(DraftMeasuredNode {
+            heap: seismic::sizing::PlanHeapNode {
+                buffers: shape.buffers,
+                arguments: shape.arguments,
+                words: shape.words,
+                launches: shape.launches,
+            },
+            census: (shape.arguments, shape.words, shape.launches),
+            result_ranks: shape.result_ranks,
+            disjoint,
+            sync_start,
+            sync_len,
+            is_shape: E::NAME == <shape_rows::Entry as seismic::Entry>::NAME,
+        });
+        Ok(E::decode_workflow(pending))
+    }
+
+    fn total_upload_bytes(&self) -> u64 {
+        let mut upload = 0u64;
+        for port in &self.ports {
+            if port.owned_input {
+                let offset = upload.div_ceil(Self::BUFFER_ALIGNMENT) * Self::BUFFER_ALIGNMENT;
+                upload = offset
+                    .checked_add(port.upload_bytes.max(1))
+                    .expect("draft graph upload bytes overflow");
+            }
+        }
+        upload
+    }
+
+    fn total_sync_bytes(&self) -> u64 {
+        let mut sync = 0u64;
+        for node in &self.nodes {
+            for &bytes in &self.sync_scratch[node.sync_start..node.sync_start + node.sync_len] {
+                let offset = sync.next_multiple_of(Self::BUFFER_ALIGNMENT);
+                sync = offset + bytes.max(seismic::sizing::MINIMUM_SCRATCH_BYTES);
+            }
+        }
+        sync
+    }
+
+    fn inj_has_sync(&self, bounds: &DraftSectionBounds) -> bool {
+        bounds.after_inj.first().is_some_and(|&end| {
+            self.nodes[bounds.after_cond.nodes..end.nodes]
+                .iter()
+                .any(|node| node.sync_len > 0)
+        })
+    }
+
+    /// Compose exact `(plan_heap, recorded, upload, sync)` for `target_layers`
+    /// identical layers, `target_shaped`, and `target_proposals` (for DFlash2's
+    /// uniform selector step loop) from a measurement recorded with `bounds`
+    /// over `2` representative layers (`after_lw.len() == 2`,
+    /// `after_inj.len() == 2`, and `after_blk.len() == 2` when drafting).
+    ///
+    /// Layer 0 is emitted once (carrying one-time shared graph constants such as
+    /// `GraphConstant::absent`), and layer 1 is replicated `target_layers - 1`
+    /// times. When `bounds.before_sel` is recorded (DFlash2), step 0 of the
+    /// selector loop is replicated `target_proposals` times.
+    fn compose(
+        &self,
+        bounds: &DraftSectionBounds,
+        target_layers: usize,
+        target_shaped: bool,
+        target_proposals: u64,
+    ) -> (seismic::HostHeap, seismic::GraphCensus, u64, u64) {
+        let mut port_ranks = Vec::with_capacity(self.ports.len() * 2);
+        let mut heap_nodes = Vec::with_capacity(self.nodes.len() * 2);
+        let mut census_nodes = Vec::with_capacity(self.nodes.len() * 2);
+        let mut result_ranks: Vec<&[Option<usize>]> = Vec::with_capacity(self.nodes.len() * 2);
+        let mut timelines = Vec::with_capacity(self.timelines.len());
+        let mut disjoint = 0usize;
+        let mut upload = 0u64;
+        let mut sync = 0u64;
+
+        let mut push_range = |start: DraftBoundary, end: DraftBoundary| {
+            for port in &self.ports[start.ports..end.ports] {
+                if target_shaped || !port.is_shape {
+                    port_ranks.push(port.rank);
+                    if port.owned_input {
+                        let offset =
+                            upload.div_ceil(Self::BUFFER_ALIGNMENT) * Self::BUFFER_ALIGNMENT;
+                        upload = offset
+                            .checked_add(port.upload_bytes.max(1))
+                            .expect("draft graph upload bytes overflow");
+                    }
+                }
+            }
+            for node in &self.nodes[start.nodes..end.nodes] {
+                if target_shaped || !node.is_shape {
+                    heap_nodes.push(node.heap);
+                    census_nodes.push(node.census);
+                    result_ranks.push(node.result_ranks);
+                    disjoint += node.disjoint;
+                    for &bytes in
+                        &self.sync_scratch[node.sync_start..node.sync_start + node.sync_len]
+                    {
+                        let offset = sync.next_multiple_of(Self::BUFFER_ALIGNMENT);
+                        sync = offset + bytes.max(seismic::sizing::MINIMUM_SCRATCH_BYTES);
+                    }
+                }
+            }
+            timelines.extend_from_slice(&self.timelines[start.timelines..end.timelines]);
+        };
+
+        // Prefix before layer weights (fusion_norm).
+        push_range(DraftBoundary::default(), bounds.before_lw);
+        // Layer weights: layer 0 once (declares shared absent constant), then layer 1 (target_layers - 1) times.
+        let lw_end = *bounds.after_lw.last().expect("at least one layer weight");
+        push_range(bounds.before_lw, bounds.after_lw[0]);
+        for _ in 1..target_layers {
+            push_range(bounds.after_lw[0], bounds.after_lw[1]);
+        }
+        // Conditioning.
+        push_range(lw_end, bounds.after_cond);
+        // Injection layers: layer 0 once, then layer 1 (target_layers - 1) times.
+        let inj_end = *bounds.after_inj.last().expect("at least one injected layer");
+        push_range(bounds.after_cond, bounds.after_inj[0]);
+        for _ in 1..target_layers {
+            push_range(bounds.after_inj[0], bounds.after_inj[1]);
+        }
+        // Backbone + tail (if drafting) or tail (if injection-only).
+        if let Some(before_blk) = bounds.before_blk {
+            push_range(inj_end, before_blk);
+            let blk_end = *bounds.after_blk.last().expect("at least one backbone layer");
+            push_range(before_blk, bounds.after_blk[0]);
+            for _ in 1..target_layers {
+                push_range(bounds.after_blk[0], bounds.after_blk[1]);
+            }
+            if let Some(before_sel) = bounds.before_sel {
+                push_range(blk_end, before_sel);
+                let sel_end = *bounds.after_sel.last().expect("at least one selector step");
+                for _ in 0..target_proposals {
+                    push_range(before_sel, bounds.after_sel[0]);
+                }
+                push_range(sel_end, self.boundary());
+            } else {
+                push_range(blk_end, self.boundary());
+            }
+        } else {
+            push_range(inj_end, self.boundary());
+        }
+
+        let _ = disjoint;
+        let plan_heap = seismic::sizing::plan_heap_of(
+            &port_ranks,
+            &heap_nodes,
+            &result_ranks,
+            self.exports.len(),
+            timelines.len(),
+            self.marks,
+        );
+        let recorded = seismic::sizing::recorded_census_of(self.backend, &census_nodes, &timelines);
+        (plan_heap, recorded, upload, sync)
+    }
+
+    /// Compose exact `(plan_heap, recorded)` directly from the full measured
+    /// draft, filtering out `shape_rows` when `!target_shaped` and replicating
+    /// DFlash2's uniform selector step loop to `target_proposals` when present.
+    fn compose_full(
+        &self,
+        bounds: &DraftSectionBounds,
+        target_shaped: bool,
+        target_proposals: u64,
+    ) -> (seismic::HostHeap, seismic::GraphCensus) {
+        let mut port_ranks = Vec::with_capacity(self.ports.len());
+        let mut heap_nodes = Vec::with_capacity(self.nodes.len());
+        let mut census_nodes = Vec::with_capacity(self.nodes.len());
+        let mut result_ranks: Vec<&[Option<usize>]> = Vec::with_capacity(self.nodes.len());
+        let mut timelines = Vec::with_capacity(self.timelines.len());
+        let mut disjoint = 0usize;
+
+        let mut push_range = |start: DraftBoundary, end: DraftBoundary| {
+            for port in &self.ports[start.ports..end.ports] {
+                if target_shaped || !port.is_shape {
+                    port_ranks.push(port.rank);
+                }
+            }
+            for node in &self.nodes[start.nodes..end.nodes] {
+                if target_shaped || !node.is_shape {
+                    heap_nodes.push(node.heap);
+                    census_nodes.push(node.census);
+                    result_ranks.push(node.result_ranks);
+                    disjoint += node.disjoint;
+                }
+            }
+            timelines.extend_from_slice(&self.timelines[start.timelines..end.timelines]);
+        };
+
+        if let Some(before_sel) = bounds.before_sel {
+            push_range(DraftBoundary::default(), before_sel);
+            let sel_end = *bounds.after_sel.last().expect("at least one selector step");
+            for _ in 0..target_proposals {
+                push_range(before_sel, bounds.after_sel[0]);
+            }
+            push_range(sel_end, self.boundary());
+        } else {
+            push_range(DraftBoundary::default(), self.boundary());
+        }
+
+        let _ = disjoint;
+        let plan_heap = seismic::sizing::plan_heap_of(
+            &port_ranks,
+            &heap_nodes,
+            &result_ranks,
+            self.exports.len(),
+            timelines.len(),
+            self.marks,
+        );
+        let recorded = seismic::sizing::recorded_census_of(self.backend, &census_nodes, &timelines);
+        (plan_heap, recorded)
+    }
+}
+
+impl GraphDraft for DraftMeasureDraft {
+    type Plan = ();
+    type Binding<'a, E: seismic::EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Ranged<'a, E: seismic::EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Forms = ();
+
+    fn pick<'a, E: seismic::EntryContract + 'a>(
+        ranged: Self::Ranged<'a, E>,
+        _rows: &Dim,
+    ) -> Self::Binding<'a, E> {
+        ranged
+    }
+
+    fn first<'a, E: seismic::EntryContract + 'a>(
+        ranged: Self::Ranged<'a, E>,
+    ) -> Self::Binding<'a, E> {
+        ranged
+    }
+
+    fn port<D: Clone>(&mut self, _element: Element, extents: &[D]) -> Result<NativePort, GraphError>
+    where
+        Dim: From<D>,
+    {
+        Ok(self.push_port(DraftMeasuredPort {
+            rank: extents.len(),
+            local: false,
+            owned_input: false,
+            upload_bytes: 0,
+            is_shape: false,
+        }))
+    }
+
+    fn local_for<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.checked_port::<E>(entry, parameter, dimensions, true, false)
+    }
+
+    fn input_for<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.checked_port::<E>(entry, parameter, dimensions, true, true)
+    }
+
+    fn port_for<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.checked_port::<E>(entry, parameter, dimensions, false, false)
+    }
+
+    fn enqueue<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        self.enqueue_node::<E>(entry, dimensions, args)
+    }
+
+    fn enqueue_under<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+        _port: &NativePort,
+        _index: u64,
+        _encoded: seismic::LaunchEncoding,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        self.enqueue_node::<E>(entry, dimensions, args)
+    }
+
+    fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError> {
+        let reference = result.raw_ref();
+        if !self.exports.contains(&reference) {
+            self.exports.push(reference);
+        }
+        Ok(())
+    }
+
+    fn share(&mut self, _other: &WorkflowTensor, _primary: &WorkflowTensor) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn store(&mut self, _result: &WorkflowTensor, _port: &NativePort) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn operand_carry(
+        &mut self,
+        rows: u64,
+        width: &Dim,
+        activation: Element,
+    ) -> Result<seismic::OperandCarry, GraphError> {
+        let rows_port = self.push_port(DraftMeasuredPort {
+            rank: 2,
+            local: false,
+            owned_input: false,
+            upload_bytes: 0,
+            is_shape: false,
+        });
+        let quantized_port = self.push_port(DraftMeasuredPort {
+            rank: 2,
+            local: false,
+            owned_input: false,
+            upload_bytes: 0,
+            is_shape: false,
+        });
+        Ok(seismic::OperandCarry::from_ports(
+            rows_port,
+            quantized_port,
+            activation,
+            self.backend,
+            [rows, width.fixed()],
+        ))
+    }
+
+    fn carry_out(
+        &mut self,
+        _result: &WorkflowTensor,
+        _carry: &seismic::OperandCarry,
+        (): (),
+    ) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn carry_in(
+        &mut self,
+        _hidden: &NativePort,
+        _carry: &seismic::OperandCarry,
+        (): (),
+        _norm: &NativePort,
+        _epsilon: f32,
+    ) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn timeline<N: seismic::timeline::TimelineNodeKind>(
+        &mut self,
+        _node: N,
+    ) -> seismic::NativeTimelinePort<N::Role> {
+        let ordinal = u32::try_from(self.timelines.len()).expect("timeline ordinal exhausted");
+        self.timelines.push(N::NODE);
+        seismic::sizing::make_timeline_port(self.identity, ordinal)
+    }
+
+    fn span_mark(&mut self) -> usize {
+        let ordinal = self.marks;
+        self.marks += 1;
+        ordinal
+    }
+
+    fn seal(self) -> Result<Self::Plan, GraphError> {
+        Ok(())
+    }
+}
+
+impl ElementBoundDraft for DraftMeasureDraft {
+    fn bind<'a, E: seismic::EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Binding<'a, E> {
+        elements
+    }
+
+    fn bind_ranged<'a, E: seismic::EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Ranged<'a, E> {
+        elements
+    }
+}
+
+/// Structural topology key collapsing draft classes that share identical graph
+/// structure and kernel sets into one composition group.
+///
+/// # Topology Invariance Proof
+///
+/// Within one `(proposals, windowed, device, rows, block_form)` key, every
+/// `DraftGraphClass` builds the same graph topology (same node kinds, edges,
+/// port ranks, timelines, exports, and `KernelRequest` set up to `shape_rows`
+/// when `model.samples` and DFlash2's uniform per-step loop):
+///
+/// - **Injection pass** (`draft_graph_observed`, `draft_conditioning`,
+///   `inject_observed`): branches only on `windowed` (layer skipping via
+///   `skippable_layers`), `device` (`DraftConditioning::Features` vs `Rows`),
+///   and `rows: RowForm` (`attention_graph::attention` decode/prepared-append
+///   predicates).
+/// - **Block pass** (`BlockPass::of`, `BlockPass::backbone_observed`,
+///   `convolved_layer`, `BlockPass::project`, `BlockPass::select`): branches
+///   only on `block_form: Option<RowForm>` (injection-only vs drafting, and
+///   block `attention_graph::attention`/`mix` decode predicate), `shaped`
+///   (`readout::select` when `model.samples`), and the method:
+///   - `DraftMethod::DFlash` (`BlockPass::dflash`): single `readout::select`
+///     over `outputs = slots * proposals`; no loop or branch on `proposals` or
+///     `block_rows`.
+///   - `DraftMethod::DFlash2` (`selector_path`, `convolved_layer`): `block_rows`
+///     is only a scalar `u32` runtime argument to `draft_convolve_{input,residual}`;
+///     `for step in 0..proposals` in `selector_path` enqueues two identical nodes
+///     (`embedding_rows` + `draft_path_step`, 0 ports, 0 constants, 0 timelines,
+///     0 exports) per step, composed linearly by `DraftMeasureDraft::compose` via
+///     `BeforeSelectorSteps` / `AfterSelectorStep`.
+///   - `DraftMethod::LiLiCorr` (`correct_candidates`): `proposals` enters only
+///     as runtime dim `P` of `corrector_path` and `result` reshape (`mask_rows =
+///     max_proposals` is model-fixed); no loop or branch on `proposals`.
+///   - `DraftMethod::DSpark` (`BlockPass::dspark`): `for step in 0..proposals`
+///     allocates per-step `GraphConstant::i32` ports and `readout::select`
+///     subgraphs, so `DraftBaseKey::proposals` retains `Some(topology.proposals)`
+///     for `DSpark` and is `None` for `DFlash`, `DFlash2`, and `LiLiCorr`.
+/// - **Kernel statics**: no draft or corrector kernel (`dflash.seismic`,
+///   `corrector.seismic`) declares `entry_rows`, `slots`, `block_rows`, or
+///   `proposals` as a static dimension (`corrector_path` statics are `(J, K, F)`
+///   where `J = mask_rows` is model-fixed).
+///
+/// # Storage Monotonicity & Pareto Dominance Proof
+///
+/// Within one `DraftBaseKey`, every tensor extent, scratch buffer, upload
+/// buffer, and output buffer in `draft_graph` is monotonically non-decreasing
+/// in the method's size tuple (`DraftFamilyComposition::bucket_dominates`):
+///
+/// - Injection-only (`block_form.is_none()`): `(max_entry_rows,)`.
+/// - `DFlash`: `(max_entry_rows, max_slots * block_rows, max_slots * proposals,
+///   shaped)` — `slots` never appears independently of `rows = slots * block_rows`
+///   and `outputs = slots * proposals`.
+/// - `DFlash2`: `(max_entry_rows, max_slots * block_rows, max_slots * proposals,
+///   max_slots, proposals)` — `slots` also sizes `anchors`, `predecessors`, and
+///   `draft_path_step`, and `proposals` bounds the step loop.
+/// - `LiLiCorr`: `(max_entry_rows, max_slots, max_slots * proposals, proposals)`
+///   — `block_rows = max_proposals + 1` is model-fixed, so `rows`, `outputs`,
+///   and `node_rows` are all linear in `slots`.
+/// - `DSpark`: `(max_entry_rows, max_slots, shaped)` (`proposals` and
+///   `block_rows` are fixed by `DraftBaseKey`).
+///
+/// Evaluating `SizingOutline::certify_one` on the Pareto-undominated real
+/// buckets (each with the union of `entry_rows` from buckets it dominates, all
+/// `<= rep.max_entry_rows`) yields exact family `storage` and `kernels` without
+/// ever fabricating an inadmissible `(max_entry_rows, max_slots, max_proposals)`
+/// combination, while `collect_group_constants` enumerates every bucket's exact
+/// `(max_entry_rows, slots * block_rows, slots * proposals, slots)` constants.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DraftBaseKey {
+    /// Fixed only for `DraftMethod::DSpark` (whose `for step in 0..proposals`
+    /// loop allocates per-step ports and constants); `None` for `DFlash`,
+    /// `DFlash2`, and `LiLiCorr`.
+    proposals: Option<u64>,
+    windowed: bool,
+    device: bool,
+    rows: RowForm,
+    block_form: Option<RowForm>,
+}
+
+struct BucketMeta {
+    entry_rows_set: Vec<u64>,
+    max_entry_rows: u64,
+    max_slots: u64,
+    /// `max_slots * topology.block_rows` (0 for injection-only).
+    max_block_total_rows: u64,
+    /// `max_slots * topology.proposals` (0 for injection-only).
+    max_selected: u64,
+    proposals: u64,
+    shaped: bool,
+}
+
+/// Whether every layer in `active` has identical topology, numbers, entries,
+/// history geometry, attention passes, and weight views.
+fn all_active_layers_identical(
+    split: &DraftSplit<'_>,
+    resolved_numbers: &DraftModelNumbers<Dim>,
+    raw_passes_identical: bool,
+    active: &[usize],
+) -> bool {
+    if active.len() <= 1 {
+        return true;
+    }
+    if !raw_passes_identical {
+        return false;
+    }
+    let first = active[0];
+    let model = &split.model.topology;
+    let first_dense = resolved_numbers.dense[first]
+        .clone()
+        .map(&mut |d: Dim| d.fixed());
+    let first_weights = &split.layer_weights[first];
+    for &idx in &active[1..] {
+        if model.expansions[idx] != model.expansions[first] {
+            return false;
+        }
+        let idx_dense = resolved_numbers.dense[idx]
+            .clone()
+            .map(&mut |d: Dim| d.fixed());
+        if idx_dense != first_dense {
+            return false;
+        }
+        if model.entries.layers[idx] != model.entries.layers[first] {
+            return false;
+        }
+        if let Some(conv) = &model.entries.convolved {
+            if conv.layers[idx] != conv.layers[first] {
+                return false;
+            }
+        }
+        if split.histories[idx] != split.histories[first] {
+            return false;
+        }
+        let idx_weights = &split.layer_weights[idx];
+        if idx_weights.len() != first_weights.len()
+            || !idx_weights.iter().all(|v| first_weights.contains(v))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+struct DraftGroupOut {
+    storage: seismic::NativeGraphStorageBytes,
+    constants: Vec<GraphConstant>,
+    graphs: Vec<(seismic::GraphCensus, seismic::HostHeap, usize)>,
+    kernels: Vec<seismic::KernelRequest>,
+}
+
+/// Single-owner composition of a draft graph family's resources and kernel set,
+/// used by both assessment and load reservation.
+///
+/// Collapses classes sharing a [`DraftBaseKey`] (across `shaped`, `proposals`,
+/// `block_rows`, and `(entry_rows, slots)` for `DFlash`/`DFlash2`/`LiLiCorr`),
+/// evaluates `SizingOutline` only on each group's Pareto-undominated real
+/// buckets, collapses `L >= 3` identical injection/backbone layers to `2`
+/// representative layers, and composes exact `upload`, `sync`, `plan_heap`, and
+/// `GraphCensus` across all layers, `shaped` variants, and DFlash2 selector
+/// steps via [`DraftMeasureDraft`].
+pub(crate) struct DraftFamilyComposition;
+
+impl DraftFamilyComposition {
+    fn base_key(method: &DraftMethod, topology: ClassTopology) -> DraftBaseKey {
+        let proposals_unrolled = matches!(method, DraftMethod::DSpark { .. });
+        DraftBaseKey {
+            proposals: proposals_unrolled.then_some(topology.proposals),
+            windowed: topology.windowed,
+            device: topology.device,
+            rows: topology.rows,
+            block_form: topology.block_form,
+        }
+    }
+
+    fn bucket_meta(topology: ClassTopology, group: &[DraftGraphClass]) -> BucketMeta {
+        let mut entry_rows_set: Vec<u64> = group.iter().map(|class| class.entry_rows).collect();
+        entry_rows_set.sort_unstable();
+        entry_rows_set.dedup();
+        let max_entry_rows = *entry_rows_set.last().expect("a topology holds a class");
+        let max_slots = group
+            .iter()
+            .map(|class| class.slots)
+            .max()
+            .expect("a topology holds a class");
+        let (max_block_total_rows, max_selected) = if topology.block_form.is_some() {
+            (max_slots * topology.block_rows, max_slots * topology.proposals)
+        } else {
+            (0, 0)
+        };
+        BucketMeta {
+            entry_rows_set,
+            max_entry_rows,
+            max_slots,
+            max_block_total_rows,
+            max_selected,
+            proposals: topology.proposals,
+            shaped: topology.shaped,
+        }
+    }
+
+    /// Whether bucket `a`'s certified layout dominates bucket `b`'s on all
+    /// storage axes (`workspace`, `sync`, `output`, `upload`, `recorded`) and
+    /// `kernels` within one [`DraftBaseKey`].
+    fn bucket_dominates(
+        method: &DraftMethod,
+        block_form: Option<RowForm>,
+        a: &BucketMeta,
+        b: &BucketMeta,
+    ) -> bool {
+        if block_form.is_none() {
+            return a.max_entry_rows >= b.max_entry_rows;
+        }
+        match method {
+            DraftMethod::DFlash => {
+                a.max_entry_rows >= b.max_entry_rows
+                    && a.max_block_total_rows >= b.max_block_total_rows
+                    && a.max_selected >= b.max_selected
+                    && a.shaped >= b.shaped
+            }
+            DraftMethod::DFlash2 { .. } => {
+                a.max_entry_rows >= b.max_entry_rows
+                    && a.max_block_total_rows >= b.max_block_total_rows
+                    && a.max_selected >= b.max_selected
+                    && a.max_slots >= b.max_slots
+                    && a.proposals >= b.proposals
+            }
+            DraftMethod::LiLiCorr { .. } => {
+                a.max_entry_rows >= b.max_entry_rows
+                    && a.max_slots >= b.max_slots
+                    && a.max_selected >= b.max_selected
+                    && a.proposals >= b.proposals
+            }
+            DraftMethod::DSpark { .. } => {
+                a.max_entry_rows >= b.max_entry_rows
+                    && a.max_slots >= b.max_slots
+                    && a.shaped >= b.shaped
+            }
+        }
+    }
+
+    fn pareto_frontier(
+        method: &DraftMethod,
+        block_form: Option<RowForm>,
+        metas: &[BucketMeta],
+    ) -> Vec<usize> {
+        (0..metas.len())
+            .filter(|&i| {
+                !(0..metas.len()).any(|j| {
+                    j != i
+                        && Self::bucket_dominates(method, block_form, &metas[j], &metas[i])
+                        && (!Self::bucket_dominates(method, block_form, &metas[i], &metas[j])
+                            || j < i)
+                })
+            })
+            .collect()
+    }
+
+    fn collect_group_constants(
+        split: &DraftSplit<'_>,
+        model: &DraftModelTopology,
+        block_form: Option<RowForm>,
+        buckets: &[(ClassTopology, Vec<DraftGraphClass>)],
+        parts_constants: &[GraphConstant],
+        injection_constants: usize,
+        backbone_constants: usize,
+    ) -> Result<Vec<GraphConstant>, GraphError> {
+        let (injection_consts, rest_consts) = parts_constants.split_at(injection_constants);
+        let (backbone_consts, select_consts) =
+            rest_consts.split_at(backbone_constants - injection_constants);
+        let mut out = Vec::with_capacity(parts_constants.len());
+
+        let mut max_entries: Vec<u64> = buckets
+            .iter()
+            .map(|(_, group)| {
+                group
+                    .iter()
+                    .map(|class| class.entry_rows)
+                    .max()
+                    .expect("a topology holds a class")
+            })
+            .collect();
+        max_entries.sort_unstable();
+        max_entries.dedup();
+        for &entry_rows in &max_entries {
+            for constant in injection_consts {
+                out.push(constant.at_rows(entry_rows)?);
+            }
+        }
+
+        if block_form.is_some() {
+            let mut block_rows_set: Vec<u64> = buckets
+                .iter()
+                .flat_map(|(topo, group)| {
+                    group.iter().map(move |class| class.slots * topo.block_rows)
+                })
+                .collect();
+            block_rows_set.sort_unstable();
+            block_rows_set.dedup();
+            for &rows in &block_rows_set {
+                for constant in backbone_consts {
+                    out.push(constant.at_rows(rows)?);
+                }
+            }
+            out.extend(select_consts.iter().cloned());
+            match &split.draft.method {
+                DraftMethod::DFlash => {
+                    let mut outputs_set: Vec<u64> = buckets
+                        .iter()
+                        .flat_map(|(topo, group)| {
+                            group.iter().map(move |class| class.slots * topo.proposals)
+                        })
+                        .collect();
+                    outputs_set.sort_unstable();
+                    outputs_set.dedup();
+                    for &outputs in &outputs_set {
+                        out.push(GraphConstant::identity_value(outputs)?);
+                    }
+                }
+                DraftMethod::DSpark { .. } => {
+                    let mut slot_proposals: Vec<(u64, u64)> = buckets
+                        .iter()
+                        .flat_map(|(topo, group)| {
+                            group.iter().map(move |class| (class.slots, topo.proposals))
+                        })
+                        .collect();
+                    slot_proposals.sort_unstable();
+                    slot_proposals.dedup();
+                    for &(slots, proposals) in &slot_proposals {
+                        out.push(GraphConstant::identity_value(slots)?);
+                        for step in 0..proposals {
+                            out.push(GraphConstant::i32_range_value(
+                                step * slots,
+                                (step + 1) * slots,
+                            )?);
+                        }
+                    }
+                }
+                DraftMethod::DFlash2 { .. } => {}
+                DraftMethod::LiLiCorr { corrector } => {
+                    let mut slot_values: Vec<u64> = buckets
+                        .iter()
+                        .flat_map(|(_, group)| group.iter().map(|class| class.slots))
+                        .collect();
+                    slot_values.sort_unstable();
+                    slot_values.dedup();
+                    for &slots in &slot_values {
+                        out.push(GraphConstant::identity_value(
+                            slots * model.mask_rows * corrector.top_k,
+                        )?);
+                        out.push(GraphConstant::identity_value(slots)?);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn evaluate_group(
+        split: &DraftSplit<'_>,
+        (base_key, buckets): &(DraftBaseKey, Vec<(ClassTopology, Vec<DraftGraphClass>)>),
+    ) -> Result<DraftGroupOut, GraphError> {
+        let model = &split.model.topology;
+        let has_shaped = buckets.iter().any(|(topo, _)| topo.shaped);
+        let metas: Vec<BucketMeta> = buckets
+            .iter()
+            .map(|(topo, group)| Self::bucket_meta(*topo, group))
+            .collect();
+        let frontier = Self::pareto_frontier(&split.draft.method, base_key.block_form, &metas);
+
+        let mut storage = seismic::NativeGraphStorageBytes::default();
+        let mut kernels = Vec::new();
+        let mut constants_out: Option<Vec<GraphConstant>> = None;
+        let mut measure_template: Option<(DraftMeasureDraft, DraftSectionBounds, usize)> = None;
+        let mut fallback_rep: Option<(usize, seismic::HostHeap, seismic::GraphCensus)> = None;
+
+        for &rep_idx in &frontier {
+            let (rep_topo, rep_group) = &buckets[rep_idx];
+            let meta = &metas[rep_idx];
+            let largest = DraftGraphClass {
+                entry_rows: meta.max_entry_rows,
+                slots: meta.max_slots,
+                ..rep_group[0]
+            };
+            let context = || format!("draft graph topology {rep_topo:?}");
+            let (key, facts, raw_passes_identical) = split.class_with_passes(largest)?;
+            let mut rep_entry_rows: Vec<u64> = metas
+                .iter()
+                .filter(|m| {
+                    Self::bucket_dominates(&split.draft.method, base_key.block_form, meta, m)
+                })
+                .flat_map(|m| m.entry_rows_set.iter().copied())
+                .collect();
+            rep_entry_rows.sort_unstable();
+            rep_entry_rows.dedup();
+            let slices = vec![NativeGraphClassSlice::new().dimension(
+                ENTRY_ROWS,
+                rep_entry_rows.iter().copied(),
+            )];
+            let dims: Vec<Dim> = facts.values().iter().copied().map(Dim::from).collect();
+            let eval_facts = Facts::new(&dims, facts.reals());
+            let resolved_numbers = eval_facts.dims(key.model.numbers.clone());
+            let class_resolved = eval_facts
+                .dims(key.class.clone())
+                .resolve(|topology| {
+                    eval_facts
+                        .arguments(topology)
+                        .tables(|table| eval_facts.table(table))
+                });
+
+            let active_indices: Vec<usize> = (0..model.expansions.len())
+                .filter(|&index| key.class.passes.injection(index).is_some())
+                .collect();
+            let can_dedup_layers = active_indices.len() >= 3
+                && all_active_layers_identical(
+                    split,
+                    &resolved_numbers,
+                    raw_passes_identical,
+                    &active_indices,
+                );
+
+            if can_dedup_layers {
+                let subset = &active_indices[..2];
+                let rep_parts = draft_graph_observed(
+                    SizingOutline::new_draft(model.backend),
+                    model.entries.entries()?,
+                    model,
+                    (&resolved_numbers, &class_resolved),
+                    &eval_facts,
+                    Some(subset),
+                    &mut |_, _| {},
+                )
+                .map_err(|error| error.context(context()))?;
+                let rep_layout = SizingOutline::certify_one(rep_parts.plan, slices.clone())
+                    .map_err(|error| error.context(context()))?;
+
+                let mut bounds = DraftSectionBounds::default();
+                let measured = draft_graph_observed(
+                    DraftMeasureDraft::new(model.backend),
+                    model.entries.entries()?,
+                    model,
+                    (&resolved_numbers, &class_resolved),
+                    &eval_facts,
+                    Some(subset),
+                    &mut |mark, g| bounds.record(mark, g.boundary()),
+                )
+                .map_err(|error| error.context(context()))?;
+
+                let rep_upload = measured.plan.total_upload_bytes();
+                let rep_sync = measured.plan.total_sync_bytes();
+                if !measured.plan.inj_has_sync(&bounds)
+                    && rep_upload == rep_layout.storage_bytes().upload
+                    && rep_sync == rep_layout.storage_bytes().sync
+                {
+                    #[cfg(debug_assertions)]
+                    {
+                        let (chk_heap, chk_rec, chk_up, chk_sync) = measured.plan.compose(
+                            &bounds,
+                            2,
+                            rep_topo.shaped,
+                            rep_topo.proposals,
+                        );
+                        debug_assert_eq!(chk_heap, rep_layout.plan_heap());
+                        debug_assert_eq!(chk_rec, rep_layout.storage_bytes().recorded);
+                        debug_assert_eq!(chk_up, rep_layout.storage_bytes().upload);
+                        debug_assert_eq!(chk_sync, rep_layout.storage_bytes().sync);
+                    }
+                    let k = active_indices.len();
+                    let (_, rep_recorded, full_upload, full_sync) = measured.plan.compose(
+                        &bounds,
+                        k,
+                        rep_topo.shaped,
+                        rep_topo.proposals,
+                    );
+                    storage = storage.most(seismic::NativeGraphStorageBytes {
+                        workspace: rep_layout.storage_bytes().workspace,
+                        sync: full_sync,
+                        output: rep_layout.storage_bytes().output,
+                        upload: full_upload,
+                        recorded: rep_recorded,
+                    });
+                    kernels.extend(rep_layout.kernels().iter().cloned());
+                    if constants_out.is_none() {
+                        constants_out = Some(Self::collect_group_constants(
+                            split,
+                            model,
+                            base_key.block_form,
+                            buckets,
+                            &rep_parts.constants,
+                            rep_parts.injection_constants,
+                            rep_parts.backbone_constants,
+                        )?);
+                    }
+                    if measure_template.is_none()
+                        && (!model.samples || rep_topo.shaped == has_shaped)
+                    {
+                        measure_template = Some((measured.plan, bounds, k));
+                    }
+                    continue;
+                }
+            }
+
+            let parts = draft_graph(
+                SizingOutline::new_draft(model.backend),
+                model.entries.entries()?,
+                model,
+                (&resolved_numbers, &class_resolved),
+                &eval_facts,
+            )
+            .map_err(|error| error.context(context()))?;
+            let layout = SizingOutline::certify_one(parts.plan, slices)
+                .map_err(|error| error.context(context()))?;
+            storage = storage.most(layout.storage_bytes());
+            kernels.extend(layout.kernels().iter().cloned());
+            if constants_out.is_none() {
+                constants_out = Some(Self::collect_group_constants(
+                    split,
+                    model,
+                    base_key.block_form,
+                    buckets,
+                    &parts.constants,
+                    parts.injection_constants,
+                    parts.backbone_constants,
+                )?);
+            }
+            if fallback_rep.is_none() && (!model.samples || rep_topo.shaped == has_shaped) {
+                fallback_rep = Some((rep_idx, layout.plan_heap(), layout.storage_bytes().recorded));
+            }
+        }
+
+        let first_topo = buckets[0].0;
+        let varies_shaped =
+            model.samples && buckets.iter().any(|(topo, _)| topo.shaped != first_topo.shaped);
+        let varies_proposals = matches!(split.draft.method, DraftMethod::DFlash2 { .. })
+            && buckets
+                .iter()
+                .any(|(topo, _)| topo.proposals != first_topo.proposals);
+
+        let mut graphs = Vec::with_capacity(buckets.len());
+        if let Some((measured, bounds, k)) = measure_template {
+            if !varies_shaped && !varies_proposals {
+                let (plan_heap, recorded, _, _) =
+                    measured.compose(&bounds, k, first_topo.shaped, first_topo.proposals);
+                for (_, group) in buckets {
+                    graphs.push((recorded, plan_heap, group.len()));
+                }
+            } else {
+                for (topo, group) in buckets {
+                    let (plan_heap, recorded, _, _) =
+                        measured.compose(&bounds, k, topo.shaped, topo.proposals);
+                    graphs.push((recorded, plan_heap, group.len()));
+                }
+            }
+        } else {
+            let (fb_idx, fb_heap, fb_recorded) = fallback_rep
+                .expect("at least one Pareto representative matches group shaping");
+            if !varies_shaped && !varies_proposals {
+                for (_, group) in buckets {
+                    graphs.push((fb_recorded, fb_heap, group.len()));
+                }
+            } else {
+                let (fb_topo, fb_group) = &buckets[fb_idx];
+                let fb_meta = &metas[fb_idx];
+                let largest = DraftGraphClass {
+                    entry_rows: fb_meta.max_entry_rows,
+                    slots: fb_meta.max_slots,
+                    ..fb_group[0]
+                };
+                let context = || format!("draft graph topology {fb_topo:?}");
+                let (key, facts, _) = split.class_with_passes(largest)?;
+                let dims: Vec<Dim> = facts.values().iter().copied().map(Dim::from).collect();
+                let eval_facts = Facts::new(&dims, facts.reals());
+                let resolved_numbers = eval_facts.dims(key.model.numbers.clone());
+                let class_resolved = eval_facts
+                    .dims(key.class.clone())
+                    .resolve(|topology| {
+                        eval_facts
+                            .arguments(topology)
+                            .tables(|table| eval_facts.table(table))
+                    });
+                let mut bounds = DraftSectionBounds::default();
+                let measured = draft_graph_observed(
+                    DraftMeasureDraft::new(model.backend),
+                    model.entries.entries()?,
+                    model,
+                    (&resolved_numbers, &class_resolved),
+                    &eval_facts,
+                    None,
+                    &mut |mark, g| bounds.record(mark, g.boundary()),
+                )
+                .map_err(|error| error.context(context()))?;
+                #[cfg(debug_assertions)]
+                {
+                    let (chk_heap, chk_rec) = measured.plan.compose_full(
+                        &bounds,
+                        fb_topo.shaped,
+                        fb_topo.proposals,
+                    );
+                    debug_assert_eq!(chk_heap, fb_heap);
+                    debug_assert_eq!(chk_rec, fb_recorded);
+                }
+                for (topo, group) in buckets {
+                    let (plan_heap, recorded) = if topo.shaped == fb_topo.shaped
+                        && (!varies_proposals || topo.proposals == fb_topo.proposals)
+                    {
+                        (fb_heap, fb_recorded)
+                    } else {
+                        measured
+                            .plan
+                            .compose_full(&bounds, topo.shaped, topo.proposals)
+                    };
+                    graphs.push((recorded, plan_heap, group.len()));
+                }
+            }
+        }
+
+        Ok(DraftGroupOut {
+            storage,
+            constants: constants_out.expect("at least one Pareto representative evaluated"),
+            graphs,
+            kernels,
+        })
+    }
+
+    pub(crate) fn evaluate(
+        split: &DraftSplit<'_>,
+        classes: &[DraftGraphClass],
+    ) -> Result<(CheckedGraphResources, std::collections::HashSet<seismic::KernelRequest>), GraphError> {
+        let mut groups: BTreeMap<ClassTopology, Vec<DraftGraphClass>> = BTreeMap::new();
+        for &class in classes {
+            let group = groups.entry(ClassTopology::of(class, split.draft)).or_default();
+            if group.contains(&class) {
+                return Err("draft graph class is duplicated".into());
+            }
+            group.push(class);
+        }
+        if groups.is_empty() {
+            return Err("draft graph family has no classes".into());
+        }
+
+        let mut base_groups: BTreeMap<DraftBaseKey, Vec<(ClassTopology, Vec<DraftGraphClass>)>> =
+            BTreeMap::new();
+        for (topology, group) in groups {
+            let base_key = Self::base_key(&split.draft.method, topology);
+            base_groups
+                .entry(base_key)
+                .or_default()
+                .push((topology, group));
+        }
+
+        let base_groups: Vec<(DraftBaseKey, Vec<(ClassTopology, Vec<DraftGraphClass>)>)> =
+            base_groups.into_iter().collect();
+
+        let group_outputs: Vec<DraftGroupOut> =
+            crate::assessment::pool::par_for_results(&base_groups, |entry| {
+                Self::evaluate_group(split, entry)
+            })?;
+
+        let mut family = CheckedGraphFamilyResources::new();
+        let mut kernels = std::collections::HashSet::with_capacity(64);
+        for out in group_outputs {
+            family.include(out.storage, out.constants);
+            for (recorded, plan_heap, count) in out.graphs {
+                family.include_graph(recorded, false);
+                for _ in 0..count {
+                    family.include_plan(plan_heap)?;
+                }
+            }
+            kernels.extend(out.kernels);
+        }
+
+        Ok((family.finish()?, kernels))
+    }
+}
+
+/// The family's storage and each class's layout. Every class field but
+/// `entry_rows` and `slots` fixes a graph's topology ([`ClassTopology`]), as do
+/// the attention forms (`RowForm`) of its injection and block passes. Each
+/// topology is drafted once at its largest `(entry_rows, slots)` — whose layout
+/// dominates every class in the group — and certified over the group's entry
+/// rows, with every `slots`-varying constant accounted across the group's
+/// distinct `slots` values.
 fn certify_draft_family<L: Certified>(
     split: &DraftSplit<'_>,
     classes: &[DraftGraphClass],
@@ -1388,27 +2679,96 @@ fn certify_draft_family<L: Certified>(
     let mut layouts = BTreeMap::new();
     for (topology, group) in groups {
         let context = || format!("draft graph topology {topology:?}");
-        // Recorded at its largest entry rows: the recording's constants are
-        // charged for every class it certifies, and the largest's hold
-        // every smaller class's.
-        let largest = *group.iter().max_by_key(|class| class.entry_rows).expect("a topology holds a class");
-        let (key, facts) = split.class(largest)?;
-        let slices = group
+        // Recorded at the group's largest `(entry_rows, slots)`: its layout
+        // dominates every class in the group.
+        let first = *group.first().expect("a topology holds a class");
+        let max_entry_rows = group
             .iter()
-            .map(|class| {
-                NativeGraphClassSlice::new().dimension(ENTRY_ROWS, [class.entry_rows])
-            })
-            .collect::<Vec<_>>();
-        let (layout, constants) = L::traced(
-            &DRAFT_TRACES,
-            &key,
-            &facts,
-            &[ClassFact { fact: key.class.entry_rows.position(), scope: None, dimension: ENTRY_ROWS }],
-            slices,
-            record_draft_graph,
+            .map(|class| class.entry_rows)
+            .max()
+            .expect("a topology holds a class");
+        let max_slots = group
+            .iter()
+            .map(|class| class.slots)
+            .max()
+            .expect("a topology holds a class");
+        let largest = DraftGraphClass {
+            entry_rows: max_entry_rows,
+            slots: max_slots,
+            ..first
+        };
+        let (key, facts) = split.class(largest)?;
+        let slices = vec![NativeGraphClassSlice::new().dimension(
+            ENTRY_ROWS,
+            group.iter().map(|class| class.entry_rows),
+        )];
+        let dims: Vec<Dim> = facts.values().iter().copied().map(Dim::from).collect();
+        let eval_facts = Facts::new(&dims, facts.reals());
+        let model = &key.model.topology;
+        let class_resolved = eval_facts
+            .dims(key.class.clone())
+            .resolve(|topology| eval_facts.arguments(topology).tables(|table| eval_facts.table(table)));
+        let parts = draft_graph(
+            L::new_draft(model.backend),
+            model.entries.entries()?,
+            model,
+            (&eval_facts.dims(key.model.numbers.clone()), &class_resolved),
+            &eval_facts,
         )
         .map_err(|error| error.context(context()))?;
-        family.include(layout.storage_bytes(), constants);
+        let layout = L::certify_one(parts.plan, slices)
+            .map_err(|error| error.context(context()))?;
+        let (injection_consts, rest_consts) = parts.constants.split_at(parts.injection_constants);
+        let (backbone_consts, select_consts) =
+            rest_consts.split_at(parts.backbone_constants - parts.injection_constants);
+        family.include(layout.storage_bytes(), injection_consts.iter().cloned());
+        if topology.block_form.is_some() {
+            let mut slot_values: Vec<u64> = group.iter().map(|class| class.slots).collect();
+            slot_values.sort_unstable();
+            slot_values.dedup();
+            let block_rows: Vec<u64> = slot_values
+                .iter()
+                .map(|&slots| slots * topology.block_rows)
+                .collect();
+            family.include_classes(
+                seismic::NativeGraphStorageBytes::default(),
+                backbone_consts,
+                &block_rows,
+            )?;
+            family.include(
+                seismic::NativeGraphStorageBytes::default(),
+                select_consts.iter().cloned(),
+            );
+            let mut method_consts = Vec::new();
+            match &split.draft.method {
+                DraftMethod::DFlash => {
+                    for &slots in &slot_values {
+                        method_consts.push(GraphConstant::identity_value(slots * topology.proposals)?);
+                    }
+                }
+                DraftMethod::DSpark { .. } => {
+                    for &slots in &slot_values {
+                        method_consts.push(GraphConstant::identity_value(slots)?);
+                        for step in 0..topology.proposals {
+                            method_consts.push(GraphConstant::i32_range_value(
+                                step * slots,
+                                (step + 1) * slots,
+                            )?);
+                        }
+                    }
+                }
+                DraftMethod::DFlash2 { .. } => {}
+                DraftMethod::LiLiCorr { corrector } => {
+                    for &slots in &slot_values {
+                        method_consts.push(GraphConstant::identity_value(
+                            slots * model.mask_rows * corrector.top_k,
+                        )?);
+                        method_consts.push(GraphConstant::identity_value(slots)?);
+                    }
+                }
+            }
+            family.include(seismic::NativeGraphStorageBytes::default(), method_consts);
+        }
         // A draft launch runs on its own lane, never in a decode step's.
         family.include_graph(layout.storage_bytes().recorded, false);
         for &class in &group {
@@ -1492,6 +2852,7 @@ impl DraftSplit<'_> {
         let class = DraftClass {
             topology,
             entry_rows: Dim::from(class.entry_rows),
+            slots: class.slots,
             passes: passes.map(|pass| AttentionPass {
                 topology: constant_reals(pass.topology).tables(Table::from),
                 numbers: constant(pass.numbers),
@@ -1599,6 +2960,11 @@ struct DraftGraphParts<P> {
     injection: Vec<Option<LayerPorts>>,
     block: Option<BlockPorts>,
     constants: Vec<GraphConstant>,
+    /// Prefix of `constants` built during injection (independent of `slots`).
+    injection_constants: usize,
+    /// Prefix of `constants` through the block backbone (constants in
+    /// `[injection_constants..backbone_constants]` follow `slots * block_rows`).
+    backbone_constants: usize,
     weights: Vec<(WeightPort, NativePort)>,
     /// Selections `[proposals · slots, 2]` when drafting; otherwise the
     /// last injection's rows, exported so the graph has a result.
@@ -1618,12 +2984,44 @@ fn draft_sublayer(block: usize, sublayer: u32) -> Result<WeightScope, String> {
 /// load ([`DraftSplit::build`]) build the same graph. Each pass's attention
 /// topology comes resolved: its tables a recording's facts or a load's
 /// bytes.
+#[derive(Clone, Copy, Debug)]
+enum DraftSectionMark {
+    BeforeLayerWeights,
+    AfterLayerWeight,
+    AfterConditioning,
+    AfterInjectLayer,
+    BeforeBackboneLayers,
+    AfterBackboneLayer,
+    BeforeSelectorSteps,
+    AfterSelectorStep,
+}
+
 fn draft_graph<'a, G: GraphDraft + 'a>(
+    graph: G,
+    entries: DraftGraphEntries<'a, G>,
+    model: &DraftModelTopology,
+    (numbers, draft_class): (&DraftModelNumbers<Dim>, &DraftClass<Dim, AttentionTopology>),
+    reals: &Facts<'_>,
+) -> Result<DraftGraphParts<G>, GraphError> {
+    draft_graph_observed(
+        graph,
+        entries,
+        model,
+        (numbers, draft_class),
+        reals,
+        None,
+        &mut |_, _| {},
+    )
+}
+
+fn draft_graph_observed<'a, G: GraphDraft + 'a>(
     mut graph: G,
     entries: DraftGraphEntries<'a, G>,
     model: &DraftModelTopology,
     (numbers, draft_class): (&DraftModelNumbers<Dim>, &DraftClass<Dim, AttentionTopology>),
     reals: &Facts<'_>,
+    layer_subset: Option<&[usize]>,
+    on_mark: &mut impl FnMut(DraftSectionMark, &G),
 ) -> Result<DraftGraphParts<G>, GraphError> {
     let class = draft_class.topology;
     let passes = &draft_class.passes;
@@ -1641,26 +3039,46 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     // Each layer's attention weights for injection, whose input norm is the
     // fusion norm; the block pass reads the same weights with the layer's
     // own input norm.
+    on_mark(DraftSectionMark::BeforeLayerWeights, &graph);
     let mut layer_weights = Vec::with_capacity(layer_count);
     for index in 0..layer_count {
+        let included = layer_subset.is_none_or(|subset| subset.contains(&index));
         // An injection-only class skips the layers it does not inject.
-        layer_weights.push(match passes.injection(index) {
-            Some(pass) => Some(AttentionWeights::planned(
-                &mut graph,
-                planned,
-                draft_sublayer(index, 0)?,
-                (&pass.topology, &pass.numbers),
-                (InputForm::SINGLE, class.slots > 0),
-                Some(&fusion_norm),
-                (&mut weights, &mut constants),
-            )?),
-            None => None,
-        });
+        let planned_layer = if included {
+            match passes.injection(index) {
+                Some(pass) => {
+                    let aw = AttentionWeights::planned(
+                        &mut graph,
+                        planned,
+                        draft_sublayer(index, 0)?,
+                        (&pass.topology, &pass.numbers),
+                        (InputForm::SINGLE, class.block_form.is_some()),
+                        Some(&fusion_norm),
+                        (&mut weights, &mut constants),
+                    )?;
+                    on_mark(DraftSectionMark::AfterLayerWeight, &graph);
+                    Some(aw)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        layer_weights.push(planned_layer);
     }
     let (conditioning, conditioning_rows) =
         draft_conditioning(&mut graph, &entries, model.activation, (numbers, draft_class), &layer_weights)?;
-    let (injection, injected) =
-        inject(&mut graph, &entries.layers, passes, &layer_weights, &conditioning_rows, &mut constants)?;
+    on_mark(DraftSectionMark::AfterConditioning, &graph);
+    let (injection, injected) = inject_observed(
+        &mut graph,
+        &entries.layers,
+        passes,
+        &layer_weights,
+        &conditioning_rows,
+        &mut constants,
+        on_mark,
+    )?;
+    let injection_constants = constants.len();
     let ClassPasses::Drafting(drafting) = passes else {
         graph.export(&injected)?;
         return Ok(DraftGraphParts {
@@ -1669,18 +3087,23 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             injection,
             block: None,
             constants,
+            injection_constants,
+            backbone_constants: injection_constants,
             weights,
             output: injected,
         });
     };
     let pass = BlockPass::of(&entries, (model, numbers), draft_class, reals, (&fusion_norm, &conditioning_rows))?;
-    let (block, output) = pass.build(&mut graph, &layer_weights, drafting, &mut weights, &mut constants)?;
+    let (block, output, backbone_constants) =
+        pass.build_observed(&mut graph, &layer_weights, drafting, &mut weights, &mut constants, on_mark)?;
     Ok(DraftGraphParts {
         plan: graph,
         conditioning,
         injection,
         block: Some(block),
         constants,
+        injection_constants,
+        backbone_constants,
         weights,
         output,
     })
@@ -1738,13 +3161,14 @@ fn draft_conditioning<'a, G: GraphDraft + 'a>(
 /// destination in every layer the class injects (`layer_weights`'), from
 /// the `conditioning` rows. Returns each layer's ports, none of a skipped
 /// one, and the last injection's rows.
-fn inject<'a, G: GraphDraft + 'a>(
+fn inject_observed<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     layers: &[DraftLayerEntries<'a, G>],
     passes: &ClassPasses<AttentionPass<Dim, AttentionTopology>>,
     layer_weights: &[Option<AttentionWeights>],
     conditioning: &WorkflowTensor,
     constants: &mut Vec<GraphConstant>,
+    on_mark: &mut impl FnMut(DraftSectionMark, &G),
 ) -> Result<(Vec<Option<LayerPorts>>, WorkflowTensor), GraphError> {
     let mut injection = Vec::with_capacity(layers.len());
     let mut injected = None;
@@ -1764,6 +3188,7 @@ fn inject<'a, G: GraphDraft + 'a>(
             conditioning,
             &Join::single(Some(ENTRY_ROWS)),
         )?;
+        on_mark(DraftSectionMark::AfterInjectLayer, graph);
         injection.push(Some(LayerPorts { controls, planes: state.planes }));
         injected = Some(mixed);
     }
@@ -1781,6 +3206,7 @@ struct BlockPass<'r, 'a, G: GraphDraft + 'a> {
     numbers: &'r DraftModelNumbers<Dim>,
     reals: &'r Facts<'r>,
     class: ClassTopology,
+    slots: u64,
     epsilon: Argument<f32>,
     embedding_scale: Argument<f32>,
     softcap: Argument<f32>,
@@ -1858,7 +3284,8 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         };
         // The selections, step-major; a corrector projects every mask row of
         // every slot (slot-major), the rest each proposing row.
-        let selected = class.proposals * class.slots;
+        let slots = draft_class.slots;
+        let selected = class.proposals * slots;
         let scalars = reals.arguments(model.scalars);
         Ok(Self {
             entries,
@@ -1866,32 +3293,34 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
             numbers,
             reals,
             class,
+            slots,
             epsilon: scalars.epsilon.f32(),
             embedding_scale: scalars.embedding_scale.f32(),
             softcap: scalars.softcap.f32(),
             entry_rows: &draft_class.entry_rows,
             fusion_norm,
             conditioning,
-            rows: class.slots * class.block_rows,
+            rows: slots * class.block_rows,
             selected,
             outputs: match corrects {
-                true => class.slots * model.mask_rows,
+                true => slots * model.mask_rows,
                 false => selected,
             },
         })
     }
 
     /// The block pass over the `drafting` layers, whose attention weights
-    /// are their injections' (`layer_weights`): its ports and its result,
-    /// the selections.
-    fn build(
+    /// are their injections' (`layer_weights`): its ports, its result
+    /// (the selections), and the count of constants through its backbone.
+    fn build_observed(
         &self,
         graph: &mut G,
         layer_weights: &[Option<AttentionWeights>],
         drafting: &[DraftingLayer<AttentionPass<Dim, AttentionTopology>>],
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<(BlockPorts, WorkflowTensor), GraphError> {
+        on_mark: &mut impl FnMut(DraftSectionMark, &G),
+    ) -> Result<(BlockPorts, WorkflowTensor, usize), GraphError> {
         // The block's tokens are the host's (`BoundDraftGraphs::embedding`).
         let mut table =
             GatheredTable::of(graph, &self.numbers.weights, self.model.token_scope, WeightKind::Embedding, weights)?;
@@ -1899,9 +3328,10 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         // the host's rows or the rows of a table held whole (`gathered_table`).
         let direct = table.by_rows(graph, constants)?;
         let (tokens, residual, layers) =
-            self.backbone(graph, (&table, &direct), layer_weights, drafting, weights, constants)?;
+            self.backbone_observed(graph, (&table, &direct), layer_weights, drafting, weights, constants, on_mark)?;
+        let backbone_constants = constants.len();
         let mut projected = self.project(graph, residual, weights, constants)?;
-        let method = self.select(graph, (&mut table, &direct), &mut projected, weights, constants)?;
+        let method = self.select(graph, (&mut table, &direct), &mut projected, weights, constants, on_mark)?;
         // A selector's or corrector's proposals are chosen by path scores over
         // a few candidates, which give no probability: they carry none.
         if let Some(confidence) = &projected.confidence {
@@ -1923,13 +3353,14 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                 confidence: projected.confidence,
             },
             output,
+            backbone_constants,
         ))
     }
 
     /// The block's tokens embedded from `table` (through `direct`), then
     /// every layer: its tokens' input port, its last residual and each
     /// layer's ports.
-    fn backbone(
+    fn backbone_observed(
         &self,
         graph: &mut G,
         (table, direct): (&GatheredTable, &RowDirectory),
@@ -1937,6 +3368,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         drafting: &[DraftingLayer<AttentionPass<Dim, AttentionTopology>>],
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
+        on_mark: &mut impl FnMut(DraftSectionMark, &G),
     ) -> Result<(NativePort, WorkflowTensor, Vec<LayerPorts>), GraphError> {
         let (entries, numbers, planned) = (self.entries, self.numbers, &self.numbers.weights);
         let (hidden, rows, block_rows, epsilon) = (&numbers.hidden, self.rows, self.class.block_rows, self.epsilon);
@@ -1975,11 +3407,13 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
             (None, None) => None,
             _ => return Err("draft convolutions and entries disagree".into()),
         };
+        on_mark(DraftSectionMark::BeforeBackboneLayers, graph);
         for (index, ((layer_weight, layer), drafting)) in
             layer_weights.iter().zip(&entries.layers).zip(drafting).enumerate()
         {
-            // A drafting class injects every layer.
-            let injection_weights = layer_weight.as_ref().expect("a drafting class injects every layer");
+            let Some(injection_weights) = layer_weight.as_ref() else {
+                continue;
+            };
             let (topology, block) = (&drafting.block.topology, &drafting.block.numbers);
             if let Some((stages, kernel, group, rows_map)) = &convolved {
                 let ports;
@@ -2008,6 +3442,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                     constants,
                     &residual,
                 )?;
+                on_mark(DraftSectionMark::AfterBackboneLayer, graph);
                 layers.push(ports);
                 continue;
             }
@@ -2040,6 +3475,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                 epsilon,
                 None,
             )?;
+            on_mark(DraftSectionMark::AfterBackboneLayer, graph);
         }
         Ok((tokens, residual, layers))
     }
@@ -2144,9 +3580,10 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         projected: &mut BlockReadout,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
+        on_mark: &mut impl FnMut(DraftSectionMark, &G),
     ) -> Result<MethodPorts, GraphError> {
         let (entries, numbers, planned) = (self.entries, self.numbers, &self.numbers.weights);
-        let (slots, proposals) = (self.class.slots, self.class.proposals);
+        let (slots, proposals) = (self.slots, self.class.proposals);
         let (hidden, vocabulary) = (&numbers.hidden, &numbers.vocabulary);
         Ok(match (&numbers.method, &entries.markov) {
             (MethodNumbers::DFlash, None) => MethodPorts {
@@ -2184,6 +3621,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                         top_k,
                         epsilon: self.epsilon,
                     },
+                    on_mark,
                 )?;
                 MethodPorts { selections: Vec::new(), anchors: Some(anchors), anchor_rows: None, landed: None }
             }
@@ -2276,7 +3714,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         constants: &mut Vec<GraphConstant>,
     ) -> Result<(Vec<SelectionPorts>, NativePort), GraphError> {
         let planned = &self.numbers.weights;
-        let (slots, proposals, outputs) = (self.class.slots, self.class.proposals, self.outputs);
+        let (slots, proposals, outputs) = (self.slots, self.class.proposals, self.outputs);
         let vocabulary = &self.numbers.vocabulary;
         let markov_table = weight(graph, planned, WeightScope::Draft, WeightKind::MarkovEmbedding, weights)?;
         let markov_role = WeightRole { scope: WeightScope::Draft, kind: WeightKind::MarkovProjection };
@@ -2729,6 +4167,7 @@ fn selector_path<'a, G: GraphDraft + 'a>(
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     path: SelectorPath<'_>,
+    on_mark: &mut impl FnMut(DraftSectionMark, &G),
 ) -> Result<NativePort, GraphError> {
     let SelectorPath {
         slots,
@@ -2838,6 +4277,7 @@ fn selector_path<'a, G: GraphDraft + 'a>(
         ("F", path.direct.shape[1].clone()),
     ];
     let anchors = graph.input_for(entries.predecessor, "tokens", &code_dims)?;
+    on_mark(DraftSectionMark::BeforeSelectorSteps, graph);
     for step in 0..path.proposals {
         let (first, last) = (step * slots, (step + 1) * slots);
         let previous = match step {
@@ -2871,6 +4311,7 @@ fn selector_path<'a, G: GraphDraft + 'a>(
                 selection: (&mut selection).into(),
             },
         )?;
+        on_mark(DraftSectionMark::AfterSelectorStep, graph);
     }
     Ok(anchors)
 }
@@ -3513,6 +4954,8 @@ impl PreparedDraftGraphs {
                     injection: parts.injection,
                     block: parts.block,
                     constants: parts.constants,
+                    injection_constants: parts.injection_constants,
+                    backbone_constants: parts.backbone_constants,
                     weights: parts.weights,
                     output: parts.output,
                 },
@@ -3520,6 +4963,7 @@ impl PreparedDraftGraphs {
         }
         let plans = prepared.values().map(|graph| (false, graph.plan.clone()));
         let family = super::graph::serial_family("drafter", plans, &resources.graphs).map_err(device)?;
+        super::graph::assert_storage_eq("drafter", &family, resources.storage);
         Ok(Self {
             classes: prepared,
             family,
@@ -4087,7 +5531,7 @@ impl NativeDraftProgram {
         Ok((
             completion,
             HeadOutput {
-                selections,
+                selected: selections.map_or(HeadSelected::Causal, HeadSelected::Proposals),
                 landed_reads: landed.into_iter().map(SelectedRead::submitted).collect(),
             },
         ))
@@ -4166,5 +5610,447 @@ mod window_tests {
             }
         }
         assert_eq!(draft_fresh_span([9, 17], 12, None), [9, 17]);
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::*;
+
+    fn multi_layer_dflash_fixture(layers: usize) -> (ModelDefinition, magnitude_artifacts::PackageManifest) {
+        use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
+        use magnitude_artifacts::{ArtifactIdentity, ComponentFile, ComponentManifest};
+        use magnitude_family_contracts::{
+            FeedForwardUp, HeadNorm, HistoryRows, InputNorm, Operator, OutputProjection,
+            QueryProjection, RowProducer, ValueSource,
+        };
+        let (mut definition, mut manifest) = crate::planning::fixtures::separate_draft_fixture(false);
+        let template = definition.draft.as_ref().unwrap().blocks[0].clone();
+        let rename_block = |layer: usize| {
+            let mut block = template.clone();
+            let prefix = |name: &mut String| *name = format!("d{layer}_{name}");
+            for sublayer in &mut block.sublayers {
+                if let InputNorm::Rms(norm) = &mut sublayer.input {
+                    prefix(&mut norm.weight.name);
+                }
+                match &mut sublayer.op {
+                    Operator::Attention(attn) => {
+                        if let QueryProjection::Full(w) = &mut attn.query {
+                            prefix(&mut w.name);
+                        }
+                        if let HeadNorm::Rms(n) = &mut attn.query_norm {
+                            prefix(&mut n.weight.name);
+                        }
+                        for source in &mut attn.history {
+                            if let HistoryRows::Own(RowProducer::Projected(p)) = &mut source.rows {
+                                prefix(&mut p.key.name);
+                                if let ValueSource::Projected(v) = &mut p.value {
+                                    prefix(&mut v.name);
+                                }
+                                if let HeadNorm::Rms(n) = &mut p.key_norm {
+                                    prefix(&mut n.weight.name);
+                                }
+                            }
+                        }
+                        if let OutputProjection::Full(w) = &mut attn.output {
+                            prefix(&mut w.name);
+                        }
+                    }
+                    Operator::DenseFfn(dense) => {
+                        if let FeedForwardUp::Gated { gate, up, .. } = &mut dense.up {
+                            prefix(&mut gate.name);
+                            prefix(&mut up.name);
+                        }
+                        prefix(&mut dense.down.name);
+                    }
+                    _ => unreachable!("fixture block has attention and dense sublayers"),
+                }
+            }
+            block
+        };
+        let draft = definition.draft.as_mut().unwrap();
+        draft.blocks = (0..layers).map(rename_block).collect();
+        draft.block_attention = vec![BlockAttention::Bidirectional; layers];
+        draft.block_size = 8;
+        definition.validate().unwrap();
+
+        let draft = definition.draft.as_ref().unwrap();
+        let mut offset = 0u64;
+        let tensors = crate::operators::draft::fusion_weights(draft)
+            .into_iter()
+            .chain(crate::operators::draft::draft_weights(draft).unwrap())
+            .map(|(_, descriptor)| {
+                let nbytes = descriptor.shape.iter().product::<u64>() * 2;
+                let tensor = TensorDescriptor {
+                    name: descriptor.name.clone(),
+                    shape: descriptor.shape.clone(),
+                    encoding: Encoding::F16,
+                    offset,
+                    nbytes,
+                };
+                offset += nbytes;
+                tensor
+            })
+            .collect();
+        manifest.draft = Some(ComponentManifest {
+            files: vec![ComponentFile {
+                path: "draft-5layer-fixture.gguf".into(),
+                size: offset,
+            }],
+            identity: ArtifactIdentity([11; 32]),
+            tensors,
+        });
+        (definition, manifest)
+    }
+
+    fn multi_layer_dflash2_fixture(
+        layers: usize,
+    ) -> (ModelDefinition, magnitude_artifacts::PackageManifest) {
+        use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
+        use magnitude_artifacts::{ArtifactIdentity, ComponentFile, ComponentManifest};
+        use magnitude_family_contracts::{
+            AttentionGate, BlockConvolutions, CandidateSelector, DynamicConvolution,
+            FeedForwardUp, HeadNorm, HistoryRows, InputNorm, LayerConvolutions, Operator,
+            OutputProjection, QueryProjection, RowProducer, ValueSource, WeightDescriptor,
+        };
+        let (mut definition, mut manifest) = crate::planning::fixtures::separate_draft_fixture(false);
+        let hidden = definition.decoder.hidden;
+        let vocabulary = definition.decoder.vocabulary;
+        let template = definition.draft.as_ref().unwrap().blocks[0].clone();
+        let rename_block = |layer: usize| {
+            let mut block = template.clone();
+            let prefix = |name: &mut String| *name = format!("d2_{layer}_{name}");
+            for sublayer in &mut block.sublayers {
+                if let InputNorm::Rms(norm) = &mut sublayer.input {
+                    prefix(&mut norm.weight.name);
+                }
+                match &mut sublayer.op {
+                    Operator::Attention(attn) => {
+                        attn.gate = AttentionGate::None;
+                        let q_rows = attn.heads * attn.width;
+                        attn.query = QueryProjection::Full(WeightDescriptor::stored(
+                            format!("d2_{layer}_q"),
+                            &[q_rows, hidden],
+                        ));
+                        if let HeadNorm::Rms(n) = &mut attn.query_norm {
+                            prefix(&mut n.weight.name);
+                        }
+                        for source in &mut attn.history {
+                            if let HistoryRows::Own(RowProducer::Projected(p)) = &mut source.rows {
+                                prefix(&mut p.key.name);
+                                if let ValueSource::Projected(v) = &mut p.value {
+                                    prefix(&mut v.name);
+                                }
+                                if let HeadNorm::Rms(n) = &mut p.key_norm {
+                                    prefix(&mut n.weight.name);
+                                }
+                            }
+                        }
+                        if let OutputProjection::Full(w) = &mut attn.output {
+                            prefix(&mut w.name);
+                        }
+                    }
+                    Operator::DenseFfn(dense) => {
+                        if let FeedForwardUp::Gated { gate, up, .. } = &mut dense.up {
+                            prefix(&mut gate.name);
+                            prefix(&mut up.name);
+                        }
+                        prefix(&mut dense.down.name);
+                    }
+                    _ => unreachable!("fixture block has attention and dense sublayers"),
+                }
+            }
+            block
+        };
+        const CONV_KERNEL: u64 = 4;
+        const CONV_GROUP: u64 = 16;
+        let conv_coeffs = 2 * CONV_KERNEL * (hidden / CONV_GROUP);
+        let conv_layers = (0..layers)
+            .map(|layer| LayerConvolutions {
+                attention: DynamicConvolution {
+                    base: WeightDescriptor::stored(
+                        format!("d2_{layer}_attn_conv_base"),
+                        &[2, CONV_KERNEL, hidden],
+                    ),
+                    projection: WeightDescriptor::stored(
+                        format!("d2_{layer}_attn_conv_proj"),
+                        &[conv_coeffs, hidden],
+                    ),
+                },
+                feed_forward: DynamicConvolution {
+                    base: WeightDescriptor::stored(
+                        format!("d2_{layer}_ffn_conv_base"),
+                        &[2, CONV_KERNEL, hidden],
+                    ),
+                    projection: WeightDescriptor::stored(
+                        format!("d2_{layer}_ffn_conv_proj"),
+                        &[conv_coeffs, hidden],
+                    ),
+                },
+            })
+            .collect();
+        const SELECTOR_RANK: u64 = 64;
+        const SELECTOR_TOP_K: u64 = 8;
+        let draft = definition.draft.as_mut().unwrap();
+        draft.blocks = (0..layers).map(rename_block).collect();
+        draft.block_attention = vec![BlockAttention::Bidirectional; layers];
+        draft.block_size = 16;
+        draft.convolutions = Some(BlockConvolutions {
+            kernel: CONV_KERNEL,
+            group: CONV_GROUP,
+            layers: conv_layers,
+        });
+        draft.method = DraftMethod::DFlash2 {
+            selector: CandidateSelector {
+                rank: SELECTOR_RANK,
+                top_k: SELECTOR_TOP_K,
+                hidden: WeightDescriptor::stored("d2_sel_hidden", &[SELECTOR_RANK, hidden]),
+                predecessor: WeightDescriptor::stored(
+                    "d2_sel_pred",
+                    &[vocabulary, SELECTOR_RANK],
+                ),
+                successor: WeightDescriptor::stored(
+                    "d2_sel_succ",
+                    &[vocabulary, SELECTOR_RANK],
+                ),
+            },
+        };
+        definition.validate().unwrap();
+
+        let draft = definition.draft.as_ref().unwrap();
+        let mut offset = 0u64;
+        let tensors = crate::operators::draft::fusion_weights(draft)
+            .into_iter()
+            .chain(crate::operators::draft::draft_weights(draft).unwrap())
+            .map(|(_, descriptor)| {
+                let nbytes = descriptor.shape.iter().product::<u64>() * 2;
+                let tensor = TensorDescriptor {
+                    name: descriptor.name.clone(),
+                    shape: descriptor.shape.clone(),
+                    encoding: Encoding::F16,
+                    offset,
+                    nbytes,
+                };
+                offset += nbytes;
+                tensor
+            })
+            .collect();
+        manifest.draft = Some(ComponentManifest {
+            files: vec![ComponentFile {
+                path: "draft-dflash2-5layer-fixture.gguf".into(),
+                size: offset,
+            }],
+            identity: ArtifactIdentity([12; 32]),
+            tensors,
+        });
+        (definition, manifest)
+    }
+
+    fn setup_draft_fixture(
+        definition: &ModelDefinition,
+        manifest: &magnitude_artifacts::PackageManifest,
+        proposals: u8,
+    ) -> (ModelLoadPlan, crate::StateResourcePlan, Vec<DraftGraphClass>) {
+        let method = crate::PlannedMethod::DFlash {
+            proposals,
+            widths: crate::DraftWidths::Adaptive,
+        };
+        let limits = ResourceLimits {
+            max_launch_rows: 256,
+            max_launch_slots: 16,
+            max_selected_rows: 16,
+            max_drafting_slots: 16,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        let load = ModelLoadPlan::derive(
+            manifest,
+            definition,
+            crate::ComponentSelection {
+                head: true,
+                vision: false,
+            },
+            seismic::Layout::Rows16,
+            method,
+            limits,
+        )
+        .unwrap();
+        let state = crate::ResourcePlanner::state_plan(
+            definition,
+            &load,
+            method,
+            magnitude_state::KvCodec::Dense,
+            limits,
+            crate::ResourceCapacity {
+                domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
+            },
+        )
+        .unwrap();
+        let classes = draft_graph_classes(
+            limits,
+            method.draft_rows(),
+            &method.block_widths(),
+            definition.draft.as_ref().unwrap(),
+        )
+        .unwrap();
+        (load, state, classes)
+    }
+
+    fn assert_composition_matches_unrolled(
+        definition: &ModelDefinition,
+        manifest: &magnitude_artifacts::PackageManifest,
+        proposals: u8,
+    ) {
+        let (load, state, classes) = setup_draft_fixture(definition, manifest, proposals);
+        let plan = load
+            .program_plan(definition, magnitude_state::KvCodec::Dense)
+            .unwrap();
+        let draft_plan = plan.draft().unwrap();
+        let geometry = DraftGeometry::new(definition, state.head_state().unwrap()).unwrap();
+        assert!(classes
+            .iter()
+            .any(|c| c.proposals == u64::from(proposals) && c.shaped));
+        assert!(classes
+            .iter()
+            .any(|c| c.proposals == u64::from(proposals) && !c.shaped));
+        assert!(classes.iter().any(|c| c.slots == 0 && c.device));
+
+        let split = DraftSplit::of(BackendName::Cpu, &load, draft_plan, &geometry).unwrap();
+        let (composed_resources, composed_kernels) =
+            DraftFamilyComposition::evaluate(&split, &classes).unwrap();
+
+        let (unrolled_resources, unrolled_outlines) =
+            certify_draft_family::<SizingOutline>(&split, &classes).unwrap();
+        let mut unrolled_kernels = std::collections::HashSet::new();
+        for outline in unrolled_outlines.values() {
+            unrolled_kernels.extend(outline.kernels().iter().cloned());
+        }
+
+        assert_eq!(composed_resources.storage, unrolled_resources.storage);
+        assert_eq!(composed_resources.host_heap, unrolled_resources.host_heap);
+        assert_eq!(
+            composed_resources.binding_constant_bytes,
+            unrolled_resources.binding_constant_bytes
+        );
+        assert_eq!(composed_resources.graphs, unrolled_resources.graphs);
+        assert_eq!(composed_kernels, unrolled_kernels);
+
+        // Independent equality witness: real sealed NativeGraphLayouts.
+        let (laid_resources, _) =
+            certify_draft_family::<NativeGraphLayout>(&split, &classes).unwrap();
+        assert_eq!(composed_resources, laid_resources);
+    }
+
+    #[test]
+    fn draft_family_composition_matches_unrolled_bit_for_bit() {
+        let (definition, manifest) = multi_layer_dflash_fixture(5);
+        assert_composition_matches_unrolled(&definition, &manifest, 7);
+    }
+
+    #[test]
+    fn dflash2_family_composition_matches_unrolled_bit_for_bit() {
+        let (definition, manifest) = multi_layer_dflash2_fixture(5);
+        assert_composition_matches_unrolled(&definition, &manifest, 15);
+    }
+
+    #[test]
+    fn draft_family_composition_storage_monotonicity_across_proposals_and_block_rows() {
+        for (label, (definition, manifest), proposals) in [
+            ("DFlash", multi_layer_dflash_fixture(5), 7u8),
+            ("DFlash2", multi_layer_dflash2_fixture(5), 15u8),
+        ] {
+            let (load, state, classes) = setup_draft_fixture(&definition, &manifest, proposals);
+            let plan = load
+                .program_plan(&definition, magnitude_state::KvCodec::Dense)
+                .unwrap();
+            let draft_plan = plan.draft().unwrap();
+            let geometry = DraftGeometry::new(&definition, state.head_state().unwrap()).unwrap();
+            let split = DraftSplit::of(BackendName::Cpu, &load, draft_plan, &geometry).unwrap();
+
+            let mut groups: BTreeMap<ClassTopology, Vec<DraftGraphClass>> = BTreeMap::new();
+            for &class in &classes {
+                groups
+                    .entry(ClassTopology::of(class, split.draft))
+                    .or_default()
+                    .push(class);
+            }
+            let raw_drafting_groups = groups
+                .keys()
+                .filter(|k| k.block_rows > 0)
+                .count();
+            let mut base_groups: BTreeMap<
+                DraftBaseKey,
+                Vec<(ClassTopology, Vec<DraftGraphClass>)>,
+            > = BTreeMap::new();
+            for (topology, group) in groups {
+                let key = DraftFamilyComposition::base_key(&split.draft.method, topology);
+                base_groups.entry(key).or_default().push((topology, group));
+            }
+
+            let drafting_groups = base_groups
+                .keys()
+                .filter(|k| k.block_form.is_some())
+                .count();
+            assert!(
+                drafting_groups < raw_drafting_groups && drafting_groups <= 12,
+                "{label}: expected collapsed drafting base groups < {raw_drafting_groups} and <= 12, got {drafting_groups}"
+            );
+
+            // Certify every bucket individually via SizingOutline and assert
+            // that every bucket's storage is dominated on every axis by the
+            // Pareto representatives of its collapsed DraftBaseKey group.
+            let (_, unrolled_outlines) =
+                certify_draft_family::<SizingOutline>(&split, &classes).unwrap();
+
+            for (base_key, buckets) in &base_groups {
+                let metas: Vec<BucketMeta> = buckets
+                    .iter()
+                    .map(|(topo, group)| DraftFamilyComposition::bucket_meta(*topo, group))
+                    .collect();
+                let frontier = DraftFamilyComposition::pareto_frontier(
+                    &split.draft.method,
+                    base_key.block_form,
+                    &metas,
+                );
+                let mut rep_storage = seismic::NativeGraphStorageBytes::default();
+                for &rep_idx in &frontier {
+                    let rep_class = buckets[rep_idx].1[0];
+                    rep_storage = rep_storage.most(unrolled_outlines[&rep_class].storage_bytes());
+                }
+                for (topo, group) in buckets {
+                    let bucket_storage = unrolled_outlines[&group[0]].storage_bytes();
+                    assert!(
+                        bucket_storage.workspace <= rep_storage.workspace,
+                        "{label} {base_key:?}: bucket {topo:?} workspace {} > rep {}",
+                        bucket_storage.workspace,
+                        rep_storage.workspace
+                    );
+                    assert!(
+                        bucket_storage.sync <= rep_storage.sync,
+                        "{label} {base_key:?}: bucket {topo:?} sync {} > rep {}",
+                        bucket_storage.sync,
+                        rep_storage.sync
+                    );
+                    assert!(
+                        bucket_storage.output <= rep_storage.output,
+                        "{label} {base_key:?}: bucket {topo:?} output {} > rep {}",
+                        bucket_storage.output,
+                        rep_storage.output
+                    );
+                    assert!(
+                        bucket_storage.upload <= rep_storage.upload,
+                        "{label} {base_key:?}: bucket {topo:?} upload {} > rep {}",
+                        bucket_storage.upload,
+                        rep_storage.upload
+                    );
+                }
+            }
+        }
     }
 }

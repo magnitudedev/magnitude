@@ -12,9 +12,13 @@
 //! confidence in each proposal. A causal-only transaction (priming,
 //! catch-up) drafts nothing: its entry pass ends once the attention has
 //! appended the rows' K/V history, the only thing a later draft reads of
-//! them.
+//! them. A front launch runs behind a selecting target step of two-row
+//! decode: its entry pass embeds the step's selections and is conditioned
+//! by its features on the device, selects on every entry row, and at its
+//! tail makes the next pass's chain from the step's token rows and
+//! selections and its own (`guess_chain`).
 
-use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelections};
+use super::{DeviceSubmission, FrontOutput, HeadOutput, HeadProgram, HeadSelected, HeadSelections};
 use crate::device_table::SelectedRead;
 use crate::operators::streams::{
     BlockStreams, Sites, StreamsGeometry,
@@ -40,8 +44,7 @@ use crate::{
     },
     operators::routed::ExpansionForm,
     operators::streams::LowRankGeometry,
-    programs::graph::facts::{FactIndex, FactSink, Facts, Numbers, RealIndex, TableIndex, constant, constant_reals},
-    programs::native_constants::RecordedConstant,
+    programs::graph::facts::{Numbers, constant, constant_reals},
     operators::output::TailEntries,
     operators::routed::fused_graph::{self as routed, CheckedRoutedEntries, RoutedGraphEntries},
     operators::routed::graph::{
@@ -52,7 +55,11 @@ use crate::{
     programs::{
         graph::RowForm,
         graph::readout::{self, SelectionPorts, shapes},
-        graph::{GraphError, draft::{Certified, GraphDraft}},
+        graph::{
+            GraphError,
+            draft::{Certified, ElementBoundDraft, GraphDraft},
+            sizing::SizingOutline,
+        },
         native_constants::{
             CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
             distinct_storage_bytes,
@@ -69,16 +76,19 @@ use magnitude_family_contracts::{
     ActivationDType, Decoder, ProgressivePlane, SublayerIndex, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::feature_rows;
+use magnitude_kernels::constants::{
+    CHAINING_FRONT, CHAINING_ROW, CHAINING_WORDS, CONTINUING_DEPTH, CONTINUING_SLOT, CONTINUING_WORDS,
+    VERIFY_ROWS,
+};
 use magnitude_kernels::{
-    attention_project, draft_rows, feature_copy, readout_features_rows,
+    attention_project, draft_rows, feature_copy, guess_chain, readout_features_rows,
     sample_rows, shape_rows, token_confidence,
 };
 use magnitude_state::LayerRef;
 use seismic::{
-    BackendName, BoundNativeGraphPlan, ClassFact, Device, Dim, Element, NativeGraph,
-    NativeGraphClassSlice, NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan,
-    NativeGraphResourceTemplate, NativeGraphTraces,
-    NativeGraphStorageBytes, NativePort, Reals, Table, Tensor, WorkflowTensor, Argument,
+    Argument, BackendName, BoundNativeGraphPlan, Device, Dim, Element, NativeGraph,
+    NativeGraphClassSlice, NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata,
+    NativeGraphPlan, NativeGraphStorageBytes, NativePort, Table, Tensor, WorkflowTensor,
 };
 use std::{collections::BTreeMap, rc::Rc, sync::Arc};
 
@@ -104,29 +114,69 @@ fn activation(dtype: ActivationDType) -> Element {
     }
 }
 
-/// One head graph: the entry pass's row class, the slot class of its
-/// outputs and of every chained pass, the head's state, the number of
-/// selections per slot (0 for a causal-only head) and whether selection is
-/// shaped first.
+/// One head graph: the entry pass's row class, the head's state and what
+/// its launch runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct HeadGraphClass {
     pub entry_rows: u64,
-    pub slots: u64,
     pub history: HeadHistoryGeometry,
-    pub steps: u64,
-    pub shaped: bool,
-    /// Whether the head's indexer scores: some row of some pass has more
-    /// complete units than it picks (`SelectionSite::scored`). Only a
-    /// drafting graph of a head that selects takes both.
-    pub scored: bool,
-    /// Whether a causal-only entry of one slot reads its conditioning from a
-    /// target feature output on the device (a prompt chunk's entry run
-    /// behind the chunk) rather than host-written rows.
-    pub device: bool,
-    pub prefix: bool,
+    pub launch: HeadLaunchClass,
+}
+
+/// What a head graph's launch runs over its entry rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum HeadLaunchClass {
+    /// A transaction of the head's own: the slot class of its outputs and
+    /// of every chained pass, and the number of selections per slot, 0 for
+    /// a causal-only transaction (priming, catch-up), which selects nothing.
+    Transaction {
+        slots: u64,
+        steps: u64,
+        /// Whether selection is shaped first.
+        shaped: bool,
+        /// Whether the head's indexer scores: some row of some pass has
+        /// more complete units than it picks (`SelectionSite::scored`).
+        /// Only a drafting graph of a head that selects takes both.
+        scored: bool,
+        /// Whether a causal-only entry of one slot reads its conditioning
+        /// from a target feature output on the device (a prompt chunk's
+        /// entry run behind the chunk) rather than host-written rows.
+        device: bool,
+        prefix: bool,
+    },
+    /// A front launch behind a selecting target step of two-row decode:
+    /// its entry tokens are the step's selections on the device, each
+    /// entry row selects once (its slots are its entry rows), and its tail
+    /// makes the next pass's chain (`guess_chain`). A decode pass's has at
+    /// most the decode form's rows (VERIFY_ROWS) and is conditioned by the
+    /// step's feature rows; the prompt's closing chunk's (`prefix`) is one
+    /// entry row conditioned by the chunk's boundary feature.
+    Front { shaped: bool, scored: bool, prefix: bool },
 }
 
 impl HeadGraphClass {
+    /// The slot class of its outputs and of every chained pass.
+    pub(crate) fn slots(&self) -> u64 {
+        match self.launch {
+            HeadLaunchClass::Transaction { slots, .. } => slots,
+            HeadLaunchClass::Front { .. } => self.entry_rows,
+        }
+    }
+
+    /// Selections per slot.
+    pub(crate) fn steps(&self) -> u64 {
+        match self.launch {
+            HeadLaunchClass::Transaction { steps, .. } => steps,
+            HeadLaunchClass::Front { .. } => 1,
+        }
+    }
+
+    pub(crate) fn scored(&self) -> bool {
+        match self.launch {
+            HeadLaunchClass::Transaction { scored, .. } | HeadLaunchClass::Front { scored, .. } => scored,
+        }
+    }
+
     /// The span class every head graph is sealed with: the most spans any
     /// history of the head's store presents to a launch, to a power of two.
     pub(crate) fn segments(&self) -> Result<u64, String> {
@@ -146,12 +196,16 @@ impl HeadGraphClass {
 
 /// The admitted head classes used by both prepared formation and metadata
 /// assessment. A causal head has one pass, conditioned by host rows or, for
-/// one slot, by the target's features on the device; a drafting head chains
-/// up to the method's proposal bound.
+/// one slot, by the target's features on the device. A drafting head chains
+/// up to the method's proposal bound. A load that `fronts`
+/// (`ModelLoadPlan::fronts`) runs both of a pass's forms (§7.1): its head
+/// selects in front launches behind front passes, and drafts in
+/// transactions the proposals a verify pass runs on.
 pub(crate) fn head_graph_classes(
     limits: ResourceLimits,
     history: HeadHistoryGeometry,
     proposals: usize,
+    fronts: bool,
 ) -> Result<Vec<HeadGraphClass>, String> {
     let row_classes = magnitude_batching::row_classes(limits.max_launch_rows)
         .into_iter()
@@ -169,33 +223,42 @@ pub(crate) fn head_graph_classes(
         .map(|slots| slots as u64)
         .collect::<Vec<_>>();
     let mut classes = Vec::new();
+    let transaction = |entry_rows, slots, steps, (shaped, scored), device, prefix| HeadGraphClass {
+        entry_rows,
+        history,
+        launch: HeadLaunchClass::Transaction { slots, steps, shaped, scored, device, prefix },
+    };
     for &entry_rows in &row_classes {
         for &slots in slot_classes.iter().filter(|slots| **slots <= entry_rows) {
-            classes.push(HeadGraphClass {
-                entry_rows,
-                slots,
-                history,
-                steps: 0,
-                shaped: false,
-                scored: false,
-                device: false,
-                prefix: false,
-            });
+            classes.push(transaction(entry_rows, slots, 0, (false, false), false, false));
         }
-        classes.push(HeadGraphClass {
-            entry_rows,
-            slots: 1,
-            history,
-            steps: 0,
-            shaped: false,
-            scored: false,
-            device: true,
-            prefix: false,
-        });
-        classes.push(HeadGraphClass {
-            prefix: true,
-            ..*classes.last().unwrap()
-        });
+        for prefix in [false, true] {
+            classes.push(transaction(entry_rows, 1, 0, (false, false), true, prefix));
+        }
+    }
+    // A head that selects does with and without its indexer scoring
+    // (`HeadLaunchClass::Transaction::scored`), and shaped or not.
+    let selecting = [false, true]
+        .into_iter()
+        .flat_map(|shaped| {
+            [false, true]
+                .into_iter()
+                .take(1 + usize::from(history.indexer.is_some()))
+                .map(move |scored| (shaped, scored))
+        })
+        .collect::<Vec<_>>();
+    if fronts {
+        // A decode pass's front launch, its entry rows the pass's rows (at
+        // most the decode form's), and the prompt's closing chunk's, one row.
+        for &(shaped, scored) in &selecting {
+            let front = |entry_rows, prefix| HeadGraphClass {
+                entry_rows,
+                history,
+                launch: HeadLaunchClass::Front { shaped, scored, prefix },
+            };
+            classes.extend(row_classes.iter().filter(|rows| **rows <= VERIFY_ROWS).map(|&rows| front(rows, false)));
+            classes.push(front(1, true));
+        }
     }
     // Drafting passes project the draft vocabulary per slot: their slots are
     // bounded by the selection bound, not the launch's request slots.
@@ -214,21 +277,8 @@ pub(crate) fn head_graph_classes(
             .filter(|rows| **rows >= slots && **rows <= entry_bound)
         {
             for steps in 1..=proposals as u64 {
-                for shaped in [false, true] {
-                    // A head that selects drafts with and without its
-                    // indexer scoring (`HeadGraphClass::scored`).
-                    for scored in [false, true].into_iter().take(1 + usize::from(history.indexer.is_some())) {
-                        classes.push(HeadGraphClass {
-                            entry_rows,
-                            slots,
-                            history,
-                            steps,
-                            shaped,
-                            scored,
-                            device: false,
-                            prefix: false,
-                        });
-                    }
+                for &selection in &selecting {
+                    classes.push(transaction(entry_rows, slots, steps, selection, false, false));
                 }
             }
         }
@@ -285,7 +335,10 @@ struct HeadGraphEntries<'a, G: GraphDraft + 'a> {
     logits: readout::ProjectionEntries<'a, G>,
     shape: G::Binding<'a, shape_rows::Entry>,
     sample: G::Binding<'a, sample_rows::Entry>,
+    /// A drafting graph's proposals' confidences.
     confidence: G::Binding<'a, token_confidence::Entry>,
+    /// Of a load that fronts, the chain at its front graphs' tail.
+    chain: Option<G::Binding<'a, guess_chain::Entry>>,
 }
 
 enum HeadFeedForwardEntries<'a, G: GraphDraft + 'a> {
@@ -328,6 +381,7 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
             shape: &head.shape,
             sample: &head.sample,
             confidence: &head.confidence,
+            chain: head.chain.as_ref(),
         })
     }
 }
@@ -344,6 +398,9 @@ struct CheckedHeadEntries {
     features: [(&'static str, Element); 2],
     logits: readout::CheckedProjectionEntries,
     selection: [(&'static str, Element); 0],
+    /// Whether its front graphs' selections feed the chain
+    /// (`ModelLoadPlan::fronts`), beside its transactions' proposals.
+    fronts: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -392,18 +449,19 @@ impl CheckedHeadEntries {
                 true,
             ),
             selection: [],
+            fronts: load.fronts(),
         })
     }
 
-    fn entries(&self) -> Result<HeadGraphEntries<'_, NativeGraphMetadata>, String> {
+    fn entries<G: ElementBoundDraft + 'static>(&self) -> Result<HeadGraphEntries<'_, G>, String> {
         Ok(HeadGraphEntries {
-            landing: self.landing.as_ref().map(CheckedLandingEntries::entries),
-            streams: self.streams.as_ref().map(CheckedStreamsEntries::entries),
-            gather: &self.gather,
-            input: &self.input,
-            copy: &self.copy,
+            landing: self.landing.as_ref().map(CheckedLandingEntries::entries::<G>),
+            streams: self.streams.as_ref().map(CheckedStreamsEntries::entries::<G>),
+            gather: G::bind(&self.gather),
+            input: G::bind_ranged(&self.input),
+            copy: G::bind(&self.copy),
             attention: self.attention.entries()?,
-            priming_project: self.attention.entries()?.project,
+            priming_project: self.attention.entries::<G>()?.project,
             feed_forward: match &self.feed_forward {
                 CheckedHeadFeedForwardEntries::Dense(entries) => {
                     HeadFeedForwardEntries::Dense(entries.entries())
@@ -415,17 +473,20 @@ impl CheckedHeadEntries {
                     HeadFeedForwardEntries::GeneralRouted(entries.entries())
                 }
             },
-            features: &self.features,
+            features: G::bind(&self.features),
             logits: self.logits.entries(),
-            shape: &self.selection,
-            sample: &self.selection,
-            confidence: &self.selection,
+            shape: G::bind(&self.selection),
+            sample: G::bind(&self.selection),
+            confidence: G::bind(&self.selection),
+            chain: self.fronts.then(|| G::bind(&self.selection)),
         })
     }
 }
 
 struct HeadGraphParts<P> {
     plan: P,
+    /// The entry pass's tokens: the table rows the host writes or, of a
+    /// front graph, the target step's selections the device binds.
     tokens: NativePort,
     conditioning: Option<NativePort>,
     previous: Option<NativePort>,
@@ -434,15 +495,40 @@ struct HeadGraphParts<P> {
     out_rows: Option<NativePort>,
     passes: Vec<PassPorts>,
     constants: Vec<GraphConstant>,
+    /// Prefix of `constants` built before chained passes (fixed and
+    /// `entry_rows`-following constants); the suffix follows `slots`.
+    entry_constants: usize,
     weights: Vec<(WeightPort, NativePort)>,
     /// The complete output head, when drafting.
     projection: Option<readout::ProjectionPorts>,
-    /// Selections `[steps * slots, 2]` when drafting; otherwise the entry
+    /// Selections `[steps * slots, 2]` when selecting; otherwise the entry
     /// rows' block input, exported so the graph has a result.
     output: WorkflowTensor,
-    /// Each selection's probability under the logits it was selected from,
-    /// `[steps * slots]` in the selections' order, when drafting.
-    confidence: Option<WorkflowTensor>,
+    selected: SelectedPorts,
+}
+
+/// What a head graph's selections feed.
+enum SelectedPorts {
+    /// Nothing: a causal-only graph selects nothing.
+    Causal,
+    /// A drafting graph's proposals, with each selection's probability
+    /// under the logits it was selected from, `[steps * slots]` in the
+    /// selections' order.
+    Proposals { confidence: WorkflowTensor },
+    /// A front graph's chain.
+    Chain(FrontPorts),
+}
+
+/// A front graph's chain (`guess_chain`): the target step's token rows the
+/// device binds, the host's chaining and continuing words, and its exported
+/// outputs ([`crate::programs::FrontOutput`]).
+struct FrontPorts {
+    tokens: NativePort,
+    chaining: NativePort,
+    continuing: NativePort,
+    guesses: WorkflowTensor,
+    next_selected: WorkflowTensor,
+    next_guesses: WorkflowTensor,
 }
 
 type PreparedHeadGraph = HeadGraphParts<NativeGraphPlan>;
@@ -460,10 +546,11 @@ impl<P> HeadGraphParts<P> {
             out_rows: self.out_rows,
             passes: self.passes,
             constants: self.constants,
+            entry_constants: self.entry_constants,
             weights: self.weights,
             projection: self.projection,
             output: self.output,
-            confidence: self.confidence,
+            selected: self.selected,
         })
     }
 }
@@ -492,6 +579,19 @@ struct HeadPasses {
     shaped: bool,
     device: bool,
     prefix: bool,
+    front: bool,
+}
+
+impl HeadPasses {
+    fn of(launch: HeadLaunchClass) -> Self {
+        match launch {
+            HeadLaunchClass::Transaction { shaped, device, prefix, .. } => {
+                Self { shaped, device, prefix, front: false }
+            }
+            // A front graph's entry is conditioned on the device.
+            HeadLaunchClass::Front { shaped, prefix, .. } => Self { shaped, device: true, prefix, front: true },
+        }
+    }
 }
 
 /// A drafting head graph's passes: how many it chains and the projection
@@ -741,20 +841,28 @@ impl<'h> HeadSplit<'h> {
 
     /// `class`'s graph as its builder takes it: its topology and its numbers.
     fn class(&self, class: HeadGraphClass) -> Result<(HeadForm<f64, Arc<[u8]>>, HeadNumbers<u64>), GraphError> {
-        if class.entry_rows == 0
-            || class.slots == 0
-            || class.slots > class.entry_rows
+        let consistent = match class.launch {
+            HeadLaunchClass::Transaction { slots, steps, shaped, scored, device, .. } => {
+                slots != 0
+                    && slots <= class.entry_rows
+                    && (steps != 0 || !(shaped || scored))
+                    && (!device || (steps == 0 && slots == 1))
+            }
+            HeadLaunchClass::Front { prefix, .. } => {
+                class.entry_rows <= VERIFY_ROWS && (!prefix || class.entry_rows == 1)
+            }
+        };
+        if !consistent
+            || class.entry_rows == 0
             || class.history.tokens.rows == 0
-            || (class.steps == 0 && (class.shaped || class.scored))
-            || (class.scored && class.history.indexer.is_none())
-            || (class.device && (class.steps != 0 || class.slots != 1))
+            || (class.scored() && class.history.indexer.is_none())
         {
             return Err(format!("head graph class {class:?} is inconsistent").into());
         }
-        let drafting = std::num::NonZeroU64::new(class.steps).map(|steps| HeadDrafting {
+        let drafting = std::num::NonZeroU64::new(class.steps()).map(|steps| HeadDrafting {
             steps,
             projection: self.plans.selected(),
-            certified: self.plans.certifies(class.slots),
+            certified: self.plans.certifies(class.slots()),
         });
         // A causal-only transaction only publishes its entry rows' K/V
         // history: nothing reads their attention output, so its pass ends at
@@ -763,7 +871,7 @@ impl<'h> HeadSplit<'h> {
         let selection = match (self.selection, class.history.indexer) {
             (Some((shape, _)), Some([window, blocks])) => Some(SelectionSite {
                 shape,
-                scored: class.scored,
+                scored: class.scored(),
                 window_rows: window.rows,
                 window_slab_rows: window.slab_rows,
                 block_rows: blocks.rows,
@@ -794,7 +902,7 @@ impl<'h> HeadSplit<'h> {
         })?;
         let (feed_forward, feed_forward_numbers) = self.feed_forward.clone();
         let form = HeadForm {
-            passes: HeadPasses { shaped: class.shaped, device: class.device, prefix: class.prefix },
+            passes: HeadPasses::of(class.launch),
             residual_chain: self.residual_chain,
             activation: self.activation,
             epsilon: self.epsilon,
@@ -804,7 +912,7 @@ impl<'h> HeadSplit<'h> {
         };
         let numbers = HeadNumbers {
             attention: attention_numbers,
-            slots: class.slots,
+            slots: class.slots(),
             hidden: self.hidden,
             vocabulary: self.vocabulary,
             streams: self.streams.clone(),
@@ -829,13 +937,23 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
 /// proposal is only ever verified, so a certified selection serves every
 /// slot it fits) and projects every draft-vocabulary row beyond them.
 fn head_graph_draft<'a, G: GraphDraft + 'a>(
-    mut graph: G,
+    graph: G,
     entries: HeadGraphEntries<'a, G>,
     topology: &HeadForm,
     numbers: &HeadNumbers,
 ) -> Result<HeadGraphParts<G>, GraphError> {
+    head_graph_draft_observed(graph, entries, topology, numbers, &mut |_| {})
+}
+
+fn head_graph_draft_observed<'a, G: GraphDraft + 'a>(
+    mut graph: G,
+    entries: HeadGraphEntries<'a, G>,
+    topology: &HeadForm,
+    numbers: &HeadNumbers,
+    on_boundary: &mut impl FnMut(&G),
+) -> Result<HeadGraphParts<G>, GraphError> {
     let planned = &numbers.weights;
-    let HeadPasses { device, prefix, .. } = topology.passes;
+    let HeadPasses { device, prefix, front, .. } = topology.passes;
     let steps = topology.drafting.map_or(0, |drafting| drafting.steps.get());
     let (entry_rows, slots, hidden, vocabulary) =
         (&numbers.attention.rows, &numbers.slots, &numbers.hidden, &numbers.vocabulary);
@@ -911,7 +1029,11 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         ("R", Dim::from(0)),
         ("F", Dim::from(1)),
     ];
-    let tokens = graph.input_for(G::first(entries.input), "tokens", &entry_dims)?;
+    let tokens = if front {
+        graph.port_with_class_extent(Element::i32(), &[entry_rows.clone(), Dim::from(2)], 0, "head_entry_rows")?
+    } else {
+        graph.input_for(G::first(entries.input), "tokens", &entry_dims)?
+    };
     // The host writes the entry rows' conditioning, or a device-conditioned
     // class binds the leading rows of its chunk's target features.
     let conditioning = if prefix && entry_rows.equals(1u64) {
@@ -990,27 +1112,29 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             )
         })
         .transpose()?;
-    // Each pass's selections' confidences, beside them step-major; a pass's
-    // selection `s` was drawn from its logits row `s`.
-    let confidence = (steps > 0)
-        .then(|| {
-            Ok::<_, GraphError>((
-                graph
-                    .local_for(
-                        entries.confidence,
-                        "confidence",
-                        &[
-                            ("M", slots * steps),
-                            ("N", slots.clone()),
-                            ("V", vocabulary.clone()),
-                        ],
-                    )?
-                    .tensor()
-                    .clone(),
-                GraphConstant::identity(&mut graph, slots)?,
-            ))
-        })
-        .transpose()?;
+    // A drafting graph's selections' confidences, beside them step-major;
+    // a pass's selection `s` was drawn from its logits row `s`. A front
+    // graph's selections feed its chain alone.
+    let selecting = match (steps, front) {
+        (0, _) => Selecting::<G>::Causal,
+        (_, false) => Selecting::Proposals {
+            entry: entries.confidence,
+            confidence: graph
+                .local_for(
+                    entries.confidence,
+                    "confidence",
+                    &[
+                        ("M", slots * steps),
+                        ("N", slots.clone()),
+                        ("V", vocabulary.clone()),
+                    ],
+                )?
+                .tensor()
+                .clone(),
+            rows: GraphConstant::row_identity(&mut graph, slots.clone(), None)?,
+        },
+        (_, true) => Selecting::Chain(entries.chain.ok_or_else(|| "a front head graph on a load that does not front".to_owned())?),
+    };
     let context = HeadPassContext {
         entries: &entries,
         topology,
@@ -1030,14 +1154,18 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         out_rows: out_rows.as_ref(),
         projection: projection.as_ref(),
         selections: selections.as_ref(),
-        confidence: confidence.as_ref(),
+        selecting: &selecting,
     };
     let mut passes = Vec::new();
     let mut entry_features = None;
     let mut previous: Option<WorkflowTensor> = None;
+    let mut entry_constants = 0;
+    on_boundary(&graph);
     for pass in 0..steps.max(1) {
         match head_pass(&mut graph, &context, pass, previous.as_ref(), &mut table, &mut weights, &mut constants)? {
             HeadPass::Causal(ports, attended) => {
+                on_boundary(&graph);
+                let entry_constants = constants.len();
                 return Ok(HeadGraphParts {
                     plan: graph,
                     tokens,
@@ -1046,16 +1174,19 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     out_rows: None,
                     passes: vec![ports],
                     constants,
+                    entry_constants,
                     weights,
                     projection: None,
                     output: attended,
-                    confidence: None,
+                    selected: SelectedPorts::Causal,
                 });
             }
             HeadPass::Drafted { ports, features, chained } => {
+                on_boundary(&graph);
                 passes.push(ports);
                 if pass == 0 {
                     entry_features = Some(features);
+                    entry_constants = constants.len();
                 }
                 previous = Some(chained);
             }
@@ -1066,13 +1197,57 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         None => entry_features.ok_or_else(|| "head graph has no entry pass".to_owned())?,
     };
     graph.export(&output)?;
-    let confidence = confidence
-        .map(|(confidence, rows)| {
+    let selected = match selecting {
+        Selecting::Causal => SelectedPorts::Causal,
+        Selecting::Proposals { confidence, rows, .. } => {
             graph.export(&confidence)?;
             constants.push(rows);
-            Ok::<_, GraphError>(confidence)
-        })
-        .transpose()?;
+            SelectedPorts::Proposals { confidence }
+        }
+        // A front graph's chain, from the target step's token rows and
+        // selections and its own selections on the same rows.
+        Selecting::Chain(entry) => SelectedPorts::Chain({
+            let dimensions = [
+                ("S", entry_rows.clone()),
+                ("M", entry_rows.clone()),
+                ("N", Dim::from(VERIFY_ROWS)),
+            ];
+            let tokens_rows =
+                graph.port_with_class_extent(Element::i32(), &[entry_rows.clone(), Dim::from(2)], 0, "head_entry_rows")?;
+            let chaining = graph.input_for(entry, "chaining", &dimensions)?;
+            let continuing = graph.input_for(entry, "continuing", &dimensions)?;
+            let mut guesses = graph.local_for(entry, "guesses", &dimensions)?;
+            let mut next_selected = graph.local_for(entry, "next_selected", &dimensions)?;
+            let mut next_guesses = graph.local_for(entry, "next_guesses", &dimensions)?;
+            graph.enqueue(
+                entry,
+                &dimensions,
+                guess_chain::WorkflowArgs {
+                    tokens: tokens_rows.tensor().into(),
+                    chaining: chaining.tensor().into(),
+                    selected: tokens.tensor().into(),
+                    drafted: (&output).into(),
+                    continuing: continuing.tensor().into(),
+                    guesses: guesses.tensor_mut().into(),
+                    next_selected: next_selected.tensor_mut().into(),
+                    next_guesses: next_guesses.tensor_mut().into(),
+                },
+            )?;
+            let [guesses, next_selected, next_guesses] =
+                [guesses, next_selected, next_guesses].map(|port| port.tensor().clone());
+            for output in [&guesses, &next_selected, &next_guesses] {
+                graph.export(output)?;
+            }
+            FrontPorts {
+                tokens: tokens_rows,
+                chaining,
+                continuing,
+                guesses,
+                next_selected,
+                next_guesses,
+            }
+        }),
+    };
     Ok(HeadGraphParts {
         plan: graph,
         tokens,
@@ -1081,10 +1256,11 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         out_rows: Some(out_rows.ok_or_else(|| "head graph has no entry pass".to_owned())?),
         passes,
         constants,
+        entry_constants,
         weights,
         projection,
         output,
-        confidence,
+        selected,
     })
 }
 
@@ -1120,11 +1296,11 @@ struct HeadPassContext<'r, 'a, G: GraphDraft + 'a> {
     /// Its output norm and each slot's last entry row, of a drafting graph.
     output_norm: Option<&'r WorkflowTensor>,
     out_rows: Option<&'r NativePort>,
-    /// Its drafting passes' projection, selections and their confidences
-    /// (with the identity row map of the slots).
+    /// Its selecting passes' projection and selections, and what the
+    /// selections feed ([`Selecting`]).
     projection: Option<&'r readout::ProjectionPorts>,
     selections: Option<&'r NativePort>,
-    confidence: Option<&'r (WorkflowTensor, GraphConstant)>,
+    selecting: &'r Selecting<'a, G>,
 }
 
 /// One pass of a head graph ([`head_pass`]).
@@ -1244,7 +1420,7 @@ fn head_pass<'a, G: GraphDraft + 'a>(
     // The entry pass reads each slot's last entry row; a chained
     // pass has one row per slot.
     let chained_rows = (pass > 0)
-        .then(|| GraphConstant::identity(graph, slots))
+        .then(|| GraphConstant::row_identity(graph, slots.clone(), None))
         .transpose()?;
     let mixed = match (streams, &context.sites) {
         (Some(streams), Some(sites)) => {
@@ -1331,7 +1507,8 @@ fn head_pass<'a, G: GraphDraft + 'a>(
 }
 
 /// The `rows` input rows of pass `pass`: the entry pass embeds the host's
-/// tokens and combines them with its conditioning rows; a chained pass
+/// tokens (a front graph's, the target step's selections, as a chained pass
+/// embeds its own) and combines them with its conditioning rows; a chained pass
 /// embeds the tokens the previous pass selected, read from `table` (landed,
 /// of a table with landing slots), and combines them with the `previous`
 /// pass's rows. Returns them and the landed read.
@@ -1347,7 +1524,55 @@ fn pass_input<'a, G: GraphDraft + 'a>(
     let (entries, numbers) = (context.entries, context.numbers);
     let (slots, hidden) = (&numbers.slots, &numbers.hidden);
     let (stream_count, epsilon) = (context.stream_count, context.epsilon);
+    // The entry pass's conditioning: the host's rows, the target's
+    // features, or a prefix assembled from both.
+    let entry_conditioning = || {
+        context
+            .entry_conditioning
+            .map(|rows| rows.tensor())
+            .ok_or_else(|| "a head graph's entry pass has no conditioning".to_owned())
+    };
     Ok(match previous {
+        None if context.topology.passes.front => {
+            let (gathered, table_rows) = (table.table.clone(), table.rows.clone());
+            let selected = context.tokens.tensor();
+            let conditioned = entry_conditioning()?;
+            table.read_selected(
+                graph,
+                &numbers.weights,
+                weights,
+                constants,
+                entries.landing,
+                selected.into(),
+                rows,
+                Some("head_entry_rows"),
+                |graph, directory| {
+                    Ok(graph
+                        .enqueue(
+                            G::pick(entries.input, rows),
+                            &[
+                                ("M", rows.clone()),
+                                ("V", table_rows),
+                                ("D", hidden.clone()),
+                                ("S", Dim::from(stream_count)),
+                                ("R", directory.shape[0].clone()),
+                                ("F", directory.shape[1].clone()),
+                            ],
+                            draft_rows::WorkflowArgs {
+                                tokens: selected.into(),
+                                directory: (&directory.tensor).into(),
+                                table: (&gathered).into(),
+                                conditioning: conditioned.into(),
+                                embedding_norm: context.embedding_norm.into(),
+                                hidden_norm: context.hidden_norm.into(),
+                                combine: context.combine.into(),
+                                epsilon,
+                            },
+                        )?
+                        .value)
+                },
+            )?
+        }
         None => {
             let directory = table.by_rows(graph, constants)?;
             let input = graph
@@ -1365,7 +1590,7 @@ fn pass_input<'a, G: GraphDraft + 'a>(
                         tokens: context.tokens.tensor().into(),
                         directory: (&directory.tensor).into(),
                         table: (&table.table).into(),
-                        conditioning: context.entry_conditioning.unwrap().tensor().into(),
+                        conditioning: entry_conditioning()?.into(),
                         embedding_norm: context.embedding_norm.into(),
                         hidden_norm: context.hidden_norm.into(),
                         combine: context.combine.into(),
@@ -1544,7 +1769,7 @@ fn head_feed_forward<'a, G: GraphDraft + 'a>(
     })
 }
 
-/// Pass `pass`'s selection of a drafting graph, from the logits of its
+/// Pass `pass`'s selection of a selecting graph, from the logits of its
 /// `rows` `features` (a progressive projection's from its `raw` hidden rows,
 /// output norm and out rows); none of a graph that does not select.
 fn pass_selection<'a, G: GraphDraft + 'a>(
@@ -1611,30 +1836,57 @@ fn pass_selection<'a, G: GraphDraft + 'a>(
             None,
         ),
     };
-    let (confidence, rows) = context
-        .confidence
-        .ok_or_else(|| "a drafting pass without confidences".to_owned())?;
-    let mut confidence =
-        confidence.slice_leading(slots * pass, slots * (pass + 1));
-    Ok(Some(readout::select(
-        graph,
-        readout::SelectionEntries {
-            shape: entries.shape,
-            sample: entries.sample,
-            confidence: entries.confidence,
-        },
-        vocabulary,
-        &mut logits,
-        view.as_ref(),
-        rows.port().tensor(),
-        slots,
-        context.topology.passes.shaped,
-        inputs,
-        &mut result,
-        &mut confidence,
-    )?))
+    let shaped = context.topology.passes.shaped;
+    Ok(Some(match context.selecting {
+        Selecting::Proposals { entry, confidence, rows } => {
+            let mut confidence =
+                confidence.slice_leading(slots * pass, slots * (pass + 1));
+            readout::select(
+                graph,
+                readout::SelectionEntries {
+                    shape: entries.shape,
+                    sample: entries.sample,
+                    confidence: *entry,
+                },
+                vocabulary,
+                &mut logits,
+                view.as_ref(),
+                rows.port().tensor(),
+                slots,
+                shaped,
+                inputs,
+                &mut result,
+                &mut confidence,
+            )?
+        }
+        Selecting::Chain(_) | Selecting::Causal => readout::sample(
+            graph,
+            entries.shape,
+            entries.sample,
+            vocabulary,
+            &mut logits,
+            slots,
+            shaped,
+            inputs,
+            (&mut result).into(),
+        )?,
+    }))
 }
 
+/// What a head graph's selections feed, as its builder holds them.
+enum Selecting<'a, G: GraphDraft + 'a> {
+    Causal,
+    /// Each pass's selections' confidences and the identity rows they are
+    /// read through.
+    Proposals {
+        entry: G::Binding<'a, token_confidence::Entry>,
+        confidence: WorkflowTensor,
+        rows: GraphConstant,
+    },
+    Chain(G::Binding<'a, guess_chain::Entry>),
+}
+
+#[cfg(test)]
 pub(crate) fn checked_head_family_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
@@ -1643,48 +1895,863 @@ pub(crate) fn checked_head_family_storage(
     binding: HeadBinding,
     classes: impl IntoIterator<Item = HeadGraphClass>,
 ) -> Result<CheckedGraphResources, GraphError> {
-    let classes = classes.into_iter().collect::<Vec<_>>();
-    certify_head_family::<seismic::NativeGraphOutline>(backend, load, geometry, head, binding, &classes)
+    checked_head_family_with_kernels(backend, load, geometry, head, binding, classes)
         .map(|(resources, _)| resources)
 }
 
-/// What decides a head graph's topology: its entries, its form and its
-/// numbers as facts (`HeadSplit::class`).
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct HeadKey {
+pub(crate) fn checked_head_family_with_kernels(
     backend: BackendName,
-    entries: CheckedHeadEntries,
-    form: HeadForm<RealIndex, TableIndex>,
-    numbers: HeadNumbers<FactIndex>,
+    load: &ModelLoadPlan,
+    geometry: &Decoder,
+    head: CausalHeadBlock<'_>,
+    binding: HeadBinding,
+    classes: impl IntoIterator<Item = HeadGraphClass>,
+) -> Result<(CheckedGraphResources, std::collections::HashSet<seismic::KernelRequest>), GraphError> {
+    let classes = classes.into_iter().collect::<Vec<_>>();
+    HeadFamilyComposition::evaluate(backend, load, geometry, head, binding, &classes)
 }
 
-/// The head graphs' traces, one per topology.
-static HEAD_TRACES: NativeGraphTraces<HeadKey, Vec<RecordedConstant>> = NativeGraphTraces::new();
-
-/// The template of a head graph of `key` at `facts`, and its binding
-/// constants.
-fn record_head(
-    key: &HeadKey,
-    facts: &[Dim],
-    reals: &Reals,
-) -> Result<(NativeGraphResourceTemplate, Vec<RecordedConstant>), GraphError> {
-    let facts = Facts::new(facts, reals);
-    let numbers = facts.dims(key.numbers.clone());
-    let form = facts.arguments(key.form.clone()).tables(|table| facts.table(table));
-    let draft = head_graph_draft(
-        NativeGraphMetadata::new_template(key.backend),
-        key.entries.entries()?,
-        &form,
-        &numbers,
-    )?;
-    let constants = draft.constants.iter().map(GraphConstant::recorded).collect();
-    Ok((draft.plan.seal_template()?, constants))
+#[derive(Clone, Copy)]
+struct HeadMeasuredPort {
+    rank: usize,
+    local: bool,
+    is_shape: bool,
 }
 
-/// How many head traces this process recorded.
+#[derive(Clone, Copy)]
+struct HeadMeasuredNode {
+    heap: seismic::sizing::PlanHeapNode,
+    census: (usize, usize, usize),
+    result_ranks: &'static [Option<usize>],
+    disjoint: usize,
+    is_shape: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct HeadPassBoundary {
+    ports: usize,
+    nodes: usize,
+    timelines: usize,
+}
+
+/// Lightweight topology recorder for composing exact `plan_heap` and
+/// `GraphCensus` across `steps` and `shaped` variants without running
+/// contract sizing or `R_b` placement.
+struct HeadMeasureDraft {
+    backend: BackendName,
+    identity: u64,
+    ports: Vec<HeadMeasuredPort>,
+    nodes: Vec<HeadMeasuredNode>,
+    exports: Vec<seismic::sizing::WorkflowResultRef>,
+    timelines: Vec<seismic::sizing::TimelineNode>,
+    marks: usize,
+}
+
+impl HeadMeasureDraft {
+    fn new(backend: BackendName) -> Self {
+        static NEXT_IDENTITY: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1 << 48);
+        Self {
+            backend,
+            identity: NEXT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ports: Vec::new(),
+            nodes: Vec::new(),
+            exports: Vec::new(),
+            timelines: Vec::new(),
+            marks: 0,
+        }
+    }
+
+    fn boundary(&self) -> HeadPassBoundary {
+        HeadPassBoundary {
+            ports: self.ports.len(),
+            nodes: self.nodes.len(),
+            timelines: self.timelines.len(),
+        }
+    }
+
+    fn push_port(&mut self, port: HeadMeasuredPort) -> NativePort {
+        let ordinal = u32::try_from(self.ports.len()).expect("native port ordinal exhausted");
+        self.ports.push(port);
+        NativePort::from_raw(self.identity, ordinal)
+    }
+
+    fn checked_port<E: seismic::EntryContract>(
+        &mut self,
+        elements: &[(&str, Element)],
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        local: bool,
+    ) -> Result<NativePort, GraphError> {
+        let dims: Vec<(&str, u64)> = dimensions
+            .iter()
+            .map(|(name, d)| (*name, d.clone().into().fixed()))
+            .collect();
+        let spec = E::contract_param_spec(self.backend, elements, parameter, &dims)
+            .map_err(|error| GraphError::Invalid(error.to_string()))?;
+        Ok(self.push_port(HeadMeasuredPort {
+            rank: spec.extents.len(),
+            local,
+            is_shape: E::NAME == <shape_rows::Entry as seismic::Entry>::NAME,
+        }))
+    }
+
+    fn enqueue_node<E: seismic::EntryContract>(
+        &mut self,
+        args: E::WorkflowArgs<'_>,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        let shape = E::contract_node_shape(self.backend)
+            .map_err(|error| GraphError::Invalid(error.to_string()))?;
+        let encoded = E::encode_workflow(args);
+        let mut disjoint = 0usize;
+        let external = |ordinal: usize| {
+            seismic::sizing::argument_reference(&encoded.arguments()[ordinal])
+                .filter(|reference| {
+                    reference.node == seismic::sizing::INPUT_NODE
+                        && !self.ports[reference.result as usize].local
+                })
+                .map(|reference| reference.result)
+        };
+        for &[first, second] in shape.disjoint {
+            if let (Some(first), Some(second)) = (external(first), external(second)) {
+                if first != second {
+                    disjoint += 1;
+                }
+            }
+        }
+        let node_ordinal =
+            u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
+        let result_count =
+            u32::try_from(shape.result_ranks.len()).expect("node result count fits u32");
+        let pending =
+            seismic::sizing::PendingWorkflowResults::new(self.identity, node_ordinal, result_count);
+        self.nodes.push(HeadMeasuredNode {
+            heap: seismic::sizing::PlanHeapNode {
+                buffers: shape.buffers,
+                arguments: shape.arguments,
+                words: shape.words,
+                launches: shape.launches,
+            },
+            census: (shape.arguments, shape.words, shape.launches),
+            result_ranks: shape.result_ranks,
+            disjoint,
+            is_shape: E::NAME == <shape_rows::Entry as seismic::Entry>::NAME,
+        });
+        Ok(E::decode_workflow(pending))
+    }
+
+    /// Compose exact `(plan_heap, recorded)` for `target_steps` and `target_shaped`
+    /// from a measurement recorded at `recorded_steps >= target_steps`.
+    fn compose(
+        &self,
+        boundaries: &[HeadPassBoundary],
+        recorded_steps: u64,
+        target_steps: u64,
+        target_shaped: bool,
+    ) -> (seismic::HostHeap, seismic::GraphCensus) {
+        let mut port_ranks = Vec::with_capacity(self.ports.len());
+        let mut heap_nodes = Vec::with_capacity(self.nodes.len());
+        let mut census_nodes = Vec::with_capacity(self.nodes.len());
+        let mut result_ranks: Vec<&[Option<usize>]> = Vec::with_capacity(self.nodes.len());
+        let mut timelines = Vec::with_capacity(self.timelines.len());
+        let mut disjoint = 0usize;
+
+        let mut push_range = |start: HeadPassBoundary, end: HeadPassBoundary| {
+            for port in &self.ports[start.ports..end.ports] {
+                if target_shaped || !port.is_shape {
+                    port_ranks.push(port.rank);
+                }
+            }
+            for node in &self.nodes[start.nodes..end.nodes] {
+                if target_shaped || !node.is_shape {
+                    heap_nodes.push(node.heap);
+                    census_nodes.push(node.census);
+                    result_ranks.push(node.result_ranks);
+                    disjoint += node.disjoint;
+                }
+            }
+            timelines.extend_from_slice(&self.timelines[start.timelines..end.timelines]);
+        };
+
+        // Prefix before pass 0.
+        push_range(HeadPassBoundary::default(), boundaries[0]);
+        // Pass 0 (entry pass).
+        push_range(boundaries[0], boundaries[1]);
+        // Pass 1 (first chained pass, which also declares `table.directory` when landed).
+        if target_steps >= 2 {
+            push_range(boundaries[1], boundaries[2]);
+            // Passes 2..target_steps are identical to pass 2.
+            for _ in 2..target_steps {
+                push_range(boundaries[2], boundaries[3]);
+            }
+        }
+        // Suffix after the pass loop.
+        push_range(boundaries[recorded_steps.max(1) as usize], self.boundary());
+
+        let _ = disjoint;
+        let plan_heap = seismic::sizing::plan_heap_of(
+            &port_ranks,
+            &heap_nodes,
+            &result_ranks,
+            self.exports.len(),
+            timelines.len(),
+            self.marks,
+        );
+        let recorded = seismic::sizing::recorded_census_of(self.backend, &census_nodes, &timelines);
+        (plan_heap, recorded)
+    }
+}
+
+impl GraphDraft for HeadMeasureDraft {
+    type Plan = ();
+    type Binding<'a, E: seismic::EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Ranged<'a, E: seismic::EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Forms = ();
+
+    fn pick<'a, E: seismic::EntryContract + 'a>(
+        ranged: Self::Ranged<'a, E>,
+        _rows: &Dim,
+    ) -> Self::Binding<'a, E> {
+        ranged
+    }
+
+    fn first<'a, E: seismic::EntryContract + 'a>(
+        ranged: Self::Ranged<'a, E>,
+    ) -> Self::Binding<'a, E> {
+        ranged
+    }
+
+    fn port<D: Clone>(&mut self, _element: Element, extents: &[D]) -> Result<NativePort, GraphError>
+    where
+        Dim: From<D>,
+    {
+        Ok(self.push_port(HeadMeasuredPort {
+            rank: extents.len(),
+            local: false,
+            is_shape: false,
+        }))
+    }
+
+    fn local_for<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.checked_port::<E>(entry, parameter, dimensions, true)
+    }
+
+    fn input_for<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.checked_port::<E>(entry, parameter, dimensions, true)
+    }
+
+    fn port_for<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        self.checked_port::<E>(entry, parameter, dimensions, false)
+    }
+
+    fn enqueue<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        _entry: Self::Binding<'a, E>,
+        _dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        self.enqueue_node::<E>(args)
+    }
+
+    fn enqueue_under<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        _entry: Self::Binding<'a, E>,
+        _dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+        _port: &NativePort,
+        _index: u64,
+        _encoded: seismic::LaunchEncoding,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        self.enqueue_node::<E>(args)
+    }
+
+    fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError> {
+        let reference = result.raw_ref();
+        if !self.exports.contains(&reference) {
+            self.exports.push(reference);
+        }
+        Ok(())
+    }
+
+    fn share(&mut self, _other: &WorkflowTensor, _primary: &WorkflowTensor) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn store(&mut self, _result: &WorkflowTensor, _port: &NativePort) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn operand_carry(
+        &mut self,
+        rows: u64,
+        width: &Dim,
+        activation: Element,
+    ) -> Result<seismic::OperandCarry, GraphError> {
+        let rows_port = self.push_port(HeadMeasuredPort {
+            rank: 2,
+            local: false,
+            is_shape: false,
+        });
+        let quantized_port = self.push_port(HeadMeasuredPort {
+            rank: 2,
+            local: false,
+            is_shape: false,
+        });
+        Ok(seismic::OperandCarry::from_ports(
+            rows_port,
+            quantized_port,
+            activation,
+            self.backend,
+            [rows, width.fixed()],
+        ))
+    }
+
+    fn carry_out(
+        &mut self,
+        _result: &WorkflowTensor,
+        _carry: &seismic::OperandCarry,
+        (): (),
+    ) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn carry_in(
+        &mut self,
+        _hidden: &NativePort,
+        _carry: &seismic::OperandCarry,
+        (): (),
+        _norm: &NativePort,
+        _epsilon: f32,
+    ) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    fn timeline<N: seismic::timeline::TimelineNodeKind>(
+        &mut self,
+        _node: N,
+    ) -> seismic::NativeTimelinePort<N::Role> {
+        let ordinal = u32::try_from(self.timelines.len()).expect("timeline ordinal exhausted");
+        self.timelines.push(N::NODE);
+        seismic::sizing::make_timeline_port(self.identity, ordinal)
+    }
+
+    fn span_mark(&mut self) -> usize {
+        let ordinal = self.marks;
+        self.marks += 1;
+        ordinal
+    }
+
+    fn seal(self) -> Result<Self::Plan, GraphError> {
+        Ok(())
+    }
+}
+
+impl ElementBoundDraft for HeadMeasureDraft {
+    fn bind<'a, E: seismic::EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Binding<'a, E> {
+        elements
+    }
+
+    fn bind_ranged<'a, E: seismic::EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Ranged<'a, E> {
+        elements
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct HeadGroupKey {
+    front: bool,
+    steps: u64,
+    shaped: bool,
+    scored: bool,
+    device: bool,
+    prefix: bool,
+    prefix_tail: bool,
+    history: HeadHistoryGeometry,
+    entry_form: RowForm,
+    certified: bool,
+    slot_form: Option<RowForm>,
+}
+
+impl HeadGroupKey {
+    fn of(class: HeadGraphClass, split: &HeadSplit<'_>) -> Self {
+        let passes = HeadPasses::of(class.launch);
+        let steps = class.steps();
+        let slots = class.slots();
+        Self {
+            front: passes.front,
+            steps,
+            shaped: passes.shaped,
+            scored: class.scored(),
+            device: passes.device,
+            prefix: passes.prefix,
+            prefix_tail: passes.prefix && class.entry_rows > 1,
+            history: class.history,
+            entry_form: RowForm::of(class.entry_rows),
+            certified: steps > 0 && split.plans.certifies(slots),
+            slot_form: (steps > 1).then(|| RowForm::of(slots)),
+        }
+    }
+}
+
+/// The structural form a row class selects inside a native head graph.
+///
+/// Unlike [`RowForm`], a head block always attends (`HeadSplit::of` rejects
+/// non-attention mixers), so `recurrent_chunked` never applies. Furthermore:
+/// - `routed::fused_graph::decodes(rows)` and `general_routed`'s `decodes(rows)`
+///   are both `rows <= VERIFY_ROWS`, identical to `attention::graph::decodes(rows)`.
+/// - When `inject_only` (`steps == 0`) and `has_indexer == false`,
+///   `attention_graph::attention` returns early at the append path without
+///   consulting `decode` or `prepared_append`.
+/// - `prepared_append` (`rows > 1 && decode`) is only branched on in
+///   `attention_graph::attention` when `!inject_only && topology.causal_cache`
+///   (`has_indexer == true`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct HeadRowForm {
+    decode: bool,
+    prepared_append: bool,
+}
+
+impl HeadRowForm {
+    fn of(rows: u64, inject_only: bool, has_indexer: bool) -> Self {
+        let decode =
+            (!inject_only || has_indexer) && crate::operators::attention::graph::decodes(rows);
+        let prepared_append = !inject_only && has_indexer && rows > 1 && decode;
+        Self {
+            decode,
+            prepared_append,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct HeadBucketKey {
+    front: bool,
+    steps: u64,
+    shaped: bool,
+    scored: bool,
+    device: bool,
+    prefix: bool,
+    prefix_tail: bool,
+    history: HeadHistoryGeometry,
+    entry_form: HeadRowForm,
+    certified: bool,
+    slot_form: Option<HeadRowForm>,
+}
+
+impl HeadBucketKey {
+    fn of(class: HeadGraphClass, split: &HeadSplit<'_>, has_chained: bool) -> Self {
+        let passes = HeadPasses::of(class.launch);
+        let steps = class.steps();
+        let slots = class.slots();
+        let inject_only = steps == 0;
+        let has_indexer = class.history.indexer.is_some();
+        Self {
+            front: passes.front,
+            steps,
+            shaped: passes.shaped,
+            scored: class.scored(),
+            device: passes.device,
+            prefix: passes.prefix,
+            prefix_tail: passes.prefix && class.entry_rows > 1,
+            history: class.history,
+            entry_form: HeadRowForm::of(class.entry_rows, inject_only, has_indexer),
+            certified: steps > 0 && split.plans.certifies(slots),
+            slot_form: (has_chained && steps > 0 && !passes.front)
+                .then(|| HeadRowForm::of(slots, false, has_indexer)),
+        }
+    }
+}
+
+fn largest_head_class(
+    first: HeadGraphClass,
+    entry_rows: u64,
+    slots: u64,
+    steps: u64,
+    shaped: bool,
+    device: bool,
+) -> HeadGraphClass {
+    let launch = match first.launch {
+        HeadLaunchClass::Transaction {
+            scored,
+            prefix,
+            ..
+        } => HeadLaunchClass::Transaction {
+            slots,
+            steps,
+            shaped,
+            scored,
+            device,
+            prefix,
+        },
+        HeadLaunchClass::Front { scored, prefix, .. } => HeadLaunchClass::Front {
+            shaped,
+            scored,
+            prefix,
+        },
+    };
+    HeadGraphClass {
+        entry_rows,
+        history: first.history,
+        launch,
+    }
+}
+
+/// Base topology key for [`HeadFamilyComposition`], collapsing invariant and
+/// monotonic axes to a single `SizingDraft` + `R_b` placement per base group
+/// while preserving bit-for-bit parity on `storage`, `graphs`, `host_heap`,
+/// `binding_constant_bytes`, and `kernels`.
+///
+/// # Invariance and monotonicity proof
+///
+/// 1. **Row-form invariance (`HeadRowForm`)**:
+///    - `HeadSplit::of` admits only `Mixer::Attention`, so `gated_delta`'s
+///      `recurrent_chunked` branch never executes inside a head graph.
+///    - `head_feed_forward` branches on `routed::fused_graph::decodes(rows)`
+///      (and `general_routed`'s `decodes(rows)`), both equal to
+///      `attention::graph::decodes(rows)` (`rows <= VERIFY_ROWS`).
+///    - In `head_pass`, a causal-only graph (`steps == 0`, `inject_only = true`)
+///      returns `HeadPass::Causal` immediately after `attention_graph::attention`;
+///      when `history.indexer.is_none()`, `attention_graph::attention` takes the
+///      `inject_only` early return without branching on `decode` or
+///      `prepared_append`. When `history.indexer.is_some()`, `prepared_append`
+///      (`rows > 1 && decode`) is only branched on when `!inject_only`.
+///    - Every remaining row-dependent branch in `head_graph_draft_observed` is
+///      `prefix && entry_rows > 1` (`prefix_tail`), which stays in `Causal`.
+///
+/// 2. **Monotonicity across `steps` (`1..=s_max` collapsed into `Draft`)**:
+///    - In `head_graph_draft_observed`, `selections` (`[slots * steps, 2]`) and
+///      `Selecting::Proposals::confidence` (`[slots * steps]`) are exported
+///      tensors whose extents scale linearly with `steps`, so `output` is
+///      monotonically non-decreasing in `steps`.
+///    - Pass `0` is identical for `steps == 1` and `steps == s_max`; in
+///      `steps >= 2`, `chained_features` remains live into Pass `1`, and each
+///      chained pass `1..steps` appends owned input ports (`coordinates`,
+///      `visible`, `fresh`, `destinations`, `selection`, `landed`) and nodes.
+///      Hence `workspace`, `sync`, and `upload` at `s_max` dominate every
+///      smaller `steps` (including `steps == 1`).
+///    - `entry_constants` (set at the end of Pass `0`) is identical across all
+///      `steps >= 1`, and `slot_constants` at `s_max` is a superset of every
+///      smaller `steps` (including `Selecting::Proposals::rows` for `steps == 1`).
+///    - The kernel set at `s_max` is a superset of every smaller `steps`.
+///    - Exact per-bucket `(plan_heap, recorded)` is composed without running
+///      `R_b` by `HeadMeasureDraft::compose` from pass-boundary snapshots
+///      (`boundaries[0]` pre-loop, `boundaries[1]` after Pass `0`,
+///      `boundaries[2]` after Pass `1`, `boundaries[3]` after Pass `2`).
+///
+/// 3. **Monotonicity across `shaped ∈ {false, true}`**:
+///    - In `pass_selection`, `shaped = true` adds the `shape_rows` port and
+///      node on top of the `shaped = false` graph, so `shaped = has_shaped`
+///      dominates `storage`, `constants`, and `kernels`. `HeadMeasureDraft::compose`
+///      filters `!port.is_shape` and `!node.is_shape` to recover exact
+///      `shaped = false` `plan_heap` and `recorded`.
+///
+/// 4. **Dominance across `device ∈ {false, true}` in `Causal`**:
+///    - In `head_graph_draft_observed` (for `steps == 0`), `device = false`
+///      declares `conditioning` via `input_for` (`owned_input = true`, charging
+///      `upload`), while `device = true` declares it via `port_with_class_extent`
+///      (`owned_input = false`, 0 `upload`). Both have identical port ranks,
+///      nodes, result ranks, exports, timelines, constants, kernels, `workspace`,
+///      `sync`, and `output`. Building the representative with `device = false`
+///      whenever any bucket is host-conditioned dominates `storage` with exact
+///      `plan_heap` and `recorded`.
+///
+/// 5. **Exact slice sets**:
+///    - Retaining `(max_entry_rows, max_slots, entry_rows_set)` in the key
+///      ensures no non-existent `(entry_rows, slots, steps)` combination is ever
+///      synthesized on custom class lists.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum HeadBaseKey {
+    Causal {
+        prefix: bool,
+        prefix_tail: bool,
+        history: HeadHistoryGeometry,
+        entry_form: HeadRowForm,
+        max_entry_rows: u64,
+        entry_rows_set: Vec<u64>,
+    },
+    Front {
+        scored: bool,
+        prefix: bool,
+        history: HeadHistoryGeometry,
+        entry_form: HeadRowForm,
+        certified: bool,
+        max_entry_rows: u64,
+        entry_rows_set: Vec<u64>,
+    },
+    Draft {
+        chained: bool,
+        scored: bool,
+        history: HeadHistoryGeometry,
+        entry_form: HeadRowForm,
+        certified: bool,
+        slot_form: Option<HeadRowForm>,
+        max_entry_rows: u64,
+        max_slots: u64,
+        entry_rows_set: Vec<u64>,
+    },
+}
+
+struct HeadGroupOut {
+    storage: NativeGraphStorageBytes,
+    constants: Vec<GraphConstant>,
+    graphs: Vec<(Vec<HeadGroupKey>, seismic::GraphCensus, seismic::HostHeap, usize)>,
+    kernels: Vec<seismic::KernelRequest>,
+}
+
+/// Single-owner composition of a head graph family's resources and kernel set,
+/// used by both assessment and load reservation.
+///
+/// Collapses invariant and monotonic axes (`HeadRowForm`, `steps >= 1`,
+/// `shaped ∈ {false, true}`, and causal `device ∈ {false, true}`) to one
+/// `SizingDraft` per [`HeadBaseKey`] (evaluated over all eligible `entry_rows`
+/// slices before `R_b`), while computing each constituent bucket's exact
+/// `plan_heap` and `GraphCensus` from pass-boundary measurements.
+pub(crate) struct HeadFamilyComposition;
+
+impl HeadFamilyComposition {
+    fn evaluate_group(
+        backend: BackendName,
+        entries: &CheckedHeadEntries,
+        split: &HeadSplit<'_>,
+        buckets: &[(HeadBucketKey, Vec<HeadGraphClass>)],
+    ) -> Result<HeadGroupOut, GraphError> {
+        let s_max = buckets
+            .iter()
+            .map(|(key, _)| key.steps)
+            .max()
+            .expect("a base group holds a bucket");
+        let has_shaped = buckets.iter().any(|(key, _)| key.shaped);
+        let representative_device = buckets.iter().all(|(key, _)| key.device);
+        let first_class = buckets[0].1[0];
+        let mut entry_rows: Vec<u64> = buckets
+            .iter()
+            .flat_map(|(_, group)| group.iter().map(|class| class.entry_rows))
+            .collect();
+        entry_rows.sort_unstable();
+        entry_rows.dedup();
+        let max_entry_rows = *entry_rows.last().expect("a group holds a class");
+        let mut all_slots: Vec<u64> = buckets
+            .iter()
+            .flat_map(|(_, group)| group.iter().map(|class| class.slots()))
+            .collect();
+        all_slots.sort_unstable();
+        all_slots.dedup();
+        let max_slots = *all_slots.last().expect("a group holds a class");
+        let representative_slots = if s_max == 0 && representative_device {
+            1
+        } else {
+            max_slots
+        };
+        let largest = largest_head_class(
+            first_class,
+            max_entry_rows,
+            representative_slots,
+            s_max,
+            has_shaped,
+            representative_device,
+        );
+
+        let (form, numbers) = split.class(largest)?;
+        let form = crate::programs::graph::facts::constant_reals(form).tables(Table::from);
+        let numbers = crate::programs::graph::facts::constant(numbers);
+        let slices = entry_rows
+            .iter()
+            .map(|&rows| NativeGraphClassSlice::new().dimension("head_entry_rows", [rows]))
+            .collect::<Vec<_>>();
+        let draft = head_graph_draft(
+            SizingOutline::new_draft(backend),
+            entries.entries()?,
+            &form,
+            &numbers,
+        )
+        .map_err(|error| error.context(format!("head class {largest:?}")))?;
+        let layout = SizingOutline::certify_one(draft.plan, slices)
+            .map_err(|error| error.context(format!("head class {largest:?}")))?;
+
+        let (entry_constants, slot_constants) = draft.constants.split_at(draft.entry_constants);
+        let mut constants = Vec::with_capacity(
+            entry_constants.len() * entry_rows.len() + slot_constants.len() * all_slots.len(),
+        );
+        for &rows in &entry_rows {
+            for constant in entry_constants {
+                constants.push(constant.at_rows(rows)?);
+            }
+        }
+        for &slots in &all_slots {
+            for constant in slot_constants {
+                constants.push(constant.at_rows(slots)?);
+            }
+        }
+
+        let storage = layout.storage_bytes();
+        let mut graphs = Vec::with_capacity(buckets.len());
+
+        let distinct_group_keys = |group: &[HeadGraphClass]| -> Vec<HeadGroupKey> {
+            let mut keys: Vec<_> = group.iter().map(|&class| HeadGroupKey::of(class, split)).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            keys
+        };
+        let needs_measure = buckets
+            .iter()
+            .any(|(key, _)| key.steps != s_max || key.shaped != has_shaped);
+        if !needs_measure {
+            for (_, group) in buckets {
+                graphs.push((distinct_group_keys(group), storage.recorded, layout.plan_heap(), group.len()));
+            }
+        } else {
+            let mut boundaries = Vec::with_capacity(s_max.max(1) as usize + 1);
+            let measured = head_graph_draft_observed(
+                HeadMeasureDraft::new(backend),
+                entries.entries()?,
+                &form,
+                &numbers,
+                &mut |g| boundaries.push(g.boundary()),
+            )
+            .map_err(|error| error.context(format!("head class {largest:?}")))?;
+            for (key, group) in buckets {
+                let (plan_heap, recorded) =
+                    measured.plan.compose(&boundaries, s_max, key.steps, key.shaped);
+                if key.steps == s_max && key.shaped == has_shaped {
+                    debug_assert_eq!(recorded, storage.recorded);
+                    debug_assert_eq!(plan_heap, layout.plan_heap());
+                }
+                graphs.push((distinct_group_keys(group), recorded, plan_heap, group.len()));
+            }
+        }
+
+        Ok(HeadGroupOut {
+            storage,
+            constants,
+            graphs,
+            kernels: layout.kernels().to_vec(),
+        })
+    }
+
+    pub(crate) fn evaluate(
+        backend: BackendName,
+        load: &ModelLoadPlan,
+        geometry: &Decoder,
+        head: CausalHeadBlock<'_>,
+        binding: HeadBinding,
+        classes: &[HeadGraphClass],
+    ) -> Result<(CheckedGraphResources, std::collections::HashSet<seismic::KernelRequest>), GraphError> {
+        let entries = CheckedHeadEntries::new(binding, backend, load)?;
+        let split = HeadSplit::of(load, geometry, head, binding.feed_forward)?;
+        let has_chained = classes.iter().any(|class| class.steps() > 1);
+        let mut groups: BTreeMap<HeadBucketKey, Vec<HeadGraphClass>> = BTreeMap::new();
+        for &class in classes {
+            let key = HeadBucketKey::of(class, &split, has_chained);
+            let group = groups.entry(key).or_default();
+            if group.contains(&class) {
+                return Err("head graph class is duplicated".into());
+            }
+            group.push(class);
+        }
+
+        let mut base_groups: BTreeMap<HeadBaseKey, Vec<(HeadBucketKey, Vec<HeadGraphClass>)>> =
+            BTreeMap::new();
+        for (key, group) in groups {
+            let mut entry_rows_set: Vec<u64> = group.iter().map(|class| class.entry_rows).collect();
+            entry_rows_set.sort_unstable();
+            entry_rows_set.dedup();
+            let max_entry_rows = *entry_rows_set.last().expect("a group holds a class");
+            let max_slots = group
+                .iter()
+                .map(|class| class.slots())
+                .max()
+                .expect("a group holds a class");
+            let base_key = if key.front {
+                HeadBaseKey::Front {
+                    scored: key.scored,
+                    prefix: key.prefix,
+                    history: key.history,
+                    entry_form: key.entry_form,
+                    certified: key.certified,
+                    max_entry_rows,
+                    entry_rows_set,
+                }
+            } else if key.steps == 0 {
+                HeadBaseKey::Causal {
+                    prefix: key.prefix,
+                    prefix_tail: key.prefix_tail,
+                    history: key.history,
+                    entry_form: key.entry_form,
+                    max_entry_rows,
+                    entry_rows_set,
+                }
+            } else {
+                HeadBaseKey::Draft {
+                    chained: key.steps > 1,
+                    scored: key.scored,
+                    history: key.history,
+                    entry_form: key.entry_form,
+                    certified: key.certified,
+                    slot_form: key.slot_form,
+                    max_entry_rows,
+                    max_slots,
+                    entry_rows_set,
+                }
+            };
+            base_groups.entry(base_key).or_default().push((key, group));
+        }
+
+        let base_groups: Vec<Vec<(HeadBucketKey, Vec<HeadGraphClass>)>> =
+            base_groups.into_values().collect();
+
+        crate::assessment::stage_timer::record_stage(|t| {
+            t.native_head_groups += base_groups.len() as u64;
+        });
+
+        let group_outputs: Vec<HeadGroupOut> =
+            crate::assessment::pool::par_for_results(&base_groups, |buckets| {
+                Self::evaluate_group(backend, &entries, &split, buckets)
+            })?;
+
+        let mut family = CheckedGraphFamilyResources::new();
+        let mut kernels = std::collections::HashSet::new();
+        let mut seen_group_keys = std::collections::BTreeSet::new();
+        for out in group_outputs {
+            family.include(out.storage, out.constants);
+            for (group_keys, recorded, plan_heap, plan_count) in out.graphs {
+                for group_key in group_keys {
+                    if seen_group_keys.insert(group_key) {
+                        family.include_graph(recorded, false);
+                    }
+                }
+                for _ in 0..plan_count {
+                    family.include_plan(plan_heap)?;
+                }
+            }
+            kernels.extend(out.kernels);
+        }
+
+        Ok((family.finish()?, kernels))
+    }
+}
+
+/// Direct contract sizing records zero traces.
 #[cfg(test)]
 pub(crate) fn head_traces_recorded() -> usize {
-    HEAD_TRACES.recorded()
+    0
 }
 
 pub(crate) fn certify_head_family<L: Certified>(
@@ -1702,67 +2769,77 @@ pub(crate) fn certify_head_family<L: Certified>(
     GraphError,
 > {
     let entries = CheckedHeadEntries::new(binding, backend, load)?;
+    let split = HeadSplit::of(load, geometry, head, binding.feed_forward)?;
     let mut family = CheckedGraphFamilyResources::new();
     let mut layouts = BTreeMap::new();
-    // Every field but the entry row count fixes the graph's structure; the
-    // entry pass also distinguishes a prefix with a current-chunk tail
-    // from a single previous row, independently of attention row forms.
-    let mut groups: BTreeMap<
-        (u64, u64, bool, bool, bool, bool, bool, HeadHistoryGeometry, RowForm),
-        Vec<HeadGraphClass>,
-    > = BTreeMap::new();
+    // Every structural branch fixes a group: the entry pass distinguishes a
+    // prefix with a current-chunk tail from a single previous row and its own
+    // RowForm; drafting passes distinguish front vs transaction, progressive
+    // certification, and when chained passes exist (`steps > 1`), the chained
+    // pass's RowForm.
+    let mut groups: BTreeMap<HeadGroupKey, Vec<HeadGraphClass>> = BTreeMap::new();
     for &class in classes {
-        if groups.values().any(|group| group.contains(&class)) {
+        let key = HeadGroupKey::of(class, &split);
+        let group = groups.entry(key).or_default();
+        if group.contains(&class) {
             return Err("head graph class is duplicated".into());
         }
-        groups
-            .entry((
-                class.slots,
-                class.steps,
-                class.shaped,
-                class.scored,
-                class.device,
-                class.prefix,
-                class.prefix && class.entry_rows > 1,
-                class.history,
-                RowForm::of(class.entry_rows),
-            ))
-            .or_default()
-            .push(class);
+        group.push(class);
     }
-    let split = HeadSplit::of(load, geometry, head, binding.feed_forward)?;
+    crate::assessment::stage_timer::record_stage(|t| t.native_head_groups += groups.len() as u64);
     for group in groups.into_values() {
-        // Recorded at its largest entry rows: the recording's constants are
-        // charged for every class it certifies, and the largest's hold
-        // every smaller class's.
-        let largest = *group.iter().max_by_key(|class| class.entry_rows).expect("a group holds a class");
+        // Recorded at the group's largest `(entry_rows, slots)`: its layout
+        // dominates every class in the group (all classes satisfy
+        // `slots <= entry_rows`, so `max_slots <= max_entry_rows`).
+        let first = *group.first().expect("a group holds a class");
+        let max_entry_rows = group
+            .iter()
+            .map(|class| class.entry_rows)
+            .max()
+            .expect("a group holds a class");
+        let max_slots = group
+            .iter()
+            .map(|class| class.slots())
+            .max()
+            .expect("a group holds a class");
+        let passes = HeadPasses::of(first.launch);
+        let largest = largest_head_class(
+            first,
+            max_entry_rows,
+            max_slots,
+            first.steps(),
+            passes.shaped,
+            passes.device,
+        );
         let (form, numbers) = split.class(largest)?;
-        let mut facts = FactSink::new();
-        let form = facts.index_reals(form).tables(|bytes| facts.table(bytes));
-        let key = HeadKey { backend, entries: entries.clone(), form, numbers: facts.index(numbers) };
-        // The entry rows are the one fact the group's classes vary.
-        let classes = [ClassFact {
-            fact: key.numbers.attention.rows.position(),
-            scope: None,
-            dimension: "head_entry_rows",
-        }];
+        let form = crate::programs::graph::facts::constant_reals(form).tables(Table::from);
+        let numbers = crate::programs::graph::facts::constant(numbers);
         let slices = group
             .iter()
             .map(|class| NativeGraphClassSlice::new().dimension("head_entry_rows", [class.entry_rows]))
             .collect::<Vec<_>>();
-        let (layout, constants) = L::traced(&HEAD_TRACES, &key, &facts, &classes, slices, record_head)
+        let draft = head_graph_draft(
+            L::new_draft(backend),
+            entries.entries()?,
+            &form,
+            &numbers,
+        )
+        .map_err(|error| error.context(format!("head class {largest:?}")))?;
+        let layout = L::certify_one(draft.plan, slices)
             .map_err(|error| error.context(format!("head class {largest:?}")))?;
-        family.include(NativeGraphStorageBytes::default(), constants);
+        let (entry_constants, slot_constants) = draft.constants.split_at(draft.entry_constants);
+        let mut entry_rows = group.iter().map(|class| class.entry_rows).collect::<Vec<_>>();
+        entry_rows.sort_unstable();
+        entry_rows.dedup();
+        let mut slots = group.iter().map(|class| class.slots()).collect::<Vec<_>>();
+        slots.sort_unstable();
+        slots.dedup();
+        family.include_classes(NativeGraphStorageBytes::default(), entry_constants, &entry_rows)?;
+        family.include_classes(NativeGraphStorageBytes::default(), slot_constants, &slots)?;
         family.include(layout.storage_bytes(), []);
         // A head launch runs on its own lane, never in a decode step's.
         family.include_graph(layout.storage_bytes().recorded, false);
         for &class in &group {
-            if class.steps > 0 && matches!(binding.feed_forward, FeedForwardProgramSlot::Dense(_)) {
-                family.include(
-                    NativeGraphStorageBytes::default(),
-                    [GraphConstant::identity_value(class.entry_rows)?],
-                );
-            }
             family.include_plan(layout.plan_heap())?;
             layouts.insert(class, layout.clone());
         }
@@ -1851,6 +2928,7 @@ impl PreparedHeadGraphs {
         }
         let plans = prepared.values().map(|graph| (false, graph.plan.clone()));
         let family = super::graph::serial_family("head", plans, &resources.graphs).map_err(device)?;
+        super::graph::assert_storage_eq("head", &family, resources.storage);
         Ok(Self {
             selection_top: split.selection.map(|(_, top)| top),
             conditioning_bytes: load.residual_conditioning().map_or(
@@ -2159,8 +3237,9 @@ impl NativeHeadProgram {
         })
     }
 
-    /// Queue one head transaction. Returns its completion and, when
-    /// drafting, the selections the graph fills.
+    /// Queue one head launch. Returns its completion and what its
+    /// selections make: a drafting transaction's proposals, a front
+    /// launch's chain.
     fn queue(
         &self,
         core: &HeadLaunchCore,
@@ -2171,8 +3250,6 @@ impl NativeHeadProgram {
         let entry = batch.upload();
         let chain = batch.chain().collect::<Vec<_>>();
         let steps = batch.steps();
-        let actual_slots = batch.actual_slots();
-        let slots = row_class(actual_slots).ok_or_else(|| invalid("head slots have no class"))?;
         let entry_rows = entry.class.rows();
         let shaped = std::iter::once(&entry)
             .chain(&chain)
@@ -2210,33 +3287,37 @@ impl NativeHeadProgram {
             })
             .transpose()?;
         let segments = HeadGraphClass::segments_of(&geometry).map_err(invalid)?;
-        let controls = std::iter::once((&entry, entry_rows))
-            .chain(chain.iter().map(|pass| (pass, slots)))
-            .map(|(pass, rows)| PassControls::new(pass, rows, segments as usize, &geometry))
+        // A chained pass's rows are one per slot, of the slot class.
+        let controls = std::iter::once(Ok((&entry, entry_rows)))
+            .chain(chain.iter().map(|pass| {
+                row_class(pass.actual_rows)
+                    .map(|rows| (pass, rows))
+                    .ok_or_else(|| invalid("head slots have no class"))
+            }))
+            .map(|pass| pass.and_then(|(pass, rows)| PassControls::new(pass, rows, segments as usize, &geometry)))
             .collect::<Result<Vec<_>, _>>()?;
         let scored = match self.graphs.prepared.selection_top {
             Some(top) => controls.iter().any(|pass| pass.scores(top)),
             None => false,
         };
-        let class = HeadGraphClass {
-            entry_rows: entry_rows as u64,
-            slots: slots as u64,
-            history: geometry,
-            steps: steps as u64,
-            shaped,
-            scored: scored && steps > 0,
-            device: matches!(
-                core.conditioning(),
-                crate::HeadConditioning::Features { .. }
-            ),
-            prefix: matches!(
-                core.conditioning(),
-                crate::HeadConditioning::Features {
-                    previous: Some(_),
-                    ..
-                }
-            ),
+        let scored = scored && steps > 0;
+        let launch = match core.conditioning() {
+            crate::HeadConditioning::Front(reads) => HeadLaunchClass::Front {
+                shaped,
+                scored,
+                prefix: matches!(reads.features, crate::FrontFeatures::Boundary(_)),
+            },
+            conditioning => HeadLaunchClass::Transaction {
+                slots: row_class(batch.actual_slots()).ok_or_else(|| invalid("head slots have no class"))? as u64,
+                steps: steps as u64,
+                shaped,
+                scored,
+                device: matches!(conditioning, crate::HeadConditioning::Features { .. }),
+                prefix: matches!(conditioning, crate::HeadConditioning::Features { previous: Some(_), .. }),
+            },
         };
+        let class = HeadGraphClass { entry_rows: entry_rows as u64, history: geometry, launch };
+        let slots = class.slots() as usize;
         let (graph, bound) = self.graphs.class(class)?;
         if graph.passes.len() != chain.len() + 1 {
             return Err(invalid("head graph passes differ from the batch's steps"));
@@ -2313,12 +3394,35 @@ impl NativeHeadProgram {
                     bindings.set(&self.unallocating, port, &features).map_err(device)?;
                 }
             }
+            // The target step's leading class rows: entry row `r` reads its
+            // selection, feature and token row `r`; rows past the entry
+            // rows are padding rows', which append nowhere and whose chain
+            // rows chain nothing.
+            crate::HeadConditioning::Front(reads) => {
+                let leading = |tensor: &crate::GraphOutputTensor, what: &str| {
+                    tensor
+                        .tensor()
+                        .slice_leading(0, entry_rows as u64)
+                        .map_err(|error| invalid(format!("front head {what}: {error}")))
+                };
+                match (&reads.features, &graph.conditioning, &graph.previous) {
+                    (crate::FrontFeatures::Rows(features), Some(port), None) => {
+                        bindings.set(&self.unallocating, port, &leading(features, "features")?).map_err(device)?;
+                    }
+                    (crate::FrontFeatures::Boundary(boundary), None, Some(port)) => {
+                        bindings
+                            .set(&self.unallocating, port, boundary.allocation().tensor().map_err(device)?)
+                            .map_err(device)?;
+                    }
+                    _ => return Err(invalid("a front launch's conditioning differs from its graph class")),
+                }
+                let SelectedPorts::Chain(chain) = &graph.selected else {
+                    return Err(invalid("a front head graph has no chain"));
+                };
+                bindings.set(&self.unallocating, &graph.tokens, &leading(&reads.selected, "selections")?).map_err(device)?;
+                bindings.set(&self.unallocating, &chain.tokens, &leading(&reads.tokens, "token rows")?).map_err(device)?;
+            }
         }
-        let rows = self
-            .graphs
-            .embedding
-            .indices(entry.tokens)
-            .map_err(invalid)?;
         // A chained pass embeds the device's selection, a landed read of a
         // table with landing slots.
         let landed = graph
@@ -2328,12 +3432,28 @@ impl NativeHeadProgram {
             .map(|ports| ports.queue(&self.graphs.embedding, &self.unallocating, &mut bindings))
             .collect::<Result<Vec<_>, _>>()
             .map_err(invalid)?;
-        active
-            .write_input(
-                &graph.tokens,
-                &i32_bytes(rows.iter().flat_map(|row| [*row, 0])),
-            )
-            .map_err(device)?;
+        match (&graph.selected, batch.continuing()) {
+            // The host's tokens, as the table's rows.
+            (SelectedPorts::Causal | SelectedPorts::Proposals { .. }, None) => {
+                let rows = self
+                    .graphs
+                    .embedding
+                    .indices(entry.tokens)
+                    .map_err(invalid)?;
+                active
+                    .write_input(
+                        &graph.tokens,
+                        &i32_bytes(rows.iter().flat_map(|row| [*row, 0])),
+                    )
+                    .map_err(device)?;
+            }
+            (SelectedPorts::Chain(chain), Some(continuing)) => {
+                let [chaining, continuing] = front_words(batch, continuing, entry_rows)?;
+                active.write_input(&chain.chaining, &chaining).map_err(device)?;
+                active.write_input(&chain.continuing, &continuing).map_err(device)?;
+            }
+            _ => return Err(invalid("a head graph's chain differs from its batch's")),
+        }
         if let Some(out_rows) = &graph.out_rows {
             active
                 .write_input(
@@ -2366,7 +3486,7 @@ impl NativeHeadProgram {
                     active.write_input(&tables.window_destinations, &window.destinations).map_err(device)?;
                     active.write_input(&tables.block_destinations, &blocks.destinations).map_err(device)?;
                     // A class that scores lists each row's complete units.
-                    match (&tables.index, class.scored) {
+                    match (&tables.index, class.scored()) {
                         (Some(index), true) => {
                             active.write_input(&index.block_visible, &blocks.visible).map_err(device)?;
                             active.write_input(&index.complete, &i32_bytes(blocks.seen.iter().copied())).map_err(device)?;
@@ -2399,32 +3519,70 @@ impl NativeHeadProgram {
             .map_err(device)?;
         let landed_reads = landed.into_iter().map(SelectedRead::submitted).collect();
         let owner = output.publish(outputs);
-        let selections = (steps > 0)
-            .then(|| {
-                let confidence = graph
-                    .confidence
-                    .as_ref()
-                    .ok_or_else(|| invalid("a drafting head graph has no confidence"))?;
-                Ok::<_, SubmitError>(HeadSelections {
-                    tokens: owner
-                        .tensor(&graph.output)
-                        .ok_or_else(|| invalid("head graph omitted its selections"))?,
-                    confidence: Some(
-                        owner
-                            .tensor(confidence)
-                            .ok_or_else(|| invalid("head graph omitted its confidence"))?,
-                    ),
-                })
-            })
-            .transpose()?;
-        Ok((
-            completion,
-            HeadOutput {
-                selections,
-                landed_reads,
-            },
-        ))
+        let exported = |tensor: &WorkflowTensor, what: &str| {
+            owner
+                .tensor(tensor)
+                .ok_or_else(|| invalid(format!("head graph omitted its {what}")))
+        };
+        let selected = match &graph.selected {
+            SelectedPorts::Causal => HeadSelected::Causal,
+            SelectedPorts::Proposals { confidence } => HeadSelected::Proposals(HeadSelections {
+                tokens: exported(&graph.output, "selections")?,
+                confidence: Some(exported(confidence, "confidence")?),
+            }),
+            SelectedPorts::Chain(chain) => HeadSelected::Chain(FrontOutput {
+                guesses: exported(&chain.guesses, "chain's guesses")?,
+                next_selected: exported(&chain.next_selected, "chain's next selections")?,
+                next_guesses: exported(&chain.next_guesses, "chain's next guesses")?,
+            }),
+        };
+        Ok((completion, HeadOutput { selected, landed_reads }))
     }
+}
+
+/// A front launch's chain words (`guess_chain`): per entry row of its
+/// class, its `chaining` row, which of a slot's first row is that row's
+/// token row (the batch's row: the launch binds the step's token rows from
+/// the first one's) and the slot's front rows, and none of every other row;
+/// per row of the decode form, its `continuing` row, the first entry row of
+/// the slot its `queued` row continues and its depth there, or none.
+fn front_words(
+    batch: &magnitude_batching::ValidatedHeadBatch,
+    queued: &[Option<magnitude_batching::FrontContinuation>],
+    entry_rows: usize,
+) -> Result<[Vec<u8>; 2], SubmitError> {
+    let word = |count: u64, fields: [(u64, usize); 2]| -> Result<Vec<i32>, SubmitError> {
+        let mut row = vec![0; count as usize];
+        for (field, value) in fields {
+            row[field as usize] = i32::try_from(value).map_err(|_| invalid("a front chain word exceeds i32"))?;
+        }
+        Ok(row)
+    };
+    let none = |count: u64, field: u64| {
+        let mut row = vec![0; count as usize];
+        row[field as usize] = -1;
+        row
+    };
+    let firsts = batch.slots().map(|slot| slot.span()).collect::<Vec<_>>();
+    let mut chaining = vec![none(CHAINING_WORDS, CHAINING_ROW); entry_rows];
+    for span in &firsts {
+        chaining[span.start] = word(CHAINING_WORDS, [(CHAINING_ROW, span.start), (CHAINING_FRONT, span.len() - 1)])?;
+    }
+    if queued.len() > VERIFY_ROWS as usize {
+        return Err(invalid("a front launch continues more rows than the decode form's"));
+    }
+    let continuing = (0..VERIFY_ROWS as usize)
+        .map(|row| match queued.get(row).copied().flatten() {
+            Some(continuation) => {
+                let slot = firsts
+                    .get(continuation.slot)
+                    .ok_or_else(|| invalid("a queued row continues no slot of its front launch"))?;
+                word(CONTINUING_WORDS, [(CONTINUING_SLOT, slot.start), (CONTINUING_DEPTH, continuation.depth)])
+            }
+            None => Ok(none(CONTINUING_WORDS, CONTINUING_SLOT)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok([chaining, continuing].map(|rows| i32_bytes(rows.into_iter().flatten())))
 }
 
 impl HeadProgram for NativeHeadProgram {
@@ -2453,5 +3611,191 @@ impl HeadProgram for NativeHeadProgram {
             workspace,
             output,
         ))
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::*;
+
+    #[test]
+    fn head_family_composition_matches_unrolled_bit_for_bit() {
+        let hidden = crate::planning::fixtures::mix_site_hidden();
+        let definition = crate::planning::fixtures::with_mtp_head(
+            crate::planning::fixtures::fixture_definition_of(hidden),
+        );
+        let manifest = crate::planning::fixtures::fixture_manifest(&definition);
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            crate::ComponentSelection {
+                head: true,
+                vision: false,
+            },
+            seismic::Layout::Rows16,
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+        )
+        .unwrap();
+        let method = crate::PlannedMethod::Mtp {
+            greedy_proposals: 4,
+            sampled_proposals: 4,
+            widths: crate::DraftWidths::Adaptive,
+        };
+        let limits = ResourceLimits {
+            max_launch_rows: 256,
+            max_launch_slots: 16,
+            max_selected_rows: 16,
+            max_drafting_slots: 16,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        let state = crate::ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            method,
+            magnitude_state::KvCodec::Dense,
+            limits,
+            crate::ResourceCapacity {
+                domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
+            },
+        )
+        .unwrap();
+        let plan = load
+            .program_plan(&definition, magnitude_state::KvCodec::Dense)
+            .unwrap();
+        let head = definition.head.clone().unwrap();
+        let head_block = CausalHeadBlock::of(&head, &head.blocks[0]).unwrap();
+        let geometry = state.head_state().unwrap().head_geometry().unwrap();
+        let classes =
+            head_graph_classes(limits, geometry, method.draft_rows(), load.fronts()).unwrap();
+        assert!(classes
+            .iter()
+            .any(|c| c.steps() == 4 && HeadPasses::of(c.launch).shaped));
+        assert!(classes
+            .iter()
+            .any(|c| c.steps() == 2 && !HeadPasses::of(c.launch).shaped));
+        let binding = plan.head().unwrap().blocks()[0];
+
+        let (composed_resources, composed_kernels) = HeadFamilyComposition::evaluate(
+            BackendName::Cpu,
+            &load,
+            &definition.decoder,
+            head_block,
+            binding,
+            &classes,
+        )
+        .unwrap();
+
+        let (unrolled_resources, unrolled_outlines) = certify_head_family::<SizingOutline>(
+            BackendName::Cpu,
+            &load,
+            &definition.decoder,
+            head_block,
+            binding,
+            &classes,
+        )
+        .unwrap();
+        let mut unrolled_kernels = std::collections::HashSet::new();
+        for outline in unrolled_outlines.values() {
+            unrolled_kernels.extend(outline.kernels().iter().cloned());
+        }
+
+        assert_eq!(composed_resources.storage, unrolled_resources.storage);
+        assert_eq!(composed_resources.host_heap, unrolled_resources.host_heap);
+        assert_eq!(
+            composed_resources.binding_constant_bytes,
+            unrolled_resources.binding_constant_bytes
+        );
+        assert_eq!(composed_resources.graphs, unrolled_resources.graphs);
+        assert_eq!(composed_kernels, unrolled_kernels);
+
+        // Monotonicity witness: no smaller `steps` (including `steps == 1`) or
+        // `shaped = false` drafting class ever needs more storage than its
+        // `(max_steps, shaped = true)` representative, and no device-conditioned
+        // causal class (`prefix = false`) ever needs more storage than its
+        // host-conditioned representative.
+        let max_steps = method.draft_rows() as u64;
+        for &class in &classes {
+            let s = unrolled_outlines[&class].storage_bytes();
+            match class.launch {
+                HeadLaunchClass::Transaction {
+                    slots,
+                    steps,
+                    scored,
+                    device: false,
+                    prefix: false,
+                    ..
+                } if steps >= 1 => {
+                    let rep_steps = if steps == 1 { 1 } else { max_steps };
+                    let rep_class = HeadGraphClass {
+                        entry_rows: class.entry_rows,
+                        history: class.history,
+                        launch: HeadLaunchClass::Transaction {
+                            slots,
+                            steps: rep_steps,
+                            shaped: true,
+                            scored,
+                            device: false,
+                            prefix: false,
+                        },
+                    };
+                    let rep = unrolled_outlines[&rep_class].storage_bytes();
+                    assert!(
+                        s.workspace <= rep.workspace
+                            && s.sync <= rep.sync
+                            && s.output <= rep.output
+                            && s.upload <= rep.upload,
+                        "drafting class {class:?} storage {s:?} exceeds representative {rep_class:?} storage {rep:?}"
+                    );
+                }
+                HeadLaunchClass::Transaction {
+                    steps: 0,
+                    device: true,
+                    prefix: false,
+                    ..
+                } => {
+                    let rep_class = HeadGraphClass {
+                        entry_rows: class.entry_rows,
+                        history: class.history,
+                        launch: HeadLaunchClass::Transaction {
+                            slots: 1,
+                            steps: 0,
+                            shaped: false,
+                            scored: false,
+                            device: false,
+                            prefix: false,
+                        },
+                    };
+                    let rep = unrolled_outlines[&rep_class].storage_bytes();
+                    assert!(
+                        s.workspace <= rep.workspace
+                            && s.sync <= rep.sync
+                            && s.output <= rep.output
+                            && s.upload <= rep.upload,
+                        "causal device class {class:?} storage {s:?} exceeds host representative {rep_class:?} storage {rep:?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Independent equality witness: real sealed NativeGraphLayouts.
+        let (laid_resources, _) = certify_head_family::<NativeGraphLayout>(
+            BackendName::Cpu,
+            &load,
+            &definition.decoder,
+            head_block,
+            binding,
+            &classes,
+        )
+        .unwrap();
+        assert_eq!(composed_resources, laid_resources);
     }
 }

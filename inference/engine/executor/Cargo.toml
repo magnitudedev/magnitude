@@ -8,11 +8,13 @@ license.workspace = true
 libc = "0.2"
 magnitude-artifacts = { path = "../artifacts" }
 magnitude-batching = { path = "../batching" }
+magnitude-cost-model = { path = "../cost-model" }
 magnitude-family-contracts = { path = "../families/contracts" }
 magnitude-kernels = { path = "../kernels" }
 magnitude-state = { path = "../state" }
 seismic.workspace = true
 seismic-io.workspace = true
+seismic-threads.workspace = true
 serde.workspace = true
 # Persisted precision policies and objective weights retain their exact f64 identity.
 serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }
@@ -38,7 +40,7 @@ machine-line = ["magnitude-kernels/machine-line"]
 # fake expert bank, for the tests of the owners above the domain, and the
 # expert watchers' stall (`starve`). Enabled only as a
 # dev-dependency; never by a served engine.
-fixtures = ["seismic/fixtures"]
+fixtures = ["seismic/fixtures", "magnitude-cost-model/fixtures"]
 
 # The report's stacks on x86-64 Linux, unwound through the images' tables
 # without allocating (`diagnostics::stacks::cfi`).
@@ -46,6 +48,8 @@ fixtures = ["seismic/fixtures"]
 gimli = { version = "0.32", default-features = false, features = ["read-core"] }
 
 [dev-dependencies]
+# The reference lines (`magnitude_cost_model`).
+magnitude-cost-model = { path = "../cost-model", features = ["fixtures"] }
 # The registered families and the catalog's headers, for the assessment terms
 # of every catalog target, and the families its drafts name
 # (`assessment::catalog`).

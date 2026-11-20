@@ -1,0 +1,49 @@
+// `routed_gate_up_part` (routed.seismic) in Vulkan: `routed_gate_up`'s forms in two passes over one
+// `product`, so the experts a layer holds run while its host lands the absent ones. The early pass
+// (`late` 0, before the tier wait) is `routed_gate_up`'s rows into `product`. The late pass (after
+// the wait) computes only the choices the route left absent (its routing record's source -1) that
+// the wait has since sourced, and leaves every other row as the early pass wrote it. Each choice's
+// product is computed once, by the one body (`lib/routed/gate_up.glsl`), so the sum that follows
+// reads the bits of one pass.
+#if SEISMIC_STATIC_LB != 0
+#define PROJECTION_GLU_LIMIT SEISMIC_STATIC_LB
+#endif
+#if SEISMIC_STATIC_GS + SEISMIC_STATIC_US != 0
+#define PROJECTION_SCALED
+#endif
+#define KERNEL_A SEISMIC_ELEMENT_A
+#define KERNEL_W0 SEISMIC_EXPERT_GATE
+#define KERNEL_W1 SEISMIC_EXPERT_UP
+#include "lib/core/activation.glsl"
+#include "lib/streaming/control.glsl"
+// Whether flat choice c runs in this pass: every choice in the early pass (`late` 0); in the late
+// pass, only a choice the route left absent (`streaming_left_absent`) that the wait has sourced.
+#define ROUTED_CHOICE_ACTIVE(c, source)                                                                         \
+    (int(SEISMIC_PARAM_LATE) == 0                                                                               \
+        || (!slab_source_none(source)                                                                           \
+            && streaming_left_absent(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0,                   \
+                SEISMIC_PTR(SEISMIC_BUFFER_ROUTING), SEISMIC_ROUTING_STRIDE_0, SEISMIC_ROUTING_STRIDE_1,        \
+                uint(SEISMIC_DIM_FLIGHT), uint(SEISMIC_DIM_P), (c))))
+#include "lib/routed/routed.glsl"
+
+#define ROUTED_GATE_UP_PRODUCT SEISMIC_OUT_PRODUCT
+#define ROUTED_GATE_UP_PRODUCT_STRIDE_0 SEISMIC_PRODUCT_STRIDE_0
+#define ROUTED_GATE_UP_PRODUCT_STRIDE_1 SEISMIC_PRODUCT_STRIDE_1
+#define ROUTED_GATE_UP_PRODUCT_STRIDE_2 SEISMIC_PRODUCT_STRIDE_2
+#define ROUTED_GATE_UP_SOURCE_ROWS SEISMIC_CONST_SOURCE_ROWS
+#include "lib/routed/gate_up.glsl"
+
+void routed_gate_up_part_choice() { routed_gate_up_rows(gl_WorkGroupID.y, 0ul, 0ul, 1u, 1u); }
+
+void routed_gate_up_part_gather() {
+    routed_gather(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_CONST_SOURCE_ROWS,
+        SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2,
+        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), ROUTED_GATE_UP_PRODUCT_STRIDE_0, ROUTED_GATE_UP_PRODUCT_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GATHERED));
+}
+
+void routed_gate_up_part_gathered1() { routed_gate_up_gathered_bounded(1u); }
+void routed_gate_up_part_gathered2() { routed_gate_up_gathered_bounded(2u); }
+void routed_gate_up_part_gathered4() { routed_gate_up_gathered_bounded(4u); }
+void routed_gate_up_part_gathered8() { routed_gate_up_gathered_bounded(8u); }

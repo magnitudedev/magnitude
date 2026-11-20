@@ -459,12 +459,12 @@ impl<'a> Fit<'a> {
             return Ok(u64::MAX);
         };
         let left = match mode {
-            FitMode::Stable => grant.value,
+            FitMode::Stable => grant.bytes.value,
             FitMode::Live => match self.status.grant_left(path) {
-                Some(Ok(left)) => grant.value.min(left.value),
+                Some(Ok(left)) => grant.bytes.value.min(left.value),
                 Some(Err(error)) => return Err(MemoryPolicyError::Observation(error.clone())),
                 // An unopened executor has only its reported stable grant.
-                None => grant.value,
+                None => grant.bytes.value,
             },
         };
         Ok(left)
@@ -774,7 +774,7 @@ mod tests {
         let path = topology
             .access_path(executor.paths(kind)[index])
             .unwrap();
-        path.grant().unwrap().value
+        path.grant().unwrap().bytes.value
     }
 
     fn demand(executor: &Executor, kind: Contract, bytes: u64) -> StorageDemand {
@@ -1052,7 +1052,7 @@ mod tests {
         let topology = recorded::gb10();
         let cuda = executor(&topology, BackendName::Cuda);
         let path = cuda.paths(Contract::DeviceOnly)[0];
-        let total = topology.access_path(path).unwrap().grant().unwrap().value;
+        let total = topology.access_path(path).unwrap().grant().unwrap().bytes.value;
         let mut opened = sampled(&topology, host(40 * GIB));
         let holding = |opened: &mut Status, held| {
             opened.runtime.grants = vec![(

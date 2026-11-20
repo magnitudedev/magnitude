@@ -17,7 +17,8 @@ pub(crate) struct VolumeReads {
 
 /// A link's depths, in bytes in flight, and its read sizes ("A volume's
 /// curve", "Order and depth"): due pieces join the due bytes in flight up
-/// to `due`; a piece read ahead joins everything in flight up to `knee`.
+/// to `due`; a piece read ahead joins the parked bytes and those read
+/// ahead in flight up to `knee`, while nothing parked is queued.
 /// Due pieces are cut at `due_read`, the others at `ahead_read`.
 /// Its reads at once occupy `cores` of the host's processors (the cores
 /// its threads ran, in seconds a second).
@@ -92,12 +93,14 @@ impl EarlierChoice {
 
 impl Curve {
     /// The rule a curve is kept by, a term of a stored curve's key, so a
-    /// curve probed by another is probed again: 6, every point kept,
+    /// curve probed by another is probed again: 7, every point kept,
     /// windows from one read, each lone time a step's whole request's, and
-    /// the request's range line through the engine, its knee (5 had none
-    /// and took the knee of the power-of-two read sizes; 4 timed one record
-    /// of a request; [`EarlierChoice`] the rule before).
-    pub const SCHEMA: u64 = 6;
+    /// the request's range line read ahead through the engine's queue in
+    /// ranges of their aligned span, its knee (6 held the line by a thread a
+    /// range and counted a range by its bytes; 5 had none and took the knee
+    /// of the power-of-two read sizes; 4 timed one record of a request;
+    /// [`EarlierChoice`] the rule before).
+    pub const SCHEMA: u64 = 7;
 }
 
 /// Each volume's lines, by volume.

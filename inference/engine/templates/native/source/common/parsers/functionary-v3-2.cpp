@@ -22,6 +22,7 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
         data.prompt += data.generation_prompt;
     }
 
+    common_chat_apply_cached_parser(tmpl, inputs, "", data, [&](common_chat_params & data) {
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         // Functionary v3.2 format:
         // - Normal content: >>>all\n{content}
@@ -90,6 +91,7 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
             { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, ">>>(?!all)" }
         };
     }
+    });
 
     return data;
 }

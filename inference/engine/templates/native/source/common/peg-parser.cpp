@@ -1112,8 +1112,21 @@ common_peg_parser operator|(const std::string & str, const common_peg_parser & p
 }
 
 static std::string rule_name(const std::string & name) {
-    static const std::regex invalid_rule_chars_re("[^a-zA-Z0-9-]+");
-    return std::regex_replace(name, invalid_rule_chars_re, "-");
+    std::string out;
+    out.reserve(name.size());
+    bool in_invalid = false;
+    for (unsigned char c : name) {
+        const bool valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                           (c >= '0' && c <= '9') || c == '-';
+        if (valid) {
+            out.push_back(static_cast<char>(c));
+            in_invalid = false;
+        } else if (!in_invalid) {
+            out.push_back('-');
+            in_invalid = true;
+        }
+    }
+    return out;
 }
 
 common_peg_parser_builder::common_peg_parser_builder() {}
@@ -1427,24 +1440,30 @@ common_peg_parser common_peg_parser_builder::ac(const common_peg_parser & p, con
     return add(common_peg_ac_parser{p, delimiters});
 }
 
-static std::string gbnf_escape_char_class(uint32_t c) {
+static void gbnf_append_escaped_char_class(std::string & out, uint32_t c) {
     if (c == '-' || c == ']' || c == '[' || c == '\\') {
-        return "\\" + std::string(1, (char) c);
+        out.push_back('\\');
+        out.push_back(static_cast<char>(c));
+        return;
     }
     // Escape whitespace control characters
     if (c == '\n') {
-        return "\\n";
+        out.append("\\n");
+        return;
     }
     if (c == '\t') {
-        return "\\t";
+        out.append("\\t");
+        return;
     }
     if (c == '\r') {
-        return "\\r";
+        out.append("\\r");
+        return;
     }
 
     // Printable ASCII
     if (c >= 0x20 && c <= 0x7E) {
-        return std::string(1, (char) c);
+        out.push_back(static_cast<char>(c));
+        return;
     }
 
     // Hex escape
@@ -1456,7 +1475,7 @@ static std::string gbnf_escape_char_class(uint32_t c) {
         buf[1] = 'x';
         buf[2] = hex[(c >> 4) & 0xF];
         buf[3] = hex[c & 0xF];
-        buf[4] = '\0';
+        out.append(buf, 4);
     } else if (c <= 0xFFFF) {
         buf[0] = '\\';
         buf[1] = 'u';
@@ -1464,66 +1483,156 @@ static std::string gbnf_escape_char_class(uint32_t c) {
         buf[3] = hex[(c >> 8) & 0xF];
         buf[4] = hex[(c >> 4) & 0xF];
         buf[5] = hex[c & 0xF];
-        buf[6] = '\0';
+        out.append(buf, 6);
     } else {
         buf[0] = '\\';
         buf[1] = 'U';
         for (int i = 0; i < 8; i++) {
             buf[2 + i] = hex[(c >> ((7 - i) * 4)) & 0xF];
         }
-        buf[10] = '\0';
+        out.append(buf, 10);
     }
-
-    return std::string(buf);
 }
 
-static std::string gbnf_char_class(const std::vector<uint32_t> & chars, bool negate) {
-    std::string s = negate ? "[^" : "[";
+static void gbnf_append_char_class(std::string & out, const std::vector<uint32_t> & chars, bool negate) {
+    out.append(negate ? "[^" : "[");
     for (uint32_t ch : chars) {
-        s += gbnf_escape_char_class(ch);
+        gbnf_append_escaped_char_class(out, ch);
     }
-    return s + "]";
+    out.push_back(']');
+}
+
+static void gbnf_append_state_name(std::string & out, const std::string & prefix, size_t s) {
+    out.append(prefix);
+    if (s == 0) {
+        return;
+    }
+    out.push_back('-');
+    if (s < 10) {
+        out.push_back('0');
+        out.push_back(static_cast<char>('0' + s));
+    } else {
+        out.append(std::to_string(s));
+    }
 }
 
 static std::string gbnf_ac_grammar(
     const common_grammar_builder &   builder,
     const std::string &              prefix,
     const std::vector<std::string> & strings,
-    const std::function<std::string(const std::vector<uint32_t> &,
-                                    const std::map<size_t, std::vector<uint32_t>> &,
-                                    const std::vector<uint32_t> &,
-                                    const std::function<std::string(size_t)> &)> & build_rule) {
+    bool                             include_delimiter) {
     common_aho_corasick ac(strings);
 
-    auto state_name = [&](size_t s) -> std::string {
-        if (s == 0) {
-            return prefix;
-        }
-        std::string num = std::to_string(s);
-        num = num.size() == 1 ? ("0" + num) : num;
-        return prefix + "-" + num;
-    };
+    const size_t num_states = ac.num_states();
+    const std::vector<uint32_t> alpha(ac.alphabet.begin(), ac.alphabet.end());
+    const size_t alpha_size = alpha.size();
 
-    for (size_t q = 0; q < ac.num_states(); q++) {
+    std::vector<size_t> trans;
+    if (alpha_size > 0) {
+        trans.assign(num_states * alpha_size, 0);
+        for (size_t q : ac.order) {
+            size_t * row = trans.data() + q * alpha_size;
+            if (q != 0) {
+                const size_t * fail_row = trans.data() + ac.fail[q] * alpha_size;
+                std::copy(fail_row, fail_row + alpha_size, row);
+            }
+            for (const auto & [ch, child] : ac.t.nodes[q].children) {
+                auto it = std::lower_bound(alpha.begin(), alpha.end(), ch);
+                row[static_cast<size_t>(it - alpha.begin())] = child;
+            }
+        }
+    }
+
+    std::vector<std::pair<size_t, uint32_t>> transitions;
+    std::vector<uint32_t> completing;  // chars that complete a delimiter
+    std::vector<uint32_t> specific;    // chars with an explicit transition
+    transitions.reserve(alpha_size);
+    completing.reserve(alpha_size);
+    specific.reserve(alpha_size);
+
+    std::string name_buf;
+    std::string rhs;
+    name_buf.reserve(prefix.size() + 8);
+    rhs.reserve(256);
+
+    for (size_t q = 0; q < num_states; q++) {
         if (ac.is_terminal(q)) {
             continue; // match states
         }
 
-        std::map<size_t, std::vector<uint32_t>> buckets;
-        std::vector<uint32_t> completing;  // chars that complete a delimiter
-        std::vector<uint32_t> specific;    // chars with an explicit transition
-        for (uint32_t c : ac.alphabet) {
-            size_t d = ac.next(q, c);
-            if (ac.is_terminal(d)) {
-                completing.push_back(c);
-                specific.push_back(c);
-            } else if (d != 0) {
-                buckets[d].push_back(c); // specific non-root destination
-                specific.push_back(c);
+        transitions.clear();
+        completing.clear();
+        specific.clear();
+        if (alpha_size > 0) {
+            const size_t * row = trans.data() + q * alpha_size;
+            for (size_t ai = 0; ai < alpha_size; ai++) {
+                uint32_t c = alpha[ai];
+                size_t d = row[ai];
+                if (ac.is_terminal(d)) {
+                    completing.push_back(c);
+                    specific.push_back(c);
+                } else if (d != 0) {
+                    transitions.emplace_back(d, c); // specific non-root destination
+                    specific.push_back(c);
+                }
             }
         }
+        std::sort(transitions.begin(), transitions.end());
 
-        builder.add_rule(state_name(q), build_rule(completing, buckets, specific, state_name));
+        rhs.clear();
+        if (!include_delimiter) {
+            // every state is accepting and completing chars get no
+            // alternative, so a forbidden string can never be matched
+            rhs.push_back('|');
+            size_t idx = 0;
+            while (idx < transitions.size()) {
+                size_t d = transitions[idx].first;
+                rhs.append(" [");
+                while (idx < transitions.size() && transitions[idx].first == d) {
+                    gbnf_append_escaped_char_class(rhs, transitions[idx].second);
+                    idx++;
+                }
+                rhs.append("] ");
+                gbnf_append_state_name(rhs, prefix, d);
+                rhs.append(" |");
+            }
+            rhs.push_back(' ');
+            gbnf_append_char_class(rhs, specific, true);
+            rhs.push_back(' ');
+            gbnf_append_state_name(rhs, prefix, 0);
+        } else {
+            bool first = true;
+            if (!completing.empty()) {
+                gbnf_append_char_class(rhs, completing, false); // terminate on match
+                first = false;
+            }
+            size_t idx = 0;
+            while (idx < transitions.size()) {
+                if (!first) {
+                    rhs.append(" | ");
+                }
+                first = false;
+                size_t d = transitions[idx].first;
+                rhs.push_back('[');
+                while (idx < transitions.size() && transitions[idx].first == d) {
+                    gbnf_append_escaped_char_class(rhs, transitions[idx].second);
+                    idx++;
+                }
+                rhs.append("] ");
+                gbnf_append_state_name(rhs, prefix, d);
+            }
+            if (!first) {
+                rhs.append(" | ");
+            }
+            // every other character keeps scanning from the start state
+            gbnf_append_char_class(rhs, specific, true);
+            rhs.push_back(' ');
+            gbnf_append_state_name(rhs, prefix, 0);
+        }
+
+        name_buf.clear();
+        gbnf_append_state_name(name_buf, prefix, q);
+        builder.add_rule(name_buf, rhs);
     }
 
     // An empty delimiter makes the start state terminal. Emit an entry rule
@@ -1534,7 +1643,7 @@ static std::string gbnf_ac_grammar(
         builder.add_rule(prefix, "\"\"");
     }
 
-    return state_name(0);
+    return prefix;
 }
 
 // GBNF grammar matching strings that contain no string in `strings` as a
@@ -1545,20 +1654,7 @@ static std::string gbnf_ac_grammar(
 static std::string gbnf_excluding_grammar(const common_grammar_builder & builder,
                                           const std::string &            prefix,
                                           const std::vector<std::string> & strings) {
-    return gbnf_ac_grammar(builder, prefix, strings,
-        [](const std::vector<uint32_t> & /*completing*/,
-           const std::map<size_t, std::vector<uint32_t>> & buckets,
-           const std::vector<uint32_t> & specific,
-           const std::function<std::string(size_t)> & state_name) {
-            // every state is accepting and completing chars get no
-            // alternative, so a forbidden string can never be matched
-            std::string rhs = "|";
-            for (const auto & [d, chars] : buckets) {
-                rhs += " " + gbnf_char_class(chars, false) + " " + state_name(d) + " |";
-            }
-            rhs += " " + gbnf_char_class(specific, true) + " " + state_name(0);
-            return rhs;
-        });
+    return gbnf_ac_grammar(builder, prefix, strings, /* include_delimiter = */ false);
 }
 
 // GBNF grammar matching everything up to and including the first occurrence of
@@ -1567,22 +1663,7 @@ static std::string gbnf_excluding_grammar(const common_grammar_builder & builder
 static std::string gbnf_including_grammar(const common_grammar_builder & builder,
                                           const std::string &            prefix,
                                           const std::vector<std::string> & strings) {
-    return gbnf_ac_grammar(builder, prefix, strings,
-        [](const std::vector<uint32_t> & completing,
-           const std::map<size_t, std::vector<uint32_t>> & buckets,
-           const std::vector<uint32_t> & specific,
-           const std::function<std::string(size_t)> & state_name) {
-            std::vector<std::string> alts;
-            if (!completing.empty()) {
-                alts.push_back(gbnf_char_class(completing, false)); // terminate on match
-            }
-            for (const auto & [d, chars] : buckets) {
-                alts.push_back(gbnf_char_class(chars, false) + " " + state_name(d));
-            }
-            // every other character keeps scanning from the start state
-            alts.push_back(gbnf_char_class(specific, true) + " " + state_name(0));
-            return string_join(alts, " | ");
-        });
+    return gbnf_ac_grammar(builder, prefix, strings, /* include_delimiter = */ true);
 }
 
 static std::set<std::string> collect_reachable_rules(
@@ -1864,100 +1945,6 @@ void common_peg_arena::build_grammar(const common_grammar_builder & builder, boo
     }
 }
 
-static common_json serialize_parser_variant(const common_peg_parser_variant & variant) {
-    using json = common_json;
-
-    return std::visit([](const auto & p) -> json {
-        using T = std::decay_t<decltype(p)>;
-
-        if constexpr (std::is_same_v<T, common_peg_epsilon_parser>) {
-            return json{{"type", "epsilon"}};
-        } else if constexpr (std::is_same_v<T, common_peg_start_parser>) {
-            return json{{"type", "start"}};
-        } else if constexpr (std::is_same_v<T, common_peg_end_parser>) {
-            return json{{"type", "end"}};
-        } else if constexpr (std::is_same_v<T, common_peg_literal_parser>) {
-            return json{{"type", "literal"}, {"literal", p.literal}};
-        } else if constexpr (std::is_same_v<T, common_peg_sequence_parser>) {
-            return json{{"type", "sequence"}, {"children", p.children}};
-        } else if constexpr (std::is_same_v<T, common_peg_choice_parser>) {
-            return json{{"type", "choice"}, {"children", p.children}};
-        } else if constexpr (std::is_same_v<T, common_peg_repetition_parser>) {
-            return json{
-                {"type", "repetition"},
-                {"child", p.child},
-                {"min_count", p.min_count},
-                {"max_count", p.max_count}
-            };
-        } else if constexpr (std::is_same_v<T, common_peg_and_parser>) {
-            return json{{"type", "and"}, {"child", p.child}};
-        } else if constexpr (std::is_same_v<T, common_peg_not_parser>) {
-            return json{{"type", "not"}, {"child", p.child}};
-        } else if constexpr (std::is_same_v<T, common_peg_any_parser>) {
-            return json{{"type", "any"}};
-        } else if constexpr (std::is_same_v<T, common_peg_space_parser>) {
-            return json{{"type", "space"}};
-        } else if constexpr (std::is_same_v<T, common_peg_chars_parser>) {
-            json ranges = json::array();
-            for (const auto & range : p.ranges) {
-                ranges.push_back({{"start", range.start}, {"end", range.end}});
-            }
-            return json{
-                {"type", "chars"},
-                {"pattern", p.pattern},
-                {"ranges", ranges},
-                {"negated", p.negated},
-                {"min_count", p.min_count},
-                {"max_count", p.max_count}
-            };
-        } else if constexpr (std::is_same_v<T, common_peg_string_parser>) {
-            return json{{"type", "string"}, {"delimiter", std::string(1, p.delimiter)}};
-        } else if constexpr (std::is_same_v<T, common_peg_until_parser>) {
-            return json{{"type", "until"}, {"delimiters", p.delimiters}};
-        } else if constexpr (std::is_same_v<T, common_peg_schema_parser>) {
-            return json{
-                {"type", "schema"},
-                {"child", p.child},
-                {"name", p.name},
-                {"raw", p.raw}
-            };
-        } else if constexpr (std::is_same_v<T, common_peg_rule_parser>) {
-            return json{
-                {"type", "rule"},
-                {"name", p.name},
-                {"child", p.child},
-                {"trigger", p.trigger}
-            };
-        } else if constexpr (std::is_same_v<T, common_peg_ref_parser>) {
-            return json{{"type", "ref"}, {"name", p.name}};
-        } else if constexpr (std::is_same_v<T, common_peg_atomic_parser>) {
-            return json{{"type", "atomic"}, {"child", p.child}};
-        } else if constexpr (std::is_same_v<T, common_peg_tag_parser>) {
-            return json{
-                {"type", "tag"},
-                {"child", p.child},
-                {"tag", p.tag}
-            };
-        } else if constexpr (std::is_same_v<T, common_peg_gbnf_parser>) {
-            return json{{"type", "gbnf"}, {"child", p.child}, {"grammar", p.grammar}};
-        } else if constexpr (std::is_same_v<T, common_peg_ac_parser>) {
-            return json{{"type", "ac"}, {"child", p.child}, {"delimiters", p.delimiters}};
-        }
-    }, variant);
-}
-
-common_json common_peg_arena::to_json() const {
-    auto parsers = common_json::array();
-    for (const auto & parser : parsers_) {
-        parsers.push_back(serialize_parser_variant(parser));
-    }
-    return common_json{
-        {"parsers", parsers},
-        {"rules", rules_},
-        {"root", root_}
-    };
-}
-
 static common_peg_parser_variant deserialize_parser_variant(const common_json & j) {
     if (!j.contains("type") || !j["type"].is_string()) {
         throw std::runtime_error("Parser variant JSON missing or invalid 'type' field");
@@ -2159,8 +2146,187 @@ common_peg_arena common_peg_arena::from_json(const common_json & j) {
     return arena;
 }
 
+static void append_json_string(std::string & out, const std::string & s) {
+    out.push_back('"');
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    static constexpr char hex[] = "0123456789abcdef";
+                    out += "\\u00";
+                    out.push_back(hex[c >> 4]);
+                    out.push_back(hex[c & 0x0f]);
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    out.push_back('"');
+}
+
+static void append_id_array(std::string & out, const std::vector<common_peg_parser_id> & ids) {
+    out.push_back('[');
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (i > 0) out.push_back(',');
+        out += std::to_string(ids[i]);
+    }
+    out.push_back(']');
+}
+
+static void append_string_array(std::string & out, const std::vector<std::string> & strs) {
+    out.push_back('[');
+    for (size_t i = 0; i < strs.size(); ++i) {
+        if (i > 0) out.push_back(',');
+        append_json_string(out, strs[i]);
+    }
+    out.push_back(']');
+}
+
 std::string common_peg_arena::save() const {
-    return to_json().dump();
+    std::string out;
+    out.reserve(parsers_.size() * 64 + rules_.size() * 32 + 64);
+    out += "{\"parsers\":[";
+    for (size_t i = 0; i < parsers_.size(); ++i) {
+        if (i > 0) out.push_back(',');
+        std::visit([&](const auto & p) {
+            using T = std::decay_t<decltype(p)>;
+            if constexpr (std::is_same_v<T, common_peg_epsilon_parser>) {
+                out += "{\"type\":\"epsilon\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_start_parser>) {
+                out += "{\"type\":\"start\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_end_parser>) {
+                out += "{\"type\":\"end\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_literal_parser>) {
+                out += "{\"literal\":";
+                append_json_string(out, p.literal);
+                out += ",\"type\":\"literal\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_sequence_parser>) {
+                out += "{\"children\":";
+                append_id_array(out, p.children);
+                out += ",\"type\":\"sequence\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_choice_parser>) {
+                out += "{\"children\":";
+                append_id_array(out, p.children);
+                out += ",\"type\":\"choice\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_repetition_parser>) {
+                out += "{\"child\":";
+                out += std::to_string(p.child);
+                out += ",\"max_count\":";
+                out += std::to_string(p.max_count);
+                out += ",\"min_count\":";
+                out += std::to_string(p.min_count);
+                out += ",\"type\":\"repetition\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_and_parser>) {
+                out += "{\"child\":";
+                out += std::to_string(p.child);
+                out += ",\"type\":\"and\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_not_parser>) {
+                out += "{\"child\":";
+                out += std::to_string(p.child);
+                out += ",\"type\":\"not\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_any_parser>) {
+                out += "{\"type\":\"any\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_space_parser>) {
+                out += "{\"type\":\"space\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_chars_parser>) {
+                out += "{\"max_count\":";
+                out += std::to_string(p.max_count);
+                out += ",\"min_count\":";
+                out += std::to_string(p.min_count);
+                out += ",\"negated\":";
+                out += p.negated ? "true" : "false";
+                out += ",\"pattern\":";
+                append_json_string(out, p.pattern);
+                out += ",\"ranges\":[";
+                for (size_t r = 0; r < p.ranges.size(); ++r) {
+                    if (r > 0) out.push_back(',');
+                    out += "{\"end\":";
+                    out += std::to_string(p.ranges[r].end);
+                    out += ",\"start\":";
+                    out += std::to_string(p.ranges[r].start);
+                    out.push_back('}');
+                }
+                out += "],\"type\":\"chars\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_string_parser>) {
+                out += "{\"delimiter\":";
+                append_json_string(out, std::string(1, p.delimiter));
+                out += ",\"type\":\"string\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_until_parser>) {
+                out += "{\"delimiters\":";
+                append_string_array(out, p.delimiters);
+                out += ",\"type\":\"until\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_schema_parser>) {
+                out += "{\"child\":";
+                out += std::to_string(p.child);
+                out += ",\"name\":";
+                append_json_string(out, p.name);
+                out += ",\"raw\":";
+                out += p.raw ? "true" : "false";
+                out += ",\"type\":\"schema\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_rule_parser>) {
+                out += "{\"child\":";
+                out += std::to_string(p.child);
+                out += ",\"name\":";
+                append_json_string(out, p.name);
+                out += ",\"trigger\":";
+                out += p.trigger ? "true" : "false";
+                out += ",\"type\":\"rule\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_ref_parser>) {
+                out += "{\"name\":";
+                append_json_string(out, p.name);
+                out += ",\"type\":\"ref\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_atomic_parser>) {
+                out += "{\"child\":";
+                out += std::to_string(p.child);
+                out += ",\"type\":\"atomic\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_tag_parser>) {
+                out += "{\"child\":";
+                out += std::to_string(p.child);
+                out += ",\"tag\":";
+                append_json_string(out, p.tag);
+                out += ",\"type\":\"tag\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_gbnf_parser>) {
+                out += "{\"child\":";
+                out += std::to_string(p.child);
+                out += ",\"grammar\":";
+                append_json_string(out, p.grammar);
+                out += ",\"type\":\"gbnf\"}";
+            } else if constexpr (std::is_same_v<T, common_peg_ac_parser>) {
+                out += "{\"child\":";
+                out += std::to_string(p.child);
+                out += ",\"delimiters\":";
+                append_string_array(out, p.delimiters);
+                out += ",\"type\":\"ac\"}";
+            }
+        }, parsers_[i]);
+    }
+    out += "],\"root\":";
+    out += std::to_string(root_);
+    out += ",\"rules\":{";
+    std::vector<std::pair<std::string_view, common_peg_parser_id>> sorted_rules;
+    sorted_rules.reserve(rules_.size());
+    for (const auto & [name, id] : rules_) {
+        sorted_rules.emplace_back(name, id);
+    }
+    std::sort(sorted_rules.begin(), sorted_rules.end(), [](const auto & a, const auto & b) {
+        return a.first < b.first;
+    });
+    for (size_t i = 0; i < sorted_rules.size(); ++i) {
+        if (i > 0) out.push_back(',');
+        append_json_string(out, std::string(sorted_rules[i].first));
+        out.push_back(':');
+        out += std::to_string(sorted_rules[i].second);
+    }
+    out += "}}";
+    return out;
 }
 
 void common_peg_arena::load(const std::string & data) {

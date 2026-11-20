@@ -5,10 +5,9 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import magnitude_fixtures
 import psutil
 import pytest
-from bench_support import TREE, character_lengths
+from bench_support import TREE, body_length, character_lengths, template_paths
 from magnitude_bench import report, runner
 from magnitude_bench.adapters.base import Adapter
 from magnitude_bench.adapters.llama_cpp import LlamaCpp
@@ -52,27 +51,25 @@ def fake_harness(tmp_path):
 
 
 @pytest.fixture
-def fake_runtime(monkeypatch, fixtures):
+def fake_runtime(monkeypatch):
     # Test runs may overlap (other checkouts' suites); the machine lock guards real runs only.
     monkeypatch.setattr(runner, "machine_lock", contextlib.nullcontext)
-    monkeypatch.setattr(magnitude_fixtures, "build", lambda mode, count: fixtures[:count])
     monkeypatch.setitem(runner.ADAPTERS, "mlx-vlm", FixtureAdapter)
 
 
-def measure(tmp_path, acquisition, artifacts, reference, sections=("single", "parallel"),
+def measure(tmp_path, acquisition, artifacts, reference, sections=("context", "parallel"),
             options=None):
     target = Target(engine="mlx-vlm", reference=str(reference))
     return runner.run(
         RunStore(tmp_path / "run"),
-        "tools",
+        template_paths(tmp_path / "templates", 2),
         [target],
         sections,
-        (1500,),
         acquisition,
         artifacts,
         BUILD,
         options or EngineOptions(inference=TREE),
-        ["magnitude-bench", "job", "--mode", "tools"],
+        ["magnitude-bench", "job", "--template", "tools-2k.json"],
         lambda _: None,
     )
 
@@ -82,7 +79,7 @@ async def test_real_process_full_run_and_contract_record(
 ):
     result = await measure(tmp_path, acquisition, artifacts, artifact_path)
     assert result["status"] == "completed", result
-    # single + four parallel requests, on each of the two balanced passes
+    # one context request + four parallel requests, on each of the two balanced passes
     assert result["completed"] == result["planned"] == 10
     path = Path(result["path"])
     assert "Serving bench" in (path / "report.md").read_text()
@@ -90,19 +87,21 @@ async def test_real_process_full_run_and_contract_record(
     assert record["schema"] == "evaluation-result/1" and record["tool"] == "bench"
     assert record["build"] == BUILD and record["model"] == acquisition.model
     assert record["artifacts"] == json.loads(artifacts.read_text())
-    fixture_set = record["fixture_set"]
-    assert (path / fixture_set["path"]).is_file() and len(fixture_set["digest"]) == 64
+    (template,) = record["templates"]
+    assert template["template"] == "tools:2k" and template["context"] == 2048
+    assert (path / template["path"]).is_file() and len(template["digest"]) == 64
     assert record["rendered_digest"] is None  # Sized by a comparison engine's own counter.
     serving = record["measurements"]["serving"]
     assert len(serving) == 10 and all(row["valid"] for row in serving)
     parallel = next(row for row in serving if row["section"] == "parallel")
-    assert parallel["context"] == 1500 and parallel["concurrency"] == 4
+    assert parallel["context"] == 2048 and parallel["concurrency"] == 4
+    assert parallel["template"] == "tools:2k" and parallel["prompt_sha256"] is None
     assert parallel["prefill_tps"] == 500 and parallel["decode_tps"] == 100
     assert parallel["draft_n"] == 3 and parallel["draft_n_accepted"] == 2
     assert "drafting" not in record["measurements"] and "tuning" not in record["measurements"]
     requests = [json.loads(line) for line in (path / "requests.jsonl").read_text().splitlines()]
     sized = next(r for r in requests if r["section"] == "parallel")
-    assert character_lengths_of(sized) < 1500  # The serving prompt stops before the answer.
+    assert character_lengths_of(sized) < 2048  # The serving prompt stops before the answer.
     counts = json.loads((path / "mlx-vlm-prompt-counts.json").read_text())
     assert set(counts) == {r["id"] for r in requests}
     events = [json.loads(line) for line in (path / "events.jsonl").read_text().splitlines()]
@@ -127,8 +126,8 @@ async def test_gguf_engines_are_sized_and_counted_by_the_harness(
         lambda target, store: _artifact(acquisition),
     )
     result = await runner.run(
-        RunStore(tmp_path / "run"), "tools", [target], ("context",), (1500,), acquisition,
-        artifacts, BUILD, EngineOptions(inference=TREE, magnitude=MagnitudeOptions.of(TREE, harness=fake_harness)),
+        RunStore(tmp_path / "run"), template_paths(tmp_path / "templates", 2, 4), [target],
+        ("context",), acquisition, artifacts, BUILD, EngineOptions(inference=TREE, magnitude=MagnitudeOptions.of(TREE, harness=fake_harness)),
         ["magnitude-bench"], lambda _: None,
     )
     assert result["status"] == "completed", result
@@ -140,10 +139,13 @@ async def test_gguf_engines_are_sized_and_counted_by_the_harness(
     assert len(record["rendered_digest"]) == 64
     counts = json.loads((path / "llama.cpp-prompt-counts.json").read_text())
     requests = [json.loads(line) for line in (path / "requests.jsonl").read_text().splitlines()]
-    assert counts == {
-        r["id"]: len(json.dumps({"messages": r["messages"], "tools": r["tools"]}))
-        for r in requests
-    }
+    assert counts == {r["id"]: body_length(r["messages"], r["tools"]) for r in requests}
+    # Every lane is sized as the harness sized it, and carries its rendered digest.
+    rendered = {(line["template"], line["lane"]): line for line in
+                map(json.loads, (path / "rendered" / "rendered.jsonl").read_text().splitlines())}
+    assert {r["template"] for r in requests} == {"tools:2k", "tools:4k"}
+    assert all(r["prompt_sha256"] == rendered[(r["template"], r["lane"])]["prompt_sha256"]
+               for r in requests)
 
 
 async def _artifact(acquisition):
@@ -217,7 +219,8 @@ def test_reports_exclude_truncation_but_keep_context_semantic_invalidity():
             "phase": "measured",
             "target": "test",
             "section": section,
-            "family": "tools",
+            "template": "tools:1k",
+            "key": "tools",
             "checkpoint": 1024,
             "timing_basis": "native-model-service",
             "observation": Observation(
@@ -283,7 +286,7 @@ def test_the_expert_bank_is_followed_over_each_pass():
                     "resizes": {"experts": {"Grew": 1, "Shrank": 1}, "host": {"Grew": 1},
                                 "table 0": {"Grew": 1}},
                     "latest_resize": {"holding": "table 0", **table}}
-    shown = report.markdown({**report.summarize([], "completed", "c", "id", 0), "mode": "tools",
+    shown = report.markdown({**report.summarize([], "completed", "c", "id", 0), "key": "tools",
                              "expert_banks": [bank]})
     assert ("| magnitude | block-0 | 64 → 80 | 64–96 | 26 | 256 | experts Grew 1, Shrank 1; host Grew 1; "
             "table 0 Grew 1 | table 0 Grew 2 → 3 |") in shown
@@ -356,7 +359,8 @@ def test_report_separates_concurrency_points():
             "phase": "measured",
             "target": "test",
             "section": "concurrency",
-            "family": "tools",
+            "template": "tools:1k",
+            "key": "tools",
             "checkpoint": 1024,
             "concurrency": n,
             "timing_basis": "native-model-service",

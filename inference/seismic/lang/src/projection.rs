@@ -3158,7 +3158,7 @@ mod tests {
             let path = file.expect("a directory entry").path();
             if path.extension().is_some_and(|extension| extension == "seismic") {
                 let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-                let file = crate::syntax::parse(&text, &BTreeMap::new())
+                let file = crate::syntax::parse(&text, &BTreeMap::new(), &BTreeMap::new())
                     .unwrap_or_else(|error| panic!("{}: {error:?}", path.display()));
                 decls.extend(file.decls);
             }

@@ -48,7 +48,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 static NEXT_NATIVE_GRAPH: AtomicU64 = AtomicU64::new(1);
-const INPUT_NODE: u32 = u32::MAX;
+pub const INPUT_NODE: u32 = u32::MAX;
+const _: () = assert!(BUFFER_ALIGNMENT == seismic_memory::BUFFER_ALIGNMENT);
 
 /// Host heap a structure holds: the bytes it asked the allocator for and in
 /// how many allocations. The allocator's own rounding and bookkeeping of
@@ -267,6 +268,26 @@ fn add_port(identity: u64, ports: &mut Vec<PortSpec>, spec: PortSpec) -> NativeP
     }
 }
 
+/// Construct a [`NativePort`] handle for graph `workflow` and port ordinal `result`.
+pub fn make_native_port(workflow: u64, result: u32) -> NativePort {
+    NativePort {
+        reference: WorkflowResultRef {
+            workflow,
+            node: INPUT_NODE,
+            result,
+        },
+    }
+}
+
+/// Construct a [`NativeTimelinePort`] handle for graph `workflow` and timeline ordinal `ordinal`.
+pub fn make_timeline_port<R: TimelineRole>(workflow: u64, ordinal: u32) -> NativeTimelinePort<R> {
+    NativeTimelinePort {
+        workflow,
+        ordinal,
+        role: PhantomData,
+    }
+}
+
 /// Add a timeline node of kind `N` after the `nodes` enqueued so far.
 fn add_timeline<N: TimelineNodeKind>(
     identity: u64,
@@ -415,8 +436,9 @@ fn emission_word(rows: bool, formed: bool, nvfp4: bool) -> u64 {
 pub struct OperandCarry {
     /// F32 `[ROWS, WIDTH]`: the formed rows.
     pub rows: NativePort,
-    /// U32 words `[ROWS, ceil(WIDTH / Q8_VALUES) * OPERAND_CARRY_BLOCK_WORDS]`:
-    /// the rows' Q8 blocks.
+    /// U32 words `[q_rows, ceil(WIDTH / Q8_VALUES) * OPERAND_CARRY_BLOCK_WORDS]`:
+    /// the rows' Q8 blocks, where `q_rows` is `ROWS` rounded up to the
+    /// backend's Q8 row tile ([`operand_carry_row_tile`]).
     pub quantized: NativePort,
     /// The activation element both sides bind
     /// ([`super::OPERAND_ACTIVATION`]), which the rows are rounded to.
@@ -426,20 +448,50 @@ pub struct OperandCarry {
 /// The u32 words of one Q8 block (`cpu::CPU_Q8_BYTES`) in a carry's
 /// `quantized` port: its blocks are opaque words, as a call's scratch is
 /// bytes.
-pub const OPERAND_CARRY_BLOCK_WORDS: u64 = seismic_lang::cpu::CPU_Q8_BYTES / 4;
+const OPERAND_CARRY_BLOCK_WORDS: u64 = seismic_lang::cpu::CPU_Q8_BYTES / 4;
 const _: () = assert!(seismic_lang::cpu::CPU_Q8_BYTES % 4 == 0, "a Q8 block is whole u32 words");
 
+/// The row tile alignment of a backend's carried Q8 operand buffer: CPU
+/// tiled projections size their Q8 scratch in whole `CPU_Q8_ROWS` strips,
+/// while GPU backends do not tile CPU Q8 blocks.
+pub fn operand_carry_row_tile(backend: BackendName) -> u64 {
+    match backend {
+        BackendName::Cpu => seismic_lang::cpu::CPU_Q8_ROWS,
+        BackendName::Metal | BackendName::Cuda | BackendName::Vulkan => 1,
+    }
+}
+
+/// An extent of an operand carry's ports: concrete (`u64`) in the runtime,
+/// or symbolic (`Dim`) in metadata templates.
+pub trait CarryExtent: Clone {
+    /// `ceil(self / divisor) * factor`.
+    fn ceil_div_mul(&self, divisor: u64, factor: u64) -> Self;
+}
+
+impl CarryExtent for u64 {
+    fn ceil_div_mul(&self, divisor: u64, factor: u64) -> Self {
+        self.div_ceil(divisor) * factor
+    }
+}
+
 /// The representation and extents of each port of a carry of `rows` rows of
-/// `width` values: its rows, then its Q8 blocks ([`OperandCarry`]).
-pub fn operand_carry_ports(rows: u64, width: u64) -> [(RepresentationId, [u64; 2]); 2] {
+/// `width` values on `backend`: its rows, then its Q8 blocks
+/// ([`OperandCarry`]). Generic over concrete (`u64`) and symbolic (`Dim`)
+/// extents so runtime graphs, carry allocation, validation, and metadata
+/// templates all share one owner.
+pub fn operand_carry_ports<D: CarryExtent>(
+    backend: BackendName,
+    rows: D,
+    width: D,
+) -> [(RepresentationId, [D; 2]); 2] {
     let representation =
         |name| seismic_lang::registry::representation(name).expect("the registry holds every dense dtype");
+    let tile = operand_carry_row_tile(backend);
+    let quantized_rows = if tile == 1 { rows.clone() } else { rows.ceil_div_mul(tile, tile) };
+    let quantized_cols = width.ceil_div_mul(seismic_lang::cpu::CPU_Q8_VALUES, OPERAND_CARRY_BLOCK_WORDS);
     [
         (representation("f32"), [rows, width]),
-        (
-            representation("u32"),
-            [rows, width.div_ceil(seismic_lang::cpu::CPU_Q8_VALUES) * OPERAND_CARRY_BLOCK_WORDS],
-        ),
+        (representation("u32"), [quantized_rows, quantized_cols]),
     ]
 }
 
@@ -453,11 +505,12 @@ struct Carry<F = ()> {
     quantized: u32,
     forms: F,
     activation: RepresentationId,
-    side: CarrySide,
+    side: OperandCarrySide,
 }
 
+/// One end of an operand carry ([`OperandCarrySpec`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CarrySide {
+pub enum OperandCarrySide {
     /// The node producing `result` emits its normed operand into the ports.
     Out { result: WorkflowResultRef },
     /// Each consumer of port `hidden`'s whole tensor whose operand is
@@ -478,6 +531,7 @@ enum CarryEnd {
 /// names; a carried out result is one of its nodes', carried out once; a
 /// carried in tensor and norm are its ports.
 fn add_carry<F>(
+    backend: BackendName,
     identity: u64,
     ports: &[PortSpec],
     nodes: usize,
@@ -500,10 +554,10 @@ fn add_carry<F>(
             if result.workflow != identity || result.node == INPUT_NODE || result.node as usize >= nodes {
                 return Err(WorkflowError::CrossWorkflowResult);
             }
-            if carries.iter().any(|other| other.side == CarrySide::Out { result }) {
+            if carries.iter().any(|other| other.side == OperandCarrySide::Out { result }) {
                 return Err(WorkflowError::OperandEmitter { node: result.node as usize });
             }
-            CarrySide::Out { result }
+            OperandCarrySide::Out { result }
         }
         CarryEnd::In { hidden, norm, epsilon } => {
             if !own(hidden) || !own(norm) {
@@ -512,12 +566,12 @@ fn add_carry<F>(
             if [hidden, norm].iter().any(|port| *port == carry.rows || *port == carry.quantized) {
                 return Err(mismatch(hidden));
             }
-            CarrySide::In { hidden: hidden.reference.result, norm: norm.reference.result, epsilon: epsilon.to_bits() }
+            OperandCarrySide::In { hidden: hidden.reference.result, norm: norm.reference.result, epsilon: epsilon.to_bits() }
         }
     };
     let rows = &ports[carry.rows.reference.result as usize];
     let [rows_port, quantized_port] = match rows.extents[..] {
-        [count, width] => operand_carry_ports(count, width),
+        [count, width] => operand_carry_ports(backend, count, width),
         _ => return Err(mismatch(carry.rows)),
     };
     for (port, (representation, extents)) in [(carry.rows, rows_port), (carry.quantized, quantized_port)] {
@@ -808,6 +862,11 @@ impl NativeGraphDraft {
         )
     }
 
+    /// The backend of the device this graph drafts for.
+    pub fn backend(&self) -> BackendName {
+        super::backend_name(&self.device.kind)
+    }
+
     /// Declare a carry of `rows` rows of `width` values, its rows rounded
     /// to `activation`: two external ports of the shapes
     /// [`operand_carry_ports`] gives, which each run binds.
@@ -817,7 +876,8 @@ impl NativeGraphDraft {
         width: u64,
         activation: RepresentationId,
     ) -> Result<OperandCarry, TensorError> {
-        let [(rows_element, rows_extents), (quantized_element, quantized_extents)] = operand_carry_ports(rows, width);
+        let [(rows_element, rows_extents), (quantized_element, quantized_extents)] =
+            operand_carry_ports(self.backend(), rows, width);
         Ok(OperandCarry {
             rows: self.port(rows_element, &rows_extents)?,
             quantized: self.port(quantized_element, &quantized_extents)?,
@@ -834,7 +894,7 @@ impl NativeGraphDraft {
         carry: &OperandCarry,
         forms: OperandForms,
     ) -> Result<(), WorkflowError> {
-        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, forms, CarryEnd::Out(result))
+        add_carry(self.backend(), self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, forms, CarryEnd::Out(result))
     }
 
     /// Each consumer of `hidden`'s whole tensor whose operand is normed by
@@ -851,7 +911,7 @@ impl NativeGraphDraft {
         epsilon: f32,
     ) -> Result<(), WorkflowError> {
         let end = CarryEnd::In { hidden, norm, epsilon };
-        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, forms, end)
+        add_carry(self.backend(), self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, forms, end)
     }
 
     /// Seal the graph as a plan whose runs replay graphs: on CUDA graphs
@@ -879,7 +939,7 @@ impl NativeGraphDraft {
         validate_park(&self.timelines, self.nodes.len(), false).map_err(CallError::Workflow)?;
         validate_used_ports(
             self.ports.len(),
-            self.nodes.iter().map(|node| &node.args),
+            self.nodes.iter().map(|node| (&node.args, node.condition.map(|condition| condition.port.reference.result))),
             &self.exports,
             &self.stores,
             &self.carries,
@@ -1048,6 +1108,9 @@ pub struct NativeGraphMetadataDraft {
     carries: Vec<Carry>,
     timelines: Vec<(usize, TimelineNode)>,
     marks: Vec<usize>,
+    /// Per node on CUDA, the active-launch bound at its enqueued dimensions
+    /// (`cuda_recorded_census`), empty on other backends.
+    cuda_launches: Vec<u64>,
 }
 
 /// A Seismic placement for a dominating graph class. Exact graphs with the
@@ -1329,6 +1392,126 @@ impl PlanShape {
 /// binds it (`graph_segments`), or on CUDA the nodes of it a graph holds
 /// instead (`cuda::timeline_nodes`). Every run of the plan, on any slot or
 /// place, replays these graphs.
+/// What recording one run of a graph of `(arguments, words, launches)` nodes
+/// and `timelines` takes at most on `backend` (exact match with
+/// [`SealedNodeShape::of`] + [`recorded_census`]).
+pub fn recorded_census_of(
+    backend: BackendName,
+    nodes: &[(usize, usize, usize)],
+    timelines: &[TimelineNode],
+) -> GraphCensus {
+    let mut shapes = nodes.iter().map(|&(arguments, words, launches)| {
+        let launch_arguments = argument_bytes(backend, arguments as u64, 8 * words as u64);
+        (0..launches)
+            .map(|_| GraphCensus::launch(launch_arguments))
+            .try_fold(GraphCensus::default(), GraphCensus::plus)
+            .expect("a node's launch census fits u64")
+    });
+    let launches = shapes
+        .try_fold(GraphCensus::default(), GraphCensus::plus)
+        .expect("a graph's launch census fits u64");
+    let (graphs, held) = match backend {
+        BackendName::Cuda => (0, timelines.iter().map(|&node| super::cuda::timeline_nodes(node)).sum()),
+        BackendName::Vulkan | BackendName::Metal | BackendName::Cpu => (timelines.len() as u64, 0),
+    };
+    GraphCensus { graphs: 1 + graphs, launches: launches.launches + held, ..launches }
+}
+
+/// Per-node sealed vector lengths needed to compute a plan's [`HostHeap`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanHeapNode {
+    pub buffers: usize,
+    pub arguments: usize,
+    pub words: usize,
+    pub launches: usize,
+}
+
+/// The host heap of a plan sealed from a topology of these vector lengths
+/// (`NativeGraphPlan::host_heap`, single owner shared by
+/// `NativeGraphMetadataDraft::plan_heap` and `SizingDraft`).
+pub fn plan_heap_of(
+    port_ranks: &[usize],
+    nodes: &[PlanHeapNode],
+    result_ranks: &[&[Option<usize>]],
+    exports: usize,
+    timelines: usize,
+    marks: usize,
+) -> HostHeap {
+    use std::mem::size_of;
+    let mut heap = HostHeap::default();
+    heap.hold(1, SHARED_PLAN_BYTES);
+    heap.hold(port_ranks.len(), size_of::<PortSpec>());
+    for &rank in port_ranks {
+        heap.hold(rank, size_of::<u64>());
+        heap.hold(rank, size_of::<u64>());
+    }
+    heap.hold(nodes.len(), size_of::<SealedNode>());
+    // `Executable::external_writes` and `port_uses`.
+    heap.hold(port_ranks.len(), size_of::<bool>());
+    heap.hold(port_ranks.len(), size_of::<PortUse>());
+    heap.hold(timelines, size_of::<(usize, TimelineNode)>());
+    heap.hold(marks, size_of::<usize>());
+    for shape in nodes {
+        heap.hold(shape.buffers, size_of::<Site>());
+        heap.hold(shape.arguments, size_of::<&'static str>());
+        heap.hold(shape.words, size_of::<u64>());
+        heap.hold(shape.launches, size_of::<Option<LaunchGeometry>>());
+    }
+    heap.hold(
+        result_ranks.len(),
+        size_of::<Vec<Option<NativeTensorSpec>>>(),
+    );
+    heap.hold(result_ranks.len(), size_of::<Vec<Placement>>());
+    for row in result_ranks {
+        heap.hold(row.len(), size_of::<Option<NativeTensorSpec>>());
+        heap.hold(row.len(), size_of::<Placement>());
+        for &rank in row.iter().flatten() {
+            heap.hold(rank, size_of::<u64>());
+            heap.hold(rank, size_of::<u64>());
+        }
+    }
+    heap.hold(exports, size_of::<WorkflowResultRef>());
+    heap.hold(port_ranks.len(), size_of::<Option<Placement>>());
+    heap
+}
+
+fn cuda_recorded_census_sum(
+    nodes: usize,
+    launches: u64,
+    timelines: &[(usize, TimelineNode)],
+    marks: &[usize],
+) -> GraphCensus {
+    let timelines = timelines
+        .iter()
+        .filter(|(position, _)| (1..nodes).contains(position))
+        .map(|&(_, node)| super::cuda::timeline_nodes(node))
+        .sum::<u64>();
+    let held_marks = marks
+        .iter()
+        .filter(|mark| (1..nodes).contains(mark))
+        .count() as u64;
+    GraphCensus {
+        graphs: u64::from(nodes > 0),
+        launches: launches + held_marks + timelines,
+        arguments: 0,
+        largest: 0,
+    }
+}
+
+/// What recording one run of a CUDA graph takes: one graph when `nodes > 0`,
+/// with a node for each active launch in `node_launches`, each span mark
+/// inside `(1..nodes)`, and the nodes of each timeline node inside `(1..nodes)`
+/// (`cuda::timeline_nodes`), matching [`NativeGraphPlan::run_graphs`] exactly.
+pub fn cuda_recorded_census(
+    nodes: usize,
+    node_launches: &[u64],
+    timelines: &[(usize, TimelineNode)],
+    marks: &[usize],
+) -> GraphCensus {
+    let launches = node_launches.iter().copied().sum::<u64>();
+    cuda_recorded_census_sum(nodes, launches, timelines, marks)
+}
+
 fn recorded_census(shapes: impl IntoIterator<Item = GraphCensus>, timelines: &[(usize, TimelineNode)], backend: BackendName) -> GraphCensus {
     let launches = shapes
         .into_iter()
@@ -1357,6 +1540,7 @@ impl NativeGraphMetadataDraft {
             carries: Vec::new(),
             timelines: Vec::new(),
             marks: Vec::new(),
+            cuda_launches: Vec::new(),
         }
     }
 
@@ -1378,42 +1562,47 @@ impl NativeGraphMetadataDraft {
     /// plan in its shared allocation, its ports, each node's buffers, words
     /// and launches, the result specs, the exports and the placements.
     pub fn plan_heap(&self) -> HostHeap {
-        use std::mem::size_of;
-        let mut heap = HostHeap::default();
-        heap.hold(1, SHARED_PLAN_BYTES);
-        heap.hold(self.ports.len(), size_of::<PortSpec>());
-        for port in &self.ports {
-            heap.hold(port.extents.len(), size_of::<u64>());
-            heap.hold(port.strides.len(), size_of::<u64>());
-        }
-        heap.hold(self.nodes.len(), size_of::<SealedNode>());
-        // `Executable::external_writes` and `port_uses`.
-        heap.hold(self.ports.len(), size_of::<bool>());
-        heap.hold(self.ports.len(), size_of::<PortUse>());
-        heap.hold(self.timelines.len(), size_of::<(usize, TimelineNode)>());
-        heap.hold(self.marks.len(), size_of::<usize>());
-        for shape in &self.shapes {
-            heap.hold(shape.buffers, size_of::<Site>());
-            heap.hold(shape.arguments, size_of::<&'static str>());
-            heap.hold(shape.words, size_of::<u64>());
-            heap.hold(shape.launches, size_of::<Option<LaunchGeometry>>());
-        }
-        heap.hold(
-            self.results.len(),
-            size_of::<Vec<Option<NativeTensorSpec>>>(),
-        );
-        heap.hold(self.results.len(), size_of::<Vec<Placement>>());
-        for row in &self.results {
-            heap.hold(row.len(), size_of::<Option<NativeTensorSpec>>());
-            heap.hold(row.len(), size_of::<Placement>());
-            for spec in row.iter().flatten() {
-                heap.hold(spec.extents.len(), size_of::<u64>());
-                heap.hold(spec.strides.len(), size_of::<u64>());
-            }
-        }
-        heap.hold(self.exports.len(), size_of::<WorkflowResultRef>());
-        heap.hold(self.ports.len(), size_of::<Option<Placement>>());
-        heap
+        let port_ranks: Vec<usize> = self
+            .ports
+            .iter()
+            .map(|port| {
+                debug_assert_eq!(port.extents.len(), port.strides.len());
+                port.extents.len()
+            })
+            .collect();
+        let nodes: Vec<PlanHeapNode> = self
+            .shapes
+            .iter()
+            .map(|shape| PlanHeapNode {
+                buffers: shape.buffers,
+                arguments: shape.arguments,
+                words: shape.words,
+                launches: shape.launches,
+            })
+            .collect();
+        let result_rows: Vec<Vec<Option<usize>>> = self
+            .results
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|spec| {
+                        spec.as_ref().map(|s| {
+                            debug_assert_eq!(s.extents.len(), s.strides.len());
+                            s.extents.len()
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        let result_slices: Vec<&[Option<usize>]> = result_rows.iter().map(Vec::as_slice).collect();
+        plan_heap_of(
+            &port_ranks,
+            &nodes,
+            &result_slices,
+            self.exports.len(),
+            self.timelines.len(),
+            self.marks.len(),
+        )
     }
 
     pub fn port(
@@ -1453,6 +1642,7 @@ impl NativeGraphMetadataDraft {
         scratch: Vec<ScratchNeed>,
         activation: Option<RepresentationId>,
         shape: SealedNodeShape,
+        cuda_launches: Option<u64>,
     ) -> Result<PendingWorkflowResults, CallError> {
         let node = u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
         validate_node_references(self.identity, self.ports.len(), node, &args)
@@ -1476,6 +1666,9 @@ impl NativeGraphMetadataDraft {
             })
             .collect::<Result<Vec<_>, CallError>>()?;
         let count = u32::try_from(results.len()).expect("native result ordinal exhausted");
+        if self.backend == BackendName::Cuda {
+            self.cuda_launches.push(cuda_launches.unwrap_or(shape.launches as u64));
+        }
         self.nodes.push(PlannedNode { args: Arc::new(args), scratch, activation, condition: None, share: None });
         self.entries.push(entry);
         self.shapes.push(shape);
@@ -1500,10 +1693,11 @@ impl NativeGraphMetadataDraft {
         scratch: Vec<ScratchNeed>,
         activation: Option<RepresentationId>,
         shape: SealedNodeShape,
+        cuda_launches: Option<u64>,
         condition: NodeCondition,
     ) -> Result<PendingWorkflowResults, CallError> {
         let port = condition_port(self.identity, &self.ports, self.nodes.len(), condition).map_err(CallError::Workflow)?;
-        let pending = self.enqueue(entry, args, parameter_shapes, result_shapes, scratch, activation, shape)?;
+        let pending = self.enqueue(entry, args, parameter_shapes, result_shapes, scratch, activation, shape, cuda_launches)?;
         self.nodes.last_mut().expect("the node just enqueued").condition = Some((port, condition.index, condition.encoded));
         Ok(pending)
     }
@@ -1536,7 +1730,7 @@ impl NativeGraphMetadataDraft {
     /// the graph reserves for them is the same in every form
     /// ([`OperandForms`]).
     pub fn carry_out(&mut self, result: WorkflowResultRef, carry: &OperandCarry) -> Result<(), WorkflowError> {
-        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, (), CarryEnd::Out(result))
+        add_carry(self.backend, self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, (), CarryEnd::Out(result))
     }
 
     /// `NativeGraphDraft::carry_in`, in no form.
@@ -1548,7 +1742,7 @@ impl NativeGraphMetadataDraft {
         epsilon: f32,
     ) -> Result<(), WorkflowError> {
         let end = CarryEnd::In { hidden, norm, epsilon };
-        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, (), end)
+        add_carry(self.backend, self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, (), end)
     }
 
     pub fn seal(mut self) -> Result<NativeGraphStorageBytes, WorkflowError> {
@@ -1571,9 +1765,18 @@ impl NativeGraphMetadataDraft {
         })
     }
 
-    /// What recording one run of this graph takes ([`recorded_census`]).
+    /// What recording one run of this graph takes ([`recorded_census`], or
+    /// [`cuda_recorded_census`] on CUDA).
     fn recorded(&self) -> GraphCensus {
-        recorded_census(self.shapes.iter().map(|shape| shape.census), &self.timelines, self.backend)
+        match self.backend {
+            BackendName::Cuda => {
+                debug_assert_eq!(self.cuda_launches.len(), self.nodes.len());
+                cuda_recorded_census(self.nodes.len(), &self.cuda_launches, &self.timelines, &self.marks)
+            }
+            BackendName::Vulkan | BackendName::Metal | BackendName::Cpu => {
+                recorded_census(self.shapes.iter().map(|shape| shape.census), &self.timelines, self.backend)
+            }
+        }
     }
 
     /// Verify an exact checked metadata graph against the storage certificate
@@ -1622,7 +1825,7 @@ impl NativeGraphMetadataDraft {
         }
         validate_used_ports(
             self.ports.len(),
-            self.nodes.iter().map(|node| &*node.args),
+            self.nodes.iter().map(|node| (&*node.args, node.condition.map(|(port, _, _)| port))),
             &self.exports,
             &self.stores,
             &self.carries,
@@ -1732,8 +1935,18 @@ impl ValidatedMetadataDraft {
         ports: &[u64],
         results: &[Vec<u64>],
         scratch: Vec<Vec<ScratchNeed>>,
+        cuda_launches: Option<&[u64]>,
     ) -> Result<NativeGraphLayout, WorkflowError> {
         let (ports, nodes, results) = self.at_capacities(ports, results, scratch)?;
+        let recorded = match cuda_launches {
+            Some(launches) => cuda_recorded_census(
+                self.draft.nodes.len(),
+                launches,
+                &self.draft.timelines,
+                &self.draft.marks,
+            ),
+            None => self.census,
+        };
         Ok(make_layout(
             &ports,
             &nodes,
@@ -1743,7 +1956,7 @@ impl ValidatedMetadataDraft {
             &self.draft.stores,
             self.plan_heap,
             self.draft.timelines.len(),
-            self.census,
+            recorded,
         ))
     }
 
@@ -1755,15 +1968,25 @@ impl ValidatedMetadataDraft {
         ports: &[u64],
         results: &[Vec<u64>],
         scratch: Vec<Vec<ScratchNeed>>,
+        cuda_launches: Option<&[u64]>,
     ) -> Result<NativeGraphStorageBytes, WorkflowError> {
         let (ports, nodes, results) = self.at_capacities(ports, results, scratch)?;
         let storage = plan_storage(&ports, &nodes, &self.links, &results, &self.draft.exports, &self.draft.stores);
+        let recorded = match cuda_launches {
+            Some(launches) => cuda_recorded_census(
+                self.draft.nodes.len(),
+                launches,
+                &self.draft.timelines,
+                &self.draft.marks,
+            ),
+            None => self.census,
+        };
         Ok(NativeGraphStorageBytes {
             workspace: storage.scratch_bytes,
             sync: storage.sync_bytes,
             output: storage.output_bytes,
             upload: storage.upload_bytes,
-            recorded: self.census,
+            recorded,
         })
     }
 
@@ -2052,17 +2275,21 @@ fn validate_export_reference(
     Ok(())
 }
 
-/// Every port is used: by a node's argument, an export, a store or a carry.
-/// A carry's ports are its alone: no node, export or store names them.
+/// Every port is used: by a node's argument or condition (the port whose
+/// word its launches are encoded under), an export, a store or a carry. A
+/// carry's ports are its alone: no node, export or store names them.
 fn validate_used_ports<'a, F>(
     port_count: usize,
-    nodes: impl Iterator<Item = &'a EncodedWorkflowArgs>,
+    nodes: impl Iterator<Item = (&'a EncodedWorkflowArgs, Option<u32>)>,
     exports: &[WorkflowResultRef],
     stores: &[Store],
     carries: &[Carry<F>],
 ) -> Result<(), WorkflowError> {
     let mut used = vec![false; port_count];
-    for node in nodes {
+    for (node, condition) in nodes {
+        if let Some(port) = condition {
+            used[port as usize] = true;
+        }
         for argument in node.arguments() {
             if let Some(reference) = argument_reference(argument) {
                 if reference.node == INPUT_NODE {
@@ -2093,7 +2320,7 @@ fn validate_used_ports<'a, F>(
     Ok(())
 }
 
-fn argument_reference(argument: &EncodedWorkflowArgument) -> Option<WorkflowResultRef> {
+pub fn argument_reference(argument: &EncodedWorkflowArgument) -> Option<WorkflowResultRef> {
     match argument {
         EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::Result(reference))
         | EncodedWorkflowArgument::ScalarResult(reference) => Some(*reference),
@@ -2245,6 +2472,23 @@ struct PlannedNode {
     share: Option<(u32, WorkflowResultRef)>,
 }
 
+/// Plain descriptor of one graph node for [`resolve_operand_links`].
+#[derive(Clone, Copy)]
+pub struct OperandNode<'a> {
+    pub args: &'a EncodedWorkflowArgs,
+    pub scratch: &'a [ScratchNeed],
+    pub activation: Option<RepresentationId>,
+}
+
+/// Plain descriptor of one graph carry for [`resolve_operand_links`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperandCarrySpec {
+    pub rows: u32,
+    pub quantized: u32,
+    pub activation: RepresentationId,
+    pub side: OperandCarrySide,
+}
+
 /// One operand pairing (`ScratchOperand`): node `consumer`'s buffer
 /// `formed` holds one form of the operand of a tensor node `producer` writes
 /// whole, whose buffer `emitted` holds that form of that tensor's operand,
@@ -2253,11 +2497,11 @@ struct PlannedNode {
 /// reads it, or forms it over the producer's where the producer's does not
 /// stand for its own (`formations_left_out`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OperandPair {
-    consumer: usize,
-    formed: usize,
-    producer: usize,
-    emitted: usize,
+pub struct OperandPair {
+    pub consumer: usize,
+    pub formed: usize,
+    pub producer: usize,
+    pub emitted: usize,
 }
 
 /// Every operand pairing of `nodes`: each consumer's formed operand whose
@@ -2266,7 +2510,7 @@ struct OperandPair {
 /// each bound to the same norm weight and epsilon. An emitted operand pairs
 /// with its first consumer alone: another consumer's own layout may differ,
 /// so it forms its own.
-fn operand_pairs(nodes: &[PlannedNode]) -> Vec<OperandPair> {
+fn operand_pairs(nodes: &[OperandNode<'_>]) -> Vec<OperandPair> {
     let mut pairs: Vec<OperandPair> = Vec::new();
     for (consumer, node) in nodes.iter().enumerate() {
         for (formed, need) in node.scratch.iter().enumerate() {
@@ -2286,7 +2530,7 @@ fn operand_pairs(nodes: &[PlannedNode]) -> Vec<OperandPair> {
                 Some(ScratchOperand::Emitted { result, rows: emitted_rows, norm: emitted_norm }) => {
                     result == source.result
                         && emitted_rows == rows
-                        && same_norm(&node.args, norm, &nodes[producer].args, emitted_norm)
+                        && same_norm(node.args, norm, nodes[producer].args, emitted_norm)
                 }
                 _ => false,
             });
@@ -2338,11 +2582,11 @@ fn same_norm(
 
 /// Where a graph's operand buffers lie beyond their own node: its in-graph
 /// pairs (`operand_pairs`) and its carried buffers. Its topology decides it
-/// (`operand_links`), every class of a layout alike.
-#[derive(Clone, Debug)]
-struct OperandLinks {
-    pairs: Vec<OperandPair>,
-    carried: Vec<CarriedBuffer>,
+/// ([`resolve_operand_links`]), every class of a layout alike.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperandLinks {
+    pub pairs: Vec<OperandPair>,
+    pub carried: Vec<CarriedBuffer>,
 }
 
 /// Node `node`'s operand buffer `scratch`, which lies on port `port` of
@@ -2350,39 +2594,50 @@ struct OperandLinks {
 /// buffer of a carry out, which the node writes, or a formed one of a carry
 /// in, which it reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CarriedBuffer {
-    node: usize,
-    scratch: usize,
-    port: u32,
-    carry: usize,
+pub struct CarriedBuffer {
+    pub node: usize,
+    pub scratch: usize,
+    pub port: u32,
+    pub carry: usize,
 }
 
 impl OperandLinks {
     /// Whether node `node`'s buffer `scratch` is a consumer's operand its
     /// producer emits: in the graph or through a carry.
-    fn linked(&self, node: usize, scratch: usize) -> bool {
+    pub fn linked(&self, node: usize, scratch: usize) -> bool {
         self.pairs.iter().any(|pair| pair.consumer == node && pair.formed == scratch)
             || self.carried.iter().any(|carried| carried.node == node && carried.scratch == scratch)
     }
 
     /// The carry node `node`'s buffer `scratch` lies on, if any.
-    fn carried(&self, node: usize, scratch: usize) -> Option<&CarriedBuffer> {
+    pub fn carried(&self, node: usize, scratch: usize) -> Option<&CarriedBuffer> {
         self.carried.iter().find(|carried| carried.node == node && carried.scratch == scratch)
     }
 
     /// The buffers node `node` emits an operand into for a consumer: its
     /// paired and carried out ones.
-    fn emitted(&self, node: usize) -> impl Iterator<Item = usize> + '_ {
+    pub fn emitted(&self, node: usize) -> impl Iterator<Item = usize> + '_ {
         let paired = self.pairs.iter().filter(move |pair| pair.producer == node).map(|pair| pair.emitted);
         let carried = self.carried.iter().filter(move |carried| carried.node == node).map(|carried| carried.scratch);
         paired.chain(carried)
     }
+
+    /// Charge `MINIMUM_SCRATCH_BYTES` to every emission scratch buffer of
+    /// `node` whose result is not emitted for any consumer in `self`.
+    pub fn charge_node_emissions(&self, node: usize, scratch: &mut [ScratchNeed]) {
+        let emitted = self
+            .emitted(node)
+            .filter_map(|ordinal| match scratch[ordinal].operand {
+                Some(ScratchOperand::Emitted { result, .. }) => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        charge_emissions(scratch, |result| emitted.contains(&result));
+    }
 }
 
-/// The operand links of `nodes` and `carries`: its in-graph pairs, and each
-/// carry's buffers. A carry's forms `F` decide none of it: a graph links,
-/// and so reserves (`charge_node_emissions`, `plan_storage`), alike in
-/// each.
+/// Resolve the operand links of plain node descriptors `nodes` and carry
+/// descriptors `carries`: its in-graph pairs, and each carry's buffers.
 ///
 /// - A carry out's producer emits both forms of its result's operand under
 ///   a norm, neither paired in the graph (`OperandEmitter` otherwise).
@@ -2393,7 +2648,10 @@ impl OperandLinks {
 ///   (`UnreadOperandCarry` otherwise).
 /// - Every pair's ends bind one activation element, and every carry's ends
 ///   the carry's (`OperandElement` otherwise).
-fn operand_links<F>(nodes: &[PlannedNode], carries: &[Carry<F>]) -> Result<OperandLinks, WorkflowError> {
+pub fn resolve_operand_links(
+    nodes: &[OperandNode<'_>],
+    carries: &[OperandCarrySpec],
+) -> Result<OperandLinks, WorkflowError> {
     let pairs = operand_pairs(nodes);
     if let Some(pair) = pairs.iter().find(|pair| nodes[pair.producer].activation != nodes[pair.consumer].activation) {
         return Err(WorkflowError::OperandElement { node: pair.consumer });
@@ -2403,7 +2661,7 @@ fn operand_links<F>(nodes: &[PlannedNode], carries: &[Carry<F>]) -> Result<Opera
         let port = |rows: bool| if rows { carry.rows } else { carry.quantized };
         let buffer = |node: usize, (scratch, rows): (usize, bool)| CarriedBuffer { node, scratch, port: port(rows), carry: index };
         match carry.side {
-            CarrySide::Out { result } => {
+            OperandCarrySide::Out { result } => {
                 let producer = result.node as usize;
                 let emitted = |rows: bool| {
                     nodes[producer].scratch.iter().position(|need| {
@@ -2428,7 +2686,7 @@ fn operand_links<F>(nodes: &[PlannedNode], carries: &[Carry<F>]) -> Result<Opera
                 }
                 carried.extend([(emitted_rows, true), (emitted_blocks, false)].map(|form| buffer(producer, form)));
             }
-            CarrySide::In { hidden, norm, epsilon } => {
+            OperandCarrySide::In { hidden, norm, epsilon } => {
                 let mut read = false;
                 for (consumer, node) in nodes.iter().enumerate() {
                     let arguments = node.args.arguments();
@@ -2480,6 +2738,29 @@ fn operand_links<F>(nodes: &[PlannedNode], carries: &[Carry<F>]) -> Result<Opera
     Ok(OperandLinks { pairs, carried })
 }
 
+/// The operand links of `nodes` and `carries`: delegates to
+/// [`resolve_operand_links`], ignoring any carry forms `F`.
+fn operand_links<F>(nodes: &[PlannedNode], carries: &[Carry<F>]) -> Result<OperandLinks, WorkflowError> {
+    let node_specs = nodes
+        .iter()
+        .map(|node| OperandNode {
+            args: &node.args,
+            scratch: &node.scratch,
+            activation: node.activation,
+        })
+        .collect::<Vec<_>>();
+    let carry_specs = carries
+        .iter()
+        .map(|carry| OperandCarrySpec {
+            rows: carry.rows,
+            quantized: carry.quantized,
+            activation: carry.activation,
+            side: carry.side,
+        })
+        .collect::<Vec<_>>();
+    resolve_operand_links(&node_specs, &carry_specs)
+}
+
 /// Charge each node of `nodes` the minimum for every buffer serving the
 /// emission of a result it emits no operand of for a consumer (`links`):
 /// unpaired and uncarried producers reserve what a call alone does
@@ -2487,14 +2768,7 @@ fn operand_links<F>(nodes: &[PlannedNode], carries: &[Carry<F>]) -> Result<Opera
 /// layout's capacities bound its classes'.
 fn charge_node_emissions(nodes: &mut [PlannedNode], links: &OperandLinks) {
     for (node, planned) in nodes.iter_mut().enumerate() {
-        let emitted = links
-            .emitted(node)
-            .filter_map(|scratch| match planned.scratch[scratch].operand {
-                Some(ScratchOperand::Emitted { result, .. }) => Some(result),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        charge_emissions(&mut planned.scratch, |result| emitted.contains(&result));
+        links.charge_node_emissions(node, &mut planned.scratch);
     }
 }
 
@@ -3174,8 +3448,9 @@ impl Executable {
     }
 }
 
+/// Where a graph buffer is placed in storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Placement {
+pub enum StoragePlacement {
     Scratch(u64),
     /// Arrival counters in the slot's sync region.
     Sync(u64),
@@ -3188,7 +3463,9 @@ enum Placement {
     Scalar,
 }
 
-impl Placement {
+type Placement = StoragePlacement;
+
+impl StoragePlacement {
     fn site(self) -> (Region, u64) {
         match self {
             Self::Scratch(offset) => (Region::Workspace, offset),
@@ -3201,6 +3478,52 @@ impl Placement {
     }
 }
 
+/// Plain descriptor of one graph port for [`plan_storage_sizes`] and
+/// [`plan_storage_with_links`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoragePort {
+    pub byte_len: u64,
+    pub local: bool,
+    pub owned_input: bool,
+    pub prewritten: bool,
+}
+
+/// Plain descriptor of one graph node for [`plan_storage_sizes`] and
+/// [`plan_storage_with_links`].
+#[derive(Clone, Copy)]
+pub struct StorageNode<'a> {
+    pub args: &'a EncodedWorkflowArgs,
+    pub results: &'a [Option<u64>],
+    pub scratch: &'a [ScratchNeed],
+    pub activation: Option<RepresentationId>,
+    pub share: Option<(u32, WorkflowResultRef)>,
+}
+
+/// Region byte sizes for one slice of a [`CompiledStoragePlan`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageSizes {
+    pub workspace: u64,
+    pub workspace_floor: u64,
+    pub sync: u64,
+    pub output: u64,
+    pub upload: u64,
+}
+
+/// Placed graph storage returned by [`plan_storage_sizes`] and
+/// [`plan_storage_with_links`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedStorage {
+    pub port_placements: Vec<Option<StoragePlacement>>,
+    pub placements: Vec<Vec<StoragePlacement>>,
+    pub node_scratch: Vec<Vec<StoragePlacement>>,
+    pub workspace: u64,
+    pub workspace_floor: u64,
+    pub sync: u64,
+    pub output: u64,
+    pub upload: u64,
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum StorageKey {
     Port(usize),
@@ -3225,6 +3548,7 @@ struct StoragePlan {
     upload_bytes: u64,
 }
 
+#[cfg(test)]
 struct Interval {
     key: StorageKey,
     start: usize,
@@ -3233,6 +3557,7 @@ struct Interval {
     exported: bool,
 }
 
+#[cfg(test)]
 impl Interval {
     /// Whether the two buffers are live at a common step. Endpoints count:
     /// a node's inputs end and its results start at the same step, so they
@@ -3257,6 +3582,334 @@ impl Interval {
     /// consumer (`operand_pairs`). Either lies between the ends.
     fn scratch(&self) -> bool {
         matches!(self.key, StorageKey::NodeScratch(..))
+    }
+}
+
+/// How a workspace or output interval obtains its byte length from a slice's
+/// port, result, and scratch byte sizes.
+#[derive(Clone, Copy, Debug)]
+enum BufferSource {
+    Port(usize),
+    Result(usize, usize),
+    Scratch(usize, usize),
+    PairedScratch {
+        producer: usize,
+        emitted: usize,
+        consumer: usize,
+        formed: usize,
+    },
+}
+
+impl BufferSource {
+    fn bytes(
+        self,
+        port_byte: impl Fn(usize) -> u64,
+        result_byte: impl Fn(usize, usize) -> Option<u64>,
+        scratch_byte: impl Fn(usize, usize) -> u64,
+    ) -> u64 {
+        match self {
+            Self::Port(ordinal) => port_byte(ordinal).max(1),
+            Self::Result(node, ordinal) => result_byte(node, ordinal)
+                .expect("tensor result has byte length")
+                .max(1),
+            Self::Scratch(node, ordinal) => scratch_byte(node, ordinal),
+            Self::PairedScratch {
+                producer,
+                emitted,
+                consumer,
+                formed,
+            } => scratch_byte(producer, emitted).max(scratch_byte(consumer, formed)),
+        }
+    }
+}
+
+struct StructuralInterval {
+    source: BufferSource,
+    start: usize,
+    end: usize,
+    exported: bool,
+}
+
+impl StructuralInterval {
+    fn scratch(&self) -> bool {
+        matches!(
+            self.source,
+            BufferSource::Scratch(..) | BufferSource::PairedScratch { .. }
+        )
+    }
+}
+
+/// Lifetime-only storage classification shared by [`CompiledStoragePlan`] and
+/// [`plan_storage_with_links`]. Every decision here depends strictly on graph
+/// topology, ports, exports, stores, shares, and operand links — never on
+/// slice byte lengths.
+struct StorageTopology {
+    upload_ports: Vec<usize>,
+    sync_scratch: Vec<(usize, usize)>,
+    carried_scratch: Vec<(usize, usize, u32)>,
+    intervals: Vec<StructuralInterval>,
+}
+
+impl StorageTopology {
+    fn of(
+        ports: &[StoragePort],
+        nodes: &[StorageNode<'_>],
+        links: &OperandLinks,
+        exports: &[WorkflowResultRef],
+        stores: &[(WorkflowResultRef, u32)],
+    ) -> Self {
+        let stored = |node: usize, ordinal: usize| {
+            stores
+                .iter()
+                .find(|&&(result, _)| {
+                    result.node as usize == node && result.result as usize == ordinal
+                })
+                .map(|&(_, port)| port as usize)
+        };
+        let mut last_use = nodes
+            .iter()
+            .enumerate()
+            .map(|(node, spec)| vec![node * 2 + 1; spec.results.len()])
+            .collect::<Vec<_>>();
+        let mut port_first = vec![None; ports.len()];
+        let mut port_last = vec![0usize; ports.len()];
+        for (consumer, node) in nodes.iter().enumerate() {
+            for argument in node.args.arguments() {
+                if let Some(reference) = argument_reference(argument) {
+                    if reference.node == INPUT_NODE {
+                        let ordinal = reference.result as usize;
+                        if ports[ordinal].local {
+                            port_first[ordinal].get_or_insert(consumer * 2);
+                            port_last[ordinal] = consumer * 2 + 1;
+                        }
+                    } else {
+                        last_use[reference.node as usize][reference.result as usize] =
+                            consumer * 2 + 1;
+                    }
+                }
+            }
+        }
+        let mut upload_ports = Vec::new();
+        let mut intervals = Vec::new();
+        for (ordinal, port) in ports.iter().enumerate() {
+            if !port.local {
+                continue;
+            }
+            if port.owned_input {
+                upload_ports.push(ordinal);
+                continue;
+            }
+            let exported = exports
+                .iter()
+                .any(|item| item.node == INPUT_NODE && item.result as usize == ordinal);
+            intervals.push(StructuralInterval {
+                source: BufferSource::Port(ordinal),
+                start: if port.prewritten {
+                    0
+                } else {
+                    port_first[ordinal].unwrap_or(0)
+                },
+                end: port_last[ordinal],
+                exported,
+            });
+        }
+        // A result another shares (`NativeGraphDraft::share`) lives from the
+        // first of its writers to its last read and the last writer.
+        let sharers = |node: usize, ordinal: usize| {
+            nodes.iter().enumerate().filter_map(move |(sharer, planned)| {
+                planned
+                    .share
+                    .filter(|(_, primary)| {
+                        primary.node as usize == node && primary.result as usize == ordinal
+                    })
+                    .map(|_| sharer)
+            })
+        };
+        for (node, spec) in nodes.iter().enumerate() {
+            for (ordinal, &bytes) in spec.results.iter().enumerate() {
+                if bytes.is_none() {
+                    continue;
+                }
+                // A stored result lives in its port's tensor, a shared one in
+                // the storage of the result it shares (below).
+                if stored(node, ordinal).is_some()
+                    || spec
+                        .share
+                        .is_some_and(|(shared, _)| shared as usize == ordinal)
+                {
+                    continue;
+                }
+                let exported = exports
+                    .iter()
+                    .any(|item| item.node as usize == node && item.result as usize == ordinal);
+                let writers = std::iter::once(node).chain(sharers(node, ordinal));
+                let (first, last) = writers.fold((node, node), |(first, last), writer| {
+                    (first.min(writer), last.max(writer))
+                });
+                intervals.push(StructuralInterval {
+                    source: BufferSource::Result(node, ordinal),
+                    start: first * 2 + 1,
+                    end: last_use[node][ordinal].max(last * 2 + 1),
+                    exported,
+                });
+            }
+        }
+        let mut sync_scratch = Vec::new();
+        let mut carried_scratch = Vec::new();
+        let pairs = &links.pairs;
+        for (node, planned) in nodes.iter().enumerate() {
+            for (ordinal, need) in planned.scratch.iter().enumerate() {
+                if let Some(carried) = links.carried(node, ordinal) {
+                    carried_scratch.push((node, ordinal, carried.port));
+                    continue;
+                }
+                if pairs
+                    .iter()
+                    .any(|pair| pair.consumer == node && pair.formed == ordinal)
+                {
+                    continue;
+                }
+                if let Some(pair) = pairs
+                    .iter()
+                    .find(|pair| pair.producer == node && pair.emitted == ordinal)
+                {
+                    intervals.push(StructuralInterval {
+                        source: BufferSource::PairedScratch {
+                            producer: node,
+                            emitted: ordinal,
+                            consumer: pair.consumer,
+                            formed: pair.formed,
+                        },
+                        start: node * 2,
+                        end: pair.consumer * 2 + 1,
+                        exported: false,
+                    });
+                    continue;
+                }
+                if need.sync {
+                    sync_scratch.push((node, ordinal));
+                    continue;
+                }
+                intervals.push(StructuralInterval {
+                    source: BufferSource::Scratch(node, ordinal),
+                    start: node * 2,
+                    end: node * 2 + 1,
+                    exported: false,
+                });
+            }
+        }
+        intervals.sort_by_key(|interval| interval.start);
+        Self {
+            upload_ports,
+            sync_scratch,
+            carried_scratch,
+            intervals,
+        }
+    }
+}
+
+/// Precompiled lifetime analysis and R_b placement structure for one graph
+/// topology, reusable across slices with varying tensor and scratch byte
+/// lengths ([`Self::storage_bytes`]).
+#[derive(Clone, Debug)]
+pub struct CompiledStoragePlan {
+    upload_ports: Vec<usize>,
+    sync_scratch: Vec<(usize, usize)>,
+    output_sources: Vec<BufferSource>,
+    workspace_sources: Vec<BufferSource>,
+    placement: seismic_memory::placement::CompiledPlacement,
+}
+
+impl CompiledStoragePlan {
+    /// Precompile lifetime analysis, region assignments, and R_b colouring
+    /// once from the graph's structural topology.
+    pub fn of(
+        ports: &[StoragePort],
+        nodes: &[StorageNode<'_>],
+        links: &OperandLinks,
+        exports: &[WorkflowResultRef],
+        stores: &[(WorkflowResultRef, u32)],
+    ) -> Self {
+        let topology = StorageTopology::of(ports, nodes, links, exports, stores);
+        let mut output_sources = Vec::new();
+        let mut workspace_sources = Vec::new();
+        let mut spans = Vec::new();
+        let mut scratch = Vec::new();
+        for interval in topology.intervals {
+            if interval.exported {
+                output_sources.push(interval.source);
+            } else {
+                scratch.push(interval.scratch());
+                spans.push(seismic_memory::placement::Span {
+                    start: interval.start,
+                    end: interval.end,
+                });
+                workspace_sources.push(interval.source);
+            }
+        }
+        let placement = seismic_memory::placement::CompiledPlacement::of(&spans, &scratch);
+        Self {
+            upload_ports: topology.upload_ports,
+            sync_scratch: topology.sync_scratch,
+            output_sources,
+            workspace_sources,
+            placement,
+        }
+    }
+
+    /// Compute exact region byte sizes for one slice's byte lengths,
+    /// bit-for-bit identical to [`plan_storage_with_links`].
+    pub fn storage_bytes(
+        &self,
+        port_bytes: &[u64],
+        result_bytes: &[Vec<Option<u64>>],
+        scratch_needs: &[Vec<ScratchNeed>],
+    ) -> StorageSizes {
+        let mut upload = 0u64;
+        for &ordinal in &self.upload_ports {
+            let offset = align_up(upload, BUFFER_ALIGNMENT);
+            upload = offset
+                .checked_add(port_bytes[ordinal].max(1))
+                .expect("native graph upload bytes overflow");
+        }
+
+        let mut sync = 0u64;
+        for &(node, ordinal) in &self.sync_scratch {
+            let offset = sync.next_multiple_of(BUFFER_ALIGNMENT);
+            sync = offset + scratch_needs[node][ordinal].bytes.max(MINIMUM_SCRATCH_BYTES);
+        }
+
+        let port_byte = |ordinal: usize| port_bytes[ordinal];
+        let result_byte = |node: usize, ordinal: usize| result_bytes[node][ordinal];
+        let scratch_byte = |node: usize, ordinal: usize| scratch_needs[node][ordinal].bytes;
+
+        let mut output = 0u64;
+        for &source in &self.output_sources {
+            let offset = align_up(output, BUFFER_ALIGNMENT);
+            output = offset
+                .checked_add(source.bytes(port_byte, result_byte, scratch_byte))
+                .expect("native graph output bytes overflow");
+        }
+
+        let raw_bytes: Vec<u64> = self
+            .workspace_sources
+            .iter()
+            .map(|&source| source.bytes(port_byte, result_byte, scratch_byte))
+            .collect();
+        let padded_bytes: Vec<u64> = raw_bytes
+            .iter()
+            .map(|&bytes| seismic_memory::placement::padded(bytes))
+            .collect();
+        let workspace = self.placement.arena_bytes(&padded_bytes);
+        let workspace_floor = self.placement.liveness_floor(&raw_bytes);
+
+        StorageSizes {
+            workspace,
+            workspace_floor,
+            sync,
+            output,
+            upload,
+        }
     }
 }
 
@@ -3296,6 +3949,7 @@ fn align_up(value: u64, alignment: u64) -> u64 {
 
 /// The most bytes of `intervals` live at one step: the size no placement of
 /// them can go below.
+#[cfg(test)]
 fn liveness_floor(intervals: &[&Interval]) -> u64 {
     let mut events = intervals
         .iter()
@@ -3321,250 +3975,196 @@ fn liveness_floor(intervals: &[&Interval]) -> u64 {
     u64::try_from(floor).expect("live workspace bytes fit u64")
 }
 
-/// A placement of an arena's buffers: each one's offset, the arena's bytes
-/// (the end of its last buffer), and the size comparisons that decided it:
-/// the guards a shape's placement holds, under which the same offsets are
-/// expressions of its buffers' sizes.
-struct Placed {
-    offsets: Vec<u64>,
-    bytes: u64,
-    guards: usize,
-}
-
-/// Two-colour `order`'s buffers (indices into `intervals`) by their
-/// crossings, in that order: each joins the ends its earlier crossing
-/// partners force, by a union-find over the parity of their ends, and one
-/// that would close an odd cycle of crossings with them is lifted. Each
-/// coloured buffer's end (0 the bottom, 1 the top), and the lifted ones in
-/// order.
-fn colour_ends(intervals: &[&Interval], order: &[usize]) -> (Vec<Option<u8>>, Vec<usize>) {
-    let mut parent = (0..intervals.len()).collect::<Vec<_>>();
-    let mut parity = vec![0u8; intervals.len()];
-    let find = |parent: &[usize], parity: &[u8], mut index: usize| {
-        let mut relative = 0u8;
-        while parent[index] != index {
-            relative ^= parity[index];
-            index = parent[index];
-        }
-        (index, relative)
-    };
-    let mut coloured = Vec::with_capacity(order.len());
-    let mut lifted = Vec::new();
-    for &index in order {
-        let mut required: Vec<(usize, u8)> = Vec::new();
-        let mut odd = false;
-        for &other in &coloured {
-            if !intervals[index].crosses(intervals[other]) {
-                continue;
-            }
-            let (root, relative) = find(&parent, &parity, other);
-            let want = relative ^ 1;
-            match required.iter().find(|(found, _)| *found == root) {
-                Some(&(_, wanted)) if wanted != want => {
-                    odd = true;
-                    break;
-                }
-                Some(_) => {}
-                None => required.push((root, want)),
-            }
-        }
-        if odd {
-            lifted.push(index);
-            continue;
-        }
-        for (root, want) in required {
-            parent[root] = index;
-            parity[root] = want;
-        }
-        coloured.push(index);
-    }
-    let mut ends = vec![None; intervals.len()];
-    for index in coloured {
-        ends[index] = Some(find(&parent, &parity, index).1);
-    }
-    (ends, lifted)
-}
-
-/// Place `intervals` in one arena by the two-ended rule over their
-/// lifetimes. Results, ports and locals are coloured into a bottom end and
-/// a top end so that no two buffers of one end cross ([`colour_ends`]):
-/// on each end they nest, and each buffer lies past the buffers of its end
-/// that enclose it, from the bottom up or from the top down. Node scratch,
-/// and any buffer that would close an odd cycle of crossings, lies between
-/// the ends, above everything below it at every step of its life. The
-/// arena is the most any step holds: on a graph whose crossings are
-/// two-colourable with no lifted buffer, the liveness floor of its aligned
-/// sizes, less the last buffer's pad.
-///
-/// On such a graph the rule decides from lifetimes alone, in birth order,
-/// with every lifted buffer on the bottom side: no comparison of sizes, so
-/// its offsets and arena are max/sum expressions of the sizes, under the
-/// one guard below. A graph with an odd cycle of crossings colours its
-/// buffers largest first and lifts each to the side that holds the least.
-/// Last, one guard: a placement that ends at the aligned floor
-/// ([`aligned_floor_end`]) is kept; otherwise first fit is the one other
-/// candidate, and the smaller is kept. Each of those decisions compares
-/// sizes, and is a guard.
-fn place(intervals: &[&Interval]) -> Placed {
-    /// First fit: largest first, each buffer takes the lowest aligned
-    /// offset that overlaps no placed buffer whose lifetime overlaps its
-    /// own. Ties keep the intervals' order, so the placement is
-    /// deterministic.
-    fn first_fit(intervals: &[&Interval]) -> Placed {
-        let mut order = (0..intervals.len()).collect::<Vec<_>>();
-        order.sort_by_key(|&index| std::cmp::Reverse(intervals[index].bytes));
-        // An order holds as long as each neighbouring pair compares as it did.
-        let mut guards = order.len().saturating_sub(1);
-        let mut offsets = vec![0u64; intervals.len()];
-        let mut placed: Vec<usize> = Vec::with_capacity(intervals.len());
-        let mut size = 0u64;
-        for index in order {
-            let interval = intervals[index];
-            let mut occupied = placed
-                .iter()
-                .filter(|&&other| intervals[other].overlaps(interval))
-                .map(|&other| (offsets[other], offsets[other] + intervals[other].bytes))
-                .collect::<Vec<_>>();
-            occupied.sort_unstable();
-            let mut offset = 0u64;
-            for (start, end) in occupied {
-                guards += 1;
-                if offset
-                    .checked_add(interval.bytes)
-                    .expect("native graph storage overflow")
-                    <= start
-                {
-                    break;
-                }
-                offset = offset.max(align_up(end, BUFFER_ALIGNMENT));
-            }
-            offsets[index] = offset;
-            size = size.max(offset + interval.bytes);
-            placed.push(index);
-        }
-        Placed { offsets, bytes: size, guards }
-    }
-    let bytes = |index: usize| align_up(intervals[index].bytes, BUFFER_ALIGNMENT);
-    let birth = |&index: &usize| (intervals[index].start, std::cmp::Reverse(intervals[index].end), index);
-    let mut held = (0..intervals.len()).filter(|&index| !intervals[index].scratch()).collect::<Vec<_>>();
-    held.sort_by_key(birth);
-    let (mut ends, mut lifted) = colour_ends(intervals, &held);
-    let odd = !lifted.is_empty();
-    let mut guards = 0usize;
-    // Largest first, an order that holds while each neighbouring pair
-    // compares as it did: a guard per pair.
-    let largest_first = |order: &mut Vec<usize>, guards: &mut usize| {
-        order.sort_by_key(|index| (std::cmp::Reverse(intervals[*index].bytes), birth(index)));
-        *guards += order.len().saturating_sub(1);
-    };
-    if odd {
-        largest_first(&mut held, &mut guards);
-        (ends, lifted) = colour_ends(intervals, &held);
-    }
-    lifted.extend((0..intervals.len()).filter(|&index| intervals[index].scratch()));
-    match odd {
-        true => largest_first(&mut lifted, &mut guards),
-        false => lifted.sort_by_key(birth),
-    }
-    let mut steps = intervals.iter().map(|interval| interval.start).collect::<Vec<_>>();
-    steps.sort_unstable();
-    steps.dedup();
-    let lives = |index: usize, step: usize| intervals[index].start <= step && step <= intervals[index].end;
-    // What each end holds at each step, then what lies between them.
-    let mut held_at = [vec![0u64; steps.len()], vec![0u64; steps.len()]];
-    for (index, end) in ends.iter().enumerate() {
-        let Some(end) = end else { continue };
-        for (at, &step) in steps.iter().enumerate() {
-            if lives(index, step) {
-                held_at[*end as usize][at] += bytes(index);
-            }
-        }
-    }
-    let mut lifted_at = Vec::with_capacity(lifted.len());
-    for &index in &lifted {
-        let life = (0..steps.len()).filter(|&at| lives(index, steps[at])).collect::<Vec<_>>();
-        // On `side`, past everything it holds at any step of its life: the
-        // most the arena then holds over its life, and its offset.
-        let on = |side: usize| {
-            let offset = life.iter().map(|&at| held_at[side][at]).max().unwrap_or(0);
-            let most = life.iter().map(|&at| offset + bytes(index) + held_at[1 - side][at]).max().unwrap_or(0);
-            (most, offset)
-        };
-        let (side, offset) = match odd {
-            false => (0, on(0).1),
-            true => {
-                guards += 1;
-                let [bottom, top] = [on(0), on(1)];
-                match top.0 < bottom.0 {
-                    true => (1, top.1),
-                    false => (0, bottom.1),
-                }
-            }
-        };
-        for &at in &life {
-            held_at[side][at] = offset + bytes(index);
-        }
-        lifted_at.push((index, side, offset));
-    }
-    let arena = (0..steps.len()).map(|at| held_at[0][at] + held_at[1][at]).max().unwrap_or(0);
-    let mut offsets = vec![0u64; intervals.len()];
-    for (index, end) in ends.iter().enumerate() {
-        let Some(end) = *end else { continue };
-        // The buffers of its end that enclose it: an equal lifetime
-        // encloses only a later one.
-        let enclosing = (0..intervals.len())
-            .filter(|&other| {
-                other != index
-                    && ends[other] == Some(end)
-                    && intervals[other].contains(intervals[index])
-                    && (!intervals[index].contains(intervals[other]) || other < index)
-            })
-            .map(bytes)
-            .sum::<u64>();
-        offsets[index] = match end {
-            0 => enclosing,
-            _ => arena - bytes(index) - enclosing,
-        };
-    }
-    for (index, side, offset) in lifted_at {
-        offsets[index] = match side {
-            0 => offset,
-            _ => arena - offset - bytes(index),
-        };
-    }
-    let end = intervals.iter().zip(&offsets).map(|(interval, offset)| offset + interval.bytes).max().unwrap_or(0);
-    // No placement at aligned offsets ends below the floor: one that does
-    // is the rule's, and first fit is a candidate only beside one that
-    // does not, the smaller kept. Each comparison is a guard.
-    guards += 1;
-    let placed = Placed { offsets, bytes: end, guards };
-    if end <= aligned_floor_end(intervals, &steps) {
-        return placed;
-    }
-    let first_fit = first_fit(intervals);
-    let guards = placed.guards + first_fit.guards + 1;
-    match first_fit.bytes < placed.bytes {
-        true => Placed { guards, ..first_fit },
-        false => Placed { guards, ..placed },
-    }
-}
-
-/// The least end of any placement of `intervals` at aligned offsets: at
-/// each of `steps` (every start), the aligned bytes live there less the
-/// largest alignment pad among them, which the last buffer leaves unpadded.
-fn aligned_floor_end(intervals: &[&Interval], steps: &[usize]) -> u64 {
-    steps
+/// Place `intervals` in one workspace arena by R_b
+/// ([`seismic_memory::placement::place`]).
+#[cfg(test)]
+fn place(intervals: &[&Interval]) -> seismic_memory::placement::Placed {
+    let buffers = intervals
         .iter()
-        .map(|&step| {
-            let live = intervals.iter().filter(|interval| interval.start <= step && step <= interval.end);
-            let (bytes, pad) = live.fold((0u64, 0u64), |(bytes, pad), interval| {
-                let aligned = align_up(interval.bytes, BUFFER_ALIGNMENT);
-                (bytes + aligned, pad.max(aligned - interval.bytes))
-            });
-            bytes - pad
+        .map(|interval| seismic_memory::placement::Buffer {
+            span: seismic_memory::placement::Span { start: interval.start, end: interval.end },
+            bytes: interval.bytes,
+            scratch: interval.scratch(),
         })
-        .max()
-        .unwrap_or(0)
+        .collect::<Vec<_>>();
+    seismic_memory::placement::place(&buffers)
+}
+
+/// Place graph storage from plain descriptors with pre-resolved operand
+/// `links` (whose `charge_node_emissions` has already been applied to each
+/// node's `scratch`). Single owner of interval construction and R_b placement
+/// shared by `NativeGraph` and direct graph sizing.
+pub fn plan_storage_with_links(
+    ports: &[StoragePort],
+    nodes: &[StorageNode<'_>],
+    links: &OperandLinks,
+    exports: &[WorkflowResultRef],
+    stores: &[(WorkflowResultRef, u32)],
+) -> PlannedStorage {
+    let topology = StorageTopology::of(ports, nodes, links, exports, stores);
+
+    let mut upload_bytes = 0u64;
+    let mut port_placements = vec![None; ports.len()];
+    for &ordinal in &topology.upload_ports {
+        let offset = align_up(upload_bytes, BUFFER_ALIGNMENT);
+        upload_bytes = offset
+            .checked_add(ports[ordinal].byte_len.max(1))
+            .expect("native graph upload bytes overflow");
+        port_placements[ordinal] = Some(StoragePlacement::Upload(offset));
+    }
+
+    // Sync scratch lives in the slot's sync region, each node's buffers
+    // disjoint from every other node's, so the region is as large as they
+    // need together.
+    let mut sync_bytes = 0u64;
+    let mut node_scratch = nodes
+        .iter()
+        .map(|node| vec![None; node.scratch.len()])
+        .collect::<Vec<_>>();
+    for &(node, ordinal, port) in &topology.carried_scratch {
+        node_scratch[node][ordinal] = Some(StoragePlacement::Port(port));
+    }
+    for &(node, ordinal) in &topology.sync_scratch {
+        // At least the minimum, so a region a buffer lies in exists.
+        let offset = sync_bytes.next_multiple_of(BUFFER_ALIGNMENT);
+        sync_bytes = offset + nodes[node].scratch[ordinal].bytes.max(MINIMUM_SCRATCH_BYTES);
+        node_scratch[node][ordinal] = Some(StoragePlacement::Sync(offset));
+    }
+
+    let port_byte = |ordinal: usize| ports[ordinal].byte_len;
+    let result_byte = |node: usize, ordinal: usize| nodes[node].results[ordinal];
+    let scratch_byte = |node: usize, ordinal: usize| nodes[node].scratch[ordinal].bytes;
+
+    let mut workspace_buffers = Vec::new();
+    let mut workspace_spans = Vec::new();
+    let mut workspace_raw = Vec::new();
+    for interval in &topology.intervals {
+        if !interval.exported {
+            let bytes = interval.source.bytes(port_byte, result_byte, scratch_byte);
+            let span = seismic_memory::placement::Span {
+                start: interval.start,
+                end: interval.end,
+            };
+            workspace_spans.push(span);
+            workspace_raw.push(bytes);
+            workspace_buffers.push(seismic_memory::placement::Buffer {
+                span,
+                bytes,
+                scratch: interval.scratch(),
+            });
+        }
+    }
+    let seismic_memory::placement::Placed {
+        offsets: scratch_offsets,
+        bytes: scratch_bytes,
+    } = seismic_memory::placement::place(&workspace_buffers);
+    let scratch_floor_bytes =
+        seismic_memory::placement::liveness_floor(&workspace_spans, &workspace_raw);
+
+    let mut scratch_offsets = scratch_offsets.into_iter();
+    let mut output_bytes = 0u64;
+    let mut placements = nodes
+        .iter()
+        .map(|spec| vec![StoragePlacement::Scalar; spec.results.len()])
+        .collect::<Vec<_>>();
+    for interval in &topology.intervals {
+        let placement = if interval.exported {
+            let bytes = interval.source.bytes(port_byte, result_byte, scratch_byte);
+            let offset = align_up(output_bytes, BUFFER_ALIGNMENT);
+            output_bytes = offset
+                .checked_add(bytes)
+                .expect("native graph output bytes overflow");
+            StoragePlacement::Export(offset)
+        } else {
+            StoragePlacement::Scratch(
+                scratch_offsets
+                    .next()
+                    .expect("every scratch interval is placed"),
+            )
+        };
+        match (interval.source, placement) {
+            (BufferSource::Port(ordinal), _) => port_placements[ordinal] = Some(placement),
+            (BufferSource::Result(node, ordinal), _) => placements[node][ordinal] = placement,
+            (
+                BufferSource::Scratch(node, ordinal)
+                | BufferSource::PairedScratch {
+                    producer: node,
+                    emitted: ordinal,
+                    ..
+                },
+                placement @ StoragePlacement::Scratch(_),
+            ) => {
+                node_scratch[node][ordinal] = Some(placement);
+            }
+            (BufferSource::Scratch(..) | BufferSource::PairedScratch { .. }, _) => {
+                unreachable!("node scratch is never exported")
+            }
+        }
+    }
+    for pair in &links.pairs {
+        node_scratch[pair.consumer][pair.formed] = node_scratch[pair.producer][pair.emitted];
+    }
+    let node_scratch = node_scratch
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|placement| placement.expect("every scratch buffer is placed"))
+                .collect()
+        })
+        .collect();
+    for &(result, port) in stores {
+        placements[result.node as usize][result.result as usize] = StoragePlacement::Port(port);
+    }
+    for (node, planned) in nodes.iter().enumerate() {
+        if let Some((ordinal, primary)) = planned.share {
+            placements[node][ordinal as usize] =
+                placements[primary.node as usize][primary.result as usize];
+        }
+    }
+    PlannedStorage {
+        port_placements,
+        placements,
+        node_scratch,
+        workspace: scratch_bytes,
+        workspace_floor: scratch_floor_bytes,
+        sync: sync_bytes,
+        output: output_bytes,
+        upload: upload_bytes,
+    }
+}
+
+/// Resolve operand links, charge unemitted scratch buffers, and place graph
+/// storage from plain descriptors in one step.
+pub fn plan_storage_sizes(
+    ports: &[StoragePort],
+    nodes: &[StorageNode<'_>],
+    carries: &[OperandCarrySpec],
+    exports: &[WorkflowResultRef],
+    stores: &[(WorkflowResultRef, u32)],
+) -> Result<PlannedStorage, WorkflowError> {
+    let operand_nodes: Vec<OperandNode<'_>> = nodes
+        .iter()
+        .map(|node| OperandNode {
+            args: node.args,
+            scratch: node.scratch,
+            activation: node.activation,
+        })
+        .collect();
+    let links = resolve_operand_links(&operand_nodes, carries)?;
+    let mut charged_scratch: Vec<Vec<ScratchNeed>> =
+        nodes.iter().map(|node| node.scratch.to_vec()).collect();
+    for (node, scratch) in charged_scratch.iter_mut().enumerate() {
+        links.charge_node_emissions(node, scratch);
+    }
+    let charged_nodes: Vec<StorageNode<'_>> = nodes
+        .iter()
+        .zip(&charged_scratch)
+        .map(|(node, scratch)| StorageNode {
+            scratch,
+            ..*node
+        })
+        .collect();
+    Ok(plan_storage_with_links(ports, &charged_nodes, &links, exports, stores))
 }
 
 /// Place graph storage. Results, graph locals and node scratch share one
@@ -3584,204 +4184,50 @@ fn plan_storage(
     exports: &[WorkflowResultRef],
     stores: &[Store],
 ) -> StoragePlan {
-    let stored = |node: usize, ordinal: usize| {
-        stores
-            .iter()
-            .find(|store| store.result.node as usize == node && store.result.result as usize == ordinal)
-            .map(|store| store.port as usize)
-    };
-    let mut last_use = results
+    let storage_ports: Vec<StoragePort> = ports
         .iter()
-        .enumerate()
-        .map(|(node, row)| vec![node * 2 + 1; row.len()])
-        .collect::<Vec<_>>();
-    let mut port_first = vec![None; ports.len()];
-    let mut port_last = vec![0usize; ports.len()];
-    for (consumer, node) in nodes.iter().enumerate() {
-        for argument in node.args.arguments() {
-            if let Some(reference) = argument_reference(argument) {
-                if reference.node == INPUT_NODE {
-                    let ordinal = reference.result as usize;
-                    if ports[ordinal].local {
-                        port_first[ordinal].get_or_insert(consumer * 2);
-                        port_last[ordinal] = consumer * 2 + 1;
-                    }
-                } else {
-                    last_use[reference.node as usize][reference.result as usize] = consumer * 2 + 1;
-                }
-            }
-        }
-    }
-    let mut intervals = Vec::new();
-    let mut upload_bytes = 0u64;
-    let mut port_placements = vec![None; ports.len()];
-    for (ordinal, port) in ports.iter().enumerate() {
-        if !port.local {
-            continue;
-        }
-        if port.owned_input {
-            let offset = align_up(upload_bytes, BUFFER_ALIGNMENT);
-            upload_bytes = offset
-                .checked_add(port.byte_len.max(1))
-                .expect("native graph upload bytes overflow");
-            port_placements[ordinal] = Some(Placement::Upload(offset));
-            continue;
-        }
-        let exported = exports
-            .iter()
-            .any(|item| item.node == INPUT_NODE && item.result as usize == ordinal);
-        intervals.push(Interval {
-            key: StorageKey::Port(ordinal),
-            start: if port.prewritten {
-                0
-            } else {
-                port_first[ordinal].unwrap_or(0)
-            },
-            end: port_last[ordinal],
-            bytes: port.byte_len.max(1),
-            exported,
-        });
-    }
-    // A result another shares (`NativeGraphDraft::share`) lives from the
-    // first of its writers to its last read and the last writer.
-    let sharers = |node: usize, ordinal: usize| {
-        nodes.iter().enumerate().filter_map(move |(sharer, planned)| {
-            planned
-                .share
-                .filter(|(_, primary)| primary.node as usize == node && primary.result as usize == ordinal)
-                .map(|_| sharer)
+        .map(|port| StoragePort {
+            byte_len: port.byte_len,
+            local: port.local,
+            owned_input: port.owned_input,
+            prewritten: port.prewritten,
         })
-    };
-    for (node, row) in results.iter().enumerate() {
-        for (ordinal, result) in row.iter().enumerate() {
-            let Some(spec) = result else { continue };
-            // A stored result lives in its port's tensor, a shared one in
-            // the storage of the result it shares (below).
-            if stored(node, ordinal).is_some() || nodes[node].share.is_some_and(|(shared, _)| shared as usize == ordinal) {
-                continue;
-            }
-            let exported = exports
-                .iter()
-                .any(|item| item.node as usize == node && item.result as usize == ordinal);
-            let writers = std::iter::once(node).chain(sharers(node, ordinal));
-            let (first, last) = writers.fold((node, node), |(first, last), writer| (first.min(writer), last.max(writer)));
-            intervals.push(Interval {
-                key: StorageKey::Result(node, ordinal),
-                start: first * 2 + 1,
-                end: last_use[node][ordinal].max(last * 2 + 1),
-                bytes: spec.byte_len.max(1),
-                exported,
-            });
-        }
-    }
-    // Sync scratch lives in the slot's sync region, each node's buffers
-    // disjoint from every other node's, so the region is as large as they
-    // need together.
-    let mut sync_bytes = 0u64;
-    let mut node_scratch = nodes
-        .iter()
-        .map(|node| vec![None; node.scratch.len()])
-        .collect::<Vec<_>>();
-    // A paired operand (`operand_pairs`) is one buffer, the producer's, live
-    // from the producer to its consumer and as large as either needs. A
-    // carried one lies in the tensor each run binds to its carry's port.
-    let pairs = &links.pairs;
-    for (node, planned) in nodes.iter().enumerate() {
-        for (ordinal, need) in planned.scratch.iter().enumerate() {
-            if let Some(carried) = links.carried(node, ordinal) {
-                node_scratch[node][ordinal] = Some(Placement::Port(carried.port));
-                continue;
-            }
-            if pairs.iter().any(|pair| pair.consumer == node && pair.formed == ordinal) {
-                continue;
-            }
-            if let Some(pair) = pairs.iter().find(|pair| pair.producer == node && pair.emitted == ordinal) {
-                intervals.push(Interval {
-                    key: StorageKey::NodeScratch(node, ordinal),
-                    start: node * 2,
-                    end: pair.consumer * 2 + 1,
-                    bytes: need.bytes.max(nodes[pair.consumer].scratch[pair.formed].bytes),
-                    exported: false,
-                });
-                continue;
-            }
-            if need.sync {
-                // At least the minimum, so a region a buffer lies in exists.
-                let offset = sync_bytes.next_multiple_of(BUFFER_ALIGNMENT);
-                sync_bytes = offset + need.bytes.max(MINIMUM_SCRATCH_BYTES);
-                node_scratch[node][ordinal] = Some(Placement::Sync(offset));
-                continue;
-            }
-            intervals.push(Interval {
-                key: StorageKey::NodeScratch(node, ordinal),
-                start: node * 2,
-                end: node * 2 + 1,
-                bytes: need.bytes,
-                exported: false,
-            });
-        }
-    }
-    intervals.sort_by_key(|interval| interval.start);
-    let scratch = intervals
-        .iter()
-        .filter(|interval| !interval.exported)
-        .collect::<Vec<_>>();
-    let Placed { offsets: scratch_offsets, bytes: scratch_bytes, .. } = place(&scratch);
-    let scratch_floor_bytes = liveness_floor(&scratch);
-    let mut scratch_offsets = scratch_offsets.into_iter();
-    let mut output_bytes = 0u64;
-    let mut placements = results
-        .iter()
-        .map(|row| vec![Placement::Scalar; row.len()])
-        .collect::<Vec<_>>();
-    for interval in &intervals {
-        let placement = if interval.exported {
-            let offset = align_up(output_bytes, BUFFER_ALIGNMENT);
-            output_bytes = offset
-                .checked_add(interval.bytes)
-                .expect("native graph output bytes overflow");
-            Placement::Export(offset)
-        } else {
-            Placement::Scratch(
-                scratch_offsets
-                    .next()
-                    .expect("every scratch interval is placed"),
-            )
-        };
-        match (interval.key, placement) {
-            (StorageKey::Port(ordinal), _) => port_placements[ordinal] = Some(placement),
-            (StorageKey::Result(node, ordinal), _) => placements[node][ordinal] = placement,
-            (StorageKey::NodeScratch(node, ordinal), placement @ Placement::Scratch(_)) => {
-                node_scratch[node][ordinal] = Some(placement);
-            }
-            (StorageKey::NodeScratch(..), _) => unreachable!("node scratch is never exported"),
-        }
-    }
-    for pair in pairs {
-        node_scratch[pair.consumer][pair.formed] = node_scratch[pair.producer][pair.emitted];
-    }
-    let node_scratch = node_scratch
-        .into_iter()
-        .map(|row| row.into_iter().map(|placement| placement.expect("every scratch buffer is placed")).collect())
         .collect();
-    for store in stores {
-        placements[store.result.node as usize][store.result.result as usize] =
-            Placement::Port(store.port);
-    }
-    for (node, planned) in nodes.iter().enumerate() {
-        if let Some((ordinal, primary)) = planned.share {
-            placements[node][ordinal as usize] = placements[primary.node as usize][primary.result as usize];
-        }
-    }
+    let result_bytes: Vec<Vec<Option<u64>>> = results
+        .iter()
+        .map(|row| row.iter().map(|spec| spec.as_ref().map(|s| s.byte_len)).collect())
+        .collect();
+    let storage_nodes: Vec<StorageNode<'_>> = nodes
+        .iter()
+        .zip(&result_bytes)
+        .map(|(node, results)| StorageNode {
+            args: &node.args,
+            results,
+            scratch: &node.scratch,
+            activation: node.activation,
+            share: node.share,
+        })
+        .collect();
+    let storage_stores: Vec<(WorkflowResultRef, u32)> = stores
+        .iter()
+        .map(|store| (store.result, store.port))
+        .collect();
+    let planned = plan_storage_with_links(
+        &storage_ports,
+        &storage_nodes,
+        links,
+        exports,
+        &storage_stores,
+    );
     StoragePlan {
-        port_placements,
-        placements,
-        node_scratch,
-        scratch_bytes,
-        scratch_floor_bytes,
-        sync_bytes,
-        output_bytes,
-        upload_bytes,
+        port_placements: planned.port_placements,
+        placements: planned.placements,
+        node_scratch: planned.node_scratch,
+        scratch_bytes: planned.workspace,
+        scratch_floor_bytes: planned.workspace_floor,
+        sync_bytes: planned.sync,
+        output_bytes: planned.output,
+        upload_bytes: planned.upload,
     }
 }
 
@@ -4028,21 +4474,13 @@ impl NativeGraphPlan {
         }
         match super::backend_name(&self.device.kind) {
             BackendName::Cuda => {
-                let nodes = self.executable.nodes.len();
-                let timelines = self
-                    .executable
-                    .timelines
-                    .iter()
-                    .filter(|(position, _)| (1..nodes).contains(position))
-                    .map(|&(_, node)| super::cuda::timeline_nodes(node))
-                    .sum::<u64>();
                 let launches = form.iter().map(|word| u64::from(word.count_ones())).sum::<u64>();
-                GraphCensus {
-                    graphs: u64::from(nodes > 0),
-                    launches: launches + self.held_marks().len() as u64 + timelines,
-                    arguments: 0,
-                    largest: 0,
-                }
+                cuda_recorded_census_sum(
+                    self.executable.nodes.len(),
+                    launches,
+                    &self.executable.timelines,
+                    &self.executable.marks,
+                )
             }
             BackendName::Vulkan | BackendName::Metal | BackendName::Cpu => self.recorded,
         }
@@ -4268,7 +4706,7 @@ impl BoundNativeGraphPlan {
 
 /// The host heap of the bindings of a plan of `ports` ports and
 /// `timelines` timeline nodes (`NativeGraphPlan::bindings`).
-fn bindings_heap(ports: usize, timelines: usize) -> HostHeap {
+pub fn bindings_heap(ports: usize, timelines: usize) -> HostHeap {
     use std::mem::size_of;
     let mut heap = HostHeap::default();
     heap.hold(ports, size_of::<Option<BoundPort>>());
@@ -6286,16 +6724,16 @@ mod operand_pairing_tests {
         normed(source, 1, 1e-6, vec![need(4096, formed(true, 0)), need(320, formed(false, 0)), need(64, None)])
     }
 
-    fn carry(side: CarrySide, rows: u32) -> Carry {
+    fn carry(side: OperandCarrySide, rows: u32) -> Carry {
         Carry { rows, quantized: rows + 1, forms: (), activation: bf16().unwrap(), side }
     }
 
     fn carry_in(rows: u32) -> Carry {
-        carry(CarrySide::In { hidden: 0, norm: 1, epsilon: 1e-6f32.to_bits() }, rows)
+        carry(OperandCarrySide::In { hidden: 0, norm: 1, epsilon: 1e-6f32.to_bits() }, rows)
     }
 
     fn carry_out(rows: u32) -> Carry {
-        carry(CarrySide::Out { result: WorkflowResultRef { workflow: WORKFLOW, node: 0, result: 0 } }, rows)
+        carry(OperandCarrySide::Out { result: WorkflowResultRef { workflow: WORKFLOW, node: 0, result: 0 } }, rows)
     }
 
     /// The storage of a chain of nodes, each with the `sync` buffers of
@@ -6455,7 +6893,7 @@ mod operand_pairing_tests {
     /// in no workspace; a layout certifies the carry with its topology.
     #[test]
     fn carried_operands_lie_on_their_ports() {
-        let [(rows, rows_extents), (blocks, blocks_extents)] = operand_carry_ports(1, 256);
+        let [(rows, rows_extents), (blocks, blocks_extents)] = operand_carry_ports(BackendName::Cpu, 1, 256);
         let name = |id| seismic_lang::registry::representation_info(id).name;
         let ports = [
             port("f32", &[1, 256], false),
@@ -6489,6 +6927,89 @@ mod operand_pairing_tests {
             Some(WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Topology)),
             "a layout of a carry certifies no graph without it"
         );
+    }
+
+    /// The quantized port of an operand carry rounds its row extent up to
+    /// `CPU_Q8_ROWS` on CPU (covering the tiled projection's Q8 scratch for
+    /// `rows = 1` and other non-multiples) and stays unpadded on GPU backends.
+    #[test]
+    fn operand_carry_quantized_port_rounds_rows_per_backend() {
+        use seismic_lang::cpu::{CPU_Q8_BYTES, CPU_Q8_ROWS, CPU_Q8_VALUES};
+        let name = |id| seismic_lang::registry::representation_info(id).name;
+        let native_port = |ordinal: u32| NativePort {
+            reference: WorkflowResultRef { workflow: WORKFLOW, node: INPUT_NODE, result: ordinal },
+        };
+        let backends = [
+            (BackendName::Cpu, CPU_Q8_ROWS),
+            (BackendName::Metal, 1),
+            (BackendName::Cuda, 1),
+            (BackendName::Vulkan, 1),
+        ];
+        for (backend, tile) in backends {
+            assert_eq!(operand_carry_row_tile(backend), tile);
+            for rows in [1u64, 2, 7, 8, 9, 15, 16] {
+                for width in [1u64, 256, 257, 2048] {
+                    let [(rows_repr, rows_extents), (q_repr, q_extents)] = operand_carry_ports(backend, rows, width);
+                    let expected_q_rows = rows.next_multiple_of(tile);
+                    let expected_blocks = width.div_ceil(CPU_Q8_VALUES);
+                    assert_eq!(rows_extents, [rows, width]);
+                    assert_eq!(q_extents, [expected_q_rows, expected_blocks * OPERAND_CARRY_BLOCK_WORDS]);
+                    let q_port = port(name(q_repr), &q_extents, false);
+                    let expected_bytes = expected_q_rows * expected_blocks * CPU_Q8_BYTES;
+                    assert_eq!(q_port.byte_len, expected_bytes);
+
+                    let ports = [
+                        port("f32", &[rows, width], false),
+                        port("f32", &[width], false),
+                        port(name(rows_repr), &rows_extents, false),
+                        q_port,
+                    ];
+                    let carry = OperandCarry {
+                        rows: native_port(2),
+                        quantized: native_port(3),
+                        activation: bf16().unwrap(),
+                    };
+                    let mut carries = Vec::new();
+                    add_carry(
+                        backend,
+                        WORKFLOW,
+                        &ports,
+                        0,
+                        &mut carries,
+                        &carry,
+                        (),
+                        CarryEnd::In { hidden: native_port(0), norm: native_port(1), epsilon: 1e-6 },
+                    )
+                    .unwrap();
+
+                    if rows % CPU_Q8_ROWS != 0 {
+                        let wrong_rows = if backend == BackendName::Cpu {
+                            rows
+                        } else {
+                            rows.next_multiple_of(CPU_Q8_ROWS)
+                        };
+                        let mut mismatched = ports;
+                        mismatched[3] = port(name(q_repr), &[wrong_rows, expected_blocks * OPERAND_CARRY_BLOCK_WORDS], false);
+                        let mut carries = Vec::new();
+                        assert_eq!(
+                            add_carry(
+                                backend,
+                                WORKFLOW,
+                                &mismatched,
+                                0,
+                                &mut carries,
+                                &carry,
+                                (),
+                                CarryEnd::In { hidden: native_port(0), norm: native_port(1), epsilon: 1e-6 },
+                            )
+                            .err(),
+                            Some(WorkflowError::NativePortMismatch { port: 3 }),
+                            "mismatched quantized rows={wrong_rows} for backend={backend:?} rows={rows} must be rejected"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// What a carry or pair does not hold is refused: a carry nothing
@@ -6577,6 +7098,240 @@ mod operand_pairing_tests {
 mod liveness_placement_tests {
     use super::*;
 
+    struct OraclePlaced {
+        offsets: Vec<u64>,
+        bytes: u64,
+        guards: usize,
+    }
+
+    fn oracle_colour_ends(intervals: &[&Interval], order: &[usize]) -> (Vec<Option<u8>>, Vec<usize>) {
+        let mut parent = (0..intervals.len()).collect::<Vec<_>>();
+        let mut parity = vec![0u8; intervals.len()];
+        let find = |parent: &[usize], parity: &[u8], mut index: usize| {
+            let mut relative = 0u8;
+            while parent[index] != index {
+                relative ^= parity[index];
+                index = parent[index];
+            }
+            (index, relative)
+        };
+        let mut coloured = Vec::with_capacity(order.len());
+        let mut lifted = Vec::new();
+        for &index in order {
+            let mut required: Vec<(usize, u8)> = Vec::new();
+            let mut odd = false;
+            for &other in &coloured {
+                if !intervals[index].crosses(intervals[other]) {
+                    continue;
+                }
+                let (root, relative) = find(&parent, &parity, other);
+                let want = relative ^ 1;
+                match required.iter().find(|(found, _)| *found == root) {
+                    Some(&(_, wanted)) if wanted != want => {
+                        odd = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => required.push((root, want)),
+                }
+            }
+            if odd {
+                lifted.push(index);
+                continue;
+            }
+            for (root, want) in required {
+                parent[root] = index;
+                parity[root] = want;
+            }
+            coloured.push(index);
+        }
+        let mut ends = vec![None; intervals.len()];
+        for index in coloured {
+            ends[index] = Some(find(&parent, &parity, index).1);
+        }
+        (ends, lifted)
+    }
+
+    fn aligned_floor_end(intervals: &[&Interval], steps: &[usize]) -> u64 {
+        steps
+            .iter()
+            .map(|&step| {
+                let live = intervals.iter().filter(|interval| interval.start <= step && step <= interval.end);
+                let (bytes, pad) = live.fold((0u64, 0u64), |(bytes, pad), interval| {
+                    let aligned = align_up(interval.bytes, BUFFER_ALIGNMENT);
+                    (bytes + aligned, pad.max(aligned - interval.bytes))
+                });
+                bytes - pad
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Oracle copy of `main`'s old `place` (`first_fit` + largest-first odd-cycle pass).
+    fn oracle_place(intervals: &[&Interval]) -> OraclePlaced {
+        fn first_fit(intervals: &[&Interval]) -> OraclePlaced {
+            let mut order = (0..intervals.len()).collect::<Vec<_>>();
+            order.sort_by_key(|&index| std::cmp::Reverse(intervals[index].bytes));
+            let mut guards = order.len().saturating_sub(1);
+            let mut offsets = vec![0u64; intervals.len()];
+            let mut placed: Vec<usize> = Vec::with_capacity(intervals.len());
+            let mut size = 0u64;
+            for index in order {
+                let interval = intervals[index];
+                let mut occupied = placed
+                    .iter()
+                    .filter(|&&other| intervals[other].overlaps(interval))
+                    .map(|&other| (offsets[other], offsets[other] + intervals[other].bytes))
+                    .collect::<Vec<_>>();
+                occupied.sort_unstable();
+                let mut offset = 0u64;
+                for (start, end) in occupied {
+                    guards += 1;
+                    if offset
+                        .checked_add(interval.bytes)
+                        .expect("native graph storage overflow")
+                        <= start
+                    {
+                        break;
+                    }
+                    offset = offset.max(align_up(end, BUFFER_ALIGNMENT));
+                }
+                offsets[index] = offset;
+                size = size.max(offset + interval.bytes);
+                placed.push(index);
+            }
+            OraclePlaced { offsets, bytes: size, guards }
+        }
+        let bytes = |index: usize| align_up(intervals[index].bytes, BUFFER_ALIGNMENT);
+        let birth = |&index: &usize| (intervals[index].start, std::cmp::Reverse(intervals[index].end), index);
+        let mut held = (0..intervals.len()).filter(|&index| !intervals[index].scratch()).collect::<Vec<_>>();
+        held.sort_by_key(birth);
+        let (mut ends, mut lifted) = oracle_colour_ends(intervals, &held);
+        let odd = !lifted.is_empty();
+        let mut guards = 0usize;
+        let largest_first = |order: &mut Vec<usize>, guards: &mut usize| {
+            order.sort_by_key(|index| (std::cmp::Reverse(intervals[*index].bytes), birth(index)));
+            *guards += order.len().saturating_sub(1);
+        };
+        if odd {
+            largest_first(&mut held, &mut guards);
+            (ends, lifted) = oracle_colour_ends(intervals, &held);
+        }
+        lifted.extend((0..intervals.len()).filter(|&index| intervals[index].scratch()));
+        match odd {
+            true => largest_first(&mut lifted, &mut guards),
+            false => lifted.sort_by_key(birth),
+        }
+        let mut steps = intervals.iter().map(|interval| interval.start).collect::<Vec<_>>();
+        steps.sort_unstable();
+        steps.dedup();
+        let lives = |index: usize, step: usize| intervals[index].start <= step && step <= intervals[index].end;
+        let mut held_at = [vec![0u64; steps.len()], vec![0u64; steps.len()]];
+        for (index, end) in ends.iter().enumerate() {
+            let Some(end) = end else { continue };
+            for (at, &step) in steps.iter().enumerate() {
+                if lives(index, step) {
+                    held_at[*end as usize][at] += bytes(index);
+                }
+            }
+        }
+        let mut lifted_at = Vec::with_capacity(lifted.len());
+        for &index in &lifted {
+            let life = (0..steps.len()).filter(|&at| lives(index, steps[at])).collect::<Vec<_>>();
+            let on = |side: usize| {
+                let offset = life.iter().map(|&at| held_at[side][at]).max().unwrap_or(0);
+                let most = life.iter().map(|&at| offset + bytes(index) + held_at[1 - side][at]).max().unwrap_or(0);
+                (most, offset)
+            };
+            let (side, offset) = match odd {
+                false => (0, on(0).1),
+                true => {
+                    guards += 1;
+                    let [bottom, top] = [on(0), on(1)];
+                    match top.0 < bottom.0 {
+                        true => (1, top.1),
+                        false => (0, bottom.1),
+                    }
+                }
+            };
+            for &at in &life {
+                held_at[side][at] = offset + bytes(index);
+            }
+            lifted_at.push((index, side, offset));
+        }
+        let arena = (0..steps.len()).map(|at| held_at[0][at] + held_at[1][at]).max().unwrap_or(0);
+        let mut offsets = vec![0u64; intervals.len()];
+        for (index, end) in ends.iter().enumerate() {
+            let Some(end) = *end else { continue };
+            let enclosing = (0..intervals.len())
+                .filter(|&other| {
+                    other != index
+                        && ends[other] == Some(end)
+                        && intervals[other].contains(intervals[index])
+                        && (!intervals[index].contains(intervals[other]) || other < index)
+                })
+                .map(bytes)
+                .sum::<u64>();
+            offsets[index] = match end {
+                0 => enclosing,
+                _ => arena - bytes(index) - enclosing,
+            };
+        }
+        for (index, side, offset) in lifted_at {
+            offsets[index] = match side {
+                0 => offset,
+                _ => arena - offset - bytes(index),
+            };
+        }
+        let end = intervals.iter().zip(&offsets).map(|(interval, offset)| offset + interval.bytes).max().unwrap_or(0);
+        guards += 1;
+        let placed = OraclePlaced { offsets, bytes: end, guards };
+        if end <= aligned_floor_end(intervals, &steps) {
+            return placed;
+        }
+        let first_fit = first_fit(intervals);
+        let guards = placed.guards + first_fit.guards + 1;
+        match first_fit.bytes < placed.bytes {
+            true => OraclePlaced { guards, ..first_fit },
+            false => OraclePlaced { guards, ..placed },
+        }
+    }
+
+    fn catalog_arenas() -> Vec<(u64, Vec<Interval>)> {
+        use std::io::Read;
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(&include_bytes!("fixtures/arenas.txt.gz")[..])
+            .read_to_string(&mut text)
+            .unwrap();
+        text.lines()
+            .enumerate()
+            .map(|(row, line)| {
+                let mut fields = line.split(' ');
+                let first_fit = fields.next().unwrap().parse::<u64>().unwrap();
+                let intervals = fields
+                    .enumerate()
+                    .map(|(ordinal, field)| {
+                        let parts = field.split(':').collect::<Vec<_>>();
+                        let number = |at: usize| parts[at].parse::<u64>().unwrap();
+                        Interval {
+                            key: match parts[0] {
+                                "P" => StorageKey::Port(ordinal),
+                                "R" => StorageKey::Result(ordinal, 0),
+                                "S" => StorageKey::NodeScratch(ordinal, 0),
+                                kind => panic!("arena {row}: unknown buffer kind {kind}"),
+                            },
+                            start: number(1) as usize,
+                            end: number(2) as usize,
+                            bytes: number(3),
+                            exported: false,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                (first_fit, intervals)
+            })
+            .collect()
+    }
+
     fn interval(start: usize, end: usize, bytes: u64) -> Interval {
         Interval {
             key: StorageKey::Result(0, 0),
@@ -6615,59 +7370,37 @@ mod liveness_placement_tests {
         // Each buffer read by the next node alone: a chain, which takes the
         // most two adjacent links hold.
         let intervals = [interval(1, 3, 256), interval(3, 5, 512), interval(5, 7, 768), interval(7, 9, 256)];
-        let placed = place(&intervals.iter().collect::<Vec<_>>());
+        let refs = intervals.iter().collect::<Vec<_>>();
+        let placed = place(&refs);
         assert_disjoint(&intervals, &placed.offsets);
         assert_eq!(placed.bytes, 512 + 768);
-        // Its end against the floor, the one comparison of sizes.
-        assert_eq!(placed.guards, 1);
+        let oracle = oracle_place(&refs);
+        assert_eq!(oracle.guards, 1);
     }
 
     #[test]
     fn an_odd_cycle_of_crossings_reaches_the_floor() {
         // Three buffers each crossing the other two, all live at step 5.
         let intervals = [interval(1, 5, 1024), interval(3, 7, 256), interval(5, 9, 512)];
-        let placed = place(&intervals.iter().collect::<Vec<_>>());
+        let refs = intervals.iter().collect::<Vec<_>>();
+        let placed = place(&refs);
         assert_disjoint(&intervals, &placed.offsets);
         assert_eq!(placed.bytes, floor(&intervals));
-        assert!(placed.guards > 1);
+        let oracle = oracle_place(&refs);
+        assert!(oracle.guards > 1);
     }
 
     /// The 8,373 distinct arenas the served catalog's outline tests place on
     /// every backend, each line first fit's bytes for the arena and then its
     /// buffers (`kind:start:end:bytes`, kind `P` port, `R` result, `S` node
-    /// scratch). Every arena places disjointly, never above first fit, and
-    /// under no more guards than the most any shape of the catalog holds.
+    /// scratch). Every arena places disjointly under the oracle, never above
+    /// first fit, and under no more guards than the most any shape of the
+    /// catalog holds.
     #[test]
     fn no_catalog_arena_places_above_first_fit() {
-        use std::io::Read;
         const MOST_GUARDS: usize = 4_238;
-        let mut text = String::new();
-        flate2::read::GzDecoder::new(&include_bytes!("fixtures/arenas.txt.gz")[..])
-            .read_to_string(&mut text)
-            .unwrap();
-        for (row, line) in text.lines().enumerate() {
-            let mut fields = line.split(' ');
-            let first_fit = fields.next().unwrap().parse::<u64>().unwrap();
-            let intervals = fields
-                .enumerate()
-                .map(|(ordinal, field)| {
-                    let parts = field.split(':').collect::<Vec<_>>();
-                    let number = |at: usize| parts[at].parse::<u64>().unwrap();
-                    Interval {
-                        key: match parts[0] {
-                            "P" => StorageKey::Port(ordinal),
-                            "R" => StorageKey::Result(ordinal, 0),
-                            "S" => StorageKey::NodeScratch(ordinal, 0),
-                            kind => panic!("arena {row}: unknown buffer kind {kind}"),
-                        },
-                        start: number(1) as usize,
-                        end: number(2) as usize,
-                        bytes: number(3),
-                        exported: false,
-                    }
-                })
-                .collect::<Vec<_>>();
-            let placed = place(&intervals.iter().collect::<Vec<_>>());
+        for (row, (first_fit, intervals)) in catalog_arenas().into_iter().enumerate() {
+            let placed = oracle_place(&intervals.iter().collect::<Vec<_>>());
             assert_disjoint(&intervals, &placed.offsets);
             assert!(
                 placed.bytes <= first_fit,
@@ -6675,6 +7408,234 @@ mod liveness_placement_tests {
                 placed.bytes
             );
             assert!(placed.guards <= MOST_GUARDS, "arena {row}: {} guards", placed.guards);
+        }
+    }
+
+    /// R_b (`seismic_memory::placement::place`) places every catalog arena
+    /// disjointly and never exceeds `main`'s aligned placement end, and
+    /// `CompiledPlacement` matches `place` and `liveness_floor` bit-for-bit on
+    /// every arena.
+    #[test]
+    fn rb_never_exceeds_main_on_arena_fixture() {
+        for (row, (_first_fit, intervals)) in catalog_arenas().into_iter().enumerate() {
+            let refs = intervals.iter().collect::<Vec<_>>();
+            let rb = place(&refs);
+            let main_placed = oracle_place(&refs);
+            assert_disjoint(&intervals, &rb.offsets);
+            let main_aligned = align_up(main_placed.bytes, BUFFER_ALIGNMENT);
+            assert!(
+                rb.bytes <= main_aligned,
+                "arena {row}: R_b {} bytes above main's aligned {main_aligned}",
+                rb.bytes
+            );
+
+            let spans = intervals
+                .iter()
+                .map(|interval| seismic_memory::placement::Span {
+                    start: interval.start,
+                    end: interval.end,
+                })
+                .collect::<Vec<_>>();
+            let scratch = intervals
+                .iter()
+                .map(Interval::scratch)
+                .collect::<Vec<_>>();
+            let raw_bytes = intervals.iter().map(|interval| interval.bytes).collect::<Vec<_>>();
+            let padded_bytes = raw_bytes
+                .iter()
+                .map(|&bytes| seismic_memory::placement::padded(bytes))
+                .collect::<Vec<_>>();
+            let compiled = seismic_memory::placement::CompiledPlacement::of(&spans, &scratch);
+            assert_eq!(
+                compiled.arena_bytes(&padded_bytes),
+                rb.bytes,
+                "arena {row}: CompiledPlacement::arena_bytes mismatch"
+            );
+            assert_eq!(
+                compiled.liveness_floor(&raw_bytes),
+                liveness_floor(&refs),
+                "arena {row}: CompiledPlacement::liveness_floor mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_storage_plan_matches_plan_storage_with_links() {
+        const WORKFLOW: u64 = 42;
+        let port_ref = |ordinal: u32| WorkflowResultRef {
+            workflow: WORKFLOW,
+            node: INPUT_NODE,
+            result: ordinal,
+        };
+        let node_ref = |node: u32, result: u32| WorkflowResultRef {
+            workflow: WORKFLOW,
+            node,
+            result,
+        };
+
+        // Ports:
+        // 0: external (non-local)
+        // 1: local owned_input (upload)
+        // 2: local prewritten workspace
+        // 3: local exported
+        // 4: external store target
+        // 5: external carry target
+        let make_ports = |sizes: [u64; 6]| {
+            vec![
+                StoragePort { byte_len: sizes[0], local: false, owned_input: false, prewritten: false },
+                StoragePort { byte_len: sizes[1], local: true, owned_input: true, prewritten: false },
+                StoragePort { byte_len: sizes[2], local: true, owned_input: false, prewritten: true },
+                StoragePort { byte_len: sizes[3], local: true, owned_input: false, prewritten: false },
+                StoragePort { byte_len: sizes[4], local: false, owned_input: false, prewritten: false },
+                StoragePort { byte_len: sizes[5], local: false, owned_input: false, prewritten: false },
+            ]
+        };
+
+        // Node 0: consumes port 1 & 2, produces tensor result 0 & scalar result 1,
+        //         has unpaired scratch 0, sync scratch 1, paired producer scratch 2.
+        let mut args0 = EncodedWorkflowArgs::new();
+        args0.push_result_tensor(port_ref(1));
+        args0.push_result_tensor(port_ref(2));
+
+        // Node 1: consumes node 0 result 0 & port 3, produces tensor result 0 (stored to port 4)
+        //         and tensor result 1 (workspace), has carried scratch 0.
+        let mut args1 = EncodedWorkflowArgs::new();
+        args1.push_result_tensor(node_ref(0, 0));
+        args1.push_result_tensor(port_ref(3));
+
+        // Node 2: consumes node 0 result 0 & node 1 result 1, produces tensor result 0 (exported)
+        //         and shares result 1 with node 0 result 0; has paired consumer scratch 0 & sync scratch 1.
+        let mut args2 = EncodedWorkflowArgs::new();
+        args2.push_result_tensor(node_ref(0, 0));
+        args2.push_result_tensor(node_ref(1, 1));
+
+        let links = OperandLinks {
+            pairs: vec![OperandPair {
+                consumer: 2,
+                formed: 0,
+                producer: 0,
+                emitted: 2,
+            }],
+            carried: vec![CarriedBuffer {
+                node: 1,
+                scratch: 0,
+                port: 5,
+                carry: 0,
+            }],
+        };
+        let exports = vec![port_ref(3), node_ref(2, 0)];
+        let stores = vec![(node_ref(1, 0), 4u32)];
+
+        let need = |bytes: u64, sync: bool| ScratchNeed {
+            bytes,
+            sync,
+            operand: None,
+            emission: None,
+        };
+
+        let slices: &[([u64; 6], Vec<Vec<Option<u64>>>, Vec<Vec<ScratchNeed>>)] = &[
+            (
+                [1024, 512, 2048, 300, 4096, 1024],
+                vec![
+                    vec![Some(4096), None],
+                    vec![Some(4096), Some(1536)],
+                    vec![Some(8192), Some(4096)],
+                ],
+                vec![
+                    vec![need(768, false), need(64, true), need(1024, false)],
+                    vec![need(2048, false)],
+                    vec![need(3072, false), need(512, true)],
+                ],
+            ),
+            // Edge case: zero-byte ports, results, and scratch mixed with non-zero.
+            (
+                [0, 0, 0, 0, 0, 0],
+                vec![
+                    vec![Some(0), None],
+                    vec![Some(0), Some(128)],
+                    vec![Some(0), Some(0)],
+                ],
+                vec![
+                    vec![need(0, false), need(0, true), need(512, false)],
+                    vec![need(0, false)],
+                    vec![need(0, false), need(0, true)],
+                ],
+            ),
+            // Larger slice with producer scratch > consumer scratch.
+            (
+                [16384, 777, 32768, 999, 8192, 4096],
+                vec![
+                    vec![Some(65536), None],
+                    vec![Some(8192), Some(12288)],
+                    vec![Some(10000), Some(65536)],
+                ],
+                vec![
+                    vec![need(4096, false), need(256, true), need(16384, false)],
+                    vec![need(4096, false)],
+                    vec![need(2048, false), need(1024, true)],
+                ],
+            ),
+        ];
+
+        // Compile once from slice 0.
+        let init_ports = make_ports(slices[0].0);
+        let init_nodes = [
+            StorageNode {
+                args: &args0,
+                results: &slices[0].1[0],
+                scratch: &slices[0].2[0],
+                activation: None,
+                share: None,
+            },
+            StorageNode {
+                args: &args1,
+                results: &slices[0].1[1],
+                scratch: &slices[0].2[1],
+                activation: None,
+                share: None,
+            },
+            StorageNode {
+                args: &args2,
+                results: &slices[0].1[2],
+                scratch: &slices[0].2[2],
+                activation: None,
+                share: Some((1, node_ref(0, 0))),
+            },
+        ];
+        let compiled = CompiledStoragePlan::of(&init_ports, &init_nodes, &links, &exports, &stores);
+
+        for (idx, (port_bytes, result_bytes, scratch_needs)) in slices.iter().enumerate() {
+            let ports = make_ports(*port_bytes);
+            let nodes = [
+                StorageNode {
+                    args: &args0,
+                    results: &result_bytes[0],
+                    scratch: &scratch_needs[0],
+                    activation: None,
+                    share: None,
+                },
+                StorageNode {
+                    args: &args1,
+                    results: &result_bytes[1],
+                    scratch: &scratch_needs[1],
+                    activation: None,
+                    share: None,
+                },
+                StorageNode {
+                    args: &args2,
+                    results: &result_bytes[2],
+                    scratch: &scratch_needs[2],
+                    activation: None,
+                    share: Some((1, node_ref(0, 0))),
+                },
+            ];
+            let planned = plan_storage_with_links(&ports, &nodes, &links, &exports, &stores);
+            let sizes = compiled.storage_bytes(port_bytes, result_bytes, scratch_needs);
+            assert_eq!(sizes.workspace, planned.workspace, "slice {idx}: workspace");
+            assert_eq!(sizes.workspace_floor, planned.workspace_floor, "slice {idx}: workspace_floor");
+            assert_eq!(sizes.sync, planned.sync, "slice {idx}: sync");
+            assert_eq!(sizes.output, planned.output, "slice {idx}: output");
+            assert_eq!(sizes.upload, planned.upload, "slice {idx}: upload");
         }
     }
 

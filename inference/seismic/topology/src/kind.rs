@@ -1,10 +1,10 @@
 //! Storage kinds: each
-//! executor's ways of obtaining memory, as facts.
+//! executor's ways of obtaining memory, as storage attributes.
 //!
 //! A kind is one way a backend obtains memory: a CUDA allocation call and
 //! location, a Vulkan memory type, a Metal storage mode, host pages. Which
 //! kinds exist, what each is called and how it is allocated are the
-//! backend's, so here a kind is opaque ([`NativeKind`]) with the facts its
+//! backend's, so here a kind is opaque ([`NativeKind`]) with the attributes its
 //! backend reports of it. A kind holds no measured figure: what running on
 //! it costs is measured by whoever prices it.
 

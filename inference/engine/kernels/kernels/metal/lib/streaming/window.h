@@ -61,8 +61,13 @@ template <class B> struct Windows {
         return !B::planar() ? 0u : B::grid_tile_rows() == 1u ? repack::TILE_ROWS : 1u;
     }
     static constexpr uint scales_per_row() {
-        constexpr uint most = uint(SEISMIC_CONST_WINDOW_BYTES) / (repack::TILE_ROWS * packet_bytes());
-        return !B::planar() ? 0u : (most * B::group() + B::grid_tile_columns() - 1u) / B::grid_tile_columns() + 1u;
+        // Only a planar source's grid tiles have columns to divide by.
+        if constexpr (!B::planar()) {
+            return 0u;
+        } else {
+            constexpr uint packets = uint(SEISMIC_CONST_WINDOW_BYTES) / (repack::TILE_ROWS * packet_bytes());
+            return (packets * B::group() + B::grid_tile_columns() - 1u) / B::grid_tile_columns() + 1u;
+        }
     }
     static constexpr uint scale_pitch() {
         return scales_per_row() * B::grid_scale_bytes();

@@ -1,6 +1,6 @@
 //! Host samples recorded on real machines, for other crates' tests.
 
-use crate::{Counted, Harm, HostSample, Lag, OwnCold, OwnReclaimed, PressureLevel, Supply, WiredFigures, WiredLimit};
+use crate::{ColdPages, Counted, Harm, HostSample, Lag, OwnReclaimed, PressureLevel, Supply, WiredFigures, WiredLimit};
 use std::time::{Duration, Instant};
 
 /// The 48 GB M4 Pro (Mac16,11, macOS 15.7.9, build 24G830) idle, read
@@ -19,8 +19,7 @@ pub fn m4_pro() -> HostSample {
         total: 51_539_607_552,
         supply: Supply { free_beyond_target: 18_506_711_040, clean_cache: 29_273_047_040, cold_reclaimable: 0 },
         counted: Counted { at, lag: Duration::from_secs(1) },
-        cold: 0,
-        own_cold: OwnCold::Unobserved,
+        cold: ColdPages { machine: 0, own: None },
         own_reclaimed: Some(OwnReclaimed::NONE),
         wired: Some(WiredFigures { limit: WiredLimit::OsDefault, wire_count: 1_795_801_088 }),
         harm: Some(Harm { machine: 15_802_606, own: 0 }),

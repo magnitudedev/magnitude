@@ -5,14 +5,17 @@ use crate::{
     DeviceError, InvariantError, NativeGraphWorkspaceLease, StateLaunchCore, StateStorePlan,
     StateWork, SubmitError, ValidatedStateLaunch,
     native::AttestedState,
-    programs::graph::{GraphError, draft::{Certified, GraphDraft}, facts::{FactIndex, FactSink}},
+    programs::graph::{
+        GraphError,
+        draft::{Certified, ElementBoundDraft, GraphDraft},
+        sizing::SizingOutline,
+    },
 };
 use magnitude_kernels::copy_rows;
 use seismic::{
-    BackendName, ClassFact, Device, Dim, Element, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphBindings,
-    NativeGraphClassSlice, NativeGraphFamily, NativeGraphFamilySlot, NativeGraphLayout, NativeGraphMetadata,
-    NativeGraphOutputs, NativeGraphPlan, NativeGraphResourceTemplate, NativeGraphStorageBytes, NativeGraphTraces,
-    NativePort, Reals, Tensor,
+    BackendName, Device, Dim, Element, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphBindings,
+    NativeGraphClassSlice, NativeGraphFamily, NativeGraphFamilySlot, NativeGraphLayout,
+    NativeGraphOutputs, NativeGraphPlan, NativeGraphStorageBytes, NativePort, Tensor,
 };
 use std::rc::Rc;
 
@@ -94,6 +97,7 @@ pub(crate) fn state_copy_classes(
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|_| "state bank count exceeds u64")?;
+            let slab_rows = state.bank_slab_banks()?;
             for component in &state.recurrent_components {
                 let width = component
                     .shape
@@ -108,7 +112,7 @@ pub(crate) fn state_copy_classes(
                         source_extents: vec![banks, 1, width],
                         destination_extents: vec![banks, 1, width],
                         map_rows: rows,
-                        slab_rows: state.bank_slab_banks()?,
+                        slab_rows,
                     };
                     if !classes.contains(&class) {
                         classes.push(class);
@@ -219,61 +223,12 @@ impl StateCopyGraphClass {
         };
         [rows, middle, width, self.map_rows, u64::from(self.slab_rows)]
     }
-
-    /// Its numbers as its trace's facts, in [`Self::numbers`]' order, and
-    /// the fact of its map rows (the class dimension `N`).
-    fn facts(&self) -> (FactSink, FactIndex) {
-        let mut facts = FactSink::new();
-        let [_, _, _, map_rows, _] = facts.index(self.numbers());
-        (facts, map_rows)
-    }
-
-    fn topology(&self, backend: BackendName) -> CopyTopology {
-        CopyTopology {
-            backend,
-            element: self.element,
-        }
-    }
 }
 
-/// What decides a state copy graph's topology: its backend and its plane's
-/// element. Every number of it is a fact of its trace
-/// ([`StateCopyGraphClass::facts`]).
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct CopyTopology {
-    backend: BackendName,
-    element: Element,
-}
-
-/// The state copy graphs' traces, one per topology.
-static COPY_TRACES: NativeGraphTraces<CopyTopology> = NativeGraphTraces::new();
-
-/// How many state copy traces this process recorded.
+/// Direct contract sizing records zero traces.
 #[cfg(test)]
 pub(crate) fn copy_traces_recorded() -> usize {
-    COPY_TRACES.recorded()
-}
-
-/// The template of a state copy graph of `topology` at `facts`
-/// ([`StateCopyGraphClass::facts`]).
-fn record_copy_graph(
-    topology: &CopyTopology,
-    facts: &[Dim],
-    _reals: &Reals,
-) -> Result<(NativeGraphResourceTemplate, ()), GraphError> {
-    let [rows, middle, width, map_rows, slab_rows] = facts else {
-        unreachable!("a state copy graph is recorded at its five facts")
-    };
-    let elements = [("A", topology.element)];
-    let (graph, ..) = copy_graph_draft(
-        NativeGraphMetadata::new_template(topology.backend),
-        &elements,
-        topology.element,
-        [rows, middle, width],
-        map_rows,
-        slab_rows,
-    )?;
-    Ok((graph.seal_template()?, ()))
+    0
 }
 
 pub struct PreparedStateCopyGraphs {
@@ -299,7 +254,7 @@ impl PreparedStateCopyGraphs {
         classes: impl IntoIterator<Item = StateCopyGraphClass>,
     ) -> Result<Self, SubmitError> {
         let classes = classes.into_iter().collect::<Vec<_>>();
-        let (_, graphs, layouts) = certify_copy_family::<NativeGraphLayout>(target_device.backend(), &classes)
+        let (storage, graphs, layouts) = certify_copy_family::<NativeGraphLayout>(target_device.backend(), &classes)
             .map_err(|error| invalid(error.to_string()))?;
         let planned = copy_family_heap(&classes, &layouts).map_err(invalid)?;
         // The graphs go into a vector of exactly the classes, and each
@@ -341,6 +296,7 @@ impl PreparedStateCopyGraphs {
         // A state copy runs on its own lane, never in a decode step's launch.
         let plans = variants.iter().map(|variant| (false, variant.plan.clone()));
         let family = super::graph::serial_family("state copy", plans, &graphs).map_err(device)?;
+        super::graph::assert_storage_eq("state copy", &family, storage);
         let graphs = Self {
             variants,
             family,
@@ -508,6 +464,7 @@ fn copy_graph_draft<'a, G: GraphDraft + 'a>(
     Ok((graph, rows, from, to))
 }
 
+#[cfg(test)]
 pub(crate) fn checked_copy_family_storage(
     backend: BackendName,
     classes: impl IntoIterator<Item = StateCopyGraphClass>,
@@ -518,13 +475,26 @@ pub(crate) fn checked_copy_family_storage(
 /// The family's storage, what its graphs hold, and the host heap its
 /// prepared graphs hold (`copy_family_heap`): what a load's assessment
 /// charges, from the classes the load prepares.
+#[cfg(test)]
 pub(crate) fn checked_copy_family(
     backend: BackendName,
     classes: impl IntoIterator<Item = StateCopyGraphClass>,
 ) -> Result<(NativeGraphStorageBytes, LaunchGraphs, HostHeap), GraphError> {
+    let (storage, graphs, heap, _) = checked_copy_family_with_kernels(backend, classes)?;
+    Ok((storage, graphs, heap))
+}
+
+pub(crate) fn checked_copy_family_with_kernels(
+    backend: BackendName,
+    classes: impl IntoIterator<Item = StateCopyGraphClass>,
+) -> Result<(NativeGraphStorageBytes, LaunchGraphs, HostHeap, std::collections::HashSet<seismic::KernelRequest>), GraphError> {
     let classes = classes.into_iter().collect::<Vec<_>>();
-    let (storage, graphs, layouts) = certify_copy_family::<seismic::NativeGraphOutline>(backend, &classes)?;
-    Ok((storage, graphs, copy_family_heap(&classes, &layouts)?))
+    let (storage, graphs, layouts) = certify_copy_family::<SizingOutline>(backend, &classes)?;
+    let mut kernels = std::collections::HashSet::new();
+    for layout in &layouts {
+        kernels.extend(layout.kernels().iter().cloned());
+    }
+    Ok((storage, graphs, copy_family_heap(&classes, &layouts)?, kernels))
 }
 
 /// The host heap the prepared state copy graphs of `classes` hold, each
@@ -573,14 +543,19 @@ pub(crate) fn certify_copy_family<L: Certified>(
     }
     for group in groups {
         let first = &classes[group[0]];
-        let (facts, map_rows) = first.facts();
-        let (layout, ()) = L::traced(
-            &COPY_TRACES,
-            &first.topology(backend),
-            &facts,
-            &[ClassFact { fact: map_rows.position(), scope: None, dimension: "N" }],
+        let [rows, middle, width, map_rows, slab_rows] = first.numbers().map(Dim::from);
+        let elements = [("A", first.element)];
+        let (graph, ..) = copy_graph_draft(
+            L::new_draft(backend),
+            L::Draft::bind(&elements),
+            first.element,
+            [&rows, &middle, &width],
+            &map_rows,
+            &slab_rows,
+        )?;
+        let layout = L::certify_one(
+            graph,
             vec![NativeGraphClassSlice::new().dimension("N", group.iter().map(|&index| classes[index].map_rows))],
-            record_copy_graph,
         )?;
         let storage = layout.storage_bytes();
         graphs.push(LaunchedGraph { graph: storage.recorded, pinned_runs: 0, runs: 1 });
@@ -734,6 +709,7 @@ mod tests {
             recurrent_pool_bytes: 48,
             granule: BANK_GRANULE,
             block: seismic::BlockSize { bytes: BANK_GRANULE, held: BANK_GRANULE },
+            cached_bank_slab: Default::default(),
         };
         let classes = state_copy_classes(&plan, None, &[1, 2, 4, 8]).unwrap();
         assert_eq!(
@@ -774,6 +750,7 @@ mod tests {
             recurrent_pool_bytes: 160,
             granule: BANK_GRANULE,
             block: seismic::BlockSize { bytes: BANK_GRANULE, held: BANK_GRANULE },
+            cached_bank_slab: Default::default(),
         };
         let banks = plan.bank_capacity.storage_total().unwrap();
         let max_launch_rows = 64;

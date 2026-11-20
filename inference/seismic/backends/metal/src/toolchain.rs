@@ -13,7 +13,7 @@
 //! which the former compiles and stores again.
 
 use crate::direct::DirectPipeline;
-use crate::facts::{LanguageVersion, MetalFacts};
+use crate::device_info::{LanguageVersion, MetalDeviceInfo};
 use crate::{DeviceHandle, MetalDevice};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -34,14 +34,14 @@ pub struct MetalToolchain {
 }
 
 impl MetalToolchain {
-    pub fn new(device: MetalDevice, facts: &MetalFacts) -> Self {
+    pub fn new(device: MetalDevice, specs: &MetalDeviceInfo) -> Self {
         Self {
             device,
-            language: facts.language,
+            language: specs.language,
             identity: ToolchainIdentity {
                 namespace: "metal",
-                material: material(facts.operating_system(), facts.language),
-                stored: format!("{};build {FORMATION_BUILD}", facts.architecture),
+                material: material(specs.operating_system(), specs.language),
+                stored: format!("{};build {FORMATION_BUILD}", specs.architecture),
             },
         }
     }
@@ -399,8 +399,8 @@ mod tests {
     #[test]
     fn native_tensor_operations_use_the_probed_language() {
         let device = crate::test_support::metal_device();
-        let facts = crate::profile::open_device(&device, crate::test_support::probes()).unwrap();
-        if !facts.facts().properties().tensor_ops.holds() {
+        let description = crate::profile::open_device(&device, crate::test_support::probes()).unwrap();
+        if !description.device_info().properties().tensor_ops.holds() {
             return;
         }
         let source = ProgramSource {
@@ -416,7 +416,7 @@ mod tests {
                    out[0] = float(acc.get_capacity()); }\n".into(),
             entries: vec![ProgramEntry::named("tensor_probe")],
         };
-        let toolchain = MetalToolchain::new(device, facts.facts());
+        let toolchain = MetalToolchain::new(device, description.device_info());
         assert_eq!(toolchain.compile(&source).unwrap().1.len(), 1);
     }
 
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn a_stored_archive_serves_its_pipelines_without_compiling() {
         let device = crate::test_support::metal_device();
-        let facts = crate::profile::open_device(&device, crate::test_support::probes()).unwrap().facts().clone();
+        let specs = crate::profile::open_device(&device, crate::test_support::probes()).unwrap().device_info().clone();
         let source = ProgramSource {
             text: "#include <metal_stdlib>\nusing namespace metal;\n\
                    template <uint TILE> kernel void probe(device float* x [[buffer(0)]], \
@@ -438,9 +438,9 @@ mod tests {
                 ProgramEntry { symbol: "probe<4>".into(), group_size: Some([1024, 1, 1]), constants: Vec::new() },
             ],
         };
-        let compiling = MetalToolchain::new(device.clone(), &facts);
+        let compiling = MetalToolchain::new(device.clone(), &specs);
         let stored = compiling.artifact(compiling.compile(&source).unwrap().0).unwrap();
-        let toolchain = MetalToolchain::new(device, &facts);
+        let toolchain = MetalToolchain::new(device, &specs);
         let artifact = MetalArchive::decode(&stored, None).unwrap();
         assert_eq!(toolchain.load(&artifact, &source.entries).expect("the archive serves its compile").len(), 2);
         let wanted = &source.entries[1..];
@@ -460,8 +460,8 @@ mod tests {
     #[test]
     fn what_an_archive_does_not_serve_is_a_miss() {
         let device = crate::test_support::metal_device();
-        let facts = crate::profile::open_device(&device, crate::test_support::probes()).unwrap().facts().clone();
-        let toolchain = MetalToolchain::new(device, &facts);
+        let specs = crate::profile::open_device(&device, crate::test_support::probes()).unwrap().device_info().clone();
+        let toolchain = MetalToolchain::new(device, &specs);
         let source = ProgramSource {
             text: "kernel void probe(device float* x [[buffer(0)]]) { x[0] = 1; }\n".into(),
             entries: vec![ProgramEntry::named("probe")],
@@ -484,11 +484,11 @@ mod tests {
     #[test]
     fn an_entry_group_size_bounds_its_pipeline() {
         let device = crate::test_support::metal_device();
-        let facts = crate::profile::open_device(&device, crate::test_support::probes())
+        let specs = crate::profile::open_device(&device, crate::test_support::probes())
             .unwrap()
-            .facts()
+            .device_info()
             .clone();
-        let toolchain = MetalToolchain::new(device, &facts);
+        let toolchain = MetalToolchain::new(device, &specs);
         let source = ProgramSource {
             text: "#include <metal_stdlib>\nusing namespace metal;\n\
                    kernel void plain(device float* x [[buffer(0)]], uint i [[thread_position_in_grid]]) { x[i] += 1; }\n\
@@ -525,11 +525,11 @@ mod tests {
     #[test]
     fn every_requested_instance_forms_a_pipeline() {
         let device = crate::test_support::metal_device();
-        let facts = crate::profile::open_device(&device, crate::test_support::probes())
+        let specs = crate::profile::open_device(&device, crate::test_support::probes())
             .unwrap()
-            .facts()
+            .device_info()
             .clone();
-        let toolchain = MetalToolchain::new(device, &facts);
+        let toolchain = MetalToolchain::new(device, &specs);
         let source = ProgramSource {
             text: "#include <metal_stdlib>\nusing namespace metal;\n\
                    template <uint TILE> kernel void probe(device float* x [[buffer(0)]], uint i [[thread_position_in_grid]]) { x[i] *= TILE; }\n\

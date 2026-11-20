@@ -475,28 +475,39 @@ fn work(engine: &'static Engine, flight: &InFlight) {
         // only some of them need, or in a gap between them none needs: each
         // part's own span is read again, and only those that fail fail.
         let file = &taken.file;
-        let read = taken.state.submitter.run(|| match file.read_piece(piece, &engine.buffers) {
-            Ok(()) => Vec::new(),
-            Err(error) if piece.parts.len() == 1 => vec![(piece.parts[0].range, Arc::new(error))],
-            Err(_) => piece
+        let read = taken.state.submitter.run(|| match file.fetch(piece, &engine.buffers) {
+            Ok(fetched) => Ok(fetched),
+            Err(error) if piece.parts.len() == 1 => Err(vec![(piece.parts[0].range, Arc::new(error))]),
+            Err(_) => Err(piece
                 .parts_alone()
                 .filter_map(|alone| {
                     let range = alone.parts[0].range;
                     file.read_piece(&alone, &engine.buffers).err().map(|error| (range, Arc::new(error)))
                 })
-                .collect(),
+                .collect()),
         });
-        // The piece leaves its link's flight as its read returns, before its
-        // request's end runs the request's hook (a landing), which reads
-        // nothing: the depths and the book count reads alone, at the instant
-        // the read returned. Where another holds the queue's lock the piece
-        // is left for the lock's next holder to end, and lands without
+        // The piece leaves its link's flight as its read from the volume
+        // returns, before its bytes are copied out of a buffer and before its
+        // request's end runs the request's hook (a landing), neither of which
+        // reads: the depths and the book count reads alone, at the instant
+        // the read returned, and the room it frees admits the next piece
+        // while this one lands. Where another holds the queue's lock the
+        // piece is left for the lock's next holder to end, and lands without
         // waiting for it. It is counted ended, or left to be, before it stops
         // being reported in flight ([`engine_work`]).
         let now = Instant::now();
         crate::timeline::note_at(now, crate::timeline::Kind::Read, 0, (piece.start as i64, (piece.end - piece.start) as i64, 0));
         engine.read_returned(taken.returned(now));
         *flight.lock().expect("a read worker's flight") = None;
+        let read = read.and_then(|read| {
+            taken.state.submitter.run(|| match read {
+                Ok(fetched) => {
+                    fetched.land(piece, &engine.buffers);
+                    Vec::new()
+                }
+                Err(failed) => failed,
+            })
+        });
         match read {
             Ok(failed) => taken.state.pieces_ended(1, failed, None),
             Err(panic) => taken.state.pieces_ended(1, [], Some(panic)),

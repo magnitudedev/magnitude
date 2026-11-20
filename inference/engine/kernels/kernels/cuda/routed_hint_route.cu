@@ -54,7 +54,6 @@ extern "C" __global__ void routed_hint_route_ordered_gemv(SEISMIC_KERNEL_PARAMS)
     const float *logits = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
     const int *step = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP));
     int *rings = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_RINGS));
-    const int seq = step[SEISMIC_CONST_STEP_LOW * SEISMIC_STEP_STRIDE_0];
     const unsigned lane = threadIdx.x % 32, warp = threadIdx.x / 32, warps = blockDim.x / 32;
     for (unsigned lead = 0; lead < static_cast<unsigned>(SEISMIC_DIM_AHEAD); ++lead) {
         const float *plane = logits + static_cast<unsigned long long>(lead) * SEISMIC_DIM_M * SEISMIC_DIM_EN;
@@ -63,12 +62,14 @@ extern "C" __global__ void routed_hint_route_ordered_gemv(SEISMIC_KERNEL_PARAMS)
             const auto ranked = selection::rank_row<static_cast<unsigned>(SEISMIC_DIM_EN), static_cast<unsigned>(SEISMIC_DIM_K)>(
                 [&](unsigned e) { return __ldcg(row_logits + e); }, lane);
             if (lane == 0) {
-                for (unsigned c = 0; c < static_cast<unsigned>(SEISMIC_DIM_K); ++c)
+                for (unsigned c = 0; c < static_cast<unsigned>(SEISMIC_DIM_K); ++c) {
                     words[STREAMING_HINT_CHOSEN(row) + c] = ranked.winners[c];
+                    words[STREAMING_HINT_WEIGHT(m, row) + c] = __float_as_int(ranked.chosen[c]);
+                }
             }
         }
         streaming_hint(m, rings + static_cast<unsigned long long>(lead) * SEISMIC_RINGS_STRIDE_0,
-                       SEISMIC_RINGS_STRIDE_1, seq, words, threadIdx.x, blockDim.x);
+                       SEISMIC_RINGS_STRIDE_1, step, SEISMIC_STEP_STRIDE_0, words, threadIdx.x, blockDim.x);
         streaming_barrier();
     }
 }

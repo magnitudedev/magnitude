@@ -36,7 +36,7 @@ fn constant_writer(
     let output = construction.view(output, representation);
     let mut builder = construction.portable_kernel(
         &mut arena,
-        target.facts(),
+        target.device_info(),
         target.addressable_resources(),
         target.vectors(),
     );

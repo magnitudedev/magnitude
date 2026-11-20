@@ -6,7 +6,7 @@
 //! step at a time.
 
 use crate::planning::fixtures::{
-    expert_stacks, qwen4exp_fixture_definition_of, relaid_manifest,
+    RoutedShape, expert_stacks, qwen4exp_fixture_definition_of, relaid_manifest, routed_fixture_definition,
     stored_table_manifest, streamed_experts_manifest,
 };
 use crate::{
@@ -62,6 +62,8 @@ fn forward(request: RequestId, kind: WorkKind, tokens: &[u32], position: usize, 
             .collect(),
         committed: tokens.len(),
         prime: None,
+        front: Vec::new(),
+        chain: None,
     }
 }
 
@@ -117,7 +119,7 @@ fn an_ngram_decoder_steps_on_host_and_selected_tokens() {
             false,
             backend,
         );
-        let Outcome::Forward { rows } = outcome else {
+        let Outcome::Forward { rows, .. } = outcome else {
             panic!("{backend:?}: a decode step has a forward outcome");
         };
         let selected = rows
@@ -215,10 +217,12 @@ fn a_verification_row_scores_its_history_as_plain_decode_does() {
             conditioning,
             committed,
             prime,
+            front: Vec::new(),
+            chain: None,
         }
     };
     let scores = |outcome: &Outcome| -> Vec<Vec<f32>> {
-        let Outcome::Forward { rows } = outcome else {
+        let Outcome::Forward { rows, .. } = outcome else {
             panic!("a forward has a forward outcome: {outcome:?}");
         };
         rows.iter()
@@ -359,17 +363,346 @@ const STREAMING_BACKENDS: [seismic::BackendName; 3] =
 /// its layers hit, miss and promote, each at its own map words, so the
 /// steps score as the resident load does ([`Scores::assert_as_resident`]).
 /// A layer resolving at another's words would serve that layer's experts as
-/// hits.
+/// hits. Its streamed decode launches meet every residency
+/// ([`Scores::assert_every_residency`]): a layer cold (every choice
+/// absent, all computed after its tier wait), partly warm (its held
+/// choices computed before the wait, its absent ones after it) and warm
+/// (every choice held, all before it), each step bit for bit the resident
+/// load's, whose arithmetic holds no bank: decode depends on nothing the
+/// bank held.
 #[test]
 fn a_partial_banks_shared_graphs_read_each_layers_own_experts() {
     let definition = qwen4exp_fixture_definition_of(9, 256);
     banked_shared_graphs_score_as_resident("partial-bank-shared", definition, &STREAMING_BACKENDS, Banked::Half);
 }
 
+/// A partial bank of a general routed model (no shared expert: the layers
+/// Gemma's routed shape gives, 128 experts choosing 8), whose gate/up runs
+/// in two passes around the tier wait (the up-only wait after its latent
+/// projection included), scores as the resident load does, each streamed
+/// decode launch meeting every residency
+/// ([`Scores::assert_every_residency`]).
+#[test]
+fn a_partial_banks_general_routed_layers_score_as_resident() {
+    let definition = routed_fixture_definition(RoutedShape { layers: 4, experts: 128, selected: 8, hidden: 2816, intermediate: 1152 });
+    banked_shared_graphs_score_as_resident("partial-bank-general", definition, &STREAMING_BACKENDS, Banked::Half);
+}
+
+/// The fronting fixture written for `test`: the decoder of
+/// `two_row_exact_rows_score_alike_across_guesses_and_banks` (four
+/// attention blocks of 128 experts a layer after the gated delta block)
+/// with an MTP head of its own history (`with_mtp_head`), its experts'
+/// stacks stored as a bank streams them. A load of it serving
+/// [`FRONTING`] with its experts in a bank fronts
+/// (`ExecutorDomain::fronts`): its decode passes run front rows on the
+/// chain the head launch behind each pass makes (`crate::TwoRowDecode`).
+fn fronting_fixture(test: &str) -> (std::path::PathBuf, Rc<ModelDefinition>, Arc<Package>) {
+    let definition = crate::planning::fixtures::with_mtp_head(qwen4exp_fixture_definition_of(4, 128));
+    fixture_with(test, definition, streamed_experts_manifest)
+}
+
+/// The method a fronting load serves: the MTP head of its own history,
+/// which on a load that fronts makes each pass's chain and never proposes.
+const FRONTING: PlannedMethod =
+    PlannedMethod::Mtp { greedy_proposals: 2, sampled_proposals: 2, widths: crate::DraftWidths::Adaptive };
+
+/// [`fronting_fixture`]'s load on `backend` serving [`FRONTING`], its
+/// experts `banked` (in a bank, so it fronts), `lookahead` or not,
+/// exporting up to `logits` rows of logits: its launches and selections as
+/// wide as a chained launch's rows ([`crate::CHAINED_ROWS`]), so a front
+/// pass of any depth a chain reaches launches.
+#[allow(clippy::too_many_arguments)]
+fn load_fronting(
+    catalog: &seismic::Devices,
+    definition: &Rc<ModelDefinition>,
+    package: &Arc<Package>,
+    backend: seismic::BackendName,
+    lookahead: bool,
+    logits: usize,
+    banked: Banked,
+) -> (Box<ExecutorDomain>, crate::StateBindings) {
+    let limits = ResourceLimits { max_selected_rows: crate::CHAINED_ROWS, ..limits(crate::CHAINED_ROWS, lookahead, 1, logits) };
+    let (domain, bindings, ..) = load_with(catalog, definition, package, backend, limits, banked, FRONTING);
+    assert!(domain.fronts(), "{backend:?}: a banked load of a head of its own history fronts");
+    (domain, bindings)
+}
+
+/// A greedy selection at `position`.
+fn greedy(position: usize) -> SelectSpec {
+    SelectSpec { sampling: Sampling::Greedy, seed: 0, position, domain: 0, mask: None, shaping: Shaping::default(), history: None }
+}
+
+/// The prompt `tokens` of a fronting load's `request` from its first row,
+/// in one chunk that closes it, selecting the first token: its drafter
+/// entry primes the head through it, every pair inside the chunk as the
+/// first chunk's (`Priming::pairs_previous`), and the head launch behind
+/// it enters its selection with its boundary feature right past that entry
+/// (`ChainEntry`), so the head stands level with the target's rows.
+fn fronting_prompt(request: RequestId, tokens: &[u32]) -> Operation {
+    let tokens = tokens.iter().map(|&token| TokenId(token)).collect::<Vec<_>>();
+    let prime = crate::Priming { boundary: true, tokens: tokens[1..].to_vec(), position: 0, draft_from: tokens.len() };
+    Operation::Forward {
+        request,
+        kind: WorkKind::Prefill,
+        select: vec![greedy(tokens.len() - 1)],
+        committed: tokens.len(),
+        chain: Some(crate::ChainEntry { position: prime.position + prime.tokens.len() }),
+        prime: Some(prime),
+        tokens,
+        position: 0,
+        conditioning: None,
+        demand: crate::batching::Demand::SELECT | crate::batching::Demand::FEATURES,
+        front: Vec::new(),
+    }
+}
+
+/// `request`'s front pass of `rows` from its `pending` token at
+/// `position`, which enters the head right behind it at the same position
+/// (its closing chunk left the head level with the target's rows), every
+/// row selecting greedily: demanding the selection, the features its head
+/// entry reads, and `demand`.
+fn front_pass(request: RequestId, rows: &crate::Rows, pending: TokenId, position: usize, demand: crate::batching::Demand) -> Operation {
+    Operation::Forward {
+        request,
+        kind: WorkKind::Decode,
+        tokens: rows.tokens(pending),
+        position,
+        conditioning: None,
+        demand: crate::batching::Demand::SELECT | crate::batching::Demand::FEATURES | demand,
+        select: vec![greedy(position)],
+        committed: 1,
+        prime: None,
+        front: rows
+            .front_kinds()
+            .into_iter()
+            .enumerate()
+            .map(|(depth, kind)| crate::FrontRow { select: greedy(position + 1 + depth), kind })
+            .collect(),
+        chain: Some(crate::ChainEntry { position }),
+    }
+}
+
+/// A fronting load's prompt (`fronting_prompt`) run, its outcome's
+/// selection and the chain its head launch made: the head's guess alone,
+/// of its selection's successor.
+fn run_fronting_prompt(
+    domain: &mut ExecutorDomain,
+    bindings: crate::StateBindings,
+    request: RequestId,
+    backend: seismic::BackendName,
+) -> (TokenId, Vec<crate::Guess>, crate::StateBindings) {
+    let (outcome, bindings) = run(domain, bindings, fronting_prompt(request, &[5, 1]), false, backend);
+    let Outcome::Forward { rows, guesses } = outcome else { panic!("{backend:?}: a prompt's outcome") };
+    let selected = rows.last().and_then(|row| row.selected).expect("the closing chunk selects").token;
+    assert!(
+        matches!(guesses.as_slice(), [crate::Guess { kind: crate::GuessKind::Head, .. }]),
+        "{backend:?}: the closing chunk's chain is the head's guess alone: {guesses:?}"
+    );
+    (selected, guesses, bindings)
+}
+
+/// On every backend experts stream on, front passes score their exact rows
+/// alike whatever their front rows guess and whatever the bank holds: a
+/// partial bank (the load of
+/// `a_partial_banks_shared_graphs_read_each_layers_own_experts`, under an
+/// MTP head of its own history: [`fronting_fixture`]) decoding in chained
+/// passes of one front row, which guesses the next token or not, of each
+/// kind in turn, scores each pass's exact row bit for bit as a whole bank
+/// (which scores as the resident load does) through the same passes on one
+/// fixed guess. Each prompt primes the head and its closing chunk enters
+/// it, and each pass enters it behind its step. The front row, which
+/// computes only the experts its step holds, reaches neither its exact row
+/// nor any later one, nor the head's committed entry.
+/// The bank's record counts each pass with front rows that completed.
+#[test]
+fn two_row_exact_rows_score_alike_across_guesses_and_banks() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let (directory, definition, package) = fronting_fixture("two-row-exact");
+    let request = RequestId(1);
+    for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
+        // Each pass's exact row's bits and its selection, of the passes of
+        // `banked` whose front row guesses as `guess` makes it of the pass's
+        // index and its exact row's position.
+        let steps = |banked: Banked, guess: &dyn Fn(usize, usize) -> crate::Guess| {
+            // Two logits rows: a pass's front row's besides its exact row's.
+            let (mut domain, mut bindings) = load_fronting(&catalog, &definition, &package, backend, false, 2, banked);
+            domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+            domain.open_served(&mut bindings, request, None).unwrap();
+            let (mut pending, _, mut returned) = run_fronting_prompt(&mut domain, bindings, request, backend);
+            let mut steps = Vec::new();
+            let mut selections = Vec::new();
+            for (index, position) in (2..2 + DECODE_STEPS).enumerate() {
+                let rows = crate::Rows::front(vec![guess(index, position)], 0);
+                let operation = front_pass(request, &rows, pending, position, crate::batching::Demand::LOGITS);
+                let (mut outcomes, next, claimed) = launched(&mut domain, returned, &[operation], backend);
+                assert!(!claimed, "{backend:?} pass {index}: no pass is queued without lookahead");
+                let outcome = outcomes.pop().expect("one pass");
+                steps.push(step_bits(outcome.outcome()));
+                pending = TokenId(selected_token(outcome.outcome(), backend));
+                selections.push(pending);
+                let decision = PhysicalDecision { accepted_rows: 1, ahead: crate::AheadVerdict::new(&rows, &[pending]) };
+                domain.reconcile(outcome, decision).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+                returned = next;
+            }
+            if matches!(banked, Banked::Half) {
+                let passes = domain.expert_costs().map(|costs| costs.front.passes);
+                assert_eq!(passes, Some(DECODE_STEPS as u64), "{backend:?}: the passes that ran");
+            }
+            (steps, selections)
+        };
+        // One fixed guess.
+        let (whole, truths) = steps(Banked::Whole, &|_, _| crate::Guess { token: TokenId(0), kind: crate::GuessKind::Chained });
+        // Every other pass's front row guesses the token its exact row
+        // selects (as the whole bank's did); the rest guess another. The
+        // kinds take turns, every other pair of passes.
+        let (banked, _) = steps(Banked::Half, &|index, position| crate::Guess {
+            token: TokenId((truths[index].0 + (position % 2) as u32) % 256),
+            kind: crate::GuessKind::ALL[position / 2 % crate::GuessKind::ALL.len()],
+        });
+        for (step, (whole, banked)) in whole.iter().zip(&banked).enumerate() {
+            assert!(whole.last().is_some_and(|(_, logits, _)| logits.is_some()), "{backend:?} step {step}: the whole bank's pass scores its exact row");
+            assert_eq!(banked, whole, "{backend:?} step {step}: the partial bank's pass's exact row is the whole bank's");
+        }
+    }
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+/// Front passes pipeline, and emit the tokens the same passes do without
+/// lookahead. With lookahead, each pass claims the pass queued behind the
+/// one before where it is that pass's continuation: its exact token read
+/// on the device from the selection behind it, its rows as deep as the
+/// queue ran them. On [`fronting_fixture`]'s load, which measures no
+/// expert lines, no regime is priced (`ExecutorDomain::two_row_pricing`),
+/// so each continuation is queued with its exact row alone
+/// (`at_chain_depths`): a pass of one row claims it, and a pass the host
+/// builds deeper, on the chain the head launch behind the pass before made
+/// (`guess_chain`), orphans it, running as submitted. Each pass, its rows
+/// and their guesses, the token its exact row selects and the chain its
+/// head launch makes are those of the same pass submitted without
+/// lookahead, at the same history: a partial bank on every backend experts
+/// stream on.
+///
+/// The chain behind each pass is the head's: its consistent front rows'
+/// selections, chained, then the head's guess one past them; one deeper
+/// than the pass's guessed rows at most, and the head's guess alone where
+/// the pass's first guess fell or it guessed nothing. Each pass's verdict
+/// is told by its step: the orphaned passes are discarded, no verdict
+/// judging them, and every later verdict judges its own pass (a verdict
+/// matched to another pass is a broken invariant, which fails the load).
+/// So every guessed row whose shallower rows stood and whose truth a later
+/// pass learned is judged, by its kind and depth, and those that stood are
+/// counted as the passes saw them.
+#[test]
+fn pipelined_two_row_passes_claim_their_successors_and_emit_their_unpipelined_tokens() {
+    /// The front rows each pass the host builds runs at most, by index: a
+    /// pass of none claims the queued one.
+    const DEPTHS: [usize; 12] = [0, 1, 0, 2, 2, 0, 0, 1, 2, 0, 1, 0];
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let (directory, definition, package) = fronting_fixture("two-row-pipelined");
+    let request = RequestId(1);
+    for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
+        // Each pass, `lookahead` or not: its rows, its exact row's token and
+        // the chain made behind it.
+        let passes = |lookahead: bool| {
+            let (mut domain, mut bindings) = load_fronting(&catalog, &definition, &package, backend, lookahead, 0, Banked::Half);
+            assert!(
+                domain.two_row_pricing().unwrap_or_else(|error| panic!("{backend:?}: {error}")).is_none(),
+                "{backend:?}: the fixture's load prices no regime"
+            );
+            domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+            domain.open_served(&mut bindings, request, None).unwrap();
+            let (mut exact, chain, returned) = run_fronting_prompt(&mut domain, bindings, request, backend);
+            bindings = returned;
+            let mut two_row = crate::TwoRowDecode::default();
+            two_row.guessed(chain);
+            let mut passes = Vec::new();
+            // The front rows' record of the load.
+            let front = |domain: &ExecutorDomain| domain.expert_costs().expect("a banked load's record").front;
+            for (index, depth) in DEPTHS.into_iter().enumerate() {
+                let rows = two_row.pass(crate::FrontGrant::UpTo(depth));
+                let guesses = rows.guesses().to_vec();
+                let before = front(&domain);
+                assert_eq!(domain.queued_steps(), usize::from(lookahead && index > 0), "{backend:?} pass {index}: the passes queued behind the one before");
+                let operation = front_pass(request, &rows, exact, 2 + index, crate::batching::Demand::NONE);
+                let (mut pending, next, claimed) = launched(&mut domain, bindings, &[operation], backend);
+                let pending = pending.pop().expect("one pass");
+                assert_eq!(
+                    claimed,
+                    lookahead && index > 0 && guesses.is_empty(),
+                    "{backend:?} pass {index}: whether it claims the queued pass"
+                );
+                let Outcome::Forward { rows: results, guesses: chain } = pending.outcome().clone() else {
+                    panic!("{backend:?}: a pass's outcome")
+                };
+                assert_eq!(results.len(), 1, "{backend:?} pass {index}: its exact row");
+                exact = results[0].selected.expect("an exact row selects").token;
+                let kinds = chain.iter().map(|guess| guess.kind).collect::<Vec<_>>();
+                let (head, chained) = kinds.split_last().unwrap_or_else(|| panic!("{backend:?} pass {index}: the head guesses behind every pass"));
+                assert!(
+                    *head == crate::GuessKind::Head && chained.iter().all(|&kind| kind == crate::GuessKind::Chained),
+                    "{backend:?} pass {index}: its chain's consistent selections, then the head's guess: {kinds:?}"
+                );
+                assert!(chain.len() <= guesses.len() + 1, "{backend:?} pass {index}: one deeper than its guesses at most");
+                if guesses.first().is_none_or(|guess| guess.token != exact) {
+                    assert_eq!(chain.len(), 1, "{backend:?} pass {index}: the head's guess alone where no guess stood");
+                }
+                let decision = PhysicalDecision { accepted_rows: 1, ahead: crate::AheadVerdict::new(&rows, &[exact]) };
+                domain.reconcile(pending, decision).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+                // The orphaned queued pass ran its exact row alone.
+                let after = front(&domain);
+                assert_eq!(after.passes - before.passes, u64::from(!guesses.is_empty()), "{backend:?} pass {index}: the passes with front rows that completed");
+                passes.push((rows, exact, chain.clone()));
+                two_row.guessed(chain);
+                bindings = next;
+            }
+            // The guesses the verdicts judged and those that stood, by kind
+            // and by depth.
+            let verdicts = |domain: &ExecutorDomain| {
+                let front = front(domain);
+                (front.judged, front.stood, front.judged_at, front.stood_at)
+            };
+            // Each guessed row is judged where every shallower row of its
+            // pass stood and a pass learned its truth: the exact selection
+            // of the pass `depth - 1` past its own.
+            let (mut judged, mut stood, mut judged_at, mut stood_at) = verdicts(&domain);
+            judged.fill(0);
+            stood.fill(0);
+            judged_at.fill(0);
+            stood_at.fill(0);
+            for (index, (rows, ..)) in passes.iter().enumerate() {
+                for (depth, guess) in rows.guesses().iter().enumerate() {
+                    let Some((_, truth, _)) = passes.get(index + depth) else { break };
+                    let held = guess.token == *truth;
+                    judged[guess.kind.index()] += 1;
+                    stood[guess.kind.index()] += u64::from(held);
+                    judged_at[depth] += 1;
+                    stood_at[depth] += u64::from(held);
+                    if !held {
+                        break;
+                    }
+                }
+            }
+            // Judged on the service's thread.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while verdicts(&domain).0 != judged || verdicts(&domain).2 != judged_at {
+                assert!(std::time::Instant::now() < deadline, "{backend:?}: the verdicts were never judged: {:?}", front(&domain));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(verdicts(&domain), (judged, stood, judged_at, stood_at), "{backend:?}: each verdict judged its own pass");
+            passes
+        };
+        assert_eq!(passes(true), passes(false), "{backend:?}: pipelined passes run and emit as the same passes unpipelined");
+    }
+    std::fs::remove_dir_all(&directory).ok();
+}
+
 /// On each of `backends` this host has, `definition` (its attention blocks
 /// sharing a graph) loaded resident and `banked` score [`scores`]'s steps
 /// alike ([`Scores::assert_as_resident`]), each step's last row's logits and
-/// selection.
+/// selection; a partial bank's streamed launches having met every residency
+/// ([`Scores::assert_every_residency`]).
 fn banked_shared_graphs_score_as_resident(
     test: &str,
     definition: ModelDefinition,
@@ -380,8 +713,11 @@ fn banked_shared_graphs_score_as_resident(
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) = fixture_with(test, definition, streamed_experts_manifest);
     for &backend in backends.iter().filter(|&&backend| available(&catalog, backend)) {
-        scores(&catalog, &definition, &package, backend, banked, Start::AtOnce)
-            .assert_as_resident(backend, "the banked load's logits and selection");
+        let scores = scores(&catalog, &definition, &package, backend, banked, Start::AtOnce);
+        if matches!(banked, Banked::Half) {
+            scores.assert_every_residency(backend);
+        }
+        scores.assert_as_resident(backend, "the banked load's logits and selection");
     }
     std::fs::remove_dir_all(&directory).ok();
 }
@@ -447,7 +783,7 @@ const DECODE_STEPS: usize = 32;
 /// `operation` with its last row's logits demanded too, to compare.
 fn scored(operation: Operation) -> Operation {
     match operation {
-        Operation::Forward { request, kind, tokens, position, conditioning, demand, select, committed, prime } => {
+        Operation::Forward { request, kind, tokens, position, conditioning, demand, select, committed, prime, front, chain } => {
             Operation::Forward {
                 request,
                 kind,
@@ -458,6 +794,8 @@ fn scored(operation: Operation) -> Operation {
                 select,
                 committed,
                 prime,
+                front,
+                chain,
             }
         }
         other => other,
@@ -475,9 +813,23 @@ struct Scores {
     banked: Vec<StepBits>,
     sited: Vec<(usize, usize, u64)>,
     site: bool,
+    /// The banked load's streamed decode launches by what their layer's
+    /// bank held of the experts they routed to ([`residencies`]).
+    held: [u64; 3],
 }
 
 impl Scores {
+    /// The banked load's streamed decode launches met every residency:
+    /// some layer held none of the experts its launch routed to, some held
+    /// part of them, and some held every one.
+    fn assert_every_residency(&self, backend: seismic::BackendName) {
+        let [cold, partial, warm] = self.held;
+        assert!(
+            cold > 0 && partial > 0 && warm > 0,
+            "{backend:?}: the streamed launches held none, part and all of their experts {cold}, {partial} and {warm} times"
+        );
+    }
+
     /// Every step scores its last row; the banked load's steps before its
     /// CPU site first served a miss score bit for bit as the resident
     /// load's, and every later one's logits are finite; a load with a site
@@ -605,6 +957,29 @@ fn site_answers(
     answers
 }
 
+/// How many streamed layers of `domain`'s last completed step held none,
+/// part and every one of the experts its decode launch routed to (a grouped
+/// step routes none).
+fn residencies(domain: &ExecutorDomain) -> [u64; 3] {
+    let mut held = [0; 3];
+    let Some((_, cost)) = domain.expert_costs().and_then(|costs| costs.completed) else {
+        return held;
+    };
+    for layer in &cost.experts {
+        let Some(routed) = &layer.routed else {
+            continue;
+        };
+        let absent = routed.experts.iter().filter(|&expert| layer.missed.contains(expert)).count();
+        let residency = match absent {
+            0 => 2,
+            absent if absent == routed.experts.len() => 0,
+            _ => 1,
+        };
+        held[residency] += 1;
+    }
+    held
+}
+
 /// On `backend`, the outputs of the resident load and then of `banked`:
 /// a prompt chunk and [`DECODE_STEPS`] decode steps of distinct tokens
 /// (37 is prime to the vocabulary's 256), so each layer routes many
@@ -678,12 +1053,16 @@ fn scores(
             run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, backend);
         // The prompt step's misses reach the site as a decode step's do.
         let mut sited = site_answers(&domain, &stored, expansion, backend, 0);
+        let mut held = residencies(&domain);
         let mut steps = vec![step_bits(&outcome)];
         for position in 2..2 + DECODE_STEPS {
             let token = (position * 37 % 256) as u32;
             let (outcome, next) =
                 run(&mut domain, returned, scored(forward(request, WorkKind::Decode, &[token], position, true)), false, backend);
             sited.extend(site_answers(&domain, &stored, expansion, backend, steps.len()));
+            for (total, step) in held.iter_mut().zip(residencies(&domain)) {
+                *total += step;
+            }
             steps.push(step_bits(&outcome));
             returned = next;
         }
@@ -704,10 +1083,10 @@ fn scores(
             let misses = costs.layers.iter().map(|layer| layer.misses).sum::<u64>();
             assert!(misses > 0, "{backend:?}: a partial bank misses");
         }
-        scores.push((steps, sited, site));
+        scores.push((steps, sited, site, held));
     }
-    let [(resident, ..), (banked, sited, site)] = <[_; 2]>::try_from(scores).expect("a resident and a banked load");
-    Scores { resident, banked, sited, site }
+    let [(resident, ..), (banked, sited, site, held)] = <[_; 2]>::try_from(scores).expect("a resident and a banked load");
+    Scores { resident, banked, sited, site, held }
 }
 
 /// What a test's banked load is priced on: its costs and the pass they
@@ -719,7 +1098,8 @@ fn scores(
 /// the site, as a real model's on that host; the fixture's experts are too
 /// small for a link at their own bytes to lose to a handshake.
 fn test_measures(domain: &ExecutorDomain, pricing: &Pricing) -> crate::LoadMeasures {
-    use crate::assessment::{ExpertLines, HostLines, Priced};
+    use crate::assessment::Priced;
+    use magnitude_cost_model::{ExpertLines, HostLines};
     let reference = ExpertLines::reference(ExpertLines::REFERENCE_RECORD);
     let lines = Priced::Measured(
         domain
@@ -734,7 +1114,7 @@ fn test_measures(domain: &ExecutorDomain, pricing: &Pricing) -> crate::LoadMeasu
 
 /// The token a step's last row selected.
 fn selected_token(outcome: &Outcome, backend: seismic::BackendName) -> u32 {
-    let Outcome::Forward { rows } = outcome else {
+    let Outcome::Forward { rows, .. } = outcome else {
         panic!("{backend:?}: a forward step has a forward outcome");
     };
     let selected = rows
@@ -968,7 +1348,7 @@ impl DecodeSteps {
         let flight = domain.submit_target(bindings, &operations, reservation).unwrap_or_else(|failure| panic!("{backend:?}: {}", failure.error()));
         let (pendings, bindings) = domain.finish_target(flight).unwrap();
         for pending in pendings {
-            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+            domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
         }
         for position in &mut self.positions[..count] {
             *position += 1;
@@ -1308,6 +1688,8 @@ impl DrafterSteps {
             demand: if last { demand | crate::batching::Demand::SELECT } else { demand },
             select: last.then(|| Self::greedy(position + Self::ROWS - 1)).into_iter().collect(),
             committed: Self::ROWS,
+            front: Vec::new(),
+            chain: None,
         }
     }
 
@@ -1374,7 +1756,7 @@ impl DrafterSteps {
         let (pendings, bindings) = domain.finish_head(flight).unwrap_or_else(|error| panic!("{error}"));
         for pending in pendings {
             self.drafted.push(pending.outcome().clone());
-            domain.reconcile(pending, PhysicalDecision { accepted_rows: entry_rows }).unwrap_or_else(|error| panic!("{error}"));
+            domain.reconcile(pending, PhysicalDecision::rows(entry_rows)).unwrap_or_else(|error| panic!("{error}"));
         }
         self.keep(domain, before, format!("a draft of {proposals} proposals by {drafted:?}"));
         bindings
@@ -1525,6 +1907,8 @@ fn prompt_chunk(request: RequestId, chunk: usize, chunks: usize, rows: usize) ->
             .collect(),
         committed: rows,
         prime: None,
+        front: Vec::new(),
+        chain: None,
     }
 }
 
@@ -1533,7 +1917,7 @@ fn prompt_chunk(request: RequestId, chunk: usize, chunks: usize, rows: usize) ->
 type StepBits = Vec<(Option<Vec<u32>>, Option<Vec<u32>>, Option<(u32, u8)>)>;
 
 fn step_bits(outcome: &Outcome) -> StepBits {
-    let Outcome::Forward { rows } = outcome else {
+    let Outcome::Forward { rows, .. } = outcome else {
         panic!("a forward step has a forward outcome: {outcome:?}");
     };
     let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
@@ -1783,7 +2167,7 @@ fn engram_requests_decode_together_as_each_alone() {
                 let (outcomes, returned, _) = steps(&mut domain, bindings, operations, backend);
                 bindings = returned;
                 logits.extend(outcomes.iter().map(|outcome| {
-                    let Outcome::Forward { rows } = outcome else {
+                    let Outcome::Forward { rows, .. } = outcome else {
                         panic!("{backend:?}: a forward has a forward outcome: {outcome:?}");
                     };
                     rows[0].logits.as_ref().expect("a scored row has logits").read_to_host().unwrap()
@@ -1954,7 +2338,7 @@ fn decode_logits(
         let operation = scored(forward(request, WorkKind::Decode, &tokens, rows.start, false));
         let (outcome, returned) = run(domain, bindings, operation, false, backend);
         bindings = returned;
-        let Outcome::Forward { rows: results } = outcome else {
+        let Outcome::Forward { rows: results, .. } = outcome else {
             panic!("{backend:?}: a forward has a forward outcome: {outcome:?}");
         };
         // The scored rows: those from the prompt's end.
@@ -2063,12 +2447,49 @@ fn step(
 /// step.
 fn steps(
     domain: &mut ExecutorDomain,
-    mut bindings: crate::StateBindings,
+    bindings: crate::StateBindings,
     operations: Vec<Operation>,
     backend: seismic::BackendName,
 ) -> (Vec<Outcome>, crate::StateBindings, bool) {
+    let pairs = operations
+        .into_iter()
+        .map(|operation| {
+            let accepted = operation.row_count() - operation.front_rows();
+            (operation, PhysicalDecision::rows(accepted))
+        })
+        .collect();
+    steps_decided(domain, bindings, pairs, backend)
+}
+
+fn steps_decided(
+    domain: &mut ExecutorDomain,
+    bindings: crate::StateBindings,
+    pairs: Vec<(Operation, PhysicalDecision)>,
+    backend: seismic::BackendName,
+) -> (Vec<Outcome>, crate::StateBindings, bool) {
+    let (operations, decisions): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    let (pending, bindings, claimed) = launched(domain, bindings, &operations, backend);
+    let mut outcomes = Vec::new();
+    for (pending, decision) in pending.into_iter().zip(decisions) {
+        outcomes.push(pending.outcome().clone());
+        domain
+            .reconcile(pending, decision)
+            .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    }
+    (outcomes, bindings, claimed)
+}
+
+/// One launch of `operations`, one request's each, whichever way it
+/// reserves, finished and not yet reconciled: their outcomes in order, none
+/// a failed read's, and whether it claimed the queued step.
+fn launched(
+    domain: &mut ExecutorDomain,
+    mut bindings: crate::StateBindings,
+    operations: &[Operation],
+    backend: seismic::BackendName,
+) -> (Vec<crate::domain::PendingOperationOutcome>, crate::StateBindings, bool) {
     let reserved = domain
-        .reserve(&mut bindings, &operations)
+        .reserve(&mut bindings, operations)
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
         .into_resources();
     let ReservedResources::Target(reservation) = reserved else {
@@ -2076,25 +2497,20 @@ fn steps(
     };
     let claimed = matches!(reservation, TargetGraphReservation::Claim(_));
     let flight = domain
-        .submit_target(bindings, &operations, reservation)
+        .submit_target(bindings, operations, reservation)
         .unwrap_or_else(|failure| panic!("{backend:?}: {}", failure.error()));
     let (pending, bindings) = domain
         .finish_target(flight)
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     assert_eq!(pending.len(), operations.len(), "{backend:?}: an outcome per operation");
-    let mut outcomes = Vec::new();
-    for (pending, operation) in pending.into_iter().zip(&operations) {
-        let outcome = pending.outcome().clone();
+    for pending in &pending {
         assert!(
-            !matches!(outcome, Outcome::WeightReadFailed(_)),
-            "{backend:?}: {outcome:?}"
+            !matches!(pending.outcome(), Outcome::WeightReadFailed(_)),
+            "{backend:?}: {:?}",
+            pending.outcome()
         );
-        domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: operation.row_count() })
-            .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-        outcomes.push(outcome);
     }
-    (outcomes, bindings, claimed)
+    (pending, bindings, claimed)
 }
 
 /// A streamed load's step whose host starves past every wait's patience
@@ -2139,7 +2555,7 @@ fn a_starved_step_is_interrupted_and_its_rerun_scores_as_unstarved() {
         let operation = scored(forward(starved, WorkKind::Decode, &[148], prompt.len(), true));
         let (pending, returned) = starved_step(&mut domain, returned, operation, std::time::Duration::from_millis(10), backend);
         assert!(matches!(pending.outcome(), Outcome::Forward { .. }), "{backend:?}: a short stall interrupts: {:?}", pending.outcome());
-        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
         drop(returned);
     }
     std::fs::remove_dir_all(&directory).ok();

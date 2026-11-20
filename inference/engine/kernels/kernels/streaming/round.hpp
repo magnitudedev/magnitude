@@ -11,13 +11,13 @@ STREAMING_FN u64 streaming_scratch_lane(u64 q, u64 lane STREAMING_WORDS_PARAM) {
         + lane * u64(SEISMIC_CONST_SCRATCH_SLOT) * SEISMIC_SCRATCH_STRIDE_1;
 }
 
-// Step `q`'s lane SCRATCH_ROUND + `window` * `rounds` + `round` of its slot
+// Step `q`'s lane ROUND_LANE(`window` * `rounds` + `round`) of its slot
 // of the table `scratch` (`routed_round`'s slot).
 STREAMING_FN STREAMING_SYSTEM_WORDS streaming_round_lane(u64 q, STREAMING_DEVICE_READ window, u64 rounds, u64 round,
     STREAMING_SYSTEM_WORDS scratch STREAMING_WORDS_PARAM) {
     const u64 w = u64(u32(streaming_device_load(window)));
     return STREAMING_AT(scratch,
-        streaming_scratch_lane(q, u64(SEISMIC_CONST_SCRATCH_ROUND) + w * rounds + round STREAMING_WORDS_ARG));
+        streaming_scratch_lane(q, SEISMIC_CONST_ROUND_LANE(w * rounds + round) STREAMING_WORDS_ARG));
 }
 
 // Step `q`'s arrival at the round whose lane is `lane` (its words `stride`

@@ -52,6 +52,7 @@ fn plain_owner(
             exported_logits_rows: 0,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -296,6 +297,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
             exported_logits_rows: 0,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         },
         context_tokens: Some(1024),
         service: ServiceLimits {
@@ -355,7 +357,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         bindings = next;
         for pending in pending {
             domain
-                .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+                .reconcile(pending, PhysicalDecision::rows(1))
                 .unwrap();
         }
         let retained = domain.resume_state(request).unwrap();
@@ -419,6 +421,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
             exported_logits_rows: 0,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -503,6 +506,7 @@ fn admission_reclaims_under_a_real_process_limit() {
             exported_logits_rows: 0,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         },
         context_tokens: Some(1024),
         service: limits.clone(),

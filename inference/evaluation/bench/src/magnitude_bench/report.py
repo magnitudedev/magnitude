@@ -14,7 +14,7 @@ def summarize(
     planned: int,
     error: str | None = None,
 ) -> dict:
-    """Rows per engine, section, context and concurrency. Truncation, protocol errors,
+    """Rows per engine, section, template and concurrency. Truncation, protocol errors,
     timeouts and cancellation never enter latency or rates, but every recorded request
     enters the outcome counts and accuracy denominators."""
     measured = [r for r in records if r["phase"] == "measured"]
@@ -24,19 +24,19 @@ def summarize(
             (
                 record["target"],
                 record["section"],
-                record["checkpoint"],
+                record["template"],
                 record.get("concurrency", 1),
             )
         ].append(record)
     rows = []
-    for (target, section, context, concurrency), values in groups.items():
+    for (target, section, template, concurrency), values in groups.items():
         outcomes = Counter(r["observation"]["outcome"] for r in values)
         valid = [
             r["observation"]
             for r in values
             if r["observation"]["outcome"] == "valid"
             or (
-                (section == "context" or r["family"] == "retrieval")
+                (section == "context" or r["key"] == "retrieve")
                 and r["observation"]["outcome"] == "invalid"
             )
         ]
@@ -63,7 +63,8 @@ def summarize(
             {
                 "target": target,
                 "section": section,
-                "context_target": context,
+                "template": template,
+                "context_target": values[0]["checkpoint"],
                 "concurrency": concurrency,
                 "observations": len(values),
                 "eligible": len(valid),
@@ -83,7 +84,7 @@ def summarize(
                 "timing_basis": values[0]["timing_basis"],
             }
         )
-        if values[0]["family"] == "retrieval":
+        if values[0]["key"] == "retrieve":
             scores = [
                 r["observation"]["retrieval"]
                 for r in values
@@ -203,7 +204,7 @@ def markdown(summary: dict) -> str:
         "",
         f"Outcomes: {summary['outcomes']}",
         "",
-        "| Target | Section | Concurrency | Context target | Actual prompt tokens | "
+        "| Target | Section | Concurrency | Template | Actual prompt tokens | "
         "Eligible / recorded | "
         "TTFT ms | Completion ms | Prefill tok/s | Decode tok/s | Drafts accepted |",
         "| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -219,7 +220,7 @@ def markdown(summary: dict) -> str:
     for row in summary["rows"]:
         lines.append(
             f"| {row['target']} | {row['section']} | {row['concurrency']} | "
-            f"{row['context_target']} | "
+            f"{row['template']} | "
             f"{', '.join(map(str, row['actual_prompt_tokens'])) or '—'} | "
             f"{row['eligible']} / {row['observations']} | {number(row['ttft_ms'])} | "
             f"{number(row['completion_ms'])} | {number(row['prefill_tokens_per_second'])} | "
@@ -229,7 +230,7 @@ def markdown(summary: dict) -> str:
     if retrieval_rows:
         lines += [
             "",
-            "| Target | Section | Concurrency | Context target | "
+            "| Target | Section | Concurrency | Template | "
             "Exact answers | Retrieved fields |",
             "| --- | --- | ---: | ---: | --- | --- |",
         ]
@@ -237,7 +238,7 @@ def markdown(summary: dict) -> str:
             score = row["retrieval"]
             lines.append(
                 f"| {row['target']} | {row['section']} | {row['concurrency']} | "
-                f"{row['context_target']} | {score['exact_matches']}/{score['requests']} "
+                f"{row['template']} | {score['exact_matches']}/{score['requests']} "
                 f"({100 * score['exact_accuracy']:.1f}%) | {score['correct']}/{score['total']} "
                 f"({100 * score['field_accuracy']:.1f}%) |"
             )
@@ -246,23 +247,24 @@ def markdown(summary: dict) -> str:
         "Latencies and phase rates above are medians; nearest-rank p95 latency is in summary.json.",
         "",
         {
-            "retrieval": "RULER-derived retrieval; strict JSON answers, not an official RULER "
+            "retrieve": "RULER-derived retrieval; strict JSON answers, not an official RULER "
             "score. All recorded requests enter accuracy denominators; unscored failures earn "
             "zero. Partial field accuracy does not penalize extra keys; exact accuracy does. "
             "Latency includes correct and incorrect protocol-complete responses.",
-            "prose-continue": "Prose continuation; no answer-quality scoring. EOS or reaching "
-            "the output budget ends a valid measurement; actual lengths are in summary.json.",
-            "prose-repeat": "Prose repeat: each request repeats a Moby Dick passage back; no "
+            "repeat": "Moby Dick repeat: each request repeats a Moby Dick passage back; no "
             "answer-quality scoring. EOS or reaching the output budget ends a valid "
             "measurement; actual lengths are in summary.json.",
-            "prose-shift": "Prose shift: each request repeats the end of a Moby Dick passage, "
+            "twist": "Moby Dick twist: each request repeats the end of a Moby Dick passage, "
             "writes new prose, and repeats the same words again; no answer-quality scoring. "
             "EOS or reaching the output budget ends a valid measurement; actual lengths are "
             "in summary.json.",
+            "code": "BigCodeBench stacked Python implementation tasks; no answer-quality "
+            "scoring. EOS or reaching the output budget ends a valid measurement; actual "
+            "lengths are in summary.json.",
             "tools": "BFCL-derived tool correctness; not an official BFCL leaderboard score. "
             "Context rows may include semantically invalid responses with complete protocol "
             "evidence; all other sections require valid semantics.",
-        }[summary["mode"]],
+        }[summary["key"]] if summary["key"] else "No template was read.",
         "",
         "Truncation, protocol errors, timeouts and cancellation are excluded from latency and "
         "rates, and retained in outcome counts and accuracy.",

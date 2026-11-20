@@ -24,7 +24,7 @@ import { LocalModelSources, type CatalogModelSource } from "./local-model-source
 import { LocalModels } from "./local-models"
 
 /** The decode speed a chosen rung should reach: a long agent conversation stays responsive. */
-export const TARGET_TOKENS_PER_SECOND = 20
+export const TARGET_TOKENS_PER_SECOND = 16
 /** The decode speed below which onboarding recommends no model. */
 export const ONBOARDING_FLOOR_TOKENS_PER_SECOND = 10
 

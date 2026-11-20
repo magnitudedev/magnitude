@@ -145,12 +145,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Value each resident request's reservation by what its replay costs
     /// per byte it holds (`Reservation::value`): the seconds one launch of
     /// its written rows takes resident from an empty history, on the load's
-    /// measured step (`LoadCosts::step`), over the reservation's bytes. A
+    /// measured prices (`LoadCosts::prices`), over the reservation's bytes. A
     /// shortage's relief preempts the request worth least first. None is
     /// valued before the load's step is measured; one that wrote no rows
     /// replays nothing and keeps no value.
     pub fn value_state(&self) -> Result<(), DomainError> {
-        let Some(step) = self.load_costs().map(|costs| &costs.step) else {
+        let Some(prices) = self.launch_prices() else {
             return Ok(());
         };
         for (sequence, state) in &self.state_claims {
@@ -158,7 +158,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 continue;
             };
             let rows = u32::try_from(state.through()).unwrap_or_else(|_| panic!("invariant violated: {sequence:?} writes rows past a launch's count"));
-            let replay = step(rows, 0).map_err(|error| DomainError::invariant(format!("the replay of {sequence:?}: {error}")))?.resident;
+            let replay = prices.launch(rows, 0).map_err(|error| DomainError::invariant(format!("the replay of {sequence:?}: {error}")))?.resident;
             state.value(crate::memory::ledger::Value::per_byte(replay, bytes));
         }
         Ok(())
@@ -342,12 +342,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .chain(queued.iter().copied().map(primed))
                         .flatten()
                         .map(|prime| prime.tokens.len())
+                        .filter(|&rows| rows > 0)
                         .collect::<Vec<_>>();
-                    if let (false, Some(state)) = (entries.is_empty(), self.head.get(request)) {
-                        let ahead = entries.iter().sum::<usize>() - entry;
-                        head.extend(state.demands(entry));
-                        head_queued.extend(state.queued_demands(entry, ahead));
-                        head_banks += entries.len();
+                    // The front head launch behind each chained forward
+                    // (`crate::two_row`) advances the head its entry rows
+                    // (`Operation::entry_rows`), right past the forward's
+                    // drafter entry: its own and its queued steps' each an
+                    // advance of its own.
+                    let fronts = std::iter::once(operation)
+                        .chain(queued.iter().copied())
+                        .filter(|operation| operation.chain().is_some())
+                        .count();
+                    if let (false, Some(state)) = (entries.is_empty() && fronts == 0, self.head.get(request)) {
+                        let own = entry + operation.entry_rows();
+                        let ahead = entries.iter().sum::<usize>() - entry
+                            + queued.iter().copied().map(Operation::entry_rows).sum::<usize>();
+                        head.extend(state.demands(own));
+                        head_queued.extend(state.queued_demands(own, ahead));
+                        head_banks += entries.len() + fronts;
                     }
                     if let Some(state) = self.target.get(request) {
                         let ahead = queued.iter().copied().map(Operation::row_count).sum::<usize>();
@@ -433,8 +445,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(());
         };
         self.bind_component(lane)?;
-        // A primed chunk's drafter entry runs on the head.
-        if operations.iter().any(|operation| matches!(operation, Operation::Forward { prime: Some(prime), .. } if !prime.tokens.is_empty())) {
+        // A primed chunk's drafter entry and a chained forward's front head launch both run on the head.
+        if operations.iter().any(|operation| {
+            matches!(
+                operation,
+                Operation::Forward { prime: Some(prime), .. } if !prime.tokens.is_empty()
+            ) || matches!(operation, Operation::Forward { chain: Some(_), .. })
+        }) {
             self.bind_component(ReservationLane::Head)?;
         }
         let bounded = operations.iter().any(|operation| matches!(operation, Operation::Forward { prime: Some(Priming { boundary: true, .. }), .. }));
@@ -950,7 +967,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let mut class = ledgers.holding(crate::memory::ledger::CommittedKind::GroupClass, claims);
             let held = class.allocate(&device, |charges| {
                 self.resources
-                    .grow_class(charges, limits.class_slots(places))
+                    .grow_class(charges, limits.class_slots(places, self.execution.load().fronts()))
                     .and_then(|slots| self.family.hold_group(charges, grown, quiet).map(|()| slots))
                     .map(|slots| self.resources.hold_class(slots))
             });
@@ -1515,7 +1532,7 @@ fn class_demand<F: ProgramFamily>(
     device: &seismic::Device,
     places: usize,
 ) -> Result<crate::memory::ClaimDemand, DomainError> {
-    let slots = execution.policy().limits().class_slots(places);
+    let slots = execution.policy().limits().class_slots(places, execution.load().fronts());
     let pools = resources.class_bytes(slots).map_err(DomainError::invariant)?;
     let graphs = resources.class_graphs(slots).map_err(DomainError::invariant)?;
     let graphs = graph_demand(device.graph_cost(), device.graph_budget(), graphs).map_err(DomainError::invariant)?;

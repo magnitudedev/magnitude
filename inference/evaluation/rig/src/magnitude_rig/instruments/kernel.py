@@ -4,12 +4,13 @@ Prepare alone, over the model's own files: tuning imports its weights as a load 
 stored format, so validation compares every configuration's output with the default's over real
 codes and scales (over the header export's zero weights every output is zero and every
 configuration is admitted alike). The work every admissible configuration of
-the named entry runs at each of the entry's tuning points for this model and context (each
-launch's own choices included, for an entry whose launches are formed separately) is formed,
-validated and timed there once, with the tuner's own cache-defeating rotations; a configuration's
-time at a point is that of the work it runs there. The rest of the model is searched in a token
-budget. It reports per point the declared default, the configuration the tuner chose, and the
-fastest work there, each the median of its samples with its deviation; then the production
+the named entry runs at each of the entry's tuning points for this model at the template's
+context (each launch's own choices included, for an entry whose launches are formed separately)
+is formed, validated and timed there once, with the tuner's own cache-defeating rotations; a
+configuration's time at a point is that of the work it runs there. The rest of the model is
+searched in a token budget. It reports per point the declared default, the configuration the
+tuner chose, and the fastest work there, each the median of its samples with its deviation; then
+the production
 search replayed against the survey: how often it lands within 1/2/5% of the true best at the
 evaluations this load allows it, and the per-point gap of one configuration for all points.
 
@@ -21,6 +22,7 @@ load's tuning.
 import argparse
 import json
 
+from .. import templates
 from ..engine import Step, Weights
 from . import Answer, Instrument, JobResult, Measure, Plan, harness, lacking
 
@@ -36,18 +38,18 @@ def configure(parser: argparse.ArgumentParser) -> None:
 
 
 def plan(arguments, source, host) -> Plan:
+    template = templates.file(arguments.template, 1)
     job = Step("kernel", (
         harness.EXECUTABLE, "prepare",
-        "--artifacts", "{artifacts}", "--fixtures", f"{{inputs}}/{arguments.fixture.name}",
+        "--artifacts", "{artifacts}", "--template", templates.argument(template),
         "--output", "{run_dir}", "--build-identity", "{build_file}",
         "--cache-dir", "{engine_cache}/kernels", "--device", arguments.backend,
-        "--context", str(arguments.context),
         "--fresh-tuning", "--tuning-budget", OTHERS_TUNING_SECONDS,
         "--tuning-survey", "{run_dir}/survey", "--tuning-survey-entries", arguments.entry,
         "--tuning-survey-samples", str(arguments.samples),
     ))  # fmt: skip
     return Plan(builds=(harness.BUILD,), jobs=(("kernel", job),), device="timed",
-                acquires=Weights(arguments.model), files=(arguments.fixture,))
+                acquires=Weights(arguments.model), files=(template,))
 
 
 def _parameters(configuration: dict) -> str:
@@ -168,7 +170,7 @@ INSTRUMENT = Instrument(
     kind="speed",
     question="How fast is this kernel entry, per configuration, at this model's shapes, and how well does the search choose?",
     observable="one entry's time per configuration and shape",
-    selectors=("backend", "host", "build", "model", "context", "fixture", "entry", "purpose", "estimate"),
+    selectors=("backend", "host", "build", "model", "template", "entry", "purpose", "estimate"),
     configure=configure,
     plan=plan,
     answer=answer,

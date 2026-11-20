@@ -1,14 +1,15 @@
-//! Metal opened-device acquisition: immutable device-wide facts are assembled
-//! into `DeviceDescription<Metal>`, while fixed probe observations on the
-//! production service become the separately bound `ExecutionProfile<Metal>`.
+//! Metal opened-device acquisition: immutable device-wide capabilities and
+//! limits are assembled into `DeviceDescription<Metal>`, while fixed probe
+//! observations on the production service become the separately bound
+//! `ExecutionProfile<Metal>`.
 //!
 //! Unknown is distinct from unsupported: a dtype is advertised only when
 //! its probe compiled and produced a pipeline.
 
 use crate::device::MetalDevice;
-use crate::facts::{
-    LanguageVersion, MatrixCombination, MetalFacts, MetalFamily, Properties, ARGUMENT_TABLE_ENTRIES,
-    MSL_GRID_INDEX_MAX, RESERVED_ARGUMENT_ENTRIES,
+use crate::device_info::{
+    LanguageVersion, MatrixCombination, MetalFamily, MetalDeviceInfo, Properties,
+    ARGUMENT_TABLE_ENTRIES, MSL_GRID_INDEX_MAX, RESERVED_ARGUMENT_ENTRIES,
 };
 use crate::{Metal, BACKEND_REVISION};
 use objc2::runtime::ProtocolObject;
@@ -42,7 +43,7 @@ use std::time::Instant;
 pub const PROBE_SUITE_REVISION: &str = "seismic-metal-probes-v2";
 
 fn addressable_resources(
-    _: &MetalFacts,
+    _: &MetalDeviceInfo,
 ) -> Vec<seismic_ir::physical_target::AddressableResourceClass> {
     Vec::new()
 }
@@ -87,8 +88,8 @@ pub fn open_device(
     crate::pooled(|| discover_device(device, &answers)).map(std::sync::Arc::new)
 }
 
-/// Gathers every Metal target fact of one device, its probes answered by
-/// `answers`.
+/// Gathers every Metal target capability and limit of one device, its probes
+/// answered by `answers`.
 fn discover_device(
     device: &MetalDevice,
     answers: &MetalProbeAnswers,
@@ -108,7 +109,7 @@ fn discover_device(
         return Err(unsupported_language());
     };
     let size = raw.maxThreadsPerThreadgroup();
-    let facts = MetalFacts {
+    let specs = MetalDeviceInfo {
         device_name: handle.name(),
         architecture: architecture_name(raw),
         operating_system: operating_system(),
@@ -134,7 +135,7 @@ fn discover_device(
         reserved_argument_entries: RESERVED_ARGUMENT_ENTRIES,
         backend_revision: BACKEND_REVISION,
     };
-    assemble_device_description(parts_from_facts(facts), registry())
+    assemble_device_description(parts_from_device_info(specs), registry())
 }
 
 fn acquire_execution_parts(
@@ -150,7 +151,7 @@ fn acquire_execution_parts(
         .copied()
         .filter(|service| {
             seismic_estimator_metal::service_available(
-                description.facts().bfloat_arithmetic,
+                description.device_info().bfloat_arithmetic,
                 description.intrinsics(),
                 *service,
             )
@@ -209,37 +210,37 @@ impl KernelAbiModel<Metal> for MetalKernelAbi {
     }
 }
 
-fn limits_of(facts: &MetalFacts) -> TargetLimits {
+fn limits_of(specs: &MetalDeviceInfo) -> TargetLimits {
     TargetLimits {
-        max_workgroup_size: facts.max_threads_per_threadgroup,
+        max_workgroup_size: specs.max_threads_per_threadgroup,
         // The exact total is pipeline-specific. This device-wide product is
         // only an outer representability bound; every admitted kernel uses
         // its reflected `maxTotalThreadsPerThreadgroup`.
-        max_workgroup_threads: facts.max_threads_per_threadgroup.into_iter().product(),
+        max_workgroup_threads: specs.max_threads_per_threadgroup.into_iter().product(),
         max_grid: [MSL_GRID_INDEX_MAX; 3],
-        max_workgroup_bytes: facts.properties.shared_bytes_per_group.get(),
+        max_workgroup_bytes: specs.properties.shared_bytes_per_group.get(),
         // Metal exposes no authoritative private-stack capacity. Participant
         // locals are realized as explicit invocation scratch and constrained
         // by their global allocation topology, not by a fabricated stack
         // limit.
         participant_local_bytes: None,
-        max_bindings: facts.argument_table_entries - facts.reserved_argument_entries,
+        max_bindings: specs.argument_table_entries - specs.reserved_argument_entries,
         // Every Metal buffer argument is one 64-bit resource address.
         max_argument_bytes: u64::from(ARGUMENT_TABLE_ENTRIES) * 8,
-        max_allocation_bytes: facts.max_buffer_bytes,
-        max_allocation_alignment: facts.buffer_alignment,
+        max_allocation_bytes: specs.max_buffer_bytes,
+        max_allocation_alignment: specs.buffer_alignment,
         max_index_bits: 64,
         // SIMD width is reflected from each concrete pipeline.
         subgroup_width: None,
     }
 }
 
-fn dtype_support_of(facts: &MetalFacts) -> DataTypeSupport {
+fn dtype_support_of(specs: &MetalDeviceInfo) -> DataTypeSupport {
     let mut scalars: BTreeSet<DType> =
         [DType::F32, DType::F16, DType::I32, DType::U32, DType::U64, DType::Bool]
             .into_iter()
             .collect();
-    if facts.bfloat_arithmetic {
+    if specs.bfloat_arithmetic {
         scalars.insert(DType::BF16);
     }
     // Atomics: native 32-bit fetch operations for i32/u32 and a 32-bit
@@ -248,7 +249,7 @@ fn dtype_support_of(facts: &MetalFacts) -> DataTypeSupport {
     // padding/alignment guarantee that dense f16/bf16 storage does not own.
     let atomics: BTreeSet<DType> = [DType::I32, DType::U32, DType::F32].into_iter().collect();
     // Representation geometry and packed decode recipes are canonical
-    // registry facts consumed by the shared emission layout.
+    // registry definitions consumed by the shared emission layout.
     let representations = registry::representations()
         .iter()
         .filter(|info| match &info.kind {
@@ -293,7 +294,7 @@ fn numerical_environment() -> NumericalEnvironment {
 }
 
 fn identity_of(
-    facts: &MetalFacts,
+    specs: &MetalDeviceInfo,
     limits: &TargetLimits,
     dtypes: &DataTypeSupport,
     numerics: &NumericalEnvironment,
@@ -307,12 +308,12 @@ fn identity_of(
     };
     field(b"format", b"seismic-metal-target-v1");
     field(b"registry", REGISTRY_REVISION.as_bytes());
-    field(b"backend", facts.backend_revision.as_bytes());
-    field(b"architecture", facts.architecture.as_bytes());
-    field(b"operating-system", facts.operating_system.as_bytes());
-    field(b"unified", &[u8::from(facts.unified_memory)]);
-    field(b"language", facts.language.label().as_bytes());
-    for family in &facts.families {
+    field(b"backend", specs.backend_revision.as_bytes());
+    field(b"architecture", specs.architecture.as_bytes());
+    field(b"operating-system", specs.operating_system.as_bytes());
+    field(b"unified", &[u8::from(specs.unified_memory)]);
+    field(b"language", specs.language.label().as_bytes());
+    for family in &specs.families {
         let tag = match family {
             MetalFamily::Metal3 => vec![0],
             MetalFamily::Metal4 => vec![1],
@@ -375,14 +376,14 @@ fn identity_of(
     for name in &numerics.approximate_transcendentals {
         field(b"approximate", name.as_bytes());
     }
-    for dtype in &facts.scalar_collective_dtypes {
+    for dtype in &specs.scalar_collective_dtypes {
         field(b"collective-dtype", &[dtype_tag(*dtype)]);
     }
-    field(b"bfloat", &[u8::from(facts.bfloat_arithmetic)]);
-    for dtype in &facts.matrix_dtypes {
+    field(b"bfloat", &[u8::from(specs.bfloat_arithmetic)]);
+    for dtype in &specs.matrix_dtypes {
         field(b"matrix-dtype", &[dtype_tag(*dtype)]);
     }
-    for combination in &facts.matrix_combinations {
+    for combination in &specs.matrix_combinations {
         field(
             b"matrix-combination",
             &[
@@ -395,15 +396,15 @@ fn identity_of(
     CompatibilityIdentity {
         backend: BackendName::Metal,
         backend_revision: BACKEND_REVISION,
-        hardware: format!("{} ({})", facts.device_name, facts.architecture),
+        hardware: format!("{} ({})", specs.device_name, specs.architecture),
         driver: format!(
             "{};registry-id={}",
-            facts.operating_system, facts.registry_id
+            specs.operating_system, specs.registry_id
         ),
         toolchain: format!(
             "metal-compiler/{};msl-{}",
-            facts.operating_system,
-            facts.language.label()
+            specs.operating_system,
+            specs.language.label()
         ),
         fingerprint: hash.finalize().into(),
     }
@@ -657,7 +658,14 @@ impl MetalProbeAnswers {
 pub(crate) fn architecture_name(device: &ProtocolObject<dyn MTLDevice>) -> String {
     // SAFETY: `architecture` is a property getter taking no arguments that returns an `MTLArchitecture` or nil.
     let architecture: Option<objc2::rc::Retained<objc2_metal::MTLArchitecture>> = unsafe { objc2::msg_send![device, architecture] };
-    crate::pooled(|| architecture.map_or_else(|| device.name(), |architecture| architecture.name()).to_string())
+    crate::pooled(|| {
+        seismic_topology::resolve(
+            &[("MTLDevice.architecture.name", &|| architecture.as_ref().map(|a| a.name().to_string()))],
+            "MTLDevice.name",
+            || device.name().to_string(),
+        )
+        .0
+    })
 }
 
 /// The answers of `device`'s capability probes, under the key of everything
@@ -950,23 +958,23 @@ const TENSOR_HEADERS_PROBE: &str = "#include <metal_tensor>\n\
 
 /// Pure target assembly from a complete immutable description. No device
 /// opening, native compilation, or timing acquisition occurs here.
-pub fn device_description_from_facts(
-    facts: MetalFacts,
+pub fn device_description_from_device_info(
+    specs: MetalDeviceInfo,
 ) -> Result<DeviceDescription<Metal>, TargetError> {
-    assemble_device_description(parts_from_facts(facts), registry())
+    assemble_device_description(parts_from_device_info(specs), registry())
 }
-fn parts_from_facts(facts: MetalFacts) -> DiscoveredTarget<Metal> {
-    let limits = limits_of(&facts);
-    let dtypes = dtype_support_of(&facts);
+fn parts_from_device_info(specs: MetalDeviceInfo) -> DiscoveredTarget<Metal> {
+    let limits = limits_of(&specs);
+    let dtypes = dtype_support_of(&specs);
     let numerics = numerical_environment();
-    let identity = identity_of(&facts, &limits, &dtypes, &numerics);
+    let identity = identity_of(&specs, &limits, &dtypes, &numerics);
     DiscoveredTarget {
         identity,
         limits,
         dtypes,
         vectors: VectorSupport::default(),
         numerics,
-        facts,
+        device_info: specs,
         kernel_abi: MetalKernelAbi,
         local_realization: LocalRealizationPolicy {
             workgroup: LocalRealization::NativeDynamic,

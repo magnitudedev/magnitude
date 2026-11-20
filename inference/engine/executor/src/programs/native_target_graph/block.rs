@@ -3,7 +3,7 @@ use super::classes::BlockClass;
 use super::{
     classes::{StagedClass, block_routed},
     heap::owned_vectors_heap,
-    weights::{BankPort, BlockWeights, GraphTimeline, GraphWeights, PlannedWeights, WeightPart, WeightPort, activation, weight_port},
+    weights::{BankPort, BlockWeights, GraphTimeline, PlannedWeights, WeightPart, WeightPort, activation, weight_port},
 };
 use crate::{
     MixerProgramSlot, ModelLoadPlan, StateResourcePlan, TargetBlockProgramSlot,
@@ -30,20 +30,20 @@ use crate::{
     programs::{
         graph::{
             GraphError,
-            draft::{Certified, GraphDraft},
-            facts::{FactIndex, FactSink, Facts, Numbers, RealIndex, TableIndex, constant, constant_reals},
+            draft::{Certified, ElementBoundDraft, GraphDraft},
+            facts::{FactIndex, FactSink, Numbers, RealIndex, TableIndex, constant, constant_reals},
             tap::{TapEntry, TapPorts, TapPositions, Taps},
         },
-        native_constants::{FamilyConstants, GraphConstant, RecordedConstant},
+        native_constants::{FamilyConstants, GraphConstant},
     },
 };
 use magnitude_family_contracts::{Decoder, ExitNorm, SublayerIndex, WeightKind, WeightRole, WeightScope};
 #[cfg(test)]
-use seismic::NativeGraphStorageBytes;
+use seismic::{NativeGraphMetadata, NativeGraphStorageBytes};
 use seismic::{
-    BackendName, ClassFact, Device, Dim, Element, HostHeap, NativeGraphClassSlice, NativeGraphLayout,
-    NativeGraphMetadata, NativeGraphPlan, NativeGraphResourceTemplate, NativeGraphTraces, NativePort,
-    NativeTimelinePort, OperandCarry, OperandForms, Reals, Table, TraceOutput, WorkflowTensor, Argument,
+    Argument, BackendName, Device, Dim, Element, HostHeap, NativeGraphClassSlice, NativeGraphLayout,
+    NativeGraphPlan, NativePort, NativeTimelinePort, OperandCarry, OperandForms, Table,
+    WorkflowTensor,
 };
 use std::sync::Arc;
 
@@ -265,9 +265,9 @@ pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
     pub per_layer: Option<NativePort>,
     /// What each step binds of a block with an n-gram input.
     pub ngram: Option<NGramStepPorts>,
-    /// The step sequence a run writes of a graph that sets its step word
-    /// (`StreamedLayer::step`).
-    pub sequence: Option<NativePort>,
+    /// What a run binds of a graph that sets its step word: its sequence and,
+    /// of a decode graph, its token rows (`StreamedLayer::step`).
+    pub step_inputs: Option<crate::operators::routed::streamed::StepInputs>,
     /// The ports of a split block's stage of the values it crosses, which
     /// each run binds to its chain region's rows of the crossing buffers
     /// and a pass to its rows of them, and of the merged values a back
@@ -416,7 +416,7 @@ impl SealedBlockGraph {
                     taps: parts.taps,
                     per_layer: parts.per_layer,
                     ngram: parts.ngram,
-                    sequence: parts.sequence,
+                    step_inputs: parts.step_inputs,
                     ports: $ports,
                     residual: parts.residual,
                     output: parts.output,
@@ -807,8 +807,8 @@ struct BlockGraphParts<F> {
     per_layer: Option<NativePort>,
     /// What each step binds of a block with an n-gram input.
     ngram: Option<NGramStepPorts>,
-    /// The step sequence a run of a graph that sets its step word writes.
-    sequence: Option<NativePort>,
+    /// What a run of a graph that sets its step word binds (`StepInputs`).
+    step_inputs: Option<crate::operators::routed::streamed::StepInputs>,
     ports: StagePorts,
     /// The span marks at the ends of a whole block whose routed layer
     /// streams, which a sampled decode step's run times its block between
@@ -887,7 +887,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
                 taps: None,
                 per_layer: None,
                 ngram: None,
-                sequence: None,
+                step_inputs: None,
                 ports,
                 span: None,
                 operand: None,
@@ -991,7 +991,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             Ok::<_, GraphError>((side, CarryPorts { carry, forms: side.reader, norm }, port))
         })
         .transpose()?;
-    let (output, sequence) = sublayers.feed_forward(
+    let (output, step_inputs) = sublayers.feed_forward(
         graph,
         feed_forward,
         streams_entries,
@@ -1017,7 +1017,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             taps: taps.map(|taps| taps.ports),
             per_layer: None,
             ngram: None,
-            sequence,
+            step_inputs,
             ports,
             span: None,
             operand,
@@ -1080,7 +1080,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         taps: taps.map(|taps| taps.ports),
         per_layer,
         ngram,
-        sequence,
+        step_inputs,
         ports,
         span,
         operand,
@@ -1120,16 +1120,16 @@ impl CheckedBlockEntries {
     }
 }
 
-/// The metadata graph of a block of `shape` at `numbers` from its checked
-/// `entries`, over `planned`: the graph, its constants, and the host heap of
-/// the vectors its prepared graph owns (`owned_vectors_heap`).
-fn checked_block_graph(
-    mut graph: NativeGraphMetadata,
+/// The metadata or sizing graph of a block of `shape` at `numbers` from its
+/// checked `entries`, over `planned`: the graph, its constants, and the host
+/// heap of the vectors its prepared graph owns (`owned_vectors_heap`).
+fn checked_block_graph<G: ElementBoundDraft + 'static>(
+    mut graph: G,
     entries: &CheckedBlockEntries,
     shape: &BlockShape,
     numbers: &BlockNumbers,
     planned: &(impl PlannedWeights + ?Sized),
-) -> Result<(NativeGraphMetadata, Vec<GraphConstant>, HostHeap), GraphError> {
+) -> Result<(G, Vec<GraphConstant>, HostHeap), GraphError> {
     let mut weights = Vec::new();
     let mut constants = Vec::new();
     let rows = &numbers.sublayers.rows;
@@ -1143,19 +1143,19 @@ fn checked_block_graph(
     let tap_elements = [("A", shape.activation)];
     let mut banks = Vec::new();
     let mut parks = Vec::new();
-    let bank = layer_bank(shape.stage, entries.bank.as_ref().map(CheckedBankEntries::entries), &mut banks, &mut parks);
+    let bank = layer_bank(shape.stage, entries.bank.as_ref().map(CheckedBankEntries::entries::<G>), &mut banks, &mut parks);
     let parts = block_graph(
         &mut graph,
         BlockEntries {
-            tap: shape.tap.map(|positions| TapEntry { entry: &tap_elements[..], positions }),
+            tap: shape.tap.map(|positions| TapEntry { entry: G::bind(&tap_elements[..]), positions }),
             mixer: entries.mixer.entries()?,
             feed_forward: FeedForwardGraph {
-                entries: entries.feed_forward.as_ref().map(block::CheckedFeedForwardEntries::entries),
+                entries: entries.feed_forward.as_ref().map(block::CheckedFeedForwardEntries::entries::<G>),
                 bank,
             },
-            per_layer: entries.per_layer.as_ref().map(CheckedPerLayerEntries::entries),
-            ngram: entries.ngram.as_ref().map(CheckedNGramEntries::entries),
-            streams: entries.streams.as_ref().map(CheckedStreamsEntries::entries),
+            per_layer: entries.per_layer.as_ref().map(CheckedPerLayerEntries::entries::<G>),
+            ngram: entries.ngram.as_ref().map(CheckedNGramEntries::entries::<G>),
+            streams: entries.streams.as_ref().map(CheckedStreamsEntries::entries::<G>),
         },
         hidden.as_ref().map(ResidualCarry::as_ref),
         shape,
@@ -1177,57 +1177,7 @@ fn checked_block_graph(
     Ok((graph, constants, owned))
 }
 
-/// A target block graph's topology key: its backend, its checked entries,
-/// its shape, and its numbers and weights as the facts they are split into.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct BlockKey {
-    backend: BackendName,
-    entries: CheckedBlockEntries,
-    shape: BlockShape<RealIndex, TableIndex>,
-    numbers: BlockNumbers<FactIndex>,
-    weights: GraphWeights<FactIndex>,
-}
-
-/// What a block graph's recording keeps beside its template: its constants,
-/// and the host heap its prepared graph's vectors own, which its topology
-/// alone decides.
-pub(super) struct RecordedBlock {
-    constants: Vec<RecordedConstant>,
-    owned: HostHeap,
-}
-
-impl TraceOutput for RecordedBlock {
-    type Value = (Vec<GraphConstant>, HostHeap);
-    fn at(&self, facts: &[u64], reals: &Reals) -> Option<Self::Value> {
-        Some((self.constants.at(facts, reals)?, self.owned))
-    }
-}
-
-/// The target block graphs' traces, one per topology key.
-pub(super) static BLOCK_TRACES: NativeGraphTraces<BlockKey, RecordedBlock> = NativeGraphTraces::new();
-
-/// The template of a target block graph of `key` at `facts`.
-fn record_block(
-    key: &BlockKey,
-    facts: &[Dim],
-    reals: &Reals,
-) -> Result<(NativeGraphResourceTemplate, RecordedBlock), GraphError> {
-    let facts = Facts::new(facts, reals);
-    let (graph, constants, owned) = checked_block_graph(
-        NativeGraphMetadata::new_template(key.backend),
-        &key.entries,
-        &facts.arguments(key.shape.clone()).tables(|table| facts.table(table)),
-        &facts.dims(key.numbers.clone()),
-        &facts.dims(key.weights.clone()),
-    )?;
-    Ok((
-        graph.seal_template()?,
-        RecordedBlock { constants: constants.iter().map(GraphConstant::recorded).collect(), owned },
-    ))
-}
-
-/// A class dimension of a block graph's slices, and the number of its split
-/// that it varies (`seismic::ClassFact`).
+/// A class dimension of a block graph's slices.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ClassNumber {
     Rows,
@@ -1237,62 +1187,32 @@ pub(super) enum ClassNumber {
 }
 
 /// The block graph `inputs` names of `slot` on `backend`, with its draft
-/// taps (`tap`), certified over each slice set of `slice_sets`, whose class
-/// dimensions `classes` names: from the block graphs' traces
-/// (`Certified::traced_each`), each with its constants and owned heap.
+/// taps (`tap`), certified over each slice set of `slice_sets`, each with its
+/// constants and owned heap.
 pub(super) fn certify_block<L: Certified>(
     backend: BackendName,
     slot: TargetBlockProgramSlot,
     tap: Option<(u64, TapPositions)>,
     inputs: BlockGraphInputs<'_>,
-    classes: &[(Option<&'static str>, &'static str, ClassNumber)],
+    _classes: &[(Option<&'static str>, &'static str, ClassNumber)],
     slice_sets: &[Vec<NativeGraphClassSlice>],
 ) -> Result<Vec<(L, (Vec<GraphConstant>, HostHeap))>, GraphError> {
-    with_block_key(backend, slot, tap, inputs, classes, |key, facts, classes| {
-        L::traced_each(&BLOCK_TRACES, key, facts, classes, slice_sets, record_block)
-    })
-}
-
-/// `trace` over the topology key of the block graph `inputs` names of
-/// `slot` on `backend`, with its draft taps (`tap`): the key, the facts it
-/// is split into, and the facts its classes vary, whose dimensions
-/// `classes` names. The key holds the block's checked entries, which live
-/// in this frame alone.
-fn with_block_key<T>(
-    backend: BackendName,
-    slot: TargetBlockProgramSlot,
-    tap: Option<(u64, TapPositions)>,
-    inputs: BlockGraphInputs<'_>,
-    classes: &[(Option<&'static str>, &'static str, ClassNumber)],
-    trace: impl FnOnce(&BlockKey, &FactSink, &[ClassFact]) -> Result<T, GraphError>,
-) -> Result<T, GraphError> {
     let entries = CheckedBlockEntries::new(inputs.state, backend, slot)?;
     let (mut banks, mut parks) = (Vec::new(), Vec::new());
-    let bank = layer_bank(inputs.stage, entries.bank.as_ref().map(CheckedBankEntries::entries), &mut banks, &mut parks);
-    let mut facts = FactSink::new();
-    let (shape, numbers) = inputs.indexed_split(slot, &bank, tap, &mut facts)?;
-    // The key names what the block reads relative to it (`relative_scope`),
-    // as its graph does.
-    let block = inputs.block()?;
-    let weights = facts.index(
-        GraphWeights::of_block(inputs.load, block, shape.exit.is_some(), shape.carries.carry_out.is_some())?
-            .relative_to(block),
+    let bank = layer_bank(
+        inputs.stage,
+        entries.bank.as_ref().map(CheckedBankEntries::entries::<L::Draft>),
+        &mut banks,
+        &mut parks,
     );
-    let classes = classes
-        .iter()
-        .map(|&(scope, dimension, number)| {
-            let sublayers = &numbers.sublayers;
-            let fact = match number {
-                ClassNumber::Rows => sublayers.rows,
-                ClassNumber::Segments => sublayers.segments,
-                ClassNumber::Listed => sublayers.listed,
-                ClassNumber::Slots => sublayers.slots,
-            };
-            ClassFact { fact: fact.position(), scope, dimension }
-        })
-        .collect::<Vec<_>>();
-    let key = BlockKey { backend, entries, shape, numbers, weights };
-    trace(&key, &facts, &classes)
+    let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(()))?;
+    let planned = inputs.weights()?;
+    let (graph, constants, owned) = checked_block_graph(L::new_draft(backend), &entries, &shape, &numbers, &planned)?;
+    let certified = L::certify_draft(graph, slice_sets)?;
+    Ok(certified
+        .into_iter()
+        .map(|layout| (layout, (constants.clone(), owned)))
+        .collect())
 }
 
 /// The metadata graph of block `inputs` names of `slot`, with its draft taps
@@ -1307,7 +1227,7 @@ pub(super) fn checked_block_graph_draft(
 ) -> Result<(NativeGraphMetadata, Vec<GraphConstant>, HostHeap), GraphError> {
     let entries = CheckedBlockEntries::new(inputs.state, graph.backend(), slot)?;
     let (mut banks, mut parks) = (Vec::new(), Vec::new());
-    let bank = layer_bank(inputs.stage, entries.bank.as_ref().map(CheckedBankEntries::entries), &mut banks, &mut parks);
+    let bank = layer_bank(inputs.stage, entries.bank.as_ref().map(CheckedBankEntries::entries::<NativeGraphMetadata>), &mut banks, &mut parks);
     let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(()))?;
     let planned = inputs.weights()?;
     checked_block_graph(graph, &entries, &shape, &numbers, &planned)

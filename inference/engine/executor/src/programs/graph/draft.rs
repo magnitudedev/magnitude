@@ -3,10 +3,12 @@
 //! storage layout and interval placement in either route.
 
 use super::GraphError;
+use super::sizing::{SizedCall, SizingDraft, SizingOutline};
 use crate::native::RangedKernels;
 use seismic::{
-    Dim, Element, Entry, LaunchEncoding, NativeGraph, NativeGraphMetadata, NativeGraphPlan, NativeGraphStorageBytes,
-    NativeKernel, NativePort, NativeTimelinePort, OperandCarry, OperandForms, WorkflowTensor,
+    BackendName, Dim, Element, EntryContract, KernelRequest, LaunchEncoding, NativeGraph,
+    NativeGraphMetadata, NativeGraphPlan, NativeGraphStorageBytes, NativeKernel, NativePort,
+    NativeTimelinePort, OperandCarry, OperandForms, WorkflowTensor,
 };
 
 /// How a block's graph takes its launch's per-step controls (coordinates,
@@ -23,12 +25,12 @@ pub(crate) enum ControlSource {
 
 pub(crate) trait GraphDraft: Sized {
     type Plan;
-    type Binding<'a, E: Entry + 'a>: Copy
+    type Binding<'a, E: EntryContract + 'a>: Copy
     where
         Self: 'a;
     /// An entry's bindings by the range of rows a node's launch takes
     /// ([`RangedKernels`]).
-    type Ranged<'a, E: Entry + 'a>: Copy
+    type Ranged<'a, E: EntryContract + 'a>: Copy
     where
         Self: 'a;
     /// The forms the graph names its operand carries in
@@ -39,13 +41,21 @@ pub(crate) trait GraphDraft: Sized {
     type Forms: Copy;
 
     /// The binding of the range `rows` lie in.
-    fn pick<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>, rows: &Dim) -> Self::Binding<'a, E>;
+    fn pick<'a, E: EntryContract + 'a>(ranged: Self::Ranged<'a, E>, rows: &Dim) -> Self::Binding<'a, E>;
     /// The binding of the lowest range, whose layout every range shares.
-    fn first<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E>;
+    fn first<'a, E: EntryContract + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E>;
 
     fn port<D: Clone>(&mut self, element: Element, extents: &[D]) -> Result<NativePort, GraphError>
     where
         Dim: From<D>;
+    /// Declare an external weight value port (tagged for assessment's decode
+    /// demand census). Default delegates to [`Self::port`].
+    fn weight_port<D: Clone>(&mut self, element: Element, extents: &[D]) -> Result<NativePort, GraphError>
+    where
+        Dim: From<D>,
+    {
+        self.port(element, extents)
+    }
     fn set_class_scope(&mut self, _scope: Option<&'static str>) {}
     fn port_with_class_extent<D: Clone>(
         &mut self,
@@ -59,13 +69,13 @@ pub(crate) trait GraphDraft: Sized {
     {
         self.port(element, extents)
     }
-    fn local_for<'a, E: Entry + 'a>(
+    fn local_for<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         parameter: &str,
         dimensions: &[(&str, impl Clone + Into<Dim>)],
     ) -> Result<NativePort, GraphError>;
-    fn input_for<'a, E: Entry + 'a>(
+    fn input_for<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         parameter: &str,
@@ -73,7 +83,7 @@ pub(crate) trait GraphDraft: Sized {
     ) -> Result<NativePort, GraphError>;
     /// An external port in the layout `entry`'s `parameter` takes at
     /// `dimensions`, which each run binds.
-    fn port_for<'a, E: Entry + 'a>(
+    fn port_for<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         parameter: &str,
@@ -81,7 +91,7 @@ pub(crate) trait GraphDraft: Sized {
     ) -> Result<NativePort, GraphError>;
     /// A launch control `entry`'s `parameter` reads at `dimensions`, as
     /// `source` gives it.
-    fn control_for<'a, E: Entry + 'a>(
+    fn control_for<'a, E: EntryContract + 'a>(
         &mut self,
         source: ControlSource,
         entry: Self::Binding<'a, E>,
@@ -93,7 +103,7 @@ pub(crate) trait GraphDraft: Sized {
             ControlSource::Bound => self.port_for(entry, parameter, dimensions),
         }
     }
-    fn enqueue<'a, E: Entry + 'a>(
+    fn enqueue<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         dimensions: &[(&str, impl Clone + Into<Dim>)],
@@ -104,7 +114,7 @@ pub(crate) trait GraphDraft: Sized {
     /// are encoded only while the word is nonzero (`WhileSet`) or zero
     /// (`WhileClear`), as the host reads it when a run is queued. Planning
     /// holds the node whether or not a run encodes it.
-    fn enqueue_under<'a, E: Entry + 'a>(
+    fn enqueue_under<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         dimensions: &[(&str, impl Clone + Into<Dim>)],
@@ -181,14 +191,14 @@ fn fixed_dimensions<'n>(dimensions: &[(&'n str, impl Clone + Into<Dim>)]) -> Vec
 
 impl GraphDraft for NativeGraph {
     type Plan = NativeGraphPlan;
-    type Binding<'a, E: Entry + 'a> = &'a NativeKernel<E>;
-    type Ranged<'a, E: Entry + 'a> = &'a RangedKernels<E>;
+    type Binding<'a, E: EntryContract + 'a> = &'a NativeKernel<E>;
+    type Ranged<'a, E: EntryContract + 'a> = &'a RangedKernels<E>;
     type Forms = OperandForms;
 
-    fn pick<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>, rows: &Dim) -> Self::Binding<'a, E> {
+    fn pick<'a, E: EntryContract + 'a>(ranged: Self::Ranged<'a, E>, rows: &Dim) -> Self::Binding<'a, E> {
         ranged.for_rows(rows)
     }
-    fn first<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E> {
+    fn first<'a, E: EntryContract + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E> {
         ranged.first()
     }
 
@@ -198,7 +208,7 @@ impl GraphDraft for NativeGraph {
     {
         self.port(element, &fixed_extents(extents)).map_err(invalid)
     }
-    fn local_for<'a, E: Entry + 'a>(
+    fn local_for<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         parameter: &str,
@@ -207,7 +217,7 @@ impl GraphDraft for NativeGraph {
         self.local_for(entry, parameter, &fixed_dimensions(dimensions))
             .map_err(invalid)
     }
-    fn input_for<'a, E: Entry + 'a>(
+    fn input_for<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         parameter: &str,
@@ -216,7 +226,7 @@ impl GraphDraft for NativeGraph {
         self.input_for(entry, parameter, &fixed_dimensions(dimensions))
             .map_err(invalid)
     }
-    fn port_for<'a, E: Entry + 'a>(
+    fn port_for<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         parameter: &str,
@@ -225,7 +235,7 @@ impl GraphDraft for NativeGraph {
         self.port_for(entry, parameter, &fixed_dimensions(dimensions))
             .map_err(invalid)
     }
-    fn enqueue<'a, E: Entry + 'a>(
+    fn enqueue<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         _dimensions: &[(&str, impl Clone + Into<Dim>)],
@@ -233,7 +243,7 @@ impl GraphDraft for NativeGraph {
     ) -> Result<E::WorkflowResults, GraphError> {
         self.enqueue(entry, args).map_err(invalid)
     }
-    fn enqueue_under<'a, E: Entry + 'a>(
+    fn enqueue_under<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         _dimensions: &[(&str, impl Clone + Into<Dim>)],
@@ -287,14 +297,14 @@ impl GraphDraft for NativeGraph {
 
 impl GraphDraft for NativeGraphMetadata {
     type Plan = NativeGraphStorageBytes;
-    type Binding<'a, E: Entry + 'a> = &'a [(&'a str, Element)];
-    type Ranged<'a, E: Entry + 'a> = &'a [(&'a str, Element)];
+    type Binding<'a, E: EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Ranged<'a, E: EntryContract + 'a> = &'a [(&'a str, Element)];
     type Forms = ();
 
-    fn pick<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>, _rows: &Dim) -> Self::Binding<'a, E> {
+    fn pick<'a, E: EntryContract + 'a>(ranged: Self::Ranged<'a, E>, _rows: &Dim) -> Self::Binding<'a, E> {
         ranged
     }
-    fn first<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E> {
+    fn first<'a, E: EntryContract + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E> {
         ranged
     }
 
@@ -319,7 +329,7 @@ impl GraphDraft for NativeGraphMetadata {
     {
         Ok(self.port_with_class_extent(element, extents, extent_axis, class_dimension)?)
     }
-    fn local_for<'a, E: Entry + 'a>(
+    fn local_for<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         parameter: &str,
@@ -327,7 +337,7 @@ impl GraphDraft for NativeGraphMetadata {
     ) -> Result<NativePort, GraphError> {
         Ok(self.local_for::<E>(entry, parameter, dimensions)?)
     }
-    fn input_for<'a, E: Entry + 'a>(
+    fn input_for<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         parameter: &str,
@@ -335,7 +345,7 @@ impl GraphDraft for NativeGraphMetadata {
     ) -> Result<NativePort, GraphError> {
         Ok(self.input_for::<E>(entry, parameter, dimensions)?)
     }
-    fn port_for<'a, E: Entry + 'a>(
+    fn port_for<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         parameter: &str,
@@ -343,7 +353,7 @@ impl GraphDraft for NativeGraphMetadata {
     ) -> Result<NativePort, GraphError> {
         Ok(self.port_for::<E>(entry, parameter, dimensions)?)
     }
-    fn enqueue<'a, E: Entry + 'a>(
+    fn enqueue<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         dimensions: &[(&str, impl Clone + Into<Dim>)],
@@ -354,7 +364,7 @@ impl GraphDraft for NativeGraphMetadata {
     /// Planning holds a conditioned node as any other (its storage is the
     /// graph's whether or not a run encodes it), its condition kept for the
     /// proof that results may share storage.
-    fn enqueue_under<'a, E: Entry + 'a>(
+    fn enqueue_under<'a, E: EntryContract + 'a>(
         &mut self,
         entry: Self::Binding<'a, E>,
         dimensions: &[(&str, impl Clone + Into<Dim>)],
@@ -401,92 +411,91 @@ impl GraphDraft for NativeGraphMetadata {
     }
 }
 
+/// A [`GraphDraft`] whose entry bindings are element slices (`&[(&str, Element)]`)
+/// and whose operand carry forms are `()`: implemented by both
+/// [`NativeGraphMetadata`] (load layout certification) and [`SizingDraft`]
+/// (direct contract sizing for assessment).
+pub(crate) trait ElementBoundDraft: GraphDraft<Forms = ()> {
+    fn bind<'a, E: EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Binding<'a, E>;
+    fn bind_ranged<'a, E: EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Ranged<'a, E>;
+}
+
+impl ElementBoundDraft for NativeGraphMetadata {
+    fn bind<'a, E: EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Binding<'a, E> {
+        elements
+    }
+    fn bind_ranged<'a, E: EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Ranged<'a, E> {
+        elements
+    }
+}
+
+impl ElementBoundDraft for SizingDraft {
+    fn bind<'a, E: EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Binding<'a, E> {
+        elements
+    }
+    fn bind_ranged<'a, E: EntryContract + 'a>(
+        elements: &'a [(&'a str, Element)],
+    ) -> Self::Ranged<'a, E> {
+        elements
+    }
+}
+
 /// What a structural regime's classes certify to: the layout a load seals
-/// them into ([`NativeGraphLayout`]), or exactly what that layout holds,
-/// without building it ([`seismic::NativeGraphOutline`]), which the
-/// assessment charges. Every family's enumeration builds either from the
-/// same templates and classes.
-///
-/// A family on graph traces (`seismic::trace`) certifies through
-/// [`Self::traced_each`] (or [`Self::traced`] for one slice set): one recorder, recorded once at the model's facts
-/// for the load's layouts, and looked up in the family's traces for
-/// assessment's outlines.
+/// them into ([`seismic::NativeGraphLayout`]), or the direct contract-sized
+/// outline ([`SizingOutline`]) that assessment charges. Every family's
+/// enumeration builds either from the same topology builder and class slices.
 pub(crate) trait Certified: Clone {
-    fn of(
-        template: &seismic::NativeGraphResourceTemplate,
-        slices: &[seismic::NativeGraphClassSlice],
-    ) -> Result<Self, seismic::NativeGraphMetadataError>;
-    /// What `record`'s template of topology `key` at `facts` (a model's
-    /// split: its facts and its reals) certifies to over each slice set of
-    /// `slice_sets`, with the builder's output at `facts`: one recording for the load, one trace lookup per set for
-    /// assessment. `classes` names the facts the slices vary
-    /// (`seismic::ClassFact`).
-    fn traced_each<K: Clone + Eq + std::hash::Hash, X: seismic::TraceOutput>(
-        traces: &seismic::NativeGraphTraces<K, X>,
-        key: &K,
-        facts: &super::facts::FactSink,
-        classes: &[seismic::ClassFact],
+    type Draft: ElementBoundDraft + 'static;
+
+    fn new_draft(backend: BackendName) -> Self::Draft;
+    fn certify_draft(
+        draft: Self::Draft,
         slice_sets: &[Vec<seismic::NativeGraphClassSlice>],
-        record: seismic::GraphRecorder<K, X, GraphError>,
-    ) -> Result<Vec<(Self, X::Value)>, GraphError>
-    where
-        X::Value: Clone;
-    /// [`Self::traced_each`] over the one slice set `slices`.
-    ///
-    /// # Panics
-    ///
-    /// Where `traced_each` does not answer one set with one result.
-    fn traced<K: Clone + Eq + std::hash::Hash, X: seismic::TraceOutput>(
-        traces: &seismic::NativeGraphTraces<K, X>,
-        key: &K,
-        facts: &super::facts::FactSink,
-        classes: &[seismic::ClassFact],
+    ) -> Result<Vec<Self>, GraphError>;
+    fn certify_one(
+        draft: Self::Draft,
         slices: Vec<seismic::NativeGraphClassSlice>,
-        record: seismic::GraphRecorder<K, X, GraphError>,
-    ) -> Result<(Self, X::Value), GraphError>
-    where
-        X::Value: Clone,
-    {
-        let [certified]: [_; 1] = Self::traced_each(traces, key, facts, classes, &[slices], record)?
+    ) -> Result<Self, GraphError> {
+        let [certified]: [_; 1] = Self::certify_draft(draft, &[slices])?
             .try_into()
-            .unwrap_or_else(|results: Vec<_>| panic!("one slice set certified to {} results", results.len()));
+            .unwrap_or_else(|results: Vec<_>| {
+                panic!("one slice set certified to {} results", results.len())
+            });
         Ok(certified)
     }
     fn storage_bytes(&self) -> NativeGraphStorageBytes;
     fn plan_heap(&self) -> seismic::HostHeap;
     fn bound_heap(&self) -> seismic::HostHeap;
+    fn sizing_census(&self) -> Option<(&[SizedCall], &[KernelRequest], usize)> {
+        None
+    }
 }
 
 impl Certified for seismic::NativeGraphLayout {
-    fn of(
-        template: &seismic::NativeGraphResourceTemplate,
-        slices: &[seismic::NativeGraphClassSlice],
-    ) -> Result<Self, seismic::NativeGraphMetadataError> {
-        template.certify(slices)
+    type Draft = NativeGraphMetadata;
+
+    fn new_draft(backend: BackendName) -> Self::Draft {
+        NativeGraphMetadata::new_template(backend)
     }
-    /// One recording at the model's facts: a load's graphs are its own
-    /// model's.
-    fn traced_each<K: Clone + Eq + std::hash::Hash, X: seismic::TraceOutput>(
-        _traces: &seismic::NativeGraphTraces<K, X>,
-        key: &K,
-        facts: &super::facts::FactSink,
-        classes: &[seismic::ClassFact],
+    fn certify_draft(
+        draft: Self::Draft,
         slice_sets: &[Vec<seismic::NativeGraphClassSlice>],
-        record: seismic::GraphRecorder<K, X, GraphError>,
-    ) -> Result<Vec<(Self, X::Value)>, GraphError>
-    where
-        X::Value: Clone,
-    {
-        let (layouts, output) =
-            seismic::NativeGraphTraces::<K, X>::certify(
-                key,
-                facts.values(),
-                facts.reals(),
-                classes,
-                slice_sets,
-                record,
-            )?;
-        Ok(layouts.into_iter().map(|layout| (layout, output.clone())).collect())
+    ) -> Result<Vec<Self>, GraphError> {
+        let template = draft.seal_template()?;
+        slice_sets
+            .iter()
+            .map(|slices| template.certify(slices).map_err(GraphError::from))
+            .collect()
     }
     fn storage_bytes(&self) -> NativeGraphStorageBytes {
         self.storage_bytes()
@@ -499,25 +508,17 @@ impl Certified for seismic::NativeGraphLayout {
     }
 }
 
-impl Certified for seismic::NativeGraphOutline {
-    fn of(
-        template: &seismic::NativeGraphResourceTemplate,
-        slices: &[seismic::NativeGraphClassSlice],
-    ) -> Result<Self, seismic::NativeGraphMetadataError> {
-        template.outline(slices)
+impl Certified for SizingOutline {
+    type Draft = SizingDraft;
+
+    fn new_draft(backend: BackendName) -> Self::Draft {
+        SizingDraft::new(backend)
     }
-    fn traced_each<K: Clone + Eq + std::hash::Hash, X: seismic::TraceOutput>(
-        traces: &seismic::NativeGraphTraces<K, X>,
-        key: &K,
-        facts: &super::facts::FactSink,
-        classes: &[seismic::ClassFact],
+    fn certify_draft(
+        draft: Self::Draft,
         slice_sets: &[Vec<seismic::NativeGraphClassSlice>],
-        record: seismic::GraphRecorder<K, X, GraphError>,
-    ) -> Result<Vec<(Self, X::Value)>, GraphError>
-    where
-        X::Value: Clone,
-    {
-        traces.outline(key, facts.values(), facts.reals(), classes, slice_sets, record)
+    ) -> Result<Vec<Self>, GraphError> {
+        draft.certify_each(slice_sets)
     }
     fn storage_bytes(&self) -> NativeGraphStorageBytes {
         self.storage_bytes()
@@ -527,5 +528,8 @@ impl Certified for seismic::NativeGraphOutline {
     }
     fn bound_heap(&self) -> seismic::HostHeap {
         self.bound_heap()
+    }
+    fn sizing_census(&self) -> Option<(&[SizedCall], &[KernelRequest], usize)> {
+        Some((self.launches(), self.kernels(), self.timeline_count()))
     }
 }

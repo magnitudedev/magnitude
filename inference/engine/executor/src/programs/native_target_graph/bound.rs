@@ -59,6 +59,8 @@ pub(crate) struct BoundTargetGraphs {
 pub(crate) struct BankRun {
     pub(crate) bank: Arc<crate::experts::ExpertBank>,
     pub(crate) sequence: u64,
+    /// The step's front rows (STEP_FRONT's bits), its step words carry.
+    pub(crate) front: u32,
     pub(crate) sampled: bool,
     pub(crate) resident: bool,
 }
@@ -258,6 +260,11 @@ pub(crate) struct GroupBuffers {
     /// (`kept_tokens`), and its blocks read them; a step of selected tokens
     /// reads its selection.
     pub token_rows: Option<seismic::Tensor>,
+    /// The host's guesses kept for a step of host tokens, of a load that
+    /// fronts: `[rows, 2]` (guess, kind) rows its front rows run on, which
+    /// its entry copies into its region as it keeps its tokens
+    /// (`PreparedTargetEntryGraph::kept_guesses`) and its step words read.
+    pub kept_guesses: Option<seismic::Tensor>,
     /// The group's crossing and merged positions beside the load's pass
     /// buffers, of a load whose blocks split.
     split: Option<SplitValues<seismic::Tensor>>,
@@ -317,6 +324,7 @@ impl GroupBuffers {
             taps: allocate(&extents.taps)?,
             per_layer_rows: allocate(&extents.per_layer)?,
             token_rows: allocate(&extents.tokens)?,
+            kept_guesses: allocate(&extents.guesses)?,
             split,
             blocks,
             operands,
@@ -346,7 +354,7 @@ impl GroupBuffers {
     fn storage(&self) -> impl Iterator<Item = &seismic::Tensor> {
         let split = self.split.iter().flat_map(|split| split.crossing.iter().chain([&split.merged.inverse]));
         let operands = self.operands.iter().flatten().flatten();
-        self.taps.iter().chain(&self.per_layer_rows).chain(&self.token_rows).chain(split).chain(operands)
+        self.taps.iter().chain(&self.per_layer_rows).chain(&self.token_rows).chain(&self.kept_guesses).chain(split).chain(operands)
     }
 }
 

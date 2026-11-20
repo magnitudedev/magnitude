@@ -48,6 +48,11 @@ TEMPLATES_API int32_t templates_template_inspect(templates_handle handle,
  * Context may not replace artifact special tokens. Output is UTF-8 prompt bytes. */
 TEMPLATES_API int32_t templates_template_render(templates_handle handle,
     const uint8_t * json, uint64_t size, templates_buffer * output, templates_buffer * error);
+/* Single-call probe: applies a request without retaining a prepared handle and
+ * returns a compact JSON signature with prompt, generation_prefix, 128-bit hex
+ * hashes of parser and grammar, and thinking metadata. */
+TEMPLATES_API int32_t templates_template_probe(templates_handle handle,
+    const uint8_t * input, uint64_t size, templates_buffer * output, templates_buffer * error);
 /* Prepared requests retain all parser/grammar data independently of the template.
  * Request payload includes messages, tools, tool_choice, parallel_tool_calls,
  * template_arguments, optional json_schema, and explicit now. enable_thinking is

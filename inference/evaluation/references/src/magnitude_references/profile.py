@@ -53,7 +53,7 @@ def install():
         run_batch(reference, group, writer, sanity)
         wall = time.perf_counter() - started
         with lock:
-            line = {"profile": "batch", "fixtures": len(group), "wall_s": round(wall, 3), "workers": model.WORKERS,
+            line = {"profile": "batch", "sessions": len(group), "wall_s": round(wall, 3), "workers": model.WORKERS,
                     "read_thread_s": round(spent["read"], 3), "dequantize_thread_s": round(spent["dequantize"], 3)}
         print(json.dumps(line), file=sys.stderr, flush=True)
 

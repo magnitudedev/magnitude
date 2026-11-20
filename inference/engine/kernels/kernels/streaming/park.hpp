@@ -92,6 +92,18 @@ STREAMING_FN u64 streaming_step(STREAMING_DEVICE_READ step, u64 stride) {
            u64(u32(streaming_device_load(STREAMING_AT(step, SEISMIC_CONST_STEP_LOW * stride))));
 }
 
+// Whether the route left choice `choice` of the step (`step`, stride `step0`)
+// absent: its source in the step's routing record (`routing`'s row q mod
+// `flight`, strides `routing0` and `routing1`, choice c's source at
+// ROUTING_SOURCE(`width`, c), as streaming/resolve.hpp writes it) is -1: the
+// late gate/up pass's test.
+STREAMING_FN bool streaming_left_absent(STREAMING_DEVICE_READ step, u64 step0, STREAMING_SYSTEM_READ routing,
+    u64 routing0, u64 routing1, u32 flight, u32 width, u32 choice) {
+    const u64 q = streaming_step(step, step0);
+    const u64 at = streaming_modulo(q, u64(flight)) * routing0 + u64(SEISMIC_CONST_ROUTING_SOURCE(width, choice)) * routing1;
+    return streaming_load(STREAMING_AT(routing, at)) == -1;
+}
+
 // The record a map's row holds for step `q` (streaming_words.seismic's map,
 // `held` in routed.seismic): `row` the row's first word, `stride` its words'
 // stride (1: a row's words are contiguous, so each step is one aligned u64).

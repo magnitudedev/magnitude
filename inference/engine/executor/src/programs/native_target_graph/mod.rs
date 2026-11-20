@@ -41,13 +41,15 @@ pub(crate) use weights::{
     weight_scale_port,
 };
 
-use crate::operators::routed::split::{Extents, SplitValues};
+use crate::{
+    operators::routed::split::{Extents, SplitValues},
+};
 use classes::BlockServed;
 use seismic::Element;
 
 /// The buffers a prompt group holds over its rows, a region per place
 /// (`GroupBuffers`): the draft input rows of a tapped target, the per-layer
-/// rows, the kept token rows, and its split layers' crossing and merged
+/// rows, the kept token rows and guesses, and its split layers' crossing and merged
 /// positions (`SplitValues::at_rows`) in the load's one buffer of each
 /// (`SplitValues::widest`), beside the merged experts and row table of the
 /// group's pass, which every group shares (`pass_bytes`).
@@ -55,6 +57,7 @@ struct GroupExtents {
     taps: Option<Extents>,
     per_layer: Option<Extents>,
     tokens: Option<Extents>,
+    guesses: Option<Extents>,
     split: Option<SplitValues<Extents>>,
 }
 
@@ -65,6 +68,7 @@ impl GroupExtents {
         taps: Option<(Element, [u64; 2])>,
         per_layer: Option<[u64; 2]>,
         tokens: Option<[u64; 2]>,
+        guesses: Option<[u64; 2]>,
         served: &[BlockServed],
         rows: u64,
     ) -> Self {
@@ -72,6 +76,7 @@ impl GroupExtents {
             taps: taps.map(|(element, [_, width])| (element, vec![rows, width])),
             per_layer: per_layer.map(|[_, width]| (Element::f32(), vec![rows, width])),
             tokens: tokens.map(|[_, width]| (Element::i32(), vec![rows, width])),
+            guesses: guesses.map(|[_, width]| (Element::i32(), vec![rows, width])),
             split: SplitLayers::of(served).map(|layers| layers.at_rows(rows)),
         }
     }
@@ -79,7 +84,7 @@ impl GroupExtents {
     /// The group's own buffers.
     fn owned(&self) -> impl Iterator<Item = &Extents> {
         let split = self.split.iter().flat_map(|split| split.crossing.iter().chain([&split.merged.inverse]));
-        self.taps.iter().chain(&self.per_layer).chain(&self.tokens).chain(split)
+        self.taps.iter().chain(&self.per_layer).chain(&self.tokens).chain(&self.guesses).chain(split)
     }
 
     /// Bytes of the group's own buffers.
@@ -111,8 +116,12 @@ struct GroupRows {
     /// every per-layer input sublayer reads.
     per_layer: Option<[u64; 2]>,
     /// The `[rows, 2]` I32 extents of one region of the token rows a model
-    /// whose blocks read them keeps (`keeps_token_rows`).
+    /// that reads them past its entry keeps
+    /// (`ModelLoadPlan::keeps_token_rows`).
     tokens: Option<[u64; 2]>,
+    /// The `[rows, 2]` I32 extents of one region of the host's guesses a
+    /// load that fronts keeps (`PreparedTargetEntryGraph::kept_guesses`).
+    guesses: Option<[u64; 2]>,
     /// The rows of one chain region of the launch-row buffers: the largest
     /// row class.
     region_rows: u64,
@@ -130,6 +139,7 @@ impl GroupRows {
             taps: tap_width.map(|width| (activation(geometry), [largest_rows, width])),
             per_layer: prepared::per_layer_rows(plan, largest_rows),
             tokens: entry::token_rows_extents(load, largest_rows),
+            guesses: load.fronts().then_some([largest_rows, 2]),
             region_rows: largest_rows,
         }
     }
@@ -144,7 +154,7 @@ impl GroupRows {
     /// The buffers a prompt group of `places` places holds over the blocks
     /// `served`.
     fn extents(&self, served: &[BlockServed], places: usize) -> GroupExtents {
-        GroupExtents::of(self.taps, self.per_layer, self.tokens, served, self.region_start(places))
+        GroupExtents::of(self.taps, self.per_layer, self.tokens, self.guesses, served, self.region_start(places))
     }
 
     /// The bytes a group of `places` places' own buffers hold beside the

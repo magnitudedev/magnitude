@@ -19,7 +19,6 @@ pub mod fixtures;
 mod gather;
 mod host;
 mod inventory;
-mod machine;
 mod pressure;
 mod processors;
 mod status;
@@ -30,14 +29,15 @@ mod tests;
 
 pub use gather::DiscoveryError;
 pub use host::{
-    host_sample, Counted, Harm, HostSample, Lag, ObservationError, OwnCold, OwnReclaimed, PressureLevel, Supply, WiredFigures, WiredLimit,
+    host_sample, ColdPages, Counted, Harm, HostSample, Lag, OwnReclaimed, PressureLevel, Supply,
+    WiredFigures, WiredLimit,
 };
 pub use inventory::Inventory;
-pub use machine::{Machine, MachineFormFactor, MachineIdentity};
-pub use processors::{
-    device_node, pin, place_process, Core, DeviceNode, MemoryNode, PciLocation, ProcessPlacement,
-    Processors, ProcessorsReportedBy,
-};
 pub use pressure::{PressureEvents, PressureWaker, Wake};
-pub use status::{RuntimeStatus, Sample, Status};
+pub use processors::{
+    device_node, discover_processors, pin, place_process, Core, HostNode, MemoryNode, PciLocation,
+    ProcessPlacement, Processors,
+};
+pub use seismic_topology::{FormFactor, HardwareIdentity, SystemIdentity};
+pub use status::{ObservationError, RuntimeStatus, Sample, Status};
 pub use volume::{identify as volume_identity, volume_available};

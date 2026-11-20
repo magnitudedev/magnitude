@@ -173,7 +173,8 @@ def test_a_request_the_drafter_proposed_nothing_for_is_a_valid_measurement():
 
     declined, drafted = response(None), response((7, 5))
     assert "draft_n" not in declined["timings"]
-    rows = [{"target": "magnitude", "section": "context", "checkpoint": 4096, "concurrency": 1, "family": "prose",
+    rows = [{"target": "magnitude", "section": "context", "checkpoint": 4096, "concurrency": 1,
+             "template": "repeat:4k", "key": "continue",
              "phase": "measured", "timing_basis": "native",
              "observation": {"outcome": "valid", "terminal": terminal, "ttft_ms": 5, "completed_ms": 55}}
             for terminal in (declined, drafted)]

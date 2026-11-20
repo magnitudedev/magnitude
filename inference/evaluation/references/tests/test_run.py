@@ -39,16 +39,17 @@ def test_contract_logits_output(tmp_path: Path, tiny_llama: Path) -> None:
     assert header["model"] == "tiny:gguf:f32"
     assert header["rendered_digest"] == sha256(rendered)
     assert header["vocabulary"] == VOCAB
-    expected_rows = [{"fixture_id": f"test/{index}", "position": position}
-                     for index, (_, spans) in enumerate(FIXTURES) for start, end in spans
+    expected_rows = [{"template": "repeat:1k", "lane": lane, "position": position}
+                     for lane, (_, spans) in enumerate(FIXTURES) for start, end in spans
                      for position in range(start - 1, end - 1)]
     assert header["rows"] == expected_rows
     assert values.shape == (len(expected_rows), VOCAB)
     assert (output / "logits.f32").stat().st_size == len(expected_rows) * VOCAB * 4
-    assert set(record) == {"model", "rendered_digest", "family", "implementation_digest", "platform", "dtype", "sanity"}
+    assert set(record) == {"model", "template", "prompt_sha256", "rendered_digest", "family", "implementation_digest",
+                           "platform", "dtype", "sanity"}
     assert record["family"] == "llama" and record["dtype"] == "float32"
-    assert set(record["sanity"]) == {"perplexity", "top1_accuracy", "bounds", "passed", "fixtures"}
-    assert [fixture["fixture_id"] for fixture in record["sanity"]["fixtures"]] == ["test/0", "test/1", "test/2"]
+    assert set(record["sanity"]) == {"perplexity", "top1_accuracy", "bounds", "passed", "sessions"}
+    assert [session["lane"] for session in record["sanity"]["sessions"]] == [0, 1, 2]
     assert json.loads((output / "reference.json").read_text()) == record
     result = json.loads((output / "result.json").read_text())
     assert result["schema"] == "evaluation-result/1" and result["tool"] == "reference"
@@ -56,7 +57,7 @@ def test_contract_logits_output(tmp_path: Path, tiny_llama: Path) -> None:
     assert result["rendered_digest"] == header["rendered_digest"]
     assert result["artifacts"]["target"] == str(tiny_llama)
 
-    # Every row equals an unbatched, unpadded forward of its own fixture (padding and batching are
+    # Every row equals an unbatched, unpadded forward of its own session (padding and batching are
     # exact), at position i - 1 for scored token i.
     reference = open_reference(tiny_llama, CPU, cache=True)
     row = 0
@@ -181,7 +182,7 @@ def test_cli_exit_status_follows_the_gate(tmp_path: Path, tiny_llama: Path) -> N
     (lambda line: line | {"scored_spans": [[0, 4]]}, "token 0"),
     (lambda line: line | {"scored_spans": []}, "no scored span"),
     (lambda line: line | {"model": "other:gguf:q4"}, "different model"),
-    (lambda line: {k: v for k, v in line.items() if k != "template_sha256"}, "missing"),
+    (lambda line: {k: v for k, v in line.items() if k != "chat_template_sha256"}, "missing"),
 ])
 def test_contract_violations_are_refused(tmp_path: Path, tiny_llama: Path, change, message: str) -> None:
     rendered, artifacts = write_rendered(tmp_path, tiny_llama, FIXTURES)

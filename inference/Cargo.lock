@@ -2241,6 +2241,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnitude-cost-model"
+version = "0.1.0"
+dependencies = [
+ "seismic-measure",
+ "serde",
+]
+
+[[package]]
 name = "magnitude-engine"
 version = "0.1.0"
 dependencies = [
@@ -2249,6 +2257,7 @@ dependencies = [
  "magnitude-artifacts",
  "magnitude-batching",
  "magnitude-chat",
+ "magnitude-cost-model",
  "magnitude-executor",
  "magnitude-family-common",
  "magnitude-family-contracts",
@@ -2306,6 +2315,7 @@ dependencies = [
  "libc",
  "magnitude-artifacts",
  "magnitude-batching",
+ "magnitude-cost-model",
  "magnitude-family-common",
  "magnitude-family-contracts",
  "magnitude-family-dflash",
@@ -2516,6 +2526,7 @@ dependencies = [
  "libc",
  "magnitude-artifacts",
  "magnitude-chat",
+ "magnitude-cost-model",
  "magnitude-engine",
  "magnitude-executor",
  "magnitude-family-contracts",
@@ -2694,7 +2705,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "sysinfo",
  "tempfile",
  "tokio",
  "tower",
@@ -4161,6 +4171,7 @@ dependencies = [
  "seismic-discovery",
  "seismic-lang",
  "seismic-measure",
+ "seismic-memory",
  "seismic-native-cpu",
  "seismic-runtime",
  "seismic-std",
@@ -4255,6 +4266,7 @@ dependencies = [
  "seismic-native-target",
  "seismic-topology",
  "sha2 0.11.0",
+ "tracing",
 ]
 
 [[package]]
@@ -4272,7 +4284,6 @@ dependencies = [
  "seismic-threads",
  "seismic-topology",
  "seismic-vulkan",
- "serde",
  "serde_json",
  "windows",
  "windows-sys 0.61.2",
@@ -4482,6 +4493,7 @@ dependencies = [
  "seismic-native-target",
  "seismic-topology",
  "spirv-tools",
+ "tracing",
 ]
 
 [[package]]

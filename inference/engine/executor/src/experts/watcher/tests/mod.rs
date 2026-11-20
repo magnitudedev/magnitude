@@ -1,5 +1,6 @@
 mod decode;
 mod failure;
+mod front;
 mod harness;
 mod hints;
 mod lending;

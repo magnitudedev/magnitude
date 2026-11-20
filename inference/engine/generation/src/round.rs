@@ -2,7 +2,7 @@ use crate::{
     accept_prefix, verification_selects, Constraint, Demand, MethodRequirements, Sampling,
     SelectSpec, Shaping, TokenId, WorkKind,
 };
-use magnitude_executor::{ConditioningRef, Operation, Priming, RequestId};
+use magnitude_executor::{AheadVerdict, ChainEntry, ConditioningRef, FrontRow, Guess, Operation, PhysicalDecision, Priming, RequestId, RowResult, Rows, Selected, TwoRowDecode};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -10,11 +10,18 @@ pub struct RoundForward {
     pub kind: WorkKind,
     pub tokens: Vec<TokenId>,
     pub demand: Demand,
-    /// One selection row per input row for Decode/Verify.
+    /// One selection row per input row a decision may accept, for
+    /// Decode/Verify.
     pub selects: Vec<SelectSpec>,
     pub committed: usize,
     /// A prompt chunk's drafter entry, drafted behind the chunk.
     pub prime: Option<Priming>,
+    /// Its front rows, its last token rows by depth (`Operation::Forward`'s
+    /// `front`).
+    pub front: Vec<FrontRow>,
+    /// Its entry into the MTP head behind it, of a sequence decoding in
+    /// front passes (`Operation::Forward`'s `chain`).
+    pub chain: Option<ChainEntry>,
 }
 
 impl RoundForward {
@@ -34,9 +41,40 @@ impl RoundForward {
             select: self.selects,
             committed: self.committed,
             prime: self.prime,
+            front: self.front,
+            chain: self.chain,
         };
         operation.validate().map_err(|error| error.to_string())?;
         Ok(operation)
+    }
+
+    /// The samples its round is reconciled by ([`RoundState::reconcile`]),
+    /// from its outcome's `rows` (the rows a decision may accept, never a
+    /// front row's): each selected row's token, in row order. The one
+    /// reading of a forward's selections, the scheduler's and the
+    /// evaluation harness's alike.
+    pub fn samples(&self, rows: &[RowResult]) -> Result<Vec<TokenId>, String> {
+        if rows.len() != self.tokens.len() - self.front.len() {
+            return Err("target round returned the wrong number of rows".into());
+        }
+        let selected = rows.iter().filter_map(|row| row.selected).collect::<Vec<_>>();
+        if selected.len() != self.selects.len() {
+            return Err(match self.selects.is_empty() {
+                true => "non-selecting target round returned an unexpected sample".into(),
+                false => "target round selection count differs from its rows".into(),
+            });
+        }
+        selected.into_iter().map(selected_token).collect()
+    }
+}
+
+/// A row's selected token, or why its sampling selected none.
+fn selected_token(selected: Selected) -> Result<TokenId, String> {
+    match selected.status {
+        0 => Ok(selected.token),
+        1 => Err("sampling distribution is empty".into()),
+        2 => Err("sampling distribution is nonfinite".into()),
+        _ => Err("sampling returned an unknown status".into()),
     }
 }
 
@@ -48,6 +86,30 @@ pub struct RoundAcceptance {
     pub proposed: usize,
     pub accepted_proposals: usize,
     pub method_update: MethodUpdate,
+    /// How the pass's guessed rows fared, for the executor's reads ahead.
+    /// Empty of any round that is not a pass.
+    pub verdict: AheadVerdict,
+}
+
+impl RoundAcceptance {
+    /// The decision the executor reconciles the round's outcome by: its
+    /// committed rows and its verdict, moved. The one constructor of a
+    /// round's decision, generation's and the evaluation harness's alike.
+    pub fn decision(self) -> PhysicalDecision {
+        PhysicalDecision { accepted_rows: self.committed_rows, ahead: self.verdict }
+    }
+
+    /// Leave the chain its outcome guessed (`guesses`, `Outcome::Forward`'s:
+    /// empty of a round that made none) to the sequence's front-row decode
+    /// (`two_row`), the next pass's front tokens: the one advance of a
+    /// front-row decode, generation's and the evaluation harness's alike. A
+    /// sequence not decoding in front passes (none) runs no front row,
+    /// whatever its rounds guess.
+    pub fn advance(&self, two_row: Option<&mut TwoRowDecode>, guesses: Vec<Guess>) {
+        if let Some(decode) = two_row {
+            decode.guessed(guesses);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,8 +128,10 @@ enum RoundKind {
     Forced {
         emitted: Vec<TokenId>,
     },
-    Verification {
-        proposal: Vec<TokenId>,
+    /// A decode pass: its exact row, then its rows ahead, each checked
+    /// against the selection of the row before it.
+    Pass {
+        rows: Rows,
     },
 }
 
@@ -80,12 +144,18 @@ pub struct RoundState {
 }
 
 impl RoundState {
+    /// A prompt or replay chunk of `tokens` at `position`; the chunk closing
+    /// the prompt selects or forces its successor, and of a sequence decoding
+    /// in front passes enters the head behind its drafter entry (`chain`).
+    #[allow(clippy::too_many_arguments)]
     pub fn progress(
         kind: WorkKind,
         tokens: Vec<TokenId>,
+        position: usize,
         emitted: Vec<TokenId>,
         select: Option<SelectSpec>,
         prime: Option<Priming>,
+        chain: Option<ChainEntry>,
         requirements: MethodRequirements,
     ) -> Result<Self, String> {
         if tokens.is_empty()
@@ -117,6 +187,8 @@ impl RoundState {
                 demand,
                 selects: select.into_iter().collect(),
                 prime,
+                front: Vec::new(),
+                chain,
             },
             kind: RoundKind::Progress {
                 emitted,
@@ -130,7 +202,7 @@ impl RoundState {
         round
             .forward
             .clone()
-            .into_operation(RequestId(0), 0, None)?;
+            .into_operation(RequestId(0), position, None)?;
         Ok(round)
     }
 
@@ -149,50 +221,57 @@ impl RoundState {
             .saturating_sub(1)
     }
 
-    /// A decode or verification of `proposal` behind `anchor`, publishing
-    /// its rows' features where `verify_demand` demands them.
+    /// A decode pass of `rows` behind the accepted history, whose pending
+    /// token is `pending` ([`Rows::tokens`]): each row selects the token
+    /// after it, with the rows ahead before it as history, publishing its
+    /// features where `demand` demands them. A plain decode, a verification
+    /// of proposals or a front pass; of a sequence decoding in front passes,
+    /// entering the head behind it (`chain`).
     #[allow(clippy::too_many_arguments)]
-    pub fn verification(
-        anchor: TokenId,
-        proposal: Vec<TokenId>,
-        proposal_limit: usize,
+    pub fn pass(
+        pending: TokenId,
+        rows: Rows,
         generated_position: usize,
         accepted_history: &[TokenId],
         constraint: Option<&dyn Constraint>,
         sampling: Sampling,
         shaping: Shaping,
         seed: u64,
-        verify_demand: Demand,
+        demand: Demand,
+        chain: Option<ChainEntry>,
     ) -> Result<Self, String> {
-        if proposal.len() > proposal_limit {
-            return Err("method proposal exceeds the round width limit".into());
-        }
-        let selects = verification_selects(
+        let tokens = rows.tokens(pending);
+        let mut selects = verification_selects(
             generated_position,
             accepted_history,
-            &proposal,
+            &tokens[1..],
             constraint,
             sampling,
             shaping,
             seed,
         )?;
-        let mut tokens = Vec::with_capacity(proposal.len() + 1);
-        tokens.push(anchor);
-        tokens.extend_from_slice(&proposal);
+        let front = selects
+            .split_off(1 + rows.acceptable().len())
+            .into_iter()
+            .zip(rows.front_kinds())
+            .map(|(select, kind)| FrontRow { select, kind })
+            .collect::<Vec<_>>();
+        assert_eq!(front.len(), rows.front_rows(), "a select for each front row");
         Ok(Self {
             forward: RoundForward {
-                kind: if proposal.is_empty() {
-                    WorkKind::Decode
-                } else {
-                    WorkKind::Verify
+                kind: match rows.acceptable().is_empty() {
+                    true => WorkKind::Decode,
+                    false => WorkKind::Verify,
                 },
                 tokens,
-                demand: Demand::SELECT | verify_demand,
+                demand: Demand::SELECT | demand,
                 selects,
                 committed: 1,
                 prime: None,
+                front,
+                chain,
             },
-            kind: RoundKind::Verification { proposal },
+            kind: RoundKind::Pass { rows },
         })
     }
 
@@ -218,6 +297,8 @@ impl RoundState {
                 selects: Vec::new(),
                 committed,
                 prime: None,
+                front: Vec::new(),
+                chain: None,
             },
             kind: RoundKind::Forced { emitted: forced },
         })
@@ -235,10 +316,16 @@ impl RoundState {
             RoundKind::Progress { emitted, .. } | RoundKind::Forced { emitted } => {
                 emitted.len() + self.forward.selects.len()
             }
-            RoundKind::Verification { .. } => self.forward.selects.len(),
+            RoundKind::Pass { .. } => self.forward.selects.len(),
         }
     }
 
+    /// The round's acceptance of `samples`, one per row it selects in row
+    /// order: the rows a decision may accept, then its front rows. A pass's
+    /// rows ahead are guesses checked against the selection of the row
+    /// before each: its acceptable rows commit as far as acceptance takes
+    /// them (`accept_prefix`), the selection of the last row committed is
+    /// emitted after them, and a front row's guess stood or not.
     pub fn reconcile(
         self,
         samples: &[TokenId],
@@ -263,6 +350,7 @@ impl RoundState {
                     accepted_proposals: 0,
                     emitted,
                     method_update,
+                    verdict: AheadVerdict::default(),
                 })
             }
             RoundKind::Forced { emitted } => {
@@ -276,23 +364,30 @@ impl RoundState {
                     accepted_proposals: 0,
                     emitted,
                     method_update: MethodUpdate::Observe,
+                    verdict: AheadVerdict::default(),
                 })
             }
-            RoundKind::Verification { proposal } => {
-                if samples.len() != proposal.len() + 1 {
-                    return Err("verification returned the wrong number of samples".into());
+            RoundKind::Pass { rows } => {
+                // Every row selects but a front row, whose selection is spent
+                // on the next guess (`guess_chain`).
+                if samples.len() != rows.row_count() - rows.front_rows() {
+                    return Err("a pass returned the wrong number of samples".into());
                 }
-                let accepted_proposals = accept_prefix(&proposal, samples, stops)?;
-                let bonus = samples[accepted_proposals];
-                let mut emitted = proposal[..accepted_proposals].to_vec();
-                emitted.push(bonus);
+                let acceptable = rows.acceptable();
+                // Each guess, a row ahead's token, is checked against the
+                // selection of the row before it.
+                let verdict = AheadVerdict::new(&rows, samples);
+                let accepted = accept_prefix(acceptable, samples, stops)?;
+                let mut emitted = acceptable[..accepted].to_vec();
+                emitted.push(samples[accepted]);
                 Ok(RoundAcceptance {
-                    inputs: self.forward.tokens,
-                    committed_rows: accepted_proposals + 1,
-                    proposed: proposal.len(),
-                    accepted_proposals,
+                    inputs: self.forward.tokens[..1 + acceptable.len()].to_vec(),
+                    committed_rows: 1 + accepted,
+                    proposed: acceptable.len(),
+                    accepted_proposals: accepted,
                     emitted,
                     method_update: MethodUpdate::Observe,
+                    verdict,
                 })
             }
         }
@@ -302,6 +397,7 @@ impl RoundState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magnitude_executor::{FrontGrant, FrontKind, GuessKind};
 
     fn requirements() -> MethodRequirements {
         MethodRequirements {
@@ -312,11 +408,15 @@ mod tests {
         }
     }
 
-    fn round(proposal: &[u32]) -> RoundState {
-        RoundState::verification(
+    fn tokens(tokens: &[u32]) -> Vec<TokenId> {
+        tokens.iter().copied().map(TokenId).collect()
+    }
+
+    /// A pass of `rows` behind the history [1, 2], its pending token 7.
+    fn pass(rows: Rows) -> RoundState {
+        RoundState::pass(
             TokenId(7),
-            proposal.iter().copied().map(TokenId).collect(),
-            proposal.len(),
+            rows,
             10,
             &[TokenId(1), TokenId(2)],
             None,
@@ -327,8 +427,14 @@ mod tests {
             },
             4,
             Demand::NONE,
+            None,
         )
         .unwrap()
+    }
+
+    /// A decode, or verification of `proposal`, behind its anchor 7.
+    fn round(proposal: &[u32]) -> RoundState {
+        pass(Rows::Exact { acceptable: tokens(proposal) })
     }
 
     #[test]
@@ -386,12 +492,78 @@ mod tests {
         );
     }
 
+    /// A two-row pass is a verification of one proposal that is never
+    /// accepted: its exact row's token is emitted, its front row's
+    /// selection is no sample (it is spent on the next guess), and the
+    /// guess its outcome made is the next pass's, whether its own stood or
+    /// not. Its front row carries its guess's kind. Each verdict names its
+    /// guesses and their kind.
+    #[test]
+    fn a_two_row_pass_checks_its_guess_as_one_proposal() {
+        let stops = BTreeSet::from([TokenId(99)]);
+        let guess = Guess { token: TokenId(8), kind: GuessKind::Head };
+        let paired = pass(Rows::front(vec![guess], 0));
+        assert_eq!(paired.forward().kind, WorkKind::Decode);
+        assert_eq!(paired.forward().tokens, tokens(&[7, 8]));
+        assert_eq!((paired.forward().committed, paired.forward().selects.len()), (1, 1));
+        assert_eq!(paired.forward().front.iter().map(|front| front.kind).collect::<Vec<_>>(), [FrontKind::Host(GuessKind::Head)]);
+        assert_eq!(paired.publication_bound(), 1);
+        // Its samples are its exact row's selection alone.
+        let selected = |token| Selected { token: TokenId(token), status: 0 };
+        let exact = [RowResult { selected: Some(selected(8)), ..Default::default() }];
+        assert_eq!(paired.forward().samples(&exact).unwrap(), tokens(&[8]));
+        assert!(paired.forward().samples(&[]).is_err(), "its exact row's outcome");
+        let held = paired.clone().reconcile(&tokens(&[8]), &stops).unwrap();
+        assert_eq!((held.emitted.clone(), held.committed_rows, held.inputs.clone()), (tokens(&[8]), 1, tokens(&[7])));
+        assert_eq!((held.proposed, held.accepted_proposals, held.method_update), (0, 0, MethodUpdate::Observe));
+        assert_eq!((held.verdict.stood(), held.verdict.acceptable()), (1, 0));
+        // The guess its outcome made is the next pass's, of a sequence
+        // decoding in two-row passes alone; none leaves the next pass one
+        // row.
+        let mut decode = TwoRowDecode::default();
+        let next = Guess { token: TokenId(9), kind: GuessKind::Chained };
+        held.advance(Some(&mut decode), vec![next]);
+        assert_eq!(decode.pass(FrontGrant::UpTo(1)), Rows::front(vec![next], 0));
+        held.advance(Some(&mut decode), Vec::new());
+        assert_eq!(decode.pass(FrontGrant::UpTo(1)), Rows::Exact { acceptable: Vec::new() });
+        assert_eq!(held.verdict.checked(), [(TokenId(8), TokenId(8))]);
+        assert_eq!((held.verdict.front(), held.verdict.truths()), (&tokens(&[8])[..], &tokens(&[8])[..]));
+        assert_eq!(held.decision(), PhysicalDecision { accepted_rows: 1, ahead: AheadVerdict::new(&Rows::front(vec![guess], 0), &tokens(&[8])) });
+        // A wrong guess emits the exact token all the same.
+        let wrong = paired.clone().reconcile(&tokens(&[5]), &stops).unwrap();
+        assert_eq!((wrong.emitted.clone(), wrong.committed_rows, wrong.verdict.stood()), (tokens(&[5]), 1, 0));
+        // A stop token the front row guessed stood, though acceptance
+        // accepts none.
+        let stopped = pass(Rows::front(vec![Guess { token: TokenId(99), ..guess }], 0)).reconcile(&tokens(&[99]), &stops).unwrap();
+        assert_eq!((stopped.emitted, stopped.verdict.stood()), (tokens(&[99]), 1));
+        assert!(paired.reconcile(&tokens(&[8, 9]), &stops).is_err(), "no front row's sample");
+    }
+
+    /// A front pass of three rows runs each on its guess, by depth, and
+    /// emits its exact row's token alone: its verdict holds every front
+    /// token and the one truth its round learned, which judges only its
+    /// first (a later round learns the rest).
+    #[test]
+    fn a_front_pass_runs_each_guess_by_depth_and_learns_one_truth() {
+        let stops = BTreeSet::from([TokenId(99)]);
+        let chain = [8, 9, 10].map(|token| Guess { token: TokenId(token), kind: GuessKind::Chained });
+        let deep = pass(Rows::front(chain.to_vec(), 0));
+        assert_eq!(deep.forward().tokens, tokens(&[7, 8, 9, 10]));
+        assert_eq!((deep.forward().committed, deep.forward().selects.len(), deep.forward().front.len()), (1, 1, 3));
+        let held = deep.reconcile(&tokens(&[8]), &stops).unwrap();
+        assert_eq!((held.emitted.clone(), held.committed_rows), (tokens(&[8]), 1));
+        assert_eq!(held.verdict.front(), &tokens(&[8, 9, 10])[..]);
+        assert_eq!((held.verdict.truths(), held.verdict.checked()), (&tokens(&[8])[..], vec![(TokenId(8), TokenId(8))]));
+    }
+
     #[test]
     fn publication_bound_includes_prefill_emission_without_selection() {
         let progress = RoundState::progress(
             WorkKind::Prefill,
             vec![TokenId(1)],
+            0,
             vec![TokenId(2)],
+            None,
             None,
             None,
             requirements(),
@@ -454,7 +626,9 @@ mod tests {
         let replay = RoundState::progress(
             WorkKind::Replay,
             vec![TokenId(1), TokenId(2)],
+            0,
             vec![],
+            None,
             None,
             None,
             requirements,
@@ -480,7 +654,7 @@ mod tests {
             head: true,
         };
         let chunk = |emitted: Vec<TokenId>, select: Option<SelectSpec>, kind| {
-            RoundState::progress(kind, vec![TokenId(1), TokenId(2)], emitted, select, None, requirements)
+            RoundState::progress(kind, vec![TokenId(1), TokenId(2)], 0, emitted, select, None, None, requirements)
                 .unwrap()
                 .forward()
                 .demand

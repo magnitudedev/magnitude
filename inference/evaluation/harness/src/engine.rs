@@ -13,11 +13,12 @@ use magnitude_engine::options::{
 };
 use magnitude_executor::platform::{DeviceRequest, ReleaseRate};
 use magnitude_executor::{
-    Demand, DomainError, ExecutionPath, ExecutorDomain, NumericalProfile, Operation, Outcome,
-    PhysicalDecision, ProgramFamily, RequestId, ReservedResources, ResumeState, Sampling, SelectSpec,
-    Shaping, StateBindings, TokenId, TuningSettings, WorkKind,
+    ChainEntry, Demand, DomainError, DraftForm, ExecutionPath, ExecutorDomain, FeatureReader, FeatureRows, FeatureSpan, FrontGrant,
+    FrontPass, HeadPhase, NumericalProfile, Operation, Outcome, PhysicalDecision, Priming, ProgramFamily, RequestId,
+    ReservedResources, ResumeState, Sampling, SelectSpec, Shaping, StateBindings, TokenId, TuningSettings, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
+use magnitude_generation::{RoundState, drafted_chain};
 use magnitude_scheduler::owner::{BetweenFlights, MemoryHost, between_flights, relieve};
 use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
@@ -73,6 +74,9 @@ pub struct Load {
     /// Rows one launch exports full logits for; zero loads as served.
     pub exported_logits_rows: usize,
     pub lookahead: bool,
+    /// The load records its routes (`ModelPolicy::record_routes`): a
+    /// streamed load, whose decode cells write them (`time --record-routes`).
+    pub record_routes: bool,
 }
 
 /// Resolve the catalog model for `load`, as the engine's host would.
@@ -110,6 +114,7 @@ pub fn configuration(
             exported_logits_rows: load.exported_logits_rows,
             numerical_profile: options.numerical_profile.clone(),
             weight_bound: options.weight_bound,
+            record_routes: load.record_routes,
         },
         context_tokens: Some(load.context_tokens),
         service: ServiceLimits {
@@ -345,6 +350,58 @@ pub struct Sequence {
     pub position: usize,
     /// The token the last step selected.
     pub selected: Option<TokenId>,
+    /// Its front-row decode: the chain its last step's outcome guessed, the
+    /// next pass's front tokens ([`Engine::two_row_step`]).
+    pub two_row: magnitude_executor::TwoRowDecode,
+    /// The form and guessed rows of its next pass: its pricing's grant, as
+    /// [`Engine::two_row_step`] takes it.
+    pub grant: FrontGrant,
+    /// Whether its steps enter the MTP head, which makes its chain: behind
+    /// a front pass on the device (`magnitude_executor::ChainEntry`), or
+    /// after a verify pass in a host head transaction ([`Trailing`]). A
+    /// two-row sequence of a load that fronts, which opens with its whole
+    /// prompt, closing it selecting ([`Engine::open_two_row_sequence`]).
+    /// That closing chunk enters its selection in the head right past the
+    /// prompt's, so the head's position is its own from then on; no other
+    /// prefill follows.
+    chains: bool,
+    /// The pairs its head lacks, after a verify pass: none where the head
+    /// entered every pair up to its selection.
+    trailing: Option<Trailing>,
+    /// The two-row pass of the step under way, whose round accepts its
+    /// rows ([`Engine::two_row_step`]): none of any other step.
+    pass: Option<RoundState>,
+}
+
+/// A verify pass's accepted rows as pairs the head enters: each committed
+/// row's successor token with that row's feature, read to the host. The
+/// sequence's next pass enters them first, in one head transaction drafting
+/// that pass's chain from the last, as generation's does.
+#[derive(Clone)]
+struct Trailing {
+    tokens: Vec<TokenId>,
+    features: FeatureRows,
+}
+
+impl Sequence {
+    /// Its next pass from its selection, in the form and as deep as its
+    /// grant holds it, the round generation runs (`RoundState::pass`),
+    /// which also accepts its rows; every row selects greedily. A chaining
+    /// sequence's demands its rows' features: a front pass enters the head
+    /// behind it from its position, and a verify pass's accepted pairs
+    /// enter it after.
+    pub fn two_row_round(&self) -> Result<RoundState, String> {
+        let pending = self.selected.ok_or("a two-row decode follows a selection")?;
+        let rows = self.two_row.pass(self.grant);
+        let (demand, chain) = match (self.chains, self.grant) {
+            (true, FrontGrant::Verify(_)) => (Demand::FEATURES, None),
+            (true, FrontGrant::UpTo(_) | FrontGrant::Exactly(_)) => {
+                (Demand::FEATURES, Some(ChainEntry { position: self.position }))
+            }
+            (false, _) => (Demand::NONE, None),
+        };
+        RoundState::pass(pending, rows, self.position, &[], None, Sampling::Greedy, Shaping::default(), 0, demand, chain)
+    }
 }
 
 /// A sequence's accepted state and selection, which sequences open from
@@ -353,6 +410,9 @@ pub struct Sequence {
 pub struct Checkpoint {
     state: ResumeState,
     selected: Option<TokenId>,
+    two_row: magnitude_executor::TwoRowDecode,
+    chains: bool,
+    trailing: Option<Trailing>,
 }
 
 /// Host and device times of one step. All times are `seismic::host_seconds`.
@@ -442,7 +502,27 @@ impl Engine {
     }
 
     pub fn open_sequence(&mut self) -> Result<Sequence, String> {
-        Ok(Sequence { request: self.open_request(None)?, position: 0, selected: None })
+        Ok(Sequence {
+            request: self.open_request(None)?,
+            position: 0,
+            selected: None,
+            two_row: Default::default(),
+            grant: FrontGrant::UpTo(0),
+            chains: false,
+            trailing: None,
+            pass: None,
+        })
+    }
+
+    /// A sequence of `prompt` that decodes in front passes
+    /// ([`Self::two_row_step`]), chaining through the MTP head where the
+    /// load fronts (`ExecutorDomain::fronts`): its prompt primes the head,
+    /// its closing chunk selecting, and every pass enters it, as a
+    /// generation of the MTP method does there.
+    pub fn open_two_row_sequence(&mut self, prompt: &[TokenId]) -> Result<Sequence, String> {
+        let mut sequence = Sequence { chains: self.domain.fronts(), ..self.open_sequence()? };
+        self.run_prompt(&mut sequence, prompt, true)?;
+        Ok(sequence)
     }
 
     /// A request opened with fresh state, or `from`'s.
@@ -476,18 +556,30 @@ impl Engine {
         Ok(())
     }
 
-    /// The sequence's accepted state and selection ([`Checkpoint`]).
+    /// The sequence's accepted state, its head's among it, its selection
+    /// and its chain ([`Checkpoint`]).
     pub fn checkpoint(&self, sequence: &Sequence) -> Result<Checkpoint, String> {
-        Ok(Checkpoint { state: self.domain.resume_state(sequence.request)?, selected: sequence.selected })
+        Ok(Checkpoint {
+            state: self.domain.resume_state(sequence.request)?,
+            selected: sequence.selected,
+            two_row: sequence.two_row.clone(),
+            chains: sequence.chains,
+            trailing: sequence.trailing.clone(),
+        })
     }
 
-    /// A sequence opened from `checkpoint`: its state, position and
-    /// selection as the checkpoint's sequence stood.
+    /// A sequence opened from `checkpoint`: its state, position, selection
+    /// and chain as the checkpoint's sequence stood.
     pub fn open_from(&mut self, checkpoint: &Checkpoint) -> Result<Sequence, String> {
         Ok(Sequence {
             request: self.open_request(Some(&checkpoint.state))?,
             position: checkpoint.state.position(),
             selected: checkpoint.selected,
+            two_row: checkpoint.two_row.clone(),
+            grant: FrontGrant::UpTo(0),
+            chains: checkpoint.chains,
+            trailing: checkpoint.trailing.clone(),
+            pass: None,
         })
     }
 
@@ -543,7 +635,40 @@ impl Engine {
             select,
             committed,
             prime: None,
+            front: Vec::new(),
+            chain: None,
         }
+    }
+
+    /// A prompt chunk of `tokens` at `position`, the chunk closing the
+    /// prompt (`closing`) selecting greedily from its last row. A chaining
+    /// sequence's ([`Sequence::chains`]) primes the head across its
+    /// boundary, and the closing chunk enters its selection right past that
+    /// entry, as generation's chunks do.
+    fn prompt_chunk(sequence: &Sequence, position: usize, tokens: Vec<TokenId>, closing: bool) -> Operation {
+        let demand = match closing {
+            true => Demand::SELECT,
+            false => Demand::NONE,
+        };
+        let mut operation = Self::forward_at(sequence, position, WorkKind::Prefill, tokens, demand);
+        if sequence.chains {
+            let Operation::Forward { tokens, demand, prime, chain, .. } = &mut operation else {
+                unreachable!("a prompt chunk is a forward");
+            };
+            let entry = Priming {
+                boundary: true,
+                tokens: match position {
+                    0 => tokens[1..].to_vec(),
+                    _ => tokens.clone(),
+                },
+                position: position.saturating_sub(1),
+                draft_from: position + tokens.len(),
+            };
+            *chain = closing.then(|| ChainEntry { position: entry.position + entry.tokens.len() });
+            *demand |= Demand::FEATURES;
+            *prime = Some(entry);
+        }
+        operation
     }
 
     /// Plan the prompt chunks after the sequence's next one as the owner
@@ -568,13 +693,8 @@ impl Engine {
             Ok(grouped
                 .into_iter()
                 .map(|chunk| {
-                    let demand = match select && chunk.end == rest.len() {
-                        true => Demand::SELECT,
-                        false => Demand::NONE,
-                    };
-                    let position = sequence.position + chunk.start;
-                    let tokens = rest[chunk].to_vec();
-                    Self::forward_at(sequence, position, WorkKind::Prefill, tokens, demand)
+                    let closing = select && chunk.end == rest.len();
+                    Self::prompt_chunk(sequence, sequence.position + chunk.start, rest[chunk].to_vec(), closing)
                 })
                 .collect())
         })
@@ -663,26 +783,59 @@ impl Engine {
             return Ok(None);
         }
         let mut outcomes = Vec::with_capacity(pending.len());
-        for (pending, sequence) in pending.into_iter().zip(sequences.iter_mut()) {
+        for ((pending, sequence), operation) in pending.into_iter().zip(sequences.iter_mut()).zip(&operations) {
             if pending.request() != sequence.request {
                 return Err("step outcome order differs from its sequences".into());
             }
-            if let Outcome::Forward { rows } = pending.outcome() {
-                sequence.selected = rows
-                    .last()
-                    .and_then(|row| row.selected)
-                    .map(|row| row.token);
-            }
+            // A two-row pass accepts as its round does
+            // (`Sequence::two_row_round`), its decision carrying the verdict
+            // to the expert bank, and a chaining sequence's verify pass
+            // leaves its accepted pairs trailing the head; any other forward
+            // commits every row, selecting its last. The chain a forward's
+            // outcome guessed advances the sequence's front-row decode.
+            let decision = match (operation, sequence.pass.clone()) {
+                (Operation::Forward { .. }, Some(round)) => {
+                    let Outcome::Forward { rows, guesses } = pending.outcome() else {
+                        return Err(format!("a two-row pass completed as {:?}", pending.outcome()));
+                    };
+                    let samples = round.forward().samples(rows)?;
+                    let verifies = sequence.chains && round.forward().chain.is_none();
+                    let acceptance = round.reconcile(&samples, &Default::default())?;
+                    let next = *acceptance.emitted.last().expect("a pass emits its exact row's token");
+                    if verifies {
+                        // Each committed row's feature selected the token
+                        // after it: the next accepted input, or the pass's
+                        // successor after the last.
+                        let committed = acceptance.committed_rows;
+                        let features = rows
+                            .iter()
+                            .find_map(|row| row.features.clone())
+                            .ok_or("a verify pass publishes its rows' features")?;
+                        let features = self
+                            .domain
+                            .read(&FeatureSpan::new(features, 0, committed).map_err(|error| error.to_string())?)?;
+                        let mut tokens = acceptance.inputs[1..committed].to_vec();
+                        tokens.push(next);
+                        sequence.trailing = Some(Trailing { tokens, features });
+                    }
+                    acceptance.advance(Some(&mut sequence.two_row), guesses.clone());
+                    sequence.selected = Some(next);
+                    acceptance.decision()
+                }
+                _ => {
+                    if let Outcome::Forward { rows, guesses } = pending.outcome() {
+                        sequence.selected = rows
+                            .last()
+                            .and_then(|row| row.selected)
+                            .map(|row| row.token);
+                        sequence.two_row.guessed(guesses.clone());
+                    }
+                    PhysicalDecision::rows(pending.rows())
+                }
+            };
             outcomes.push(pending.outcome().clone());
-            let rows = pending.rows();
-            self.domain
-                .reconcile(
-                    pending,
-                    PhysicalDecision {
-                        accepted_rows: rows,
-                    },
-                )
-                .map_err(text)?;
+            let rows = decision.accepted_rows;
+            self.domain.reconcile(pending, decision).map_err(text)?;
             sequence.position += rows;
         }
         let reconciled = host_seconds();
@@ -705,23 +858,103 @@ impl Engine {
         )))
     }
 
+    /// Decode `sequence` from its selection on in one pass
+    /// (`magnitude_executor::TwoRowDecode`) in the form and at the depth its
+    /// pricing grants (`ExecutorDomain::front_pass`, of one sequence: the
+    /// queued pass's where one is queued, else the regime's; none before
+    /// the regime is measured, or of a load whose bank is whole), every row
+    /// selecting greedily. A front pass emits its exact row's token, and
+    /// the pass after it is queued on the device before this one finishes,
+    /// its tokens this pass's selections
+    /// (`ExecutorDomain::queue_successor`), and the next call claims it, as
+    /// plain decode's successor is. A verify pass emits its exact row's
+    /// token and those of the guesses that stood, and is never queued
+    /// behind: the next call first enters its accepted pairs in a head
+    /// transaction drafting that pass's chain, as generation's next round
+    /// does.
+    pub fn two_row_step(&mut self, sequence: &mut Sequence, trace: Option<&SubmissionTrace>) -> Result<Step, String> {
+        let request = [sequence.request];
+        sequence.grant = match self.domain.front_pass(&request, &request).map_err(|error| error.to_string())? {
+            // A claim's requests are exactly the launch's.
+            FrontPass::Claim(claim) => FrontGrant::Exactly(claim[&sequence.request]),
+            FrontPass::Built { form, depths } => form.grant(depths.get(&sequence.request).copied().unwrap_or(0)),
+        };
+        if let Some(Trailing { tokens, features }) = sequence.trailing.take() {
+            // The head entered every pair before the pass's; its
+            // proposals, at most its width, are the pass's chain.
+            let entered = tokens.len();
+            let drafts = sequence.grant.depth().min(self.method.proposals());
+            let operation = Operation::Head {
+                request: sequence.request,
+                phase: HeadPhase::Generation,
+                tokens,
+                conditioning: features,
+                position: sequence.position - entered,
+                proposals: (0..drafts).map(|proposal| Self::greedy(sequence.position + proposal)).collect(),
+                form: DraftForm::Chained,
+            };
+            let Outcome::Head { proposals, .. } = self.head(operation, entered)? else {
+                return Err("a head transaction returns proposals".into());
+            };
+            sequence.two_row.guessed(drafted_chain(&proposals));
+        }
+        let round = sequence.two_row_round()?;
+        let operation = round.forward().clone().into_operation(sequence.request, sequence.position, None)?;
+        sequence.pass = Some(round);
+        let step = self.step(vec![operation], &mut [&mut *sequence], trace);
+        sequence.pass = None;
+        step.map(|(step, _)| step)
+    }
+
+    /// Submit one head operation and reconcile `accepted` of its entry
+    /// rows, as the scheduler reconciles a head transaction; its outcome.
+    pub(crate) fn head(&mut self, operation: Operation, accepted: usize) -> Result<Outcome, String> {
+        let operations = [operation];
+        let mut bindings = self.bindings();
+        self.provision(&mut bindings, &operations)?;
+        let ReservedResources::Head(workspace, output, advances) = self
+            .domain
+            .reserve(&mut bindings, &operations)
+            .map_err(text)?
+            .into_resources()
+        else {
+            return Err("a head operation runs on the head lane".into());
+        };
+        let flight = self
+            .domain
+            .submit_head(bindings, &operations, workspace, output, advances)
+            .map_err(|failure| failure.error().to_string())?;
+        let (pending, bindings) = self.domain.finish_head(flight).map_err(text)?;
+        self.bindings = Some(bindings);
+        let mut outcome = None;
+        for pending in pending {
+            outcome = Some(pending.outcome().clone());
+            self.domain.reconcile(pending, PhysicalDecision::rows(accepted)).map_err(text)?;
+        }
+        self.between_steps()?;
+        outcome.ok_or_else(|| "a head operation returned no outcome".into())
+    }
+
     /// Accept `tokens` from the sequence's position in prefill chunks, as the
-    /// service runs a prompt. The last chunk selects when `select`.
+    /// service runs a prompt. The last chunk selects when `select`. A
+    /// chaining sequence's prompt is its opening's alone.
     pub fn prefill(
         &mut self,
         sequence: &mut Sequence,
         tokens: &[TokenId],
         select: bool,
     ) -> Result<(), String> {
+        assert!(!sequence.chains, "invariant violated: a chaining sequence prefills only the prompt it opens with");
+        self.run_prompt(sequence, tokens, select)
+    }
+
+    /// [`Self::prefill`], of any sequence.
+    fn run_prompt(&mut self, sequence: &mut Sequence, tokens: &[TokenId], select: bool) -> Result<(), String> {
         let chunks = tokens.chunks(PREFILL_ROWS).collect::<Vec<_>>();
         for (index, chunk) in chunks.iter().enumerate() {
-            let demand = if select && index + 1 == chunks.len() {
-                Demand::SELECT
-            } else {
-                Demand::NONE
-            };
+            let closing = select && index + 1 == chunks.len();
             self.plan_prompt(sequence, &tokens[index * PREFILL_ROWS..], select)?;
-            let operation = Self::forward(sequence, WorkKind::Prefill, chunk.to_vec(), demand);
+            let operation = Self::prompt_chunk(sequence, sequence.position, chunk.to_vec(), closing);
             self.step(vec![operation], &mut [&mut *sequence], None)?;
         }
         Ok(())

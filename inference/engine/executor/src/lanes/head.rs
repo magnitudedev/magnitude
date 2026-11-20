@@ -4,7 +4,7 @@ use crate::{
     FeatureRows, InvariantError, NativeGraphOutputLease, NativeGraphWorkspaceLease, PoolClass,
     ResourceDomainId,
 };
-use magnitude_batching::{coalesce_spans, HeadPasses, ValidatedHeadBatch};
+use magnitude_batching::{coalesce_spans, FrontContinuation, HeadPasses, ValidatedHeadBatch};
 use magnitude_state::{SequenceState, StateStore, TentativeAdvance};
 use std::rc::Rc;
 
@@ -20,6 +20,34 @@ pub enum HeadConditioning {
         current: crate::GraphOutputTensor,
         previous: Option<crate::FeatureRef>,
     },
+    /// A front launch's entry rows (`HeadPasses::Front`), behind the
+    /// selecting target step whose outputs it reads on the device. Holding
+    /// them keeps their arenas from recycling until the launch has run.
+    Front(FrontReads),
+}
+
+/// The target step a front launch runs behind, as its rows read it: entry
+/// row `r` (in batch order) embeds the step's selection `r`, is conditioned
+/// by `features`, and its chain (`guess_chain`) reads the token row the step
+/// ran it on, `tokens` row `r`.
+pub struct FrontReads {
+    /// The step's `[rows, 2]` (token, status) selections.
+    pub selected: crate::GraphOutputTensor,
+    /// The step's `[rows, 2]` (token, status) token rows, row `r` the one
+    /// selection `r` was made on: a decode pass's own, the prompt's closing
+    /// chunk's from its last row on.
+    pub tokens: crate::GraphOutputTensor,
+    pub features: FrontFeatures,
+}
+
+/// What conditions a front launch's entry rows.
+pub enum FrontFeatures {
+    /// A decode pass's: its feature output, row `r` conditioning entry row
+    /// `r` (`[rows, width]`).
+    Rows(crate::GraphOutputTensor),
+    /// The prompt's closing chunk's lone entry row: its boundary feature,
+    /// the output feature of the chunk's last row.
+    Boundary(crate::FeatureRef),
 }
 
 /// The accepted target history a launch of a head without a store reads:
@@ -212,6 +240,52 @@ impl HeadLaunchInputs {
         Ok(())
     }
 
+    /// Check a front launch's reads of its target step: every one holds
+    /// the batch's class rows, a decode pass's at most the decode form's
+    /// rows (VERIFY_ROWS, the extent of the chain's queued rows), and the
+    /// closing chunk's one entry row is conditioned by a boundary feature
+    /// of this domain. Its `continuing` rows, the batch's, fit the decode
+    /// form's rows.
+    fn validate_front(
+        &self,
+        reads: &FrontReads,
+        continuing: &[Option<FrontContinuation>],
+        domain: &ResourceDomainId,
+    ) -> Result<(), String> {
+        use magnitude_kernels::constants::VERIFY_ROWS;
+        let rows = self.batch.class().rows();
+        let holds = |tensor: &crate::GraphOutputTensor| match tensor.tensor().extents() {
+            [held, ..] => usize::try_from(*held).is_ok_and(|held| held >= rows),
+            [] => false,
+        };
+        let pairs = |tensor: &crate::GraphOutputTensor| matches!(tensor.tensor().extents(), [_, 2]);
+        if !holds(&reads.selected) || !pairs(&reads.selected) || !holds(&reads.tokens) || !pairs(&reads.tokens) {
+            return Err(format!("a front launch's selections or token rows hold fewer than its {rows} class rows"));
+        }
+        if continuing.len() > VERIFY_ROWS as usize {
+            return Err(format!(
+                "a front launch's {} queued rows exceed the decode form's {VERIFY_ROWS}",
+                continuing.len()
+            ));
+        }
+        match &reads.features {
+            FrontFeatures::Rows(features) => {
+                if rows > VERIFY_ROWS as usize {
+                    return Err(format!("a front decode launch's {rows} class rows exceed the decode form's {VERIFY_ROWS}"));
+                }
+                if !holds(features) {
+                    return Err(format!("a front launch's features hold fewer than its {rows} class rows"));
+                }
+            }
+            FrontFeatures::Boundary(boundary) => {
+                if self.batch.actual_slots() != 1 || self.batch.actual_rows() != 1 || !boundary_feature(boundary, domain) {
+                    return Err("a closing chunk's front launch is not one entry row behind its boundary feature".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -240,16 +314,27 @@ impl HeadLaunchInputs {
             context: "head launch",
             detail,
         };
+        // A front launch's slots are conditioned by its step's rows
+        // (`validate_front`).
         let conditioned = match &self.conditioning {
-            HeadConditioning::Rows(rows) => rows.len(),
-            HeadConditioning::Features { .. } => 1,
+            HeadConditioning::Rows(rows) => Some(rows.len()),
+            HeadConditioning::Features { .. } => Some(1),
+            HeadConditioning::Front(_) => None,
         };
         if self.batch.actual_slots() != self.advances.len()
-            || self.batch.actual_slots() != conditioned
+            || conditioned.is_some_and(|conditioned| conditioned != self.batch.actual_slots())
         {
             return Err(invalid(
                 "slot, advance, and conditioning counts disagree".into(),
             ));
+        }
+        // A front batch is a front launch's alone.
+        match (&self.conditioning, self.batch.continuing()) {
+            (HeadConditioning::Front(reads), Some(continuing)) => {
+                self.validate_front(reads, continuing, domain).map_err(invalid)?;
+            }
+            (HeadConditioning::Rows(_) | HeadConditioning::Features { .. }, None) => {}
+            _ => return Err(invalid("a front launch and its batch disagree".into())),
         }
         if self.graph_workspace.domain() != domain
             || self
@@ -268,33 +353,30 @@ impl HeadLaunchInputs {
             {
                 return Err(invalid(format!("slot {index} uses another state bank")));
             }
-            // Bound features' width is checked where the graph binds them.
-            let (rows, fits) = match &self.conditioning {
-                HeadConditioning::Rows(rows) => (
+            // Bound features' width is checked where the graph binds them;
+            // `validate_front` checked a front launch's step outputs.
+            let conditioned = match &self.conditioning {
+                HeadConditioning::Rows(rows) => Some((
                     rows[index].rows(),
                     rows[index].rows() == slot.rows() && rows[index].row_bytes() == row_bytes,
-                ),
+                )),
+                HeadConditioning::Front(_) => None,
                 HeadConditioning::Features { current, previous } => {
                     if let Some(previous) = previous {
-                        if self.batch.passes() == HeadPasses::Block
-                            || previous.domain() != domain
-                            || previous.allocation().rows() != 1
-                            || previous.allocation().is_graph_backed()
-                            || previous.allocation().tensor().is_err()
-                        {
+                        if self.batch.passes() == HeadPasses::Block || !boundary_feature(previous, domain) {
                             return Err(invalid("invalid prefix conditioning feature".into()));
                         }
                     }
-                    match current.tensor().extents() {
+                    Some(match current.tensor().extents() {
                         [rows, _] => {
                             let rows = usize::try_from(*rows).unwrap_or(0);
                             (rows, rows + usize::from(previous.is_some()) >= slot.rows())
                         }
                         _ => (0, false),
-                    }
+                    })
                 }
             };
-            if !fits {
+            if let Some((rows, false)) = conditioned {
                 return Err(invalid(format!(
                     "slot {index} conditioning has {rows} rows for {} entry rows",
                     slot.rows()
@@ -328,6 +410,11 @@ impl HeadLaunchInputs {
                     }
                 }
                 continue;
+            }
+            // A front slot commits its first row alone: the rest are
+            // scratch, never accepted.
+            if self.batch.passes() == HeadPasses::Front && binding.stop != 1 {
+                return Err(invalid(format!("front slot {index} commits other than its first row")));
             }
             // The head's own rows' domain; its indexer's, if it keeps one,
             // are produced from them.
@@ -422,6 +509,16 @@ impl HeadLaunchInputs {
         }
         Ok(())
     }
+}
+
+/// Whether `feature` is a lone row of `domain` held apart from any graph
+/// output: a chunk's boundary feature, which conditions a launch's first
+/// entry row.
+fn boundary_feature(feature: &crate::FeatureRef, domain: &ResourceDomainId) -> bool {
+    feature.domain() == domain
+        && feature.allocation().rows() == 1
+        && !feature.allocation().is_graph_backed()
+        && feature.allocation().tensor().is_ok()
 }
 
 pub struct ValidatedHeadLaunch {

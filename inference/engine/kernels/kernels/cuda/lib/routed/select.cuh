@@ -109,10 +109,12 @@ template <unsigned K> struct Selected {
 // The selection order of the general routed form (`select_experts`,
 // functions.seismic), shared by `routed_select` and its hints: the scores of
 // this lane's candidates from their logits (`logit(expert)`) by `function`,
-// ranked on score + `bias(expert)`, sorted, then K argmax rounds over the
-// lane heads. Every lane of the warp calls it.
-template <unsigned E, unsigned K, class Logit, class Bias>
-__device__ __forceinline__ Selected<K> rank_row(int function, Logit logit, Bias bias, unsigned lane) {
+// ranked on score + `bias(expert)` (each held expert's ranked value given to
+// `keys`), sorted, then K argmax rounds over the lane heads. Every lane of
+// the warp calls it.
+template <unsigned E, unsigned K, class Logit, class Bias, class Keys = selection::NoKeys>
+__device__ __forceinline__ Selected<K> rank_row(int function, Logit logit, Bias bias, unsigned lane,
+                                                Keys keys = Keys{}) {
     constexpr unsigned P = (E + 31) / 32;
     // P when 32 divides E (a constant: no excluded entries).
     const unsigned held = selection::candidates<E>(lane);
@@ -127,6 +129,10 @@ __device__ __forceinline__ Selected<K> rank_row(int function, Logit logit, Bias 
 #pragma unroll
     for (unsigned i = 0; i < P; ++i)
         ranked[i] = i < held ? selection::ranked(seismic_add_rn(score[i], bias(expert[i]))) : -__int_as_float(0x7f800000);
+#pragma unroll
+    for (unsigned i = 0; i < P; ++i)
+        if (i < held)
+            keys(static_cast<unsigned>(expert[i]), ranked[i]);
     sort<P>(ranked, score, expert);
 
     Selected<K> selected;

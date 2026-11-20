@@ -1,21 +1,22 @@
-//! `draft`: the catalog drafter's behaviour on fixtures. At anchors spread
-//! over each fixture's scored spans, the target prefills the tokens before
+//! `draft`: the catalog drafter's behaviour on template lanes. At anchors
+//! spread over each lane's scored spans, the target prefills the tokens before
 //! the anchor (its features condition the drafter), a drafter keeping its own
 //! history is primed on them as the served path primes it (one reading the
 //! target's history, such as an MTP assistant, enters none), drafts greedy
 //! proposals from the
 //! anchor token, and the target verifies them: the accepted prefix is the
 //! proposals equal to the target's own greedy choices. Proposals are also
-//! compared with the fixture's own next tokens.
+//! compared with the session's own next tokens.
 
 use crate::artifacts::Artifacts;
 use crate::engine::{self, Engine, EngineOptions, Load, PREFILL_ROWS, text};
 use crate::render::Rendered;
 use magnitude_engine::options::{ModelMethod, ResolvedMethod};
 use magnitude_executor::{
-    Demand, DraftForm, FeatureReader, FeatureSpan, HeadPhase, Operation, Outcome, PhysicalDecision,
-    ReservedResources, TokenId, WorkKind,
+    Demand, DraftForm, FeatureReader, FeatureSpan, HeadPhase, Operation, Outcome,
+    ReservedResources, Rows, Sampling, Shaping, TokenId, WorkKind,
 };
+use magnitude_generation::RoundState;
 use magnitude_family_contracts::HeadHistory;
 use seismic::{TraceDetail, host_seconds};
 use serde_json::{Value, json};
@@ -23,7 +24,7 @@ use std::io::Write;
 use std::path::Path;
 
 pub struct DraftOptions {
-    /// Anchors per fixture, spread evenly over its scored positions.
+    /// Anchors per lane, spread evenly over its scored positions.
     pub anchors: usize,
     /// How the load drafts: the catalog's drafter or head (`Auto`), or a named method.
     pub method: ModelMethod,
@@ -34,7 +35,7 @@ pub struct DraftOptions {
     pub attribute: bool,
 }
 
-/// Draft at every fixture's anchors, writing one JSON line per anchor to
+/// Draft at every lane's anchors, writing one JSON line per anchor to
 /// `records`. Returns the drafting measurement and the device's name.
 pub fn run(
     artifacts: &Artifacts,
@@ -45,9 +46,9 @@ pub fn run(
 ) -> Result<(Value, String), String> {
     let longest = rendered
         .iter()
-        .map(|fixture| fixture.tokens.len())
+        .map(|lane| lane.tokens.len())
         .max()
-        .expect("a fixture set is nonempty");
+        .expect("a run renders at least one lane");
     let mut engine = Engine::open(
         artifacts,
         options,
@@ -55,11 +56,12 @@ pub fn run(
             method: draft.method,
             proposals: draft.proposals,
             context_tokens: longest + 2 * usize::from(u8::MAX),
-            // One fixture's sequence at a time.
+            // One lane's sequence at a time.
             sequences: std::num::NonZeroUsize::MIN,
             decode_rows: magnitude_executor::StepAllowances::EVALUATION_DRAFTING.decode_tokens,
             exported_logits_rows: 0,
             lookahead: false,
+            record_routes: false,
         },
     )?;
     let drafter = Drafter::of(engine.method)
@@ -67,21 +69,22 @@ pub fn run(
     let mut file = std::fs::File::create(records)
         .map_err(|error| format!("{}: {error}", records.display()))?;
     let (mut proposed, mut accepted, mut matched, mut verifications) = (0, 0, 0, 0);
-    for fixture in rendered {
-        let tokens = engine::tokens(&fixture.tokens);
-        for anchor in anchors(fixture, draft.anchors) {
+    for lane in rendered {
+        let tokens = engine::tokens(&lane.tokens);
+        for anchor in anchors(lane, draft.anchors) {
             let outcome = draft_at(&mut engine, drafter, &tokens, anchor, draft.attribute)?;
             proposed += outcome.proposals.len();
             accepted += outcome.accepted;
             matched += outcome.matched;
             verifications += 1;
             let record = json!({
-                "fixture_id": fixture.fixture_id,
+                "template": lane.template,
+                "lane": lane.lane,
                 "anchor": anchor,
                 "proposals": outcome.proposals.iter().map(|token| token.0).collect::<Vec<_>>(),
                 "target": outcome.target.iter().map(|token| token.0).collect::<Vec<_>>(),
                 "accepted": outcome.accepted,
-                "matched_fixture": outcome.matched,
+                "matched_session": outcome.matched,
                 "attribution": outcome.attribution,
             });
             serde_json::to_writer(&mut file, &record)
@@ -95,21 +98,21 @@ pub fn run(
             "proposed": proposed,
             "accepted": accepted,
             "tokens_per_verify": (accepted + verifications) as f64 / verifications.max(1) as f64,
-            "matched_fixture": matched,
+            "matched_session": matched,
             "anchors": verifications,
         }),
         device,
     ))
 }
 
-/// Up to `count` anchors spread evenly over the fixture's scored positions,
+/// Up to `count` anchors spread evenly over the lane's scored positions,
 /// each with a committed token before it and a next token after it.
-fn anchors(fixture: &Rendered, count: usize) -> Vec<usize> {
-    let positions = fixture
+fn anchors(lane: &Rendered, count: usize) -> Vec<usize> {
+    let positions = lane
         .scored_spans
         .iter()
         .flat_map(|span| span.clone())
-        .filter(|&position| position >= 1 && position + 1 < fixture.tokens.len())
+        .filter(|&position| position >= 1 && position + 1 < lane.tokens.len())
         .collect::<Vec<_>>();
     if positions.is_empty() || count == 0 {
         return Vec::new();
@@ -129,42 +132,6 @@ struct Drafted {
     /// Device time by entry of the draft, the verification and a plain
     /// decode step after it, when attributed.
     attribution: Value,
-}
-
-/// Submit one drafter operation and reconcile `accepted` rows of it.
-fn head(engine: &mut Engine, operation: Operation, accepted: usize) -> Result<Outcome, String> {
-    let operations = [operation];
-    let mut bindings = engine.bindings();
-    engine.provision(&mut bindings, &operations)?;
-    let ReservedResources::Head(workspace, output, advances) = engine
-        .domain
-        .reserve(&mut bindings, &operations)
-        .map_err(text)?
-        .into_resources()
-    else {
-        return Err("a drafter operation runs on the head lane".into());
-    };
-    let flight = engine
-        .domain
-        .submit_head(bindings, &operations, workspace, output, advances)
-        .map_err(|failure| failure.error().to_string())?;
-    let (pending, bindings) = engine.domain.finish_head(flight).map_err(text)?;
-    engine.bindings = Some(bindings);
-    let mut outcome = None;
-    for pending in pending {
-        outcome = Some(pending.outcome().clone());
-        engine
-            .domain
-            .reconcile(
-                pending,
-                PhysicalDecision {
-                    accepted_rows: accepted,
-                },
-            )
-            .map_err(text)?;
-    }
-    engine.between_steps()?;
-    outcome.ok_or_else(|| "a drafter operation returned no outcome".into())
 }
 
 /// How the loaded drafter enters history and drafts, as the served method
@@ -221,7 +188,7 @@ fn draft_at(
             Demand::FEATURES,
         );
         let (_, outcomes) = engine.step(vec![operation], &mut [&mut sequence], None)?;
-        let [Outcome::Forward { rows }] = outcomes.as_slice() else {
+        let [Outcome::Forward { rows, .. }] = outcomes.as_slice() else {
             return Err("a prefill returns forward rows".into());
         };
         let features = rows
@@ -251,7 +218,7 @@ fn draft_at(
             proposals: Vec::new(),
             form: drafter.form,
         };
-        head(engine, operation, end - start)?;
+        engine.head(operation, end - start)?;
     }
     let (last_start, last_rows) = conditioning
         .last()
@@ -294,7 +261,7 @@ fn draft_at(
         }))
     };
     let draft_start = host_seconds();
-    let Outcome::Head { proposals, .. } = head(engine, operation, 1)? else {
+    let Outcome::Head { proposals, .. } = engine.head(operation, 1)? else {
         return Err("a draft returns proposals".into());
     };
     let proposals = proposals
@@ -302,22 +269,21 @@ fn draft_at(
         .map(|selected| selected.token)
         .collect::<Vec<_>>();
     let draft_phase = phase(draft_start)?;
-    // The target verifies the anchor and the proposals greedily.
-    let mut verified = vec![tokens[anchor]];
-    verified.extend_from_slice(&proposals);
-    let operations = [Operation::Forward {
-        request: sequence.request,
-        kind: WorkKind::Verify,
-        select: (0..verified.len())
-            .map(|row| Engine::greedy(anchor + row + 1))
-            .collect(),
-        tokens: verified,
-        position: anchor,
-        conditioning: None,
-        demand: Demand::SELECT,
-        committed: 1,
-        prime: None,
-    }];
+    // The target verifies the anchor and the proposals greedily, in the
+    // round generation runs (`RoundState::pass`), which accepts its rows.
+    let round = RoundState::pass(
+        tokens[anchor],
+        Rows::Exact { acceptable: proposals.clone() },
+        anchor + 1,
+        &[],
+        None,
+        Sampling::Greedy,
+        Shaping::default(),
+        0,
+        Demand::NONE,
+        None,
+    )?;
+    let operations = [round.forward().clone().into_operation(sequence.request, anchor, None)?];
     let verify_start = host_seconds();
     let mut bindings = engine.bindings();
     engine.provision(&mut bindings, &operations)?;
@@ -338,28 +304,13 @@ fn draft_at(
     let mut target = Vec::new();
     let mut accepted = 0;
     for pending in pending {
-        let Outcome::Forward { rows } = pending.outcome() else {
+        let Outcome::Forward { rows, .. } = pending.outcome() else {
             return Err("verification returns forward rows".into());
         };
-        target = rows
-            .iter()
-            .map(|row| row.selected.as_ref().map(|selected| selected.token))
-            .collect::<Option<Vec<_>>>()
-            .ok_or("a verification row has no selection")?;
-        accepted = proposals
-            .iter()
-            .zip(&target)
-            .take_while(|(proposal, sampled)| proposal == sampled)
-            .count();
-        engine
-            .domain
-            .reconcile(
-                pending,
-                PhysicalDecision {
-                    accepted_rows: accepted + 1,
-                },
-            )
-            .map_err(text)?;
+        target = round.forward().samples(rows)?;
+        let acceptance = round.clone().reconcile(&target, &Default::default())?;
+        accepted = acceptance.accepted_proposals;
+        engine.domain.reconcile(pending, acceptance.decision()).map_err(text)?;
     }
     engine.between_steps()?;
     let verify_phase = phase(verify_start)?;

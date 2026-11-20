@@ -25,7 +25,7 @@ pub(crate) fn compile_kernel(
     layout: &KernelEmissionLayout,
 ) -> Result<NativeCandidate, NativeCompilationError> {
     let started = Instant::now();
-    let emitted = emit::emit(kernel, layout, target.facts().codegen.call_conv)?;
+    let emitted = emit::emit(kernel, layout, target.device_info().codegen.call_conv)?;
     let source = toolchain::source(&emitted);
     let formed = programs
         .form(std::slice::from_ref(&source))?

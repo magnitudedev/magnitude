@@ -326,7 +326,7 @@ mod platform {
     /// ([`crate::host::pressure_files`]) whose trigger the kernel accepts
     /// ([`set_each`]).
     fn triggers() -> Vec<Trigger> {
-        set_each(crate::host::pressure_files(), |path| {
+        set_each(crate::host::pressure_files(&crate::host::LiveSys), |path| {
             std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)

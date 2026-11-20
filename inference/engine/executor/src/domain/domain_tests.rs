@@ -25,6 +25,8 @@ fn forward(request: RequestId, position: usize) -> Operation {
         select: Vec::new(),
         committed: 1,
         prime: None,
+        front: Vec::new(),
+        chain: None,
     }
 }
 
@@ -83,6 +85,8 @@ fn prefill(request: RequestId, position: usize) -> Operation {
         select: Vec::new(),
         committed: 1,
         prime: None,
+        front: Vec::new(),
+        chain: None,
     }
 }
 
@@ -97,7 +101,7 @@ fn queue_lookahead(
     let flight = submit_reserved_target(domain, bindings, vec![prefill(request, 0)]);
     let (pending, bindings) = finish_one(domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     assert_eq!(domain.queue.len(), 1, "the next chunk is queued");
     bindings
@@ -118,7 +122,7 @@ fn ready_target_can_abort_then_reconcile() {
     let (pending, _) = finish_one(&mut domain, flight);
     assert!(
         domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .reconcile(pending, PhysicalDecision::rows(1))
             .is_ok()
     );
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
@@ -166,7 +170,7 @@ fn a_launch_is_charged_its_requests_host_turn_but_not_idle_time() {
         let within = before.elapsed();
         let duration = pending.physical_duration();
         domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .reconcile(pending, PhysicalDecision::rows(1))
             .unwrap();
         (duration, within, bindings)
     };
@@ -183,6 +187,76 @@ fn a_launch_is_charged_its_requests_host_turn_but_not_idle_time() {
     assert!(idle <= within, "after the owner idled: {idle:?}, its step {within:?}");
 }
 
+/// The host's turn after a verify pass is what the regime prices a verify
+/// pass's overhead `O` by: the flight that ran one opens the turn as it
+/// finishes, and the next launch of its request times it, so the pricing
+/// carries a measured overhead. A launch of no verify pass opens none.
+/// The fixture runs no selecting launch, so the replay stands in for the
+/// verify pass, marked as `submit_target` marks one
+/// (`ExecutorDomain::verify_pass`).
+#[test]
+fn a_verify_pass_times_the_host_turn_its_overhead_prices() {
+    let backend = bank_backends()[0];
+    let (mut domain, mut bindings) = banked(backend, 4, 4);
+    let request = RequestId(72);
+    open(&mut domain, &mut bindings, request);
+    let step = |domain: &mut ExecutorDomain<TestFamily>, bindings: StateBindings, position: usize, verifies: bool| {
+        let mut flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
+        assert!(!flight.work.verifies, "a replay is no verify pass");
+        flight.work.verifies = verifies;
+        let (pending, bindings) = finish_one(domain, flight);
+        domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
+        bindings
+    };
+    let bindings = step(&mut domain, bindings, 0, false);
+    let bindings = step(&mut domain, bindings, 1, false);
+    assert_eq!(domain.verify_turns.mean(domain.family.expert_bank().unwrap().bank_epoch()), None, "no verify pass ran");
+    let bindings = step(&mut domain, bindings, 2, true);
+    assert_eq!(domain.verify_turns.mean(domain.family.expert_bank().unwrap().bank_epoch()), None, "the turn is open until the next launch");
+    step(&mut domain, bindings, 3, false);
+    assert!(domain.verify_turns.mean(domain.family.expert_bank().unwrap().bank_epoch()).is_some(), "the next launch timed the verify pass's turn");
+    if let Some(pricing) = domain.two_row_pricing().unwrap() {
+        assert!(pricing.overhead.is_some());
+    }
+}
+
+/// A verify pass is known by its form: rows verified past its exact row,
+/// or, on a load that fronts, a selecting decode entering no head behind
+/// it, however few rows its chain left it; a front pass enters the head.
+#[test]
+fn a_verify_pass_is_known_by_its_form() {
+    let (domain, _bindings) = fixture(None);
+    let select = |position| crate::SelectSpec {
+        sampling: crate::Sampling::Greedy,
+        seed: 1,
+        position,
+        domain: 0,
+        mask: None,
+        shaping: crate::Shaping::default(),
+        history: None,
+    };
+    let pass = |kind, tokens: usize, demand, chain| Operation::Forward {
+        request: RequestId(1),
+        kind,
+        tokens: vec![crate::TokenId(1); tokens],
+        position: 4,
+        conditioning: None,
+        demand,
+        select: (0..tokens).map(|row| select(4 + row)).collect(),
+        committed: 1,
+        prime: None,
+        front: Vec::new(),
+        chain,
+    };
+    let select_only = crate::batching::Demand::SELECT;
+    let verify_demand = crate::batching::Demand::SELECT | crate::batching::Demand::FEATURES;
+    assert!(domain.verify_pass(&pass(WorkKind::Verify, 3, select_only, None)));
+    assert_eq!(domain.verify_pass(&pass(WorkKind::Decode, 1, verify_demand, None)), domain.fronts());
+    assert!(!domain.verify_pass(&pass(WorkKind::Decode, 1, select_only, None)));
+    assert!(!domain.verify_pass(&pass(WorkKind::Decode, 1, verify_demand, Some(crate::ChainEntry { position: 5 }))));
+    assert!(!domain.verify_pass(&forward(RequestId(1), 0)));
+}
+
 /// The owner's own work between flights (memory observation, and what it
 /// releases or grows) serves no request: a launch is charged its request's
 /// host turn without it. The owner's span is long against the request's
@@ -195,7 +269,7 @@ fn a_launch_is_not_charged_the_owners_work_in_its_requests_host_turn() {
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
     let (pending, bindings) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     let own = std::time::Instant::now();
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -249,7 +323,7 @@ fn a_queued_step_is_charged_from_where_its_predecessor_ends() {
     let first_duration = first.physical_duration();
     assert_eq!(domain.queue.len(), 1, "the next chunk is queued");
     domain
-        .reconcile(first, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(first, PhysicalDecision::rows(1))
         .unwrap();
     let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 1)]);
     assert_eq!(
@@ -388,7 +462,7 @@ fn a_prompt_chunk_opens_a_chain_its_holder_claims() {
     assert_eq!(domain.queue.len(), 2, "the chain queues two chunks");
     let (pending, mut bindings) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     assert_eq!(domain.group_places().get(), 3, "the chain runs within its group's places");
     for position in 1..3 {
@@ -398,7 +472,7 @@ fn a_prompt_chunk_opens_a_chain_its_holder_claims() {
         let (pending, returned) = finish_one(&mut domain, flight);
         bindings = returned;
         domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .reconcile(pending, PhysicalDecision::rows(1))
             .unwrap();
     }
     assert!(domain.queue.is_empty());
@@ -426,7 +500,7 @@ fn an_open_during_a_chain_waits_for_its_end() {
     domain.plan_successors((1..3).map(|position| prefill(holder, position)).collect());
     let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(holder, 0)]);
     let (pending, mut bindings) = finish_one(&mut domain, flight);
-    domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+    domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
     for position in 1..3 {
         assert_eq!(domain.chain_holder(), Some(holder));
         assert!(domain.unchained(&mut bindings).is_none(), "the open waits while the chain is under way");
@@ -434,7 +508,7 @@ fn an_open_during_a_chain_waits_for_its_end() {
         let flight = submit_claimed(&mut domain, bindings, vec![prefill(holder, position)]);
         let (pending, returned) = finish_one(&mut domain, flight);
         bindings = returned;
-        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
     }
     assert_eq!(domain.chain_holder(), None);
     let unchained = domain.unchained(&mut bindings).expect("the chain ended: the queue is free");
@@ -575,7 +649,7 @@ fn a_chain_concludes_at_what_its_holder_reconciled_whatever_ends_it() {
         let flight = submit_reserved_target(domain, bindings, vec![prefill(request, at)]);
         let (pending, bindings) = finish_one(domain, flight);
         domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .reconcile(pending, PhysicalDecision::rows(1))
             .unwrap();
         assert_eq!((domain.queue.len(), domain.chain_holder()), (2, Some(request)));
         bindings
@@ -627,7 +701,7 @@ fn an_aborted_chunk_concludes_its_chain_at_the_chunks_reconciled_before_it() {
                 domain.abort(pending).unwrap();
                 break returned;
             }
-            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+            domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
             flight = submit_claimed(&mut domain, returned, vec![prefill(request, position + 1)]);
             position += 1;
         };
@@ -638,7 +712,7 @@ fn an_aborted_chunk_concludes_its_chain_at_the_chunks_reconciled_before_it() {
         assert_eq!(domain.group_places().get(), 1, "chunk {aborted} aborted: its group's class is freed");
         let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, aborted)]);
         let (pending, mut bindings) = finish_one(&mut domain, flight);
-        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
         assert_eq!(domain.resume_state(request).unwrap().target.position(), aborted + 1, "chunk {aborted} aborted");
         super::fixtures::shrink_settled(&mut domain, &mut bindings);
     }
@@ -659,7 +733,7 @@ fn a_chunk_outstanding_as_its_chain_concludes_returns_its_holders_state() {
         domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
         let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
         let (pending, bindings) = finish_one(&mut domain, flight);
-        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
         let flight = submit_claimed(&mut domain, bindings, vec![prefill(request, 1)]);
         let (pending, mut bindings) = finish_one(&mut domain, flight);
         match another_group {
@@ -670,13 +744,13 @@ fn a_chunk_outstanding_as_its_chain_concludes_returns_its_holders_state() {
         assert_eq!(domain.chain_holder(), None, "{how}");
         match aborted {
             true => domain.abort(pending).unwrap(),
-            false => domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap(),
+            false => domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap(),
         }
         let reached = if aborted { 1 } else { 2 };
         assert_eq!(domain.resume_state(request).unwrap().target.position(), reached, "{how}");
         let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, reached)]);
         let (pending, mut bindings) = finish_one(&mut domain, flight);
-        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
         assert_eq!(domain.resume_state(request).unwrap().target.position(), reached + 1, "{how}");
         super::fixtures::shrink_settled(&mut domain, &mut bindings);
     }
@@ -713,12 +787,14 @@ fn spare_slabs_owed_wait_for_a_held_chain_and_release_once_it_ends() {
             select: Vec::new(),
             committed: 512,
             prime: None,
+            front: Vec::new(),
+            chain: None,
         };
         let flight = submit_reserved_target(&mut domain, bindings, vec![step]);
         let (pending, next) = finish_one(&mut domain, flight);
         bindings = next;
         domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 512 })
+            .reconcile(pending, PhysicalDecision { accepted_rows: 512, ahead: crate::AheadVerdict::default() })
             .unwrap();
     }
     domain.close(other).unwrap();
@@ -734,7 +810,7 @@ fn spare_slabs_owed_wait_for_a_held_chain_and_release_once_it_ends() {
     let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
     let (pending, mut bindings) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1, ahead: crate::AheadVerdict::default() })
         .unwrap();
     assert_eq!((domain.queue.len(), domain.chain_holder()), (2, Some(request)));
     let _taken = super::fixtures::take_all_cache(&domain);
@@ -796,7 +872,7 @@ fn in_place_rows_reserve_without_a_free_page() {
             let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
             let (pending, bindings) = finish_one(domain, flight);
             domain
-                .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+                .reconcile(pending, PhysicalDecision::rows(1))
                 .unwrap();
             bindings
         };
@@ -837,14 +913,14 @@ fn reservation_recomputes_row_demand_after_shared_tail_relocation() {
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(source, 0)]);
     let (pending, mut bindings) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     let checkpoint = domain.resume_state(source).unwrap();
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(source, 1)]);
     let (pending, returned) = finish_one(&mut domain, flight);
     bindings = returned;
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     let copy = RequestId(72);
     domain
@@ -880,7 +956,7 @@ fn one_launch_advances_two_continuations_of_a_shared_tail() {
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(source, 0)]);
     let (pending, mut bindings) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     let checkpoint = domain.resume_state(source).unwrap();
     let copies = [RequestId(82), RequestId(83)];
@@ -904,7 +980,7 @@ fn one_launch_advances_two_continuations_of_a_shared_tail() {
     assert_eq!(pending.len(), 2);
     for outcome in pending {
         domain
-            .reconcile(outcome, PhysicalDecision { accepted_rows: 1 })
+            .reconcile(outcome, PhysicalDecision::rows(1))
             .unwrap();
     }
     for copy in copies {
@@ -981,8 +1057,9 @@ fn fresh_memory_observation_reads_released_state_backing() {
 fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
     let backend = bank_backends()[0];
     let (mut domain, mut bindings) = banked(backend, 4, 4);
+    let prices = load_costs(domain.expert_bank_plan()).prices;
     let measures = |blocks| crate::LoadMeasures {
-        costs: Ok(load_costs()),
+        costs: Ok(crate::LoadCosts { prices: prices.clone() }),
         experts: Some(crate::ExpertMeasures {
             lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
             read: crate::assessment::Priced::Pending("unmeasured".into()),
@@ -991,6 +1068,8 @@ fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
                 blocks,
                 whole_seconds: 0.001,
                 stall_share: 0.1,
+                transfer: magnitude_cost_model::ReadLine::new(1e-5, 1e-10).unwrap(),
+                back: magnitude_cost_model::ReadLine::new(1e-5, 1e-10).unwrap(),
             })),
             convert: crate::assessment::Priced::Measured(None),
         }),
@@ -1099,7 +1178,7 @@ fn a_launch_a_bank_resize_ran_across_is_not_timed() {
             during(domain);
             let (pending, bindings) = finish_one(domain, flight);
             let timed = pending.launch_duration().is_some();
-            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+            domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
             (timed, bindings)
         };
         let quiet = |_: &mut ExecutorDomain<TestFamily>| {};
@@ -1138,7 +1217,7 @@ fn a_launch_says_whether_the_banks_cover_read_beside_it() {
             during(domain);
             let (pending, bindings) = finish_one(domain, flight);
             let duration = pending.launch_duration();
-            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+            domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
             (duration.map(|duration| duration.covering), bindings)
         };
         let quiet = |_: &ExecutorDomain<TestFamily>| {};
@@ -1208,7 +1287,7 @@ fn a_shrink_during_a_chain_is_deferred_to_its_end() {
         domain.plan_successors((1..4).map(|position| prefill(request, position)).collect());
         let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
         let (pending, mut bindings) = finish_one(&mut domain, flight);
-        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
         assert_eq!(domain.chain_holder(), Some(request), "{backend:?}");
         let shrink = |domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings| {
             domain.shrink_expert_bank_to(bindings, crate::BankHolding::Experts, 3, unwatched()).unwrap()
@@ -1242,6 +1321,8 @@ fn decode(request: RequestId, position: usize) -> Operation {
         }],
         committed: 1,
         prime: None,
+        front: Vec::new(),
+        chain: None,
     }
 }
 
@@ -1286,7 +1367,7 @@ fn a_growth_keeps_the_pipelined_lookahead() {
         domain.plan_successors(vec![prefill(request, 1)]);
         let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
         let (pending, mut bindings) = finish_one(&mut domain, flight);
-        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
         assert_eq!(domain.queue.len(), 1, "with no growth, the next chunk queues");
         // A growth begun while that chunk runs.
         price_growth(&mut domain, &mut bindings, misses_at(3, 100));
@@ -1295,7 +1376,7 @@ fn a_growth_keeps_the_pipelined_lookahead() {
         domain.plan_successors(vec![prefill(request, 2)]);
         let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 1)]);
         let (pending, _) = finish_one(&mut domain, flight);
-        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
         assert_eq!(domain.queue.len(), 1, "a successor queues beside a running growth");
         assert!(matches!(finish(&mut domain), crate::BankResized::Grown { to: 4, .. }));
         assert_eq!(domain.resume_state(request).unwrap().target.position(), 2, "the request ran on unaffected");
@@ -1426,12 +1507,14 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             },
             advance: Some(Advance::Step(head_advance)),
             primed: None,
+            front: None,
             rows: 1,
             committed_rows: 0,
             kind: WorkKind::Decode,
             physical_duration: Duration::ZERO,
             timed: Timed::Settled,
             image: None,
+            awaited: None,
         })
         .unwrap();
     assert_eq!(domain.target.get(&request).unwrap().position(), 0);
@@ -1454,12 +1537,14 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             },
             advance: None,
             primed: None,
+            front: None,
             rows: 0,
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: Duration::ZERO,
             timed: Timed::Settled,
             image: Some(image),
+            awaited: None,
         })
         .unwrap();
     assert_eq!(domain.target.get(&request).unwrap().position(), 0);
@@ -1675,14 +1760,16 @@ fn reconcile_encode<F: ProgramFamily>(
                 },
                 advance: None,
                 primed: None,
+                front: None,
                 rows: 0,
                 committed_rows: 0,
                 kind: WorkKind::Prefill,
                 physical_duration: Duration::ZERO,
                 timed: Timed::Settled,
                 image: Some(image),
+                awaited: None,
             },
-            PhysicalDecision { accepted_rows: 0 },
+            PhysicalDecision::rows(0),
         )
         .unwrap();
     features
@@ -1776,6 +1863,8 @@ fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() 
         demand: crate::batching::Demand::NONE,
         select: Vec::new(),
         prime: None,
+        front: Vec::new(),
+        chain: None,
     };
     for (position, tokens) in [(0, vec![TEXT, MEDIA]), (2, vec![TEXT])] {
         let rows = tokens.len();
@@ -1785,9 +1874,7 @@ fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() 
         domain
             .reconcile(
                 pending,
-                PhysicalDecision {
-                    accepted_rows: rows,
-                },
+                PhysicalDecision::rows(rows),
             )
             .unwrap();
         bindings = returned;
@@ -1933,7 +2020,7 @@ fn attach_pending_priming(
         core,
         workspace: (workspace, output),
         output: crate::programs::HeadOutput {
-            selections: None,
+            selected: crate::programs::HeadSelected::Causal,
             landed_reads: Vec::new(),
         },
     });
@@ -1968,7 +2055,7 @@ fn deferred_priming_commits_after_target_publication_and_releases_leases() {
     let held_outputs = domain.resources.target_readout_graph(usize::MAX).available_output();
     let (pending, mut priming) = publish_before_priming(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .reconcile(pending, PhysicalDecision::rows(2))
         .unwrap();
     assert_eq!(domain.target[&request].position(), 2);
     assert!(!domain.head.contains_key(&request));
@@ -2030,7 +2117,7 @@ fn a_deferred_entry_commits_with_the_chain_its_chunk_opens() {
     let control = attach_pending_priming(&mut domain, &mut flight, request, TokenId(1));
     let (pending, priming) = publish_before_priming(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     assert_eq!(domain.chain_holder(), Some(request));
     control.resolve(Ok(()));
@@ -2041,7 +2128,7 @@ fn a_deferred_entry_commits_with_the_chain_its_chunk_opens() {
         let (pending, returned) = finish_one(&mut domain, flight);
         bindings = returned;
         domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .reconcile(pending, PhysicalDecision::rows(1))
             .unwrap();
     }
     assert_eq!(domain.chain_holder(), None);
@@ -2069,7 +2156,7 @@ fn deferred_priming_aborts_when_its_target_chunk_is_rejected() {
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
     let (pending, _) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     domain.close(request).unwrap();
 }
@@ -2082,7 +2169,7 @@ fn deferred_priming_prevents_cancelled_request_retirement_until_completion() {
     let (mut domain, flight, control) = target_with_pending_priming(request);
     let (pending, priming) = publish_before_priming(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .reconcile(pending, PhysicalDecision::rows(2))
         .unwrap();
     assert_eq!(
         domain.close(request).unwrap_err(),
@@ -2122,13 +2209,14 @@ fn boundary_features_commit_fork_and_abort_with_numerical_state() {
                 features: Some(aggregate),
                 ..RowResult::default()
             }],
+            guesses: Vec::new(),
         };
     };
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
     let (mut pending, mut bindings) = finish_one(&mut domain, flight);
     attach(&mut pending, &first);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     let checkpoint = domain.resume_state(request).unwrap();
     assert!(
@@ -2163,7 +2251,7 @@ fn boundary_features_commit_fork_and_abort_with_numerical_state() {
         if invalid {
             assert!(
                 domain
-                    .reconcile(pending, PhysicalDecision { accepted_rows: 0 })
+                    .reconcile(pending, PhysicalDecision::rows(0))
                     .is_err()
             );
         } else {
@@ -2177,7 +2265,7 @@ fn boundary_features_commit_fork_and_abort_with_numerical_state() {
     let (mut pending, _) = finish_one(&mut domain, flight);
     attach(&mut pending, &second);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     assert!(
         domain
@@ -2209,6 +2297,8 @@ fn feed(request: RequestId, position: usize, values: &[u32]) -> Operation {
         select: Vec::new(),
         committed: values.len(),
         prime: None,
+        front: Vec::new(),
+        chain: None,
     }
 }
 
@@ -2229,12 +2319,12 @@ fn token_history_follows_rollback_and_fork() {
     let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 0, &[10, 11])]);
     let (pending, returned) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .reconcile(pending, PhysicalDecision::rows(2))
         .unwrap();
     let flight = submit_reserved_target(&mut domain, returned, vec![feed(source, 2, &[12])]);
     let (pending, returned) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     // A step past the accepted rows is fed, then aborted.
     let flight = submit_reserved_target(&mut domain, returned, vec![feed(source, 3, &[20, 21])]);
@@ -2248,7 +2338,7 @@ fn token_history_follows_rollback_and_fork() {
     let flight = submit_reserved_target(&mut domain, returned, vec![feed(source, 3, &[40])]);
     let (pending, mut bindings) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     assert_eq!(
         token_values(domain.preceding_tokens(source, 4, 2).unwrap()),
@@ -2272,7 +2362,7 @@ fn token_history_follows_rollback_and_fork() {
     let flight = submit_reserved_target(&mut domain, bindings, vec![feed(copy, 4, &[50])]);
     let (pending, _) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     assert_eq!(
         token_values(domain.preceding_tokens(copy, 5, 2).unwrap()),
@@ -2549,7 +2639,7 @@ fn a_table_read_failure_fails_only_the_sequence_that_named_the_rows() {
             if pending.request() == kept {
                 assert!(matches!(pending.outcome(), Outcome::Forward { .. }));
                 domain
-                    .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+                    .reconcile(pending, PhysicalDecision::rows(1))
                     .unwrap();
             } else {
                 let Outcome::WeightReadFailed(error) = pending.outcome() else {
@@ -2557,7 +2647,7 @@ fn a_table_read_failure_fails_only_the_sequence_that_named_the_rows() {
                 };
                 assert!(error.detail.contains("3500"), "{error}");
                 assert!(matches!(
-                    domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }),
+                    domain.reconcile(pending, PhysicalDecision::rows(1)),
                     Err(DomainError::WeightRead(_))
                 ));
             }
@@ -2572,7 +2662,7 @@ fn a_table_read_failure_fails_only_the_sequence_that_named_the_rows() {
     let (pending, _) = finish_one(&mut domain, flight);
     assert!(matches!(pending.outcome(), Outcome::Forward { .. }));
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     std::fs::remove_file(path).unwrap();
 }
@@ -2605,7 +2695,7 @@ fn an_expert_read_failure_fails_only_its_steps_sequences() {
         };
         assert!(error.detail.contains("failed to fill"), "{error}");
         assert!(matches!(
-            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }),
+            domain.reconcile(pending, PhysicalDecision::rows(1)),
             Err(DomainError::WeightRead(_))
         ));
     }
@@ -2615,7 +2705,7 @@ fn an_expert_read_failure_fails_only_its_steps_sequences() {
     let (pending, _) = finish_one(&mut domain, flight);
     assert!(matches!(pending.outcome(), Outcome::Forward { .. }));
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
 }
 
@@ -2718,7 +2808,7 @@ fn selected_histories_follow_blocks_across_rollback() {
         let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 0, &tokens)]);
         let (pending, bindings) = finish_one(&mut domain, flight);
         domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 10 })
+            .reconcile(pending, PhysicalDecision::rows(10))
             .unwrap();
         assert_eq!(blocks(&domain, source), 2);
         // Six rows from 10 complete blocks 2 and 3, then roll back whole: the
@@ -2736,7 +2826,7 @@ fn selected_histories_follow_blocks_across_rollback() {
         let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 10, &[40, 41])]);
         let (pending, bindings) = finish_one(&mut domain, flight);
         domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+            .reconcile(pending, PhysicalDecision::rows(2))
             .unwrap();
         assert_eq!(domain.resume_state(source).unwrap().position(), 12);
         assert_eq!(blocks(&domain, source), 3);
@@ -2757,7 +2847,7 @@ fn selected_histories_follow_blocks_across_rollback() {
             let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, position, &[token])]);
             let (pending, returned) = finish_one(&mut domain, flight);
             domain
-                .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+                .reconcile(pending, PhysicalDecision::rows(1))
                 .unwrap();
             bindings = returned;
         }
@@ -2842,21 +2932,142 @@ fn compressed_layers_bind_their_state_on(backend: seismic::BackendName, form: Co
     let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 0, &[1, 2, 3, 4, 5])]);
     let (pending, bindings) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 5 })
+        .reconcile(pending, PhysicalDecision::rows(5))
         .unwrap();
     // Two rows from 5 complete group 2 (position 5) from the pending row
     // and leave position 6 pending.
     let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 5, &[6, 7])]);
     let (pending, bindings) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .reconcile(pending, PhysicalDecision::rows(2))
         .unwrap();
     assert_eq!(domain.resume_state(source).unwrap().position(), 7);
     // A decode at 7 completes group 3 from the pending row.
     let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 7, &[9])]);
     let (pending, _) = finish_one(&mut domain, flight);
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .reconcile(pending, PhysicalDecision::rows(1))
         .unwrap();
     assert_eq!(domain.resume_state(source).unwrap().position(), 8);
+}
+
+/// A two-row pass selects its front row too: its readout projects both
+/// rows, so its reservation takes the readout slot of the class that holds
+/// two (a slot of the one-row class runs no two-row readout graph).
+#[test]
+fn a_two_row_pass_projects_its_front_row() {
+    let spec = |position| SelectSpec {
+        sampling: crate::Sampling::Greedy,
+        seed: 0,
+        position,
+        domain: 0,
+        mask: None,
+        shaping: crate::Shaping::default(),
+        history: None,
+    };
+    // A chained pass at 10: its exact row, then its front row.
+    let paired = Operation::Forward {
+        request: RequestId(1),
+        kind: WorkKind::Decode,
+        front: vec![crate::FrontRow { select: spec(11), kind: crate::FrontKind::Host(crate::GuessKind::Chained) }],
+        chain: Some(crate::ChainEntry { position: 10 }),
+        tokens: vec![crate::TokenId(7), crate::TokenId(8)],
+        position: 10,
+        conditioning: None,
+        demand: crate::batching::Demand::SELECT | crate::batching::Demand::FEATURES,
+        select: vec![spec(10)],
+        committed: 1,
+        prime: None,
+    };
+    paired.validate().unwrap();
+    assert_eq!((paired.selected_rows(), projected_rows(std::slice::from_ref(&paired))), (2, 2));
+}
+
+/// A pass that ran rows ahead in an expert bank's step tells the bank its
+/// verdict by that step as its outcome is reconciled, and its discard as
+/// its outcome is aborted; a pass of no rows ahead tells it nothing. A load
+/// banking no experts reconciles a verdict all the same.
+///
+/// The domain routes a verdict by the rows a pass runs ahead, whatever they
+/// read out, and the controlled fixture plans no readout, while every pass
+/// the product runs ahead selects (a front row its guess, a verification
+/// every row). So the pass judged here is one of an acceptable row reading
+/// nothing out, on a drafting load: only planned draft rows run ahead
+/// as acceptable rows.
+#[test]
+fn a_reconciled_verdict_reaches_the_expert_bank_by_its_step() {
+    let request = RequestId(1);
+    // A pass at `position` of its exact row and one acceptable row.
+    let ahead = |position| Operation::Forward {
+        request,
+        kind: WorkKind::Decode,
+        tokens: vec![crate::TokenId(1), crate::TokenId(2)],
+        position,
+        conditioning: None,
+        demand: crate::batching::Demand::NONE,
+        select: Vec::new(),
+        committed: 1,
+        prime: None,
+        front: Vec::new(),
+        chain: None,
+    };
+    let rows = crate::Rows::Exact { acceptable: vec![crate::TokenId(2)] };
+    // Its exact row selects 3, rejecting the acceptable row: one row accepted.
+    let verdict = crate::AheadVerdict::new(&rows, &[crate::TokenId(3), crate::TokenId(5)]);
+    let decided = |verdict: &crate::AheadVerdict| PhysicalDecision { accepted_rows: 1, ahead: verdict.clone() };
+    // The next flight runs in a step of its own, whose sequence is returned.
+    let stepped = || {
+        let step = crate::experts::ExpertStep::unwatched();
+        let sequence = step.sequence();
+        EXPERT_STEPS.with(|steps| *steps.borrow_mut() = Some(step));
+        sequence
+    };
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked_drafted(backend, 4, 4);
+        open(&mut domain, &mut bindings, request);
+        let judged = stepped();
+        let flight = submit_reserved_target(&mut domain, bindings, vec![ahead(0)]);
+        let (pending, bindings) = finish_one(&mut domain, flight);
+        domain.reconcile(pending, decided(&verdict)).unwrap();
+        stepped();
+        let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 1)]);
+        let (pending, bindings) = finish_one(&mut domain, flight);
+        domain.reconcile(pending, PhysicalDecision::rows(1)).unwrap();
+        let discarded = stepped();
+        let flight = submit_reserved_target(&mut domain, bindings, vec![ahead(2)]);
+        let (pending, _) = finish_one(&mut domain, flight);
+        domain.abort(pending).unwrap();
+        let bank = domain.family.bank.as_ref().unwrap();
+        assert_eq!(*bank.decided.lock().unwrap(), [(judged, request, verdict.clone())], "{backend:?}");
+        assert_eq!(*bank.discarded.lock().unwrap(), [(discarded, request)], "{backend:?}");
+        assert_eq!(domain.resume_state(request).unwrap().target.position(), 2, "{backend:?}");
+    }
+    let (mut domain, mut bindings) = drafted_on(platform::DeviceRequest::Automatic);
+    open(&mut domain, &mut bindings, request);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![ahead(0)]);
+    let (pending, _) = finish_one(&mut domain, flight);
+    domain.reconcile(pending, decided(&verdict)).unwrap();
+    assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
+}
+
+/// Evicting a request's state or closing it tells the expert bank none of its
+/// passes will come (`ElasticBank::closed`), and succeeds all the same on a
+/// load that banks no experts.
+#[test]
+fn evicting_or_closing_a_request_reaches_the_expert_bank() {
+    let [evicted, closed] = [RequestId(1), RequestId(2)];
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 4);
+        open(&mut domain, &mut bindings, evicted);
+        open(&mut domain, &mut bindings, closed);
+        domain.release_state(&[evicted]).unwrap();
+        domain.close(closed).unwrap();
+        let told = domain.family.bank.as_ref().unwrap().closed.lock().unwrap().clone();
+        assert_eq!(told, [evicted, closed], "{backend:?}");
+    }
+    let (mut domain, mut bindings) = fixture(None);
+    open(&mut domain, &mut bindings, evicted);
+    open(&mut domain, &mut bindings, closed);
+    domain.release_state(&[evicted]).unwrap();
+    domain.close(closed).unwrap();
 }

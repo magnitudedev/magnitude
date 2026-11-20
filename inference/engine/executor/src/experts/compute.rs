@@ -84,6 +84,16 @@ impl Urgency {
         self.0.lock().expect("a job's urgency").1
     }
 
+    /// Its read is repriced as `want` (the ledger's aggregate): a job no step
+    /// waits on follows its read's want, up or down; one a step waits on
+    /// stays due.
+    pub(in crate::experts) fn set(&self, want: Want) {
+        let mut urgency = self.0.lock().expect("a job's urgency");
+        if !urgency.1 {
+            urgency.0 = want;
+        }
+    }
+
     /// A step waits on it from now: due, if not due before.
     pub(in crate::experts) fn hasten(&self) {
         let mut urgency = self.0.lock().expect("a job's urgency");
@@ -120,7 +130,7 @@ impl ComputeThreads {
     pub(crate) fn placeable(workers: usize) -> Self {
         let nodes = {
             let _placement = crate::test_support::process_placement();
-            seismic::Processors::discover().memory_cores()
+            seismic::discover_processors().memory_cores()
         };
         let cpus = nodes.iter().flat_map(|(_, cores)| cores).map(|threads| threads[0]).collect::<Vec<_>>();
         Self::unplaced(vec![(0..workers).map(|worker| cpus[worker % cpus.len()]).collect()])
@@ -162,15 +172,13 @@ impl Machine {
     /// CPU device's pool) and the memory node it is attached to
     /// (`Device::host_node`).
     pub(crate) fn discover(device: &seismic::Device, read_cores: f64) -> Result<Self, String> {
-        let node = device.host_node().map_err(|error| format!("the device's memory node: {error}"))?;
-        Self::beside(device.host_threads(), read_cores, node)
-    }
-
-    /// This machine's beside a device of `device_threads` threads on the
-    /// host, attached to node `device_node`, and reads of `read_cores`.
-    fn beside(device_threads: usize, read_cores: f64, device_node: seismic::DeviceNode) -> Result<Self, String> {
-        let processors = seismic::Processors::discover();
-        Ok(Self::of(&processors, processors.quota().get(), busy_threads(device_threads, read_cores), device_node))
+        let processors = &device.topology().host().processors;
+        Ok(Self::of(
+            processors,
+            processors.quota().get(),
+            busy_threads(device.host_threads(), read_cores),
+            device.host_node(),
+        ))
     }
 
     /// The machine of `processors` under `quota` threads, of which `busy`
@@ -179,9 +187,9 @@ impl Machine {
     /// fill it only once every other node is full and the device's own
     /// threads (its submitter, its driver's) run beside it; a device of no
     /// known node orders none.
-    pub(crate) fn of(processors: &seismic::Processors, quota: usize, busy: usize, device_node: seismic::DeviceNode) -> Self {
+    pub(crate) fn of(processors: &seismic::Processors, quota: usize, busy: usize, device_node: seismic::HostNode) -> Self {
         let mut nodes = processors.memory_cores();
-        nodes.sort_by_key(|&(id, _)| device_node == seismic::DeviceNode::Node(id));
+        nodes.sort_by_key(|&(id, _)| device_node == seismic::HostNode::Node(id));
         Self {
             nodes: nodes.into_iter().map(|(_, cores)| cores).collect(),
             allowed: processors.allowed().iter().copied().collect(),
@@ -230,7 +238,7 @@ impl Machine {
     /// of the fewest workers within the least's resolution ([`fewest_at_least`]).
     pub(crate) fn sized(
         &self,
-        mut stage: impl FnMut(&ComputeThreads) -> Result<crate::assessment::Sample, String>,
+        mut stage: impl FnMut(&ComputeThreads) -> Result<magnitude_cost_model::Sample, String>,
     ) -> Result<ComputeThreads, String> {
         let candidates = self.candidates();
         if candidates.is_empty() {
@@ -263,7 +271,7 @@ impl Machine {
 /// The index of the least stage time of `samples` (fewest workers first),
 /// or of the fewest workers within its resolution: on a flat curve, more
 /// workers buy nothing a measurement resolves and cost the quota.
-fn fewest_at_least(samples: &[crate::assessment::Sample]) -> usize {
+fn fewest_at_least(samples: &[magnitude_cost_model::Sample]) -> usize {
     let least = samples.iter().min_by(|a, b| a.seconds.total_cmp(&b.seconds)).expect("a sample of each candidate");
     samples.iter().position(|sample| sample.seconds <= least.seconds + least.resolution).expect("the least is within its own resolution")
 }

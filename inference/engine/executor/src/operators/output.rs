@@ -10,18 +10,18 @@ use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_target_graph::{PackedWeight, WeightOperands};
 use magnitude_kernels::{post_norm_residual, project_rows};
 use seismic::{
-    Argument, Dim, Element, Entry, NativeGraph, NativeGraphMetadata, WorkflowTensor, WorkflowTensorRef,
+    Argument, Dim, Element, EntryContract, NativeGraph, WorkflowTensor, WorkflowTensorRef,
 };
 
 /// A sublayer's output entries, with `E` the operator's own output entry;
 /// each projection's by row range.
-pub(crate) enum TailEntries<'a, G: GraphDraft + 'a, E: Entry + 'a> {
+pub(crate) enum TailEntries<'a, G: GraphDraft + 'a, E: EntryContract + 'a> {
     Residual(G::Ranged<'a, E>),
     PostNorm(PostNormEntries<'a, G>),
 }
 
-impl<'a, G: GraphDraft + 'a, E: Entry + 'a> Copy for TailEntries<'a, G, E> {}
-impl<'a, G: GraphDraft + 'a, E: Entry + 'a> Clone for TailEntries<'a, G, E> {
+impl<'a, G: GraphDraft + 'a, E: EntryContract + 'a> Copy for TailEntries<'a, G, E> {}
+impl<'a, G: GraphDraft + 'a, E: EntryContract + 'a> Clone for TailEntries<'a, G, E> {
     fn clone(&self) -> Self {
         *self
     }
@@ -39,7 +39,7 @@ impl<'a, G: GraphDraft + 'a> Clone for PostNormEntries<'a, G> {
     }
 }
 
-impl<'a, E: Entry + 'a> From<&'a SublayerOutput<RangedKernels<E>>>
+impl<'a, E: EntryContract + 'a> From<&'a SublayerOutput<RangedKernels<E>>>
     for TailEntries<'a, NativeGraph, E>
 {
     fn from(output: &'a SublayerOutput<RangedKernels<E>>) -> Self {
@@ -68,10 +68,12 @@ impl CheckedPostNormEntries {
         }
     }
 
-    pub(crate) fn entries(&self) -> PostNormEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> PostNormEntries<'_, G> {
         PostNormEntries {
-            project: &self.project,
-            residual: &self.residual,
+            project: G::bind_ranged(&self.project),
+            residual: G::bind(&self.residual),
         }
     }
 }

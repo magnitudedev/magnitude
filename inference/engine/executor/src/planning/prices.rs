@@ -1,25 +1,23 @@
-//! What the plan prices its holdings with: the
-//! generic prior assessment estimates with, from the model's headers and
-//! the machine's standing figures alone (`ExecutorCosts`,
-//! `StreamedFigures`), never live data or recorded data of a model. A bank
-//! slot is worth the decode seconds it saves (`StreamedLayers::step_seconds`
-//! on the step `C` of the form its slots decode in) times decode steps a
-//! second; a prompt pass
-//! size the routed prefill seconds its fewer passes save
-//! (`routed_prompt_seconds`) times requests a second; both rates the
-//! workload prior's ([`WorkloadRates::prior`]).
+//! The executor's side of a plan's bank prices
+//! ([`magnitude_cost_model::BankPrices`]): the executor's costs, the
+//! machine's streamed figures and its decode step in each form, from which
+//! a bank's prices are built for the plan that holds it ([`PlanPrices`]).
 
-use super::{ExecutionPlanDraft, PassLaunches, ResourceLimits};
-use crate::assessment::{AssessmentError, ExecutorCosts, ExpertPass, FormSeconds, HeldSlots, Priced, StreamedFigures, StreamedLayers};
+use super::{ExecutionPlanDraft, ResourceLimits};
+use crate::assessment::{AssessmentError, ExecutorCosts, Priced, StreamedFigures};
 use crate::error::PlanError;
-use crate::workload::WorkloadRates;
+use magnitude_cost_model::{BankPrices, FormSeconds, PassLayers, Prior, PriorOverflow};
 use magnitude_family_contracts::ModelDefinition;
 
+/// A plan's launch of some rows at some depth in each form, as its
+/// assessment prices it on this executor (`LaunchPrices::launch`).
+pub type PlanForms = dyn Fn(u32, u32) -> Result<FormSeconds, AssessmentError>;
+
 /// What prices a plan's decode step in each form: of `definition` planned
-/// as the plan that banks its experts, its step `C` (`crate::DecodeStep`: a
-/// launch of some rows at some depth, the plan before any bank's and the
-/// banked plan's streamed form's).
-pub type PlanSteps = dyn Fn(&ModelDefinition, &ExecutionPlanDraft) -> Result<Box<crate::DecodeStep>, AssessmentError>;
+/// as the plan that banks its experts, its step `C` (a launch of some rows
+/// at some depth, the plan before any bank's and the banked plan's
+/// streamed form's).
+pub type PlanSteps = dyn Fn(&ModelDefinition, &ExecutionPlanDraft) -> Result<Box<PlanForms>, AssessmentError>;
 
 /// The prices of a plan's holdings: the executor's costs, the machine's
 /// streamed figures, and its decode step in each form.
@@ -35,6 +33,22 @@ impl std::fmt::Debug for PlanPrices {
     }
 }
 
+impl From<PriorOverflow> for PlanError {
+    fn from(_: PriorOverflow) -> Self {
+        PlanError::Arithmetic("a prior's figure exceeds u32")
+    }
+}
+
+/// The workload prior of a load planning `context` rows of context with
+/// `limits` ([`Prior`]).
+pub(crate) fn prior(context: u64, limits: ResourceLimits) -> Result<Prior, PlanError> {
+    let region_rows = magnitude_batching::row_classes(limits.max_launch_rows)
+        .last()
+        .copied()
+        .expect("a launch's row bound has a row class") as u64;
+    Ok(Prior::of(context, limits.max_launch_rows as u64, region_rows)?)
+}
+
 impl PlanPrices {
     pub fn new(costs: ExecutorCosts, figures: StreamedFigures, steps: Box<PlanSteps>) -> Self {
         Self { costs, figures, steps }
@@ -46,36 +60,38 @@ impl PlanPrices {
     /// adds are what the settle sizes, so the prior cannot read them first.
     /// Serving starts its meter at the step the bank it holds then prices
     /// (`ExecutorDomain::serving_prior`).
-    /// Pending or unavailable as its layers' lines are (`StreamedLayers::of_bank`).
+    /// Pending or unavailable as its layers' lines are (`streamed_layers`).
     pub(crate) fn of_bank(&self, banked: &ExecutionPlanDraft, definition: &ModelDefinition) -> Result<Priced<BankPrices>, PlanError> {
         let priced = |error: String| PlanError::ResourcePlanning(format!("the plan's prices: {error}"));
         let bank = banked.load().expert_bank().ok_or_else(|| priced("the plan holds no bank".into()))?;
         let limits = banked.policy().limits();
-        let prior = Prior::of(definition.decoder.context_limit, limits)?;
+        let prior = prior(definition.decoder.context_limit, limits)?;
         let step = (self.steps)(definition, banked).map_err(|error| priced(error.to_string()))?;
         let step = |rows: u32, depth: u32| step(rows, depth).map_err(|error| priced(error.to_string()));
         let compute = step(1, prior.decode_depth)?;
         let rates = prior.rates(compute.resident, |rows, depth| step(rows, depth).map(|step| step.resident))?;
-        let layers = match StreamedLayers::of_bank(bank, &self.costs, &self.figures) {
+        let layers = match crate::assessment::streamed_layers(bank, &self.costs, &self.figures) {
             Priced::Measured(layers) => layers,
             Priced::Pending(reason) => return Ok(Priced::Pending(reason)),
             Priced::Unavailable(reason) => return Ok(Priced::Unavailable(reason)),
         };
-        Ok(Priced::Measured(BankPrices {
+        let pass = crate::assessment::expert_pass(bank, &self.costs).map_err(|error| priced(error.to_string()))?;
+        let routed = PassLayers::of(&pass, bank.layers().iter().map(|layer| layer.experts), bank.selected());
+        Ok(Priced::Measured(BankPrices::new(
             layers,
-            pass: ExpertPass::of_bank(bank, self.costs.clone()).map_err(|error| priced(error.to_string()))?,
-            routed: bank.layers().iter().map(|layer| (layer.experts, bank.selected())).collect(),
-            windows: bank.windows(),
-            read: self.figures.read,
+            pass,
+            routed,
+            bank.windows(),
+            self.figures.read,
             compute,
             rates,
-            region_rows: prior.region_rows,
+            prior.region_rows,
             // A pass is sized for the prompts a load's chain takes, every
             // chunk of a whole-context one (`ExecutionPlanDraft::prompt_places`):
             // a pass the prior's half-context prompt fills would split
             // longer prompts into more passes, each reading its misses again.
-            prompt_rows: definition.decoder.context_limit,
-        }))
+            definition.decoder.context_limit,
+        )))
     }
 }
 
@@ -90,90 +106,3 @@ pub(crate) fn measured<T>(priced: Priced<T>) -> Result<T, PlanError> {
     }
 }
 
-/// The workload prior before a load serves, with no request history to
-/// read: one stream that prefills half the planned context, then decodes
-/// the other half, a row at a time. The plan prices its holdings with it,
-/// and serving starts every load's meter from it, banked or not
-/// (`ExecutorDomain::serving_rates`).
-pub(crate) struct Prior {
-    prefill_tokens: u64,
-    decode_steps: u64,
-    /// The depth a decode step is priced at: the middle of the decode.
-    pub(crate) decode_depth: u32,
-    /// The prefill's launches of `launch_rows` rows each, priced at the
-    /// middle of the prompt.
-    launch_rows: u32,
-    prefill_launches: u64,
-    prefill_depth: u32,
-    /// The rows of one launch's region of a prompt pass: the widest row
-    /// class of a launch.
-    pub(crate) region_rows: u64,
-}
-
-impl Prior {
-    /// The prior of a load planning `context` rows of context with
-    /// `limits`.
-    pub(crate) fn of(context: u64, limits: ResourceLimits) -> Result<Self, PlanError> {
-        let narrow = |figure: u64| u32::try_from(figure).map_err(|_| PlanError::Arithmetic("a prior's figure exceeds u32"));
-        let context = context.max(2);
-        let prefill_tokens = context / 2;
-        let decode_steps = context - prefill_tokens;
-        let launch_rows = limits.max_launch_rows as u64;
-        let region_rows = magnitude_batching::row_classes(limits.max_launch_rows)
-            .last()
-            .copied()
-            .expect("a launch's row bound has a row class") as u64;
-        Ok(Self {
-            prefill_tokens,
-            decode_steps,
-            decode_depth: narrow(prefill_tokens + decode_steps / 2)?,
-            launch_rows: narrow(launch_rows)?,
-            prefill_launches: prefill_tokens.div_ceil(launch_rows),
-            prefill_depth: narrow(prefill_tokens / 2)?,
-            region_rows,
-        })
-    }
-
-    /// The prior's rates, its decode steps `step_seconds` each and its
-    /// prefill's launches priced on the resident step `resident(rows,
-    /// depth)`.
-    pub(crate) fn rates<E>(&self, step_seconds: f64, resident: impl Fn(u32, u32) -> Result<f64, E>) -> Result<WorkloadRates, E> {
-        let launch = resident(self.launch_rows, self.prefill_depth)?;
-        let prefill_seconds = self.prefill_launches as f64 * launch;
-        Ok(WorkloadRates::prior(step_seconds, self.decode_steps as f64, self.prefill_tokens as f64, prefill_seconds))
-    }
-}
-
-/// The prices of one bank's holdings under the workload prior.
-pub(crate) struct BankPrices {
-    layers: StreamedLayers,
-    pass: ExpertPass,
-    /// Each routed layer's `(experts, selected)`.
-    routed: Vec<(u64, u64)>,
-    windows: u64,
-    read: crate::assessment::ReadLine,
-    /// `C`: the step at the prior's row and depth in each form.
-    compute: FormSeconds,
-    rates: WorkloadRates,
-    region_rows: u64,
-    prompt_rows: u64,
-}
-
-impl BankPrices {
-    /// A decode step's seconds holding `held` of each layer's experts.
-    pub(crate) fn step_seconds(&self, held: HeldSlots) -> f64 {
-        self.layers.step_seconds(None, self.read, held, 1.0, self.compute).total_seconds
-    }
-
-    /// A whole-context prompt's routed seconds in passes of `pass` launches
-    /// holding `held`: each pass's compute and the reads of its misses
-    /// ([`StreamedLayers::pass_reads`]).
-    pub(crate) fn prompt_seconds(&self, pass: PassLaunches, held: HeldSlots) -> f64 {
-        let reads = |rows: u64| self.layers.pass_reads(self.read, held, rows as f64);
-        super::routed_prompt_seconds(&self.pass, &self.routed, self.windows, self.region_rows, self.prompt_rows, pass, &reads)
-    }
-
-    pub(crate) fn rates(&self) -> WorkloadRates {
-        self.rates
-    }
-}

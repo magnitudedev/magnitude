@@ -438,12 +438,23 @@ static bool is_reserved_name(const std::string & name) {
     return RESERVED_NAMES.find(name) != RESERVED_NAMES.end();
 }
 
-static std::regex INVALID_RULE_CHARS_RE("[^a-zA-Z0-9-]+");
-static std::regex GRAMMAR_LITERAL_ESCAPE_RE("[\r\n\"\\\\]");
-static std::regex GRAMMAR_RANGE_LITERAL_ESCAPE_RE("[\r\n\"\\]\\-\\\\]");
-static std::unordered_map<char, std::string> GRAMMAR_LITERAL_ESCAPES = {
-    {'\r', "\\r"}, {'\n', "\\n"}, {'"', "\\\""}, {'-', "\\-"}, {']', "\\]"}, {'\\', "\\\\"}
-};
+static std::string sanitize_rule_name(const std::string & name) {
+    std::string out;
+    out.reserve(name.size());
+    bool in_invalid = false;
+    for (unsigned char c : name) {
+        const bool valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                           (c >= '0' && c <= '9') || c == '-';
+        if (valid) {
+            out.push_back(static_cast<char>(c));
+            in_invalid = false;
+        } else if (!in_invalid) {
+            out.push_back('-');
+            in_invalid = true;
+        }
+    }
+    return out;
+}
 
 static const int MAX_PATTERN_DEPTH = 100;
 
@@ -624,30 +635,21 @@ static uint32_t decode_utf8(const std::string & text, size_t & i) {
     return cp;
 }
 
-static std::string replacePattern(const std::string & input, const std::regex & regex, const std::function<std::string(const std::smatch  &)> & replacement) {
-    std::smatch match;
-    std::string result;
-
-    std::string::const_iterator searchStart(input.cbegin());
-    std::string::const_iterator searchEnd(input.cend());
-
-    while (std::regex_search(searchStart, searchEnd, match, regex)) {
-        result.append(searchStart, searchStart + match.position());
-        result.append(replacement(match));
-        searchStart = match.suffix().first;
-    }
-
-    result.append(searchStart, searchEnd);
-
-    return result;
-}
-
 static std::string format_literal(const std::string & literal) {
-    std::string escaped = replacePattern(literal, GRAMMAR_LITERAL_ESCAPE_RE, [&](const std::smatch & match) {
-        char c = match.str()[0];
-        return GRAMMAR_LITERAL_ESCAPES.at(c);
-    });
-    return "\"" + escaped + "\"";
+    std::string out;
+    out.reserve(literal.size() + 2);
+    out.push_back('"');
+    for (char c : literal) {
+        switch (c) {
+            case '\r': out.append("\\r"); break;
+            case '\n': out.append("\\n"); break;
+            case '"':  out.append("\\\""); break;
+            case '\\': out.append("\\\\"); break;
+            default:   out.push_back(c); break;
+        }
+    }
+    out.push_back('"');
+    return out;
 }
 
 std::string gbnf_format_literal(const std::string & literal) { return format_literal(literal); }
@@ -804,18 +806,29 @@ private:
     }
 
     std::string _add_rule(const std::string & name, const std::string & rule) {
-        std::string esc_name = regex_replace(name, INVALID_RULE_CHARS_RE, "-");
-        if (_rules.find(esc_name) == _rules.end() || _rules[esc_name] == rule) {
-            _rules[esc_name] = rule;
+        std::string esc_name = sanitize_rule_name(name);
+        auto it = _rules.find(esc_name);
+        if (it == _rules.end()) {
+            _rules.emplace(esc_name, rule);
+            return esc_name;
+        }
+        if (it->second == rule) {
             return esc_name;
         }
         int i = 0;
-        while (_rules.find(esc_name + std::to_string(i)) != _rules.end() && _rules[esc_name + std::to_string(i)] != rule) {
+        std::string key;
+        while (true) {
+            key = esc_name + std::to_string(i);
+            auto kit = _rules.find(key);
+            if (kit == _rules.end()) {
+                _rules.emplace(key, rule);
+                return key;
+            }
+            if (kit->second == rule) {
+                return key;
+            }
             i++;
         }
-        std::string key = esc_name + std::to_string(i);
-        _rules[key] = rule;
-        return key;
     }
 
     std::string _generate_union_rule(const std::string & name, const std::vector<common_chat_schema_ptr> & alt_schemas) {
@@ -1088,8 +1101,7 @@ private:
         common_trie trie(strings);
 
         std::string char_rule = _add_primitive("char", PRIMITIVE_RULES.at("char"));
-        std::ostringstream out;
-        out << "[\"] ( ";
+        std::string out = "[\"] ( ";
         std::function<void(size_t)> visit = [&](size_t idx) {
             const auto & node = trie.nodes[idx];
             codepoint_ranges rejects;
@@ -1099,36 +1111,43 @@ private:
                 if (first) {
                     first = false;
                 } else {
-                    out << " | ";
+                    out.append(" | ");
                 }
-                out << "\"" << json_text_literal(cpt) << "\"";
+                out.push_back('"');
+                out.append(json_text_literal(cpt));
+                out.push_back('"');
                 if (!trie.nodes[child].children.empty()) {
-                    out << " (";
+                    out.append(" (");
                     visit(child);
-                    out << ")";
+                    out.push_back(')');
                 } else {
-                    out << " " << char_rule << "+";
+                    out.push_back(' ');
+                    out.append(char_rule);
+                    out.push_back('+');
                 }
             }
             if (!node.children.empty()) {
-                out << " | " << json_text_class(rejects, true) << " " << char_rule << "*";
+                out.append(" | ");
+                out.append(json_text_class(rejects, true));
+                out.push_back(' ');
+                out.append(char_rule);
+                out.push_back('*');
             }
         };
         visit(0);
 
-        out << " )";
+        out.append(" )");
         if (trie.nodes[0].pattern < 0) {
-            out << "?";
+            out.push_back('?');
         }
-        out << " [\"]";
-        return out.str();
+        out.append(" [\"]");
+        return out;
     }
 
     std::string _resolve_ref(const common_chat_schema_ref & schema) {
         auto it = schema.ref.find('#');
         std::string ref_fragment = it != std::string::npos ? schema.ref.substr(it + 1) : schema.ref;
-        static const std::regex nonalphanumeric_regex(R"([^a-zA-Z0-9-]+)");
-        std::string ref_name = "ref" + std::regex_replace(ref_fragment, nonalphanumeric_regex, "-");
+        std::string ref_name = "ref" + sanitize_rule_name(ref_fragment);
         if (_rules.find(ref_name) == _rules.end() && _refs_being_resolved.find(schema.ref) == _refs_being_resolved.end()) {
             if (!schema.target) {
                 _errors.push_back("Unresolved $ref " + schema.ref);
@@ -1394,11 +1413,19 @@ public:
     }
 
     std::string format_grammar() {
-        std::stringstream ss;
+        size_t total = 0;
         for (const auto & kv : _rules) {
-            ss << kv.first << " ::= " << kv.second << '\n';
+            total += kv.first.size() + 5 + kv.second.size() + 1;
         }
-        return ss.str();
+        std::string out;
+        out.reserve(total);
+        for (const auto & kv : _rules) {
+            out.append(kv.first);
+            out.append(" ::= ");
+            out.append(kv.second);
+            out.push_back('\n');
+        }
+        return out;
     }
 };
 

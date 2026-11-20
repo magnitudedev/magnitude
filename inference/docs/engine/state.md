@@ -23,6 +23,11 @@ accepted state → reserve private destinations → submit tentative work
 ```
 
 - A sequence has at most one unresolved advance.
+- An advance is a pass's rows: committed rows (at least one), which always
+  commit, then acceptable rows a commit may accept, then front rows that only
+  run ahead. It commits a prefix of its rows: all of them, a verification's
+  accepted prefix, or a front pass's exact row, never a front row. No advance
+  runs front rows alone.
 - Submission does not advance logical position.
 - Acceptance requires completion and valid request-level results.
 - Abort preserves accepted history and waits before recycling destinations that

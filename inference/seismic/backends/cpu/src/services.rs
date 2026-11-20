@@ -333,7 +333,7 @@ pub(crate) fn probe_suite_revision() -> &'static str {
 
 /// Runs the calibrated batched service suite after the production pool exists.
 /// Measurement-control constants affect acquisition only and never enter a
-/// duration expression. Every returned numeric service fact is observed on
+/// duration expression. Every returned numeric service measurement is observed on
 /// this open rather than copied from a nominal hardware table.
 /// `scratch` is the entry any scratch the probes' launches grow is charged
 /// to.

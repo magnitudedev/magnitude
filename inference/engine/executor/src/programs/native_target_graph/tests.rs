@@ -10,8 +10,7 @@ use super::{
         slot_scores,
     },
     entry::{
-        EntryTokens, EntryWidth, TARGET_TABLE, embedding_transform, entry_graph_topology, keeps_token_rows,
-        notifies_selection,
+        EntryTokens, EntryWidth, TARGET_TABLE, embedding_transform, entry_graph_topology,
     },
     prepared::{block_graph_shapes, block_scopes, block_taps, chain_rows, trailing_run},
     weights::{CheckedLandingEntries, PlannedWeights, activation},
@@ -68,6 +67,47 @@ mod token_rows_tests {
         assert!(matches!(rows.find(5).unwrap(), TokenRow::Held(slot) if slot == third));
         rows.overwrite(0..2);
         assert!(matches!(rows.find(5).unwrap(), TokenRow::Free(_)));
+    }
+}
+
+#[cfg(test)]
+mod kept_token_rows_tests {
+    use super::super::entry::keep_tokens;
+    use crate::programs::graph::draft::GraphDraft;
+    use magnitude_kernels::selection_notice;
+    use seismic::{BackendName, Dim, Element, NativeSpecialization, Tensor};
+
+    fn i32_bytes(words: &[i32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// A step's host tokens reach the bound token rows on every step: an
+    /// n-gram input or the chain reads them on every step, a prompt chunk's
+    /// included.
+    #[test]
+    fn token_rows_are_copied_on_every_step() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
+        let implementation = selection_notice::native_implementation(&device).unwrap().unwrap();
+        let copy = selection_notice::native_for_device(
+            &device,
+            &implementation.default_specialization(&NativeSpecialization::new()).unwrap(),
+        )
+        .unwrap();
+        let rows = 2u64;
+        let (host, before) = ([7, 0, 9, 0], [-1, -1, -1, -1]);
+        let mut graph = device.native_graph();
+        let tokens = keep_tokens(&mut graph, &copy, &Dim::from(rows)).unwrap();
+        let plan = GraphDraft::seal(graph).unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let kept_rows = Tensor::from_host(&charges, Element::i32(), &[rows, 2], &i32_bytes(&before)).unwrap();
+        let mut bindings = plan.bindings();
+        bindings.set(&charges, &tokens.rows, &kept_rows).unwrap();
+        let mut slot = plan.new_slot(&charges).unwrap();
+        slot.write_input(&tokens.uploaded, &i32_bytes(&host)).unwrap();
+        let (_, completion) = slot.attach(bindings, plan.new_outputs(&charges).unwrap()).unwrap().submit().unwrap();
+        completion.wait().unwrap();
+        assert_eq!(kept_rows.read_to_host().unwrap(), i32_bytes(&host));
     }
 }
 
@@ -1012,7 +1052,7 @@ mod resource_template_tests {
                     .filter_map(|block| block.split.as_ref())
                     .map(|split| split.merged.experts.1.iter().product::<u64>())
                     .collect::<Vec<_>>();
-                if let Some(split) = GroupExtents::of(None, None, None, &served, chain_rows).split {
+                if let Some(split) = GroupExtents::of(None, None, None, None, &served, chain_rows).split {
                     assert_eq!(split.merged.experts.1, [*lengths.iter().max().unwrap()]);
                 }
                 // Each staged class's graph, drafted alone, fits its
@@ -1059,9 +1099,11 @@ mod resource_template_tests {
                         let graph = entry_graph_topology(
                             NativeGraphMetadata::new(backend),
                             &elements,
-                            notifies_selection(&load).then_some(&[][..]),
+                            load.copies_token_rows().then_some(&[][..]),
+                            load.notifies_selection(),
                             landing.as_ref().map(CheckedLandingEntries::entries),
-                            keeps_token_rows(&load),
+                            load.keeps_token_rows(),
+                            load.fronts(),
                             &weight,
                             EntryWidth {
                                 hidden: &seismic::Dim::from(geometry.hidden),
@@ -1106,7 +1148,7 @@ mod resource_template_tests {
                         check(index, once_class(rows, stage));
                     }
                 }
-                let floor = GroupExtents::of(None, None, None, &served, 64);
+                let floor = GroupExtents::of(None, None, None, None, &served, 64);
                 assert_eq!(
                     certificate.resources.binding_constant_bytes,
                     constants.into_inner().finish().unwrap().binding_constant_bytes

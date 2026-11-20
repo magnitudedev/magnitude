@@ -676,10 +676,6 @@ impl Claims {
         self.entry(|entry| entry.ranges.clone())
     }
 
-    fn slab_rows(&self) -> usize {
-        self.arena.borrow().slab_rows
-    }
-
     fn rows(&self) -> usize {
         self.entry(Entry::rows)
     }
@@ -1280,8 +1276,9 @@ impl StateStore {
     /// is a granule of `pool`, the pool of the store on `device` the state
     /// lies in, and holds as many whole pages or banks as fit one
     /// ([`HistoryDomainLayout::geometry`], [`banks_per_slab`]): a granule
-    /// below a page or a bank is refused. The store's one [`StoreBindings`]
-    /// comes with it.
+    /// below a page or a bank is refused. The store's one
+    /// [`StoreBindings`] comes with it.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         charges: &seismic::Charges,
         pool: Pool,
@@ -2081,20 +2078,14 @@ impl StateStore {
         self.reserve_rows(tails, &counts)
     }
 
-    /// The demand of a history at `position`, growing at each domain's
-    /// `tails` tail, appending `rows`: in every stored domain, the page
-    /// demand of that domain's rows of the advance.
-    fn demands(&self, tails: &[Tail], position: usize, rows: usize) -> Vec<RowDemand> {
+    /// The demand of a history growing at each domain's `tails` tail by
+    /// `counts[domain]` rows: in every stored domain, the page demand of
+    /// those rows.
+    fn demands(&self, tails: &[Tail], counts: &[usize]) -> Vec<RowDemand> {
         self.history_domains()
             .map(|domain| RowDemand {
                 domain,
-                rows: self.page_demand(
-                    domain,
-                    tails[domain.0].end,
-                    self.domains[domain.0]
-                        .kind
-                        .advance_rows(position, rows),
-                ),
+                rows: self.page_demand(domain, tails[domain.0].end, counts[domain.0]),
             })
             .collect()
     }
@@ -2108,13 +2099,15 @@ impl StateStore {
     }
 
     /// Reserve `counts[domain]` rows in every stored domain (see
-    /// [`StateStore::reserve`]).
+    /// [`StateStore::reserve`]). A domain taking no rows does not grow, so
+    /// its tail may be blocked.
     fn reserve_rows(&self, tails: &[Tail], counts: &[usize]) -> Result<Vec<Claims>, Error> {
         if self
             .domains
             .iter()
             .zip(tails)
-            .any(|(domain, &tail)| domain.arena.borrow().tail_blocked(tail))
+            .zip(counts)
+            .any(|((domain, &tail), &count)| count > 0 && domain.arena.borrow().tail_blocked(tail))
         {
             return Err(Error::Request(
                 "a history whose last page another history continued, or may continue first, must relocate it before it grows"
@@ -2123,6 +2116,10 @@ impl StateStore {
         }
         let mut reserved = Vec::with_capacity(self.domains.len());
         for ((domain, &count), &Tail { end: after, .. }) in self.domains.iter().zip(counts).zip(tails) {
+            if count == 0 {
+                reserved.push(Claims::new(&domain.arena, Vec::new()));
+                continue;
+            }
             let mut arena = domain.arena.borrow_mut();
             let claimable = arena.claimable(after);
             if claimable < count {
@@ -2180,7 +2177,7 @@ pub struct SequenceState {
     /// Rows of `bank`'s tape that complete the accepted recurrent state: the
     /// bank holds the state `tape` rows before `position`, and the next
     /// advance replays those tape rows before its own (see
-    /// [`OwnedStateAdvance::begin_speculative`]). 0 after a plain advance.
+    /// [`OwnedStateAdvance::begin_rows`]). 0 after a plain advance.
     tape: usize,
 }
 impl SequenceState {
@@ -2216,7 +2213,8 @@ impl SequenceState {
     /// domain's rows of that advance, for provisioning a launch's backing
     /// before its advances begin.
     pub fn demands(&self, rows: usize) -> Vec<RowDemand> {
-        self.store.demands(&self.tails(), self.position, rows)
+        let counts = self.store.domains.iter().map(|domain| domain.kind.advance_rows(self.position, rows)).collect::<Vec<_>>();
+        self.store.demands(&self.tails(), &counts)
     }
     /// Where this history grows, per domain.
     fn tails(&self) -> Vec<Tail> {
@@ -3530,7 +3528,7 @@ mod tests {
         assert_eq!(original, ZERO_SEED_BANK);
         let checkpoint = state.checkpoint();
 
-        let advance = OwnedStateAdvance::begin_speculative(state, 3, 1)
+        let advance = OwnedStateAdvance::begin_rows(state, 1, 2, 0)
             .ok()
             .unwrap();
         assert_eq!(advance.bindings().previous_bank, original);
@@ -3542,7 +3540,7 @@ mod tests {
         assert_eq!(state.bank_index(), original);
         assert_eq!(store.occupied_rows(TOKEN), 0);
 
-        let advance = OwnedStateAdvance::begin_speculative(state, 3, 1)
+        let advance = OwnedStateAdvance::begin_rows(state, 1, 2, 0)
             .ok()
             .unwrap();
         let successor = advance.bindings().following_bank;
@@ -3783,7 +3781,7 @@ mod tests {
             .unwrap();
         let left = OwnedStateAdvance::begin(left, 2).ok().unwrap();
         let right = OwnedStateAdvance::begin(right, 1).ok().unwrap();
-        let parent = OwnedStateAdvance::begin_speculative(parent, 3, 1)
+        let parent = OwnedStateAdvance::begin_rows(parent, 1, 2, 0)
             .ok()
             .unwrap();
         let successors = [&left, &right, &parent].map(|advance| advance.bindings().following_bank);

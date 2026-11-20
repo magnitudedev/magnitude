@@ -19,15 +19,15 @@ from collections.abc import Callable
 from pathlib import Path
 
 RESULTS = "served.json"
-# Every complete answer, as a fixture whose scored assistant message is that answer: what the
-# harness teacher-forces through the model to judge it (`instruments/served.py`).
-ANSWERS = "answers.jsonl"
+# Every complete answer as the final assistant turn of the conversation it answered, in a template
+# file of the asked template's name: what the harness teacher-forces through the model to judge it
+# (`instruments/served.py`).
+ANSWERS = "answers.json"
 # The request options evaluation renders with (the harness's standard ones): every answer is
-# asked with them, so the harness renders its judged fixture's prompt as the service did.
+# asked with them, so the harness renders its judged conversation as the service did.
 OPTIONS = {"chat_template_kwargs": {"enable_thinking": False}}
 SCENARIOS = ("lifecycle", "stop", "stop-prepare", "failure", "repeat")
-# Characters of a fixture's opening a prompt keeps: within any context an evaluated load serves.
-PROMPT_CHARACTERS = 9000
+# The most tokens an answer generates; a prompt's own bound is at most its canonical answer's.
 ANSWER_TOKENS = 64
 # Answers a `repeat` run asks past the first of each prompt.
 REPEATS = 16
@@ -169,12 +169,12 @@ class Service:
     def stop(self, instance: dict) -> object:
         return self.call("POST", f"/api/v1/instances/{instance['id']}/stop", {})
 
-    def chat(self, model: str, messages: list[dict]) -> dict:
+    def chat(self, model: str, prompt: dict) -> dict:
         """One answer: its text, how it ended, and its first token's time and each later one's."""
         started = time.monotonic()
         request = urllib.request.Request(self.origin + "/v1/chat/completions", method="POST", headers={"content-type": "application/json"}, data=json.dumps({
-            "model": model, **request_body(messages),
-            "max_tokens": ANSWER_TOKENS, "temperature": 0, "seed": 1,
+            "model": model, **request_body(prompt),
+            "max_tokens": prompt["answer_tokens"], "temperature": 0, "seed": 1,
             "stream": True, "stream_options": {"include_usage": True}, **OPTIONS,
         }).encode())
         pieces, content, reasoning, times, finish, usage = [], [], [], [], None, None
@@ -199,13 +199,13 @@ class Service:
         answer = {"seconds": round(time.monotonic() - started, 3), "first_seconds": round(times[0] - started, 3) if times else None,
                   "decode_ms": round((times[-1] - times[0]) * 1000 / max(tokens - 1, 1), 2) if len(times) > 1 else None,
                   "text": "".join(pieces), "pieces": pieces, "finish": finish, "usage": usage}
-        self.run.answered(f"{self.name}-{len(self.run.answers)}", messages, answer, "".join(content), "".join(reasoning))
+        self.run.answered(f"{self.name}-{len(self.run.answers)}", prompt, answer, "".join(content), "".join(reasoning))
         return answer
 
-    def stream(self, model: str, messages: list[dict], started: threading.Event) -> dict:
+    def stream(self, model: str, prompt: dict, started: threading.Event) -> dict:
         """An answer token by token, `started` set at its first; how far it got and how it ended."""
         request = urllib.request.Request(self.origin + "/v1/chat/completions", method="POST", headers={"content-type": "application/json"}, data=json.dumps({
-            "model": model, **request_body(messages),
+            "model": model, **request_body(prompt),
             "max_tokens": ANSWER_TOKENS * 4, "temperature": 0, "seed": 1, "stream": True,
             **OPTIONS,
         }).encode())
@@ -273,8 +273,9 @@ class Run:
         self.capped += plain
         self.resident = (*(("--context-tokens", str(arguments.context)) if arguments.context else ()), *plain)
         self.install()
-        self.messages = opening(Path(arguments.fixtures), 0)
-        self.other = opening(Path(arguments.fixtures), 1, 40)
+        self.template = json.loads(Path(arguments.template).read_text())
+        # The template's lanes 0 and 1 as asked (`instruments/served.py` `prompts`).
+        self.messages, self.other = json.loads(Path(arguments.prompts).read_text())
 
     def install(self) -> None:
         """An installation as `build-local` prepares one (`installation.rs`): the binary, the
@@ -297,63 +298,37 @@ class Run:
         print(line, flush=True)
         self.report.append(line[:400])
 
-    def answered(self, name: str, messages: list[dict], answer: dict, content: str, reasoning: str) -> None:
-        """Keep `answer` to `messages` for judgement, as a fixture whose scored assistant message
-        is what it said, beside how many tokens the service generated for it and how it ended."""
+    def answered(self, name: str, prompt: dict, answer: dict, content: str, reasoning: str) -> None:
+        """Keep `answer` to `prompt` for judgement, as a session whose final assistant turn is what
+        it said (the conversation before it the session's head, so the harness renders it whole),
+        beside how many tokens the service generated for it and how it ended."""
         reply = {"role": "assistant", "content": content, "scored": True, **({"reasoning_content": reasoning} if reasoning else {})}
-        self.answers.append({"id": name, "sizing": {"unit": "fixed"}, "messages": [*messages, reply],
+        lane = self.template["sessions"][prompt["lane"]]
+        session = {"key": lane["key"], "tools": prompt["tools"],
+                   "messages": [*prompt["messages"], reply],
+                   "generation": {"prefix": len(prompt["messages"]), "max_tokens": prompt["answer_tokens"], "expected": {}},
+                   "keep_head": len(prompt["messages"]) - 1}
+        self.answers.append({"name": name, "session": session,
                              "served": {"tokens": (answer["usage"] or {}).get("completion_tokens"), "finish": answer["finish"]}})
 
     def finish(self) -> None:
         # An answer that generated nothing, in its content or its reasoning, has nothing to
         # teacher-force: it is named, never judged.
-        said = [bool(fixture["messages"][-1]["content"] or fixture["messages"][-1].get("reasoning_content"))
-                for fixture in self.answers]
-        with (self.directory / ANSWERS).open("w") as file:
-            for fixture, judged in zip(self.answers, said):
-                if judged:
-                    file.write(json.dumps(fixture) + "\n")
-        self.record["unjudged"] = [fixture["id"] for fixture, judged in zip(self.answers, said) if not judged]
+        judged = [answer for answer in self.answers
+                  if answer["session"]["messages"][-1]["content"] or answer["session"]["messages"][-1].get("reasoning_content")]
+        answers = {key: self.template[key] for key in ("template", "context", "source")}
+        (self.directory / ANSWERS).write_text(json.dumps({**answers, "sessions": [answer["session"] for answer in judged]}))
+        self.record["answers"] = [{"name": answer["name"], "lane": lane, "served": answer["served"]}
+                                  for lane, answer in enumerate(judged)]
+        self.record["unjudged"] = [answer["name"] for answer in self.answers if answer not in judged]
         self.record["report"] = self.report
         (self.directory / RESULTS).write_text(json.dumps(self.record, indent=1))
         shutil.rmtree(self.scratch, ignore_errors=True)
 
 
-def opening(path: Path, index: int, skip: int = 0) -> list[dict]:
-    """Fixture `index`'s messages from the first user message at or past `skip`, its system
-    message first, within a prompt's characters and ending on a user message: whole turns
-    only, so a tool result never loses the assistant call it completes, each message whole (a
-    tool call and its result keep their ids), the fixture's own tools offered on its first
-    user message, as the fixture format places a unit's tools (`harness/src/render.rs`)."""
-    fixture = json.loads(path.read_text().splitlines()[index])
-    messages = fixture["messages"]
-    start = next(at for at in range(1 + skip, len(messages)) if messages[at]["role"] == "user")
-    kept, characters = [], 0
-    for message in messages[:1] + messages[start:]:
-        characters += len(str(message["content"]))
-        if characters > PROMPT_CHARACTERS:
-            break
-        kept.append({key: value for key, value in message.items() if key != "scored"})
-    while kept[-1]["role"] != "user":
-        kept.pop()
-    if fixture.get("tools"):
-        first = next(message for message in kept if message["role"] == "user")
-        first["tools"] = [*fixture["tools"], *first.get("tools", [])]
-    return kept
-
-
-def request_body(messages: list[dict]) -> dict:
-    """`messages` as a chat request carries them: each unit's tools lifted off its message into
-    the request's offered tools, deduplicated by function name, first kept."""
-    sent, offered, names = [], [], set()
-    for message in messages:
-        message = dict(message)
-        for tool in message.pop("tools", []):
-            if tool["function"]["name"] not in names:
-                names.add(tool["function"]["name"])
-                offered.append(tool)
-        sent.append(message)
-    return {"messages": sent, **({"tools": offered} if offered else {})}
+def request_body(prompt: dict) -> dict:
+    """`prompt` as a chat request carries it: its messages and its offered tools."""
+    return {"messages": prompt["messages"], **({"tools": prompt["tools"]} if prompt["tools"] else {})}
 
 
 def fields(line: str) -> dict[str, str]:
@@ -636,7 +611,8 @@ def repeat(run: Run) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    for name in ("--service", "--bundle", "--models", "--artifacts", "--fixtures", "--scratch", "--run-dir", "--model"):
+    for name in ("--service", "--bundle", "--models", "--artifacts", "--template", "--prompts", "--scratch", "--run-dir",
+                 "--model"):
         parser.add_argument(name, required=True)
     parser.add_argument("--scenario", choices=SCENARIOS, required=True)
     parser.add_argument("--context", type=int)

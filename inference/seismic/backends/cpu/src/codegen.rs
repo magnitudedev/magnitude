@@ -1,5 +1,5 @@
-//! The retained Cranelift code-generation policy: a target-profile fact
-//! (`HostFacts::codegen`) gathered once at discovery and reconstructed
+//! The retained Cranelift code-generation policy: a target-profile setting
+//! (`CpuDeviceInfo::codegen`) gathered once at discovery and reconstructed
 //! into an ISA at native compilation. Nothing is rediscovered late: the
 //! triple and every flag are part of the profile identity.
 

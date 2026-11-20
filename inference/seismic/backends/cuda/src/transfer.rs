@@ -22,6 +22,7 @@ use crate::direct::HostWord;
 use crate::driver::Stream;
 use crate::executor::Device;
 use seismic_compiler::errors::ExecutionError;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// One copy of a batch: `bytes` bytes from `source` at `source_offset` to
@@ -53,8 +54,12 @@ pub struct TransferQueue {
     stream: Arc<Stream>,
     /// Dropped only once the stream is known to write it no more.
     done: std::mem::ManuallyDrop<HostWord>,
+    /// Lock-free mirror of `fault.is_some()`, set under `fault` before waking
+    /// waiters so `wait` and `completed` never block on `fault`.
+    faulted: AtomicBool,
     /// Why the queue can complete no batch from now: a driver call failed
     /// after a batch began to be queued (the stream then holds part of it).
+    /// Never held across a CUDA driver call.
     fault: std::sync::Mutex<Option<String>>,
 }
 
@@ -87,6 +92,7 @@ impl TransferQueue {
             device: device.clone(),
             stream: Stream::new(device.context()).map_err(submission)?,
             done: std::mem::ManuallyDrop::new(HostWord::new(device)?),
+            faulted: AtomicBool::new(false),
             fault: std::sync::Mutex::new(None),
         })
     }
@@ -102,22 +108,21 @@ impl TransferQueue {
     /// until the batch is complete.
     pub fn copy(&self, items: &[TransferItem<'_>], value: u32) -> Result<(), ExecutionError> {
         let checked = items.iter().map(Self::check).collect::<Result<Vec<_>, _>>()?;
-        let faulted = {
-            let mut fault = self.fault.lock().expect("transfer fault lock is never poisoned");
-            if let Some(fault) = fault.as_ref() {
-                return Err(ExecutionError::SubmissionFailed(format!("the transfer queue faulted: {fault}")));
-            }
-            match self.queue(&checked, value).map_err(submission).and_then(|()| self.done.wake_after(&self.stream)) {
-                Ok(()) => false,
-                Err(error) => {
+        if self.faulted() {
+            let fault = self.fault.lock().expect("transfer fault lock is never poisoned");
+            let reason = fault.as_deref().unwrap_or("unknown");
+            return Err(ExecutionError::SubmissionFailed(format!("the transfer queue faulted: {reason}")));
+        }
+        if let Err(error) = self.queue(&checked, value).map_err(submission).and_then(|()| self.done.wake_after(&self.stream)) {
+            {
+                let mut fault = self.fault.lock().expect("transfer fault lock is never poisoned");
+                if fault.is_none() {
                     *fault = Some(error.to_string());
-                    true
                 }
+                self.faulted.store(true, Ordering::Release);
             }
-        };
-        // Its waiters learn the fault now ([`Self::completed`]), the fault's
-        // lock released first: a waiter reads it under the word's.
-        if faulted {
+            // Its waiters learn the fault now ([`Self::completed`]), with
+            // `fault` already released and `faulted` published.
             self.done.wake();
         }
         Ok(())
@@ -131,7 +136,7 @@ impl TransferQueue {
     }
 
     fn faulted(&self) -> bool {
-        self.fault.lock().expect("transfer fault lock is never poisoned").is_some()
+        self.faulted.load(Ordering::Acquire)
     }
 
     /// A batch's item as the driver calls that queue it: a signal, or a
@@ -210,6 +215,9 @@ impl TransferQueue {
     /// any batch still writes.
     pub fn completed(&self, value: u32) -> Result<bool, ExecutionError> {
         let reached = || (self.done.load().wrapping_sub(value) as i32) >= 0;
+        if !self.faulted() && reached() {
+            return Ok(true);
+        }
         let fault = self.fault.lock().expect("transfer fault lock is never poisoned").clone();
         if fault.is_none() && reached() {
             return Ok(true);
@@ -351,7 +359,7 @@ extern "C" __global__ void spin(unsigned int* out, Words words, unsigned int* sc
         eprintln!("transfer rate: {rate:.2} GB/s over {} MiB", BYTES >> 20);
 
         // A kernel spinning about 0.5 s, then a transfer queued behind it.
-        let capability = description.facts().compute_capability;
+        let capability = description.device_info().compute_capability;
         let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
         let cubin = crate::nvrtc::compile_cubin_named(SPIN, "spin.cu", architecture, &["spin"]).unwrap();
         let module = DirectModule::load(&device, &cubin.image, &[cubin.lowered_names[0].as_str()]).unwrap();
@@ -413,7 +421,7 @@ extern "C" __global__ void sum(const unsigned long long* data, unsigned long lon
             return;
         }
         let device = opened.service;
-        let capability = opened.device.facts().compute_capability;
+        let capability = opened.device.device_info().compute_capability;
         let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
         let cubin = crate::nvrtc::compile_cubin_named(SUM, "sum.cu", architecture, &["sum"]).unwrap();
         let module = DirectModule::load(&device, &cubin.image, &[cubin.lowered_names[0].as_str()]).unwrap();

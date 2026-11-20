@@ -4,9 +4,7 @@
 //! one cost function prices ([`StreamedStep`], [`super::streamed`]) and a
 //! stored table's step ([`TableCurve`]).
 
-use super::cost::ExpertLines;
-use super::step::{LayerLoad, Lead, ReadAhead, StepInputs};
-use super::streaming_costs::ReadLine;
+use magnitude_cost_model::{ExpertLines, LayerLoad, Lead, ReadAhead, ReadLine};
 use serde::{Deserialize, Serialize};
 
 /// What one streamed layer of one decode step routed and missed: the
@@ -41,20 +39,11 @@ impl LayerStep {
 
     /// What the layer's misses added to its step along `lines`, its file
     /// misses read along `read` as their one request, none hinted
-    /// ([`super::step`]): its routed experts each of the step's mean rows
+    /// ([`magnitude_cost_model::StepTime`]): its routed experts each of the step's mean rows
     /// an expert.
     pub fn exposed(&self, lines: &ExpertLines, read: &ReadLine) -> f64 {
         let all = [*lines];
-        let inputs = StepInputs {
-            compute: 0.,
-            head: 0.,
-            overlap: 1.,
-            read: *read,
-            sustained: read.seconds_per_byte(),
-            ahead: ReadAhead::NONE,
-            lines: &all,
-        };
-        inputs
+        magnitude_cost_model::step_inputs(0., *read, ReadAhead::NONE, &all)
             .one(
                 &[LayerLoad {
                     routed: self.routed as f64,
@@ -117,33 +106,6 @@ impl HintCounts {
             0 => ReadAhead::NONE,
             reads => ReadAhead { precision: (self.used as f64 / reads as f64).max(f64::MIN_POSITIVE), lead: Lead::Layers(self.lead as f64 / reads as f64) },
         }
-    }
-}
-
-/// A streamed decode step as the one cost function prices it
-/// ([`super::streamed::StreamedLayers::step_seconds`]): `C`, what its
-/// layers' misses add, and `T`, their sum.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct StreamedStep {
-    pub compute_seconds: f64,
-    pub exposed_seconds: f64,
-    pub total_seconds: f64,
-}
-
-/// What a load holds of each streamed layer's experts: `slots` in the bank,
-/// and `host` in a host tier, inclusive of the bank's (none on unified
-/// memory): the tier holds the bank's experts too, so it holds more only
-/// past `slots`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HeldSlots {
-    pub slots: usize,
-    pub host: usize,
-}
-
-impl HeldSlots {
-    /// `slots` in the bank and nothing in a host tier.
-    pub fn bank(slots: usize) -> Self {
-        Self { slots, host: 0 }
     }
 }
 

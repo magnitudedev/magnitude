@@ -133,7 +133,7 @@ impl<'a> Entry<'a> {
     }
 
     /// The entry's key and value ([`Self::value`]).
-    pub(crate) fn metadata(&self, header: &Arc<Vec<u8>>) -> Metadata {
+    pub(crate) fn metadata(&self, header: &Arc<HeaderBacking>) -> Metadata {
         Metadata {
             name: self.head.key.to_owned(),
             value: self.value(header),
@@ -146,7 +146,7 @@ impl<'a> Entry<'a> {
     ///
     /// # Panics
     /// When `header` is not the bytes the entry was walked from.
-    pub(crate) fn value(&self, header: &Arc<Vec<u8>>) -> Value {
+    pub(crate) fn value(&self, header: &Arc<HeaderBacking>) -> Value {
         let StoredType::Array(stored) = self.head.stored else {
             return Value::Scalar(self.scalar().expect("a scalar entry holds its value"));
         };
@@ -239,10 +239,65 @@ pub fn walk(bytes: &[u8]) -> Result<Walk<'_>, Error> {
     Ok(walked.view(bytes, &[]))
 }
 
+/// Backing storage for a walked GGUF header's bytes: either owned in memory or a read-only
+/// `MAP_PRIVATE` file mapping.
+pub(crate) enum HeaderBacking {
+    Owned(Arc<Vec<u8>>),
+    #[cfg(unix)]
+    Mapped {
+        ptr: *const u8,
+        map_len: usize,
+        len: usize,
+    },
+}
+
+// SAFETY: `HeaderBacking::Mapped` owns a read-only `MAP_PRIVATE` mapping of `map_len` bytes that
+// is never mutated through this pointer and is unmapped only in `Drop`.
+unsafe impl Send for HeaderBacking {}
+// SAFETY: Only immutable `&[u8]` access is ever exposed from `HeaderBacking`.
+unsafe impl Sync for HeaderBacking {}
+
+impl Drop for HeaderBacking {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Self::Mapped { ptr, map_len, .. } = *self {
+            if map_len > 0 {
+                // SAFETY: `ptr` and `map_len` came from a successful `libc::mmap` call in
+                // `SharedHeader::read_mapped`, and `Drop` runs at most once.
+                unsafe {
+                    let _ = libc::munmap(ptr.cast_mut().cast::<libc::c_void>(), map_len);
+                }
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for HeaderBacking {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes.as_slice(),
+            #[cfg(unix)]
+            Self::Mapped { ptr, len, .. } => {
+                // SAFETY: `ptr` is non-null and valid for immutable reads of `len <= map_len`
+                // bytes for the lifetime of `&self` (until `Drop` unmaps it).
+                unsafe { std::slice::from_raw_parts(*ptr, *len) }
+            }
+        }
+    }
+}
+
+impl AsRef<[u8]> for HeaderBacking {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
 /// A whole GGUF header's bytes, shared with the metadata arrays of its directory
 /// ([`Self::directory`]), and their walk.
 pub struct SharedHeader {
-    bytes: Arc<Vec<u8>>,
+    bytes: Arc<HeaderBacking>,
     /// The payloads `bytes` lack.
     absent: Vec<Absence>,
     walked: Progress,
@@ -259,13 +314,80 @@ impl SharedHeader {
             });
         }
         Ok(Self {
-            bytes,
+            bytes: Arc::new(HeaderBacking::Owned(bytes)),
             absent,
             walked,
         })
     }
 
+    /// Walks a GGUF header directly from a read-only `MAP_PRIVATE` mapping of up to
+    /// [`HEADER_LIMIT`] bytes of `file`, avoiding heap zero-fill and `File::read` copies.
+    /// Returns `Ok(None)` when the file is empty or `mmap` fails so the caller can fall back to
+    /// [`HeaderBytes::read`].
+    #[cfg(unix)]
+    pub(super) fn read_mapped(
+        file: &std::fs::File,
+        file_size: u64,
+    ) -> Result<Option<Self>, Error> {
+        use std::os::fd::AsRawFd;
+
+        if file_size == 0 {
+            return Ok(None);
+        }
+        let map_len = usize::try_from(file_size.min(HEADER_LIMIT as u64)).unwrap_or(HEADER_LIMIT);
+        // SAFETY: `file` is an open file descriptor, `map_len > 0`, and we request a read-only
+        // private mapping starting at offset 0.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Ok(None);
+        }
+        // Wrap immediately so `munmap` runs on every error or early return.
+        let backing = HeaderBacking::Mapped {
+            ptr: ptr.cast::<u8>().cast_const(),
+            map_len,
+            len: map_len,
+        };
+        let mut walked = Progress::default();
+        walked.advance(&backing, &[])?;
+        match walked.stop {
+            Stop::Incomplete { .. } => {
+                return Err(if file_size <= HEADER_LIMIT as u64 {
+                    Error::Truncated {
+                        offset: map_len as u64,
+                    }
+                } else {
+                    beyond()
+                });
+            }
+            Stop::Complete { .. } => {}
+        }
+        Ok(Some(Self {
+            bytes: Arc::new(backing),
+            absent: Vec::new(),
+            walked,
+        }))
+    }
+
     pub fn bytes(&self) -> &Arc<Vec<u8>> {
+        match self.bytes.as_ref() {
+            HeaderBacking::Owned(bytes) => bytes,
+            #[cfg(unix)]
+            HeaderBacking::Mapped { .. } => {
+                unreachable!("mapped headers are internal and never expose Arc<Vec<u8>>")
+            }
+        }
+    }
+
+    pub(super) fn backing(&self) -> &Arc<HeaderBacking> {
         &self.bytes
     }
 
@@ -307,7 +429,34 @@ impl HeaderBytes {
 
     /// Appends up to `limit` bytes read from `source`, returning how many.
     pub fn read_from(&mut self, source: &mut impl Read, limit: usize) -> std::io::Result<usize> {
-        source.by_ref().take(limit as u64).read_to_end(&mut self.bytes)
+        const MAX_RESERVE: usize = 8 * 1024 * 1024;
+        const CHUNK: usize = 2 * 1024 * 1024;
+
+        self.bytes.reserve(limit.min(MAX_RESERVE));
+        let start = self.bytes.len();
+        let mut total = 0;
+        while total < limit {
+            let step = (limit - total).min(CHUNK);
+            let pos = start + total;
+            self.bytes.resize(pos + step, 0);
+            let mut filled = 0;
+            while filled < step {
+                match source.read(&mut self.bytes[pos + filled..pos + step]) {
+                    Ok(0) => {
+                        self.bytes.truncate(pos + filled);
+                        return Ok(total + filled);
+                    }
+                    Ok(n) => filled += n,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        self.bytes.truncate(pos + filled);
+                        return Err(err);
+                    }
+                }
+            }
+            total += filled;
+        }
+        Ok(total)
     }
 
     /// The walk of the bytes in hand, continuing the walk of the bytes before.
@@ -325,7 +474,8 @@ impl HeaderBytes {
             let Stop::Incomplete { estimate, .. } = self.walked.stop else {
                 break;
             };
-            if self.read_from(source, estimate)? == 0 {
+            let to_read = estimate.min(HEADER_LIMIT.saturating_sub(self.bytes.len()));
+            if self.read_from(source, to_read)? == 0 {
                 return Err(Error::Truncated {
                     offset: self.bytes.len() as u64,
                 });
@@ -358,7 +508,7 @@ impl HeaderBytes {
         }
         self.bytes.truncate(length);
         Ok(SharedHeader {
-            bytes: Arc::new(self.bytes),
+            bytes: Arc::new(HeaderBacking::Owned(Arc::new(self.bytes))),
             absent: Vec::new(),
             walked: self.walked,
         })
@@ -952,28 +1102,69 @@ impl Progress {
         rest: usize,
     ) -> Result<(), Halt> {
         let held = cursor.held();
+        let stop_at = |this: &mut Self, read: usize, before: usize| {
+            let left = array.elements - read;
+            let average = if read < MEASURED_STRINGS {
+                STRING_ESTIMATE
+            } else {
+                ((before - array.head.end) / read)
+                    .clamp(STRING_ESTIMATE_BOUNDS.0, STRING_ESTIMATE_BOUNDS.1)
+            };
+            let in_string = held - before;
+            let halt = stop(
+                held,
+                Some(array.head),
+                (left * 8).saturating_sub(in_string),
+                (left * average).saturating_sub(in_string) + rest,
+            );
+            if let Halt::Stopped(_) = halt {
+                this.array = Some(OpenArray { read, ..array });
+                this.offset = before;
+            }
+            halt
+        };
+        if cursor.absent.is_empty() && cursor.order == ByteOrder::Little {
+            let bytes = cursor.bytes;
+            let shift = cursor.shift;
+            let max_pos = bytes.len().min(HEADER_LIMIT.saturating_sub(shift));
+            let mut pos = cursor.offset - shift;
+            let mut read = array.read;
+            while read < array.elements {
+                if max_pos - pos < 8 {
+                    if HEADER_LIMIT - (pos + shift) < 8 {
+                        return Err(beyond().into());
+                    }
+                    break;
+                }
+                let len = u64::from_le_bytes(
+                    bytes[pos..pos + 8]
+                        .try_into()
+                        .expect("eight bytes"),
+                );
+                let header_end = pos + 8;
+                let rem = (max_pos - header_end) as u64;
+                if len > rem {
+                    let end = (header_end as u64)
+                        .checked_add(shift as u64)
+                        .and_then(|base| base.checked_add(len));
+                    if end.is_none_or(|end| end > HEADER_LIMIT as u64) {
+                        return Err(beyond().into());
+                    }
+                    break;
+                }
+                pos = header_end + len as usize;
+                read += 1;
+            }
+            cursor.offset = pos + shift;
+            if read < array.elements {
+                return Err(stop_at(self, read, cursor.offset));
+            }
+            return Ok(());
+        }
         for read in array.read..array.elements {
             let before = cursor.offset;
             if cursor.text()?.is_none() {
-                let left = array.elements - read;
-                let average = if read < MEASURED_STRINGS {
-                    STRING_ESTIMATE
-                } else {
-                    ((before - array.head.end) / read)
-                        .clamp(STRING_ESTIMATE_BOUNDS.0, STRING_ESTIMATE_BOUNDS.1)
-                };
-                let in_string = held - before;
-                let halt = stop(
-                    held,
-                    Some(array.head),
-                    (left * 8).saturating_sub(in_string),
-                    (left * average).saturating_sub(in_string) + rest,
-                );
-                if let Halt::Stopped(_) = halt {
-                    self.array = Some(OpenArray { read, ..array });
-                    self.offset = before;
-                }
-                return Err(halt);
+                return Err(stop_at(self, read, before));
             }
         }
         Ok(())
@@ -1149,6 +1340,103 @@ pub(super) fn element(
     })
 }
 
+/// The elements at `indices` of an array payload of `count` elements stored as `stored`, returned
+/// in the order of `indices` (`None` for any index `>= count`). For string arrays, walks the
+/// payload once up to the largest in-bounds index, skipping unrequested elements by length alone.
+pub(super) fn elements_at<'a>(
+    stored: ValueType,
+    order: ByteOrder,
+    count: usize,
+    bytes: &'a [u8],
+    indices: &[usize],
+) -> Result<Vec<Option<Element<'a>>>, Error> {
+    if stored.kind() != Kind::String {
+        return indices
+            .iter()
+            .map(|&index| {
+                if index < count {
+                    element(stored, order, bytes, index).map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect();
+    }
+    let mut out = vec![None; indices.len()];
+    let mut targets: Vec<(usize, usize)> = indices
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, &idx)| (idx < count).then_some((idx, pos)))
+        .collect();
+    if targets.is_empty() {
+        return Ok(out);
+    }
+    targets.sort_unstable_by_key(|&(idx, _)| idx);
+    if order == ByteOrder::Little {
+        let len = bytes.len();
+        let mut pos = 0usize;
+        let mut cursor = 0usize;
+        let mut i = 0;
+        while i < targets.len() {
+            let target = targets[i].0;
+            while cursor < target {
+                if len - pos < 8 {
+                    return Err(Error::ShortPayload);
+                }
+                let n = u64::from_le_bytes(
+                    bytes[pos..pos + 8]
+                        .try_into()
+                        .expect("eight bytes"),
+                );
+                pos += 8;
+                if n > (len - pos) as u64 {
+                    return Err(Error::ShortPayload);
+                }
+                pos += n as usize;
+                cursor += 1;
+            }
+            if len - pos < 8 {
+                return Err(Error::ShortPayload);
+            }
+            let n = u64::from_le_bytes(
+                bytes[pos..pos + 8]
+                    .try_into()
+                    .expect("eight bytes"),
+            );
+            pos += 8;
+            if n > (len - pos) as u64 {
+                return Err(Error::ShortPayload);
+            }
+            let end = pos + n as usize;
+            let value = Element::String(utf8(&bytes[pos..end])?);
+            pos = end;
+            cursor += 1;
+            while i < targets.len() && targets[i].0 == target {
+                out[targets[i].1] = Some(value);
+                i += 1;
+            }
+        }
+        return Ok(out);
+    }
+    let mut decoder = Decoder { bytes, order };
+    let mut cursor = 0;
+    let mut i = 0;
+    while i < targets.len() {
+        let target = targets[i].0;
+        while cursor < target {
+            decoder.text()?;
+            cursor += 1;
+        }
+        let value = Element::String(decoder.string()?);
+        cursor += 1;
+        while i < targets.len() && targets[i].0 == target {
+            out[targets[i].1] = Some(value);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
 /// Decodes the bytes of a value; one that ends early is [`Error::ShortPayload`].
 struct Decoder<'a> {
     bytes: &'a [u8],
@@ -1267,7 +1555,7 @@ mod tests {
 
     #[test]
     fn a_whole_header_lists_its_entries_and_tensors_and_ends_at_its_aligned_data_offset() {
-        let bytes = Arc::new(header(10_000));
+        let bytes = Arc::new(HeaderBacking::Owned(Arc::new(header(10_000))));
         let Ok(Walk::Complete(header)) = walk(&bytes) else {
             panic!("a whole header");
         };
@@ -1391,7 +1679,7 @@ mod tests {
             .position(|window| window == b"token-000042")
             .unwrap();
         bytes[at] = 0xff;
-        let bytes = Arc::new(bytes);
+        let bytes = Arc::new(HeaderBacking::Owned(Arc::new(bytes)));
         let Ok(Walk::Complete(whole)) = walk(&bytes) else {
             panic!("a whole header");
         };
@@ -1674,5 +1962,27 @@ mod tests {
             held,
             "decoded elements are moved, not copied"
         );
+    }
+
+    #[test]
+    fn elements_at_reads_unsorted_duplicate_and_out_of_bounds_indices_in_one_pass() {
+        let bytes = Arc::new(header(100));
+        let directory = crate::gguf::read_header(Arc::clone(&bytes)).unwrap();
+        let list = tokens(&directory);
+        let indices = [42, 7, 42, 100, 0, 99];
+        let expected = vec![
+            Some(Element::String("token-000042")),
+            Some(Element::String("token-000007")),
+            Some(Element::String("token-000042")),
+            None,
+            Some(Element::String("token-000000")),
+            Some(Element::String("token-000099")),
+        ];
+        assert_eq!(list.elements_at(&indices).unwrap(), expected);
+        assert_eq!(list.elements_at(&[]).unwrap(), vec![]);
+        assert_eq!(list.elements_at(&[100, 200]).unwrap(), vec![None, None]);
+        // After full decode, elements_at matches the stored single-pass result.
+        let _ = list.elements().unwrap();
+        assert_eq!(list.elements_at(&indices).unwrap(), expected);
     }
 }

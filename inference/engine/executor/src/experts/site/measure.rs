@@ -10,11 +10,11 @@ const SITE_SAMPLES: u64 = 16;
 /// measurement job times (`assessment::CpuCosts`): the workers among the
 /// machine's candidates ([`super::Machine::sized`], each timed on a decode
 /// request, a row's choices, one row each: the site's stage) and its lines
-/// there ([`crate::assessment::CpuLines::measured`]: a request of no entries,
+/// there ([`magnitude_cost_model::CpuLines::measured`]: a request of no entries,
 /// the handshake; requests of one expert of one row, of a decode row's
 /// choices and of one expert of every decode row), each on a pool of its
 /// own, over a layer of its own.
-pub(crate) fn measure_cpu_site(charges: &seismic::Charges, form: &crate::assessment::CpuForm) -> Result<(usize, crate::assessment::CpuLines), String> {
+pub(crate) fn measure_cpu_site(charges: &seismic::Charges, form: &crate::assessment::CpuForm) -> Result<(usize, magnitude_cost_model::CpuLines), String> {
     use super::{SiteRecords, SiteScales, SiteTensors};
     let count = (form.choices * SITE_SAMPLES).min(form.experts);
     let records = |record: crate::planning::RecordTensor| -> Result<SiteRecords, String> {
@@ -39,6 +39,6 @@ pub(crate) fn measure_cpu_site(charges: &seismic::Charges, form: &crate::assessm
         .map_err(|reason| format!("the expert compute pool could not be sized: {reason}"))?;
     let experts = shape.choices.min(tensors.up.count());
     let measure = |requests: &[(usize, usize)]| super::measure_site(owned()?, &threads, requests);
-    let lines = crate::assessment::CpuLines::measured(experts, shape.rows, &measure).map_err(|error| error.to_string())?;
+    let lines = magnitude_cost_model::CpuLines::measured(experts, shape.rows, &measure).map_err(|error| error.to_string())?;
     Ok((threads.count(), lines))
 }

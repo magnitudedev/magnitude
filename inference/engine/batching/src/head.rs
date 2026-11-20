@@ -5,7 +5,8 @@
 //! produces the slot's first output feature (and, when drafting, its first
 //! selection). Each chained pass carries exactly one speculative row per
 //! slot, whose token and conditioning are the previous pass's selection and
-//! output feature on the device.
+//! output feature on the device. A front batch is one entry pass alone,
+//! every row of which selects.
 
 use crate::{
     ClassLimits, Demand, LaunchClass, PackError, Row, Select, Slot, TargetBatchUpload,
@@ -39,6 +40,31 @@ pub struct BlockSlot {
     pub block: Vec<Row>,
 }
 
+/// One request's rows of a front launch, the MTP head's launch behind a
+/// selecting target step of two-row decode: entry row `r` pairs the step's
+/// selection `r` rows past the slot's first with its conditioning, at the
+/// head position one past that selection's row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrontSlot {
+    /// The entry rows: the committed one (the exact selection's), then the
+    /// scratch rows, its `front` rows, which run on the step's front rows'
+    /// selections and are never accepted. No row selects or demands
+    /// outputs; the batch derives every row's demand. Tokens are ignored
+    /// (the device feeds them).
+    pub entry: Slot,
+    /// One selection per entry row, in row order.
+    pub selects: Vec<Select>,
+}
+
+/// A token row of the step queued behind a front launch that continues one
+/// of its slots: the slot, and its depth there, 0 for the exact row and `j`
+/// for front row `j`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontContinuation {
+    pub slot: usize,
+    pub depth: usize,
+}
+
 /// How a head batch drafts past its entry pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadPasses {
@@ -46,14 +72,27 @@ pub enum HeadPasses {
     Chained,
     /// One block pass drafting every proposal (DFlash, DSpark).
     Block,
+    /// None: every entry row selects (a front launch, [`FrontSlot`]).
+    Front,
+}
+
+/// What follows a head batch's entry pass, per [`HeadPasses`].
+#[derive(Clone, Debug)]
+enum Passes {
+    /// The chained passes, in step order.
+    Chained(Vec<ValidatedTargetBatch>),
+    /// The one block pass, of a batch that drafts.
+    Block(Option<Box<ValidatedTargetBatch>>),
+    /// No pass: per token row of the step queued behind the front launch,
+    /// the slot it continues ([`FrontContinuation`]), none where it
+    /// continues no slot.
+    Front(Vec<Option<FrontContinuation>>),
 }
 
 #[derive(Clone, Debug)]
 pub struct ValidatedHeadBatch {
     entry: ValidatedTargetBatch,
-    /// The chained passes, or the one block pass.
-    chain: Vec<ValidatedTargetBatch>,
-    passes: HeadPasses,
+    passes: Passes,
 }
 
 impl ValidatedHeadBatch {
@@ -113,6 +152,7 @@ impl ValidatedHeadBatch {
                             previous_tape: slot.entry.previous_tape,
                             following_bank: slot.entry.following_bank,
                             stop: 1,
+                            front: 0,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -121,8 +161,7 @@ impl ValidatedHeadBatch {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             entry,
-            chain,
-            passes: HeadPasses::Chained,
+            passes: Passes::Chained(chain),
         })
     }
 
@@ -166,8 +205,8 @@ impl ValidatedHeadBatch {
         }
         let entry = slots.iter().map(|slot| slot.entry.clone()).collect::<Vec<_>>();
         let entry = ValidatedTargetBatch::from_slots(&entry, vocabulary_size, limits)?;
-        let chain = if width == 0 {
-            Vec::new()
+        let block = if width == 0 {
+            None
         } else {
             let stop =
                 i32::try_from(width).map_err(|_| PackError::IntegerOverflow("block rows"))?;
@@ -189,24 +228,84 @@ impl ValidatedHeadBatch {
                     previous_tape: slot.entry.previous_tape,
                     following_bank: slot.entry.following_bank,
                     stop,
+                    front: 0,
                 })
                 .collect::<Vec<_>>();
-            vec![ValidatedTargetBatch::from_slots(
+            Some(Box::new(ValidatedTargetBatch::from_slots(
                 &rows,
                 vocabulary_size,
                 limits,
-            )?]
+            )?))
         };
         Ok(Self {
             entry,
-            chain,
-            passes: HeadPasses::Block,
+            passes: Passes::Block(block),
+        })
+    }
+
+    /// A front launch's batch: each slot's entry rows, every one demanding
+    /// its features and selecting by its own selection. `continuing` names,
+    /// per token row of the step queued behind (none where it continues no
+    /// slot), the slot that row continues and its depth.
+    pub fn from_front_slots(
+        slots: &[FrontSlot],
+        continuing: &[Option<FrontContinuation>],
+        vocabulary_size: usize,
+        limits: ClassLimits,
+    ) -> Result<Self, PackError> {
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.selects.len() != slot.entry.rows.len() || slot.entry.front + 1 != slot.entry.rows.len() {
+                return Err(PackError::FrontSlot { slot: index });
+            }
+            for (row, entry) in slot.entry.rows.iter().enumerate() {
+                if entry.demand != Demand::NONE || entry.select.is_some() {
+                    return Err(PackError::InvalidHeadDemand {
+                        row,
+                        demand: entry.demand,
+                    });
+                }
+            }
+        }
+        if let Some(row) = continuing
+            .iter()
+            .position(|row| row.is_some_and(|row| row.slot >= slots.len()))
+        {
+            return Err(PackError::FrontContinuation { row });
+        }
+        let entry = slots
+            .iter()
+            .map(|slot| {
+                let mut entry = slot.entry.clone();
+                for (row, select) in entry.rows.iter_mut().zip(&slot.selects) {
+                    row.demand = Demand::FEATURES | Demand::SELECT;
+                    row.select = Some(select.clone());
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        Ok(Self {
+            entry: ValidatedTargetBatch::from_slots(&entry, vocabulary_size, limits)?,
+            passes: Passes::Front(continuing.to_vec()),
         })
     }
 
     /// How the batch drafts past its entry pass.
     pub fn passes(&self) -> HeadPasses {
-        self.passes
+        match self.passes {
+            Passes::Chained(_) => HeadPasses::Chained,
+            Passes::Block(_) => HeadPasses::Block,
+            Passes::Front(_) => HeadPasses::Front,
+        }
+    }
+
+    /// The passes behind the entry pass: the chained passes, or the one
+    /// block pass.
+    fn following(&self) -> &[ValidatedTargetBatch] {
+        match &self.passes {
+            Passes::Chained(chain) => chain,
+            Passes::Block(block) => block.as_deref().map_or(&[], std::slice::from_ref),
+            Passes::Front(_) => &[],
+        }
     }
 
     /// The entry pass's class.
@@ -217,12 +316,22 @@ impl ValidatedHeadBatch {
     /// Selections per slot: 0 for a causal-only head or an injection-only
     /// draft batch.
     pub fn steps(&self) -> usize {
-        match self.passes {
-            HeadPasses::Chained if self.entry.upload().select_rows.is_empty() => 0,
-            HeadPasses::Chained => self.chain.len() + 1,
-            HeadPasses::Block => self.chain.first().map_or(0, |block| {
+        match &self.passes {
+            Passes::Chained(_) if self.entry.upload().select_rows.is_empty() => 0,
+            Passes::Chained(chain) => chain.len() + 1,
+            Passes::Block(block) => block.as_ref().map_or(0, |block| {
                 block.upload().select_rows.len() / block.actual_slots()
             }),
+            Passes::Front(_) => 1,
+        }
+    }
+
+    /// Of a front batch, per token row of the step queued behind, the slot
+    /// it continues and its depth there; none of any other batch.
+    pub fn continuing(&self) -> Option<&[Option<FrontContinuation>]> {
+        match &self.passes {
+            Passes::Front(continuing) => Some(continuing),
+            Passes::Chained(_) | Passes::Block(_) => None,
         }
     }
 
@@ -236,7 +345,7 @@ impl ValidatedHeadBatch {
 
     /// The most visible history spans of any entry or chained row.
     pub fn segments(&self) -> usize {
-        self.chain
+        self.following()
             .iter()
             .map(|pass| pass.class().segments())
             .fold(self.entry.class().segments(), usize::max)
@@ -249,7 +358,7 @@ impl ValidatedHeadBatch {
     /// The chained passes' tables, in step order (step 1 first), or the one
     /// block pass.
     pub fn chain(&self) -> impl Iterator<Item = TargetBatchUpload<'_>> {
-        self.chain.iter().map(ValidatedTargetBatch::upload)
+        self.following().iter().map(ValidatedTargetBatch::upload)
     }
 
     pub fn slots(&self) -> impl Iterator<Item = crate::TargetBatchSlot<'_>> {
@@ -257,15 +366,15 @@ impl ValidatedHeadBatch {
     }
 
     /// Destinations of each slot's chained rows in history domain `domain`,
-    /// in step order. Block rows append nowhere.
+    /// in step order. Block rows append nowhere; a front batch chains none.
     pub fn chain_destinations(&self, slot: usize, domain: usize) -> Vec<i32> {
-        if self.passes == HeadPasses::Block {
-            return Vec::new();
+        match &self.passes {
+            Passes::Chained(chain) => chain
+                .iter()
+                .map(|pass| pass.upload().histories[domain].destinations[slot])
+                .collect(),
+            Passes::Block(_) | Passes::Front(_) => Vec::new(),
         }
-        self.chain
-            .iter()
-            .map(|pass| pass.upload().histories[domain].destinations[slot])
-            .collect()
     }
 }
 
@@ -316,6 +425,7 @@ mod tests {
                 previous_tape: 0,
                 following_bank: bank + 1,
                 stop: entry as i32,
+                front: 0,
             },
             // A mask-slot block: row 0 is the anchor, rows 1.. propose.
             block: (0..=proposals)

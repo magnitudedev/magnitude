@@ -21,19 +21,22 @@ use crate::planning::{
     BankBinding, BankedFeedForward, HINT_LEADS, RecordTensor, RecordTensors,
 };
 use magnitude_kernels::constants::{
-    FILE_CHOICE, FILE_COUNT, FILE_RECORD, LANDING_DONE, LANDING_ENTRIES, LANDING_FROM, LANDING_HEAD, LANDING_TO, LIST_COUNT,
-    LIST_ENTRIES, LIST_FROM, LIST_SEQUENCE, LIST_TO, MAP_FROM, MAP_RECORD, MAP_UNTIL, MAP_WORDS, POLICY_HOME, POLICY_PRICED,
-    POLICY_RESOLVED, POLICY_WHOLE, POLICY_WORDS, RING_COUNT, RING_SEQUENCE, SCRATCH_ASK, SCRATCH_ROUND, SCRATCH_STAGED,
-    SLOT_ANSWER, SLOT_REQUEST, SOURCE_RECORD, SOURCE_ROWS, SOURCE_SITE, STEP_HIGH, STEP_LOW, STEP_WORDS,
+    FILE_CHOICE, FILE_COUNT, FILE_RECORD, LANDING_DONE, LANDING_FROM, LANDING_HEAD, LANDING_TO, LIST_COUNT,
+    LIST_FROM, LIST_SEQUENCE, LIST_TO, MAP_FROM, MAP_RECORD, MAP_UNTIL, MAP_WORDS, POLICY_HOME, POLICY_PRICED,
+    POLICY_RESOLVED, POLICY_WHOLE, POLICY_WORDS, RING_COUNT, RING_SEQUENCE, ROUND_LANE, SCRATCH_ASK, SCRATCH_STAGED,
+    SLOT_ANSWER, SLOT_REQUEST, SOURCE_RECORD, SOURCE_ROWS, SOURCE_SITE, STEP_HIGH, STEP_LOW, STEP_GUESSES, STEP_WORDS, GUESS_CHAINED, GUESS_HEAD,
 };
 use magnitude_kernels::{
-    SlotTable, landing_extent, list_extent, routed_copy, routed_hint_route, routed_hint_select, routed_land,
-    routed_list_grid, routed_pass_map, routed_round, routed_route_streamed, routed_scratch_grids,
-    routed_scratch_request, routed_seed_commit, routed_select_streamed, routed_step,
+    constants, routed_copy, routed_gate_up, routed_gate_up_part,
+    routed_hint_route, routed_hint_select, routed_land, routed_list_grid, routed_pass_map, routed_round,
+    routed_route_streamed, routed_scratch_grids, routed_scratch_request, routed_seed_commit,
+    routed_select_streamed, routed_step, step_words,
 };
 
 /// The fixture step's sequence.
 const SEQUENCE: i32 = 1;
+/// Rows of a step that are front rows when qualification passes a front: row 1.
+const FRONT_ROWS: u32 = 0b10;
 
 /// The fixture bank's records: one no entry writes (0), and the one a prompt
 /// group's seed lands in (1).
@@ -79,6 +82,7 @@ pub(super) fn qualify_bank(
         pass_map,
         placement,
         site,
+        gate_up,
     } = kernels;
     let served = Served::of(banked, route, feed_forward, label)?;
     let mut records = binding
@@ -87,15 +91,35 @@ pub(super) fn qualify_bank(
     let selected = word(binding.selected, "routed_bank", label)?;
     let words = |extents: &[u64], set: &[(u64, i32)], entry| shared_words(charges, extents, set, entry, label);
 
-    // The step's sequence.
+    // The step's sequence, of a graph without token rows.
+    let none = words(&[0, 2], &[], "routed_step")?;
     let mut step = words(&[STEP_WORDS], &[], "routed_step")?;
     step_kernel
         .call(charges, routed_step::Args {
             step: &mut step,
-            sequence: &words(&[STEP_WORDS], &[(STEP_LOW, SEQUENCE)], "routed_step")?,
+            sequence: &words(&[STEP_WORDS], &sparse(&step_words(SEQUENCE as u64, 0)), "routed_step")?,
+            guesses: &none,
         })
         .map_err(|error| qualification_dynamic("routed_step", label, error))?;
-    require_words(&step, &[(STEP_LOW, SEQUENCE), (STEP_HIGH, 0)], "routed_step", label)?;
+    require_words(&step, &sparse(&step_words(SEQUENCE as u64, 0)), "routed_step", label)?;
+    // A step's front rows pass through with its sequence, each front row's
+    // field of STEP_GUESSES the kind of the guess it runs on, its row
+    // before's (`guesses[row - 1]`, (token, kind)); a row that is no front
+    // row's is clear.
+    let front = step_words(SEQUENCE as u64, FRONT_ROWS);
+    for kind in [GUESS_CHAINED, GUESS_HEAD].map(|kind| kind as i32) {
+        let mut fronted = words(&[STEP_WORDS], &[], "routed_step")?;
+        step_kernel
+            .call(charges, routed_step::Args {
+                step: &mut fronted,
+                sequence: &words(&[STEP_WORDS], &sparse(&front), "routed_step")?,
+                guesses: &words(&[2, 2], &[(0, 7), (1, kind), (2, 9), (3, GUESS_HEAD as i32)], "routed_step")?,
+            })
+            .map_err(|error| qualification_dynamic("routed_step", label, error))?;
+        let mut expected = front;
+        expected[STEP_GUESSES as usize] = magnitude_kernels::step_guesses([(FRONT_ROWS.trailing_zeros() as usize, kind)]);
+        require_words(&fronted, &sparse(&expected), "routed_step", label)?;
+    }
 
     served.qualify_routes(charges, binding, rows, &step, label)?;
 
@@ -115,19 +139,21 @@ pub(super) fn qualify_bank(
     // -1 - expert).
     let table = binding.words.file();
     let slot = table.lane(SEQUENCE as u64, 0);
-    let others = (1..binding.selected).map(|choice| (slot + SlotTable::file_entry(choice) + FILE_CHOICE, -1));
+    let others = (1..binding.selected).map(|choice| (slot + constants::FILE_ENTRY(choice) + FILE_CHOICE, -1));
     // Its answer names record 0 by its record word: tier record 0 (-2)
     // across a link, bank record 0 on unified memory.
     let (landed, appended) = match binding.placer {
         crate::planning::Placer::Tier => (-2, 0),
         crate::planning::Placer::Bank => (0, 1),
     };
+    // It launches on the grid the route wrote of a step that requested.
+    let groups = binding.placer.land_groups();
     let request = [
         (slot + SLOT_REQUEST, SEQUENCE),
         (slot + SLOT_ANSWER, SEQUENCE),
         (slot + FILE_COUNT, selected),
-        (slot + SlotTable::file_entry(0) + FILE_CHOICE, 0),
-        (slot + SlotTable::file_entry(0) + FILE_RECORD, landed),
+        (slot + constants::FILE_ENTRY(0) + FILE_CHOICE, 0),
+        (slot + constants::FILE_ENTRY(0) + FILE_RECORD, landed),
     ]
     .into_iter()
     .chain(others)
@@ -139,7 +165,7 @@ pub(super) fn qualify_bank(
     let mut sources =
         semantic_i32(charges, &[SOURCE_ROWS, 1, count], &vec![-1; (SOURCE_ROWS * count) as usize], entry, label)?;
     let policy = words(&[POLICY_WORDS], &[], entry)?;
-    let mut landing = words(&[landing_extent(binding.selected)], &landing_list(appended, 0), entry)?;
+    let mut landing = words(&[constants::LANDING_ENTRY(binding.selected)], &landing_list(appended, 0), entry)?;
     // Where the tier places, staging and records views of none.
     let none = |tensor: &Tensor| tensor.slice_leading(0, 0).map_err(|error| qualification_dynamic("routed_bank", label, error));
     let views = |tensor: &Tensor| match binding.placer {
@@ -162,11 +188,12 @@ pub(super) fn qualify_bank(
         gate: &mut gate,
         up: &mut bank.up,
         down: &mut bank.down,
+        grid: &words(&[3], &[(0, groups), (1, 1), (2, 1)], entry)?,
     })
     .map_err(|error| qualification_dynamic(entry, label, error))?;
     require_words(&sources, &[(SOURCE_RECORD * count, landed), (SOURCE_SITE * count, -1)], entry, label)?;
     if appended > 0 {
-        require_words(&landing, &[(LANDING_ENTRIES + LANDING_DONE, SEQUENCE)], entry, label)?;
+        require_words(&landing, &[(constants::LANDING_ENTRY(0) + LANDING_DONE, SEQUENCE)], entry, label)?;
         for fixture in records.as_ref() {
             fixture.require(&[&fixture.converted, &fixture.marker], entry, label)?;
         }
@@ -178,7 +205,7 @@ pub(super) fn qualify_bank(
     // into scratch slot 0), then answered every round.
     let table = binding.words.scratch();
     let ask = table.lane(SEQUENCE as u64, SCRATCH_ASK);
-    let first = table.lane(SEQUENCE as u64, SCRATCH_ROUND);
+    let first = table.lane(SEQUENCE as u64, ROUND_LANE(0));
     let answered = (0..table.lanes()).map(|lane| (table.lane(SEQUENCE as u64, lane) + SLOT_ANSWER, SEQUENCE));
     let mut scratch_table = words(
         &table.extents(),
@@ -198,13 +225,13 @@ pub(super) fn qualify_bank(
     require_words(&scratch_table, &[(ask + SLOT_REQUEST, SEQUENCE), (ask + SLOT_REQUEST + 1, 0)], "routed_scratch_request", label)?;
     let requested = (0..binding.selected).map(|expert| (expert, 1)).collect::<Vec<_>>();
     require_words(&flags, &requested, "routed_scratch_request", label)?;
-    let list = |from, to| [(LIST_SEQUENCE, SEQUENCE), (LIST_COUNT, 1), (LIST_ENTRIES + LIST_FROM, from), (LIST_ENTRIES + LIST_TO, to)];
+    let list = |from, to| [(LIST_SEQUENCE, SEQUENCE), (LIST_COUNT, 1), (constants::LIST_ENTRY(0) + LIST_FROM, from), (constants::LIST_ENTRY(0) + LIST_TO, to)];
     // The seeds: scratch slot 0, which holds expert 0, into record 1.
-    let seeds = words(&[list_extent(binding.window_slots)], &list(0, 1), "routed_copy")?;
+    let seeds = words(&[constants::LIST_ENTRY(binding.window_slots)], &list(0, 1), "routed_copy")?;
     let entry = "routed_round";
     let window = semantic_i32(charges, &[1], &[0], entry, label)?;
     let window_rounds = word(binding.window_rounds, entry, label)?;
-    let mut round_list = words(&[landing_extent(binding.round_records)], &landing_list(1, 0), entry)?;
+    let mut round_list = words(&[constants::LANDING_ENTRY(binding.round_records)], &landing_list(1, 0), entry)?;
     let gate_conveyor = gate_or_empty(&records, |fixture| &fixture.conveyor, label)?;
     let mut scratch = records.as_ref().map(|_, fixture| fixture.scratch.clone());
     let mut gate = scratch.gate.take().map_or_else(|| none(&scratch.up), Ok)?;
@@ -216,7 +243,7 @@ pub(super) fn qualify_bank(
             rounds: window_rounds,
             round: 0,
             landing: &mut round_list,
-            tiered: &words(&[list_extent(binding.window_slots)], &[], entry)?,
+            tiered: &words(&[constants::LIST_ENTRY(binding.window_slots)], &[], entry)?,
             conveyor_gate: &gate_conveyor,
             conveyor_up: &records.up.conveyor,
             conveyor_down: &records.down.conveyor,
@@ -230,7 +257,7 @@ pub(super) fn qualify_bank(
         })
         .map_err(|error| qualification_dynamic(entry, label, error))?;
     require_words(&scratch_table, &[(first + SLOT_REQUEST, SEQUENCE)], entry, label)?;
-    require_words(&round_list, &[(LANDING_ENTRIES + LANDING_DONE, SEQUENCE)], entry, label)?;
+    require_words(&round_list, &[(constants::LANDING_ENTRY(0) + LANDING_DONE, SEQUENCE)], entry, label)?;
     for fixture in records.as_ref() {
         require_bytes(&fixture.scratch, &fixture.converted, entry, label)?;
     }
@@ -258,7 +285,7 @@ pub(super) fn qualify_bank(
             let grid_of = |listed: &Tensor, entry| {
                 let blocks = magnitude_kernels::LIST_BLOCKS as i32;
                 let mut grid = semantic_i32(charges, &[3], &[blocks, 0, 0], entry, label)?;
-                let mut staged = words(&[list_extent(binding.window_slots)], &[], entry)?;
+                let mut staged = words(&[constants::LIST_ENTRY(binding.window_slots)], &[], entry)?;
                 list_grid
                     .call(charges, routed_list_grid::Args { list: listed, step: &step, grid: &mut grid, staged: &mut staged })
                     .map_err(|error| qualification_dynamic("routed_list_grid", label, error))?;
@@ -362,15 +389,174 @@ pub(super) fn qualify_bank(
         stacks: records.as_ref().map(|_, fixture| fixture.stacks.records.clone()),
         tier: tier.as_ref().map(|tier| tier.as_ref().map(|_, tier| tier.records.clone())),
     };
-    match &served {
-        Served::Fused { binding, kernels, .. } => qualify_routed(charges, *binding, kernels, rows, &reads)?,
-        Served::General { binding, kernels, .. } => qualify_general_routed(charges, *binding, kernels, &reads)?,
+    // Each routed form's resident gate/up, which a gated layer's passes
+    // follow: a streamed fused layer's decode is the shared-route form
+    // (planning admits no other beside a bank).
+    let resident = match &served {
+        Served::Fused { binding, kernels, .. } => {
+            qualify_routed(charges, *binding, kernels, rows, &reads)?;
+            match &kernels.decode {
+                crate::native::RoutedDecodeKernels::SharedRoute { choices, .. } => Some(ResidentKernel {
+                    kernel: choices.first(),
+                    hidden: binding.hidden,
+                    features: binding.features,
+                    element: binding.activation,
+                    activation: crate::operators::routed::FUSED_ACTIVATION,
+                    limit: None,
+                }),
+                crate::native::RoutedDecodeKernels::Expand(_) => {
+                    panic!("a streamed fused layer's decode is the shared-route form")
+                }
+            }
+        }
+        Served::General { binding, kernels, .. } => {
+            qualify_general_routed(charges, *binding, kernels, &reads)?;
+            match &kernels.experts {
+                crate::native::ExpertKernels::Gated { decode, .. } => Some(ResidentKernel {
+                    kernel: decode.first(),
+                    hidden: binding.shape.expert_hidden,
+                    features: binding.shape.intermediate,
+                    element: binding.activation,
+                    activation: binding.shape.experts_expansion.activation,
+                    limit: binding.shape.experts_expansion.limit,
+                }),
+                crate::native::ExpertKernels::Plain { .. } => None,
+            }
+        }
+    };
+    if let Some(part) = gate_up {
+        let resident = resident.expect("a bank's gate/up passes are a gated layer's (`bank_gate_up`)");
+        qualify_gate_up(charges, binding, part.first(), resident, &reads, &step, label)?;
     }
 
     Ok(site.as_ref().map(|site| match requirement {
         Some(requirement) => super::site::site_verdict(charges, &binding, site.form, requirement, cache),
         None => crate::assessment::Priced::Unavailable("the numerical profile approves no CPU site".into()),
     }))
+}
+
+/// A gated layer's resident gate/up (`routed_gate_up`) at its dimensions,
+/// which its streamed passes follow.
+struct ResidentKernel<'a> {
+    kernel: &'a NativeKernel<routed_gate_up::Entry>,
+    hidden: u64,
+    features: u64,
+    element: Element,
+    activation: i32,
+    limit: Option<magnitude_family_contracts::GluLimit>,
+}
+
+/// A gated layer's gate/up passes (`routed_gate_up_part`) of one decode
+/// row whose choices route to distinct experts, over one product: choice
+/// 0's expert absent at the route (its source none, and its routing
+/// record's of the step), landed by the wait into record 0; choice 1's
+/// held in record 1 (where the layer selects two or more); every other
+/// choice the CPU's, sourced on the GPU by neither. The early pass, then the
+/// late pass once the wait has sourced choice 0, form the resident gate/up's one pass over the
+/// sourced choices bit for bit, and the late pass alone writes the
+/// absent choice's row and no other.
+fn qualify_gate_up(
+    charges: &seismic::Charges,
+    binding: BankBinding,
+    part: &NativeKernel<routed_gate_up_part::Entry>,
+    resident: ResidentKernel<'_>,
+    reads: &ExpertReads,
+    step: &Tensor,
+    label: &str,
+) -> Result<(), CatalogFailure> {
+    let entry = "routed_gate_up_part";
+    let failed = |error: &dyn fmt::Display| qualification_dynamic(entry, label, error);
+    let ResidentKernel { kernel: resident, hidden, features, element, activation, limit } = resident;
+    let selected = binding.selected;
+    let choices = usize::try_from(selected).map_err(|error| failed(&error))?;
+    // Each choice's record: the route's (choice 0 absent, choice 1 held
+    // in record 1, the rest the CPU's), then the wait's (choice 0 landed
+    // in record 0).
+    let sources = |first: i32| {
+        let records = (0..choices).map(|choice| [first, 1, -1][choice.min(2)]).collect::<Vec<_>>();
+        semantic_i32(
+            charges,
+            &[SOURCE_ROWS, 1, selected],
+            &magnitude_kernels::source_words(&records, &vec![-1; choices]),
+            entry,
+            label,
+        )
+    };
+    let (absent, sourced) = (sources(-1)?, sources(0)?);
+    // The step's routing record: every choice but the held one absent at
+    // its route.
+    let (flight, routing_words) = (binding.words.flight, binding.words.routing_words());
+    let slot = u64::from(SEQUENCE.unsigned_abs()) % flight * routing_words;
+    let unrouted = (0..selected)
+        .map(|choice| (slot + binding.words.routing_source(choice), if choice == 1 { 1 } else { -1 }))
+        .collect::<Vec<_>>();
+    let routing = shared_words(charges, &[flight, routing_words], &unrouted, entry, label)?;
+    let normalized = semantic_ones(charges, element, &[1, hidden], entry, label)?;
+    // Distinct experts, as a row's choices are.
+    let experts = (0..i32::try_from(selected).map_err(|error| failed(&error))?).collect::<Vec<_>>();
+    let routes = semantic_i32(charges, &[1, selected], &experts, entry, label)?;
+    let gate = |records: &RecordTensors<Tensor>| records.gate.clone().ok_or_else(|| failed(&"a gated layer's records have no gate"));
+    let tier = reads.tier_records(label)?;
+    let (records_gate, tier_gate) = (gate(&reads.records)?, gate(&tier)?);
+    let (gate_scale, up_scale) = (unit_scale(charges, part, "GS", entry, label)?, unit_scale(charges, part, "US", entry, label)?);
+    let glu_limit = glu_limit(charges, limit, entry, label)?;
+    let mut product = semantic_zeros(charges, element, &[1, selected, features], entry, label)?;
+    let pass = |sources: &Tensor, late: i32, product: &mut Tensor| {
+        part.call(charges, routed_gate_up_part::Args {
+            normalized: &normalized,
+            routes: &routes,
+            sources,
+            expert_gate: &records_gate,
+            expert_up: &reads.records.up,
+            tier_gate: &tier_gate,
+            tier_up: &tier.up,
+            activation,
+            gate_scale: &gate_scale,
+            up_scale: &up_scale,
+            glu_limit: &glu_limit,
+            routing: &routing,
+            step,
+            late,
+            product,
+        })
+        .map(drop)
+        .map_err(|error| failed(&error))
+    };
+    pass(&absent, 0, &mut product)?;
+    pass(&sourced, 1, &mut product)?;
+    let one = resident
+        .call(charges, routed_gate_up::Args {
+            normalized: &normalized,
+            routes: &routes,
+            sources: &sourced,
+            expert_gate: &records_gate,
+            expert_up: &reads.records.up,
+            tier_gate: &tier_gate,
+            tier_up: &tier.up,
+            activation,
+            gate_scale: &gate_scale,
+            up_scale: &up_scale,
+            glu_limit: &glu_limit,
+        })
+        .map_err(|error| failed(&error))?
+        .value;
+    // The late pass alone, over a product of ones: it writes the absent
+    // choice's row, leaving every other as it found it.
+    let mut marked = semantic_ones(charges, element, &[1, selected, features], entry, label)?;
+    let ones = marked.read_to_host().map_err(|error| failed(&error))?;
+    pass(&sourced, 1, &mut marked)?;
+    let [passes, one, late] =
+        [&product, &one, &marked].map(|tensor| tensor.read_to_host().map_err(|error| failed(&error)));
+    let (one, late) = (one?, late?);
+    if passes? != one {
+        return Err(failed(&"the early and late passes differ from the resident gate/up's one pass"));
+    }
+    let row = one.len() / choices;
+    let wanted = [&one[..row], &ones[row..]].concat();
+    if late != wanted {
+        return Err(failed(&"the late pass wrote other than the absent choice's row"));
+    }
+    Ok(())
 }
 
 /// A streamed layer's routed form: its binding, its resident entries and its
@@ -457,6 +643,7 @@ impl<'a> Served<'a> {
         let unrouted = (0..selected)
             .map(|choice| (record + binding.words.routing_source(choice), -1))
             .collect::<Vec<_>>();
+        let land_groups = binding.placer.land_groups();
         for whole in [0, 1] {
             let map = words(&[experts, MAP_WORDS], &unmapped(experts), entry)?;
             let tier = words(&[tier_experts], &(0..tier_experts).map(|expert| (expert, -1)).collect::<Vec<_>>(), entry)?;
@@ -464,7 +651,10 @@ impl<'a> Served<'a> {
             let mut file = words(&binding.words.file().extents(), &[], entry)?;
             let mut sources = zeros(Element::i32(), &[SOURCE_ROWS, 1, selected], entry)?;
             let mut routing = words(&[flight, routing_words], &[], entry)?;
+            let mut keys = words(&[flight, constants::VERIFY_ROWS, binding.experts], &[], entry)?;
+            let mut front = words(&[ring], &[], entry)?;
             let mut routes = zeros(Element::i32(), &[1, selected], entry)?;
+            let mut land_grid = words(&[3], &[], entry)?;
             match *self {
                 Self::Fused { binding: b, route, .. } => {
                     let kernel = route.first();
@@ -491,6 +681,10 @@ impl<'a> Served<'a> {
                             file: &mut file,
                             sources: &mut sources,
                             routing: &mut routing,
+                            keys: &mut keys,
+                            front: &mut front,
+                            land_grid: &mut land_grid,
+                            land_groups,
                         })
                         .map_err(|error| qualification_dynamic(entry, label, error))?;
                 }
@@ -521,6 +715,10 @@ impl<'a> Served<'a> {
                             file: &mut file,
                             sources: &mut sources,
                             routing: &mut routing,
+                            keys: &mut keys,
+                            front: &mut front,
+                            land_grid: &mut land_grid,
+                            land_groups,
                         })
                         .map_err(|error| qualification_dynamic(entry, label, error))?;
                 }
@@ -532,6 +730,10 @@ impl<'a> Served<'a> {
                 let slot = binding.words.file().lane(SEQUENCE as u64, 0);
                 require_words(&file, &[(slot + SLOT_REQUEST, SEQUENCE), (slot + FILE_COUNT, choices)], entry, label)?;
             }
+            // Every choice absent requests the step's slot, so the landing
+            // launch lands; a whole group's lands nothing.
+            let groups = if whole == 0 { land_groups } else { 0 };
+            require_words(&land_grid, &[(0, groups), (1, 1), (2, 1)], entry, label)?;
             if whole == 1 {
                 let routed = routes.read_to_host().map_err(|error| qualification_dynamic(entry, label, error))?;
                 let sourced = routed
@@ -703,11 +905,11 @@ fn gate_or_empty(
 }
 
 /// The words of a landing list holding `count` entries of step SEQUENCE,
-/// entry 0 converting record `from` into record 0 (`landing_extent`).
+/// entry 0 converting record `from` into record 0 (LANDING_ENTRY).
 fn landing_list(count: i32, from: i32) -> Vec<(u64, i32)> {
     let mut words = vec![(LANDING_HEAD, SEQUENCE), (LANDING_HEAD + 1, count)];
     if count > 0 {
-        words.extend([(LANDING_ENTRIES + LANDING_FROM, from), (LANDING_ENTRIES + LANDING_TO, 0)]);
+        words.extend([(constants::LANDING_ENTRY(0) + LANDING_FROM, from), (constants::LANDING_ENTRY(0) + LANDING_TO, 0)]);
     }
     words
 }
@@ -749,6 +951,12 @@ fn shared_words(
         .map_err(|error| qualification_dynamic(entry, label, error))?;
     set_words(&tensor, set, entry, label)?;
     Ok(tensor)
+}
+
+/// The `(index, value)` pairs of `words`' nonzero words, the form `words`
+/// and `require_words` take.
+fn sparse(words: &[i32]) -> Vec<(u64, i32)> {
+    words.iter().enumerate().filter(|(_, &word)| word != 0).map(|(index, &word)| (index as u64, word)).collect()
 }
 
 /// Each `(index, value)` of `set` stored into the host-shared i32 `tensor`,
@@ -900,7 +1108,7 @@ mod tests {
     }
 
     fn route_statics<'v>(bank: BankBinding, resident: &[(&'v str, u64)]) -> Vec<(&'v str, u64)> {
-        [("TM", crate::native::tuning::routed::tier_experts(bank))]
+        crate::native::tuning::routed::bank_statics(bank)
             .into_iter()
             .chain(resident.iter().copied())
             .collect()
@@ -916,8 +1124,8 @@ mod tests {
     /// `bank`'s entries on `device` beside its `route`, each at the statics
     /// preparation fixes (`Preparation::bank`).
     fn bank_kernels(device: &Device, bank: BankBinding, route: BankRouteKernels) -> ExpertBankKernels {
-        let RecordTensors { gate, up, down } = bank.record;
-        let gate = gate.unwrap_or(up);
+        let RecordTensors { gate: gated, up, down } = bank.record;
+        let gate = gated.unwrap_or(up);
         let table = bank.words.scratch();
         let scratch = [("FLIGHT", table.slots()), ("LANES", table.lanes())];
         let land = prepare(device, routed_land::native_entry_with(routed_land::Elements {
@@ -963,6 +1171,19 @@ mod tests {
                 list_grid: prepare(device, routed_list_grid::native_entry(), &[]),
             },
             site: None,
+            // A gated record's passes, at the activations the fixtures
+            // route in.
+            gate_up: gated.map(|gate| {
+                every_row(prepare(
+                    device,
+                    routed_gate_up_part::native_entry_with(routed_gate_up_part::Elements {
+                        EGW: gate.resident,
+                        EUW: up.resident,
+                        A: Element::bf16(),
+                    }),
+                    &[("H", HIDDEN), ("K", bank.selected), ("F", FEATURES), ("GS", 0), ("US", 0), ("LB", 0)],
+                ))
+            }),
         }
     }
 

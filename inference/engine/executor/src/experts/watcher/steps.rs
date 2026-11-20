@@ -18,14 +18,15 @@
 
 use super::Shared;
 use super::core::At;
-use crate::assessment::ExpertLines;
+use magnitude_cost_model::ExpertLines;
 use crate::experts::directory::{Park, Piece, Point};
 use crate::experts::events::Events;
 use crate::FlightDepth;
-use crate::operation::LaunchWork;
+use crate::operation::{LaunchWork, RequestId};
+use magnitude_kernels::constants::VERIFY_ROWS;
 use crate::programs::Chain;
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -33,6 +34,78 @@ use std::time::Instant;
 /// A step's sequence, the host's one step type: the u64 the host and the
 /// device share (`streaming_words.seismic`'s steps), consecutive from one.
 pub(crate) type Step = u64;
+
+/// A decode batch row that runs ahead of its pass's exact rows
+/// ([`ExpertStep::decoding`]), derived from its pass's rows ([`AheadOf::new`],
+/// `crate::Rows`) and its index among them: its index among its pass's
+/// ahead rows (`row`, 0 the first after the exact rows); its pass's
+/// acceptable rows (`acceptable`), a verification's proposals, which its
+/// pass may commit, so their routes are their step's; or else one of its
+/// pass's front rows, which only run ahead and which their route resolves
+/// to skip what the step does not hold. A pass's front rows are its ahead
+/// rows of a pass of no acceptable rows, front row `d` (its depth, from 1)
+/// on the `d`-th guess of the pass's chain, exact `d` passes later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AheadOf {
+    row: u8,
+    acceptable: u8,
+}
+
+impl AheadOf {
+    /// Ahead row `row` of a pass of `exact` exact rows and `acceptable`
+    /// acceptable rows: an acceptable row where `row` is below them, else
+    /// a front row. Panics on a pass no `Rows` represents: ahead rows with
+    /// no exact row before them, or front rows behind acceptable rows.
+    pub(crate) fn new(exact: usize, acceptable: usize, row: usize) -> Self {
+        let front = row >= acceptable;
+        assert!(
+            exact > 0 && (!front || acceptable == 0),
+            "a pass's ahead rows are acceptable rows behind an exact row, or front rows of a pass of none: {exact} exact, {acceptable} acceptable, ahead row {row}"
+        );
+        let byte = |count: usize| u8::try_from(count).expect("a pass's ahead rows fit a byte");
+        Self { row: byte(row), acceptable: byte(acceptable) }
+    }
+
+    /// Its index among its pass's ahead rows.
+    pub(crate) fn row(&self) -> u8 {
+        self.row
+    }
+
+    /// Its pass's acceptable rows.
+    pub(crate) fn acceptable(&self) -> u8 {
+        self.acceptable
+    }
+
+    /// Its pass's guessed rows up to it, it among them: every ahead row's
+    /// token is a guess, and each rests on the guesses before it.
+    pub(crate) fn guessed(&self) -> NonZeroU8 {
+        NonZeroU8::MIN.checked_add(self.row).expect("a pass's ahead rows fit a byte")
+    }
+
+    /// Whether it only runs ahead, a front row (STEP_FRONT's bit).
+    pub(crate) fn front(&self) -> bool {
+        self.row >= self.acceptable
+    }
+
+    /// The passes of its request after its own at which its token is
+    /// exact: none for an acceptable row; a front row's depth (1 the first
+    /// front row's).
+    pub(crate) fn exact_in(&self) -> u8 {
+        match self.front() {
+            true => self.row - self.acceptable + 1,
+            false => 0,
+        }
+    }
+}
+
+/// A decode launch's batch row: its position, the request whose pass runs
+/// it, and, an ahead row, its [`AheadOf`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DecodeRow {
+    pub position: u64,
+    pub request: RequestId,
+    pub ahead: Option<AheadOf>,
+}
 
 /// Step `step`'s low word: what the words that tell steps apart only within
 /// a flight carry (rings, lists and routing records,
@@ -253,6 +326,15 @@ impl Begun {
 }
 
 impl State {
+    /// The request at layer `layer` of step `sequence` in the device's
+    /// order, of a bank of `layers` layers.
+    fn at(&mut self, sequence: Step, layer: usize, layers: usize) -> At {
+        let (group, begun) = self.group(sequence);
+        let opened = *begun.front(layer);
+        let position = opened.base.at(layers) + (layer - opened.from) as u64 * begun.steps + (sequence - group);
+        At::new(Point { piece: opened.piece, layer, sequence, group }, position)
+    }
+
     /// The point of layer `layer` of step `sequence` of group `group` that
     /// its pass there reaches ([`Begun::pass`]): the start of the device's
     /// order for a group forgotten, every step of which ended.
@@ -341,26 +423,250 @@ impl State {
             .unwrap_or_else(|| panic!("step {sequence} began in no group"))
     }
 
+    /// Whether a scratch-served group has begun that is not retired: from
+    /// its begin until the device is past it, its lender's lent host
+    /// records are its lease (`HostRecords::lease`), so the reserve unmaps
+    /// none meanwhile, which would grace one for the group's own steps and
+    /// hold its lease behind them (`HostRecords::refill`). The lease is
+    /// claimed record by record later, as the group's first request is
+    /// taken: this span is what covers the begin before it.
+    fn lending(&self) -> bool {
+        self.groups.values().any(|group| group.scratch && !group.retired)
+    }
+
     /// Forget the groups both retired and ended.
     fn forget(&mut self) {
         self.groups.retain(|_, group| !(group.retired && group.ended == group.steps));
     }
 }
 
+/// The steps yet to resolve each layer, the device known at `point`, while
+/// the lock every step begins under is held ([`Steps::unresolved`]): the
+/// one rule a map entry whose record is whole is stored from where the
+/// device may run anywhere ([`Self::from`]), so a step begun that has yet
+/// to resolve its layer hits it rather than wait on bytes already there. A
+/// read ahead's landing (the step it is for may have begun: a queued pass)
+/// and a tier upload's map by it. A park reads the exact first unresolved
+/// step instead (`Park::unresolved`), what its unmappings and its landings
+/// are stored from.
+pub(in crate::experts) struct Unresolved<'a> {
+    state: &'a State,
+    point: Point,
+}
+
+impl Unresolved<'_> {
+    /// The first step of the group of `point` or a later one whose
+    /// resolution of `layer` lies after `point`
+    /// ([`State::first_unresolved`]); past every running scratch-served
+    /// group from it on, whose rounds read a cold expert from the file
+    /// unless the map held it as its request was taken (`scratch::hit`),
+    /// which may precede this mapping while its pass, which resolves the
+    /// map, follows it: so no entry may start resolving for its steps.
+    /// Never past the first step not yet begun.
+    pub(in crate::experts) fn from(&self, layer: usize) -> MapFrom {
+        let state = self.state;
+        let unbegun = state.last + 1;
+        let mut from = state.first_unresolved(self.point, layer);
+        for (&first, group) in &state.groups {
+            if group.scratch && group.ended < group.steps && first + group.steps > from {
+                from = from.max(first + group.steps);
+            }
+        }
+        MapFrom(from.min(unbegun))
+    }
+}
+
+/// The step a map entry whose record is whole is stored from where the
+/// device may run anywhere ([`Unresolved::from`], its one maker): pushed
+/// past every running scratch-served group. It reaches a mapping alone, as
+/// a [`MapStep`]: no [`UnmapStep`] is made of it, as an unmapping stored
+/// past the exact first step yet to resolve its layer leaves a step that
+/// resolves the layer after the unmapping reading a record taken back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::experts) struct MapFrom(Step);
+
+impl MapFrom {
+    /// From step `step`, where a test plays the steps.
+    #[cfg(test)]
+    pub(in crate::experts) fn at(step: Step) -> Self {
+        Self(step)
+    }
+}
+
+/// The exact first step yet to resolve a layer, the device parked
+/// ([`Steps::park`], its one maker, by [`State::first_unresolved`]): never
+/// pushed past a running scratch-served group. What a park's unmappings and
+/// its landings' mappings are stored from (`Park::unresolved`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::experts) struct ParkFrom(Step);
+
 /// The first step not yet begun, while the lock every step begins under is
 /// held ([`Steps::unbegun`], its one maker): what a map entry is stored
-/// from or until so that it holds for every step that begins after it.
-pub(in crate::experts) struct Unbegun(Step);
+/// from or until so that it holds for every step that begins after it;
+/// and whether a scratch-served group's lease is out ([`State::lending`]),
+/// read under the same lock, so no group begins between the two.
+pub(in crate::experts) struct Unbegun {
+    next: Step,
+    lending: bool,
+}
 
 impl Unbegun {
+    fn of(state: &State) -> Self {
+        // Admission keeps the step after the last one begun representable.
+        Self { next: state.last + 1, lending: state.lending() }
+    }
+
     pub(in crate::experts) fn next(&self) -> Step {
+        self.next
+    }
+
+    /// Whether a scratch-served group begun is not yet retired: its
+    /// lender's lent records are its lease.
+    pub(in crate::experts) fn lending(&self) -> bool {
+        self.lending
+    }
+
+    /// The first step not yet begun at `next`, no group lending, where a
+    /// test plays the steps.
+    #[cfg(test)]
+    pub(in crate::experts) fn at(next: Step) -> Self {
+        Self { next, lending: false }
+    }
+
+    /// The first step not yet begun at `next`, a scratch-served group's
+    /// lease out, where a test plays the steps.
+    #[cfg(test)]
+    pub(in crate::experts) fn lending_at(next: Step) -> Self {
+        Self { next, lending: true }
+    }
+}
+
+/// A scratch-served group, a prompt's steps grouped and not resident: its
+/// first step and its steps, read from the steps that began it
+/// ([`Steps::scratch_group`], its one maker). Its steps read none of the
+/// records it takes but their hits, and every step before its first runs
+/// before it writes one (a group cut in after its first step runs after the
+/// taking): so an expert a record it takes held is unmapped from its first
+/// step ([`UnmapStep`]), the victims of its lend, its claims and its seeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScratchGroup {
+    first: Step,
+    steps: u64,
+}
+
+impl ScratchGroup {
+    /// Its first step.
+    pub(crate) fn first(self) -> Step {
+        self.first
+    }
+
+    /// Its last step.
+    pub(crate) fn last(self) -> Step {
+        self.first + self.steps - 1
+    }
+
+    /// Its steps.
+    pub(crate) fn steps(self) -> u64 {
+        self.steps
+    }
+
+    /// The group of `steps` steps from `first`, where a test plays the
+    /// steps, or a replay does (a directory of no device, whose bank maps
+    /// nothing, `directory::replay`).
+    #[cfg(any(test, feature = "expert-routing"))]
+    pub(in crate::experts) fn at(first: Step, steps: u64) -> Self {
+        Self { first, steps }
+    }
+}
+
+/// The step a map entry is stored from (its FROM), the record holding its
+/// expert whole, made only by a map rule: a park's exact first step yet to
+/// resolve the layer ([`ParkFrom`]), the first step not yet begun
+/// ([`Unbegun`]), the step pushed past every running scratch-served group
+/// ([`MapFrom`]), or every step ([`Self::EVERY`]). None is later than a
+/// step that must read the record: no step its rule makes resolve the
+/// expert there misses it. An earlier one is as sound: a step that
+/// resolves the entry reads the expert whole, and the record is reused
+/// only once every step from its FROM is past (`Steps::served`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::experts) struct MapStep(Step);
+
+impl MapStep {
+    /// Every step: what a bank imported whole, before any step, is mapped
+    /// from, and what an entry is held mapped from where its own FROM is
+    /// not known as it is recorded (a read ahead's landing, mapped from its
+    /// pushed step, `HostRecords`' `Whole::from`).
+    pub(in crate::experts) const EVERY: Self = Self(0);
+
+    pub(in crate::experts) fn step(self) -> Step {
         self.0
     }
 
-    /// The first step not yet begun at `next`, where a test plays the steps.
+    /// From step `step`, where a test plays the steps.
     #[cfg(test)]
-    pub(in crate::experts) fn at(next: Step) -> Self {
-        Self(next)
+    pub(in crate::experts) fn at(step: Step) -> Self {
+        Self(step)
+    }
+}
+
+impl From<ParkFrom> for MapStep {
+    fn from(ParkFrom(step): ParkFrom) -> Self {
+        Self(step)
+    }
+}
+
+impl From<&Unbegun> for MapStep {
+    fn from(at: &Unbegun) -> Self {
+        Self(at.next)
+    }
+}
+
+impl From<MapFrom> for MapStep {
+    fn from(MapFrom(step): MapFrom) -> Self {
+        Self(step)
+    }
+}
+
+/// The step an entry is unmapped from (its UNTIL), made only by an unmap
+/// rule: a park's exact first step yet to resolve the layer
+/// ([`ParkFrom`]), the first step not yet begun ([`Unbegun`]), or a scratch
+/// group's first step ([`ScratchGroup`]). Each is exact: every step of the
+/// groups below it has resolved the layer, or reads the record while it
+/// holds the expert (it is reused only once each is past,
+/// `Steps::served`), and no step from it on that resolves the layer after
+/// the store reads the record, so none resolves an expert in another's
+/// bytes. Never the pushed step ([`MapFrom`]), past running steps that
+/// resolve the layer after it; the earlier of two is one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::experts) struct UnmapStep(Step);
+
+impl UnmapStep {
+    pub(in crate::experts) fn step(self) -> Step {
+        self.0
+    }
+
+    /// From step `step`, where a test plays the steps.
+    #[cfg(test)]
+    pub(in crate::experts) fn at(step: Step) -> Self {
+        Self(step)
+    }
+}
+
+impl From<ParkFrom> for UnmapStep {
+    fn from(ParkFrom(step): ParkFrom) -> Self {
+        Self(step)
+    }
+}
+
+impl From<&Unbegun> for UnmapStep {
+    fn from(at: &Unbegun) -> Self {
+        Self(at.next)
+    }
+}
+
+impl From<ScratchGroup> for UnmapStep {
+    fn from(group: ScratchGroup) -> Self {
+        Self(group.first)
     }
 }
 
@@ -444,12 +750,12 @@ impl Steps {
         (sequence % self.flight as u64) as usize
     }
 
-    /// The group step `sequence` began in: its first sequence and its
-    /// steps.
-    pub(super) fn group_of(&self, sequence: Step) -> (Step, u64) {
+    /// The group step `sequence` began in where it is scratch-served
+    /// ([`ScratchGroup`], its one maker); none where it is served otherwise.
+    pub(in crate::experts) fn scratch_group(&self, sequence: Step) -> Option<ScratchGroup> {
         let mut state = self.lock();
         let (first, group) = state.group(sequence);
-        (first, group.steps)
+        group.scratch.then_some(ScratchGroup { first, steps: group.steps })
     }
 
     /// Group `group`'s merge set size at streamed layer `layer`.
@@ -518,11 +824,7 @@ impl Steps {
     /// order, of a bank of `layers` layers: its front's point
     /// ([`Begun::front`]), and the layer runs before it.
     pub(in crate::experts) fn at(&self, sequence: Step, layer: usize, layers: usize) -> At {
-        let mut state = self.lock();
-        let (group, begun) = state.group(sequence);
-        let opened = *begun.front(layer);
-        let position = opened.base.at(layers) + (layer - opened.from) as u64 * begun.steps + (sequence - group);
-        At::new(Point { piece: opened.piece, layer, sequence, group }, position)
+        self.lock().at(sequence, layer, layers)
     }
 
     /// The point of layer `layer` of step `sequence` of group `group`
@@ -540,13 +842,24 @@ impl Steps {
         self.lock().groups.get(&group).map_or(Point::START, |begun| begun.after(group))
     }
 
+    /// `write` given the steps yet to resolve each layer with the device
+    /// known at `progress` ([`Unresolved`]), under the lock every step
+    /// begins under: a map entry it stores from [`Unresolved::from`] is read
+    /// by every step that has yet to resolve its layer, begun or not.
+    pub(in crate::experts) fn unresolved<T>(&self, progress: Point, write: impl FnOnce(&Unresolved) -> T) -> T {
+        let state = self.lock();
+        write(&Unresolved { state: &state, point: progress })
+    }
+
     /// The device parked at `point` (a decode request at its layer), of a
-    /// bank of `layers` layers ([`Park`]).
+    /// bank of `layers` layers ([`Park`]): each layer's exact first step yet
+    /// to resolve it, never pushed past a running group
+    /// ([`Unresolved::from`]'s rule is a mapping's alone).
     pub(in crate::experts) fn park(&self, point: Point, layers: usize) -> Park {
         let state = self.lock();
         Park {
             point,
-            unresolved: (0..layers).map(|layer| state.first_unresolved(point, layer)).collect(),
+            unresolved: (0..layers).map(|layer| ParkFrom(state.first_unresolved(point, layer))).collect(),
             earlier: (0..layers).map(|layer| state.unresolved_before(point, layer)).collect(),
         }
     }
@@ -581,21 +894,25 @@ impl Steps {
 
     /// Retire the groups whose every step is below `frontier`: the device
     /// is past them. The point past the latest of them in the device's
-    /// order, read before any is forgotten, and how many scratch-served
-    /// groups retired now (each held the lent records' reservation,
-    /// `lent`).
-    pub(super) fn retire_groups(&self, frontier: Step) -> (Option<Point>, usize) {
+    /// order, read before any is forgotten.
+    pub(super) fn retire_groups(&self, frontier: Step) -> Option<Point> {
         let mut state = self.lock();
-        let (mut past, mut reserving) = (None::<Point>, 0);
+        let mut past = None::<Point>;
         for (&first, group) in &mut state.groups {
             if first + group.steps <= frontier {
-                reserving += usize::from(!group.retired && group.scratch);
                 group.retired = true;
                 past = past.max(Some(group.after(first)));
             }
         }
         state.forget();
-        (past, reserving)
+        past
+    }
+
+    /// Whether a scratch-served group's lease is out ([`State::lending`]),
+    /// as of now: what a choice made outside the steps' lock reads, which
+    /// [`Unbegun::lending`] confirms under it.
+    pub(in crate::experts) fn lending(&self) -> bool {
+        self.lock().lending()
     }
 
     /// The step begun in flight whose low word is `low` ([`low_word`]): the
@@ -604,6 +921,7 @@ impl Steps {
     /// begins only once the step a flight before it ended), far fewer than
     /// 2^32, so at most one has it; none where that step has ended, or none
     /// such has begun.
+    #[cfg(test)]
     pub(in crate::experts) fn of_low_word(&self, low: i32) -> Option<Step> {
         let state = self.lock();
         let span = state.frontier..=state.last;
@@ -611,6 +929,19 @@ impl Steps {
         [step, step.wrapping_sub(1 << 32)]
             .into_iter()
             .find(|step| span.contains(step) && !state.ended.contains(step))
+    }
+
+    /// [`Self::at`] of the step not ended whose low word is `low`
+    /// ([`Self::of_low_word`]), read under one lock so the step cannot end
+    /// and be forgotten between naming it and reading its position.
+    pub(in crate::experts) fn at_low_word(&self, low: i32, layer: usize, layers: usize) -> Option<At> {
+        let mut state = self.lock();
+        let span = state.frontier..=state.last;
+        let step = (state.last & !u64::from(u32::MAX)) | u64::from(low as u32);
+        let sequence = [step, step.wrapping_sub(1 << 32)]
+            .into_iter()
+            .find(|step| span.contains(step) && !state.ended.contains(step))?;
+        Some(state.at(sequence, layer, layers))
     }
 
     /// The frontier: the least step not yet ended, every step below it
@@ -632,9 +963,7 @@ impl Steps {
     /// that one on is queued after what it stores (a map entry's FROM or
     /// UNTIL, `experts::map`).
     pub(in crate::experts) fn unbegun<T>(&self, write: impl FnOnce(&Unbegun) -> T) -> T {
-        let state = self.lock();
-        // Admission keeps the step after the last one begun representable.
-        write(&Unbegun(state.last + 1))
+        write(&Unbegun::of(&self.lock()))
     }
 
     /// `write` given the frontier and the first step not yet begun, read
@@ -642,7 +971,7 @@ impl Steps {
     /// in between is in flight, so they are at most the flight apart.
     pub(in crate::experts) fn unbegun_beside_frontier<T>(&self, write: impl FnOnce(Step, &Unbegun) -> T) -> T {
         let state = self.lock();
-        write(state.frontier, &Unbegun(state.last + 1))
+        write(state.frontier, &Unbegun::of(&state))
     }
 
     /// Whether step `last` is the last begun: no group began after its own.
@@ -863,11 +1192,10 @@ impl Shared {
     /// step; `scratch` says whether they are scratch-served, read where no
     /// publication of the whole words runs (they are published while no
     /// step runs, under this lock), so what it reads of them holds until
-    /// the group ends. A scratch-served group holds the lent records
-    /// reserved from before its steps begin (`lent`): where a copy into
-    /// them runs, it waits for every one to complete outside this lock,
-    /// then reads `scratch` again; or for serving's end, why it cannot
-    /// begin. Each streamed layer's merge set comes with them: the
+    /// the group ends. A scratch-served group's lease of the lent records
+    /// is out from its begin, under this lock, until it retires
+    /// ([`State::lending`]): it waits on nothing, as no promotion copies
+    /// into a lent record. Each streamed layer's merge set comes with them: the
     /// priced one (`Telemetry::merge_sets`) for a scratch-served group, the
     /// whole group otherwise. A group with a grouped step takes a group reads
     /// record from the pool, one for each group the queue can have in
@@ -882,7 +1210,7 @@ impl Shared {
         launches: Chain<L>,
         route: impl Fn(&L) -> StepRoute,
         work: impl Fn(&L) -> LaunchWork,
-        scratch: impl FnMut() -> Result<bool, String>,
+        scratch: impl FnOnce() -> Result<bool, String>,
     ) -> Result<(Chain<(L, ExpertStep)>, Vec<usize>), (String, Chain<L>)> {
         self.open(launches, route, work, scratch, None)
     }
@@ -901,7 +1229,7 @@ impl Shared {
         launches: Chain<L>,
         route: impl Fn(&L) -> StepRoute,
         work: impl Fn(&L) -> LaunchWork,
-        scratch: impl FnMut() -> Result<bool, String>,
+        scratch: impl FnOnce() -> Result<bool, String>,
         (group, layer): (Step, usize),
     ) -> Result<(Chain<(L, ExpertStep)>, Vec<usize>), (String, Chain<L>)> {
         self.open(launches, route, work, scratch, Some((group, layer)))
@@ -915,105 +1243,89 @@ impl Shared {
         launches: Chain<L>,
         route: impl Fn(&L) -> StepRoute,
         work: impl Fn(&L) -> LaunchWork,
-        mut scratch: impl FnMut() -> Result<bool, String>,
+        scratch: impl FnOnce() -> Result<bool, String>,
         before: Option<(Step, usize)>,
     ) -> Result<(Chain<(L, ExpertStep)>, Vec<usize>), (String, Chain<L>)> {
+        // A step beginning where none runs is a pipeline's break: the
+        // policy words staged are written first, so its runs read them.
+        self.write_staged();
         let grouped = launches.iter().any(|launch| route(launch) == StepRoute::Grouped);
         let prompt = launches.iter().any(|launch| work(launch) == LaunchWork::Prompt);
-        // Whether the group holds the lent records reserved (`lent`): a
-        // scratch-served group does before any of its steps begins, until
-        // it retires. Where a copy into them runs it waits outside the lock
-        // and looks again, holding them: at most twice.
-        let mut reserved = false;
-        let begun = loop {
-            let attempt = (|| -> Result<Option<_>, String> {
-                let count = launches.len() as u64;
-                let mut state = self.steps.lock();
-                if launches.len() > self.steps.flight {
-                    return Err(format!("a group of {} steps exceeds the {} routing records", launches.len(), self.steps.flight));
-                }
-                // Retirement names the sequence after the last one begun, so
-                // that one must be representable too.
-                let first = state
-                    .last
-                    .checked_add(1)
-                    .filter(|first| first.checked_add(count).is_some())
-                    .ok_or("the load's step sequences are exhausted")?;
-                for sequence in first..first + count {
-                    if let Some(held) = state.slots[self.steps.slot(sequence)] {
-                        return Err(format!("step {sequence}'s routing record is still owned by step {held}"));
-                    }
-                }
-                let scratch = scratch()?;
-                if scratch && !reserved {
-                    if !self.lent.reserve() {
-                        return Ok(None);
-                    }
-                    reserved = true;
-                }
-                if !scratch && reserved {
-                    self.lent.release();
-                    reserved = false;
-                }
-                let reads = match grouped {
-                    false => None,
-                    true => {
-                        let record = state
-                            .records
-                            .pop()
-                            .ok_or("a group of grouped steps begun beyond the groups the queue holds in flight")?;
-                        self.telemetry.clear_reads(record.0, launches.len());
-                        Some(record)
-                    }
-                };
-                let index = reads.as_ref().map(|&GroupRecord(index)| index);
-                let merges = self
-                    .telemetry
-                    .merge_sets(self.priced().as_deref(), self.passes().as_deref(), self.notice(), launches.len())
-                    .into_iter()
-                    .map(|size| if scratch { size } else { launches.len() })
-                    .collect::<Vec<_>>();
-                // Known to the watcher before any of its steps' requests can be.
-                let pieces = state.open(first, count, before);
-                state.groups.insert(
-                    first,
-                    Begun {
-                        steps: count,
-                        pieces,
-                        ended: 0,
-                        begun: Instant::now(),
-                        retired: false,
-                        scratch,
-                        merges: merges.clone(),
-                        reads,
-                        prompt,
-                    },
-                );
-                for sequence in first..first + count {
-                    state.slots[self.steps.slot(sequence)] = Some(NonZeroU64::new(sequence).expect("sequences begin at one"));
-                }
-                state.last = first + count - 1;
-                state.running += launches.len();
-                Ok(Some((first, index, merges)))
-            })();
-            match attempt {
-                Ok(None) => match self.lent.await_copies(&self.life) {
-                    Ok(()) => reserved = true,
-                    Err(error) => break Err(error),
-                },
-                Ok(Some(begun)) => break Ok(begun),
-                Err(error) => break Err(error),
+        let begun = (|| -> Result<_, String> {
+            let count = launches.len() as u64;
+            let mut state = self.steps.lock();
+            if launches.len() > self.steps.flight {
+                return Err(format!("a group of {} steps exceeds the {} routing records", launches.len(), self.steps.flight));
             }
-        };
+            // Retirement names the sequence after the last one begun, so
+            // that one must be representable too.
+            let first = state
+                .last
+                .checked_add(1)
+                .filter(|first| first.checked_add(count).is_some())
+                .ok_or("the load's step sequences are exhausted")?;
+            for sequence in first..first + count {
+                if let Some(held) = state.slots[self.steps.slot(sequence)] {
+                    return Err(format!("step {sequence}'s routing record is still owned by step {held}"));
+                }
+            }
+            let scratch = scratch()?;
+            let reads = match grouped {
+                false => None,
+                true => {
+                    let record = state
+                        .records
+                        .pop()
+                        .ok_or("a group of grouped steps begun beyond the groups the queue holds in flight")?;
+                    self.telemetry.clear_reads(record.0, launches.len());
+                    Some(record)
+                }
+            };
+            let index = reads.as_ref().map(|&GroupRecord(index)| index);
+            let merges = self
+                .telemetry
+                .merge_sets(self.priced().as_deref(), self.passes().as_deref(), self.notice(), launches.len())
+                .into_iter()
+                .map(|size| if scratch { size } else { launches.len() })
+                .collect::<Vec<_>>();
+            // Known to the watcher before any of its steps' requests can be.
+            let pieces = state.open(first, count, before);
+            state.groups.insert(
+                first,
+                Begun {
+                    steps: count,
+                    pieces,
+                    ended: 0,
+                    begun: Instant::now(),
+                    retired: false,
+                    scratch,
+                    merges: merges.clone(),
+                    reads,
+                    prompt,
+                },
+            );
+            for sequence in first..first + count {
+                state.slots[self.steps.slot(sequence)] = Some(NonZeroU64::new(sequence).expect("sequences begin at one"));
+            }
+            state.last = first + count - 1;
+            state.running += launches.len();
+            Ok((first, index, merges))
+        })();
         let (first, index, merges) = match begun {
             Ok(begun) => begun,
-            Err(error) => {
-                if reserved {
-                    self.lent.release();
-                }
-                return Err((error, launches));
-            }
+            Err(error) => return Err((error, launches)),
         };
+        // A grouped generation group (e.g. a verification or batched decode
+        // wider than the decode form) never calls `ExpertStep::decoding`, yet
+        // `Telemetry::group_read` feeds its reads as `Fed::Decode` at its last
+        // step (`first + count - 1`): register that step on the clock now,
+        // before any later step can begin and register a higher sequence.
+        if grouped && !prompt && launches.iter().all(|launch| route(launch) == StepRoute::Grouped) {
+            self.register_step(
+                first + launches.len() as u64 - 1,
+                crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0)),
+            );
+        }
         // Known to serving before any of its steps' requests can be.
         self.steps.events.notify();
         // Each launch's step, in chain order from `first`. The admission
@@ -1041,6 +1353,7 @@ impl Shared {
                 shared: self.clone(),
                 launch: None,
                 recorded: None,
+                ending: Ending::Unrun,
             };
             admission.remaining -= 1;
             admission.next += 1;
@@ -1073,6 +1386,24 @@ pub(crate) struct ExpertStep {
     /// (`Telemetry::samples`), decided as it begins; none of a step not
     /// sampled.
     sampled: Option<Arc<[ExpertLines]>>,
+    /// How it ends, as the interest ledger is told ([`Ending`]).
+    ending: Ending,
+}
+
+/// How a step ends, as the interest ledger is told
+/// (`interest::Told::Ended`): never run on the device, or completed (it
+/// ran, whatever its outputs), with a decode step's routing.
+enum Ending {
+    Unrun,
+    Completed(Option<DecodeRouting>),
+}
+
+/// A completed decode step's routing (`interest::Told::Completed`): at each
+/// streamed layer the experts its exact rows chose, and its front rows'
+/// guess kinds.
+pub(super) struct DecodeRouting {
+    pub(super) chose: Vec<Vec<crate::experts::interest::Chosen>>,
+    pub(super) guesses: Option<u32>,
 }
 
 /// A step whose load counts its decode (`Stack::live`).
@@ -1095,12 +1426,45 @@ pub(super) enum CompletedRoute {
     Decode(Decoded),
 }
 
-/// A decode launch: its rows, and the mean tokens its rows' histories
-/// read.
+/// A decode launch: its rows; the mean tokens its rows that read (all
+/// but its front rows, whose reads are a later step's) read (`tokens`);
+/// its front rows (STEP_FRONT's bits: bit r where row r is a front row);
+/// and its acceptable rows (bit r where row r is a verify row, accepted
+/// where its guess stands). A launch's passes are of one form: front rows
+/// or acceptable rows, never both (`crate::BuiltForm`).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DecodeLaunch {
     pub(super) rows: usize,
+    /// Its rows' requests and positions, the first `rows` ([`Self::placed`]).
+    placed: [(RequestId, u64); VERIFY_ROWS as usize],
     pub(super) tokens: u64,
+    pub(super) front: u32,
+    pub(super) acceptable: u32,
+}
+
+impl DecodeLaunch {
+    /// Each row's request and position, rows in order: what a recording
+    /// load records it at (`RouteRecorder::record`).
+    pub(super) fn placed(&self) -> &[(RequestId, u64)] {
+        &self.placed[..self.rows]
+    }
+
+    /// Its depth: the most guessed rows it ran a sequence, front or
+    /// acceptable, the longest run of them (each sequence's follow its
+    /// exact row, `decode_rows`), 0 of a launch of none.
+    pub(super) fn depth(&self) -> usize {
+        let (mut guessed, mut depth) = (self.front | self.acceptable, 0);
+        while guessed != 0 {
+            guessed &= guessed << 1;
+            depth += 1;
+        }
+        depth
+    }
+
+    /// Whether its passes are verify passes: it ran acceptable rows.
+    pub(super) fn verifies(&self) -> bool {
+        self.acceptable != 0
+    }
 }
 
 /// A decode step completed: how its load records it, its launch, its
@@ -1119,6 +1483,11 @@ impl ExpertStep {
         self.sequence
     }
 
+    /// Its group where it is scratch-served ([`Steps::scratch_group`]).
+    pub(crate) fn scratch_group(&self) -> Option<ScratchGroup> {
+        self.shared.steps.scratch_group(self.sequence)
+    }
+
     /// Whether the step's runs time their blocks, each whose ends are
     /// marked (`Telemetry::samples`).
     pub fn samples(&self) -> bool {
@@ -1131,14 +1500,92 @@ impl ExpertStep {
         self.reads
     }
 
-    /// The step's decode launch: its rows, at `positions`, counted at its
-    /// rows' mean context (`Stack::live`), so rows of several sequences at
-    /// their own depths take theirs, not the first row's.
-    pub fn decoding(mut self, positions: impl ExactSizeIterator<Item = u64>) -> Self {
-        let rows = positions.len();
-        assert!(rows > 0, "a decode launch runs a row");
-        self.launch = Some(DecodeLaunch { rows, tokens: positions.map(|position| position + 1).sum::<u64>() / rows as u64 });
+    /// The step's decode launch: its `rows` ([`DecodeRow`]), each at its
+    /// position, of its request's pass, and, an ahead row, its
+    /// [`AheadOf`]; then the `padding` rows its class runs past them, which
+    /// the device routes as exact rows of the step: the interest ledger
+    /// learns them before the launch is
+    /// queued (`interest::Told::Began`), by which the rings' rows name the
+    /// step their names are for and the request whose pass ran them. Its
+    /// front rows (those that only run ahead, which their route resolves to
+    /// skip what the step does not hold, `resolve`) are STEP_FRONT's bits.
+    /// Each ahead row is noted on the read timeline (`ahead_row`: its
+    /// request, index and passes to exact), the key a pass's record joins
+    /// its guess's verdict by (`Shared::decided`). It is counted at the mean
+    /// context of its rows that are not front rows (`Stack::live`), so rows
+    /// of several sequences at their own depths take theirs, not the first
+    /// row's, and a front row, whose reads are a later step's, takes none.
+    /// Its class counts its sequences by their exact rows, one each, and
+    /// takes their mean history alone: a verification's acceptable rows are
+    /// rows of its sequence, not sequences of their own.
+    pub fn decoding(mut self, rows: impl ExactSizeIterator<Item = DecodeRow>, padding: usize) -> Self {
+        let count = rows.len();
+        assert!(count > 0, "a decode launch runs a row");
+        assert!((count + padding) as u64 <= magnitude_kernels::constants::VERIFY_ROWS, "a decode launch of {count} rows and {padding} padding");
+        let (mut front, mut acceptable, mut reading, mut tokens, mut sequences) = (0u32, 0u32, 0u64, 0u64, 0u32);
+        let mut verifying = [RequestId(0); VERIFY_ROWS as usize];
+        let mut verifying_requests = 0usize;
+        let rows = rows.collect::<Box<[_]>>();
+        for (index, row) in rows.iter().enumerate() {
+            let fronted = row.ahead.is_some_and(|ahead| ahead.front());
+            let accepts = row.ahead.is_some_and(|ahead| !ahead.front());
+            front |= u32::from(fronted) << index;
+            acceptable |= u32::from(accepts) << index;
+            if accepts && !verifying[..verifying_requests].contains(&row.request) {
+                verifying[verifying_requests] = row.request;
+                verifying_requests += 1;
+            }
+            if !fronted {
+                reading += 1;
+                tokens += row.position + 1;
+            }
+            sequences += u32::from(row.ahead.is_none());
+            if let Some(ahead) = row.ahead {
+                seismic_io::timeline::note(
+                    seismic_io::timeline::Kind::Noted("ahead_row"),
+                    self.sequence,
+                    (row.request.0 as i64, i64::from(ahead.row()), i64::from(ahead.exact_in())),
+                );
+            }
+        }
+        let mut placed = [(RequestId(0), 0); VERIFY_ROWS as usize];
+        for (at, row) in placed.iter_mut().zip(rows.iter()) {
+            *at = (row.request, row.position);
+        }
+        // Every pass runs its exact row in its launch (`AheadOf::new`), so a
+        // launch has a sequence, and a row that reads.
+        assert!(sequences > 0, "a decode launch of {count} rows runs no exact row");
+        assert!(front == 0 || acceptable == 0, "a decode launch's passes are of one form: front rows {front:#b}, acceptable rows {acceptable:#b}");
+        let advance = if acceptable != 0 {
+            crate::experts::horizon::Advance::Pending { requests: verifying_requests as u32 }
+        } else {
+            crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0))
+        };
+        self.shared.register_step(self.sequence, advance);
+        self.shared.tell(crate::experts::interest::Told::Began { step: self.sequence, launch: crate::experts::interest::Launched::Decode { rows, padding } });
+        self.launch = Some(DecodeLaunch { rows: count, placed, tokens: tokens / reading, front, acceptable });
         self
+    }
+
+    /// Its grouped launch's passes of `requests` run rows ahead (a
+    /// verification wider than the decode form): the interest ledger
+    /// learns them before the launch is queued (`interest::Told::Began`),
+    /// so each awaits its verdict by this step, as a decode launch's does.
+    /// Its rows name nothing ahead. Nothing is told of a launch without
+    /// one (a prompt chunk's).
+    pub fn guessing(self, requests: impl Iterator<Item = RequestId>) -> Self {
+        assert_eq!(self.route, StepRoute::Grouped, "a decode launch's rows ahead are its rows' (`Self::decoding`)");
+        let requests = requests.collect::<Box<[_]>>();
+        if !requests.is_empty() {
+            self.shared.tell(crate::experts::interest::Told::Began { step: self.sequence, launch: crate::experts::interest::Launched::Grouped(requests) });
+        }
+        self
+    }
+
+    /// Its front rows (STEP_FRONT's bits): none but of a decode launch
+    /// that has them.
+    pub fn front(&self) -> u32 {
+        self.launch.map_or(0, |launch| launch.front)
     }
 
     /// The step's load counts its decode.
@@ -1166,15 +1613,16 @@ impl ExpertStep {
         };
         let completion = CompletedStep { work: self.work, begun, route };
         let sequence = self.sequence;
-        if let Err(error) = shared.telemetry.complete_step(
-            &shared.steps,
-            sequence,
-            completion,
-            &|layer| shared.compute.sited(layer, sequence),
-            shared.priced().as_deref(),
-        ) {
-            shared.failed_completion(error);
-        }
+        // Told as the step ends, once its group's reads are feedable.
+        self.ending = Ending::Completed(
+            match shared.telemetry.complete_step(&shared.steps, sequence, completion, &|layer| shared.compute.sited(layer, sequence), shared.priced().as_deref()) {
+                Ok(routed) => routed,
+                Err(error) => {
+                    shared.failed_completion(error);
+                    None
+                }
+            },
+        );
         if let Some(reason) = shared.life.ended() {
             return Err(StepFailure::Watcher(reason));
         }
@@ -1240,7 +1688,7 @@ impl Drop for ExpertStep {
         if self.expired() {
             self.shared.steps.lock().tainted.insert(self.sequence);
         }
-        self.shared.end_step(self.sequence);
+        self.shared.end_step(self.sequence, std::mem::replace(&mut self.ending, Ending::Unrun));
     }
 }
 
@@ -1268,7 +1716,7 @@ struct Admission<'a> {
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
         for sequence in (self.next..).take(self.remaining) {
-            self.shared.end_step(sequence);
+            self.shared.end_step(sequence, Ending::Unrun);
         }
     }
 }
@@ -1277,7 +1725,7 @@ impl Shared {
     /// Step `sequence` has ended. Submission owners drain issued work before
     /// releasing a step: its parks retire before its routing record is free
     /// for another sequence.
-    fn end_step(&self, sequence: Step) {
+    fn end_step(&self, sequence: Step, ending: Ending) {
         self.parks.retire(sequence);
         self.telemetry.end_step(sequence);
         // A group is fed only once its every step has ended, its passes'
@@ -1290,6 +1738,13 @@ impl Shared {
             }
             self.telemetry.ended(ended);
         });
+        let completed = matches!(ending, Ending::Completed(_));
+        if let Ending::Completed(Some(DecodeRouting { chose, guesses })) = ending {
+            self.tell(crate::experts::interest::Told::Completed { step: sequence, chose, guesses });
+        }
+        // Told once the steps know it ended, so a ring of it read after this
+        // is drained finds it ended (`Steps::of_low_word`).
+        self.tell(crate::experts::interest::Told::Ended { step: sequence, completed });
     }
 }
 
@@ -1299,10 +1754,18 @@ impl ExpertStep {
     /// watcher and no layer: what a failed expert read leaves a step with,
     /// for the domain's failure tests.
     pub fn failed(reason: &str) -> Self {
+        let step = Self::unwatched();
+        step.shared.steps.fail(step.sequence, reason.to_owned());
+        step
+    }
+
+    /// A decode step of steps shared with no watcher and no layer: what a
+    /// fixture's flight runs in, for the domain's tests of what it tells
+    /// its bank by the step.
+    pub fn unwatched() -> Self {
         let shared = Self::unbanked(FlightDepth::PIPELINED, 1);
         let begun = shared.begin(Chain::one(()), |_| StepRoute::Decode, |_| LaunchWork::Generation, || Ok(false));
         let ((_, step), _) = begun.map_err(|(error, _)| error).unwrap().0.split_first();
-        shared.steps.fail(step.sequence, reason.to_owned());
         step
     }
 
@@ -1326,13 +1789,17 @@ impl ExpertStep {
             words,
             selected: 1,
             demand: 1,
-            reserve: 0,
             placer: crate::planning::Placer::Tier,
+            recording: false,
         };
         let steps = Arc::new(Steps::new(flights, places, crate::experts::exchange::Pulse::new()));
         let events = steps.events().clone();
+        let behind = crate::planning::FlightDepth::PIPELINED.steps(crate::experts::DEPTHS as u64) as usize + crate::experts::DEPTHS;
+        let time = crate::experts::horizon::Time::new(&[vec![1]], behind);
         Arc::new(Shared {
             steps,
+            time: time.clone(),
+            pending_verify: std::sync::Mutex::new(None),
             telemetry: Telemetry::new(
                 &[],
                 super::telemetry::GroupReadWords { layers: Vec::new(), places: 1 },
@@ -1340,11 +1807,13 @@ impl ExpertStep {
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 Vec::new(),
                 None,
-                crate::experts::reuse::Reuse::ranking(&[], &[], Vec::new()),
+                crate::experts::reuse::Reuse::ranking(&[], &[], &[], time),
                 Vec::new(),
                 false,
             ),
-            lent: super::lent::LentRecords::new(),
+            // No ledger drains it: what it is told is dropped.
+            told: std::sync::mpsc::channel().0,
+            lend: Default::default(),
             covers: Default::default(),
             resizing: ResizeHandoff::new(),
             traffic_held: Default::default(),
@@ -1367,7 +1836,9 @@ impl ExpertStep {
             landings: Default::default(),
             priced: std::sync::Mutex::new(None),
             passes: std::sync::Mutex::new(None),
+            prices: std::sync::Mutex::new(None),
             settled: Default::default(),
+            policy: Default::default(),
             promoted: Default::default(),
             copy: std::sync::Mutex::new(None),
         })
@@ -1556,54 +2027,21 @@ mod slot_tests {
             .map_err(|(error, _)| error)
     }
 
-    /// Spin until `ready`.
-    fn spin(what: &str, ready: impl Fn() -> bool) {
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while !ready() {
-            assert!(Instant::now() < deadline, "{what}");
-            std::thread::yield_now();
-        }
-    }
-
-    /// A scratch-served group that finds a copy into the lent records
-    /// running waits to begin; serving's end, after which no copy
-    /// completes, ends the wait, and the group cannot begin, for its reason.
+    /// A scratch-served group's lease is out from its begin until the
+    /// device is past it ([`State::lending`]), read alike outside the
+    /// steps' lock and under it, and it begins at once, waiting on no
+    /// record; a group that serves no scratch puts none out.
     #[test]
-    fn a_begin_waiting_for_a_copy_returns_once_serving_ends() {
-        let shared = ExpertStep::unbanked(FlightDepth::SERIAL, 2);
-        shared.lent.lock().copying();
-        let waiting = {
-            let shared = shared.clone();
-            std::thread::spawn(move || prompt(&shared, true))
-        };
-        spin("the group never waited", || shared.lent.lock().reserved());
-        shared.end_serving("serving ended".into());
-        assert_eq!(waiting.join().unwrap(), Err("serving ended".to_owned()));
-        assert!(!shared.lent.lock().reserved(), "an ended wait holds nothing");
-        assert_eq!(shared.steps.in_flight(), 0, "no step began");
-    }
-
-    /// While a scratch-served group waits for a copy into the lent records,
-    /// they count as reserved, so no promotion queues another copy into
-    /// them; once the copy running completes, the group begins holding
-    /// them. A group that serves no scratch reserves nothing and waits for
-    /// no copy.
-    #[test]
-    fn only_a_scratch_served_group_reserves_and_waits_for_the_copy_running() {
+    fn a_scratch_served_group_lends_from_its_begin_until_it_retires() {
         let shared = ExpertStep::unbanked(FlightDepth::SERIAL, 4);
-        shared.lent.lock().copying();
         assert_eq!(prompt(&shared, false), Ok(1), "a group serving no scratch begins at once");
-        assert!(!shared.lent.lock().reserved(), "and reserves nothing");
-        let waiting = {
-            let shared = shared.clone();
-            std::thread::spawn(move || prompt(&shared, true))
-        };
-        spin("the group never waited", || shared.lent.lock().reserved());
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        assert!(!waiting.is_finished(), "a group began beside a copy into its lent records");
-        shared.lent.copied();
-        assert_eq!(waiting.join().unwrap(), Ok(1));
-        assert!(shared.lent.lock().reserved(), "the group holds the lent records until it retires");
+        assert!(!shared.steps.lending(), "and lends nothing");
+        shared.steps.retire_groups(shared.steps.frontier());
+        assert_eq!(prompt(&shared, true), Ok(1), "a scratch-served group begins at once");
+        assert!(shared.steps.lending(), "its lease is out from its begin");
+        assert!(shared.steps.unbegun(Unbegun::lending), "under the steps' lock too");
+        shared.steps.retire_groups(shared.steps.frontier());
+        assert!(!shared.steps.lending() && !shared.steps.unbegun(Unbegun::lending), "and no longer once it retires");
     }
 }
 
@@ -1678,13 +2116,32 @@ mod order_tests {
         let park = steps.park(steps.at(3, 3, LAYERS).point, LAYERS);
         assert!(park.cut_in());
         assert_eq!(park.earlier, [None, None, Some((1, 2)), Some((1, 2))]);
-        assert_eq!(park.unresolved, [4; LAYERS], "the step cut in resolved every layer to its own");
+        assert_eq!(park.unresolved, [ParkFrom(4); LAYERS], "the step cut in resolved every layer to its own");
         assert!(!park.frees(2, 0, Step::MAX) && park.frees(2, 3, Step::MAX) && park.frees(1, 0, Step::MAX));
         let chain = steps.park(steps.at(1, 1, LAYERS).point, LAYERS);
         assert!(!chain.cut_in());
-        assert_eq!(chain.unresolved, [3, 2, 1, 1], "the step cut in, the chain's next, its first, its first");
+        assert_eq!(chain.unresolved, [3, 2, 1, 1].map(ParkFrom), "the step cut in, the chain's next, its first, its first");
         let last = steps.park(steps.at(2, 1, LAYERS).point, LAYERS);
-        assert_eq!(last.unresolved, [3, 3, 1, 1]);
+        assert_eq!(last.unresolved, [3, 3, 1, 1].map(ParkFrom));
+    }
+
+    /// A park's unmappings are stored from the exact first step yet to
+    /// resolve each layer, never pushed past a running scratch-served group,
+    /// so no step that resolves a layer after an unmapping reads the record
+    /// taken back; a mapping where the device may run anywhere is pushed
+    /// past that group, whose requests may be taken before its passes
+    /// resolve the map.
+    #[test]
+    fn a_park_unmaps_from_the_exact_first_unresolved_step_and_a_mapping_past_a_scratch_group() {
+        let steps = steps();
+        let decode = steps.begin_group(1, None);
+        let prompt = steps.begin_group(2, None);
+        steps.lock().groups.get_mut(&prompt).expect("the prompt group").scratch = true;
+        let parked = steps.at(decode, 1, LAYERS).point;
+        let park = steps.park(parked, LAYERS);
+        assert_eq!(park.unresolved, [prompt, prompt, decode, decode].map(ParkFrom), "the parked step's own from layer 2, the prompt group's below");
+        let mapped = steps.unresolved(parked, |unresolved| (0..LAYERS).map(|layer| unresolved.from(layer)).collect::<Vec<_>>());
+        assert_eq!(mapped, [MapFrom(prompt + 2); LAYERS], "past the prompt group, the first step not yet begun");
     }
 
     /// A record is served once each step it could serve is past its layer
@@ -1727,7 +2184,7 @@ mod order_tests {
             steps.end_played(step);
         }
         let chain = steps.after(1);
-        assert_eq!(steps.retire_groups(4), (Some(chain), 0));
+        assert_eq!(steps.retire_groups(4), Some(chain));
         assert_eq!(steps.after(1), Point::START, "a group forgotten is past");
     }
 

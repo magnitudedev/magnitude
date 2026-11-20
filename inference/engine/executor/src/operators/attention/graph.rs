@@ -48,7 +48,7 @@ use magnitude_kernels::{
 };
 use magnitude_state::{CodecSpec, HistoryEncoding, HistoryValue};
 use seismic::{
-    Argument, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor,
+    Argument, Dim, Element, NativeGraph, NativePort, WorkflowTensor,
     WorkflowTensorRef, WorkflowTensorView,
 };
 
@@ -180,18 +180,20 @@ pub(crate) fn dense_decodes(
     if !binding.shape.extends_base_form() {
         return Ok(true);
     }
-    let entry = attention_decode::native_entry_with(attention_decode::Elements {
-        A: binding.activation,
-    });
-    match crate::native::entry_statics(
+    let elements = [("A", binding.activation)];
+    let statics = binding.shape.dense_mix_statics();
+    match <attention_decode::Entry as seismic::EntryContract>::contract_scratch_configs(
         backend,
-        &entry,
-        &format!("{:?}", binding.shape),
-        &binding.shape.dense_mix_statics(),
+        &elements,
+        &statics,
     ) {
         Ok(_) => Ok(true),
-        Err(crate::native::CatalogFailure::KernelDomain { .. }) => Ok(false),
-        Err(error) => Err(error),
+        Err(seismic::ContractError::DomainViolation) => Ok(false),
+        Err(error) => Err(crate::native::CatalogFailure::Preparation {
+            entry: <attention_decode::Entry as seismic::Entry>::NAME,
+            bindings: format!("{:?}", binding.shape),
+            outcome: error.to_string(),
+        }),
     }
 }
 
@@ -338,17 +340,19 @@ impl CheckedPickedEntries {
         })
     }
 
-    fn entries(&self) -> PickedEntries<'_, NativeGraphMetadata> {
+    fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> PickedEntries<'_, G> {
         PickedEntries {
             rows: self.elements.rows.as_ref().map(|rows| PooledEntries {
-                project: &rows.project[..],
-                widen: &self.activation[..],
+                project: G::bind_ranged(&rows.project[..]),
+                widen: G::bind(&self.activation[..]),
                 pool: match rows.pooling {
-                    Pooling::Identity => PoolEntry::Identity(&self.activation[..]),
-                    Pooling::Grouped => PoolEntry::Grouped(&self.pool[..]),
+                    Pooling::Identity => PoolEntry::Identity(G::bind(&self.activation[..])),
+                    Pooling::Grouped => PoolEntry::Grouped(G::bind(&self.pool[..])),
                 },
-                key_project: &rows.key_project[..],
-                keys: &self.activation[..],
+                key_project: G::bind_ranged(&rows.key_project[..]),
+                keys: G::bind(&self.activation[..]),
             }),
             indexer: self.indexer.entries(),
         }
@@ -369,13 +373,22 @@ impl CheckedIndexerEntries {
         Self { elements, activation: [("A", activation)] }
     }
 
-    fn entries(&self) -> IndexerEntries<'_, NativeGraphMetadata> {
+    fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> IndexerEntries<'_, G> {
         IndexerEntries {
-            query_project: &self.elements.query_project[..],
-            weights_project: self.elements.weights_project.as_ref().map(|elements| &elements[..]),
-            score: &self.activation[..],
-            topk: &[],
-            candidates: self.elements.produces().then_some(CandidateEntries { blocks: &[], rows: &[] }),
+            query_project: G::bind_ranged(&self.elements.query_project[..]),
+            weights_project: self
+                .elements
+                .weights_project
+                .as_ref()
+                .map(|elements| G::bind_ranged(&elements[..])),
+            score: G::bind(&self.activation[..]),
+            topk: G::bind(&[]),
+            candidates: self.elements.produces().then_some(CandidateEntries {
+                blocks: G::bind(&[]),
+                rows: G::bind(&[]),
+            }),
         }
     }
 }
@@ -408,14 +421,17 @@ impl CheckedSelectionEntries {
         }
     }
 
-    fn entries<'a>(&'a self, prefill: SelectedPrefillEntries<'a, NativeGraphMetadata>) -> SelectionGraphEntries<'a, NativeGraphMetadata> {
+    fn entries<'a, G: crate::programs::graph::draft::ElementBoundDraft + 'a>(
+        &'a self,
+        prefill: SelectedPrefillEntries<'a, G>,
+    ) -> SelectionGraphEntries<'a, G> {
         SelectionGraphEntries {
-            project: &self.project[..],
-            widen: &self.activation[..],
-            pool: &self.pool[..],
+            project: G::bind_ranged(&self.project[..]),
+            widen: G::bind(&self.activation[..]),
+            pool: G::bind(&self.pool[..]),
             indexer: self.indexer.entries(),
-            reads: &[],
-            rows: &[],
+            reads: G::bind(&[]),
+            rows: G::bind(&[]),
             prefill,
         }
     }
@@ -529,50 +545,52 @@ impl CheckedAttentionEntries {
         })
     }
 
-    pub(crate) fn entries(&self) -> Result<AttentionGraphEntries<'_, NativeGraphMetadata>, String> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> Result<AttentionGraphEntries<'_, G>, String> {
         let history = match self.history.encoding() {
             HistoryEncoding::Dense => AttentionHistoryEntries::Dense {
                 codec: self.history,
-                append: &self.mix[..],
+                append: G::bind(&self.mix[..]),
                 decode: if self.decodes {
-                    DenseDecodeEntries::Decode(&self.mix[..])
+                    DenseDecodeEntries::Decode(G::bind(&self.mix[..]))
                 } else {
-                    DenseDecodeEntries::Prefill(&self.mix[..])
+                    DenseDecodeEntries::Prefill(G::bind(&self.mix[..]))
                 },
-                prefill: &self.mix[..],
+                prefill: G::bind(&self.mix[..]),
             },
             HistoryEncoding::Affine => AttentionHistoryEntries::AffineK8V4 {
                 codec: self.history,
-                append: &self.mix[..],
-                decode: &self.mix[..],
-                prefill: &self.mix[..],
-                prefill_listed: self.lists.then_some(&self.mix[..]),
+                append: G::bind(&self.mix[..]),
+                decode: G::bind(&self.mix[..]),
+                prefill: G::bind(&self.mix[..]),
+                prefill_listed: self.lists.then(|| G::bind(&self.mix[..])),
             },
             HistoryEncoding::Unsupported => {
                 return Err("rotated K4/V4 has no native attention entry".into());
             }
         };
         Ok(AttentionGraphEntries {
-            project: &self.project,
+            project: G::bind_ranged(&self.project),
             history,
             output: match &self.post_norm {
-                None => TailEntries::Residual(&self.output[..]),
+                None => TailEntries::Residual(G::bind_ranged(&self.output[..])),
                 Some(post_norm) => TailEntries::PostNorm(post_norm.entries()),
             },
-            grouped: self.grouped.as_ref().map(|grouped| &grouped[..]),
-            absorbed: self.absorbed.as_ref().map(|absorbed| &absorbed[..]),
+            grouped: self.grouped.as_ref().map(|grouped| G::bind_ranged(&grouped[..])),
+            absorbed: self.absorbed.as_ref().map(|absorbed| G::bind_ranged(&absorbed[..])),
             selection: self.selection.as_ref().map(|selection| {
                 selection.entries(match self.history.encoding() {
-                    HistoryEncoding::Affine => SelectedPrefillEntries::AffineK8V4(&self.mix[..]),
-                    _ => SelectedPrefillEntries::Dense(&self.mix[..]),
+                    HistoryEncoding::Affine => SelectedPrefillEntries::AffineK8V4(G::bind(&self.mix[..])),
+                    _ => SelectedPrefillEntries::Dense(G::bind(&self.mix[..])),
                 })
             }),
             low_rank_query: self
                 .low_rank_query
                 .as_ref()
                 .map(|(widen, project)| LowRankQueryEntries {
-                    widen: &widen[..],
-                    project: &project[..],
+                    widen: G::bind(&widen[..]),
+                    project: G::bind_ranged(&project[..]),
                 }),
             picked: self.picked.as_ref().map(CheckedPickedEntries::entries),
         })

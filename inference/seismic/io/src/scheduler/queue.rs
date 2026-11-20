@@ -230,8 +230,8 @@ impl Link {
     /// The request whose next piece may start now, and how it stands:
     /// the more urgent of the two maps' due heads, where the due bytes in
     /// flight leave it room; else, where no parked piece is queued, the
-    /// head read ahead, where the bytes in flight it is counted against
-    /// leave it room ([`admits`]). A due head held back at the due depth
+    /// head read ahead, where the parked bytes and those read ahead in
+    /// flight leave it room ([`admits`]). A due head held back at the due depth
     /// holds back the due pieces behind it, a parked one everything read
     /// ahead too; a streamed one holds back nothing read ahead.
     fn next(&self) -> Option<((Want, u64), Standing)> {
@@ -293,10 +293,10 @@ impl Link {
 /// `flight` by `shape`'s depths ("Order and depth"): a due piece while the
 /// due bytes in flight, parked and streamed, leave it room under the due
 /// depth; a piece read ahead (the caller's to know that nothing parked
-/// waits) while the parked bytes and those read ahead leave it room under
-/// the knee: a stream's bytes are its own, at the rate the stream takes.
-/// A piece past its depth starts where nothing it is counted against is in
-/// flight.
+/// is queued) while the parked bytes in flight and those read ahead leave
+/// it room under the knee, so it may start beside parked pieces in flight:
+/// a stream's bytes are its own, at the rate the stream takes. A piece past
+/// its depth starts where nothing it is counted against is in flight.
 fn admits(flight: InFlight, shape: &Shape, bytes: u64, standing: Standing) -> bool {
     let (counted, depth) = match standing {
         Standing::Parked | Standing::Streamed => (flight.parked + flight.streamed, shape.due),

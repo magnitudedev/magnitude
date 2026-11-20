@@ -25,7 +25,7 @@ mod table;
 use super::resources::FlightDepth;
 use super::weights::WeightPlan;
 use crate::memory::ClaimDemand;
-use magnitude_kernels::{SlotTable, constants, list_extent};
+use magnitude_kernels::{SlotTable, constants};
 use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use seismic::Element;
 use std::num::NonZeroU64;
@@ -99,6 +99,12 @@ pub struct BankLayer {
     /// hint_kinds`): every streamed layer's are alike, kinds and elements,
     /// as the entries read the next layer's weights as their own.
     pub hinted: Vec<HintWeight>,
+    /// For fused routed layers whose `routed_output` kernel fuses `SharedDown`
+    /// with `ExpertDown`, the `SharedDown` weight's `(resident, resident_bytes,
+    /// shape)` key so layers with distinct `SharedDown` quants/shapes get
+    /// distinct `RoutedKind`s (`Self::routed_kinds`). `None` for non-fused
+    /// layers where `SharedDown` runs in its own `dense_output` call.
+    pub shared_down: Option<(Element, u64, Vec<u64>)>,
 }
 
 /// A weight a streamed layer's route reads of the layer it predicts: its
@@ -215,6 +221,44 @@ pub struct ExpertBankPlan {
     pub tables: Vec<BankTable>,
     /// Which layers hold a CPU site's words and buffers ([`Self::sited`]).
     pub sites: BankSites,
+    /// Its model store's path as the plan priced it ([`BankPaths`]).
+    pub paths: BankPaths,
+    /// Whether the load traces its routes (`ModelLoadPlan::recorded_routes`,
+    /// `watcher::routes`): every layer keeps its key records beside its
+    /// routing records (`BankPart::Keys`) whatever it traces, since
+    /// placement ranks by them.
+    pub recording: bool,
+}
+
+/// A bank's model store's path as its plan priced it: its stored read line
+/// and the free records its moves need at the plan's slots
+/// (`BankPrices::paths`), its reads ahead's staging
+/// ([`ExpertBankPlan::hint_records`]) and the tier's reserve
+/// ([`ExpertBankPlan::tier_reserve`]); or unpriced, a bank planned before
+/// the machine's figures were measured, which reads nothing ahead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BankPaths {
+    Unpriced,
+    Priced { line: magnitude_cost_model::ReadLine, records: magnitude_cost_model::PathRecords },
+}
+
+impl BankPaths {
+    /// The free records its path needs: none unpriced, or where its line
+    /// gives no rate (`PathRecords::of`).
+    pub fn records(&self) -> magnitude_cost_model::PathRecords {
+        match self {
+            Self::Unpriced => magnitude_cost_model::PathRecords::NONE,
+            Self::Priced { records, .. } => *records,
+        }
+    }
+
+    /// The stored read line it was priced on.
+    pub fn line(&self) -> Option<magnitude_cost_model::ReadLine> {
+        match self {
+            Self::Unpriced => None,
+            Self::Priced { line, .. } => Some(*line),
+        }
+    }
 }
 
 impl BankLayer {
@@ -308,13 +352,17 @@ impl<'a> IntoIterator for &'a BankLayers {
 
 /// The leads a streamed layer's route predicts at: the layers one and two
 /// ahead, each over the post-attention residual through that layer's router
-/// (the gate-ahead), each candidate priced at its own lead
-/// (`experts::watcher::telemetry::HintPrice`). A second lead pays where
-/// wrong reads are cheap: GB10's read engine on the reference routing's
-/// exact hints, 28.9 ms a step against 32.2 at one lead (a third adds 0.6
-/// ms); on an M4 Pro it is even (45.0 against 45.1), and its pricing admits
-/// what pays.
-pub const HINT_LEADS: u64 = 2;
+/// (the gate-ahead), each candidate priced by its lead's measured
+/// precision (`experts::interest::Ledger`). It is the hint form's maximum,
+/// not a choice, and the kernels' own (`streaming_words.seismic`): the hint
+/// kernels (`routed_hint_route`, `routed_hint_select`) bind the routers of
+/// the next and the after layer and declare `AHEAD <= HINT_LEADS`, so no
+/// launch hints further. Whether a layer's leads run is priced live, never
+/// fixed here: the hint gate
+/// (`experts::watcher::gate`) runs a layer's launch where what its leads'
+/// named misses save a pass, summed, exceeds the launch's price; a lead
+/// is not gated alone, as one launch at a fixed `AHEAD` computes them all.
+pub use magnitude_kernels::constants::HINT_LEADS;
 
 /// What a streamed routed layer's bank entries are specialized to: its
 /// group's record form and records, and the bank's word and staging
@@ -405,27 +453,22 @@ impl RegionWords {
         SlotTable::scratch(self.flight, self.rounds)
     }
 
-    /// `RING`: a hint ring's words, an entry (its expert and its rank,
-    /// HINT_ENTRY_WORDS) for every choice.
+    /// `RING`: a hint ring's words, an entry (its expert, rank, batch row
+    /// and gate weight, HINT_ENTRY_WORDS) for every choice (HINT_ENTRY).
     pub fn ring_words(&self) -> u64 {
-        constants::RING_EXPERTS + constants::HINT_ENTRY_WORDS * self.choices
+        constants::HINT_ENTRY(self.choices)
     }
 
-    /// A routing record's words, RING_EXPERTS + 2 P: each choice's expert
-    /// and each choice's source (`routed_route_streamed`'s `routing`).
+    /// A routing record's words (ROUTING_WORDS): each choice's expert and
+    /// each choice's source (`routed_route_streamed`'s `routing`).
     pub fn routing_words(&self) -> u64 {
-        constants::RING_EXPERTS + 2 * self.choices
-    }
-
-    /// The word of a routing record holding choice `choice`'s expert.
-    pub fn routing_expert(&self, choice: u64) -> u64 {
-        constants::RING_EXPERTS + choice
+        constants::ROUTING_WORDS(self.choices)
     }
 
     /// The word of a routing record holding choice `choice`'s source as its
-    /// route resolved it, after every choice's expert.
+    /// route resolved it, after every choice's expert (ROUTING_SOURCE).
     pub fn routing_source(&self, choice: u64) -> u64 {
-        constants::RING_EXPERTS + self.choices + choice
+        constants::ROUTING_SOURCE(self.choices, choice)
     }
 }
 
@@ -647,6 +690,17 @@ impl ExpertBankPlan {
             .then_some(target)
     }
 
+    /// Each streamed layer's routed kind, in decoder order: one numbering
+    /// of the load's, by what makes two layers' routed calls alike in every
+    /// form (their record group, their experts, whether a CPU site serves
+    /// them, and for fused `routed_output` layers their `SharedDown` weight),
+    /// by which its routed passes are priced (`magnitude_cost_model::RoutedKind`).
+    pub fn routed_kinds(&self) -> Vec<magnitude_cost_model::RoutedKind> {
+        magnitude_cost_model::RoutedKind::number(self.layers().iter().enumerate().map(|(index, layer)| {
+            (layer.group, layer.experts, self.sited(index), layer.shared_down.as_ref())
+        }))
+    }
+
     /// The streamed layer whose hinted weights layer `layer`'s route binds
     /// at lead `lead`: the layer it predicts there ([`Self::hints`]); past
     /// the leads it has, which the route does not read, the next layer it
@@ -798,32 +852,43 @@ impl ExpertBankPlan {
         }
     }
 
-    /// Staging records hints may hold beyond the demand reserve: 2K, twice
-    /// the experts a token selects per layer, and so the tier's reserve
-    /// ([`Self::tier_reserve`]). Underived (ledger L30),
-    /// pending the read-ahead design: it is to follow from that design's
-    /// lead and precision, the planner reading the stored measurement
-    /// records (read line, device peak, resident step). Derived from today's
-    /// hints, 40–51% of whose reads go unused, it would grow the wrong
-    /// thing.
+    /// The stored bytes of the least move its model store's path makes: an
+    /// expert of the group whose experts store fewest, which the path moves
+    /// at the most records a second, so the records it sizes
+    /// ([`magnitude_cost_model::PathRecords::of`]) cover every group's.
+    pub fn least_move_bytes(&self) -> Result<u64, String> {
+        let moves = self
+            .groups()
+            .iter()
+            .map(|group| group.record.iter().map(|(_, tensor)| tensor.stored_bytes()).sum::<Result<u64, String>>())
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(moves.into_iter().min().expect("a bank has a group"))
+    }
+
+    /// Staging records reads ahead may hold beyond the demand reserve: the
+    /// moves the path has in flight at its rate, each from its issue to its
+    /// landing ([`magnitude_cost_model::PathRecords::ahead`]).
     pub fn hint_records(&self) -> u64 {
-        2 * self.selected()
+        self.paths.records().ahead
     }
 
     /// The tier records each group keeps holding no expert mapped (ready,
     /// graced, or taken by a read ahead's landing in flight:
-    /// `HostRecords::reserved`): the reads ahead's, a record for each staging
-    /// record beyond demand's ([`Self::hint_records`]), so every read
-    /// ahead's landing finds one. A read ahead lands off any park, so it can
+    /// `HostRecords::reserved`): the path's moves in flight and those landed
+    /// whose victims the device still reads, until it passes their layer, at
+    /// most a decode step at the plan's slots
+    /// ([`magnitude_cost_model::PathRecords::reserve`]), so no read ahead's
+    /// landing is ever short of a record. A read ahead lands off any park, so it can
     /// take only a record no step reads already; a demand landing, at its
-    /// park, takes a ready one or reclaims a kept one the parked step does
-    /// not read (`Directory::claim_demand`), so it needs none kept for it.
+    /// park, reclaims a kept one the parked step does not read
+    /// (`Directory::claim_demand`), so it needs none kept for it and takes
+    /// none of these while it can reclaim.
     /// Where the host places (unified memory) the tier is the bank's own
     /// records, which each group holds beside its slots: the one count of
     /// what the bank holds empty, which the plan charges and the bank's
     /// telemetry leaves out of the records its experts are held in.
     pub fn tier_reserve(&self) -> u64 {
-        self.hint_records()
+        self.paths.records().reserve
     }
 
     /// Records a scratch round converts: half the decode set (the most
@@ -863,10 +928,10 @@ impl ExpertBankPlan {
     }
 
     /// Words of a scratch round's landing list (`routed_round`,
-    /// `magnitude_kernels::landing_extent`): its head, then an entry per record it converts,
+    /// LANDING_ENTRY): its head, then an entry per record it converts,
     /// (conveyor record or scratch slot, scratch slot, DONE).
     pub fn round_list_words(&self) -> u64 {
-        magnitude_kernels::landing_extent(self.round_records())
+        magnitude_kernels::constants::LANDING_ENTRY(self.round_records())
     }
 
     /// Words of the tier list and the seed list (`routed_copy` from the host
@@ -874,7 +939,7 @@ impl ExpertBankPlan {
     /// bank records, then `routed_seed_commit`): the sequence and count,
     /// then a pair per expert, at most a window's slots.
     pub fn expert_list_words(&self) -> u64 {
-        list_extent(self.window_slots())
+        constants::LIST_ENTRY(self.window_slots())
     }
 
     /// The least `slots` a load of this bank holds, and the least a shrink

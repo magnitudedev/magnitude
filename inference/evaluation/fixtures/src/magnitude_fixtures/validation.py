@@ -1,14 +1,14 @@
-"""Answer validation against a fixture's ``generation.expected``.
+"""Answer validation against a session's ``generation.expected``, keyed by template key.
 
 - ``tools``: ``{"calls": [{"name", "arguments": {key: [allowed values]}}]}``. Each generated
   call must match a distinct expected call; an argument may be omitted only when ``""`` or
   ``null`` is among its allowed values (BFCL possible-answer semantics).
-- ``retrieval``: ``{"values": {key: value}}``. The answer must be a JSON object of strings
+- ``retrieve``: ``{"values": {key: value}}``. The answer must be a JSON object of strings
   with no duplicate keys; it is exact when it equals the expected values.
-- ``prose-repeat``: ``{"text": …}`` is the canonical repeat; ``prose-shift``: ``{"text": …}``
-  is the words its answer repeats before and after new writing; ``prose-continue``: ``{}``.
-  Prose answers are valid when they contain text; the serving benchmark judges finish
-  reasons against its output budget.
+- ``repeat``: ``{"text": …}`` is the canonical repeat; ``twist``: ``{"text": …}`` is the
+  words its answer repeats before and after new writing; ``code``: ``{}``. Text answers
+  are valid when they contain text; the serving benchmark judges finish reasons against its
+  output budget.
 """
 
 import json
@@ -16,7 +16,7 @@ import json
 from pydantic import Field
 
 from .canonical import Record, encoded
-from .tools import ExpectedCall
+from .bfcl import ExpectedCall
 
 
 class GeneratedCall(Record):
@@ -94,7 +94,7 @@ def tool_calls(expected: dict, actual: list[GeneratedCall]) -> str | None:
     return None
 
 
-def retrieval(expected: dict, text: str) -> RetrievalScore:
+def retrieve(expected: dict, text: str) -> RetrievalScore:
     values: dict[str, str] = expected["values"]
 
     def unique_object(pairs):

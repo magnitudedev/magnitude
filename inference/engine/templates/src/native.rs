@@ -50,6 +50,13 @@ extern "C" {
         output: *mut Buffer,
         error: *mut Buffer,
     ) -> i32;
+    fn templates_template_probe(
+        handle: u64,
+        input: *const u8,
+        size: u64,
+        output: *mut Buffer,
+        error: *mut Buffer,
+    ) -> i32;
     fn templates_request_create(
         handle: u64,
         json: *const u8,
@@ -210,10 +217,48 @@ impl Drop for Handle {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateMetadata {
+    pub capabilities: BTreeMap<String, bool>,
+    pub handler_context_variables: Vec<String>,
+    pub template_reasoning_identifiers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeSignature {
+    pub prompt: String,
+    pub generation_prefix: String,
+    pub parser_hash: String,
+    pub grammar_hash: String,
+    pub supports_thinking: bool,
+    pub thinking_start: String,
+    pub thinking_ends: Vec<String>,
+}
+
+fn encode_request_payload(request: &Request) -> Result<Vec<u8>, Error> {
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        version: u32,
+        #[serde(flatten)]
+        request: &'a Request,
+    }
+    encode(&Payload {
+        version: 1,
+        request,
+    })
+}
+
 pub struct Template {
     handle: Handle,
     identity: String,
 }
+// SAFETY: Every `&self` method on `Template` delegates to a thread-safe native
+// ABI entry point (either serialized by the native mutex or, for
+// `templates_template_probe`, holding a refcounted immutable template state
+// with per-template mutexes on internal caches and thread-local scratch), and
+// `Drop` requires `&mut self`.
+unsafe impl Sync for Template {}
 impl Template {
     pub fn new(source: &str, special_tokens: &SpecialTokens) -> Result<Self, Error> {
         let build = build_info()?;
@@ -235,20 +280,33 @@ impl Template {
     pub fn identity(&self) -> &str {
         &self.identity
     }
-    pub fn capabilities(&self) -> Result<BTreeMap<String, bool>, Error> {
+    pub fn inspect_metadata(&self) -> Result<TemplateMetadata, Error> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct Capabilities {
+        struct Inspection {
             version: u32,
             capabilities: BTreeMap<String, bool>,
+            handler_context_variables: Vec<String>,
+            template_reasoning_identifiers: Vec<String>,
         }
-        let result: Capabilities = decode(&output(|o, e| unsafe {
+        let result: Inspection = decode(&output(|o, e| unsafe {
             templates_template_inspect(self.handle.id, o, e)
         })?)?;
         if result.version != 1 {
             return Err(Error::incompatible("capability payload version"));
         }
-        Ok(result.capabilities)
+        Ok(TemplateMetadata {
+            capabilities: result.capabilities,
+            handler_context_variables: result.handler_context_variables,
+            template_reasoning_identifiers: result.template_reasoning_identifiers,
+        })
+    }
+    pub fn capabilities(&self) -> Result<BTreeMap<String, bool>, Error> {
+        Ok(self.inspect_metadata()?.capabilities)
+    }
+    /// Context variables read outside Jinja by the specialized native handler matching this template.
+    pub fn handler_context_variables(&self) -> Result<Vec<String>, Error> {
+        Ok(self.inspect_metadata()?.handler_context_variables)
     }
     pub fn render(&self, context: &Map<String, Value>, now: i64) -> Result<String, Error> {
         let payload = encode(&serde_json::json!({"version":1,"context":context,"now":now}))?;
@@ -257,17 +315,15 @@ impl Template {
         })?;
         String::from_utf8(bytes).map_err(|_| Error::incompatible("native prompt is not UTF-8"))
     }
+    pub fn prepare_probe(&self, request: &Request) -> Result<ProbeSignature, Error> {
+        let payload = encode_request_payload(request)?;
+        // SAFETY: borrowed payload lives through the call, output/error are initialized.
+        decode(&output(|o, e| unsafe {
+            templates_template_probe(self.handle.id, payload.as_ptr(), payload.len() as u64, o, e)
+        })?)
+    }
     pub fn prepare(&self, request: &Request) -> Result<PreparedRequest, Error> {
-        #[derive(Serialize)]
-        struct Payload<'a> {
-            version: u32,
-            #[serde(flatten)]
-            request: &'a Request,
-        }
-        let payload = encode(&Payload {
-            version: 1,
-            request,
-        })?;
+        let payload = encode_request_payload(request)?;
         let handle = Handle::create(Kind::Request, |o, e| unsafe {
             templates_request_create(self.handle.id, payload.as_ptr(), payload.len() as u64, o, e)
         })?;

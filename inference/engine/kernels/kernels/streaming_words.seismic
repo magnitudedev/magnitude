@@ -27,13 +27,35 @@
 #
 # The step word `step[STEP_WORDS]`: the step's sequence (`routed_step`, from
 # the host's `sequence[STEP_WORDS]`, written before the step is submitted),
-# its low word (STEP_LOW) then its high word (STEP_HIGH). The device writes
-# and reads it in order within its queue; the words that tell steps apart
-# only within a flight and that nothing waits on (routing records, hint
-# rings, lists) carry its low word.
+# its low word (STEP_LOW) then its high word (STEP_HIGH), then the step's
+# front rows (STEP_FRONT): bit r set where decode row r is a front row, the
+# provisional row of a two-row decode pass, which computes only the choices
+# of an expert the step holds or an exact row chooses and reads ahead the
+# rest (`resolve`); 0 for a step without one. A front row r is paired with the
+# exact row r - 1 before it (a two-row slot's rows are its exact row, then
+# its front row), so bit 0 is never set. Then the kind of each front row's
+# guess (STEP_GUESSES), the device's alone (`routed_step`, at the step's
+# first streamed layer, before any ring of the step is written; the host's
+# `sequence` word there is never read): front row r's field, the
+# STEP_GUESS_BITS bits from bit STEP_GUESS_SHIFT(r), holds its guess's kind
+# (guess.seismic's GUESS_CHAINED, GUESS_HEAD), the predictor that made it
+# at the tail of the step before, 0 for a row that is no front row; a front
+# row is below VERIFY_ROWS (the host asserts it as it writes STEP_FRONT), so
+# every field fits (`magnitude_kernels`' const asserts). It changes nothing
+# the device computes: the host prices a front row's names by its guess's
+# kind, reading the word from every ring the step writes (RING_GUESSES).
+# The device writes and reads the step word in order within its queue; the words that tell steps apart only within a
+# flight and that nothing waits on (routing records, hint and front rings,
+# lists) carry its low word.
 const STEP_LOW = 0
 const STEP_HIGH = 1
-const STEP_WORDS = 2
+const STEP_FRONT = 2
+const STEP_GUESSES = 3
+const STEP_WORDS = 4
+
+# A front row's field of STEP_GUESSES: its bits, and row `R`'s first bit.
+const STEP_GUESS_BITS = 2
+const STEP_GUESS_SHIFT(R) = STEP_GUESS_BITS * R
 
 # The map. A layer's map is `map[E, MAP_WORDS]`, the layer's rows of its
 # group's map `map[GM, MAP_WORDS]` from its home (`policy[POLICY_HOME]`):
@@ -77,25 +99,33 @@ const MAP_WORDS = 6
 #   and the handshake a request adds (POLICY_HANDSHAKE_NS);
 # - the GPU's: an expert of r rows read in place from the host tier,
 #   max(POLICY_LINK_NS, r POLICY_LINK_ROW_NS), and from the bank,
-#   max(POLICY_HIT_NS, r POLICY_HIT_ROW_NS).
+#   max(POLICY_HIT_NS, r POLICY_HIT_ROW_NS);
+# - the link's: what the step's moves (promotions into the bank) hold it,
+#   a layer's share (POLICY_LINK_BUSY_NS), none where nothing moves.
 # POLICY_PRICED is set once every line the assignment reads is measured;
 # until then no line is written nor read, and a layer without a site never
-# reads the CPU's. Last, whether no expert of the layer can be absent
+# reads the CPU's. Then whether no expert of the layer can be absent
 # (POLICY_RESOLVED, nonzero: its group is whole, or its group's host tier
 # keeps every expert), so no step's route can request the file and the
 # landing launch (`routed_land`) is not encoded, nor its park where parks
 # are submission boundaries.
+# Last, whether the layer's hint launches run (POLICY_HINTS, nonzero), a
+# condition of the graph the host reads as it queues a step: the device
+# never reads it.
 #
 # The assignment (`assign` in routed.seismic), per step on the device, is
 # the cost function's (`ExpertLines::serve` at one step's choices, nothing
 # copied, every record whole at the router), stated once here: each
 # distinct expert's rows r are the choices naming it. The GPU's queue
 # starts at its hits, the sum over the distinct hit experts of their
-# resident lines; the CPU's at zero. The distinct missed experts (those the
+# resident lines, and a read in place at no sooner than POLICY_LINK_BUSY_NS,
+# the link held by the moves before it; the CPU's at zero. The distinct
+# missed experts (those the
 # tier holds; across a link also those it lacks, which land in it first)
 # are taken by rows, most first, ties in choice order; each goes to the CPU
 # when it ends there no later than in place (its line, plus the handshake
-# for the CPU's first), else to the GPU in place. Until POLICY_PRICED is set
+# for the CPU's first), else to the GPU in place: the miss goes where the
+# makespan of the GPU, the link and the CPU ends least. Until POLICY_PRICED is set
 # (every line it reads measured, a site's CPU lines among them) no miss is
 # assigned: every one is the GPU's in place, the CPU site off. Every choice
 # of an expert goes to its expert's side.
@@ -110,7 +140,16 @@ const POLICY_LINK_ROW_NS = 7
 const POLICY_HIT_NS = 8
 const POLICY_HIT_ROW_NS = 9
 const POLICY_RESOLVED = 10
-const POLICY_WORDS = 11
+const POLICY_HINTS = 11
+const POLICY_LINK_BUSY_NS = 12
+const POLICY_WORDS = 13
+
+# A routing weight as the words carry it (a ring entry's HINT_WEIGHT): its
+# magnitude's f32 bits, the sign cleared on the device where the entry is
+# written, so -0.0 is +0 and the word is never negative. A nonnegative
+# float's bits order as its value, so two weights' words compare as their
+# magnitudes do, exactly and alike on every backend, with no rounding; a
+# heavy weight is heavy by magnitude.
 
 # The exchange: the one protocol by which the device
 # asks the host for anything and waits for its answer. Every request is a
@@ -193,7 +232,7 @@ const PULSE_SPINS = 1500000
 # The site kind: a sited layer's misses the route gave the CPU
 # (`routed_site_request`, then the combine's wait), each a tensor of the
 # layer:
-# - `site[FLIGHT, R]` (R >= SITE_ENTRIES + SITE_ENTRY_WORDS M K, even), the
+# - `site[FLIGHT, R]` (R >= SITE_ENTRY(M K), even), the
 #   slots. The request's payload: the count of entries (SITE_COUNT), then
 #   each entry from SITE_ENTRIES: the decode row it serves (SITE_ROW), the
 #   host tier record the CPU computes it from (SITE_TIER_RECORD), the expert
@@ -216,6 +255,10 @@ const SITE_EXPERT = 2
 const SITE_WEIGHT_BITS = 3
 const SITE_ENTRY_WORDS = 4
 
+# The first word of a site request's entry `C` (the host's `SlotTable::site`):
+# a request of C entries ends there.
+const SITE_ENTRY(C) = SITE_ENTRIES + SITE_ENTRY_WORDS * C
+
 # A decode step's sources at a layer, the route's snapshot
 # `sources[SOURCE_ROWS, M, K]` every later entry of the layer reads: each
 # choice's record the GPU reads (SOURCE_RECORD: a bank record >= 0, a tier
@@ -228,7 +271,7 @@ const SOURCE_ROWS = 2
 
 # The file kind: a decode layer's experts neither its bank nor its tier
 # holds (file misses, which land first), its table `file[FLIGHT, FW]` (FW >=
-# FILE_ENTRIES + FILE_ENTRY_WORDS P, even; P the decode form's widest
+# FILE_ENTRY(P), even; P the decode form's widest
 # choices), the slots. The payload: the count of choices (FILE_COUNT), then
 # each choice's entry from FILE_ENTRIES, FILE_ENTRY_WORDS words: the
 # request's word (FILE_CHOICE, `routed_route_streamed`'s), an absent
@@ -245,9 +288,12 @@ const FILE_CHOICE = 0
 const FILE_RECORD = 1
 const FILE_ENTRY_WORDS = 2
 
-# A landing list `landing[LANDING_ENTRIES + LANDING_ENTRY_WORDS L]`
-# (host-shared, the host's `landing_extent`): the records one landing
-# launch converts as their reads land, a decode layer's (`routed_land`, its
+# The first word of a file request's choice `C`: a request of C choices
+# ends there.
+const FILE_ENTRY(C) = FILE_ENTRIES + FILE_ENTRY_WORDS * C
+
+# A landing list `landing[LANDING_ENTRY(L)]` (host-shared): the records
+# one landing launch converts as their reads land, a decode layer's (`routed_land`, its
 # file misses) or a scratch round's (`routed_round`, its conveyed records),
 # L its most entries.
 # - LANDING_HEAD, one u64 at an even word: its low word the step's low word
@@ -279,6 +325,10 @@ const LANDING_FROM = 0
 const LANDING_TO = 1
 const LANDING_DONE = 2
 
+# The first word of a landing list's entry `E`: a list of E entries ends
+# there.
+const LANDING_ENTRY(E) = LANDING_ENTRIES + LANDING_ENTRY_WORDS * E
+
 # A landing launch's counters (device words, `scratch counters`, in its
 # graph slot's own sync region): the claims taken, the groups arrived, the
 # polling lead, the count heard, then a word per entry counting its items
@@ -302,18 +352,24 @@ const LAND_ITEMS = 4
 # `threadgroups (LAND_GROUPS, ...)` from this module constant, before any
 # device's count is known; a device with more units than this (an 80-core Apple
 # Ultra, a large discrete GPU) leaves the rest idle during a convert.
-# Where the host tier places, a decode landing converts nothing and is one
-# threadgroup.
 const LAND_GROUPS = 64
+
+# The decode landing launch's threadgroups (`routed_land`'s), every
+# backend's declaration's and its host's (`magnitude_kernels::land_groups`,
+# which its route writes into its grid while it lands): LAND_GROUPS where
+# it binds staging records (STAGED 1: V > 0, the bank places), whose
+# conversions claim them; one where it binds none and only sources (STAGED
+# 0, the host tier places, converting nothing).
+const LAND_THREADGROUPS(STAGED) = 1 + STAGED * (LAND_GROUPS - 1)
 
 # The scratch kind: a scratch-served step's request at a layer and a
 # group's windowed fills, the layer's table `scratch[FLIGHT, SCRATCH_SLOT LANES]`
-# (LANES = SCRATCH_ROUND + P RW, P the windows and RW a window's rounds),
+# (LANES = ROUND_LANE(P RW), P the windows and RW a window's rounds),
 # step q's slot q mod FLIGHT of lanes of SCRATCH_SLOT words each:
 # - lane SCRATCH_ASK, step q's request (`routed_scratch_request`, its experts
 #   in its chain place's flags), which the host answers when it takes the
 #   request (no payload; nothing waits on it).
-# - lane SCRATCH_ROUND + w RW + r, window w's round r (`routed_round`) in
+# - lane ROUND_LANE(w RW + r), window w's round r (`routed_round`) in
 #   the row of the group's first step q0: its request is the device's
 #   arrival at the round, which its launch stores as it begins; its answer,
 #   every record of the round appended to the round's landing list. Window
@@ -339,40 +395,87 @@ const SCRATCH_STAGED = 8
 const SCRATCH_FOLLOWED = 9
 const SCRATCH_SLOT = 10
 
+# The lane of a scratch slot's round lane `R` (window w's round r: R = w RW +
+# r): a slot of R round lanes has ROUND_LANE(R) lanes.
+const ROUND_LANE(R) = SCRATCH_ROUND + R
+
 # ---------------------------------------------------------------------------
 # The rest of expert streaming's words.
 
-# A ring `ring[RING]`, a hint ring's or a routing record's: the sequence
-# (the step's low word) and the count, then its entries from RING_EXPERTS. A
-# routing record's are its choices' experts, RING >= RING_EXPERTS + M K (each
-# choice's source after them, `routing` below); a hint ring's are pairs,
-# RING >= RING_EXPERTS + HINT_ENTRY_WORDS M K: each hinted expert
-# (HINT_EXPERT) and the rank of the choice it was hinted as (HINT_RANK, 0 a
-# row's best), by which the host keeps each hint's precision, whatever the
-# rows.
+# A ring `ring[RING]`, a hint ring's, a front ring's or a routing record's:
+# the sequence (the step's low word), the count and the step's guesses'
+# kinds (its STEP_GUESSES word, written before the sequence as the count
+# is), then
+# its entries from RING_EXPERTS. A routing record's are its choices'
+# experts, then their sources (ROUTING_WORDS(P) words, P >= M K: `routing`
+# below); a hint ring's and a front ring's are named choices, RING >=
+# HINT_ENTRY(M K), each entry one choice of the pass: its expert
+# (HINT_EXPERT), its rank (HINT_RANK, 0 a row's best), by which the host
+# keeps each name's precision, its row of the pass (HINT_ROW, the routes'
+# row index, exact rows and front rows alike), by which the host knows the
+# row that named it, and its weight (HINT_WEIGHT, a weight's word):
+# a front ring's the choice's routing weight as the route weighs it, a hint
+# ring's the probability its lead's ranking gave it (the router's softmax,
+# or the general form's score), by which the host bands a front row's
+# names heavy (by magnitude). Entries are in rank order (every row's first
+# choice, then every row's second), each expert once per source: a hint
+# ring's (a lead's one prediction over the rows) once, as its best-ranked
+# choice; a front ring's once per front row (each front row its own source,
+# whose choices are distinct). A layer's front ring names every choice of
+# its step's front rows there (`resolve`), read ahead where absent for the
+# step the front row's token is exact in.
 const RING_SEQUENCE = 0
 const RING_COUNT = 1
-const RING_EXPERTS = 2
-const HINT_ENTRY_WORDS = 2
+const RING_GUESSES = 2
+const RING_EXPERTS = 3
+const HINT_ENTRY_WORDS = 4
 const HINT_EXPERT = 0
 const HINT_RANK = 1
+const HINT_ROW = 2
+const HINT_WEIGHT = 3
 
-# A layer's routing records `routing[FLIGHT, ROUTING]`, ROUTING >=
-# RING_EXPERTS + 2 P, one for each step in flight (the host's bound on steps
-# begun and not ended), the one of a step's sequence mod FLIGHT: a ring's
-# words, then from RING_EXPERTS + P each choice's source as the route
-# resolved it (SOURCE_RECORD's word, a CPU choice's -1). Sequences are
-# consecutive, so no step's record is rewritten before the host has read it.
+# The first word of a hint or front ring's entry `E`: a ring of E entries
+# ends there (the host's `RegionWords::ring_words`).
+const HINT_ENTRY(E) = RING_EXPERTS + HINT_ENTRY_WORDS * E
 
-# A list `list[LIST_ENTRIES + LIST_ENTRY_WORDS L]` (`routed_copy`,
-# `routed_seed_commit`): the sequence it was written for and the count, then
-# each entry's from and to words.
+# The hint form's leads: a streamed layer's hint launch (`routed_hint_route`,
+# `routed_hint_select`) routes the next layer (`next_*`) and the after layer
+# (`after_*`), a hint ring's row each (`rings[AHEAD, RING]`, AHEAD at most
+# HINT_LEADS), so no launch hints further.
+const HINT_LEADS = 2
+
+# A layer's routing records `routing[FLIGHT, ROUTING_WORDS(P)]`, one for each
+# step in flight (the host's bound on steps begun and not ended), the one of
+# a step's sequence mod FLIGHT: a ring's words, choice c's expert at
+# ROUTING_EXPERT(c), then each choice's source as the route resolved it
+# (SOURCE_RECORD's word, a CPU choice's -1) at ROUTING_SOURCE(P, c); the
+# host's `RegionWords`. Sequences are consecutive, so no step's record is
+# rewritten before the host has read it.
+#
+# Every layer keeps beside them its key records `keys[FLIGHT, VERIFY_ROWS,
+# E]`, slot for slot: row r's selection key of expert x, the value its
+# selection ranked x by (the router's softmax probability of the fused
+# form, score plus bias of the general form, a NaN as -inf), as its f32
+# bits at `keys[q mod FLIGHT, r, x]`, for every row of a decode launch
+# (M <= VERIFY_ROWS), which placement ranks every expert by. Every layer
+# writes its routing record, a whole layer's too (its sources its home
+# records), so the host reads each layer's routing of every decode step.
+const ROUTING_EXPERT(C) = RING_EXPERTS + C
+const ROUTING_SOURCE(P, C) = RING_EXPERTS + P + C
+const ROUTING_WORDS(P) = RING_EXPERTS + 2 * P
+
+# A list `list[LIST_ENTRY(L)]` (`routed_copy`, `routed_seed_commit`): the
+# sequence it was written for and the count, then each entry's from and to
+# words.
 const LIST_SEQUENCE = 0
 const LIST_COUNT = 1
 const LIST_ENTRIES = 2
 const LIST_ENTRY_WORDS = 2
 const LIST_FROM = 0
 const LIST_TO = 1
+
+# The first word of a list's entry `E`: a list of E entries ends there.
+const LIST_ENTRY(E) = LIST_ENTRIES + LIST_ENTRY_WORDS * E
 
 # A group's words of a list it reads (streaming/list.hpp): the list's
 # sequence and count (LIST_GROUP_HEADER, at LIST_SEQUENCE and LIST_COUNT),
@@ -400,6 +503,11 @@ const LIST_CHUNK = 32
 const LIST_GROUPS = 64
 const LIST_ROWS = 8
 const LIST_PART = 16384
+
+# A copy's blocks within device memory, LIST_GROUPS by LIST_ROWS: every
+# backend's `routed_copy` bound, and the grid word its host writes (the
+# host's `LIST_BLOCKS`).
+const LIST_BLOCKS() = LIST_GROUPS * LIST_ROWS
 
 # The threads of the protocol entries' one-group launches, every backend's
 # (unmeasured: each launch moves a few words, so no backend's choice is a

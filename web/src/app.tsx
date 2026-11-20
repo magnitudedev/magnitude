@@ -70,7 +70,7 @@ import { HuggingFaceRow } from "./components/hugging-face"
 import { HostNotices } from "./components/host-notices"
 import { ModelsScreen } from "./components/models/models-screen"
 import { NoModelsYet } from "./components/models/no-models"
-import { MachineCard } from "./components/models/parts"
+import { MachineCard, MachineStrip } from "./components/models/parts"
 import { machineView } from "./components/models/machine"
 import { Explore, exploreFirst } from "./components/models/explore"
 import { WhatRuns } from "./components/models/explore-view"
@@ -133,10 +133,11 @@ function ModelsPage({ observation }: { observation: ServiceObservation }) {
       setQuery={next => { if (Option.isSome(linked)) clearLinked(); setTyped(next) }} />
   </>
   return <>
-    <div className="mb-5 flex items-center justify-between gap-3">
+    <div className="mb-2 flex items-center justify-between gap-3">
       <h1 className={pageLayout.pageTitle}>Models</h1>
       {ready ? <ExploreModelsButton onClick={() => explore({ query: "", first: null })} /> : <Skeleton aria-hidden="true" className="h-8 w-40" />}
     </div>
+    {ready && Result.isSuccess(hardware) ? <MachineStrip machine={machineView(hardware.value)} formFactor={hardware.value.identity.formFactor} /> : <div className="mb-5" />}
     <div>
       {ready ? <ModelsScreen onExplore={explore} empty={<NoModelsYet memory={memory} />} />
         : Result.isFailure(observation.service) ? <ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." />

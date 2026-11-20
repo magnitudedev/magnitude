@@ -16,10 +16,10 @@ fn start() {
             "wire_count": wired.wire_count,
         })
     });
-    let own_cold = match sample.own_cold {
-        seismic_discovery::OwnCold::Bytes(bytes) => serde_json::Value::from(bytes),
-        seismic_discovery::OwnCold::Unobserved => serde_json::Value::Null,
-    };
+    let own_cold = sample
+        .cold
+        .own
+        .map_or(serde_json::Value::Null, serde_json::Value::from);
     let harm = sample.harm.map(|harm| serde_json::json!({ "machine": harm.machine, "own": harm.own }));
     let recorded = serde_json::json!({
         "page_bytes": sample.page_bytes,
@@ -30,7 +30,7 @@ fn start() {
             "cold_reclaimable": sample.supply.cold_reclaimable,
         },
         "counted_lag_ns": sample.counted.lag.as_nanos() as u64,
-        "cold": sample.cold,
+        "cold": sample.cold.machine,
         "own_cold": own_cold,
         "own_reclaimed": sample.own_reclaimed.map(|own| serde_json::json!({ "bytes": own.bytes, "stored": own.stored, "exact": own.exact })),
         "wired": wired,

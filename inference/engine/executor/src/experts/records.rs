@@ -8,41 +8,59 @@
 //! - `Free → Promoting(Queued)`: [`BankRecords::promote`], the ranking's
 //!   promotion into a record no step reads; `Queued → Copying`:
 //!   [`BankRecords::copy`]; `Copying → Held`: [`BankRecords::promoted`],
-//!   mapped from the first step not yet begun and for every step its entry
+//!   mapped from the map rule's step for its layer, which its caller reads
+//!   under the lock every step begins under, and for every step its entry
 //!   resolved already ([`BankRecords::map`]); `Promoting → Free`:
-//!   [`BankRecords::unpromoted`]. Never into a lent record a prompt group
-//!   holds reserved.
-//! - `Held → Releasing`: [`BankRecords::release`], for the reserve, its
-//!   expert unmapped from the first step not yet begun; `Releasing → Free`:
-//!   [`BankRecords::drain`], once every step its entry was mapped for, from
-//!   its mapping's step to that one, has passed its layer or ended.
+//!   [`BankRecords::unpromoted`]. Never into a lent record: those are the
+//!   scratch's, so no copy into one can run as a prompt group's lease
+//!   takes them.
+//!
+//! Every expert leaves the bank by its one exit (`Directory::exit`, an
+//! [`Exit`] every transition from `Held` takes): written back into the
+//! host tier where that pays, its record then releasing until the copy
+//! ends, else to the tier's copy or the file, its record taken at once.
+//!
+//! - `Held → Releasing`: [`BankRecords::release`], for the reserve or a
+//!   shrink whose victim's exit writes it back, never of a lent record but
+//!   by a lease ([`BankRecords::lease`]), its expert unmapped from the
+//!   first step not yet begun (a lease's, from its group's first), and,
+//!   where its exit writes it back, copied into the host tier from the
+//!   record ([`Back`]: queued, [`BankRecords::back_copy`] posts it,
+//!   [`BankRecords::backed`] ends it, written or failed);
+//!   `Releasing → Free`: [`BankRecords::drain`], once every step its entry
+//!   was mapped for, from its mapping's step to that one, has passed its
+//!   layer or ended, and its write-back, if any, has ended: nothing
+//!   overwrites the bytes a write-back reads.
 //! - `Free | Held → Filling`: [`BankRecords::fill`], a prompt group's seed,
-//!   its victim unmapped from the group's first step; never of an expert
+//!   its victim unmapped from the group's first step, never one whose exit
+//!   writes it back; never of an expert
 //!   the map holds for a step of the group, whose scratch slot no round
 //!   filled. `Filling → Held | Free`: [`BankRecords::retire_fills`].
-//! - `Free | Held | Promoting(Queued) | Releasing → Lent`:
-//!   [`BankRecords::lend`], once a prompt group, as the conveyor serves it:
-//!   what it held unmapped from the group's first step, a queued promotion
-//!   dropped; never a copy's record, a fill's, or a release's whose expert
-//!   the group's steps may still read. `Lent → Free`:
+//! - `Free | Held → Lent`: [`BankRecords::lease`], a prompt group's lease
+//!   as the conveyor serves it: what it held (a home of a bank imported
+//!   whole) unmapped from the group's first step, where its exit writes
+//!   it back once released and drained. `Lent → Free`:
 //!   [`BankRecords::unlend`].
 //! - `Free | Held | Releasing → Absent`: [`BankRecords::evict`], a shrink's,
 //!   beside running steps or not: the record's storage leaves the bank, its
-//!   expert unmapped from the step its caller names, and nothing moves (the
-//!   records allow holes). `Absent → Free`: [`BankRecords::grow`], a slot
+//!   expert unmapped from the step its caller names (never one whose exit
+//!   writes it back, nor a release whose write-back reads it), and nothing
+//!   moves (the records allow holes). `Absent → Free`: [`BankRecords::grow`], a slot
 //!   whose storage the bank holds again.
 //!
-//! A mapping from the first step not yet begun takes the steps' [`Unbegun`]
-//! (`Steps::unbegun`, its one maker), so it is stored under the lock every
-//! step begins under; an unmapping from a prompt group's first step, a step
-//! begun already, needs no lock. Every transition that frees a record or
-//! takes one a promotion could use marks the records changed
-//! ([`BankRecords::take_changed`]), so the promotions are asked again.
+//! Every mapping and unmapping is stored from a step its rule makes
+//! ([`MapStep`], [`UnmapStep`]): one from the first step not yet begun takes
+//! the steps' `Unbegun` (`Steps::unbegun`, its one maker), so it is stored
+//! under the lock every step begins under; an unmapping from a prompt
+//! group's first step ([`ScratchGroup`]), a step begun already, needs no
+//! lock. Every transition that frees a record or takes one a promotion
+//! could use marks the records changed ([`BankRecords::take_changed`]), so
+//! the promotions are asked again.
 
-use super::directory::{BankRecord, HostRecord, Point, Promotion, bank_record};
+use super::directory::{BankRecord, Exit, HostRecord, Point, Promotion, bank_record};
 use super::map::{MapView, StampedMap};
 use super::staging::Staged;
-use super::watcher::{Lending, LentRecords, Step, Unbegun};
+use super::watcher::{MapFrom, MapStep, ScratchGroup, Step, UnmapStep};
 use std::collections::HashSet;
 
 /// What a bank record holds.
@@ -56,8 +74,9 @@ pub(super) enum Record {
     Promoting(Staged, Moving),
     /// Released for the reserve: its expert of `layer`, mapped from step
     /// `from`, is unmapped from step `until` on, and it is free once every
-    /// step of `[from, until)` has passed the layer or ended.
-    Releasing { layer: usize, from: Step, until: Step },
+    /// step of `[from, until)` has passed the layer or ended and its
+    /// write-back into the host tier (`back`), if it has one, has ended.
+    Releasing { layer: usize, from: Step, until: Step, back: Option<Back> },
     /// Taken by a prompt group's seed of the expert placed at the point,
     /// until its step ends.
     Filling(Staged, Point),
@@ -67,6 +86,19 @@ pub(super) enum Record {
     /// A hole: the bank holds no storage for it, so nothing is placed in it
     /// until a growth backs it again.
     Absent,
+}
+
+/// A release's write-back of its expert into the host tier, the reverse
+/// of a promotion: tier record `tier`, which a landing of the expert took
+/// (`HostRecords::claim`), written from the releasing record by the copy
+/// engine's batch `batch` once posted (none while queued). The tier holds
+/// the expert alone once it is written, so each expert is held in one
+/// place: the bank, the tier, or only the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Back {
+    pub staged: Staged,
+    pub tier: HostRecord,
+    pub batch: Option<u64>,
 }
 
 /// Where a promotion is.
@@ -79,21 +111,23 @@ pub(super) enum Moving {
     Copying { tier: HostRecord, batch: u64 },
 }
 
-/// A group's records, a bit per record set while it is free, and the count
-/// the bank holds storage for (every one but the holes). Every change of a
-/// record goes through [`Self::set`], so the bits and the count are the
-/// free and present records by construction, and a placement finds free
-/// records without ranking the group's held ones (that ranking, over 8,880
-/// records, measured 167 µs of each miss's service).
+/// A group's records, a bit per record set while it is free, the count the
+/// bank holds storage for (every one but the holes), and the count lent to
+/// a prompt group's lease. Every change of a record goes through
+/// [`Self::set`], so the bits and the counts are the free, present and lent
+/// records by construction, and a placement finds free records without
+/// ranking the group's held ones (that ranking, over 8,880 records,
+/// measured 167 µs of each miss's service).
 struct Records {
     contents: Vec<Record>,
     free: Vec<u64>,
     present: usize,
+    lent: usize,
 }
 
 impl Records {
     fn new(count: usize) -> Self {
-        let mut records = Self { contents: Vec::new(), free: Vec::new(), present: 0 };
+        let mut records = Self { contents: Vec::new(), free: Vec::new(), present: 0, lent: 0 };
         records.grow(0..count);
         records
     }
@@ -116,6 +150,8 @@ impl Records {
         }
         let old = std::mem::replace(&mut self.contents[record], content);
         self.present = self.present + usize::from(old == Record::Absent) - usize::from(content == Record::Absent);
+        let lent = |content: Record| usize::from(matches!(content, Record::Lent { .. }));
+        self.lent = self.lent + lent(content) - lent(old);
     }
 
     /// Back `records`, each a hole or past every record: free from now.
@@ -130,15 +166,6 @@ impl Records {
             self.set(record, Record::Free);
         }
     }
-}
-
-/// What a prompt group's lend took: the experts it unmapped, which leave
-/// the bank, and those whose queued promotions it dropped, which the bank
-/// lacks.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct Lent {
-    pub evicted: Vec<Staged>,
-    pub dropped: Vec<Staged>,
 }
 
 pub(super) struct BankRecords {
@@ -276,22 +303,15 @@ impl BankRecords {
     }
 
     /// Map `expert` to `record`, which holds it whole, from `from` on, or
-    /// from its entry's FROM where its entry covers an earlier step: a step
-    /// its old mapping covers may yet resolve the layer (a prompt step whose
-    /// hit the host planned at its request reads no scratch slot), and it
-    /// reads the expert in its new record, as does a step between the old
-    /// UNTIL and `from` that resolves the layer after this. The entry's
-    /// FROM, which its release reads, so covers every step that may read
-    /// the record.
-    fn map(&self, (layer, expert): Staged, record: usize, from: Step) {
+    /// from its entry's FROM where that covers an earlier step
+    /// (`StampedMap::map_covering`).
+    fn map(&self, (layer, expert): Staged, record: usize, from: MapStep) {
         if let Some(maps) = self.maps() {
-            let view = maps[layer].view();
-            let (covered, until) = (view.from(expert), view.until(expert));
-            maps[layer].map(expert, record, if covered < until { from.min(covered) } else { from });
+            maps[layer].map_covering(expert, record, from);
         }
     }
 
-    fn unmap(&self, (layer, expert): Staged, until: Step) {
+    fn unmap(&self, (layer, expert): Staged, until: UnmapStep) {
         if let Some(maps) = self.maps() {
             maps[layer].unmap(expert, until);
         }
@@ -321,33 +341,26 @@ impl BankRecords {
         self.changed
     }
 
-    /// Whether a promotion may take record `record` of group `group`, a
-    /// prompt group holding the lent records reserved or not (`lending`).
-    pub fn usable(&self, group: usize, record: usize, lending: &Lending) -> bool {
-        !(lending.reserved() && self.lends(group, record))
+    /// Whether a promotion or a release may take record `record` of group
+    /// `group`: any but a lent one, the scratch's.
+    pub fn usable(&self, group: usize, record: usize) -> bool {
+        !self.lends(group, record)
     }
 
     /// Group `group`'s records a promotion may take now or once released:
-    /// those free or releasing, but a lent one while a prompt group holds
-    /// them reserved, and none lent to it.
-    pub fn covering(&self, group: usize, lending: &Lending) -> usize {
-        let free = self.free(group).filter(|&record| self.usable(group, record, lending)).count();
-        let releasing = self.releasing.iter().filter(|&&(of, record)| of == group && self.usable(group, record, lending)).count();
+    /// those free or releasing, but a lent one.
+    pub fn covering(&self, group: usize) -> usize {
+        let free = self.free(group).filter(|&record| self.usable(group, record)).count();
+        let releasing = self.releasing.iter().filter(|&&(of, record)| of == group && self.usable(group, record)).count();
         free + releasing
     }
 
-    /// Group `group`'s lent records a prompt group holds reserved that
-    /// return free as it ends (lent to it, or free or releasing beside its
-    /// reservation): none a promotion may take meanwhile, each one it may
-    /// once the group ends.
-    pub fn returning(&self, group: usize, lending: &Lending) -> usize {
-        match self.lent() {
-            Some((lender, records)) if lender == group && lending.reserved() => self.groups[group].contents[..records]
-                .iter()
-                .filter(|content| matches!(content, Record::Free | Record::Releasing { .. } | Record::Lent { .. }))
-                .count(),
-            _ => 0,
-        }
+    /// Decode's capacity in group `group`: the records the bank holds
+    /// storage for, less the lent ones, which hold only the scratch (a
+    /// bank imported whole keeps homes there until a lease takes them, and
+    /// nothing is promoted into one).
+    pub fn capacity(&self, group: usize) -> usize {
+        self.groups[group].present - self.seeded_from(group)
     }
 
     /// `staged` held in `record` of its group from now.
@@ -359,18 +372,34 @@ impl BankRecords {
         self.set(self.layers[staged.0].0, record, Record::Held(staged));
     }
 
-    /// The expert `record` of `group` holds leaves it, unmapped from
-    /// `until`: the expert, or none where the record was free.
-    fn vacate(&mut self, group: usize, record: usize, until: Step) -> Option<Staged> {
-        match self.groups[group].contents[record] {
-            Record::Free => None,
-            Record::Held(staged) => {
-                self.layers[staged.0].1[staged.1] = None;
-                self.holdings += 1;
-                self.unmap(staged, until);
-                Some(staged)
+    /// The expert held record `record` of `group` holds leaves the bank
+    /// by `exit`, its one exit's (`Directory::exit`), unmapped from
+    /// `until`. Its bytes stay in the record only where its exit writes it
+    /// back ([`Self::release_from`]). The expert.
+    fn unhold(&mut self, group: usize, record: usize, until: UnmapStep, exit: &Exit) -> Staged {
+        let Record::Held(staged) = self.groups[group].contents[record] else {
+            panic!("record {record} of group {group} is left from {:?}", self.groups[group].contents[record]);
+        };
+        assert_eq!(exit.staged(), staged, "record {record} of group {group} is left by another expert's exit");
+        self.layers[staged.0].1[staged.1] = None;
+        self.holdings += 1;
+        self.unmap(staged, until);
+        staged
+    }
+
+    /// Record `record` of group `group` is taken now for another use: the
+    /// expert it holds, if any, leaves the bank by `exit`, which writes
+    /// nothing back (the record's bytes are overwritten or its storage
+    /// leaves), unmapped from `until`. The expert, none where the record
+    /// was free.
+    fn vacate(&mut self, group: usize, record: usize, until: UnmapStep, exit: Option<Exit>) -> Option<Staged> {
+        match (self.groups[group].contents[record], exit) {
+            (Record::Free, None) => None,
+            (Record::Held(_), Some(exit)) => {
+                assert_eq!(exit.back(), None, "record {record} of group {group} is taken while its expert's exit writes it back");
+                Some(self.unhold(group, record, until, &exit))
             }
-            other => panic!("record {record} of group {group} is taken from {other:?}"),
+            (content, exit) => panic!("record {record} of group {group} is taken from {content:?} by exit {exit:?}"),
         }
     }
 
@@ -382,55 +411,58 @@ impl BankRecords {
                 let record = home(layer) + expert;
                 assert_eq!(self.groups[self.layers[layer].0].contents[record], Record::Free, "a home of a whole bank is free");
                 self.hold((layer, expert), record);
-                self.map((layer, expert), record, 0);
+                self.map((layer, expert), record, MapStep::EVERY);
             }
         }
     }
 
     /// Promotion `promotion` takes its free record, which no step reads,
-    /// until its copy has completed. Never a lent record while a prompt
-    /// group holds them reserved (`lending`): its lend would find the copy
-    /// writing it.
-    pub fn promote(&mut self, promotion: &Promotion, lending: &Lending) {
+    /// until its copy has completed. Never a lent record: a lease would
+    /// find the copy writing it, and the copy may wait in the driver behind
+    /// a step parked on the scratch the lease holds back (`experts::copies`).
+    pub fn promote(&mut self, promotion: &Promotion) {
         let Promotion { group, record, layer, expert } = *promotion;
         let record = record.index();
-        assert!(self.usable(group, record, lending), "a promotion into lent record {record} a prompt group holds reserved");
+        assert!(self.usable(group, record), "a promotion into lent record {record}");
         assert_eq!(self.groups[group].contents[record], Record::Free, "a promotion takes a free record");
         assert!(self.placing.insert((layer, expert)), "expert {expert} of layer {layer} is placed twice");
         self.set(group, record, Record::Promoting((layer, expert), Moving::Queued));
         self.promoting.push((group, record));
     }
 
-    /// The promotions queued, each (group, record, expert), but those into
-    /// lent records while a prompt group holds them reserved (`lending`),
-    /// which its lend drops.
-    pub fn queued(&self, lending: &Lending) -> Vec<(usize, BankRecord, Staged)> {
+    /// The promotions queued, each (group, record, expert).
+    pub fn queued(&self) -> Vec<(usize, BankRecord, Staged)> {
         self.promoting
             .iter()
             .filter_map(|&(group, record)| match self.groups[group].contents[record] {
-                Record::Promoting(staged, Moving::Queued) if self.usable(group, record, lending) => Some((group, bank_record(record), staged)),
+                Record::Promoting(staged, Moving::Queued) => Some((group, bank_record(record), staged)),
                 _ => None,
             })
             .collect()
     }
 
-    /// Release record `record` of group `group` for the reserve, its expert
-    /// unmapped from the first step not yet begun, under the steps' lock
-    /// with `lending` (a prompt group reserves before its steps begin): it
-    /// is free once every step its entry was mapped for has passed its
-    /// layer or ended ([`Self::drain`]). Never a lent record while a prompt
-    /// group holds them reserved, whose lend unmaps what it holds instead.
-    /// Its expert.
-    pub fn release(&mut self, group: usize, BankRecord(record): BankRecord, at: &Unbegun, lending: &Lending) -> Staged {
+    /// Release record `record` of group `group`, its expert leaving the
+    /// bank by `exit` (`Directory::exit`), unmapped from `until` (the first
+    /// step not yet begun, under the steps' lock, for the reserve or a
+    /// shrink): written back into the tier record its exit took, if it
+    /// took one, it is free once every step its entry was mapped for has
+    /// passed its layer or ended and its write-back has ended
+    /// ([`Self::drain`]). Never a lent record, whose lease leaves what it
+    /// holds instead ([`Self::lease`]). Its expert.
+    pub fn release(&mut self, group: usize, BankRecord(record): BankRecord, until: UnmapStep, exit: Exit) -> Staged {
         let record = record as usize;
-        assert!(self.usable(group, record, lending), "a release of lent record {record} a prompt group holds reserved");
-        let Some(staged @ (layer, expert)) = self.vacate(group, record, at.next()) else {
-            panic!("a release of record {record} of group {group}, which holds nothing");
-        };
+        assert!(self.usable(group, record), "a release of lent record {record}");
+        self.release_from(group, record, until, exit)
+    }
+
+    /// [`Self::release`] of any record, a lent one's among them.
+    fn release_from(&mut self, group: usize, record: usize, until: UnmapStep, exit: Exit) -> Staged {
+        let staged @ (layer, expert) = self.unhold(group, record, until, &exit);
         // Its entry's FROM, which the unmapping leaves: no step before it
         // resolves the entry to the record. None mapped without a device.
         let from = self.maps().map_or(0, |maps| maps[layer].view().from(expert));
-        self.set(group, record, Record::Releasing { layer, from, until: at.next() });
+        let back = exit.back().map(|tier| Back { staged, tier, batch: None });
+        self.set(group, record, Record::Releasing { layer, from, until: until.step(), back });
         self.releasing.push((group, record));
         staged
     }
@@ -440,10 +472,10 @@ impl BankRecords {
     /// (`Steps::served`), so no step reads it. Whether any was.
     pub fn drain(&mut self, progress: Point, steps: &super::watcher::Steps) -> bool {
         let (drained, releasing) = std::mem::take(&mut self.releasing).into_iter().partition::<Vec<_>, _>(|&(group, record)| {
-            let Record::Releasing { layer, from, until } = self.groups[group].contents[record] else {
+            let Record::Releasing { layer, from, until, back } = self.groups[group].contents[record] else {
                 panic!("record {record} of group {group} is listed releasing");
             };
-            steps.served(from, until, layer, progress)
+            back.is_none() && steps.served(from, until, layer, progress)
         });
         self.releasing = releasing;
         for &(group, record) in &drained {
@@ -463,6 +495,51 @@ impl BankRecords {
             .collect()
     }
 
+    /// The releases' write-backs queued, each (group, record, expert, the
+    /// tier record it writes).
+    pub fn backs_queued(&self) -> Vec<(usize, BankRecord, Staged, HostRecord)> {
+        self.releasing
+            .iter()
+            .filter_map(|&(group, record)| match self.groups[group].contents[record] {
+                Record::Releasing { back: Some(Back { staged, tier, batch: None }), .. } => Some((group, bank_record(record), staged, tier)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The releases' write-backs copying, each (group, record, batch).
+    pub fn backing(&self) -> Vec<(usize, BankRecord, u64)> {
+        self.releasing
+            .iter()
+            .filter_map(|&(group, record)| match self.groups[group].contents[record] {
+                Record::Releasing { back: Some(Back { batch: Some(batch), .. }), .. } => Some((group, bank_record(record), batch)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Queued write-back of releasing `record` of group `group` copies by
+    /// batch `batch`.
+    pub fn back_copy(&mut self, group: usize, BankRecord(record): BankRecord, batch: u64) {
+        let record = record as usize;
+        let Record::Releasing { layer, from, until, back: Some(back @ Back { batch: None, .. }) } = self.groups[group].contents[record] else {
+            panic!("record {record} of group {group} copies no queued write-back");
+        };
+        self.set(group, record, Record::Releasing { layer, from, until, back: Some(Back { batch: Some(batch), ..back }) });
+    }
+
+    /// The write-back of releasing `record` of group `group` ended, written
+    /// or failed (a queued one whose copy never began among them): the
+    /// record drains as any release from now. The write-back.
+    pub fn backed(&mut self, group: usize, BankRecord(record): BankRecord) -> Back {
+        let record = record as usize;
+        let Record::Releasing { layer, from, until, back: Some(back) } = self.groups[group].contents[record] else {
+            panic!("record {record} of group {group} ends no write-back");
+        };
+        self.set(group, record, Record::Releasing { layer, from, until, back: None });
+        back
+    }
+
     /// Whether any promotion is in flight or any release draining.
     pub fn moving(&self) -> bool {
         !self.promoting.is_empty() || !self.releasing.is_empty()
@@ -476,23 +553,18 @@ impl BankRecords {
     }
 
     /// Queued promotion `record` of group `group` copies from tier record
-    /// `tier`, which it holds, by batch `batch`: counted against the
-    /// reservation (`lending`, held across the batch's queueing) where its
-    /// record is a lent one.
-    pub fn copy(&mut self, group: usize, BankRecord(record): BankRecord, tier: HostRecord, batch: u64, lending: &mut Lending) {
+    /// `tier`, which it holds, by batch `batch`.
+    pub fn copy(&mut self, group: usize, BankRecord(record): BankRecord, tier: HostRecord, batch: u64) {
         let record = record as usize;
         let Record::Promoting(staged, Moving::Queued) = self.groups[group].contents[record] else {
             panic!("record {record} of group {group} copies no queued promotion");
         };
-        if self.lends(group, record) {
-            lending.copying();
-        }
         self.set(group, record, Record::Promoting(staged, Moving::Copying { tier, batch }));
     }
 
     /// Take promotion `record` of group `group` out of what is promoting:
     /// its expert, and the tier record its copy held.
-    fn end_promotion(&mut self, group: usize, record: usize, lent: &LentRecords) -> (Staged, Option<HostRecord>) {
+    fn end_promotion(&mut self, group: usize, record: usize) -> (Staged, Option<HostRecord>) {
         let Record::Promoting(staged, moving) = self.groups[group].contents[record] else {
             panic!("record {record} of group {group} is no promotion's");
         };
@@ -500,58 +572,59 @@ impl BankRecords {
         self.placing.remove(&staged);
         match moving {
             Moving::Queued => (staged, None),
-            Moving::Copying { tier, .. } => {
-                if self.lends(group, record) {
-                    lent.copied();
-                }
-                (staged, Some(tier))
-            }
+            Moving::Copying { tier, .. } => (staged, Some(tier)),
         }
     }
 
     /// The copies of promotions `completed`, each (group, record), have
-    /// completed: each holds its expert, mapped from the first step not yet
-    /// begun, the maps alone written under the steps' lock (`steps`). Each
-    /// one's expert, and the tier record its copy held.
-    pub fn promoted(&mut self, completed: Vec<(usize, BankRecord)>, steps: &super::watcher::Steps, lent: &LentRecords) -> Vec<(Staged, HostRecord)> {
+    /// completed: each holds its expert, mapped from `from(layer)`, the one
+    /// map rule's step for its layer (the caller's, read under the lock
+    /// every step begins under): the record was free and holds the expert
+    /// whole, so any step from it on that resolves the layer after the
+    /// stores reads it there. Each one's expert, its record, and the tier
+    /// record its copy held.
+    pub fn promoted(&mut self, completed: Vec<(usize, BankRecord)>, from: impl Fn(usize) -> MapFrom) -> Vec<(Staged, BankRecord, HostRecord)> {
         let promoted = completed
             .into_iter()
             .map(|(group, BankRecord(record))| {
                 let record = record as usize;
-                let (staged, tier) = self.end_promotion(group, record, lent);
+                let (staged, tier) = self.end_promotion(group, record);
                 let tier = tier.unwrap_or_else(|| panic!("record {record} of group {group} completed a promotion it never copied"));
                 self.hold(staged, record);
+                // The caller (`Directory::promoted`) feeds the tier-0 move
+                // (`Times::moved(group, Tier::Compute)`) outside the steps' lock.
                 (staged, record, tier)
             })
             .collect::<Vec<_>>();
-        steps.unbegun(|at| {
-            for &(staged, record, _) in &promoted {
-                self.map(staged, record, at.next());
-            }
-        });
-        promoted.into_iter().map(|(staged, _, tier)| (staged, tier)).collect()
+        for &(staged, record, _) in &promoted {
+            self.map(staged, record, from(staged.0).into());
+        }
+        promoted.into_iter().map(|(staged, record, tier)| (staged, bank_record(record), tier)).collect()
     }
 
     /// Promotion `record` of group `group` ended without its expert (its
     /// tier record went before its copy began, or its copy failed): the
     /// record is free, as nothing maps it. Its expert, and the tier record
     /// a copy held.
-    pub fn unpromoted(&mut self, group: usize, BankRecord(record): BankRecord, lent: &LentRecords) -> (Staged, Option<HostRecord>) {
+    pub fn unpromoted(&mut self, group: usize, BankRecord(record): BankRecord) -> (Staged, Option<HostRecord>) {
         let record = record as usize;
-        let ended = self.end_promotion(group, record, lent);
+        let ended = self.end_promotion(group, record);
         self.set(group, record, Record::Free);
         ended
     }
 
-    /// A prompt group's seed of `staged` at `point` takes `record`, until
-    /// its step ends ([`Self::retire_fills`]), its victim unmapped from the
-    /// group's first step: the group's steps read none of its records but
-    /// their hits, which no seed takes. The seed copies the expert's
-    /// scratch slot, which a round filled only where none of the group's
-    /// steps resolved it held: seeding one the map holds for any of them
-    /// (`point.group` to the seeding step) would bank an unfilled slot. The
+    /// Scratch group `scratch_group`'s seed of `staged` at `point`, a point of it,
+    /// takes `record`, until its step ends ([`Self::retire_fills`]), its
+    /// victim unmapped from the group's first step: the group's steps read
+    /// none of its records but their hits, which no seed takes. The seed
+    /// copies the expert's scratch slot, which a round filled only where
+    /// none of the group's steps resolved it held: seeding one the map
+    /// holds for any of them (`point.group` to the seeding step) would bank
+    /// an unfilled slot. Its victim, if any, leaves the bank by `exit`,
+    /// which writes nothing back: the seed overwrites its bytes. The
     /// victim.
-    pub fn fill(&mut self, point: Point, staged: Staged, BankRecord(record): BankRecord) -> Option<Staged> {
+    pub fn fill(&mut self, point: Point, scratch_group: ScratchGroup, staged: Staged, BankRecord(record): BankRecord, exit: Option<Exit>) -> Option<Staged> {
+        assert_eq!(point.group, scratch_group.first(), "a seed at {point:?} of the scratch group from step {}", scratch_group.first());
         let record = record as usize;
         let group = self.layers[staged.0].0;
         assert!(self.layers[staged.0].1[staged.1].is_none(), "seeded expert {staged:?} is held");
@@ -564,7 +637,7 @@ impl BankRecords {
             );
         }
         assert!(self.placing.insert(staged), "expert {staged:?} is placed twice");
-        let victim = self.vacate(group, record, point.group);
+        let victim = self.vacate(group, record, scratch_group.into(), exit);
         self.set(group, record, Record::Filling(staged, point));
         self.filling.push((group, record));
         victim
@@ -615,52 +688,74 @@ impl BankRecords {
         if !mapped.is_empty() {
             steps.unbegun(|at| {
                 for &(staged, record) in &mapped {
-                    self.map(staged, record, at.next());
+                    self.map(staged, record, at.into());
                 }
             });
         }
         retiring.into_iter().map(|(group, _, staged, committed)| (group, staged, committed)).collect()
     }
 
-    /// Lend the lent records to the prompt group whose first step is
-    /// `from`, which holds them reserved (`lending`), as the conveyor
-    /// starts serving it, before it takes any hit: each expert one holds
-    /// unmapped from `from` on (the steps before it, which may read it, run
-    /// before the group writes it), each queued promotion into one
-    /// dropped, and each release of one taken as it is. A release of a lent
-    /// record is asked only before the group reserved them, before its
-    /// steps began ([`Self::release`]), so its expert is unmapped from a
-    /// step at or before `from`; and no promotion's copy into one runs
-    /// while a group holds them reserved: so the lend waits on nothing.
-    /// Nothing seeds a lent record: a group seeds only once it holds them.
-    /// What it took.
-    pub fn lend(&mut self, from: Step, lending: &Lending) -> Lent {
-        let mut lent = Lent::default();
+    /// The lent records holding an expert (a home of a bank imported
+    /// whole) a lease has yet to take, each (group, record, expert): those
+    /// whose exits ([`Self::lease`]) are decided.
+    pub fn lent_held(&self) -> Vec<(usize, usize, Staged)> {
         let Some((group, records)) = self.lent() else {
-            return lent;
+            return Vec::new();
         };
-        assert!(lending.reserved(), "lent records lent to a group that holds no reservation");
+        (0..records)
+            .filter_map(|record| match self.groups[group].contents[record] {
+                Record::Held(staged) => Some((group, record, staged)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Grant scratch group `scratch_group` its lease of the lent records as
+    /// the conveyor serves it, before it takes any hit: each a free one at
+    /// once; each holding an expert (a home of a bank imported whole) as
+    /// that expert leaves the bank by its exit in `exits`
+    /// ([`Self::lent_held`]), unmapped from the group's first step on (the
+    /// steps before it, which may read it, run before the group writes
+    /// it): at once where its exit writes nothing back, else released
+    /// ([`Self::release_from`]) and granted by a later call once its
+    /// write-back has ended and it drained. Nothing else is ever in one: no
+    /// promotion, release or seed takes a lent record. The experts that
+    /// left the bank.
+    pub fn lease(&mut self, scratch_group: ScratchGroup, exits: Vec<Exit>) -> Vec<Staged> {
+        let mut left = Vec::new();
+        let mut exits = exits.into_iter().map(|exit| (exit.staged(), exit)).collect::<std::collections::HashMap<_, _>>();
+        let Some((group, records)) = self.lent() else {
+            assert!(exits.is_empty(), "exits from lent records where none is lent");
+            return left;
+        };
         for record in 0..records {
             match self.groups[group].contents[record] {
                 Record::Free => {}
-                Record::Held(_) => lent.evicted.extend(self.vacate(group, record, from)),
-                Record::Promoting(staged, Moving::Queued) => {
-                    self.promoting.retain(|&taken| taken != (group, record));
-                    self.placing.remove(&staged);
-                    lent.dropped.push(staged);
+                Record::Held(staged) => {
+                    let exit = exits.remove(&staged).unwrap_or_else(|| panic!("lent record {record} holds {staged:?}, which has no exit"));
+                    if exit.back().is_some() {
+                        left.push(self.release_from(group, record, scratch_group.into(), exit));
+                        continue;
+                    }
+                    left.extend(self.vacate(group, record, scratch_group.into(), Some(exit)));
                 }
-                Record::Releasing { until, .. } => {
-                    assert!(until <= from, "a release of lent record {record} unmapped its expert from step {until}, past step {from} its group reads from");
-                    self.releasing.retain(|&taken| taken != (group, record));
-                }
-                other => panic!("lent record {record} lent from {other:?}"),
+                // Granted already, or its write-back still reads it.
+                Record::Lent { .. } | Record::Releasing { .. } => continue,
+                other => panic!("lent record {record} leased from {other:?}"),
             }
-            self.set(group, record, Record::Lent { from });
+            self.set(group, record, Record::Lent { from: scratch_group.first() });
         }
-        lent
+        assert!(exits.is_empty(), "exits of experts no lent record holds: {exits:?}");
+        left
     }
 
-    /// The prompt group the records were lent to is past: every one is
+    /// Whether the prompt group's lease holds every lent record: true where
+    /// nothing is lent.
+    pub fn leased(&self) -> bool {
+        self.lent().is_none_or(|(group, records)| self.groups[group].lent == records)
+    }
+
+    /// The prompt group the records were leased to is past: every one is
     /// free.
     pub fn unlend(&mut self) {
         let Some((group, records)) = self.lent() else {
@@ -676,26 +771,33 @@ impl BankRecords {
 
     /// The records of group `group` a shrink may evict now, beside running
     /// steps or not: past the lent ones (the floor's, which the conveyor
-    /// borrows), and free, releasing or held, so none a promotion, a seed
-    /// or a prompt group writes or reads in place. Each with what it holds.
+    /// borrows), and free, releasing with no write-back reading it, or
+    /// held, so none a promotion, a write-back, a seed or a prompt group
+    /// writes or reads in place. Each with what it holds.
     pub fn evictable(&self, group: usize) -> impl Iterator<Item = (usize, Record)> + '_ {
         let lent = self.seeded_from(group);
-        self.groups[group].contents.iter().copied().enumerate().skip(lent).filter(|(_, content)| matches!(content, Record::Free | Record::Releasing { .. } | Record::Held(_)))
+        self.groups[group].contents.iter().copied().enumerate().skip(lent).filter(|(_, content)| matches!(content, Record::Free | Record::Releasing { back: None, .. } | Record::Held(_)))
     }
 
     /// Evict `records` of group `group` ([`Self::evictable`] each): holes
     /// from now, nothing moved. A held one's expert leaves, unmapped from
     /// step `until(expert)` on, so the steps before it still read it where
-    /// its bytes are until the bank releases its storage behind them; a
-    /// releasing one's expert left already. The experts that left.
-    pub fn evict(&mut self, group: usize, records: &[usize], until: impl Fn(Staged) -> Step) -> Vec<Staged> {
+    /// its bytes are until the bank releases its storage behind them, by
+    /// its exit (`exits`, each record's, none for one holding no expert),
+    /// which writes nothing back; a releasing one's expert left already.
+    /// The experts that left.
+    pub fn evict(&mut self, group: usize, records: &[usize], until: impl Fn(Staged) -> UnmapStep, exits: Vec<Option<Exit>>) -> Vec<Staged> {
+        assert_eq!(records.len(), exits.len(), "each evicted record has its exit");
         let mut evicted = Vec::new();
-        for &record in records {
+        for (&record, exit) in records.iter().zip(exits) {
             assert!(!self.lends(group, record), "a shrink evicts lent record {record} of group {group}");
             match self.groups[group].contents[record] {
-                Record::Free => {}
-                Record::Releasing { .. } => self.releasing.retain(|&taken| taken != (group, record)),
-                Record::Held(staged) => evicted.extend(self.vacate(group, record, until(staged))),
+                Record::Free => assert!(exit.is_none(), "a free record has no exit"),
+                Record::Releasing { back: None, .. } => {
+                    assert!(exit.is_none(), "a releasing record's expert left already");
+                    self.releasing.retain(|&taken| taken != (group, record));
+                }
+                Record::Held(staged) => evicted.extend(self.vacate(group, record, until(staged), exit)),
                 other => panic!("a shrink evicts record {record} of group {group}, holding {other:?}"),
             }
             self.set(group, record, Record::Absent);
@@ -739,12 +841,9 @@ mod tests {
     /// Hold expert `expert` in free record `record`, mapped from `from`:
     /// its promotion's copy completed.
     fn promoted(bank: &mut BankRecords, record: u32, expert: usize, from: Step) {
-        let lent = LentRecords::new();
-        bank.promote(&promotion(record, expert), &lent.lock());
-        bank.copy(0, BankRecord(record), HostRecord(0), 0, &mut lent.lock());
-        let steps = super::super::watcher::Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new());
-        steps.begin_through(from - 1);
-        bank.promoted(vec![(0, BankRecord(record))], &steps, &lent);
+        bank.promote(&promotion(record, expert));
+        bank.copy(0, BankRecord(record), HostRecord(0), 0);
+        bank.promoted(vec![(0, BankRecord(record))], |_| MapFrom::at(from));
     }
 
     /// Every transition keeps the record, the expert's index and the map
@@ -760,18 +859,37 @@ mod tests {
         steps.begin_through(13);
         promoted(&mut bank, 2, 3, 4);
         assert_eq!((bank.held(0, 3), view.resolve(3, 3), view.resolve(3, 4)), (Some(2), None, Some(2)));
-        let lent = LentRecords::new();
-        assert_eq!(bank.release(0, BankRecord(2), &Unbegun::at(9), &lent.lock()), (0, 3));
+        assert_eq!(bank.release(0, BankRecord(2), UnmapStep::at(9), Exit::to_file((0, 3))), (0, 3));
         assert_eq!((bank.held(0, 3), view.resolve(3, 8), view.resolve(3, 9)), (None, Some(2), None), "the released expert is read until 9");
         assert!(!bank.drain(Point::whole(8, 0, 8), &steps) && !bank.free(0).any(|record| record == 2), "steps below 9 still read it");
         assert!(bank.drain(Point::whole(9, 0, 9), &steps) && bank.free(0).any(|record| record == 2));
         let point = Point::whole(12, 0, 13);
         promoted(&mut bank, 3, 6, 10);
-        assert_eq!(bank.fill(point, (0, 7), BankRecord(3)), Some((0, 6)));
+        assert_eq!(bank.fill(point, ScratchGroup::at(12, 2), (0, 7), BankRecord(3), Some(Exit::to_file((0, 6)))), Some((0, 6)));
         assert_eq!((view.resolve(6, 11), view.resolve(6, 12)), (Some(3), None), "a seed's victim leaves from its group's first step");
         let retired = bank.retire_fills(Point::whole(13, usize::MAX, Step::MAX), |_, _| super::super::watcher::low_word(13), |_| super::super::directory::Ending::Ended, &steps);
         assert_eq!(retired, [(0, (0, 7), true)]);
         assert_eq!((bank.held(0, 7), view.resolve(7, 14)), (Some(3), Some(3)));
+    }
+
+    /// A release written back into the host tier keeps its bytes until
+    /// the write-back ends: it never drains, nor may a shrink take it,
+    /// while its copy is queued or in flight, though every step it was
+    /// mapped for is past; once the write-back ends it drains as any.
+    #[test]
+    fn a_release_written_back_holds_its_bytes_until_the_copy_ends() {
+        let (mut bank, _) = bank();
+        let steps = super::super::watcher::Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new());
+        steps.begin_through(13);
+        promoted(&mut bank, 2, 3, 4);
+        bank.release(0, BankRecord(2), UnmapStep::at(9), Exit::written_back((0, 3), HostRecord(5)));
+        assert_eq!(bank.backs_queued(), [(0, BankRecord(2), (0, 3), HostRecord(5))]);
+        assert!(!bank.evictable(0).any(|(record, _)| record == 2), "a shrink never takes a record a write-back reads");
+        bank.back_copy(0, BankRecord(2), 7);
+        assert_eq!((bank.backs_queued(), bank.backing()), (vec![], vec![(0, BankRecord(2), 7)]));
+        assert!(!bank.drain(Point::whole(12, 0, 12), &steps), "past every step it was mapped for, its copy still reads it");
+        assert_eq!(bank.backed(0, BankRecord(2)), Back { staged: (0, 3), tier: HostRecord(5), batch: Some(7) });
+        assert!(bank.drain(Point::whole(12, 0, 12), &steps) && bank.free(0).any(|record| record == 2));
     }
 
     /// A regression: the bank let a prompt group's hit go mid-group (then a
@@ -786,9 +904,8 @@ mod tests {
         let (mut bank, _) = bank();
         promoted(&mut bank, 2, 5, 1);
         // Group 3's steps 3 and 4 have begun: the release unmaps 5 from 5.
-        let lent = LentRecords::new();
-        bank.release(0, BankRecord(2), &Unbegun::at(5), &lent.lock());
-        bank.fill(Point::whole(3, 0, 4), (0, 5), BankRecord(3));
+        bank.release(0, BankRecord(2), UnmapStep::at(5), Exit::to_file((0, 5)));
+        bank.fill(Point::whole(3, 0, 4), ScratchGroup::at(3, 2), (0, 5), BankRecord(3), None);
     }
 
     /// A regression: a hit a prompt group's steps planned at their request
@@ -801,86 +918,73 @@ mod tests {
         let (mut bank, view) = bank();
         promoted(&mut bank, 2, 5, 1);
         // Group 3's steps 3 and 4 have begun: the release unmaps 5 from 5.
-        let lent = LentRecords::new();
-        bank.release(0, BankRecord(2), &Unbegun::at(5), &lent.lock());
+        bank.release(0, BankRecord(2), UnmapStep::at(5), Exit::to_file((0, 5)));
         promoted(&mut bank, 3, 5, 6);
         assert_eq!((view.resolve(5, 0), view.resolve(5, 4), view.resolve(5, 6)), (None, Some(3), Some(3)));
     }
 
-    /// A regression: a record taken from a lent one after a prompt group's
-    /// steps began (then a promotion's victim, now a release) unmapped its
-    /// expert only from a step past the group's first, so the group read it
-    /// as a hit while its scratch overwrote the record. Lending a record
-    /// whose expert the group may still read is refused.
+    /// No promotion and no release takes a lent record: those are the
+    /// scratch's, so no copy into one runs as a lease takes them.
     #[test]
-    #[should_panic(expected = "past step 3 its group reads from")]
-    fn lending_a_record_whose_expert_the_group_still_reads_panics() {
+    #[should_panic(expected = "a promotion into lent record 1")]
+    fn a_promotion_into_a_lent_record_panics() {
         let (mut bank, _) = bank();
-        promoted(&mut bank, 0, 5, 1);
-        let lent = LentRecords::new();
-        bank.release(0, BankRecord(0), &Unbegun::at(7), &lent.lock());
-        assert!(lent.reserve());
-        bank.lend(3, &lent.lock());
-    }
-
-    /// The reservation that makes it so: no promotion takes and no release
-    /// unmaps a lent record a prompt group holds reserved.
-    #[test]
-    #[should_panic(expected = "a prompt group holds reserved")]
-    fn a_promotion_into_a_reserved_lent_record_panics() {
-        let (mut bank, _) = bank();
-        let lent = LentRecords::new();
-        assert!(lent.reserve());
-        bank.promote(&promotion(1, 6), &lent.lock());
+        bank.promote(&promotion(1, 6));
     }
 
     #[test]
-    #[should_panic(expected = "a prompt group holds reserved")]
-    fn a_release_of_a_reserved_lent_record_panics() {
+    #[should_panic(expected = "a release of lent record 1")]
+    fn a_release_of_a_lent_record_panics() {
         let (mut bank, _) = bank();
-        promoted(&mut bank, 1, 5, 1);
-        let lent = LentRecords::new();
-        assert!(lent.reserve());
-        bank.release(0, BankRecord(1), &Unbegun::at(7), &lent.lock());
+        bank.hold((0, 5), 1);
+        bank.release(0, BankRecord(1), UnmapStep::at(7), Exit::to_file((0, 5)));
     }
 
-    /// One asked before the reservation the lend takes as it is: a queued
-    /// promotion dropped, a release taken, its expert unmapped from a step
-    /// before the group's: the lend takes every lent record at once and
-    /// waits on nothing (a claim that waited for such a
-    /// promotion, which waited for the group's steps, never ended). What a
-    /// lend took is unmapped for every step of the group, so no step of it
-    /// resolves a hit in a lent record.
+    /// The lease takes every lent record at once, a home one held (a bank
+    /// imported whole) unmapped for every step of the group, so no step of
+    /// it resolves a hit in a lent record; a second grant takes nothing,
+    /// and the return frees them. Neither covers a want, nor counts in
+    /// decode's capacity.
     #[test]
-    fn a_lend_waits_on_nothing_and_leaves_no_hit_in_a_lent_record() {
+    fn a_lease_is_whole_at_once_and_leaves_no_hit_in_a_lent_record() {
         let (mut bank, view) = bank();
-        promoted(&mut bank, 1, 4, 1);
+        bank.hold((0, 4), 1);
+        bank.map((0, 4), 1, MapStep::EVERY);
         promoted(&mut bank, 2, 5, 1);
-        let lent = LentRecords::new();
-        bank.promote(&promotion(0, 6), &lent.lock());
-        assert!(lent.reserve());
-        let taken = bank.lend(3, &lent.lock());
-        assert_eq!(taken, Lent { evicted: vec![(0, 4)], dropped: vec![(0, 6)] });
-        assert!(!bank.moving() && !bank.placing((0, 6)));
+        assert_eq!((bank.covering(0), bank.capacity(0)), (1, 2), "the lent records cover no want, and hold no decode expert");
+        assert_eq!(bank.lent_held(), [(0, 1, (0, 4))]);
+        assert_eq!(bank.lease(ScratchGroup::at(3, 2), vec![Exit::to_file((0, 4))]), [(0, 4)]);
+        assert!(bank.leased(), "it took every lent record at once");
+        assert!(bank.lease(ScratchGroup::at(3, 2), Vec::new()).is_empty(), "and a second grant takes nothing");
         assert_eq!((view.resolve(4, 2), view.resolve(4, 3)), (Some(1), None));
         assert_eq!(bank.resolve(0, 4, 3), None);
+        assert_eq!(bank.held(0, 5), Some(2), "a record past the lent ones keeps its expert");
         bank.unlend();
+        assert!(!bank.leased());
         assert_eq!(bank.free(0).collect::<Vec<_>>(), [0, 1, 3]);
+        assert_eq!(bank.covering(0), 1);
     }
 
-    /// No copy into a lent record runs while a group holds them reserved:
-    /// a group begins only once every such copy completed. A lend meeting
-    /// one is refused.
+    /// A lent record whose expert's exit writes it back is released into
+    /// its write-back, not lent: the lease waits for it, granting the rest,
+    /// and a later grant takes it once the copy ended and it drained.
     #[test]
-    #[should_panic(expected = "lent from Promoting")]
-    fn lending_a_record_a_copy_writes_panics() {
+    fn a_lease_waits_for_a_lent_records_write_back() {
         let (mut bank, _) = bank();
-        let lent = LentRecords::new();
-        bank.promote(&promotion(0, 6), &lent.lock());
-        bank.copy(0, BankRecord(0), HostRecord(0), 0, &mut lent.lock());
-        // The group waits for the copy, holding the records reserved.
-        assert!(!lent.reserve());
-        bank.lend(3, &lent.lock());
+        let steps = super::super::watcher::Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new());
+        steps.begin_through(13);
+        bank.hold((0, 4), 1);
+        bank.map((0, 4), 1, MapStep::EVERY);
+        assert_eq!(bank.lease(ScratchGroup::at(3, 2), vec![Exit::written_back((0, 4), HostRecord(6))]), [(0, 4)]);
+        assert!(!bank.leased(), "its write-back holds the record");
+        assert_eq!(bank.covering(0), 2, "a lent release covers no want");
+        assert!(bank.lent_held().is_empty() && bank.lease(ScratchGroup::at(3, 2), Vec::new()).is_empty());
+        assert!(!bank.leased());
+        bank.back_copy(0, BankRecord(1), 7);
+        bank.backed(0, BankRecord(1));
+        assert!(bank.drain(Point::whole(3, 0, 3), &steps));
+        assert!(bank.lease(ScratchGroup::at(3, 2), Vec::new()).is_empty());
+        assert!(bank.leased(), "granted once the copy ended and it drained");
     }
 
     /// Nothing seeds or promotes into a lent record: the transition into
@@ -889,31 +993,8 @@ mod tests {
     #[should_panic(expected = "is taken from Lent")]
     fn a_seed_into_a_lent_record_panics() {
         let (mut bank, _) = bank();
-        let lent = LentRecords::new();
-        assert!(lent.reserve());
-        bank.lend(3, &lent.lock());
-        bank.fill(Point::whole(3, 0, 3), (0, 2), BankRecord(0));
-    }
-
-    /// A reserve's records cover a want only where a promotion may take
-    /// them: never a lent record while a prompt group holds them reserved,
-    /// nor one lent to it.
-    #[test]
-    fn lent_records_cover_no_want_a_promotion_cannot_take() {
-        let (mut bank, _) = bank();
-        let lent = LentRecords::new();
-        assert_eq!(bank.covering(0, &lent.lock()), 4);
-        assert_eq!(bank.returning(0, &lent.lock()), 0);
-        assert!(lent.reserve());
-        assert_eq!(bank.covering(0, &lent.lock()), 2, "the reserved lent records cover no want now");
-        assert_eq!(bank.returning(0, &lent.lock()), 2, "they return free as the group ends");
-        bank.lend(3, &lent.lock());
-        let lending = lent.lock();
-        assert_eq!((bank.covering(0, &lending), bank.returning(0, &lending)), (2, 2), "nor do the records lent, until they return");
-        drop(lending);
-        lent.release();
-        assert_eq!(bank.covering(0, &lent.lock()), 2);
-        assert!(bank.take_changed() && lent.lock().take_freed(), "the lend took free records, the release freed the reservation");
+        bank.lease(ScratchGroup::at(3, 2), Vec::new());
+        bank.fill(Point::whole(3, 0, 3), ScratchGroup::at(3, 2), (0, 2), BankRecord(0), None);
     }
 
     /// A shrink evicts with holes and moves nothing: an evicted held
@@ -927,7 +1008,7 @@ mod tests {
         promoted(&mut bank, 2, 3, 4);
         promoted(&mut bank, 3, 5, 4);
         assert_eq!(bank.evictable(0).map(|(record, _)| record).collect::<Vec<_>>(), [2, 3], "the lent records are the floor's");
-        assert_eq!(bank.evict(0, &[2], |_| 9), [(0, 3)]);
+        assert_eq!(bank.evict(0, &[2], |_| UnmapStep::at(9), vec![Some(Exit::to_file((0, 3)))]), [(0, 3)]);
         assert_eq!((bank.held(0, 3), view.resolve(3, 8), view.resolve(3, 9)), (None, Some(2), None), "read by the steps before 9 where it was");
         assert_eq!((bank.held(0, 5), view.resolve(5, 9)), (Some(3), Some(3)), "the kept expert stays in its record");
         assert_eq!(bank.counts(), [3]);
@@ -936,7 +1017,7 @@ mod tests {
         assert_eq!(bank.counts(), [5]);
         assert!(bank.free(0).any(|record| record == 2) && bank.free(0).any(|record| record == 5));
         assert_eq!(bank.records(0)[4], Record::Absent, "a growth past every record leaves the holes below it");
-        assert!(bank.evict(0, &[2, 5], |_| 9).is_empty(), "free records leave nothing");
+        assert!(bank.evict(0, &[2, 5], |_| UnmapStep::at(9), vec![None, None]).is_empty(), "free records leave nothing");
         assert_eq!(bank.counts(), [3]);
     }
 
@@ -946,7 +1027,7 @@ mod tests {
     #[should_panic(expected = "a shrink evicts lent record 1")]
     fn evicting_a_lent_record_panics() {
         let (mut bank, _) = bank();
-        bank.evict(0, &[1], |_| 9);
+        bank.evict(0, &[1], |_| UnmapStep::at(9), vec![None]);
     }
 
     /// A growth of a record the bank holds is a broken invariant.

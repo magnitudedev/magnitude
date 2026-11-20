@@ -17,12 +17,12 @@ pub(super) use std::time::{Duration, Instant};
 
 /// A file request's choice `choice`'s word: the route's request.
 pub(super) fn choice_word(choice: u64) -> u64 {
-    magnitude_kernels::SlotTable::file_entry(choice) + constants::FILE_CHOICE
+    magnitude_kernels::constants::FILE_ENTRY(choice) + constants::FILE_CHOICE
 }
 
 /// A file request's choice `choice`'s record word: the host's answer.
 pub(super) fn record_word(choice: u64) -> u64 {
-    magnitude_kernels::SlotTable::file_entry(choice) + constants::FILE_RECORD
+    magnitude_kernels::constants::FILE_ENTRY(choice) + constants::FILE_RECORD
 }
 
 pub(super) const EXPERTS: usize = 8;
@@ -57,7 +57,7 @@ pub(super) const ROUND_RECORDS: u64 = 2;
 /// The lane of scratch round `index` of [`WORDS`].
 pub(super) fn round(index: u64) -> u64 {
     assert!(index < WORDS.rounds, "a round of the table");
-    scratch::round_lane(index)
+    constants::ROUND_LANE(index)
 }
 
 /// The last round's lane, whose answer is the request's verdict.
@@ -68,7 +68,7 @@ fn last_round() -> u64 {
 /// `slots`' table of the exchange on the CPU device, beating with `steps`'
 /// pulse.
 fn cpu_slots(table: magnitude_kernels::SlotTable, steps: &Steps) -> ExchangeTable {
-    ExchangeTable::new(Tensor::shared(&seismic::Charges::tally(&cpu()), Element::i32(), &[table.words()]).unwrap(), table, steps.pulse()).unwrap()
+    ExchangeTable::new(Words::aligned_cpu_tensor(&cpu(), table.words()), table, steps.pulse()).unwrap()
 }
 
 /// Spin until lane `lane` of `step`'s slot of `slots` is answered, by the
@@ -90,7 +90,7 @@ pub(super) struct Harness {
     /// Each layer's round landing lists, read over the watcher's words.
     round_lists: Vec<Vec<LandingList>>,
     /// The first layer's words, and every layer's: map, file and scratch
-    /// tables, rings, routing records and policy words.
+    /// tables, rings, routing records, policy words and front ring.
     pub(super) layer: LayerWords,
     pub(super) layers: Vec<LayerWords>,
     /// Each layer's group reads (`[records, places, EXPERTS]`).
@@ -112,6 +112,9 @@ pub(super) struct Harness {
     pub(super) window_rounds: u64,
     /// The second chain place's scratch flags (the first's are `load.0`).
     pub(super) second: Words,
+    /// Each layer's routing keys (`Layer::keys`), written by `route_sourced`
+    /// so `KeyRecords::read` reads the routed experts' keys rather than zeros.
+    keys: Vec<Words>,
     staging: Tensor,
     conveyor: Tensor,
     /// The conveyor's records of each tensor.
@@ -133,6 +136,30 @@ pub(super) struct Harness {
     /// Its share of the read engine's pool, none where its test holds the
     /// pool alone ([`alone`]).
     _pool: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    /// The watchdog's report, once it trips: after the watcher, so it
+    /// drops once the watchdog stopped.
+    trip: Tripped,
+}
+
+/// A harness's watchdog report, once it trips, which the test that expects
+/// it takes ([`Harness::tripped`]). One no test took is its test's failure
+/// (a wait the host left unanswered past its bound, or a kernel's
+/// violation), checked as it drops: after the watcher, whose watchdog then
+/// trips no more.
+struct Tripped(Arc<Mutex<Option<String>>>);
+
+impl Tripped {
+    fn take(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+    }
+}
+
+impl Drop for Tripped {
+    fn drop(&mut self) {
+        if let Some(report) = self.take().filter(|_| !std::thread::panicking()) {
+            panic!("the exchange's watchdog tripped:\n{report}");
+        }
+    }
 }
 
 /// The read engine's pool is the process's one
@@ -202,7 +229,7 @@ impl BankRecordViews for BankRows {
     }
 }
 
-type LayerWords = (MapView, ExchangeTable, ExchangeTable, Words, Words, Words);
+type LayerWords = (MapView, ExchangeTable, ExchangeTable, Words, Words, Words, Words);
 
 impl Drop for Harness {
     fn drop(&mut self) {
@@ -306,7 +333,7 @@ pub(super) fn cpu() -> seismic::Device {
 
 /// `count` words on `device`, each `initial`.
 pub(super) fn cpu_words(device: &seismic::Device, count: u64, initial: i32) -> Words {
-    Words::new(Tensor::shared(&seismic::Charges::tally(device), Element::i32(), &[count]).unwrap(), count, initial).unwrap()
+    Words::on_cpu(device, count, initial)
 }
 
 /// [`layered`], its conveyor carried as `conveying` says, beside a host
@@ -406,6 +433,7 @@ pub(super) fn lending_windowed(
                 words(ahead * WORDS.ring_words(), 0),
                 words(WORDS.flight * WORDS.routing_words(), 0),
                 words(constants::POLICY_WORDS, 0),
+                words(WORDS.ring_words(), 0),
             )
         })
         .collect::<Vec<_>>();
@@ -457,9 +485,9 @@ pub(super) fn lending_windowed(
         lent: if addressed && window_count == 1 { layer_window as u64 } else { 0 },
     };
     let round_words = (0..layers)
-        .map(|_| (0..WORDS.rounds).map(|_| words(magnitude_kernels::landing_extent(ROUND_RECORDS), 0)).collect::<Vec<_>>())
+        .map(|_| (0..WORDS.rounds).map(|_| words(magnitude_kernels::constants::LANDING_ENTRY(ROUND_RECORDS), 0)).collect::<Vec<_>>())
         .collect::<Vec<_>>();
-    let lists = || (0..layers).map(|_| words(magnitude_kernels::list_extent(window_slots as u64), 0)).collect::<Vec<_>>();
+    let lists = || (0..layers).map(|_| words(magnitude_kernels::constants::LIST_ENTRY(window_slots as u64), 0)).collect::<Vec<_>>();
     let (tiered, seeds) = (lists(), lists());
     let layer_windows = (0..layers)
         .map(|_| {
@@ -483,9 +511,8 @@ pub(super) fn lending_windowed(
         })
         .collect::<Vec<_>>();
     let conveyed = || (0..3).map(|kind| view(&conveyor, kind, conveyor_records)).collect::<Vec<_>>();
-    let lending = |records, bytes, pools: &[Records]| Lending {
+    let lending = |bytes, pools: &[Records]| Lending {
         group: 0,
-        records,
         pools: pools
             .iter()
             .map(|pool| LentPool { record: bytes, offset: 0, conveyor: pool.bytes() })
@@ -498,7 +525,7 @@ pub(super) fn lending_windowed(
     let carrier = Carrier {
         records: conveyor_records as usize,
         slots: if addressed { window_slots } else { 0 },
-        lending: lending(lent, bytes, &conveyors),
+        lending: lending(bytes, &conveyors),
         pools: conveyors,
     };
     // Who places, with the maps each placement writes: beside a host tier
@@ -525,13 +552,19 @@ pub(super) fn lending_windowed(
         .map(|_| {
             (placer == Placer::Bank).then(|| {
                 let bounds = ListBounds { from: u64::from(staging_records), to: bank_records, lent: 0 };
-                Arc::new(LandingList::new(words(magnitude_kernels::landing_extent(WORDS.choices), 0), bounds))
+                Arc::new(LandingList::new(words(magnitude_kernels::constants::LANDING_ENTRY(WORDS.choices), 0), bounds))
             })
         })
         .collect::<Vec<_>>();
     // A hung test reports every owner and every thread's stack on SIGUSR1.
     crate::diagnostics::install();
-    let watcher = Watcher::start(WatcherParts {
+    // The watchdog hands its report to the harness, not ending the test
+    // process: the test that expects it takes it, and any other fails.
+    let trip = Arc::new(Mutex::new(None));
+    let tripped = trip.clone();
+    let layer_keys = (0..layers).map(|_| words(WORDS.flight * constants::VERIFY_ROWS * EXPERTS as u64, 0)).collect::<Vec<_>>();
+    let watcher = Watcher::start_with_bounds(
+        WatcherParts {
         layers: all
             .iter()
             .enumerate()
@@ -546,7 +579,9 @@ pub(super) fn lending_windowed(
                 // Each ring row hints the layer its lead is ahead.
                 hints: (0..layer.3.len() / WORDS.ring_words() as usize).map(|lead| index + 1 + lead).collect(),
                 routing: layer.4.clone(),
+                keys: layer_keys[index].clone(),
                 policy: layer.5.clone(),
+                front: layer.6.clone(),
                 site: None,
                 stored: (0..3).map(stored_tensor).collect(),
                 slots: addressed.then(|| scratch.iter().map(|slots| Records::rows(slots, RECORD, layer_window as u64).unwrap()).collect()),
@@ -587,17 +622,13 @@ pub(super) fn lending_windowed(
             // One choice a row.
             selected: 1,
             demand: WORDS.choices as usize,
-            // The tier's reserve: one record for each staging record, so the
-            // tests exercise the refill's unmapping and the reads ahead
-            // beside a request at any size (a load's is its reads-ahead
-            // window, `ExpertBankPlan::tier_reserve`).
-            reserve: staging_records as usize,
             placer,
+            recording: false,
         },
         slots: Arc::new(std::sync::atomic::AtomicU64::new(slots as u64)),
         whole,
         staging: staging_records,
-        host: crate::experts::directory::HostTier { records: vec![tier], lent: vec![lent as u32], placement },
+        host: crate::experts::directory::HostTier { records: vec![tier], lent: vec![lent as u32], reserve: staging_records as usize, placement },
         carrier,
         source: ExpertSource::open(std::slice::from_ref(&file), &urgent()).unwrap(),
         // The landings' executor, of no site layer.
@@ -605,10 +636,23 @@ pub(super) fn lending_windowed(
         copier,
         steps,
         spans: false,
-    })
+        // Its bound is its own reads' line, as a plan priced on no figures.
+        line: None,
+        trip: Box::new(move |report: String| *tripped.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report)),
+    }, Box::new(|| crate::experts::exchange::Bounds {
+        // Synthetic 48-byte fixture reads complete in nanoseconds from page
+        // cache, which would derive a ~30µs wall-clock bound far below OS
+        // thread-scheduling latency under concurrent test load.
+        lane: crate::experts::exchange::Bound { limit: Duration::from_secs(2), derivation: "synthetic 48-byte test fixture".into() },
+        volumes: crate::watched::VolumeBound(None),
+    }))
     .unwrap();
-    // Its steps compute nothing: its hints are priced on an idle volume.
-    watcher.shared().telemetry.price_at(0.);
+    // Its steps compute nothing: every read ahead is admitted.
+    watcher.shared().telemetry.admit_at(0.);
+    // Its promotions copy at a measured transfer queue's line, as a
+    // discrete load's do: one record at a time, its latency none.
+    let transfer = magnitude_cost_model::ReadLine::new(0., 1e-10).unwrap();
+    watcher.shared().price_copy(&crate::assessment::TierCopyCosts { blocks: 1, whole_seconds: 1e-3, stall_share: 0., transfer, back: transfer });
     Harness {
         _pool: (!ALONE.get()).then(|| POOL.read().unwrap_or_else(std::sync::PoisonError::into_inner)),
         watcher,
@@ -626,6 +670,7 @@ pub(super) fn lending_windowed(
         window_count,
         window_rounds,
         second,
+        keys: layer_keys,
         staging,
         conveyor,
         conveyor_records,
@@ -638,6 +683,7 @@ pub(super) fn lending_windowed(
             Placer::Tier => bank_lent,
             Placer::Bank => lent,
         },
+        trip: Tripped(trip),
     }
 }
 
@@ -886,16 +932,15 @@ impl Harness {
 
     /// Wait until the tier holds its whole reserve ready (the fixture's, a
     /// record per staging record, or the experts it lacks where fewer),
-    /// every record the refill unmapped retired from its grace: a hint takes a ready record only as
-    /// its ring is read (`Prefetch::admit`), and a hint refused then is never
-    /// read, so a test hinting after a step must find the graces retired,
-    /// not race their retirement.
+    /// every record the refill unmapped retired from its grace: a read ahead
+    /// takes a ready record as the ledger derives it (`Prefetch::drive`), so
+    /// a test hinting after a step must find the graces retired, not race
+    /// their retirement.
     pub(super) fn tier_ready(&self) {
-        let reserve = self.staging_records as usize;
         eventually("the tier's graces never retired", || {
             let state = residency::lock(&self.watcher.state);
             let directory = &state.core.directory;
-            directory.host(0).graced() == 0 && !directory.refill_short(reserve)
+            directory.host(0).graced() == 0 && !directory.refill_short()
         });
     }
 
@@ -911,9 +956,23 @@ impl Harness {
         });
     }
 
-    /// Begin a decode step, a group of one.
-    pub(super) fn step(&self) -> ExpertStep {
+    /// Begin a decode step, a group of one, before its launch is configured
+    /// (`ExpertStep::decoding`).
+    pub(super) fn begun(&self) -> ExpertStep {
         self.group(&[StepRoute::Decode]).pop().unwrap()
+    }
+
+    /// Begin a single-row decode step, a group of one, registered on the
+    /// load's clock as a production decode launch is (`ExpertStep::decoding`).
+    pub(super) fn step(&self) -> ExpertStep {
+        self.begun().decoding([row(1000, None)].into_iter(), 0)
+    }
+
+    /// Begin a two-row decode step, a group of one: an exact row, then the
+    /// one ahead row of its pass at batch row 1 (the row [`Self::front_at`]
+    /// names).
+    pub(super) fn two_row_step(&self) -> ExpertStep {
+        self.begun().decoding([row(1000, None), row(1001, front_row())].into_iter(), 0)
     }
 
     /// Begin a prompt step, a group of one.
@@ -921,9 +980,11 @@ impl Harness {
         self.group(&[StepRoute::Grouped]).pop().unwrap()
     }
 
-    /// Begin a scratch-served group of steps of `routes`.
+    /// Begin a group of steps of `routes`, scratch-served where a step of
+    /// it is grouped (a prompt's): a decode step never reserves the lent
+    /// records, as none does in a load.
     pub(super) fn group(&self, routes: &[StepRoute]) -> Vec<ExpertStep> {
-        begin(self.watcher.shared(), routes, true).unwrap()
+        begin(self.watcher.shared(), routes, routes.contains(&StepRoute::Grouped)).unwrap()
     }
 
     /// Play a begun decode step's route of `experts` at its one layer, and
@@ -966,12 +1027,21 @@ impl Harness {
         let ring = WORDS.routing_words() as usize;
         let record = &self.layers[layer].4;
         let base = (step.sequence() % WORDS.flight) as usize * ring;
+        let key_base = (step.sequence() % WORDS.flight) as usize * constants::VERIFY_ROWS as usize * EXPERTS;
+        let key_words = &self.keys[layer];
+        for expert in 0..EXPERTS {
+            key_words.store(key_base + expert, 0);
+        }
         for (choice, (&word, &source)) in choices.iter().zip(sources).enumerate() {
             let expert = if word < 0 { -1 - word } else { word };
-            record.store(base + WORDS.routing_expert(choice as u64) as usize, expert);
+            record.store(base + constants::ROUTING_EXPERT(choice as u64) as usize, expert);
             record.store(base + WORDS.routing_source(choice as u64) as usize, source);
+            if (expert as usize) < EXPERTS {
+                key_words.store(key_base + expert as usize, 1.0f32.to_bits() as i32);
+            }
         }
         record.store(base + constants::RING_COUNT as usize, choices.len() as i32);
+        record.store(base + constants::RING_GUESSES as usize, guesses(step));
         record.store(base + constants::RING_SEQUENCE as usize, low_word(step.sequence()));
     }
 
@@ -1103,9 +1173,10 @@ impl Harness {
 
     /// Bank `experts` of layer `layer` as decode does, a request's experts
     /// at a time: a step lands them into the tier, and once it completed the
-    /// ranking, which has its reads, promotes each into a record; every
-    /// other layer routes nothing. Each is mapped to a record holding its
-    /// bytes.
+    /// ranking, which has its reads, promotes each into a record; the next
+    /// step reads them again from the bank, so the carry of a chosen expert
+    /// is calibrated as used before the next request is ranked; every other
+    /// layer routes nothing. Each is mapped to a record holding its bytes.
     pub(super) fn promoted(&self, layer: usize, experts: &[usize]) {
         for chunk in experts.chunks(WORDS.choices as usize) {
             let landing = self.step();
@@ -1126,6 +1197,11 @@ impl Harness {
                     assert_eq!(self.banked(kind, record), (100 * kind + expert) as u8, "expert {expert}'s bank record");
                 }
             }
+            let again = self.step();
+            for index in 0..self.layers.len() {
+                drop(self.route_at(&again, index, if index == layer { chunk } else { &[] }));
+            }
+            again.complete().unwrap();
         }
         self.holding_all(layer);
     }
@@ -1188,7 +1264,7 @@ impl Harness {
 
     /// The flags of `step`'s chain place, its group's `n`th.
     fn flags(&self, step: &ExpertStep) -> &Words {
-        let (first, _) = self.watcher.shared().steps.group_of(step.sequence());
+        let first = step.scratch_group().expect("a scratch request's step is scratch-served").first();
         match step.sequence() - first {
             0 => &self.flags,
             1 => &self.second,
@@ -1480,19 +1556,45 @@ impl Harness {
         self.layers[layer].1.violate(step.sequence(), 0);
     }
 
+    /// The watchdog's report, once it trips, taken: its test expected it.
+    pub(super) fn tripped(&self) -> String {
+        awaited("the exchange's watchdog tripped", || self.trip.take())
+    }
+
     /// Play layer `layer`'s ring row of lead `lead` hinting `experts` of
     /// the layer `lead + 1` ahead in `step`: a row each, its one choice
-    /// (rank 0) at the harness's one choice a row.
+    /// (rank 0) at the harness's one choice a row, each an exact row's (row
+    /// 0, the step's only row unless it decodes ahead).
     pub(super) fn hint_at(&self, step: &ExpertStep, layer: usize, lead: usize, experts: &[i32]) {
         let ring = &self.layers[layer].3;
         let base = lead * WORDS.ring_words() as usize;
         for (index, &expert) in experts.iter().enumerate() {
-            let entry = base + (constants::RING_EXPERTS + constants::HINT_ENTRY_WORDS * index as u64) as usize;
+            let entry = base + constants::HINT_ENTRY(index as u64) as usize;
             ring.store(entry + constants::HINT_EXPERT as usize, expert);
             ring.store(entry + constants::HINT_RANK as usize, 0);
+            ring.store(entry + constants::HINT_ROW as usize, 0);
         }
         ring.store(base + constants::RING_COUNT as usize, experts.len() as i32);
         ring.store(base + constants::RING_SEQUENCE as usize, low_word(step.sequence()));
+    }
+
+    /// Play layer `layer`'s front ring naming `experts` its front row chose
+    /// in `step`, a two-row step ([`Self::two_row_step`]), each as rank 0
+    /// of batch row 1, its ahead row, at weight 0: `resolve` publishes it
+    /// once the step's request there is out, so it also shows the step
+    /// routed the layer.
+    pub(super) fn front_at(&self, step: &ExpertStep, layer: usize, experts: &[i32]) {
+        let ring = &self.layers[layer].6;
+        for (index, &expert) in experts.iter().enumerate() {
+            let entry = constants::HINT_ENTRY(index as u64) as usize;
+            ring.store(entry + constants::HINT_EXPERT as usize, expert);
+            ring.store(entry + constants::HINT_RANK as usize, 0);
+            ring.store(entry + constants::HINT_ROW as usize, 1);
+            ring.store(entry + constants::HINT_WEIGHT as usize, 0);
+        }
+        ring.store(constants::RING_COUNT as usize, experts.len() as i32);
+        ring.store(constants::RING_GUESSES as usize, guesses(step));
+        ring.store(constants::RING_SEQUENCE as usize, low_word(step.sequence()));
     }
 
     pub(super) fn staged(&self, kind: u64, record: i32) -> u8 {
@@ -1507,7 +1609,7 @@ impl Harness {
 pub(super) fn listed(list: &Words) -> Vec<(i32, i32)> {
     (0..list.load(constants::LIST_COUNT as usize) as usize)
         .map(|index| {
-            let entry = magnitude_kernels::list_extent(index as u64) as usize;
+            let entry = magnitude_kernels::constants::LIST_ENTRY(index as u64) as usize;
             (
                 list.load(entry + constants::LIST_FROM as usize),
                 list.load(entry + constants::LIST_TO as usize),
@@ -1530,4 +1632,21 @@ fn a_line_holds_back_a_read_ahead_however_late_its_reads_resubmit() {
     assert!(held.running(), "a read ahead was taken past the line");
     drop(held);
     line.finish();
+}
+
+/// A decode launch's batch row at `position`, of request 1's pass.
+/// The guess kinds word `step`'s rings and records carry (RING_GUESSES):
+/// each of its front rows (STEP_FRONT's bits) running on a chained guess.
+pub(super) fn guesses(step: &ExpertStep) -> i32 {
+    let chained = crate::GuessKind::Chained.word();
+    magnitude_kernels::step_guesses((0..u32::BITS as usize).filter(|&row| step.front() >> row & 1 == 1).map(|row| (row, chained)))
+}
+
+pub(super) fn row(position: u64, ahead: Option<AheadOf>) -> DecodeRow {
+    DecodeRow { position, request: crate::operation::RequestId(1), ahead }
+}
+
+/// The front row of a pass of one exact row: its guess.
+pub(super) fn front_row() -> Option<AheadOf> {
+    Some(AheadOf::new(1, 0, 0))
 }

@@ -19,8 +19,8 @@ use magnitude_service_contracts::{
     HardwareSnapshot, HardwareStore, HardwareTransferPath, HardwareVolume, InventoryError,
 };
 use seismic::{
-    Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, Inventory,
-    Contract, MachineFormFactor, PhysicalIdentity, ReportedBy, RuntimeStatus, Status, StoreKind,
+    Availability, BackendName, Contract, DeviceMemory, DeviceTopology, DiagnosticSource,
+    FormFactor, Inventory, PhysicalIdentity, ReportedBy, RuntimeStatus, Status, StoreKind,
 };
 use sha2::{Digest, Sha256};
 
@@ -40,38 +40,6 @@ pub fn execution_backend(backend: BackendName) -> ExecutionBackend {
     }
 }
 
-/// Descriptive facts about the machine that do not change while the service runs.
-struct MachineDescription {
-    machine: seismic::Machine,
-    cpu_model: Option<String>,
-    // Every count is the engine's own processors' (`seismic::Processors`): at least one, since
-    // the pool's count (`Processors::cores`) is.
-    chip_cores: usize,
-    logical_cpus: usize,
-    cpu_pool_cores: usize,
-}
-
-impl MachineDescription {
-    fn discover() -> Result<Self, String> {
-        let system = sysinfo::System::new_with_specifics(
-            sysinfo::RefreshKind::nothing().with_cpu(sysinfo::CpuRefreshKind::nothing()),
-        );
-        let processors = seismic::Processors::discover();
-        let cores = || processors.nodes().iter().flat_map(|node| &node.cores);
-        Ok(Self {
-            machine: seismic::Machine::discover(),
-            cpu_model: system
-                .cpus()
-                .first()
-                .map(|cpu| cpu.brand().trim().to_owned())
-                .filter(|brand| !brand.is_empty()),
-            chip_cores: cores().count(),
-            logical_cpus: cores().map(|core| core.threads.len()).sum(),
-            cpu_pool_cores: processors.cores()?.get(),
-        })
-    }
-}
-
 /// The resident worker's memory observations, when a model is loaded.
 pub trait ResidentMemory: Send + Sync + 'static {
     fn observe(&self) -> BoxFuture<'_, Option<MemoryObservation>>;
@@ -88,14 +56,13 @@ pub struct HardwareInventory {
     inventory: Arc<Inventory>,
     volumes: Arc<ServedVolumes>,
     serving: ServingDevice,
-    machine: Arc<MachineDescription>,
     resident: Arc<dyn ResidentMemory>,
 }
 
 impl HardwareInventory {
-    /// Describe the machine once; every snapshot then reads `inventory`'s current topology, a
-    /// fresh status sample and the resident worker's fresh observations, and reports `serving`
-    /// as the device the service serves on. An error is the host's processors unreadable.
+    /// Every snapshot reads `inventory`'s current topology, a fresh status sample and the
+    /// resident worker's fresh observations, and reports `serving` as the device the service
+    /// serves on.
     pub fn new(
         inventory: Arc<Inventory>,
         volumes: ServedVolumes,
@@ -106,7 +73,6 @@ impl HardwareInventory {
             inventory,
             volumes: Arc::new(volumes),
             serving,
-            machine: Arc::new(MachineDescription::discover()?),
             resident,
         })
     }
@@ -118,7 +84,6 @@ impl HardwareInventory {
         inventory: &Inventory,
         volumes: &ServedVolumes,
         serving: ServingDevice,
-        machine: &MachineDescription,
         resident: Option<&MemoryObservation>,
     ) -> Result<HardwareSnapshot, InventoryError> {
         let topology = inventory.topology();
@@ -131,7 +96,7 @@ impl HardwareInventory {
             sample: inventory.sample(&topology, &every),
             runtime: RuntimeStatus::default(),
         };
-        let mut snapshot = snapshot(&topology, &status, volumes, serving, machine)?;
+        let mut snapshot = snapshot(&topology, &status, volumes, serving)?;
         if let Some(resident) = resident {
             merge_resident(&mut snapshot.device_memory, resident);
         }
@@ -156,13 +121,9 @@ fn merge_resident(device_memory: &mut [HardwareDeviceMemory], resident: &MemoryO
 /// The wire name of the interface a value was reported by.
 pub fn reported_by(by: ReportedBy) -> HardwareReportedBy {
     match by {
-        ReportedBy::LinuxMemTotal => HardwareReportedBy::LinuxMemTotal,
+        ReportedBy::LinuxMemTotal | ReportedBy::LinuxSysinfo => HardwareReportedBy::LinuxMemTotal,
         ReportedBy::MacOsMemsize => HardwareReportedBy::MacOsMemsize,
         ReportedBy::WindowsTotalPhys => HardwareReportedBy::WindowsTotalPhys,
-        ReportedBy::LinuxMemAvailable => HardwareReportedBy::LinuxMemAvailable,
-        ReportedBy::MachMovablePages => HardwareReportedBy::MachMovablePages,
-        ReportedBy::MacOsFreePages => HardwareReportedBy::MacOsFreePages,
-        ReportedBy::WindowsPhysicalAndCommit => HardwareReportedBy::WindowsPhysicalAndCommit,
         ReportedBy::CpuAddressSpace => HardwareReportedBy::CpuAddressSpace,
         ReportedBy::MetalMaxBufferLength => HardwareReportedBy::MetalMaxBufferLength,
         ReportedBy::MetalRecommendedWorkingSet => HardwareReportedBy::MetalRecommendedWorkingSet,
@@ -176,14 +137,7 @@ pub fn reported_by(by: ReportedBy) -> HardwareReportedBy {
         ReportedBy::VulkanHeapsBeyondDedicated => HardwareReportedBy::VulkanHeapsBeyondDedicated,
         ReportedBy::VulkanMaxAllocation => HardwareReportedBy::VulkanMaxAllocation,
         ReportedBy::CudaTotalBeyondDedicated => HardwareReportedBy::CudaTotalBeyondDedicated,
-        ReportedBy::MetalWorkingSetBeyondDedicated => {
-            HardwareReportedBy::MetalWorkingSetBeyondDedicated
-        }
         ReportedBy::DxgiDedicatedMemory => HardwareReportedBy::DxgiDedicatedMemory,
-        ReportedBy::LinuxSysfsCache => HardwareReportedBy::LinuxSysfsCache,
-        ReportedBy::MacOsSysctlCache => HardwareReportedBy::MacOsSysctlCache,
-        ReportedBy::WindowsProcessorCache => HardwareReportedBy::WindowsProcessorCache,
-        ReportedBy::CudaL2Cache => HardwareReportedBy::CudaL2Cache,
         ReportedBy::FilesystemSize => HardwareReportedBy::FilesystemSize,
         ReportedBy::FilesystemAvailable => HardwareReportedBy::FilesystemAvailable,
     }
@@ -194,17 +148,10 @@ impl HardwareProvider for HardwareInventory {
         let inventory = Arc::clone(&self.inventory);
         let volumes = Arc::clone(&self.volumes);
         let serving = self.serving;
-        let machine = Arc::clone(&self.machine);
         Box::pin(async move {
             let resident = self.resident.observe().await;
             magnitude_service_utils::blocking::run(move || {
-                Self::snapshot_with(
-                    &inventory,
-                    &volumes,
-                    serving,
-                    &machine,
-                    resident.as_ref(),
-                )
+                Self::snapshot_with(&inventory, &volumes, serving, resident.as_ref())
             })
             .await
         })
@@ -224,7 +171,6 @@ fn snapshot(
     status: &Status,
     served: &ServedVolumes,
     serving: ServingDevice,
-    machine: &MachineDescription,
 ) -> Result<HardwareSnapshot, InventoryError> {
     let fit = Fit::new(topology, status).with_volumes(&served.reserves);
     let path_index = |id| {
@@ -354,8 +300,8 @@ fn snapshot(
                 executor: executor_id(path.executor()),
                 store: store_domain_id(topology, path.store()),
                 grant: path.grant().map(|grant| HardwareGrant {
-                    bytes: grant.value,
-                    basis: reported_by(grant.by),
+                    bytes: grant.bytes.value,
+                    basis: reported_by(grant.bytes.by),
                     remaining_bytes: remaining.map(|left| left.value),
                 }),
             })
@@ -391,29 +337,39 @@ fn snapshot(
         .duration_since(UNIX_EPOCH)
         .map_err(|error| internal(&error))?
         .as_millis();
+    let host = topology.host();
+    let cpu_pool_cores = host
+        .processors
+        .cores()
+        .map_err(InventoryError::Internal)?
+        .get();
     Ok(HardwareSnapshot {
         captured_at: u64::try_from(captured_at).map_err(|error| internal(&error))?,
         platform: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
-        system_product_name: machine.machine.name.clone(),
-        machine_identity: machine.machine.identity.as_ref().map(|identity| HardwareMachineIdentity {
-            manufacturer: identity.manufacturer.clone(),
-            model: identity.model.clone(),
-            family: identity.family.clone(),
-            version: identity.version.clone(),
-        }),
-        form_factor: match machine.machine.form_factor {
-            MachineFormFactor::Portable => HardwareFormFactor::Portable,
-            MachineFormFactor::Desktop => HardwareFormFactor::Desktop,
-            MachineFormFactor::AllInOne => HardwareFormFactor::AllInOne,
-            MachineFormFactor::MiniPc => HardwareFormFactor::MiniPc,
-            MachineFormFactor::Server => HardwareFormFactor::Server,
-            MachineFormFactor::Unknown => HardwareFormFactor::Unknown,
+        system_product_name: host.system.name.clone(),
+        machine_identity: host
+            .system
+            .identity
+            .as_ref()
+            .map(|identity| HardwareMachineIdentity {
+                manufacturer: identity.manufacturer.clone(),
+                model: identity.model.clone(),
+                family: identity.family.clone(),
+                version: identity.version.clone(),
+            }),
+        form_factor: match host.system.form_factor {
+            FormFactor::Portable => HardwareFormFactor::Portable,
+            FormFactor::Desktop => HardwareFormFactor::Desktop,
+            FormFactor::AllInOne => HardwareFormFactor::AllInOne,
+            FormFactor::MiniPc => HardwareFormFactor::MiniPc,
+            FormFactor::Server => HardwareFormFactor::Server,
+            FormFactor::Unknown => HardwareFormFactor::Unknown,
         },
-        cpu_model: machine.cpu_model.clone(),
-        chip_cores: machine.chip_cores,
-        logical_cpus: machine.logical_cpus,
-        cpu_pool_cores: machine.cpu_pool_cores,
+        cpu_model: (!host.cpu_model.is_empty()).then(|| host.cpu_model.clone()),
+        chip_cores: host.processors.chip_cores(),
+        logical_cpus: host.processors.logical_cpus(),
+        cpu_pool_cores,
         native_build: build_identity::native_build(),
         backend_diagnostics,
         topology_fingerprint: format!("{:x}", Sha256::digest(topology.normalized().as_bytes())),
@@ -490,7 +446,6 @@ mod tests {
             &inventory,
             &served,
             ServingDevice::of(seismic::ExecutorSelector::HostCpu),
-            &MachineDescription::discover().unwrap(),
             None,
         )
         .unwrap();
@@ -511,7 +466,6 @@ mod tests {
             &inventory,
             &ServedVolumes::new(Arc::new(VolumeReserves::new(None))),
             serving,
-            &MachineDescription::discover().unwrap(),
             None,
         )
         .unwrap();

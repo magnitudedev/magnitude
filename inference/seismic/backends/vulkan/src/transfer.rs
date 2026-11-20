@@ -3,7 +3,7 @@
 //! (`seismic_runtime::native::transfer`): each batch one command buffer of
 //! `vkCmdCopyBuffer` regions, and of each signal a `vkCmdFillBuffer` of its
 //! word behind a barrier over the copies before it, submitted to the second
-//! queue (`Facts::side_family`, which pool blocks' zero fills share),
+//! queue (`DeviceInfo::side_family`, which pool blocks' zero fills share),
 //! signalling the queue's own timeline semaphore with the batch's value.
 //! The semaphore's value is the last batch complete.
 //!
@@ -98,7 +98,7 @@ impl TransferQueue {
             unsafe {
                 raw.create_command_pool(
                     &vk::CommandPoolCreateInfo::default()
-                        .queue_family_index(device.inner.facts.side_family.expect("a second queue has a family"))
+                        .queue_family_index(device.inner.info.side_family.expect("a second queue has a family"))
                         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
                     None,
                 )
@@ -291,9 +291,9 @@ mod tests {
     #[test]
     fn a_batch_lands_its_runs_and_signals() {
         for description in crate::test_devices() {
-            let device = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).expect("a device meeting the floor opens");
+            let device = Device::open(description.info.uuid, crate::unbounded_stores(&description.info), &Default::default()).expect("a device meeting the floor opens");
             let queue = TransferQueue::new(&device);
-            assert_eq!(queue.is_ok(), device.has_side_queue(), "{}: a transfer queue exactly where a side queue is", description.facts.name);
+            assert_eq!(queue.is_ok(), device.has_side_queue(), "{}: a transfer queue exactly where a side queue is", description.info.name);
             let Ok(queue) = queue else {
                 continue;
             };
@@ -324,14 +324,14 @@ mod tests {
                     TransferItem::Signal { word: TransferEnd(&words, 4), value: 9 },
                 ], 1)
                 .unwrap();
-            assert!(queue.wait(1, Duration::from_secs(10)).unwrap(), "{}: the batch completes", description.facts.name);
+            assert!(queue.wait(1, Duration::from_secs(10)).unwrap(), "{}: the batch completes", description.info.name);
             let mut signalled = [0u8; 8];
             device.read(&words, 0, &mut signalled).unwrap();
-            assert_eq!(signalled, [7, 0, 0, 0, 9, 0, 0, 0], "{}: each signal is written", description.facts.name);
+            assert_eq!(signalled, [7, 0, 0, 0, 9, 0, 0, 0], "{}: each signal is written", description.info.name);
             let mut landed = vec![0u8; bytes as usize];
             device.read(&destination, 0, &mut landed).unwrap();
             let expected = pattern[half as usize..].iter().chain(&pattern[..half as usize]).copied().collect::<Vec<_>>();
-            assert!(landed == expected, "{}: the runs land byte for byte", description.facts.name);
+            assert!(landed == expected, "{}: the runs land byte for byte", description.info.name);
             // Back to host storage: the destination's first 4 KiB.
             let back = device.allocate_upload(4096, 256, &own).expect("upload storage");
             let run = TransferRun { source: TransferEnd(&destination, 0), destination: TransferEnd(&back, 0), bytes: 4096 };
@@ -339,14 +339,14 @@ mod tests {
             assert!(queue.wait(2, Duration::from_secs(10)).unwrap());
             let mut returned = vec![0u8; 4096];
             device.read(&back, 0, &mut returned).unwrap();
-            assert!(returned == expected[..4096], "{}: the device's bytes return to the host", description.facts.name);
+            assert!(returned == expected[..4096], "{}: the device's bytes return to the host", description.info.name);
             let started = std::time::Instant::now();
             let run = TransferRun { source: TransferEnd(&source, 0), destination: TransferEnd(&destination, 0), bytes };
             queue.copy(&[TransferItem::Run(run)], 3).unwrap();
             assert!(queue.wait(3, Duration::from_secs(10)).unwrap());
             eprintln!(
                 "{}: transfer of {} MiB at {:.2} GB/s",
-                description.facts.name,
+                description.info.name,
                 bytes >> 20,
                 bytes as f64 / started.elapsed().as_secs_f64() / 1e9
             );

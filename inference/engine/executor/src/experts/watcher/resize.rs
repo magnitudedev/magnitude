@@ -10,7 +10,8 @@
 //! only once the host maps it. Each carries the bank's slots, which the
 //! watcher's telemetry reads.
 
-use super::{Shared, Step};
+use super::Shared;
+use super::steps::{ScratchGroup, UnmapStep};
 use super::core::PlacedWords;
 use super::residency::Residency;
 use super::telemetry::GroupReadWords;
@@ -77,8 +78,8 @@ impl Candidates {
 pub(super) enum Ask {
     /// Evict `evicting`'s records down to the deepest of `candidates` whose
     /// records hold every one in flight, beside the running scratch-served
-    /// chain whose steps run from `first` through `last` where given.
-    Evict { evicting: Evicting, candidates: Candidates, chain: Option<(Step, Step)> },
+    /// chain, prompt group `chain`'s steps, where given.
+    Evict { evicting: Evicting, candidates: Candidates, chain: Option<ScratchGroup> },
     /// Serve the places the bank holds from now by their words.
     Place(PlacedWords),
 }
@@ -165,7 +166,8 @@ enum Answer {
     Done(Trip),
     /// A shrink: evicted, none where even its shallowest candidate keeps
     /// fewer records than those in flight (or beside a chain it may not
-    /// evict), or refused.
+    /// evict, or while a victim's write-back holds its record), or
+    /// refused.
     Evicted(Result<Option<Evicted>, String>),
 }
 
@@ -219,14 +221,15 @@ impl ResizeHandoff {
 impl Shared {
     /// Evict `evicting`'s records down to the deepest of `candidates` whose
     /// every group keeps its records in flight, beside running steps or
-    /// not, the running scratch-served chain whose steps run from `first`
-    /// through `last` where `chain` names one: residency answers at its next
+    /// not, the running scratch-served chain, prompt group `chain`'s steps,
+    /// where given: residency answers at its next
     /// turn, waiting on no flight ([`Residency::serve_evict`]). Nothing
     /// moves: each group keeps its most valuable experts where their bytes
     /// are, and evicts the rest, free records first. None where even the
-    /// shallowest candidate keeps fewer records than those in flight, or
-    /// beside a chain it may not evict.
-    pub fn shrink(&self, evicting: Evicting, candidates: Candidates, chain: Option<(Step, Step)>) -> Result<Option<Evicted>, String> {
+    /// shallowest candidate keeps fewer records than those in flight,
+    /// beside a chain it may not evict, or where a bank victim's exit
+    /// writes it back, which holds its record until the copy ends.
+    pub fn shrink(&self, evicting: Evicting, candidates: Candidates, chain: Option<ScratchGroup>) -> Result<Option<Evicted>, String> {
         match self.ask(Ask::Evict { evicting, candidates, chain })? {
             Answer::Evicted(evicted) => evicted,
             Answer::Done(_) => unreachable!("a shrink is answered by its evictions"),
@@ -331,7 +334,24 @@ impl Residency {
     pub(super) fn join(&mut self) -> bool {
         let joins = self.shared.joins.take();
         let count = joins.len();
+        let mut coalesced: Vec<Join> = Vec::new();
         for join in joins {
+            match (coalesced.last_mut(), join) {
+                (Some(Join::Bank { records: acc }), Join::Bank { records }) => {
+                    for (dst, src) in acc.iter_mut().zip(records) {
+                        dst.extend(src);
+                    }
+                }
+                (Some(Join::Landed { records: acc, views: acc_views }), Join::Landed { records, views }) => {
+                    for (dst, src) in acc.iter_mut().zip(records) {
+                        dst.extend(src);
+                    }
+                    *acc_views = views;
+                }
+                (_, join) => coalesced.push(join),
+            }
+        }
+        for join in coalesced {
             match join {
                 Join::Bank { records } => {
                     for (group, records) in records.into_iter().enumerate() {
@@ -347,7 +367,6 @@ impl Residency {
             }
         }
         if count > 0 {
-            self.shared.telemetry.resized(self.core.bank_records());
             self.owed.joined += count;
         }
         count > 0
@@ -414,8 +433,8 @@ impl Residency {
     /// way to the proof an answer takes.
     fn publish_resized(&mut self) -> Published {
         self.refill_tier();
-        let steps = self.shared.steps.clone();
-        steps.while_idle(|| self.publish_policy());
+        self.publish_policy();
+        self.shared.write_staged();
         self.publish_lines();
         Published(())
     }
@@ -425,10 +444,11 @@ impl Residency {
     /// (`Directory::evictions`, `Directory::host_evictions`), moving
     /// nothing, beside running steps or not. Each evicted expert is unmapped
     /// from the first step not yet begun; beside the running scratch-served
-    /// chain `chain` names, from the chain's first step where none of its
-    /// requests taken so far routed it at its layer, so every step of the
-    /// chain still to decide the layer's hits resolves it a miss and its
-    /// rounds read it, as any cold expert. The steps before still read the
+    /// chain, prompt group `chain`'s steps, from the chain's first step
+    /// ([`UnmapStep`]) where none of its requests taken so far routed it at
+    /// its layer, so every step of the chain still to decide the layer's
+    /// hits resolves it a miss and its rounds read it, as any cold expert.
+    /// The steps before still read the
     /// rest where they are: the owner releases their storage once every
     /// pass that may read them is submitted (`Evicted::decided`).
     ///
@@ -440,17 +460,19 @@ impl Residency {
     /// reads), evict as between flights. None beside a chain once a group
     /// began after it, whose steps decided their hits by the map before the
     /// eviction; nor where even the shallowest candidate keeps more records
-    /// of some group than it may evict now.
-    fn serve_evict(&mut self, evicting: Evicting, candidates: &Candidates, chain: Option<(Step, Step)>, trip: impl Fn() -> Trip) -> Result<Option<Evicted>, String> {
+    /// of some group than it may evict now; nor where a bank victim's exit
+    /// writes it back (`Directory::evict`), whose record the next boundary
+    /// evicts once the copy ends.
+    fn serve_evict(&mut self, evicting: Evicting, candidates: &Candidates, chain: Option<ScratchGroup>, trip: impl Fn() -> Trip) -> Result<Option<Evicted>, String> {
         let running = !self.shared.steps.idle();
         let kept = (0..self.core.groups.len())
             .map(|group| {
                 evicting == Evicting::Bank
                     && running
-                    && self.core.layers.iter().zip(&self.whole).any(|(layer, &whole)| whole && layer.group == group)
+                    && self.core.layers.iter().enumerate().any(|(index, layer)| layer.group == group && self.shared.telemetry.is_whole(index))
             })
             .collect::<Vec<_>>();
-        if chain.is_some_and(|(_, last)| !self.shared.steps.latest(last)) {
+        if chain.is_some_and(|chain| !self.shared.steps.latest(chain.last())) {
             return Ok(None);
         }
         // Ranked by every step that ended before it, whichever turn of this
@@ -475,22 +497,19 @@ impl Residency {
         };
         let evicted = targets.iter().enumerate().map(|(group, &target)| evictable(group, target)).collect::<Vec<_>>();
         // An expert the chain's steps routed at its layer stays mapped for
-        // them; any other leaves from its first step.
+        // them, unmapped from the first step not yet begun; any other leaves
+        // from the chain's first step.
         let scratch = &self.scratch;
-        let routed = |(layer, expert): (usize, usize)| chain.is_none_or(|(first, _)| scratch.routed(first, layer, expert));
-        let first = chain.map_or(Step::MAX, |(first, _)| first);
+        let leaves_first = |(layer, expert): (usize, usize)| chain.filter(|chain| !scratch.routed(chain.first(), layer, expert)).map(UnmapStep::from);
         match evicting {
             Evicting::Bank => {
                 let (directory, steps) = (&mut self.core.directory, &self.core.steps);
-                steps.unbegun(|at| {
-                    for (group, records) in evicted.iter().enumerate() {
-                        let records = records.iter().map(|&record| record as usize).collect::<Vec<_>>();
-                        directory.evict(group, &records, last_read, |staged| match routed(staged) {
-                            true => at.next(),
-                            false => first.min(at.next()),
-                        });
-                    }
-                });
+                let records = evicted.iter().map(|records| records.iter().map(|&record| record as usize).collect::<Vec<_>>()).collect::<Vec<_>>();
+                // A victim whose exit writes it back holds its record until
+                // the copy ends: the shrink waits a boundary for it.
+                if !steps.unbegun(|at| directory.evict(&records, last_read, |staged| leaves_first(staged).map_or(at.into(), |first| first.min(at.into())), at)) {
+                    return Ok(None);
+                }
             }
             Evicting::Landed => {
                 // The views without the evicted records are formed first, so a
@@ -498,16 +517,12 @@ impl Residency {
                 let views = self.core.tier_views(&evicted)?;
                 let directory = &mut self.core.directory;
                 for (group, records) in evicted.iter().enumerate() {
-                    directory.evict_host(group, records, |staged| match routed(staged) {
-                        true => Step::MAX,
-                        false => first,
-                    });
+                    directory.evict_host(group, records, leaves_first);
                 }
                 self.address_tier(views);
             }
         }
-        self.shared.telemetry.resized(self.core.bank_records());
-        let decided = chain.and_then(|(first, _)| self.scratch.decided(first));
+        let decided = chain.and_then(|chain| self.scratch.decided(chain.first()));
         Ok(Some(Evicted { slots, records: evicted, decided, trip: trip() }))
     }
 }

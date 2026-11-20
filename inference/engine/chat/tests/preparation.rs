@@ -427,7 +427,7 @@ fn json_constrained_generation_starts_with_and_without_forced_runs() {
         .unwrap();
         // The executor installs fresh numerical state before the first round.
         generation.resume_at(None).unwrap();
-        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 64) else {
+        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 64, magnitude_generation::FrontGrant::UpTo(0)) else {
             panic!("a fresh plain generation starts a target round");
         };
         let forward = round.round_forward();

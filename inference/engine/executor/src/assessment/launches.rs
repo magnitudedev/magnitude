@@ -33,10 +33,12 @@ const ROW_DIMENSIONS: [&str; 2] = ["M", "O"];
 pub struct Kernel {
     name: &'static str,
     /// The entry's declaration on a backend at a request's elements.
-    implementation: fn(
-        BackendName,
-        &[(&str, Element)],
-    ) -> Result<Option<&'static NativeImplementation>, CheckedBundleError>,
+    implementation: Option<
+        fn(
+            BackendName,
+            &[(&str, Element)],
+        ) -> Result<Option<&'static NativeImplementation>, CheckedBundleError>,
+    >,
 }
 
 impl Kernel {
@@ -44,7 +46,15 @@ impl Kernel {
     pub fn of<E: Entry>() -> Self {
         Self {
             name: E::NAME,
-            implementation: seismic::generated::native_implementation_at::<E>,
+            implementation: Some(seismic::generated::native_implementation_at::<E>),
+        }
+    }
+
+    /// A kernel identified by its entry name (from `SizingDraft`'s census).
+    pub(crate) fn named(name: &'static str) -> Self {
+        Self {
+            name,
+            implementation: None,
         }
     }
 
@@ -157,7 +167,13 @@ impl Declarations {
                     .iter()
                     .map(|(name, element)| (name.as_str(), *element))
                     .collect::<Vec<_>>();
-                let implementation = (kernel.implementation)(self.backend, &elements)
+                let implementation_fn = kernel.implementation.ok_or_else(|| {
+                    launch_error(format!(
+                        "`{}` was named without a bundle declaration",
+                        kernel.name
+                    ))
+                })?;
+                let implementation = (implementation_fn)(self.backend, &elements)
                     .map_err(|error| launch_error(format!("`{}`: {error}", kernel.name)))?
                     .ok_or(AssessmentError::Unimplemented {
                         entry: kernel.name,
@@ -209,10 +225,12 @@ impl Declarations {
     ) -> Result<Launches, AssessmentError> {
         Ok(Launches {
             kernel,
-            prepared: self.prepared(kernel, recipe, statics)?,
-            recipe,
-            dimensions: dimensions.to_vec(),
-            words,
+            source: LaunchSource::Declared {
+                prepared: self.prepared(kernel, recipe, statics)?,
+                recipe,
+                dimensions: dimensions.to_vec(),
+                words,
+            },
         })
     }
 }
@@ -233,58 +251,152 @@ pub fn operand_recipe(elements: impl IntoIterator<Item = Element>) -> OperandRec
     }
 }
 
+#[derive(Clone)]
+enum LaunchSource {
+    Declared {
+        prepared: Vec<Prepared>,
+        recipe: OperandRecipe,
+        dimensions: Vec<(&'static str, u64)>,
+        words: &'static Words,
+    },
+    Contract {
+        backend: BackendName,
+        elements: Vec<(String, Element)>,
+        dimensions: Vec<(String, u64)>,
+        words: &'static Words,
+        eval_launches: crate::programs::graph::sizing::LaunchesEvalFn,
+    },
+}
+
+impl fmt::Debug for LaunchSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Declared { recipe, dimensions, words, .. } => formatter
+                .debug_struct("Declared")
+                .field("recipe", recipe)
+                .field("dimensions", dimensions)
+                .field("words", words)
+                .finish(),
+            Self::Contract { backend, elements, dimensions, words, .. } => formatter
+                .debug_struct("Contract")
+                .field("backend", backend)
+                .field("elements", elements)
+                .field("dimensions", dimensions)
+                .field("words", words)
+                .finish(),
+        }
+    }
+}
+
 /// What a call dispatches as a function of its rows.
 #[derive(Clone, Debug)]
 pub struct Launches {
     kernel: Kernel,
-    prepared: Vec<Prepared>,
-    recipe: OperandRecipe,
-    dimensions: Vec<(&'static str, u64)>,
-    words: &'static Words,
+    source: LaunchSource,
 }
 
 impl PartialEq for Launches {
     fn eq(&self, other: &Self) -> bool {
-        self.kernel == other.kernel
-            && self.recipe == other.recipe
-            && self.dimensions == other.dimensions
-            && self.words == other.words
+        if self.kernel != other.kernel {
+            return false;
+        }
+        match (&self.source, &other.source) {
+            (
+                LaunchSource::Declared { recipe: r1, dimensions: d1, words: w1, .. },
+                LaunchSource::Declared { recipe: r2, dimensions: d2, words: w2, .. },
+            ) => r1 == r2 && d1 == d2 && w1 == w2,
+            (
+                LaunchSource::Contract { backend: b1, elements: e1, dimensions: d1, words: w1, .. },
+                LaunchSource::Contract { backend: b2, elements: e2, dimensions: d2, words: w2, .. },
+            ) => b1 == b2 && e1 == e2 && d1 == d2 && w1 == w2,
+            _ => false,
+        }
     }
 }
 
 impl Launches {
+    /// Construct launch evaluator directly from a `SizingDraft` recorded call,
+    /// evaluating active launches via compiled `EntryContract::contract_active_launches`
+    /// without decoding `.seismicbundle` metadata.
+    pub(crate) fn from_sized_call(
+        call: &crate::programs::graph::sizing::SizedCall,
+        words: &'static Words,
+    ) -> Self {
+        Self {
+            kernel: Kernel::named(call.entry),
+            source: LaunchSource::Contract {
+                backend: call.backend,
+                elements: call.elements.clone(),
+                dimensions: call.dimensions.clone(),
+                words,
+                eval_launches: call.eval_launches,
+            },
+        }
+    }
+
     /// The entry the call runs.
     pub fn kernel(&self) -> Kernel {
         self.kernel
     }
 
-    /// The launches one call dispatches at `rows` rows. Every specialization
-    /// of the entry the load prepares must dispatch as many: the walk names
-    /// the entry, not which of its specializations a call takes.
+    /// The launches one call dispatches at `rows` rows.
     pub fn at(&self, rows: u64) -> Result<u64, AssessmentError> {
-        let mut counts = self
-            .prepared
-            .iter()
-            .map(|prepared| self.count(prepared, rows))
-            .collect::<Result<Vec<_>, _>>()?;
-        counts.sort_unstable();
-        counts.dedup();
-        match counts[..] {
-            [count] => Ok(count),
-            _ => Err(launch_error(format!(
-                "the prepared specializations of `{}` dispatch {counts:?} launches at {rows} rows",
-                self.kernel.name
-            ))),
+        match &self.source {
+            LaunchSource::Contract {
+                backend,
+                elements,
+                dimensions,
+                words,
+                eval_launches,
+            } => {
+                let els: Vec<(&str, Element)> =
+                    elements.iter().map(|(n, e)| (n.as_str(), *e)).collect();
+                let dims: Vec<(&str, u64)> = dimensions
+                    .iter()
+                    .map(|(n, v)| {
+                        let value = if ROW_DIMENSIONS.contains(&n.as_str()) {
+                            rows
+                        } else {
+                            *v
+                        };
+                        (n.as_str(), value)
+                    })
+                    .collect();
+                (eval_launches)(*backend, &els, &dims, words).map_err(|error| {
+                    launch_error(format!("`{}` at {rows} rows: {error}", self.kernel.name))
+                })
+            }
+            LaunchSource::Declared { prepared, dimensions, words, .. } => {
+                let mut counts = prepared
+                    .iter()
+                    .map(|prepared| self.count(prepared, dimensions, words, rows))
+                    .collect::<Result<Vec<_>, _>>()?;
+                counts.sort_unstable();
+                counts.dedup();
+                match counts[..] {
+                    [count] => Ok(count),
+                    _ => Err(launch_error(format!(
+                        "the prepared specializations of `{}` dispatch {counts:?} launches at {rows} rows",
+                        self.kernel.name
+                    ))),
+                }
+            }
         }
     }
 
-    fn count(&self, prepared: &Prepared, rows: u64) -> Result<u64, AssessmentError> {
+    fn count(
+        &self,
+        prepared: &Prepared,
+        dimensions: &[(&'static str, u64)],
+        words: &'static Words,
+        rows: u64,
+    ) -> Result<u64, AssessmentError> {
         let statics = prepared.specialization.statics();
         let mut values = BTreeMap::<&str, u64>::new();
         for (name, value) in statics {
             values.insert(name.as_str(), *value);
         }
-        for (name, value) in &self.dimensions {
+        for (name, value) in dimensions {
             values.insert(name, *value);
         }
         for name in ROW_DIMENSIONS {
@@ -319,8 +431,7 @@ impl Launches {
             }
             let mut encoded = true;
             for condition in &launch.conditions {
-                let (_, _, set) = self
-                    .words
+                let (_, _, set) = words
                     .iter()
                     .find(|(word, index, _)| *word == condition.word && *index == condition.index)
                     .ok_or_else(|| {

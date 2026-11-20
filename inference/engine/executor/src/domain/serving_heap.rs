@@ -10,8 +10,132 @@
 use super::{BankHolding, BankStep, DomainError, ExecutorDomain, OptionalComponent, ProgramFamily, StateBindings};
 use crate::experts::derived::BankMove;
 use crate::memory::ledger::{CacheKind, Cached, Claim, CommittedKind, Keeping, Value};
-use crate::workload::WorkloadRates;
+use magnitude_cost_model::WorkloadRates;
 use std::time::Instant;
+
+/// What the form and depth of a decode launch's guessed rows are decided
+/// on ([`ExecutorDomain::two_row_pricing`]): the decode's passes as the
+/// bank's watcher measured them (none before one is timed), the load's
+/// launch prices as they stand, the counted decode's context, the rows a
+/// launch of chained decode passes holds
+/// (`crate::ResourceLimits::chained_rows`), the acceptable rows a pass of
+/// the load's method may verify (its draft rows), and the host's turn after
+/// a verify pass (`overhead`, none before one is timed).
+pub struct TwoRowPricing {
+    measured: Option<crate::experts::Measured>,
+    prices: magnitude_cost_model::LaunchPrices,
+    depth: u32,
+    rows: usize,
+    verifies: usize,
+    pub(super) overhead: Option<f64>,
+}
+
+/// A decode launch's pass as the regime decides it
+/// ([`TwoRowPricing::regime`]): what it is decided on, the depth the latest
+/// pass ran (within the launch's), the front depth chosen (a queued pass's,
+/// [`magnitude_cost_model::Regime::depth`]), and the form and depth a pass
+/// the host builds wants ([`magnitude_cost_model::Regime::pass`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrontRegime {
+    pub regime: magnitude_cost_model::Regime,
+    pub running: usize,
+    pub depth: usize,
+    pub pass: magnitude_cost_model::Form,
+}
+
+impl TwoRowPricing {
+    /// Of a pass the host builds of `requests`, each decoding a row,
+    /// `fronted` of them able to run guessed rows (`crate::TwoRowDecode`)
+    /// in the order they take them, the form and the most guessed rows each
+    /// runs ([`crate::FrontPass::Built`]; none of one absent): the regime's pass
+    /// ([`Self::regime`]), deeper than the latest pass ran by one at most
+    /// after a front pass (the head lengthens a chain by one a pass; after
+    /// a verify pass the head transaction drafts the chain to the pass's
+    /// depth), run by as many of `fronted`, first first, as the launch's
+    /// rows hold beside every exact row at it
+    /// ([`crate::two_row::fronted_requests`]); front passes of no guessed
+    /// row before the regime is measured.
+    pub fn built(
+        &self,
+        requests: &[crate::RequestId],
+        fronted: &[crate::RequestId],
+    ) -> Result<crate::FrontPass, DomainError> {
+        let Some(FrontRegime { running, pass, .. }) = self.regime(requests.len(), fronted.len())? else {
+            return Ok(crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() });
+        };
+        let verifying = self.measured.as_ref().is_some_and(|measured| measured.verifying);
+        let reach = |depth: usize| if verifying { depth } else { depth.min(running + 1) };
+        let (form, depth) = match pass {
+            magnitude_cost_model::Form::Front(depth) => (crate::BuiltForm::Front, reach(depth)),
+            magnitude_cost_model::Form::Verify(depth) => (crate::BuiltForm::Verify, reach(depth)),
+        };
+        let count = crate::two_row::fronted_requests(self.rows, requests.len(), depth).min(fronted.len());
+        Ok(crate::FrontPass::Built { form, depths: fronted[..count].iter().map(|&request| (request, depth)).collect() })
+    }
+
+    /// The regime a launch of `requests` requests, `fronted` of them able
+    /// to run guessed rows, is decided by
+    /// (`magnitude_cost_model::Regime::pass`, the one owner of it); none
+    /// where no request can, or before the measured passes counted a miss
+    /// and the ranking's shadows read a decode step.
+    ///
+    /// The regime is the measured passes': their resident compute at each
+    /// depth the launch may run, measured where the window holds passes of
+    /// it, else the measured depth's nearest below it (or above) scaled by
+    /// the launch prices' compute at the two (the prior a measurement
+    /// refines); the ranking's misses at each depth of foresight
+    /// (`Reuse::shadows`); the first front row's stand rate; the stall a
+    /// miss held a plain pass; and every term besides the GPU's
+    /// (`magnitude_cost_model::Terms::each_path`), each its seconds a miss
+    /// and, on the drive, the reads ahead nothing used each depth led; and
+    /// a verify pass's rows' stand rates at each depth the load verifies,
+    /// and the host's turn after one.
+    pub fn regime(&self, requests: usize, fronted: usize) -> Result<Option<FrontRegime>, DomainError> {
+        let Some(measured) = self.measured.as_ref().filter(|_| fronted > 0) else {
+            return Ok(None);
+        };
+        let (Some(paths), Some(front), Some(verify)) = (
+            measured.paths.clone(),
+            measured.needed[0].into_iter().collect::<Option<Vec<_>>>(),
+            measured.needed[1].into_iter().collect::<Option<Vec<_>>>(),
+        ) else {
+            return Ok(None);
+        };
+        let needed = magnitude_cost_model::NeededByForm { front, verify };
+        let deepest = (1..crate::experts::DEPTHS)
+            .rev()
+            .find(|&depth| crate::two_row::fronted_requests(self.rows, requests, depth).min(fronted) > 0)
+            .unwrap_or(0);
+        let rows = |rows: usize| u32::try_from(rows).map_err(|_| DomainError::invariant("a decode launch's rows exceed u32"));
+        // A launch at `depth` holds its requests' exact rows and the front
+        // rows of those that front at it, which read their experts as the
+        // decode's routes measured them.
+        let routes = measured.routes();
+        let price = |depth: usize| {
+            let fronting = crate::two_row::fronted_requests(self.rows, requests, depth).min(fronted);
+            self.prices
+                .front(rows(requests)?, rows(fronting)?, rows(depth)?, self.depth, &routes)
+                .map(|form| form.streamed)
+                .map_err(|error| DomainError::invariant(format!("the decode launch: {error}")))
+        };
+        let measured_at = |depth: usize| measured.terms[depth].map(|terms| terms.compute);
+        let resident = (0..=deepest)
+            .map(|depth| match measured_at(depth) {
+                Some(resident) => Ok(resident),
+                None => {
+                    let nearest = (0..=depth).rev().chain(depth + 1..crate::experts::DEPTHS).find(|&at| measured_at(at).is_some());
+                    let at = nearest.expect("a timed pass has a depth");
+                    let resident = measured_at(at).expect("the nearest measured depth");
+                    Ok(resident * price(depth)? / price(at.min(deepest))?)
+                }
+            })
+            .collect::<Result<Vec<_>, DomainError>>()?;
+        let accepts = measured.accepts[..self.verifies.min(measured.accepts.len())].to_vec();
+        let regime = magnitude_cost_model::Regime { resident, needed, stand: measured.stand, accepts, stall: measured.stall, overhead: self.overhead, paths };
+        let (depth, pass) = (regime.depth(), regime.pass());
+        Ok(Some(FrontRegime { regime, running: measured.depth.min(deepest), depth, pass }))
+    }
+}
 
 /// What following the bank's target did
 /// ([`ExecutorDomain::follow_cache_targets`]).
@@ -165,7 +289,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None => BankStep::Deferred,
             Some(_) => {
                 let experts = self.measures.as_ref().and_then(|measures| measures.experts.as_ref());
-                bank.shrink(holding, to, &mut || self.queue.conclude(&mut self.target, experts), wake)?
+                bank.shrink(holding, to, &mut || self.queue.conclude(&mut self.target, experts, Some(bank)), wake)?
             }
         };
         match step {
@@ -194,20 +318,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// The slots the bank and its host tier hold now, as the decode
     /// prices them.
-    fn held_slots(&self) -> Result<Option<crate::assessment::HeldSlots>, DomainError> {
+    fn held_slots(&self) -> Result<Option<magnitude_cost_model::HeldSlots>, DomainError> {
         let Some(bank) = self.family.expert_bank() else {
             return Ok(None);
         };
         let count = |value: u64| usize::try_from(value).expect("invariant violated: a bank's slots exceed the host's");
         let host = bank.residency()?.host.map_or(0, |host| host.slots);
-        Ok(Some(crate::assessment::HeldSlots { slots: count(bank.slots()), host: count(host) }))
+        Ok(Some(magnitude_cost_model::HeldSlots { slots: count(bank.slots()), host: count(host) }))
     }
 
     /// The workload prior of the load's planned context and limits
     /// (`planning::Prior`).
-    fn prior(&self) -> Result<crate::planning::Prior, DomainError> {
+    fn prior(&self) -> Result<magnitude_cost_model::Prior, DomainError> {
         let context = self.execution.resources().target_state().context_rows as u64;
-        crate::planning::Prior::of(context, self.execution.policy().limits())
+        crate::planning::prior(context, self.execution.policy().limits())
             .map_err(|error| DomainError::invariant(format!("the workload prior: {error}")))
     }
 
@@ -227,7 +351,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let price = self.decode_price()?;
         if let (Some(bank), Some(price), Some(held), Some(plan)) = (self.family.expert_bank(), price.as_ref(), self.held_slots()?, self.expert_bank_plan()) {
             let floor = usize::try_from(plan.floor()).expect("invariant violated: a bank's slots exceed the host's");
-            let saved = price.step(crate::assessment::HeldSlots { slots: floor.min(held.slots), ..held }).total_seconds - price.step(held).total_seconds;
+            let saved = price.step(magnitude_cost_model::HeldSlots { slots: floor.min(held.slots), ..held }).total_seconds - price.step(held).total_seconds;
             // A bank at its floor holds no cache to value.
             if let Some(bytes) = std::num::NonZeroU64::new(self.resources.ledgers().device().estimate().cache_of(CacheKind::Bank)) {
                 bank.value(Value::recompute(saved.max(0.0), self.served.decode_steps, bytes));
@@ -408,12 +532,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// step until the load serves its own. None before the load's step is
     /// measured.
     pub fn serving_prior(&self) -> Result<Option<WorkloadRates>, DomainError> {
-        let Some(step) = self.load_costs().map(|costs| &costs.step) else {
+        let Some(prices) = self.launch_prices() else {
             return Ok(None);
         };
         let prior = self.prior()?;
         let resident = |rows: u32, depth: u32| {
-            step(rows, depth)
+            prices
+                .launch(rows, depth)
                 .map(|forms| forms.resident)
                 .map_err(|error| DomainError::invariant(format!("the decode step: {error}")))
         };
@@ -426,6 +551,54 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None => resident(1, prior.decode_depth)?,
         };
         prior.rates(step_seconds, resident).map(Some)
+    }
+
+    /// What a decode launch now pairs on ([`TwoRowPricing`]): none without a
+    /// priced bank, or at a whole one, where no launch pairs, so a load that
+    /// cannot pair plans no request's two-row pass. Taken afresh for every
+    /// launch from the bank's live size, its watcher's measured passes, the
+    /// host's turns after verify passes and the pass queued behind the last
+    /// flight.
+    pub fn two_row_pricing(&self) -> Result<Option<TwoRowPricing>, DomainError> {
+        let (Some(price), Some(held), Some(prices), Some(bank)) = (self.decode_price()?, self.held_slots()?, self.launch_prices(), self.family.expert_bank()) else {
+            return Ok(None);
+        };
+        Ok((!price.whole(held)).then(|| TwoRowPricing {
+            measured: bank.measured(),
+            prices: prices.clone(),
+            depth: price.depth(),
+            rows: self.chained_rows(),
+            verifies: self.execution.policy().method().draft_rows(),
+            overhead: self.verify_turns.mean(bank.bank_epoch()),
+        }))
+    }
+
+    /// The front rows of a launch of chained decode passes of `requests`,
+    /// `fronted` of them able to run front rows in the order they take
+    /// them. A launch of exactly the requests of the pass queued behind the
+    /// last flight claims it, as deep as it was queued
+    /// (`ExecutorDomain::claim_slots`), whether or not a regime prices
+    /// launches now, so no queued pass is orphaned by its depth. Any other
+    /// the host builds, in the form and as deep as the regime grants
+    /// ([`TwoRowPricing::built`]), front passes of no guessed row without
+    /// one.
+    pub fn front_pass(
+        &self,
+        requests: &[crate::RequestId],
+        fronted: &[crate::RequestId],
+    ) -> Result<crate::FrontPass, DomainError> {
+        let launched = requests.iter().collect::<std::collections::BTreeSet<_>>();
+        if let Some(queued) = self
+            .queue
+            .queued_fronts()
+            .filter(|queued| queued.iter().map(|(request, _)| request).collect::<std::collections::BTreeSet<_>>() == launched)
+        {
+            return Ok(crate::FrontPass::Claim(queued.into_iter().collect()));
+        }
+        Ok(match self.two_row_pricing()? {
+            Some(pricing) => pricing.built(requests, fronted)?,
+            None => crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() },
+        })
     }
 
     /// A test's growth toward the bank's target, at a fresh probe: what the

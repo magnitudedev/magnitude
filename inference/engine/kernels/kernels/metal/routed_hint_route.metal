@@ -52,21 +52,22 @@ typedef ELEMENT_OF(SEISMIC_NEXT_NORM) Norm;
     do {                                                                                    \
         const uint tid = sg * 32u + lane;                                                   \
         if (arrive::last(arrivals, ordered_tiles, reinterpret_cast<threadgroup uint *>(shared), tid)) { \
-            threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                                \
             threadgroup int *words = reinterpret_cast<threadgroup int *>(shared);           \
-            const int seq = step[SEISMIC_CONST_STEP_LOW * SEISMIC_STEP_STRIDE_0];           \
             for (uint lead = 0u; lead < uint(SEISMIC_DIM_AHEAD); ++lead) {                  \
                 arrive::coherent_device<float> plane = logits + ulong(lead) * SEISMIC_DIM_M * SEISMIC_DIM_EN; \
                 for (uint r = sg; r < m; r += simdgroups) {                                 \
-                    const auto ranked = selection::rank_row<uint(SEISMIC_DIM_EN), uint(SEISMIC_DIM_K)>(                   \
+                    const auto ranked = selection::rank_row<uint(SEISMIC_DIM_EN), uint(SEISMIC_DIM_K)>( \
                         [&](uint e) { return plane[ulong(r) * SEISMIC_DIM_EN + e]; }, lane); \
                     if (lane == 0u) {                                                       \
-                        for (uint c = 0u; c < uint(SEISMIC_DIM_K); ++c)                     \
+                        for (uint c = 0u; c < uint(SEISMIC_DIM_K); ++c) {                   \
                             words[STREAMING_HINT_CHOSEN(r) + c] = ranked.winners[c];        \
+                            words[STREAMING_HINT_WEIGHT(m, r) + c] = as_type<int>(ranked.chosen[c]); \
+                        }                                                                   \
                     }                                                                       \
                 }                                                                           \
                 streaming_hint(m, rings + ulong(lead) * SEISMIC_RINGS_STRIDE_0,             \
-                    SEISMIC_RINGS_STRIDE_1, seq, words, tid, simdgroups * 32u);             \
+                    SEISMIC_RINGS_STRIDE_1, step, SEISMIC_STEP_STRIDE_0, words, tid, simdgroups * 32u);             \
                 streaming_barrier();                                                        \
             }                                                                               \
         }                                                                                   \

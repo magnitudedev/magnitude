@@ -18,9 +18,10 @@ against its charge's runtime, vocabulary and program terms (`HostProcessCosts`).
 `--weight-cap BYTES` the load is planned under the cap and reads its routed experts from storage
 (a `fresh` job), and the answer is that streamed load's own memory against everything its plan
 charges, term by term: what it charges must equal what it is observed to hold. `--context TOKENS`
-loads at that context; `--residency TOKENS` (under both) also reads the pages of the expert
-stacks the file cache holds once loaded and once the load has decoded TOKENS tokens of the
-`--fixture` set's first fixture (it must hold none). `--pressure-store STORE` (under `--residency`)
+loads at that context; `--residency TOKENS` (under `--weight-cap`, with `--template`) instead loads
+at the template's context plus TOKENS, decodes TOKENS tokens after the template (its lane 0), and
+also reads the pages of the expert stacks the file cache holds once loaded and once decoded (it
+must hold none). `--pressure-store STORE` (under `--residency`)
 is the forced-pressure gate: a sibling process takes what that physical store gives past the
 guarantee the load's ledger keeps free there (read from the load's own memory readings), then
 everything the store still gives, from a quarter of that decode to three quarters of it, and the
@@ -38,6 +39,7 @@ constants' comment names, then the fit over those runs' loads:
 import argparse
 import json
 
+from .. import templates
 from ..engine import Step, Weights
 from ..host import memory
 from ..host.agent import PLAN
@@ -53,9 +55,11 @@ def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--context", type=int, metavar="TOKENS",
                         help="unified memory: load at this context (default: the model's declared one)")
     parser.add_argument("--residency", type=int, metavar="TOKENS",
-                        help="under --weight-cap and --context: also read the pages of the expert stacks the file "
-                             "cache holds once loaded and once the load has decoded TOKENS tokens of --fixture's "
-                             "first fixture (it must hold none)")
+                        help="under --weight-cap, with --template: load at the template's context plus TOKENS, decode "
+                             "TOKENS tokens after the template and read the pages of the expert stacks the file cache "
+                             "holds once loaded and once decoded (it must hold none)")
+    parser.add_argument("--template", type=templates.name,
+                        help="the request --residency decodes after, <fixture>-<responsekind>:<context>")
     parser.add_argument("--pressure-store", choices=("host", "device"),
                         help="under --residency: another process takes what this physical store gives past the "
                              "load's guarantee from a quarter of the decode to three quarters of it; report the "
@@ -81,9 +85,12 @@ def plan(arguments, source, host) -> Plan:
     # Every option as given: the host's judge (`refusal`) refuses a pair it cannot measure.
     pressure = (*(("--pressure-store", arguments.pressure_store) if arguments.pressure_store else ()),
                 *(("--pressure-prompt",) if arguments.pressure_prompt else ()))
+    if (arguments.residency is None) != (arguments.template is None):
+        raise SystemExit("memory: --residency decodes after a template: give both --residency and --template")
+    template = templates.file(arguments.template, 1) if arguments.template else None
     context = ("--context", str(arguments.context)) if arguments.context else ()
-    residency = (("--residency", harness.EXECUTABLE, f"{{inputs}}/{arguments.fixture.name}",
-                  str(arguments.residency)) if arguments.residency else ())
+    residency = (("--residency", templates.argument(template), str(arguments.residency))
+                 if template else ())
     given = ("--bin", "{target}/release", "--backend", arguments.backend, "--memory", kind, "--scratch", "{run_dir}",
              *cap, *context, *residency, *pressure)
     # A streamed load prepares from the host's kernel cache, as a served load does, after the
@@ -96,7 +103,7 @@ def plan(arguments, source, host) -> Plan:
     # The load's own footprint, not the device's: the device is held so no other load runs.
     return priced(Plan(builds=(harness.BUILD,), jobs=(("memory", job),),
                        device="device", acquires=Weights(arguments.model),
-                       files=(arguments.fixture,) if arguments.residency else ()), bool(cap), arguments.backend)
+                       files=(template,) if template else ()), bool(cap), arguments.backend)
 
 
 def planned_memory(result: JobResult) -> str:
@@ -121,7 +128,7 @@ INSTRUMENT = Instrument(
     kind="memory",
     question="What does a load of this model hold, by the terms assessment prices?",
     observable="memory a load holds, by term",
-    selectors=("backend", "host", "build", "model", "fixture", "purpose", "estimate"),
+    selectors=("backend", "host", "build", "model", "purpose", "estimate"),
     configure=configure,
     plan=plan,
     answer=answer,

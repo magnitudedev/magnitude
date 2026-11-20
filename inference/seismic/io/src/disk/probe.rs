@@ -52,21 +52,34 @@
 //! - **The knee** of a line: the narrowest window whose rate is within the
 //!   noise of its best rate. M4 Max stacked ranges: 16 to 32 deep, by the
 //!   noise; M4 Pro: 4 deep; GB10 above any decode depth.
-//! - **The knee depth**: the most in flight, due and ahead, beside which a
-//!   read ahead may start. Below it depth still adds rate, so a read ahead
-//!   runs on throughput a due read would leave unused; past it every byte
-//!   more in flight delays a due byte (an M4 Pro's internal drive: about
-//!   0.12 ms a due read for each 640 KB range more). A request's is the knee
-//!   of its **range line**: its own ranges, each one piece, read through the
-//!   engine at every depth to 8 ranges and a quarter more each past it, to
-//!   the first depth within the noise of the one before, as its reads ahead
-//!   are read. A knee of other reads misplaces it: an M4 Pro's 1 MiB reads put
-//!   it at 4 MiB where its 580–710 KiB ranges reach their rate 4 deep, about
-//!   2.6 MB; and threads reading those ranges reach 5.1 GB/s where the
-//!   engine reads a prompt's experts at 3.86, so only the engine's own
-//!   reads say what its reads ahead are served at. Its reads ahead
-//!   are cut at the least read size holding its widest range, so each is
-//!   one piece, as the line read them.
+//! - **The knee depth**: the most in flight, parked and read ahead, beside
+//!   which a read ahead may start. A request's is set by its **range
+//!   line**: its own ranges, each one piece, read ahead through the
+//!   engine's queue with more queued than its link admits, the link's knee
+//!   that many ranges, at every depth to 8 ranges and a quarter more each
+//!   past it, to the first depth within the noise of the one before: the
+//!   reads it prices, read as they are. A line held instead by a thread a
+//!   range, each waiting for its own read before the next, paid a wake a
+//!   read and read an M4 Pro's drive 3–4% short of the engine's queue
+//!   (4.07–4.17 GB/s 3–4 deep against 4.31–4.34, `tests/read_path.rs`),
+//!   placing its knee a range deep. A range holds its piece in flight, its
+//!   bytes as the aligned read that serves it at any offset
+//!   ([`Urgent::span`]), so a knee of `k` ranges admits `k`. Its knee is the
+//!   fewest ranges whose transfers at the line's best rate cover one
+//!   range's latency, `⌈D/R₁⌉` (`latency_knee`): fewer leave the drive a
+//!   gap between reads, and each one more adds no rate and delays a parked
+//!   read arriving behind them by a range's transfer (an M4 Pro's internal
+//!   drive: about 0.12 ms for each 640 KB range more). The knee of the
+//!   line's noise placed it a range past that (cecff5's 3900 KiB, where
+//!   simulating its two-row cell at 2600 gained 2 ms a token). A knee of
+//!   other reads misplaces it: an M4 Pro's 1 MiB reads put it at 4 MiB
+//!   where its 580–710 KiB ranges reach their rate 4 deep, about 2.6 MB;
+//!   and threads reading those ranges reach 5.1 GB/s where the engine reads
+//!   a prompt's experts at 3.86, so only the engine's own reads say what
+//!   its reads ahead are served at. Its reads ahead are cut at the least
+//!   read size holding its widest range, so each is one piece, as the line
+//!   read them. A reader no step waits on reads ahead to its line's knee
+//!   (below).
 //! - **The size read ahead** with no request: of the sizes that reach the
 //!   volume's best rate, the one whose knee holds the fewest bytes, the
 //!   wider of two that tie (fewer pieces, the same depth); its knee is the
@@ -160,10 +173,17 @@ impl Urgent {
         self.records * self.parts.iter().sum::<u64>()
     }
 
-    /// A range's bytes, the mean of its ranges: what one range of its range
-    /// line holds in flight.
+    /// A range's bytes, the mean of its ranges.
     pub(crate) fn range(&self) -> u64 {
         self.parts.iter().sum::<u64>() / self.parts.len() as u64
+    }
+
+    /// The bytes one of its ranges holds in flight: its mean range read as
+    /// the aligned piece that serves it at any offset, a block past its
+    /// aligned length (a model file stores tensors off the alignment). A
+    /// depth of `k` ranges is `k` of them, which a link admits as `k` pieces.
+    pub fn span(&self) -> u64 {
+        self.range().next_multiple_of(ALIGNMENT) + ALIGNMENT
     }
 
     /// The ranges in flight its range line is probed at: every depth to
@@ -231,10 +251,10 @@ impl Curve {
     }
 
     /// The point of `urgent`'s range line `depth` ranges deep: its window
-    /// the bytes of that many ranges.
+    /// the bytes that many ranges hold in flight ([`Urgent::span`]).
     pub fn range_point(urgent: &Urgent, depth: u64, rate: f64, spread: f64, cores: f64) -> Point {
-        let range = urgent.range();
-        Point { read: range, window: depth * range, rate, spread, cores }
+        let span = urgent.span();
+        Point { read: span, window: depth * span, rate, spread, cores }
     }
 }
 
@@ -393,10 +413,10 @@ impl Shape {
         reads.dedup();
         let cores_at = |line: &[Point], window: u64| line.iter().filter(|point| point.window <= window).map(|point| point.cores).fold(0., f64::max);
         let (ahead_read, knee, ahead_cores) = match &request {
-            // The range line's knee, its reads ahead whole ranges.
+            // The range line's latency knee, its reads ahead whole ranges.
             Some(request) => {
-                let knee = knee(request.ranges);
-                (request.urgent.whole_range(), knee.window, cores_at(request.ranges, knee.window))
+                let knee = latency_knee(request.urgent, request.ranges);
+                (request.urgent.whole_range(), knee, cores_at(request.ranges, knee))
             }
             // Each size reaching the best rate, at its knee.
             None => {
@@ -421,15 +441,24 @@ impl Shape {
     }
 }
 
-/// Of a line's points, its knee's: the narrowest window within the noise of
-/// the line's best rate ("A volume's curve": the knee depth).
-fn knee(line: &[Point]) -> Point {
-    let top = line.iter().max_by(|a, b| a.rate.total_cmp(&b.rate)).expect("a probed range line");
-    *line
-        .iter()
-        .filter(|point| point.rate + point.spread + top.spread >= top.rate)
-        .min_by_key(|point| point.window)
-        .expect("the best is within its own noise")
+/// The bytes `urgent`'s reads ahead may hold in flight, by its range line
+/// `line` ("A volume's curve": the knee depth): `⌈D/R₁⌉` whole ranges, `D`
+/// the line's best rate and `R₁` its rate one range deep. A range of `b`
+/// bytes alone reads in `λ + b/D` ("How reads share the engine"), so
+/// `R₁ = b/(λ + b/D)` and `D/R₁ = 1 + λ/(b/D)`: the fewest ranges in flight
+/// whose transfers cover the next one's latency, so the drive reads with
+/// no gap. A parked read arriving behind them waits only for what its own
+/// latency does not cover, `k·b/D − λ < 2·b/D`, at most two ranges'
+/// transfer, a fraction of one expert's read; each range more adds no rate
+/// and delays it `b/D` more.
+fn latency_knee(urgent: &Urgent, line: &[Point]) -> u64 {
+    let span = urgent.span();
+    let top = line.iter().map(|point| point.rate).fold(0., f64::max);
+    let lone = line.iter().min_by_key(|point| point.window).expect("a probed range line");
+    assert_eq!(lone.window, span, "a range line starts one range deep");
+    let ranges = (top / lone.rate).ceil();
+    assert!(ranges.is_finite() && ranges >= 1., "a range line's best rate {top} over one range's {}", lone.rate);
+    ranges as u64 * span
 }
 
 /// Of a line's points, the full rate's: the widest window within the noise
@@ -602,7 +631,8 @@ fn range_line(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent) -> Result<Ve
     let mut line = Vec::<Point>::new();
     for depth in urgent.depths() {
         let passes = (0..PASSES).map(|_| ranges_rate(key, file, urgent, depth)).collect::<Result<Vec<_>, _>>()?;
-        let point = Point::of(urgent.range(), depth * urgent.range(), &passes);
+        let point = Curve::range_point(urgent, depth, 0., 0., 0.);
+        let point = Point::of(point.read, point.window, &passes);
         let flat = line.last().is_some_and(|before| point.rate <= before.rate + before.spread + point.spread);
         line.push(point);
         if flat {
@@ -614,63 +644,59 @@ fn range_line(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent) -> Result<Ve
 
 /// The bytes a second `file` reads at, and the cores the process runs,
 /// with `depth` of `urgent`'s ranges in flight through the read engine:
-/// `depth` threads, each submitting one range at a time as a due request of
-/// volume `key`, its whole range one piece, at a random offset unaligned at
-/// the 32-byte grain a model file stores tensors at, for [`PROBE_SECONDS`]
-/// from when every one has started. What a range pays is the engine's (its wakes and the copy of a piece
-/// that does not land straight), as a read ahead's is.
+/// ranges read ahead on a link of volume `key` whose knee is that many
+/// ranges ([`Urgent::span`]), each its own request of one piece at a random
+/// offset unaligned at the 32-byte grain a model file stores tensors at,
+/// cycling its parts, from one submitter that keeps more queued than the
+/// link admits, so the link alone holds the depth as it does a decode's
+/// reads ahead, for [`PROBE_SECONDS`]. What a range pays is the engine's
+/// (its admission, wakes, and the copy of a piece that does not land
+/// straight), and nothing a reader's thread adds.
 fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64) -> Result<(f64, f64), Error> {
     const GRAIN: u64 = 32;
     let parts = &urgent.parts;
     let widest = *parts.iter().max().expect("a request has a range");
-    let volume = VolumeReads { id: key, shape: Shape { ahead_read: urgent.whole_range(), due_read: urgent.whole_range(), ..Shape::PENDING } };
+    let window = depth * urgent.span();
+    let volume = VolumeReads { id: key, shape: Shape { due: window, knee: window, ahead_read: urgent.whole_range(), due_read: urgent.whole_range(), ..Shape::PENDING } };
     // The pool's workers for its ranges are the probe's, while it runs.
     let need = scheduler::need(&volume);
     let outstanding = Arc::default();
-    let (volume, need, outstanding) = (&volume, &need, &outstanding);
-    // Where every thread reads until, once all have started; none where one
-    // could not, which ends the others at once.
-    let start = (Mutex::new(None::<Option<Instant>>), Condvar::new());
-    let start = &start;
+    // Twice the depth and two more queued: the link, not the submitter,
+    // holds what is in flight while the oldest is waited on.
+    let queued = 2 * depth as usize + 2;
+    let mut spare = (0..queued).map(|_| Arc::new(Buffer::new(widest as usize)) as Arc<dyn crate::Destination>).collect::<Vec<_>>();
+    let mut flight = std::collections::VecDeque::<(scheduler::Handle, Arc<dyn crate::Destination>, u64)>::new();
+    let (mut state, mut part, mut bytes) = (0x9e37_79b9_7f4a_7c15u64 ^ depth.wrapping_mul(0xbf58_476d_1ce4_e5b9), 0, 0);
+    let end = |(handle, sink, length): (scheduler::Handle, Arc<dyn crate::Destination>, u64)| -> Result<(Arc<dyn crate::Destination>, u64), Error> {
+        match handle.wait() {
+            Ended::Read { failed } => match failed.first() {
+                Some((_, error)) => Err(Error::Invalid(format!("a range line's read: {error}"))),
+                None => Ok((sink, length)),
+            },
+            Ended::Panicked(panic) => panic.resume(),
+        }
+    };
     let cpu = process_cpu_seconds()?;
-    let bytes = std::thread::scope(|scope| -> Result<(u64, Instant), Error> {
-        let reader = |thread: u64| {
-            move || -> Result<u64, Error> {
-                let sink: Arc<dyn crate::Destination> = Arc::new(Buffer::new(widest as usize));
-                let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (thread + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-                let (mut bytes, mut part) = (0, thread as usize % parts.len());
-                let until = *start.1.wait_while(start.0.lock().expect("probe start"), |until| until.is_none()).expect("probe start");
-                let until = until.expect("the probe started");
-                while until.is_some_and(|until| Instant::now() < until) {
-                    let length = parts[part];
-                    part = (part + 1) % parts.len();
-                    let offset = random_offset(file, &mut state, length + ALIGNMENT) + state % (ALIGNMENT / GRAIN) * GRAIN;
-                    let ranges = vec![Range { offset, length: length as usize, into: sink.clone(), at: 0 }];
-                    // SAFETY: the range's bytes are this thread's sink's,
-                    // which nothing else touches until the request, waited
-                    // on here, ends.
-                    match unsafe { request(file, volume, need, outstanding, ranges, Want::now()) }?.wait() {
-                        Ended::Read { failed } => {
-                            if let Some((_, error)) = failed.first() {
-                                return Err(Error::Invalid(format!("a range line's read: {error}")));
-                            }
-                        }
-                        Ended::Panicked(panic) => panic.resume(),
-                    }
-                    bytes += length;
-                }
-                Ok(bytes)
-            }
-        };
-        let spawned = (0..depth).map(|thread| seismic_threads::spawn_scoped(scope, "disk-probe", reader(thread))).collect::<Result<Vec<_>, _>>();
-        let began = Instant::now();
-        *start.0.lock().expect("probe start") = Some(spawned.as_ref().ok().map(|_| began + std::time::Duration::from_secs_f64(PROBE_SECONDS)));
-        start.1.notify_all();
-        let threads = spawned.map_err(Error::ThreadStart)?;
-        let bytes = threads.into_iter().map(|thread| thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).sum::<Result<u64, Error>>()?;
-        Ok((bytes, began))
-    })?;
-    let (bytes, began) = bytes;
+    let began = Instant::now();
+    let until = began + std::time::Duration::from_secs_f64(PROBE_SECONDS);
+    while Instant::now() < until {
+        if flight.len() == queued {
+            let (sink, length) = end(flight.pop_front().expect("a full queue"))?;
+            spare.push(sink);
+            bytes += length;
+        }
+        let length = parts[part];
+        part = (part + 1) % parts.len();
+        let offset = random_offset(file, &mut state, length + ALIGNMENT) + state % (ALIGNMENT / GRAIN) * GRAIN;
+        let sink = spare.pop().expect("a sink for every request queued");
+        let ranges = vec![Range { offset, length: length as usize, into: sink.clone(), at: 0 }];
+        // SAFETY: each sink is one queued request's alone: it is reused only
+        // once that request has ended, and the request holds it until then.
+        flight.push_back((unsafe { request(file, &volume, &need, &outstanding, ranges, Want::expected(0, 1.)) }?, sink, length));
+    }
+    for queued in flight {
+        bytes += end(queued)?.1;
+    }
     let wall = began.elapsed().as_secs_f64();
     Ok((bytes as f64 / wall, (process_cpu_seconds()? - cpu) / wall))
 }

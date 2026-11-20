@@ -13,8 +13,14 @@ pub(crate) fn print(file: &File) -> String {
     for constant in &file.constants {
         let _ = writeln!(p.out, "const {} = {}", constant.name.name, constant.value);
     }
+    for function in &file.constant_functions {
+        let parameters = function.parameters.iter().map(|parameter| parameter.name.as_str());
+        let _ = write!(p.out, "const {}({}) = ", function.name.name, parameters.collect::<Vec<_>>().join(", "));
+        p.expr(&function.body, 0);
+        p.out.push('\n');
+    }
     for (i, decl) in file.decls.iter().enumerate() {
-        if i > 0 || !file.constants.is_empty() {
+        if i > 0 || !file.constants.is_empty() || !file.constant_functions.is_empty() {
             p.out.push('\n');
         }
         p.decl(decl);

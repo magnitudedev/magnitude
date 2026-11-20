@@ -1681,7 +1681,7 @@ mod tests {
         let curve = &stack.curve;
         assert_eq!((curve.steps, curve.rows), (1, 4));
         assert_eq!(curve.sampled, [2, 0, 1, 0, 1]);
-        let line = crate::assessment::ReadLine::new(1e-4, 1e-9).unwrap();
+        let line = magnitude_cost_model::ReadLine::new(1e-4, 1e-9).unwrap();
         let cost = |records| curve.step_seconds(records, &line).unwrap();
         assert!(cost(0) > cost(1) && cost(1) == cost(2) && cost(2) > cost(3) && cost(3) == cost(4));
         assert!(cost(4) > 0.);

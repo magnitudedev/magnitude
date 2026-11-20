@@ -671,7 +671,8 @@ fn portable_select_matches_host_reference() {
 
 /// A general-form hint (`hint_selected`) names exactly what `routed_select`
 /// selects over the same rows, in rank order across the rows (each row's
-/// first choice, then each row's second), at LFM2-MoE's
+/// first choice, then each row's second), each weighed by the score its
+/// ranking gave it (its magnitude's bits), at LFM2-MoE's
 /// routing, where the selection bias reorders the unbiased sigmoid scores
 /// (checked here, so the case keeps that power).
 #[test]
@@ -684,7 +685,7 @@ fn general_hints_name_what_routed_select_selects() {
     let (h, e, k, m) = (routing.hidden, routing.experts, routing.selected, 2);
     let case = SelectCase::new(&routing, m);
     let (routes, _, _) = portable_select(&module, &routing, &case, DType::BF16, DType::F32);
-    let ring = (constants::RING_EXPERTS + constants::HINT_ENTRY_WORDS * (m * k) as u64) as usize;
+    let ring = constants::HINT_ENTRY((m * k) as u64) as usize;
     let sequence = 7;
     let outcome = interpret(
         &module,
@@ -697,36 +698,51 @@ fn general_hints_name_what_routed_select_selects() {
             floats(DType::F32, &[e], &case.bias),
             Input::I32(routing.score),
             Input::F32(1e-6),
-            ints(&[1], &[sequence]),
+            ints(&[constants::STEP_WORDS as usize], &step_words(sequence as u64)),
             floats(DType::BF16, &[m, h], &vec![0.0; m * h]),
             floats(DType::F32, &[m, e], &vec![0.0; m * e]),
             ints(&[m, k], &vec![-7; m * k]),
             ints(&[ring], &vec![0; ring]),
         ],
     );
-    // Each expert once, in rank order across the rows, with the rank of the
-    // choice it was first named as.
-    let mut wanted = Vec::<(i32, i32)>::new();
+    // Each expert once, in rank order across the rows, as the choice it was
+    // first named as: its rank and row.
+    let mut wanted = Vec::<(i32, i32, i32)>::new();
     for rank in 0..k {
         for row in 0..m {
             let expert = routes[row * k + k - 1 - rank];
-            if !wanted.iter().any(|&(named, _)| named == expert) {
-                wanted.push((expert, rank as i32));
+            if !wanted.iter().any(|&(named, ..)| named == expert) {
+                wanted.push((expert, rank as i32, row as i32));
             }
         }
     }
     let published = input(&outcome, 10).iter().map(|v| *v as i32).collect::<Vec<_>>();
-    let [at_sequence, at_count, at_experts] =
-        [constants::RING_SEQUENCE, constants::RING_COUNT, constants::RING_EXPERTS].map(|word| word as usize);
+    let [at_sequence, at_count] = [constants::RING_SEQUENCE, constants::RING_COUNT].map(|word| word as usize);
+    let at_entry = |index: usize| constants::HINT_ENTRY(index as u64) as usize;
     assert_eq!(published[at_sequence], sequence, "the ring's sequence");
     assert_eq!(published[at_count] as usize, wanted.len(), "the ring's count");
     let entries = (0..wanted.len())
-        .map(|index| at_experts + constants::HINT_ENTRY_WORDS as usize * index)
-        .map(|entry| (published[entry + constants::HINT_EXPERT as usize], published[entry + constants::HINT_RANK as usize]))
+        .map(at_entry)
+        .map(|entry| {
+            let word = |at: u64| published[entry + at as usize];
+            (word(constants::HINT_EXPERT), word(constants::HINT_RANK), word(constants::HINT_ROW))
+        })
         .collect::<Vec<_>>();
-    assert_eq!(entries, wanted, "hints in rank order across the rows, each with its rank");
-    // The bias reorders: the unbiased scores' top K differ from the choices.
+    assert_eq!(entries, wanted, "hints in rank order across the rows, each with its rank and row");
+    // Each entry's weight word: the score of its expert in its row, from the
+    // hint's own logits, as `assert_selection` weighs.
     let logits = input(&outcome, 8);
+    let scores = logits.chunks_exact(e).map(|row| row_scores(routing.score, row)).collect::<Vec<_>>();
+    for (index, &(expert, _, row)) in wanted.iter().enumerate() {
+        let word = published[at_entry(index) + constants::HINT_WEIGHT as usize];
+        let (actual, expected) = (f64::from(f32::from_bits(word as u32)), scores[row as usize][expert as usize].abs());
+        assert!(word >= 0, "hint {index}: weight word {word:#x} is negative");
+        assert!(
+            (actual - expected).abs() <= 5e-4 * expected.max(1e-3),
+            "hint {index} (expert {expert}, row {row}) weight: {actual}, reference {expected}"
+        );
+    }
+    // The bias reorders: the unbiased scores' top K differ from the choices.
     let reordered = (0..m).any(|row| {
         let mut order = (0..e).collect::<Vec<_>>();
         order.sort_by(|&a, &b| logits[row * e + b].total_cmp(&logits[row * e + a]).then(b.cmp(&a)));
@@ -737,6 +753,20 @@ fn general_hints_name_what_routed_select_selects() {
         unbiased != chosen
     });
     assert!(reordered, "the selection bias reorders some row's choices");
+}
+
+fn row_scores(score: i32, logits: &[f64]) -> Vec<f64> {
+    let maximum = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let total = logits.iter().map(|l| (l - maximum).exp()).sum::<f64>();
+    logits
+        .iter()
+        .map(|&logit| match score {
+            0 => (logit - maximum).exp() / total,
+            1 => 1.0 / (1.0 + (-logit).exp()),
+            2 => (logit.max(0.0) + (-logit.abs()).exp().ln_1p()).sqrt(),
+            other => panic!("score function {other}"),
+        })
+        .collect()
 }
 
 /// Every native against the host reference at the catalog's real shapes.

@@ -25,7 +25,7 @@ use magnitude_family_contracts::{NGramHash, WeightKind, WeightScope};
 use magnitude_kernels::{
     ngram_add, ngram_gate, ngram_inject, ngram_rows, project_rows, stored_rows,
 };
-use seismic::{Argument, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, Table, WorkflowTensor};
+use seismic::{Argument, Dim, Element, NativeGraph, NativePort, Table, WorkflowTensor};
 use std::sync::Arc;
 
 pub(crate) struct NGramEntries<'a, G: GraphDraft + 'a> {
@@ -104,16 +104,18 @@ impl CheckedNGramEntries {
         }
     }
 
-    pub(crate) fn entries(&self) -> NGramEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> NGramEntries<'_, G> {
         NGramEntries {
-            rows: &[],
-            stored: &self.stored,
-            key: &self.key,
-            value: &self.value,
-            gate: &self.norms,
+            rows: G::bind(&[]),
+            stored: G::bind(&self.stored),
+            key: G::bind_ranged(&self.key),
+            value: G::bind_ranged(&self.value),
+            gate: G::bind(&self.norms),
             output: match self.convolution {
-                false => NGramOutputEntry::Add(&[][..]),
-                true => NGramOutputEntry::Inject(&self.norms[..]),
+                false => NGramOutputEntry::Add(G::bind(&[][..])),
+                true => NGramOutputEntry::Inject(G::bind(&self.norms[..])),
             },
         }
     }

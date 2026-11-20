@@ -3,12 +3,9 @@
 
 use magnitude_kernels::constants;
 
-/// A step's pair (STEP_LOW, STEP_HIGH).
+/// A step's words: its pair (STEP_LOW, STEP_HIGH), and no front row.
 pub fn step_words(q: u64) -> Vec<i32> {
-    let mut words = vec![0; constants::STEP_WORDS as usize];
-    words[constants::STEP_LOW as usize] = q as u32 as i32;
-    words[constants::STEP_HIGH as usize] = (q >> 32) as u32 as i32;
-    words
+    magnitude_kernels::step_words(q, 0).to_vec()
 }
 
 /// The map rows `[N, MAP_WORDS]` of (record, from, until) entries.

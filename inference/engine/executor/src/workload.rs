@@ -10,45 +10,8 @@
 //! a prior's rates over one time constant: the measurements replace the
 //! prior as they accumulate, at the same decay, with no weight of their own
 //! to choose.
+use magnitude_cost_model::WorkloadRates;
 use std::time::{Duration, Instant};
-
-/// The load's serving rates.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WorkloadRates {
-    /// Decode steps a second of serving.
-    pub decode_steps_per_s: f64,
-    /// The prefill's speed while it runs: tokens a second of prefill.
-    pub prefill_tokens_per_s: f64,
-    /// Requests a second of serving: each prefills its prompt once, in
-    /// whole or from a resumed prefix, so the prompts prefilled a second
-    /// too.
-    pub requests_per_s: f64,
-    /// Requests a second whose input the vision projector encodes.
-    pub vision_uses_per_s: f64,
-}
-
-impl WorkloadRates {
-    /// The rates before the load serves, with no request history to read:
-    /// one stream that prefills `prefill_tokens` (the planned context) in
-    /// `prefill_seconds`, then decodes `decode_steps` steps of
-    /// `step_seconds`, then repeats.
-    ///
-    /// # Panics
-    /// Where a figure is not positive and finite: a load that cannot
-    /// prefill or step has no rates.
-    pub fn prior(step_seconds: f64, decode_steps: f64, prefill_tokens: f64, prefill_seconds: f64) -> Self {
-        for figure in [step_seconds, decode_steps, prefill_tokens, prefill_seconds] {
-            assert!(figure.is_finite() && figure > 0.0, "a workload prior needs positive figures, not {figure}");
-        }
-        let span = prefill_seconds + decode_steps * step_seconds;
-        Self {
-            decode_steps_per_s: decode_steps / span,
-            prefill_tokens_per_s: prefill_tokens / prefill_seconds,
-            requests_per_s: 1.0 / span,
-            vision_uses_per_s: 0.0,
-        }
-    }
-}
 
 /// The decaying counts the rates are read from.
 #[derive(Clone, Debug)]

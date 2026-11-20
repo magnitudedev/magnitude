@@ -561,9 +561,10 @@ impl StateProgramPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramPlan {
     imports: Vec<ImportProgramSlot>,
-    /// Whether a read of rows the device selects copies its selection for
-    /// the host (`selection_notice`).
-    notices_selection: bool,
+    /// Whether its steps hold the token row copy (`selection_notice`): its
+    /// entries do (`ModelLoadPlan::copies_token_rows`), or a landed read of
+    /// rows the device selects copies its selection for the host.
+    copies_token_rows: bool,
     target: TargetProgramPlan,
     head: Option<HeadProgramPlan>,
     shared_head: Option<SharedHeadProgramPlan>,
@@ -577,7 +578,7 @@ impl ProgramPlan {
     pub(crate) fn new(
         definition: &ModelDefinition,
         imports: Vec<ImportProgramSlot>,
-        notices_selection: bool,
+        copies_token_rows: bool,
         target: TargetProgramPlan,
         head: Option<HeadProgramPlan>,
         shared_head: Option<SharedHeadProgramPlan>,
@@ -631,7 +632,7 @@ impl ProgramPlan {
         }
         Ok(Self {
             imports,
-            notices_selection,
+            copies_token_rows,
             target,
             head,
             shared_head,
@@ -645,11 +646,11 @@ impl ProgramPlan {
         &self.imports
     }
 
-    /// Whether a read of rows the device selects copies its selection for
-    /// the host (`selection_notice`): the load holds a table the host fills
-    /// for such reads.
-    pub fn notices_selection(&self) -> bool {
-        self.notices_selection
+    /// Whether its steps hold the token row copy (`selection_notice`): its
+    /// entries do (`ModelLoadPlan::copies_token_rows`), or a landed read of
+    /// rows the device selects copies its selection for the host.
+    pub fn copies_token_rows(&self) -> bool {
+        self.copies_token_rows
     }
 
     pub fn target(&self) -> &TargetProgramPlan {
@@ -693,6 +694,7 @@ pub(super) fn derive_program_plan(
     host_tables: &[HostTablePlan],
     readout_choices: &[super::ReadoutClassChoice],
     bank: Option<&super::ExpertBankPlan>,
+    entry_copies_token_rows: bool,
     history: KvCodec,
 ) -> Result<ProgramPlan, PlanError> {
     operators::admit(definition, head.is_some())?;
@@ -711,13 +713,15 @@ pub(super) fn derive_program_plan(
             imports.push(slot);
         }
     }
-    // A read of rows the device selects copies its selection for the host
-    // when the host fills a table for it: a stored table's slots, or an
-    // imported table's landing slots.
-    let notices_selection = target
-        .iter()
-        .chain(head.unwrap_or_default())
-        .any(|weight| weight.stored_in_slots() || weight.lands_selected_rows());
+    // Steps hold the token row copy where their entries do
+    // (`ModelLoadPlan::copies_token_rows`), and where a read of rows the
+    // device selects from an imported table copies its selection for the
+    // host, which lands them in the table's landing slots.
+    let copies_token_rows = entry_copies_token_rows
+        || target
+            .iter()
+            .chain(head.unwrap_or_default())
+            .any(WeightPlan::lands_selected_rows);
     let activation = activation_dtype(definition.decoder.activation_dtype);
     let active_element = Element::dense(activation);
     let embedding = EmbeddingBinding {
@@ -1067,7 +1071,7 @@ pub(super) fn derive_program_plan(
     ProgramPlan::new(
         definition,
         imports,
-        notices_selection,
+        copies_token_rows,
         target_program,
         head_program,
         shared_head_program,

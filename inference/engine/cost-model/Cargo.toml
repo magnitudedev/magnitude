@@ -1,0 +1,18 @@
+[package]
+name = "magnitude-cost-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The model-level cost model: what every launch of a loaded model costs,
+# from its census and the machine's figures, all plain data. The per-call
+# formula is Seismic's (`seismic_measure::pricing`), as are the lines its
+# reads take; serde keeps the lines the measurement records store.
+[dependencies]
+seismic-measure.workspace = true
+serde.workspace = true
+
+[features]
+# Test-only: the reference lines (`ExpertLines::reference`), for the tests
+# of the crates above. Never enabled by a served engine.
+fixtures = []

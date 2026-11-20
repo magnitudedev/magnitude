@@ -42,7 +42,7 @@ pub(crate) fn entry() -> std::sync::Arc<dyn seismic_memory::entry::Entry> {
 /// toolchain, so a test of a kernel's rendering and execution runs the
 /// compile the former would.
 pub(crate) fn programs(device: &MetalDevice, description: &DeviceDescription<Metal>) -> MetalPrograms {
-    Arc::new(Compiled(MetalToolchain::new(device.clone(), description.facts())))
+    Arc::new(Compiled(MetalToolchain::new(device.clone(), description.device_info())))
 }
 
 struct Compiled(MetalToolchain);

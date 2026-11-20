@@ -12,6 +12,7 @@ from magnitude_references.digest import implementation
 from magnitude_rig.host.identity import sha256
 
 from magnitude_references import cache as reference
+from magnitude_references.contract import read_rendered
 from magnitude_references import digest
 
 
@@ -21,9 +22,10 @@ def sanity(passed: bool) -> dict:
         "top1_accuracy": 0.1 if not passed else 0.6,
         "bounds": {"perplexity_max": 300.0, "top1_min": 0.25},
         "passed": passed,
-        "fixtures": [
-            {"fixture_id": "f/0", "perplexity": 3.0, "top1_accuracy": 0.6, "passed": True},
-            {"fixture_id": "f/1", "perplexity": 2000.0, "top1_accuracy": 0.1, "passed": passed},
+        "sessions": [
+            {"template": logits_fake.TEMPLATE, "lane": 0, "perplexity": 3.0, "top1_accuracy": 0.6, "passed": True},
+            {"template": logits_fake.TEMPLATE, "lane": 1, "perplexity": 2000.0, "top1_accuracy": 0.1,
+             "passed": passed},
         ],
     }
 
@@ -39,13 +41,9 @@ def artifacts(tmp_path):
 
 @pytest.fixture
 def rendered(tmp_path):
-    fixtures = tmp_path / "set.jsonl"
-    fixtures.write_text("".join(json.dumps({"id": f"f/{index}"}) + "\n" for index in range(2)))
     path = tmp_path / "rendered.jsonl"
     path.write_text(
-        "".join(
-            json.dumps(line) + "\n" for line in logits_fake.rendered_lines(fixtures, 4096, False)
-        )
+        "".join(json.dumps(line) + "\n" for line in logits_fake.rendered_lines(2, 4096, False))
     )
     return path
 
@@ -77,6 +75,8 @@ def references_cli(monkeypatch):
                 json.dumps(
                     {
                         "model": logits_fake.MODEL,
+                        "template": logits_fake.TEMPLATE,
+                        "prompt_sha256": read_rendered(Path(rendered)).prompt_sha256,
                         "rendered_digest": sha256(rendered),
                         "family": "fake",
                         "implementation_digest": implementation(logits_fake.family(), variant, device),
@@ -125,7 +125,8 @@ def test_built_admitted_once_then_cached(tmp_path, rendered, references_cli):
     assert not first.cached and _devices(calls) == ["cpu"]  # one CPU build, admitted alone
     assert {command[command.index("--build-identity") + 1] for command in calls} == {str(tmp_path / "build-tools.json")}
     assert first.directory == reference.location(
-        tmp_path / "cache", logits_fake.MODEL, sha256(rendered), implementation(logits_fake.family(), None, "cpu")
+        tmp_path / "cache", logits_fake.MODEL, logits_fake.TEMPLATE, read_rendered(rendered).prompt_sha256,
+        implementation(logits_fake.family(), None, "cpu")
     )
     assert first.record["admission"] == {"device": "cpu", "agreement": "CPU-deterministic"}
     assert reference.check(first) is first
@@ -145,7 +146,8 @@ def test_a_build_of_non_finite_logits_is_refused_and_kept(tmp_path, rendered, re
     behaviour["logits"] = logits
     with pytest.raises(reference.ReferenceRefused, match=r"\(built on cpu\) has non-finite logits"):
         obtain(rendered, tmp_path)
-    directory = reference.location(tmp_path / "cache", logits_fake.MODEL, sha256(rendered), implementation(logits_fake.family(), None, "cpu"))
+    directory = reference.location(tmp_path / "cache", logits_fake.MODEL, logits_fake.TEMPLATE,
+                                   read_rendered(rendered).prompt_sha256, implementation(logits_fake.family(), None, "cpu"))
     assert not directory.exists()  # nothing is admitted
     assert _leftovers(tmp_path / "cache") == ["partial"]  # the build is kept
 
@@ -173,7 +175,7 @@ def test_only_an_entry_admitted_as_a_cpu_build_is_reused(tmp_path, rendered, ref
 def test_failed_sanity_is_cached_and_refused(tmp_path, rendered, references_cli):
     calls, behaviour = references_cli
     behaviour["passed"] = False
-    with pytest.raises(reference.ReferenceRefused, match="failing fixtures f/1"):
+    with pytest.raises(reference.ReferenceRefused, match=f"failing sessions {logits_fake.TEMPLATE}/1"):
         reference.check(obtain(rendered, tmp_path))
     again = obtain(rendered, tmp_path)
     assert again.cached and len(calls) == 1  # built once

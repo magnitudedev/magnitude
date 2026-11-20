@@ -1,9 +1,11 @@
 // Expert streaming: a streamed layer's absent choices' sources
 // (`source_landed` in routed.seismic, the end of `routed_land`), over the
 // backend's shim (streaming/contract.hpp): the body of the landing
-// launch's threadgroup 0, once it has converted what it claimed. A step
-// whose route requested nothing finds its slot not this step's request and
-// writes nothing.
+// launch's threadgroup 0, once it has converted what it claimed. The launch
+// runs only on the grid of a step whose route requested its slot
+// (`resolve`'s `land_grid`), so a slot not this step's request is no state
+// the protocol reaches: the slot's SLOT_VIOLATED stored, as
+// `streaming_land_await` stores it, and nothing written.
 //
 // Each thread waits on the slot (`streaming_await_slot`, which the host
 // answers once it landed every absent choice's expert and wrote where each
@@ -17,8 +19,7 @@
 // SOURCE_SITE -1. Every thread reads the same words, so no thread waits for
 // another.
 
-// Thread `tid` of `threads`' wait and its choices' sources, where the slot
-// is this step's request: `file` the
+// Thread `tid` of `threads`' wait and its choices' sources: `file` the
 // layer's file table (strides `file0`, `file1`), `sources0`..`sources2` the
 // route's sources' strides; `step` the step pair.
 STREAMING_FN void streaming_tier_wait(STREAMING_DEVICE_READ step, u64 step0, STREAMING_SYSTEM_WORDS file, u64 file0,
@@ -26,13 +27,19 @@ STREAMING_FN void streaming_tier_wait(STREAMING_DEVICE_READ step, u64 step0, STR
     u32 threads STREAMING_WORDS_PARAM) {
     const u64 q = streaming_step(step, step0);
     STREAMING_SYSTEM_WORDS slot = STREAMING_AT(file, streaming_modulo(q, u64(SEISMIC_DIM_FLIGHT)) * file0);
-    if (streaming_load_u64_acquire(STREAMING_AT(slot, SEISMIC_CONST_SLOT_REQUEST * file1)) != q)
+    if (streaming_load_u64_acquire(STREAMING_AT(slot, SEISMIC_CONST_SLOT_REQUEST * file1)) != q) {
+        if (tid == 0) {
+            streaming_store(STREAMING_AT(slot, SEISMIC_CONST_SLOT_VIOLATED * file1),
+                int(u32(q) | u32(SEISMIC_CONST_VIOLATED_STAMP)));
+            streaming_system_fence();
+        }
         return;
+    }
     const bool answered = streaming_await_slot(slot, file1, q);
     const u32 K = u32(SEISMIC_DIM_K);
     const u32 count = u32(streaming_load(STREAMING_AT(slot, SEISMIC_CONST_FILE_COUNT * file1)));
     for (u32 choice = tid; choice < count; choice += threads) {
-        const u64 entry = SEISMIC_CONST_FILE_ENTRIES + SEISMIC_CONST_FILE_ENTRY_WORDS * u64(choice);
+        const u64 entry = SEISMIC_CONST_FILE_ENTRY(u64(choice));
         const int expert = streaming_load(STREAMING_AT(slot, (entry + SEISMIC_CONST_FILE_CHOICE) * file1));
         if (expert < 0)
             continue;

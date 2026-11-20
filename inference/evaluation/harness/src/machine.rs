@@ -34,7 +34,7 @@ impl CpuMachine {
     /// of the executor, in this process, as any load's job is, so the
     /// figure is never left to a manual step.
     pub fn measured(cache: Option<&Path>, storage: &Path) -> Result<Self, String> {
-        let threads = std::thread::available_parallelism().map_err(|error| error.to_string())?.get();
+        let threads = seismic::threads::quota().get();
         let int8_ops_per_second = match cache {
             Some(cache) => Self::int8(cache, storage),
             None => Err("no kernel cache holds the CPU's line (--cache-dir)".to_owned()),

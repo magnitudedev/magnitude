@@ -1,6 +1,7 @@
 use super::{Directory, Ending, HostTier, Point};
+use crate::experts::horizon::{Advance, Tokens};
 use crate::experts::reuse::Reuse;
-use crate::experts::watcher::{Step, Steps};
+use crate::experts::watcher::{ScratchGroup, Step, Steps};
 use crate::experts::watcher::low_word;
 use super::stack::RoutedRead;
 
@@ -71,7 +72,7 @@ pub fn replay(
     for (layer, experts) in held.iter().enumerate() {
         let point = Point::whole(0, layer, 0);
         let placed = directory
-            .place(point, layer, &[], experts, |_| 0)
+            .place(point, ScratchGroup::at(0, 1), layer, &[], experts, |_| 0)
             .ok_or_else(|| format!("layer {layer}'s group holds fewer records than it held"))?;
         for (&expert, &record) in experts.iter().zip(&placed.records) {
             stamps[layers[layer]][record.index()] = Reads {
@@ -88,6 +89,7 @@ pub fn replay(
     for (position, read) in reads.iter().enumerate() {
         let (layer, sequence, group) = (read.layer, read.sequence, layers[read.layer]);
         let point = Point::whole(position as Step + 1, layer, sequence);
+        let prompt = ScratchGroup::at(point.group, 1);
         directory.retire(point, |group, record| commits[group][record.index()], |_| Ending::Ended, &steps);
         let (held, absent): (Vec<usize>, Vec<usize>) =
             read.experts.iter().partition(|&&expert| directory.held(layer, expert).is_some());
@@ -96,26 +98,32 @@ pub fn replay(
         }
         // Bélády's bound ranks by the future alone: it logs no read.
         if recency == Recency::Reuse {
-            Reuse::of(&directory.ranking).read(read, &vec![1; read.experts.len()], crate::experts::reuse::Evidence::Decode);
+            {
+                let mut times = directory.time().lock();
+                if times.clock.latest().is_none_or(|latest| sequence > latest) {
+                    times.register(sequence, Advance::Known(Tokens::new(1.0)));
+                }
+            }
+            let mut experts = read.experts.clone();
+            experts.sort_unstable();
+            experts.dedup();
+            Reuse::of(&directory.ranking).read(&RoutedRead { experts, ..read.clone() }, None, crate::experts::reuse::Evidence::Decode);
         }
         if absent.is_empty() {
             continue;
         }
         misses[position] = absent.len() as u64;
-        // Higher ranks are kept: Bélády's keeps the soonest next read.
-        let rank = |record: usize| -> Step {
-            let read = stamps[group][record];
-            match recency {
-                Recency::Reuse => read.last,
-                Recency::NextRead => {
-                    let next = uses[read.owner][read.expert].iter().find(|&&at| at > position);
-                    next.map_or(0, |&at| Step::MAX - at as Step)
-                }
-            }
-        };
-        let placed = directory
-            .place(point, layer, &held, &absent, rank)
-            .ok_or_else(|| format!("layer {layer}'s group holds fewer records than read {position} misses"))?;
+        // Higher ranks are kept: Bélády's keeps the soonest next read,
+        // ranked by its key alone without touching Reuse or the clock.
+        let placed = match recency {
+            Recency::Reuse => directory.place(point, prompt, layer, &held, &absent, |record| stamps[group][record].last),
+            Recency::NextRead => directory.place_by(point, prompt, layer, &held, &absent, |record| {
+                let read = stamps[group][record];
+                let next = uses[read.owner][read.expert].iter().find(|&&at| at > position);
+                next.map_or(0, |&at| Step::MAX - at as Step)
+            }),
+        }
+        .ok_or_else(|| format!("layer {layer}'s group holds fewer records than read {position} misses"))?;
         for (&expert, &record) in absent.iter().zip(&placed.records) {
             commits[group][record.index()] = low_word(sequence);
             stamps[group][record.index()] = Reads {
@@ -123,6 +131,12 @@ pub fn replay(
                 owner: layer,
                 expert,
             };
+        }
+        if recency == Recency::Reuse {
+            let mut times = directory.time().lock();
+            for _ in &absent {
+                times.moved(group, crate::experts::horizon::Tier::Compute);
+            }
         }
     }
     directory.retire(Point::whole(reads.len() as Step + 1, usize::MAX, Step::MAX), |group, record| commits[group][record.index()], |_| Ending::Ended, &steps);

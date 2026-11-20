@@ -44,6 +44,7 @@ fn resolved() -> ResolvedEngineConfiguration {
             exported_logits_rows: 512,
             numerical_profile: None,
             weight_bound: None,
+            record_routes: false,
         },
         context_tokens: Some(4096),
         service: ServiceLimits {

@@ -76,6 +76,7 @@ const STREAMING_ENTRIES: &[&str] = &[
     "routed_down_sited",
     "routed_output_project",
     "routed_output_sited",
+    "routed_gate_up_part",
     "routed_step",
     "routed_scratch_request",
     "routed_round",
@@ -112,6 +113,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "lib/routed/resolve",
         &[BackendName::Cuda],
         "the streamed routes' resolve over their bank ports is separate from CUDA's streaming shim so the other streaming entries bind none of them",
+    ),
+    (
+        "lib/routed/keys",
+        &[BackendName::Metal],
+        "a recording route's key-record sink, bound by the two streamed routes alone; CUDA keeps it in `lib/routed/resolve`, Vulkan in `lib/routed/streamed`",
     ),
     (
         "lib/attention/inputs",
@@ -286,6 +292,10 @@ const STREAMING_LIBRARIES: &[(&str, &str)] = &[
     (
         "lib/routed/output",
         "the fused decode output's projections, shared by `routed_output` and `routed_output_project`, apart from `routed.h` so the entries that include that bind none of the combine's ports",
+    ),
+    (
+        "lib/routed/gate_up",
+        "the decode expansion's body, shared by `routed_gate_up` and `routed_gate_up_part`",
     ),
     (
         "lib/routed/output_sum",

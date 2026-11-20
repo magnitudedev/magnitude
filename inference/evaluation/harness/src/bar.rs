@@ -45,7 +45,7 @@
 //! priced from the run's own convert or copy, whose flaws a bar would then
 //! hide: the harness reports those beside it.
 
-use magnitude_executor::assessment::{CpuLines, ExpertLines, LayerLoad, LineError, Nanoseconds, RowCost, RowLine, StepInputs, StepTime};
+use magnitude_cost_model::{CpuLines, ExpertLines, LayerLoad, LayerRun, LineError, Nanoseconds, RowCost, RowLine, StepInputs, StepTime};
 
 /// One streamed layer of one decode step as the bar prices it: the experts
 /// its route chose and their choices, the replay's misses, and the share of
@@ -79,22 +79,23 @@ pub fn peak_lines(lines: &ExpertLines, arithmetic: f64, handshake: Nanoseconds, 
 /// misses where its lines say: from the host tier beside a tier; from the
 /// file without one, hinted as predicted.
 pub fn step(inputs: &StepInputs<'_>, steps: &[Vec<OracleLayer>]) -> StepTime {
-    let loads = steps
+    let runs = steps
         .iter()
         .map(|step| {
             step.iter()
                 .enumerate()
                 .map(|(layer, oracle)| {
                     let (routed, rows) = (oracle.routed as f64, oracle.choices as f64 / oracle.routed as f64);
-                    match inputs.lines[layer].host.memory {
+                    let load = match inputs.lines[layer].host.memory {
                         Some(_) => LayerLoad { routed, rows, tier: oracle.misses, ..LayerLoad::default() },
                         None => LayerLoad { routed, rows, file: oracle.misses, recall: oracle.predictable, ..LayerLoad::default() },
-                    }
+                    };
+                    LayerRun { load, layers: 1 }
                 })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    inputs.run(loads.iter().map(Vec::as_slice))
+    inputs.run(runs.iter().map(|runs| (runs.as_slice(), 1)))
 }
 
 /// The most records a cap can hold: `records` of each group, each of
@@ -227,7 +228,7 @@ mod tests {
     use magnitude_executor::{EvictionRecency, RoutedRead, replay_routing};
     use std::collections::{BTreeSet, HashMap};
 
-    use magnitude_executor::assessment::{Lead, ReadAhead, ReadLine};
+    use magnitude_cost_model::{Lead, ReadAhead, ReadLine};
 
     /// An M4 Pro volume's lines: a record alone in 0.971 ms, 3.172 GB/s
     /// peak, 2.510 GB/s sustained.

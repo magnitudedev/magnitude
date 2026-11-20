@@ -53,7 +53,7 @@ pub trait AnalyticalModelDefinition<T: PhysicalDialect>: Send + Sync + 'static {
 
     fn service_state(
         &self,
-        _facts: &T::Facts,
+        _device_info: &T::DeviceInfo,
         _supported_intrinsics: &std::collections::BTreeSet<seismic_lang::ids::IntrinsicId>,
         _service: Self::Service,
     ) -> AnalyticalServiceState {
@@ -62,7 +62,7 @@ pub trait AnalyticalModelDefinition<T: PhysicalDialect>: Send + Sync + 'static {
 
     fn operation_cost(
         &self,
-        facts: &T::Facts,
+        device_info: &T::DeviceInfo,
         supported_intrinsics: &std::collections::BTreeSet<seismic_lang::ids::IntrinsicId>,
         arena: &mut ExprArena,
         kernel: &Kernel<T>,
@@ -411,7 +411,7 @@ mod tests {
         }
 
         const NAME: seismic_lang::registry::BackendName = seismic_lang::registry::BackendName::Cpu;
-        type Facts = ();
+        type DeviceInfo = ();
         type Intrinsic = NoIntrinsic;
         fn write_intrinsic_identity(op: &NoIntrinsic, _: &mut IntrinsicIdentityBuilder) {
             match *op {}

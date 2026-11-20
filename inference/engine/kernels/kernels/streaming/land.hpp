@@ -225,7 +225,7 @@ STREAMING_FN u32 streaming_land_item_of(u32 within, u32 gate, u32 up, u32 tensor
 // Entry `entry`'s from and to, read from its landed words into the group's.
 STREAMING_FN void streaming_land_entry(STREAMING_SYSTEM_WORDS landing, u64 landing_stride, u32 entry,
     STREAMING_GROUP_PARAM) {
-    const u64 words = SEISMIC_CONST_LANDING_ENTRIES + SEISMIC_CONST_LANDING_ENTRY_WORDS * u64(entry);
+    const u64 words = SEISMIC_CONST_LANDING_ENTRY(u64(entry));
     STREAMING_GROUP(STREAMING_LAND_FROM) =
         streaming_load(STREAMING_AT(landing, (words + SEISMIC_CONST_LANDING_FROM) * landing_stride));
     STREAMING_GROUP(STREAMING_LAND_TO) =
@@ -323,8 +323,7 @@ STREAMING_FN void streaming_land(STREAMING_LAND_PARAM, STREAMING_SYSTEM_WORDS la
             const int landed = streaming_device_add(STREAMING_AT(counters, STREAMING_LAND_ITEMS + int(entry)), 1);
             if (landed + 1 == int(per_entry)) {
                 streaming_system_fence();
-                streaming_store(STREAMING_AT(landing, (SEISMIC_CONST_LANDING_ENTRIES
-                    + SEISMIC_CONST_LANDING_ENTRY_WORDS * u64(entry) + SEISMIC_CONST_LANDING_DONE) * landing_stride),
+                streaming_store(STREAMING_AT(landing, (SEISMIC_CONST_LANDING_ENTRY(u64(entry)) + SEISMIC_CONST_LANDING_DONE) * landing_stride),
                     int(u32(q)));
             }
         }

@@ -24,7 +24,7 @@ use crate::{
 };
 use magnitude_family_contracts::{ShortConv, WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project, short_conv_rows};
-use seismic::{Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Dim, Element, NativeGraph, NativePort, WorkflowTensor};
 
 /// A short-convolution block's entries; each projection's by row range.
 pub(crate) struct ShortConvGraphEntries<'a, G: GraphDraft + 'a> {
@@ -75,12 +75,14 @@ impl CheckedShortConvEntries {
         }
     }
 
-    pub(crate) fn entries(&self) -> ShortConvGraphEntries<'_, NativeGraphMetadata> {
+    pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
+        &self,
+    ) -> ShortConvGraphEntries<'_, G> {
         ShortConvGraphEntries {
-            project: &self.project,
-            rows: &self.rows,
+            project: G::bind_ranged(&self.project),
+            rows: G::bind(&self.rows),
             output: match &self.post_norm {
-                None => TailEntries::Residual(&self.output[..]),
+                None => TailEntries::Residual(G::bind_ranged(&self.output[..])),
                 Some(post_norm) => TailEntries::PostNorm(post_norm.entries()),
             },
         }

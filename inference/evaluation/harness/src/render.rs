@@ -1,10 +1,10 @@
-//! Rendering fixtures exactly as the engine serves them (contract "Rendered
-//! fixture"): every conversation passes through the serving chat adapter, the
+//! Rendering template lanes exactly as the engine serves them (contract
+//! "Rendered lane"): every conversation passes through the serving chat adapter, the
 //! model's chat template and its tokenizer, the same host path that counting
 //! and generation use.
 
 use crate::digest::sha256_hex;
-use crate::fixture::{Fixture, Sizing};
+use crate::template::{Session, TemplateFile};
 use magnitude_chat::{ChatRequest, TemplateSelection, ToolChoice};
 use magnitude_engine::host::HostArtifacts;
 use magnitude_serving::chat::{ChatCompletionRequest, chat_input};
@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 /// The time templates that print the date render with
-/// (2026-01-01T00:00:00Z), so a rendering is a function of the fixture.
+/// (2026-01-01T00:00:00Z), so a rendering is a function of the session.
 const RENDER_TIME: i64 = 1_767_225_600;
 
 /// Stands in for what a scored message generated (its reasoning, its content)
@@ -36,7 +36,7 @@ pub fn standard_request_options() -> RequestOptions {
 }
 
 /// Parse request options: a JSON object of request fields that leave the
-/// conversation itself to the fixture.
+/// conversation itself to the session.
 pub fn request_options(text: &str) -> Result<RequestOptions, String> {
     let Value::Object(options) =
         serde_json::from_str(text).map_err(|error| format!("request options: {error}"))?
@@ -52,128 +52,55 @@ pub fn request_options(text: &str) -> Result<RequestOptions, String> {
     Ok(options)
 }
 
-/// One fixture rendered for one model.
+/// One lane of a template rendered for one model, sized to the template's
+/// context.
 pub struct Rendered {
-    pub fixture_id: String,
-    pub template_sha256: String,
+    /// The template's name.
+    pub template: String,
+    pub lane: usize,
+    /// SHA-256 of the chat template variant the conversation was prepared
+    /// with.
+    pub chat_template_sha256: String,
     /// The serving request's options the conversation was rendered with.
     pub request_options: RequestOptions,
-    pub context_target: Option<usize>,
+    pub context: usize,
+    /// The history units sizing kept before the probe.
+    pub history: usize,
     pub tokens: Vec<u32>,
     pub scored_spans: Vec<Range<usize>>,
-    /// The length of `generation`'s serving prompt, when the fixture has one.
-    pub generation_prefix_tokens: Option<usize>,
-}
-
-/// The contract's rendered-fixture line, as read from a rendered file.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OwnedLine {
-    fixture_id: String,
-    fixture_set_digest: String,
-    model: String,
-    target_sha256: String,
-    template_sha256: String,
-    request_options: RequestOptions,
-    context_target: Option<usize>,
-    tokens: Vec<u32>,
-    scored_spans: Vec<[usize; 2]>,
-    generation_prefix_tokens: Option<usize>,
-}
-
-/// A rendered-fixture file read back: its fixtures and its digest (SHA-256
-/// of its bytes).
-pub struct RenderedFile {
-    pub bytes: Vec<u8>,
-    pub digest: String,
-    pub rendered: Vec<Rendered>,
-}
-
-impl RenderedFile {
-    /// Read `path`, which must have been rendered from the fixture set of
-    /// `fixture_set_digest` for this model and target.
-    pub fn read(
-        path: &std::path::Path,
-        fixture_set_digest: &str,
-        model: &str,
-        target_sha256: &str,
-    ) -> Result<Self, String> {
-        let bytes =
-            std::fs::read(path).map_err(|error| format!("rendered {}: {error}", path.display()))?;
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|error| format!("rendered {}: {error}", path.display()))?;
-        let mut rendered = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            let failed = |reason: String| {
-                format!("rendered {} line {}: {reason}", path.display(), index + 1)
-            };
-            let line: OwnedLine =
-                serde_json::from_str(line).map_err(|error| failed(error.to_string()))?;
-            if line.model != model || line.target_sha256 != target_sha256 {
-                return Err(failed(format!(
-                    "rendered for {} ({}), not {model} ({target_sha256})",
-                    line.model, line.target_sha256
-                )));
-            }
-            if line.fixture_set_digest != fixture_set_digest {
-                return Err(failed("rendered from another fixture set".into()));
-            }
-            rendered.push(Rendered {
-                fixture_id: line.fixture_id,
-                template_sha256: line.template_sha256,
-                request_options: line.request_options,
-                context_target: line.context_target,
-                tokens: line.tokens,
-                scored_spans: line
-                    .scored_spans
-                    .into_iter()
-                    .map(|[start, end]| start..end)
-                    .collect(),
-                generation_prefix_tokens: line.generation_prefix_tokens,
-            });
-        }
-        if rendered.is_empty() {
-            return Err(format!("rendered {} holds no fixture", path.display()));
-        }
-        Ok(Self {
-            digest: sha256_hex(&bytes),
-            bytes,
-            rendered,
-        })
-    }
-}
-
-/// The contract's rendered-fixture line.
-#[derive(Serialize)]
-pub struct RenderedLine<'a> {
-    pub fixture_id: &'a str,
-    pub fixture_set_digest: &'a str,
-    pub model: &'a str,
-    pub target_sha256: &'a str,
-    pub template_sha256: &'a str,
-    pub request_options: &'a RequestOptions,
-    pub context_target: Option<usize>,
-    pub tokens: &'a [u32],
-    pub scored_spans: Vec<[usize; 2]>,
-    pub generation_prefix_tokens: Option<usize>,
+    /// The length of the serving request's prompt (the messages before the
+    /// generation prefix).
+    pub generation_prefix_tokens: usize,
 }
 
 impl Rendered {
-    pub fn line<'a>(
-        &'a self,
-        fixture_set_digest: &'a str,
-        model: &'a str,
-        target_sha256: &'a str,
-    ) -> RenderedLine<'a> {
+    /// SHA-256 of the rendered tokens as `u32` little-endian bytes.
+    pub fn prompt_sha256(&self) -> String {
+        let bytes = self
+            .tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        sha256_hex(&bytes)
+    }
+
+    /// The lane's label in messages: `<template>/<lane>`.
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.template, self.lane)
+    }
+
+    pub fn line<'a>(&'a self, model: &'a str, target_sha256: &'a str) -> RenderedLine<'a> {
         RenderedLine {
-            fixture_id: &self.fixture_id,
-            fixture_set_digest,
+            template: &self.template,
+            lane: self.lane,
             model,
             target_sha256,
-            template_sha256: &self.template_sha256,
+            chat_template_sha256: &self.chat_template_sha256,
             request_options: &self.request_options,
-            context_target: self.context_target,
+            context: self.context,
+            history: self.history,
             tokens: &self.tokens,
+            prompt_sha256: self.prompt_sha256(),
             scored_spans: self
                 .scored_spans
                 .iter()
@@ -184,54 +111,64 @@ impl Rendered {
     }
 }
 
-/// Writes rendered fixtures as the contract's JSON Lines and returns the
+/// The contract's rendered line.
+#[derive(Serialize)]
+pub struct RenderedLine<'a> {
+    pub template: &'a str,
+    pub lane: usize,
+    pub model: &'a str,
+    pub target_sha256: &'a str,
+    pub chat_template_sha256: &'a str,
+    pub request_options: &'a RequestOptions,
+    pub context: usize,
+    pub history: usize,
+    pub tokens: &'a [u32],
+    pub prompt_sha256: String,
+    pub scored_spans: Vec<[usize; 2]>,
+    pub generation_prefix_tokens: usize,
+}
+
+/// Writes rendered lanes as the contract's JSON Lines and returns the
 /// file's digest.
 pub fn write_rendered(
     path: &std::path::Path,
     rendered: &[Rendered],
-    fixture_set_digest: &str,
     model: &str,
     target_sha256: &str,
 ) -> Result<String, String> {
     let mut bytes = Vec::new();
-    for fixture in rendered {
-        serde_json::to_writer(
-            &mut bytes,
-            &fixture.line(fixture_set_digest, model, target_sha256),
-        )
-        .map_err(|error| error.to_string())?;
+    for lane in rendered {
+        serde_json::to_writer(&mut bytes, &lane.line(model, target_sha256))
+            .map_err(|error| error.to_string())?;
         bytes.push(b'\n');
     }
     std::fs::write(path, &bytes).map_err(|error| format!("writing {}: {error}", path.display()))?;
     Ok(sha256_hex(&bytes))
 }
 
-/// The conversation a fixture is rendered as after sizing: its messages
-/// without the fixture's own fields, which of them are scored, the offered
+/// The conversation a session is rendered as after sizing: its messages
+/// without the session's own fields, which of them are scored, the offered
 /// tools and the serving request's length.
 struct Conversation {
     messages: Vec<Map<String, Value>>,
     scored: Vec<bool>,
     tools: Vec<Value>,
-    generation_prefix: Option<usize>,
+    generation_prefix: usize,
 }
 
 impl Conversation {
-    /// The fixture's messages at `kept` (ascending indices). The serving
+    /// The session's messages at `kept` (ascending indices). The serving
     /// request shrinks by the messages dropped before its end.
-    fn of(fixture: &Fixture, kept: &[usize]) -> Result<Self, String> {
-        let mut tools = fixture.tools.clone();
+    fn of(session: &Session, kept: &[usize]) -> Result<Self, String> {
+        let mut tools = session.tools.clone();
         let mut messages = Vec::with_capacity(kept.len());
         let mut scored = Vec::with_capacity(kept.len());
         for &index in kept {
-            let mut message = fixture.messages[index].clone();
+            let mut message = session.messages[index].clone();
             scored.push(message.remove("scored").is_some());
             if let Some(unit_tools) = message.remove("tools") {
                 let Value::Array(unit_tools) = unit_tools else {
-                    return Err(format!(
-                        "fixture {}: a unit's tools must be an array",
-                        fixture.id
-                    ));
+                    return Err("a unit's tools must be an array".into());
                 };
                 tools.extend(unit_tools);
             }
@@ -243,17 +180,16 @@ impl Conversation {
         for tool in tools {
             let name = tool["function"]["name"]
                 .as_str()
-                .ok_or_else(|| format!("fixture {}: a tool has no function name", fixture.id))?
+                .ok_or("a tool has no function name")?
                 .to_owned();
             if names.insert(name) {
                 offered.push(tool);
             }
         }
-        let generation_prefix = fixture.generation.as_ref().map(|generation| {
-            kept.iter()
-                .take_while(|&&index| index < generation.prefix)
-                .count()
-        });
+        let generation_prefix = kept
+            .iter()
+            .take_while(|&&index| index < session.generation.prefix)
+            .count();
         Ok(Self {
             messages,
             scored,
@@ -295,32 +231,27 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// Render `fixture`, sized to `context` tokens when given.
-    pub fn render(&self, fixture: &Fixture, context: Option<usize>) -> Result<Rendered, String> {
-        let failed = |error: String| format!("fixture {}: {error}", fixture.id);
-        let all = (0..fixture.messages.len()).collect::<Vec<_>>();
-        let (candidate, context_target) = match (context, fixture.sizing) {
-            (None, _) => (
-                self.candidate(Conversation::of(fixture, &all)?)
-                    .map_err(failed)?,
-                None,
-            ),
-            (Some(target), Sizing::Fixed) => {
-                let candidate = self
-                    .candidate(Conversation::of(fixture, &all)?)
-                    .map_err(failed)?;
-                let length = candidate.prompt.tokens.len();
-                if length > target {
-                    return Err(failed(format!(
-                        "a fixed fixture of {length} tokens exceeds the context of {target}"
-                    )));
-                }
-                (candidate, None)
-            }
-            (Some(target), Sizing::Turn { keep_head }) => {
-                (self.sized(fixture, keep_head, target)?, Some(target))
-            }
-        };
+    /// Every lane of `file`, in lane order, each sized to its context.
+    pub fn render(&self, file: &TemplateFile) -> Result<Vec<Rendered>, String> {
+        file.sessions
+            .iter()
+            .enumerate()
+            .map(|(lane, session)| {
+                self.render_lane(&file.name, lane, session, file.context)
+                    .map_err(|error| format!("{} lane {lane}: {error}", file.name))
+            })
+            .collect()
+    }
+
+    /// `session`, lane `lane` of `template`, sized to `context` tokens.
+    pub fn render_lane(
+        &self,
+        template: &str,
+        lane: usize,
+        session: &Session,
+        context: usize,
+    ) -> Result<Rendered, String> {
+        let (candidate, history) = self.sized(session, context)?;
         let Candidate {
             conversation,
             request,
@@ -331,7 +262,7 @@ impl<'a> Renderer<'a> {
             .iter()
             .map(|token| token.0)
             .collect::<Vec<_>>();
-        let offsets = self.offsets(&prepared).map_err(failed)?;
+        let offsets = self.offsets(&prepared)?;
         let mut scored_spans = Vec::new();
         for (index, _) in conversation
             .scored
@@ -339,25 +270,21 @@ impl<'a> Renderer<'a> {
             .enumerate()
             .filter(|(_, scored)| **scored)
         {
-            let bytes = self
-                .scored_bytes(&conversation, &request, &prepared, index)
-                .map_err(failed)?;
+            let bytes = self.scored_bytes(&conversation, &request, &prepared, index)?;
             scored_spans.push(token_range(&offsets, bytes));
         }
-        let generation_prefix_tokens = conversation
-            .generation_prefix
-            .map(|prefix| {
-                let request =
-                    self.request(&conversation.messages[..prefix], &conversation.tools)?;
-                Ok::<_, String>(self.prepare(&request)?.tokens.len())
-            })
-            .transpose()
-            .map_err(failed)?;
+        let asked = self.request(
+            &conversation.messages[..conversation.generation_prefix],
+            &conversation.tools,
+        )?;
+        let generation_prefix_tokens = self.prepare(&asked)?.tokens.len();
         Ok(Rendered {
-            fixture_id: fixture.id.clone(),
-            template_sha256: self.template_sha256(&request).map_err(failed)?,
+            template: template.to_owned(),
+            lane,
+            chat_template_sha256: self.chat_template_sha256(&request)?,
             request_options: self.options.clone(),
-            context_target,
+            context,
+            history,
             tokens,
             scored_spans,
             generation_prefix_tokens,
@@ -365,46 +292,39 @@ impl<'a> Renderer<'a> {
     }
 
     /// Keep the head and the probe, then the newest history units that fit
-    /// `target` tokens, in conversation order. A conversation never exceeds
-    /// its target.
-    fn sized(
-        &self,
-        fixture: &Fixture,
-        keep_head: usize,
-        target: usize,
-    ) -> Result<Candidate, String> {
-        let failed = |error: String| format!("fixture {}: {error}", fixture.id);
-        let units = fixture.units()?;
-        let (probe, history) = units.split_last().expect("a fixture has a probe");
+    /// `target` tokens, in conversation order, and how many history units
+    /// it kept. A conversation never exceeds its target.
+    fn sized(&self, session: &Session, target: usize) -> Result<(Candidate, usize), String> {
+        let units = session.units()?;
+        let (probe, history) = units.split_last().expect("a session has a probe");
         let render = |kept_units: usize| {
-            let mut kept = (0..keep_head).collect::<Vec<_>>();
+            let mut kept = (0..session.keep_head).collect::<Vec<_>>();
             for unit in &history[history.len() - kept_units..] {
                 kept.extend(unit.clone());
             }
             kept.extend(probe.clone());
-            self.candidate(Conversation::of(fixture, &kept)?)
-                .map_err(failed)
+            self.candidate(Conversation::of(session, &kept)?)
         };
         let base = render(0)?;
         let base_length = base.prompt.tokens.len();
         if base_length > target {
-            return Err(failed(format!(
+            return Err(format!(
                 "its head and probe exceed the context of {target} tokens"
-            )));
+            ));
         }
         // The rendered length grows with every unit kept: keep the most that
         // fit. Every count tried is rendered exactly, so the choice is the
         // one a bisection makes; each try renders the count the measured
-        // lengths predict (units of one fixture are of similar length),
+        // lengths predict (units of one session are of similar length),
         // alternating with bisection so the interval at least halves every
-        // other try. A fixture's long history is never rendered whole.
+        // other try. A session's long history is never rendered whole.
         let (mut fitting, mut fitting_length, mut chosen) = (0, base_length, base);
         let mut exceeding: Option<(usize, usize)> = None;
         let mut tries = 0usize;
         loop {
             let high = exceeding.map_or(history.len() + 1, |(count, _)| count);
             if high - fitting <= 1 {
-                return Ok(chosen);
+                return Ok((chosen, fitting));
             }
             let per_unit = match exceeding {
                 Some((count, length)) => {
@@ -463,7 +383,7 @@ impl<'a> Renderer<'a> {
             .render(RENDER_TIME, self.host.media_placeholder())
             .map_err(|error| error.to_string())?;
         if !rendered.images.is_empty() {
-            return Err("fixtures carry no images".into());
+            return Err("sessions carry no images".into());
         }
         Ok(rendered.request)
     }
@@ -493,7 +413,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// SHA-256 of the template variant the request was prepared with.
-    fn template_sha256(&self, request: &ChatRequest) -> Result<String, String> {
+    fn chat_template_sha256(&self, request: &ChatRequest) -> Result<String, String> {
         let tools_offered = !request.tools.is_empty() && request.tool_choice != ToolChoice::None;
         let variant = self
             .host
@@ -643,15 +563,14 @@ fn token_range(offsets: &[Range<usize>], bytes: Range<usize>) -> Range<usize> {
 }
 
 /// Real-model checks of rendering:
-/// `MAGNITUDE_TEST_GGUF=M.gguf MAGNITUDE_TEST_FIXTURES=SET.jsonl cargo test
+/// `MAGNITUDE_TEST_GGUF=M.gguf MAGNITUDE_TEST_TEMPLATE=FILE.json cargo test
 /// --release -p magnitude-harness -- --ignored render`.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::FixtureSet;
     use magnitude_engine::options::{PackageOptions, ProjectorSelection};
 
-    fn setup() -> (HostArtifacts, FixtureSet) {
+    fn setup() -> (HostArtifacts, TemplateFile) {
         let variable = |name: &str| {
             std::path::PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("set {name}")))
         };
@@ -663,7 +582,7 @@ mod tests {
         .unwrap();
         (
             host,
-            FixtureSet::read(&variable("MAGNITUDE_TEST_FIXTURES")).unwrap(),
+            TemplateFile::read(&variable("MAGNITUDE_TEST_TEMPLATE")).unwrap(),
         )
     }
 
@@ -682,54 +601,43 @@ mod tests {
     }
 
     /// Every scored span is exactly its message's content (its tool calls'
-    /// markup when it has them) at served context lengths, and sizing never
-    /// exceeds the target.
+    /// markup when it has them) at the template's context, and sizing never
+    /// exceeds it.
     #[test]
-    #[ignore = "requires MAGNITUDE_TEST_GGUF and MAGNITUDE_TEST_FIXTURES"]
+    #[ignore = "requires MAGNITUDE_TEST_GGUF and MAGNITUDE_TEST_TEMPLATE"]
     fn render_spans_cover_exactly_the_scored_content() {
-        let (host, set) = setup();
+        let (host, file) = setup();
         let options = standard_request_options();
         let renderer = Renderer::new(&host, "evaluation", &options);
-        for context in [Some(4096), Some(16384), Some(65536)] {
-            for fixture in &set.fixtures {
-                let rendered = match renderer.render(fixture, context) {
-                    Ok(rendered) => rendered,
-                    Err(error) if error.contains("exceed the context") => continue,
-                    Err(error) => panic!("{error}"),
-                };
-                if let Some(target) = context {
-                    assert!(rendered.tokens.len() <= target, "{}", fixture.id);
-                }
-                let scored = fixture
-                    .messages
-                    .iter()
-                    .filter(|message| message.contains_key("scored"))
-                    .collect::<Vec<_>>();
-                assert_eq!(scored.len(), rendered.scored_spans.len(), "{}", fixture.id);
-                for (message, span) in scored.iter().zip(&rendered.scored_spans) {
-                    let spanned = text(&host, &rendered.tokens[span.clone()]);
-                    match message.get("content").and_then(Value::as_str) {
-                        Some(content) if !message.contains_key("tool_calls") => assert_eq!(
-                            spanned.trim(),
-                            content.trim(),
-                            "{} at {context:?}",
-                            fixture.id
-                        ),
-                        _ => {
-                            for call in message["tool_calls"].as_array().unwrap() {
-                                let name = call["function"]["name"].as_str().unwrap();
-                                assert!(spanned.contains(name), "{}: {spanned}", fixture.id);
-                            }
+        for (session, rendered) in file.sessions.iter().zip(renderer.render(&file).unwrap()) {
+            let label = rendered.label();
+            assert!(rendered.tokens.len() <= file.context, "{label}");
+            let scored = session
+                .messages
+                .iter()
+                .filter(|message| message.contains_key("scored"))
+                .collect::<Vec<_>>();
+            assert_eq!(scored.len(), rendered.scored_spans.len(), "{label}");
+            for (message, span) in scored.iter().zip(&rendered.scored_spans) {
+                let spanned = text(&host, &rendered.tokens[span.clone()]);
+                match message.get("content").and_then(Value::as_str) {
+                    Some(content) if !message.contains_key("tool_calls") => {
+                        assert_eq!(spanned.trim(), content.trim(), "{label}")
+                    }
+                    _ => {
+                        for call in message["tool_calls"].as_array().unwrap() {
+                            let name = call["function"]["name"].as_str().unwrap();
+                            assert!(spanned.contains(name), "{label}: {spanned}");
                         }
                     }
                 }
-                eprintln!(
-                    "{} at {context:?}: {} tokens, spans {:?}",
-                    fixture.id,
-                    rendered.tokens.len(),
-                    rendered.scored_spans
-                );
             }
+            eprintln!(
+                "{label}: {} tokens, {} history units, spans {:?}",
+                rendered.tokens.len(),
+                rendered.history,
+                rendered.scored_spans
+            );
         }
     }
 }

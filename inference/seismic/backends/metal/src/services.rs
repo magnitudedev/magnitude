@@ -18,7 +18,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSActivityOptions, NSObjectProtocol, NSProcessInfo, NSString};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLSize,
+    MTLComputePipelineState, MTLDispatchType, MTLSize,
 };
 use seismic_estimator::{AnalyticalService, CoreService};
 use seismic_estimator_metal::MetalService;
@@ -240,7 +240,8 @@ pub(crate) struct Acquisition {
 /// Acquires the definitions of every core service ([`core_services`]) and
 /// of the GPU services `gpu` the device's model admits. One fixed library is
 /// formed once, through the device's programs; every GPU observation is read
-/// from `GPUStartTime`/`GPUEndTime` after completion.
+/// from GPU timestamp samples at its encoder's start and end after
+/// completion (`direct::sampled_pass`).
 pub(crate) fn acquire(
     device: &crate::device::MetalDevice,
     programs: &crate::MetalPrograms,
@@ -764,17 +765,25 @@ fn gpu_elapsed_pipeline_batch(
     buffer: &crate::device::MetalBuffer,
     requests: &[(&ProtocolObject<dyn MTLComputePipelineState>, u32, usize)],
 ) -> Result<Vec<u64>, seismic_compiler::errors::TargetError> {
+    let unavailable = |detail: String| seismic_compiler::errors::TargetError::DeviceUnavailable(detail);
+    let timestamps = crate::direct::LaunchTimestamps::shared(device)
+        .map_err(|error| unavailable(error.to_string()))?;
+    let calibration = crate::direct::sample_timestamps(device);
     let mut commands = Vec::with_capacity(requests.len());
     for &(pipeline, iterations, threads) in requests {
         let command = device.command_buffer().ok_or_else(|| {
-            seismic_compiler::errors::TargetError::DeviceUnavailable(
-                "Metal could not create a service-probe command buffer".into(),
-            )
+            unavailable("Metal could not create a service-probe command buffer".into())
         })?;
-        let encoder = device.compute_encoder(&command, crate::device::EncoderKind::Serial).ok_or_else(|| {
-            seismic_compiler::errors::TargetError::DeviceUnavailable(
-                "Metal could not create a service-probe encoder".into(),
-            )
+        let pair = std::sync::Arc::new(
+            timestamps
+                .span(device, || commands.len())
+                .map_err(|error| unavailable(error.to_string()))?,
+        );
+        let pass = crate::direct::sampled_pass(MTLDispatchType::Serial, &pair, true);
+        let encoder = device
+            .compute_encoder(&command, crate::device::EncoderKind::Pass(&pass))
+            .ok_or_else(|| {
+                unavailable("Metal could not create a service-probe encoder".into())
         })?;
         encoder.setComputePipelineState(pipeline);
         unsafe {
@@ -800,23 +809,29 @@ fn gpu_elapsed_pipeline_batch(
             },
         );
         encoder.endEncoding();
-        let time = crate::timing::SubmissionTime::before_commit();
+        pair.hold_until_completed(&command);
+        let committed = crate::timing::host_seconds();
         command.commit();
-        commands.push((command, time));
+        commands.push((command, committed, pair));
     }
-    let mut elapsed = Vec::with_capacity(commands.len());
-    for (command, time) in commands {
+    let mut ticks = Vec::with_capacity(commands.len());
+    for (command, committed, pair) in &commands {
         command.waitUntilCompleted();
         if let Some(error) = command.error() {
-            return Err(seismic_compiler::errors::TargetError::DeviceUnavailable(
-                error.localizedDescription().to_string(),
-            ));
+            return Err(unavailable(error.localizedDescription().to_string()));
         }
-        let (start, end) = time.interval(command.GPUStartTime(), command.GPUEndTime())
-            .map_err(seismic_compiler::errors::TargetError::UnsupportedDriver)?;
-        elapsed.push(((end - start) * 1_000_000_000.0).ceil() as u64);
+        ticks.push((*committed, pair.resolve().map_err(|error| unavailable(error.to_string()))?));
     }
-    Ok(elapsed)
+    let host = crate::direct::host_clock(device, calibration).map_err(|error| unavailable(error.to_string()))?;
+    let after = crate::timing::host_seconds();
+    ticks
+        .into_iter()
+        .map(|(committed, (start, end))| {
+            let (start, end) = crate::timing::checked_interval(committed, host.seconds(start), host.seconds(end), after, host.uncertainty)
+                .map_err(seismic_compiler::errors::TargetError::UnsupportedDriver)?;
+            Ok(((end - start) * 1_000_000_000.0).ceil() as u64)
+        })
+        .collect()
 }
 
 fn paired_linear_combination_confidence_interval(

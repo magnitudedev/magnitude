@@ -80,6 +80,13 @@ pub(in crate::experts) struct Layer {
     /// (`RegionWords::flight`), routing words each
     /// (`RegionWords::routing_words`).
     pub routing: Words,
+    /// Its key records, one `[VERIFY_ROWS, experts]` slot for each step in
+    /// flight beside its routing records (`BankPart::Keys`): every row's
+    /// selection key of every expert, which placement ranks by.
+    pub keys: Words,
+    /// Its front ring (`BankPart::Front`, `RegionWords::ring_words`): every
+    /// choice of its last step's front rows there, with its weight.
+    pub front: Words,
     /// Its policy words (`BankPart::Policy`): those a run's encoding reads
     /// written between flights (`Residency::publish_policy`), its line words
     /// at any turn (`Residency::publish_lines`).
@@ -165,8 +172,17 @@ impl Layer {
 pub(super) struct RoutingRecord {
     /// Each choice's expert and the source its route resolved it to.
     choices: Vec<(i32, i32)>,
-    /// Whether its route wrote it: a whole layer's writes none.
-    written: bool,
+    /// Its step's front rows' guess kinds (RING_GUESSES, STEP_GUESSES's
+    /// fields) where its route wrote it; none of a whole layer's, which
+    /// writes none.
+    guesses: Option<u32>,
+}
+
+/// Whether choice `index` of a routing record (`selected` choices a row, in
+/// row order as the route writes them) is a front row's (`front`,
+/// STEP_FRONT's bits).
+fn front_choice(front: u32, selected: usize, index: usize) -> bool {
+    front >> (index / selected) & 1 == 1
 }
 
 /// A routing record's words as they were while its step held its slot
@@ -176,6 +192,7 @@ pub(super) struct CopiedRecord {
     sequence: super::Step,
     written: i32,
     count: i32,
+    guesses: i32,
     /// Every choice's words the record has room for.
     choices: Vec<(i32, i32)>,
 }
@@ -193,7 +210,8 @@ impl RoutingRecord {
             sequence,
             written: word(constants::RING_SEQUENCE),
             count: word(constants::RING_COUNT),
-            choices: (0..shape.choices).map(|choice| (word(shape.routing_expert(choice)), word(shape.routing_source(choice)))).collect(),
+            guesses: word(constants::RING_GUESSES),
+            choices: (0..shape.choices).map(|choice| (word(constants::ROUTING_EXPERT(choice)), word(shape.routing_source(choice)))).collect(),
         }
     }
 
@@ -202,24 +220,30 @@ impl RoutingRecord {
     /// step, or of a count that is none of its choices, is the device's
     /// broken invariant.
     pub(super) fn read(copied: CopiedRecord, shape: RegionWords, layer: usize) -> Self {
-        let CopiedRecord { sequence, written, count, mut choices } = copied;
+        let CopiedRecord { sequence, written, count, guesses, mut choices } = copied;
         assert_eq!(written, low_word(sequence), "step {sequence}'s routing record at layer {layer} is another step's ({written})");
         let count = usize::try_from(count)
             .ok()
             .filter(|&count| count as u64 <= shape.choices)
             .unwrap_or_else(|| panic!("step {sequence}'s routing record at layer {layer} counts {count} of {} choices", shape.choices));
         choices.truncate(count);
-        Self { choices, written: true }
+        Self { choices, guesses: Some(guesses as u32) }
     }
 
     /// A whole layer's: its route writes none, so it holds no choice.
     pub(super) fn unwritten() -> Self {
-        Self { choices: Vec::new(), written: false }
+        Self { choices: Vec::new(), guesses: None }
     }
 
     /// Whether its route wrote it ([`Self::unwritten`] is a whole layer's).
     pub(super) fn written(&self) -> bool {
-        self.written
+        self.guesses.is_some()
+    }
+
+    /// Its step's front rows' guess kinds (STEP_GUESSES's fields) as its
+    /// route wrote them; none of a whole layer's.
+    pub(super) fn guesses(&self) -> Option<u32> {
+        self.guesses
     }
 
     /// The choices it holds.
@@ -230,6 +254,18 @@ impl RoutingRecord {
     /// Each choice's expert and the source its route resolved it to.
     pub(super) fn choices(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
         self.choices.iter().copied()
+    }
+
+    /// Its choices of rows that are not front rows (`front`, STEP_FRONT's
+    /// bits; `selected` choices a row, in row order as the route writes
+    /// them).
+    pub(super) fn exact(mut self, front: u32, selected: usize) -> Self {
+        let mut index = 0;
+        self.choices.retain(|_| {
+            index += 1;
+            !front_choice(front, selected, index - 1)
+        });
+        self
     }
 }
 
@@ -290,15 +326,12 @@ pub(in crate::experts) struct Extents {
     /// The staging records reads ahead leave free for demand
     /// (`ExpertBankPlan::demand_records`).
     pub demand: usize,
-    /// The tier records each group keeps holding no expert mapped (ready,
-    /// graced, or taken by a read ahead's landing in flight,
-    /// `HostRecords::reserved`) for the reads ahead
-    /// (`ExpertBankPlan::tier_reserve`).
-    pub reserve: usize,
     /// Who places into the bank (`ExpertBankPlan::placer`): where the
     /// device does, landings are into tier records, answered as -2 - t;
     /// where the host does, into bank records, answered as themselves.
     pub placer: crate::planning::Placer,
+    /// Whether the load traces its routes (`ExpertBankPlan::recording`).
+    pub recording: bool,
 }
 
 /// The records a scratch round of the request at `until` listed: free once
@@ -389,7 +422,7 @@ impl ReadTable {
 /// group run whole is one piece, whose `g·L` runs before it (of a bank of
 /// `L` layers) are the steps' before it (sequences begin at 1, each step
 /// `L` runs).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::experts) struct At {
     pub(in crate::experts) point: Point,
     position: u64,
@@ -399,6 +432,12 @@ impl At {
     /// `point`, `position` runs into the device's order.
     pub(super) fn new(point: Point, position: u64) -> Self {
         Self { point, position }
+    }
+
+    /// A unit test's whole-step point at `(sequence, layer)`.
+    #[cfg(test)]
+    pub(in crate::experts) const fn whole(sequence: super::Step, layer: usize) -> Self {
+        Self { point: Point::whole(sequence, layer, sequence), position: 0 }
     }
 
     /// The layer runs from `self` to `later`: what a read submitted at
@@ -446,22 +485,6 @@ impl Core {
             crate::planning::Placer::Bank => directory.host(group).records() as usize,
         };
         directory.group_whole(group) && directory.group_at_home(group) && records == self.groups[group].commits.len()
-    }
-
-    /// Each group's records that hold the bank's experts: its own where the
-    /// device places into the bank from a tier, the landed records it keeps
-    /// where the bank is the one store (unified memory), less the reserve
-    /// it keeps ready for the reads ahead ([`Extents::reserve`]): none where
-    /// a group holds no more than its reserve, which then keeps nothing
-    /// (`HostRecords::refill_victims`; a plan's group holds its reserve
-    /// beside a request's records, `ExpertBankPlan::least_records`).
-    pub(super) fn bank_records(&self) -> Vec<usize> {
-        match self.extents.placer {
-            crate::planning::Placer::Tier => self.directory.records(),
-            crate::planning::Placer::Bank => (0..self.directory.records().len())
-                .map(|group| (self.directory.host(group).records() as usize).saturating_sub(self.extents.reserve))
-                .collect(),
-        }
     }
 
     /// The device is at `progress`: the records taken before it, now free.

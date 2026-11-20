@@ -1,7 +1,7 @@
 use super::{AttentionKernels, DenseKernels, GeneralRoutedKernels, ProjectionKernels, RoutedKernels};
 use crate::HeadBinding;
 use magnitude_kernels::{
-    attention_project, draft_rows, readout_features_rows, sample_rows,
+    attention_project, draft_rows, guess_chain, readout_features_rows, sample_rows,
     shape_rows,
 };
 use seismic::NativeKernel;
@@ -25,4 +25,7 @@ pub struct HeadKernels {
     /// Token selection over the draft vocabulary, shared by every block.
     pub(super) shape: Option<NativeKernel<shape_rows::Entry>>,
     pub(super) sample: Option<NativeKernel<sample_rows::Entry>>,
+    /// Two-row decode's chain at a front launch's tail, of a load that
+    /// fronts (`ProgramPlan::fronts`).
+    pub(super) chain: Option<NativeKernel<guess_chain::Entry>>,
 }

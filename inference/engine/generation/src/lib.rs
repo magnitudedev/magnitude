@@ -6,6 +6,7 @@ mod dflash;
 mod draft_budget;
 mod draft_control;
 mod draft_transition;
+mod front;
 mod method;
 mod mtp;
 mod plain;
@@ -23,14 +24,15 @@ pub use draft_transition::{
 };
 pub use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan};
 pub use magnitude_executor::{
-    Demand, FeatureReader, FeatureRef, LaunchDuration, Operation, Priming, RequestId, Sampling, SelectSpec,
-    Shaping, TokenId, WorkKind,
+    Demand, FeatureReader, FeatureRef, FrontGrant, LaunchDuration, Operation, Priming, RequestId, Sampling,
+    SelectSpec, Shaping, TokenId, WorkKind,
 };
+use magnitude_executor::{AheadVerdict, ChainEntry, Guess, GuessKind, PhysicalDecision, Rows, TwoRowDecode};
 pub use method::{
-    DraftCheckpoint, Method, MethodCheckpoint, MethodCheckpointError, MethodChoice, MethodEffects,
+    DraftCheckpoint, FrontEntry, Method, MethodCheckpoint, MethodCheckpointError, MethodChoice, MethodEffects,
     MethodRequirements, MethodState, Propose, Verification,
 };
-pub use mtp::Mtp;
+pub use mtp::{drafted_chain, Mtp};
 pub use plain::Plain;
 pub use round::{MethodUpdate, RoundAcceptance, RoundForward, RoundState};
 pub use shaping::{selection_history, verification_selects, HISTORY_WIDTH};
@@ -213,27 +215,24 @@ enum NextRound {
     Method(Vec<Operation>),
 }
 
-/// The sole numerical decision generation sends back to the executor: the
-/// target rows (or, for a head transaction, the head entry rows) to commit.
-/// A verified prefix may need physical repair before the prepared transition
-/// is committed, but its accepted length cannot change during that repair.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReconcileDecision {
-    pub accepted_rows: usize,
-}
-
 /// Every fallible logical change is performed against private state before
 /// physical reconciliation. Dropping this value leaves the started round
 /// untouched, including its generation's method state.
 pub struct PreparedGenerationTransition {
     request: RequestId,
+    decision: PhysicalDecision,
+    commit: GenerationCommit,
+}
+
+/// What a prepared round transition commits into its generation, once the
+/// executor reconciled its decision.
+struct GenerationCommit {
     expected_resident_position: usize,
     expected_generated_len: usize,
     expected_finish: Option<FinishReason>,
     expected_output_len: usize,
     expected_published: usize,
     expected_forward: RoundForward,
-    decision: ReconcileDecision,
     method: Box<dyn MethodState>,
     effects: MethodEffects,
     constraint: Option<Box<dyn Constraint>>,
@@ -243,6 +242,7 @@ pub struct PreparedGenerationTransition {
     resident_position: usize,
     accepted_position: usize,
     finish: Option<FinishReason>,
+    two_row: Option<TwoRowDecode>,
 }
 
 /// A method operation's outcome consumed against private method state.
@@ -252,12 +252,18 @@ pub struct PreparedMethodTransition {
     expected_generated_len: usize,
     expected_finish: Option<FinishReason>,
     method: Box<dyn MethodState>,
-    decision: ReconcileDecision,
+    /// The head entry rows it commits.
+    accepted_rows: usize,
+    /// Its generation's front-row decode after it: the chain a head
+    /// transaction that drafted leaves the next pass.
+    two_row: Option<TwoRowDecode>,
 }
 
 impl PreparedMethodTransition {
-    pub const fn decision(&self) -> ReconcileDecision {
-        self.decision
+    /// The sole decision generation sends back to the executor for a head
+    /// transaction: its entry rows to commit, guessing nothing.
+    pub fn decision(&self) -> PhysicalDecision {
+        PhysicalDecision::rows(self.accepted_rows)
     }
     pub const fn request(&self) -> RequestId {
         self.request
@@ -265,8 +271,14 @@ impl PreparedMethodTransition {
 }
 
 impl PreparedGenerationTransition {
-    pub const fn decision(&self) -> ReconcileDecision {
-        self.decision
+    /// The sole decision generation sends back to the executor: the target
+    /// rows to commit and how the round's guessed rows fared
+    /// (`RoundAcceptance::decision`). A verified prefix may need physical
+    /// repair before the transition commits, but its accepted length cannot
+    /// change during that repair. [`StartedRound::reconcile`] moves it into
+    /// the executor's reconciliation.
+    pub const fn decision(&self) -> &PhysicalDecision {
+        &self.decision
     }
     pub const fn request(&self) -> RequestId {
         self.request
@@ -291,6 +303,19 @@ pub struct Generation {
     method: Box<dyn MethodState>,
     cached_tokens: usize,
     draft_stats: DraftStats,
+    /// Its front-row decode, where its method decodes in front passes
+    /// (`Method::decodes_two_rows`): the chain the head made past the
+    /// pending token, behind its last round on the device or in the host
+    /// head transaction that drafted it, the next pass's guesses. A guess
+    /// is only checked against the sequence's own tokens, so no state
+    /// change invalidates it; a completed round that made none leaves none
+    /// (`RoundAcceptance::advance`). Such a generation forces no token and
+    /// proposes none: every decode round is a pass in the form its launch
+    /// grants, a front pass entering the head behind it or a verify pass
+    /// whose accepted pairs the next round's head transaction enters, and
+    /// the chunk closing its prompt enters the head as a front pass does
+    /// where the head enters its chunks on the device.
+    two_row: Option<TwoRowDecode>,
 }
 
 /// A target round in progress. It owns its generation from start until the
@@ -356,6 +381,7 @@ impl Generation {
             options.vocabulary,
         )?;
         let method = method_factory.create(None)?;
+        let two_row = method_factory.decodes_two_rows().then(TwoRowDecode::default);
         Ok(Self {
             prompt,
             layout,
@@ -374,6 +400,7 @@ impl Generation {
             method,
             cached_tokens: 0,
             draft_stats: DraftStats::default(),
+            two_row,
         })
     }
     pub fn prompt(&self) -> &[TokenId] {
@@ -461,20 +488,16 @@ impl Generation {
         self.method.checkpoint().map_err(|error| error.to_string())
     }
 
-    /// Method state restored from a retained checkpoint of `position` rows.
+    /// Method state restored from a retained checkpoint of `position` rows,
+    /// one this generation resumes from (`MethodCheckpoint::resumes`).
     fn method_at(
         &self,
         position: usize,
         checkpoint: &MethodCheckpoint,
     ) -> Result<Box<dyn MethodState>, String> {
-        match (self.options.method, checkpoint) {
-            (MethodChoice::Plain, MethodCheckpoint::Plain) => {}
-            (MethodChoice::Mtp { .. }, MethodCheckpoint::Mtp(state))
-            | (MethodChoice::DFlash { .. }, MethodCheckpoint::DFlash(state))
-                if state.target_rows() == position => {}
-            _ => {
-                return Err("retained method checkpoint does not match the generation".into());
-            }
+        let successor = self.prompt.iter().chain(&self.generated).nth(position).copied();
+        if !checkpoint.resumes(self.options.method, position, successor) {
+            return Err("retained method checkpoint does not match the generation".into());
         }
         self.method_factory.create(Some(checkpoint))
     }
@@ -496,19 +519,50 @@ impl Generation {
             .transpose()
     }
 
+    /// Whether its next round is a pass in the form its launch grants
+    /// (`magnitude_executor::FrontPass`): it decodes in front passes
+    /// (`Method::decodes_two_rows`) and its next round is a decode. A front
+    /// pass enters the head behind it (`Operation::Forward`'s `chain`) and
+    /// a verify pass does not, and a launch's forwards chain all or none,
+    /// so such rounds launch only beside each other, in one form.
+    pub fn chains(&self) -> bool {
+        self.two_row.is_some() && matches!(self.plan_round(1), Ok(RoundPlan::Propose { .. }))
+    }
+
+    /// The kind of the first guess its next pass runs where granted every
+    /// guessed row it holds: the chain's first, or the head's where its
+    /// head trails the target, so that the round drafts the chain first
+    /// ([`MethodState::trails`]); none where it decodes in no front pass,
+    /// where that round is no decode, or where no guessed row fits it.
+    pub fn front_guess(&self) -> Option<GuessKind> {
+        let two_row = self.two_row.as_ref()?;
+        let RoundPlan::Propose { limit } = self.plan_round(1).ok()? else {
+            return None;
+        };
+        let deepest = FrontGrant::UpTo(usize::MAX);
+        match self.method.trails() {
+            true => (self.granted(limit, usize::MAX, deepest).min(self.method_factory.proposals()) > 0)
+                .then_some(GuessKind::Head),
+            false => Some(self.front_rows(two_row, usize::MAX, limit, deepest).guesses().first()?.kind),
+        }
+    }
+
     pub fn is_resident(&self) -> bool {
         self.resident
     }
     /// Start the next target round, which then owns this generation. Method
     /// work is returned as ordinary executor operations with the generation;
     /// callers start again after reconciling it. A refused start returns the
-    /// generation with its error.
+    /// generation with its error. `grant`: the form and guessed rows of a
+    /// decode round of a method decoding in front passes (its launch grants
+    /// them, `ExecutorDomain::front_pass`), as its rows hold.
     pub fn start_round(
         mut self,
         request: RequestId,
         allowance: usize,
+        grant: FrontGrant,
     ) -> Result<RoundStart, (Self, String)> {
-        match self.next_round(request, allowance) {
+        match self.next_round(request, allowance, grant) {
             Ok(NextRound::Target(round)) => Ok(RoundStart::Target(StartedRound {
                 generation: self,
                 round,
@@ -529,8 +583,11 @@ impl Generation {
     /// - a forced run publishes exactly its forced tokens;
     /// - a decode or verification publishes at most `limit + 1` tokens, where
     ///   `limit` is the proposal width from the allowance, remaining
-    ///   `max_tokens`, output credit, context limit and method proposals. The
-    ///   method may propose fewer, or return drafter work that starts no
+    ///   `max_tokens`, output credit, context limit and method proposals;
+    ///   of a method decoding in front passes, the deepest verify pass
+    ///   those allow, whatever form its launch grants (a front pass emits
+    ///   its exact row's token alone).
+    ///   The method may propose fewer, or return drafter work that starts no
     ///   target round and publishes nothing.
     ///
     /// It fails exactly when `start_round` would refuse before proposing.
@@ -596,12 +653,17 @@ impl Generation {
             remaining,
             credit,
             self.options.method == MethodChoice::Plain,
-        )
-        .min(self.options.method.proposals());
+        );
+        // A verify pass's acceptable rows are the chain's guesses, as deep
+        // as its launch grants; a drafted proposal is the method's.
+        let limit = match self.two_row {
+            Some(_) => limit,
+            None => limit.min(self.options.method.proposals()),
+        };
         Ok(RoundPlan::Propose { limit })
     }
 
-    fn next_round(&mut self, request: RequestId, allowance: usize) -> Result<NextRound, String> {
+    fn next_round(&mut self, request: RequestId, allowance: usize, grant: FrontGrant) -> Result<NextRound, String> {
         let requirements = self.method_factory.requires();
         let round = match self.plan_round(allowance)? {
             RoundPlan::Replay { end } => {
@@ -617,7 +679,9 @@ impl Generation {
                 RoundState::progress(
                     WorkKind::Replay,
                     tokens,
+                    position,
                     Vec::new(),
+                    None,
                     None,
                     None,
                     requirements,
@@ -630,6 +694,41 @@ impl Generation {
                 RoundState::forced(*self.generated.last().unwrap(), forced, requirements)?
             }
             RoundPlan::Propose { limit } => {
+                let pending = *self.generated.last().unwrap();
+                if let Some(two_row) = &self.two_row {
+                    // Where the head trails the target, the round is the
+                    // head transaction drafting the chain this grant's pass
+                    // runs, at most the head's proposals deep.
+                    let drafts = self.granted(limit, allowance, grant).min(self.method_factory.proposals());
+                    let selects = self.proposal_selects(drafts)?;
+                    // The method's state moves only once the round it
+                    // starts is valid.
+                    let mut method = self.method.fork_transition();
+                    let pass = |chain| {
+                        RoundState::pass(
+                            pending,
+                            self.front_rows(two_row, allowance, limit, grant),
+                            self.generated.len(),
+                            &self.generated,
+                            self.constraint.as_deref(),
+                            self.options.sampling,
+                            self.options.shaping,
+                            self.options.seed,
+                            requirements.verify_demand,
+                            chain,
+                        )
+                    };
+                    let next = match method.front(request, pending, grant, &selects)? {
+                        FrontEntry::Chain(chain) => NextRound::Target(pass(Some(chain))?),
+                        FrontEntry::Verify => NextRound::Target(pass(None)?),
+                        FrontEntry::Pending(operations) => {
+                            self.validate_method_operations(request, &operations)?;
+                            NextRound::Method(operations)
+                        }
+                    };
+                    self.method = method;
+                    return Ok(next);
+                }
                 let selects = self.proposal_selects(limit)?;
                 let proposal = match self.method.propose(request, &selects) {
                     Propose::Tokens(tokens) => tokens,
@@ -661,10 +760,9 @@ impl Generation {
                     true => Demand::NONE,
                     false => requirements.verify_demand,
                 };
-                RoundState::verification(
-                    *self.generated.last().unwrap(),
-                    proposal,
-                    limit,
+                RoundState::pass(
+                    pending,
+                    Rows::Exact { acceptable: proposal },
                     self.generated.len(),
                     &self.generated,
                     self.constraint.as_deref(),
@@ -672,16 +770,65 @@ impl Generation {
                     self.options.shaping,
                     self.options.seed,
                     verify_demand,
+                    None,
                 )?
             }
         };
         Ok(NextRound::Target(round))
     }
 
+    /// The guessed rows `grant` gives a pass of this generation at most. A
+    /// front pass the host builds runs as many as the rows `allowance` and
+    /// the context leave past its exact row hold. A verify pass runs as
+    /// many as its decode's `limit` holds ([`RoundPlan::Propose`]), every
+    /// acceptable row a token it may emit. One claiming the pass queued
+    /// behind its predecessor runs that pass's rows as they were queued,
+    /// held to the context then
+    /// (`magnitude_executor::ExecutorDomain::front_pass`): it is never
+    /// reshaped.
+    fn granted(&self, limit: usize, allowance: usize, grant: FrontGrant) -> usize {
+        match grant {
+            FrontGrant::UpTo(depth) => depth.min(
+                allowance
+                    .min(self.options.context_limit.saturating_sub(self.resident_position))
+                    .saturating_sub(1),
+            ),
+            FrontGrant::Exactly(depth) => depth,
+            FrontGrant::Verify(depth) => depth.min(limit),
+        }
+    }
+
+    /// The rows of a pass of `two_row` where `grant`ed
+    /// (`TwoRowDecode::pass`), held to what it gives at most
+    /// ([`Self::granted`]): its exact row alone where none fits. A verify
+    /// pass's acceptable rows end before a stop token, which is never
+    /// accepted as a guess, so rows after it could only be rejected.
+    fn front_rows(&self, two_row: &TwoRowDecode, allowance: usize, limit: usize, grant: FrontGrant) -> Rows {
+        let depth = self.granted(limit, allowance, grant);
+        match grant {
+            FrontGrant::UpTo(_) => two_row.pass(FrontGrant::UpTo(depth)),
+            FrontGrant::Exactly(_) => two_row.pass(grant),
+            FrontGrant::Verify(_) => {
+                let Rows::Exact { acceptable } = two_row.pass(FrontGrant::Verify(depth)) else {
+                    unreachable!("a verify pass's rows are exact");
+                };
+                Rows::Exact {
+                    acceptable: acceptable
+                        .into_iter()
+                        .take_while(|token| !self.options.stop_tokens.contains(token))
+                        .collect(),
+                }
+            }
+        }
+    }
+
     /// The prompt chunk from `position` to `end`; the chunk ending the prompt
     /// selects (or forces) the first generated token. A drafter entering
     /// chunks on the device at `drafter` enters, behind the chunk, each
-    /// following prompt token with the chunk row before it.
+    /// following prompt token with the chunk row before it; of a sequence
+    /// decoding in front passes, the chunk ending the prompt then enters its
+    /// selection with its boundary feature, right past that entry
+    /// ([`ChainEntry`]).
     fn prefill_round(
         &self,
         position: usize,
@@ -726,7 +873,11 @@ impl Generation {
         } else {
             None
         };
-        RoundState::progress(WorkKind::Prefill, tokens, forced, select, prime, requirements)
+        let chain = prime
+            .as_ref()
+            .filter(|prime| self.two_row.is_some() && select.is_some() && prime.boundary)
+            .map(|prime| ChainEntry { position: prime.position + prime.tokens.len() });
+        RoundState::progress(WorkKind::Prefill, tokens, position, forced, select, prime, chain, requirements)
     }
 
     /// See `StartedRound::planned_prefill`.
@@ -850,7 +1001,9 @@ impl Generation {
         let round = RoundState::progress(
             WorkKind::Replay,
             tokens,
+            pending.start,
             Vec::new(),
+            None,
             None,
             None,
             self.method_factory.requires(),
@@ -858,7 +1011,14 @@ impl Generation {
         Ok((pending.end, round))
     }
 
+    /// A constrained run of at most `limit` tokens accepted without
+    /// selection. A sequence decoding in front passes forces none: each row
+    /// it commits enters the head behind a selecting step, and the
+    /// constraint's mask selects what it would force.
     fn forced_tokens(&self, limit: usize) -> Result<Vec<TokenId>, String> {
+        if self.two_row.is_some() {
+            return Ok(Vec::new());
+        }
         let limit = limit
             .min(self.options.forced_quantum)
             .min(self.options.max_tokens - self.generated.len())
@@ -922,15 +1082,24 @@ impl Generation {
         }
         let mut method = self.method.fork_transition();
         method.reconcile(operation, outcome.clone())?;
+        // A head transaction that drafted, of a generation decoding in
+        // front passes, drafted the next pass's chain.
+        let mut two_row = self.two_row.clone();
+        if let (Some(decode), Operation::Head { proposals, .. }, magnitude_executor::Outcome::Head { proposals: selected, .. }) =
+            (two_row.as_mut(), operation, outcome)
+        {
+            if !proposals.is_empty() {
+                decode.guessed(drafted_chain(selected));
+            }
+        }
         Ok(PreparedMethodTransition {
             request: *request,
             expected_resident_position: self.resident_position,
             expected_generated_len: self.generated.len(),
             expected_finish: self.finish,
             method,
-            decision: ReconcileDecision {
-                accepted_rows: tokens.len(),
-            },
+            accepted_rows: tokens.len(),
+            two_row,
         })
     }
 
@@ -962,6 +1131,7 @@ impl Generation {
             "generation changed between method preparation and physical reconciliation"
         );
         self.method = transition.method;
+        self.two_row = transition.two_row;
     }
 
     /// See `StartedRound::prepare_round_transition`.
@@ -970,21 +1140,27 @@ impl Generation {
         round: &RoundState,
         request: RequestId,
         samples: &[TokenId],
+        guesses: Vec<Guess>,
         features: Option<FeatureRef>,
         reader: &mut dyn FeatureReader,
     ) -> Result<PreparedGenerationTransition, String> {
         let causal_reconciliation = self.finish.is_some()
             && round.forward().kind == WorkKind::Replay
             && round.forward().selects.is_empty();
-        let mut acceptance = round
-            .clone()
-            .reconcile(samples, &self.options.stop_tokens)?;
+        let mut acceptance = round.clone().reconcile(samples, &self.options.stop_tokens)?;
+        // The chain the round's outcome guessed is the next pass's, of a
+        // sequence decoding in front passes, which alone runs front rows.
+        let mut two_row = self.two_row.clone();
+        acceptance.advance(two_row.as_mut(), guesses);
+        // A finished generation accepts nothing of a round that ran past its
+        // end, and its guesses decide nothing.
         if self.finish.is_some() && !causal_reconciliation {
             acceptance.emitted.clear();
             acceptance.committed_rows = 0;
             acceptance.proposed = 0;
             acceptance.accepted_proposals = 0;
             acceptance.method_update = MethodUpdate::None;
+            acceptance.verdict = AheadVerdict::default();
         }
         if acceptance
             .emitted
@@ -1071,7 +1247,7 @@ impl Generation {
         let mut generated = self.generated.clone();
         let mut output = self.output.clone();
         let mut finish = self.finish;
-        for token in acceptance.emitted {
+        for &token in &acceptance.emitted {
             generated.push(token);
             if self.options.stop_tokens.contains(&token) {
                 finish = Some(FinishReason::Stop);
@@ -1097,33 +1273,30 @@ impl Generation {
         }
         Ok(PreparedGenerationTransition {
             request,
-            expected_resident_position: self.resident_position,
-            expected_generated_len: self.generated.len(),
-            expected_finish: self.finish,
-            expected_output_len: self.output.len(),
-            expected_published: self.published,
-            expected_forward: round.forward().clone(),
-            decision: ReconcileDecision {
-                accepted_rows: acceptance.committed_rows,
+            decision: acceptance.decision(),
+            commit: GenerationCommit {
+                expected_resident_position: self.resident_position,
+                expected_generated_len: self.generated.len(),
+                expected_finish: self.finish,
+                expected_output_len: self.output.len(),
+                expected_published: self.published,
+                expected_forward: round.forward().clone(),
+                method,
+                effects,
+                constraint,
+                generated,
+                output,
+                draft_stats,
+                resident_position,
+                accepted_position,
+                finish,
+                two_row,
             },
-            method,
-            effects,
-            constraint,
-            generated,
-            output,
-            draft_stats,
-            resident_position,
-            accepted_position,
-            finish,
         })
     }
 
     /// See `StartedRound::commit`.
-    fn commit_transition(
-        &mut self,
-        forward: &RoundForward,
-        transition: PreparedGenerationTransition,
-    ) -> MethodEffects {
+    fn commit_transition(&mut self, forward: &RoundForward, transition: GenerationCommit) -> MethodEffects {
         assert!(
             self.resident_position == transition.expected_resident_position
                 && self.generated.len() == transition.expected_generated_len
@@ -1143,6 +1316,7 @@ impl Generation {
         self.resident_position = transition.resident_position;
         self.accepted_position = transition.accepted_position;
         self.finish = transition.finish;
+        self.two_row = transition.two_row;
         transition.effects
     }
 
@@ -1288,23 +1462,44 @@ impl StartedRound {
         &self,
         request: RequestId,
         samples: &[TokenId],
+        guesses: Vec<Guess>,
         features: Option<FeatureRef>,
         reader: &mut dyn FeatureReader,
     ) -> Result<PreparedGenerationTransition, String> {
         self.generation
-            .prepare_round_transition(&self.round, request, samples, features, reader)
+            .prepare_round_transition(&self.round, request, samples, guesses, features, reader)
     }
 
     /// Apply a fully checked transition after physical state reconciliation,
     /// ending the round. Any mismatch here is an executor/generation ordering
     /// bug.
     pub fn commit(self, transition: PreparedGenerationTransition) -> (Generation, MethodEffects) {
+        self.commit_with(transition.commit)
+    }
+
+    fn commit_with(self, commit: GenerationCommit) -> (Generation, MethodEffects) {
         let Self {
             mut generation,
             round,
         } = self;
-        let effects = generation.commit_transition(round.forward(), transition);
+        let effects = generation.commit_transition(round.forward(), commit);
         (generation, effects)
+    }
+
+    /// Reconcile the round's outcome physically by `transition`'s decision,
+    /// moved into `physical` (the executor's reconciliation), then commit
+    /// `transition` where that succeeds ([`Self::commit`]). Where it fails,
+    /// the round returns unended, beside the failure.
+    pub fn reconcile<E>(
+        self,
+        transition: PreparedGenerationTransition,
+        physical: impl FnOnce(PhysicalDecision) -> Result<(), E>,
+    ) -> Result<(Generation, MethodEffects), (Box<Self>, E)> {
+        let PreparedGenerationTransition { decision, commit, .. } = transition;
+        match physical(decision) {
+            Ok(()) => Ok(self.commit_with(commit)),
+            Err(error) => Err((Box::new(self), error)),
+        }
     }
 
     /// Discard the round after the execution owner releases numerical state.

@@ -17,7 +17,7 @@
 //!   lines at its reference form ([`PointRequest::CpuSite`]) where a bank can
 //!   have a host tier, which a streamed load's bank is priced by, then the
 //!   rest of the walk. They are measured first, whatever a load asks: their
-//!   samples share [`MEASUREMENT_SECONDS`] of sampling among them alone
+//!   samples share [`MEASUREMENT_SECONDS`](super::executor_costs::MEASUREMENT_SECONDS) of sampling among them alone
 //!   ([`JobDeadlines`]), so no load moves them later or earlier, and
 //!   a point of them the job's time does not reach is left unrecorded for
 //!   the next job, never priced: what is recorded of a figure never follows
@@ -36,14 +36,14 @@
 //!   requests alone.
 //! - **The job** ([`measure`]) measures the outstanding requests in that
 //!   order: assessment's standing points, each sampling for its part of
-//!   what is left of [`MEASUREMENT_SECONDS`] beside the fewest passes
+//!   what is left of [`MEASUREMENT_SECONDS`](super::executor_costs::MEASUREMENT_SECONDS) beside the fewest passes
 //!   forecast of those after it; then the loads', each sampling for an
 //!   equal part of what is left of the job's time. It begins points until
 //!   its time ends, each begun timed to its end, and the next job resumes
 //!   the rest from the records stored. No load measures, and no load waits
 //!   on the job.
 
-use super::executor_costs::{executor_identity, walk_points, CostWalk, ExecutorCostsError, Measurement, Visit, Walks, Whose, MEASUREMENT_SECONDS};
+use super::executor_costs::{executor_identity, walk_points, CostWalk, ExecutorCostsError, Measurement, Visit, Walks, Whose};
 use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, StorageCosts, TierCopyCosts, TierCopyError, GraphMemory, StoredVolume, VolumeCosts};
 use super::Priced;
 use crate::native::SiteForm;
@@ -290,14 +290,11 @@ fn walk_outstanding(topology: &DeviceTopology, executor: &Executor, store: &dyn 
 /// CPU site's lines at its reference form where a bank can have a host tier
 /// (a discrete device); then the rest of the walk, whose figures are priced
 /// closer without it. Each is of the machine alone, so what is measured is
-/// fixed per backend, and their samples share [`MEASUREMENT_SECONDS`] of
+/// fixed per backend, and their samples share [`MEASUREMENT_SECONDS`](super::executor_costs::MEASUREMENT_SECONDS) of
 /// sampling ([`JobDeadlines`]).
 pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) -> Result<Vec<PointRequest>, String> {
     let tiered = !topology.shared_ranges_lie_in_device_memory(executor);
-    let memory = tiered
-        .then(|| std::thread::available_parallelism().map(|readers| PointRequest::HostMemory { readers: readers.get() as u64 }))
-        .transpose()
-        .map_err(|error| format!("the host's processors: {error}"))?;
+    let memory = tiered.then(|| PointRequest::HostMemory { readers: seismic::threads::quota().get() as u64 });
     let site = match tiered {
         true => CpuForm::reference(executor.backend()).map_err(|error| error.to_string())?,
         false => None,
@@ -472,13 +469,15 @@ impl Outstanding {
     }
 }
 
-/// A measurement job's time: its host's slot for measuring, from when its
-/// device is open (`started`), so that discovering the machine, probing the
-/// device and opening it take none of it. It decides only whether a point
-/// begins ([`Self::ends`]): a point begun is formed (its kernels' compiles,
-/// however long, kept as they end) and timed to its end, and one not begun
-/// is left unrecorded for the next job. The standing points' samples share
-/// [`MEASUREMENT_SECONDS`] of sampling, which nothing but sampling takes.
+/// A measurement job's sampling budget: how much sampling time (`budget`)
+/// the job spends across its points before it stops beginning new ones.
+/// Discovering the machine, probing and opening the device, forming kernels
+/// (cold JIT), and constructing points take none of the budget — only the
+/// sampling window after a point is made (`Self::charge`) counts against it.
+/// A point begun while budget remains is formed and timed to its end, and
+/// one reached after the budget is exhausted is left unrecorded for the next
+/// job. The standing points' samples share
+/// [`MEASUREMENT_SECONDS`](super::executor_costs::MEASUREMENT_SECONDS) of sampling, which nothing but sampling takes.
 /// So a busy host stretches each sample, and fewer points begin in a job
 /// and fewer samples are read of each, but no point begun expires, none is
 /// priced for want of time, and what is recorded of one never follows from
@@ -486,19 +485,36 @@ impl Outstanding {
 #[derive(Clone, Copy, Debug)]
 pub struct JobDeadlines {
     started: std::time::Instant,
-    ends: std::time::Instant,
+    budget: std::time::Duration,
+    spent: std::time::Duration,
 }
 
 impl JobDeadlines {
-    /// The time of a job whose device opened at `started`, given `time`.
+    /// A job opened at `started` with a sampling budget of `time`.
     pub fn new(started: std::time::Instant, time: std::time::Duration) -> Self {
-        Self { started, ends: started + time }
+        Self { started, budget: time, spent: std::time::Duration::ZERO }
     }
 
-    /// When the job begins no more points: a point begun by then is formed
-    /// and timed to its end.
+    /// The sampling budget remaining before the job stops beginning points.
+    pub fn remaining(&self) -> std::time::Duration {
+        self.budget.saturating_sub(self.spent)
+    }
+
+    /// When the job begins no more points: already passed once the sampling
+    /// budget is exhausted, else `remaining` from now.
     pub fn ends(&self) -> std::time::Instant {
-        self.ends
+        let remaining = self.remaining();
+        if remaining.is_zero() {
+            self.started
+        } else {
+            std::time::Instant::now() + remaining
+        }
+    }
+
+    /// Charge `sampled` (time spent actually sampling a made point) against
+    /// the job's budget.
+    pub(super) fn charge(&mut self, sampled: std::time::Duration) {
+        self.spent = self.spent.saturating_add(sampled);
     }
 }
 
@@ -559,6 +575,7 @@ pub fn measure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::executor_costs::MEASUREMENT_SECONDS;
 
     /// The host's CPU executor, its topology and identity: one every host
     /// derives kernel identities of.
@@ -757,5 +774,26 @@ mod tests {
                 assert!(convert.outstanding(&topology, executor, &records, walk_outstanding(&topology, executor, &records)), "{:?}", executor.backend());
             }
         }
+    }
+
+    #[test]
+    fn sampling_budget_ignores_elapsed_wall_time_until_charged() {
+        let started = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        let budget = std::time::Duration::from_secs(10);
+        let mut deadlines = JobDeadlines::new(started, budget);
+        // 30 s of wall time (e.g. cold JIT) passed since `started`, yet none
+        // of the 10 s sampling budget has been spent.
+        assert_eq!(deadlines.remaining(), budget);
+        assert!(deadlines.ends() > std::time::Instant::now());
+        deadlines.charge(std::time::Duration::from_secs(4));
+        assert_eq!(deadlines.remaining(), std::time::Duration::from_secs(6));
+        assert!(deadlines.ends() > std::time::Instant::now());
+        deadlines.charge(std::time::Duration::from_secs(6));
+        assert_eq!(deadlines.remaining(), std::time::Duration::ZERO);
+        assert!(deadlines.ends() <= std::time::Instant::now());
+        // A zero-budget deadline is immediately exhausted.
+        let empty = JobDeadlines::new(std::time::Instant::now(), std::time::Duration::ZERO);
+        assert_eq!(empty.remaining(), std::time::Duration::ZERO);
+        assert!(empty.ends() <= std::time::Instant::now());
     }
 }

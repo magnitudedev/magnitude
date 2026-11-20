@@ -191,13 +191,14 @@ pub struct Dimension {
 
 /// Entry-construction-owned elimination plan for call dimensions.
 ///
-/// Every input tensor axis is observed in schema order. Each step chooses one
-/// authored axis equation and carries the canonical inverse operations that
-/// isolate one not-yet-bound dimension. Fields are private so runtime cannot
-/// invent a different solve order or shape contract.
+/// Every input tensor axis is observed in schema order, and `axes` holds its
+/// authored extent: the one equation each observation must satisfy. Each
+/// step chooses one observation and carries the canonical inverse operations
+/// that isolate one not-yet-bound dimension from it. Fields are private so
+/// runtime cannot invent a different solve order or shape contract.
 #[derive(Debug)]
 pub struct DimensionInferencePlan {
-    observation_count: usize,
+    axes: Vec<NatExpr>,
     steps: Vec<DimensionInferenceStep>,
 }
 
@@ -205,7 +206,6 @@ pub struct DimensionInferencePlan {
 struct DimensionInferenceStep {
     dimension: SymbolId,
     observation: usize,
-    axis: NatExpr,
     operations: Vec<DimensionInferenceOp>,
 }
 
@@ -226,21 +226,18 @@ pub(crate) enum DimensionInferenceOp {
 
 impl DimensionInferencePlan {
     pub(crate) fn new(
-        observation_count: usize,
-        steps: Vec<(SymbolId, usize, NatExpr, Vec<DimensionInferenceOp>)>,
+        axes: Vec<NatExpr>,
+        steps: Vec<(SymbolId, usize, Vec<DimensionInferenceOp>)>,
     ) -> Self {
         Self {
-            observation_count,
+            axes,
             steps: steps
                 .into_iter()
-                .map(
-                    |(dimension, observation, axis, operations)| DimensionInferenceStep {
-                        dimension,
-                        observation,
-                        axis,
-                        operations,
-                    },
-                )
+                .map(|(dimension, observation, operations)| DimensionInferenceStep {
+                    dimension,
+                    observation,
+                    operations,
+                })
                 .collect(),
         }
     }
@@ -260,9 +257,22 @@ impl DimensionInferencePlan {
             })
             .sum::<usize>();
         assert_eq!(
-            self.observation_count, observed,
+            self.axes.len(),
+            observed,
             "DimensionInferencePlan observation count differs from its CallSchema"
         );
+        // An axis is of declared shape parameters (and the target's
+        // constants), never of a scalar parameter: inference binds the call's
+        // dimensions from tensors alone, before any scalar is read.
+        for axis in &self.axes {
+            assert!(
+                arena
+                    .free_symbols(AnyExpr::Nat(*axis))
+                    .into_iter()
+                    .all(|symbol| !matches!(arena.symbol_kind(symbol), crate::expr::SymbolKind::CallScalar(_))),
+                "DimensionInferencePlan observes a tensor axis that names a scalar parameter"
+            );
+        }
         assert_eq!(
             self.steps.len(),
             dimensions.len(),
@@ -271,10 +281,9 @@ impl DimensionInferencePlan {
         let mut seen = Vec::with_capacity(dimensions.len());
         for step in &self.steps {
             assert!(
-                step.observation < self.observation_count,
+                step.observation < self.axes.len(),
                 "DimensionInferencePlan step names an absent tensor-axis observation"
             );
-            let _ = arena.view(AnyExpr::Nat(step.axis));
             for operation in &step.operations {
                 let known = match operation {
                     DimensionInferenceOp::Add(known)
@@ -285,7 +294,7 @@ impl DimensionInferencePlan {
                 match known {
                     DimensionInferenceKnown::Observation(observation) => {
                         assert!(
-                            *observation < self.observation_count,
+                            *observation < self.axes.len(),
                             "DimensionInferencePlan operation names an absent tensor-axis observation"
                         )
                     }
@@ -328,14 +337,17 @@ impl DimensionInferencePlan {
         fixed: &PartialAssignment,
     ) -> CompiledDimensionInferencePlan {
         CompiledDimensionInferencePlan {
-            observation_count: self.observation_count,
+            axes: self
+                .axes
+                .iter()
+                .map(|axis| arena.compile_nat_with(*axis, fixed))
+                .collect(),
             steps: self
                 .steps
                 .iter()
                 .map(|step| CompiledDimensionInferenceStep {
                     dimension: step.dimension,
                     observation: step.observation,
-                    axis: arena.compile_nat_with(step.axis, fixed),
                     operations: step
                         .operations
                         .iter()
@@ -388,7 +400,7 @@ fn compile_known(
 /// plan. Evaluation only executes the entry-construction-selected steps.
 #[derive(Debug)]
 pub struct CompiledDimensionInferencePlan {
-    observation_count: usize,
+    axes: Vec<CompiledNat>,
     steps: Vec<CompiledDimensionInferenceStep>,
 }
 
@@ -396,7 +408,6 @@ pub struct CompiledDimensionInferencePlan {
 struct CompiledDimensionInferenceStep {
     dimension: SymbolId,
     observation: usize,
-    axis: CompiledNat,
     operations: Vec<CompiledDimensionInferenceOp>,
 }
 
@@ -428,18 +439,20 @@ impl DimensionInferenceFailure {
 
 impl CompiledDimensionInferencePlan {
     pub fn observation_count(&self) -> usize {
-        self.observation_count
+        self.axes.len()
     }
 
     /// Bind every call dimension from the already flattened input-axis
-    /// observations. Failure means the caller's extents do not admit the
-    /// exact integer solution sealed into this entry.
+    /// observations, and check every observation against its axis: the one
+    /// check of an invocation's input extents. Failure means the caller's
+    /// extents do not admit the exact integer solution sealed into this entry,
+    /// or an axis (a fixed one included) differs from its extent.
     pub fn infer(
         &self,
         observations: &[u64],
         values: &mut InvocationValues,
     ) -> Result<(), DimensionInferenceFailure> {
-        if observations.len() != self.observation_count {
+        if observations.len() != self.axes.len() {
             panic!(
                 "CompiledDimensionInferencePlan received an observation vector that disagrees with its generated CallSchema contract"
             );
@@ -480,15 +493,11 @@ impl CompiledDimensionInferencePlan {
             values.bind(step.dimension, SymbolValue::Nat(value));
         }
         // An observed subexpression can eliminate a dimension whose own value
-        // is solved later. Validate the original equations only after the full
-        // triangular solve, retaining their partial-operation checks.
-        for step in &self.steps {
-            if step.axis.evaluate(values).ok()
-                != Some(BigUint::from(observations[step.observation]))
-            {
-                return Err(DimensionInferenceFailure {
-                    observation: step.observation,
-                });
+        // is solved later. Validate every axis's equation only after the full
+        // triangular solve, retaining the steps' partial-operation checks.
+        for (observation, (axis, actual)) in self.axes.iter().zip(observations).enumerate() {
+            if axis.evaluate(values).ok() != Some(BigUint::from(*actual)) {
+                return Err(DimensionInferenceFailure { observation });
             }
         }
         Ok(())
@@ -4021,17 +4030,16 @@ mod dimension_inference_tests {
         let (y_symbol, y) = arena.call_dimension(CallSchema::dimension_id(schema, 1));
         let sum = arena.nat_add(x, y);
         let plan = DimensionInferencePlan::new(
-            2,
+            vec![sum, y],
             vec![
                 (
                     x_symbol,
                     0,
-                    sum,
                     vec![DimensionInferenceOp::Subtract(
                         DimensionInferenceKnown::Observation(1),
                     )],
                 ),
-                (y_symbol, 1, y, Vec::new()),
+                (y_symbol, 1, Vec::new()),
             ],
         )
         .compile(&arena, &PartialAssignment::new());
@@ -4056,13 +4064,12 @@ mod dimension_inference_tests {
         let (g_symbol, g) = arena.call_dimension(CallSchema::dimension_id(schema, 1));
         let product = arena.nat_mul(n, g);
         let plan = DimensionInferencePlan::new(
-            2,
+            vec![n, product],
             vec![
-                (n_symbol, 0, n, Vec::new()),
+                (n_symbol, 0, Vec::new()),
                 (
                     g_symbol,
                     1,
-                    product,
                     vec![DimensionInferenceOp::DivideExact(
                         DimensionInferenceKnown::Nat(n),
                     )],
@@ -4080,6 +4087,24 @@ mod dimension_inference_tests {
         let mut values = InvocationValues::new();
         assert_eq!(
             plan.infer(&[0, 0], &mut values).unwrap_err().observation(),
+            1
+        );
+    }
+
+    #[test]
+    fn sealed_plan_rejects_a_fixed_axis_of_another_extent() {
+        let mut arena = ExprArena::new();
+        let schema = CallSchema::fresh_id();
+        let (n_symbol, n) = arena.call_dimension(CallSchema::dimension_id(schema, 0));
+        let words = arena.nat(4);
+        let plan = DimensionInferencePlan::new(vec![n, words], vec![(n_symbol, 0, Vec::new())])
+            .compile(&arena, &PartialAssignment::new());
+
+        plan.infer(&[3, 4], &mut InvocationValues::new()).unwrap();
+        assert_eq!(
+            plan.infer(&[3, 1], &mut InvocationValues::new())
+                .unwrap_err()
+                .observation(),
             1
         );
     }

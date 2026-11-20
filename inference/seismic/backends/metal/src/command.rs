@@ -11,7 +11,7 @@ pub struct Pipeline {
     program: Arc<Compile<Vec<DirectPipeline>>>,
     position: usize,
     /// The minimal native ABI metadata retained by the executable. Geometry,
-    /// representations, storage topology, and resource facts remain owned by
+    /// representations, storage topology, and resource limits remain owned by
     /// the consumed core plan and are not mirrored here.
     pub(crate) words: seismic_ir::physical_target::KernelWordLayout,
 }

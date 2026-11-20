@@ -386,7 +386,7 @@ fn open_domain(
         lines: pending(),
         read: pending(),
         pass: crate::assessment::Priced::Measured(
-            crate::assessment::ExpertPass::of_bank(bank, costs.clone()).expect("synthetic costs price pass"),
+            crate::assessment::expert_pass(bank, &costs).expect("synthetic costs price pass"),
         ),
         tier_copy: pending(),
         convert: pending(),
@@ -426,6 +426,8 @@ fn prompt_chunk(request: RequestId, chunk: usize, chunks: usize, rows: usize) ->
             .collect(),
         committed: rows,
         prime: None,
+        front: Vec::new(),
+        chain: None,
     }
 }
 
@@ -448,11 +450,13 @@ fn decode_step(request: RequestId, token: u32, position: usize) -> Operation {
         }],
         committed: 1,
         prime: None,
+        front: Vec::new(),
+        chain: None,
     }
 }
 
 fn step_bits(outcome: &Outcome) -> StepBits {
-    let Outcome::Forward { rows } = outcome else {
+    let Outcome::Forward { rows, .. } = outcome else {
         panic!("expected forward outcome, got {outcome:?}");
     };
     let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
@@ -493,7 +497,7 @@ fn run_step(
     let outcome = pending.outcome().clone();
     assert!(!matches!(outcome, Outcome::WeightReadFailed(_)), "{backend:?}: {outcome:?}");
     domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: operations[0].row_count() })
+        .reconcile(pending, PhysicalDecision { accepted_rows: operations[0].row_count(), ahead: crate::AheadVerdict::default() })
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     (outcome, bindings)
 }

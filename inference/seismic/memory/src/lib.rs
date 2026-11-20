@@ -7,7 +7,11 @@
 //! written once, then executable.
 
 pub mod entry;
+pub mod placement;
 pub mod pool;
+
+/// Alignment of the base of every workspace buffer placed in a graph arena.
+pub const BUFFER_ALIGNMENT: u64 = 256;
 
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -148,7 +152,7 @@ pub fn large_page_backing() -> LargePageBacking {
 /// `ENOTDIR`, `ENOSYS`, `EOPNOTSUPP`; Windows' file, path or function not
 /// found or not supported) or refused (`EACCES`, `EPERM`, `EROFS`; Windows'
 /// access denied, a privilege not held): either way the reader goes to the
-/// fact's next source. The one rule every host reader shares; any other
+/// reading's next source. The one rule every host reader shares; any other
 /// error is no answer of the source's but an invariant violation.
 pub fn unanswered(error: &std::io::Error) -> bool {
     use std::io::ErrorKind::{NotADirectory, NotFound, PermissionDenied, ReadOnlyFilesystem, Unsupported};

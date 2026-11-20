@@ -279,8 +279,9 @@ impl<S> PrefixCache<S> {
 
     /// The deepest entry whose path is a prefix of `path`, retained under
     /// the method `path` generates under (a request drafting without media
-    /// and one generating plainly beside it never share a drafter history).
-    /// Entries in
+    /// and one generating plainly beside it never share a drafter history),
+    /// whose drafter entered no successor of its rows but `path`'s own
+    /// (`MethodCheckpoint::resumes`). Entries in
     /// submitted use are hits too: every hit forks shared claims. Only
     /// entries below position `bound` qualify: a resumed request must still
     /// compute the row it samples from.
@@ -327,7 +328,7 @@ impl<S> PrefixCache<S> {
             let position = entry.position();
             if position < MIN_PREFIX_HIT
                 || position >= bound
-                || !entry.method.resumes(path.method)
+                || !entry.method.resumes(path.method, position, path.tokens().nth(position).copied())
                 || path.shared_boundary(&entry.tokens, &entry.conditioning) != position
             {
                 continue;

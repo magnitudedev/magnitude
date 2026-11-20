@@ -2,7 +2,9 @@
 //! Native code is statically linked; no runtime source tree or Python is required.
 mod native;
 
-pub use native::{build_info, OutputStream, PreparedRequest, Template};
+pub use native::{
+    build_info, OutputStream, PreparedRequest, ProbeSignature, Template, TemplateMetadata,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;

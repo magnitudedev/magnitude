@@ -4,8 +4,8 @@
 
 use super::graph::{GraphError, draft::GraphDraft};
 use seismic::{
-    Dim, DimensionExpr, Element, GraphCensus, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphStorageBytes,
-    NativePort, Reals, Table, TableExpr, Tensor, TraceOutput,
+    Dim, Element, GraphCensus, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphStorageBytes,
+    NativePort, Table, Tensor,
 };
 use std::sync::{Arc, Mutex};
 
@@ -19,9 +19,6 @@ pub(crate) struct GraphConstant {
     source: ConstantSource,
 }
 
-/// What a constant's value is: known, or, inside a graph trace's recording
-/// where a fact reaches its numbers, expressions over the facts that the
-/// trace evaluates at each model's ([`ConstantExpr`]).
 #[derive(Clone)]
 enum ConstantSource {
     Known {
@@ -31,67 +28,6 @@ enum ConstantSource {
         /// value is the same at every class.
         rows: Option<RowRule>,
     },
-    Recorded(ConstantExpr),
-}
-
-/// A constant as a graph trace keeps it beside its template: what a family
-/// recorder returns of its builder's constants
-/// ([`GraphConstant::recorded`]), each the constant of a model's facts there
-/// (`seismic::TraceOutput`).
-#[derive(Clone)]
-pub(crate) struct RecordedConstant(ConstantSource);
-
-/// A constant whose numbers a recording's facts reach, as expressions over
-/// them.
-#[derive(Clone)]
-enum ConstantExpr {
-    /// `rule` at `count`, following the class rows where `follows`.
-    Rule { rule: RowRule<DimensionExpr>, count: DimensionExpr, follows: bool },
-    /// An empty tensor of `element` and `extents`, one of them zero.
-    Empty { element: Element, extents: Vec<DimensionExpr> },
-    /// The `f32` tensor of `extents` holding `value` everywhere.
-    Filled { extents: Vec<DimensionExpr>, value: f32 },
-    /// The tensor of `element` and `extents` holding a model's table.
-    Table { element: Element, extents: Vec<DimensionExpr>, table: TableExpr },
-}
-
-impl ConstantExpr {
-    /// Its value at `facts` and `reals`, `None` where a number does not
-    /// evaluate there.
-    ///
-    /// # Panics
-    ///
-    /// Where its value cannot be built at numbers that evaluate: every such
-    /// limit is a guard of its recording ([`RowRule::count_limit`]) or of
-    /// its port's extents, which the trace's template admits before asking
-    /// (`seismic::TraceOutput::at`).
-    fn at(&self, facts: &[u64], reals: &Reals) -> Option<ConstantSource> {
-        let evaluated = |extents: &[DimensionExpr]| extents.iter().map(|extent| extent.evaluate(facts)).collect::<Option<Vec<_>>>();
-        let admitted = "a trace admits its constants' values (`TraceOutput::at`)";
-        Some(match self {
-            Self::Rule { rule, count, follows } => {
-                let rule = rule.try_map(|width| width.evaluate(facts))?;
-                let value = rule.storage(count.evaluate(facts)?).unwrap_or_else(|error| panic!("{admitted}: {error}"));
-                ConstantSource::Known { value: Arc::new(value), rows: follows.then_some(rule) }
-            }
-            Self::Empty { element, extents } => ConstantSource::Known {
-                value: Arc::new(ConstantStorage {
-                    element: *element,
-                    extents: evaluated(extents)?.into(),
-                    value: ConstantValue::Bytes(Arc::from([])),
-                }),
-                rows: None,
-            },
-            Self::Filled { extents, value } => {
-                let value = filled_f32(evaluated(extents)?, *value).unwrap_or_else(|error| panic!("{admitted}: {error}"));
-                ConstantSource::Known { value: Arc::new(value), rows: None }
-            }
-            Self::Table { element, extents, table } => {
-                let bytes = table.at(reals).expect("a trace is evaluated at reals of its own split");
-                ConstantSource::Known { value: Arc::new(table_storage(*element, evaluated(extents)?, bytes)), rows: None }
-            }
-        })
-    }
 }
 
 /// The `f32` tensor of `extents` holding `value` everywhere.
@@ -101,10 +37,21 @@ fn filled_f32(extents: Vec<u64>, value: f32) -> Result<ConstantStorage, String> 
         .try_fold(1u64, |count, &extent| count.checked_mul(extent))
         .and_then(|count| usize::try_from(count).ok())
         .ok_or("filled constant length overflows")?;
+    Element::f32()
+        .canonical_byte_len(&extents)
+        .ok()
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or("filled constant length overflows")?;
+    let bits = value.to_bits();
+    let value = if count > 0 && bits == 0 {
+        ConstantValue::Zero
+    } else {
+        ConstantValue::FilledF32(bits)
+    };
     Ok(ConstantStorage {
         element: Element::f32(),
         extents: extents.into(),
-        value: ConstantValue::Bytes(std::iter::repeat_n(value.to_le_bytes(), count).flatten().collect()),
+        value,
     })
 }
 
@@ -125,26 +72,6 @@ fn table_storage(element: Element, extents: Vec<u64>, bytes: Arc<[u8]>) -> Const
         bytes.len()
     );
     ConstantStorage { element, extents: extents.into(), value: ConstantValue::Bytes(bytes) }
-}
-
-/// The value of a constant expression: a builder's numbers that no fact
-/// reached.
-fn constant_of(expression: &DimensionExpr) -> Option<u64> {
-    match expression {
-        DimensionExpr::Constant(value) => Some(*value),
-        _ => None,
-    }
-}
-
-impl TraceOutput for RecordedConstant {
-    type Value = GraphConstant;
-    fn at(&self, facts: &[u64], reals: &Reals) -> Option<GraphConstant> {
-        let source = match &self.0 {
-            known @ ConstantSource::Known { .. } => known.clone(),
-            ConstantSource::Recorded(expression) => expression.at(facts, reals)?,
-        };
-        Some(GraphConstant { port: None, source })
-    }
 }
 
 /// How a constant's extents and values follow its graph's class rows: the
@@ -217,17 +144,21 @@ impl RowRule<Dim> {
 
 impl RowRule {
     fn storage(self, rows: u64) -> Result<ConstantStorage, String> {
-        let table = |values: Vec<i32>| ConstantStorage {
-            element: Element::i32(),
-            extents: Box::new([rows]),
-            value: ConstantValue::Bytes(values.iter().flat_map(|value| value.to_le_bytes()).collect()),
-        };
         Ok(match self {
-            Self::Identity => table(
-                (0..rows)
-                    .map(|index| i32::try_from(index).map_err(|_| "identity index exceeds i32".to_owned()))
-                    .collect::<Result<_, _>>()?,
-            ),
+            Self::Identity => {
+                if rows > (1u64 << 31) {
+                    return Err("identity index exceeds i32".to_owned());
+                }
+                let byte_len = Element::i32()
+                    .canonical_byte_len(&[rows])
+                    .map_err(|error| error.to_string())?;
+                usize::try_from(byte_len).map_err(|_| "identity byte length exceeds usize")?;
+                ConstantStorage {
+                    element: Element::i32(),
+                    extents: Box::new([rows]),
+                    value: ConstantValue::Identity,
+                }
+            }
             Self::Zeros { element, width } => {
                 element.canonical_byte_len(&[rows, width]).map_err(|error| error.to_string())?;
                 ConstantStorage { element, extents: Box::new([rows, width]), value: ConstantValue::Zero }
@@ -237,31 +168,41 @@ impl RowRule {
                 extents: Box::new([0, rows, width]),
                 value: ConstantValue::Bytes(Arc::from([])),
             },
-            Self::Filled(value) => table(vec![value; usize::try_from(rows).map_err(|_| "row count exceeds usize")?]),
-            Self::OneHot { width } => f32_rows(rows, width, |column| if column == 0 { 1.0 } else { 0.0 })?,
+            Self::Filled(value) => {
+                usize::try_from(rows).map_err(|_| "row count exceeds usize")?;
+                let byte_len = Element::i32()
+                    .canonical_byte_len(&[rows])
+                    .map_err(|error| error.to_string())?;
+                usize::try_from(byte_len).map_err(|_| "row constant byte length exceeds usize")?;
+                ConstantStorage {
+                    element: Element::i32(),
+                    extents: Box::new([rows]),
+                    value: ConstantValue::FilledI32(value),
+                }
+            }
+            Self::OneHot { width } => {
+                let count = rows.checked_mul(width).ok_or("row constant extent exceeds u64")?;
+                usize::try_from(count).map_err(|_| "row constant extent exceeds usize")?;
+                let byte_len = Element::f32()
+                    .canonical_byte_len(&[rows, width])
+                    .map_err(|error| error.to_string())?;
+                usize::try_from(byte_len).map_err(|_| "row constant byte length exceeds usize")?;
+                ConstantStorage {
+                    element: Element::f32(),
+                    extents: Box::new([rows, width]),
+                    value: ConstantValue::OneHot,
+                }
+            }
             Self::Count => {
                 let rows = i32::try_from(rows).map_err(|_| "row count exceeds i32")?;
                 ConstantStorage {
                     element: Element::i32(),
                     extents: Box::new([1]),
-                    value: ConstantValue::Bytes(rows.to_le_bytes().into()),
+                    value: ConstantValue::FilledI32(rows),
                 }
             }
         })
     }
-}
-
-/// The F32 matrix `[rows, width]` whose every row holds `column`'s value at
-/// each column.
-fn f32_rows(rows: u64, width: u64, column: impl Fn(u64) -> f32) -> Result<ConstantStorage, String> {
-    let count = rows.checked_mul(width).ok_or("row constant extent exceeds u64")?;
-    usize::try_from(count).map_err(|_| "row constant extent exceeds usize")?;
-    let values = (0..count).flat_map(|at| column(at % width).to_le_bytes());
-    Ok(ConstantStorage {
-        element: Element::f32(),
-        extents: Box::new([rows, width]),
-        value: ConstantValue::Bytes(values.collect()),
-    })
 }
 
 /// A constant's value: what the binder uploads for it.
@@ -277,35 +218,175 @@ pub(crate) struct ConstantStorage {
 enum ConstantValue {
     Bytes(Arc<[u8]>),
     Zero,
+    /// Rank-1 `i32` `0, 1, …, rows - 1`.
+    Identity,
+    /// Rank-1 `i32` repeated `value`.
+    FilledI32(i32),
+    /// Rank-2 `f32` `[rows, width]` with `1.0` in column 0 and `0.0` elsewhere.
+    OneHot,
+    /// Tensor of `f32` filled with `f32::from_bits(bits)`.
+    FilledF32(u32),
 }
 
 impl ConstantStorage {
-    fn same_storage_as(&self, other: &Self) -> bool {
-        self.element == other.element
-            && self.extents == other.extents
-            && match (&self.value, &other.value) {
-                (ConstantValue::Zero, ConstantValue::Zero) => true,
-                (ConstantValue::Bytes(left), ConstantValue::Bytes(right)) => left == right,
-                (ConstantValue::Zero, ConstantValue::Bytes(bytes))
-                | (ConstantValue::Bytes(bytes), ConstantValue::Zero) => {
-                    bytes.iter().all(|&byte| byte == 0)
-                }
-            }
+    fn canonical_usize_len(&self) -> usize {
+        let len = self
+            .element
+            .canonical_byte_len(&self.extents)
+            .expect("constant extents have a canonical byte length");
+        usize::try_from(len).expect("constant byte length fits usize")
     }
 
-    /// Whether the value is held as bytes in a family's one copy of it:
+    fn element_count(&self) -> usize {
+        let count = self
+            .extents
+            .iter()
+            .try_fold(1u64, |acc, &extent| acc.checked_mul(extent))
+            .expect("constant element count fits u64");
+        usize::try_from(count).expect("constant element count fits usize")
+    }
+
+    fn matches_bytes(&self, bytes: &[u8]) -> bool {
+        match &self.value {
+            ConstantValue::Zero => bytes.iter().all(|&byte| byte == 0),
+            ConstantValue::Bytes(own) => own.as_ref() == bytes,
+            ConstantValue::Identity => {
+                bytes.len() == self.canonical_usize_len()
+                    && bytes
+                        .chunks_exact(4)
+                        .enumerate()
+                        .all(|(index, chunk)| chunk == (index as i32).to_le_bytes())
+            }
+            ConstantValue::FilledI32(value) => {
+                let pattern = value.to_le_bytes();
+                bytes.len() == self.canonical_usize_len()
+                    && bytes.chunks_exact(4).all(|chunk| chunk == pattern)
+            }
+            ConstantValue::OneHot => {
+                let width = usize::try_from(self.extents[1]).expect("one-hot width fits usize");
+                let one = 1.0f32.to_le_bytes();
+                let zero = 0.0f32.to_le_bytes();
+                bytes.len() == self.canonical_usize_len()
+                    && bytes
+                        .chunks_exact(4)
+                        .enumerate()
+                        .all(|(index, chunk)| chunk == if index % width == 0 { one } else { zero })
+            }
+            ConstantValue::FilledF32(bits) => {
+                let pattern = bits.to_le_bytes();
+                bytes.len() == self.canonical_usize_len()
+                    && bytes.chunks_exact(4).all(|chunk| chunk == pattern)
+            }
+        }
+    }
+
+    fn materialize_bytes(&self) -> Vec<u8> {
+        match &self.value {
+            ConstantValue::Zero => vec![0u8; self.canonical_usize_len()],
+            ConstantValue::Bytes(bytes) => bytes.to_vec(),
+            ConstantValue::Identity => {
+                let rows = usize::try_from(self.extents[0]).expect("identity rows fit usize");
+                let mut bytes = Vec::with_capacity(rows * 4);
+                for index in 0..rows {
+                    bytes.extend_from_slice(&(index as i32).to_le_bytes());
+                }
+                bytes
+            }
+            ConstantValue::FilledI32(value) => {
+                let count = self.element_count();
+                let pattern = value.to_le_bytes();
+                let mut bytes = Vec::with_capacity(count * 4);
+                for _ in 0..count {
+                    bytes.extend_from_slice(&pattern);
+                }
+                bytes
+            }
+            ConstantValue::OneHot => {
+                let rows = usize::try_from(self.extents[0]).expect("one-hot rows fit usize");
+                let width = usize::try_from(self.extents[1]).expect("one-hot width fits usize");
+                let mut bytes = vec![0u8; rows * width * 4];
+                if width > 0 {
+                    let one = 1.0f32.to_le_bytes();
+                    for row in 0..rows {
+                        let offset = row * width * 4;
+                        bytes[offset..offset + 4].copy_from_slice(&one);
+                    }
+                }
+                bytes
+            }
+            ConstantValue::FilledF32(bits) => {
+                let count = self.element_count();
+                let pattern = bits.to_le_bytes();
+                let mut bytes = Vec::with_capacity(count * 4);
+                for _ in 0..count {
+                    bytes.extend_from_slice(&pattern);
+                }
+                bytes
+            }
+        }
+    }
+
+    fn same_storage_as(&self, other: &Self) -> bool {
+        if self.element != other.element || self.extents != other.extents {
+            return false;
+        }
+        if self.extents.contains(&0) {
+            return true;
+        }
+        match (&self.value, &other.value) {
+            (ConstantValue::Zero, ConstantValue::Zero)
+            | (ConstantValue::Identity, ConstantValue::Identity)
+            | (ConstantValue::OneHot, ConstantValue::OneHot) => true,
+            (ConstantValue::FilledI32(left), ConstantValue::FilledI32(right)) => left == right,
+            (ConstantValue::FilledF32(left), ConstantValue::FilledF32(right)) => left == right,
+            (ConstantValue::Bytes(left), ConstantValue::Bytes(right)) => left == right,
+            (ConstantValue::Zero, ConstantValue::Identity)
+            | (ConstantValue::Identity, ConstantValue::Zero) => *self.extents == [1],
+            (ConstantValue::Zero, ConstantValue::FilledI32(value))
+            | (ConstantValue::FilledI32(value), ConstantValue::Zero) => *value == 0,
+            (ConstantValue::Zero, ConstantValue::FilledF32(bits))
+            | (ConstantValue::FilledF32(bits), ConstantValue::Zero) => *bits == 0,
+            (ConstantValue::Zero, ConstantValue::OneHot)
+            | (ConstantValue::OneHot, ConstantValue::Zero) => false,
+            (ConstantValue::Identity, ConstantValue::FilledI32(value))
+            | (ConstantValue::FilledI32(value), ConstantValue::Identity) => {
+                *self.extents == [1] && *value == 0
+            }
+            (ConstantValue::OneHot, ConstantValue::FilledF32(bits))
+            | (ConstantValue::FilledF32(bits), ConstantValue::OneHot) => {
+                self.extents.len() == 2
+                    && self.extents[1] == 1
+                    && *bits == 1.0f32.to_bits()
+            }
+            (_, ConstantValue::Bytes(bytes)) => self.matches_bytes(bytes),
+            (ConstantValue::Bytes(bytes), _) => other.matches_bytes(bytes),
+            _ => false,
+        }
+    }
+
+    /// The byte length held for this value in a family's one copy of it:
     /// empty bytes, or bytes that are not all zero. A nonempty value of
     /// zeros is held as `ConstantValue::Zero` there, whichever form its
     /// graph declared it in, so what a family holds of a value does not
     /// follow which of its graphs came first.
-    fn held_bytes(&self) -> Option<&Arc<[u8]>> {
+    fn held_byte_len(&self) -> Option<usize> {
         match &self.value {
-            ConstantValue::Bytes(bytes)
-                if bytes.is_empty() || bytes.iter().any(|&byte| byte != 0) =>
-            {
-                Some(bytes)
+            ConstantValue::Zero => None,
+            ConstantValue::Bytes(bytes) => {
+                (bytes.is_empty() || bytes.iter().any(|&byte| byte != 0)).then_some(bytes.len())
             }
-            _ => None,
+            ConstantValue::Identity => {
+                (self.extents[0] != 1).then(|| self.canonical_usize_len())
+            }
+            ConstantValue::FilledI32(value) => {
+                let len = self.canonical_usize_len();
+                (len == 0 || *value != 0).then_some(len)
+            }
+            ConstantValue::OneHot => Some(self.canonical_usize_len()),
+            ConstantValue::FilledF32(bits) => {
+                let len = self.canonical_usize_len();
+                (len == 0 || *bits != 0).then_some(len)
+            }
         }
     }
 
@@ -316,12 +397,12 @@ impl ConstantStorage {
         let counts = 2 * size_of::<usize>();
         let mut heap = HostHeap::allocation(1, size_of::<Self>() + counts);
         heap.hold(self.extents.len(), size_of::<u64>());
-        if let Some(bytes) = self.held_bytes() {
+        if let Some(len) = self.held_byte_len() {
             // A shared byte slice is allocated with its two counts, to the
             // counts' alignment.
             heap.hold(
                 1,
-                (counts + bytes.len()).next_multiple_of(size_of::<usize>()),
+                (counts + len).next_multiple_of(size_of::<usize>()),
             );
         }
         heap
@@ -349,28 +430,14 @@ impl GraphConstant {
     }
 
     /// Its value and the rule it follows class rows by.
-    ///
-    /// # Panics
-    ///
-    /// On a constant of a recording a fact reaches: a trace evaluates it
-    /// ([`Self::recorded`]) before anything reads its value.
     fn known(&self) -> (&Arc<ConstantStorage>, Option<RowRule>) {
         match &self.source {
             ConstantSource::Known { value, rows } => (value, *rows),
-            ConstantSource::Recorded(_) => {
-                panic!("a recorded graph constant's value is read only at a model's facts (`GraphConstant::recorded`)")
-            }
         }
     }
 
     fn value(&self) -> &Arc<ConstantStorage> {
         self.known().0
-    }
-
-    /// What a graph trace keeps of it beside its template: a family
-    /// recorder's output, one for each of its builder's constants.
-    pub(crate) fn recorded(&self) -> RecordedConstant {
-        RecordedConstant(self.source.clone())
     }
 
     /// The constant `rule` makes at `count`, following the class rows where
@@ -383,8 +450,6 @@ impl GraphConstant {
         follows: bool,
         class: Option<&'static str>,
     ) -> Result<Self, GraphError> {
-        // Its value's one limit its port's extents do not bound, guarded: a
-        // model past it records again, and is refused there.
         if let Some((limit, error)) = rule.count_limit() {
             if !count.at_most(limit) {
                 return Err(error.into());
@@ -396,16 +461,12 @@ impl GraphConstant {
             Some(class) => graph.port_with_class_extent(element, &extents, 0, class)?,
             None => graph.port(element, &extents)?,
         };
-        let source = match (rule.try_map(|width| constant_of(&width.expression())), constant_of(&count.expression())) {
-            (Some(known), Some(count)) => ConstantSource::Known {
-                value: Arc::new(known.storage(count)?),
-                rows: follows.then_some(known),
-            },
-            _ => ConstantSource::Recorded(ConstantExpr::Rule {
-                rule: rule.try_map(|width| Some(width.expression())).expect("every dimension has an expression"),
-                count: count.expression(),
-                follows,
-            }),
+        let known = rule
+            .try_map(|width| Some(width.fixed()))
+            .expect("every dimension is concrete");
+        let source = ConstantSource::Known {
+            value: Arc::new(known.storage(count.fixed())?),
+            rows: follows.then_some(known),
         };
         Ok(Self { port: Some(port), source })
     }
@@ -454,13 +515,10 @@ impl GraphConstant {
         table: &Table,
     ) -> Result<Self, GraphError> {
         let port = graph.port(element, extents)?;
-        let expressions = extents.iter().map(Dim::expression).collect::<Vec<_>>();
-        let known = expressions.iter().map(constant_of).collect::<Option<Vec<_>>>();
-        let source = match (known, table.expression()) {
-            (Some(extents), TableExpr::Constant(bytes)) => {
-                ConstantSource::Known { value: Arc::new(table_storage(element, extents, bytes)), rows: None }
-            }
-            (_, table) => ConstantSource::Recorded(ConstantExpr::Table { element, extents: expressions, table }),
+        let values = extents.iter().map(Dim::fixed).collect::<Vec<_>>();
+        let source = ConstantSource::Known {
+            value: Arc::new(table_storage(element, values, Arc::clone(table.bytes()))),
+            rows: None,
         };
         Ok(Self { port: Some(port), source })
     }
@@ -528,18 +586,12 @@ impl GraphConstant {
     {
         let extents = extents.iter().cloned().map(Dim::from).collect::<Vec<_>>();
         assert!(
-            extents.iter().any(|extent| constant_of(&extent.expression()) == Some(0)),
+            extents.iter().any(|extent| extent.fixed() == 0),
             "an empty tensor has a zero extent"
         );
         let port = graph.port::<Dim>(element, &extents)?;
-        let expressions = extents.iter().map(Dim::expression).collect::<Vec<_>>();
-        let constant = match expressions.iter().map(constant_of).collect::<Option<Vec<_>>>() {
-            Some(extents) => Self::of(Some(port), element, extents, ConstantValue::Bytes(Arc::from([]))),
-            None => Self {
-                port: Some(port),
-                source: ConstantSource::Recorded(ConstantExpr::Empty { element, extents: expressions }),
-            },
-        };
+        let values = extents.iter().map(Dim::fixed).collect::<Vec<_>>();
+        let constant = Self::of(Some(port), element, values, ConstantValue::Bytes(Arc::from([])));
         let port = constant.port().clone();
         constants.push(constant);
         Ok(port)
@@ -647,10 +699,10 @@ impl GraphConstant {
     {
         let extents = extents.iter().cloned().map(Dim::from).collect::<Vec<_>>();
         let port = graph.port::<Dim>(Element::f32(), &extents)?;
-        let expressions = extents.iter().map(Dim::expression).collect::<Vec<_>>();
-        let source = match expressions.iter().map(constant_of).collect::<Option<Vec<_>>>() {
-            Some(extents) => ConstantSource::Known { value: Arc::new(filled_f32(extents, value)?), rows: None },
-            None => ConstantSource::Recorded(ConstantExpr::Filled { extents: expressions, value }),
+        let values = extents.iter().map(Dim::fixed).collect::<Vec<_>>();
+        let source = ConstantSource::Known {
+            value: Arc::new(filled_f32(values, value)?),
+            rows: None,
         };
         Ok(Self { port: Some(port), source })
     }
@@ -683,6 +735,19 @@ impl GraphConstant {
             port: None,
             source: ConstantSource::Known { value: Arc::new(RowRule::<u64>::Identity.storage(count)?), rows: None },
         })
+    }
+
+    /// Rank-1 `i32` range constant `[start, end)` for resource accounting
+    /// without a graph port.
+    pub(crate) fn i32_range_value(start: u64, end: u64) -> Result<Self, String> {
+        let len = end.saturating_sub(start);
+        let bytes = (start..end)
+            .map(|row| i32::try_from(row).map_err(|_| "draft output row exceeds i32".to_owned()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        Ok(Self::of(None, Element::i32(), vec![len], ConstantValue::Bytes(bytes)))
     }
 
     /// The row table `0, 1, …, rows - 1` of the class's `rows` rows, its
@@ -945,16 +1010,14 @@ impl FamilyConstants {
     /// its own when no graph before it bound that value.
     pub(crate) fn share(&self, constant: &mut GraphConstant) {
         let mut values = self.values.lock().expect("family constants poisoned");
-        let ConstantSource::Known { value, .. } = &mut constant.source else {
-            panic!("a prepared graph's constants are known")
-        };
+        let ConstantSource::Known { value, .. } = &mut constant.source;
         if let Some(held) = values.iter().find(|held| held.same_storage_as(value)) {
             *value = held.clone();
             return;
         }
         // A nonempty value of zeros is held without its bytes
-        // (`ConstantStorage::held_bytes`).
-        if value.held_bytes().is_none() && matches!(value.value, ConstantValue::Bytes(_)) {
+        // (`ConstantStorage::held_byte_len`).
+        if value.held_byte_len().is_none() && matches!(value.value, ConstantValue::Bytes(_)) {
             *value = Arc::new(ConstantStorage {
                 element: value.element,
                 extents: value.extents.clone(),
@@ -1008,6 +1071,13 @@ impl<'c> ConstantTensors<'c> {
             ConstantValue::Zero => Tensor::zeros(self.charges, value.element, &value.extents),
             ConstantValue::Bytes(bytes) => {
                 Tensor::from_host(self.charges, value.element, &value.extents, bytes)
+            }
+            ConstantValue::Identity
+            | ConstantValue::FilledI32(_)
+            | ConstantValue::OneHot
+            | ConstantValue::FilledF32(_) => {
+                let bytes = value.materialize_bytes();
+                Tensor::from_host(self.charges, value.element, &value.extents, &bytes)
             }
         }
         .map_err(|error| format!("graph constant upload failed: {error}"))?;
@@ -1105,5 +1175,175 @@ mod tests {
         assert_eq!(device.allocated() - before, distinct, "a tied constant charges nothing past its value's");
         drop(uploaded);
         assert_eq!(device.allocated(), before);
+    }
+
+    #[test]
+    fn symbolic_constants_match_raw_bytes_in_metadata_heap_and_upload() {
+        let from_storage = |storage: ConstantStorage| {
+            GraphConstant::of(
+                None,
+                storage.element,
+                storage.extents.into_vec(),
+                storage.value,
+            )
+        };
+        let raw_i32 = |extents: Vec<u64>, values: &[i32]| {
+            let bytes: Arc<[u8]> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            GraphConstant::of(None, Element::i32(), extents, ConstantValue::Bytes(bytes))
+        };
+        let raw_f32 = |extents: Vec<u64>, values: &[f32]| {
+            let bytes: Arc<[u8]> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            GraphConstant::of(None, Element::f32(), extents, ConstantValue::Bytes(bytes))
+        };
+
+        let cases: Vec<(&str, GraphConstant, GraphConstant, Vec<u8>)> = vec![
+            (
+                "identity_5",
+                from_storage(RowRule::<u64>::Identity.storage(5).unwrap()),
+                raw_i32(vec![5], &[0, 1, 2, 3, 4]),
+                [0i32, 1, 2, 3, 4].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            ),
+            (
+                "identity_1",
+                from_storage(RowRule::<u64>::Identity.storage(1).unwrap()),
+                raw_i32(vec![1], &[0]),
+                0i32.to_le_bytes().to_vec(),
+            ),
+            (
+                "identity_0",
+                from_storage(RowRule::<u64>::Identity.storage(0).unwrap()),
+                raw_i32(vec![0], &[]),
+                Vec::new(),
+            ),
+            (
+                "filled_i32_nonzero",
+                from_storage(RowRule::<u64>::Filled(7).storage(4).unwrap()),
+                raw_i32(vec![4], &[7, 7, 7, 7]),
+                [7i32; 4].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            ),
+            (
+                "filled_i32_zero",
+                from_storage(RowRule::<u64>::Filled(0).storage(4).unwrap()),
+                raw_i32(vec![4], &[0, 0, 0, 0]),
+                vec![0u8; 16],
+            ),
+            (
+                "filled_i32_empty",
+                from_storage(RowRule::<u64>::Filled(7).storage(0).unwrap()),
+                raw_i32(vec![0], &[]),
+                Vec::new(),
+            ),
+            (
+                "count_42",
+                from_storage(RowRule::<u64>::Count.storage(42).unwrap()),
+                raw_i32(vec![1], &[42]),
+                42i32.to_le_bytes().to_vec(),
+            ),
+            (
+                "count_0",
+                from_storage(RowRule::<u64>::Count.storage(0).unwrap()),
+                raw_i32(vec![1], &[0]),
+                0i32.to_le_bytes().to_vec(),
+            ),
+            (
+                "one_hot_3x4",
+                from_storage(RowRule::<u64>::OneHot { width: 4 }.storage(3).unwrap()),
+                raw_f32(
+                    vec![3, 4],
+                    &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                ),
+                [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            ),
+            (
+                "one_hot_3x1",
+                from_storage(RowRule::<u64>::OneHot { width: 1 }.storage(3).unwrap()),
+                raw_f32(vec![3, 1], &[1.0, 1.0, 1.0]),
+                [1.0f32; 3].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            ),
+            (
+                "one_hot_empty",
+                from_storage(RowRule::<u64>::OneHot { width: 0 }.storage(3).unwrap()),
+                raw_f32(vec![3, 0], &[]),
+                Vec::new(),
+            ),
+            (
+                "filled_f32_nonzero",
+                from_storage(filled_f32(vec![2, 3], 1.5).unwrap()),
+                raw_f32(vec![2, 3], &[1.5; 6]),
+                [1.5f32; 6].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            ),
+            (
+                "filled_f32_neg_zero",
+                from_storage(filled_f32(vec![2, 3], -0.0).unwrap()),
+                raw_f32(vec![2, 3], &[-0.0; 6]),
+                [-0.0f32; 6].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            ),
+            (
+                "filled_f32_pos_zero",
+                from_storage(filled_f32(vec![2, 3], 0.0).unwrap()),
+                raw_f32(vec![2, 3], &[0.0; 6]),
+                vec![0u8; 24],
+            ),
+            (
+                "filled_f32_empty",
+                from_storage(filled_f32(vec![0, 3], 0.0).unwrap()),
+                raw_f32(vec![0, 3], &[]),
+                Vec::new(),
+            ),
+        ];
+
+        // Verify symbolic variants did not fall back to Bytes.
+        assert!(matches!(cases[0].1.value().value, ConstantValue::Identity));
+        assert!(matches!(cases[3].1.value().value, ConstantValue::FilledI32(7)));
+        assert!(matches!(cases[6].1.value().value, ConstantValue::FilledI32(42)));
+        assert!(matches!(cases[8].1.value().value, ConstantValue::OneHot));
+        assert!(matches!(cases[11].1.value().value, ConstantValue::FilledF32(_)));
+        assert!(matches!(cases[13].1.value().value, ConstantValue::Zero));
+
+        // Cross-symbolic equivalence and non-equivalence checks.
+        let one_hot_3x1 = &cases[9].1;
+        let filled_ones_3x1 = from_storage(filled_f32(vec![3, 1], 1.0).unwrap());
+        assert!(one_hot_3x1.same_storage_as(&filled_ones_3x1));
+        assert!(filled_ones_3x1.same_storage_as(one_hot_3x1));
+        let identity_1 = &cases[1].1;
+        let count_0 = &cases[7].1;
+        assert!(identity_1.same_storage_as(count_0));
+        assert!(count_0.same_storage_as(identity_1));
+        assert!(!cases[0].1.same_storage_as(&from_storage(RowRule::<u64>::Filled(0).storage(5).unwrap())));
+        assert!(!cases[8].1.same_storage_as(&from_storage(filled_f32(vec![3, 4], 1.0).unwrap())));
+        assert!(!cases[12].1.same_storage_as(&cases[13].1));
+
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
+        for (name, symbolic, raw, expected_bytes) in &cases {
+            assert!(symbolic.same_storage_as(raw), "{name}: symbolic == raw");
+            assert!(raw.same_storage_as(symbolic), "{name}: raw == symbolic");
+            assert_eq!(
+                symbolic.storage_bytes().unwrap(),
+                raw.storage_bytes().unwrap(),
+                "{name}: storage_bytes"
+            );
+            assert_eq!(
+                symbolic.value().host_heap(),
+                raw.value().host_heap(),
+                "{name}: host_heap"
+            );
+            assert_eq!(
+                distinct_storage_bytes([symbolic, raw]).unwrap(),
+                raw.storage_bytes().unwrap(),
+                "{name}: distinct_storage_bytes"
+            );
+
+            let charges = seismic::Charges::tally(&device);
+            let mut uploaded = ConstantTensors::new(&charges);
+            let tensor = uploaded.tensor(symbolic).unwrap();
+            assert_eq!(tensor.read_to_host().unwrap(), *expected_bytes, "{name}: upload bytes");
+            let tied = uploaded.tensor(raw).unwrap();
+            assert_eq!(tied.read_to_host().unwrap(), *expected_bytes, "{name}: tied upload bytes");
+            assert_eq!(uploaded.uploaded.len(), 1, "{name}: symbolic and raw share one allocation");
+        }
     }
 }

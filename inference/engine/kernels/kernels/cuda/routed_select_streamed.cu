@@ -6,6 +6,7 @@
 #include "lib/projection/operator.cuh"
 #include "lib/routed/selection.cuh"
 #include "lib/streaming/control.cuh"
+#include "../streaming/hint.hpp"
 #include "../streaming/resolve.hpp"
 #include "lib/routed/resolve.cuh"
 
@@ -52,13 +53,15 @@ extern "C" __global__ void routed_select_streamed_ordered_gemv(SEISMIC_KERNEL_PA
     const float *expert_scale = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE));
     int *routes = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const auto weights = SEISMIC_OUT_WEIGHTS;
+    ROUTED_KEYS_RECORD;
     for (unsigned row = threadIdx.x / 32; row < m; row += blockDim.x / 32) {
         const float *row_logits = logits + static_cast<unsigned long long>(row) * SEISMIC_DIM_E;
         select_row(row, [&](unsigned e) { return __ldcg(row_logits + e); }, bias, expert_scale, routes, weights,
-                   seismic_words_value);
+                   seismic_words_value, ROUTED_ROW_KEYS(row));
     }
     int *words = reinterpret_cast<int *>(dynamic_shared);
-    const ResolvePorts bank = ROUTED_RESOLVE_PORTS;
+    const ResolvePorts bank =
+        ROUTED_RESOLVE_PORTS(SEISMIC_OUT_WEIGHTS.stored(), SEISMIC_WEIGHTS_STRIDE_0, SEISMIC_WEIGHTS_STRIDE_1);
     const bool whole =
         streaming_load(STREAMING_AT(bank.policy, SEISMIC_CONST_POLICY_WHOLE * SEISMIC_POLICY_STRIDE_0)) != 0;
     routed_resolve(bank, whole, words, seismic_words_value);

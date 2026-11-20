@@ -454,6 +454,8 @@ fn watch(
             rings: words(&layer.rings, 0)?,
             hints: plan.predicted(index).collect(),
             routing: words(&layer.routing, 0)?,
+            keys: words(&layer.keys, 0)?,
+            front: words(&layer.front, 0)?,
             policy: words(&layer.policy, 0)?,
             site: site_layers.iter().find(|site| site.layer() == index).map(|site| site.slots().clone()),
             stored: stored.into(),
@@ -498,7 +500,6 @@ fn watch(
         let lent = &plan.groups()[lender.group].record;
         Ok::<_, String>(Lending {
             group: lender.group,
-            records: usize::try_from(lender.records).map_err(|_| "lent records exceed the host")?,
             pools: staging_pools
                 .iter()
                 .zip(&conveyor.conveyor.offsets)
@@ -568,7 +569,8 @@ fn watch(
             }
             Placer::Bank => Placement::Bank { landing_maps },
         };
-        TierStart { records, lent, placement }
+        let reserve = usize::try_from(plan.tier_reserve()).map_err(|_| "the tier's reserve exceeds the host")?;
+        TierStart { records, lent, reserve, placement }
     };
     // A group's commits span its ceiling, as its entries bind them, so a
     // resize keeps them.
@@ -609,8 +611,8 @@ fn watch(
             words: binding.words,
             selected: usize::try_from(binding.selected).map_err(|_| "choices exceed the host")?,
             demand: usize::try_from(plan.demand_records()).map_err(|_| "the demand reserve exceeds the host")?,
-            reserve: usize::try_from(plan.tier_reserve()).map_err(|_| "the tier's reserve exceeds the host")?,
             placer: plan.placer(),
+            recording: plan.recording,
         },
         slots,
         whole: plan.whole(),
@@ -622,6 +624,8 @@ fn watch(
         copier,
         steps,
         spans: device.backend().times_spans() && device.backend().parks_in_kernels(),
+        trip: crate::experts::exchange::abort(),
+        line: plan.paths.line(),
     })
     .map(|watcher| (watcher, lines, tables))
 }

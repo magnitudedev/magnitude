@@ -24,7 +24,7 @@ pub trait PhysicalDialect: Sized + 'static + fmt::Debug {
     fn ordinary_launch() -> Self::LaunchDescriptor;
     /// Resolve a source participation requirement during construction.
     fn launch_for_participation(
-        _facts: &Self::Facts,
+        _device_info: &Self::DeviceInfo,
         requirement: crate::schedule::LaunchParticipation,
     ) -> Option<Self::LaunchDescriptor> {
         match requirement {
@@ -38,9 +38,9 @@ pub trait PhysicalDialect: Sized + 'static + fmt::Debug {
     /// kernel (§7.3).
     type Intrinsic: Clone + fmt::Debug + Send + Sync + 'static;
 
-    /// Backend-specific target facts beyond the common limits (SIMD width,
+    /// Backend-specific device info beyond the common limits (SIMD width,
     /// compute capability, language version, ...). Complete before planning.
-    type Facts: Clone + fmt::Debug + PartialEq + Send + Sync + 'static;
+    type DeviceInfo: Clone + fmt::Debug + PartialEq + Send + Sync + 'static;
 
     /// Canonically identifies one backend intrinsic without Debug rendering
     /// or opaque backend-supplied bytes.
@@ -54,7 +54,7 @@ pub trait PhysicalDialect: Sized + 'static + fmt::Debug {
     /// semantics; this hook closes target facts such as accumulator rounding
     /// and subnormal handling before the solver derives admissibility.
     fn intrinsic_numerics(
-        facts: &Self::Facts,
+        device_info: &Self::DeviceInfo,
         signature: &seismic_lang::registry::IntrinsicSignature,
         intrinsic: &Self::Intrinsic,
     ) -> IntrinsicNumericalSemantics;

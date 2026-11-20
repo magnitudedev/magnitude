@@ -83,7 +83,7 @@ pub struct DeviceDescriptionParts<T: TargetFamily> {
     pub numerics: NumericalEnvironment,
     pub capabilities: BTreeSet<CapabilityId>,
     pub intrinsics: BTreeSet<IntrinsicId>,
-    pub facts: T::Facts,
+    pub device_info: T::DeviceInfo,
     pub kernel_abi: T::KernelAbi,
     pub local_realization: LocalRealizationPolicy,
     pub addressable_resources: Vec<AddressableResourceClass>,
@@ -100,7 +100,7 @@ pub struct DeviceDescription<T: TargetFamily> {
     numerics: NumericalEnvironment,
     capabilities: BTreeSet<CapabilityId>,
     intrinsics: BTreeSet<IntrinsicId>,
-    facts: T::Facts,
+    device_info: T::DeviceInfo,
     kernel_abi: T::KernelAbi,
     local_realization: LocalRealizationPolicy,
     addressable_resources: Vec<AddressableResourceClass>,
@@ -118,7 +118,7 @@ impl<T: TargetFamily> fmt::Debug for DeviceDescription<T> {
             .field("numerics", &self.numerics)
             .field("capabilities", &self.capabilities)
             .field("intrinsics", &self.intrinsics)
-            .field("facts", &self.facts)
+            .field("device_info", &self.device_info)
             .field("kernel_abi", &self.kernel_abi)
             .field("local_realization", &self.local_realization)
             .field("addressable_resources", &self.addressable_resources)
@@ -158,7 +158,7 @@ impl<T: TargetFamily> DeviceDescription<T> {
             numerics: parts.numerics,
             capabilities: parts.capabilities,
             intrinsics: parts.intrinsics,
-            facts: parts.facts,
+            device_info: parts.device_info,
             kernel_abi: parts.kernel_abi,
             local_realization: parts.local_realization,
             addressable_resources: parts.addressable_resources,
@@ -186,8 +186,8 @@ impl<T: TargetFamily> DeviceDescription<T> {
     pub fn numerics(&self) -> &NumericalEnvironment {
         &self.numerics
     }
-    pub fn facts(&self) -> &T::Facts {
-        &self.facts
+    pub fn device_info(&self) -> &T::DeviceInfo {
+        &self.device_info
     }
     pub fn kernel_abi(&self) -> &T::KernelAbi {
         &self.kernel_abi

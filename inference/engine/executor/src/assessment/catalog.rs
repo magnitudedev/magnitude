@@ -12,8 +12,6 @@
 //! the backend has no native of an entry the load prepares; any other
 //! failure of its terms fails.
 
-use super::demand::DecodeDemand;
-use super::launches::Declarations;
 use super::AssessmentError;
 use crate::{
     resident_layout, AssessmentGraphResourceBounds, AssessmentMemoryTerms, ComponentSelection,
@@ -41,7 +39,7 @@ use std::path::Path;
 /// alone. DeepSeek V4.1 Flash is disabled for users until it passes on real
 /// text, but its loads plan on every backend, so a call outside a
 /// declaration's domain at its shapes fails here, not at a device's load.
-const REQUIRED: [&str; 2] = ["qwen3.8-flash-next:gguf:q4", "deepseek-v4.1-flash:gguf:mxfp4"];
+const REQUIRED: [&str; 2] = ["qwen3.8-flash-next:gguf:q6", "deepseek-v4.1-flash:gguf:mxfp4"];
 
 /// Whether the catalog serves a model: its support level
 /// (`catalog/models.json`) is neither disabled nor deprecated.
@@ -144,7 +142,7 @@ fn every_admitted_catalog_target_derives_complete_terms_on(backend: BackendName)
         .filter(|component| component.role == ComponentRole::Target)
         .collect::<Vec<_>>();
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let threads = seismic::threads::quota().get();
     let derived = std::thread::scope(|scope| {
         let workers = (0..threads.min(targets.len()))
             .map(|_| {
@@ -514,17 +512,7 @@ fn derive_terms(
     let demands = [KvCodec::Dense, KvCodec::AffineK8V4]
         .into_iter()
         .map(|codec| {
-            let program = load
-                .program_plan(definition, codec)
-                .map_err(|error| AssessmentError::Demand(error.to_string()))?;
-            let declarations = Declarations::of_load(
-                backend,
-                &program,
-                definition,
-                load,
-                crate::native::TuningLimits::of(LIMITS, definition),
-            )?;
-            let demand = DecodeDemand::from_model(definition, load, codec, &declarations)?;
+            let demand = crate::assessment::demand::tests::demand_on(definition, load, codec, backend)?;
             // Every call's launches at one and at the decode rows' most.
             for call in &demand.calls {
                 for rows in [1, magnitude_kernels::constants::VERIFY_ROWS] {
@@ -1250,7 +1238,7 @@ fn every_served_target_outlines_its_state_copies_from_traces(backend: BackendNam
             .unwrap_or_else(|error| panic!("{line}: its state plans: {error}"));
         let classes = state_copy_classes(state.target_state(), state.head_state(), &row_classes)
             .unwrap_or_else(|error| panic!("{line}: its copy classes: {error}"));
-        let outlined = tally.outline(copy_traces_recorded, || certify_copy_family::<seismic::NativeGraphOutline>(backend, &classes));
+        let outlined = tally.outline(copy_traces_recorded, || certify_copy_family::<crate::programs::graph::sizing::SizingOutline>(backend, &classes));
         let certified = certify_copy_family::<seismic::NativeGraphLayout>(backend, &classes);
         rows += 1;
         match (outlined, certified) {
@@ -1323,11 +1311,11 @@ fn every_served_head_outlines_its_graphs_from_traces(backend: BackendName) {
             panic!("{line}: a selected causal head plans no head program or state");
         };
         let geometry = head_state.head_geometry().unwrap_or_else(|error| panic!("{line}: {error}"));
-        let classes = head_graph_classes(LIMITS, geometry, HEAD_METHOD.draft_rows())
+        let classes = head_graph_classes(LIMITS, geometry, HEAD_METHOD.draft_rows(), load.fronts())
         .unwrap_or_else(|error| panic!("{line}: its head classes: {error}"));
         let binding = head_program.blocks()[0];
         let outlined = tally.outline(head_traces_recorded, || {
-            certify_head_family::<seismic::NativeGraphOutline>(backend, &load, &definition.decoder, head_block, binding, &classes)
+            certify_head_family::<crate::programs::graph::sizing::SizingOutline>(backend, &load, &definition.decoder, head_block, binding, &classes)
                 .map(|(storage, outlines)| (storage, class_terms(outlines.values())))
         });
         let laid = certify_head_family::<seismic::NativeGraphLayout>(backend, &load, &definition.decoder, head_block, binding, &classes)
@@ -1398,7 +1386,7 @@ fn every_served_shared_head_outlines_its_graphs_from_traces(backend: BackendName
         let classes = shared_head_graph_classes(LIMITS, HEAD_METHOD.draft_rows())
             .unwrap_or_else(|error| panic!("{line}: its shared head classes: {error}"));
         let outlined = tally.outline(shared_head_traces_recorded, || {
-            certify_shared_head_family::<seismic::NativeGraphOutline>(backend, &load, &geometry, classes.iter().copied())
+            certify_shared_head_family::<crate::programs::graph::sizing::SizingOutline>(backend, &load, &geometry, classes.iter().copied())
                 .map(|(storage, outlines)| (storage, class_terms(outlines.values())))
         });
         let laid = certify_shared_head_family::<seismic::NativeGraphLayout>(backend, &load, &geometry, classes.iter().copied())

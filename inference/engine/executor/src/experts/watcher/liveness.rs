@@ -7,7 +7,7 @@ use super::requests::Service;
 use super::residency::Residency;
 use super::telemetry::CompletionError;
 use super::{Shared, decode, scratch};
-use crate::assessment::{FileLine, ReadLineError};
+use magnitude_cost_model::FileLine;
 use crate::experts::ExchangeTable;
 use crate::experts::exchange::{Bound, Bounds, Kind, Trip, Watchdog, Watched, Witness};
 use crate::experts::yielding::Yielding;
@@ -29,6 +29,9 @@ pub(super) struct Answers {
     pub(super) bytes: u64,
     /// Each sited layer, its rows and most distinct experts of a request.
     pub(super) sites: Vec<(usize, f64, f64)>,
+    /// The model store's read line the load's plan was priced on: the line
+    /// answers are bounded at until the load's reads measure one.
+    pub(super) planned: Option<magnitude_cost_model::ReadLine>,
 }
 
 impl Answers {
@@ -37,19 +40,19 @@ impl Answers {
     /// in flight read one after another, then landed (a layer whose
     /// landings are unmeasured lands no slower than it reads the same
     /// records: a landing reads and writes each byte once in host memory),
-    /// beside the CPU's longest request and the longest rest of a serving
-    /// thread before it looks again. `landings` are each layer's landing
+    /// beside the CPU's longest request and `rest`, the longer of the
+    /// serving threads' rests now (`requests::Rest`) before one looks
+    /// again. `landings` are each layer's landing
     /// lines now, and `priced` its lines as the load refines them
     /// (`Telemetry::refined`): the CPU's longest request is, per
     /// sited layer with lines, its distinct experts at most each cold over
     /// every row, and the handshake.
-    pub(super) fn longest(&self, line: crate::assessment::ReadLine, landings: &[Option<FileLine>], priced: Option<&[crate::assessment::ExpertLines]>) -> Bound {
+    pub(super) fn longest(&self, line: magnitude_cost_model::ReadLine, landings: &[Option<FileLine>], priced: Option<&[magnitude_cost_model::ExpertLines]>, rest: Duration) -> Bound {
         // Every term is a measured line's at its records, and no line's
         // term is negative (`assessment::Terms`), so none shortens the bound.
         let read = self.records as f64 * line.seconds(self.bytes);
         let unmeasured = landings.iter().filter(|landing| landing.is_none()).count();
         let landing = landings.iter().map(|landing| landing.map_or(read, |landing| landing.seconds(self.records))).fold(0.0, f64::max);
-        let notice = super::requests::IDLE;
         let cpu = self
             .sites
             .iter()
@@ -58,12 +61,12 @@ impl Answers {
                 Some((distinct * lines.expert.nanoseconds(rows) + lines.handshake.get()) * 1e-9)
             })
             .fold(0.0, f64::max);
-        let seconds = read + landing + cpu + notice.as_secs_f64();
+        let seconds = read + landing + cpu + rest.as_secs_f64();
         Bound {
             limit: Duration::from_secs_f64(seconds) * MULTIPLE,
             derivation: format!(
                 "{MULTIPLE} × ({} records of {} bytes read {read:.3} s at {:.3} ms + {:.3} ms/GB + landed {landing:.3} s ({unmeasured} layers' landings unmeasured, at their reads) \
-                 + the CPU's longest request {:.3} s + a rest {notice:?})",
+                 + the CPU's longest request {:.3} s + the longest rest now {rest:?})",
                 self.records,
                 self.bytes,
                 line.latency_seconds() * 1e3,
@@ -78,6 +81,7 @@ impl Answers {
 /// layer, bounded by [`Answers::longest`] at the run's read line, reporting
 /// the steps, the request service, residency, the transfer queue, the
 /// parks, the CPU site and serving's life.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn watch(
     core: &Core,
     shared: &Arc<Shared>,
@@ -85,6 +89,7 @@ pub(super) fn watch(
     service: Arc<Mutex<Service>>,
     copies: Option<crate::experts::copies::Copies>,
     answers: Answers,
+    bounds: Option<Box<dyn Fn() -> Bounds + Send>>,
     trip: Trip,
 ) -> Result<Watchdog, String> {
     let mut tables = Vec::new();
@@ -95,19 +100,24 @@ pub(super) fn watch(
             tables.push(Watched { kind: Kind::Site, layer, slots: site.clone() });
         }
     }
-    let bounds = {
+    // The request service's rest and the parks' keeper's, as each sets it.
+    let rests = [service.lock().expect("the request service is never left by a panic").rested(), shared.parks.rested()];
+    let bounds = bounds.unwrap_or_else(|| {
         let shared = shared.clone();
         Box::new(move || {
-            match shared.telemetry.line() {
+            // The drive's line as the load's reads measure it, else as the
+            // plan was priced on.
+            match shared.telemetry.line().or(answers.planned) {
                 Some(line) => {
                     let priced = shared.priced().map(|lines| shared.telemetry.refined(&lines));
-                    let lane = answers.longest(line, &shared.telemetry.landing_lines(), priced.as_deref());
+                    let rest = rests[0].get().max(rests[1].get());
+                    let lane = answers.longest(line, &shared.telemetry.landing_lines(), priced.as_deref(), rest);
                     Bounds { lane, volumes: VolumeBound(Some(line)) }
                 }
                 None => Bounds::unpriced(),
             }
         })
-    };
+    });
     let reads = Box::new(core.table.source().reads());
     let witnesses = vec![
         Witness { name: "steps", report: Arc::new({ let shared = shared.clone(); move || shared.steps.describe() }) },
@@ -220,7 +230,7 @@ pub(super) fn refuse(core: &Core, shared: &Shared) -> bool {
         }
         let last = served.scratch.table().lanes() - 1;
         for sequence in open(&served.scratch, constants::SCRATCH_ASK, last) {
-            scratch::fail(core, shared, layer, sequence, reason());
+            scratch::fail(core, shared, sequence, reason());
             refused = true;
         }
     }
@@ -229,21 +239,16 @@ pub(super) fn refuse(core: &Core, shared: &Shared) -> bool {
 
 impl Shared {
     /// End the watcher's serving for `reason`, unless it ended already,
-    /// and wake an owner waiting for a resize's answer, or a prompt group's
-    /// begin waiting for a copy, neither of which comes; an event, so the
-    /// request service turns to refusing at once. Never called under the
-    /// lent records' lock.
+    /// and wake an owner waiting for a resize's answer, which never comes;
+    /// an event, so the request service turns to refusing at once.
     pub(super) fn end_serving(&self, reason: String) {
         self.life.end(reason);
         self.resizing.wake();
-        self.lent.wake();
         self.events().notify();
     }
 
     /// Count a read step `sequence`'s decode request at `layer` named that
-    /// landed (`Telemetry::landed`): one that leaves the served file with
-    /// no read line ends serving: every rule that weighs reads against
-    /// compute reads that line.
+    /// landed (`Telemetry::landed`).
     pub(super) fn landed(
         &self,
         layer: usize,
@@ -252,9 +257,7 @@ impl Shared {
         timed: Option<(u64, std::time::Duration)>,
         queued: std::time::Duration,
     ) {
-        if let Err(error) = self.telemetry.landed(layer, sequence, read, timed, queued) {
-            self.lost_read_line(error);
-        }
+        self.telemetry.landed(layer, sequence, read, timed, queued);
     }
 
     /// Why serving ends that no serving thread met itself: the device lost
@@ -263,20 +266,10 @@ impl Shared {
         self.parks.lost()
     }
 
-    /// The served file's reads make no read line (`error`): serving ends,
-    /// as every rule that weighs reads against compute reads that line.
-    pub(super) fn lost_read_line(&self, error: ReadLineError) {
-        self.end_serving(format!("the served file's read line: {error}"));
-    }
-
     /// A completed step's costs could not be recorded (`error`): serving
-    /// ends, a lost read line through [`Self::lost_read_line`].
+    /// ends.
     pub(super) fn failed_completion(&self, error: CompletionError) {
-        match error {
-            CompletionError::ReadLine(error) => self.lost_read_line(error),
-            CompletionError::Stamps { layer, error } => {
-                self.end_serving(format!("streamed layer {layer}'s sampled block stamps: {error}"));
-            }
-        }
+        let CompletionError { layer, error } = error;
+        self.end_serving(format!("streamed layer {layer}'s sampled block stamps: {error}"));
     }
 }

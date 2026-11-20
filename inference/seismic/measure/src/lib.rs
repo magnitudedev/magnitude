@@ -18,6 +18,9 @@
 //! - **Lines** ([`Line`]): a cost that grows with a quantity, fitted
 //!   through measured points and refined by observations of real work,
 //!   with its state ([`LineState`]).
+//! - **Pricing** ([`pricing`]): what one kernel call and one launch of
+//!   calls cost, from their bytes and FLOPs and the device's measured
+//!   rates.
 //! - **Records** ([`measure_all`], [`Record`], [`RecordStore`]): measured
 //!   points kept under the caller's keys, each begun before its host's
 //!   cutoff and timed to its end, so what is recorded never follows from
@@ -36,6 +39,7 @@
 pub mod clock;
 mod deadline;
 pub mod line;
+pub mod pricing;
 mod measure;
 pub mod session;
 pub mod statistics;

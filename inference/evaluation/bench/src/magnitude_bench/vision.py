@@ -1,4 +1,7 @@
-"""Qualify catalog image serving with and without its drafter on fixed fixtures.
+"""Qualify catalog image serving with and without its drafter on fixed image conversations.
+
+A capability check that multimodal input is accepted and answered, not a benchmark request: its
+cases are the bench's own, never a template.
 
 Run through `mrig serve`, which records source, artifacts and host evidence.
 This checks observable answers and speculative serving, not distributional quality.
@@ -6,11 +9,14 @@ This checks observable answers and speculative serving, not distributional quali
 
 import argparse
 import asyncio
+import base64
+import struct
+import zlib
 from pathlib import Path
 
 import httpx
+from magnitude_fixtures import Generation
 from magnitude_fixtures.canonical import digest
-from magnitude_fixtures.vision import fixtures
 
 from .adapters.native import Native
 from .client import measure
@@ -18,6 +24,97 @@ from .models import Acquisition, Target, prepare
 from .options import EngineOptions, MagnitudeOptions
 from .requests import Request
 from .store import RunStore
+
+
+def image(width: int, height: int, colors: tuple[tuple[int, int, int], ...]) -> str:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    row = b"\0" + b"".join(
+        bytes(colors[min(x * len(colors) // width, len(colors) - 1)]) for x in range(width)
+    )
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(row * height))
+        + chunk(b"IEND", b"")
+    )
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
+#: The cases: (name, the conversation's messages, its question's expected values).
+Case = tuple[str, list[dict], dict[str, str]]
+
+
+def cases() -> tuple[Case, ...]:
+    """Deterministic image conversations with exact, visible color answers."""
+    red, blue = (255, 0, 0), (0, 0, 255)
+    asked = (
+        ("solid", [image(224, 224, (red,))], "What color is the image?", {"color": "red"}),
+        (
+            "details",
+            [image(896, 896, (red, blue))],
+            "What colors are the left and right halves of the image?",
+            {"left": "red", "right": "blue"},
+        ),
+        (
+            "ordered",
+            [image(224, 224, (red,)), image(224, 224, (blue,)), image(224, 224, (red,))],
+            "What color is each image, in order?",
+            {"first": "red", "second": "blue", "third": "red"},
+        ),
+        (
+            "history",
+            [image(224, 224, (blue,))],
+            "What colors are the earlier image and the current image?",
+            {"earlier": "red", "current": "blue"},
+        ),
+    )
+    results = []
+    for name, urls, question, values in asked:
+        content: list[dict] = [{"type": "image_url", "image_url": {"url": url}} for url in urls]
+        content.append(
+            {
+                "type": "text",
+                "text": question
+                + " Reply only with a JSON object using these keys: "
+                + ", ".join(values)
+                + ". Use lowercase color names as string values. Do not use Markdown.",
+            }
+        )
+        messages: list[dict] = [{"role": "user", "content": content}]
+        if name == "history":
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image(224, 224, (red,))}},
+                        {"type": "text", "text": "Describe this image."},
+                    ],
+                },
+                {"role": "assistant", "content": "The image is red."},
+                *messages,
+            ]
+        results.append((name, messages, values))
+    return tuple(results)
+
+
+def vision_request(case: Case, drafting: bool) -> Request:
+    name, messages, values = case
+    return Request(
+        id=name + ("-draft" if drafting else "-plain"),
+        section="vision",
+        session=name,
+        checkpoint=0,
+        template=None,
+        lane=0,
+        key="vision",
+        messages=messages,
+        tools=[],
+        generation=Generation(prefix=len(messages), max_tokens=80, expected={"values": values}),
+    )
 
 
 async def run(args):
@@ -29,12 +126,11 @@ async def run(args):
     )
     artifact = prepare(target)
     store = RunStore(args.output / "vision")
-    cases = fixtures()
-    (store.path / "fixtures.jsonl").write_text("".join(f.model_dump_json() + "\n" for f in cases))
+    asked = cases()
     store.event(
         "inputs",
         catalog=acquisition.model_dump(mode="json"),
-        fixtures_sha256=digest([f.model_dump(mode="json") for f in cases]),
+        cases_sha256=digest([list(case) for case in asked]),
     )
     observations = []
     try:
@@ -58,18 +154,8 @@ async def run(args):
                 adapter.launch(8192, 1, "draft" if drafting else "plain") as engine,
                 httpx.AsyncClient(timeout=None, trust_env=False) as client,
             ):
-                for fixture in cases:
-                    request = Request(
-                        id=fixture.id + ("-draft" if drafting else "-plain"),
-                        section="single",
-                        session=fixture.id,
-                        checkpoint=0,
-                        family=fixture.family,
-                        fixture_id=fixture.id,
-                        messages=fixture.messages[: fixture.generation.prefix],
-                        tools=fixture.tools,
-                        generation=fixture.generation,
-                    )
+                for case in asked:
+                    request = vision_request(case, drafting)
                     engine.started(request.id)
                     observation = await measure(
                         client,

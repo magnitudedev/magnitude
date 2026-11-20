@@ -10,7 +10,7 @@
 //! The exchange's watchdog measures its lanes on the same clock and trips
 //! the same way.
 
-use crate::assessment::ReadLine;
+use magnitude_cost_model::ReadLine;
 use seismic_io::{EngineWork, Flight, Volume};
 use std::sync::{Condvar, MutexGuard};
 use std::time::{Duration, Instant};

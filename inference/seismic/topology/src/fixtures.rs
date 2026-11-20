@@ -12,15 +12,19 @@
 
 use crate::kind::{HostReads, KindMemory, KindReport, Reach};
 use crate::model::{
-    Availability, DeviceTopology, Executor, ExecutorKind, PhysicalDeviceId, PhysicalIdentity,
-    Reported, ReportedBy, Revision, StoreId, StoreKind, VolumeId,
+    Availability, CacheSize, DeviceTopology, Executor, ExecutorKind, Grant, PhysicalDeviceId,
+    PhysicalIdentity, Reported, ReportedBy, Revision, StoreId, StoreKind, VolumeId,
 };
+use crate::processors::{HostNode, Processors};
 use crate::reports::{
     build, AdapterReport, CpuReport, CudaMemory, CudaReport, MetalReport, Reports, VolumeReport,
     VulkanHeap, VulkanMemory, VulkanReport,
 };
+use crate::system::SystemIdentity;
 use seismic_lang::registry::BackendName;
+use std::collections::BTreeSet;
 use std::fmt::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 pub const GB: u64 = 1_000_000_000;
@@ -205,18 +209,34 @@ fn cpu() -> CpuReport {
     CpuReport {
         name: "Host CPU (x86_64)".into(),
         identity: "recorded x86_64 host".into(),
-        cache: None,
+        cache: CacheSize::UNREPORTED,
         availability: Availability::Available,
         max_allocation: CPU_MAX_ALLOCATION,
         kind: cpu_kind(),
     }
 }
 
-fn reports(host: Reported<u64>, os_build: &str, page: u64, cpu: CpuReport) -> Reports {
+fn flat_processors(count: usize) -> Processors {
+    Processors::flat(
+        (0..count).collect::<BTreeSet<_>>(),
+        NonZeroUsize::new(count).expect("fixture processor count is nonzero"),
+    )
+}
+
+fn reports(
+    host: Reported<u64>,
+    cpu_model: &str,
+    os_build: &str,
+    page: u64,
+    cpu: CpuReport,
+) -> Reports {
     Reports {
         host,
+        cpu_model: cpu_model.into(),
         os_build: os_build.into(),
         page,
+        processors: flat_processors(8),
+        system: SystemIdentity::default(),
         cpu,
         metal: Vec::new(),
         cuda: Vec::new(),
@@ -231,6 +251,7 @@ fn reports(host: Reported<u64>, os_build: &str, page: u64, cpu: CpuReport) -> Re
 pub fn rtx3090_host() -> Reports {
     reports(
         Reported::new(RTX3090_HOST, ReportedBy::LinuxMemTotal),
+        "recorded x86_64 host",
         RTX3090_OS,
         4096,
         cpu(),
@@ -280,6 +301,7 @@ pub fn vulkan(
         driver: driver.into(),
         max_allocation,
         least_object: Ok(heaps.iter().map(|&(bytes, _)| bytes).sum::<u64>().div_ceil(VULKAN_MEMORY_OBJECTS)),
+        host_node: HostNode::Any,
         memory: VulkanMemory {
             luid,
             heaps: heaps
@@ -342,12 +364,12 @@ fn rtx3090_vulkan_of(uuid: [u8; 16], heap: u64) -> VulkanReport {
 }
 
 /// CUDA's view of the RTX 3090 machine's GPU.
-pub fn rtx3090_cuda(uuid: [u8; 16], peers: Vec<[u8; 16]>) -> CudaReport {
-    rtx3090_cuda_of(uuid, peers, RTX3090_CUDA_USABLE)
+pub fn rtx3090_cuda(uuid: [u8; 16]) -> CudaReport {
+    rtx3090_cuda_of(uuid, RTX3090_CUDA_USABLE)
 }
 
 /// CUDA's view of the RTX 3090 letting this process use `usable` bytes.
-fn rtx3090_cuda_of(uuid: [u8; 16], peers: Vec<[u8; 16]>, usable: u64) -> CudaReport {
+fn rtx3090_cuda_of(uuid: [u8; 16], usable: u64) -> CudaReport {
     cuda(
         CudaReport {
             uuid,
@@ -360,10 +382,10 @@ fn rtx3090_cuda_of(uuid: [u8; 16], peers: Vec<[u8; 16]>, usable: u64) -> CudaRep
             allocation_granularity: CUDA_DEVICE_GRANULARITY,
             integrated: false,
             l2: Some(RTX3090_CUDA_L2),
+            host_node: HostNode::Any,
             memory: CudaMemory::Own {
                 usable: Ok(usable),
             },
-            peers,
             kinds: Vec::new(),
         },
     )
@@ -379,7 +401,7 @@ pub fn rtx3090_uuid() -> [u8; 16] {
 pub fn rtx3090() -> Reports {
     let gpu = rtx3090_uuid();
     let mut reports = rtx3090_host();
-    reports.cuda.push(rtx3090_cuda(gpu, Vec::new()));
+    reports.cuda.push(rtx3090_cuda(gpu));
     reports.vulkan.push(rtx3090_vulkan(gpu));
     reports
 }
@@ -410,7 +432,7 @@ pub fn rtx3090_granting(backend: BackendName, grant: u64) -> Reports {
         BackendName::Vulkan => (RTX3090_CUDA_USABLE, grant),
         _ => (grant, RTX3090_VULKAN_HEAP),
     };
-    reports.cuda.push(rtx3090_cuda_of(gpu, Vec::new(), usable));
+    reports.cuda.push(rtx3090_cuda_of(gpu, usable));
     reports.vulkan.push(rtx3090_vulkan_of(gpu, heap));
     reports
 }
@@ -428,15 +450,16 @@ pub const M4_PRO_CPU_CACHE: u64 = 37_748_736;
 pub fn m4_pro() -> Reports {
     let mut reports = reports(
         Reported::new(M4_PRO_HOST, ReportedBy::MacOsMemsize),
+        "Apple M4 Pro",
         M4_PRO_OS,
         16384,
         CpuReport {
             name: "Host CPU (aarch64)".into(),
             identity: "Apple M4 Pro".into(),
-            cache: Some(Reported::new(
-                M4_PRO_CPU_CACHE,
-                ReportedBy::MacOsSysctlCache,
-            )),
+            cache: CacheSize {
+                bytes: M4_PRO_CPU_CACHE,
+                is_last_level: false,
+            },
             availability: Availability::Available,
             max_allocation: CPU_MAX_ALLOCATION,
             kind: cpu_kind(),
@@ -498,12 +521,16 @@ pub const GB10_CUDA_L2: u64 = 25_165_824;
 pub fn gb10() -> Reports {
     let mut reports = reports(
         Reported::new(GB10_HOST, ReportedBy::LinuxMemTotal),
+        "NVIDIA GB10",
         GB10_OS,
         4096,
         CpuReport {
             name: "Host CPU (aarch64)".into(),
             identity: "NVIDIA GB10".into(),
-            cache: Some(Reported::new(GB10_CPU_CACHE, ReportedBy::LinuxSysfsCache)),
+            cache: CacheSize {
+                bytes: GB10_CPU_CACHE,
+                is_last_level: true,
+            },
             availability: Availability::Available,
             max_allocation: CPU_MAX_ALLOCATION,
             kind: cpu_kind(),
@@ -521,8 +548,8 @@ pub fn gb10() -> Reports {
             allocation_granularity: CUDA_DEVICE_GRANULARITY,
             integrated: true,
             l2: Some(GB10_CUDA_L2),
+            host_node: HostNode::Any,
             memory: CudaMemory::Host,
-            peers: Vec::new(),
             kinds: Vec::new(),
         },
     ));
@@ -591,6 +618,7 @@ pub const STRIX_HALO_WINDOWS_MAX_ALLOCATION: u64 = 2_147_483_648;
 pub fn windows_host(bytes: u64, os_build: &str) -> Reports {
     reports(
         Reported::new(bytes, ReportedBy::WindowsTotalPhys),
+        "recorded x86_64 host",
         os_build,
         4096,
         cpu(),
@@ -707,10 +735,10 @@ pub fn a10_8q() -> Reports {
             allocation_granularity: CUDA_DEVICE_GRANULARITY,
             integrated: false,
             l2: None,
+            host_node: HostNode::Any,
             memory: CudaMemory::Own {
                 usable: Ok(A10_8Q_CUDA_USABLE),
             },
-            peers: Vec::new(),
             kinds: Vec::new(),
         },
     ));
@@ -755,7 +783,7 @@ pub fn placement(
     topology: &DeviceTopology,
     executor: &Executor,
     contract: crate::Contract,
-) -> Vec<(StoreKind, Option<Reported<u64>>)> {
+) -> Vec<(StoreKind, Option<Grant>)> {
     executor
         .paths(contract)
         .iter()
@@ -821,10 +849,11 @@ pub fn describe(topology: &DeviceTopology) -> String {
                     let path = topology.access_path(id).unwrap();
                     match path.grant() {
                         Some(grant) => format!(
-                            "{} under {} ({:?})",
+                            "{} under {} ({:?}, {:?})",
                             store(path.store()),
-                            gb(grant.value),
-                            grant.by
+                            gb(grant.bytes.value),
+                            grant.bytes.by,
+                            grant.kind,
                         ),
                         None => format!("{} ungranted", store(path.store())),
                     }

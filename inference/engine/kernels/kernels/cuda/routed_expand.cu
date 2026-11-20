@@ -117,8 +117,13 @@ __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
     if (blockIdx.y < choices) {
         seismic_dependency_start();
         __shared__ routed::Gathered table;
-        if (!routed::gather(table, routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
-                            (unsigned)SEISMIC_DIM_M, (unsigned)SEISMIC_DIM_K, blockIdx.y,
+        const unsigned slots = (unsigned)SEISMIC_DIM_K;
+        const auto record = [&](unsigned c) {
+            const int ex = routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, c);
+            return routed::ChoiceKey{ex, ex, true};
+        };
+        if (!routed::gather(table, record, routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
+                            (unsigned)SEISMIC_DIM_M, slots, blockIdx.y,
                             STRIDE_OF(ROUTED_NVFP4), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1))
             return;
         const projection::u64 expert = (projection::u64)table.expert;

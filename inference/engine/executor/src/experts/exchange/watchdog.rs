@@ -45,7 +45,7 @@ impl Kind {
     fn waited(self, lanes: u64) -> std::ops::Range<u64> {
         match self {
             Self::File | Self::Site => 0..1,
-            Self::Scratch => constants::SCRATCH_ROUND..lanes,
+            Self::Scratch => constants::ROUND_LANE(0)..lanes,
         }
     }
 }

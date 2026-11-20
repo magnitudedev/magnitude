@@ -43,7 +43,7 @@
 //! refusal names, for each way the entry point breaks the model, how many
 //! instructions break it so and the first (in reverse postorder), and where
 //! what breaks it there comes from: the instruction that first raised the
-//! offending fact of its operand (a built-in's load, a read of memory with
+//! offending property of its operand (a built-in's load, a read of memory with
 //! a store that may race it, a subgroup operation, a load of a variable
 //! written where divergent control rejoins), the construct whose divergent
 //! control rejoins at a phi, or the loop that carries it out, and for
@@ -179,9 +179,9 @@
 //! is a function of its arguments and the memory it reads; it writes no
 //! memory but its own variables, and executes no subgroup operation or
 //! barrier) stays a call, and the check analyses its body as an entry point
-//! whose parameters hold what the call's arguments hold, once per such facts
+//! whose parameters hold what the call's arguments hold, once per such state
 //! and context ([`Summaries::summary`]). A load in the body is judged as the
-//! inlined body's would be, by its memory's kind and its pointer's facts,
+//! inlined body's would be, by its memory's kind and its pointer's state,
 //! which the arguments give; workgroup memory and device memory the launch
 //! writes, by what a load at the call may see of the caller's stores
 //! ([`Context`]), which is what each load of the body sees, as the body
@@ -643,7 +643,7 @@ pub(crate) fn summarised(module: &[u32]) -> Result<HashMap<u32, Vec<Option<bool>
         id
     };
     // `id` points into memory a load of which the analysis judges by its
-    // kind and the pointer's facts alone, in a body as where inlined: a
+    // kind and the pointer's state alone, in a body as where inlined: a
     // module-scope variable but a private one (the invocation's own, which
     // its caller may have written), or an address converted to a pointer.
     let judged = |id: u32| {
@@ -1187,9 +1187,9 @@ pub fn check(module: &[u32], maximal_reconvergence: bool) -> Result<Findings, Ma
     })
 }
 
-/// What a call of a summarised function gives its caller, for the facts of
+/// What a call of a summarised function gives its caller, for the state of
 /// its arguments ([`Summaries::summary`]): its body analysed as an entry
-/// point whose parameters hold those facts.
+/// point whose parameters hold that state.
 struct Summary {
     /// What the result holds where the body returns it.
     result: Held,
@@ -1223,8 +1223,8 @@ struct Context {
 }
 
 /// The summarised functions ([`summarised`]) an entry point calls, and
-/// what each call of each gives, for the facts of its arguments and its
-/// [`Context`]: each function analysed once per such facts.
+/// what each call of each gives, for the state of its arguments and its
+/// [`Context`]: each function analysed once per such state.
 struct Summaries<'a> {
     /// By function: the function, read as an entry point is.
     programs: HashMap<u32, Program<'a>>,
@@ -1238,7 +1238,7 @@ struct Summaries<'a> {
     steers: HashMap<u32, bool>,
     /// The module declares maximal reconvergence ([`check`]).
     maximal_reconvergence: bool,
-    /// The summaries made so far, by function, arguments' facts and context.
+    /// The summaries made so far, by function, arguments' state and context.
     #[allow(clippy::type_complexity)]
     made: std::cell::RefCell<HashMap<(u32, Vec<Held>, Context), std::rc::Rc<Summary>>>,
 }
@@ -1343,7 +1343,7 @@ impl<'a> Summaries<'a> {
     }
 }
 
-/// A fact the analysis raises to a fixed point: it only grows, by `join`.
+/// A lattice value the analysis raises to a fixed point: it only grows, by `join`.
 trait Join: Copy + PartialEq {
     fn join(self, other: Self) -> Self;
 }
@@ -1387,11 +1387,11 @@ struct Seen {
     /// beside it; in written device memory, which no barrier here orders,
     /// also one that may run before it.
     raced: Option<Racer>,
-    /// What the stores it may see keep ([`Fact::kept`]): those in its
+    /// What the stores it may see keep ([`ValueState::kept`]): those in its
     /// barrier interval and those that may run before it. A store that can
     /// run neither (on a path no invocation of the workgroup takes to it)
     /// keeps nothing it reads.
-    kept: Fact,
+    kept: ValueState,
 }
 
 impl Join for Seen {
@@ -1474,9 +1474,9 @@ impl Stores {
 /// How much a value may differ between the invocations of a subgroup, and
 /// which of the two unrelated orders of a workgroup's invocations it derives
 /// from: their local ids, or their lanes in subgroups (which subgroup, and
-/// which lane in it). A set of the facts below, each made of bits: every
+/// which lane in it). A set of the bits below: every
 /// value is made by joining them, so none holds a bit without the others of
-/// its fact (a local value is divergent, a lane's id varies).
+/// its kind (a local value is divergent, a lane's id varies).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 struct Taint(u8);
 
@@ -1526,7 +1526,7 @@ impl Taint {
         self.holds(Taint::VARIES)
     }
 
-    /// Holds every fact `other` does.
+    /// Holds every bit `other` does.
     fn holds(self, other: Taint) -> bool {
         self.0 & other.0 == other.0
     }
@@ -1646,7 +1646,7 @@ impl Reach {
 /// `api::exclusive_pairs`); an address read from any other memory may
 /// point anywhere. A function or private variable is the invocation's own,
 /// as its registers are: what it holds keeps its names. A condition holds
-/// none ([`Fact::condition`]).
+/// none ([`ValueState::condition`]).
 ///
 /// The default is what nothing is known of yet, which the analysis raises
 /// from; a known value derived from no address and read from no memory
@@ -1734,20 +1734,20 @@ impl Provenance {
 
 /// What is known of a value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-struct Fact {
+struct ValueState {
     taint: Taint,
     provenance: Provenance,
 }
 
-impl Fact {
+impl ValueState {
     /// A value of `taint`, of which nothing else is known yet.
-    const fn of(taint: Taint) -> Fact {
-        Fact { taint, provenance: Provenance { known: false, names: Reach::NONE, loaded: Reach::NONE } }
+    const fn of(taint: Taint) -> ValueState {
+        ValueState { taint, provenance: Provenance { known: false, names: Reach::NONE, loaded: Reach::NONE } }
     }
 
     /// A value of `taint` derived from no address and no memory.
-    const fn plain(taint: Taint) -> Fact {
-        Fact { taint, provenance: Provenance::PLAIN }
+    const fn plain(taint: Taint) -> ValueState {
+        ValueState { taint, provenance: Provenance::PLAIN }
     }
 
     /// What memory shared between invocations keeps of a value placed in
@@ -1755,29 +1755,29 @@ impl Fact {
     /// whether it derives from the local id and from the lane order beyond
     /// what the address does, and where it points. Its divergence is the
     /// read's. A byte holds its one writer's value, and which invocation
-    /// that is the address decides: a fact the address holds too leaves the
+    /// that is the address decides: a taint bit the address holds too leaves the
     /// value a function of the byte, whichever invocation wrote it (a store
     /// staging `x[t]` at `y[t]`). A value placed by one order and deriving
     /// from the other is refused where it is stored ([`MIXING`]).
-    fn kept(self, address: Taint) -> Fact {
+    fn kept(self, address: Taint) -> ValueState {
         let taint = [Taint::LOCAL, Taint::SUBGROUP, Taint::LANE]
             .into_iter()
-            .filter(|fact| self.taint.holds(*fact) && !address.holds(*fact))
+            .filter(|bit| self.taint.holds(*bit) && !address.holds(*bit))
             .fold(Taint::UNIFORM, Taint::join);
-        Fact { taint, provenance: self.provenance.read() }
+        ValueState { taint, provenance: self.provenance.read() }
     }
 
-    /// What a condition (a boolean) of this fact holds: its taint, but no
+    /// What a condition (a boolean) of this state holds: its taint, but no
     /// address, nor anything read from memory that one could address. One
     /// bit chooses; it points nowhere.
-    fn condition(self) -> Fact {
-        Fact { taint: self.taint, provenance: Provenance { known: self.provenance.known, ..Provenance::default() } }
+    fn condition(self) -> ValueState {
+        ValueState { taint: self.taint, provenance: Provenance { known: self.provenance.known, ..Provenance::default() } }
     }
 }
 
-impl Join for Fact {
-    fn join(self, other: Fact) -> Fact {
-        Fact { taint: self.taint.join(other.taint), provenance: self.provenance.join(other.provenance) }
+impl Join for ValueState {
+    fn join(self, other: ValueState) -> ValueState {
+        ValueState { taint: self.taint.join(other.taint), provenance: self.provenance.join(other.provenance) }
     }
 }
 
@@ -1813,8 +1813,8 @@ enum Shaped<T> {
     Members(Vec<Shaped<T>>),
 }
 
-/// The taint and provenance of a value ([`Fact`]), by member.
-type Held = Shaped<Fact>;
+/// The taint and provenance of a value ([`ValueState`]), by member.
+type Held = Shaped<ValueState>;
 /// The bits of a value ([`Constant`]), by member.
 type Known = Shaped<Constant>;
 
@@ -1921,21 +1921,21 @@ impl Held {
     /// Nothing yet: what the analysis raises from, and what an undefined
     /// value (`OpUndef`, a variable before it is written) holds, which adds
     /// nothing to what it joins.
-    const UNIFORM: Held = Shaped::Whole(Fact::of(Taint::UNIFORM));
+    const UNIFORM: Held = Shaped::Whole(ValueState::of(Taint::UNIFORM));
     /// A uniform value derived from no address.
-    const CONSTANT: Held = Shaped::Whole(Fact::plain(Taint::UNIFORM));
+    const CONSTANT: Held = Shaped::Whole(ValueState::plain(Taint::UNIFORM));
 
-    fn fact(&self) -> Fact {
+    fn state(&self) -> ValueState {
         self.leaf()
     }
 
     fn taint(&self) -> Taint {
-        self.fact().taint
+        self.state().taint
     }
 
     fn joined(mut self, taint: Taint) -> Held {
         if taint != Taint::UNIFORM {
-            self.join(&Shaped::Whole(Fact::of(taint)));
+            self.join(&Shaped::Whole(ValueState::of(taint)));
         }
         self
     }
@@ -2720,7 +2720,7 @@ impl Node {
     }
 }
 
-/// Where a fact of a value's taint was first raised: an instruction (a
+/// Where a bit of a value's taint was first raised: an instruction (a
 /// built-in's load, a subgroup operation), a read of shared memory and a
 /// store of the workgroup that may race it, a construct whose divergent
 /// control rejoins where a phi is, or a loop that carries the value out.
@@ -2732,7 +2732,7 @@ enum Origin {
     Loop(usize),
 }
 
-/// By fact of a taint a refusal traces ([`Traced`]): where it was first
+/// By traced bit of a taint a refusal traces ([`Traced`]): where it was first
 /// raised.
 type Origins = [Option<Origin>; Traced::ALL.len()];
 
@@ -2797,7 +2797,7 @@ fn parted(first: &[Edge], second: &[Edge]) -> bool {
 }
 
 /// Which accesses of one barrier interval of workgroup memory may run
-/// beside each other, under one pass's control facts
+/// beside each other, under one pass's control state
 /// ([`Analysis::memory`]). Invocations may be at two points of an interval
 /// at once unless a branch the whole workgroup takes alike, which the
 /// interval passes once at most, parts every way from the interval's
@@ -3000,7 +3000,7 @@ struct Entered {
     exit: usize,
 }
 
-/// The facts of the entry point the analysis raises to a fixed point, where
+/// The state of the entry point the analysis raises to a fixed point, where
 /// control and memory flow as its [`Flow`] has them.
 /// Mapping from SPIR-V SSA ids to dense slots in `Analysis::values`,
 /// `Analysis::origins`, and `Prepared::defined_block`. Entry points use direct
@@ -3073,7 +3073,7 @@ impl PreparedFlow<'_, '_> {
 }
 
 /// Where `pointer`, into workgroup memory, lands ([`Location`]) using
-/// `known` constant-folding facts.
+/// `known` constant-folding state.
 fn workgroup_location(program: &Program<'_>, known: &[Known], pointer: u32) -> Location {
     let mut chains = Vec::new();
     let mut root = pointer;
@@ -3314,7 +3314,7 @@ struct Analysis<'p, 'a> {
     held: Vec<Held>,
     /// By id.
     values: Vec<Held>,
-    /// By id: where each fact of its taint a refusal traces was first
+    /// By id: where each traced bit of its taint a refusal traces was first
     /// raised.
     origins: Vec<Origins>,
     /// By block: how its terminator sends invocations.
@@ -3332,8 +3332,8 @@ struct Analysis<'p, 'a> {
     /// what a load of it there may see of the workgroup's stores ([`Seen`]).
     seen: [Vec<Vec<Seen>>; 2],
     /// By block and instruction: what a store to shared memory there keeps
-    /// of the values it places ([`Fact::kept`]).
-    kept: Vec<Vec<Fact>>,
+    /// of the values it places ([`ValueState::kept`]).
+    kept: Vec<Vec<ValueState>>,
     /// The device memory the launch writes: what the pointers it stores
     /// through address.
     written: Reach,
@@ -4245,7 +4245,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             exited: vec![Taint::UNIFORM; count],
             seen: [WORKGROUP, WRITTEN]
                 .map(|_| blocks.iter().map(|block| vec![Seen::default(); block.instructions.len()]).collect()),
-            kept: blocks.iter().map(|block| vec![Fact::default(); block.instructions.len()]).collect(),
+            kept: blocks.iter().map(|block| vec![ValueState::default(); block.instructions.len()]).collect(),
             written: Reach::NONE,
             summaries,
         }
@@ -4439,23 +4439,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .fold(Taint::UNIFORM, Taint::join)
     }
 
-    fn fact(&self, id: u32, block: usize) -> Fact {
-        let mut fact = self.stored_value(id).fact();
+    fn value_state(&self, id: u32, block: usize) -> ValueState {
+        let mut state = self.stored_value(id).state();
         let temporal = self.temporal(id, block);
         if temporal != Taint::UNIFORM {
-            fact.taint = fact.taint.join(temporal);
+            state.taint = state.taint.join(temporal);
         }
-        fact
+        state
     }
 
     fn operand(&self, id: u32, block: usize) -> Taint {
-        self.fact(id, block).taint
+        self.value_state(id, block).taint
     }
 
     /// What `words`' id operands, in `block`, are together.
-    fn operands(&self, words: &[u32], block: usize) -> Fact {
+    fn operands(&self, words: &[u32], block: usize) -> ValueState {
         let shape = shape(words[0] & 0xffff).expect("an analysed program holds only instructions of a known shape");
-        shape.positions(words).map(|at| self.fact(words[at], block)).fold(Fact::default(), Fact::join)
+        shape.positions(words).map(|at| self.value_state(words[at], block)).fold(ValueState::default(), ValueState::join)
     }
 
     /// `pointer` addresses device memory the launch only reads: the
@@ -4469,7 +4469,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     /// The memory `pointer` addresses: wherever it is used, as where it
     /// points does not change with the iteration a loop leaves at.
     fn addressed(&self, pointer: u32) -> Reach {
-        self.stored_value(pointer).fact().provenance.attributed()
+        self.stored_value(pointer).state().provenance.attributed()
     }
 
     /// The shared memory (workgroup, written device) `words` stores to.
@@ -4517,14 +4517,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             // What memory shared between invocations keeps is a value read
             // back, whether or not anything is stored.
-            Place::Workgroup => Held::Whole(Fact {
+            Place::Workgroup => Held::Whole(ValueState {
                 taint: racing(WORKGROUP),
                 provenance: Provenance::PLAIN.join(seen(WORKGROUP).kept.provenance),
             }),
             Place::Device => match self.flow.program.argument_block(pointer)? {
                 // The argument block holds the buffers' addresses and the
                 // words; the tables, values every launch reads alike.
-                Some(provenance) => Held::Whole(Fact { taint: Taint::UNIFORM, provenance }),
+                Some(provenance) => Held::Whole(ValueState { taint: Taint::UNIFORM, provenance }),
                 // What memory the launch only reads by declaration holds
                 // addresses into such memory alone, and an address table
                 // into its port's bytes; any other memory's may point
@@ -4537,7 +4537,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     } else {
                         Provenance::loaded(addressed.holding())
                     };
-                    Held::Whole(Fact { taint: Taint::UNIFORM, provenance })
+                    Held::Whole(ValueState { taint: Taint::UNIFORM, provenance })
                 }
                 // Memory the launch writes is never read alike: nothing
                 // shows that no other workgroup stores the bytes read, and
@@ -4545,13 +4545,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 // stores derives from its own invocations' places, none the
                 // reader holds, so it adds the race alone; the reader's own
                 // workgroup's stores race as they do in workgroup memory.
-                None => Held::Whole(Fact {
+                None => Held::Whole(ValueState {
                     taint: racing(WRITTEN).join(Taint::DIVERGENT),
                     provenance: Provenance::loaded(Reach::ANYWHERE),
                 }),
             },
             Place::ReadOnly => Held::CONSTANT,
-            Place::BuiltIn(which) => Held::Whole(Fact::plain(built_in(which))),
+            Place::BuiltIn(which) => Held::Whole(ValueState::plain(built_in(which))),
         };
         Ok(held.joined(self.operand(pointer, block)))
     }
@@ -4559,9 +4559,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
     /// What the operands of `words`, in `block`, but the pointer it writes
     /// or reads through (its first id operand) are together: an atomic's
     /// value and scope, a cooperative-matrix store's object.
-    fn carried(&self, words: &[u32], block: usize) -> Fact {
+    fn carried(&self, words: &[u32], block: usize) -> ValueState {
         let shape = shape(words[0] & 0xffff).expect("an analysed program holds only instructions of a known shape");
-        shape.ids(words).into_iter().skip(1).map(|id| self.fact(id, block)).fold(Fact::default(), Fact::join)
+        shape.ids(words).into_iter().skip(1).map(|id| self.value_state(id, block)).fold(ValueState::default(), ValueState::join)
     }
 
     /// The pointer `words`, in `block`, stores through and the value it
@@ -4578,8 +4578,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             // what memory held there.
             _ => {
                 let content = match read_pointer(words) {
-                    Some(pointer) => self.read(pointer, block, memory)?.fact(),
-                    None => Fact::default(),
+                    Some(pointer) => self.read(pointer, block, memory)?.state(),
+                    None => ValueState::default(),
                 };
                 Held::Whole(self.carried(words, block).join(content))
             }
@@ -4664,9 +4664,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             OP_LOAD => self.read(words[3], block, memory)?,
             // An address and an offset (`Provenance::sum`).
             OP_I_ADD | OP_I_SUB => {
-                let first = self.fact(words[3], block);
-                let second = self.fact(words[4], block);
-                Held::Whole(Fact {
+                let first = self.value_state(words[3], block);
+                let second = self.value_state(words[4], block);
+                Held::Whole(ValueState {
                     taint: first.taint.join(second.taint),
                     provenance: first.provenance.sum(second.provenance),
                 })
@@ -4674,15 +4674,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             // A pointer into what its base pointer addresses: its element and
             // indices are offsets (`Provenance::indexed`).
             opcode if ACCESS_CHAINS.contains(&opcode) || ELEMENT_CHAINS.contains(&opcode) => {
-                let base = self.fact(words[3], block);
+                let base = self.value_state(words[3], block);
                 let mut taint = base.taint;
                 let mut provenance = base.provenance;
                 for &index in &words[4..] {
-                    let index = self.fact(index, block);
+                    let index = self.value_state(index, block);
                     taint = taint.join(index.taint);
                     provenance = provenance.indexed(index.provenance);
                 }
-                Held::Whole(Fact { taint, provenance })
+                Held::Whole(ValueState { taint, provenance })
             }
             // A variable's address is every invocation's own copy of it.
             OP_VARIABLE => Held::UNIFORM,
@@ -4695,7 +4695,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             // A copy holds its value, wherever invocations arrive from.
             OP_PHI if self.copies.contains_key(&words[2]) => self.value(self.copies[&words[2]], block),
             OP_PHI => {
-                let mut held = Held::Whole(Fact::of(self.join[block]));
+                let mut held = Held::Whole(ValueState::of(self.join[block]));
                 for (value, parent) in self.flow.program.incoming(words[2], block, &self.flow.successors) {
                     held.join(&self.value(value, parent));
                 }
@@ -4731,20 +4731,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
             // held, wherever the pointer points.
             opcode if atomic(opcode) || opcode == OP_COOPERATIVE_MATRIX_LOAD => {
                 let operands = self.operands(words, block);
-                let content = self.read(words[3], block, memory)?.fact();
+                let content = self.read(words[3], block, memory)?.state();
                 let own = if opcode == OP_COOPERATIVE_MATRIX_LOAD {
                     operands.taint.join(Taint::LANE)
                 } else {
                     Taint::DIVERGENT
                 };
-                Held::Whole(Fact {
+                Held::Whole(ValueState {
                     taint: operands.taint.join(content.taint).join(own),
                     provenance: content.provenance,
                 })
             }
             opcode => {
                 let operands = self.operands(words, block);
-                let whole = |taint: Taint| Held::Whole(Fact { taint, provenance: operands.provenance });
+                let whole = |taint: Taint| Held::Whole(ValueState { taint, provenance: operands.provenance });
                 let per_lane = operands.taint.join(Taint::LANE);
                 let gathered = operands.taint.gathered();
                 match subgroup_operation(opcode)
@@ -4768,7 +4768,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
         // A condition holds no address: one on an address carries its
         // divergence, but not the address.
-        Ok(if self.flow.program.booleans.contains(&words[1]) { Held::Whole(held.fact().condition()) } else { held })
+        Ok(if self.flow.program.booleans.contains(&words[1]) { Held::Whole(held.state().condition()) } else { held })
     }
 
     /// What `words`, at `at`, gives where it calls a summarised function, of
@@ -4787,7 +4787,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     /// Carry what values hold through the entry point under the current
-    /// control and memory facts; whether anything changed.
+    /// control and memory state; whether anything changed.
     fn propagate(&mut self) -> Result<bool, MalformedModule> {
         let program = self.flow.program;
         let mut changed_at_all = false;
@@ -4824,7 +4824,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    /// Where each fact of `risen`, first raised in the result of `words` at
+    /// Where each bit of `risen`, first raised in the result of `words` at
     /// `at`, comes from: where it was raised in the first operand that holds
     /// it (a phi's, arriving along an edge some invocation may take; a
     /// copy's, its value), or else this instruction, which raises it: a read
@@ -4843,11 +4843,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 shape.ids(words).iter().map(|id| (*id, block)).collect()
             }
         };
-        // A phi where invocations parted by control that holds the fact
+        // A phi where invocations parted by control that holds the bit
         // rejoin holds it by that control, whatever its operands hold: the
         // construct merging there.
-        let rejoined = |fact: Traced| {
-            let bit = Taint(fact.bit());
+        let rejoined = |traced: Traced| {
+            let bit = Taint(traced.bit());
             (opcode == OP_PHI && !self.copies.contains_key(&words[2]) && self.join[block].holds(bit))
                 .then(|| {
                     (0..self.constructs.len())
@@ -4857,17 +4857,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .map(Origin::Rejoined)
         };
         let mut origins = Origins::default();
-        for (origin, fact) in origins.iter_mut().zip(Traced::ALL).filter(|(_, fact)| risen & fact.bit() != 0) {
+        for (origin, traced) in origins.iter_mut().zip(Traced::ALL).filter(|(_, traced)| risen & traced.bit() != 0) {
             *origin = Some(
-                rejoined(fact)
-                    .or_else(|| operands.iter().find_map(|&(id, used)| self.origin(id, used, fact)))
+                rejoined(traced)
+                    .or_else(|| operands.iter().find_map(|&(id, used)| self.origin(id, used, traced)))
                     .unwrap_or_else(|| self.raised(words, at)),
             );
         }
         origins
     }
 
-    /// The origin of a fact the result of `words`, at `at`, raises itself: a
+    /// The origin of a bit the result of `words`, at `at`, raises itself: a
     /// read of shared memory with the store that may race it, where one may;
     /// else the instruction.
     fn raised(&self, words: &[u32], at: At) -> Origin {
@@ -4885,14 +4885,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    /// Where the fact `fact` of `id`, used in `block`, was raised, if `id`
+    /// Where the traced bit `traced` of `id`, used in `block`, was raised, if `id`
     /// holds it there: where its value first held it, or a loop it is
     /// carried out of.
-    fn origin(&self, id: u32, block: usize, fact: Traced) -> Option<Origin> {
-        let bit = Taint(fact.bit());
+    fn origin(&self, id: u32, block: usize, traced: Traced) -> Option<Origin> {
+        let bit = Taint(traced.bit());
         if let Some(slot) = self.flow.ids.get(id) {
             if self.values[slot].taint().holds(bit) {
-                return self.origins[slot][fact as usize];
+                return self.origins[slot][traced as usize];
             }
         }
         self.carried_out_of(id, block).find(|construct| self.construct[*construct].holds(bit)).map(Origin::Loop)
@@ -4961,7 +4961,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    /// Establish the control facts the current values give; whether any
+    /// Establish the control state the current values give; whether any
     /// rose.
     fn control(&mut self) -> bool {
         let program = self.flow.program;
@@ -5064,7 +5064,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     /// Establish what memory holds through the entry point under the current
-    /// values and control facts; whether anything rose.
+    /// values and control state; whether anything rose.
     fn memory(&mut self) -> Result<bool, MalformedModule> {
         let program = self.flow.program;
         let count = program.blocks.len();
@@ -5273,7 +5273,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     let Node::Phi(incoming) = &self.flow.nodes[phi] else {
                         unreachable!("a block's phis are phi nodes")
                     };
-                    let mut joined = Held::Whole(Fact::of(self.join[block]));
+                    let mut joined = Held::Whole(ValueState::of(self.join[block]));
                     for &(from, node) in incoming {
                         joined.join(&held[node].clone().joined(self.carried_out(node, from)));
                     }
@@ -5290,8 +5290,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         if self.flow.has_shared_stores && classes[block][position].is_some() {
                             let address = written_pointer(words)
                                 .expect("an instruction storing to shared memory stores through a pointer");
-                            let fact = value.fact().kept(self.operand(address, block));
-                            kept[block][position] = kept[block][position].join(fact);
+                            let kept_state = value.state().kept(self.operand(address, block));
+                            kept[block][position] = kept[block][position].join(kept_state);
                         }
                     }
                 }
@@ -5460,7 +5460,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     };
                     // An address leaves the registers and variables, where
                     // the analysis follows it, for no memory (`Provenance`).
-                    if common && value.fact().provenance.is_named() {
+                    if common && value.state().provenance.is_named() {
                         found.report(
                             "a store of a buffer's address, or of a value derived from one, to workgroup or device memory"
                                 .to_owned(),
@@ -5630,8 +5630,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if let Some((block, condition)) = self.steering(construct) {
             text += &format!(" steered by {}", self.named(condition));
             let taint = self.construct[construct];
-            let fact = if taint.varies() { Traced::Varies } else { Traced::Subgroup };
-            text += &self.traced_within(self.origin(condition, block, fact), "which differs", depth);
+            let traced = if taint.varies() { Traced::Varies } else { Traced::Subgroup };
+            text += &self.traced_within(self.origin(condition, block, traced), "which differs", depth);
         }
         text
     }

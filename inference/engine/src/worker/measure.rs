@@ -504,6 +504,52 @@ impl InProcessJobs {
     }
 }
 
+/// Measure `requests` (a load's) on the device of `charges`, which its
+/// points allocate through, in this process, as the
+/// measurement job measures them (`assessment::requests::measure`), each
+/// walk given the [`job_time`], into `store`, until no point is
+/// left expired: for a caller that holds the device already (a tool, or a
+/// tiered load's transfer-queue line before it streams). Why the walks
+/// could not run, or stopped before measuring the rest; a point left
+/// unrecorded otherwise is the caller's to report, from what is stored.
+pub fn measure_in_process(
+    charges: &seismic::Charges,
+    store: &dyn RecordStore<PointKey>,
+    requests: &[magnitude_executor::assessment::PointRequest],
+) -> Result<(), String> {
+    loop {
+        let mut measurer = Measurer::new(magnitude_executor::SEARCH_SETTINGS.error_rate, magnitude_executor::MIN_SAMPLE_SECONDS);
+        let deadline = requests::JobDeadlines::new(std::time::Instant::now(), job_time());
+        let (mut measured, mut failed, mut expired) = (false, false, false);
+        let walked = requests::measure(
+            &mut measurer,
+            charges,
+            store,
+            &magnitude_executor::assessment::Outstanding { standing: Vec::new(), loads: requests.to_vec() },
+            deadline,
+            &mut |_| Attempt::Proceed,
+            &mut |_, outcome| match outcome {
+                Outcome::Loaded(_) => {}
+                Outcome::Measured(_) | Outcome::Skipped(_) | Outcome::Unformed(_) => measured = true,
+                Outcome::Unmade(_) | Outcome::Failed(_) | Outcome::Store(_) => failed = true,
+                Outcome::Expired => expired = true,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(error) = walked.ended.into_iter().chain(walked.failures).next() {
+            return Err(error.to_string());
+        }
+        if !expired {
+            return Ok(());
+        }
+        // A point begun runs to its end, so a walk whose time ended having
+        // measured nothing never will.
+        if !measured {
+            return Err(format!("the measurement walk stopped: it measured nothing{}", if failed { " and failed" } else { "" }));
+        }
+    }
+}
+
 /// The measurement job's probing of the device alone, as a job probes before
 /// it measures ([`measure_machine`]): executor `executor` of the machine
 /// discovered with `paths` runs each of its probes the process's store

@@ -163,6 +163,12 @@ pub struct HistoryTables {
 /// `following_bank` and record the rows after `stop` on its tape. A
 /// successor is never the zero seed (bank 0), the slot's own bank, or another
 /// slot's successor.
+///
+/// A slot's last `front` rows are front rows, a pass's rows that only run
+/// ahead (`Rows`), such as a two-row decode pass's provisional row: they
+/// follow `stop` and are never accepted (only the slot's rows before them
+/// may be), and in the decode form they read only the experts their step
+/// holds. A slot has a committed row before its front rows (`stop` >= 1).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Slot {
     pub rows: Vec<Row>,
@@ -170,6 +176,7 @@ pub struct Slot {
     pub previous_tape: i32,
     pub following_bank: i32,
     pub stop: i32,
+    pub front: usize,
 }
 
 /// Fully padded logical row tables.
@@ -192,6 +199,8 @@ pub struct PackedRowTables {
     pub previous_tape: Vec<i32>,
     pub following_bank: Vec<i32>,
     pub stop: Vec<i32>,
+    /// Per row, whether it is a front row (`Slot::front`).
+    pub front: Vec<bool>,
     pub plane_base: Vec<i32>,
     pub out_rows: Vec<i32>,
     pub select_rows: Vec<i32>,
@@ -219,7 +228,8 @@ pub enum PackError {
         bank: i32,
         following_bank: i32,
     },
-    /// A negative read tape, or a publication point outside the slot's rows.
+    /// A negative read tape, or a publication point outside the slot's rows
+    /// before its front rows.
     InvalidRecurrentVersion {
         slot: usize,
         previous_tape: i32,
@@ -280,6 +290,16 @@ pub enum PackError {
     /// batch's step count.
     HeadSteps {
         slot: usize,
+    },
+    /// A front head slot that is not one committed row then its front rows,
+    /// each with a selection.
+    FrontSlot {
+        slot: usize,
+    },
+    /// A token row of the step queued behind a front batch that continues
+    /// no slot of it.
+    FrontContinuation {
+        row: usize,
     },
     EmptyVocabulary,
 }
@@ -361,6 +381,13 @@ impl fmt::Display for PackError {
                 f,
                 "head slot {slot} has a proposal or chained row count other than the batch's steps"
             ),
+            Self::FrontSlot { slot } => write!(
+                f,
+                "front head slot {slot} is not one committed row then its front rows, each with a selection"
+            ),
+            Self::FrontContinuation { row } => {
+                write!(f, "queued row {row} continues no slot of its front head batch")
+            }
             Self::EmptyVocabulary => f.write_str("vocabulary must contain at least one token"),
         }
     }
@@ -439,9 +466,11 @@ impl PackedRowTables {
                     following_bank: slot.following_bank,
                 });
             }
+            // A slot commits a nonempty prefix of its rows before its front
+            // rows: a front row runs ahead of a committed row, never alone.
+            let accepted = slot.rows.len().saturating_sub(slot.front);
             if slot.previous_tape < 0
-                || slot.stop < 1
-                || usize::try_from(slot.stop).is_ok_and(|stop| stop > slot.rows.len())
+                || !usize::try_from(slot.stop).is_ok_and(|stop| (1..=accepted).contains(&stop))
             {
                 return Err(PackError::InvalidRecurrentVersion {
                     slot: slot_index,
@@ -530,6 +559,7 @@ impl PackedRowTables {
             previous_tape: vec![0; padded_slots + 1],
             following_bank: vec![-1; padded_slots + 1],
             stop: vec![0; padded_slots + 1],
+            front: vec![false; m],
             plane_base: vec![0; padded_slots + 1],
             out_rows: Vec::new(),
             select_rows: Vec::new(),
@@ -565,6 +595,7 @@ impl PackedRowTables {
                 }
                 packed.row_slots[row_index] = as_i32(slot_index, "row slot")?;
                 packed.demand[row_index] = row.demand.bits();
+                packed.front[row_index] = offset + slot.front >= slot.rows.len();
 
                 if row
                     .demand
@@ -744,6 +775,7 @@ mod tests {
                 previous_tape: 2,
                 following_bank: 8,
                 stop: 1,
+                front: 0,
             },
             Slot {
                 rows: vec![row(4, Demand::LOGITS)],
@@ -751,6 +783,7 @@ mod tests {
                 previous_tape: 0,
                 following_bank: 10,
                 stop: 1,
+                front: 0,
             },
             Slot {
                 rows: vec![row(5, Demand::NONE), row(6, Demand::NONE)],
@@ -758,6 +791,7 @@ mod tests {
                 previous_tape: 0,
                 following_bank: 12,
                 stop: 2,
+                front: 0,
             },
         ];
         let packed = PackedRowTables::pack(&slots, 33, LIMITS).unwrap();
@@ -819,6 +853,7 @@ mod tests {
             previous_tape: 0,
             following_bank: 1,
             stop: 3,
+            front: 0,
         }];
         let packed = PackedRowTables::pack(&slots, 33, LIMITS).unwrap();
         assert_eq!(packed.histories.len(), 2);
@@ -871,6 +906,7 @@ mod tests {
                 previous_tape: 0,
                 following_bank: 1,
                 stop: 1,
+                front: 0,
             }],
             33,
             LIMITS,
@@ -902,6 +938,7 @@ mod tests {
                     previous_tape: 0,
                     following_bank: 1,
                     stop: 1,
+                    front: 0,
                 }],
                 32,
                 LIMITS
@@ -918,6 +955,7 @@ mod tests {
                     previous_tape: 0,
                     following_bank: 1,
                     stop: 1,
+                    front: 0,
                 }],
                 32,
                 LIMITS
@@ -933,6 +971,7 @@ mod tests {
                     previous_tape: 0,
                     following_bank: 1,
                     stop: 1,
+                    front: 0,
                 }],
                 32,
                 LIMITS
@@ -951,6 +990,7 @@ mod tests {
                         previous_tape: 0,
                         following_bank: 1,
                         stop: 1,
+                        front: 0,
                     }],
                     32,
                     LIMITS
@@ -971,6 +1011,7 @@ mod tests {
                 previous_tape: 0,
                 following_bank: 1,
                 stop: 1,
+                front: 0,
             }],
             32,
             LIMITS,
@@ -1025,6 +1066,7 @@ mod tests {
                         previous_tape: 0,
                         following_bank,
                         stop: 1,
+                        front: 0,
                     })
                     .collect::<Vec<_>>(),
                 32,
@@ -1055,6 +1097,7 @@ mod tests {
                     previous_tape,
                     following_bank: 1,
                     stop,
+                    front: 0,
                 }],
                 32,
                 LIMITS,

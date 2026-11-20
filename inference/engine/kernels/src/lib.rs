@@ -8,27 +8,63 @@
 
 include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
 
-/// Words of an expert-streaming list of `entries` entries (`routed_copy`,
-/// `routed_seed_commit`): the sequence and count,
-/// then each entry's from and to words. Entry `entries` begins there.
-pub fn list_extent(entries: u64) -> u64 {
-    constants::LIST_ENTRIES + constants::LIST_ENTRY_WORDS * entries
+/// The threadgroups of a decode landing launch (`routed_land`) as the grid
+/// word its route writes while it lands (`resolve`'s `land_groups`):
+/// streaming_words.seismic's LAND_THREADGROUPS, which every backend's
+/// declaration calls, where it binds staging records (`staged`, V > 0: the
+/// bank places) or none (the host tier places).
+pub fn land_groups(staged: bool) -> i32 {
+    const fn word(staged: bool) -> i32 {
+        let groups = constants::LAND_THREADGROUPS(staged as u64);
+        assert!(groups <= i32::MAX as u64, "a grid word holds the landing groups");
+        groups as i32
+    }
+    const GROUPS: [i32; 2] = [word(false), word(true)];
+    GROUPS[staged as usize]
 }
 
-/// Words of a landing list of `entries` entries (`routed_land`,
-/// `routed_round`; streaming_words.seismic's landing list): the head (the
-/// step's low word, the count landed), then each entry's from, to and DONE
-/// words. Entry `entries` begins there.
-pub fn landing_extent(entries: u64) -> u64 {
-    constants::LANDING_ENTRIES + constants::LANDING_ENTRY_WORDS * entries
+/// A decode step's words (`routed_step`'s `step` and `sequence`): the u64
+/// `sequence` as its pair (STEP_LOW, STEP_HIGH), and the rows of the step
+/// that are front rows as STEP_FRONT's bits (bit r: row r).
+pub fn step_words(sequence: u64, front: u32) -> [i32; constants::STEP_WORDS as usize] {
+    let mut words = [0; constants::STEP_WORDS as usize];
+    words[constants::STEP_LOW as usize] = sequence as u32 as i32;
+    words[constants::STEP_HIGH as usize] = (sequence >> 32) as u32 as i32;
+    words[constants::STEP_FRONT as usize] = front as i32;
+    words
 }
 
-/// The blocks of a list's whole launch grid, LIST_GROUPS by LIST_ROWS
-/// (streaming_words.seismic's list grid): a copy within device memory's,
-/// which its host writes as the grid's first word (`routed_list_grid`). A
-/// copy over the link takes fewer.
+/// Front row `row`'s field of a step's STEP_GUESSES word (`routed_step`;
+/// a ring's RING_GUESSES, streaming_words.seismic's STEP_GUESS_BITS from
+/// STEP_GUESS_SHIFT(row)): the kind word of the guess it ran on
+/// (guess.seismic's GUESS_CHAINED, GUESS_HEAD), 0 for a row that is no
+/// front row.
+pub fn guess_kind(word: i32, row: usize) -> i32 {
+    assert!(row < constants::VERIFY_ROWS as usize, "a front row is below VERIFY_ROWS");
+    (word >> constants::STEP_GUESS_SHIFT(row as u64)) & ((1 << constants::STEP_GUESS_BITS) - 1)
+}
+
+/// The STEP_GUESSES word of front rows `rows`, each a (row, kind word) of a
+/// front row and the kind of the guess it runs on: what `routed_step` writes
+/// of them. Panics on a row at or past VERIFY_ROWS, row 0 (no front row
+/// precedes its exact row) or a word no guess kind's, which no field holds.
+pub fn step_guesses(rows: impl IntoIterator<Item = (usize, i32)>) -> i32 {
+    rows.into_iter().fold(0, |word, (row, kind)| {
+        assert!(row > 0 && row < constants::VERIFY_ROWS as usize, "front row {row} is past row 0 and below VERIFY_ROWS");
+        assert!(
+            [constants::GUESS_CHAINED, constants::GUESS_HEAD].contains(&(kind as u64)),
+            "{kind} is no guess kind's word"
+        );
+        word | kind << constants::STEP_GUESS_SHIFT(row as u64)
+    })
+}
+
+/// The blocks of a list's whole launch grid (streaming_words.seismic's
+/// LIST_BLOCKS, every backend's `routed_copy` bound): a copy within device
+/// memory's, which its host writes as the grid's first word
+/// (`routed_list_grid`). A copy over the link takes fewer.
 pub const LIST_BLOCKS: u32 = {
-    let blocks = constants::LIST_GROUPS * constants::LIST_ROWS;
+    let blocks = constants::LIST_BLOCKS();
     assert!(blocks <= i32::MAX as u64, "a grid word holds a list's blocks");
     blocks as u32
 };
@@ -51,6 +87,11 @@ pub fn source_words(records: &[i32], sites: &[i32]) -> Vec<i32> {
 // window's round-0 lane: SCRATCH_STAGED, then SCRATCH_FOLLOWED), and a
 // scratch lane is SCRATCH_SLOT words: the slot's words and its payload, even.
 const _: () = {
+    assert!(constants::STEP_GUESS_SHIFT(constants::VERIFY_ROWS) <= 32, "a step's STEP_GUESSES word holds a kind field per front row");
+    assert!(
+        constants::GUESS_CHAINED < 1 << constants::STEP_GUESS_BITS && constants::GUESS_HEAD < 1 << constants::STEP_GUESS_BITS,
+        "every guess kind's word fits a STEP_GUESSES field"
+    );
     assert!(constants::SITE_COUNT == constants::SLOT_PAYLOAD, "a site request's count is its payload's first word");
     assert!(constants::FILE_COUNT == constants::SLOT_PAYLOAD, "a file request's count is its payload's first word");
     assert!(constants::SCRATCH_STAGED == constants::SLOT_PAYLOAD, "a scratch window's count is its payload's first word");
@@ -94,25 +135,20 @@ impl SlotTable {
     /// The site kind's table (`site[FLIGHT, R]`), its requests of at most
     /// `choices` entries: SITE_COUNT, then the entries.
     pub fn site(slots: u64, choices: u64) -> Self {
-        Self::new(slots, 1, constants::SITE_ENTRIES - constants::SLOT_PAYLOAD + constants::SITE_ENTRY_WORDS * choices)
+        Self::new(slots, 1, constants::SITE_ENTRY(choices) - constants::SLOT_PAYLOAD)
     }
 
     /// The file kind's table (`file[FLIGHT, FW]`) of `choices` choices:
     /// FILE_COUNT, then each choice's entry, its word and its record.
     pub fn file(slots: u64, choices: u64) -> Self {
-        Self::new(slots, 1, constants::FILE_ENTRIES - constants::SLOT_PAYLOAD + constants::FILE_ENTRY_WORDS * choices)
-    }
-
-    /// The first word of choice `choice`'s entry in a file request.
-    pub fn file_entry(choice: u64) -> u64 {
-        constants::FILE_ENTRIES + constants::FILE_ENTRY_WORDS * choice
+        Self::new(slots, 1, constants::FILE_ENTRY(choices) - constants::SLOT_PAYLOAD)
     }
 
     /// The scratch kind's table (`scratch[FLIGHT, SCRATCH_SLOT LANES]`) of
     /// `rounds` round lanes across the windows (`P * RW`): the request's lane
     /// (SCRATCH_ASK), then each window's round lanes.
     pub fn scratch(slots: u64, rounds: u64) -> Self {
-        Self::new(slots, constants::SCRATCH_ROUND + rounds, SCRATCH_PAYLOAD)
+        Self::new(slots, constants::ROUND_LANE(rounds), SCRATCH_PAYLOAD)
     }
 
     /// Its slots, `FLIGHT`.

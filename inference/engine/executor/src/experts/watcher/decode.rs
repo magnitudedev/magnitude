@@ -34,7 +34,7 @@ use crate::experts::landing::{Answer, Source};
 use crate::experts::staging::{Staged, StagingPool};
 use crate::experts::{ExchangeTable, Words};
 use crate::planning::RegionWords;
-use magnitude_kernels::{SlotTable, constants};
+use magnitude_kernels::constants;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -195,7 +195,7 @@ impl Look {
         let mut absent: Vec<usize> = Vec::new();
         let mut choices = Vec::with_capacity(count);
         for choice in 0..count {
-            let entry = SlotTable::file_entry(choice as u64);
+            let entry = constants::FILE_ENTRY(choice as u64);
             let word = file.load(sequence, 0, entry + constants::FILE_CHOICE);
             // No record is the step's until its landing writes it
             // (`parked_reads`).
@@ -235,23 +235,30 @@ impl Look {
         let read = (!claimed.is_empty()).then(|| {
             let reading = claimed.len() as i64;
             seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("decided"), sequence, (layer as i64, reading, 0));
-            let (submitted, want) = (Instant::now(), seismic_io::Want::now());
+            let submitted = Instant::now();
             let landings = claimed
                 .into_iter()
-                .map(|(expert, record)| {
-                    let posting = prefetch::post(&self.table, self.table.reads(layer, expert, record), want);
-                    if let Ok(posting) = &posting {
-                        for request in posting.ticket.requests() {
-                            seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), request, (layer as i64, sequence as i64, reading));
-                        }
-                    }
-                    (expert, record, posting)
-                })
+                .map(|(expert, record)| (expert, record, read_demand(&self.table, (layer, expert), record, sequence, reading)))
                 .collect();
             PostedRead { landings, submitted }
         });
         Posted { sequence, layer, noticed, choices, absent, read }
     }
+}
+
+/// Post a read of `staged` into staging record `record` at demand, for
+/// step `sequence`'s request: the one way a request reads its own miss, as
+/// the look posts it (`reading`, the reads it posted together) and as a miss
+/// that waited for records is read (`reading` -1). A read ahead the request
+/// finds is the ledger's to hasten (`Prefetch::want`).
+fn read_demand(table: &ReadTable, (layer, expert): Staged, record: u32, sequence: Step, reading: i64) -> Result<Posting, String> {
+    let posting = prefetch::post(table, table.reads(layer, expert, record), seismic_io::Want::now());
+    if let Ok(posting) = &posting {
+        for request in posting.ticket.requests() {
+            seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), request, (layer as i64, sequence as i64, reading));
+        }
+    }
+    posting
 }
 
 /// How a request's absent expert lands: read now, the look's posted read
@@ -516,10 +523,13 @@ impl Decode {
                     progressed = true;
                     continue;
                 }
-                // A landing of it is in flight, hastened to demand: it
-                // lands it, or fails and lacks it again.
+                // A landing of it is in flight, hastened to demand as the
+                // ledger orders it (one may have begun since its request
+                // was served, the cover's): it lands it, or fails and lacks
+                // it again.
                 Located::Landing => {
-                    prefetch.hasten(staged);
+                    let at = waits.at;
+                    prefetch.want(core, shared, at, &[expert]);
                     index += 1;
                     continue;
                 }
@@ -563,11 +573,8 @@ impl Decode {
                 crate::experts::landing::LandingAccount::add(&shared.landings.waited, waits.named.elapsed());
             }
             let naming = Naming { layer, sequence: waits.at.point.sequence, named: waits.named };
-            match prefetch::post(&core.table, core.table.reads(layer, expert, record), seismic_io::Want::now()) {
+            match read_demand(&core.table, staged, record, naming.sequence, -1) {
                 Ok(posting) => {
-                    for request in posting.ticket.requests() {
-                        seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), request, (layer as i64, naming.sequence as i64, -1));
-                    }
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("plan"), naming.sequence, (layer as i64, expert as i64, 5));
                     prefetch::account(&[&posting], naming, None, shared);
                     let named = Named { expert, posting, staged: record, grant, rows: waits.rows, answer: waits.answer };
@@ -654,11 +661,11 @@ impl Decode {
                         core.directory.answer(layer, HostRecord(tier), point);
                         (Plan::Unread(Unread::Kept(tier)), None)
                     }
-                    // A landing of it is in flight, whoever's (a hint's, the
-                    // cover's, another request's): it waits for it, hastened
-                    // to demand.
-                    Located::Landing => match prefetch.hasten(staged) {
-                        Some(Reading::Hint(issued)) => {
+                    // A landing of it is in flight, whoever's (a read ahead's,
+                    // the cover's, another request's): it waits for it,
+                    // hastened to demand ([`Prefetch::want`], below).
+                    Located::Landing => match prefetch.reading(staged) {
+                        Some(Reading::Predicted(issued)) => {
                             taken_from(issued);
                             (Plan::Unread(Unread::Reading), Some(Anticipation::Reading))
                         }
@@ -683,6 +690,9 @@ impl Decode {
             }
             plans.push((expert, plan));
         }
+        // Every absent expert is wanted now, certainly: the ledger hastens
+        // each read ahead it finds to demand.
+        prefetch.want(core, shared, at, &absent);
         // The posted reads' records, each claimed now (of a read the engine
         // took): a short tier leaves its landing waiting for one, its read
         // in flight (`Self::resume`).
@@ -693,18 +703,9 @@ impl Decode {
         });
         let short = read.as_ref().map_or(0, |(_, grants): &(PostedRead, Vec<Option<Grant>>)| grants.iter().filter(|grant| grant.is_none()).count());
         seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("claimed"), sequence, (layer as i64, read.as_ref().map_or(0, |(read, _)| read.landings.len()) as i64, short as i64));
-        // Its own hints hastened, the device is at this layer: the hints of
-        // layers it has begun or passed read nothing more. Cancelling them
-        // frees no record now (a cancelled read frees its own as it ends).
-        prefetch.cancel_passed(core, &shared.steps, Some((sequence, layer)));
-        // The next request's victims, prepared now its reads are in flight
-        // where this one took any or they are of an earlier step: a claim
-        // then takes the first still free, scanning nothing while its step
-        // waits. Twice a request's choices, as some are read by the step a
-        // claim parks or gone by then.
-        if read.is_some() {
+        let has_read = read.is_some();
+        if has_read {
             lead = Some(0);
-            core.directory.prepare_demand(layer, 2 * width as usize, sequence);
         }
         served.lead = lead;
         served.misses = served.missed.len() as u64;
@@ -772,6 +773,13 @@ impl Decode {
         // read now, its records free since.
         if waits {
             self.resume(Serving { core, prefetch, shared });
+        }
+        // Off the parked request's critical path (landings, answers and
+        // reads are now in flight): retire read-ahead interests of layers
+        // the device has reached and prepare victims for subsequent requests.
+        prefetch.pass(core, shared, Some((sequence, layer)));
+        if has_read {
+            core.directory.prepare_demand(layer, 2 * width as usize, sequence);
         }
     }
 }

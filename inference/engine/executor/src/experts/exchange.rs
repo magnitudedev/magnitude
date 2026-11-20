@@ -244,7 +244,7 @@ mod tests {
         let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let table = SlotTable::scratch(2, 2);
         let slots = ExchangeTable::new(Tensor::shared(&seismic::Charges::tally(&device), Element::i32(), &[table.words()]).unwrap(), table, &Pulse::new()).unwrap();
-        let lane = constants::SCRATCH_ROUND;
+        let lane = constants::ROUND_LANE(0);
         slots.request(5, lane);
         assert!(!slots.answered(5, lane));
         assert!(slots.answered(5, 0), "the request's lane is not requested");

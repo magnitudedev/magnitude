@@ -106,6 +106,7 @@ mod tests {
         let plain = Plain;
         assert_eq!(plain.identity(), "plain");
         assert_eq!(plain.proposals(), 0);
+        assert!(!plain.decodes_two_rows(), "plain decode runs no front pass");
         assert_eq!(
             plain.requires(),
             MethodRequirements {

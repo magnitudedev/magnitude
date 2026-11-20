@@ -26,6 +26,7 @@ common_chat_params common_chat_params_init_gigachat_v3(
     auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
     const auto *tool_call_start_prefix = "<|message_sep|>\n\nfunction call<|role_sep|>\n";
 
+    common_chat_apply_cached_parser(tmpl, inputs, "", data, [&](common_chat_params & data) {
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto ret = p.eps();
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
@@ -73,5 +74,6 @@ common_chat_params common_chat_params_init_gigachat_v3(
             {COMMON_GRAMMAR_TRIGGER_TYPE_WORD, tool_call_start_prefix}
         };
     }
+    });
     return data;
 }

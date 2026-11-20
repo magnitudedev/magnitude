@@ -214,6 +214,12 @@ impl Drop for Ticket {
 }
 
 impl Ticket {
+    /// An empty ticket with no requests.
+    #[cfg(test)]
+    pub(super) fn empty() -> Self {
+        Self { requests: Vec::new() }
+    }
+
     /// The outcome, waiting for it until `deadline`; `None` while a read
     /// runs. The first failed read is its outcome.
     pub fn wait_until(&self, deadline: Instant) -> Option<Outcome> {
@@ -284,6 +290,11 @@ impl Ticket {
     /// earliest.
     pub fn started(&self) -> Vec<std::sync::Arc<std::sync::OnceLock<Instant>>> {
         self.requests.iter().map(|(_, ending, _)| ending.started()).collect()
+    }
+
+    /// Whether a worker has begun reading any piece of the ticket.
+    pub fn begun(&self) -> bool {
+        self.requests.iter().any(|(_, ending, _)| ending.started().get().is_some())
     }
 
     /// Order the reads not yet taken by `want` from now

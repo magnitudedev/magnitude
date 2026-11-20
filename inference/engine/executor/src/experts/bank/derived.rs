@@ -87,52 +87,6 @@ impl BankShape {
     }
 }
 
-/// One step's working set of a bank, from its header's counts and the
-/// prompt's scratch the ledger grants: what a pooled bank's floor holds,
-/// once for the whole bank.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WorkingSet {
-    /// `K`: the experts a row selects.
-    selected: u64,
-    /// A decode step's parked layer: `min(VERIFY_ROWS · K, E)`, `E` the
-    /// widest layer's experts. The device runs in layer order, so one park
-    /// holds records at once, whichever layer.
-    decode: u64,
-    /// The prompt's scratch records a prompt group converts its rounds
-    /// through: never fewer than the decode set.
-    lent: u64,
-    /// The staging pools: one per routed tensor's stored form, each with
-    /// its own hint window.
-    staging_forms: u64,
-}
-
-impl WorkingSet {
-    /// The working set of a bank whose rows select `selected` of at most
-    /// `widest` experts a layer, in `staging_forms` stored forms, its
-    /// prompt's scratch `lent` records, raised to the decode set where
-    /// fewer: a prompt converts a layer in as many rounds as its scratch
-    /// takes, and the floor holds at least what a decode step needs.
-    pub fn new(selected: u64, widest: u64, lent: u64, staging_forms: u64) -> Self {
-        let decode = crate::planning::decode_set(selected, widest);
-        Self { selected, decode, lent: lent.max(decode), staging_forms }
-    }
-
-    /// The prompt's scratch records, at least the decode set.
-    pub fn lent(&self) -> u64 {
-        self.lent
-    }
-
-    /// The records the bank holds at its floor: the prompt's scratch, which
-    /// holds the decode step's parked layer too, beside every staging
-    /// pool's read-ahead landings (its hint window, `2K`: a read ahead holds
-    /// a staging record from its read to its landing and waits for one past
-    /// them, so a pool's window bounds its landings in flight however many
-    /// leads its routes predict).
-    pub fn floor_records(&self) -> u64 {
-        self.lent + 2 * self.selected * self.staging_forms
-    }
-}
-
 /// The most slots in `[from, to]` whose charge beyond `from`'s fits `room`,
 /// `charge` the bank's charge at a slot count (its resident charge, which
 /// rises in steps where a slot crosses its storage's granule, and never

@@ -190,10 +190,10 @@ async def measure(
                         f"response carries {len(reasoned)} characters of reasoning text "
                         "although the request disables thinking",
                     )
-                elif request.family in ("prose-continue", "prose-repeat", "prose-shift"):
+                elif request.key in ("repeat", "twist", "code"):
                     if calls or generated < 1:
                         raise ValueError(
-                            "prose response must report generated tokens and no tool calls"
+                            "text response must report generated tokens and no tool calls"
                         )
                     if not output.strip():
                         outcome, error = (
@@ -204,31 +204,31 @@ async def measure(
                         if generated != request.output_limit:
                             outcome, error = (
                                 "truncated",
-                                "context ended before the prose output budget",
+                                "context ended before the output budget",
                             )
                         else:
                             outcome = "valid"
                     elif finish == "stop":
                         outcome = "valid"
                     else:
-                        raise ValueError(f"unexpected prose finish reason: {finish}")
+                        raise ValueError(f"unexpected finish reason: {finish}")
                 elif finish == "length":
                     outcome, error = "truncated", "engine reached its output or context limit"
-                elif request.family in ("retrieval", "vision"):
+                elif request.key in ("retrieve", "vision"):
+                    # A vision case's answer is the image's values, checked as retrieved ones.
+                    kind = request.key
                     if finish != "stop" or calls:
-                        raise ValueError(
-                            f"{request.family} response must finish with stop and no tool calls"
-                        )
+                        raise ValueError(f"{kind} response must finish with stop and no tool calls")
                     if evidence["usage"]["completion_tokens"] < 1:
-                        raise ValueError(f"{request.family} response must report generated tokens")
-                    retrieval = answers.retrieval(request.generation.expected, output)
+                        raise ValueError(f"{kind} response must report generated tokens")
+                    retrieval = answers.retrieve(request.generation.expected, output)
                     outcome = "valid" if retrieval.exact_match else "invalid"
                     error = (
                         None
                         if retrieval.exact_match
-                        else f"{request.family} answer does not match expected values"
+                        else f"{kind} answer does not match expected values"
                     )
-                elif request.family == "tools":
+                elif request.key == "tools":
                     if finish not in ("stop", "tool_calls"):
                         raise ValueError(f"unexpected finish reason: {finish}")
                     if any(not call["id"] or not call["name"] for call in calls.values()):
@@ -244,7 +244,7 @@ async def measure(
                     )
                     outcome = "invalid" if error else "valid"
                 else:
-                    raise ValueError(f"the bench does not serve {request.family} fixtures")
+                    raise ValueError(f"the bench does not check {request.key} answers")
     except asyncio.CancelledError:
         outcome, error = "cancelled", "request cancelled"
         if cancelled:

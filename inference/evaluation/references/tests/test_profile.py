@@ -25,6 +25,6 @@ def test_a_profiled_build_reports_each_batch_and_computes_the_same_logits(tmp_pa
     lines = [json.loads(line) for line in capsys.readouterr().err.splitlines() if line.startswith('{"profile"')]
     assert lines and all(line["wall_s"] >= 0 and line["dequantize_thread_s"] > 0 and line["read_thread_s"] >= 0
                          for line in lines)
-    assert sum(line["fixtures"] for line in lines) == len(FIXTURES)
+    assert sum(line["sessions"] for line in lines) == len(FIXTURES)
     (_, plain), (_, profiled) = (read_logits(tmp_path / name, "logits") for name in ("plain", "profiled"))
     assert np.array_equal(plain, profiled)

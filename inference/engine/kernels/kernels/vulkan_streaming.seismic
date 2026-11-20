@@ -35,7 +35,7 @@ native routed_hint_route for vulkan from "vulkan/routed_hint_route.comp":
         threadgroups (1, AHEAD, 1)
         unless (next_policy[POLICY_RESOLVED])
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (8 * VERIFY_ROWS * K)
+        shared_bytes (12 * VERIFY_ROWS * K)
 
 native routed_select_streamed for vulkan from "vulkan/routed_select_streamed.comp":
     static (H, E, K, ES, TM)
@@ -63,7 +63,7 @@ native routed_hint_select for vulkan from "vulkan/routed_hint_select.comp":
         threadgroups (1, AHEAD, 1)
         unless (next_policy[POLICY_RESOLVED])
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (8 * VERIFY_ROWS * K)
+        shared_bytes (12 * VERIFY_ROWS * K)
 
 native routed_step for vulkan from "vulkan/routed_step.comp":
     launch routed_step:
@@ -75,7 +75,7 @@ native routed_step for vulkan from "vulkan/routed_step.comp":
 native routed_copy for vulkan from "vulkan/routed_copy.comp":
     records (source, destination)
     launch routed_copy:
-        threadgroups (LIST_GROUPS, LIST_ROWS, 1)
+        threadgroups (LIST_BLOCKS(), 1, 1)
         grid (grid)
         threads_per_threadgroup (LIST_THREADS, 1, 1)
         shared_bytes (4 * (LIST_GROUP_CHUNK + LIST_CHUNK * LIST_ENTRY_WORDS))
@@ -112,7 +112,7 @@ native routed_round for vulkan from "vulkan/routed_round.comp":
     launch routed_round:
         threadgroups (LAND_GROUPS, 1, 1)
         grid (grid)
-        threads_per_threadgroup (256, 1, 1)
+        threads_per_threadgroup (WINDOW_THREADS, 1, 1)
         shared_bytes (LAND_WINDOW_AT + max(packed(UG), max(packed(UU), packed(UD))) * WINDOW_BYTES)
 
 native routed_scratch_grids for vulkan from "vulkan/routed_scratch_grids.comp":
@@ -133,14 +133,16 @@ native routed_scratch_grids for vulkan from "vulkan/routed_scratch_grids.comp":
 # Vulkan fixes group memory when the kernel is prepared, before V is
 # known, so a layer the host tier places (V = 0, one workgroup that only
 # sources) reserves the window too.
+# Its threadgroups are LAND_THREADGROUPS, which its route writes.
 native routed_land for vulkan from "vulkan/routed_land.comp":
     static (K)
     records (staging_gate, staging_up, staging_down, gate, up, down)
     scratch counters bytes (4 * (LAND_ITEMS + L)) sync
     launch routed_land:
-        threadgroups (1 + min(V, 1) * (LAND_GROUPS - 1), 1, 1)
+        threadgroups (LAND_THREADGROUPS(min(V, 1)), 1, 1)
+        grid (grid)
         unless (policy[POLICY_RESOLVED])
-        threads_per_threadgroup (256, 1, 1)
+        threads_per_threadgroup (WINDOW_THREADS, 1, 1)
         shared_bytes (LAND_WINDOW_AT + max(packed(UG), max(packed(UU), packed(UD))) * WINDOW_BYTES)
 
 # One workgroup reads the list's count into its group memory, then commits.

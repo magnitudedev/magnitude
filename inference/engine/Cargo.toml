@@ -17,6 +17,7 @@ magnitude-scheduler = { path = "scheduler" }
 magnitude-templates = { path = "templates" }
 magnitude-batching = { path = "batching" }
 magnitude-family-contracts = { path = "families/contracts" }
+magnitude-cost-model = { path = "cost-model" }
 magnitude-executor = { path = "executor" }
 magnitude-family-registry = { path = "families/registry" }
 magnitude-family-qwen35 = { path = "families/qwen35" }
@@ -31,6 +32,7 @@ sha2 = "=0.11.0"
 tokio = { version = "=1.53.0", features = ["rt", "sync", "macros", "time"] }
 seismic.workspace = true
 seismic-io.workspace = true
+seismic-threads.workspace = true
 opentelemetry = "0.33.0"
 opentelemetry_sdk = "0.33.0"
 opentelemetry-otlp = { version = "0.33.0", features = ["http-json", "reqwest"] }

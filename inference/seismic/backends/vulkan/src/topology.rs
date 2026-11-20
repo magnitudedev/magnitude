@@ -4,8 +4,8 @@
 use crate::DeviceHandle;
 use seismic_lang::registry::BackendName;
 use seismic_topology::{
-    Diagnostic, DiagnosticSource, ExecutorKind, HostReads, KindMemory, KindReport, Reach, VulkanHeap,
-    VulkanMemory, VulkanReport,
+    Diagnostic, DiagnosticSource, ExecutorKind, HostNode, HostReads, KindMemory, KindReport,
+    PciLocation, Reach, VulkanHeap, VulkanMemory, VulkanReport,
 };
 
 /// The kinds of `layout`: each memory type a kind on its heap, which the
@@ -30,9 +30,9 @@ fn layout_kinds(layout: &crate::MemoryLayout) -> Vec<KindReport> {
         .collect()
 }
 
-/// The kinds `facts` allocates.
-pub(crate) fn kinds(facts: &crate::Facts) -> Vec<KindReport> {
-    layout_kinds(&facts.memory)
+/// The kinds `info` allocates.
+pub(crate) fn kinds(info: &crate::DeviceInfo) -> Vec<KindReport> {
+    layout_kinds(&info.memory)
 }
 
 /// `layout`'s heaps as its report states them.
@@ -41,8 +41,11 @@ fn heaps(layout: &crate::MemoryLayout) -> Vec<VulkanHeap> {
 }
 
 /// Every Vulkan device's report, with its handle, which status samples
-/// read; why none can be enumerated, as `diagnostics`.
-pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<(VulkanReport, DeviceHandle)> {
+/// read, and its PCI bus location when reported; why none can be enumerated,
+/// as `diagnostics`.
+pub fn describe(
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<(VulkanReport, DeviceHandle, Option<PciLocation>)> {
     match crate::discover() {
         Err(error) => {
             diagnostics.push(Diagnostic {
@@ -57,7 +60,13 @@ pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<(VulkanReport, DeviceH
             }
             descriptions
                 .iter()
-                .map(|description| (vulkan_report(description), description.handle.clone()))
+                .map(|description| {
+                    (
+                        vulkan_report(description),
+                        description.handle.clone(),
+                        description.info.pci,
+                    )
+                })
                 .collect()
         }
     }
@@ -65,7 +74,7 @@ pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<(VulkanReport, DeviceH
 
 /// The Vulkan backend's description of one device.
 fn vulkan_report(description: &crate::Description) -> VulkanReport {
-    let device = &description.facts;
+    let device = &description.info;
     let kind = match device.device_type {
         crate::DeviceType::Cpu => ExecutorKind::Cpu,
         crate::DeviceType::Integrated => ExecutorKind::IntegratedGpu,
@@ -85,6 +94,7 @@ fn vulkan_report(description: &crate::Description) -> VulkanReport {
         ),
         max_allocation: device.limits.max_allocation_bytes,
         least_object: crate::memory::least_object(device),
+        host_node: HostNode::Any,
         memory: VulkanMemory {
             luid: device.luid,
             heaps: heaps(&device.memory),

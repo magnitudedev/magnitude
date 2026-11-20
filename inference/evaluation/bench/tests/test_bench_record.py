@@ -51,7 +51,8 @@ def row(outcome="valid", draft=(10, 7), engine="magnitude"):
     return {
         "target": engine, "block": 0, "phase": "measured", "section": "context",
         "checkpoint": 16384, "concurrency": 1, "session": "context-t16384-c1",
-        "fixture_id": "tools/x", "timing_basis": "native-model-service",
+        "template": "tools:16k", "lane": 0, "prompt_sha256": None,
+        "timing_basis": "native-model-service",
         "observation": observation,
     }
 

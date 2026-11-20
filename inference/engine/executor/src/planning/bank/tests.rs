@@ -140,6 +140,7 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
                     experts: experts(layers.len()),
                     resident: form.each(|_| Ok::<_, ()>(resident())).unwrap(),
                     hinted: Vec::new(),
+                    shared_down: None,
                 });
             }
             BankGroup {
@@ -167,8 +168,21 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
         flights: FlightDepth::PIPELINED,
         tables: Vec::new(),
         sites: BankSites::Unadmitted,
+        paths: BankPaths::Priced { line: LINE, records: PATHS },
+        recording: false,
     }
 }
+
+/// The path records the fixtures' banks are priced at (`PathRecords::of`,
+/// as a settle prices them): 16 records in flight, and as many free beside
+/// the device's reads.
+const PATHS: magnitude_cost_model::PathRecords = magnitude_cost_model::PathRecords { ahead: 16, reserve: 16 };
+
+/// The fixtures' stored read line.
+const LINE: magnitude_cost_model::ReadLine = match magnitude_cost_model::ReadLine::new(100e-6, 1. / 2e9) {
+    Ok(line) => line,
+    Err(_) => panic!("a fixture's line"),
+};
 
 /// `plan` with its structure changed by `change`, and that structure's
 /// lending.
@@ -205,8 +219,8 @@ fn beside(plan: ExpertBankPlan, host: HostTier) -> ExpertBankPlan {
 /// across a link no step takes a bank record, so each group holds one
 /// record and the floor is no slot; on
 /// unified memory each group holds one decode launch's distinct experts
-/// (`VERIFY_ROWS · K`, at most a layer's experts) beside the landing
-/// reserve (`VERIFY_ROWS · K + 2K`), and the floor is the most slots
+/// (`VERIFY_ROWS · K`, at most a layer's experts) beside the tier's
+/// reserve, its priced path's, and the floor is the most slots
 /// within them. A group commits its least records at every slots up to
 /// the floor, its record regions so committed, and no other group more
 /// for it.
@@ -215,9 +229,8 @@ fn the_minimum_is_what_progress_holds_at_once() {
     let linked = beside(bank(&[37, 3], 0), HostTier::Linked);
     let unified = beside(bank(&[37, 3], 1), HostTier::Unified(Parking::InKernels));
     let request = (VERIFY_ROWS * 8).min(256);
-    // The tier's reserve: the reads ahead's, a record per hint staging
-    // record (a demand reclaims at its park).
-    let reserve = 2 * 8;
+    // The tier's reserve: its priced path's (a demand reclaims at its park).
+    let reserve = PATHS.reserve;
     assert_eq!((request, reserve, linked.tier_reserve()), (64, 16, 16));
     for group in 0..2 {
         for plan in [&linked, &unified] {
@@ -391,10 +404,10 @@ fn a_banks_counts_are_its_plans_derivations_at_every_count() {
 /// one slot, a tier of the decode's saturation in host slots holds every
 /// miss, and the step costs what serving them from it does, the CPU and
 /// the link bounded together by the host memory they read
-/// ([`crate::assessment::StepInputs`]).
+/// ([`magnitude_cost_model::StepInputs`]).
 #[test]
 fn a_tiered_records_host_held_misses_are_priced_as_served() {
-    use crate::assessment::{DecodePrice, ExpertLines, FormSeconds, HeldSlots, StreamedLayers};
+    use magnitude_cost_model::{DecodePrice, ExpertLines, FormSeconds, HeldSlots, StreamedLayers};
     let lines = ExpertLines::reference(1_000_000);
     let layers = StreamedLayers::new(vec![4], 4, std::sync::Arc::from([lines]));
     let decode = crate::domain::fixtures::misses_at(3, 100);
@@ -512,10 +525,10 @@ fn the_demand_reserve_follows_where_the_device_parks() {
     assert_eq!(beside(bank(&[37, 3], 0), HostTier::Linked).demand_records(), 8);
     let words = |(_, extents): (seismic::Element, Vec<u64>)| extents.iter().product::<u64>();
     for layer in [0, 39] {
-        assert_eq!(words(kernels.part_shape(layer, BankPart::LandingList).unwrap()), magnitude_kernels::landing_extent(kernels.choices()));
+        assert_eq!(words(kernels.part_shape(layer, BankPart::LandingList).unwrap()), magnitude_kernels::constants::LANDING_ENTRY(kernels.choices()));
         for round in 0..kernels.rounds() {
             let list = kernels.part_shape(layer, BankPart::RoundList { round: round as u8 }).unwrap();
-            assert_eq!(words(list), magnitude_kernels::landing_extent(kernels.round_records()));
+            assert_eq!(words(list), magnitude_kernels::constants::LANDING_ENTRY(kernels.round_records()));
         }
     }
 }
@@ -1182,13 +1195,13 @@ fn every_byte_the_bank_demands_has_its_owner() {
 #[test]
 fn scratch_rounds_deliver_every_expert() {
     let plan = bank(&[4], 64);
-    assert_eq!(plan.staging_records(), 8 + 2 * 8);
+    assert_eq!(plan.staging_records(), 8 + PATHS.ahead);
     assert_eq!(plan.round_records(), 32);
     assert_eq!(plan.rounds(), 8);
     let table = plan.binding(0).unwrap().words.scratch();
-    assert_eq!(table.lanes(), constants::SCRATCH_ROUND + 8);
+    assert_eq!(table.lanes(), constants::ROUND_LANE(8));
     assert_eq!(table.width(), constants::SCRATCH_SLOT);
-    assert_eq!(table.lane(1, constants::SCRATCH_ROUND + 7), (table.lanes() + constants::SCRATCH_ROUND + 7) * table.width());
+    assert_eq!(table.lane(1, constants::ROUND_LANE(7)), (table.lanes() + constants::ROUND_LANE(7)) * table.width());
 }
 
 /// Every placed part's instances begin at whole u64s at any count of
@@ -1249,7 +1262,7 @@ fn windowed_scratch_bounds_lending_and_layout() {
     assert_eq!(full.window_rounds(), widest.div_ceil(round));
     assert_eq!(full.rounds(), full.window_rounds());
     assert_eq!(full.layer_window(0), widest);
-    assert_eq!(full.expert_list_words(), list_extent(widest));
+    assert_eq!(full.expert_list_words(), constants::LIST_ENTRY(widest));
     assert_eq!(windowed(&full, widest).unwrap(), full);
 
     assert!(windowed(&full, round - 1).is_err());
@@ -1263,7 +1276,7 @@ fn windowed_scratch_bounds_lending_and_layout() {
     assert_eq!(win.window_rounds(), 1);
     assert_eq!(win.rounds(), p);
     assert_eq!(win.layer_window(0), w);
-    assert_eq!(win.expert_list_words(), list_extent(w));
+    assert_eq!(win.expert_list_words(), constants::LIST_ENTRY(w));
     assert!(win.prompt_records(0) < full.prompt_records(0));
     assert!(win.least_records(0) < full.least_records(0));
     assert!(win.lent(0) < full.lent(0));
@@ -1279,4 +1292,70 @@ fn windowed_scratch_bounds_lending_and_layout() {
     assert_eq!(layout.load.window, vec![BankAllocation::Device { element: Element::i32(), extents: vec![1] }; p as usize]);
     assert_eq!(layout.layers[0].windows, vec![BankAllocation::Words { element: Element::i32(), extents: vec![widest] }; p as usize]);
     assert_eq!(layout.layers[0].rounds.len(), win.rounds() as usize);
+}
+
+/// A bank's staging and its tier's reserve are its priced path's records
+/// (`ExpertBankPlan::paths`): staging the demand reserve and the moves in
+/// flight, a step's landings its choices and those moves, the tier's
+/// reserve the path's free records, which the one store holds beside every
+/// expert. Unpriced, a bank reads nothing ahead: staging holds demand
+/// alone and the tier keeps nothing free.
+#[test]
+fn a_banks_staging_and_reserve_are_its_priced_paths() {
+    let priced = |plan: ExpertBankPlan, paths| ExpertBankPlan { paths, ..plan };
+    let paths = BankPaths::Priced { line: LINE, records: magnitude_cost_model::PathRecords { ahead: 5, reserve: 23 } };
+    for host in [HostTier::Linked, HostTier::Unified(Parking::InKernels)] {
+        let plan = priced(beside(bank(&[4], 64), host), paths);
+        assert_eq!(plan.staging_records(), plan.demand_records() + 5, "{host:?}");
+        assert_eq!(plan.landing_records(), plan.choices() + 5, "{host:?}");
+        assert_eq!(plan.tier_reserve(), 23, "{host:?}");
+        let unpriced = priced(plan.clone(), BankPaths::Unpriced);
+        assert_eq!((unpriced.staging_records(), unpriced.tier_reserve()), (plan.demand_records(), 0), "{host:?}");
+    }
+    let unified = priced(beside(bank(&[4], 64), HostTier::Unified(Parking::InKernels)), paths);
+    assert_eq!(unified.records(0), (4 * 256 + 23).max(unified.least_records(0)), "the one store holds the reserve beside every expert");
+}
+
+/// Two streamed fused layers that share an expert record group, expert count,
+/// and site status, but differ in `SharedDown` quant, produce distinct
+/// `routed_output` `Kind`s and therefore must get distinct `RoutedKind`s so
+/// `Census::new` does not panic.
+#[test]
+fn layers_with_different_shared_down_quants_get_distinct_routed_kinds_in_census() {
+    use magnitude_cost_model::{Census, Kind, LaunchCounts, LayerCall, RoutedCall};
+    use seismic::measure::pricing::{Bytes, Format, Work};
+
+    let mut plan = bank(&[2], 64);
+    let mut layers: Vec<BankLayer> = plan.layers().to_vec();
+    let q4 = Element::stored("q4k", Layout::Rows16).unwrap();
+    let q6 = Element::stored("q6k", Layout::Rows16).unwrap();
+    layers[0].shared_down = Some((q4, 1024, vec![64, 64]));
+    layers[1].shared_down = Some((q6, 1536, vec![64, 64]));
+    plan.structured = conveyor::Structured::new(
+        plan.choices(),
+        HostTier::Linked,
+        plan.groups().to_vec(),
+        BankLayers::new(layers).unwrap(),
+        None,
+    )
+    .unwrap();
+
+    let kinds = plan.routed_kinds();
+    assert_ne!(kinds[0], kinds[1], "distinct SharedDown quants must yield distinct RoutedKinds");
+
+    let decode_rows = 1u64;
+    let call = |format: &'static str, bytes: u64, layer: usize| {
+        (
+            Kind {
+                work: Work {
+                    weights: vec![Bytes { format: Format(format), bytes }],
+                    ..Work::default()
+                },
+                launches: LaunchCounts::new(vec![Ok(1); decode_rows as usize]),
+            },
+            Some(LayerCall::Routed(RoutedCall { kind: kinds[layer], layer })),
+        )
+    };
+    let census = Census::new([call("q4k", 1024, 0), call("q6k", 1536, 1)], 0, decode_rows);
+    assert_eq!(census.kinds().len(), 2);
 }

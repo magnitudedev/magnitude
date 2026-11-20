@@ -152,7 +152,7 @@ def test_a_build_is_judged_against_the_storage_resolution_bar(tmp_path, rendered
     assert all(draw["positions"] == near["build"]["positions"] and draw["median_kl"] > 0 for draw in bar["draws"])
     assert bar["rows"] == {"judgeable": near["build"]["positions"], "unjudgeable": 0}
     assert bar["within"] is True and bar["over"] == [] and bar["ratio"]["max"] < 4 / 64 * 1.5
-    assert set(bar["worst"]) == {"fixture_id", "position"}
+    assert set(bar["worst"]) == {"template", "lane", "position"}
     far = judged(16, "far")
     assert far["resolution"]["within"] is False and far["resolution"]["over"]
     assert len(calls) == 3  # the reference and the two draws, each built once on the CPU
@@ -181,7 +181,7 @@ def _within(exact, draws, build):
     entropy = quality.entropy(exact)
     perturbed = np.stack([quality.compare_rows(exact, draw)[0] for draw in draws])
     kl_build, agree = quality.compare_rows(exact, build)
-    rows = [{"fixture_id": "f", "position": position} for position in range(len(exact))]
+    rows = [{"template": "t", "lane": 0, "position": position} for position in range(len(exact))]
     return kl.within_resolution(rows, entropy, VOCABULARY, perturbed, kl_build, agree)
 
 
@@ -198,7 +198,7 @@ def test_a_build_at_four_times_a_draw_s_kl_is_within_the_bar():
 def test_one_row_over_its_bar_fails_the_build_and_is_listed():
     """The bar is each row's 64 times the draws' largest KL. A build within it at every row passes; one row past it
     fails the build, and each row over is listed by identity with its ratio and whether its top-1 flipped."""
-    rows = [{"fixture_id": "f", "position": position} for position in range(10)]
+    rows = [{"template": "t", "lane": 0, "position": position} for position in range(10)]
     perturbed, entropy = np.full((3, 10), 1e-4) * np.linspace(0.5, 1.0, 10), np.ones(10)
     perturbed[0, :2] = 1e-3
     bar = 64 * perturbed.max(axis=0)
@@ -215,8 +215,8 @@ def test_one_row_over_its_bar_fails_the_build_and_is_listed():
     assert at["within"] is True and at["over"] == [] and at["ratio"]["max"] == 1.0
     past = build(2)
     assert past["within"] is False
-    assert past["over"] == [{"fixture_id": "f", "position": 8, "ratio": 2.0, "top1_flipped": False},
-                            {"fixture_id": "f", "position": 9, "ratio": 2.0, "top1_flipped": True}]
+    assert past["over"] == [{"template": "t", "lane": 0, "position": 8, "ratio": 2.0, "top1_flipped": False},
+                            {"template": "t", "lane": 0, "position": 9, "ratio": 2.0, "top1_flipped": True}]
 
 
 def test_a_uniform_guess_is_over_every_judgeable_bar():
@@ -241,7 +241,7 @@ def _rows_of(exact, size):
 
 
 def test_a_zero_bar_admits_only_a_zero_kl_and_no_judgeable_row_is_no_pass():
-    rows = [{"fixture_id": "f", "position": position} for position in range(2)]
+    rows = [{"template": "t", "lane": 0, "position": position} for position in range(2)]
     entropy, zero, agree = np.array([1.0, 1.0]), np.zeros(2), np.ones(2, dtype=bool)
     draws = np.zeros((3, 2))
     assert kl.within_resolution(rows, entropy, VOCABULARY, draws, zero, agree)["within"] is True

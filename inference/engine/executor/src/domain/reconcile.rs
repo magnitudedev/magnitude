@@ -27,7 +27,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             // A head commits exactly its entry rows; its chained proposal
             // rows never become visible.
             if decision.accepted_rows != pending.committed_rows {
-                let _ = self.abort(pending);
+                self.abort(pending)?;
                 return Err("head decision differs from its committed entry rows".into());
             }
             // A head that keeps no history committed nothing: the target
@@ -71,53 +71,88 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if decision.accepted_rows < pending.committed_rows
             || decision.accepted_rows > pending.rows()
         {
-            let _ = self.abort(pending);
+            self.abort(pending)?;
             return Err("accepted target prefix is outside the submitted row commitment".into());
         }
         let request = pending.request;
         // Its state is the outcome's alone until it reconciles, a chain it
         // carries with it: no other owner can hold it.
         assert!(
-            !self.target.contains_key(&request) && !(pending.primed.is_some() && self.head.contains_key(&request)),
+            !self.target.contains_key(&request)
+                && !((pending.primed.is_some() || matches!(pending.front, Some(FrontAdvance::Step(_))))
+                    && self.head.contains_key(&request)),
             "invariant violated: a reconciled request has another physical state owner"
         );
         let advance = pending.advance.take().expect("invariant violated: a target outcome owns no target advance");
-        // A prompt chunk commits whole, and its drafter entry with it.
-        if let Some(primed) = pending.primed.take() {
-            let rows = primed.rows();
-            match primed.commit(rows) {
-                Ok(
-                    OwnedAdvanceResolution::Aborted(state)
-                    | OwnedAdvanceResolution::Committed(state),
-                ) => {
-                    self.head.insert(request, state);
-                }
-                Err((state, error)) => {
-                    self.head.insert(request, state);
-                    self.abort_target(request, advance)?;
-                    return Err(error.into());
-                }
-            }
+        // How the guesses of a pass that ran rows ahead in a bank's step
+        // fared, which only a bank reading experts ahead follows, told
+        // before its state is published.
+        if let (Some(bank), Some(step)) = (self.family.expert_bank(), pending.awaited) {
+            bank.decided(step, request, &decision.ahead);
         }
-        match advance {
+        // The target commits the decision's rows first: the only commit a
+        // decision decides. A refusal leaves every head advance uncommitted,
+        // returned with it. A chain's chunk is accepted whole; a failure
+        // joining or concluding its chain is reported once the head advances
+        // committed, as they commit whatever its chain does.
+        let published = match advance {
             Advance::Step(advance) => match advance.commit(decision.accepted_rows) {
                 Ok(
                     OwnedAdvanceResolution::Aborted(state)
                     | OwnedAdvanceResolution::Committed(state),
                 ) => {
                     self.target.insert(request, state);
+                    Ok(())
                 }
                 Err((state, error)) => {
                     self.target.insert(request, state);
+                    self.return_head_advances(request, pending.primed.take(), pending.front.take());
                     return Err(error.into());
                 }
             },
             // A chain holds its chunks' rows until it concludes.
-            Advance::Opens { flight, first } => self.open_chain(request, flight, first)?,
-            Advance::Chained { flight, joined, chunk } => self.join_chain(request, flight, joined, chunk)?,
+            Advance::Opens { flight, first } => self.open_chain(request, flight, first),
+            Advance::Chained { flight, joined, chunk } => self.join_chain(request, flight, joined, chunk),
+        };
+        // Then the head advances commit what they always commit, whatever
+        // the decision: a prompt chunk's drafter entry its every row, and the
+        // front head launch behind a chained forward its one entry row (the
+        // closing chunk's following the drafter entry just committed). The
+        // target accepted at least its committed rows, so only a broken
+        // invariant refuses either.
+        let broken = |error: magnitude_state::Error| -> ! {
+            panic!("invariant violated: a head advance refused the commit its target's commit implies: {error}")
+        };
+        if let Some(primed) = pending.primed.take() {
+            let rows = primed.rows();
+            match primed.commit(rows) {
+                Ok(OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) => {
+                    self.head.insert(request, state);
+                }
+                Err((_, error)) => broken(error),
+            }
         }
+        if let Some(front) = pending.front.take() {
+            let front = match front {
+                FrontAdvance::Step(front) => front,
+                FrontAdvance::Entry(front) => {
+                    let state = self
+                        .head
+                        .remove(&request)
+                        .expect("invariant violated: a closing chunk's front head advance follows no drafter entry");
+                    front.attach(state).unwrap_or_else(|(_, error)| broken(error))
+                }
+            };
+            match front.commit(1) {
+                Ok(OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) => {
+                    self.head.insert(request, state);
+                }
+                Err((_, error)) => broken(error),
+            }
+        }
+        published?;
         let boundary = match &pending.outcome {
-            Outcome::Forward { rows } => rows
+            Outcome::Forward { rows, .. } => rows
                 .last()
                 .and_then(|row| row.features.as_ref())
                 .and_then(FeatureRef::boundary)
@@ -132,22 +167,27 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Cancellation while completion is already available makes no physical
-    /// successor visible and returns the original accepted sequence.
+    /// successor visible and returns the original accepted sequence. A pass
+    /// that ran rows ahead in a bank's step is discarded
+    /// (`ElasticBank::discarded`).
     pub fn abort(&mut self, pending: PendingOperationOutcome) -> Result<(), DomainError> {
         let conflicting_owner = match &pending.outcome {
             Outcome::Head { .. } => self.head.contains_key(&pending.request),
             Outcome::Forward { .. } | Outcome::WeightReadFailed(_) | Outcome::Interrupted { .. } => {
                 self.target.contains_key(&pending.request)
-                    || (pending.primed.is_some() && self.head.contains_key(&pending.request))
+                    || ((pending.primed.is_some() || matches!(pending.front, Some(FrontAdvance::Step(_))))
+                        && self.head.contains_key(&pending.request))
             }
             Outcome::Encode { .. } => false,
         };
         // Its state is the outcome's alone until it aborts, a chain it
         // carries with it: no other owner can hold it.
         assert!(!conflicting_owner, "invariant violated: an aborted request has another physical state owner");
-        if let Some(primed) = pending.primed {
-            self.head.insert(pending.request, primed.abort());
+        // No verdict will judge a pass that ran rows ahead in a bank's step.
+        if let (Some(bank), Some(step)) = (self.family.expert_bank(), pending.awaited) {
+            bank.discarded(step, pending.request);
         }
+        self.return_head_advances(pending.request, pending.primed, pending.front);
         let Some(advance) = pending.advance else {
             return Ok(());
         };
@@ -196,6 +236,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     false => Ok(()),
                 }
             }
+        }
+    }
+
+    /// Return `request`'s uncommitted head advances: its drafter entry
+    /// returns the head state it holds, and so does a front head advance
+    /// over it; the closing chunk's follows the drafter entry just returned,
+    /// and drops.
+    fn return_head_advances(&mut self, request: RequestId, primed: Option<OwnedStateAdvance>, front: Option<FrontAdvance>) {
+        if let Some(primed) = primed {
+            self.head.insert(request, primed.abort());
+        }
+        match front {
+            Some(FrontAdvance::Step(front)) => {
+                self.head.insert(request, front.abort());
+            }
+            Some(FrontAdvance::Entry(front)) => drop(front),
+            None => {}
         }
     }
 }

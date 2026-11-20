@@ -2,7 +2,7 @@
 //!
 //! A contract states what each agent may do with a buffer. [`place`] turns
 //! a buffer's contract and an executor's kinds into the kinds the buffer is
-//! allocated from, from facts alone: it never branches on a
+//! allocated from, from storage attributes alone: it never branches on a
 //! backend, vendor, driver or model, and reads no rate. It runs when a
 //! revision is built, and a backend runs it over its own kinds for the
 //! storage it allocates for itself.
