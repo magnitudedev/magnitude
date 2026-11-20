@@ -385,7 +385,10 @@ impl GgufGroup {
 
     #[must_use]
     pub fn size_bytes(&self) -> u64 {
-        self.files.iter().map(|file| file.size_bytes).sum()
+        self.files
+            .iter()
+            .map(|file| file.size_bytes)
+            .fold(0_u64, u64::saturating_add)
     }
 }
 
@@ -1605,5 +1608,16 @@ mod tests {
             resolve_split_groups(partition_ggufs(&ambiguous_files), &ambiguous_headers);
         assert_eq!(ambiguous.len(), 1); // only mmproj survives
         assert_eq!(ambiguous[0].primary().path, PathBuf::from("mmproj-BF16.gguf"));
+    }
+
+    #[test]
+    fn gguf_group_size_bytes_saturates_instead_of_overflowing() {
+        let group = GgufGroup {
+            files: vec![
+                gguf("shard-00001-of-00002.gguf", u64::MAX - 10),
+                gguf("shard-00002-of-00002.gguf", 100),
+            ],
+        };
+        assert_eq!(group.size_bytes(), u64::MAX);
     }
 }

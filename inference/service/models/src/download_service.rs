@@ -65,6 +65,26 @@ enum DownloadAttempt {
     },
 }
 
+impl DownloadAttempt {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Failed { .. } | Self::Cancelled { .. }
+        )
+    }
+}
+
+/// Applies a monotonic transition to a download attempt. Once an attempt reaches a terminal state
+/// (`Completed`, `Failed`, or `Cancelled`), all subsequent updates are ignored so stale stream
+/// events cannot regress a cancelled attempt back to `Downloading` or overwrite it with `Failed`.
+fn apply_attempt_transition(current: &mut DownloadAttempt, next: DownloadAttempt) -> bool {
+    if current.is_terminal() {
+        return false;
+    }
+    *current = next;
+    true
+}
+
 /// Maximum number of terminal (completed/failed/cancelled) model downloads retained in memory.
 /// Active downloads and all attempt records referenced by retained downloads are always preserved.
 const MAX_RETAINED_TERMINAL_DOWNLOADS: usize = 128;
@@ -383,15 +403,19 @@ impl ManagedModelDownloads {
         prune_terminal_maps(&mut records, &mut downloads, MAX_RETAINED_TERMINAL_DOWNLOADS);
     }
 
-    fn update(&self, id: &DownloadAttemptId, attempt: DownloadAttempt) {
+    fn update(&self, id: &DownloadAttemptId, attempt: DownloadAttempt) -> bool {
         let Ok(mut records) = self.records.write() else {
-            return;
+            return false;
         };
-        if let Some(record) = records.get_mut(id) {
-            record.attempt = attempt;
-            drop(records);
-            self.invalidate();
+        let Some(record) = records.get_mut(id) else {
+            return false;
+        };
+        if !apply_attempt_transition(&mut record.attempt, attempt) {
+            return false;
         }
+        drop(records);
+        self.invalidate();
+        true
     }
 
     async fn consume(
@@ -462,16 +486,11 @@ impl ManagedModelDownloads {
                     failure: error,
                 },
             };
-            let is_terminal = matches!(
-                attempt,
-                DownloadAttempt::Completed { .. }
-                    | DownloadAttempt::Failed { .. }
-                    | DownloadAttempt::Cancelled { .. }
-            );
+            let is_terminal = attempt.is_terminal();
             (completed_bytes, total_bytes) = attempt_progress(&attempt);
             let failed = matches!(attempt, DownloadAttempt::Failed { .. });
-            self.update(&id, attempt);
-            if failed {
+            let applied = self.update(&id, attempt);
+            if failed && applied {
                 self.stop_failed_bundle_work(&id).await;
             }
             if is_terminal {
@@ -481,7 +500,7 @@ impl ManagedModelDownloads {
             }
         }
         if !terminal {
-            self.update(
+            if self.update(
                 &id,
                 DownloadAttempt::Failed {
                     id: id.clone(),
@@ -490,8 +509,9 @@ impl ManagedModelDownloads {
                     total_bytes,
                     failure: DownloadFailure::Interrupted,
                 },
-            );
-            self.stop_failed_bundle_work(&id).await;
+            ) {
+                self.stop_failed_bundle_work(&id).await;
+            }
             self.prune_terminal_records();
         }
     }
@@ -612,7 +632,11 @@ fn validate_bundle_repository_revisions(packages: &[ModelPackage]) -> Result<(),
 }
 
 fn package_bytes(package: &ModelPackage) -> u64 {
-    package.files.iter().map(|file| file.size_bytes).sum()
+    package
+        .files
+        .iter()
+        .map(|file| file.size_bytes)
+        .fold(0_u64, u64::saturating_add)
 }
 
 fn model_download(
@@ -627,7 +651,7 @@ fn model_download(
     let total_bytes = admitted
         .iter()
         .map(|attempt| package_bytes(&attempt.package))
-        .sum();
+        .fold(0_u64, u64::saturating_add);
     let attempted_bytes = admitted
         .iter()
         .map(|record| match &record.attempt {
@@ -643,7 +667,7 @@ fn model_download(
             } => *completed_bytes,
             DownloadAttempt::Pending { .. } => 0,
         })
-        .sum::<u64>();
+        .fold(0_u64, u64::saturating_add);
     let completed_bytes = attempted_bytes.min(total_bytes);
     let missing_attempt = admitted.len() != record.attempt_ids.len();
     let state = if record.cancelled {
@@ -935,7 +959,7 @@ impl ModelDownloads for ManagedModelDownloads {
                                 completed_bytes,
                                 total_bytes,
                             },
-                        )
+                        );
                     }
                     // The operation may have crossed its terminal boundary after the
                     // attempt snapshot above. The model-download cancellation is already
@@ -1423,5 +1447,120 @@ mod tests {
         assert!(downloads.contains_key(&ModelDownloadId("download_006".to_owned())));
         assert!(!records.contains_key(&DownloadAttemptId("attempt_005".to_owned())));
         assert!(records.contains_key(&DownloadAttemptId("attempt_006".to_owned())));
+    }
+
+    #[test]
+    fn terminal_attempt_states_never_regress_or_overwrite() {
+        let id = DownloadAttemptId("attempt_mono".to_owned());
+        let package_id = ModelPackageId("package_mono".to_owned());
+        let pending = DownloadAttempt::Pending {
+            id: id.clone(),
+            package_id: package_id.clone(),
+        };
+        let downloading = DownloadAttempt::Downloading {
+            id: id.clone(),
+            package_id: package_id.clone(),
+            stage: DownloadStage::Downloading,
+            completed_bytes: 5,
+            total_bytes: 10,
+            bytes_per_second: Some(100),
+        };
+        let cancelled = DownloadAttempt::Cancelled {
+            id: id.clone(),
+            package_id: package_id.clone(),
+            completed_bytes: 5,
+            total_bytes: 10,
+        };
+        let failed = DownloadAttempt::Failed {
+            id: id.clone(),
+            package_id: package_id.clone(),
+            completed_bytes: 5,
+            total_bytes: 10,
+            failure: DownloadFailure::Interrupted,
+        };
+        let completed = DownloadAttempt::Completed {
+            id: id.clone(),
+            package_id,
+        };
+
+        let mut attempt = pending.clone();
+        assert!(apply_attempt_transition(&mut attempt, downloading.clone()));
+        assert_eq!(attempt, downloading);
+
+        // Once cancelled, stale Downloading/Pending/Failed/Completed updates are ignored.
+        assert!(apply_attempt_transition(&mut attempt, cancelled.clone()));
+        assert_eq!(attempt, cancelled);
+        assert!(!apply_attempt_transition(&mut attempt, downloading.clone()));
+        assert!(!apply_attempt_transition(&mut attempt, pending.clone()));
+        assert!(!apply_attempt_transition(&mut attempt, failed.clone()));
+        assert!(!apply_attempt_transition(&mut attempt, completed.clone()));
+        assert_eq!(attempt, cancelled);
+
+        // Completed and Failed are also absorbing.
+        let mut completed_attempt = completed.clone();
+        assert!(!apply_attempt_transition(&mut completed_attempt, downloading.clone()));
+        assert!(!apply_attempt_transition(&mut completed_attempt, failed.clone()));
+        assert_eq!(completed_attempt, completed);
+
+        let mut failed_attempt = failed.clone();
+        assert!(!apply_attempt_transition(&mut failed_attempt, downloading));
+        assert!(!apply_attempt_transition(&mut failed_attempt, cancelled));
+        assert_eq!(failed_attempt, failed);
+    }
+
+    #[test]
+    fn model_download_byte_totals_saturate_instead_of_overflowing() {
+        let target = package("package_huge_a", u64::MAX - 10);
+        let draft = package("package_huge_b", 100);
+        let target_id = DownloadAttemptId("attempt_huge_a".to_owned());
+        let draft_id = DownloadAttemptId("attempt_huge_b".to_owned());
+        let attempts = BTreeMap::from([
+            (
+                target_id.clone(),
+                AttemptRecord {
+                    attempt: DownloadAttempt::Completed {
+                        id: target_id.clone(),
+                        package_id: target.id.clone(),
+                    },
+                    package: target.clone(),
+                    sequence: 1,
+                },
+            ),
+            (
+                draft_id.clone(),
+                AttemptRecord {
+                    attempt: DownloadAttempt::Downloading {
+                        id: draft_id.clone(),
+                        package_id: draft.id.clone(),
+                        stage: DownloadStage::Downloading,
+                        completed_bytes: 50,
+                        total_bytes: 100,
+                        bytes_per_second: None,
+                    },
+                    package: draft.clone(),
+                    sequence: 2,
+                },
+            ),
+        ]);
+        let record = DownloadRecord {
+            id: ModelDownloadId("model_download_huge".to_owned()),
+            bundle: paired_bundle(target, draft),
+            for_model: test_model(),
+            attempt_ids: vec![target_id, draft_id],
+            cancelled: false,
+            failure_acknowledged: false,
+            sequence: 1,
+        };
+
+        let projected = model_download(&record, &attempts);
+        assert_eq!(
+            projected.state,
+            ModelDownloadState::Downloading {
+                stage: DownloadStage::Downloading,
+                completed_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+                bytes_per_second: None,
+            }
+        );
     }
 }

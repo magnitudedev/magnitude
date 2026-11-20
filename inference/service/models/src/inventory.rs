@@ -440,6 +440,7 @@ pub struct ManagedModelStore {
     pub(crate) model_assessments:
         Arc<RwLock<BTreeMap<String, crate::cache::CachedModelAssessment>>>,
     pub(crate) catalog_affiliations: Arc<RwLock<CatalogAffiliations>>,
+    pub(crate) catalog_affiliations_persist: Arc<std::sync::Mutex<()>>,
     cache_evidence: Arc<RwLock<BTreeMap<InventoryEntryId, CacheEvidence>>>,
     ensure_gate: Arc<tokio::sync::Mutex<()>>,
     ensure_generation: Arc<AtomicU64>,
@@ -512,6 +513,7 @@ impl Clone for ManagedModelStore {
             installed_packages: Arc::clone(&self.installed_packages),
             model_assessments: Arc::clone(&self.model_assessments),
             catalog_affiliations: Arc::clone(&self.catalog_affiliations),
+            catalog_affiliations_persist: Arc::clone(&self.catalog_affiliations_persist),
             cache_evidence: Arc::clone(&self.cache_evidence),
             ensure_gate: Arc::clone(&self.ensure_gate),
             ensure_generation: Arc::clone(&self.ensure_generation),
@@ -728,6 +730,7 @@ impl ManagedModelStore {
                 installed_packages: Arc::new(RwLock::new(InstalledPackageSnapshot::default())),
                 model_assessments: Arc::new(RwLock::new(BTreeMap::new())),
                 catalog_affiliations: Arc::new(RwLock::new(catalog_affiliations)),
+                catalog_affiliations_persist: Arc::default(),
                 cache_evidence: Arc::new(RwLock::new(BTreeMap::new())),
                 ensure_gate: Arc::new(tokio::sync::Mutex::new(())),
                 ensure_generation: Arc::new(AtomicU64::new(0)),
@@ -1172,48 +1175,45 @@ impl ManagedModelStore {
                 })
             })
             .transpose()?;
-        let mut models = self
-            .models
-            .read()
-            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-            .clone();
-        let mut cache = self
-            .cache_evidence
-            .read()
-            .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))?
-            .clone();
-        models.insert(model.id.clone(), model.clone());
-        if let Some(evidence) = evidence {
-            cache.insert(model.id.clone(), evidence);
-        } else {
-            cache.remove(&model.id);
-        }
-        let unreadable_directories = self
-            .installed_packages
-            .read()
-            .map_err(|_| {
-                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
-            })?
-            .unreadable_directories
-            .clone();
-        let installed = self.build_installed_package_snapshot(&models, unreadable_directories)?;
+        let installed = {
+            let mut snapshot_models = self
+                .models
+                .read()
+                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+                .clone();
+            snapshot_models.insert(model.id.clone(), model.clone());
+            let unreadable_directories = self
+                .installed_packages
+                .read()
+                .map_err(|_| {
+                    InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+                })?
+                .unreadable_directories
+                .clone();
+            self.build_installed_package_snapshot(&snapshot_models, unreadable_directories)?
+        };
         persist_inventory_index(
             &self.cache,
             IndexChange::Published {
                 model: model.clone(),
-                evidence: cache.get(&model.id).cloned(),
+                evidence: evidence.clone(),
             },
         )
         .await;
-        *self
-            .models
+        self.models
             .write()
-            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))? = models;
-        *self
-            .cache_evidence
-            .write()
-            .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))? =
-            cache;
+            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+            .insert(model.id.clone(), model.clone());
+        {
+            let mut cache = self.cache_evidence.write().map_err(|_| {
+                InventoryError::Internal("inventory cache lock poisoned".to_owned())
+            })?;
+            if let Some(evidence) = evidence {
+                cache.insert(model.id.clone(), evidence);
+            } else {
+                cache.remove(&model.id);
+            }
+        }
         *self.installed_packages.write().map_err(|_| {
             InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
         })? = installed;
@@ -1229,43 +1229,34 @@ impl ManagedModelStore {
         ids: &[InventoryEntryId],
     ) -> Result<(), InventoryError> {
         let _guard = self.ensure_gate.lock().await;
-        let mut models = self
-            .models
-            .read()
-            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-            .clone();
-        let mut cache = self
-            .cache_evidence
-            .read()
-            .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))?
-            .clone();
         for id in ids {
-            models.remove(id);
-            cache.remove(id);
-        }
-        let mut installed = self
-            .installed_packages
-            .read()
-            .map_err(|_| {
-                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
-            })?
-            .clone();
-        for id in ids {
-            installed.records.remove(id);
             persist_inventory_index(&self.cache, IndexChange::Removed(id.clone())).await;
         }
-        *self
-            .models
-            .write()
-            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))? = models;
-        *self
-            .cache_evidence
-            .write()
-            .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))? =
-            cache;
-        *self.installed_packages.write().map_err(|_| {
-            InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
-        })? = installed;
+        {
+            let mut models = self
+                .models
+                .write()
+                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?;
+            for id in ids {
+                models.remove(id);
+            }
+        }
+        {
+            let mut cache = self.cache_evidence.write().map_err(|_| {
+                InventoryError::Internal("inventory cache lock poisoned".to_owned())
+            })?;
+            for id in ids {
+                cache.remove(id);
+            }
+        }
+        {
+            let mut installed = self.installed_packages.write().map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })?;
+            for id in ids {
+                installed.records.remove(id);
+            }
+        }
         self.ensure_generation.fetch_add(1, Ordering::Release);
         self.packages_revision.fetch_add(1, Ordering::Release);
         self.notify_installed_packages_changed();
@@ -1782,7 +1773,10 @@ fn scan_managed(
                         metadata: None,
                     },
                     location: ModelLocation::MagnitudeCache {
-                        total_bytes: components.iter().map(|item| item.size_bytes).sum(),
+                        total_bytes: components
+                            .iter()
+                            .map(|item| item.size_bytes)
+                            .fold(0_u64, u64::saturating_add),
                         components,
                         integrity: Integrity::Verified {
                             method: "catalog_content_identity".to_owned(),
@@ -1972,7 +1966,10 @@ fn append_discovered_groups(
                 metadata: None,
             },
             location: ModelLocation::MagnitudeCache {
-                total_bytes: components.iter().map(|item| item.size_bytes).sum(),
+                total_bytes: components
+                    .iter()
+                    .map(|item| item.size_bytes)
+                    .fold(0_u64, u64::saturating_add),
                 components,
                 integrity: Integrity::Unverified {
                     reason: "filesystem_discovery".to_owned(),
@@ -2070,7 +2067,10 @@ pub(crate) fn scan_hf_cache(
                         cache_root: snapshot.clone(),
                         repository: repository.clone(),
                         commit: commit.clone(),
-                        total_bytes: components.iter().map(|item| item.size_bytes).sum(),
+                        total_bytes: components
+                            .iter()
+                            .map(|item| item.size_bytes)
+                            .fold(0_u64, u64::saturating_add),
                         components,
                         integrity: Integrity::Unverified {
                             reason: "external_cache".to_owned(),
@@ -4504,5 +4504,82 @@ mod tests {
         let uncached = ManagedModelStore::open_unbounded(config).await.unwrap();
         uncached.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(uncached.list().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn complete_and_remove_published_models_preserve_concurrent_downloading_entries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let cache_root = temporary.path().join("cache");
+        let model_file = temporary.path().join("published.gguf");
+        write_minimal_gguf(&model_file);
+
+        let config = InventoryConfig::with_roots(store, cache_root).unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
+
+        let downloading_id = InventoryEntryId("mdl_downloading_concurrent".to_owned());
+        let downloading_model = InventoryModel {
+            id: downloading_id.clone(),
+            content_id: content_id(&[]),
+            created: 1,
+            name: "owner/concurrent".to_owned(),
+            supported_parameters: Vec::new(),
+            availability: ModelAvailability::Downloading {
+                operation_id: "op_1".to_owned(),
+                stage: magnitude_service_contracts::DownloadStage::Downloading,
+                completed_bytes: 5,
+                total_bytes: 10,
+                current_component: None,
+                started_at: 1,
+                updated_at: 1,
+            },
+            source: ModelSource::HuggingFace {
+                repository: "owner/concurrent".to_owned(),
+                requested_revision: "main".to_owned(),
+                commit: "abc123".to_owned(),
+                metadata: None,
+            },
+            location: ModelLocation::MagnitudeCache {
+                components: Vec::new(),
+                total_bytes: 10,
+                integrity: Integrity::Unverified {
+                    reason: "download_in_progress".to_owned(),
+                },
+            },
+            properties: InventoryProperties::Pending,
+            operations: Vec::new(),
+            updated_at: 1,
+        };
+        manager
+            .models
+            .write()
+            .unwrap()
+            .insert(downloading_id.clone(), downloading_model);
+
+        let published_id = manager
+            .register_active_model(&model_file, Some("published"))
+            .await
+            .unwrap();
+        {
+            let models = manager.models.read().unwrap();
+            assert!(models.contains_key(&published_id));
+            assert!(
+                models.contains_key(&downloading_id),
+                "complete_and_publish_model must not clobber unrelated entries"
+            );
+        }
+
+        manager
+            .remove_published_models(std::slice::from_ref(&published_id))
+            .await
+            .unwrap();
+        {
+            let models = manager.models.read().unwrap();
+            assert!(!models.contains_key(&published_id));
+            assert!(
+                models.contains_key(&downloading_id),
+                "remove_published_models must not clobber unrelated entries"
+            );
+        }
     }
 }

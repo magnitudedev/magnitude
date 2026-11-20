@@ -1364,7 +1364,7 @@ impl ModelContext<'_> {
             .iter()
             .chain(projector.iter())
             .map(|file| file.size_bytes)
-            .sum();
+            .fold(0_u64, u64::saturating_add);
         // Only a model that serves is enriched; one that can't serve has no drafter to await.
         let drafter_pending = (matches!(choice, DrafterChoice::Auto) && !enrichment_known
             || chosen_pending)

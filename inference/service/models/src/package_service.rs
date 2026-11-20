@@ -20,7 +20,6 @@ use magnitude_service_contracts::{
 use sha2::{Digest, Sha256};
 
 use crate::cache::{CachedModelAssessment, ModelIndexKind};
-use crate::catalog_affiliations::CatalogAffiliations;
 use crate::inventory::{
     InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, UnreadableDirectory,
     catalog_packages,
@@ -955,24 +954,63 @@ impl ManagedModelStore {
     }
 
     fn forget_catalog_package(&self, package: &ModelPackage) {
-        let Ok(mut affiliations) = self.catalog_affiliations.write() else {
-            tracing::warn!("catalog affiliation lock poisoned while forgetting a package");
-            return;
+        let changed = {
+            let Ok(mut affiliations) = self.catalog_affiliations.write() else {
+                tracing::warn!("catalog affiliation lock poisoned while forgetting a package");
+                return;
+            };
+            affiliations.forget_package(&package.id)
         };
-        if affiliations.forget_package(&package.id) {
-            self.persist_catalog_affiliations(&mut affiliations);
+        if changed {
+            self.persist_catalog_affiliations();
         }
     }
 
     /// Persist what this process changed of the catalog affiliations, and nothing when it changed
     /// nothing; a failure keeps the change for the next persist, at the latest the next inventory
     /// reconciliation's.
-    fn persist_catalog_affiliations(&self, affiliations: &mut CatalogAffiliations) {
-        if let Err(error) = affiliations.persist(&self.config.root) {
-            tracing::warn!(
-                %error,
-                "failed to persist catalog package affiliations; retrying on the next inventory reconciliation"
-            );
+    ///
+    /// Runs the cross-process lock and durable write outside `self.catalog_affiliations` so
+    /// readers never block on disk I/O, serialized across threads by
+    /// `self.catalog_affiliations_persist`.
+    fn persist_catalog_affiliations(&self) {
+        let Ok(_persist_guard) = self.catalog_affiliations_persist.lock() else {
+            tracing::warn!("catalog affiliation persist lock poisoned");
+            return;
+        };
+        let pending = {
+            let Ok(mut affiliations) = self.catalog_affiliations.write() else {
+                tracing::warn!("catalog affiliation lock poisoned while taking pending changes");
+                return;
+            };
+            affiliations.take_pending()
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        match pending.persist(&self.config.root) {
+            Ok(entries) => {
+                let Ok(mut affiliations) = self.catalog_affiliations.write() else {
+                    tracing::warn!(
+                        "catalog affiliation lock poisoned while applying persisted entries"
+                    );
+                    return;
+                };
+                affiliations.apply_persisted(entries);
+            }
+            Err(error) => {
+                if let Ok(mut affiliations) = self.catalog_affiliations.write() {
+                    affiliations.restore_pending(pending);
+                } else {
+                    tracing::warn!(
+                        "catalog affiliation lock poisoned while restoring pending changes"
+                    );
+                }
+                tracing::warn!(
+                    %error,
+                    "failed to persist catalog package affiliations; retrying on the next inventory reconciliation"
+                );
+            }
         }
     }
 
@@ -985,18 +1023,24 @@ impl ManagedModelStore {
         let ModelPackageSource::HuggingFace { repository, .. } = &package.source else {
             return;
         };
-        let Ok(mut affiliations) = self.catalog_affiliations.write() else {
-            tracing::warn!("catalog affiliation lock poisoned while recording installed package");
-            return;
+        let changed = {
+            let Ok(mut affiliations) = self.catalog_affiliations.write() else {
+                tracing::warn!(
+                    "catalog affiliation lock poisoned while recording installed package"
+                );
+                return;
+            };
+            affiliations.add(CatalogPackageAffiliation {
+                model_id: catalog_model.model_id.clone(),
+                variant_id: catalog_model.variant_id.clone(),
+                package_id: package.id.clone(),
+                repository: repository.clone(),
+                role,
+            })
         };
-        affiliations.add(CatalogPackageAffiliation {
-            model_id: catalog_model.model_id.clone(),
-            variant_id: catalog_model.variant_id.clone(),
-            package_id: package.id.clone(),
-            repository: repository.clone(),
-            role,
-        });
-        self.persist_catalog_affiliations(&mut affiliations);
+        if changed {
+            self.persist_catalog_affiliations();
+        }
     }
 
     pub(crate) fn inspect_package_from_resolved(
@@ -1137,11 +1181,7 @@ impl ManagedModelStore {
     }
 
     fn retry_catalog_affiliation_persistence(&self) {
-        let Ok(mut affiliations) = self.catalog_affiliations.write() else {
-            tracing::warn!("catalog affiliation lock poisoned while retrying persistence");
-            return;
-        };
-        self.persist_catalog_affiliations(&mut affiliations);
+        self.persist_catalog_affiliations();
     }
 
     #[must_use]

@@ -853,7 +853,10 @@ impl Quantization {
         // mixes keep some layers a step higher (a Q3_K_M's in Q4_K), but writers of other mixed
         // quantizations (Unsloth's dynamic ones) declare one type for every file, which a few of
         // its tensors use whatever the file mostly is. Otherwise the body's main type names it.
-        let total = bytes.values().map(|(_, bytes)| *bytes).sum::<u64>();
+        let total = bytes
+            .values()
+            .map(|(_, bytes)| *bytes)
+            .fold(0_u64, u64::saturating_add);
         let declared_bytes = bytes.get(&declared_type).map_or(0, |(_, bytes)| *bytes);
         if declared_bytes.saturating_mul(3) >= total {
             return Some(Self::Declared(file_type));

@@ -1102,13 +1102,13 @@ fn catalog_resolution<'a>(
             .iter()
             .filter(|file| !present_files.contains(&file.id))
             .map(|file| file.size_bytes)
-            .sum()
+            .fold(0_u64, u64::saturating_add)
     };
     let missing_bytes = desired_packages
         .iter()
         .filter(|(package, _)| missing(&package.id))
         .map(|(package, _)| download_bytes(package))
-        .sum::<u64>();
+        .fold(0_u64, u64::saturating_add);
     // A missing target whose weights are all here differs only in its projector: an image input update.
     let missing_parts = desired_packages
         .iter()
@@ -1364,7 +1364,11 @@ fn catalog_drafter(definition: &RecommendableModel) -> Option<CatalogDrafter> {
     Some(CatalogDrafter {
         method: method.clone(),
         repository: repository.clone(),
-        size_bytes: draft.files.iter().map(|file| file.size_bytes).sum(),
+        size_bytes: draft
+            .files
+            .iter()
+            .map(|file| file.size_bytes)
+            .fold(0_u64, u64::saturating_add),
     })
 }
 
@@ -1440,9 +1444,9 @@ fn installation(
                 .files
                 .iter()
                 .map(|file| file.size_bytes)
-                .sum::<u64>()
+                .fold(0_u64, u64::saturating_add)
         })
-        .sum();
+        .fold(0_u64, u64::saturating_add);
     let owned = selected_target.map_or_else(|| installed.to_vec(), |target| vec![target]);
     let origins = owned
         .iter()

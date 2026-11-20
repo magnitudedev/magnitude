@@ -117,7 +117,10 @@ fn push_external(
         location: ModelLocation::External {
             origin,
             root: root.to_path_buf(),
-            total_bytes: components.iter().map(|item| item.size_bytes).sum(),
+            total_bytes: components
+                .iter()
+                .map(|item| item.size_bytes)
+                .fold(0_u64, u64::saturating_add),
             components,
             integrity: Integrity::Unverified {
                 reason: "external_location".to_owned(),

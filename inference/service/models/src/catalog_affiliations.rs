@@ -17,15 +17,49 @@ use crate::catalog::{valid_identity_component, valid_variant_id};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CatalogAffiliations {
     entries: BTreeSet<CatalogPackageAffiliation>,
-    pending: Pending,
+    pending: PendingAffiliations,
 }
 
 /// What this process changed since its last persist: the packages it forgot, applied first, and
-/// the affiliations it added.
+/// the affiliations it added. Taken out of [`CatalogAffiliations`] so the cross-process lock and
+/// durable write can run without holding the in-memory `RwLock`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Pending {
+pub(crate) struct PendingAffiliations {
     forgotten: BTreeSet<ModelPackageId>,
     added: BTreeSet<CatalogPackageAffiliation>,
+}
+
+impl PendingAffiliations {
+    fn is_empty(&self) -> bool {
+        self.forgotten.is_empty() && self.added.is_empty()
+    }
+
+    /// Apply this pending delta to the on-disk file under its cross-process record lock and return
+    /// the resulting persisted entry set (including any changes made by other processes).
+    pub(crate) fn persist(
+        &self,
+        root: &Path,
+    ) -> std::io::Result<BTreeSet<CatalogPackageAffiliation>> {
+        let store = crate::store_fs::model_store(root).map_err(std::io::Error::other)?;
+        let record = store
+            .lock(Path::new(FILE_NAME))
+            .map_err(std::io::Error::other)?;
+        let mut entries = record
+            .read(MAX_FILE_BYTES)
+            .map_err(std::io::Error::other)?
+            .map(|bytes| decode(&bytes))
+            .unwrap_or_default();
+        entries.retain(|affiliation| !self.forgotten.contains(&affiliation.package_id));
+        entries.extend(self.added.iter().cloned());
+        let bytes = serde_json::to_vec_pretty(&StoredCatalogAffiliations {
+            affiliations: entries.iter().collect(),
+        })
+        .map_err(std::io::Error::other)?;
+        record
+            .write(&bytes, seismic_io::Durability::Durable)
+            .map_err(std::io::Error::other)?;
+        Ok(entries)
+    }
 }
 
 #[derive(Serialize)]
@@ -69,7 +103,7 @@ impl CatalogAffiliations {
         };
         Self {
             entries,
-            pending: Pending::default(),
+            pending: PendingAffiliations::default(),
         }
     }
 
@@ -100,26 +134,50 @@ impl CatalogAffiliations {
         true
     }
 
+    /// Takes the pending delta for an off-lock persist, returning `None` when nothing changed.
+    pub(crate) fn take_pending(&mut self) -> Option<PendingAffiliations> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.pending))
+    }
+
+    /// Merges the on-disk entries returned by [`PendingAffiliations::persist`] with any newer
+    /// mutations recorded while the persist ran off-lock.
+    pub(crate) fn apply_persisted(&mut self, mut entries: BTreeSet<CatalogPackageAffiliation>) {
+        entries.retain(|affiliation| !self.pending.forgotten.contains(&affiliation.package_id));
+        entries.extend(self.pending.added.iter().cloned());
+        self.entries = entries;
+    }
+
+    /// Restores a previously taken delta after a failed off-lock persist, preserving the causal
+    /// order `earlier` followed by any newer `self.pending` mutations.
+    pub(crate) fn restore_pending(&mut self, mut earlier: PendingAffiliations) {
+        earlier
+            .added
+            .retain(|affiliation| !self.pending.forgotten.contains(&affiliation.package_id));
+        self.pending.forgotten.extend(earlier.forgotten);
+        self.pending.added.extend(earlier.added);
+    }
+
     /// Apply what this process changed since its last persist to what the file holds, under the
     /// file's record lock, and hold what that leaves, every other process's changes among it. A
     /// failure keeps the change for the next persist.
+    #[cfg(test)]
     pub(crate) fn persist(&mut self, root: &Path) -> std::io::Result<()> {
-        if self.pending == Pending::default() {
+        let Some(pending) = self.take_pending() else {
             return Ok(());
+        };
+        match pending.persist(root) {
+            Ok(entries) => {
+                self.apply_persisted(entries);
+                Ok(())
+            }
+            Err(error) => {
+                self.restore_pending(pending);
+                Err(error)
+            }
         }
-        let store = crate::store_fs::model_store(root).map_err(std::io::Error::other)?;
-        let record = store.lock(Path::new(FILE_NAME)).map_err(std::io::Error::other)?;
-        let mut entries = record.read(MAX_FILE_BYTES).map_err(std::io::Error::other)?.map(|bytes| decode(&bytes)).unwrap_or_default();
-        entries.retain(|affiliation| !self.pending.forgotten.contains(&affiliation.package_id));
-        entries.extend(self.pending.added.iter().cloned());
-        let bytes = serde_json::to_vec_pretty(&StoredCatalogAffiliations {
-            affiliations: entries.iter().collect(),
-        })
-        .map_err(std::io::Error::other)?;
-        record.write(&bytes, seismic_io::Durability::Durable).map_err(std::io::Error::other)?;
-        self.entries = entries;
-        self.pending = Pending::default();
-        Ok(())
     }
 }
 
@@ -226,5 +284,41 @@ mod tests {
         affiliations.persist(root.path()).expect("persist");
         assert_eq!(affiliations.entries.len(), 2);
         assert_eq!(CatalogAffiliations::load(root.path()), affiliations);
+    }
+
+    #[test]
+    fn off_lock_persist_merges_concurrent_mutations_and_restores_deltas_on_failure() {
+        let root = tempfile::tempdir().expect("temporary store");
+        let mut affiliations = CatalogAffiliations::load(root.path());
+        assert!(affiliations.add(affiliation("in_flight")));
+        assert!(affiliations.add(affiliation("kept")));
+
+        // Simulate taking pending deltas under the lock, then mutating while off-lock.
+        let taken = affiliations.take_pending().expect("pending delta");
+        assert!(affiliations.forget_package(&ModelPackageId("in_flight".to_owned())));
+        assert!(affiliations.add(affiliation("concurrent_add")));
+
+        // Persist the taken delta off-lock and merge back.
+        let persisted = taken.persist(root.path()).expect("off-lock persist");
+        affiliations.apply_persisted(persisted);
+
+        let held = |affiliations: &CatalogAffiliations| {
+            affiliations
+                .entries()
+                .map(|entry| entry.package_id.0.clone())
+                .collect::<Vec<_>>()
+        };
+        // `in_flight` must stay forgotten in memory; `concurrent_add` and `kept` must be present.
+        assert_eq!(held(&affiliations), ["concurrent_add", "kept"]);
+
+        // Now simulate a failed off-lock persist of the remaining delta while another concurrent
+        // mutation arrives: `restore_pending` must preserve causal order so a later retry persists
+        // the exact combined state.
+        let taken_second = affiliations.take_pending().expect("second pending delta");
+        assert!(affiliations.forget_package(&ModelPackageId("concurrent_add".to_owned())));
+        affiliations.restore_pending(taken_second);
+        affiliations.persist(root.path()).expect("retry persist");
+        assert_eq!(held(&CatalogAffiliations::load(root.path())), ["kept"]);
+        assert_eq!(held(&affiliations), ["kept"]);
     }
 }

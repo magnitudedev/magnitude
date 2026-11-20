@@ -1306,7 +1306,7 @@ impl ManagedModelStore {
             total_bytes: components
                 .iter()
                 .map(|component| component.size_bytes)
-                .sum(),
+                .fold(0_u64, u64::saturating_add),
             integrity: Integrity::Verified {
                 method: "immutable_huggingface_revision_and_header_digest".to_owned(),
             },
