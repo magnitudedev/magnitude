@@ -2331,6 +2331,10 @@ impl TuningReport {
 }
 
 impl TuningObserver for TuningReport {
+    fn needs_receipts(&self) -> bool {
+        self.trace.is_some()
+    }
+
     fn event(&self, event: &TuningEvent) {
         if let Some(trace) = &self.trace {
             trace.event(event);

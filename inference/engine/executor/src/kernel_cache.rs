@@ -364,15 +364,18 @@ impl KernelCache {
     }
 
     /// The record of the unit stored under `key`, if its choice parses: the
-    /// choice, all a load decodes of it, and the evidence it names, taken
-    /// whole with it under the store's lock held shared, so the record is
-    /// one writer's and no remover touches it meanwhile. A choice without
-    /// its evidence is a store that broke its invariant, an error, not a
-    /// miss; so is a lock or a file that cannot be read.
+    /// choice, all a load decodes of it, and — when `need_evidence(&choice)`
+    /// holds — the evidence it names, taken whole with it under the store's
+    /// lock held shared, so the record is one writer's and no remover touches
+    /// it meanwhile. When `need_evidence(&choice)` is false, the evidence file
+    /// is not read from disk. A choice whose requested evidence is missing is
+    /// a store that broke its invariant, an error, not a miss; so is a lock or
+    /// a file that cannot be read.
     pub fn tuning<C: serde::de::DeserializeOwned>(
         &self,
         key: &TuningCacheKey,
-    ) -> Result<Option<(C, StoredEvidence)>, String> {
+        need_evidence: impl FnOnce(&C) -> bool,
+    ) -> Result<Option<(C, Option<StoredEvidence>)>, String> {
         let records = self.store.reading().map_err(|error| self.failed("cannot take its lock to read a record", error))?;
         let choice = Self::choice(key);
         let Some(entry) = records
@@ -382,6 +385,9 @@ impl KernelCache {
         else {
             return Ok(None);
         };
+        if !need_evidence(&entry.choice) {
+            return Ok(Some((entry.choice, None)));
+        }
         let path = Self::evidence_path(key, &entry.evidence);
         let bytes = records
             .read(&path, u64::MAX)
@@ -392,7 +398,7 @@ impl KernelCache {
                     self.root().join(&path).display()
                 )
             })?;
-        Ok(Some((entry.choice, StoredEvidence { path: self.root().join(path), bytes: bytes.into() })))
+        Ok(Some((entry.choice, Some(StoredEvidence { path: self.root().join(path), bytes: bytes.into() }))))
     }
 
     /// Store a unit's record under `key`: the `evidence` its search made,
@@ -497,7 +503,7 @@ mod tests {
         let key = TuningCacheKey::of("material");
         fs::create_dir_all(root.join(TUNING)).unwrap();
         fs::write(root.join(KernelCache::choice(&key)), b"{ not json").unwrap();
-        assert!(cache.tuning::<serde_json::Value>(&key).unwrap().is_none());
+        assert!(cache.tuning::<serde_json::Value>(&key, |_| true).unwrap().is_none());
         cache.store.writing().unwrap().write(&KernelCache::choice(&key), b"rewritten", Durability::Durable).unwrap();
         assert_eq!(fs::read(root.join(KernelCache::choice(&key))).unwrap(), b"rewritten");
         fs::remove_dir_all(root).unwrap();
@@ -571,13 +577,15 @@ mod tests {
         let cache = KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES).unwrap();
         let key = TuningCacheKey::of("material");
         cache.store_tuning(&key, &1u32, &result("first")).unwrap();
-        let (choice, taken) = cache.tuning::<u32>(&key).unwrap().unwrap();
+        let (choice, taken) = cache.tuning::<u32>(&key, |_| true).unwrap().unwrap();
+        let taken = taken.expect("evidence was requested");
         assert_eq!((choice, taken.read().unwrap()), (1, result("first")));
         cache.store_tuning(&key, &2u32, &result("replaced")).unwrap();
         assert_eq!(evidence_files(&root), 1, "the store removes what the replaced choice named");
         cache.store_tuning(&key, &3u32, &result("replaced")).unwrap();
         assert_eq!(evidence_files(&root), 1, "evidence stored again is the new choice's");
-        let (choice, evidence) = cache.tuning::<u32>(&key).unwrap().unwrap();
+        let (choice, evidence) = cache.tuning::<u32>(&key, |_| true).unwrap().unwrap();
+        let evidence = evidence.expect("evidence was requested");
         assert_eq!((choice, evidence.read().unwrap()), (3, result("replaced")));
         assert_eq!(taken.read().unwrap(), result("first"), "a record a load took needs no file");
         fs::remove_dir_all(root).unwrap();
@@ -609,12 +617,14 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(evidence_files(&root), 1);
-        let (choice, evidence) = cache.tuning::<u32>(&live).unwrap().expect("the live record stays");
-        assert_eq!((choice, evidence.read().unwrap()), (1, result("live")));
+        let (choice, evidence) = cache.tuning::<u32>(&live, |_| true).unwrap().expect("the live record stays");
+        assert_eq!((choice, evidence.unwrap().read().unwrap()), (1, result("live")));
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// A choice whose evidence is gone is a broken store, never a miss.
+    /// A choice whose evidence is gone is a broken store, never a miss, when
+    /// evidence is requested; when `need_evidence` returns false, the evidence
+    /// file is never read from disk.
     #[test]
     fn a_choice_without_its_evidence_is_an_invariant_violation() {
         let root = scratch("orphan");
@@ -622,7 +632,12 @@ mod tests {
         let key = TuningCacheKey::of("material");
         cache.store_tuning(&key, &1u32, &result("first")).unwrap();
         fs::remove_dir_all(root.join(EVIDENCE)).unwrap();
-        let broken = cache.tuning::<u32>(&key).unwrap_err();
+        let skipped = cache.tuning::<u32>(&key, |choice| {
+            assert_eq!(*choice, 1);
+            false
+        }).unwrap();
+        assert_eq!(skipped, Some((1, None)));
+        let broken = cache.tuning::<u32>(&key, |_| true).unwrap_err();
         assert!(broken.contains("invariant broken"), "{broken}");
         fs::remove_dir_all(root).unwrap();
     }
@@ -674,8 +689,8 @@ mod tests {
         let mut writers = [spawn(), spawn()];
         let mut read = 0u32;
         while writers.iter_mut().any(|writer| writer.try_wait().unwrap().is_none()) {
-            if let Some((choice, evidence)) = cache.tuning::<u32>(&key).expect("a choice read names evidence that reads") {
-                let evidence = evidence.read().expect("the evidence taken parses");
+            if let Some((choice, evidence)) = cache.tuning::<u32>(&key, |_| true).expect("a choice read names evidence that reads") {
+                let evidence = evidence.expect("evidence was requested").read().expect("the evidence taken parses");
                 assert_eq!(evidence.entry, choice.to_string(), "the evidence a choice names is its own");
                 read += 1;
             }
@@ -684,8 +699,8 @@ mod tests {
             assert!(writer.wait().unwrap().success(), "each writer ends whole");
         }
         assert!(read > 0, "the reader read while the writers wrote");
-        let (choice, evidence) = cache.tuning::<u32>(&key).unwrap().expect("a record remains");
-        assert_eq!(evidence.read().unwrap().entry, choice.to_string());
+        let (choice, evidence) = cache.tuning::<u32>(&key, |_| true).unwrap().expect("a record remains");
+        assert_eq!(evidence.unwrap().read().unwrap().entry, choice.to_string());
         assert_eq!(evidence_files(&root), 1, "no evidence outlives the choice that named it");
         fs::remove_dir_all(root).unwrap();
     }

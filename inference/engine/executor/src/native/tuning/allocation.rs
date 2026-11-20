@@ -229,13 +229,19 @@ pub(crate) enum HostRoom {
 
 impl HostRoom {
     /// Whether a piece taken to add `bytes` may start beside pieces in
-    /// flight taken to add `flying`.
-    fn admits(self, bytes: u64, flying: u64) -> bool {
+    /// flight taken to add `flying`, once `returned` host bytes are freed.
+    fn admits_with(self, bytes: u64, flying: u64, returned: u64) -> bool {
         match self {
             Self::Unbounded => true,
-            Self::Free(free) => bytes <= free.saturating_sub(flying),
-            Self::Exceeded => false,
+            Self::Free(free) => bytes <= free.saturating_add(returned).saturating_sub(flying),
+            Self::Exceeded => returned > 0,
         }
+    }
+
+    /// Whether a piece taken to add `bytes` may start beside pieces in
+    /// flight taken to add `flying`.
+    fn admits(self, bytes: u64, flying: u64) -> bool {
+        self.admits_with(bytes, flying, 0)
     }
 }
 
@@ -390,11 +396,11 @@ pub(crate) trait Unit {
     {
     }
     /// What the load holds beside the units' inputs that it builds again
-    /// when next needed, counted against [`Unit::free`]: the bytes dropping
-    /// it returns. One more entry in the account given up from
-    /// ([`Unit::returned`]), dropped only when what the units' give-ups
-    /// return falls short of the room a piece needs and it makes up the
-    /// rest, so a load that never needs it never builds it again.
+    /// when next needed: the host bytes dropping it returns. Where host RAM
+    /// is a domain apart ([`Unit::host_free`]), it relieves that host domain;
+    /// otherwise it relieves [`Unit::free`]. Dropped only when what the
+    /// units' give-ups return falls short of the room a piece needs and it
+    /// makes up the rest, so a load that never needs it never builds it again.
     fn spare(_context: &Self::Context) -> u64
     where
         Self: Sized,
@@ -406,6 +412,12 @@ pub(crate) trait Unit {
     where
         Self: Sized,
     {
+    }
+    /// The host bytes releasing this unit's resident inputs is taken to
+    /// return, where host RAM is a domain apart ([`Unit::host_free`]):
+    /// zero when the unit holds no inputs or its inputs hold no host RAM.
+    fn host_holding(&self, _context: &Self::Context) -> u64 {
+        0
     }
     /// What the unit owes when the allocator stops, priced: publishing its
     /// record, when its optional work changed the record since it was last
@@ -1271,13 +1283,20 @@ pub(crate) fn allocate<U: Unit>(
                     free.saturating_add(returned).saturating_sub(flying_bytes).saturating_sub(extra)
                 })
             };
-            let host_fits = |context: &U::Context| U::host_free(context).admits(host, flying_host);
+            let device_fits = |context: &U::Context, returned: u64| {
+                work.footprint.fits(free(context, returned), largest)
+            };
+            let host_fits = |context: &U::Context, returned: u64| {
+                U::host_free(context).admits_with(host, flying_host, returned)
+            };
             // Before any unit gives up inputs it would build again, the
             // load gives back what it holds for nothing.
-            if !work.footprint.fits(free(context, 0), largest) || !host_fits(context) {
+            if !device_fits(context, 0) || !host_fits(context, 0) {
                 U::reclaim(context);
             }
-            if !work.footprint.fits(free(context, 0), largest) || !host_fits(context) {
+            let need_device = !device_fits(context, 0);
+            let need_host = !host_fits(context, 0);
+            if need_device || need_host {
                 let worth = |holder: usize| {
                     offers
                         .iter()
@@ -1304,40 +1323,60 @@ pub(crate) fn allocate<U: Unit>(
                     .fold(U::returned(units, &holders), |sum, holder| {
                         sum.saturating_add(units[*holder].programs())
                     });
-                // A holder whose giving up returns nothing while the others
-                // keep theirs waits behind one whose giving up returns some:
-                // what several bind returns when the last of them gives up.
-                let returning = holders
-                    .iter()
-                    .copied()
-                    .filter(|holder| {
-                        units[*holder].programs() > 0 || U::returned(units, &[*holder]) > 0
-                    })
-                    .collect::<Vec<_>>();
-                let victim = (if returning.is_empty() { holders } else { returning })
-                    .into_iter()
-                    .filter(|_| work.footprint.fits(free(context, given_up), largest))
-                    .min_by(|left, right| worth(*left).total_cmp(&worth(*right)));
-                // The unit whose own next work is worth least gives up
-                // first: its programs, and when it holds none, its inputs.
+                let given_up_host = holders.iter().fold(0u64, |sum, holder| {
+                    sum.saturating_add(units[*holder].host_holding(context))
+                });
                 let spare = U::spare(context);
+                let host_apart = U::host_free(context) != HostRoom::Unbounded;
+                let (device_spare, host_spare) = if host_apart { (0, spare) } else { (spare, 0) };
+                let holders_fit =
+                    device_fits(context, given_up) && host_fits(context, given_up_host);
+                let spare_fits = device_fits(context, given_up.saturating_add(device_spare))
+                    && host_fits(context, given_up_host.saturating_add(host_spare));
+                // Only evict holders that relieve a domain currently short:
+                // when VRAM already fits and only host RAM is short, GPU-only
+                // programs and inputs free zero host RAM and stay untouched.
+                let victim = if !holders_fit {
+                    None
+                } else if need_device {
+                    // A holder whose giving up returns nothing while the others
+                    // keep theirs waits behind one whose giving up returns some:
+                    // what several bind returns when the last of them gives up.
+                    let returning = holders
+                        .iter()
+                        .copied()
+                        .filter(|holder| {
+                            units[*holder].programs() > 0 || U::returned(units, &[*holder]) > 0
+                        })
+                        .collect::<Vec<_>>();
+                    (if returning.is_empty() { holders } else { returning })
+                        .into_iter()
+                        .min_by(|left, right| worth(*left).total_cmp(&worth(*right)))
+                } else {
+                    holders
+                        .into_iter()
+                        .filter(|holder| units[*holder].host_holding(context) > 0)
+                        .min_by(|left, right| worth(*left).total_cmp(&worth(*right)))
+                };
+                // The unit whose own next work is worth least gives up
+                // first: under device pressure its programs, and when it
+                // holds none, its inputs; under host-only pressure its
+                // inputs (GPU programs hold no host RAM).
                 match victim {
-                    Some(victim) if units[victim].programs() > 0 => units[victim].give_up(context),
+                    Some(victim) if need_device && units[victim].programs() > 0 => {
+                        units[victim].give_up(context);
+                    }
                     Some(victim) => {
                         apart +=
                             give_up_inputs(units, victim, context, clock, &mut own, &mut report);
                     }
-                    None if spare > 0
-                        && work
-                            .footprint
-                            .fits(free(context, given_up.saturating_add(spare)), largest) =>
-                    {
+                    None if spare > 0 && spare_fits => {
                         U::drop_spare(context);
                     }
                     None => {
                         starved[unit] = Some(Starved {
                             free: free(context, 0),
-                            given_up: given_up.saturating_add(spare),
+                            given_up: given_up.saturating_add(device_spare),
                         })
                     }
                 }
@@ -1389,23 +1428,31 @@ pub(crate) fn allocate<U: Unit>(
             let flying = flights.iter().fold(flying_compiles, |sum, flight| {
                 sum.saturating_add(units[flight.unit].host_footprint(context).unwrap_or(0))
             });
-            let fits = |context: &U::Context| {
+            let fits = |context: &U::Context, device_returned: u64, host_returned: u64| {
                 let device = work
                     .footprint
                     .forecast(units[*unit].largest_footprint())
                     .saturating_add(flying_bytes);
                 let extra = U::shared_host(context, compile_host.saturating_add(flying_compiles));
-                U::host_free(context).admits(piece, flying)
-                    && U::free(context)
-                        .is_none_or(|free| device.saturating_add(extra) <= free)
+                U::host_free(context).admits_with(piece, flying, host_returned)
+                    && U::free(context).is_none_or(|free| {
+                        device.saturating_add(extra) <= free.saturating_add(device_returned)
+                    })
             };
-            if !fits(context) {
+            if !fits(context, 0, 0) {
                 if !flights.is_empty() {
                     crowded[*unit] = true;
                     continue;
                 }
                 U::reclaim(context);
-                if !fits(context) {
+                if !fits(context, 0, 0) {
+                    let spare = U::spare(context);
+                    let host_apart = U::host_free(context) != HostRoom::Unbounded;
+                    let (device_spare, host_spare) = if host_apart { (0, spare) } else { (spare, 0) };
+                    if spare > 0 && fits(context, device_spare, host_spare) {
+                        U::drop_spare(context);
+                        continue;
+                    }
                     // Its compile's host bytes: nothing was given up for them.
                     starved[*unit] = Some(Starved {
                         free: U::free(context),
@@ -2253,10 +2300,19 @@ mod tests {
         fn drop_spare(_: &mut Log) {
             MEMORY.with(|memory| {
                 let mut now = memory.get();
-                now.held -= std::mem::take(&mut now.spare);
+                let spare = std::mem::take(&mut now.spare);
+                if now.host_ceiling.is_some() && !now.shared_host {
+                    now.host = now.host.saturating_sub(spare);
+                } else {
+                    now.held = now.held.saturating_sub(spare);
+                }
                 now.dropped += 1;
                 memory.set(now);
             });
+        }
+
+        fn host_holding(&self, _: &Log) -> u64 {
+            if self.resident { self.host } else { 0 }
         }
 
         fn built(&self) -> Quote {
@@ -3682,6 +3738,62 @@ mod tests {
         assert_eq!(memory.host_peak, 200, "one unit's inputs at a time");
         assert_eq!((units[0].served, units[1].served), (0.5, 0.5));
         assert_eq!(units[2].built, 0, "the unit the host cannot hold never ran");
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|refused| (refused.unit, refused.refusal))
+                .collect::<Vec<_>>(),
+            [(2, Refusal::Bytes)]
+        );
+    }
+
+    /// On a discrete GPU (`shared_host == false`), VRAM fitting while host RAM
+    /// does not must not evict GPU-only programs or inputs that free zero host
+    /// RAM; instead, host spare memory (such as `tuner.noise`) is reclaimed
+    /// under host pressure, and an un-fittable piece starves without touching
+    /// GPU-only victims.
+    #[test]
+    fn discrete_gpu_host_pressure_does_not_evict_gpu_only_victims_and_reclaims_spare() {
+        let clock = Fake::default();
+        // Unit 0 holds GPU-only inputs and formed programs (0 host bytes).
+        // Unit 1 needs 200 host bytes, fitting once the 200-byte host spare is
+        // dropped. Unit 2 needs 500 host bytes, never fitting under the 300
+        // host ceiling.
+        let mut units = [
+            Synthetic {
+                inputs: 100,
+                programs_held: 100,
+                host: 0,
+                ..Synthetic::new(0, &clock, 0.5, &[0.5])
+            },
+            Synthetic {
+                inputs: 100,
+                host: 200,
+                ..Synthetic::new(1, &clock, 0.3, &[0.5])
+            },
+            Synthetic {
+                inputs: 100,
+                host: 500,
+                ..Synthetic::new(2, &clock, 0.2, &[0.5])
+            },
+        ];
+        MEMORY.with(|memory| {
+            memory.set(Memory {
+                ceiling: Some(1_000_000),
+                host_ceiling: Some(300),
+                host: 200,
+                spare: 200,
+                ..Memory::default()
+            })
+        });
+        let (_, report) = run(&mut units, &clock, 600);
+        let memory = MEMORY.with(Cell::take);
+        assert_eq!((memory.dropped, memory.spare), (1, 0), "host spare reclaimed under host pressure");
+        assert_eq!(units[0].given_up, 0, "GPU-only programs must not be evicted for host RAM");
+        assert_eq!(units[0].built, 1, "GPU-only inputs must not be evicted for host RAM");
+        assert_eq!((units[0].served, units[1].served), (0.5, 0.5));
+        assert_eq!(units[2].built, 0, "unit exceeding host ceiling never ran");
         assert_eq!(
             report
                 .refused

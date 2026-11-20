@@ -221,11 +221,13 @@ impl StoredChoice {
 
 /// The evidence of a unit's choice: every candidate and measurement of its
 /// search. A search holds its own; a stored unit's is the bytes taken with
-/// its choice, undecoded until something states it.
+/// its choice, undecoded until something states it, or unread when neither
+/// re-selection nor the observer needs it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Receipt {
     Held(Arc<TuningResult>),
     Stored(StoredEvidence),
+    Unread,
 }
 
 impl Receipt {
@@ -234,6 +236,7 @@ impl Receipt {
         match self {
             Self::Held(result) => Ok(result.clone()),
             Self::Stored(evidence) => evidence.read().map(Arc::new),
+            Self::Unread => Err("stored tuning evidence was not read".into()),
         }
     }
 }
