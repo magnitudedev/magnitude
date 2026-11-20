@@ -427,12 +427,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 self.back_reservation(bindings, sequence)?;
             }
         }
-        for (sequence, through) in state_rows {
-            self.state_claims
-                .get_mut(&sequence)
-                .expect("invariant violated: a resident request holds no reservation")
-                .grow(through);
-        }
         // Stores without history domains still grow banks.
         if target_banks != 0 {
             self.grant_state_growth(bindings, false, &target, &target_queued, target_banks)?;
@@ -440,7 +434,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if head_banks != 0 && self.head_store.is_some() {
             self.grant_state_growth(bindings, true, &head, &head_queued, head_banks)?;
         }
-        self.change_state(|_, _| ());
         let Some(lane) = operations.first().map(ReservationLane::of) else {
             return Ok(());
         };
@@ -465,10 +458,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let class = self
                     .image_class(image.patches())
                     .map_err(DomainError::Input)?;
-                self.provision_vision(class as u64)
+                self.provision_vision(class as u64)?;
             }
-            _ => self.provision_output(lane, super::projected_rows(operations)),
+            _ => self.provision_output(lane, super::projected_rows(operations))?,
         }
+        // Advance each request's reservation reach only after every fallible
+        // provisioning step succeeds, so a refused launch never inflates
+        // `Reservation::through()`.
+        self.change_state(|this, _| {
+            for (sequence, through) in state_rows {
+                this.state_claims
+                    .get_mut(&sequence)
+                    .expect("invariant violated: a resident request holds no reservation")
+                    .grow(through);
+            }
+        });
+        Ok(())
     }
 
     /// The state the stores commit: every history and bank slab they back,
@@ -700,7 +705,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// kept with its binding. A refused claim unbinds the head.
     pub(super) fn hold_bound_head(&mut self, claiming: &crate::memory::ledger::Claiming) -> Result<(), DomainError> {
         let places = self.group_places().get();
-        let demand = self.family.bound_head_demand(places).map_err(DomainError::Input)?;
+        let demand = match self.family.bound_head_demand(places) {
+            Ok(demand) => demand,
+            Err(error) => {
+                self.unbind(super::OptionalComponent::Drafter);
+                return Err(DomainError::Input(error));
+            }
+        };
         if demand == crate::memory::ClaimDemand::default() {
             return Ok(());
         }
@@ -841,6 +852,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(StateShrink { state, slots })
     }
 
+    /// The one granule pool backing the domain's state stores (both target and
+    /// head share `LoadPools::state`).
+    pub(super) fn state_pool(&self) -> &seismic::Pool {
+        self.target_store.pool()
+    }
+
     /// Release both stores' slabs beyond the live requests' next steps
     /// ([`Self::shrink_store`]), moving no row or bank, and return what
     /// they freed to the OS through the state's pool, which empties its
@@ -850,7 +867,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub(super) fn yield_state(&mut self, unchained: &mut Unchained<'_>) -> Result<StateYield, DomainError> {
         self.conclude_chain()?;
         let bindings = unchained.bindings();
-        let pool = bindings.target.pool().clone();
+        let pool = self.state_pool().clone();
         self.change_state(|this, _| {
             let mut released = this.shrink_store(bindings, false)?;
             if this.head_store.is_some() {
@@ -870,16 +887,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// At a flight boundary: drain any settled owed blocks from the state
-    /// pools (so fenced granules from an earlier state shrink or rollback
+    /// pool (so fenced granules from an earlier state shrink or rollback
     /// vacate on the next boundary once their flight ends) and poll the idle
     /// graph slots' release (`AllocatedResources::released_slots`).
     pub fn advance_slot_release(&mut self) -> Option<crate::resources::SlotsReleased> {
         let changes = self.resources.ledgers().changes().clone();
-        for pool in std::iter::once(self.target_store.pool()).chain(self.head_store.as_ref().map(|store| store.pool())) {
-            if pool.owed() > 0 {
-                if let Err(error) = changes.change(|_| pool.return_freed(0)) {
-                    tracing::error!(%error, "state pool could not drain settled owed blocks");
-                }
+        let pool = self.state_pool();
+        if pool.owed() > 0 {
+            if let Err(error) = changes.change(|_| pool.return_freed(0)) {
+                tracing::error!(%error, "state pool could not drain settled owed blocks");
             }
         }
         self.resources.released_slots()
@@ -1611,6 +1627,44 @@ mod group_demand_tests {
         assert_eq!(demand, crate::memory::ClaimDemand { device: 640, upload: 2048, ..Default::default() });
         let demand = graph_demand(seismic::GraphCost::None, budget, launches(1000)).unwrap();
         assert_eq!(demand, crate::memory::ClaimDemand::default());
+    }
+
+    #[test]
+    fn provision_failure_does_not_inflate_reservation_through() {
+        let (mut domain, mut bindings) = super::super::fixtures::fixture(None);
+        let request = RequestId(1);
+        domain
+            .install_input(request, PreparedModelInput::continuation_only())
+            .unwrap();
+        domain.open_served(&mut bindings, request, None).unwrap();
+        assert_eq!(domain.state_claims[&request].through(), 0);
+        // Priming requires binding the head component, which is disabled on
+        // this fixture, so `provision` fails after `grant_state_growth`.
+        let op = Operation::Forward {
+            request,
+            kind: WorkKind::Prefill,
+            tokens: vec![TokenId(1)],
+            position: 0,
+            conditioning: None,
+            demand: Demand::NONE,
+            select: Vec::new(),
+            front: Vec::new(),
+            chain: None,
+            committed: 1,
+            prime: Some(Priming {
+                boundary: false,
+                tokens: vec![TokenId(1)],
+                position: 0,
+                draft_from: 0,
+            }),
+        };
+        let err = domain.provision(&mut bindings, &[op], None).unwrap_err();
+        assert!(matches!(err, DomainError::Input(_)), "unexpected error: {err:?}");
+        assert_eq!(
+            domain.state_claims[&request].through(),
+            0,
+            "a refused provision must not inflate Reservation::through()"
+        );
     }
 }
 
