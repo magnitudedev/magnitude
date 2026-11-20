@@ -1061,7 +1061,13 @@ impl Directory {
             .enumerate()
             .map(|(group, records)| {
                 let rank = store_rank(reuse.ranker(group, tier, Reader::Move), &self.prompt_reads);
-                records.refill_victims(rank, lending)
+                // Protect unconsumed read-aheads (landed for a step Reuse has not
+                // yet logged) from immediate eviction before their step runs.
+                let protected = |staged @ (layer, _): Staged, read: Option<Step>| {
+                    let unconsumed = read.is_some_and(|step| reuse.lead_of(layer, step).is_some());
+                    (unconsumed, rank(staged, read))
+                };
+                records.refill_victims(protected, lending)
             })
             .collect()
     }

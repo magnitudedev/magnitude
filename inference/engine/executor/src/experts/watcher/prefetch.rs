@@ -843,9 +843,6 @@ impl Prefetch {
         while let Ok(event) = self.inbox.try_recv() {
             told = true;
             let completed = matches!(&event, Told::Completed { .. });
-            if completed {
-                shared.telemetry.feed();
-            }
             let learned = self.ledger.tell(event);
             if completed {
                 shared.telemetry.resolved(&learned.resolved, &learned.cohorts);
@@ -1426,11 +1423,11 @@ mod tests {
         let line = ReadLine::new(0., 1e-9).expect("a line");
         let mut passes = Passes::new(Time::new(&[vec![1]], 8));
         // compute = 0.1 - 0.065 = 0.035 s -> c_layer = 0.035 / 35 = 0.001 s (1.0 ms).
-        // Drive-bound (0.068 > 0.035), stall = 0.065 / 68 ≈ 0.956 ms ->
-        // break_even(1.0 ms, 0.0) ≈ 0.511.
+        // Drive-bound (0.068 > 0.035), stall = 0.065 / 68 ≈ 0.956 ms <= read = 1.0 ms ->
+        // break_even(1.0 ms, 0.0) = 1.0 (only a certain read pays with no idle window).
         passes.timed(Pass { rows: 1, depth: 0, seconds: 0.1, parked: 0.065, misses: 68., drive: 0.068, ..Pass::default() });
         let price = ReadPrice::priced(passes.miss_cost(), line);
-        assert!(!price.admits_with_idle(0.30, bytes, 0.0) && price.admits_with_idle(0.52, bytes, 0.0));
+        assert!(!price.admits_with_idle(0.30, bytes, 0.0) && !price.admits_with_idle(0.52, bytes, 0.0) && price.admits_with_idle(1.0, bytes, 0.0));
 
         let time = Time::new(&[vec![2, 2]], 32);
         let ranking = Reuse::ranking(&[4, 4], &[0, 0], &[2], time.clone());
@@ -1465,7 +1462,8 @@ mod tests {
         let idle = IdleBudget::new(layers, queued);
         assert_eq!(idle.get(&price), 0.0, "demand read on layer l-1 saturates shared drive");
         assert!(!price.admits_with_idle(0.30, bytes, idle.get(&price)), "low-p hint rejected when drive is busy");
-        assert!(price.admits_with_idle(0.52, bytes, idle.get(&price)), "hint above full break-even still admitted");
+        assert!(!price.admits_with_idle(0.52, bytes, idle.get(&price)), "50% hint rejected on saturated drive with no park overhead");
+        assert!(price.admits_with_idle(1.0, bytes, idle.get(&price)), "certain read still admitted");
 
         // An unbegun ahead read in `seen` (being re-evaluated in this pass) is
         // not double-counted, while an out-of-pass ahead read on another layer

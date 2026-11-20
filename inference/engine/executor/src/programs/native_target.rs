@@ -97,22 +97,18 @@ fn wait_all(completions: Vec<NativeGraphCompletion>) -> Result<(), SubmitError> 
     })
 }
 
-/// Growing submission-chunk schedule (`1, 1, 2, 3, 4, …` runs per queue
+/// Doubling submission-chunk schedule (`1, 2, 4, 8, …` runs per queue
 /// submission): the single owner used both by [`StepSubmitter`] at execution
 /// time and by [`crate::ExecutionPlan::command_buffer_capacity`] when sizing
 /// the command queue at load time.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SubmissionChunks {
     limit: usize,
-    held_first: bool,
 }
 
 impl SubmissionChunks {
     pub(crate) const fn new() -> Self {
-        Self {
-            limit: 1,
-            held_first: false,
-        }
+        Self { limit: 1 }
     }
 
     const fn limit(self) -> usize {
@@ -120,11 +116,7 @@ impl SubmissionChunks {
     }
 
     fn advance(&mut self) {
-        if self.held_first {
-            self.limit += 1;
-        } else {
-            self.held_first = true;
-        }
+        self.limit = self.limit.saturating_mul(2);
     }
 
     /// Number of queue submissions required for `runs` queued runs.
@@ -140,16 +132,14 @@ impl SubmissionChunks {
     }
 }
 
-/// Submits a step's runs in sequences of growing length (1, 1, 2, 3, 4, …
-/// runs): the entry run and the first block run each submit at once so the
-/// device begins the first block without waiting on a second block's encoding,
-/// and each later sequence grows by one run instead of doubling so host
-/// encoding never outlasts the GPU work already queued when per-run encode and
-/// execute times are comparable, while a chain of N runs still takes only
-/// O(sqrt(N)) submission boundaries. Every run replays one of the graphs its
-/// family's slots hold (`seismic::NativeGraphFamily::launch`), so a sequence
-/// of any length and mix of places and classes records nothing once each shape
-/// has run. A scratch-served chain's submissions are its release's boundaries
+/// Submits a step's runs in sequences of doubling length (1, 2, 4, … runs):
+/// the device starts on the first run as soon as it is queued, and each
+/// sequence is queued while the device executes the previous ones, so a step
+/// of N runs has about log2(N) submission boundaries instead of N. Every run
+/// replays one of the graphs its family's slots hold
+/// (`seismic::NativeGraphFamily::launch`), so a sequence of any length and
+/// mix of places and classes records nothing once each shape has run. A
+/// scratch-served chain's submissions are its release's boundaries
 /// ([`RunningRelease`]).
 struct StepSubmitter<'p> {
     device: Device,

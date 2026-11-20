@@ -508,6 +508,9 @@ pub struct Reuse {
     /// ([`Self::in_top`]).
     order: Vec<Vec<Placed>>,
     ranks: Vec<Vec<Rank>>,
+    /// Layers whose `ranks[layer]` changed since their group's `order` and
+    /// `top` were last rebuilt ([`Self::read_layer`], [`Self::finish_batch`]).
+    dirty: Vec<bool>,
     top: Vec<Vec<bool>>,
     /// The (layer, expert)s whose membership of what the bank is asked to
     /// hold changed since they were last taken ([`Self::take_changes`]).
@@ -607,6 +610,7 @@ impl Reuse {
             stands,
             order,
             ranks: experts.iter().map(|&experts| vec![none; experts]).collect(),
+            dirty: vec![false; experts.len()],
             top: experts.iter().map(|&experts| vec![false; experts]).collect(),
             changed: BTreeSet::new(),
             reads: 0,
@@ -680,7 +684,7 @@ impl Reuse {
     /// Lead `g ≥ 1` of target step `step` past `layer`'s latest logged step.
     /// Before the layer's first log, taken at lead 1 (design §3.4).
     /// Returns `None` if the log has already reached or passed `step`.
-    fn lead_of(&self, layer: usize, step: Step) -> Option<usize> {
+    pub(crate) fn lead_of(&self, layer: usize, step: Step) -> Option<usize> {
         match self.layers[layer].latest_step() {
             None => Some(1),
             Some(latest) => step.checked_sub(latest).filter(|&lead| lead > 0).map(|lead| usize::try_from(lead).expect("lead fits usize")),
@@ -698,9 +702,23 @@ impl Reuse {
     /// `read.sequence` (captured while the step was still live on `Clock`'s
     /// ring, so asynchronous stack feeding never races ring eviction).
     pub(crate) fn read_at(&mut self, read: &RoutedRead, rows: Option<Arc<Rows>>, evidence: Evidence, clock: Option<horizon::Tokens>) -> Vec<usize> {
+        let depths = self.read_layer(read, rows, evidence, clock);
+        self.rerank_group(self.groups[read.layer]);
+        depths
+    }
+
+    /// Log one layer's read and update its `history`, calibration, `pools`,
+    /// and `ranks[layer]`, deferring the group-wide `order` rebuild and
+    /// `retop` until [`Self::finish_batch`]. If the same layer is already
+    /// dirty from an earlier read in the same batch, its group is rebuilt
+    /// first so `depths` reflects the prior read.
+    pub(crate) fn read_layer(&mut self, read: &RoutedRead, rows: Option<Arc<Rows>>, evidence: Evidence, clock: Option<horizon::Tokens>) -> Vec<usize> {
         assert!(read.experts.windows(2).all(|pair| pair[0] < pair[1]), "a read lists each expert once, ascending");
         self.reads += 1;
         let (layer, group) = (read.layer, self.groups[read.layer]);
+        if self.dirty[layer] {
+            self.rerank_group(group);
+        }
         let depths = read.experts.iter().map(|&expert| self.depth(layer, expert)).collect();
         let (horizon, a_bar, epoch, clock) = self.step_horizon_at(group, read.sequence, evidence, clock);
         let far_lead = match horizon {
@@ -750,11 +768,20 @@ impl Reuse {
             })
             .collect();
         self.pools.read(layer, group, &read.experts, |expert| ranks[expert]);
-        self.rerank(layer, ranks);
+        self.ranks[layer] = ranks;
+        self.dirty[layer] = true;
         if let Some(shadowed) = &mut self.shadowed {
             shadowed.push(ShadowFeed::Read { read: read.clone(), rows, evidence, clock });
         }
         depths
+    }
+
+    /// Rebuild `order` and `top` once for every group that had at least one
+    /// layer updated by [`Self::read_layer`].
+    pub(crate) fn finish_batch(&mut self) {
+        for group in 0..self.order.len() {
+            self.rerank_group(group);
+        }
     }
 
     /// Record that `step`'s front row `first_fall` (1-based, `1..DEPTHS`) was
@@ -766,26 +793,55 @@ impl Reuse {
         self.layers[layer].record_fell(step, first_fall, epoch);
     }
 
-    /// `layer`'s experts rank `ranks` from now: each moved to its place in
-    /// its group's order, in one pass over it, and what the bank is asked
-    /// to hold taken again.
-    fn rerank(&mut self, layer: usize, ranks: Vec<Rank>) {
-        let group = self.groups[layer];
-        let mut entering = ranks.iter().enumerate().map(|(expert, &rank)| (rank, layer, expert)).collect::<Vec<_>>();
-        entering.sort_unstable();
-        let order = std::mem::take(&mut self.order[group]);
-        let mut merged = Vec::with_capacity(order.len());
-        let mut entering = entering.into_iter().peekable();
-        for placed in order.into_iter().filter(|&(_, of, _)| of != layer) {
-            while let Some(next) = entering.next_if(|next| *next < placed) {
-                merged.push(next);
-            }
-            merged.push(placed);
+    /// Rebuild `self.order[group]` and `self.top` once for every dirty layer
+    /// in `group`. Returns true if any layer in `group` was dirty.
+    fn rerank_group(&mut self, group: usize) -> bool {
+        let dirty_count = self
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|&(layer, &g)| g == group && self.dirty[layer])
+            .count();
+        if dirty_count == 0 {
+            return false;
         }
-        merged.extend(entering);
-        self.order[group] = merged;
-        self.ranks[layer] = ranks;
+        if dirty_count == self.members[group] {
+            let order = &mut self.order[group];
+            order.clear();
+            for (layer, &g) in self.groups.iter().enumerate() {
+                if g == group {
+                    self.dirty[layer] = false;
+                    order.extend(self.ranks[layer].iter().enumerate().map(|(expert, &rank)| (rank, layer, expert)));
+                }
+            }
+            order.sort_unstable();
+        } else {
+            let mut entering = Vec::new();
+            for (layer, &g) in self.groups.iter().enumerate() {
+                if g == group && self.dirty[layer] {
+                    entering.extend(self.ranks[layer].iter().enumerate().map(|(expert, &rank)| (rank, layer, expert)));
+                }
+            }
+            entering.sort_unstable();
+            let order = std::mem::take(&mut self.order[group]);
+            let mut merged = Vec::with_capacity(order.len());
+            let mut entering = entering.into_iter().peekable();
+            for placed in order.into_iter().filter(|&(_, of, _)| !self.dirty[of]) {
+                while let Some(next) = entering.next_if(|next| *next < placed) {
+                    merged.push(next);
+                }
+                merged.push(placed);
+            }
+            merged.extend(entering);
+            self.order[group] = merged;
+            for (layer, &g) in self.groups.iter().enumerate() {
+                if g == group {
+                    self.dirty[layer] = false;
+                }
+            }
+        }
         self.retop(group);
+        true
     }
 
     /// What the bank is asked to hold of group `group`: its most ranked as
@@ -810,7 +866,9 @@ impl Reuse {
         self.pools.fit(group, records);
         self.history.resize(group, records);
         self.step_horizon[group] = None;
-        self.retop(group);
+        if !self.rerank_group(group) {
+            self.retop(group);
+        }
         if let Some(shadowed) = &mut self.shadowed {
             shadowed.push(ShadowFeed::Resize { group, records });
         }

@@ -1579,17 +1579,18 @@ impl Telemetry {
         for (_, read, fed) in reads {
             match fed {
                 Fed::Decode { counted, keys, clock } => {
-                    stack.read_at(&read, counted, keys.as_deref(), clock);
+                    stack.read_at_batched(&read, counted, keys.as_deref(), clock);
                     decoded = true;
                 }
                 Fed::Group { steps, merged, choices } => {
                     let routed = read.experts.iter().copied().zip(choices.iter().copied()).collect::<Vec<_>>();
                     let rows = crate::experts::reuse::Rows::union(self.routing.experts[read.layer], self.routing.selected, &routed);
-                    let depths = stack.read_group(&read, rows);
+                    let depths = stack.read_group_batched(&read, rows);
                     unions.push((read.layer, GroupUnion::new(steps, merged, depths.into_iter().zip(choices).collect())));
                 }
             }
         }
+        stack.finish_batch();
         // What the feed counted, in one take.
         let live = decoded.then(|| stack.live());
         let recorded = &mut *self.lock();
@@ -2748,8 +2749,9 @@ mod tests {
             passes.timed(pass);
             ReadPrice { miss: passes.miss_cost(), line: Some(line), ..ReadPrice::unpriced() }
         };
-        let bound = price(Pass { rows: 1, depth: 0, seconds: 0.1, parked: 0.065, misses: 68., drive: 0.068, ..Pass::default() });
-        assert!(bound.admits(0.52, 1_000_000) && !bound.admits(0.50, 1_000_000) && !bound.admits(0.15, 1_000_000));
+        let bound = price(Pass { rows: 1, depth: 0, seconds: 0.1, parked: 0.085, misses: 68., drive: 0.068, ..Pass::default() });
+        // stall = 1.25 ms, read = 1.0 ms -> overhead = 0.25 ms -> break_even(1.0ms, 0.0) = 0.80.
+        assert!(bound.admits(0.81, 1_000_000) && !bound.admits(0.79, 1_000_000) && !bound.admits(0.15, 1_000_000));
         assert!(bound.admits(1., 1_000_000));
         let resident = price(Pass { rows: 1, depth: 0, seconds: 0.05, parked: 0.018, misses: 21., drive: 0.021, ..Pass::default() });
         assert!(resident.admits(0.15, 1_000_000), "an idle drive's read saves a stall at no cost");

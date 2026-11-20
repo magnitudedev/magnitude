@@ -4210,10 +4210,11 @@ mod tests {
         assert_eq!(SubmissionChunks::count(0), 0);
         assert_eq!(SubmissionChunks::count(1), 1);
         assert_eq!(SubmissionChunks::count(2), 2);
-        assert_eq!(SubmissionChunks::count(3), 3);
+        assert_eq!(SubmissionChunks::count(3), 2);
         assert_eq!(SubmissionChunks::count(4), 3);
-        assert_eq!(SubmissionChunks::count(5), 4);
-        assert_eq!(SubmissionChunks::count(50), 11);
+        assert_eq!(SubmissionChunks::count(7), 3);
+        assert_eq!(SubmissionChunks::count(8), 4);
+        assert_eq!(SubmissionChunks::count(50), 6);
 
         let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
         let room = StableRoom::of_selected(&device);

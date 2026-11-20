@@ -241,11 +241,42 @@ impl Stack {
         keys: Option<&StepKeys>,
         clock: Option<crate::experts::horizon::Tokens>,
     ) {
+        self.read_decode(read, counted, keys, clock, false);
+    }
+
+    /// [`Self::read_at`], deferring the group-wide `order` rebuild and `retop`
+    /// until [`Self::finish_batch`].
+    pub(crate) fn read_at_batched(
+        &mut self,
+        read: &RoutedRead,
+        counted: Option<CountedLaunch>,
+        keys: Option<&StepKeys>,
+        clock: Option<crate::experts::horizon::Tokens>,
+    ) {
+        self.read_decode(read, counted, keys, clock, true);
+    }
+
+    fn read_decode(
+        &mut self,
+        read: &RoutedRead,
+        counted: Option<CountedLaunch>,
+        keys: Option<&StepKeys>,
+        clock: Option<crate::experts::horizon::Tokens>,
+        batched: bool,
+    ) {
         let mut experts = read.experts.clone();
         experts.sort_unstable();
         experts.dedup();
         let rows = keys.map(|keys| std::sync::Arc::new(keys.rows(read.layer)));
-        let depths = Reuse::feeding(&self.ranking).read_at(&RoutedRead { experts, ..read.clone() }, rows, Evidence::Decode, clock);
+        let normalized = RoutedRead { experts, ..read.clone() };
+        let depths = {
+            let mut reuse = Reuse::feeding(&self.ranking);
+            if batched {
+                reuse.read_layer(&normalized, rows, Evidence::Decode, clock)
+            } else {
+                reuse.read_at(&normalized, rows, Evidence::Decode, clock)
+            }
+        };
         count(&mut self.decoded, &mut self.last_decoded, read, &depths);
         if let Some(launch) = counted {
             if count(&mut self.curve, &mut self.counted, read, &depths) {
@@ -261,6 +292,18 @@ impl Stack {
     /// ascending order.
     pub fn read_group(&mut self, read: &RoutedRead, rows: Rows) -> Vec<usize> {
         Reuse::feeding(&self.ranking).read(read, Some(std::sync::Arc::new(rows)), Evidence::Prompt)
+    }
+
+    /// [`Self::read_group`], deferring the group-wide `order` rebuild and
+    /// `retop` until [`Self::finish_batch`].
+    pub(crate) fn read_group_batched(&mut self, read: &RoutedRead, rows: Rows) -> Vec<usize> {
+        Reuse::feeding(&self.ranking).read_layer(read, Some(std::sync::Arc::new(rows)), Evidence::Prompt, None)
+    }
+
+    /// Rebuild `order` and `top` once for every group dirtied by
+    /// [`Self::read_at_batched`] or [`Self::read_group_batched`].
+    pub(crate) fn finish_batch(&mut self) {
+        Reuse::feeding(&self.ranking).finish_batch();
     }
 
     /// What the load's counted decode read and ran ([`LiveDecode`]); none

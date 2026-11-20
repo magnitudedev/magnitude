@@ -281,15 +281,22 @@ impl MissCost {
     /// A read ahead overlaps `overlap = min(read, idle)` of otherwise-idle
     /// drive time during compute, so when the drive binds its net critical-path
     /// waste if wrong is `w = (read - overlap).max(0)` (0 when `idle >= read`
-    /// or the drive does not bind). A used read saves `stall`, so it pays
-    /// where `p · stall >= (1 − p) · w`, i.e. `p >= w / (w + stall)`.
+    /// or the drive does not bind). A used read still consumes `read` seconds
+    /// of drive bandwidth on a binding drive, so it saves only the overlapped
+    /// compute window plus any per-miss park overhead above `read` itself:
+    /// `saved = (overlap + (stall - read).max(0)).min(stall)`. It pays where
+    /// `p · saved >= (1 − p) · w`, i.e. `p >= w / (w + saved)` (or `1` when
+    /// `saved == 0`).
     pub fn break_even(&self, read: f64, idle: f64) -> f64 {
         assert!(idle.is_finite() && idle >= 0., "idle compute window must be finite and non-negative, got {idle}");
         let overlap = read.min(idle);
         let waste = if self.binds { (read - overlap).max(0.) } else { 0. };
         match (waste > 0., self.stall) {
             (false, _) => 0.,
-            (true, Some(stall)) => waste / (waste + stall),
+            (true, Some(stall)) => {
+                let saved = (overlap + (stall - read).max(0.)).min(stall);
+                if saved > 0. { waste / (waste + saved) } else { 1. }
+            }
             (true, None) => 1.,
         }
     }
@@ -544,12 +551,19 @@ mod tests {
             passes.miss_cost()
         };
         let drive_bound = cost(0.1, 0.065, 68.);
-        let stall = 0.065 / 68.;
-        let at_zero = drive_bound.break_even(1e-3, 0.);
-        assert!((at_zero - 1e-3 / (1e-3 + stall)).abs() < 1e-9 && at_zero > 0.15, "{at_zero}");
-        // Partial idle compute overlap reduces waste to `read - idle`.
+        // stall = 0.065 / 68 ≈ 0.956 ms <= read = 1.0 ms: with no idle compute
+        // and no park overhead above read, a used hint saves 0 on a binding
+        // drive, so break-even is 1.0 (only a certain read pays).
+        assert_eq!(drive_bound.break_even(1e-3, 0.), 1., "saturated drive with stall <= read and no idle");
+        // Partial idle compute overlap saves `overlap = 0.4 ms` and wastes `0.6 ms` -> 0.6.
         let at_partial = drive_bound.break_even(1e-3, 0.4e-3);
-        assert!((at_partial - 0.6e-3 / (0.6e-3 + stall)).abs() < 1e-9 && at_partial < at_zero, "{at_partial}");
+        assert!((at_partial - 0.6).abs() < 1e-9, "{at_partial}");
+        // When demand park stall exceeds the read itself (e.g. shallow-QD park
+        // latency: stall = 1.25 ms vs read = 1.0 ms -> 0.25 ms overhead), a
+        // hit saves that overhead even at idle = 0 -> 1.0 / (1.0 + 0.25) = 0.8.
+        let high_overhead = cost(0.1, 0.085, 68.);
+        let at_zero_overhead = high_overhead.break_even(1e-3, 0.);
+        assert!((at_zero_overhead - 1e-3 / (1e-3 + 0.25e-3)).abs() < 1e-9, "{at_zero_overhead}");
         // Idle compute covering the read makes it free (waste = 0).
         assert_eq!(drive_bound.break_even(1e-3, 1e-3), 0., "idle == read");
         assert_eq!(drive_bound.break_even(1e-3, 2e-3), 0., "idle > read");

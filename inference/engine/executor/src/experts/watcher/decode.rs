@@ -714,6 +714,10 @@ impl Decode {
         // Counted before any answer, which releases the device to complete
         // the step: no landing is registered yet, nor answer published.
         shared.telemetry.serve(layer, sequence, served);
+        // Retire passed read-ahead interests (any needed expert in `absent` was
+        // already hastened above) before publishing answers so unneeded hints
+        // are cancelled before the device moves on.
+        prefetch.pass(core, shared, Some((sequence, layer)));
         if let Some((PostedRead { landings, submitted }, grants)) = read {
             // The tier map's unmappings, a ready record's reclaim among
             // them, were stored as each claim took its record, before any
@@ -775,9 +779,7 @@ impl Decode {
             self.resume(Serving { core, prefetch, shared });
         }
         // Off the parked request's critical path (landings, answers and
-        // reads are now in flight): retire read-ahead interests of layers
-        // the device has reached and prepare victims for subsequent requests.
-        prefetch.pass(core, shared, Some((sequence, layer)));
+        // reads are now in flight): prepare victims for subsequent requests.
         if has_read {
             core.directory.prepare_demand(layer, 2 * width as usize, sequence);
         }
