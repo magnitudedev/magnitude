@@ -117,10 +117,7 @@ struct EntryLaunches {
 }
 
 /// Launches and device time per entry of `steps` attributed steps, from
-/// their submissions that started from `from` (the end of the step before
-/// the first: its own launches, untraced under lookahead, are not one of
-/// them) to before `until` (the last step's end: a step queued behind it
-/// under lookahead is not one of them). Every launch
+/// their owned submissions. Every launch
 /// a submission lists is counted: inactive ones (their condition did not
 /// hold) and empty ones (active, no work, so untimed) as well as timed ones.
 /// The device runs launches one after another in submission order, and a
@@ -128,11 +125,11 @@ struct EntryLaunches {
 /// before is still running; so a timed launch is attributed from the later
 /// of its start and the previous launch's end to its own end: what it held
 /// the device alone (an empty dispatch, its encode).
-pub fn attribution(submissions: &[TracedSubmission], steps: usize, (from, until): (f64, f64)) -> Value {
+pub fn attribution(submissions: &[TracedSubmission], steps: usize) -> Value {
     let mut entries: BTreeMap<String, EntryLaunches> = BTreeMap::new();
     let mut timed = 0.0;
     let mut previous = f64::NEG_INFINITY;
-    for submission in submissions.iter().filter(|submission| (from..until).contains(&submission.device.0)) {
+    for submission in submissions {
         for launch in &submission.launches {
             let label = if launch.launch == 0 {
                 launch.entry.clone()
@@ -163,7 +160,7 @@ pub fn attribution(submissions: &[TracedSubmission], steps: usize, (from, until)
                 "timed_per_step": launches.timed as f64 / count,
                 "device_ms_per_step": launches.seconds / count * MS,
                 "mean_launch_us": (launches.timed > 0).then(|| launches.seconds / launches.timed as f64 * 1e6),
-                "share": launches.seconds / timed,
+                "share": if timed > 0.0 { launches.seconds / timed } else { 0.0 },
             })
         })
         .collect::<Vec<_>>();
@@ -455,7 +452,6 @@ mod tests {
     /// A launch is attributed from the later of its start and the previous
     /// launch's end to its own end: one opened while the launch before ran
     /// takes only what it held alone, one wholly inside it takes nothing.
-    /// A submission starting from `until` on is not attributed.
     #[test]
     fn a_launch_is_attributed_what_it_held_the_device_alone() {
         let submissions = [
@@ -470,14 +466,12 @@ mod tests {
                 ],
             ),
             submission(4.0, 4.0, (5.0, 8.0), vec![launch("c", 0, Some((5.0, 6.0))), launch("c", 0, Some((7.0, 8.0)))]),
-            submission(8.0, 8.0, (9.0, 10.0), vec![launch("d", 0, Some((9.0, 10.0)))]),
         ];
-        let attributed = attribution(&submissions, 2, (f64::NEG_INFINITY, 8.5));
+        let attributed = attribution(&submissions, 2);
         close(&attributed["timed_device_ms_per_step"], 2500.0);
         let entries = attributed["entries"].as_array().unwrap();
         let names = entries.iter().map(|entry| entry["entry"].as_str().unwrap()).collect::<Vec<_>>();
         assert_eq!(names[0], "a");
-        assert!(!names.contains(&"d"));
         let entry = |name: &str| entries.iter().find(|entry| entry["entry"] == name).unwrap();
         close(&entry("a")["device_ms_per_step"], 1000.0);
         close(&entry("a#1")["device_ms_per_step"], 500.0);
@@ -487,12 +481,8 @@ mod tests {
         close(&entry("a")["share"], 0.4);
     }
 
-    /// The window holds the attributed steps alone, at their full launch
-    /// counts: the shape of a recorded decode attribution at eight steps
-    /// (30 gated-delta launches and one readout a step), whose leading
-    /// step's submission and the step queued behind the last fall outside
-    /// the window, so every count divides by the steps whose launches it
-    /// holds.
+    /// Eight attributed steps' submissions divide cleanly by eight at their
+    /// full launch counts (30 gated-delta launches and one readout a step).
     #[test]
     fn the_window_holds_exactly_the_attributed_steps() {
         let step = |start: f64| {
@@ -505,12 +495,8 @@ mod tests {
             launches.push(launch("readout", 0, Some((start + 0.3, start + 0.4))));
             submission(start, start, (start, start + 0.4), launches)
         };
-        // Steps run from 0.0 a second apart; each ends 0.5 after it starts.
-        // The leading step at 0.0 ends the window's start at 0.5, the
-        // eighth attributed step ends it at 8.5, and the step queued behind
-        // it starts at 9.0.
-        let submissions = (0..10).map(|index| step(index as f64)).collect::<Vec<_>>();
-        let attributed = attribution(&submissions, 8, (0.5, 8.5));
+        let submissions = (1..=8).map(|index| step(index as f64)).collect::<Vec<_>>();
+        let attributed = attribution(&submissions, 8);
         let entries = attributed["entries"].as_array().unwrap();
         let entry = |name: &str| entries.iter().find(|entry| entry["entry"] == name).unwrap();
         close(&entry("gated_delta")["launches_per_step"], 30.0);
@@ -540,7 +526,7 @@ mod tests {
             ),
             submission(2.0, 2.0, (2.0, 3.0), vec![launch("fill", 0, Some((2.0, 3.0))), inactive("port")]),
         ];
-        let attributed = attribution(&submissions, 2, (f64::NEG_INFINITY, f64::INFINITY));
+        let attributed = attribution(&submissions, 2);
         let entries = attributed["entries"].as_array().unwrap();
         let entry = |name: &str| entries.iter().find(|entry| entry["entry"] == name).unwrap();
         close(&entry("fill")["launches_per_step"], 2.0);
@@ -553,6 +539,17 @@ mod tests {
         assert!(entry("port")["mean_launch_us"].is_null());
         let listed = entries.iter().map(|entry| entry["launches_per_step"].as_f64().unwrap()).sum::<f64>();
         close(&json!(listed), 3.5);
+    }
+
+    /// When no launch is timed (`timed == 0.0`), `share` is `0.0` rather than
+    /// `NaN` (which `serde_json` would serialize as `null`).
+    #[test]
+    fn untimed_attribution_reports_zero_share_not_nan() {
+        let submissions = [submission(0.0, 0.0, (0.0, 1.0), vec![launch("empty", 0, None), inactive("skipped")])];
+        let attributed = attribution(&submissions, 1);
+        for entry in attributed["entries"].as_array().unwrap() {
+            close(&entry["share"], 0.0);
+        }
     }
 
     /// The window's idle before a submission is split at its commit: host
