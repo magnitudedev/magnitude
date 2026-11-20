@@ -290,6 +290,13 @@ impl StepInputs<'_> {
             assert!(!reads_ahead, "invariant violated: a step reading ahead is evaluated layer by layer");
         }
         let tau = (self.compute - self.head) / layers as f64;
+        // Rounded layer lead (`None` under `Lead::Token`). When a layer lead
+        // rounds to `0`, hinted misses are issued at the layer's own route so
+        // they stay on demand and must complete before the layer's barrier.
+        let lead_layers = match self.ahead.lead {
+            Lead::Token => None,
+            Lead::Layers(lead) => Some(lead.round() as usize),
+        };
         // Each run's lines, its hinted reads, its wrong hints', and its
         // demand reads, a layer.
         let mut first = 0;
@@ -305,7 +312,8 @@ impl StepInputs<'_> {
                 } else {
                     hinted as f64 * (1. / self.ahead.precision - 1.)
                 };
-                (lines, hinted, wrong, run.load.file - hinted)
+                let demand = if lead_layers == Some(0) { run.load.file } else { run.load.file - hinted };
+                (lines, hinted, wrong, demand)
             })
             .collect::<Vec<_>>();
         let bytes = runs.iter().zip(&reads).map(|(run, &(lines, _, wrong, _))| run.layers as f64 * lines.host.record_bytes as f64 * (run.load.file as f64 + wrong)).sum::<f64>();
@@ -316,20 +324,16 @@ impl StepInputs<'_> {
         let mut ready = vec![0f64; runs.len()];
         // Under a token's lead every read is issued at the step's start, in
         // layer order, wrong hints after each layer's own.
-        let (lead, on_demand) = match self.ahead.lead {
-            Lead::Token => {
-                for (at, &(lines, hinted, wrong, demand)) in reads.iter().enumerate() {
-                    let bytes = lines.host.record_bytes as f64;
-                    let started = hinted + demand;
-                    if started > 0 {
-                        ready[at] = device.read(0., started as f64, bytes) + landing(at, started);
-                    }
-                    device.read(0., wrong, bytes);
+        if lead_layers.is_none() {
+            for (at, &(lines, hinted, wrong, demand)) in reads.iter().enumerate() {
+                let bytes = lines.host.record_bytes as f64;
+                let started = hinted + demand;
+                if started > 0 {
+                    ready[at] = device.read(0., started as f64, bytes) + landing(at, started);
                 }
-                (None, false)
+                device.read(0., wrong, bytes);
             }
-            Lead::Layers(lead) => (Some(lead.round() as usize), true),
-        };
+        }
         let (mut end, mut served_sum, mut link_sum) = (0f64, 0f64, 0f64);
         for (at, run) in runs.iter().enumerate() {
             let lines = reads[at].0;
@@ -339,17 +343,24 @@ impl StepInputs<'_> {
                 // names of the layers ahead, their wrong reads after them;
                 // under a token's lead, nothing issued at it.
                 let (route, queued) = (end, device.free - end);
-                let demand = if on_demand { reads[at].3 } else { 0 };
+                let demand = if lead_layers.is_some() { reads[at].3 } else { 0 };
                 let whole = ready[at];
-                let ahead = |device: &mut Device| {
-                    let Some((ahead, &(lines, hinted, wrong, _))) = lead.and_then(|lead| Some((at + lead, reads.get(at + lead)?))) else {
-                        return;
-                    };
-                    let bytes = lines.host.record_bytes as f64;
-                    if hinted > 0 {
-                        ready[ahead] = ready[ahead].max(device.read(route, hinted as f64, bytes) + landing(ahead, hinted));
+                let ahead = |device: &mut Device| match lead_layers {
+                    Some(0) => {
+                        let (lines, _, wrong, _) = reads[at];
+                        device.read(route, wrong, lines.host.record_bytes as f64);
                     }
-                    device.read(route, wrong, bytes);
+                    Some(lead) => {
+                        let Some((ahead, &(lines, hinted, wrong, _))) = at.checked_add(lead).and_then(|ahead| Some((ahead, reads.get(ahead)?))) else {
+                            return;
+                        };
+                        let bytes = lines.host.record_bytes as f64;
+                        if hinted > 0 {
+                            ready[ahead] = ready[ahead].max(device.read(route, hinted as f64, bytes) + landing(ahead, hinted));
+                        }
+                        device.read(route, wrong, bytes);
+                    }
+                    None => {}
                 };
                 let (layer_end, service, link) = self.layer(lines, run.load, route, whole, demand, tau, &mut device, ahead);
                 (end, left) = (layer_end, left - 1);
@@ -867,5 +878,50 @@ mod tests {
                 close(link, expected_link);
             }
         }
+    }
+
+    /// When `Lead::Layers(lead)` rounds to `0` (mean lead `< 0.5`), hinted
+    /// misses are folded into on-demand reads so the layer's barrier still
+    /// waits for them, while imprecise hints' wrong reads queue behind them
+    /// at that layer's route.
+    #[test]
+    fn zero_rounded_lead_keeps_hinted_misses_on_demand_barrier() {
+        let lines = [unified(); 4];
+        let unhinted = [load(0, 0.), load(2, 0.), load(0, 0.), load(0, 0.)];
+        let expected_demand = one(&inputs(&lines, Lead::Layers(0.), 1.), &unhinted).0;
+        close(expected_demand, 1e-3 + 2e-3 + 3e-3);
+
+        for lead in [0., 0.4, -1., f64::NAN] {
+            let zero_lead = inputs(&lines, Lead::Layers(lead), 1.);
+            for recall in [0.5, 1.] {
+                let loads = [load(0, recall), load(2, recall), load(0, recall), load(0, recall)];
+                let (step, _, bytes, _) = one(&zero_lead, &loads);
+                close(step, expected_demand);
+                close(bytes, 2. * 2e6);
+            }
+        }
+
+        // Imprecise hints at zero-rounded lead: layer 1 still waits for its 2
+        // misses (3 ms) while its 2 wrong reads queue behind them (to 5 ms),
+        // delaying layer 2's 1 miss (routed at 4 ms) until 6 ms (+ 2 ms compute = 8 ms).
+        let imprecise = StepInputs {
+            ahead: ReadAhead { precision: 0.5, lead: Lead::Layers(0.4) },
+            ..inputs(&lines, Lead::Layers(0.4), 1.)
+        };
+        let (step_alone, _, bytes_alone, _) = one(&imprecise, &[load(0, 1.), load(2, 1.), load(0, 1.), load(0, 1.)]);
+        close(step_alone, 6e-3);
+        close(bytes_alone, 4. * 2e6);
+
+        let (step_queued, _, bytes_queued, _) = one(&imprecise, &[load(0, 1.), load(2, 1.), load(1, 0.), load(0, 1.)]);
+        close(step_queued, 8e-3);
+        close(bytes_queued, 5. * 2e6);
+
+        // Host-tiered lines also receive the real file readiness delay rather
+        // than `0.0` when `Lead::Layers` rounds to `0`.
+        let tiered = [ExpertLines::reference(2_000_000); 4];
+        let demand_tiered = one(&inputs(&tiered, Lead::Layers(0.), 1.), &unhinted);
+        let hinted_tiered = one(&inputs(&tiered, Lead::Layers(0.4), 1.), &[load(0, 1.), load(2, 1.), load(0, 1.), load(0, 1.)]);
+        close(hinted_tiered.0, demand_tiered.0);
+        close(hinted_tiered.1, demand_tiered.1);
     }
 }
