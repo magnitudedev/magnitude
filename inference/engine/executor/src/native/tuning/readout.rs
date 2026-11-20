@@ -201,6 +201,9 @@ impl HeadRowsTuning {
 impl EntryTuning for HeadRowsTuning {
     type Entry = readout_head_rows::Entry;
     type Case = HeadRowsCase;
+    fn row_dimension(&self) -> &'static str {
+        "O"
+    }
     /// A readout's call projects the launch's projected rows, which its
     /// kernel is bound by (`project_readout`).
     fn launch_rows(&self, launch: &Launch) -> u64 {
@@ -310,6 +313,9 @@ impl SelectedRowsTuning {
 impl EntryTuning for SelectedRowsTuning {
     type Entry = readout_selected_rows::Entry;
     type Case = SelectedRowsCase;
+    fn row_dimension(&self) -> &'static str {
+        "O"
+    }
     /// A readout's call projects the launch's projected rows, which its
     /// kernel is bound by (`project_readout`).
     fn launch_rows(&self, launch: &Launch) -> u64 {
@@ -415,6 +421,9 @@ pub(crate) struct PreparedProjectionCase {
 impl EntryTuning for PreparedProjectionTuning {
     type Entry = readout_project_rows::Entry;
     type Case = PreparedProjectionCase;
+    fn row_dimension(&self) -> &'static str {
+        "O"
+    }
     /// A readout's call projects the launch's projected rows, which its
     /// kernel is bound by (`project_readout`).
     fn launch_rows(&self, launch: &Launch) -> u64 {

@@ -7279,18 +7279,27 @@ pub fn kernel_digest(
                 backend.as_str()
             ))
         })?;
-    // A kernel's identity names a backend, not an opened device: a declaration
-    // whose defaults read the device has no device-free default to name.
-    // A launch's geometry may read the device; the declaration's digest
-    // names it as declared.
-    let default = implementation
-        .default_specialization_without_device(statics)
-        .ok_or_else(|| {
-            declaration(format!(
-                "`{entry_name}`'s defaults read the device's properties; a kernel identity names no device"
-            ))
-        })?
-        .map_err(|error| declaration(error.to_string()))?;
+    // A kernel's identity names a backend, not a device. When the
+    // declaration has a device-free default, digest that default; when its
+    // defaults read the device, validate that every static is present and
+    // digest the statics alongside the declaration's own digest (which
+    // already hashes every parameter's default AST and launch geometry).
+    let specialization = match implementation.default_specialization_without_device(statics) {
+        Some(result) => result.map_err(|error| declaration(error.to_string()))?,
+        None => {
+            if let Some(name) = implementation
+                .statics
+                .iter()
+                .find(|name| statics.static_value(name).is_none())
+            {
+                return Err(declaration(
+                    seismic_lang::checked::NativeSpecializationError::MissingStatic(name.clone())
+                        .to_string(),
+                ));
+            }
+            statics.clone()
+        }
+    };
     let mut digest = Sha256::new();
     digest.update(b"kernel-identity-v2");
     digest.update(backend.as_str().as_bytes());
@@ -7299,7 +7308,7 @@ pub fn kernel_digest(
         let storage = seismic_lang::registry::representation_info(representation).name;
         digest.update(format!("{parameter:?}={storage:?};").as_bytes());
     }
-    digest.update(format!("{default:?}").as_bytes());
+    digest.update(format!("{specialization:?}").as_bytes());
     let dialect = match backend {
         BackendName::Cpu => {
             let kernels = cpu.ok_or_else(|| {
@@ -7359,8 +7368,15 @@ pub fn kernel_digest(
             ))
         })?;
         digest.update(
-            super::abi::render_source(dialect, &logical, bindings, implementation, &default, asset)
-                .as_bytes(),
+            super::abi::render_source(
+                dialect,
+                &logical,
+                bindings,
+                implementation,
+                &specialization,
+                asset,
+            )
+            .as_bytes(),
         );
     }
     Ok(crate::telemetry::hex(&digest.finalize()))

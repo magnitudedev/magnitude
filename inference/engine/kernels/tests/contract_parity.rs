@@ -76,14 +76,31 @@ fn assert_contract_parity<E: EntryContract>(
         let expected_default = implementation.default_specialization_without_device(&statics);
         let actual_default = E::contract_default_params(backend, elements, dims);
 
-        let spec = match expected_default {
+        let (spec, device_dependent) = match expected_default {
             None => {
                 // Implementation's defaults or constraint read `device.NAME`.
                 assert!(
                     matches!(actual_default, Err(ContractError::DeviceDependent(_))),
                     "{label} ({backend:?}): expected DeviceDependent, got {actual_default:?}"
                 );
-                continue;
+                let constraint_reads_device =
+                    implementation.constraint.as_ref().is_some_and(|constraint| {
+                        let mut reads = Vec::new();
+                        constraint.device_reads(&mut reads);
+                        !reads.is_empty()
+                    });
+                if constraint_reads_device {
+                    continue;
+                }
+                let mut first = None;
+                let walked = implementation.walk_admissible(&statics, |configuration| {
+                    first = Some(configuration.clone());
+                    false
+                });
+                match (walked, first) {
+                    (Ok(()), Some(spec)) => (spec, true),
+                    _ => continue,
+                }
             }
             Some(Err(NativeSpecializationError::Inadmissible)) => {
                 assert_eq!(
@@ -103,12 +120,8 @@ fn assert_contract_parity<E: EntryContract>(
             Some(Err(other)) => {
                 panic!("{label} ({backend:?}): unexpected default_specialization error: {other}");
             }
-            Some(Ok(spec)) => spec,
+            Some(Ok(spec)) => (spec, false),
         };
-
-        let params = actual_default.unwrap_or_else(|err| {
-            panic!("{label} ({backend:?}): contract_default_params failed: {err:?}")
-        });
 
         let spec_ref = &spec;
         let expected_params: Vec<(&str, u64)> = implementation
@@ -140,10 +153,18 @@ fn assert_contract_parity<E: EntryContract>(
             )
             .collect();
 
-        assert_eq!(
-            params, expected_params,
-            "{label} ({backend:?}): default params mismatch"
-        );
+        let params: Vec<(&str, u64)> = if device_dependent {
+            expected_params
+        } else {
+            let params = actual_default.unwrap_or_else(|err| {
+                panic!("{label} ({backend:?}): contract_default_params failed: {err:?}")
+            });
+            assert_eq!(
+                params, expected_params,
+                "{label} ({backend:?}): default params mismatch"
+            );
+            params
+        };
 
         // 2. Compare contract_admit against implementation.validate(&spec).
         assert_eq!(

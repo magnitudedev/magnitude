@@ -206,7 +206,7 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
 #pragma unroll
         for (int d = 0; d < DPL; ++d) queries[h * W + lane * DPL + d] = x[d] * query_scale;
     }
-    if (attention::FRESH && part == 0 && warp == WARPS - 1) {
+    if (attention::FRESH && part == 0 && warp == WARPS - 1 && ATTENTION_DESTINATION(in, row) >= 0) {
         float k[DPL];
         attention::prepared_key(in, row, kv, k, own, lane);
         attention::append(in, history, row, kv, k, lane);

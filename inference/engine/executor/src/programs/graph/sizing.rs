@@ -1218,7 +1218,81 @@ fn eval_contract_launches<E: EntryContract>(
     dims: &[(&str, u64)],
     words: &[(&str, u64, bool)],
 ) -> Result<u64, ContractError> {
-    let params = E::contract_default_params(backend, elements, dims)?;
+    let params = match E::contract_default_params(backend, elements, dims) {
+        Ok(params) => params,
+        Err(ContractError::DeviceDependent(property)) => {
+            let implementation =
+                seismic::generated::native_implementation_at::<E>(backend, elements)
+                    .ok()
+                    .flatten()
+                    .ok_or(ContractError::DeviceDependent(property))?;
+            let constraint_reads_device =
+                implementation.constraint.as_ref().is_some_and(|constraint| {
+                    let mut reads = Vec::new();
+                    constraint.device_reads(&mut reads);
+                    !reads.is_empty()
+                });
+            let mut launch_params = Vec::new();
+            if let Some(repeat) = &implementation.repeat {
+                repeat.count.parameters(&mut launch_params);
+            }
+            for launch in &implementation.launches {
+                if let Some(when) = &launch.when {
+                    when.parameters(&mut launch_params);
+                }
+            }
+            if constraint_reads_device || !launch_params.is_empty() {
+                return Err(ContractError::DeviceDependent(property));
+            }
+            let mut statics = seismic::NativeSpecialization::new();
+            for name in &implementation.statics {
+                let value = dims
+                    .iter()
+                    .find(|(candidate, _)| *candidate == name.as_str())
+                    .map(|(_, value)| *value)
+                    .ok_or(ContractError::DeviceDependent(property))?;
+                statics = statics.with_static(name.clone(), value);
+            }
+            let mut first = None;
+            implementation
+                .walk_admissible(&statics, |configuration| {
+                    first = Some(configuration.clone());
+                    false
+                })
+                .map_err(|_| ContractError::DomainViolation)?;
+            let spec = first.ok_or(ContractError::DomainViolation)?;
+            let spec_ref = &spec;
+            implementation
+                .params
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.as_str(),
+                        spec_ref
+                            .param(&p.name)
+                            .expect("admissible specialization binds every entry param"),
+                    )
+                })
+                .chain(
+                    implementation
+                        .launches
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(launch_idx, launch)| {
+                            launch.params.iter().map(move |p| {
+                                (
+                                    p.name.as_str(),
+                                    spec_ref
+                                        .launch_param(launch_idx, &p.name)
+                                        .expect("admissible specialization binds every launch param"),
+                                )
+                            })
+                        }),
+                )
+                .collect()
+        }
+        Err(err) => return Err(err),
+    };
     E::contract_active_launches(backend, elements, dims, &params, words)
 }
 

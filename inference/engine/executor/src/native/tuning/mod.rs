@@ -1109,6 +1109,12 @@ pub(crate) trait EntryTuning: Clone + 'static {
     fn launch_rows(&self, launch: &Launch) -> u64 {
         launch.rows
     }
+    /// The dimension name of the rows this entry's launch conditions and grid
+    /// axes index by: `"M"` for entries operating on every step row, `"O"` for
+    /// entries operating on an `out_rows` subset.
+    fn row_dimension(&self) -> &'static str {
+        "M"
+    }
     /// Project a logical graph launch onto this entry's performance
     /// representative: the rows of the point that times it, none where the
     /// unit's kernel does not serve it (another kernel for the same layers
