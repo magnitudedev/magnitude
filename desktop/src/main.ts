@@ -5,7 +5,7 @@ import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
 import { makeHostActions } from "./host-actions"
 import { UpdateSetupRefused, updateSetupReason } from "./update-setup"
-import { startupFailureDetail } from "./startup-failure"
+import { runsFromDiskImage, startupFailureDetail } from "./startup-failure"
 import { nativeQuitFailureDecision, resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
 import { buildTrayMenu, MODEL_STATUS_ITEM } from "./tray-menu"
@@ -497,7 +497,7 @@ Effect.runPromiseExit(program.pipe(
     const message = Cause.pretty(cause)
     console.error(message)
     if (!canPresentErrors) { exiting = true; app.exit(1); return }
-    const detail = startupFailureDetail(cause)
+    const detail = startupFailureDetail(cause, process.platform === "darwin" && app.isPackaged && runsFromDiskImage(app.getPath("exe")))
     void app.whenReady().then(() => {
       if (!background && !systemShutdownRequested) dialog.showErrorBox("Magnitude couldn’t continue", detail)
       exiting = true
