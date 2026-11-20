@@ -194,11 +194,7 @@ impl<'a> PrefixPath<'a> {
         self.shared(
             key.tokens.iter(),
             key.coordinates.iter().copied(),
-            |position| {
-                key.conditioning
-                    .iter()
-                    .take_while(move |span| span.start < position)
-            },
+            &key.conditioning,
             |position| {
                 !key.conditioning.iter().any(|span| {
                     span.boundaries == magnitude_family_contracts::BoundaryRule::Indivisible
@@ -215,43 +211,54 @@ impl<'a> PrefixPath<'a> {
         self.shared(
             live.prompt.iter(),
             live.coordinates.coordinates().iter().copied(),
-            |position| {
-                live.layout
-                    .spans()
-                    .iter()
-                    .take_while(move |span| span.start < position)
-            },
+            live.layout.spans(),
             |position| live.layout.boundary(position),
         )
     }
 
-    fn shared<'b, I>(
+    fn shared<'b>(
         &self,
         tokens: impl Iterator<Item = &'b TokenId>,
         coordinates: impl Iterator<Item = [i32; 3]>,
-        other_conditioning: impl Fn(usize) -> I,
+        other_spans: &[InputSpan],
         other_boundary: impl Fn(usize) -> bool,
-    ) -> usize
-    where
-        I: Iterator<Item = &'b InputSpan>,
-    {
+    ) -> usize {
+        // Conditioning spans are ordered by `start`, so `conditioning_at(p) ==
+        // other_conditioning(p)` holds iff `p <= cond_limit`, where `cond_limit`
+        // is the start of the first diverging span (or unbounded when identical).
+        let mut cond_limit = usize::MAX;
+        let mut left_spans = self.layout.spans().iter();
+        let mut right_spans = other_spans.iter();
+        loop {
+            match (left_spans.next(), right_spans.next()) {
+                (Some(left), Some(right)) if left == right => {}
+                (Some(left), Some(right)) => {
+                    cond_limit = left.start.min(right.start);
+                    break;
+                }
+                (Some(left), None) => {
+                    cond_limit = left.start;
+                    break;
+                }
+                (None, Some(right)) => {
+                    cond_limit = right.start;
+                    break;
+                }
+                (None, None) => break,
+            }
+        }
         let common = self
             .tokens()
             .zip(self.coordinates())
             .zip(tokens.zip(coordinates))
+            .take(cond_limit)
             .take_while(|((left_tok, left_coord), (right_tok, right_coord))| {
                 left_tok == right_tok && left_coord == right_coord
             })
             .count();
         (0..=common)
             .rev()
-            .find(|&position| {
-                self.exact_boundary(position)
-                    && other_boundary(position)
-                    && self
-                        .conditioning_at(position)
-                        .eq(other_conditioning(position))
-            })
+            .find(|&position| self.exact_boundary(position) && other_boundary(position))
             .unwrap_or(0)
     }
 }
@@ -292,6 +299,10 @@ pub struct CachedPrefix<S> {
     state: S,
     method: MethodCheckpoint,
     key: PrefixKey,
+    /// Cached tokens this entry saves beyond the deepest shorter prefix entry
+    /// under the same method at depth >= [`MIN_PREFIX_HIT`]. Maintained on
+    /// every insertion and removal in [`PrefixCache::entries`].
+    saved_tokens: usize,
     last_use: u64,
     submitted: usize,
     /// The cache's lookups when the entry was retained, and the lookups
@@ -476,12 +487,13 @@ impl<S> PrefixCache<S> {
             .next_id
             .checked_add(1)
             .ok_or("prefix cache entry identity exhausted")?;
-        self.entries.push(CachedPrefix {
+        self.push_entry(CachedPrefix {
             id,
             point,
             state,
             method,
             key,
+            saved_tokens: 0,
             last_use,
             submitted: 0,
             lookups_at_retain: self.lookups,
@@ -489,7 +501,9 @@ impl<S> PrefixCache<S> {
         });
         while self.entries.len() > self.capacity.max_entries {
             if !self.evict_one_except(id) {
-                self.entries.retain(|entry| entry.id != id);
+                if let Some(index) = self.entries.iter().position(|entry| entry.id == id) {
+                    self.remove_entry(index);
+                }
                 return Ok(false);
             }
         }
@@ -536,7 +550,8 @@ impl<S> PrefixCache<S> {
     /// their holder evicts first ([`Self::evict_one`]). None with no such
     /// entry.
     pub fn least_value(&self) -> Option<(u64, u64)> {
-        self.victim(|_| true).map(|index| (self.saved_tokens(index) as u64, self.entries[index].hits))
+        self.victim(|_| true)
+            .map(|index| (self.entries[index].saved_tokens as u64, self.entries[index].hits))
     }
 
     /// The ledger took the retained prefixes' cache: drop the entry worth
@@ -549,7 +564,7 @@ impl<S> PrefixCache<S> {
         let unused = self.victim(|entry| !held.contains(&entry.id));
         match unused.or_else(|| self.victim(|_| true)) {
             Some(index) => {
-                self.entries.remove(index);
+                self.remove_entry(index);
                 true
             }
             None => false,
@@ -590,7 +605,7 @@ impl<S> PrefixCache<S> {
         let Some(index) = self.unspared(held) else {
             return false;
         };
-        self.entries.remove(index);
+        self.remove_entry(index);
         true
     }
 
@@ -613,7 +628,7 @@ impl<S> PrefixCache<S> {
 
     /// The prefill tokens entry `index` saves a request, in expectation:
     /// the tokens it holds beyond the deepest shorter entry on its path that
-    /// a hit would fall back to ([`Self::saved_tokens`]), times its chance of
+    /// a hit would fall back to (`entry.saved_tokens`), times its chance of
     /// a hit per lookup. The chance is Laplace's estimate from the lookups
     /// since it was retained, `(hits + 1) / (lookups + 2)`: an entry no
     /// lookup has seen yet is as likely hit as not, and each lookup that
@@ -622,29 +637,72 @@ impl<S> PrefixCache<S> {
         let entry = &self.entries[index];
         let lookups = self.lookups - entry.lookups_at_retain;
         let chance = (entry.hits + 1) as f64 / (lookups + 2) as f64;
-        self.saved_tokens(index) as f64 * chance
+        entry.saved_tokens as f64 * chance
     }
 
-    /// The tokens entry `index` holds beyond the deepest other entry a hit
-    /// on its path would resume from instead: one retained under the same
-    /// method, at least [`MIN_PREFIX_HIT`] deep, whose path is a prefix of
-    /// its own.
-    fn saved_tokens(&self, index: usize) -> usize {
-        let entry = &self.entries[index];
-        let fallback = self
-            .entries
+    /// Compute the exact tokens `target` holds beyond the deepest other entry
+    /// in `entries` a hit on its path would resume from instead: one retained
+    /// under the same method, at least [`MIN_PREFIX_HIT`] deep, whose path is
+    /// a prefix of its own.
+    fn compute_saved_tokens(entries: &[CachedPrefix<S>], target: &CachedPrefix<S>) -> usize {
+        let target_pos = target.position();
+        let target_method = std::mem::discriminant(&target.method);
+        let fallback = entries
             .iter()
             .filter(|other| {
-                other.id != entry.id
+                other.id != target.id
                     && other.position() >= MIN_PREFIX_HIT
-                    && other.position() < entry.position()
-                    && std::mem::discriminant(&other.method) == std::mem::discriminant(&entry.method)
-                    && other.key.is_prefix_of(&entry.key)
+                    && other.position() < target_pos
+                    && std::mem::discriminant(&other.method) == target_method
+                    && other.key.is_prefix_of(&target.key)
             })
             .map(CachedPrefix::position)
             .max()
             .unwrap_or(0);
-        entry.position() - fallback
+        target_pos - fallback
+    }
+
+    /// Push `entry` into `self.entries`, initializing its `saved_tokens` and
+    /// tightening `saved_tokens` on any deeper existing entries it becomes the
+    /// new fallback for.
+    fn push_entry(&mut self, mut entry: CachedPrefix<S>) {
+        entry.saved_tokens = Self::compute_saved_tokens(&self.entries, &entry);
+        let new_pos = entry.position();
+        if new_pos >= MIN_PREFIX_HIT {
+            let new_method = std::mem::discriminant(&entry.method);
+            for existing in &mut self.entries {
+                let candidate = existing.position().saturating_sub(new_pos);
+                if existing.position() > new_pos
+                    && candidate < existing.saved_tokens
+                    && std::mem::discriminant(&existing.method) == new_method
+                    && entry.key.is_prefix_of(&existing.key)
+                {
+                    existing.saved_tokens = candidate;
+                }
+            }
+        }
+        self.entries.push(entry);
+    }
+
+    /// Remove `self.entries[index]` and recompute `saved_tokens` for any
+    /// remaining entry whose fallback depth equaled the removed entry's.
+    fn remove_entry(&mut self, index: usize) {
+        let removed = self.entries.remove(index);
+        let removed_pos = removed.position();
+        if removed_pos < MIN_PREFIX_HIT {
+            return;
+        }
+        let removed_method = std::mem::discriminant(&removed.method);
+        for i in 0..self.entries.len() {
+            let entry = &self.entries[i];
+            if entry.position() > removed_pos
+                && entry.position() - entry.saved_tokens == removed_pos
+                && std::mem::discriminant(&entry.method) == removed_method
+                && removed.key.is_prefix_of(&entry.key)
+            {
+                self.entries[i].saved_tokens = Self::compute_saved_tokens(&self.entries, &self.entries[i]);
+            }
+        }
     }
 
     /// The checkpoints the plan charges the most recently cached
@@ -681,14 +739,20 @@ impl<S> PrefixCache<S> {
 
     /// Drop every entry without submitted uses.
     pub fn evict_all(&mut self) {
+        let before = self.entries.len();
         self.entries.retain(|entry| entry.submitted != 0);
+        if self.entries.len() != before {
+            for i in 0..self.entries.len() {
+                self.entries[i].saved_tokens = Self::compute_saved_tokens(&self.entries, &self.entries[i]);
+            }
+        }
     }
 
     fn evict_one_except(&mut self, keep: u64) -> bool {
         let Some(index) = self.victim(|entry| entry.id != keep) else {
             return false;
         };
-        self.entries.remove(index);
+        self.remove_entry(index);
         true
     }
 
@@ -1476,5 +1540,138 @@ mod tests {
         assert!(!retain(&mut cache, &second, 64, rows(1..2)));
         assert_eq!(cache.len(), 1);
         assert!(lookup_any(&mut cache, &second).is_none());
+    }
+
+    #[test]
+    fn cached_saved_tokens_matches_exact_overlap_across_retain_and_remove() {
+        let assert_invariants = |cache: &PrefixCache<Rows>| {
+            for entry in &cache.entries {
+                assert_eq!(
+                    entry.saved_tokens,
+                    PrefixCache::compute_saved_tokens(&cache.entries, entry),
+                    "cached saved_tokens drifted for entry id={} at position={}",
+                    entry.id,
+                    entry.position(),
+                );
+            }
+        };
+
+        let mut cache = PrefixCache::new(capacity(16));
+        let owned = text(200, "nested");
+        // Insert out of order (deepest first, then middle, then shallow, then below MIN_PREFIX_HIT).
+        assert!(retain(&mut cache, &owned, 160, rows(0..1)));
+        assert_invariants(&cache);
+        assert_eq!(cache.least_value(), Some((160, 0)));
+
+        assert!(retain(&mut cache, &owned, 80, rows(1..2)));
+        assert_invariants(&cache);
+        // 80 saves 80, 160 now saves 80 beyond 80.
+        assert_eq!(cache.least_value(), Some((80, 0)));
+
+        assert!(retain(&mut cache, &owned, 110, rows(2..3)));
+        assert_invariants(&cache);
+        // 110 saves 30 beyond 80, 160 saves 50 beyond 110.
+        assert_eq!(cache.least_value(), Some((30, 0)));
+
+        assert!(retain(&mut cache, &owned, 64, rows(3..4)));
+        assert_invariants(&cache);
+        // 80 now saves 16 beyond 64.
+        assert_eq!(cache.least_value(), Some((16, 0)));
+
+        // Below MIN_PREFIX_HIT: never acts as a fallback for deeper entries.
+        assert!(retain(&mut cache, &owned, 40, rows(4..5)));
+        assert_invariants(&cache);
+
+        // Separate method on the same path does not share fallbacks.
+        let mtp = MethodChoice::Mtp { proposals: 2 };
+        assert!(cache
+            .retain(
+                owned.under(mtp),
+                120,
+                CachePoint::Branch,
+                rows(5..6),
+                MethodCheckpoint::Mtp(magnitude_generation::DraftCheckpoint::trailing_at(120)),
+            )
+            .unwrap());
+        assert_invariants(&cache);
+
+        // Evict one by one and verify saved_tokens updates as fallbacks disappear.
+        // First victim: 80 (saves 16). After removing 80, 110 falls back to 64 (saves 46).
+        assert!(cache.evict_one(&BTreeSet::new()));
+        assert_invariants(&cache);
+        // Next victim: 40 (saves 40).
+        assert!(cache.evict_one(&BTreeSet::new()));
+        assert_invariants(&cache);
+        // Next victim: 110 (saves 46 beyond 64). After removing 110, 160 falls back to 64 (saves 96).
+        assert!(cache.evict_one(&BTreeSet::new()));
+        assert_invariants(&cache);
+        assert_eq!(cache.least_value(), Some((64, 0)));
+
+        // Rollback when capacity is full of submitted entries must restore saved_tokens.
+        let mut bounded = PrefixCache::new(capacity(1));
+        assert!(retain(&mut bounded, &owned, 160, rows(10..11)));
+        let hit = lookup_any(&mut bounded, &owned).unwrap();
+        bounded.begin_submitted(hit.id()).unwrap();
+        assert!(!retain(&mut bounded, &owned, 100, rows(11..12)));
+        assert_invariants(&bounded);
+        assert_eq!(bounded.entries[0].saved_tokens, 160);
+
+        // evict_all recomputes saved_tokens for surviving submitted entries.
+        let hit = lookup_any(&mut cache, &owned).unwrap();
+        assert_eq!(hit.position(), 160);
+        cache.begin_submitted(hit.id()).unwrap();
+        cache.evict_all();
+        assert_invariants(&cache);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.entries[0].saved_tokens, 160);
+    }
+
+    #[test]
+    fn shared_bounds_early_conditioning_divergence() {
+        let build = |spans: Vec<InputSpan>| Owned {
+            prompt: (0..1024).map(TokenId).collect(),
+            generated: Vec::new(),
+            layout: InputLayout::new(1024, spans).unwrap(),
+            coordinates: PromptCoordinates::linear(1024).unwrap(),
+        };
+        let span = |start, end, id: &str, boundaries| InputSpan {
+            start,
+            end,
+            identity: id.into(),
+            boundaries,
+            language_history: false,
+        };
+        let a = build(vec![
+            span(4, 10, "shared", BoundaryRule::Indivisible),
+            span(20, 30, "img-a", BoundaryRule::Indivisible),
+        ]);
+        let b = build(vec![
+            span(4, 10, "shared", BoundaryRule::Indivisible),
+            span(20, 30, "img-b", BoundaryRule::Indivisible),
+        ]);
+        let shorter_spans = build(vec![span(4, 10, "shared", BoundaryRule::Indivisible)]);
+        let shifted = build(vec![
+            span(4, 10, "shared", BoundaryRule::Indivisible),
+            span(25, 35, "img-a", BoundaryRule::Indivisible),
+        ]);
+
+        // Divergence at the second span (position 20) despite 1024 identical tokens.
+        assert_eq!(a.path().shared_with_prompt_of(b.path()), 20);
+        assert_eq!(a.path().shared_with_prompt_of(shorter_spans.path()), 20);
+        assert_eq!(shorter_spans.path().shared_with_prompt_of(a.path()), 20);
+        assert_eq!(a.path().shared_with_prompt_of(shifted.path()), 20);
+
+        // Same behavior through PrefixKey::shared_boundary.
+        let mut cache = PrefixCache::new(capacity(4));
+        assert!(retain(&mut cache, &a, 1024, rows(0..1)));
+        assert_eq!(cache.shared_boundary(b.path()), 20);
+        assert_eq!(cache.shared_boundary(shorter_spans.path()), 20);
+        assert_eq!(cache.shared_boundary(shifted.path()), 20);
+
+        // Token divergence inside a shared indivisible span rolls back to span.start.
+        let mut inside_indivisible = build(vec![span(4, 10, "shared", BoundaryRule::Indivisible)]);
+        inside_indivisible.prompt[7] = TokenId(99_999);
+        assert_eq!(a.path().shared_with_prompt_of(inside_indivisible.path()), 4);
+        assert_eq!(cache.shared_boundary(inside_indivisible.path()), 4);
     }
 }

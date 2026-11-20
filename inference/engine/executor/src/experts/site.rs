@@ -159,10 +159,10 @@ pub(crate) struct SiteTensors {
 }
 
 impl SiteTensors {
-    fn address(&mut self, views: &[Records]) {
+    fn address(&mut self, views: &[Records], displaced: &mut Vec<Records>) {
         let tensors = self.gate.iter_mut().chain([&mut self.up, &mut self.down]);
         for (tensor, records) in tensors.zip(views) {
-            tensor.records = records.clone();
+            displaced.push(std::mem::replace(&mut tensor.records, records.clone()));
         }
     }
 }
@@ -1566,11 +1566,15 @@ impl Site {
 
     /// Each group's tier records `views` address from now (between flights,
     /// or a growth's joined slot, which leaves every record a request names
-    /// where it is), for every layer of the group.
-    pub(super) fn address(&self, views: &[Vec<Records>]) {
+    /// where it is), for every layer of the group. Returns the displaced
+    /// `Records` so the caller can drop them outside `layer.tensors.write()`
+    /// and any no-blocking-allocation scope.
+    pub(super) fn address(&self, views: &[Vec<Records>]) -> Vec<Records> {
+        let mut displaced = Vec::new();
         for layer in &self.layers {
-            layer.tensors.write().expect("site tensors").address(&views[layer.group]);
+            layer.tensors.write().expect("site tensors").address(&views[layer.group], &mut displaced);
         }
+        displaced
     }
 
     /// Record `step`'s failure at site layer `index` of `rows` for `why`,

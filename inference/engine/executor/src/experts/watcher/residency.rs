@@ -736,7 +736,7 @@ impl Residency {
     /// between flights, or a growth's joined slot): the landings' tier
     /// tensors and the CPU site's, which read the same records.
     pub(super) fn address_tier(&mut self, views: Vec<Vec<crate::experts::source::Records>>) {
-        self.shared.compute.address(&views);
+        self.owed.deferred_records.extend(self.shared.compute.address(&views));
         self.core.address_tier(views, &mut self.owed.deferred_records);
     }
 
