@@ -661,6 +661,28 @@ impl ResumeState {
     }
 }
 
+/// How urgently the domain's memory state asks for timed re-reads when idle
+/// between flights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryStanding {
+    /// No active shortage/wait/step and every bank holding is saturated.
+    Settled,
+    /// Calm state where at least one bank holding sits below saturation and can
+    /// opportunistically reclaim room if another app releases RAM.
+    Opportunity,
+    /// Active shortage, refused claim waiting, or open growth step.
+    Active,
+}
+
+#[derive(Clone, Debug)]
+struct ExogenousShrink {
+    store: seismic::StoreIdentity,
+    at: std::time::Instant,
+    committed: u64,
+    hold_room: u64,
+    block: u64,
+}
+
 /// Native executor with no erased stage or executor type parameters. The
 /// accepted map is vacant while that request's advance is in flight.
 pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
@@ -784,6 +806,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// kept as its slots were made; elsewhere it records its graphs at
     /// first use, as any new shape's.
     shrink_step: bool,
+    /// Records the most recent bank shrink's reading state so transient external
+    /// room jitter cannot immediately ping-pong back into a small grow while
+    /// still letting own-claim frees and large app exits regrow immediately.
+    exogenous_shrink: Option<ExogenousShrink>,
     /// A cut of the expert bank begun beside a running chain, until the
     /// owner takes it ([`Self::take_running_release`]): the storage it
     /// resizes.
@@ -1952,14 +1978,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.stores().map(crate::memory::ledger::Ledger::holdings_generation).sum()
     }
 
-    /// Whether anything stands that only a later reading can answer: a
-    /// store's own standing (`memory::ledger::Ledger::standing`: a real
-    /// shortage, a refused claim waiting, a growth the boundary holds
-    /// back), or the expert bank short of its saturation in any holding
-    /// (`experts::derived::BankShape::saturation_slots`), which only memory
-    /// another program frees can grow, and which the ledger, holding no
-    /// miss curve, cannot see.
-    pub fn memory_stands(&self) -> Result<bool, DomainError> {
+    /// How urgently the domain's ledgers and bank ask for timed re-reads when idle:
+    /// `Active` on an active shortage/wait/step, `Opportunity` when calm but a bank
+    /// holding is short of saturation, `Settled` otherwise.
+    pub fn memory_standing(&self) -> Result<MemoryStanding, DomainError> {
         if self.stores().any(|ledger| {
             matches!(
                 ledger.standing(),
@@ -1970,12 +1992,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 )
             )
         }) {
-            return Ok(true);
+            return Ok(MemoryStanding::Active);
         }
         let Some(bank) = self.family.expert_bank() else {
-            return Ok(false);
+            return Ok(MemoryStanding::Settled);
         };
-        self.derive_bank(bank, |derived| derived.iter().any(|(target, _)| target.at < target.shape.saturation_slots()))
+        let unsaturated = self.derive_bank(bank, |derived| derived.iter().any(|(target, _)| target.at < target.shape.saturation_slots()))?;
+        Ok(match unsaturated {
+            true => MemoryStanding::Opportunity,
+            false => MemoryStanding::Settled,
+        })
     }
 
     /// The sum of readings folded into the load's stores so far: unchanged
@@ -2986,6 +3012,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             measures: None,
             resize_held: ResizeHeld::default(),
             shrink_step: false,
+            exogenous_shrink: None,
             running_release: None,
             _owner: owner,
             teardown: Default::default(),

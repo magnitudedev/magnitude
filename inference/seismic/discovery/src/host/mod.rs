@@ -200,20 +200,22 @@ pub struct Supply {
     /// that its reclaim has not yet refilled), so a fall of free memory
     /// shows whole, above the floor or below it: macOS
     /// `vm.page_free_count + vm.page_purgeable_count` less
-    /// `vm.vm_page_free_target`; Linux `MemFree` less the zones' low
-    /// watermarks (`/proc/zoneinfo`); Windows the free and zero lists, the
-    /// OS keeping no floor of them. In a binding limit, the limit less its
-    /// usage.
+    /// `vm.vm_page_free_target` (with a small multi-GB reserve floor);
+    /// Linux `MemFree` less the zones' low watermarks (`/proc/zoneinfo`);
+    /// Windows `Free & Zero` less Windows' host safety floor. In a binding
+    /// limit, the limit less its usage.
     pub free_beyond_target: i64,
     /// File pages no one has dirtied, which the OS drops without writing:
-    /// macOS file-backed pages (`external_page_count` of a
-    /// `host_statistics64` snapshot; macOS counts no dirty file page) above
-    /// those it keeps while it compresses others' memory, the file pages
-    /// standing where it last compressed more than was free above its
-    /// target (none before);
-    /// Linux `Active(file) + Inactive(file) −
-    /// Dirty − Writeback`, within a cgroup its `active_file + inactive_file −
-    /// file_dirty − file_writeback`; Windows the standby lists.
+    /// macOS live file-backed pages (`vm.page_pageable_external_count`, else
+    /// `external_page_count`) above the larger of `vm.vm_page_xpmapped_min`
+    /// and any temporary compression floor while the OS compresses others'
+    /// memory;
+    /// Linux `Active(file) + Inactive(file) − Dirty − Writeback − Shmem`
+    /// (`Shmem` / tmpfs / shared memory excluded because it cannot drop
+    /// without swap), within a cgroup its `active_file + inactive_file −
+    /// file_dirty − file_writeback − shmem`; Windows reclaimable standby
+    /// lists (`Normal Priority` + `Reserve`, keeping `Standby Cache Core`
+    /// protected), bounded with free pages by available system commit.
     pub clean_cache: u64,
     /// What compressing or swapping the cold anonymous pages frees, bounded
     /// by where they can go: macOS [`HostSample::cold`] times what the
@@ -371,10 +373,12 @@ pub struct Harm {
 pub enum PressureLevel {
     Normal,
     /// macOS `kern.memorystatus_vm_pressure_level` warn; Linux PSI `some
-    /// avg10` above zero; Windows the low-memory resource notification.
+    /// avg10 >= 1.0`; Windows the low-memory resource notification or commit
+    /// headroom within the host safety floor.
     Warn,
-    /// macOS critical; Linux PSI `full avg10` above zero. Windows reports
-    /// no level past low memory.
+    /// macOS critical; Linux PSI `full avg10 >= 0.5`; Windows critical
+    /// commit exhaustion (`<= floor / 2`) or low-memory notification with
+    /// physical availability within the host safety floor.
     Critical,
 }
 

@@ -325,10 +325,11 @@ impl Sys for LiveSys {
             *value = u64::try_from(raw.FirstValue)
                 .unwrap_or_else(|_| panic!("invariant violated: {path} reads {}", raw.FirstValue));
         }
-        let [free_zero, core, normal, reserve] = values;
+        let [free_zero, standby_core, normal, reserve] = values;
         Some(Counters {
             free_zero,
-            standby: core + normal + reserve,
+            standby_core,
+            standby_reclaimable: normal + reserve,
         })
     }
 

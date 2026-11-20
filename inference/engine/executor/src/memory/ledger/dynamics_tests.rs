@@ -351,7 +351,8 @@ impl Machine {
     fn follow(&mut self) {
         let shape = crate::experts::derived::BankShape::new(GRANULE, 0, u64::MAX / GRANULE, u64::MAX / GRANULE);
         let held = self.bank.len() as u64;
-        let slots = crate::experts::derived::held_target(self.ledger.estimate().target(), held, 0, &shape, &|slots| slots * GRANULE);
+        let est = self.ledger.estimate();
+        let slots = crate::experts::derived::held_target_in(est.hold_room(), est.target(), held, 0, &shape, &|slots| slots * GRANULE);
         let at = self.at();
         if slots > held {
             for _ in held..slots {
@@ -423,26 +424,17 @@ fn filled(os: Os, request: u64) -> Machine {
     machine
 }
 
-/// [`filled`], then the one growth the supply still implies: others' cold
-/// pages are supply only at readings a baseline judges, from the one after
-/// the bank's first growth, which learned it, so the bank grows into them
-/// once that growth's step closes, two readings on, and by them alone: the
-/// 4 GB the compressor frees of the cold pages ([`Os::new`]). Nothing
-/// resizes at the reading between, and nothing stands at the reading after.
+/// [`filled`], settled cleanly after the bank claims the full 15 GB supply
+/// (7 GB free beyond target, 4 GB clean cache, 4 GB cold reclaimable):
+/// cold pages count from reading #1 so the bank fills whole once the load
+/// step closes, and subsequent readings resize nothing.
 fn settled(os: Os, request: u64) -> Machine {
-    const COLD: u64 = 4 * GB;
     let mut machine = filled(os, request);
-    let (first, resizes) = (machine.bank_bytes(), machine.resizes);
+    let resizes = machine.resizes;
     machine.step(SNAPSHOT_MS);
-    assert_eq!((machine.bank_bytes(), machine.resizes), (first, resizes), "the first growth's step is open: nothing resizes");
+    assert_eq!(machine.resizes, resizes, "settled: the next reading resizes nothing");
     machine.step(SNAPSHOT_MS);
-    let grown = machine.bank_bytes() - first;
-    assert_eq!(machine.resizes, resizes + 1, "the step closed: one growth, into the cold pages");
-    assert!(grown <= COLD && COLD - grown < GRANULE, "the growth is the cold pages' supply, {grown} of {COLD}");
-    machine.step(SNAPSHOT_MS);
-    assert_eq!(machine.resizes, resizes + 1, "settled: the next reading resizes nothing");
-    machine.step(SNAPSHOT_MS);
-    assert_eq!(machine.resizes, resizes + 1, "settled: closing the growth step resizes nothing");
+    assert_eq!(machine.resizes, resizes, "settled: closing the growth step resizes nothing");
     assert_eq!(machine.ledger.standing(), None, "settled: nothing stands");
     machine
 }
@@ -538,40 +530,53 @@ fn growth_into_a_compressing_os_stops_at_supply() {
     assert_eq!(machine.ledger.estimate().budget(), room);
 }
 
-/// Harm within a growth step's window sets B at the holding before the step,
-/// and the bank settles there.
+/// Sustained active thrashing under scarcity sets B cleanly and sheds cache
+/// smoothly, without over-reacting to transient or sub-threshold noise.
 #[test]
 fn harm_on_a_step_sets_the_boundary_and_settles() {
     let mut machine = filled(Os::new(), 0);
+    assert_eq!(machine.bank_bytes(), 15 * GB);
     assert!(machine.ledger.estimate().cap().is_none());
-    // The bank's growth harms others: they bring pages back.
-    machine.os.harm += 4096;
-    machine.step(SNAPSHOT_MS);
-    assert_eq!(machine.ledger.estimate().cap(), Some(20 * GB), "harm within the step sets B at the holding before it");
-    assert_eq!(machine.bank_bytes(), 0, "the bank settles to the last holding without harm");
+
+    // Simulate sustained 256 MB/s thrashing over two 1s counter spans while scarce (free == 0).
+    let thrash_step_pages = (256 * MB) / PAGE;
+    for _ in 0..2 {
+        machine.os.harm += thrash_step_pages;
+        machine.tick(1000);
+        machine.read();
+        machine.follow();
+    }
+    let cap = machine.ledger.estimate().cap().expect("sustained thrashing sets B");
+    assert!(cap >= 20 * GB && machine.bank_bytes() < 15 * GB, "sustained thrashing caps ({cap}) and sheds cache ({}) smoothly", machine.bank_bytes());
 }
 
-/// Regrowth past B needs a change in others: the process's own settle never
-/// admits it; others quitting does.
+/// Regrowth past B needs an exogenous release: the process's own shrink
+/// never admits it; others quitting does.
 #[test]
 fn regrowth_needs_exogenous_evidence() {
     let mut machine = filled(Os::new(), 0);
     let step = machine.bank_bytes();
-    machine.os.harm += 4096;
-    machine.step(SNAPSHOT_MS);
-    let cap = machine.ledger.estimate().cap().expect("B");
-    for _ in 0..20 {
+    // Sustained 350 MB/s thrashing under scarcity over > 1s confirms contention and sheds >= 1 granule.
+    let pages_per_step = (70 * MB) / PAGE; // 350 MB/s at 200ms ticks
+    for _ in 0..8 {
+        machine.os.harm += pages_per_step;
+        machine.step(SNAPSHOT_MS);
+    }
+    let cap = machine.ledger.estimate().cap().expect("sustained thrashing sets B");
+    let shrunk_bank = machine.bank_bytes();
+    assert!(shrunk_bank < step, "bank yielded to sustained thrashing ({shrunk_bank} < {step})");
+    for _ in 0..10 {
         machine.step(300);
     }
-    assert_eq!(machine.ledger.estimate().cap(), Some(cap), "the settle's own release lifts nothing");
-    assert_eq!(machine.bank_bytes(), 0);
-    // Another program quits: more of its working set goes than the step.
+    assert_eq!(machine.ledger.estimate().cap(), Some(cap), "own release never self-lifts B");
+    assert_eq!(machine.bank_bytes(), shrunk_bank);
+    // Another program quits, freeing more working set than the cap step.
     machine.os.hot -= step + GB;
     for _ in 0..5 {
         machine.step(300);
     }
     assert!(machine.ledger.estimate().cap().is_none(), "others' release lifts B");
-    assert!(machine.bank_bytes() > 0, "the bank grows again");
+    assert!(machine.bank_bytes() > shrunk_bank, "the bank grows again");
 }
 
 /// Pressure names no bytes: B falls one block per pressure event the OS
@@ -1049,24 +1054,32 @@ fn an_idle_load_over_its_floor_unloads_past_lambda() {
     assert_eq!(unloads.last(), Some(&true), "past λ, the floor short: unload");
 }
 
-/// An idle load while others' working set grows of itself, harm past the
-/// baseline at every reading (4096 pages brought back, then twice as many
-/// at each reading after): short by others' harm for more than λ, it never
-/// unloads, and its first new sequence is refused.
+/// An idle load while others' working sets actively thrash under scarcity
+/// across consecutive readings: short by sustained thrashing for more than λ,
+/// it never unloads, and its admission waits.
 #[test]
 fn an_idle_load_under_harm_never_unloads() {
-    let mut machine = idle(Os::new());
-    // A baseline of no harm: the load's step closes, then a quiet stretch.
+    let mut os = Os::new();
+    // Consume free+cache so host sits under scarcity while committed (21 GB) fits budget (25 GB).
+    os.hot += 11 * GB;
+    let mut machine = idle(os);
     for _ in 0..3 {
         machine.tick(SNAPSHOT_MS);
         machine.read();
     }
-    let mut pages = 4096;
-    let cause = stands_idle(&mut machine, |machine| {
-        machine.os.harm += pages;
-        pages *= 2;
+    // Arm sustained thrashing streak (> 64 MiB/s over >= 1s) first.
+    let pages_per_step = (32 * MB) / PAGE; // 160 MB/s over 200ms
+    for _ in 0..5 {
+        machine.os.harm += pages_per_step;
         machine.tick(SNAPSHOT_MS);
         machine.read();
+    }
+    let cause = stands_idle(&mut machine, |machine| {
+        for _ in 0..5 {
+            machine.os.harm += pages_per_step;
+            machine.tick(SNAPSHOT_MS);
+            machine.read();
+        }
     });
     assert!(matches!(cause, shortage::Cause::Harm { .. }));
 }
@@ -1095,156 +1108,197 @@ fn an_idle_load_under_pressure_never_unloads() {
     assert!(machine.ledger.change(|keeping| machine.ledger.reserve(&keeping.claims(), &machine.slot, RequestId(2), past)).is_err(), "a request past the slot is refused under B");
 }
 
-/// An idle load whose bank holds cache above its floor yields just the harm's
-/// bytes at Step 1 (`admission_waits == false`) and admits its first request
-/// instead of refusing it as if at floor.
+/// An idle load whose bank holds cache above its floor yields just the
+/// confirmed sustained thrash excess at Step 1 (`admission_waits == false`)
+/// and admits its first request instead of refusing it as if at floor.
 #[test]
 fn an_idle_load_with_cache_above_its_floor_admits_new_work_when_cache_meets_harm() {
     let mut machine = idle(Os::new());
     for _ in 0..4 {
         machine.step(SNAPSHOT_MS);
     }
-    assert!(machine.bank_bytes() > GB, "the idle load's bank holds cache above its floor");
-    // Its last growth's step closes: harm within it would be the growth's,
-    // setting B at the holding before it, not others' of themselves.
+    assert!(machine.bank_bytes() > GB, "the idle load's bank holds cache above its floor (free == 0, scarce)");
     for _ in 0..3 {
         machine.tick(SNAPSHOT_MS);
         machine.read();
     }
-    machine.os.harm += 8;
-    machine.tick(SNAPSHOT_MS);
-    machine.read();
-    let shortage = machine.ledger.shortage(&std::collections::BTreeSet::new()).expect("harm past the baseline");
-    assert_eq!(shortage.cause, shortage::Cause::Harm { bytes: 8 * PAGE });
-    assert!(!shortage.response.admission_waits, "cache meets the harm above its floor");
+    // 5 spans * 200ms = 1.0s at 128 MB/s (exceeds 64 MiB/s thrash threshold, confirming on 5th step).
+    let pages_per_step = (25_600 * 1024) / PAGE;
+    for _ in 0..5 {
+        machine.os.harm += pages_per_step;
+        machine.tick(SNAPSHOT_MS);
+        machine.read();
+    }
+    let shortage = machine.ledger.shortage(&std::collections::BTreeSet::new()).expect("confirmed sustained thrashing");
+    let excess = match shortage.cause {
+        shortage::Cause::Harm { bytes } => bytes,
+        other => panic!("expected Harm shortage, got {other:?}"),
+    };
+    assert!(excess > 0);
+    assert!(!shortage.response.admission_waits, "cache meets sustained thrash excess above floor");
     let plan = shortage.response.relief.expect("the bank covers the harm");
-    assert_eq!(machine.ledger.change(|keeping| machine.ledger.execute(&keeping.claims(), plan)).yielded, 8 * PAGE);
+    assert_eq!(machine.ledger.change(|keeping| machine.ledger.execute(&keeping.claims(), plan)).yielded, excess);
     let admitted = machine.ledger.change(|keeping| machine.ledger.reserve(&keeping.claims(), &machine.slot, RequestId(1), 2 * super::tests::page_rows()));
     assert!(admitted.is_ok(), "the first request is admitted once cache meets the shortage: {:?}", admitted.err());
 }
 
-/// Unified Metal (macOS, `own_cold == None`) with an unallocated request-slot
-/// reservation (`counted.allocated < committed + cache`) and pageable host
-/// memory:
-/// 1. `cold_supply()` preserves `cold_reclaimable - pageable` instead of
-///    zeroing all cold supply.
-/// 2. Repeated small background OS decompressions while free supply is
-///    abundant and `PressureLevel::Normal` do not tighten `cap` or shrink the
-///    bank.
-/// 3. Under genuine scarcity (`free == 0`), a small harm tick tightens `cap`
-///    in held units (`committed + cache`) without subtracting the unallocated
-///    reservation a second time, and a subsequent calm reading with abundant
-///    free supply lifts `cap`.
+/// Real 64 GiB macOS desktop dynamics (reproducing PID 90382 cold-start load
+/// and PID 1441 multi-app churn):
+/// 1. Reading #1 (model load open) counts `cold_reclaimable` immediately so a
+///    model requiring 13 GB admits even when `free + clean` is only 12 GB and
+///    9 GB sits in cold reclaimable pages.
+/// 2. Lazy background OS decompressions (20 MB/s), single tab-switch spikes,
+///    and a 4 GB wakeup/exit release (`others` dropping, `free` rising) neither
+///    tighten `cap` nor trigger panic collapses.
+/// 3. Small noisy app GC allocations (`±80 MB`) cause zero bank ping-pong.
 #[test]
-fn unified_metal_preserves_cold_supply_avoids_spurious_ratchet_and_lifts_cap() {
+fn macos_desktop_load_and_background_app_dynamics() {
     let mut os = Os::new();
-    // 64 GB unified Metal with 48 GB wired ceiling, 16 GB others' working set,
-    // 16 GB cold (8 GB cold_reclaimable), 4 GB clean cache.
-    os.wired = Some((48 * GB, 4 * GB));
-    os.hot = 16 * GB;
-    os.cold = 16 * GB;
+    // Mirror real 64 GiB Mac snapshot at model open:
+    // ~8 GB free beyond target, ~4 GB clean cache, ~18 GB cold -> 9 GB cold_reclaimable (~21 GB total supply).
+    os.hot = 33 * GB;
     os.cache = 4 * GB;
-    // 20 GB wired weights + 1 GB unallocated request slot (not serving).
-    let mut machine = Machine::start(os, 20 * GB, GB, false);
-    // Add 512 MB of pageable host memory beside the wired weights.
-    let pageable = machine.ledger.change(|keeping| machine.ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, 512 * MB)).expect("room");
-    machine.ledger.change(|_| {
-        let entry = pageable.entry();
-        entry.take(&entry.change(), 512 * MB, Wiring::Pageable)
-    }).expect("pageable host bytes");
-    let at = machine.at();
-    machine.os.grow(at, 512 * MB, Wiring::Pageable);
-
-    // Let the load's step close and a baseline be learned.
-    for _ in 0..6 {
-        machine.tick(SNAPSHOT_MS);
-        machine.read();
-    }
-    let before_bank = machine.ledger.estimate();
-    // `own_cold == None` with 512 MB pageable preserves `8 GB - 512 MB = 7.5 GB`
-    // of `cold_reclaimable` beside free_beyond_target and clean_cache.
-    let expected_free_and_clean = (machine.os.total - machine.os.used() - machine.os.target) + machine.os.cache;
-    let expected_cold_supply = (machine.os.cold / 2).saturating_sub(512 * MB);
-    assert_eq!(
-        before_bank.supply(),
-        (expected_free_and_clean + expected_cold_supply) as i64,
-        "pageable host memory bounds own cold pages without zeroing all cold_reclaimable"
-    );
-
-    // Grow the bank partway so abundant free supply (> 6 GB) remains beside the
-    // 1 GB unallocated request slot.
-    let grow_slots = 16u64; // 4 GB bank
-    let at = machine.at();
-    for _ in 0..grow_slots {
-        let granule = machine.ledger.cache(CacheKind::Bank, GRANULE, super::Reclaim::Unbacked).expect("room");
-        machine.ledger.change(|_| machine.pool.take(&machine.pool.change(), GRANULE, machine.wiring)).expect("pool block");
-        machine.os.grow(at, GRANULE, machine.wiring);
-        machine.bank.push(granule);
-    }
-    // Close the growth step.
-    for _ in 0..3 {
-        machine.tick(SNAPSHOT_MS);
-        machine.read();
-    }
-    let steady_bank = machine.bank_bytes();
-    assert_eq!(steady_bank, grow_slots * GRANULE);
-
-    // Repeated 4 MB background decompressions at steady cadence tighten `cap`
-    // by at most the first 4 MB excess (in held units, never subtracting the
-    // 1 GB unallocated slot) and learn the quiet baseline so subsequent ticks
-    // do not ratchet `cap` further.
-    let four_mb_pages = (4 * MB) / PAGE;
-    machine.os.harm += four_mb_pages;
-    machine.tick(SNAPSHOT_MS);
-    machine.read();
+    os.cold = 18 * GB;
+    os.wired = Some((48 * GB, 4 * GB));
+    let mut machine = Machine::start(os, 0, 0, false);
+    // Immediately on reading #1 (no quiet baseline yet!), room covers 13 GB > 12 GB free+clean.
     let first_est = machine.ledger.estimate();
-    let first_cap = first_est.cap().expect("first harm tick above zero baseline sets B");
-    let held_total = first_est.committed() + first_est.cache();
-    assert_eq!(
-        held_total.saturating_sub(first_cap),
-        4 * MB,
-        "cap ({first_cap}) must tighten by excess alone in held units (held_total={held_total})"
-    );
-    assert!(
-        first_est.import_room() + 4 * MB >= steady_bank,
-        "import_room ({}) must not drop by the 1 GB unallocated slot (bank={steady_bank})",
-        first_est.import_room()
-    );
-    for _ in 0..4 {
-        machine.os.harm += four_mb_pages;
-        machine.tick(SNAPSHOT_MS);
-        machine.read();
-        assert_eq!(machine.ledger.estimate().cap(), Some(first_cap), "steady background decompression must not ratchet B");
-        assert!(machine.ledger.shortage(&std::collections::BTreeSet::new()).is_none());
-    }
+    assert!(first_est.free() >= 19 * GB, "reading #1 exposes cold_reclaimable ({})", first_est.free());
+    let floor_weights = machine.ledger.change(|keeping| machine.ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, 13 * GB))
+        .expect("13 GB model load admits on reading #1 alongside cold_reclaimable");
+    machine.ledger.change(|_| floor_weights.entry().take(&floor_weights.entry().change(), 13 * GB, Wiring::Wired)).unwrap();
+    let at = machine.at();
+    machine.os.grow(at, 13 * GB, Wiring::Wired);
 
-    // Drain free+clean supply, then restore it so free supply rises by > unit
-    // on a calm reading, lifting `cap`.
-    let drain = (machine.os.total - machine.os.used() - machine.os.target) + machine.os.cache;
-    machine.os.hot += drain;
-    machine.os.reclaim();
-    for _ in 0..2 {
-        machine.tick(SNAPSHOT_MS);
-        machine.read();
+    // Fill bank smoothly into remaining headroom including cold.
+    for _ in 0..5 {
+        if machine.bank_bytes() >= 6 * GB {
+            break;
+        }
+        machine.step(SNAPSHOT_MS);
     }
-    assert_eq!(machine.ledger.estimate().guarantee(), 0);
-    machine.os.harm += 2 * four_mb_pages;
-    machine.tick(SNAPSHOT_MS);
-    machine.read();
-    let scarce_est = machine.ledger.estimate();
-    let cap = scarce_est.cap().expect("scarce harm tightens standing B");
-    assert!(
-        first_cap.saturating_sub(cap) <= 8 * MB,
-        "standing cap ({cap}) must tighten by excess alone from {first_cap}"
-    );
+    let bank_before = machine.bank_bytes();
+    assert!(bank_before >= 6 * GB, "bank grows cleanly into cold headroom ({bank_before})");
 
-    // When others release memory past what was free when `cap` was set, a calm
-    // reading lifts `cap`.
-    machine.os.hot -= drain + 2 * GB;
-    machine.tick(SNAPSHOT_MS);
+    // Background Electron/Safari lazy decompressions (20 MB/s) + single 160 MB spike + 4 GB exit wakeup!
+    for _ in 0..5 {
+        machine.os.harm += (20 * MB) / PAGE;
+        machine.step(1000);
+        assert_eq!(machine.ledger.estimate().cap(), None, "normal decompression noise never sets B");
+    }
+    machine.os.harm += (160 * MB) / PAGE;
+    machine.step(1000);
+    machine.os.harm += (10 * MB) / PAGE;
+    machine.step(1000);
+    assert_eq!(machine.ledger.estimate().cap(), None, "one-shot wakeup never sets B");
+
+    // App frees 4 GB while triggering 4 GB of OS decompressions (PID 1441 10:25:04 scenario).
+    machine.os.harm += (4 * GB) / PAGE;
+    machine.os.hot -= 4 * GB;
+    machine.step(1000);
+    assert_eq!(machine.ledger.estimate().cap(), None, "exogenous release with decompressions never panics");
+
+    // Re-fill bank to new room and confirm ±80 MB GC jitter produces zero resize ping-pong.
+    machine.step(SNAPSHOT_MS);
+    let settled_resizes = machine.resizes;
+    let settled_bank = machine.bank_bytes();
+    for tick in 0..10 {
+        match tick % 2 {
+            0 => machine.os.hot += 80 * MB,
+            _ => machine.os.hot -= 80 * MB,
+        }
+        machine.step(SNAPSHOT_MS);
+    }
+    assert_eq!((machine.resizes, machine.bank_bytes()), (settled_resizes, settled_bank), "80 MB app jitter causes zero bank oscillation");
+    drop(floor_weights);
+}
+
+/// Real Linux desktop dynamics (both shared cgroup `harm == None` with PSI and
+/// post-load pageable CPU weights with `own_cold == None`):
+/// 1. Retaining CPU weights (`Pageable`, `wired == 0`) keeps remaining machine
+///    `cold_reclaimable` intact rather than triggering a false post-load
+///    `FloorShort` cliff.
+/// 2. With `harm == None` + `pressure = Warn` + initial PSI event, standing
+///    `Warn` yields past 1 s dwell even when PSI rate-limiting emits no second event.
+#[test]
+fn linux_desktop_post_load_cold_supply_and_standing_psi() {
+    // Part 1: dedicated Linux cgroup (`counts_own = true`) retains cold_reclaimable
+    // immediately on load and after 20 GB pageable CPU weights are allocated.
+    let mut os = Os::new();
+    os.counts_own = true;
+    os.hot = 20 * GB;
+    os.cold = 16 * GB; // 8 GB cold_reclaimable
+    os.cache = 4 * GB;
+    let machine = Machine::start(os, 20 * GB, GB, false);
+    assert!(machine.ledger.estimate().free() >= 10 * GB, "post-load CPU model keeps cold supply ({})", machine.ledger.estimate().free());
+
+    // Part 2: shared cgroup (`counts_own = false`, harm == None) with PSI Warn
+    // fires on initial PSI event and steps down smoothly past 1 s dwell even
+    // when PSI rate-limiting emits no second edge event.
+    let mut shared_os = Os::new();
+    shared_os.counts_own = false;
+    let mut machine = filled(shared_os, 0);
+    machine.os.pressure = seismic::PressureLevel::Warn;
+    machine.ledger.pressure_event();
+    machine.tick(100);
     machine.read();
-    assert_eq!(machine.ledger.estimate().cap(), None, "calm restored free supply lifts B");
-    drop(pageable);
+    machine.follow();
+    let after_event = machine.bank_bytes();
+    assert_eq!(after_event, 11 * GB - GRANULE);
+
+    // Standing Warn with 0 new events steps down 1 more block past 1s dwell.
+    machine.tick(1100);
+    machine.read();
+    let shortage = machine.ledger.shortage(&std::collections::BTreeSet::new()).expect("standing Warn yields past 1s dwell");
+    assert_eq!(shortage.cause, shortage::Cause::Pressure(seismic::PressureLevel::Warn));
+    machine.follow();
+    assert_eq!(machine.bank_bytes(), after_event - GRANULE);
+}
+
+/// Real Windows desktop dynamics (`harm == None`, `cold_reclaimable == 0`,
+/// level-triggered `LowMemoryResourceNotification` firing once on edge then
+/// staying `Warn`/`Critical` with zero subsequent events): yields smoothly block
+/// by block until pressure lifts, then regrows only on exogenous release.
+#[test]
+fn windows_level_triggered_pressure_yields_smoothly_until_relief() {
+    let mut os = Os::new();
+    os.counts_own = false;
+    os.cold = 0; // Windows trims to standby (`cache`), cold_reclaimable == 0
+    let mut machine = filled(os, 0);
+    let full_bank = machine.bank_bytes();
+    assert_eq!(full_bank, 19 * GB);
+
+    // Windows LowMemoryResourceNotification fires once on transition into Warn.
+    machine.os.pressure = seismic::PressureLevel::Warn;
+    machine.ledger.pressure_event();
+    machine.step(100);
+    assert_eq!(machine.bank_bytes(), full_bank - GRANULE);
+
+    // Pressure remains `Warn` with zero further OS edge events (level-triggered).
+    // Stepping past 1 s dwell continues yielding cleanly without freezing.
+    machine.tick(1100);
+    machine.read();
+    assert!(machine.ledger.shortage(&std::collections::BTreeSet::new()).is_some());
+    machine.follow();
+    assert_eq!(machine.bank_bytes(), full_bank - 2 * GRANULE);
+
+    // Escalation to Critical (commit headroom exhausted) yields every 250 ms without events.
+    machine.os.pressure = seismic::PressureLevel::Critical;
+    machine.tick(300);
+    machine.read();
+    assert!(machine.ledger.shortage(&std::collections::BTreeSet::new()).is_some());
+    machine.follow();
+    assert_eq!(machine.bank_bytes(), full_bank - 3 * GRANULE);
+
+    // Pressure clears, bank holds under cap until exogenous app release lifts cap.
+    machine.os.pressure = seismic::PressureLevel::Normal;
+    for _ in 0..3 {
+        machine.step(300);
+    }
+    assert_eq!(machine.bank_bytes(), full_bank - 3 * GRANULE);
+    machine.os.hot -= 4 * GB;
+    machine.step(300);
+    assert!(machine.bank_bytes() > full_bank - 3 * GRANULE, "exogenous release lifts cap cleanly");
 }
 
 /// A store with paging (such as `HostRam` on a dedicated GPU) may hold

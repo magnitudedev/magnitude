@@ -57,9 +57,14 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
     let cold_machine = resolve(&[((), &|| field("Inactive(anon):"))], (), || 0).0;
     let clean_cache = clean_cache(
         ["Active(file):", "Inactive(file):", "Dirty:", "Writeback:"].map(field),
+        field("Shmem:").unwrap_or(0),
     );
+    let free_beyond_target = beyond(free, reclaim_floor(sys, total, page));
+    let immediate = u64::try_from(free_beyond_target.max(0))
+        .unwrap_or(0)
+        .saturating_add(clean_cache);
     let swap_free = resolve(&[((), &|| field("SwapFree:"))], (), || 0).0;
-    let cold_reclaimable = cold_machine.min(swap_free);
+    let cold_reclaimable = cold_machine.min(swap_free).min(total.saturating_sub(immediate));
     let pressure = pressure(sys, &cgroups);
     let machine = sys
         .text(Path::new("/proc/vmstat"))
@@ -86,7 +91,7 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
     let host = Scope {
         total,
         supply: Supply {
-            free_beyond_target: beyond(free, reclaim_floor(sys, total, page)),
+            free_beyond_target,
             clean_cache,
             cold_reclaimable,
         },
@@ -306,10 +311,11 @@ fn pressure(sys: &impl Sys, cgroups: &Cgroups) -> Option<PressureLevel> {
     machine.max(cgroup)
 }
 
-/// The pressure level a PSI file `path` reports: critical where some task
-/// stalled with every task waiting (`full avg10`), warn where some task
-/// stalled (`some avg10`), over the last ten seconds; none where it is
-/// missing.
+/// The pressure level a PSI file `path` reports over the last ten seconds:
+/// critical where every runnable task stalled meaningfully (`full avg10 >= 0.5`),
+/// warn where some task stalled meaningfully (`some avg10 >= 1.0`), avoiding
+/// false triggers on microsecond background allocation stalls; none where the
+/// file is missing.
 ///
 /// # Panics
 /// Where the file reads no level.
@@ -328,8 +334,8 @@ fn parse_psi(text: &str) -> Option<PressureLevel> {
             .ok()
     };
     Some(match (avg10("some ")?, avg10("full ")?) {
-        (_, full) if full > 0.0 => PressureLevel::Critical,
-        (some, _) if some > 0.0 => PressureLevel::Warn,
+        (_, full) if full >= 0.5 => PressureLevel::Critical,
+        (some, _) if some >= 1.0 => PressureLevel::Warn,
         _ => PressureLevel::Normal,
     })
 }
@@ -366,19 +372,17 @@ fn refault_count(text: &str) -> Option<u64> {
     }
 }
 
-/// Clean file cache from its four counts, active and inactive file pages
-/// less dirty and writeback ones (which may lie on either list): 0 where
-/// any is missing, which then establishes none. Active cache counts too: a
-/// charge at a cgroup's limit reclaims it (a v1 docker cgroup gave up all
-/// of its 58.7 GB at an unchanged allocation rate, with no failed charge or
-/// OOM kill); anonymous pages, tmpfs and kernel allocations never.
-pub(super) fn clean_cache([active, inactive, dirty, writeback]: [Option<u64>; 4]) -> u64 {
+/// Clean file cache from its four counts (`active`, `inactive`, `dirty`,
+/// `writeback`), also excluding `shmem` (tmpfs, `/dev/shm`, memfd, shared GPU
+/// buffers, which Linux places on the file LRU lists even though they cannot
+/// drop without swap): 0 where any of the four primary counts is missing.
+pub(super) fn clean_cache([active, inactive, dirty, writeback]: [Option<u64>; 4], shmem: u64) -> u64 {
     resolve(
         &[((), &|| {
             Some(
                 active?
                     .saturating_add(inactive?)
-                    .saturating_sub(dirty?.saturating_add(writeback?)),
+                    .saturating_sub(dirty?.saturating_add(writeback?).saturating_add(shmem)),
             )
         })],
         (),

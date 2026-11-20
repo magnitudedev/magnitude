@@ -2106,9 +2106,21 @@ trait MemoryStep: MemoryHost + Sized {
         let changed = preempted
             || waited != response.admission_waits
             || self.domain().memory_generation() != read.generation;
-        let reread = match self.domain().memory_stands().map_err(classify_domain_error)? {
-            true => Reread::Stands { cost: read.cost, changed, ceiling: self.domain().others_interval() },
-            false => Reread::Settled,
+        const ACTIVE_MIN_REREAD: std::time::Duration = std::time::Duration::from_millis(50);
+        const ACTIVE_MAX_REREAD: std::time::Duration = std::time::Duration::from_secs(1);
+        const OPPORTUNITY_REREAD: std::time::Duration = std::time::Duration::from_secs(2);
+        let reread = match self.domain().memory_standing().map_err(classify_domain_error)? {
+            magnitude_executor::MemoryStanding::Active => Reread::Stands {
+                cost: read.cost.max(ACTIVE_MIN_REREAD),
+                changed,
+                ceiling: self.domain().others_interval().map(|interval| interval.clamp(ACTIVE_MIN_REREAD, ACTIVE_MAX_REREAD)),
+            },
+            magnitude_executor::MemoryStanding::Opportunity => Reread::Stands {
+                cost: OPPORTUNITY_REREAD,
+                changed: false,
+                ceiling: Some(OPPORTUNITY_REREAD),
+            },
+            magnitude_executor::MemoryStanding::Settled => Reread::Settled,
         };
         Ok(Observed { unload: false, reread })
     }

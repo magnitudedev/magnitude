@@ -309,10 +309,11 @@ mod platform {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    /// Any stall (1 µs) within a window ([`PSI_WINDOW`]), NUL-terminated as
-    /// the kernel parses it.
+    /// Sustained stall (at least 50 ms within [`PSI_WINDOW`], i.e. 2.5%) so
+    /// sub-millisecond background allocation stalls never fire pressure events,
+    /// NUL-terminated as the kernel parses it.
     fn trigger() -> String {
-        format!("some 1 {}\0", PSI_WINDOW.as_micros())
+        format!("some 50000 {}\0", PSI_WINDOW.as_micros())
     }
 
     /// A PSI trigger set on one PSI file, and its edges.

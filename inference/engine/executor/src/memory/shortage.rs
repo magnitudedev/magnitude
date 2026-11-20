@@ -21,7 +21,11 @@
 //! the boundary never falls below what is committed
 //! (`memory::supply::Boundary`), so pressure sheds cache alone.
 
+use std::time::Duration;
+
 use super::ledger::{Estimate, Relief, ReliefPlan, Sampled};
+
+const MIN_UNLOAD_SPAN: Duration = Duration::from_millis(50);
 
 /// A real shortage and the response to it.
 #[derive(Clone, Debug)]
@@ -99,12 +103,12 @@ pub(crate) fn lacks(estimate: &Estimate, cause: Cause) -> u64 {
     match cause {
         Cause::FloorShort { over } | Cause::RiseShort { over } => over,
         Cause::Harm { bytes } => bytes,
-        // What the process holds above B, its yielded bytes still releasing
-        // left out: sized from the boundary's state, so a later answer
-        // yields only what B lowered since.
+        // What the process still holds un-yielded above B (`committed + cache`),
+        // matching `Boundary::observe`'s held units: sized from the boundary's
+        // state so overlapping pressure events yield only what B lowered since.
         Cause::Pressure(_) => {
             let cap = estimate.cap().expect("invariant violated: a pressure event set no boundary");
-            estimate.allocated().saturating_sub(estimate.releasing()).saturating_sub(cap)
+            estimate.held().saturating_sub(cap)
         }
     }
 }
@@ -124,7 +128,7 @@ pub(crate) fn allows(cause: Cause, evictable: &std::collections::BTreeSet<crate:
 /// `persistence`'s first reading.
 pub(crate) fn respond(estimate: &Estimate, cause: Cause, relief: Option<ReliefPlan>, persistence: &Persistence) -> Shortage {
     let at = estimate.at();
-    let spans = persistence.since.is_some_and(|since| at.at().duration_since(since.at()) > estimate.lag());
+    let spans = persistence.since.is_some_and(|since| at.at().duration_since(since.at()) > estimate.lag().max(MIN_UNLOAD_SPAN));
     let committed_short = matches!(cause, Cause::FloorShort { .. } | Cause::RiseShort { .. });
     let unload = matches!(cause, Cause::FloorShort { .. }) && spans && relief.is_none() && estimate.releasing() == 0 && !estimate.pending();
     let admission_waits = committed_short || relief.is_none();

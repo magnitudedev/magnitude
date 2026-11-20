@@ -7,11 +7,18 @@
 //! the seconds its holding saves per byte, counted over its uses since it
 //! was retained and never decayed, the order the ledger takes cache in.
 
-use super::{BankHolding, BankStep, DomainError, ExecutorDomain, OptionalComponent, ProgramFamily, StateBindings};
+use super::{BankHolding, BankStep, DomainError, ExogenousShrink, ExecutorDomain, OptionalComponent, ProgramFamily, StateBindings};
 use crate::experts::derived::BankMove;
 use crate::memory::ledger::{CacheKind, Cached, Claim, CommittedKind, Keeping, Value};
 use magnitude_cost_model::WorkloadRates;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Cooldown after an exogenous bank shrink before a modest room recovery can
+/// regrow, damping desktop app allocation/GC ping-pong while letting large exits
+/// or freed own-claims regrow immediately.
+const EXOGENOUS_REGROW_COOLDOWN: Duration = Duration::from_secs(3);
+const REBOUND_MARGIN_MIN: u64 = 512 * (1 << 20);
+const PARTIAL_GROW_MIN_CAP: u64 = 256 * (1 << 20);
 
 /// What the form and depth of a decode launch's guessed rows are decided
 /// on ([`ExecutorDomain::two_row_pricing`]): the decode's passes as the
@@ -243,10 +250,41 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The one resize toward `bank`'s derived targets
-    /// (`experts::derived::next_move`), at the decode's price now: the
-    /// targets the domain reports (`Self::derive_bank`).
+    /// (`experts::derived::next_move`), at the decode's price now: filters out
+    /// sub-noise partial grows on small-slot banks and post-shrink ping-pong
+    /// rebounds while letting shrinks, saturation grows, own-claim frees, and
+    /// large exogenous releases through immediately.
     fn next_bank_move(&self, bank: &dyn super::ElasticBank) -> Result<Option<(BankHolding, BankMove)>, DomainError> {
-        self.derive_bank(bank, crate::experts::derived::next_move)
+        self.derive_bank(bank, |derived| {
+            let Some((holding, mv)) = crate::experts::derived::next_move(derived) else {
+                return None;
+            };
+            let BankMove::Grow { to } = mv else {
+                return Some((holding, mv));
+            };
+            let (target, _) = derived.iter().find(|(t, _)| t.holding == holding)?;
+            let sat = target.shape.saturation_slots();
+            let sat_charge = (target.charge)(sat);
+            let floor_charge = (target.charge)(target.shape.floor_slots());
+            let sat_cache = sat_charge.saturating_sub(floor_charge);
+            let gained = (target.charge)(to).saturating_sub((target.charge)(target.at));
+            let min_partial = target.shape.block_bytes().max((sat_charge / 64).min(PARTIAL_GROW_MIN_CAP));
+            if to < sat && gained < min_partial {
+                return None;
+            }
+            let ledger = self.resources.ledgers().of(target.tier);
+            if let Some(shrink) = self.exogenous_shrink.as_ref().filter(|s| s.store == ledger.store()) {
+                let est = ledger.estimate();
+                let own_committed_freed = est.committed() < shrink.committed;
+                let elapsed = est.at().at().saturating_duration_since(shrink.at);
+                let rebound_margin = shrink.block.saturating_mul(4).max(REBOUND_MARGIN_MIN).min(sat_cache.max(shrink.block));
+                let large_release = est.hold_room() >= shrink.hold_room.saturating_add(rebound_margin);
+                if !own_committed_freed && elapsed < EXOGENOUS_REGROW_COOLDOWN && !large_release {
+                    return None;
+                }
+            }
+            Some((holding, mv))
+        })
     }
 
     /// Begin one growth of `holding` to `to`, its derived target
@@ -257,6 +295,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let step = bank.grow(self.resources.ledgers(), holding, to, wake)?;
         if let BankStep::Begun(tier) = step {
             self.resize_held.begin(tier, started);
+            let grew_store = self.resources.ledgers().of(tier).store();
+            if self.exogenous_shrink.as_ref().is_some_and(|s| s.store == grew_store) {
+                self.exogenous_shrink = None;
+            }
         }
         Ok(step)
     }
@@ -296,6 +338,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             BankStep::Begun(tier) => {
                 self.resize_held.begin(tier, started);
                 self.shrink_step = true;
+                let block = bank
+                    .targets(self.decode_price()?.as_ref())?
+                    .into_iter()
+                    .find(|t| t.holding == holding)
+                    .map_or(0, |t| t.shape.block_bytes());
+                let ledger = self.resources.ledgers().of(tier);
+                let est = ledger.estimate();
+                self.exogenous_shrink = Some(ExogenousShrink {
+                    store: ledger.store(),
+                    at: est.at().at(),
+                    committed: est.committed(),
+                    hold_room: est.hold_room(),
+                    block,
+                });
             }
             _ => self.resize_held.hold(started, super::HeldSource::Decision),
         }

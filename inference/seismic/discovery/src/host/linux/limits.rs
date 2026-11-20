@@ -199,7 +199,10 @@ fn v1_limit(sys: &impl Sys, mount: &CgroupMount) -> Option<Limit> {
         },
         limit_bytes,
         used_bytes,
-        reclaimable_bytes: clean_cache(cache.map(|key| stat_field(&path, &stat, key))),
+        reclaimable_bytes: clean_cache(
+            cache.map(|key| stat_field(&path, &stat, key)),
+            stat_field(&path, &stat, "total_shmem").unwrap_or(0),
+        ),
     })
 }
 
@@ -224,6 +227,9 @@ fn v2_limit(sys: &impl Sys, directory: &Path, cgroup: String) -> Option<Limit> {
     let stat = sys.text(&path);
     let reclaimable_bytes = clean_cache(
         cache.map(|key| stat.as_deref().and_then(|stat| stat_field(&path, stat, key))),
+        stat.as_deref()
+            .and_then(|stat| stat_field(&path, stat, "shmem"))
+            .unwrap_or(0),
     );
     Some(Limit {
         kind: ProcessLimitKind::CgroupV2 { cgroup },
@@ -317,6 +323,7 @@ fn allowed_nodes(sys: &impl Sys, status: &str) -> Option<Limit> {
         cache += clean_cache(
             ["Active(file):", "Inactive(file):", "Dirty:", "Writeback:"]
                 .map(|name| kib_field(&meminfo, name)),
+            kib_field(&meminfo, "Shmem:").unwrap_or(0),
         );
     }
     let floor = super::memory::nodes_floor(sys, &nodes, total);

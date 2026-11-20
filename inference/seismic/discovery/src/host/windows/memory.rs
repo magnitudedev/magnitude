@@ -15,8 +15,12 @@ use windows_sys::Win32::System::Performance::{PDH_HCOUNTER, PDH_HQUERY};
 pub(crate) struct Counters {
     /// `\Memory\Free & Zero Page List Bytes`.
     pub(super) free_zero: u64,
-    /// `\Memory\Standby Cache {Core, Normal Priority, Reserve} Bytes`.
-    pub(super) standby: u64,
+    /// `\Memory\Standby Cache Core Bytes`: protected system and core mapped
+    /// pages that apps depend on to avoid hard-fault stalls.
+    pub(super) standby_core: u64,
+    /// `\Memory\Standby Cache {Normal Priority, Reserve} Bytes`: reclaimable
+    /// standby cache.
+    pub(super) standby_reclaimable: u64,
 }
 
 /// The open query of [`Counters`], opened once.
@@ -37,31 +41,65 @@ pub(super) const COUNTER_PATHS: [&str; 4] = [
     "\\Memory\\Standby Cache Reserve Bytes",
 ];
 
-/// Host RAM now: the free and zero lists and the standby lists
-/// ([`lists`]), bounded by the commit this process has left
+/// Host safety reserve on Windows: preserves free physical and system commit
+/// headroom above zero so kernel and desktop allocations never hit hard-fault
+/// stalls or commit-limit OOM before `LowMemoryResourceNotification` triggers.
+pub(super) fn windows_floor(total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    (total / 128).clamp(64 << 20, 512 << 20).min(total / 8)
+}
+
+/// Host RAM now: the free and zero lists and the reclaimable standby lists
+/// ([`lists`]), keeping Windows' safety floor ([`windows_floor`]) and
+/// `Standby Cache Core` protected, bounded by the commit this process has left
 /// (`GlobalMemoryStatusEx`) and by its own job's limits ([`job_limits`]);
-/// the low-memory notification. Windows reports no `harm`: no unprivileged
-/// counter separates reclaimed-page refaults from cold file reads.
+/// pressure from `LowMemoryResourceNotification` and tight commit/physical
+/// headroom. Windows reports no `harm`: no unprivileged counter separates
+/// reclaimed-page refaults from cold file, DLL, or memory-mapped reads.
 pub(crate) fn sample(sys: &impl Sys) -> HostSample {
     let at = Instant::now();
     let status = sys.memory_status();
     let counters = sys.counters();
     let (free_zero, standby) = lists(sys, counters.as_ref(), status.ullAvailPhys);
     let limits = job_limits(sys, &status);
-    let pressure = match sys.low_memory() {
-        true => PressureLevel::Warn,
-        false => PressureLevel::Normal,
+    let floor = windows_floor(status.ullTotalPhys);
+    let low_memory = sys.low_memory();
+    let pressure = if floor > 0
+        && (status.ullAvailPageFile <= floor / 2 || (low_memory && status.ullAvailPhys <= floor))
+    {
+        PressureLevel::Critical
+    } else if low_memory || (floor > 0 && status.ullAvailPageFile <= floor) {
+        PressureLevel::Warn
+    } else {
+        PressureLevel::Normal
     };
     let counted_at = Instant::now();
-    // What the lists hold, within the commit this process can still make:
-    // a page taken is committed first.
-    let room = (free_zero + standby).min(status.ullAvailPageFile);
-    let free = free_zero.min(room);
+    // Physical room reserves `floor` on free+zero pages first; what the system
+    // can additionally commit (`ullAvailPageFile`, keeping host commit reserve
+    // outside isolated job-commit containers) bounds the positive total.
+    let in_job_commit = limits
+        .iter()
+        .any(|limit| matches!(limit.kind, super::super::ProcessLimitKind::WindowsJobCommit));
+    let commit_cap = if in_job_commit {
+        status.ullAvailPageFile
+    } else {
+        status.ullAvailPageFile.saturating_sub(floor)
+    };
+    let phys_free_beyond = beyond(free_zero, floor);
+    let (free_beyond_target, clean_cache) = if phys_free_beyond <= 0 {
+        (phys_free_beyond, standby.min(commit_cap))
+    } else {
+        let free_pos = (phys_free_beyond as u64).min(commit_cap);
+        let cache = standby.min(commit_cap - free_pos);
+        (free_pos as i64, cache)
+    };
     let host = Scope {
         total: status.ullTotalPhys,
         supply: Supply {
-            free_beyond_target: beyond(free, 0),
-            clean_cache: room - free,
+            free_beyond_target,
+            clean_cache,
             cold_reclaimable: 0,
         },
     };
@@ -106,7 +144,10 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
 fn lists(sys: &impl Sys, counters: Option<&Counters>, available: u64) -> (u64, u64) {
     resolve(
         &[
-            ((), &|| counters.map(|c| (c.free_zero, c.standby))),
+            ((), &|| counters.map(|c| {
+                let _ = c.standby_core;
+                (c.free_zero, c.standby_reclaimable)
+            })),
             ((), &|| {
                 let mut answered = false;
                 let mut sum = 0u64;

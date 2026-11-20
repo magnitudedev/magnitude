@@ -1,6 +1,6 @@
 use super::super::{beyond, ColdPages, Limit, ProcessLimitKind, Supply};
 use super::limits::job_limits;
-use super::memory::Counters;
+use super::memory::{windows_floor, Counters};
 use super::*;
 use seismic_topology::{flat_nodes, CacheSize, HostNode, PciLocation};
 use windows_sys::Win32::System::JobObjects::{
@@ -8,6 +8,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 
 const GB: u64 = 1 << 30;
+const MB: u64 = 1 << 20;
 
 /// A Windows machine's fixture for one case: 64 GiB, 40 GiB of it
 /// available, a commit room of 100 GiB, no job, two memory nodes, a
@@ -36,7 +37,8 @@ impl Machine {
             },
             counters: Some(Counters {
                 free_zero: 10 * GB,
-                standby: 30 * GB,
+                standby_core: 2 * GB,
+                standby_reclaimable: 28 * GB,
             }),
             nodes: vec![Some(6 * GB), Some(4 * GB)],
             job: None,
@@ -123,25 +125,28 @@ impl Sys for Machine {
     }
 }
 
-fn supply(free: u64, clean: u64) -> Supply {
+fn supply(free: u64, floor: u64, clean: u64) -> Supply {
     Supply {
-        free_beyond_target: beyond(free, 0),
+        free_beyond_target: beyond(free, floor),
         clean_cache: clean,
         cold_reclaimable: 0,
     }
 }
 
-/// The performance counters split the available lists; Windows reports no
-/// harm because no unprivileged counter separates reclaimed-page refaults
-/// from cold file reads.
+/// The performance counters split free+zero from reclaimable standby while
+/// keeping `Standby Cache Core` protected and reserving Windows' safety floor;
+/// Windows reports no harm because no unprivileged counter separates
+/// reclaimed-page refaults from cold file reads.
 #[test]
 fn the_counters_split_free_from_standby() {
     let sample = sample(&Machine::new());
+    let floor = windows_floor(64 * GB);
+    assert_eq!(floor, 512 * MB);
     assert_eq!(
         (sample.total, sample.supply, sample.cold, sample.harm),
         (
             64 * GB,
-            supply(10 * GB, 30 * GB),
+            supply(10 * GB, floor, 28 * GB),
             ColdPages {
                 machine: 0,
                 own: None
@@ -151,19 +156,32 @@ fn the_counters_split_free_from_standby() {
     );
 }
 
+/// Exhausting system commit below the safety floor signals pressure even
+/// before `LowMemoryResourceNotification` triggers.
+#[test]
+fn tight_commit_signals_pressure_proactively() {
+    let mut tight = Machine::new();
+    let floor = windows_floor(64 * GB);
+    tight.status.ullAvailPageFile = floor;
+    assert_eq!(sample(&tight).pressure, Some(PressureLevel::Warn));
+    tight.status.ullAvailPageFile = floor / 2;
+    assert_eq!(sample(&tight).pressure, Some(PressureLevel::Critical));
+}
+
 /// Without the performance counters (an account outside Performance
 /// Monitor Users), the free and zero lists are the nodes' available
-/// bytes summed, the standby lists the rest of `ullAvailPhys`, and no
-/// harm is counted.
+/// bytes summed, the standby lists the rest of `ullAvailPhys`, less the
+/// host safety floor, and no harm is counted.
 #[test]
 fn without_the_counters_free_is_the_nodes_and_standby_the_rest() {
+    let floor = windows_floor(64 * GB);
     let taken = sample(&Machine {
         counters: None,
         ..Machine::new()
     });
     assert_eq!(
         (taken.total, taken.supply, taken.harm),
-        (64 * GB, supply(10 * GB, 30 * GB), None)
+        (64 * GB, supply(10 * GB, floor, 30 * GB), None)
     );
     // One node's available bytes include its standby lists: all free.
     let one_node = Machine {
@@ -171,14 +189,14 @@ fn without_the_counters_free_is_the_nodes_and_standby_the_rest() {
         nodes: vec![Some(40 * GB)],
         ..Machine::new()
     };
-    assert_eq!(sample(&one_node).supply, supply(40 * GB, 0));
+    assert_eq!(sample(&one_node).supply, supply(40 * GB, floor, 0));
     // A number naming no node adds nothing.
     let sparse = Machine {
         counters: None,
         nodes: vec![Some(5 * GB), None, Some(2 * GB)],
         ..Machine::new()
     };
-    assert_eq!(sample(&sparse).supply, supply(7 * GB, 33 * GB));
+    assert_eq!(sample(&sparse).supply, supply(7 * GB, floor, 33 * GB));
 }
 
 /// Outside a job, no limit: the host's total and supply.
@@ -219,7 +237,7 @@ fn a_job_process_limit_binds_against_private_commit() {
         job.ProcessMemoryLimit = 4 * GB as usize
     });
     let sample = sample(&machine);
-    assert_eq!((sample.total, sample.supply), (4 * GB, supply(GB, 0)));
+    assert_eq!((sample.total, sample.supply), (4 * GB, supply(GB, 0, 0)));
 }
 
 /// A job's working-set limit is a physical scope against this process's
@@ -239,7 +257,7 @@ fn a_job_working_set_limit_is_a_physical_scope() {
         }]
     );
     let sample = sample(&machine);
-    assert_eq!((sample.total, sample.supply), (5 * GB, supply(3 * GB, 0)));
+    assert_eq!((sample.total, sample.supply), (5 * GB, supply(3 * GB, 0, 0)));
 }
 
 /// Without the processor records, the flat topology of the quota's

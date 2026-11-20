@@ -717,9 +717,9 @@ fn a_claim_takes_cache_and_is_refused_only_past_the_budget() {
     assert!(matches!(held(&ledger, 15 * GB), Err(refused) if refused == short));
 }
 
-/// Every claim counts the store's supply: free memory above the OS's
-/// target, clean file cache and, once harm is judged, cold reclaimable
-/// pages. What the claim takes, the next finds held.
+/// Every claim counts the store's supply from the first reading: free memory
+/// above the OS's target, clean file cache, and cold reclaimable pages (minus
+/// any unwired idle cache when the OS gives no own cold share).
 #[test]
 fn every_claim_counts_the_supply() {
     let (_scope, ledger, _pool) = host();
@@ -731,21 +731,20 @@ fn every_claim_counts_the_supply() {
         ..sample
     };
     ledger.read(ledger.sampled(clock.next()), Reading::host(&sample));
-    // No baseline judges harm yet: cold pages are not room.
-    assert_eq!(ledger.estimate().free(), 10 * GB);
-    let floor = held(&ledger, 10 * GB).expect("the supply covers it");
+    assert_eq!(ledger.estimate().free(), 13 * GB, "first reading counts cold reclaimable pages so loads never starve");
+    let floor = held(&ledger, 13 * GB).expect("the supply covers it");
     assert!(ledger.covers(None, 1).is_err(), "what it took is held");
     drop(floor);
-    // A reading whose counters show the machine later learns a baseline;
-    // it judges the readings after it, so cold pages count from the next.
-    let counted_after = |ms: u64| seismic::HostSample {
-        counted: seismic::Counted { at: sample.counted.at + Duration::from_millis(ms), ..sample.counted },
-        ..sample
-    };
-    ledger.read(ledger.sampled(clock.next()), Reading::host(&counted_after(100)));
-    assert_eq!(ledger.estimate().free(), 10 * GB, "the reading a baseline is learned at is judged by none");
-    ledger.read(ledger.sampled(clock.next()), Reading::host(&counted_after(200)));
-    assert_eq!(ledger.estimate().free(), 13 * GB, "a reading the baseline judges counts cold pages");
+    let drafter_claim = commit(&ledger, 2 * GB);
+    let idle_drafter = ledger.change(|_| drafter_claim.into_cache(CacheKind::Drafter, Reclaim::Deferred));
+    ledger.read(ledger.sampled(clock.next()), Reading::host(&sample));
+    assert_eq!(ledger.estimate().supply(), 11 * GB as i64, "idle cache reduces unknown-owner cold supply conservatively");
+    assert_eq!(ledger.estimate().free(), 11 * GB);
+    let entry = idle_drafter.entry();
+    ledger.change(|_| {
+        entry.freed(&entry.change(), 2 * GB, Pageable);
+        drop(idle_drafter);
+    });
 }
 
 /// A reading whose supply exceeds its total is no reading.
