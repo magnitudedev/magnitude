@@ -229,14 +229,21 @@ impl ByteBpeTokenizer {
             if !stages.is_empty() {
                 encoder.with_pre_tokenizer(Some(Sequence::new(stages.clone())));
             }
+            let mut added_tokens = Vec::new();
+            let mut expected_ids = Vec::new();
             for (i, (piece, kind)) in config.pieces.iter().zip(&config.kinds).enumerate() {
                 if *kind == PieceKind::UserDefined || (recognize && *kind == PieceKind::Control) {
-                    encoder.add_tokens(&[AddedToken::from(
-                        piece.clone(),
-                        *kind == PieceKind::Control,
-                    )
-                    .normalized(false)]);
-                    if encoder.token_to_id(piece) != Some(i as u32) {
+                    added_tokens.push(
+                        AddedToken::from(piece.clone(), *kind == PieceKind::Control)
+                            .normalized(false),
+                    );
+                    expected_ids.push((piece.as_str(), i as u32));
+                }
+            }
+            if !added_tokens.is_empty() {
+                encoder.add_tokens(&added_tokens);
+                for (piece, id) in expected_ids {
+                    if encoder.token_to_id(piece) != Some(id) {
                         return Err("tokenizer construction changed a token ID".into());
                     }
                 }
@@ -531,7 +538,7 @@ impl TokenDecoder<'_> {
                 }
             }
         }
-        self.pending = self.pending[offset..].to_vec();
+        self.pending.drain(..offset);
         Ok(output)
     }
     pub fn finish(&mut self) -> Result<String, String> {
@@ -540,5 +547,57 @@ impl TokenDecoder<'_> {
         }
         self.finished = true;
         Ok(String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn byte_fallback_tokenizer() -> ByteBpeTokenizer {
+        let mut pieces: Vec<String> = (0..=255u8).map(|b| format!("<0x{b:02X}>")).collect();
+        pieces.push("<eos>".into());
+        let mut kinds = vec![PieceKind::Byte; 256];
+        kinds.push(PieceKind::Control);
+        ByteBpeTokenizer::new(BpeConfig {
+            artifact_identity: "test".into(),
+            pieces,
+            kinds,
+            merges: vec![],
+            normalization: Normalization::None,
+            splits: vec![],
+            encoding: PieceEncoding::MetaspaceByteFallback,
+            ignore_merges: false,
+            implicit_bos: None,
+            stop_tokens: BTreeSet::from([TokenId(256)]),
+            suppressed_tokens: BTreeSet::new(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn token_decoder_drains_pending_across_split_utf8_and_invalid_bytes() {
+        let tokenizer = byte_fallback_tokenizer();
+        let mut decoder = tokenizer.decoder(false);
+
+        // Split 4-byte UTF-8 emoji U+1F600 (F0 9F 98 80) across pushes.
+        assert_eq!(decoder.push(TokenId(0xF0)).unwrap(), "");
+        assert_eq!(decoder.pending.len(), 1);
+        assert_eq!(decoder.push(TokenId(0x9F)).unwrap(), "");
+        assert_eq!(decoder.push(TokenId(0x98)).unwrap(), "");
+        assert_eq!(decoder.push(TokenId(0x80)).unwrap(), "\u{1F600}");
+        assert!(decoder.pending.is_empty());
+
+        // Invalid byte followed by valid ASCII drains both cleanly.
+        assert_eq!(decoder.push(TokenId(0xFF)).unwrap(), "\u{FFFD}");
+        assert!(decoder.pending.is_empty());
+        assert_eq!(decoder.push(TokenId(b'A' as u32)).unwrap(), "A");
+        assert!(decoder.pending.is_empty());
+
+        // Incomplete trailing UTF-8 sequence is held until finish().
+        assert_eq!(decoder.push(TokenId(0xE2)).unwrap(), "");
+        assert_eq!(decoder.pending.len(), 1);
+        assert_eq!(decoder.finish().unwrap(), "\u{FFFD}");
+        assert!(decoder.pending.is_empty());
     }
 }

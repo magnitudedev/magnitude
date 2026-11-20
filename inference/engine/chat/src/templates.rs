@@ -4,8 +4,71 @@ use magnitude_grammar::{CompileCache, Compiled, GrammarError};
 use magnitude_templates::{PreparedRequest, Request as NativeRequest, SpecialTokens, Template};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Bounded concurrent single-flight cache: the mutex is held only to look up
+/// or insert a per-key `OnceLock` cell (evicting the least-recently-used entry
+/// when full), never while computing a value.
+struct BoundedOnceCache<K, V> {
+    max_entries: usize,
+    entries: Mutex<VecDeque<(K, Arc<OnceLock<V>>)>>,
+}
+
+impl<K: PartialEq, V> BoundedOnceCache<K, V> {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            entries: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn cell(&self, key: K) -> Arc<OnceLock<V>> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = entries.iter().position(|(existing, _)| *existing == key) {
+            let entry = entries.remove(index).unwrap();
+            let cell = Arc::clone(&entry.1);
+            entries.push_back(entry);
+            return cell;
+        }
+        let cell = Arc::new(OnceLock::new());
+        if self.max_entries > 0 {
+            while entries.len() >= self.max_entries {
+                entries.pop_front();
+            }
+            entries.push_back((key, Arc::clone(&cell)));
+        }
+        cell
+    }
+
+    fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let mut canonical = serde_json::Map::new();
+            for (k, v) in entries {
+                canonical.insert(k.clone(), canonical_json(v));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        other => other.clone(),
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,7 +83,7 @@ pub struct TemplateBundle {
     variants: BTreeMap<String, TemplateVariant>,
     default: String,
     special_tokens: SpecialTokens,
-    profiles: Mutex<super::reasoning::ProfileCache>,
+    profiles: BoundedOnceCache<(String, Vec<u8>), Result<Arc<super::reasoning::ReasoningProfile>, String>>,
     grammars: CompileCache,
 }
 #[derive(Default)]
@@ -158,7 +221,7 @@ impl TemplateBundle {
             variants: declared,
             default,
             special_tokens,
-            profiles: Mutex::new(super::reasoning::ProfileCache::new(16, 1024 * 1024)),
+            profiles: BoundedOnceCache::new(16),
             grammars: CompileCache::new(16, 16 * 1024 * 1024),
         })
     }
@@ -341,11 +404,23 @@ impl TemplateBundle {
                 controls: Default::default(),
             }
         } else {
-            let profile = self
+            let arguments_key = serde_json::to_vec(&canonical_json(&serde_json::Value::Object(
+                request.template_arguments.clone(),
+            )))
+            .map_err(|error| error.to_string())?;
+            let cell = self
                 .profiles
-                .lock()
-                .expect("template profile cache lock")
-                .inspect(template, &variant.source, &request.template_arguments)?;
+                .cell((template.identity().to_owned(), arguments_key));
+            let profile = cell
+                .get_or_init(|| {
+                    super::reasoning::inspect_reasoning(
+                        template,
+                        &variant.source,
+                        &request.template_arguments,
+                    )
+                    .map(Arc::new)
+                })
+                .clone()?;
             profile.resolve(intent).map_err(Prepare::Reasoning)?
         };
         for (key, value) in &reasoning.controls {
@@ -405,18 +480,16 @@ pub struct TemplateInspection {
     pub fingerprint: String,
 }
 
-type CachedInspection = std::sync::Arc<std::sync::OnceLock<Result<TemplateInspection, String>>>;
-static INSPECTIONS: std::sync::OnceLock<Mutex<std::collections::HashMap<Vec<u8>, CachedInspection>>> =
-    std::sync::OnceLock::new();
+const MAX_CACHED_INSPECTIONS: usize = 64;
+static INSPECTIONS: OnceLock<BoundedOnceCache<Vec<u8>, Result<TemplateInspection, String>>> =
+    OnceLock::new();
 
 impl TemplateBundle {
     /// Clear the process-wide template inspection cache (for cold/held-out benchmarking).
     #[doc(hidden)]
     pub fn clear_inspection_cache() {
-        if let Some(map) = INSPECTIONS.get() {
-            map.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+        if let Some(cache) = INSPECTIONS.get() {
+            cache.clear();
         }
     }
 
@@ -433,20 +506,20 @@ impl TemplateBundle {
             .collect::<Vec<_>>();
         let key = serde_json::to_vec(&(&sources, &self.default, &self.special_tokens))
             .map_err(|error| error.to_string())?;
-        let inspection = std::sync::Arc::clone(
-            INSPECTIONS
-                .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(key)
-                .or_default(),
-        );
+        let inspection = INSPECTIONS
+            .get_or_init(|| BoundedOnceCache::new(MAX_CACHED_INSPECTIONS))
+            .cell(key);
         inspection.get_or_init(|| self.inspect()).clone()
     }
 
     /// The default variant's source text.
     pub fn default_source(&self) -> &str {
         &self.variants[&self.default].source
+    }
+
+    #[cfg(test)]
+    pub(crate) fn special_token(&self, name: &str) -> Option<&str> {
+        self.special_tokens.get(name).map(String::as_str)
     }
 
     /// The native template's capability flags for the default variant.

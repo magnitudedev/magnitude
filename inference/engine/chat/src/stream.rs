@@ -139,8 +139,11 @@ impl StopText {
             .unwrap_or(0);
         let end = self.pending.len() - keep;
         let output = self.pending[..end].to_owned();
-        // Replace rather than drain so one large transport chunk is not retained.
-        self.pending = self.pending[end..].to_owned();
+        self.pending.drain(..end);
+        // Shrink only if an unusually large chunk inflated the retained buffer.
+        if self.pending.capacity() > 4096 && self.pending.len() <= 1024 {
+            self.pending.shrink_to(1024);
+        }
         Ok(output)
     }
     pub fn finish(&mut self) -> Result<String, String> {
@@ -224,5 +227,32 @@ impl ChatStream {
             .map_err(|e| e.to_string())?;
         events.extend(self.parser.finish(cause).map_err(|e| e.to_string())?);
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_text_drains_prefix_and_shrinks_oversized_chunks() {
+        let mut stop = StopText::new(vec!["STOP".into()]).unwrap();
+        // Holds partial stop prefix, then releases it when continuation does not match.
+        assert_eq!(stop.feed("hello ST").unwrap(), "hello ");
+        assert_eq!(stop.pending, "ST");
+        assert_eq!(stop.feed("ART!").unwrap(), "START!");
+        assert!(stop.pending.is_empty());
+
+        // Oversized chunk does not stay pinned in `pending`.
+        let large = "x".repeat(16 * 1024);
+        assert_eq!(stop.feed(&large).unwrap(), large);
+        assert!(stop.pending.is_empty());
+        assert!(stop.pending.capacity() <= 4096);
+
+        // Split stop match across chunks emits only text before the stop.
+        assert_eq!(stop.feed("tail ST").unwrap(), "tail ");
+        assert_eq!(stop.feed("OPignored").unwrap(), "");
+        assert_eq!(stop.matched(), Some("STOP"));
+        assert!(stop.pending.is_empty());
     }
 }

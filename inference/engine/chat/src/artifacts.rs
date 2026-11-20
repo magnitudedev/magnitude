@@ -34,6 +34,18 @@ fn strings(payload: &TokenizerPayload, key: &str) -> Result<Vec<String>, String>
     Ok(text(payload, key)?.iter().map(str::to_owned).collect())
 }
 
+/// GGUF special-token ID keys and the template special-token names they map to.
+/// GGUF spells the separator key `seperator_token_id`.
+const SPECIAL_TOKEN_KEYS: &[(&str, &str)] = &[
+    ("tokenizer.ggml.bos_token_id", "bos_token"),
+    ("tokenizer.ggml.eos_token_id", "eos_token"),
+    ("tokenizer.ggml.unknown_token_id", "unk_token"),
+    ("tokenizer.ggml.padding_token_id", "pad_token"),
+    ("tokenizer.ggml.seperator_token_id", "sep_token"),
+    ("tokenizer.ggml.cls_token_id", "cls_token"),
+    ("tokenizer.ggml.mask_token_id", "mask_token"),
+];
+
 /// Adapt literal package template sources and tokenizer special-token metadata
 /// into the generic rendering bundle.
 pub fn gguf_templates(
@@ -59,16 +71,8 @@ pub fn gguf_templates(
         _ => return Err(format!("missing string array {key}")),
     };
     let mut requested = Vec::new();
-    for (native, name) in [
-        ("bos", "bos_token"),
-        ("eos", "eos_token"),
-        ("unknown", "unk_token"),
-        ("padding", "pad_token"),
-        ("separator", "sep_token"),
-        ("cls", "cls_token"),
-        ("mask", "mask_token"),
-    ] {
-        if let Some(value) = tokenizer.value(&format!("tokenizer.ggml.{native}_token_id")) {
+    for &(key, name) in SPECIAL_TOKEN_KEYS {
+        if let Some(value) = tokenizer.value(key) {
             let id = value
                 .unsigned()
                 .and_then(|n| usize::try_from(n).ok())
@@ -219,8 +223,9 @@ impl Profile {
     }
 }
 
-/// Tokenizer metadata the adaptation interprets. Any other key could change
-/// encoding semantics, so it is rejected.
+/// Tokenizer metadata the adaptation interprets (in addition to
+/// [`SPECIAL_TOKEN_KEYS`]). Any other key could change encoding semantics, so
+/// it is rejected.
 const INTERPRETED_KEYS: &[&str] = &[
     "tokenizer.ggml.model",
     "tokenizer.ggml.pre",
@@ -229,16 +234,9 @@ const INTERPRETED_KEYS: &[&str] = &[
     "tokenizer.ggml.merges",
     // Piece scores rank SentencePiece unigram merges; BPE ranks by merges.
     "tokenizer.ggml.scores",
-    "tokenizer.ggml.bos_token_id",
-    "tokenizer.ggml.eos_token_id",
     "tokenizer.ggml.eos_token_ids",
     "tokenizer.ggml.eot_token_id",
     "tokenizer.ggml.eom_token_id",
-    "tokenizer.ggml.unknown_token_id",
-    "tokenizer.ggml.padding_token_id",
-    "tokenizer.ggml.seperator_token_id",
-    "tokenizer.ggml.cls_token_id",
-    "tokenizer.ggml.mask_token_id",
     "tokenizer.ggml.add_bos_token",
     "tokenizer.ggml.add_eos_token",
     // Separators join sequence pairs for ranking; generation encodes one
@@ -253,6 +251,11 @@ const INTERPRETED_KEYS: &[&str] = &[
     // normalization, which the profile alone decides.
     "tokenizer.ggml.normalizer.nfc",
 ];
+
+fn is_interpreted_key(key: &str) -> bool {
+    INTERPRETED_KEYS.contains(&key)
+        || SPECIAL_TOKEN_KEYS.iter().any(|&(special, _)| special == key)
+}
 
 /// Pieces that end a turn by the GGUF convention (llama.cpp 18443257a30c,
 /// `llama-vocab.cpp` end-of-generation detection), besides the declared EOS,
@@ -341,7 +344,7 @@ fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), Toke
     let mut unsupported = payload
         .metadata
         .iter()
-        .filter(|entry| !INTERPRETED_KEYS.contains(&entry.name.as_str()))
+        .filter(|entry| !is_interpreted_key(entry.name.as_str()))
         .map(|entry| UnsupportedReason::UnrecognizedMetadata {
             key: entry.name.clone(),
         })
@@ -635,5 +638,38 @@ mod normalization_tests {
                 other => panic!("{pre} {nfc}: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn gguf_seperator_token_id_resolves_to_sep_token() {
+        use crate::{ChatRequest, TemplateSelection};
+        use magnitude_artifacts::TemplateSource;
+
+        let text = |value: &str| GgufValue::Scalar(Scalar::String(value.into()));
+        let strings = |values: &[&str]| {
+            GgufValue::Array(Array::from(values.iter().copied().collect::<Strings>()))
+        };
+        let tokenizer = TokenizerPayload {
+            metadata: vec![
+                Metadata { name: "tokenizer.ggml.model".into(), value: text("gpt2") },
+                Metadata { name: "tokenizer.ggml.pre".into(), value: text("llama-bpe") },
+                Metadata { name: "tokenizer.ggml.tokens".into(), value: strings(&["<eos>", "<sep>"]) },
+                Metadata { name: "tokenizer.ggml.token_type".into(), value: GgufValue::Array(Array::from(vec![3_u64, 3])) },
+                Metadata { name: "tokenizer.ggml.merges".into(), value: strings(&[]) },
+                Metadata { name: "tokenizer.ggml.eos_token_id".into(), value: GgufValue::Scalar(Scalar::Unsigned(0)) },
+                Metadata { name: "tokenizer.ggml.seperator_token_id".into(), value: GgufValue::Scalar(Scalar::Unsigned(1)) },
+            ],
+        };
+        assert_eq!(gguf_tokenizer_vocabulary(&tokenizer).unwrap(), 2);
+
+        let templates = TemplatePayload {
+            sources: vec![TemplateSource {
+                name: "default".into(),
+                source: "{{ sep_token }}".into(),
+                provenance: "test".into(),
+            }],
+        };
+        let bundle = gguf_templates(&templates, &tokenizer).unwrap();
+        assert_eq!(bundle.special_token("sep_token"), Some("<sep>"));
     }
 }
