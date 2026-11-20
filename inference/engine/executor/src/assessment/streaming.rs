@@ -3,7 +3,7 @@
 //! experts are in the GPU's memory, is priced by the one cost function
 //! ([`ExpertLines::staged`], [`super::cost`]), as decode is.
 
-use magnitude_cost_model::{ExpertLines, ExpertPass, Miss, ReadLine};
+use magnitude_cost_model::{ExpertLines, ExpertPass, ReadLine};
 
 /// One streamed layer of a prompt group, as [`Stages`] takes it: the
 /// compute of one of the group's steps there, measured on the run, and the
@@ -49,16 +49,7 @@ impl Stages<'_> {
     /// their one read and landing, each moved.
     fn stage(&self, layer: usize) -> f64 {
         let (terms, lines) = (&self.layers[layer], &self.lines[layer]);
-        let filed = match terms.filed {
-            0 => 0.,
-            count => lines.filed(&self.line, count),
-        };
-        // A stage is its moves', which no row count enters.
-        let misses = std::iter::repeat_n(0., terms.tiered as usize)
-            .chain(std::iter::repeat_n(filed, terms.filed as usize))
-            .map(|ready_seconds| Miss { rows: 1., ready_seconds })
-            .collect::<Vec<_>>();
-        lines.staged(&misses)
+        lines.group_stage(&self.line, terms.tiered, terms.filed)
     }
 
     /// The steps a group runs while decode waits, at most `capacity`: the

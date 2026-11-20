@@ -206,12 +206,12 @@ impl AddAssign for Sums {
 }
 
 /// The decode passes timed over the bank-wide turnover's window, their
-/// sums overall and by depth, and the latest pass.
+/// sums overall and by `(form, depth)`, and the latest pass.
 pub(super) struct Passes {
     time: Time,
     latest: Option<Pass>,
     all: Window<Sums>,
-    sums: Box<[Window<Sums>]>,
+    sums: [Box<[Window<Sums>]>; 2],
 }
 
 impl std::fmt::Debug for Passes {
@@ -331,6 +331,7 @@ pub struct Measured {
     pub depth: usize,
     pub verifying: bool,
     pub terms: [Option<Terms>; DEPTHS],
+    pub verify_terms: [Option<Terms>; DEPTHS],
     pub paths: Option<Vec<magnitude_cost_model::PathTerm>>,
     pub stall: Option<f64>,
     pub needed: [[Option<magnitude_cost_model::Needed>; DEPTHS]; 2],
@@ -341,6 +342,16 @@ pub struct Measured {
 }
 
 impl Measured {
+    /// Mean terms for `(verify, depth)`: verify passes use their own form's
+    /// measurements and extrapolate from front passes when verify has no
+    /// samples yet at `depth`.
+    pub fn terms_for(&self, verify: bool, depth: usize) -> Option<Terms> {
+        match verify {
+            false => self.terms[depth],
+            true => self.verify_terms[depth].or(self.terms[depth]),
+        }
+    }
+
     /// The routes a front pass reads its experts by
     /// (`magnitude_cost_model::FrontRoutes`): the fresh experts of each lag
     /// up to the first unmeasured one, beyond which routing is taken as
@@ -358,7 +369,7 @@ impl Passes {
             time,
             latest: None,
             all: Window::new(epoch),
-            sums: (0..DEPTHS).map(|_| Window::new(epoch)).collect(),
+            sums: std::array::from_fn(|_| (0..DEPTHS).map(|_| Window::new(epoch)).collect()),
         }
     }
 
@@ -367,20 +378,20 @@ impl Passes {
     }
 
     /// A decode pass was timed: counted into the bank-wide window overall
-    /// and for its depth.
+    /// and for its `(form, depth)`.
     pub fn timed(&mut self, pass: Pass) {
         assert!(pass.depth < DEPTHS, "a pass of depth {} past the decode form's rows", pass.depth);
         let epoch = self.epoch();
         let one = Sums::of(&pass);
         *self.all.count(epoch) += one;
-        *self.sums[pass.depth].count(epoch) += one;
+        *self.sums[usize::from(pass.verifies)][pass.depth].count(epoch) += one;
         self.latest = Some(pass);
     }
 
-    /// One depth's sums over its window (keeping its last measured epoch
-    /// while unrun).
-    fn depth(&mut self, depth: usize, epoch: u64) -> Sums {
-        self.sums[depth].read(epoch).map(Sums::over).unwrap_or_default()
+    /// One `(form, depth)`'s sums over its window (keeping its last measured
+    /// epoch while unrun).
+    fn depth(&mut self, verify: bool, depth: usize, epoch: u64) -> Sums {
+        self.sums[usize::from(verify)][depth].read(epoch).map(Sums::over).unwrap_or_default()
     }
 
     /// Every pass of the bank-wide window, together.
@@ -447,45 +458,56 @@ impl Passes {
         let epoch = self.epoch();
         let all = self.all.read(epoch).map(Sums::over).unwrap_or_default();
         let routed = all.pass.routed;
-        // A read's seconds on the drive's line, and each depth's reads
-        // ahead nothing used (spent in whichever pass learned it) a pass of
-        // each form that ran that depth: exact-row lookahead hints (`depth == 0`,
-        // `Basis::Hint`, always stored under `unused[0][0]`) run on ALL passes
-        // (both front and verify), so their waste is divided by `all.passes`
-        // and shared by both forms; deeper rows (`depth >= 1`) are divided by
-        // the passes of their own form that ran that depth (`AheadUse`).
-        let per_read = (all.pass.reads > 0.).then(|| all.pass.drive / all.pass.reads);
-        let wasted = |verify: bool| {
+        // Each depth's unused reads ahead per pass of each form that ran that
+        // depth: exact-row lookahead hints (`depth == 0`, `Basis::Hint`,
+        // always stored under `unused[0][0]`) run on ALL passes (both front
+        // and verify), so their waste is divided by `all.passes` and shared by
+        // both forms; deeper rows (`depth >= 1`) are divided by the passes of
+        // their own form that ran that depth (`AheadUse`). Each of the 4
+        // resources (`drive`, `link`, `cpu`, `memory`) attributes wasted reads
+        // proportionally via its own per-read cost (`seconds / all.pass.reads`
+        // when `all.pass.reads > 0.`).
+        let unused_per_pass = |verify: bool| {
             let form = usize::from(verify);
             (0..DEPTHS)
                 .map(|depth| {
                     if depth == 0 {
-                        (all.passes > 0.).then(|| all.pass.unused[0][0] / all.passes * per_read.unwrap_or(0.))
+                        (all.passes > 0.).then(|| all.pass.unused[0][0] / all.passes)
                     } else {
                         let passes: f64 = all.by_depth[form][depth..DEPTHS].iter().sum();
-                        (passes > 0.).then(|| all.pass.unused[form][depth] / passes * per_read.unwrap_or(0.))
+                        (passes > 0.).then(|| all.pass.unused[form][depth] / passes)
                     }
                 })
                 .collect::<Vec<_>>()
         };
-        let wasted = magnitude_cost_model::Waste { front: wasted(false), verify: wasted(true) };
+        let unused_front = unused_per_pass(false);
+        let unused_verify = unused_per_pass(true);
         let paths = (all.pass.missed > 0.).then(|| {
             let terms = Terms { compute: 0., drive: all.pass.drive, link: all.pass.link, cpu: all.pass.cpu, memory: all.pass.memory };
-            let path = |(at, seconds): (usize, f64)| magnitude_cost_model::PathTerm {
-                seconds: seconds / all.pass.missed,
-                wasted: match at {
-                    0 => wasted.clone(),
-                    _ => magnitude_cost_model::Waste { front: vec![None; DEPTHS], verify: vec![None; DEPTHS] },
-                },
+            let scale = |unused: &[Option<f64>], per_read: f64| unused.iter().map(|count| count.map(|n| n * per_read)).collect();
+            let path = |seconds: f64| {
+                let per_read = if all.pass.reads > 0. { seconds / all.pass.reads } else { 0. };
+                magnitude_cost_model::PathTerm {
+                    seconds: seconds / all.pass.missed,
+                    wasted: magnitude_cost_model::Waste {
+                        front: scale(&unused_front, per_read),
+                        verify: scale(&unused_verify, per_read),
+                    },
+                }
             };
-            terms.each_path().into_iter().enumerate().map(path).collect()
+            terms.each_path().into_iter().map(path).collect()
         });
-        let plain = self.depth(0, epoch).pass;
-        let terms = std::array::from_fn(|depth| self.depth(depth, epoch).terms());
+        let plain = self.depth(false, 0, epoch).pass;
+        let front_terms: [Option<Terms>; DEPTHS] =
+            std::array::from_fn(|depth| self.depth(false, depth, epoch).terms());
+        let verify_terms: [Option<Terms>; DEPTHS] =
+            std::array::from_fn(|depth| self.depth(true, depth, epoch).terms());
+        let terms = std::array::from_fn(|depth| front_terms[depth].or(verify_terms[depth]));
         Some(Measured {
             depth: latest.depth,
             verifying: latest.verifies,
             terms,
+            verify_terms,
             paths,
             stall: (plain.missed > 0.).then(|| plain.parked / plain.missed),
             needed,
@@ -611,7 +633,7 @@ mod tests {
         assert!((paths[0].seconds - 0.18 / 180.).abs() < 1e-15 && paths[1..].iter().all(|path| path.seconds == 0.), "{paths:?}");
         let wasted = paths[0].wasted.front.iter().map(|wasted| wasted.map(|seconds| (seconds * 1e6).round())).collect::<Vec<_>>();
         assert_eq!(wasted[..4], [Some(2000.), Some(6000.), Some(4000.), None], "depth 0 over both passes, 1 and 2 over the deep one, 3 none");
-        assert!(paths[1].wasted.front.iter().all(Option::is_none), "no read ahead crosses the link");
+        assert!(paths[1].wasted.front.iter().all(|w| w.unwrap_or(0.) == 0.), "link has zero busy seconds so zero waste");
         assert!((measured.stall.unwrap() - 0.1 / 100.).abs() < 1e-15, "the plain pass's parking a miss: {measured:?}");
         // Two bank-wide epochs of plain passes replace `all` and `by_depth[0]`,
         // while unrun depth 2 keeps its last measured compute.
@@ -627,23 +649,66 @@ mod tests {
         assert!((measured.terms[0].unwrap().compute - 0.04).abs() < 1e-9, "{measured:?}");
     }
 
-    /// A verify pass computes as a front pass of its depth's rows does, so
-    /// its terms join theirs; the reads ahead nothing used its verify rows
-    /// led are its form's waste, apart from the front pass's. The latest
+    /// Front and verify passes keep separate compute sums by `(form, depth)`
+    /// rather than conflating them; when verify has no samples yet at a depth,
+    /// `terms_for(true, depth)` extrapolates from the front pass at that depth.
+    /// The reads ahead nothing used are tracked per form apart, and the latest
     /// pass says whether it verified.
     #[test]
-    fn a_verify_pass_joins_its_depths_compute_and_no_front_rows_waste() {
+    fn front_and_verify_compute_are_keyed_by_form_and_depth() {
         let (mut passes, time) = passes();
         let front = Pass { rows: 2, depth: 1, seconds: 0.05, parked: 0.01, misses: 10., missed: 10., reads: 10., drive: 0.01, unused: [[0., 4., 0., 0., 0., 0., 0., 0.], [0.; DEPTHS]], ..Pass::default() };
         passes.timed(front);
+        // Depth 2 only has a front pass: verify extrapolates from front.
+        passes.timed(Pass { rows: 3, depth: 2, seconds: 0.06, parked: 0.01, ..front });
+        // Depth 1 has both front (compute = 0.04) and verify (compute = 0.06).
         passes.timed(Pass { verifies: true, seconds: 0.07, unused: [[0.; DEPTHS], [0., 2., 0., 0., 0., 0., 0., 0.]], ..front });
         let measured = passes.measured([[Some(magnitude_cost_model::Needed::Executed(10.)); DEPTHS]; 2], &unjudged(time)).expect("passes timed");
         assert!(measured.verifying, "{measured:?}");
-        assert!((measured.terms[1].unwrap().compute - 0.05).abs() < 1e-12, "both passes' compute: {measured:?}");
+        assert!((measured.terms[1].unwrap().compute - 0.04).abs() < 1e-12, "front depth 1 compute alone: {measured:?}");
+        assert!((measured.verify_terms[1].unwrap().compute - 0.06).abs() < 1e-12, "verify depth 1 compute alone: {measured:?}");
+        assert_eq!(measured.verify_terms[2], None, "no verify pass at depth 2");
+        assert!((measured.terms_for(true, 2).unwrap().compute - 0.05).abs() < 1e-12, "verify extrapolates from front at unmeasured depth 2");
         let wasted = &measured.paths.as_ref().expect("a miss counted")[0].wasted;
-        let (front, verify) = (wasted.front[1].expect("a front pass ran depth 1"), wasted.verify[1].expect("a verify pass ran depth 1"));
-        assert!((front - 4. * 1e-3).abs() < 1e-15, "the front pass's four unused reads, over it alone: {front}");
-        assert!((verify - 2. * 1e-3).abs() < 1e-15, "the verify pass's two unused reads, over it alone: {verify}");
+        let (front_w, verify_w) = (wasted.front[1].expect("a front pass ran depth 1"), wasted.verify[1].expect("a verify pass ran depth 1"));
+        assert!((front_w - 4. * 1e-3).abs() < 1e-15, "the front pass's four unused reads over its two passes (depth 1 and 2): {front_w}");
+        assert!((verify_w - 2. * 1e-3).abs() < 1e-15, "the verify pass's two unused reads, over it alone: {verify_w}");
+    }
+
+    /// Wasted reads are attributed proportionally across all 4 resources
+    /// (`drive`, `link`, `cpu`, `memory`) via each resource's per-read cost
+    /// (`seconds / all.pass.reads`) when `reads > 0`.
+    #[test]
+    fn wasted_reads_are_attributed_proportionally_across_all_four_resources() {
+        let (mut passes, time) = passes();
+        passes.timed(Pass {
+            rows: 2,
+            depth: 1,
+            seconds: 0.10,
+            parked: 0.02,
+            misses: 10.,
+            missed: 20.,
+            reads: 10.,
+            drive: 0.020,  // 2.0 ms / read
+            link: 0.015,   // 1.5 ms / read
+            cpu: 0.005,    // 0.5 ms / read
+            memory: 0.010, // 1.0 ms / read
+            unused: [[2., 4., 0., 0., 0., 0., 0., 0.], [0.; DEPTHS]],
+            ..Pass::default()
+        });
+        let measured = passes
+            .measured([[Some(magnitude_cost_model::Needed::Executed(20.)); DEPTHS]; 2], &unjudged(time))
+            .expect("passes timed");
+        let paths = measured.paths.as_ref().expect("misses counted");
+        assert_eq!(paths.len(), 4);
+        let expected_per_read = [2.0e-3, 1.5e-3, 0.5e-3, 1.0e-3];
+        for (idx, per_read) in expected_per_read.into_iter().enumerate() {
+            let w0 = paths[idx].wasted.front[0].expect("depth 0 waste");
+            let w1 = paths[idx].wasted.front[1].expect("depth 1 waste");
+            assert!((w0 - 2. * per_read).abs() < 1e-15, "resource {idx} depth 0: {w0}");
+            assert!((w1 - 4. * per_read).abs() < 1e-15, "resource {idx} depth 1: {w1}");
+            assert_eq!(paths[idx].wasted.front[2], None, "unmeasured depth 2 stays None");
+        }
     }
 
     /// Exact-row lookahead hints (`depth == 0`, `unused[0][0]`) run on both

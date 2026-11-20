@@ -653,19 +653,24 @@ impl ExecutorCosts {
 
     /// The matrix throughput of weights resident as `format`: its measured
     /// throughput; until a job measures it, its pilot's arithmetic rate at
-    /// one row along device storage's first route, as a CPU's rows take
-    /// about one row's time each (a 12-core M6's CPU ran 8 rows in 7 to 9.4
-    /// times one row's time, 2026-10-22), and a GPU, whose rows share its
-    /// weights' bytes, reads every throughput in its first job. Where its
-    /// pilot could not be read, the activation dtype's, which its arithmetic
-    /// runs in once its weights are decoded (an M4 Max's Metal, 2026-10-21:
-    /// every format within 2.5% of bf16); the activation dtype's own, until
-    /// read, at the probe's one-row rate, by the same bound.
+    /// one row along device storage's first route scaled by the activation
+    /// dtype's measured matrix-to-one-row ratio (`activation / bf16_one_row`),
+    /// capped at `activation`. On a CPU, `activation / bf16_one_row ≈ 1` (8
+    /// rows take about 8 one-row times), preserving one-row CPU scaling; on a
+    /// GPU, where one-row calls are memory-bandwidth-bound and multi-row
+    /// matrix calls reach 30×–100× higher tensor-core throughput, scaling by
+    /// the activation ratio prevents a 30×–100× underestimate when a format's
+    /// 1-row pilot is measured before its matrix throughput, while capping at
+    /// `activation` prevents narrower decoded formats from exceeding bf16
+    /// arithmetic. Where its pilot could not be read, `activation` itself
+    /// (falling back to the probe's one-row rate before `activation_matrix` is
+    /// read).
     pub fn matrix_flops(&self, format: Element) -> f64 {
-        let activation = self.activation_matrix.as_ref().map_or_else(
-            || one_row_flops(Element::bf16(), &self.first.activation),
-            |matrix| matrix.flops.value,
-        );
+        let bf16_one_row = one_row_flops(Element::bf16(), &self.first.activation);
+        let activation = self
+            .activation_matrix
+            .as_ref()
+            .map_or(bf16_one_row, |matrix| matrix.flops.value);
         if format == Element::bf16() {
             return activation;
         }
@@ -673,7 +678,10 @@ impl ExecutorCosts {
             return matrix.flops.value;
         }
         match self.first.formats.iter().find(|(read, _)| *read == format) {
-            Some((_, rates)) => one_row_flops(format, &rates.pilot),
+            Some((_, rates)) => {
+                let scale = activation / bf16_one_row;
+                (one_row_flops(format, &rates.pilot) * scale).min(activation)
+            }
             None => activation,
         }
     }
@@ -3869,10 +3877,10 @@ fn plan(routes: &[&Route], formats: &[Element]) -> Vec<Step> {
             );
         }
     }
+    steps.extend(others.iter().map(|&format| Step::Matrix(format)));
     steps.extend(HISTORY_LAYOUTS.into_iter().flat_map(|layout| {
         (FIRST_RUNGS..HISTORY_DEPTHS.len()).map(move |index| Step::Rung(layout, Rung::Depth(index)))
     }));
-    steps.extend(others.iter().map(|&format| Step::Matrix(format)));
     steps
 }
 
@@ -5587,8 +5595,8 @@ mod tests {
             Step::WeightRate(0, f32, Pass::Pilot),
             Step::WeightRate(0, f32, Pass::Rate),
         ]);
-        expected.extend(deeper(KvCodec::Dense).chain(deeper(KvCodec::AffineK8V4)));
         expected.push(Step::Matrix(f32));
+        expected.extend(deeper(KvCodec::Dense).chain(deeper(KvCodec::AffineK8V4)));
         assert_eq!(steps, expected);
     }
 
@@ -5903,5 +5911,47 @@ mod tests {
         assert!(fit_decode_line(&timing(1.0e-3, Some((f64::NAN, 1.1e-3))), &timing(2.0e-3, None), flops).is_err());
         assert!(fit_decode_line(&timing(1.0e-3, Some((1.2e-3, 0.9e-3))), &timing(2.0e-3, None), flops).is_err());
         assert!(fit_decode_line(&timing(1.0e-3, None), &timing(2.0e-3, None), 0.0).is_err());
+    }
+
+    /// On a GPU whose multi-row `activation_matrix` throughput is 30×–100×
+    /// higher than its memory-bound 1-row bf16 probe, measuring a format's
+    /// 1-row pilot before its matrix throughput scales by
+    /// `activation_matrix / one_row_flops(bf16)` (capped at `activation_matrix`)
+    /// rather than degrading to 1-row FLOPs; on a CPU (`ratio ≈ 1`) one-row
+    /// scaling is preserved.
+    #[test]
+    fn matrix_flops_scales_unmeasured_formats_by_activation_matrix_ratio() {
+        let measured = |value| MeasuredCost { value, interval: None, samples: 8 };
+        let rate = |bytes_per_second| WeightRate {
+            bytes_per_second: measured(bytes_per_second),
+            features: 16384,
+        };
+        let mut gpu = crate::assessment::fixtures::costs();
+        // GPU: 300 GB/s 1-row bf16 (300 GFLOP/s), 30 TFLOP/s bf16 matrix (100× ratio).
+        gpu.first.activation = rate(300e9);
+        gpu.activation_matrix = Some(MatrixCosts { flops: measured(30e12), features: 16384 });
+        gpu.matrices.clear();
+        let f32_el = Element::f32();
+        let q4k_el = chain_element(seismic::BackendName::Cuda).unwrap();
+        gpu.first.formats = vec![
+            // F32 at 300 GB/s has half bf16's 1-row FLOPs (150 GFLOP/s) -> scales 100× to 15 TFLOP/s.
+            (f32_el, FormatRates { pilot: rate(300e9), streamed: None }),
+            // Q4_K at 300 GB/s has >3× bf16's 1-row FLOPs -> caps at 30 TFLOP/s (never exceeds bf16).
+            (q4k_el, FormatRates { pilot: rate(300e9), streamed: None }),
+        ];
+        assert!((gpu.matrix_flops(f32_el) - 15e12).abs() < 1e6, "got {}", gpu.matrix_flops(f32_el));
+        assert!((gpu.matrix_flops(q4k_el) - 30e12).abs() < 1e6, "got {}", gpu.matrix_flops(q4k_el));
+        // Once Q4_K's own matrix throughput is measured, that value is returned directly.
+        gpu.matrices.push((q4k_el, MatrixCosts { flops: measured(28e12), features: 16384 }));
+        assert_eq!(gpu.matrix_flops(q4k_el), 28e12);
+
+        // CPU: 1-row bf16 is compute-bound at 100 GFLOP/s and matrix is also 100 GFLOP/s (ratio = 1).
+        let mut cpu = gpu.clone();
+        cpu.matrices.clear();
+        cpu.first.activation = rate(100e9);
+        cpu.activation_matrix = Some(MatrixCosts { flops: measured(100e9), features: 16384 });
+        // F32 pilot at 100 GB/s = 50 GFLOP/s; with ratio = 1 it stays 50 GFLOP/s.
+        cpu.first.formats = vec![(f32_el, FormatRates { pilot: rate(100e9), streamed: None })];
+        assert!((cpu.matrix_flops(f32_el) - 50e9).abs() < 1e3, "got {}", cpu.matrix_flops(f32_el));
     }
 }

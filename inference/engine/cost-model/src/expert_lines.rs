@@ -641,6 +641,26 @@ impl ExpertLines {
         served.end_seconds - served.moved_compute_seconds
     }
 
+    /// When a prompt group's pass has `tiered` host-tier misses (ready at 0)
+    /// and `filed` file misses (ready after [`Self::filed`]) in the GPU's
+    /// memory, from their requests: [`Self::staged`] (`Pass::Group`) without
+    /// resident compute. Single owner shared by runtime `Stages` and plan-time
+    /// [`crate::BankPrices::prompt_seconds`].
+    pub fn group_stage(&self, line: &ReadLine, tiered: u64, filed: u64) -> f64 {
+        if tiered == 0 && filed == 0 {
+            return 0.;
+        }
+        let filed_seconds = match filed {
+            0 => 0.,
+            count => self.filed(line, count),
+        };
+        let misses: Vec<Miss> = std::iter::repeat_n(0., tiered as usize)
+            .chain(std::iter::repeat_n(filed_seconds, filed as usize))
+            .map(|ready_seconds| Miss { rows: 1., ready_seconds })
+            .collect();
+        self.staged(&misses)
+    }
+
     /// The policy words of the layer's lines (`streaming_words.seismic`'s
     /// policy after its home), each `(word, value)` at `layout`'s offsets:
     /// POLICY_PRICED set, and the GPU's words and a site's CPU words

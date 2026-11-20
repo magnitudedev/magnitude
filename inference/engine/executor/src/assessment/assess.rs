@@ -564,200 +564,73 @@ impl StateSizer {
     }
 }
 
+/// Thin single-owner evaluator for banked `ModelLoadPlan` charges at
+/// `(slots, places, paths)`: delegates weight demands to
+/// [`ModelLoadPlan::weight_demands`] (adjusted only for `places` via
+/// [`crate::planning::ExpertBankPlan::places_storage_demand`]) and
+/// qualification peak bytes directly to
+/// [`AttestedPrograms::qualification_peak_bytes`].
 #[derive(Clone, Debug)]
 struct BankSlotModel {
-    base_demand: ClaimDemand,
-    device_only: bool,
-    layers: Vec<(u64, u64)>,
-    non_banked_qual_max: u64,
-    banked_block_qual: Vec<(u64, usize, usize)>,
+    load: std::sync::Arc<crate::ModelLoadPlan>,
 }
 
 impl BankSlotModel {
-    fn of(
-        load: &crate::ModelLoadPlan,
-        bank: &crate::planning::ExpertBankPlan,
-        prepared_weight_demand: ClaimDemand,
-    ) -> Result<Self, String> {
-        use magnitude_family_contracts::{ProgressivePlane, WeightKind, WeightScope};
-        use std::collections::HashMap;
-
-        let group_slot_bytes: Vec<u64> = bank
-            .groups()
-            .iter()
-            .map(|group| {
-                group.record.iter().try_fold(0u64, |sum, (_, tensor)| {
-                    sum.checked_add(tensor.record_bytes()?)
-                        .ok_or_else(|| "a record's bytes overflow".to_owned())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut layer_entries: Vec<(u32, u64, u64)> = Vec::with_capacity(bank.layers().len());
-        for layer in bank.layers() {
-            let block = match layer.scope {
-                WeightScope::TargetSublayer(index)
-                | WeightScope::TargetBranch { sublayer: index, .. } => index.block,
-                other => return Err(format!("banked layer scope {other:?} is not a target block")),
-            };
-            layer_entries.push((block, group_slot_bytes[layer.group], layer.experts));
+    fn of(load: &crate::ModelLoadPlan) -> Self {
+        Self {
+            load: std::sync::Arc::new(load.clone()),
         }
-        layer_entries.sort_by_key(|&(block, _, _)| block);
-
-        let mut layers: Vec<(u64, u64)> = Vec::with_capacity(layer_entries.len());
-        let mut block_ranges: Vec<(u32, usize, usize)> = Vec::new();
-        for (block, slot_bytes, experts) in layer_entries {
-            let idx = layers.len();
-            layers.push((slot_bytes, experts));
-            if let Some(last) = block_ranges.last_mut().filter(|last| last.0 == block) {
-                last.2 = idx + 1;
-            } else {
-                block_ranges.push((block, idx, idx + 1));
-            }
-        }
-
-        let places_0 = bank.places_storage_demand(bank.places)?;
-        let paths_layout_0 = bank.paths_layout_demand(bank.paths)?;
-        let pooled_0 = bank.pooled_demand_at(bank.slots, bank.paths)?;
-        let device_only =
-            bank.host().contract(crate::planning::BankTier::Bank) == seismic::Contract::DeviceOnly;
-        let mut base_demand = prepared_weight_demand;
-        if !device_only {
-            let res_0 = bank.resident_charge_with_paths(bank.slots, bank.paths)?;
-            let mut rec_0 = 0u64;
-            for &(slot_bytes, experts) in &layers {
-                let bytes = slot_bytes
-                    .checked_mul(bank.slots.min(experts))
-                    .ok_or_else(|| "banked expert bytes overflow".to_owned())?;
-                rec_0 = rec_0
-                    .checked_add(bytes)
-                    .ok_or_else(|| "banked record bytes overflow".to_owned())?;
-            }
-            let lent_0 = rec_0.saturating_sub(res_0);
-            base_demand.device = base_demand
-                .device
-                .checked_sub(lent_0)
-                .ok_or_else(|| "bank weight demand underflows".to_owned())?;
-            base_demand.shared = base_demand
-                .shared
-                .checked_add(lent_0)
-                .ok_or_else(|| "bank weight demand overflows".to_owned())?;
-        }
-        for part in [places_0, paths_layout_0, pooled_0] {
-            base_demand = base_demand
-                .checked_minus(part)
-                .ok_or_else(|| "bank weight demand underflows".to_owned())?;
-        }
-
-        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-        enum FixtureScope {
-            Block(u32),
-            Head(u32),
-            Other(WeightScope),
-        }
-        let fixture_scope = |scope| match scope {
-            WeightScope::TargetSublayer(index)
-            | WeightScope::TargetBranch { sublayer: index, .. } => FixtureScope::Block(index.block),
-            WeightScope::HeadBlock(block) => FixtureScope::Head(block),
-            WeightScope::HeadSublayer(index)
-            | WeightScope::HeadBranch { sublayer: index, .. } => FixtureScope::Head(index.block),
-            other => FixtureScope::Other(other),
-        };
-        let mut scopes = HashMap::<FixtureScope, u64>::new();
-        for weight in load.weights() {
-            if weight.role.kind == WeightKind::Embedding || weight.banked().is_some() {
-                continue;
-            }
-            let scope = scopes.entry(fixture_scope(weight.role.scope)).or_default();
-            *scope = scope
-                .checked_add(weight.resident_bytes)
-                .ok_or("qualification scope byte count overflows")?;
-        }
-        if load.head().is_some() {
-            let target = |kind| {
-                load.weight_by_role(magnitude_family_contracts::WeightRole {
-                    scope: WeightScope::Target,
-                    kind,
-                })
-            };
-            let fixture = |element: seismic::Element, shape: &[u64]| {
-                element
-                    .canonical_byte_len(shape)
-                    .map_err(|error| format!("draft projection fixture: {error}"))
-            };
-            let projection = match target(WeightKind::Output) {
-                Some(output) => {
-                    let [vocabulary, hidden] = output.shape[..] else {
-                        return Err("target output is not a matrix".into());
-                    };
-                    fixture(output.resident, &[vocabulary, hidden])?
-                }
-                None => {
-                    let top = target(WeightKind::OutputPlane(ProgressivePlane::Top))
-                        .ok_or("head qualification requires the target output")?;
-                    let [vocabulary, groups, _] = top.shape[..] else {
-                        return Err("target top plane is not a matrix".into());
-                    };
-                    let depth = top
-                        .progressive_depth()
-                        .ok_or("target top plane has no code depth")?;
-                    let hidden = groups * 32;
-                    ProgressivePlane::ALL.into_iter().try_fold(0u64, |bytes, plane| {
-                        let element = crate::progressive::element(plane);
-                        let plane_bytes =
-                            fixture(element, &plane.shape(vocabulary, hidden, depth))?;
-                        bytes
-                            .checked_add(plane_bytes)
-                            .ok_or_else(|| "draft projection fixture overflows".to_owned())
-                    })?
-                }
-            };
-            for (scope, bytes) in &mut scopes {
-                if matches!(scope, FixtureScope::Head(_)) {
-                    *bytes = bytes
-                        .checked_add(projection)
-                        .ok_or("qualification scope byte count overflows")?;
-                }
-            }
-        }
-        let mut banked_block_qual = Vec::with_capacity(block_ranges.len());
-        for (block, start, end) in block_ranges {
-            let non_banked = scopes.remove(&FixtureScope::Block(block)).unwrap_or(0);
-            banked_block_qual.push((non_banked, start, end));
-        }
-        let non_banked_qual_max = scopes.into_values().max().unwrap_or(0);
-
-        let model = Self {
-            base_demand,
-            device_only,
-            layers,
-            non_banked_qual_max,
-            banked_block_qual,
-        };
-        #[cfg(debug_assertions)]
-        {
-            debug_assert_eq!(
-                model.weight_demand(bank, bank.slots).expect("bank slot model demand"),
-                prepared_weight_demand,
-                "BankSlotModel weight_demand diverged at prepared slots"
-            );
-            debug_assert_eq!(
-                model.qualification_peak(bank.slots).expect("bank slot model qual"),
-                AttestedPrograms::qualification_peak_bytes(load).expect("reference qual"),
-                "BankSlotModel qualification_peak diverged at prepared slots"
-            );
-        }
-        Ok(model)
     }
 
-    fn weight_demand(
+    fn resized_load(
         &self,
-        bank: &crate::planning::ExpertBankPlan,
         slots: u64,
-    ) -> Result<ClaimDemand, String> {
-        self.weight_demand_at(bank, slots, bank.places, bank.paths)
+        paths: crate::planning::BankPaths,
+    ) -> Result<crate::ModelLoadPlan, String> {
+        let mut load = (*self.load).clone();
+        let (cur_slots, cur_ceiling, widest) = {
+            let bank = load
+                .expert_bank()
+                .ok_or_else(|| "a bank slot model requires an expert bank".to_owned())?;
+            (bank.slots, bank.ceiling, bank.widest().get())
+        };
+        if cur_ceiling < widest {
+            load = load
+                .with_bank_slots(cur_slots, widest)
+                .map_err(|error| error.to_string())?;
+        }
+        if load.expert_bank().expect("banked").paths != paths {
+            load = load
+                .with_bank_paths(paths)
+                .map_err(|error| error.to_string())?;
+        }
+        if load.expert_bank().expect("banked").slots != slots {
+            load = load
+                .with_bank_slots(slots, widest)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(load)
     }
 
+    fn weight_demand_for(
+        resized: &crate::ModelLoadPlan,
+        bank: &crate::planning::ExpertBankPlan,
+        places: u64,
+    ) -> Result<ClaimDemand, String> {
+        let mut demand = ClaimDemand::checked_sum(resized.weight_demands()?)
+            .ok_or_else(|| "weight demand overflows".to_owned())?;
+        if places != bank.places {
+            let old_places = bank.places_storage_demand(bank.places)?;
+            let new_places = bank.places_storage_demand(places)?;
+            demand = demand
+                .checked_minus(old_places)
+                .and_then(|d| d.checked_plus(new_places))
+                .ok_or_else(|| "weight demand overflows".to_owned())?;
+        }
+        Ok(demand)
+    }
+
+    #[cfg(test)]
     fn weight_demand_at(
         &self,
         bank: &crate::planning::ExpertBankPlan,
@@ -765,59 +638,21 @@ impl BankSlotModel {
         places: u64,
         paths: crate::planning::BankPaths,
     ) -> Result<ClaimDemand, String> {
-        let places_demand = bank.places_storage_demand(places)?;
-        let paths_demand = bank.paths_layout_demand(paths)?;
-        let pooled_demand = bank.pooled_demand_at(slots, paths)?;
-        let mut demand = self
-            .base_demand
-            .checked_plus(places_demand)
-            .and_then(|d| d.checked_plus(paths_demand))
-            .and_then(|d| d.checked_plus(pooled_demand))
-            .ok_or_else(|| "weight demand overflows".to_owned())?;
-        if !self.device_only {
-            let res = bank.resident_charge_with_paths(slots, paths)?;
-            let mut rec = 0u64;
-            for &(slot_bytes, experts) in &self.layers {
-                let bytes = slot_bytes
-                    .checked_mul(slots.min(experts))
-                    .ok_or_else(|| "banked expert bytes overflow".to_owned())?;
-                rec = rec
-                    .checked_add(bytes)
-                    .ok_or_else(|| "banked record bytes overflow".to_owned())?;
-            }
-            let lent = rec.saturating_sub(res);
-            demand.device = demand
-                .device
-                .checked_add(lent)
-                .ok_or_else(|| "weight demand overflows".to_owned())?;
-            demand.shared = demand
-                .shared
-                .checked_sub(lent)
-                .ok_or_else(|| "weight demand underflows".to_owned())?;
-        }
-        Ok(demand)
+        let resized = self.resized_load(slots, paths)?;
+        Self::weight_demand_for(&resized, bank, places)
     }
 
-    fn qualification_peak(&self, slots: u64) -> Result<u64, String> {
-        const FIXTURES: u64 = 16 * 1024 * 1024;
-        let mut peak = self.non_banked_qual_max;
-        for &(non_banked, start, end) in &self.banked_block_qual {
-            let mut scope = non_banked;
-            for &(slot_bytes, experts) in &self.layers[start..end] {
-                let bytes = slot_bytes
-                    .checked_mul(slots.min(experts))
-                    .ok_or_else(|| "banked expert bytes overflow".to_owned())?;
-                scope = scope
-                    .checked_add(bytes)
-                    .ok_or_else(|| "qualification scope byte count overflows".to_owned())?;
-            }
-            if scope > peak {
-                peak = scope;
-            }
-        }
-        FIXTURES
-            .checked_add(peak)
-            .ok_or_else(|| "qualification peak byte count overflows".to_owned())
+    fn charge_terms(
+        &self,
+        bank: &crate::planning::ExpertBankPlan,
+        slots: u64,
+        places: u64,
+        paths: crate::planning::BankPaths,
+    ) -> Result<(ClaimDemand, u64), String> {
+        let resized = self.resized_load(slots, paths)?;
+        let weight_demand = Self::weight_demand_for(&resized, bank, places)?;
+        let qualification_peak = AttestedPrograms::qualification_peak_bytes(&resized)?;
+        Ok((weight_demand, qualification_peak))
     }
 }
 
@@ -1057,11 +892,8 @@ impl StructuralCharge {
                 ClaimDemand::checked_sum(demands).ok_or_else(|| "weight demand overflows".to_owned())
             })
             .map_err(AssessmentError::Memory)?;
-        let bank_slot_model = if build_fit_models {
-            load.expert_bank()
-                .map(|bank| BankSlotModel::of(load, bank, prepared_weight_demand))
-                .transpose()
-                .map_err(AssessmentError::Memory)?
+        let bank_slot_model = if build_fit_models && load.expert_bank().is_some() {
+            Some(BankSlotModel::of(load))
         } else {
             None
         };
@@ -1185,15 +1017,6 @@ impl StructuralCharge {
         let (weight_demand, startup_additional_bytes) =
             if bank_slots_key(load) == self.prepared_bank_slots {
                 (self.prepared_weight_demand, self.prepared_startup_additional_bytes)
-            } else if let (Some(model), Some(bank)) = (&self.bank_slot_model, load.expert_bank()) {
-                let weight_demand = model
-                    .weight_demand(bank, bank.slots)
-                    .map_err(AssessmentError::Memory)?;
-                let startup_additional_bytes = model
-                    .qualification_peak(bank.slots)
-                    .map_err(AssessmentError::Memory)?
-                    .max(self.staging_upload_bytes);
-                (weight_demand, startup_additional_bytes)
             } else {
                 let weight_demand = load
                     .weight_demands()
@@ -1226,13 +1049,10 @@ impl StructuralCharge {
             .bank_slot_model
             .as_ref()
             .expect("invariant violated: charge_at_slots_places_and_paths requires a banked StructuralCharge");
-        let weight_demand = model
-            .weight_demand_at(bank, slots, places, paths)
+        let (weight_demand, qualification_peak) = model
+            .charge_terms(bank, slots, places, paths)
             .map_err(AssessmentError::Memory)?;
-        let startup_additional_bytes = model
-            .qualification_peak(slots)
-            .map_err(AssessmentError::Memory)?
-            .max(self.staging_upload_bytes);
+        let startup_additional_bytes = qualification_peak.max(self.staging_upload_bytes);
         self.compose_charge(state_bytes, weight_demand, startup_additional_bytes, pricing.cost())
     }
 }

@@ -518,12 +518,15 @@ mod tests {
 
     /// Until a job reads a format's streaming rate and throughput, its
     /// pilot prices them: its bytes at the slower of its pilot's rate and
-    /// the activation dtype's streaming one, its arithmetic at its pilot's
-    /// one-row rate.
+    /// the activation dtype's streaming one, and its arithmetic at its pilot's
+    /// one-row rate scaled by `activation_matrix / one_row_flops(bf16)`
+    /// (capped at `activation_matrix`), or unscaled when `activation_matrix`
+    /// is absent.
     #[test]
     fn a_format_read_only_by_its_pilot_is_priced_from_it() {
         let mut costs = crate::assessment::fixtures::costs();
         costs.first.activation.bytes_per_second.value = 150e9;
+        costs.decode_line = None;
         costs
             .matrices
             .retain(|(format, _)| *format != Element::f32());
@@ -550,8 +553,16 @@ mod tests {
         };
         // A pilot faster than memory streams: memory bounds the rate.
         assert_eq!(priced(400e9, &mut costs).bytes, 3e6 / 150e9);
-        // A pilot slower than memory: its arithmetic bounds it, and its
-        // rate over f32's 4-byte weights is half a FLOP per byte.
+        // With activation_matrix measured (GPU ratio), pilot FLOPs scale by
+        // activation_matrix / one_row_flops(bf16), capped at activation_matrix.
+        let activation_matrix = costs.activation_matrix.as_ref().unwrap().flops.value;
+        let expected_scaled_flops = (50e9 * (activation_matrix / 150e9)).min(activation_matrix);
+        let slow_scaled = priced(100e9, &mut costs);
+        assert_eq!(slow_scaled.bytes, 3e6 / 100e9);
+        assert_eq!(slow_scaled.compute, 4e6 / expected_scaled_flops);
+        // Without activation_matrix (or CPU ratio = 1): its arithmetic bounds
+        // it at its pilot's one-row rate (f32's 4-byte weights = 0.5 FLOP/byte).
+        costs.activation_matrix = None;
         let slow = priced(100e9, &mut costs);
         assert_eq!(slow.bytes, 3e6 / 100e9);
         assert_eq!(slow.compute, 4e6 / 50e9);
