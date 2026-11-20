@@ -974,15 +974,16 @@ pub(super) struct ExpertReads {
 }
 
 impl ExpertReads {
-    /// The resident shape: zero one-expert stacks of each routed tensor's
+    /// The resident shape: zero `experts`-expert stacks of each routed tensor's
     /// element and matrix `[N, K]`, read by index through an empty slot map.
     fn resident(
         charges: &seismic::Charges,
+        experts: u64,
         record: RecordTensors<(Element, [u64; 2])>,
         label: &str,
     ) -> Result<Self, CatalogFailure> {
         let stacks = record.try_map(|_, (element, [n, k])| {
-            semantic_zeros(charges, element, &[1, n, k], "target_routed", label)
+            semantic_zeros(charges, element, &[experts, n, k], "target_routed", label)
         })?;
         Ok(Self {
             map: semantic_zeros(charges, Element::i32(), &[0, magnitude_kernels::constants::MAP_WORDS], "target_routed", label)?,
@@ -1020,7 +1021,8 @@ impl ExpertReads {
         })
     }
 
-    /// A fused routed binding's resident shape.
+    /// A fused routed binding's resident shape: `selected` zero experts, so
+    /// every distinct choice in a row is in bounds.
     pub(super) fn routed(charges: &seismic::Charges, binding: RoutedBinding) -> Result<Self, CatalogFailure> {
         let (h, f) = (binding.hidden, binding.features);
         let record = RecordTensors {
@@ -1028,10 +1030,11 @@ impl ExpertReads {
             up: (binding.expert_up, [f, h]),
             down: (binding.expert_down, [h, f]),
         };
-        Self::resident(charges, record, &format!("{binding:?}"))
+        Self::resident(charges, binding.selected, record, &format!("{binding:?}"))
     }
 
-    /// A general routed binding's resident shape, in the experts' width.
+    /// A general routed binding's resident shape, in the experts' width:
+    /// `selected` zero experts, so every distinct choice in a row is in bounds.
     pub(super) fn general(
         charges: &seismic::Charges,
         binding: crate::GeneralRoutedBinding,
@@ -1042,14 +1045,28 @@ impl ExpertReads {
             up: (binding.expert_up, [f, x]),
             down: (binding.expert_down, [x, f]),
         };
-        Self::resident(charges, record, &format!("{binding:?}"))
+        Self::resident(charges, binding.shape.selected, record, &format!("{binding:?}"))
     }
+}
+
+/// `[rows, selected]` routes where every row names distinct experts `0..selected`,
+/// upholding the routed decode contract (a row chooses an expert at most once).
+fn distinct_routes(
+    charges: &seismic::Charges,
+    rows: u64,
+    selected: u64,
+    entry: &'static str,
+    label: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let k = i32::try_from(selected).map_err(|error| qualification_dynamic(entry, label, error))?;
+    let values = (0..rows).flat_map(|_| 0..k).collect::<Vec<_>>();
+    semantic_i32(charges, &[rows, selected], &values, entry, label)
 }
 
 /// The routed entries at the model's routed geometry (they fix it
 /// statically) with zero weights, so both forms leave the residual unchanged.
-/// The route runs over the full expert range; the projections read expert 0
-/// through all-zero routes where `reads` places it.
+/// The route runs over the full expert range; the projections read distinct
+/// experts `0..selected` per row where `reads` places them.
 pub(super) fn qualify_routed(
     charges: &seismic::Charges,
     binding: RoutedBinding,
@@ -1104,7 +1121,7 @@ pub(super) fn qualify_routed(
                 })
                 .map_err(|error| qualification_dynamic("routed_route", &label, error))
         };
-        let first = zeros(Element::i32(), &[rows, k])?;
+        let chosen = distinct_routes(charges, rows, k, "target_routed", &label)?;
         let (map, step) = (&reads.map, &reads.step);
         let result = if rows <= VERIFY_ROWS {
             let sources = reads.sources(charges, rows, k, &label)?;
@@ -1115,7 +1132,7 @@ pub(super) fn qualify_routed(
                     let expanded = expand
                         .call(charges, routed_expand::Args {
                             normalized: &routed.r0,
-                            routes: &first,
+                            routes: &chosen,
                             expert_gate: &records_gate,
                             expert_up: &reads.records.up,
                             shared_gate: &shared_gate,
@@ -1149,7 +1166,7 @@ pub(super) fn qualify_routed(
                     let product = choices
                         .call(charges, routed_gate_up::Args {
                             normalized: &routed.r0,
-                            routes: &first,
+                            routes: &chosen,
                             sources: &sources,
                             expert_gate: &records_gate,
                             expert_up: &reads.records.up,
@@ -1173,7 +1190,7 @@ pub(super) fn qualify_routed(
                     inject: &inject,
                     expert_product: &expert_product,
                     shared_product: &shared_product,
-                    routes: &first,
+                    routes: &chosen,
                     sources: &sources,
                     scores: &scores,
                     coefficient: &coefficient,
@@ -1203,7 +1220,7 @@ pub(super) fn qualify_routed(
                 .call(charges, routed_group::Args {
                     first: &from_row,
                     rows: &grouped,
-                    routes: &first,
+                    routes: &chosen,
                     counts: &mut counts,
                     order: &mut order,
                     inverse: &mut inverse,
@@ -1333,9 +1350,9 @@ fn qualify_parallel(
 }
 
 /// A general routed sublayer at the model's geometry with zero weights, at
-/// one decode row and one grouped row class: every choice routes to expert
-/// 0, read where `reads` places it, the shared expert and latent
-/// projections are zero, so the residual comes back unchanged.
+/// one decode row and one grouped row class: each row chooses distinct
+/// experts `0..selected`, read where `reads` places them, the shared expert
+/// and latent projections are zero, so the residual comes back unchanged.
 pub(super) fn qualify_general_routed(
     charges: &seismic::Charges,
     binding: crate::GeneralRoutedBinding,
@@ -1484,8 +1501,7 @@ pub(super) fn qualify_general_routed(
             ),
             _ => (normalized, base.clone()),
         };
-        // Every choice routes to expert 0.
-        let first = zeros(Element::i32(), &[rows, k])?;
+        let chosen = distinct_routes(charges, rows, k, entry, &label)?;
         let routed = if rows <= VERIFY_ROWS {
             let sources = reads.sources(charges, rows, k, &label)?;
             let product = match &kernels.experts {
@@ -1494,7 +1510,7 @@ pub(super) fn qualify_general_routed(
                     decode
                         .call(charges, routed_gate_up::Args {
                             normalized: &input,
-                            routes: &first,
+                            routes: &chosen,
                             sources: &sources,
                             expert_gate: &records_gate,
                             expert_up: &reads.records.up,
@@ -1513,7 +1529,7 @@ pub(super) fn qualify_general_routed(
                     decode
                         .call(charges, routed_up::Args {
                             normalized: &input,
-                            routes: &first,
+                            routes: &chosen,
                             sources: &sources,
                             expert_up: &reads.records.up,
                             tier_up: &tier.up,
@@ -1530,7 +1546,7 @@ pub(super) fn qualify_general_routed(
                 .call(charges, routed_down::Args {
                     base: &sum_base,
                     product: &product,
-                    routes: &first,
+                    routes: &chosen,
                     sources: &sources,
                     weights: &weights,
                     expert_down: &reads.records.down,
@@ -1559,7 +1575,7 @@ pub(super) fn qualify_general_routed(
                 .call(charges, routed_group::Args {
                     first: &from_row,
                     rows: &grouped_rows,
-                    routes: &first,
+                    routes: &chosen,
                     counts: &mut counts,
                     order: &mut order,
                     inverse: &mut inverse,
@@ -2190,4 +2206,185 @@ pub(super) fn qualify_progressive(
         .value;
     require_zero_result(&planes, "readout_planes_rows", &label)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Expansion, GeneralRoutedShape};
+    use seismic::{BackendName, Device, Element};
+
+    fn every_row<E: seismic::Entry>(kernel: seismic::NativeKernel<E>) -> RangedKernels<E> {
+        RangedKernels::new(vec![(crate::native::tuning::ranged::EVERY_ROW, kernel)])
+    }
+
+    fn prepare<E: seismic::Entry>(
+        device: &Device,
+        entry: seismic::BoundEntry<E>,
+        values: &[(&str, u64)],
+        params: &[(&str, u64)],
+    ) -> seismic::NativeKernel<E> {
+        let implementation = entry.offered(device).unwrap().unwrap();
+        let statics = implementation.statics.iter().fold(seismic::NativeSpecialization::new(), |statics, name| {
+            let (_, value) = values
+                .iter()
+                .find(|(candidate, _)| *candidate == name.as_str())
+                .unwrap_or_else(|| panic!("{} declares {name}", E::NAME));
+            statics.with_static(name.clone(), *value)
+        });
+        let spec = params
+            .iter()
+            .fold(implementation.default_specialization(&statics).unwrap(), |spec, (name, value)| {
+                spec.with_param(*name, *value)
+            });
+        entry.prepare(device, &spec).unwrap()
+    }
+
+    /// Gathered decode qualification with more selected experts per row than
+    /// `VERIFY_ROWS` (e.g. Nemotron 3.5 Super's K=22 > 8) must pass distinct
+    /// experts per row so `routed::record_choices` never traps on duplicate
+    /// `(expert, record)` entries.
+    #[test]
+    fn gathered_routed_qualification_handles_selected_above_verify_rows() {
+        let devices = seismic::Devices::discover(&[]).unwrap();
+        if !crate::test_support::available(&devices, BackendName::Cuda) {
+            return;
+        }
+        let device = crate::test_support::open_backend(&devices, BackendName::Cuda).unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let (bf16, f32) = (Element::bf16(), Element::f32());
+        const HIDDEN: u64 = 256;
+        const FEATURES: u64 = 128;
+        const SHARED: u64 = 128;
+        const EXPERTS: u64 = 32;
+        const SELECTED: u64 = VERIFY_ROWS + 2;
+        let statics = [
+            ("H", HIDDEN),
+            ("PT", 1),
+            ("NM", HIDDEN),
+            ("E", EXPERTS),
+            ("K", SELECTED),
+            ("F", FEATURES),
+            ("S", SHARED),
+            ("T", TILE_ROWS),
+            ("ES", 0),
+            ("GS", 0),
+            ("US", 0),
+            ("LB", 0),
+            ("SN", 1),
+            ("IN", 0),
+        ];
+
+        // General routed up-only with `routed_up` in GATHERED=1 form.
+        let general_binding = crate::GeneralRoutedBinding {
+            shape: GeneralRoutedShape {
+                hidden: HIDDEN,
+                experts: EXPERTS,
+                selected: SELECTED,
+                intermediate: FEATURES,
+                expert_hidden: HIDDEN,
+                latent: false,
+                experts_expansion: Expansion { gated: false, activation: 2, limit: None },
+                shared: None,
+                score: 1,
+                normalization: 1,
+                normalization_epsilon: 0,
+                scale: 1.0_f32.to_bits(),
+                bias: false,
+                expert_scale: false,
+                router_norm: false,
+            },
+            norm: bf16,
+            router_norm: bf16,
+            router: bf16,
+            expert_gate: None,
+            expert_up: bf16,
+            expert_down: bf16,
+            latent: None,
+            shared: None,
+            activation: bf16,
+            scales: Default::default(),
+        };
+        let general_kernels = GeneralRoutedKernels {
+            select: prepare(&device, routed_select::native_entry_with(routed_select::Elements { NW: bf16, RNW: bf16, RW: bf16, A: bf16 }), &statics, &[]),
+            experts: ExpertKernels::Plain {
+                decode: every_row(prepare(
+                    &device,
+                    routed_up::native_entry_with(routed_up::Elements { EUW: bf16, A: bf16 }),
+                    &statics,
+                    &[("GATHERED", 1)],
+                )),
+                grouped: every_row(prepare(
+                    &device,
+                    routed_experts_up::native_entry_with(routed_experts_up::Elements { A: bf16, EUW: bf16, EDW: bf16 }),
+                    &statics,
+                    &[],
+                )),
+            },
+            down: every_row(prepare(&device, routed_down::native_entry_with(routed_down::Elements { EDW: bf16, A: bf16, R: f32 }), &statics, &[])),
+            group: prepare(&device, routed_group::native_entry(), &statics, &[]),
+            scatter: prepare(&device, routed_scatter::native_entry_with(routed_scatter::Elements { A: bf16, R: f32 }), &statics, &[]),
+            shared: None,
+            latent: None,
+        };
+        let reads = ExpertReads::general(&charges, general_binding).unwrap();
+        qualify_general_routed(&charges, general_binding, &general_kernels, &reads).unwrap();
+
+        // Fused routed with `routed_expand` (defaults to GATHERED=1 on CUDA).
+        let fused_binding = RoutedBinding {
+            hidden: HIDDEN,
+            experts: EXPERTS,
+            selected: SELECTED,
+            features: FEATURES,
+            shared: SHARED,
+            normalize_selected: true,
+            norm: bf16,
+            router: bf16,
+            expert_gate: bf16,
+            expert_up: bf16,
+            expert_down: bf16,
+            shared_gate: bf16,
+            shared_up: bf16,
+            shared_down: bf16,
+            activation: bf16,
+            scales: Default::default(),
+        };
+        let fused_kernels = RoutedKernels {
+            route: prepare(&device, routed_route::native_entry_with(routed_route::Elements { NW: bf16, RW: bf16, SRW: f32, A: bf16 }), &statics, &[]),
+            decode: RoutedDecodeKernels::Expand(every_row(prepare(
+                &device,
+                routed_expand::native_entry_with(routed_expand::Elements {
+                    EGW: bf16,
+                    EUW: bf16,
+                    SGW: bf16,
+                    SUW: bf16,
+                    A: bf16,
+                }),
+                &statics,
+                &[("GATHERED", 1)],
+            ))),
+            output: every_row(prepare(
+                &device,
+                routed_output::native_entry_with(routed_output::Elements { EDW: bf16, SDW: bf16, A: bf16, NW: bf16 }),
+                &statics,
+                &[],
+            )),
+            operand_norm: bf16,
+            group: prepare(&device, routed_group::native_entry(), &statics, &[]),
+            experts: every_row(prepare(
+                &device,
+                routed_experts::native_entry_with(routed_experts::Elements { EGW: bf16, EUW: bf16, EDW: bf16, A: bf16 }),
+                &statics,
+                &[],
+            )),
+            combine: every_row(prepare(
+                &device,
+                routed_combine::native_entry_with(routed_combine::Elements { SGW: bf16, SUW: bf16, SDW: bf16, A: bf16 }),
+                &statics,
+                &[],
+            )),
+        };
+        let reads = ExpertReads::routed(&charges, fused_binding).unwrap();
+        qualify_routed(&charges, fused_binding, &fused_kernels, SublayerRows::SINGLE, &reads).unwrap();
+    }
 }
