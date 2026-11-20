@@ -102,7 +102,7 @@ export const installStandaloneArchive = (options: {
   const staging = path.join(options.root, `.staging-${options.version}`)
   const target = path.join(options.root, options.version)
   yield* fs.remove(staging, { recursive: true }).pipe(Effect.ignore)
-  yield* fs.makeDirectory(staging, { recursive: true, mode: 0o755 }).pipe(Effect.mapError(error => failed(`Could not prepare the update folder: ${error.message}`)))
+  yield* fs.makeDirectory(staging, { recursive: true, mode: 0o700 }).pipe(Effect.mapError(error => failed(`Could not prepare the update folder: ${error.message}`)))
   const unpacked = yield* Command.make(tarExecutable(options.platform, options.environment), "-xzf", options.archive, "-C", staging, "--no-same-owner").pipe(
     Command.exitCode, Effect.timeout("5 minutes"), Effect.mapError(error => failed(`Could not unpack the update: ${String(error)}`)))
   if (unpacked !== 0) return yield* failed("Could not unpack the update.")
