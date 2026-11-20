@@ -38,7 +38,7 @@ use seismic::{
     Device, Element, NativeGraphCompletion, NativeGraphOutputs, NativeGraphPlan,
     NativeGraphSequence, NativePort, NativeQueue, Tensor,
 };
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc, time::Instant};
+use std::{borrow::Cow, cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc, time::Instant};
 
 fn invalid(detail: impl Into<String>) -> SubmitError {
     SubmitError::Invariant(InvariantError {
@@ -223,10 +223,14 @@ impl<'p> StepSubmitter<'p> {
         self.pending_landed.push(read);
     }
 
-    /// After a failure, once the submitted runs completed: the stored-table
-    /// steps and the landed reads (dropped unsubmitted) of runs never
-    /// submitted read nothing.
+    /// After a failure, once the submitted runs completed: retire the
+    /// stored-table reads of already-submitted runs so their failure records
+    /// are not leaked, and abandon the stored-table steps of runs never
+    /// submitted (whose landed reads drop unsubmitted).
     fn abandon_unsubmitted(self) {
+        for read in self.reads {
+            read.table.retire(read.value);
+        }
         for read in self.pending_reads {
             let _ = read.table.abandon(read.value);
         }
@@ -567,23 +571,62 @@ impl<'l> OutputRotation<'l> {
         Self { slots, free }
     }
 
-    /// Activate the slot of the launch at `place` for its entry's `plan`.
-    fn entry(&mut self, place: usize, plan: &NativeGraphPlan) -> Result<(usize, NativeGraphOutputs), SubmitError> {
-        let outputs = self.slots[place].activate(plan).map_err(SubmitError::Invariant)?;
-        Ok((place, outputs))
+    /// Activate the slot of the launch at `place` for its entry's `plan`,
+    /// queue into it via `queue`, and park the active outputs in that slot.
+    fn entry(
+        &mut self,
+        place: usize,
+        plan: &NativeGraphPlan,
+        queue: impl FnOnce(NativeGraphOutputs) -> Result<NativeGraphOutputs, SubmitError>,
+    ) -> Result<usize, SubmitError> {
+        let active = self.slots[place]
+            .activate(plan)
+            .map_err(SubmitError::Invariant)?
+            .run_outputs(queue)?;
+        self.slots[place].hold(active);
+        Ok(place)
     }
 
-    /// Activate the free slot for `plan`.
-    fn activate(&mut self, plan: &NativeGraphPlan) -> Result<(usize, NativeGraphOutputs), SubmitError> {
-        let outputs = self.slots[self.free].activate(plan).map_err(SubmitError::Invariant)?;
-        Ok((self.free, outputs))
+    /// Activate the free slot for `plan`, queue into it via `queue`, and park
+    /// the active outputs in that slot.
+    fn run_free<T>(
+        &mut self,
+        plan: &NativeGraphPlan,
+        queue: impl FnOnce(NativeGraphOutputs) -> Result<(NativeGraphOutputs, T), SubmitError>,
+    ) -> Result<(usize, T), SubmitError> {
+        let at = self.free;
+        let (active, value) = self.slots[at]
+            .activate(plan)
+            .map_err(SubmitError::Invariant)?
+            .run(queue)?;
+        self.slots[at].hold(active);
+        Ok((at, value))
+    }
+
+    fn outputs(&self, at: usize) -> &NativeGraphOutputs {
+        self.slots[at]
+            .active_outputs()
+            .expect("output rotation slot is active")
     }
 
     /// Free slot `at`, whose outputs every reader queued has read.
-    fn recycle(&mut self, (at, outputs): (usize, NativeGraphOutputs)) -> Result<(), SubmitError> {
-        self.slots[at].recycle(outputs).map_err(SubmitError::Invariant)?;
+    fn recycle(&mut self, at: usize) -> Result<(), SubmitError> {
+        self.slots[at]
+            .recycle_active()
+            .map_err(SubmitError::Invariant)?;
         self.free = at;
         Ok(())
+    }
+}
+
+impl Drop for OutputRotation<'_> {
+    fn drop(&mut self) {
+        for slot in &mut self.slots {
+            if slot.is_active() {
+                slot.recycle_active()
+                    .expect("an active target output slot outlived its exported tensor views");
+            }
+        }
     }
 }
 
@@ -630,9 +673,9 @@ struct BlockRun {
 /// `finish_run`).
 struct TargetRun<'l> {
     launch: RunLaunch<'l>,
-    /// The output slot of the chain's rotation the run's latest graph wrote
-    /// (`OutputRotation`), which holds `hidden`.
-    output: (usize, NativeGraphOutputs),
+    /// The output slot index in the chain's rotation (`OutputRotation`) the
+    /// run's latest graph wrote, which holds `hidden`.
+    output: usize,
     /// The block whose front the run queued last and its class, whose back
     /// its merge set queues next (`run_sets`).
     back: Option<(usize, BlockRun)>,
@@ -868,8 +911,8 @@ impl NativeTargetProgram {
         submitter: &mut StepSubmitter,
     ) -> Result<Option<TargetReadoutGraphResult>, SubmitError> {
         let (workspace, output) = &mut run.launch.readout;
-        let mut output = output
-            .take()
+        let output = output
+            .as_mut()
             .ok_or_else(|| invalid("readout output was not reserved before submit"))?;
         let workspace = &mut **workspace;
         let (batch, region, window, hidden, residual) = (
@@ -1014,16 +1057,14 @@ impl NativeTargetProgram {
             };
             bindings.set(&self.unallocating(), &ports.tokens, &window.slice(&tokens)?).map_err(device)?;
         }
-        let ready = active
-            .attach(
-                bindings,
-                output
-                    .activate(&graph.plan)
-                    .map_err(SubmitError::Invariant)?,
-            )
-            .map_err(device)?;
-        let outputs = submitter.queue(ready, |_| {})?;
-        let owner = output.publish(outputs);
+        let active_output = output
+            .activate(&graph.plan)
+            .map_err(SubmitError::Invariant)?;
+        let active_output = active_output.run_outputs(|outputs| {
+            let ready = active.attach(bindings, outputs).map_err(device)?;
+            submitter.queue(ready, |_| {})
+        })?;
+        let owner = active_output.publish();
         let features = owner
             .tensor(&graph.features)
             .ok_or_else(|| invalid("readout features were not exported"))?;
@@ -1659,7 +1700,7 @@ impl NativeTargetProgram {
         // A step reading selected tokens in a model with a stored table
         // copies them for the host first (`EntryNotice`).
         let mut notice = None;
-        let entry_outputs = {
+        let entry_at = {
             let mut active = graph_workspace
                 .slot_mut()
                 .activate(&entry.plan)
@@ -1724,9 +1765,10 @@ impl NativeTargetProgram {
                     .map_err(invalid)?;
                 submitter.lands(read);
             }
-            let (at, outputs) = rotation.entry(region.place, &entry.plan)?;
-            let ready = active.attach(bindings, outputs).map_err(device)?;
-            (at, submitter.queue(ready, |_| {})?)
+            rotation.entry(region.place, &entry.plan, |outputs| {
+                let ready = active.attach(bindings, outputs).map_err(device)?;
+                submitter.queue(ready, |_| {})
+            })?
         };
         // The device embeds while the host prepares the remaining runs.
         let first_commit = Instant::now();
@@ -1744,8 +1786,8 @@ impl NativeTargetProgram {
             self.graphs.prepared.controls(),
             graph_workspace.slot_mut(),
         )?;
-        let hidden = entry_outputs
-            .1
+        let hidden = rotation
+            .outputs(entry_at)
             .exported(&entry.hidden)
             .ok_or_else(|| invalid("target embedding hidden was not exported"))?;
         let conditioning = self.conditioning_sources(state, batch)?;
@@ -1813,7 +1855,7 @@ impl NativeTargetProgram {
                 graph_workspace,
                 readout,
             },
-            output: entry_outputs,
+            output: entry_at,
             back: None,
             unfilled: None,
             residual: None,
@@ -2528,13 +2570,14 @@ impl NativeTargetProgram {
                     bindings.set(&self.unallocating(), port, controls.bound(control)?).map_err(device)?;
                 }
             }
-            let (next, outputs) = rotation.activate(&graph.plan)?;
-            let ready = active.attach(bindings, outputs).map_err(device)?;
             let mut registered = Ok(());
             // A sampled step times each block whose routed layer streams.
             let sampled = bank.is_some_and(|bank| bank.samples(graph));
-            let (outputs, spans) = submitter.queue_as(ready, sampled, |outputs| {
-                registered = bank.map_or(Ok(()), |bank| bank.register_parks(graph, index, outputs));
+            let (next, spans) = rotation.run_free(&graph.plan, |outputs| {
+                let ready = active.attach(bindings, outputs).map_err(device)?;
+                submitter.queue_as(ready, sampled, |outputs| {
+                    registered = bank.map_or(Ok(()), |bank| bank.register_parks(graph, index, outputs));
+                })
             })?;
             registered.map_err(invalid)?;
             if let (Some(bank), Some(spans)) = (bank, spans) {
@@ -2543,13 +2586,20 @@ impl NativeTargetProgram {
             if let Some(bank) = &graph.state.bank {
                 run.recurrent_component += bank.components.len();
             }
-            run.residual = graph.residual.as_ref().map(|edge| outputs.exported(edge).ok_or_else(|| invalid("target residual was not exported"))).transpose()?;
-            run.hidden = graph
+            let outputs = rotation.outputs(next);
+            let residual = graph
+                .residual
+                .as_ref()
+                .map(|edge| outputs.exported(edge).ok_or_else(|| invalid("target residual was not exported")))
+                .transpose()?;
+            let hidden = graph
                 .output
                 .as_ref()
                 .try_map(|output| outputs.exported(output).ok_or_else(|| invalid("target block output was not exported")))?;
+            run.residual = residual;
+            run.hidden = hidden;
             run.carried = carried;
-            rotation.recycle(std::mem::replace(&mut run.output, (next, outputs)))?;
+            rotation.recycle(std::mem::replace(&mut run.output, next))?;
             if let Some(started) = block_started {
                 let kind = graph.state.kind();
                 eprintln!(
@@ -2782,49 +2832,78 @@ impl GraphControls {
                 .zip(histories.get(read))
                 .ok_or_else(|| invalid("the batch lacks a history read its layout places"))
         };
-        let bytes = controls
-            .iter()
-            .map(|(control, extents)| {
-                Ok(match *control {
-                    LaunchControl::Coordinates => i32_bytes(batch.coordinates.as_flattened()),
-                    LaunchControl::Visible { read: at } => read(at)?.1.visible.clone(),
-                    LaunchControl::Padded { read: at } => {
-                        padded_spans(&read(at)?.1.visible, segments, extents[1])
-                    }
-                    LaunchControl::Fresh { read: at } => pairs(&read(at)?.0.fresh),
-                    LaunchControl::Destinations { read: at } => read(at)?.1.destinations.clone(),
-                    // The rows a row's visible spans list in a Block read are
-                    // its complete groups, and its unit list `[0, c)`.
-                    LaunchControl::Complete { read: at } => i32_bytes(&complete(&read(at)?.0.visible)),
-                    LaunchControl::Units { read: at } => i32_bytes(
-                        &complete(&read(at)?.0.visible)
-                            .into_iter()
-                            .flat_map(|complete| [0, complete])
-                            .collect::<Vec<_>>(),
-                    ),
-                    // The picks and the candidate pool the read's own layer
-                    // stores before any reader.
-                    LaunchControl::Picks { .. } | LaunchControl::Pool { .. } => {
-                        i32_bytes(&vec![-1; extents.iter().product::<u64>() as usize])
-                    }
-                    LaunchControl::Segments => pairs(&batch.segments[..=slots]),
-                    LaunchControl::Stop => i32_bytes(&batch.stop[..slots]),
-                    LaunchControl::PreviousBank => i32_bytes(&batch.bank[..slots]),
-                    LaunchControl::PreviousTape => {
-                        i32_bytes(&batch.previous_tape[..slots])
-                    }
-                    LaunchControl::FollowingBank => {
-                        i32_bytes(&batch.following_bank[..slots])
-                    }
+        let uploaded = {
+            let mut completed: Vec<Option<Vec<i32>>> = vec![None; batch.histories.len()];
+            let bytes = controls
+                .iter()
+                .map(|(control, extents)| {
+                    let mut complete_at = |at: usize| -> Result<usize, SubmitError> {
+                        let history = batch.histories.get(at).ok_or_else(|| {
+                            invalid("the batch lacks a history read its layout places")
+                        })?;
+                        if completed[at].is_none() {
+                            completed[at] = Some(complete(&history.visible));
+                        }
+                        Ok(at)
+                    };
+                    Ok(match *control {
+                        LaunchControl::Coordinates => {
+                            Cow::Owned(i32_bytes(batch.coordinates.as_flattened()))
+                        }
+                        LaunchControl::Visible { read: at } => {
+                            Cow::Borrowed(read(at)?.1.visible.as_slice())
+                        }
+                        LaunchControl::Padded { read: at } => {
+                            Cow::Owned(padded_spans(&read(at)?.1.visible, segments, extents[1]))
+                        }
+                        LaunchControl::Fresh { read: at } => {
+                            Cow::Owned(pairs(&read(at)?.0.fresh))
+                        }
+                        LaunchControl::Destinations { read: at } => {
+                            Cow::Borrowed(read(at)?.1.destinations.as_slice())
+                        }
+                        // The rows a row's visible spans list in a Block read are
+                        // its complete groups, and its unit list `[0, c)`.
+                        LaunchControl::Complete { read: at } => {
+                            let at = complete_at(at)?;
+                            Cow::Owned(i32_bytes(completed[at].as_deref().unwrap()))
+                        }
+                        LaunchControl::Units { read: at } => {
+                            let at = complete_at(at)?;
+                            Cow::Owned(
+                                completed[at]
+                                    .as_deref()
+                                    .unwrap()
+                                    .iter()
+                                    .flat_map(|&complete| [0i32, complete])
+                                    .flat_map(i32::to_le_bytes)
+                                    .collect(),
+                            )
+                        }
+                        // The picks and the candidate pool the read's own layer
+                        // stores before any reader (-1i32 == 0xFFFF_FFFF in LE).
+                        LaunchControl::Picks { .. } | LaunchControl::Pool { .. } => {
+                            Cow::Owned(vec![0xFFu8; extents.iter().product::<u64>() as usize * 4])
+                        }
+                        LaunchControl::Segments => Cow::Owned(pairs(&batch.segments[..=slots])),
+                        LaunchControl::Stop => Cow::Owned(i32_bytes(&batch.stop[..slots])),
+                        LaunchControl::PreviousBank => Cow::Owned(i32_bytes(&batch.bank[..slots])),
+                        LaunchControl::PreviousTape => {
+                            Cow::Owned(i32_bytes(&batch.previous_tape[..slots]))
+                        }
+                        LaunchControl::FollowingBank => {
+                            Cow::Owned(i32_bytes(&batch.following_bank[..slots]))
+                        }
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, SubmitError>>()?;
-        let tensors = controls
-            .iter()
-            .zip(&bytes)
-            .map(|((_, extents), bytes)| (Element::i32(), extents.as_slice(), bytes.as_slice()))
-            .collect::<Vec<_>>();
-        let uploaded = slot.upload(&tensors).map_err(device)?;
+                .collect::<Result<Vec<_>, SubmitError>>()?;
+            let tensors = controls
+                .iter()
+                .zip(&bytes)
+                .map(|((_, extents), bytes)| (Element::i32(), extents.as_slice(), bytes.as_ref()))
+                .collect::<Vec<_>>();
+            slot.upload(&tensors).map_err(device)?
+        };
         let launch = controls
             .into_iter()
             .map(|(control, _)| control)

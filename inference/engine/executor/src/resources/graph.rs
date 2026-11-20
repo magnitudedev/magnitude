@@ -237,7 +237,7 @@ impl NativeGraphPool {
         let Claimed { slot, claims } = slot;
         Ok(NativeGraphOutputLease {
             domain: self.domain.clone(),
-            slot: Some(slot),
+            slot: LeaseSlot::Free(slot),
             claims,
             free: self.output.clone(),
         })
@@ -402,7 +402,7 @@ impl VisionGraphPool {
         let Claimed { slot, claims } = slot;
         Ok(NativeGraphOutputLease {
             domain: self.domain.clone(),
-            slot: Some(slot),
+            slot: LeaseSlot::Free(slot),
             claims,
             free: class.output.clone(),
         })
@@ -531,52 +531,63 @@ impl Drop for NativeGraphWorkspaceLease {
     }
 }
 
+enum LeaseSlot {
+    Free(NativeGraphFamilyOutputSlot),
+    Active(NativeGraphOutputs),
+    Empty,
+}
+
 /// An output reservation owns one family arena. Activation transfers it into
-/// a one-shot Seismic output value; successful work returns that value after
-/// every exported tensor view has been released.
+/// an RAII [`ActiveGraphOutput`] guard that recycles the arena back to its
+/// pool on drop unless explicitly held back in a lease or published into a
+/// [`GraphOutputOwner`].
 pub struct NativeGraphOutputLease {
     domain: ResourceDomainId,
-    slot: Option<NativeGraphFamilyOutputSlot>,
-    /// The slot's claims, kept while it is activated.
+    slot: LeaseSlot,
+    /// The slot's claims, kept while it is free or held active.
     claims: Vec<crate::memory::ledger::Claim>,
     free: FreeSlots<NativeGraphFamilyOutputSlot>,
 }
 
-impl NativeGraphOutputLease {
-    pub fn domain(&self) -> &ResourceDomainId {
-        &self.domain
+/// RAII guard for an activated [`NativeGraphOutputs`] slot. Dropping it
+/// without publishing or parking it back in a lease recycles the output arena
+/// directly back into its admitted pool.
+pub struct ActiveGraphOutput {
+    outputs: Option<NativeGraphOutputs>,
+    claims: Vec<crate::memory::ledger::Claim>,
+    free: FreeSlots<NativeGraphFamilyOutputSlot>,
+}
+
+impl ActiveGraphOutput {
+    /// Pass the active outputs through a fallible execution step that returns
+    /// them alongside a secondary value (such as a completion or timing spans).
+    pub fn run<T, E>(
+        mut self,
+        f: impl FnOnce(NativeGraphOutputs) -> Result<(NativeGraphOutputs, T), E>,
+    ) -> Result<(Self, T), E> {
+        let outputs = self.outputs.take().expect("active graph output is live");
+        let (outputs, value) = f(outputs)?;
+        self.outputs = Some(outputs);
+        Ok((self, value))
     }
 
-    pub fn activate(
-        &mut self,
-        plan: &NativeGraphPlan,
-    ) -> Result<NativeGraphOutputs, InvariantError> {
-        let slot = self.slot.take().expect("graph output lease is live");
-        slot.activate(plan).map_err(|error| InvariantError {
-            context: "target graph output",
-            detail: error.to_string(),
-        })
-    }
-
-    pub fn recycle(&mut self, outputs: NativeGraphOutputs) -> Result<(), InvariantError> {
-        if self.slot.is_some() {
-            return Err(InvariantError {
-                context: "target graph output",
-                detail: "output arena was already recycled".into(),
-            });
-        }
-        self.slot = Some(outputs.recycle().map_err(|error| InvariantError {
-            context: "target graph output",
-            detail: error.to_string(),
-        })?);
-        Ok(())
+    /// Pass the active outputs through a fallible execution step that returns
+    /// them directly.
+    pub fn run_outputs<E>(
+        mut self,
+        f: impl FnOnce(NativeGraphOutputs) -> Result<NativeGraphOutputs, E>,
+    ) -> Result<Self, E> {
+        let outputs = self.outputs.take().expect("active graph output is live");
+        let outputs = f(outputs)?;
+        self.outputs = Some(outputs);
+        Ok(self)
     }
 
     /// Publish a completed graph's outputs. Every exported tensor returned
     /// through this owner retains the physical output arena. Final drop
     /// recycles it into the same admitted pool.
-    pub fn publish(mut self, outputs: NativeGraphOutputs) -> GraphOutputOwner {
-        assert!(self.slot.is_none(), "graph output was not activated");
+    pub fn publish(mut self) -> GraphOutputOwner {
+        let outputs = self.outputs.take().expect("active graph output is live");
         GraphOutputOwner {
             claim: Rc::new(GraphOutputClaim {
                 outputs: Some(outputs),
@@ -587,11 +598,100 @@ impl NativeGraphOutputLease {
     }
 }
 
+impl Drop for ActiveGraphOutput {
+    fn drop(&mut self) {
+        let Some(outputs) = self.outputs.take() else {
+            return;
+        };
+        let slot = outputs
+            .recycle()
+            .expect("an active graph output was dropped while exported tensor views were still live");
+        self.free.borrow_mut().push(Claimed {
+            slot,
+            claims: std::mem::take(&mut self.claims),
+        });
+    }
+}
+
+impl NativeGraphOutputLease {
+    pub fn domain(&self) -> &ResourceDomainId {
+        &self.domain
+    }
+
+    pub fn activate(
+        &mut self,
+        plan: &NativeGraphPlan,
+    ) -> Result<ActiveGraphOutput, InvariantError> {
+        let LeaseSlot::Free(slot) = std::mem::replace(&mut self.slot, LeaseSlot::Empty) else {
+            panic!("graph output lease is live");
+        };
+        let claims = std::mem::take(&mut self.claims);
+        let outputs = slot.activate(plan).map_err(|error| InvariantError {
+            context: "target graph output",
+            detail: error.to_string(),
+        })?;
+        Ok(ActiveGraphOutput {
+            outputs: Some(outputs),
+            claims,
+            free: self.free.clone(),
+        })
+    }
+
+    /// Park an activated output back into this empty lease so the lease owns
+    /// its recycling until [`Self::recycle_active`] or drop.
+    pub fn hold(&mut self, mut active: ActiveGraphOutput) {
+        assert!(
+            matches!(self.slot, LeaseSlot::Empty),
+            "graph output lease already holds a slot"
+        );
+        debug_assert!(
+            Rc::ptr_eq(&self.free, &active.free),
+            "active graph output belongs to a different pool"
+        );
+        let outputs = active.outputs.take().expect("active graph output is live");
+        self.slot = LeaseSlot::Active(outputs);
+        self.claims = std::mem::take(&mut active.claims);
+    }
+
+    pub fn active_outputs(&self) -> Option<&NativeGraphOutputs> {
+        match &self.slot {
+            LeaseSlot::Active(outputs) => Some(outputs),
+            LeaseSlot::Free(_) | LeaseSlot::Empty => None,
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self.slot, LeaseSlot::Active(_))
+    }
+
+    pub fn recycle_active(&mut self) -> Result<(), InvariantError> {
+        let LeaseSlot::Active(outputs) = std::mem::replace(&mut self.slot, LeaseSlot::Empty) else {
+            return Err(InvariantError {
+                context: "target graph output",
+                detail: "output arena is not active".into(),
+            });
+        };
+        self.slot = LeaseSlot::Free(outputs.recycle().map_err(|error| InvariantError {
+            context: "target graph output",
+            detail: error.to_string(),
+        })?);
+        Ok(())
+    }
+}
+
 impl Drop for NativeGraphOutputLease {
     fn drop(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            self.free.borrow_mut().push(Claimed { slot, claims: std::mem::take(&mut self.claims) });
-        }
+        let slot = match std::mem::replace(&mut self.slot, LeaseSlot::Empty) {
+            LeaseSlot::Free(slot) => slot,
+            LeaseSlot::Active(outputs) => outputs
+                .recycle()
+                .expect("an active graph output lease was dropped while exported tensor views were still live"),
+            LeaseSlot::Empty => return,
+        };
+        self.free.borrow_mut().push(Claimed {
+            slot,
+            claims: std::mem::take(&mut self.claims),
+        });
     }
 }
 
@@ -649,6 +749,18 @@ impl GraphOutputTensor {
         &self.tensor
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_tensor(tensor: Tensor) -> Self {
+        Self {
+            tensor,
+            claim: Rc::new(GraphOutputClaim {
+                outputs: None,
+                claims: Vec::new(),
+                free: Rc::new(RefCell::new(Vec::new())),
+            }),
+        }
+    }
+
     pub fn slice_leading(&self, start: u64, end: u64) -> Result<Self, seismic::TensorError> {
         Ok(Self {
             tensor: self.tensor.slice_leading(start, end)?,
@@ -689,5 +801,80 @@ mod tests {
         assert_eq!(ledgers.device().estimate().committed(), 1 << 20, "the freed slot's claim is held until its release");
         assert_eq!(slot.release(|()| 0), 0);
         assert_eq!(ledgers.device().estimate().committed(), 0, "the released slot's claim is gone");
+    }
+
+    /// Dropping an `ActiveGraphOutput` without publishing or parking it back
+    /// into a lease recycles the physical output slot directly to its pool.
+    #[test]
+    fn dropping_active_graph_output_returns_slot_to_pool() {
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        let device = crate::test_support::open_backend(&catalog, seismic::BackendName::Cpu)
+            .expect("the CPU backend opens");
+        let implementation = magnitude_kernels::selection_notice::native_implementation(&device)
+            .expect("selection_notice implementation")
+            .expect("CPU supports selection_notice");
+        let copy = magnitude_kernels::selection_notice::native_for_device(
+            &device,
+            &implementation
+                .default_specialization(&seismic::NativeSpecialization::new())
+                .expect("default specialization"),
+        )
+        .expect("selection_notice compiles");
+        let mut graph = device.native_graph();
+        let src = graph.port(seismic::Element::i32(), &[2, 2]).expect("src port");
+        let mut dst = graph
+            .local_for(&copy, "notice", &[("M", 2)])
+            .expect("dst local");
+        graph
+            .enqueue(
+                &copy,
+                magnitude_kernels::selection_notice::WorkflowArgs {
+                    selection: src.tensor().into(),
+                    notice: dst.tensor_mut().into(),
+                },
+            )
+            .expect("enqueue");
+        graph.export(dst.tensor()).expect("export");
+        let plan = graph.seal().expect("seal");
+        let family = seismic::NativeGraphFamily::new(&[plan.clone()], 0).expect("family");
+        let charges = seismic::Charges::tally(&device);
+        let arena = seismic::NativeExecutionArena::new(&charges, family.workspace_bytes().max(1))
+            .expect("arena");
+        let charge = crate::NativeGraphCharge {
+            activations: 1,
+            output_slots: 1,
+            workspace_bytes: family.workspace_bytes(),
+            sync_bytes: family.sync_bytes(),
+            output_bytes: family.output_bytes(),
+            upload_regions: crate::planning::serial_upload_regions(family.upload_bytes()),
+            committed_bytes: 0,
+            graphs: family.graphs(),
+        };
+        let pool = super::NativeGraphPool::new(
+            crate::ResourceDomainId::new("test").expect("domain"),
+            &family,
+            &charge,
+            &arena,
+            &charges,
+            super::Outputs::Host,
+        )
+        .expect("pool");
+        assert_eq!(pool.available_output(), 1);
+        let mut lease = pool.acquire_output().expect("acquire output");
+        assert_eq!(pool.available_output(), 0);
+        let active = lease.activate(&plan).expect("activate");
+        assert_eq!(pool.available_output(), 0);
+        drop(active);
+        assert_eq!(
+            pool.available_output(),
+            1,
+            "dropping ActiveGraphOutput recycles the slot to the pool"
+        );
+        drop(lease);
+        assert_eq!(
+            pool.available_output(),
+            1,
+            "dropping the emptied lease does not double-return"
+        );
     }
 }

@@ -3922,7 +3922,7 @@ impl NativeDraftProgram {
         &self,
         core: &HeadLaunchCore,
         workspace: &mut NativeGraphWorkspaceLease,
-        output: NativeGraphOutputLease,
+        output: &mut NativeGraphOutputLease,
     ) -> Result<(seismic::NativeGraphCompletion, HeadOutput), SubmitError> {
         let decoder = &self.definition.decoder;
         let draft = self
@@ -4169,15 +4169,13 @@ impl NativeDraftProgram {
             .map(|ports| ports.queue(&self.graphs.embedding, &self.unallocating, &mut bindings))
             .transpose()
             .map_err(invalid)?;
-        let mut output = output;
-        let outputs = output
+        let active_output = output
             .activate(&graph.plan)
             .map_err(SubmitError::Invariant)?;
-        let (outputs, completion) = active
-            .attach(bindings, outputs)
-            .and_then(|ready| ready.submit())
+        let (active_output, completion) = active_output
+            .run(|outputs| active.attach(bindings, outputs).and_then(|ready| ready.submit()))
             .map_err(device)?;
-        let owner = output.publish(outputs);
+        let owner = active_output.publish();
         let selections = (steps > 0)
             .then(|| {
                 let block = graph
@@ -4241,7 +4239,7 @@ impl HeadProgram for NativeDraftProgram {
     ) -> Result<Self::Submission, (SubmitError, ValidatedHeadLaunch)> {
         let queued = {
             let (core, workspace, output) = launch.execution_parts_mut();
-            match output.take() {
+            match output.as_mut() {
                 Some(output) => self.queue(core, workspace, output),
                 None => Err(invalid("draft graph output lease is absent")),
             }
