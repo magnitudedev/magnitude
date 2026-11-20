@@ -488,26 +488,32 @@ impl Package {
 const DISTINCT_PROJECTOR: &str = "target and projector must be distinct package components";
 const DISTINCT_DRAFT: &str = "the draft must be a distinct package component";
 
+/// Cross-platform underlying-file identity used for every duplicate-component
+/// check in this module: `(dev, ino)` on Unix, canonicalized and normalized
+/// path on non-Unix, with an absolute-path fallback when metadata or
+/// canonicalization is unavailable (e.g. virtual [`HeaderSource`] paths).
 #[derive(PartialEq, Eq)]
 enum FileIdentity {
     #[cfg(unix)]
     Inode(u64, u64),
-    #[cfg(not(unix))]
-    Canonical(PathBuf),
+    Path(PathBuf),
 }
 
 impl FileIdentity {
-    fn of(path: &Path) -> Result<Self, Error> {
+    fn of(path: &Path) -> Self {
         #[cfg(unix)]
-        {
+        if let Ok(metadata) = std::fs::metadata(path) {
             use std::os::unix::fs::MetadataExt;
-            let metadata = std::fs::metadata(path)?;
-            Ok(Self::Inode(metadata.dev(), metadata.ino()))
+            return Self::Inode(metadata.dev(), metadata.ino());
         }
         #[cfg(not(unix))]
-        {
-            Ok(Self::Canonical(path.canonicalize()?))
-        }
+        let resolved = path
+            .canonicalize()
+            .or_else(|_| std::path::absolute(path))
+            .unwrap_or_else(|_| path.to_path_buf());
+        #[cfg(unix)]
+        let resolved = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        Self::Path(normalize_identity_path(resolved))
     }
 }
 
@@ -515,7 +521,20 @@ pub(crate) fn same_disk_file(left: &Path, right: &Path) -> Result<bool, Error> {
     if left == right {
         return Ok(true);
     }
-    Ok(FileIdentity::of(left)? == FileIdentity::of(right)?)
+    Ok(FileIdentity::of(left) == FileIdentity::of(right))
+}
+
+fn normalize_identity_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(raw) = path.to_str() {
+        let stripped = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else {
+            raw.strip_prefix(r"\\?\").unwrap_or(raw).to_owned()
+        };
+        return PathBuf::from(stripped.replace('/', r"\").to_lowercase());
+    }
+    path
 }
 
 /// Verify that no file in `left` refers to the same underlying file as any
@@ -573,7 +592,7 @@ pub fn model_store(target: &Path) -> Result<PathBuf, Error> {
 
 fn discover_projector(target: &Path) -> Result<Option<PathBuf>, Error> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let canonical_target = target.canonicalize()?;
+    let target_id = FileIdentity::of(target);
     let mut projectors = Vec::new();
     for entry in std::fs::read_dir(parent)? {
         let path = entry?.path();
@@ -583,9 +602,7 @@ fn discover_projector(target: &Path) -> Result<Option<PathBuf>, Error> {
         if path.is_file()
             && name.starts_with("mmproj-")
             && name.ends_with(".gguf")
-            && path
-                .canonicalize()
-                .is_ok_and(|path| path != canonical_target)
+            && FileIdentity::of(&path) != target_id
         {
             projectors.push(path);
         }
@@ -760,5 +777,56 @@ mod tests {
         let expected = blobs.canonicalize().unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(stored.unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn require_distinct_files_rejects_symlinks_hardlinks_and_virtual_duplicates() {
+        let root = temporary_directory("distinct-files");
+        let target = root.join("model.gguf");
+        let other = root.join("projector.gguf");
+        let symlink = root.join("mmproj-link.gguf");
+        let hardlink = root.join("mmproj-hard.gguf");
+        std::fs::write(&target, b"GGUF").unwrap();
+        std::fs::write(&other, b"GGUF").unwrap();
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        std::fs::hard_link(&target, &hardlink).unwrap();
+
+        assert!(super::require_distinct_files(
+            [target.as_path()],
+            [other.as_path()],
+            &super::FileHeaders,
+            super::DISTINCT_PROJECTOR,
+        )
+        .is_ok());
+        assert!(super::require_distinct_files(
+            [target.as_path()],
+            [symlink.as_path()],
+            &super::FileHeaders,
+            super::DISTINCT_PROJECTOR,
+        )
+        .is_err());
+        assert!(super::require_distinct_files(
+            [target.as_path()],
+            [hardlink.as_path()],
+            &super::FileHeaders,
+            super::DISTINCT_PROJECTOR,
+        )
+        .is_err());
+        // Sibling discovery also skips hardlinks/symlinks pointing to target.
+        assert_eq!(super::discover_projector(&target).unwrap(), None);
+
+        // Fallback path identity still rejects duplicate virtual/missing paths.
+        let missing = root.join("missing.gguf");
+        let missing_dot = root.join(".").join("missing.gguf");
+        assert!(super::require_distinct_files(
+            [missing.as_path()],
+            [missing_dot.as_path()],
+            &super::FileHeaders,
+            super::DISTINCT_DRAFT,
+        )
+        .is_err());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

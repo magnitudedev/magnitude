@@ -1192,6 +1192,11 @@ const SPLIT_INDEX: &str = "split.no";
 const SPLIT_COUNT: &str = "split.count";
 const SPLIT_TENSORS: &str = "split.tensors.count";
 
+/// Maximum shards admitted in a single split GGUF. Prevents a crafted
+/// `split.count` from triggering an unbounded `Vec<PathBuf>` allocation in
+/// [`split_paths`].
+const MAX_SPLIT_SHARDS: u64 = 4096;
+
 /// This file's `(index, count)` within a split GGUF, or `None` when it is
 /// not split (no split metadata, or a count of one).
 fn split_position(directory: &Directory) -> Result<Option<(u64, u64)>, SplitError> {
@@ -1207,7 +1212,14 @@ fn split_position(directory: &Directory) -> Result<Option<(u64, u64)>, SplitErro
     };
     match (number(SPLIT_INDEX)?, number(SPLIT_COUNT)?) {
         (None, None) | (Some(0), Some(1)) => Ok(None),
-        (Some(index), Some(count)) if index < count => Ok(Some((index, count))),
+        (Some(index), Some(count)) if index < count => {
+            if count > MAX_SPLIT_SHARDS {
+                return Err(SplitError::InconsistentMetadata(format!(
+                    "{SPLIT_COUNT} ({count}) exceeds maximum supported shards ({MAX_SPLIT_SHARDS})"
+                )));
+            }
+            Ok(Some((index, count)))
+        }
         _ => Err(SplitError::InconsistentMetadata(
             "inconsistent GGUF split metadata".into(),
         )),
@@ -1879,5 +1891,42 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn split_position_and_resolve_shard_paths_reject_excessive_split_count() {
+        let directory_with_split = |index: u64, count: u64| Directory {
+            version: 3,
+            byte_order: ByteOrder::Little,
+            alignment: 32,
+            data_offset: 0,
+            metadata: vec![
+                Metadata {
+                    name: SPLIT_INDEX.into(),
+                    value: Value::Scalar(Scalar::Unsigned(index)),
+                },
+                Metadata {
+                    name: SPLIT_COUNT.into(),
+                    value: Value::Scalar(Scalar::Unsigned(count)),
+                },
+            ],
+            tensors: Vec::new(),
+        };
+
+        let at_limit = directory_with_split(0, MAX_SPLIT_SHARDS);
+        assert_eq!(split_position(&at_limit), Ok(Some((0, MAX_SPLIT_SHARDS))));
+
+        for excessive in [MAX_SPLIT_SHARDS + 1, 10_000_000_000] {
+            let crafted = directory_with_split(0, excessive);
+            assert!(matches!(
+                split_position(&crafted),
+                Err(SplitError::InconsistentMetadata(_))
+            ));
+            let path = PathBuf::from(format!("model-00001-of-{excessive:05}.gguf"));
+            assert!(matches!(
+                resolve_shard_paths(&[path], &crafted),
+                Err(SplitError::InconsistentMetadata(_))
+            ));
+        }
     }
 }
