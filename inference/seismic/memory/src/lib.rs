@@ -15,10 +15,12 @@ pub use pool::SlabFill;
 pub const BUFFER_ALIGNMENT: u64 = 256;
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 thread_local! {
     /// Nesting depth of no-blocking-allocation scopes on this thread.
@@ -117,18 +119,9 @@ pub enum PageSize {
 pub struct HostBlock {
     base: NonNull<u8>,
     bytes: usize,
-    /// Where the block is whole large pages: how many of them the kernel
-    /// backed large, the rest small ([`large_page_backing`]).
-    large: Option<LargeBacking>,
-}
-
-/// A large-page block's backing, counted into the process's
-/// [`LargePageBacking`] while it lives.
-#[derive(Clone, Copy)]
-struct LargeBacking {
-    page: usize,
-    large: usize,
-    small: usize,
+    /// Where the block is whole large pages: the large page size it is tracked
+    /// under in [`live_large_blocks`] ([`large_page_backing`]).
+    large_page: Option<usize>,
 }
 
 // The block is plain memory owned by this struct; its bytes are accessed
@@ -177,15 +170,45 @@ pub struct LargePageBacking {
     pub small_bytes: u64,
 }
 
-static LARGE_BYTES: AtomicU64 = AtomicU64::new(0);
-static SMALL_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Live `PageSize::Large` whole-large-page blocks: `base -> (bytes, large_page)`.
+/// Maintained in O(1) on [`HostBlock::allocate`] and [`HostBlock::drop`] so
+/// allocation never walks `/proc/self/smaps`; [`large_page_backing`] measures
+/// all live blocks in one single `/proc/self/smaps` pass on demand.
+fn live_large_blocks() -> &'static Mutex<HashMap<usize, (usize, usize)>> {
+    static LIVE: OnceLock<Mutex<HashMap<usize, (usize, usize)>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
-/// The process's [`LargePageBacking`] now.
+/// The process's [`LargePageBacking`] now, measured lazily in a single
+/// `/proc/self/smaps` pass across all live large-page blocks.
 pub fn large_page_backing() -> LargePageBacking {
-    LargePageBacking {
-        large_bytes: LARGE_BYTES.load(Ordering::Relaxed),
-        small_bytes: SMALL_BYTES.load(Ordering::Relaxed),
+    let mut ranges: Vec<(usize, usize, usize)> = {
+        let live = live_large_blocks().lock().unwrap_or_else(PoisonError::into_inner);
+        live.iter().map(|(&base, &(bytes, large))| (base, bytes, large)).collect()
+    };
+    if ranges.is_empty() {
+        return LargePageBacking::default();
     }
+    ranges.sort_unstable_by_key(|&(base, _, _)| base);
+    host::measure_large_page_backing(&ranges)
+}
+
+/// Latched `true` on Linux once a `MADV_HUGEPAGE` block under a blocking
+/// `/sys/kernel/mm/transparent_hugepage/defrag` policy hits synchronous kernel
+/// compaction during `fault_in`, so subsequent blocks skip `MADV_HUGEPAGE` and
+/// fault at full RAM speed.
+#[cfg(target_os = "linux")]
+static COMPACTION_STALLED: AtomicBool = AtomicBool::new(false);
+
+/// Below this `fault_in` throughput (500 MB/s), `MADV_HUGEPAGE` under a
+/// blocking `thp/defrag` policy has hit synchronous kernel compaction.
+#[cfg(target_os = "linux")]
+const MIN_THP_FAULT_BYTES_PER_SEC: u128 = 500_000_000;
+
+#[cfg(target_os = "linux")]
+fn fault_stalled(bytes: usize, elapsed: std::time::Duration) -> bool {
+    (bytes as u128).saturating_mul(1_000_000_000)
+        < MIN_THP_FAULT_BYTES_PER_SEC.saturating_mul(elapsed.as_nanos())
 }
 
 /// Whether a host read's `error` is its source missing (`ENOENT`,
@@ -227,21 +250,37 @@ impl HostBlock {
         let large_page = large_page()?.filter(|&large| pages == PageSize::Large && bytes % large == 0);
         let base = host::map(bytes, large_page.unwrap_or(page))?;
         // Unmapped by its drop from here, whatever fails.
-        let mut block = Self { base, bytes, large: None };
+        let mut block = Self { base, bytes, large_page: None };
         #[cfg(target_os = "linux")]
-        if large_page.is_some() {
-            // Faulted in large pages opportunistically when free, falling back
-            // to host pages immediately when fragmented instead of stalling in
-            // synchronous kernel compaction.
-            unsafe { host::prefer_large(base.as_ptr(), bytes)? };
-        }
+        let advised_blocking = if large_page.is_some() {
+            let blocking = host::thp_defrag().blocks_on_madvise();
+            if !blocking || !COMPACTION_STALLED.load(Ordering::Relaxed) {
+                // Faulted in large pages opportunistically when free; under a
+                // blocking `thp/defrag` policy, once synchronous kernel
+                // compaction stalls a block's `fault_in`, subsequent blocks
+                // skip `MADV_HUGEPAGE` to fault at full RAM speed.
+                unsafe { host::prefer_large(base.as_ptr(), bytes)? };
+                blocking
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        #[cfg(target_os = "linux")]
+        let fault_start = advised_blocking.then(std::time::Instant::now);
         fault_in(base, bytes, page);
+        #[cfg(target_os = "linux")]
+        if let Some(start) = fault_start {
+            if fault_stalled(bytes, start.elapsed()) {
+                COMPACTION_STALLED.store(true, Ordering::Relaxed);
+            }
+        }
         if let Some(large_page) = large_page {
-            let large = host::count_large_pages(base.as_ptr(), bytes, large_page);
-            let backing = LargeBacking { page: large_page, large, small: bytes / large_page - large };
-            LARGE_BYTES.fetch_add((backing.large * backing.page) as u64, Ordering::Relaxed);
-            SMALL_BYTES.fetch_add((backing.small * backing.page) as u64, Ordering::Relaxed);
-            block.large = Some(backing);
+            let mut live = live_large_blocks().lock().unwrap_or_else(PoisonError::into_inner);
+            let prev = live.insert(base.as_ptr() as usize, (bytes, large_page));
+            debug_assert!(prev.is_none(), "live HostBlock address already registered");
+            block.large_page = Some(large_page);
         }
         Ok(block)
     }
@@ -259,15 +298,20 @@ impl HostBlock {
     /// whole large pages asked for as such (none otherwise).
     #[cfg(all(test, target_os = "linux"))]
     fn large_pages(&self) -> Option<usize> {
-        self.large.map(|backing| backing.large)
+        let large = self.large_page?;
+        let backing = host::measure_large_page_backing(&[(self.base.as_ptr() as usize, self.bytes, large)]);
+        Some((backing.large_bytes / large as u64) as usize)
     }
 }
 
 impl Drop for HostBlock {
     fn drop(&mut self) {
-        if let Some(backing) = self.large {
-            LARGE_BYTES.fetch_sub((backing.large * backing.page) as u64, Ordering::Relaxed);
-            SMALL_BYTES.fetch_sub((backing.small * backing.page) as u64, Ordering::Relaxed);
+        if self.large_page.is_some() {
+            // Remove before unmapping so the OS cannot hand the same virtual
+            // address to another `HostBlock::allocate` while we still hold the
+            // entry.
+            let mut live = live_large_blocks().lock().unwrap_or_else(PoisonError::into_inner);
+            live.remove(&(self.base.as_ptr() as usize));
         }
         unsafe { host::unmap(self.base, self.bytes) };
     }
@@ -415,6 +459,57 @@ mod host {
     #[cfg(target_os = "linux")]
     const THP_SIZE: &str = "/sys/kernel/mm/transparent_hugepage/hpage_pmd_size";
 
+    /// The kernel's transparent huge page defragmentation policy.
+    #[cfg(target_os = "linux")]
+    const THP_DEFRAG: &str = "/sys/kernel/mm/transparent_hugepage/defrag";
+
+    /// Active token parsed from `/sys/kernel/mm/transparent_hugepage/defrag`.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum ThpDefrag {
+        Never,
+        Defer,
+        Madvise,
+        DeferMadvise,
+        Always,
+        Unknown,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ThpDefrag {
+        /// Whether `madvise(MADV_HUGEPAGE)` may trigger synchronous direct
+        /// reclaim / compaction on page fault under this policy.
+        pub(super) fn blocks_on_madvise(self) -> bool {
+            !matches!(self, Self::Never | Self::Defer)
+        }
+    }
+
+    /// Parse the active `[token]` from `/sys/kernel/mm/transparent_hugepage/defrag`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn parse_thp_defrag(content: &str) -> ThpDefrag {
+        let active = content
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix('[').and_then(|s| s.strip_suffix(']')));
+        match active {
+            Some("never") => ThpDefrag::Never,
+            Some("defer") => ThpDefrag::Defer,
+            Some("madvise") => ThpDefrag::Madvise,
+            Some("defer+madvise") => ThpDefrag::DeferMadvise,
+            Some("always") => ThpDefrag::Always,
+            _ => ThpDefrag::Unknown,
+        }
+    }
+
+    /// Read `/sys/kernel/mm/transparent_hugepage/defrag` once per process.
+    #[cfg(target_os = "linux")]
+    pub(super) fn thp_defrag() -> ThpDefrag {
+        static DEFRAG: std::sync::OnceLock<ThpDefrag> = std::sync::OnceLock::new();
+        *DEFRAG.get_or_init(|| match std::fs::read_to_string(THP_DEFRAG) {
+            Ok(content) => parse_thp_defrag(&content),
+            Err(_) => ThpDefrag::Unknown,
+        })
+    }
+
     /// The transparent huge page size `read` of [`THP_SIZE`] gives on a
     /// host of `page`: the size it reads; where it is missing (a kernel
     /// without transparent huge pages, a sandbox's `/sys`) or refused, the
@@ -493,65 +588,87 @@ mod host {
         }
     }
 
-    /// Count how many of the backed `[start, start + bytes)`, whole large
-    /// pages of `large` bytes, the kernel backed with transparent huge pages,
-    /// by reading `AnonHugePages:` for the covering VMA(s) from
-    /// `/proc/self/smaps`. Returns 0 if `/proc/self/smaps` cannot be read.
+    /// Measure large-page and small-page backing for `ranges` — sorted,
+    /// non-overlapping `(base, bytes, large_page)` entries — in a single pass
+    /// over `/proc/self/smaps`. If `/proc/self/smaps` cannot be opened, every
+    /// tracked range is counted as small-page backed.
     #[cfg(target_os = "linux")]
-    pub(super) fn count_large_pages(start: *mut u8, bytes: usize, large: usize) -> usize {
+    pub(super) fn measure_large_page_backing(ranges: &[(usize, usize, usize)]) -> super::LargePageBacking {
+        if ranges.is_empty() {
+            return super::LargePageBacking::default();
+        }
         let Ok(file) = std::fs::File::open("/proc/self/smaps") else {
-            return 0;
+            let small_bytes = ranges.iter().map(|&(_, bytes, _)| bytes as u64).sum();
+            return super::LargePageBacking { large_bytes: 0, small_bytes };
         };
-        parse_smaps_large_pages(std::io::BufReader::new(file), start as usize, bytes, large)
+        parse_smaps_large_pages_batch(std::io::BufReader::new(file), ranges)
     }
 
-    /// Parse `AnonHugePages:` entries from `smaps` for VMAs overlapping
-    /// `[base, base + bytes)` and return the count of whole `large`-byte
-    /// pages, clamped to `bytes / large`.
+    /// Parse `AnonHugePages:` entries from `smaps` for all sorted,
+    /// non-overlapping `ranges` (`(base, bytes, large_page)`) in one pass and
+    /// return the aggregate [`super::LargePageBacking`].
     #[cfg(target_os = "linux")]
-    pub(super) fn parse_smaps_large_pages(
+    pub(super) fn parse_smaps_large_pages_batch(
         mut reader: impl std::io::BufRead,
-        base: usize,
-        bytes: usize,
-        large: usize,
-    ) -> usize {
+        ranges: &[(usize, usize, usize)],
+    ) -> super::LargePageBacking {
         use std::io::BufRead;
-        let end = base.saturating_add(bytes);
+        if ranges.is_empty() {
+            return super::LargePageBacking::default();
+        }
+        let max_end = ranges
+            .iter()
+            .map(|&(base, bytes, _)| base.saturating_add(bytes))
+            .max()
+            .unwrap_or(0);
+        let mut anon_huge_bytes = vec![0usize; ranges.len()];
+        let mut cursor = 0usize;
+        let mut current_vma: Option<(usize, usize)> = None;
         let mut line = String::new();
-        let mut covering: Option<(usize, usize)> = None;
-        let mut anon_huge_bytes: usize = 0;
         while let Ok(read) = reader.read_line(&mut line) {
             if read == 0 {
                 break;
             }
             if let Some(first) = line.split_whitespace().next() {
                 if !first.ends_with(':') {
-                    covering = None;
+                    current_vma = None;
                     if let Some((start_hex, end_hex)) = first.split_once('-') {
                         if let (Ok(vma_start), Ok(vma_end)) = (
                             usize::from_str_radix(start_hex, 16),
                             usize::from_str_radix(end_hex, 16),
                         ) {
-                            if vma_start >= end {
+                            if vma_start >= max_end {
                                 break;
                             }
-                            if vma_end > base {
-                                covering = Some((vma_start, vma_end));
+                            while cursor < ranges.len()
+                                && ranges[cursor].0.saturating_add(ranges[cursor].1) <= vma_start
+                            {
+                                cursor += 1;
+                            }
+                            if cursor < ranges.len() && ranges[cursor].0 < vma_end {
+                                current_vma = Some((vma_start, vma_end));
                             }
                         }
                     }
-                } else if let Some((vma_start, vma_end)) = covering {
+                } else if let Some((vma_start, vma_end)) = current_vma {
                     if let Some(rest) = line.strip_prefix("AnonHugePages:") {
                         if let Some(kb) = rest.split_whitespace().next().and_then(|s| s.parse::<usize>().ok()) {
                             let huge_bytes = kb.saturating_mul(1024);
-                            if vma_start >= base && vma_end <= end {
-                                anon_huge_bytes = anon_huge_bytes.saturating_add(huge_bytes);
-                            } else {
-                                let overlap = vma_end.min(end).saturating_sub(vma_start.max(base));
-                                let vma_len = vma_end.saturating_sub(vma_start);
-                                if vma_len > 0 {
-                                    let share = ((huge_bytes as u128 * overlap as u128) / vma_len as u128) as usize;
-                                    anon_huge_bytes = anon_huge_bytes.saturating_add(share);
+                            let vma_len = vma_end.saturating_sub(vma_start);
+                            for (&(base, bytes, _), huge_acc) in
+                                ranges[cursor..].iter().zip(&mut anon_huge_bytes[cursor..])
+                            {
+                                if base >= vma_end {
+                                    break;
+                                }
+                                let end = base.saturating_add(bytes);
+                                if vma_start >= base && vma_end <= end {
+                                    *huge_acc = huge_acc.saturating_add(huge_bytes);
+                                } else if vma_len > 0 {
+                                    let overlap = vma_end.min(end).saturating_sub(vma_start.max(base));
+                                    let share =
+                                        ((huge_bytes as u128 * overlap as u128) / vma_len as u128) as usize;
+                                    *huge_acc = huge_acc.saturating_add(share);
                                 }
                             }
                         }
@@ -560,11 +677,20 @@ mod host {
             }
             line.clear();
         }
-        (anon_huge_bytes / large).min(bytes / large)
+        let mut large_bytes = 0u64;
+        let mut small_bytes = 0u64;
+        for (&(_, bytes, large), &huge) in ranges.iter().zip(&anon_huge_bytes) {
+            let total_pages = bytes / large;
+            let large_pages = (huge / large).min(total_pages);
+            let small_pages = total_pages - large_pages;
+            large_bytes += (large_pages * large) as u64;
+            small_bytes += (small_pages * large) as u64;
+        }
+        super::LargePageBacking { large_bytes, small_bytes }
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(super) fn count_large_pages(_start: *mut u8, _bytes: usize, _large: usize) -> usize {
+    pub(super) fn measure_large_page_backing(_ranges: &[(usize, usize, usize)]) -> super::LargePageBacking {
         unreachable!("only Linux reports large pages")
     }
 
@@ -630,7 +756,7 @@ mod host {
         NonNull::new(base.cast()).ok_or(AllocationFailure::OutOfMemory)
     }
 
-    pub(super) fn count_large_pages(_start: *mut u8, _bytes: usize, _large: usize) -> usize {
+    pub(super) fn measure_large_page_backing(_ranges: &[(usize, usize, usize)]) -> super::LargePageBacking {
         unreachable!("only Linux reports large pages")
     }
 
@@ -749,13 +875,92 @@ AnonHugePages:         0 kB
 Size:               8192 kB
 AnonHugePages:      8192 kB
 ";
+        let l = large as u64;
         // Exact single VMA with 2 of 3 huge pages backed.
-        assert_eq!(host::parse_smaps_large_pages(smaps.as_bytes(), 0x1000_0000, 3 * large, large), 2);
+        assert_eq!(
+            host::parse_smaps_large_pages_batch(smaps.as_bytes(), &[(0x1000_0000, 3 * large, large)]),
+            LargePageBacking { large_bytes: 2 * l, small_bytes: l },
+        );
         // Two split VMAs covering a 2-large-page block: 1 huge + 0 huge.
-        assert_eq!(host::parse_smaps_large_pages(smaps.as_bytes(), 0x2000_0000, 2 * large, large), 1);
+        assert_eq!(
+            host::parse_smaps_large_pages_batch(smaps.as_bytes(), &[(0x2000_0000, 2 * large, large)]),
+            LargePageBacking { large_bytes: l, small_bytes: l },
+        );
         // Merged VMA twice as large as the block: proportionally attributed and never exceeds block's pages.
-        assert_eq!(host::parse_smaps_large_pages(smaps.as_bytes(), 0x3000_0000, 2 * large, large), 2);
-        // Unmapped address range returns 0.
-        assert_eq!(host::parse_smaps_large_pages(smaps.as_bytes(), 0x4000_0000, 2 * large, large), 0);
+        assert_eq!(
+            host::parse_smaps_large_pages_batch(smaps.as_bytes(), &[(0x3000_0000, 2 * large, large)]),
+            LargePageBacking { large_bytes: 2 * l, small_bytes: 0 },
+        );
+        // Unmapped address range counts all pages as small.
+        assert_eq!(
+            host::parse_smaps_large_pages_batch(smaps.as_bytes(), &[(0x4000_0000, 2 * large, large)]),
+            LargePageBacking { large_bytes: 0, small_bytes: 2 * l },
+        );
+        // Single-pass batch across all ranges, including two adjacent blocks sharing a merged VMA.
+        assert_eq!(
+            host::parse_smaps_large_pages_batch(
+                smaps.as_bytes(),
+                &[
+                    (0x1000_0000, 3 * large, large),
+                    (0x2000_0000, 2 * large, large),
+                    (0x3000_0000, 2 * large, large),
+                    (0x3040_0000, 2 * large, large),
+                    (0x4000_0000, 2 * large, large),
+                ],
+            ),
+            LargePageBacking { large_bytes: 7 * l, small_bytes: 4 * l },
+        );
+    }
+
+    #[test]
+    fn large_page_backing_tracks_multiple_live_blocks_and_drops_to_zero() {
+        let _counting = counting();
+        let Some(large) = large_page().unwrap() else {
+            eprintln!("no large pages on this host");
+            return;
+        };
+        let before = large_page_backing();
+        let a = HostBlock::allocate((2 * large) as u64, PageSize::Large).unwrap();
+        let b = HostBlock::allocate((3 * large) as u64, PageSize::Large).unwrap();
+        let both = large_page_backing();
+        let counted_both = (both.large_bytes - before.large_bytes) + (both.small_bytes - before.small_bytes);
+        assert_eq!(counted_both, (5 * large) as u64, "both live blocks counted in one smaps pass");
+        drop(a);
+        let only_b = large_page_backing();
+        let counted_b = (only_b.large_bytes - before.large_bytes) + (only_b.small_bytes - before.small_bytes);
+        assert_eq!(counted_b, (3 * large) as u64, "dropping first block removes only its bytes");
+        drop(b);
+        assert_eq!(large_page_backing(), before, "dropping all blocks returns backing to baseline");
+    }
+
+    #[test]
+    fn thp_defrag_parser_recognizes_active_token_and_blocking_policy() {
+        use host::{ThpDefrag, parse_thp_defrag};
+        assert_eq!(parse_thp_defrag("[madvise]"), ThpDefrag::Madvise);
+        assert!(parse_thp_defrag("[madvise]").blocks_on_madvise());
+
+        assert_eq!(parse_thp_defrag("always defer defer+madvise [madvise] never\n"), ThpDefrag::Madvise);
+        assert!(parse_thp_defrag("always defer defer+madvise [madvise] never\n").blocks_on_madvise());
+
+        assert_eq!(parse_thp_defrag("[never]"), ThpDefrag::Never);
+        assert!(!parse_thp_defrag("[never]").blocks_on_madvise());
+
+        assert_eq!(parse_thp_defrag("[defer]"), ThpDefrag::Defer);
+        assert!(!parse_thp_defrag("[defer]").blocks_on_madvise());
+
+        assert_eq!(parse_thp_defrag("always defer [defer+madvise] madvise never"), ThpDefrag::DeferMadvise);
+        assert!(parse_thp_defrag("always defer [defer+madvise] madvise never").blocks_on_madvise());
+
+        assert_eq!(parse_thp_defrag("[always] defer defer+madvise madvise never"), ThpDefrag::Always);
+        assert!(parse_thp_defrag("[always] defer defer+madvise madvise never").blocks_on_madvise());
+
+        assert_eq!(parse_thp_defrag(""), ThpDefrag::Unknown);
+        assert!(parse_thp_defrag("").blocks_on_madvise());
+
+        // Fault throughput stall threshold: 500 MB/s.
+        let block = 64usize << 20; // 67_108_864 bytes -> 500 MB/s threshold is ~134.2 ms
+        assert!(!fault_stalled(block, std::time::Duration::from_millis(16))); // ~4 GB/s
+        assert!(!fault_stalled(block, std::time::Duration::ZERO));
+        assert!(fault_stalled(block, std::time::Duration::from_millis(200))); // ~335 MB/s
     }
 }

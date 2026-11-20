@@ -116,8 +116,8 @@
 //!
 //! A reader measures nothing: the probe runs where nothing waits on it
 //! ([`probe_volume`], the measurement job), a load adopts its curve
-//! ([`adopt_volume`]), and until one exists a volume reads at the search's
-//! bounds ([`Shape::PENDING`]).
+//! ([`adopt_volume`]), and until one exists a volume reads at
+//! [`Shape::PENDING`].
 
 use super::file::SourceFile;
 use super::platform::{process_cpu_seconds, thread_cpu_seconds};
@@ -313,7 +313,7 @@ enum Adopted {
 impl VolumeLines {
     /// How `urgent` reads the volume: by the curve it last adopted; else by
     /// the lines other requests hold, its due pieces at the size read ahead;
-    /// else at the search's bounds.
+    /// else at [`Shape::PENDING`].
     pub(crate) fn shape(&self, urgent: Option<&Urgent>) -> Shape {
         match self.requests.get(&urgent.cloned()) {
             Some(Adopted::Earlier(earlier)) => earlier.shape(),
@@ -583,7 +583,7 @@ fn lone(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, reads: &[u64]) -> 
     let volumes = reads
         .iter()
         .map(|&read| {
-            let volume = VolumeReads { id: key, shape: Shape { ahead_read: read, due_read: read, ..Shape::PENDING } };
+            let volume = VolumeReads { id: key, shape: Shape { due: WIDEST_WINDOW, knee: WIDEST_WINDOW, ahead_read: read, due_read: read, cores: 0. } };
             let need = scheduler::need(&volume);
             (volume, need)
         })
@@ -659,7 +659,7 @@ fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64)
     let parts = &urgent.parts;
     let widest = *parts.iter().max().expect("a request has a range");
     let window = depth * urgent.span();
-    let volume = VolumeReads { id: key, shape: Shape { due: window, knee: window, ahead_read: urgent.whole_range(), due_read: urgent.whole_range(), ..Shape::PENDING } };
+    let volume = VolumeReads { id: key, shape: Shape { due: window, knee: window, ahead_read: urgent.whole_range(), due_read: urgent.whole_range(), cores: 0. } };
     // The pool's workers for its ranges are the probe's, while it runs.
     let need = scheduler::need(&volume);
     let outstanding = Arc::default();

@@ -752,6 +752,26 @@ fn a_cancelled_read_ahead_ends_with_what_it_had_in_flight_and_the_due_one_lands(
     std::fs::remove_file(path).unwrap();
 }
 
+/// An unprobed volume falls back to `Shape::PENDING` with modern NVMe/SSD
+/// defaults: at least 1 MiB reads (avoiding 128 KiB fragmentation), a knee of
+/// at most 4 MiB so speculative read-ahead cannot pile up behind parked demand
+/// reads, each read size at most half the knee, and due depth at least knee.
+#[test]
+fn unprobed_volume_uses_sane_pending_shape() {
+    const MIB: u64 = 1024 * 1024;
+    let lines = VolumeLines::default();
+    let urgent = Urgent { parts: vec![460 * 1024; 3], records: 8 };
+    for shape in [Shape::PENDING, lines.shape(None), lines.shape(Some(&urgent))] {
+        assert_eq!(shape, Shape::PENDING);
+        assert!(shape.due_read >= MIB, "due_read {} < 1 MiB", shape.due_read);
+        assert!(shape.ahead_read >= MIB, "ahead_read {} < 1 MiB", shape.ahead_read);
+        assert!(shape.knee <= 4 * MIB, "knee {} > 4 MiB", shape.knee);
+        assert!(shape.due_read <= shape.knee / 2, "due_read {} > knee / 2 ({})", shape.due_read, shape.knee / 2);
+        assert!(shape.ahead_read <= shape.knee / 2, "ahead_read {} > knee / 2 ({})", shape.ahead_read, shape.knee / 2);
+        assert!(shape.due >= shape.knee, "due {} < knee {}", shape.due, shape.knee);
+    }
+}
+
 /// Due reads hold the widest window at the full rate of their line: past
 /// the knee a wider one costs a read alone nothing, and serving needs it
 /// (GB10's medians: 9.66 GB/s at 4 MiB, then flat through 32); a narrower
