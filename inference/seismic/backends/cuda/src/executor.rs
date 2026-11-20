@@ -302,19 +302,61 @@ impl NativeExecutor<Cuda> for Executor {
     fn begin_submission(&self) -> Result<Self::Submission, ExecutionError> {
         Ok(Submission {
             device: self.device.clone(),
-            in_flight_uploads: Vec::new(),
+            in_flight_uploads: InFlightUploads::new(self.device.clone()),
         })
+    }
+}
+
+struct InFlightUploads {
+    device: Device,
+    uploads: Vec<PinnedUpload>,
+}
+
+impl InFlightUploads {
+    fn new(device: Device) -> Self {
+        Self {
+            device,
+            uploads: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, upload: PinnedUpload) {
+        self.uploads.push(upload);
+    }
+
+    fn complete(&mut self) -> Result<(), ExecutionError> {
+        self.device
+            .stream
+            .synchronize()
+            .map_err(synchronization_error)?;
+        self.uploads.clear();
+        Ok(())
+    }
+}
+
+impl Drop for InFlightUploads {
+    fn drop(&mut self) {
+        if self.uploads.is_empty() {
+            return;
+        }
+        if self.device.stream.synchronize().is_ok() {
+            self.uploads.clear();
+        } else {
+            // Never free pinned memory that a live DMA may still read. On a
+            // lost device/context this is a bounded process-lifetime leak;
+            // it is safer than violating the CUDA async-copy contract.
+            std::mem::forget(std::mem::take(&mut self.uploads));
+        }
     }
 }
 
 pub struct Submission {
     device: Device,
-    in_flight_uploads: Vec<PinnedUpload>,
+    in_flight_uploads: InFlightUploads,
 }
 
 pub struct Execution {
-    device: Device,
-    in_flight_uploads: Vec<PinnedUpload>,
+    in_flight_uploads: InFlightUploads,
 }
 
 impl NativeSubmission<Cuda> for Submission {
@@ -389,17 +431,16 @@ impl NativeSubmission<Cuda> for Submission {
         self.synchronize_pending()
     }
 
-    fn submit(mut self) -> Self::Execution {
+    fn submit(self) -> Self::Execution {
         Execution {
-            device: self.device.clone(),
-            in_flight_uploads: std::mem::take(&mut self.in_flight_uploads),
+            in_flight_uploads: self.in_flight_uploads,
         }
     }
 }
 
 impl NativeExecution for Execution {
     fn complete(&mut self) -> Result<(), ExecutionError> {
-        synchronize(&self.device, &mut self.in_flight_uploads)
+        self.in_flight_uploads.complete()
     }
 }
 
@@ -676,7 +717,7 @@ impl Submission {
     }
 
     fn synchronize_pending(&mut self) -> Result<(), ExecutionError> {
-        synchronize(&self.device, &mut self.in_flight_uploads)
+        self.in_flight_uploads.complete()
     }
 
     fn copy(
@@ -816,15 +857,6 @@ fn abi_buffer<'a>(
     env.buffer(bindings.allocation(role))
 }
 
-fn synchronize(
-    device: &Device,
-    in_flight_uploads: &mut Vec<PinnedUpload>,
-) -> Result<(), ExecutionError> {
-    device.stream.synchronize().map_err(synchronization_error)?;
-    in_flight_uploads.clear();
-    Ok(())
-}
-
 fn abi_offset(buffer: &RuntimeBuffer<Buffer>) -> usize {
     usize::try_from(buffer.base_offset)
         .unwrap_or_else(|_| panic!("prepared CUDA ABI offset exceeds usize"))
@@ -920,21 +952,5 @@ fn synchronization_error(error: DriverError) -> ExecutionError {
         ExecutionError::DeviceLost(error.to_string())
     } else {
         ExecutionError::SynchronizationFailed(error.to_string())
-    }
-}
-
-impl Drop for Submission {
-    fn drop(&mut self) {
-        if self.in_flight_uploads.is_empty() {
-            return;
-        }
-        if self.device.stream.synchronize().is_ok() {
-            self.in_flight_uploads.clear();
-        } else {
-            // Never free pinned memory that a live DMA may still read. On a
-            // lost device/context this is a bounded process-lifetime leak;
-            // it is safer than violating the CUDA async-copy contract.
-            std::mem::forget(std::mem::take(&mut self.in_flight_uploads));
-        }
     }
 }

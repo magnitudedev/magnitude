@@ -120,7 +120,7 @@ impl Blocks {
             }
         };
         Ok(Range {
-            _carved: block.backed.charge().carve(entry, bytes),
+            carved: Some(block.backed.charge().carve(entry, bytes)),
             blocks: self.clone(),
             block,
             offset,
@@ -167,8 +167,8 @@ impl Blocks {
 /// A range of a block, returned on drop.
 pub(crate) struct Range {
     /// Its bytes, carved for its allocation's entry from the block's;
-    /// returned to the block as the range drops.
-    _carved: Carved,
+    /// returned to the block before the range becomes allocatable again.
+    carved: Option<Carved>,
     blocks: Arc<Blocks>,
     block: Arc<Block>,
     offset: u64,
@@ -202,6 +202,7 @@ impl Range {
 
 impl Drop for Range {
     fn drop(&mut self) {
+        drop(self.carved.take());
         self.blocks.release(self);
     }
 }
