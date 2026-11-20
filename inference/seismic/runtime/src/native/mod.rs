@@ -183,6 +183,21 @@ pub(crate) struct CallLaunches {
 /// placed buffer, as they do for a standalone call's.
 pub(crate) const BUFFER_ALIGNMENT: u64 = seismic_native_cpu::tensor::BUFFER_ALIGNMENT as u64;
 
+/// Minimum host-only schedule cache capacity on Metal while any graph hold is
+/// live: prevents thrashing when alternating across draft/target/prefill or
+/// multiple active KV slab layouts while keeping host memory strictly bounded.
+#[cfg(target_os = "macos")]
+const METAL_SCHEDULE_CAPACITY: u64 = 64;
+
+#[cfg(target_os = "macos")]
+fn metal_schedule_budget(budget: GraphCensus) -> GraphCensus {
+    if budget.graphs == 0 {
+        GraphCensus::default()
+    } else {
+        GraphCensus { graphs: budget.graphs.max(METAL_SCHEDULE_CAPACITY), ..budget }
+    }
+}
+
 /// Per-device state of native submission, on every native queue.
 #[derive(Default)]
 pub(crate) struct NativeState {
@@ -197,6 +212,9 @@ pub(crate) struct NativeState {
     /// Schedules of sealed-plan submissions (Metal devices only).
     #[cfg(target_os = "macos")]
     metal_schedules: graph_replays::Replays<hazard::Schedule>,
+    /// Reusable scratch for Metal schedule key hashing (zero per-step allocs).
+    #[cfg(target_os = "macos")]
+    metal_placement: Mutex<hazard::PlacementScratch>,
     /// What the graphs the device keeps may be made of.
     graph_budget: Mutex<GraphBudget>,
 }
@@ -253,6 +271,26 @@ impl NativeState {
         self.graph_budget.lock().expect("graph budget lock is never poisoned").census
     }
 
+    /// Track a live plan key so its `by_plan` counters are pruned when dropped.
+    pub(crate) fn register_plan_key(&self, backend: BackendName, plan: u64) {
+        match backend {
+            BackendName::Cuda => self.cuda_replays.register_plan(plan),
+            #[cfg(not(target_os = "macos"))]
+            BackendName::Vulkan => self.vulkan_replays.register_plan(plan),
+            _ => {}
+        }
+    }
+
+    /// Release a live plan key when its plan drops.
+    pub(crate) fn unregister_plan_key(&self, backend: BackendName, plan: u64) {
+        match backend {
+            BackendName::Cuda => self.cuda_replays.unregister_plan(plan),
+            #[cfg(not(target_os = "macos"))]
+            BackendName::Vulkan => self.vulkan_replays.unregister_plan(plan),
+            _ => {}
+        }
+    }
+
     /// Release graphs of every kind beyond `budget`, the device's graph
     /// budget as a hold of it shrank ([`graph_replays::Replays::fit_to`]).
     fn fit_graphs(&self, budget: GraphCensus) {
@@ -260,7 +298,7 @@ impl NativeState {
         #[cfg(not(target_os = "macos"))]
         self.vulkan_replays.fit_to(budget);
         #[cfg(target_os = "macos")]
-        self.metal_schedules.fit_to(budget);
+        self.metal_schedules.fit_to(metal_schedule_budget(budget));
     }
 
     /// Drop every recorded graph, of every kind, while no hold of the graph
@@ -3772,7 +3810,7 @@ struct Encoding<'a, L> {
 
 /// Encode and commit `work`.
 fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Result<Committed, EncodeFailure> {
-    let Encoding { list, repetitions, timed, observed, retained, queue, after } = *work;
+    let Encoding { list, repetitions, timed, observed, retained: _, queue, after } = *work;
     #[cfg(target_os = "macos")]
     let mut buffers = Vec::new();
     assert!(
@@ -3898,18 +3936,20 @@ fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Res
                     match list.runs() {
                         Some(runs) => {
                             // A schedule holds no parameter: its shape is
-                            // its plans, its repetitions and how their
-                            // reaches meet, and it binds nothing.
-                            let mut key = runs.iter().map(|run| run.plan).collect::<Vec<_>>();
-                            key.push(repetitions as u64);
-                            key.extend(hazard::relative_placement(list, 0..list.count()));
-                            let shaped = graph_replays::Shaped { key, bound: Vec::new() };
+                            // its plans, its repetitions and a fixed-size
+                            // digest of how their reaches meet.
+                            let key = {
+                                let mut scratch = first
+                                    .public_device
+                                    .native
+                                    .metal_placement
+                                    .lock()
+                                    .expect("metal placement scratch is never poisoned");
+                                hazard::schedule_key(&mut scratch, &runs, repetitions, list)
+                            };
                             let schedules = &first.public_device.native.metal_schedules;
-                            // Deriving a schedule is host work alone: it
-                            // waits for nothing.
-                            let budget = first.public_device.native.graph_budget();
-                            let taken = schedules.record(std::slice::from_ref(&shaped), budget, retained, || Ok(()), |_| Ok(derive()))?;
-                            schedules.replay(&shaped, taken[0], |_, _| unreachable!("a schedule binds no parameter"), |schedule| scheduled(schedule))?
+                            let budget = metal_schedule_budget(first.public_device.native.graph_budget());
+                            schedules.with_unbound(&key, budget, derive, |schedule| scheduled(schedule))?
                         }
                         None => scheduled(&derive())?,
                     }

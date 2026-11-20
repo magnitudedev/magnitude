@@ -1575,3 +1575,32 @@ fn concurrent_controllers_share_look_seconds_without_lost_updates_or_stale_overw
         "peer accrues from 0.0 after reset ({after_reset} vs {after_first})"
     );
 }
+
+#[test]
+fn draft_load_costs_stays_bounded_across_many_context_and_sequence_buckets() {
+    let load = Arc::new(DraftLoad::default());
+    let mut controller = DraftController::new(8, load.clone());
+    // Sweep 200 distinct (context_class, sequences) pairs across simulated sessions.
+    for context_pow in 0..10u32 {
+        let position = 1usize << context_pow;
+        for sequences in 1..=20usize {
+            let _ = controller.generate(0, position, true);
+            controller.timed(
+                TimedLaunch::Target,
+                Some(LaunchDuration { duration: std::time::Duration::from_millis(10), covering: false }),
+                sequences,
+                sequences,
+            );
+            controller.committed(&[TokenId(0)]);
+        }
+    }
+    let buckets = load.costs.lock().unwrap().len();
+    assert_eq!(
+        buckets,
+        super::MAX_COST_BUCKETS,
+        "DraftLoad::costs should populate and cap at MAX_COST_BUCKETS ({})",
+        super::MAX_COST_BUCKETS
+    );
+    // Most recently measured bucket is still retained.
+    assert!(load.costs.lock().unwrap().contains_key(&(1 << 9, 20)));
+}

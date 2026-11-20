@@ -1671,6 +1671,11 @@ impl Telemetry {
         move |layer, expert| crate::experts::reuse::Reuse::of(&ranking).in_top(layer, expert)
     }
 
+    #[cfg(test)]
+    pub(super) fn ahead_len(&self) -> usize {
+        self.lock().costs.ahead.len()
+    }
+
     /// Step `sequence` ended, completed or not: what it left uncompleted,
     /// its cost and its sampled blocks, is dropped.
     pub(super) fn end_step(&self, sequence: Step) {
@@ -2001,6 +2006,7 @@ impl Telemetry {
         // every earlier one too.
         costs.running.retain(|running, _| *running > sequence);
         costs.layer_wait.retain(|running, _| *running > sequence);
+        costs.ahead.retain(|running, _| *running > sequence);
         costs.completed = Some((sequence, cost));
         Ok(chose)
     }
@@ -2290,7 +2296,9 @@ impl Telemetry {
         match source {
             Source::Lead { distance, row: None } => {
                 costs.hints.reads += 1;
-                costs.ahead.entry(step).or_default().push((layer, expert, distance, from));
+                if costs.completed.as_ref().is_none_or(|(completed, _)| step > *completed) {
+                    costs.ahead.entry(step).or_default().push((layer, expert, distance, from));
+                }
             }
             Source::Ahead(_) | Source::Lead { row: Some(_), .. } => {
                 costs.front.reads += 1;
@@ -2306,7 +2314,11 @@ impl Telemetry {
     pub(super) fn hints_named(&self, named: &[(Step, usize, u8, bool)]) {
         let costs = &mut self.lock().costs;
         let layers = costs.layers.len();
+        let completed = costs.completed.as_ref().map(|(step, _)| *step);
         for &(step, layer, distance, admitted) in named {
+            if completed.is_some_and(|done| step <= done) {
+                continue;
+            }
             let lead = &mut costs.running.entry(step).or_insert_with(|| StepCost::of(layers)).hints[layer][usize::from(distance) - 1];
             lead.published += 1;
             lead.admitted += u64::from(admitted);

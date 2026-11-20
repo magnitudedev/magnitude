@@ -60,8 +60,15 @@ pub(crate) struct Replays<G> {
     updated: std::sync::atomic::AtomicU64,
     /// The two counts by their graphs' keys' first word (a plan's, or on
     /// CUDA its layout's, `PlanShape::keyed`): what one load's plans cost,
-    /// beside other loads on the device.
-    by_plan: Mutex<HashMap<u64, GraphReplays>>,
+    /// beside other loads on the device. Pruned when the last plan using a
+    /// key drops ([`Self::unregister_plan`]).
+    by_plan: Mutex<HashMap<u64, PlanCounts>>,
+}
+
+#[derive(Default)]
+struct PlanCounts {
+    live: usize,
+    counts: GraphReplays,
 }
 
 impl<G> Default for Replays<G> {
@@ -114,14 +121,15 @@ struct ReplayEntries<G> {
     clock: u64,
     /// The next graph's identity.
     next: u64,
-    graphs: HashMap<Vec<u64>, Replay<G>>,
+    graphs: HashMap<Arc<[u64]>, Replay<G>>,
 }
 
 /// A shape's graphs.
 struct Replay<G> {
     graphs: Vec<Instance<G>>,
-    /// The plans the graphs' kernels belong to, kept loaded while they live.
-    _retained: Arc<dyn Any + Send + Sync>,
+    /// The plans the graphs' kernels belong to, kept loaded while they live;
+    /// `None` for host-only schedules that hold no plan resources.
+    _retained: Option<Arc<dyn Any + Send + Sync>>,
     /// The graphs of it kept for each launch in flight, one demand for each
     /// family that runs it, by its `flights` ([`Replays::ensure`]): a
     /// shape two families run is kept for both families' launches.
@@ -179,7 +187,39 @@ impl<G> Replays<G> {
 
     /// What the graphs of plan `plan`'s runs cost so far.
     pub(crate) fn plan_counts(&self, plan: u64) -> GraphReplays {
-        self.by_plan.lock().expect("graph counts lock is never poisoned").get(&plan).copied().unwrap_or_default()
+        self.by_plan
+            .lock()
+            .expect("graph counts lock is never poisoned")
+            .get(&plan)
+            .map_or(GraphReplays::default(), |entry| entry.counts)
+    }
+
+    /// Track a live plan key so its `by_plan` entry is pruned once every plan
+    /// sharing that key has been dropped.
+    pub(crate) fn register_plan(&self, plan: u64) {
+        self.by_plan
+            .lock()
+            .expect("graph counts lock is never poisoned")
+            .entry(plan)
+            .or_default()
+            .live += 1;
+    }
+
+    /// Release a live plan key; removes its `by_plan` entry when no live plan
+    /// remains for that key.
+    pub(crate) fn unregister_plan(&self, plan: u64) {
+        let mut by_plan = self.by_plan.lock().expect("graph counts lock is never poisoned");
+        if let Some(entry) = by_plan.get_mut(&plan) {
+            entry.live = entry.live.saturating_sub(1);
+            if entry.live == 0 {
+                by_plan.remove(&plan);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn by_plan_len(&self) -> usize {
+        self.by_plan.lock().expect("graph counts lock is never poisoned").len()
     }
 
     /// Count a recording of a graph of `key` beside [`Self::record`]'s: one
@@ -198,7 +238,15 @@ impl<G> Replays<G> {
     /// `count` on the counts of the plan `key` is a graph of.
     fn of_plan(&self, key: &[u64], count: impl FnOnce(&mut GraphReplays)) {
         let plan = *key.first().expect("a graph's key begins with its plan");
-        count(self.by_plan.lock().expect("graph counts lock is never poisoned").entry(plan).or_default());
+        count(
+            &mut self
+                .by_plan
+                .lock()
+                .expect("graph counts lock is never poisoned")
+                .entry(plan)
+                .or_default()
+                .counts,
+        );
     }
 }
 
@@ -261,11 +309,74 @@ impl<G: RecordedGraph> Replays<G> {
         entries.clock += 1;
         let clock = entries.clock;
         for (Shaped { key, .. }, identity) in graphs.iter().zip(&taken) {
-            let replay = entries.graphs.get_mut(key).expect("a taken graph is kept under its run's shape");
+            let replay = entries.graphs.get_mut(key.as_slice()).expect("a taken graph is kept under its run's shape");
             let instance = replay.graphs.iter_mut().find(|instance| instance.identity == *identity).expect("a taken graph is kept");
             instance.used = clock;
         }
         Ok(taken)
+    }
+
+    /// Single-lock lookup and use for an unbound, host-only graph (a Metal
+    /// schedule): zero allocations on cache hit, does not retain plan objects
+    /// or pollute `by_plan`, and derives outside the lock on a miss.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn with_unbound(
+        &self,
+        key: &[u64],
+        budget: GraphCensus,
+        derive: impl FnOnce() -> G,
+        use_graph: impl FnOnce(&mut G) -> Result<(), CallError>,
+    ) -> Result<(), CallError> {
+        let lock = || self.entries.lock().expect("native graph replays lock is never poisoned");
+        let mut entries = lock();
+        if entries.graphs.get(key).is_some_and(|replay| !replay.graphs.is_empty()) {
+            entries.clock += 1;
+            let clock = entries.clock;
+            let instance = entries
+                .graphs
+                .get_mut(key)
+                .expect("checked present")
+                .graphs
+                .first_mut()
+                .expect("checked non-empty");
+            instance.used = clock;
+            return use_graph(&mut instance.graph);
+        }
+        drop(entries);
+        let graph = derive();
+        let mut entries = lock();
+        if entries.graphs.get(key).is_some_and(|replay| !replay.graphs.is_empty()) {
+            entries.clock += 1;
+            let clock = entries.clock;
+            let instance = entries
+                .graphs
+                .get_mut(key)
+                .expect("checked present")
+                .graphs
+                .first_mut()
+                .expect("checked non-empty");
+            instance.used = clock;
+            return use_graph(&mut instance.graph);
+        }
+        let identity = entries.next;
+        entries.next += 1;
+        entries.clock += 1;
+        let used = entries.clock;
+        entries.graphs.insert(
+            Arc::from(key),
+            Replay {
+                graphs: vec![Instance { identity, graph, bound: Some(Vec::new()), used }],
+                _retained: None,
+                pinned: Vec::new(),
+            },
+        );
+        Self::fit(&mut entries, &[identity], budget);
+        let instance = entries
+            .graphs
+            .get_mut(key)
+            .and_then(|replay| replay.graphs.first_mut())
+            .expect("inserted unbound graph is kept");
+        use_graph(&mut instance.graph)
     }
 
     /// Keep `per_flight` graphs of shape `key` for each of `flights`, those
@@ -328,12 +439,18 @@ impl<G: RecordedGraph> Replays<G> {
         entries.next += 1;
         entries.clock += 1;
         let used = entries.clock;
-        entries
-            .graphs
-            .entry(key.to_vec())
-            .or_insert_with(|| Replay { graphs: Vec::new(), _retained: retained.clone(), pinned: Vec::new() })
-            .graphs
-            .push(Instance { identity, graph, bound, used });
+        if let Some(replay) = entries.graphs.get_mut(key) {
+            replay.graphs.push(Instance { identity, graph, bound, used });
+        } else {
+            entries.graphs.insert(
+                Arc::from(key),
+                Replay {
+                    graphs: vec![Instance { identity, graph, bound, used }],
+                    _retained: Some(retained.clone()),
+                    pinned: Vec::new(),
+                },
+            );
+        }
         identity
     }
 
@@ -344,7 +461,7 @@ impl<G: RecordedGraph> Replays<G> {
         // A run whose binding a graph holds takes it, every run of that
         // binding alike.
         for (index, shaped) in graphs.iter().enumerate() {
-            if let Some(replay) = entries.graphs.get(&shaped.key) {
+            if let Some(replay) = entries.graphs.get(shaped.key.as_slice()) {
                 taken[index] = replay
                     .graphs
                     .iter()
@@ -358,7 +475,7 @@ impl<G: RecordedGraph> Replays<G> {
             if taken[index].is_some() {
                 continue;
             }
-            let Some(replay) = entries.graphs.get(&graphs[index].key) else {
+            let Some(replay) = entries.graphs.get(graphs[index].key.as_slice()) else {
                 continue;
             };
             let mut free = None;
@@ -418,7 +535,7 @@ impl<G: RecordedGraph> Replays<G> {
         let clock = entries.clock;
         let instance = entries
             .graphs
-            .get_mut(&shaped.key)
+            .get_mut(shaped.key.as_slice())
             .and_then(|replay| replay.graphs.iter_mut().find(|instance| instance.identity == identity))
             .expect("a submission replays only graphs chosen for it");
         instance.used = clock;
@@ -463,7 +580,7 @@ impl<G: RecordedGraph> Replays<G> {
             .lock()
             .expect("native graph replays lock is never poisoned");
         for shaped in graphs {
-            if let Some(replay) = entries.graphs.get_mut(&shaped.key) {
+            if let Some(replay) = entries.graphs.get_mut(shaped.key.as_slice()) {
                 for instance in &mut replay.graphs {
                     instance.bound = None;
                     forget(&mut instance.graph);
@@ -613,7 +730,7 @@ mod tests {
         for key in 0..3 {
             submit(&replays, &[shaped(key, 0)], budget, |_| ());
         }
-        let mut kept = replays.entries.lock().unwrap().graphs.keys().cloned().collect::<Vec<_>>();
+        let mut kept = replays.entries.lock().unwrap().graphs.keys().map(|key| key.to_vec()).collect::<Vec<_>>();
         kept.sort();
         assert_eq!(kept, vec![vec![1], vec![2]]);
     }
@@ -631,7 +748,7 @@ mod tests {
             submit(&replays, &[shaped(key, 0)], budget, |_| ());
         }
         let kept = |replays: &Replays<Graph<false>>| {
-            let mut kept = replays.entries.lock().unwrap().graphs.keys().cloned().collect::<Vec<_>>();
+            let mut kept = replays.entries.lock().unwrap().graphs.keys().map(|key| key.to_vec()).collect::<Vec<_>>();
             kept.sort();
             kept
         };
@@ -654,7 +771,7 @@ mod tests {
         // Again for the first family: its demand replaces its last, beside
         // the second's, rather than adding to it.
         replays.ensure(&[0], 1, &first, budget(4), &retained(), || Ok(()), || Ok(graph(4))).unwrap();
-        let held = |replays: &Replays<Graph<false>>| replays.entries.lock().unwrap().graphs.get(&vec![0]).map_or(0, |replay| replay.graphs.len());
+        let held = |replays: &Replays<Graph<false>>| replays.entries.lock().unwrap().graphs.get(&[0][..]).map_or(0, |replay| replay.graphs.len());
         assert_eq!(held(&replays), 3, "both families' launches in flight are kept");
         submit(&replays, &[shaped(1, 0)], budget(4), |_| ());
         submit(&replays, &[shaped(2, 0)], budget(4), |_| ());
@@ -776,5 +893,70 @@ mod tests {
         assert!(failed.is_err());
         replays.replay(&first, taken[0], |graph, _| count(graph, &first), |_| Ok(())).unwrap();
         assert_eq!(updates.get(), 2, "updated again after its own failure");
+    }
+
+    /// `by_plan` entries are pruned as plans drop, including shared layout keys
+    /// where the entry stays until the last plan sharing it drops.
+    #[test]
+    fn dropped_plans_are_pruned_from_by_plan() {
+        let replays = Replays::<Graph<true>>::default();
+        let budget = GraphCensus { graphs: 4, launches: 16, arguments: 256, largest: 16 };
+        // Two plans sharing layout key 7 (CUDA case): dropping one keeps counts.
+        replays.register_plan(7);
+        replays.register_plan(7);
+        submit(&replays, &[shaped(7, 1)], budget, |_| ());
+        assert_eq!(replays.plan_counts(7).recorded, 1);
+        replays.unregister_plan(7);
+        assert_eq!(replays.plan_counts(7).recorded, 1, "still live while second plan exists");
+        replays.unregister_plan(7);
+        assert_eq!(replays.by_plan_len(), 0, "pruned once last plan for key drops");
+
+        // Many sequential plans across engine lifetime leave zero retained entries.
+        for plan in 100..600u64 {
+            replays.register_plan(plan);
+            submit(&replays, &[shaped(plan, 0)], budget, |_| ());
+            replays.unregister_plan(plan);
+        }
+        assert_eq!(replays.by_plan_len(), 0, "by_plan stays bounded as plans churn");
+    }
+
+    /// Unbound host-only schedules (`with_unbound`, Metal) hit without re-deriving,
+    /// do not pollute `by_plan` or `counts()`, stay bounded by LRU eviction, and
+    /// clear completely when unheld.
+    #[test]
+    fn with_unbound_caches_without_thrashing_or_by_plan_leak() {
+        let replays = Replays::<Graph<true>>::default();
+        let budget = GraphCensus { graphs: 4, launches: 16, arguments: 256, largest: 16 };
+        let derived = std::cell::Cell::new(0usize);
+        let run = |key: &[u64]| {
+            replays
+                .with_unbound(
+                    key,
+                    budget,
+                    || {
+                        derived.set(derived.get() + 1);
+                        graph(4)
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap();
+        };
+        // Alternating across 4 active shapes fits within budget: derives once each.
+        for _ in 0..50 {
+            for shape in 0..4u64 {
+                run(&[shape, 1, 2, 3, 4]);
+            }
+        }
+        assert_eq!(derived.get(), 4, "no thrashing when working set fits budget");
+        assert_eq!(replays.by_plan_len(), 0, "unbound schedules do not pollute by_plan");
+        assert_eq!(replays.counts(), GraphReplays::default(), "unbound schedules are not counted");
+
+        // Churning 200 distinct shapes stays bounded at budget.graphs.
+        for shape in 10..210u64 {
+            run(&[shape, 1, 2, 3, 4]);
+        }
+        assert_eq!(replays.entries.lock().unwrap().graphs.len(), 4);
+        replays.clear_unheld(|| true);
+        assert_eq!(replays.entries.lock().unwrap().graphs.len(), 0);
     }
 }
