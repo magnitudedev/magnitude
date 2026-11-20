@@ -11,9 +11,9 @@
 use crate::BuildError;
 use seismic_lang::checked::{
     CheckedModule, ElementDomain, ElementQuery, ElementSummary, ElementTarget, ElementTerm,
-    Encoded, EntryInfo, NativeComparison, NativeCondition, NativeDefault, NativeImplementation,
-    NativeNatExpr, NativeOperand, NativeParameter, NativeScratch, ParameterSummaryKind,
-    ResultSummaryKind,
+    ElementUses, Encoded, EntryInfo, NativeComparison, NativeCondition, NativeDefault,
+    NativeImplementation, NativeNatExpr, NativeOperand, NativeParameter, NativeScratch,
+    ParameterSummaryKind, ResultSummaryKind,
 };
 use seismic_lang::entry::{AliasRule, ElementBindings, ParameterKind, ResultKind, TensorAccess};
 use seismic_lang::expr::{AnyExpr, BinaryOp, BoolExpr, CmpOp, ExprArena, NaryOp, NatExpr, NodeView, SymbolId, UnaryOp};
@@ -21,13 +21,6 @@ use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry::{self, BackendName, RowPart};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
-
-const BACKENDS: [BackendName; 4] = [
-    BackendName::Cpu,
-    BackendName::Metal,
-    BackendName::Cuda,
-    BackendName::Vulkan,
-];
 
 fn backend_variant(backend: BackendName) -> &'static str {
     match backend {
@@ -61,7 +54,7 @@ pub(crate) fn render_contract(
     module: &CheckedModule,
     entry: &EntryInfo,
 ) -> Result<(), BuildError> {
-    let natives: Vec<(BackendName, &NativeImplementation)> = BACKENDS
+    let natives: Vec<(BackendName, &NativeImplementation)> = BackendName::ALL
         .into_iter()
         .filter_map(|backend| {
             module
@@ -360,10 +353,20 @@ fn extract_schema_info(
         .map(|idx| entry.dimensions[idx].clone())
         .collect();
 
-    let static_dims: BTreeSet<&str> = natives
+    // CPU natives intentionally compile one unspecialized kernel (empty `statics`),
+    // so intersect `statics` across the static-specializing (non-CPU) backends.
+    let mut specializing = natives
         .iter()
-        .flat_map(|(_, native)| native.statics.iter().map(String::as_str))
-        .collect();
+        .filter(|(backend, _)| *backend != BackendName::Cpu);
+    let mut static_dims: BTreeSet<&str> = specializing
+        .next()
+        .map(|(_, native)| native.statics.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    for (_, native) in specializing {
+        let backend_statics: BTreeSet<&str> =
+            native.statics.iter().map(String::as_str).collect();
+        static_dims.retain(|d| backend_statics.contains(d));
+    }
 
     let mut tensor_params = Vec::new();
     let mut tensor_param_count = 0usize;
@@ -909,6 +912,38 @@ fn emit_element_binding(out: &mut String, entry: &EntryInfo, indent: &str) {
             .expect("element domain names an entry element parameter")
     };
 
+    for param in entry.element_domain.parameters() {
+        let idx = elem_idx(&param.name);
+        let ElementUses {
+            decoded_read,
+            component_read,
+            integer_code_read,
+            stored,
+            record_stored,
+            conversion_source,
+            partial_copy,
+        } = param.uses;
+        let _ = writeln!(
+            out,
+            "{indent}seismic::contract::rt::admits_uses(seismic::contract::rt::ElementUses {{ decoded_read: {decoded_read}, component_read: {component_read}, integer_code_read: {integer_code_read}, stored: {stored}, record_stored: {record_stored}, conversion_source: {conversion_source}, partial_copy: {partial_copy} }}, __e_{idx})?;"
+        );
+    }
+
+    for conv in entry.element_domain.conversions() {
+        let src = format!("__e_{}", elem_idx(&conv.source));
+        let dst = match &conv.target {
+            ElementTarget::Parameter(name) => format!("__e_{}", elem_idx(name)),
+            ElementTarget::Concrete(id) => {
+                let name = registry::representation_info(*id).name;
+                format!("seismic::contract::rt::element_named({name:?})")
+            }
+        };
+        let _ = writeln!(
+            out,
+            "{indent}seismic::contract::rt::admits_conversion({src}, {dst})?;"
+        );
+    }
+
     for pred in entry.element_domain.predicates() {
         let term = |t: &ElementTerm| match t {
             ElementTerm::Constant(v) => format!("{v}u64"),
@@ -1186,6 +1221,11 @@ impl<'a> ExprCtx<'a> {
         launch_matches.next().is_none().then_some(first)
     }
 
+    fn expect_param_index(&self, name: &str) -> usize {
+        self.resolve_param_index(name)
+            .unwrap_or_else(|| panic!("unknown or ambiguous parameter `{name}` in native expression"))
+    }
+
     fn lower_nat(&self, expr: &NativeNatExpr) -> String {
         match expr {
             NativeNatExpr::Constant(v) => format!("{v}u64"),
@@ -1201,9 +1241,7 @@ impl<'a> ExprCtx<'a> {
                 if self.default_param == Some(name.as_str()) {
                     return "__cand".to_owned();
                 }
-                let idx = self
-                    .resolve_param_index(name)
-                    .unwrap_or_else(|| panic!("unknown parameter `{name}` in native expression"));
+                let idx = self.expect_param_index(name);
                 format!("__p_{idx}")
             }
             NativeNatExpr::Element(elem_name, query) => {
@@ -1341,7 +1379,7 @@ fn render_backend_dispatch(
             "        seismic::BackendName::{variant} => __contract::{helper_prefix}_{slug}({call_args}),"
         );
     }
-    if natives.len() < BACKENDS.len() {
+    if natives.len() < BackendName::ALL.len() {
         out.push_str("        _ => Err(seismic::ContractError::NoImplementation(backend)),\n");
     }
     out.push_str("      }\n");
@@ -1463,7 +1501,15 @@ fn render_contract_default_params_helpers(
             let vals = format_u64_slice(&slot.param.values);
             match &slot.param.default {
                 NativeDefault::Value(expr) => {
-                    let e = ctx.lower_nat(expr);
+                    let default_ctx = ExprCtx {
+                        backend,
+                        elements: &entry.element_parameters,
+                        dims: &native.statics,
+                        params: &slots,
+                        launch: slot.launch,
+                        default_param: None,
+                    };
+                    let e = default_ctx.lower_nat(expr);
                     let _ = writeln!(
                         out,
                         "      let __def_{k}: u64 = (|| -> Result<u64, seismic::ContractError> {{ Ok({e}) }})()?;"
@@ -1524,7 +1570,7 @@ fn render_contract_default_params_helpers(
             c.parameters(&mut names);
             let max_depth = names
                 .iter()
-                .filter_map(|n| ctx.resolve_param_index(n))
+                .map(|n| ctx.expect_param_index(n))
                 .max();
             match max_depth {
                 None => static_conjuncts.push(*c),
@@ -1532,13 +1578,13 @@ fn render_contract_default_params_helpers(
             }
         }
 
-        for c in &static_conjuncts {
-            let cond_expr = ctx.lower_cond(c);
-            let _ = writeln!(
-                out,
-                "      if matches!((|| -> Result<bool, seismic::ContractError> {{ Ok({cond_expr}) }})(), Ok(false)) {{ return Err(seismic::ContractError::DomainViolation); }}"
-            );
-        }
+        emit_conjunct_guards(
+            out,
+            &ctx,
+            &static_conjuncts,
+            "return Err(seismic::ContractError::DomainViolation);",
+            "      ",
+        );
 
         if slots.is_empty() {
             if let Some(constraint) = &native.constraint {
@@ -2051,7 +2097,7 @@ fn render_contract_node_shape(
             schema_info.parks
         );
     }
-    if natives.len() < BACKENDS.len() {
+    if natives.len() < BackendName::ALL.len() {
         out.push_str("        _ => Err(seismic::ContractError::NoImplementation(backend)),\n");
     }
     out.push_str("      }\n");
@@ -2135,7 +2181,7 @@ fn render_contract_scratch_meta(
             "        seismic::BackendName::{variant} => Ok(seismic::ContractScratchMeta {{ scratch: {scratch_lit} }}),"
         );
     }
-    if natives.len() < BACKENDS.len() {
+    if natives.len() < BackendName::ALL.len() {
         out.push_str("        _ => Err(seismic::ContractError::NoImplementation(backend)),\n");
     }
     out.push_str("      }\n");
@@ -2166,7 +2212,7 @@ fn render_contract_param_spec(
         let _ = write!(out, "seismic::BackendName::{}", backend_variant(backend));
     }
     out.push_str(" => {}\n");
-    if natives.len() < BACKENDS.len() {
+    if natives.len() < BackendName::ALL.len() {
         out.push_str("        _ => return Err(seismic::ContractError::NoImplementation(backend)),\n");
     }
     out.push_str("      }\n");
@@ -2185,7 +2231,7 @@ fn render_contract_param_spec(
                 out.push_str("        }\n");
             }
         }
-        if non_empty_unit_cols < BACKENDS.len() {
+        if non_empty_unit_cols < BackendName::ALL.len() {
             out.push_str("        _ => {}\n");
         }
         out.push_str("      }\n");
@@ -2350,7 +2396,7 @@ fn factor_constraints_for<'a>(
         c.parameters(&mut names);
         let mut indices: Vec<usize> = names
             .iter()
-            .filter_map(|n| ctx.resolve_param_index(n))
+            .map(|n| ctx.expect_param_index(n))
             .collect();
         indices.sort_unstable();
         indices.dedup();
@@ -2418,7 +2464,7 @@ fn factor_constraints_for<'a>(
                     c.parameters(&mut names);
                     let mut local_inner: Vec<usize> = names
                         .iter()
-                        .filter_map(|n| ctx.resolve_param_index(n).and_then(|k| inner_pos[k]))
+                        .filter_map(|n| inner_pos[ctx.expect_param_index(n)])
                         .collect();
                     local_inner.sort_unstable();
                     local_inner.dedup();
@@ -2482,7 +2528,7 @@ fn partition_component_conjuncts<'a>(
         c.parameters(&mut names);
         if let Some(max_depth) = names
             .iter()
-            .filter_map(|n| ctx.resolve_param_index(n).and_then(|k| local_depth.get(&k).copied()))
+            .filter_map(|n| local_depth.get(&ctx.expect_param_index(n)).copied())
             .max()
         {
             depth_conjuncts[max_depth].push(c);
@@ -2523,7 +2569,15 @@ fn emit_default_first_order(
     let _ = writeln!(out, "{indent}  let mut __arr = {vals};");
     match &slot.param.default {
         NativeDefault::Value(expr) => {
-            let e = ctx.lower_nat(expr);
+            let default_ctx = ExprCtx {
+                backend,
+                elements: &entry.element_parameters,
+                dims: ctx.dims,
+                params: slots,
+                launch: slot.launch,
+                default_param: None,
+            };
+            let e = default_ctx.lower_nat(expr);
             let _ = writeln!(
                 out,
                 "{indent}  if let Ok(__def) = (|| -> Result<u64, seismic::ContractError> {{ Ok({e}) }})() {{"
@@ -2738,9 +2792,7 @@ fn render_contract_sizing_bound_helpers(
                 formed.parameters(&mut names);
                 nvfp4.parameters(&mut names);
                 for n in &names {
-                    if let Some(k) = ctx.resolve_param_index(n) {
-                        used_by_meta[k] = true;
-                    }
+                    used_by_meta[ctx.expect_param_index(n)] = true;
                 }
             }
         }
@@ -2757,9 +2809,7 @@ fn render_contract_sizing_bound_helpers(
                 let mut names = Vec::new();
                 when.parameters(&mut names);
                 for n in &names {
-                    if let Some(k) = lctx.resolve_param_index(n) {
-                        used_by_meta[k] = true;
-                    }
+                    used_by_meta[lctx.expect_param_index(n)] = true;
                 }
             }
         }
@@ -2767,9 +2817,7 @@ fn render_contract_sizing_bound_helpers(
             let mut names = Vec::new();
             repeat.count.parameters(&mut names);
             for n in &names {
-                if let Some(k) = ctx.resolve_param_index(n) {
-                    used_by_meta[k] = true;
-                }
+                used_by_meta[ctx.expect_param_index(n)] = true;
             }
         }
 
@@ -3649,7 +3697,7 @@ fn render_contract_launch_configs(
             );
         }
     }
-    if natives.len() < BACKENDS.len() {
+    if natives.len() < BackendName::ALL.len() {
         out.push_str("        _ => Err(seismic::ContractError::NoImplementation(backend)),\n");
     }
     out.push_str("      }\n");
@@ -3844,7 +3892,7 @@ fn render_contract_launch_mask(
             let _ = writeln!(out, "        seismic::BackendName::{variant} => Ok(0u64),");
         }
     }
-    if natives.len() < BACKENDS.len() {
+    if natives.len() < BackendName::ALL.len() {
         out.push_str("        _ => Err(seismic::ContractError::NoImplementation(backend)),\n");
     }
     out.push_str("      }\n");
