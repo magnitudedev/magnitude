@@ -41,7 +41,7 @@ use std::path::Path;
 /// alone. DeepSeek V4.1 Flash is disabled for users until it passes on real
 /// text, but its loads plan on every backend, so a call outside a
 /// declaration's domain at its shapes fails here, not at a device's load.
-const REQUIRED: [&str; 2] = ["qwen3.8-flash-next:gguf:q4", "deepseek-v4.1-flash:gguf:mxfp4"];
+const REQUIRED: [&str; 2] = ["qwen3.8-flash-next:gguf:q6", "deepseek-v4.1-flash:gguf:mxfp4"];
 
 /// Whether the catalog serves a model: its support level
 /// (`catalog/models.json`) is neither disabled nor deprecated.
