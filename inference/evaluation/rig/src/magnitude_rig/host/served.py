@@ -129,16 +129,31 @@ class Service:
     def __init__(self, run: "Run", name: str, bounds: tuple[str, ...], environment: dict[str, str] | None = None) -> None:
         self.run, self.name = run, name
         self.log_path = run.directory / f"service-{name}.log"
+        self._ended = False
         self.output = self.log_path.open("w")
-        self.process = subprocess.Popen(
-            [str(run.installed), "serve", "--bind", "127.0.0.1:0", "--exit-on-stdin-eof", "--model-store", str(run.models),
-             "--cache-root", str(run.cache), "--installation", str(run.installation), *bounds],
-            stdin=subprocess.PIPE, stdout=self.output, stderr=subprocess.STDOUT, start_new_session=True, env={**os.environ, "RUST_LOG": "info", **(environment or {})},
-        )
-        self.log = Log(self.log_path)
-        ready = self.log.wait("MAGNITUDE_ICN_READY", START_SECONDS, self.process)
-        self.origin = json.loads(ready.split("MAGNITUDE_ICN_READY ", 1)[1])["origin"]
-        self.log.offset = 0
+        try:
+            self.process = subprocess.Popen(
+                [str(run.installed), "serve", "--bind", "127.0.0.1:0", "--exit-on-stdin-eof", "--model-store", str(run.models),
+                 "--cache-root", str(run.cache), "--installation", str(run.installation), *bounds],
+                stdin=subprocess.PIPE, stdout=self.output, stderr=subprocess.STDOUT, start_new_session=True, env={**os.environ, "RUST_LOG": "info", **(environment or {})},
+            )
+        except BaseException:
+            self.output.close()
+            raise
+        try:
+            self.log = Log(self.log_path)
+            ready = self.log.wait("MAGNITUDE_ICN_READY", START_SECONDS, self.process)
+            self.origin = json.loads(ready.split("MAGNITUDE_ICN_READY ", 1)[1])["origin"]
+            self.log.offset = 0
+        except BaseException:
+            self.end()
+            raise
+
+    def __enter__(self) -> "Service":
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.end()
 
     def call(self, method: str, path: str, body: object = None, seconds: float = 60.0) -> object:
         data = None if body is None else json.dumps(body).encode()
@@ -262,12 +277,22 @@ class Service:
         return {"pieces": len(streamed), "ended": ended, "text": "".join(streamed)}
 
     def end(self) -> int | None:
-        self.process.stdin.close()
+        if self._ended:
+            return self.process.returncode
+        self._ended = True
         try:
-            return self.process.wait(30)
-        except subprocess.TimeoutExpired:
-            self.process.send_signal(signal.SIGKILL)
-            return self.process.wait(30)
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+            if self.process.poll() is not None:
+                return self.process.returncode
+            try:
+                return self.process.wait(30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                return self.process.wait(30)
         finally:
             self.output.close()
 
@@ -420,71 +445,71 @@ def settled(service: Service, run: Run, banked: bool) -> dict[str, str]:
 
 def lifecycle(run: Run) -> None:
     wanted = run.arguments.model
-    capped = Service(run, "capped", run.capped)
-    model = capped.model(wanted)
-    run.note("service up", origin=capped.origin)
-    # A load arriving during the job.
-    capped.log.wait("measurement attempting", START_SECONDS, capped.process)
-    run.note("job running, load requested")
-    join, loaded = in_thread(lambda: capped.load(model))
-    join()
-    if "error" in loaded:
-        raise Failed(f"cold load: {loaded['error']}")
-    run.note("load against the job", preempted="load preempts the job" in capped.log_path.read_text(errors="replace"))
-    instance = loaded["result"]
-    banked = streaming(instance) is not None
-    run.note("cold load ready", seconds=loaded["seconds"], streaming=json.dumps(streaming(instance))[:300])
-    first = capped.chat(model, run.messages)
-    run.note("no-cost answer", first=first["first_seconds"], decode_ms=first["decode_ms"], usage=first["usage"], finish=first["finish"], text=first["text"][:60])
-    log = capped.log_path.read_text(errors="replace")
-    (run.directory / "pricing-at-load.txt").write_text("\n".join(l for l in log.splitlines() if "experts are priced" in l or "CPU sites" in l))
-    # The job beside the idle load, and a request preempting it.
-    capped.log.mark()
-    capped.log.wait("measurement attempting", JOB_SECONDS, capped.process)
-    run.note("job beside the idle load")
-    during = capped.chat(model, run.messages)
-    run.note("answer during the job", first=during["first_seconds"], decode_ms=during["decode_ms"], same=during["text"] == first["text"])
-    # The job resumes when idle again; `Reprice` reaches the load.
-    capped.log.mark()
-    settled(capped, run, banked)
-    time.sleep(1)
-    third = capped.chat(model, run.messages)
-    status = streaming(capped.instances())
-    run.note("priced answer", first=third["first_seconds"], decode_ms=third["decode_ms"], same=third["text"] == first["text"], streaming=json.dumps(status)[:300])
-    other = capped.chat(model, run.other)
-    run.note("priced answer to another prompt", first=other["first_seconds"], decode_ms=other["decode_ms"])
-    fourth = capped.chat(model, run.messages)
-    run.note("priced answer repeated", first=fourth["first_seconds"], decode_ms=fourth["decode_ms"], same=fourth["text"] == first["text"])
-    run.record["answers"] = {"no_cost": first, "repeated": fourth}
-    # Stopped first: its worker reports its streaming terms as it ends.
-    capped.log.mark()
-    capped.stop(instance)
-    capped.log.wait("model residency terminalized", 60, capped.process)
-    run.note("capped service ended", code=capped.end())
+    with Service(run, "capped", run.capped) as capped:
+        model = capped.model(wanted)
+        run.note("service up", origin=capped.origin)
+        # A load arriving during the job.
+        capped.log.wait("measurement attempting", START_SECONDS, capped.process)
+        run.note("job running, load requested")
+        join, loaded = in_thread(lambda: capped.load(model))
+        join()
+        if "error" in loaded:
+            raise Failed(f"cold load: {loaded['error']}")
+        run.note("load against the job", preempted="load preempts the job" in capped.log_path.read_text(errors="replace"))
+        instance = loaded["result"]
+        banked = streaming(instance) is not None
+        run.note("cold load ready", seconds=loaded["seconds"], streaming=json.dumps(streaming(instance))[:300])
+        first = capped.chat(model, run.messages)
+        run.note("no-cost answer", first=first["first_seconds"], decode_ms=first["decode_ms"], usage=first["usage"], finish=first["finish"], text=first["text"][:60])
+        log = capped.log_path.read_text(errors="replace")
+        (run.directory / "pricing-at-load.txt").write_text("\n".join(l for l in log.splitlines() if "experts are priced" in l or "CPU sites" in l))
+        # The job beside the idle load, and a request preempting it.
+        capped.log.mark()
+        capped.log.wait("measurement attempting", JOB_SECONDS, capped.process)
+        run.note("job beside the idle load")
+        during = capped.chat(model, run.messages)
+        run.note("answer during the job", first=during["first_seconds"], decode_ms=during["decode_ms"], same=during["text"] == first["text"])
+        # The job resumes when idle again; `Reprice` reaches the load.
+        capped.log.mark()
+        settled(capped, run, banked)
+        time.sleep(1)
+        third = capped.chat(model, run.messages)
+        status = streaming(capped.instances())
+        run.note("priced answer", first=third["first_seconds"], decode_ms=third["decode_ms"], same=third["text"] == first["text"], streaming=json.dumps(status)[:300])
+        other = capped.chat(model, run.other)
+        run.note("priced answer to another prompt", first=other["first_seconds"], decode_ms=other["decode_ms"])
+        fourth = capped.chat(model, run.messages)
+        run.note("priced answer repeated", first=fourth["first_seconds"], decode_ms=fourth["decode_ms"], same=fourth["text"] == first["text"])
+        run.record["lifecycle_answers"] = {"no_cost": first, "repeated": fourth}
+        # Stopped first: its worker reports its streaming terms as it ends.
+        capped.log.mark()
+        capped.stop(instance)
+        capped.log.wait("model residency terminalized", 60, capped.process)
+        run.note("capped service ended", code=capped.end())
     # A new service reads what the job stored.
-    second = Service(run, "second", run.capped)
-    started = time.monotonic()
-    second.model(wanted)
-    instance = second.load(model)
-    loaded = time.monotonic() - started
-    pricing = priced(second.log.wait("the experts are priced", 5, second.process)) if banked else {}
-    run.note("second load ready", seconds=round(loaded, 2), **pricing)
-    answer = second.chat(model, run.messages)
-    run.note("second load's answer", first=answer["first_seconds"], decode_ms=answer["decode_ms"], same=answer["text"] == first["text"])
-    second_other = second.chat(model, run.other)
-    run.note("second load's other answer", first=second_other["first_seconds"], decode_ms=second_other["decode_ms"], same=second_other["text"] == other["text"])
-    run.note("second service ended", code=second.end())
+    with Service(run, "second", run.capped) as second:
+        started = time.monotonic()
+        second.model(wanted)
+        instance = second.load(model)
+        loaded = time.monotonic() - started
+        pricing = priced(second.log.wait("the experts are priced", 5, second.process)) if banked else {}
+        run.note("second load ready", seconds=round(loaded, 2), **pricing)
+        answer = second.chat(model, run.messages)
+        run.note("second load's answer", first=answer["first_seconds"], decode_ms=answer["decode_ms"], same=answer["text"] == first["text"])
+        second_other = second.chat(model, run.other)
+        run.note("second load's other answer", first=second_other["first_seconds"], decode_ms=second_other["decode_ms"], same=second_other["text"] == other["text"])
+        run.note("second service ended", code=second.end())
     # The reference.
-    resident = Service(run, "resident", run.resident)
-    resident.model(wanted)
-    resident.load(model)
-    reference = resident.chat(model, run.messages)
-    resident_other = resident.chat(model, run.other)
-    run.note("resident answer", first=reference["first_seconds"], decode_ms=reference["decode_ms"], same=reference["text"] == first["text"], text=reference["text"][:60])
-    run.note("resident service ended", code=resident.end())
+    with Service(run, "resident", run.resident) as resident:
+        resident.model(wanted)
+        resident.load(model)
+        reference = resident.chat(model, run.messages)
+        resident_other = resident.chat(model, run.other)
+        run.note("resident answer", first=reference["first_seconds"], decode_ms=reference["decode_ms"], same=reference["text"] == first["text"], text=reference["text"][:60])
+        run.note("resident service ended", code=resident.end())
     reference_other = resident_other
-    run.record["answers"] = {"no_cost": first, "during": during, "priced": third, "second": answer, "resident": reference,
-                             "repeated": fourth, "other": other, "second_other": second_other, "resident_other": reference_other}
+    run.record["lifecycle_answers"] = {"no_cost": first, "during": during, "priced": third, "second": answer, "resident": reference,
+                                       "repeated": fourth, "other": other, "second_other": second_other, "resident_other": reference_other}
     # Paths that compute the same features in other arithmetic may part from the resident answer
     # at a near tie, so a parting is reported, never failed: each answer is judged token by token
     # against the model's own distributions (`instruments/served.py`).
@@ -529,33 +554,33 @@ def stop_prepare(run: Run) -> None:
     """A stop during a cold load's Prepare with a second load queued behind it: the stopped load
     starts no worker past the stop, the queued load loads and answers, and at no moment do two
     inference workers run."""
-    service = Service(run, "stop-prepare", run.capped)
-    model = service.model(run.arguments.model)
-    first, cold = in_thread(lambda: service.load(model))
-    end = time.monotonic() + LOAD_SECONDS
-    while '"optimizing"' not in (state := json.dumps(service.instances())):
-        if time.monotonic() > end or "result" in cold or "error" in cold:
-            raise Failed(f"the cold load never prepared: {state[:400]}")
-        time.sleep(0.05)
-    (instance,) = [item for item in service.instances()["instances"] if "loading" in json.dumps(item).lower()]
-    run.note("cold load preparing, stopping it", instance=instance["id"])
-    stopped, stop_result = in_thread(lambda: service.stop(instance))
-    end = time.monotonic() + STOPPING_SECONDS
-    while '"stopping"' not in (state := json.dumps(service.instances()).lower()) and "result" not in stop_result:
-        if time.monotonic() > end or "error" in stop_result:
-            raise Failed(f"the stopped load never showed stopping in {STOPPING_SECONDS:.0f} s: "
-                         f"{stop_result.get('error', state[:400])}")
-        time.sleep(0.01)
-    queued, next_load = in_thread(lambda: service.load(model))
-    stopped()
-    first()
-    queued()
-    run.note("stopped load ended", ended=cold.get("error", "loaded")[:200], stop=stop_result.get("error", "stopped")[:200])
-    if "error" in next_load:
-        raise Failed(f"the load queued behind the stop: {next_load['error']}")
-    answer = service.chat(model, run.messages)
-    run.note("queued load's answer", seconds=answer["seconds"], text=answer["text"][:60])
-    run.note("service ended", code=service.end())
+    with Service(run, "stop-prepare", run.capped) as service:
+        model = service.model(run.arguments.model)
+        first, cold = in_thread(lambda: service.load(model))
+        end = time.monotonic() + LOAD_SECONDS
+        while '"optimizing"' not in (state := json.dumps(service.instances())):
+            if time.monotonic() > end or "result" in cold or "error" in cold:
+                raise Failed(f"the cold load never prepared: {state[:400]}")
+            time.sleep(0.05)
+        (instance,) = [item for item in service.instances()["instances"] if "loading" in json.dumps(item).lower()]
+        run.note("cold load preparing, stopping it", instance=instance["id"])
+        stopped, stop_result = in_thread(lambda: service.stop(instance))
+        end = time.monotonic() + STOPPING_SECONDS
+        while '"stopping"' not in (state := json.dumps(service.instances()).lower()) and "result" not in stop_result:
+            if time.monotonic() > end or "error" in stop_result:
+                raise Failed(f"the stopped load never showed stopping in {STOPPING_SECONDS:.0f} s: "
+                             f"{stop_result.get('error', state[:400])}")
+            time.sleep(0.01)
+        queued, next_load = in_thread(lambda: service.load(model))
+        stopped()
+        first()
+        queued()
+        run.note("stopped load ended", ended=cold.get("error", "loaded")[:200], stop=stop_result.get("error", "stopped")[:200])
+        if "error" in next_load:
+            raise Failed(f"the load queued behind the stop: {next_load['error']}")
+        answer = service.chat(model, run.messages)
+        run.note("queued load's answer", seconds=answer["seconds"], text=answer["text"][:60])
+        run.note("service ended", code=service.end())
     most = most_workers(service.log_path.read_text(errors="replace"))
     run.note("workers", most_at_once=most)
     if most == 0:
@@ -566,22 +591,22 @@ def stop_prepare(run: Run) -> None:
 
 def stop(run: Run) -> None:
     wanted = run.arguments.model
-    service = Service(run, "stop", run.capped)
-    model = service.model(wanted)
-    # Past the job's first run, so a job starts beside the load, and stop the load under it.
-    instance = service.load(model)
-    run.note("load ready", streaming=json.dumps(streaming(instance))[:200])
-    service.log.mark()
-    service.log.wait("measurement attempting", JOB_SECONDS, service.process)
-    run.note("job beside the load, stopping it")
-    service.stop(instance)
-    ended = service.log.wait("measurement job ended", 30, service.process)
-    run.note("job ended", line=ended[-60:])
-    instance = service.load(model)
-    run.note("next load ready", instance=instance["id"])
-    answer = service.chat(model, run.messages)
-    run.note("its answer", seconds=answer["seconds"], text=answer["text"][:60])
-    run.note("service ended", code=service.end())
+    with Service(run, "stop", run.capped) as service:
+        model = service.model(wanted)
+        # Past the job's first run, so a job starts beside the load, and stop the load under it.
+        instance = service.load(model)
+        run.note("load ready", streaming=json.dumps(streaming(instance))[:200])
+        service.log.mark()
+        service.log.wait("measurement attempting", JOB_SECONDS, service.process)
+        run.note("job beside the load, stopping it")
+        service.stop(instance)
+        ended = service.log.wait("measurement job ended", 30, service.process)
+        run.note("job ended", line=ended[-60:])
+        instance = service.load(model)
+        run.note("next load ready", instance=instance["id"])
+        answer = service.chat(model, run.messages)
+        run.note("its answer", seconds=answer["seconds"], text=answer["text"][:60])
+        run.note("service ended", code=service.end())
 
 
 def failure(run: Run) -> None:
@@ -594,71 +619,71 @@ def failure(run: Run) -> None:
     subprocess.check_call(["cc", "-shared", "-fPIC", "-o", str(shim), str(source), *(() if sys.platform == "darwin" else ("-ldl",))])
     trigger = run.scratch / "fail"
     environment = {PRELOAD: str(shim), "MAGNITUDE_FAILED_READS": f"{size // 2},{size // 2 + FAILED_BYTES},{trigger}"}
-    service = Service(run, "failure", run.capped, environment)
-    model = service.model(run.arguments.model)
-    instance = service.load(model)
-    run.note("load ready", streaming=json.dumps(streaming(instance))[:200])
-    before = service.chat(model, run.messages)
-    run.note("answer before", seconds=before["seconds"], text=before["text"][:60])
-    gates = threading.Event(), threading.Event()
-    first, one = in_thread(lambda: service.stream(model, run.messages, gates[0]))
-    second, two = in_thread(lambda: service.stream(model, run.other, gates[1]))
-    gates[0].wait(120)
-    gates[1].wait(120)
-    trigger.touch()
-    run.note("reads failing", first_bytes=size // 2, last_bytes=size // 2 + FAILED_BYTES)
-    first()
-    second()
-    trigger.unlink()
-    for name, ended in (("first", one), ("second", two)):
-        result = ended.get("result", ended)
-        run.note(f"{name} answer ended", pieces=result.get("pieces"), ended=result.get("ended") or ended.get("error"))
-    run.note("instances", state=json.dumps(service.instances())[:300])
-    after = service.chat(model, run.messages)
-    run.note("answer after", seconds=after["seconds"], parted_at=parted(after, before))
-    run.note("service ended", code=service.end())
+    with Service(run, "failure", run.capped, environment) as service:
+        model = service.model(run.arguments.model)
+        instance = service.load(model)
+        run.note("load ready", streaming=json.dumps(streaming(instance))[:200])
+        before = service.chat(model, run.messages)
+        run.note("answer before", seconds=before["seconds"], text=before["text"][:60])
+        gates = threading.Event(), threading.Event()
+        first, one = in_thread(lambda: service.stream(model, run.messages, gates[0]))
+        second, two = in_thread(lambda: service.stream(model, run.other, gates[1]))
+        gates[0].wait(120)
+        gates[1].wait(120)
+        trigger.touch()
+        run.note("reads failing", first_bytes=size // 2, last_bytes=size // 2 + FAILED_BYTES)
+        first()
+        second()
+        trigger.unlink()
+        for name, ended in (("first", one), ("second", two)):
+            result = ended.get("result", ended)
+            run.note(f"{name} answer ended", pieces=result.get("pieces"), ended=result.get("ended") or ended.get("error"))
+        run.note("instances", state=json.dumps(service.instances())[:300])
+        after = service.chat(model, run.messages)
+        run.note("answer after", seconds=after["seconds"], parted_at=parted(after, before))
+        run.note("service ended", code=service.end())
 
 
 def repeat(run: Run) -> None:
     """One load answering two prompts in turn: where each answer to a prompt parts from its
     first, reported; each is judged as every answer is (`instruments/served.py`)."""
-    service = Service(run, "repeat", run.capped)
-    model = service.model(run.arguments.model)
-    service.load(model)
-    first = [service.chat(model, run.messages), service.chat(model, run.other)]
-    run.note("first answers", decode_ms=[answer["decode_ms"] for answer in first], prefill=[answer["first_seconds"] for answer in first])
-    parts = []
-    for turn in range(REPEATS):
-        which = turn % 2
-        answer = service.chat(model, (run.messages, run.other)[which])
-        at = parted(answer, first[which])
-        run.note("answer", prompt=which, decode_ms=answer["decode_ms"], prefill=answer["first_seconds"], parted_at=at)
-        if at is not None:
-            parts.append({"turn": turn, "at": at, "answer": answer["pieces"], "first": first[which]["pieces"]})
-    run.record["parted"] = parts
-    run.note("service ended", code=service.end())
+    with Service(run, "repeat", run.capped) as service:
+        model = service.model(run.arguments.model)
+        service.load(model)
+        first = [service.chat(model, run.messages), service.chat(model, run.other)]
+        run.note("first answers", decode_ms=[answer["decode_ms"] for answer in first], prefill=[answer["first_seconds"] for answer in first])
+        parts = []
+        for turn in range(REPEATS):
+            which = turn % 2
+            answer = service.chat(model, (run.messages, run.other)[which])
+            at = parted(answer, first[which])
+            run.note("answer", prompt=which, decode_ms=answer["decode_ms"], prefill=answer["first_seconds"], parted_at=at)
+            if at is not None:
+                parts.append({"turn": turn, "at": at, "answer": answer["pieces"], "first": first[which]["pieces"]})
+        run.record["parted"] = parts
+        run.note("service ended", code=service.end())
 
 
 def turns(run: Run) -> None:
     """A conversation's next turn on a load that drafts: its first answer is cancelled past the
     depth a stopped request is retained at, and the next turn, the conversation with that answer
     and one more question, resumes the prefix the first decoded and answers whole."""
-    service = Service(run, "turns", run.capped)
-    model = service.model(run.arguments.model)
-    instance = service.load(model)
-    run.note("load ready", streaming=json.dumps(streaming(instance))[:300])
-    first = service.cancelled(model, run.messages, TURN_PIECES)
-    run.note("first turn cancelled", pieces=first["pieces"], ended=first["ended"], text=first["text"][:60])
-    if first["ended"] or first["pieces"] < TURN_PIECES:
-        raise Failed(f"the first turn ended ({first['ended']}) at {first['pieces']} pieces, before its cancel")
-    following = {**run.messages, "messages": [*run.messages["messages"], {"role": "assistant", "content": first["text"]},
-                                              {"role": "user", "content": "Go on."}]}
-    second = service.chat(model, following)
-    run.note("second turn", finish=second["finish"], usage=second["usage"], first=second["first_seconds"],
-             decode_ms=second["decode_ms"], text=second["text"][:60])
-    if second["finish"] not in ("stop", "length") or not second["pieces"]:
-        raise Failed(f"the second turn ended {second['finish']} after {len(second['pieces'])} pieces")
-    run.note("service ended", code=service.end())
+    with Service(run, "turns", run.capped) as service:
+        model = service.model(run.arguments.model)
+        instance = service.load(model)
+        run.note("load ready", streaming=json.dumps(streaming(instance))[:300])
+        first = service.cancelled(model, run.messages, TURN_PIECES)
+        run.note("first turn cancelled", pieces=first["pieces"], ended=first["ended"], text=first["text"][:60])
+        if first["ended"] or first["pieces"] < TURN_PIECES:
+            raise Failed(f"the first turn ended ({first['ended']}) at {first['pieces']} pieces, before its cancel")
+        following = {**run.messages, "messages": [*run.messages["messages"], {"role": "assistant", "content": first["text"]},
+                                                  {"role": "user", "content": "Go on."}]}
+        second = service.chat(model, following)
+        run.note("second turn", finish=second["finish"], usage=second["usage"], first=second["first_seconds"],
+                 decode_ms=second["decode_ms"], text=second["text"][:60])
+        if second["finish"] not in ("stop", "length") or not second["pieces"]:
+            raise Failed(f"the second turn ended {second['finish']} after {len(second['pieces'])} pieces")
+        run.note("service ended", code=service.end())
 
 
 def prompts(template: Path, rendered: Path, output: Path) -> None:

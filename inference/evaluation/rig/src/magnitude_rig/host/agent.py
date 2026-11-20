@@ -728,21 +728,21 @@ class Session:
         self.rig.guarded(take)
 
     def end_outputs(self) -> list:
-        """Release every output the session holds and remove each no other live run holds: moved
-        aside under the guard, removed outside it. The outputs removed."""
+        """Release every output the session holds and remove each no other live run holds:
+        withdrawal and move-aside happen in one guarded transaction, removal outside the guard.
+        The outputs removed."""
         trash = os.path.join(self.rig.directory, TRASH)
         removed = []
         for kind in [kind for kind in self.entries if kind.startswith("output:")]:
-            self.release(kind)
             key = kind.split(":", 1)[1]
 
-            def unheld():
+            def release_and_discard():
+                self._withdraw(kind)
                 if kind in {e["kind"] for e in self.rig.live()}:
                     return False
-                _discard_output(self.rig.root, trash, key)
-                return True
+                return _discard_output(self.rig.root, trash, key)
 
-            if self.rig.guarded(unheld):
+            if self.rig.guarded(release_and_discard):
                 removed.append(key)
         for name in _directories(trash):
             _remove_tree(os.path.join(trash, name))
@@ -786,24 +786,24 @@ class Session:
 
         return self.rig.guarded(judge)
 
-    def release(self, kind: str) -> None:
-        def withdraw():
-            entry = self.entries.pop(kind, None)
-            if entry is None:
-                return
-            path, lock = entry
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
-            lock.close()
-            self.held.discard(kind)
-            self._account()
-            if self.device is not None and not self.held.intersection(DEVICE_KINDS):
-                self.device.close()
-                self.device = None
+    def _withdraw(self, kind: str) -> None:
+        entry = self.entries.pop(kind, None)
+        if entry is None:
+            return
+        path, lock = entry
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        lock.close()
+        self.held.discard(kind)
+        self._account()
+        if self.device is not None and not self.held.intersection(DEVICE_KINDS):
+            self.device.close()
+            self.device = None
 
-        self.rig.guarded(withdraw)
+    def release(self, kind: str) -> None:
+        self.rig.guarded(lambda: self._withdraw(kind))
 
     def release_all(self) -> None:
         for kind in list(self.entries):
@@ -811,17 +811,22 @@ class Session:
 
     def evict(self, keep: str) -> dict:
         base = os.path.join(self.rig.root, "checkouts")
+        trash = os.path.join(self.rig.directory, TRASH)
         # Each building checkout's bytes, measured outside the guard as `built` measures them
         # (a large target takes seconds, and every hold and status waits on the guard); under
         # it, only which checkouts are held is read again, and one held meanwhile is measured.
+        # Evicted directories are moved into `trash` under the guard and removed outside it,
+        # re-checking `room_free` after each removal so `guard.lock` is never held across rmtree.
         sizes = {}
+        removed = []
+        before = room_free(self.rig.root)
 
-        def act():
+        def step():
             live = self.rig.live()
             held = held_checkouts(live)
             if (held | {keep}) - set(sizes):
-                return None
-            before = room_free(self.rig.root)
+                return ("measure", None)
+            free = room_free(self.rig.root)
             fallback = largest(self.rig.directory)
             entries = checkout_entries(live)
 
@@ -839,23 +844,32 @@ class Session:
             building = {key for key, runs in holders.items() if key not in mine and not runs <= later}
             others = {key: runs for key, runs in holders.items() if key in building and not runs & later}
             needed = sum(growth(key) for key in mine | building)
-            removed = _remove_least_recent(self.rig.root, live, {keep}, needed)
-            return {
+            if free < needed:
+                moved = _move_least_recent(self.rig.root, live, trash, {keep})
+                if moved is not None:
+                    return ("moved", moved)
+            return ("done", {
                 "removed": removed,
-                "free_bytes": room_free(self.rig.root),
-                "freed_bytes": room_free(self.rig.root) - before,
+                "free_bytes": free,
+                "freed_bytes": free - before,
                 "needed_bytes": needed,
                 "own_bytes": sum(growth(key) for key in own),
                 "releasable_bytes": sum(sizes[key] for key in others),
                 "releasing": sorted(set().union(*others.values())),
-            }
+            })
 
+        for name in _directories(trash):
+            _remove_tree(os.path.join(trash, name))
         while True:
             for key in (self.rig.guarded(lambda: held_checkouts(self.rig.live())) | {keep}) - set(sizes):
                 sizes[key] = checkout_bytes(os.path.join(base, key))
-            evicted = self.rig.guarded(act)
-            if evicted is not None:
-                return evicted
+            status, payload = self.rig.guarded(step)
+            if status == "done":
+                return payload
+            if status == "moved":
+                kind, name, aside = payload
+                _remove_tree(aside)
+                removed.append("%s/%s" % (kind, name))
 
     def reclaim(self) -> dict:
         """After a build: remove the checkouts no live run holds, least recently used first,
@@ -882,21 +896,25 @@ class Session:
                 _remove_tree(os.path.join(trash, name))
             if sum(sizes.values()) <= budget:
                 break
-            moved = self.rig.guarded(lambda: _move_least_recent(root, self.rig.live(), trash))
+            moved = self.rig.guarded(lambda: _move_least_recent(root, self.rig.live(), trash, checkouts_only=True))
             if moved is None:
                 break
-            name, aside = moved
+            _, name, aside = moved
             # One made since `sizes` was taken is measured where it was moved.
             freed += sizes.pop(name) if name in sizes else checkout_bytes(aside)
             removed.append("checkouts/" + name)
         return {"removed": removed, "freed_bytes": freed}
 
 
-def _discard_output(root: str, trash: str, key: str) -> None:
-    """Move build output `key` into `trash`, removed from there outside the guard. Call guarded."""
+def _discard_output(root: str, trash: str, key: str) -> bool:
+    """Move build output `key` into `trash`, removed from there outside the guard. Call guarded.
+    Returns whether the output directory existed and was moved."""
+    source = os.path.join(root, OUTPUTS, key)
+    if not os.path.exists(source):
+        return False
     os.makedirs(trash, exist_ok=True)
-    os.rename(os.path.join(root, OUTPUTS, key),
-              os.path.join(trash, "output-%s-%d-%d" % (key, os.getpid(), time.time_ns())))
+    os.rename(source, os.path.join(trash, "output-%s-%d-%d" % (key, os.getpid(), time.time_ns())))
+    return True
 
 
 def _link_tree(origin: str, destination: str) -> None:
@@ -935,7 +953,7 @@ def _remove_tree(path: str) -> None:
 
 def _least_recent(root: str, live: list, keep: set) -> list:
     """What a run whose checkouts are `keep` may evict, the one owner of it (its eviction,
-    `_remove_least_recent`, and the room placement counts it to find, `room`): the checkouts
+    `_move_least_recent`, and the room placement counts it to find, `room`): the checkouts
     no live run holds, but its own, and the directories of gone runs, never an ended one not
     yet fetched, least recently used first: each as `(kind, name)`. Call guarded."""
     base, runs = os.path.join(root, "checkouts"), os.path.join(root, "runs")
@@ -964,27 +982,16 @@ def _unheld_outputs(root: str, live: list) -> list:
     return [key for key in _directories(os.path.join(root, OUTPUTS)) if key not in held]
 
 
-def _remove_least_recent(root: str, live: list, keep: set, wanted: float) -> list:
-    """Remove the least recently used of `_least_recent` until the volume has `wanted` bytes
-    free beyond its floor (`room_free`): the paths removed, relative to the root. Call guarded."""
-    removed = []
-    for kind, name in _least_recent(root, live, keep):
-        if room_free(root) >= wanted:
-            break
-        _remove_tree(os.path.join(root, kind, name))
-        removed.append("%s/%s" % (kind, name))
-    return removed
-
-
-def _move_least_recent(root: str, live: list, trash: str):
-    """Move the least recently used checkout no live run holds into `trash` (no run takes it
-    from there): its name and where it was moved, or None when there is none. Call guarded."""
-    for kind, name in _least_recent(root, live, set()):
-        if kind == "checkouts":
-            os.makedirs(trash, exist_ok=True)
-            aside = os.path.join(trash, "%s-%d-%d" % (name, os.getpid(), time.time_ns()))
-            os.rename(os.path.join(root, kind, name), aside)
-            return name, aside
+def _move_least_recent(root: str, live: list, trash: str, keep: set | None = None, *, checkouts_only: bool = False):
+    """Move the least recently used evictable entry (`_least_recent`) into `trash` (no run takes
+    it from there): `(kind, name, aside)`, or None when there is none. Call guarded."""
+    for kind, name in _least_recent(root, live, keep or set()):
+        if checkouts_only and kind != "checkouts":
+            continue
+        os.makedirs(trash, exist_ok=True)
+        aside = os.path.join(trash, "%s-%s-%d-%d" % (kind, name, os.getpid(), time.time_ns()))
+        os.rename(os.path.join(root, kind, name), aside)
+        return kind, name, aside
     return None
 
 
@@ -1753,8 +1760,8 @@ class Runner:
                     {"kind": "disk", "run": run, "state": "held"} for run in reported])
             self.session.release("install")
             runs = lambda: self.rig.guarded(lambda: {e["run"] for e in self.rig.live()})
-            live = runs()
-            while live <= runs():  # until one of them ends: what frees room
+            releasing = set(evicted["releasing"])
+            while releasing and releasing <= runs():  # until one of them ends: what frees room
                 self._check_stop()
                 time.sleep(POLL_SECONDS)
             self.hold("install")
@@ -1905,10 +1912,15 @@ class Runner:
                 failed["moved"] = True
         except Exception as error:  # the run's end is recorded whatever ends it
             failed = {"phase": self.events.phase, "detail": "agent: %s" % _fault(error)}
-        if self.child is not None and not self.child.finished.is_set():
-            self.child.kill()
-        self.session.end_outputs()
-        self.session.release_all()
+        try:
+            if self.child is not None and not self.child.finished.is_set():
+                self.child.kill()
+            self.session.end_outputs()
+        except Exception as error:
+            if failed is None:
+                failed = {"phase": self.events.phase, "detail": "agent: %s" % _fault(error)}
+        finally:
+            self.session.release_all()
         self.phases.append({"phase": self.events.phase,
                             "seconds": round(time.monotonic() - self._phase_started, 3)})
         ended = {"codes": self.codes, "phases": self.phases, "failed": failed}
