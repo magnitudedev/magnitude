@@ -44,10 +44,31 @@ extern "C" __global__ void indexer_keys(SEISMIC_KERNEL_PARAMS) {
         reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_LATENT_ROWS))[row * SEISMIC_LATENT_ROWS_STRIDE_0];
     if (destination < 0) return;
     const element::u8 *key = SEISMIC_PTR(SEISMIC_BUFFER_KEY);
+    const u64 key_row_offset = row * SEISMIC_KEY_STRIDE_0;
     float x[E];
+    if constexpr (E % 4 == 0) {
+        const element::u8 *key_row = key + key_row_offset * Act::bytes;
+        if (SEISMIC_KEY_STRIDE_1 == 1ull &&
+            (reinterpret_cast<u64>(key_row) & (4ull * Act::bytes - 1ull)) == 0ull) {
 #pragma unroll
-    for (int i = 0; i < E; ++i)
-        x[i] = element::at<Act>(key, row * SEISMIC_KEY_STRIDE_0 + static_cast<u64>(lane * E + i) * SEISMIC_KEY_STRIDE_1);
+            for (int i = 0; i < E; i += 4) {
+                float chunk[4];
+                element::span<Act, 4, true>(key_row, static_cast<u64>(lane * E + i), chunk);
+                x[i + 0] = chunk[0];
+                x[i + 1] = chunk[1];
+                x[i + 2] = chunk[2];
+                x[i + 3] = chunk[3];
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < E; ++i)
+                x[i] = element::at<Act>(key, key_row_offset + static_cast<u64>(lane * E + i) * SEISMIC_KEY_STRIDE_1);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < E; ++i)
+            x[i] = element::at<Act>(key, key_row_offset + static_cast<u64>(lane * E + i) * SEISMIC_KEY_STRIDE_1);
+    }
     // A rounded key is rounded from its norm and rotation held in A.
     const rounding::Rounding trained = rounding::of(SEISMIC_PARAM_BLOCK, SEISMIC_PARAM_ELEMENT, SEISMIC_PARAM_SCALE,
                                                    SEISMIC_PARAM_AMAX_FLOOR);
@@ -62,6 +83,15 @@ extern "C" __global__ void indexer_keys(SEISMIC_KERNEL_PARAMS) {
     rounding::round_lanes<E>(x, trained);
     const element::Out<element::F32> target =
         SEISMIC_OUT_KEYS.row(static_cast<u64>(destination), SEISMIC_PARAM_SLAB_ROWS, W);
+    if constexpr (E % 4 == 0) {
+        if ((reinterpret_cast<u64>(target.stored(0)) & 15ull) == 0ull) {
+            target.put_span<E>(static_cast<u64>(lane * E), x);
+        } else {
 #pragma unroll
-    for (int i = 0; i < E; ++i) target.put(lane * E + i, x[i]);
+            for (int i = 0; i < E; ++i) target.put(lane * E + i, x[i]);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < E; ++i) target.put(lane * E + i, x[i]);
+    }
 }

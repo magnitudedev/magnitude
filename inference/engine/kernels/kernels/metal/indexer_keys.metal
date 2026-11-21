@@ -43,8 +43,23 @@ kernel void indexer_keys(
     if (destination < 0)
         return;
     float x[KEYS_E];
-    for (uint i = 0; i < KEYS_E; ++i)
-        x[i] = float(key[row * KEYS_W + lane * KEYS_E + i]);
+    const ulong key_offset = row * KEYS_W + ulong(lane * KEYS_E);
+    if constexpr (KEYS_E % 4 == 0) {
+        device const activation::Act::storage *key_base =
+            reinterpret_cast<device const activation::Act::storage *>(key) + key_offset;
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < KEYS_E; i += 4) {
+            const float4 v = activation::Act::load4(key_base + i);
+            x[i + 0] = v.x;
+            x[i + 1] = v.y;
+            x[i + 2] = v.z;
+            x[i + 3] = v.w;
+        }
+    } else {
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < KEYS_E; ++i)
+            x[i] = float(key[key_offset + i]);
+    }
     // A rounded key is rounded from its norm and rotation held in A.
     const rounding::Rounding trained = rounding::of(uint(SEISMIC_PARAM_BLOCK), uint(SEISMIC_PARAM_ELEMENT),
         uint(SEISMIC_PARAM_SCALE), uint(SEISMIC_PARAM_AMAX_FLOOR));
@@ -57,6 +72,13 @@ kernel void indexer_keys(
     rounding::round_lanes<KEYS_E>(x, trained);
     const element::Out<element::F32> target = slab::out_row(keys, ulong(destination), ulong(SEISMIC_PARAM_SLAB_ROWS),
         KEYS_W);
-    for (uint i = 0; i < KEYS_E; ++i)
-        target.put(lane * KEYS_E + i, x[i]);
+    if constexpr (KEYS_E % 4 == 0) {
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < KEYS_E; i += 4)
+            target.put4(ulong(lane * KEYS_E + i), float4(x[i + 0], x[i + 1], x[i + 2], x[i + 3]));
+    } else {
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < KEYS_E; ++i)
+            target.put(lane * KEYS_E + i, x[i]);
+    }
 }
