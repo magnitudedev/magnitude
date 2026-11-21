@@ -376,8 +376,156 @@ fn indexer_scores_head_tiled_wide_shape_equal_the_reference_scores() {
     check_with(
         &Case::with_shape(2, 64, 64, 128, 256, true, 12),
         "wide w512 h64 deepseek",
-        |b| matches!(b, BackendName::Metal | BackendName::Cpu),
+        |b| matches!(b, BackendName::Metal | BackendName::Cuda | BackendName::Cpu),
     );
+}
+
+fn check_cuda_wide_shape(
+    device: &seismic::Device,
+    h: usize,
+    p: usize,
+    s: usize,
+    rows: usize,
+    n: usize,
+    deepseek: bool,
+    pooled: bool,
+    seed: u64,
+    label: &str,
+) {
+    let w = 2 * p + s;
+    let mut random = Random(seed);
+    let (layout, rounding) = if deepseek { (DEEPSEEK, INDEX) } else { (HALF_SPLIT, NONE) };
+    let weighted = deepseek;
+    let normed = !deepseek;
+    let hw = if weighted { h } else { 0 };
+    let nq = usize::from(normed);
+    let freqs: Vec<f32> = (0..p).map(|pair| 160_000f32.powf(-(2.0 * pair as f32) / (2.0 * p as f32))).collect();
+    let query: Vec<f32> = (0..rows * h * w).map(|_| bf16_round(random.next() * 3.0)).collect();
+    let query_norm: Vec<f32> = (0..w).map(|_| 1.0 + 0.5 * random.next()).collect();
+    let head_weights: Vec<f32> = (0..rows * h).map(|_| bf16_round(random.next())).collect();
+    let lists: Vec<Vec<[i32; 2]>> = (0..rows)
+        .map(|row| {
+            let count = n.saturating_sub(7 * row).max(1);
+            if pooled { pool_spans(count, seed * 17 + row as u64) } else { scattered_spans(count, seed * 31 + row as u64) }
+        })
+        .collect();
+    let positions: Vec<usize> = (0..rows).map(|row| 2 * n + row).collect();
+    let plane_rows = lists.iter().flatten().map(|span| span[1]).max().unwrap() as usize + 1;
+    let keys: Vec<f32> = (0..plane_rows)
+        .flat_map(|_| {
+            let row = (0..w).map(|_| random.next()).collect::<Vec<_>>();
+            rounding_model::round(rounding, &row)
+        })
+        .collect();
+    let scale = 1.0 / ((w * h) as f32).sqrt();
+
+    let mut expected = vec![f32::NEG_INFINITY; rows * n];
+    let mut terms = vec![0.0f32; rows * n];
+    for row in 0..rows {
+        let q: Vec<Vec<f32>> = (0..h)
+            .map(|head| {
+                let mut y = query[(row * h + head) * w..][..w].to_vec();
+                let hold = |vals: &mut [f32]| {
+                    if rounding.block != 0 {
+                        vals.iter_mut().for_each(|v| *v = bf16_round(*v));
+                    }
+                };
+                if normed {
+                    let squares = y.iter().map(|v| v * v).sum::<f32>();
+                    let inverse = 1.0 / (squares / w as f32 + EPSILON).sqrt();
+                    for (v, qn) in y.iter_mut().zip(&query_norm) {
+                        *v = *v * inverse * qn;
+                    }
+                    hold(&mut y);
+                }
+                let first = if layout.rt == 1 { s } else { 0 };
+                for (pair, frequency) in freqs.iter().enumerate() {
+                    let (lo, hi) = if layout.ra == 1 { (first + 2 * pair, first + 2 * pair + 1) } else { (first + pair, first + pair + p) };
+                    let (sin, cos) = (positions[row] as f32 * frequency).sin_cos();
+                    let (low, high) = (y[lo], y[hi]);
+                    y[lo] = low * cos - high * sin;
+                    y[hi] = high * cos + low * sin;
+                }
+                hold(&mut y);
+                rounding_model::round(rounding, &y)
+            })
+            .collect();
+        for (ordinal, at) in list_rows(&lists[row]).into_iter().take(n).enumerate() {
+            let k = &keys[at as usize * w..][..w];
+            let (mut score, mut term) = (0.0f32, 0.0f32);
+            for (head, qh) in q.iter().enumerate() {
+                let weight = if weighted { head_weights[row * h + head] } else { 1.0 };
+                let dot = qh.iter().zip(k).fold(0.0f32, |acc, (a, b)| a.mul_add(*b, acc));
+                score += dot.max(0.0) * weight;
+                term += weight.abs() * qh.iter().zip(k).map(|(a, b)| (a * b).abs()).sum::<f32>();
+            }
+            expected[row * n + ordinal] = scale * score;
+            terms[row * n + ordinal] = scale * term;
+        }
+    }
+
+    let charges = seismic::Charges::tally(device);
+    let m = rows as u64;
+    let (spans, r) = span_table(&lists);
+    let statics = [
+        ("H", h as u64),
+        ("P", p as u64),
+        ("S", s as u64),
+        ("NQ", nq as u64),
+        ("HW", hw as u64),
+        ("RA", layout.ra as u64),
+        ("RT", layout.rt as u64),
+    ];
+    let specialization = statics.iter().fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value));
+    let entry = indexer_score::native_entry_with(indexer_score::Elements { A: Element::bf16() });
+    let specialization = entry.offered(device).unwrap().unwrap().default_specialization(&specialization).unwrap();
+    let kernel = entry.prepare(device, &specialization).unwrap();
+    let (_slabs, planes) =
+        slab_arenas(device, plane_rows, SLAB_ROWS as u64, &[Arena { element: Element::f32(), bank_shape: vec![w as u64], values: &keys }], false);
+    let keys_plane = planes.into_iter().next().unwrap();
+    let coords: Vec<i32> = positions.iter().flat_map(|position| coordinates(*position)).collect();
+    let results = kernel
+        .call(&charges, indexer_score::Args {
+            query: &tensor(device, Element::bf16(), &[m, h as u64, w as u64], &query),
+            query_norm: &tensor(device, Element::f32(), &[nq as u64, w as u64], &query_norm[..nq * w]),
+            head_weights: &tensor(device, Element::bf16(), &[m, hw as u64], if weighted { &head_weights } else { &[] }),
+            rotary_components: &ints(device, &[p as u64], &vec![0i32; p]),
+            rotary_frequencies: &tensor(device, Element::f32(), &[p as u64], &freqs),
+            rotary_amplitudes: &tensor(device, Element::f32(), &[p as u64], &vec![1.0f32; p]),
+            coordinates: &ints(device, &[m, 4], &coords),
+            keys: &keys_plane,
+            spans: &ints(device, &[m, r as u64, 2], &spans),
+            score_slots: &ints(device, &[0, n as u64], &[]),
+            form: &Tensor::from_host(&charges, Element::i32(), &[0, layout.ra as u64, layout.rt as u64], &[]).unwrap(),
+            scale,
+            epsilon: EPSILON,
+            block: rounding.block,
+            element: rounding.element,
+            rounding_scale: rounding.scale,
+            amax_floor: rounding.amax_floor,
+            slab_rows: SLAB_ROWS as u32,
+        })
+        .unwrap();
+    let actual = read(&results.value);
+    assert_eq!(actual.len(), expected.len());
+    for (index, ((a, e), t)) in actual.iter().zip(&expected).zip(&terms).enumerate() {
+        if *e == f32::NEG_INFINITY {
+            assert!(*a == f32::NEG_INFINITY, "cuda {label}: score {index} past the list is {a}");
+        } else {
+            assert!((a - e).abs() <= 2e-3 * t + 1e-30, "cuda {label}: score {index} {a} vs model {e} (terms {t})");
+        }
+    }
+}
+
+/// Wide shapes (`H = 64, W = 512` and `H = 32, W = 512`) exercise CUDA's
+/// head-tiled path (fitting within 48 KiB shared memory with `HEAD_TILE = 8`).
+#[test]
+fn indexer_scores_cuda_wide_shapes_equal_the_reference_scores() {
+    let Some(device) = devices().into_iter().find(|device| device.backend() == seismic::BackendName::Cuda) else {
+        return;
+    };
+    check_cuda_wide_shape(&device, 64, 128, 256, 3, 290, true, true, 101, "H=64 W=512 pool");
+    check_cuda_wide_shape(&device, 32, 128, 256, 2, 70, false, false, 102, "H=32 W=512 qwen");
 }
 
 /// The time of `indexer_score` on Metal at DeepSeek V4.1 Flash's prefill
