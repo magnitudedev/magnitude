@@ -328,7 +328,7 @@ fn walk_outstanding(topology: &DeviceTopology, executor: &Executor, store: &dyn 
 /// sampling ([`JobDeadlines`]).
 pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) -> Result<Vec<PointRequest>, String> {
     let tiered = !topology.shared_ranges_lie_in_device_memory(executor);
-    let memory = tiered.then(|| PointRequest::HostMemory { readers: seismic::threads::quota().get() as u64 });
+    let memory = tiered.then(|| PointRequest::HostMemory { readers: MemoryCosts::readers(topology) });
     let site = match tiered {
         true => CpuForm::reference(executor.backend()).map_err(|error| error.to_string())?,
         false => None,
