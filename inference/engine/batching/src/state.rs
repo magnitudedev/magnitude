@@ -13,17 +13,20 @@ pub enum StateBatchKind {
 }
 
 #[derive(Clone, Debug)]
-enum StateRows {
-    Copies(Vec<PlaneCopy>),
-    Conversions(Vec<CodecConversionStep>),
+enum StateBatchPayload {
+    Copy(Vec<PlaneCopy>),
+    CodecConversion {
+        source: KvCodec,
+        destination: KvCodec,
+        steps: Vec<CodecConversionStep>,
+    },
 }
 
 /// A closed state operation: copy and conversion carry checked plane row
 /// mappings.
 #[derive(Clone, Debug)]
 pub struct ValidatedStateBatch {
-    kind: StateBatchKind,
-    rows: StateRows,
+    payload: StateBatchPayload,
     actual_rows: usize,
     class_rows: usize,
 }
@@ -61,7 +64,41 @@ impl ValidatedStateBatch {
         row_capacity: usize,
         class_rows: usize,
     ) -> Result<Self, StateBatchError> {
-        Self::mapped(StateBatchKind::Copy, copies, row_capacity, class_rows)
+        let actual_rows = copies.first().map_or(0, |copy| copy.from.len());
+        if actual_rows == 0 || copies.is_empty() {
+            return Err(StateBatchError::Empty);
+        }
+        if actual_rows > class_rows {
+            return Err(StateBatchError::Capacity {
+                required: actual_rows,
+                available: class_rows,
+            });
+        }
+        let first_from = &copies[0].from;
+        let first_to = &copies[0].to;
+        if first_to.len() != actual_rows
+            || first_from
+                .iter()
+                .chain(first_to)
+                .any(|&row| row >= row_capacity)
+            || !unique_rows(first_from)
+            || !unique_rows(first_to)
+        {
+            return Err(StateBatchError::InvalidMapping);
+        }
+        let mut planes = HashSet::with_capacity(copies.len());
+        if copies.iter().any(|copy| {
+            !planes.insert(copy.plane_index)
+                || &copy.from != first_from
+                || &copy.to != first_to
+        }) {
+            return Err(StateBatchError::InvalidMapping);
+        }
+        Ok(Self {
+            payload: StateBatchPayload::Copy(copies),
+            actual_rows,
+            class_rows,
+        })
     }
 
     pub fn convert(
@@ -137,62 +174,28 @@ impl ValidatedStateBatch {
             });
         }
         Ok(Self {
-            kind: StateBatchKind::CodecConversion {
+            payload: StateBatchPayload::CodecConversion {
                 source,
                 destination,
+                steps,
             },
-            rows: StateRows::Conversions(steps),
-            actual_rows,
-            class_rows,
-        })
-    }
-
-    fn mapped(
-        kind: StateBatchKind,
-        copies: Vec<PlaneCopy>,
-        row_capacity: usize,
-        class_rows: usize,
-    ) -> Result<Self, StateBatchError> {
-        let actual_rows = copies.first().map_or(0, |copy| copy.from.len());
-        if actual_rows == 0 || copies.is_empty() {
-            return Err(StateBatchError::Empty);
-        }
-        if actual_rows > class_rows {
-            return Err(StateBatchError::Capacity {
-                required: actual_rows,
-                available: class_rows,
-            });
-        }
-        let first_from = &copies[0].from;
-        let first_to = &copies[0].to;
-        if first_to.len() != actual_rows
-            || first_from
-                .iter()
-                .chain(first_to)
-                .any(|&row| row >= row_capacity)
-            || !unique_rows(first_from)
-            || !unique_rows(first_to)
-        {
-            return Err(StateBatchError::InvalidMapping);
-        }
-        let mut planes = HashSet::with_capacity(copies.len());
-        if copies.iter().any(|copy| {
-            !planes.insert(copy.plane_index)
-                || &copy.from != first_from
-                || &copy.to != first_to
-        }) {
-            return Err(StateBatchError::InvalidMapping);
-        }
-        Ok(Self {
-            kind,
-            rows: StateRows::Copies(copies),
             actual_rows,
             class_rows,
         })
     }
 
     pub fn kind(&self) -> StateBatchKind {
-        self.kind
+        match &self.payload {
+            StateBatchPayload::Copy(_) => StateBatchKind::Copy,
+            StateBatchPayload::CodecConversion {
+                source,
+                destination,
+                ..
+            } => StateBatchKind::CodecConversion {
+                source: *source,
+                destination: *destination,
+            },
+        }
     }
     pub fn actual_rows(&self) -> usize {
         self.actual_rows
@@ -201,15 +204,15 @@ impl ValidatedStateBatch {
         self.class_rows
     }
     pub fn copies(&self) -> Option<&[PlaneCopy]> {
-        match &self.rows {
-            StateRows::Copies(copies) => Some(copies),
-            StateRows::Conversions(_) => None,
+        match &self.payload {
+            StateBatchPayload::Copy(copies) => Some(copies),
+            StateBatchPayload::CodecConversion { .. } => None,
         }
     }
     pub fn conversions(&self) -> Option<&[CodecConversionStep]> {
-        match &self.rows {
-            StateRows::Conversions(steps) => Some(steps),
-            StateRows::Copies(_) => None,
+        match &self.payload {
+            StateBatchPayload::CodecConversion { steps, .. } => Some(steps),
+            StateBatchPayload::Copy(_) => None,
         }
     }
 }

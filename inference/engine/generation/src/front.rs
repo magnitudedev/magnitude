@@ -44,11 +44,9 @@ pub(crate) struct FrontState {
     /// host by a head transaction; trailing them by the pairs a verify
     /// pass accepted, or history the device did not enter.
     tail: DraftTail,
-    /// The form of the pass a round started from the level head, until it
-    /// is observed: whether the head entered its selection behind it.
-    pass: Option<PassForm>,
-    /// The host head transaction entering pairs, until it reconciles.
-    head: Option<HeadTransaction>,
+    /// The in-flight round work, if any: a target pass started from the
+    /// level head, or a host head transaction entering pairs.
+    round: FrontRound,
 }
 
 /// The form of a pass ([`FrontState::front`]).
@@ -60,6 +58,19 @@ enum PassForm {
     Verify,
 }
 
+/// In-flight round state of a fronting head: a target pass and a host head
+/// transaction are mutually exclusive.
+#[derive(Clone)]
+enum FrontRound {
+    /// No pass or host head transaction is in flight.
+    Idle,
+    /// A target pass started from the level head, until it is observed
+    /// (or superseded / checkpointed after abandonment).
+    Pass(PassForm),
+    /// A host head transaction entering pairs, until it reconciles.
+    Head(HeadTransaction),
+}
+
 impl FrontState {
     pub(crate) fn restore(checkpoint: Option<&MethodCheckpoint>) -> Result<Self, String> {
         let state = match checkpoint {
@@ -67,8 +78,7 @@ impl FrontState {
                 return Ok(Self {
                     position: 0,
                     tail: DraftTail::EMPTY,
-                    pass: None,
-                    head: None,
+                    round: FrontRound::Idle,
                 });
             }
             Some(MethodCheckpoint::Mtp(state)) => state,
@@ -80,16 +90,8 @@ impl FrontState {
         Ok(Self {
             position: state.position,
             tail: state.tail.clone(),
-            pass: None,
-            head: None,
+            round: FrontRound::Idle,
         })
-    }
-
-    fn idle(&self) -> Result<(), String> {
-        match self.head {
-            Some(_) => Err("MTP already has an unresolved head transaction".into()),
-            None => Ok(()),
-        }
     }
 
     /// Enter `pairs` as a head transaction at the head's position, drafting
@@ -104,7 +106,7 @@ impl FrontState {
         let transaction =
             HeadTransaction::new(request, phase, pairs, self.position, proposals.to_vec(), DraftForm::Chained)?;
         let operation = transaction.operation().clone();
-        self.head = Some(transaction);
+        self.round = FrontRound::Head(transaction);
         Ok(MethodEffects {
             operations: vec![operation],
         })
@@ -123,14 +125,14 @@ impl MethodState for FrontState {
     /// token (a prefix resumed past a closing chunk's or a pass's entry),
     /// its entry is the chunk's pairs past that token (`Priming`).
     fn priming_position(&self) -> Option<usize> {
-        match (&self.tail, &self.head) {
+        match (&self.tail, &self.round) {
             (
                 DraftTail::Trailing {
                     pending: None,
                     open: None | Some(OpenFeature::Device(_)),
                 }
                 | DraftTail::Entered(_),
-                None,
+                FrontRound::Idle,
             ) => Some(self.position),
             _ => None,
         }
@@ -146,7 +148,11 @@ impl MethodState for FrontState {
         primed: Option<usize>,
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
-        self.idle()?;
+        match self.round {
+            FrontRound::Idle => {}
+            FrontRound::Pass(_) => return Err("MTP cannot prime while a pass is in flight".into()),
+            FrontRound::Head(_) => return Err("MTP already has an unresolved head transaction".into()),
+        }
         let features = features.ok_or("MTP priming requires the chunk's target features")?;
         if let Some(primed) = primed {
             if self.priming_position() != Some(self.position) || primed > tokens.len() {
@@ -246,7 +252,12 @@ impl MethodState for FrontState {
         grant: FrontGrant,
         selects: &[SelectSpec],
     ) -> Result<FrontEntry, String> {
-        self.idle()?;
+        match self.round {
+            // An abandoned target pass leaves Pass(_) without mutating position
+            // or tail; starting a new round supersedes it.
+            FrontRound::Idle | FrontRound::Pass(_) => {}
+            FrontRound::Head(_) => return Err("MTP already has an unresolved head transaction".into()),
+        }
         match &self.tail {
             DraftTail::Entered(token) if *token == pending => {
                 let (form, entry) = match grant {
@@ -258,7 +269,7 @@ impl MethodState for FrontState {
                     ),
                     FrontGrant::Verify(_) => (PassForm::Verify, FrontEntry::Verify),
                 };
-                self.pass = Some(form);
+                self.round = FrontRound::Pass(form);
                 return Ok(entry);
             }
             DraftTail::Entered(_) => return Err("MTP entered another successor than the pending token".into()),
@@ -274,7 +285,6 @@ impl MethodState for FrontState {
             (Some(pairs), None) if pairs.tokens.last() == Some(&pending) => pairs,
             _ => return Err("MTP trails a decode with no pair of its pending token to enter".into()),
         };
-        self.pass = None;
         Ok(FrontEntry::Pending(
             self.enter(request, pairs, HeadPhase::Generation, selects)?
                 .operations,
@@ -299,7 +309,11 @@ impl MethodState for FrontState {
         verification: Verification<'_>,
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
-        self.idle()?;
+        let form = match self.round {
+            FrontRound::Pass(form) => form,
+            FrontRound::Head(_) => return Err("MTP already has an unresolved head transaction".into()),
+            FrontRound::Idle => return Err("MTP observes no pass it started".into()),
+        };
         let accepted = verification.accepted;
         match self.tail {
             DraftTail::Entered(token)
@@ -308,8 +322,8 @@ impl MethodState for FrontState {
                     && accepted <= verification.inputs.len() => {}
             _ => return Err("a pass commits from the token MTP entered".into()),
         }
-        match self.pass.take() {
-            Some(PassForm::Front) => {
+        match form {
+            PassForm::Front => {
                 if accepted != 1 || verification.inputs.len() != 1 {
                     return Err("a front pass commits its exact row alone".into());
                 }
@@ -319,7 +333,7 @@ impl MethodState for FrontState {
                     .ok_or("MTP head position exhausted")?;
                 self.tail = DraftTail::Entered(verification.next);
             }
-            Some(PassForm::Verify) => {
+            PassForm::Verify => {
                 let features = verification
                     .features
                     .ok_or("a verify pass publishes its rows' features")?;
@@ -331,17 +345,20 @@ impl MethodState for FrontState {
                     open: None,
                 };
             }
-            None => return Err("MTP observes no pass it started".into()),
         }
+        self.round = FrontRound::Idle;
         Ok(MethodEffects::default())
     }
 
     fn reconcile(&mut self, operation: &Operation, outcome: Outcome) -> Result<(), String> {
-        let drafted = self
-            .head
-            .take()
-            .ok_or("MTP has no pending head transaction")?
-            .reconcile(operation, outcome)?;
+        let transaction = match std::mem::replace(&mut self.round, FrontRound::Idle) {
+            FrontRound::Head(transaction) => transaction,
+            other => {
+                self.round = other;
+                return Err("MTP has no pending head transaction".into());
+            }
+        };
+        let drafted = transaction.reconcile(operation, outcome)?;
         self.position = self
             .position
             .checked_add(drafted.entered)
@@ -353,8 +370,11 @@ impl MethodState for FrontState {
     /// sampled successor, past the retained prefix, so its feature is
     /// exported open and each restored request enters its own successor.
     fn checkpoint(&self) -> Result<MethodCheckpoint, MethodCheckpointError> {
-        if self.head.is_some() {
-            return Err(MethodCheckpointError::Unresolved);
+        match self.round {
+            // An abandoned target pass leaves Pass(_) without mutating position
+            // or tail, so the head state is still resolved and checkpointable.
+            FrontRound::Idle | FrontRound::Pass(_) => {}
+            FrontRound::Head(_) => return Err(MethodCheckpointError::Unresolved),
         }
         let tail = match &self.tail {
             DraftTail::Trailing {
@@ -379,8 +399,7 @@ impl MethodState for FrontState {
     fn evict(&mut self) {
         self.position = 0;
         self.tail = DraftTail::EMPTY;
-        self.pass = None;
-        self.head = None;
+        self.round = FrontRound::Idle;
     }
 
     fn reclaimable(&self) -> u64 {
