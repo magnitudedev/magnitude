@@ -67,47 +67,6 @@ struct ChoiceKey {
     bool active;
 };
 
-// Whether `choice` is the first active choice of its (expert, record) group
-// (inactive choices do not run and do not shadow active ones; an active choice
-// reading no record is its own singleton group).
-template <class Key> __device__ __forceinline__ bool first_choice(Key key, u32 choice) {
-    const ChoiceKey mine = key(choice);
-    if (!mine.active)
-        return false;
-    if (mine.record == -1)
-        return true;
-    for (u32 c = 0; c < choice; ++c) {
-        const ChoiceKey other = key(c);
-        if (other.active && other.expert == mine.expert && other.record == mine.record)
-            return false;
-    }
-    return true;
-}
-
-// The active choices sharing `choice`'s (expert, record) in order (`choice`
-// alone when it reads no record), into `chosen`; returns their count. The
-// forms run at most VERIFY_ROWS rows, a row's choices distinct records, so
-// `chosen` is never full when another choice is found; one found then breaks
-// that invariant, and the block traps rather than drop it.
-template <class Key>
-__device__ __forceinline__ u32 record_choices(Key key, u32 choices, u32 choice,
-                                              u32 (&chosen)[SEISMIC_CONST_VERIFY_ROWS]) {
-    const ChoiceKey mine = key(choice);
-    u32 count = 0;
-    chosen[count++] = choice;
-    if (mine.record == -1)
-        return count;
-    for (u32 c = choice + 1; c < choices; ++c) {
-        const ChoiceKey other = key(c);
-        if (other.active && other.expert == mine.expert && other.record == mine.record) {
-            if (count == SEISMIC_CONST_VERIFY_ROWS)
-                __trap();
-            chosen[count++] = c;
-        }
-    }
-    return count;
-}
-
 // A gathered choice's expert and the GEMV rows of its choices, in the
 // block's shared memory (`gather`): row r reads the activation row at
 // element offset rows[r] and publishes into the product at element offset
@@ -118,28 +77,86 @@ struct Gathered {
     u64 rows[SEISMIC_CONST_VERIFY_ROWS], products[SEISMIC_CONST_VERIFY_ROWS];
 };
 
-// Block-collective, by every thread before any leaves: whether `choice` is
-// the first active choice of its (expert, record), and where it is, its expert
-// and every active choice sharing it into `table`: choice (m, k) reads
-// activation row m at m * `row_stride` and publishes at m * `product0` +
-// k * `product1`.
+// Block-collective, by every thread before any leaves: warp 0 resolves
+// whether `choice` is the first active choice of its (expert, record)
+// (inactive choices do not run and do not shadow active ones; an active
+// choice reading no record is its own singleton group), and where it is,
+// gathers its expert and every active choice sharing it into `table`:
+// choice (m, k) reads activation row at m * `row0` + k * `row1` and
+// publishes at m * `product0` + k * `product1`. The forms run at most
+// VERIFY_ROWS rows, a row's choices distinct records, so `table` is never
+// full when another choice is found; one found then breaks that invariant,
+// and the block traps rather than drop it.
 template <class Key>
-__device__ __forceinline__ bool gather(Gathered &table, Key key, const int *routes, u64 routes0, u64 routes1,
-                                       u32 rows, u32 slots, u32 choice, u64 row_stride, u64 product0, u64 product1) {
-    if (!first_choice(key, choice))
-        return false;
-    if (threadIdx.x == 0) {
-        u32 chosen[SEISMIC_CONST_VERIFY_ROWS];
-        table.expert = route(routes, routes0, routes1, slots, choice);
-        table.count = record_choices(key, rows * slots, choice, chosen);
-        for (u32 r = 0; r < table.count; ++r) {
-            const u64 m = chosen[r] / slots, k = chosen[r] % slots;
-            table.rows[r] = m * row_stride;
-            table.products[r] = m * product0 + k * product1;
+__device__ __forceinline__ bool gather(Gathered &table, Key key, u32 rows, u32 slots, u32 choice,
+                                       u64 row0, u64 row1, u64 product0, u64 product1) {
+    if (threadIdx.x < 32u) {
+        const u32 lane = threadIdx.x;
+        ChoiceKey mine{};
+        if (lane == 0u)
+            mine = key(choice);
+        mine.expert = __shfl_sync(0xffffffffu, mine.expert, 0);
+        mine.record = __shfl_sync(0xffffffffu, mine.record, 0);
+        mine.active = __shfl_sync(0xffffffffu, mine.active ? 1 : 0, 0) != 0;
+
+        u32 count = 0u;
+        if (mine.active) {
+            if (mine.record == -1) {
+                if (lane == 0u) {
+                    const u64 m = choice / slots, k = choice % slots;
+                    table.rows[0] = m * row0 + k * row1;
+                    table.products[0] = m * product0 + k * product1;
+                }
+                count = 1u;
+            } else {
+                const u32 total = rows * slots;
+                const u32 lt_mask = (1u << lane) - 1u;
+                for (u32 base = 0u; base < total; base += 32u) {
+                    const u32 c = base + lane;
+                    bool match = false;
+                    if (c < total) {
+                        if (c == choice) {
+                            match = true;
+                        } else {
+                            const ChoiceKey other = key(c);
+                            match = other.active && other.expert == mine.expert && other.record == mine.record;
+                        }
+                    }
+                    const u32 mask = __ballot_sync(0xffffffffu, match);
+                    const u32 earlier_mask =
+                        base >= choice ? 0u : (choice - base >= 32u ? 0xffffffffu : (1u << (choice - base)) - 1u);
+                    if ((mask & earlier_mask) != 0u) {
+                        count = 0u;
+                        break;
+                    }
+                    const u32 chunk_hits = __popc(mask);
+                    if (chunk_hits != 0u) {
+                        if (count + chunk_hits > (u32)SEISMIC_CONST_VERIFY_ROWS)
+                            __trap();
+                        if (match) {
+                            const u32 pos = count + __popc(mask & lt_mask);
+                            const u64 m = c / slots, k = c % slots;
+                            table.rows[pos] = m * row0 + k * row1;
+                            table.products[pos] = m * product0 + k * product1;
+                        }
+                        count += chunk_hits;
+                    }
+                }
+            }
+        }
+        if (lane == 0u) {
+            table.expert = mine.expert;
+            table.count = count;
         }
     }
     __syncthreads();
-    return true;
+    return table.count != 0u;
+}
+
+template <class Key>
+__device__ __forceinline__ bool gather(Gathered &table, Key key, const int *, u64, u64,
+                                       u32 rows, u32 slots, u32 choice, u64 row_stride, u64 product0, u64 product1) {
+    return gather(table, key, rows, slots, choice, row_stride, 0, product0, product1);
 }
 
 // A gathered GEMV's epilogue: `Epi` (its row stride 0) with row m
