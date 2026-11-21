@@ -61,8 +61,10 @@ __device__ __forceinline__ void draft_join(const DraftInput &input, long long he
     }
     // Fixed-order block sums (warp sums, then the DRAFT_WARPS warps in index
     // order); their barriers order every joined write before the updates.
-    const float embedding_inverse = rsqrtf(reduce::group_sum(embedding_squares, partials) / (float)D + epsilon);
-    const float hidden_inverse = rsqrtf(reduce::group_sum(hidden_squares, partials) / (float)D + epsilon);
+    float squares[2] = {embedding_squares, hidden_squares};
+    reduce::group_sum_n<2>(squares, partials);
+    const float embedding_inverse = rsqrtf(squares[0] / (float)D + epsilon);
+    const float hidden_inverse = rsqrtf(squares[1] / (float)D + epsilon);
     for (u64 column = threadIdx.x; column < D; column += blockDim.x) {
         joined[column] = Act::round(
             joined[column] * embedding_inverse
@@ -78,7 +80,7 @@ __device__ __forceinline__ void draft_join(const DraftInput &input, long long he
 
 extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ float joined[];
-    __shared__ float partials[DRAFT_WARPS];
+    __shared__ float partials[2 * DRAFT_WARPS];
     const u64 D = SEISMIC_DIM_D;
     const u64 row = blockIdx.y / SEISMIC_DIM_S;
     const u64 stream = blockIdx.y % SEISMIC_DIM_S;
@@ -112,7 +114,7 @@ extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
 
 extern "C" __global__ void draft_rows_join(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ float joined[];
-    __shared__ float partials[DRAFT_WARPS];
+    __shared__ float partials[2 * DRAFT_WARPS];
     const u64 D = SEISMIC_DIM_D;
     const u64 row = blockIdx.y / SEISMIC_DIM_S;
     const u64 stream = blockIdx.y % SEISMIC_DIM_S;

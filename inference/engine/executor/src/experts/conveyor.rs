@@ -116,7 +116,8 @@ pub(super) struct Settled {
 /// An expert held whole in conveyor record `record` of its layer's form,
 /// landing from it into its host tier's record `tier`, read for step `read`
 /// (`Conveyor::land`): the conveyor record takes no read until its landing
-/// ends, as `ended` records (landed: its bytes are whole).
+/// ends, as `ended` records (landed: its bytes are whole; unlanded if
+/// cancelled via `cancel`).
 pub(super) struct ConveyorLanding {
     pub layer: usize,
     pub expert: usize,
@@ -124,6 +125,7 @@ pub(super) struct ConveyorLanding {
     pub tier: u32,
     pub read: Option<Step>,
     pub ended: crate::experts::landing::Ended,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What carries the conveyor: `records` records of each form, where they
@@ -139,14 +141,15 @@ pub(super) struct Carrier {
 }
 
 pub(super) struct Conveyor {
-    /// Each streamed layer's form: the records its experts take.
-    form_of: Vec<usize>,
+    /// Each streamed layer's staging pool indices, in record order.
+    layer_pools: Vec<Vec<usize>>,
     /// Per layer, where each expert carried is.
     carried: Vec<Vec<Option<State>>>,
     /// The experts being read, (layer, expert): what settling looks at.
     reading: Vec<(usize, usize)>,
-    /// Per form, each conveyor record's expert (layer, expert).
-    occupant: Vec<Vec<Option<(usize, usize)>>>,
+    /// Each physical conveyor slot's expert (layer, expert): all staging pools
+    /// share one conveyor region, so each slot has at most one owner.
+    occupant: Vec<Option<(usize, usize)>>,
     /// Per scratch slot, the expert (layer, expert) whose stored bytes it
     /// carries, from its read's start until its round's converts are past.
     slots: Vec<Option<(usize, usize)>>,
@@ -172,18 +175,17 @@ pub(super) fn readiness(state: Option<&State>) -> u8 {
 }
 
 impl Conveyor {
-    /// A conveyor of the forms `form_of` names (per streamed layer, of
+    /// A conveyor for layers whose routed tensors use `layer_pools` (of
     /// layers of `experts` experts each), carried by `carrier`; every
     /// record empty.
-    pub fn new(form_of: Vec<usize>, experts: &[usize], carrier: Carrier) -> Self {
-        let forms = form_of.iter().max().map_or(0, |last| last + 1);
+    pub fn new(layer_pools: Vec<Vec<usize>>, experts: &[usize], carrier: Carrier) -> Self {
         Self {
             carried: experts.iter().map(|&experts| (0..experts).map(|_| None).collect()).collect(),
             reading: Vec::new(),
-            occupant: vec![vec![None; carrier.records]; forms],
+            occupant: vec![None; carrier.records],
             slots: vec![None; carrier.slots],
             landings: Vec::new(),
-            form_of,
+            layer_pools,
             serving: None,
             carrier,
             #[cfg(test)]
@@ -247,12 +249,11 @@ impl Conveyor {
         (self.carrier.records + slot) as u32
     }
 
-    /// Free record `record` of `layer`'s form for another read, a conveyor
-    /// record or a slot.
-    fn unoccupy(&mut self, layer: usize, record: u32) {
+    /// Free record `record` for another read, a conveyor record or a slot.
+    fn unoccupy(&mut self, record: u32) {
         match self.slot_of(record) {
             Some(slot) => self.slots[slot as usize] = None,
-            None => self.occupant[self.form_of[layer]][record as usize] = None,
+            None => self.occupant[record as usize] = None,
         }
     }
 
@@ -272,14 +273,49 @@ impl Conveyor {
         records.iter().enumerate().filter(|(_, occupant)| occupant.is_none()).map(|(record, _)| record as u32)
     }
 
-    /// The conveyor records of `layer`'s form free that `admits`: none
-    /// carries an expert and no landing reads it.
+    /// Whether conveyor record `rec_a` of `layer_a` and `rec_b` of `layer_b`
+    /// overlap in the shared conveyor backing: always for equal slot indices,
+    /// or when layers with distinct pool record sizes overlap byte ranges in
+    /// any shared carrier tensor.
+    fn overlaps(&self, layer_a: usize, rec_a: u32, layer_b: usize, rec_b: u32) -> bool {
+        if rec_a == rec_b {
+            return true;
+        }
+        let pa = &self.layer_pools[layer_a];
+        let pb = &self.layer_pools[layer_b];
+        if pa == pb {
+            return false;
+        }
+        let pools = &self.carrier.lending.pools;
+        pa.iter().zip(pb).any(|(&pa, &pb)| {
+            if pa == pb {
+                return false;
+            }
+            let a = &pools[pa];
+            let b = &pools[pb];
+            let a_start = a.offset + u64::from(rec_a) * a.conveyor;
+            let a_end = a_start + a.conveyor;
+            let b_start = b.offset + u64::from(rec_b) * b.conveyor;
+            let b_end = b_start + b.conveyor;
+            a_start < b_end && b_start < a_end
+        })
+    }
+
+    /// Whether conveyor record `record` of `layer` overlaps any currently
+    /// occupied conveyor slot or in-flight conveyor landing.
+    fn conflicts(&self, layer: usize, record: u32) -> bool {
+        self.occupant
+            .iter()
+            .enumerate()
+            .any(|(other_rec, occ)| occ.is_some_and(|(other_layer, _)| self.overlaps(layer, record, other_layer, other_rec as u32)))
+            || self.landings.iter().any(|landing| self.overlaps(layer, record, landing.layer, landing.record))
+    }
+
+    /// The conveyor records free for `layer` that `admits`: none carries an
+    /// expert, none overlaps an occupied record of another pool size, and no
+    /// landing reads it.
     pub fn free_conveyor(&self, layer: usize, admits: impl Fn(u32) -> bool) -> Vec<u32> {
-        let form = self.form_of[layer];
-        let landing = |record: u32| {
-            self.landings.iter().any(|landing| self.form_of[landing.layer] == form && landing.record == record)
-        };
-        Self::free(&self.occupant[form]).filter(|&record| !landing(record) && admits(record)).collect()
+        Self::free(&self.occupant).filter(|&record| !self.conflicts(layer, record) && admits(record)).collect()
     }
 
     /// Each staging pool's conveyor records, as the host addresses them.
@@ -293,18 +329,47 @@ impl Conveyor {
         self.landings.push(landing);
     }
 
-    /// Take the conveyor landings that ended: each landed, as a landing
-    /// from a record whose bytes are whole always does.
+    /// Cancel every in-flight landing from a conveyor record into the host
+    /// tier so the next group never stalls behind previous-group CPU repacks.
+    pub fn cancel_landings(&mut self) {
+        for landing in &self.landings {
+            landing.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Cancel any in-flight landing holding or overlapping conveyor record
+    /// `record` for `layer`.
+    pub fn cancel_landing_for(&mut self, layer: usize, record: u32) {
+        for landing in &self.landings {
+            if landing.record == record || self.overlaps(layer, record, landing.layer, landing.record) {
+                landing.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    /// A conveyor record for `layer` that `admits` and is occupied by no
+    /// active GPU round (nor overlaps one), held only by an uncancelled
+    /// [`ConveyorLanding`].
+    pub fn landing_only_record(&self, layer: usize, admits: impl Fn(u32) -> bool) -> Option<u32> {
+        Self::free(&self.occupant).find(|&record| {
+            admits(record)
+                && !self.occupant.iter().enumerate().any(|(other_rec, occ)| {
+                    occ.is_some_and(|(other_layer, _)| self.overlaps(layer, record, other_layer, other_rec as u32))
+                })
+                && self.landings.iter().any(|landing| {
+                    (landing.record == record || self.overlaps(layer, record, landing.layer, landing.record))
+                        && !landing.cancel.load(std::sync::atomic::Ordering::Acquire)
+                })
+        })
+    }
+
+    /// Take the conveyor landings that ended: each ended with `Some(true)`
+    /// (landed) or `Some(false)` (cancelled).
     pub fn landed(&mut self) -> Vec<ConveyorLanding> {
         let (ended, running): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.landings).into_iter().partition(|landing| landing.ended.get().is_some());
         self.landings = running;
         ended
-    }
-
-    /// Whether `a` and `b` take records of one form.
-    pub fn shares_form(&self, a: usize, b: usize) -> bool {
-        self.form_of[a] == self.form_of[b]
     }
 
     /// Expert `expert` of `layer` takes record `record` for its read: a
@@ -318,15 +383,18 @@ impl Conveyor {
             *borrower = Some((layer, expert));
             return;
         }
-        let form = self.form_of[layer];
-        let slot = &mut self.occupant[form][record as usize];
+        assert!(
+            !self.conflicts(layer, record),
+            "conveyor record {record} of layer {layer} overlaps an occupied record or landing"
+        );
+        let slot = &mut self.occupant[record as usize];
         assert!(slot.is_none(), "a conveyor record carries two experts");
         *slot = Some((layer, expert));
     }
 
-    /// Give back record `record`, which a layer of `layer`'s form took.
-    pub fn untake(&mut self, layer: usize, record: u32) {
-        self.unoccupy(layer, record);
+    /// Give back record `record`.
+    pub fn untake(&mut self, record: u32) {
+        self.unoccupy(record);
     }
 
     /// Expert `expert` of `layer` is being read into conveyor record
@@ -366,7 +434,7 @@ impl Conveyor {
                 }
                 Outcome::Failed(reason) => {
                     self.carried[layer][expert] = None;
-                    self.untake(layer, record);
+                    self.untake(record);
                     settled.failed.push((layer, expert, reason));
                 }
                 Outcome::Panicked(panic) => panic.resume(),
@@ -394,7 +462,7 @@ impl Conveyor {
     /// it is forgotten, to be read again.
     pub fn yield_record(&mut self, layer: usize, expert: usize) {
         match self.carried[layer][expert].take() {
-            Some(State::Held { record }) => self.untake(layer, record),
+            Some(State::Held { record }) => self.untake(record),
             _ => panic!("expert {expert} of layer {layer} yields no record it holds unlisted"),
         }
     }
@@ -408,7 +476,7 @@ impl Conveyor {
         };
         self.carried[layer][expert] = match lists {
             1 => {
-                self.unoccupy(layer, record);
+                self.unoccupy(record);
                 None
             }
             _ => Some(State::Listed { record, lists: lists - 1 }),
@@ -424,7 +492,7 @@ impl Conveyor {
                     // A listed record frees as its rounds pass.
                     Some(State::Held { record }) => {
                         self.carried[layer][expert] = None;
-                        self.unoccupy(layer, record);
+                        self.unoccupy(record);
                     }
 
                     _ => {}
@@ -450,9 +518,117 @@ impl Conveyor {
         for experts in &mut self.carried {
             experts.iter_mut().for_each(|state| *state = None);
         }
-        for records in &mut self.occupant {
-            records.iter_mut().for_each(|record| *record = None);
-        }
+        self.occupant.iter_mut().for_each(|record| *record = None);
         self.slots.iter_mut().for_each(|slot| *slot = None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::experts::events::Events;
+    use crate::experts::landing::Ended;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn test_conveyor(layer_pools: Vec<Vec<usize>>, records: usize) -> Conveyor {
+        let experts = vec![4; layer_pools.len()];
+        let carrier = Carrier {
+            records,
+            slots: 0,
+            lending: Lending { group: 0, pools: Vec::new() },
+            pools: Vec::new(),
+        };
+        Conveyor::new(layer_pools, &experts, carrier)
+    }
+
+    fn dummy_landing(events: &Arc<Events>, layer: usize, expert: usize, record: u32, tier: u32) -> (ConveyorLanding, Arc<AtomicBool>, Ended) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ended = Ended::new(events);
+        let landing = ConveyorLanding {
+            layer,
+            expert,
+            record,
+            tier,
+            read: Some(1),
+            ended: ended.clone(),
+            cancel: cancel.clone(),
+        };
+        (landing, cancel, ended)
+    }
+
+    /// `landing_only_record` identifies conveyor records unoccupied by any GPU
+    /// round and held only by an uncancelled `ConveyorLanding`; `cancel_landing_for`
+    /// cancels matching record landings, and `cancel_landings` cancels all.
+    #[test]
+    fn conveyor_landing_cancellation_and_lookup() {
+        let events = Arc::new(Events::default());
+        let mut conveyor = test_conveyor(vec![vec![], vec![], vec![]], 3);
+        let (l0, c0, e0) = dummy_landing(&events, 0, 0, 0, 0);
+        let (l1, c1, e1) = dummy_landing(&events, 1, 1, 1, 1);
+        let (l2, c2, e2) = dummy_landing(&events, 2, 0, 2, 2);
+        conveyor.land(l0);
+        conveyor.land(l1);
+        conveyor.land(l2);
+
+        // Occupy record 0 with an active GPU round: records 1 and 2 are landing-only.
+        conveyor.take(0, 2, 0);
+        assert_eq!(conveyor.landing_only_record(1, |_| true), Some(1));
+
+        // Cancel record 1: cancels l1 only.
+        conveyor.cancel_landing_for(0, 1);
+        assert!(!c0.load(Ordering::Acquire));
+        assert!(c1.load(Ordering::Acquire));
+        assert!(!c2.load(Ordering::Acquire));
+        assert_eq!(conveyor.landing_only_record(1, |_| true), Some(2));
+
+        // `cancel_landings` cancels every remaining in-flight landing.
+        conveyor.cancel_landings();
+        assert!(c0.load(Ordering::Acquire));
+        assert!(c2.load(Ordering::Acquire));
+        assert_eq!(conveyor.landing_only_record(1, |_| true), None, "already-cancelled landings skipped");
+
+        // Settling ended landings drains them cleanly.
+        e0.set(false);
+        e1.set(false);
+        e2.set(true);
+        let drained = conveyor.landed();
+        assert_eq!(drained.len(), 3);
+        assert!(conveyor.quiet());
+    }
+
+    /// Mixed-quant layers sharing one conveyor region prevent both slot-index
+    /// collisions and byte-range overlaps across distinct pool record sizes.
+    #[test]
+    fn shared_conveyor_prevents_byte_overlap_across_pool_sizes() {
+        // Pool 0: 500 bytes/record; Pool 1: 800 bytes/record; both at offset 0.
+        let carrier = Carrier {
+            records: 4,
+            slots: 0,
+            lending: Lending {
+                group: 0,
+                pools: vec![
+                    LentPool { record: 1000, offset: 0, conveyor: 500 },
+                    LentPool { record: 1000, offset: 0, conveyor: 800 },
+                ],
+            },
+            pools: Vec::new(),
+        };
+        // Layer 0 uses pool 0 (500 B), layer 1 uses pool 1 (800 B).
+        let mut conveyor = Conveyor::new(vec![vec![0], vec![1]], &[8, 8], carrier);
+        // Layer 0 takes slot 1 -> bytes [500, 1000).
+        conveyor.take(0, 0, 1);
+        // For layer 0 (same pool): slots 0, 2, 3 are free.
+        assert_eq!(conveyor.free_conveyor(0, |_| true), vec![0, 2, 3]);
+        // For layer 1 (800 B/slot):
+        // - slot 0: [0, 800) overlaps [500, 1000) -> blocked
+        // - slot 1: occupied -> blocked
+        // - slot 2: [1600, 2400) disjoint -> free
+        // - slot 3: [2400, 3200) disjoint -> free
+        assert_eq!(conveyor.free_conveyor(1, |_| true), vec![2, 3]);
+        conveyor.take(1, 0, 2);
+        // Layer 0 slot 3 is [1500, 2000), which overlaps layer 1 slot 2 [1600, 2400) -> blocked!
+        // Layer 0 slot 0 is [0, 500), disjoint -> free!
+        assert_eq!(conveyor.free_conveyor(0, |_| true), vec![0]);
     }
 }

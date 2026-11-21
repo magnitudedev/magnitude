@@ -238,6 +238,14 @@ struct Codes {
     float4 even[4], odd[4];
 };
 
+// The group's bit-3 signs: +1 where bit 3 is set, -1 elsewhere.
+inline Codes sign_codes(uint plane) {
+    Codes codes;
+    for (uint q = 0; q < 4u; ++q)
+        signs(plane, q, codes.even[q], codes.odd[q]);
+    return codes;
+}
+
 // The group's exact signed codes c = u - 128: the exact view's code bytes
 // (`readout::ProgressiveExact`) as exact floats, by half subtraction rather
 // than integer conversion.
@@ -375,6 +383,36 @@ struct Planes {
     }
 };
 
+inline void load_features(device const uchar *features, ulong feature_stride, threadgroup const uint4 *stage,
+    uint groups, bool staged, uint m, uint g, thread float4 (&xe)[4], thread float4 (&xo)[4]) {
+    if (staged)
+        for (uint q = 0; q < 4u; ++q)
+            activation::split8(stage[(m * 4u + q) * groups + g], xe[q], xo[q]);
+    else
+        features_group(features, feature_stride, m, g, xe, xo);
+}
+
+template <bool REFINE>
+inline Codes decode_group(thread const Planes &planes, uint v, uint g, thread float &scale) {
+    if (REFINE) {
+        scale = planes.scale(v, g) * float(1u << (PROGRESSIVE_LOW_PLANES - 1u));
+        return sign_codes(planes.third(v, g));
+    } else {
+        const readout::ProgressiveExact::packet group = planes.group(v, g);
+        scale = group.scale;
+        return exact_codes(group);
+    }
+}
+
+template <bool REFINE>
+inline float accumulate_group(float acc, float scale, thread const Codes &codes, thread const float4 (&xe)[4],
+    thread const float4 (&xo)[4]) {
+    if (REFINE)
+        return metal::fma(scale, codes_dot(codes, xe, xo), acc);
+    else
+        return acc + exact(scale, codes, xe, xo);
+}
+
 // A later level: one simdgroup per 32 vocabulary rows. Lane l decides row l
 // for every output row: it survives when the previous level's upper-bound
 // score reaches `floor` (that level's threshold); −inf elsewhere. The
@@ -411,50 +449,68 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
     const uint n = first + lane;
     // Bit m: output row m keeps vocabulary row n.
     uint candidate = 0u;
-    if (n < vocabulary)
+    if (n < vocabulary) {
+        const float radius = radius_previous[ulong(n) * radius_stride];
         for (uint m = 0; m < rows; ++m) {
-            const float reach = radius_previous[n * radius_stride] * lengths[m * length_stride];
+            const float reach = radius * lengths[m * length_stride];
             if (selection.survives(m, n, coarse[m * coarse_row + ulong(n) * coarse_col], reach,
                     floor[m * floor_stride]))
                 candidate |= 1u << m;
             else
                 out.put(m * out_row + ulong(n) * out_col, -INFINITY);
         }
+    }
     for (uint pending = uint(uint64_t(simd_ballot(candidate != 0u))); pending != 0u; pending &= pending - 1u) {
         const uint i = ctz(pending);
         const uint v = first + i;
         const uint which = simd_shuffle(candidate, ushort(i));
-        for (uint m = 0; m < rows; ++m) {
-            if ((which >> m & 1u) == 0u)
-                continue;
+        const float next_radius = REFINE && lane == 0u ? radius_next[ulong(v) * radius_stride] : 0.0f;
+        if ((which & (which - 1u)) == 0u) {
+            const uint m = ctz(which);
             float acc = 0.0f;
             for (uint g = lane; g < groups; g += 32u) {
                 float4 xe[4], xo[4];
-                if (staged)
-                    for (uint q = 0; q < 4u; ++q)
-                        activation::split8(stage[(m * 4u + q) * groups + g], xe[q], xo[q]);
-                else
-                    features_group(features, feature_stride, m, g, xe, xo);
-                if (REFINE) {
-                    const uint plane = planes.third(v, g);
-                    float dot = 0.0f;
-                    for (uint q = 0; q < 4u; ++q) {
-                        float4 se, so;
-                        signs(plane, q, se, so);
-                        dot += metal::dot(se, xe[q]) + metal::dot(so, xo[q]);
-                    }
-                    acc = metal::fma(planes.scale(v, g) * float(1u << (PROGRESSIVE_LOW_PLANES - 1u)), dot, acc);
-                } else {
-                    acc += exact(planes.scale(v, g), exact_codes(planes.group(v, g)), xe, xo);
-                }
+                load_features(features, feature_stride, stage, groups, staged, m, g, xe, xo);
+                float scale;
+                const Codes codes = decode_group<REFINE>(planes, v, g, scale);
+                acc = accumulate_group<REFINE>(acc, scale, codes, xe, xo);
             }
             acc = simd_sum(acc);
-            if (lane != 0u)
-                continue;
-            const float logit = REFINE ? coarse[m * coarse_row + ulong(v) * coarse_col] + acc : acc;
-            out.put(m * out_row + ulong(v) * out_col, REFINE ? logit : selection.transform(logit));
-            if (REFINE && selection.competes(m, v))
-                selection.raise(&lowest[m], m, v, logit - radius_next[v * radius_stride] * lengths[m * length_stride]);
+            if (lane == 0u) {
+                const float logit = REFINE ? coarse[m * coarse_row + ulong(v) * coarse_col] + acc : acc;
+                out.put(m * out_row + ulong(v) * out_col, REFINE ? logit : selection.transform(logit));
+                if (REFINE && selection.competes(m, v))
+                    selection.raise(&lowest[m], m, v, logit - next_radius * lengths[m * length_stride]);
+            }
+        } else {
+            float acc[SEISMIC_CONST_VERIFY_ROWS];
+            _Pragma("clang loop unroll(full)")
+            for (uint m = 0; m < SEISMIC_CONST_VERIFY_ROWS; ++m)
+                acc[m] = 0.0f;
+            for (uint g = lane; g < groups; g += 32u) {
+                float scale;
+                const Codes codes = decode_group<REFINE>(planes, v, g, scale);
+                _Pragma("clang loop unroll(full)")
+                for (uint m = 0; m < SEISMIC_CONST_VERIFY_ROWS; ++m) {
+                    if ((which >> m & 1u) == 0u)
+                        continue;
+                    float4 xe[4], xo[4];
+                    load_features(features, feature_stride, stage, groups, staged, m, g, xe, xo);
+                    acc[m] = accumulate_group<REFINE>(acc[m], scale, codes, xe, xo);
+                }
+            }
+            _Pragma("clang loop unroll(full)")
+            for (uint m = 0; m < SEISMIC_CONST_VERIFY_ROWS; ++m) {
+                if ((which >> m & 1u) == 0u)
+                    continue;
+                const float total = simd_sum(acc[m]);
+                if (lane == 0u) {
+                    const float logit = REFINE ? coarse[m * coarse_row + ulong(v) * coarse_col] + total : total;
+                    out.put(m * out_row + ulong(v) * out_col, REFINE ? logit : selection.transform(logit));
+                    if (REFINE && selection.competes(m, v))
+                        selection.raise(&lowest[m], m, v, logit - next_radius * lengths[m * length_stride]);
+                }
+            }
         }
     }
     if (REFINE)

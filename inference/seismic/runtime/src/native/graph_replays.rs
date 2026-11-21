@@ -25,8 +25,9 @@
 use crate::api::CallError;
 use seismic_compiler::graph_cost::GraphCensus;
 use std::any::Any;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A recorded graph: what it is made of.
 pub(crate) trait RecordedGraph {
@@ -124,9 +125,79 @@ struct ReplayEntries<G> {
     graphs: HashMap<Arc<[u64]>, Replay<G>>,
 }
 
+impl<G> ReplayEntries<G> {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn touch_first_mut(&mut self, key: &[u64]) -> Option<&mut G> {
+        let replay = self.graphs.get_mut(key)?;
+        self.clock += 1;
+        let instance = replay.graphs.first_mut();
+        instance.used = self.clock;
+        Some(&mut instance.graph)
+    }
+}
+
+/// Non-empty set of recorded graph instances for one shape.
+struct ReplayGraphs<G> {
+    first: Instance<G>,
+    rest: Vec<Instance<G>>,
+}
+
+enum TakeOutcome<G> {
+    /// Removed while leaving at least one graph in the shape.
+    Taken(Instance<G>),
+    /// The sole remaining graph in the shape matched; remove the shape entry.
+    Last,
+    /// No graph with that identity exists in this shape.
+    Missing,
+}
+
+impl<G> ReplayGraphs<G> {
+    fn singleton(first: Instance<G>) -> Self {
+        Self { first, rest: Vec::new() }
+    }
+
+    fn len(&self) -> usize {
+        1 + self.rest.len()
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn first_mut(&mut self) -> &mut Instance<G> {
+        &mut self.first
+    }
+
+    fn push(&mut self, instance: Instance<G>) {
+        self.rest.push(instance);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Instance<G>> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Instance<G>> {
+        std::iter::once(&mut self.first).chain(&mut self.rest)
+    }
+
+    fn find_mut(&mut self, identity: u64) -> Option<&mut Instance<G>> {
+        self.iter_mut().find(|instance| instance.identity == identity)
+    }
+
+    fn take(&mut self, identity: u64) -> TakeOutcome<G> {
+        if self.first.identity == identity {
+            match self.rest.pop() {
+                Some(replacement) => TakeOutcome::Taken(std::mem::replace(&mut self.first, replacement)),
+                None => TakeOutcome::Last,
+            }
+        } else if let Some(at) = self.rest.iter().position(|instance| instance.identity == identity) {
+            TakeOutcome::Taken(self.rest.swap_remove(at))
+        } else {
+            TakeOutcome::Missing
+        }
+    }
+}
+
 /// A shape's graphs.
 struct Replay<G> {
-    graphs: Vec<Instance<G>>,
+    graphs: ReplayGraphs<G>,
     /// The plans the graphs' kernels belong to, kept loaded while they live;
     /// `None` for host-only schedules that hold no plan resources.
     _retained: Option<Arc<dyn Any + Send + Sync>>,
@@ -164,19 +235,57 @@ impl Pinned {
     }
 }
 
+/// What parameters a recorded graph instance currently binds.
+enum GraphBinding {
+    /// Unknown or placeholder storage (not yet bound, or forgotten after a
+    /// failed submission via [`Replays::unbind`]).
+    Unbound,
+    /// Bound to these parameters once the work queued so far ran.
+    Bound(Vec<u64>),
+}
+
+impl GraphBinding {
+    fn matches(&self, target: &[u64]) -> bool {
+        matches!(self, Self::Bound(bound) if bound.as_slice() == target)
+    }
+
+    fn take(&mut self) -> Option<Vec<u64>> {
+        match std::mem::replace(self, Self::Unbound) {
+            Self::Bound(bound) => Some(bound),
+            Self::Unbound => None,
+        }
+    }
+}
+
 struct Instance<G> {
     /// Its identity, which a submission's replays name it by
     /// ([`Replays::record`]).
     identity: u64,
     graph: G,
-    /// The parameters it binds once the work queued so far ran; none where
+    /// The parameters it binds once the work queued so far ran; unbound where
     /// that is unknown (`Replays::unbind`).
-    bound: Option<Vec<u64>>,
+    bound: GraphBinding,
     /// Clock of its last replay.
     used: u64,
 }
 
+/// Result of matching a submission's runs against kept graphs.
+enum Chosen {
+    /// Every run matched an existing graph.
+    Complete(Vec<u64>),
+    /// At least one run lacks a graph and must be recorded.
+    Incomplete(Vec<Option<u64>>),
+}
+
 impl<G> Replays<G> {
+    fn entries(&self) -> MutexGuard<'_, ReplayEntries<G>> {
+        self.entries.lock().expect("native graph replays lock is never poisoned")
+    }
+
+    fn by_plan(&self) -> MutexGuard<'_, HashMap<u64, PlanCounts>> {
+        self.by_plan.lock().expect("graph counts lock is never poisoned")
+    }
+
     /// What the graphs cost serving so far.
     pub(crate) fn counts(&self) -> GraphReplays {
         GraphReplays {
@@ -187,9 +296,7 @@ impl<G> Replays<G> {
 
     /// What the graphs of plan `plan`'s runs cost so far.
     pub(crate) fn plan_counts(&self, plan: u64) -> GraphReplays {
-        self.by_plan
-            .lock()
-            .expect("graph counts lock is never poisoned")
+        self.by_plan()
             .get(&plan)
             .map_or(GraphReplays::default(), |entry| entry.counts)
     }
@@ -197,18 +304,13 @@ impl<G> Replays<G> {
     /// Track a live plan key so its `by_plan` entry is pruned once every plan
     /// sharing that key has been dropped.
     pub(crate) fn register_plan(&self, plan: u64) {
-        self.by_plan
-            .lock()
-            .expect("graph counts lock is never poisoned")
-            .entry(plan)
-            .or_default()
-            .live += 1;
+        self.by_plan().entry(plan).or_default().live += 1;
     }
 
     /// Release a live plan key; removes its `by_plan` entry when no live plan
     /// remains for that key.
     pub(crate) fn unregister_plan(&self, plan: u64) {
-        let mut by_plan = self.by_plan.lock().expect("graph counts lock is never poisoned");
+        let mut by_plan = self.by_plan();
         if let Some(entry) = by_plan.get_mut(&plan) {
             entry.live = entry.live.saturating_sub(1);
             if entry.live == 0 {
@@ -219,7 +321,7 @@ impl<G> Replays<G> {
 
     #[cfg(test)]
     pub(crate) fn by_plan_len(&self) -> usize {
-        self.by_plan.lock().expect("graph counts lock is never poisoned").len()
+        self.by_plan().len()
     }
 
     /// Count a recording of a graph of `key` beside [`Self::record`]'s: one
@@ -238,15 +340,7 @@ impl<G> Replays<G> {
     /// `count` on the counts of the plan `key` is a graph of.
     fn of_plan(&self, key: &[u64], count: impl FnOnce(&mut GraphReplays)) {
         let plan = *key.first().expect("a graph's key begins with its plan");
-        count(
-            &mut self
-                .by_plan
-                .lock()
-                .expect("graph counts lock is never poisoned")
-                .entry(plan)
-                .or_default()
-                .counts,
-        );
+        count(&mut self.by_plan().entry(plan).or_default().counts);
     }
 }
 
@@ -276,43 +370,51 @@ impl<G: RecordedGraph> Replays<G> {
         prepare: impl FnOnce() -> Result<(), CallError>,
         mut record: impl FnMut(usize) -> Result<G, CallError>,
     ) -> Result<Vec<u64>, CallError> {
-        let lock = || self.entries.lock().expect("native graph replays lock is never poisoned");
-        let mut entries = lock();
-        let mut taken = Self::choose(&entries, graphs)?;
-        if taken.contains(&None) {
-            drop(entries);
-            prepare()?;
-            entries = lock();
-            taken = Self::choose(&entries, graphs)?;
-        }
-        // The rest record a graph each, which every later run of that
-        // binding takes, and where updates run in queue order every later
-        // run of its shape.
-        for index in 0..graphs.len() {
-            if taken[index].is_some() {
-                continue;
-            }
-            let Shaped { key, bound } = &graphs[index];
-            let graph = record(index)?;
-            let identity = self.keep(&mut entries, key, graph, G::recorded_bound().then(|| bound.clone()), retained);
-            for later in index..graphs.len() {
-                if taken[later].is_none()
-                    && graphs[later].key == *key
-                    && (G::updates_in_flight() || graphs[later].bound == *bound)
-                {
-                    taken[later] = Some(identity);
+        let mut entries = self.entries();
+        let taken = match Self::choose(&mut entries, graphs)? {
+            Chosen::Complete(taken) => taken,
+            Chosen::Incomplete(_) => {
+                drop(entries);
+                prepare()?;
+                entries = self.entries();
+                match Self::choose(&mut entries, graphs)? {
+                    Chosen::Complete(taken) => taken,
+                    Chosen::Incomplete(mut partial) => {
+                        // The rest record a graph each, which every later run
+                        // of that binding takes, and where updates run in
+                        // queue order every later run of its shape.
+                        let mut resolved = Vec::with_capacity(graphs.len());
+                        for index in 0..graphs.len() {
+                            let identity = match partial[index] {
+                                Some(identity) => identity,
+                                None => {
+                                    let Shaped { key, bound } = &graphs[index];
+                                    let graph = record(index)?;
+                                    let binding = if G::recorded_bound() {
+                                        GraphBinding::Bound(bound.clone())
+                                    } else {
+                                        GraphBinding::Unbound
+                                    };
+                                    let identity = self.keep(&mut entries, key, graph, binding, retained);
+                                    for later in index + 1..graphs.len() {
+                                        if partial[later].is_none()
+                                            && graphs[later].key == *key
+                                            && (G::updates_in_flight() || graphs[later].bound == *bound)
+                                        {
+                                            partial[later] = Some(identity);
+                                        }
+                                    }
+                                    identity
+                                }
+                            };
+                            resolved.push(identity);
+                        }
+                        resolved
+                    }
                 }
             }
-        }
-        let taken = taken.into_iter().map(|taken| taken.expect("every run takes a graph")).collect::<Vec<_>>();
+        };
         Self::fit(&mut entries, &taken, budget);
-        entries.clock += 1;
-        let clock = entries.clock;
-        for (Shaped { key, .. }, identity) in graphs.iter().zip(&taken) {
-            let replay = entries.graphs.get_mut(key.as_slice()).expect("a taken graph is kept under its run's shape");
-            let instance = replay.graphs.iter_mut().find(|instance| instance.identity == *identity).expect("a taken graph is kept");
-            instance.used = clock;
-        }
         Ok(taken)
     }
 
@@ -327,56 +429,32 @@ impl<G: RecordedGraph> Replays<G> {
         derive: impl FnOnce() -> G,
         use_graph: impl FnOnce(&mut G) -> Result<(), CallError>,
     ) -> Result<(), CallError> {
-        let lock = || self.entries.lock().expect("native graph replays lock is never poisoned");
-        let mut entries = lock();
-        if entries.graphs.get(key).is_some_and(|replay| !replay.graphs.is_empty()) {
-            entries.clock += 1;
-            let clock = entries.clock;
-            let instance = entries
-                .graphs
-                .get_mut(key)
-                .expect("checked present")
-                .graphs
-                .first_mut()
-                .expect("checked non-empty");
-            instance.used = clock;
-            return use_graph(&mut instance.graph);
+        let mut entries = self.entries();
+        if let Some(graph) = entries.touch_first_mut(key) {
+            return use_graph(graph);
         }
         drop(entries);
         let graph = derive();
-        let mut entries = lock();
-        if entries.graphs.get(key).is_some_and(|replay| !replay.graphs.is_empty()) {
-            entries.clock += 1;
-            let clock = entries.clock;
-            let instance = entries
-                .graphs
-                .get_mut(key)
-                .expect("checked present")
-                .graphs
-                .first_mut()
-                .expect("checked non-empty");
-            instance.used = clock;
-            return use_graph(&mut instance.graph);
+        let mut entries = self.entries();
+        if let Some(graph) = entries.touch_first_mut(key) {
+            return use_graph(graph);
         }
+        Self::fit_with(&mut entries, &[], graph.census(), budget);
         let identity = entries.next;
         entries.next += 1;
         entries.clock += 1;
         let used = entries.clock;
-        entries.graphs.insert(
-            Arc::from(key),
-            Replay {
-                graphs: vec![Instance { identity, graph, bound: Some(Vec::new()), used }],
-                _retained: None,
-                pinned: Vec::new(),
-            },
-        );
-        Self::fit(&mut entries, &[identity], budget);
-        let instance = entries
-            .graphs
-            .get_mut(key)
-            .and_then(|replay| replay.graphs.first_mut())
-            .expect("inserted unbound graph is kept");
-        use_graph(&mut instance.graph)
+        let replay = entries.graphs.entry(Arc::from(key)).or_insert(Replay {
+            graphs: ReplayGraphs::singleton(Instance {
+                identity,
+                graph,
+                bound: GraphBinding::Bound(Vec::new()),
+                used,
+            }),
+            _retained: None,
+            pinned: Vec::new(),
+        });
+        use_graph(&mut replay.graphs.first_mut().graph)
     }
 
     /// Keep `per_flight` graphs of shape `key` for each of `flights`, those
@@ -398,31 +476,34 @@ impl<G: RecordedGraph> Replays<G> {
         prepare: impl FnOnce() -> Result<(), seismic_compiler::errors::ExecutionError>,
         mut record: impl FnMut() -> Result<G, seismic_compiler::errors::ExecutionError>,
     ) -> Result<(), seismic_compiler::errors::ExecutionError> {
-        let lock = || self.entries.lock().expect("native graph replays lock is never poisoned");
         let kept = |entries: &ReplayEntries<G>| entries.graphs.get(key).map_or(0, |replay| replay.graphs.len());
         let beside = |entries: &ReplayEntries<G>| entries.graphs.get(key).map_or(0, |replay| replay.pinned_beside(flights));
-        let mut entries = lock();
+        let mut entries = self.entries();
         let mut count = beside(&entries) + per_flight * flights.load(std::sync::atomic::Ordering::Acquire);
         if kept(&entries) < count {
             drop(entries);
             prepare()?;
-            entries = lock();
+            entries = self.entries();
             count = beside(&entries) + per_flight * flights.load(std::sync::atomic::Ordering::Acquire);
         }
         for _ in kept(&entries)..count {
             let graph = record()?;
-            self.keep(&mut entries, key, graph, None, retained);
+            self.keep(&mut entries, key, graph, GraphBinding::Unbound, retained);
         }
         if let Some(replay) = entries.graphs.get_mut(key) {
             replay.pinned.retain(|pinned| !Arc::ptr_eq(&pinned.flights, flights));
             replay.pinned.push(Pinned { per_flight, flights: flights.clone() });
         }
-        let own = entries.graphs.get(key).map(|replay| replay.graphs.iter().map(|instance| instance.identity).collect::<Vec<_>>()).unwrap_or_default();
+        let own = entries
+            .graphs
+            .get(key)
+            .map(|replay| replay.graphs.iter().map(|instance| instance.identity).collect::<Vec<_>>())
+            .unwrap_or_default();
         Self::fit(&mut entries, &own, budget);
         Ok(())
     }
 
-    /// Keep `graph`, just recorded, of shape `key`, binding `bound` (none
+    /// Keep `graph`, just recorded, of shape `key`, binding `bound` (unbound
     /// until its first replay binds it): counted recorded, and the most
     /// recently used, so it is released after every graph kept before it.
     /// Returns its identity.
@@ -431,7 +512,7 @@ impl<G: RecordedGraph> Replays<G> {
         entries: &mut ReplayEntries<G>,
         key: &[u64],
         graph: G,
-        bound: Option<Vec<u64>>,
+        bound: GraphBinding,
         retained: &Arc<dyn Any + Send + Sync>,
     ) -> u64 {
         self.count_recorded(key);
@@ -439,13 +520,14 @@ impl<G: RecordedGraph> Replays<G> {
         entries.next += 1;
         entries.clock += 1;
         let used = entries.clock;
+        let instance = Instance { identity, graph, bound, used };
         if let Some(replay) = entries.graphs.get_mut(key) {
-            replay.graphs.push(Instance { identity, graph, bound, used });
+            replay.graphs.push(instance);
         } else {
             entries.graphs.insert(
                 Arc::from(key),
                 Replay {
-                    graphs: vec![Instance { identity, graph, bound, used }],
+                    graphs: ReplayGraphs::singleton(instance),
                     _retained: Some(retained.clone()),
                     pinned: Vec::new(),
                 },
@@ -455,18 +537,20 @@ impl<G: RecordedGraph> Replays<G> {
     }
 
     /// The graph each of `graphs` takes of those kept ([`Self::record`]),
-    /// none where it would record one.
-    fn choose(entries: &ReplayEntries<G>, graphs: &[Shaped]) -> Result<Vec<Option<u64>>, CallError> {
+    /// stamping each chosen graph as most recently used; returns
+    /// [`Chosen::Incomplete`] where any run lacks a graph and must record one.
+    fn choose(entries: &mut ReplayEntries<G>, graphs: &[Shaped]) -> Result<Chosen, CallError> {
+        entries.clock += 1;
+        let clock = entries.clock;
         let mut taken: Vec<Option<u64>> = vec![None; graphs.len()];
         // A run whose binding a graph holds takes it, every run of that
         // binding alike.
         for (index, shaped) in graphs.iter().enumerate() {
-            if let Some(replay) = entries.graphs.get(shaped.key.as_slice()) {
-                taken[index] = replay
-                    .graphs
-                    .iter()
-                    .find(|instance| instance.bound.as_ref() == Some(&shaped.bound))
-                    .map(|instance| instance.identity);
+            if let Some(replay) = entries.graphs.get_mut(shaped.key.as_slice()) {
+                if let Some(instance) = replay.graphs.iter_mut().find(|instance| instance.bound.matches(&shaped.bound)) {
+                    instance.used = clock;
+                    taken[index] = Some(instance.identity);
+                }
             }
         }
         // Another takes a graph of its shape that may be updated now: one no
@@ -475,31 +559,37 @@ impl<G: RecordedGraph> Replays<G> {
             if taken[index].is_some() {
                 continue;
             }
-            let Some(replay) = entries.graphs.get(graphs[index].key.as_slice()) else {
+            let Some(replay) = entries.graphs.get_mut(graphs[index].key.as_slice()) else {
                 continue;
             };
-            let mut free = None;
-            for instance in &replay.graphs {
+            let mut free: Option<&mut Instance<G>> = None;
+            for instance in replay.graphs.iter_mut() {
                 let updatable = G::updates_in_flight()
                     || (!taken.contains(&Some(instance.identity)) && instance.graph.idle()?);
-                if updatable && free.is_none_or(|(used, _)| instance.used < used) {
-                    free = Some((instance.used, instance.identity));
+                if updatable && free.as_ref().is_none_or(|best| instance.used < best.used) {
+                    free = Some(instance);
                 }
             }
-            let free = free.map(|(_, identity)| identity);
-            taken[index] = free;
-            // The graph serves every later run of its binding, and where
-            // updates run in queue order every other binding of its shape.
-            for later in index + 1..graphs.len() {
-                if taken[later].is_none()
-                    && graphs[later].key == graphs[index].key
-                    && (G::updates_in_flight() || graphs[later].bound == graphs[index].bound)
-                {
-                    taken[later] = free;
+            if let Some(instance) = free {
+                instance.used = clock;
+                let identity = instance.identity;
+                taken[index] = Some(identity);
+                // The graph serves every later run of its binding, and where
+                // updates run in queue order every other binding of its shape.
+                for later in index + 1..graphs.len() {
+                    if taken[later].is_none()
+                        && graphs[later].key == graphs[index].key
+                        && (G::updates_in_flight() || graphs[later].bound == graphs[index].bound)
+                    {
+                        taken[later] = Some(identity);
+                    }
                 }
             }
         }
-        Ok(taken)
+        match taken.iter().copied().collect::<Option<Vec<u64>>>() {
+            Some(complete) => Ok(Chosen::Complete(complete)),
+            None => Ok(Chosen::Incomplete(taken)),
+        }
     }
 
     /// Release graphs while they exceed `budget`, the least recently
@@ -507,8 +597,8 @@ impl<G: RecordedGraph> Replays<G> {
     /// more than their owners do.
     pub(crate) fn fit_to(&self, budget: GraphCensus) {
         let released = {
-            let mut entries = self.entries.lock().expect("native graph replays lock is never poisoned");
-            Self::release_beyond(&mut entries, &[], budget)
+            let mut entries = self.entries();
+            Self::release_beyond(&mut entries, &[], GraphCensus::default(), budget).0
         };
         // Dropped after the lock, as what they keep may drop holds.
         drop(released);
@@ -527,24 +617,22 @@ impl<G: RecordedGraph> Replays<G> {
         update: impl FnOnce(&mut G, Option<&[u64]>) -> Result<(), CallError>,
         replay: impl FnOnce(&mut G) -> Result<(), CallError>,
     ) -> Result<(), CallError> {
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("native graph replays lock is never poisoned");
+        let mut entries = self.entries();
+        let entries = &mut *entries;
         entries.clock += 1;
         let clock = entries.clock;
         let instance = entries
             .graphs
             .get_mut(shaped.key.as_slice())
-            .and_then(|replay| replay.graphs.iter_mut().find(|instance| instance.identity == identity))
+            .and_then(|replay| replay.graphs.find_mut(identity))
             .expect("a submission replays only graphs chosen for it");
         instance.used = clock;
-        if instance.bound.as_ref() != Some(&shaped.bound) {
+        if !instance.bound.matches(&shaped.bound) {
             // Unknown until the update is queued: a failure in it leaves the
             // graph to be updated whole.
             let bound = instance.bound.take();
             update(&mut instance.graph, bound.as_deref())?;
-            instance.bound = Some(shaped.bound.clone());
+            instance.bound = GraphBinding::Bound(shaped.bound.clone());
             self.count_updated(&shaped.key);
         }
         replay(&mut instance.graph)
@@ -557,10 +645,7 @@ impl<G: RecordedGraph> Replays<G> {
     /// graphs drop after it is, as what they keep may drop holds.
     pub(crate) fn clear_unheld(&self, unheld: impl FnOnce() -> bool) {
         let graphs = {
-            let mut entries = self
-                .entries
-                .lock()
-                .expect("native graph replays lock is never poisoned");
+            let mut entries = self.entries();
             if !unheld() {
                 return;
             }
@@ -575,14 +660,11 @@ impl<G: RecordedGraph> Replays<G> {
     /// a graph's next replay updates it whole, `forget` dropping the graph's
     /// own record of its bindings.
     pub(crate) fn unbind(&self, graphs: &[Shaped], mut forget: impl FnMut(&mut G)) {
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("native graph replays lock is never poisoned");
+        let mut entries = self.entries();
         for shaped in graphs {
             if let Some(replay) = entries.graphs.get_mut(shaped.key.as_slice()) {
-                for instance in &mut replay.graphs {
-                    instance.bound = None;
+                for instance in replay.graphs.iter_mut() {
+                    instance.bound = GraphBinding::Unbound;
                     forget(&mut instance.graph);
                 }
             }
@@ -593,10 +675,7 @@ impl<G: RecordedGraph> Replays<G> {
     /// replayed: a graph's census can change as it is replayed (a Vulkan
     /// division recorded again, `vulkan::Divided`).
     pub(crate) fn fit_after_replay(&self, taken: &[u64], budget: GraphCensus) {
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("native graph replays lock is never poisoned");
+        let mut entries = self.entries();
         Self::fit(&mut entries, taken, budget);
     }
 
@@ -605,7 +684,11 @@ impl<G: RecordedGraph> Replays<G> {
     /// holds every graph its owners' runs in flight can need, so the submission's
     /// own past it break an invariant.
     fn fit(entries: &mut ReplayEntries<G>, taken: &[u64], budget: GraphCensus) {
-        let (released, held) = Self::release_beyond(entries, taken, budget);
+        Self::fit_with(entries, taken, GraphCensus::default(), budget);
+    }
+
+    fn fit_with(entries: &mut ReplayEntries<G>, taken: &[u64], incoming: GraphCensus, budget: GraphCensus) {
+        let (released, held) = Self::release_beyond(entries, taken, incoming, budget);
         assert!(
             held.within(budget),
             "a submission's graphs, {held:?}, exceed every graph its owners hold, {budget:?}"
@@ -614,18 +697,21 @@ impl<G: RecordedGraph> Replays<G> {
     }
 
     /// Take out graphs no run of a submission takes (`taken`), the least
-    /// recently replayed first, while the graphs exceed `budget`; returns
-    /// them, to be dropped, and the census of those kept.
-    fn release_beyond(entries: &mut ReplayEntries<G>, taken: &[u64], budget: GraphCensus) -> (Vec<Instance<G>>, GraphCensus) {
-        let census = |entries: &ReplayEntries<G>| {
-            entries
-                .graphs
-                .values()
-                .flat_map(|replay| &replay.graphs)
-                .try_fold(GraphCensus::default(), |census, instance| census.plus(instance.graph.census()))
-                .expect("a device's recorded graphs' census fits u64")
-        };
-        let mut held = census(entries);
+    /// recently replayed first, while the kept graphs plus `incoming` exceed
+    /// `budget`; returns them, to be dropped, and the census of those kept
+    /// (including `incoming`).
+    fn release_beyond(
+        entries: &mut ReplayEntries<G>,
+        taken: &[u64],
+        incoming: GraphCensus,
+        budget: GraphCensus,
+    ) -> (Vec<Instance<G>>, GraphCensus) {
+        let mut held = entries
+            .graphs
+            .values()
+            .flat_map(|replay| replay.graphs.iter())
+            .try_fold(incoming, |census, instance| census.plus(instance.graph.census()))
+            .expect("a device's recorded graphs' census fits u64");
         let mut released = Vec::new();
         if held.within(budget) {
             return (released, held);
@@ -638,18 +724,20 @@ impl<G: RecordedGraph> Replays<G> {
             .collect::<Vec<_>>();
         others.sort_unstable();
         for (_, identity, key) in others {
-            let replay = entries.graphs.get_mut(&key).expect("an other graph's shape is recorded");
+            let Entry::Occupied(mut entry) = entries.graphs.entry(key) else {
+                unreachable!("an other graph's shape is recorded");
+            };
             // A shape's graphs kept for its launches in flight stay.
-            if replay.graphs.len() <= replay.pinned() {
+            if entry.get().graphs.len() <= entry.get().pinned() {
                 continue;
             }
-            let at = replay.graphs.iter().position(|instance| instance.identity == identity).expect("an other graph is kept");
-            let instance = replay.graphs.swap_remove(at);
+            let instance = match entry.get_mut().graphs.take(identity) {
+                TakeOutcome::Taken(instance) => instance,
+                TakeOutcome::Last => entry.remove().graphs.first,
+                TakeOutcome::Missing => unreachable!("an other graph is kept"),
+            };
             held = held.minus(instance.graph.census()).expect("a kept graph is part of the census");
             released.push(instance);
-            if replay.graphs.is_empty() {
-                entries.graphs.remove(&key);
-            }
             if held.within(budget) {
                 break;
             }

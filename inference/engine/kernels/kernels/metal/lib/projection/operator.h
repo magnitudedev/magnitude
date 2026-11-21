@@ -547,8 +547,8 @@ inline void zero_segment(thread const Out &out, uint m, uint n, uint row0, uint 
 }
 
 // A segment's batched threadgroup `tile`: the matrix GEMV where MATRIX takes
-// it and it serves the weights (`matrix_form`, over whole 256-column blocks
-// unless symmetric), else the batched rows, whose threadgroups past the
+// it and it serves the weights (`matrix_form`, over whole 32-column groups),
+// else the batched rows, whose threadgroups past the
 // segment's rows (the matrix GEMV's grid) return. A pair takes `w` and `v`
 // together.
 template <typename W, typename V, bool PAIRED, uint BATCH_ROWS, uint PARTS, uint MATRIX, bool COLUMNS, typename In,
@@ -557,7 +557,7 @@ inline void segment_batch(thread const In &in, thread const Out &out, thread con
     thread const Weights<V> &v, uint m, uint n, uint k, uint tile, threadgroup uchar *shared, uint simdgroups,
     uint sg, uint lane) {
     if constexpr (MATRIX == 1 && matrix_form<W>::available && (!PAIRED || matrix_form<V>::available)) {
-        if (k % 256u == 0 || (matrix_form<W>::symmetric32 && (!PAIRED || matrix_form<V>::symmetric32))) {
+        if (k % 32u == 0) {
             if constexpr (PAIRED)
                 gemv_matrix_paired<W, V, PARTS>(in, out, w, v, m, n, k, tile, shared, simdgroups, sg, lane);
             else if constexpr (COLUMNS)
@@ -916,6 +916,31 @@ struct PartPartial {
         return;                                                                                                 \
     PROJECTION_SEGMENT_CHAIN                                                                                    \
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_COMBINE, )
+
+#define PROJECTION_SEGMENT_PART_BATCH(s, ...)                                                                   \
+    else if (segment == s##u)                                                                                   \
+        projection::gemv_batch_runtime<PROJECTION_PACKET(s), BATCH_ROWS>(x,                                     \
+            projection::PartPartial{sums.y, sums.row, sums.column + PROJECTION_FIRST_##s}, w##s, m,             \
+            uint(PROJECTION_N##s), width, local, shared, simdgroups, sg, lane, part * (width / 32u));
+
+#define PROJECTION_SEGMENTED_PARTS_BATCH                                                                        \
+    PROJECTION_OPERANDS;                                                                                        \
+    const uint parts = uint(PROJECTION_PARTS), width = k / parts;                                               \
+    const uint per = 8u * simdgroups * BATCH_ROWS;                                                              \
+    const uint outputs = 0u PROJECTION_EACH_SEGMENT(PROJECTION_ADD_ROWS, );                                     \
+    const uint tiles = 0u PROJECTION_EACH_SEGMENT(PROJECTION_ADD_TILES, per);                                   \
+    const uint part = position.x / tiles, row_tile = position.x % tiles;                                        \
+    PROJECTION_PART_INPUT(x, part, row_tile == 0u);                                                             \
+    const projection::PartPartial sums{partials, ulong(parts) * outputs, ulong(part) * outputs};                \
+    PROJECTION_SEGMENT_FIND(row_tile, per);                                                                     \
+    PROJECTION_SEGMENT_CHAIN                                                                                    \
+    PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_BATCH, )                                                    \
+    threadgroup uint last;                                                                                      \
+    const uint thread_index = sg * 32u + lane, threads = simdgroups * 32u;                                      \
+    if (!arrive::last(arrivals + row_tile, parts, &last, thread_index))                                         \
+        return;                                                                                                 \
+    PROJECTION_SEGMENT_CHAIN                                                                                    \
+    PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_COMBINE, )
 #endif
 
 // ---------------------------------------------------------------------------
@@ -1141,15 +1166,17 @@ constexpr uint ordered_walk_batch() {
 
 template <uint MAXM>
 constexpr uint ordered_mixed_w_per_sg() {
-    return (MAXM == 1u) ? 4u : ((MAXM == 2u) ? 2u : 1u);
+    return 4u;
 }
-// The simdgroups of a threadgroup that hold an ordered segment's rows: at one
-// row, two (a tile of 8 rows), so a router of a few hundred rows reads its
-// weights from many cores rather than a few; the rest of the threadgroup
-// stages the row and leaves. `dense.seismic`'s `ordered_gemv1` grid matches.
+// The simdgroups of a threadgroup that hold an ordered segment's rows: two
+// at 1..2 rows (spreading a small router across many cores), four at 3..4
+// rows, and up to eight at 5..8 rows so compute-heavy verify steps keep every
+// simdgroup active and avoid redundant RMS/staging passes. `dense.seismic`'s
+// `ordered_gemv1..8` grids match.
 template <uint MAXM, uint SIMDGROUPS>
 constexpr uint ordered_mixed_sgs() {
-    return (MAXM == 1u && SIMDGROUPS > 2u) ? 2u : SIMDGROUPS;
+    constexpr uint cap = (MAXM >= 8u) ? 8u : ((MAXM >= 4u) ? 4u : 2u);
+    return (SIMDGROUPS > cap) ? cap : SIMDGROUPS;
 }
 template <uint MAXM, uint SIMDGROUPS>
 constexpr uint ordered_mixed_rows() {
@@ -1375,10 +1402,11 @@ inline void ordered_gemv_run(thread const In &in, thread const Out &out, thread 
 }
 
 // Row-specialized reference-order GEMV (`MAXM` in {1, 2, 4, 8}) for mixed
-// ordered/unordered segmented launches (`ordered_gemv1..8`): maps the four
-// 8-lane quarters of each simdgroup across `(4x1)` at `MAXM == 1`, `(2x2)` at
-// `MAXM == 2`, `(1x4)` at `MAXM == 4`, and `(1x8)` (`2` rows/quarter) at
-// `MAXM == 8`, reading lane-strided `uint4` staged activations conflict-free.
+// ordered/unordered segmented launches (`ordered_gemv1..8`): each of the four
+// 8-lane quarters of a simdgroup owns a distinct weight row (`W_PER_SG == 4`),
+// fetches and decodes its weights once per 64-column block, and reuses them
+// across all `m <= MAXM` activation rows, reading lane-strided `uint4` staged
+// activations conflict-free.
 template <typename W, bool PUBLISH, uint MAXM, uint SIMDGROUPS, typename In, typename Out, typename PubOut>
 inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     PubOut pub_out, ulong pub_stride0, ulong pub_stride1, bool publish_rows, uint m, uint n, uint k, uint local_tile,
@@ -1388,10 +1416,8 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
     constexpr uint W_PER_SG = ordered_mixed_w_per_sg<MAXM>();
     const uint q = lane >> 3u;
     const uint u = lane & 7u;
-    const uint w_off = (MAXM == 1u) ? q : ((MAXM == 2u) ? (q >> 1u) : 0u);
-    const uint r0 = (MAXM == 1u) ? 0u : ((MAXM == 2u) ? (q & 1u) : q);
     const uint sg_base_row = local_tile * ordered_mixed_rows<MAXM, SIMDGROUPS>() + sg * W_PER_SG;
-    const uint w_row = sg_base_row + w_off;
+    const uint w_row = sg_base_row + q;
     const bool sg_has_rows = sg < ordered_mixed_sgs<MAXM, SIMDGROUPS>() && sg_base_row < n;
     const bool has_row = sg_has_rows && w_row < n;
     const uint p_own = u >> 2u;
@@ -1504,7 +1530,7 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
     }
     constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : 4608u));
     const uint packets = (k + 31u) >> 5u;
-    const uint avail_bytes = metal::max(min_shared_bytes, metal::min(packets * MAXM, 448u) * 64u);
+    const uint avail_bytes = metal::max(min_shared_bytes, metal::min(packets * MAXM, 256u) * 64u);
     threadgroup float *smem_inv = reinterpret_cast<threadgroup float *>(shared);
     in.ordered_inverses_sram(m, smem_inv, smem_inv, avail_bytes >> 2u, sg, lane, SIMDGROUPS);
     const float inv_lane = (lane < MAXM && lane < m) ? smem_inv[lane] : 0.0f;
@@ -1533,11 +1559,10 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
         const uint max_blocks = metal::min(total_blocks, avail_bytes / (MAXM * 128u));
         const uint row_cols = max_blocks * 64u;
         threadgroup uint4 *x_packed = reinterpret_cast<threadgroup uint4 *>(shared);
-        float acc0 = 0.0f;
-        float acc1 = 0.0f;
-        const bool has_r0 = r0 < m;
-        const uint r1 = r0 + 4u;
-        const bool has_r1 = (MAXM == 8u) && (r1 < m);
+        float acc[MAXM];
+        PROJECTION_UNROLL
+        for (uint r = 0u; r < MAXM; ++r)
+            acc[r] = 0.0f;
         for (uint k0 = 0u; k0 < k; k0 += row_cols) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const uint chunk = metal::min(row_cols, k - k0);
@@ -1589,60 +1614,33 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
                             wt[j] = 0.0f;
                     }
                     ordered_transpose8(wt, u);
-                    if constexpr (MAXM <= 4u) {
-                        if (has_r0) {
-                            float4 xe, xo;
-                            A::split8(x_packed[(r0 * chunk_blocks + xb) * 8u + u], xe, xo);
-                            if (sub + 64u <= chunk) {
-                                acc0 = metal::fma(xe.x, wt[0], acc0);
-                                acc0 = metal::fma(xo.x, wt[1], acc0);
-                                acc0 = metal::fma(xe.y, wt[2], acc0);
-                                acc0 = metal::fma(xo.y, wt[3], acc0);
-                                acc0 = metal::fma(xe.z, wt[4], acc0);
-                                acc0 = metal::fma(xo.z, wt[5], acc0);
-                                acc0 = metal::fma(xe.w, wt[6], acc0);
-                                acc0 = metal::fma(xo.w, wt[7], acc0);
-                            } else {
+                    if (sub + 64u <= chunk) {
+                        PROJECTION_UNROLL
+                        for (uint r = 0u; r < MAXM; ++r) {
+                            if (r < m) {
+                                float4 xe, xo;
+                                A::split8(x_packed[(r * chunk_blocks + xb) * 8u + u], xe, xo);
+                                acc[r] = metal::fma(xe.x, wt[0], acc[r]);
+                                acc[r] = metal::fma(xo.x, wt[1], acc[r]);
+                                acc[r] = metal::fma(xe.y, wt[2], acc[r]);
+                                acc[r] = metal::fma(xo.y, wt[3], acc[r]);
+                                acc[r] = metal::fma(xe.z, wt[4], acc[r]);
+                                acc[r] = metal::fma(xo.z, wt[5], acc[r]);
+                                acc[r] = metal::fma(xe.w, wt[6], acc[r]);
+                                acc[r] = metal::fma(xo.w, wt[7], acc[r]);
+                            }
+                        }
+                    } else {
+                        PROJECTION_UNROLL
+                        for (uint r = 0u; r < MAXM; ++r) {
+                            if (r < m) {
+                                float4 xe, xo;
+                                A::split8(x_packed[(r * chunk_blocks + xb) * 8u + u], xe, xo);
                                 const float xv[8] = {xe.x, xo.x, xe.y, xo.y, xe.z, xo.z, xe.w, xo.w};
                                 PROJECTION_UNROLL
                                 for (uint s = 0u; s < 8u; ++s) {
                                     if (sub + 8u * s + u < chunk)
-                                        acc0 = metal::fma(xv[s], wt[s], acc0);
-                                }
-                            }
-                        }
-                    } else {
-                        float4 xe0 = float4(0.0f), xo0 = float4(0.0f);
-                        float4 xe1 = float4(0.0f), xo1 = float4(0.0f);
-                        if (has_r0)
-                            A::split8(x_packed[(r0 * chunk_blocks + xb) * 8u + u], xe0, xo0);
-                        if (has_r1)
-                            A::split8(x_packed[(r1 * chunk_blocks + xb) * 8u + u], xe1, xo1);
-                        if (sub + 64u <= chunk) {
-                            acc0 = metal::fma(xe0.x, wt[0], acc0);
-                            acc1 = metal::fma(xe1.x, wt[0], acc1);
-                            acc0 = metal::fma(xo0.x, wt[1], acc0);
-                            acc1 = metal::fma(xo1.x, wt[1], acc1);
-                            acc0 = metal::fma(xe0.y, wt[2], acc0);
-                            acc1 = metal::fma(xe1.y, wt[2], acc1);
-                            acc0 = metal::fma(xo0.y, wt[3], acc0);
-                            acc1 = metal::fma(xo1.y, wt[3], acc1);
-                            acc0 = metal::fma(xe0.z, wt[4], acc0);
-                            acc1 = metal::fma(xe1.z, wt[4], acc1);
-                            acc0 = metal::fma(xo0.z, wt[5], acc0);
-                            acc1 = metal::fma(xo1.z, wt[5], acc1);
-                            acc0 = metal::fma(xe0.w, wt[6], acc0);
-                            acc1 = metal::fma(xe1.w, wt[6], acc1);
-                            acc0 = metal::fma(xo0.w, wt[7], acc0);
-                            acc1 = metal::fma(xo1.w, wt[7], acc1);
-                        } else {
-                            const float xv0[8] = {xe0.x, xo0.x, xe0.y, xo0.y, xe0.z, xo0.z, xe0.w, xo0.w};
-                            const float xv1[8] = {xe1.x, xo1.x, xe1.y, xo1.y, xe1.z, xo1.z, xe1.w, xo1.w};
-                            PROJECTION_UNROLL
-                            for (uint s = 0u; s < 8u; ++s) {
-                                if (sub + 8u * s + u < chunk) {
-                                    acc0 = metal::fma(xv0[s], wt[s], acc0);
-                                    acc1 = metal::fma(xv1[s], wt[s], acc1);
+                                        acc[r] = metal::fma(xv[s], wt[s], acc[r]);
                                 }
                             }
                         }
@@ -1651,13 +1649,13 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
             }
         }
         if (sg_has_rows) {
-            const float sum0 = ordered_combine8(acc0);
-            if (has_row && has_r0 && u == 0u)
-                out.store(r0, w_row, sum0);
-            if constexpr (MAXM == 8u) {
-                const float sum1 = ordered_combine8(acc1);
-                if (has_row && has_r1 && u == 0u)
-                    out.store(r1, w_row, sum1);
+            PROJECTION_UNROLL
+            for (uint r = 0u; r < MAXM; ++r) {
+                if (r < m) {
+                    const float sum = ordered_combine8(acc[r]);
+                    if (has_row && u == 0u)
+                        out.store(r, w_row, sum);
+                }
             }
         }
     }

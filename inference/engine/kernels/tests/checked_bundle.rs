@@ -118,8 +118,9 @@ fn launches_chosen_by_rows_up_to_a_draft_verification_are_row_classes() {
                             specialization = specialization.with_range(dimension, rows, rows);
                         }
                     }
+                    let bound = native.at_device(&seismic::device::BackendFloor(backend));
                     (0..native.launches.len())
-                        .map(|launch| native.reachable(&specialization, launch))
+                        .map(|launch| bound.reachable(&specialization, launch))
                         .collect::<Vec<_>>()
                 };
                 let active = (1..=verify).map(at).collect::<Vec<_>>();

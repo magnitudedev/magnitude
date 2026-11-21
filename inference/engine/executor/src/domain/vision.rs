@@ -136,16 +136,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let pending = PendingOperationOutcome {
             request,
             outcome: Outcome::Encode { features },
-            advance: None,
-            primed: None,
-            front: None,
+            payload: PendingPayload::Encode { image },
             rows: 0,
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: duration,
             timed,
-            image: Some(image),
-            awaited: None,
         };
         Ok((pending, bindings))
     }

@@ -70,6 +70,9 @@ pub fn describe(
                 });
             }
             let answers = crate::profile::probe_answers(&handle, store);
+            let properties = answers
+                .properties(&handle)
+                .map(seismic_lang::device::DeviceProperties::Metal);
             let report = MetalReport {
                 registry_id: handle.registry_id(),
                 name: handle.name(),
@@ -79,6 +82,7 @@ pub fn describe(
                 working_set: handle.recommended_working_set_bytes(),
                 max_allocation: handle.max_allocation_bytes(),
                 kinds: kinds(handle.has_unified_memory()),
+                properties,
             };
             (report, handle)
         })

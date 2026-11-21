@@ -11,7 +11,7 @@
 //! The encoding (serde) is versioned with the engine build: both ends
 //! exchange [`EngineBuild`] first and refuse a mismatch.
 
-use super::measure::{MeasureFailure, MeasureRequest};
+use super::measure::{MeasureFailure, MeasureRequest, MeasurementProgress};
 use crate::census::AllocationCensus;
 use crate::error::{LoadError, RequestError, UnloadCause};
 use crate::options::{ExecutionManifest, ReadyInfo};
@@ -249,6 +249,10 @@ pub enum WorkerMessage {
     },
     /// A `Measure` opened its device.
     Opened,
+    /// Standing benchmark progress updated.
+    MeasureProgress {
+        progress: MeasurementProgress,
+    },
     /// A `Measure` stored `record` of `key`.
     Recorded {
         key: PointKey,

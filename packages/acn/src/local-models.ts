@@ -142,6 +142,7 @@ export const projectLocalModelPreparation = (
       settledModels: catalog.settledModels + custom.settledModels,
       totalModels: catalog.totalModels + custom.totalModels,
     },
+    measurement: projectMeasurement(assessments.measurement),
   }
 }
 
@@ -161,10 +162,31 @@ export const assessmentTargetVisible = (
   assessment: CoordinatedLocalModelAssessment | undefined,
 ): assessment is VisibleCoordinatedLocalModelAssessment | undefined => assessment?._tag !== "Dropped"
 
-const projectMeasurement = (measurement: MeasurementState): MachineMeasurement =>
-  measurement._tag === "Failed"
-    ? { _tag: "Failed", retryAt: measurement.retryAt }
-    : { _tag: measurement._tag }
+const projectMeasurement = (measurement: MeasurementState): MachineMeasurement => {
+  switch (measurement._tag) {
+    case "Failed":
+      return { _tag: "Failed", retryAt: measurement.retryAt }
+    case "Measuring":
+      return {
+        _tag: "Measuring",
+        progress: Option.filter(measurement.progress, ({ completed, total }) => total > 0 && completed <= total),
+      }
+    case "Unmeasured":
+      return { _tag: "Unmeasured" }
+    case "Measured":
+      return { _tag: "Measured" }
+  }
+}
+
+/** Encoded form of `projectMeasurement` for `decodeLocalModelAssessment` (which expects raw optional fields, not `Option`). */
+const encodeMeasurement = (measurement: MeasurementState) => {
+  const projected = projectMeasurement(measurement)
+  if (projected._tag !== "Measuring") return projected
+  return Option.match(projected.progress, {
+    onNone: () => ({ _tag: "Measuring" as const }),
+    onSome: (progress) => ({ _tag: "Measuring" as const, progress }),
+  })
+}
 
 /** A pending speed carries the machine's measurement progress, which is what it waits on. */
 const projectPerformance = <Performance extends ModelPerformance>(
@@ -172,7 +194,7 @@ const projectPerformance = <Performance extends ModelPerformance>(
   measurement: MeasurementState,
 ) =>
   performance._tag === "Pending"
-    ? { _tag: "Pending" as const, measurement: projectMeasurement(measurement) }
+    ? { _tag: "Pending" as const, measurement: encodeMeasurement(measurement) }
     : performance as Exclude<Performance, { readonly _tag: "Pending" }>
 
 /** Every speed a fit carries waits on the same machine measurements. */

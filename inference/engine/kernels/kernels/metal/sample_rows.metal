@@ -18,8 +18,53 @@ constant constexpr uint no_token = 0xffffffffu;
 
 // The better of two (score, token) candidates: higher score, then lower token.
 inline bool sample_better(float score, uint token, float best_score, uint best_token) {
-    return best_token == no_token || (token != no_token
-        && (score > best_score || (score == best_score && token < best_token)));
+    return token != no_token &&
+        (best_token == no_token || score > best_score || (score == best_score && token < best_token));
+}
+
+template <bool NOISY>
+inline void sample_consider(
+    float value, uint token, bool masked,
+    device const uint *words, ulong mask_stride,
+    device const uint *draw, ulong draws_stride,
+    thread float &best, thread uint &best_token, thread uint &bad) {
+    bad |= uint(metal::isnan(value) || value == INFINITY);
+    if (!(value > -INFINITY && value < INFINITY))
+        return;
+    if (masked && ((words[ulong(token >> 5u) * mask_stride] >> (token & 31u)) & 1u) == 0u)
+        return;
+    const float score = NOISY ? (value + gumbel::noise(token, draw, draws_stride)) : value;
+    if (sample_better(score, token, best, best_token)) {
+        best = score;
+        best_token = token;
+    }
+}
+
+template <bool NOISY>
+inline void sample_scan_partition(
+    device const float *values, ulong logits_stride,
+    uint begin, uint end, uint thread_index, bool masked,
+    device const uint *words, ulong mask_stride,
+    device const uint *draw, ulong draws_stride,
+    thread float &best, thread uint &best_token, thread uint &bad) {
+    if (logits_stride == 1ul) {
+        const uint vec_end = begin + ((end - begin) & ~3u);
+        for (uint token = begin + thread_index * 4u; token < vec_end; token += sample_threads * 4u) {
+            const float4 v = float4(*reinterpret_cast<device const packed_float4 *>(values + token));
+            sample_consider<NOISY>(v.x, token, masked, words, mask_stride, draw, draws_stride, best, best_token, bad);
+            sample_consider<NOISY>(v.y, token + 1u, masked, words, mask_stride, draw, draws_stride, best, best_token, bad);
+            sample_consider<NOISY>(v.z, token + 2u, masked, words, mask_stride, draw, draws_stride, best, best_token, bad);
+            sample_consider<NOISY>(v.w, token + 3u, masked, words, mask_stride, draw, draws_stride, best, best_token, bad);
+        }
+        if (thread_index < end - vec_end) {
+            const uint token = vec_end + thread_index;
+            sample_consider<NOISY>(values[token], token, masked, words, mask_stride, draw, draws_stride, best, best_token, bad);
+        }
+    } else {
+        for (uint token = begin + thread_index; token < end; token += sample_threads) {
+            sample_consider<NOISY>(values[ulong(token) * logits_stride], token, masked, words, mask_stride, draw, draws_stride, best, best_token, bad);
+        }
+    }
 }
 
 // Reduce (score, token, bad) over a simdgroup.
@@ -55,21 +100,18 @@ kernel void sample_rows_partition(
     device const uint *draw = draws + ulong(row) * SEISMIC_DRAWS_STRIDE_0;
     // An unconstrained row admits every token; its mask row is never read.
     const bool masked = constrained[ulong(row) * SEISMIC_CONSTRAINED_STRIDE_0] != 0;
+    const bool noisy = draw[0] == 1u;
     float best = -INFINITY;
     uint best_token = no_token;
     uint bad = 0;
-    for (uint token = begin + thread_index; token < end; token += sample_threads) {
-        float value = values[ulong(token) * SEISMIC_LOGITS_STRIDE_1];
-        bad |= uint(metal::isnan(value) || value == INFINITY);
-        if (!(value > -INFINITY && value < INFINITY))
-            continue;
-        if (masked && ((words[ulong(token / 32u) * SEISMIC_MASK_STRIDE_1] >> (token % 32u)) & 1u) == 0u)
-            continue;
-        float score = value + gumbel::noise(token, draw, SEISMIC_DRAWS_STRIDE_1);
-        if (sample_better(score, token, best, best_token)) {
-            best = score;
-            best_token = token;
-        }
+    if (noisy) {
+        sample_scan_partition<true>(
+            values, SEISMIC_LOGITS_STRIDE_1, begin, end, thread_index, masked,
+            words, SEISMIC_MASK_STRIDE_1, draw, SEISMIC_DRAWS_STRIDE_1, best, best_token, bad);
+    } else {
+        sample_scan_partition<false>(
+            values, SEISMIC_LOGITS_STRIDE_1, begin, end, thread_index, masked,
+            words, SEISMIC_MASK_STRIDE_1, draw, SEISMIC_DRAWS_STRIDE_1, best, best_token, bad);
     }
     sample_simd_reduce(best, best_token, bad);
     if (lane == 0) {

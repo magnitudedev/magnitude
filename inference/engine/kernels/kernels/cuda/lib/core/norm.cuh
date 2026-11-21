@@ -21,6 +21,17 @@ __device__ __forceinline__ float square(float centered, float squares) {
     return fmaf(centered, centered, squares);
 }
 
+// Componentwise `square` over four centred values.
+__device__ __forceinline__ float4 square4(float4 centered, float4 squares) {
+    return make_float4(fmaf(centered.x, centered.x, squares.x), fmaf(centered.y, centered.y, squares.y),
+                       fmaf(centered.z, centered.z, squares.z), fmaf(centered.w, centered.w, squares.w));
+}
+
+// Pairwise sum of four lane accumulators.
+__device__ __forceinline__ float sum4(float4 values) {
+    return (values.x + values.y) + (values.z + values.w);
+}
+
 // The inverse deviation of a row of `width` values whose centred squares sum
 // to `squares` (the mean taken as 0: its root mean square).
 __device__ __forceinline__ float inverse(float squares, unsigned width, float epsilon) {
@@ -39,6 +50,15 @@ __device__ __forceinline__ float apply(float centered, float inverse, float weig
         return centered * inverse + bias;
     else
         return centered * inverse;
+}
+
+// Four centred values normed, componentwise `apply`.
+template <bool WEIGHT, bool BIAS>
+__device__ __forceinline__ float4 apply4(float4 centered, float inverse, float4 weight, float4 bias) {
+    return make_float4(apply<WEIGHT, BIAS>(centered.x, inverse, weight.x, bias.x),
+                       apply<WEIGHT, BIAS>(centered.y, inverse, weight.y, bias.y),
+                       apply<WEIGHT, BIAS>(centered.z, inverse, weight.z, bias.z),
+                       apply<WEIGHT, BIAS>(centered.w, inverse, weight.w, bias.w));
 }
 
 }  // namespace row_norm

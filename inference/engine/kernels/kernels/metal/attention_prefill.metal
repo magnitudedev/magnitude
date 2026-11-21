@@ -121,8 +121,11 @@ kernel void attention_prefill_merge(
     uint column [[thread_index_in_threadgroup]]) {
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
+    threadgroup float weights[attention::PREFILL_MERGE_MAX_PARTS];
+    threadgroup float shared_inv_divisor;
     attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, element::Out<activation::Act>(result_cells), partials,
-        statistics, counts, SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
+        statistics, counts, weights, shared_inv_divisor, SEISMIC_DIM_M, group.x, group.y, column,
+        SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 }
 
 // A layer with picks (KS > 0): threadgroup (kv head, row), the shared-tile

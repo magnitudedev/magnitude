@@ -917,7 +917,7 @@ pub(crate) fn validate_apply_template_request(
         ignore_eos: false,
         timings_per_token: false,
     })?;
-    Ok(finalize_request(validated)?.0.input)
+    Ok(finalize_request(validated)?.input)
 }
 
 pub(crate) fn apply_template_response(prepared: AppliedTemplate) -> ApplyTemplateResponse {
@@ -936,6 +936,31 @@ pub(crate) fn apply_template_response(prepared: AppliedTemplate) -> ApplyTemplat
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatDelivery {
+    Complete,
+    Stream(StreamPlan),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamPlan {
+    pub(crate) include_progress: bool,
+    pub(crate) timings_per_token: bool,
+    pub(crate) include_usage: bool,
+}
+
+impl ChatDelivery {
+    fn with_progress(self, include_progress: bool) -> Self {
+        match self {
+            Self::Complete => Self::Complete,
+            Self::Stream(plan) => Self::Stream(StreamPlan {
+                include_progress,
+                ..plan
+            }),
+        }
+    }
+}
+
 pub(crate) struct ValidatedChatRequest {
     pub(crate) model: Option<String>,
     conversation: Conversation,
@@ -951,17 +976,13 @@ pub(crate) struct ValidatedChatRequest {
     sampling: SamplingControls,
     cache_prompt: bool,
     ignore_eos: bool,
-    pub(crate) timings_per_token: bool,
-    include_usage: bool,
-    pub(crate) stream: bool,
+    pub(crate) delivery: ChatDelivery,
 }
 
 pub(crate) struct AdaptedChatRequest {
     pub(crate) model: String,
     pub(crate) request: GenerationRequest,
-    pub(crate) stream: bool,
-    pub(crate) timings_per_token: bool,
-    pub(crate) include_usage: bool,
+    pub(crate) delivery: ChatDelivery,
 }
 
 pub(crate) fn adapt_request(request: ChatCompletionRequest) -> Result<AdaptedChatRequest, ApiError> {
@@ -971,15 +992,12 @@ pub(crate) fn adapt_request(request: ChatCompletionRequest) -> Result<AdaptedCha
         .clone()
         .filter(|model| !model.is_empty())
         .ok_or_else(|| ApiError::invalid("model is required"))?;
-    let stream = validated.stream;
-    let timings_per_token = validated.timings_per_token;
-    let (request, include_usage) = finalize_request(validated)?;
+    let delivery = validated.delivery;
+    let request = finalize_request(validated)?;
     Ok(AdaptedChatRequest {
         model,
         request,
-        stream,
-        timings_per_token,
-        include_usage,
+        delivery,
     })
 }
 
@@ -1039,6 +1057,18 @@ pub(crate) fn validate_request(
     }
     let response_format = response_format(request.response_format)?;
     let stop = stops(request.stop)?;
+    let delivery = if request.stream {
+        ChatDelivery::Stream(StreamPlan {
+            include_progress: false,
+            timings_per_token: request.timings_per_token,
+            include_usage: request
+                .stream_options
+                .and_then(|options| options.include_usage)
+                .unwrap_or(false),
+        })
+    } else {
+        ChatDelivery::Complete
+    };
     Ok(ValidatedChatRequest {
         model: request.model,
         conversation,
@@ -1054,18 +1084,13 @@ pub(crate) fn validate_request(
         sampling,
         cache_prompt: request.cache_prompt,
         ignore_eos: request.ignore_eos,
-        timings_per_token: request.timings_per_token,
-        include_usage: request
-            .stream_options
-            .and_then(|options| options.include_usage)
-            .unwrap_or(false),
-        stream: request.stream,
+        delivery,
     })
 }
 
 pub(crate) fn finalize_request(
     mut validated: ValidatedChatRequest,
-) -> Result<(GenerationRequest, bool), ApiError> {
+) -> Result<GenerationRequest, ApiError> {
     let (reasoning, budget) = reasoning_intent(
         validated.reasoning_effort,
         validated.thinking_budget_tokens,
@@ -1080,48 +1105,65 @@ pub(crate) fn finalize_request(
     let template_arguments = std::mem::take(&mut validated.template_args)
         .into_iter()
         .collect::<Map<_, _>>();
-    Ok((
-        GenerationRequest {
-            input: ChatInput {
-                conversation: validated.conversation,
-                tools,
-                reasoning,
-                output: validated.response_format,
-                template_arguments,
+    Ok(GenerationRequest {
+        input: ChatInput {
+            conversation: validated.conversation,
+            tools,
+            reasoning,
+            output: validated.response_format,
+            template_arguments,
+        },
+        controls: GenerationControls {
+            max_output_tokens: validated.max_tokens,
+            sampling: validated.sampling,
+            stops: validated.stop,
+            end_of_generation: if validated.ignore_eos {
+                EndOfGeneration::Suppress
+            } else {
+                EndOfGeneration::Stop
             },
-            controls: GenerationControls {
-                max_output_tokens: validated.max_tokens,
-                sampling: validated.sampling,
-                stops: validated.stop,
-                end_of_generation: if validated.ignore_eos {
-                    EndOfGeneration::Suppress
-                } else {
-                    EndOfGeneration::Stop
-                },
-                reasoning_budget: budget,
-                prompt_cache: if validated.cache_prompt {
-                    PromptCache::Allowed
-                } else {
-                    PromptCache::Disabled
-                },
+            reasoning_budget: budget,
+            prompt_cache: if validated.cache_prompt {
+                PromptCache::Allowed
+            } else {
+                PromptCache::Disabled
             },
         },
-        validated.include_usage,
-    ))
+    })
+}
+
+fn take_leading_instruction(messages: &mut VecDeque<ChatMessageRequest>) -> Option<String> {
+    match messages.pop_front()? {
+        ChatMessageRequest::System { content } | ChatMessageRequest::Developer { content } => {
+            Some(content)
+        }
+        other => {
+            messages.push_front(other);
+            None
+        }
+    }
+}
+
+fn take_tool_result(
+    messages: &mut VecDeque<ChatMessageRequest>,
+) -> Option<(String, ChatContentRequest)> {
+    match messages.pop_front()? {
+        ChatMessageRequest::Tool {
+            tool_call_id,
+            content,
+            name: _,
+        } => Some((tool_call_id, content)),
+        other => {
+            messages.push_front(other);
+            None
+        }
+    }
 }
 
 fn chat_context(messages: Vec<ChatMessageRequest>) -> Result<Conversation, ApiError> {
     let mut messages = VecDeque::from(messages);
     let mut instructions = Vec::new();
-    while matches!(
-        messages.front(),
-        Some(ChatMessageRequest::System { .. } | ChatMessageRequest::Developer { .. })
-    ) {
-        let (ChatMessageRequest::System { content } | ChatMessageRequest::Developer { content }) =
-            messages.pop_front().expect("front was present")
-        else {
-            unreachable!("front variant was checked")
-        };
+    while let Some(content) = take_leading_instruction(&mut messages) {
         if !content.is_empty() {
             instructions.push(content);
         }
@@ -1160,15 +1202,7 @@ fn chat_context(messages: Vec<ChatMessageRequest>) -> Result<Conversation, ApiEr
                 } else {
                     let calls = canonical_tool_calls(tool_calls)?;
                     let mut results = BTreeMap::new();
-                    while matches!(messages.front(), Some(ChatMessageRequest::Tool { .. })) {
-                        let Some(ChatMessageRequest::Tool {
-                            tool_call_id,
-                            content,
-                            name: _,
-                        }) = messages.pop_front()
-                        else {
-                            unreachable!("front variant was checked")
-                        };
+                    while let Some((tool_call_id, content)) = take_tool_result(&mut messages) {
                         require_non_empty(&tool_call_id, "tool_call_id")?;
                         if results
                             .insert(tool_call_id.clone(), tool_result(content)?)
@@ -1548,93 +1582,89 @@ pub async fn chat_completions(
     let span = tracing::Span::current();
     span.record("completion.id", id.as_str());
     span.record("model.id", adapted.model.as_str());
-    let options = ChatStreamOptions {
-        include_progress: adapted.stream && include_progress(&headers),
-        timings_per_token: adapted.timings_per_token,
-        include_usage: adapted.include_usage,
-    };
-    if adapted.stream && options.include_progress {
-        // The stream commits before the model is bound so loading progress
-        // reaches the client; every later failure is an in-stream error.
-        let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
-        let progress_sender = sender.clone();
-        let progress_id = id.clone();
-        let progress_model = adapted.model.clone();
-        let progress: LoadProgress = std::sync::Arc::new(move |load| {
-            let chunk = ChatCompletionChunk {
-                progress: Some(ChatCompletionProgress::model_loading(load)),
-                ..chunk(&progress_id, created, &progress_model)
-            };
-            if let Ok(data) = serde_json::to_string(&chunk) {
-                let _ = progress_sender.try_send(Ok(Event::default().data(data)));
-            }
-        });
-        let frame = Frame {
-            id: id.clone(),
-            created,
-            model: adapted.model.clone(),
-        };
-        tokio::spawn(async move {
-            let invocation = tokio::select! {
-                result = state.models.invoke(&adapted.model, Some(progress)) => result,
-                _ = sender.closed() => return,
-            };
-            match invocation {
-                Ok(invocation) => {
-                    let stream = invocation.generate(adapted.request);
-                    stream_chat(stream, Vec::new(), frame, sender, options).await;
+    match adapted.delivery.with_progress(include_progress(&headers)) {
+        ChatDelivery::Stream(plan) if plan.include_progress => {
+            // The stream commits before the model is bound so loading progress
+            // reaches the client; every later failure is an in-stream error.
+            let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
+            let progress_sender = sender.clone();
+            let progress_id = id.clone();
+            let progress_model = adapted.model.clone();
+            let progress: LoadProgress = std::sync::Arc::new(move |load| {
+                let chunk = ChatCompletionChunk {
+                    progress: Some(ChatCompletionProgress::model_loading(load)),
+                    ..chunk(&progress_id, created, &progress_model)
+                };
+                if let Ok(data) = serde_json::to_string(&chunk) {
+                    let _ = progress_sender.try_send(Ok(Event::default().data(data)));
                 }
-                Err(error) => emit_error(&sender, ApiError::from(error).body).await,
+            });
+            let frame = Frame {
+                id: id.clone(),
+                created,
+                model: adapted.model.clone(),
+            };
+            tokio::spawn(async move {
+                let invocation = tokio::select! {
+                    result = state.models.invoke(&adapted.model, Some(progress)) => result,
+                    _ = sender.closed() => return,
+                };
+                match invocation {
+                    Ok(invocation) => {
+                        let stream = invocation.generate(adapted.request);
+                        stream_chat(stream, Vec::new(), frame, sender, plan).await;
+                    }
+                    Err(error) => emit_error(&sender, ApiError::from(error).body).await,
+                }
+            });
+            let response = Sse::new(ReceiverStream::new(receiver))
+                .keep_alive(KeepAlive::default())
+                .into_response();
+            Ok(with_request_id(response, &id))
+        }
+        delivery => {
+            let invocation = state
+                .models
+                .invoke(&adapted.model, None)
+                .await
+                .map_err(|error| ApiError::from(error).with_param("model"))?;
+            let mut stream = invocation.generate(adapted.request);
+            match delivery {
+                ChatDelivery::Complete => {
+                    let (output, completion) = collect(stream)
+                        .await
+                        .map_err(|error| ApiError::from(error).with_param("messages"))?;
+                    let response = Json(chat_completion_response(
+                        id.clone(),
+                        created,
+                        adapted.model,
+                        output,
+                        &completion,
+                    ))
+                    .into_response();
+                    Ok(with_request_id(response, &id))
+                }
+                ChatDelivery::Stream(plan) => {
+                    // An ordinary stream commits only once the engine admitted the request,
+                    // so preparation and admission failures keep their HTTP status.
+                    let (_, before) = admitted(&mut stream)
+                        .await
+                        .map_err(|error| ApiError::from(error).with_param("messages"))?;
+                    let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
+                    let frame = Frame {
+                        id: id.clone(),
+                        created,
+                        model: adapted.model,
+                    };
+                    tokio::spawn(stream_chat(stream, before, frame, sender, plan));
+                    let response = Sse::new(ReceiverStream::new(receiver))
+                        .keep_alive(KeepAlive::default())
+                        .into_response();
+                    Ok(with_request_id(response, &id))
+                }
             }
-        });
-        let response = Sse::new(ReceiverStream::new(receiver))
-            .keep_alive(KeepAlive::default())
-            .into_response();
-        return Ok(with_request_id(response, &id));
+        }
     }
-    let invocation = state
-        .models
-        .invoke(&adapted.model, None)
-        .await
-        .map_err(|error| ApiError::from(error).with_param("model"))?;
-    let mut stream = invocation.generate(adapted.request);
-    if !adapted.stream {
-        let (output, completion) = collect(stream)
-            .await
-            .map_err(|error| ApiError::from(error).with_param("messages"))?;
-        let response = Json(chat_completion_response(
-            id.clone(),
-            created,
-            adapted.model,
-            output,
-            &completion,
-        ))
-        .into_response();
-        return Ok(with_request_id(response, &id));
-    }
-    // An ordinary stream commits only once the engine admitted the request,
-    // so preparation and admission failures keep their HTTP status.
-    let (_, before) = admitted(&mut stream)
-        .await
-        .map_err(|error| ApiError::from(error).with_param("messages"))?;
-    let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(16);
-    let frame = Frame {
-        id: id.clone(),
-        created,
-        model: adapted.model,
-    };
-    tokio::spawn(stream_chat(stream, before, frame, sender, options));
-    let response = Sse::new(ReceiverStream::new(receiver))
-        .keep_alive(KeepAlive::default())
-        .into_response();
-    Ok(with_request_id(response, &id))
-}
-
-#[derive(Clone, Copy)]
-struct ChatStreamOptions {
-    include_progress: bool,
-    timings_per_token: bool,
-    include_usage: bool,
 }
 
 struct Frame {
@@ -1650,7 +1680,7 @@ async fn stream_chat(
     before: Vec<GenerationEvent>,
     frame: Frame,
     sender: SseSender,
-    options: ChatStreamOptions,
+    plan: StreamPlan,
 ) {
     let Frame { id, created, model } = frame;
     let mut pending = before.into_iter();
@@ -1664,7 +1694,7 @@ async fn stream_chat(
         };
         let chunk = match event {
             Some(GenerationEvent::Progress(progress)) => {
-                if !options.include_progress {
+                if !plan.include_progress {
                     continue;
                 }
                 ChatCompletionChunk {
@@ -1674,7 +1704,7 @@ async fn stream_chat(
             }
             Some(GenerationEvent::Admitted { .. }) => continue,
             Some(GenerationEvent::Output { event, snapshot }) => {
-                let keep_timings = options.timings_per_token || event == OutputEvent::Started;
+                let keep_timings = plan.timings_per_token || event == OutputEvent::Started;
                 let timings = keep_timings
                     .then_some(snapshot)
                     .flatten()
@@ -1701,7 +1731,7 @@ async fn stream_chat(
                     "chat completion finished"
                 );
                 let timings = timing_values(&completion.snapshot());
-                let terminal_timings = (!options.include_usage).then(|| timings.clone());
+                let terminal_timings = (!plan.include_usage).then(|| timings.clone());
                 if !emit_chunk(
                     &sender,
                     choice_chunk(
@@ -1717,7 +1747,7 @@ async fn stream_chat(
                 {
                     return;
                 }
-                if options.include_usage
+                if plan.include_usage
                     && !emit_chunk(
                         &sender,
                         ChatCompletionChunk {

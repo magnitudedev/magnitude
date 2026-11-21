@@ -201,6 +201,22 @@ impl Records {
             Backing::Pooled(store) => store.view(record).unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count())),
         }
     }
+
+    /// Copy record `from`'s bytes into record `to` (`from != to`).
+    ///
+    /// # Safety
+    ///
+    /// No writer writes `from`, and no reader or writer accesses `to`, while
+    /// the copy runs.
+    pub unsafe fn copy_record(&self, from: u64, to: u64) {
+        assert_ne!(from, to, "copy_record source and destination must differ ({from})");
+        let src = self.hold(from);
+        let dst = self.hold(to);
+        // SAFETY: `from != to`, both views hold `self.0.bytes` host-accessible
+        // bytes kept alive by `src` and `dst`, and the caller guarantees no
+        // concurrent write to `from` or concurrent access to `to`.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.address().as_ptr(), self.0.bytes as usize) };
+    }
 }
 
 /// One range of a model file read into a record: `bytes` at `offset` of

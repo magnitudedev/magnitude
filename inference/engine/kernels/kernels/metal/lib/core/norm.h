@@ -22,6 +22,16 @@ inline float square(float centered, float squares) {
     return metal::fma(centered, centered, squares);
 }
 
+// Componentwise `square` over four centred values.
+inline float4 square4(float4 centered, float4 squares) {
+    return metal::fma(centered, centered, squares);
+}
+
+// Pairwise sum of four lane accumulators.
+inline float sum4(float4 values) {
+    return (values.x + values.y) + (values.z + values.w);
+}
+
 // The inverse deviation of a row of `width` values whose centred squares sum
 // to `squares` (the mean taken as 0: its root mean square).
 inline float inverse(float squares, uint width, float epsilon) {
@@ -33,11 +43,24 @@ inline float inverse(float squares, uint width, float epsilon) {
 // within an expression), as the layer norm has always been written.
 template <bool WEIGHT, bool BIAS>
 inline float apply(float centered, float inverse, float weight, float bias) {
-    if (WEIGHT && BIAS)
+    if constexpr (WEIGHT && BIAS)
         return centered * inverse * weight + bias;
-    else if (WEIGHT)
+    else if constexpr (WEIGHT)
         return centered * inverse * weight;
-    else if (BIAS)
+    else if constexpr (BIAS)
+        return centered * inverse + bias;
+    else
+        return centered * inverse;
+}
+
+// Four centred values normed, componentwise `apply`.
+template <bool WEIGHT, bool BIAS>
+inline float4 apply4(float4 centered, float inverse, float4 weight, float4 bias) {
+    if constexpr (WEIGHT && BIAS)
+        return centered * inverse * weight + bias;
+    else if constexpr (WEIGHT)
+        return centered * inverse * weight;
+    else if constexpr (BIAS)
         return centered * inverse + bias;
     else
         return centered * inverse;

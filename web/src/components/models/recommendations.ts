@@ -3,6 +3,7 @@ import { Option } from "effect"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { CountryCodeSchema, type LocalModel, type RecommendedModel, type RoomShortfall } from "@magnitudedev/sdk"
 import { useAgentClient, useLocalInferenceHardware, useLocalModels, type ServingMemory } from "@magnitudedev/client-common"
+import { hardwareBenchmarkView, type HardwareBenchmarkView } from "./benchmark"
 import { offeredFromRecommendation, runnableFamily } from "./data"
 import type { OfferedModel } from "./expanding-model"
 import type { RunnableFamily } from "./explore-view"
@@ -58,11 +59,11 @@ export const recommendedForYourMachine = (offered: readonly OfferedRecommendatio
 }
 
 /** Whether "Recommended for your machine" can show its list: once the recommendations are read and every quant measured. */
-export const recommendationsSettled = (view: RecommendationsView): boolean => view.ready && view.measuring === null
+export const recommendationsSettled = (view: RecommendationsView): boolean => view.ready && view.benchmark === null
 
 export interface RecommendationsView {
   readonly ready: boolean
-  readonly measuring: { readonly settled: number; readonly total: number } | null
+  readonly benchmark: HardwareBenchmarkView | null
   readonly offered: readonly OfferedRecommendation[]
   readonly roomShortfall: RoomShortfall | null
   readonly families: readonly RunnableFamily[]
@@ -70,7 +71,7 @@ export interface RecommendationsView {
 
 /**
  * The service's recommendations for this machine as offered models, optionally only US developers', and the families
- * it runs. While any rung is still being measured the order is not final, so `measuring` says how far along it is.
+ * it runs. While the machine benchmark or ranking is still running, `benchmark` describes the live phase and progress.
  */
 export function useRecommendations(usOnly: boolean, memory: ServingMemory): RecommendationsView {
   const client = useAgentClient()
@@ -80,12 +81,12 @@ export function useRecommendations(usOnly: boolean, memory: ServingMemory): Reco
   const freeDiskBytes = Result.isSuccess(hardware) ? Option.getOrNull(Option.map(hardware.value.modelStorage, storage => storage.freeBytes)) : null
   const models = useLocalModels()
   return useMemo(() => {
-    if (!Result.isSuccess(recommendations) || !Result.isSuccess(models)) return { ready: false, measuring: null, offered: [], roomShortfall: null, families: [] }
-    const { complete, measured, rungs } = recommendations.value
+    if (!Result.isSuccess(recommendations) || !Result.isSuccess(models)) return { ready: false, benchmark: null, offered: [], roomShortfall: null, families: [] }
+    const { complete } = recommendations.value
     const byId = new Map<string, LocalModel>(models.value.models.map(model => [model.modelId, model]))
     return {
       ready: true,
-      measuring: complete ? null : { settled: measured, total: rungs },
+      benchmark: hardwareBenchmarkView(models.value.preparation.measurement, complete),
       offered: recommendations.value.models.flatMap(recommendation => {
         const model = offeredFromRecommendation(recommendation, byId, memory, freeDiskBytes)
         return model ? [{ recommendation, model }] : []

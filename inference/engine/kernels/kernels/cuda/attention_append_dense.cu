@@ -16,10 +16,13 @@ extern "C" __global__ void attention_append_dense(SEISMIC_KERNEL_PARAMS) {
         SEISMIC_HISTORY_VALUE_STRIDE_0, SEISMIC_HISTORY_VALUE_STRIDE_1,
         SEISMIC_PARAM_SLAB_ROWS};
     const attention::u64 item = static_cast<attention::u64>(blockIdx.x) * 8 + threadIdx.x / 32;
-    const attention::u64 row = item / attention::KV;
-    const int kv = item % attention::KV;
+    if (!attention::FRESH || item >= static_cast<attention::u64>(SEISMIC_DIM_M) * attention::KV) return;
+    const u32 item32 = static_cast<u32>(item);
+    constexpr u32 KV = static_cast<u32>(attention::KV);
+    const u32 row = item32 / KV;
+    const int kv = static_cast<int>(item32 % KV);
     const int lane = threadIdx.x % 32;
-    if (!attention::FRESH || row >= SEISMIC_DIM_M || ATTENTION_DESTINATION(in, row) < 0) return;
+    if (ATTENTION_DESTINATION(in, row) < 0) return;
     extern __shared__ float shared[];
     float k[attention::DPL];
     // The stored key prepared and rounded as the attention entries do.

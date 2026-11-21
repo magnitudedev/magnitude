@@ -123,23 +123,25 @@ fn per_layer_inputs[M, L, P](gathered: &tensor[M, L * P] TW,
                 result[row, column] = (normalized + token) * scale
     return result
 
-# Metal and Vulkan: threadgroup (chunk, row), one thread per chunk column (P
-# is static), the gathered value decoded from its rows16 or dense packet.
+# Metal: threadgroup (chunk, row) of min(P, 256) threads looping over the
+# chunk, the gathered values decoded cooperatively per simdgroup
+# (<seismic/gather.h>).
 native per_layer_inputs for metal from "metal/per_layer_inputs.metal":
     static (L, P)
-    where P % 32 == 0 and P <= 1024
+    where P % 32 == 0
     launch per_layer_inputs:
         threadgroups (L, M, 1)
-        threads_per_threadgroup (P, 1, 1)
+        threads_per_threadgroup (min(P, 256), 1, 1)
 
-# CUDA: as Metal, the chunk's gathered values first decoded into shared
-# memory (mma16 lane chunks of 64-column k-blocks).
+# CUDA: as Metal, looping over the chunk with min(P, 256) threads; the
+# gathered values are decoded directly after the RMS reduction
+# (<seismic/gather.cuh>).
 native per_layer_inputs for cuda from "cuda/per_layer_inputs.cu":
     static (L, P)
-    where P % 64 == 0 and P <= 1024
+    where P % 64 == 0
     launch per_layer_inputs:
         threadgroups (L, M, 1)
-        threads_per_threadgroup (P, 1, 1)
+        threads_per_threadgroup (min(P, 256), 1, 1)
 
 # Vulkan: as Metal, its workgroup P rounded up to 64 (a workgroup's X is a
 # multiple of 64); an invocation past P adds nothing to the square sum and

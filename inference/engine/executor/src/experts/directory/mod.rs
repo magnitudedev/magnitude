@@ -894,6 +894,23 @@ impl Directory {
         self.host[group].claim((layer, expert), keep, taking, outranking(ranker, &self.prompt_reads, candidate))
     }
 
+    /// Claim a background host-tier landing for a cold expert read into the
+    /// conveyor (`Scratch::land_conveyed`): admitted whenever the tier covers
+    /// every expert (`HostRecords::covers`); otherwise takes a free ready
+    /// record or displaces a kept record only when the expert outranks its
+    /// victim in the reuse ranking (beside `read` and pending prompt reads).
+    pub fn claim_conveyed(&mut self, layer: usize, expert: usize, read: Option<Step>) -> Claim {
+        let group = self.bank.group(layer);
+        if self.host[group].covers() {
+            return self.host[group].claim((layer, expert), 0, Taking::Out, (|_, _| (), |_, _| true));
+        }
+        let tier = self.host_tier();
+        let reuse = Reuse::of(&self.ranking);
+        let ranker = reuse.ranker(group, tier, Reader::Move);
+        let candidate = store_rank(ranker, &self.prompt_reads)((layer, expert), read);
+        self.host[group].claim((layer, expert), 0, Taking::Out, outranking(ranker, &self.prompt_reads, candidate))
+    }
+
     /// Where `layer`'s `expert` is in its group's host tier: lacked
     /// without a tier.
     pub fn located(&self, layer: usize, expert: usize) -> Located {
@@ -1681,9 +1698,18 @@ impl Directory {
     /// held one's expert leaving the bank. The pool shrinks by the host
     /// records claimed now ([`Self::resize_pool`]). Whether the group holds
     /// the records its scratch lies in ([`Self::leased`]).
-    pub fn lease(&mut self, lender: usize, scratch_group: ScratchGroup) -> bool {
+    pub fn lease(&mut self, lender: usize, scratch_group: ScratchGroup, may_evict: bool, copy: Option<&mut dyn FnMut(u32, u32)>) -> bool {
         let before = self.host[lender].claimed();
-        self.host[lender].lease(scratch_group);
+        if !self.host[lender].leased() {
+            let tier = self.host_tier();
+            if copy.is_some() && self.host[lender].capacity() > 0 {
+                let reuse = Reuse::of(&self.ranking);
+                let rank = store_rank(reuse.ranker(lender, tier, Reader::Move), &self.prompt_reads);
+                self.host[lender].lease(scratch_group, rank, may_evict, copy);
+            } else {
+                self.host[lender].lease(scratch_group, |_, _| 0u64, false, None);
+            }
+        }
         if self.host[lender].claimed() != before {
             self.resize_pool(lender);
         }

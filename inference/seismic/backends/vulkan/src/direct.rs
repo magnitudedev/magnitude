@@ -16,7 +16,7 @@ use crate::formation::DirectModule;
 use crate::memory::{Buffer, Range};
 use ash::vk::{self, Handle};
 use seismic_compiler::direct_launch::{
-    DirectLaunchContract, DirectLaunchRequest, LaunchGrid, ValidatedLaunch,
+    DirectLaunchContract, DirectLaunchRequest, LaunchGrid, ValidatedLaunch, WorkgroupContract,
 };
 use seismic_compiler::errors::ExecutionError;
 use seismic_native_target::{GateOpening, ParkAnswer};
@@ -131,43 +131,52 @@ impl Arguments {
         recording: &mut Recording,
         launch: &DirectLaunch<'_>,
     ) -> Result<u64, ExecutionError> {
-        self.write_block(device, recording, launch).map(|(address, _)| address)
+        write_block_into(&mut self.chunks, &mut self.used, device, recording, launch)
+            .map(|(address, _)| address)
     }
+}
 
-    /// Write the block of `launch`; its device address, and where it lies
-    /// with the bytes it holds.
-    fn write_block(
-        &mut self,
-        device: &Device,
-        recording: &mut Recording,
-        launch: &DirectLaunch<'_>,
-    ) -> Result<(u64, Block), ExecutionError> {
-        let block = launch.argument_block();
-        let bytes = block.len() as u64;
-        if bytes > ARGUMENT_CHUNK_BYTES {
-            return Err(ExecutionError::SubmissionFailed(format!(
-                "a launch's argument block needs {bytes} bytes; a chunk holds {ARGUMENT_CHUNK_BYTES}"
-            )));
-        }
-        if self.used + bytes > ARGUMENT_CHUNK_BYTES {
-            self.chunks.push(device.argument_chunk(recording)?);
-            self.used = 0;
-        }
-        let start = self.used;
-        let chunk = self.chunks.last().expect("a chunk was taken above");
-        chunk.write_mapped(start, &block);
-        self.used = start + bytes;
-        let address = chunk.address() + start;
-        Ok((
-            address,
-            Block {
-                chunk: self.chunks.len() - 1,
-                offset: start,
-                slot_bytes: bytes,
-                bytes: block,
-            },
-        ))
+/// Write the argument block of `launch` into `chunks` (with `used` bytes taken
+/// in the last chunk); returns its device address and its recorded slot.
+fn write_block_into(
+    chunks: &mut Vec<Range>,
+    used: &mut u64,
+    device: &Device,
+    recording: &mut Recording,
+    launch: &DirectLaunch<'_>,
+) -> Result<(u64, Block), ExecutionError> {
+    let block = launch.argument_block();
+    let bytes = block.len() as u64;
+    if bytes > ARGUMENT_CHUNK_BYTES {
+        return Err(ExecutionError::SubmissionFailed(format!(
+            "a launch's argument block needs {bytes} bytes; a chunk holds {ARGUMENT_CHUNK_BYTES}"
+        )));
     }
+    let (chunk_index, start, address) = match chunks.last() {
+        Some(chunk) if *used + bytes <= ARGUMENT_CHUNK_BYTES => {
+            let start = *used;
+            chunk.write_mapped(start, &block);
+            *used = start + bytes;
+            (chunks.len() - 1, start, chunk.address() + start)
+        }
+        _ => {
+            let chunk = device.argument_chunk(recording)?;
+            chunk.write_mapped(0, &block);
+            let address = chunk.address();
+            chunks.push(chunk);
+            *used = bytes;
+            (chunks.len() - 1, 0, address)
+        }
+    };
+    Ok((
+        address,
+        Block {
+            chunk: chunk_index,
+            offset: start,
+            slot_bytes: bytes,
+            bytes: block,
+        },
+    ))
 }
 
 /// The bytes `launch`'s argument block takes in its chunk, as Vulkan's
@@ -248,9 +257,7 @@ fn validate_launch<'a>(
     let contract = DirectLaunchContract {
         max_buffer_slots: None,
         max_grid: device.info().limits.max_group_count,
-        max_group_size: None,
-        max_group_threads: None,
-        max_shared_bytes: None,
+        workgroup: WorkgroupContract::FixedInPipeline,
         max_param_bytes: Some(ARGUMENT_CHUNK_BYTES),
     };
     let request = DirectLaunchRequest {
@@ -293,16 +300,45 @@ fn begin(
     )
 }
 
+/// Allocate and begin the secondary command buffer of one graph segment.
+fn open_segment(device: &Device) -> Result<vk::CommandBuffer, ExecutionError> {
+    let mut recording = device.recording()?;
+    let command = device.command(&mut recording, vk::CommandBufferLevel::SECONDARY)?;
+    let inheritance = vk::CommandBufferInheritanceInfo::default();
+    let begun = begin(
+        device,
+        command,
+        vk::CommandBufferUsageFlags::SIMULTANEOUS_USE,
+        Some(&inheritance),
+    );
+    // Released before an error retires the command buffer under this lock.
+    drop(recording);
+    if let Err(error) = begun {
+        device.retire(Retired {
+            value: 0,
+            command: RetiredCommand::Secondary(command),
+            queries: None,
+            arguments: Vec::new(),
+        });
+        return Err(error);
+    }
+    Ok(command)
+}
+
 /// Forms a [`DirectGraph`]: the launches of one submission, in order, with
 /// their argument blocks fixed, in one or more segments.
 pub struct DirectGraphBuilder {
     device: Device,
     /// Heap usage and held memory when recording began.
     mark: (u64, u64),
-    /// Becomes the graph; dropping an abandoned builder retires it (and the
-    /// chunks it wrote) unsubmitted.
-    graph: Option<GraphInner>,
-    arguments: Arguments,
+    /// Becomes the graph; dropping an abandoned builder drops this directly,
+    /// retiring its command buffers and argument chunks unsubmitted.
+    graph: GraphInner,
+    /// The secondary command buffer currently open for recording (also the
+    /// last element of `graph.commands`).
+    current: vk::CommandBuffer,
+    /// Bytes used in the last chunk of `graph.arguments`.
+    arguments_used: u64,
     /// Each launch's argument block, in launch order.
     blocks: Vec<Block>,
     launched: bool,
@@ -312,61 +348,29 @@ pub struct DirectGraphBuilder {
 
 impl DirectGraphBuilder {
     pub fn new(device: &Device) -> Result<Self, ExecutionError> {
-        let mut builder = Self {
+        let mark = device.inner.unheld_mark();
+        let current = open_segment(device)?;
+        Ok(Self {
             device: device.clone(),
-            mark: device.inner.unheld_mark(),
-            graph: Some(GraphInner {
+            mark,
+            graph: GraphInner {
                 device: device.clone(),
-                commands: Vec::new(),
+                commands: vec![current],
                 arguments: Vec::new(),
                 last_use: AtomicU64::new(0),
-            }),
-            arguments: Arguments::new(),
+            },
+            current,
+            arguments_used: ARGUMENT_CHUNK_BYTES,
             blocks: Vec::new(),
             launched: false,
             launches: GraphCensus::default(),
-        };
-        builder.begin_segment()?;
-        Ok(builder)
-    }
-
-    fn graph(&mut self) -> &mut GraphInner {
-        self.graph.as_mut().expect("a live builder holds its graph")
-    }
-
-    fn command(&self) -> vk::CommandBuffer {
-        *self
-            .graph
-            .as_ref()
-            .expect("a live builder holds its graph")
-            .commands
-            .last()
-            .expect("a live builder has begun a segment")
-    }
-
-    /// Allocate and begin the secondary buffer of the next segment.
-    fn begin_segment(&mut self) -> Result<(), ExecutionError> {
-        let device = self.device.clone();
-        let mut recording = device.recording()?;
-        let command = device.command(&mut recording, vk::CommandBufferLevel::SECONDARY)?;
-        self.graph().commands.push(command);
-        let inheritance = vk::CommandBufferInheritanceInfo::default();
-        let begun = begin(
-            &device,
-            command,
-            vk::CommandBufferUsageFlags::SIMULTANEOUS_USE,
-            Some(&inheritance),
-        );
-        // Released before an error drops the builder, whose graph retires
-        // under this lock.
-        drop(recording);
-        begun
+        })
     }
 
     fn end_segment(&self) -> Result<(), ExecutionError> {
         let recording = self.device.locked();
         let ended = memory_call(
-            unsafe { self.device.inner.device.end_command_buffer(self.command()) },
+            unsafe { self.device.inner.device.end_command_buffer(self.current) },
             "vkEndCommandBuffer",
             0,
             &self.device.inner.memory,
@@ -382,7 +386,10 @@ impl DirectGraphBuilder {
     /// segment's first launch still follows the previous launch's writes.
     pub fn segment(&mut self) -> Result<(), ExecutionError> {
         self.end_segment()?;
-        self.begin_segment()
+        let next = open_segment(&self.device)?;
+        self.graph.commands.push(next);
+        self.current = next;
+        Ok(())
     }
 
     /// Append a launch after every launch added before it; an empty direct
@@ -392,12 +399,18 @@ impl DirectGraphBuilder {
             return Ok(());
         };
         let mut recording = self.device.recording()?;
-        let (address, block) = self.arguments.write_block(&self.device, &mut recording, launch)?;
+        let (address, block) = write_block_into(
+            &mut self.graph.arguments,
+            &mut self.arguments_used,
+            &self.device,
+            &mut recording,
+            launch,
+        )?;
         self.blocks.push(block);
         unsafe {
             record_launch(
                 &self.device,
-                self.command(),
+                self.current,
                 launch,
                 address,
                 dispatch,
@@ -419,29 +432,20 @@ impl DirectGraphBuilder {
     /// it (command buffers it reuses, chunks it hands out again), so they
     /// stay held. Only the command memory is the driver's: the chunks are
     /// charged as the upload blocks they lie in.
-    pub fn instantiate(mut self) -> Result<DirectGraph, ExecutionError> {
+    pub fn instantiate(self) -> Result<DirectGraph, ExecutionError> {
         self.end_segment()?;
-        let mut graph = self.graph.take().expect("a live builder holds its graph");
-        graph.arguments = std::mem::take(&mut self.arguments.chunks);
+        let census = GraphCensus::graph(self.launches)
+            .ok_or_else(|| ExecutionError::SubmissionFailed("a graph's census overflows".into()))?;
         let inner = &self.device.inner;
         let command = inner.unheld_since(self.mark);
         inner.graphs.fetch_add(command, Ordering::Relaxed);
-        let arguments = graph.arguments.iter().map(Range::bytes).sum::<u64>();
+        let arguments = self.graph.arguments.iter().map(Range::bytes).sum::<u64>();
         Ok(DirectGraph {
-            inner: std::sync::Arc::new(graph),
-            blocks: std::mem::take(&mut self.blocks),
+            inner: std::sync::Arc::new(self.graph),
+            blocks: self.blocks,
             device_bytes: command + arguments,
-            census: GraphCensus::graph(self.launches)
-                .ok_or_else(|| ExecutionError::SubmissionFailed("a graph's census overflows".into()))?,
+            census,
         })
-    }
-}
-
-impl Drop for DirectGraphBuilder {
-    fn drop(&mut self) {
-        if let Some(graph) = &mut self.graph {
-            graph.arguments.append(&mut self.arguments.chunks);
-        }
     }
 }
 
@@ -522,8 +526,8 @@ impl Drop for GraphInner {
 /// each launch follows the previous launch's writes; a trailing barrier
 /// makes results visible to the host. Whether it writes device timestamps is
 /// its type ([`Timing`]): a [`Measured`] batch resets its queries and
-/// stamps its start and end (and, timed, each launch), an [`Unmeasured`]
-/// one writes none.
+/// stamps its start and end, a [`Timed`] batch also stamps each launch and
+/// never replays graphs, and an [`Unmeasured`] one writes none.
 pub struct DirectBatch<T: Timing = Measured> {
     device: Device,
     command: vk::CommandBuffer,
@@ -552,13 +556,13 @@ pub trait Timing: sealed::Sealed + Sized {
     /// What its submission keeps of them.
     type Stamps;
 
-    /// Its queries, taken under the recording lock.
-    #[doc(hidden)]
-    fn open(device: &Device, recording: &mut Recording, launches: Option<usize>) -> Result<Self, ExecutionError>;
-
-    /// Its query pool, returned with the batch.
+    /// Its query pool, returned if the batch is dropped uncommitted.
     #[doc(hidden)]
     fn queries(&self) -> Option<(vk::QueryPool, u32)>;
+
+    /// Its query pool, returned when the submission is dropped.
+    #[doc(hidden)]
+    fn stamps_queries(stamps: &Self::Stamps) -> Option<(vk::QueryPool, u32)>;
 
     /// Reset its queries, before the leading barrier.
     #[doc(hidden)]
@@ -582,10 +586,21 @@ pub trait Timing: sealed::Sealed + Sized {
     /// For a timed batch, keep an empty launch's place.
     #[doc(hidden)]
     fn skip(&mut self);
+}
 
-    /// Whether the batch times each launch.
+/// A batch timing mode that can replay recorded graphs ([`Measured`] or
+/// [`Unmeasured`]): a [`Timed`] batch times each individual launch and never
+/// replays.
+pub trait Replayable: Timing {}
+
+/// A batch timing mode that writes start and end device timestamps
+/// ([`Measured`] or [`Timed`]).
+pub trait HasTimestamps: Timing {
     #[doc(hidden)]
-    fn timed(&self) -> bool;
+    fn pool(stamps: &Self::Stamps) -> vk::QueryPool;
+
+    #[doc(hidden)]
+    fn end_query(stamps: &Self::Stamps) -> u32;
 }
 
 /// Device timestamps at marks of work on the device's queue
@@ -634,31 +649,25 @@ impl Drop for Stamps {
     }
 }
 
-/// A batch that writes its start and end timestamps, and, timed, one before
-/// each launch: its submission's device interval is known.
-pub struct Measured {
+/// Query pool and write cursor shared by [`Measured`] and [`Timed`] batches.
+struct TimestampQueries {
     queries: (vk::QueryPool, u32),
     /// Queries written so far (the first is the batch start).
     written: u32,
-    /// For a timed batch, per `launch` call, the query written just before
-    /// the launch (absent for an empty launch).
-    marks: Option<Vec<Option<u32>>>,
 }
 
-/// A batch that writes no timestamp and resets no query.
-pub struct Unmeasured;
+impl TimestampQueries {
+    fn open(device: &Device, recording: &mut Recording, count: u32) -> Result<Self, ExecutionError> {
+        Ok(Self {
+            queries: device.queries(recording, count)?,
+            written: 0,
+        })
+    }
 
-/// What a measured submission reads: its end query (the start is query 0),
-/// and a timed batch's marks.
-pub struct MeasuredStamps {
-    end: u32,
-    marks: Option<Vec<Option<u32>>>,
-}
+    fn reset(&self, raw: &ash::Device, command: vk::CommandBuffer) {
+        unsafe { raw.cmd_reset_query_pool(command, self.queries.0, 0, self.queries.1) };
+    }
 
-impl sealed::Sealed for Measured {}
-impl sealed::Sealed for Unmeasured {}
-
-impl Measured {
     fn stamp(&mut self, raw: &ash::Device, command: vk::CommandBuffer) -> u32 {
         let query = self.written;
         unsafe { raw.cmd_write_timestamp2(command, vk::PipelineStageFlags2::ALL_COMMANDS, self.queries.0, query) };
@@ -667,67 +676,169 @@ impl Measured {
     }
 }
 
+/// A batch that writes its start and end timestamps: its submission's device
+/// interval is known.
+pub struct Measured {
+    queries: TimestampQueries,
+}
+
+/// A measurement batch that writes its start and end timestamps and one before
+/// each launch: each launch's device interval is known. Never replays graphs.
+pub struct Timed {
+    queries: TimestampQueries,
+    /// Per `launch` call, the query written just before the launch (absent for
+    /// an empty launch).
+    marks: Vec<Option<u32>>,
+}
+
+/// A batch that writes no timestamp and resets no query.
+pub struct Unmeasured;
+
+/// What a [`Measured`] submission reads: its query pool and end query (the
+/// start is query 0).
+pub struct MeasuredStamps {
+    queries: (vk::QueryPool, u32),
+    end: u32,
+}
+
+/// What a [`Timed`] submission reads: its query pool, end query (the start is
+/// query 0), and per-launch marks.
+pub struct TimedStamps {
+    queries: (vk::QueryPool, u32),
+    end: u32,
+    marks: Vec<Option<u32>>,
+}
+
+impl sealed::Sealed for Measured {}
+impl sealed::Sealed for Timed {}
+impl sealed::Sealed for Unmeasured {}
+
+impl Replayable for Measured {}
+impl Replayable for Unmeasured {}
+
+impl HasTimestamps for Measured {
+    fn pool(stamps: &MeasuredStamps) -> vk::QueryPool {
+        stamps.queries.0
+    }
+
+    fn end_query(stamps: &MeasuredStamps) -> u32 {
+        stamps.end
+    }
+}
+
+impl HasTimestamps for Timed {
+    fn pool(stamps: &TimedStamps) -> vk::QueryPool {
+        stamps.queries.0
+    }
+
+    fn end_query(stamps: &TimedStamps) -> u32 {
+        stamps.end
+    }
+}
+
+impl Measured {
+    fn open(device: &Device, recording: &mut Recording) -> Result<Self, ExecutionError> {
+        Ok(Self {
+            queries: TimestampQueries::open(device, recording, 2)?,
+        })
+    }
+}
+
+impl Timed {
+    fn open(device: &Device, recording: &mut Recording, launches: usize) -> Result<Self, ExecutionError> {
+        let queries = launches
+            .checked_add(2)
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or_else(|| ExecutionError::SubmissionFailed("too many timed launches".into()))?;
+        Ok(Self {
+            queries: TimestampQueries::open(device, recording, queries)?,
+            marks: Vec::with_capacity(launches),
+        })
+    }
+}
+
 impl Timing for Measured {
     type Stamps = MeasuredStamps;
 
-    fn open(device: &Device, recording: &mut Recording, launches: Option<usize>) -> Result<Self, ExecutionError> {
-        let queries = u32::try_from(launches.unwrap_or(0) + 2)
-            .map_err(|_| ExecutionError::SubmissionFailed("too many timed launches".into()))?;
-        Ok(Self {
-            queries: device.queries(recording, queries)?,
-            written: 0,
-            marks: launches.map(Vec::with_capacity),
-        })
+    fn queries(&self) -> Option<(vk::QueryPool, u32)> {
+        Some(self.queries.queries)
     }
 
-    fn queries(&self) -> Option<(vk::QueryPool, u32)> {
-        Some(self.queries)
+    fn stamps_queries(stamps: &MeasuredStamps) -> Option<(vk::QueryPool, u32)> {
+        Some(stamps.queries)
     }
 
     fn reset(&self, raw: &ash::Device, command: vk::CommandBuffer) {
-        unsafe { raw.cmd_reset_query_pool(command, self.queries.0, 0, self.queries.1) };
+        self.queries.reset(raw, command);
     }
 
     fn start(&mut self, raw: &ash::Device, command: vk::CommandBuffer) {
-        self.stamp(raw, command);
+        self.queries.stamp(raw, command);
     }
 
     fn end(&mut self, raw: &ash::Device, command: vk::CommandBuffer) -> MeasuredStamps {
-        MeasuredStamps { end: self.stamp(raw, command), marks: self.marks.take() }
+        MeasuredStamps {
+            queries: self.queries.queries,
+            end: self.queries.stamp(raw, command),
+        }
+    }
+
+    fn mark(&mut self, _: &ash::Device, _: vk::CommandBuffer, _: bool) -> bool {
+        false
+    }
+
+    fn skip(&mut self) {}
+}
+
+impl Timing for Timed {
+    type Stamps = TimedStamps;
+
+    fn queries(&self) -> Option<(vk::QueryPool, u32)> {
+        Some(self.queries.queries)
+    }
+
+    fn stamps_queries(stamps: &TimedStamps) -> Option<(vk::QueryPool, u32)> {
+        Some(stamps.queries)
+    }
+
+    fn reset(&self, raw: &ash::Device, command: vk::CommandBuffer) {
+        self.queries.reset(raw, command);
+    }
+
+    fn start(&mut self, raw: &ash::Device, command: vk::CommandBuffer) {
+        self.queries.stamp(raw, command);
+    }
+
+    fn end(&mut self, raw: &ash::Device, command: vk::CommandBuffer) -> TimedStamps {
+        TimedStamps {
+            queries: self.queries.queries,
+            end: self.queries.stamp(raw, command),
+            marks: std::mem::take(&mut self.marks),
+        }
     }
 
     fn mark(&mut self, raw: &ash::Device, command: vk::CommandBuffer, launched: bool) -> bool {
-        if self.marks.is_none() {
-            return false;
-        }
         if launched {
             unsafe { compute_barrier(raw, command) };
         }
-        let mark = self.stamp(raw, command);
-        self.marks.as_mut().expect("a timed batch has marks").push(Some(mark));
+        let mark = self.queries.stamp(raw, command);
+        self.marks.push(Some(mark));
         true
     }
 
     fn skip(&mut self) {
-        if let Some(marks) = &mut self.marks {
-            marks.push(None);
-        }
-    }
-
-    fn timed(&self) -> bool {
-        self.marks.is_some()
+        self.marks.push(None);
     }
 }
 
 impl Timing for Unmeasured {
     type Stamps = ();
 
-    fn open(_: &Device, _: &mut Recording, launches: Option<usize>) -> Result<Self, ExecutionError> {
-        assert!(launches.is_none(), "an unmeasured batch times no launch");
-        Ok(Self)
+    fn queries(&self) -> Option<(vk::QueryPool, u32)> {
+        None
     }
 
-    fn queries(&self) -> Option<(vk::QueryPool, u32)> {
+    fn stamps_queries(_: &()) -> Option<(vk::QueryPool, u32)> {
         None
     }
 
@@ -742,10 +853,6 @@ impl Timing for Unmeasured {
     }
 
     fn skip(&mut self) {}
-
-    fn timed(&self) -> bool {
-        false
-    }
 }
 
 /// Which side raises a host timeline, so a batch can only wait on what the
@@ -879,30 +986,35 @@ impl<S: Side> Drop for HostTimeline<S> {
 impl DirectBatch<Measured> {
     /// A batch that stamps its start and end.
     pub fn new(device: &Device) -> Result<Self, ExecutionError> {
-        Self::create(device, None)
+        Self::create(device, Measured::open)
     }
+}
 
+impl DirectBatch<Timed> {
     /// A measurement batch that writes a timestamp before every launch, so
     /// each launch's device interval is known; `launches` bounds the calls
     /// of `launch` and `skip`. A timed batch attributes time but does not
     /// measure production, and never replays.
     pub fn timed(device: &Device, launches: usize) -> Result<Self, ExecutionError> {
-        Self::create(device, Some(launches))
+        Self::create(device, |device, recording| Timed::open(device, recording, launches))
     }
 }
 
 impl DirectBatch<Unmeasured> {
     /// A batch that writes no timestamp.
     pub fn unmeasured(device: &Device) -> Result<Self, ExecutionError> {
-        Self::create(device, None)
+        Self::create(device, |_, _| Ok(Unmeasured))
     }
 }
 
 impl<T: Timing> DirectBatch<T> {
-    fn create(device: &Device, launches: Option<usize>) -> Result<Self, ExecutionError> {
+    fn create(
+        device: &Device,
+        open: impl FnOnce(&Device, &mut Recording) -> Result<T, ExecutionError>,
+    ) -> Result<Self, ExecutionError> {
         let mut recording = device.recording()?;
         let command = device.command(&mut recording, vk::CommandBufferLevel::PRIMARY)?;
-        let timing = match T::open(device, &mut recording, launches) {
+        let timing = match open(device, &mut recording) {
             Ok(timing) => timing,
             Err(error) => {
                 recording.free_command(&device.inner.device, command);
@@ -1004,79 +1116,6 @@ impl<T: Timing> DirectBatch<T> {
         Ok(())
     }
 
-    /// Rewrite, in queue order, the argument blocks of `graph` whose bytes
-    /// differ from `blocks` (each launch's [`DirectLaunch::argument_block`],
-    /// in launch order), so the graph's launches replayed after this in the
-    /// batch, or in a later submission, take them: a graph is recorded once
-    /// for its shape and bound to the storage of each replay. The rewrite
-    /// follows every earlier use of the blocks (the batch's leading barrier
-    /// orders it after earlier submissions, a barrier here after this
-    /// batch's launches) and precedes every later one. The bytes are
-    /// carried in the command buffer (`vkCmdUpdateBuffer`): nothing is
-    /// written through the mapping, which work in flight may still read.
-    pub fn rebind(&mut self, graph: &mut DirectGraph, blocks: Vec<Vec<u8>>) -> Result<(), ExecutionError> {
-        assert!(
-            !self.timing.timed(),
-            "DirectBatch::rebind precondition: a timed batch times each launch"
-        );
-        assert_eq!(blocks.len(), graph.blocks.len(), "a shape's launches are its graph's");
-        for (held, block) in graph.blocks.iter().zip(&blocks) {
-            assert!(
-                block.len() as u64 <= held.slot_bytes,
-                "DirectBatch::rebind precondition: argument block ({} bytes) exceeds its recorded slot ({} bytes)",
-                block.len(),
-                held.slot_bytes,
-            );
-            assert_eq!(
-                block.len() % 4,
-                0,
-                "DirectBatch::rebind precondition: argument block ({} bytes) must be a multiple of 4 bytes",
-                block.len(),
-            );
-        }
-        if graph.blocks.iter().zip(&blocks).all(|(held, block)| held.bytes == *block) {
-            return Ok(());
-        }
-        let _recording = self.device.locked();
-        let raw = &self.device.inner.device;
-        unsafe {
-            if self.launched {
-                barrier(
-                    raw,
-                    self.command,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::SHADER_READ,
-                    vk::PipelineStageFlags2::TRANSFER,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                );
-            }
-            for (held, block) in graph.blocks.iter_mut().zip(blocks) {
-                if held.bytes != block {
-                    let chunk = &graph.inner.arguments[held.chunk];
-                    cmd_update_buffer(raw, self.command, chunk.raw(), chunk.offset() + held.offset, &block);
-                    held.bytes = block;
-                }
-            }
-            barrier(
-                raw,
-                self.command,
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_READ,
-            );
-        }
-        self.launched = true;
-        if !self
-            .replayed
-            .iter()
-            .any(|replayed| std::sync::Arc::ptr_eq(replayed, &graph.inner))
-        {
-            self.replayed.push(graph.inner.clone());
-        }
-        Ok(())
-    }
-
     /// Copy each of `copies` (`bytes` bytes of a source end into a
     /// destination end, `vkCmdCopyBuffer`) and then set each of `words` (the
     /// 8-byte word at an end, its value carried in the command buffer,
@@ -1150,11 +1189,6 @@ impl<T: Timing> DirectBatch<T> {
         Ok(())
     }
 
-    /// Execute every launch of `graph` in its order.
-    pub fn replay(&mut self, graph: &DirectGraph) -> Result<(), ExecutionError> {
-        self.execute(graph, &graph.inner.commands)
-    }
-
     /// Stamp mark `mark` of `stamps` once the queue's preceding work
     /// completes ([`Stamps`]).
     pub fn stamp(&mut self, stamps: &Stamps, mark: usize) {
@@ -1165,43 +1199,6 @@ impl<T: Timing> DirectBatch<T> {
             raw.cmd_reset_query_pool(self.command, stamps.pool, query, 1);
             raw.cmd_write_timestamp2(self.command, vk::PipelineStageFlags2::ALL_COMMANDS, stamps.pool, query);
         }
-    }
-
-    /// Execute the launches of the segments `segments` of `graph`, in order.
-    pub fn replay_segments(
-        &mut self,
-        graph: &DirectGraph,
-        segments: std::ops::Range<usize>,
-    ) -> Result<(), ExecutionError> {
-        self.execute(graph, &graph.inner.commands[segments])
-    }
-
-    fn execute(
-        &mut self,
-        graph: &DirectGraph,
-        commands: &[vk::CommandBuffer],
-    ) -> Result<(), ExecutionError> {
-        assert!(
-            !self.timing.timed(),
-            "DirectBatch::replay precondition: a timed batch times each launch"
-        );
-        let _recording = self.device.locked();
-        let raw = &self.device.inner.device;
-        unsafe {
-            if self.launched {
-                compute_barrier(raw, self.command);
-            }
-            raw.cmd_execute_commands(self.command, commands);
-        }
-        self.launched = true;
-        if !self
-            .replayed
-            .iter()
-            .any(|replayed| std::sync::Arc::ptr_eq(replayed, &graph.inner))
-        {
-            self.replayed.push(graph.inner.clone());
-        }
-        Ok(())
     }
 
     /// Submit without waiting.
@@ -1246,16 +1243,121 @@ impl<T: Timing> DirectBatch<T> {
         Ok(DirectSubmission {
             device: self.device.clone(),
             value,
-            retired: Some(Retired {
-                value,
-                command: RetiredCommand::Primary(self.command),
-                queries: self.timing.queries(),
-                arguments: std::mem::take(&mut self.arguments.chunks),
-            }),
+            command: self.command,
+            arguments: std::mem::take(&mut self.arguments.chunks),
             _graphs: std::mem::take(&mut self.replayed),
             stamps,
             handed,
         })
+    }
+}
+
+impl<T: Replayable> DirectBatch<T> {
+    /// Rewrite, in queue order, the argument blocks of `graph` whose bytes
+    /// differ from `blocks` (each launch's [`DirectLaunch::argument_block`],
+    /// in launch order), so the graph's launches replayed after this in the
+    /// batch, or in a later submission, take them: a graph is recorded once
+    /// for its shape and bound to the storage of each replay. The rewrite
+    /// follows every earlier use of the blocks (the batch's leading barrier
+    /// orders it after earlier submissions, a barrier here after this
+    /// batch's launches) and precedes every later one. The bytes are
+    /// carried in the command buffer (`vkCmdUpdateBuffer`): nothing is
+    /// written through the mapping, which work in flight may still read.
+    pub fn rebind(&mut self, graph: &mut DirectGraph, blocks: Vec<Vec<u8>>) -> Result<(), ExecutionError> {
+        assert_eq!(blocks.len(), graph.blocks.len(), "a shape's launches are its graph's");
+        for (held, block) in graph.blocks.iter().zip(&blocks) {
+            assert!(
+                block.len() as u64 <= held.slot_bytes,
+                "DirectBatch::rebind precondition: argument block ({} bytes) exceeds its recorded slot ({} bytes)",
+                block.len(),
+                held.slot_bytes,
+            );
+            assert_eq!(
+                block.len() % 4,
+                0,
+                "DirectBatch::rebind precondition: argument block ({} bytes) must be a multiple of 4 bytes",
+                block.len(),
+            );
+        }
+        if graph.blocks.iter().zip(&blocks).all(|(held, block)| held.bytes == *block) {
+            return Ok(());
+        }
+        let _recording = self.device.locked();
+        let raw = &self.device.inner.device;
+        unsafe {
+            if self.launched {
+                barrier(
+                    raw,
+                    self.command,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_READ,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                );
+            }
+            for (held, block) in graph.blocks.iter_mut().zip(blocks) {
+                if held.bytes != block {
+                    let chunk = &graph.inner.arguments[held.chunk];
+                    cmd_update_buffer(raw, self.command, chunk.raw(), chunk.offset() + held.offset, &block);
+                    held.bytes = block;
+                }
+            }
+            barrier(
+                raw,
+                self.command,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_READ,
+            );
+        }
+        self.launched = true;
+        if !self
+            .replayed
+            .iter()
+            .any(|replayed| std::sync::Arc::ptr_eq(replayed, &graph.inner))
+        {
+            self.replayed.push(graph.inner.clone());
+        }
+        Ok(())
+    }
+
+    /// Execute every launch of `graph` in its order.
+    pub fn replay(&mut self, graph: &DirectGraph) -> Result<(), ExecutionError> {
+        self.execute(graph, &graph.inner.commands)
+    }
+
+    /// Execute the launches of the segments `segments` of `graph`, in order.
+    pub fn replay_segments(
+        &mut self,
+        graph: &DirectGraph,
+        segments: std::ops::Range<usize>,
+    ) -> Result<(), ExecutionError> {
+        self.execute(graph, &graph.inner.commands[segments])
+    }
+
+    fn execute(
+        &mut self,
+        graph: &DirectGraph,
+        commands: &[vk::CommandBuffer],
+    ) -> Result<(), ExecutionError> {
+        let _recording = self.device.locked();
+        let raw = &self.device.inner.device;
+        unsafe {
+            if self.launched {
+                compute_barrier(raw, self.command);
+            }
+            raw.cmd_execute_commands(self.command, commands);
+        }
+        self.launched = true;
+        if !self
+            .replayed
+            .iter()
+            .any(|replayed| std::sync::Arc::ptr_eq(replayed, &graph.inner))
+        {
+            self.replayed.push(graph.inner.clone());
+        }
+        Ok(())
     }
 }
 
@@ -1331,12 +1433,12 @@ fn mask(bits: u32) -> u64 {
 }
 
 /// Submitted launches, observed through the device's timeline semaphore; a
-/// [`Measured`] one's timestamps read once it completes.
+/// [`Measured`] or [`Timed`] one's timestamps read once it completes.
 pub struct DirectSubmission<T: Timing = Measured> {
     device: Device,
     value: u64,
-    /// Returned to the device for reuse when this submission is dropped.
-    retired: Option<Retired>,
+    command: vk::CommandBuffer,
+    arguments: Vec<Range>,
     /// The graphs it replays, alive until it is.
     _graphs: Vec<std::sync::Arc<GraphInner>>,
     stamps: T::Stamps,
@@ -1370,18 +1472,13 @@ impl<T: Timing> DirectSubmission<T> {
     pub fn finish(&self) -> Result<(), ExecutionError> {
         self.device.wait(self.value)
     }
-
 }
 
-impl DirectSubmission<Measured> {
+impl<T: HasTimestamps> DirectSubmission<T> {
     /// The first `count` timestamps of the completed batch.
     fn timestamps(&self, count: u32) -> Result<Vec<u64>, ExecutionError> {
         self.finish()?;
-        let (pool, _) = self
-            .retired
-            .as_ref()
-            .and_then(|retired| retired.queries)
-            .expect("a live submission holds its queries");
+        let pool = T::pool(&self.stamps);
         let mut values = vec![0u64; count as usize];
         call(
             unsafe {
@@ -1399,7 +1496,7 @@ impl DirectSubmission<Measured> {
 
     /// Device execution time between the batch's start and end timestamps.
     pub fn device_seconds(&self) -> Result<f64, ExecutionError> {
-        let end = self.stamps.end;
+        let end = T::end_query(&self.stamps);
         let values = self.timestamps(end + 1)?;
         let limits = self.device.info().limits;
         let ticks =
@@ -1409,22 +1506,21 @@ impl DirectSubmission<Measured> {
 
     /// The completed batch's device interval on the anchor's host clock.
     pub fn device_interval(&self, anchor: &TimelineAnchor) -> Result<(f64, f64), ExecutionError> {
-        let end = self.stamps.end;
+        let end = T::end_query(&self.stamps);
         let values = self.timestamps(end + 1)?;
         Ok((anchor.place(values[0]), anchor.place(values[end as usize])))
     }
+}
 
-    /// For a timed batch, each `launch` call's device interval on the
-    /// anchor's host clock, in launch order (`None` for an empty launch). A
-    /// launch ends where the next recorded launch (or the batch) ends.
-    /// `None` for a production batch.
+impl DirectSubmission<Timed> {
+    /// Each `launch` call's device interval on the anchor's host clock, in
+    /// launch order (`None` for an empty launch). A launch ends where the
+    /// next recorded launch (or the batch) ends.
     pub fn launch_intervals(
         &self,
         anchor: &TimelineAnchor,
-    ) -> Result<Option<Vec<Option<(f64, f64)>>>, ExecutionError> {
-        let Some(marks) = &self.stamps.marks else {
-            return Ok(None);
-        };
+    ) -> Result<Vec<Option<(f64, f64)>>, ExecutionError> {
+        let marks = &self.stamps.marks;
         let values = self.timestamps(self.stamps.end + 1)?;
         let mut intervals = Vec::with_capacity(marks.len());
         for (index, mark) in marks.iter().enumerate() {
@@ -1443,15 +1539,18 @@ impl DirectSubmission<Measured> {
                 anchor.place(values[end as usize]),
             )));
         }
-        Ok(Some(intervals))
+        Ok(intervals)
     }
 }
 
 impl<T: Timing> Drop for DirectSubmission<T> {
     fn drop(&mut self) {
-        if let Some(retired) = self.retired.take() {
-            self.device.retire(retired);
-        }
+        self.device.retire(Retired {
+            value: self.value,
+            command: RetiredCommand::Primary(self.command),
+            queries: T::stamps_queries(&self.stamps),
+            arguments: std::mem::take(&mut self.arguments),
+        });
     }
 }
 

@@ -3,7 +3,7 @@
 // output entries' epilogue (`projection::OutputOf`: the residual add, or the
 // `Scatter` with the inject values and, when the inject row carries one,
 // their comb).
-#include "lib/projection/projection.h"
+#include "lib/projection/join.h"
 
 typedef projection::OutputOf<element::F32, projection::AllRows, SEISMIC_DIM_SN, SEISMIC_DIM_IN != 0,
     (SEISMIC_DIM_IN > SEISMIC_DIM_SN)> output_join;

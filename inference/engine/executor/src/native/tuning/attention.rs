@@ -268,7 +268,7 @@ fn row_starts(
 /// whose `key` is least, the first of equals in declaration order: found by
 /// walking the domain, never holding it.
 fn nearest<K: Ord>(
-    implementation: &seismic::NativeImplementation,
+    implementation: &seismic::OnDevice,
     statics: &seismic::NativeSpecialization,
     accepts: impl Fn(&seismic::NativeSpecialization) -> bool,
     key: impl Fn(&seismic::NativeSpecialization) -> K,

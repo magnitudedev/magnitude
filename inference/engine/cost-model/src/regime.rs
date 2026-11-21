@@ -82,6 +82,8 @@
 //! Where no path term or stall exceeds what the rows add to the GPU's, and
 //! no stand pays a verify pass's turn, the depth is 0 and the pass is plain.
 
+use crate::{ReadLine, Terms};
+
 /// One term besides the GPU's pass ([`crate::Terms::each_path`]): `seconds`,
 /// what a miss of the memory the GPU computes from holds it (`t_i` times
 /// the moves over it a miss makes); and `wasted`, a pass's seconds on it
@@ -144,6 +146,17 @@ impl NeededByForm {
     }
 }
 
+/// Per-layer route-sharing statistics for pricing unexecuted verify passes
+/// (`Needed::Shadow`): `layers` is the number of streamed routed layers (`L`),
+/// and `fresh[j - 1]` is the mean fresh experts per layer introduced by lag
+/// `j >= 1` relative to the preceding `j` tokens (matching
+/// [`crate::FrontRoutes::fresh`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VerifyRoutes {
+    pub layers: usize,
+    pub fresh: Vec<f64>,
+}
+
 /// What the pass is decided on, each a pass's mean over the latest
 /// measured decode passes: at index `k`, `resident`, the resident pass's
 /// compute at depth `k`, `C(1 + k)` (measured where the window holds such
@@ -157,7 +170,8 @@ impl NeededByForm {
 /// verifies; `stall`, the seconds a miss held a plain pass past its compute
 /// (none before one is measured); `overhead`, the seconds from a verify
 /// pass's completion to the next pass's start (`O`, none before one is
-/// measured); and `paths`, every term besides the GPU's.
+/// measured); `paths`, every term besides the GPU's; and `routes`, the
+/// per-layer route sharing used to deduplicate unexecuted shadow verify rows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Regime {
     pub resident: Vec<f64>,
@@ -167,6 +181,7 @@ pub struct Regime {
     pub stall: Option<f64>,
     pub overhead: Option<f64>,
     pub paths: Vec<PathTerm>,
+    pub routes: VerifyRoutes,
 }
 
 /// The form and depth of a pass the host builds ([`Regime::pass`]): `k`
@@ -260,18 +275,61 @@ impl Regime {
         self.verify_pass_and_emitted(k).0
     }
 
+    /// Prior target-launch durations for plain decode (`index 0`) and
+    /// `1 + k`-row verify passes (`index k` for `1..=max_k`).
+    pub fn verify_prior(&self, max_k: usize) -> Vec<f64> {
+        let mut prior = Vec::with_capacity(1 + max_k);
+        prior.push(self.time(0));
+        for k in 1..=max_k {
+            prior.push(self.verify_pass_time(k));
+        }
+        prior
+    }
+
+    /// Total distinct misses across all `1 + k` rows of an unexecuted verify
+    /// pass whose single-token shadow misses are `u`.
+    ///
+    /// With `L = routes.layers` streamed layers and `fresh[j - 1]` the mean
+    /// fresh experts per layer at lag `j >= 1`, row 0 incurs `u_l = u / L`
+    /// misses and each subsequent row `j in 1..=k` adds
+    /// `fresh_at(j) * (u_l / fresh_at(1)).min(1.0)` distinct misses (carrying
+    /// forward the last measured `fresh` for lags past `fresh.len()`).
+    /// Degrades cleanly to `(1 + k) * u` when `layers == 0`, `fresh` is empty,
+    /// or `fresh[0] <= 0.0`.
+    pub fn shadow_verify_misses(&self, u: f64, k: usize) -> f64 {
+        let Some(&f1) = self.routes.fresh.first() else {
+            return (1 + k) as f64 * u;
+        };
+        if self.routes.layers == 0 || f1 <= 0.0 {
+            return (1 + k) as f64 * u;
+        }
+        let layers = self.routes.layers as f64;
+        let u_l = u / layers;
+        let p_miss = (u_l / f1).min(1.0);
+        let last = *self.routes.fresh.last().expect("non-empty");
+        let extra: f64 = (1..=k)
+            .map(|j| self.routes.fresh.get(j - 1).copied().unwrap_or(last) * p_miss)
+            .sum();
+        layers * (u_l + extra)
+    }
+
     fn verify_pass_and_emitted(&self, k: usize) -> (f64, f64) {
         let depths = self.priced(k);
         let emitted = self.verify_emitted(k);
         // An unexecuted shadow measures misses per true row, whereas a verify
         // pass runs and reads all `1 + k` rows (including discarded rows past
-        // the first fall). Once executed, `needed.verify[k]` already divides
-        // all `1 + k` rows' misses by `emitted`.
-        let (rows, needed) = match self.needed.verify[k] {
-            Needed::Shadow(u) => ((1 + k) as f64, u),
-            Needed::Executed(u) => (emitted, u),
+        // the first fall), deduplicated across shared experts via `routes`.
+        // Once executed, `needed.verify[k]` already divides all `1 + k` rows'
+        // misses by `emitted`.
+        let pass_misses = match self.needed.verify[k] {
+            Needed::Shadow(u) => self.shadow_verify_misses(u, k),
+            Needed::Executed(u) => emitted * u,
         };
-        let read = self.paths.iter().map(|path| rows * path.read(needed, depths) + sum(&path.wasted.verify[..=k])).fold(0., f64::max);
+        let read = self
+            .paths
+            .iter()
+            .map(|path| path.read(pass_misses, depths) + sum(&path.wasted.verify[..=k]))
+            .fold(0., f64::max);
         (self.resident[k].max(read), emitted)
     }
 
@@ -334,6 +392,89 @@ fn sum(wasted: &[Option<f64>]) -> f64 {
     wasted.iter().map(|wasted| wasted.unwrap_or(0.)).sum()
 }
 
+/// The single owner of read-ahead admission and demand-miss stall pricing,
+/// evaluated purely on measured quantities (`terms`, `drive_line`,
+/// `demand_stall`, `plain_stall`).
+///
+/// Issuing a speculative read of `bytes` consumes pipelined drive bandwidth
+/// `t_bw = b / P_peak` (`ReadLine::transfer_seconds`). Given `idle` seconds
+/// of remaining per-layer idle compute, `overlap = min(t_bw, idle)` is hidden
+/// behind compute, leaving net critical-path cost `w_net = (t_bw - overlap)`
+/// when the drive binds (`D > 0 && D >= max(C, L_link, CPU, Mem)`) and `0`
+/// otherwise. If the expert is used (probability `p`), it avoids a demand
+/// stall `s_demand`. Expected step time decreases iff
+/// `w_net - p * s_demand <= 0`, i.e. `p >= (w_net / s_demand).min(1.0)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ReadAdmission {
+    pub terms: Terms,
+    pub drive_line: Option<ReadLine>,
+    pub demand_stall: Option<f64>,
+    pub plain_stall: Option<f64>,
+}
+
+impl ReadAdmission {
+    /// Pipelined marginal bandwidth time `t_bw = b / P_peak` for `bytes`
+    /// (`0.0` before the drive line is measured).
+    pub fn transfer_seconds(&self, bytes: u64) -> f64 {
+        self.drive_line.map_or(0.0, |line| line.transfer_seconds(bytes as f64))
+    }
+
+    /// Whether the drive is the binding resource
+    /// (`D > 0 && D >= max(C, L_link, CPU, Mem)`).
+    pub fn binds(&self) -> bool {
+        let t = self.terms;
+        t.drive > 0.0 && t.drive >= t.compute.max(t.link).max(t.cpu).max(t.memory)
+    }
+
+    /// Expected critical-path stall saved by avoiding one demand miss of
+    /// `bytes`: live `demand_stall`, falling back to `plain_stall` (so 100%
+    /// prefetch hit rate never collapses to `break_even == 1.0`), then to the
+    /// unpipelined drive read time `λ + b / P_peak`.
+    pub fn effective_stall(&self, bytes: u64) -> Option<f64> {
+        self.demand_stall
+            .or(self.plain_stall)
+            .or_else(|| self.drive_line.map(|line| line.seconds(bytes)))
+    }
+
+    /// The probability of use at which a read ahead of `bytes` breaks even
+    /// given `idle` seconds of remaining per-layer idle compute.
+    ///
+    /// # Panics
+    /// Where `idle` is non-finite or negative.
+    pub fn break_even(&self, bytes: u64, idle: f64) -> f64 {
+        assert!(idle.is_finite() && idle >= 0.0, "idle compute window must be finite and non-negative, got {idle}");
+        if !self.binds() {
+            return 0.0;
+        }
+        let t_bw = self.transfer_seconds(bytes);
+        let overlap = t_bw.min(idle.max(0.0));
+        let w_net = (t_bw - overlap).max(0.0);
+        if w_net == 0.0 {
+            return 0.0;
+        }
+        match self.effective_stall(bytes) {
+            Some(s_demand) if s_demand > 0.0 => (w_net / s_demand).min(1.0),
+            _ => 1.0,
+        }
+    }
+
+    /// Whether a read ahead of `bytes` used with probability `p` is admitted
+    /// given `idle` seconds of remaining per-layer idle compute.
+    pub fn admits(&self, p: f64, bytes: u64, idle: f64) -> bool {
+        p >= self.break_even(bytes, idle)
+    }
+
+    /// Critical-path stall of `reads` demand reads fetched together at a
+    /// layer (`reads * demand_stall.or(plain_stall).unwrap_or(0.0)`).
+    ///
+    /// # Panics
+    /// Where `reads` is non-finite or negative.
+    pub fn layer_stall(&self, reads: f64) -> f64 {
+        assert!(reads.is_finite() && reads >= 0.0, "layer_stall reads must be finite and non-negative, got {reads}");
+        reads * self.demand_stall.or(self.plain_stall).unwrap_or(0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,7 +492,16 @@ mod tests {
     /// step at depth `k`, the first row standing `stand`, no stall, and no
     /// verify pass judged or timed.
     fn regime(needed: impl Fn(usize) -> f64, stand: Option<f64>, paths: Vec<PathTerm>) -> Regime {
-        Regime { resident: CODE.to_vec(), needed: NeededByForm::both((0..8).map(|k| Needed::Executed(needed(k))).collect()), stand, accepts: vec![None; 7], stall: None, overhead: None, paths }
+        Regime {
+            resident: CODE.to_vec(),
+            needed: NeededByForm::both((0..8).map(|k| Needed::Executed(needed(k))).collect()),
+            stand,
+            accepts: vec![None; 7],
+            stall: None,
+            overhead: None,
+            paths,
+            routes: VerifyRoutes::default(),
+        }
     }
 
     /// A drive-bound decode (245 misses of 1 ms a step plain, the ranking
@@ -554,6 +704,7 @@ mod tests {
                     verify: vec![Some(0.), Some(0.003), None, None, None, None, None, None],
                 },
             }],
+            routes: VerifyRoutes::default(),
         };
         // Depth 7 carries forward 0.875 -> emitted = 1 + sum_{j=1..=7} 0.875^j.
         let emitted_7: f64 = 1. + (1..=7).map(|j| 0.875f64.powi(j)).sum::<f64>();
@@ -595,6 +746,7 @@ mod tests {
                     verify: vec![Some(0.0024), Some(0.0035), None, None, None, None, None, None],
                 },
             }],
+            routes: VerifyRoutes::default(),
         };
         assert!(reg.time(1) < reg.verify_time(1), "front(1) {} must beat verify(1) {}", reg.time(1), reg.verify_time(1));
         assert_eq!(reg.pass(), Form::Front(1));
@@ -622,6 +774,7 @@ mod tests {
                     verify: vec![Some(0.), Some(0.004), Some(0.003), None, None, None, None, None],
                 },
             }],
+            routes: VerifyRoutes::default(),
         };
         for k in 1..=7 {
             let emitted = reg.verify_emitted(k);
@@ -633,10 +786,138 @@ mod tests {
                 reg.verify_time(k)
             );
         }
+        // `verify_prior(7)` matches `[time(0), verify_pass_time(1), ..., verify_pass_time(7)]`.
+        let prior = reg.verify_prior(7);
+        assert_eq!(prior.len(), 8);
+        assert!((prior[0] - reg.time(0)).abs() < 1e-15);
+        for k in 1..=7 {
+            assert!((prior[k] - reg.verify_pass_time(k)).abs() < 1e-15);
+        }
         // Compute-bound regime: verify_pass_time(k) == resident[k].
         let compute = verifying(regime(|_| 1.3, Some(0.8), vec![path(1e-3, |_| Some(0.))]), Some(0.8), Some(5e-3));
         for k in 1..=7 {
             assert!((compute.verify_pass_time(k) - CODE[k]).abs() < 1e-12);
         }
+    }
+
+    /// `shadow_verify_misses` deduplicates shared experts across verify rows
+    /// via `VerifyRoutes` on prose, code, and thrashing (`u_l >= fresh[0]`),
+    /// and degrades cleanly to `(1 + k) * u` when `routes` is empty or `layers == 0`.
+    #[test]
+    fn shadow_verify_misses_deduplicates_prose_code_thrashing_and_empty_fallback() {
+        let with_routes = |routes: VerifyRoutes| Regime {
+            routes,
+            ..regime(|_| 0., Some(0.9), vec![path(1e-3, |_| Some(0.))])
+        };
+
+        // 1. Prose: L = 48, fresh = [3.10, 1.73, 1.33, 1.07, 0.91, 0.80, 0.71], u = 1.9.
+        let prose_fresh = vec![3.10, 1.73, 1.33, 1.07, 0.91, 0.80, 0.71];
+        let prose = with_routes(VerifyRoutes { layers: 48, fresh: prose_fresh.clone() });
+        let u_prose = 1.9;
+        let u_l = u_prose / 48.0;
+        let p_miss = u_l / 3.10;
+        // k = 1: row 0 (u_l) + row 1 (3.10 * u_l / 3.10 = u_l) = 2 * u.
+        assert!((prose.shadow_verify_misses(u_prose, 1) - 2.0 * u_prose).abs() < 1e-12);
+        // k = 4: strictly less than 5 * u_prose because fresh decays sharply on prose.
+        let expected_prose_4 = 48.0 * (u_l + (3.10 + 1.73 + 1.33 + 1.07) * p_miss);
+        assert!((prose.shadow_verify_misses(u_prose, 4) - expected_prose_4).abs() < 1e-12);
+        assert!(prose.shadow_verify_misses(u_prose, 4) < 5.0 * u_prose);
+        // Lag past fresh.len() carries forward the last measured fresh (0.71).
+        let expected_prose_8 = 48.0 * (u_l + (prose_fresh.iter().sum::<f64>() + 0.71) * p_miss);
+        assert!((prose.shadow_verify_misses(u_prose, 8) - expected_prose_8).abs() < 1e-12);
+
+        // 2. Code: L = 48, fresh = [8.18, 7.16, 6.56, 6.09, 5.71, 5.37, 5.10], u = 240.0 (u_l = 5.0).
+        let code_fresh = vec![8.18, 7.16, 6.56, 6.09, 5.71, 5.37, 5.10];
+        let code = with_routes(VerifyRoutes { layers: 48, fresh: code_fresh });
+        let expected_code_3 = 48.0 * (5.0 + (8.18 + 7.16 + 6.56) * (5.0 / 8.18));
+        assert!((code.shadow_verify_misses(240.0, 3) - expected_code_3).abs() < 1e-12);
+        assert!(code.shadow_verify_misses(240.0, 3) < 4.0 * 240.0);
+
+        // 3. Thrashing: u_l >= fresh[0] clamps p_miss to 1.0 (every fresh expert misses).
+        let thrash = with_routes(VerifyRoutes { layers: 48, fresh: vec![3.10, 1.73, 1.33] });
+        let u_thrash = 48.0 * 5.0; // u_l = 5.0 >= 3.10
+        let expected_thrash_3 = 48.0 * (5.0 + 3.10 + 1.73 + 1.33);
+        assert!((thrash.shadow_verify_misses(u_thrash, 3) - expected_thrash_3).abs() < 1e-12);
+        assert!(thrash.shadow_verify_misses(u_thrash, 3) < 4.0 * u_thrash);
+
+        // 4. Empty fresh or layers == 0 degrades cleanly to (1 + k) * u.
+        let empty = with_routes(VerifyRoutes::default());
+        assert!((empty.shadow_verify_misses(100.0, 4) - 500.0).abs() < 1e-12);
+        let zero_layers = with_routes(VerifyRoutes { layers: 0, fresh: vec![3.10, 1.73] });
+        assert!((zero_layers.shadow_verify_misses(100.0, 4) - 500.0).abs() < 1e-12);
+    }
+
+    /// `ReadAdmission::break_even` prices pipelined bandwidth `t_bw = b / P_peak`
+    /// against `s_demand` across bandwidth-saturated (M4 Pro), latency-bound
+    /// (GB10), discrete (RTX 3090), GPU-bound, and 100%-prefetch-hit regimes.
+    #[test]
+    fn read_admission_prices_every_hardware_regime_without_cliff() {
+        let bytes = 3_090_000_u64;
+        let drive_bound = Terms { compute: 0.032, drive: 0.160, ..Terms::default() };
+
+        // 1. M4 Pro (bandwidth-saturated): t_bw = 0.67 ms, s_demand = 0.81 ms -> p* = 0.67 / 0.81 ≈ 0.827.
+        let m4_line = ReadLine::new(0.14e-3, 0.67e-3 / bytes as f64).unwrap();
+        let m4 = ReadAdmission {
+            terms: drive_bound,
+            drive_line: Some(m4_line),
+            demand_stall: Some(0.81e-3),
+            plain_stall: Some(0.81e-3),
+        };
+        assert!(m4.binds());
+        assert!((m4.transfer_seconds(bytes) - 0.67e-3).abs() < 1e-12);
+        let p_m4 = m4.break_even(bytes, 0.0);
+        assert!((p_m4 - 0.67 / 0.81).abs() < 1e-9, "M4 Pro p* = {p_m4}");
+        assert!(m4.admits(0.83, bytes, 0.0) && !m4.admits(0.82, bytes, 0.0));
+        // Partial idle compute overlap reduces w_net = 0.67 - 0.27 = 0.40 ms -> p* = 0.40 / 0.81.
+        assert!((m4.break_even(bytes, 0.27e-3) - 0.40 / 0.81).abs() < 1e-9);
+        // Full idle overlap covers t_bw -> free (p* = 0.0).
+        assert_eq!(m4.break_even(bytes, 0.67e-3), 0.0);
+        assert_eq!(m4.break_even(bytes, 1.0e-3), 0.0);
+
+        // 2. GB10 (latency-bound): t_bw = 0.08 ms, lambda = 0.32 ms, s_demand = 0.40 ms -> p* = 0.20.
+        let gb10_line = ReadLine::new(0.32e-3, 0.08e-3 / bytes as f64).unwrap();
+        let gb10 = ReadAdmission {
+            terms: drive_bound,
+            drive_line: Some(gb10_line),
+            demand_stall: Some(0.40e-3),
+            plain_stall: None,
+        };
+        let p_gb10 = gb10.break_even(bytes, 0.0);
+        assert!((p_gb10 - 0.20).abs() < 1e-9, "GB10 p* = {p_gb10}");
+        assert!(gb10.admits(0.20, bytes, 0.0) && !gb10.admits(0.19, bytes, 0.0));
+
+        // 3. RTX 3090: t_bw = 0.40 ms, s_demand = 0.60 ms -> p* = 2/3 ≈ 0.667.
+        let rtx_line = ReadLine::new(0.20e-3, 0.40e-3 / bytes as f64).unwrap();
+        let rtx = ReadAdmission {
+            terms: Terms { compute: 0.020, drive: 0.090, link: 0.040, cpu: 0.025, memory: 0.015 },
+            drive_line: Some(rtx_line),
+            demand_stall: Some(0.60e-3),
+            plain_stall: None,
+        };
+        let p_rtx = rtx.break_even(bytes, 0.0);
+        assert!((p_rtx - 2.0 / 3.0).abs() < 1e-9, "RTX 3090 p* = {p_rtx}");
+
+        // 4. GPU-bound: drive does not bind -> p* = 0.0.
+        let gpu_bound = ReadAdmission {
+            terms: Terms { compute: 0.032, drive: 0.002, ..Terms::default() },
+            ..m4
+        };
+        assert!(!gpu_bound.binds());
+        assert_eq!(gpu_bound.break_even(bytes, 0.0), 0.0);
+
+        // 5. 100% prefetch hit: demand_stall = None falls back to plain_stall, never collapsing to 1.0.
+        let full_hit = ReadAdmission { demand_stall: None, ..m4 };
+        assert!((full_hit.break_even(bytes, 0.0) - 0.67 / 0.81).abs() < 1e-9);
+        assert!((full_hit.layer_stall(3.0) - 3.0 * 0.81e-3).abs() < 1e-12);
+
+        // 6. Both stalls None: falls back to drive_line.seconds(bytes) = lambda + t_bw.
+        let line_only = ReadAdmission { demand_stall: None, plain_stall: None, ..m4 };
+        assert!((line_only.break_even(bytes, 0.0) - 0.67 / 0.81).abs() < 1e-9);
+        assert_eq!(line_only.layer_stall(3.0), 0.0);
+
+        // 7. Default (unmeasured): admits everything, layer_stall = 0.
+        let default = ReadAdmission::default();
+        assert_eq!(default.break_even(bytes, 0.0), 0.0);
+        assert_eq!(default.layer_stall(4.0), 0.0);
     }
 }

@@ -1173,6 +1173,15 @@ fn format_u64_slice(values: &[u64]) -> String {
     s
 }
 
+#[derive(Clone, Copy)]
+enum ParamBinding<'a> {
+    /// Normal expression context: parameters resolve to `__p_{idx}`.
+    Loop,
+    /// Sequential parameter-default context: the candidate parameter (if any)
+    /// resolves to `__cand`, and earlier parameters resolve to `__def_{idx}`.
+    Default(Option<&'a str>),
+}
+
 struct ExprCtx<'a> {
     backend: BackendName,
     elements: &'a [String],
@@ -1181,9 +1190,8 @@ struct ExprCtx<'a> {
     /// When lowering inside a launch's `when` condition, resolve its local
     /// parameters first.
     launch: Option<usize>,
-    /// When lowering a parameter's `least where` / `greatest where` default,
-    /// only that parameter is in scope under `__cand`.
-    default_param: Option<&'a str>,
+    /// How parameter references lower in this context.
+    param_binding: ParamBinding<'a>,
 }
 
 impl<'a> ExprCtx<'a> {
@@ -1231,11 +1239,17 @@ impl<'a> ExprCtx<'a> {
                 format!("__d_{idx}")
             }
             NativeNatExpr::Parameter(name) => {
-                if self.default_param == Some(name.as_str()) {
-                    return "__cand".to_owned();
+                match self.param_binding {
+                    ParamBinding::Default(Some(cand)) if cand == name.as_str() => "__cand".to_owned(),
+                    ParamBinding::Default(_) => {
+                        let idx = self.expect_param_index(name);
+                        format!("__def_{idx}")
+                    }
+                    ParamBinding::Loop => {
+                        let idx = self.expect_param_index(name);
+                        format!("__p_{idx}")
+                    }
                 }
-                let idx = self.expect_param_index(name);
-                format!("__p_{idx}")
             }
             NativeNatExpr::Element(elem_name, query) => {
                 let idx = self
@@ -1272,7 +1286,7 @@ impl<'a> ExprCtx<'a> {
                 }
             }
             NativeNatExpr::Device(name) => format!(
-                "{{ let __dev: u64 = Err(seismic::ContractError::DeviceDependent({name:?}))?; __dev }}"
+                "(__device.ok_or(seismic::ContractError::DeviceDependent({name:?}))?.value({name:?}))"
             ),
             NativeNatExpr::Add(l, r) => format!(
                 "(({}).checked_add({}).ok_or(seismic::ContractError::ArithmeticOverflow)?)",
@@ -1409,9 +1423,9 @@ fn render_contract_admit(
     natives: &[(BackendName, &NativeImplementation)],
 ) {
     out.push_str(
-        "    fn contract_admit(backend: seismic::BackendName, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<(), seismic::ContractError> {\n",
+        "    fn contract_admit(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<(), seismic::ContractError> {\n",
     );
-    render_backend_dispatch(out, natives, "admit", "elements, dims, params");
+    render_backend_dispatch(out, natives, "admit", "device, elements, dims, params");
 }
 
 fn render_contract_admit_helpers(
@@ -1423,8 +1437,9 @@ fn render_contract_admit_helpers(
         let slug = backend_slug(backend);
         let _ = writeln!(
             out,
-            "    pub(super) fn admit_{slug}(elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<(), seismic::ContractError> {{"
+            "    pub(super) fn admit_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<(), seismic::ContractError> {{"
         );
+        out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
         emit_unit_column_checks(out, entry, native, "      ");
         emit_dim_binding(out, &native.statics, "      ");
@@ -1437,7 +1452,7 @@ fn render_contract_admit_helpers(
                 dims: &native.statics,
                 params: &slots,
                 launch: None,
-                default_param: None,
+                param_binding: ParamBinding::Loop,
             };
             emit_constraint_guard(out, &ctx, constraint, "      ");
         }
@@ -1451,9 +1466,9 @@ fn render_contract_default_params(
     natives: &[(BackendName, &NativeImplementation)],
 ) {
     out.push_str(
-        "    fn contract_default_params(backend: seismic::BackendName, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<(&'static str, u64)>, seismic::ContractError> {\n",
+        "    fn contract_default_params(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<(&'static str, u64)>, seismic::ContractError> {\n",
     );
-    render_backend_dispatch(out, natives, "default_params", "elements, dims");
+    render_backend_dispatch(out, natives, "default_params", "device, elements, dims");
 }
 
 fn render_contract_default_params_helpers(
@@ -1465,10 +1480,33 @@ fn render_contract_default_params_helpers(
         let slug = backend_slug(backend);
         let _ = writeln!(
             out,
-            "    pub(super) fn default_params_{slug}(elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<(&'static str, u64)>, seismic::ContractError> {{"
+            "    pub(super) fn default_params_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<(&'static str, u64)>, seismic::ContractError> {{"
         );
+        out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
         emit_unit_column_checks(out, entry, native, "      ");
+        let mut device_reads = Vec::new();
+        for param in native
+            .params
+            .iter()
+            .chain(native.launches.iter().flat_map(|launch| &launch.params))
+        {
+            match &param.default {
+                NativeDefault::Value(expr) => expr.device_reads(&mut device_reads),
+                NativeDefault::Least(cond) | NativeDefault::Greatest(cond) => {
+                    cond.device_reads(&mut device_reads);
+                }
+            }
+        }
+        if let Some(constraint) = &native.constraint {
+            constraint.device_reads(&mut device_reads);
+        }
+        if let Some(first) = device_reads.first() {
+            let _ = writeln!(
+                out,
+                "      if __device.is_none() {{ return Err(seismic::ContractError::DeviceDependent({first:?})); }}"
+            );
+        }
         emit_dim_binding(out, &native.statics, "      ");
         let slots = collect_params(native);
         let ctx = ExprCtx {
@@ -1477,7 +1515,7 @@ fn render_contract_default_params_helpers(
             dims: &native.statics,
             params: &slots,
             launch: None,
-            default_param: None,
+            param_binding: ParamBinding::Loop,
         };
 
         // Compute each parameter's default and its defaults-first candidate order.
@@ -1492,7 +1530,7 @@ fn render_contract_default_params_helpers(
                         dims: &native.statics,
                         params: &slots,
                         launch: slot.launch,
-                        default_param: None,
+                        param_binding: ParamBinding::Default(None),
                     };
                     let e = default_ctx.lower_nat(expr);
                     let _ = writeln!(
@@ -1517,7 +1555,7 @@ fn render_contract_default_params_helpers(
                         dims: &native.statics,
                         params: &slots,
                         launch: slot.launch,
-                        default_param: Some(pname.as_str()),
+                        param_binding: ParamBinding::Default(Some(pname.as_str())),
                     };
                     let cond_expr = default_ctx.lower_cond(cond);
                     let _ = writeln!(
@@ -1625,9 +1663,9 @@ fn render_contract_sizing(
     natives: &[(BackendName, &NativeImplementation)],
 ) {
     out.push_str(
-        "    fn contract_sizing(backend: seismic::BackendName, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {\n",
+        "    fn contract_sizing(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {\n",
     );
-    render_backend_dispatch(out, natives, "sizing", "elements, dims, params");
+    render_backend_dispatch(out, natives, "sizing", "device, elements, dims, params");
 }
 
 fn render_contract_sizing_helpers(
@@ -1640,8 +1678,9 @@ fn render_contract_sizing_helpers(
         let slug = backend_slug(backend);
         let _ = writeln!(
             out,
-            "    pub(super) fn sizing_{slug}(elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {{"
+            "    pub(super) fn sizing_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {{"
         );
+        out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
         emit_unit_column_checks(out, entry, native, "      ");
         emit_dim_binding(out, &entry.dimensions, "      ");
@@ -1654,7 +1693,7 @@ fn render_contract_sizing_helpers(
             dims: &entry.dimensions,
             params: &slots,
             launch: None,
-            default_param: None,
+            param_binding: ParamBinding::Loop,
         };
 
         if let Some(constraint) = &native.constraint {
@@ -1783,7 +1822,7 @@ fn render_contract_sizing_helpers(
                         dims: &entry.dimensions,
                         params: &slots,
                         launch: Some(launch_idx),
-                        default_param: None,
+                        param_binding: ParamBinding::Loop,
                     };
                     let w = lctx.lower_cond(when);
                     let _ = writeln!(
@@ -2535,12 +2574,100 @@ fn lower_conjunction(ctx: &ExprCtx<'_>, conjuncts: &[&NativeCondition]) -> Strin
         .join(" && ")
 }
 
-fn emit_default_first_order(
+fn emit_default_bindings(
     out: &mut String,
     backend: BackendName,
     entry: &EntryInfo,
     slots: &[ParamSlot<'_>],
     ctx: &ExprCtx<'_>,
+    indent: &str,
+) {
+    let mut need = vec![false; slots.len()];
+    for (k, slot) in slots.iter().enumerate() {
+        if slot.param.values.len() > 1 {
+            need[k] = true;
+        }
+    }
+    for k in (0..slots.len()).rev() {
+        if !need[k] {
+            continue;
+        }
+        let slot = &slots[k];
+        let mut names = Vec::new();
+        match &slot.param.default {
+            NativeDefault::Value(expr) => expr.parameters(&mut names),
+            NativeDefault::Least(cond) | NativeDefault::Greatest(cond) => cond.parameters(&mut names),
+        }
+        let lctx = ExprCtx {
+            backend,
+            elements: &entry.element_parameters,
+            dims: ctx.dims,
+            params: slots,
+            launch: slot.launch,
+            param_binding: ParamBinding::Loop,
+        };
+        for name in names {
+            if name != slot.param.name {
+                let idx = lctx.expect_param_index(&name);
+                if !slots[idx].param.values.is_empty() {
+                    need[idx] = true;
+                }
+            }
+        }
+    }
+    for (k, slot) in slots.iter().enumerate() {
+        if !need[k] || slot.param.values.is_empty() {
+            continue;
+        }
+        let pname = &slot.param.name;
+        let fallback = slot.param.values[0];
+        match &slot.param.default {
+            NativeDefault::Value(expr) => {
+                let default_ctx = ExprCtx {
+                    backend,
+                    elements: &entry.element_parameters,
+                    dims: ctx.dims,
+                    params: slots,
+                    launch: slot.launch,
+                    param_binding: ParamBinding::Default(None),
+                };
+                let e = default_ctx.lower_nat(expr);
+                let _ = writeln!(
+                    out,
+                    "{indent}#[allow(unused_variables)] let __def_{k}: u64 = (|| -> Result<u64, seismic::ContractError> {{ Ok({e}) }})().unwrap_or({fallback}u64);"
+                );
+            }
+            NativeDefault::Least(cond) | NativeDefault::Greatest(cond) => {
+                let mut sorted = slot.param.values.clone();
+                sorted.sort_unstable();
+                if matches!(slot.param.default, NativeDefault::Greatest(_)) {
+                    sorted.reverse();
+                }
+                let sorted_lit = format_u64_slice(&sorted);
+                let default_ctx = ExprCtx {
+                    backend,
+                    elements: &entry.element_parameters,
+                    dims: ctx.dims,
+                    params: slots,
+                    launch: slot.launch,
+                    param_binding: ParamBinding::Default(Some(pname.as_str())),
+                };
+                let cond_expr = default_ctx.lower_cond(cond);
+                let _ = writeln!(
+                    out,
+                    "{indent}#[allow(unused_variables)] let __def_{k}: u64 = (|| -> Result<u64, seismic::ContractError> {{ for __cand in {sorted_lit} {{ if {cond_expr} {{ return Ok(__cand); }} }} Err(seismic::ContractError::NoDefault({pname:?})) }})().unwrap_or({fallback}u64);"
+                );
+            }
+        }
+    }
+}
+
+fn emit_default_first_order(
+    out: &mut String,
+    _backend: BackendName,
+    _entry: &EntryInfo,
+    slots: &[ParamSlot<'_>],
+    _ctx: &ExprCtx<'_>,
     k: usize,
     indent: &str,
 ) {
@@ -2548,54 +2675,14 @@ fn emit_default_first_order(
     if slot.param.values.len() <= 1 {
         return;
     }
-    let pname = &slot.param.name;
     let vals = format_u64_slice(&slot.param.values);
     let _ = writeln!(out, "{indent}let __ord_{k} = {{");
     let _ = writeln!(out, "{indent}  let mut __arr = {vals};");
-    match &slot.param.default {
-        NativeDefault::Value(expr) => {
-            let default_ctx = ExprCtx {
-                backend,
-                elements: &entry.element_parameters,
-                dims: ctx.dims,
-                params: slots,
-                launch: slot.launch,
-                default_param: None,
-            };
-            let e = default_ctx.lower_nat(expr);
-            let _ = writeln!(
-                out,
-                "{indent}  if let Ok(__def) = (|| -> Result<u64, seismic::ContractError> {{ Ok({e}) }})() {{"
-            );
-        }
-        NativeDefault::Least(cond) | NativeDefault::Greatest(cond) => {
-            let mut sorted = slot.param.values.clone();
-            sorted.sort_unstable();
-            if matches!(slot.param.default, NativeDefault::Greatest(_)) {
-                sorted.reverse();
-            }
-            let sorted_lit = format_u64_slice(&sorted);
-            let default_ctx = ExprCtx {
-                backend,
-                elements: &entry.element_parameters,
-                dims: ctx.dims,
-                params: slots,
-                launch: slot.launch,
-                default_param: Some(pname.as_str()),
-            };
-            let cond_expr = default_ctx.lower_cond(cond);
-            let _ = writeln!(
-                out,
-                "{indent}  if let Ok(__def) = (|| -> Result<u64, seismic::ContractError> {{ for __cand in {sorted_lit} {{ if {cond_expr} {{ return Ok(__cand); }} }} Err(seismic::ContractError::NoDefault({pname:?})) }})() {{"
-            );
-        }
-    }
     let _ = writeln!(
         out,
-        "{indent}    if let Some(__idx) = __arr.iter().position(|&__v| __v == __def) {{"
+        "{indent}  if let Some(__idx) = __arr.iter().position(|&__v| __v == __def_{k}) {{"
     );
-    let _ = writeln!(out, "{indent}      __arr[..=__idx].rotate_right(1);");
-    let _ = writeln!(out, "{indent}    }}");
+    let _ = writeln!(out, "{indent}    __arr[..=__idx].rotate_right(1);");
     let _ = writeln!(out, "{indent}  }}");
     let _ = writeln!(out, "{indent}  __arr");
     let _ = writeln!(out, "{indent}}};");
@@ -2735,9 +2822,9 @@ fn render_contract_sizing_bound(
     natives: &[(BackendName, &NativeImplementation)],
 ) {
     out.push_str(
-        "    fn contract_sizing_bound(backend: seismic::BackendName, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {\n",
+        "    fn contract_sizing_bound(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {\n",
     );
-    render_backend_dispatch(out, natives, "sizing_bound", "elements, dims");
+    render_backend_dispatch(out, natives, "sizing_bound", "device, elements, dims");
 }
 
 fn render_contract_sizing_bound_helpers(
@@ -2750,8 +2837,9 @@ fn render_contract_sizing_bound_helpers(
         let slug = backend_slug(backend);
         let _ = writeln!(
             out,
-            "    pub(super) fn sizing_bound_{slug}(elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {{"
+            "    pub(super) fn sizing_bound_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {{"
         );
+        out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
         emit_unit_column_checks(out, entry, native, "      ");
         emit_dim_binding(out, &entry.dimensions, "      ");
@@ -2762,7 +2850,7 @@ fn render_contract_sizing_bound_helpers(
             dims: &entry.dimensions,
             params: &slots,
             launch: None,
-            default_param: None,
+            param_binding: ParamBinding::Loop,
         };
 
         let factored = factor_constraints(native, &slots, &ctx);
@@ -2789,7 +2877,7 @@ fn render_contract_sizing_bound_helpers(
                     dims: &entry.dimensions,
                     params: &slots,
                     launch: Some(launch_idx),
-                    default_param: None,
+                    param_binding: ParamBinding::Loop,
                 };
                 let mut names = Vec::new();
                 when.parameters(&mut names);
@@ -2814,6 +2902,9 @@ fn render_contract_sizing_bound_helpers(
             "return Err(seismic::ContractError::DomainViolation);",
             "      ",
         );
+
+        // Compute sequential parameter defaults upfront so later defaults can read earlier ones.
+        emit_default_bindings(out, backend, entry, &slots, &ctx, "      ");
 
         // Unreferenced singletons: 0 loop iterations.
         for &k in &factored.unreferenced {
@@ -2908,7 +2999,7 @@ fn render_contract_sizing_bound_helpers(
                             dims: &entry.dimensions,
                             params: &slots,
                             launch: Some(launch_idx),
-                            default_param: None,
+                            param_binding: ParamBinding::Loop,
                         };
                         let w = lctx.lower_cond(when);
                         let _ = writeln!(
@@ -3207,9 +3298,9 @@ fn render_contract_scratch_configs(
     natives: &[(BackendName, &NativeImplementation)],
 ) {
     out.push_str(
-        "    fn contract_scratch_configs(backend: seismic::BackendName, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::contract::ScratchConfigs, seismic::ContractError> {\n",
+        "    fn contract_scratch_configs(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::contract::ScratchConfigs, seismic::ContractError> {\n",
     );
-    render_backend_dispatch(out, natives, "scratch_configs", "elements, dims");
+    render_backend_dispatch(out, natives, "scratch_configs", "device, elements, dims");
 }
 
 fn render_contract_scratch_configs_helpers(
@@ -3221,8 +3312,9 @@ fn render_contract_scratch_configs_helpers(
         let slug = backend_slug(backend);
         let _ = writeln!(
             out,
-            "    pub(super) fn scratch_configs_{slug}(elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::contract::ScratchConfigs, seismic::ContractError> {{"
+            "    pub(super) fn scratch_configs_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::contract::ScratchConfigs, seismic::ContractError> {{"
         );
+        out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
         emit_unit_column_checks(out, entry, native, "      ");
         emit_dim_binding(out, &native.statics, "      ");
@@ -3233,7 +3325,7 @@ fn render_contract_scratch_configs_helpers(
             dims: &native.statics,
             params: &slots,
             launch: None,
-            default_param: None,
+            param_binding: ParamBinding::Loop,
         };
 
         let factored = factor_constraints(native, &slots, &ctx);
@@ -3380,13 +3472,13 @@ fn render_contract_sizing_at_point(
     natives: &[(BackendName, &NativeImplementation)],
 ) {
     out.push_str(
-        "    fn contract_sizing_at_point(backend: seismic::BackendName, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], configs: &seismic::contract::ScratchConfigs, max_results: &mut [u64], max_scratch: &mut [u64]) -> Result<(), seismic::ContractError> {\n",
+        "    fn contract_sizing_at_point(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], configs: &seismic::contract::ScratchConfigs, max_results: &mut [u64], max_scratch: &mut [u64]) -> Result<(), seismic::ContractError> {\n",
     );
     render_backend_dispatch(
         out,
         natives,
         "sizing_at_point",
-        "elements, dims, configs, max_results, max_scratch",
+        "device, elements, dims, configs, max_results, max_scratch",
     );
 }
 
@@ -3400,8 +3492,9 @@ fn render_contract_sizing_at_point_helpers(
         let slug = backend_slug(backend);
         let _ = writeln!(
             out,
-            "    pub(super) fn sizing_at_point_{slug}(elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], configs: &seismic::contract::ScratchConfigs, max_results: &mut [u64], max_scratch: &mut [u64]) -> Result<(), seismic::ContractError> {{"
+            "    pub(super) fn sizing_at_point_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], configs: &seismic::contract::ScratchConfigs, max_results: &mut [u64], max_scratch: &mut [u64]) -> Result<(), seismic::ContractError> {{"
         );
+        out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
         emit_unit_column_checks(out, entry, native, "      ");
         emit_dim_binding(out, &entry.dimensions, "      ");
@@ -3437,7 +3530,7 @@ fn render_contract_sizing_at_point_helpers(
                 dims: &entry.dimensions,
                 params: &slots,
                 launch: None,
-                default_param: None,
+                param_binding: ParamBinding::Loop,
             };
             let mut scratch_param_names = Vec::new();
             for s in &native.scratch {
@@ -3493,13 +3586,13 @@ fn render_contract_active_launches(
     natives: &[(BackendName, &NativeImplementation)],
 ) {
     out.push_str(
-        "    fn contract_active_launches(backend: seismic::BackendName, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)], words: &[(&str, u64, bool)]) -> Result<u64, seismic::ContractError> {\n",
+        "    fn contract_active_launches(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)], words: &[(&str, u64, bool)]) -> Result<u64, seismic::ContractError> {\n",
     );
     render_backend_dispatch(
         out,
         natives,
         "active_launches",
-        "elements, dims, params, words",
+        "device, elements, dims, params, words",
     );
 }
 
@@ -3512,8 +3605,9 @@ fn render_contract_active_launches_helpers(
         let slug = backend_slug(backend);
         let _ = writeln!(
             out,
-            "    pub(super) fn active_launches_{slug}(elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)], words: &[(&str, u64, bool)]) -> Result<u64, seismic::ContractError> {{"
+            "    pub(super) fn active_launches_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)], words: &[(&str, u64, bool)]) -> Result<u64, seismic::ContractError> {{"
         );
+        out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
         emit_unit_column_checks(out, entry, native, "      ");
         emit_dim_binding(out, &entry.dimensions, "      ");
@@ -3526,7 +3620,7 @@ fn render_contract_active_launches_helpers(
             dims: &entry.dimensions,
             params: &slots,
             launch: None,
-            default_param: None,
+            param_binding: ParamBinding::Loop,
         };
 
         if let Some(constraint) = &native.constraint {
@@ -3547,7 +3641,7 @@ fn render_contract_active_launches_helpers(
                             dims: &entry.dimensions,
                             params: &slots,
                             launch: Some(launch_idx),
-                            default_param: None,
+                            param_binding: ParamBinding::Loop,
                         };
                         let w = lctx.lower_cond(when);
                         let _ = writeln!(
@@ -3583,7 +3677,7 @@ fn render_contract_active_launches_helpers(
                             dims: &entry.dimensions,
                             params: &slots,
                             launch: Some(launch_idx),
-                            default_param: None,
+                            param_binding: ParamBinding::Loop,
                         };
                         let w = lctx.lower_cond(when);
                         let _ = writeln!(
@@ -3661,8 +3755,9 @@ fn render_contract_launch_configs(
     natives: &[(BackendName, &NativeImplementation)],
 ) {
     out.push_str(
-        "    fn contract_launch_configs(backend: seismic::BackendName, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<Vec<u64>>, seismic::ContractError> {\n",
+        "    fn contract_launch_configs(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<Vec<u64>>, seismic::ContractError> {\n",
     );
+    out.push_str("      let _ = device;\n");
     if natives.is_empty() {
         out.push_str("      Err(seismic::ContractError::NoImplementation(backend))\n");
         out.push_str("    }\n");
@@ -3673,7 +3768,7 @@ fn render_contract_launch_configs(
         let variant = backend_variant(backend);
         if backend == BackendName::Cuda {
             out.push_str(
-                "        seismic::BackendName::Cuda => __contract::launch_configs_cuda(elements, dims),\n",
+                "        seismic::BackendName::Cuda => __contract::launch_configs_cuda(device, elements, dims),\n",
             );
         } else {
             let _ = writeln!(
@@ -3699,8 +3794,9 @@ fn render_contract_launch_configs_helpers(
             continue;
         }
         out.push_str(
-            "    pub(super) fn launch_configs_cuda(elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<Vec<u64>>, seismic::ContractError> {\n",
+            "    pub(super) fn launch_configs_cuda(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<Vec<u64>>, seismic::ContractError> {\n",
         );
+        out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
         emit_unit_column_checks(out, entry, native, "      ");
         emit_dim_binding(out, &native.statics, "      ");
@@ -3711,7 +3807,7 @@ fn render_contract_launch_configs_helpers(
             dims: &native.statics,
             params: &slots,
             launch: None,
-            default_param: None,
+            param_binding: ParamBinding::Loop,
         };
         let outer_indices = launch_when_outer_indices(native, &slots);
         let factored = factor_constraints_for(native, &slots, &ctx, outer_indices);
@@ -3859,19 +3955,21 @@ fn render_contract_launch_mask(
     natives: &[(BackendName, &NativeImplementation)],
 ) {
     out.push_str(
-        "    fn contract_launch_mask(backend: seismic::BackendName, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[u64]) -> Result<u64, seismic::ContractError> {\n",
+        "    fn contract_launch_mask(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[u64]) -> Result<u64, seismic::ContractError> {\n",
     );
     if natives.is_empty() {
+        out.push_str("      let _ = device;\n");
         out.push_str("      Err(seismic::ContractError::NoImplementation(backend))\n");
         out.push_str("    }\n");
         return;
     }
+    out.push_str("      let _ = device;\n");
     out.push_str("      match backend {\n");
     for &(backend, _) in natives {
         let variant = backend_variant(backend);
         if backend == BackendName::Cuda {
             out.push_str(
-                "        seismic::BackendName::Cuda => __contract::launch_mask_cuda(elements, dims, params),\n",
+                "        seismic::BackendName::Cuda => __contract::launch_mask_cuda(device, elements, dims, params),\n",
             );
         } else {
             let _ = writeln!(out, "        seismic::BackendName::{variant} => Ok(0u64),");
@@ -3900,8 +3998,9 @@ fn render_contract_launch_mask_helpers(
             native.launches.len()
         );
         out.push_str(
-            "    pub(super) fn launch_mask_cuda(elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[u64]) -> Result<u64, seismic::ContractError> {\n",
+            "    pub(super) fn launch_mask_cuda(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[u64]) -> Result<u64, seismic::ContractError> {\n",
         );
+        out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
         emit_unit_column_checks(out, entry, native, "      ");
         emit_dim_binding(out, &entry.dimensions, "      ");
@@ -3934,7 +4033,7 @@ fn render_contract_launch_mask_helpers(
                         dims: &entry.dimensions,
                         params: &slots,
                         launch: Some(launch_idx),
-                        default_param: None,
+                        param_binding: ParamBinding::Loop,
                     };
                     let w = lctx.lower_cond(when);
                     let _ = writeln!(
@@ -4074,7 +4173,7 @@ mod tests {
             dims: &[],
             params: &slots,
             launch: None,
-            default_param: None,
+            param_binding: ParamBinding::Loop,
         };
         let factored = factor_constraints(&native, &slots, &ctx);
 
@@ -4094,8 +4193,10 @@ mod tests {
         // Two disjoint singleton components ([A]=1, [B]=2) plus one coupled pair ([C, D]=[3, 4]).
         assert_eq!(residual_param_sets, vec![vec![1], vec![2], vec![3, 4]]);
 
-        // Cross-check satisfiable (OUT=1) and unsatisfiable (OUT=0) against NativeImplementation::scratch_configurations.
+        // Cross-check satisfiable (OUT=1) and unsatisfiable (OUT=0) against DeviceBound::scratch_configurations.
         let admitted = native
+            .device_independent()
+            .expect("test declaration reads no device property")
             .scratch_configurations(&NativeSpecialization::new())
             .expect("OUT=1 is satisfiable");
         let admitted_outs: Vec<u64> = admitted

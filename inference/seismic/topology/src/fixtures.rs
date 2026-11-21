@@ -213,6 +213,7 @@ fn cpu() -> CpuReport {
         availability: Availability::Available,
         max_allocation: CPU_MAX_ALLOCATION,
         kind: cpu_kind(),
+        properties: None,
     }
 }
 
@@ -313,6 +314,7 @@ pub fn vulkan(
                 .collect(),
         },
         kinds: recorded_vulkan_kinds(layout, heaps),
+        properties: None,
     }
 }
 
@@ -387,6 +389,7 @@ fn rtx3090_cuda_of(uuid: [u8; 16], usable: u64) -> CudaReport {
                 usable: Ok(usable),
             },
             kinds: Vec::new(),
+            properties: None,
         },
     )
 }
@@ -463,6 +466,7 @@ pub fn m4_pro() -> Reports {
             availability: Availability::Available,
             max_allocation: CPU_MAX_ALLOCATION,
             kind: cpu_kind(),
+            properties: None,
         },
     );
     reports.metal.push(MetalReport {
@@ -476,6 +480,7 @@ pub fn m4_pro() -> Reports {
         working_set: M4_PRO_WORKING_SET,
         max_allocation: M4_PRO_MAX_BUFFER,
         kinds: vec![metal_kind()],
+        properties: None,
     });
     reports
 }
@@ -534,6 +539,7 @@ pub fn gb10() -> Reports {
             availability: Availability::Available,
             max_allocation: CPU_MAX_ALLOCATION,
             kind: cpu_kind(),
+            properties: None,
         },
     );
     reports.cuda.push(cuda(
@@ -551,6 +557,7 @@ pub fn gb10() -> Reports {
             host_node: HostNode::Any,
             memory: CudaMemory::Host,
             kinds: Vec::new(),
+            properties: None,
         },
     ));
     reports.vulkan.push(vulkan(
@@ -740,6 +747,7 @@ pub fn a10_8q() -> Reports {
                 usable: Ok(A10_8Q_CUDA_USABLE),
             },
             kinds: Vec::new(),
+            properties: None,
         },
     ));
     reports.vulkan.push(vulkan(

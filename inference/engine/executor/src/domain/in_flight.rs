@@ -15,6 +15,14 @@ pub(super) struct HostTurn {
     requests: Vec<RequestId>,
 }
 
+#[derive(Debug)]
+struct OpenVerifyTurn {
+    since: Instant,
+    owner: Duration,
+    begun_epoch: u64,
+    requests: Vec<RequestId>,
+}
+
 /// The host's turns after verify passes (§7.1): a verify pass's verdict
 /// decides the next pass's tokens, so nothing is queued behind it, and from
 /// its completion to the next target launch of one of its requests (the
@@ -24,10 +32,13 @@ pub(super) struct HostTurn {
 /// (`experts::Window<Turns>` rolling on `bank_epoch`) is the regime's `O`
 /// (`magnitude_cost_model::Regime::overhead`). A turn the owner idled in,
 /// or another launch ended first, is no verify pass's; a turn of a load
-/// with no expert bank prices no regime and is not timed.
+/// with no expert bank prices no regime and is not timed. The owner's own
+/// work in the turn (`owner_worked`) is excluded, and a turn spanned by a
+/// bank-epoch transition (such as a bank resize) is dropped without rolling
+/// the window so clean pre-resize turns survive.
 #[derive(Debug)]
 pub(super) struct VerifyTurns {
-    open: Option<(Instant, Vec<RequestId>)>,
+    open: Option<OpenVerifyTurn>,
     latest: crate::experts::Window<Turns>,
 }
 
@@ -52,23 +63,44 @@ impl crate::experts::Tally for Turns {
 }
 
 impl VerifyTurns {
-    /// A verify pass of `requests` completed at `since`.
-    pub(super) fn begin(&mut self, since: Instant, requests: Vec<RequestId>) {
-        self.open = Some((since, requests));
+    /// A verify pass of `requests` completed at `since` at bank-wide `epoch`
+    /// (none without a bank).
+    pub(super) fn begin(&mut self, since: Instant, epoch: Option<u64>, requests: Vec<RequestId>) {
+        self.open = epoch.map(|begun_epoch| OpenVerifyTurn {
+            since,
+            owner: Duration::ZERO,
+            begun_epoch,
+            requests,
+        });
+    }
+
+    /// The owner spent `spent` on its own work during the open verify turn:
+    /// excluded from the turn's duration, mirroring [`HostTurn`].
+    pub(super) fn owner_worked(&mut self, spent: Duration) {
+        if let Some(turn) = &mut self.open {
+            turn.owner += spent;
+        }
     }
 
     /// A target launch of `requests` submitted at `started` ends the open
-    /// turn: timed where it carries one of the turn's requests, counted into
-    /// the bank-wide turnover's `epoch` (none without a bank).
+    /// turn: timed where it carries one of the turn's requests and the
+    /// bank-wide `epoch` did not change during the turn, counted into
+    /// `epoch` (none without a bank).
     pub(super) fn launched(&mut self, requests: &[RequestId], started: Instant, epoch: Option<u64>) {
-        let Some((since, turned)) = self.open.take() else {
+        let Some(turn) = self.open.take() else {
             return;
         };
         let Some(epoch) = epoch else {
             return;
         };
-        if requests.iter().any(|request| turned.contains(request)) {
-            let seconds = started.saturating_duration_since(since).as_secs_f64();
+        if epoch != turn.begun_epoch {
+            return;
+        }
+        if requests.iter().any(|request| turn.requests.contains(request)) {
+            let seconds = started
+                .saturating_duration_since(turn.since)
+                .saturating_sub(turn.owner)
+                .as_secs_f64();
             let tally = self.latest.count(epoch);
             tally.seconds += seconds;
             tally.turns += 1;
@@ -118,11 +150,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The owner spent `spent` on its own work, which serves no request: the
-    /// running host turn, if any, is charged none of it.
+    /// running host and verify turns, if any, are charged none of it.
     pub fn owner_worked(&mut self, spent: Duration) {
         if let Some(turn) = &mut self.host_turn {
             turn.owner += spent;
         }
+        self.verify_turns.owner_worked(spent);
     }
 
     /// The owner has no work: time until its next launch is idle, not
@@ -175,10 +208,20 @@ impl<F: ProgramFamily> HeadFlight<F> {
 pub(super) struct PrimingFlight<H> {
     pub(super) request: RequestId,
     pub(super) submission: H,
-    /// For a claimed queued step: the accepted head state its successor
-    /// advance attaches to at finish, or `None` when nobody claimed it (its
-    /// rows are discarded). `None` for an ordinary flight.
-    pub(super) continuation: Option<Option<SequenceState>>,
+    /// How the drafter entry's head advance resolves at finish.
+    pub(super) continuation: PrimingContinuation,
+}
+
+/// How a [`PrimingFlight`]'s head advance resolves at finish.
+pub(super) enum PrimingContinuation {
+    /// An ordinary flight: its advance already owns the accepted head state.
+    Ordinary,
+    /// A claimed queued step whose head state nobody claimed: its successor
+    /// rows are discarded.
+    Unclaimed,
+    /// A claimed queued step whose successor advance attaches to this
+    /// accepted head state.
+    Accepted(SequenceState),
 }
 
 /// A front head launch's parts secured before it launches, behind a target
@@ -416,5 +459,44 @@ impl<F: ProgramFamily> TargetFlight<F> {
             .expect("invariant violated: target launch has no slot")
             .advance;
         Some((work, target.position() + target.rows()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Owner work during an open verify turn is excluded from `Regime::overhead`,
+    /// and a turn spanned by a bank-epoch change (e.g. a bank resize) is dropped
+    /// without rolling the window or evicting clean pre-resize turns.
+    #[test]
+    fn verify_turns_excludes_owner_work_and_drops_epoch_spanning_turns() {
+        let mut turns = VerifyTurns::default();
+        let req = RequestId(1);
+        let t0 = Instant::now();
+
+        // Clean turn at epoch 0: 10 ms wall time with 7 ms of owner work -> 3 ms.
+        turns.begin(t0, Some(0), vec![req]);
+        turns.owner_worked(Duration::from_millis(7));
+        turns.launched(&[req], t0 + Duration::from_millis(10), Some(0));
+        let clean = turns.mean(0).expect("clean turn recorded");
+        assert!((clean - 0.003).abs() < 1e-9, "expected 3 ms after subtracting owner work, got {clean}");
+
+        // Resize-spanning turn (epoch 0 -> epoch 1) with a 25 ms pause must be
+        // skipped AND must not roll the window or evict the clean 3 ms turn.
+        turns.begin(t0 + Duration::from_millis(20), Some(0), vec![req]);
+        turns.launched(&[req], t0 + Duration::from_millis(45), Some(1));
+        let after_resize = turns.mean(1).expect("clean pre-resize turn survives at new epoch");
+        assert!(
+            (after_resize - 0.003).abs() < 1e-9,
+            "resize-spanning turn must not contaminate or evict clean mean: {after_resize}"
+        );
+
+        // Owner work exceeding wall time saturates at 0 without panicking.
+        turns.begin(t0 + Duration::from_millis(50), Some(1), vec![req]);
+        turns.owner_worked(Duration::from_millis(10));
+        turns.launched(&[req], t0 + Duration::from_millis(52), Some(1));
+        let with_zero = turns.mean(1).expect("clean turn at epoch 1 recorded");
+        assert!((with_zero - 0.0015).abs() < 1e-9, "mean of 3 ms (epoch 0) and 0 ms (epoch 1): {with_zero}");
     }
 }

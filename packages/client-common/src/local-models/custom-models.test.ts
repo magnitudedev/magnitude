@@ -283,6 +283,7 @@ describe("custom models in client projections", () => {
       localModelPreparation: {
         discovery: { complete: true, modelsFound: 1 },
         assessment: { complete: true, settledModels: 2, totalModels: 2 },
+        measurement: { _tag: "Measured" },
       },
       unsupportedLocalModels: [unsupported],
       hiddenLocalModels: [],
@@ -304,6 +305,7 @@ describe("custom models in client projections", () => {
       localModelPreparation: {
         discovery: { complete: true, modelsFound: 0 },
         assessment: { complete: true, settledModels: 1, totalModels: 1 },
+        measurement: { _tag: "Measured" },
       },
       unsupportedLocalModels: [],
       hiddenLocalModels: [hidden],
@@ -344,7 +346,7 @@ describe("custom models in client projections", () => {
       },
     })
     const state: LocalModelsState = {
-      preparation: { discovery: { complete: true, modelsFound: 1 }, assessment: { complete: true, settledModels: 1, totalModels: 1 } },
+      preparation: { discovery: { complete: true, modelsFound: 1 }, assessment: { complete: true, settledModels: 1, totalModels: 1 }, measurement: { _tag: "Measured" } },
       models: [makeSetupModel(true), loading],
       unsupported: [],
       hidden: [],

@@ -610,6 +610,12 @@ properties! {
         // (`gpu-core-count`), or one where it states none (an Intel, AMD or
         // paravirtualized GPU, which has no AGX entry).
         gpu_cores: Count,
+        // The SIMD-group width of a compute pipeline on this device
+        // (`MTLComputePipelineState.threadExecutionWidth`).
+        thread_execution_width: Count,
+        // The maximum threads in a threadgroup (`MTLDevice.maxThreadsPerThreadgroup`,
+        // capped by a compute pipeline's `maxTotalThreadsPerThreadgroup`).
+        max_threads_per_threadgroup: Count,
         apple10_family: Support,
         // The compiler forms a `matmul2d` pipeline: asked of the API at
         // open, running nothing.
@@ -619,6 +625,8 @@ properties! {
     properties {
         shared_bytes_per_group: Count = query(max_threadgroup_memory_length);
         units: Count = query(gpu_cores);
+        subgroup_width: Count = query(thread_execution_width);
+        max_group_threads: Count = query(max_threads_per_threadgroup);
         tensor_ops: Support = query(apple10_family) & query(tensor_matmul_forms);
     }
 }
@@ -631,6 +639,47 @@ properties! {
     probes {}
     properties {
         units: Count = query(worker_cores);
+    }
+}
+
+/// Conservative per-backend floor properties used ONLY when contract or
+/// declaration evaluation runs without an opened device or discovered executor
+/// properties (e.g., bare-`BackendName` offline tests or device-less listings).
+/// Whenever an `Executor` or `Device` is in scope, its real [`DeviceProperties`]
+/// are used instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BackendFloor(pub BackendName);
+
+impl DeviceValues for BackendFloor {
+    fn value(&self, name: &str) -> u64 {
+        match (self.0, name) {
+            (BackendName::Metal, "shared_bytes_per_group") => 32 * 1024,
+            (BackendName::Metal, "max_group_threads") => 1024,
+            (BackendName::Metal, "subgroup_width") => 32,
+            (BackendName::Metal, "units") => 16,
+            (BackendName::Metal, "tensor_ops") => 0,
+            (BackendName::Cuda, "shared_bytes_per_group") => 96 * 1024,
+            (BackendName::Cuda, "max_group_threads") => 1024,
+            (BackendName::Cuda, "subgroup_width") => 32,
+            (BackendName::Cuda, "units") => 48,
+            (BackendName::Cuda, "threads_per_unit") => 1536,
+            (BackendName::Cuda, "l2_bytes") => 6 * 1024 * 1024,
+            (BackendName::Cuda, "cooperative_launch") => 1,
+            (BackendName::Cuda, "registers_per_thread") => 255,
+            (BackendName::Cuda, "registers_per_group") => 65536,
+            (BackendName::Vulkan, "shared_bytes_per_group") => VULKAN_FLOOR_SHARED_BYTES,
+            (BackendName::Vulkan, "max_group_threads") => 1024,
+            (BackendName::Vulkan, "subgroup_width") => 32,
+            (BackendName::Vulkan, _) => 0,
+            (BackendName::Cpu, "units") => 1,
+            (backend, other) => {
+                panic!("unknown device property `{other}` for backend `{}`", backend.as_str())
+            }
+        }
+    }
+
+    fn measured(&self, _name: &str) -> Option<u64> {
+        None
     }
 }
 

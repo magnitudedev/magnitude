@@ -152,31 +152,15 @@ pub(crate) fn compile_characters(gbnf: &str) -> Result<Grammar, GrammarError> {
         &mut language::Regexes::new(),
     );
     loop {
-        let view = &terms;
         let lexemes = plan
-            .rules
-            .iter()
-            .enumerate()
-            .flat_map(|(rule, earley)| {
-                earley
-                    .edges
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(edge, e)| match e.kind {
-                        lexeme::EdgeKind::Lexeme { lexeme, .. }
-                            if !view.single_character(lexeme) =>
-                        {
-                            Some((rule, edge))
-                        }
-                        _ => None,
-                    })
-            })
+            .lexemes()
+            .filter_map(|(edge, lexeme, _, _)| (!terms.single_character(lexeme)).then_some(edge))
             .collect::<Vec<_>>();
         if lexemes.is_empty() {
             break;
         }
-        for (rule, edge) in lexemes {
-            plan.characters(rule, edge, &mut terms);
+        for edge in lexemes {
+            plan.characters(edge, &mut terms);
         }
     }
     Ok(Grammar {

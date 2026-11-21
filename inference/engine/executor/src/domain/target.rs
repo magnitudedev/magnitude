@@ -25,7 +25,57 @@ pub struct TargetHostTiming {
 
 /// A finished front head launch (`ExecutorDomain::finish_front`): the guess
 /// its chain holds per entry row, and per slot its head advance.
-type FinishedFront = (Vec<Option<Guess>>, Vec<Option<FrontAdvance>>);
+type FinishedFront = (Vec<Option<Guess>>, FinishedFrontAdvances);
+
+/// The per-slot head advances of a finished front head launch
+/// (`ExecutorDomain::finish_front`), matching the launch's [`FrontJoins`].
+enum FinishedFrontAdvances {
+    None,
+    /// Over each claimed slot's accepted head state (`FrontJoins::Accepted` or
+    /// `FrontJoins::Claimed`).
+    Steps(Vec<Option<OwnedStateAdvance>>),
+    /// Following the closing chunk's drafter entry (`FrontJoins::Entry`).
+    Entries(Vec<Option<OwnedSuccessorAdvance>>),
+}
+
+impl FinishedFrontAdvances {
+    /// Combine `primed` (a prompt chunk's drafter entry, if any) with slot
+    /// `index`'s front head advance into [`TargetHeadAdvances`].
+    fn take_head(
+        &mut self,
+        index: usize,
+        primed: Option<OwnedStateAdvance>,
+    ) -> TargetHeadAdvances {
+        match (primed, self) {
+            (None, Self::None) => TargetHeadAdvances::None,
+            (Some(primed), Self::None) => TargetHeadAdvances::Primed(primed),
+            (None, Self::Steps(steps)) => match steps.get_mut(index).and_then(Option::take) {
+                Some(front) => TargetHeadAdvances::Front(front),
+                None => TargetHeadAdvances::None,
+            },
+            (Some(primed), Self::Entries(entries)) => {
+                match entries.get_mut(index).and_then(Option::take) {
+                    Some(front) => TargetHeadAdvances::PrimedAndFront { primed, front },
+                    None => TargetHeadAdvances::Primed(primed),
+                }
+            }
+            (Some(primed), Self::Steps(steps)) => {
+                assert!(
+                    steps.get(index).is_none_or(Option::is_none),
+                    "invariant violated: a primed chunk's front head advance does not follow its drafter entry"
+                );
+                TargetHeadAdvances::Primed(primed)
+            }
+            (None, Self::Entries(entries)) => {
+                assert!(
+                    entries.get(index).is_none_or(Option::is_none),
+                    "invariant violated: a closing chunk's front head advance follows no drafter entry"
+                );
+                TargetHeadAdvances::None
+            }
+        }
+    }
+}
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
     pub(super) fn trace_target_submission(
@@ -396,7 +446,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         work.priming = Some(PrimingFlight {
             request,
             submission,
-            continuation: None,
+            continuation: PrimingContinuation::Ordinary,
         });
         Ok(work)
     }
@@ -488,8 +538,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Finish the front head launch behind a target step: the guess its
     /// chain holds per entry row (`crate::programs::FrontOutput::read_guesses`),
     /// and per slot of the step its head advance as its outcome commits it
-    /// (`FrontAdvance`): over the request's accepted head state, or, of the
-    /// closing chunk, following the chunk's drafter entry; none of a slot
+    /// (`TargetHeadAdvances`): over the request's accepted head state, or, of
+    /// the closing chunk, following the chunk's drafter entry; none of a slot
     /// nobody claimed, whose rows are discarded. The head lane returns the
     /// advances it launched, so one of another kind than launched is a
     /// broken invariant.
@@ -508,41 +558,47 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let returned = || -> ! { panic!("invariant violated: a front head launch returned another advance than it launched") };
         let finished = match front.joins {
-            FrontJoins::Accepted => advances
-                .into_iter()
-                .map(|advance| match advance {
-                    TentativeAdvance::Accepted(advance) => Some(FrontAdvance::Step(advance)),
-                    TentativeAdvance::Successor(_) | TentativeAdvance::Chained(_) => returned(),
-                })
-                .collect(),
-            FrontJoins::Entry => advances
-                .into_iter()
-                .map(|advance| match advance {
-                    TentativeAdvance::Successor(advance) => Some(FrontAdvance::Entry(advance)),
-                    TentativeAdvance::Accepted(_) | TentativeAdvance::Chained(_) => returned(),
-                })
-                .collect(),
+            FrontJoins::Accepted => FinishedFrontAdvances::Steps(
+                advances
+                    .into_iter()
+                    .map(|advance| match advance {
+                        TentativeAdvance::Accepted(advance) => Some(advance),
+                        TentativeAdvance::Successor(_) | TentativeAdvance::Chained(_) => returned(),
+                    })
+                    .collect(),
+            ),
+            FrontJoins::Entry => FinishedFrontAdvances::Entries(
+                advances
+                    .into_iter()
+                    .map(|advance| match advance {
+                        TentativeAdvance::Successor(advance) => Some(advance),
+                        TentativeAdvance::Accepted(_) | TentativeAdvance::Chained(_) => returned(),
+                    })
+                    .collect(),
+            ),
             FrontJoins::Claimed(states) => {
                 assert_eq!(
                     states.len(),
                     advances.len(),
                     "invariant violated: front head advances differ from their claimed slots"
                 );
-                advances
-                    .into_iter()
-                    .zip(states)
-                    .map(|(advance, state)| {
-                        let TentativeAdvance::Successor(successor) = advance else {
-                            returned();
-                        };
-                        state.map(|state| match successor.attach(state) {
-                            Ok(advance) => FrontAdvance::Step(advance),
-                            Err((_, error)) => panic!(
-                                "invariant violated: a claimed front head slot no longer follows its head state: {error}"
-                            ),
+                FinishedFrontAdvances::Steps(
+                    advances
+                        .into_iter()
+                        .zip(states)
+                        .map(|(advance, state)| {
+                            let TentativeAdvance::Successor(successor) = advance else {
+                                returned();
+                            };
+                            state.map(|state| match successor.attach(state) {
+                                Ok(advance) => advance,
+                                Err((_, error)) => panic!(
+                                    "invariant violated: a claimed front head slot no longer follows its head state: {error}"
+                                ),
+                            })
                         })
-                    })
-                    .collect()
+                        .collect(),
+                )
             }
         };
         Ok((guesses, finished))
@@ -830,7 +886,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // The front head launch behind a chained step follows it and its
         // drafter entry on the device: the step's outcome is its chain.
         let (chain, mut front_advances) = match flight.front {
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), FinishedFrontAdvances::None),
             Some(front) => self.finish_front(front)?,
         };
         if let Some(trace) = &flight.launch_trace {
@@ -1098,9 +1154,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .map(|sources| std::mem::replace(&mut sources[index], Source::Unclaimed));
             // The outcome owns its rows until reconciled or aborted: a
             // chain's chunks join it only as they reconcile.
-            // Its head advance in the front head launch behind the step,
-            // which a slot nobody claimed drops with its rows.
-            let front = front_advances.get_mut(index).and_then(Option::take);
             let advance = match (advance, source) {
                 (TentativeAdvance::Accepted(first), None) if opens_chain => {
                     Advance::Opens { flight: flight.id, first }
@@ -1128,6 +1181,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 _ => panic!("invariant violated: a target flight's advances differ from its continuation"),
             };
             let primed_here = primed.take_if(|(primed, _)| *primed == request).map(|(_, advance)| advance);
+            let head = front_advances.take_head(index, primed_here);
             // A chunk of a chain that failed or was interrupted is aborted as
             // any step's outcome is: its chain concludes with the chunks
             // reconciled before it, its holder's state again, and its head
@@ -1141,17 +1195,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             pending.push(PendingOperationOutcome {
                 request,
                 outcome,
-                advance: Some(advance),
-                primed: primed_here,
-                front,
+                payload: PendingPayload::Target {
+                    advance,
+                    head,
+                    awaited,
+                },
                 // The rows a decision may accept: never a front row.
                 rows: rows - fronts,
                 committed_rows,
                 kind,
                 physical_duration,
                 timed,
-                image: None,
-                awaited,
             });
         }
         assert!(primed.is_none(), "invariant violated: a drafter entry's chunk is absent from its flight");
@@ -1189,7 +1243,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.target_timing = Some(timing);
         self.begin_host_turn(pending.iter().map(|item| item.request));
         if verified {
-            self.verify_turns.begin(finish_started, pending.iter().map(|item| item.request).collect());
+            let bank_epoch = self.family.expert_bank().map(|bank| bank.bank_epoch());
+            self.verify_turns.begin(finish_started, bank_epoch, pending.iter().map(|item| item.request).collect());
         }
         Ok(pending)
     }
@@ -1207,13 +1262,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             panic!("invariant violated: a drafter entry has other than one slot");
         };
         match (advance, priming.continuation) {
-            (TentativeAdvance::Accepted(advance), None) => Ok(Some((priming.request, advance))),
+            (TentativeAdvance::Accepted(advance), PrimingContinuation::Ordinary) => {
+                Ok(Some((priming.request, advance)))
+            }
             // `claim_slots` found the state the successor follows.
-            (TentativeAdvance::Successor(successor), Some(Some(state))) => match successor.attach(state) {
-                Ok(advance) => Ok(Some((priming.request, advance))),
-                Err((_, error)) => panic!("invariant violated: a claimed drafter entry no longer follows its state: {error}"),
-            },
-            (TentativeAdvance::Successor(_), Some(None)) => Ok(None),
+            (TentativeAdvance::Successor(successor), PrimingContinuation::Accepted(state)) => {
+                match successor.attach(state) {
+                    Ok(advance) => Ok(Some((priming.request, advance))),
+                    Err((_, error)) => panic!(
+                        "invariant violated: a claimed drafter entry no longer follows its state: {error}"
+                    ),
+                }
+            }
+            (TentativeAdvance::Successor(_), PrimingContinuation::Unclaimed) => Ok(None),
             _ => panic!("invariant violated: a drafter entry's advance differs from its continuation"),
         }
     }
@@ -1228,7 +1289,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) -> Result<(Vec<PendingOperationOutcome>, TargetContinuation<F>), DomainError> {
         // A chained chunk's outcome is the chain its front head launch made
         // behind its drafter entry, whose head advance follows the entry's
-        // (`FrontAdvance::Entry`): the entry finishes with the chunk.
+        // (`TargetHeadAdvances::PrimedAndFront`): the entry finishes with the
+        // chunk.
         let priming = (final_prompt_chunk && flight.work.front.is_none())
             .then(|| flight.detach_priming())
             .flatten();

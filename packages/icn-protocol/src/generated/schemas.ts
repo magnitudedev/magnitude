@@ -2206,9 +2206,35 @@ export const LocalModelsResponse = S.Struct({
 export type LocalModelsResponse = S.Schema.Type<typeof LocalModelsResponse>
 export type LocalModelsResponseEncoded = S.Schema.Encoded<typeof LocalModelsResponse>
 
+export const MeasurementPhase = S.Union(
+  S.Literal("Baseline"),
+  S.Literal("MemoryAndStorage"),
+  S.Literal("TokenGeneration"),
+  S.Literal("PromptProcessing"),
+  S.Literal("LongContextAttention"),
+)
+export type MeasurementPhase = S.Schema.Type<typeof MeasurementPhase>
+export type MeasurementPhaseEncoded = S.Schema.Encoded<typeof MeasurementPhase>
+
+export const MeasurementProgress = S.Struct({
+  completed: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  phase: S.suspend((): S.Schema<MeasurementPhase, MeasurementPhaseEncoded> => MeasurementPhase),
+  total: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type MeasurementProgress = S.Schema.Type<typeof MeasurementProgress>
+export type MeasurementProgressEncoded = S.Schema.Encoded<typeof MeasurementProgress>
+
 export const MeasurementState = S.Union(
   S.extend(S.TaggedStruct("Unmeasured", {}), S.Record({ key: S.String, value: JsonValue })),
-  S.extend(S.TaggedStruct("Measuring", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Measuring", {
+      progress: S.optionalWith(
+        S.suspend((): S.Schema<MeasurementProgress, MeasurementProgressEncoded> => MeasurementProgress),
+        { exact: true, as: "Option" },
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
   S.extend(S.TaggedStruct("Measured", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
     S.TaggedStruct("Failed", {

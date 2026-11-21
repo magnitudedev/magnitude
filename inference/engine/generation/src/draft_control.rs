@@ -436,7 +436,8 @@ fn prune_costs(costs: &mut BTreeMap<(usize, usize), LaunchCosts>, keep: (usize, 
 }
 
 /// The launch costs of one context class and number of requests sharing a
-/// launch. Borrows `DraftLoad::costs` under its lock with zero cloning.
+/// launch. Borrows `DraftLoadState::costs` and `verify_prior` under the load's
+/// lock with zero cloning.
 ///
 /// A launch not measured there costs at least what its other measurements
 /// prove, and at least what the same launch measured over no longer a
@@ -450,8 +451,8 @@ fn prune_costs(costs: &mut BTreeMap<(usize, usize), LaunchCosts>, keep: (usize, 
 /// duration would otherwise price it out of being taken, and so of ever
 /// being measured again.
 struct RoundCosts<'a> {
-    costs: std::sync::MutexGuard<'a, BTreeMap<(usize, usize), LaunchCosts>>,
-    verify_prior: Option<StreamedVerifyPrior>,
+    costs: &'a BTreeMap<(usize, usize), LaunchCosts>,
+    verify_prior: Option<&'a StreamedVerifyPrior>,
     context_class: usize,
     /// Requests sharing each launch.
     sequences: usize,
@@ -460,21 +461,36 @@ struct RoundCosts<'a> {
 }
 
 impl<'a> RoundCosts<'a> {
-    fn of(
-        load: &'a DraftLoad,
+    fn from_parts(
+        costs: &'a BTreeMap<(usize, usize), LaunchCosts>,
+        verify_prior: Option<&'a StreamedVerifyPrior>,
         context_class: usize,
         sequences: usize,
         after_drafting: Option<bool>,
     ) -> Self {
-        let verify_prior = load.verify_prior.lock().expect("draft load verify prior").clone();
         Self {
-            costs: load.costs.lock().expect("draft load costs"),
+            costs,
             verify_prior,
             context_class,
             sequences,
             after_drafting,
             switch_weight: 0.0,
         }
+    }
+
+    fn of(
+        state: &'a DraftLoadState,
+        context_class: usize,
+        sequences: usize,
+        after_drafting: Option<bool>,
+    ) -> Self {
+        Self::from_parts(
+            &state.costs,
+            state.verify_prior.as_ref(),
+            context_class,
+            sequences,
+            after_drafting,
+        )
     }
 
     fn own(&self) -> Option<&LaunchCosts> {
@@ -568,7 +584,6 @@ impl<'a> RoundCosts<'a> {
         if self.own().is_none_or(|own| !own.verify.contains_key(&rows)) {
             if let Some(prior) = self
                 .verify_prior
-                .as_ref()
                 .and_then(|prior| Self::prior_verify_seconds(prior, self.sequences, rows))
             {
                 return prior;
@@ -666,7 +681,8 @@ pub fn share_rows(outlooks: &[DraftOutlook], rows: usize) -> Option<Vec<usize>> 
         return None;
     }
     let context_class = outlooks.iter().map(|outlook| outlook.context_class).max()?;
-    let costs = RoundCosts::of(&outlooks[0].load, context_class, requests, None);
+    let state = outlooks[0].load.lock();
+    let costs = RoundCosts::of(&state, context_class, requests, None);
     let drafted: f64 = outlooks.iter().map(|outlook| outlook.draft_seconds).sum();
     // A request's proposals are no more often right the deeper they are, so
     // taking proposals in this order takes each request's in depth order.
@@ -710,6 +726,56 @@ pub fn share_rows(outlooks: &[DraftOutlook], rows: usize) -> Option<Vec<usize>> 
     Some(shares)
 }
 
+/// Shared mutable state of a [`DraftLoad`], guarded by a single mutex so
+/// coupled fields (costs, bank epoch via `verify_prior`, cover state,
+/// rounds, depth means + calibration, and look budgets) update atomically
+/// with no nested locks.
+#[derive(Clone, Debug)]
+struct DraftLoadState {
+    costs: BTreeMap<(usize, usize), LaunchCosts>,
+    rounds: u64,
+    depths: Vec<(DepthMeans, Calibration)>,
+    /// The run of accepted rounds that earned its latest request a look.
+    look_run: u32,
+    look_seconds: f64,
+    /// The decode time set aside for the next plain look.
+    plain_seconds: f64,
+    /// Whether `costs` holds a duration measured beside the expert bank's
+    /// cover read ([`Self::settle`]).
+    beside_cover: bool,
+    /// Latest streamed verify prior from the cost model's regime. Its
+    /// `bank_epoch` is the single authority for epoch-change invalidation.
+    verify_prior: Option<StreamedVerifyPrior>,
+}
+
+impl Default for DraftLoadState {
+    fn default() -> Self {
+        Self {
+            costs: BTreeMap::new(),
+            rounds: 0,
+            depths: Vec::new(),
+            look_run: 1,
+            look_seconds: 0.0,
+            plain_seconds: 0.0,
+            beside_cover: false,
+            verify_prior: None,
+        }
+    }
+}
+
+impl DraftLoadState {
+    /// Drop every duration measured beside the bank's cover read, which a
+    /// launch measured with none beside it shows ended ([`LaunchCosts::settle`]).
+    fn settle(&mut self) {
+        if std::mem::take(&mut self.beside_cover) {
+            self.costs.retain(|_, costs| {
+                costs.settle();
+                !costs.is_empty()
+            });
+        }
+    }
+}
+
 /// What a load's requests share: launch costs by context class and sequence
 /// count, the acceptance means its latest request reached, and the decode
 /// time set aside for the next look. That time carries from request to
@@ -718,57 +784,31 @@ pub fn share_rows(outlooks: &[DraftOutlook], rows: usize) -> Option<Vec<usize>> 
 /// stopped paying is tried again.
 #[derive(Debug, Default)]
 pub struct DraftLoad {
-    costs: Mutex<BTreeMap<(usize, usize), LaunchCosts>>,
-    rounds: Mutex<u64>,
-    depths: Mutex<Option<Vec<DepthMeans>>>,
-    calibration: Mutex<Option<Vec<Calibration>>>,
-    /// The run of accepted rounds that earned its latest request a look.
-    look_run: Mutex<Option<u32>>,
-    look_seconds: Mutex<f64>,
-    /// The decode time set aside for the next plain look.
-    plain_seconds: Mutex<f64>,
-    /// Whether `costs` holds a duration measured beside the expert bank's
-    /// cover read ([`Self::settle`]).
-    beside_cover: Mutex<bool>,
-    /// Expert bank epoch of the currently observed streamed verify prior.
-    bank_epoch: Mutex<Option<u64>>,
-    /// Latest streamed verify prior from the cost model's regime.
-    verify_prior: Mutex<Option<StreamedVerifyPrior>>,
+    state: Mutex<DraftLoadState>,
 }
 
 impl DraftLoad {
+    fn lock(&self) -> std::sync::MutexGuard<'_, DraftLoadState> {
+        self.state.lock().expect("draft load state")
+    }
+
     /// Observe the streamed target verify prior for the current round.
     /// When `bank_epoch` changes, invalidates target verify/enter/leave
     /// durations across every bucket (preserving `draft` durations, which
     /// do not stream from the target expert bank) and prunes empty buckets.
     pub fn observe_streamed(&self, prior: Option<StreamedVerifyPrior>) {
-        let epoch = prior.as_ref().map(|p| p.bank_epoch);
-        {
-            let mut bank_epoch = self.bank_epoch.lock().expect("draft load bank epoch");
-            if *bank_epoch != epoch {
-                let mut costs = self.costs.lock().expect("draft load costs");
-                costs.retain(|_, bucket| {
-                    bucket.verify.clear();
-                    bucket.enter = Durations::default();
-                    bucket.leave = Durations::default();
-                    !bucket.is_empty()
-                });
-                *bank_epoch = epoch;
-            }
-        }
-        *self.verify_prior.lock().expect("draft load verify prior") = prior;
-    }
-
-    /// Drop every duration measured beside the bank's cover read, which a
-    /// launch measured with none beside it shows ended ([`LaunchCosts::settle`]).
-    fn settle(&self) {
-        let mut beside_cover = self.beside_cover.lock().expect("draft load cover");
-        if std::mem::take(&mut *beside_cover) {
-            self.costs.lock().expect("draft load costs").retain(|_, costs| {
-                costs.settle();
-                !costs.is_empty()
+        let mut state = self.lock();
+        let prev_epoch = state.verify_prior.as_ref().map(|p| p.bank_epoch);
+        let next_epoch = prior.as_ref().map(|p| p.bank_epoch);
+        if prev_epoch != next_epoch {
+            state.costs.retain(|_, bucket| {
+                bucket.verify.clear();
+                bucket.enter = Durations::default();
+                bucket.leave = Durations::default();
+                !bucket.is_empty()
             });
         }
+        state.verify_prior = prior;
     }
 }
 
@@ -810,6 +850,95 @@ struct DepthSlot {
     scored: bool,
 }
 
+impl DepthSlot {
+    const UNSCORED: Self = Self {
+        means: DepthMeans::UNSCORED,
+        calibration: Calibration::EMPTY,
+        scored: false,
+    };
+}
+
+/// The launch this round is currently expecting a [`TimedLaunch`] duration for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ExpectedLaunch {
+    /// No launch is currently awaiting timing.
+    #[default]
+    None,
+    /// Expecting the drafter's proposing launch for this many generated proposals.
+    Draft(usize),
+    /// Expecting the target's verification or plain-decode launch.
+    Target,
+}
+
+/// Duration of drafter entry launches accumulated for the upcoming timed launch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EntryTiming {
+    /// All entries so far replayed their graphs, totalling these seconds.
+    Replayed(f64),
+    /// At least one entry recorded its graph, so the launch it serves has no
+    /// replay duration.
+    Recorded,
+}
+
+impl Default for EntryTiming {
+    fn default() -> Self {
+        Self::Replayed(0.0)
+    }
+}
+
+impl EntryTiming {
+    fn record(&mut self, seconds: Option<f64>) {
+        *self = match (*self, seconds) {
+            (Self::Replayed(total), Some(seconds)) => Self::Replayed(total + seconds),
+            _ => Self::Recorded,
+        };
+    }
+
+    fn take_with(&mut self, seconds: Option<f64>) -> Option<f64> {
+        match (std::mem::take(self), seconds) {
+            (Self::Replayed(entered), Some(seconds)) => Some(entered + seconds),
+            _ => None,
+        }
+    }
+}
+
+/// This round's drafter launch outcome, awaited by the target launch that
+/// closes the round.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum DrafterTiming {
+    /// This round did not run a timed drafter launch.
+    #[default]
+    None,
+    /// The drafter launch (or an entry folded into it) recorded its graph,
+    /// so it ran as part of this round but has no replay duration.
+    Recorded,
+    /// The drafter launch (and any entries folded into it) replayed in these
+    /// seconds.
+    Replayed(f64),
+}
+
+impl DrafterTiming {
+    fn ran(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn seconds(self) -> Option<f64> {
+        match self {
+            Self::None => Some(0.0),
+            Self::Recorded => None,
+            Self::Replayed(seconds) => Some(seconds),
+        }
+    }
+}
+
+/// Timing state for the round currently in flight.
+#[derive(Clone, Copy, Debug, Default)]
+struct RoundTiming {
+    expected: ExpectedLaunch,
+    entered: EntryTiming,
+    drafter: DrafterTiming,
+}
+
 /// State of a deferred switch from plain decoding to drafting (see [`Switch`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwitchStage {
@@ -845,14 +974,8 @@ pub struct DraftController {
     /// The width last generated by the fastest pair or kept past it, and
     /// the rounds of being kept it has earned.
     kept: Option<(usize, f64)>,
-    /// The launches this round's durations belong to.
-    timing_draft: Option<usize>,
-    timing_target: bool,
-    /// What this round's entries took; `None` when one recorded its graph.
-    entered: Option<f64>,
-    /// This round's drafter launch, with what it took when it replayed its
-    /// graph.
-    drafter: Option<Option<f64>>,
+    /// Launch timing state for the round in flight.
+    timing: RoundTiming,
     after_drafting: Option<bool>,
     chosen: Option<bool>,
     /// How often this round's drafted block is expected to be right through
@@ -869,27 +992,23 @@ impl DraftController {
     /// latest acceptance means. A load that has scored nothing takes every
     /// proposal as right.
     pub fn new(widest: usize, load: Arc<DraftLoad>) -> Self {
-        let seed = load.depths.lock().expect("draft load acceptance").clone();
-        let look_run = load.look_run.lock().expect("draft load looks").unwrap_or(1);
-        let means = seed
-            .filter(|depths| depths.len() == widest)
-            .unwrap_or_else(|| vec![DepthMeans::UNSCORED; widest]);
-        let calibration = load
-            .calibration
-            .lock()
-            .expect("draft load calibration")
-            .clone()
-            .filter(|calibration| calibration.len() == widest)
-            .unwrap_or_else(|| vec![Calibration::EMPTY; widest]);
-        let depths = means
-            .into_iter()
-            .zip(calibration)
-            .map(|(means, calibration)| DepthSlot {
-                means,
-                calibration,
-                scored: false,
-            })
-            .collect();
+        let (depths, look_run) = {
+            let state = load.lock();
+            let depths = if state.depths.len() == widest {
+                state
+                    .depths
+                    .iter()
+                    .map(|(means, calibration)| DepthSlot {
+                        means: means.clone(),
+                        calibration: calibration.clone(),
+                        scored: false,
+                    })
+                    .collect()
+            } else {
+                vec![DepthSlot::UNSCORED; widest]
+            };
+            (depths, state.look_run)
+        };
         Self {
             ladder: draft_ladder(widest),
             load,
@@ -899,10 +1018,7 @@ impl DraftController {
             look_run,
             run_look: false,
             kept: None,
-            timing_draft: None,
-            timing_target: false,
-            entered: Some(0.0),
-            drafter: None,
+            timing: RoundTiming::default(),
             after_drafting: None,
             chosen: None,
             drafted: None,
@@ -946,7 +1062,12 @@ impl DraftController {
 
     /// The measured launch seconds at this round's context class.
     pub fn measured(&self) -> LaunchCosts {
-        self.costs().own().cloned().unwrap_or_default()
+        self.load
+            .lock()
+            .costs
+            .get(&(self.context_class, self.sequences))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// The costs this round chooses by. A plain decode taken to measure it
@@ -954,18 +1075,21 @@ impl DraftController {
     /// round coming back from it is priced as one continuing to draft. A
     /// switch is shared by the weight a block has in the first depth's
     /// estimate, which every drafting round depends on.
-    fn costs(&self) -> RoundCosts<'_> {
-        RoundCosts::of(&self.load, self.context_class, self.sequences, self.chosen)
+    fn costs<'a>(&self, state: &'a DraftLoadState) -> RoundCosts<'a> {
+        RoundCosts::of(state, self.context_class, self.sequences, self.chosen)
             .sharing_switches(self.depths.first().map_or(MEMORY, |slot| slot.means.weight()))
     }
 
     /// This round's drafted block, while it awaits verification.
     pub fn outlook(&self) -> Option<DraftOutlook> {
+        let right = self.drafted.clone()?;
+        let state = self.load.lock();
+        let draft_seconds = self.costs(&state).draft(self.choice.generated);
         Some(DraftOutlook {
             load: self.load.clone(),
             context_class: self.context_class,
-            right: self.drafted.clone()?,
-            draft_seconds: self.costs().draft(self.choice.generated),
+            right,
+            draft_seconds,
         })
     }
 
@@ -1014,15 +1138,14 @@ impl DraftController {
         self.context_class = position.max(1).next_power_of_two();
         // Entries before a round chooses are no round's: the prompt's, or
         // pairs held past their bound by rounds that drafted nothing.
-        self.entered = Some(0.0);
+        self.timing.entered = EntryTiming::default();
         match std::mem::replace(&mut self.switch, SwitchStage::Ready) {
             // The round after the choice prepares: it is the decode queued
             // publishing its feature, and drafts nothing.
             SwitchStage::QueuedBehind(choice) if !anchored => {
                 self.switch = SwitchStage::Preparing(choice);
                 self.choice = RoundChoice { generated: 0, verified: 0, look: choice.look };
-                self.timing_draft = None;
-                self.timing_target = true;
+                self.timing.expected = ExpectedLaunch::Target;
                 return 0;
             }
             // The round after the one that prepared drafts the choice, where
@@ -1032,14 +1155,21 @@ impl DraftController {
             {
                 self.chosen = Some(true);
                 self.choice = choice;
-                self.timing_draft = Some(choice.generated);
-                self.timing_target = false;
+                self.timing.expected = ExpectedLaunch::Draft(choice.generated);
                 return choice.generated;
             }
             _ => {}
         }
-        let costs = RoundCosts::of(&self.load, self.context_class, self.sequences, self.chosen)
-            .sharing_switches(self.depths.first().map_or(MEMORY, |slot| slot.means.weight()));
+        let mut load = self.load.lock();
+        let state = &mut *load;
+        let costs = RoundCosts::from_parts(
+            &state.costs,
+            state.verify_prior.as_ref(),
+            self.context_class,
+            self.sequences,
+            self.chosen,
+        )
+        .sharing_switches(self.depths.first().map_or(MEMORY, |slot| slot.means.weight()));
         let right = self.right();
         // The fastest pair. Of equal rates the narrowest.
         let mut fastest = (0, 0, f64::NEG_INFINITY);
@@ -1054,7 +1184,7 @@ impl DraftController {
         // it is measured here but its cost is unproven or stale it is taken
         // again in place of drafting: a duration another process held up,
         // or a machine since freed, would otherwise price it for good.
-        let round = *self.load.rounds.lock().expect("draft load rounds");
+        let round = state.rounds;
         let plain = costs.own().and_then(|own| own.verify.get(&costs.sequences));
         let plain_unsettled = fastest > 0
             && plain.is_some_and(|plain| {
@@ -1128,10 +1258,9 @@ impl DraftController {
         let generated = match look {
             Some((generated, gain, lost)) => {
                 self.run_look = false;
-                let mut set_aside = self.load.look_seconds.lock().expect("draft load look time");
-                *set_aside += LOOK_SHARE * gain.min(1.0) * costs.round(fastest, verified);
-                if *set_aside >= lost {
-                    *set_aside = 0.0;
+                state.look_seconds += LOOK_SHARE * gain.min(1.0) * costs.round(fastest, verified);
+                if state.look_seconds >= lost {
+                    state.look_seconds = 0.0;
                     generated
                 } else if self.accepted_run >= self.look_run {
                     self.accepted_run = 0;
@@ -1168,16 +1297,16 @@ impl DraftController {
                 .reduce(f64::max);
             let gain = floor.map_or(1.0, |floor| (1.0 / floor / rate - 1.0).min(1.0));
             gain > 0.0 && {
-                let mut set_aside = self.load.plain_seconds.lock().expect("draft load look time");
-                *set_aside += LOOK_SHARE * gain * costs.round(fastest, verified);
+                state.plain_seconds += LOOK_SHARE * gain * costs.round(fastest, verified);
                 let lost = costs.round(0, 0) + costs.excursion(0) - 1.0 / rate;
-                let due = generated == kept && kept == fastest && *set_aside >= lost;
+                let due = generated == kept && kept == fastest && state.plain_seconds >= lost;
                 if due {
-                    *set_aside = 0.0;
+                    state.plain_seconds = 0.0;
                 }
                 due
             }
         };
+        drop(load);
         // A plain decode taken to measure it changes no choice (see
         // [`Self::costs`]).
         let measuring = plain_unsettled || plain_look;
@@ -1197,8 +1326,11 @@ impl DraftController {
             self.switch = SwitchStage::QueuedBehind(choice);
         }
         self.choice = RoundChoice { generated, ..choice };
-        self.timing_draft = (generated > 0).then_some(generated);
-        self.timing_target = generated == 0;
+        self.timing.expected = if generated > 0 {
+            ExpectedLaunch::Draft(generated)
+        } else {
+            ExpectedLaunch::Target
+        };
         generated
     }
 
@@ -1255,14 +1387,18 @@ impl DraftController {
             .drafted
             .take()
             .expect("a round verifies the block it drafted");
-        let (verified, _) = self.verified(
-            &right,
-            &self.costs(),
-            self.choice.generated,
-            limit.min(right.len()),
-        );
+        let verified = {
+            let state = self.load.lock();
+            self.verified(
+                &right,
+                &self.costs(&state),
+                self.choice.generated,
+                limit.min(right.len()),
+            )
+            .0
+        };
         self.choice.verified = verified;
-        self.timing_target = true;
+        self.timing.expected = ExpectedLaunch::Target;
         verified
     }
 
@@ -1319,15 +1455,13 @@ impl DraftController {
                 slot.means.unscored();
             }
         }
-        *self.load.depths.lock().expect("draft load acceptance") =
-            Some(self.depths.iter().map(|slot| slot.means.clone()).collect());
-        *self.load.calibration.lock().expect("draft load calibration") = Some(
-            self.depths
-                .iter()
-                .map(|slot| slot.calibration.clone())
-                .collect(),
-        );
-        *self.load.look_run.lock().expect("draft load looks") = Some(self.look_run);
+        let mut state = self.load.lock();
+        state.depths = self
+            .depths
+            .iter()
+            .map(|slot| (slot.means.clone(), slot.calibration.clone()))
+            .collect();
+        state.look_run = self.look_run;
     }
 
     /// A launch of this request finished in `duration`: `rows` rows of
@@ -1356,35 +1490,38 @@ impl DraftController {
         rows: usize,
     ) {
         let covering = duration.is_some_and(|duration| duration.covering);
+        let seconds = duration.map(|duration| duration.duration.as_secs_f64());
+        let mut load = self.load.lock();
         match duration {
-            Some(LaunchDuration { covering: true, .. }) => {
-                *self.load.beside_cover.lock().expect("draft load cover") = true
-            }
-            Some(_) => self.load.settle(),
+            Some(LaunchDuration { covering: true, .. }) => load.beside_cover = true,
+            Some(_) => load.settle(),
             None => {}
         }
-        let seconds = duration.map(|duration| duration.duration.as_secs_f64());
-        let size = match launch {
-            TimedLaunch::Entry => {
-                self.entered = self.entered.zip(seconds).map(|(entered, seconds)| entered + seconds);
+        let size = match (launch, self.timing.expected) {
+            (TimedLaunch::Entry, _) => {
+                self.timing.entered.record(seconds);
                 return;
             }
-            TimedLaunch::Draft => self.timing_draft.take(),
-            TimedLaunch::Target => std::mem::take(&mut self.timing_target).then_some(rows),
-        };
-        let Some(size) = size else {
-            return;
+            (TimedLaunch::Draft, ExpectedLaunch::Draft(generated)) => {
+                self.timing.expected = ExpectedLaunch::None;
+                generated
+            }
+            (TimedLaunch::Target, ExpectedLaunch::Target) => {
+                self.timing.expected = ExpectedLaunch::None;
+                rows
+            }
+            _ => return,
         };
         self.sequences = sequences.max(1);
         let drafting = self.choice.drafting(self.preparing());
-        let generated_for_steady = if self.drafter.is_some() {
+        let generated_for_steady = if self.timing.drafter.ran() {
             self.choice.generated
         } else {
             0
         };
         let (switch, switch_cost, steady) = {
             let costs = RoundCosts::of(
-                &self.load,
+                &load,
                 self.context_class,
                 self.sequences,
                 self.after_drafting,
@@ -1415,47 +1552,43 @@ impl DraftController {
                 (paying == Switch::Leave && !launches.verify.contains_key(&size)).then_some(0.0)
             })
         };
-        let took = seconds
-            .zip(self.entered.replace(0.0))
-            .map(|(seconds, entered)| seconds + entered);
-        let round = {
-            let mut rounds = self.load.rounds.lock().expect("draft load rounds");
-            if launch == TimedLaunch::Target {
-                *rounds += 1;
-            }
-            *rounds
-        };
+        let took = self.timing.entered.take_with(seconds);
+        if launch == TimedLaunch::Target {
+            load.rounds += 1;
+        }
+        let round = load.rounds;
         let key = (self.context_class, self.sequences);
-        let mut measured = self.load.costs.lock().expect("draft load costs");
-        let launches = measured.entry(key).or_default();
+        let launches = load.costs.entry(key).or_default();
         if launch == TimedLaunch::Draft {
-            self.drafter = Some(took);
+            self.timing.drafter = match took {
+                Some(seconds) => DrafterTiming::Replayed(seconds),
+                None => DrafterTiming::Recorded,
+            };
             if let (Some(took), Some(paid)) = (took, paid(Switch::Enter, launches, size)) {
                 LaunchCosts::record(&mut launches.draft, round, size, (took - paid).max(0.0), covering);
             }
-            prune_costs(&mut measured, key);
+            prune_costs(&mut load.costs, key);
             return;
         }
-        let drafter = self.drafter.take();
+        let drafter = std::mem::take(&mut self.timing.drafter);
         self.after_drafting = Some(drafting);
         // A launch that recorded its graph measured that, not itself.
         let Some(took) = took else {
             return;
         };
-        let drafter_took = drafter.map_or(Some(0.0), |drafter| drafter);
         if let (Some(switch), Some(steady), Some(drafter_took)) =
-            (switch, steady, drafter_took)
+            (switch, steady, drafter.seconds())
         {
             launches
                 .switch_mut(switch)
                 .record(round, (took + drafter_took - steady).max(0.0), covering);
         }
         if self.preparing() {
-            prune_costs(&mut measured, key);
+            prune_costs(&mut load.costs, key);
             return;
         }
         let Some(paid) = paid(Switch::Leave, launches, size) else {
-            prune_costs(&mut measured, key);
+            prune_costs(&mut load.costs, key);
             return;
         };
         let seconds = (took - paid).max(0.0);
@@ -1466,7 +1599,7 @@ impl DraftController {
             (1, _) => {}
             (rows, _) => LaunchCosts::record(&mut launches.verify, round, rows, seconds, covering),
         }
-        prune_costs(&mut measured, key);
+        prune_costs(&mut load.costs, key);
     }
 }
 

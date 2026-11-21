@@ -39,12 +39,25 @@ fn unrolled(min: u32, max: Option<u32>) -> Option<u64> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum Key {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PlanKey {
     Rule(RuleId),
     Repeat(RepeatId),
-    /// The character-level rendering of a region terminal.
-    Twin(TermId),
+}
+
+/// A handle to a lexeme edge in a [`Plan`], minted only from existing
+/// `EdgeKind::Lexeme` edges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LexemeEdge {
+    rule: usize,
+    edge: usize,
+    region: TermId,
+}
+
+impl LexemeEdge {
+    pub(crate) fn rule(self) -> usize {
+        self.rule
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,7 +90,8 @@ pub(crate) struct Earley {
 
 pub(crate) struct Plan {
     pub rules: Vec<Earley>,
-    index: HashMap<Key, usize>,
+    /// Character-level Earley rules indexed by their region terminal.
+    twins: HashMap<TermId, usize>,
     pub unflattened: usize,
     pub hubs: usize,
     /// Unbounded repetitions built with their first iteration before the
@@ -88,7 +102,7 @@ pub(crate) struct Plan {
 enum Raw {
     /// A terminal; `EMPTY` is ε.
     Term(TermId),
-    Call(Key, u32, Option<u32>),
+    Call(PlanKey, u32, Option<u32>),
 }
 
 struct Skeleton {
@@ -131,7 +145,7 @@ impl<'n> Builder<'n, '_> {
     }
     /// A call between private endpoints, so paths that bypass it never end a
     /// lexeme where the call starts or ends.
-    fn call(&mut self, from: u32, to: u32, key: Key, min: u32, max: Option<u32>) {
+    fn call(&mut self, from: u32, to: u32, key: PlanKey, min: u32, max: Option<u32>) {
         let (enter, exit) = (self.state(), self.state());
         self.eps(from, enter);
         self.skeleton
@@ -187,7 +201,7 @@ impl<'n> Builder<'n, '_> {
                     self.eps(from, entry);
                 }
                 Class::Structural | Class::Recursive => {
-                    self.call(from, to, Key::Rule(*rule), 1, Some(1))
+                    self.call(from, to, PlanKey::Rule(*rule), 1, Some(1))
                 }
                 Class::Regular(_) => unreachable!("regular references are terminals"),
             },
@@ -211,7 +225,7 @@ impl<'n> Builder<'n, '_> {
             Node::Repeat { id, part, min, max } => {
                 if unrolled(*min, *max).is_none() {
                     self.repeats.insert(*id, part);
-                    self.call(from, to, Key::Repeat(*id), *min, *max);
+                    self.call(from, to, PlanKey::Repeat(*id), *min, *max);
                     return;
                 }
                 let mut current = from;
@@ -641,23 +655,23 @@ impl Plan {
     ) -> Self {
         let mut plan = Self {
             rules: Vec::new(),
-            index: HashMap::new(),
+            twins: HashMap::new(),
             unflattened: 0,
             hubs: 0,
             peeled: 0,
         };
+        let mut index: HashMap<PlanKey, usize> = HashMap::new();
         let mut repeats: BTreeMap<RepeatId, &Node> = BTreeMap::new();
-        let mut pending = VecDeque::from([Key::Rule(network.root)]);
-        plan.index.insert(Key::Rule(network.root), 0);
+        let mut pending = VecDeque::from([PlanKey::Rule(network.root)]);
+        index.insert(PlanKey::Rule(network.root), 0);
         plan.rules.push(Earley {
             boundaries: 0,
             edges: Vec::new(),
         });
         while let Some(key) = pending.pop_front() {
             let body: &Node = match key {
-                Key::Rule(rule) => &network.bodies[rule],
-                Key::Repeat(id) => repeats[&id],
-                Key::Twin(_) => unreachable!("twins are added by certification"),
+                PlanKey::Rule(rule) => &network.bodies[rule],
+                PlanKey::Repeat(id) => repeats[&id],
             };
             // A loop head that splits text from what its part leads with is
             // peeled and the rule planned again, while the allowance pays for
@@ -686,22 +700,22 @@ impl Plan {
                     builder.skeleton
                 };
                 let size = skeleton.edges.len();
-                let mut resolve = |key: Key, plan: &mut Plan| -> usize {
-                    if let Some(&index) = plan.index.get(&key) {
-                        return index;
+                let resolve = |key: PlanKey| -> usize {
+                    if let Some(&rule) = index.get(&key) {
+                        return rule;
                     }
-                    let index = plan.rules.len();
-                    plan.index.insert(key, index);
+                    let rule = plan.rules.len();
+                    index.insert(key, rule);
                     plan.rules.push(Earley {
                         boundaries: 0,
                         edges: Vec::new(),
                     });
                     pending.push_back(key);
-                    index
+                    rule
                 };
                 let mut attempt = allowance.clone();
                 let (boundaries, edges, heads, hubs) =
-                    regions(skeleton, terms, &mut attempt, |key| resolve(key, &mut plan));
+                    regions(skeleton, terms, &mut attempt, resolve);
                 let delimiting = delimiting(&edges, &heads, terms, regexes)
                     .difference(&peeled)
                     .copied()
@@ -714,7 +728,7 @@ impl Plan {
                 }
                 peeled.extend(delimiting);
             };
-            let rule = plan.index[&key];
+            let rule = index[&key];
             plan.rules[rule].boundaries = boundaries;
             plan.rules[rule].edges = edges;
             plan.hubs += hubs;
@@ -722,13 +736,33 @@ impl Plan {
         plan
     }
 
-    /// Render the lexeme at `rules[rule].edges[edge]` at character level.
-    pub(crate) fn characters(&mut self, rule: usize, edge: usize, terms: &mut Terms) {
-        let EdgeKind::Lexeme { region, .. } = self.rules[rule].edges[edge].kind else {
-            unreachable!("only lexemes are rendered at character level")
-        };
-        let twin = self.twin(region, terms);
-        self.rules[rule].edges[edge].kind = EdgeKind::Call {
+    /// Iterate over every lexeme edge in the plan, yielding its handle,
+    /// non-empty lexeme terminal, and `(from, to)` boundary indices.
+    pub(crate) fn lexemes(&self) -> impl Iterator<Item = (LexemeEdge, TermId, u32, u32)> + '_ {
+        self.rules.iter().enumerate().flat_map(|(rule_index, rule)| {
+            rule.edges
+                .iter()
+                .enumerate()
+                .filter_map(move |(edge_index, edge)| match edge.kind {
+                    EdgeKind::Lexeme { lexeme, region } => Some((
+                        LexemeEdge {
+                            rule: rule_index,
+                            edge: edge_index,
+                            region,
+                        },
+                        lexeme,
+                        edge.from,
+                        edge.to,
+                    )),
+                    EdgeKind::Call { .. } | EdgeKind::Eps => None,
+                })
+        })
+    }
+
+    /// Render the lexeme identified by `lexeme` at character level.
+    pub(crate) fn characters(&mut self, lexeme: LexemeEdge, terms: &mut Terms) {
+        let twin = self.twin(lexeme.region, terms);
+        self.rules[lexeme.rule].edges[lexeme.edge].kind = EdgeKind::Call {
             rule: twin,
             min: 1,
             max: Some(1),
@@ -737,11 +771,11 @@ impl Plan {
 
     /// The Earley rule spelling a terminal with one-character lexemes.
     fn twin(&mut self, term: TermId, terms: &mut Terms) -> usize {
-        if let Some(&index) = self.index.get(&Key::Twin(term)) {
+        if let Some(&index) = self.twins.get(&term) {
             return index;
         }
         let index = self.rules.len();
-        self.index.insert(Key::Twin(term), index);
+        self.twins.insert(term, index);
         self.rules.push(Earley {
             boundaries: 2,
             edges: Vec::new(),
@@ -813,6 +847,39 @@ impl Plan {
     }
 }
 
+/// Boundary numbering for a skeleton: state 0 is entry (boundary 0), state 1
+/// is exit (boundary 1), and other marked states receive consecutive boundary
+/// numbers on first mark.
+struct Boundaries {
+    numbers: Vec<Option<u32>>,
+    count: u32,
+}
+
+impl Boundaries {
+    fn new(states: u32) -> Self {
+        let mut numbers = vec![None; states as usize];
+        numbers[0] = Some(0);
+        numbers[1] = Some(1);
+        Self { numbers, count: 2 }
+    }
+
+    fn mark(&mut self, state: u32) -> u32 {
+        *self.numbers[state as usize].get_or_insert_with(|| {
+            let id = self.count;
+            self.count += 1;
+            id
+        })
+    }
+
+    fn keep_mask(&self) -> Vec<bool> {
+        self.numbers.iter().map(Option::is_some).collect()
+    }
+
+    fn get(&self, state: u32) -> u32 {
+        self.numbers[state as usize].expect("eliminated edges join kept states")
+    }
+}
+
 /// Collapse a skeleton to its boundaries: calls keep their endpoints; every
 /// regular path between two boundaries becomes one lexeme. Returns the
 /// boundary count, the edges, the loop heads by boundary, and how many
@@ -821,61 +888,40 @@ fn regions(
     skeleton: Skeleton,
     terms: &mut Terms,
     allowance: &mut Allowance,
-    mut resolve: impl FnMut(Key) -> usize,
+    mut resolve: impl FnMut(PlanKey) -> usize,
 ) -> (u32, Vec<Edge>, BTreeMap<u32, Head>, usize) {
-    let states = skeleton.states as usize;
-    let mut boundary = vec![false; states];
-    boundary[0] = true;
-    boundary[1] = true;
-    for &(head, _) in &skeleton.heads {
-        boundary[head as usize] = true;
-    }
-    let mut calls = Vec::new();
+    let mut boundaries = Boundaries::new(skeleton.states);
+    let heads = skeleton
+        .heads
+        .into_iter()
+        .map(|(state, head)| (boundaries.mark(state), head))
+        .collect();
+    let mut edges = Vec::new();
     let mut regular = Vec::new();
     for (from, to, raw) in skeleton.edges {
         match raw {
             Raw::Term(term) => regular.push((from, to, term)),
             Raw::Call(key, min, max) => {
-                boundary[from as usize] = true;
-                boundary[to as usize] = true;
-                calls.push((from, to, key, min, max));
+                edges.push(Edge {
+                    from: boundaries.mark(from),
+                    to: boundaries.mark(to),
+                    kind: EdgeKind::Call {
+                        rule: resolve(key),
+                        min,
+                        max,
+                    },
+                });
             }
         }
     }
-    let eliminated = elimination::eliminate(skeleton.states, regular, &boundary, terms, allowance);
+    let keep = boundaries.keep_mask();
+    let eliminated = elimination::eliminate(skeleton.states, regular, &keep, terms, allowance);
     for &hub in &eliminated.kept {
-        boundary[hub as usize] = true;
-    }
-    let numbers: Vec<Option<u32>> = {
-        let mut next = 2;
-        (0..states)
-            .map(|state| match state {
-                0 | 1 => Some(state as u32),
-                _ if boundary[state] => {
-                    next += 1;
-                    Some(next - 1)
-                }
-                _ => None,
-            })
-            .collect()
-    };
-    let count = numbers.iter().flatten().count() as u32;
-    let number = |state: u32| numbers[state as usize].expect("edges join boundaries");
-    let mut edges = Vec::new();
-    for (from, to, key, min, max) in calls {
-        edges.push(Edge {
-            from: number(from),
-            to: number(to),
-            kind: EdgeKind::Call {
-                rule: resolve(key),
-                min,
-                max,
-            },
-        });
+        boundaries.mark(hub);
     }
     let mut eps = BTreeSet::new();
     for (from, to, region) in eliminated.edges {
-        let (from, to) = (number(from), number(to));
+        let (from, to) = (boundaries.get(from), boundaries.get(to));
         if terms.nullable(region) && from != to {
             eps.insert((from, to));
         }
@@ -895,12 +941,7 @@ fn regions(
         to,
         kind: EdgeKind::Eps,
     }));
-    let heads = skeleton
-        .heads
-        .iter()
-        .map(|&(state, head)| (number(state), head))
-        .collect();
-    (count, edges, heads, eliminated.kept.len())
+    (boundaries.count, edges, heads, eliminated.kept.len())
 }
 
 /// Repetitions whose loop head ends a lexeme that a lexeme starting with it

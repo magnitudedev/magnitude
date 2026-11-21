@@ -20,6 +20,20 @@ __device__ __forceinline__ void rms_norm(float (&x)[E], const float *weight, uns
     for (int i = 0; i < E; ++i) squares = __fmaf_rn(x[i], x[i], squares);
     squares = seismic_warp_sum_f32(squares);
     const float inverse = rsqrtf(squares / static_cast<float>(32 * E) + epsilon);
+    if constexpr (E % 4 == 0) {
+        if (weight_stride == 1ull && (reinterpret_cast<unsigned long long>(weight) & 15ull) == 0ull) {
+            const float *lane_weight = weight + lane * E;
+#pragma unroll
+            for (int i = 0; i < E; i += 4) {
+                const float4 w = *reinterpret_cast<const float4 *>(lane_weight + i);
+                x[i + 0] = x[i + 0] * inverse * w.x;
+                x[i + 1] = x[i + 1] * inverse * w.y;
+                x[i + 2] = x[i + 2] * inverse * w.z;
+                x[i + 3] = x[i + 3] * inverse * w.w;
+            }
+            return;
+        }
+    }
 #pragma unroll
     for (int i = 0; i < E; ++i)
         x[i] = x[i] * inverse * weight[static_cast<unsigned long long>(lane * E + i) * weight_stride];

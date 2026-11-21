@@ -234,7 +234,7 @@ pub struct Skeleton {
 
 /// The structure of the GGUF header `bytes` begin, or why they can't begin one.
 pub fn walk(bytes: &[u8]) -> Result<Walk<'_>, Error> {
-    let mut walked = Progress::default();
+    let mut walked = Phase::default();
     walked.advance(bytes, &[])?;
     Ok(walked.view(bytes, &[]))
 }
@@ -300,19 +300,19 @@ pub struct SharedHeader {
     bytes: Arc<HeaderBacking>,
     /// The payloads `bytes` lack.
     absent: Vec<Absence>,
-    walked: Progress,
+    walked: CompletedWalk,
 }
 
 impl SharedHeader {
     /// The whole header `bytes` hold, with the payloads `absent` lacks.
     pub(super) fn walk(bytes: Arc<Vec<u8>>, absent: Vec<Absence>) -> Result<Self, Error> {
-        let mut walked = Progress::default();
+        let mut walked = Phase::default();
         walked.advance(&bytes, &absent)?;
-        if let Stop::Incomplete { .. } = walked.stop {
+        let Some(walked) = walked.into_complete() else {
             return Err(Error::Truncated {
                 offset: bytes.len() as u64,
             });
-        }
+        };
         Ok(Self {
             bytes: Arc::new(HeaderBacking::Owned(bytes)),
             absent,
@@ -356,20 +356,17 @@ impl SharedHeader {
             map_len,
             len: map_len,
         };
-        let mut walked = Progress::default();
+        let mut walked = Phase::default();
         walked.advance(&backing, &[])?;
-        match walked.stop {
-            Stop::Incomplete { .. } => {
-                return Err(if file_size <= HEADER_LIMIT as u64 {
-                    Error::Truncated {
-                        offset: map_len as u64,
-                    }
-                } else {
-                    beyond()
-                });
-            }
-            Stop::Complete { .. } => {}
-        }
+        let Some(walked) = walked.into_complete() else {
+            return Err(if file_size <= HEADER_LIMIT as u64 {
+                Error::Truncated {
+                    offset: map_len as u64,
+                }
+            } else {
+                beyond()
+            });
+        };
         Ok(Some(Self {
             bytes: Arc::new(backing),
             absent: Vec::new(),
@@ -392,10 +389,7 @@ impl SharedHeader {
     }
 
     pub fn header(&self) -> Header<'_> {
-        match self.walked.view(&self.bytes, &self.absent) {
-            Walk::Complete(header) => header,
-            Walk::Incomplete(_) => unreachable!("a shared header is whole"),
-        }
+        self.walked.view(&self.bytes, &self.absent)
     }
 }
 
@@ -406,7 +400,7 @@ impl SharedHeader {
 #[derive(Default)]
 pub struct HeaderBytes {
     bytes: Vec<u8>,
-    walked: Progress,
+    walked: Phase,
 }
 
 impl HeaderBytes {
@@ -469,48 +463,57 @@ impl HeaderBytes {
     /// returning its walk. Each read asks for the walk's estimate of the rest, so the bytes may run
     /// past the header by up to the last estimate. A source that ends first is a truncated header.
     pub fn read(&mut self, source: &mut impl Read) -> Result<Header<'_>, Error> {
-        loop {
+        let completed = loop {
             self.walked.advance(&self.bytes, &[])?;
-            let Stop::Incomplete { estimate, .. } = self.walked.stop else {
-                break;
+            let (phase, estimate) = match std::mem::take(&mut self.walked) {
+                Phase::Complete(completed) => break completed,
+                Phase::Preamble { missing } => (Phase::Preamble { missing }, missing),
+                Phase::Entries(state) => {
+                    let estimate = state.need.estimate;
+                    (Phase::Entries(state), estimate)
+                }
+                Phase::Tensors(state) => {
+                    let estimate = state.estimate;
+                    (Phase::Tensors(state), estimate)
+                }
             };
+            self.walked = phase;
             let to_read = estimate.min(HEADER_LIMIT.saturating_sub(self.bytes.len()));
             if self.read_from(source, to_read)? == 0 {
                 return Err(Error::Truncated {
                     offset: self.bytes.len() as u64,
                 });
             }
-        }
-        match self.walked.view(&self.bytes, &[]) {
-            Walk::Complete(header) => Ok(header),
-            Walk::Incomplete(_) => unreachable!("the reads end at a whole header"),
-        }
+        };
+        let header = completed.view(&self.bytes, &[]);
+        self.walked = Phase::Complete(completed);
+        Ok(header)
     }
 
     /// The first `length` bytes in hand, which hold the whole header walked (padding aside),
     /// shared with the metadata arrays of its directory, its walk kept.
     pub fn into_shared(mut self, length: usize) -> Result<SharedHeader, Error> {
-        if let Stop::Incomplete { .. } = self.walked.stop {
+        let Phase::Complete(walked) = self.walked else {
             return Err(Error::Truncated {
                 offset: self.bytes.len() as u64,
             });
-        }
+        };
         if length > self.bytes.len() {
             return Err(Error::Truncated {
                 offset: self.bytes.len() as u64,
             });
         }
-        if length < self.walked.offset {
+        if length < walked.offset {
             return Err(invalid(format!(
                 "{length} bytes cut the GGUF header walked through byte {}",
-                self.walked.offset
+                walked.offset
             )));
         }
         self.bytes.truncate(length);
         Ok(SharedHeader {
             bytes: Arc::new(HeaderBacking::Owned(Arc::new(self.bytes))),
             absent: Vec::new(),
-            walked: self.walked,
+            walked,
         })
     }
 }
@@ -526,12 +529,12 @@ fn utf8(bytes: &[u8]) -> Result<&str, Error> {
 /// Text the walk checked ([`utf8`]), read back without checking it again.
 fn checked(text: &[u8]) -> &str {
     debug_assert!(std::str::from_utf8(text).is_ok());
-    // SAFETY: only text the walk checked comes here: the keys and tensor names a `Progress` holds
-    // the ranges of, read back from the bytes it walked (a `HeaderBytes` only ever extends its
-    // bytes, and a `SharedHeader` never changes them), and the text of the scalar values of the
-    // entries it reports, which nothing else constructs or changes (an `Entry`'s head and value
-    // are private), so each decodes by the head the walk checked it by. Array text is checked
-    // when it is decoded ([`decode`]).
+    // SAFETY: only text the walk checked comes here: the keys and tensor names a `Phase` or
+    // `CompletedWalk` holds the ranges of, read back from the bytes it walked (a `HeaderBytes`
+    // only ever extends its bytes, and a `SharedHeader` never changes them), and the text of the
+    // scalar values of the entries it reports, which nothing else constructs or changes (an
+    // `Entry`'s head and value are private), so each decodes by the head the walk checked it by.
+    // Array text is checked when it is decoded ([`decode`]).
     unsafe { std::str::from_utf8_unchecked(text) }
 }
 
@@ -568,15 +571,62 @@ fn u64_of(order: ByteOrder, bytes: [u8; 8]) -> u64 {
 /// walk of those bytes extended continues from here. It moves only past what the walk read whole
 /// (an item, or the whole strings of a string array the bytes end in), so a walk that finds the
 /// bytes invalid leaves it where it was, and walking them again finds the same error.
-struct Progress {
+enum Phase {
+    /// Waiting for the 24-byte preamble.
+    Preamble { missing: usize },
+    /// Walking metadata entries (possibly paused inside a string array).
+    Entries(EntriesPhase),
+    /// Walking tensor descriptors.
+    Tensors(TensorsPhase),
+    /// The whole header has been walked.
+    Complete(CompletedWalk),
+}
+
+impl Default for Phase {
+    /// The walk of no bytes.
+    fn default() -> Self {
+        Self::Preamble {
+            missing: PREAMBLE_BYTES,
+        }
+    }
+}
+
+/// Position in the whole header being walked.
+#[derive(Clone, Copy, Debug)]
+struct Position {
     /// Where the walk continues in the whole header: the start of the next item, or of the next
-    /// string of `array`.
+    /// string of an open string array.
     offset: usize,
     /// The bytes of the absent payloads before `offset`, which the bytes walked lack.
     shift: usize,
     /// How many absent payloads lie before `offset`.
     passed: usize,
-    preamble: Option<Counted>,
+}
+
+impl Position {
+    /// A cursor at where the walk continues.
+    fn cursor<'a>(self, bytes: &'a [u8], absent: &'a [Absence], order: ByteOrder) -> Cursor<'a> {
+        Cursor {
+            bytes,
+            offset: self.offset,
+            shift: self.shift,
+            absent: &absent[self.passed..],
+            order,
+        }
+    }
+
+    /// Moves the walk on to where `cursor` is.
+    fn pass(&mut self, cursor: &Cursor<'_>, absent: &[Absence]) {
+        self.offset = cursor.offset;
+        self.shift = cursor.shift;
+        self.passed = absent.len() - cursor.absent.len();
+    }
+}
+
+/// Metadata-entry walking state; dropped upon transitioning to [`TensorsPhase`].
+struct EntriesPhase {
+    pos: Position,
+    counted: Counted,
     /// The keys of `entries`.
     keys: HashSet<Box<str>>,
     entries: Vec<Walked>,
@@ -584,31 +634,51 @@ struct Progress {
     alignment: u64,
     /// The string array the walk stopped in, when it did.
     array: Option<OpenArray>,
-    /// Where the tensor descriptors start, once every entry is walked.
-    tensors_start: Option<usize>,
-    tensors: Vec<WalkedTensor>,
-    stop: Stop,
+    need: Need,
 }
 
-impl Default for Progress {
-    /// The walk of no bytes.
-    fn default() -> Self {
-        Self {
-            offset: 0,
-            shift: 0,
-            passed: 0,
-            preamble: None,
-            keys: HashSet::new(),
-            entries: Vec::new(),
-            alignment: DEFAULT_ALIGNMENT,
-            array: None,
-            tensors_start: None,
-            tensors: Vec::new(),
-            stop: Stop::Incomplete {
-                open: None,
-                minimum: PREAMBLE_BYTES,
-                estimate: PREAMBLE_BYTES,
-            },
+/// Tensor-descriptor walking state; dropped upon transitioning to [`CompletedWalk`].
+struct TensorsPhase {
+    pos: Position,
+    preamble: Preamble,
+    tensor_count: usize,
+    entries: Vec<Walked>,
+    alignment: u64,
+    /// Where the tensor descriptors start in the whole header.
+    tensors_start: usize,
+    tensors: Vec<WalkedTensor>,
+    minimum: usize,
+    estimate: usize,
+}
+
+/// A completed GGUF header walk, retaining only the fields needed to construct a [`Header`].
+struct CompletedWalk {
+    preamble: Preamble,
+    entries: Vec<Walked>,
+    tensors: Vec<WalkedTensor>,
+    alignment: u64,
+    data_offset: usize,
+    /// Where the walked header ends before alignment padding.
+    offset: usize,
+}
+
+impl CompletedWalk {
+    fn view<'a>(&self, bytes: &'a [u8], absent: &'a [Absence]) -> Header<'a> {
+        let order = self.preamble.byte_order;
+        Header {
+            preamble: self.preamble,
+            entries: self
+                .entries
+                .iter()
+                .map(|walked| walked.view(bytes, absent, order))
+                .collect(),
+            tensors: self
+                .tensors
+                .iter()
+                .map(|tensor| tensor.view(bytes, order))
+                .collect(),
+            alignment: self.alignment,
+            data_offset: self.data_offset,
         }
     }
 }
@@ -621,23 +691,18 @@ struct Counted {
     entries: usize,
 }
 
-/// Where a walk ends: inside the header ([`Prefix`]) or at its end ([`Header`]).
+/// Where an incomplete walk stopped: the entry it ended in (when its fixed part is in hand) and
+/// how many more bytes the header needs.
 #[derive(Clone, Copy, Debug)]
-enum Stop {
-    Incomplete {
-        open: Option<Head>,
-        minimum: usize,
-        estimate: usize,
-    },
-    Complete {
-        preamble: Preamble,
-        data_offset: usize,
-    },
+struct Need {
+    open: Option<Head>,
+    minimum: usize,
+    estimate: usize,
 }
 
 /// Why a walk ends before the header does: the bytes end, or they can't begin a header.
 enum Halt {
-    Stopped(Stop),
+    Stopped(Need),
     Invalid(Error),
 }
 
@@ -742,7 +807,7 @@ fn stop(held: usize, open: Option<Head>, minimum: usize, estimate: usize) -> Hal
     if minimum > room {
         return Halt::Invalid(beyond());
     }
-    Halt::Stopped(Stop::Incomplete {
+    Halt::Stopped(Need {
         open,
         minimum,
         estimate: estimate.clamp(minimum, room),
@@ -797,93 +862,145 @@ fn preamble(bytes: &[u8], absent: &[Absence]) -> Result<Counted, Halt> {
     })
 }
 
-impl Progress {
+impl Phase {
     /// Walks `bytes`, which extend the bytes walked before, from where that walk stopped. The
     /// bytes lack the payloads `absent` names (none, for a walk that may continue).
     fn advance(&mut self, bytes: &[u8], absent: &[Absence]) -> Result<(), Error> {
-        if let Stop::Incomplete { .. } = self.stop {
-            self.stop = match self.walk(bytes, absent) {
-                Ok(stop) | Err(Halt::Stopped(stop)) => stop,
-                Err(Halt::Invalid(error)) => return Err(error),
+        let mut phase = std::mem::take(self);
+        let result = loop {
+            phase = match phase {
+                Self::Preamble { missing } => match preamble(bytes, absent) {
+                    Ok(counted) => Self::Entries(EntriesPhase::new(counted)),
+                    Err(Halt::Stopped(need)) => {
+                        phase = Self::Preamble {
+                            missing: need.minimum,
+                        };
+                        break Ok(());
+                    }
+                    Err(Halt::Invalid(error)) => {
+                        phase = Self::Preamble { missing };
+                        break Err(error);
+                    }
+                },
+                Self::Entries(mut state) => match state.advance(bytes, absent) {
+                    Ok(()) => Self::Tensors(state.into_tensors()),
+                    Err(Halt::Stopped(need)) => {
+                        state.need = need;
+                        phase = Self::Entries(state);
+                        break Ok(());
+                    }
+                    Err(Halt::Invalid(error)) => {
+                        phase = Self::Entries(state);
+                        break Err(error);
+                    }
+                },
+                Self::Tensors(mut state) => match state.advance(bytes, absent) {
+                    Ok(data_offset) => {
+                        phase = Self::Complete(state.into_complete(data_offset));
+                        break Ok(());
+                    }
+                    Err(Halt::Stopped(need)) => {
+                        state.minimum = need.minimum;
+                        state.estimate = need.estimate;
+                        phase = Self::Tensors(state);
+                        break Ok(());
+                    }
+                    Err(Halt::Invalid(error)) => {
+                        phase = Self::Tensors(state);
+                        break Err(error);
+                    }
+                },
+                Self::Complete(completed) => {
+                    phase = Self::Complete(completed);
+                    break Ok(());
+                }
             };
+        };
+        *self = phase;
+        result
+    }
+
+    fn into_complete(self) -> Option<CompletedWalk> {
+        match self {
+            Self::Complete(completed) => Some(completed),
+            Self::Preamble { .. } | Self::Entries(_) | Self::Tensors(_) => None,
         }
-        Ok(())
     }
 
     /// The walk of `bytes`, which are the bytes walked, lacking the payloads `absent` names.
     fn view<'a>(&self, bytes: &'a [u8], absent: &'a [Absence]) -> Walk<'a> {
-        let order = self
-            .preamble
-            .map_or(ByteOrder::Little, |counted| counted.preamble.byte_order);
-        let entries = self
-            .entries
-            .iter()
-            .map(|walked| walked.view(bytes, absent, order))
-            .collect();
-        match self.stop {
-            Stop::Incomplete {
-                open,
-                minimum,
-                estimate,
-            } => Walk::Incomplete(Prefix {
-                preamble: self.preamble.map(|counted| counted.preamble),
-                entries,
-                alignment: self.alignment,
-                open: open.map(|head| head.view(bytes)),
-                minimum,
-                estimate,
+        match self {
+            Self::Preamble { missing } => Walk::Incomplete(Prefix {
+                preamble: None,
+                entries: Vec::new(),
+                alignment: DEFAULT_ALIGNMENT,
+                open: None,
+                minimum: *missing,
+                estimate: *missing,
             }),
-            Stop::Complete {
-                preamble,
-                data_offset,
-            } => Walk::Complete(Header {
-                preamble,
-                entries,
-                tensors: self
-                    .tensors
-                    .iter()
-                    .map(|tensor| tensor.view(bytes, order))
-                    .collect(),
-                alignment: self.alignment,
-                data_offset,
-            }),
-        }
-    }
-
-    /// A cursor at where the walk continues.
-    fn cursor<'a>(&self, bytes: &'a [u8], absent: &'a [Absence], order: ByteOrder) -> Cursor<'a> {
-        Cursor {
-            bytes,
-            offset: self.offset,
-            shift: self.shift,
-            absent: &absent[self.passed..],
-            order,
-        }
-    }
-
-    /// Moves the walk on to where `cursor` is.
-    fn pass(&mut self, cursor: &Cursor<'_>, absent: &[Absence]) {
-        self.offset = cursor.offset;
-        self.shift = cursor.shift;
-        self.passed = absent.len() - cursor.absent.len();
-    }
-
-    fn walk(&mut self, bytes: &[u8], absent: &[Absence]) -> Result<Stop, Halt> {
-        let counted = match self.preamble {
-            Some(counted) => counted,
-            None => {
-                let counted = preamble(bytes, absent)?;
-                self.preamble = Some(counted);
-                self.offset = PREAMBLE_BYTES;
-                counted
+            Self::Entries(state) => {
+                let order = state.counted.preamble.byte_order;
+                Walk::Incomplete(Prefix {
+                    preamble: Some(state.counted.preamble),
+                    entries: state
+                        .entries
+                        .iter()
+                        .map(|walked| walked.view(bytes, absent, order))
+                        .collect(),
+                    alignment: state.alignment,
+                    open: state.need.open.map(|head| head.view(bytes)),
+                    minimum: state.need.minimum,
+                    estimate: state.need.estimate,
+                })
             }
-        };
-        let order = counted.preamble.byte_order;
-        let tensors_estimate = counted.tensors * TENSOR_ESTIMATE;
-        while self.entries.len() < counted.entries {
-            let rest =
-                (counted.entries - self.entries.len() - 1) * ENTRY_ESTIMATE + tensors_estimate;
-            let mut cursor = self.cursor(bytes, absent, order);
+            Self::Tensors(state) => {
+                let order = state.preamble.byte_order;
+                Walk::Incomplete(Prefix {
+                    preamble: Some(state.preamble),
+                    entries: state
+                        .entries
+                        .iter()
+                        .map(|walked| walked.view(bytes, absent, order))
+                        .collect(),
+                    alignment: state.alignment,
+                    open: None,
+                    minimum: state.minimum,
+                    estimate: state.estimate,
+                })
+            }
+            Self::Complete(completed) => Walk::Complete(completed.view(bytes, absent)),
+        }
+    }
+}
+
+impl EntriesPhase {
+    fn new(counted: Counted) -> Self {
+        Self {
+            pos: Position {
+                offset: PREAMBLE_BYTES,
+                shift: 0,
+                passed: 0,
+            },
+            counted,
+            keys: HashSet::new(),
+            entries: Vec::new(),
+            alignment: DEFAULT_ALIGNMENT,
+            array: None,
+            need: Need {
+                open: None,
+                minimum: 1,
+                estimate: 1,
+            },
+        }
+    }
+
+    fn advance(&mut self, bytes: &[u8], absent: &[Absence]) -> Result<(), Halt> {
+        let order = self.counted.preamble.byte_order;
+        let tensors_estimate = self.counted.tensors * TENSOR_ESTIMATE;
+        while self.entries.len() < self.counted.entries {
+            let rest = (self.counted.entries - self.entries.len() - 1) * ENTRY_ESTIMATE
+                + tensors_estimate;
+            let mut cursor = self.pos.cursor(bytes, absent, order);
             let (head, value) = match self.array {
                 Some(array) => {
                     self.strings(&mut cursor, array, rest)?;
@@ -914,65 +1031,23 @@ impl Progress {
             self.keys.insert(entry.head.key.into());
             self.entries.push(walked);
             self.array = None;
-            self.pass(&cursor, absent);
+            self.pos.pass(&cursor, absent);
         }
-        let alignment = usize::try_from(self.alignment).unwrap_or(usize::MAX);
-        let tensors_start = *self.tensors_start.get_or_insert(self.offset);
-        while self.tensors.len() < counted.tensors {
-            let index = self.tensors.len();
-            let mut cursor = self.cursor(bytes, absent, order);
-            let held = cursor.held();
-            let before = cursor.offset;
-            let left = counted.tensors - index;
-            let average = if index == 0 {
-                TENSOR_ESTIMATE
-            } else {
-                (before - tensors_start) / index
-            };
-            let estimate = (left * average)
-                .saturating_add(alignment)
-                .saturating_sub(held - before);
-            let Some(name) = cursor.string()? else {
-                return Err(stop(held, None, 8, estimate));
-            };
-            let shift = cursor.shift;
-            let name_range = before + 8 - shift..cursor.offset - shift;
-            let Some(rank) = cursor.u32()? else {
-                return Err(stop(held, None, 4, estimate));
-            };
-            if !(1..=MAX_TENSOR_RANK).contains(&rank) {
-                return Err(invalid(format!(
-                    "invalid or duplicate tensor directory entry {name:?}"
-                ))
-                .into());
-            }
-            let dimensions = rank as usize * 8;
-            let fixed = dimensions + 4 + 8;
-            let Some(descriptor) = cursor.take(fixed)? else {
-                return Err(stop(held, None, fixed, estimate));
-            };
-            let (type_id, offset) = descriptor[dimensions..].split_at(4);
-            let descriptor_start = cursor.offset - fixed - shift;
-            self.tensors.push(WalkedTensor {
-                name: name_range,
-                type_id: u32_of(order, type_id.try_into().expect("four bytes")),
-                offset: u64_of(order, offset.try_into().expect("eight bytes")),
-                dimensions: descriptor_start..descriptor_start + dimensions,
-            });
-            self.pass(&cursor, absent);
+        Ok(())
+    }
+
+    fn into_tensors(self) -> TensorsPhase {
+        TensorsPhase {
+            tensors_start: self.pos.offset,
+            pos: self.pos,
+            preamble: self.counted.preamble,
+            tensor_count: self.counted.tensors,
+            entries: self.entries,
+            alignment: self.alignment,
+            tensors: Vec::new(),
+            minimum: 1,
+            estimate: 1,
         }
-        if self.passed < absent.len() {
-            return Err(invalid("an absent GGUF payload is not a metadata array's").into());
-        }
-        let data_offset = self
-            .offset
-            .checked_next_multiple_of(alignment)
-            .filter(|end| *end <= HEADER_LIMIT)
-            .ok_or_else(beyond)?;
-        Ok(Stop::Complete {
-            preamble: counted.preamble,
-            data_offset,
-        })
     }
 
     /// Walks the metadata entry `cursor` is at, returning its head and where its value lies.
@@ -1029,7 +1104,12 @@ impl Progress {
                     ))
                     .into());
                 }
-                return Ok((head, WalkedValue::Apart { index: self.passed }));
+                return Ok((
+                    head,
+                    WalkedValue::Apart {
+                        index: self.pos.passed,
+                    },
+                ));
             }
             if element == ValueType::String {
                 self.strings(
@@ -1119,7 +1199,7 @@ impl Progress {
             );
             if let Halt::Stopped(_) = halt {
                 this.array = Some(OpenArray { read, ..array });
-                this.offset = before;
+                this.pos.offset = before;
             }
             halt
         };
@@ -1168,6 +1248,77 @@ impl Progress {
             }
         }
         Ok(())
+    }
+}
+
+impl TensorsPhase {
+    fn advance(&mut self, bytes: &[u8], absent: &[Absence]) -> Result<usize, Halt> {
+        let order = self.preamble.byte_order;
+        let alignment = usize::try_from(self.alignment).unwrap_or(usize::MAX);
+        while self.tensors.len() < self.tensor_count {
+            let index = self.tensors.len();
+            let mut cursor = self.pos.cursor(bytes, absent, order);
+            let held = cursor.held();
+            let before = cursor.offset;
+            let left = self.tensor_count - index;
+            let average = if index == 0 {
+                TENSOR_ESTIMATE
+            } else {
+                (before - self.tensors_start) / index
+            };
+            let estimate = (left * average)
+                .saturating_add(alignment)
+                .saturating_sub(held - before);
+            let Some(name) = cursor.string()? else {
+                return Err(stop(held, None, 8, estimate));
+            };
+            let shift = cursor.shift;
+            let name_range = before + 8 - shift..cursor.offset - shift;
+            let Some(rank) = cursor.u32()? else {
+                return Err(stop(held, None, 4, estimate));
+            };
+            if !(1..=MAX_TENSOR_RANK).contains(&rank) {
+                return Err(invalid(format!(
+                    "invalid or duplicate tensor directory entry {name:?}"
+                ))
+                .into());
+            }
+            let dimensions = rank as usize * 8;
+            let fixed = dimensions + 4 + 8;
+            let Some(descriptor) = cursor.take(fixed)? else {
+                return Err(stop(held, None, fixed, estimate));
+            };
+            let (type_id, offset) = descriptor[dimensions..].split_at(4);
+            let descriptor_start = cursor.offset - fixed - shift;
+            self.tensors.push(WalkedTensor {
+                name: name_range,
+                type_id: u32_of(order, type_id.try_into().expect("four bytes")),
+                offset: u64_of(order, offset.try_into().expect("eight bytes")),
+                dimensions: descriptor_start..descriptor_start + dimensions,
+            });
+            self.pos.pass(&cursor, absent);
+        }
+        if self.pos.passed < absent.len() {
+            return Err(invalid("an absent GGUF payload is not a metadata array's").into());
+        }
+        let data_offset = self
+            .pos
+            .offset
+            .checked_next_multiple_of(alignment)
+            .filter(|end| *end <= HEADER_LIMIT)
+            .ok_or_else(beyond)?;
+        Ok(data_offset)
+    }
+
+    fn into_complete(self, data_offset: usize) -> CompletedWalk {
+        CompletedWalk {
+            preamble: self.preamble,
+            entries: self.entries,
+            tensors: self.tensors,
+            alignment: self.alignment,
+            data_offset,
+            offset: self.pos.offset,
+        }
     }
 }
 

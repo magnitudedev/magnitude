@@ -44,6 +44,7 @@ pub fn drafted(
         method,
         codec: KvCodec::Dense,
         machine: Machine::Still,
+        pass: None,
     });
     (directory, definition, domain, bindings)
 }
@@ -90,6 +91,7 @@ pub fn chaining(
         method: PlannedMethod::Plain,
         codec: KvCodec::Dense,
         machine: Machine::Still,
+        pass: None,
     });
     (directory, definition, domain, bindings)
 }
@@ -471,6 +473,7 @@ pub(crate) fn load_with(
         method,
         codec: KvCodec::Dense,
         machine: Machine::Live,
+        pass: None,
     })
 }
 
@@ -498,6 +501,9 @@ pub(crate) struct LoadRequest<'a> {
     pub(crate) method: PlannedMethod,
     pub(crate) codec: KvCodec,
     pub(crate) machine: Machine,
+    /// Optional explicit pass budget overriding `draft.load().pass(limits)`
+    /// (for tests exercising multi-pass splitting within a longer chain).
+    pub(crate) pass: Option<crate::PassLaunches>,
 }
 
 /// `request` loaded as the engine's load does: its device opened, its plan
@@ -677,7 +683,7 @@ fn prepare_graphs(
     programs: &mut AttestedPrograms,
     state: crate::StateResourcePlan,
 ) -> (crate::ResourcePlan, u64) {
-    let LoadRequest { definition, backend, limits, method, .. } = *request;
+    let LoadRequest { definition, backend, limits, method, pass, .. } = *request;
     let target_graphs = programs
         .prepare_target_graphs(
             device,
@@ -686,7 +692,7 @@ fn prepare_graphs(
             &state,
             draft.programs().target(),
             limits,
-            draft.load().pass(limits),
+            pass.unwrap_or_else(|| draft.load().pass(limits)),
             &seismic::Workers::new(1),
         )
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));

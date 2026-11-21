@@ -60,9 +60,9 @@ fn dense_expand[M, O, H, F, GS, US, GB, UB, LB](residual: &tensor[M, H] f32, nor
 native dense_expand for metal from "metal/dense_expand.metal":
     static (H, F, GS, US, GB, UB, LB)
     where GS <= 1 and US <= 1
-    scratch normalized bytes ((O + TALL * (ceil_div(O, 64) * 64 - O)) * H * 2) when O > VERIFY_ROWS
+    scratch normalized bytes ((O + TALL * (ceil_div(O, 64) * 64 - O)) * H * 2) when O > VERIFY_ROWS or MATRIX > 0
     project dense paired (gate_weight, up_weight)
-    launch dense_expand_normalize before gemv when O > VERIFY_ROWS and (O <= 64 or TALL == 0 or INT8 == 1 or PACK == 1):
+    launch dense_expand_normalize before gemv when (O > VERIFY_ROWS or MATRIX > 0) and (O <= 64 or TALL == 0 or INT8 == 1 or PACK == 1):
         staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -176,8 +176,8 @@ native dense_up for metal from "metal/dense_up.metal":
     where US <= 1
     project dense single (up_weight)
     restate single_gemv
-    scratch normalized bytes (O * H * 2) when O > VERIFY_ROWS
-    launch dense_up_normalize before batch when O > VERIFY_ROWS:
+    scratch normalized bytes (O * H * 2) when O > VERIFY_ROWS or MATRIX > 0
+    launch dense_up_normalize before batch when O > VERIFY_ROWS or MATRIX > 0:
         staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)

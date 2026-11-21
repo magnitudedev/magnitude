@@ -328,7 +328,7 @@ fn walk_outstanding(topology: &DeviceTopology, executor: &Executor, store: &dyn 
 /// sampling ([`JobDeadlines`]).
 pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) -> Result<Vec<PointRequest>, String> {
     let tiered = !topology.shared_ranges_lie_in_device_memory(executor);
-    let memory = tiered.then(|| PointRequest::HostMemory { readers: seismic::threads::quota().get() as u64 });
+    let memory = tiered.then(|| PointRequest::HostMemory { readers: MemoryCosts::readers(topology) });
     let site = match tiered {
         true => CpuForm::reference(executor.backend()).map_err(|error| error.to_string())?,
         false => None,
@@ -611,12 +611,101 @@ impl JobDeadlines {
 /// this process (`DeviceLedgers::measurement`). The job's split is
 /// traced, point by point and whole. Fails only when the device's
 /// executor is not of its own topology's revision.
+/// High-level phase of a standing hardware benchmark job, ordered monotonically
+/// as the job progresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum MeasurementPhase {
+    /// Baseline compute, attention, and dispatch probes (`Costs(Required)`).
+    Baseline,
+    /// Storage read speed, expert conversion, and host memory probes.
+    MemoryAndStorage,
+    /// Decode token-generation kernel probes (`rows=1`).
+    TokenGeneration,
+    /// Prompt-processing kernel probes (`rows=512`).
+    PromptProcessing,
+    /// Long-context KV-cache attention probes (`depth`).
+    LongContextAttention,
+}
+
+/// Distinct standing points `standing` visits on `executor`: `Costs(Whole)` is a superset of
+/// `Costs(Required)`, so only the largest `Costs` walk is counted alongside the remaining requests.
+pub fn standing_points(topology: &DeviceTopology, executor: &Executor, standing: &[PointRequest]) -> usize {
+    let mut costs_max = 0usize;
+    let mut other = 0usize;
+    for request in standing {
+        let count = request.points(topology, executor).unwrap_or(0);
+        if matches!(request, PointRequest::Costs(_)) {
+            costs_max = costs_max.max(count);
+        } else {
+            other = other.saturating_add(count);
+        }
+    }
+    costs_max.saturating_add(other)
+}
+
+/// Phase label for `request` when no specific point key is being attempted yet.
+pub fn request_phase(request: &PointRequest) -> MeasurementPhase {
+    match request {
+        PointRequest::GraphCost | PointRequest::Costs(CostWalk::Required) => MeasurementPhase::Baseline,
+        PointRequest::Storage { .. }
+        | PointRequest::Convert(_)
+        | PointRequest::HostMemory { .. }
+        | PointRequest::TierCopy
+        | PointRequest::CpuSite(_)
+        | PointRequest::Site(_)
+        | PointRequest::Volume { .. } => MeasurementPhase::MemoryAndStorage,
+        PointRequest::Costs(CostWalk::Whole) => MeasurementPhase::TokenGeneration,
+        #[cfg(feature = "machine-line")]
+        PointRequest::Line => MeasurementPhase::Baseline,
+    }
+}
+
+/// Phase label for a specific point `key` within `request`.
+pub fn phase_of(request: &PointRequest, key: &PointKey) -> MeasurementPhase {
+    match request {
+        PointRequest::Costs(CostWalk::Whole) => {
+            if key.point.contains_key("depth") {
+                MeasurementPhase::LongContextAttention
+            } else if key.configuration.get("rows").copied().unwrap_or(1) > 8 {
+                MeasurementPhase::PromptProcessing
+            } else {
+                MeasurementPhase::TokenGeneration
+            }
+        }
+        _ => request_phase(request),
+    }
+}
+
 pub fn measure(
     measurer: &mut Measurer,
     charges: &seismic::Charges,
     store: &dyn RecordStore<PointKey>,
     requests: &Outstanding,
     deadlines: JobDeadlines,
+    attempting: &mut dyn FnMut(&PointKey) -> Attempt,
+    visit: &mut Visit<'_>,
+) -> Result<Measurement, ExecutorCostsError> {
+    measure_observed(
+        measurer,
+        charges,
+        store,
+        requests,
+        deadlines,
+        &mut |_, _| {},
+        attempting,
+        visit,
+    )
+}
+
+/// [`measure`] with an `on_request` callback fired before each request begins.
+#[allow(clippy::too_many_arguments)]
+pub fn measure_observed(
+    measurer: &mut Measurer,
+    charges: &seismic::Charges,
+    store: &dyn RecordStore<PointKey>,
+    requests: &Outstanding,
+    deadlines: JobDeadlines,
+    on_request: &mut dyn FnMut(Whose, &PointRequest),
     attempting: &mut dyn FnMut(&PointKey) -> Attempt,
     visit: &mut Visit<'_>,
 ) -> Result<Measurement, ExecutorCostsError> {
@@ -669,6 +758,7 @@ pub fn measure(
             .map(|(_, points)| points)
             .sum();
         walks.begin(*whose, left);
+        on_request(*whose, request);
         let (end, failed) = request.measure(&mut walks);
         ended.extend(end);
         failures.extend(failed);

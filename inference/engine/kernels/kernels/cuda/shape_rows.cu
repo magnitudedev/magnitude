@@ -83,22 +83,37 @@ __device__ __forceinline__ u32 *row_scratch(unsigned char *scratch, u64 row) {
     return reinterpret_cast<u32 *>(scratch) + row * (SEISMIC_TUNE_PARTS + 8);
 }
 
+#define COUNT_CAP 4096u
+
 extern "C" __global__ void shape_rows_prepare(SEISMIC_KERNEL_PARAMS) {
     const element::Out<element::F32> logits = SEISMIC_OUT_LOGITS;
     const float *params = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_PARAMS));
     const int *history = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY));
-    extern __shared__ int recent[];
+    __shared__ u32 counts[COUNT_CAP];
     __shared__ u32 warp_maximum[32];
     const u64 row = blockIdx.y;
     const u64 part = blockIdx.x;
+    const u64 begin = slice_begin(part);
+    const u64 end = slice_end(part);
+    const u64 slice_len = end - begin;
     const float temperature = parameter(params, row, 0);
     const float repetition = parameter(params, row, 4);
     const float presence = parameter(params, row, 5);
     const float frequency = parameter(params, row, 6);
     const bool penalized = SEISMIC_DIM_HN > 0 && (repetition != 1.0f || presence != 0.0f || frequency != 0.0f);
-    if (penalized) {
-        for (u64 h = threadIdx.x; h < SEISMIC_DIM_HN; h += blockDim.x)
-            recent[h] = history[row * SEISMIC_HISTORY_STRIDE_0 + h * SEISMIC_HISTORY_STRIDE_1];
+    const bool use_counts = penalized && slice_len <= COUNT_CAP;
+    if (use_counts) {
+        for (u64 i = threadIdx.x; i < slice_len; i += blockDim.x)
+            counts[i] = 0u;
+        __syncthreads();
+        for (u64 h = threadIdx.x; h < SEISMIC_DIM_HN; h += blockDim.x) {
+            const int tok = history[row * SEISMIC_HISTORY_STRIDE_0 + h * SEISMIC_HISTORY_STRIDE_1];
+            if (tok >= 0) {
+                const u64 u = (u64)tok;
+                if (u >= begin && u < end)
+                    atomicAdd(&counts[(u32)(u - begin)], 1u);
+            }
+        }
         __syncthreads();
     }
     // A constrained row removes every rejected value but NaN and +inf, which
@@ -109,14 +124,19 @@ extern "C" __global__ void shape_rows_prepare(SEISMIC_KERNEL_PARAMS) {
     const bool scale_temp = temperature != 0.0f && temperature != 1.0f;
     const bool write_back = penalized || masked || scale_temp;
     u32 maximum = 0u;
-    for (u64 token = slice_begin(part) + threadIdx.x; token < slice_end(part); token += blockDim.x) {
+    for (u64 token = begin + threadIdx.x; token < end; token += blockDim.x) {
         const u64 slot = row * SEISMIC_LOGITS_STRIDE_0 + token * SEISMIC_LOGITS_STRIDE_1;
         float value = logits.at(slot);
         if (penalized) {
-            int count = 0;
-            for (u64 h = 0; h < SEISMIC_DIM_HN; ++h)
-                count += recent[h] == (int)token ? 1 : 0;
-            if (count > 0) {
+            u32 count = 0u;
+            if (use_counts) {
+                count = counts[(u32)(token - begin)];
+            } else {
+                for (u64 h = 0; h < SEISMIC_DIM_HN; ++h)
+                    count += history[row * SEISMIC_HISTORY_STRIDE_0 + h * SEISMIC_HISTORY_STRIDE_1] == (int)token ? 1u
+                                                                                                                  : 0u;
+            }
+            if (count > 0u) {
                 value = value < 0.0f ? value * repetition : value / repetition;
                 value = value - presence - frequency * (float)count;
             }
@@ -564,6 +584,8 @@ extern "C" __global__ void shape_rows_apply(SEISMIC_KERNEL_PARAMS) {
         return;
     const float maximum = order::value(selection.maximum);
     const float min_p = parameter(params, row, 3);
+    if (selection.top_k_key == 0u && !(min_p > 0.0f) && selection.top_p_mode == 0u)
+        return;
     for (u64 token = slice_begin(part) + threadIdx.x; token < slice_end(part); token += blockDim.x) {
         const u64 slot = row * SEISMIC_LOGITS_STRIDE_0 + token * SEISMIC_LOGITS_STRIDE_1;
         const float value = logits.at(slot);

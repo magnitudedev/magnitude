@@ -20,7 +20,7 @@
 
 use super::graph::{query_operand_dimensions, query_projection_dimensions};
 use crate::operators::scalar;
-use super::split::{IndexedReals, IndexedSource, both};
+use super::split::IndexedPart;
 use crate::CandidatePool;
 use crate::planning::axis;
 use crate::operators::InputForm;
@@ -212,10 +212,10 @@ pub(crate) enum Picks<'v> {
     Units(&'v WorkflowTensorView),
 }
 
-/// The extents of one class of the indexer `source`.
+/// The extents of one class of the indexer `indexed`.
 #[derive(Clone, Debug)]
 pub(crate) struct IndexerClass<'s> {
-    pub source: &'s IndexedSource<Dim>,
+    pub indexed: IndexedPart<'s>,
     pub rows: Dim,
     /// Spans per row of its lists (`R`).
     pub spans: Dim,
@@ -236,13 +236,14 @@ impl IndexerClass<'_> {
         rotary_adjacent: bool,
         rotary_trailing: bool,
     ) -> [(&'static str, Dim); 11] {
-        let (heads, width, pairs) = (&self.source.heads, &self.source.width, &self.rotary_pairs);
+        let source = self.indexed.source;
+        let (heads, width, pairs) = (&source.heads, &source.width, &self.rotary_pairs);
         [
             ("M", self.rows.clone()),
             ("H", heads.clone()),
             ("NQ", axis(query_norm)),
             ("HW", if head_weights { heads.clone() } else { Dim::from(0) }),
-            ("TB", self.source.plane.rows.clone()),
+            ("TB", source.plane.rows.clone()),
             ("R", self.spans.clone()),
             ("N", self.scores.clone()),
             ("P", pairs.clone()),
@@ -312,14 +313,15 @@ fn project<'a, G: GraphDraft + 'a>(
 pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     class: &IndexerClass<'_>,
-    reals: &IndexedReals<Argument<f64>>,
     entries: IndexerEntries<'a, G>,
     inputs: IndexerInputs<'_, 'a, G>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<Indexed, GraphError> {
-    let (rows, heads, width) = (&class.rows, &class.source.heads, &class.source.width);
+    let indexed = class.indexed;
+    let source = indexed.source;
+    let (rows, heads, width) = (&class.rows, &source.heads, &source.width);
     let pairs = &class.rotary_pairs;
-    let slab_rows = scalar::<u32>(&class.source.plane.slab_rows, "slab rows")?;
+    let slab_rows = scalar::<u32>(&source.plane.slab_rows, "slab rows")?;
     let rotary = [
         ("P", pairs.clone()),
         ("S", width - pairs * 2),
@@ -336,7 +338,7 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
     let [components, frequencies, amplitudes] = inputs.rotary;
     // The query heads' own norm (`[1, width]`) and its epsilon, or none
     // (zero rows of the absent F32 operand).
-    let (query_norm, query_epsilon) = match (reals.query_norm, inputs.query_norm) {
+    let (query_norm, query_epsilon) = match (indexed.query_norm, inputs.query_norm) {
         (Some(epsilon), Some(weight)) => (weight.clone(), epsilon.f32()),
         (None, None) => (
             GraphConstant::absent(graph, constants)?
@@ -348,14 +350,14 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
     };
     // The completed rows' keys, before any row scores them: an indexer
     // keeping its own writes them, one sharing them reads its owner's.
-    match (reals.key_norm, &inputs.write) {
+    match (indexed.key_norm, &inputs.write) {
         (Some(key_epsilon), Some(write)) => {
-            let rounding = RoundingArguments::of(both(&class.source.key_rounding, &reals.key_rounding, "indexer key rounding"))?;
+            let rounding = RoundingArguments::of(indexed.key_rounding)?;
             let key = project(graph, write.project, rows, width.clone(), &write.latent, &write.key, constants)?;
             graph.enqueue(
                 write.write,
                 &[
-                    [("M", rows.clone()), ("TB", class.source.plane.rows.clone())].as_slice(),
+                    [("M", rows.clone()), ("TB", source.plane.rows.clone())].as_slice(),
                     &rotary,
                 ]
                 .concat(),
@@ -401,15 +403,14 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
             .reshape(&[rows.clone(), Dim::from(0)]),
         _ => return Err("an indexer's head-weight projection and its inputs disagree".into()),
     };
-    let query_rounding =
-        RoundingArguments::of(both(&class.source.query_rounding, &reals.query_rounding, "indexer query rounding"))?;
+    let query_rounding = RoundingArguments::of(indexed.query_rounding)?;
     let scores = &class.scores;
     let score_slots = none.reshape(&[Dim::from(0), scores.clone()]);
     let score = graph
         .enqueue(
             entries.score,
             &class.score_dimensions(
-                reals.query_norm.is_some(),
+                indexed.query_norm.is_some(),
                 inputs.head_weights.is_some(),
                 inputs.rotary_adjacent,
                 inputs.rotary_trailing,
@@ -426,7 +427,7 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
                 spans: inputs.spans.into(),
                 score_slots: (&score_slots).into(),
                 form: (&form).into(),
-                scale: reals.scale.f32(),
+                scale: indexed.scale.f32(),
                 epsilon: query_epsilon,
                 block: query_rounding.block,
                 element: query_rounding.element,
@@ -436,7 +437,7 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    let top_slots = none.reshape(&[Dim::from(0), class.source.top.clone()]);
+    let top_slots = none.reshape(&[Dim::from(0), source.top.clone()]);
     let (list, list_spans) = match inputs.picks {
         Picks::Rows => (inputs.spans, class.spans.clone()),
         Picks::Units(units) => (units, Dim::from(1)),
@@ -448,7 +449,7 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
                 ("M", rows.clone()),
                 ("N", scores.clone()),
                 ("R", list_spans),
-                ("K", class.source.top.clone()),
+                ("K", source.top.clone()),
             ],
             rows_topk::WorkflowArgs {
                 scores: (&score).into(),

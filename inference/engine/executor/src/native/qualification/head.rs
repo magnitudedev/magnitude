@@ -4,7 +4,9 @@ use crate::ReadoutHead;
 
 impl<'a> QualificationView<'a> {
     pub(super) fn qualify_head(&self, charges: &seismic::Charges) -> Result<(), CatalogFailure> {
-        let (Some(head_plan), Some(head)) = (self.plan.head(), self.programs.head.as_ref()) else {
+        let (Some(head_plan), Some(AttestedDrafter::Head(head))) =
+            (self.plan.head(), self.programs.drafter.as_ref())
+        else {
             return Ok(());
         };
         let (hidden, vocabulary) = (self.geometry.hidden, self.geometry.vocabulary);

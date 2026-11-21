@@ -22,6 +22,7 @@ describe("model slot reconciliation", () => {
       preparation: {
         discovery: { complete: true, modelsFound: 1 },
         assessment: { complete: true, settledModels: 1, totalModels: 1 },
+        measurement: { _tag: "Measured" },
       },
       models: [{
         _tag: "Custom",
@@ -160,6 +161,7 @@ describe("model slot reconciliation", () => {
       preparation: {
         discovery: { complete: true, modelsFound: 0 },
         assessment: { complete: true, settledModels: 1, totalModels: 1 },
+        measurement: { _tag: "Measured" },
       },
       models: [{ _tag: "Catalog", modelId: catalogId, catalogData: { aliases: [alias] } }],
       unsupported: [],

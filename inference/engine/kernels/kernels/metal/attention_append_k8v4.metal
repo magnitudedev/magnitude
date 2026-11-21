@@ -36,9 +36,12 @@ kernel void attention_append_k8v4(
     typedef attention::lane_codes<ATTENTION_KEY_BITS> key_lane;
     typedef attention::lane_codes<ATTENTION_VALUE_BITS> value_lane;
     const ulong item = ulong(group.x) * 8 + simd;
-    const ulong row = item / KV;
-    const uint kv_head = uint(item % KV);
-    if (!ATTENTION_FRESH || row >= SEISMIC_DIM_M || destinations[row] < 0)
+    if (!ATTENTION_FRESH || item >= ulong(SEISMIC_DIM_M) * KV)
+        return;
+    const uint item32 = uint(item);
+    const uint row = item32 / KV;
+    const uint kv_head = item32 % KV;
+    if (destinations[row] < 0)
         return;
     const ulong destination = ulong(destinations[row]);
     const ulong slab_rows = ulong(SEISMIC_PARAM_SLAB_ROWS);

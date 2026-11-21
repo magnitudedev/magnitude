@@ -85,7 +85,7 @@ impl KeyRecords {
             })
             .expect("a completing step owns its key records");
         let placed = launch.placed();
-        let guessed = launch.front | launch.acceptable;
+        let guessed = launch.guessed.mask();
         let exact = |request| {
             placed
                 .iter()
@@ -163,7 +163,7 @@ impl RouteRecorder {
             })
             .collect();
         let rows = launch.placed().iter().map(|&(request, position)| (request.0, position)).collect();
-        recorded.steps.push(RoutedStep { sequence, rows, front: launch.front, choices, keys: keys.layers.clone() });
+        recorded.steps.push(RoutedStep { sequence, rows, front: launch.front(), choices, keys: keys.layers.clone() });
     }
 
     /// The verdicts of judged front rows.

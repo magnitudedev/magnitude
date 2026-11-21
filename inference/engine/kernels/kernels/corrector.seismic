@@ -151,20 +151,20 @@ fn corrector_nodes[S, J, K, H, TB](token: &tensor[S, J, K, H] f32, token_bias: &
                 result[row, mask, candidate] = value
     return result
 
-# GPU: one thread per element (Vulkan: a grid-stride loop, the x grid capped
-# at the 65535-group floor).
+# GPU: 4 elements per thread on a (column, node, slot) grid (Vulkan: a
+# grid-stride loop, the x grid capped at the 65535-group floor).
 native corrector_nodes for metal from "metal/corrector_nodes.metal":
     static (J, K, H, TB)
     where TB <= 1
     launch corrector_nodes:
-        threadgroups (ceil_div(S * J * K * H, 256), 1, 1)
+        threadgroups (ceil_div(H, 1024), J * K, S)
         threads_per_threadgroup (256, 1, 1)
 
 native corrector_nodes for cuda from "cuda/corrector_nodes.cu":
     static (J, K, H, TB)
     where TB <= 1
     launch corrector_nodes:
-        threadgroups (ceil_div(S * J * K * H, 256), 1, 1)
+        threadgroups (ceil_div(H, 1024), min(J * K, 65535), min(S, 65535))
         threads_per_threadgroup (256, 1, 1)
 
 native corrector_nodes for vulkan from "vulkan/corrector_nodes.comp":
@@ -258,18 +258,18 @@ fn corrector_factors[S, N, H](nodes: &tensor[S, N, H] A, anchor: &tensor[S, H] A
             result[block, node, 2] = x * a
     return result
 
-# GPU: one thread per element of the joined rows (Vulkan: a grid-stride
-# loop, the x grid capped at the 65535-group floor).
+# GPU: 4 elements per thread on a (column, node, block) grid (Vulkan: a
+# grid-stride loop, the x grid capped at the 65535-group floor).
 native corrector_factors for metal from "metal/corrector_factors.metal":
     static (N, H)
     launch corrector_factors:
-        threadgroups (ceil_div(S * N * H, 256), 1, 1)
+        threadgroups (ceil_div(H, 1024), N, S)
         threads_per_threadgroup (256, 1, 1)
 
 native corrector_factors for cuda from "cuda/corrector_factors.cu":
     static (N, H)
     launch corrector_factors:
-        threadgroups (ceil_div(S * N * H, 256), 1, 1)
+        threadgroups (ceil_div(H, 1024), min(N, 65535), min(S, 65535))
         threads_per_threadgroup (256, 1, 1)
 
 native corrector_factors for vulkan from "vulkan/corrector_factors.comp":

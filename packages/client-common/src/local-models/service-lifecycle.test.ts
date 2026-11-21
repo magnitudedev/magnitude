@@ -24,6 +24,7 @@ const localModelsState: LocalModelsState = {
   preparation: {
     discovery: { complete: true, modelsFound: 0 },
     assessment: { complete: true, settledModels: 0, totalModels: 0 },
+    measurement: { _tag: "Measured" },
   },
   models: [],
   unsupported: [],

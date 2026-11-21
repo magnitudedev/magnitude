@@ -21,12 +21,7 @@ extern "C" __global__ void stream_collapse(SEISMIC_KERNEL_PARAMS) {
 #pragma unroll
         for (unsigned stream = 0; stream < STREAMS; ++stream)
             ones[stream] = 1.0f;
-        streams::collapse<STREAMS>(hidden, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2, ones, out,
-                                   SEISMIC_RESULT_0_STRIDE_1, SEISMIC_DIM_H, threadIdx.x, blockDim.x);
-        // Each thread divides the columns it wrote.
-        for (unsigned column = threadIdx.x; column < SEISMIC_DIM_H; column += blockDim.x) {
-            const u64 at = (u64)column * SEISMIC_RESULT_0_STRIDE_1;
-            out.put(at, __fdiv_rn(out.at(at), float(STREAMS)));
-        }
+        streams::collapse<STREAMS, true>(hidden, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2, ones, out,
+                                         SEISMIC_RESULT_0_STRIDE_1, SEISMIC_DIM_H, threadIdx.x, blockDim.x);
     }
 }

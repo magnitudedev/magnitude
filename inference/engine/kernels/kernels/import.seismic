@@ -14,16 +14,19 @@ fn import_dense[B, N, K](source: &tensor[B, N, K] E) -> tensor[B, N, K] U:
                 destination[b, n, k] = f32(source[b, n, k])
     return destination
 
+# Metal: four elements per thread along K, one 3D grid over (K/4, N, B).
 native import_dense for metal from "metal/import_dense.metal":
     records (result 0)
     launch import_dense:
-        threadgroups (ceil_div(B * N * K, 256), 1, 1)
+        threadgroups (ceil_div(ceil_div(K, 4), 256), N, B)
         threads_per_threadgroup (256, 1, 1)
 
+# CUDA: four elements per thread along K, with grid-stride loops over y and z
+# because CUDA caps both grid dimensions at 65535 groups.
 native import_dense for cuda from "cuda/import_dense.cu":
     records (result 0)
     launch import_dense:
-        threadgroups (ceil_div(B * N * K, 256), 1, 1)
+        threadgroups (ceil_div(ceil_div(K, 4), 256), min(N, 65535), min(B, 65535))
         threads_per_threadgroup (256, 1, 1)
 
 

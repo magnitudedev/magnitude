@@ -239,18 +239,25 @@ impl Turnover {
     }
 
     /// A move at `clock`'s T; closes the epoch where it brings the running
-    /// moves to `records`. Returns the epoch now running. Panics where
+    /// moves to `records` on a non-empty running span (`running.steps > 0`).
+    /// Further moves before the next decode step belong to the step that just
+    /// closed `previous`, so they count into `previous.moves` rather than
+    /// closing a zero-step epoch. Returns the epoch now running. Panics where
     /// `records` is 0: a move fills a record.
     pub(crate) fn moved(&mut self, clock: &Clock, records: u64) -> u64 {
         assert!(records > 0, "a move into a tier of no records");
         let now = clock.through_latest();
-        let (epoch, since, running) = match self {
-            Self::Unturned { epoch, since, running } | Self::Turned { epoch, since, running, .. } => (*epoch, *since, running),
-        };
-        running.moves += 1;
-        if running.moves >= records {
-            let previous = Span { tokens: now.since(since).get(), steps: running.steps, moves: running.moves };
-            *self = Self::Turned { epoch: epoch + 1, previous, since: now, running: Counts::default() };
+        match self {
+            Self::Turned { previous, running, .. } if running.steps == 0 => {
+                previous.moves += 1;
+            }
+            Self::Unturned { epoch, since, running } | Self::Turned { epoch, since, running, .. } => {
+                running.moves += 1;
+                if running.moves >= records && running.steps > 0 {
+                    let previous = Span { tokens: now.since(*since).get(), steps: running.steps, moves: running.moves };
+                    *self = Self::Turned { epoch: *epoch + 1, previous, since: now, running: Counts::default() };
+                }
+            }
         }
         self.epoch()
     }
@@ -810,5 +817,41 @@ mod tests {
         assert_eq!(hold.expected(tokens(105.0)), Held::Tokens(tokens(50.0)), "the open hold lengthens it: (40 + 60)/2");
         assert!(hold.pays(tokens(105.0), 0.5, 25.0), "0.5 a token over 50 repays 25");
         assert!(!hold.pays(tokens(105.0), 0.5, 26.0));
+    }
+
+    #[test]
+    fn many_moves_in_one_step_never_clear_window_or_close_zero_step_epoch() {
+        const K: u64 = 2;
+        let time = Time::new(&[vec![K]], 8);
+        let mut times = time.lock();
+        // Moves before any decode step never close an epoch or produce a window.
+        for _ in 0..5 {
+            times.moved(0, Tier::Compute);
+        }
+        assert_eq!(times.group_epoch(0), 0);
+        assert_eq!(times.tokens_per_step(0), None);
+        assert_eq!(times.horizon(0, Tier::Compute, Reader::Move), None);
+
+        // Step 1 with > 2K moves after a resize: turns once, keeps ā = 1.0,
+        // and attributes all moves of the step to its closed span.
+        times.register(1, front());
+        times.resized(0, Tier::Compute, K);
+        let after_resize = times.group_epoch(0);
+        for _ in 0..7 {
+            times.moved(0, Tier::Compute);
+        }
+        assert_eq!(times.group_epoch(0), after_resize + 1, "at most one epoch closes per step");
+        assert_eq!(times.tokens_per_step(0), Some(1.0));
+        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Observe), Horizon::Tokens(tokens(2.0 / 7.0)));
+        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Move), Horizon::Tokens(tokens(2.0 / 8.0)));
+
+        // Step 2 with another 7 moves: turns once more with the exact 7 moves/token rate.
+        times.register(2, front());
+        for _ in 0..7 {
+            times.moved(0, Tier::Compute);
+        }
+        assert_eq!(times.group_epoch(0), after_resize + 2);
+        assert_eq!(times.tokens_per_step(0), Some(1.0));
+        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Observe), Horizon::Tokens(tokens(2.0 / 7.0)));
     }
 }

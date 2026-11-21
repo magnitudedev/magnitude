@@ -1,6 +1,6 @@
-// corrector_nodes: one thread per element (slot s, mask row j, candidate k,
-// column): the sum of its token, pass, feature, slot and rank rows with their
-// biases, in the portable body's order.
+// corrector_nodes: 4 elements per thread (slot s, mask row j, candidate k,
+// column) on a (column, node, slot) grid: the sum of its token, pass, feature,
+// slot and rank rows with their biases, in the portable body's order.
 #include <seismic/element.h>
 
 kernel void corrector_nodes(
@@ -14,25 +14,56 @@ kernel void corrector_nodes(
     device const float *rank_rows [[buffer(SEISMIC_BUFFER_RANK)]],
     SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
-    uint index [[thread_position_in_grid]]) {
+    uint3 position [[thread_position_in_grid]]) {
     const ulong rows = SEISMIC_DIM_J, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
-    const ulong element_index = ulong(index);
-    if (element_index >= ulong(SEISMIC_DIM_S) * rows * count * width)
+    const ulong col = ulong(position.x) * 4ul;
+    const ulong node = ulong(position.y);
+    const ulong slot = ulong(position.z);
+    if (col >= width || node >= rows * count || slot >= ulong(SEISMIC_DIM_S))
         return;
-    const ulong column = element_index % width, node = element_index / width;
-    const ulong candidate = node % count, mask = node / count % rows, slot = node / (rows * count);
-    float value = token[slot * SEISMIC_TOKEN_STRIDE_0 + mask * SEISMIC_TOKEN_STRIDE_1 +
-        candidate * SEISMIC_TOKEN_STRIDE_2 + column * SEISMIC_TOKEN_STRIDE_3];
-    value += pass[slot * SEISMIC_PASS_STRIDE_0 + mask * SEISMIC_PASS_STRIDE_1 + column * SEISMIC_PASS_STRIDE_2];
-    value += pass_bias[column * SEISMIC_PASS_BIAS_STRIDE_0];
-    value += feature[slot * SEISMIC_FEATURE_STRIDE_0 + mask * SEISMIC_FEATURE_STRIDE_1 +
-        candidate * SEISMIC_FEATURE_STRIDE_2 + column * SEISMIC_FEATURE_STRIDE_3];
-    value += feature_bias[column * SEISMIC_FEATURE_BIAS_STRIDE_0];
-    value += slot_rows[mask * SEISMIC_SLOT_STRIDE_0 + column * SEISMIC_SLOT_STRIDE_1];
-    value += rank_rows[candidate * SEISMIC_RANK_STRIDE_0 + column * SEISMIC_RANK_STRIDE_1];
-    if (SEISMIC_DIM_TB == 1)
-        value += token_bias[column * SEISMIC_TOKEN_BIAS_STRIDE_1];
-    element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(result_cells).put(slot * SEISMIC_RESULT_0_STRIDE_0 +
-        mask * SEISMIC_RESULT_0_STRIDE_1 + candidate * SEISMIC_RESULT_0_STRIDE_2 + column * SEISMIC_RESULT_0_STRIDE_3,
-        value);
+    const ulong mask = node / count;
+    const ulong candidate = node % count;
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> result(result_cells);
+    device const float *t_row =
+        token + slot * SEISMIC_TOKEN_STRIDE_0 + mask * SEISMIC_TOKEN_STRIDE_1 + candidate * SEISMIC_TOKEN_STRIDE_2;
+    device const float *p_row = pass + slot * SEISMIC_PASS_STRIDE_0 + mask * SEISMIC_PASS_STRIDE_1;
+    device const float *f_row = feature + slot * SEISMIC_FEATURE_STRIDE_0 + mask * SEISMIC_FEATURE_STRIDE_1 +
+                                candidate * SEISMIC_FEATURE_STRIDE_2;
+    device const float *s_row = slot_rows + mask * SEISMIC_SLOT_STRIDE_0;
+    device const float *r_row = rank_rows + candidate * SEISMIC_RANK_STRIDE_0;
+    const ulong out_base =
+        slot * SEISMIC_RESULT_0_STRIDE_0 + mask * SEISMIC_RESULT_0_STRIDE_1 + candidate * SEISMIC_RESULT_0_STRIDE_2;
+
+    const bool unit_strides = SEISMIC_TOKEN_STRIDE_3 == 1ul && SEISMIC_PASS_STRIDE_2 == 1ul &&
+                              SEISMIC_PASS_BIAS_STRIDE_0 == 1ul && SEISMIC_FEATURE_STRIDE_3 == 1ul &&
+                              SEISMIC_FEATURE_BIAS_STRIDE_0 == 1ul && SEISMIC_SLOT_STRIDE_1 == 1ul &&
+                              SEISMIC_RANK_STRIDE_1 == 1ul && SEISMIC_RESULT_0_STRIDE_3 == 1ul &&
+                              (SEISMIC_DIM_TB == 0 || SEISMIC_TOKEN_BIAS_STRIDE_1 == 1ul);
+
+    if (col + 4ul <= width && unit_strides) {
+        float4 value = float4(*reinterpret_cast<device const packed_float4 *>(t_row + col));
+        value += float4(*reinterpret_cast<device const packed_float4 *>(p_row + col));
+        value += float4(*reinterpret_cast<device const packed_float4 *>(pass_bias + col));
+        value += float4(*reinterpret_cast<device const packed_float4 *>(f_row + col));
+        value += float4(*reinterpret_cast<device const packed_float4 *>(feature_bias + col));
+        value += float4(*reinterpret_cast<device const packed_float4 *>(s_row + col));
+        value += float4(*reinterpret_cast<device const packed_float4 *>(r_row + col));
+        if (SEISMIC_DIM_TB == 1)
+            value += float4(*reinterpret_cast<device const packed_float4 *>(token_bias + col));
+        result.put4(out_base + col, value);
+    } else {
+        const ulong end = col + 4ul < width ? col + 4ul : width;
+        for (ulong c = col; c < end; ++c) {
+            float value = t_row[c * SEISMIC_TOKEN_STRIDE_3];
+            value += p_row[c * SEISMIC_PASS_STRIDE_2];
+            value += pass_bias[c * SEISMIC_PASS_BIAS_STRIDE_0];
+            value += f_row[c * SEISMIC_FEATURE_STRIDE_3];
+            value += feature_bias[c * SEISMIC_FEATURE_BIAS_STRIDE_0];
+            value += s_row[c * SEISMIC_SLOT_STRIDE_1];
+            value += r_row[c * SEISMIC_RANK_STRIDE_1];
+            if (SEISMIC_DIM_TB == 1)
+                value += token_bias[c * SEISMIC_TOKEN_BIAS_STRIDE_1];
+            result.put(out_base + c * SEISMIC_RESULT_0_STRIDE_3, value);
+        }
+    }
 }

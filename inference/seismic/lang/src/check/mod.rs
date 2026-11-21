@@ -1653,31 +1653,35 @@ fn check_native(
         &folded
     };
 
-    // Every default reads only the device, the static dimensions and the
-    // bound elements, and `least`/`greatest` the parameter itself; a default
-    // that reads no dimension and no element is checked here on every
-    // device of the backend.
+    // Every default reads only the device, the static dimensions, the
+    // bound elements, and earlier already-declared parameters in scope (plus
+    // the parameter itself for `least`/`greatest`); a default that reads no
+    // dimension and no element is checked here on every device of the backend.
     let lowered_default = |param: &ast::NativeParamDecl,
                            values: &[u64],
+                           prior_params: &[(&str, &[u64])],
                            errors: &mut Vec<(Span, String)>|
      -> Option<crate::checked::NativeDefault> {
         let name = &param.name.name;
+        let prior_names: Vec<String> = prior_params.iter().map(|(n, _)| (*n).to_owned()).collect();
         let (expr, lowered) = match &param.default {
             ast::NativeDefaultDecl::Value(expr) => (
                 expr,
-                native_nat_expr(expr, &entry.dimensions, &[], native_reads)
+                native_nat_expr(expr, &entry.dimensions, &prior_names, native_reads)
                     .map(crate::checked::NativeDefault::Value)
                     .map_err(|message| (expr.span, message)),
             ),
             ast::NativeDefaultDecl::Least(expr) | ast::NativeDefaultDecl::Greatest(expr) => {
                 let least = matches!(param.default, ast::NativeDefaultDecl::Least(_));
+                let mut allowed = prior_names;
+                allowed.push(name.clone());
                 (
                     expr,
                     native_condition(
                         "default",
                         expr,
                         &entry.dimensions,
-                        std::slice::from_ref(name),
+                        &allowed,
                         native_reads,
                     )
                     .map(|condition| match least {
@@ -1705,35 +1709,39 @@ fn check_native(
             return None;
         }
         if dimensions.is_empty() && !element {
-            if let Err(error) = default.on_every_device(name, values, backend) {
+            if let Err(error) = default.on_every_device(name, values, backend, prior_params) {
                 errors.push((expr.span, error.to_string()));
                 return None;
             }
         }
         Some(default)
     };
-    let params = declared
-        .into_iter()
-        .filter_map(|(name, values)| {
-            let param = native
-                .params
-                .iter()
-                .find(|param| param.name.name == name)
-                .expect("every checked parameter is declared");
-            let default = lowered_default(param, &values, &mut errors)?;
-            Some(NativeParameter {
-                name,
-                // Derived from the source in `check_closed`, before the
-                // implementation is kept.
-                code: false,
-                arithmetic: param.arithmetic,
-                form: param.form,
-                values,
-                default,
-                role: crate::checked::NativeParameterRole::Declared,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut params = Vec::with_capacity(declared.len());
+    for (name, values) in declared {
+        let param = native
+            .params
+            .iter()
+            .find(|param| param.name.name == name)
+            .expect("every checked parameter is declared");
+        let prior: Vec<(&str, &[u64])> = params
+            .iter()
+            .map(|p: &NativeParameter| (p.name.as_str(), p.values.as_slice()))
+            .collect();
+        let Some(default) = lowered_default(param, &values, &prior, &mut errors) else {
+            continue;
+        };
+        params.push(NativeParameter {
+            name,
+            // Derived from the source in `check_closed`, before the
+            // implementation is kept.
+            code: false,
+            arithmetic: param.arithmetic,
+            form: param.form,
+            values,
+            default,
+            role: crate::checked::NativeParameterRole::Declared,
+        });
+    }
 
     let records = native_records(&native.records, contract, &mut errors);
 
@@ -2012,7 +2020,12 @@ fn check_native(
                     values.push(*value);
                 }
             }
-            let Some(default) = lowered_default(param, &values, &mut errors) else {
+            let prior: Vec<(&str, &[u64])> = params
+                .iter()
+                .chain(&launch_params)
+                .map(|p| (p.name.as_str(), p.values.as_slice()))
+                .collect();
+            let Some(default) = lowered_default(param, &values, &prior, &mut errors) else {
                 continue;
             };
             launch_params.push(NativeParameter {

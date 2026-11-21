@@ -146,13 +146,26 @@ template <uint B>
 inline void store(lane_encoding<B> encoding, device uint *row, element::Out<element::F16> coefficients,
     uint lane) {
     typedef lane_codes<B> codes;
-    if (codes::bits >= 32) {
-        ATTENTION_UNROLL
-        for (uint j = 0; j < codes::words; ++j)
-            row[lane * codes::words + j] = encoding.codes[j];
+    if constexpr (codes::bits >= 32) {
+        device uint *dst = row + lane * codes::words;
+        if constexpr (codes::words % 4 == 0) {
+            ATTENTION_UNROLL
+            for (uint j = 0; j < codes::words; j += 4)
+                *reinterpret_cast<device packed_uint4 *>(dst + j) =
+                    packed_uint4(encoding.codes[j], encoding.codes[j + 1], encoding.codes[j + 2], encoding.codes[j + 3]);
+        } else if constexpr (codes::words % 2 == 0) {
+            ATTENTION_UNROLL
+            for (uint j = 0; j < codes::words; j += 2)
+                *reinterpret_cast<device packed_uint2 *>(dst + j) =
+                    packed_uint2(encoding.codes[j], encoding.codes[j + 1]);
+        } else {
+            ATTENTION_UNROLL
+            for (uint j = 0; j < codes::words; ++j)
+                dst[j] = encoding.codes[j];
+        }
     } else {
         // 32 / bits neighbouring lanes share a word: join their parts.
-        constexpr uint sharing = codes::bits >= 32 ? 1 : 32 / codes::bits;
+        constexpr uint sharing = 32 / codes::bits;
         uint joined = encoding.codes[0] << ((lane % sharing) * codes::bits);
         ATTENTION_UNROLL
         for (uint offset = 1; offset < sharing; offset *= 2)

@@ -177,9 +177,11 @@ impl Device {
         seismic_compiler::direct_launch::DirectLaunchContract {
             max_buffer_slots: None,
             max_grid: self.launch_limits.max_grid,
-            max_group_size: Some(self.launch_limits.max_block),
-            max_group_threads: Some(max_threads_per_block),
-            max_shared_bytes: Some(self.launch_limits.max_shared_bytes),
+            workgroup: seismic_compiler::direct_launch::WorkgroupContract::Dynamic {
+                max_size: self.launch_limits.max_block,
+                max_threads: max_threads_per_block,
+                max_shared_bytes: self.launch_limits.max_shared_bytes,
+            },
             max_param_bytes: Some(self.launch_limits.max_param_bytes),
         }
     }

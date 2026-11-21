@@ -742,7 +742,7 @@ impl Probes {
         Ok(Self {
             shape,
             stream,
-            host: (backend == BackendName::Cpu).then(host_readers),
+            host: (backend == BackendName::Cpu).then(|| host_readers(topology)),
             peaks: (
                 Ladder::of(backend, &line_f32::native_entry(), shape, Operand::F32)?,
                 Ladder::of(backend, &line_matrix::native_entry(), shape, Operand::Matrix)?,
@@ -868,8 +868,8 @@ impl MachineLine {
 /// (the performance cores the process may run on, within its quota), and one
 /// step more: every hardware thread where the pool has fewer, else twice the
 /// pool. None where the process may run on no performance core.
-pub(super) fn host_readers() -> Result<[u64; 2], ExecutorCostsError> {
-    let processors = seismic::discover_processors();
+pub(super) fn host_readers(topology: &DeviceTopology) -> Result<[u64; 2], ExecutorCostsError> {
+    let processors = &topology.host().processors;
     readers_among(processors.quota().get(), processors.performance_cores())
 }
 
@@ -1117,7 +1117,7 @@ mod tests {
         let time = |key: PointKey, timing| store.store(&key, &Record::Measured(timing)).unwrap();
         // The stream is the host's sweeps: at the pool's readers a span
         // read in 2 s beyond the sweep of none, at more readers in 3 s.
-        let [pool, wider] = host_readers().unwrap();
+        let [pool, wider] = host_readers(topology).unwrap();
         let span = MemoryCosts::span(topology);
         let sweeps = [(pool, 0), (pool, span), (wider, 0), (wider, span)]
             .map(|(readers, bytes)| sweep_key(topology, readers, span, bytes));

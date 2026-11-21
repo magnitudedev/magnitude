@@ -48,16 +48,65 @@ pub(super) struct Navigator {
 /// Persistent remaining search space, including unresolved subdivisions.
 /// Resuming a query never restarts rejected sampling.
 pub(super) struct WitnessCursor {
-    coarse: VecDeque<Vec<usize>>,
-    queued: HashSet<Vec<usize>>,
-    refinement: VecDeque<Cell>,
-    focused: VecDeque<Cell>,
-    focused_seen: HashSet<Cell>,
-    turn: u64,
+    mode: TraversalMode,
     visited: HashSet<Point>,
-    enumerate: Option<Vec<u64>>,
-    enumerate_done: bool,
-    alternate: bool,
+}
+
+enum TraversalMode {
+    /// Exhaustive lexicographic enumeration of a small finite domain.
+    /// `Some(next)` holds the next coordinate tuple to yield; `None` when exhausted.
+    Enumerate(Option<Vec<u64>>),
+    /// Broad-plus-refinement cell subdivision for larger domains.
+    Subdivide {
+        coarse: VecDeque<Vec<usize>>,
+        queued: HashSet<Vec<usize>>,
+        refinement: VecDeque<Cell>,
+        focused: VecDeque<Cell>,
+        focused_seen: HashSet<Cell>,
+        turn: u64,
+    },
+}
+
+enum TraversalStep {
+    Point(Point),
+    Skipped,
+    Exhausted,
+}
+
+impl WitnessCursor {
+    fn footprint(&self, axes: usize) -> usize {
+        let mode_entries = match &self.mode {
+            TraversalMode::Enumerate(_) => 0,
+            TraversalMode::Subdivide {
+                queued,
+                refinement,
+                focused,
+                focused_seen,
+                ..
+            } => queued
+                .len()
+                .saturating_add(refinement.len())
+                .saturating_add(focused.len())
+                .saturating_add(focused_seen.len()),
+        };
+        self.visited
+            .len()
+            .saturating_add(mode_entries)
+            .saturating_add(axes)
+            .saturating_add(2)
+    }
+
+    fn exhausted(&self) -> bool {
+        match &self.mode {
+            TraversalMode::Enumerate(next) => next.is_none(),
+            TraversalMode::Subdivide {
+                coarse,
+                refinement,
+                focused,
+                ..
+            } => coarse.is_empty() && refinement.is_empty() && focused.is_empty(),
+        }
+    }
 }
 
 /// Outcomes concern the remaining, unvisited search space. ProvenEmpty is
@@ -353,10 +402,6 @@ impl Navigator {
                 n.checked_mul(a.high.checked_sub(a.low)?.checked_add(1)?)
             })
             .filter(|n| *n <= 4096);
-        for axis in &mut axes {
-            axis.make_bands();
-        }
-        let initial = vec![0; axes.len()];
         let mut fixed = PartialAssignment::new();
         for (symbol, value) in domain.constants().bindings() {
             fixed.bind(*symbol, value.clone());
@@ -381,6 +426,22 @@ impl Navigator {
             matches!(axis.sort, SymbolSort::Nat | SymbolSort::Int)
                 && !rank_scoped.contains(&axis.symbol)
         });
+        let mode = if finite.is_some() {
+            TraversalMode::Enumerate(Some(axes.iter().map(|a| a.low).collect()))
+        } else {
+            for axis in &mut axes {
+                axis.make_bands();
+            }
+            let initial = vec![0; axes.len()];
+            TraversalMode::Subdivide {
+                coarse: VecDeque::from([initial.clone()]),
+                queued: HashSet::from([initial]),
+                refinement: VecDeque::new(),
+                focused: VecDeque::new(),
+                focused_seen: HashSet::new(),
+                turn: 0,
+            }
+        };
         Ok(Self {
             predicate,
             intervals,
@@ -389,16 +450,8 @@ impl Navigator {
             resource_limited: false,
             rank_limited,
             cursor: WitnessCursor {
-                enumerate: finite.map(|_| axes.iter().map(|a| a.low).collect()),
-                coarse: VecDeque::from([initial.clone()]),
-                queued: HashSet::from([initial]),
-                refinement: VecDeque::new(),
-                focused: VecDeque::new(),
-                focused_seen: HashSet::new(),
-                turn: 0,
+                mode,
                 visited: HashSet::new(),
-                enumerate_done: false,
-                alternate: false,
             },
             axes,
             unresolved: 0,
@@ -417,9 +470,14 @@ impl Navigator {
     /// Disagreement gives a region extra opportunities, without removing any
     /// broad-coverage cell or treating endpoint agreement as a proof.
     pub fn prioritize_between(&mut self, left: &Point, right: &Point) {
-        if self.cursor.enumerate.is_some() {
-            return;
-        }
+        let (focused, focused_seen) = match &mut self.cursor.mode {
+            TraversalMode::Enumerate(_) => return,
+            TraversalMode::Subdivide {
+                focused,
+                focused_seen,
+                ..
+            } => (focused, focused_seen),
+        };
         let cell = Cell {
             bounds: left
                 .0
@@ -431,10 +489,8 @@ impl Navigator {
         if cell.bounds.iter().all(|(lo, hi)| lo == hi) {
             return;
         }
-        if self.cursor.focused_seen.len() < self.resource_limit / 4
-            && self.cursor.focused_seen.insert(cell.clone())
-        {
-            self.cursor.focused.push_back(cell);
+        if focused_seen.len() < self.resource_limit / 4 && focused_seen.insert(cell.clone()) {
+            focused.push_back(cell);
         }
     }
 
@@ -446,8 +502,9 @@ impl Navigator {
         origin: &Point,
         eligibility: impl Fn(&InvocationValues) -> Option<bool>,
     ) {
-        if self.cursor.enumerate.is_some() {
-            return;
+        match &self.cursor.mode {
+            TraversalMode::Enumerate(_) => return,
+            TraversalMode::Subdivide { .. } => {}
         }
         let Some(origin_eligible) = eligibility(&self.values(origin)) else {
             return;
@@ -506,14 +563,24 @@ impl Navigator {
                     }
                 }
                 for point in [left, right] {
-                    let cell = Cell {
-                        bounds: point.0.iter().map(|v| (*v, *v)).collect(),
-                    };
-                    if !self.cursor.visited.contains(&point)
-                        && self.cursor.focused_seen.len() < self.resource_limit / 4
-                        && self.cursor.focused_seen.insert(cell.clone())
-                    {
-                        self.cursor.focused.push_front(cell);
+                    if !self.cursor.visited.contains(&point) {
+                        let cell = Cell {
+                            bounds: point.0.iter().map(|v| (*v, *v)).collect(),
+                        };
+                        match &mut self.cursor.mode {
+                            TraversalMode::Enumerate(_) => {}
+                            TraversalMode::Subdivide {
+                                focused,
+                                focused_seen,
+                                ..
+                            } => {
+                                if focused_seen.len() < self.resource_limit / 4
+                                    && focused_seen.insert(cell.clone())
+                                {
+                                    focused.push_front(cell);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -537,25 +604,35 @@ impl Navigator {
 
     fn search(&mut self, random: &mut Random, allowance: usize) -> Option<Point> {
         for _ in 0..allowance {
-            if self
-                .cursor
-                .visited
-                .len()
-                .saturating_add(self.cursor.queued.len())
-                .saturating_add(self.cursor.refinement.len())
-                .saturating_add(self.cursor.focused.len())
-                .saturating_add(self.cursor.focused_seen.len())
-                .saturating_add(self.axes.len())
-                .saturating_add(2)
-                > self.resource_limit
-            {
+            if self.cursor.footprint(self.axes.len()) > self.resource_limit {
                 self.resource_limited = true;
                 return None;
             }
-            let point = if let Some(cursor) = self.cursor.enumerate.as_mut() {
-                if self.cursor.enumerate_done {
-                    return None;
-                }
+            let point = match self.next_point(random) {
+                TraversalStep::Point(point) => point,
+                TraversalStep::Skipped => continue,
+                TraversalStep::Exhausted => return None,
+            };
+            if !self.cursor.visited.insert(point.clone()) {
+                continue;
+            }
+            let values = self.values(&point);
+            if self.predicate.evaluate(&values).unwrap_or(false) {
+                return Some(point);
+            }
+        }
+        if !self.exhausted() {
+            self.unresolved += 1;
+        }
+        None
+    }
+
+    fn next_point(&mut self, random: &mut Random) -> TraversalStep {
+        match &mut self.cursor.mode {
+            TraversalMode::Enumerate(next) => {
+                let Some(cursor) = next.as_mut() else {
+                    return TraversalStep::Exhausted;
+                };
                 let point = Point(cursor.clone());
                 let mut advanced = false;
                 for i in (0..cursor.len()).rev() {
@@ -568,40 +645,46 @@ impl Navigator {
                         break;
                     }
                 }
-                self.cursor.enumerate_done = !advanced;
-                point
-            } else {
-                self.cursor.alternate = !self.cursor.alternate;
-                self.cursor.turn += 1;
-                let mut cell = if self.cursor.turn % 3 == 0 && !self.cursor.focused.is_empty() {
-                    self.cursor.focused.pop_front()?
-                } else if self.cursor.alternate && !self.cursor.refinement.is_empty() {
-                    self.cursor.refinement.pop_front()?
-                } else if let Some(indices) = self.cursor.coarse.pop_front() {
+                if !advanced {
+                    *next = None;
+                }
+                TraversalStep::Point(point)
+            }
+            TraversalMode::Subdivide {
+                coarse,
+                queued,
+                refinement,
+                focused,
+                turn,
+                ..
+            } => {
+                *turn += 1;
+                let Some(mut cell) = (if *turn % 3 == 0 && !focused.is_empty() {
+                    focused.pop_front()
+                } else if *turn % 2 == 1 && !refinement.is_empty() {
+                    refinement.pop_front()
+                } else if let Some(indices) = coarse.pop_front() {
                     for i in 0..indices.len() {
                         let mut next = indices.clone();
                         next[i] += 1;
-                        if next[i] < self.axes[i].bands.len()
-                            && self.cursor.queued.insert(next.clone())
-                        {
-                            self.cursor.coarse.push_back(next);
+                        if next[i] < self.axes[i].bands.len() && queued.insert(next.clone()) {
+                            coarse.push_back(next);
                         }
                     }
-                    Cell {
+                    Some(Cell {
                         bounds: indices
                             .iter()
                             .zip(&self.axes)
                             .map(|(i, a)| a.bands[*i])
                             .collect(),
-                    }
+                    })
                 } else {
-                    self.cursor
-                        .refinement
-                        .pop_front()
-                        .or_else(|| self.cursor.focused.pop_front())?
+                    refinement.pop_front().or_else(|| focused.pop_front())
+                }) else {
+                    return TraversalStep::Exhausted;
                 };
                 if !self.intervals.contract(&self.axes, &mut cell) {
-                    continue;
+                    return TraversalStep::Skipped;
                 }
                 // Bind one coordinate at a time and propagate before drawing
                 // the next. Coupled equalities therefore construct witnesses
@@ -620,50 +703,37 @@ impl Navigator {
                         break;
                     }
                 }
-                let mut split = None;
-                let mut largest = 0.0;
+                let mut split: Option<(usize, u64, u64, f64)> = None;
                 for (index, &(low, high)) in cell.bounds.iter().enumerate() {
                     if low == high {
                         continue;
                     }
                     let span = self.axes[index].normalized_span(low, high);
-                    if split.is_none() || span > largest {
-                        largest = span;
-                        split = Some((index, low, high));
+                    if split.is_none_or(|(_, _, _, largest)| span > largest) {
+                        split = Some((index, low, high, span));
                     }
                 }
-                if let Some((axis, low, high)) = split {
+                if let Some((axis, low, high, _)) = split {
                     let mid = self.axes[axis].midpoint(low, high);
                     let mut left = cell.clone();
                     let mut right = cell;
                     left.bounds[axis] = (low, mid);
                     right.bounds[axis] = (mid + 1, high);
-                    self.cursor.refinement.push_back(left);
-                    self.cursor.refinement.push_back(right);
+                    refinement.push_back(left);
+                    refinement.push_back(right);
                 }
                 if !possible {
-                    continue;
+                    return TraversalStep::Skipped;
                 }
-                Point(proposal.bounds.into_iter().map(|(rank, _)| rank).collect())
-            };
-            if !self.cursor.visited.insert(point.clone()) {
-                continue;
-            }
-            let values = self.values(&point);
-            if self.predicate.evaluate(&values).unwrap_or(false) {
-                return Some(point);
+                TraversalStep::Point(Point(
+                    proposal.bounds.into_iter().map(|(rank, _)| rank).collect(),
+                ))
             }
         }
-        if !self.exhausted() {
-            self.unresolved += 1;
-        }
-        None
     }
+
     pub fn exhausted(&self) -> bool {
-        self.cursor.enumerate_done
-            || (self.cursor.coarse.is_empty()
-                && self.cursor.refinement.is_empty()
-                && self.cursor.focused.is_empty())
+        self.cursor.exhausted()
     }
     pub fn case<T: TargetFamily>(
         &self,
@@ -981,16 +1051,15 @@ mod tests {
             rank_limited: false,
             unresolved: 0,
             cursor: WitnessCursor {
-                coarse: VecDeque::new(),
-                queued: HashSet::new(),
-                refinement: VecDeque::from([Cell { bounds }]),
-                focused: VecDeque::new(),
-                focused_seen: HashSet::new(),
-                turn: 0,
+                mode: TraversalMode::Subdivide {
+                    coarse: VecDeque::new(),
+                    queued: HashSet::new(),
+                    refinement: VecDeque::from([Cell { bounds }]),
+                    focused: VecDeque::new(),
+                    focused_seen: HashSet::new(),
+                    turn: 0,
+                },
                 visited: HashSet::new(),
-                enumerate: None,
-                enumerate_done: false,
-                alternate: false,
             },
         }
     }
@@ -1017,7 +1086,10 @@ mod tests {
         let WitnessResult::Unresolved = nav.query(&mut random, 0) else {
             panic!("zero allowance is not proof of emptiness")
         };
-        assert_eq!(nav.cursor.refinement.len(), 1);
+        let TraversalMode::Subdivide { refinement, .. } = &nav.cursor.mode else {
+            panic!("expected subdivide traversal mode")
+        };
+        assert_eq!(refinement.len(), 1);
         let WitnessResult::Found(first) = nav.query(&mut random, 1) else {
             panic!("affine propagation should construct a witness")
         };
@@ -1092,20 +1164,45 @@ mod tests {
             Some(SymbolValue::Nat(v)) => Some(v < BigUint::from(64u32)),
             _ => None,
         });
-        assert!(nav
-            .cursor
-            .focused
-            .iter()
-            .any(|cell| cell.bounds == vec![(63, 63)]));
-        assert!(nav
-            .cursor
-            .focused
-            .iter()
-            .any(|cell| cell.bounds == vec![(64, 64)]));
-        assert_eq!(
-            nav.cursor.refinement.front().unwrap().bounds,
-            vec![(1, 256)]
+        let TraversalMode::Subdivide {
+            focused,
+            refinement,
+            ..
+        } = &nav.cursor.mode
+        else {
+            panic!("expected subdivide traversal mode")
+        };
+        assert!(focused.iter().any(|cell| cell.bounds == vec![(63, 63)]));
+        assert!(focused.iter().any(|cell| cell.bounds == vec![(64, 64)]));
+        assert_eq!(refinement.front().unwrap().bounds, vec![(1, 256)]);
+    }
+    #[test]
+    fn enumerate_mode_exhausts_finite_domain_and_ignores_focus_hints() {
+        let mut arena = ExprArena::new();
+        let (_, symbol) = arena.target_constant(SymbolSort::Nat);
+        let x = arena.nat_symbol(symbol);
+        let two = arena.nat(2);
+        let predicate = arena.nat_cmp(CmpOp::Le, x, two);
+        let mut nav = test_navigator(
+            &arena,
+            predicate,
+            vec![Axis::new(symbol, SymbolSort::Nat)],
+            vec![(0, 2)],
         );
+        nav.cursor.mode = TraversalMode::Enumerate(Some(vec![0]));
+        nav.prioritize_between(&Point(vec![0]), &Point(vec![2]));
+        nav.prioritize_boundary(&Point(vec![0]), |_| Some(true));
+        let mut random = Random(7);
+        let mut found = Vec::new();
+        while let WitnessResult::Found(point) = nav.query(&mut random, 1) {
+            found.push(point.0[0]);
+        }
+        assert_eq!(found, vec![0, 1, 2]);
+        assert!(nav.exhausted());
+        assert!(matches!(
+            nav.query(&mut random, 1),
+            WitnessResult::ProvenEmpty
+        ));
     }
     #[test]
     fn equal_parameters_share_one_axis_and_intersect_partial_scopes() {

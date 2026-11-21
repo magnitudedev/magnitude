@@ -14,6 +14,7 @@ export const localModelsFromCatalog = (catalog: ModelCatalogState): LocalModelsS
         preparation: {
           discovery: { complete: false, modelsFound: 0 },
           assessment: { complete: false, settledModels: 0, totalModels: 0 },
+          measurement: { _tag: "Unmeasured" },
         },
         models: [],
         unsupported: [],

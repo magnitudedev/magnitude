@@ -29,7 +29,7 @@ enum Mode<'a> {
     Prepare(&'a Device),
     /// A tuning count or census walks the program through its tuner; it
     /// forms nothing and every entry comes back `None`.
-    Count,
+    Count(seismic::device::DeviceProperties),
     /// A search's count: as a count, and it collects every entry without
     /// tuning parameters for the search to form ([`UntunedEntries`]).
     CountUntuned(&'a Device, UntunedEntries<'a>),
@@ -255,7 +255,7 @@ fn failure(entry: &'static str, bindings: &str, outcome: String) -> CatalogFailu
 /// site can fix; each dimension the implementation declares static must be
 /// among them, and a declared parameter among them is fixed at its value.
 fn domain_statics(
-    implementation: &NativeImplementation,
+    implementation: &seismic::OnDevice,
     entry: &'static str,
     bindings: &str,
     values: &[(&str, u64)],
@@ -310,8 +310,9 @@ pub(crate) fn entry_statics<E: Entry>(
     let implementation =
         seismic::generated::native_implementation_at::<E>(backend, entry.elements())
             .map_err(|error| failure(E::NAME, bindings, error.to_string()))?
-            .ok_or_else(|| failure(E::NAME, bindings, "native implementation absent".into()))?;
-    domain_statics(implementation, E::NAME, bindings, values)
+            .ok_or_else(|| failure(E::NAME, bindings, "native implementation absent".into()))?
+            .at_device(&seismic::device::BackendFloor(backend));
+    domain_statics(&implementation, E::NAME, bindings, values)
 }
 
 impl<'a> Specializer<'a> {
@@ -329,7 +330,7 @@ impl<'a> Specializer<'a> {
         Self {
             backend: device.backend(),
             tensor_operations: device.forms_tensor_operations(),
-            mode: Mode::Count,
+            mode: Mode::Count(*device.properties()),
         }
     }
 
@@ -358,7 +359,7 @@ impl<'a> Specializer<'a> {
     pub fn into_untuned(self) -> UntunedEntries<'a> {
         match self.mode {
             Mode::CountUntuned(_, untuned) => untuned,
-            Mode::Prepare(_) | Mode::Count | Mode::List(_) => {
+            Mode::Prepare(_) | Mode::Count(_) | Mode::List(_) => {
                 panic!("only a search's count collects untuned entries")
             }
         }
@@ -387,29 +388,38 @@ impl<'a> Specializer<'a> {
     pub fn into_requests(self) -> Vec<KernelRequest> {
         match self.mode {
             Mode::List(requests) => requests,
-            Mode::Prepare(_) | Mode::Count | Mode::CountUntuned(..) => {
+            Mode::Prepare(_) | Mode::Count(_) | Mode::CountUntuned(..) => {
                 panic!("only a listing names requests")
             }
         }
     }
 
-    /// `entry`'s implementation at its element bindings, whose
-    /// configurations its preparation forms.
+    /// `entry`'s implementation at its element bindings, bound to the target
+    /// device's properties (or the backend floor during device-less listing),
+    /// whose configurations its preparation forms.
     fn implementation<E: Entry>(
         &self,
         entry: &BoundEntry<E>,
         bindings: &str,
-    ) -> Result<&'static NativeImplementation, CatalogFailure> {
+    ) -> Result<seismic::OnDevice, CatalogFailure> {
         let implementation =
             seismic::generated::native_implementation_at::<E>(self.backend, entry.elements())
-                .map_err(|error| failure(E::NAME, bindings, error.to_string()))?;
-        Ok(implementation.unwrap_or_else(|| {
-            panic!(
-                "`{}` has no {} implementation, which the kernels crate's build rules out",
-                E::NAME,
-                self.backend.as_str()
-            )
-        }))
+                .map_err(|error| failure(E::NAME, bindings, error.to_string()))?
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{}` has no {} implementation, which the kernels crate's build rules out",
+                        E::NAME,
+                        self.backend.as_str()
+                    )
+                });
+        Ok(match &self.mode {
+            Mode::Prepare(device) | Mode::CountUntuned(device, _) => {
+                implementation.at_device(device.properties())
+            }
+            Mode::Count(properties) => implementation.at_device(properties),
+            Mode::List(_) => implementation
+                .at_device(&seismic::device::BackendFloor(self.backend)),
+        })
     }
 
     /// Prepare `entry` at `specialization`, or list it.
@@ -423,7 +433,7 @@ impl<'a> Specializer<'a> {
             Mode::Prepare(device) => prepare_program(device, entry, specialization)
                 .map(Some)
                 .map_err(|error| failure(E::NAME, bindings, error.to_string())),
-            Mode::Count | Mode::CountUntuned(..) => Ok(None),
+            Mode::Count(_) | Mode::CountUntuned(..) => Ok(None),
             Mode::List(requests) => {
                 requests.push(entry.request(self.backend, specialization));
                 Ok(None)
@@ -440,7 +450,32 @@ impl<'a> Specializer<'a> {
         entry: BoundEntry<E>,
     ) -> Result<Option<NativeKernel<E>>, CatalogFailure> {
         let implementation = self.implementation(&entry, bindings)?;
-        let specialization = domain_statics(implementation, E::NAME, bindings, values)?;
+        let specialization =
+            domain_statics(&implementation, E::NAME, bindings, values)?;
+        if let Mode::CountUntuned(device, untuned) = &mut self.mode {
+            untuned.add(*device, entry, bindings, specialization);
+            return Ok(None);
+        }
+        self.form(entry, bindings, &specialization)
+    }
+
+    /// Prepare an entry at its declared defaults, resolving any device-derived
+    /// parameter defaults on the opened device; `None` during a count or a
+    /// listing.
+    pub fn at_defaults<E: Entry>(
+        &mut self,
+        bindings: &str,
+        values: &[(&str, u64)],
+        entry: BoundEntry<E>,
+    ) -> Result<Option<NativeKernel<E>>, CatalogFailure> {
+        let implementation = self.implementation(&entry, bindings)?;
+        let statics = domain_statics(&implementation, E::NAME, bindings, values)?;
+        let specialization = match &self.mode {
+            Mode::Prepare(_) | Mode::CountUntuned(..) => implementation
+                .default_specialization(&statics)
+                .map_err(|error| failure(E::NAME, bindings, error.to_string()))?,
+            Mode::Count(_) | Mode::List(_) => statics,
+        };
         if let Mode::CountUntuned(device, untuned) = &mut self.mode {
             untuned.add(*device, entry, bindings, specialization);
             return Ok(None);
@@ -468,8 +503,8 @@ impl<'a> Specializer<'a> {
         case: &T,
     ) -> Result<NativeSpecialization, CatalogFailure> {
         let implementation = self.implementation(&case.entry(), &case.bindings())?;
-        let fixed = case_statics(&tuning.model(), case, implementation)?;
-        self.chosen(tuning, case, implementation, fixed)
+        let fixed = case_statics(&tuning.model(), case, &implementation)?;
+        self.chosen(tuning, case, implementation.implementation(), fixed)
     }
 
     /// [`Self::tuned`] of `case` at each range of the rows `served` that it
@@ -500,7 +535,11 @@ impl<'a> Specializer<'a> {
         case: T,
         prerequisite: P,
     ) -> Result<Option<RangedKernels<T::Entry>>, CatalogFailure> {
-        if !self.implementation(&case.entry(), &case.bindings())?.has_tuning_parameters() {
+        if !self
+            .implementation(&case.entry(), &case.bindings())?
+            .implementation()
+            .has_tuning_parameters()
+        {
             return self.tuned_ranges(tuning, served, case);
         }
         let ranges = self.partition(tuning, served, &prerequisite)?;
@@ -527,17 +566,23 @@ impl<'a> Specializer<'a> {
         case: &T,
     ) -> Result<Vec<Range<u64>>, CatalogFailure> {
         let implementation = self.implementation(&case.entry(), &case.bindings())?;
-        if !implementation.has_tuning_parameters() {
+        if !implementation.implementation().has_tuning_parameters() {
             return Ok(vec![served]);
         }
         let model = tuning.model();
-        let statics = case_statics(&model, case, implementation)?;
+        let statics = case_statics(&model, case, &implementation)?;
         let points = case
             .points(model.limits)
             .into_iter()
             .map(|point| point.rows)
             .collect::<Vec<_>>();
-        let mut cuts = row_cuts(implementation, &statics, case.row_dimension(), &served, &points);
+        let mut cuts = row_cuts(
+            &implementation,
+            &statics,
+            case.row_dimension(),
+            &served,
+            &points,
+        );
         cuts.extend_from_slice(case.row_regime_cuts());
         Ok(row_ranges(served, &cuts, &points))
     }
@@ -600,17 +645,17 @@ impl<'a> Specializer<'a> {
     ) -> Result<NativeSpecialization, CatalogFailure> {
         let bindings = case.bindings();
         let implementation = self.implementation(&case.entry(), &bindings)?;
-        if !implementation.has_tuning_parameters() {
+        if !implementation.implementation().has_tuning_parameters() {
             return self.specialization(tuning, case);
         }
-        let fixed = case_statics(&tuning.model(), case, implementation)?;
+        let fixed = case_statics(&tuning.model(), case, &implementation)?;
         let fixed = tuning.following(
             prerequisite,
             (<T::Entry as Entry>::NAME, &bindings),
-            implementation,
+            implementation.implementation(),
             fixed,
         )?;
-        self.chosen(tuning, case, implementation, fixed)
+        self.chosen(tuning, case, implementation.implementation(), fixed)
     }
 
     /// The specialization `case`'s entry is prepared at from `fixed`: tuned
@@ -661,7 +706,7 @@ impl<'a> Specializer<'a> {
 fn case_statics<T: EntryTuning>(
     model: &ModelInputs<'_>,
     case: &T,
-    implementation: &NativeImplementation,
+    implementation: &seismic::OnDevice,
 ) -> Result<NativeSpecialization, CatalogFailure> {
     let entry = <T::Entry as Entry>::NAME;
     let bindings = case.bindings();
@@ -684,8 +729,9 @@ fn unit_of<T: EntryTuning>(
         case.entry().elements(),
     )
     .map_err(|error| failure(entry, &bindings, error.to_string()))?
-    .ok_or_else(|| failure(entry, &bindings, "native implementation absent".into()))?;
-    let fixed = case_statics(model, case, implementation)?;
+    .ok_or_else(|| failure(entry, &bindings, "native implementation absent".into()))?
+    .at_device(device.properties());
+    let fixed = case_statics(model, case, &implementation)?;
     Ok(super::tuning::unit_key(entry, bindings, &fixed))
 }
 
@@ -776,7 +822,8 @@ mod tests {
         let implementation =
             seismic::generated::native_implementation::<routed_output::Entry>(&device)
                 .unwrap()
-                .unwrap();
+                .unwrap()
+                .at_device(device.properties());
         let values = [
             ("H", 256),
             ("SN", 1),
@@ -820,5 +867,153 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// Preparation's `domain_statics`, `default_specialization`, and `row_cuts`
+    /// must bind device properties before evaluating any `where` clause or
+    /// default expression: `attention_prefill` (including the W=512 BF16
+    /// M=1..9 shape), `dense_output`, `routed_expand`, `stream_mix_sinkhorn`,
+    /// and `sample_rows` must succeed with zero `Unbound("device.*")` errors
+    /// on both CUDA and Metal.
+    #[test]
+    fn device_dependent_entries_pass_domain_statics_and_row_cuts_with_zero_unbound_errors() {
+        use magnitude_kernels::{
+            attention_prefill, dense_output, routed_expand, sample_rows, stream_mix_sinkhorn,
+        };
+        use seismic::Element;
+
+        let bf16 = Element::bf16();
+        let prefill_values = [
+            ("KV", 8),
+            ("G", 4),
+            ("P", 256),
+            ("S", 0),
+            ("I", 0),
+            ("U", 0),
+            ("F", 1),
+            ("NQ", 1),
+            ("N", 1),
+            ("NV", 0),
+            ("B", 0),
+            ("BR", 1),
+            ("SK", 0),
+            ("RA", 0),
+            ("RT", 0),
+            ("RO", 0),
+            ("VK", 0),
+            ("KR", 0),
+            ("AB", 0),
+            ("KS", 0),
+        ];
+
+        for backend in [BackendName::Cuda, BackendName::Metal] {
+            let floor = seismic::device::BackendFloor(backend);
+
+            // 1. attention_prefill with W=2*P+S=512, A=bf16, M=1..9
+            let prefill_impl = seismic::generated::native_implementation_at::<
+                attention_prefill::Entry,
+            >(backend, &[("A", bf16)])
+            .unwrap()
+            .unwrap()
+            .at_device(&floor);
+            let prefill_statics = domain_statics(
+                &prefill_impl,
+                "attention_prefill",
+                "A=bf16,M=1..9",
+                &prefill_values,
+            )
+            .unwrap_or_else(|e| panic!("attention_prefill domain_statics on {backend:?}: {e:?}"));
+            prefill_impl
+                .default_specialization(&prefill_statics)
+                .unwrap_or_else(|e| {
+                    panic!("attention_prefill default_specialization on {backend:?}: {e:?}")
+                });
+            let _ = row_cuts(
+                &prefill_impl,
+                &prefill_statics,
+                "M",
+                &(1..10),
+                &[1, 2, 4, 8],
+            );
+
+            // 2. dense_output
+            let dense_impl = seismic::generated::native_implementation_at::<dense_output::Entry>(
+                backend,
+                &[("A", bf16), ("DW", bf16)],
+            )
+            .unwrap()
+            .unwrap()
+            .at_device(&floor);
+            let dense_statics = domain_statics(
+                &dense_impl,
+                "dense_output",
+                "A=bf16,DW=bf16",
+                &[("H", 2048), ("F", 5632), ("DS", 0), ("DB", 0)],
+            )
+            .unwrap_or_else(|e| panic!("dense_output domain_statics on {backend:?}: {e:?}"));
+            dense_impl
+                .default_specialization(&dense_statics)
+                .unwrap_or_else(|e| {
+                    panic!("dense_output default_specialization on {backend:?}: {e:?}")
+                });
+
+            // 3. routed_expand
+            let routed_impl = seismic::generated::native_implementation_at::<routed_expand::Entry>(
+                backend,
+                &[("A", bf16), ("EGW", bf16), ("EUW", bf16), ("SGW", bf16), ("SUW", bf16)],
+            )
+            .unwrap()
+            .unwrap()
+            .at_device(&floor);
+            let routed_statics = domain_statics(
+                &routed_impl,
+                "routed_expand",
+                "A=bf16",
+                &[("H", 2048), ("E", 64), ("K", 8), ("F", 1536), ("S", 0), ("GS", 0), ("US", 0)],
+            )
+            .unwrap_or_else(|e| panic!("routed_expand domain_statics on {backend:?}: {e:?}"));
+            routed_impl
+                .default_specialization(&routed_statics)
+                .unwrap_or_else(|e| {
+                    panic!("routed_expand default_specialization on {backend:?}: {e:?}")
+                });
+
+            // 4. stream_mix_sinkhorn
+            let stream_impl =
+                seismic::generated::native_implementation_at::<stream_mix_sinkhorn::Entry>(
+                    backend,
+                    &[],
+                )
+                .unwrap()
+                .unwrap()
+                .at_device(&floor);
+            let stream_statics = domain_statics(
+                &stream_impl,
+                "stream_mix_sinkhorn",
+                "",
+                &[("H", 2048), ("S", 4), ("P", 4)],
+            )
+            .unwrap_or_else(|e| panic!("stream_mix_sinkhorn domain_statics on {backend:?}: {e:?}"));
+            stream_impl
+                .default_specialization(&stream_statics)
+                .unwrap_or_else(|e| {
+                    panic!("stream_mix_sinkhorn default_specialization on {backend:?}: {e:?}")
+                });
+
+            // 5. sample_rows
+            let sample_impl =
+                seismic::generated::native_implementation_at::<sample_rows::Entry>(backend, &[])
+                    .unwrap()
+                    .unwrap()
+                    .at_device(&floor);
+            let sample_statics =
+                domain_statics(&sample_impl, "sample_rows", "", &[("V", 151_936)])
+                    .unwrap_or_else(|e| panic!("sample_rows domain_statics on {backend:?}: {e:?}"));
+            sample_impl
+                .default_specialization(&sample_statics)
+                .unwrap_or_else(|e| {
+                    panic!("sample_rows default_specialization on {backend:?}: {e:?}")
+                });
+        }
     }
 }

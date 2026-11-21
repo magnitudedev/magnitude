@@ -182,13 +182,26 @@ template <typename E> struct Out {
     Out offset(ulong elements) const { return Out(cells + elements); }
     // Moves `count` elements of `from`, which the owner stored, to `index` without decoding.
     void move_stored(ulong index, Out from, ulong from_index, ulong count) const {
-        for (ulong i = 0; i < count; ++i)
-            cells[index + i].stored = from.cells[from_index + i].stored;
+        copy_stored(index, reinterpret_cast<device const typename E::storage *>(from.cells), from_index, count);
     }
     // Copies `count` elements of `from`, already stored in E, to `index` without decoding.
     void copy_stored(ulong index, device const typename E::storage *from, ulong from_index, ulong count) const {
+        device typename E::storage *dst = reinterpret_cast<device typename E::storage *>(cells) + index;
+        device const typename E::storage *src = from + from_index;
+        const ulong bytes = count * E::bytes;
+        if (bytes >= 16ul && ((ulong(dst) | ulong(src)) & 15ul) == 0ul) {
+            const ulong vectors = bytes / 16ul;
+            device uint4 *dst4 = reinterpret_cast<device uint4 *>(dst);
+            device const uint4 *src4 = reinterpret_cast<device const uint4 *>(src);
+            for (ulong i = 0; i < vectors; ++i)
+                dst4[i] = src4[i];
+            const ulong copied = vectors * (16ul / E::bytes);
+            for (ulong i = copied; i < count; ++i)
+                dst[i] = src[i];
+            return;
+        }
         for (ulong i = 0; i < count; ++i)
-            cells[index + i].stored = from[from_index + i];
+            dst[i] = src[i];
     }
 
 private:

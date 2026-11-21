@@ -86,6 +86,9 @@ pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<(CudaReport, Option<Pc
                 host_node: HostNode::Any,
                 memory,
                 kinds: kinds(),
+                properties: Some(seismic_lang::device::DeviceProperties::Cuda(
+                    descriptor.properties,
+                )),
             },
             Some(PciLocation { domain, bus, device }),
         ));

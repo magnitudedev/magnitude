@@ -29,12 +29,15 @@ use super::client::{handshake, receive, Lost};
 use super::protocol::{EngineBuild, HostMessage, WorkerMessage};
 use super::transport::{HostTransport, MessageSender};
 use super::{Held, Served, WorkerExit};
-use magnitude_executor::assessment::{requests, CostWalk, ExecutorCosts, PointRequests, StoredCosts};
+use magnitude_executor::assessment::{
+    requests, CostWalk, ExecutorCosts, MeasurementPhase, PointRequest, PointRequests, StoredCosts, Whose,
+};
 use magnitude_executor::KernelCache;
 use seismic::measure::{Attempt, JsonFileStore, Outcome, Reason, Record, RecordStore, StoreError};
 use seismic::{Devices, KernelIdentity, Measurer, PointKey};
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -124,6 +127,16 @@ pub struct MeasureRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeasureJob(pub u64);
 
+pub use magnitude_executor::assessment::MeasurementPhase as EngineMeasurementPhase;
+
+/// Standing hardware benchmark progress reported while a measurement job runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasurementProgress {
+    pub completed: u32,
+    pub total: u32,
+    pub phase: MeasurementPhase,
+}
+
 /// What a running job reports as it goes, in order.
 #[derive(Clone, Debug, PartialEq)]
 pub enum MeasureEvent {
@@ -134,6 +147,8 @@ pub enum MeasureEvent {
     /// point's attempt counts, as it is the machine's present state rather
     /// than a point's; its host keeps account of it.
     Opened,
+    /// Standing benchmark progress advanced (point completed or phase changed).
+    Progress(MeasurementProgress),
     /// It stored the point's record.
     Recorded(PointKey, Record),
 }
@@ -333,6 +348,7 @@ pub fn report_measurement(
             let message = match event {
                 MeasureEvent::Attempting(key) => WorkerMessage::Attempting { key },
                 MeasureEvent::Opened => WorkerMessage::Opened,
+                MeasureEvent::Progress(progress) => WorkerMessage::MeasureProgress { progress },
                 MeasureEvent::Recorded(key, record) => WorkerMessage::Recorded { key, record },
             };
             lost = sender.send(message).err().map(|error| error.to_string());
@@ -679,18 +695,49 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
         magnitude_executor::SEARCH_SETTINGS.error_rate,
         magnitude_executor::MIN_SAMPLE_SECONDS,
     );
-    // Reports attempts and records as the walk goes; a RefCell as both the
-    // attempting and the visiting closures report.
+    // Reports attempts, progress, and records as the walk goes; a RefCell as the request,
+    // attempting, and visiting closures all report.
     let report = RefCell::new(report);
+    let total_standing = u32::try_from(requests::standing_points(topology, executor, &outstanding.standing))
+        .unwrap_or(u32::MAX);
+    let current_request: RefCell<Option<(Whose, PointRequest)>> = RefCell::new(None);
+    let seen_standing: RefCell<HashSet<PointKey>> = RefCell::new(HashSet::new());
+    let phase = Cell::new(MeasurementPhase::Baseline);
+    let last_reported: Cell<Option<MeasurementProgress>> = Cell::new(None);
+    let emit_progress = |completed: u32, next_phase: MeasurementPhase| {
+        if total_standing == 0 {
+            return;
+        }
+        let clamped = completed.min(total_standing);
+        let monotonic_phase = phase.get().max(next_phase);
+        phase.set(monotonic_phase);
+        let progress = MeasurementProgress {
+            completed: clamped,
+            total: total_standing,
+            phase: monotonic_phase,
+        };
+        if last_reported.get() != Some(progress) {
+            last_reported.set(Some(progress));
+            (report.borrow_mut())(MeasureEvent::Progress(progress));
+        }
+    };
+    emit_progress(0, MeasurementPhase::Baseline);
     let mut failures = probing;
     // The job's process opened its device on tallies of its own
     // (`Devices::open_with`): every byte it allocates is the job's.
-    let measured = requests::measure(
+    let measured = requests::measure_observed(
         &mut measurer,
         &seismic::Charges::tally(&device),
         &records,
         &outstanding,
         deadlines,
+        &mut |whose, req| {
+            *current_request.borrow_mut() = Some((whose, req.clone()));
+            if whose == Whose::Standing {
+                let completed = u32::try_from(seen_standing.borrow().len()).unwrap_or(u32::MAX);
+                emit_progress(completed, requests::request_phase(req));
+            }
+        },
         &mut |key| {
             // A point that ended two jobs is not timed again; the measurer
             // records it unobtainable with this reason.
@@ -698,6 +745,15 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
                 Ok(Some(reason)) => return Attempt::Skip(Reason::new(reason)),
                 Ok(None) => {}
                 Err(error) => unrecorded.borrow_mut().push(error),
+            }
+            let next_phase = current_request
+                .borrow()
+                .as_ref()
+                .filter(|(whose, _)| *whose == Whose::Standing)
+                .map(|(_, req)| requests::phase_of(req, key));
+            if let Some(next_phase) = next_phase {
+                let completed = u32::try_from(seen_standing.borrow().len()).unwrap_or(u32::MAX);
+                emit_progress(completed, next_phase);
             }
             // Reported before it is recorded, so a host that kills the job
             // knows every attempt the job may have counted.
@@ -708,6 +764,27 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
             Attempt::Proceed
         },
         &mut |key, outcome| {
+            let is_standing = current_request
+                .borrow()
+                .as_ref()
+                .is_some_and(|(whose, _)| *whose == Whose::Standing);
+            // Only advance the displayed phase for points actually measured now; already-cached
+            // `Costs(Required)` points revisited as `Loaded` during `Costs(Whole)` must not jump
+            // the phase ahead to `LongContextAttention`.
+            let measured_phase = (!matches!(outcome, Outcome::Loaded(_)))
+                .then(|| {
+                    current_request
+                        .borrow()
+                        .as_ref()
+                        .filter(|(whose, _)| *whose == Whose::Standing)
+                        .map(|(_, req)| requests::phase_of(req, &key))
+                })
+                .flatten();
+            let resolved_standing = is_standing
+                && matches!(
+                    outcome,
+                    Outcome::Loaded(_) | Outcome::Measured(_) | Outcome::Skipped(_) | Outcome::Unformed(_)
+                );
             let record = match outcome {
                 Outcome::Loaded(_) => None,
                 Outcome::Measured(timing) => Some(Record::Measured(timing)),
@@ -755,6 +832,14 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
             };
             if let Err(error) = markers.resolved(&key) {
                 unrecorded.borrow_mut().push(error);
+            }
+            if resolved_standing {
+                let inserted = seen_standing.borrow_mut().insert(key.clone());
+                let completed = u32::try_from(seen_standing.borrow().len()).unwrap_or(u32::MAX);
+                let next_phase = measured_phase.unwrap_or_else(|| phase.get());
+                if inserted || next_phase > phase.get() {
+                    emit_progress(completed, next_phase);
+                }
             }
             if let Some(record) = record {
                 (report.borrow_mut())(MeasureEvent::Recorded(key, record));
@@ -835,9 +920,12 @@ fn observed(
                 opened = true;
                 report(MeasureEvent::Opened);
             }
+            WorkerMessage::MeasureProgress { progress } if opened => report(MeasureEvent::Progress(progress)),
             WorkerMessage::Attempting { key } if opened => report(MeasureEvent::Attempting(key)),
             WorkerMessage::Recorded { key, record } if opened => report(MeasureEvent::Recorded(key, record)),
-            WorkerMessage::Attempting { .. } | WorkerMessage::Recorded { .. } => {
+            WorkerMessage::Attempting { .. }
+            | WorkerMessage::MeasureProgress { .. }
+            | WorkerMessage::Recorded { .. } => {
                 return Err(JobLost("a point was reported before the device opened".into()))
             }
             WorkerMessage::MeasureFinished { failures } => return Ok(failures),

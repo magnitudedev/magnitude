@@ -23,7 +23,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tower::ServiceExt;
 
-use crate::chat::{ChatCompletionRequest, adapt_request, validate_request};
+use crate::chat::{
+    ChatCompletionRequest, ChatDelivery, StreamPlan, adapt_request, validate_request,
+};
 use crate::error::{ModelUnavailable, ServingError};
 use crate::source::{
     GenerationEvent, GenerationStream, HostChat, LoadProgress, ModelInvocation, ModelLoadProgress,
@@ -1334,8 +1336,14 @@ fn maps_the_complete_chat_request_contract() {
         "timings_per_token": true
     })))
     .unwrap();
-    assert!(adapted.include_usage);
-    assert!(adapted.timings_per_token);
+    assert_eq!(
+        adapted.delivery,
+        ChatDelivery::Stream(StreamPlan {
+            include_progress: false,
+            timings_per_token: true,
+            include_usage: true,
+        })
+    );
     let request = adapted.request;
     assert_eq!(request.input.conversation.system(), Some("system"));
     assert_eq!(request.input.conversation.entries().len(), 2);
@@ -1383,7 +1391,14 @@ fn maps_the_complete_chat_request_contract() {
 #[test]
 fn preserves_model_defaults_when_optional_controls_are_omitted() {
     let adapted = adapt_request(request_from_json(minimal_request())).unwrap();
-    assert!(!adapted.include_usage);
+    assert_eq!(
+        adapted.delivery,
+        ChatDelivery::Stream(StreamPlan {
+            include_progress: false,
+            timings_per_token: false,
+            include_usage: false,
+        })
+    );
     let request = adapted.request;
     assert_eq!(request.input.tools.choice(), &ToolChoice::Auto);
     assert!(request.input.tools.parallel());
@@ -1566,11 +1581,25 @@ fn timing_control_accepts_tolerant_boolean_semantics() {
     ] {
         let mut request = minimal_request();
         request["timings_per_token"] = value;
-        assert!(!validate_request(request_from_json(request)).unwrap().timings_per_token);
+        assert_eq!(
+            validate_request(request_from_json(request)).unwrap().delivery,
+            ChatDelivery::Stream(StreamPlan {
+                include_progress: false,
+                timings_per_token: false,
+                include_usage: false,
+            })
+        );
     }
     let mut request = minimal_request();
     request["timings_per_token"] = json!(true);
-    assert!(validate_request(request_from_json(request)).unwrap().timings_per_token);
+    assert_eq!(
+        validate_request(request_from_json(request)).unwrap().delivery,
+        ChatDelivery::Stream(StreamPlan {
+            include_progress: false,
+            timings_per_token: true,
+            include_usage: false,
+        })
+    );
 }
 
 #[test]

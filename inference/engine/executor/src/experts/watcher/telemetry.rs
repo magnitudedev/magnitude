@@ -641,14 +641,11 @@ fn parked_union(intervals: Vec<(Instant, Instant)>, step_start: Instant, step_en
 }
 
 /// What a read ahead is priced by ([`Telemetry::price`]), whatever named it
-/// (its probability is the interest ledger's, `experts::interest`): what a
-/// miss costs the decode ([`MissCost`], over the measured passes' window),
-/// by which every read ahead is admitted at its break-even
-/// ([`Self::admits`]); and the drive's line (none before a demand read
-/// ended).
+/// (its probability is the interest ledger's, `experts::interest`): wraps
+/// [`magnitude_cost_model::ReadAdmission`] (the single owner of drive
+/// binding, drive line, and demand/plain stall) with a test-only override.
 pub(super) struct ReadPrice {
-    miss: super::passes::MissCost,
-    line: Option<ReadLine>,
+    admission: magnitude_cost_model::ReadAdmission,
     /// The break-even a test admits at in place of the measured one
     /// ([`Telemetry::admit_at`]).
     #[cfg(test)]
@@ -659,13 +656,13 @@ impl ReadPrice {
     /// A price before anything is measured.
     #[cfg(test)]
     pub(super) fn unpriced() -> Self {
-        Self { miss: super::passes::MissCost::default(), line: None, even: None }
+        Self { admission: magnitude_cost_model::ReadAdmission::default(), even: None }
     }
 
-    /// A price with an explicit miss cost and drive line.
+    /// A price with an explicit [`magnitude_cost_model::ReadAdmission`].
     #[cfg(test)]
-    pub(super) fn priced(miss: super::passes::MissCost, line: ReadLine) -> Self {
-        Self { miss, line: Some(line), even: None }
+    pub(super) fn priced(admission: magnitude_cost_model::ReadAdmission) -> Self {
+        Self { admission, even: None }
     }
 
     /// Whether a read ahead of `bytes` of an expert used with probability
@@ -676,27 +673,27 @@ impl ReadPrice {
 
     /// Whether a read ahead of `bytes` of an expert used with probability
     /// `p` is admitted given `idle` seconds of remaining per-layer idle
-    /// compute (`MissCost::break_even`, `designs/streamed-decode.md` §5).
-    /// Before the line is measured a read's time is unknown, and every read
-    /// is admitted.
+    /// compute (`ReadAdmission::break_even`).
+    /// Before the line is measured a read's transfer time is 0, and every
+    /// read is admitted.
     pub(super) fn admits_with_idle(&self, p: f64, bytes: u64, idle: f64) -> bool {
         assert!(bytes > 0, "a read ahead reads an expert's bytes");
         #[cfg(test)]
         if let Some(even) = self.even {
             return p >= even;
         }
-        self.line.is_none_or(|line| p >= self.miss.break_even(line.seconds(bytes), idle))
+        self.admission.admits(p, bytes, idle)
     }
 
-    /// Mean resident compute seconds per decode pass (`MissCost::compute`).
+    /// Mean resident compute seconds per decode pass (`Terms::compute`).
     pub(super) fn compute(&self) -> f64 {
-        self.miss.compute
+        self.admission.terms.compute
     }
 
-    /// Read seconds of an expert of `bytes` on the measured drive line;
-    /// `0.0` before the line is measured.
-    pub(super) fn read_seconds(&self, bytes: u64) -> f64 {
-        self.line.map_or(0., |line| line.seconds(bytes))
+    /// Pipelined marginal bandwidth time `t_bw = b / P_peak` of an expert of
+    /// `bytes` on the measured drive line; `0.0` before the line is measured.
+    pub(super) fn transfer_seconds(&self, bytes: u64) -> f64 {
+        self.admission.transfer_seconds(bytes)
     }
 }
 
@@ -1761,7 +1758,7 @@ impl Telemetry {
                 // The step completes, so it holds its records until it ends.
                 // Its exact rows' choices: a front row's are the next
                 // step's, which its exact row routes again.
-                let front = decoded.launch.map_or(0, |launch| launch.front);
+                let front = decoded.launch.map_or(0, |launch| launch.front());
                 // Its rows' keys, which placement ranks by and a recording
                 // load traces.
                 let keys = decoded.launch.map(|launch| std::sync::Arc::new(self.keys.read(steps, sequence, launch)));
@@ -1943,7 +1940,7 @@ impl Telemetry {
                     let absent = &decoded.4;
                     // One sequence's exact row is its next token: its routes
                     // lag against its tokens before.
-                    let routed = match launch.rows - launch.front.count_ones() as usize {
+                    let routed = match launch.rows - launch.front().count_ones() as usize {
                         1 => lagged(&mut costs.recent, &decoded.1, absent),
                         _ => {
                             costs.recent.clear();
@@ -2018,7 +2015,7 @@ impl Telemetry {
                             });
                         }
                     }
-                    if launch.front != 0 {
+                    if launch.front() != 0 {
                         costs.front.passes += 1;
                     }
                 }
@@ -2309,8 +2306,7 @@ impl Telemetry {
         let mut recorded = self.lock();
         let costs = &mut recorded.costs;
         ReadPrice {
-            miss: costs.passes.miss_cost(),
-            line,
+            admission: costs.passes.read_admission(line),
             #[cfg(test)]
             even: *self.even.lock().expect("the admitted break-even"),
         }
@@ -2432,7 +2428,7 @@ impl Telemetry {
     /// resolved as the gate is written.
     pub(super) fn hint_gates(&self, resolved: &[bool], prices: Option<&magnitude_cost_model::LaunchPrices>) -> Vec<bool> {
         let costs = &mut self.lock().costs;
-        let (miss, latest) = (costs.passes.miss_cost(), costs.passes.latest());
+        let (miss, latest) = (costs.passes.read_admission(None), costs.passes.latest());
         costs.hints_gate.decide(resolved, prices, miss, latest)
     }
 
@@ -2479,7 +2475,7 @@ impl Telemetry {
                 })
             })
         });
-        let measured = self.lock().costs.passes.measured(needed, &self.stands);
+        let measured = self.lock().costs.passes.measured(self.routing.experts.len(), needed, &self.stands);
         if measured.is_some() && gaps[0].iter().any(Option::is_some) {
             tracing::debug!(
                 "expert shadow gaps: {}",
@@ -2774,7 +2770,7 @@ fn feed_decode(
     // counts those rows: every decode launch has one.
     let counted = recording.map(|Recording| {
         let launch = launch.expect("a recorded decode step has its launch");
-        let rows = launch.rows as u64 - u64::from(launch.front.count_ones());
+        let rows = launch.rows as u64 - u64::from(launch.front().count_ones());
         assert!(rows > 0, "a decode launch has an exact row");
         CountedLaunch { rows, tokens: launch.tokens }
     });
@@ -2856,7 +2852,7 @@ mod tests {
 
     /// A read ahead is admitted where its probability of use reaches the
     /// break-even of a read of its bytes on the drive's line
-    /// (`passes::MissCost::break_even`), whatever named it, an exact row's
+    /// (`magnitude_cost_model::ReadAdmission::break_even`), whatever named it, an exact row's
     /// hint or a front row's name: where the drive binds (68 ms of reads a
     /// 100 ms pass computing 35 ms, a miss stalling 0.96 ms), a 1 MB expert
     /// read in 1 ms is admitted from about 0.511, so a front hint at 0.15
@@ -2864,19 +2860,28 @@ mod tests {
     /// Before the line is measured every read is admitted.
     #[test]
     fn a_read_ahead_is_admitted_at_its_measured_break_even() {
-        let line = ReadLine::new(0., 1e-9).expect("a line");
-        let price = |pass: Pass| {
+        let line = ReadLine::new(0.25e-3, 1e-9).expect("a line");
+        let price = |pass: Pass, line: Option<ReadLine>| {
             let mut passes = Passes::new(Time::new(&[vec![1]], 8));
             passes.timed(pass);
-            ReadPrice { miss: passes.miss_cost(), line: Some(line), ..ReadPrice::unpriced() }
+            ReadPrice::priced(passes.read_admission(line))
         };
-        let bound = price(Pass { rows: 1, depth: 0, seconds: 0.1, parked: 0.085, misses: 68., drive: 0.068, ..Pass::default() });
-        // stall = 1.25 ms, read = 1.0 ms -> overhead = 0.25 ms -> break_even(1.0ms, 0.0) = 0.80.
+        let bound = price(
+            Pass { rows: 1, depth: 0, seconds: 0.1, parked: 0.085, misses: 68., drive: 0.068, ..Pass::default() },
+            Some(line),
+        );
+        // t_bw = 1.0 ms (for 1 MB), stall = 1.25 ms -> break_even(1.0ms, 0.0) = 1.0 / 1.25 = 0.80.
         assert!(bound.admits(0.81, 1_000_000) && !bound.admits(0.79, 1_000_000) && !bound.admits(0.15, 1_000_000));
         assert!(bound.admits(1., 1_000_000));
-        let resident = price(Pass { rows: 1, depth: 0, seconds: 0.05, parked: 0.018, misses: 21., drive: 0.021, ..Pass::default() });
+        let resident = price(
+            Pass { rows: 1, depth: 0, seconds: 0.05, parked: 0.018, misses: 21., drive: 0.021, ..Pass::default() },
+            Some(line),
+        );
         assert!(resident.admits(0.15, 1_000_000), "an idle drive's read saves a stall at no cost");
-        let unmeasured = ReadPrice { miss: bound.miss, ..ReadPrice::unpriced() };
+        let unmeasured = price(
+            Pass { rows: 1, depth: 0, seconds: 0.1, parked: 0.085, misses: 68., drive: 0.068, ..Pass::default() },
+            None,
+        );
         assert!(unmeasured.admits(0.01, 1_000_000), "no line: every read admitted");
     }
 

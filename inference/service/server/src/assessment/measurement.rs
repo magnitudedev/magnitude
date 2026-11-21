@@ -32,10 +32,11 @@ use magnitude_engine::assessment::{AssessmentSetup, AssessmentStructure, Measure
 use magnitude_engine::error::RequestError;
 use magnitude_engine::worker::protocol::{RoomAnswer, RoomRefusal};
 use magnitude_engine::worker::measure::{
-    JobLost, MeasureEvent, MeasureFailure, MeasureJob, MeasureRequest, OPENING_LIMIT, POINT_LIMIT,
-    hang_silence, job_time, measure_worker, release_killed,
+    EngineMeasurementPhase, JobLost, MeasureEvent, MeasureFailure, MeasureJob, MeasureRequest,
+    MeasurementProgress as EngineMeasurementProgress, OPENING_LIMIT, POINT_LIMIT, hang_silence,
+    job_time, measure_worker, release_killed,
 };
-use magnitude_service_contracts::models::MeasurementState;
+use magnitude_service_contracts::models::{MeasurementPhase, MeasurementProgress, MeasurementState};
 use seismic::PointKey;
 use seismic::measure::Record;
 use tokio::sync::{mpsc, watch};
@@ -133,10 +134,33 @@ fn published<S: StoredRecords>(stored: S, unopened: Option<&Unopened>) -> S {
     }
 }
 
+/// Minimum interval between steady-state progress publications during a measurement job; phase
+/// transitions and completion publish immediately.
+const PROGRESS_THROTTLE: Duration = Duration::from_millis(120);
+
+fn contract_phase(phase: EngineMeasurementPhase) -> MeasurementPhase {
+    match phase {
+        EngineMeasurementPhase::Baseline => MeasurementPhase::Baseline,
+        EngineMeasurementPhase::MemoryAndStorage => MeasurementPhase::MemoryAndStorage,
+        EngineMeasurementPhase::TokenGeneration => MeasurementPhase::TokenGeneration,
+        EngineMeasurementPhase::PromptProcessing => MeasurementPhase::PromptProcessing,
+        EngineMeasurementPhase::LongContextAttention => MeasurementPhase::LongContextAttention,
+    }
+}
+
+fn contract_progress(progress: EngineMeasurementProgress) -> MeasurementProgress {
+    MeasurementProgress {
+        completed: progress.completed,
+        total: progress.total,
+        phase: contract_phase(progress.phase),
+    }
+}
+
 /// What a job's reader passes on, in order: its opening of the device, then each point it
 /// attempts and each record it stores, then the outcome.
 pub enum JobFrame {
     Opened,
+    Progress(EngineMeasurementProgress),
     Attempting(PointKey),
     Recorded(PointKey, Record),
     Finished(Result<Vec<MeasureFailure>, JobLost>),
@@ -251,6 +275,7 @@ impl MeasuredMachine for ServiceMachine {
                 let _ = frames.blocking_send(match event {
                     MeasureEvent::Attempting(key) => JobFrame::Attempting(key),
                     MeasureEvent::Opened => JobFrame::Opened,
+                    MeasureEvent::Progress(progress) => JobFrame::Progress(progress),
                     MeasureEvent::Recorded(key, record) => JobFrame::Recorded(key, record),
                 });
             });
@@ -383,10 +408,44 @@ async fn run<M: MeasuredMachine>(
             // A job refining measured costs leaves them measured, whatever becomes of it.
             let measured = status.borrow().measurements.stage() != Stage::Unmeasured;
             if !measured {
-                status.send_modify(|status| status.state = MeasurementState::Measuring);
+                status.send_modify(|status| {
+                    if !matches!(status.state, MeasurementState::Measuring { .. }) {
+                        status.state = MeasurementState::Measuring { progress: None };
+                    }
+                });
             }
             let started = tokio::time::Instant::now();
-            let (end, preempted) = run_job(&machine, held).await;
+            let mut last_published: Option<(MeasurementProgress, tokio::time::Instant)> = None;
+            let (end, preempted) = run_job(&machine, held, |progress| {
+                if measured {
+                    return;
+                }
+                let now = tokio::time::Instant::now();
+                let should_publish = match last_published {
+                    None => true,
+                    Some((prev, at)) => {
+                        prev != progress
+                            && (prev.phase != progress.phase
+                                || progress.completed >= progress.total
+                                || now.duration_since(at) >= PROGRESS_THROTTLE)
+                    }
+                };
+                if should_publish {
+                    last_published = Some((progress, now));
+                    status.send_if_modified(|status| {
+                        let next = MeasurementState::Measuring {
+                            progress: Some(progress),
+                        };
+                        if status.state == next {
+                            false
+                        } else {
+                            status.state = next;
+                            true
+                        }
+                    });
+                }
+            })
+            .await;
             // A preempted job's attempts are released before what is stored is read, and before
             // the next job starts: a counted attempt would read as its point's failure. A
             // release that fails is retried on the failure's backoff until it succeeds, and the
@@ -456,7 +515,9 @@ async fn run<M: MeasuredMachine>(
             stage = measurements.stage();
             let measurements = published(measurements, unopened.as_ref());
             let state = match measurements.stage() {
-                Stage::Unmeasured => MeasurementState::Measuring,
+                Stage::Unmeasured => MeasurementState::Measuring {
+                    progress: last_published.map(|(progress, _)| progress),
+                },
                 Stage::Refining | Stage::Settled => MeasurementState::Measured,
             };
             status.send_replace(MeasurementStatus {
@@ -608,6 +669,7 @@ async fn release_killed_attempts<M: MeasuredMachine>(
 async fn run_job<M: MeasuredMachine>(
     machine: &Arc<M>,
     mut exclusive: DeviceJob,
+    mut on_progress: impl FnMut(MeasurementProgress),
 ) -> (JobEnd, Option<(MeasureJob, Vec<PointKey>)>) {
     let time = job_time();
     let started = {
@@ -656,6 +718,9 @@ async fn run_job<M: MeasuredMachine>(
                             "measurement opened the device"
                         );
                         opened = true;
+                    }
+                    Some(JobFrame::Progress(progress)) => {
+                        on_progress(contract_progress(progress));
                     }
                     Some(JobFrame::Recorded(key, record)) => {
                         recorded += 1;
@@ -738,7 +803,7 @@ async fn run_job<M: MeasuredMachine>(
                 recorded += 1;
                 log_record(&key, &record);
             }
-            JobFrame::Finished(_) => {}
+            JobFrame::Progress(_) | JobFrame::Finished(_) => {}
         }
     }
     // A preempted job says nothing of its points: their attempts are released. A hung one hung
@@ -1035,7 +1100,7 @@ mod tests {
         let machine = ScriptedMachine::new(vec![running], Vec::new());
         let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
         status
-            .wait_for(|status| status.state == MeasurementState::Measuring)
+            .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
             .await
             .unwrap();
         assert_eq!(given(&machine, 1), [job_time()]);
@@ -1075,7 +1140,7 @@ mod tests {
         let device = DeviceLock::default();
         let mut status = start(machine.clone(), PENDING, device.clone(), settled());
         status
-            .wait_for(|status| status.state == MeasurementState::Measuring)
+            .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
             .await
             .unwrap();
         settle().await;
@@ -1235,7 +1300,7 @@ mod tests {
         device.resident_idle(Some(idle.clone()));
         let mut status = start(machine.clone(), PENDING, device.clone(), settled());
         status
-            .wait_for(|status| status.state == MeasurementState::Measuring)
+            .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
             .await
             .unwrap();
         settle().await;
@@ -1345,7 +1410,7 @@ mod tests {
         let device = DeviceLock::default();
         let mut status = start(machine.clone(), PENDING, device.clone(), settled());
         status
-            .wait_for(|status| status.state == MeasurementState::Measuring)
+            .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
             .await
             .unwrap();
         settle().await;
@@ -1531,5 +1596,65 @@ mod tests {
         settle().await;
         assert_eq!(status.borrow().state, MeasurementState::Measured);
         assert_eq!(machine.started.load(Ordering::SeqCst), 0);
+    }
+
+    /// Standing progress frames update `MeasurementState::Measuring` with real phase transitions
+    /// and completion counts while the benchmark runs.
+    #[tokio::test(start_paused = true)]
+    async fn progress_frames_publish_phase_and_completion() {
+        let (running, _, frames) = job(Vec::new());
+        let machine = ScriptedMachine::new(vec![running], vec![COMPLETE]);
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        status
+            .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
+            .await
+            .unwrap();
+        let tx = frames.upgrade().expect("the job runs");
+        tx.send(JobFrame::Progress(EngineMeasurementProgress {
+            completed: 0,
+            total: 100,
+            phase: EngineMeasurementPhase::Baseline,
+        }))
+        .await
+        .unwrap();
+        status
+            .wait_for(|status| {
+                status.state
+                    == MeasurementState::Measuring {
+                        progress: Some(MeasurementProgress {
+                            completed: 0,
+                            total: 100,
+                            phase: MeasurementPhase::Baseline,
+                        }),
+                    }
+            })
+            .await
+            .unwrap();
+        // Phase transitions publish immediately even without waiting for the throttle interval.
+        tx.send(JobFrame::Progress(EngineMeasurementProgress {
+            completed: 15,
+            total: 100,
+            phase: EngineMeasurementPhase::MemoryAndStorage,
+        }))
+        .await
+        .unwrap();
+        status
+            .wait_for(|status| {
+                status.state
+                    == MeasurementState::Measuring {
+                        progress: Some(MeasurementProgress {
+                            completed: 15,
+                            total: 100,
+                            phase: MeasurementPhase::MemoryAndStorage,
+                        }),
+                    }
+            })
+            .await
+            .unwrap();
+        tx.send(JobFrame::Finished(Ok(Vec::new()))).await.unwrap();
+        status
+            .wait_for(|status| status.state == MeasurementState::Measured)
+            .await
+            .unwrap();
     }
 }

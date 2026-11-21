@@ -180,6 +180,10 @@ impl<K, V> FxCache<K, V> {
         }
     }
 
+    fn clear(&mut self) {
+        self.buckets.clear();
+    }
+
     #[inline]
     fn get_with(&self, hash: u64, mut eq: impl FnMut(&K) -> bool) -> Option<&V> {
         match self.buckets.get(&hash)? {
@@ -435,6 +439,10 @@ struct ScopedNodeCoverKey {
 
 struct ScopedScratchConfigs {
     depth: usize,
+    /// Active hardware properties for this sizing scope (None for offline
+    /// backend-floor evaluation). Changing device clears the device-dependent
+    /// caches (`map`, `points`, `node_cover_points`).
+    device: Option<seismic::device::DeviceProperties>,
     map: FxCache<ScopedScratchConfigKey, Result<ScratchConfigs, ContractError>>,
     points: FxCache<ScopedSizingPointKey, Result<(Vec<u64>, Vec<u64>), ContractError>>,
     node_cover_points: FxCache<ScopedNodeCoverKey, Result<(Vec<u64>, Vec<u64>), ContractError>>,
@@ -448,17 +456,42 @@ thread_local! {
     static SCOPED_SCRATCH_CONFIGS: RefCell<Option<ScopedScratchConfigs>> = const { RefCell::new(None) };
 }
 
+/// Active device properties bound to the current thread's [`SizingScope`].
+pub(crate) fn current_sizing_device() -> Option<seismic::device::DeviceProperties> {
+    SCOPED_SCRATCH_CONFIGS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|state| state.depth > 0)
+            .and_then(|state| state.device)
+    })
+}
+
+/// Evaluate `f` with the current thread's bound [`DeviceProperties`] (when its
+/// backend matches `backend`), falling back to [`seismic::device::BackendFloor`]
+/// for offline bare-`BackendName` callers.
+pub(crate) fn eval_with_device<R>(
+    backend: BackendName,
+    f: impl FnOnce(&dyn seismic::device::DeviceValues) -> R,
+) -> R {
+    match current_sizing_device().filter(|props| props.backend() == backend) {
+        Some(props) => f(&props),
+        None => {
+            let floor = seismic::device::BackendFloor(backend);
+            f(&floor)
+        }
+    }
+}
+
 /// Stack-lifetime RAII guard that activates thread-local memoization of
 /// `EntryContract::contract_scratch_configs`, `EntryContract::contract_sizing_at_point`,
-/// and `EntryContract::contract_param_spec` across `SizingDraft` instances.
+/// and `EntryContract::contract_param_spec` across `SizingDraft` instances,
+/// and optionally binds target [`DeviceProperties`] for `device.*` contract reads.
 ///
-/// Nesting-safe: all cached entries are pure functions of their keys (static contract
-/// fn pointers, backend, element types, and dimension values), so dropping the outermost
-/// `SizingScope` deactivates the scope (`depth = 0`) while retaining the thread-local
-/// tables warm (bounded by `SCOPED_CACHE_MAX_ENTRIES`) instead of freeing and
-/// reallocating them on every scope exit.
+/// Nesting-safe: `enter()` inherits the enclosing scope's device; `enter_with_device()`
+/// binds a device for its lifetime and restores the previous device on drop.
 pub struct SizingScope {
-    _private: (),
+    prev_device: Option<seismic::device::DeviceProperties>,
+    restore_device: bool,
 }
 
 impl SizingScope {
@@ -470,6 +503,7 @@ impl SizingScope {
                 None => {
                     *slot = Some(ScopedScratchConfigs {
                         depth: 1,
+                        device: None,
                         map: FxCache::new(),
                         points: FxCache::new(),
                         node_cover_points: FxCache::new(),
@@ -479,7 +513,45 @@ impl SizingScope {
                 }
             }
         });
-        Self { _private: () }
+        Self {
+            prev_device: None,
+            restore_device: false,
+        }
+    }
+
+    pub fn enter_with_device(device: Option<seismic::device::DeviceProperties>) -> Self {
+        let prev_device = SCOPED_SCRATCH_CONFIGS.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            match slot.as_mut() {
+                Some(state) => {
+                    let prev = state.device;
+                    if state.device != device {
+                        state.device = device;
+                        state.map.clear();
+                        state.points.clear();
+                        state.node_cover_points.clear();
+                    }
+                    state.depth += 1;
+                    prev
+                }
+                None => {
+                    *slot = Some(ScopedScratchConfigs {
+                        depth: 1,
+                        device,
+                        map: FxCache::new(),
+                        points: FxCache::new(),
+                        node_cover_points: FxCache::new(),
+                        param_specs: FxCache::new(),
+                        param_read_dims: FxCache::new(),
+                    });
+                    None
+                }
+            }
+        });
+        Self {
+            prev_device,
+            restore_device: true,
+        }
     }
 }
 
@@ -490,6 +562,12 @@ impl Drop for SizingScope {
             if let Some(state) = slot.as_mut() {
                 debug_assert!(state.depth > 0);
                 state.depth -= 1;
+                if self.restore_device && state.device != self.prev_device {
+                    state.device = self.prev_device;
+                    state.map.clear();
+                    state.points.clear();
+                    state.node_cover_points.clear();
+                }
             }
         });
     }
@@ -743,7 +821,9 @@ fn eval_or_lookup_scratch_configs(
         }
     };
     let Some(cell) = scoped_cell else {
-        let result = eval_configs(backend, els, point_dims);
+        let result = eval_with_device(backend, |dev| {
+            eval_configs(backend, Some(dev), els, point_dims)
+        });
         record_miss(start);
         return result;
     };
@@ -754,7 +834,9 @@ fn eval_or_lookup_scratch_configs(
             match dims.iter().find(|(dim, _)| dim == name) {
                 Some((_, v)) => *slot = *v,
                 None => {
-                    let result = eval_configs(backend, els, point_dims);
+                    let result = eval_with_device(backend, |dev| {
+                        eval_configs(backend, Some(dev), els, point_dims)
+                    });
                     record_miss(start);
                     return result;
                 }
@@ -767,7 +849,9 @@ fn eval_or_lookup_scratch_configs(
             match dims.iter().find(|(dim, _)| dim == name) {
                 Some((_, v)) => static_heap.push(*v),
                 None => {
-                    let result = eval_configs(backend, els, point_dims);
+                    let result = eval_with_device(backend, |dev| {
+                        eval_configs(backend, Some(dev), els, point_dims)
+                    });
                     record_miss(start);
                     return result;
                 }
@@ -809,7 +893,9 @@ fn eval_or_lookup_scratch_configs(
         }
         return result;
     }
-    let result = eval_configs(backend, els, point_dims);
+    let result = eval_with_device(backend, |dev| {
+        eval_configs(backend, Some(dev), els, point_dims)
+    });
     let scoped_key = ScopedScratchConfigKey {
         eval_configs: eval_addr,
         backend,
@@ -852,14 +938,17 @@ fn eval_or_lookup_sizing_point(
         }
     };
     let Some(cell) = scoped_cell else {
-        let result = eval_point(
-            backend,
-            els,
-            point_dims,
-            configs,
-            max_tensor_results,
-            max_scratch_bytes,
-        );
+        let result = eval_with_device(backend, |dev| {
+            eval_point(
+                backend,
+                Some(dev),
+                els,
+                point_dims,
+                configs,
+                max_tensor_results,
+                max_scratch_bytes,
+            )
+        });
         record_miss(start);
         return result;
     };
@@ -904,14 +993,17 @@ fn eval_or_lookup_sizing_point(
     point_results.resize(max_tensor_results.len(), 0);
     point_scratch.clear();
     point_scratch.resize(max_scratch_bytes.len(), 0);
-    let eval_result = eval_point(
-        backend,
-        els,
-        point_dims,
-        configs,
-        point_results,
-        point_scratch,
-    );
+    let eval_result = eval_with_device(backend, |dev| {
+        eval_point(
+            backend,
+            Some(dev),
+            els,
+            point_dims,
+            configs,
+            point_results,
+            point_scratch,
+        )
+    });
     let point_key = ScopedSizingPointKey {
         eval_point: eval_addr,
         backend,
@@ -973,17 +1065,21 @@ fn eval_or_lookup_node_cover_points(
 ) -> Result<(), ContractError> {
     let start = stage_timer::is_recording().then(Instant::now);
     let Some(cell) = scoped_cell else {
-        for &v in values {
-            point_dims[slot].1 = v;
-            eval_point(
-                backend,
-                els,
-                point_dims,
-                configs,
-                max_tensor_results,
-                max_scratch_bytes,
-            )?;
-        }
+        eval_with_device(backend, |dev| {
+            for &v in values {
+                point_dims[slot].1 = v;
+                eval_point(
+                    backend,
+                    Some(dev),
+                    els,
+                    point_dims,
+                    configs,
+                    max_tensor_results,
+                    max_scratch_bytes,
+                )?;
+            }
+            Ok(())
+        })?;
         if let Some(start) = start {
             let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let n = values.len() as u64;
@@ -1095,14 +1191,17 @@ fn eval_or_lookup_node_cover_points(
         point_scratch.clear();
         point_scratch.resize(max_scratch_bytes.len(), 0);
         point_misses += 1;
-        match eval_point(
-            backend,
-            els,
-            point_dims,
-            configs,
-            point_results,
-            point_scratch,
-        ) {
+        match eval_with_device(backend, |dev| {
+            eval_point(
+                backend,
+                Some(dev),
+                els,
+                point_dims,
+                configs,
+                point_results,
+                point_scratch,
+            )
+        }) {
             Ok(()) => {
                 for (dst, &src) in max_tensor_results.iter_mut().zip(point_results.iter()) {
                     *dst = (*dst).max(src);
@@ -1184,17 +1283,31 @@ fn eval_or_lookup_node_cover_points(
     }
 }
 
-type ScratchConfigsEvalFn =
-    fn(BackendName, &[(&str, Element)], &[(&str, u64)]) -> Result<ScratchConfigs, ContractError>;
+type ScratchConfigsEvalFn = fn(
+    BackendName,
+    Option<&dyn seismic::device::DeviceValues>,
+    &[(&str, Element)],
+    &[(&str, u64)],
+) -> Result<ScratchConfigs, ContractError>;
 
-type LaunchConfigsEvalFn =
-    fn(BackendName, &[(&str, Element)], &[(&str, u64)]) -> Result<Vec<Vec<u64>>, ContractError>;
+type LaunchConfigsEvalFn = fn(
+    BackendName,
+    Option<&dyn seismic::device::DeviceValues>,
+    &[(&str, Element)],
+    &[(&str, u64)],
+) -> Result<Vec<Vec<u64>>, ContractError>;
 
-type LaunchMaskEvalFn =
-    fn(BackendName, &[(&str, Element)], &[(&str, u64)], &[u64]) -> Result<u64, ContractError>;
+type LaunchMaskEvalFn = fn(
+    BackendName,
+    Option<&dyn seismic::device::DeviceValues>,
+    &[(&str, Element)],
+    &[(&str, u64)],
+    &[u64],
+) -> Result<u64, ContractError>;
 
 type SizingPointEvalFn = fn(
     BackendName,
+    Option<&dyn seismic::device::DeviceValues>,
     &[(&str, Element)],
     &[(&str, u64)],
     &ScratchConfigs,
@@ -1218,82 +1331,10 @@ fn eval_contract_launches<E: EntryContract>(
     dims: &[(&str, u64)],
     words: &[(&str, u64, bool)],
 ) -> Result<u64, ContractError> {
-    let params = match E::contract_default_params(backend, elements, dims) {
-        Ok(params) => params,
-        Err(ContractError::DeviceDependent(property)) => {
-            let implementation =
-                seismic::generated::native_implementation_at::<E>(backend, elements)
-                    .ok()
-                    .flatten()
-                    .ok_or(ContractError::DeviceDependent(property))?;
-            let constraint_reads_device =
-                implementation.constraint.as_ref().is_some_and(|constraint| {
-                    let mut reads = Vec::new();
-                    constraint.device_reads(&mut reads);
-                    !reads.is_empty()
-                });
-            let mut launch_params = Vec::new();
-            if let Some(repeat) = &implementation.repeat {
-                repeat.count.parameters(&mut launch_params);
-            }
-            for launch in &implementation.launches {
-                if let Some(when) = &launch.when {
-                    when.parameters(&mut launch_params);
-                }
-            }
-            if constraint_reads_device || !launch_params.is_empty() {
-                return Err(ContractError::DeviceDependent(property));
-            }
-            let mut statics = seismic::NativeSpecialization::new();
-            for name in &implementation.statics {
-                let value = dims
-                    .iter()
-                    .find(|(candidate, _)| *candidate == name.as_str())
-                    .map(|(_, value)| *value)
-                    .ok_or(ContractError::DeviceDependent(property))?;
-                statics = statics.with_static(name.clone(), value);
-            }
-            let mut first = None;
-            implementation
-                .walk_admissible(&statics, |configuration| {
-                    first = Some(configuration.clone());
-                    false
-                })
-                .map_err(|_| ContractError::DomainViolation)?;
-            let spec = first.ok_or(ContractError::DomainViolation)?;
-            let spec_ref = &spec;
-            implementation
-                .params
-                .iter()
-                .map(|p| {
-                    (
-                        p.name.as_str(),
-                        spec_ref
-                            .param(&p.name)
-                            .expect("admissible specialization binds every entry param"),
-                    )
-                })
-                .chain(
-                    implementation
-                        .launches
-                        .iter()
-                        .enumerate()
-                        .flat_map(|(launch_idx, launch)| {
-                            launch.params.iter().map(move |p| {
-                                (
-                                    p.name.as_str(),
-                                    spec_ref
-                                        .launch_param(launch_idx, &p.name)
-                                        .expect("admissible specialization binds every launch param"),
-                                )
-                            })
-                        }),
-                )
-                .collect()
-        }
-        Err(err) => return Err(err),
-    };
-    E::contract_active_launches(backend, elements, dims, &params, words)
+    eval_with_device(backend, |dev| {
+        let params = E::contract_default_params(backend, Some(dev), elements, dims)?;
+        E::contract_active_launches(backend, Some(dev), elements, dims, &params, words)
+    })
 }
 
 /// One external or uploaded port bound to a node call (weight, norm, scale,
@@ -2233,7 +2274,9 @@ fn eval_concrete_node(
                 Some(found) => found
                     .map_err(|error| contract_error(entry_name, backend, shape.statics, dims, error))?,
                 None => {
-                    let computed = eval_configs(backend, elements, dims);
+                    let computed = eval_with_device(backend, |dev| {
+                        eval_configs(backend, Some(dev), elements, dims)
+                    });
                     {
                         let mut guard = cell.borrow_mut();
                         if let Some(state) = guard.as_mut().filter(|s| s.depth > 0) {
@@ -2257,8 +2300,10 @@ fn eval_concrete_node(
 
         let mut result_lens = vec![0u64; shape.result_ranks.len()];
         let mut scratch = vec![0u64; shape.buffers];
-        let evaluated = eval_point(backend, elements, dims, &configs, &mut result_lens, &mut scratch)
-            .map(|()| (result_lens, scratch));
+        let evaluated = eval_with_device(backend, |dev| {
+            eval_point(backend, Some(dev), elements, dims, &configs, &mut result_lens, &mut scratch)
+        })
+        .map(|()| (result_lens, scratch));
         {
             let mut guard = cell.borrow_mut();
             if let Some(state) = guard.as_mut().filter(|s| s.depth > 0) {
@@ -2297,7 +2342,10 @@ fn eval_concrete_node(
         let lconfigs = match launch_configs_cache.entry(lkey) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(slot) => {
-                let computed = eval_launch_configs(backend, elements, dims).map_err(|error| {
+                let computed = eval_with_device(backend, |dev| {
+                    eval_launch_configs(backend, Some(dev), elements, dims)
+                })
+                .map_err(|error| {
                     contract_error(entry_name, backend, shape.statics, dims, error)
                 })?;
                 slot.insert(computed)
@@ -2305,8 +2353,10 @@ fn eval_concrete_node(
         };
         let mut launch_mask = 0u64;
         for config in lconfigs.iter() {
-            let mask = eval_launch_mask(backend, elements, dims, config)
-                .map_err(|error| contract_error(entry_name, backend, shape.statics, dims, error))?;
+            let mask = eval_with_device(backend, |dev| {
+                eval_launch_mask(backend, Some(dev), elements, dims, config)
+            })
+            .map_err(|error| contract_error(entry_name, backend, shape.statics, dims, error))?;
             launch_mask |= mask;
         }
         launch_mask

@@ -8,6 +8,46 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static HEAD_LAUNCH_TRACED: AtomicBool = AtomicBool::new(false);
 
+/// Borrowed view of a validated [`Operation::Head`], extracted once at launch
+/// entry so downstream steps operate on typed head fields without re-matching.
+struct HeadOp<'a> {
+    raw: &'a Operation,
+    request: RequestId,
+    phase: crate::HeadPhase,
+    tokens: &'a [TokenId],
+    conditioning: &'a FeatureRows,
+    position: usize,
+    proposals: &'a [SelectSpec],
+    form: DraftForm,
+}
+
+impl<'a> HeadOp<'a> {
+    fn from_operation(operation: &'a Operation) -> Option<Self> {
+        let Operation::Head {
+            request,
+            phase,
+            tokens,
+            conditioning,
+            position,
+            proposals,
+            form,
+        } = operation
+        else {
+            return None;
+        };
+        Some(Self {
+            raw: operation,
+            request: *request,
+            phase: *phase,
+            tokens,
+            conditioning,
+            position: *position,
+            proposals,
+            form: *form,
+        })
+    }
+}
+
 /// One slot of a front launch ([`ExecutorDomain::front_head_batch`]).
 pub(super) struct FrontHeadSlot<'a> {
     pub request: RequestId,
@@ -74,65 +114,46 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .collect::<Vec<_>>();
         let mut seen = BTreeSet::new();
         let mut steps = 0usize;
+        let mut heads = Vec::with_capacity(operations.len());
         for (operation, advance) in operations.iter().zip(&advances) {
             if let Err(error) = operation.validate() {
                 panic!("invariant violated: a reserved head operation is invalid: {error}");
             }
-            let Operation::Head {
-                request,
-                position,
-                proposals,
-                ..
-            } = operation
-            else {
+            let Some(head) = HeadOp::from_operation(operation) else {
                 panic!("invariant violated: a reserved head group holds another operation kind");
             };
-            assert!(seen.insert(*request), "invariant violated: a reserved head group repeats a request");
             assert!(
-                advance.position() == *position && advance.rows() == operation.row_count(),
+                seen.insert(head.request),
+                "invariant violated: a reserved head group repeats a request"
+            );
+            assert!(
+                advance.position() == head.position && advance.rows() == head.raw.row_count(),
                 "invariant violated: a reserved head operation's position or rows differ from its accepted state"
             );
-            steps = steps.max(proposals.len());
+            steps = steps.max(head.proposals.len());
+            heads.push(head);
         }
         if std::env::var_os("MAGNITUDE_TRACE_DRAFT").is_some() {
-            for operation in operations {
-                if let Operation::Head {
-                    request,
-                    tokens,
-                    position,
-                    proposals,
-                    ..
-                } = operation
-                {
-                    eprintln!(
-                        "draft transaction request={request:?} position={position} proposals={} entry={:?}",
-                        proposals.len(),
-                        tokens.iter().map(|token| token.0).collect::<Vec<_>>()
-                    );
-                }
+            for head in &heads {
+                eprintln!(
+                    "draft transaction request={:?} position={} proposals={} entry={:?}",
+                    head.request,
+                    head.position,
+                    head.proposals.len(),
+                    head.tokens.iter().map(|token| token.0).collect::<Vec<_>>()
+                );
             }
         }
-        let metadata = operations
+        let metadata = heads
             .iter()
-            .map(|operation| match operation {
-                Operation::Head {
-                    request,
-                    tokens,
-                    proposals,
-                    ..
-                } => (*request, tokens.len(), proposals.len()),
-                _ => unreachable!("validated head group"),
-            })
+            .map(|head| (head.request, head.tokens.len(), head.proposals.len()))
             .collect::<Vec<_>>();
-        let form = match &operations[0] {
-            Operation::Head { form, .. } => *form,
-            _ => unreachable!("validated head group"),
-        };
-        let shape = operations[0].draft_shape();
-        if operations.iter().any(|operation| {
-            !matches!(operation, Operation::Head { form: other, .. } if *other == form)
-                || operation.draft_shape() != shape
-        }) {
+        let form = heads[0].form;
+        let shape = heads[0].raw.draft_shape();
+        if heads
+            .iter()
+            .any(|head| head.form != form || head.raw.draft_shape() != shape)
+        {
             self.restore_head_advances(&metadata, advances);
             return Err(SubmitFailure::Refused(
                 "head group mixes draft forms or draft shapes".into(),
@@ -142,18 +163,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let vocabulary = self.definition.decoder.vocabulary as usize;
         let class_limits = self.head_class_limits();
         let batch = match form {
-            DraftForm::Chained => operations
+            DraftForm::Chained => heads
                 .iter()
                 .zip(&advances)
-                .map(|(operation, advance)| match operation {
-                    Operation::Head {
-                        request,
-                        tokens,
-                        position,
-                        proposals,
-                        ..
-                    } => self.head_slot(*request, tokens, *position, proposals, advance, steps),
-                    _ => unreachable!("validated head group"),
+                .map(|(head, advance)| {
+                    self.head_slot(
+                        head.request,
+                        head.tokens,
+                        head.position,
+                        head.proposals,
+                        advance,
+                        steps,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|slots| {
@@ -164,10 +185,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     )
                     .map_err(|error| error.to_string())
                 }),
-            DraftForm::Block => operations
+            DraftForm::Block => heads
                 .iter()
                 .zip(&advances)
-                .map(|(operation, advance)| self.draft_slot(operation, advance, steps))
+                .map(|(head, advance)| self.draft_slot(head.raw, advance, steps))
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|slots| {
                     crate::batching::ValidatedHeadBatch::from_block_slots(
@@ -186,12 +207,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         };
         let conditioning = HeadConditioning::Rows(
-            operations
+            heads
                 .iter()
-                .map(|operation| match operation {
-                    Operation::Head { conditioning, .. } => conditioning.clone(),
-                    _ => unreachable!("validated head group"),
-                })
+                .map(|head| head.conditioning.clone())
                 .collect(),
         );
         // A block drafter's first draft anchors at `draft_from` and its
@@ -199,14 +217,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // priming rows before that every window drops unread.
         let windowed = !(form == DraftForm::Block && steps == 0)
             || skippable_window(&store).is_none_or(|window| {
-                operations.iter().any(|operation| match operation {
-                    Operation::Head {
-                        phase: crate::HeadPhase::Priming { draft_from },
-                        tokens,
-                        position,
-                        ..
-                    } => position + tokens.len() + window > *draft_from,
-                    _ => true,
+                heads.iter().any(|head| match head.phase {
+                    crate::HeadPhase::Priming { draft_from } => {
+                        head.position + head.tokens.len() + window > draft_from
+                    }
+                    crate::HeadPhase::Generation => true,
                 })
             });
         let inputs = HeadLaunchInputs::new(
@@ -217,34 +232,75 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             graph_workspace,
             graph_output,
         );
-        let launch = match ValidatedHeadLaunch::new(
-            inputs,
-            &store,
-            self.domain.id(),
-            self.head_conditioning_bytes(),
-        ) {
-            Ok(launch) => launch,
-            Err((inputs, error)) => {
-                let HeadState::Owned { advances, .. } = inputs.into_state() else {
-                    unreachable!("owned head launch")
-                };
-                self.restore_head_advances(&metadata, advances);
-                return Err(SubmitFailure::Failed(DomainError::Invariant(error)));
-            }
-        };
         // A single proposing flight supplies kernel attribution without
         // making every served step pay launch-detail tracing overhead.
         let trace_position = std::env::var("MAGNITUDE_TRACE_HEAD_MIN_POSITION")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(0);
-        let launch_trace = if steps > 0
+        let trace_launches = steps > 0
             && std::env::var_os("MAGNITUDE_TRACE_HEAD_LAUNCHES").is_some()
-            && operations.iter().any(|operation| {
-                matches!(operation, Operation::Head { position, .. } if *position >= trace_position)
-            })
-            && !HEAD_LAUNCH_TRACED.swap(true, Ordering::Relaxed)
-        {
+            && heads.iter().any(|head| head.position >= trace_position);
+        self.launch_head(inputs, &store, metadata, steps, trace_launches, bindings)
+    }
+
+    /// Submit one batch of transactions of a head that keeps no history.
+    /// Each drafts from one anchor row at its request's accepted target
+    /// position, reading that state's history; nothing is written. The
+    /// flight holds the accepted target states and `bindings` until
+    /// `finish_head` returns them, so no target work, checkpoint or binding
+    /// change can touch the rows it reads.
+    fn submit_target_reading_head(
+        &mut self,
+        bindings: StateBindings,
+        operations: &[Operation],
+        graph_workspace: NativeGraphWorkspaceLease,
+        graph_output: NativeGraphOutputLease,
+        states: Vec<SequenceState>,
+    ) -> Result<HeadFlight<F>, SubmitFailure> {
+        let launch = self.target_reading_launch(operations, &states);
+        let (batch, history, conditioning, metadata, steps) = match launch {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.restore_target_reads(operations, states);
+                return Err(SubmitFailure::Refused(error.into(), bindings));
+            }
+        };
+        let inputs = HeadLaunchInputs::reading_target(
+            batch,
+            crate::TargetReads { states, history },
+            conditioning,
+            graph_workspace,
+            graph_output,
+        );
+        let store = self.target_store.clone();
+        self.launch_head(inputs, &store, metadata, steps, false, bindings)
+    }
+
+    /// Validate and submit a prepared head launch, returning its held state to
+    /// the domain if validation or submission fails.
+    fn launch_head(
+        &mut self,
+        inputs: HeadLaunchInputs,
+        store: &Rc<StateStore>,
+        metadata: Vec<(RequestId, usize, usize)>,
+        steps: usize,
+        trace_launches: bool,
+        bindings: StateBindings,
+    ) -> Result<HeadFlight<F>, SubmitFailure> {
+        let launch = match ValidatedHeadLaunch::new(
+            inputs,
+            store,
+            self.domain.id(),
+            self.head_conditioning_bytes(),
+        ) {
+            Ok(launch) => launch,
+            Err((inputs, error)) => {
+                self.restore_head_state(&metadata, inputs.into_state());
+                return Err(SubmitFailure::Failed(DomainError::Invariant(error)));
+            }
+        };
+        let launch_trace = if trace_launches && !HEAD_LAUNCH_TRACED.swap(true, Ordering::Relaxed) {
             match self
                 .domain
                 .device()
@@ -266,10 +322,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Ok(submission) => submission,
             Err((error, launch)) => {
                 let (core, _, _) = launch.into_submission_parts();
-                let HeadState::Owned { advances, .. } = core.into_state() else {
-                    unreachable!("owned head launch")
-                };
-                self.restore_head_advances(&metadata, advances);
+                self.restore_head_state(&metadata, core.into_state());
                 return Err(SubmitFailure::Failed(error.into()));
             }
         };
@@ -285,80 +338,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         })
     }
 
-    /// Submit one batch of transactions of a head that keeps no history.
-    /// Each drafts from one anchor row at its request's accepted target
-    /// position, reading that state's history; nothing is written. The
-    /// flight holds the accepted target states and `bindings` until
-    /// `finish_head` returns them, so no target work, checkpoint or binding
-    /// change can touch the rows it reads.
-    fn submit_target_reading_head(
-        &mut self,
-        bindings: StateBindings,
-        operations: &[Operation],
-        graph_workspace: NativeGraphWorkspaceLease,
-        graph_output: NativeGraphOutputLease,
-        states: Vec<SequenceState>,
-    ) -> Result<HeadFlight<F>, SubmitFailure> {
-        let launch = self.target_reading_launch(operations, &states);
-        let (batch, history, metadata, steps) = match launch {
-            Ok(launch) => launch,
-            Err(error) => {
-                self.restore_target_reads(operations, states);
-                return Err(SubmitFailure::Refused(error.into(), bindings));
+    /// Return the state held by a head launch that did not run: accepted head
+    /// advances return to the head store; accepted target states return to the
+    /// target store.
+    fn restore_head_state(&mut self, metadata: &[(RequestId, usize, usize)], state: HeadState) {
+        match state {
+            HeadState::Owned { advances, .. } => self.restore_head_advances(metadata, advances),
+            HeadState::TargetReads { reads, .. } => {
+                for ((request, _, _), state) in metadata.iter().zip(reads.states) {
+                    self.put_target_state(*request, state);
+                }
             }
-        };
-        let conditioning = operations
-            .iter()
-            .filter_map(|operation| match operation {
-                Operation::Head { conditioning, .. } => Some(conditioning.clone()),
-                _ => None,
-            })
-            .collect();
-        let inputs = HeadLaunchInputs::reading_target(
-            batch,
-            crate::TargetReads { states, history },
-            conditioning,
-            graph_workspace,
-            graph_output,
-        );
-        let launch = match ValidatedHeadLaunch::new(
-            inputs,
-            &self.target_store,
-            self.domain.id(),
-            self.head_conditioning_bytes(),
-        ) {
-            Ok(launch) => launch,
-            Err((inputs, error)) => {
-                let HeadState::TargetReads { reads, .. } = inputs.into_state() else {
-                    unreachable!("target-reading head launch")
-                };
-                self.restore_target_reads(operations, reads.states);
-                return Err(SubmitFailure::Failed(DomainError::Invariant(error)));
-            }
-        };
-        let started = Instant::now();
-        let epoch = self.launch_epoch();
-        let submission = match self.family.submit_head(launch) {
-            Ok(submission) => submission,
-            Err((error, launch)) => {
-                let (core, _, _) = launch.into_submission_parts();
-                let HeadState::TargetReads { reads, .. } = core.into_state() else {
-                    unreachable!("target-reading head launch")
-                };
-                self.restore_target_reads(operations, reads.states);
-                return Err(SubmitFailure::Failed(error.into()));
-            }
-        };
-        let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
-        Ok(HeadFlight {
-            started: self.service_start(&requests, started),
-            epoch,
-            requests: metadata,
-            steps,
-            submission,
-            launch_trace: None,
-            bindings,
-        })
+        }
     }
 
     /// Return the accepted target states a head reading them held.
@@ -369,8 +360,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The batch of a head reading target history, the target history each
-    /// of its blocks binds, and per slot its request, entry rows and
-    /// proposals with the batch's steps.
+    /// of its blocks binds, its per-slot conditioning, and per slot its
+    /// request, entry rows and proposals with the batch's steps.
     #[allow(clippy::type_complexity)]
     fn target_reading_launch(
         &self,
@@ -380,6 +371,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         (
             crate::batching::ValidatedHeadBatch,
             Vec<crate::TargetHistoryRead>,
+            Vec<FeatureRows>,
             Vec<(RequestId, usize, usize)>,
             usize,
         ),
@@ -390,40 +382,37 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let mut seen = BTreeSet::new();
         let mut steps = 0usize;
+        let mut heads = Vec::with_capacity(operations.len());
         let mut metadata = Vec::with_capacity(operations.len());
         for (operation, state) in operations.iter().zip(states) {
             operation.validate().map_err(|error| error.to_string())?;
-            let Operation::Head {
-                request,
-                tokens,
-                position,
-                proposals,
-                form: DraftForm::Chained,
-                ..
-            } = operation
+            let Some(head) = HeadOp::from_operation(operation)
+                .filter(|head| head.form == DraftForm::Chained)
             else {
                 return Err("a head reading target history runs chained head operations".into());
             };
-            if !seen.insert(*request) {
+            if !seen.insert(head.request) {
                 return Err("head request is repeated".into());
             }
-            if tokens.len() != 1 || proposals.is_empty() || state.position() != *position {
+            if head.tokens.len() != 1
+                || head.proposals.is_empty()
+                || state.position() != head.position
+            {
                 return Err(
                     "a head reading target history drafts from one anchor row at the accepted \
                      target position"
                         .into(),
                 );
             }
-            steps = steps.max(proposals.len());
-            metadata.push((*request, tokens.len(), proposals.len()));
+            steps = steps.max(head.proposals.len());
+            metadata.push((head.request, head.tokens.len(), head.proposals.len()));
+            heads.push(head);
         }
-        let slots = operations
+        let slots = heads
             .iter()
             .zip(states)
             .enumerate()
-            .map(|(slot, (operation, state))| {
-                self.target_reading_slot(operation, state, steps, slot)
-            })
+            .map(|(slot, (head, state))| self.target_reading_slot(head, state, steps, slot))
             .collect::<Result<Vec<_>, _>>()?;
         let batch = crate::batching::ValidatedHeadBatch::from_slots(
             &slots,
@@ -463,7 +452,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok((batch, history, metadata, steps))
+        let conditioning = heads.iter().map(|head| head.conditioning.clone()).collect();
+        Ok((batch, history, conditioning, metadata, steps))
     }
 
     /// One transaction of a head reading target history, padded to `steps`
@@ -474,26 +464,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// selections are discarded.
     fn target_reading_slot(
         &self,
-        operation: &Operation,
+        head: &HeadOp<'_>,
         state: &SequenceState,
         steps: usize,
         slot: usize,
     ) -> Result<crate::batching::HeadSlot, String> {
-        let Operation::Head {
-            request,
-            tokens,
-            position,
-            proposals,
-            ..
-        } = operation
-        else {
-            return Err("non-head operation".into());
-        };
         let i32_of = |value: usize, what: &str| {
             i32::try_from(value).map_err(|_| format!("head {what} exceeds i32"))
         };
         let coordinates = *self
-            .input_coordinates(*request, *position, 1)?
+            .input_coordinates(head.request, head.position, 1)?
             .first()
             .ok_or("prepared input has no coordinate at the anchor")?;
         let histories = self
@@ -503,7 +483,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let from = self
                     .target_store
                     .history_domain_kind(domain)
-                    .visible_from(*position);
+                    .visible_from(head.position);
                 let visible = state
                     .visible_ranges(domain, from)
                     .into_iter()
@@ -534,11 +514,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             demand: crate::batching::Demand::NONE,
             select: None,
         };
-        let anchor = tokens.first().ok_or("a head transaction has no anchor")?;
-        let last = proposals.last();
+        let anchor = head.tokens.first().ok_or("a head transaction has no anchor")?;
+        let last = head.proposals.last();
         let selections = (0..steps)
             .map(|step| {
-                let spec = proposals
+                let spec = head
+                    .proposals
                     .get(step)
                     .or(last)
                     .ok_or("a head reading target history has no selection")?;
@@ -884,16 +865,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                                 .collect()
                         }),
                     },
-                    advance: advance.map(Advance::Step),
-                    primed: None,
-                    front: None,
+                    payload: PendingPayload::Head { advance },
                     rows: advance_rows(passes, rows, proposals),
                     committed_rows: rows,
                     kind: WorkKind::Decode,
                     physical_duration: Duration::ZERO,
                     timed: Timed::Untimed,
-                    image: None,
-                    awaited: None,
                 },
             )
             .collect();

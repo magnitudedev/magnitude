@@ -1431,9 +1431,6 @@ struct BankPricing {
     /// Each layer's request of its CPU site's verdict, where it holds a
     /// site: its CPU lines wait on it.
     sites: Vec<Option<magnitude_executor::assessment::SiteRequest>>,
-    /// The threads that read host memory at once beside the load (its
-    /// process's CPUs), which its memory line is keyed by.
-    readers: u64,
     /// The points the load's decisions wait on, which it requests of the
     /// measurement job as it loads and touches each time it prices again
     /// while their inputs are pending ([`load_measures`]), so the job
@@ -1533,7 +1530,6 @@ impl LoadPricing {
             storage: kernel_cache.clone().unwrap_or_default(),
             lines: Arc::from([]),
             sites: Vec::new(),
-            readers: 1,
             requests: Vec::new(),
         });
         let pricing = Self {
@@ -1587,7 +1583,7 @@ impl BankPricing {
         lines: Arc<[magnitude_executor::assessment::BankLines]>,
         sites: Vec<Option<magnitude_executor::assessment::SiteRequest>>,
     ) -> Result<Self, LoadError> {
-        let (requests, readers) = expert_requests(bank, &sites)?;
+        let requests = expert_requests(bank, &sites)?;
         tracing::info!(
             "the expert host lines of {} layers, {} with CPU lines",
             lines.len(),
@@ -1597,7 +1593,6 @@ impl BankPricing {
             storage: manifest.store().to_path_buf(),
             lines,
             sites,
-            readers,
             requests,
         })
     }
@@ -1678,7 +1673,7 @@ fn expert_measures(
     // A host tier's record read from host memory, at its memory line.
     let memory = match bank.tiered() {
         false => Priced::Measured(None),
-        true => MemoryCosts::priced(topology, info, pricing.readers, &records)
+        true => MemoryCosts::priced(topology, info, MemoryCosts::readers(topology), &records)
             .and_then(|memory| Priced::Measured(Some(memory.byte_seconds))),
     };
     // A CPU site's lines as the job stored them, and whose verdict admits it:
@@ -1732,22 +1727,19 @@ fn expert_measures(
 }
 
 /// What `bank` waits on of the measurement job at runtime, in the order
-/// the job measures it after assessment's standing requests ([`touch`]),
-/// and the host memory readers its pricing reads the standing line of (the
-/// executor's costs and the host memory's line are standing requests, of
-/// no load): a host tier's copies' blocks are the tier copy's points; each
-/// of its `sites` (by streamed layer) serves once admitted with its lines
-/// stored. A load serves without them until the job has measured them.
+/// the job measures it after assessment's standing requests ([`touch`]):
+/// a host tier's copies' blocks are the tier copy's points; each of its
+/// `sites` (by streamed layer) serves once admitted with its lines stored.
+/// A load serves without them until the job has measured them.
 fn expert_requests(
     bank: &magnitude_executor::ExpertBankPlan,
     sites: &[Option<magnitude_executor::assessment::SiteRequest>],
-) -> Result<(Vec<magnitude_executor::assessment::PointRequest>, u64), LoadError> {
+) -> Result<Vec<magnitude_executor::assessment::PointRequest>, LoadError> {
     use magnitude_executor::assessment::{ConvertCosts, PointRequest};
-    let readers = seismic::threads::quota().get() as u64;
     let tier = bank.tiered().then_some(PointRequest::TierCopy).into_iter();
     let sites = sites.iter().flatten().cloned().map(PointRequest::Site);
     let converts = (!bank.tiered()).then(|| ConvertCosts::forms(bank).map(PointRequest::Convert)).into_iter().flatten();
-    Ok((tier.chain(sites).chain(converts).collect(), readers))
+    Ok(tier.chain(sites).chain(converts).collect())
 }
 
 /// The volumes a load of `artifact` reads for: the largest shard on each
@@ -1796,7 +1788,7 @@ pub fn request_load_points(catalog: &Rc<Devices>, manifest: &ExecutionManifest, 
     let sites = draft.site_requests(&numerical_profile(manifest)?).map_err(internal)?;
     let mut requests = Vec::new();
     if let Some(bank) = bank {
-        requests.extend(expert_requests(bank, &sites)?.0);
+        requests.extend(expert_requests(bank, &sites)?);
     }
     let volumes = volumes(package.target(), bank).map_err(internal)?;
     requests.extend(volumes.iter().map(|(source, urgent)| volume_request(source, urgent.as_ref())));
@@ -2144,16 +2136,16 @@ impl Startup {
 /// or cache) is the store's [`Short`], refused as a startup allocation is
 /// ([`refused`]); anything else is internal.
 fn domain_refused(error: magnitude_executor::DomainError, ledgers: &DeviceLedgers) -> LoadError {
-    use magnitude_executor::{CapacityError, DomainError, ResourceKind};
+    use magnitude_executor::{DomainError, ResourceKind};
     let store = |resource| match resource {
         ResourceKind::DeviceMemory => Some(ledgers.device().store()),
         ResourceKind::HostStaging => Some(ledgers.host().store()),
         _ => None,
     };
     match error {
-        DomainError::Capacity(CapacityError { resource, required, available }) => match store(resource) {
-            Some(store) => refused("the executor domain", Short { store, required, over: required.saturating_sub(available) }),
-            None => internal(format!("the executor domain: {resource:?} requires {required} units; {available} available")),
+        DomainError::Capacity(error) => match store(error.resource) {
+            Some(store) => refused("the executor domain", Short { store, required: error.required, over: error.lacks() }),
+            None => internal(format!("the executor domain: {:?} requires {} units; {} available", error.resource, error.required, error.available)),
         },
         error => internal(error.to_string()),
     }
@@ -2192,8 +2184,9 @@ fn import_refused(error: magnitude_executor::ResidencyError, device: &seismic::D
 }
 
 /// A startup allocation `short` refused, for `purpose`.
-fn refused(purpose: &str, Short { store, required, over }: Short) -> LoadError {
-    LoadError::InsufficientMemory { purpose: purpose.to_owned(), store, memory: InsufficientMemory { required, available: required - over } }
+fn refused(purpose: &str, short: Short) -> LoadError {
+    let available = short.available();
+    LoadError::InsufficientMemory { purpose: purpose.to_owned(), store: short.store, memory: InsufficientMemory { required: short.required, available } }
 }
 
 /// Run one throwaway single-row forward before readiness, so a broken device
@@ -2704,5 +2697,48 @@ mod tests {
         search(catalog, &manifest, &package, Rc::new(|_| ())).unwrap();
         let kernel_cache = KernelCache::open(cache.path().to_owned(), DEFAULT_KERNEL_CACHE_BYTES).unwrap();
         assert!(kernel_cache.prepared(&prepared_key(&manifest).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn standing_host_memory_follows_topology_quota() {
+        use magnitude_executor::assessment::{MemoryCosts, PointRequest, Priced, StreamedFigures};
+        let live = seismic::threads::quota().get();
+        let quota = live + 7;
+        let mut reports = seismic::fixtures::rtx3090();
+        reports.processors = seismic::Processors::flat(
+            (0..quota).collect(),
+            std::num::NonZeroUsize::new(quota).unwrap(),
+        );
+        let topology = seismic::fixtures::topology(&reports);
+        let cuda = topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() == BackendName::Cuda)
+            .expect("rtx3090 fixture has a CUDA executor");
+        let expected = quota as u64;
+        assert_eq!(MemoryCosts::readers(&topology), expected);
+
+        let dir = std::env::temp_dir();
+        let standing = magnitude_executor::assessment::requests::standing(&topology, cuda, &dir).unwrap();
+        assert!(
+            standing.contains(&PointRequest::HostMemory { readers: expected }),
+            "standing requests must key HostMemory by topology quota {expected}: {standing:?}"
+        );
+
+        let store = seismic::measure::HeldStore::default();
+        let Priced::Pending(pending) = MemoryCosts::priced(&topology, cuda, MemoryCosts::readers(&topology), &store) else {
+            panic!("empty store must leave MemoryCosts pending");
+        };
+        assert_eq!(pending.outstanding().standing, vec![PointRequest::HostMemory { readers: expected }]);
+
+        let (figures, _) = StreamedFigures::stored(&topology, cuda, &dir, &store);
+        let Priced::Pending(pending) = figures else {
+            panic!("empty store must leave StreamedFigures pending");
+        };
+        assert!(
+            pending.outstanding().standing.contains(&PointRequest::HostMemory { readers: expected }),
+            "StreamedFigures must request HostMemory under topology quota {expected}: {:?}",
+            pending.outstanding().standing
+        );
     }
 }

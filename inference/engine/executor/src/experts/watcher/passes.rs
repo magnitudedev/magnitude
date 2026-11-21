@@ -2,10 +2,12 @@
 //! what a pass takes, of which every decision priced by a pass's time
 //! reads its own figure, and none keeps another.
 //!
-//! - **What a miss costs** ([`MissCost`]): the seconds a pass parked per
-//!   file miss, and whether the drive is the binding term, by which every
-//!   read ahead is admitted ([`MissCost::break_even`]) and the hint gate
-//!   values what its reads save (`gate::HintGate`).
+//! - **Read-ahead admission & miss stall** ([`Passes::read_admission`],
+//!   `magnitude_cost_model::ReadAdmission`): the seconds a pass parked per
+//!   file miss (falling back to plain-pass stall), the drive line, and
+//!   whether the drive is the binding term, by which every read ahead is
+//!   admitted (`ReadAdmission::break_even`) and the hint gate values what
+//!   its reads save (`gate::HintGate`).
 //! - **The terms** ([`Measured`], `magnitude_cost_model::Terms`): a pass's
 //!   busy seconds on each resource, by how many front rows it ran a
 //!   sequence (its depth): its resident compute (its time less what it
@@ -41,7 +43,7 @@
 use super::telemetry::FRONT_DEPTHS;
 use crate::experts::horizon::{self, Time, Window};
 use crate::experts::interest::{Form, Stands};
-use magnitude_cost_model::Terms;
+use magnitude_cost_model::{ReadAdmission, ReadLine, Terms};
 use std::ops::AddAssign;
 
 /// One decode pass as timed: its launch's rows, its depth (the guessed rows
@@ -220,90 +222,9 @@ impl std::fmt::Debug for Passes {
     }
 }
 
-/// What a miss costs the decode over the latest passes timed
-/// ([`Passes::miss_cost`]): the seconds a pass parked per file miss
-/// (`stall`, none before a miss is counted), and whether the drive is the
-/// binding term (`binds`: its busy seconds at least every other term's,
-/// [`Terms`]; not before a pass is timed). The one measure of what a read
-/// ahead saves and costs, by which every read ahead is admitted, an exact
-/// row's hints' and a front row's names alike ([`Self::break_even`]), and
-/// the hint gate values what its reads save.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(super) struct MissCost {
-    pub stall: Option<f64>,
-    binds: bool,
-    /// Mean resident compute seconds per decode pass over the window
-    /// (`Terms::compute`, 0 before a pass is timed): divided by streamed
-    /// layers, the per-layer idle compute window a read ahead overlaps
-    /// (`designs/streamed-decode.md` §5).
-    pub compute: f64,
-}
-
-impl MissCost {
-    /// The probability of use at which a read ahead the drive reads in
-    /// `read` seconds breaks even: below it a read ahead costs more than it
-    /// saves, at or above it it pays.
-    ///
-    /// A read ahead holds the drive its read, `t`, whether or not it is
-    /// used; a used one spares the demand read its miss would have made, so
-    /// the drive's work changes by what the unused ones add, `(1 − p)·t`.
-    /// That lengthens the token exactly where the drive is the binding term
-    /// (`T = max(C, D, …)`): there a wasted read costs a full `t`, and
-    /// anywhere else nothing, the drive having that slack. A used read also
-    /// saves the stall its miss would have taken, `s`, the passes' parked
-    /// seconds over their file misses. So it pays where
-    /// `p·s ≥ (1 − p)·w`, `w = t` where the drive binds and none elsewhere:
-    /// `p ≥ w / (w + s)`. On a saturated drive that is about a half (a
-    /// miss stalls about a read), which a front row's hint at 0.15 never
-    /// reaches; with the drive idle beside a resident-bound pass every read
-    /// that may be used pays. Before any pass is timed nothing binds and
-    /// every read pays; a drive that binds with no file miss to save admits
-    /// none. What a landing displaces is placement's to price.
-    /// `stall_l(n)` (design §3.5): the critical-path stall of `reads` demand
-    /// reads at `layer` fetched together, priced by this one owner of what a
-    /// miss costs the decode (the one U·t is built from). A layer's demand
-    /// reads queue on one link, so the critical path is their sum:
-    /// `reads * measured_per_miss_cost` (0 before any miss is measured).
-    /// `reads` is real and non-negative: the gate prices `m − exclusive·cohort`.
-    ///
-    /// # Panics
-    /// Where `reads` is non-finite or negative.
-    pub fn layer_stall(&self, _layer: usize, reads: f64) -> f64 {
-        assert!(reads.is_finite() && reads >= 0.0, "layer_stall reads must be finite and non-negative, got {reads}");
-        reads * self.stall.unwrap_or(0.0)
-    }
-
-    /// The probability of use at which a read ahead the drive reads in `read`
-    /// seconds breaks even, given `idle` seconds of remaining per-layer idle
-    /// compute (`designs/streamed-decode.md` §5): below it a read ahead costs
-    /// more than it saves, at or above it it pays.
-    ///
-    /// A read ahead overlaps `overlap = min(read, idle)` of otherwise-idle
-    /// drive time during compute, so when the drive binds its net critical-path
-    /// waste if wrong is `w = (read - overlap).max(0)` (0 when `idle >= read`
-    /// or the drive does not bind). A used read still consumes `read` seconds
-    /// of drive bandwidth on a binding drive, so it saves only the overlapped
-    /// compute window plus any per-miss park overhead above `read` itself:
-    /// `saved = (overlap + (stall - read).max(0)).min(stall)`. It pays where
-    /// `p · saved >= (1 − p) · w`, i.e. `p >= w / (w + saved)` (or `1` when
-    /// `saved == 0`).
-    pub fn break_even(&self, read: f64, idle: f64) -> f64 {
-        assert!(idle.is_finite() && idle >= 0., "idle compute window must be finite and non-negative, got {idle}");
-        let overlap = read.min(idle);
-        let waste = if self.binds { (read - overlap).max(0.) } else { 0. };
-        match (waste > 0., self.stall) {
-            (false, _) => 0.,
-            (true, Some(stall)) => {
-                let saved = (overlap + (stall - read).max(0.)).min(stall);
-                if saved > 0. { waste / (waste + saved) } else { 1. }
-            }
-            (true, None) => 1.,
-        }
-    }
-}
-
 /// What the regime's pass is decided on (`magnitude_cost_model::Regime`),
-/// as the decode passes of the latest turnover measured it: the latest's depth (`depth`,
+/// as the decode passes of the latest turnover measured it: the streamed
+/// layer count (`layers`), the latest's depth (`depth`,
 /// the depth in effect) and whether it verified (`verifying`, after which
 /// the next pass's chain is drafted to its own depth); a pass's mean terms
 /// among the passes of each depth, front and verify alike
@@ -328,6 +249,7 @@ impl MissCost {
 /// back), and the share of picks the bank held (`held`, none of no pick).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Measured {
+    pub layers: usize,
     pub depth: usize,
     pub verifying: bool,
     pub terms: [Option<Terms>; DEPTHS],
@@ -410,14 +332,16 @@ impl Passes {
         (all.pass.reads > 0.).then(|| (terms, all.pass.drive / all.pass.reads))
     }
 
-    /// What a miss costs over the window ([`MissCost`]).
-    pub fn miss_cost(&mut self) -> MissCost {
-        let all = self.all();
-        let Pass { parked, misses, .. } = all.pass;
-        let terms = all.terms();
-        let binds = terms.is_some_and(|terms| terms.drive > 0. && terms.drive >= terms.compute.max(terms.link).max(terms.cpu).max(terms.memory));
-        let compute = terms.map_or(0., |terms| terms.compute);
-        MissCost { stall: (misses > 0.).then(|| parked / misses), binds, compute }
+    /// What a read ahead is admitted by over the window ([`ReadAdmission`]),
+    /// given the drive's measured read line (`drive_line`).
+    pub fn read_admission(&mut self, drive_line: Option<ReadLine>) -> ReadAdmission {
+        let epoch = self.epoch();
+        let all = self.all.read(epoch).map(Sums::over).unwrap_or_default();
+        let plain = self.depth(false, 0, epoch).pass;
+        let terms = all.terms().unwrap_or_default();
+        let demand_stall = (all.pass.misses > 0.).then(|| all.pass.parked / all.pass.misses);
+        let plain_stall = (plain.missed > 0.).then(|| plain.parked / plain.missed);
+        ReadAdmission { terms, drive_line, demand_stall, plain_stall }
     }
 
     /// The latest pass's rows, and a pass's mean time over the window: what
@@ -449,11 +373,12 @@ impl Passes {
         }
     }
 
-    /// What the regime is decided on ([`Measured`]), beside the ranking's
-    /// misses at each depth of foresight (`needed`), and the guesses' stand
-    /// rates as their one owner (`stands`) holds them: the first front
-    /// row's and a verify pass's rows'; none before a pass is timed.
-    pub fn measured(&mut self, needed: [[Option<magnitude_cost_model::Needed>; DEPTHS]; 2], stands: &Stands) -> Option<Measured> {
+    /// What the regime is decided on ([`Measured`]), beside the streamed layer
+    /// count (`layers`), the ranking's misses at each depth of foresight
+    /// (`needed`), and the guesses' stand rates as their one owner (`stands`)
+    /// holds them: the first front row's and a verify pass's rows'; none before
+    /// a pass is timed.
+    pub fn measured(&mut self, layers: usize, needed: [[Option<magnitude_cost_model::Needed>; DEPTHS]; 2], stands: &Stands) -> Option<Measured> {
         let latest = self.latest?;
         let epoch = self.epoch();
         let all = self.all.read(epoch).map(Sums::over).unwrap_or_default();
@@ -504,6 +429,7 @@ impl Passes {
             std::array::from_fn(|depth| self.depth(true, depth, epoch).terms());
         let terms = std::array::from_fn(|depth| front_terms[depth].or(verify_terms[depth]));
         Some(Measured {
+            layers,
             depth: latest.depth,
             verifying: latest.verifies,
             terms,
@@ -511,8 +437,8 @@ impl Passes {
             paths,
             stall: (plain.missed > 0.).then(|| plain.parked / plain.missed),
             needed,
-            stand: stands.rate(1, Form::Front),
-            accepts: std::array::from_fn(|depth| stands.rate(depth + 1, Form::Verify)),
+            stand: stands.live_rate(1, Form::Front),
+            accepts: std::array::from_fn(|depth| stands.live_rate(depth + 1, Form::Verify)),
             fresh: std::array::from_fn(|lag| (routed.layers[lag] > 0.).then(|| routed.fresh[lag] / routed.layers[lag])),
             held: (routed.picks > 0.).then(|| (routed.held / routed.picks).clamp(0., 1.)),
         })
@@ -555,57 +481,67 @@ mod tests {
         Pass { rows: 1, depth: 0, seconds, parked, misses, drive: misses * 1e-3, ..Pass::default() }
     }
 
-    /// A read ahead breaks even where its probability of use pays its
-    /// waste on the binding term: drive-bound (68 ms of reads a 100 ms
-    /// pass computing 35 ms), a wasted read costs its whole 1 ms and a used
-    /// one saves a miss's 0.96 ms stall, so reads pay from about 0.51 and a
-    /// front row's hint at 0.15 does not (measured on code at 8K: two-row
-    /// 410.9 ms a token against plain's 306.8, 115.5 of 152 reads ahead
-    /// unused). Resident-bound (32 ms of compute over 21 ms of reads) the
-    /// drive has slack: every read that may be used pays, the hint at 0.15
-    /// too. Before a pass is timed every read pays; a binding drive with no
-    /// file miss to save admits none.
+    /// A read ahead breaks even where its pipelined marginal bandwidth cost
+    /// `w_net = (t_bw - min(t_bw, idle)).max(0)` on a binding drive pays
+    /// against the demand stall `s_demand` it avoids: `p* = (w_net / s_demand).min(1)`.
+    /// When prefetch achieves 100% hit rate (`misses == 0`), `demand_stall` is
+    /// `None` and `ReadAdmission` falls back to `plain_stall` (`plain.parked / plain.missed`)
+    /// so `break_even` never collapses to `1.0`.
     #[test]
     fn the_break_even_prices_waste_on_the_binding_term() {
-        let cost = |seconds: f64, parked: f64, misses: f64| {
+        let bytes = 3_090_000_u64;
+        // M4 Pro drive line: lambda = 0.14 ms, t_bw = 0.67 ms for 3.09 MB.
+        let m4_line = ReadLine::new(0.14e-3, 0.67e-3 / bytes as f64).unwrap();
+        let admission = |seconds: f64, parked: f64, misses: f64, drive: f64, line: Option<ReadLine>| {
             let (mut passes, _) = passes();
-            passes.timed(plain(seconds, parked, misses));
-            passes.miss_cost()
+            passes.timed(Pass { rows: 1, depth: 0, seconds, parked, misses, missed: misses, drive, ..Pass::default() });
+            passes.read_admission(line)
         };
-        let drive_bound = cost(0.1, 0.065, 68.);
-        // stall = 0.065 / 68 ≈ 0.956 ms <= read = 1.0 ms: with no idle compute
-        // and no park overhead above read, a used hint saves 0 on a binding
-        // drive, so break-even is 1.0 (only a certain read pays).
-        assert_eq!(drive_bound.break_even(1e-3, 0.), 1., "saturated drive with stall <= read and no idle");
-        // Partial idle compute overlap saves `overlap = 0.4 ms` and wastes `0.6 ms` -> 0.6.
-        let at_partial = drive_bound.break_even(1e-3, 0.4e-3);
-        assert!((at_partial - 0.6).abs() < 1e-9, "{at_partial}");
-        // When demand park stall exceeds the read itself (e.g. shallow-QD park
-        // latency: stall = 1.25 ms vs read = 1.0 ms -> 0.25 ms overhead), a
-        // hit saves that overhead even at idle = 0 -> 1.0 / (1.0 + 0.25) = 0.8.
-        let high_overhead = cost(0.1, 0.085, 68.);
-        let at_zero_overhead = high_overhead.break_even(1e-3, 0.);
-        assert!((at_zero_overhead - 1e-3 / (1e-3 + 0.25e-3)).abs() < 1e-9, "{at_zero_overhead}");
-        // Idle compute covering the read makes it free (waste = 0).
-        assert_eq!(drive_bound.break_even(1e-3, 1e-3), 0., "idle == read");
-        assert_eq!(drive_bound.break_even(1e-3, 2e-3), 0., "idle > read");
-        assert!((drive_bound.compute - 0.035).abs() < 1e-9, "{}", drive_bound.compute);
 
-        let resident_bound = cost(0.05, 0.018, 21.);
-        assert_eq!(resident_bound.break_even(1e-3, 0.), 0., "non-binding drive");
-        assert_eq!(resident_bound.break_even(1e-3, 0.4e-3), 0., "non-binding drive with idle");
-        assert_eq!(passes().0.miss_cost().break_even(1e-3, 0.), 0., "nothing timed");
-        let (mut parked_on_nothing, _) = passes();
-        parked_on_nothing.timed(Pass { drive: 0.04, ..plain(0.05, 0.04, 0.) });
-        assert_eq!(parked_on_nothing.miss_cost().break_even(1e-3, 0.), 1., "a binding drive with no file miss to save");
-        assert_eq!(parked_on_nothing.miss_cost().break_even(1e-3, 1e-3), 0., "free when idle covers read");
-        // layer_stall prices queued demand reads as reads * per_miss_stall.
+        // 1. M4 Pro (bandwidth-saturated): t_bw = 0.67 ms, s_demand = 0.81 ms -> p* = 0.67 / 0.81 ≈ 0.83.
+        let m4 = admission(0.20, 0.081, 100., 0.160, Some(m4_line));
+        assert!((m4.break_even(bytes, 0.) - 0.67 / 0.81).abs() < 1e-9, "{}", m4.break_even(bytes, 0.));
+        // Partial idle overlap: idle = 0.27 ms -> w_net = 0.40 ms -> p* = 0.40 / 0.81.
+        assert!((m4.break_even(bytes, 0.27e-3) - 0.40 / 0.81).abs() < 1e-9);
+        // Full idle overlap covers t_bw -> free (0.0).
+        assert_eq!(m4.break_even(bytes, 0.67e-3), 0.);
+        assert_eq!(m4.break_even(bytes, 1.0e-3), 0.);
+        assert!((m4.terms.compute - 0.119).abs() < 1e-9, "{}", m4.terms.compute);
+
+        // 2. GB10 (latency-bound): t_bw = 0.08 ms, lambda = 0.32 ms, s_demand = 0.40 ms -> p* = 0.20.
+        let gb10_line = ReadLine::new(0.32e-3, 0.08e-3 / bytes as f64).unwrap();
+        let gb10 = admission(0.07, 0.040, 100., 0.100, Some(gb10_line));
+        assert!((gb10.break_even(bytes, 0.) - 0.20).abs() < 1e-9, "{}", gb10.break_even(bytes, 0.));
+
+        // 3. GPU-bound: drive does not bind -> p* = 0.0.
+        let resident_bound = admission(0.05, 0.018, 21., 0.021, Some(m4_line));
+        assert_eq!(resident_bound.break_even(bytes, 0.), 0., "non-binding drive");
+        assert_eq!(resident_bound.break_even(bytes, 0.4e-3), 0., "non-binding drive with idle");
+
+        // 4. Nothing timed -> p* = 0.0.
+        assert_eq!(passes().0.read_admission(Some(m4_line)).break_even(bytes, 0.), 0., "nothing timed");
+
+        // 5. 100% prefetch hit rate in later epochs: plain pass had stall = 0.81 ms,
+        //    then two epochs of front passes have misses == 0 (demand_stall == None)
+        //    while drive still binds. `plain_stall` keeps p* = 0.67 / 0.81 (never 1.0!).
+        let (mut p, time) = passes();
+        p.timed(Pass { rows: 1, depth: 0, seconds: 0.20, parked: 0.081, misses: 100., missed: 100., drive: 0.160, ..Pass::default() });
+        turn_epoch(&time, 1, 2);
+        p.timed(Pass { rows: 2, depth: 1, seconds: 0.16, parked: 0.0, misses: 0., missed: 100., drive: 0.160, ..Pass::default() });
+        turn_epoch(&time, 2, 2);
+        p.timed(Pass { rows: 2, depth: 1, seconds: 0.16, parked: 0.0, misses: 0., missed: 100., drive: 0.160, ..Pass::default() });
+        let full_hit = p.read_admission(Some(m4_line));
+        assert_eq!(full_hit.demand_stall, None);
+        assert!((full_hit.plain_stall.unwrap() - 0.81e-3).abs() < 1e-12);
+        assert!((full_hit.break_even(bytes, 0.) - 0.67 / 0.81).abs() < 1e-9, "100% prefetch hit must not collapse to 1.0");
+
+        // 6. layer_stall prices queued demand reads as reads * demand_stall.or(plain_stall).
         let (mut p, _) = passes();
         p.timed(plain(0.1, 0.05, 50.));
-        let cost = p.miss_cost();
-        assert!((cost.layer_stall(0, 3.0) - 3.0 * 1e-3).abs() < 1e-12);
-        assert_eq!(cost.layer_stall(0, 0.0), 0.0);
-        assert_eq!(MissCost::default().layer_stall(0, 4.0), 0.0);
+        let cost = p.read_admission(None);
+        assert!((cost.layer_stall(3.0) - 3.0 * 1e-3).abs() < 1e-12);
+        assert_eq!(cost.layer_stall(0.0), 0.0);
+        assert_eq!(ReadAdmission::default().layer_stall(4.0), 0.0);
     }
 
     /// The regime's figures are the window's: each kind's terms apart; each
@@ -619,13 +555,13 @@ mod tests {
     fn the_regime_is_measured_over_the_window_by_kind() {
         let (mut passes, time) = passes();
         let stands = unjudged(time.clone());
-        assert_eq!(passes.measured([[None; DEPTHS]; 2], &stands), None);
+        assert_eq!(passes.measured(48, [[None; DEPTHS]; 2], &stands), None);
         passes.timed(Pass { missed: 100., reads: 100., unused: [[2., 0., 0., 0., 0., 0., 0., 0.], [0.; DEPTHS]], ..plain(0.13, 0.1, 100.) });
         let deep = Pass { rows: 3, depth: 2, seconds: 0.1, parked: 0.06, misses: 60., missed: 80., reads: 80., drive: 0.08, ..Pass::default() };
         passes.timed(Pass { unused: [[2., 6., 4., 0., 0., 0., 0., 0.], [0.; DEPTHS]], ..deep });
-        let measured = passes.measured([[Some(magnitude_cost_model::Needed::Executed(90.)); DEPTHS]; 2], &stands).expect("passes timed");
+        let measured = passes.measured(48, [[Some(magnitude_cost_model::Needed::Executed(90.)); DEPTHS]; 2], &stands).expect("passes timed");
         let compute = |depth: usize| measured.terms[depth].map(|terms| terms.compute);
-        assert_eq!((measured.depth, measured.needed[0][0], measured.stand, measured.accepts), (2, Some(magnitude_cost_model::Needed::Executed(90.)), None, [None; FRONT_DEPTHS]));
+        assert_eq!((measured.layers, measured.depth, measured.needed[0][0], measured.stand, measured.accepts), (48, 2, Some(magnitude_cost_model::Needed::Executed(90.)), None, [None; FRONT_DEPTHS]));
         assert!((compute(0).unwrap() - 0.03).abs() < 1e-12 && (compute(2).unwrap() - 0.04).abs() < 1e-12, "{measured:?}");
         assert_eq!(measured.terms[1], None, "no pass of depth 1: {measured:?}");
         let paths = measured.paths.as_ref().expect("a miss counted");
@@ -641,7 +577,7 @@ mod tests {
         passes.timed(plain(0.05, 0.01, 1.));
         turn_epoch(&time, 2, 2);
         passes.timed(plain(0.05, 0.01, 1.));
-        let measured = passes.measured([[None; DEPTHS]; 2], &stands).expect("passes timed");
+        let measured = passes.measured(48, [[None; DEPTHS]; 2], &stands).expect("passes timed");
         assert_eq!(measured.depth, 0);
         assert!((measured.terms[2].unwrap().compute - 0.04).abs() < 1e-12, "unrun depth keeps its last measured compute");
         assert!(measured.paths.is_none() && measured.stall.is_none(), "no miss of the memory the GPU computes from counted: {measured:?}");
@@ -663,7 +599,7 @@ mod tests {
         passes.timed(Pass { rows: 3, depth: 2, seconds: 0.06, parked: 0.01, ..front });
         // Depth 1 has both front (compute = 0.04) and verify (compute = 0.06).
         passes.timed(Pass { verifies: true, seconds: 0.07, unused: [[0.; DEPTHS], [0., 2., 0., 0., 0., 0., 0., 0.]], ..front });
-        let measured = passes.measured([[Some(magnitude_cost_model::Needed::Executed(10.)); DEPTHS]; 2], &unjudged(time)).expect("passes timed");
+        let measured = passes.measured(48, [[Some(magnitude_cost_model::Needed::Executed(10.)); DEPTHS]; 2], &unjudged(time)).expect("passes timed");
         assert!(measured.verifying, "{measured:?}");
         assert!((measured.terms[1].unwrap().compute - 0.04).abs() < 1e-12, "front depth 1 compute alone: {measured:?}");
         assert!((measured.verify_terms[1].unwrap().compute - 0.06).abs() < 1e-12, "verify depth 1 compute alone: {measured:?}");
@@ -697,7 +633,7 @@ mod tests {
             ..Pass::default()
         });
         let measured = passes
-            .measured([[Some(magnitude_cost_model::Needed::Executed(20.)); DEPTHS]; 2], &unjudged(time))
+            .measured(48, [[Some(magnitude_cost_model::Needed::Executed(20.)); DEPTHS]; 2], &unjudged(time))
             .expect("passes timed");
         let paths = measured.paths.as_ref().expect("misses counted");
         assert_eq!(paths.len(), 4);
@@ -723,7 +659,7 @@ mod tests {
         for _ in 0..9 {
             passes.timed(Pass { verifies: true, unused: [[2., 0., 0., 0., 0., 0., 0., 0.], [0.; DEPTHS]], ..base });
         }
-        let measured = passes.measured([[Some(magnitude_cost_model::Needed::Executed(10.)); DEPTHS]; 2], &unjudged(time)).expect("passes timed");
+        let measured = passes.measured(48, [[Some(magnitude_cost_model::Needed::Executed(10.)); DEPTHS]; 2], &unjudged(time)).expect("passes timed");
         let wasted = &measured.paths.as_ref().expect("a miss counted")[0].wasted;
         let front_0 = wasted.front[0].expect("depth 0 waste");
         let verify_0 = wasted.verify[0].expect("depth 0 waste");
@@ -790,7 +726,7 @@ mod tests {
         };
         passes.timed(fits);
         let measured = passes
-            .measured([[Some(magnitude_cost_model::Needed::Executed(40.)); DEPTHS]; 2], &stands)
+            .measured(48, [[Some(magnitude_cost_model::Needed::Executed(40.)); DEPTHS]; 2], &stands)
             .expect("passes timed");
         assert_eq!(measured.stall, Some(0.), "no file-miss park stall when Host RAM holds every expert");
         let regime = magnitude_cost_model::Regime {
@@ -801,6 +737,7 @@ mod tests {
             stall: measured.stall,
             overhead: None,
             paths: measured.paths.expect("VRAM misses accounted in paths"),
+            routes: magnitude_cost_model::VerifyRoutes::default(),
         };
         assert_eq!(regime.depth(), 0, "100% Host RAM with flat U(k) must stay plain (depth 0), not falsely front-row");
     }
@@ -820,7 +757,7 @@ mod tests {
         };
         passes.timed(Pass { routed: routed(8., 480., 120.), ..plain(0.1, 0.05, 50.) });
         passes.timed(Pass { routed: routed(6., 480., 200.), ..plain(0.1, 0.05, 50.) });
-        let measured = passes.measured([[None; DEPTHS]; 2], &stands).expect("passes timed");
+        let measured = passes.measured(48, [[None; DEPTHS]; 2], &stands).expect("passes timed");
         assert_eq!(measured.fresh[..3], [Some(7.), Some(7.), None]);
         assert!((measured.held.unwrap() - 320. / 960.).abs() < 1e-12, "{measured:?}");
         assert_eq!(measured.routes(), magnitude_cost_model::FrontRoutes { fresh: vec![7., 7.], held: measured.held });
@@ -828,7 +765,41 @@ mod tests {
         passes.timed(plain(0.05, 0.01, 1.));
         turn_epoch(&time, 2, 2);
         passes.timed(plain(0.05, 0.01, 1.));
-        let measured = passes.measured([[None; DEPTHS]; 2], &stands).expect("passes timed");
+        let measured = passes.measured(48, [[None; DEPTHS]; 2], &stands).expect("passes timed");
         assert_eq!((measured.fresh, measured.held), ([None; LAGS], None), "the routed passes left the window");
+    }
+
+    /// A stale low `Form::Verify` warmup stand rate does not permanently lock
+    /// out `Verify` while `Form::Front` is actively measuring a higher live
+    /// stand rate on the same MTP drafter.
+    #[test]
+    fn stale_verify_stand_rate_uses_live_front_rate_in_measured() {
+        let (mut passes, time) = passes();
+        let stands = unjudged(time.clone());
+        passes.timed(plain(0.05, 0.01, 10.));
+
+        // Warmup: Verify runs 7 steps at 5/7 = 0.714 on step 1.
+        time.lock().register(1, Advance::Known(Tokens::new(1.0)));
+        for stood in [true, true, true, true, true, false, false] {
+            stands.count(1, Form::Verify, stood);
+        }
+        let during_verify = passes.measured(48, [[None; DEPTHS]; 2], &stands).expect("passes timed");
+        assert!((during_verify.accepts[0].unwrap() - 5.0 / 7.0).abs() < 1e-12);
+        assert_eq!(during_verify.stand, None, "unjudged front stays None");
+
+        // Bank resizes and Front runs subsequent steps with 100% acceptance:
+        // Front is strictly fresher than stale Verify, so `accepts[0]` reflects
+        // the live MTP drafter rate instead of staying locked at 5/7.
+        turn_epoch(&time, 2, 2);
+        stands.count(1, Form::Front, true);
+        let during_front = passes.measured(48, [[None; DEPTHS]; 2], &stands).expect("passes timed");
+        assert_eq!(during_front.stand, Some(1.0));
+        assert_eq!(during_front.accepts[0], Some(1.0), "stale verify falls back to fresher live front rate");
+
+        // Once Verify runs again, Verify is freshest and uses its own rate.
+        turn_epoch(&time, 3, 2);
+        stands.count(1, Form::Verify, true);
+        let reentered = passes.measured(48, [[None; DEPTHS]; 2], &stands).expect("passes timed");
+        assert!((reentered.accepts[0].unwrap() - 6.0 / 8.0).abs() < 1e-12);
     }
 }

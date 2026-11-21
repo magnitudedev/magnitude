@@ -2042,14 +2042,19 @@ fn admit(mut params: Vec<&mut NativeParamDecl>, conjuncts: Vec<Expr>) -> Result<
         if values.len() == param.values.len() {
             continue;
         }
-        let NativeDefaultDecl::Value(Expr { kind: ExprKind::Int(default), .. }) = param.default else {
-            return Err(error(
-                param.span,
-                format!("the projection's admission narrows `{name}` for this entry, so its default is a literal value"),
-            ));
-        };
-        if !values.contains(&default) {
-            param.default = NativeDefaultDecl::Value(Expr { kind: ExprKind::Int(first), span: param.span });
+        match &param.default {
+            NativeDefaultDecl::Value(Expr { kind: ExprKind::Int(default), .. }) => {
+                if !values.contains(default) {
+                    param.default = NativeDefaultDecl::Value(Expr { kind: ExprKind::Int(first), span: param.span });
+                }
+            }
+            NativeDefaultDecl::Least(_) | NativeDefaultDecl::Greatest(_) => {}
+            NativeDefaultDecl::Value(_) => {
+                return Err(error(
+                    param.span,
+                    format!("the projection's admission narrows `{name}` for this entry, so its default is a literal value or `least`/`greatest`"),
+                ));
+            }
         }
         param.values = values;
     }
@@ -3902,5 +3907,45 @@ native down_project for metal from \"down.metal\":
         let down_impl = module.native_implementation(down, BackendName::Metal).unwrap();
         assert_eq!(down_impl.launches.len(), 1);
         assert_eq!(down_impl.launches[0].kernel, "down_project_summed");
+    }
+
+    #[test]
+    fn projection_templates_allow_device_properties() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "ops.seismic".to_owned(),
+            text: "\
+fn proj[M, H, N](x: &tensor[M, H] f32, weight: &tensor[N, H] W) -> tensor[M, N] f32:
+    let mut out = tensor[M, N] f32
+    parallel for row in 0..M:
+        parallel for col in 0..N:
+            out[row, col] = x[row, 0]
+    return out
+
+projection dense for metal:
+    let HALF_SHARED = device.shared_bytes_per_group / 2
+    params (SPLIT in [1, 2, 4] default least where SPLIT >= device.units or SPLIT == 4, SIMDS in [2, 4, 8] default 4)
+    where SIMDS * device.subgroup_width <= device.max_group_threads
+    where SIMDS * 1024 <= HALF_SHARED
+    launch gemv:
+        threadgroups (ceil_div(N, 32), SPLIT, 1)
+        threads_per_threadgroup (SIMDS * device.subgroup_width, 1, 1)
+
+native proj for metal from \"proj.metal\":
+    static (H, N)
+    project dense single (weight)
+"
+            .to_owned(),
+        });
+        let module = crate::native_source::check_fixture(sources, &[]).expect("projection with device.* checks");
+        let entry = module.entry_named("proj").unwrap();
+        let native = module.native_implementation(entry, BackendName::Metal).unwrap();
+        let statics = crate::checked::NativeSpecialization::new()
+            .with_static("H", 64)
+            .with_static("N", 64);
+        assert!(
+            native.default_specialization_without_device(&statics).is_none(),
+            "projection with device.* requires a device to resolve defaults and constraints"
+        );
     }
 }

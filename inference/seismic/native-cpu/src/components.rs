@@ -906,7 +906,7 @@ mod tests {
         for (row, out) in activations.chunks_exact(k).zip(quantized.chunks_exact_mut(blocks)) {
             crate::quant::quantize(row, out);
         }
-        assert!(quantized.iter().all(|block| block.d < f32::MIN_POSITIVE && block.codes.iter().all(|code| *code >= -127)));
+        assert!(quantized.iter().all(|block| block.d.iter().all(|&d| d < f32::MIN_POSITIVE) && block.codes.iter().all(|code| *code >= -127)));
         let mut tiles = vec![Q8Tile::ZERO; crate::quant::tiles(m, blocks)];
         crate::quant::interleave(&quantized, m, blocks, &mut tiles);
         let mut tested = 0;
@@ -1240,7 +1240,7 @@ mod tests {
                 let bound: f64 = decoded
                     .iter()
                     .enumerate()
-                    .map(|(i, w)| f64::from(w.abs()) * f64::from(xq[i / Q8_BLOCK].d) * 0.5)
+                    .map(|(i, w)| f64::from(w.abs()) * f64::from(xq[i / Q8_BLOCK].d[(i % Q8_BLOCK) / crate::quant::Q8_GROUP]) * 0.5)
                     .sum::<f64>()
                     + 1e-4
                         * decoded
@@ -1298,7 +1298,11 @@ mod tests {
         let mut xq = vec![Q8Block::ZERO; blocks(k)];
         quantize(&x, &mut xq);
         assert_exact(&x, &xq);
-        assert!(xq.iter().all(|block| block.d > 0.0 && block.d < f32::MIN_POSITIVE));
+        assert!(xq.iter().enumerate().all(|(b, block)| {
+            let active = (k - b * Q8_BLOCK).min(Q8_BLOCK).div_ceil(crate::quant::Q8_GROUP);
+            block.d[..active].iter().all(|&d| d > 0.0 && d < f32::MIN_POSITIVE)
+                && block.d[active..].iter().all(|&d| d == 0.0)
+        }));
         let detected = Tier::detected().unwrap();
         for representation in int8_elements() {
             let (data, geometry) = rows(representation, BLOCK_ROWS, k, 11);
@@ -1315,7 +1319,8 @@ mod tests {
                 };
                 for (i, w) in decoded.iter().enumerate() {
                     let code = xq[i / Q8_BLOCK].codes[i % Q8_BLOCK];
-                    let term = f64::from(xq[i / Q8_BLOCK].d) * f64::from(code) * f64::from(*w);
+                    let d = xq[i / Q8_BLOCK].d[(i % Q8_BLOCK) / crate::quant::Q8_GROUP];
+                    let term = f64::from(d) * f64::from(code) * f64::from(*w);
                     exact[row] += term;
                     magnitude[row] += term.abs();
                 }

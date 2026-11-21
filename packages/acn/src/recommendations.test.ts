@@ -58,7 +58,7 @@ const rung = (fixture: RungFixture): LocalModel => {
               performance: fixture.speedUnavailable
                 ? { _tag: "Unavailable", failure: { code: "performance_unavailable", message: "cannot be measured", retryable: false } }
                 : fixture.tokensPerSecond === undefined
-                ? { _tag: "Pending", measurement: { _tag: "Measuring" } }
+                ? { _tag: "Pending", measurement: { _tag: "Measuring", progress: Option.none() } }
                 : {
                     _tag: "Estimated",
                     samples: [

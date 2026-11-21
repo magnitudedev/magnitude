@@ -3,13 +3,42 @@ use super::{ByteBpeTokenizer, TokenDecoder};
 use magnitude_generation::{FinishReason, OutputToken};
 use magnitude_templates::{Event, OutputStream, PreparedRequest, TerminalCause};
 
+enum MatchedStop {
+    User(String),
+    Template,
+}
+
+enum TerminalState {
+    Stopped(MatchedStop),
+    Ended,
+}
+
+impl TerminalState {
+    fn stopped(&self) -> bool {
+        matches!(self, Self::Stopped(_))
+    }
+
+    fn matched_stop(&self) -> Option<&str> {
+        match self {
+            Self::Stopped(MatchedStop::User(stop)) => Some(stop.as_str()),
+            Self::Stopped(MatchedStop::Template) | Self::Ended => None,
+        }
+    }
+}
+
+enum TokenChatStreamState<'a> {
+    Active {
+        decoder: TokenDecoder<'a>,
+        chat: ChatStream,
+        next_index: usize,
+    },
+    Terminal(TerminalState),
+}
+
 /// Host-owned composition of accepted token publication and native parsing.
 /// A matched stop is terminal here; the caller must cancel further generation.
 pub struct TokenChatStream<'a> {
-    decoder: TokenDecoder<'a>,
-    chat: ChatStream,
-    next_index: usize,
-    terminal: bool,
+    state: TokenChatStreamState<'a>,
 }
 impl<'a> TokenChatStream<'a> {
     pub fn new(
@@ -24,58 +53,105 @@ impl<'a> TokenChatStream<'a> {
             return Err("stream tokenizer differs from prepared chat".into());
         }
         Ok(Self {
-            // Parser delimiters can themselves be control tokens. Generation
-            // removes EOS before publication; preserve every other token byte.
-            decoder: tokenizer.decoder(false),
-            chat: ChatStream::new(prepared.native(), stops, max_output_bytes)?,
-            next_index: 0,
-            terminal: false,
+            state: TokenChatStreamState::Active {
+                // Parser delimiters can themselves be control tokens. Generation
+                // removes EOS before publication; preserve every other token byte.
+                decoder: tokenizer.decoder(false),
+                chat: ChatStream::new(prepared.native(), stops, max_output_bytes)?,
+                next_index: 0,
+            },
         })
     }
     pub fn stopped(&self) -> bool {
-        self.chat.stopped()
+        match &self.state {
+            TokenChatStreamState::Active { .. } => false,
+            TokenChatStreamState::Terminal(terminal) => terminal.stopped(),
+        }
     }
     /// The caller stop sequence that ended output, if one did.
     pub fn matched_stop(&self) -> Option<&str> {
-        self.chat.matched_stop()
+        match &self.state {
+            TokenChatStreamState::Active { .. } => None,
+            TokenChatStreamState::Terminal(terminal) => terminal.matched_stop(),
+        }
     }
     pub fn feed(&mut self, output: &OutputToken) -> Result<Vec<Event>, String> {
-        if self.terminal {
+        let TokenChatStreamState::Active {
+            decoder,
+            chat,
+            next_index,
+        } = &mut self.state
+        else {
             return Err("token chat stream is terminal".into());
-        }
+        };
         let result = (|| {
-            if output.index != self.next_index {
+            if output.index != *next_index {
                 return Err("token publication is out of order".into());
             }
-            let next = self
-                .next_index
+            let next = next_index
                 .checked_add(1)
                 .ok_or("token publication index overflow")?;
-            let text = self.decoder.push(output.token)?;
-            let events = self.chat.feed(&text)?;
-            self.next_index = next;
+            let text = decoder.push(output.token)?;
+            let events = chat.feed(&text)?;
+            *next_index = next;
             Ok(events)
         })();
-        self.terminal = self.chat.stopped() || result.is_err();
+        let should_terminate = chat.is_terminal() || result.is_err();
+        if should_terminate {
+            self.finish_to_terminal();
+        }
         result
     }
     pub fn finish(&mut self, reason: FinishReason) -> Result<Vec<Event>, String> {
-        if self.terminal {
+        let TokenChatStreamState::Active { decoder, chat, .. } = &mut self.state else {
             return Err("token chat stream is terminal".into());
+        };
+        let result = (|| {
+            let tail = decoder.finish()?;
+            let mut events = chat.feed(&tail)?;
+            if !chat.stopped() {
+                let cause = match reason {
+                    FinishReason::Stop => TerminalCause::Natural,
+                    FinishReason::Length | FinishReason::Context => TerminalCause::Length,
+                    FinishReason::Cancelled => TerminalCause::Cancelled,
+                    FinishReason::Failed => TerminalCause::Failed,
+                };
+                events.extend(chat.finish(cause)?);
+            }
+            Ok(events)
+        })();
+        self.finish_to_terminal();
+        result
+    }
+    fn finish_to_terminal(&mut self) {
+        if matches!(self.state, TokenChatStreamState::Active { .. }) {
+            let prev = std::mem::replace(
+                &mut self.state,
+                TokenChatStreamState::Terminal(TerminalState::Ended),
+            );
+            if let TokenChatStreamState::Active { chat, .. } = prev {
+                self.state = TokenChatStreamState::Terminal(chat.into_terminal());
+            }
         }
-        self.terminal = true;
-        let tail = self.decoder.finish()?;
-        let mut events = self.chat.feed(&tail)?;
-        if !self.chat.stopped() {
-            let cause = match reason {
-                FinishReason::Stop => TerminalCause::Natural,
-                FinishReason::Length | FinishReason::Context => TerminalCause::Length,
-                FinishReason::Cancelled => TerminalCause::Cancelled,
-                FinishReason::Failed => TerminalCause::Failed,
-            };
-            events.extend(self.chat.finish(cause)?);
+    }
+}
+
+enum StopState {
+    Buffering { pending: String },
+    Matched(usize),
+    Closed,
+}
+
+enum StopFeed {
+    Continue(String),
+    Matched { output: String, index: usize },
+}
+
+impl StopFeed {
+    fn into_output(self) -> String {
+        match self {
+            Self::Continue(output) | Self::Matched { output, .. } => output,
         }
-        Ok(events)
     }
 }
 
@@ -83,9 +159,7 @@ impl<'a> TokenChatStream<'a> {
 /// completed match, with configured order breaking ties, independent of chunks.
 pub struct StopText {
     stops: Vec<String>,
-    pending: String,
-    matched: Option<usize>,
-    closed: bool,
+    state: StopState,
 }
 impl StopText {
     pub fn new(stops: Vec<String>) -> Result<Self, String> {
@@ -94,74 +168,94 @@ impl StopText {
         }
         Ok(Self {
             stops,
-            pending: String::new(),
-            matched: None,
-            closed: false,
+            state: StopState::Buffering {
+                pending: String::new(),
+            },
         })
     }
     pub fn matched(&self) -> Option<&str> {
-        self.matched.map(|i| self.stops[i].as_str())
+        match self.state {
+            StopState::Matched(index) => Some(self.stops[index].as_str()),
+            StopState::Buffering { .. } | StopState::Closed => None,
+        }
     }
     pub fn feed(&mut self, text: &str) -> Result<String, String> {
-        if self.closed {
-            return Err("stop filter is closed".into());
+        Ok(self.feed_outcome(text)?.into_output())
+    }
+    pub fn finish(&mut self) -> Result<String, String> {
+        match std::mem::replace(&mut self.state, StopState::Closed) {
+            StopState::Buffering { pending } => Ok(pending),
+            StopState::Matched(_) => Ok(String::new()),
+            StopState::Closed => Err("stop filter is closed".into()),
         }
-        if self.matched.is_some() {
-            return Ok(String::new());
-        }
-        self.pending.push_str(text);
+    }
+    fn stop(&self, index: usize) -> &str {
+        self.stops[index].as_str()
+    }
+    fn feed_outcome(&mut self, text: &str) -> Result<StopFeed, String> {
+        let pending = match &mut self.state {
+            StopState::Closed => return Err("stop filter is closed".into()),
+            StopState::Matched(index) => {
+                return Ok(StopFeed::Matched {
+                    output: String::new(),
+                    index: *index,
+                });
+            }
+            StopState::Buffering { pending } => pending,
+        };
+        pending.push_str(text);
         let matched = self
             .stops
             .iter()
             .enumerate()
             .filter_map(|(i, stop)| {
-                self.pending
+                pending
                     .find(stop)
                     .map(|start| (start + stop.len(), i, start))
             })
             .min();
         if let Some((_, index, start)) = matched {
-            let output = self.pending[..start].to_owned();
-            self.pending.clear();
-            self.matched = Some(index);
-            return Ok(output);
+            let output = pending[..start].to_owned();
+            self.state = StopState::Matched(index);
+            return Ok(StopFeed::Matched { output, index });
         }
-        let keep = self
-            .stops
-            .iter()
-            .flat_map(|stop| {
-                stop.char_indices()
-                    .map(|(i, _)| i)
-                    .filter(|&i| i > 0)
-                    .filter(|&i| self.pending.ends_with(&stop[..i]))
-            })
-            .max()
-            .unwrap_or(0);
-        let end = self.pending.len() - keep;
-        let output = self.pending[..end].to_owned();
-        self.pending.drain(..end);
+        let keep = {
+            let pending = pending.as_str();
+            self.stops
+                .iter()
+                .flat_map(|stop| {
+                    stop.char_indices()
+                        .map(|(i, _)| i)
+                        .filter(|&i| i > 0)
+                        .filter(move |&i| pending.ends_with(&stop[..i]))
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        let end = pending.len() - keep;
+        let output = pending[..end].to_owned();
+        pending.drain(..end);
         // Shrink only if an unusually large chunk inflated the retained buffer.
-        if self.pending.capacity() > 4096 && self.pending.len() <= 1024 {
-            self.pending.shrink_to(1024);
+        if pending.capacity() > 4096 && pending.len() <= 1024 {
+            pending.shrink_to(1024);
         }
-        Ok(output)
+        Ok(StopFeed::Continue(output))
     }
-    pub fn finish(&mut self) -> Result<String, String> {
-        if self.closed {
-            return Err("stop filter is closed".into());
-        }
-        self.closed = true;
-        Ok(std::mem::take(&mut self.pending))
-    }
+}
+
+enum ChatStreamState {
+    Active {
+        parser: OutputStream,
+        stops: StopText,
+        user_stops: usize,
+    },
+    Terminal(TerminalState),
 }
 
 /// Consumes incrementally decoded text. Token decoding stays with the tokenizer;
 /// stop filtering precedes semantic parsing so truncated calls remain incomplete.
 pub struct ChatStream {
-    parser: OutputStream,
-    stops: StopText,
-    user_stops: usize,
-    terminal: bool,
+    state: ChatStreamState,
 }
 impl ChatStream {
     pub fn new(
@@ -172,61 +266,84 @@ impl ChatStream {
         let user_stops = stops.len();
         stops.extend(plan.description().additional_stops.iter().cloned());
         Ok(Self {
-            parser: plan.stream(max_output_bytes).map_err(|e| e.to_string())?,
-            stops: StopText::new(stops)?,
-            user_stops,
-            terminal: false,
+            state: ChatStreamState::Active {
+                parser: plan.stream(max_output_bytes).map_err(|e| e.to_string())?,
+                stops: StopText::new(stops)?,
+                user_stops,
+            },
         })
     }
     pub fn stopped(&self) -> bool {
-        self.stops.matched().is_some()
+        match &self.state {
+            ChatStreamState::Active { .. } => false,
+            ChatStreamState::Terminal(terminal) => terminal.stopped(),
+        }
     }
     /// The caller stop sequence that ended output; template stops are natural
     /// completion.
     pub fn matched_stop(&self) -> Option<&str> {
-        self.stops
-            .matched
-            .filter(|index| *index < self.user_stops)
-            .map(|index| self.stops.stops[index].as_str())
+        match &self.state {
+            ChatStreamState::Active { .. } => None,
+            ChatStreamState::Terminal(terminal) => terminal.matched_stop(),
+        }
     }
     pub fn feed(&mut self, text: &str) -> Result<Vec<Event>, String> {
-        if self.terminal {
+        let ChatStreamState::Active {
+            parser,
+            stops,
+            user_stops,
+        } = &mut self.state
+        else {
             return Err("chat stream is terminal".into());
-        }
-        let text = self.stops.feed(text)?;
-        let result = (|| {
-            let mut events = self
-                .parser
-                .feed(text.as_bytes())
-                .map_err(|e| e.to_string())?;
-            if self.stopped() {
-                events.extend(
-                    self.parser
-                        .finish(if self.stops.matched.unwrap() < self.user_stops {
-                            TerminalCause::UserStop
-                        } else {
-                            TerminalCause::Natural
-                        })
-                        .map_err(|e| e.to_string())?,
-                );
+        };
+        match stops.feed_outcome(text)? {
+            StopFeed::Continue(output) => match parser.feed(output.as_bytes()) {
+                Ok(events) => Ok(events),
+                Err(err) => {
+                    self.state = ChatStreamState::Terminal(TerminalState::Ended);
+                    Err(err.to_string())
+                }
+            },
+            StopFeed::Matched { output, index } => {
+                let (matched, cause) = if index < *user_stops {
+                    (
+                        MatchedStop::User(stops.stop(index).to_owned()),
+                        TerminalCause::UserStop,
+                    )
+                } else {
+                    (MatchedStop::Template, TerminalCause::Natural)
+                };
+                let result = (|| {
+                    let mut events = parser.feed(output.as_bytes()).map_err(|e| e.to_string())?;
+                    events.extend(parser.finish(cause).map_err(|e| e.to_string())?);
+                    Ok(events)
+                })();
+                self.state = ChatStreamState::Terminal(TerminalState::Stopped(matched));
+                result
             }
-            Ok(events)
-        })();
-        self.terminal = self.stopped() || result.is_err();
-        result
+        }
     }
     pub fn finish(&mut self, cause: TerminalCause) -> Result<Vec<Event>, String> {
-        if self.terminal {
+        let ChatStreamState::Active { parser, stops, .. } = &mut self.state else {
             return Err("chat stream is terminal".into());
+        };
+        let result = (|| {
+            let tail = stops.finish()?;
+            let mut events = parser.feed(tail.as_bytes()).map_err(|e| e.to_string())?;
+            events.extend(parser.finish(cause).map_err(|e| e.to_string())?);
+            Ok(events)
+        })();
+        self.state = ChatStreamState::Terminal(TerminalState::Ended);
+        result
+    }
+    fn is_terminal(&self) -> bool {
+        matches!(self.state, ChatStreamState::Terminal(_))
+    }
+    fn into_terminal(self) -> TerminalState {
+        match self.state {
+            ChatStreamState::Active { .. } => TerminalState::Ended,
+            ChatStreamState::Terminal(terminal) => terminal,
         }
-        self.terminal = true;
-        let tail = self.stops.finish()?;
-        let mut events = self
-            .parser
-            .feed(tail.as_bytes())
-            .map_err(|e| e.to_string())?;
-        events.extend(self.parser.finish(cause).map_err(|e| e.to_string())?);
-        Ok(events)
     }
 }
 
@@ -234,25 +351,46 @@ impl ChatStream {
 mod tests {
     use super::*;
 
+    fn pending_buf(stop: &StopText) -> Option<&String> {
+        match &stop.state {
+            StopState::Buffering { pending } => Some(pending),
+            StopState::Matched(_) | StopState::Closed => None,
+        }
+    }
+
     #[test]
     fn stop_text_drains_prefix_and_shrinks_oversized_chunks() {
         let mut stop = StopText::new(vec!["STOP".into()]).unwrap();
         // Holds partial stop prefix, then releases it when continuation does not match.
         assert_eq!(stop.feed("hello ST").unwrap(), "hello ");
-        assert_eq!(stop.pending, "ST");
+        assert_eq!(pending_buf(&stop).map(String::as_str), Some("ST"));
         assert_eq!(stop.feed("ART!").unwrap(), "START!");
-        assert!(stop.pending.is_empty());
+        assert_eq!(pending_buf(&stop).map(String::as_str), Some(""));
 
         // Oversized chunk does not stay pinned in `pending`.
         let large = "x".repeat(16 * 1024);
         assert_eq!(stop.feed(&large).unwrap(), large);
-        assert!(stop.pending.is_empty());
-        assert!(stop.pending.capacity() <= 4096);
+        let pending = pending_buf(&stop).unwrap();
+        assert!(pending.is_empty());
+        assert!(pending.capacity() <= 4096);
 
         // Split stop match across chunks emits only text before the stop.
         assert_eq!(stop.feed("tail ST").unwrap(), "tail ");
         assert_eq!(stop.feed("OPignored").unwrap(), "");
         assert_eq!(stop.matched(), Some("STOP"));
-        assert!(stop.pending.is_empty());
+        assert!(pending_buf(&stop).is_none());
+        assert_eq!(stop.feed("more").unwrap(), "");
+        assert_eq!(stop.matched(), Some("STOP"));
+    }
+
+    #[test]
+    fn stop_text_finish_flushes_pending_and_closes() {
+        let mut stop = StopText::new(vec!["STOP".into()]).unwrap();
+        assert_eq!(stop.feed("hello ST").unwrap(), "hello ");
+        assert_eq!(stop.finish().unwrap(), "ST");
+        assert!(matches!(stop.state, StopState::Closed));
+        assert_eq!(stop.matched(), None);
+        assert!(stop.feed("more").is_err());
+        assert!(stop.finish().is_err());
     }
 }

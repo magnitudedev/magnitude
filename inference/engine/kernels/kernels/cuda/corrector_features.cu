@@ -8,7 +8,7 @@
 
 extern "C" __global__ void corrector_features(SEISMIC_KERNEL_PARAMS) {
     typedef unsigned long long u64;
-    __shared__ float partials[32];
+    __shared__ reduce::OnlineSoftmax partials[32];
     const float *logits = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_LOGITS));
     const float *unary = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_UNARY));
     const float *norm_weight = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_NORM_WEIGHT));
@@ -21,14 +21,30 @@ extern "C" __global__ void corrector_features(SEISMIC_KERNEL_PARAMS) {
     const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
     const float *line = logits + row * SEISMIC_LOGITS_STRIDE_0;
 
-    float maximum = -__int_as_float(0x7f800000);
-    for (u64 i = threadIdx.x; i < vocabulary; i += blockDim.x)
-        maximum = fmaxf(maximum, line[i * SEISMIC_LOGITS_STRIDE_1]);
-    maximum = reduce::group_max(maximum, partials);
-    float total = 0.0f;
-    for (u64 i = threadIdx.x; i < vocabulary; i += blockDim.x)
-        total += expf(line[i * SEISMIC_LOGITS_STRIDE_1] - maximum);
-    const float normalizer = maximum + logf(reduce::group_sum(total, partials));
+    reduce::OnlineSoftmax state = reduce::OnlineSoftmax::empty();
+    if (SEISMIC_LOGITS_STRIDE_1 == 1ull && (reinterpret_cast<u64>(line) & 3ull) == 0ull) {
+        const u64 misalign = (reinterpret_cast<u64>(line) & 15ull) >> 2;
+        const u64 head = misalign == 0ull ? 0ull : min(4ull - misalign, vocabulary);
+        if (threadIdx.x < head)
+            state.add(line[threadIdx.x]);
+        const float *aligned = line + head;
+        const u64 vec_count = (vocabulary - head) & ~3ull;
+        const u64 step4 = static_cast<u64>(blockDim.x) * 4ull;
+        for (u64 i = static_cast<u64>(threadIdx.x) * 4ull; i < vec_count; i += step4) {
+            const float4 v = *reinterpret_cast<const float4 *>(aligned + i);
+            state.add(v.x);
+            state.add(v.y);
+            state.add(v.z);
+            state.add(v.w);
+        }
+        for (u64 i = head + vec_count + threadIdx.x; i < vocabulary; i += blockDim.x)
+            state.add(line[i]);
+    } else {
+        for (u64 i = threadIdx.x; i < vocabulary; i += blockDim.x)
+            state.add(line[i * SEISMIC_LOGITS_STRIDE_1]);
+    }
+    const reduce::OnlineSoftmax softmax = reduce::group_online_softmax(state, partials);
+    const float normalizer = softmax.max + logf(softmax.sum);
 
     const float best = unary[row * SEISMIC_UNARY_STRIDE_0];
     for (u64 rank = 0; rank < count; ++rank) {

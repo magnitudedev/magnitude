@@ -269,8 +269,12 @@ inline void advance_rows(Inputs inputs, RowGates gates,
     load_state_rows(initial, SEISMIC_DELTA_STRIDE_2, state);
     for (long entry = 0; begin == lo && entry < slot.taped; ++entry) {
         device const float *row = tape_view(tape, slot.source, entry, seismic_words);
+        float k[COLUMNS];
         // One decay per value head is loaded once.
         float factor[LANE_DECAYS];
+        RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+            k[j] = row[RECURRENT_TAPE_K + key * width + first_column + j];
+        }
         RECURRENT_UNROLL for (uint j = 0; j < LANE_DECAYS; ++j) {
             factor[j] = row[tape_decays + j];
         }
@@ -278,8 +282,7 @@ inline void advance_rows(Inputs inputs, RowGates gates,
             const float innovation = row[RECURRENT_TAPE_U + head * width + row0 + r];
             RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
                 state[r][j] *= factor[j % LANE_DECAYS];
-                state[r][j] = metal::fma(innovation, row[RECURRENT_TAPE_K + key * width + first_column + j],
-                    state[r][j]);
+                state[r][j] = metal::fma(innovation, k[j], state[r][j]);
             }
         }
     }

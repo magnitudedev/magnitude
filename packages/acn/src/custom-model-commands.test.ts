@@ -259,7 +259,7 @@ const harness = (options: {
       drafterChoice: configuredDrafterChoice(config, entry.id),
     })))
     const localState: LocalModelsState = {
-      preparation: { discovery: { complete: true, modelsFound: rows.length }, assessment: { complete: true, settledModels: 0, totalModels: 0 } },
+      preparation: { discovery: { complete: true, modelsFound: rows.length }, assessment: { complete: true, settledModels: 0, totalModels: 0 }, measurement: { _tag: "Measured" } },
       models: [...(options.catalogRows ?? []), ...(options.listedModels ?? rows)],
       unsupported: [],
       hidden: [],

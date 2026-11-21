@@ -472,7 +472,7 @@ impl TuningPartition {
     /// that configuration as it stands; none when it does not. The checked
     /// declaration is the admissibility authority.
     pub fn place(
-        implementation: &NativeImplementation,
+        implementation: &seismic_lang::checked::OnDevice,
         base: &NativeSpecialization,
         parameters: &[ParameterAddress],
         values: &[u64],
@@ -501,7 +501,7 @@ impl TuningPartition {
     /// they leave open up to the batch, not the declared product. Each
     /// assignment yielded is one [`Self::place`] admits.
     pub fn admissible(
-        implementation: &NativeImplementation,
+        implementation: &seismic_lang::checked::OnDevice,
         base: &NativeSpecialization,
         parameters: &[ParameterAddress],
         after: Option<&[u64]>,
@@ -541,7 +541,7 @@ impl TuningPartition {
     /// admits any: the work is the size of the restrictions the change
     /// violates, not of the domain.
     pub fn nearest(
-        implementation: &NativeImplementation,
+        implementation: &seismic_lang::checked::OnDevice,
         base: &NativeSpecialization,
         parameters: &[ParameterAddress],
         values: &[u64],
@@ -553,7 +553,7 @@ impl TuningPartition {
             .iter()
             .zip(values)
             .fold(base.clone(), |fixed, (address, value)| address.set(fixed, *value));
-        let mut narrowed = implementation.clone();
+        let mut narrowed = implementation.implementation().clone();
         narrowed.constraint = match implementation
             .constraint
             .as_ref()
@@ -915,7 +915,7 @@ fn declared_values<'i>(
 /// parameters conditions read are assigned for this, a launch or a pair at
 /// a time; the domain's other parameters are never assigned at all.
 pub fn partition(
-    implementation: &NativeImplementation,
+    implementation: &seismic_lang::checked::OnDevice,
     statics: &NativeSpecialization,
     points: &[PointShape],
 ) -> Result<TuningPartition, PlanError> {
@@ -1120,19 +1120,20 @@ pub fn partition(
         });
     }
     let mut components = BTreeMap::<usize, Vec<usize>>::new();
-    for launch in tuned {
+    for launch in measured {
         components
             .entry(root(&mut parents, launch))
             .or_default()
             .push(launch);
     }
-    // A bounded workload need not reach every declared launch. An entirely
-    // unserved independent component keeps its declared default; there is no
-    // measurement from which to choose a different configuration. Components
-    // coupled to a served launch still participate in that launch's search.
+    // A bounded workload need not reach every declared launch. Unserved
+    // launches keep their declared defaults: there is no measurement from
+    // which to choose a different configuration for their parameters, and
+    // including them in a served launch's group would inflate the group with
+    // inert axes. Served launches coupled by shared parameters or `where`
+    // restrictions stay in one group.
     let mut groups = components
         .into_values()
-        .filter(|launches| launches.iter().any(|launch| measured.contains(launch)))
         .map(|launches| {
             let parameters = owners
                 .iter()
@@ -1186,7 +1187,7 @@ mod tests {
     use seismic_lang::checked::{SourceFile, SourceSet};
     use seismic_lang::registry::BackendName;
 
-    fn implementation(last_when: &str) -> NativeImplementation {
+    fn implementation(last_when: &str) -> seismic_lang::checked::OnDevice {
         checked(format!(
             "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3] default 5)\n    launch gemv when N < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8] default 16, ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when N >= BATCH_FROM and N <= 16:\n        params (SIMDGROUPS in [8, 4] default 8, ROWS in [2, 1] default 2)\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch gemm when {last_when}:\n        params (TILE in [64, 128] default 64)\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n"
         ))
@@ -1204,7 +1205,7 @@ mod tests {
 
     /// The fixture's implementation, checked with a source whose kernels
     /// take `ROWS`, `TILE` and `TOKENS` as template parameters.
-    fn checked(text: String) -> NativeImplementation {
+    fn checked(text: String) -> seismic_lang::checked::OnDevice {
         let module = seismic_lang::native_source::check_fixture(
             SourceSet::new(vec![SourceFile {
                 path: "scale.seismic".into(),
@@ -1216,19 +1217,19 @@ mod tests {
         module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap()
-            .clone()
+            .at_device(&seismic_lang::device::BackendFloor(BackendName::Metal))
     }
 
     /// Structural forms whose launch parameters `where` holds at their
     /// defaults outside the form, as the projection entries declare them.
-    fn forms() -> NativeImplementation {
+    fn forms() -> seismic_lang::checked::OnDevice {
         checked(
             "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3] default 5, form TALL in [1, 0] default 1, form PACK in [0, 1] default 0)\n    where (PACK == 0 or TALL == 1) and (TALL == 1 or TILE == 64) and (PACK == 1 or (TOKENS == 4 and AHEAD == 0))\n    scratch staged bytes (N * 4 + TALL * 64) when N > 16\n    launch gemv when N < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8, 4] default 16, ROWS in [1, 2, 4] default 1)\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when N >= BATCH_FROM and N <= 16:\n        params (SIMDGROUPS in [8, 4] default 8, ROWS in [2, 1] default 2)\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch gemm when N > 16 and PACK == 0:\n        params (TILE in [64, 128, 32] default 64)\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n    launch packed when N > 16 and PACK == 1 and TALL == 1:\n        params (TOKENS in [4, 2] default 4, AHEAD in [0, 1] default 0)\n        threadgroups (ceil_div(N, TOKENS), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n"
                 .into(),
         )
     }
 
-    fn constrained() -> NativeImplementation {
+    fn constrained() -> seismic_lang::checked::OnDevice {
         checked("fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3] default 5)\n    where BATCH_FROM >= 3\n    launch gemv when N < BATCH_FROM:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n".into())
     }
 
@@ -1236,7 +1237,7 @@ mod tests {
     /// declaration admits that configuration.
     fn assemble(
         plan: &TuningPartition,
-        implementation: &NativeImplementation,
+        implementation: &seismic_lang::checked::OnDevice,
         groups: &[Vec<u64>],
         boundary: &[u64],
     ) -> Option<NativeSpecialization> {
@@ -1257,7 +1258,7 @@ mod tests {
     }
 
     impl Materialised {
-        fn of(implementation: &NativeImplementation) -> Self {
+        fn of(implementation: &seismic_lang::checked::OnDevice) -> Self {
             let mut admissible = Vec::new();
             implementation
                 .walk_admissible(&NativeSpecialization::new(), |configuration| {
@@ -1397,23 +1398,27 @@ mod tests {
 
     #[test]
     fn guarded_boundary_completes_with_a_legal_local_witness() {
-        let mut implementation = forms();
-        let constraint = implementation.constraint.take().unwrap();
-        implementation.constraint = Some(NativeCondition::And(
-            Box::new(constraint),
-            Box::new(NativeCondition::Or(
-                Box::new(NativeCondition::Compare {
-                    left: seismic_lang::checked::NativeNatExpr::Parameter("PACK".into()),
-                    comparison: seismic_lang::checked::CmpOp::Eq,
-                    right: seismic_lang::checked::NativeNatExpr::Constant(0),
-                }),
-                Box::new(NativeCondition::Compare {
-                    left: seismic_lang::checked::NativeNatExpr::Parameter("TILE".into()),
-                    comparison: seismic_lang::checked::CmpOp::Eq,
-                    right: seismic_lang::checked::NativeNatExpr::Constant(128),
-                }),
-            )),
-        ));
+        let implementation = forms()
+            .adjusted::<std::convert::Infallible>(|implementation| {
+                let constraint = implementation.constraint.take().unwrap();
+                implementation.constraint = Some(NativeCondition::And(
+                    Box::new(constraint),
+                    Box::new(NativeCondition::Or(
+                        Box::new(NativeCondition::Compare {
+                            left: seismic_lang::checked::NativeNatExpr::Parameter("PACK".into()),
+                            comparison: seismic_lang::checked::CmpOp::Eq,
+                            right: seismic_lang::checked::NativeNatExpr::Constant(0),
+                        }),
+                        Box::new(NativeCondition::Compare {
+                            left: seismic_lang::checked::NativeNatExpr::Parameter("TILE".into()),
+                            comparison: seismic_lang::checked::CmpOp::Eq,
+                            right: seismic_lang::checked::NativeNatExpr::Constant(128),
+                        }),
+                    )),
+                ));
+                Ok(())
+            })
+            .unwrap();
         let statics = NativeSpecialization::new();
         let default = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let pack = [ParameterAddress::Entry("PACK".into())];
@@ -1752,5 +1757,32 @@ mod tests {
             TuningPartition::nearest(&implementation, &default, &plan.boundary, &[3]),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn unserved_coupled_launches_do_not_pollute_served_group() {
+        let implementation = checked(
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (LANES in [16, 32] default 32, DEAD_ENTRY in [0, 1] default 0)\n    where LANES >= 16 or DEAD_ENTRY == 0\n    launch active_gemv when N <= 8:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS * 32 / LANES), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch dead_batch when N > 16:\n        params (TILE in [16, 32, 64, 128] default 16, TOKENS in [1, 2, 4, 8] default 1)\n        reads (LANES, DEAD_ENTRY)\n        threadgroups (ceil_div(N, TILE * TOKENS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+                .into(),
+        );
+        let served = [PointShape {
+            label: "m8".into(),
+            dimensions: BTreeMap::from([("N".into(), 8)]),
+        }];
+        let plan = partition(&implementation, &NativeSpecialization::new(), &served).unwrap();
+        assert_eq!(plan.groups.len(), 1);
+        let group = &plan.groups[0];
+        assert_eq!(group.launches, [0]);
+        assert_eq!(
+            group.parameters,
+            [
+                ParameterAddress::Entry("LANES".into()),
+                ParameterAddress::Launch {
+                    ordinal: 0,
+                    name: "ROWS".into(),
+                },
+            ]
+        );
+        assert_eq!(group.declared(), 4);
     }
 }

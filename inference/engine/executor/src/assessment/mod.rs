@@ -58,7 +58,7 @@ pub use estimate::{estimate_decode, expert_pass, performance_depths, Performance
 pub use executor_costs::{
     ChainCost, CostWalk, Derived, ExecutorCosts, ExecutorCostsError, FormatRates, Held, HistoryCosts,
     MatrixCosts, MeasuredCost, Measurement, Placement, Placements, Required, RouteCosts, StoredCosts,
-    WeightRate, HISTORY_LAYOUTS, MEASUREMENT_SECONDS,
+    WeightRate, Whose, HISTORY_LAYOUTS, MEASUREMENT_SECONDS,
 };
 pub use launches::{Declarations, Kernel, Launches, Words};
 #[cfg(feature = "machine-line")]
@@ -68,7 +68,7 @@ pub use priced::Priced;
 pub(crate) use streaming_costs::CpuForm;
 #[cfg(feature = "machine-line")]
 pub use requests::line_outstanding;
-pub use requests::{Outstanding, PendingPrices, PointRequest, PointRequests, SiteRequest, Waiter};
+pub use requests::{MeasurementPhase, Outstanding, PendingPrices, PointRequest, PointRequests, SiteRequest, Waiter};
 pub use streamed::{streamed_layers, StreamedError, StreamedFigures};
 pub use misses::{Anticipated, HintCounts, LayerStep, TableCurve, TableRange};
 pub use streaming::{

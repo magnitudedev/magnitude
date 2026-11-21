@@ -111,17 +111,24 @@ pub enum PublicationWakeKind {
     Cancelled,
 }
 
+enum WakePayload {
+    OutputCredit { epoch: u64 },
+    Cancelled,
+}
+
 /// An opaque reserved wake. The host passes it through an independent,
 /// nonblocking worker wake path; only the matching worker sender consumes it.
 pub struct PublicationWake {
-    kind: PublicationWakeKind,
     queue_id: u64,
-    credit_epoch: u64,
+    payload: WakePayload,
 }
 
 impl PublicationWake {
     pub fn kind(&self) -> PublicationWakeKind {
-        self.kind
+        match self.payload {
+            WakePayload::OutputCredit { .. } => PublicationWakeKind::OutputCredit,
+            WakePayload::Cancelled => PublicationWakeKind::Cancelled,
+        }
     }
 }
 
@@ -132,8 +139,33 @@ pub enum PublishError {
     ReceiverClosed,
 }
 
+#[derive(Default)]
+struct OpenChannel {
+    receiver_waker: Option<Waker>,
+    reservation_waiting: bool,
+    credit: Option<u64>,
+    next_credit_epoch: u64,
+}
+
+impl OpenChannel {
+    fn try_issue_credit(&mut self) -> Option<u64> {
+        if self.credit.is_none() {
+            self.reservation_waiting = false;
+            let epoch = self
+                .next_credit_epoch
+                .checked_add(1)
+                .expect("publication credit epoch exhausted");
+            self.next_credit_epoch = epoch;
+            self.credit = Some(epoch);
+            Some(epoch)
+        } else {
+            None
+        }
+    }
+}
+
 enum ChannelState {
-    Open { receiver_waker: Option<Waker> },
+    Open(OpenChannel),
     SenderClosed(Publication),
     ReceiverClosed,
 }
@@ -147,9 +179,6 @@ struct State {
     data: VecDeque<Vec<OutputToken>>,
     capacity: usize,
     reserved: usize,
-    reservation_waiting: bool,
-    credit: Option<u64>,
-    next_credit_epoch: u64,
     channel: ChannelState,
     retirement: RetirementState,
     /// The request became resident: it began, before anything it publishes.
@@ -158,23 +187,8 @@ struct State {
 
 impl State {
     fn has_capacity(&self) -> bool {
-        matches!(self.channel, ChannelState::Open { .. })
+        matches!(self.channel, ChannelState::Open(_))
             && self.data.len().saturating_add(self.reserved) < self.capacity
-    }
-
-    fn try_issue_credit(&mut self) -> Option<u64> {
-        if matches!(self.channel, ChannelState::Open { .. }) && self.credit.is_none() {
-            self.reservation_waiting = false;
-            let epoch = self
-                .next_credit_epoch
-                .checked_add(1)
-                .expect("publication credit epoch exhausted");
-            self.next_credit_epoch = epoch;
-            self.credit = Some(epoch);
-            Some(epoch)
-        } else {
-            None
-        }
     }
 }
 
@@ -207,12 +221,7 @@ impl PublicationQueue {
                 data: VecDeque::with_capacity(capacity),
                 capacity,
                 reserved: 0,
-                reservation_waiting: false,
-                credit: None,
-                next_credit_epoch: 0,
-                channel: ChannelState::Open {
-                    receiver_waker: None,
-                },
+                channel: ChannelState::Open(OpenChannel::default()),
                 retirement: RetirementState::Active(None),
                 began: false,
             }),
@@ -224,7 +233,7 @@ impl PublicationQueue {
             },
             PublicationReceiver {
                 shared,
-                terminal_seen: false,
+                lifecycle: ReceiverLifecycle::Open,
             },
         ))
     }
@@ -238,31 +247,39 @@ pub struct PublicationSender {
 /// unused permit returns the slot; consuming it makes publication infallible
 /// with respect to queue capacity.
 pub struct PublicationPermit {
-    shared: Option<Arc<Shared>>,
+    shared: Arc<Shared>,
+    armed: bool,
+}
+
+impl PublicationPermit {
+    /// Disarm and drop the permit after its reserved slot has been consumed
+    /// under the queue lock. Consuming `self` ensures a disarmed permit cannot
+    /// be observed alive.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for PublicationPermit {
     fn drop(&mut self) {
-        let Some(shared) = self.shared.take() else {
+        if !self.armed {
             return;
-        };
+        }
         let wake = {
-            let mut state = shared.state.lock().unwrap();
+            let mut state = self.shared.state.lock().unwrap();
             state.reserved = state
                 .reserved
                 .checked_sub(1)
                 .expect("publication permit underflow");
-            if state.reservation_waiting {
-                state.try_issue_credit()
-            } else {
-                None
+            match &mut state.channel {
+                ChannelState::Open(open) if open.reservation_waiting => open.try_issue_credit(),
+                _ => None,
             }
         };
-        if let Some(credit_epoch) = wake {
-            (shared.wake_worker)(PublicationWake {
-                kind: PublicationWakeKind::OutputCredit,
-                queue_id: shared.id,
-                credit_epoch,
+        if let Some(epoch) = wake {
+            (self.shared.wake_worker)(PublicationWake {
+                queue_id: self.shared.id,
+                payload: WakePayload::OutputCredit { epoch },
             });
         }
     }
@@ -277,8 +294,8 @@ impl PublicationSender {
             let mut state = self.shared.state.lock().unwrap();
             if std::mem::replace(&mut state.began, true) {
                 None
-            } else if let ChannelState::Open { receiver_waker } = &mut state.channel {
-                receiver_waker.take()
+            } else if let ChannelState::Open(open) = &mut state.channel {
+                open.receiver_waker.take()
             } else {
                 None
             }
@@ -297,9 +314,10 @@ impl PublicationSender {
             return Ok(Vec::new());
         }
         let mut state = self.shared.state.lock().unwrap();
-        if !matches!(state.channel, ChannelState::Open { .. }) {
+        let state = &mut *state;
+        let ChannelState::Open(open) = &mut state.channel else {
             return Err(PublishError::ReceiverClosed);
-        }
+        };
         if count > state.capacity {
             return Err(PublishError::ExceedsCapacity);
         }
@@ -307,14 +325,15 @@ impl PublicationSender {
             .capacity
             .saturating_sub(state.data.len().saturating_add(state.reserved));
         if available < count {
-            state.reservation_waiting = true;
+            open.reservation_waiting = true;
             return Err(PublishError::Full);
         }
-        state.reservation_waiting = false;
+        open.reservation_waiting = false;
         state.reserved += count;
         Ok((0..count)
             .map(|_| PublicationPermit {
-                shared: Some(Arc::clone(&self.shared)),
+                shared: Arc::clone(&self.shared),
+                armed: true,
             })
             .collect())
     }
@@ -322,32 +341,29 @@ impl PublicationSender {
     pub fn output_with_permit(
         &mut self,
         tokens: Vec<OutputToken>,
-        mut permit: PublicationPermit,
+        permit: PublicationPermit,
     ) -> Result<(), (PublishError, Vec<OutputToken>)> {
         assert!(
-            Arc::ptr_eq(
-                &self.shared,
-                permit.shared.as_ref().expect("publication permit active"),
-            ),
+            Arc::ptr_eq(&self.shared, &permit.shared),
             "publication permit belongs to another queue"
         );
         let receiver_waker = {
             let mut state = self.shared.state.lock().unwrap();
             let state = &mut *state;
-            let ChannelState::Open { receiver_waker } = &mut state.channel else {
+            let ChannelState::Open(open) = &mut state.channel else {
                 return Err((PublishError::ReceiverClosed, tokens));
             };
             state.reserved = state
                 .reserved
                 .checked_sub(1)
                 .expect("publication permit underflow");
-            permit.shared = None;
+            permit.disarm();
             assert!(
                 state.data.len() < state.capacity,
                 "reserved publication slot is unavailable"
             );
             state.data.push_back(tokens);
-            receiver_waker.take()
+            open.receiver_waker.take()
         };
         if let Some(waker) = receiver_waker {
             waker.wake();
@@ -363,14 +379,14 @@ impl PublicationSender {
         let receiver_waker = {
             let mut state = self.shared.state.lock().unwrap();
             let state = &mut *state;
-            let ChannelState::Open { receiver_waker } = &mut state.channel else {
+            let ChannelState::Open(open) = &mut state.channel else {
                 return Err((PublishError::ReceiverClosed, tokens));
             };
             if state.data.len().saturating_add(state.reserved) == state.capacity {
                 return Err((PublishError::Full, tokens));
             }
             state.data.push_back(tokens);
-            receiver_waker.take()
+            open.receiver_waker.take()
         };
         if let Some(waker) = receiver_waker {
             waker.wake();
@@ -401,8 +417,8 @@ impl PublicationSender {
         let receiver_waker = {
             let mut state = self.shared.state.lock().unwrap();
             match &mut state.channel {
-                ChannelState::Open { receiver_waker } => {
-                    let waker = receiver_waker.take();
+                ChannelState::Open(open) => {
+                    let waker = open.receiver_waker.take();
                     state.channel = ChannelState::SenderClosed(publication);
                     waker
                 }
@@ -420,22 +436,27 @@ impl PublicationSender {
     /// Clearing the flag while full lets the next full-to-non-full drain send
     /// a fresh wake. An older wake cannot clear that later credit.
     pub fn process_output_credit(&mut self, wake: PublicationWake) -> bool {
-        if wake.kind != PublicationWakeKind::OutputCredit || self.shared.id != wake.queue_id {
+        let WakePayload::OutputCredit { epoch } = wake.payload else {
+            return false;
+        };
+        if self.shared.id != wake.queue_id {
             return false;
         }
         let mut state = self.shared.state.lock().unwrap();
-        if state.credit == Some(wake.credit_epoch) {
-            state.credit = None;
-            state.has_capacity()
-        } else {
-            false
-        }
+        let cleared = match &mut state.channel {
+            ChannelState::Open(open) if open.credit == Some(epoch) => {
+                open.credit = None;
+                true
+            }
+            _ => false,
+        };
+        cleared && state.has_capacity()
     }
 
     /// Check a reserved cancellation wake against the owning queue. A wake
     /// from another request cannot cancel this sender.
     pub fn process_cancelled(&self, wake: PublicationWake) -> bool {
-        wake.kind == PublicationWakeKind::Cancelled
+        matches!(wake.payload, WakePayload::Cancelled)
             && self.shared.id == wake.queue_id
             && !self.receiver_open()
     }
@@ -460,9 +481,15 @@ impl Drop for PublicationSender {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiverLifecycle {
+    Open,
+    Terminated,
+}
+
 pub struct PublicationReceiver {
     shared: Arc<Shared>,
-    terminal_seen: bool,
+    lifecycle: ReceiverLifecycle,
 }
 
 /// Physical retirement is independent of a request publishing its terminal
@@ -510,43 +537,42 @@ impl PublicationReceiver {
     }
 
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Publication>> {
-        if self.terminal_seen {
+        if self.lifecycle == ReceiverLifecycle::Terminated {
             return Poll::Ready(None);
         }
         let (publication, wake_credit) = {
             let mut state = self.shared.state.lock().unwrap();
             let was_full = state.data.len().saturating_add(state.reserved) == state.capacity;
             if let Some(tokens) = state.data.pop_front() {
-                let wake_credit = if was_full || state.reservation_waiting {
-                    state.try_issue_credit()
-                } else {
-                    None
+                let wake_credit = match &mut state.channel {
+                    ChannelState::Open(open) if was_full || open.reservation_waiting => {
+                        open.try_issue_credit()
+                    }
+                    _ => None,
                 };
                 (Some(Publication::Output(tokens)), wake_credit)
             } else {
                 match std::mem::replace(&mut state.channel, ChannelState::ReceiverClosed) {
-                    ChannelState::Open { .. } => {
-                        state.channel = ChannelState::Open {
-                            receiver_waker: Some(cx.waker().clone()),
-                        };
+                    ChannelState::Open(mut open) => {
+                        open.receiver_waker = Some(cx.waker().clone());
+                        state.channel = ChannelState::Open(open);
                         return Poll::Pending;
                     }
                     ChannelState::SenderClosed(terminal) => {
-                        self.terminal_seen = true;
+                        self.lifecycle = ReceiverLifecycle::Terminated;
                         (Some(terminal), None)
                     }
                     ChannelState::ReceiverClosed => {
-                        self.terminal_seen = true;
+                        self.lifecycle = ReceiverLifecycle::Terminated;
                         (None, None)
                     }
                 }
             }
         };
-        if let Some(credit_epoch) = wake_credit {
+        if let Some(epoch) = wake_credit {
             (self.shared.wake_worker)(PublicationWake {
-                kind: PublicationWakeKind::OutputCredit,
                 queue_id: self.shared.id,
-                credit_epoch,
+                payload: WakePayload::OutputCredit { epoch },
             });
         }
         Poll::Ready(publication)
@@ -555,11 +581,14 @@ impl PublicationReceiver {
 
 impl Drop for PublicationReceiver {
     fn drop(&mut self) {
+        if self.lifecycle == ReceiverLifecycle::Terminated {
+            return;
+        }
         let wake_cancel = {
             let mut state = self.shared.state.lock().unwrap();
             match std::mem::replace(&mut state.channel, ChannelState::ReceiverClosed) {
                 ChannelState::ReceiverClosed => false,
-                ChannelState::Open { .. } | ChannelState::SenderClosed(_) => {
+                ChannelState::Open(_) | ChannelState::SenderClosed(_) => {
                     state.data.clear();
                     true
                 }
@@ -567,9 +596,8 @@ impl Drop for PublicationReceiver {
         };
         if wake_cancel {
             (self.shared.wake_worker)(PublicationWake {
-                kind: PublicationWakeKind::Cancelled,
                 queue_id: self.shared.id,
-                credit_epoch: 0,
+                payload: WakePayload::Cancelled,
             });
         }
     }

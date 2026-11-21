@@ -442,6 +442,10 @@ pub(in crate::experts) struct Converting {
     /// How urgently its pieces run (`compute::Job::want`): a step's
     /// miss's, or a hint's until a request names its expert.
     urgency: std::sync::Arc<Urgency>,
+    /// Set by the submitter to cancel this conversion before completion:
+    /// remaining pieces skip work, the tier record is not mapped, and
+    /// `ended` is set `false`.
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The load's landings' account; when it was submitted and when a
     /// worker began its first piece; its pieces' worker time so far, in
     /// nanoseconds.
@@ -549,11 +553,19 @@ impl Converting {
             pieces,
             then: std::sync::Mutex::new(Some(Box::new(then))),
             urgency,
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             account,
             submitted: std::time::Instant::now(),
             began: std::sync::OnceLock::new(),
             worked: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// A handle that cancels this conversion before completion: setting it
+    /// skips remaining pieces, leaves the tier record unmapped, and sets
+    /// `ended` to `false`.
+    pub fn cancel_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.cancelled.clone()
     }
 }
 
@@ -579,6 +591,9 @@ impl super::compute::Job for Converting {
     }
 
     fn piece(&self, index: usize) {
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let (tensor, piece) = self.pieces[index].clone();
         let (staging, staged, bytes, tier) = &self.landing.tensors[tensor];
         // SAFETY: `new`'s: the stored record is whole and nothing lands in
@@ -592,8 +607,14 @@ impl super::compute::Job for Converting {
     }
 
     /// Every piece is converted, so the record's bytes are whole: map it
-    /// ([`Grant::map`]), then answer.
+    /// ([`Grant::map`]), then answer. If cancelled before completion, skip
+    /// mapping and mark `ended` as `false` so `Directory::unlanded` returns
+    /// the tier record cleanly.
     fn end(&self) {
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            self.ended.set(false);
+            return;
+        }
         let terms = match self.urgency.is_waited() {
             true => &self.account.demand,
             false => &self.account.hinted,
@@ -660,5 +681,84 @@ impl Answer {
             seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("answer"), sequence as u64, (self.layer as i64, record.is_some() as i64, slot as i64));
         });
         self.parks.settle();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::experts::compute::Job;
+    use crate::experts::events::Events;
+    use crate::experts::host_records::{HostRecords, InboundTable, Resolution, Taking};
+    use crate::experts::map::LandingMap;
+    use crate::experts::Words;
+    use seismic::{BackendName, Element, Tensor};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn test_converting(cancel_before_piece: bool) -> (Ended, bool, i32) {
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let staging_tensor = Tensor::shared(&charges, Element::i32(), &[1, 4]).unwrap();
+        unsafe { staging_tensor.write_shared(0, &[0xAB; 16]).unwrap() };
+        let staging = Records::rows(&staging_tensor, 16, 1).unwrap();
+
+        let tier_tensor = Tensor::shared(&charges, Element::i32(), &[1, 4]).unwrap();
+        let tier_records = Records::rows(&tier_tensor, 16, 1).unwrap();
+        let landed_record = TierTensor::new(tier_records, Element::i32(), Element::i32(), [1, 4], 16).unwrap().landed(0);
+
+        let map_words = Words::on_cpu(&device, 2, -1);
+        let mut host = HostRecords::new(
+            1,
+            1,
+            vec![(0, 2, Some(LandingMap::Tier(map_words.clone())))],
+            Resolution::AfterStore,
+            (0, 0),
+            Arc::new(InboundTable::new(&[2])),
+        );
+        let crate::experts::host_records::Claim::Taken(grant) = host.claim((0, 0), 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("claim ready tier record");
+        };
+
+        let events = Arc::new(Events::default());
+        let ended = Ended::new(&events);
+        let then_ran = Arc::new(AtomicBool::new(false));
+        let then_flag = then_ran.clone();
+        let landing = Landing { tensors: vec![(staging, 0, 16, landed_record)], grant };
+        let converting = unsafe {
+            Converting::new(
+                landing,
+                Urgency::ahead(seismic_io::Want::undated(0.)),
+                Arc::new(LandingAccount::default()),
+                ended.clone(),
+                move || {
+                    then_flag.store(true, Ordering::Release);
+                },
+            )
+        };
+        if cancel_before_piece {
+            converting.cancel_handle().store(true, Ordering::Release);
+        }
+        for i in 0..converting.pieces() {
+            converting.piece(i);
+        }
+        converting.end();
+        (ended, then_ran.load(Ordering::Acquire), map_words.load(0))
+    }
+
+    /// Cancelling a `Converting` job before completion skips conversion pieces,
+    /// leaves the tier map unmapped (`-1`), does not invoke `then`, and sets
+    /// `ended` to `false` so `Directory::unlanded` returns the tier record.
+    #[test]
+    fn cancelled_converting_skips_mapping_and_ends_unlanded() {
+        let (ended, then_ran, mapped) = test_converting(true);
+        assert_eq!(ended.get(), Some(false));
+        assert!(!then_ran, "then callback must not run when cancelled");
+        assert_eq!(mapped, -1, "tier record must remain unmapped when cancelled");
+
+        let (ended, then_ran, mapped) = test_converting(false);
+        assert_eq!(ended.get(), Some(true));
+        assert!(then_ran, "then callback runs when uncancelled");
+        assert_eq!(mapped, 0, "tier record mapped when uncancelled");
     }
 }

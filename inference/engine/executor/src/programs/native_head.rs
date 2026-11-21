@@ -34,8 +34,8 @@ use crate::{
     completion::CompletionWaiter,
     native::{AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedLanding},
     operators::attention::graph::{
-        self as attention_graph, AttentionGraphEntries, AttentionWeights,
-        CheckedAttentionEntries, IndexerControlPorts, IndexerStatePorts,
+        self as attention_graph, AttentionControlPorts, AttentionGraphEntries, AttentionWeights,
+        CheckedAttentionEntries, IndexerHistoryPorts,
     },
     operators::attention::split::{AttentionBlock, AttentionSite, AttentionTopology, SelectionSite, split},
     planning::{DomainRows, HeadHistoryGeometry},
@@ -288,35 +288,15 @@ pub(crate) fn head_graph_classes(
 
 /// The per-run inputs of one pass.
 struct PassPorts {
-    coordinates: NativePort,
-    visible: Option<NativePort>,
-    fresh: Option<NativePort>,
-    destinations: NativePort,
+    controls: AttentionControlPorts,
     /// The head's history planes, in plane-descriptor order.
     planes: Vec<NativePort>,
     /// A selected read's indexer planes and tables.
-    indexer: Option<IndexerPorts>,
+    indexer: Option<IndexerHistoryPorts>,
     selection: Option<SelectionPorts>,
     /// A chained pass's landed read of the tokens it embeds, of a table
     /// with landing slots.
     landed: Option<LandedReadPorts>,
-}
-
-/// A pass's selected read's indexer: its keys' planes and the tables of its
-/// rows' spans, destinations and units.
-struct IndexerPorts {
-    planes: IndexerStatePorts,
-    tables: IndexerControlPorts,
-}
-
-impl IndexerPorts {
-    fn of(planes: Option<IndexerStatePorts>, tables: Option<IndexerControlPorts>) -> Result<Option<Self>, GraphError> {
-        match (planes, tables) {
-            (Some(planes), Some(tables)) => Ok(Some(Self { planes, tables })),
-            (None, None) => Ok(None),
-            _ => Err("a head's selected read's planes and tables disagree".into()),
-        }
-    }
 }
 
 struct HeadGraphEntries<'a, G: GraphDraft + 'a> {
@@ -1356,12 +1336,9 @@ fn head_pass<'a, G: GraphDraft + 'a>(
         graph.export(&attended)?;
         return Ok(HeadPass::Causal(
             PassPorts {
-                coordinates: controls.coordinates,
-                visible: controls.visible,
-                fresh: controls.fresh,
-                destinations: controls.destinations,
+                controls,
                 planes: state.planes,
-                indexer: IndexerPorts::of(state.indexer, controls.indexer)?,
+                indexer: state.indexer,
                 selection: None,
                 landed,
             },
@@ -1468,12 +1445,9 @@ fn head_pass<'a, G: GraphDraft + 'a>(
     )?;
     Ok(HeadPass::Drafted {
         ports: PassPorts {
-            coordinates: controls.coordinates,
-            visible: controls.visible,
-            fresh: controls.fresh,
-            destinations: controls.destinations,
+            controls,
             planes: state.planes,
-            indexer: IndexerPorts::of(state.indexer, controls.indexer)?,
+            indexer: state.indexer,
             selection,
             landed,
         },
@@ -2680,18 +2654,18 @@ impl NativeHeadProgram {
         }
         for ((ports, pass), controls) in graph.passes.iter().zip(std::iter::once(&entry).chain(&chain)).zip(&controls) {
             active
-                .write_input(&ports.coordinates, &controls.coordinates)
+                .write_input(&ports.controls.coordinates, &controls.coordinates)
                 .map_err(device)?;
-            if let Some(visible) = &ports.visible {
+            if let Some(read) = &ports.controls.read {
                 active
-                    .write_input(visible, &controls.tokens.visible)
+                    .write_input(&read.visible, &controls.tokens.visible)
+                    .map_err(device)?;
+                active
+                    .write_input(&read.fresh, &controls.tokens.fresh)
                     .map_err(device)?;
             }
-            if let Some(fresh) = &ports.fresh {
-                active.write_input(fresh, &controls.tokens.fresh).map_err(device)?;
-            }
             active
-                .write_input(&ports.destinations, &controls.tokens.destinations)
+                .write_input(&ports.controls.destinations, &controls.tokens.destinations)
                 .map_err(device)?;
             match (&ports.indexer, &controls.indexer) {
                 (Some(ports), Some([window, blocks])) => {
