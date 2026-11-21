@@ -703,9 +703,10 @@ impl Prefetch {
         for layer in 0..core.layers.len() {
             let (routed, file) = (self.ledger.routed(layer), &core.layers[layer].file);
             let passed = self.ledger.pass(layer, Instant::now(), |interest| {
-                served.is_some_and(|(sequence, at)| (interest.step, layer) <= (sequence, at))
-                    || steps.ended(interest.step)
-                    || (routed >= interest.step && !file.requested(interest.step, 0))
+                let step = interest.step();
+                served.is_some_and(|(sequence, at)| (step, layer) <= (sequence, at))
+                    || steps.ended(step)
+                    || (routed >= step && !file.requested(step, 0))
             });
             changed.extend(passed.into_iter().map(|expert| (layer, expert)));
         }
@@ -1196,7 +1197,7 @@ impl Prefetch {
                     match self.read_ahead(core, shared, staged, wanted(class), ahead, expected, reserve) {
                         Ok(bytes) => {
                             self.ledger.issued(layer, expert, &interest, bytes, Instant::now());
-                            shared.telemetry.read_ahead(interest.source, interest.step, staged, interest.from.point.layer, bytes);
+                            shared.telemetry.read_ahead(interest.source, interest.step(), staged, interest.from.point.layer, bytes);
                             read = true;
                             if seismic_io::timeline::recording() {
                                 Fate::Read.note(interest.from.point.sequence, layer, interest.source, (expert, interest.rank), self.staging.free());

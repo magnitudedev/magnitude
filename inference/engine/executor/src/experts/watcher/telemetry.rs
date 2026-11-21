@@ -1761,7 +1761,7 @@ impl Telemetry {
                 // The step completes, so it holds its records until it ends.
                 // Its exact rows' choices: a front row's are the next
                 // step's, which its exact row routes again.
-                let front = decoded.launch.map_or(0, |launch| launch.front);
+                let front = decoded.launch.map_or(0, |launch| launch.front());
                 // Its rows' keys, which placement ranks by and a recording
                 // load traces.
                 let keys = decoded.launch.map(|launch| std::sync::Arc::new(self.keys.read(steps, sequence, launch)));
@@ -1943,7 +1943,7 @@ impl Telemetry {
                     let absent = &decoded.4;
                     // One sequence's exact row is its next token: its routes
                     // lag against its tokens before.
-                    let routed = match launch.rows - launch.front.count_ones() as usize {
+                    let routed = match launch.rows - launch.front().count_ones() as usize {
                         1 => lagged(&mut costs.recent, &decoded.1, absent),
                         _ => {
                             costs.recent.clear();
@@ -2018,7 +2018,7 @@ impl Telemetry {
                             });
                         }
                     }
-                    if launch.front != 0 {
+                    if launch.front() != 0 {
                         costs.front.passes += 1;
                     }
                 }
@@ -2774,7 +2774,7 @@ fn feed_decode(
     // counts those rows: every decode launch has one.
     let counted = recording.map(|Recording| {
         let launch = launch.expect("a recorded decode step has its launch");
-        let rows = launch.rows as u64 - u64::from(launch.front.count_ones());
+        let rows = launch.rows as u64 - u64::from(launch.front().count_ones());
         assert!(rows > 0, "a decode launch has an exact row");
         CountedLaunch { rows, tokens: launch.tokens }
     });

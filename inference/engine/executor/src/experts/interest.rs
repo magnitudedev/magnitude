@@ -246,6 +246,20 @@ pub(in crate::experts) enum When {
     Pass { request: RequestId, pass: u64, estimate: Step },
 }
 
+impl When {
+    /// The step it is bound to, or its estimate while awaiting a pass.
+    pub(in crate::experts) fn step(self) -> Step {
+        match self {
+            Self::Step(step) | Self::Pass { estimate: step, .. } => step,
+        }
+    }
+
+    /// Whether it is bound to a step begun, which resolves and expires it.
+    fn bound(self) -> bool {
+        matches!(self, Self::Step(_))
+    }
+}
+
 /// How a ring's entry of one batch row names its experts ([`Ledger::row`]):
 /// as an exact row of its own step, or as an ahead row, for the step its
 /// token is exact in, of its lineage.
@@ -277,10 +291,8 @@ pub(in crate::experts) struct Name {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::experts) struct Interest {
     pub source: Source,
-    /// The step that wants it: bound, or, while `pass` is some, an estimate.
-    pub step: Step,
-    /// The request's pass it is for, until that pass begins.
-    pub pass: Option<(RequestId, u64)>,
+    /// The step that wants it: bound, or an estimated future pass.
+    pub when: When,
     pub rank: u8,
     pub from: At,
     pub candidate: bool,
@@ -301,6 +313,11 @@ pub(in crate::experts) struct Interest {
 }
 
 impl Interest {
+    /// The step that wants it: bound, or its estimate while awaiting a pass.
+    pub(in crate::experts) fn step(&self) -> Step {
+        self.when.step()
+    }
+
     /// The predicted name it is; none for an exact request.
     fn kind(&self) -> Option<Kind> {
         match self.source {
@@ -311,7 +328,7 @@ impl Interest {
 
     /// Whether it is for a step begun, which resolves and expires it.
     fn bound(&self) -> bool {
-        self.pass.is_none()
+        self.when.bound()
     }
 
     /// The nearest of names first ([`Look`]'s order, then the best rank):
@@ -335,9 +352,10 @@ impl Interest {
     fn same(&self, other: &Interest) -> bool {
         self.source == other.source
             && self.lineage.map(|lineage| lineage.request) == other.lineage.map(|lineage| lineage.request)
-            && match (self.pass, other.pass) {
-                (None, None) => self.step == other.step,
-                (left, right) => left == right,
+            && match (self.when, other.when) {
+                (When::Step(left), When::Step(right)) => left == right,
+                (When::Pass { request: lr, pass: lp, .. }, When::Pass { request: rr, pass: rp, .. }) => (lr, lp) == (rr, rp),
+                _ => false,
             }
     }
 }
@@ -499,12 +517,20 @@ pub(in crate::experts) enum Spent {
     Unused { basis: Basis, depth: u8, verify: bool, fell: bool, bytes: u64 },
 }
 
+/// The target of an issued read ahead: bound to a step begun, or awaiting
+/// a request's future decode pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IssuedTarget {
+    Bound(Step),
+    Pass(RequestId, u64),
+}
+
 /// A read ahead issued and not yet spent ([`Ledger::issued`]): what it was
 /// issued for, the depth of the row whose name led it ([`Source::depth`]),
 /// the publication order of the interest that led it (unique, kept across a
 /// republication), its bytes, and whether that interest's guess fell; the
-/// step it was admitted for (its leading interest's), its target step once
-/// bound (`None` while awaiting a future pass `pass`), when it was issued,
+/// step it was admitted for (its leading interest's), its target step or
+/// future pass ([`IssuedTarget`]), when it was issued,
 /// and when it landed ([`Ledger::landed`]): its landing's measured
 /// duration, by which a resolution finds who would have caught it.
 #[derive(Clone, Copy, Debug)]
@@ -516,8 +542,7 @@ struct Issued {
     bytes: u64,
     fell: bool,
     step: Step,
-    target: Option<Step>,
-    pass: Option<(RequestId, u64)>,
+    target: IssuedTarget,
     issued: Instant,
     landed: Option<Instant>,
 }
@@ -1175,14 +1200,14 @@ impl Entry {
     /// Its earliest live interest's step, and the probability it is used
     /// there ([`Self::chance`]), at its group's `epoch`.
     fn derived(&self, calibration: &mut Calibration, group: usize, epoch: u64) -> Option<Derived> {
-        let step = self.live().map(|interest| interest.step).min()?;
+        let step = self.live().map(Interest::step).min()?;
         Some(Derived { step, p: self.chance(step, calibration, group, epoch) })
     }
 
     /// Whether an exact request makes this expert due at `now`: a step
     /// parks on it, unpriced.
     fn is_due(&self, now: Step) -> bool {
-        self.live().any(|interest| interest.source == Source::Exact && interest.step <= now)
+        self.live().any(|interest| interest.source == Source::Exact && interest.step() <= now)
     }
 
     /// The combination of the predicted interests for `step`, live,
@@ -1193,7 +1218,7 @@ impl Entry {
         if self.at(step).any(|interest| interest.source == Source::Exact) {
             return None;
         }
-        Combination::of(self.interests.iter().filter(|interest| interest.step == step).filter_map(Interest::kind))
+        Combination::of(self.interests.iter().filter(|interest| interest.step() == step).filter_map(Interest::kind))
     }
 
     /// The probability it is used at `step`: certain where an exact row
@@ -1221,20 +1246,20 @@ impl Entry {
     /// order: an expert holds a few interests, so each visit is a pass over
     /// them. Each step visited is a decision on its names ([`Self::decide`]).
     fn admitted_class(&mut self, admit: &impl Admit, calibration: &mut Calibration, group: usize, epoch: u64) -> Option<Class> {
-        let mut step = self.live().map(|interest| interest.step).min()?;
+        let mut step = self.live().map(Interest::step).min()?;
         loop {
             self.decide(step);
             let p = self.chance(step, calibration, group, epoch);
             if admit.admits(p) {
                 return Some(Class::Expected { step, p });
             }
-            step = self.live().map(|interest| interest.step).filter(|&later| later > step).min()?;
+            step = self.live().map(Interest::step).filter(|&later| later > step).min()?;
         }
     }
 
     /// The live interests wanting it at `step`.
     fn at(&self, step: Step) -> impl Iterator<Item = &Interest> + Clone {
-        self.live().filter(move |interest| interest.step == step)
+        self.live().filter(move |interest| interest.step() == step)
     }
 
     /// The live interest that leads its read at `step`: the nearest name
@@ -1252,7 +1277,7 @@ impl Entry {
     /// host never saw pass before the step completed times no read, and is
     /// caught by none.
     fn saved(&self, step: Step, issued: Instant, landed: Instant) -> Option<Catchers> {
-        let named = self.interests.iter().filter(|interest| interest.step == step && interest.bound());
+        let named = self.interests.iter().filter(|interest| interest.when == When::Step(step));
         let hints = named.clone().filter_map(|interest| Some((interest.hint()?, interest.named))).collect::<Vec<_>>();
         if hints.is_empty() {
             return None;
@@ -1278,7 +1303,7 @@ impl Entry {
         let (lead, _) = self
             .interests
             .iter()
-            .filter(|interest| interest.step == step && interest.bound())
+            .filter(|interest| interest.when == When::Step(step))
             .filter_map(|interest| Some((interest.hint()?, interest.named)))
             .min_by_key(|&(_, at)| at)?;
         let mut catchers = Catchers::default();
@@ -1534,18 +1559,18 @@ impl Ledger {
         for (request, awaiting) in ahead {
             self.awaiting.entry(request).or_default().insert(step, awaiting);
         }
-        self.each(|interest| {
-            let bound = interest.pass.is_some_and(|pass| passes.contains(&pass));
-            if bound {
-                interest.step = step;
-                interest.pass = None;
+        self.each(|interest| match interest.when {
+            When::Pass { request, pass, .. } if passes.contains(&(request, pass)) => {
+                interest.when = When::Step(step);
+                true
             }
-            bound
+            _ => false,
         });
         for read in self.reads.values_mut() {
-            if read.pass.is_some_and(|pass| passes.contains(&pass)) {
-                read.target = Some(step);
-                read.pass = None;
+            if let IssuedTarget::Pass(request, pass) = read.target {
+                if passes.contains(&(request, pass)) {
+                    read.target = IssuedTarget::Bound(step);
+                }
             }
         }
         self.launches.insert(step, Launch { rows, padding, passes });
@@ -1572,12 +1597,9 @@ impl Ledger {
     /// replaced its producer's earlier publication.
     pub fn publish(&mut self, layer: usize, expert: usize, name: Name, at: Instant) -> Option<f64> {
         let Name { source, when, rank, from, candidate, lineage } = name;
-        let (step, pass) = match when {
-            When::Step(step) => (step, None),
-            When::Pass { request, pass, estimate } => (estimate, Some((request, pass))),
-        };
+        let step = when.step();
         self.published += 1;
-        let interest = Interest { source, step, pass, rank, from, candidate, lineage, named: at, passed: None, fell: false, order: self.published };
+        let interest = Interest { source, when, rank, from, candidate, lineage, named: at, passed: None, fell: false, order: self.published };
         let (group, epoch) = (self.groups[layer], self.epoch(layer));
         let entry = self.layers[layer].entry(expert).or_default();
         let new = match entry.interests.iter_mut().find(|held| held.same(&interest)) {
@@ -1701,9 +1723,9 @@ impl Ledger {
         landed_hints.retain(|&(s, l, _), _| !(s <= step && l == layer));
         // Any read ahead bound to this step (or earlier) at `layer` that was
         // not chosen here is now settled unused. Reads still pending for a
-        // future step (`target.is_none()` or `target > step`) stay live.
+        // future step (`Pass` or `Bound(target)` with `target > step`) stay live.
         reads.retain(|&(l, _), read| {
-            if l == layer && read.target.is_some_and(|target| target <= step) {
+            if l == layer && matches!(read.target, IssuedTarget::Bound(target) if target <= step) {
                 spent.push(Spent::Unused {
                     basis: read.basis,
                     depth: read.depth,
@@ -1733,7 +1755,7 @@ impl Ledger {
             });
             let before = entry.interests.len();
             entry.interests.retain(|interest| {
-                if !interest.bound() || interest.step != step {
+                if interest.when != When::Step(step) {
                     return true;
                 }
                 if let (Some(_), false) = (interest.kind(), interest.fell) {
@@ -1924,7 +1946,7 @@ impl Ledger {
         self.drop_where(|interest| interest.lineage.is_some_and(|lineage| lineage.request == request));
         let Self { reads, spent, .. } = self;
         reads.retain(|_, read| {
-            if read.pass.is_some_and(|(r, _)| r == request) {
+            if matches!(read.target, IssuedTarget::Pass(r, _) if r == request) {
                 spent.push(Spent::Unused {
                     basis: read.basis,
                     depth: read.depth,
@@ -1978,13 +2000,15 @@ impl Ledger {
                 passes.remove(&step);
             }
         }
-        self.drop_where(|interest| (interest.bound() && interest.step == step) || (!completed && interest.lineage.is_some() && interest.from.point.sequence == step));
+        self.drop_where(|interest| interest.when == When::Step(step) || (!completed && interest.lineage.is_some() && interest.from.point.sequence == step));
         self.each(|interest| {
-            let late = !interest.bound() && interest.step <= step;
-            if late {
-                interest.step = step + 1;
+            if let When::Pass { estimate, .. } = &mut interest.when {
+                if *estimate <= step {
+                    *estimate = step + 1;
+                    return true;
+                }
             }
-            late
+            false
         });
     }
 
@@ -2037,6 +2061,10 @@ impl Ledger {
     /// and its issue time and landing time ([`Self::landed`]) measure its
     /// landing duration for the step's cohort ([`Entry::saved`]).
     pub fn issued(&mut self, layer: usize, expert: usize, led: &Interest, bytes: u64, at: Instant) {
+        let target = match led.when {
+            When::Step(step) => IssuedTarget::Bound(step),
+            When::Pass { request, pass, .. } => IssuedTarget::Pass(request, pass),
+        };
         let read = Issued {
             basis: Basis::of(led.source),
             depth: led.source.depth(),
@@ -2044,9 +2072,8 @@ impl Ledger {
             led: led.order,
             bytes,
             fell: false,
-            step: led.step,
-            target: led.bound().then_some(led.step),
-            pass: led.pass,
+            step: led.step(),
+            target,
             issued: at,
             landed: None,
         };
@@ -2235,7 +2262,7 @@ impl Ledger {
     #[cfg(test)]
     pub fn leading(&self, layer: usize, expert: usize) -> Option<Interest> {
         let entry = self.layers[layer].get(&expert)?;
-        let step = entry.live().map(|interest| interest.step).min()?;
+        let step = entry.live().map(Interest::step).min()?;
         entry.leading(step).copied()
     }
 }
@@ -2480,7 +2507,7 @@ mod tests {
         ledger.issued(0, 2, &led2, 10, t0);
         ledger.landed(0, 2, t0 + Duration::from_millis(2));
 
-        ledger.pass(0, t0 + Duration::from_millis(5), |interest| interest.step == 6);
+        ledger.pass(0, t0 + Duration::from_millis(5), |interest| interest.step() == 6);
         let chose = vec![vec![
             Chosen { expert: 1, saves: true, tier: true },
             Chosen { expert: 2, saves: true, tier: true },
@@ -2637,7 +2664,7 @@ mod tests {
         let t = now();
         ledger.publish(0, 1, name(AHEAD, 6), t);
         ledger.publish(0, 2, name(AHEAD, 6), t);
-        assert_eq!(ledger.pass(0, t, |interest| interest.step <= 6), vec![1, 2]);
+        assert_eq!(ledger.pass(0, t, |interest| interest.step() <= 6), vec![1, 2]);
         assert_eq!(ledger.act(0, 1, Read::Reading { begun: false }, &PRICE), Act::Cancel);
         assert_eq!(ledger.act(0, 2, Read::Reading { begun: true }, &PRICE), Act::Keep);
     }
@@ -2972,7 +2999,7 @@ mod tests {
         ledger.publish(0, 1, name(Source::Exact, 5), t);
         ledger.publish(0, 1, name(AHEAD, 6), t);
         assert_eq!(ledger.act(0, 1, Read::Absent, &Unpriced), Act::Issue(Class::Due), "the request's own");
-        assert_eq!(ledger.pass(0, t, |interest| interest.step <= 5), vec![1]);
+        assert_eq!(ledger.pass(0, t, |interest| interest.step() <= 5), vec![1]);
         assert!(matches!(ledger.act(0, 1, Read::Absent, &PRICE), Act::Issue(Class::Expected { step: 6, .. })));
         assert_eq!(ledger.derived(0, 1).map(|derived| derived.step), Some(6));
     }
@@ -3235,7 +3262,7 @@ mod tests {
         let led = ledger.leading(0, 7).expect("live hint interest");
         ledger.issued(0, 7, &led, 100, t0);
         ledger.landed(0, 7, t1);
-        ledger.pass(0, t2, |interest| interest.step == 6);
+        ledger.pass(0, t2, |interest| interest.step() == 6);
         // Expert 7 is evicted and re-issued for the same step (landed = None in `reads`).
         ledger.issued(0, 7, &led, 100, t2);
         let learned = ledger.tell(Told::Completed {
