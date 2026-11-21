@@ -1098,14 +1098,21 @@ fn cuda_matrix_configurations(
         .iter()
         .filter(|(_, warps, stages, columns)| {
             // The declaration's shared bound: the query tile, STAGES K-piece +
-            // V-window stages (16-key tiles above W = 256), the exchange.
+            // V-window stages (16-key tiles above W = 256; whole K tiles when
+            // split scores are active at COLUMNS >= 2, W > 256), the exchange,
+            // position plan, and split-scores exchange.
             let w = form.w() as u64;
             let keys = if w > 256 { 16 } else { 32 };
+            let split = w > 256 && *columns >= 2;
+            let k_piece = if split { w } else { w.min(256) };
+            let split_bytes = if split { columns * warps * 1024 } else { 0 };
             form.g as u64 <= warps * 16
                 && (w <= 256 || w % 256 == 0)
                 && w.min(256 * columns) % (16 * columns) == 0
-                && (warps * 16 * w + stages * keys * (w.min(256) + w.min(256 * columns))) * 2
+                && (warps * 16 * w + stages * keys * (k_piece + w.min(256 * columns))) * 2
                     + warps * columns * w * 4
+                    + 320
+                    + split_bytes
                     <= 98304
         })
         .map(|&(parts, warps, stages, columns)| {
@@ -5094,6 +5101,62 @@ fn an_absorbed_read_has_no_f16_staged_prefill_form() {
                 assert!(prefill_admitted_absorbed(&device, GLM, true, 0, 0, false) > 0, "absorbed, vector");
             }
             _ => {}
+        }
+    }
+}
+
+/// CUDA `attention_decode` over 512-wide heads:
+/// - `G = 64, W = 512` with `MATRIX = 1, QREG = 1, COLUMNS = 2, WARPS = 4, STAGES = 2`
+///   exercises split scores (`ATTENTION_SPLIT_SCORES`) and register queries
+///   within 90,432 <= 98,304 shared bytes.
+/// - `G = 16, W = 512` with `MATRIX = 0, WARPS = 4, SLICES = 4` (`DPL = 16, H = 4`)
+///   exercises the `TOKENS = 2` wide-head vector path.
+#[test]
+fn cuda_wide_mla_decode_split_scores_and_tokens() {
+    const WIDE_G64: Form = Form {
+        g: 64,
+        ..WIDE_G16
+    };
+    let cases = [
+        (
+            "cuda wide g64 matrix qreg split scores",
+            Case::new(WIDE_G64, 320, decode_rows(260), 128, 1.0, 1.0, 61),
+            [
+                ("PARTS", 12),
+                ("WARPS", 4),
+                ("SLICES", 1),
+                ("MATRIX", 1),
+                ("STAGES", 2),
+                ("COLUMNS", 2),
+                ("QREG", 1),
+            ],
+        ),
+        (
+            "cuda wide g16 vector tokens2",
+            Case::new(WIDE_G16, 320, decode_rows(260), 128, 1.0, 1.0, 62),
+            [
+                ("PARTS", 12),
+                ("WARPS", 4),
+                ("SLICES", 4),
+                ("MATRIX", 0),
+                ("STAGES", 2),
+                ("COLUMNS", 1),
+                ("QREG", 0),
+            ],
+        ),
+    ];
+    for device in devices()
+        .into_iter()
+        .filter(|device| device.backend() == BackendName::Cuda)
+    {
+        for (label, case, config) in &cases {
+            let expected = case.expected();
+            let specialization = config
+                .iter()
+                .fold(statics(&device, case.form, 0), |s, (n, v)| s.with_param(*n, *v));
+            let result = run(&device, true, &specialization, case)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            check(label, &result, &expected, case);
         }
     }
 }

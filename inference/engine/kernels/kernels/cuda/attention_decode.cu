@@ -46,6 +46,8 @@
 #define ATTENTION_COLUMNS SEISMIC_TUNE_COLUMNS
 #define ATTENTION_Q_REGISTERS SEISMIC_TUNE_QREG
 #define ATTENTION_PRODUCER_WARPS 0
+// Two or more column warps over a head wider than 256 split the scores by key piece.
+#define ATTENTION_SPLIT_SCORES 1
 #include "lib/attention/prefill.cuh"
 
 extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS)
@@ -85,8 +87,8 @@ constexpr int SLICES = SEISMIC_TUNE_SLICES;
 constexpr int H = G / SLICES;
 constexpr int GROUPS = WARPS / SLICES;
 // History tokens a warp keeps in flight (fewer when H query heads of state
-// already fill the registers).
-constexpr int TOKENS = H >= 8 ? 2 : 4;
+// or heads wider than 256 already fill the registers).
+constexpr int TOKENS = (DPL >= 16 || H >= 8) ? 2 : 4;
 
 }  // namespace
 

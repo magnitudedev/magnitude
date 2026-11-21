@@ -747,20 +747,21 @@ native attention_decode for metal from "metal/attention_decode.metal":
 # stages plus its 320-byte position plan and a [WARPS * COLUMNS][W] F32
 # exchange for the in-block query and
 # fresh-key preparation. QREG retains query fragments in registers (heads
-# up to 256 columns), so the query tile and operand stages share storage.
+# up to 256 columns, or with COLUMNS >= 2 over wider heads via split scores),
+# so the query tile and operand stages share storage.
 native attention_decode for cuda from "cuda/attention_decode.cu":
     static (KV, G, P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, AB, KS)
     params (arithmetic PARTS in [12, 24, 48, 96] default least where KV * PARTS * 2 >= device.units or PARTS == 96, arithmetic WARPS in [4, 8, 1, 2] default 4,
         arithmetic SLICES in [1, 2, 4, 8] default least where G % SLICES == 0 and 4 % SLICES == 0 and ((G / SLICES) * (2 * P + S) <= 1024 or SLICES == 4 or G % (2 * SLICES) != 0),
         arithmetic form MATRIX in [0, 1] default 0,
         arithmetic STAGES in [2, 3, 4] default 2, arithmetic COLUMNS in [1, 2, 4] default 1, arithmetic QREG in [0, 1] default 0)
-    where KR == 0 and KS == 0 and NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and G % SLICES == 0 and WARPS % SLICES == 0 and (MATRIX == 1 or (WARPS >= 4 and STAGES == 2 and COLUMNS == 1 and QREG == 0)) and (MATRIX == 1 or (G + WARPS) * (2 * P + S) * 4 + WARPS * (G / SLICES) * 8 <= 98304) and (MATRIX == 0 or (SLICES == 1 and (QREG == 0 or 2 * P + S <= 256) and G <= WARPS * 16 and min((2 * P + S), 256 * COLUMNS) % (16 * COLUMNS) == 0 and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min((2 * P + S), 256) + min((2 * P + S), 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min((2 * P + S), 256) + min((2 * P + S), 256 * COLUMNS)))) * 2 + WARPS * COLUMNS * (2 * P + S) * 4 <= 98304))
+    where KR == 0 and KS == 0 and NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and G % SLICES == 0 and WARPS % SLICES == 0 and (MATRIX == 1 or (WARPS >= 4 and STAGES == 2 and COLUMNS == 1 and QREG == 0)) and (MATRIX == 1 or (G + WARPS) * (2 * P + S) * 4 + WARPS * (G / SLICES) * 8 <= 98304) and (MATRIX == 0 or (SLICES == 1 and (QREG == 0 or 2 * P + S <= 256 or COLUMNS >= 2) and G <= WARPS * 16 and min((2 * P + S), 256 * COLUMNS) % (16 * COLUMNS) == 0 and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS)))) * 2 + WARPS * COLUMNS * (2 * P + S) * 4 + 320 + min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257) * COLUMNS * WARPS * 1024 <= 98304))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
     launch attention_decode_partial:
         threadgroups (KV, PARTS, (1 - MATRIX) * M + MATRIX * ceil_div(M, max(1, WARPS * 16 / G)))
         threads_per_threadgroup (COLUMNS * WARPS * 32, 1, 1)
-        shared_bytes ((1 - MATRIX) * ((G + WARPS) * (2 * P + S) * 4 + WARPS * (G / SLICES) * 8) + MATRIX * (((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min((2 * P + S), 256) + min((2 * P + S), 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min((2 * P + S), 256) + min((2 * P + S), 256 * COLUMNS)))) * 2 + WARPS * COLUMNS * (2 * P + S) * 4 + 320))
+        shared_bytes ((1 - MATRIX) * ((G + WARPS) * (2 * P + S) * 4 + WARPS * (G / SLICES) * 8) + MATRIX * (((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS)))) * 2 + WARPS * COLUMNS * (2 * P + S) * 4 + 320 + min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257) * COLUMNS * WARPS * 1024))
     launch attention_decode_merge:
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
