@@ -461,8 +461,10 @@ projection dense for cuda:
     let ORDERED_ANY = min(1, sum(W, ORDERED))
     let ORDERED_ALL = sum(W, ORDERED) / WEIGHTS
     let ORDERED_GEMV_SHARED = 256 + max(2, M) * 1024
-    let ZSPLIT = 1 for paired | segmented
+    let GEMM_TILES = tiles(W, ceil_div(ceil_div(N, 16), 8))
+    let ZSPLIT = 1 for paired
     let ZSPLIT = 1 + (SPLIT - 1) * min(1, 128 / M) for single
+    let ZSPLIT = GEMM_SPLIT for segmented
     let OPERANDS = min(1, sum(W, operands(W)))
     let HALF_SM_SHARED = device.shared_bytes_per_group / 2
     # The shared bytes that bound the int8 GEMM's layout of the weights, the
@@ -482,10 +484,12 @@ projection dense for cuda:
     let INT8_LAYOUT = most(W, form(W, INT8) * (2 * (128 * 96 + 8 * 16 * row_bytes(W, codes, 64)) + 2 * 128 * 16 * ceil_div(row_bytes(W, coefficients, 256), 16) + 8 * 16 * 16 * ceil_div(4 * (64 / max(1, min(axis(W, COEFF_GROUP), 64))) * (2 - (2 - axis(W, COEFF)) * (1 - min(1, axis(W, COEFF_BIAS)))), 16)))
     params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0,
         arithmetic SPLIT in [2, 1] default 2 for single,
+        arithmetic GEMM_SPLIT in [1, 2, 4, 8] default least where (PARTED == 0 and GEMM_SPLIT == 1) or (PARTED == 1 and (GEMM_TILES * 4 * GEMM_SPLIT >= device.units or GEMM_SPLIT * 512 > K or GEMM_SPLIT == 8)) for segmented,
         TPW in [1, 2] default 1 for ordered,
         form STAGING in [0, 1] default 0 for single | segmented, form STAGING in [0] default 0 for paired,
-        arithmetic KSPLIT in [4, 2, 8, 1] default (4 - 3 * ORDERED_ANY))
+        arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ANY == 1 and KSPLIT == 1) or (ORDERED_ANY == 0 and KSPLIT != 1 and (4 * P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= 3 * device.units or KSPLIT == 8)))
     where dense_bytes(A) == 2
+    where (GEMM_SPLIT == 1 or (PARTED == 1 and K >= GEMM_SPLIT * 256)) for segmented
     where (ORDERED_ANY == 1 or KSPLIT != 1)
     where (ORDERED_ANY == 0 or (INT8 == 0 and OPERAND == 0 and STAGING == 0 and KSPLIT != 8))
     where (ORDERED_ANY == 0 or SPLIT == 2) for single
@@ -506,7 +510,7 @@ projection dense for cuda:
     scratch staged bytes (M * K * max(1 + OPERAND, 2 * OPERANDS)) when ORDERED_ANY == 0 and ((M > 1 and (OPERANDS == 1 or INT8 == 1)) or (M > 16 and OPERAND == 1)) for plain
     scratch groups bytes (M * K / 4) when ORDERED_ANY == 0 and INT8 == 1 and M > 1 and PLANES == 0
     scratch partials bytes (SPLIT * G * M * N * 4) when ORDERED_ANY == 0 and M > 16 and M <= 128 and SPLIT > 1 and PLANES == 0 for single
-    scratch partials bytes (M * P * sum(W, N) * 4) when ORDERED_ANY == 0 and M <= 16 and PARTED == 1 for segmented
+    scratch partials bytes (M * (P * (1 - min(1, M / 17)) + GEMM_SPLIT * min(1, M / 17)) * sum(W, N) * 4) when ORDERED_ANY == 0 and PARTED == 1 and (M <= 16 or GEMM_SPLIT > 1) for segmented
     scratch arrivals bytes (4) sync when ORDERED_ANY == 0 and M <= 16 and PARTED == 1 for segmented
     launch ordered_stage for rms when ORDERED_ALL == 1 and M > VERIFY_ROWS:
         staging
@@ -571,6 +575,10 @@ projection dense for cuda:
     launch finalize for single when ORDERED_ANY == 0 and M > 16 and M <= 128 and SPLIT > 1 and PLANES == 0:
         reads (SPLIT)
         threadgroups (ceil_div(M * N, 256), 1, G)
+        threads_per_threadgroup (256, 1, 1)
+    launch finalize for segmented when ORDERED_ANY == 0 and M > 16 and PARTED == 1 and GEMM_SPLIT > 1 and PLANES == 0:
+        reads (GEMM_SPLIT)
+        threadgroups (ceil_div(M * sum(W, N), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch planes for single when ORDERED_ANY == 0 and PLANES == 1:
         params (WARPS in [8, 4, 2] default 8, ROWS in [2, 1, 4] default 2)

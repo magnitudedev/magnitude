@@ -77,14 +77,14 @@ __global__ void gated_delta_project_gemv16(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM_SMALL
-template <unsigned INT8, unsigned OPERAND>
+template <unsigned INT8, unsigned OPERAND, unsigned GEMM_SPLIT>
 __global__ void gated_delta_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
     PROJECTION_SEGMENTED_GEMM(projection::SmallGemm, PROJECTION_OPERANDS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM
-template <unsigned INT8, unsigned OPERAND, unsigned ROTATE, unsigned BLOCKS>
+template <unsigned INT8, unsigned OPERAND, unsigned GEMM_SPLIT, unsigned ROTATE, unsigned BLOCKS>
 __launch_bounds__(256, BLOCKS) __global__ void gated_delta_project_gemm(SEISMIC_KERNEL_PARAMS) {
     PROJECTION_SEGMENTED_GEMM(projection::LargeGemm<ROTATE>, PROJECTION_OPERANDS);
 }

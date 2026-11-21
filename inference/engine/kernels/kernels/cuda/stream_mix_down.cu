@@ -84,12 +84,15 @@ __device__ __forceinline__ void mix_gemv(const Stream streams, const projection:
                                                                                  segments);
 }
 
-// The projection's segmented GEMM of one row band over the staged rows.
+// The projection's segmented GEMM of one row band over the staged rows,
+// splitting K across `gridDim.z` when the grid under-fills the device.
 template <class Shape>
-__device__ __forceinline__ void mix_gemm(const projection::u8 *staged, unsigned M, const Segments &segments) {
+__device__ __forceinline__ void mix_gemm(const projection::u8 *staged, float *partials, unsigned M,
+                                         const Segments &segments) {
     extern __shared__ uint4 dynamic_shared[];
-    projection::op::gemm_segmented<Shape, false, false, projection::SemanticGemmOperands>(
-        reinterpret_cast<projection::u8 *>(dynamic_shared), staged, nullptr, M, WIDTH, segments, 0u);
+    projection::op::gemm_segmented_split<Shape, false, false, projection::SemanticGemmOperands>(
+        reinterpret_cast<projection::u8 *>(dynamic_shared), staged, nullptr, M, WIDTH, segments, partials, blockIdx.z,
+        gridDim.z, 0u);
 }
 
 // Past one row: one block per row stages its normalized streams and
@@ -122,15 +125,22 @@ __global__ void stream_mix_down_gemv16(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMM_SMALL
-template <unsigned INT8, unsigned OPERAND>
+template <unsigned INT8, unsigned OPERAND, unsigned GEMM_SPLIT>
 __global__ void stream_mix_down_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    mix_gemm<projection::SmallGemm>(STAGED_ROWS, (unsigned)SEISMIC_DIM_M, SEGMENTS);
+    mix_gemm<projection::SmallGemm>(STAGED_ROWS, PARTIALS, (unsigned)SEISMIC_DIM_M, SEGMENTS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMM
-template <unsigned INT8, unsigned OPERAND, unsigned ROTATE, unsigned BLOCKS>
+template <unsigned INT8, unsigned OPERAND, unsigned GEMM_SPLIT, unsigned ROTATE, unsigned BLOCKS>
 __launch_bounds__(256, BLOCKS) __global__ void stream_mix_down_gemm(SEISMIC_KERNEL_PARAMS) {
-    mix_gemm<projection::LargeGemm<ROTATE>>(STAGED_ROWS, (unsigned)SEISMIC_DIM_M, SEGMENTS);
+    mix_gemm<projection::LargeGemm<ROTATE>>(STAGED_ROWS, PARTIALS, (unsigned)SEISMIC_DIM_M, SEGMENTS);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_FINALIZE
+template <unsigned GEMM_SPLIT>
+__global__ void stream_mix_down_finalize(SEISMIC_KERNEL_PARAMS) {
+    projection::op::finalize_segmented(PARTIALS, (projection::u64)GEMM_SPLIT, (unsigned)SEISMIC_DIM_M, SEGMENTS);
 }
 #endif

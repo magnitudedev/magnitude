@@ -4241,26 +4241,42 @@ impl<'a> Tuner<'a> {
         }
         // The units' canonical programs and the untuned entries compile
         // together on the load's worker threads: a compile needs nothing of
-        // another or of the device's queue. The canonical compiles come
-        // first, in the order of `searching`.
+        // another or of the device's queue. Units that share one canonical
+        // program (e.g. ranged row bands of one entry) compile it once on the
+        // worker pool; duplicates then reuse the live compiled program without
+        // blocking worker threads on the store claim or inflating compile time.
         let began = self.started.elapsed();
         let untuned_programs = untuned.len();
-        let groundings = searching
-            .iter()
-            .map(|key| {
-                self.prepared
-                    .get_mut(key)
-                    .expect("counted unit has its opened search")
-                    .grounding()
-                    .map(|grounding| std::sync::Mutex::new(Some(Mandatory::Canonical(grounding))))
-                    .map_err(|error| unit_failure(key, error))
-            })
-            .chain(
-                untuned.into_formations().into_iter().map(|formation| {
-                    Ok(std::sync::Mutex::new(Some(Mandatory::Untuned(formation))))
-                }),
-            )
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut seen_canonical = std::collections::HashSet::<seismic::GroundingKey>::new();
+        let mut primary_indices = Vec::with_capacity(searching.len());
+        let mut primary_groundings = Vec::with_capacity(searching.len() + untuned_programs);
+        let mut duplicate_groundings = Vec::<(usize, seismic::Grounding)>::new();
+        for (index, key) in searching.iter().enumerate() {
+            let grounding = self
+                .prepared
+                .get_mut(key)
+                .expect("counted unit has its opened search")
+                .grounding()
+                .map_err(|error| unit_failure(key, error))?;
+            match grounding {
+                Some(grounding) if !seen_canonical.insert(grounding.canonical_key()) => {
+                    duplicate_groundings.push((index, grounding));
+                }
+                grounding => {
+                    primary_indices.push(index);
+                    primary_groundings
+                        .push(std::sync::Mutex::new(Some(Mandatory::Canonical(grounding))));
+                }
+            }
+        }
+        let primary_canonical_len = primary_groundings.len();
+        primary_groundings.extend(
+            untuned
+                .into_formations()
+                .into_iter()
+                .map(|formation| std::sync::Mutex::new(Some(Mandatory::Untuned(formation)))),
+        );
+        let groundings = primary_groundings;
         let workers = self.workers();
         let ground = |compile: &std::sync::Mutex<Option<Mandatory<'a>>>| match compile
             .lock()
@@ -4327,7 +4343,20 @@ impl<'a> Tuner<'a> {
         if self.room.is_some() {
             self.memory.host_mandatory_bytes = self.memory.host_grown();
         }
-        let untuned = grounded.split_off(searching.len());
+        let untuned = grounded.split_off(primary_canonical_len);
+        // Reassemble canonical results in `searching` order; duplicate units
+        // hit the live compiled program held by their primary `Grounded`.
+        let mut by_unit: Vec<Option<MandatoryFormed>> = (0..searching.len()).map(|_| None).collect();
+        for (index, formed) in primary_indices.into_iter().zip(grounded) {
+            by_unit[index] = Some(formed);
+        }
+        for (index, grounding) in duplicate_groundings {
+            by_unit[index] = Some(MandatoryFormed::Canonical(Some(grounding.run())));
+        }
+        let grounded: Vec<MandatoryFormed> = by_unit
+            .into_iter()
+            .map(|formed| formed.expect("every searching unit was grounded"))
+            .collect();
         let mut untuned_forming = Duration::ZERO;
         for formed in untuned {
             let MandatoryFormed::Untuned(formed) = formed else {

@@ -419,6 +419,107 @@ __device__ __forceinline__ void gemm_segmented(u8 *shared, const u8 *rows, const
     }
 }
 
+// One unpaired segment's split-K GEMM block into `partials` at `offset` among
+// the segments' `total_cols` columns.
+template <int I, class Shape, bool S8, bool ENTRIES, class Operands, class Segments>
+__device__ __forceinline__ void gemm_segment_split_of(u8 *shared, const u8 *rows, const void *groups, u32 M, u64 K,
+                                                      u64 column, const Segments &s, float *partials, u64 total_cols,
+                                                      u64 offset, u64 part, u64 parts) {
+    static_assert(Segments::served(I) == 1, "split segmented GEMM segments are unpaired");
+    constexpr int A = first_weight<Segments, I>();
+    gemm_run<Shape, S8, ENTRIES, Operands>(shared, rows, K, groups, M, K, column, s.rows[I], weight_of<A>(s),
+                                           NoWeight{}, PartialStore<1>{partials, M, total_cols, offset, part}, part,
+                                           parts);
+}
+
+// The segmented GEMM with optional split-K (`parts > 1`): when `parts == 1`,
+// publishes directly through the segments' epilogues (`gemm_segmented`); when
+// `parts > 1`, each K share writes its F32 partials for `finalize_segmented`.
+template <class Shape, bool S8, bool ENTRIES, class Operands, class Segments>
+__device__ __forceinline__ void gemm_segmented_split(u8 *shared, const u8 *rows, const void *groups, u32 M, u64 K,
+                                                     const Segments &s, float *partials, u64 part, u64 parts,
+                                                     unsigned zero) {
+    if (parts <= 1) {
+        gemm_segmented<Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, s, zero);
+        return;
+    }
+    seismic_dependency_start();
+    u64 column = gemm_column<Shape>();
+    u64 columns[Segments::COUNT];
+    u64 offsets[Segments::COUNT];
+    u64 total_cols = 0;
+#pragma unroll
+    for (int i = 0; i < Segments::COUNT; ++i) {
+        columns[i] = gemm_columns(s.rows[i]);
+        offsets[i] = total_cols;
+        total_cols += s.rows[i];
+    }
+    const int segment = locate_segment(column, columns);
+    switch (segment) {
+    case 0:
+        if constexpr (!Segments::empty(0))
+            gemm_segment_split_of<0, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s, partials,
+                                                                   total_cols, offsets[0], part, parts);
+        break;
+    case 1:
+        if constexpr (Segments::COUNT > 1 && !Segments::empty(1))
+            gemm_segment_split_of<1, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s, partials,
+                                                                   total_cols, offsets[1], part, parts);
+        break;
+    case 2:
+        if constexpr (Segments::COUNT > 2 && !Segments::empty(2))
+            gemm_segment_split_of<2, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s, partials,
+                                                                   total_cols, offsets[2], part, parts);
+        break;
+    case 3:
+        if constexpr (Segments::COUNT > 3 && !Segments::empty(3))
+            gemm_segment_split_of<3, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s, partials,
+                                                                   total_cols, offsets[3], part, parts);
+        break;
+    }
+}
+
+// The finalize launch of a split-K segmented GEMM: sums each element over the
+// `parts` K shares in exact part order and hands it to its segment's epilogue.
+template <class Segments>
+__device__ __forceinline__ void finalize_segmented(const float *partials, u64 parts, u32 M, const Segments &s) {
+    seismic_dependency_start();
+    u64 total_cols = 0;
+#pragma unroll
+    for (int i = 0; i < Segments::COUNT; ++i)
+        total_cols += s.rows[i];
+    split_finalize<1>(partials, parts, M, total_cols, [&](unsigned m, unsigned long long col, float value, float) {
+        u64 offset = 0;
+        if constexpr (!Segments::empty(0)) {
+            if (col < s.rows[0]) {
+                out_of<0>(s)(m, col, value, 0.0f);
+                return;
+            }
+            offset += s.rows[0];
+        }
+        if constexpr (Segments::COUNT > 1 && !Segments::empty(1)) {
+            if (col < offset + s.rows[1]) {
+                out_of<1>(s)(m, col - offset, value, 0.0f);
+                return;
+            }
+            offset += s.rows[1];
+        }
+        if constexpr (Segments::COUNT > 2 && !Segments::empty(2)) {
+            if (col < offset + s.rows[2]) {
+                out_of<2>(s)(m, col - offset, value, 0.0f);
+                return;
+            }
+            offset += s.rows[2];
+        }
+        if constexpr (Segments::COUNT > 3 && !Segments::empty(3)) {
+            if (col < offset + s.rows[3]) {
+                out_of<3>(s)(m, col - offset, value, 0.0f);
+                return;
+            }
+        }
+    });
+}
+
 #ifdef PROJECTION_PARTS
 // Parts: a segmented projection whose K is PARTS parts of PART_K columns, each
 // part's rows of their own (its own norm group), splits its GEMV along K by

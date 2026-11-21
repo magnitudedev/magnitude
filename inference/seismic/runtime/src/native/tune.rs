@@ -1458,6 +1458,15 @@ impl UnitSearch<'_, '_> {
 
 }
 
+/// Identity of the canonical program formed by a [`Grounding`]: units that
+/// differ only in their served row range share one canonical program.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GroundingKey {
+    entry: EntryId,
+    bindings: ElementBindings,
+    default: NativeSpecialization,
+}
+
 /// The compile of a unit's canonical program ([`UnitSearch::grounding`]).
 pub struct Grounding<'m> {
     charges: Charges,
@@ -1472,6 +1481,15 @@ pub struct Grounding<'m> {
 }
 
 impl Grounding<'_> {
+    /// The canonical program identity this grounding forms.
+    pub fn canonical_key(&self) -> GroundingKey {
+        GroundingKey {
+            entry: self.entry,
+            bindings: self.bindings.clone(),
+            default: self.default.clone(),
+        }
+    }
+
     /// Form the canonical program, to the end.
     pub fn run(self) -> Grounded {
         let began = Instant::now();

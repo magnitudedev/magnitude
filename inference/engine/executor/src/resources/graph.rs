@@ -82,6 +82,13 @@ impl NativeGraphPool {
             output: Rc::new(RefCell::new(Vec::new())),
         };
         pool.grow(charges, floor)?;
+        // Record each floor flight's decode graphs at load time while memory
+        // serves them so no decode step records a graph (including a bank
+        // shrink's under pressure). Extra slots grown later for prompt-group
+        // chains (`grow_class`) serve prefill chains only and never run decode.
+        if floor.activations > 0 {
+            pool.family.record_decode().map_err(super::AllocationError::Tensor)?;
+        }
         Ok(pool)
     }
 
@@ -112,7 +119,6 @@ impl NativeGraphPool {
     /// [`Self::hold_bytes`] across this call. On a failure what was
     /// allocated idles until released.
     pub(crate) fn grow(&mut self, charges: &seismic::Charges, slots: GraphSlots) -> Result<(), super::AllocationError> {
-        let grows = self.allocated.activations < slots.activations;
         while self.allocated.activations < slots.activations {
             let slot = self
                 .family
@@ -120,12 +126,6 @@ impl NativeGraphPool {
                 .map_err(super::AllocationError::Workflow)?;
             self.workspace.borrow_mut().push(Claimed::under_class(slot));
             self.allocated.activations += 1;
-        }
-        // Each launch in flight's decode graphs, recorded as the slots are
-        // made, at load and as a class grows, while memory serves them: no
-        // later step records them, a bank shrink's under pressure included.
-        if grows {
-            self.family.record_decode().map_err(super::AllocationError::Tensor)?;
         }
         while self.allocated.output < slots.output {
             let slot = self.new_output(charges).map_err(super::AllocationError::Tensor)?;

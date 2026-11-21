@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 /// Compile-time element bindings for an entry's element parameters (§14.5).
 /// The only compile-time bindings that exist.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ElementBindings {
     bindings: BTreeMap<String, RepresentationId>,
 }

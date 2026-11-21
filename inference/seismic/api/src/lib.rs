@@ -2542,6 +2542,7 @@ pub struct NativeSearch<'a, E: Entry> {
 pub type Forming = seismic_runtime::native::tune::Forming<'static>;
 /// The compile of a unit's canonical program ([`NativeSearch::grounding`]).
 pub type Grounding = seismic_runtime::native::tune::Grounding<'static>;
+pub use seismic_runtime::native::tune::GroundingKey;
 impl<'a, E: Entry> NativeSearch<'a, E> {
     /// The unit's mandatory work: form the declared canonical program and
     /// hand it to serving, without building point inputs or observations.
