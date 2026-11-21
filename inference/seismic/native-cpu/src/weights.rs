@@ -2417,9 +2417,7 @@ pub trait Coefficients: Copy + Send + Sync + 'static {
     const UNIT: usize;
 
     /// Whether each unit's coefficient is an integer (a scale code), so the
-    /// units' widened sums add exactly into one per block (`tile::Scaled`),
-    /// on x86.
-    #[cfg(target_arch = "x86_64")]
+    /// units' sums are widened by `Side::widen` and added in `tile::Scaled`.
     const INTEGER_UNITS: bool;
 
     /// The largest magnitude of a unit's integer and of a minimum code.
@@ -2950,7 +2948,6 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
 {
     const BIASED: bool = BIAS;
     const UNIT: usize = if GROUP < PACKET { GROUP } else { PACKET };
-    #[cfg(target_arch = "x86_64")]
     const INTEGER_UNITS: bool = false;
     const MAGNITUDE: i32 = 1;
     type Units<const W: usize> = tile::Sums<W>;
@@ -4136,7 +4133,6 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
 {
     const BIASED: bool = L::BIAS.is_some();
     const UNIT: usize = if GROUP < PACKET { GROUP } else { PACKET };
-    #[cfg(target_arch = "x86_64")]
     const INTEGER_UNITS: bool = true;
     const MAGNITUDE: i32 = L::MAGNITUDE;
     type Units<const W: usize> = tile::Scaled<W>;

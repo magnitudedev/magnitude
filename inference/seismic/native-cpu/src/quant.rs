@@ -198,10 +198,7 @@ pub fn quantize(x: &[f32], out: &mut [Q8Block]) {
             }
         }
         for (j, sum) in block.sums.iter_mut().enumerate() {
-            *sum = block.codes[16 * j..16 * j + 16]
-                .iter()
-                .map(|code| i16::from(*code))
-                .sum();
+            *sum = sum_16(&block.codes[16 * j..16 * j + 16]);
         }
     }
 }
@@ -282,10 +279,26 @@ pub fn code(value: f32, scale: f32) -> i8 {
 pub fn quantize_group<G: ScaleGrid>(values: &[f32], codes: &mut [i8]) -> f32 {
     let maximum = largest(values);
     let d = scale_on::<G>(maximum);
+    #[cfg(target_arch = "aarch64")]
+    neon::quantize_codes(values, d, codes);
+    #[cfg(not(target_arch = "aarch64"))]
     for (code_out, value) in codes.iter_mut().zip(values) {
         *code_out = code(*value, d);
     }
     if maximum.is_finite() { d } else { f32::NAN }
+}
+
+/// Sum of 16 consecutive quantized codes.
+#[inline(always)]
+fn sum_16(codes: &[i8]) -> i16 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::sum_16(codes)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        codes.iter().map(|code| i16::from(*code)).sum()
+    }
 }
 
 /// The largest magnitude of `values`: NaN where any value is NaN, else
@@ -311,9 +324,9 @@ fn magnitudes(values: &[f32]) -> u32 {
     values.iter().fold(0, |maximum, value| maximum.max(value.to_bits() & MAGNITUDE))
 }
 
-/// [`magnitudes`] by vectors of four, the values past the last whole
-/// vector seeding the maximum: one path for every length, so the maximum
-/// stays in the vector register the scale's division reads.
+/// NEON quantization helpers: 4-wide magnitude reduction, 2-wide `f64`
+/// division and tie-away rounding with exact parity to [`code`], and
+/// 16-byte code sums.
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use super::MAGNITUDE;
@@ -321,16 +334,73 @@ mod neon {
 
     #[inline(always)]
     pub(super) fn magnitudes(values: &[f32]) -> u32 {
-        let vectors = values.chunks_exact(4);
+        let pairs = values.chunks_exact(8);
+        let rem = pairs.remainder().chunks_exact(4);
         // SAFETY: each load reads one whole chunk of four.
         unsafe {
             let magnitude = vdupq_n_u32(MAGNITUDE);
-            let mut maximum = vdupq_n_u32(super::magnitudes(vectors.remainder()));
-            for vector in vectors {
-                maximum = vmaxq_u32(maximum, vandq_u32(vld1q_u32(vector.as_ptr().cast()), magnitude));
+            let mut max0 = vdupq_n_u32(super::magnitudes(rem.remainder()));
+            let mut max1 = vdupq_n_u32(0);
+            for pair in pairs {
+                let p = pair.as_ptr().cast::<u32>();
+                max0 = vmaxq_u32(max0, vandq_u32(vld1q_u32(p), magnitude));
+                max1 = vmaxq_u32(max1, vandq_u32(vld1q_u32(p.add(4)), magnitude));
             }
-            vmaxvq_u32(maximum)
+            for vector in rem {
+                max0 = vmaxq_u32(max0, vandq_u32(vld1q_u32(vector.as_ptr().cast()), magnitude));
+            }
+            vmaxvq_u32(vmaxq_u32(max0, max1))
         }
+    }
+
+    #[inline(always)]
+    pub(super) fn quantize_codes(values: &[f32], scale: f32, codes: &mut [i8]) {
+        let len = values.len().min(codes.len());
+        let (values, codes) = (&values[..len], &mut codes[..len]);
+        let mut v_chunks = values.chunks_exact(16);
+        let mut c_chunks = codes.chunks_exact_mut(16);
+        // SAFETY: each chunk holds 16 elements of `f32` / `i8`.
+        unsafe {
+            let scale = vdupq_n_f64(f64::from(scale));
+            for (vs, cs) in v_chunks.by_ref().zip(c_chunks.by_ref()) {
+                let p = vs.as_ptr();
+                let v0 = vld1q_f32(p);
+                let v1 = vld1q_f32(p.add(4));
+                let v2 = vld1q_f32(p.add(8));
+                let v3 = vld1q_f32(p.add(12));
+
+                let q0 = vcvtaq_s64_f64(vdivq_f64(vcvt_f64_f32(vget_low_f32(v0)), scale));
+                let q1 = vcvtaq_s64_f64(vdivq_f64(vcvt_high_f64_f32(v0), scale));
+                let q2 = vcvtaq_s64_f64(vdivq_f64(vcvt_f64_f32(vget_low_f32(v1)), scale));
+                let q3 = vcvtaq_s64_f64(vdivq_f64(vcvt_high_f64_f32(v1), scale));
+
+                let q4 = vcvtaq_s64_f64(vdivq_f64(vcvt_f64_f32(vget_low_f32(v2)), scale));
+                let q5 = vcvtaq_s64_f64(vdivq_f64(vcvt_high_f64_f32(v2), scale));
+                let q6 = vcvtaq_s64_f64(vdivq_f64(vcvt_f64_f32(vget_low_f32(v3)), scale));
+                let q7 = vcvtaq_s64_f64(vdivq_f64(vcvt_high_f64_f32(v3), scale));
+
+                let s0 = vqmovn_high_s64(vqmovn_s64(q0), q1);
+                let s1 = vqmovn_high_s64(vqmovn_s64(q2), q3);
+                let s2 = vqmovn_high_s64(vqmovn_s64(q4), q5);
+                let s3 = vqmovn_high_s64(vqmovn_s64(q6), q7);
+
+                let h0 = vqmovn_high_s32(vqmovn_s32(s0), s1);
+                let h1 = vqmovn_high_s32(vqmovn_s32(s2), s3);
+
+                let b = vqmovn_high_s16(vqmovn_s16(h0), h1);
+                vst1q_s8(cs.as_mut_ptr(), b);
+            }
+        }
+        for (code_out, value) in c_chunks.into_remainder().iter_mut().zip(v_chunks.remainder()) {
+            *code_out = super::code(*value, scale);
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn sum_16(codes: &[i8]) -> i16 {
+        debug_assert_eq!(codes.len(), 16);
+        // SAFETY: `codes` has 16 elements.
+        unsafe { vaddlvq_s8(vld1q_s8(codes.as_ptr())) }
     }
 }
 
@@ -498,5 +568,123 @@ pub(crate) mod tests {
     fn interleave_zero_blocks_is_noop() {
         interleave(&[], 0, 0, &mut []);
         interleave(&[], 4, 0, &mut []);
+    }
+
+    /// NEON `quantize_codes` and `sum_16` match scalar `code` and scalar sums
+    /// bit-for-bit across edge cases: zeros, subnormals, exact half-integers
+    /// (ties away from zero), near-ties, clamp bounds `±127`, saturation,
+    /// mixed signs, non-finite values, and partial lengths.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_quantize_group_matches_scalar_bit_for_bit() {
+        fn check_group<G: ScaleGrid>(values: &[f32], label: &str) {
+            let scalar_max = f32::from_bits(magnitudes(values));
+            let scalar_d = scale_on::<G>(scalar_max);
+            let scalar_scale = if scalar_max.is_finite() { scalar_d } else { f32::NAN };
+            let scalar_codes: Vec<i8> = values.iter().map(|&v| code(v, scalar_d)).collect();
+
+            let mut neon_codes = vec![0x55i8; values.len()];
+            let neon_scale = quantize_group::<G>(values, &mut neon_codes);
+
+            if scalar_scale.is_nan() {
+                assert!(neon_scale.is_nan(), "{label}: expected NaN scale, got {neon_scale:e}");
+            } else {
+                assert_eq!(neon_scale.to_bits(), scalar_scale.to_bits(), "{label}: scale mismatch");
+            }
+            assert_eq!(neon_codes, scalar_codes, "{label}: codes mismatch");
+        }
+
+        // Exact half-integers (scale = 1.0 via max = 127.0) and clamp bounds ±127.
+        let mut ties = vec![0.0f32; 32];
+        ties[0] = 127.0;
+        ties[1] = -127.0;
+        ties[2] = 0.5;
+        ties[3] = -0.5;
+        ties[4] = 1.5;
+        ties[5] = -1.5;
+        ties[6] = 2.5;
+        ties[7] = -2.5;
+        ties[8] = 126.5;
+        ties[9] = -126.5;
+        ties[10] = f32::from_bits(0.5f32.to_bits() - 1);
+        ties[11] = -f32::from_bits(0.5f32.to_bits() - 1);
+        ties[12] = f32::from_bits(0.5f32.to_bits() + 1);
+        ties[13] = -f32::from_bits(0.5f32.to_bits() + 1);
+        ties[14] = -0.0;
+        ties[15] = 0.0;
+        ties[16] = 63.5;
+        ties[17] = -63.5;
+        ties[18] = 64.5;
+        ties[19] = -64.5;
+        ties[20] = 125.5;
+        ties[21] = -125.5;
+        ties[22] = f32::from_bits(1);
+        ties[23] = -f32::from_bits(1);
+        check_group::<F32Grid>(&ties, "ties-f32");
+        check_group::<F16Grid>(&ties, "ties-f16");
+
+        // All zeros (including -0.0).
+        let zeros = [0.0f32, -0.0].repeat(16);
+        check_group::<F32Grid>(&zeros, "zeros-f32");
+        check_group::<F16Grid>(&zeros, "zeros-f16");
+
+        // Subnormals and tiny maxima.
+        let subnormals: Vec<f32> = (0..32)
+            .map(|i| {
+                let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                sign * f32::from_bits((i as u32) * 3 + 1)
+            })
+            .collect();
+        check_group::<F32Grid>(&subnormals, "subnormals-f32");
+        check_group::<F16Grid>(&subnormals, "subnormals-f16");
+
+        // Near-tie case from a_near_tie_codes_by_the_exact_quotient.
+        let mut near_tie = vec![0.0f32; 32];
+        near_tie[0] = 1.8490553;
+        near_tie[1] = 0.16743414;
+        near_tie[17] = -0.16743414;
+        check_group::<F32Grid>(&near_tie, "near-tie-f32");
+
+        // Non-finite values in various lanes.
+        for non_finite in [f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for pos in [0, 1, 15, 16, 31] {
+                let mut v = ties.clone();
+                v[pos] = non_finite;
+                check_group::<F32Grid>(&v, &format!("non-finite-{non_finite}-at-{pos}"));
+            }
+        }
+
+        // Arbitrary lengths (partial chunks and whole groups).
+        let mixed: Vec<f32> = (0..39)
+            .map(|i| ((i * 7919 % 509) as f32 - 254.0) * 0.0371)
+            .collect();
+        for len in [0, 1, 7, 15, 16, 17, 31, 32, 39] {
+            check_group::<F32Grid>(&mixed[..len], &format!("len-{len}-f32"));
+            check_group::<F16Grid>(&mixed[..len], &format!("len-{len}-f16"));
+        }
+
+        // Direct saturation test on neon::quantize_codes (out-of-range quotients + 0/0).
+        let extreme = [
+            1e10f32, -1e10, 128.0, -129.0, 127.5, -127.5, 127.4, -127.4,
+            0.0, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5, -0.5, 42.5,
+        ];
+        for scale in [1.0f32, 0.0, f32::NAN, f32::INFINITY] {
+            let expected: Vec<i8> = extreme.iter().map(|&v| code(v, scale)).collect();
+            let mut got = [0i8; 16];
+            neon::quantize_codes(&extreme, scale, &mut got);
+            assert_eq!(got.as_slice(), expected.as_slice(), "direct saturation scale={scale}");
+        }
+
+        // NEON sum_16 parity against scalar sum.
+        for pattern in [
+            [127i8; 16],
+            [-127i8; 16],
+            [-128i8; 16],
+            [0i8; 16],
+            std::array::from_fn(|i| (i as i8) * 15 - 110),
+        ] {
+            let expected: i16 = pattern.iter().map(|&c| i16::from(c)).sum();
+            assert_eq!(neon::sum_16(&pattern), expected);
+        }
     }
 }

@@ -94,6 +94,22 @@ pub trait Integers<const W: usize>: Sized {
     /// activation row's units arrive in unit order.
     fn add<K: Coefficients, const R: usize>(&mut self, u: usize, a: usize, sums: [i32; 8], side: &Side, x: &Q8Tile<R>);
 
+    /// Adds unit `u`'s exact integers for weight rows `4 * quad .. 4 * quad + 4`
+    /// of activation row `a` directly from a NEON register.
+    ///
+    /// # Safety
+    /// `quad < 2`, `a < W`, and `u` lies in the block's units.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn add_neon_quad<K: Coefficients, const R: usize>(
+        &mut self,
+        u: usize,
+        a: usize,
+        quad: usize,
+        sums: std::arch::aarch64::int32x4_t,
+        side: &Side,
+        x: &Q8Tile<R>,
+    );
+
     /// The x86 core's, of the source's first `packets` packets.
     ///
     /// # Safety
@@ -115,6 +131,33 @@ impl<const W: usize> Integers<W> for Sums<W> {
             let term = side.scales[u][r] * sums[r] as f32;
             let term = if K::BIASED { side.biases[u][r].mul_add(codes as f32, term) } else { term };
             *value = d.mul_add(term, *value);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn add_neon_quad<K: Coefficients, const R: usize>(
+        &mut self,
+        u: usize,
+        a: usize,
+        quad: usize,
+        sums: std::arch::aarch64::int32x4_t,
+        side: &Side,
+        x: &Q8Tile<R>,
+    ) {
+        use std::arch::aarch64::*;
+        unsafe {
+            let offset = 4 * quad;
+            let d = vdupq_n_f32(x.d[a][u * K::UNIT / PACKET]);
+            let scales = vld1q_f32(side.scales[u][offset..].as_ptr());
+            let mut term = vmulq_f32(scales, vcvtq_f32_s32(sums));
+            if K::BIASED {
+                let codes = vdupq_n_f32(unit_sum(x, K::UNIT, u, a) as f32);
+                let biases = vld1q_f32(side.biases[u][offset..].as_ptr());
+                term = vfmaq_f32(term, biases, codes);
+            }
+            let ptr = self.values[a][offset..].as_mut_ptr();
+            vst1q_f32(ptr, vfmaq_f32(vld1q_f32(ptr), d, term));
         }
     }
 
@@ -155,6 +198,62 @@ impl<const W: usize> Integers<W> for Scaled<W> {
                 if K::BIASED {
                     minimums[r] = d.mul_add(pm[r] as f32, minimums[r]);
                     pm[r] = 0;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn add_neon_quad<K: Coefficients, const R: usize>(
+        &mut self,
+        u: usize,
+        a: usize,
+        quad: usize,
+        sums: std::arch::aarch64::int32x4_t,
+        side: &Side,
+        x: &Q8Tile<R>,
+    ) {
+        use std::arch::aarch64::*;
+        unsafe {
+            let offset = 4 * quad;
+            let units_per_packet = PACKET / K::UNIT;
+            if units_per_packet == 1 {
+                let d = vdupq_n_f32(x.d[a][u]);
+                let scaled_ptr = self.scaled[a][offset..].as_mut_ptr();
+                vst1q_f32(scaled_ptr, vfmaq_f32(vld1q_f32(scaled_ptr), d, vcvtq_f32_s32(sums)));
+                if K::BIASED {
+                    let codes = vdupq_n_s32(unit_sum(x, K::UNIT, u, a));
+                    let minimums = vld1q_s32(side.minimums[u][offset..].as_ptr());
+                    let min_ptr = self.minimums[a][offset..].as_mut_ptr();
+                    vst1q_f32(min_ptr, vfmaq_f32(vld1q_f32(min_ptr), d, vcvtq_f32_s32(vmulq_s32(minimums, codes))));
+                }
+            } else {
+                let ps_ptr = self.packet_scaled[a][offset..].as_mut_ptr();
+                let ps = vaddq_s32(vld1q_s32(ps_ptr), sums);
+                let pm = if K::BIASED {
+                    let codes = vdupq_n_s32(unit_sum(x, K::UNIT, u, a));
+                    let minimums = vld1q_s32(side.minimums[u][offset..].as_ptr());
+                    let pm_ptr = self.packet_minimums[a][offset..].as_mut_ptr();
+                    vaddq_s32(vld1q_s32(pm_ptr), vmulq_s32(minimums, codes))
+                } else {
+                    vdupq_n_s32(0)
+                };
+                if u % units_per_packet == units_per_packet - 1 {
+                    let d = vdupq_n_f32(x.d[a][u / units_per_packet]);
+                    let scaled_ptr = self.scaled[a][offset..].as_mut_ptr();
+                    vst1q_f32(scaled_ptr, vfmaq_f32(vld1q_f32(scaled_ptr), d, vcvtq_f32_s32(ps)));
+                    vst1q_s32(ps_ptr, vdupq_n_s32(0));
+                    if K::BIASED {
+                        let min_ptr = self.minimums[a][offset..].as_mut_ptr();
+                        vst1q_f32(min_ptr, vfmaq_f32(vld1q_f32(min_ptr), d, vcvtq_f32_s32(pm)));
+                        vst1q_s32(self.packet_minimums[a][offset..].as_mut_ptr(), vdupq_n_s32(0));
+                    }
+                } else {
+                    vst1q_s32(ps_ptr, ps);
+                    if K::BIASED {
+                        vst1q_s32(self.packet_minimums[a][offset..].as_mut_ptr(), pm);
+                    }
                 }
             }
         }
@@ -560,8 +659,6 @@ unsafe fn core_neon<K: Coefficients, S: Source, const W: usize, const R: usize>(
     use std::arch::aarch64::*;
     unsafe {
         for u in 0..count {
-            // Each activation row's widened sums of the eight rows.
-            let mut rows = [[0i32; 8]; W];
             for quad in 0..2 {
                 let mut sums = [vdupq_n_s32(0); W];
                 if R == 1 {
@@ -603,13 +700,16 @@ unsafe fn core_neon<K: Coefficients, S: Source, const W: usize, const R: usize>(
                         }
                     }
                 }
-                let widen = vld1q_s32(side.widen[u][4 * quad..].as_ptr());
-                for (rows, sums) in rows.iter_mut().zip(sums) {
-                    vst1q_s32(rows[4 * quad..].as_mut_ptr(), vmulq_s32(sums, widen));
+                if K::INTEGER_UNITS {
+                    let widen = vld1q_s32(side.widen[u][4 * quad..].as_ptr());
+                    for (a, sums) in sums.into_iter().enumerate() {
+                        out.add_neon_quad::<K, R>(u, a, quad, vmulq_s32(sums, widen), side, x);
+                    }
+                } else {
+                    for (a, sums) in sums.into_iter().enumerate() {
+                        out.add_neon_quad::<K, R>(u, a, quad, sums, side, x);
+                    }
                 }
-            }
-            for (a, rows) in rows.into_iter().enumerate() {
-                out.add::<K, R>(u, a, rows, side, x);
             }
         }
     }
@@ -658,18 +758,22 @@ unsafe fn core_mmla<K: Coefficients, S: Source, const W: usize, const R: usize>(
                     }
                 }
             }
-            let mut rows = [[0i32; 8]; W];
             for half in 0..2 {
-                let widen = vld1q_s32(side.widen[u][4 * half..].as_ptr());
-                let (first, second) = (vzip1q_s32(widen, widen), vzip2q_s32(widen, widen));
-                for (q, sums) in sums.iter().enumerate().take(W / 2) {
-                    let (first, second) = (vmulq_s32(sums[2 * half], first), vmulq_s32(sums[2 * half + 1], second));
-                    vst1q_s32(rows[2 * q][4 * half..].as_mut_ptr(), vuzp1q_s32(first, second));
-                    vst1q_s32(rows[2 * q + 1][4 * half..].as_mut_ptr(), vuzp2q_s32(first, second));
+                if K::INTEGER_UNITS {
+                    let widen = vld1q_s32(side.widen[u][4 * half..].as_ptr());
+                    let (w0, w1) = (vzip1q_s32(widen, widen), vzip2q_s32(widen, widen));
+                    for (q, sums) in sums.iter().enumerate().take(W / 2) {
+                        let (first, second) = (vmulq_s32(sums[2 * half], w0), vmulq_s32(sums[2 * half + 1], w1));
+                        out.add_neon_quad::<K, R>(u, 2 * q, half, vuzp1q_s32(first, second), side, x);
+                        out.add_neon_quad::<K, R>(u, 2 * q + 1, half, vuzp2q_s32(first, second), side, x);
+                    }
+                } else {
+                    for (q, sums) in sums.iter().enumerate().take(W / 2) {
+                        let (first, second) = (sums[2 * half], sums[2 * half + 1]);
+                        out.add_neon_quad::<K, R>(u, 2 * q, half, vuzp1q_s32(first, second), side, x);
+                        out.add_neon_quad::<K, R>(u, 2 * q + 1, half, vuzp2q_s32(first, second), side, x);
+                    }
                 }
-            }
-            for (a, rows) in rows.into_iter().enumerate() {
-                out.add::<K, R>(u, a, rows, side, x);
             }
         }
     }
