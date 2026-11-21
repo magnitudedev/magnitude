@@ -918,6 +918,36 @@ fn a_requests_probe_reads_its_range_line() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// Probing succeeds when each individual part fits in the file even if their
+/// sum exceeds `file.size`, and returns `Error::Invalid` (never panicking)
+/// when a single part exceeds `file.size` or the file is empty.
+#[cfg(unix)]
+#[test]
+fn probe_handles_small_files_without_panicking() {
+    let _volume = temporary_volume();
+    let urgent = Urgent { parts: vec![64 * 1024; 3], records: 2 };
+
+    // Record sum (192 KiB) > file (128 KiB), but every part (64 KiB) fits.
+    let fits_parts = temporary("probe-fits-parts", &vec![3u8; 128 * 1024]);
+    let curve = probe_volume(&OpenFile::open(&fits_parts).unwrap(), Some(&urgent)).unwrap();
+    assert!(!curve.points.is_empty());
+    assert!(!curve.lone.is_empty());
+    assert!(!curve.ranges.is_empty());
+    std::fs::remove_file(fits_parts).unwrap();
+
+    // Widest part (64 KiB) > file (32 KiB): returns Invalid instead of panicking.
+    let too_small = temporary("probe-too-small", &vec![5u8; 32 * 1024]);
+    assert!(matches!(probe_volume(&OpenFile::open(&too_small).unwrap(), Some(&urgent)), Err(Error::Invalid(_))));
+    std::fs::remove_file(too_small).unwrap();
+
+    // Empty file: returns Invalid instead of panicking.
+    let empty = temporary("probe-empty", &[]);
+    let empty_source = OpenFile::open(&empty).unwrap();
+    assert!(matches!(probe_volume(&empty_source, None), Err(Error::Invalid(_))));
+    assert!(matches!(probe_volume(&empty_source, Some(&urgent)), Err(Error::Invalid(_))));
+    std::fs::remove_file(empty).unwrap();
+}
+
 /// A request's range line at each depth, GB/s, with a spread of 2%.
 fn range_line(urgent: &Urgent, line: &[(u64, f64)]) -> Vec<Point> {
     line.iter().map(|&(depth, rate)| Curve::range_point(urgent, depth, rate * 1e9, 0.02 * rate * 1e9, 1.)).collect()

@@ -1739,16 +1739,22 @@ fn expert_requests(
     Ok((tier.chain(sites).chain(converts).collect(), readers))
 }
 
-/// The volumes a load of `artifact` reads for: each source for a reader no
-/// step waits on and for `bank`'s urgent request.
+/// The volumes a load of `artifact` reads for: the largest shard on each
+/// storage volume, for a reader no step waits on and (where that shard can
+/// hold a probed range) for `bank`'s urgent request.
 fn volumes(
     artifact: &magnitude_artifacts::gguf::GgufArtifact,
     bank: Option<&magnitude_executor::ExpertBankPlan>,
 ) -> Result<Vec<(Arc<magnitude_artifacts::FileSource>, Option<seismic_io::Urgent>)>, String> {
     let urgent = bank.map(magnitude_executor::ExpertBankPlan::urgent).transpose()?;
+    let widest = urgent.as_ref().and_then(|urgent| urgent.parts.iter().copied().max()).unwrap_or(0);
     Ok(artifact
-        .sources()
-        .flat_map(|source| std::iter::once(None).chain(urgent.clone().map(Some)).map(|urgent| (source.clone(), urgent)))
+        .volume_sources()
+        .into_iter()
+        .flat_map(|source| {
+            let urgent = urgent.clone().filter(|_| source.size() >= widest);
+            std::iter::once(None).chain(urgent.map(Some)).map(move |urgent| (source.clone(), urgent))
+        })
         .collect())
 }
 

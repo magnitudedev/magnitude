@@ -1637,6 +1637,24 @@ impl GgufArtifact {
         self.shards.iter().map(|shard| &shard.source)
     }
 
+    /// One representative file per storage volume the component's shards lie
+    /// on: the largest shard on each volume, in first-seen volume order.
+    /// Volume probes and adoption use this so a small metadata shard is never
+    /// chosen over the weight shards on the same volume, and each volume is
+    /// handled once.
+    pub fn volume_sources(&self) -> Vec<Arc<FileSource>> {
+        let mut by_volume: Vec<(seismic_io::Volume, Arc<FileSource>)> = Vec::new();
+        for shard in &self.shards {
+            let volume = shard.source.volume();
+            match by_volume.iter_mut().find(|(known, _)| *known == volume) {
+                Some((_, best)) if shard.source.size() > best.size() => *best = shard.source.clone(),
+                Some(_) => {}
+                None => by_volume.push((volume, shard.source.clone())),
+            }
+        }
+        by_volume.into_iter().map(|(_, source)| source).collect()
+    }
+
     pub fn identity(&self) -> ArtifactIdentity {
         self.identity
     }
@@ -1928,5 +1946,55 @@ mod tests {
                 Err(SplitError::InconsistentMetadata(_))
             ));
         }
+    }
+
+    #[test]
+    fn volume_sources_selects_largest_shard_per_volume() {
+        let root = temporary_directory("volume-sources-largest-shard");
+        let shard0 = write_shard(
+            &root.join("model-00001-of-00003.gguf"),
+            0,
+            3,
+            Some(2),
+            Some("small-first-shard"),
+            &[],
+            0,
+        );
+        let shard1 = write_shard(
+            &root.join("model-00002-of-00003.gguf"),
+            1,
+            3,
+            None,
+            None,
+            &[("weights.large", vec![512, 256], Encoding::Q8_0)],
+            0x11,
+        );
+        let shard2 = write_shard(
+            &root.join("model-00003-of-00003.gguf"),
+            2,
+            3,
+            None,
+            None,
+            &[("weights.tail", vec![16, 32], Encoding::Q8_0)],
+            0x22,
+        );
+        let artifact = GgufArtifact::open_shards(&[shard0.clone(), shard1.clone(), shard2.clone()]).unwrap();
+        assert_eq!(artifact.sources().len(), 3);
+        let first_size = artifact.sources().next().unwrap().size();
+        let selected = artifact.volume_sources();
+        assert_eq!(selected.len(), 1, "all shards on one volume collapse to one representative");
+        assert_eq!(selected[0].path(), std::path::absolute(&shard1).unwrap());
+        assert!(selected[0].size() > first_size, "largest weight shard chosen over small metadata shard 1");
+
+        // Probing the representative shard succeeds for a record larger than shard 1.
+        let part = (first_size + 4096).min(selected[0].size() / 2);
+        let urgent = seismic_io::Urgent { parts: vec![part; 3], records: 2 };
+        assert!(urgent.parts.iter().sum::<u64>() > first_size);
+        let curve = seismic_io::probe_volume(&*selected[0], Some(&urgent)).unwrap();
+        assert!(!curve.points.is_empty());
+        assert!(!curve.lone.is_empty());
+        assert!(!curve.ranges.is_empty());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

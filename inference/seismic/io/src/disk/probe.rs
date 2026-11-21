@@ -147,6 +147,9 @@ pub(crate) const WIDEST_WINDOW: u64 = 32 * 1024 * 1024;
 /// tracks its reads in flight (an M4 Pro's internal drive, 3 to 4).
 const EVERY_DEPTH_TO: u64 = 8;
 
+/// The alignment grain a model file stores tensors at.
+const TENSOR_GRAIN: u64 = 32;
+
 /// The seconds a volume's probe reads at each read size and window, and
 /// the passes it takes each point's median of.
 const PROBE_SECONDS: f64 = 0.03;
@@ -349,6 +352,15 @@ impl VolumeLines {
     /// Probe `urgent`'s curve through `file`: the lines it needs not yet
     /// probed through a file as large, its lone times and its range line.
     pub(crate) fn probe(&mut self, key: Volume, file: &Arc<SourceFile>, urgent: Option<&Urgent>) -> Result<Curve, Error> {
+        if file.size == 0 {
+            return Err(Error::Invalid("cannot probe an empty file".into()));
+        }
+        if let Some(urgent) = urgent {
+            let widest = urgent.parts.iter().copied().max().expect("a request has a range");
+            if widest > file.size {
+                return Err(Error::Invalid(format!("a range of {widest} bytes beyond a file of {}", file.size)));
+            }
+        }
         self.probe_lines(file, &reads_of(urgent))?;
         let (lone, ranges) = match urgent {
             Some(urgent) => {
@@ -502,13 +514,13 @@ fn median_error(values: &[f64]) -> f64 {
     1.253 * (quartile(3) - quartile(1)) / 1.349 / (sorted.len() as f64).sqrt()
 }
 
-/// A random aligned offset of `file` such that `offset + length <= file.size`
-/// holds whenever `length <= file.size`.
-fn random_offset(file: &SourceFile, state: &mut u64, length: u64) -> u64 {
+/// A random `grain`-aligned offset of `file` such that
+/// `offset + length <= file.size` holds whenever `length <= file.size`.
+fn random_offset(file: &SourceFile, state: &mut u64, length: u64, grain: u64) -> u64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
     *state ^= *state << 17;
-    *state % (file.size.saturating_sub(length) / ALIGNMENT + 1) * ALIGNMENT
+    *state % (file.size.saturating_sub(length) / grain + 1) * grain
 }
 
 /// The bytes a second `file` reads at, and the cores its reads occupy, with
@@ -533,7 +545,7 @@ fn rate(file: &SourceFile, read: u64, depth: usize) -> Result<(f64, f64), Error>
                 let began = thread_cpu_seconds()?;
                 let mut bytes = 0;
                 while until.is_some_and(|until| Instant::now() < until) {
-                    let at = random_offset(file, &mut state, length as u64);
+                    let at = random_offset(file, &mut state, length as u64, ALIGNMENT);
                     file.read_block(at, buffer.bytes_mut())?;
                     sink.copy_from_slice(buffer.bytes_mut());
                     bytes += (at + length as u64).min(file.size) - at;
@@ -573,10 +585,7 @@ fn rate(file: &SourceFile, read: u64, depth: usize) -> Result<(f64, f64), Error>
 /// (its cut into pieces, the workers it wakes, the copy of a piece that
 /// does not land straight), not a read's alone.
 fn lone(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, reads: &[u64]) -> Result<Vec<Vec<f64>>, Error> {
-    const GRAIN: u64 = 32;
     let parts = &urgent.parts;
-    let record = parts.iter().sum::<u64>();
-    assert!(record + ALIGNMENT * parts.len() as u64 <= file.size, "a record of {record} bytes beyond a file of {}", file.size);
     let sink: Arc<dyn crate::Destination> = Arc::new(Buffer::new(urgent.bytes() as usize));
     // Every piece of a request at once: its due depth holds it whole. The
     // pool's workers for them are the probe's, while it runs.
@@ -598,7 +607,7 @@ fn lone(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, reads: &[u64]) -> 
             let ranges = (0..urgent.records)
                 .flat_map(|_| parts.iter())
                 .map(|&part| {
-                    let offset = random_offset(file, &mut state, part + ALIGNMENT) + state % (ALIGNMENT / GRAIN) * GRAIN;
+                    let offset = random_offset(file, &mut state, part, TENSOR_GRAIN);
                     let range = Range { offset, length: part as usize, into: sink.clone(), at };
                     at += part as usize;
                     range
@@ -655,7 +664,6 @@ fn range_line(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent) -> Result<Ve
 /// (its admission, wakes, and the copy of a piece that does not land
 /// straight), and nothing a reader's thread adds.
 fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64) -> Result<(f64, f64), Error> {
-    const GRAIN: u64 = 32;
     let parts = &urgent.parts;
     let widest = *parts.iter().max().expect("a request has a range");
     let window = depth * urgent.span();
@@ -689,7 +697,7 @@ fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64)
         }
         let length = parts[part];
         part = (part + 1) % parts.len();
-        let offset = random_offset(file, &mut state, length + ALIGNMENT) + state % (ALIGNMENT / GRAIN) * GRAIN;
+        let offset = random_offset(file, &mut state, length, TENSOR_GRAIN);
         let sink = spare.pop().expect("a sink for every request queued");
         let ranges = vec![Range { offset, length: length as usize, into: sink.clone(), at: 0 }];
         // SAFETY: each sink is one queued request's alone: it is reused only
