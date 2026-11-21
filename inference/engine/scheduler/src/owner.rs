@@ -121,9 +121,9 @@ fn competes(request: &Request, status: Status) -> bool {
 /// compute the row it samples from). None when that is not an exact input
 /// boundary, too short to be a hit, or already retained.
 fn prompt_boundary(record: &Record, generation: &Generation) -> Option<usize> {
+    let prefix = record.prefix.as_ref()?;
     let boundary = generation.prompt().len().checked_sub(1)?;
-    (record.prefix_cache
-        && !record.prefill_retained
+    (!prefix.prefill_retained
         && boundary >= MIN_PREFIX_HIT
         && generation.layout().boundary(boundary))
     .then_some(boundary)
@@ -141,7 +141,8 @@ fn resumes_from_stop(layout: &InputLayout, position: usize, method: &MethodCheck
 /// The first position after `position` where the request's prefill stops
 /// for the prefix cache: a planned branch point or its prompt boundary.
 fn next_stop(record: &Record, generation: &Generation, position: usize) -> Option<usize> {
-    let branch = record.branches.range(position + 1..).next().copied();
+    let prefix = record.prefix.as_ref()?;
+    let branch = prefix.branches.range(position + 1..).next().copied();
     [branch, prompt_boundary(record, generation)]
         .into_iter()
         .flatten()
@@ -376,8 +377,10 @@ fn computes_toward(state: &State, position: usize, resumes: impl FnOnce(&Generat
 /// Whether a finished request still owes the prefix cache its reconciliation
 /// round: numerical state trails its accepted path.
 fn owes_reconciliation(record: &Record, generation: &Generation) -> bool {
-    record.prefix_cache
-        && record.terminal_retention == TerminalRetention::Pending
+    record
+        .prefix
+        .as_ref()
+        .is_some_and(|prefix| prefix.terminal_retention == TerminalRetention::Pending)
         && matches!(
             generation.finish_reason(),
             Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context)
@@ -402,18 +405,13 @@ enum TerminalRetention {
     Abandoned,
 }
 
-/// What stays with a request wherever its state is.
-struct Record {
-    waiting_since: u64,
-    service_ns: u64,
-    clock: RequestClock,
-    error: Option<RequestError>,
-    preemption_debt: u32,
-    /// Whether the request resumes from and contributes to the prefix cache.
-    prefix_cache: bool,
+/// Prefix-cache participation for a request admitted with
+/// [`PrefixRetention::Retain`]. Absent when the request is transient, so
+/// dead prefix-cache state cannot exist without participation.
+struct PrefixParticipation {
     /// The cached prefix the request's residency forked, protected while
     /// work derived from it is submitted.
-    prefix_source: Option<u64>,
+    source: Option<u64>,
     prefill_retained: bool,
     terminal_retention: TerminalRetention,
     /// Planned branch points, in prompt order: where this request diverges
@@ -421,12 +419,57 @@ struct Record {
     /// declared. Prefill stops at each so the cache can retain a state every
     /// later request diverging there resumes from.
     branches: BTreeSet<usize>,
-    /// The host's stream; `None` once the host released the request.
-    publication: Option<PublicationSender>,
+}
+
+impl PrefixParticipation {
+    fn new(branches: BTreeSet<usize>) -> Self {
+        Self {
+            source: None,
+            prefill_retained: false,
+            terminal_retention: TerminalRetention::Pending,
+            branches,
+        }
+    }
+}
+
+/// The host's live output stream and its in-flight publication state.
+/// Taking or dropping it atomically drops pending tokens and permits.
+struct ActivePublication {
+    sender: PublicationSender,
+    batch_limit: usize,
+    pending: Option<Vec<OutputToken>>,
+    permits: VecDeque<PublicationPermit>,
+}
+
+impl ActivePublication {
+    fn new(sender: PublicationSender, batch_limit: usize) -> Self {
+        Self {
+            sender,
+            batch_limit,
+            pending: None,
+            permits: VecDeque::new(),
+        }
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending = None;
+        self.permits.clear();
+    }
+}
+
+/// What stays with a request wherever its state is.
+struct Record {
+    waiting_since: u64,
+    service_ns: u64,
+    clock: RequestClock,
+    error: Option<RequestError>,
+    preemption_debt: u32,
+    /// Prefix-cache participation; `None` when the request is transient.
+    prefix: Option<PrefixParticipation>,
+    /// The host's stream and its publication state; `None` once the host
+    /// released the request or its terminal outcome was delivered.
+    publication: Option<ActivePublication>,
     retirement: Retirement,
-    publication_batch_limit: usize,
-    pending_publication: Option<Vec<OutputToken>>,
-    publication_permits: VecDeque<PublicationPermit>,
 }
 
 /// A request's wall-clock timing, kept as llama.cpp's server keeps a slot's:
@@ -480,9 +523,7 @@ impl RequestClock {
 impl Record {
     /// Drop everything the host would still receive.
     fn release_publication(&mut self) {
-        self.pending_publication = None;
-        self.publication_permits.clear();
-        self.publication.take();
+        self.publication = None;
     }
 }
 
@@ -686,7 +727,9 @@ fn fail_generation(record: &mut Record, generation: &mut Generation, error: Requ
         generation.finish_reason(),
         Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context)
     ) {
-        record.terminal_retention = TerminalRetention::Abandoned;
+        if let Some(prefix) = &mut record.prefix {
+            prefix.terminal_retention = TerminalRetention::Abandoned;
+        }
         return;
     }
     // Accepted output still precedes the terminal failure on this
@@ -777,9 +820,9 @@ impl ReservedRound {
             Err(detail) => return Reservation::Returned(failed(record, generation, detail)),
         };
         if bound != 0 {
-            if let Some(sender) = &record.publication {
-                let capacity = sender.capacity();
-                let max_bound = capacity.saturating_mul(record.publication_batch_limit);
+            if let Some(publication) = &mut record.publication {
+                let capacity = publication.sender.capacity();
+                let max_bound = capacity.saturating_mul(publication.batch_limit);
                 if bound > max_bound && max_bound > 0 {
                     allowance = allowance.min(max_bound);
                     bound = match generation.publication_bound(allowance) {
@@ -790,9 +833,9 @@ impl ReservedRound {
                     };
                 }
                 if bound != 0 {
-                    let slots = bound.div_ceil(record.publication_batch_limit);
-                    match sender.reserve_outputs(slots) {
-                        Ok(permits) => record.publication_permits.extend(permits),
+                    let slots = bound.div_ceil(publication.batch_limit);
+                    match publication.sender.reserve_outputs(slots) {
+                        Ok(permits) => publication.permits.extend(permits),
                         Err(PublishError::Full) => {
                             return Reservation::Returned(Request {
                                 record,
@@ -1185,13 +1228,22 @@ struct Service<F: ProgramFamily> {
     wakes: Arc<dyn Wakes>,
 }
 
+/// One bank tier's resize state: its running resize (if any) and the reading
+/// its last resize began on, against which the next one's moved terms are read.
+struct TierResize {
+    /// The running expert bank resize this owner began: the stores resize on
+    /// their own (`BankStep::Begun`).
+    began: Option<BankBegun>,
+    /// The reading this tier's last resize began on.
+    sized: Option<SizingTerms>,
+}
+
 /// What a loaded model's owner holds of its memory between flights
 /// ([`between_flights`]): the expert bank's running resizes, the load's
 /// newly stored measures, and whether new work waits on a real shortage.
 pub struct BetweenFlights {
-    /// Each store's running expert bank resize this owner began: the stores
-    /// resize on their own (`BankStep::Begun`).
-    bank_began: [Option<BankBegun>; BankTier::COUNT],
+    /// Each store's expert bank resize state.
+    tiers: [TierResize; BankTier::COUNT],
     /// Costs the executor stored since the load was priced, which price it
     /// from the next flight boundary on ([`Owner::measure_load`]).
     measures: Option<LoadMeasures>,
@@ -1208,16 +1260,13 @@ pub struct BetweenFlights {
     /// owes a fresh reading before selection/provisioning, and an unpressured
     /// wake whose stores were unread while asleep opens a fresh baseline.
     settled: Option<u64>,
-    /// Each store's reading its last resize began on: what the next one's
-    /// moved terms are read against.
-    sized: [Option<SizingTerms>; BankTier::COUNT],
 }
 
 impl BetweenFlights {
     /// A resize of `tier` storage began, as `begun`: the bank begins none of
     /// a store while one of it runs.
     fn bank_begun(&mut self, tier: BankTier, begun: BankBegun) -> Result<(), String> {
-        match &mut self.bank_began[tier.index()] {
+        match &mut self.tiers[tier.index()].began {
             Some(running) => Err(format!("a {tier:?} resize began beside one running since {:?}", running.cause)),
             slot => {
                 *slot = Some(begun);
@@ -1230,12 +1279,11 @@ impl BetweenFlights {
     /// step.
     pub fn new() -> Self {
         Self {
-            bank_began: [const { None }; BankTier::COUNT],
+            tiers: [const { TierResize { began: None, sized: None } }; BankTier::COUNT],
             measures: None,
             admission_waits: false,
             owed: true,
             settled: None,
-            sized: [const { None }; BankTier::COUNT],
         }
     }
 }
@@ -1373,9 +1421,8 @@ impl<F: ProgramFamily> Owner<F> {
                 generation.discard_output();
                 if release {
                     record.release_publication();
-                } else {
-                    record.pending_publication = None;
-                    record.publication_permits.clear();
+                } else if let Some(publication) = &mut record.publication {
+                    publication.clear_pending();
                 }
                 round.members.insert(
                     id,
@@ -1629,14 +1676,15 @@ impl<F: ProgramFamily> Service<F> {
         self.domain
             .install_input(id, input)
             .map_err(|error| AdmissionError::Refused(RequestError::Input(error)))?;
-        let plan = if prefix_cache {
-            self.plan_branches(path, generation.resume_bound(), &cache_points, members)
+        let (prefix, stage) = if prefix_cache {
+            let plan = self.plan_branches(path, generation.resume_bound(), &cache_points, members);
+            let stage = match plan.awaited {
+                Some((producer, through)) => Stage::AwaitingPrefix { producer, through },
+                None => Stage::NonResident(None),
+            };
+            (Some(PrefixParticipation::new(plan.branches)), stage)
         } else {
-            BranchPlan::default()
-        };
-        let stage = match plan.awaited {
-            Some((producer, through)) => Stage::AwaitingPrefix { producer, through },
-            None => Stage::NonResident(None),
+            (None, Stage::NonResident(None))
         };
         if self.memory.settled.is_some() {
             self.memory.owed = true;
@@ -1650,16 +1698,9 @@ impl<F: ProgramFamily> Service<F> {
                     clock: RequestClock::Waiting,
                     error: None,
                     preemption_debt: 0,
-                    prefix_cache,
-                    prefix_source: None,
-                    prefill_retained: false,
-                    terminal_retention: TerminalRetention::Pending,
-                    branches: plan.branches,
-                    publication: Some(sender),
+                    prefix,
+                    publication: Some(ActivePublication::new(sender, output_capacity)),
                     retirement: receiver.retirement(),
-                    publication_batch_limit: output_capacity,
-                    pending_publication: None,
-                    publication_permits: VecDeque::new(),
                 },
                 state: State::Between(generation, stage),
             },
@@ -1694,26 +1735,29 @@ impl<F: ProgramFamily> Service<F> {
         let live = self
             .requests
             .iter_mut()
-            .map(|(&id, request)| {
-                (id, &mut request.record, request.state.generation(), Some(&request.state))
+            .filter_map(|(&id, request)| {
+                let prefix = request.record.prefix.as_mut()?;
+                Some((id, prefix, request.state.generation(), Some(&request.state)))
             })
             .chain(
                 members
                     .into_iter()
                     .flat_map(|members| members.iter_mut())
-                    .map(|(&id, member)| (id, &mut member.record, member.state.generation(), None)),
-            )
-            .filter(|(_, record, ..)| record.prefix_cache);
-        for (peer_id, record, generation, outside) in live {
+                    .filter_map(|(&id, member)| {
+                        let prefix = member.record.prefix.as_mut()?;
+                        Some((id, prefix, member.state.generation(), None))
+                    }),
+            );
+        for (peer_id, prefix, generation, outside) in live {
             let shared = path.shared_with_prompt_of(PrefixPath::of(generation));
             deepest = deepest.max(shared);
             plan_branch(
-                &mut record.branches,
+                &mut prefix.branches,
                 shared,
                 generation.resident_position(),
                 generation.prompt().len(),
             );
-            if let Some(stop) = peer_stop(&record.branches, shared) {
+            if let Some(stop) = peer_stop(&prefix.branches, shared) {
                 // A round member is resident; a request outside the
                 // pipeline may not be yet.
                 let computes = match outside {
@@ -1768,7 +1812,7 @@ impl<F: ProgramFamily> Service<F> {
             .filter(|(_, generation)| generation.is_resident() && generation.finish_reason().is_none())
             .flat_map(|(record, generation)| {
                 self.prefix_cache.held(
-                    record.prefix_source,
+                    record.prefix.as_ref().and_then(|prefix| prefix.source),
                     PrefixPath::of(generation),
                     generation.resident_position(),
                 )
@@ -1779,8 +1823,10 @@ impl<F: ProgramFamily> Service<F> {
     /// Whether `peer` is a live, prefix-compatible producer still computing
     /// toward a planned branch point at `through` for `waiter`.
     fn is_prefix_producer(&self, waiter: &Generation, peer: &Request, through: usize) -> bool {
-        peer.record.prefix_cache
-            && peer.record.branches.contains(&through)
+        peer.record
+            .prefix
+            .as_ref()
+            .is_some_and(|prefix| prefix.branches.contains(&through))
             && PrefixPath::of(waiter)
                 .shared_with_prompt_of(PrefixPath::of(peer.state.generation()))
                 >= through
@@ -1821,12 +1867,12 @@ impl<F: ProgramFamily> Service<F> {
     ) -> Option<&'a mut PublicationSender> {
         if let Pipeline::InFlight(round, _) = pipeline {
             if let Some(member) = round.members.get_mut(&request) {
-                return member.record.publication.as_mut();
+                return member.record.publication.as_mut().map(|publication| &mut publication.sender);
             }
         }
         self.requests
             .get_mut(&request)
-            .and_then(|request| request.record.publication.as_mut())
+            .and_then(|request| request.record.publication.as_mut().map(|publication| &mut publication.sender))
     }
 
     /// A credit wake sends a request waiting on credit back to selection,
@@ -1853,9 +1899,8 @@ impl<F: ProgramFamily> Service<F> {
         generation.discard_output();
         if release {
             record.release_publication();
-        } else {
-            record.pending_publication = None;
-            record.publication_permits.clear();
+        } else if let Some(publication) = &mut record.publication {
+            publication.clear_pending();
         }
         self.requests.insert(
             id,
@@ -1882,15 +1927,13 @@ impl<F: ProgramFamily> Service<F> {
             // Only output already accepted by the queue precedes a terminal
             // outcome. Unpublished generation output is not promoted by a
             // second, unbounded failure delivery channel.
-            if let Some(sender) = record.publication.take() {
+            if let Some(publication) = record.publication.take() {
                 generation.discard_output();
-                record.pending_publication = None;
-                record.publication_permits.clear();
                 match generation.finish_reason() {
                     Some(FinishReason::Failed) | None => {
-                        sender.fail(record.error.clone().unwrap_or_else(|| error.clone()));
+                        publication.sender.fail(record.error.clone().unwrap_or_else(|| error.clone()));
                     }
-                    Some(finish) => sender.complete(
+                    Some(finish) => publication.sender.complete(
                         finish,
                         generation.detailed_usage(),
                         generation.method_identity().to_owned(),
@@ -2181,7 +2224,7 @@ trait MemoryStep: MemoryHost + Sized {
         held: u64,
         reading: magnitude_executor::SizingTerms,
     ) -> Result<(), RequestError> {
-        let (before, moved, term) = match self.memory().sized[tier.index()].replace(reading.clone()) {
+        let (before, moved, term) = match self.memory().tiers[tier.index()].sized.replace(reading.clone()) {
             Some(before) => (before.reading, reading.moved(&before), reading.term(&before)),
             None => (None, Vec::new(), Some("load")),
         };
@@ -2281,7 +2324,8 @@ trait MemoryStep: MemoryHost + Sized {
         };
         let tier = self.domain().expert_holding_storage(finished.holding()).map_err(classify_domain_error)?;
         let after = self.domain().held_bytes_of(tier);
-        let BankBegun { held: before, cause, reading, before: before_generation, moved, term } = self.memory().bank_began[tier.index()]
+        let BankBegun { held: before, cause, reading, before: before_generation, moved, term } = self.memory().tiers[tier.index()]
+            .began
             .take()
             .ok_or_else(|| invariant("expert bank")(format!("a {tier:?} resize finished that never began")))?;
         let at_unix_ms = std::time::SystemTime::now()
@@ -2855,8 +2899,8 @@ impl<F: ProgramFamily> Service<F> {
                     Ok(residency) => residency,
                     // No map holds `record` now: it takes the error itself.
                     Err((members, error)) => {
-                        if let Some(sender) = record.publication.take() {
-                            sender.fail(error.clone());
+                        if let Some(publication) = record.publication.take() {
+                            publication.sender.fail(error.clone());
                         }
                         return Err((members, error));
                     }
@@ -2918,7 +2962,7 @@ impl<F: ProgramFamily> Service<F> {
         // eviction may drop it. While another request's chain is under way
         // the open changes no bindings: it waits for the chain's end, a
         // flight boundary.
-        let prefix = record.prefix_cache;
+        let prefix = record.prefix.is_some();
         let open = |this: &mut Self, bindings: &mut StateBindings| {
                 let Some(unchained) = this.domain.unchained(bindings) else {
                     return Ok(Ok(None));
@@ -2979,11 +3023,13 @@ impl<F: ProgramFamily> Service<F> {
         if let Err(error) = self.domain.prefetch_prompt(id, position, &path) {
             return Err(fatal(invariant("stored table prefetch")(error)));
         }
-        record.prefix_source = hit.map(|hit| hit.id());
+        if let Some(prefix) = &mut record.prefix {
+            prefix.source = hit.map(|hit| hit.id());
+        }
         // Its host answers it admitted only now: one refused before this
         // never was.
-        if let Some(sender) = &record.publication {
-            sender.began();
+        if let Some(publication) = &record.publication {
+            publication.sender.began();
         }
         Ok(Residency::Resident(generation, encodes))
     }
@@ -3067,7 +3113,7 @@ impl<F: ProgramFamily> Service<F> {
                         let source = round
                             .members
                             .get(&request)
-                            .and_then(|member| member.record.prefix_source);
+                            .and_then(|member| member.record.prefix.as_ref()?.source);
                         if let Some(source) = source {
                             match self.prefix_cache.begin_submitted_if_cached(source) {
                                 Ok(true) => prefix_uses.push(source),
@@ -3652,13 +3698,16 @@ impl<F: ProgramFamily> Service<F> {
         let Some((record, generation)) = self.between(id) else {
             return Ok(());
         };
-        if record.branches.is_empty() {
+        let Some(prefix) = record.prefix.as_ref() else {
+            return Ok(());
+        };
+        if prefix.branches.is_empty() {
             return Ok(());
         }
         let resident = generation.resident_position();
         let live = generation.finish_reason().is_none() && generation.is_resident();
-        let reached = live && record.branches.contains(&resident);
-        let branches = &mut self.requests.get_mut(&id).unwrap().record.branches;
+        let reached = live && prefix.branches.contains(&resident);
+        let branches = &mut self.requests.get_mut(&id).unwrap().record.prefix.as_mut().unwrap().branches;
         if live {
             branches.retain(|&branch| branch > resident);
         } else {
@@ -3730,7 +3779,7 @@ impl<F: ProgramFamily> Service<F> {
             return Ok(());
         }
         self.cache_prefix(id, CachePoint::PromptBoundary)?;
-        self.requests.get_mut(&id).unwrap().record.prefill_retained = true;
+        self.requests.get_mut(&id).unwrap().record.prefix.as_mut().unwrap().prefill_retained = true;
         Ok(())
     }
 
@@ -3742,8 +3791,10 @@ impl<F: ProgramFamily> Service<F> {
         let Some((record, generation)) = self.between(id) else {
             return Ok(());
         };
-        if record.terminal_retention != TerminalRetention::Pending
-            || !record.prefix_cache
+        if !record
+            .prefix
+            .as_ref()
+            .is_some_and(|prefix| prefix.terminal_retention == TerminalRetention::Pending)
             || !generation.is_resident()
         {
             return Ok(());
@@ -3776,7 +3827,8 @@ impl<F: ProgramFamily> Service<F> {
             _ => return Ok(()),
         }
         self.cache_prefix(id, CachePoint::Terminal)?;
-        self.requests.get_mut(&id).unwrap().record.terminal_retention = TerminalRetention::Retained;
+        self.requests.get_mut(&id).unwrap().record.prefix.as_mut().unwrap().terminal_retention =
+            TerminalRetention::Retained;
         Ok(())
     }
 
@@ -3815,30 +3867,30 @@ impl<F: ProgramFamily> Service<F> {
     /// Drain accepted output into reserved permits. Returns whether the
     /// receiver has closed.
     fn drain(record: &mut Record, generation: &mut Generation) -> bool {
-        let Some(sender) = record.publication.as_mut() else {
+        let Some(publication) = record.publication.as_mut() else {
             return false;
         };
-        if !sender.receiver_open() {
+        if !publication.sender.receiver_open() {
             return true;
         }
         loop {
-            let tokens = match record.pending_publication.take() {
+            let tokens = match publication.pending.take() {
                 Some(tokens) => tokens,
                 None if generation.output_len() > 0 => {
-                    match generation.take(record.publication_batch_limit) {
+                    match generation.take(publication.batch_limit) {
                         Ok(tokens) => tokens,
                         Err(_) => break,
                     }
                 }
                 None => break,
             };
-            let Some(permit) = record.publication_permits.pop_front() else {
+            let Some(permit) = publication.permits.pop_front() else {
                 // Output beyond the reserved bound waits for the next round's
                 // reservation.
-                record.pending_publication = Some(tokens);
+                publication.pending = Some(tokens);
                 break;
             };
-            match sender.output_with_permit(tokens, permit) {
+            match publication.sender.output_with_permit(tokens, permit) {
                 Ok(()) => {}
                 Err((PublishError::Full | PublishError::ExceedsCapacity, _)) => {
                     unreachable!("a publication permit owns an exact output slot")
@@ -3846,8 +3898,8 @@ impl<F: ProgramFamily> Service<F> {
                 Err((PublishError::ReceiverClosed, _)) => return true,
             }
         }
-        if record.pending_publication.is_none() && generation.output_len() == 0 {
-            record.publication_permits.clear();
+        if publication.pending.is_none() && generation.output_len() == 0 {
+            publication.permits.clear();
         }
         false
     }
@@ -3870,7 +3922,7 @@ impl<F: ProgramFamily> Service<F> {
             };
             let record = &request.record;
             let finished = generation.finish_reason().is_some()
-                && record.pending_publication.is_none()
+                && record.publication.as_ref().is_none_or(|publication| publication.pending.is_none())
                 && generation.output_len() == 0
                 && !owes_reconciliation(record, generation);
             if !finished {
@@ -3882,15 +3934,15 @@ impl<F: ProgramFamily> Service<F> {
                 continue;
             };
             let record = &mut request.record;
-            if let Some(sender) = record.publication.take() {
+            if let Some(publication) = record.publication.take() {
                 match generation.finish_reason().expect("terminal generation") {
-                    FinishReason::Failed => sender.fail(record.error.clone().unwrap_or_else(|| {
+                    FinishReason::Failed => publication.sender.fail(record.error.clone().unwrap_or_else(|| {
                         RequestError::Invariant(InvariantError {
                             context: "service request",
                             detail: "failed without a classified cause".into(),
                         })
                     })),
-                    finish => sender.complete(
+                    finish => publication.sender.complete(
                         finish,
                         generation.detailed_usage(),
                         generation.method_identity().to_owned(),
@@ -3945,7 +3997,7 @@ impl<F: ProgramFamily> Service<F> {
     fn check_no_unwakeable_wait(&self) {
         let under_way = self.memory.admission_waits
             || self.memory.owed
-            || self.memory.bank_began.iter().any(Option::is_some)
+            || self.memory.tiers.iter().any(|tier| tier.began.is_some())
             || self.domain.releasing_slots();
         if under_way {
             return;
@@ -4297,7 +4349,10 @@ mod timing_tests {
     /// orphan the queued chunk, discarding a whole chunk of device work.
     #[test]
     fn only_live_work_outside_the_round_competes_with_a_queued_chunk() {
-        let record = || Record { prefix_cache: true, ..super::front_rows_tests::record() };
+        let record = || Record {
+            prefix: Some(PrefixParticipation::new(BTreeSet::new())),
+            ..super::front_rows_tests::record()
+        };
         let request = |stage| Request {
             record: record(),
             state: State::Between(super::termination_tests::generation(), stage),
@@ -4995,8 +5050,9 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
             panic!("resident request");
         };
         record.clock.serve(Instant::now());
-        let permits = record.publication.as_ref().unwrap().reserve_outputs(1).unwrap();
-        record.publication_permits.extend(permits);
+        let publication = record.publication.as_mut().unwrap();
+        let permits = publication.sender.reserve_outputs(1).unwrap();
+        publication.permits.extend(permits);
         let Ok(RoundStart::Target(round)) = generation.start_round(id, 4, FrontGrant::UpTo(0)) else {
             panic!("prompt target round");
         };
@@ -5097,7 +5153,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         let (unrelated, _rx_unrelated) = owner
             .admit(make_gen(unrelated_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: vec![THROUGH] }, 4, 0)
             .unwrap();
-        assert!(owner.service.requests[&unrelated].record.branches.contains(&THROUGH));
+        assert!(owner.service.requests[&unrelated].record.prefix.as_ref().unwrap().branches.contains(&THROUGH));
         owner.cancel(producer);
         owner.service.publish_ready().unwrap();
         assert!(!owner.service.requests.contains_key(&producer));
@@ -5312,11 +5368,9 @@ mod front_rows_tests {
     pub(super) fn record() -> Record {
         Record {
             waiting_since: 0, service_ns: 0, clock: RequestClock::Waiting, error: None, preemption_debt: 0,
-            prefix_cache: false, prefix_source: None,
-            prefill_retained: false, terminal_retention: TerminalRetention::Pending, branches: BTreeSet::new(),
+            prefix: None,
             retirement: PublicationQueue::bounded(1, |_| {}).unwrap().1.retirement(),
-            publication: None, publication_batch_limit: 4, pending_publication: None,
-            publication_permits: VecDeque::new(),
+            publication: None,
         }
     }
 
@@ -5494,7 +5548,7 @@ mod front_rows_tests {
     fn a_request_turned_back_is_neither_priced_nor_granted_a_front_row() {
         let (sender, _receiver) = PublicationQueue::bounded(1, |_| {}).unwrap();
         let _held = sender.reserve_outputs(1).unwrap();
-        let full = Record { publication: Some(sender), ..record() };
+        let full = Record { publication: Some(ActivePublication::new(sender, 4)), ..record() };
         let selected = vec![
             (RequestId(1), guessing(RequestId(1), 32), record()),
             (RequestId(2), guessing(RequestId(2), 32), full),
@@ -5516,7 +5570,7 @@ mod front_rows_tests {
     fn a_request_with_a_closed_receiver_is_neither_priced_nor_granted_a_front_row() {
         let (sender, receiver) = PublicationQueue::bounded(1, |_| {}).unwrap();
         drop(receiver);
-        let closed = Record { publication: Some(sender), ..record() };
+        let closed = Record { publication: Some(ActivePublication::new(sender, 4)), ..record() };
         let selected = vec![
             (RequestId(1), guessing(RequestId(1), 32), record()),
             (RequestId(2), guessing(RequestId(2), 32), closed),
@@ -5788,8 +5842,7 @@ mod front_rows_tests {
     fn reserve_clamps_allowance_to_publication_queue_capacity() {
         let (sender, _receiver) = PublicationQueue::bounded(1, |_| {}).unwrap();
         let record = Record {
-            publication: Some(sender),
-            publication_batch_limit: 1,
+            publication: Some(ActivePublication::new(sender, 1)),
             ..record()
         };
         let generation = guessing(RequestId(1), 32);
@@ -5801,7 +5854,7 @@ mod front_rows_tests {
         match ReservedRound::reserve(record, generation, 4, 1, &mut epoch) {
             Reservation::Round(reserved) => {
                 assert_eq!(reserved.allowance, 1);
-                assert_eq!(reserved.record.publication_permits.len(), 1);
+                assert_eq!(reserved.record.publication.as_ref().unwrap().permits.len(), 1);
             }
             Reservation::Returned(_) => panic!("must clamp allowance instead of stalling in AwaitingCredit"),
             Reservation::Composed(..) => panic!("unexpected composed work"),
