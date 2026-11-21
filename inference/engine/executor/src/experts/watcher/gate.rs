@@ -559,4 +559,30 @@ mod tests {
         assert_eq!(gate.decide(&[false, true], None, ReadAdmission::default(), Some((1, 0.01))), [true, false]);
         assert_eq!(gate.decide(&[false, true], Some(&table()), ReadAdmission::default(), None), [true, false]);
     }
+
+    /// A bank shrink to small capacity followed by `>= 2 * records` moves
+    /// within a single decode step must never clear `ā` or panic in `decide`.
+    #[test]
+    fn decide_survives_many_moves_in_one_step_after_shrink() {
+        let time = Time::new(&[vec![64]], 32);
+        let mut gate = HintGate::new(vec![vec![1], Vec::new()], time.clone());
+        let prices = table();
+        let cost = miss_cost(&time, 1e-3);
+
+        time.lock().register(1, Advance::Known(Tokens::new(1.0)));
+        gate.resolved(&[Cohort { step: 1, layer: 1, misses: 1, saved: vec![catchers(&[1])] }]);
+        let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)));
+        gate.publish(&decided);
+
+        {
+            let mut times = time.lock();
+            times.resized(0, Tier::Compute, 2);
+            times.register(2, Advance::Known(Tokens::new(1.0)));
+            for _ in 0..6 {
+                times.moved(0, Tier::Compute);
+            }
+        }
+        let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)));
+        assert!(decided[0], "decide succeeds with ā intact after >= 2K moves in one step");
+    }
 }
