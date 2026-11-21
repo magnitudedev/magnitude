@@ -167,6 +167,13 @@ struct PreparedCandidate<T: seismic_native_target::TargetFamily, H> {
     executable: ExecutableVariant<T, H>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionPhase {
+    AwaitingUniversal,
+    OptionalOpen,
+    OptionalBudgetExhausted,
+}
+
 pub struct EvaluationSession<'a, T, C>
 where
     T: seismic_native_target::TargetFamily,
@@ -182,8 +189,7 @@ where
     construction_allowance: crate::candidate_domain::ConstructionAllowance,
     candidates: Vec<PreparedCandidate<T, C::Handle>>,
     coordinates: HashMap<CandidateCoordinate, PreparedCandidateId>,
-    universal_admitted: bool,
-    optional_native_open: bool,
+    phase: SessionPhase,
 }
 
 impl<'a, T, C> EvaluationSession<'a, T, C>
@@ -234,8 +240,7 @@ where
             },
             candidates: Vec::new(),
             coordinates: HashMap::new(),
-            universal_admitted: false,
-            optional_native_open: true,
+            phase: SessionPhase::AwaitingUniversal,
         })
     }
 
@@ -310,12 +315,37 @@ where
 
     pub fn native_usage(&self) -> (u64, u64, bool) {
         let (code, metadata) = self.accounting.native_usage();
-        (code, metadata, !self.optional_native_open)
+        (
+            code,
+            metadata,
+            matches!(self.phase, SessionPhase::OptionalBudgetExhausted),
+        )
     }
 
     pub fn extend_native_time(&mut self, additional: std::time::Duration) {
         self.accounting.extend_native_time(additional);
-        self.optional_native_open = self.accounting.native_attempt_available();
+        if matches!(self.phase, SessionPhase::OptionalBudgetExhausted)
+            && self.accounting.native_attempt_available()
+        {
+            self.phase = SessionPhase::OptionalOpen;
+        }
+    }
+
+    fn record_native_formation(
+        &mut self,
+        is_universal: bool,
+        newly_formed: seismic_native_target::NativeArtifactMetrics,
+    ) -> Result<(), PreparationError> {
+        let within_optional_budget = if is_universal {
+            self.accounting
+                .record_required_native_artifact(newly_formed)?
+        } else {
+            self.accounting.record_native_artifact(newly_formed)
+        };
+        if !within_optional_budget && matches!(self.phase, SessionPhase::OptionalOpen) {
+            self.phase = SessionPhase::OptionalBudgetExhausted;
+        }
+        Ok(())
     }
 
     pub fn realize_checked(
@@ -340,7 +370,7 @@ where
                     "evaluator requested an invalid coordinate: {error:?}"
                 ))
             })?;
-        if !self.universal_admitted && !checked.is_universal() {
+        if matches!(self.phase, SessionPhase::AwaitingUniversal) && !checked.is_universal() {
             return Err(PreparationError::InvalidCandidateDomain(
                 "candidate evaluation must realize the universal coordinate first".into(),
             ));
@@ -354,7 +384,10 @@ where
         };
         let requirements = self.realizer.inspect(&self.domain.arena(), &realization);
         let needs_formation = !requirements.missing.is_empty();
-        if !checked.is_universal() && !self.optional_native_open && needs_formation {
+        if !checked.is_universal()
+            && matches!(self.phase, SessionPhase::OptionalBudgetExhausted)
+            && needs_formation
+        {
             return Ok(RealizationAdmission::Pending(
                 RealizationPending::NativeBudget,
             ));
@@ -367,48 +400,31 @@ where
             Err(failure) => {
                 // Earlier kernels in a multi-kernel request may already be
                 // resident even though a later formation failed.
-                let within_optional_budget = if checked.is_universal() {
-                    self.accounting
-                        .record_required_native_artifact(failure.newly_formed)?
-                } else {
-                    self.accounting.record_native_artifact(failure.newly_formed)
-                };
-                if !within_optional_budget {
-                    self.optional_native_open = false;
-                }
+                self.record_native_formation(checked.is_universal(), failure.newly_formed)?;
                 return Err(failure.error);
             }
         };
-        let (realized, rejection, metrics) = match outcome {
+        let realized = match outcome {
             RealizationOutcome::Ready {
                 candidate,
                 newly_formed,
-            } => (Some(candidate), None, newly_formed),
+            } => {
+                self.record_native_formation(checked.is_universal(), newly_formed)?;
+                candidate
+            }
             RealizationOutcome::Rejected {
                 rejection,
                 newly_formed,
-            } => (None, Some(rejection), newly_formed),
-        };
-        let within_optional_budget = if checked.is_universal() {
-            self.accounting.record_required_native_artifact(metrics)?
-        } else {
-            self.accounting.record_native_artifact(metrics)
-        };
-        if !within_optional_budget {
-            self.optional_native_open = false;
-        }
-        let Some(realized) = realized else {
-            if checked.is_universal() {
-                return Err(PreparationError::UniversalClosure(format!(
-                    "native reconciliation rejected the covered implementation: {}",
-                    rejection
-                        .expect("rejected outcome carries its reason")
-                        .reason()
-                )));
+            } => {
+                self.record_native_formation(checked.is_universal(), newly_formed)?;
+                if checked.is_universal() {
+                    return Err(PreparationError::UniversalClosure(format!(
+                        "native reconciliation rejected the covered implementation: {}",
+                        rejection.reason()
+                    )));
+                }
+                return Ok(RealizationAdmission::Rejected(rejection));
             }
-            return Ok(RealizationAdmission::Rejected(
-                rejection.expect("rejected outcome carries its reason"),
-            ));
         };
 
         let (precision, target_domain, constants) = self.domain.numerical_context();
@@ -462,7 +478,13 @@ where
         let executable =
             crate::executable::materialize_variant(&retained, self.realizer.registry(), reference);
         let fixed = compiled.fixed().clone();
-        self.universal_admitted |= checked.is_universal();
+        if checked.is_universal() && matches!(self.phase, SessionPhase::AwaitingUniversal) {
+            self.phase = if self.accounting.native_attempt_available() {
+                SessionPhase::OptionalOpen
+            } else {
+                SessionPhase::OptionalBudgetExhausted
+            };
+        }
         self.coordinates
             .entry(coordinate.clone())
             .or_insert(reference);
