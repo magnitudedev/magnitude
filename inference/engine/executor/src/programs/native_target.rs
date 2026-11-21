@@ -9,7 +9,8 @@
 use super::{
     Branded, Chain, DeviceSubmission, TargetProgram,
     graph::readout::{
-        BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind, certifies, shapes, write_selection,
+        BoundTargetReadoutGraphs, PreparedFeatureInputs, ReadoutClass, ReadoutKind, certifies,
+        shapes, write_selection,
     },
     native_target_graph::{
         BankRun, BoundTargetGraphs, CarryPorts, EntryTokens, GroupBuffers, LaunchControl, LaunchControlLayout,
@@ -985,20 +986,29 @@ impl NativeTargetProgram {
         };
         let (graph, bound) = self.readout_graphs.class(class, features).map_err(invalid)?;
         let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
-        let tap_rows = graph
-            .taps
-            .as_ref()
-            .map(|_| self.tap_rows(region, class.rows))
-            .transpose()?;
         let mut bindings = bound.bindings();
-        if let Some(port) = &graph.residual {
-            bindings.set(&self.unallocating(), port, residual.ok_or_else(|| invalid("residual conditioning was not exported"))?).map_err(device)?;
+        match &graph.feature_inputs {
+            PreparedFeatureInputs::Output(_) => {}
+            PreparedFeatureInputs::Residual(port) => {
+                bindings
+                    .set(
+                        &self.unallocating(),
+                        port,
+                        residual.ok_or_else(|| invalid("residual conditioning was not exported"))?,
+                    )
+                    .map_err(device)?;
+            }
+            PreparedFeatureInputs::Taps(ports) => {
+                let tap_rows = self.tap_rows(region, class.rows)?;
+                bindings
+                    .set(&self.unallocating(), &ports.taps, &tap_rows)
+                    .map_err(device)?;
+            }
         }
-        if let Some(rows) = &graph.final_rows {
-            bindings.set(&self.unallocating(), &rows.hidden, hidden).map_err(device)?;
-        }
-        if let (Some(ports), Some(tap_rows)) = (&graph.taps, &tap_rows) {
-            bindings.set(&self.unallocating(), &ports.taps, tap_rows).map_err(device)?;
+        if let Some(rows) = graph.final_rows() {
+            bindings
+                .set(&self.unallocating(), &rows.hidden, hidden)
+                .map_err(device)?;
         }
         let mut out_rows = vec![0_i32; output_class];
         for (index, &row) in batch.out_rows.iter().enumerate() {
@@ -1007,7 +1017,7 @@ impl NativeTargetProgram {
         active
             .write_input(&graph.out_rows, &i32_bytes(&out_rows))
             .map_err(device)?;
-        if let Some(port) = &graph.logit_rows {
+        if let Some(projection) = &graph.projection {
             // The head gathers the hidden rows of the projected outputs.
             let mut rows = vec![0_i32; projected_class];
             for (index, &output_index) in projected_output_rows.iter().enumerate() {
@@ -1019,21 +1029,30 @@ impl NativeTargetProgram {
                 )?;
             }
             active
-                .write_input(port, &i32_bytes(&rows))
+                .write_input(&projection.logit_rows, &i32_bytes(&rows))
                 .map_err(device)?;
-        }
-        if let Some(ports) = &graph.selection {
-            write_selection(batch, &mut active, ports, selected_class, batch.mask_words)?;
-        }
-        // The step's token rows in the readout's window: the kept host rows,
-        // or the selection the step read.
-        if let Some(ports) = &graph.token_rows {
-            let rows = u64::try_from(batch.class.rows()).map_err(|_| invalid("row class exceeds u64"))?;
-            let tokens = match run.launch.state.tokens() {
-                TargetTokens::Host(..) => self.kept_token_rows(region, rows)?,
-                TargetTokens::Selected { selected, .. } => selected.tensor().clone(),
-            };
-            bindings.set(&self.unallocating(), &ports.tokens, &window.slice(&tokens)?).map_err(device)?;
+            if let Some(selection) = &projection.selection {
+                write_selection(
+                    batch,
+                    &mut active,
+                    &selection.ports,
+                    selected_class,
+                    batch.mask_words,
+                )?;
+                // The step's token rows in the readout's window: the kept host rows,
+                // or the selection the step read.
+                if let Some(ports) = &selection.token_rows {
+                    let rows = u64::try_from(batch.class.rows())
+                        .map_err(|_| invalid("row class exceeds u64"))?;
+                    let tokens = match run.launch.state.tokens() {
+                        TargetTokens::Host(..) => self.kept_token_rows(region, rows)?,
+                        TargetTokens::Selected { selected, .. } => selected.tensor().clone(),
+                    };
+                    bindings
+                        .set(&self.unallocating(), &ports.tokens, &window.slice(&tokens)?)
+                        .map_err(device)?;
+                }
+            }
         }
         let active_output = output
             .activate(&graph.plan)
@@ -1046,29 +1065,40 @@ impl NativeTargetProgram {
         let features = owner
             .tensor(&graph.features)
             .ok_or_else(|| invalid("readout features were not exported"))?;
-        let logits = graph
-            .logits
-            .as_ref()
-            .map(|edge| {
-                owner
-                    .tensor(edge)
-                    .ok_or_else(|| invalid("readout logits were not exported"))
-            })
-            .transpose()?;
-        let selected = graph
-            .selected
-            .as_ref()
-            .map(|edge| {
-                owner
-                    .tensor(edge)
-                    .ok_or_else(|| invalid("readout selection was not exported"))
-            })
-            .transpose()?;
-        let token_rows = graph
-            .token_rows
-            .as_ref()
-            .map(|ports| owner.tensor(&ports.rows).ok_or_else(|| invalid("readout token rows were not exported")))
-            .transpose()?;
+        let (logits, selected, token_rows) = match &graph.projection {
+            None => (None, None, None),
+            Some(projection) => {
+                let logits = projection
+                    .logits
+                    .as_ref()
+                    .map(|edge| {
+                        owner
+                            .tensor(edge)
+                            .ok_or_else(|| invalid("readout logits were not exported"))
+                    })
+                    .transpose()?;
+                let (selected, token_rows) = match &projection.selection {
+                    None => (None, None),
+                    Some(selection) => (
+                        Some(
+                            owner
+                                .tensor(&selection.selected)
+                                .ok_or_else(|| invalid("readout selection was not exported"))?,
+                        ),
+                        selection
+                            .token_rows
+                            .as_ref()
+                            .map(|ports| {
+                                owner
+                                    .tensor(&ports.rows)
+                                    .ok_or_else(|| invalid("readout token rows were not exported"))
+                            })
+                            .transpose()?,
+                    ),
+                };
+                (logits, selected, token_rows)
+            }
+        };
         Ok(Some(TargetReadoutGraphResult {
             features,
             logits,
