@@ -2740,6 +2740,45 @@ inline void gemv_matrix_runs_body(thread const In &in, thread const Out &out,
         for (uint f = 0; f < NB; ++f)
             y[f] = metal::fma(float2(d), reinterpret_cast<thread float2 &>(acc[f].thread_elements()), y[f]);
     }
+    const uint tail = (k / 32u) & 7u;
+    if (tail != 0u && part == PARTS - 1u) {
+        const uint block = blocks;
+        const typename runs::fields scales = runs::block_fields(row, block);
+        const float d = runs::block_factor(row, block);
+        _Pragma("clang loop unroll(disable)")
+        for (uint b = 0; b < tail; ++b) {
+            const uint g = block * 8u + b;
+            const float scale = runs::run_scale(scales, b, run_of);
+            const typename lanes::words words = lanes::template load<true>(w.matrix, codes, g);
+            const lane_operands<lanes> pairs = lane_operands<lanes>::of(words);
+            uint2 stored[NB][2];
+            PROJECTION_UNROLL
+            for (uint f = 0; f < NB; ++f) {
+                PROJECTION_UNROLL
+                for (uint j = 0; j < 2; ++j)
+                    stored[f][j] = matrix_stored<UNIT>(in, stored_rows[f][j], 32u * g,
+                        8u * (at.y / 2u) + 4u * (at.y & 1u));
+            }
+            PROJECTION_UNROLL
+            for (uint s = 0; s < 4; ++s) {
+                metal::conditional_t<halves, simdgroup_half8x8, simdgroup_float8x8> left;
+                reinterpret_cast<thread operand &>(left.thread_elements()) = operand(pairs.pair(s)) * operand(scale);
+                PROJECTION_UNROLL
+                for (uint f = 0; f < NB; ++f) {
+                    simdgroup_float8x8 right;
+                    reinterpret_cast<thread float2 &>(right.thread_elements()) = float2(
+                        matrix_value<A>(stored[f][0], s), matrix_value<A>(stored[f][1], s));
+                    if (b == 0 && s == 0)
+                        simdgroup_multiply(acc[f], left, right);
+                    else
+                        simdgroup_multiply_accumulate(acc[f], left, right, acc[f]);
+                }
+            }
+        }
+        PROJECTION_UNROLL
+        for (uint f = 0; f < NB; ++f)
+            y[f] = metal::fma(float2(d), reinterpret_cast<thread float2 &>(acc[f].thread_elements()), y[f]);
+    }
     if (!matrix_exchange<NB, PARTS>(y, parts, part, sg, lane) || n >= rows)
         return;
     PROJECTION_UNROLL
@@ -3057,6 +3096,97 @@ inline void gemv_matrix_products(thread const In &in, thread const Out &out, thr
             reinterpret_cast<thread float2 &>(right.thread_elements()) = sums;
             simdgroup_multiply(mins[f], left, right);
             // The accumulators carry the 2^-24 of the F16 integers.
+            y[f] = metal::fma(float2(factors.x * 0x1p24f), reinterpret_cast<thread float2 &>(acc[f].thread_elements()),
+                metal::fma(float2(factors.y * 0x1p24f), reinterpret_cast<thread float2 &>(mins[f].thread_elements()),
+                    y[f]));
+            if constexpr (PAIRED) {
+                simdgroup_multiply(mins_up[f], up_left, right);
+                y_up[f] = metal::fma(float2(up_factors.x * 0x1p24f), reinterpret_cast<thread float2 &>(acc_up[f].thread_elements()),
+                    metal::fma(float2(up_factors.y * 0x1p24f), reinterpret_cast<thread float2 &>(mins_up[f].thread_elements()), y_up[f]));
+            }
+        }
+    }
+    const uint tail = (k / 32u) & 7u;
+    if (tail != 0u && part == PARTS - 1u) {
+        const uint block = blocks;
+        const typename coded::fields fields = coded::block_fields(row, block);
+        const float2 factors = coded::block_factors(row, block);
+        typename coded_up::fields up_fields;
+        float2 up_factors;
+        if constexpr (PAIRED) {
+            up_fields = coded_up::block_fields(up_row, block);
+            up_factors = coded_up::block_factors(up_row, block);
+        }
+        _Pragma("clang loop unroll(disable)")
+        for (uint b = 0; b < tail; ++b) {
+            const uint g = block * 8u + b;
+            const uint scale = coded::scale_code(fields, b);
+            const typename coded::words words = coded::load(w.matrix, codes, g);
+            uint up_scale;
+            typename coded_up::words up_words;
+            if constexpr (PAIRED) {
+                up_scale = coded_up::scale_code(up_fields, b);
+                up_words = coded_up::load(u.matrix, up_codes, g);
+            }
+            uint2 stored[NB][2];
+            PROJECTION_UNROLL
+            for (uint f = 0; f < NB; ++f) {
+                PROJECTION_UNROLL
+                for (uint j = 0; j < 2; ++j) {
+                    stored[f][j] = matrix_stored<UNIT>(in, stored_rows[f][j], 32u * g,
+                        8u * (at.y / 2u) + 4u * (at.y & 1u));
+                }
+            }
+            PROJECTION_UNROLL
+            for (uint s = 0; s < 4; ++s) {
+                simdgroup_half8x8 left;
+                reinterpret_cast<thread half2 &>(left.thread_elements()) =
+                    as_type<half2>(coded::pair(words, s) * scale);
+                simdgroup_half8x8 up_left;
+                if constexpr (PAIRED)
+                    reinterpret_cast<thread half2 &>(up_left.thread_elements()) =
+                        as_type<half2>(coded_up::pair(up_words, s) * up_scale);
+                PROJECTION_UNROLL
+                for (uint f = 0; f < NB; ++f) {
+                    simdgroup_float8x8 right;
+                    reinterpret_cast<thread float2 &>(right.thread_elements()) = float2(
+                        matrix_value<A>(stored[f][0], s), matrix_value<A>(stored[f][1], s));
+                    if (b == 0 && s == 0)
+                        simdgroup_multiply(acc[f], left, right);
+                    else
+                        simdgroup_multiply_accumulate(acc[f], left, right, acc[f]);
+                    if constexpr (PAIRED) {
+                        if (b == 0 && s == 0)
+                            simdgroup_multiply(acc_up[f], up_left, right);
+                        else
+                            simdgroup_multiply_accumulate(acc_up[f], up_left, right, acc_up[f]);
+                    }
+                }
+            }
+        }
+        simdgroup_half8x8 left;
+        const uint mc0 = at.x < tail ? coded::min_code(fields, at.x) : 0u;
+        const uint mc1 = at.x + 1u < tail ? coded::min_code(fields, at.x + 1u) : 0u;
+        reinterpret_cast<thread half2 &>(left.thread_elements()) = as_type<half2>(mc0 | (mc1 << 16));
+        simdgroup_half8x8 up_left;
+        if constexpr (PAIRED) {
+            const uint umc0 = at.x < tail ? coded_up::min_code(up_fields, at.x) : 0u;
+            const uint umc1 = at.x + 1u < tail ? coded_up::min_code(up_fields, at.x + 1u) : 0u;
+            reinterpret_cast<thread half2 &>(up_left.thread_elements()) = as_type<half2>(umc0 | (umc1 << 16));
+        }
+        PROJECTION_UNROLL
+        for (uint f = 0; f < NB; ++f) {
+            float2 sums = float2(0.0f);
+            if (at.y < tail) {
+                if constexpr (STAGED)
+                    sums = *reinterpret_cast<threadgroup const float2 *>(
+                        block_sums + (block * 8u + at.y) * 8u * NB + 8u * f + at.x);
+                else
+                    sums = matrix_block_sums<UNIT>(in, m[f][0], m[f][1], block * 8u + at.y);
+            }
+            simdgroup_float8x8 right;
+            reinterpret_cast<thread float2 &>(right.thread_elements()) = sums;
+            simdgroup_multiply(mins[f], left, right);
             y[f] = metal::fma(float2(factors.x * 0x1p24f), reinterpret_cast<thread float2 &>(acc[f].thread_elements()),
                 metal::fma(float2(factors.y * 0x1p24f), reinterpret_cast<thread float2 &>(mins[f].thread_elements()),
                     y[f]));
@@ -3492,11 +3622,14 @@ inline void int8_quantize(thread const In &in, thread const int8_scratch &s, uin
 // A 32-row weight tile's factored coefficients, in 16-byte words: the rows'
 // factors of 256-column block `block`, and their scale bytes of the four
 // blocks from `g` (a multiple of four), for row class r.
+inline uint int8_blocks(uint groups) { return (groups + 7u) / 8u; }
 inline ulong int8_factor_at(uint tile, uint block, uint r, uint groups) {
-    return ulong(tile) * groups * 3u + block * 8u + r;
+    const uint blocks = int8_blocks(groups);
+    return ulong(tile) * blocks * 24u + block * 8u + r;
 }
 inline ulong int8_scale_bytes_at(uint tile, uint g, uint r, uint groups) {
-    return ulong(tile) * groups * 3u + groups + g * 2u + r;
+    const uint blocks = int8_blocks(groups);
+    return ulong(tile) * blocks * 24u + blocks * 8u + g * 2u + r;
 }
 
 // The coefficient pass: one thread per (32-row weight tile, row class r,
@@ -3504,18 +3637,19 @@ inline ulong int8_scale_bytes_at(uint tile, uint g, uint r, uint groups) {
 template <typename W>
 inline void int8_coefficients(thread const Weights<W> &w, thread const int8_scratch &s, uint rows, uint columns,
     uint item) {
-    const uint groups = columns / 32u, blocks = columns / 256u;
+    const uint groups = columns / 32u, blocks = int8_blocks(groups);
     const uint set = item / blocks, block = item % blocks;
     const uint tile = set / 8u, r = set & 7u;
     if (tile * 32u >= rows)
         return;
+    const uint count = metal::min(8u, groups - block * 8u);
     float4 factor;
     float scale[4][8], bias[4][8];
     PROJECTION_UNROLL
     for (uint q = 0; q < 4; ++q) {
         const uint n = tile * 32u + r + 8u * q;
         float row_factor;
-        packets::int8<W>::coefficients(w.locate(n), block, row_factor, scale[q], bias[q]);
+        packets::int8<W>::coefficients(w.locate(n), block, count, row_factor, scale[q], bias[q]);
         factor[q] = row_factor;
     }
     if constexpr (packets::int8<W>::factored) {
@@ -3535,8 +3669,10 @@ inline void int8_coefficients(thread const Weights<W> &w, thread const int8_scra
         device float4 *scales = reinterpret_cast<device float4 *>(s.coefficients)
             + (ulong(tile) * groups + block * 8u) * 8u + r;
         PROJECTION_UNROLL
-        for (uint i = 0; i < 8; ++i)
-            scales[i * 8u] = factor * float4(scale[0][i], scale[1][i], scale[2][i], scale[3][i]);
+        for (uint i = 0; i < 8; ++i) {
+            if (i < count)
+                scales[i * 8u] = factor * float4(scale[0][i], scale[1][i], scale[2][i], scale[3][i]);
+        }
     }
     if constexpr (packets::int8<W>::biased) {
         // A 16-row tile's rows r, r + 8 by four blocks are a lane's eight
@@ -3555,7 +3691,7 @@ inline void int8_coefficients(thread const Weights<W> &w, thread const int8_scra
             }
             // The blocks that pad the min-term product's last 32 are zero.
             if (block == blocks - 1u) {
-                for (uint g = groups; g < int8_min_chunks(groups) * 32u; g += 4u)
+                for (uint g = blocks * 8u; g < int8_min_chunks(groups) * 32u; g += 4u)
                     *reinterpret_cast<device uint4 *>(s.biases + int8_bias_at(n, g, groups)) = uint4(0u);
             }
         }

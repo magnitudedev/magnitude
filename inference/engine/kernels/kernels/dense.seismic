@@ -60,9 +60,8 @@
 # which `forms::metal_matrix` admits: integer lane codes under factors per
 # 256 columns, or direct scales per 32), the launch takes the matrix GEMV
 # instead, `gemv_matrix`: the weights' integer codes as the left fragment
-# (whole 256-column blocks for the codes and runs products, which sum a
-# block's factors once and would drop a partial one; whole 32-column groups
-# for the symmetric product),
+# (whole 32-column groups, with a masked final partial 256-column block for
+# the codes and runs products when K is not a multiple of 256),
 # BATCH_PARTS simdgroups sharing a fragment's eight weight rows, a summation
 # order of its own; BATCH_ROWS is the batched rows' and BATCH_PARTS the
 # matrix GEMV's, each held at its default in the other form; a segmented
@@ -193,11 +192,11 @@ projection dense for metal:
     where (TILED == 0 or (PLANES == 0 and PARTED == 0))
     where (STAGE == 0 or PLANES == 0)
     where (STAGE == 0 or (TILED == 0 and LANES < 32))
-    where (TALL == 0 or (GATHERED == 0 and PLANES == 0 and SPLITS == 1 and K % 64 == 0))
+    where (TALL == 0 or (GATHERED == 0 and PLANES == 0 and SPLITS == 1 and (K % 64 == 0 or INT8 == 1)))
     where (TALL == 0 or K % 128 == 0 or TALL_K == 64)
     where (SMALL == 0 or (PLANES == 0 and PARTED == 0))
     where (SPLIT == 1 or PLANES == 0) for single
-    where (INT8 == 0 or (GATHERED == 0 and TALL == 1 and K % 512 == 0 and N % (64 / WEIGHTS) == 0 and each(W, form(W, INT8) == 1) and agree(W, form(W, INT8_INTERLEAVED)))) for paired | single
+    where (INT8 == 0 or (GATHERED == 0 and TALL == 1 and K % 32 == 0 and N % (64 / WEIGHTS) == 0 and each(W, form(W, INT8) == 1) and agree(W, form(W, INT8_INTERLEAVED)))) for paired | single
     where (INT8 == 1 or INT8_TILE == 128) for single
     where (PACK == 0 or (GATHERED == 0 and TALL == 1 and INT8 == 0 and K % 128 == 0 and K < 1048576 and N % (64 / WEIGHTS) == 0 and each(W, form(W, PACK) == 1) and agree(W, form(W, PACK_FOLDS)) and agree(W, form(W, PACK_RESIDUE)) and agree(W, form(W, PACK_SUMS)))) for paired | single
     where (PACK == 0 or (TALL == 1 and K % 128 == 0 and K < 1048576 and SERVED == 1 and any(W, N > 0 and N % 32 == 0 and form(W, PACK) == 1))) for segmented
@@ -206,8 +205,8 @@ projection dense for metal:
     where (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))
     where (RESIDUE == 1 or (PACK == 1 and any(W, bound(W) > 0 and form(W, PACK_RESIDUE) == 1)))
     where (G == 1 or (INT8 == 0 and PACK == 0 and MATRIX == 0 and each(W, operands(W) == 0)))
-    where (MATRIX == 0 or (GATHERED == 0 and each(W, form(W, MATRIX) == 1 and (K % 256 == 0 or (form(W, MATRIX_SYMMETRIC) == 1 and K % 32 == 0))))) for paired | single
-    where (MATRIX == 0 or (PARTED == 0 and any(W, N > 0 and form(W, MATRIX) == 1 and (K % 256 == 0 or (form(W, MATRIX_SYMMETRIC) == 1 and K % 32 == 0))))) for segmented
+    where (MATRIX == 0 or (GATHERED == 0 and K % 32 == 0 and each(W, form(W, MATRIX) == 1))) for paired | single
+    where (MATRIX == 0 or (PARTED == 0 and K % 32 == 0 and any(W, N > 0 and form(W, MATRIX) == 1))) for segmented
     where (MATRIX == 1 or BATCH_PARTS == 2)
     where (MATRIX == 0 or BATCH_ROWS == 2) for paired | single
     scratch staged bytes (M * K * 2) when ORDERED_ALL == 1 and PUBLISHED == 0 and M > VERIFY_ROWS for rms
@@ -229,7 +228,7 @@ projection dense for metal:
     scratch row_scales bytes (ceil_div(M, TOKENS) * TOKENS * (K / 32) * 2) when ORDERED_ANY == 0 and M > 64 and INT8 == 1 and PLANES == 0 for paired | single
     scratch block_sums bytes (ceil_div(M, TOKENS) * TOKENS * ceil_div(K, 1024) * 32 * 2) when ORDERED_ANY == 0 and M > 64 and INT8 == 1 and PLANES == 0 for paired | single
     each W:
-        scratch coefficients bytes (N * (K / 32) * 4) when ORDERED_ANY == 0 and M > 64 and INT8 == 1 and PLANES == 0 for paired | single
+        scratch coefficients bytes (N * max(K / 32, 3) * 4) when ORDERED_ANY == 0 and M > 64 and INT8 == 1 and PLANES == 0 for paired | single
         scratch biases bytes (ceil_div(N, 32) * 32 * ceil_div(K, 1024) * 32 * 2) when ORDERED_ANY == 0 and M > 64 and INT8 == 1 and PLANES == 0 for paired | single
     launch ordered_stage for rms when ORDERED_ALL == 1 and M > VERIFY_ROWS:
         staging
@@ -299,7 +298,7 @@ projection dense for metal:
         threadgroups (ceil_div(M, TOKENS) * TOKENS, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch coefficients for paired | single when ORDERED_ANY == 0 and M > 64 and INT8 == 1 and PLANES == 0:
-        threadgroups (ceil_div(N * (K / 256), 1024), 1, 1)
+        threadgroups (ceil_div(N * ceil_div(K, 256), 1024), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch int8 for paired when ORDERED_ANY == 0 and M > 64 and INT8 == 1 and PLANES == 0:
         threadgroups (ceil_div(N, 32), ceil_div(M, 64), 1)

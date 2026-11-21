@@ -203,7 +203,7 @@ struct Planes {
 }
 
 fn planes(repr: Repr, k: usize) -> Planes {
-    let blocks = k / 256;
+    let blocks = k.div_ceil(256);
     let mut planes = Planes::default();
     let mut at = 0;
     let mut place = |bytes: usize| {
@@ -213,25 +213,26 @@ fn planes(repr: Repr, k: usize) -> Planes {
     };
     match repr {
         Repr::Q4k => {
-            planes.codes = place(k / 2);
+            planes.codes = place(128 * blocks);
             planes.scales = place(12 * blocks);
             planes.supers = place(4 * blocks);
         }
         Repr::Q5k => {
-            planes.codes = place(k / 2);
-            planes.high = place(k / 8);
+            planes.codes = place(128 * blocks);
+            planes.high = place(32 * blocks);
             planes.scales = place(12 * blocks);
             planes.supers = place(4 * blocks);
         }
         Repr::Q6k => {
-            planes.codes = place(k / 2);
-            planes.high = place(k / 4);
-            planes.scales = place(k / 16);
+            planes.codes = place(128 * blocks);
+            planes.high = place(64 * blocks);
+            planes.scales = place(16 * blocks);
             planes.supers = place(2 * blocks);
         }
         Repr::Q8 => {
-            planes.codes = place(k);
-            planes.supers = place(2 * (k / 32));
+            let groups = k.div_ceil(32);
+            planes.codes = place(32 * groups);
+            planes.supers = place(2 * groups);
         }
         Repr::Bf16 => at = 2 * k,
         Repr::Gguf(_) => unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)"),
@@ -385,7 +386,7 @@ fn rows16_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -
             Repr::Q4k | Repr::Q5k => {
                 let bits = if repr == Repr::Q4k { 4 } else { 5 };
                 let center = if bits == 5 { 15.5 } else { 7.5 };
-                for block in 0..k / 256 {
+                for block in 0..k.div_ceil(256) {
                     let d_value = scale / (center * 32.0) * (0.5 + rng.fraction());
                     let d = f16_bits(d_value);
                     let dmin = f16_bits(d_value * center * (0.75 + 0.5 * rng.fraction()));
@@ -408,13 +409,15 @@ fn rows16_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -
                             if bits == 5 {
                                 put_bits(&mut row[p.high..], column, 1, code >> 4);
                             }
-                            out[column] = group_scale.mul_add(code as f32, group_bias);
+                            if column < k {
+                                out[column] = group_scale.mul_add(code as f32, group_bias);
+                            }
                         }
                     }
                 }
             }
             Repr::Q6k => {
-                for block in 0..k / 256 {
+                for block in 0..k.div_ceil(256) {
                     let d = f16_bits(scale / 32.0 / 48.0 * (0.5 + rng.fraction()));
                     row[p.supers + 2 * block..p.supers + 2 * block + 2]
                         .copy_from_slice(&d.to_le_bytes());
@@ -427,7 +430,9 @@ fn rows16_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -
                             let code = rng.below(64);
                             put_bits(&mut row[p.codes..], 4 * column, 4, code & 15);
                             put_bits(&mut row[p.high..], 2 * column, 2, code >> 4);
-                            out[column] = group_scale * (code as i32 - 32) as f32;
+                            if column < k {
+                                out[column] = group_scale * (code as i32 - 32) as f32;
+                            }
                         }
                     }
                 }
@@ -2680,6 +2685,82 @@ fn metal_int8_dense_output_agrees_with_the_tall_form() {
     }
 }
 
+/// Metal's INT8 form at partial 256/512-column shapes (`K = 320` and `K = 640`,
+/// multiples of 32 but not 256 or 512): both Q4_K (factored + biased) and Q8_0
+/// (direct per-32 scales) are admitted and agree with the staged GEMM within
+/// activation quantization error.
+#[test]
+fn metal_int8_partial_k_block_agrees_with_the_tall_form() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let staged = gemm_mapping(64, 64, 1);
+    let tall = Mapping {
+        tall: Some(TALL_DEFAULT),
+        ..staged
+    };
+    let (outputs, rows) = (192usize, 128usize);
+    for repr in [Repr::Q4k, Repr::Q8] {
+        for k in [320usize, 640usize] {
+            let admitted = declared::prepared(
+                &device,
+                &dense_output::native_entry_with(dense_output::Elements {
+                    A: act.element(),
+                    DW: repr.resident(&device),
+                }),
+                &with_matrix::<dense_output::Entry>(
+                    &device,
+                    dense_output_specialization_on(
+                        &device,
+                        &[("H", outputs), ("F", k)],
+                        tall,
+                    )
+                    .with_param("INT8", 1),
+                    &[("A", act.element()), ("DW", repr.resident(&device))],
+                ),
+            );
+            assert!(
+                admitted.is_ok(),
+                "INT8 must admit {repr:?} at K = {k}: {:?}",
+                admitted.err()
+            );
+            let down = weight(repr, outputs, k, 131 + k as u64, 1.0);
+            let mut rng = Rng::new(k as u64 + 132);
+            let residual = (0..rows * outputs)
+                .map(|_| rng.symmetric())
+                .collect::<Vec<_>>();
+            let product = (0..rows * k).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let out_rows = (0..rows as i32).collect::<Vec<_>>();
+            let exact = dense_output_native_arithmetic(
+                &device, act, &down, &residual, rows, &product, &out_rows, staged, false,
+            );
+            let int8 = dense_output_native_arithmetic(
+                &device, act, &down, &residual, rows, &product, &out_rows, tall, true,
+            );
+            let projected = |values: &[f32]| {
+                values
+                    .iter()
+                    .zip(&residual)
+                    .map(|(value, residual)| f64::from(value - residual))
+                    .collect::<Vec<_>>()
+            };
+            let (reference, actual) = (projected(&exact), projected(&int8));
+            let (relative, worst) = relative_difference(&reference, &actual);
+            eprintln!(
+                "int8 dense_output partial-k {repr:?} K={k} rows {rows}: relative RMS error {relative:.2e}, largest {worst:.2e} reference RMS"
+            );
+            assert!(
+                relative <= 1.5e-2 && worst <= 0.1,
+                "int8 dense_output partial-k {repr:?} K={k} rows {rows}: relative RMS error {relative:.2e}, largest {worst:.2e}"
+            );
+        }
+    }
+}
+
 /// The relative RMS difference of `actual` from `reference` and the largest
 /// element difference in units of the reference RMS.
 fn relative_difference(reference: &[f64], actual: &[f64]) -> (f64, f64) {
@@ -4112,6 +4193,115 @@ fn metal_dense_output_matrix_gemv_matches_the_host() {
                         &bound,
                     );
                 }
+            }
+        }
+    }
+}
+
+/// Metal's MATRIX GEMV at partial 256-column shapes (`K = 320` and `K = 640`):
+/// Q4_K (`MATRIX_CODES`), Q6_K (`MATRIX_RUNS`), and Q8_0 (`MATRIX_SYMMETRIC`)
+/// are all admitted for `MATRIX = 1` and agree with the host reference across
+/// `BATCH_PARTS` for both single (`dense_output`) and paired (`dense_expand`).
+#[test]
+fn metal_matrix_gemv_partial_k_block_matches_the_host() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let rows = 13usize;
+    let h = 67usize;
+    for k in [320usize, 640usize] {
+        for repr in [Repr::Q4k, Repr::Q6k, Repr::Q8] {
+            let admitted = declared::prepared(
+                &device,
+                &dense_output::native_entry_with(dense_output::Elements {
+                    A: act.element(),
+                    DW: repr.resident(&device),
+                }),
+                &dense_output_specialization_on(
+                    &device,
+                    &[("H", h), ("F", k)],
+                    gemm_mapping(64, 64, 1),
+                )
+                .with_param("MATRIX", 1)
+                .with_launch_param(common::metal_launch::<dense_output::Entry>("batch"), "BATCH_ROWS", 2),
+            );
+            assert!(
+                admitted.is_ok(),
+                "MATRIX must admit dense_output {repr:?} at K = {k}: {:?}",
+                admitted.err()
+            );
+            let down = weight(repr, h, k, 141 + k as u64, 1.0);
+            let mut rng = Rng::new(k as u64 + 142);
+            let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let product = (0..rows * k)
+                .map(|_| act.round(rng.symmetric()))
+                .collect::<Vec<_>>();
+            let out_rows = (0..rows as i32).collect::<Vec<_>>();
+            let (expected, bound) = dense_output_reference(
+                device.backend(), act, &down, &residual, &product, &out_rows,
+            );
+            for batch_parts in [1u64, 2, 4] {
+                let actual = dense_output_native(
+                    &device,
+                    act,
+                    &down,
+                    &residual,
+                    rows,
+                    &product,
+                    &out_rows,
+                    Mapping {
+                        batch_parts,
+                        ..gemm_mapping(64, 64, 1)
+                    },
+                );
+                assert_within(
+                    &format!(
+                        "matrix dense_output partial-k {repr:?} {h}x{k} rows {rows} parts {batch_parts}"
+                    ),
+                    &actual,
+                    &expected,
+                    &bound,
+                );
+            }
+        }
+        // Paired MATRIX (`dense_expand`) for both MATRIX_CODES (Q4_K) and MATRIX_RUNS (Q6_K).
+        let norm = norm_values(k, 143 + k as u64);
+        let residual = uniform_values(rows * k, 144 + k as u64, 1.0);
+        let out_rows = (0..rows as i32).collect::<Vec<_>>();
+        for repr in [Repr::Q4k, Repr::Q6k] {
+            let gate = weight(repr, h, k, 145 + k as u64, 1.0);
+            let up = weight(repr, h, k, 146 + k as u64, 1.0);
+            let (expected, bound) = dense_expand_reference(
+                device.backend(), act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY,
+            );
+            for batch_parts in [1u64, 2, 4] {
+                let actual = dense_expand_native(
+                    &device,
+                    act,
+                    &gate,
+                    &up,
+                    &residual,
+                    rows,
+                    &norm,
+                    &out_rows,
+                    1e-6,
+                    Mapping {
+                        batch_parts,
+                        ..gemm_mapping(64, 64, 1)
+                    },
+                );
+                assert_within(
+                    &format!(
+                        "matrix dense_expand partial-k {repr:?} {h}x{k} rows {rows} parts {batch_parts}"
+                    ),
+                    &actual,
+                    &expected,
+                    &bound,
+                );
             }
         }
     }

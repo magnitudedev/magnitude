@@ -10938,3 +10938,47 @@ fn route_choice_follows_the_reference_order() {
         }
     }
 }
+
+/// Metal's routed `INT8` and `DOWN_INT8` admit partial 256/512-column shapes
+/// (`H = 320`, `F = 640`, multiples of 32) for both Q4_K and Q8_0 experts.
+#[test]
+fn metal_routed_experts_int8_partial_k_block_admitted() {
+    let Some(device) = seismic_native_tests::every_device()
+        .into_iter()
+        .find(|device| device.backend() == seismic::BackendName::Metal)
+    else {
+        return;
+    };
+    let (h, f, e) = (320u64, 640u64, 2u64);
+    for repr in ["q4k", "q8g32s"] {
+        let (gate, _) = packed_weight(&device, repr, &[e, f, h], 211);
+        let (up, _) = packed_weight(&device, repr, &[e, f, h], 212);
+        let (down, _) = packed_weight(&device, repr, &[e, h, f], 213);
+        let entry = routed_experts::native_entry_with(routed_experts::Elements {
+            A: seismic::Element::bf16(),
+            EGW: gate.element(),
+            EUW: up.element(),
+            EDW: down.element(),
+        });
+        let statics = [("H", h), ("F", f), ("T", 32), ("GS", 0), ("US", 0), ("LB", 0)];
+        for (label, params) in [
+            ("INT8", &[("TALL", 1u64), ("INT8", 1)][..]),
+            ("DOWN_INT8", &[("DOWN_TALL", 1u64), ("DOWN_INT8", 1)][..]),
+            (
+                "INT8+DOWN_INT8",
+                &[("TALL", 1u64), ("INT8", 1), ("DOWN_TALL", 1), ("DOWN_INT8", 1)][..],
+            ),
+        ] {
+            let prepared = declared::prepared(
+                &device,
+                &entry,
+                &specialization_on(&device, &statics, params),
+            );
+            assert!(
+                prepared.is_ok(),
+                "routed_experts {label} must admit {repr} at H={h}, F={f}: {:?}",
+                prepared.err()
+            );
+        }
+    }
+}

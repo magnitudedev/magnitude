@@ -608,7 +608,8 @@ struct int8 {
     static constant constexpr bool biased = false;
     static constant constexpr bool factored = false;
     static constant constexpr bool interleaved = false;
-    static void coefficients(thread const Located &, uint, thread float &, thread float (&)[8], thread float (&)[8]) {}
+    static void coefficients(thread const Located &, uint, uint, thread float &, thread float (&)[8],
+        thread float (&)[8]) {}
 };
 #if SEISMIC_HAS_TENSOR_OPS
 // Unsigned 4-bit codes (`Fields<4>`): a lane's eight codes of one row and
@@ -639,16 +640,16 @@ public:
     // factor's significand times a code of at most 8 bits): the factor is
     // the 256 columns' and the scales are the integer codes.
     static constant constexpr bool factored = true;
-    static void coefficients(thread const Located &row, uint block, thread float &factor, thread float (&scale)[8],
-        thread float (&bias)[8]) {
+    static void coefficients(thread const Located &row, uint block, uint count, thread float &factor,
+        thread float (&scale)[8], thread float (&bias)[8]) {
         typename K::run run = K::start(row.row, row.geometry, block * K::packets);
         factor = run.factor.scale(0);
         // A block's bias, bias factor * minimum code, is exact in F32.
         _Pragma("clang loop unroll(full)")
         for (uint i = 0; i < 8; ++i) {
             const uint field = K::next(run);
-            scale[i] = float(K::scale_code(field, 0u));
-            bias[i] = MIN ? run.factor.bias(0) * float(K::min_code(field, 0u)) : 0.0f;
+            scale[i] = i < count ? float(K::scale_code(field, 0u)) : 0.0f;
+            bias[i] = (MIN && i < count) ? run.factor.bias(0) * float(K::min_code(field, 0u)) : 0.0f;
         }
     }
 };
@@ -672,13 +673,13 @@ public:
         second = as_type<char4>(words.y);
     }
     static constant constexpr bool factored = false;
-    static void coefficients(thread const Located &row, uint block, thread float &factor, thread float (&scale)[8],
-        thread float (&bias)[8]) {
+    static void coefficients(thread const Located &row, uint block, uint count, thread float &factor,
+        thread float (&scale)[8], thread float (&bias)[8]) {
         weight_bytes supers = row.geometry.super_at(row.row, 0ul);
         factor = 1.0f;
         _Pragma("clang loop unroll(full)")
         for (uint i = 0; i < 8; ++i) {
-            scale[i] = K::at(supers, block * 8u + i).scale(0);
+            scale[i] = i < count ? K::at(supers, block * 8u + i).scale(0) : 0.0f;
             bias[i] = 0.0f;
         }
     }

@@ -547,8 +547,8 @@ inline void zero_segment(thread const Out &out, uint m, uint n, uint row0, uint 
 }
 
 // A segment's batched threadgroup `tile`: the matrix GEMV where MATRIX takes
-// it and it serves the weights (`matrix_form`, over whole 256-column blocks
-// unless symmetric), else the batched rows, whose threadgroups past the
+// it and it serves the weights (`matrix_form`, over whole 32-column groups),
+// else the batched rows, whose threadgroups past the
 // segment's rows (the matrix GEMV's grid) return. A pair takes `w` and `v`
 // together.
 template <typename W, typename V, bool PAIRED, uint BATCH_ROWS, uint PARTS, uint MATRIX, bool COLUMNS, typename In,
@@ -557,7 +557,7 @@ inline void segment_batch(thread const In &in, thread const Out &out, thread con
     thread const Weights<V> &v, uint m, uint n, uint k, uint tile, threadgroup uchar *shared, uint simdgroups,
     uint sg, uint lane) {
     if constexpr (MATRIX == 1 && matrix_form<W>::available && (!PAIRED || matrix_form<V>::available)) {
-        if (k % 256u == 0 || (matrix_form<W>::symmetric32 && (!PAIRED || matrix_form<V>::symmetric32))) {
+        if (k % 32u == 0) {
             if constexpr (PAIRED)
                 gemv_matrix_paired<W, V, PARTS>(in, out, w, v, m, n, k, tile, shared, simdgroups, sg, lane);
             else if constexpr (COLUMNS)
