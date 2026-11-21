@@ -182,73 +182,36 @@ fn shape_rows[Sx, V, Hn](logits: &mut tensor[Sx, V] f32,
                         if preceding >= top_p:
                             logits[row, token] = -inf
 
-# Native Metal: the vocabulary of each row is split into PARTS contiguous
-# partitions. prepare applies the constraint mask, penalties and temperature; three count/select
-# rounds of an order-preserving-key radix select (11/11/10-bit digits) find
-# the top-k threshold, three more the top-p cutoff over the top-k and min-p
-# survivors (masses exp(v - max) in 64-bit fixed point, so decisions do not
-# depend on PARTS); ties counts the cutoff key's survivors per partition for
-# the ascending-index tie rule; apply writes -inf over removed tokens.
+# Native Metal: each row's vocabulary is split into PARTS contiguous slices.
+# prepare applies the constraint mask, penalties (via a partition-local count
+# table when the slice fits in threadgroup memory, falling back to a history
+# scan otherwise) and temperature; select finds both cutoffs in one
+# 1024-thread threadgroup per row with order-independent integer sums (using a
+# bitonic-sort compact fast path when candidates fit in COMPACT_CAP, and a
+# multi-pass radix select otherwise); apply writes -inf over removed tokens.
 native shape_rows for metal from "metal/shape_rows.metal":
     params (PARTS in [64, 32, 128] default 64)
-    scratch state bytes (Sx * 64)
-    scratch partials bytes (Sx * PARTS * 12)
-    scratch histogram bytes (Sx * 2048 * 12)
+    scratch state bytes (Sx * (PARTS + 8) * 4)
     launch shape_rows_prepare:
         threadgroups (PARTS, Sx, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_count:
-        threadgroups (PARTS, Sx, 1)
-        threads_per_threadgroup (256, 1, 1)
     launch shape_rows_select:
         threadgroups (Sx, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_count:
-        threadgroups (PARTS, Sx, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_select:
-        threadgroups (Sx, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_count:
-        threadgroups (PARTS, Sx, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_select:
-        threadgroups (Sx, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_count:
-        threadgroups (PARTS, Sx, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_select:
-        threadgroups (Sx, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_count:
-        threadgroups (PARTS, Sx, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_select:
-        threadgroups (Sx, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_count:
-        threadgroups (PARTS, Sx, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_select:
-        threadgroups (Sx, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch shape_rows_ties:
-        threadgroups (PARTS, Sx, 1)
-        threads_per_threadgroup (256, 1, 1)
+        threads_per_threadgroup (1024, 1, 1)
     launch shape_rows_apply:
         threadgroups (PARTS, Sx, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # Native CUDA: each row's vocabulary is split into PARTS contiguous slices.
-# prepare applies the constraint mask, penalties and temperature; select
-# finds both cutoffs in one
-# 1024-thread block per row with order-independent integer sums; apply writes
-# -inf over removed tokens. On one device the result is independent of PARTS
-# and WIDTH: every configuration decides each token alike. Differs from
-# Metal: 3 launches (Metal selects over 6 count/select rounds plus a ties
-# launch, 5 stages); both follow the same contract, and their decisions differ
-# only for a token within rounding of a cut (tests/decision).
+# prepare applies the constraint mask, penalties (via a partition-local count
+# table in static shared memory when the slice fits, falling back to a global
+# history scan otherwise, with no Hn shared-memory cap) and temperature; select
+# finds both cutoffs in one 1024-thread block per row with order-independent
+# integer sums; apply writes -inf over removed tokens. On one device the result
+# is independent of PARTS and WIDTH: every configuration decides each token
+# alike. Both Metal and CUDA follow the same 3-launch design and contract, and
+# their decisions differ only for a token within rounding of a cut
+# (tests/decision).
 native shape_rows for cuda from "cuda/shape_rows.cu":
     static (V, Hn)
     params (PARTS in [64, 128, 32] default 64, WIDTH in [256, 512] default 256)
@@ -256,7 +219,6 @@ native shape_rows for cuda from "cuda/shape_rows.cu":
     launch shape_rows_prepare:
         threadgroups (PARTS, Sx, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
-        shared_bytes (Hn * 4)
     launch shape_rows_select:
         threadgroups (Sx, 1, 1)
         threads_per_threadgroup (1024, 1, 1)
