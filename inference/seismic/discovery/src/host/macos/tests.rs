@@ -177,9 +177,9 @@ fn a_snapshot_pairs_with_the_paging_read_when_it_was_first_served() {
 
 /// The file floor is the file pages standing where the OS compressed
 /// more than was free above its target (excluding speculative pages as
-/// `vm.page_free_count` does), held while compressions or tight free persist,
-/// decaying and releasing once compressions cease and free recovers
-/// comfortably above target, and clamped to current external pages.
+/// `vm.page_free_count` does), held across calm free recovery (so freeing our
+/// own memory never fabricates phantom `clean_cache` from mapped binaries),
+/// and clamped to current external pages whenever files are evicted or closed.
 #[test]
 fn the_file_floor_is_what_the_os_keeps_as_it_compresses() {
     let statistics = |compressions, free, external| libc::vm_statistics64 {
@@ -207,8 +207,8 @@ fn the_file_floor_is_what_the_os_keeps_as_it_compresses() {
     let pressed = statistics(30_000, 4_500, 95_000);
     assert_eq!(file_floor(Some(&rest), &pressed, target), 95_000);
     let kept = snapshot(pressed, 95_000);
-    // Still tight near target without new compressions: floor stays standing,
-    // clamped to current external pages.
+    // Without new compressions: floor stays standing (even when free recovers
+    // above 4x target after our own shrink), clamped to current external pages.
     assert_eq!(
         file_floor(Some(&kept), &statistics(30_000, 7_000, 140_000), target),
         95_000
@@ -217,16 +217,9 @@ fn the_file_floor_is_what_the_os_keeps_as_it_compresses() {
         file_floor(Some(&kept), &statistics(30_000, 7_000, 80_000), target),
         80_000
     );
-    // Modest calm recovery (2x..4x target) halves the temporary floor; full
-    // calm recovery (>= 4x target) clears it completely so a past transient
-    // spike never permanently blacklists gigabytes of file cache.
-    assert_eq!(
-        file_floor(Some(&kept), &statistics(30_000, 10_000, 140_000), target),
-        47_500
-    );
     assert_eq!(
         file_floor(Some(&kept), &statistics(30_000, 60_000, 140_000), target),
-        0
+        95_000
     );
     assert_eq!(
         file_floor(Some(&kept), &statistics(60_000, 4_200, 88_000), target),

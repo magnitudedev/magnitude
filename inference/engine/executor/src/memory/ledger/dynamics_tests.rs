@@ -1353,15 +1353,20 @@ fn non_pooled_cache_without_open_pool_reads_and_relieves_under_pressure() {
     assert_eq!(owed.yielded, drafter_bytes);
     os.release(*now.lock().expect("the clock"), drafter_bytes, Wiring::Pageable);
 
-    // Pressure clears and others release memory -> once the growth step closes
-    // and a calm baseline is established, B lifts cleanly.
+    // Pressure clears and others release 1 GiB -> once the growth step closes
+    // and a calm baseline is established, B lifts by the 1 GiB exogenous gain
+    // (without clearing straight to None across unverified cold overhang).
     os.pressure = seismic::PressureLevel::Normal;
     os.hot = os.hot.saturating_sub(GB);
     for _ in 0..4 {
         *now.lock().expect("the clock") += Duration::from_millis(SNAPSHOT_MS);
         read(&ledger, &mut os, *now.lock().expect("the clock"));
     }
-    assert_eq!(ledger.estimate().cap(), None, "restored supply lifts B");
+    assert_eq!(
+        ledger.estimate().cap(),
+        Some(held - drafter_bytes + GB),
+        "restored supply raises B by the exogenous release while cold overhangs"
+    );
 
     drop((graph_slots, drafter, load));
 }
@@ -1382,4 +1387,58 @@ fn pooled_cache_without_open_pool_still_violates_invariant() {
     let _bank = ledger.cache(CacheKind::Bank, 32 * MB, super::Reclaim::Unbacked).expect("unbacked bank cache fits");
     *now.lock().expect("the clock") += Duration::from_millis(100);
     read(&ledger, &mut os, *now.lock().expect("the clock"));
+}
+
+/// End-to-end reproduction of the `PID 91361` sawtooth scenario: after
+/// sustained `Harm` caps the bank and the bank shrinks, other apps' pages
+/// aging back from `hot` to `cold` (raising `cold` and `room` without any app
+/// exiting) must NOT clear `cap` or cause any bank resize oscillation; when a
+/// genuine exogenous competitor later exits (`os.hot` drops), the bank grows
+/// smoothly into the freed RAM.
+#[test]
+fn cold_reaging_after_harm_shrink_never_sawtooths_bank_while_exogenous_exit_grows_smoothly() {
+    let mut os = Os::new();
+    os.hot = 24 * GB;
+    os.cold = 0;
+    let mut machine = filled(os, 0);
+    let initial_bank = machine.bank_bytes();
+
+    // Sustained thrashing under scarcity confirms Harm and caps + shrinks the bank.
+    let pages_per_step = (70 * MB) / PAGE; // 350 MB/s at 200ms ticks
+    for _ in 0..8 {
+        machine.os.harm += pages_per_step;
+        machine.step(SNAPSHOT_MS);
+    }
+    let cap = machine.ledger.estimate().cap().expect("sustained thrashing sets B");
+    let shrunk_bank = machine.bank_bytes();
+    assert!(shrunk_bank < initial_bank, "bank shrank under Harm ({shrunk_bank} < {initial_bank})");
+
+    // 2 s later, other apps' pages age from active (`hot`) to inactive (`cold`),
+    // adding 6 GiB of `cold` (3 GiB `cold_reclaimable`) while `free` does not rise.
+    machine.os.hot -= 6 * GB;
+    machine.os.cold += 6 * GB;
+    for tick in 0..20 {
+        machine.step(300);
+        assert_eq!(
+            machine.ledger.estimate().cap(),
+            Some(cap),
+            "cold re-aging at tick {tick} must never clear Cap to None"
+        );
+        assert_eq!(
+            machine.bank_bytes(),
+            shrunk_bank,
+            "zero sawtooth resizes while cold re-ages at tick {tick}"
+        );
+    }
+
+    // Now a competing app genuinely exits, freeing 4 GiB of active RAM into `free`.
+    machine.os.hot -= 4 * GB;
+    for _ in 0..5 {
+        machine.step(300);
+    }
+    assert!(
+        machine.bank_bytes() > shrunk_bank,
+        "genuine exogenous exit smoothly grows bank ({} > {shrunk_bank})",
+        machine.bank_bytes()
+    );
 }

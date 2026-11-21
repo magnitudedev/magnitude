@@ -165,9 +165,10 @@ pub(super) struct Snapshot {
 /// `free_target` (`free_count` excludes `speculative_count` as
 /// `vm.page_free_count` does), it chose compressing over every file page still
 /// standing, so those are its floor (a mapped library or binary in use);
-/// when compression stops and free pages recover comfortably above target, the
-/// temporary floor decays rather than latching permanently; clamped to the
-/// snapshot's external file pages.
+/// otherwise the floor `before` showed, clamped to current external file pages.
+/// Freeing our own memory raises `free` without making those mapped binaries
+/// evictable, so `file_floor` never resets on calm `free` alone (which would
+/// fabricate phantom `clean_cache` supply after every shrink).
 pub(super) fn file_floor(
     before: Option<&Snapshot>,
     statistics: &libc::vm_statistics64,
@@ -181,10 +182,6 @@ pub(super) fn file_floor(
         + u64::from(statistics.purgeable_count);
     let floor = if compressed > free.saturating_sub(free_target) {
         external
-    } else if compressed == 0 && free >= free_target.saturating_mul(4) {
-        0
-    } else if compressed == 0 && free > free_target.saturating_mul(2) {
-        before.file_floor / 2
     } else {
         before.file_floor
     };
