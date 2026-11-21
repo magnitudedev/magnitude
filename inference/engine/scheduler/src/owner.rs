@@ -451,9 +451,52 @@ impl ActivePublication {
         }
     }
 
+    fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn extend_permits(&mut self, permits: impl IntoIterator<Item = PublicationPermit>) {
+        self.permits.extend(permits);
+    }
+
     fn clear_pending(&mut self) {
         self.pending = None;
         self.permits.clear();
+    }
+
+    /// Drain accepted output into reserved permits. Returns whether the
+    /// receiver has closed.
+    fn drain(&mut self, generation: &mut Generation) -> bool {
+        if !self.sender.receiver_open() {
+            return true;
+        }
+        loop {
+            let tokens = match self.pending.take() {
+                Some(tokens) => tokens,
+                None if generation.output_len() > 0 => match generation.take(self.batch_limit) {
+                    Ok(tokens) => tokens,
+                    Err(_) => break,
+                },
+                None => break,
+            };
+            let Some(permit) = self.permits.pop_front() else {
+                // Output beyond the reserved bound waits for the next round's
+                // reservation.
+                self.pending = Some(tokens);
+                break;
+            };
+            match self.sender.output_with_permit(tokens, permit) {
+                Ok(()) => {}
+                Err((PublishError::Full | PublishError::ExceedsCapacity, _)) => {
+                    unreachable!("a publication permit owns an exact output slot")
+                }
+                Err((PublishError::ReceiverClosed, _)) => return true,
+            }
+        }
+        if self.pending.is_none() && generation.output_len() == 0 {
+            self.permits.clear();
+        }
+        false
     }
 }
 
@@ -835,7 +878,7 @@ impl ReservedRound {
                 if bound != 0 {
                     let slots = bound.div_ceil(publication.batch_limit);
                     match publication.sender.reserve_outputs(slots) {
-                        Ok(permits) => publication.permits.extend(permits),
+                        Ok(permits) => publication.extend_permits(permits),
                         Err(PublishError::Full) => {
                             return Reservation::Returned(Request {
                                 record,
@@ -1132,22 +1175,67 @@ pub struct Ran {
     pub reread: Reread,
 }
 
+/// How a running expert bank resize relates to the tier's previous resize:
+/// a store's first resize follows the load's own reading (term `"load"`,
+/// nothing moved before it, and no prior reading generation); each later
+/// resize records the previous resize's reading generation, the terms that
+/// moved between the two, and the one whose change set the target
+/// (`SizingTerms::term`).
+#[derive(Clone, Debug)]
+enum ResizeOrigin {
+    Load,
+    Delta {
+        before: Option<u64>,
+        moved: Vec<SizingTerm>,
+        term: Option<&'static str>,
+    },
+}
+
+impl ResizeOrigin {
+    fn from_previous(previous: Option<SizingTerms>, reading: &SizingTerms) -> Self {
+        match previous {
+            Some(before) => Self::Delta {
+                before: before.reading,
+                moved: reading.moved(&before),
+                term: reading.term(&before),
+            },
+            None => Self::Load,
+        }
+    }
+
+    fn before_generation(&self) -> Option<u64> {
+        match self {
+            Self::Load => None,
+            Self::Delta { before, .. } => *before,
+        }
+    }
+
+    fn moved(&self) -> &[SizingTerm] {
+        match self {
+            Self::Load => &[],
+            Self::Delta { moved, .. } => moved,
+        }
+    }
+
+    fn term(&self) -> Option<&'static str> {
+        match self {
+            Self::Load => Some("load"),
+            Self::Delta { term, .. } => *term,
+        }
+    }
+}
+
 /// A running expert bank resize: what the process held in the tier's
 /// store when it began (`ExecutorDomain::held_bytes_of`), and why it began:
-/// the reading its store's target was derived from, the generation of the
-/// reading the store's previous resize began on (`before`), and the terms
-/// that moved between the two, with the one whose change set the target
-/// (`SizingTerms::term`), which trace the resize to the event that moved
-/// them. A store's first resize follows the load's own reading: its term
-/// is `load`, nothing moved before it, and it names no `before`.
+/// the reading its store's target was derived from, and how it relates to the
+/// store's previous resize ([`ResizeOrigin`]), which traces the resize to the
+/// event that moved its sizing terms.
 #[derive(Clone, Debug)]
 struct BankBegun {
     held: u64,
     cause: BankBegunFor,
     reading: SizingTerms,
-    before: Option<u64>,
-    moved: Vec<SizingTerm>,
-    term: Option<&'static str>,
+    origin: ResizeOrigin,
 }
 
 /// Why an expert bank resize began: a shrink to the bank's derived target,
@@ -1238,6 +1326,87 @@ struct TierResize {
     sized: Option<SizingTerms>,
 }
 
+/// Whether a memory reading is owed at the next step and whether the worker is
+/// waking from a [`Reread::Settled`] idle period.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadingState {
+    /// Active: no reading owed, not waking from an idle period.
+    Active,
+    /// A reading is owed at the next step whatever brings it: the load's
+    /// first, the worker's timed one ([`Owner::reread`]), or one a change
+    /// beside it deferred (`MemoryReading::Beside`).
+    Owed,
+    /// The worker went idle with [`Reread::Settled`] (no flight and no timed
+    /// reading running) at this `readings_generation`; no reading is owed yet.
+    Settled(u64),
+    /// Was [`Self::Settled`] at this `readings_generation` and now owes a
+    /// fresh reading (e.g., after admission or a deferred wake reading): an
+    /// unpressured wake whose stores were unread while asleep opens a fresh
+    /// baseline.
+    WakingFromIdle(u64),
+}
+
+impl ReadingState {
+    fn is_owed(self) -> bool {
+        matches!(self, Self::Owed | Self::WakingFromIdle(_))
+    }
+
+    /// Mark a reading owed at the next step, preserving any settled idle
+    /// baseline generation.
+    fn owe(&mut self) {
+        *self = match *self {
+            Self::Active | Self::Owed => Self::Owed,
+            Self::Settled(generation) | Self::WakingFromIdle(generation) => {
+                Self::WakingFromIdle(generation)
+            }
+        };
+    }
+
+    /// A new request was admitted: if the worker was idle-settled, it owes a
+    /// fresh reading before selection/provisioning while keeping its idle
+    /// baseline generation.
+    fn on_admit(&mut self) {
+        if let Self::Settled(generation) = *self {
+            *self = Self::WakingFromIdle(generation);
+        }
+    }
+
+    /// The worker went idle with [`Reread::Settled`] at `generation`.
+    fn mark_settled(&mut self, generation: u64) {
+        *self = match *self {
+            Self::Active | Self::Settled(_) => Self::Settled(generation),
+            Self::Owed | Self::WakingFromIdle(_) => Self::WakingFromIdle(generation),
+        };
+    }
+
+    /// Begin a memory observation step: consume any owed flag, clear any idle
+    /// baseline if `pressured`, and return `(owed, after_idle)`.
+    fn begin_step(&mut self, pressured: bool, readings_generation: u64) -> (bool, bool) {
+        let owed = self.is_owed();
+        let after_idle = if pressured {
+            *self = Self::Active;
+            false
+        } else {
+            match *self {
+                Self::Active | Self::Owed => {
+                    *self = Self::Active;
+                    false
+                }
+                Self::Settled(generation) | Self::WakingFromIdle(generation) => {
+                    *self = Self::Settled(generation);
+                    generation == readings_generation
+                }
+            }
+        };
+        (owed, after_idle)
+    }
+
+    /// A reading completed: clear any idle baseline.
+    fn on_read(&mut self) {
+        *self = Self::Active;
+    }
+}
+
 /// What a loaded model's owner holds of its memory between flights
 /// ([`between_flights`]): the expert bank's running resizes, the load's
 /// newly stored measures, and whether new work waits on a real shortage.
@@ -1251,15 +1420,9 @@ pub struct BetweenFlights {
     /// becomes resident anew until a reading finds none (the ordered
     /// response's second step, `MemoryResponse::admission_waits`).
     admission_waits: bool,
-    /// A reading is owed at the next step whatever brings it: the load's
-    /// first, the worker's timed one ([`Owner::reread`]), or one a change
-    /// beside it deferred (`MemoryReading::Beside`).
-    owed: bool,
-    /// Readings generation when the worker went idle with [`Reread::Settled`]
-    /// (no flight and no timed reading running): the next admitted request
-    /// owes a fresh reading before selection/provisioning, and an unpressured
-    /// wake whose stores were unread while asleep opens a fresh baseline.
-    settled: Option<u64>,
+    /// Whether a memory reading is owed and whether the worker is waking from
+    /// an idle [`Reread::Settled`] period.
+    reading: ReadingState,
 }
 
 impl BetweenFlights {
@@ -1282,8 +1445,7 @@ impl BetweenFlights {
             tiers: [const { TierResize { began: None, sized: None } }; BankTier::COUNT],
             measures: None,
             admission_waits: false,
-            owed: true,
-            settled: None,
+            reading: ReadingState::Owed,
         }
     }
 }
@@ -1533,7 +1695,7 @@ impl<F: ProgramFamily> Owner<F> {
     /// The worker's timed reading of memory is due ([`Reread`]): the next
     /// run reads memory.
     pub fn reread(&mut self) {
-        self.service.memory.owed = true;
+        self.service.memory.reading.owe();
     }
 
     /// What the census counts moves only with: the generation of what the
@@ -1686,9 +1848,7 @@ impl<F: ProgramFamily> Service<F> {
         } else {
             (None, Stage::NonResident(None))
         };
-        if self.memory.settled.is_some() {
-            self.memory.owed = true;
-        }
+        self.memory.reading.on_admit();
         self.requests.insert(
             id,
             Request {
@@ -2024,7 +2184,7 @@ impl<F: ProgramFamily> Service<F> {
                             self.domain.host_idle();
                             let ran = self.ran(false, unload);
                             if ran.reread == Reread::Settled {
-                                self.memory.settled = Some(self.domain.readings_generation());
+                                self.memory.reading.mark_settled(self.domain.readings_generation());
                             }
                             return Ok((Pipeline::Idle(bindings), ran));
                         }
@@ -2131,13 +2291,9 @@ trait MemoryStep: MemoryHost + Sized {
             self.domain().value_cache(prefix).map_err(classify_domain_error)?;
             self.domain().value_state().map_err(classify_domain_error)?;
         }
-        let owed = std::mem::take(&mut self.memory().owed);
         let pressured = self.domain().take_pressure();
-        if pressured {
-            self.memory().settled = None;
-        }
-        let settled = self.memory().settled;
-        let after_idle = settled == Some(self.domain().readings_generation());
+        let readings_generation = self.domain().readings_generation();
+        let (owed, after_idle) = self.memory().reading.begin_step(pressured, readings_generation);
         let read = match boundary || completed || owed || pressured {
             false => None,
             true => match {
@@ -2145,13 +2301,13 @@ trait MemoryStep: MemoryHost + Sized {
                 self.domain().read_memory(after_idle, &evictable).map_err(classify_domain_error)?
             } {
                 MemoryReading::Read(read) => {
-                    self.memory().settled = None;
+                    self.memory().reading.on_read();
                     Some(read)
                 }
                 // A change off this thread stood beside the sample: its
                 // completion wakes the owner, whose step reads then.
                 MemoryReading::Beside => {
-                    self.memory().owed = true;
+                    self.memory().reading.owe();
                     None
                 }
             },
@@ -2224,11 +2380,11 @@ trait MemoryStep: MemoryHost + Sized {
         held: u64,
         reading: magnitude_executor::SizingTerms,
     ) -> Result<(), RequestError> {
-        let (before, moved, term) = match self.memory().tiers[tier.index()].sized.replace(reading.clone()) {
-            Some(before) => (before.reading, reading.moved(&before), reading.term(&before)),
-            None => (None, Vec::new(), Some("load")),
-        };
-        let begun = BankBegun { held, cause, reading, before, moved, term };
+        let origin = ResizeOrigin::from_previous(
+            self.memory().tiers[tier.index()].sized.replace(reading.clone()),
+            &reading,
+        );
+        let begun = BankBegun { held, cause, reading, origin };
         self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))
     }
 
@@ -2324,7 +2480,7 @@ trait MemoryStep: MemoryHost + Sized {
         };
         let tier = self.domain().expert_holding_storage(finished.holding()).map_err(classify_domain_error)?;
         let after = self.domain().held_bytes_of(tier);
-        let BankBegun { held: before, cause, reading, before: before_generation, moved, term } = self.memory().tiers[tier.index()]
+        let BankBegun { held: before, cause, reading, origin } = self.memory().tiers[tier.index()]
             .began
             .take()
             .ok_or_else(|| invariant("expert bank")(format!("a {tier:?} resize finished that never began")))?;
@@ -2351,6 +2507,7 @@ trait MemoryStep: MemoryHost + Sized {
         // resize began on (none for its first, whose term is `load`), the
         // terms that moved between the two, and the one whose change set
         // the target.
+        let (before_generation, term, moved) = (origin.before_generation(), origin.term(), origin.moved());
         let read_before = before_now(reading.read_at);
         let (store, figures) = (reading.store, reading.figures);
         let reading = reading.reading;
@@ -3867,41 +4024,10 @@ impl<F: ProgramFamily> Service<F> {
     /// Drain accepted output into reserved permits. Returns whether the
     /// receiver has closed.
     fn drain(record: &mut Record, generation: &mut Generation) -> bool {
-        let Some(publication) = record.publication.as_mut() else {
-            return false;
-        };
-        if !publication.sender.receiver_open() {
-            return true;
-        }
-        loop {
-            let tokens = match publication.pending.take() {
-                Some(tokens) => tokens,
-                None if generation.output_len() > 0 => {
-                    match generation.take(publication.batch_limit) {
-                        Ok(tokens) => tokens,
-                        Err(_) => break,
-                    }
-                }
-                None => break,
-            };
-            let Some(permit) = publication.permits.pop_front() else {
-                // Output beyond the reserved bound waits for the next round's
-                // reservation.
-                publication.pending = Some(tokens);
-                break;
-            };
-            match publication.sender.output_with_permit(tokens, permit) {
-                Ok(()) => {}
-                Err((PublishError::Full | PublishError::ExceedsCapacity, _)) => {
-                    unreachable!("a publication permit owns an exact output slot")
-                }
-                Err((PublishError::ReceiverClosed, _)) => return true,
-            }
-        }
-        if publication.pending.is_none() && generation.output_len() == 0 {
-            publication.permits.clear();
-        }
-        false
+        record
+            .publication
+            .as_mut()
+            .is_some_and(|publication| publication.drain(generation))
     }
 
     /// Publish every request outside the pipeline, and retire the ones with
@@ -3922,7 +4048,7 @@ impl<F: ProgramFamily> Service<F> {
             };
             let record = &request.record;
             let finished = generation.finish_reason().is_some()
-                && record.publication.as_ref().is_none_or(|publication| publication.pending.is_none())
+                && record.publication.as_ref().is_none_or(|publication| !publication.has_pending())
                 && generation.output_len() == 0
                 && !owes_reconciliation(record, generation);
             if !finished {
@@ -3996,7 +4122,7 @@ impl<F: ProgramFamily> Service<F> {
     /// invariant violation, never a silent park.
     fn check_no_unwakeable_wait(&self) {
         let under_way = self.memory.admission_waits
-            || self.memory.owed
+            || self.memory.reading.is_owed()
             || self.memory.tiers.iter().any(|tier| tier.began.is_some())
             || self.domain.releasing_slots();
         if under_way {
@@ -5147,7 +5273,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         record.clock.serve(Instant::now());
         let publication = record.publication.as_mut().unwrap();
         let permits = publication.sender.reserve_outputs(1).unwrap();
-        publication.permits.extend(permits);
+        publication.extend_permits(permits);
         let Ok(RoundStart::Target(round)) = generation.start_round(id, 4, FrontGrant::UpTo(0)) else {
             panic!("prompt target round");
         };
@@ -5302,7 +5428,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
             .unwrap();
         let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("an idle owner") };
         let service = &mut owner.service;
-        service.memory.owed = false;
+        service.memory.reading = ReadingState::Active;
         assert_eq!(residency(service, bindings, first), Some(true));
         assert_eq!(residency(service, bindings, second), Some(true));
         let Request { record, state: State::Between(generation, Stage::Ready) } =
@@ -5355,7 +5481,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
             .unwrap();
         let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("an idle owner") };
         let service = &mut owner.service;
-        service.memory.owed = false;
+        service.memory.reading = ReadingState::Active;
         assert_eq!(residency(service, bindings, first), Some(true));
         assert_eq!(residency(service, bindings, second), Some(true));
         for id in [first, second] {
