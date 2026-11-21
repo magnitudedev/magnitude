@@ -268,11 +268,14 @@ impl ValidatedHeadBatch {
                 }
             }
         }
+        // A slot with `front` front rows (`front + 1 == rows.len()` entry rows)
+        // lengthens its chain by one via the head, so a continuing row's depth
+        // is 0 (exact) or 1..=rows.len() (front row `j` reads `guesses[s + j - 1]`).
         if let Some(row) = continuing.iter().position(|row| {
             row.is_some_and(|row| {
                 slots
                     .get(row.slot)
-                    .is_none_or(|slot| row.depth >= slot.entry.rows.len())
+                    .is_none_or(|slot| row.depth > slot.entry.rows.len())
             })
         }) {
             return Err(PackError::FrontContinuation { row });
@@ -487,6 +490,17 @@ mod tests {
 
     #[test]
     fn front_slots_reject_overflowing_front_count_and_out_of_range_continuation_depth() {
+        let single_row_slot = FrontSlot {
+            entry: Slot {
+                rows: vec![row(1, 0, None)],
+                bank: 0,
+                previous_tape: 0,
+                following_bank: 1,
+                stop: 1,
+                front: 0,
+            },
+            selects: vec![select(0)],
+        };
         let front_slot = |front: usize| FrontSlot {
             entry: Slot {
                 rows: vec![row(1, 0, None), row(2, 1, None)],
@@ -502,10 +516,40 @@ mod tests {
             ValidatedHeadBatch::from_front_slots(&[front_slot(usize::MAX)], &[], 16, LIMITS),
             Err(PackError::FrontSlot { slot: 0 })
         ));
+        // A 1-row front slot (`front == 0`) lengthens its chain to depth 1 via the head.
+        assert!(matches!(
+            ValidatedHeadBatch::from_front_slots(
+                &[single_row_slot.clone()],
+                &[
+                    Some(FrontContinuation { slot: 0, depth: 0 }),
+                    Some(FrontContinuation { slot: 0, depth: 1 }),
+                ],
+                16,
+                LIMITS,
+            ),
+            Ok(_)
+        ));
+        assert!(matches!(
+            ValidatedHeadBatch::from_front_slots(
+                &[single_row_slot.clone()],
+                &[
+                    Some(FrontContinuation { slot: 0, depth: 0 }),
+                    Some(FrontContinuation { slot: 0, depth: 2 }),
+                ],
+                16,
+                LIMITS,
+            ),
+            Err(PackError::FrontContinuation { row: 1 })
+        ));
+        // A 2-row front slot (`front == 1`) accepts depths 0..=2 and rejects depth 3.
         assert!(matches!(
             ValidatedHeadBatch::from_front_slots(
                 &[front_slot(1)],
-                &[Some(FrontContinuation { slot: 0, depth: 1 })],
+                &[
+                    Some(FrontContinuation { slot: 0, depth: 0 }),
+                    Some(FrontContinuation { slot: 0, depth: 1 }),
+                    Some(FrontContinuation { slot: 0, depth: 2 }),
+                ],
                 16,
                 LIMITS,
             ),
@@ -514,7 +558,17 @@ mod tests {
         assert!(matches!(
             ValidatedHeadBatch::from_front_slots(
                 &[front_slot(1)],
-                &[Some(FrontContinuation { slot: 0, depth: 2 })],
+                &[Some(FrontContinuation { slot: 0, depth: 3 })],
+                16,
+                LIMITS,
+            ),
+            Err(PackError::FrontContinuation { row: 0 })
+        ));
+        // Out-of-range slot index is rejected.
+        assert!(matches!(
+            ValidatedHeadBatch::from_front_slots(
+                &[single_row_slot],
+                &[Some(FrontContinuation { slot: 1, depth: 0 })],
                 16,
                 LIMITS,
             ),
