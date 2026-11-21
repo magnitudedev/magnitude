@@ -11,7 +11,7 @@ fn copy_rows[N, T, KV, W](rows: &slab mut tensor[T, KV, W] A, from: &tensor[N] i
 
 native copy_rows for metal from "metal/copy_rows.metal":
     launch copy_rows:
-        threadgroups (ceil_div(N * KV * W, 256), 1, 1)
+        threadgroups (ceil_div(N * KV * ceil_div(W, max(1, 16 / max(1, dense_bytes(A)))), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native copy_rows for cuda from "cuda/copy_rows.cu":
