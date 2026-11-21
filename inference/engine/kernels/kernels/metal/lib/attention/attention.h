@@ -969,8 +969,8 @@ struct dense_history {
     // History read in place is attended in one launch.
     inline prefill_held held() const { return prefill_held{true, true, true, 0, INT_MAX}; }
 
-    // The matrix decode's key operand: the history dtype. Its values enter the
-    // P.V product as F16, exact for activation values within F16's range.
+    // The matrix decode's operand: the history dtype, for keys, values and
+    // probabilities alike.
     typedef Scalar KeyOperand;
 
     // One simdgroup's KEYS history rows (`tile_rows`) of columns
@@ -990,7 +990,7 @@ struct dense_history {
             store_key(staged, lane);
         }
 
-        inline void store_value_direct(threadgroup half *staged, uint lane) const {
+        inline void store_value_direct(threadgroup KeyOperand *staged, uint lane) const {
             store_value(staged, lane);
         }
 
@@ -1004,18 +1004,13 @@ struct dense_history {
             }
         }
 
-        inline void store_value(threadgroup half *staged, uint lane) const {
+        inline void store_value(threadgroup KeyOperand *staged, uint lane) const {
             ATTENTION_UNROLL
             for (uint n = 0; n < COUNT; ++n) {
                 const uint item = lane + n * 32;
-                if (item >= KEYS * PIECES)
-                    continue;
-                uint converted[4];
-                ATTENTION_UNROLL
-                for (uint i = 0; i < 4; ++i)
-                    converted[i] = as_type<uint>(half2(float2(as_type<vec<Scalar, 2>>(value[n][i]))));
-                *reinterpret_cast<threadgroup uint4 *>(staged + (item / PIECES) * (WC + 8) + (item % PIECES) * 8) =
-                    uint4(converted[0], converted[1], converted[2], converted[3]);
+                if (item < KEYS * PIECES)
+                    *reinterpret_cast<threadgroup uint4 *>(staged + (item / PIECES) * (WC + 8) + (item % PIECES) * 8) =
+                        value[n];
             }
         }
     };
@@ -3549,9 +3544,9 @@ inline void prefill_merge(device const Scalar *query, device const Scalar *gate,
 // several slices the team (then the whole threadgroup) sums the partial
 // scores in slice order through threadgroup memory, so every member holds the
 // same scores and softmax state, and accumulates P.V into its own columns.
-// Scores, the softmax state and the outputs are F32; queries and keys enter
-// the score product as History::KeyOperand, probabilities and values the
-// output product as F16. The teams' states merge in team order into the
+// Scores, the softmax state and the outputs are F32; queries, keys,
+// probabilities and values enter their products as History::KeyOperand.
+// The teams' states merge in team order into the
 // partition's partials and statistics, the layout `decode_output` merges.
 // ---------------------------------------------------------------------------
 
@@ -3683,12 +3678,12 @@ struct gather_walk {
 // by `scale`, key columns past `count` and keys outside the row's own
 // interval [own_lo, own_hi) (key j of the tile at position token + j)
 // masked; the row's running maximum and denominator updated and its
-// probabilities formed (entering the P.V product as F16, summed in F32).
+// probabilities formed (entering the P.V product as ProbOperand, summed in F32).
 // Returns the factor the row's outputs are rescaled by before this tile's
 // P.V.
-template <uint KB>
+template <uint KB, class ProbOperand>
 inline float tile_softmax(thread simdgroup_matrix<float, 8, 8> (&scores)[KB],
-    thread simdgroup_matrix<half, 8, 8> (&probabilities)[KB], thread float &maximum, thread float &denominator,
+    thread simdgroup_matrix<ProbOperand, 8, 8> (&probabilities)[KB], thread float &maximum, thread float &denominator,
     float scale, int token, uint count, int own_lo, int own_hi, uint fn) {
     float tile_maximum = -INFINITY;
     ATTENTION_UNROLL
@@ -3720,7 +3715,7 @@ inline float tile_softmax(thread simdgroup_matrix<float, 8, 8> (&scores)[KB],
         for (uint e = 0; e < 2; ++e) {
             const float s = scores[j].thread_elements()[e];
             const float p = s > -INFINITY ? metal::fast::exp2(s - next) : 0.0f;
-            probabilities[j].thread_elements()[e] = half(p);
+            probabilities[j].thread_elements()[e] = ProbOperand(p);
             tile_sum += p;
         }
     }
@@ -3867,7 +3862,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
     threadgroup uchar *middle = shared + (PACKED ? 0 : QUERY_ROWS * W * sizeof(KeyOperand));
     threadgroup KeyOperand *key_region = reinterpret_cast<threadgroup KeyOperand *>(middle)
         + (PACKED ? 0 : simd) * KEYS * PITCH;
-    threadgroup half *value_region = reinterpret_cast<threadgroup half *>(key_region) + (PACKED ? KEYS * PITCH : 0);
+    threadgroup KeyOperand *value_region = key_region + (PACKED ? KEYS * PITCH : 0);
     threadgroup float *exchange = reinterpret_cast<threadgroup float *>(BANDED ? middle + KEYS * W * 4 : DIRECT ? middle : middle + TILE_BYTES);
     threadgroup float *merged = reinterpret_cast<threadgroup float *>(middle);
     constexpr uint WORK_BYTES = BANDED ? KEYS * W * 4 + EXCHANGE_BYTES : DIRECT
@@ -3957,7 +3952,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         const uint stripe_fresh = available - stripe_history;
         const int fresh_first = (historical ? fresh_token : token) + int(offset + stripe_history - history_keys);
         threadgroup KeyOperand *stripe_key = key_region + offset * PITCH;
-        threadgroup half *stripe_value = value_region + offset * PITCH;
+        threadgroup KeyOperand *stripe_value = value_region + offset * PITCH;
         // The stripe's history rows: key k of the stripe is the tile's key
         // offset + k (a gathered tile's rows are held by their lanes).
         const int shifted = simd_shuffle(held.row, ushort((offset + lane) % 32));
@@ -3982,7 +3977,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
     // here).
     auto absorb_tile = [&](bool live, bool historical, int position, bool masked, int token, uint count,
                            History source, tile_rows history_rows, threadgroup KeyOperand *keys,
-                           threadgroup half *values, int fresh_token, uint fresh_count) {
+                           threadgroup KeyOperand *values, int fresh_token, uint fresh_count) {
         typename History::template decode_tile<KEYS, WC> tile;
         simdgroup_matrix<float, 8, 8> scores[RB][KB];
         if (live) {
@@ -4069,8 +4064,8 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         if (live) {
             // Online softmax per row block; key columns past `count`, and a
             // row's keys outside its own interval, are masked. Probabilities
-            // enter the P.V product as F16; the denominator sums them in F32.
-            simdgroup_matrix<half, 8, 8> probabilities[RB][KB];
+            // enter the P.V product as KeyOperand; the denominator sums them in F32.
+            simdgroup_matrix<KeyOperand, 8, 8> probabilities[RB][KB];
             ATTENTION_UNROLL
             for (uint b = 0; b < RB; ++b) {
                 // This lane's row of the block: in a row tile, its own key
@@ -4078,8 +4073,8 @@ inline void decode_matrix(History history, device const Scalar *query, device co
                 // attends).
                 const int own_lo = masked ? 0 : int(0x80000000);
                 const int own_hi = masked ? own[b] : 0x7fffffff;
-                const float carry = tile_softmax<KB>(scores[b], probabilities[b], maximum[b], denominator[b], scale,
-                    position, count, own_lo, own_hi, fn);
+                const float carry = tile_softmax<KB, KeyOperand>(scores[b], probabilities[b], maximum[b],
+                    denominator[b], scale, position, count, own_lo, own_hi, fn);
                 ATTENTION_UNROLL
                 for (uint d = 0; d < DB; ++d) {
                     output[b][d].thread_elements()[0] *= carry;
@@ -4114,7 +4109,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
             for (uint d = 0; d < DB; ++d) {
                 ATTENTION_UNROLL
                 for (uint j = 0; j < KB; ++j) {
-                    simdgroup_matrix<half, 8, 8> v;
+                    simdgroup_matrix<KeyOperand, 8, 8> v;
                     simdgroup_load(v, values + j * 8 * PITCH + (PACKED ? col0 : 0) + d * 8, PITCH);
                     ATTENTION_UNROLL
                     for (uint b = 0; b < RB; ++b)
@@ -4471,7 +4466,7 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
     const uint visible_hi = metal::min(partition_hi, total);
 
     threadgroup KeyOperand *keys = reinterpret_cast<threadgroup KeyOperand *>(shared);
-    threadgroup half *values = reinterpret_cast<threadgroup half *>(shared + TILE_BYTES);
+    threadgroup KeyOperand *values = reinterpret_cast<threadgroup KeyOperand *>(shared + TILE_BYTES);
     threadgroup float *exchange = reinterpret_cast<threadgroup float *>(shared + 2 * TILE_BYTES);
 
     // Queries are rotary-prepared and rounded to the activation dtype (as the
@@ -4590,7 +4585,7 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
             }
         }
     };
-    // A tile into the key and value tiles (values as F16): the loaded
+    // A tile into the key and value tiles (in KeyOperand): the loaded
     // pieces into its rows below `loaded` (every row when it has no fresh
     // keys), then its fresh keys prepared in place from row rows.count,
     // simdgroup s preparing rows s, s + SIMDGROUPS, ..., rows past them
@@ -4604,12 +4599,7 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
                 continue;
             const uint at = (item / PIECES) * PITCH + (item % PIECES) * 8;
             *reinterpret_cast<threadgroup uint4 *>(keys + at) = key_piece[n];
-            uint converted[4];
-            ATTENTION_UNROLL
-            for (uint i = 0; i < 4; ++i)
-                converted[i] = as_type<uint>(half2(float2(as_type<vec<Scalar, 2>>(value_piece[n][i]))));
-            *reinterpret_cast<threadgroup uint4 *>(values + at) =
-                uint4(converted[0], converted[1], converted[2], converted[3]);
+            *reinterpret_cast<threadgroup uint4 *>(values + at) = value_piece[n];
         }
         if (t.fresh_count == 0)
             return;
@@ -4666,9 +4656,9 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
                 }
             }
         }
-        simdgroup_matrix<half, 8, 8> probabilities[KB];
-        const float carry = tile_softmax<KB>(scores, probabilities, maximum, denominator, scale, 0, current.count,
-            INT_MIN, INT_MAX, fn);
+        simdgroup_matrix<KeyOperand, 8, 8> probabilities[KB];
+        const float carry = tile_softmax<KB, KeyOperand>(scores, probabilities, maximum, denominator, scale, 0,
+            current.count, INT_MIN, INT_MAX, fn);
         ATTENTION_UNROLL
         for (uint d = 0; d < DB; ++d) {
             output[d].thread_elements()[0] *= carry;
@@ -4678,7 +4668,7 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
         for (uint d = 0; d < DB; ++d) {
             ATTENTION_UNROLL
             for (uint j = 0; j < KB; ++j) {
-                simdgroup_matrix<half, 8, 8> v;
+                simdgroup_matrix<KeyOperand, 8, 8> v;
                 simdgroup_load(v, values + j * 8 * PITCH + col0 + d * 8, PITCH);
                 simdgroup_multiply_accumulate(output[d], probabilities[j], v, output[d]);
             }

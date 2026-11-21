@@ -169,11 +169,11 @@ impl<'a, G: GraphDraft + 'a> Clone for DenseDecodeEntries<'a, G> {
 /// prefill entry, tuned on those classes, attends them, a selected read's
 /// rows through the prefill entry's WorkList bitmap. An absorbed latent read
 /// (`AB`) has no F16-staged form in either entry: the declarations refuse
-/// their matrix forms for it (precision.md, "Absorbed latent attention"), so
-/// the catalog decides. Metal's vector decode holds no group as wide as
-/// GLM's (64 queries of 512 exceed its threadgroup memory) and CUDA's decode
-/// holds no stored key, so both send it to prefill; Vulkan's vector decode
-/// holds it.
+/// F16-staged matrix forms for it (precision.md, "Absorbed latent
+/// attention"), so the catalog decides. Metal's matrix decode stages in the
+/// activation element and holds GLM's 64 queries of 512 (shared-tile form),
+/// Vulkan's vector decode holds it, and CUDA's decode holds no stored key so
+/// CUDA sends it to prefill.
 pub(crate) fn dense_decodes(
     backend: seismic::BackendName,
     binding: AttentionBinding,
