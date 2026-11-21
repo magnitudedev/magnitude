@@ -22,7 +22,7 @@
 constant constexpr uint group_experts = SEISMIC_DIM_E;
 constant constexpr uint group_parts = 1024u / group_experts;
 constant constexpr uint group_threads = group_experts * group_parts;
-constant constexpr uint group_simdgroups = (group_threads + 31u) / 32u;
+constant constexpr uint group_expert_simdgroups = (group_experts + 31u) / 32u;
 constant constexpr uint group_choices = SEISMIC_CONST_GROUP_CHOICES;
 
 // The flat index of the first grouped choice: row first[0]'s.
@@ -38,8 +38,9 @@ inline uint group_live(device const int *rows, constant ulong *seismic_words) {
 
 // The count of `expert` among the 8 staged experts of `vector`.
 inline uint group_matches(ushort4 low, ushort4 high, ushort expert) {
-    return uint(low.x == expert) + uint(low.y == expert) + uint(low.z == expert) + uint(low.w == expert)
-        + uint(high.x == expert) + uint(high.y == expert) + uint(high.z == expert) + uint(high.w == expert);
+    const ushort4 target = ushort4(expert);
+    const ushort4 hits = ushort4(low == target) + ushort4(high == target);
+    return uint(hits.x + hits.y + hits.z + hits.w);
 }
 
 inline int group_route(device const int *routes, uint flat, constant ulong *seismic_words) {
@@ -117,8 +118,10 @@ kernel void routed_group_place(
         halves[flat] =
             flat < choices ? ushort(group_route(routes, base + first + flat, seismic_words)) : ushort(0xffff);
     // Expert e's choices in every chunk and in the chunks before this one.
+    // For a single live chunk (chunks <= 1), `partials` is not needed and may
+    // not be populated; `total` is summed directly from `slices` below.
     uint total = 0, before = 0;
-    if (part == 0)
+    if (part == 0 && chunks > 1u)
         for (uint other = 0; other < chunks; ++other) {
             const uint value = partials[ulong(other) * group_experts + expert];
             total += value;
@@ -129,21 +132,36 @@ kernel void routed_group_place(
     for (uint vector = begin; vector < end; ++vector)
         count += group_matches(staged[2u * vector], staged[2u * vector + 1u], mine);
     slices[expert * group_parts + part] = count;
-    // Exclusive scan of the experts' tile counts (thread e < E holds expert e).
-    const uint tiles = (total + tile - 1u) / tile;
-    const uint inclusive = metal::simd_prefix_inclusive_sum(tiles);
-    if (lane == 31u)
-        sums[sg] = inclusive;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-        const uint value = lane < group_simdgroups ? sums[lane] : 0u;
-        const uint scanned = metal::simd_prefix_inclusive_sum(value);
-        if (lane < group_simdgroups)
-            sums[lane] = scanned;
+    if (chunks <= 1u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (part == 0) {
+            for (uint slice = 0; slice < group_parts; ++slice)
+                total += slices[expert * group_parts + slice];
+        }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint start = inclusive + (sg > 0 ? sums[sg - 1u] : 0u) - tiles;
+    // Exclusive scan of the experts' tile counts (thread e < E holds expert e;
+    // only simdgroups < group_expert_simdgroups carry part == 0 threads).
+    const uint tiles = (total + tile - 1u) / tile;
+    uint inclusive = tiles;
+    if (sg < group_expert_simdgroups) {
+        inclusive = metal::simd_prefix_inclusive_sum(tiles);
+        if constexpr (group_expert_simdgroups > 1u) {
+            if (lane == 31u && sg < group_expert_simdgroups - 1u)
+                sums[sg] = inclusive;
+        }
+    }
+    if constexpr (group_expert_simdgroups > 1u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            const uint value = lane < group_expert_simdgroups - 1u ? sums[lane] : 0u;
+            const uint scanned = metal::simd_prefix_inclusive_sum(value);
+            if (lane < group_expert_simdgroups - 1u)
+                sums[lane] = scanned;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     if (part == 0) {
+        const uint start = inclusive + (group_expert_simdgroups > 1u && sg > 0 ? sums[sg - 1u] : 0u) - tiles;
         bases[expert] = start * tile + before;
         if (chunk == 0) {
             counts[expert * SEISMIC_COUNTS_STRIDE_0] = int(total);
@@ -158,12 +176,16 @@ kernel void routed_group_place(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    if (count == 0)
+        return;
     uint position = bases[expert];
     for (uint slice = 0; slice < part; ++slice)
         position += slices[expert * group_parts + slice];
+    uint remaining = count;
     for (uint vector = begin; vector < end; ++vector) {
         const ushort4 low = staged[2u * vector], high = staged[2u * vector + 1u];
-        if (group_matches(low, high, mine) == 0)
+        const uint found = group_matches(low, high, mine);
+        if (found == 0)
             continue;
         const ushort values[8] = {low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
         for (uint i = 0; i < 8u; ++i) {
@@ -177,5 +199,8 @@ kernel void routed_group_place(
                 = int(position);
             ++position;
         }
+        remaining -= found;
+        if (remaining == 0)
+            break;
     }
 }

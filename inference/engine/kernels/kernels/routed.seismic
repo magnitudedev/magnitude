@@ -1009,16 +1009,19 @@ fn routed_group[M, E, K, B, T](first: &tensor[1] i32, rows: &tensor[1] i32, rout
 # words (E <= 1024: 4 KiB). Prefill chunks of 512 rows (K <= 16) are one.
 const GROUP_CHOICES = 8192
 
-# Metal and CUDA: `routed_group_count` counts each chunk of GROUP_CHOICES
-# choices by expert (`partials[chunk, e]`); `routed_group_place` places each
-# chunk's choices after the earlier chunks' of their expert, and its first
-# threadgroup writes the per-expert tables and `used`. No launch is bounded
-# by the row count, and chunks past the grouped rows exit.
+# Metal and CUDA: when M * K <= GROUP_CHOICES, `routed_group_place` runs alone
+# (single launch, no `partials` scratch) and sums each expert's total directly
+# from its per-part slice counts in group memory. Above GROUP_CHOICES,
+# `routed_group_count` counts each chunk of GROUP_CHOICES choices by expert
+# (`partials[chunk, e]`), and `routed_group_place` places each chunk's choices
+# after the earlier chunks' of their expert; its first threadgroup writes the
+# per-expert tables and `used`. No launch is bounded by the row count, and
+# chunks past the grouped rows exit.
 native routed_group for metal from "metal/routed_group.metal":
     static (E, K)
     where E <= 1024
-    scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4)
-    launch routed_group_count:
+    scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4) when M * K > GROUP_CHOICES
+    launch routed_group_count when M * K > GROUP_CHOICES:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
         threads_per_threadgroup (1024, 1, 1)
         shared_bytes (E * 4)
@@ -1030,8 +1033,8 @@ native routed_group for metal from "metal/routed_group.metal":
 native routed_group for cuda from "cuda/routed_group.cu":
     static (E, K)
     where E <= 1024
-    scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4)
-    launch routed_group_count:
+    scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4) when M * K > GROUP_CHOICES
+    launch routed_group_count when M * K > GROUP_CHOICES:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
         threads_per_threadgroup (1024, 1, 1)
         shared_bytes (E * 4)
