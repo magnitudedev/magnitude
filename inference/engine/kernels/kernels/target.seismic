@@ -75,8 +75,9 @@ fn embedding_rows[M, V, D, R, F](table: &tensor[V, D] EW, tokens: &tensor[M, 2] 
                 embedded[row, column] = 0.0
     return embedded, f32(embedded)
 
-# Metal: 256 threads, each decoding whole 32-value rows16 packets. (CUDA: 128
-# threads over mma16 lane chunks.)
+# Metal: 256 threads (8 simdgroups), each simdgroup cooperatively decoding
+# 32-value rows16/rows32 packets (<seismic/gather.h>). (CUDA: 128 threads
+# over mma16 lane chunks.)
 native embedding_rows for metal from "metal/embedding_rows.metal":
     static (D)
     launch embedding_rows:
