@@ -271,9 +271,10 @@ pub(crate) fn reopen(file: &File, direct: bool) -> io::Result<File> {
         if unsafe { libc::fcntl(reopened.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
             return Err(io::Error::last_os_error());
         }
-    } else {
-        advise_random(&reopened)?;
     }
+    // Disable read-ahead unconditionally so any residual XNU UBC/cluster
+    // path on an `F_NOCACHE` descriptor never triggers sequential read-ahead.
+    advise_random(&reopened)?;
     Ok(reopened)
 }
 

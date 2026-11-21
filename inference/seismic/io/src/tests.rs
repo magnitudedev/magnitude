@@ -425,9 +425,10 @@ fn reads_coalesce_then_split_into_pieces() {
         length,
         sink: sink(),
     };
+    let second = ALIGNMENT + 100;
     let ranges = [
         range(0, 90),
-        range(8000, 90),
+        range(second, 90),
         range(2_000_000, 90),
         range(1_000_000, 3 * LEAST_READ as usize),
     ];
@@ -457,7 +458,7 @@ fn reads_coalesce_then_split_into_pieces() {
             .map(|part| (part.range, part.from, part.length))
             .collect::<Vec<_>>()
     };
-    assert_eq!(parts(&pieces[0]), [(0, 0, 90), (1, 8000, 90)]);
+    assert_eq!(parts(&pieces[0]), [(0, 0, 90), (1, second as usize, 90)]);
     let skip = (1_000_000 - start) as usize;
     assert_eq!(parts(&pieces[1]), [(3, skip, LEAST_READ as usize - skip)]);
     assert_eq!(parts(&pieces[2]), [(3, 0, LEAST_READ as usize)]);
@@ -1287,4 +1288,22 @@ fn stream_rejects_offset_overflow_with_invalid_input() {
         })
         .unwrap();
     std::fs::remove_file(path).unwrap();
+}
+
+/// `ALIGNMENT` matches the platform's direct-read alignment (16 KiB VM page
+/// size on Apple Silicon macOS, 4 KiB elsewhere) and `Buffer::new` returns
+/// allocations aligned to `ALIGNMENT`.
+#[test]
+fn alignment_and_buffer_match_platform_direct_read_alignment() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    assert_eq!(ALIGNMENT, 16384);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    assert_eq!(ALIGNMENT, 4096);
+
+    for length in [0, 1, 4096, ALIGNMENT as usize, ALIGNMENT as usize + 7] {
+        let buffer = Buffer::new(length);
+        let (base, region_len) = buffer.region();
+        assert_eq!(region_len, length);
+        assert_eq!(base.as_ptr() as usize % ALIGNMENT as usize, 0);
+    }
 }
