@@ -387,6 +387,46 @@ __device__ __forceinline__ float merge(const float *statistics, u64 stride, cons
     return maximum;
 }
 
+// Warp-cooperative softmax weights for `COUNT` contiguous (maximum,
+// denominator) pairs at `statistics`: writes each partition's weight (0 for
+// empty partitions) to `weights[0..COUNT-1]`, sets `denominator` to the merged
+// denominator, and returns the merged maximum. Every lane of the warp calls it
+// convergently; `statistics` is 8-byte aligned.
+template <int COUNT>
+__device__ __forceinline__ float merge_weights(const float *statistics, float *weights,
+                                               float &denominator, int lane) {
+    static_assert(COUNT > 0, "merge_weights requires at least one partition");
+    constexpr int PER_LANE = (COUNT + 31) / 32;
+    float2 stat[PER_LANE];
+    float local_max = -__int_as_float(0x7f800000);
+#pragma unroll
+    for (int i = 0; i < PER_LANE; ++i) {
+        const int p = lane + i * 32;
+        if (p < COUNT) {
+            const float2 s = reinterpret_cast<const float2 *>(statistics)[p];
+            stat[i] = s;
+            if (s.y > 0.0f) local_max = fmaxf(local_max, s.x);
+        }
+    }
+    const float maximum = seismic_warp_max_f32(local_max);
+    float local_denom = 0.0f;
+#pragma unroll
+    for (int i = 0; i < PER_LANE; ++i) {
+        const int p = lane + i * 32;
+        if (p < COUNT) {
+            const float l = stat[i].y;
+            float weight = 0.0f;
+            if (l > 0.0f) {
+                weight = seismic_ex2_approx(stat[i].x - maximum);
+                local_denom = __fmaf_rn(l, weight, local_denom);
+            }
+            weights[p] = weight;
+        }
+    }
+    denominator = seismic_warp_sum_f32(local_denom);
+    return maximum;
+}
+
 // Publishes one decode partition: the warp states merge in key-group order
 // into one partial per (row, query head, partition) `part`: the unnormalized
 // output at partials[slot * W] and (maximum, denominator) at
@@ -400,6 +440,18 @@ __device__ __forceinline__ void publish(const Heads<H> &state, float *exchange, 
                                         int part, int warp, int lane) {
     static_assert(H * SLICES == G && WARPS % SLICES == 0, "slices split the group and the warps");
     constexpr int GROUPS = WARPS / SLICES;
+    if constexpr (GROUPS == 1) {
+#pragma unroll
+        for (int h = 0; h < H; ++h) {
+            const u64 at = (row * KV * G + kv * G + warp * H + h) * PARTS + part;
+            element::f32_span_store(partials + at * W + lane * DPL, state.accumulator[h]);
+            if (lane == 0) {
+                reinterpret_cast<float2 *>(statistics)[at] =
+                    make_float2(state.maximum[h], state.denominator[h]);
+            }
+        }
+        return;
+    }
     if (lane == 0) {
 #pragma unroll
         for (int h = 0; h < H; ++h) {
