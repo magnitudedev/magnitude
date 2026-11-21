@@ -884,16 +884,19 @@ fn block_geometry_shape<'a>(
                 absorbed_query: operators::attention::absorbed_query(operator),
             }
         }
-        Mixer::GatedDelta(operator) => MixerShapeKey::GatedDelta {
-            convolution_width: operator.convolution_width,
-            key_heads: operator.key_heads,
-            value_heads: operator.value_heads,
-            width: operator.width,
-            head_mapping: operator.head_mapping,
-            output_gate_function: operator.output_gate.function,
-            key_norm_epsilon: operator.key_norm_epsilon.to_bits(),
-            decay_lower: operators::gated_delta::decay_lower(operator).map(f32::to_bits),
-        },
+        Mixer::GatedDelta(admitted) => {
+            let operator = admitted.operator();
+            MixerShapeKey::GatedDelta {
+                convolution_width: operator.convolution_width,
+                key_heads: operator.key_heads,
+                value_heads: operator.value_heads,
+                width: operator.width,
+                head_mapping: operator.head_mapping,
+                output_gate_function: operator.output_gate.function,
+                key_norm_epsilon: operator.key_norm_epsilon.to_bits(),
+                decay_lower: admitted.decay_lower().map(f32::to_bits),
+            }
+        }
         Mixer::StateSpace(operator) => MixerShapeKey::StateSpace {
             shape: StateSpaceShape::of(0, operator).map_err(|error| error.to_string())?,
             norm_epsilon: operator.norm.epsilon.to_bits(),

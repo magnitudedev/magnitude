@@ -14,7 +14,7 @@ use objc2_metal::{
     MTLResourceUsage, MTLSharedEvent, MTLSize, MTLStorageMode,
 };
 use seismic_compiler::direct_launch::{
-    DirectLaunchContract, DirectLaunchRequest, LaunchGrid, ValidatedLaunch,
+    DirectLaunchContract, DirectLaunchRequest, LaunchGrid, ValidatedLaunch, WorkgroupContract,
 };
 use seismic_compiler::errors::ExecutionError;
 
@@ -1090,13 +1090,15 @@ impl DirectBatch {
         let contract = DirectLaunchContract {
             max_buffer_slots: Some(DIRECT_BUFFER_SLOTS),
             max_grid: [crate::device_info::MSL_GRID_INDEX_MAX; 3],
-            max_group_size: Some([
-                max_size.width as u64,
-                max_size.height as u64,
-                max_size.depth as u64,
-            ]),
-            max_group_threads: Some(launch.pipeline.max_threads_per_threadgroup()),
-            max_shared_bytes: Some(raw.maxThreadgroupMemoryLength() as u64),
+            workgroup: WorkgroupContract::Dynamic {
+                max_size: [
+                    max_size.width as u64,
+                    max_size.height as u64,
+                    max_size.depth as u64,
+                ],
+                max_threads: launch.pipeline.max_threads_per_threadgroup(),
+                max_shared_bytes: raw.maxThreadgroupMemoryLength() as u64,
+            },
             max_param_bytes: Some(DIRECT_WORD_BYTES_LIMIT as u64),
         };
         let buffer_slots = launch.buffers.len().checked_add(2).ok_or_else(|| {

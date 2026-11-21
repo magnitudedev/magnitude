@@ -21,6 +21,26 @@ pub enum LaunchGrid {
     Indirect,
 }
 
+/// How a backend specifies and bounds workgroup / block geometry and shared
+/// memory for direct native launches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkgroupContract {
+    /// Workgroup size and shared memory are fixed in the compiled pipeline
+    /// (Vulkan).
+    FixedInPipeline,
+    /// Workgroup / block dimensions and shared memory are supplied by the host
+    /// and validated against device and pipeline limits (Metal, CUDA).
+    Dynamic {
+        /// Maximum workgroup / block dimensions per axis.
+        max_size: [u64; 3],
+        /// Maximum total threads per workgroup / block (typically reflected
+        /// from the compiled pipeline/function).
+        max_threads: u64,
+        /// Maximum total shared / threadgroup memory bytes (static + dynamic).
+        max_shared_bytes: u64,
+    },
+}
+
 /// Hardware and ABI limits for validating a direct native launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectLaunchContract {
@@ -30,16 +50,8 @@ pub struct DirectLaunchContract {
     /// Maximum grid dimensions (workgroups / blocks) per axis for direct
     /// dispatches.
     pub max_grid: [u64; 3],
-    /// Maximum workgroup / block dimensions per axis.
-    /// `None` when workgroup size is fixed in the compiled pipeline (Vulkan).
-    pub max_group_size: Option<[u64; 3]>,
-    /// Maximum total threads per workgroup / block (typically reflected from
-    /// the compiled pipeline/function).
-    /// `None` when workgroup size is fixed in the compiled pipeline (Vulkan).
-    pub max_group_threads: Option<u64>,
-    /// Maximum total shared / threadgroup memory bytes (static + dynamic).
-    /// `None` when shared memory is fixed in the compiled pipeline (Vulkan).
-    pub max_shared_bytes: Option<u64>,
+    /// Workgroup / block geometry and shared memory limits.
+    pub workgroup: WorkgroupContract,
     /// Maximum kernel parameter / argument block bytes (Metal `setBytes`,
     /// CUDA kernel parameter space, Vulkan argument chunk).
     pub max_param_bytes: Option<u64>,
@@ -89,10 +101,42 @@ impl DirectLaunchContract {
     /// Validate `request` against all configured limits of this contract.
     pub fn validate(&self, request: &DirectLaunchRequest) -> Result<ValidatedLaunch, ExecutionError> {
         let empty_grid = matches!(request.grid, LaunchGrid::Direct(grid) if grid.contains(&0));
-        let empty_group = request.group.is_some_and(|group| group.contains(&0));
-        if empty_grid || empty_group {
-            return Ok(ValidatedLaunch::Empty);
-        }
+        let dynamic_workgroup = match (self.workgroup, request.group) {
+            (WorkgroupContract::FixedInPipeline, Some(_)) => {
+                return Err(ExecutionError::SubmissionFailed(
+                    "native launch supplies workgroup dimensions, but the contract fixes workgroup size in the pipeline".into(),
+                ));
+            }
+            (WorkgroupContract::Dynamic { .. }, None) => {
+                return Err(ExecutionError::SubmissionFailed(
+                    "native launch omits workgroup dimensions, but the contract requires dynamic workgroup dimensions".into(),
+                ));
+            }
+            (WorkgroupContract::FixedInPipeline, None) => {
+                if request.static_shared_bytes != 0 || request.dynamic_shared_bytes != 0 {
+                    return Err(ExecutionError::SubmissionFailed(
+                        "native launch requests shared memory, but the contract fixes shared memory in the pipeline".into(),
+                    ));
+                }
+                if empty_grid {
+                    return Ok(ValidatedLaunch::Empty);
+                }
+                None
+            }
+            (
+                WorkgroupContract::Dynamic {
+                    max_size,
+                    max_threads,
+                    max_shared_bytes,
+                },
+                Some(axes),
+            ) => {
+                if empty_grid || axes.contains(&0) {
+                    return Ok(ValidatedLaunch::Empty);
+                }
+                Some((axes, max_size, max_threads, max_shared_bytes))
+            }
+        };
 
         if let Some(limit) = self.max_buffer_slots {
             if request.buffer_slots > limit {
@@ -134,21 +178,17 @@ impl DirectLaunchContract {
             }
         };
 
-        let group = match request.group {
+        let group = match dynamic_workgroup {
             None => None,
-            Some(axes) => {
-                if let Some(max_size) = self.max_group_size {
-                    for axis in 0..3 {
-                        if axes[axis] > max_size[axis] {
-                            return Err(ExecutionError::SubmissionFailed(format!(
-                                "native launch requests {} threads on workgroup axis {axis}, but the device allows {}",
-                                axes[axis], max_size[axis]
-                            )));
-                        }
-                    }
-                }
+            Some((axes, max_size, max_threads, max_shared_bytes)) => {
                 let mut validated = [0u32; 3];
                 for axis in 0..3 {
+                    if axes[axis] > max_size[axis] {
+                        return Err(ExecutionError::SubmissionFailed(format!(
+                            "native launch requests {} threads on workgroup axis {axis}, but the device allows {}",
+                            axes[axis], max_size[axis]
+                        )));
+                    }
                     validated[axis] = u32::try_from(axes[axis]).map_err(|_| {
                         ExecutionError::SubmissionFailed(format!(
                             "native launch workgroup axis {axis} ({}) exceeds 32-bit driver ABI",
@@ -164,31 +204,28 @@ impl DirectLaunchContract {
                             "native workgroup thread count overflowed".into(),
                         )
                     })?;
-                if let Some(max_threads) = self.max_group_threads {
-                    if threads > max_threads {
-                        return Err(ExecutionError::SubmissionFailed(format!(
-                            "native launch requests {threads} threads per workgroup, but the pipeline allows {max_threads}"
-                        )));
-                    }
+                if threads > max_threads {
+                    return Err(ExecutionError::SubmissionFailed(format!(
+                        "native launch requests {threads} threads per workgroup, but the pipeline allows {max_threads}"
+                    )));
+                }
+                let total_shared = request
+                    .static_shared_bytes
+                    .checked_add(request.dynamic_shared_bytes)
+                    .ok_or_else(|| {
+                        ExecutionError::SubmissionFailed(
+                            "native shared memory size overflowed".into(),
+                        )
+                    })?;
+                if total_shared > max_shared_bytes {
+                    return Err(ExecutionError::SubmissionFailed(format!(
+                        "native launch requests {total_shared} shared memory bytes ({} static + {} dynamic), but the device allows {max_shared_bytes}",
+                        request.static_shared_bytes, request.dynamic_shared_bytes
+                    )));
                 }
                 Some(validated)
             }
         };
-
-        if let Some(max_shared) = self.max_shared_bytes {
-            let total_shared = request
-                .static_shared_bytes
-                .checked_add(request.dynamic_shared_bytes)
-                .ok_or_else(|| {
-                    ExecutionError::SubmissionFailed("native shared memory size overflowed".into())
-                })?;
-            if total_shared > max_shared {
-                return Err(ExecutionError::SubmissionFailed(format!(
-                    "native launch requests {total_shared} shared memory bytes ({} static + {} dynamic), but the device allows {max_shared}",
-                    request.static_shared_bytes, request.dynamic_shared_bytes
-                )));
-            }
-        }
 
         Ok(ValidatedLaunch::Active { grid, group })
     }
@@ -202,9 +239,11 @@ mod tests {
         DirectLaunchContract {
             max_buffer_slots: Some(31),
             max_grid: [65_535, 65_535, 65_535],
-            max_group_size: Some([1024, 1024, 64]),
-            max_group_threads: Some(1024),
-            max_shared_bytes: Some(32_768),
+            workgroup: WorkgroupContract::Dynamic {
+                max_size: [1024, 1024, 64],
+                max_threads: 1024,
+                max_shared_bytes: 32_768,
+            },
             max_param_bytes: Some(4096),
         }
     }
@@ -278,9 +317,7 @@ mod tests {
         let vulkan = DirectLaunchContract {
             max_buffer_slots: None,
             max_grid: [65_535, 65_535, 65_535],
-            max_group_size: None,
-            max_group_threads: None,
-            max_shared_bytes: None,
+            workgroup: WorkgroupContract::FixedInPipeline,
             max_param_bytes: Some(256 << 10),
         };
         let vk_request = DirectLaunchRequest {
@@ -381,6 +418,44 @@ mod tests {
         let error = contract.validate(&request).unwrap_err();
         assert!(
             matches!(error, ExecutionError::SubmissionFailed(ref msg) if msg.contains("parameter bytes")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_workgroup_contract_mismatch() {
+        let dynamic = sample_contract();
+        let mut missing_group = sample_request();
+        missing_group.group = None;
+        let error = dynamic.validate(&missing_group).unwrap_err();
+        assert!(
+            matches!(error, ExecutionError::SubmissionFailed(ref msg) if msg.contains("omits workgroup")),
+            "unexpected error: {error:?}"
+        );
+
+        let fixed = DirectLaunchContract {
+            max_buffer_slots: None,
+            max_grid: [65_535, 65_535, 65_535],
+            workgroup: WorkgroupContract::FixedInPipeline,
+            max_param_bytes: Some(256 << 10),
+        };
+        let error = fixed.validate(&sample_request()).unwrap_err();
+        assert!(
+            matches!(error, ExecutionError::SubmissionFailed(ref msg) if msg.contains("fixes workgroup size")),
+            "unexpected error: {error:?}"
+        );
+
+        let shared_on_fixed = DirectLaunchRequest {
+            buffer_slots: 0,
+            grid: LaunchGrid::Direct([1, 1, 1]),
+            group: None,
+            static_shared_bytes: 0,
+            dynamic_shared_bytes: 64,
+            param_bytes: 0,
+        };
+        let error = fixed.validate(&shared_on_fixed).unwrap_err();
+        assert!(
+            matches!(error, ExecutionError::SubmissionFailed(ref msg) if msg.contains("fixes shared memory")),
             "unexpected error: {error:?}"
         );
     }

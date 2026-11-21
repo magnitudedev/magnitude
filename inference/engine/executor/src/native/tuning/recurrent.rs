@@ -485,7 +485,9 @@ impl RecurrentState {
         match inputs.operator(&self.shape.scopes)? {
             Operator::GatedDelta(delta) => Ok(RecurrentCodes {
                 grouped: matches!(delta.head_mapping, RecurrentHeadMapping::Grouped),
-                gate_function: gated_delta::gate_function(delta),
+                gate_function: gated_delta::AdmittedGateFunction::admit(delta.output_gate.function)
+                    .map_err(|error| error.to_string())?
+                    .code(),
                 key_norm_epsilon: delta.key_norm_epsilon as f32,
             }),
             other => Err(format!("a {} layer has no recurrent mixer", other.name())),
@@ -1032,7 +1034,9 @@ impl KimiState {
         let Operator::GatedDelta(delta) = inputs.operator(&self.0.shape.scopes)? else {
             unreachable!("the recurrent codes are a gated delta layer's")
         };
-        let decay_lower = gated_delta::decay_lower(delta)
+        let decay_lower = gated_delta::admit(delta, delta.norm.epsilon)
+            .map_err(|error| error.to_string())?
+            .decay_lower()
             .expect("a Kimi Delta Attention case's layers have the per-channel decay");
         Ok(KimiCodes {
             recurrent,

@@ -16,7 +16,7 @@ use crate::formation::DirectModule;
 use crate::memory::{Buffer, Range};
 use ash::vk::{self, Handle};
 use seismic_compiler::direct_launch::{
-    DirectLaunchContract, DirectLaunchRequest, LaunchGrid, ValidatedLaunch,
+    DirectLaunchContract, DirectLaunchRequest, LaunchGrid, ValidatedLaunch, WorkgroupContract,
 };
 use seismic_compiler::errors::ExecutionError;
 use seismic_native_target::{GateOpening, ParkAnswer};
@@ -248,9 +248,7 @@ fn validate_launch<'a>(
     let contract = DirectLaunchContract {
         max_buffer_slots: None,
         max_grid: device.info().limits.max_group_count,
-        max_group_size: None,
-        max_group_threads: None,
-        max_shared_bytes: None,
+        workgroup: WorkgroupContract::FixedInPipeline,
         max_param_bytes: Some(ARGUMENT_CHUNK_BYTES),
     };
     let request = DirectLaunchRequest {
