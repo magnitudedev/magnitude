@@ -3739,6 +3739,33 @@ fn routes_over_a_multiple_of_101_slots_draw_distinct_experts_per_row() {
     }
 }
 
+/// Synthetic routes use canonical Zipf locality (`1 / (r + 1)`), so a
+/// multi-row decode batch (`M=8, E=512, K=10`, Qwen3.8-Flash-Next verify
+/// shape) shares hot experts across rows rather than touching nearly every
+/// slot once (`M * K = 80`).
+#[test]
+fn routes_share_hot_experts_across_multi_row_decode() {
+    let (rows, selected) = (8, 10);
+    let shape = super::routed::RoutedShape {
+        hidden: 128,
+        experts: 512,
+        selected,
+        features: 128,
+        shared: 0,
+    };
+    let table = super::routed::routes(rows, shape);
+    assert_eq!(table.len() as u64, rows * selected);
+    for row in table.chunks(selected as usize) {
+        let distinct = row.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(distinct.len(), row.len(), "a row's experts are distinct: {row:?}");
+    }
+    let unique = table.iter().collect::<std::collections::BTreeSet<_>>().len();
+    assert!(
+        (selected as usize + 1..=60).contains(&unique),
+        "expected realistic multi-row expert sharing well below M*K=80, got {unique}"
+    );
+}
+
 /// A search of a streamed load forms and runs every streamed tuning case
 /// on the device, its all-defaults configuration included, over operands
 /// bound as a step binds them: the fused route (`routed_route_streamed`)

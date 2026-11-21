@@ -87,7 +87,7 @@ pub(crate) fn grouped_pass_points(limits: TuningLimits) -> Vec<PointShape> {
 /// Distinct experts per row with the uneven expert loads of real routing: the
 /// expert of popularity rank r is (p r) mod E, p the first of 101, 103 and 107
 /// that E is no multiple of (a permutation: p is prime; a bank's slot count
-/// may be a multiple of 101), with popularity 1 / sqrt(r + 1),
+/// may be a multiple of 101), with canonical Zipf popularity 1 / (r + 1),
 /// and each row draws its choices by popularity without replacement from a
 /// fixed-seed generator. A grouped point then holds blocks of every live-row
 /// count, from one row to full tiles, and experts with no rows.
@@ -98,7 +98,7 @@ pub(crate) fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
         .find(|prime| experts % prime != 0)
         .expect("an expert count is a multiple of none of 101, 103 and 107");
     let popularity = (0..experts)
-        .map(|rank| 1.0 / ((rank + 1) as f64).sqrt())
+        .map(|rank| 1.0 / (rank + 1) as f64)
         .collect::<Vec<_>>();
     let total = popularity.iter().sum::<f64>();
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
