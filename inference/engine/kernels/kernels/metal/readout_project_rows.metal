@@ -87,12 +87,29 @@ kernel void readout_project_rows_stage(PROJECTION_ARGUMENTS,
 }
 #endif
 
+// A selection's logit, or -inf for a selection past the vocabulary (which
+// the GEMV read as row 0).
+#ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GATHER_CHOICE
+struct SelectedLogits {
+    projection::scaling<(SEISMIC_DIM_WS != 0)>::type<projection::Logits> logits;
+    device const int *selected;
+    ulong selected_stride;
+    ulong vocab;
+    element::Out<element::F32> row;
+    ulong row_stride;
+    void store(uint m, uint n, float value) const {
+        if (ulong(selected[ulong(n) * selected_stride]) < vocab)
+            logits.store(m, n, value);
+        else
+            row.put(ulong(n) * row_stride, -INFINITY);
+    }
+};
+
 // The routed projection's `choice` over row m's selected rows (choice k of
 // I): threadgroup x a tile of SIMDGROUPS x 32 / LANES lane groups of ROWS
 // selected rows, the K1 GEMV of the feature row against them. A selection
-// past the vocabulary reads row 0 (`PROJECTION_TABLE_ROWS`), and once the tile's
-// logits are stored its logit is -inf.
-#ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GATHER_CHOICE
+// past the vocabulary reads row 0 (`PROJECTION_TABLE_ROWS`) and emits -inf
+// through `SelectedLogits`.
 template <uint GATHER_ROWS, uint GATHER_LANES>
 kernel void readout_project_rows_gather_choice(PROJECTION_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
@@ -112,15 +129,12 @@ kernel void readout_project_rows_gather_choice(PROJECTION_ARGUMENTS,
     projection::Weights<packets::W0> w{{weight, KERNEL_W0_LAYOUT(d), d}, selected, 0,
         SEISMIC_TOKEN_ROWS_STRIDE_2};
     const element::Out<element::F32> row = element::Out<element::F32>(logits_cells).offset(m * SEISMIC_RESULT_0_STRIDE_0);
-    const auto out = READOUT_LOGITS(row);
+    const SelectedLogits out{READOUT_LOGITS(row), selected, SEISMIC_TOKEN_ROWS_STRIDE_2, SEISMIC_DIM_V, row,
+        SEISMIC_RESULT_0_STRIDE_1};
     PROJECTION_OPERANDS_SHARED(globals, NVFP4);
     const auto x = Operands::rows(in, 1u, d, globals, simdgroups, sg, lane);
     projection::gemv_runtime<packets::W0, GATHER_ROWS, 1, GATHER_LANES>(
         x, out, w, 1u, s, d, tile, shared, simdgroups, sg, lane);
-    threadgroup_barrier(mem_flags::mem_device);
-    for (uint n = tile * span + sg * 32u + lane; n < min(s, (tile + 1u) * span); n += simdgroups * 32u)
-        if (ulong(selected[ulong(n) * SEISMIC_TOKEN_ROWS_STRIDE_2]) >= SEISMIC_DIM_V)
-            row.put(ulong(n) * SEISMIC_RESULT_0_STRIDE_1, -INFINITY);
 }
 #endif
 
