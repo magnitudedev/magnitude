@@ -1136,10 +1136,9 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let mut kernel = self.builder.portable_kernel();
         let source = stored_view_in_kernel(&mut kernel, &source, false);
         let destination = stored_view_in_kernel(&mut kernel, &destination, true);
-        let mut logical_base = None;
-        if let Some(domain) = parallel_domain {
-            let (linear, base) = logical_global_id(&mut kernel, true, domain.parallel_extent);
-            logical_base = base;
+        let launch = if let Some(domain) = parallel_domain {
+            let (linear, logical_base) =
+                logical_global_id(&mut kernel, true, domain.parallel_extent);
             let extent = kernel.nat_arg(domain.parallel_extent);
             let active = kernel.cmp(CmpOp::Lt, linear, extent);
             let axis_values = axes
@@ -1156,6 +1155,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 },
                 |_| Vec::new(),
             );
+            Some((domain, logical_base))
         } else {
             nested(
                 &mut kernel,
@@ -1167,9 +1167,10 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                     kernel.tensor_write(&destination, index, value);
                 },
             );
-        }
+            None
+        };
         let kernel = kernel.close();
-        if let Some(domain) = parallel_domain {
+        if let Some((domain, logical_base)) = launch {
             self.launch_semantic(kernel, domain, logical_base);
         } else {
             self.builder.schedule().launch_sequential(kernel);
@@ -1204,16 +1205,22 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 .collect::<Vec<_>>(),
             _ => panic!("whole-tensor intrinsic requires an owned tensor result"),
         };
-        let scalar_target = match signature.result {
-            registry::IntrinsicResultType::Scalar(_) => Some(self.output_target(output)),
-            _ => None,
-        };
-        let owned_target = match signature.result {
-            registry::IntrinsicResultType::Owned { .. } => Some(
-                self.builder
-                    .portable_allocate_tensor_axes(output, axes.clone()),
-            ),
-            _ => None,
+        let result_target = match &signature.result {
+            registry::IntrinsicResultType::Scalar(_) => {
+                IntrinsicTarget::Scalar(self.output_target(output))
+            }
+            registry::IntrinsicResultType::Owned { .. } => {
+                let view = self
+                    .builder
+                    .portable_allocate_tensor_axes(output, axes.clone());
+                let rank = u32::try_from(self.builder.portable_layout(view).extents.len())
+                    .expect("semantic tensor rank exceeds u32::MAX");
+                IntrinsicTarget::Owned { view, rank }
+            }
+            registry::IntrinsicResultType::Void => IntrinsicTarget::Void,
+            registry::IntrinsicResultType::Opaque { .. } => {
+                panic!("opaque intrinsic results are not admitted by the active registry")
+            }
         };
         let mut prepared = Vec::with_capacity(inputs.len());
         for (value, argument) in inputs.iter().zip(&signature.arguments) {
@@ -1238,10 +1245,6 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 }
             });
         }
-        let destination_rank = owned_target.map(|view| {
-            u32::try_from(self.builder.portable_layout(view).extents.len())
-                .expect("semantic tensor rank exceeds u32::MAX")
-        });
         let one = self.builder.arena().nat(1);
         let zero = self.builder.arena().nat(0);
         let parallel_extent = self.builder.arena().nat_product(&axes);
@@ -1302,18 +1305,14 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             };
             operands.push(operand);
         }
-        let destination = owned_target.map(|view| {
-            let place = kernel.arg_view(view, true);
-            {
+        let destination = match &result_target {
+            IntrinsicTarget::Owned { view, rank } => {
+                let place = kernel.arg_view(*view, true);
                 let tensor = kernel.tensor(place);
-                kernel.semantic_place(
-                    tensor,
-                    view.representation(),
-                    destination_rank.expect("owned intrinsic has no destination rank"),
-                    true,
-                )
+                Some(kernel.semantic_place(tensor, view.representation(), *rank, true))
             }
-        });
+            IntrinsicTarget::Scalar(_) | IntrinsicTarget::Void => None,
+        };
         let call = SemanticIntrinsicCall {
             signature,
             operands: &operands,
@@ -1322,15 +1321,16 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let mut sink = SemanticIntrinsicSink::open(&mut kernel, &call);
         (implementation.lower)(target, &domain, call, &mut sink);
         let result = sink.finish();
-        match (result, scalar_target.as_ref()) {
+        match (result, &result_target) {
             (
                 SemanticIntrinsicResult::Scalar(value),
-                Some(Bound::Scalar(ScalarBinding::Published(slot))),
+                IntrinsicTarget::Scalar(Bound::Scalar(ScalarBinding::Published(slot))),
             ) => {
                 let destination = kernel.result_slot(*slot);
                 kernel.store_slot(destination, value.value());
             }
-            (SemanticIntrinsicResult::Owned(_), None) | (SemanticIntrinsicResult::Void, None) => {}
+            (SemanticIntrinsicResult::Owned(_), IntrinsicTarget::Owned { .. })
+            | (SemanticIntrinsicResult::Void, IntrinsicTarget::Void) => {}
             (SemanticIntrinsicResult::Opaque(_), _) => {
                 panic!("opaque intrinsic results are not admitted by the active registry")
             }
@@ -1338,30 +1338,14 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         }
         let kernel = kernel.close();
         self.launch_semantic(kernel, domain, None);
-        match signature.result {
-            registry::IntrinsicResultType::Scalar(_) => {
-                self.values.bind(
-                    self.builder.bindings_mut(),
-                    output,
-                    scalar_target.expect("scalar intrinsic has a target"),
-                );
+        let bound = match result_target {
+            IntrinsicTarget::Scalar(bound) => bound,
+            IntrinsicTarget::Owned { view, .. } => {
+                self.stored_allocation(output, view, InitializationState::full())
             }
-            registry::IntrinsicResultType::Owned { .. } => {
-                let bound = self.stored_allocation(
-                    output,
-                    owned_target.expect("owned intrinsic has a target"),
-                    InitializationState::full(),
-                );
-                self.values.bind(self.builder.bindings_mut(), output, bound);
-            }
-            registry::IntrinsicResultType::Void => {
-                self.values
-                    .bind(self.builder.bindings_mut(), output, Bound::Unit);
-            }
-            registry::IntrinsicResultType::Opaque { .. } => {
-                panic!("opaque intrinsic results are not admitted by the active registry")
-            }
-        }
+            IntrinsicTarget::Void => Bound::Unit,
+        };
+        self.values.bind(self.builder.bindings_mut(), output, bound);
     }
 
     fn lower_copy(&mut self, input: SemanticValueId, output: SemanticValueId) {
@@ -1701,14 +1685,14 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             &mut InitializationContext::new(self.builder.arena()),
             &point,
         );
-        let mut args = indices
+        let index_args = indices
             .iter()
             .map(|value| PreparedArg::Index(self.scalar_ref_nat(&ScalarRef::Value(*value))))
             .collect::<Vec<_>>();
-        args.push(self.prepared(&self.bound(value)));
+        let value_arg = self.prepared(&self.bound(value));
         let mut kernel = self.builder.portable_kernel();
         let place = stored_view_in_kernel(&mut kernel, &base, true);
-        let value = Self::kernel_arg(&mut kernel, args.pop().expect("write has no value"));
+        let value = Self::kernel_arg(&mut kernel, value_arg);
         let destination_type = value_type(element_dtype(base.backing().representation()));
         let value = if value.ty() != destination_type {
             // Checked element assignment permits the language's explicit
@@ -1718,7 +1702,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         } else {
             value
         };
-        let indices = args
+        let indices = index_args
             .into_iter()
             .map(|arg| {
                 let value = Self::kernel_arg(&mut kernel, arg);
@@ -1839,25 +1823,18 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         inputs: &[SemanticValueId],
         out: SemanticValueId,
     ) {
-        let input_bounds = inputs
+        let prepared_inputs = inputs
             .iter()
-            .map(|value| self.bound(*value))
-            .collect::<Vec<_>>();
-        let scalar_args = input_bounds
-            .iter()
-            .map(|bound| match bound {
-                Bound::Scalar(_) => Some(self.prepared(bound)),
-                _ => None,
+            .map(|value| match self.bound(*value) {
+                Bound::Tensor(tensor) => ElementwisePrepared::Tensor(tensor.stored()),
+                bound @ Bound::Scalar(_) => ElementwisePrepared::Scalar(self.prepared(&bound)),
+                _ => panic!("elementwise input is neither tensor nor scalar"),
             })
             .collect::<Vec<_>>();
-        let input_axes = input_bounds
-            .iter()
-            .map(|bound| match bound {
-                Bound::Tensor(value) => Some(value.stored().extents().to_vec()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let axes = self.broadcast_axes(input_axes.iter().flatten().map(Vec::as_slice));
+        let axes = self.broadcast_axes(prepared_inputs.iter().filter_map(|input| match input {
+            ElementwisePrepared::Tensor(view) => Some(view.extents()),
+            ElementwisePrepared::Scalar(_) => None,
+        }));
         let destination = self
             .builder
             .portable_allocate_tensor_axes(out, axes.clone());
@@ -1872,48 +1849,48 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let mut kernel = self.builder.portable_kernel();
         let status_words = segment_check_statuses(&mut kernel, &checks, &statuses);
         let output = kernel.arg_view(destination, true);
-        let places = input_bounds
-            .iter()
-            .map(|bound| match bound {
-                Bound::Tensor(value) => {
-                    Some(stored_view_in_kernel(&mut kernel, &value.stored(), false))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let scalars = scalar_args
+        let kernel_inputs = prepared_inputs
             .into_iter()
-            .map(|arg| arg.map(|arg| Self::kernel_arg(&mut kernel, arg)))
+            .map(|input| match input {
+                ElementwisePrepared::Tensor(view) => {
+                    let place = stored_view_in_kernel(&mut kernel, &view, false);
+                    ElementwiseInput::Tensor {
+                        place,
+                        axes: view.extents().to_vec(),
+                    }
+                }
+                ElementwisePrepared::Scalar(arg) => {
+                    ElementwiseInput::Scalar(Self::kernel_arg(&mut kernel, arg))
+                }
+            })
             .collect::<Vec<_>>();
         let mut emit =
             |kernel: &mut PortableBuilder<'_, B>, index: &[PortableValue], alive: PortableValue| {
                 kernel.branch(
                     alive,
                     |kernel| {
-                        let mut args = Vec::new();
-                        for ((place, scalar), source_axes) in
-                            places.iter().zip(&scalars).zip(&input_axes)
-                        {
-                            if let Some(place) = place {
-                                let source_axes =
-                                    source_axes.as_ref().expect("tensor input has no axes");
-                                let skip = index.len() - source_axes.len();
-                                let source_index = index[skip..]
-                                    .iter()
-                                    .zip(source_axes)
-                                    .map(|(value, extent)| {
-                                        let extent = kernel.nat_arg(*extent);
-                                        let one = kernel.index_constant(1);
-                                        let zero = kernel.index_constant(0);
-                                        let singleton = kernel.cmp(CmpOp::Eq, extent, one);
-                                        kernel.select(singleton, zero, *value)
-                                    })
-                                    .collect::<Vec<_>>();
-                                args.push(kernel.tensor_read(place, &source_index));
-                            } else {
-                                args.push(
-                                    scalar.expect("elementwise input is neither tensor nor scalar"),
-                                );
+                        let mut args = Vec::with_capacity(kernel_inputs.len());
+                        for input in &kernel_inputs {
+                            match input {
+                                ElementwiseInput::Tensor {
+                                    place,
+                                    axes: source_axes,
+                                } => {
+                                    let skip = index.len() - source_axes.len();
+                                    let source_index = index[skip..]
+                                        .iter()
+                                        .zip(source_axes)
+                                        .map(|(value, extent)| {
+                                            let extent = kernel.nat_arg(*extent);
+                                            let one = kernel.index_constant(1);
+                                            let zero = kernel.index_constant(0);
+                                            let singleton = kernel.cmp(CmpOp::Eq, extent, one);
+                                            kernel.select(singleton, zero, *value)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    args.push(kernel.tensor_read(place, &source_index));
+                                }
+                                ElementwiseInput::Scalar(scalar) => args.push(*scalar),
                             }
                         }
                         let (value, successful) = source_scalar::lower(
@@ -1940,10 +1917,9 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 )[0]
             };
         let alive = kernel.constant(ConstantValue::Bool(true), ValueType::Bool);
-        let mut logical_base = None;
-        if let Some(domain) = parallel_domain {
-            let (linear, base) = logical_global_id(&mut kernel, true, domain.parallel_extent);
-            logical_base = base;
+        let launch = if let Some(domain) = parallel_domain {
+            let (linear, logical_base) =
+                logical_global_id(&mut kernel, true, domain.parallel_extent);
             let extent = kernel.nat_arg(domain.parallel_extent);
             let active = kernel.cmp(CmpOp::Lt, linear, extent);
             let axis_values = axes
@@ -1959,15 +1935,17 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 },
                 |_| Vec::new(),
             );
+            Some((domain, logical_base))
         } else {
             let axes = axes
                 .iter()
                 .map(|axis| kernel.nat_arg(*axis))
                 .collect::<Vec<_>>();
             source_scalar::nested(&mut kernel, &axes, 0, &mut Vec::new(), alive, &mut emit);
-        }
+            None
+        };
         let kernel = kernel.close();
-        if let Some(domain) = parallel_domain {
+        if let Some((domain, logical_base)) = launch {
             self.launch_semantic(kernel, domain, logical_base);
         } else {
             self.builder.schedule().launch_sequential(kernel);
@@ -2180,12 +2158,13 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let source =
             instantiate_stream_tensor(&mut kernel, &source_plan, bindings, &self.values.selections);
         let output = match &destination {
-            Bound::Tensor(value) => Some(stored_view_in_kernel(&mut kernel, &value.stored(), true)),
-            _ => None,
-        };
-        let scalar_output = match &destination {
-            Bound::Scalar(ScalarBinding::Published(slot)) => Some(kernel.result_slot(*slot)),
-            _ => None,
+            Bound::Tensor(value) => {
+                ReductionOutput::Tensor(stored_view_in_kernel(&mut kernel, &value.stored(), true))
+            }
+            Bound::Scalar(ScalarBinding::Published(slot)) => {
+                ReductionOutput::Scalar(kernel.result_slot(*slot))
+            }
+            _ => panic!("reduction destination is neither tensor nor published scalar slot"),
         };
         let emit = |kernel: &mut PortableBuilder<'_, B>, outer: &[PortableValue]| {
             let zero = kernel.index_constant(0);
@@ -2240,17 +2219,14 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             } else {
                 result[0]
             };
-            if let Some(output) = &output {
-                kernel.tensor_write(output, outer, value);
-            } else {
-                kernel.store_slot(
-                    scalar_output.expect("scalar reduction has a publication slot"),
-                    value,
-                );
+            match &output {
+                ReductionOutput::Tensor(output) => kernel.tensor_write(output, outer, value),
+                ReductionOutput::Scalar(slot) => kernel.store_slot(*slot, value),
             }
         };
-        let logical_base = if let Some(domain) = domain {
-            let (linear, base) = logical_global_id(&mut kernel, true, domain.parallel_extent);
+        let launch = if let Some(domain) = domain {
+            let (linear, logical_base) =
+                logical_global_id(&mut kernel, true, domain.parallel_extent);
             let extent = kernel.nat_arg(domain.parallel_extent);
             let active = kernel.cmp(CmpOp::Lt, linear, extent);
             let axis_values = output_axes
@@ -2266,13 +2242,13 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 },
                 |_| Vec::new(),
             );
-            base
+            Some((domain, logical_base))
         } else {
             nested(&mut kernel, &output_axes, 0, &mut Vec::new(), &mut { emit });
             None
         };
         let kernel = kernel.close();
-        if let Some(domain) = domain {
+        if let Some((domain, logical_base)) = launch {
             self.launch_semantic(kernel, domain, logical_base);
         } else {
             self.builder.schedule().launch_sequential(kernel);
@@ -3472,6 +3448,30 @@ pub(crate) enum PreparedArg {
 enum IntrinsicPrepared {
     Scalar(PreparedArg, DType, bool),
     Place(StoredView, seismic_lang::ids::RepresentationId, u32, bool),
+}
+
+enum IntrinsicTarget {
+    Scalar(Bound),
+    Owned { view: AnyBufferView, rank: u32 },
+    Void,
+}
+
+enum ElementwisePrepared {
+    Tensor(StoredView),
+    Scalar(PreparedArg),
+}
+
+enum ElementwiseInput {
+    Tensor {
+        place: PortableTensor,
+        axes: Vec<NatExpr>,
+    },
+    Scalar(PortableValue),
+}
+
+enum ReductionOutput {
+    Tensor(PortableTensor),
+    Scalar(u32),
 }
 
 fn merge_exact<T: Copy + PartialEq>(slot: &mut Option<T>, value: Option<T>, what: &str) {
