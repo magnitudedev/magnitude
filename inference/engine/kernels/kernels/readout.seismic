@@ -530,6 +530,7 @@ native readout_refine_rows for cuda from "cuda/readout_refine_rows.cu":
         params (WARPS in [8, 4, 2] default 8)
         threadgroups (ceil_div(V, WARPS * 32), 1, 1)
         threads_per_threadgroup (WARPS * 32, 1, 1)
+        shared_bytes (min(O * D * 2, 16384))
 
 native readout_exact_rows for cuda from "cuda/readout_exact_rows.cu":
     static (V, D, P)
@@ -537,6 +538,7 @@ native readout_exact_rows for cuda from "cuda/readout_exact_rows.cu":
         params (WARPS in [8, 4, 2] default 8)
         threadgroups (ceil_div(V, WARPS * 32), 1, 1)
         threads_per_threadgroup (WARPS * 32, 1, 1)
+        shared_bytes (min(O * D * 2, 16384))
 
 # CUDA: the `dense` projection's `planes` form (`dense.seismic`), single,
 # onto the exact codes, by the routine the exact level's gather shares.
