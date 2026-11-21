@@ -6,7 +6,129 @@ use super::super::{
     Supply, Widened, WiredFigures, WiredLimit,
 };
 use super::{capacity, sysctl_always, sysctl_count, Sys};
+use std::ffi::{c_char, c_void};
 use std::time::{Duration, Instant};
+
+type CFTypeRef = *const c_void;
+type IoObject = u32;
+
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+    fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> IoObject;
+    fn IORegistryEntryCreateCFProperty(
+        entry: IoObject,
+        key: CFTypeRef,
+        allocator: CFTypeRef,
+        options: u32,
+    ) -> CFTypeRef;
+    fn IOObjectRelease(object: IoObject) -> i32;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFStringCreateWithCString(
+        allocator: CFTypeRef,
+        text: *const c_char,
+        encoding: u32,
+    ) -> CFTypeRef;
+    fn CFGetTypeID(value: CFTypeRef) -> usize;
+    fn CFDictionaryGetTypeID() -> usize;
+    fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+    fn CFNumberGetTypeID() -> usize;
+    fn CFNumberGetValue(number: CFTypeRef, kind: isize, value: *mut c_void) -> u8;
+    fn CFRelease(value: CFTypeRef);
+}
+
+/// `kIOMainPortDefault`.
+const MAIN_PORT: u32 = 0;
+/// `kCFStringEncodingUTF8`.
+const UTF8: u32 = 0x0800_0100;
+/// `kCFNumberSInt64Type`.
+const SINT64: isize = 4;
+
+struct IoGuard(IoObject);
+
+impl Drop for IoGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a non-zero owned `io_object_t`.
+        unsafe {
+            let _ = IOObjectRelease(self.0);
+        }
+    }
+}
+
+struct CfGuard(CFTypeRef);
+
+impl Drop for CfGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a non-null owned `CFTypeRef`.
+        unsafe {
+            CFRelease(self.0);
+        }
+    }
+}
+
+/// Apple Silicon IOGPU's `"In use system memory"` from IORegistry
+/// `AGXAccelerator` → `PerformanceStatistics`, in bytes.
+///
+/// On Apple Silicon, `recommendedMaxWorkingSetSize` / `iogpu.wired_limit_mb`
+/// caps the IOGPU subsystem's wired allocations alone (macOS reserves the
+/// remainder of RAM for XNU kernel wired pages). Reading IOGPU's in-use system
+/// memory excludes XNU kernel wired pages that do not count against the GPU
+/// wired ceiling; returns `None` where `AGXAccelerator` or the property is
+/// unavailable (e.g. Intel Mac or VM).
+pub(super) fn iogpu_in_use_memory() -> Option<u64> {
+    // SAFETY: each IOKit and CoreFoundation call receives valid arguments per
+    // its documentation; `IOServiceGetMatchingService` consumes the matching
+    // dictionary, and every owned `io_object_t` / `CFTypeRef` is wrapped in a
+    // drop guard immediately upon creation.
+    unsafe {
+        let matching = IOServiceMatching(c"AGXAccelerator".as_ptr());
+        if matching.is_null() {
+            return None;
+        }
+        let service = IOServiceGetMatchingService(MAIN_PORT, matching);
+        if service == 0 {
+            return None;
+        }
+        let service = IoGuard(service);
+
+        let stats_key =
+            CFStringCreateWithCString(std::ptr::null(), c"PerformanceStatistics".as_ptr(), UTF8);
+        if stats_key.is_null() {
+            return None;
+        }
+        let stats_key = CfGuard(stats_key);
+
+        let stats = IORegistryEntryCreateCFProperty(service.0, stats_key.0, std::ptr::null(), 0);
+        if stats.is_null() {
+            return None;
+        }
+        let stats = CfGuard(stats);
+        if CFGetTypeID(stats.0) != CFDictionaryGetTypeID() {
+            return None;
+        }
+
+        let mem_key =
+            CFStringCreateWithCString(std::ptr::null(), c"In use system memory".as_ptr(), UTF8);
+        if mem_key.is_null() {
+            return None;
+        }
+        let mem_key = CfGuard(mem_key);
+
+        // Borrowed from `stats`; stays valid until `stats` is dropped.
+        let value = CFDictionaryGetValue(stats.0, mem_key.0);
+        if value.is_null() || CFGetTypeID(value) != CFNumberGetTypeID() {
+            return None;
+        }
+        let mut bytes = 0i64;
+        if CFNumberGetValue(value, SINT64, (&raw mut bytes).cast()) == 0 {
+            return None;
+        }
+        u64::try_from(bytes).ok()
+    }
+}
 
 /// XNU's `HOST_STATISTICS_TIME_WINDOW` (`osfmk/kern/host.c`): within a
 /// window of it, once ordinary processes have asked a flavor more often than
@@ -396,7 +518,13 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
         }),
         wired: wired_limit.map(|limit| WiredFigures {
             limit,
-            wire_count: pages(u64::from(statistics.wire_count)),
+            // Prefer IOGPU's `"In use system memory"` over machine-wide
+            // `vm_statistics64.wire_count` so XNU kernel wired pages are not
+            // double-charged against the IOGPU wired ceiling; fall back to
+            // `vm_statistics64.wire_count` where `AGXAccelerator` is absent.
+            wire_count: sys
+                .iogpu_in_use_memory()
+                .unwrap_or_else(|| pages(u64::from(statistics.wire_count))),
         }),
         harm: Some(Harm {
             machine: statistics.decompressions.saturating_add(statistics.swapins),

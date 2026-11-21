@@ -323,8 +323,12 @@ pub struct ColdPages {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WiredFigures {
     pub limit: WiredLimit,
-    /// Bytes wired machine-wide, ours included (`wire_count`): a counter
-    /// ([`Counted`]).
+    /// Bytes wired against the GPU's wired ceiling, ours included: on Apple
+    /// Silicon, IOGPU's `AGXAccelerator` `PerformanceStatistics`
+    /// `"In use system memory"` (excluding XNU kernel wired pages that do not
+    /// count against `iogpu.wired_limit_mb` / `recommendedMaxWorkingSetSize`),
+    /// falling back to machine-wide `vm_statistics64.wire_count` where
+    /// `AGXAccelerator` is unavailable.
     pub wire_count: u64,
 }
 

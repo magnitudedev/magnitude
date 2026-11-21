@@ -18,6 +18,8 @@ struct Mac {
     sysctls: BTreeMap<String, Vec<u8>>,
     parallelism: NonZeroUsize,
     profiler_json: Option<Vec<u8>>,
+    vm_wire_count: u32,
+    iogpu_in_use: Option<u64>,
 }
 
 impl Mac {
@@ -27,6 +29,8 @@ impl Mac {
             sysctls: BTreeMap::new(),
             parallelism: NonZeroUsize::MIN,
             profiler_json: None,
+            vm_wire_count: 0,
+            iogpu_in_use: None,
         }
         .count("hw.memsize", 64 * GB)
     }
@@ -58,7 +62,10 @@ impl Sys for Mac {
         self.sysctls.get(name).cloned()
     }
     fn vm_statistics(&self) -> libc::vm_statistics64 {
-        unsafe { std::mem::zeroed() }
+        libc::vm_statistics64 {
+            wire_count: self.vm_wire_count,
+            ..unsafe { std::mem::zeroed() }
+        }
     }
     fn task_vm(&self) -> TaskVm {
         TaskVm::default()
@@ -71,6 +78,9 @@ impl Sys for Mac {
     }
     fn hardware_profiler_json(&self) -> Option<Vec<u8>> {
         self.profiler_json.clone()
+    }
+    fn iogpu_in_use_memory(&self) -> Option<u64> {
+        self.iogpu_in_use
     }
 }
 
@@ -424,4 +434,53 @@ fn the_host_sample_reads_within_the_machine() {
         "macOS reports the task's compressed bytes"
     );
     assert!(sample.counted.at <= Instant::now() && sample.counted.lag <= STATISTICS_WINDOW);
+}
+
+/// `WiredFigures::wire_count` prefers IOGPU's `"In use system memory"` when
+/// available and falls back to `vm_statistics64.wire_count` otherwise.
+#[test]
+fn wired_count_prefers_iogpu_in_use_memory_and_falls_back_to_vm_wire_count() {
+    let base = Mac::new().counts(&[
+        ("vm.page_free_count", 100_000),
+        ("vm.vm_page_free_target", 4_000),
+        ("iogpu.wired_limit_mb", 0),
+    ]);
+    let with_iogpu = Mac {
+        vm_wire_count: 120_000,
+        iogpu_in_use: Some(256 << 20),
+        ..base
+    };
+    let wired = sample(&with_iogpu)
+        .wired
+        .expect("iogpu.wired_limit_mb reports wired figures");
+    assert_eq!(wired.limit, WiredLimit::OsDefault);
+    assert_eq!(wired.wire_count, 256 << 20);
+
+    let fallback = Mac {
+        iogpu_in_use: None,
+        ..with_iogpu
+    };
+    let wired_fallback = sample(&fallback)
+        .wired
+        .expect("fallback still reports wired figures");
+    assert_eq!(wired_fallback.wire_count, 120_000 * (16 << 10));
+}
+
+/// On Apple Silicon, IORegistry `AGXAccelerator` → `PerformanceStatistics` →
+/// `"In use system memory"` returns `Some(bytes)` strictly below machine-wide
+/// `vm_statistics64.wire_count` (excluding XNU kernel wired pages).
+#[test]
+fn iogpu_in_use_memory_excludes_kernel_wired_pages() {
+    let stats = LiveSys.vm_statistics();
+    let vm_wired = u64::from(stats.wire_count) * LiveSys.page();
+    let iogpu = LiveSys.iogpu_in_use_memory();
+    if cfg!(target_arch = "aarch64") && wired_limit(&LiveSys).is_some() {
+        let bytes = iogpu.expect("Apple Silicon AGXAccelerator reports In use system memory");
+        assert!(
+            bytes < vm_wired,
+            "IOGPU in-use system memory ({bytes}) should be less than machine-wide vm_statistics64.wire_count ({vm_wired})"
+        );
+    } else if let Some(bytes) = iogpu {
+        assert!(bytes < vm_wired);
+    }
 }
