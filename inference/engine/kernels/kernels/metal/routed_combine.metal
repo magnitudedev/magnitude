@@ -302,6 +302,35 @@ kernel void routed_combine_down_unpacked(COMBINE_ARGUMENTS, PROJECTION_TILE_ARGU
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_COMBINE
+// Exact unsigned 32-bit divmod by a runtime-invariant divisor >= 1:
+// shift/mask for powers of two (`magic == 0`), Granlund-Montgomery `mulhi`
+// reciprocal otherwise.
+struct FastDiv32 {
+    uint d;
+    uint magic;
+    uint shift;
+
+    static inline FastDiv32 make(uint divisor) {
+        const uint s = 31u - metal::clz(divisor);
+        if ((divisor & (divisor - 1u)) == 0u)
+            return FastDiv32{divisor, 0u, s};
+        const ulong rem = (ulong(1) << (s + 1u)) - ulong(divisor);
+        const uint m = uint((rem << 32u) / ulong(divisor)) + 1u;
+        return FastDiv32{divisor, m, s};
+    }
+
+    inline void divmod(uint n, thread uint &q, thread uint &r) const {
+        if (magic == 0u) {
+            q = n >> shift;
+            r = n & (d - 1u);
+        } else {
+            const uint t = metal::mulhi(n, magic);
+            q = (t + ((n - t) >> 1u)) >> shift;
+            r = n - q * d;
+        }
+    }
+};
+
 kernel void routed_combine(COMBINE_ARGUMENTS,
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -315,14 +344,17 @@ kernel void routed_combine(COMBINE_ARGUMENTS,
         return;
     const bool vector = SEISMIC_EXPERT_OUTPUT_STRIDE_2 == 1 && (SEISMIC_EXPERT_OUTPUT_STRIDE_1 & 7u) == 0
         && (SEISMIC_EXPERT_OUTPUT_STRIDE_0 & 7u) == 0;
-    const uint t_dim = uint(SEISMIC_DIM_T);
+    const FastDiv32 tile_div = FastDiv32::make(uint(SEISMIC_DIM_T));
+    device const int *inv_row = inverse + ulong(m) * SEISMIC_INVERSE_STRIDE_0;
+    device const float *score_row = scores + ulong(m) * SEISMIC_SCORES_STRIDE_0;
+    device const S *expert_base = reinterpret_cast<device const S *>(expert_output);
     float4 selected_even = float4(0.0f), selected_odd = float4(0.0f);
     for (uint k = 0; k < SEISMIC_DIM_K; ++k) {
-        const uint position = uint(inverse[m * SEISMIC_INVERSE_STRIDE_0 + k * SEISMIC_INVERSE_STRIDE_1]);
-        const float score = scores[m * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1];
-        const uint bucket = position / t_dim;
-        const uint slot = position - bucket * t_dim;
-        device const S *row = reinterpret_cast<device const S *>(expert_output)
+        const uint position = uint(inv_row[k * SEISMIC_INVERSE_STRIDE_1]);
+        const float score = score_row[k * SEISMIC_SCORES_STRIDE_1];
+        uint bucket, slot;
+        tile_div.divmod(position, bucket, slot);
+        device const S *row = expert_base
             + ulong(bucket) * SEISMIC_EXPERT_OUTPUT_STRIDE_0
             + ulong(slot) * SEISMIC_EXPERT_OUTPUT_STRIDE_1;
         float4 even, odd;
