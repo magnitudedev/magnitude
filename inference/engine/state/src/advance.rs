@@ -133,7 +133,7 @@ impl OwnedCodecAdvance {
                 let claims = match destination
                     .snapshot
                     .store
-                    .reserve_rows(&vec![Tail::NEW; counts.len()], &counts)
+                    .reserve_rows(&vec![Tail::New; counts.len()], &counts)
                 {
                     Ok(claims) => claims,
                     Err(error) => return Err((source, destination, error)),
@@ -867,12 +867,18 @@ impl<'a> Predecessor<'a> {
     fn tails(&self) -> Vec<Tail> {
         self.domains
             .iter()
-            .map(|domain| Tail {
-                end: domain
+            .map(|domain| {
+                match domain
                     .front
                     .end()
-                    .or(domain.ranges.last().map(|(start, count)| start + count)),
-                history: Some(domain.live),
+                    .or_else(|| domain.ranges.last().map(|(start, count)| start + count))
+                {
+                    Some(end) => Tail::Extending {
+                        end,
+                        history: domain.live,
+                    },
+                    None => Tail::New,
+                }
             })
             .collect()
     }

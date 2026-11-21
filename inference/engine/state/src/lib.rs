@@ -387,20 +387,24 @@ impl Arena {
         self.free_page_count() * self.page_rows
     }
 
+    /// `(hole, start, count)` of rows a history ending at `end` can take in
+    /// place within its last page, or `None` if it has no partial last page or
+    /// those rows are not free.
+    fn in_place_hole(&self, end: Option<usize>) -> Option<(usize, usize, usize)> {
+        let end = end.filter(|end| end % self.page_rows != 0)?;
+        let hole = self
+            .free
+            .binary_search_by_key(&end, |&(start, _)| start)
+            .ok()?;
+        let (start, count) = self.free[hole];
+        let rest = self.page_end(start) - start;
+        (count >= rest).then_some((hole, start, rest))
+    }
+
     /// Rows a history ending at `end` can take in place: the free rows that
     /// begin at its end, up to the end of its last page.
     fn in_place(&self, end: Option<usize>) -> usize {
-        let Some(end) = end.filter(|end| end % self.page_rows != 0) else {
-            return 0;
-        };
-        self.free
-            .binary_search_by_key(&end, |&(start, _)| start)
-            .ok()
-            .map_or(0, |hole| {
-                let (start, count) = self.free[hole];
-                let rest = self.page_end(start) - start;
-                if count >= rest { rest } else { 0 }
-            })
+        self.in_place_hole(end).map_or(0, |(_, _, count)| count)
     }
 
     /// Whether a history ending at `end` has a partial last page whose next
@@ -419,19 +423,21 @@ impl Arena {
     /// take it first (sibling forks of one state, which a launch can grow
     /// together).
     fn tail_blocked(&self, tail: Tail) -> bool {
-        self.tail_taken(tail.end)
-            || tail.end.is_some_and(|end| {
-                if end % self.page_rows == 0 {
-                    return false;
-                }
-                let total = self.live_ends.get(&end).copied().unwrap_or(0);
-                let self_counts = tail.history.is_some_and(|id| {
-                    self.entries
-                        .get(&id)
-                        .is_some_and(|entry| entry.live && entry.end() == Some(end))
-                });
-                total > usize::from(self_counts)
-            })
+        let Tail::Extending { end, history } = tail else {
+            return false;
+        };
+        if end % self.page_rows == 0 {
+            return false;
+        }
+        if self.tail_taken(Some(end)) {
+            return true;
+        }
+        let total = self.live_ends.get(&end).copied().unwrap_or(0);
+        let self_counts = self
+            .entries
+            .get(&history)
+            .is_some_and(|entry| entry.live && entry.end() == Some(end));
+        total > usize::from(self_counts)
     }
 
     /// Rows a history ending at `end` can take (see [`Arena::claim`]).
@@ -439,37 +445,40 @@ impl Arena {
         self.in_place(end) + self.available()
     }
 
-    /// The free page a history ending at `end` takes next (see the placement
-    /// rule above). Every maximal contiguous run of free pages within one slab
-    /// lies inside a single coalesced hole in `self.free`.
-    fn next_page(&self, end: Option<usize>) -> usize {
+    /// The `(hole, start)` of the free page a history ending at `end` takes
+    /// next (see the placement rule above). Every maximal contiguous run of
+    /// free pages within one slab lies inside a single coalesced hole in
+    /// `self.free`.
+    fn next_page(&self, end: Option<usize>) -> (usize, usize) {
         if let Some(end) = end.filter(|end| end % self.page_rows == 0) {
             let idx = self.free.partition_point(|&(start, _)| start <= end);
             if idx > 0 {
-                let (start, count) = self.free[idx - 1];
+                let hole = idx - 1;
+                let (start, count) = self.free[hole];
                 if end + self.page_rows <= start + count {
-                    return end;
+                    return (hole, end);
                 }
             }
         }
-        let mut largest: Option<(usize, usize)> = None;
-        for &(start, len) in &self.free {
+        let mut largest: Option<(usize, usize, usize)> = None;
+        for (hole, &(start, len)) in self.free.iter().enumerate() {
             let end = start + len;
             let first = start.next_multiple_of(self.page_rows);
             if first >= end {
                 continue;
             }
             let pages = (end - first) / self.page_rows;
-            if pages > 0 && largest.is_none_or(|(_, count)| pages > count) {
-                largest = Some((first, pages));
+            if pages > 0 && largest.is_none_or(|(_, _, count)| pages > count) {
+                largest = Some((hole, first, pages));
             }
         }
-        let (first, count) = largest.expect("claimed rows never exceed the available rows");
-        if first == 0 {
+        let (hole, first, count) = largest.expect("claimed rows never exceed the available rows");
+        let start = if first == 0 {
             0
         } else {
             first + ((count - 1) / 2) * self.page_rows
-        }
+        };
+        (hole, start)
     }
 
     /// Claim `count` rows, in logical order, for a history whose end is row
@@ -482,17 +491,10 @@ impl Arena {
         let mut remaining = count;
         let mut end = after;
         while remaining > 0 {
-            let in_place = self.in_place(end);
-            let (start, taken) = if in_place > 0 {
-                (end.expect("in-place rows follow a history end"), in_place)
-            } else {
-                (self.next_page(end), self.page_rows)
-            };
-            let hole = self
-                .free
-                .partition_point(|&(hole, _)| hole <= start)
-                .checked_sub(1)
-                .expect("the rows taken are free");
+            let (hole, start, taken) = self.in_place_hole(end).unwrap_or_else(|| {
+                let (hole, start) = self.next_page(end);
+                (hole, start, self.page_rows)
+            });
             debug_assert!(
                 self.free[hole].0 <= start && start < self.free[hole].0 + self.free[hole].1
             );
@@ -773,21 +775,24 @@ pub fn fresh_history_ranges(
         .collect()
 }
 
-/// Where rows grow in one domain: after row `end` (none for a new history's
-/// rows), extending live history `history`, which never contends with itself
-/// for its next row ([`Arena::tail_blocked`]).
+/// Where rows grow in one domain: either a new history with no predecessor
+/// row, or extending a live history after its last row `end` (which never
+/// contends with itself for its next row in [`Arena::tail_blocked`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Tail {
-    end: Option<usize>,
-    history: Option<u64>,
+enum Tail {
+    /// The rows of a new history (or an empty history with no rows yet).
+    New,
+    /// Growing after `end`, belonging to live history `history`.
+    Extending { end: usize, history: u64 },
 }
 
 impl Tail {
-    /// The rows of a new history.
-    const NEW: Self = Self {
-        end: None,
-        history: None,
-    };
+    fn end(self) -> Option<usize> {
+        match self {
+            Self::New => None,
+            Self::Extending { end, .. } => Some(end),
+        }
+    }
 }
 
 /// A history's claims: one reference on each row of its ranges, registered in
@@ -829,11 +834,14 @@ impl Claims {
         self.entry(Entry::end)
     }
 
-    /// Where this history grows: after its last row.
+    /// Where this history grows: after its last row, or as a new history if empty.
     fn tail(&self) -> Tail {
-        Tail {
-            end: self.end(),
-            history: Some(self.id),
+        match self.end() {
+            Some(end) => Tail::Extending {
+                end,
+                history: self.id,
+            },
+            None => Tail::New,
         }
     }
 
@@ -2407,7 +2415,7 @@ impl StateStore {
         self.history_domains()
             .map(|domain| RowDemand {
                 domain,
-                rows: self.page_demand(domain, tails[domain.0].end, counts[domain.0]),
+                rows: self.page_demand(domain, tails[domain.0].end(), counts[domain.0]),
             })
             .collect()
     }
@@ -2438,11 +2446,12 @@ impl StateStore {
             ));
         }
         let mut reserved = Vec::with_capacity(self.domains.len());
-        for ((domain, &count), &Tail { end: after, .. }) in self.domains.iter().zip(counts).zip(tails) {
+        for ((domain, &count), &tail) in self.domains.iter().zip(counts).zip(tails) {
             if count == 0 {
                 reserved.push(Claims::new(&domain.arena, Vec::new()));
                 continue;
             }
+            let after = tail.end();
             let mut arena = domain.arena.borrow_mut();
             let claimable = arena.claimable(after);
             if claimable < count {
