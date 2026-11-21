@@ -1,7 +1,7 @@
 pub(super) use super::super::*;
 pub(super) use super::super::scratch::conveyor_forms;
 pub(super) use super::super::steps::{FailedRows, StepFailure};
-pub(super) use super::super::telemetry::GroupFacts;
+pub(super) use super::super::telemetry::{GroupFacts, LayerFacts};
 pub(super) use crate::experts::exchange::Answer;
 pub(super) use crate::experts::{ExchangeTable, Words};
 pub(super) use crate::experts::conveyor::{Carrier, LentPool, Lending};

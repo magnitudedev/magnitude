@@ -808,6 +808,32 @@ fn lagged(recent: &mut std::collections::VecDeque<Vec<Vec<usize>>>, routed: &[Ro
     lags
 }
 
+/// A step still running: its accumulated cost, wall-clock wait intervals, and
+/// exact rows' hints' reads ahead.
+struct RunningStep {
+    cost: StepCost,
+    /// Wall-clock `[start, end]` intervals during which the step was parked
+    /// waiting on request dispatch (`Telemetry::serve`) or demand reads
+    /// landing (`Telemetry::landed`). Taking their union clipped to the step
+    /// window avoids double-counting overlapping concurrent layer reads.
+    layer_wait: Vec<(Instant, Instant)>,
+    /// The step's exact rows' hints' reads ahead, as they were issued
+    /// ([`Telemetry::read_ahead`]): the layer, the expert, its lead and the
+    /// layer whose hint named it. Its completion counts them into its layers'
+    /// costs.
+    ahead: Vec<(usize, usize, u8, usize)>,
+}
+
+impl RunningStep {
+    fn of(layers: usize) -> Self {
+        Self {
+            cost: StepCost::of(layers),
+            layer_wait: Vec::new(),
+            ahead: Vec::new(),
+        }
+    }
+}
+
 /// The costs as serving records them: the steps still running keep theirs
 /// until they complete.
 struct Costs {
@@ -829,11 +855,6 @@ struct Costs {
     /// it ([`Telemetry::device_convert`]).
     convert: Vec<Option<magnitude_cost_model::RecordLine>>,
     hints: HintCost,
-    /// Each running decode step's exact rows' hints' reads ahead, as they
-    /// were issued ([`Telemetry::read_ahead`]): the layer, the expert, its
-    /// lead and the layer whose hint named it. Its completion counts them
-    /// into its layers' costs.
-    ahead: BTreeMap<Step, Vec<(usize, usize, u8, usize)>>,
     front: FrontSkips,
     /// What the reads ahead's bytes were spent on ([`Telemetry::spent`]),
     /// and as the last step's end saw it.
@@ -860,12 +881,7 @@ struct Costs {
     /// saw it, from none: the first step counts what each read since the
     /// process began.
     looked: Vec<seismic_io::Totals>,
-    running: BTreeMap<Step, StepCost>,
-    /// Wall-clock `[start, end]` intervals during which a running step was
-    /// parked waiting on request dispatch (`Self::serve`) or demand reads
-    /// landing (`Self::landed`). Taking their union clipped to the step window
-    /// avoids double-counting overlapping concurrent layer reads.
-    layer_wait: BTreeMap<Step, Vec<(Instant, Instant)>>,
+    running: BTreeMap<Step, RunningStep>,
     completed: Option<(Step, StepCost)>,
     group: Option<Counted>,
 }
@@ -901,31 +917,56 @@ pub(super) struct RequestCost {
     pub(super) read: Duration,
 }
 
-/// What the prompt-group size rule reads ([`Telemetry::group_size`]), per
-/// streamed layer: the compute of one scratch-served step there, measured
+/// What the prompt-group size and merge-set rules read for one streamed layer
+/// ([`GroupFacts`]): the compute of one scratch-served step there, measured
 /// on this run (the mean of the latest group's steps measured there:
 /// [`GroupLayer::compute_of`]), the experts the layer holds, the experts
 /// the last scratch-served group to end there read from the file and
 /// pulled from the host tier there (its [`GroupLayer::conveyed`] and
 /// [`GroupLayer::pulled`] once its last step's request there is taken:
 /// [`Telemetry::group`]), the union the last prompt group the stack was fed
-/// read there (`unions`: its experts at their depths and the choices routed
-/// to each, [`Telemetry::flush`]), and one expert's stored bytes; and each
-/// layer's experts.
+/// read there (`union`: its experts at their depths and the choices routed
+/// to each, [`Telemetry::flush`]), one expert's stored bytes, one pull's
+/// resident bytes where prompt groups pull from a host tier
+/// (`TierPulls::bytes`), and the layer's experts.
+#[derive(Clone)]
+pub(super) struct LayerFacts {
+    pub(super) compute: Option<Duration>,
+    pub(super) held: usize,
+    /// The experts its host records hold alone (a host tier's, exclusive of
+    /// the bank), as the watcher last published them.
+    pub(super) alone: usize,
+    pub(super) read: Option<u64>,
+    pub(super) pulled: Option<u64>,
+    pub(super) union: Option<GroupUnion>,
+    pub(super) bytes: u64,
+    /// The resident bytes one pull of its experts copies, where prompt groups
+    /// pull from a host tier (`TierPulls::bytes`).
+    pub(super) resident: Option<u64>,
+    pub(super) experts: usize,
+}
+
+impl LayerFacts {
+    /// The experts the next group will read from the file and pull from
+    /// the host tier at this layer ([`GroupFacts::terms`]), which need no
+    /// measured compute.
+    fn cold(&self) -> (u64, u64) {
+        let lacked = self
+            .experts
+            .checked_sub(self.held)
+            .expect("a layer's bank holds no more experts than the layer has");
+        let alone = self.resident.map_or(0, |_| self.alone);
+        let filed = lacked
+            .checked_sub(alone)
+            .expect("the host tier holds alone no more experts than the bank lacks");
+        (self.read.unwrap_or(filed as u64), self.pulled.unwrap_or(alone as u64))
+    }
+}
+
+/// What the prompt-group size rule reads ([`Telemetry::group_size`]), per
+/// streamed layer ([`LayerFacts`]), and the scratch tier's window count.
 pub(super) struct GroupFacts {
-    pub(super) compute: Vec<Option<Duration>>,
-    pub(super) held: Vec<usize>,
-    /// Per layer, the experts its host records hold alone (a host tier's,
-    /// exclusive of the bank), as the watcher last published them.
-    pub(super) alone: Vec<usize>,
-    pub(super) read: Vec<Option<u64>>,
-    pub(super) pulled: Vec<Option<u64>>,
-    pub(super) unions: Vec<Option<GroupUnion>>,
-    pub(super) bytes: Vec<u64>,
-    /// Per layer, the resident bytes one pull of its experts copies, where
-    /// prompt groups pull from a host tier (`TierPulls::bytes`).
-    pub(super) resident: Option<Vec<u64>>,
-    pub(super) experts: Vec<usize>,
+    pub(super) layers: Vec<LayerFacts>,
     pub(super) windows: u64,
 }
 
@@ -943,26 +984,13 @@ impl GroupFacts {
     /// they route whatever their merge sets, so nothing computes wrongly.
     /// None until the run has measured every layer's compute.
     pub(super) fn terms(&self) -> Option<Vec<GroupLayerTerms>> {
-        (0..self.compute.len())
+        self.layers
+            .iter()
             .map(|layer| {
-                let (filed, tiered) = self.cold(layer);
-                Some(GroupLayerTerms { compute_seconds: self.compute[layer]?.as_secs_f64(), filed, tiered })
+                let (filed, tiered) = layer.cold();
+                Some(GroupLayerTerms { compute_seconds: layer.compute?.as_secs_f64(), filed, tiered })
             })
             .collect()
-    }
-
-    /// The experts the next group will read from the file and pull from
-    /// the host tier at `layer` ([`Self::terms`]), which need no measured
-    /// compute.
-    fn cold(&self, layer: usize) -> (u64, u64) {
-        let lacked = self.experts[layer]
-            .checked_sub(self.held[layer])
-            .expect("a layer's bank holds no more experts than the layer has");
-        let alone = self.resident.as_ref().map_or(0, |_| self.alone[layer]);
-        let filed = lacked
-            .checked_sub(alone)
-            .expect("the host tier holds alone no more experts than the bank lacks");
-        (self.read[layer].unwrap_or(filed as u64), self.pulled[layer].unwrap_or(alone as u64))
     }
 
     /// [`Telemetry::group_size`] along each layer's `lines` and the read
@@ -984,15 +1012,15 @@ impl GroupFacts {
     /// the pass ends.
     pub(super) fn merge_sets(&self, lines: Option<&[ExpertLines]>, line: Option<ReadLine>, pass: Option<&ExpertPass>, notice: Notice, steps: usize) -> Vec<usize> {
         if self.windows > 1 {
-            return vec![steps; self.compute.len()];
+            return vec![steps; self.layers.len()];
         }
-        let unions = self.unions.iter().map(Option::as_ref).collect::<Option<Vec<_>>>();
+        let unions = self.layers.iter().map(|layer| layer.union.as_ref()).collect::<Option<Vec<_>>>();
         match (self.terms(), unions, lines, line, pass) {
             (Some(layers), Some(unions), Some(lines), Some(line), Some(pass)) => {
                 Stages { layers: layers.as_slice(), lines, line, notice }.merge_sets(steps, &unions, pass)
             }
-            _ => (0..self.compute.len())
-                .map(|layer| match layer + 1 < self.compute.len() && self.cold(layer + 1) != (0, 0) {
+            _ => (0..self.layers.len())
+                .map(|layer| match self.layers.get(layer + 1).is_some_and(|next| next.cold() != (0, 0)) {
                     true => steps.saturating_sub(1).max(1),
                     false => steps,
                 })
@@ -1200,6 +1228,12 @@ struct ReadRows {
 }
 
 impl Costs {
+    /// Step `step`'s running record, creating it on first observation.
+    fn running_step(&mut self, step: Step) -> &mut RunningStep {
+        let layers = self.layers.len();
+        self.running.entry(step).or_insert_with(|| RunningStep::of(layers))
+    }
+
     /// Group `group`'s landing line now, none until landings of two counts
     /// make one. Its points are counts and clock seconds, finite and not
     /// negative, so every fit of them is a line.
@@ -1319,7 +1353,6 @@ impl Telemetry {
                     blocks: vec![seismic::measure::Line::new(); layers.len()],
                     convert: vec![None; groups],
                     hints: HintCost::default(),
-                    ahead: BTreeMap::new(),
                     front: FrontSkips::default(),
                     spent: AheadUse::default(),
                     spent_seen: AheadUse::default(),
@@ -1330,23 +1363,30 @@ impl Telemetry {
                     hints_gate: HintGate::new(layers.iter().map(|layer| layer.hints.clone()).collect(), horizon.clone()),
                     looked,
                     running: BTreeMap::new(),
-                    layer_wait: BTreeMap::new(),
                     completed: None,
                     group: None,
                 },
                 facts: GroupFacts {
-                    compute: vec![None; layers.len()],
-                    held: vec![0; layers.len()],
-                    alone: vec![0; layers.len()],
-                    read: vec![None; layers.len()],
-                    pulled: vec![None; layers.len()],
-                    unions: vec![None; layers.len()],
-                    bytes: layers
-                        .iter()
-                        .map(Layer::expert_bytes)
-                        .collect(),
-                    resident,
-                    experts: layers.iter().map(|layer| layer.experts).collect(),
+                    layers: {
+                        if let Some(resident) = &resident {
+                            assert_eq!(resident.len(), layers.len(), "resident byte counts must match streamed layers");
+                        }
+                        layers
+                            .iter()
+                            .enumerate()
+                            .map(|(layer_index, layer)| LayerFacts {
+                                compute: None,
+                                held: 0,
+                                alone: 0,
+                                read: None,
+                                pulled: None,
+                                union: None,
+                                bytes: layer.expert_bytes(),
+                                resident: resident.as_ref().map(|resident| resident[layer_index]),
+                                experts: layer.experts,
+                            })
+                            .collect()
+                    },
                     windows: extents.windows,
                 },
                 feed: Feed { pending: Vec::new(), ended: None },
@@ -1608,7 +1648,7 @@ impl Telemetry {
     /// Feed `stack` the reads of every group that has ended
     /// ([`Self::ended`]), each of whose steps has ended, in the device's
     /// order: a prompt group's union at a layer, ranked at its depths, is
-    /// the layer's last group union ([`GroupFacts::unions`]). Only the
+    /// the layer's last group union ([`LayerFacts::union`]). Only the
     /// taking of the reads and each union's note hold `recorded`.
     fn feed_stack(&self, stack: &mut Stack) {
         let ended = self.feedable.load(Ordering::Acquire);
@@ -1642,7 +1682,7 @@ impl Telemetry {
         let live = decoded.then(|| stack.live());
         let recorded = &mut *self.lock();
         for (layer, union) in unions {
-            recorded.facts.unions[layer] = Some(union);
+            recorded.facts.layers[layer].union = Some(union);
         }
         if let Some(live) = live {
             recorded.ranked.live = live;
@@ -1659,11 +1699,11 @@ impl Telemetry {
     }
 
     /// Whether layer `layer` holds a group union, every ended step's group
-    /// fed: a prompt group's read there ([`GroupFacts::unions`]).
+    /// fed: a prompt group's read there ([`LayerFacts::union`]).
     #[cfg(test)]
     pub(super) fn group_union(&self, layer: usize) -> bool {
         drop(self.fed());
-        self.lock().facts.unions[layer].is_some()
+        self.lock().facts.layers[layer].union.is_some()
     }
 
     /// The step the stack last fed a read of a layer's expert into the
@@ -1685,18 +1725,13 @@ impl Telemetry {
 
     #[cfg(test)]
     pub(super) fn ahead_len(&self) -> usize {
-        self.lock().costs.ahead.len()
+        self.lock().costs.running.values().filter(|step| !step.ahead.is_empty()).count()
     }
 
     /// Step `sequence` ended, completed or not: what it left uncompleted,
     /// its cost and its sampled blocks, is dropped.
     pub(super) fn end_step(&self, sequence: Step) {
-        {
-            let costs = &mut self.lock().costs;
-            costs.running.remove(&sequence);
-            costs.layer_wait.remove(&sequence);
-            costs.ahead.remove(&sequence);
-        }
+        self.lock().costs.running.remove(&sequence);
         if self.samples(sequence) {
             self.sampled.lock().expect("the sampled blocks").retain(|&(step, _), _| step != sequence);
         }
@@ -1784,12 +1819,10 @@ impl Telemetry {
             }
         }
         let layers = costs.layers.len();
-        let mut cost = costs
+        let RunningStep { mut cost, layer_wait, ahead } = costs
             .running
             .remove(&sequence)
-            .unwrap_or_else(|| StepCost::of(layers));
-        let layer_wait = costs.layer_wait.remove(&sequence);
-        let ahead = costs.ahead.remove(&sequence).unwrap_or_default();
+            .unwrap_or_else(|| RunningStep::of(layers));
         // Each streamed layer's misses the CPU site served and its request's
         // path time, which the pass's terms count.
         let mut sites = vec![(0u64, Duration::ZERO); layers];
@@ -1809,12 +1842,13 @@ impl Telemetry {
             // by.
             for (layer, served) in tiered.iter().enumerate() {
                 let hosted = served.len() as u64;
+                let bytes = facts.layers[layer].bytes;
                 let total = &mut costs.layers[layer];
                 total.misses += hosted;
                 total.hosted += hosted;
-                total.missed_bytes += hosted * facts.bytes[layer];
+                total.missed_bytes += hosted * bytes;
                 cost.misses += hosted;
-                cost.missed_bytes += hosted * facts.bytes[layer];
+                cost.missed_bytes += hosted * bytes;
                 cost.layers[layer].hosted += hosted;
                 // Of them, those the CPU site served; the device read the
                 // rest over the link.
@@ -1899,8 +1933,8 @@ impl Telemetry {
             LaunchWork::Generation => {
                 let step_start = ended.0.map_or(begun, |previous| previous.max(begun));
                 cost.seconds = step_seconds(ended.0, begun, ended.1);
-                if let Some(intervals) = layer_wait {
-                    cost.parked = parked_union(intervals, step_start, ended.1);
+                if !layer_wait.is_empty() {
+                    cost.parked = parked_union(layer_wait, step_start, ended.1);
                 }
                 cost.storage = self.delivered(costs);
                 let (used, used_bytes) = std::mem::take(&mut costs.used_ahead);
@@ -1925,8 +1959,8 @@ impl Telemetry {
                     let drive = line.map_or(0., |line| {
                         let missed = absent
                             .iter()
-                            .zip(&facts.bytes)
-                            .map(|(&misses, &bytes)| line.transfer_seconds((misses * bytes) as f64))
+                            .zip(&facts.layers)
+                            .map(|(&misses, layer)| line.transfer_seconds((misses * layer.bytes) as f64))
                             .sum::<f64>();
                         missed + line.transfer_seconds(used_bytes as f64)
                     });
@@ -2016,8 +2050,6 @@ impl Telemetry {
         // Steps run in submission order on one queue: the device is past
         // every earlier one too.
         costs.running.retain(|running, _| *running > sequence);
-        costs.layer_wait.retain(|running, _| *running > sequence);
-        costs.ahead.retain(|running, _| *running > sequence);
         costs.completed = Some((sequence, cost));
         Ok(chose)
     }
@@ -2211,15 +2243,15 @@ impl Telemetry {
         }
         cost.parked += served.parked;
         cost.read += served.read;
-        let layers = costs.layers.len();
-        let step = costs.running.entry(sequence).or_insert_with(|| StepCost::of(layers));
+        let running = costs.running_step(sequence);
+        let step = &mut running.cost;
         step.misses += served.misses;
         step.missed_bytes += served.bytes;
         step.parked += served.parked;
         step.read += served.read;
         let end = Instant::now();
         if let Some(start) = end.checked_sub(served.parked) {
-            costs.layer_wait.entry(sequence).or_default().push((start, end));
+            running.layer_wait.push((start, end));
         }
         let timeline = &mut step.layers[layer];
         timeline.misses += served.misses - served.hosted;
@@ -2240,12 +2272,12 @@ impl Telemetry {
         let costs = &mut recorded.costs;
         let cost = &mut costs.layers[layer];
         cost.read += read;
-        if let Some(step) = costs.running.get_mut(&sequence) {
-            step.read += read;
-        }
-        let end = Instant::now();
-        if let Some(start) = end.checked_sub(read) {
-            costs.layer_wait.entry(sequence).or_default().push((start, end));
+        if let Some(running) = costs.running.get_mut(&sequence) {
+            running.cost.read += read;
+            let end = Instant::now();
+            if let Some(start) = end.checked_sub(read) {
+                running.layer_wait.push((start, end));
+            }
         }
         if let Some((bytes, job)) = timed {
             costs.reads.add(bytes, job.saturating_sub(queued).as_secs_f64());
@@ -2308,7 +2340,7 @@ impl Telemetry {
             Source::Lead { distance, row: None } => {
                 costs.hints.reads += 1;
                 if costs.completed.as_ref().is_none_or(|(completed, _)| step > *completed) {
-                    costs.ahead.entry(step).or_default().push((layer, expert, distance, from));
+                    costs.running_step(step).ahead.push((layer, expert, distance, from));
                 }
             }
             Source::Ahead(_) | Source::Lead { row: Some(_), .. } => {
@@ -2324,13 +2356,12 @@ impl Telemetry {
     /// ([`LeadHints`]).
     pub(super) fn hints_named(&self, named: &[(Step, usize, u8, bool)]) {
         let costs = &mut self.lock().costs;
-        let layers = costs.layers.len();
         let completed = costs.completed.as_ref().map(|(step, _)| *step);
         for &(step, layer, distance, admitted) in named {
             if completed.is_some_and(|done| step <= done) {
                 continue;
             }
-            let lead = &mut costs.running.entry(step).or_insert_with(|| StepCost::of(layers)).hints[layer][usize::from(distance) - 1];
+            let lead = &mut costs.running_step(step).cost.hints[layer][usize::from(distance) - 1];
             lead.published += 1;
             lead.admitted += u64::from(admitted);
         }
@@ -2587,20 +2618,20 @@ impl Telemetry {
     pub(super) fn group(&self, point: Point, last: Step, took: GroupLayer) {
         let mut recorded = self.lock();
         let Recorded { costs, facts, .. } = &mut *recorded;
-        let bytes = facts.bytes[point.layer];
+        let fact = &mut facts.layers[point.layer];
         let group = counted(costs, point.group, last);
         let layer = &mut group.cost.layers[point.layer];
         layer.union = took.union;
         layer.hits += took.hits;
         layer.conveyed += took.conveyed;
-        layer.cold_bytes += took.conveyed * bytes;
+        layer.cold_bytes += took.conveyed * fact.bytes;
         layer.pulled += took.pulled;
-        layer.tier_bytes += took.pulled * facts.resident.as_ref().map_or(0, |resident| resident[point.layer]);
+        layer.tier_bytes += took.pulled * fact.resident.unwrap_or(0);
         layer.seeded += took.seeded;
         layer.parked += took.parked;
         if point.sequence == last {
-            facts.read[point.layer] = Some(layer.conveyed);
-            facts.pulled[point.layer] = Some(layer.pulled);
+            fact.read = Some(layer.conveyed);
+            fact.pulled = Some(layer.pulled);
         }
     }
 
@@ -2644,15 +2675,20 @@ impl Telemetry {
     /// those its host records hold alone.
     pub(super) fn publish_held(&self, held: &[usize], alone: &[usize]) {
         let mut recorded = self.lock();
-        recorded.facts.held.copy_from_slice(held);
-        recorded.facts.alone.copy_from_slice(alone);
+        let layers = &mut recorded.facts.layers;
+        assert_eq!(held.len(), layers.len(), "held length must match streamed layers");
+        assert_eq!(alone.len(), layers.len(), "alone length must match streamed layers");
+        for ((layer, &held), &alone) in layers.iter_mut().zip(held).zip(alone) {
+            layer.held = held;
+            layer.alone = alone;
+        }
     }
 
     /// Per layer, the experts its bank holds and those its host records hold
     /// alone, as last published together.
     pub(super) fn holdings(&self) -> (Vec<usize>, Vec<usize>) {
         let recorded = self.lock();
-        (recorded.facts.held.clone(), recorded.facts.alone.clone())
+        recorded.facts.layers.iter().map(|layer| (layer.held, layer.alone)).unzip()
     }
 }
 
@@ -2686,7 +2722,7 @@ fn compute(group: &mut GroupCost, facts: &mut GroupFacts, served: Point, interva
         layer.computed += 1;
     }
     let step = layer.compute_of(steps).map(|compute| compute / steps);
-    facts.compute[served.layer] = step;
+    facts.layers[served.layer].compute = step;
 }
 
 /// A sampled block's point of its layer's block line: its hits, link
