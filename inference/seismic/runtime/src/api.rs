@@ -1119,6 +1119,22 @@ pub mod tensor {
         }
     }
 
+    /// How a tensor view is backed: either elements directly in its allocation
+    /// (optionally holding the slab granule it lies in), or a logical slab view
+    /// addressed through a region table with its own alias identity.
+    enum TensorBacking {
+        Plain {
+            /// The slab this view lies in, held while any view of it lives: its
+            /// store's slot, and its granule where it is a pool's
+            /// (`crate::pool::SlabHold`).
+            hold: Option<Arc<SlabHold>>,
+        },
+        Slabs {
+            view: SlabView,
+            alias_identity: u64,
+        },
+    }
+
     pub struct TensorInner {
         device: Arc<DeviceInner>,
         allocation: Arc<Allocation>,
@@ -1127,12 +1143,7 @@ pub mod tensor {
         representation: RepresentationId,
         extents: Vec<u64>,
         strides: Vec<u64>,
-        slabs: Option<SlabView>,
-        alias_identity: Option<u64>,
-        /// The slab this view lies in, held while any view of it lives: its
-        /// store's slot, and its granule where it is a pool's
-        /// (`crate::pool::SlabHold`).
-        hold: Option<Arc<SlabHold>>,
+        backing: TensorBacking,
         /// This view's records as a native record port binds them, formed
         /// at its first such binding ([`TensorInner::forming_records`]).
         records: OnceLock<Arc<Records>>,
@@ -1368,15 +1379,24 @@ pub mod tensor {
             other: &Reaching<'_>,
             other_span: std::ops::Range<u64>,
         ) -> bool {
-            match (&self.tensor.slabs, &other.tensor.slabs) {
-                (None, None) => {
+            match (&self.tensor.backing, &other.tensor.backing) {
+                (TensorBacking::Plain { .. }, TensorBacking::Plain { .. }) => {
                     let (identity, range) = self.tensor.plain_bytes(span);
                     let (other_identity, other_range) = other.tensor.plain_bytes(other_span);
                     identity == other_identity && meet(&range, &other_range)
                 }
-                (Some(slabs), None) => self.meets_plain(slabs, span, other.tensor, other_span),
-                (None, Some(slabs)) => other.meets_plain(slabs, other_span, self.tensor, span),
-                (Some(slabs), Some(other_slabs)) => self.meets_slabs(slabs, span, other_slabs, other_span),
+                (TensorBacking::Slabs { view, .. }, TensorBacking::Plain { hold }) => {
+                    self.meets_plain(view, span, other.tensor, hold.as_ref(), other_span)
+                }
+                (TensorBacking::Plain { hold }, TensorBacking::Slabs { view, .. }) => {
+                    other.meets_plain(view, other_span, self.tensor, hold.as_ref(), span)
+                }
+                (
+                    TensorBacking::Slabs { view, .. },
+                    TensorBacking::Slabs {
+                        view: other_view, ..
+                    },
+                ) => self.meets_slabs(view, span, other_view, other_span),
             }
         }
 
@@ -1389,13 +1409,14 @@ pub mod tensor {
             slabs: &SlabView,
             span: std::ops::Range<u64>,
             plain: &TensorInner,
+            hold: Option<&Arc<SlabHold>>,
             plain_span: std::ops::Range<u64>,
         ) -> bool {
             let (identity, range) = plain.plain_bytes(plain_span);
             if slabs.lent_bytes(&span).is_some_and(|(lender, lent)| lender == identity && meet(&lent, &range)) {
                 return true;
             }
-            let Some(hold) = plain.hold.as_ref().filter(|hold| hold.store() == slabs.slots.id()) else {
+            let Some(hold) = hold.filter(|hold| hold.store() == slabs.slots.id()) else {
                 return false;
             };
             let bytes = span.end - span.start;
@@ -1645,9 +1666,10 @@ pub mod tensor {
                 representation,
                 extents,
                 strides: layout.strides,
-                slabs: Some(SlabView::new(slots.clone(), region, 0, slots.capacity(), rows_per_slab, slab_extents, slab_bytes)),
-                alias_identity: Some(alias_identity),
-                hold: None,
+                backing: TensorBacking::Slabs {
+                    view: SlabView::new(slots.clone(), region, 0, slots.capacity(), rows_per_slab, slab_extents, slab_bytes),
+                    alias_identity,
+                },
                 records: OnceLock::new(),
             })
         }
@@ -1664,7 +1686,7 @@ pub mod tensor {
             hold: Option<Arc<SlabHold>>,
         ) -> Result<Self, TensorError> {
             let layout = layout::canonical(representation, extents)?;
-            let mut view = Self::new_view(
+            Ok(Self::new_plain(
                 device.clone(),
                 allocation,
                 offset,
@@ -1672,9 +1694,8 @@ pub mod tensor {
                 representation,
                 extents.to_vec(),
                 layout.strides,
-            );
-            view.hold = hold;
-            Ok(view)
+                hold,
+            ))
         }
 
         /// The allocations device work bound to this view reaches, each in
@@ -1682,14 +1703,20 @@ pub mod tensor {
         /// pooled slab of its store shares a domain with), and a slab
         /// view's lent slabs' storage.
         pub(crate) fn bound_allocations(&self) -> impl Iterator<Item = Arc<Allocation>> + '_ {
-            std::iter::once(self.allocation.clone())
-                .chain(self.slabs.iter().flat_map(|slabs| slabs.slots.lenders().cloned()))
+            let lenders = match &self.backing {
+                TensorBacking::Plain { .. } => None,
+                TensorBacking::Slabs { view, .. } => Some(view.slots.lenders().cloned()),
+            };
+            std::iter::once(self.allocation.clone()).chain(lenders.into_iter().flatten())
         }
 
         /// Whether the tensor is a slab view: its binding is an address table,
         /// not its elements.
         pub(crate) fn is_slab_view(&self) -> bool {
-            self.slabs.is_some()
+            match &self.backing {
+                TensorBacking::Plain { .. } => false,
+                TensorBacking::Slabs { .. } => true,
+            }
         }
 
         /// Whether the tensor may bind a slab port (`&slab`,
@@ -1703,7 +1730,7 @@ pub mod tensor {
         /// records its fences: a slab view, whose store's slots device work
         /// reads through its table as it runs.
         pub(crate) fn holds_binding_lease(&self) -> bool {
-            self.slabs.is_some()
+            self.is_slab_view()
         }
 
         /// What device work bound to a slab view reaches now: its address-table
@@ -1711,13 +1738,19 @@ pub mod tensor {
         /// each backed slab's region ([`SlabView::reach`]); `None` for any
         /// other view.
         pub(crate) fn slab_reach(&self) -> Option<Arc<SlabReach>> {
-            self.slabs.as_ref().map(SlabView::reach)
+            match &self.backing {
+                TensorBacking::Plain { .. } => None,
+                TensorBacking::Slabs { view, .. } => Some(view.reach()),
+            }
         }
 
         /// The slab a view of a slab's region lies in ([`SlabHold`]): its
         /// store's slot; none for any other view.
         pub(crate) fn slab_hold(&self) -> Option<&Arc<SlabHold>> {
-            self.hold.as_ref()
+            match &self.backing {
+                TensorBacking::Plain { hold } => hold.as_ref(),
+                TensorBacking::Slabs { .. } => None,
+            }
         }
 
         /// The bytes device work bound to this plain view's bytes `span`
@@ -1729,9 +1762,11 @@ pub mod tensor {
         /// The device bytes the tensor's elements occupy: a slab view's
         /// backed slabs, otherwise its byte length.
         pub(crate) fn occupied_bytes(&self) -> u64 {
-            match &self.slabs {
-                Some(slabs) => slabs.reach().regions.iter().flatten().count() as u64 * slabs.slab_bytes,
-                None => self.byte_len,
+            match &self.backing {
+                TensorBacking::Plain { .. } => self.byte_len,
+                TensorBacking::Slabs { view, .. } => {
+                    view.reach().regions.iter().flatten().count() as u64 * view.slab_bytes
+                }
             }
         }
 
@@ -1739,16 +1774,15 @@ pub mod tensor {
         /// ([`TensorInner::copy_of`]), in canonical layout: all of them, or
         /// each backed slab's region of a slab view.
         pub(crate) fn image(&self) -> Result<TensorImage, TensorError> {
-            if let Some(slabs) = &self.slabs {
-                return Ok(TensorImage::Slabs(
-                    slabs
-                        .regions(self.representation)?
+            match &self.backing {
+                TensorBacking::Plain { .. } => Ok(TensorImage::Whole(self.read_to_host()?)),
+                TensorBacking::Slabs { view, .. } => Ok(TensorImage::Slabs(
+                    view.regions(self.representation)?
                         .iter()
                         .map(|region| region.as_ref().map(|r| r.read_to_host()).transpose())
                         .collect::<Result<_, _>>()?,
-                ));
+                )),
             }
-            Ok(TensorImage::Whole(self.read_to_host()?))
         }
 
         /// A tensor of this one's shape over storage of its own holding
@@ -1761,8 +1795,8 @@ pub mod tensor {
         /// through `charges`.
         pub(crate) fn copy_of(&self, charges: &Charges, image: &TensorImage) -> Result<Self, TensorError> {
             let device = charges;
-            match (image, &self.slabs) {
-                (TensorImage::Whole(bytes), None) => match self.host_address() {
+            match (image, &self.backing) {
+                (TensorImage::Whole(bytes), TensorBacking::Plain { .. }) => match self.host_address() {
                     Some(_) => {
                         let copy = Self::shared(device, self.representation, &self.extents)?;
                         copy.write_from_host(bytes)?;
@@ -1770,7 +1804,9 @@ pub mod tensor {
                     }
                     None => Self::from_host(device, self.representation, &self.extents, bytes),
                 },
-                (TensorImage::Slabs(images), Some(slabs)) if images.len() == slabs.count => {
+                (TensorImage::Slabs(images), TensorBacking::Slabs { view: slabs, .. })
+                    if images.len() == slabs.count =>
+                {
                     if slabs.count == 0 {
                         let slots = Slots::copy(device, self.representation, &slabs.slab_extents, &[None])?;
                         let whole = Self::slabbed(
@@ -1864,9 +1900,10 @@ pub mod tensor {
                     to: to.name,
                 }));
             }
-            if self.slabs.is_some()
-                || layout::canonical(self.representation, &self.extents)?.strides != self.strides
-            {
+            let TensorBacking::Plain { hold } = &self.backing else {
+                return Err(TensorError::Region(RegionError::NotContiguous));
+            };
+            if layout::canonical(self.representation, &self.extents)?.strides != self.strides {
                 return Err(TensorError::Region(RegionError::NotContiguous));
             }
             let layout = layout::canonical(representation, extents)?;
@@ -1884,7 +1921,7 @@ pub mod tensor {
                     alignment: layout.alignment,
                 }));
             }
-            let mut region = Self::new_view(
+            Ok(Self::new_plain(
                 self.device.clone(),
                 self.allocation.clone(),
                 start,
@@ -1892,9 +1929,8 @@ pub mod tensor {
                 representation,
                 extents.to_vec(),
                 layout.strides,
-            );
-            region.hold = self.hold.clone();
-            Ok(region)
+                hold.clone(),
+            ))
         }
 
         /// Records `start..end` of this view (its leading-axis rows, where
@@ -1905,9 +1941,10 @@ pub mod tensor {
             let placement = self
                 .record_placement()
                 .ok_or(TensorError::Region(RegionError::Unrecorded { offset: self.byte_offset }))?;
-            if self.slabs.is_some()
-                || layout::canonical(self.representation, &self.extents)?.strides != self.strides
-            {
+            let TensorBacking::Plain { hold } = &self.backing else {
+                return Err(TensorError::Region(RegionError::NotContiguous));
+            };
+            if layout::canonical(self.representation, &self.extents)?.strides != self.strides {
                 return Err(TensorError::Region(RegionError::NotContiguous));
             }
             let extent = self.extents[0];
@@ -1918,7 +1955,7 @@ pub mod tensor {
                 .chain(self.extents[1..].iter().copied())
                 .collect::<Vec<_>>();
             let layout = layout::canonical(self.representation, &extents)?;
-            let mut region = Self::new_view(
+            Ok(Self::new_plain(
                 self.device.clone(),
                 self.allocation.clone(),
                 placement.at(start),
@@ -1926,9 +1963,8 @@ pub mod tensor {
                 self.representation,
                 extents,
                 layout.strides,
-            );
-            region.hold = self.hold.clone();
-            Ok(region)
+                hold.clone(),
+            ))
         }
 
         pub fn device_address(&self) -> u64 {
@@ -1975,8 +2011,8 @@ pub mod tensor {
             let record = seismic_lang::registry::record_bytes(self.representation, &self.extents)
                 .ok_or(TensorError::Region(RegionError::Unrecorded { offset: self.byte_offset }))?
                 .get();
-            let records = match &self.slabs {
-                Some(slabs) if slabs.rows_per_slab == 1 => Records {
+            let records = match &self.backing {
+                TensorBacking::Slabs { view, .. } if view.rows_per_slab == 1 => Records {
                     table: self.allocation.clone(),
                     table_offset: self.byte_offset,
                     count: self.extents[0],
@@ -1984,12 +2020,12 @@ pub mod tensor {
                     #[cfg(any(test, target_os = "macos"))]
                     storage: None,
                 },
-                Some(_) => {
+                TensorBacking::Slabs { .. } => {
                     return Err(TensorError::SlabLayout(
                         "a record port binds a slab view of one row a slab".into(),
                     ))
                 }
-                None => {
+                TensorBacking::Plain { .. } => {
                     let (table, table_offset) = self.record_table(record, charges)?;
                     Records {
                         table,
@@ -2143,8 +2179,9 @@ pub mod tensor {
         /// floating values read out to a caller leave through `read_with` or
         /// `canonicalize_in_place` so NaN bits are never exposed.
         pub fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
-            if self.slabs.is_some() {
-                return None;
+            match &self.backing {
+                TensorBacking::Slabs { .. } => return None,
+                TensorBacking::Plain { .. } => {}
             }
             let base = self.allocation.storage().host_address()?;
             // In bounds: a backed view's bytes lie inside its allocation.
@@ -2371,6 +2408,29 @@ pub mod tensor {
             extents: Vec<u64>,
             strides: Vec<u64>,
         ) -> Self {
+            Self::new_plain(
+                device,
+                allocation,
+                byte_offset,
+                byte_len,
+                representation,
+                extents,
+                strides,
+                None,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn new_plain(
+            device: Arc<DeviceInner>,
+            allocation: Arc<Allocation>,
+            byte_offset: u64,
+            byte_len: u64,
+            representation: RepresentationId,
+            extents: Vec<u64>,
+            strides: Vec<u64>,
+            hold: Option<Arc<SlabHold>>,
+        ) -> Self {
             assert_eq!(
                 extents.len(),
                 strides.len(),
@@ -2391,34 +2451,37 @@ pub mod tensor {
                 representation,
                 extents,
                 strides,
-                slabs: None,
-                alias_identity: None,
-                hold: None,
+                backing: TensorBacking::Plain { hold },
                 records: OnceLock::new(),
             }
         }
         pub fn read_to_host(&self) -> Result<Vec<u8>, TensorError> {
-            if let Some(slabs) = &self.slabs {
-                let length = usize::try_from(self.byte_len).map_err(|_| {
-                    ExecutionError::AllocationFailed(
-                        "slab tensor is too large for a host byte vector".into(),
-                    )
-                })?;
-                let slab_bytes = usize::try_from(slabs.slab_bytes).map_err(|_| {
-                    ExecutionError::AllocationFailed("slab exceeds host byte domain".into())
-                })?;
-                let mut bytes = vec![0u8; length];
-                for (index, region) in slabs.regions(self.representation)?.iter().enumerate() {
-                    if let Some(region) = region {
-                        let start = index * slab_bytes;
-                        let keep = slab_bytes.min(length - start);
-                        bytes[start..start + keep].copy_from_slice(&region.read_to_host()?[..keep]);
+            match &self.backing {
+                TensorBacking::Slabs { view: slabs, .. } => {
+                    let length = usize::try_from(self.byte_len).map_err(|_| {
+                        ExecutionError::AllocationFailed(
+                            "slab tensor is too large for a host byte vector".into(),
+                        )
+                    })?;
+                    let slab_bytes = usize::try_from(slabs.slab_bytes).map_err(|_| {
+                        ExecutionError::AllocationFailed("slab exceeds host byte domain".into())
+                    })?;
+                    let mut bytes = vec![0u8; length];
+                    for (index, region) in slabs.regions(self.representation)?.iter().enumerate() {
+                        if let Some(region) = region {
+                            let start = index * slab_bytes;
+                            let keep = slab_bytes.min(length - start);
+                            bytes[start..start + keep]
+                                .copy_from_slice(&region.read_to_host()?[..keep]);
+                        }
                     }
+                    Ok(bytes)
                 }
-                return Ok(bytes);
+                TensorBacking::Plain { .. } => {
+                    let access = self.allocation.acquire(false)?;
+                    self.read_with(&access)
+                }
             }
-            let access = self.allocation.acquire(false)?;
-            self.read_with(&access)
         }
         pub(crate) fn read_with(
             &self,
@@ -2450,44 +2513,46 @@ pub mod tensor {
             Ok(bytes)
         }
         pub fn write_from_host(&self, bytes: &[u8]) -> Result<(), TensorError> {
-            if let Some(slabs) = &self.slabs {
-                let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                if actual != self.byte_len {
-                    return Err(TensorError::HostByteLength {
-                        expected: self.byte_len,
-                        actual,
-                    });
-                }
-                let regions = slabs.regions(self.representation)?;
-                if regions.iter().any(Option::is_none) {
-                    return Err(TensorError::SlabLayout(
-                        "host write reaches a free slab".into(),
-                    ));
-                }
-                let slab_bytes = usize::try_from(slabs.slab_bytes).map_err(|_| {
-                    TensorError::SlabLayout("slab exceeds host byte domain".into())
-                })?;
-                for (index, region) in regions.iter().enumerate() {
-                    let start = index * slab_bytes;
-                    let keep = slab_bytes.min(bytes.len() - start);
-                    let region = region.as_ref().expect("checked backed slab");
-                    if keep == slab_bytes {
-                        region.write_from_host(&bytes[start..start + keep])?;
-                    } else {
-                        let rows = u64::try_from(keep)
-                            .ok()
-                            .and_then(|count| count.checked_div(self.byte_len / self.extents[0]))
-                            .ok_or_else(|| {
-                                TensorError::SlabLayout("partial slab row count overflows".into())
-                            })?;
-                        region
-                            .slice_leading(0, rows)?
-                            .write_from_host(&bytes[start..start + keep])?;
+            match &self.backing {
+                TensorBacking::Slabs { view: slabs, .. } => {
+                    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    if actual != self.byte_len {
+                        return Err(TensorError::HostByteLength {
+                            expected: self.byte_len,
+                            actual,
+                        });
                     }
+                    let regions = slabs.regions(self.representation)?;
+                    if regions.iter().any(Option::is_none) {
+                        return Err(TensorError::SlabLayout(
+                            "host write reaches a free slab".into(),
+                        ));
+                    }
+                    let slab_bytes = usize::try_from(slabs.slab_bytes).map_err(|_| {
+                        TensorError::SlabLayout("slab exceeds host byte domain".into())
+                    })?;
+                    for (index, region) in regions.iter().enumerate() {
+                        let start = index * slab_bytes;
+                        let keep = slab_bytes.min(bytes.len() - start);
+                        let region = region.as_ref().expect("checked backed slab");
+                        if keep == slab_bytes {
+                            region.write_from_host(&bytes[start..start + keep])?;
+                        } else {
+                            let rows = u64::try_from(keep)
+                                .ok()
+                                .and_then(|count| count.checked_div(self.byte_len / self.extents[0]))
+                                .ok_or_else(|| {
+                                    TensorError::SlabLayout("partial slab row count overflows".into())
+                                })?;
+                            region
+                                .slice_leading(0, rows)?
+                                .write_from_host(&bytes[start..start + keep])?;
+                        }
+                    }
+                    Ok(())
                 }
-                return Ok(());
+                TensorBacking::Plain { .. } => self.write_whole(bytes, false),
             }
-            self.write_whole(bytes, false)
         }
 
         /// Write `bytes` into storage no device work uses: an upload region
@@ -2546,10 +2611,13 @@ pub mod tensor {
             &self,
             fill: impl FnOnce(&mut dyn FnMut(u64, &[u8]) -> std::io::Result<()>) -> std::io::Result<()>,
         ) -> Result<(), TensorError> {
-            if self.slabs.is_some() {
-                return Err(TensorError::SlabLayout(
-                    "a chunked upload requires one contiguous allocation".into(),
-                ));
+            match &self.backing {
+                TensorBacking::Slabs { .. } => {
+                    return Err(TensorError::SlabLayout(
+                        "a chunked upload requires one contiguous allocation".into(),
+                    ));
+                }
+                TensorBacking::Plain { .. } => {}
             }
             if self.allocation.storage().read_only() {
                 return Err(TensorError::HostRegion("mapped tensor is read-only".into()));
@@ -2604,8 +2672,10 @@ pub mod tensor {
             (self.allocation.identity(), self.allocation.bytes())
         }
         pub(crate) fn alias_identity(&self) -> u64 {
-            self.alias_identity
-                .unwrap_or_else(|| self.allocation.identity())
+            match &self.backing {
+                TensorBacking::Plain { .. } => self.allocation.identity(),
+                TensorBacking::Slabs { alias_identity, .. } => *alias_identity,
+            }
         }
         #[doc(hidden)]
         pub fn shares_allocation(&self, other: &Self) -> bool {
@@ -2702,6 +2772,7 @@ pub mod tensor {
         fn slab_subview(
             &self,
             slabs: &SlabView,
+            alias_identity: u64,
             first: usize,
             count: usize,
             rows: u64,
@@ -2717,125 +2788,159 @@ pub mod tensor {
                 representation: self.representation,
                 extents,
                 strides: layout.strides,
-                slabs: Some(SlabView::new(
-                    slabs.slots.clone(),
-                    slabs.region,
-                    first,
-                    count,
-                    slabs.rows_per_slab,
-                    slabs.slab_extents.clone(),
-                    slabs.slab_bytes,
-                )),
-                alias_identity: self.alias_identity,
-                hold: None,
+                backing: TensorBacking::Slabs {
+                    view: SlabView::new(
+                        slabs.slots.clone(),
+                        slabs.region,
+                        first,
+                        count,
+                        slabs.rows_per_slab,
+                        slabs.slab_extents.clone(),
+                        slabs.slab_bytes,
+                    ),
+                    alias_identity,
+                },
                 records: OnceLock::new(),
             })
         }
 
         pub fn slice_leading(&self, start: u64, end: u64) -> Result<Self, TensorError> {
-            if let Some(slabs) = &self.slabs {
-                if start > end || end > self.extents[0] {
-                    return Err(TensorError::SliceOutOfBounds {
-                        extent: self.extents[0],
-                        start,
-                        end,
-                    });
-                }
-                // An empty view names no slab: a zero-slot slab view anchored
-                // at its slot boundary in the region's address table.
-                if start == end {
-                    let local = usize::try_from(start / slabs.rows_per_slab)
-                        .unwrap_or(slabs.count)
-                        .min(slabs.count);
-                    return self.slab_subview(slabs, slabs.first + local, 0, 0);
-                }
-                // A span of whole slabs starting on a slab boundary (including
-                // a partial final slab at the view's end) stays a slab view
-                // over those slots' table entries, holding no granule.
-                if start % slabs.rows_per_slab == 0
-                    && (end % slabs.rows_per_slab == 0 || end == self.extents[0])
-                {
+            match &self.backing {
+                TensorBacking::Slabs {
+                    view: slabs,
+                    alias_identity,
+                } => {
+                    if start > end || end > self.extents[0] {
+                        return Err(TensorError::SliceOutOfBounds {
+                            extent: self.extents[0],
+                            start,
+                            end,
+                        });
+                    }
+                    // An empty view names no slab: a zero-slot slab view anchored
+                    // at its slot boundary in the region's address table.
+                    if start == end {
+                        let local = usize::try_from(start / slabs.rows_per_slab)
+                            .unwrap_or(slabs.count)
+                            .min(slabs.count);
+                        return self.slab_subview(
+                            slabs,
+                            *alias_identity,
+                            slabs.first + local,
+                            0,
+                            0,
+                        );
+                    }
+                    // A span of whole slabs starting on a slab boundary (including
+                    // a partial final slab at the view's end) stays a slab view
+                    // over those slots' table entries, holding no granule.
+                    if start % slabs.rows_per_slab == 0
+                        && (end % slabs.rows_per_slab == 0 || end == self.extents[0])
+                    {
+                        let local = usize::try_from(start / slabs.rows_per_slab).map_err(|_| {
+                            TensorError::SlabLayout("slab index exceeds host domain".into())
+                        })?;
+                        let count = usize::try_from((end - start).div_ceil(slabs.rows_per_slab))
+                            .map_err(|_| {
+                                TensorError::SlabLayout("slab count exceeds host domain".into())
+                            })?;
+                        return self.slab_subview(
+                            slabs,
+                            *alias_identity,
+                            slabs.first + local,
+                            count,
+                            end - start,
+                        );
+                    }
+                    if start / slabs.rows_per_slab != (end - 1) / slabs.rows_per_slab {
+                        return Err(TensorError::SlabLayout(
+                            "slice crosses a slab boundary".into(),
+                        ));
+                    }
                     let local = usize::try_from(start / slabs.rows_per_slab).map_err(|_| {
                         TensorError::SlabLayout("slab index exceeds host domain".into())
                     })?;
-                    let count = usize::try_from((end - start).div_ceil(slabs.rows_per_slab))
-                        .map_err(|_| {
-                            TensorError::SlabLayout("slab count exceeds host domain".into())
-                        })?;
-                    return self.slab_subview(slabs, slabs.first + local, count, end - start);
+                    let region = slabs
+                        .slots
+                        .region_view(
+                            slabs.first + local,
+                            slabs.region,
+                            self.representation,
+                            &slabs.slab_extents,
+                        )?
+                        .ok_or_else(|| TensorError::SlabLayout("slice refers to a free slab".into()))?;
+                    let local_start = start % slabs.rows_per_slab;
+                    region.slice_leading(local_start, local_start + end - start)
                 }
-                if start / slabs.rows_per_slab != (end - 1) / slabs.rows_per_slab {
-                    return Err(TensorError::SlabLayout(
-                        "slice crosses a slab boundary".into(),
-                    ));
-                }
-                let local = usize::try_from(start / slabs.rows_per_slab).map_err(|_| {
-                    TensorError::SlabLayout("slab index exceeds host domain".into())
-                })?;
-                let region = slabs
-                    .slots
-                    .region_view(
-                        slabs.first + local,
-                        slabs.region,
-                        self.representation,
-                        &slabs.slab_extents,
-                    )?
-                    .ok_or_else(|| TensorError::SlabLayout("slice refers to a free slab".into()))?;
-                let local_start = start % slabs.rows_per_slab;
-                return region.slice_leading(local_start, local_start + end - start);
+                TensorBacking::Plain { hold } => self.view(
+                    &crate::api::kernel::ViewOperation::LeadingSlice { start, end },
+                    hold.clone(),
+                ),
             }
-            self.view(&crate::api::kernel::ViewOperation::LeadingSlice { start, end })
         }
         pub fn reshape(&self, extents: &[u64]) -> Result<Self, TensorError> {
-            if let Some(slabs) = &self.slabs {
-                if extents.first() != self.extents.first() {
-                    return Err(TensorError::SlabLayout(
-                        "slab reshape must preserve its leading row axis".into(),
-                    ));
+            match &self.backing {
+                TensorBacking::Slabs {
+                    view: slabs,
+                    alias_identity,
+                } => {
+                    if extents.first() != self.extents.first() {
+                        return Err(TensorError::SlabLayout(
+                            "slab reshape must preserve its leading row axis".into(),
+                        ));
+                    }
+                    let view = layout::apply_view(
+                        self.representation,
+                        layout::ViewGeometry {
+                            extents: self.extents.clone(),
+                            strides: self.strides.clone(),
+                            byte_offset: 0,
+                            byte_len: self.byte_len,
+                        },
+                        &crate::api::kernel::ViewOperation::Reshape {
+                            extents: extents.to_vec(),
+                        },
+                    )?;
+                    let slab_extents = std::iter::once(slabs.rows_per_slab)
+                        .chain(extents.iter().skip(1).copied())
+                        .collect::<Vec<_>>();
+                    Ok(Self {
+                        device: self.device.clone(),
+                        allocation: self.allocation.clone(),
+                        byte_offset: self.byte_offset,
+                        byte_len: view.byte_len,
+                        representation: self.representation,
+                        extents: view.extents,
+                        strides: view.strides,
+                        backing: TensorBacking::Slabs {
+                            view: SlabView::new(
+                                slabs.slots.clone(),
+                                slabs.region,
+                                slabs.first,
+                                slabs.count,
+                                slabs.rows_per_slab,
+                                slab_extents,
+                                slabs.slab_bytes,
+                            ),
+                            alias_identity: *alias_identity,
+                        },
+                        records: OnceLock::new(),
+                    })
                 }
-                let view = layout::apply_view(
-                    self.representation,
-                    layout::ViewGeometry {
-                        extents: self.extents.clone(),
-                        strides: self.strides.clone(),
-                        byte_offset: 0,
-                        byte_len: self.byte_len,
-                    },
+                TensorBacking::Plain { hold } => self.view(
                     &crate::api::kernel::ViewOperation::Reshape {
                         extents: extents.to_vec(),
                     },
-                )?;
-                let slab_extents = std::iter::once(slabs.rows_per_slab)
-                    .chain(extents.iter().skip(1).copied())
-                    .collect::<Vec<_>>();
-                return Ok(Self {
-                    device: self.device.clone(),
-                    allocation: self.allocation.clone(),
-                    byte_offset: self.byte_offset,
-                    byte_len: view.byte_len,
-                    representation: self.representation,
-                    extents: view.extents,
-                    strides: view.strides,
-                    slabs: Some(SlabView::new(
-                        slabs.slots.clone(),
-                        slabs.region,
-                        slabs.first,
-                        slabs.count,
-                        slabs.rows_per_slab,
-                        slab_extents,
-                        slabs.slab_bytes,
-                    )),
-                    alias_identity: self.alias_identity,
-                    hold: None,
-                    records: OnceLock::new(),
-                });
+                    hold.clone(),
+                ),
             }
-            self.view(&crate::api::kernel::ViewOperation::Reshape {
-                extents: extents.to_vec(),
-            })
         }
-        /// This tensor seen through one view operation (`layout::apply_view`).
-        fn view(&self, operation: &crate::api::kernel::ViewOperation) -> Result<Self, TensorError> {
+        /// This plain tensor seen through one view operation (`layout::apply_view`).
+        fn view(
+            &self,
+            operation: &crate::api::kernel::ViewOperation,
+            hold: Option<Arc<SlabHold>>,
+        ) -> Result<Self, TensorError> {
             let view = layout::apply_view(
                 self.representation,
                 layout::ViewGeometry {
@@ -2846,7 +2951,7 @@ pub mod tensor {
                 },
                 operation,
             )?;
-            let mut derived = Self::new_view(
+            Ok(Self::new_plain(
                 self.device.clone(),
                 self.allocation.clone(),
                 view.byte_offset,
@@ -2854,25 +2959,28 @@ pub mod tensor {
                 self.representation,
                 view.extents,
                 view.strides,
-            );
-            derived.hold = self.hold.clone();
-            Ok(derived)
+                hold,
+            ))
         }
         /// The view's range in its alias space. A slab view's alias space is
         /// its region's logical tensor, where slot `first` starts at
         /// `first * slab_bytes`; its `byte_offset` is where its address
         /// table's entries lie, what it binds, not where its elements do.
         pub fn descriptor(&self) -> TensorDescriptor {
+            let (allocation, byte_offset) = match &self.backing {
+                TensorBacking::Plain { .. } => (self.allocation.identity(), self.byte_offset),
+                TensorBacking::Slabs {
+                    view,
+                    alias_identity,
+                } => (*alias_identity, view.first as u64 * view.slab_bytes),
+            };
             TensorDescriptor {
                 device: self.device.kind.identity(),
                 representation: self.representation,
                 extents: self.extents.clone(),
                 strides: self.strides.clone(),
-                allocation: self.alias_identity(),
-                byte_offset: match &self.slabs {
-                    Some(slabs) => slabs.first as u64 * slabs.slab_bytes,
-                    None => self.byte_offset,
-                },
+                allocation,
+                byte_offset,
                 byte_len: self.byte_len,
             }
         }
@@ -3548,13 +3656,17 @@ pub mod kernel {
         /// remain errors. Caller-owned input storage already contains the
         /// terminal prefix state when this method returns.
         pub fn outcome(&self) -> Result<WorkflowOutcome, super::CallError> {
-            loop {
+            let completion = loop {
                 let mut state = self
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match &*state {
-                    CompletionState::Complete(result) => return result.clone(),
+                match std::mem::replace(&mut *state, CompletionState::Running) {
+                    CompletionState::Complete(result) => {
+                        let output = result.clone();
+                        *state = CompletionState::Complete(result);
+                        return output;
+                    }
                     CompletionState::Running => {
                         drop(
                             self.changed
@@ -3563,39 +3675,32 @@ pub mod kernel {
                         );
                     }
                     CompletionState::Panicked => {
-                        panic!("workflow completion previously panicked")
+                        *state = CompletionState::Panicked;
+                        panic!("workflow completion previously panicked");
                     }
-                    CompletionState::Pending(_) => {
-                        let CompletionState::Pending(completion) =
-                            std::mem::replace(&mut *state, CompletionState::Running)
-                        else {
-                            unreachable!("pending workflow completion changed under its lock")
-                        };
-                        drop(state);
+                    CompletionState::Pending(completion) => break completion,
+                }
+            };
 
-                        // Device completion must not run under a host mutex. Publish the
-                        // terminal state afterward so concurrent resolvers wait without
-                        // duplicating submission or synchronization.
-                        let completed =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(completion));
-                        let mut state = self
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match completed {
-                            Ok(result) => {
-                                *state = CompletionState::Complete(result.clone());
-                                self.changed.notify_all();
-                                return result;
-                            }
-                            Err(payload) => {
-                                *state = CompletionState::Panicked;
-                                self.changed.notify_all();
-                                drop(state);
-                                std::panic::resume_unwind(payload);
-                            }
-                        }
-                    }
+            // Device completion must not run under a host mutex. Publish the
+            // terminal state afterward so concurrent resolvers wait without
+            // duplicating submission or synchronization.
+            let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(completion));
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match completed {
+                Ok(result) => {
+                    *state = CompletionState::Complete(result.clone());
+                    self.changed.notify_all();
+                    result
+                }
+                Err(payload) => {
+                    *state = CompletionState::Panicked;
+                    self.changed.notify_all();
+                    drop(state);
+                    std::panic::resume_unwind(payload);
                 }
             }
         }
