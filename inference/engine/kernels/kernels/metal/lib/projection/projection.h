@@ -1536,9 +1536,9 @@ inline void gemm_paired_halves(thread const In &in, thread const Out &out, threa
 // take their activations straight from device memory. The staged tile above
 // decodes every weight once per TM <= 128 rows and stages the activations too.
 //
-// K is a multiple of KS (the entries admit the form for K % 128 == 0), so
-// every stage is whole. Products accumulate in F32 in K order per output,
-// as in the staged tile.
+// K is a multiple of KS (the entries admit the form for K % 64 == 0, requiring
+// KS == 64 unless K % 128 == 0), so every stage is whole. Products accumulate
+// in F32 in K order per output, as in the staged tile.
 //
 // The activations are a `Tall` operand: with tensor operations the plain
 // row-major operand itself, read as a device tensor; on simdgroup matrices a

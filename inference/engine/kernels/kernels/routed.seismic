@@ -161,8 +161,10 @@ projection routed for metal:
     where K + SHARED <= 32 for summed
     where ROWS * ceil_div(SUMMED_PACKETS - (1 - min(1, LANES / 16) + (min(1, LANES / 16) - LANES / 32) * SUMMED_STAGES_16) * (SUMMED_PACKETS - SUMMED_STAGE), LANES) <= 8 for summed
     where (SHARED == 1 or 2 * ceil_div(SUMMED_PACKETS - SUMMED_STAGES_16 * (SUMMED_PACKETS - SUMMED_STAGE), 16) <= 8) for summed
-    where (TALL == 0 or (WIDTH % 128 == 0 and (STACKED == 0 or T % 32 == 0))) for grouped
-    where (DOWN_TALL == 0 or (each(W, FIRST == 1 or WIDTH % 128 == 0) and (STACKED == 0 or T % 32 == 0))) for grouped
+    where (TALL == 0 or (WIDTH % 64 == 0 and (STACKED == 0 or T % 32 == 0))) for grouped
+    where (TALL == 0 or WIDTH % 128 == 0 or TALL_K == 64) for grouped
+    where (DOWN_TALL == 0 or (each(W, FIRST == 1 or WIDTH % 64 == 0) and (STACKED == 0 or T % 32 == 0))) for grouped
+    where (DOWN_TALL == 0 or each(W, FIRST == 1 or WIDTH % 128 == 0) or DOWN_TALL_K == 64) for grouped
     where (INT8 == 0 or (TALL == 1 and (STACKED == 1 or SERVED == 2) and WIDTH % 512 == 0 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, INT8) == 1) and sum(W, FIRST * form(W, INT8_INTERLEAVED)) % SERVED == 0)) for grouped
     where (DOWN_INT8 == 0 or (DOWN_TALL == 1 and each(W, FIRST == 1 or (WIDTH % 512 == 0 and N % 64 == 0 and form(W, INT8) == 1)))) for grouped
     where (DOWN_INT8 == 1 or STACKED == 1 or INT8_TILE == 128) for grouped
