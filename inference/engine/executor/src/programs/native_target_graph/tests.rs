@@ -1215,20 +1215,16 @@ mod resource_template_tests {
         }
     }
 
-    /// An unbanked plan charges exactly the pass its load holds when its pass
-    /// budget (`whole_chain`) exceeds what the arena fits (memory-failures item
-    /// 8): the Qwen4Exp fixture unbanked on Metal in chains of 1024 launches,
-    /// more than its arena fits, holds passes the arena caps
-    /// (`group_pass_rows`), and the family the plan charges holds its prompt
-    /// groups' class at those passes' places, never at a pass above the cap.
-    /// Conversely, a banked load whose pass was settled by `execution_plan`
-    /// honors its pass budget even when `OnceStage::Pass` exceeds the non-pass
-    /// launch arena, growing the workspace arena and charging it directly.
+    /// Both resident (unbanked) and banked plans honor their planned pass
+    /// budget (`PassLaunches`, bounded only by `chain_capacity`) even when
+    /// `OnceStage::Pass` exceeds the non-pass launch workspace arena, growing
+    /// the workspace arena and charging both the workspace and pass buffers
+    /// directly so `execution_plan` is the single owner of `PassLaunches`.
     #[test]
-    fn a_budget_above_the_cap_charges_the_pass_the_load_holds() {
+    fn planned_pass_is_honored_and_charged_for_resident_and_banked_loads() {
         use crate::planning::fixtures::{LIMITS, qwen4exp_fixture_definition_of, streamed_experts_manifest};
         let backend = BackendName::Metal;
-        let chain = 1024;
+        let chain = 64;
         let limits = ResourceLimits { chain_capacity: std::num::NonZeroUsize::new(chain).unwrap(), ..LIMITS };
         let definition = qwen4exp_fixture_definition_of(4, 32);
         let manifest = streamed_experts_manifest(&definition);
@@ -1238,27 +1234,41 @@ mod resource_template_tests {
         let state = ResourcePlanner::state_plan(&definition, &derived, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
         let plan = derived.program_plan(&definition, KvCodec::Dense).unwrap();
         let budget = derived.pass(limits);
+        assert_eq!(budget.get(), chain);
+
+        // Resident (unbanked) load honors its full pass budget rather than
+        // clamping to the non-pass launch arena, and charges the larger
+        // `OnceStage::Pass` workspace and pass buffers.
+        let floor_cert =
+            certify_target_family::<seismic::NativeGraphLayout>(backend, &derived, &definition.decoder, &state, plan.target(), limits, crate::PassLaunches::FLOOR).unwrap();
         let certificate =
             certify_target_family::<seismic::NativeGraphLayout>(backend, &derived, &definition.decoder, &state, plan.target(), limits, budget).unwrap();
-        let passes = certificate.passes;
         let held = certificate.group.extents(&certificate.served, 1).pass_bytes().unwrap();
-        let found = format!("budget {budget:?}, {passes:?}, {held} bytes held");
-        assert!(budget.get() > passes.launches(), "setup: the budget is within the cap, so nothing here exceeds it: {found}");
-        assert!(held > 0, "setup: no block of the fixture splits, so it holds no pass buffers: {found}");
+        assert_eq!(certificate.passes.launches(), budget.get(), "resident load must honor planned pass {budget:?}");
+        assert!(held > 0, "routed fixture must allocate merged pass buffers");
+        assert!(
+            certificate.resources.storage.workspace > floor_cert.resources.storage.workspace,
+            "merged pass ({} bytes) must grow workspace arena above 1-launch floor ({} bytes)",
+            certificate.resources.storage.workspace,
+            floor_cert.resources.storage.workspace,
+        );
         let checked = super::super::certify::checked_target_family(backend, &derived, &definition.decoder, &state, plan.target(), limits, budget).unwrap();
-        assert_eq!(checked.group_bytes.most().get(), passes.launches(), "{found}");
+        assert_eq!(checked.group_bytes.most(), budget, "checked family must charge the full resident pass {budget:?}");
 
-        // A banked load whose settled pass exceeds the unbanked arena cap honors
-        // that pass rather than silently clamping back to the non-pass arena.
+        // A pass budget above `chain_capacity` is bounded by `chain_capacity`.
+        let over = crate::PassLaunches::new(std::num::NonZeroUsize::new(chain + 8).unwrap());
+        let bounded = super::super::certify::checked_target_family(backend, &derived, &definition.decoder, &state, plan.target(), limits, over).unwrap();
+        assert_eq!(bounded.group_bytes.most().get(), chain, "pass must be bounded by chain_capacity");
+
+        // Banked load honors the same settled pass identically.
         let host = crate::planning::HostTier::Unified(crate::planning::Parking::of(backend));
         let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
         let floor = derived.bank_floor(&definition, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
         let banked = derived.with_expert_bank(&definition, floor, None, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
         let banked_state = ResourcePlanner::state_plan(&definition, &banked, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
         let banked_plan = banked.program_plan(&definition, KvCodec::Dense).unwrap();
-        let banked_budget = crate::PassLaunches::new(std::num::NonZeroUsize::new((passes.launches() + 1).min(chain)).unwrap());
-        let banked_checked = super::super::certify::checked_target_family(backend, &banked, &definition.decoder, &banked_state, banked_plan.target(), limits, banked_budget).unwrap();
-        assert_eq!(banked_checked.group_bytes.most(), banked_budget, "banked load must honor settled pass {banked_budget:?}");
+        let banked_checked = super::super::certify::checked_target_family(backend, &banked, &definition.decoder, &banked_state, banked_plan.target(), limits, budget).unwrap();
+        assert_eq!(banked_checked.group_bytes.most(), budget, "banked load must honor settled pass {budget:?}");
     }
 }
 

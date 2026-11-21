@@ -359,7 +359,7 @@ pub(super) struct TargetFamilyCertificate<L = NativeGraphLayout> {
     /// Per block, the class axes each `(RowForm, RunStage)` actually reads,
     /// derived once at certification.
     pub(super) stage_axes: StageAxes,
-    /// The passes a group runs (`group_pass_rows`).
+    /// The passes a group runs, settled by `execution_plan` and bounded by `chain_capacity`.
     pub(super) passes: Passes,
 }
 
@@ -618,8 +618,7 @@ struct FamilyLayouts<L> {
     groups: Vec<(GroupKey, Arc<ShapeLayouts<L>>)>,
     group_index: FxHashMap<u64, Vec<usize>>,
     /// Cached `OnceStage::Pass` and `OnceStage::Fill` layouts keyed by
-    /// feed-forward-only [`OnceKey`], shared between `group_pass_rows` and
-    /// group assembly across blocks with identical routed sublayers.
+    /// feed-forward-only [`OnceKey`], shared across blocks with identical routed sublayers.
     once_layouts: Vec<(OnceKey, CertifiedBlockGraph<L>, Vec<GraphConstant>)>,
     once_index: FxHashMap<u64, Vec<usize>>,
     /// Cached deduplicated kernel sets keyed by
@@ -1262,7 +1261,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             }
             by_form.into_values().collect()
         };
-        let chain = Passes {
+        let passes = Passes {
             region: outline.largest_rows,
             launches: pass.get().min(limits.chain_capacity.get()),
         };
@@ -1276,7 +1275,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             .chain(distinct_untapped.iter().map(|&index| (index, true)))
             .collect::<Vec<_>>();
         let bank_layers = bank_layer_by_block(load, block_count);
-        let (block_launch_ids, untapped_launch_ids, block_group_ids, untapped_group_ids, passes) = {
+        let (block_launch_ids, untapped_launch_ids, block_group_ids, untapped_group_ids) = {
             let ctx = CertifyContext {
                 outline: &outline,
                 load,
@@ -1286,18 +1285,10 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
                 regimes: &regimes,
             };
             let (block_meta, block_launch_ids, untapped_launch_ids) =
-                self.certify_launches(&ctx, &shaped, &bank_layers, limits, chain)?;
-            let passes = self.resolve_passes(
-                &ctx,
-                &distinct_blocks,
-                &bank_layers,
-                &block_launch_ids,
-                &untapped_launch_ids,
-                chain,
-            )?;
+                self.certify_launches(&ctx, &shaped, &bank_layers, limits, passes)?;
             let (block_group_ids, untapped_group_ids) =
                 self.certify_groups(&ctx, &shaped, block_meta, passes)?;
-            (block_launch_ids, untapped_launch_ids, block_group_ids, untapped_group_ids, passes)
+            (block_launch_ids, untapped_launch_ids, block_group_ids, untapped_group_ids)
         };
         self.finish_core(
             outline,
@@ -1405,72 +1396,6 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             }
         }
         Ok((block_meta, block_launch_ids, untapped_launch_ids))
-    }
-
-    fn resolve_passes(
-        &mut self,
-        ctx: &CertifyContext<'_>,
-        distinct_blocks: &[usize],
-        bank_layers: &[Option<usize>],
-        block_launch_ids: &FxHashMap<usize, usize>,
-        untapped_launch_ids: &FxHashMap<usize, usize>,
-        chain: Passes,
-    ) -> Result<Passes, GraphError> {
-        // A banked load's pass is chosen by `execution_plan` (`settle_bank` /
-        // `place_whole`) over `pass_ladder`, which prices the full workspace
-        // arena and pass buffers of each pass size against `room` and
-        // `BankPrices`. Clamping it to the non-pass launch arena here would
-        // silently override that owner and collapse streamed MoE passes to 1
-        // launch whenever `OnceStage::Pass` exceeds the non-pass arena.
-        if chain.launches <= 1 || ctx.load.expert_bank().is_some() {
-            return Ok(chain);
-        }
-        let arena = block_launch_ids
-            .values()
-            .chain(untapped_launch_ids.values())
-            .flat_map(|&id| self.launches[id].1.values())
-            .map(|(graph, _)| graph.layout.storage_bytes().workspace)
-            .chain(
-                self.entries
-                    .values()
-                    .chain(&self.per_layer)
-                    .map(|layout| layout.storage_bytes().workspace),
-            )
-            .max()
-            .expect("a target family has entry graphs");
-        let mut routed_blocks: Vec<usize> = Vec::new();
-        let mut routed_once_meta: FxHashMap<usize, (OnceGraphShape, bool)> = fx_map();
-        for &index in distinct_blocks {
-            if block_routed(ctx.geometry, index)?.is_none() {
-                continue;
-            }
-            let once_shape = ctx.outline.shapes[index].once_shape();
-            let streams = bank_layers[index].is_some();
-            if !routed_once_meta
-                .values()
-                .any(|(s, st)| *st == streams && *s == once_shape)
-            {
-                routed_blocks.push(index);
-                routed_once_meta.insert(index, (once_shape, streams));
-            }
-        }
-        group_pass_rows(&routed_blocks, ctx.geometry, chain, arena, |index, rows| {
-            let (ref once_shape, streams) = routed_once_meta[&index];
-            let key = OnceKey {
-                stage: OnceStage::Pass,
-                rows,
-                streams,
-                shape: once_shape.clone(),
-            };
-            let key_hash = key.fx_hash();
-            if let Some(id) = self.find_once(key_hash, &key) {
-                return Ok(self.once_layouts[id].1.layout.storage_bytes().workspace);
-            }
-            let (layout, constants, owned) = certify_once_block::<L>(ctx, index, OnceStage::Pass, rows)?;
-            let workspace = layout.storage_bytes().workspace;
-            self.insert_once(key_hash, key, CertifiedBlockGraph { layout, owned, axes: ClassAxes::default() }, constants);
-            Ok(workspace)
-        })
     }
 
     fn certify_groups(
@@ -2757,40 +2682,6 @@ fn verify_composition_against_enumeration<L: Certified>(
         "TargetFamilyComposition graphs diverged from enumerate_block_graphs"
     );
     Ok(())
-}
-
-/// The passes a group runs: of the most whole launches, of at most
-/// `chain`'s, whose pass needs no more workspace (`pass_workspace` of block
-/// and rows) at any of the routed `blocks` than `arena`, the workspace the
-/// launches' own graphs need. A merge set of more runs splits into passes
-/// of these rows, so the pass's grouping and expert scratch share the
-/// arena's bytes and add none. A pass needs more workspace with more rows;
-/// one launch's pass is the least a group runs, as a launch of its own
-/// would.
-fn group_pass_rows(
-    blocks: &[usize],
-    geometry: &Decoder,
-    chain: Passes,
-    arena: u64,
-    mut pass_workspace: impl FnMut(usize, u64) -> Result<u64, GraphError>,
-) -> Result<Passes, GraphError> {
-    let mut passes = chain;
-    for &index in blocks {
-        if block_routed(geometry, index)?.is_none() {
-            continue;
-        }
-        // The most launches that fit: at least one, at most those found.
-        let (mut fits, mut over) = (1, passes.launches + 1);
-        while over - fits > 1 {
-            let middle = (fits + over) / 2;
-            match pass_workspace(index, passes.of_chain(middle))? <= arena {
-                true => fits = middle,
-                false => over = middle,
-            }
-        }
-        passes.launches = fits;
-    }
-    Ok(passes)
 }
 
 #[cfg(test)]

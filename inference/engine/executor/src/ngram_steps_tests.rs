@@ -254,6 +254,7 @@ fn a_verification_row_scores_its_history_as_plain_decode_does() {
                     method: *method,
                     codec,
                     machine: Machine::Live,
+                    pass: None,
                 });
                 // `request`'s prompt, in launches of up to ROWS rows.
                 let prompted = |domain: &mut ExecutorDomain, mut bindings: crate::StateBindings, request: RequestId| {
@@ -2012,18 +2013,35 @@ fn chained_prompts(
     definition: &Rc<ModelDefinition>,
     package: &Arc<Package>,
     backend: seismic::BackendName,
-    Prompts { requests, chunks, rows }: Prompts,
+    prompts: Prompts,
     chain_capacity: usize,
     banked: Banked,
 ) -> (Vec<(StepBits, Option<usize>)>, u64) {
-    let (mut domain, mut bindings, pass_rows, _) = load(
+    chained_prompts_at_pass(catalog, definition, package, backend, prompts, chain_capacity, banked, None)
+}
+
+fn chained_prompts_at_pass(
+    catalog: &seismic::Devices,
+    definition: &Rc<ModelDefinition>,
+    package: &Arc<Package>,
+    backend: seismic::BackendName,
+    Prompts { requests, chunks, rows }: Prompts,
+    chain_capacity: usize,
+    banked: Banked,
+    pass: Option<crate::PassLaunches>,
+) -> (Vec<(StepBits, Option<usize>)>, u64) {
+    let (mut domain, mut bindings, pass_rows, _) = load_read(&LoadRequest {
         catalog,
         definition,
         package,
         backend,
-        limits(rows, false, chain_capacity, rows),
+        limits: limits(rows, false, chain_capacity, rows),
         banked,
-    );
+        method: PlannedMethod::Plain,
+        codec: KvCodec::Dense,
+        machine: Machine::Live,
+        pass,
+    });
     let requests = (1..=requests).map(RequestId).collect::<Vec<_>>();
     for &request in &requests {
         domain
@@ -2428,21 +2446,18 @@ fn kl_of(p: &[f32], q: &[f32]) -> f64 {
 /// group's pass.
 const SPLIT_CHUNK_ROWS: usize = 512;
 
-/// The split-pass test's context: its prompt is a group of 7 chunks, whose
-/// pass on the CPU needs more workspace than the arena the chunks' own
-/// graphs need (`group_pass_rows`): it holds 3 chunks, so the group runs
-/// passes of 3, 3 and 1, the last over the chain's last rows.
+/// The split-pass test's context: its prompt is a group of 7 chunks; with a
+/// 3-chunk pass budget, the group runs passes of 3, 3 and 1, the last over
+/// the chain's last rows.
 const SPLIT_CONTEXT: u64 = 4096;
 
-/// On the CPU: a group of more chunks than its pass holds (`group_pass_rows`,
-/// from the model's shapes) runs as several passes, and equals the same
-/// chunks submitted one step at a time and in groups of the most chunks one
-/// pass holds (`assert_steps_equal`), for one request and for two whose
-/// prompts run in turn while the first holds its history. The CPU's routed
-/// kernels compute each row from that row alone (`routed_experts`), so a
-/// row's bits do not depend on the rows its pass covers. On Metal this
-/// model's launch graphs need an arena that holds a pass of its whole
-/// context (at 512 to 16,384 tokens), so no group of it splits.
+/// On the CPU: a group of more chunks than its pass holds runs as several
+/// passes, and equals the same chunks submitted one step at a time, in
+/// groups of the most chunks one pass holds, and in one full merged pass
+/// (`assert_steps_equal`), for one request and for two whose prompts run in
+/// turn while the first holds its history. The CPU's routed kernels compute
+/// each row from that row alone (`routed_experts`), so a row's bits do not
+/// depend on the rows its pass covers.
 #[test]
 fn a_group_longer_than_its_pass_equals_its_chunks_in_one_pass() {
     let (directory, definition, package) = fixture("split-pass");
@@ -2454,20 +2469,25 @@ fn a_group_longer_than_its_pass_equals_its_chunks_in_one_pass() {
     // The longest prompt the context holds beside its two decode rows.
     let chunks = (SPLIT_CONTEXT as usize - 2) / SPLIT_CHUNK_ROWS;
     let cpu = seismic::BackendName::Cpu;
+    let pass = 3;
+    let pass_budget = crate::PassLaunches::new(std::num::NonZeroUsize::new(pass).unwrap());
     for requests in [1, 2] {
         let prompts = Prompts {
             requests,
             chunks,
             rows: SPLIT_CHUNK_ROWS,
         };
-        let (split, pass_rows) = chained_prompts(&catalog, &definition, &package, cpu, prompts, chunks, Banked::Resident);
-        // A pass of several chunks, fewer than the group's.
-        let pass = usize::try_from(pass_rows).unwrap() / SPLIT_CHUNK_ROWS;
-        assert!((2..chunks).contains(&pass), "a pass of {pass} of the group's {chunks} chunks");
+        // Default resident load honors the full merged pass (`chunks` launches).
+        let (full, full_pass_rows) = chained_prompts(&catalog, &definition, &package, cpu, prompts, chunks, Banked::Resident);
+        assert_eq!(full_pass_rows, (chunks * SPLIT_CHUNK_ROWS) as u64, "resident load must honor full merged pass");
+        // With an explicit pass smaller than `chunks`, the group splits into passes of 3, 3, and 1.
+        let (split, pass_rows) = chained_prompts_at_pass(&catalog, &definition, &package, cpu, prompts, chunks, Banked::Resident, Some(pass_budget));
+        assert_eq!(pass_rows, (pass * SPLIT_CHUNK_ROWS) as u64, "explicit pass budget of {pass} chunks");
         let (one_pass, rows) = chained_prompts(&catalog, &definition, &package, cpu, prompts, pass, Banked::Resident);
-        assert_eq!(rows, pass_rows, "the pass's rows are the shapes', not the chain's");
+        assert_eq!(rows, pass_rows);
         let (alone, _) = chained_prompts(&catalog, &definition, &package, cpu, prompts, 1, Banked::Resident);
         let label = |of: &str| format!("{requests} requests: {of}");
+        assert_steps_equal(&full, &split, prompts, &label("split against full pass"));
         assert_steps_equal(&one_pass, &split, prompts, &label("split against one pass"));
         assert_steps_equal(&alone, &split, prompts, &label("split against alone"));
     }
