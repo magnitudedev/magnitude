@@ -437,8 +437,8 @@ impl Passes {
             paths,
             stall: (plain.missed > 0.).then(|| plain.parked / plain.missed),
             needed,
-            stand: stands.rate(1, Form::Front),
-            accepts: std::array::from_fn(|depth| stands.rate(depth + 1, Form::Verify)),
+            stand: stands.live_rate(1, Form::Front),
+            accepts: std::array::from_fn(|depth| stands.live_rate(depth + 1, Form::Verify)),
             fresh: std::array::from_fn(|lag| (routed.layers[lag] > 0.).then(|| routed.fresh[lag] / routed.layers[lag])),
             held: (routed.picks > 0.).then(|| (routed.held / routed.picks).clamp(0., 1.)),
         })
@@ -767,5 +767,39 @@ mod tests {
         passes.timed(plain(0.05, 0.01, 1.));
         let measured = passes.measured(48, [[None; DEPTHS]; 2], &stands).expect("passes timed");
         assert_eq!((measured.fresh, measured.held), ([None; LAGS], None), "the routed passes left the window");
+    }
+
+    /// A stale low `Form::Verify` warmup stand rate does not permanently lock
+    /// out `Verify` while `Form::Front` is actively measuring a higher live
+    /// stand rate on the same MTP drafter.
+    #[test]
+    fn stale_verify_stand_rate_uses_live_front_rate_in_measured() {
+        let (mut passes, time) = passes();
+        let stands = unjudged(time.clone());
+        passes.timed(plain(0.05, 0.01, 10.));
+
+        // Warmup: Verify runs 7 steps at 5/7 = 0.714 on step 1.
+        time.lock().register(1, Advance::Known(Tokens::new(1.0)));
+        for stood in [true, true, true, true, true, false, false] {
+            stands.count(1, Form::Verify, stood);
+        }
+        let during_verify = passes.measured(48, [[None; DEPTHS]; 2], &stands).expect("passes timed");
+        assert!((during_verify.accepts[0].unwrap() - 5.0 / 7.0).abs() < 1e-12);
+        assert_eq!(during_verify.stand, None, "unjudged front stays None");
+
+        // Bank resizes and Front runs subsequent steps with 100% acceptance:
+        // Front is strictly fresher than stale Verify, so `accepts[0]` reflects
+        // the live MTP drafter rate instead of staying locked at 5/7.
+        turn_epoch(&time, 2, 2);
+        stands.count(1, Form::Front, true);
+        let during_front = passes.measured(48, [[None; DEPTHS]; 2], &stands).expect("passes timed");
+        assert_eq!(during_front.stand, Some(1.0));
+        assert_eq!(during_front.accepts[0], Some(1.0), "stale verify falls back to fresher live front rate");
+
+        // Once Verify runs again, Verify is freshest and uses its own rate.
+        turn_epoch(&time, 3, 2);
+        stands.count(1, Form::Verify, true);
+        let reentered = passes.measured(48, [[None; DEPTHS]; 2], &stands).expect("passes timed");
+        assert!((reentered.accepts[0].unwrap() - 6.0 / 8.0).abs() < 1e-12);
     }
 }

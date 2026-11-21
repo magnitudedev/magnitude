@@ -1243,7 +1243,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.target_timing = Some(timing);
         self.begin_host_turn(pending.iter().map(|item| item.request));
         if verified {
-            self.verify_turns.begin(finish_started, pending.iter().map(|item| item.request).collect());
+            let bank_epoch = self.family.expert_bank().map(|bank| bank.bank_epoch());
+            self.verify_turns.begin(finish_started, bank_epoch, pending.iter().map(|item| item.request).collect());
         }
         Ok(pending)
     }

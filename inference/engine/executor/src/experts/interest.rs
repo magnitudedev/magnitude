@@ -960,6 +960,25 @@ impl Stands {
         self.judged(row, form).map(|(rate, _)| rate)
     }
 
+    /// r_row for `preferred`, falling back to the other form's live rate when
+    /// `preferred` is stale relative to it (strictly older on the token clock).
+    /// Both forms judge the same MTP drafter, so a form that stopped running
+    /// does not stay locked out by an old sample while the other form is
+    /// actively measuring a newer stand rate. An unjudged `preferred` row
+    /// stays `None` (its optimistic bound 1).
+    pub fn live_rate(&self, row: usize, preferred: Form) -> Option<f64> {
+        let (mut rows, epoch, now) = self.lock_with_now();
+        let (rate, age) = Self::read(&mut rows, row, preferred, epoch, now)?;
+        let other = match preferred {
+            Form::Front => Form::Verify,
+            Form::Verify => Form::Front,
+        };
+        match Self::read(&mut rows, row, other, epoch, now) {
+            Some((other_rate, other_age)) if other_age < age => Some(other_rate),
+            _ => Some(rate),
+        }
+    }
+
     /// Conditional front-row stand rates `r_1..r_{DEPTHS-1}`, unjudged rows at
     /// their bound 1.0 (design §3.3), read under a single lock of the clock
     /// and stand table.
@@ -2376,6 +2395,12 @@ mod tests {
         assert!((stands.through_rows(3, Form::Front) - (2.0 / 3.0) * 0.5).abs() < 1e-12, "unjudged depth 3 multiplies by 1");
         assert_eq!(stands.rate(1, Form::Verify), Some(0.0), "verify form is independent of front");
         assert_eq!(stands.through_rows(2, Form::Verify), 0.0);
+
+        // Both forms judged at the same clock position have equal age, so
+        // `live_rate` keeps each form's own rate; unjudged stays `None`.
+        assert!((stands.live_rate(1, Form::Front).unwrap() - 2.0 / 3.0).abs() < 1e-12);
+        assert_eq!(stands.live_rate(1, Form::Verify), Some(0.0));
+        assert_eq!(stands.live_rate(2, Form::Verify), None, "unjudged verify stays None");
 
         // Advance many bank-wide epochs without judging front row 2 again:
         // it never returns to Unjudged, keeps its last rate, and its age grows.
