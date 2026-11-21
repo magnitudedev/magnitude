@@ -154,9 +154,6 @@ struct GateInput {
     const u8 *rows;
     u64 stride;
     u64 first;
-    __device__ __forceinline__ float at(u64 row, u64 column) const {
-        return element::at<Act>(rows, row * stride + first + column);
-    }
 };
 
 // A rule's gates, which the entry bodies (`step`, `chunk::prepare`,
@@ -221,29 +218,40 @@ __device__ __forceinline__ float raw_input(const Inputs &in, const Slot &slot, i
 
 // Publish the slot's successor window: the C - 1 raw rows before the
 // publication row, then the raw rows of its tape, moved bit-for-bit as stored.
-// `part` of `parts` cooperating blocks writes an even share.
+// `part` of `parts` cooperating blocks writes an even share in 16-byte chunks.
 __device__ __forceinline__ void publish_window(const Inputs &in, const Slot &slot, int part,
                                                int parts) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    const int total = (C - 1 + tape_rows(in, slot)) * CH;
+    constexpr int VEC = 16 / Act::bytes;
+    static_assert(CH % VEC == 0, "window channels divide into 16-byte chunks");
+    constexpr int CH_VECS = CH / VEC;
+    const int rows = C - 1 + tape_rows(in, slot);
+    const int total = rows * CH_VECS;
     const int per = (total + parts - 1) / parts;
     const int first = part * per;
     const int last = min(total, first + per);
-    if (first + static_cast<int>(threadIdx.x) >= last) return;
+    if (first >= last) return;
     const element::Stored<Act> source =
         versions::bank_view(in.window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words_value);
     const element::Out<Act> target =
         versions::bank(in.window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words_value);
-    for (int index = first + threadIdx.x; index < last; index += blockDim.x) {
-        const int row = index / CH;
-        const int channel = index % CH;
+    const int first_row = first / CH_VECS;
+    const int last_row = (last - 1) / CH_VECS;
+    for (int row = first_row; row <= last_row; ++row) {
+        const int row_base = row * CH_VECS;
+        const int col_lo = max(first, row_base) - row_base;
+        const int col_hi = min(last, row_base + CH_VECS) - row_base;
         const int position = slot.stop + row - (C - 1);
-        const element::Stored<Act> from =
+        const element::Stored<Act> from_row =
             position < 0
-                ? source.offset(static_cast<u64>(slot.taped + C - 1 + position) * SEISMIC_WINDOW_STRIDE_1 + channel)
+                ? source.offset(static_cast<u64>(slot.taped + C - 1 + position) * SEISMIC_WINDOW_STRIDE_1)
                 : element::stored<Act>(
-                      in.projection, static_cast<u64>(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + channel);
-        target.move_stored(static_cast<u64>(row) * SEISMIC_WINDOW_STRIDE_1 + channel, from);
+                      in.projection, static_cast<u64>(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0);
+        const element::Out<Act> to_row = target.offset(static_cast<u64>(row) * SEISMIC_WINDOW_STRIDE_1);
+        for (int col = col_lo + static_cast<int>(threadIdx.x); col < col_hi; col += blockDim.x) {
+            const u64 channel = static_cast<u64>(col) * VEC;
+            to_row.move_stored(channel, from_row.offset(channel), VEC);
+        }
     }
 }
 
@@ -478,52 +486,142 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const RowGates &g
     }
 }
 
-// Gates (row, head) with one warp: each lane keeps its CPL = W / 32 raw
-// values in registers across the warp sum so `mixed` is read once. `COHERENT`
-// reads through L2 (`__ldcg`) for values other blocks published in the same
-// launch (`gate_head`).
+// Unpacks 32 bits of E (one F32 or two 16-bit elements) into F32 registers.
+template <class E>
+__device__ __forceinline__ void unpack_word(u32 bits, float *out) {
+    if constexpr (E::bytes == 4) {
+        out[0] = __uint_as_float(bits);
+    } else {
+        const float2 pair = E::unpack2(bits);
+        out[0] = pair.x;
+        out[1] = pair.y;
+    }
+}
+
+// Loads `N` contiguous elements of E from `base` at `index` into F32 registers
+// using the widest aligned vector load (`uint4`, `uint2`, `u32`), falling back
+// to scalar loads when unaligned. `COHERENT` reads through L2 (`__ldcg`).
+template <class E, int N, bool COHERENT>
+__device__ __forceinline__ void load_span(const u8 *base, u64 index, float (&out)[N]) {
+    constexpr int bytes = N * E::bytes;
+    constexpr int per_word = 4 / E::bytes;
+    const u8 *address = base + index * E::bytes;
+    if constexpr (bytes % 16 == 0) {
+        if ((reinterpret_cast<u64>(address) & 15u) == 0) {
+            const uint4 *src = reinterpret_cast<const uint4 *>(address);
+#pragma unroll
+            for (int chunk = 0; chunk < bytes / 16; ++chunk) {
+                uint4 word;
+                if constexpr (COHERENT) {
+                    word = __ldcg(src + chunk);
+                } else {
+                    word = src[chunk];
+                }
+                unpack_word<E>(word.x, out + chunk * 4 * per_word + 0 * per_word);
+                unpack_word<E>(word.y, out + chunk * 4 * per_word + 1 * per_word);
+                unpack_word<E>(word.z, out + chunk * 4 * per_word + 2 * per_word);
+                unpack_word<E>(word.w, out + chunk * 4 * per_word + 3 * per_word);
+            }
+            return;
+        }
+    }
+    if constexpr (bytes % 8 == 0) {
+        if ((reinterpret_cast<u64>(address) & 7u) == 0) {
+            const uint2 *src = reinterpret_cast<const uint2 *>(address);
+#pragma unroll
+            for (int chunk = 0; chunk < bytes / 8; ++chunk) {
+                uint2 word;
+                if constexpr (COHERENT) {
+                    word = __ldcg(src + chunk);
+                } else {
+                    word = src[chunk];
+                }
+                unpack_word<E>(word.x, out + chunk * 2 * per_word + 0 * per_word);
+                unpack_word<E>(word.y, out + chunk * 2 * per_word + 1 * per_word);
+            }
+            return;
+        }
+    }
+    if constexpr (bytes % 4 == 0) {
+        if ((reinterpret_cast<u64>(address) & 3u) == 0) {
+            const u32 *src = reinterpret_cast<const u32 *>(address);
+#pragma unroll
+            for (int chunk = 0; chunk < bytes / 4; ++chunk) {
+                u32 word;
+                if constexpr (COHERENT) {
+                    word = __ldcg(src + chunk);
+                } else {
+                    word = src[chunk];
+                }
+                unpack_word<E>(word, out + chunk * per_word);
+            }
+            return;
+        }
+    }
+    const typename E::storage *src = reinterpret_cast<const typename E::storage *>(base) + index;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        if constexpr (COHERENT) {
+            out[i] = E::load(__ldcg(src + i));
+        } else {
+            out[i] = E::load(src[i]);
+        }
+    }
+}
+
+// Gates (row, head) with one warp: each lane keeps its CPL = W / 32 contiguous
+// columns in registers across the warp sum so `mixed` is read once with vector
+// loads/stores. `COHERENT` reads through L2 (`__ldcg`) for values other blocks
+// published in the same launch (`gate_head`).
 template <class NORM, bool COHERENT>
 __device__ __forceinline__ void gate_warp(const Inputs &in, const GateInput &input, const u8 *mixed, const u8 *norm,
                                           float eps, const element::Out<Act> &gated, int row, int head, bool covered) {
     static_assert(W % 32 == 0, "head width divides into warp lanes");
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    const typename Act::storage *raw = reinterpret_cast<const typename Act::storage *>(mixed);
     const int lane = threadIdx.x % 32;
+    const int col0 = lane * CPL;
     float values[CPL];
+    if (covered) {
+        load_span<Act, CPL, COHERENT>(mixed, raw_index(row, head, col0), values);
+    } else {
+#pragma unroll
+        for (int c = 0; c < CPL; ++c) values[c] = 0.0f;
+    }
+    float norm_values[CPL], z_values[CPL];
+    load_span<NORM, CPL, false>(norm, static_cast<u64>(col0), norm_values);
+    load_span<Act, CPL, false>(input.rows,
+                               static_cast<u64>(row) * input.stride + input.first + static_cast<u64>(head) * W + col0,
+                               z_values);
     float total = 0.0f;
 #pragma unroll
-    for (int c = 0; c < CPL; ++c) {
-        const int i = lane + c * 32;
-        float v = 0.0f;
-        if (covered) {
-            const u64 index = raw_index(row, head, i);
-            if constexpr (COHERENT) {
-                v = Act::load(__ldcg(raw + index));
-            } else {
-                v = Act::load(raw[index]);
-            }
-        }
-        values[c] = v;
-        total = __fmaf_rn(v, v, total);
-    }
+    for (int c = 0; c < CPL; ++c) total = __fmaf_rn(values[c], values[c], total);
     // The butterfly leaves every lane the same sum.
     total = seismic_warp_sum_f32(total);
     const float inverse = rsqrtf(total / static_cast<float>(W) + eps);
+    float out_values[CPL];
 #pragma unroll
     for (int c = 0; c < CPL; ++c) {
-        const int i = lane + c * 32;
-        const float normalized = Act::round(values[c] * inverse * element::at<NORM>(norm, i));
-        const float z = input.at(row, head * W + i);
-        const float activated = Act::round(functions::output_gate((int)SEISMIC_PARAM_GATE_FUNCTION, z));
-        gated.put(static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 + static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
-                      static_cast<u64>(i) * SEISMIC_RESULT_0_STRIDE_2,
-                  normalized * activated);
+        const float normalized = Act::round(values[c] * inverse * norm_values[c]);
+        const float activated = Act::round(functions::output_gate((int)SEISMIC_PARAM_GATE_FUNCTION, z_values[c]));
+        out_values[c] = normalized * activated;
+    }
+    const u64 out_base = static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 +
+                         static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1;
+    constexpr u64 OUT_ALIGN = Act::bytes == 4 ? (CPL % 4 == 0 ? 16u : (CPL % 2 == 0 ? 8u : 4u)) : 2u;
+    if (SEISMIC_RESULT_0_STRIDE_2 == 1 &&
+        (reinterpret_cast<u64>(gated.stored(out_base + col0)) & (OUT_ALIGN - 1)) == 0) {
+        gated.put_span(out_base + col0, out_values);
+    } else {
+#pragma unroll
+        for (int c = 0; c < CPL; ++c) {
+            gated.put(out_base + static_cast<u64>(col0 + c) * SEISMIC_RESULT_0_STRIDE_2, out_values[c]);
+        }
     }
 }
 
 // The `gate` launch of every entry: block `row` forms the row's gated result
-// from its raw outputs `mixed`. Per value head (one warp each, lanes striding
-// the head's columns, then a warp sum),
+// from its raw outputs `mixed`. Per value head (one warp each, each lane
+// owning CPL = W / 32 contiguous columns, then a warp sum),
 //   gated = round_A(round_A(raw * rsqrt(sum_head raw^2 / W + eps) * norm[i])
 //                   * round_A(gate(z)))
 // with gate the output gate of `gate_function` (`functions::output_gate`)

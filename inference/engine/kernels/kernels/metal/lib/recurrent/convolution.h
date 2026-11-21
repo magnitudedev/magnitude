@@ -81,43 +81,78 @@ struct Convolving {
     }
 };
 
+// Channel index for segment `seg` (0 = value head, 1 + 2*k = q head, 2 + 2*k = k head)
+// at element `offset` within the head.
+inline ulong window_channel(ulong head, ulong seg, ulong offset, ulong key_heads, ulong value_heads, ulong width) {
+    if (seg == 0) {
+        return (2 * key_heads + head) * width + offset;
+    }
+    const ulong key_seg = seg - 1;
+    const ulong owner = head + (key_seg >> 1) * value_heads;
+    return ((key_seg & 1) ? key_heads + owner : owner) * width + offset;
+}
+
 // Publishes value head `head`'s share of the slot's successor window (the
 // C - 1 raw rows before the publication row, then the raw rows of its tape):
 // its value channels and the q/k channels of the key heads congruent to it.
-// Thread `thread_index` of `threads` copies an even share.
+// Thread `thread_index` of `threads` copies an even share in 16-byte chunks
+// when channels are contiguous, falling back to scalar copies otherwise.
 inline void publish_window(device const Storage *projection, device const slab::Table<activation::Act> *window,
     Slot slot, ulong head, uint thread_index, uint threads, constant ulong *seismic_words) {
-    const ulong width = SEISMIC_DIM_W;
+    constexpr ulong WIDTH = SEISMIC_DIM_W;
+    constexpr ulong VEC = 16 / activation::Act::bytes;
+    constexpr ulong CHUNKS = WIDTH / VEC;
+    static_assert(WIDTH % VEC == 0, "head width divides into 16-byte chunks");
     const ulong key_heads = SEISMIC_DIM_NK;
     const ulong value_heads = SEISMIC_DIM_NV;
     const long taps = long(RECURRENT_TAPS) - 1;
     const long rows = taps + versions::tape_rows(slot, long(SEISMIC_DIM_T));
+    if (rows <= 0) {
+        return;
+    }
     const element::Out<activation::Act> target_window =
         versions::bank(window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
     const element::Out<activation::Act> source_window =
         versions::bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
     const ulong owned = key_heads > head ? (key_heads - head - 1) / value_heads + 1 : 0;
-    const ulong per_tap = width + 2 * width * owned;
-    for (ulong item = thread_index; item < ulong(rows) * per_tap; item += threads) {
-        const long tap = long(item / per_tap);
-        const ulong offset = item % per_tap;
-        ulong channel;
-        if (offset < width) {
-            channel = (2 * key_heads + head) * width + offset;
-        } else {
-            const ulong key_offset = offset - width;
-            const ulong owner = head + (key_offset / (2 * width)) * value_heads;
-            const ulong within = key_offset % (2 * width);
-            channel = within < width ? owner * width + within : (key_heads + owner) * width + within - width;
+    const ulong segments = 1 + 2 * owned;
+    const ulong total_segments = ulong(rows) * segments;
+    if (SEISMIC_WINDOW_STRIDE_2 == 1 && SEISMIC_PROJECTION_STRIDE_1 == 1) {
+        const ulong total = total_segments * CHUNKS;
+        for (ulong item = thread_index; item < total; item += threads) {
+            const ulong seg_id = item / CHUNKS;
+            const ulong offset = (item % CHUNKS) * VEC;
+            const ulong tap = owned == 0 ? seg_id : (owned == 1 ? seg_id / 3 : seg_id / segments);
+            const ulong seg = owned == 0 ? 0 : seg_id - tap * segments;
+            const ulong channel = window_channel(head, seg, offset, key_heads, value_heads, WIDTH);
+            const long position = slot.stop + long(tap) - taps;
+            const ulong to = tap * SEISMIC_WINDOW_STRIDE_1 + channel;
+            // Both the source window and the projection are stored in `Act`: moved without decoding.
+            if (position < 0)
+                target_window.move_stored(to, source_window,
+                    ulong(slot.taped + slot.stop + long(tap)) * SEISMIC_WINDOW_STRIDE_1 + channel, VEC);
+            else
+                target_window.copy_stored(to, projection,
+                    ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + channel, VEC);
         }
-        const long position = slot.stop + tap - taps;
-        const ulong to = ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2;
-        // Both the source window and the projection are stored in `Act`: moved without decoding.
+        return;
+    }
+    const ulong total = total_segments * WIDTH;
+    for (ulong item = thread_index; item < total; item += threads) {
+        const ulong seg_id = item / WIDTH;
+        const ulong offset = item % WIDTH;
+        const ulong tap = owned == 0 ? seg_id : (owned == 1 ? seg_id / 3 : seg_id / segments);
+        const ulong seg = owned == 0 ? 0 : seg_id - tap * segments;
+        const ulong channel = window_channel(head, seg, offset, key_heads, value_heads, WIDTH);
+        const long position = slot.stop + long(tap) - taps;
+        const ulong to = tap * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2;
         if (position < 0)
-            target_window.move_stored(to, source_window, ulong(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1
+            target_window.move_stored(to, source_window,
+                ulong(slot.taped + slot.stop + long(tap)) * SEISMIC_WINDOW_STRIDE_1
                 + channel * SEISMIC_WINDOW_STRIDE_2, 1);
         else
-            target_window.copy_stored(to, projection, ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0
+            target_window.copy_stored(to, projection,
+                ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0
                 + channel * SEISMIC_PROJECTION_STRIDE_1, 1);
     }
 }
