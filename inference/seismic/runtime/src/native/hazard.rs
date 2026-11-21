@@ -265,12 +265,15 @@ impl SlabReach {
         }));
     }
 
-    /// O(1) logical summary of [`Self::extend`] when no non-slab binding in
-    /// the submission touches this view's access groups and no other
-    /// `(Slots, region)` in the submission shares a lender with it: one
-    /// `Through::Table` reach plus at most one `Through::Slab` reach over
-    /// the view's logical byte range `[first_slot * slab_bytes + offset, +bytes)`
-    /// in `self.logical_allocation`.
+    /// O(1) summary of [`Self::extend`] when no non-slab binding in the
+    /// submission touches this view's pool access group (`table`):
+    /// - 1 `Through::Table` reach for the address-table entries,
+    /// - 0 or 1 exact physical `Through::Slab` reach for any leading lent
+    ///   slots (which lie contiguously in their lender allocation, so plain
+    ///   views or other slab views aliasing the lender order against them
+    ///   exactly), and
+    /// - 0 or 1 logical `Through::Slab` reach over the pool-backed suffix in
+    ///   `self.logical_allocation`.
     #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn extend_logical(
         &self,
@@ -290,14 +293,34 @@ impl SlabReach {
             bytes: record_table_entry(slots.len() as u64),
             through: Through::Table,
         });
-        if self.any_backed(slots) {
-            reaches.push(Reach {
-                buffer,
-                allocation: self.logical_allocation,
-                offset: self.first_slot as u64 * self.slab_bytes + offset,
-                bytes,
-                through: Through::Slab,
-            });
+        let end = offset + bytes;
+        let pool_start = match self.lent_region {
+            Some((lender_id, lender_base, lent_bytes)) => {
+                let lent_end = end.min(lent_bytes);
+                if offset < lent_end {
+                    reaches.push(Reach {
+                        buffer,
+                        allocation: lender_id,
+                        offset: lender_base + offset,
+                        bytes: lent_end - offset,
+                        through: Through::Slab,
+                    });
+                }
+                offset.max(lent_bytes)
+            }
+            None => offset,
+        };
+        if pool_start < end {
+            let pool_slots = self.slots(pool_start, end - pool_start);
+            if self.any_backed(pool_slots) {
+                reaches.push(Reach {
+                    buffer,
+                    allocation: self.logical_allocation,
+                    offset: self.first_slot as u64 * self.slab_bytes + pool_start,
+                    bytes: end - pool_start,
+                    through: Through::Slab,
+                });
+            }
         }
     }
 
@@ -1103,5 +1126,74 @@ mod tests {
             ]
         );
         assert!(segment.is_empty());
+    }
+
+    #[test]
+    fn extend_logical_splits_lent_prefix_and_pool_suffix() {
+        let device = cpu_device();
+        let table = crate::memory::Charges::tally(&device).allocate(256, 64).unwrap();
+        let slab_bytes = 64u64;
+        let lender_id = 777u64;
+        let lender_base = 1024u64;
+        let logical_id = 999u64;
+        // 2 lent slots + 4 pool slots (3 backed, 1 free).
+        let regions_4 = vec![
+            Some((lender_id, lender_base, slab_bytes)),
+            Some((lender_id, lender_base + slab_bytes, slab_bytes)),
+            Some((10, 0, slab_bytes)),
+            Some((10, 128, slab_bytes)),
+            Some((11, 0, slab_bytes)),
+            None,
+        ];
+        let reach_4 = SlabReach::for_test(
+            slab_bytes,
+            regions_4,
+            logical_id,
+            0,
+            Some((lender_id, lender_base, 2 * slab_bytes)),
+        );
+
+        // Spanning lent + pool emits exactly 3 reaches: Table, physical lender, logical pool.
+        let mut out = Vec::new();
+        reach_4.extend_logical(0, &table, 0, 0, 6 * slab_bytes, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].through, Through::Table);
+        assert_eq!((out[1].allocation, out[1].offset, out[1].bytes, out[1].through), (lender_id, lender_base, 2 * slab_bytes, Through::Slab));
+        assert_eq!((out[2].allocation, out[2].offset, out[2].bytes, out[2].through), (logical_id, 2 * slab_bytes, 4 * slab_bytes, Through::Slab));
+
+        // Shrinking pool from 3 backed slots to 2 leaves extend_logical bit-for-bit identical.
+        let regions_3 = vec![
+            Some((lender_id, lender_base, slab_bytes)),
+            Some((lender_id, lender_base + slab_bytes, slab_bytes)),
+            Some((10, 0, slab_bytes)),
+            Some((10, 128, slab_bytes)),
+            None,
+            None,
+        ];
+        let reach_3 = SlabReach::for_test(
+            slab_bytes,
+            regions_3,
+            logical_id,
+            0,
+            Some((lender_id, lender_base, 2 * slab_bytes)),
+        );
+        let mut out_shrunk = Vec::new();
+        reach_3.extend_logical(0, &table, 0, 0, 6 * slab_bytes, &mut out_shrunk);
+        assert_eq!(out.len(), out_shrunk.len());
+        for (a, b) in out.iter().zip(&out_shrunk) {
+            assert_eq!((a.buffer, a.allocation, a.offset, a.bytes, a.through), (b.buffer, b.allocation, b.offset, b.bytes, b.through));
+        }
+
+        // Unbacked pool slice emits only Table (no logical pool reach).
+        let mut out_empty_pool = Vec::new();
+        reach_3.extend_logical(0, &table, 0, 4 * slab_bytes, 2 * slab_bytes, &mut out_empty_pool);
+        assert_eq!(out_empty_pool.len(), 1);
+        assert_eq!(out_empty_pool[0].through, Through::Table);
+
+        // Slice wholly inside lent prefix emits only Table + physical lender.
+        let mut out_lent_only = Vec::new();
+        reach_3.extend_logical(0, &table, 0, 0, slab_bytes, &mut out_lent_only);
+        assert_eq!(out_lent_only.len(), 2);
+        assert_eq!((out_lent_only[1].allocation, out_lent_only[1].offset, out_lent_only[1].bytes), (lender_id, lender_base, slab_bytes));
     }
 }

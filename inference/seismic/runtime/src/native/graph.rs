@@ -6957,10 +6957,10 @@ struct SequenceList<'a> {
     /// - `written_groups`: access groups written by at least one dispatch.
     ///   Strictly read-only sites are omitted from `reaches`.
     /// - `plain_groups`: access groups touched by any non-slab binding.
-    /// - `shared_lender_groups`: lent-slab lender groups touched by more than
-    ///   one distinct `(Slots, region)` in the sequence.
-    /// A slab site whose access groups are disjoint from `plain_groups` and
-    /// `shared_lender_groups` is summarized in O(1) via `SlabReach::extend_logical`.
+    /// A slab site whose pool access group (`table`) is not in `plain_groups`
+    /// is summarized in O(1) via `SlabReach::extend_logical` (emitting exact
+    /// physical bytes for any leading lent slabs and one logical range for all
+    /// pool slabs).
     #[cfg(any(test, target_os = "macos"))]
     access_summary: SequenceAccessSummary,
 }
@@ -6969,7 +6969,6 @@ struct SequenceList<'a> {
 struct SequenceAccessSummary {
     written_groups: std::collections::HashSet<usize>,
     plain_groups: std::collections::HashSet<usize>,
-    shared_lender_groups: std::collections::HashSet<usize>,
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -6977,8 +6976,6 @@ impl SequenceAccessSummary {
     fn of(runs: &[QueuedRun], nodes: &[(usize, usize)]) -> Self {
         let mut written_groups = std::collections::HashSet::new();
         let mut plain_groups = std::collections::HashSet::new();
-        let mut lender_owner = std::collections::HashMap::<usize, u64>::new();
-        let mut shared_lender_groups = std::collections::HashSet::new();
         for &(run_idx, node_idx) in nodes {
             let run = &runs[run_idx];
             let static_node = &run.plan.topology.nodes[node_idx];
@@ -6999,15 +6996,6 @@ impl SequenceAccessSummary {
                                 written_groups.insert(records.table.access_identity());
                                 written_groups.extend(slab.lender_groups.iter().copied());
                             }
-                            for &g in &slab.lender_groups {
-                                if let Some(&prev) = lender_owner.get(&g) {
-                                    if prev != slab.logical_allocation {
-                                        shared_lender_groups.insert(g);
-                                    }
-                                } else {
-                                    lender_owner.insert(g, slab.logical_allocation);
-                                }
-                            }
                         } else if let Some((storage, _)) = &records.storage {
                             let g = storage.access_identity();
                             plain_groups.insert(g);
@@ -7022,15 +7010,6 @@ impl SequenceAccessSummary {
                             if writes {
                                 written_groups.insert(g);
                                 written_groups.extend(slab.lender_groups.iter().copied());
-                            }
-                            for &lg in &slab.lender_groups {
-                                if let Some(&prev) = lender_owner.get(&lg) {
-                                    if prev != slab.logical_allocation {
-                                        shared_lender_groups.insert(lg);
-                                    }
-                                } else {
-                                    lender_owner.insert(lg, slab.logical_allocation);
-                                }
                             }
                         } else {
                             plain_groups.insert(g);
@@ -7082,7 +7061,6 @@ impl SequenceAccessSummary {
         Self {
             written_groups,
             plain_groups,
-            shared_lender_groups,
         }
     }
 
@@ -7094,12 +7072,8 @@ impl SequenceAccessSummary {
                 .any(|group| self.written_groups.contains(group))
     }
 
-    fn slab_is_logical(&self, table_group: usize, slab: &crate::api::tensor::SlabReach) -> bool {
+    fn slab_is_logical(&self, table_group: usize) -> bool {
         !self.plain_groups.contains(&table_group)
-            && !slab
-                .lender_groups
-                .iter()
-                .any(|group| self.plain_groups.contains(group) || self.shared_lender_groups.contains(group))
     }
 }
 
@@ -7229,7 +7203,7 @@ impl DispatchList for SequenceList<'_> {
             if !self.access_summary.slab_written(group, slab) {
                 return;
             }
-            if self.access_summary.slab_is_logical(group, slab) {
+            if self.access_summary.slab_is_logical(group) {
                 slab.extend_logical(buffer, table, table_offset, offset, bytes, reaches);
             } else {
                 slab.extend(buffer, table, table_offset, offset, bytes, reaches);

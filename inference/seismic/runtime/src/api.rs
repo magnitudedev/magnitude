@@ -1200,12 +1200,18 @@ pub mod tensor {
         pub(crate) lender_groups: Box<[usize]>,
         /// Globally unique logical allocation identity for this view's
         /// `(Slots, region)` (`Slots::region_identity`), used to summarize
-        /// slab-only sequences in O(1) reaches instead of O(slabs).
+        /// pool-backed slabs in O(1) reaches instead of O(slabs).
         #[cfg(any(test, target_os = "macos"))]
         pub(crate) logical_allocation: u64,
         /// Starting slot index of this view within its `Slots` store.
         #[cfg(any(test, target_os = "macos"))]
         pub(crate) first_slot: usize,
+        /// Contiguous physical lender range for this view's leading lent
+        /// slots, if any: `(lender_allocation_id, lender_byte_base, lent_bytes)`
+        /// where view byte `b < lent_bytes` lies at `lender_byte_base + b` in
+        /// `lender_allocation_id`.
+        #[cfg(any(test, target_os = "macos"))]
+        pub(crate) lent_region: Option<(u64, u64, u64)>,
     }
 
     /// The slots of `slab_bytes` each that hold bytes `[offset, offset +
@@ -1225,6 +1231,7 @@ pub mod tensor {
             #[cfg(any(test, target_os = "macos"))] lender_groups: Box<[usize]>,
             #[cfg(any(test, target_os = "macos"))] logical_allocation: u64,
             #[cfg(any(test, target_os = "macos"))] first_slot: usize,
+            #[cfg(any(test, target_os = "macos"))] lent_region: Option<(u64, u64, u64)>,
         ) -> Self {
             let backed = std::iter::once(0)
                 .chain(regions.iter().scan(0, |backed, region| {
@@ -1243,6 +1250,8 @@ pub mod tensor {
                 logical_allocation,
                 #[cfg(any(test, target_os = "macos"))]
                 first_slot,
+                #[cfg(any(test, target_os = "macos"))]
+                lent_region,
             }
         }
 
@@ -1255,6 +1264,25 @@ pub mod tensor {
         /// Whether any of `slots` is backed.
         pub(crate) fn any_backed(&self, slots: std::ops::Range<usize>) -> bool {
             self.backed[slots.end] > self.backed[slots.start]
+        }
+
+        #[cfg(test)]
+        pub(crate) fn for_test(
+            slab_bytes: u64,
+            regions: Vec<Option<(u64, u64, u64)>>,
+            logical_allocation: u64,
+            first_slot: usize,
+            lent_region: Option<(u64, u64, u64)>,
+        ) -> Self {
+            Self::new(
+                seismic_lang::registry::record_table_entry(regions.len() as u64),
+                slab_bytes,
+                regions,
+                Box::new([]),
+                logical_allocation,
+                first_slot,
+                lent_region,
+            )
         }
 
         /// The bytes device work reaches in slot `slot` for the view's bytes
@@ -1485,6 +1513,18 @@ pub mod tensor {
                         groups.dedup();
                         groups.into_boxed_slice()
                     };
+                    #[cfg(any(test, target_os = "macos"))]
+                    let lent_region = self.slots.lent_region(self.region).and_then(|(lender, start)| {
+                        let lent_slots = self.slots.lent().saturating_sub(self.first).min(self.count);
+                        let lent_bytes = lent_slots as u64 * self.slab_bytes;
+                        (lent_bytes > 0).then(|| {
+                            (
+                                lender.identity(),
+                                start + self.first as u64 * self.slab_bytes,
+                                lent_bytes,
+                            )
+                        })
+                    });
                     let reach = Arc::new(SlabReach::new(
                         seismic_lang::registry::record_table_entry(self.count as u64),
                         self.slab_bytes,
@@ -1495,6 +1535,8 @@ pub mod tensor {
                         self.slots.region_identity(self.region),
                         #[cfg(any(test, target_os = "macos"))]
                         self.first,
+                        #[cfg(any(test, target_os = "macos"))]
+                        lent_region,
                     ));
                     *cached = Some((generation, reach.clone()));
                     reach
