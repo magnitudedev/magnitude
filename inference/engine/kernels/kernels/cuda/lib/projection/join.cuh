@@ -112,6 +112,47 @@ __device__ __forceinline__ void routed_join(element::Out<element::F32> out, cons
     }
 }
 
+// Adjacent columns n and n + 1 joining their row's residual (`routed_combine`
+// epilogue pair): `float2` residual loads and `out.put2` stores when 8-byte
+// aligned, hoisting `inject[s]` once per pair.
+template <u32 STREAMS, bool INJECTED>
+__device__ __forceinline__ void routed_join_pair(element::Out<element::F32> out, const float *residual,
+                                                 const float *inject, u64 width, u64 n, float selected0,
+                                                 float selected1, float shared0, float shared1) {
+    if constexpr (!INJECTED) {
+        const float2 base = ((reinterpret_cast<u64>(residual + n) & 7u) == 0u)
+                                ? *reinterpret_cast<const float2 *>(residual + n)
+                                : make_float2(residual[n], residual[n + 1]);
+        const float y0 = base.x + selected0 + shared0;
+        const float y1 = base.y + selected1 + shared1;
+        if ((reinterpret_cast<u64>(out.stored(n)) & 7u) == 0u) {
+            out.put2(n, y0, y1);
+        } else {
+            out.put(n, y0);
+            out.put(n + 1, y1);
+        }
+    } else {
+        const float total0 = selected0 + shared0;
+        const float total1 = selected1 + shared1;
+#pragma unroll
+        for (u32 s = 0; s < STREAMS; ++s) {
+            const float gain = inject[s];
+            const u64 at = s * width + n;
+            const float2 base = ((reinterpret_cast<u64>(residual + at) & 7u) == 0u)
+                                    ? *reinterpret_cast<const float2 *>(residual + at)
+                                    : make_float2(residual[at], residual[at + 1]);
+            const float y0 = base.x + total0 * gain;
+            const float y1 = base.y + total1 * gain;
+            if ((reinterpret_cast<u64>(out.stored(at)) & 7u) == 0u) {
+                out.put2(at, y0, y1);
+            } else {
+                out.put(at, y0);
+                out.put(at + 1, y1);
+            }
+        }
+    }
+}
+
 // An output entry's epilogue: `Residual`, or `Scatter` over STREAMS streams
 // when the entry takes inject values (COMBED: and a comb after them). `make`
 // forms either from every field (`Residual` reads the leading ones).

@@ -27,29 +27,77 @@ constexpr unsigned THREADS = 256u;
 constexpr unsigned SUMS = 1u + MIXES;
 
 // Pre (`own`), post and the Sinkhorn comb (`joined`) of a row from its
-// reduced mixes (each already scaled by the row's inverse norm, held by
-// every thread), formed by the whole block: thread e < S * S owns comb
-// element (e / S, e % S) through `comb` (S * S floats of shared memory),
-// each of its sums over its row or column read there in index order, so
-// every element takes the same operations in the same order as one thread
-// forming them all would. Every thread of the block calls it. `own(stream,
-// pre)` takes each stream's pre (a result row, or shared memory).
-// Independent of any entry ABI: the caller passes its views' strides.
+// reduced sums (`reduced[1..1+MIXES]`, scaled by the row's inverse norm on
+// participating threads): thread e < S * S owns comb element (e / S, e % S).
+// When S * S <= 32, warp 0 runs the entire Sinkhorn in registers via
+// `__shfl_sync` with zero `__syncthreads()`; wider S falls back to `comb`
+// (S * S floats of shared memory). Both reduce every row and column in index
+// order, bit-identical to one thread forming them all. Every thread of the
+// block calls it. `own(stream, pre)` takes each stream's pre (a result row,
+// or `own_pre` in shared memory). Independent of any entry ABI: the caller
+// passes its views' strides.
 template <class Own>
-__device__ __forceinline__ void publish_coefficients(const float (&mixes)[MIXES], float *comb, const float *base,
-                                                     unsigned long long base_stride, const float *scale,
-                                                     unsigned long long scale_stride, const Own &own,
-                                                     const element::Out<element::F32> &joined,
+__device__ __forceinline__ void publish_coefficients(const float *reduced, float inverse, float *comb,
+                                                     const float *base, unsigned long long base_stride,
+                                                     const float *scale, unsigned long long scale_stride,
+                                                     const Own &own, const element::Out<element::F32> &joined,
                                                      unsigned long long joined_stride, float epsilon,
                                                      unsigned iterations) {
     typedef unsigned long long u64;
+    constexpr unsigned N2 = STREAMS * STREAMS;
     const unsigned source = threadIdx.x / STREAMS, target = threadIdx.x % STREAMS;
-    const bool owns = threadIdx.x < STREAMS * STREAMS;
+    const bool owns = threadIdx.x < N2;
+    if constexpr (N2 <= 32u) {
+        if (owns) {
+            constexpr unsigned MASK = (N2 == 32u) ? 0xffffffffu : ((1u << N2) - 1u);
+            const unsigned at = 2u * STREAMS + threadIdx.x;
+            const float comb_mix = reduced[1u + at] * inverse;
+            float value = comb_mix * scale[2u * scale_stride] + base[(u64)at * base_stride];
+            float maximum = -__int_as_float(0x7f800000);
+#pragma unroll
+            for (unsigned t = 0; t < STREAMS; ++t)
+                maximum = fmaxf(maximum, __shfl_sync(MASK, value, (int)(source * STREAMS + t)));
+            value = expf(value - maximum);
+            float total = 0.0f;
+#pragma unroll
+            for (unsigned t = 0; t < STREAMS; ++t)
+                total += __shfl_sync(MASK, value, (int)(source * STREAMS + t));
+            value = value / total + epsilon;
+            // The Sinkhorn normalizations: rows (after the first sweep), then
+            // columns.
+            for (unsigned sweep = 0; sweep < iterations; ++sweep) {
+                if (sweep > 0u) {
+                    float sum = 0.0f;
+#pragma unroll
+                    for (unsigned t = 0; t < STREAMS; ++t)
+                        sum += __shfl_sync(MASK, value, (int)(source * STREAMS + t));
+                    value /= sum + epsilon;
+                }
+                float sum = 0.0f;
+#pragma unroll
+                for (unsigned s = 0; s < STREAMS; ++s)
+                    sum += __shfl_sync(MASK, value, (int)(s * STREAMS + target));
+                value /= sum + epsilon;
+            }
+            joined.put((u64)(STREAMS + threadIdx.x) * joined_stride, value);
+            if (threadIdx.x < STREAMS) {
+                const unsigned stream = threadIdx.x;
+                const float pre_mix = reduced[1u + stream] * inverse;
+                const float post_mix = reduced[1u + STREAMS + stream] * inverse;
+                own(stream, functions::sigmoid(pre_mix * scale[0] + base[(u64)stream * base_stride]) + epsilon);
+                joined.put((u64)stream * joined_stride,
+                           2.0f * functions::sigmoid(post_mix * scale[scale_stride] +
+                                                     base[(u64)(STREAMS + stream) * base_stride]));
+            }
+        }
+        return;
+    }
     // The element's logit, then its row's softmax.
     float value = 0.0f;
     if (owns) {
         const unsigned at = 2u * STREAMS + threadIdx.x;
-        value = mixes[at] * scale[2u * scale_stride] + base[(u64)at * base_stride];
+        const float comb_mix = reduced[1u + at] * inverse;
+        value = comb_mix * scale[2u * scale_stride] + base[(u64)at * base_stride];
         comb[threadIdx.x] = value;
     }
     __syncthreads();
@@ -99,9 +147,11 @@ __device__ __forceinline__ void publish_coefficients(const float (&mixes)[MIXES]
         joined.put((u64)(STREAMS + threadIdx.x) * joined_stride, value);
     if (threadIdx.x < STREAMS) {
         const unsigned stream = threadIdx.x;
-        own(stream, functions::sigmoid(mixes[stream] * scale[0] + base[(u64)stream * base_stride]) + epsilon);
+        const float pre_mix = reduced[1u + stream] * inverse;
+        const float post_mix = reduced[1u + STREAMS + stream] * inverse;
+        own(stream, functions::sigmoid(pre_mix * scale[0] + base[(u64)stream * base_stride]) + epsilon);
         joined.put((u64)stream * joined_stride,
-                   2.0f * functions::sigmoid(mixes[STREAMS + stream] * scale[scale_stride] +
+                   2.0f * functions::sigmoid(post_mix * scale[scale_stride] +
                                              base[(u64)(STREAMS + stream) * base_stride]));
     }
 }
@@ -139,7 +189,7 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
     const unsigned h = SEISMIC_DIM_H, width = STREAMS * h, split = (unsigned)SEISMIC_CONST_SINKHORN_SPLIT;
     const unsigned rows = (unsigned)SEISMIC_DIM_M, row0 = blockIdx.y * TILE, span = (width + split - 1u) / split;
     const unsigned first = blockIdx.x * span, last = min(first + span, width);
-    const unsigned warp = threadIdx.x / 32u, lane = threadIdx.x % 32u, stripe = warp / GROUPS;
+    const unsigned warp = threadIdx.x / 32u, lane = threadIdx.x % 32u;
     const float *x[PER];
     bool live[PER];
 #pragma unroll
@@ -154,27 +204,75 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
 #pragma unroll
         for (unsigned j = 0; j < SUMS; ++j)
             sums[r][j] = 0.0f;
-    // Column `at` of every row this lane holds.
-    auto take = [&](unsigned at, const float (&f)[MIXES]) {
-        const unsigned stream = at / h, column = at % h;
-#pragma unroll
-        for (unsigned r = 0; r < PER; ++r) {
-            const float v = x[r][(u64)stream * SEISMIC_HIDDEN_STRIDE_1 + (u64)column * SEISMIC_HIDDEN_STRIDE_2];
-            sums[r][0] = __fmaf_rn(v, v, sums[r][0]);
-#pragma unroll
-            for (unsigned j = 0; j < MIXES; ++j)
-                sums[r][1u + j] = __fmaf_rn(f[j], v, sums[r][1u + j]);
-        }
-    };
     if constexpr (TILE == 1u) {
-        for (unsigned at = first + stripe * 32u + lane; at < last; at += PASS) {
-            float f[MIXES];
+        const bool unit_strided = SEISMIC_HIDDEN_STRIDE_2 == 1 && SEISMIC_FUNCTION_STRIDE_1 == 1 &&
+                                  (SEISMIC_FUNCTION_STRIDE_0 & 3u) == 0u;
+        for (unsigned s = 0; s < STREAMS; ++s) {
+            const unsigned s_begin = s * h;
+            const unsigned s_end = s_begin + h;
+            const unsigned lo = max(first, s_begin);
+            const unsigned hi = min(last, s_end);
+            if (lo >= hi)
+                continue;
+            const unsigned col_lo = lo - s_begin;
+            const unsigned col_hi = hi - s_begin;
+            const float *xs = x[0] + (u64)s * SEISMIC_HIDDEN_STRIDE_1;
+            auto take_scalar = [&](unsigned col) {
+                const unsigned at = s_begin + col;
+                const float v = xs[(u64)col * SEISMIC_HIDDEN_STRIDE_2];
+                sums[0][0] = __fmaf_rn(v, v, sums[0][0]);
 #pragma unroll
-            for (unsigned j = 0; j < MIXES; ++j)
-                f[j] = function[(u64)j * SEISMIC_FUNCTION_STRIDE_0 + (u64)at * SEISMIC_FUNCTION_STRIDE_1];
-            take(at, f);
+                for (unsigned j = 0; j < MIXES; ++j) {
+                    const float fj = function[(u64)j * SEISMIC_FUNCTION_STRIDE_0 + (u64)at * SEISMIC_FUNCTION_STRIDE_1];
+                    sums[0][1u + j] = __fmaf_rn(fj, v, sums[0][1u + j]);
+                }
+            };
+            const u64 x_addr = reinterpret_cast<u64>(xs + col_lo);
+            const u64 f_addr = reinterpret_cast<u64>(function + lo);
+            if (unit_strided && ((x_addr & 15u) == (f_addr & 15u))) {
+                const unsigned mis = (unsigned)((x_addr >> 2) & 3u);
+                const unsigned head = (mis == 0u) ? 0u : (4u - mis);
+                const unsigned vec_lo = min(col_lo + head, col_hi);
+                const unsigned vec_hi = vec_lo + ((col_hi - vec_lo) & ~3u);
+                for (unsigned col = col_lo + threadIdx.x; col < vec_lo; col += PASS)
+                    take_scalar(col);
+                for (unsigned col = vec_lo + threadIdx.x * 4u; col < vec_hi; col += PASS * 4u) {
+                    const float4 v = *reinterpret_cast<const float4 *>(xs + col);
+                    sums[0][0] = __fmaf_rn(v.x, v.x, sums[0][0]);
+                    sums[0][0] = __fmaf_rn(v.y, v.y, sums[0][0]);
+                    sums[0][0] = __fmaf_rn(v.z, v.z, sums[0][0]);
+                    sums[0][0] = __fmaf_rn(v.w, v.w, sums[0][0]);
+                    const unsigned at = s_begin + col;
+#pragma unroll
+                    for (unsigned j = 0; j < MIXES; ++j) {
+                        const float4 fj = *reinterpret_cast<const float4 *>(
+                            function + (u64)j * SEISMIC_FUNCTION_STRIDE_0 + (u64)at);
+                        sums[0][1u + j] = __fmaf_rn(fj.x, v.x, sums[0][1u + j]);
+                        sums[0][1u + j] = __fmaf_rn(fj.y, v.y, sums[0][1u + j]);
+                        sums[0][1u + j] = __fmaf_rn(fj.z, v.z, sums[0][1u + j]);
+                        sums[0][1u + j] = __fmaf_rn(fj.w, v.w, sums[0][1u + j]);
+                    }
+                }
+                for (unsigned col = vec_hi + threadIdx.x; col < col_hi; col += PASS)
+                    take_scalar(col);
+            } else {
+                for (unsigned col = col_lo + threadIdx.x; col < col_hi; col += PASS)
+                    take_scalar(col);
+            }
         }
     } else {
+        // Column `at` of every row this lane holds.
+        auto take = [&](unsigned at, const float (&f)[MIXES]) {
+            const unsigned stream = at / h, column = at % h;
+#pragma unroll
+            for (unsigned r = 0; r < PER; ++r) {
+                const float v = x[r][(u64)stream * SEISMIC_HIDDEN_STRIDE_1 + (u64)column * SEISMIC_HIDDEN_STRIDE_2];
+                sums[r][0] = __fmaf_rn(v, v, sums[r][0]);
+#pragma unroll
+                for (unsigned j = 0; j < MIXES; ++j)
+                    sums[r][1u + j] = __fmaf_rn(f[j], v, sums[r][1u + j]);
+            }
+        };
         for (unsigned chunk = first; chunk < last; chunk += CHUNK) {
             const unsigned count = min(CHUNK, last - chunk);
             __syncthreads();
@@ -258,7 +356,8 @@ STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_tiles, PREFILL_TILE, MIXES * CHUNK)
 extern "C" __global__ void stream_mix_sinkhorn_finish(SEISMIC_KERNEL_PARAMS) {
     typedef unsigned long long u64;
     __shared__ float reduced[SUMS];
-    __shared__ float comb[STREAMS * STREAMS];
+    __shared__ float comb[STREAMS * STREAMS <= 32u ? 1u : STREAMS * STREAMS];
+    __shared__ float own_pre[CARRIED ? 1u : STREAMS];
     const float *base = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BASE));
     const float *scale = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCALE));
     const float *partials = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS));
@@ -275,28 +374,26 @@ extern "C" __global__ void stream_mix_sinkhorn_finish(SEISMIC_KERNEL_PARAMS) {
         reduced[threadIdx.x] = total;
     }
     __syncthreads();
-    const float inverse = rsqrtf(reduced[0] / (float)width + norm_epsilon);
-    float mixes[MIXES];
-#pragma unroll
-    for (unsigned j = 0; j < MIXES; ++j)
-        mixes[j] = reduced[1u + j] * inverse;
+    const float inverse =
+        (threadIdx.x < STREAMS * STREAMS) ? rsqrtf(reduced[0] / (float)width + norm_epsilon) : 0.0f;
     if constexpr (CARRIED) {
         const element::Out<element::F32> pre = SEISMIC_RESULT_1_OUT.offset((u64)row * SEISMIC_RESULT_1_STRIDE_0);
         publish_coefficients(
-            mixes, comb, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
+            reduced, inverse, comb, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
             [&](unsigned stream, float value) { pre.put((u64)stream * SEISMIC_RESULT_1_STRIDE_1, value); }, join,
             SEISMIC_RESULT_2_STRIDE_1, epsilon, iterations);
     } else {
-        // Every thread holds its mixes, so `reduced` takes the pre.
+        // `own_pre` is separate from `reduced`, so writing pre cannot race with
+        // participating threads reading `reduced`.
         publish_coefficients(
-            mixes, comb, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
-            [&](unsigned stream, float value) { reduced[stream] = value; }, join, SEISMIC_RESULT_2_STRIDE_1, epsilon,
+            reduced, inverse, comb, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
+            [&](unsigned stream, float value) { own_pre[stream] = value; }, join, SEISMIC_RESULT_2_STRIDE_1, epsilon,
             iterations);
         __syncthreads();
         // The sublayer's input: the streams mixed by this site's pre.
         const float *hidden = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN));
         streams::collapse<STREAMS>(hidden + (u64)row * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
-                                   SEISMIC_HIDDEN_STRIDE_2, reduced, 1u,
+                                   SEISMIC_HIDDEN_STRIDE_2, own_pre, 1u,
                                    SEISMIC_RESULT_0_OUT.offset((u64)row * SEISMIC_RESULT_0_STRIDE_0),
                                    SEISMIC_RESULT_0_STRIDE_1, SEISMIC_DIM_H, threadIdx.x, THREADS);
     }
