@@ -151,9 +151,9 @@ projection routed for metal:
     let USED_EXPERTS = STACKED * min(E, B) + 1 - STACKED for grouped
     let ORDINAL_BYTES = STACKED * ceil_div(B, 4) * 16 for grouped
     params (SIMDGROUPS in [2, 4, 8, 16] default 2 for choice, ROWS in [1, 2, 4] default 1 for choice,
-        arithmetic LANES in [32, 16] default 32 for choice, form GATHERED in [0, 1] default 1 for choice,
+        arithmetic LANES in [32, 16] default 32 for choice, form GATHERED in [0, 1] default 0 for choice,
         ROWS in [2, 1, 4, 8] default 2 for summed, arithmetic LANES in [8, 16, 32, 4] default 8 for summed,
-        form GATHERED in [0, 1] default 1 for summed,
+        form GATHERED in [0, 1] default 0 for summed,
         TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
         form TALL in [0, 1] default (1 - STACKED) for grouped, arithmetic form INT8 in [0, 1] default 0 for grouped,
         arithmetic form PACK in [0, 1] default 0 for grouped, form DOWN_TALL in [0, 1] default (1 - STACKED) for grouped,
@@ -1748,6 +1748,7 @@ native routed_gate_up for metal from "metal/routed_gate_up.metal":
     records (expert_gate, expert_up, tier_gate, tier_up)
     project routed choice (expert_gate, expert_up)
     restate SIMDGROUPS in [2, 4, 8, 16] default 8
+    restate ROWS in [1, 2, 4] default 2
     restate arithmetic LANES in [32, 16] default 16
 
 # Metal: `routed_gate_up_part` projects in `routed_gate_up`'s streamed forms
@@ -1758,6 +1759,7 @@ native routed_gate_up_part for metal from "metal/routed_gate_up_part.metal":
     records (expert_gate, expert_up, tier_gate, tier_up)
     project routed choice (expert_gate, expert_up)
     restate SIMDGROUPS in [2, 4, 8, 16] default 8
+    restate ROWS in [1, 2, 4] default 2
     restate arithmetic LANES in [32, 16] default 16
 
 native routed_gate_up for cuda from "cuda/routed_gate_up.cu":
