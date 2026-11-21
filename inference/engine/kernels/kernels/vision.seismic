@@ -79,7 +79,7 @@ native vision_patch_stem for cuda from "cuda/vision_patch_stem.cu":
     scratch converted bytes (M * (1 + S) * ceil_div(C * P * P, 8) * 8 * 2)
     scratch partial bytes (M * H * 4)
     launch vision_patch_stem_convert:
-        threadgroups (ceil_div(M * (1 + S) * ceil_div(C * P * P, 8) * 8, 256), 1, 1)
+        threadgroups (M, 1 + S, ceil_div(ceil_div(C * P * P, 8) * 2, 256))
         threads_per_threadgroup (256, 1, 1)
     launch vision_patch_stem_first when S == 1:
         threadgroups (ceil_div(H, 128), ceil_div(M, 128), 1)
