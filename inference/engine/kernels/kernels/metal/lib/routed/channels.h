@@ -396,7 +396,7 @@ inline void project_gathered_expert(device const uchar *product, ulong p0, ulong
     uint first, uint sg, uint lane, threadgroup float *region, Published published) {
     constexpr uint TILE = (32u / LANES) * ROWS;
     const Gathered chosen =
-        gather(routes, r0, r1, sources, source_rows, src1, src2, m_rows, K, m * K + sg, SLOTS, 1);
+        gather(routes, r0, r1, sources, source_rows, src1, src2, m_rows, K, m * K + sg, SLOTS, 1, lane);
     if (chosen.count == 0)
         return;
     const slab::Source source = decode_source(sources, source_rows, src1, src2, m, sg, chosen.expert);

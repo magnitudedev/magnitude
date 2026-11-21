@@ -108,12 +108,13 @@ struct Gathered {
 // product rows at strides `p0`, `p1`; none where `at` is inactive or an
 // earlier active choice shares its expert and source, and `at` alone where its
 // source is none (for instance a front row's skipped choice beside an exact
-// row's record). Every thread computes the same. The form is admitted at
+// row's record). The simdgroup scans 32 choices per step via `simd_ballot`
+// and every lane receives the same result. The form is admitted at
 // M <= VERIFY_ROWS, and a row names an expert once, so the bound on `count`
 // never binds; it keeps the tables in bounds.
 template <typename Active>
 inline Gathered gather(device const int *routes, ulong s0, ulong s1, device const int *sources, ulong source_rows,
-    ulong src1, ulong src2, uint m_rows, uint slots, uint at, ulong p0, ulong p1, Active active) {
+    ulong src1, ulong src2, uint m_rows, uint slots, uint at, ulong p0, ulong p1, uint lane, Active active) {
     Gathered chosen;
     const uint at_m = at / slots, at_k = at % slots;
     chosen.expert = routes[ulong(at_m) * s0 + ulong(at_k) * s1];
@@ -135,29 +136,52 @@ inline Gathered gather(device const int *routes, ulong s0, ulong s1, device cons
         const slab::Source source = decode_source(sources, source_rows, src1, src2, m, k, chosen.expert);
         return source.code == at_source.code && active(c, source);
     };
-    for (uint c = 0; c < at; ++c)
-        if (shares(c, c / slots, c % slots))
-            return chosen;
-    for (uint c = at; c < m_rows * slots && chosen.count < uint(SEISMIC_CONST_VERIFY_ROWS); ++c) {
-        const uint m = c / slots, k = c % slots;
-        if (shares(c, m, k)) {
-            chosen.rows[chosen.count] = m;
-            chosen.products[chosen.count] = uint(ulong(m) * p0 + ulong(k) * p1);
+    const uint total = m_rows * slots;
+    for (uint base = 0; base < total; base += 32u) {
+        const uint c = base + lane;
+        uint m = 0u, k = 0u;
+        bool match = false;
+        if (c < total) {
+            if (c == at) {
+                m = at_m;
+                k = at_k;
+                match = true;
+            } else {
+                m = c / slots;
+                k = c % slots;
+                match = shares(c, m, k);
+            }
+        }
+        uint mask = uint(uint64_t(metal::simd_ballot(match)));
+        if (base < at) {
+            const uint earlier = at - base >= 32u ? 0xffffffffu : ((1u << (at - base)) - 1u);
+            if ((mask & earlier) != 0u)
+                return chosen;
+        }
+        while (mask != 0u && chosen.count < uint(SEISMIC_CONST_VERIFY_ROWS)) {
+            const uint bit = metal::ctz(mask);
+            mask &= mask - 1u;
+            const uint hit_m = metal::simd_shuffle(m, ushort(bit));
+            const uint hit_k = metal::simd_shuffle(k, ushort(bit));
+            chosen.rows[chosen.count] = hit_m;
+            chosen.products[chosen.count] = uint(ulong(hit_m) * p0 + ulong(hit_k) * p1);
             ++chosen.count;
         }
+        if (chosen.count >= uint(SEISMIC_CONST_VERIFY_ROWS))
+            break;
     }
     return chosen;
 }
 
 inline Gathered gather(device const int *routes, ulong s0, ulong s1, device const int *sources, ulong source_rows,
-    ulong src1, ulong src2, uint m_rows, uint slots, uint at, ulong p0, ulong p1) {
-    return gather(routes, s0, s1, sources, source_rows, src1, src2, m_rows, slots, at, p0, p1,
+    ulong src1, ulong src2, uint m_rows, uint slots, uint at, ulong p0, ulong p1, uint lane) {
+    return gather(routes, s0, s1, sources, source_rows, src1, src2, m_rows, slots, at, p0, p1, lane,
         [](uint, slab::Source) { return true; });
 }
 
 inline Gathered gather(device const int *routes, ulong s0, ulong s1, uint m_rows, uint slots, uint at, ulong p0,
-    ulong p1) {
-    return gather(routes, s0, s1, nullptr, 0, 0, 0, m_rows, slots, at, p0, p1);
+    ulong p1, uint lane) {
+    return gather(routes, s0, s1, nullptr, 0, 0, 0, m_rows, slots, at, p0, p1, lane);
 }
 
 // The activation rows a gathered GEMV reads: row r is `rows[r]`.

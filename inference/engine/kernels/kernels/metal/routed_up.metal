@@ -77,7 +77,8 @@ typedef projection::operands<NVFP4> Operands;
         return;                                                                                                        \
     const routed::Gathered chosen = routed::gather(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,           \
         sources, SEISMIC_DIM_XS, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2,                                   \
-        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), group.y, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1);       \
+        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), group.y, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,       \
+        lane);                                                                                                         \
     if (chosen.count == 0)                                                                                             \
         return;                                                                                                        \
     /* Every choice of an expert has its one source. */                                                                \
