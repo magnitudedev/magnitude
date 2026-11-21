@@ -23,6 +23,28 @@ inline float group_sum(float value, threadgroup float *partials, uint sg, uint l
     return total;
 }
 
+// Sum of N independent values per thread of a threadgroup of SIMDGROUPS
+// simdgroups in a single barrier pair. `partials` holds N * SIMDGROUPS floats;
+// the leading barrier lets consecutive calls share it. Every thread of the
+// threadgroup must call it.
+template <uint N, uint SIMDGROUPS>
+inline void group_sum_n(thread float (&values)[N], threadgroup float *partials, uint sg, uint lane) {
+    for (uint k = 0; k < N; ++k)
+        values[k] = simd_sum(values[k]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        for (uint k = 0; k < N; ++k)
+            partials[k * SIMDGROUPS + sg] = values[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k = 0; k < N; ++k) {
+        float total = 0.0f;
+        for (uint j = 0; j < SIMDGROUPS; ++j)
+            total += partials[k * SIMDGROUPS + j];
+        values[k] = total;
+    }
+}
+
 // Maximum of one value per thread, as `group_sum`.
 template <uint SIMDGROUPS>
 inline float group_max(float value, threadgroup float *partials, uint sg, uint lane) {
@@ -37,14 +59,22 @@ inline float group_max(float value, threadgroup float *partials, uint sg, uint l
     return maximum;
 }
 
+// A (score, index) candidate for argmax reductions.
+struct Candidate {
+    float score;
+    int index;
+};
+
 // Tie rules of an argmax: among candidates of equal score, the higher or the
 // lower index wins.
 struct HigherIndex {
     static int pick(int candidate) { return simd_max(candidate); }
+    static inline bool wins_tie(int a, int b) { return a > b; }
     static constant constexpr int none = -1;
 };
 struct LowerIndex {
     static int pick(int candidate) { return simd_min(candidate); }
+    static inline bool wins_tie(int a, int b) { return a < b; }
     static constant constexpr int none = 0x7fffffff;
 };
 
@@ -116,6 +146,28 @@ inline Located span_locate(ulong count, uint at, Length length, uint lane) {
         carried += simd_sum(own);
     }
     return Located{count, carried};
+}
+
+// Maximum score and winning index under TIES across a threadgroup of
+// SIMDGROUPS simdgroups. `partials` holds SIMDGROUPS Candidates; the leading
+// barrier lets consecutive calls share it. Every thread of the threadgroup
+// must call it.
+template <typename TIES, uint SIMDGROUPS>
+inline Candidate group_argmax(Candidate local, threadgroup Candidate *partials, uint sg, uint lane) {
+    float sg_score;
+    const int sg_index = argmax<TIES>(local.score, local.index, sg_score);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0)
+        partials[sg] = Candidate{sg_score, sg_index};
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    Candidate best = partials[0];
+    for (uint j = 1; j < SIMDGROUPS; ++j) {
+        const Candidate c = partials[j];
+        if (best.score != best.score || c.score > best.score ||
+            (c.score == best.score && TIES::wins_tie(c.index, best.index)))
+            best = c;
+    }
+    return best;
 }
 
 } // namespace reduce

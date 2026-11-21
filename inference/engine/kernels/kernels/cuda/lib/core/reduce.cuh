@@ -23,6 +23,32 @@ __device__ __forceinline__ float group_sum(float value, float *partials) {
     return total;
 }
 
+// Sum of N independent values per thread of the block in a single barrier pair.
+// `partials` holds N * warps floats (at most 32 * N); the leading barrier lets
+// consecutive calls share it. Every thread of the block must call it.
+template <unsigned N>
+__device__ __forceinline__ void group_sum_n(float (&values)[N], float *partials) {
+#pragma unroll
+    for (unsigned k = 0; k < N; ++k)
+        values[k] = seismic_warp_sum_f32(values[k]);
+    const unsigned warps = blockDim.x / 32;
+    const unsigned warp = threadIdx.x / 32;
+    __syncthreads();
+    if (threadIdx.x % 32 == 0) {
+#pragma unroll
+        for (unsigned k = 0; k < N; ++k)
+            partials[k * warps + warp] = values[k];
+    }
+    __syncthreads();
+#pragma unroll
+    for (unsigned k = 0; k < N; ++k) {
+        float total = 0.0f;
+        for (unsigned w = 0; w < warps; ++w)
+            total += partials[k * warps + w];
+        values[k] = total;
+    }
+}
+
 // Maximum of one value per thread, as `group_sum`.
 __device__ __forceinline__ float group_max(float value, float *partials) {
     value = seismic_warp_max_f32(value);
@@ -53,14 +79,22 @@ __device__ __forceinline__ float group_peak(float value, float *partials) {
     return __uint_as_float(bits);
 }
 
+// A (score, index) candidate for argmax reductions.
+struct Candidate {
+    float score;
+    int index;
+};
+
 // Tie rules of an argmax: among candidates of equal score, the higher or the
 // lower index wins.
 struct HigherIndex {
     __device__ static __forceinline__ int pick(int candidate) { return seismic_redux_max_s32(candidate); }
+    __device__ static __forceinline__ bool wins_tie(int a, int b) { return a > b; }
     static constexpr int none = -1;
 };
 struct LowerIndex {
     __device__ static __forceinline__ int pick(int candidate) { return seismic_redux_min_s32(candidate); }
+    __device__ static __forceinline__ bool wins_tie(int a, int b) { return a < b; }
     static constexpr int none = 0x7fffffff;
 };
 
@@ -69,6 +103,28 @@ struct LowerIndex {
 template <class TIES> __device__ __forceinline__ int argmax(float score, int index, float &best) {
     best = seismic_warp_max_f32(score);
     return TIES::pick(score == best ? index : TIES::none);
+}
+
+// Maximum score and winning index under TIES across the block. `partials`
+// holds one Candidate per warp (at most 32); the leading barrier lets
+// consecutive calls share it. Every thread of the block must call it.
+template <class TIES>
+__device__ __forceinline__ Candidate group_argmax(Candidate local, Candidate *partials) {
+    float warp_score;
+    const int warp_index = argmax<TIES>(local.score, local.index, warp_score);
+    const unsigned warps = blockDim.x / 32;
+    __syncthreads();
+    if (threadIdx.x % 32 == 0)
+        partials[threadIdx.x / 32] = Candidate{warp_score, warp_index};
+    __syncthreads();
+    Candidate best = partials[0];
+    for (unsigned w = 1; w < warps; ++w) {
+        const Candidate c = partials[w];
+        if (best.score != best.score || c.score > best.score ||
+            (c.score == best.score && TIES::wins_tie(c.index, best.index)))
+            best = c;
+    }
+    return best;
 }
 
 // Integer prefix sums over a warp or a block, exact in any order, and the
