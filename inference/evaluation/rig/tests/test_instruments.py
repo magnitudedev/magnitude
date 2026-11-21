@@ -1084,6 +1084,43 @@ def test_bench_serves_a_held_set_in_place_of_a_catalog_model(tmp_path):
             REGISTRY["bench"].plan(parse(*common, *refused), None, "alpha")
 
 
+def test_bench_answer_surfaces_tuning_health_alert_when_truncated_or_absent_from_report(tmp_path):
+    from magnitude_rig.instruments import bench
+
+    # No tuning.jsonl / no tuning_health -> unchanged report lines, zero extra output.
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    (clean / "report.md").write_text("# Serving bench\n\nStatus: **completed**\n")
+    ans = bench.answer(None, {"bench": JobResult(clean, clean / "log", 0)})
+    assert ans.ok and ans.lines == ("# Serving bench", "", "Status: **completed**")
+
+    # Long report (> REPORT_LINES) with tuning_health in summary.json -> appends 1–2 alert lines.
+    noisy = tmp_path / "noisy"
+    noisy.mkdir()
+    (noisy / "report.md").write_text("\n".join(f"line {i}" for i in range(bench.REPORT_LINES + 5)) + "\n")
+    (noisy / "summary.json").write_text(json.dumps({
+        "tuning_health": {
+            "total_units": 357,
+            "qualified": 5,
+            "canonical_fallbacks": 352,
+            "fallback_rate": 352 / 357,
+            "high_fallback": True,
+            "expired": 55,
+            "total_default_gaps": 1,
+            "worst_default_gaps": [{
+                "unit": "stream_mix_up [M=1..9]", "default_us": 46.5, "best_us": 36.1, "ratio": 1.29,
+            }],
+            "slowest_fallbacks": [{
+                "unit": "stream_mix_down [M=65..]", "median_us": 435.0, "weighted_ms": 87.4,
+            }],
+        }
+    }))
+    ans = bench.answer(None, {"bench": JobResult(noisy, noisy / "log", 0)})
+    assert ans.ok
+    assert any("WARNING 352/357 (98.6%)" in line for line in ans.lines)
+    assert any("stream_mix_up [M=1..9]" in line for line in ans.lines)
+
+
 def test_kl_builds_the_references_alone_before_any_build_is_judged(tmp_path):
     """`--references-only` renders the template's tokens and obtains the reference and each draw of the bar, which
     depend on the stored values and the tokens alone; no engine load runs, so no measurement job is needed."""

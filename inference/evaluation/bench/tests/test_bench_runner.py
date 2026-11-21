@@ -430,3 +430,108 @@ async def test_watchdog_retires_a_stalled_engine_and_fails_the_run(
     assert "watchdog" in result["error"] and reason in result["error"]
     events = (Path(result["path"]) / "events.jsonl").read_text()
     assert '"event":"watchdog"' in events
+
+
+def test_tuning_health_report_and_alerts(tmp_path):
+    def candidate(points: dict[str, float], admitted: bool = True):
+        return {
+            "admitted": admitted,
+            "outcome": {
+                "Measured": {
+                    "points": [{"point": label, "median_seconds": seconds} for label, seconds in points.items()]
+                }
+            },
+        }
+
+    def finished(entry: str, bindings: str, qualification: str, stop: str | None,
+                 weights: dict[str, float], candidates: list[dict]):
+        return {
+            "event": "finished",
+            "entry": entry,
+            "bindings": bindings,
+            "qualification": qualification,
+            "stop": stop,
+            "points": [{"label": label, "weight": weight} for label, weight in weights.items()],
+            "candidates": candidates,
+        }
+
+    # Empty trace -> None and zero impact on markdown.
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("")
+    assert report.tuning_health(empty) is None
+    base = {**report.summarize([], "completed", "c", "id", 0), "key": "tools"}
+    assert "## Tuning health" not in report.markdown(base)
+
+    # Healthy trace: 10% fallback (1/10, not > 10%) and no >1.25x gap -> no stdout alert.
+    healthy_events = [
+        {"event": "began", "schema": "tuning-trace/3", "work": "search", "budget_seconds": 60.0},
+        *[
+            finished(f"ok_{i}", "M=1", "qualified", "Exhausted", {"m1": 10.0},
+                     [candidate({"m1": 1e-4}), candidate({"m1": 0.9e-4})])
+            for i in range(9)
+        ],
+        finished("fb_0", "M=1", "unqualified", "Exhausted", {"m1": 5.0},
+                 [candidate({"m1": 2e-4})]),
+        {"event": "concluded", "units": 10, "canonical_fallbacks": 1},
+    ]
+    healthy_trace = tmp_path / "healthy.jsonl"
+    healthy_trace.write_text("\n".join(json.dumps(e) for e in healthy_events) + "\n")
+    healthy = report.tuning_health(healthy_trace)
+    assert healthy is not None
+    assert not healthy["high_fallback"]
+    assert healthy["worst_default_gaps"] == []
+    assert report.tuning_health_alert(healthy) == []
+    healthy_md = report.markdown({**base, "tuning_health": healthy})
+    assert "## Tuning health" in healthy_md
+    assert "WARNING: High tuning fallback rate" not in healthy_md
+    assert "Qualified: 9/10" in healthy_md
+
+    # Unhealthy trace: prefers `search` load over subsequent `load`; checks weighted ratios,
+    # rejects non-admitted candidates, and ranks top 5 gaps and slowest fallbacks.
+    unhealthy_events = [
+        {"event": "began", "schema": "tuning-trace/3", "work": "search", "budget_seconds": 60.0},
+        # 2.5x gap (weighted); also has a faster unadmitted candidate that must be ignored.
+        finished("routed_output", "M=2..9", "qualified", "Expired", {"m2": 1.0, "m8": 3.0}, [
+            candidate({"m2": 2.0e-4, "m8": 2.0e-4}),
+            candidate({"m2": 0.8e-4, "m8": 0.8e-4}, admitted=True),
+            candidate({"m2": 0.2e-4, "m8": 0.2e-4}, admitted=False),
+        ]),
+        # Faster on tiny-weight m256, much slower on heavy m512 -> NOT a gap; ranked as fallback.
+        finished("stream_mix_down", "M=65..", "unqualified", "Exhausted", {"m256": 10.0, "m512": 190.0}, [
+            candidate({"m256": 5.0e-4, "m512": 4.0e-4}),
+            candidate({"m256": 2.0e-4, "m512": 10.0e-4}),
+        ]),
+        # Expired fallback with higher weighted cost.
+        finished("readout_rows", "M=1..2", "unqualified_budget", "Expired", {"m1": 50.0}, [
+            candidate({"m1": 2.0e-3}),
+        ]),
+        {"event": "concluded", "units": 3, "canonical_fallbacks": 2},
+        # Subsequent `load` (stored) without the expired candidate: must not shadow `search`.
+        {"event": "began", "schema": "tuning-trace/3", "work": "load", "budget_seconds": 60.0},
+        finished("routed_output", "M=2..9", "qualified", "Exhausted", {"m2": 1.0}, []),
+        {"event": "concluded", "units": 1, "canonical_fallbacks": 0},
+    ]
+    unhealthy_trace = tmp_path / "unhealthy.jsonl"
+    unhealthy_trace.write_text("\n".join(json.dumps(e) for e in unhealthy_events) + "\n")
+    health = report.tuning_health(unhealthy_trace)
+    assert health is not None
+    assert health["work"] == "search"
+    assert (health["qualified"], health["canonical_fallbacks"], health["total_units"], health["expired"]) == (1, 2, 3, 2)
+    assert health["high_fallback"] is True
+    assert len(health["worst_default_gaps"]) == 1
+    gap = health["worst_default_gaps"][0]
+    assert gap["entry"] == "routed_output"
+    assert gap["ratio"] == pytest.approx(2.5)
+    assert [row["entry"] for row in health["slowest_fallbacks"]] == ["readout_rows", "stream_mix_down"]
+    assert health["slowest_fallbacks"][0]["reason"] == "Expired"
+    assert health["slowest_fallbacks"][0]["weighted_ms"] == pytest.approx(100.0)
+
+    md = report.markdown({**base, "tuning_health": health})
+    assert "WARNING: High tuning fallback rate" in md
+    assert "2/3 (66.7%)" in md
+    assert "`routed_output [M=2..9]`" in md
+    assert "`readout_rows [M=1..2]`" in md
+    alert = report.tuning_health_alert(health)
+    assert len(alert) == 2
+    assert "WARNING 2/3 (66.7%)" in alert[0]
+    assert "routed_output [M=2..9]" in alert[1] and "2.50×" in alert[1]

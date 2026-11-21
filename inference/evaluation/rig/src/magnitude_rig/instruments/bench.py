@@ -19,6 +19,7 @@ binary.
 """
 
 import argparse
+import json
 
 from .. import sync, templates
 from ..engine import Step
@@ -80,6 +81,20 @@ def plan(arguments, source, host) -> Plan:
                 acquires=held.acquires(arguments), files=files)
 
 
+def _tuning_alert(directory) -> list[str]:
+    from magnitude_bench import record, report
+
+    health = None
+    summary_path = directory / "summary.json"
+    if summary_path.exists():
+        health = json.loads(summary_path.read_text()).get("tuning_health")
+    if health is None:
+        trace_path = directory / record.TUNING_TRACE
+        if trace_path.exists():
+            health = report.tuning_health(trace_path)
+    return report.tuning_health_alert(health) if health else []
+
+
 def answer(arguments, results: dict[str, JobResult]) -> Answer:
     priced = results.get("measure")  # only when our engine serves
     if priced is not None and priced.code != 0:
@@ -89,10 +104,13 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
     report = result.directory / "report.md"
     if result.code != 0 or not report.exists():
         return Answer((f"magnitude-bench exited {result.code}", *result.output()[-15:]), False)
-    lines = report.read_text().splitlines()
+    text = report.read_text()
+    lines = text.splitlines()
     shown = lines[:REPORT_LINES]
     if len(lines) > REPORT_LINES:
         shown.append(f"… {len(lines) - REPORT_LINES} more lines in {report}")
+    if len(lines) > REPORT_LINES or "## Tuning health" not in text:
+        shown.extend(_tuning_alert(result.directory))
     return Answer(tuple(shown), True)
 
 

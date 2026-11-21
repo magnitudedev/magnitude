@@ -389,6 +389,10 @@ async def run(
             [json.loads(line) for line in allocation_path.read_text().splitlines()],
             {target: adapter.expert_bank for target, adapter in adapters.items()},
         )
+    tuning_path = store.path / record.TUNING_TRACE
+    if tuning_path.exists():
+        if health := report.tuning_health(tuning_path):
+            summary["tuning_health"] = health
     summary["templates"] = [file.template for file in ordered]
     summary["key"] = ordered[0].sessions[0].key if ordered else None
     summary["path"] = str(store.path)

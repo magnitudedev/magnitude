@@ -1,9 +1,15 @@
 """Derived summaries with explicit eligibility, denominators, and timing boundaries."""
 
+import json
 import math
 import statistics
 from collections import Counter, defaultdict
 from collections.abc import Callable
+from pathlib import Path
+
+TUNING_FALLBACK_ALERT_RATE = 0.10
+TUNING_GAP_MIN_RATIO = 1.25
+TUNING_TOP_N = 5
 
 
 def summarize(
@@ -181,6 +187,197 @@ def _resize(resize: dict) -> dict:
             "at_unix_ms": fields["at_unix_ms"]}
 
 
+def _measured_points(candidate: dict) -> dict[str, float]:
+    """Point label -> median_seconds for a Measured candidate, or {} if unmeasured."""
+    outcome = candidate.get("outcome")
+    if not isinstance(outcome, dict) or "Measured" not in outcome:
+        return {}
+    return {
+        point["point"]: float(point["median_seconds"])
+        for point in outcome["Measured"].get("points", ())
+        if point.get("median_seconds") is not None
+    }
+
+
+def _weighted_seconds(points: dict[str, float], weights: dict[str, float]) -> tuple[float, float, float]:
+    """Return (weighted_mean_seconds, total_weight, weighted_total_seconds) over ``points``."""
+    total_weight = sum(weights.get(label, 0.0) for label in points)
+    if total_weight > 0.0:
+        weighted_total = sum(seconds * weights.get(label, 0.0) for label, seconds in points.items())
+        return weighted_total / total_weight, total_weight, weighted_total
+    mean = sum(points.values()) / len(points)
+    return mean, 0.0, 0.0
+
+
+def _fallback_reason(event: dict) -> str:
+    stop = event.get("stop")
+    if stop == "Expired":
+        return "Expired"
+    if stop == "NoRoom":
+        return "NoRoom"
+    if event.get("qualification") == "unqualified_rejected":
+        return "Rejected"
+    return "Canonical"
+
+
+def _compact_unit(unit: str, limit: int = 96) -> str:
+    return unit if len(unit) <= limit else f"{unit[: limit - 1]}…"
+
+
+def tuning_health(trace: Path) -> dict | None:
+    """Tuning coverage, worst default-vs-best gaps, and slowest untuned/fallback units from
+    ``tuning.jsonl`` (tuning-trace/3). Prefers the last ``search`` load when present (since a
+    subsequent ``load`` replays stored outcomes without transient expired attempts); returns
+    ``None`` when the trace has no load."""
+    loads: list[dict] = []
+    for raw in trace.read_text().splitlines():
+        if not raw.strip():
+            continue
+        event = json.loads(raw)
+        kind = event.get("event")
+        if kind == "began":
+            loads.append({"began": event, "finished": [], "budget": None, "concluded": None})
+        elif loads and kind == "finished":
+            loads[-1]["finished"].append(event)
+        elif loads and kind == "budget":
+            loads[-1]["budget"] = event
+        elif loads and kind == "concluded":
+            loads[-1]["concluded"] = event
+
+    populated = [load for load in loads if load["finished"] or load["concluded"] is not None]
+    if not populated:
+        return None
+    searches = [load for load in populated if load["began"].get("work") == "search"]
+    selected = searches[-1] if searches else populated[-1]
+
+    finished = selected["finished"]
+    concluded = selected["concluded"] or {}
+    if finished:
+        total_units = len(finished)
+        qualified = sum(1 for item in finished if item.get("qualification") == "qualified")
+        canonical_fallbacks = total_units - qualified
+        expired = sum(1 for item in finished if item.get("stop") == "Expired")
+        unqualified_budget = sum(1 for item in finished if item.get("qualification") == "unqualified_budget")
+    else:
+        total_units = int(concluded.get("units", 0))
+        canonical_fallbacks = int(concluded.get("canonical_fallbacks", 0))
+        qualified = max(0, total_units - canonical_fallbacks)
+        expired = 0
+        unqualified_budget = 0
+
+    fallback_rate = canonical_fallbacks / total_units if total_units else 0.0
+    refused = len((selected["budget"] or {}).get("refused") or ())
+
+    gaps: list[dict] = []
+    fallbacks: list[dict] = []
+    for item in finished:
+        entry = item.get("entry", "")
+        bindings = item.get("bindings", "")
+        unit = f"{entry} [{bindings}]" if bindings else entry
+        candidates = item.get("candidates") or ()
+        if not candidates:
+            continue
+        default_points = _measured_points(candidates[0])
+        if not default_points:
+            continue
+        weights = {
+            point["label"]: max(0.0, float(point.get("weight", 0.0)))
+            for point in (item.get("points") or ())
+        }
+        default_s, total_weight, weighted_total_s = _weighted_seconds(default_points, weights)
+
+        best_s = default_s
+        for candidate in candidates[1:]:
+            if not candidate.get("admitted"):
+                continue
+            cand_points = _measured_points(candidate)
+            if not all(label in cand_points for label in default_points):
+                continue
+            cand_s, _, _ = _weighted_seconds(
+                {label: cand_points[label] for label in default_points}, weights
+            )
+            if 0.0 < cand_s < best_s:
+                best_s = cand_s
+
+        if best_s > 0.0 and default_s / best_s > TUNING_GAP_MIN_RATIO:
+            gaps.append({
+                "unit": unit,
+                "entry": entry,
+                "bindings": bindings,
+                "default_us": default_s * 1e6,
+                "best_us": best_s * 1e6,
+                "ratio": default_s / best_s,
+                "qualification": item.get("qualification"),
+                "stop": item.get("stop"),
+            })
+
+        if item.get("qualification") != "qualified":
+            fallbacks.append({
+                "unit": unit,
+                "entry": entry,
+                "bindings": bindings,
+                "reason": _fallback_reason(item),
+                "median_us": default_s * 1e6,
+                "weight": total_weight,
+                "weighted_ms": weighted_total_s * 1e3,
+            })
+
+    gaps.sort(key=lambda row: row["ratio"], reverse=True)
+    fallbacks.sort(key=lambda row: (row["weighted_ms"], row["median_us"]), reverse=True)
+    return {
+        "work": selected["began"].get("work"),
+        "budget_seconds": selected["began"].get("budget_seconds"),
+        "total_units": total_units,
+        "qualified": qualified,
+        "canonical_fallbacks": canonical_fallbacks,
+        "fallback_rate": fallback_rate,
+        "high_fallback": fallback_rate > TUNING_FALLBACK_ALERT_RATE,
+        "expired": expired,
+        "unqualified_budget": unqualified_budget,
+        "refused": refused,
+        "total_default_gaps": len(gaps),
+        "worst_default_gaps": gaps[:TUNING_TOP_N],
+        "slowest_fallbacks": fallbacks[:TUNING_TOP_N],
+    }
+
+
+def tuning_health_alert(health: dict) -> list[str]:
+    """One or two concise stdout lines when tuning health has issues, or [] when clean."""
+    high_fallback = health.get("high_fallback", False)
+    gaps = health.get("worst_default_gaps") or ()
+    if not high_fallback and not gaps:
+        return []
+    lines: list[str] = []
+    total = health["total_units"]
+    fallbacks = health["canonical_fallbacks"]
+    qualified = health["qualified"]
+    expired = health["expired"]
+    pct = 100.0 * health["fallback_rate"]
+    if high_fallback:
+        slowest = (health.get("slowest_fallbacks") or (None,))[0]
+        tail = ""
+        if slowest is not None:
+            cost = (
+                f"{slowest['weighted_ms']:.1f} weighted ms"
+                if slowest["weighted_ms"] > 0.0
+                else f"{slowest['median_us']:.1f} µs"
+            )
+            tail = f"; slowest fallback: {_compact_unit(slowest['unit'], 64)} ({cost})"
+        lines.append(
+            f"Tuning health: WARNING {fallbacks}/{total} ({pct:.1f}%) canonical fallbacks "
+            f"({qualified}/{total} qualified, {expired} expired){tail}"
+        )
+    if gaps:
+        worst = gaps[0]
+        count = health.get("total_default_gaps", len(gaps))
+        lines.append(
+            f"Tuning default gaps: {count} unit{'s' if count != 1 else ''} >{TUNING_GAP_MIN_RATIO:g}×; "
+            f"worst: {_compact_unit(worst['unit'], 64)} "
+            f"{worst['default_us']:.1f} µs → {worst['best_us']:.1f} µs ({worst['ratio']:.2f}×)"
+        )
+    return lines
+
+
 def markdown(summary: dict) -> str:
     def number(value):
         return "—" if value is None else f"{value:,.1f}"
@@ -319,6 +516,57 @@ def markdown(summary: dict) -> str:
                 f"{bank['min_slots']}–{bank['max_slots']} | {bank['floor']} | {bank['ceiling']} | {resizes} "
                 f"| {last} |"
             )
+    if health := summary.get("tuning_health"):
+        lines += _tuning_health_markdown(health)
     if summary.get("error"):
         lines += ["", "Run error:", "```text", summary["error"], "```"]
     return "\n".join(lines) + "\n"
+
+
+def _tuning_health_markdown(health: dict) -> list[str]:
+    total = health["total_units"]
+    qualified = health["qualified"]
+    fallbacks = health["canonical_fallbacks"]
+    expired = health["expired"]
+    pct = 100.0 * health["fallback_rate"]
+    lines = ["", "## Tuning health", ""]
+    if health["high_fallback"]:
+        lines.append(
+            f"> **WARNING: High tuning fallback rate** — {fallbacks}/{total} ({pct:.1f}%) units "
+            f"fell back to canonical default ({qualified}/{total} qualified, {expired} expired)."
+        )
+    else:
+        lines.append(
+            f"Qualified: {qualified}/{total} · Canonical fallbacks: {fallbacks}/{total} "
+            f"({pct:.1f}%) · Expired: {expired}."
+        )
+    gaps = health.get("worst_default_gaps") or ()
+    if gaps:
+        lines += [
+            "",
+            f"Worst `default` vs. `tuned` gaps (>{TUNING_GAP_MIN_RATIO:g}×; "
+            f"{health.get('total_default_gaps', len(gaps))} total):",
+            "",
+            "| Unit | Default µs | Best µs | Ratio | Status |",
+            "| --- | ---: | ---: | ---: | --- |",
+        ]
+        for row in gaps:
+            lines.append(
+                f"| `{_compact_unit(row['unit'])}` | {row['default_us']:,.1f} | "
+                f"{row['best_us']:,.1f} | {row['ratio']:.2f}× | {row['qualification'] or '—'} |"
+            )
+    slowest = health.get("slowest_fallbacks") or ()
+    if slowest:
+        lines += [
+            "",
+            "Slowest untuned / fallback units:",
+            "",
+            "| Unit | Reason | Median µs | Weight | Weighted ms |",
+            "| --- | --- | ---: | ---: | ---: |",
+        ]
+        for row in slowest:
+            lines.append(
+                f"| `{_compact_unit(row['unit'])}` | {row['reason']} | "
+                f"{row['median_us']:,.1f} | {row['weight']:,.1f} | {row['weighted_ms']:,.2f} |"
+            )
+    return lines

@@ -257,6 +257,11 @@ def job(argv: list[str], args: argparse.Namespace) -> int:
         )
     )
     print(f"{summary['status']}: {summary['path']}/report.md\n{summary.get('error') or ''}")
+    if health := summary.get("tuning_health"):
+        from . import report
+
+        for line in report.tuning_health_alert(health):
+            print(line)
     return 0 if summary["status"] == "completed" else 130 if summary["status"] == "cancelled" else 1
 
 
