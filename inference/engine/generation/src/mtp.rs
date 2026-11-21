@@ -42,7 +42,7 @@ use magnitude_executor::{
     Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, HeadPhase, LaunchDuration,
     Guess, GuessKind, Operation, Outcome, RequestId, SelectSpec, Selected, StreamedVerifyPrior, TokenId,
 };
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 
 #[derive(Clone, Debug)]
 pub struct Mtp {
@@ -268,8 +268,7 @@ pub(crate) fn proposal(selected: &[Selected]) -> Result<Vec<TokenId>, String> {
         .iter()
         .map_while(|selected| match *selected {
             Selected::Token(token) => Some(token),
-            Selected::Empty | Selected::Declined => None,
-            Selected::NonFinite => unreachable!("checked above"),
+            Selected::Empty | Selected::Declined | Selected::NonFinite => None,
         })
         .collect())
 }
@@ -377,6 +376,110 @@ impl AnchorRow {
     }
 }
 
+/// Tail of an own-history drafter past its entered rows.
+#[derive(Clone)]
+enum OwnHistoryTail {
+    /// No pending pairs and no open feature; not anchored.
+    Empty,
+    /// Complete pairs awaiting entry whose final pair is not the current anchor
+    /// (restored from a checkpoint or left behind by a round that published no
+    /// feature). Every pair lies inside the retained target prefix.
+    Unanchored(PendingRows),
+    /// A committed feature whose successor token is not known yet, optionally
+    /// preceded by complete pairs awaiting entry.
+    Open {
+        pending: Option<PendingRows>,
+        open: OpenFeature,
+    },
+    /// Complete pairs awaiting entry whose final pair is the current anchor:
+    /// the last accepted token with the target feature that selected it.
+    Anchored(PendingRows),
+}
+
+impl OwnHistoryTail {
+    fn from_trailing(pending: Option<PendingRows>, open: Option<OpenFeature>) -> Self {
+        match (pending, open) {
+            (None, None) => Self::Empty,
+            (Some(pending), None) => Self::Unanchored(pending),
+            (pending, Some(open)) => Self::Open { pending, open },
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Unanchored(rows) | Self::Anchored(rows) => rows.tokens.len(),
+            Self::Open { pending, .. } => pending.as_ref().map_or(0, |rows| rows.tokens.len()),
+        }
+    }
+
+    fn has_open(&self) -> bool {
+        matches!(self, Self::Open { .. })
+    }
+
+    fn host_bytes(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Unanchored(rows) | Self::Anchored(rows) => rows.features.bytes().len(),
+            Self::Open { pending, open } => {
+                pending
+                    .as_ref()
+                    .map_or(0, |rows| rows.features.bytes().len())
+                    + open.host_bytes()
+            }
+        }
+    }
+
+    /// Split off all pending pairs except the last `keep` for an entry-only
+    /// head transaction, returning the pairs to enter and the remaining tail.
+    fn split_flush(&self, keep: usize) -> Result<Option<(PendingRows, Self)>, String> {
+        enum Kind<'a> {
+            Unanchored,
+            Anchored,
+            Open(&'a OpenFeature),
+        }
+        let (rows, kind) = match self {
+            Self::Empty | Self::Open { pending: None, .. } => return Ok(None),
+            Self::Unanchored(rows) => (rows, Kind::Unanchored),
+            Self::Anchored(rows) => (rows, Kind::Anchored),
+            Self::Open {
+                pending: Some(rows),
+                open,
+            } => (rows, Kind::Open(open)),
+        };
+        let Some(entered) = rows.tokens.len().checked_sub(keep).filter(|&n| n > 0) else {
+            return Ok(None);
+        };
+        let to_enter = PendingRows {
+            tokens: rows.tokens[..entered].to_vec(),
+            features: rows
+                .features
+                .slice(0, entered)
+                .map_err(|error| error.to_string())?,
+        };
+        let kept = (keep > 0)
+            .then(|| {
+                Ok::<_, String>(PendingRows {
+                    tokens: rows.tokens[entered..].to_vec(),
+                    features: rows
+                        .features
+                        .slice(entered, keep)
+                        .map_err(|error| error.to_string())?,
+                })
+            })
+            .transpose()?;
+        let next_tail = match kind {
+            Kind::Unanchored => kept.map_or(Self::Empty, Self::Unanchored),
+            Kind::Anchored => kept.map_or(Self::Empty, Self::Anchored),
+            Kind::Open(open) => Self::Open {
+                pending: kept,
+                open: open.clone(),
+            },
+        };
+        Ok(Some((to_enter, next_tail)))
+    }
+}
+
 /// History state of a target-conditioned drafter.
 #[derive(Clone)]
 enum HistoryState {
@@ -392,15 +495,8 @@ enum HistoryState {
     OwnHistory {
         /// Drafter rows entered so far; the next entry row's position.
         position: usize,
-        /// Complete pairs not yet entered; the last is the anchor when `anchored`.
-        pending: Option<PendingRows>,
-        /// A committed feature whose successor token is not known yet.
-        open: Option<OpenFeature>,
-        /// Whether the drafter holds its next anchor's pair: the round before
-        /// published its feature (or a prompt chunk closed). Under the
-        /// controller a round that drafts nothing publishes none, so the next
-        /// one cannot draft.
-        anchored: bool,
+        /// Unentered pairs, open feature, and anchor state past `position`.
+        tail: OwnHistoryTail,
         /// Target rows whose pairs an own-history drafter never entered: rows of
         /// rounds that published no feature. Its history goes on from the next
         /// pair it is given, so its positions trail the target's by these.
@@ -414,43 +510,28 @@ impl HistoryState {
             Self::TargetReading { position, anchor } => {
                 (DraftHistory::Target, *position, usize::from(anchor.is_some()), false)
             }
-            Self::OwnHistory {
-                position,
-                pending,
-                open,
-                ..
-            } => (
-                DraftHistory::Own,
-                *position,
-                pending.as_ref().map_or(0, |pending| pending.tokens.len()),
-                open.is_some(),
-            ),
+            Self::OwnHistory { position, tail, .. } => {
+                (DraftHistory::Own, *position, tail.pending_len(), tail.has_open())
+            }
         };
         round_state_of(history, entry_bound, position, pending, open)
     }
 
-    fn has_open(&self) -> bool {
-        matches!(self, Self::OwnHistory { open: Some(_), .. })
-    }
-
-    fn skipped(&self) -> usize {
+    fn target_position(&self) -> usize {
         match self {
-            Self::TargetReading { .. } => 0,
-            Self::OwnHistory { skipped, .. } => *skipped,
-        }
-    }
-
-    fn draft_pairs(&self) -> Option<PendingRows> {
-        match self {
-            Self::TargetReading { anchor, .. } => anchor.clone().map(AnchorRow::into_pending),
-            Self::OwnHistory { pending, .. } => pending.clone(),
+            Self::TargetReading { position, .. } => *position,
+            Self::OwnHistory {
+                position,
+                tail,
+                skipped,
+            } => *position + tail.pending_len() + usize::from(tail.has_open()) + *skipped,
         }
     }
 
     fn clear_pending(&mut self) {
         match self {
             Self::TargetReading { anchor, .. } => *anchor = None,
-            Self::OwnHistory { pending, .. } => *pending = None,
+            Self::OwnHistory { tail, .. } => *tail = OwnHistoryTail::Empty,
         }
     }
 
@@ -462,15 +543,11 @@ impl HistoryState {
             }
             Self::OwnHistory {
                 position,
-                pending,
-                open,
-                anchored,
+                tail,
                 skipped,
             } => {
                 *position = 0;
-                *pending = None;
-                *open = None;
-                *anchored = false;
+                *tail = OwnHistoryTail::Empty;
                 *skipped = 0;
             }
         }
@@ -501,10 +578,10 @@ enum RoundStage {
     /// holds the chosen width to draft once catch-up reconciles.
     Entering {
         transaction: HeadTransaction,
-        resume_draft: Option<usize>,
+        resume_draft: Option<NonZeroUsize>,
     },
     /// Catch-up finished; the next `propose` drafts this chosen width.
-    ResumeDraft(usize),
+    ResumeDraft(NonZeroUsize),
     /// A drafting head transaction is in flight.
     Drafting(HeadTransaction),
     /// Reconciled proposals awaiting verification and observation.
@@ -586,10 +663,8 @@ impl DrafterState {
             }
             Drafter::Mtp | Drafter::DFlash => HistoryState::OwnHistory {
                 position: checkpoint.position,
-                pending,
-                open,
                 // The next prompt chunk anchors it.
-                anchored: false,
+                tail: OwnHistoryTail::from_trailing(pending, open),
                 skipped: checkpoint.skipped,
             },
         };
@@ -623,42 +698,24 @@ impl DrafterState {
         request: RequestId,
         keep: usize,
         phase: HeadPhase,
-        resume_draft: Option<usize>,
+        resume_draft: Option<NonZeroUsize>,
     ) -> Result<MethodEffects, String> {
-        let call = self.round_state().flushing(keep).0;
-        let (Some(call), HistoryState::OwnHistory { pending, .. }) = (call, &mut self.history)
-        else {
+        let HistoryState::OwnHistory { position, tail, .. } = &mut self.history else {
             return Ok(MethodEffects::default());
         };
-        let rows = pending
-            .take()
-            .expect("a described head entry owns pending pairs");
-        let entered = call.entry_rows;
-        let conditioning = rows
-            .features
-            .slice(0, entered)
-            .map_err(|error| error.to_string())?;
-        if keep > 0 {
-            *pending = Some(PendingRows {
-                tokens: rows.tokens[entered..].to_vec(),
-                features: rows
-                    .features
-                    .slice(entered, keep)
-                    .map_err(|error| error.to_string())?,
-            });
-        }
+        let Some((to_enter, next_tail)) = tail.split_flush(keep)? else {
+            return Ok(MethodEffects::default());
+        };
         let transaction = HeadTransaction::new(
             request,
             phase,
-            PendingRows {
-                tokens: rows.tokens[..entered].to_vec(),
-                features: conditioning,
-            },
-            call.position,
+            to_enter,
+            *position,
             Vec::new(),
             self.drafter.form(),
         )?;
         let operation = transaction.operation().clone();
+        *tail = next_tail;
         self.round = RoundStage::Entering {
             transaction,
             resume_draft,
@@ -705,13 +762,14 @@ impl MethodState for DrafterState {
         match &self.history {
             HistoryState::OwnHistory {
                 position,
-                pending: None,
-                open,
+                tail:
+                    OwnHistoryTail::Empty
+                    | OwnHistoryTail::Open {
+                        pending: None,
+                        open: OpenFeature::Device(_),
+                    },
                 skipped: 0,
-                ..
-            } if !matches!(open, Some(OpenFeature::Host(_))) && self.round.is_idle() => {
-                Some(*position)
-            }
+            } if self.round.is_idle() => Some(*position),
             _ => None,
         }
     }
@@ -758,15 +816,12 @@ impl MethodState for DrafterState {
             }
             HistoryState::OwnHistory {
                 position,
-                pending,
-                open,
-                anchored,
+                tail,
                 skipped,
             } => {
                 let features = features.ok_or_else(|| {
                     format!("{name} priming requires the chunk's target features")
                 })?;
-                *anchored = true;
                 // The first draft's anchor in the drafter's positions.
                 let draft_from = draft_from.saturating_sub(*skipped);
                 if let Some(primed) = primed {
@@ -776,28 +831,34 @@ impl MethodState for DrafterState {
                     if priming_pos != Some(*position) || primed > tokens.len() {
                         return Err(format!("{name} state cannot take a device-primed chunk"));
                     }
-                    *position = position
+                    let next_position = position
                         .checked_add(primed)
                         .ok_or_else(|| format!("{name} drafter position exhausted"))?;
-                    *open = None;
-                    if self.drafter == Drafter::Mtp {
+                    let next_tail = if self.drafter == Drafter::Mtp {
                         let boundary = features
                             .boundary()
                             .cloned()
                             .ok_or("MTP priming requires an independently owned boundary feature")?;
                         if let Some(next) = next {
-                            *pending = Some(PendingRows::joined(
-                                pending.take(),
+                            OwnHistoryTail::Anchored(PendingRows::joined(
+                                None,
                                 vec![next],
                                 Self::read(reader, boundary, 0, 1)?,
-                            )?);
+                            )?)
                         } else {
-                            *open = Some(OpenFeature::Device(boundary.downgrade()));
+                            OwnHistoryTail::Open {
+                                pending: None,
+                                open: OpenFeature::Device(boundary.downgrade()),
+                            }
                         }
                     } else if let Some(next) = next {
                         let last = Self::read(reader, features, tokens.len() - 1, 1)?;
-                        *pending = Some(PendingRows::joined(pending.take(), vec![next], last)?);
-                    }
+                        OwnHistoryTail::Anchored(PendingRows::joined(None, vec![next], last)?)
+                    } else {
+                        OwnHistoryTail::Empty
+                    };
+                    *position = next_position;
+                    *tail = next_tail;
                     return Ok(MethodEffects::default());
                 }
                 if !is_idle {
@@ -809,16 +870,24 @@ impl MethodState for DrafterState {
                 let rows = Self::read(reader, features, 0, tokens.len())?;
                 // The open feature selected this chunk's first token; each chunk
                 // row's feature selected the token after it.
-                if let Some(open_feature) = open.take() {
-                    *pending = Some(PendingRows::joined(
-                        pending.take(),
+                let (mut pending, open_feature) =
+                    match std::mem::replace(tail, OwnHistoryTail::Empty) {
+                        OwnHistoryTail::Empty => (None, None),
+                        OwnHistoryTail::Unanchored(pending) | OwnHistoryTail::Anchored(pending) => {
+                            (Some(pending), None)
+                        }
+                        OwnHistoryTail::Open { pending, open } => (pending, Some(open)),
+                    };
+                if let Some(open_feature) = open_feature {
+                    pending = Some(PendingRows::joined(
+                        pending,
                         vec![first],
                         Self::open_rows(reader, open_feature)?,
                     )?);
                 }
                 if !rest.is_empty() {
-                    *pending = Some(PendingRows::joined(
-                        pending.take(),
+                    pending = Some(PendingRows::joined(
+                        pending,
                         rest.to_vec(),
                         rows.slice(0, rest.len())
                             .map_err(|error| error.to_string())?,
@@ -829,12 +898,19 @@ impl MethodState for DrafterState {
                     .map_err(|error| error.to_string())?;
                 match next {
                     Some(next) => {
-                        *pending = Some(PendingRows::joined(pending.take(), vec![next], last)?);
+                        *tail = OwnHistoryTail::Anchored(PendingRows::joined(
+                            pending,
+                            vec![next],
+                            last,
+                        )?);
                         // Keep the anchor for the first draft.
                         (1, draft_from)
                     }
                     None => {
-                        *open = Some(OpenFeature::Host(last));
+                        *tail = OwnHistoryTail::Open {
+                            pending,
+                            open: OpenFeature::Host(last),
+                        };
                         (0, draft_from)
                     }
                 }
@@ -861,16 +937,9 @@ impl MethodState for DrafterState {
             RoundStage::Declined | RoundStage::Entering { .. } | RoundStage::Drafting(_) => {
                 return Propose::Tokens(Vec::new());
             }
-            RoundStage::ResumeDraft(generated)
-                if *generated > 0 && *generated <= selects.len() =>
-            {
-                if self.history.has_open() {
-                    return Propose::Tokens(Vec::new());
-                }
-                *generated
-            }
+            RoundStage::ResumeDraft(generated) if generated.get() <= selects.len() => *generated,
             stage @ (RoundStage::Idle | RoundStage::ResumeDraft(_)) => {
-                if self.history.has_open() || selects.is_empty() {
+                if selects.is_empty() {
                     return Propose::Tokens(Vec::new());
                 }
                 // A round drafts a prepared width that fits what the request can
@@ -880,64 +949,91 @@ impl MethodState for DrafterState {
                 // the next round's draft (`DraftController::generate`); any other
                 // drafter without its anchor's pair drafts nothing. Launch costs
                 // depend on the history the round reads, the target's position.
-                let (anchored, unanchored_for_prep) = match &self.history {
-                    HistoryState::TargetReading { anchor, .. } => {
-                        (anchor.is_some(), anchor.is_none())
-                    }
+                match &self.history {
                     HistoryState::OwnHistory {
-                        pending, anchored, ..
-                    } => (*anchored && pending.is_some(), !*anchored),
-                };
-                let prepares = unanchored_for_prep
-                    && self.drafter.fuses_taps()
-                    && matches!(self.width, WidthPolicy::Adaptive(_));
-                if !anchored && !prepares {
-                    return Propose::Tokens(Vec::new());
-                }
-                let position = self
-                    .history
-                    .round_state(entry_bound)
-                    .target_position()
-                    .expect("drafter state preserves its method boundary")
-                    + self.history.skipped();
-                let generated = match &mut self.width {
-                    WidthPolicy::Adaptive(control) => {
-                        control.generate(selects.len(), position, anchored)
+                        tail: OwnHistoryTail::Open { .. },
+                        ..
+                    } => return Propose::Tokens(Vec::new()),
+                    HistoryState::TargetReading { anchor: None, .. }
+                    | HistoryState::OwnHistory {
+                        tail: OwnHistoryTail::Empty | OwnHistoryTail::Unanchored(_),
+                        ..
+                    } => {
+                        if self.drafter.fuses_taps() {
+                            let position = self.history.target_position();
+                            if let WidthPolicy::Adaptive(control) = &mut self.width {
+                                let generated = control.generate(selects.len(), position, false);
+                                debug_assert_eq!(
+                                    generated, 0,
+                                    "unanchored controller cannot generate"
+                                );
+                                *stage = RoundStage::Declined;
+                            }
+                        }
+                        return Propose::Tokens(Vec::new());
                     }
-                    WidthPolicy::Fixed(budget) => budget.generated_within(selects.len()),
-                };
-                if generated == 0 || generated > selects.len() {
-                    *stage = RoundStage::Declined;
-                    return Propose::Tokens(Vec::new());
+                    HistoryState::TargetReading { anchor: Some(_), .. }
+                    | HistoryState::OwnHistory {
+                        tail: OwnHistoryTail::Anchored(_),
+                        ..
+                    } => {
+                        let position = self.history.target_position();
+                        let generated = match &mut self.width {
+                            WidthPolicy::Adaptive(control) => {
+                                control.generate(selects.len(), position, true)
+                            }
+                            WidthPolicy::Fixed(budget) => budget.generated_within(selects.len()),
+                        };
+                        let Some(generated) =
+                            NonZeroUsize::new(generated).filter(|g| g.get() <= selects.len())
+                        else {
+                            *stage = RoundStage::Declined;
+                            return Propose::Tokens(Vec::new());
+                        };
+                        generated
+                    }
                 }
-                generated
             }
         };
-        // Rounds that drafted nothing left their pairs pending: the drafter
-        // enters them now, then this round drafts from its anchor.
-        if self.round_state().catching_up().0.is_some() {
-            let effects = self
-                .flush(request, 1, HeadPhase::Generation, Some(generated))
-                .expect("pending pairs slice by their own rows");
-            return Propose::Pending(effects.operations);
-        }
-        let pairs = self
-            .history
-            .draft_pairs()
-            .expect("a drafting round holds its anchor");
-        let (Some(call), _) = self
-            .round_state()
-            .proposing(generated)
-            .expect("budgeted proposal fits the method boundary")
-        else {
-            unreachable!("positive proposal describes a head transaction");
+        let (position, pairs) = match &self.history {
+            HistoryState::OwnHistory {
+                position,
+                tail: OwnHistoryTail::Anchored(rows),
+                ..
+            } => {
+                // Rounds that drafted nothing left their pairs pending: the drafter
+                // enters them now, then this round drafts from its anchor.
+                if rows.tokens.len() > entry_bound {
+                    let effects = self
+                        .flush(request, 1, HeadPhase::Generation, Some(generated))
+                        .expect("pending pairs slice by their own rows");
+                    return Propose::Pending(effects.operations);
+                }
+                (*position, rows.clone())
+            }
+            HistoryState::TargetReading {
+                position,
+                anchor: Some(anchor),
+            } => (*position, anchor.clone().into_pending()),
+            HistoryState::TargetReading { anchor: None, .. }
+            | HistoryState::OwnHistory {
+                tail:
+                    OwnHistoryTail::Empty | OwnHistoryTail::Unanchored(_) | OwnHistoryTail::Open { .. },
+                ..
+            } => return Propose::Tokens(Vec::new()),
         };
+        debug_assert_eq!(
+            self.round_state()
+                .proposing(generated.get())
+                .map(|(call, _)| call.map(|call| call.position)),
+            Ok(Some(position)),
+        );
         let Ok(transaction) = HeadTransaction::new(
             request,
             HeadPhase::Generation,
             pairs,
-            call.position,
-            selects[..generated].to_vec(),
+            position,
+            selects[..generated.get()].to_vec(),
             self.drafter.form(),
         ) else {
             self.round = RoundStage::Declined;
@@ -1024,40 +1120,41 @@ impl MethodState for DrafterState {
             }
             HistoryState::OwnHistory {
                 position,
-                pending,
-                open,
-                anchored,
+                tail,
                 skipped,
             } => {
-                // After a replay the last replayed row's feature selected the anchor.
-                if let Some(open_feature) = open.take() {
-                    *pending = Some(PendingRows::joined(
-                        pending.take(),
-                        vec![verification.inputs[0]],
-                        Self::open_rows(reader, open_feature)?,
-                    )?);
-                    *anchored = true;
-                }
-                if *anchored
-                    && pending
-                        .as_ref()
-                        .and_then(|pending| pending.tokens.last())
+                if let OwnHistoryTail::Anchored(rows) = &*tail {
+                    if rows
+                        .tokens
+                        .last()
                         .is_some_and(|anchor| *anchor != verification.inputs[0])
-                {
-                    return Err(format!(
-                        "{name} pending anchor differs from the verified anchor"
-                    ));
+                    {
+                        return Err(format!(
+                            "{name} pending anchor differs from the verified anchor"
+                        ));
+                    }
                 }
+                // After a replay the last replayed row's feature selected the anchor.
+                let pending = match std::mem::replace(tail, OwnHistoryTail::Empty) {
+                    OwnHistoryTail::Empty => None,
+                    OwnHistoryTail::Unanchored(pending) | OwnHistoryTail::Anchored(pending) => {
+                        Some(pending)
+                    }
+                    OwnHistoryTail::Open { pending, open } => Some(PendingRows::joined(
+                        pending,
+                        vec![verification.inputs[0]],
+                        Self::open_rows(reader, open)?,
+                    )?),
+                };
                 // A round that published no feature (one drafting nothing under the
                 // controller) leaves the drafter without the pairs of its rows'
                 // successors: the next round cannot draft, and an own history goes
                 // on past them from the next pair it is given.
                 let Some(features) = verification.features else {
-                    *anchored = false;
+                    *tail = pending.map_or(OwnHistoryTail::Empty, OwnHistoryTail::Unanchored);
                     *skipped += accepted;
                     return Ok(MethodEffects::default());
                 };
-                *anchored = true;
                 let transition = round_state_of(
                     DraftHistory::Own,
                     entry_bound,
@@ -1071,15 +1168,11 @@ impl MethodState for DrafterState {
                 let rows = Self::read(reader, features, 0, accepted)?;
                 let mut tokens = verification.inputs[1..accepted].to_vec();
                 tokens.push(verification.next);
-                *pending = Some(PendingRows::joined(pending.take(), tokens, rows)?);
+                let joined = PendingRows::joined(pending, tokens, rows)?;
+                let joined_len = joined.tokens.len();
+                *tail = OwnHistoryTail::Anchored(joined);
                 debug_assert_eq!(
-                    round_state_of(
-                        DraftHistory::Own,
-                        entry_bound,
-                        *position,
-                        pending.as_ref().map_or(0, |pending| pending.tokens.len()),
-                        false,
-                    ),
+                    round_state_of(DraftHistory::Own, entry_bound, *position, joined_len, false),
                     transition.appended
                 );
                 transition.maintenance.is_some()
@@ -1115,7 +1208,7 @@ impl MethodState for DrafterState {
 
     fn reconcile(&mut self, operation: &Operation, outcome: Outcome) -> Result<(), String> {
         enum ReconcileKind {
-            Enter(Option<usize>),
+            Enter(Option<NonZeroUsize>),
             Draft,
         }
         let name = self.drafter.name();
@@ -1201,28 +1294,35 @@ impl MethodState for DrafterState {
             }
             HistoryState::OwnHistory {
                 position,
-                pending,
-                open,
-                anchored,
+                tail,
                 skipped,
             } => {
-                let mut pending = pending.clone();
-                let mut open = open.clone();
-                // The final pending token is the sampled successor, outside the
-                // retained target prefix. Export its feature without that token;
-                // each restored request supplies its own successor. A drafter
-                // without its anchor's pair holds no successor: its pairs are all
-                // inside the prefix.
-                if open.is_none() && *anchored {
-                    if let Some(rows) = pending.take() {
-                        let (rest, last) = rows.opened();
-                        pending = rest;
-                        open = Some(OpenFeature::Host(last));
+                // The final pending token of an anchored tail is the sampled
+                // successor, outside the retained target prefix. Export its
+                // feature without that token; each restored request supplies its
+                // own successor. An unanchored tail holds no successor: its
+                // pairs are all inside the prefix.
+                let tail = match tail {
+                    OwnHistoryTail::Empty => DraftTail::EMPTY,
+                    OwnHistoryTail::Unanchored(pending) => DraftTail::Trailing {
+                        pending: Some(pending.clone()),
+                        open: None,
+                    },
+                    OwnHistoryTail::Open { pending, open } => DraftTail::Trailing {
+                        pending: pending.clone(),
+                        open: Some(open.clone()),
+                    },
+                    OwnHistoryTail::Anchored(rows) => {
+                        let (pending, last) = rows.clone().opened();
+                        DraftTail::Trailing {
+                            pending,
+                            open: Some(OpenFeature::Host(last)),
+                        }
                     }
-                }
+                };
                 DraftCheckpoint {
                     position: *position,
-                    tail: DraftTail::Trailing { pending, open },
+                    tail,
                     skipped: *skipped,
                 }
             }
@@ -1240,13 +1340,7 @@ impl MethodState for DrafterState {
             HistoryState::TargetReading { anchor, .. } => {
                 anchor.as_ref().map_or(0, |row| row.feature.bytes().len()) as u64
             }
-            HistoryState::OwnHistory { pending, open, .. } => {
-                let pending = pending
-                    .as_ref()
-                    .map_or(0, |rows| rows.features.bytes().len());
-                let open = open.as_ref().map_or(0, OpenFeature::host_bytes);
-                (pending + open) as u64
-            }
+            HistoryState::OwnHistory { tail, .. } => tail.host_bytes() as u64,
         }
     }
 }
