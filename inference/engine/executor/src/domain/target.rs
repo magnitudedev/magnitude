@@ -196,7 +196,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Ok(rest) => rest,
             Err(error) => {
                 let (core, _) = first.into_submission_parts();
-                let (_, advances, _, _) = core.into_parts();
+                let advances = core.into_advances();
                 self.restore_advances(requests, advances);
                 abort(self, priming, front);
                 return Err(Unsubmitted::Failed(error));
@@ -229,7 +229,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 // The rest of the chain follows the first launch's advances
                 // and returns its rows and banks as it drops.
                 let (core, _) = chain.split_first().0.into_submission_parts();
-                let (_, advances, _, _) = core.into_parts();
+                let advances = core.into_advances();
                 self.restore_advances(requests, advances);
                 abort(self, priming, front);
                 return Err(Unsubmitted::Failed(error.into()));
@@ -683,27 +683,38 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(Unsubmitted::Refused(error.to_string().into()));
             }
         };
-        let conditioning = metadata
-            .iter()
-            .map(|(_, _, lease, _, _)| lease.clone())
-            .collect();
         let work = crate::operation::LaunchWork::of(metadata.iter().map(|&(_, _, _, kind, _)| kind));
+        let host_slots = operations
+            .iter()
+            .zip(&metadata)
+            .zip(advances)
+            .zip(conditioning_slices)
+            .zip(preceding)
+            .map(
+                |((((operation, (request, _, lease, _, _)), advance), conditioning_slices), preceding)| {
+                    TargetHostSlot {
+                        slot: TargetSlot {
+                            request: *request,
+                            advance,
+                            preceding,
+                        },
+                        conditioning: lease.clone(),
+                        conditioning_slices,
+                        guesses: SlotGuess::of(operation),
+                    }
+                },
+            )
+            .collect();
         let inputs = TargetLaunchInputs::new(
             batch,
             work,
-            metadata.iter().map(|&(request, ..)| request).collect(),
-            TargetTokens::Host,
-            advances,
-            conditioning,
-            conditioning_slices,
-            operations,
+            TargetTokens::Host(host_slots),
             graph_workspace,
             graph_output,
             readout_workspace,
             readout_output,
         )
-        .with_boundary(boundary)
-        .with_preceding(preceding);
+        .with_boundary(boundary);
         match ValidatedTargetLaunch::new(
             inputs,
             &self.target_store,
@@ -713,7 +724,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         ) {
             Ok(launch) => Ok((launch, metadata, spare_output)),
             Err((inputs, error)) => {
-                let (_, advances, _, _) = inputs.into_parts();
+                let advances = inputs.into_advances();
                 self.restore_advances(metadata, advances);
                 Err(Unsubmitted::Failed(DomainError::Invariant(error)))
             }
@@ -727,7 +738,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// the domain cannot continue.
     /// Per operation of a target group, the tokens its sequence holds before
     /// the operation's first row, as many as the model's row rules read
-    /// (`TargetLaunchCore::preceding`); none of a model without one. They
+    /// (`TargetSlot::preceding`); empty per slot for a model without one. They
     /// are the sequence's fed tokens followed by those of its operations in
     /// `ahead`, the launches of its chain queued before the group, which
     /// feed theirs only once the chain is on the device.
@@ -738,7 +749,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) -> Result<Vec<Vec<u64>>, String> {
         let context = crate::operators::row_rule_context(&self.definition.decoder);
         if context == 0 {
-            return Ok(Vec::new());
+            return Ok(vec![Vec::new(); operations.len()]);
         }
         operations
             .iter()
@@ -1048,7 +1059,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             request_start = request_end;
         }
-        let (_, advances, _, _) = core.into_parts();
+        let advances = core.into_advances();
         let mut pending = Vec::with_capacity(flight.requests.len());
         let mut offset = 0usize;
         let mut continuation = flight.continuation;

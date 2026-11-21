@@ -14,10 +14,10 @@ use crate::{
     FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Guess, HeadConditioning,
     HeadLaunchInputs, HeadState, ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation,
     Outcome, PoolClass, Priming, RequestId, ResidentHead, ResidentVision,
-    ResourceDomain, ResourceDomainId, ResourceKind, RowResult, SelectSpec, Selected,
-    StateLaunchInputs, StateWork, TargetLaunchInputs, TargetTokens, TokenId, ValidatedHeadLaunch,
-    ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchInputs,
-    WorkKind,
+    ResourceDomain, ResourceDomainId, ResourceKind, RowResult, SelectSpec, Selected, SlotGuess,
+    StateLaunchInputs, StateWork, TargetHostSlot, TargetLaunchInputs, TargetSlot, TargetTokens,
+    TokenId, ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
+    ValidatedVisionLaunch, VisionLaunchInputs, WorkKind,
 };
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{

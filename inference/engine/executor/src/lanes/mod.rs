@@ -11,7 +11,7 @@ pub use head::{
 pub use import::{ImportLaunchCore, ImportLaunchInputs, ResidentWeightSlot, ValidatedImportLaunch};
 pub use state::{StateLaunchCore, StateLaunchInputs, StateWork, ValidatedStateLaunch};
 pub use target::{
-    ConditioningSlice, SlotGuess, TargetLaunchCore, TargetLaunchInputs, TargetLaunchWorkspace, TargetTokens,
-    ValidatedTargetLaunch,
+    ConditioningSlice, SlotGuess, TargetHostSlot, TargetLaunchCore, TargetLaunchInputs,
+    TargetLaunchWorkspace, TargetSlot, TargetSlotsIter, TargetTokens, ValidatedTargetLaunch,
 };
 pub use vision::{ValidatedVisionLaunch, VisionLaunchCore, VisionLaunchInputs};

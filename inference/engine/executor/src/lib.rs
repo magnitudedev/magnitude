@@ -109,9 +109,9 @@ pub use lanes::ConditioningSlice;
 pub use lanes::{
     FrontFeatures, FrontReads, HeadConditioning, HeadLaunchCore, HeadLaunchInputs, HeadState, ImportLaunchCore,
     ImportLaunchInputs, ResidentWeightSlot, SlotGuess, StateLaunchCore, StateLaunchInputs, StateWork,
-    TargetHistoryRead, TargetLaunchCore, TargetLaunchInputs, TargetLaunchWorkspace, TargetReads, TargetTokens,
-    ValidatedHeadLaunch, ValidatedImportLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
-    ValidatedVisionLaunch, VisionLaunchCore, VisionLaunchInputs,
+    TargetHistoryRead, TargetHostSlot, TargetLaunchCore, TargetLaunchInputs, TargetLaunchWorkspace, TargetReads,
+    TargetSlot, TargetSlotsIter, TargetTokens, ValidatedHeadLaunch, ValidatedImportLaunch, ValidatedStateLaunch,
+    ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchCore, VisionLaunchInputs,
 };
 pub use magnitude_batching::{self as batching, Demand, LaunchClass};
 /// Development-only tuning pin for bit-exact measurement runs

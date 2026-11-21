@@ -8,7 +8,7 @@ use magnitude_batching::ValidatedVisionBatch;
 pub struct VisionLaunchInputs {
     batch: ValidatedVisionBatch,
     workspace: NativeGraphWorkspaceLease,
-    output: Option<NativeGraphOutputLease>,
+    output: NativeGraphOutputLease,
 }
 
 impl VisionLaunchInputs {
@@ -20,7 +20,7 @@ impl VisionLaunchInputs {
         Self {
             batch,
             workspace,
-            output: Some(output),
+            output,
         }
     }
 }
@@ -28,7 +28,7 @@ impl VisionLaunchInputs {
 pub struct ValidatedVisionLaunch {
     core: VisionLaunchCore,
     workspace: NativeGraphWorkspaceLease,
-    output: Option<NativeGraphOutputLease>,
+    output: NativeGraphOutputLease,
 }
 
 impl ValidatedVisionLaunch {
@@ -36,12 +36,7 @@ impl ValidatedVisionLaunch {
         inputs: VisionLaunchInputs,
         domain: &ResourceDomainId,
     ) -> Result<Self, (VisionLaunchInputs, InvariantError)> {
-        if inputs.workspace.domain() != domain
-            || inputs
-                .output
-                .as_ref()
-                .is_none_or(|output| output.domain() != domain)
-        {
+        if inputs.workspace.domain() != domain || inputs.output.domain() != domain {
             return Err((
                 inputs,
                 InvariantError {
@@ -73,21 +68,12 @@ impl ValidatedVisionLaunch {
             patch_rows: self.core.batch.class_patch_rows(),
         }
     }
-    pub(crate) fn submission_parts(
-        &self,
-    ) -> (
-        &VisionLaunchCore,
-        &NativeGraphWorkspaceLease,
-        &Option<NativeGraphOutputLease>,
-    ) {
-        (&self.core, &self.workspace, &self.output)
-    }
     pub(crate) fn execution_parts_mut(
         &mut self,
     ) -> (
         &VisionLaunchCore,
         &mut NativeGraphWorkspaceLease,
-        &mut Option<NativeGraphOutputLease>,
+        &mut NativeGraphOutputLease,
     ) {
         (&self.core, &mut self.workspace, &mut self.output)
     }
@@ -96,7 +82,7 @@ impl ValidatedVisionLaunch {
     ) -> (
         VisionLaunchCore,
         NativeGraphWorkspaceLease,
-        Option<NativeGraphOutputLease>,
+        NativeGraphOutputLease,
     ) {
         (self.core, self.workspace, self.output)
     }
