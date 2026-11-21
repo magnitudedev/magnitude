@@ -281,8 +281,10 @@ struct FormedLaunch {
     grid: [u32; 3],
     block: [u32; 3],
     shared_bytes: u32,
-    /// Buffer addresses in ABI order, then the scalar-result address.
-    pointers: Vec<u64>,
+    /// Buffer addresses in ABI order.
+    buffers: Vec<u64>,
+    /// Scalar-result address, or 0 for an entry without scalar results.
+    scalar_results: u64,
     words: Vec<u8>,
     edge: driver::Edge,
 }
@@ -340,18 +342,14 @@ impl FormedLaunch {
             ));
         };
         function.admit_shared(device, launch.shared_bytes)?;
-        let mut pointers = Vec::with_capacity(launch.buffers.len() + 1);
-        pointers.extend(
-            launch
-                .buffers
-                .iter()
-                .map(|(buffer, offset)| buffer.pointer() + offset),
-        );
-        pointers.push(
-            launch
-                .scalar_results
-                .map_or(0, |(buffer, offset)| buffer.pointer() + offset),
-        );
+        let buffers = launch
+            .buffers
+            .iter()
+            .map(|(buffer, offset)| buffer.pointer() + offset)
+            .collect();
+        let scalar_results = launch
+            .scalar_results
+            .map_or(0, |(buffer, offset)| buffer.pointer() + offset);
         let words = if launch.words.is_empty() {
             vec![0; 8]
         } else {
@@ -365,7 +363,8 @@ impl FormedLaunch {
             grid,
             block,
             shared_bytes,
-            pointers,
+            buffers,
+            scalar_results,
             words,
             edge: launch.module.edge,
         })
@@ -389,19 +388,41 @@ impl FormedLaunch {
     /// The kernel parameter array, pointing into `self`: buffers, the words
     /// struct (by value) and the scalar-result address.
     fn parameters(&mut self) -> Vec<*mut c_void> {
-        let (scalars, buffers) = self
-            .pointers
-            .split_last_mut()
-            .expect("a formed launch carries its scalar-result address");
-        let mut parameters: Vec<*mut c_void> = Vec::with_capacity(buffers.len() + 2);
+        let mut parameters: Vec<*mut c_void> = Vec::with_capacity(self.buffers.len() + 2);
         parameters.extend(
-            buffers
+            self.buffers
                 .iter_mut()
                 .map(|pointer| (pointer as *mut u64).cast::<c_void>()),
         );
         parameters.push(self.words.as_mut_ptr().cast());
-        parameters.push((scalars as *mut u64).cast());
+        parameters.push((&mut self.scalar_results as *mut u64).cast());
         parameters
+    }
+}
+
+/// One kernel node of a [`DirectGraph`]: its launch as formed or bound, and
+/// whether it runs.
+struct GraphNode {
+    launch: FormedLaunch,
+    enabled: bool,
+}
+
+/// The marks of a [`DirectGraph`] that has at least one mark node: the event
+/// they record at rest, and any sampled run's events currently bound to them.
+struct GraphMarks {
+    /// What its marks record at rest.
+    rest: Arc<Event>,
+    /// The events a sampled run set on its marks, in order; empty where they
+    /// record `rest` ([`DirectGraph::sample`]).
+    sampled: Vec<Arc<Event>>,
+}
+
+impl GraphMarks {
+    fn new(rest: Arc<Event>) -> Self {
+        Self {
+            rest,
+            sampled: Vec::new(),
+        }
     }
 }
 
@@ -410,10 +431,8 @@ impl FormedLaunch {
 pub struct DirectGraphBuilder {
     device: Device,
     graph: driver::Graph,
-    /// Each node's launch as formed, in order of addition, and whether it
-    /// runs.
-    formed: Vec<FormedLaunch>,
-    enabled: Vec<bool>,
+    /// Each kernel node as formed, in order of addition.
+    nodes: Vec<GraphNode>,
     /// What its marks record until a sampled run sets its own
     /// ([`DirectGraph::sample`]), where it has any.
     rest: Option<Arc<Event>>,
@@ -426,14 +445,30 @@ pub struct DirectGraphBuilder {
 /// A word-operation node of a [`DirectGraph`]: a host gate's wait, or a
 /// write the word's host waiters wake behind.
 struct WordNode {
-    operation: driver::WordOperation,
     /// The device address of the word it binds, and the value.
     address: u64,
     value: u32,
+    kind: WordKind,
+}
+
+enum WordKind {
+    Wait,
     /// A write's: the event recorded as it lands, which the waiters' wake
     /// follows ([`DirectBatch::replay`]), and the wake of the word it binds
     /// ([`DirectGraph::bind_word`]).
-    written: Option<(Event, Arc<Wake>)>,
+    Write {
+        written: Event,
+        wake: Arc<Wake>,
+    },
+}
+
+impl WordKind {
+    fn operation(&self) -> driver::WordOperation {
+        match self {
+            Self::Wait => driver::WordOperation::Wait,
+            Self::Write { .. } => driver::WordOperation::Write,
+        }
+    }
 }
 
 impl DirectGraphBuilder {
@@ -441,8 +476,7 @@ impl DirectGraphBuilder {
         Ok(Self {
             device: device.clone(),
             graph: driver::Graph::new(device.context()).map_err(submission)?,
-            formed: Vec::new(),
-            enabled: Vec::new(),
+            nodes: Vec::new(),
             rest: None,
             words: Vec::new(),
             launches: GraphCensus::default(),
@@ -462,7 +496,7 @@ impl DirectGraphBuilder {
     /// does). A replay binds its word and value ([`DirectGraph::bind_word`]).
     /// It counts as a launch of the graph's memory.
     pub fn wait_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
-        self.word(driver::WordOperation::Wait, word, value, None)
+        self.push_word(word, value, WordKind::Wait)
     }
 
     fn driver_error(&self, required: u64, error: driver::DriverError) -> ExecutionError {
@@ -478,19 +512,27 @@ impl DirectGraphBuilder {
     /// graph's memory.
     pub fn write_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
         let written = Event::new(self.device.context()).map_err(|error| self.driver_error(0, error))?;
-        self.word(driver::WordOperation::Write, word, value, Some(written))
+        self.push_word(
+            word,
+            value,
+            WordKind::Write {
+                written,
+                wake: word.wake.clone(),
+            },
+        )
     }
 
-    fn word(&mut self, operation: driver::WordOperation, word: &HostWord, value: u32, written: Option<Event>) -> Result<(), ExecutionError> {
+    fn push_word(&mut self, word: &HostWord, value: u32, kind: WordKind) -> Result<(), ExecutionError> {
         let address = word.device_address();
-        self.graph.push_word(operation, address, value).map_err(|error| self.driver_error(0, error))?;
+        self.graph
+            .push_word(kind.operation(), address, value)
+            .map_err(|error| self.driver_error(0, error))?;
         self.count_launch()?;
-        if let Some(written) = &written {
+        if let WordKind::Write { written, .. } = &kind {
             self.graph.push_event(written).map_err(|error| self.driver_error(0, error))?;
             self.count_launch()?;
         }
-        let written = written.map(|written| (written, word.wake.clone()));
-        self.words.push(WordNode { operation, address, value, written });
+        self.words.push(WordNode { address, value, kind });
         Ok(())
     }
 
@@ -520,8 +562,7 @@ impl DirectGraphBuilder {
         let mut parameters = formed.parameters();
         let node = formed.node(&mut parameters);
         self.graph.push_kernel(&node, formed.edge, after).map_err(|error| self.driver_error(0, error))?;
-        self.formed.push(formed);
-        self.enabled.push(enabled);
+        self.nodes.push(GraphNode { launch: formed, enabled });
         // Its memory follows no parameter byte
         // (`seismic_compiler::graph_cost::argument_bytes`).
         self.count_launch()
@@ -546,8 +587,10 @@ impl DirectGraphBuilder {
         // change.
         let change = self.device.graphs().entry().change();
         let exec = self.graph.instantiate().map_err(refused)?;
-        for (node, _) in self.enabled.iter().enumerate().filter(|(_, enabled)| !**enabled) {
-            exec.set_enabled(self.graph.node(node), false).map_err(refused)?;
+        for (index, node) in self.nodes.iter().enumerate() {
+            if !node.enabled {
+                exec.set_enabled(self.graph.node(index), false).map_err(refused)?;
+            }
         }
         exec.upload(self.device.stream()).map_err(refused)?;
         // `cuGraphUpload` enqueues asynchronous work on the device stream;
@@ -560,11 +603,9 @@ impl DirectGraphBuilder {
             device: self.device.clone(),
             exec,
             launched,
-            sampled: Vec::new(),
-            rest: self.rest,
+            marks: self.rest.map(GraphMarks::new),
             graph: self.graph,
-            formed: self.formed,
-            enabled: self.enabled,
+            nodes: self.nodes,
             words: self.words,
             census,
         })
@@ -580,18 +621,13 @@ pub struct DirectGraph {
     /// whether its last launch completed, before which no update of it is
     /// made without waiting.
     launched: Event,
-    /// The events a sampled run set on its marks, in order; empty where they
-    /// record `rest` ([`Self::sample`]).
-    sampled: Vec<Arc<Event>>,
-    /// What its marks record at rest, where it has any.
-    rest: Option<Arc<Event>>,
+    /// The graph's mark nodes, where it has any.
+    marks: Option<GraphMarks>,
     /// The graph `exec` was instantiated from, whose nodes name the
     /// launches a parameter update sets ([`Self::bind`]).
     graph: driver::Graph,
-    /// Each node's launch as the executable binds it now, and whether it
-    /// runs.
-    formed: Vec<FormedLaunch>,
-    enabled: Vec<bool>,
+    /// Each kernel node as the executable binds it now.
+    nodes: Vec<GraphNode>,
     /// Each word-operation node as the executable binds it now.
     words: Vec<WordNode>,
     /// What the graph is made of, as its driver memory follows it.
@@ -608,7 +644,7 @@ impl DirectGraph {
 
     /// The graph's launches, enabled or not.
     pub fn nodes(&self) -> usize {
-        self.formed.len()
+        self.nodes.len()
     }
 
     /// The graph's word-operation nodes ([`DirectGraphBuilder::wait_word`],
@@ -625,10 +661,12 @@ impl DirectGraph {
         let node = &mut self.words[index];
         let address = word.device_address();
         if (node.address, node.value) != (address, value) {
-            self.exec.set_word(self.graph.word(index), node.operation, address, value).map_err(submission)?;
+            self.exec
+                .set_word(self.graph.word(index), node.kind.operation(), address, value)
+                .map_err(submission)?;
             (node.address, node.value) = (address, value);
         }
-        if let Some((_, wake)) = &mut node.written {
+        if let WordKind::Write { wake, .. } = &mut node.kind {
             *wake = word.wake.clone();
         }
         Ok(())
@@ -643,27 +681,28 @@ impl DirectGraph {
     /// ([`Self::bind`]). The graph holds the events it stamps until it
     /// stamps others.
     pub fn sample(&mut self, marks: &[(&Stamps, usize)]) -> Result<(), ExecutionError> {
-        if marks.is_empty() && self.sampled.is_empty() {
+        let Some(state) = &mut self.marks else {
+            assert!(marks.is_empty(), "DirectGraph::sample: graph has no marks");
+            return Ok(());
+        };
+        if marks.is_empty() && state.sampled.is_empty() {
             return Ok(());
         }
         for (node, (stamps, mark)) in marks.iter().enumerate() {
             let event = stamps.events[*mark].clone();
             self.exec.set_event(self.graph.mark(node), &event).map_err(submission)?;
-            if node < self.sampled.len() {
-                self.sampled[node] = event;
+            if node < state.sampled.len() {
+                state.sampled[node] = event;
             } else {
-                self.sampled.push(event);
+                state.sampled.push(event);
             }
         }
-        if marks.len() < self.sampled.len() {
-            let rest = self.rest.as_ref().expect("a graph that was sampled has marks");
-            // Reset trailing nodes from the end so any partial failure keeps
-            // every still-referenced event alive in `self.sampled`.
-            while self.sampled.len() > marks.len() {
-                let node = self.sampled.len() - 1;
-                self.exec.set_event(self.graph.mark(node), rest).map_err(submission)?;
-                self.sampled.pop();
-            }
+        // Reset trailing nodes from the end so any partial failure keeps
+        // every still-referenced event alive in `state.sampled`.
+        while state.sampled.len() > marks.len() {
+            let node = state.sampled.len() - 1;
+            self.exec.set_event(self.graph.mark(node), &state.rest).map_err(submission)?;
+            state.sampled.pop();
         }
         Ok(())
     }
@@ -688,12 +727,16 @@ impl DirectGraph {
     pub fn bind(&mut self, device: &Device, node: usize, launch: &DirectLaunch<'_>, enabled: bool) -> Result<(), ExecutionError> {
         if enabled {
             let mut formed = FormedLaunch::form(device, launch, true)?;
-            assert!(formed.edge == self.formed[node].edge, "a graph's launch binds only parameters: its shape fixes its edges");
-            if formed != self.formed[node] {
+            let current = &mut self.nodes[node];
+            assert!(
+                formed.edge == current.launch.edge,
+                "a graph's launch binds only parameters: its shape fixes its edges"
+            );
+            if formed != current.launch {
                 let mut parameters = formed.parameters();
                 let params = formed.node(&mut parameters);
                 self.exec.set_kernel(self.graph.node(node), &params).map_err(submission)?;
-                self.formed[node] = formed;
+                current.launch = formed;
             }
         }
         self.set_enabled(node, enabled)
@@ -707,9 +750,10 @@ impl DirectGraph {
     }
 
     fn set_enabled(&mut self, node: usize, enabled: bool) -> Result<(), ExecutionError> {
-        if enabled != self.enabled[node] {
+        let current = &mut self.nodes[node];
+        if enabled != current.enabled {
             self.exec.set_enabled(self.graph.node(node), enabled).map_err(submission)?;
-            self.enabled[node] = enabled;
+            current.enabled = enabled;
         }
         Ok(())
     }
@@ -902,18 +946,48 @@ impl Stamps {
     }
 }
 
+/// Synchronizes its stream on drop when device work was enqueued on it and
+/// not handed off to a [`DirectSubmission`].
+struct BatchFence {
+    stream: Option<Arc<driver::Stream>>,
+}
+
+impl BatchFence {
+    fn idle() -> Self {
+        Self { stream: None }
+    }
+
+    fn arm(&mut self, stream: &Arc<driver::Stream>) {
+        if self.stream.is_none() {
+            self.stream = Some(Arc::clone(stream));
+        }
+    }
+
+    fn disarm(mut self) {
+        self.stream = None;
+    }
+}
+
+impl Drop for BatchFence {
+    fn drop(&mut self) {
+        if let Some(stream) = &self.stream {
+            let _ = stream.synchronize();
+        }
+    }
+}
+
 /// Launches issued in order on one of the device's native streams. The
 /// stream orders each launch after the previous one's writes.
 pub struct DirectBatch {
+    /// Declared first so an uncommitted drop synchronizes `stream` before
+    /// `start`, `marks`, `stream`, or `device` drop.
+    fence: BatchFence,
     device: Device,
-    stream: std::sync::Arc<driver::Stream>,
-    start: Option<Event>,
+    stream: Arc<driver::Stream>,
+    start: Event,
     /// For a timed batch, per `launch` call, the event recorded just before
     /// the launch (absent for an empty launch).
     marks: Option<Vec<Option<Event>>>,
-    /// Whether device work was enqueued on `stream` and has not yet been
-    /// handed to a [`DirectSubmission`] (or synchronized on `end` failure).
-    enqueued: bool,
 }
 
 impl DirectBatch {
@@ -923,11 +997,11 @@ impl DirectBatch {
         let start = Event::new(device.context()).map_err(submission)?;
         start.record(&stream).map_err(submission)?;
         Ok(Self {
+            fence: BatchFence::idle(),
             device: device.clone(),
             stream,
-            start: Some(start),
+            start,
             marks: None,
-            enqueued: false,
         })
     }
 
@@ -950,7 +1024,7 @@ impl DirectBatch {
         // event was recorded when its submission committed.
         let status = unsafe { context.enqueue().stream_wait_event(self.stream.raw(), other.end.raw()) };
         context.driver.check(status, "cross-stream wait").map_err(submission)?;
-        self.enqueued = true;
+        self.fence.arm(&self.stream);
         Ok(())
     }
 
@@ -994,7 +1068,7 @@ impl DirectBatch {
         driver
             .check(status, "native kernel launch")
             .map_err(submission)?;
-        self.enqueued = true;
+        self.fence.arm(&self.stream);
         Ok(())
     }
 
@@ -1011,7 +1085,7 @@ impl DirectBatch {
         // context, which the caller keeps until the batch completes.
         let status = unsafe { context.enqueue().memcpy_device_async(destination, source, count, self.stream.raw()) };
         context.driver.check(status, "device copy").map_err(submission)?;
-        self.enqueued = true;
+        self.fence.arm(&self.stream);
         Ok(())
     }
 
@@ -1030,7 +1104,7 @@ impl DirectBatch {
             // SAFETY: a word of a live device allocation of this context.
             let status = unsafe { context.enqueue().memset_d32_async(destination + offset, half, 1, self.stream.raw()) };
             context.driver.check(status, "device word write").map_err(submission)?;
-            self.enqueued = true;
+            self.fence.arm(&self.stream);
         }
         Ok(())
     }
@@ -1039,7 +1113,7 @@ impl DirectBatch {
     /// completes ([`Stamps`]).
     pub fn stamp(&mut self, stamps: &Stamps, mark: usize) -> Result<(), ExecutionError> {
         stamps.events[mark].record(&self.stream).map_err(submission)?;
-        self.enqueued = true;
+        self.fence.arm(&self.stream);
         Ok(())
     }
 
@@ -1081,7 +1155,7 @@ impl DirectBatch {
             .driver
             .check(status, "stream memory operation")
             .map_err(submission)?;
-        self.enqueued = true;
+        self.fence.arm(&self.stream);
         Ok(())
     }
 
@@ -1095,10 +1169,12 @@ impl DirectBatch {
             "DirectBatch::replay precondition: a timed batch times each launch"
         );
         graph.exec.launch(&self.stream).map_err(submission)?;
-        self.enqueued = true;
+        self.fence.arm(&self.stream);
         graph.launched.record(&self.stream).map_err(submission)?;
-        for (written, wake) in graph.words.iter().filter_map(|node| node.written.as_ref()) {
-            wake.behind(&self.stream, written)?;
+        for node in &graph.words {
+            if let WordKind::Write { written, wake } = &node.kind {
+                wake.behind(&self.stream, written)?;
+            }
         }
         Ok(())
     }
@@ -1122,36 +1198,38 @@ impl DirectBatch {
     /// finished, or (the wait failing too, both errors returned) the
     /// context's sticky error lets nothing more run, so no storage they
     /// reach is reused while they run.
-    fn end(mut self) -> Result<DirectSubmission, ExecutionError> {
-        self.enqueued = false;
-        let start = self.start.take().expect("DirectBatch::end called once");
-        let marks = self.marks.take();
-        let end = Event::new(self.device.context()).and_then(|end| {
-            end.record(&self.stream)?;
+    fn end(self) -> Result<DirectSubmission, ExecutionError> {
+        let Self {
+            fence,
+            device,
+            stream,
+            start,
+            marks,
+        } = self;
+        let end = Event::new(device.context()).and_then(|end| {
+            end.record(&stream)?;
             Ok(end)
         });
         match end {
-            Ok(end) => Ok(DirectSubmission {
-                start,
-                end,
-                marks,
-                complete: std::sync::atomic::AtomicBool::new(false),
-            }),
-            Err(error) => Err(match self.stream.synchronize() {
-                Ok(()) => submission(error),
-                Err(waited) => ExecutionError::IssueAndCompletionFailed {
-                    issue: Box::new(submission(error)),
-                    completion: Box::new(submission(waited)),
-                },
-            }),
-        }
-    }
-}
-
-impl Drop for DirectBatch {
-    fn drop(&mut self) {
-        if self.enqueued {
-            let _ = self.stream.synchronize();
+            Ok(end) => {
+                fence.disarm();
+                Ok(DirectSubmission {
+                    start,
+                    end,
+                    marks,
+                    complete: std::sync::atomic::AtomicBool::new(false),
+                })
+            }
+            Err(error) => {
+                fence.disarm();
+                Err(match stream.synchronize() {
+                    Ok(()) => submission(error),
+                    Err(waited) => ExecutionError::IssueAndCompletionFailed {
+                        issue: Box::new(submission(error)),
+                        completion: Box::new(submission(waited)),
+                    },
+                })
+            }
         }
     }
 }
