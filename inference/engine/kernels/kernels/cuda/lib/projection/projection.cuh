@@ -2006,7 +2006,7 @@ __device__ __forceinline__ void gemm_publish(const float (&acc)[2][NJ][MI][2][4]
 template <class Shape, class Operands = SemanticGemmOperands, class W>
 __device__ __forceinline__ void gemm_tile_half(float acc[Shape::MI][2][4], const W &w, const typename W::Raw &raw,
                                                const float *coefficients, int j_tile, int half,
-                                               const u32 a[2][Shape::MI][4]) {
+                                               const u32 a[2][Shape::MI][4], u32 live_tiles) {
     using Operand = typename Operands::Operand;
     const u32 g = (threadIdx.x % 32) / 4;
     constexpr int STEPS = W::GROUP / 16;
@@ -2034,6 +2034,8 @@ __device__ __forceinline__ void gemm_tile_half(float acc[Shape::MI][2][4], const
                     k[h][c] = gemm_coefficient<W>(coefficients, j_tile * 16 + h * 8 + 2 * t + c, group);
 #pragma unroll
             for (int mi = 0; mi < Shape::MI; ++mi) {
+                if (mi > 0 && (u32)mi >= live_tiles)
+                    continue;
                 float p[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
                 // sum(x) of the group per C row (every column equal).
                 float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -2077,6 +2079,8 @@ __device__ __forceinline__ void gemm_tile_half(float acc[Shape::MI][2][4], const
         const u32 b1[2] = {r[1], r[3]};
 #pragma unroll
         for (int mi = 0; mi < Shape::MI; ++mi) {
+            if (mi > 0 && (u32)mi >= live_tiles)
+                continue;
             Operand::mma(acc[mi][0], a[local][mi], b0);
             Operand::mma(acc[mi][1], a[local][mi], b1);
         }
@@ -2180,7 +2184,7 @@ template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
 // fragments by its tiles' dequantized weight fragments.
 template <class Shape, class Operands = SemanticGemmOperands, class Weights>
 __device__ __forceinline__ void gemm_multiply(float (&acc)[2][Shape::NJ][Shape::MI][2][4], const Weights &weights,
-                                              int stage, u64 index, u32 warp, u32 lane) {
+                                              int stage, u64 index, u32 warp, u32 lane, u32 live_tiles) {
     constexpr int PITCH = Shape::template A_PITCH<false>;
     constexpr int MI = Shape::MI;
     constexpr int NJ = Shape::NJ;
@@ -2207,15 +2211,17 @@ __device__ __forceinline__ void gemm_multiply(float (&acc)[2][Shape::NJ][Shape::
         for (int local = 0; local < 2; ++local)
 #pragma unroll
             for (int mi = 0; mi < MI; ++mi) {
+                if (mi > 0 && (u32)mi >= live_tiles)
+                    continue;
                 const int s = 2 * half + local;
                 const u32 row = wm * (MI * 16) + mi * 16;
                 seismic_ldmatrix_x4(a[local][mi], base + (row + lane % 16) * PITCH + (s * 16 + (lane / 16) * 8) * 2);
             }
 #pragma unroll
         for (int j = 0; j < NJ; ++j) {
-            gemm_tile_half<Shape, Operands>(acc[0][j], weights.wa, raw_a[j], coefficients_a, j, half, a);
+            gemm_tile_half<Shape, Operands>(acc[0][j], weights.wa, raw_a[j], coefficients_a, j, half, a, live_tiles);
             if constexpr (Weights::PAIR)
-                gemm_tile_half<Shape, Operands>(acc[1][j], weights.wb, raw_b[j], coefficients_b, j, half, a);
+                gemm_tile_half<Shape, Operands>(acc[1][j], weights.wb, raw_b[j], coefficients_b, j, half, a, live_tiles);
         }
     }
 }
@@ -2241,14 +2247,18 @@ __device__ __forceinline__ void mma_fp4(float (&d)[4], const u32 (&a)[4], const 
 // half h's B fragment and scales (`W::fp4_fragments`) times every A fragment.
 template <class Shape, class W, int RECORD>
 __device__ __forceinline__ void gemm_tile_fp4(float acc[Shape::MI][2][4], const u8 *chunk, const u8 *records, u32 row0,
-                                              u64 kblock, const u32 (&a)[Shape::MI][4], const u32 (&sa)[Shape::MI]) {
+                                              u64 kblock, const u32 (&a)[Shape::MI][4], const u32 (&sa)[Shape::MI],
+                                              u32 live_tiles) {
     u32 b[2][2], sb[2];
     W::template fp4_fragments<RECORD>(chunk, records, row0, kblock, threadIdx.x % 32, b, sb);
 #pragma unroll
     for (int h = 0; h < 2; ++h)
 #pragma unroll
-        for (int mi = 0; mi < Shape::MI; ++mi)
+        for (int mi = 0; mi < Shape::MI; ++mi) {
+            if (mi > 0 && (u32)mi >= live_tiles)
+                continue;
             mma_fp4(acc[mi][h], a[mi], b[h], sa[mi], sb[h]);
+        }
 }
 
 // One warp's multiply of the share's staged k-block `index` (in stage
@@ -2258,7 +2268,8 @@ __device__ __forceinline__ void gemm_tile_fp4(float acc[Shape::MI][2][4], const 
 // tile's halves (`gemm_tile_fp4`).
 template <class Shape, class Weights>
 __device__ __forceinline__ void gemm_multiply_fp4(float (&acc)[2][Shape::NJ][Shape::MI][2][4],
-                                                  const Weights &weights, int stage, u64 index, u32 warp, u32 lane) {
+                                                  const Weights &weights, int stage, u64 index, u32 warp, u32 lane,
+                                                  u32 live_tiles) {
     static_assert(packets::nvfp4_operands<decltype(weights.wa)>::value &&
                       (!Weights::PAIR || packets::nvfp4_operands<decltype(weights.wb)>::value),
                   "FP4 tensor operations multiply W4A4 NVFP4 weights");
@@ -2273,6 +2284,8 @@ __device__ __forceinline__ void gemm_multiply_fp4(float (&acc)[2][Shape::NJ][Sha
     u32 a[MI][4], sa[MI];
 #pragma unroll
     for (int mi = 0; mi < MI; ++mi) {
+        if (mi > 0 && (u32)mi >= live_tiles)
+            continue;
         const u8 *row = base + (wm * (MI * 16) + mi * 16 + g) * PITCH;
         const u8 *row8 = row + 8 * PITCH;
         a[mi][0] = *reinterpret_cast<const u32 *>(row + 4 * t);
@@ -2285,10 +2298,10 @@ __device__ __forceinline__ void gemm_multiply_fp4(float (&acc)[2][Shape::NJ][Sha
     for (int j = 0; j < NJ; ++j) {
         const u32 row0 = (wn * NJ + j) * 16;
         gemm_tile_fp4<Shape, decltype(weights.wa), Weights::RECORD_A>(
-            acc[0][j], weights.codes(stage, 0, wn * NJ + j), weights.records(kb, 0), row0, kb, a, sa);
+            acc[0][j], weights.codes(stage, 0, wn * NJ + j), weights.records(kb, 0), row0, kb, a, sa, live_tiles);
         if constexpr (Weights::PAIR)
             gemm_tile_fp4<Shape, decltype(weights.wb), Weights::RECORD_B>(
-                acc[1][j], weights.codes(stage, 1, wn * NJ + j), weights.records(kb, 1), row0, kb, a, sa);
+                acc[1][j], weights.codes(stage, 1, wn * NJ + j), weights.records(kb, 1), row0, kb, a, sa, live_tiles);
     }
 }
 
@@ -2333,7 +2346,11 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
     const u64 kbegin = K / 64 * part / parts;
     const u64 kblocks = K / 64 * (part + 1) / parts - kbegin;
     const Weights weights{shared, wa, wb, tile0, (rows + 15) / 16, kbegin, K / 64};
-    const bool active = m0 + wm * (MI * 16) < M;
+    const u64 warp_m0 = m0 + wm * (MI * 16);
+    const bool active = warp_m0 < M;
+    const u32 live_tiles = active ? (min((u32)(M - warp_m0), (u32)(MI * 16)) + 15u) / 16u : 0u;
+    const u32 block_live_rows = m0 < M ? min((u32)(M - m0), (u32)Shape::BM) : 0u;
+    const u32 block_live_padded = (block_live_rows + 15u) & ~15u;
 
     // The loader set of the share's k-block `index` issues its stage: the
     // loaders' other warps multiply meanwhile, their tensor pipes busy while
@@ -2346,11 +2363,14 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
     constexpr int CHUNKS = Shape::BM * 8 / LOADERS;
     const u8 *chunk[CHUNKS];
     bool valid[CHUNKS];
+    bool needed[CHUNKS];
 #pragma unroll
     for (int i = 0; i < CHUNKS; ++i) {
         const int c = (int)loader + i * LOADERS;
-        const u64 row = m0 + c / 8;
+        const u32 local_row = (u32)(c / 8);
+        const u64 row = m0 + local_row;
         valid[i] = row < M;
+        needed[i] = local_row < block_live_padded;
         chunk[i] = source.row(valid[i] ? row : 0) + (c % 8) * 16;
     }
     // Packed NVFP4 operand rows (`Fp4GemmOperands`) stage a row's 32 code
@@ -2360,11 +2380,14 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
     const u8 *piece[PIECES];
     int place[PIECES];
     bool present[PIECES];
+    bool piece_needed[PIECES];
 #pragma unroll
     for (int i = 0; i < PIECES; ++i) {
         const int c = (int)loader + i * LOADERS;
-        const u64 row = m0 + c / 3;
+        const u32 local_row = (u32)(c / 3);
+        const u64 row = m0 + local_row;
         present[i] = Operands::FP4 && c < Shape::BM * 3 && row < M;
+        piece_needed[i] = Operands::FP4 && c < Shape::BM * 3 && local_row < block_live_padded;
         piece[i] = source.row(present[i] ? row : 0) + (c % 3 < 2 ? 16 * (c % 3) : PackedRows::scales(K));
         place[i] = (c / 3) * PITCH + 16 * (c % 3);
     }
@@ -2377,7 +2400,7 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
 #pragma unroll
             for (int i = 0; i < PIECES; ++i) {
                 const int c = (int)loader + i * LOADERS;
-                if (c >= Shape::BM * 3)
+                if (!piece_needed[i])
                     continue;
                 if (c % 3 < 2)
                     seismic_cp_async_16_zfill(base + place[i], piece[i] + kb * 32, present[i] ? 16u : 0u);
@@ -2387,6 +2410,8 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
         } else if (wide) {
 #pragma unroll
             for (int i = 0; i < CHUNKS; ++i) {
+                if (!needed[i])
+                    continue;
                 const int c = (int)loader + i * LOADERS;
                 seismic_cp_async_16_zfill(base + (c / 8) * PITCH + (c % 8) * 16, chunk[i] + kb * 128,
                                           valid[i] ? 16u : 0u);
@@ -2396,6 +2421,8 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
             // chunk's eight 16-bit values, loaded singly.
 #pragma unroll
             for (int i = 0; i < CHUNKS; ++i) {
+                if (!needed[i])
+                    continue;
                 const int c = (int)loader + i * LOADERS;
                 u32 w[4] = {0u, 0u, 0u, 0u};
                 if (valid[i]) {
@@ -2410,9 +2437,9 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
     };
     auto multiply = [&](float (&acc)[2][NJ][MI][2][4], int stage, u64 index) {
         if constexpr (Operands::FP4)
-            gemm_multiply_fp4<Shape>(acc, weights, stage, index, warp, lane);
+            gemm_multiply_fp4<Shape>(acc, weights, stage, index, warp, lane, live_tiles);
         else
-            gemm_multiply<Shape, Operands>(acc, weights, stage, index, warp, lane);
+            gemm_multiply<Shape, Operands>(acc, weights, stage, index, warp, lane, live_tiles);
     };
     // `index` counts k-blocks of this share.
     const auto copies = weights.template loader<LOADERS, Shape::SPAN>(loader);
@@ -2500,148 +2527,163 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
 // staged groups do not hold (`gemm_s8_sums`).
 template <class W> __host__ __device__ constexpr bool gemm_s8_group_sums() { return W::BIAS && W::GROUP < 32; }
 
-// d_x sum q_x of each 16-code group `part` of each 32-code half h of a
-// warp's activation rows (rows g, g + 8 of each m16 tile),
-// sums[h][part][mi][r]: the exact s8 product of the group's codes with
-// all-ones weights, under the half's d_x. In slot order (ENTRIES false) the
-// group is the half's k 16 part..16 part + 15, one k16 MMA; in entry order
-// it is the codes of the lanes whose entry is in it (`s8_holds`), a k32 MMA
-// with the other lanes' ones zero. It depends on the activation rows alone,
-// so a warp forms it once a k-block for all its weight tiles.
+// d_x sum q_x of each 16-code group `part` of one 32-code half of a warp's
+// activation rows (rows g, g + 8 of each m16 tile), sums[part][mi][r]: the
+// exact s8 product of the group's codes with all-ones weights, under the
+// half's d_x. In slot order (ENTRIES false) the group is the half's
+// k 16 part..16 part + 15, one k16 MMA; in entry order it is the codes of the
+// lanes whose entry is in it (`s8_holds`), a k32 MMA with the other lanes'
+// ones zero. It depends on the activation rows alone, so a warp forms it once
+// a half for all its weight tiles.
 template <class Shape, bool ENTRIES>
-__device__ __forceinline__ void gemm_s8_sums(float (&sums)[2][2][Shape::MI][2], const u32 a[2][Shape::MI][4],
-                                             const float2 x[2][Shape::MI][2]) {
+__device__ __forceinline__ void gemm_s8_sums_half(float (&sums)[2][Shape::MI][2], const u32 a[Shape::MI][4],
+                                                  const float2 x[Shape::MI][2], u32 live_tiles) {
     const u32 t = threadIdx.x % 4;
 #pragma unroll
-    for (int h = 0; h < 2; ++h)
+    for (int part = 0; part < 2; ++part)
 #pragma unroll
-        for (int part = 0; part < 2; ++part)
-#pragma unroll
-            for (int mi = 0; mi < Shape::MI; ++mi) {
-                int sum[4] = {GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS};
-                if constexpr (ENTRIES) {
-                    const u32 ones = s8_holds<true>(0, part, t) ? 0x01010101u : 0u;
-                    const u32 b[2] = {ones, ones};
-                    seismic_mma_m16n8k32_s8(sum, a[h][mi], b);
-                } else {
-                    seismic_mma_m16n8k16_s8(sum, a[h][mi][2 * part], a[h][mi][2 * part + 1], 0x01010101u);
-                }
-#pragma unroll
-                for (int r = 0; r < 2; ++r)
-                    sums[h][part][mi][r] = x[h][mi][r].x * gemm_s8_product(sum[2 * r]);
+        for (int mi = 0; mi < Shape::MI; ++mi) {
+            if (mi > 0 && (u32)mi >= live_tiles)
+                continue;
+            int sum[4] = {GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS};
+            if constexpr (ENTRIES) {
+                const u32 ones = s8_holds<true>(0, part, t) ? 0x01010101u : 0u;
+                const u32 b[2] = {ones, ones};
+                seismic_mma_m16n8k32_s8(sum, a[mi], b);
+            } else {
+                seismic_mma_m16n8k16_s8(sum, a[mi][2 * part], a[mi][2 * part + 1], 0x01010101u);
             }
+#pragma unroll
+            for (int r = 0; r < 2; ++r)
+                sums[part][mi][r] = x[mi][r].x * gemm_s8_product(sum[2 * r]);
+        }
 }
 
-// The INT8 candidate's GEMM: the same block tiling and pipeline over s8
-// activations staged by `stage_row_s8` (BM rows x 64 bytes per k-block, pitch
-// 80, plus each row's two (d, d * sum q) groups) and s8 weight fragments
-// (packets.cuh virtual order), both in the rows' order (ENTRIES). Per 32
-// codes one m16n8k32 s8 MMA into an exact int32 product (for 16-code groups,
-// one k16 MMA a group in slot order, one k32 MMA a group masked to its lanes
-// in entry order), folded with the
+// The INT8 candidate's GEMM over one 32-code half `h`: the same block tiling
+// and pipeline over s8 activations staged by `stage_row_s8` (BM rows x 64
+// bytes per k-block, pitch 80, plus each row's two (d, d * sum q) groups) and
+// s8 weight fragments (packets.cuh virtual order), both in the rows' order
+// (ENTRIES). Per 32 codes one m16n8k32 s8 MMA into an exact int32 product (for
+// 16-code groups, one k16 MMA a group in slot order, one k32 MMA a group
+// masked to its lanes in entry order), folded per m16 tile with the
 // coefficients of its group (of 32 codes or more) as
 // acc += scale * (d_x * P) - bias * (d_x * sum q_x). Weights whose local codes
 // multiply their codes (`packets::int8_local`) take the s8 products of each
 // register's codes and its group's local code, so each 32 codes are one MMA
 // under the row's factor whatever their groups.
 template <class Shape, bool ENTRIES, class W>
-__device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W &w, const u8 *staged_tile,
-                                             const float *coefficients, int j_tile, const u32 a[2][Shape::MI][4],
-                                             const float2 x[2][Shape::MI][2], const float (&sums)[2][2][Shape::MI][2]) {
+__device__ __forceinline__ void gemm_tile_s8_half(float acc[Shape::MI][2][4], const W &w, const typename W::Raw &raw,
+                                                  const float *coefficients, int j_tile, int h,
+                                                  const u32 a[Shape::MI][4], const float2 x[Shape::MI][2],
+                                                  const float (&sums)[2][Shape::MI][2], u32 live_tiles) {
     static_assert(!W::DENSE, "the INT8 GEMM needs packed weights");
     constexpr bool LOCAL = staged_multiplier<W, true>();
     const u32 lane = threadIdx.x % 32;
     const u32 t = lane % 4;
-    const typename W::Raw raw = w.from_shared(staged_tile, lane);
-    // A biased 16-code group takes its part's d_x sum q_x (`gemm_s8_sums`);
+    // A biased 16-code group takes its part's d_x sum q_x (`gemm_s8_sums_half`);
     // a group of 32 codes or more the staged d_x sum q_x of each half.
     constexpr bool SUMS = gemm_s8_group_sums<W>();
-    auto fold = [&](const int (&p)[Shape::MI][2][4], int group, int h, int part) {
+    auto fold_tile = [&](int mi, const int (&p)[2][4], const float2 (&k)[2][2], int part) {
 #pragma unroll
         for (int half = 0; half < 2; ++half)
 #pragma unroll
-            for (int c = 0; c < 2; ++c) {
-                const float2 k = gemm_coefficient<W, true>(coefficients, j_tile * 16 + half * 8 + 2 * t + c, group);
+            for (int c = 0; c < 2; ++c)
 #pragma unroll
-                for (int mi = 0; mi < Shape::MI; ++mi)
-#pragma unroll
-                    for (int r = 0; r < 2; ++r) {
-                        float &value = acc[mi][half][2 * r + c];
-                        value = seismic_fma_rn(k.x, x[h][mi][r].x * gemm_s8_product(p[mi][half][2 * r + c]), value);
-                        if constexpr (SUMS)
-                            value = seismic_fma_rn(k.y, sums[h][part][mi][r], value);
-                        else if constexpr (W::BIAS)
-                            value = seismic_fma_rn(k.y, x[h][mi][r].y, value);
-                    }
-            }
-    };
-#pragma unroll
-    for (int h = 0; h < 2; ++h) {
-        // The half's registers (`s8_half`), in the rows' order: {row g low,
-        // row g + 8 low, row g high, row g + 8 high}.
-        u32 r[4];
-        w.template s8_half<packets::points_of<>, ENTRIES>(raw, h, r);
-        if constexpr (LOCAL) {
-            // Each register times its row's local code of the group it holds.
-            const u32 row = j_tile * 16 + lane / 4;
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
-                r[i] = s8_times(r[i], gemm_multiplier<W>(coefficients, row + 8 * (i % 2),
-                                                         s8_group<ENTRIES, W::GROUP>(h, i, t)));
-        }
-        if constexpr (W::GROUP >= 32 || LOCAL) {
-            // Half h's 32 codes, of group 32 h / GROUP (of any group, under
-            // the row's factor, where LOCAL).
-            const u32 b0[2] = {r[0], r[2]};
-            const u32 b1[2] = {r[1], r[3]};
-            int p[Shape::MI][2][4];
-#pragma unroll
-            for (int mi = 0; mi < Shape::MI; ++mi) {
-#pragma unroll
-                for (int e = 0; e < 4; ++e)
-                    p[mi][0][e] = p[mi][1][e] = GEMM_S8_BIAS;
-                seismic_mma_m16n8k32_s8(p[mi][0], a[h][mi], b0);
-                seismic_mma_m16n8k32_s8(p[mi][1], a[h][mi], b1);
-            }
-            fold(p, 32 * h / W::GROUP, h, 0);
-        } else {
-            static_assert(W::GROUP == 16, "groups of 16 codes, or of 32 or more");
-#pragma unroll
-            for (int part = 0; part < 2; ++part) {
-                int p[Shape::MI][2][4];
-                if constexpr (ENTRIES) {
-                    // In entry order the 16-code group `part` is the codes of
-                    // the lanes whose entry is in it, in both k halves
-                    // (`s8_holds`): a k32 MMA over the half's activation
-                    // fragment with the other lanes' registers zero.
-                    const bool holds = s8_holds<true>(0, part, t);
-                    const u32 b0[2] = {holds ? r[0] : 0u, holds ? r[2] : 0u};
-                    const u32 b1[2] = {holds ? r[1] : 0u, holds ? r[3] : 0u};
-#pragma unroll
-                    for (int mi = 0; mi < Shape::MI; ++mi) {
-#pragma unroll
-                        for (int e = 0; e < 4; ++e)
-                            p[mi][0][e] = p[mi][1][e] = GEMM_S8_BIAS;
-                        seismic_mma_m16n8k32_s8(p[mi][0], a[h][mi], b0);
-                        seismic_mma_m16n8k32_s8(p[mi][1], a[h][mi], b1);
-                    }
-                } else {
-                    // In slot order the group is step 2h + part (registers
-                    // 2 part, 2 part + 1), one k16 MMA over its half of the 32
-                    // codes' activation fragment (k 0..15: a[0], a[1]; k
-                    // 16..31: a[2], a[3]).
-#pragma unroll
-                    for (int mi = 0; mi < Shape::MI; ++mi) {
-                        const u32 a0 = a[h][mi][2 * part];
-                        const u32 a1 = a[h][mi][2 * part + 1];
-#pragma unroll
-                        for (int e = 0; e < 4; ++e)
-                            p[mi][0][e] = p[mi][1][e] = GEMM_S8_BIAS;
-                        seismic_mma_m16n8k16_s8(p[mi][0], a0, a1, r[2 * part]);
-                        seismic_mma_m16n8k16_s8(p[mi][1], a0, a1, r[2 * part + 1]);
-                    }
+                for (int r = 0; r < 2; ++r) {
+                    float &value = acc[mi][half][2 * r + c];
+                    value = seismic_fma_rn(k[half][c].x, x[mi][r].x * gemm_s8_product(p[half][2 * r + c]), value);
+                    if constexpr (SUMS)
+                        value = seismic_fma_rn(k[half][c].y, sums[part][mi][r], value);
+                    else if constexpr (W::BIAS)
+                        value = seismic_fma_rn(k[half][c].y, x[mi][r].y, value);
                 }
-                fold(p, 2 * h + part, h, part);
+    };
+    // The half's registers (`s8_half`), in the rows' order: {row g low,
+    // row g + 8 low, row g high, row g + 8 high}.
+    u32 r[4];
+    w.template s8_half<packets::points_of<>, ENTRIES>(raw, h, r);
+    if constexpr (LOCAL) {
+        // Each register times its row's local code of the group it holds.
+        const u32 row = j_tile * 16 + lane / 4;
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            r[i] = s8_times(r[i], gemm_multiplier<W>(coefficients, row + 8 * (i % 2),
+                                                     s8_group<ENTRIES, W::GROUP>(h, i, t)));
+    }
+    if constexpr (W::GROUP >= 32 || LOCAL) {
+        // Half h's 32 codes, of group 32 h / GROUP (of any group, under
+        // the row's factor, where LOCAL).
+        const int group = 32 * h / W::GROUP;
+        float2 k[2][2];
+#pragma unroll
+        for (int half = 0; half < 2; ++half)
+#pragma unroll
+            for (int c = 0; c < 2; ++c)
+                k[half][c] = gemm_coefficient<W, true>(coefficients, j_tile * 16 + half * 8 + 2 * t + c, group);
+        const u32 b0[2] = {r[0], r[2]};
+        const u32 b1[2] = {r[1], r[3]};
+#pragma unroll
+        for (int mi = 0; mi < Shape::MI; ++mi) {
+            if (mi > 0 && (u32)mi >= live_tiles)
+                continue;
+            int p[2][4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                p[0][e] = p[1][e] = GEMM_S8_BIAS;
+            seismic_mma_m16n8k32_s8(p[0], a[mi], b0);
+            seismic_mma_m16n8k32_s8(p[1], a[mi], b1);
+            fold_tile(mi, p, k, 0);
+        }
+    } else {
+        static_assert(W::GROUP == 16, "groups of 16 codes, or of 32 or more");
+#pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            const int group = 2 * h + part;
+            float2 k[2][2];
+#pragma unroll
+            for (int half = 0; half < 2; ++half)
+#pragma unroll
+                for (int c = 0; c < 2; ++c)
+                    k[half][c] = gemm_coefficient<W, true>(coefficients, j_tile * 16 + half * 8 + 2 * t + c, group);
+            if constexpr (ENTRIES) {
+                // In entry order the 16-code group `part` is the codes of
+                // the lanes whose entry is in it, in both k halves
+                // (`s8_holds`): a k32 MMA over the half's activation
+                // fragment with the other lanes' registers zero.
+                const bool holds = s8_holds<true>(0, part, t);
+                const u32 b0[2] = {holds ? r[0] : 0u, holds ? r[2] : 0u};
+                const u32 b1[2] = {holds ? r[1] : 0u, holds ? r[3] : 0u};
+#pragma unroll
+                for (int mi = 0; mi < Shape::MI; ++mi) {
+                    if (mi > 0 && (u32)mi >= live_tiles)
+                        continue;
+                    int p[2][4];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                        p[0][e] = p[1][e] = GEMM_S8_BIAS;
+                    seismic_mma_m16n8k32_s8(p[0], a[mi], b0);
+                    seismic_mma_m16n8k32_s8(p[1], a[mi], b1);
+                    fold_tile(mi, p, k, part);
+                }
+            } else {
+                // In slot order the group is step 2h + part (registers
+                // 2 part, 2 part + 1), one k16 MMA over its half of the 32
+                // codes' activation fragment (k 0..15: a[0], a[1]; k
+                // 16..31: a[2], a[3]).
+#pragma unroll
+                for (int mi = 0; mi < Shape::MI; ++mi) {
+                    if (mi > 0 && (u32)mi >= live_tiles)
+                        continue;
+                    const u32 a0 = a[mi][2 * part];
+                    const u32 a1 = a[mi][2 * part + 1];
+                    int p[2][4];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                        p[0][e] = p[1][e] = GEMM_S8_BIAS;
+                    seismic_mma_m16n8k16_s8(p[0], a0, a1, r[2 * part]);
+                    seismic_mma_m16n8k16_s8(p[1], a0, a1, r[2 * part + 1]);
+                    fold_tile(mi, p, k, part);
+                }
             }
         }
     }
@@ -2675,7 +2717,11 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const Rows &source, 
     const float *coefficients_a = weights.area(warp, 0);
     const float *coefficients_b = weights.area(warp, 1);
     // As in `gemm_segment`: a warp whose rows all lie at or past M only loads.
-    const bool active = m0 + wm * (MI * 16) < M;
+    const u64 warp_m0 = m0 + wm * (MI * 16);
+    const bool active = warp_m0 < M;
+    const u32 live_tiles = active ? (min((u32)(M - warp_m0), (u32)(MI * 16)) + 15u) / 16u : 0u;
+    const u32 block_live_rows = m0 < M ? min((u32)(M - m0), (u32)Shape::BM) : 0u;
+    const u32 block_live_padded = (block_live_rows + 15u) & ~15u;
 
     // A thread's code chunks (16 bytes of one tile row per k-block) and
     // group rows keep their rows across k-blocks, so their addresses are
@@ -2684,20 +2730,25 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const Rows &source, 
     constexpr int GROUP_ROWS = (Shape::BM + THREADS - 1) / THREADS;
     const u8 *chunk[CHUNKS];
     bool valid[CHUNKS];
+    bool needed[CHUNKS];
 #pragma unroll
     for (int i = 0; i < CHUNKS; ++i) {
         const int c = (int)threadIdx.x + i * THREADS;
-        const u64 row = m0 + c / 4;
+        const u32 local_row = (u32)(c / 4);
+        const u64 row = m0 + local_row;
         valid[i] = c < Shape::BM * 4 && row < M;
+        needed[i] = c < Shape::BM * 4 && local_row < block_live_padded;
         chunk[i] = source.row(valid[i] ? row : 0) + (c % 4) * 16;
     }
     const float2 *group_row[GROUP_ROWS];
     bool grouped[GROUP_ROWS];
+    bool group_needed[GROUP_ROWS];
 #pragma unroll
     for (int i = 0; i < GROUP_ROWS; ++i) {
         const int r = (int)threadIdx.x + i * THREADS;
         const u64 row = m0 + r;
         grouped[i] = r < Shape::BM && row < M;
+        group_needed[i] = r < Shape::BM && (u32)r < block_live_padded;
         group_row[i] = source.groups_of(grouped[i] ? row : 0);
     }
     const auto copies = weights.template loader<THREADS>(threadIdx.x);
@@ -2706,17 +2757,19 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const Rows &source, 
         u8 *base = weights.stage(stage);
 #pragma unroll
         for (int i = 0; i < CHUNKS; ++i) {
+            if (!needed[i])
+                continue;
             const int c = (int)threadIdx.x + i * THREADS;
-            if (c < Shape::BM * 4)
-                seismic_cp_async_16_zfill(base + (c / 4) * PITCH + (c % 4) * 16, chunk[i] + kb * 64,
-                                          valid[i] ? 16u : 0u);
+            seismic_cp_async_16_zfill(base + (c / 4) * PITCH + (c % 4) * 16, chunk[i] + kb * 64,
+                                      valid[i] ? 16u : 0u);
         }
         u8 *staged_groups = base + Shape::BM * PITCH;
 #pragma unroll
         for (int i = 0; i < GROUP_ROWS; ++i) {
+            if (!group_needed[i])
+                continue;
             const int r = (int)threadIdx.x + i * THREADS;
-            if (r < Shape::BM)
-                seismic_cp_async_16_zfill(staged_groups + r * 16, group_row[i] + kb * 2, grouped[i] ? 16u : 0u);
+            seismic_cp_async_16_zfill(staged_groups + r * 16, group_row[i] + kb * 2, grouped[i] ? 16u : 0u);
         }
         copies.load(weights, stage, index);
     };
@@ -2752,30 +2805,41 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const Rows &source, 
         const int stage = (int)(kb % Shape::STAGES);
         const u8 *base = weights.stage(stage);
         weights.decode(stage, kb, warp, wn * NJ * 16);
-        // Activation fragments and (d, d * sum q) of the two 32-code groups.
-        u32 a[2][MI][4];
-        float2 groups[2][MI][2];
-        const float2 *staged_groups = reinterpret_cast<const float2 *>(base + Shape::BM * PITCH);
-#pragma unroll
-        for (int h = 0; h < 2; ++h)
-#pragma unroll
-            for (int mi = 0; mi < MI; ++mi) {
-                const u32 row = wm * (MI * 16) + mi * 16;
-                seismic_ldmatrix_x4(a[h][mi], base + (row + lane % 16) * PITCH + h * 32 + (lane / 16) * 16);
-                groups[h][mi][0] = staged_groups[(row + g) * 2 + h];
-                groups[h][mi][1] = staged_groups[(row + g + 8) * 2 + h];
-            }
-        float sums[2][2][MI][2];
-        if constexpr (gemm_s8_group_sums<WA>() || gemm_s8_group_sums<WB>())
-            gemm_s8_sums<Shape, ENTRIES>(sums, a, groups);
+        typename WA::Raw raw_a[NJ];
+        typename WB::Raw raw_b[NJ];
 #pragma unroll
         for (int j = 0; j < NJ; ++j) {
             const int tile_local = wn * NJ + j;
-            gemm_tile_s8<Shape, ENTRIES>(acc[0][j], wa, weights.codes(stage, 0, tile_local), coefficients_a, j, a,
-                                         groups, sums);
+            raw_a[j] = wa.from_shared(weights.codes(stage, 0, tile_local), lane);
             if constexpr (PAIR)
-                gemm_tile_s8<Shape, ENTRIES>(acc[1][j], wb, weights.codes(stage, 1, tile_local), coefficients_b, j, a,
-                                             groups, sums);
+                raw_b[j] = wb.from_shared(weights.codes(stage, 1, tile_local), lane);
+        }
+        const float2 *staged_groups = reinterpret_cast<const float2 *>(base + Shape::BM * PITCH);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            // Activation fragments and (d, d * sum q) of half h's 32-code group.
+            u32 a[MI][4];
+            float2 groups[MI][2];
+#pragma unroll
+            for (int mi = 0; mi < MI; ++mi) {
+                if (mi > 0 && (u32)mi >= live_tiles)
+                    continue;
+                const u32 row = wm * (MI * 16) + mi * 16;
+                seismic_ldmatrix_x4(a[mi], base + (row + lane % 16) * PITCH + h * 32 + (lane / 16) * 16);
+                groups[mi][0] = staged_groups[(row + g) * 2 + h];
+                groups[mi][1] = staged_groups[(row + g + 8) * 2 + h];
+            }
+            float sums[2][MI][2];
+            if constexpr (gemm_s8_group_sums<WA>() || gemm_s8_group_sums<WB>())
+                gemm_s8_sums_half<Shape, ENTRIES>(sums, a, groups, live_tiles);
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                gemm_tile_s8_half<Shape, ENTRIES>(acc[0][j], wa, raw_a[j], coefficients_a, j, h, a, groups, sums,
+                                                  live_tiles);
+                if constexpr (PAIR)
+                    gemm_tile_s8_half<Shape, ENTRIES>(acc[1][j], wb, raw_b[j], coefficients_b, j, h, a, groups, sums,
+                                                      live_tiles);
+            }
         }
     }
     seismic_cp_async_wait<0>();

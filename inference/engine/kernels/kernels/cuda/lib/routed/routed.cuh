@@ -18,6 +18,8 @@ using element::u8;
 // The live rows of a grouped block: its `order` entries are one expert's rows
 // followed by -1 padding, so the count is the index of the first -1.
 __device__ __forceinline__ u32 block_rows(const int *order, u64 stride, u32 rows) {
+    if (rows > 0u && order[(u64)(rows - 1u) * stride] >= 0)
+        return rows;
     u32 low = 0, high = rows;
     while (low < high) {
         const u32 middle = (low + high) / 2;
@@ -29,23 +31,51 @@ __device__ __forceinline__ u32 block_rows(const int *order, u64 stride, u32 rows
     return low;
 }
 
-// The activation rows of a grouped block (a GEMM row source over `rows`, the
-// A rows or their s8 rows, `projection::gemm_source`): tile row m reads row
-// order[m] of `rows`. The GEMM reads only the block's live rows.
+// The activation rows of a coalesced grouped super-block (a GEMM row source
+// over `rows`, the A rows or their s8 rows, `projection::gemm_source`): tile
+// row m reads row order[m / tile_rows, m % tile_rows] of `rows`, starting from
+// the super-block's first block. The GEMM reads only the super-block's live rows.
 template <class Rows> struct GroupedRows {
     Rows rows;
     const int *order;
-    u64 order_stride;
-    __device__ __forceinline__ u64 at(u64 m) const { return (u64)order[m * order_stride]; }
+    u64 order_stride_0;
+    u64 order_stride_1;
+    u32 tile_rows;
+    __device__ __forceinline__ u64 at(u64 m) const {
+        const u64 block = m / tile_rows;
+        const u64 lane = m % tile_rows;
+        return (u64)order[block * order_stride_0 + lane * order_stride_1];
+    }
     __device__ __forceinline__ const u8 *row(u64 m) const { return rows.row(at(m)); }
     __device__ __forceinline__ const float2 *groups_of(u64 m) const { return rows.groups_of(at(m)); }
     __device__ __forceinline__ bool wide() const { return rows.wide(); }
     __host__ __device__ static constexpr bool entries() { return Rows::entries(); }
 };
 template <class Rows>
-__device__ __forceinline__ GroupedRows<Rows> grouped_rows(const Rows &rows, const int *order, u64 order_stride) {
-    return GroupedRows<Rows>{rows, order, order_stride};
+__device__ __forceinline__ GroupedRows<Rows> grouped_rows(const Rows &rows, const int *order, u64 order_stride_0,
+                                                          u64 order_stride_1, u32 tile_rows) {
+    return GroupedRows<Rows>{rows, order, order_stride_0, order_stride_1, tile_rows};
 }
+
+// Epilogue storing a coalesced super-block's rows into [B, T, H] starting at
+// the super-block's first block: row m writes block m / tile_rows, lane
+// m % tile_rows.
+template <class E> struct BlockStore {
+    element::Out<E> out;
+    u64 block_stride;
+    u64 row_stride;
+    u32 tile_rows;
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float value, float) const {
+        const u64 block = m / tile_rows;
+        const u64 lane = m % tile_rows;
+        out.put(block * block_stride + lane * row_stride + n, value);
+    }
+    __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
+        const u64 block = m / tile_rows;
+        const u64 lane = m % tile_rows;
+        out.put2(block * block_stride + lane * row_stride + n, first, second);
+    }
+};
 
 // Decode choices that read one record (M <= VERIFY_ROWS rows of K choices, a row's
 // choices distinct records). A choice's record is named by `record(c)` for choice
@@ -190,34 +220,22 @@ struct GatheredRows {
 };
 
 // The grouped expert GEMMs (`routed_experts`, `routed_experts_up`): block
-// tiles of 32 rows x 128 columns, one warp row (each weight tile is decoded
-// once per block: measured on GB10 with iq2xxs experts, 1.7x the rate of two
-// warp rows of four tiles). Weights whose rows hold fewer than 64 code bytes
-// per k-block (the 4- to 6-bit codes) stage k-blocks in spans of two, so each
-// warp copy reads 64 contiguous bytes of a row (`GemmStreamLoader::codes`).
-// The spanned layout must fit the declared shared bytes (`DECLARED`), else
-// the 3-stage single k-block pipeline runs, as the int8 GEMM (S8) always
-// does: it stages one k-block a stage (`gemm_segment_s8`).
-using projection::Pick;
-template <class W> __device__ constexpr bool narrow_rows() { return W::CHUNKS < 64; }
-template <class WA, class WB, int DECLARED, bool S8> struct RoutedShape {
-    using Spanned = projection::GemmShape<32, 1, 8, 4, false, 1, 2>;
-    using Single = projection::GemmShape<32, 1, 8, 3>;
-    static constexpr bool SPANNED = !S8 && narrow_rows<WA>() && narrow_rows<WB>() &&
-                                    Spanned::template LAYOUT_BYTES<WA, WB, false> <= DECLARED;
-    using Type = typename Pick<SPANNED, Spanned, Single>::Type;
-};
-constexpr u32 TILE_M = 32;
+// tiles of 128 rows x 128 columns, one warp row, 2 stages, rotating loader
+// sets (matching dense `LargeGemm<2>`). Consecutive full T-row blocks of the
+// same expert are coalesced into one super-block of up to TILE_M rows in
+// `expert_grids`, amortizing weight loads and dequantization across up to 4x
+// as many rows while empty m16 tiles in partial super-blocks are skipped by
+// `live_tiles` inside `gemm_segment` / `gemm_segment_s8`.
+using RoutedShape = projection::GemmShape<128, 1, 8, 2, false, 2>;
+constexpr u32 TILE_M = RoutedShape::BM;
 
 // One block of a grouped expert GEMM over `source` (A rows, or s8 rows where
 // S8), on either path of `projection::gemm_rows`.
-template <int DECLARED, bool S8, class Operands, class Rows, class WA, class WB, class Epi>
+template <bool S8, class Operands, class Rows, class WA, class WB, class Epi>
 __device__ __forceinline__ void routed_gemm(u8 *shared, const Rows &source, u32 M,
                                             u64 K, u64 nblock, u64 rows,
                                             const WA &wa, const WB &wb, const Epi &epi) {
-    using Shape = typename RoutedShape<WA, WB, DECLARED, S8>::Type;
-    static_assert(Shape::BM == TILE_M, "the declared row tiles");
-    projection::gemm_rows<Shape, S8, Operands>(shared, source, M, K, nblock, rows, wa, wb, epi);
+    projection::gemm_rows<RoutedShape, S8, Operands>(shared, source, M, K, nblock, rows, wa, wb, epi);
 }
 
 
@@ -253,16 +271,51 @@ __device__ __forceinline__ void write_grid(u8 *grid, u64 x, u64 y, u64 z) {
 // The grids of an expert pass over rows[0] grouped rows and used[0] blocks
 // of `tile_rows` rows (`routed_experts`): a stage block per row, a quantize
 // block per block row, and the expand's and down's column blocks by the
-// TILE_M row tiles of each used block.
-__device__ __forceinline__ void expert_grids(const u8 *rows, const u8 *used, u64 tile_rows, u64 expand_columns,
-                                             u64 down_columns, u8 *stage, u8 *expand, u8 *quantize, u8 *down) {
+// coalesced super-blocks (`tiles_out`: uint2(first_block, live_rows)). When
+// `tile_rows <= TILE_M`, consecutive full blocks of the same expert are
+// merged into one super-block of up to `TILE_M` rows (grid y = 1); otherwise
+// each block spans ceil(tile_rows / TILE_M) row tiles in grid y.
+__device__ __forceinline__ void expert_grids(const u8 *rows, const u8 *used_ptr, const int *blocks,
+                                             u64 blocks_stride, const int *order, u64 order_stride_0,
+                                             u64 order_stride_1, u64 tile_rows, u64 expand_columns,
+                                             u64 down_columns, u8 *tiles_out, u8 *stage, u8 *expand, u8 *quantize,
+                                             u8 *down) {
     const u64 grouped = (u64)*reinterpret_cast<const int *>(rows);
-    const u64 blocks = (u64)*reinterpret_cast<const int *>(used);
-    const u64 tiles = (tile_rows + TILE_M - 1) / TILE_M;
+    const u64 used = (u64)*reinterpret_cast<const int *>(used_ptr);
+    uint2 *descriptors = reinterpret_cast<uint2 *>(tiles_out);
+    if (tile_rows <= TILE_M) {
+        u64 groups = 0;
+        u64 b = 0;
+        while (b < used) {
+            const int expert = blocks[b * blocks_stride];
+            const u64 b0 = b;
+            u32 last_live = block_rows(order + b * order_stride_0, order_stride_1, (u32)tile_rows);
+            u32 live = last_live;
+            ++b;
+            while (b < used && last_live == (u32)tile_rows && blocks[b * blocks_stride] == expert &&
+                   live + (u32)tile_rows <= TILE_M) {
+                last_live = block_rows(order + b * order_stride_0, order_stride_1, (u32)tile_rows);
+                live += last_live;
+                ++b;
+            }
+            if (live > 0u) {
+                descriptors[groups] = make_uint2((u32)b0, live);
+                ++groups;
+            }
+        }
+        write_grid(expand, expand_columns, 1, groups);
+        write_grid(down, down_columns, 1, groups);
+    } else {
+        for (u64 b = 0; b < used; ++b) {
+            const u32 live = block_rows(order + b * order_stride_0, order_stride_1, (u32)tile_rows);
+            descriptors[b] = make_uint2((u32)b, live);
+        }
+        const u64 row_tiles = (tile_rows + TILE_M - 1) / TILE_M;
+        write_grid(expand, expand_columns, row_tiles, used);
+        write_grid(down, down_columns, row_tiles, used);
+    }
     write_grid(stage, grouped, 1, 1);
-    write_grid(expand, expand_columns, tiles, blocks);
-    write_grid(quantize, blocks * tile_rows, 1, 1);
-    write_grid(down, down_columns, tiles, blocks);
+    write_grid(quantize, used * tile_rows, 1, 1);
 }
 
 } // namespace routed

@@ -28,8 +28,6 @@
                        expert)
 
 using activation::Act;
-// The declared shared bytes of both launches (`routed.seismic`).
-constexpr int SHARED = 3 * (32 * 144 + 10240) + 4096;
 // Whether the up weight takes its rows as NVFP4 operands (the down weight's
 // are formed by the quantize launch).
 constexpr bool UP_NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
@@ -44,10 +42,15 @@ constexpr bool UP_NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>:
 
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_UP_GRIDS
 __global__ void routed_experts_up_grids(SEISMIC_KERNEL_PARAMS) {
-    routed::expert_grids(SEISMIC_PTR(SEISMIC_BUFFER_ROWS), SEISMIC_PTR(SEISMIC_BUFFER_USED), SEISMIC_DIM_T,
-                         projection::gemm_columns(SEISMIC_DIM_F), projection::gemm_columns(SEISMIC_DIM_H),
-                         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGE_GRID), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_EXPAND_GRID),
-                         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUANTIZE_GRID), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_DOWN_GRID));
+    routed::expert_grids(SEISMIC_PTR(SEISMIC_BUFFER_ROWS), SEISMIC_PTR(SEISMIC_BUFFER_USED),
+                         reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS)), SEISMIC_BLOCKS_STRIDE_0,
+                         reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ORDER)), SEISMIC_ORDER_STRIDE_0,
+                         SEISMIC_ORDER_STRIDE_1, SEISMIC_DIM_T, projection::gemm_columns(SEISMIC_DIM_F),
+                         projection::gemm_columns(SEISMIC_DIM_H), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_TILES),
+                         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGE_GRID),
+                         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_EXPAND_GRID),
+                         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUANTIZE_GRID),
+                         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_DOWN_GRID));
 }
 #endif
 
@@ -83,12 +86,13 @@ __device__ void routed_experts_up_expand_block(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = GROUPED_S8;
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0>;
     extern __shared__ uint4 dynamic_shared[];
-    const projection::u64 block = blockIdx.z;
-    const int expert = ROUTED_BLOCK_EXPERT(block);
-    const int *order = ROUTED_BLOCK_ORDER(block);
-    const projection::u32 live = routed::block_rows(order, SEISMIC_ORDER_STRIDE_1, (projection::u32)SEISMIC_DIM_T);
+    const uint2 tile = reinterpret_cast<const uint2 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_TILES))[blockIdx.z];
+    const projection::u64 block = tile.x;
+    const projection::u32 live = tile.y;
     if ((projection::u64)blockIdx.y * routed::TILE_M >= live)
         return;
+    const int expert = ROUTED_BLOCK_EXPERT(block);
+    const int *order = ROUTED_BLOCK_ORDER(block);
     const int slot = EXPERT_SLOT(expert);
     if (slot == -1)
         return;
@@ -105,8 +109,8 @@ __device__ void routed_experts_up_expand_block(SEISMIC_KERNEL_PARAMS) {
         projection::gemm_source<S8, UP_ENTRIES>(STAGED ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
                                     STAGED ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0,
                                     SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS), SEISMIC_DIM_H),
-        order, SEISMIC_ORDER_STRIDE_1);
-    routed::routed_gemm<SHARED, S8, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_H,
+        order, SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1, (projection::u32)SEISMIC_DIM_T);
+    routed::routed_gemm<S8, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_H,
                                      blockIdx.x, SEISMIC_DIM_F,
                                      PACKETS_MATRIX(KERNEL_W0, (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_UP),
                                                                                  SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP)}
@@ -144,25 +148,26 @@ __device__ void routed_experts_up_down_block(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = GROUPED_S8;
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W1>;
     extern __shared__ uint4 dynamic_shared[];
-    const projection::u64 block = blockIdx.z;
-    const int expert = ROUTED_BLOCK_EXPERT(block);
-    const projection::u32 live =
-        routed::block_rows(ROUTED_BLOCK_ORDER(block), SEISMIC_ORDER_STRIDE_1, (projection::u32)SEISMIC_DIM_T);
+    const uint2 tile = reinterpret_cast<const uint2 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_TILES))[blockIdx.z];
+    const projection::u64 block = tile.x;
+    const projection::u32 live = tile.y;
     if ((projection::u64)blockIdx.y * routed::TILE_M >= live)
         return;
+    const int expert = ROUTED_BLOCK_EXPERT(block);
     const int slot = EXPERT_SLOT(expert);
     if (slot == -1)
         return;
     const projection::u64 rows = block * SEISMIC_DIM_T;
-    const projection::Store<Act> epi{SEISMIC_RESULT_0_OUT.offset(block * SEISMIC_RESULT_0_STRIDE_0),
-                                     SEISMIC_RESULT_0_STRIDE_1, 0};
+    const routed::BlockStore<Act> epi{SEISMIC_RESULT_0_OUT.offset(block * SEISMIC_RESULT_0_STRIDE_0),
+                                      SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
+                                      (projection::u32)SEISMIC_DIM_T};
     // The block's product rows, or their s8 rows and groups.
     const auto source = projection::gemm_source<S8, DOWN_ENTRIES>(
         S8 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_CODES) + rows * SEISMIC_DIM_F
            : SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
         SEISMIC_DIM_F, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_GROUPS) + rows * (SEISMIC_DIM_F / 32) * 8,
         SEISMIC_DIM_F);
-    routed::routed_gemm<SHARED, S8, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_F,
+    routed::routed_gemm<S8, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_F,
                                      blockIdx.x, SEISMIC_DIM_H,
                                      PACKETS_MATRIX(KERNEL_W1, (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_DOWN),
                                                                                  SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN)}

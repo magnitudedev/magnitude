@@ -390,8 +390,9 @@ projection routed for metal:
 # (`routed_expand`, its row y = M * K), the stage launch forms every
 # activation row. summed
 # publishes each slot's projection in A (`published`, [M, K + SHARED, H])
-# for the entry's slot-order join. grouped: fixed 32-row (by expert) or
-# 64-row (every row) x 128-column mma.sync tiles, 3 cp.async stages; the
+# for the entry's slot-order join. grouped: fixed 128-row (by expert, 2
+# cp.async stages, coalescing consecutive full T-row blocks of the same expert
+# in `grids`) or 64-row (every row, 3 stages) x 128-column mma.sync tiles; the
 # rows staged where OPERAND or the experts' NVFP4 operands ask, the products
 # formed in place. INT8 is the int8 candidate of `projection dense for cuda`
 # for both GEMMs (arithmetic: the tuner keeps it only where it is faster
@@ -405,7 +406,9 @@ projection routed for metal:
 # its expert's weights.
 projection routed for cuda:
     let DECODE_GROUPS = ceil_div(ceil_div(ceil_div(most(W, N), 16), TPW), 4 / KSPLIT) for choice | summed
-    let TILE = 64 - 32 * STACKED for grouped
+    let TILE = 64 + 64 * STACKED for grouped
+    let STAGES = 3 - STACKED for grouped
+    let COEF_BYTES = 4096 - 2048 * STACKED for grouped
     let ROW_TILES = STACKED * ceil_div(T, TILE) + (1 - STACKED) * ceil_div(M, TILE) for grouped
     let TILE_BLOCKS = STACKED * B + (1 - STACKED) for grouped
     let PRODUCT_ROWS = STACKED * B * T + (1 - STACKED) * M for grouped
@@ -424,6 +427,7 @@ projection routed for cuda:
     scratch product bytes (STACKED * B * T * N * 2 + (1 - STACKED) * M * N * 2) for grouped
     scratch product_codes bytes (PRODUCT_ROWS * N) when INT8 == 1 for grouped
     scratch product_groups bytes (PRODUCT_ROWS * N / 4) when INT8 == 1 for grouped
+    scratch tiles bytes (B * 8) when STACKED == 1 for grouped
     scratch stage_grid bytes (12) when STACKED == 1 for grouped
     scratch expand_grid bytes (12) when STACKED == 1 for grouped
     scratch quantize_grid bytes (12) when STACKED == 1 for grouped
@@ -469,7 +473,7 @@ projection routed for cuda:
         threadgroups (ceil_div(ceil_div(N, 16), 8), ROW_TILES, TILE_BLOCKS)
         grid (expand_grid)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (TILE * 144 + SERVED * 10240) + SERVED * 4096)
+        shared_bytes (STAGES * (TILE * 144 + SERVED * 10240) + SERVED * COEF_BYTES)
     launch quantize for grouped when INT8 == 1 or (STACKED == 1 and any(W, FIRST == 0 and operands(W) == 1)):
         reads (INT8, OPERAND)
         threadgroups (PRODUCT_ROWS, 1, 1)
@@ -480,7 +484,7 @@ projection routed for cuda:
         threadgroups (ceil_div(ceil_div(WIDTH, 16), 8), ROW_TILES, TILE_BLOCKS)
         grid (down_grid)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (TILE * 144 + 10240) + 4096)
+        shared_bytes (STAGES * (TILE * 144 + 10240) + COEF_BYTES)
 
 # Vulkan. choice: the Metal GEMV with whole-subgroup lane groups, row y =
 # choice (m, k) (`<entry>_choice`), or gathered (GATHERED: a one-workgroup
@@ -1148,15 +1152,15 @@ fn routed_experts[M, H, E, F, B, T, GS, US, X, QS, R, LB](first: &tensor[1] i32,
 # Metal: the paired gate/up GEMM, then the down GEMM, over each block's live
 # rows in TILE_M x TILE_N simdgroup-matrix tiles, or each in a form of the
 # grouped projection over whole blocks (T static: its tiles take T % 32 == 0).
-# (CUDA: fixed 32 x 128 mma.sync tiles, 3 cp.async stages.)
+# (CUDA: fixed 128 x 128 mma.sync tiles, 2 cp.async stages.)
 native routed_experts for metal from "metal/routed_experts.metal":
     static (H, F, T, GS, US, LB)
     records (expert_gate, expert_up, expert_down, records_gate, records_up, records_down)
     project routed grouped (expert_gate, expert_up) down (expert_down)
     restate TILE_M in [32, 64] default 32
 
-# CUDA: 32-row x 128-column block tiles over mma16 weights. (Metal: tunable
-# simdgroup-matrix tiles.)
+# CUDA: 128-row x 128-column coalesced block tiles over mma16 weights. (Metal:
+# tunable simdgroup-matrix tiles.)
 native routed_experts for cuda from "cuda/routed_experts.cu":
     static (H, F, GS, US, LB)
     records (expert_gate, expert_up, expert_down, records_gate, records_up, records_down)
@@ -1858,8 +1862,8 @@ native routed_down for cpu from "cpu/routed_down.rs":
         threads_per_threadgroup (1, 1, 1)
 
 # Prefill, up-only experts: the `routed_experts` GEMMs with one expanding
-# weight (Metal TILE_M x TILE_N simdgroup-matrix tiles; CUDA 32 x 128
-# mma.sync tiles; Vulkan the Metal form; CPU ROWS features per work item).
+# weight (Metal TILE_M x TILE_N simdgroup-matrix tiles; CUDA 128 x 128
+# coalesced mma.sync tiles; Vulkan the Metal form; CPU ROWS features per work item).
 native routed_experts_up for metal from "metal/routed_experts_up.metal":
     static (H, F, T, US)
     records (expert_up, expert_down, records_up, records_down)
