@@ -764,6 +764,26 @@ struct E8M0Scale {
         return __uint_as_float(e == 0u ? 0x00400000u : e == 255u ? 0x7FC00000u : e << 23);
     }
     __device__ static __forceinline__ float read(const u8 *at) { return decode(*at); }
+    // `decode(e) * 2^N`, folding negative powers of two into the F32 exponent
+    // (or subnormal mantissa bit) with zero FP32 multiply.
+    template <int N> __device__ static __forceinline__ float decode_scaled(u32 e) {
+        if constexpr (N == 0) {
+            return decode(e);
+        } else if constexpr (N == -1) {
+            e &= 0xFFu;
+            return __uint_as_float(e < 2u ? (e + 1u) << 21 : e == 255u ? 0x7FC00000u : (e - 1u) << 23);
+        } else if constexpr (N >= -22 && N < 0) {
+            e &= 0xFFu;
+            constexpr u32 SHIFT = (u32)(-N);
+            return __uint_as_float(e <= SHIFT ? 1u << ((22u - SHIFT) + e)
+                                              : e == 255u ? 0x7FC00000u : (e - SHIFT) << 23);
+        } else {
+            return times_power2<N>(decode(e));
+        }
+    }
+    template <int N> __device__ static __forceinline__ float read_scaled(const u8 *at) {
+        return decode_scaled<N>(*at);
+    }
 };
 // UE4M3 (sign bit ignored; 0x7f is NaN): (1 + m/8) 2^(e - 7), or m 2^-9 when
 // e = 0. The GEMV stages a tile's scales in shared memory (`Direct::stage`).
@@ -831,11 +851,27 @@ template <class S, class = void> struct StagedScales {
 template <class S> struct StagedScales<S, decltype((void)S::GEMV_STAGED)> {
     static constexpr bool value = S::GEMV_STAGED;
 };
+template <class S, class = void> struct DecodeScaled {
+    template <int N> __device__ static __forceinline__ float decode(u32 bits) {
+        return times_power2<N>(S::decode(bits));
+    }
+    template <int N> __device__ static __forceinline__ float read(const u8 *at) {
+        return times_power2<N>(S::read(at));
+    }
+};
+template <class S> struct DecodeScaled<S, decltype((void)&S::template decode_scaled<0>)> {
+    template <int N> __device__ static __forceinline__ float decode(u32 bits) {
+        return S::template decode_scaled<N>(bits);
+    }
+    template <int N> __device__ static __forceinline__ float read(const u8 *at) {
+        return S::template read_scaled<N>(at);
+    }
+};
 template <class S, class = void> struct Decode4 {
     template <int N> __device__ static __forceinline__ void get(u32 word, float (&scale)[4]) {
 #pragma unroll
         for (int i = 0; i < 4; ++i)
-            scale[i] = times_power2<N>(S::decode(word >> (8 * i)));
+            scale[i] = DecodeScaled<S>::template decode<N>(word >> (8 * i));
     }
 };
 template <class S> struct Decode4<S, decltype((void)&S::template decode4<0>)> {
@@ -1155,11 +1191,10 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE, int CODE_EXPONENT> struc
     __host__ __device__ static constexpr u64 phase(u64 superblock) { return superblock * BLOCK_BYTES % 4; }
     // Byte offset of group g's scale; its bias follows it.
     __host__ __device__ static constexpr u64 scale_offset(u64 g) { return g * GROUP_BYTES; }
-    __device__ static __forceinline__ float scaled(float scale) { return times_power2<CODE_EXPONENT>(scale); }
     // Group g (of the row's) of the row's planes at `scales` and `supers`
     // (direct coefficients are all in the supers plane).
     __device__ static __forceinline__ void at(const u8 *, const u8 *supers, u64 g, float &scale, float &bias) {
-        scale = scaled(S::read(supers + scale_offset(g)));
+        scale = DecodeScaled<S>::template read<CODE_EXPONENT>(supers + scale_offset(g));
         bias = BIAS ? -S::read(supers + scale_offset(g) + S::BYTES) : 0.0f;
     }
     template <class W>
@@ -1171,7 +1206,7 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE, int CODE_EXPONENT> struc
     // The scale (and bias) at byte `at` of a superblock's coefficient
     // words, and group g of them (its first group's at byte 0).
     __device__ static __forceinline__ void decode_at(const u32 *words, u64 at, float &scale, float &bias) {
-        scale = scaled(S::decode(words[at / 4] >> (8 * (at % 4))));
+        scale = DecodeScaled<S>::template decode<CODE_EXPONENT>(words[at / 4] >> (8 * (at % 4)));
         if constexpr (BIAS) {
             const u64 b = at + S::BYTES;
             bias = -S::decode(words[b / 4] >> (8 * (b % 4)));
