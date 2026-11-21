@@ -449,7 +449,7 @@ struct Ceilings {
 impl Ceilings {
     /// [`Self::measure`] beside the load in `domain`, on its device and
     /// charged to its ledgers' measurement holding
-    /// (`ExecutorDomain::measurement_charges`), its own traffic held and
+    /// (`ExecutorDomain::claim_measurement`), its own traffic held and
     /// drained first (`ExecutorDomain::hold_expert_traffic`), as the
     /// measurement job's room beside a model holds it: no point reads the
     /// load's copies, reads or landings. Why the drain ended short: serving
@@ -460,12 +460,23 @@ impl Ceilings {
         plan: &magnitude_executor::ExpertBankPlan,
         cache: Option<&std::path::Path>,
     ) -> Result<Self, String> {
+        use magnitude_executor::assessment::{ConvertCosts, PointRequest};
         // Held until this returns, by whichever exit.
         let _traffic = domain.hold_expert_traffic();
-        domain
-            .wait_expert_traffic_quiet()
-            .map(|()| Self::measure(&domain.measurement_charges(), plan, cache))
-            .map_err(engine::text)
+        domain.wait_expert_traffic_quiet().map_err(engine::text)?;
+        let requests = plan
+            .tiered()
+            .then_some(PointRequest::TierCopy)
+            .into_iter()
+            .chain(ConvertCosts::forms(plan).map(PointRequest::Convert))
+            .collect::<Vec<_>>();
+        let demand = PointRequest::measure_demand(domain.resources().device(), &requests)
+            .map_err(|error| error.to_string())?;
+        let measurement = domain.claim_measurement(demand).map_err(|short| {
+            let available = short.required.saturating_sub(short.over);
+            format!("measuring ceilings: allocation requires {} bytes; {available} bytes available", short.required)
+        })?;
+        Ok(Self::measure(measurement.charges(), plan, cache))
     }
 
     /// The ceilings measured on the device of `charges`, which the points

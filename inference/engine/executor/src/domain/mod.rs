@@ -3212,11 +3212,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         &self.domain
     }
 
-    /// Charges of a measurement job run on this domain's device beside it,
-    /// in its process (a tool's): its ledgers' measurement holding
-    /// ([`crate::memory::ledger::DeviceLedgers::measurement`]).
-    pub fn measurement_charges(&self) -> seismic::Charges {
-        self.resources.ledgers().measurement(self.domain.device())
+    /// Pre-claimed [`crate::memory::ledger::CommittedKind::Measurement`] room
+    /// for an in-process measurement run on this domain's device beside it
+    /// ([`crate::memory::ledger::DeviceLedgers::claim_measurement`]):
+    /// synchronously reclaims backed cache (including bank slots above floor)
+    /// before admitting, so subsequent probe allocations never fail against a
+    /// full-VRAM expert bank.
+    pub fn claim_measurement(
+        &self,
+        demand: crate::memory::ClaimDemand,
+    ) -> Result<crate::memory::ledger::MeasurementCharges, crate::memory::ledger::Short> {
+        self.resources.ledgers().claim_measurement(self.domain.device(), demand)
     }
 
     /// Whether `operation` may join `launch`, the operations of one launch

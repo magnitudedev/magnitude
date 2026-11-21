@@ -2453,3 +2453,101 @@ fn measurement_grant_reclaims_bank_cache_and_refuses_shortfall_without_draining(
     assert!(ledger.estimate().allocatable() >= 5 * GB, "5 GB physically freed for measurement process");
     drop(grant);
 }
+
+/// A `CommittedKind::Measurement` claim synchronously reclaims backed bank
+/// cache when `allocatable` is tight, keeps its peak reservation across
+/// sequential measurement points (`entry_freed` does not shrink it), and
+/// releases the whole reservation when dropped.
+#[test]
+fn measurement_claim_reclaims_bank_and_reuses_peak_reservation_across_points() {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Mutex, Weak};
+
+    const MIB: u64 = 1024 * 1024;
+    const PROBE: u64 = 32 * MIB;
+    const PEAK: u64 = 3 * PROBE;
+
+    struct FakeBankReclaimer {
+        pool: Arc<dyn seismic::memory::Entry>,
+        cached: Mutex<Option<Cached>>,
+        reclaimed: AtomicU64,
+    }
+    impl CacheReclaimer for FakeBankReclaimer {
+        fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+            let mut guard = self.cached.lock().unwrap();
+            let Some(cached) = guard.as_mut() else {
+                return Err(ReclaimError::AtFloor);
+            };
+            let current = cached.bytes();
+            let drop_bytes = current.min(need);
+            if drop_bytes == 0 {
+                return Err(ReclaimError::AtFloor);
+            }
+            if drop_bytes == current {
+                drop(guard.take());
+            } else {
+                drop(cached.split(drop_bytes, CacheKind::Bank));
+            }
+            self.pool.freed(&self.pool.change(), drop_bytes, Pageable);
+            self.reclaimed.fetch_add(drop_bytes, Ordering::Relaxed);
+            Ok(drop_bytes)
+        }
+    }
+
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 12 * GB, 12 * GB, None);
+
+    // Fill the entire 12 GB budget: 4 GB committed + 8 GB backed bank cache.
+    let _weights = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, 4 * GB))
+        .expect("weights claim fits");
+    ledger
+        .change(|_| _weights.entry().take(&_weights.entry().change(), 4 * GB, Pageable))
+        .expect("weights allocate");
+    let reclaimer = Arc::new(FakeBankReclaimer {
+        pool: pools.records.clone(),
+        cached: Mutex::new(None),
+        reclaimed: AtomicU64::new(0),
+    });
+    let bank_cache = ledger
+        .cached_with(CacheKind::Bank, 8 * GB, Reclaim::Backed(Arc::downgrade(&reclaimer) as Weak<dyn CacheReclaimer>))
+        .expect("bank cache fits");
+    *reclaimer.cached.lock().unwrap() = Some(bank_cache);
+    assert_eq!(ledger.estimate().allocatable(), 0, "VRAM completely full before measurement claim");
+
+    // Pre-claim PEAK (96 MiB) for an in-process measurement: reclaims 96 MiB from Bank.
+    let measurement = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Measurement, PEAK))
+        .expect("measurement claim synchronously reclaims bank cache");
+    assert_eq!(reclaimer.reclaimed.load(Ordering::Relaxed), PEAK);
+    assert_eq!(measurement.bytes(), PEAK);
+    assert!(ledger.estimate().allocatable() >= PEAK);
+
+    let entry = measurement.entry();
+    // Point 1 & 2 (`tier_copy` blocks=1 and 512): allocate 32 MiB then free;
+    // peak reservation must NOT shrink on `freed`.
+    for _ in 0..2 {
+        ledger
+            .change(|_| entry.take(&entry.change(), PROBE, Pageable))
+            .expect("tier_copy point fits in peak reservation");
+        ledger.change(|_| entry.freed(&entry.change(), PROBE, Pageable));
+        assert_eq!(measurement.bytes(), PEAK, "measurement peak reservation survives point drop");
+        assert_eq!(measurement.allocated_bytes(), 0);
+    }
+
+    // Point 3 (stall probe beside `into`): 3 x 32 MiB live simultaneously.
+    for _ in 0..3 {
+        ledger
+            .change(|_| entry.take(&entry.change(), PROBE, Pageable))
+            .expect("stall probe buffers fit in peak reservation");
+    }
+    assert_eq!(measurement.allocated_bytes(), PEAK);
+    ledger.change(|_| entry.freed(&entry.change(), PEAK, Pageable));
+    assert_eq!(measurement.bytes(), PEAK);
+
+    // Dropping the measurement claim releases the entire peak reservation.
+    drop(entry);
+    drop(measurement);
+    assert_eq!(ledger.estimate().committed(), 4 * GB, "measurement peak reservation released whole");
+}

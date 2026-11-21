@@ -904,6 +904,15 @@ fn import_target(
     let state_graphs = programs
         .state_graphs()
         .ok_or_else(|| internal("qualified program set has no state graphs"))?;
+    // A tiered bank prices and paces every promotion by the transfer queue's
+    // line (`PointRequest::TierCopy`). Measure it before the post-sealing
+    // reading and before `claim_target_import` fills VRAM with the expert
+    // bank, so even a tight GPU whose bank leaves no room above its floor
+    // measures cleanly with zero bank evictions and any one-time driver
+    // overhead is already reflected in `startup.reading`.
+    if execution_plan.load().expert_bank().is_some_and(magnitude_executor::ExpertBankPlan::tiered) {
+        measure_tier_copy(manifest.kernel_cache.as_deref(), &device, &startup.ledgers)?;
+    }
     // The device's store ledgers as the planned load sizes its state; every
     // allocation from here is claimed on them from one post-sealing reading
     // taken now (after `seal_graphs` dropped its workers and shapes).
@@ -1234,12 +1243,7 @@ fn assemble_domain(
             BankPricing::new(manifest, bank, lines, site_requests)
         })
         .transpose()?;
-    let tiered = planned.load().expert_bank().is_some_and(magnitude_executor::ExpertBankPlan::tiered);
     let pricing = LoadPricing::new(manifest, resident, planned, (*device).clone(), bank)?;
-    if tiered {
-        phase.enter("measuring the transfer queue a host tier's promotions copy on");
-        measure_tier_copy(&domain, &pricing).map_err(internal)?;
-    }
     domain
         .measure_load(load_measures(&pricing).map_err(internal)?, &mut bindings)
         .map_err(|error| internal(error.to_string()))?;
@@ -1359,29 +1363,36 @@ fn report_sealed_graphs(
 }
 
 /// A host tier's copies' points (`PointRequest::TierCopy`: the transfer
-/// queue's line, which every promotion is priced and paced by), measured
-/// on the load's own device before it streams where its kernel cache holds
-/// none yet, its expert traffic held and drained first as the measurement
-/// job's room beside a load holds it. A promotion is never priced without
-/// the line, so no tiered load streams before it is stored; it takes
-/// milliseconds, once a machine. Without a kernel cache the load is unpriced
-/// and promotes nothing. A point the device cannot take (no transfer queue)
-/// is stored unobtainable, and the load's tier copy prices as unavailable.
-fn measure_tier_copy(domain: &ExecutorDomain, pricing: &LoadPricing) -> Result<(), String> {
+/// queue's line, which every promotion is priced and paced by), measured on
+/// the load's own device before `claim_target_import` fills VRAM with the
+/// expert bank where its kernel cache holds none yet. A promotion is never
+/// priced without the line, so no tiered load streams before it is stored; it
+/// takes milliseconds, once a machine. Without a kernel cache the load is
+/// unpriced and promotes nothing. A point the device cannot take (no transfer
+/// queue) is stored unobtainable, and the load's tier copy prices as
+/// unavailable.
+fn measure_tier_copy(
+    kernel_cache: Option<&std::path::Path>,
+    device: &seismic::Device,
+    ledgers: &DeviceLedgers,
+) -> Result<(), LoadError> {
     use magnitude_executor::assessment::{PointRequest, TierCopyCosts, TierCopyError};
-    let Some(root) = &pricing.kernel_cache else {
+    let Some(root) = kernel_cache else {
         return Ok(());
     };
     let store = KernelCache::measurement_records(root);
-    let (topology, info) = (pricing.device.topology(), pricing.device.info());
+    let (topology, info) = (device.topology(), device.info());
     if !matches!(TierCopyCosts::stored(topology, info, &store), Err(TierCopyError::Unrecorded { .. })) {
         return Ok(());
     }
-    // Held until this returns, by whichever exit.
-    let _traffic = domain.hold_expert_traffic();
-    domain.wait_expert_traffic_quiet().map_err(|error| error.to_string())?;
-    crate::worker::measure::measure_in_process(&domain.measurement_charges(), &store, &[PointRequest::TierCopy])
-        .map_err(|error| format!("the transfer queue's line: {error}"))
+    let requests = [PointRequest::TierCopy];
+    let demand = PointRequest::measure_demand(device, &requests)
+        .map_err(|error| internal(format!("the transfer queue's line: {error}")))?;
+    let measurement = ledgers
+        .claim_measurement(device, demand)
+        .map_err(|short| refused("the transfer queue's line", short))?;
+    crate::worker::measure::measure_in_process(measurement.charges(), &store, &requests)
+        .map_err(|error| internal(format!("the transfer queue's line: {error}")))
 }
 
 /// What a load unpriced without a kernel cache lacks: where the executor's
