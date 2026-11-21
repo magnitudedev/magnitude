@@ -57,9 +57,9 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
     let cold_machine = resolve(&[((), &|| field("Inactive(anon):"))], (), || 0).0;
     let clean_cache = clean_cache(
         ["Active(file):", "Inactive(file):", "Dirty:", "Writeback:"].map(field),
-        field("Shmem:")
+        field("Mapped:")
             .unwrap_or(0)
-            .saturating_add(field("Mapped:").unwrap_or(0)),
+            .saturating_sub(field("Shmem:").unwrap_or(0)),
     );
     let free_beyond_target = beyond(free, reclaim_floor(sys, total, page));
     let immediate = u64::try_from(free_beyond_target.max(0))
@@ -126,12 +126,16 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
             release: Duration::ZERO,
             // The host's supply, a node's and the address space show a
             // growth in the call; a cgroup's `memory.current` charges in
-            // the call too, and only its clean cache (read from
-            // `memory.stat`) lags within memcg's flush, where that
-            // cgroup's supply binds and carries clean cache.
+            // the call too, so while `free_beyond_target > 0` (headroom
+            // below `min(memory.max, memory.high) - floor`) growth lowers
+            // `free_beyond_target` synchronously without evicting page
+            // cache. Only when `free_beyond_target <= 0` and the binding
+            // cgroup carries clean cache can growth evict file cache whose
+            // drop in `memory.stat` lags within memcg's flush.
             growth: match binding.supplier.map(|index| &limits[index].kind) {
                 Some(ProcessLimitKind::CgroupV1 { .. } | ProcessLimitKind::CgroupV2 { .. })
-                    if binding.scope.supply.clean_cache > 0 =>
+                    if binding.scope.supply.clean_cache > 0
+                        && binding.scope.supply.free_beyond_target <= 0 =>
                 {
                     FLUSH_TIME
                 }
@@ -377,17 +381,26 @@ fn refault_count(text: &str) -> Option<u64> {
     }
 }
 
-/// Clean file cache from its four counts (`active`, `inactive`, `dirty`,
-/// `writeback`), also excluding `shmem` (tmpfs, `/dev/shm`, memfd, shared GPU
-/// buffers, which Linux places on the file LRU lists even though they cannot
-/// drop without swap): 0 where any of the four primary counts is missing.
-pub(super) fn clean_cache([active, inactive, dirty, writeback]: [Option<u64>; 4], shmem: u64) -> u64 {
+/// Clean file cache from its four LRU counts (`active`, `inactive`, `dirty`,
+/// `writeback`), also excluding `mapped_file` (mapped regular-file pages such
+/// as executables and shared libraries that cannot drop cleanly): 0 where any
+/// of the four primary counts is missing.
+///
+/// Linux places `shmem` (tmpfs, `/dev/shm`, memfd, CUDA `cuMemHostAlloc`) on
+/// the anonymous/unevictable LRU (`mm/vmscan.c:folio_is_file_lru` is false),
+/// never on `active_file + inactive_file`. Mapped `shmem` is however counted
+/// in `NR_FILE_MAPPED` (`Mapped:` / `file_mapped` / `total_mapped_file`), so
+/// callers pass `mapped.saturating_sub(shmem)` as `mapped_file`.
+pub(super) fn clean_cache(
+    [active, inactive, dirty, writeback]: [Option<u64>; 4],
+    mapped_file: u64,
+) -> u64 {
     resolve(
         &[((), &|| {
             Some(
                 active?
                     .saturating_add(inactive?)
-                    .saturating_sub(dirty?.saturating_add(writeback?).saturating_add(shmem)),
+                    .saturating_sub(dirty?.saturating_add(writeback?).saturating_add(mapped_file)),
             )
         })],
         (),

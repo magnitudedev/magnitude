@@ -210,10 +210,12 @@ pub struct Supply {
     /// `external_page_count`) above the larger of `vm.vm_page_xpmapped_min`
     /// and any temporary compression floor while the OS compresses others'
     /// memory;
-    /// Linux `Active(file) + Inactive(file) − Dirty − Writeback − Shmem`
-    /// (`Shmem` / tmpfs / shared memory excluded because it cannot drop
-    /// without swap), within a cgroup its `active_file + inactive_file −
-    /// file_dirty − file_writeback − shmem`; Windows reclaimable standby
+    /// Linux `Active(file) + Inactive(file) − Dirty − Writeback − (Mapped − Shmem)`
+    /// (regular-file mappings excluded because executables/libraries stay
+    /// resident; `Shmem` is on the anon/unevictable LRU rather than the file
+    /// LRU, while mapped `Shmem` is counted in `Mapped`), within a cgroup its
+    /// `active_file + inactive_file − file_dirty − file_writeback −
+    /// (file_mapped − shmem)`; Windows reclaimable standby
     /// lists (`Normal Priority` + `Reserve`, keeping `Standby Cache Core`
     /// protected), bounded with free pages by available system commit.
     pub clean_cache: u64,

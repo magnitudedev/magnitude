@@ -20,14 +20,10 @@ pub(super) struct Read {
     /// The store's supply, others' cold pages in it only once harm is
     /// judged ([`Boundary::judges`]).
     supply: i64,
-    /// What the process had allocated as the sample shows it.
+    /// What the process had allocated as the sample shows it (including any
+    /// own growth within `lag.growth` that the OS already flushed into
+    /// `supply`).
     visible: u64,
-    /// Of what the process had allocated at the reading's instant, the growth
-    /// `visible` does not assume shown yet (`own.allocated - visible`): zero
-    /// when `lag.growth == 0`, positive while an own growth is still within
-    /// `lag.growth` and may already have been deducted from `supply` by an
-    /// early OS flush.
-    unshown_growth: u64,
     /// Of `visible`, the pageable bytes the OS reports holding outside RAM,
     /// compressed or swapped ([`Reading::own_reclaimed`]): the process's
     /// still, and in no figure of what the store uses.
@@ -160,6 +156,16 @@ impl Estimate {
         self.releasing
     }
 
+    /// Of releasing cache, what was shed to a shortage (held by no claim).
+    pub(super) fn shed(&self) -> u64 {
+        self.shed
+    }
+
+    /// What grants' processes hold of their grants in this store's use.
+    pub(super) fn credited(&self) -> u64 {
+        self.read.credited
+    }
+
     /// The store's supply at the reading (§4.2): free memory less the OS's
     /// target, clean cache and, once harm is judged, cold reclaimable pages;
     /// below zero where the OS has fallen below its target by more than the
@@ -246,15 +252,7 @@ impl Estimate {
     /// back only into the supply), the grant the wired ceiling's where one
     /// bounds the store (§4.3).
     pub fn budget(&self) -> u64 {
-        self.budget_with(0)
-    }
-
-    /// [`Self::budget`] crediting `extra` bytes of the process's own growth
-    /// that `self.read` did not yet assume visible (`Read::unshown_growth`),
-    /// giving the upper-bound budget when the OS flushes our growth into
-    /// `supply` earlier than `lag.growth`.
-    fn budget_with(&self, extra: u64) -> u64 {
-        let room = u64::try_from((i128::from(self.read.in_use()) + i128::from(extra) + i128::from(self.read.supply)).max(0)).expect("a store's bytes fit u64");
+        let room = u64::try_from((i128::from(self.read.in_use()) + i128::from(self.read.supply)).max(0)).expect("a store's bytes fit u64");
         self.read.grant.map_or(room, |grant| grant.min(room))
     }
 
@@ -311,22 +309,21 @@ impl Estimate {
     /// bounded by `cap`. Load import sizes what the store's room holds at open
     /// (`experts::derived::import_target`).
     pub fn import_room(&self) -> u64 {
-        self.room_less(self.budget(), self.guarantee())
+        self.room_less(self.guarantee())
     }
 
     /// The room the store leaves the bank and its records pool's spare
     /// granules for holding already-resident slots without subtracting the
     /// transient `guarantee` derivative a second time (`budget` already
-    /// reflects others' growth) and without shrinking on an own growth that
-    /// flushed into the OS's `supply` earlier than `lag.growth`.
+    /// reflects others' growth).
     pub fn hold_room(&self) -> u64 {
-        self.room_less(self.budget_with(self.read.unshown_growth), 0)
+        self.room_less(0)
     }
 
-    fn room_less(&self, budget: u64, reserve: u64) -> u64 {
+    fn room_less(&self, reserve: u64) -> u64 {
         let bank = self.cache_of(CacheKind::Bank) + self.bank_spare;
         let beside = self.committed.saturating_add(self.cache - bank).saturating_add(self.shed);
-        let room = budget.saturating_sub(beside.saturating_add(reserve));
+        let room = self.budget().saturating_sub(beside.saturating_add(reserve));
         self.read.cap.map_or(room, |cap| room.min(cap.saturating_sub(beside)))
     }
 
@@ -468,7 +465,29 @@ impl State {
         // figure is an estimate at the compressor's machine-wide ratio, so
         // others' are no less than none.
         let stored = reclaimed.map_or(0, |own| own.stored.min(nonresident));
-        let others = (used - in_use).saturating_sub(stored);
+        let raw_others = (used - in_use).saturating_sub(stored);
+        // Under a positive `lag.growth` (e.g. a Linux cgroup's 2 s memcg
+        // flush), the OS may flush an own growth into `supply` earlier than
+        // `lag.growth` (Linux flushes `memory.stat` past a few MiB of updates).
+        // Any rise in `raw_others` matched by an unexplained drop in `in_use +
+        // supply` up to `unshown_growth` is our own growth already deducted
+        // from `supply`: credit it to `in_use` rather than `others` so
+        // `budget()`, `free()`, `allocatable()`, `hold_room()`, and
+        // `import_room()` never double-subtract our own growth while staying
+        // exact (zero double-spending) when the OS has not flushed yet.
+        let unshown_growth = own.allocated.saturating_sub(visible.allocated);
+        let flushed = match self.read.filter(|_| !settled && unshown_growth > 0) {
+            None => 0,
+            Some(before) => {
+                let risen = raw_others.saturating_sub(before.others);
+                let fall = i128::from(before.supply) - i128::from(supply) - (i128::from(in_use) - i128::from(before.in_use()));
+                let drop = u64::try_from(fall.max(0)).expect("a supply's fall fits u64");
+                unshown_growth.min(risen).min(drop)
+            }
+        };
+        let visible_allocated = visible.allocated + flushed;
+        let in_use = in_use + flushed;
+        let others = raw_others - flushed;
         if settled {
             self.boundary.settle_idle();
         }
@@ -543,7 +562,7 @@ impl State {
                 Some(ceiling.limit.saturating_sub(wired_others).saturating_sub(wired_rise))
             }
             Some(HostGrant::Limit(limit)) => Some(limit),
-            Some(HostGrant::Budget { capacity, left }) => Some(visible.allocated.saturating_add(left).min(capacity)),
+            Some(HostGrant::Budget { capacity, left }) => Some(visible_allocated.saturating_add(left).min(capacity)),
             None => None,
         };
         if let Some(before) = self.read.filter(|before| !settled && before.others != others) {
@@ -552,8 +571,7 @@ impl State {
         }
         let paged = reading.paging().is_some();
         let (cap, grows) = (self.boundary.cap(), !paged || self.boundary.admits_growth());
-        let unshown_growth = own.allocated.saturating_sub(visible.allocated);
-        self.read = Some(Read { at, capacity: reading.capacity(), supply, visible: visible.allocated, unshown_growth, nonresident, unobserved, credited, others, rise, grant, ceiling: reading.ceiling(), unwired, lag, shown, cap, grows });
+        self.read = Some(Read { at, capacity: reading.capacity(), supply, visible: visible_allocated, nonresident, unobserved, credited, others, rise, grant, ceiling: reading.ceiling(), unwired, lag, shown, cap, grows });
         let estimate = self.estimate().expect("a store just read is estimated");
         let cause = shortage::cause(&estimate, self.boundary.harmed(), self.boundary.pressed());
         // Only a floor shortfall unloads: its persistence alone is kept,

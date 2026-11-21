@@ -2213,6 +2213,90 @@ fn admit_or_reclaim_panics_on_reclaimer_invariant_violation() {
     let _ = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Component, 2 * GB));
 }
 
+/// When `held_now` and `allocated` are already over `budget` (e.g. after an
+/// exogenous memory spike shrunk `budget`), a small admission must request
+/// the full `overhang + bytes` deficit in a single `CacheReclaimer::reclaim`
+/// call rather than looping one slot at a time, and must fail fast with
+/// `Err(Short)` without calling the reclaimer when cache cannot cover the
+/// full deficit.
+#[test]
+fn admit_or_reclaim_over_budget_reclaims_full_deficit_in_one_call_or_fails_fast() {
+    struct RecordingReclaimer {
+        cached: Mutex<Option<Cached>>,
+        pool: Arc<dyn seismic::memory::Entry>,
+        needs: Mutex<Vec<u64>>,
+    }
+    impl CacheReclaimer for RecordingReclaimer {
+        fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+            self.needs.lock().unwrap().push(need);
+            let mut guard = self.cached.lock().unwrap();
+            let Some(cached) = guard.as_mut() else {
+                return Err(ReclaimError::AtFloor);
+            };
+            let has = cached.bytes();
+            let free = has.min(need);
+            if free == 0 {
+                return Err(ReclaimError::AtFloor);
+            }
+            if free == has {
+                drop(guard.take());
+            } else {
+                drop(cached.split(free, CacheKind::Bank));
+            }
+            self.pool.freed(&self.pool.change(), free, seismic::memory::Wiring::Pageable);
+            Ok(free)
+        }
+    }
+
+    let (_scope, ledger, pools) = host();
+    let records_pool = pools.records.clone();
+    let mut clock = Clock::new();
+    // Start with 10 GB budget: 2 GB committed + 8 GB bank cache (all allocated).
+    read(&ledger, &mut clock, 64 * GB, 10 * GB, Some(64 * GB));
+    let committed = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Component, 2 * GB))
+        .expect("committed fits");
+    committed.entry().take(&committed.entry().change(), 2 * GB, seismic::memory::Wiring::Pageable).expect("committed allocates");
+
+    let reclaimer = Arc::new(RecordingReclaimer {
+        cached: Mutex::new(None),
+        pool: records_pool.clone(),
+        needs: Mutex::new(Vec::new()),
+    });
+    let bank_cache = ledger
+        .cached_with(CacheKind::Bank, 8 * GB, Reclaim::Backed(Arc::downgrade(&reclaimer) as Weak<dyn CacheReclaimer>))
+        .expect("bank cache fits");
+    *reclaimer.cached.lock().unwrap() = Some(bank_cache);
+
+    // Exogenous pressure drops supply to -5 GB -> budget drops to 5 GB, so
+    // `held_now == allocated == 10 GB` is 5 GB over budget.
+    // Note: `read` takes `supply` as a u64 via `host_sample`; instead drop
+    // `budget` to 5 GB by shrinking the wired ceiling / grant to 5 GB.
+    read(&ledger, &mut clock, 64 * GB, 10 * GB, Some(5 * GB));
+    assert_eq!(ledger.estimate().budget(), 5 * GB);
+    assert_eq!(ledger.estimate().free(), 0);
+    assert_eq!(ledger.estimate().allocatable(), 0);
+
+    // 1. Requesting 4 GB needs 5 GB (overhang) + 4 GB = 9 GB > 8 GB bank cache:
+    // must fail fast with `Err(Short)` WITHOUT invoking the reclaimer.
+    let short = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Component, 4 * GB));
+    assert!(short.is_err(), "cannot cover 5 GB overhang + 4 GB request from 8 GB cache");
+    assert!(reclaimer.needs.lock().unwrap().is_empty(), "must fail fast without reclaiming");
+
+    // 2. Requesting 1 MB needs 5 GB (overhang) + 1 MB in ONE single reclaim call.
+    let small = 1024 * 1024;
+    let claim = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Component, small))
+        .expect("5 GB overhang + 1 MB fits inside 8 GB bank cache");
+    assert_eq!(
+        *reclaimer.needs.lock().unwrap(),
+        vec![5 * GB + small],
+        "must request full overhang + request in a single reclaim call"
+    );
+    assert!(ledger.estimate().allocatable() >= small);
+    drop((claim, committed));
+}
+
 /// Unreturned `Holding::Pool` spare bytes cannot mint a non-pooled `Claim`
 /// (via `claim_at`, `claim_units`, or `entry_take`) unless a registered
 /// `CacheReclaimer` physically returns the pool's blocks first.
