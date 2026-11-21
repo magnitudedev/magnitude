@@ -6,12 +6,18 @@ use super::*;
 /// to this lexical call; no borrowed parent builder survives a pause.
 pub(crate) struct CallConstruction<B: seismic_native_target::TargetFamily> {
     call: NodeId,
+    family: FamilyId,
+    outputs: Vec<SemanticValueId>,
     location: crate::candidate_domain::CallLocation,
     arguments: Vec<ValueBinding>,
-    bodies: Vec<CallBody>,
-    selected: Option<usize>,
-    begun: bool,
-    child: Option<ConstructedCandidate<B>>,
+    phase: CallPhase<B>,
+}
+
+enum CallPhase<B: seismic_native_target::TargetFamily> {
+    PendingSelection(Vec<CallBody>),
+    Selected(CallBody),
+    Constructing,
+    Completed(ConstructedCandidate<B>),
 }
 
 struct CallBody {
@@ -25,34 +31,33 @@ impl<B: seismic_native_target::TargetFamily> CallConstruction<B> {
         &self.location
     }
     pub(crate) fn choice(&self) -> Option<crate::candidate_domain::BodyChoice> {
-        self.selected
-            .is_none()
-            .then(|| crate::candidate_domain::BodyChoice {
+        match &self.phase {
+            CallPhase::PendingSelection(bodies) => Some(crate::candidate_domain::BodyChoice {
                 path: crate::candidate_domain::CallPath(vec![self.location.clone()]),
-                alternatives: self
-                    .bodies
-                    .iter()
-                    .map(|body| body.selection.clone())
-                    .collect(),
-            })
+                alternatives: bodies.iter().map(|body| body.selection.clone()).collect(),
+            }),
+            CallPhase::Selected(_) | CallPhase::Constructing | CallPhase::Completed(_) => None,
+        }
     }
     pub(crate) fn select(&mut self, selection: crate::candidate_domain::BodySelection) {
-        assert!(self.selected.is_none(), "call body was already selected");
-        self.selected = Some(
-            self.bodies
-                .iter()
-                .position(|body| body.selection == selection)
-                .expect("selected body is absent from this checked call"),
-        );
+        let CallPhase::PendingSelection(bodies) = &mut self.phase else {
+            panic!("call body was already selected");
+        };
+        let index = bodies
+            .iter()
+            .position(|body| body.selection == selection)
+            .expect("selected body is absent from this checked call");
+        let body = bodies.swap_remove(index);
+        self.phase = CallPhase::Selected(body);
     }
     pub(crate) fn initialization_pending(
         &self,
     ) -> Option<seismic_lang::initialization::InitializationFailure> {
-        self.bodies[self.selected.expect("call body must be selected")]
-            .initialization
-            .as_ref()
-            .err()
-            .cloned()
+        match &self.phase {
+            CallPhase::Selected(body) => body.initialization.as_ref().err().cloned(),
+            CallPhase::Constructing | CallPhase::Completed(_) => None,
+            CallPhase::PendingSelection(_) => panic!("call body must be selected"),
+        }
     }
 }
 
@@ -241,11 +246,16 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
                 });
             }
         }
-        assert!(
-            !bodies.is_empty(),
-            "checked call has no source-compatible body"
-        );
-        let selected = (bodies.len() == 1).then_some(0);
+        let phase = match <[CallBody; 1]>::try_from(bodies) {
+            Ok([body]) => CallPhase::Selected(body),
+            Err(bodies) => {
+                assert!(
+                    !bodies.is_empty(),
+                    "checked call has no source-compatible body"
+                );
+                CallPhase::PendingSelection(bodies)
+            }
+        };
         let occurrence = self.state.call_occurrences.entry(call).or_default();
         let location = crate::candidate_domain::CallLocation {
             body: self.function.stable(),
@@ -256,12 +266,11 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
         *occurrence += 1;
         CallConstruction {
             call,
+            family: family_id,
+            outputs: call_outputs.to_vec(),
             location,
             arguments: arguments.to_vec(),
-            bodies,
-            selected,
-            begun: false,
-            child: None,
+            phase,
         }
     }
 
@@ -272,17 +281,21 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
         contents: &crate::portable::initialization::StorageContents,
         binders: &[seismic_lang::expr::SymbolId],
     ) -> Option<crate::portable::construction::SourceConstruction<B>> {
-        if progress.begun {
-            return None;
-        }
-        assert!(
-            progress.initialization_pending().is_none(),
-            "unresolved initialization must remain a suspended construction"
-        );
-        let body = &progress.bodies[progress
-            .selected
-            .expect("select a child before constructing it")];
-        progress.begun = true;
+        let body = match std::mem::replace(&mut progress.phase, CallPhase::Constructing) {
+            CallPhase::Selected(body) => {
+                assert!(
+                    body.initialization.is_ok(),
+                    "unresolved initialization must remain a suspended construction"
+                );
+                body
+            }
+            phase @ CallPhase::Completed(_) => {
+                progress.phase = phase;
+                return None;
+            }
+            CallPhase::PendingSelection(_) => panic!("select a child before constructing it"),
+            CallPhase::Constructing => panic!("call child is already under construction"),
+        };
         let site = CallSite::Spliced {
             call: progress.call,
             arguments: &progress.arguments,
@@ -317,9 +330,10 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
         child: ConstructedCandidate<B>,
     ) {
         assert!(
-            progress.child.replace(child).is_none(),
-            "selected child completed twice"
+            matches!(progress.phase, CallPhase::Constructing),
+            "call child can only complete while constructing"
         );
+        progress.phase = CallPhase::Completed(child);
     }
 
     pub(super) fn finish_call(
@@ -331,21 +345,18 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
         binders: &[seismic_lang::expr::SymbolId],
     ) -> Vec<(SemanticValueId, ValueBinding)> {
         let CallConstruction {
-            call,
+            family,
+            outputs,
             arguments: parameter_bindings,
-            child,
+            phase,
             ..
         } = progress;
-        let (family_id, call_outputs) = match self.function.node(call).view() {
-            SemanticNodeView::Call {
-                family, outputs, ..
-            } => (family, outputs),
-            _ => unreachable!("call progress has a checked call owner"),
+        let CallPhase::Completed(child) = phase else {
+            panic!("selected call child has not completed");
         };
         let reference_function = self
             .program
-            .function(self.program.family(family_id).reference().function());
-        let child = child.expect("selected call child has not completed");
+            .function(self.program.family(family).reference().function());
         contents
             .call(
                 &mut crate::portable::initialization_context(self.arena, selections, binders),
@@ -376,7 +387,7 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
         );
         assert_eq!(
             results.len(),
-            call_outputs.len(),
+            outputs.len(),
             "child complete result arity differs"
         );
         self.state.choices.extend(parts.choices);
@@ -387,6 +398,6 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
         self.state.callees.extend(parts.provenance.callees);
         self.state.constraints.push(parts.semantic_coverage.node());
         self.state.constraints.push(parts.hard_constraints);
-        call_outputs.iter().copied().zip(results).collect()
+        outputs.into_iter().zip(results).collect()
     }
 }
