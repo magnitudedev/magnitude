@@ -44,6 +44,45 @@ impl Input {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CheckedTensorKind {
+    Dense(DType),
+    Packed(&'static registry::PackedPacketLayout),
+}
+impl CheckedTensorKind {
+    fn from_representation(representation: RepresentationId) -> Result<Self, ObservationError> {
+        match &registry::representation_info(representation).kind {
+            registry::RepresentationKind::Dense(dtype) => Ok(Self::Dense(*dtype)),
+            registry::RepresentationKind::Packed(packet) => Ok(Self::Packed(packet)),
+            registry::RepresentationKind::External(_) => Err(ObservationError::Unsupported(
+                "external conversion-source input needs a registered finite-content recipe".into(),
+            )),
+            registry::RepresentationKind::PackedRows(_) => Err(ObservationError::Unsupported(
+                registry::ROW_LAYOUT_IS_NATIVE_ONLY.into(),
+            )),
+        }
+    }
+}
+
+enum CheckedArgument<'a> {
+    Tensor {
+        representation: RepresentationId,
+        kind: CheckedTensorKind,
+        extents: &'a [u64],
+    },
+    Scalar(&'a SymbolValue),
+    Index(&'a seismic_lang::expr::BigUint),
+    Range {
+        start: &'a seismic_lang::expr::BigUint,
+        end: &'a seismic_lang::expr::BigUint,
+    },
+}
+
+enum ReferenceState<'a> {
+    Pending(Interpreter<'a>),
+    Completed(OracleOutcome),
+}
+
 impl<T: TargetFamily, E: NativeExecutor<T>> ControlledObserver<T, E::Handle> for Observer<T, E> {
     fn environment(&mut self) -> Result<[u8; 32], ObservationError> {
         let mut digest =
@@ -94,81 +133,83 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
         let mut required = 0u64;
         let mut reference_input_bytes = 0u64;
         let mut construction_temporary = 0u64;
+        let mut checked_arguments = Vec::with_capacity(request.case.arguments.len());
         for argument in &request.case.arguments {
-            if let CaseArgument::Tensor {
-                representation,
-                extents,
-            } = argument
-            {
-                if matches!(
-                    registry::representation_info(*representation).kind,
-                    registry::RepresentationKind::External(_)
-                ) {
-                    return Err(ObservationError::Unsupported(
-                        "external conversion-source input needs a registered finite-content recipe"
-                            .into(),
-                    ));
-                }
-                let elements = extents
-                    .iter()
-                    .try_fold(1u64, |count, extent| count.checked_mul(*extent))
-                    .ok_or_else(|| {
-                        ObservationError::InvalidCase("input element count overflow".into())
-                    })?;
-                if elements > request.reference_work_limit {
-                    return Err(ObservationError::ReferenceLimit {
-                        work_limit: request.reference_work_limit,
+            match argument {
+                CaseArgument::Tensor {
+                    representation,
+                    extents,
+                } => {
+                    let kind = CheckedTensorKind::from_representation(*representation)?;
+                    let elements = extents
+                        .iter()
+                        .try_fold(1u64, |count, extent| count.checked_mul(*extent))
+                        .ok_or_else(|| {
+                            ObservationError::InvalidCase("input element count overflow".into())
+                        })?;
+                    if elements > request.reference_work_limit {
+                        return Err(ObservationError::ReferenceLimit {
+                            work_limit: request.reference_work_limit,
+                        });
+                    }
+                    let layout = crate::layout::canonical(*representation, extents)
+                        .map_err(ObservationError::Execution)?;
+                    let shape = extents
+                        .iter()
+                        .map(|extent| usize::try_from(*extent))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| {
+                            ObservationError::InvalidCase(
+                                "input rank exceeds host address space".into(),
+                            )
+                        })?;
+                    let reference_bytes = TensorData::allocation_bytes(*representation, &shape)
+                        .map_err(ObservationError::InvalidCase)?;
+                    // Persistent input payloads: native buffer, host restore image,
+                    // and reference backing. Oracle-owned view maps are charged by
+                    // the interpreter's own live allocation ledger during replay.
+                    required = required.saturating_add(layout.byte_len.saturating_mul(2));
+                    reference_input_bytes = reference_input_bytes.saturating_add(reference_bytes);
+                    let temporary = match kind {
+                        CheckedTensorKind::Dense(_) => 0,
+                        CheckedTensorKind::Packed(packet) => {
+                            let info = registry::representation_info(*representation);
+                            let recipe = registry::decode_recipe(*representation, info.decoded)
+                                .ok_or_else(|| {
+                                    ObservationError::Unsupported(
+                                        "packed input has no reference decoder".into(),
+                                    )
+                                })?;
+                            // The packet clone, decoded group and decoder workspace
+                            // coexist during registry validation of one packet.
+                            let validation = u64::from(packet.packet_size)
+                                .saturating_add(
+                                    u64::from(packet.group)
+                                        .saturating_mul(std::mem::size_of::<f64>() as u64),
+                                )
+                                .saturating_add(
+                                    (recipe.temporary_count() as u64)
+                                        .saturating_mul(std::mem::size_of::<f64>() as u64),
+                                );
+                            layout.byte_len.max(validation)
+                        }
+                    };
+                    construction_temporary = construction_temporary.max(temporary);
+                    checked_arguments.push(CheckedArgument::Tensor {
+                        representation: *representation,
+                        kind,
+                        extents,
                     });
                 }
-                let layout = crate::layout::canonical(*representation, extents)
-                    .map_err(ObservationError::Execution)?;
-                let shape = extents
-                    .iter()
-                    .map(|extent| usize::try_from(*extent))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| {
-                        ObservationError::InvalidCase(
-                            "input rank exceeds host address space".into(),
-                        )
-                    })?;
-                let reference_bytes = TensorData::allocation_bytes(*representation, &shape)
-                    .map_err(ObservationError::InvalidCase)?;
-                // Persistent input payloads: native buffer, host restore image,
-                // and reference backing. Oracle-owned view maps are charged by
-                // the interpreter's own live allocation ledger during replay.
-                required = required.saturating_add(layout.byte_len.saturating_mul(2));
-                reference_input_bytes = reference_input_bytes.saturating_add(reference_bytes);
-                let temporary = match &registry::representation_info(*representation).kind {
-                    registry::RepresentationKind::Dense(_) => 0,
-                    registry::RepresentationKind::Packed(packet) => {
-                        let info = registry::representation_info(*representation);
-                        let recipe = registry::decode_recipe(*representation, info.decoded)
-                            .ok_or_else(|| {
-                                ObservationError::Unsupported(
-                                    "packed input has no reference decoder".into(),
-                                )
-                            })?;
-                        // The packet clone, decoded group and decoder workspace
-                        // coexist during registry validation of one packet.
-                        let validation = u64::from(packet.packet_size)
-                            .saturating_add(
-                                u64::from(packet.group)
-                                    .saturating_mul(std::mem::size_of::<f64>() as u64),
-                            )
-                            .saturating_add(
-                                (recipe.temporary_count() as u64)
-                                    .saturating_mul(std::mem::size_of::<f64>() as u64),
-                            );
-                        layout.byte_len.max(validation)
-                    }
-                    registry::RepresentationKind::External(_) => unreachable!(),
-                    registry::RepresentationKind::PackedRows(_) => {
-                        return Err(ObservationError::Unsupported(
-                            registry::ROW_LAYOUT_IS_NATIVE_ONLY.into(),
-                        ));
-                    }
-                };
-                construction_temporary = construction_temporary.max(temporary);
+                CaseArgument::Scalar(value) => {
+                    checked_arguments.push(CheckedArgument::Scalar(value));
+                }
+                CaseArgument::Index(value) => {
+                    checked_arguments.push(CheckedArgument::Index(value));
+                }
+                CaseArgument::Range { start, end } => {
+                    checked_arguments.push(CheckedArgument::Range { start, end });
+                }
             }
         }
         let construction_peak = required
@@ -184,11 +225,12 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
         let mut reference_args = Vec::new();
         let mut inputs = Vec::new();
         let mut random = request.case.seed;
-        for (ordinal, argument) in request.case.arguments.iter().enumerate() {
+        for (ordinal, argument) in checked_arguments.into_iter().enumerate() {
             check_deadline(&request)?;
             match argument {
-                CaseArgument::Tensor {
+                CheckedArgument::Tensor {
                     representation,
+                    kind,
                     extents,
                 } => {
                     let name = &request.invocation().schema().parameters()[ordinal].name;
@@ -198,72 +240,59 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                             .map(|range| (range.minimum.get(), range.maximum.get())),
                         _ => None,
                     };
-                    if let registry::RepresentationKind::Packed(layout) =
-                        &registry::representation_info(*representation).kind
-                    {
-                        let bytes = packed_input(
-                            *representation,
-                            layout,
-                            extents,
-                            assumption,
-                            &mut random,
-                        )?;
-                        let data = TensorData::encoded(
-                            *representation,
-                            extents.iter().map(|n| *n as usize).collect(),
-                            bytes.clone(),
-                        )
-                        .map_err(ObservationError::InvalidCase)?;
-                        reference_args.push(Arg::Tensor(reference.add_tensor(data)));
-                        let tensor = Arc::new(
-                            TensorInner::from_host(
-                                &self.charges,
-                                *representation,
+                    let (bytes, data) = match kind {
+                        CheckedTensorKind::Packed(layout) => {
+                            let bytes = packed_input(
+                                representation,
+                                layout,
                                 extents,
-                                &bytes,
-                            )
-                            .map_err(tensor_error)?,
-                        );
-                        inputs.push(Input::Tensor { tensor, bytes });
-                        continue;
-                    }
-                    let registry::RepresentationKind::Dense(dtype) =
-                        registry::representation_info(*representation).kind
-                    else {
-                        unreachable!()
-                    };
-                    let count = extents
-                        .iter()
-                        .try_fold(1usize, |count, extent| {
-                            count.checked_mul(usize::try_from(*extent).ok()?)
-                        })
-                        .ok_or_else(|| {
-                            ObservationError::InvalidCase(
-                                "input geometry overflows host address space".into(),
-                            )
-                        })?;
-                    let mut bytes = Vec::with_capacity(count * dtype.bytes() as usize);
-                    for element in 0..count {
-                        let rounded = match validation {
-                            Some(case) => validation_input_value(
-                                dtype,
                                 assumption,
-                                case,
-                                element,
                                 &mut random,
-                            )?,
-                            None => dense_input_value(dtype, assumption, &mut random)?,
-                        };
-                        encode(dtype, rounded, &mut bytes);
-                    }
-                    let shape = extents.iter().map(|extent| *extent as usize).collect();
-                    let data = TensorData::dense_from_bytes(dtype, shape, bytes.clone())
-                        .map_err(ObservationError::InvalidCase)?;
+                            )?;
+                            let data = TensorData::encoded(
+                                representation,
+                                extents.iter().map(|n| *n as usize).collect(),
+                                bytes.clone(),
+                            )
+                            .map_err(ObservationError::InvalidCase)?;
+                            (bytes, data)
+                        }
+                        CheckedTensorKind::Dense(dtype) => {
+                            let count = extents
+                                .iter()
+                                .try_fold(1usize, |count, extent| {
+                                    count.checked_mul(usize::try_from(*extent).ok()?)
+                                })
+                                .ok_or_else(|| {
+                                    ObservationError::InvalidCase(
+                                        "input geometry overflows host address space".into(),
+                                    )
+                                })?;
+                            let mut bytes = Vec::with_capacity(count * dtype.bytes() as usize);
+                            for element in 0..count {
+                                let rounded = match validation {
+                                    Some(case) => validation_input_value(
+                                        dtype,
+                                        assumption,
+                                        case,
+                                        element,
+                                        &mut random,
+                                    )?,
+                                    None => dense_input_value(dtype, assumption, &mut random)?,
+                                };
+                                encode(dtype, rounded, &mut bytes);
+                            }
+                            let shape = extents.iter().map(|extent| *extent as usize).collect();
+                            let data = TensorData::dense_from_bytes(dtype, shape, bytes.clone())
+                                .map_err(ObservationError::InvalidCase)?;
+                            (bytes, data)
+                        }
+                    };
                     reference_args.push(Arg::Tensor(reference.add_tensor(data)));
                     let tensor = Arc::new(
                         TensorInner::from_host(
                             &self.charges,
-                            *representation,
+                            representation,
                             extents,
                             &bytes,
                         )
@@ -271,18 +300,18 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                     );
                     inputs.push(Input::Tensor { tensor, bytes });
                 }
-                CaseArgument::Scalar(value) => {
+                CheckedArgument::Scalar(value) => {
                     let (encoded, value) = scalar(value.clone())?;
                     inputs.push(Input::Scalar(encoded));
                     reference_args.push(Arg::Scalar(value));
                 }
-                CaseArgument::Index(value) => {
+                CheckedArgument::Index(value) => {
                     inputs.push(Input::Scalar(crate::api::kernel::EncodedScalar::Index(
                         value.clone(),
                     )));
                     reference_args.push(Arg::Index(value.clone()));
                 }
-                CaseArgument::Range { start, end } => {
+                CheckedArgument::Range { start, end } => {
                     inputs.push(Input::Scalar(crate::api::kernel::EncodedScalar::Range {
                         start: start.clone(),
                         end: end.clone(),
@@ -296,8 +325,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
         let mut samples = Vec::new();
         // Reference execution occurs after ordinary admission establishes the
         // complete implementation's resource footprint, outside the timing endpoint.
-        let mut expected: Option<OracleOutcome> = None;
-        let mut reference = Some(reference);
+        let mut reference_state = ReferenceState::Pending(reference);
         let mut remaining_work = request.reference_work_limit;
         for trial in 0..request
             .protocol
@@ -317,12 +345,10 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                 request
                     .memory_limit
                     .saturating_sub(required)
-                    .saturating_sub(
-                        expected
-                            .as_ref()
-                            .map(|o| o.retained_payload_bytes())
-                            .unwrap_or(reference_input_bytes),
-                    ),
+                    .saturating_sub(match &reference_state {
+                        ReferenceState::Pending(_) => reference_input_bytes,
+                        ReferenceState::Completed(outcome) => outcome.retained_payload_bytes(),
+                    }),
                 &self.charges,
             )
             .map_err(call_error)?;
@@ -347,41 +373,42 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                 });
             }
             setup_time += setup.elapsed();
-            if expected.is_none() {
-                let check = Instant::now();
-                let outcome = reference
-                    .take()
-                    .expect("reference runs once")
-                    .run_bounded_with_memory(
-                        &reference_args,
-                        request.reference_work_limit,
-                        request.memory_limit.saturating_sub(total),
-                    )
-                    .map_err(|error| match error {
-                        seismic_lang::interp::OracleError::InterpreterDefect(reason) => {
-                            ObservationError::Contract(reason)
-                        }
-                        seismic_lang::interp::OracleError::InvalidInvocation(reason) => {
-                            ObservationError::InvalidCase(reason)
-                        }
-                        seismic_lang::interp::OracleError::WorkLimit { limit } => {
-                            ObservationError::ReferenceLimit { work_limit: limit }
-                        }
-                        seismic_lang::interp::OracleError::MemoryLimit { required, .. } => {
-                            ObservationError::Capacity {
-                                required: total.saturating_add(required).into(),
-                                limit: request.memory_limit,
+            let outcome = match reference_state {
+                ReferenceState::Pending(interpreter) => {
+                    let check = Instant::now();
+                    let outcome = interpreter
+                        .run_bounded_with_memory(
+                            &reference_args,
+                            request.reference_work_limit,
+                            request.memory_limit.saturating_sub(total),
+                        )
+                        .map_err(|error| match error {
+                            seismic_lang::interp::OracleError::InterpreterDefect(reason) => {
+                                ObservationError::Contract(reason)
                             }
-                        }
-                    })?;
-                remaining_work = remaining_work.checked_sub(outcome.work_units()).ok_or(
-                    ObservationError::ReferenceLimit {
-                        work_limit: request.reference_work_limit,
-                    },
-                )?;
-                expected = Some(outcome);
-                checking_time += check.elapsed();
-            }
+                            seismic_lang::interp::OracleError::InvalidInvocation(reason) => {
+                                ObservationError::InvalidCase(reason)
+                            }
+                            seismic_lang::interp::OracleError::WorkLimit { limit } => {
+                                ObservationError::ReferenceLimit { work_limit: limit }
+                            }
+                            seismic_lang::interp::OracleError::MemoryLimit { required, .. } => {
+                                ObservationError::Capacity {
+                                    required: total.saturating_add(required).into(),
+                                    limit: request.memory_limit,
+                                }
+                            }
+                        })?;
+                    remaining_work = remaining_work.checked_sub(outcome.work_units()).ok_or(
+                        ObservationError::ReferenceLimit {
+                            work_limit: request.reference_work_limit,
+                        },
+                    )?;
+                    checking_time += check.elapsed();
+                    outcome
+                }
+                ReferenceState::Completed(outcome) => outcome,
+            };
             check_deadline(&request)?;
             let timer = Instant::now();
             let completed = admitted
@@ -399,7 +426,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                 SourceTermination::Failed(failure) => SourceTermination::Failed(failure.failure),
             };
             let stopped = matches!(&termination, SourceTermination::Failed(_));
-            let live = total.saturating_add(expected.as_ref().unwrap().retained_payload_bytes());
+            let live = total.saturating_add(outcome.retained_payload_bytes());
             // The completed owner retains admission permits and backing until
             // all observable prefix state has been copied into this observation.
             let actual = capture_invocation(&request, termination, &inputs, live, |tensor| {
@@ -408,61 +435,63 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
             drop(completed);
             if validation.is_some() {
                 diagnostic = Some(ValidationObservation {
-                    reference: expected.take().unwrap(),
+                    reference: outcome,
                     actual,
                     remaining_work,
                 });
-            } else {
-                let mut allowance = |units| {
-                    if request
-                        .deadline
-                        .is_some_and(|deadline| Instant::now() >= deadline)
-                    {
-                        return Err(ComparisonError::Resource(
-                            "observation deadline expired".into(),
-                        ));
-                    }
-                    remaining_work = remaining_work.checked_sub(units).ok_or_else(|| {
-                        ComparisonError::Resource("checking work limit exceeded".into())
-                    })?;
-                    Ok(())
-                };
-                match compare_outcome(
-                    expected.as_ref().unwrap(),
-                    &actual,
-                    request.precision,
-                    &mut allowance,
-                )
-                .map_err(|error| match error {
-                    ComparisonError::Resource(_)
-                        if request
-                            .deadline
-                            .is_some_and(|deadline| Instant::now() >= deadline) =>
-                    {
-                        ObservationError::DeadlineExpired
-                    }
-                    ComparisonError::Resource(_) => ObservationError::ReferenceLimit {
-                        work_limit: request.reference_work_limit,
-                    },
-                    ComparisonError::Contract(reason) => ObservationError::Contract(reason),
-                })? {
-                    Comparison::Match => {}
-                    Comparison::Mismatch(reason) => {
-                        return Err(ObservationError::IncorrectResult(format!("{reason:?}")));
-                    }
-                    Comparison::Unsupported(reason) => {
-                        return Err(ObservationError::Unsupported(reason));
-                    }
-                }
-            }
-            checking_time += check.elapsed();
-            if stopped {
-                if validation.is_none() {
-                    return Err(ObservationError::Unsupported(
-                        "completed source failure has no timing sample".into(),
-                    ));
+                checking_time += check.elapsed();
+                if !stopped && trial >= request.protocol.warmup {
+                    samples.push(elapsed);
                 }
                 break;
+            }
+            let mut allowance = |units| {
+                if request
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(ComparisonError::Resource(
+                        "observation deadline expired".into(),
+                    ));
+                }
+                remaining_work = remaining_work.checked_sub(units).ok_or_else(|| {
+                    ComparisonError::Resource("checking work limit exceeded".into())
+                })?;
+                Ok(())
+            };
+            match compare_outcome(
+                &outcome,
+                &actual,
+                request.precision,
+                &mut allowance,
+            )
+            .map_err(|error| match error {
+                ComparisonError::Resource(_)
+                    if request
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline) =>
+                {
+                    ObservationError::DeadlineExpired
+                }
+                ComparisonError::Resource(_) => ObservationError::ReferenceLimit {
+                    work_limit: request.reference_work_limit,
+                },
+                ComparisonError::Contract(reason) => ObservationError::Contract(reason),
+            })? {
+                Comparison::Match => {}
+                Comparison::Mismatch(reason) => {
+                    return Err(ObservationError::IncorrectResult(format!("{reason:?}")));
+                }
+                Comparison::Unsupported(reason) => {
+                    return Err(ObservationError::Unsupported(reason));
+                }
+            }
+            reference_state = ReferenceState::Completed(outcome);
+            checking_time += check.elapsed();
+            if stopped {
+                return Err(ObservationError::Unsupported(
+                    "completed source failure has no timing sample".into(),
+                ));
             }
             if trial >= request.protocol.warmup {
                 samples.push(elapsed);
@@ -538,14 +567,14 @@ fn dense_input_value(
     random: &mut u64,
 ) -> Result<f64, ObservationError> {
     let bits = random_bits(random);
-    if matches!(dtype, DType::I32 | DType::U32 | DType::U64 | DType::Bool) {
-        let (minimum, maximum) = match dtype {
-            DType::I32 => (i32::MIN as f64, i32::MAX as f64),
-            DType::U32 => (0.0, u32::MAX as f64),
-            DType::U64 => (0.0, (1u64 << 53) as f64),
-            DType::Bool => (0.0, 1.0),
-            _ => unreachable!(),
-        };
+    let integer_bounds = match dtype {
+        DType::I32 => Some((i32::MIN as f64, i32::MAX as f64)),
+        DType::U32 => Some((0.0, u32::MAX as f64)),
+        DType::U64 => Some((0.0, (1u64 << 53) as f64)),
+        DType::Bool => Some((0.0, 1.0)),
+        DType::F32 | DType::F16 | DType::BF16 => None,
+    };
+    if let Some((minimum, maximum)) = integer_bounds {
         // Small finite defaults are content recipes, not inferred index bounds.
         // Ordinary reference admission still checks all content-based accesses.
         let (low, high) = assumption.unwrap_or((0.0, 1.0));
@@ -708,9 +737,6 @@ fn validation_input_value(
     ordinal: usize,
     random: &mut u64,
 ) -> Result<f64, ObservationError> {
-    if case == ValidationCase::FiniteRandom {
-        return dense_input_value(dtype, assumption, random);
-    }
     let integer = matches!(dtype, DType::I32 | DType::U32 | DType::U64 | DType::Bool);
     let default = match dtype {
         DType::I32 => (i32::MIN as f64, i32::MAX as f64),
@@ -730,10 +756,10 @@ fn validation_input_value(
         DType::F16 => registry::f16_to_f32(1) as f64,
         DType::BF16 => f32::from_bits(1 << 16) as f64,
         DType::F32 => f32::from_bits(1) as f64,
-        _ => 1.0,
+        DType::I32 | DType::U32 | DType::U64 | DType::Bool => 1.0,
     };
     let value = match case {
-        ValidationCase::FiniteRandom => unreachable!(),
+        ValidationCase::FiniteRandom => return dense_input_value(dtype, assumption, random),
         ValidationCase::Zeros => 0.0,
         ValidationCase::AlternatingExtremes => {
             if ordinal % 2 == 0 {
