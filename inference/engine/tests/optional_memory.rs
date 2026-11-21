@@ -65,7 +65,7 @@ fn plain_owner(
     .unwrap();
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let tokenizer = resolved.host.shared_tokenizer();
-    let package = resolved.host.shared_package();
+    let package = std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap());
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let host = Host::new(|wakes| {
         Owner::with_prefix_cache_capacity(
@@ -315,7 +315,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
     .resolve()
     .unwrap();
     let row_bytes = usize::try_from(resolved.manifest.definition.decoder.hidden).unwrap() * 2;
-    let package = resolved.host.shared_package();
+    let package = std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap());
     let (mut domain, mut bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let charge = |domain: &magnitude_executor::ExecutorDomain| {
         domain.resources().device().allocated()
@@ -434,7 +434,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
     .unwrap();
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let tokenizer = resolved.host.shared_tokenizer();
-    let package = resolved.host.shared_package();
+    let package = std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap());
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let mut host = Host::new(|wakes| Owner::new(domain, bindings, limits, wakes));
     let method = Arc::new(Mtp::new("optional-memory-first-bind", 4).unwrap());
@@ -518,7 +518,7 @@ fn admission_reclaims_under_a_real_process_limit() {
     .resolve()
     .unwrap();
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
-    let package = resolved.host.shared_package();
+    let package = std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap());
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let catalog = Devices::discover(&[]).unwrap();
     let allocation = |device: &seismic::Device| -> Result<DomainReading, String> {

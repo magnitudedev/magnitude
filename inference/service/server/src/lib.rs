@@ -6,6 +6,7 @@
 
 #![cfg_attr(test, allow(clippy::disallowed_methods, reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"))]
 
+pub mod allocator;
 pub mod assessment;
 pub mod build_identity;
 pub mod configurations;

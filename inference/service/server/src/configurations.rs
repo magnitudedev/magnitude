@@ -162,6 +162,20 @@ impl ResolvedConfigurations {
             package_ids,
         }))
     }
+
+    /// Evict any cached configurations referencing one of `package_ids` so their
+    /// tokenizers and templates are freed immediately when packages are removed.
+    pub fn evict_packages(&self, package_ids: &[ModelPackageId]) {
+        if package_ids.is_empty() {
+            return;
+        }
+        self.cache.evict_where(|config| {
+            config
+                .package_ids
+                .iter()
+                .any(|id| package_ids.contains(id))
+        });
+    }
 }
 
 /// The engine configuration serving a bundle's material: its components, its declared method
@@ -330,6 +344,23 @@ impl<T, K: Clone + Ord> ResolutionCache<T, K> {
             });
     }
 
+    fn evict_where(&self, mut predicate: impl FnMut(&T) -> bool) {
+        {
+            let mut recent = self.recent.lock().expect("resolution cache lock");
+            recent.retain(|(_, entry)| match entry.get() {
+                Some(resolved) => !predicate(resolved),
+                None => true,
+            });
+        }
+        {
+            let mut held = self.held.lock().expect("resolution cache lock");
+            held.retain(|_, weak| match weak.upgrade() {
+                Some(resolved) => !predicate(&resolved),
+                None => false,
+            });
+        }
+    }
+
     #[cfg(test)]
     fn sizes(&self) -> (usize, usize) {
         (
@@ -496,5 +527,32 @@ mod tests {
         assert_eq!(failed, Err("unreadable"));
         resolve_counting(&cache, 9, &resolutions).await;
         assert_eq!(resolutions.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn evict_where_drops_matching_entries_immediately_and_retains_others() {
+        let cache = ResolutionCache::<String, ServableModelBundleKey>::new(4);
+        let resolutions = std::sync::atomic::AtomicUsize::new(0);
+        let first = resolve_counting(&cache, 1, &resolutions).await;
+        let second = resolve_counting(&cache, 2, &resolutions).await;
+        let weak_first = Arc::downgrade(&first);
+        let weak_second = Arc::downgrade(&second);
+        drop(first);
+        drop(second);
+        assert_eq!(cache.sizes(), (2, 2));
+        assert!(weak_first.upgrade().is_some(), "recent entry stays alive before eviction");
+
+        // Evict only model 1; its Arc drops immediately while model 2 stays cached.
+        cache.evict_where(|value| value == "model 1");
+        assert!(weak_first.upgrade().is_none(), "evicted entry must be dropped immediately");
+        assert!(weak_second.upgrade().is_some(), "unrelated entry must stay cached");
+        assert_eq!(cache.sizes(), (1, 1));
+
+        // Re-resolving model 1 resolves fresh; model 2 is still a cache hit.
+        let before = resolutions.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = resolve_counting(&cache, 2, &resolutions).await;
+        assert_eq!(resolutions.load(std::sync::atomic::Ordering::Relaxed), before);
+        let _ = resolve_counting(&cache, 1, &resolutions).await;
+        assert_eq!(resolutions.load(std::sync::atomic::Ordering::Relaxed), before + 1);
     }
 }

@@ -384,21 +384,54 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
     }
     let temp = Temp(path);
     std::fs::write(&temp.0, bytes).unwrap();
+    #[cfg(unix)]
+    let (file_dev, file_ino) = {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&temp.0).unwrap();
+        (meta.dev(), meta.ino())
+    };
     let directory_error = open(temp.0.parent().unwrap()).err().unwrap().to_string();
     assert!(
         directory_error.contains("not a regular file"),
         "{directory_error}"
     );
     let model = open(&temp.0).unwrap();
+    // HostArtifacts must hold zero open OS file descriptors to the backing GGUF
+    // so removing the file immediately reclaims disk space (Major #6).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let fd_dir = if cfg!(target_os = "macos") {
+            "/dev/fd"
+        } else {
+            "/proc/self/fd"
+        };
+        if let Ok(entries) = std::fs::read_dir(fd_dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = std::fs::metadata(entry.path()) {
+                    assert!(
+                        !(meta.dev() == file_dev && meta.ino() == file_ino),
+                        "HostArtifacts leaked an open file descriptor ({:?}) to {}",
+                        entry.path(),
+                        temp.0.display(),
+                    );
+                }
+            }
+        }
+    }
     assert_eq!(model.definition().decoder.vocabulary, 257);
     let decoder = &model.definition().decoder;
     assert_eq!(decoder.exit.output, decoder.entry.embedding);
     let identity = model.definition().artifact_identity.to_string();
     // GGUF interpretation is retained; later pathname replacement cannot alter
-    // its tokenizer/template metadata or the open weight source.
+    // its tokenizer/template metadata or pure in-memory properties.
     let replacement = temp.0.with_extension("replacement");
     std::fs::write(&replacement, b"invalid replacement").unwrap();
     std::fs::rename(&replacement, &temp.0).unwrap();
+    let props = magnitude_engine::chat::model_properties(&model).unwrap();
+    assert_eq!(props.model_path, temp.0);
+    assert!(props.model_size_bytes > 0);
+    assert_eq!(props.architecture.as_deref(), Some("qwen35"));
     let tokenizer = model.tokenizer();
     assert_eq!(tokenizer.artifact_identity(), identity);
     let prepared = PreparedChat::prepare(

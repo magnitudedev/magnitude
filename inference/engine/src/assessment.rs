@@ -1386,7 +1386,7 @@ fn plan_package(
             if stage_timer::is_recording() {
                 stage_timer::record_stage(|t| t.decode_demand_ns += decode_demand_ns);
             }
-            let (draft, structure) = match alone {
+            let (draft, mut structure) = match alone {
                 Some(Ok(alone)) => alone,
                 Some(Err(refusal)) => return refused(refusal),
                 None => {
@@ -1399,6 +1399,7 @@ fn plan_package(
                     (draft, structure)
                 }
             };
+            structure.release_target_cache();
             let (demand, whole) = match demands {
                 Ok(demands) => demands,
                 Err(AssessmentError::Graph(error)) => return refused(Refusal::of(classify_graph(error))),

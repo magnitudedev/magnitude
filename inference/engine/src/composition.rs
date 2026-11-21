@@ -68,6 +68,8 @@ impl EngineConfiguration {
         let package = self.package.open().map_err(|error| {
             ResolveError::Artifact(ArtifactError::from_artifacts(error, self.package.target()))
         })?;
+        let package_manifest = package.manifest();
+        let store_path = package.store().to_path_buf();
         let host = HostArtifacts::interpret(
             package,
             self.context_tokens,
@@ -83,14 +85,14 @@ impl EngineConfiguration {
             .resolve_admitted(definition, host.draft_unavailable())
             .map_err(invalid)?;
         let manifest = ExecutionManifest::new(
-            host.package().manifest(),
+            package_manifest,
             definition.clone(),
             model,
             self.service,
             self.path,
             self.device,
             self.kernel_cache,
-            Some(host.package().store().to_path_buf()),
+            Some(store_path),
             self.release,
         )
         .map_err(invalid)?;
@@ -160,9 +162,9 @@ impl ReadyEngine {
         connection: WorkerConnection,
     ) -> Result<Self, ReadinessMismatch> {
         let ready = &connection.ready;
-        if ready.package != host.package().identity() {
+        if ready.package != host.package_identity() {
             return Err(ReadinessMismatch::Package {
-                host: host.package().identity(),
+                host: host.package_identity(),
                 worker: ready.package,
             });
         }
@@ -269,20 +271,23 @@ pub fn in_process_priced<T>(
 /// [`in_process_priced`], then [`request_load_points`] registers the load's
 /// own points, and [`InProcessJobs`] loops until all standing and load
 /// requests are recorded or a job makes no progress ([`JobsStopped::Stalled`]).
-pub fn settle_load_measurements(
-    manifest: &ExecutionManifest,
-    package: &Package,
-) -> Result<(), LoadError> {
+pub fn settle_load_measurements(manifest: &ExecutionManifest) -> Result<(), LoadError> {
     if manifest.kernel_cache.is_none() {
         return Ok(());
     }
     let internal = |reason: String| LoadError::Internal { reason };
     in_process_priced(manifest, || Ok(()))?;
+    let package = Package::open_manifest(&manifest.package).map_err(|error| {
+        LoadError::Artifact(ArtifactError::from_artifacts(
+            error,
+            manifest.package.target.path(),
+        ))
+    })?;
     let paths = vec![manifest.store().to_path_buf()];
     let catalog = Rc::new(
         seismic::Devices::discover(&paths).map_err(|error| internal(error.to_string()))?,
     );
-    request_load_points(&catalog, manifest, package)?;
+    request_load_points(&catalog, manifest, &package)?;
     let mut jobs = InProcessJobs::of_load(&catalog, paths, manifest)
         .map_err(internal)?
         .expect("a load with a kernel cache has jobs");
@@ -324,12 +329,11 @@ pub fn prepare_in_process(
 /// is started and `kernel preparation ended in S s` once it is gone.
 pub fn load_in_process<L>(
     manifest: &ExecutionManifest,
-    package: &Package,
     mut load: impl FnMut(UnpreparedUnits) -> Result<LoadAttempt<L>, LoadError>,
     mut worker: std::process::Command,
     mut prepare_progress: impl FnMut(LoadProgress),
 ) -> Result<L, LoadError> {
-    settle_load_measurements(manifest, package)?;
+    settle_load_measurements(manifest)?;
     // The diagnostic stream says when the Prepare's process began and that it
     // is gone, so a log's reader can tell preparation from the load itself.
     let preparing = std::cell::Cell::new(None);
@@ -407,7 +411,7 @@ pub fn start_in_process(
             Err(error) => unloaded(Err(error)),
         }
     };
-    load_in_process(&manifest, host.package(), attempt, worker, |update| {
+    load_in_process(&manifest, attempt, worker, |update| {
         (progress.borrow_mut())(update)
     })
 }

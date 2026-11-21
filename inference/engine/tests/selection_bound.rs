@@ -65,7 +65,7 @@ fn plain_owner(limits: ServiceLimits) -> (Host, usize, std::sync::Arc<ByteBpeTok
     .unwrap();
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let tokenizer = resolved.host.shared_tokenizer();
-    let package = resolved.host.shared_package();
+    let package = std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap());
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let host = Host::new(|wakes| {
         Owner::with_prefix_cache_capacity(
@@ -226,7 +226,7 @@ fn plain_domain(bound: usize, exported: usize) -> (Box<ExecutorDomain>, StateBin
     .resolve()
     .unwrap();
     let (domain, bindings, _) =
-        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+        build_native_domain(&resolved.manifest, std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap())).unwrap();
     (domain, bindings)
 }
 

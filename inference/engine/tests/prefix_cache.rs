@@ -93,7 +93,7 @@ fn owner() -> (Host, usize, std::sync::Arc<ByteBpeTokenizer>) {
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let tokenizer = resolved.host.shared_tokenizer();
     let (domain, bindings, _) =
-        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+        build_native_domain(&resolved.manifest, std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap())).unwrap();
     let host = Host::new(|wakes| {
         Owner::with_prefix_cache_capacity(
             domain,
@@ -327,7 +327,7 @@ fn a_growing_conversation_stays_within_the_charged_workload_state() {
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let tokenizer = resolved.host.shared_tokenizer();
     let (domain, bindings, plan) =
-        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+        build_native_domain(&resolved.manifest, std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap())).unwrap();
     let workload = plan.capacity().workload_state_bytes;
     let mut host = Host::new(|wakes| Owner::with_resource_plan(domain, bindings, limits(), &plan, wakes));
     let mut prompt = text(&tokenizer, 1, 300);
@@ -369,7 +369,7 @@ fn distinct_conversations_commit_no_state_beyond_the_charged_workload() {
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let tokenizer = resolved.host.shared_tokenizer();
     let (domain, bindings, plan) =
-        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+        build_native_domain(&resolved.manifest, std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap())).unwrap();
     let workload = plan.capacity().workload_state_bytes;
     let mut host = Host::new(|wakes| Owner::with_resource_plan(domain, bindings, limits(), &plan, wakes));
     let mut released = false;
@@ -715,7 +715,7 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
     let resolved = resolved(true);
     let input = image_prompt(&resolved.host);
     let (mut domain, mut bindings, _) =
-        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+        build_native_domain(&resolved.manifest, std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap())).unwrap();
     let charged = |domain: &ExecutorDomain| {
         let device = domain.resources().device();
         device.allocated()
@@ -772,8 +772,13 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     let split = span.end + 2;
     let end = input.tokens().len();
     assert!(split < end && split <= 512, "image span {}..{} of {end}", span.start, span.end);
-    let (mut domain, mut bindings, _) =
-        build_native_domain(&resolved.manifest, host.shared_package()).unwrap();
+    let (mut domain, mut bindings, _) = build_native_domain(
+        &resolved.manifest,
+        std::sync::Arc::new(
+            magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap(),
+        ),
+    )
+    .unwrap();
 
     // Uninterrupted: encode, the image chunk, then the rest.
     let reference = RequestId(1);

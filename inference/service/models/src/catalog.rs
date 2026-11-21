@@ -1689,6 +1689,12 @@ impl ReleaseCatalog {
     pub fn target_weight_sample(&self, bundle_key: &ServableModelBundleKey) -> Option<&WeightSample> {
         self.weight_samples.get(bundle_key)
     }
+
+    /// Release cached decompressed planner bundle chunks to reclaim memory.
+    /// Returns `true` if any decompressed chunks were freed.
+    pub fn release_cached_headers(&self) -> bool {
+        self.planner_bundle.release_decompressed()
+    }
 }
 
 /// One catalog bundle's assessment headers served directly from the release planner bundle in

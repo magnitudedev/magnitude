@@ -489,7 +489,7 @@ impl ExecutionPlanDraft {
         Ok(match outcome {
             Placing::Whole { draft, charge, found: () } => Placed::Whole(ChargedDraft { draft, charge }),
             Placing::Short(ceiling) => Placed::Short(Unplaced { draft: self, ceiling, bound, held }),
-            Placing::None(no) => return Err(refusal(no, capacity)),
+            Placing::None(no) => return Err(refusal(no)),
         })
     }
 
@@ -506,7 +506,7 @@ impl ExecutionPlanDraft {
         let capacity = room.capacity()?;
         match self.bank_ceiling(definition, HeldBound::of(bound, capacity), None)? {
             Ok(ceiling) => Ok(Unplaced { draft: self, ceiling, bound, held: HeldCharges::default() }),
-            Err(no) => Err(refusal(no, capacity)),
+            Err(no) => Err(refusal(no)),
         }
     }
 
@@ -765,10 +765,10 @@ impl ExecutionPlanDraft {
                         settled = Ok(found);
                         break;
                     }
-                    Err(NoBank::Short { deficit_bytes }) => {
-                        if let Err(NoBank::Short { deficit_bytes: least }) = &mut settled {
+                    Err(short @ NoBank::Short { deficit_bytes, .. }) => {
+                        if let Err(NoBank::Short { deficit_bytes: least, .. }) = &settled {
                             if deficit_bytes < *least {
-                                *least = deficit_bytes;
+                                settled = Err(short);
                             }
                         }
                     }
@@ -1287,8 +1287,18 @@ impl ExecutionPlanDraft {
             .map_err(PlanError::ResourcePlanning)?
             .allocation_bytes();
         assert_eq!(mandatory_bytes, priced, "invariant violated: a pass of {pass:?} certifies to other bytes than it is priced at");
-        let room = room.room(&mandatory, &floor_charge)?;
+        let settle_room = room;
+        let room = settle_room.room(&mandatory, &floor_charge)?;
         let room = room.free.min(room.ceiling);
+        let short_error = |draft: &Self, charge: &AssessmentMemoryCharge, deficit_bytes: NonZeroU64| -> Result<NoBank, PlanError> {
+            let fit = settle_room.fit_whole(draft, charge)?;
+            let available = fit.room.free.min(fit.room.ceiling);
+            Ok(NoBank::Short {
+                deficit_bytes,
+                required: fit.needed,
+                available,
+            })
+        };
         // A draft of `slots` under `ceiling`, its charge, and what it leaves
         // of the room (`Ok`) or how far it exceeds it (`Err`).
         let charged = |held: &mut HeldCharges<C>, slots: u64, ceiling: u64| -> Result<_, E> {
@@ -1317,8 +1327,9 @@ impl ExecutionPlanDraft {
             let slots = points[at];
             let (draft, charge) = match charged(held, slots, ceiling)? {
                 (draft, charge, Ok(_)) => (draft, charge),
-                (_, _, Err(excess)) if at == 0 => {
-                    return Ok(Err(NoBank::Short { deficit_bytes: NonZeroU64::new(excess).expect("a nonzero excess") }));
+                (draft, charge, Err(excess)) if at == 0 => {
+                    let deficit = NonZeroU64::new(excess).expect("a nonzero excess");
+                    return Ok(Err(short_error(&draft, charge.charge(), deficit)?));
                 }
                 (_, _, Err(_)) => {
                     at -= 1;
@@ -1327,7 +1338,9 @@ impl ExecutionPlanDraft {
             };
             let deficit = match confirm(&draft, charge.charge())? {
                 Ok(found) => return Ok(Ok((draft, charge, found))),
-                Err(deficit) if at == 0 => return Ok(Err(NoBank::Short { deficit_bytes: deficit })),
+                Err(deficit) if at == 0 => {
+                    return Ok(Err(short_error(&draft, charge.charge(), deficit)?));
+                }
                 Err(deficit) => deficit,
             };
             // The bank gives up at least the bytes the plan is short.
@@ -1884,8 +1897,13 @@ pub enum NoBank {
     /// The load's own `bound` is below the weights the plan `needed` at the
     /// bank's floor.
     Bound { bound: WeightBound, needed: u64 },
-    /// The plan at the bank's floor is still `deficit_bytes` short.
-    Short { deficit_bytes: NonZeroU64 },
+    /// The plan at the bank's floor is still `deficit_bytes` short (`required`
+    /// against live `available` device room).
+    Short {
+        deficit_bytes: NonZeroU64,
+        required: u64,
+        available: u64,
+    },
 }
 
 /// A planning refusal that the experts cannot stream as [`NoBank`]; any
@@ -2321,7 +2339,7 @@ impl<C: HeldCharge> Unplaced<C> {
         )?;
         match streamed {
             Ok((draft, charge, ())) => Ok(ChargedDraft { draft, charge }),
-            Err(no) => Err(refusal(no, capacity)),
+            Err(no) => Err(refusal(no)),
         }
     }
 }
@@ -2342,16 +2360,15 @@ fn load_confirm<'a>(
     }
 }
 
-/// A load's refusal, of a device of `capacity` bytes, where no plan holds
-/// its experts.
-fn refusal(no: NoBank, capacity: u64) -> PlanError {
+/// A load's refusal where no plan holds its experts.
+fn refusal(no: NoBank) -> PlanError {
     match no {
         NoBank::Unstreamed(reason) => PlanError::Unstreamed(reason),
         NoBank::Bound { bound, needed } => PlanError::WeightBound { bound, needed },
-        NoBank::Short { deficit_bytes } => PlanError::Resource(crate::CapacityError::new(
+        NoBank::Short { required, available, .. } => PlanError::Resource(crate::CapacityError::new(
             crate::ResourceKind::DeviceMemory,
-            capacity + deficit_bytes.get(),
-            capacity,
+            required,
+            available,
         )),
     }
 }
@@ -2479,7 +2496,8 @@ impl WindowedBankForm {
         if let Some(structure) = self.structure.get() {
             return Ok(Some((rung, structure)));
         }
-        let certified = base.reusing_non_target(prepared_definition, &rung.draft)?;
+        let mut certified = base.reusing_non_target(prepared_definition, &rung.draft)?;
+        certified.release_target_cache();
         let _ = self.structure.set(certified);
         Ok(Some((rung, self.structure.get().expect("just initialized"))))
     }
@@ -2518,6 +2536,22 @@ impl<T> BankForm<T> {
 }
 
 impl<T> FloorForms<T> {
+    /// Drop certified target-family layout caches on all forms once
+    /// preparation has finished.
+    pub fn release_target_cache(&mut self) {
+        match self {
+            Self::Banked { bank, resident } => {
+                bank.form.structure.release_target_cache();
+                if let Some(resident) = resident {
+                    resident.structure.release_target_cache();
+                }
+            }
+            Self::Resident(resident) => {
+                resident.structure.release_target_cache();
+            }
+        }
+    }
+
     /// The forms without what else their outlines gave.
     pub fn structures(self) -> FloorForms {
         let form = |HeldForm { draft, structure, .. }: HeldForm<T>| HeldForm { draft, structure, more: () };
@@ -4501,5 +4535,98 @@ mod tests {
         assert!(floor.draft().load().expert_bank().is_none());
         assert_eq!(floor.draft().policy().limits().chain_capacity.get(), 1);
         assert_eq!(floor.charge().held_pass, PassLaunches::FLOOR);
+    }
+
+    /// `NoBank::Short` reports the exact `(required, available)` from `WholeFit`
+    /// against live `device_room`, never `capacity + deficit_bytes` / `capacity`.
+    #[test]
+    fn no_bank_short_reports_exact_required_and_live_device_room() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+
+        struct LiveDeviceRoom {
+            capacity: u64,
+            device_room: u64,
+        }
+
+        impl SettleRoom for LiveDeviceRoom {
+            fn capacity(&self) -> Result<u64, PlanError> {
+                Ok(self.capacity)
+            }
+
+            fn room(&self, draft: &ExecutionPlanDraft, mandatory: &AssessmentMemoryCharge) -> Result<PlanRoom, PlanError> {
+                let needed = mandatory
+                    .store_demands(draft.device.topology(), draft.device.executor())
+                    .map_err(PlanError::ResourcePlanning)?
+                    .allocation_bytes();
+                let left = self.device_room.saturating_sub(needed);
+                Ok(PlanRoom { free: left, ceiling: left })
+            }
+
+            fn fit_whole(&self, draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge) -> Result<WholeFit, PlanError> {
+                let needed = charge
+                    .store_demands(draft.device.topology(), draft.device.executor())
+                    .map_err(PlanError::ResourcePlanning)?
+                    .allocation_bytes();
+                let short = NonZeroU64::new(needed.saturating_sub(self.device_room));
+                Ok(WholeFit {
+                    room: PlanRoom { free: self.device_room, ceiling: self.device_room },
+                    needed,
+                    short,
+                    limiting: short.map(|_| crate::platform::DomainRole::Allocation),
+                })
+            }
+
+            fn host_left(&self, _: &ExecutionPlanDraft, _: &AssessmentMemoryCharge, _: u64) -> Result<i64, PlanError> {
+                Ok(i64::MAX)
+            }
+        }
+
+        let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let definition = routed_fixture_definition(RoutedShape {
+            layers: 4,
+            experts: 32,
+            selected: 4,
+            hidden: 1024,
+            intermediate: 512,
+        });
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+
+        let total_capacity = 64_u64 << 30; // 64 GiB total machine capacity
+        let live_device_room = 1_u64 << 20; // 1 MiB live free room (far below floor)
+        let room = LiveDeviceRoom {
+            capacity: total_capacity,
+            device_room: live_device_room,
+        };
+        let Placed::Short(unplaced) = draft.placed::<AssessmentMemoryCharge>(&definition, None, &synthetic(), &room).unwrap() else {
+            panic!("expected Placed::Short when live device_room is 1 MiB");
+        };
+        let err = match unplaced.streamed(&definition, &synthetic(), &room) {
+            Err(PlanError::Resource(err)) => err,
+            Err(other) => panic!("expected PlanError::Resource, got {other:?}"),
+            Ok(_) => panic!("expected refusal when live device_room is 1 MiB"),
+        };
+        assert_eq!(err.resource, crate::ResourceKind::DeviceMemory);
+        assert_eq!(
+            err.available, live_device_room,
+            "available must be live device_room, not total machine capacity",
+        );
+        assert!(
+            err.required > live_device_room && err.required < total_capacity,
+            "required ({}) must be the actual floor need (> {} and << total capacity {})",
+            err.required,
+            live_device_room,
+            total_capacity,
+        );
     }
 }

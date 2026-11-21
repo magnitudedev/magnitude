@@ -120,8 +120,13 @@ fn image_features_match_the_reference_encoder() {
     };
     let cells = span.end - span.start;
 
-    let (mut domain, mut bindings, _) =
-        build_native_domain(&resolved.manifest, host.shared_package()).unwrap();
+    let (mut domain, mut bindings, _) = build_native_domain(
+        &resolved.manifest,
+        std::sync::Arc::new(
+            magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap(),
+        ),
+    )
+    .unwrap();
     let request = RequestId(1);
     domain.install_input(request, input).unwrap();
     let encodes = domain.open_served(&mut bindings, request, None).unwrap();

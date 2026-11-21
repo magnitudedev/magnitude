@@ -426,10 +426,11 @@ impl PreparedExecutionAssessment {
     /// demands ([`Self::compute_decode_demands`]).
     pub fn from_demands(
         definition: ModelDefinition,
-        forms: crate::FloorForms,
+        mut forms: crate::FloorForms,
         demand: DecodeDemand,
         whole: Option<DecodeDemand>,
     ) -> Box<Self> {
+        forms.release_target_cache();
         Box::new(Self {
             definition,
             demand,
@@ -768,6 +769,12 @@ impl StructuralCharge {
         self.target_cache
             .as_ref()
             .map(|cache| TargetLayoutCache(std::sync::Arc::clone(cache)))
+    }
+
+    /// Drop the target-family layout cache once certification has finished so
+    /// retained preparations do not hold certified graph layouts in memory.
+    pub fn release_target_cache(&mut self) {
+        self.target_cache = None;
     }
 
     /// The structure of `draft`'s charge.

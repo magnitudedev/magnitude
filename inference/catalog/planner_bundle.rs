@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use flate2::Compression;
@@ -164,7 +164,7 @@ struct Chunk {
     digest: [u8; 32],
     compressed: Range<usize>,
     length: usize,
-    decompressed: OnceLock<Box<[u8]>>,
+    decompressed: RwLock<Option<Box<[u8]>>>,
 }
 
 #[derive(Debug)]
@@ -204,7 +204,7 @@ impl<'a> PlannerBundle<'a> {
                 digest,
                 compressed: start..cursor,
                 length,
-                decompressed: OnceLock::new(),
+                decompressed: RwLock::new(None),
             });
         }
         let input_count = read_u32(bytes, &mut cursor)?;
@@ -289,6 +289,23 @@ impl<'a> PlannerBundle<'a> {
         Ok(())
     }
 
+    /// Release all cached decompressed chunks to reclaim memory. Subsequent
+    /// reads decompress on demand from the compressed bundle bytes. Returns
+    /// `true` if at least one cached chunk was freed.
+    pub fn release_decompressed(&self) -> bool {
+        let mut released = false;
+        for chunk in &self.chunks {
+            let mut slot = chunk
+                .decompressed
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.take().is_some() {
+                released = true;
+            }
+        }
+        released
+    }
+
     /// Reassemble an input and verify it against its digest.
     pub fn input(&self, digest: &str) -> Result<Vec<u8>, String> {
         let entry = self
@@ -297,10 +314,8 @@ impl<'a> PlannerBundle<'a> {
             .ok_or_else(|| format!("planner bundle is missing input {digest}"))?;
         let mut input = Vec::with_capacity(entry.length);
         for &chunk in &entry.chunks {
-            let bytes = self
-                .chunk_bytes(chunk)
+            self.append_chunk(chunk, &mut input)
                 .map_err(|error| format!("planner input {digest}: {error}"))?;
-            input.extend_from_slice(bytes);
         }
         if !entry.verified.load(Ordering::Acquire) {
             if sha256(&input) != digest {
@@ -313,21 +328,32 @@ impl<'a> PlannerBundle<'a> {
         Ok(input)
     }
 
-    fn chunk_bytes(&self, index: usize) -> Result<&[u8], String> {
+    fn append_chunk(&self, index: usize, output: &mut Vec<u8>) -> Result<(), String> {
         let chunk = &self.chunks[index];
-        if let Some(bytes) = chunk.decompressed.get() {
-            return Ok(bytes);
+        {
+            let guard = chunk
+                .decompressed
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(bytes) = guard.as_deref() {
+                output.extend_from_slice(bytes);
+                return Ok(());
+            }
         }
         let mut bytes = Vec::with_capacity(chunk.length);
         self.decompress(chunk, &mut bytes)?;
         if Sha256::digest(&bytes).as_slice() != chunk.digest {
             return Err("chunk failed integrity validation".to_owned());
         }
-        let _ = chunk.decompressed.set(bytes.into_boxed_slice());
-        Ok(chunk
+        output.extend_from_slice(&bytes);
+        let mut guard = chunk
             .decompressed
-            .get()
-            .expect("planner chunk cache just initialized"))
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_none() {
+            *guard = Some(bytes.into_boxed_slice());
+        }
+        Ok(())
     }
 
     fn decompress(&self, chunk: &Chunk, output: &mut Vec<u8>) -> Result<(), String> {
@@ -474,5 +500,31 @@ mod tests {
         encoded[size_offset..size_offset + 8]
             .copy_from_slice(&((MAX_PLANNER_INPUT_BYTES as u64) + 1).to_le_bytes());
         assert!(PlannerBundle::parse(&encoded).is_err());
+    }
+
+    #[test]
+    fn release_decompressed_evicts_cached_chunks_and_allows_reread() {
+        let inputs = vec![b"small header".to_vec(), pseudo_random(400_000, 7)];
+        let (encoded, digests) = bundle_of(&inputs);
+        let bundle = PlannerBundle::parse(&encoded).unwrap();
+
+        // Nothing cached initially.
+        assert!(!bundle.release_decompressed());
+
+        // Reading populates the decompressed chunk cache.
+        for (input, digest) in inputs.iter().zip(&digests) {
+            assert_eq!(&bundle.input(digest).unwrap(), input);
+        }
+        assert!(bundle.chunks.iter().any(|c| c.decompressed.read().unwrap().is_some()));
+
+        // Releasing evicts every cached chunk.
+        assert!(bundle.release_decompressed());
+        assert!(bundle.chunks.iter().all(|c| c.decompressed.read().unwrap().is_none()));
+        assert!(!bundle.release_decompressed());
+
+        // Subsequent reads decompress on demand and return exact bytes.
+        for (input, digest) in inputs.iter().zip(&digests) {
+            assert_eq!(&bundle.input(digest).unwrap(), input);
+        }
     }
 }

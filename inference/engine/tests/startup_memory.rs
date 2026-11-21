@@ -98,7 +98,7 @@ impl Drop for Window {
 fn zero_startup_headroom_is_insufficient_memory() {
     let resolved = model();
     let _window = Window::new(0);
-    let error = match build_native_domain(&resolved.manifest, resolved.host.shared_package()) {
+    let error = match build_native_domain(&resolved.manifest, std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap())) {
         Ok(_) => panic!("a load with no room in its cgroup loaded"),
         Err(error) => error,
     };
@@ -120,7 +120,7 @@ fn qualification_deficit_is_retryable_and_recovers() {
                 .map(|value| value.parse().unwrap())
                 .unwrap_or(128 * 1024 * 1024),
         );
-        let error = match build_native_domain(&resolved.manifest, resolved.host.shared_package()) {
+        let error = match build_native_domain(&resolved.manifest, std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap())) {
             Ok(_) => panic!("qualification exceeded available startup memory"),
             Err(error) => error,
         };
@@ -132,7 +132,7 @@ fn qualification_deficit_is_retryable_and_recovers() {
         );
     }
     // The same model succeeds when the temporary constraint is removed.
-    build_native_domain(&resolved.manifest, resolved.host.shared_package())
+    build_native_domain(&resolved.manifest, std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap()))
         .unwrap_or_else(|error| panic!("recovery: {error}"));
 }
 
@@ -169,7 +169,7 @@ fn virtual_cpu_availability_is_enforced_before_open() {
 fn probe_model_load() {
     let resolved = model();
     eprintln!("before load: {:?}", seismic::host_sample());
-    match build_native_domain(&resolved.manifest, resolved.host.shared_package()) {
+    match build_native_domain(&resolved.manifest, std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap())) {
         Ok(_) => eprintln!("probe: model loaded and warmed up"),
         Err(error) => panic!("probe: {error}"),
     }

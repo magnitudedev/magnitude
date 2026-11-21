@@ -65,7 +65,9 @@ fn domain() -> (Box<ExecutorDomain>, StateBindings, usize, usize, usize) {
     .resolve()
     .unwrap();
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
-    let package = resolved.host.shared_package();
+    let package = std::sync::Arc::new(
+        magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap(),
+    );
     let (domain, bindings, plan) = build_native_domain(&resolved.manifest, package).unwrap();
     (
         domain,

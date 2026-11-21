@@ -22,6 +22,7 @@ use magnitude_service_models::{
     HuggingFaceDiscovery, InventoryConfig, ManagedModelDownloads, ModelDomainResolver,
     managed_model_services,
 };
+use magnitude_service_server::allocator;
 use magnitude_service_server::assessment::assessor::{EngineHeaderVerdicts, ModelAssessor};
 use magnitude_service_server::assessment::candidates::{
     ManagedModelCandidates, engine_architectures,
@@ -45,7 +46,6 @@ use magnitude_service_server::serving::ServiceModels;
 use magnitude_service_server::worker_process::{self, WorkerLauncher};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
-mod allocator;
 mod installation;
 mod parent_control;
 mod startup;
@@ -269,6 +269,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     serving,
                     bounds,
                 )),
+                assessor: Some(assessor.clone()),
                 catalog: catalog.clone(),
                 idle_timeout: MODEL_IDLE_TIMEOUT,
                 launcher: worker_launcher,

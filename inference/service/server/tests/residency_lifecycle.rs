@@ -97,6 +97,7 @@ impl Served {
             models: self.inventory.clone(),
             model_variants: self.resolver.clone(),
             configurations: self.configurations.clone(),
+            assessor: None,
             catalog: self.catalog.clone(),
             idle_timeout,
             launcher: WorkerLauncher::current().expect("harness executable"),

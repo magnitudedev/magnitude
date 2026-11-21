@@ -52,6 +52,7 @@ use super::{
     PreparedResidency, ReleaseControl, ResidencyAcquisition, ResidencyClient, ResidencyGrant,
     ResidencyLease, ResidencyNotification, ResidencyWorker, ResolvedResidencyTarget,
 };
+use crate::assessment::assessor::ModelAssessor;
 use crate::configurations::{HeldConfiguration, ResolvedConfiguration, ResolvedConfigurations};
 use crate::device_lock::{DeviceHold, DeviceLock, DeviceShare, IdleResident, ResidentRoom};
 use crate::hardware::execution_backend;
@@ -85,6 +86,10 @@ pub struct ResidencyEnvironment {
     pub models: Arc<ManagedModelStore>,
     pub model_variants: Arc<ModelDomainResolver>,
     pub configurations: Arc<ResolvedConfigurations>,
+    /// The model assessor whose preparation and planner-bundle caches are
+    /// released before a model load starts so `magnitude-main` does not hold
+    /// stale planning graphs when the worker measures available RAM.
+    pub assessor: Option<Arc<ModelAssessor>>,
     /// The service process's device catalog: previews read it.
     pub catalog: Arc<Devices>,
     /// [`MODEL_IDLE_TIMEOUT`] in the service.
@@ -377,10 +382,19 @@ impl CatalogPackageRemover for ModelInstances {
         package_ids: Vec<ModelPackageId>,
         loaded: LoadedPackages,
     ) -> BoxFuture<'_, Result<u64, InventoryError>> {
-        let (models, residency) = (Arc::clone(&self.environment.models), self.residency.clone());
+        let (models, residency, configurations) = (
+            Arc::clone(&self.environment.models),
+            self.residency.clone(),
+            Arc::clone(&self.environment.configurations),
+        );
         // On a task of its own: a removal runs to its end whatever its caller does.
         let removal = tokio::spawn(async move {
-            let release = residency.release_packages(package_ids.clone(), loaded);
+            let release_ids = package_ids.clone();
+            let release = async move {
+                residency.release_packages(release_ids.clone(), loaded).await?;
+                configurations.evict_packages(&release_ids);
+                Ok(())
+            };
             models.remove_installed_packages(&package_ids, Box::pin(release)).await
         });
         Box::pin(async move {
@@ -775,6 +789,9 @@ impl EngineResidency {
     ) -> BoxFuture<'a, Result<PreparedResidency<ResidentEngine>, ModelOperationFailure>> {
         Box::pin(async move {
             let environment = &self.environment;
+            if let Some(assessor) = &environment.assessor {
+                assessor.release_caches();
+            }
             let resolved = Arc::new(environment.configurations.resolve(&configuration).await?);
             let manifest = resolved.manifest.clone();
             let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);

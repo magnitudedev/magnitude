@@ -180,6 +180,30 @@ impl ModelAssessor {
         &self.release_catalog
     }
 
+    /// Release cached model preparations and decompressed release planner headers,
+    /// then ask the platform allocator to return freed pages to the OS so
+    /// `magnitude-main` does not hold gigabytes of stale planning graphs when a
+    /// worker measures available RAM.
+    pub fn release_caches(&self) {
+        {
+            let mut cells = self
+                .preparations
+                .lock()
+                .expect("assessment preparations lock poisoned");
+            cells.clear();
+        }
+        self.release_catalog.release_cached_headers();
+        crate::allocator::release_now();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preparation_cache_len(&self) -> usize {
+        self.preparations
+            .lock()
+            .expect("assessment preparations lock poisoned")
+            .len()
+    }
+
     /// Resolve a bundle's exact material: release headers for a catalog bundle, installed files
     /// or source-backed previews for everything else.
     pub fn resolve_material<'a>(
@@ -226,7 +250,7 @@ impl ModelAssessor {
         }
     }
 
-    fn preparation_cell(
+    pub(crate) fn preparation_cell(
         &self,
         key: &(Arc<str>, ServableModelBundleKey),
     ) -> Arc<tokio::sync::OnceCell<Arc<PreparedModelAssessment>>> {

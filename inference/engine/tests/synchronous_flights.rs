@@ -63,7 +63,9 @@ fn each_run_reconciles_at_most_one_cpu_flight() {
     .resolve()
     .unwrap();
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
-    let package = resolved.host.shared_package();
+    let package = std::sync::Arc::new(
+        magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap(),
+    );
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let mut host = Host::new(|wakes| Owner::new(domain, bindings, limits, wakes));
 

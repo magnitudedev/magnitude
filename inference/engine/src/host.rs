@@ -22,13 +22,19 @@ use magnitude_family_contracts::{
     FamilyError, MarkerTokens, ModelDefinition, ModelFamily, ModelInputAdapter,
     PreparedModelInput, TokenPlan,
 };
-use std::{fmt, sync::Arc};
+use std::{fmt, path::{Path, PathBuf}, sync::Arc};
 
 /// The package's chat and input semantics: tokenizer, templates, media
-/// processor and the recognized family's input adapter.
+/// processor and the recognized family's input adapter. Holds only pure
+/// in-memory metadata and never retains an open [`Package`] or OS file
+/// descriptor.
 #[derive(Clone)]
 pub struct HostArtifacts {
-    package: Arc<Package>,
+    package_identity: PackageIdentity,
+    model_path: PathBuf,
+    model_size_bytes: u64,
+    model_name: Option<String>,
+    model_architecture: Option<String>,
     family: &'static dyn ModelFamily,
     /// The definition at the served context bound.
     definition: ModelDefinition,
@@ -320,8 +326,31 @@ impl HostArtifacts {
             .input_adapter(&definition, &TokenizerMarkers(&tokenizer))
             .map_err(|error| ResolveError::Unsupported(error.into()))?
             .into();
+        let package_identity = package.identity();
+        let target = package.target();
+        let directory = target.directory();
+        let text = |key: &str| {
+            directory
+                .value(key)
+                .and_then(Value::string)
+                .map(str::to_owned)
+        };
+        let model_path = target
+            .sources()
+            .next()
+            .expect("a GGUF artifact has at least one shard")
+            .path()
+            .to_owned();
+        let model_size_bytes = target.sources().map(|source| source.size()).sum();
+        let model_name = text("general.name");
+        let model_architecture = text("general.architecture");
+        drop(package);
         Ok(Self {
-            package: Arc::new(package),
+            package_identity,
+            model_path,
+            model_size_bytes,
+            model_name,
+            model_architecture,
             family,
             definition,
             draft_unavailable,
@@ -360,12 +389,24 @@ impl HostArtifacts {
         Self::interpret(opened, None, None)
     }
 
-    pub fn package(&self) -> &Package {
-        &self.package
+    pub fn package_identity(&self) -> PackageIdentity {
+        self.package_identity
     }
 
-    pub fn shared_package(&self) -> Arc<Package> {
-        self.package.clone()
+    pub fn model_path(&self) -> &Path {
+        &self.model_path
+    }
+
+    pub fn model_size_bytes(&self) -> u64 {
+        self.model_size_bytes
+    }
+
+    pub fn model_name(&self) -> Option<&str> {
+        self.model_name.as_deref()
+    }
+
+    pub fn model_architecture(&self) -> Option<&str> {
+        self.model_architecture.as_deref()
     }
 
     pub fn family(&self) -> &'static dyn ModelFamily {

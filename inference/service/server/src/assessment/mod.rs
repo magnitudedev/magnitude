@@ -117,6 +117,15 @@ impl<K: Ord + Clone, V> BoundedMap<K, V> {
         self.entries.remove(key).map(|(_, value)| value)
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     fn evict_if_full(&mut self) {
         if self.entries.len() < self.capacity {
             return;
@@ -749,13 +758,18 @@ impl ManagedModelAssessments {
             .current
             .write()
             .expect("assessment state lock poisoned");
+        let was_settled = current.settled();
         if !mutate(&mut current) {
             return false;
         }
         current.snapshot.revision = current.snapshot.revision.saturating_add(1);
         let revision = current.snapshot.revision;
+        let now_settled = current.settled();
         self.host.observe(&current);
         drop(current);
+        if !was_settled && now_settled {
+            self.assessor.release_caches();
+        }
         self.changes.send_replace(revision);
         true
     }
@@ -1105,8 +1119,12 @@ impl ManagedModelAssessments {
             let applied = current.republish(&environment.id, state, &keys, &outcomes);
             current.snapshot.revision = current.snapshot.revision.saturating_add(1);
             let revision = current.snapshot.revision;
+            let now_settled = current.settled();
             service.host.observe(&current);
             drop(current);
+            if now_settled {
+                service.assessor.release_caches();
+            }
             log_dropped_catalog_models(applied.dropped_catalog_models);
             service.changes.send_replace(revision);
         });
@@ -1121,14 +1139,19 @@ impl ManagedModelAssessments {
             .current
             .write()
             .expect("assessment state lock poisoned");
+        let was_settled = current.settled();
         let applied = current.apply_outcome(&outcome);
         if !applied.changed {
             return;
         }
         current.snapshot.revision = current.snapshot.revision.saturating_add(1);
         let revision = current.snapshot.revision;
+        let now_settled = current.settled();
         self.host.observe(&current);
         drop(current);
+        if !was_settled && now_settled {
+            self.assessor.release_caches();
+        }
         log_dropped_catalog_models(applied.dropped_catalog_models);
         self.changes.send_replace(revision);
     }

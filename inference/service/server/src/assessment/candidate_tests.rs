@@ -6503,3 +6503,25 @@ fn walk_files(root: &std::path::Path) -> Vec<PathBuf> {
         })
         .collect()
 }
+
+#[tokio::test]
+async fn model_assessor_release_caches_clears_preparations() {
+    let (_dir, models) = bare_store().await;
+    let catalog = RecommendableModelCatalog {
+        models: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let resolver = ModelDomainResolver::new(Arc::clone(&models), catalog.clone());
+    let release = Arc::new(ReleaseCatalog::without_material(catalog).unwrap());
+    let assessor = ModelAssessor::new(models, resolver, release, cpu_environment());
+
+    let key = (
+        Arc::<str>::from("structure-1"),
+        magnitude_service_models::ServableModelBundleKey("bundle-1".to_owned()),
+    );
+    let _cell = assessor.preparation_cell(&key);
+    assert_eq!(assessor.preparation_cache_len(), 1);
+
+    assessor.release_caches();
+    assert_eq!(assessor.preparation_cache_len(), 0);
+}

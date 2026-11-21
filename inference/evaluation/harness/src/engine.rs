@@ -464,13 +464,16 @@ impl Engine {
         let vocabulary = usize::try_from(resolved.manifest.definition.decoder.vocabulary)
             .map_err(|_| "vocabulary exceeds the host domain")?;
         let method = resolved.manifest.model.method;
+        let package = std::sync::Arc::new(
+            magnitude_artifacts::Package::open_manifest(&resolved.manifest.package)
+                .map_err(|error| error.to_string())?,
+        );
         let (domain, bindings, _) = load_in_process(
             &resolved.manifest,
-            resolved.host.package(),
             |unprepared| {
                 load_native_domain(
                     &resolved.manifest,
-                    resolved.host.shared_package(),
+                    std::sync::Arc::clone(&package),
                     unprepared,
                 )
             },
@@ -479,7 +482,7 @@ impl Engine {
         )
         .map_err(|error| error.to_string())?;
         let device = domain.resources().device().clone();
-        let expert_ranges = expert_ranges(domain.expert_bank_plan(), resolved.host.package().target())?;
+        let expert_ranges = expert_ranges(domain.expert_bank_plan(), package.target())?;
         Ok(Self {
             domain,
             bindings: Some(bindings),

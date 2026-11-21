@@ -170,25 +170,11 @@ pub struct ModelProperties {
 
 pub fn model_properties(host: &HostArtifacts) -> Result<ModelProperties, ChatError> {
     let inspection = host.template_inspection().clone();
-    let target = host.package().target();
-    let directory = target.directory();
-    let text = |key: &str| {
-        directory
-            .value(key)
-            .and_then(|value| value.string())
-            .map(str::to_owned)
-    };
-    let mut sources = target.sources();
-    let model_path = sources
-        .next()
-        .expect("a GGUF artifact has at least one shard")
-        .path()
-        .to_owned();
     Ok(ModelProperties {
-        model_path,
-        model_size_bytes: target.sources().map(|source| source.size()).sum(),
-        name: text("general.name"),
-        architecture: text("general.architecture"),
+        model_path: host.model_path().to_path_buf(),
+        model_size_bytes: host.model_size_bytes(),
+        name: host.model_name().map(str::to_owned),
+        architecture: host.model_architecture().map(str::to_owned),
         context_tokens: host.definition().decoder.context_limit,
         training_context_tokens: host.declared_context_limit(),
         vision: host.media_placeholder().is_some(),

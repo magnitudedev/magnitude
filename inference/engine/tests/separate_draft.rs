@@ -290,7 +290,7 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
     let proposals = resolved.manifest.model.method.proposals();
     assert!(proposals > 0, "the load drafts");
     let (mut domain, mut bindings, _) =
-        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+        build_native_domain(&resolved.manifest, std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap())).unwrap();
     let tokens = resolved
         .host
         .shared_tokenizer()
@@ -423,7 +423,7 @@ fn header_only_assessment_charges_what_a_load_commits() {
 
     // Load the target and, through one draft transaction, the draft.
     let (mut domain, mut bindings, _) =
-        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+        build_native_domain(&resolved.manifest, std::sync::Arc::new(magnitude_artifacts::Package::open_manifest(&resolved.manifest.package).unwrap())).unwrap();
     let request = RequestId(1);
     open(&mut domain, &mut bindings, request, None);
     let tokens = [1, 2, 3, 4, 5].map(TokenId);
