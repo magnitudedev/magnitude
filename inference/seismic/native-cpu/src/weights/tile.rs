@@ -66,19 +66,21 @@ pub struct Side {
 
 /// Direct coefficients' sums: per activation row `a` and weight row `r`,
 /// the single-row dot's fused sum over the units added so far, in unit
-/// order (`fma(scale, Σ code a, sum)`, then with a bias `fma(bias, Σ a,
-/// sum)`), before the activation row's scale. Each unit's integers are
-/// combined as the core forms them, so no unit's are kept.
+/// order (`fma(d_p, scale * Σ code a + bias * Σ a, sum)`). Each unit's
+/// integers are combined as the core forms them, so no unit's are kept.
 pub struct Sums<const W: usize> {
     pub(super) values: [[f32; 8]; W],
 }
 
-/// Integer-unit coefficients' exact integers: per activation row and weight
-/// row the block's `scaled` (`Σ_u widen_u Σ code a`, of true code values)
-/// and `minimums` (`Σ_u minimum_u Σ a`).
+/// Integer-unit coefficients' accumulated sums: per activation row and
+/// weight row the block's `scaled` (`Σ_p d_p (Σ_{u∈p} widen_u Σ code a)`)
+/// and `minimums` (`Σ_p d_p (Σ_{u∈p} minimum_u Σ a)`), formed packet by
+/// packet in `f32` from each packet's exact `i32` sums.
 pub struct Scaled<const W: usize> {
-    pub(super) scaled: [[i32; 8]; W],
-    pub(super) minimums: [[i32; 8]; W],
+    pub(super) scaled: [[f32; 8]; W],
+    pub(super) minimums: [[f32; 8]; W],
+    packet_scaled: [[i32; 8]; W],
+    packet_minimums: [[i32; 8]; W],
 }
 
 /// A coefficient component's exact integers of a block against a strip of
@@ -108,11 +110,11 @@ impl<const W: usize> Integers<W> for Sums<W> {
     #[inline(always)]
     fn add<K: Coefficients, const R: usize>(&mut self, u: usize, a: usize, sums: [i32; 8], side: &Side, x: &Q8Tile<R>) {
         let codes = if K::BIASED { unit_sum(x, K::UNIT, u, a) } else { 0 };
+        let d = x.d[a][u * K::UNIT / PACKET];
         for (r, value) in self.values[a].iter_mut().enumerate() {
-            *value = side.scales[u][r].mul_add(sums[r] as f32, *value);
-            if K::BIASED {
-                *value = side.biases[u][r].mul_add(codes as f32, *value);
-            }
+            let term = side.scales[u][r] * sums[r] as f32;
+            let term = if K::BIASED { side.biases[u][r].mul_add(codes as f32, term) } else { term };
+            *value = d.mul_add(term, *value);
         }
     }
 
@@ -124,16 +126,37 @@ impl<const W: usize> Integers<W> for Sums<W> {
 }
 
 impl<const W: usize> Integers<W> for Scaled<W> {
-    const ZERO: Self = Self { scaled: [[0; 8]; W], minimums: [[0; 8]; W] };
+    const ZERO: Self = Self {
+        scaled: [[0.0; 8]; W],
+        minimums: [[0.0; 8]; W],
+        packet_scaled: [[0; 8]; W],
+        packet_minimums: [[0; 8]; W],
+    };
 
-    /// The unit added into `scaled`, and its minimums from the block sums.
+    /// The unit added into the packet's `scaled` and `minimums`, flushed
+    /// into the block's `f32` sums at the end of each packet.
     #[inline(always)]
     fn add<K: Coefficients, const R: usize>(&mut self, u: usize, a: usize, sums: [i32; 8], side: &Side, x: &Q8Tile<R>) {
-        let codes = unit_sum(x, K::UNIT, u, a);
-        let (scaled, minimums) = (&mut self.scaled[a], &mut self.minimums[a]);
+        let codes = if K::BIASED { unit_sum(x, K::UNIT, u, a) } else { 0 };
+        let (ps, pm) = (&mut self.packet_scaled[a], &mut self.packet_minimums[a]);
         for (r, sum) in sums.into_iter().enumerate() {
-            scaled[r] += sum;
-            minimums[r] += side.minimums[u][r] * codes;
+            ps[r] += sum;
+            if K::BIASED {
+                pm[r] += side.minimums[u][r] * codes;
+            }
+        }
+        let units_per_packet = PACKET / K::UNIT;
+        if u % units_per_packet == units_per_packet - 1 {
+            let d = x.d[a][u / units_per_packet];
+            let (scaled, minimums) = (&mut self.scaled[a], &mut self.minimums[a]);
+            for r in 0..8 {
+                scaled[r] = d.mul_add(ps[r] as f32, scaled[r]);
+                ps[r] = 0;
+                if K::BIASED {
+                    minimums[r] = d.mul_add(pm[r] as f32, minimums[r]);
+                    pm[r] = 0;
+                }
+            }
         }
     }
 

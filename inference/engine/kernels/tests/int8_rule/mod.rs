@@ -33,7 +33,7 @@ pub enum Grid {
 pub fn cpu(values: &[f32; GROUP]) -> (f32, [i8; GROUP]) {
     let mut block = [Q8Block::ZERO];
     quant::quantize(values, &mut block);
-    (block[0].scale(), block[0].codes()[..GROUP].try_into().unwrap())
+    (block[0].scales()[0], block[0].codes()[..GROUP].try_into().unwrap())
 }
 
 /// The rule on `grid`: the CPU's quantizer on F32, and on F16 the same rule

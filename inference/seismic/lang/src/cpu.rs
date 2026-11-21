@@ -6,16 +6,21 @@
 //! them.
 
 /// Values of one CPU INT8 activation block (`quant::Q8Block`, the k-quant
-/// super block): its `i8` codes, then the `i16` sums of each 16, then its
-/// `f32` scale.
+/// super block): its `i8` codes, then the `i16` sums of each 16, then the
+/// `f32` scales of each 32-value sub-block.
 pub const CPU_Q8_VALUES: u64 = 256;
+/// Values per quantized activation scale group (one packet, matching CUDA
+/// and Metal's INT8 staging).
+pub const CPU_Q8_GROUP: u64 = 32;
 /// The alignment of a CPU INT8 activation block: the widest vector of any
 /// CPU tier (`isa::Tier::vector_bytes`, the X86V4 tiers' 512-bit), so no
 /// vector load of its codes straddles a cache line, wherever a block lies.
 pub const CPU_Q8_ALIGNMENT: u64 = 64;
 /// Bytes of one CPU INT8 activation block, its fields padded to its
 /// alignment.
-pub const CPU_Q8_BYTES: u64 = (CPU_Q8_VALUES + CPU_Q8_VALUES / 16 * 2 + 4).next_multiple_of(CPU_Q8_ALIGNMENT);
+pub const CPU_Q8_BYTES: u64 =
+    (CPU_Q8_VALUES + CPU_Q8_VALUES / 16 * 2 + CPU_Q8_VALUES / CPU_Q8_GROUP * 4)
+        .next_multiple_of(CPU_Q8_ALIGNMENT);
 
 /// Activation rows of one CPU INT8 tile (`quant::Q8Tile`), the tile
 /// kernel's strip: several rows quantized for one projection lie as tiles

@@ -225,8 +225,6 @@ trait Lanes {
     type V: Copy;
     /// Steps of four columns a weight vector holds.
     const STEPS: usize;
-    /// Pairs of 16-value groups a side vector holds.
-    const PAIRS: usize;
 
     unsafe fn zero() -> Self::V;
 
@@ -248,13 +246,6 @@ trait Lanes {
     /// the low half with the high zero (`low`).
     unsafe fn codes(codes: &[i32; 8], low: bool) -> Self::V;
 
-    /// Side vector `slot`: the group pairs `pairs` holds for it, of which
-    /// `0..live` are the block's.
-    unsafe fn side(pairs: &[[i32; 8]; Q8_BLOCK / PACKET], slot: usize, live: usize) -> Self::V;
-
-    /// Activation row `a`'s block sums of side vector `slot`'s group pairs.
-    unsafe fn sums<const R: usize>(x: &Q8Tile<R>, slot: usize, a: usize) -> Self::V;
-
     /// Each row's lanes added.
     unsafe fn rows(acc: Self::V) -> __m256i;
 }
@@ -262,10 +253,23 @@ trait Lanes {
 /// 256-bit lanes, a row each: [`Lanes`].
 struct Step;
 
+impl Step {
+    /// Side vector `slot`: the group pair `pairs` holds for packet `slot`.
+    #[inline(always)]
+    unsafe fn side(pairs: &[[i32; 8]; Q8_BLOCK / PACKET], slot: usize) -> __m256i {
+        unsafe { _mm256_loadu_si256(pairs[slot].as_ptr().cast()) }
+    }
+
+    /// Activation row `a`'s block sums of packet `slot`'s two 16-value groups.
+    #[inline(always)]
+    unsafe fn sums<const R: usize>(x: &Q8Tile<R>, slot: usize, a: usize) -> __m256i {
+        unsafe { _mm256_set1_epi32(x.sums[a].as_ptr().add(2 * slot).cast::<i32>().read_unaligned()) }
+    }
+}
+
 impl Lanes for Step {
     type V = __m256i;
     const STEPS: usize = 1;
-    const PAIRS: usize = 1;
 
     #[inline(always)]
     unsafe fn zero() -> __m256i {
@@ -312,16 +316,6 @@ impl Lanes for Step {
     }
 
     #[inline(always)]
-    unsafe fn side(pairs: &[[i32; 8]; Q8_BLOCK / PACKET], slot: usize, _: usize) -> __m256i {
-        unsafe { _mm256_loadu_si256(pairs[slot].as_ptr().cast()) }
-    }
-
-    #[inline(always)]
-    unsafe fn sums<const R: usize>(x: &Q8Tile<R>, slot: usize, a: usize) -> __m256i {
-        unsafe { _mm256_set1_epi32(x.sums[a].as_ptr().add(2 * slot).cast::<i32>().read_unaligned()) }
-    }
-
-    #[inline(always)]
     unsafe fn rows(acc: __m256i) -> __m256i {
         acc
     }
@@ -333,7 +327,6 @@ struct Pair;
 impl Lanes for Pair {
     type V = __m512i;
     const STEPS: usize = 2;
-    const PAIRS: usize = 2;
 
     #[inline(always)]
     unsafe fn zero() -> __m512i {
@@ -369,20 +362,6 @@ impl Lanes for Pair {
     #[inline(always)]
     unsafe fn codes(codes: &[i32; 8], low: bool) -> __m512i {
         unsafe { _mm512_permutexvar_epi32(load(&DUPLICATE), _mm512_castsi256_si512(Step::codes(codes, low))) }
-    }
-
-    #[inline(always)]
-    unsafe fn side(pairs: &[[i32; 8]; Q8_BLOCK / PACKET], slot: usize, live: usize) -> __m512i {
-        unsafe {
-            let first = _mm256_loadu_si256(pairs[2 * slot].as_ptr().cast());
-            let second = if 2 * slot + 1 < live { _mm256_loadu_si256(pairs[2 * slot + 1].as_ptr().cast()) } else { _mm256_setzero_si256() };
-            _mm512_permutex2var_epi32(_mm512_castsi256_si512(first), load(&INTERLEAVE), _mm512_castsi256_si512(second))
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn sums<const R: usize>(x: &Q8Tile<R>, slot: usize, a: usize) -> __m512i {
-        unsafe { _mm512_set1_epi64(x.sums[a].as_ptr().add(4 * slot).cast::<i64>().read_unaligned()) }
     }
 
     #[inline(always)]
@@ -589,34 +568,40 @@ unsafe fn block<L: Lanes, P: Multiply<L>, K: Coefficients, V: Vectors, S: Source
     together: usize,
     least: i32,
 ) -> Scaled<W> {
-    let (count, ops) = (packets * PACKET / K::UNIT, K::UNIT / 4 / L::STEPS);
-    let mut out = Scaled { scaled: [[0; 8]; W], minimums: [[0; 8]; W] };
+    let (units_per_packet, ops) = (PACKET / K::UNIT, K::UNIT / 4 / L::STEPS);
+    let mut out = Scaled::ZERO;
     unsafe {
-        let mut scaled = [L::zero(); W];
-        for u in 0..count {
-            let codes = L::codes(&side.widen[u], P::DOTS32);
-            unit::<L, P, V, S, W, R>(source, x, u, ops, together, Some(codes), &mut scaled);
-        }
-        // The shift's correction into `scaled`, and the minimums.
-        let mut minimums = [L::zero(); W];
-        if least != 0 || K::BIASED {
-            for slot in 0..packets.div_ceil(L::PAIRS) {
-                let (shift, minimum) = (L::side(&side.pairs[0], slot, packets), L::side(&side.pairs[1], slot, packets));
-                for a in 0..W {
-                    let sums = L::sums(x, slot, a);
+        let mut scaled_f = [_mm256_setzero_ps(); W];
+        let mut minimums_f = [_mm256_setzero_ps(); W];
+        for local in 0..packets {
+            let mut packet_scaled = [L::zero(); W];
+            for h in 0..units_per_packet {
+                let u = local * units_per_packet + h;
+                let codes = L::codes(&side.widen[u], P::DOTS32);
+                unit::<L, P, V, S, W, R>(source, x, u, ops, together, Some(codes), &mut packet_scaled);
+            }
+            let shift = if least != 0 { Step::side(&side.pairs[0], local) } else { Step::zero() };
+            let minimum = if K::BIASED { Step::side(&side.pairs[1], local) } else { Step::zero() };
+            for a in 0..W {
+                let mut ps = L::rows(packet_scaled[a]);
+                let d = _mm256_set1_ps(x.d[a][local]);
+                if least != 0 || K::BIASED {
+                    let sums = Step::sums(x, local, a);
                     if least != 0 {
-                        scaled[a] = L::widen::<V>(scaled[a], sums, shift);
+                        ps = Step::widen::<V>(ps, sums, shift);
                     }
                     if K::BIASED {
-                        minimums[a] = L::widen::<V>(minimums[a], sums, minimum);
+                        let pm = Step::widen::<V>(Step::zero(), sums, minimum);
+                        minimums_f[a] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(pm), minimums_f[a]);
                     }
                 }
+                scaled_f[a] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(ps), scaled_f[a]);
             }
         }
         for a in 0..W {
-            _mm256_storeu_si256(out.scaled[a].as_mut_ptr().cast(), L::rows(scaled[a]));
+            _mm256_storeu_ps(out.scaled[a].as_mut_ptr(), scaled_f[a]);
             if K::BIASED {
-                _mm256_storeu_si256(out.minimums[a].as_mut_ptr().cast(), L::rows(minimums[a]));
+                _mm256_storeu_ps(out.minimums[a].as_mut_ptr(), minimums_f[a]);
             }
         }
     }

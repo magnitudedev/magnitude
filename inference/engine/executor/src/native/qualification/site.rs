@@ -75,7 +75,22 @@ pub(crate) fn admit_site(charges: &seismic::Charges, request: &SiteRequest) -> R
     let _flight = handle.flight().expect("a site of one layer");
     let layer = &handle.layers()[0];
 
-    let values = pattern(rows * hidden, 7, 1.0);
+    // Normalize the qualification inputs so stage-1 pre-activations (`gate`,
+    // `up`) have O(1) variance regardless of the synthetic `finite_source`
+    // weight scale (whose RMS can be ~1000x larger than trained weights):
+    // Q8 quantization is scale-equivariant, while `GluLimit` clamps at a
+    // fixed physical threshold.
+    let rms = |values: &[f32]| -> f64 {
+        let mean_sq = values.iter().map(|value| f64::from(*value) * f64::from(*value)).sum::<f64>() / values.len().max(1) as f64;
+        mean_sq.sqrt()
+    };
+    let weight_rms = held.gate.as_ref().map_or_else(|| rms(&held.up.values), |gate| rms(&held.up.values).max(rms(&gate.values)));
+    let input_scale = if weight_rms > 0.0 && weight_rms.is_finite() {
+        ((3.0 / hidden as f64).sqrt() / weight_rms) as f32
+    } else {
+        1.0
+    };
+    let values = pattern(rows * hidden, 7, input_scale);
     let weights = pattern(rows * choices, 11, 0.5).iter().map(|weight| weight.abs() + 0.25).collect::<Vec<_>>();
     let entries =
         (0..rows * choices).map(|entry| (entry / choices, entry % records, weights[entry], entry % records)).collect::<Vec<_>>();
@@ -195,4 +210,63 @@ fn held_records(charges: &seismic::Charges, tensor: RecordTensor, count: u64, se
         values.extend(records.values(index));
     }
     Ok(Held { records, values })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assessment::{CpuForm, SiteRequest};
+    use crate::planning::RecordTensors;
+    use magnitude_family_contracts::GluLimit;
+
+    /// Gated + clamped (`GluLimit(10.0)`) low-bit CPU sites matching
+    /// `glm-5.3-flash` geometry (`H = 4096`, `F = 1536`, `K = 8`) are admitted
+    /// under the standard BF16 precision requirement (`alpha = 8.0`) against
+    /// the F64 reference.
+    #[test]
+    fn gated_clamped_low_bit_cpu_sites_are_admitted() {
+        let _placement = crate::test_support::process_placement();
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let requirement = ResolvedNumericalProfile::standard().requirement_of(Some(seismic::DType::BF16));
+        let limit = Some(GluLimit::new(10.0).unwrap());
+        let (hidden, features) = (4096u64, 1536u64);
+        for (source_name, resident_name) in [
+            ("gguf_iq2_xxs", "iq2xxs@mma16"),
+            ("gguf_iq2_xxs", "iq2xxs@rows16"),
+            ("gguf_iq3_xxs", "iq3xxs@mma16"),
+            ("gguf_iq3_xxs", "iq3xxs@rows16"),
+        ] {
+            let source = Element::named(source_name).unwrap_or_else(|| panic!("unknown source element {source_name}"));
+            let resident = Element::named(resident_name).unwrap_or_else(|| panic!("unknown resident element {resident_name}"));
+            let tensor = |matrix| RecordTensor { source, resident, matrix };
+            let request = SiteRequest {
+                form: CpuForm {
+                    record: RecordTensors {
+                        gate: Some(tensor([features, hidden])),
+                        up: tensor([features, hidden]),
+                        down: tensor([hidden, features]),
+                    },
+                    choices: 8,
+                    experts: 128,
+                    function: functions::SILU,
+                    limit,
+                    flight: 2,
+                    widest: magnitude_kernels::constants::VERIFY_ROWS * 8,
+                },
+                tier: 4,
+                activation: Element::bf16(),
+                requirement: requirement.clone(),
+            };
+            let verdict = admit_site(&charges, &request).unwrap_or_else(|error| panic!("{resident_name}: pool failed: {error}"));
+            assert!(verdict.is_ok(), "{resident_name} with GluLimit(10.0) refused: {}", verdict.unwrap_err());
+            let tight = SiteRequest {
+                requirement: seismic::NumericalRequirement::RoundingSteps { alpha: 0.01, activation: Some(seismic::DType::BF16) },
+                ..request
+            };
+            let refused = admit_site(&charges, &tight).unwrap_or_else(|error| panic!("{resident_name}: pool failed: {error}"));
+            let reason = refused.expect_err("alpha 0.01 must refuse q8 arithmetic");
+            eprintln!("{resident_name} GluLimit(10.0) tight check: {reason}");
+        }
+    }
 }
