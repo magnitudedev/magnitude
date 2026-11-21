@@ -427,7 +427,7 @@ pub(in crate::experts) struct Scheduled {
 /// How an executor admits a read ahead: whether an aggregate probability
 /// `p` of use reaches the break-even of a read of its expert's bytes,
 /// whatever source named it (a calibrated `p` is all that tells sources
-/// apart; the break-even is the executor's, `watcher::passes::MissCost`).
+/// apart; the break-even is the cost model's, `magnitude_cost_model::ReadAdmission`).
 /// Asked only of a read short of due, so a due read is never priced.
 pub(in crate::experts) trait Admit {
     fn admits(&self, p: f64) -> bool;

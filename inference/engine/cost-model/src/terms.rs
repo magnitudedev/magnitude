@@ -97,7 +97,7 @@ mod tests {
         const CODE: [f64; 8] = [0.0334, 0.0356, 0.0375, 0.0396, 0.0419, 0.0445, 0.0475, 0.0508];
         let depth = |terms: Terms| {
             let paths = terms.each_path().map(|seconds| crate::PathTerm { seconds, wasted: crate::Waste { front: vec![None; 8], verify: vec![None; 8] } }).to_vec();
-            crate::Regime { resident: CODE.to_vec(), needed: crate::NeededByForm::both((0..8).map(|k| crate::Needed::Executed(1. - k as f64 / 40.)).collect()), stand: None, accepts: vec![None; 7], stall: None, overhead: None, paths }.depth()
+            crate::Regime { resident: CODE.to_vec(), needed: crate::NeededByForm::both((0..8).map(|k| crate::Needed::Executed(1. - k as f64 / 40.)).collect()), stand: None, accepts: vec![None; 7], stall: None, overhead: None, paths, routes: crate::VerifyRoutes::default() }.depth()
         };
         assert_eq!((depth(unified), depth(resident)), (7, 0), "unified: the drive, else the GPU");
         assert_eq!((depth(fits), depth(short)), (3, 7), "discrete: the link, else the drive");

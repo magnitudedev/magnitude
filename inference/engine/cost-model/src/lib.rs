@@ -50,7 +50,7 @@ pub use expert_lines::{
 };
 pub use launch::{FrontRoutes, LaunchPrices, TargetCensus};
 pub use lines::{FileLine, ReadLine, RecordLine};
-pub use regime::{Form, Needed, NeededByForm, PathTerm, Regime, Waste};
+pub use regime::{Form, Needed, NeededByForm, PathTerm, ReadAdmission, Regime, VerifyRoutes, Waste};
 pub use step::{LayerLoad, LayerRun, Lead, ReadAhead, StepInputs, StepTime};
 pub use terms::Terms;
 pub use streamed::{step_inputs, DecodePrice, FormSeconds, HeldSlots, LayerReads, LiveDecode, StreamedLayers, StreamedStep};

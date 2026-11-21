@@ -487,16 +487,16 @@ impl IdleBudget {
             return rem;
         }
         let c_layer = if self.layers == 0 { 0.0 } else { price.compute() / self.layers as f64 };
-        let queued: f64 = self.queued_bytes.iter().map(|&bytes| price.read_seconds(bytes)).sum();
+        let queued: f64 = self.queued_bytes.iter().map(|&bytes| price.transfer_seconds(bytes)).sum();
         let rem = (c_layer - queued).max(0.0);
         self.remaining.set(Some(rem));
         rem
     }
 
-    fn consume(&self, price: &super::telemetry::ReadPrice, read_seconds: f64) {
+    fn consume(&self, price: &super::telemetry::ReadPrice, transfer_seconds: f64) {
         let rem = self.get(price);
         if rem > 0.0 {
-            self.remaining.set(Some((rem - read_seconds).max(0.0)));
+            self.remaining.set(Some((rem - transfer_seconds).max(0.0)));
         }
     }
 }
@@ -515,7 +515,7 @@ impl Admit for Admitting<'_> {
         let price = self.priced.get();
         let admitted = price.admits_with_idle(p, self.bytes, self.idle.get(price));
         if admitted {
-            self.idle.consume(price, price.read_seconds(self.bytes));
+            self.idle.consume(price, price.transfer_seconds(self.bytes));
         }
         admitted
     }
@@ -1420,14 +1420,15 @@ mod tests {
     #[test]
     fn shared_drive_idle_budget_counts_demand_and_cross_layer_reads() {
         let layers = 35;
-        let bytes = 1_000_000_u64; // 1 MB -> 1.0 ms on 1 GB/s line
-        let line = ReadLine::new(0., 1e-9).expect("a line");
+        let bytes = 1_000_000_u64; // 1 MB -> t_bw = 1.0 ms on 1 GB/s line (plus 0.3 ms latency, ignored by pipelined IdleBudget)
+        let line = ReadLine::new(0.3e-3, 1e-9).expect("a line");
         let mut passes = Passes::new(Time::new(&[vec![1]], 8));
         // compute = 0.1 - 0.065 = 0.035 s -> c_layer = 0.035 / 35 = 0.001 s (1.0 ms).
-        // Drive-bound (0.068 > 0.035), stall = 0.065 / 68 ≈ 0.956 ms <= read = 1.0 ms ->
-        // break_even(1.0 ms, 0.0) = 1.0 (only a certain read pays with no idle window).
+        // Drive-bound (0.068 > 0.035), stall = 0.065 / 68 ≈ 0.956 ms <= t_bw = 1.0 ms ->
+        // break_even(1.0 ms, 0.0) = (1.0 / 0.956).min(1.0) = 1.0 (only a certain read pays with no idle window).
         passes.timed(Pass { rows: 1, depth: 0, seconds: 0.1, parked: 0.065, misses: 68., drive: 0.068, ..Pass::default() });
-        let price = ReadPrice::priced(passes.miss_cost(), line);
+        let price = ReadPrice::priced(passes.read_admission(Some(line)));
+        assert!((price.transfer_seconds(bytes) - 1e-3).abs() < 1e-12, "IdleBudget uses pipelined t_bw, not lambda + t_bw");
         assert!(!price.admits_with_idle(0.30, bytes, 0.0) && !price.admits_with_idle(0.52, bytes, 0.0) && price.admits_with_idle(1.0, bytes, 0.0));
 
         let time = Time::new(&[vec![2, 2]], 32);
@@ -1437,11 +1438,11 @@ mod tests {
         let seen = HashSet::from([(1, 0)]);
 
         // Empty drive: `idle == c_layer == 1.0 ms`, so one 30% hint is admitted
-        // and consumes the shared budget, leaving 0.0 for the next candidate.
+        // and consumes the shared budget (`t_bw = 1.0 ms`), leaving 0.0 for the next candidate.
         let idle = IdleBudget::new(layers, prefetch.drive_queued_bytes(|_| bytes, &seen));
         assert!((idle.get(&price) - 1e-3).abs() < 1e-12);
         assert!(price.admits_with_idle(0.30, bytes, idle.get(&price)));
-        idle.consume(&price, price.read_seconds(bytes));
+        idle.consume(&price, price.transfer_seconds(bytes));
         assert_eq!(idle.get(&price), 0.0);
         assert!(!price.admits_with_idle(0.30, bytes, idle.get(&price)));
 

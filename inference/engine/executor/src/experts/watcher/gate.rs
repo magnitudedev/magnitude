@@ -7,7 +7,7 @@
 //! (`LaunchPrices::hint`, the cost model's one price source). Each lead ℓ's
 //! per-step saving at its target layer `l` is priced from the counterfactual
 //! demand cohort (`interest::Cohort`, `interest::CohortRates`) and the cost
-//! model's single owner of layer demand stall (`passes::MissCost::layer_stall`):
+//! model's single owner of layer demand stall (`magnitude_cost_model::ReadAdmission::layer_stall`):
 //!
 //!   `stall_l(m) − stall_l(m − exclusive_ℓ · cohort_l)`
 //!
@@ -36,10 +36,9 @@
 //! word is valid for any step: the gate moves what a pass costs, never what
 //! it computes.
 
-use super::passes::MissCost;
 use crate::experts::horizon::{Hold, Time, Tokens};
 use crate::experts::interest::{Caught, Cohort, CohortRates, HINT_LEADS};
-use magnitude_cost_model::LaunchPrices;
+use magnitude_cost_model::{LaunchPrices, ReadAdmission};
 
 /// One-sided sub-Gaussian confidence multiplier derived from the live cost
 /// ratio of a wrong flip (pipeline break `pass`) to the per-step launch cost
@@ -144,7 +143,7 @@ impl HintGate {
     /// Where the load's prices refuse a hint launch, or price none for a
     /// layer that hints: its census makes every hinting layer's hint
     /// launch (`LayerCall::Hint`).
-    pub(super) fn decide(&mut self, resolved: &[bool], prices: Option<&LaunchPrices>, miss: MissCost, pass: Option<(u32, f64)>) -> Vec<bool> {
+    pub(super) fn decide(&mut self, resolved: &[bool], prices: Option<&LaunchPrices>, miss: ReadAdmission, pass: Option<(u32, f64)>) -> Vec<bool> {
         let (Some(prices), Some((rows, pass))) = (prices, pass) else {
             return self.decided.clone();
         };
@@ -224,7 +223,7 @@ impl HintGate {
     /// - `lower_for_on` uses `(exclusive_point, cohort_lo)` at `z`: a stopped
     ///   layer flips ON only when its measured exclusive rate and lower cohort
     ///   bound repay its launch price (never turning on with `exclusive == 0`).
-    fn saving_bounds(&mut self, layer: usize, resolved: &[bool], miss: MissCost, epoch: u64, now: Tokens, z: f64) -> Option<(f64, f64, f64)> {
+    fn saving_bounds(&mut self, layer: usize, resolved: &[bool], miss: ReadAdmission, epoch: u64, now: Tokens, z: f64) -> Option<(f64, f64, f64)> {
         let (mut point, mut lower, mut upper) = (0.0, 0.0, 0.0);
         for (index, &target) in self.targets[layer].iter().enumerate() {
             if resolved[target] {
@@ -237,7 +236,7 @@ impl HintGate {
             let (excl_share, _) = self.rates.exclusive_share(lead, epoch, now)?;
             let excl = excl_share.rate();
             let excl_hi = excl_share.wilson(z).1;
-            let delta = |m: f64, e: f64| miss.layer_stall(target, m) - miss.layer_stall(target, (m - e * m).max(0.0));
+            let delta = |m: f64, e: f64| miss.layer_stall(m) - miss.layer_stall((m - e * m).max(0.0));
             point += delta(cohort, excl);
             lower += delta(cohort_lo, excl);
             upper += delta(cohort_hi, excl_hi);
@@ -246,7 +245,7 @@ impl HintGate {
     }
 
     #[cfg(test)]
-    fn saving(&mut self, layer: usize, resolved: &[bool], miss: MissCost, epoch: u64, now: Tokens) -> f64 {
+    fn saving(&mut self, layer: usize, resolved: &[bool], miss: ReadAdmission, epoch: u64, now: Tokens) -> f64 {
         let mut total = 0.0;
         for (index, &target) in self.targets[layer].iter().enumerate() {
             if resolved[target] {
@@ -258,7 +257,7 @@ impl HintGate {
             let lead = (index + 1) as u8;
             let exclusive = self.rates.exclusive(lead, epoch, now).rate();
             let remaining = (cohort - exclusive * cohort).max(0.0);
-            total += miss.layer_stall(target, cohort) - miss.layer_stall(target, remaining);
+            total += miss.layer_stall(cohort) - miss.layer_stall(remaining);
         }
         total
     }
@@ -313,10 +312,10 @@ mod tests {
         table_for(&[0])
     }
 
-    fn miss_cost(time: &Time, stall_per_miss: f64) -> MissCost {
+    fn miss_cost(time: &Time, stall_per_miss: f64) -> ReadAdmission {
         let mut passes = Passes::new(time.clone());
         passes.timed(Pass { rows: 1, depth: 0, seconds: 0.01, parked: stall_per_miss, misses: 1.0, ..Pass::default() });
-        passes.miss_cost()
+        passes.read_admission(None)
     }
 
     fn catchers(leads: &[u8]) -> Catchers {
@@ -557,7 +556,7 @@ mod tests {
         let mut gate = HintGate::new(vec![vec![1], Vec::new()], time.clone());
         time.lock().register(1, Advance::Known(Tokens::new(1.0)));
         gate.resolved(&[Cohort { step: 1, layer: 1, misses: 0, saved: Vec::new() }]);
-        assert_eq!(gate.decide(&[false, true], None, MissCost::default(), Some((1, 0.01))), [true, false]);
-        assert_eq!(gate.decide(&[false, true], Some(&table()), MissCost::default(), None), [true, false]);
+        assert_eq!(gate.decide(&[false, true], None, ReadAdmission::default(), Some((1, 0.01))), [true, false]);
+        assert_eq!(gate.decide(&[false, true], Some(&table()), ReadAdmission::default(), None), [true, false]);
     }
 }
