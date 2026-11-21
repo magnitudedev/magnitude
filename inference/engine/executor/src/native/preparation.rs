@@ -45,7 +45,8 @@ use crate::operators::routed::fused_graph::DecodeForm;
 use crate::operators::streams::{BlockStreams, SinkhornBinding, SiteEntryBindings};
 use crate::programs::invocation_demand::{GraphInvocationDemand, InvocationCounts};
 use crate::{
-    DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ReadoutHead, RecurrentForm, ShortConvBinding,
+    DenseBinding, DraftProgramPlan, DrafterProgramPlan, GeneralRoutedBinding, HeadProgramPlan,
+    ModelLoadPlan, ReadoutHead, RecurrentForm, SharedHeadProgramPlan, ShortConvBinding,
     StateSpaceBinding, SublayerTail,
 };
 use magnitude_family_contracts::{
@@ -72,6 +73,14 @@ use std::{cell::RefCell, rc::Rc};
 /// Each recipe's formed levels, by the programs they are.
 type ReadoutRecipeStates = Rc<RefCell<HashMap<String, RecipePreparation>>>;
 
+/// The active drafter's prepared kernels, mutually exclusive by construction.
+#[derive(Debug)]
+pub(super) enum PreparedDrafter {
+    Head(Box<HeadKernels>),
+    SharedHead(Box<SharedHeadKernels>),
+    Draft(Box<DraftKernels>),
+}
+
 /// The phase-one catalog. Every handle is prepared before qualification and
 /// retained for warm calls; this type has no API capable of preparing again.
 #[derive(Debug)]
@@ -80,9 +89,7 @@ pub(super) struct NativePreparationCache {
     pub(super) import: ImportKernels,
     pub(super) glue: GlueKernels,
     pub(super) target: TargetKernels,
-    pub(super) head: Option<HeadKernels>,
-    pub(super) shared_head: Option<SharedHeadKernels>,
-    pub(super) draft: Option<DraftKernels>,
+    pub(super) drafter: Option<PreparedDrafter>,
     pub(super) vision: Option<VisionKernels>,
     pub(super) tuned: Vec<TunedEntry>,
     /// Units prepared at their canonical defaults for want of a stored
@@ -233,7 +240,7 @@ impl NativePreparationCache {
         let invocations = invocation_demand(&walks, device, load, objective)?;
         let demanded = began.elapsed();
         let forming = device.programs_formed();
-        let (glue, target, head, shared_head, draft, vision, tuned, unprepared, readout_choices) = {
+        let (glue, target, drafter, vision, tuned, unprepared, readout_choices) = {
             let mut preparation = walks.preparation(
                 spec,
                 Tuning::Tuner(Tuner::serve(
@@ -249,9 +256,7 @@ impl NativePreparationCache {
             let Preparation {
                 tuning,
                 target,
-                head,
-                shared_head,
-                draft,
+                drafter,
                 vision,
                 readout_choices,
                 ..
@@ -261,9 +266,7 @@ impl NativePreparationCache {
             (
                 glue,
                 target,
-                head,
-                shared_head,
-                draft,
+                drafter,
                 vision,
                 tuner.conclude(),
                 unprepared,
@@ -289,9 +292,7 @@ impl NativePreparationCache {
             import,
             glue,
             target,
-            head,
-            shared_head,
-            draft,
+            drafter,
             vision,
             tuned,
             unprepared,
@@ -564,9 +565,11 @@ impl Walks<'_> {
             resident_downs: HashMap::new(),
             resident_choices: HashMap::new(),
             resident_gate_ups: HashMap::new(),
-            head: self.plan.head().map(|_| HeadKernels::default()),
-            shared_head: self.plan.shared_head().map(|_| SharedHeadKernels::default()),
-            draft: self.plan.draft().map(|_| DraftKernels::default()),
+            drafter: self.plan.drafter().map(|drafter| match drafter {
+                DrafterProgramPlan::Head(_) => PreparedDrafter::Head(Box::default()),
+                DrafterProgramPlan::SharedHead(_) => PreparedDrafter::SharedHead(Box::default()),
+                DrafterProgramPlan::Draft(_) => PreparedDrafter::Draft(Box::default()),
+            }),
             vision: self.plan.vision().map(|_| VisionKernels::default()),
             search: None,
         }
@@ -704,9 +707,7 @@ struct Preparation<'a> {
     /// Each gated general binding's resident gate/up, which a streamed
     /// layer's gate/up passes follow.
     resident_gate_ups: HashMap<GeneralRoutedBinding, RoutedGateUpTuning>,
-    head: Option<HeadKernels>,
-    shared_head: Option<SharedHeadKernels>,
-    draft: Option<DraftKernels>,
+    drafter: Option<PreparedDrafter>,
     vision: Option<VisionKernels>,
     /// The search whose units the walk prepares; none for a walk of every
     /// entry (a load's, a demand walk or a listing).
@@ -874,9 +875,12 @@ impl<'a> Preparation<'a> {
             self.tuning.set_invocations(demand.target.clone(), true);
         }
         self.target(plan)?;
-        self.head(plan)?;
-        self.shared_head(plan)?;
-        self.draft(plan)?;
+        match plan.drafter() {
+            Some(DrafterProgramPlan::Head(head)) => self.head(head)?,
+            Some(DrafterProgramPlan::SharedHead(head)) => self.shared_head(head)?,
+            Some(DrafterProgramPlan::Draft(draft)) => self.draft(draft)?,
+            None => {}
+        }
         self.vision(plan)?;
         Ok(glue)
     }
@@ -3273,15 +3277,12 @@ impl<'a> Preparation<'a> {
         })
     }
 
-    fn head(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+    fn head(&mut self, head_plan: &HeadProgramPlan) -> Result<(), CatalogFailure> {
         if let Some(demand) = &self.graph_demand {
             let mut calls = demand.head.clone();
             calls.add(&demand.head_prefix);
             self.tuning.set_invocations(calls, true);
         }
-        let Some(head_plan) = plan.head() else {
-            return Ok(());
-        };
         let scoped = |scope: fn(usize) -> WeightScope| {
             BindingLayers::of(
                 head_plan
@@ -3297,10 +3298,10 @@ impl<'a> Preparation<'a> {
         let mut registered = HashSet::new();
         for (head_index, &b) in head_plan.blocks().iter().enumerate() {
             if !registered.insert(b)
-                || self
-                    .head
-                    .as_ref()
-                    .is_some_and(|head| head.input.contains_key(&b))
+                || matches!(
+                    &self.drafter,
+                    Some(PreparedDrafter::Head(head)) if head.input.contains_key(&b)
+                )
             {
                 continue;
             }
@@ -3423,10 +3424,7 @@ impl<'a> Preparation<'a> {
                 logits.clone(),
             )?;
             let logits = qualified.or(logits);
-            let head = self
-                .head
-                .as_mut()
-                .expect("a head plan creates the head group");
+            let head = self.head_kernels();
             if let (
                 Some(input),
                 Some(attention),
@@ -3488,10 +3486,7 @@ impl<'a> Preparation<'a> {
             true => fixed!(self.spec, guess_chain, "head"),
             false => None,
         };
-        let head = self
-            .head
-            .as_mut()
-            .expect("a head plan creates the head group");
+        let head = self.head_kernels();
         head.shape = shape;
         head.sample = sample;
         head.chain = chain;
@@ -3502,13 +3497,10 @@ impl<'a> Preparation<'a> {
     /// (prepared with the target's): the join of its input halves, the
     /// projections into and out of its width, its normalized output and its
     /// own vocabulary table.
-    fn shared_head(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+    fn shared_head(&mut self, head: &SharedHeadProgramPlan) -> Result<(), CatalogFailure> {
         if let Some(demand) = &self.graph_demand {
             self.tuning.set_invocations(demand.head.clone(), true);
         }
-        let Some(head) = plan.shared_head() else {
-            return Ok(());
-        };
         let activation = head.activation;
         let scopes = vec![head_scope(0)];
         let bindings = format!("A={}", activation.name());
@@ -3574,11 +3566,9 @@ impl<'a> Preparation<'a> {
             None
         };
         let projection = qualified.or(projection);
-        let centroids = head
-            .clustered
-            .as_ref()
-            .map(|cluster| {
-                self.projection(PreparedProjectionTuning {
+        let clustered = match &head.clustered {
+            Some(cluster) => {
+                let centroids = self.projection(PreparedProjectionTuning {
                     scope: head_scope(0),
                     kind: WeightKind::OutputCentroids,
                     weight: cluster.centroids.element,
@@ -3586,31 +3576,30 @@ impl<'a> Preparation<'a> {
                     columns: None,
                     indexed: false,
                     softcap: 0.0,
-                })
-            })
-            .transpose()?
-            .flatten();
-        let (cluster_selection, cluster_rows, placement) = if head.clustered.is_some() {
-            (
-                fixed!(self.spec, draft_top_k, ""),
-                fixed!(self.spec, cluster_token_rows, ""),
-                fixed!(self.spec, place_logits_rows, ""),
-            )
-        } else {
-            (None, None, None)
+                })?;
+                let selection = fixed!(self.spec, draft_top_k, "");
+                let rows = fixed!(self.spec, cluster_token_rows, "");
+                let placement = fixed!(self.spec, place_logits_rows, "");
+                match (centroids, selection, rows, placement) {
+                    (Some(centroids), Some(selection), Some(rows), Some(placement)) => {
+                        Some(ClusteredReadoutKernels {
+                            centroids,
+                            selection,
+                            rows,
+                            placement,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            None => None,
         };
-        let kernels = self
-            .shared_head
-            .as_mut()
-            .expect("a shared head plan creates its group");
+        let kernels = self.shared_head_kernels();
         kernels.join = join;
         kernels.input = input;
         kernels.features = features;
         kernels.projection = projection;
-        kernels.centroids = centroids;
-        kernels.cluster_selection = cluster_selection;
-        kernels.cluster_rows = cluster_rows;
-        kernels.placement = placement;
+        kernels.clustered = clustered;
         kernels.chain = chain;
         Ok(())
     }
@@ -3618,13 +3607,10 @@ impl<'a> Preparation<'a> {
     /// A separate draft: per distinct binding, its layers' attention (block
     /// and injection) and dense entries; the block embedding; the output
     /// norm and projection of the proposing rows; DSpark's chain entries.
-    fn draft(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+    fn draft(&mut self, draft_plan: &DraftProgramPlan) -> Result<(), CatalogFailure> {
         if let Some(demand) = &self.graph_demand {
             self.tuning.set_invocations(demand.draft.clone(), true);
         }
-        let Some(draft_plan) = plan.draft() else {
-            return Ok(());
-        };
         let draft_scope = |index: usize, sublayer: u32| {
             WeightScope::DraftSublayer(SublayerIndex {
                 block: u32::try_from(index).expect("draft block count fits u32"),
@@ -3960,10 +3946,25 @@ impl<'a> Preparation<'a> {
         )
     }
 
+    fn head_kernels(&mut self) -> &mut HeadKernels {
+        match self.drafter.as_mut() {
+            Some(PreparedDrafter::Head(head)) => head,
+            _ => panic!("a head plan creates the head group"),
+        }
+    }
+
+    fn shared_head_kernels(&mut self) -> &mut SharedHeadKernels {
+        match self.drafter.as_mut() {
+            Some(PreparedDrafter::SharedHead(shared_head)) => shared_head,
+            _ => panic!("a shared head plan creates its group"),
+        }
+    }
+
     fn draft_kernels(&mut self) -> &mut DraftKernels {
-        self.draft
-            .as_mut()
-            .expect("a draft plan creates the draft group")
+        match self.drafter.as_mut() {
+            Some(PreparedDrafter::Draft(draft)) => draft,
+            _ => panic!("a draft plan creates the draft group"),
+        }
     }
 
     /// The vision group's kernels, which a vision plan creates.

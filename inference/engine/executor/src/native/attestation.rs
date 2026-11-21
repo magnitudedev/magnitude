@@ -7,14 +7,13 @@ use super::*;
 use crate::SublayerTail;
 use crate::programs::native_target_graph::TARGET_TABLE;
 use crate::{
-    ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, ImportProgramSlot, MixerProgramSlot,
-    PlanError, PlannedDevice, ProgramPlan, ReadoutHead,
+    DrafterProgramPlan, ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, ImportProgramSlot,
+    MixerProgramSlot, PlanError, PlannedDevice, ProgramPlan, ReadoutHead,
 };
 use magnitude_family_contracts::{ProgressivePlane, SublayerIndex, WeightScope};
 use magnitude_kernels::{
-    cluster_token_rows, draft_top_k, feature_rows, import_dense, packing_bound, place_logits_rows,
-    project_rows, readout_project_rows, repack_weight, selection_notice, tap_rows, token_confidence,
-    widen_rows,
+    feature_rows, import_dense, packing_bound, project_rows, repack_weight, selection_notice,
+    tap_rows, token_confidence, widen_rows,
 };
 use std::rc::Rc;
 
@@ -26,9 +25,7 @@ pub struct AttestedPrograms {
     pub(super) owner: Tensor,
     report: QualificationReport,
     pub(super) target: AttestedTarget,
-    pub(super) head: Option<AttestedHead>,
-    pub(super) shared_head: Option<AttestedSharedHead>,
-    pub(super) draft: Option<AttestedDraft>,
+    pub(super) drafter: Option<AttestedDrafter>,
     pub(super) vision: Option<AttestedVision>,
     pub(super) state: AttestedState,
     pub(super) imports: Vec<(ImportProgramSlot, AttestedImport)>,
@@ -224,6 +221,14 @@ pub(crate) enum AttestedFeedForward {
     Parallel(ParallelKernels),
 }
 
+/// The active drafter's attested entries, mutually exclusive by construction.
+#[derive(Clone)]
+pub(crate) enum AttestedDrafter {
+    Head(Box<AttestedHead>),
+    SharedHead(Box<AttestedSharedHead>),
+    Draft(Box<AttestedDraft>),
+}
+
 #[derive(Clone)]
 pub(crate) struct AttestedHead {
     pub blocks: Vec<AttestedHeadBlock>,
@@ -266,10 +271,7 @@ pub(crate) struct AttestedSharedHead {
     pub blocks: Vec<AttestedTargetBlock>,
     pub features: NativeKernel<readout_features_rows::Entry>,
     pub projection: ProjectionKernels,
-    pub centroids: Option<super::RangedKernels<readout_project_rows::Entry>>,
-    pub cluster_selection: Option<NativeKernel<draft_top_k::Entry>>,
-    pub cluster_rows: Option<NativeKernel<cluster_token_rows::Entry>>,
-    pub placement: Option<NativeKernel<place_logits_rows::Entry>>,
+    pub clustered: Option<ClusteredReadoutKernels>,
     pub chain: super::RangedKernels<project_rows::Entry>,
     pub shape: NativeKernel<shape_rows::Entry>,
     pub sample: NativeKernel<sample_rows::Entry>,
@@ -408,26 +410,30 @@ impl AttestedPrograms {
         if let ReadoutHeadKernels::Qualified { packed, .. } = &self.target.readout.head {
             self.target.readout.head = packed.as_ref().clone();
         }
-        if let Some(head) = &mut self.head {
-            for block in &mut head.blocks {
-                if let ProjectionKernels::Qualified { packed, .. } = &block.logits {
-                    block.logits = packed.as_ref().clone();
-                    let weight = block.binding.projection.packed();
-                    block.binding.projection = ReadoutHead::Packed {
-                        weight: weight.element,
-                        weight_scale: weight.scale,
-                    };
+        if let Some(drafter) = &mut self.drafter {
+            match drafter {
+                AttestedDrafter::Head(head) => {
+                    for block in &mut head.blocks {
+                        if let ProjectionKernels::Qualified { packed, .. } = &block.logits {
+                            block.logits = packed.as_ref().clone();
+                            let weight = block.binding.projection.packed();
+                            block.binding.projection = ReadoutHead::Packed {
+                                weight: weight.element,
+                                weight_scale: weight.scale,
+                            };
+                        }
+                    }
                 }
-            }
-        }
-        if let Some(head) = &mut self.shared_head {
-            if let ProjectionKernels::Qualified { packed, .. } = &head.projection {
-                head.projection = packed.as_ref().clone();
-            }
-        }
-        if let Some(draft) = &mut self.draft {
-            if let ProjectionKernels::Qualified { packed, .. } = &draft.head {
-                draft.head = packed.as_ref().clone();
+                AttestedDrafter::SharedHead(head) => {
+                    if let ProjectionKernels::Qualified { packed, .. } = &head.projection {
+                        head.projection = packed.as_ref().clone();
+                    }
+                }
+                AttestedDrafter::Draft(draft) => {
+                    if let ProjectionKernels::Qualified { packed, .. } = &draft.head {
+                        draft.head = packed.as_ref().clone();
+                    }
+                }
             }
         }
         self.readout_choices.clear();
@@ -474,28 +480,6 @@ impl AttestedPrograms {
         let proposals = method.draft_rows();
         let vision_plan = programs.vision();
         let (target_state, head_state) = (state.target_state(), state.head_state());
-        if self.shared_head.is_some() != programs.shared_head().is_some() {
-            return Err("attested and planned draft heads reading target history disagree".into());
-        }
-        if let (Some(handles), Some(plan)) = (&self.shared_head, programs.shared_head()) {
-            let geometry = crate::programs::native_shared_head::SharedHeadGeometry::new(
-                definition, state, plan,
-            )?;
-            let classes =
-                crate::programs::native_shared_head::shared_head_graph_classes(limits, proposals)?;
-            let landing = self.landing(load, TARGET_TABLE)?;
-            self.drafter_graphs = Some(crate::PreparedDrafterGraphs::SharedHead(Rc::new(
-                crate::programs::native_shared_head::PreparedSharedHeadGraphs::prepare(
-                    device,
-                    handles,
-                    landing.as_ref(),
-                    load,
-                    &geometry,
-                    classes,
-                )
-                .map_err(|error| error.to_string())?,
-            )));
-        }
         let row_classes = magnitude_batching::row_classes(limits.max_launch_rows)
             .into_iter()
             .map(|rows| rows as u64)
@@ -511,64 +495,106 @@ impl AttestedPrograms {
         {
             return Err("attested vision, program plan and model definition disagree".into());
         }
-        if let (Some(handles), Some(state)) = (&self.head, head_state) {
-            let head = definition
-                .head
-                .as_ref()
-                .ok_or("head graph requires a draft head")?;
-            let head = crate::operators::CausalHeadBlock::of(
-                head,
-                head.blocks
-                    .first()
-                    .ok_or("head graph requires a draft head block")?,
-            )
-            .map_err(|error| error.to_string())?;
-            let classes = crate::programs::native_head::head_graph_classes(
-                limits,
-                state.head_geometry()?,
-                proposals,
-                load.fronts(),
-            )?;
-            let landing = self.landing(load, TARGET_TABLE)?;
-            self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Head(Rc::new(
-                crate::programs::native_head::PreparedHeadGraphs::prepare(
-                    device,
-                    handles,
-                    landing.as_ref(),
-                    load,
-                    &definition.decoder,
-                    head,
-                    classes,
-                )
-                .map_err(|error| error.to_string())?,
-            )));
-        }
-        if let (Some(handles), Some(state)) = (&self.draft, head_state) {
-            let draft = definition
-                .draft
-                .as_ref()
-                .ok_or("draft graphs require a draft")?;
-            let geometry = crate::programs::native_draft::DraftGeometry::new(definition, state)?;
-            let classes = crate::programs::native_draft::draft_graph_classes(
-                limits,
-                proposals,
-                &method.block_widths(),
-                draft,
-            )?;
-            let landing = self.landing(load, crate::programs::native_draft::token_table(draft))?;
-            self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Draft(Rc::new(
-                crate::programs::native_draft::PreparedDraftGraphs::prepare(
-                    device,
-                    handles,
-                    landing.as_ref(),
-                    load,
-                    programs.draft().ok_or("draft graphs require a draft program")?,
-                    &geometry,
-                    classes,
-                )
-                .map_err(|error| error.to_string())?,
-            )));
-        }
+        self.drafter_graphs = match (&self.drafter, programs.drafter()) {
+            (None, None) => None,
+            (
+                Some(AttestedDrafter::SharedHead(handles)),
+                Some(DrafterProgramPlan::SharedHead(plan)),
+            ) => {
+                let geometry = crate::programs::native_shared_head::SharedHeadGeometry::new(
+                    definition, state, plan,
+                )?;
+                let classes = crate::programs::native_shared_head::shared_head_graph_classes(
+                    limits, proposals,
+                )?;
+                let landing = self.landing(load, TARGET_TABLE)?;
+                Some(crate::PreparedDrafterGraphs::SharedHead(Rc::new(
+                    crate::programs::native_shared_head::PreparedSharedHeadGraphs::prepare(
+                        device,
+                        handles,
+                        landing.as_ref(),
+                        load,
+                        &geometry,
+                        classes,
+                    )
+                    .map_err(|error| error.to_string())?,
+                )))
+            }
+            (Some(AttestedDrafter::Head(handles)), Some(DrafterProgramPlan::Head(_))) => {
+                match head_state {
+                    Some(state) => {
+                        let head = definition
+                            .head
+                            .as_ref()
+                            .ok_or("head graph requires a draft head")?;
+                        let head = crate::operators::CausalHeadBlock::of(
+                            head,
+                            head.blocks
+                                .first()
+                                .ok_or("head graph requires a draft head block")?,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let classes = crate::programs::native_head::head_graph_classes(
+                            limits,
+                            state.head_geometry()?,
+                            proposals,
+                            load.fronts(),
+                        )?;
+                        let landing = self.landing(load, TARGET_TABLE)?;
+                        Some(crate::PreparedDrafterGraphs::Head(Rc::new(
+                            crate::programs::native_head::PreparedHeadGraphs::prepare(
+                                device,
+                                handles,
+                                landing.as_ref(),
+                                load,
+                                &definition.decoder,
+                                head,
+                                classes,
+                            )
+                            .map_err(|error| error.to_string())?,
+                        )))
+                    }
+                    None => None,
+                }
+            }
+            (
+                Some(AttestedDrafter::Draft(handles)),
+                Some(DrafterProgramPlan::Draft(draft_plan)),
+            ) => match head_state {
+                Some(state) => {
+                    let draft = definition
+                        .draft
+                        .as_ref()
+                        .ok_or("draft graphs require a draft")?;
+                    let geometry =
+                        crate::programs::native_draft::DraftGeometry::new(definition, state)?;
+                    let classes = crate::programs::native_draft::draft_graph_classes(
+                        limits,
+                        proposals,
+                        &method.block_widths(),
+                        draft,
+                    )?;
+                    let landing =
+                        self.landing(load, crate::programs::native_draft::token_table(draft))?;
+                    Some(crate::PreparedDrafterGraphs::Draft(Rc::new(
+                        crate::programs::native_draft::PreparedDraftGraphs::prepare(
+                            device,
+                            handles,
+                            landing.as_ref(),
+                            load,
+                            draft_plan,
+                            &geometry,
+                            classes,
+                        )
+                        .map_err(|error| error.to_string())?,
+                    )))
+                }
+                None => None,
+            },
+            _ => {
+                return Err("attested and planned drafters disagree".into());
+            }
+        };
         if let (Some(handles), Some(vision), Some(_)) =
             (&self.vision, definition.vision.as_deref(), vision_plan)
         {
@@ -1049,58 +1075,6 @@ impl AttestedPrograms {
             Ok(blocks)
         };
         let blocks = attest_blocks(target_plan.blocks(), WeightScope::TargetSublayer)?;
-        let shared_head = topology
-            .shared_head()
-            .map(|plan| {
-                let handles = prepared
-                    .shared_head
-                    .as_ref()
-                    .ok_or_else(|| missing("shared_head", "enabled"))?;
-                Ok::<_, CatalogFailure>(AttestedSharedHead {
-                    embedding: slot(&prepared.target.embedding, plan.embedding, "embedding_rows")?,
-                    join: handles
-                        .join
-                        .clone()
-                        .ok_or_else(|| missing("tap_rows", "head"))?,
-                    input: handles
-                        .input
-                        .clone()
-                        .ok_or_else(|| missing("project_rows", "head input"))?,
-                    blocks: attest_blocks(&plan.blocks, WeightScope::HeadSublayer)?,
-                    features: handles
-                        .features
-                        .clone()
-                        .ok_or_else(|| missing("readout_features_rows", "head"))?,
-                    projection: handles
-                        .projection
-                        .clone()
-                        .ok_or_else(|| missing("readout_project_rows", "head"))?,
-                    centroids: handles.centroids.clone(),
-                    cluster_selection: handles.cluster_selection.clone(),
-                    cluster_rows: handles.cluster_rows.clone(),
-                    placement: handles.placement.clone(),
-                    chain: handles
-                        .chain
-                        .clone()
-                        .ok_or_else(|| missing("project_rows", "head chain"))?,
-                    shape: prepared
-                        .glue
-                        .shape_rows
-                        .clone()
-                        .ok_or_else(|| missing("shape_rows", "fixed"))?,
-                    sample: prepared
-                        .glue
-                        .sample_rows
-                        .clone()
-                        .ok_or_else(|| missing("sample_rows", "fixed"))?,
-                    confidence: prepared
-                        .glue
-                        .token_confidence
-                        .clone()
-                        .ok_or_else(|| missing("token_confidence", "shared head"))?,
-                })
-            })
-            .transpose()?;
         let target = AttestedTarget {
             residual_features: prepared.target.residual_features.clone(),
             embedding: slot(
@@ -1152,13 +1126,64 @@ impl AttestedPrograms {
                 })
                 .transpose()?,
         };
-        let head = topology
-            .head()
-            .map(|head_plan| {
-                let handles = prepared
-                    .head
+        let drafter = match (topology.drafter(), prepared.drafter.as_ref()) {
+            (None, None) => None,
+            (
+                Some(DrafterProgramPlan::SharedHead(plan)),
+                Some(PreparedDrafter::SharedHead(handles)),
+            ) => Some(AttestedDrafter::SharedHead(Box::new(AttestedSharedHead {
+                embedding: slot(&prepared.target.embedding, plan.embedding, "embedding_rows")?,
+                join: handles
+                    .join
+                    .clone()
+                    .ok_or_else(|| missing("tap_rows", "head"))?,
+                input: handles
+                    .input
+                    .clone()
+                    .ok_or_else(|| missing("project_rows", "head input"))?,
+                blocks: attest_blocks(&plan.blocks, WeightScope::HeadSublayer)?,
+                features: handles
+                    .features
+                    .clone()
+                    .ok_or_else(|| missing("readout_features_rows", "head"))?,
+                projection: handles
+                    .projection
+                    .clone()
+                    .ok_or_else(|| missing("readout_project_rows", "head"))?,
+                clustered: plan
+                    .clustered
                     .as_ref()
-                    .ok_or_else(|| missing("head", "enabled"))?;
+                    .map(|_| {
+                        handles
+                            .clustered
+                            .clone()
+                            .ok_or_else(|| missing("clustered_readout", "shared head"))
+                    })
+                    .transpose()?,
+                chain: handles
+                    .chain
+                    .clone()
+                    .ok_or_else(|| missing("project_rows", "head chain"))?,
+                shape: prepared
+                    .glue
+                    .shape_rows
+                    .clone()
+                    .ok_or_else(|| missing("shape_rows", "fixed"))?,
+                sample: prepared
+                    .glue
+                    .sample_rows
+                    .clone()
+                    .ok_or_else(|| missing("sample_rows", "fixed"))?,
+                confidence: prepared
+                    .glue
+                    .token_confidence
+                    .clone()
+                    .ok_or_else(|| missing("token_confidence", "shared head"))?,
+            }))),
+            (
+                Some(DrafterProgramPlan::Head(head_plan)),
+                Some(PreparedDrafter::Head(handles)),
+            ) => {
                 let mut blocks = Vec::with_capacity(head_plan.blocks().len());
                 for &binding in head_plan.blocks() {
                     let logits = handles
@@ -1214,13 +1239,15 @@ impl AttestedPrograms {
                                     .cloned()
                                     .ok_or_else(|| missing("routed_stages", binding))?,
                             ),
-                            FeedForwardProgramSlot::GeneralRouted(_) => AttestedFeedForward::GeneralRouted(
-                                handles
-                                    .general_routed
-                                    .get(&binding)
-                                    .cloned()
-                                    .ok_or_else(|| missing("general_routed_stages", binding))?,
-                            ),
+                            FeedForwardProgramSlot::GeneralRouted(_) => {
+                                AttestedFeedForward::GeneralRouted(
+                                    handles
+                                        .general_routed
+                                        .get(&binding)
+                                        .cloned()
+                                        .ok_or_else(|| missing("general_routed_stages", binding))?,
+                                )
+                            }
                             // `operators::admit` refuses a draft head's
                             // parallel feed-forward form.
                             FeedForwardProgramSlot::Parallel(_) => {
@@ -1235,7 +1262,7 @@ impl AttestedPrograms {
                         logits,
                     });
                 }
-                Ok::<_, CatalogFailure>(AttestedHead {
+                Some(AttestedDrafter::Head(Box::new(AttestedHead {
                     blocks,
                     shape: handles
                         .shape
@@ -1251,19 +1278,20 @@ impl AttestedPrograms {
                         .clone()
                         .ok_or_else(|| missing("token_confidence", "head"))?,
                     chain: match load.fronts() {
-                        true => Some(handles.chain.clone().ok_or_else(|| missing("guess_chain", "head"))?),
+                        true => Some(
+                            handles
+                                .chain
+                                .clone()
+                                .ok_or_else(|| missing("guess_chain", "head"))?,
+                        ),
                         false => None,
                     },
-                })
-            })
-            .transpose()?;
-        let draft = topology
-            .draft()
-            .map(|draft_plan| {
-                let handles = prepared
-                    .draft
-                    .as_ref()
-                    .ok_or_else(|| missing("draft", "enabled"))?;
+                })))
+            }
+            (
+                Some(DrafterProgramPlan::Draft(draft_plan)),
+                Some(PreparedDrafter::Draft(handles)),
+            ) => {
                 let attention = |binding| {
                     handles
                         .attention
@@ -1271,21 +1299,20 @@ impl AttestedPrograms {
                         .cloned()
                         .ok_or_else(|| missing("draft_attention_stages", binding))
                 };
-                let blocks =
-                    draft_plan
-                        .blocks()
-                        .iter()
-                        .map(|block| {
-                            Ok(DraftBlockKernels {
-                                attention: attention(block.attention)?,
-                                injection: attention(block.injection)?,
-                                dense: handles.dense.get(&block.feed_forward).cloned().ok_or_else(
-                                    || missing("draft_dense_stages", block.feed_forward),
-                                )?,
-                            })
+                let blocks = draft_plan
+                    .blocks()
+                    .iter()
+                    .map(|block| {
+                        Ok(DraftBlockKernels {
+                            attention: attention(block.attention)?,
+                            injection: attention(block.injection)?,
+                            dense: handles.dense.get(&block.feed_forward).cloned().ok_or_else(
+                                || missing("draft_dense_stages", block.feed_forward),
+                            )?,
                         })
-                        .collect::<Result<Vec<_>, CatalogFailure>>()?;
-                Ok::<_, CatalogFailure>(AttestedDraft {
+                    })
+                    .collect::<Result<Vec<_>, CatalogFailure>>()?;
+                Some(AttestedDrafter::Draft(Box::new(AttestedDraft {
                     blocks,
                     embedding: handles
                         .embedding
@@ -1345,9 +1372,21 @@ impl AttestedPrograms {
                                 .map_err(|entry| missing("draft_corrector_stages", entry))
                         })
                         .transpose()?,
-                })
-            })
-            .transpose()?;
+                })))
+            }
+            (Some(DrafterProgramPlan::SharedHead(_)), _) => {
+                return Err(missing("shared_head", "enabled"));
+            }
+            (Some(DrafterProgramPlan::Head(_)), _) => {
+                return Err(missing("head", "enabled"));
+            }
+            (Some(DrafterProgramPlan::Draft(_)), _) => {
+                return Err(missing("draft", "enabled"));
+            }
+            (None, Some(_)) => {
+                return Err(missing("drafter", "unexpected"));
+            }
+        };
         let vision = topology
             .vision()
             .map(|vision_plan| {
@@ -1415,9 +1454,7 @@ impl AttestedPrograms {
             owner: prepared.owner.clone(),
             report,
             target,
-            head,
-            shared_head,
-            draft,
+            drafter,
             vision,
             state,
             imports,
@@ -1640,16 +1677,16 @@ impl AttestedPrograms {
     ) -> Result<crate::programs::native_drafter::NativeDrafterProgram, CatalogError> {
         use crate::programs::native_drafter::NativeDrafterProgram;
         (|| -> Result<NativeDrafterProgram, CatalogFailure> {
-            match self
-                .drafter_graphs
-                .as_ref()
-                .ok_or_else(|| missing("head", "prepared native graphs"))?
-            {
-                crate::PreparedDrafterGraphs::Head(graphs) => {
-                    let head = self
-                        .head
-                        .as_ref()
-                        .ok_or_else(|| missing("head", "disabled"))?;
+            match (
+                self.drafter_graphs
+                    .as_ref()
+                    .ok_or_else(|| missing("head", "prepared native graphs"))?,
+                self.drafter.as_ref(),
+            ) {
+                (
+                    crate::PreparedDrafterGraphs::Head(graphs),
+                    Some(AttestedDrafter::Head(head)),
+                ) => {
                     if head.blocks.len() != 1
                         || resident.depth != 1
                         || definition
@@ -1670,10 +1707,10 @@ impl AttestedPrograms {
                     .map(NativeDrafterProgram::Head)
                     .map_err(|error| missing("head", error))
                 }
-                crate::PreparedDrafterGraphs::SharedHead(graphs) => {
-                    self.shared_head
-                        .as_ref()
-                        .ok_or_else(|| missing("head", "disabled"))?;
+                (
+                    crate::PreparedDrafterGraphs::SharedHead(graphs),
+                    Some(AttestedDrafter::SharedHead(_)),
+                ) => {
                     if resident.depth != 1 {
                         return Err(missing("head", "native single-head topology"));
                     }
@@ -1688,7 +1725,10 @@ impl AttestedPrograms {
                     .map(NativeDrafterProgram::SharedHead)
                     .map_err(|error| missing("head", error))
                 }
-                crate::PreparedDrafterGraphs::Draft(graphs) => {
+                (
+                    crate::PreparedDrafterGraphs::Draft(graphs),
+                    Some(AttestedDrafter::Draft(_)),
+                ) => {
                     let blocks = definition
                         .draft
                         .as_ref()
@@ -1709,6 +1749,8 @@ impl AttestedPrograms {
                     .map(NativeDrafterProgram::Draft)
                     .map_err(|error| missing("draft", error))
                 }
+                (crate::PreparedDrafterGraphs::Draft(_), _) => Err(missing("draft", "disabled")),
+                _ => Err(missing("head", "disabled")),
             }
         })()
         .map_err(|failure| CatalogError::native(self.backend, failure))

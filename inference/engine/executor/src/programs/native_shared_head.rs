@@ -1196,23 +1196,15 @@ impl PreparedSharedHeadGraphs {
                     features: &kernels.features,
                     projection: readout::ProjectionEntries::prepared(&kernels.projection),
                     clustered: if geometry.plan.clustered.is_some() {
+                        let clustered = kernels
+                            .clustered
+                            .as_ref()
+                            .ok_or_else(|| invalid("clustered readout entries are absent"))?;
                         Some(ClusterEntries {
-                            centroids: kernels
-                                .centroids
-                                .as_ref()
-                                .ok_or_else(|| invalid("clustered centroid entry is absent"))?,
-                            selection: kernels
-                                .cluster_selection
-                                .as_ref()
-                                .ok_or_else(|| invalid("cluster selection entry is absent"))?,
-                            rows: kernels
-                                .cluster_rows
-                                .as_ref()
-                                .ok_or_else(|| invalid("cluster row entry is absent"))?,
-                            placement: kernels
-                                .placement
-                                .as_ref()
-                                .ok_or_else(|| invalid("cluster placement entry is absent"))?,
+                            centroids: &clustered.centroids,
+                            selection: &clustered.selection,
+                            rows: &clustered.rows,
+                            placement: &clustered.placement,
                         })
                     } else {
                         None

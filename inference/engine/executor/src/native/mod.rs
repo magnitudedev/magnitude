@@ -16,9 +16,9 @@ pub(crate) use attestation::{AttestedImport, AttestedLanding};
 pub use attestation::AttestedPrograms;
 pub(crate) use attestation::QualificationPeakModel;
 pub(crate) use attestation::{
-    AttestedDraft, AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedMixer,
-    AttestedSharedHead, AttestedState, AttestedTarget, AttestedTargetBlock, AttestedVision,
-    OutputScales, output_tails, reads_layer_scale,
+    AttestedDraft, AttestedDrafter, AttestedFeedForward, AttestedHead, AttestedHeadBlock,
+    AttestedMixer, AttestedSharedHead, AttestedState, AttestedTarget, AttestedTargetBlock,
+    AttestedVision, OutputScales, output_tails, reads_layer_scale,
 };
 use draft::DraftKernels;
 pub(crate) use draft::{
@@ -28,12 +28,13 @@ pub(crate) use draft::{
 use glue::GlueKernels;
 use head::HeadKernels;
 pub(crate) use import::ImportKernels;
-use preparation::NativePreparationCache;
+use preparation::{NativePreparationCache, PreparedDrafter};
 pub(crate) use specialization::entry_statics;
 pub(crate) use preparation::kernel_requests;
 pub(crate) use qualification::admit_site;
 use qualification::QualificationView;
 pub use readout::ProjectionKernels;
+pub(crate) use shared_head::ClusteredReadoutKernels;
 use shared_head::SharedHeadKernels;
 use target::TargetKernels;
 pub(crate) use target::{
