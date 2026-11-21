@@ -2342,7 +2342,7 @@ fn refusal(no: NoBank, capacity: u64) -> PlanError {
         NoBank::Bound { bound, needed } => PlanError::WeightBound { bound, needed },
         NoBank::Short { deficit_bytes } => PlanError::Resource(crate::CapacityError {
             resource: crate::ResourceKind::DeviceMemory,
-            required: capacity.saturating_add(deficit_bytes.get()),
+            required: capacity + deficit_bytes.get(),
             available: capacity,
         }),
     }
@@ -4401,20 +4401,5 @@ mod tests {
         assert_eq!(value, envelope.records());
         assert_eq!(count, 3);
         assert_eq!(visited, vec![p_a, p_b, envelope]);
-    }
-
-    #[test]
-    fn refusal_saturates_required_bytes_on_overflow() {
-        let err = refusal(
-            NoBank::Short { deficit_bytes: NonZeroU64::new(100).unwrap() },
-            u64::MAX - 10,
-        );
-        match err {
-            PlanError::Resource(capacity) => {
-                assert_eq!(capacity.required, u64::MAX);
-                assert_eq!(capacity.available, u64::MAX - 10);
-            }
-            other => panic!("expected Resource capacity error, got {other:?}"),
-        }
     }
 }

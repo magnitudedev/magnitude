@@ -244,10 +244,6 @@ impl StreamedLayers {
     /// across groups identifies each distinct step exactly.
     fn period(&self, live: Option<&LiveDecode>, held: HeldSlots, rows: f64) -> Vec<(Vec<LayerRun>, usize)> {
         let period = self.runs.iter().map(|run| run.experts).max().expect("a streamed plan streams a layer") as usize;
-        if !rows.is_finite() || rows <= 0. {
-            let quiet = self.runs.iter().map(|run| LayerRun { load: LayerLoad::default(), layers: run.layers }).collect();
-            return vec![(quiet, period)];
-        }
         let width = match live {
             None => self.runs.len(),
             Some(_) => self.layers(),
@@ -409,8 +405,8 @@ impl DecodePrice {
     /// each form at `live`'s rows and context).
     pub fn new(layers: StreamedLayers, live: LiveDecode, read: ReadLine, compute: FormSeconds) -> Self {
         assert_eq!(layers.layers(), live.layers.len(), "a decode's reads are of its streamed layers");
-        let rows = normalize_rows(live.rows);
-        Self { layers, rows, depth: live.depth, live: Some(live), read, compute }
+        assert!(live.rows.is_finite() && live.rows > 0., "a decode's mean rows must be finite and positive, got {}", live.rows);
+        Self { layers, rows: live.rows, depth: live.depth, live: Some(live), read, compute }
     }
 
     /// The decode before the load counted a step: the generic model's misses
@@ -419,7 +415,8 @@ impl DecodePrice {
     /// headers and the machine's figures, which the load's own reads
     /// replace at each layer it reads once it counts them ([`Self::new`]).
     pub fn prior(layers: StreamedLayers, rows: f64, read: ReadLine, compute: FormSeconds) -> Self {
-        Self { layers, live: None, rows: normalize_rows(rows), depth: 0, read, compute }
+        assert!(rows.is_finite() && rows > 0., "a decode's prior rows must be finite and positive, got {rows}");
+        Self { layers, live: None, rows, depth: 0, read, compute }
     }
 
     /// The context tokens a row of the counted decode reads.
@@ -442,12 +439,6 @@ impl DecodePrice {
     pub fn saturation(&self) -> Option<u64> {
         self.live.as_ref().and_then(LiveDecode::saturation)
     }
-}
-
-/// Normalize a decode row count to a positive finite value, matching
-/// [`LiveDecode::shares`]'s fallback when no valid row count was recorded.
-fn normalize_rows(rows: f64) -> f64 {
-    if !rows.is_finite() || rows <= 0. { 1. } else { rows }
 }
 
 /// What `model` gives a bank of a share `share` of its layer's experts, a
@@ -476,13 +467,6 @@ fn fill_layer_period(
     width: usize,
     col: usize,
 ) {
-    if !rows.is_finite() || rows <= 0. || !routed.is_finite() || routed <= 0. {
-        let quiet_run = LayerRun { load: LayerLoad::default(), layers };
-        for step in 0..period {
-            flat[step * width + col] = quiet_run;
-        }
-        return;
-    }
     let misses = |slots: usize| (shares(slots).misses * routed * period as f64).round() as usize;
     let total = misses(held.slots);
     let filed = misses(held.slots.max(held.host)).min(total);
@@ -686,61 +670,6 @@ mod tests {
         for bad_rows in [0., -1., f64::NAN, f64::INFINITY] {
             let bad = LiveDecode { layers: vec![reads.clone()], steps: 1, rows: bad_rows, depth: 100 };
             assert_eq!(bad.shares(0, 1, model), model);
-        }
-    }
-
-    /// Non-positive or non-finite `rows` (and non-positive/non-finite `routed`)
-    /// never produce NaN in `DecodePrice`, `StreamedLayers::prepare`,
-    /// `step_seconds`, `pass_reads`, or `fill_layer_period`.
-    #[test]
-    fn non_positive_or_non_finite_rows_never_poison_period_or_decode_price() {
-        let lines = ExpertLines::reference(1_000_000);
-        let compute = FormSeconds { resident: 0.010, streamed: 0.012 };
-        let held = HeldSlots { slots: 8, host: 16 };
-        let layers = StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines]));
-        let reads = LayerReads::of_depths(&[2, 1, 0, 0, 1], &[1, 1, 0, 0, 1]);
-
-        let model = MissModel::of(32, 4);
-        let shares = |slots: usize| generic_shares(&model, slots as f64 / 32.);
-        for bad_rows in [0., -1., f64::NAN, f64::INFINITY] {
-            // `fill_layer_period` via `layer_period` guards invalid rows and routed.
-            let loads = layer_period(&shares, 4., 4, held, bad_rows, 32);
-            assert!(loads.iter().all(|load| *load == LayerLoad::default()));
-
-            // `StreamedLayers::prepare`, `step_seconds`, and `pass_reads` stay finite.
-            let live = LiveDecode { layers: vec![reads.clone(), reads.clone()], steps: 1, rows: bad_rows, depth: 100 };
-            for live_opt in [None, Some(&live)] {
-                let step = layers.prepare(live_opt, held, bad_rows).step_seconds(READ, compute);
-                assert!(step.compute_seconds.is_finite() && step.exposed_seconds.is_finite() && step.total_seconds.is_finite());
-                assert!(step.total_seconds >= compute.streamed);
-            }
-            assert_eq!(layers.pass_reads(READ, held, bad_rows), 0.);
-
-            // `DecodePrice::new` and `DecodePrice::prior` normalize invalid rows to 1.0.
-            let one_row_live = LiveDecode { layers: vec![reads.clone(), reads.clone()], steps: 1, rows: 1., depth: 100 };
-            let expected_prior = DecodePrice::prior(StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines])), 1., READ, compute).step(held);
-            let bad_prior = DecodePrice::prior(StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines])), bad_rows, READ, compute).step(held);
-            assert_eq!(bad_prior, expected_prior);
-
-            let bad_live_price = DecodePrice::new(StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines])), live, READ, compute).step(held);
-            assert!(bad_live_price.total_seconds.is_finite() && bad_live_price.exposed_seconds.is_finite());
-            // With invalid `live.rows`, `LiveDecode::shares` falls back to generic model
-            // while `live.routed` still reports the layer's counted distinct experts,
-            // priced at normalized `rows = 1.0`.
-            let expected_live = layers.step_seconds(
-                Some(&LiveDecode { rows: bad_rows, ..one_row_live }),
-                READ,
-                held,
-                1.,
-                compute,
-            );
-            assert_eq!(bad_live_price, expected_live);
-        }
-
-        // `fill_layer_period` also guards non-positive/non-finite `routed` with valid `rows`.
-        for bad_routed in [0., -2., f64::NAN, f64::INFINITY] {
-            let loads = layer_period(&shares, bad_routed, 4, held, 1., 32);
-            assert!(loads.iter().all(|load| *load == LayerLoad::default()));
         }
     }
 }

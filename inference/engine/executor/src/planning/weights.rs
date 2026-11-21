@@ -318,9 +318,7 @@ impl WeightPlan {
             None => None,
             Some(scale) if scale.stored == 1 => Some(WeightScalePlan {
                 extent: experts,
-                resident_bytes: (scale.extent > 0)
-                    .then(|| scale.resident_bytes / scale.extent)
-                    .and_then(|per| per.checked_mul(experts))?,
+                resident_bytes: scale.resident_bytes / scale.extent * experts,
                 ..scale.clone()
             }),
             Some(scale) if scale.extent == rows => Some(WeightScalePlan {
@@ -1950,13 +1948,9 @@ impl ModelLoadPlan {
     /// its rows in.
     pub fn host_table_bytes(&self) -> Result<u64, String> {
         self.host_tables.iter().try_fold(0u64, |total, table| {
-            let rows = table.shape[0];
-            if rows == 0 {
-                return Err(format!("host table {:?} has zero rows", table.descriptor.name));
-            }
-            (table.bytes / rows)
+            (table.bytes / table.shape[0])
                 .checked_mul(
-                    crate::streamed_table::cached_rows(rows)
+                    crate::streamed_table::cached_rows(table.shape[0])
                         .checked_add(table.step_rows)
                         .ok_or_else(|| "host table bytes overflow".to_owned())?,
                 )

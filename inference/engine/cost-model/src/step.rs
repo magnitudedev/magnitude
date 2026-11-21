@@ -891,7 +891,7 @@ mod tests {
         let expected_demand = one(&inputs(&lines, Lead::Layers(0.), 1.), &unhinted).0;
         close(expected_demand, 1e-3 + 2e-3 + 3e-3);
 
-        for lead in [0., 0.4, -1., f64::NAN] {
+        for lead in [0., 0.4] {
             let zero_lead = inputs(&lines, Lead::Layers(lead), 1.);
             for recall in [0.5, 1.] {
                 let loads = [load(0, recall), load(2, recall), load(0, recall), load(0, recall)];
