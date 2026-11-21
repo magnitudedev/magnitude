@@ -46,6 +46,17 @@ describe("Recommended for your machine", () => {
     expect(html).toContain("opacity-45")
   })
 
+  it("chooses the quant already on this computer over the recommended one", () => {
+    const chosen = (owned: ReadonlySet<string>) => {
+      let quant: string | undefined
+      function Probe() { quant = useRecommendedSelection(recommendations, owned).pickedQuant?.key; return null }
+      renderToStaticMarkup(<Probe />)
+      return quant
+    }
+    expect(chosen(new Set())).toBe("flash:gguf:q4")
+    expect(chosen(new Set(["flash:gguf:q6"]))).toBe("flash:gguf:q6")
+  })
+
   it("opens a card from its own button, with the repository link beside it rather than inside it", () => {
     const html = renderToStaticMarkup(<Shown measuring={null} />)
     expect(html).toContain('aria-expanded="true"')

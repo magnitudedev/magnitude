@@ -2,6 +2,7 @@ import { Option } from "effect"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
 import type { InferenceModel } from "@magnitudedev/sdk"
 import {
+  activeLocalModel,
   formatLocalModelDisplayName,
   localModelContextLimit,
   localModelProviderModelId,
@@ -12,7 +13,8 @@ import {
 
 /**
  * The models chats can use: every served model that reads and writes text, with what this computer knows about the
- * ones it runs: their names with quant, the context it serves them at, and the model's own when that is more.
+ * ones it runs: their names with quant, the context it serves them at, and the model's own when that is more. A new
+ * chat starts on the model loaded here, so its first message doesn't swap that model out, else on the first.
  */
 export function useChatModels() {
   const client = useAgentClient()
@@ -41,5 +43,7 @@ export function useChatModels() {
     const limit = found ? Option.getOrUndefined(localModelContextLimit(found))?.contextLength : undefined
     return limit !== undefined && limit > contextFor(model) ? limit : undefined
   }
-  return { result, models, localFor, nameOf, contextFor, contextLimitFor }
+  const active = Result.isSuccess(local) ? Option.flatMap(activeLocalModel(local.value), ({ model }) => localModelProviderModelId(model)) : Option.none<string>()
+  const preferred = Option.getOrUndefined(Option.filter(active, (id) => models.some((model) => model.id === id))) ?? models[0]?.id
+  return { result, models, preferred, localFor, nameOf, contextFor, contextLimitFor }
 }

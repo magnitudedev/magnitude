@@ -77,7 +77,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
 }) {
   const measuring = preparation !== null
   const body = useRef<HTMLDivElement>(null)
-  const selection = useRecommendedSelection(recommendations)
+  const selection = useRecommendedSelection(recommendations, owned)
   const [showUnrunnable, setShowUnrunnable] = useState(false)
   const { picked, pickedQuant } = selection
   return <Dialog open onOpenChange={open => { if (!open) onFinish() }} disablePointerDismissal>
