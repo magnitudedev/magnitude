@@ -169,7 +169,7 @@ impl State {
             !matches!(self.reclaim.get(&id), Some(super::admission::Reclaim::Unbacked)),
             "invariant violated: Reclaim::Unbacked cache entry {id} allocates physical memory"
         );
-        let Some(at) = self.read else {
+        let Some(folded) = self.folded else {
             assert!(
                 entry.holding == Holding::Committed(CommittedKind::Device),
                 "invariant violated: {:?} of {store:?} is charged before the store's first reading; only a device's own entries are",
@@ -178,6 +178,7 @@ impl State {
             self.entry_took(id, bytes, wiring);
             return Ok(());
         };
+        let at = folded.read;
         let lacks = match entry.holding {
             Holding::Pool(class) => self.spare_at(class, entry.allocated.checked_add(bytes).expect("a store's bytes fit u64")) - entry.bytes,
             _ => bytes.saturating_sub(entry.bytes - entry.allocated),
@@ -312,9 +313,9 @@ impl Ledger {
     /// class per store.
     pub fn pool_block(&self, class: PoolClass, block: NonZeroU64) -> super::store::PoolEntries {
         let mut state = self.state();
-        assert!(state.pools[class.index()].is_none(), "invariant violated: {:?} opens a second {class:?} pool", self.store.identity);
+        assert!(state.pool(class).is_none(), "invariant violated: {:?} opens a second {class:?} pool", self.store.identity);
         let entry = state.insert(Holding::Pool(class), 0);
-        state.pools[class.index()] = Some(Pool { entry, block, reclaimer: None });
+        state.pools[class.index()].pool = Some(Pool { entry, block, reclaimer: None });
         let absent = state.insert(Holding::Committed(CommittedKind::Absent(class)), 0);
         drop(state);
         super::store::PoolEntries { blocks: Arc::new(Record::new(self.clone(), entry)), absent: Arc::new(Record::new(self.clone(), absent)) }
@@ -331,9 +332,9 @@ impl Ledger {
     ) -> super::store::PoolEntries {
         assert_eq!(absent.kind(), CommittedKind::Absent(class), "invariant violated: pool absent claim has wrong kind");
         let mut state = self.state();
-        assert!(state.pools[class.index()].is_none(), "invariant violated: {:?} opens a second {class:?} pool", self.store.identity);
+        assert!(state.pool(class).is_none(), "invariant violated: {:?} opens a second {class:?} pool", self.store.identity);
         let entry = state.insert(Holding::Pool(class), 0);
-        state.pools[class.index()] = Some(Pool { entry, block, reclaimer: None });
+        state.pools[class.index()].pool = Some(Pool { entry, block, reclaimer: None });
         drop(state);
         super::store::PoolEntries { blocks: Arc::new(Record::new(self.clone(), entry)), absent: absent.entry() }
     }
@@ -395,7 +396,7 @@ impl super::CacheReclaimer for TestReclaimer {
         }
         if entry.holding.pooled() {
             let class = entry.holding.pool_class().expect("pooled cache has a pool class");
-            let pool_id = state.pools[class.index()].as_ref().expect("pooled cache has open pool").entry;
+            let pool_id = state.pool(class).expect("pooled cache has open pool").entry;
             state.resize(id, entry.bytes - free);
             state.entry_freed(pool_id, free, seismic::memory::Wiring::Pageable);
         } else {
@@ -416,7 +417,7 @@ impl Ledger {
             true => {
                 let mut state = self.state();
                 let class = Holding::Cache(kind).pool_class().expect("pooled cache has a pool class");
-                let pool = state.pools[class.index()].as_ref().expect("a test's pooled cache lies in its class's open pool").entry;
+                let pool = state.pool(class).expect("a test's pooled cache lies in its class's open pool").entry;
                 state.entry_take(&self.store.identity, pool, bytes, seismic::memory::Wiring::Pageable)
             }
             false => cached.entry().take(&cached.entry().change(), bytes, seismic::memory::Wiring::Pageable),

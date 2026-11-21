@@ -66,22 +66,17 @@ pub(super) struct State {
     pub(super) grants: BTreeMap<EntryId, super::grant::Granted>,
     /// The process's own changes no sample shows yet.
     pub(super) journal: Journal,
-    /// The latest reading, as the ledger estimated it; none before the
-    /// first.
-    pub(super) read: Option<Read>,
-    /// Others' wired bytes at the latest reading, where the store has a
-    /// wired ceiling.
-    pub(super) wired_others: Option<u64>,
+    /// The latest folded reading and its per-reading state; none before the
+    /// first reading.
+    pub(super) folded: Option<FoldedReading>,
     /// Where others' working set lies, from the store's paging signals.
     pub(super) boundary: Boundary,
     /// The store's shortage across readings.
     pub(super) persistence: Persistence,
-    /// The store's granule pools, each once it opens, by class
-    /// ([`PoolClass::index`], [`Ledger::pool_block`]).
-    pub(super) pools: [Option<Pool>; 2],
-    /// What pooled holdings of each class hold ([`Holding::pool_class`]),
-    /// summed.
-    pooled: [u64; 2],
+    /// The store's granule pool slots, by class ([`PoolClass::index`],
+    /// [`Ledger::pool_block`]), each pairing its open pool (if opened) with
+    /// the sum of bytes held by pooled holdings of its class.
+    pub(super) pools: [PoolSlot; 2],
     /// Moves on every change of the entries or a value
     /// ([`Ledger::holdings_generation`]).
     pub(super) holdings: u64,
@@ -95,9 +90,6 @@ pub(super) struct State {
     /// shortage, held by no entry and allocated still, so it is not free
     /// ([`Estimate::free`]).
     pub(super) taken: u64,
-    /// The latest reading a shortage was answered at
-    /// ([`Ledger::shortage`]): each reading is answered once.
-    pub(super) answered: Option<Sampled>,
     /// The shortest interval between two readings across which others'
     /// memory moved ([`Ledger::others_interval`]).
     pub(super) others_interval: Option<Duration>,
@@ -117,6 +109,30 @@ pub(super) struct State {
     pub(super) reclaim: HashMap<EntryId, super::admission::Reclaim>,
 }
 
+/// The store's latest folded reading and the per-reading state that only
+/// exists once at least one reading has been folded.
+#[derive(Clone, Copy)]
+pub(super) struct FoldedReading {
+    /// The latest reading, as the ledger estimated it.
+    pub(super) read: Read,
+    /// Others' wired bytes at the latest reading that showed them, where the
+    /// store has a wired ceiling.
+    pub(super) wired_others: Option<u64>,
+    /// The latest reading a shortage was answered at ([`Ledger::shortage`]):
+    /// each reading is answered once.
+    pub(super) answered: Option<Sampled>,
+}
+
+/// One granule pool class's state in a store: its open pool (once opened) and
+/// the sum of bytes held by pooled holdings of its class.
+#[derive(Default)]
+pub(super) struct PoolSlot {
+    pub(super) pool: Option<Pool>,
+    /// What pooled holdings of this class hold ([`Holding::pool_class`]),
+    /// summed.
+    held: u64,
+}
+
 /// One of a store's granule pools: its entry, which every block is charged
 /// to, its block, the unit a shrink returns to the OS, and its optional
 /// reclaimer owned for the pool's lifetime (holding only a weak pool handle).
@@ -126,15 +142,37 @@ pub(super) struct Pool {
     pub(super) reclaimer: Option<Arc<dyn super::admission::CacheReclaimer>>,
 }
 
+/// Drop guard declared after [`Locked::state`] so its check runs only after
+/// the [`MutexGuard`] has been released, keeping the ledger unpoisoned if the
+/// out-of-change invariant assertion panics.
+struct PostUnlock<'a> {
+    ledger: &'a Ledger,
+    verify_alone: bool,
+}
+
+impl Drop for PostUnlock<'_> {
+    fn drop(&mut self) {
+        if !self.verify_alone || self.ledger.store.state.is_poisoned() {
+            return;
+        }
+        assert!(
+            self.ledger.store.changes.alone(),
+            "invariant violated: an allocation change recorded outside a change of its memory"
+        );
+    }
+}
+
 /// A view's hold of its store's state: every change of what the process
 /// allocated that one hold makes is journaled, net, as it ends
 /// (`memory::journal`), so no path that allocates or frees escapes the
 /// journal: in the change its thread has under way, or, a holder's drop
 /// letting its bytes go, in one of its own.
 pub(super) struct Locked<'a> {
-    /// Held until the hold drops, which lets it go before any panic.
-    state: Option<MutexGuard<'a, State>>,
-    ledger: &'a Ledger,
+    /// Dropped first after [`Self::drop`] finishes, releasing the mutex
+    /// before `post_unlock` runs its invariant check.
+    state: MutexGuard<'a, State>,
+    /// Dropped second, once the mutex is unlocked.
+    post_unlock: PostUnlock<'a>,
     /// The process's own figures as the hold began.
     own: Own,
 }
@@ -143,13 +181,13 @@ impl std::ops::Deref for Locked<'_> {
     type Target = State;
 
     fn deref(&self) -> &State {
-        self.state.as_ref().expect("a hold holds its state until it drops")
+        &self.state
     }
 }
 
 impl std::ops::DerefMut for Locked<'_> {
     fn deref_mut(&mut self) -> &mut State {
-        self.state.as_mut().expect("a hold holds its state until it drops")
+        &mut self.state
     }
 }
 
@@ -160,23 +198,15 @@ impl Drop for Locked<'_> {
     /// this hold poisoned the ledger as the state was let go, that panic is
     /// the report.
     fn drop(&mut self) {
-        let mut state = self.state.take().expect("a hold holds its state until it drops");
-        let (before, now) = (self.own, state.own());
+        let (before, now) = (self.own, self.state.own());
         if before == now {
             return;
         }
-        let changes = &self.ledger.store.changes;
+        let changes = &self.post_unlock.ledger.store.changes;
         let open = changes.open_here();
         let number = open.unwrap_or_else(|| changes.begin(false).number);
-        state.journal.record(number, changes.now(), before, now);
-        drop(state);
-        if self.ledger.store.state.is_poisoned() {
-            return;
-        }
-        assert!(
-            open.is_some() || changes.alone(),
-            "invariant violated: an allocation change recorded outside a change of its memory"
-        );
+        self.state.journal.record(number, changes.now(), before, now);
+        self.post_unlock.verify_alone = open.is_none();
     }
 }
 
@@ -200,7 +230,7 @@ impl Ledger {
 
     fn hold<'a>(&'a self, state: MutexGuard<'a, State>) -> Locked<'a> {
         let own = state.own();
-        Locked { state: Some(state), ledger: self, own }
+        Locked { state, post_unlock: PostUnlock { ledger: self, verify_alone: false }, own }
     }
 }
 
@@ -208,6 +238,16 @@ impl State {
     /// The process's own figures in the store now.
     pub(super) fn own(&self) -> Own {
         Own { allocated: self.allocated, wired: self.wired }
+    }
+
+    /// The open granule pool of `class`, if opened.
+    pub(super) fn pool(&self, class: PoolClass) -> Option<&Pool> {
+        self.pools[class.index()].pool.as_ref()
+    }
+
+    /// Mutable access to the open granule pool of `class`, if opened.
+    pub(super) fn pool_mut(&mut self, class: PoolClass) -> Option<&mut Pool> {
+        self.pools[class.index()].pool.as_mut()
     }
 
     /// What one pressure event lowers the boundary by: the largest shrink unit
@@ -223,7 +263,7 @@ impl State {
             if entry.bytes > 0 {
                 if let Some(class) = entry.holding.pool_class().filter(|_| entry.holding.pooled()) {
                     assert!(
-                        self.pools[class.index()].is_some(),
+                        self.pool(class).is_some(),
                         "invariant violated: {:?} ({} bytes) held in a store whose {class:?} pool never opened",
                         entry.holding,
                         entry.bytes
@@ -234,7 +274,7 @@ impl State {
         let unit = self
             .pools
             .iter()
-            .flatten()
+            .filter_map(|slot| slot.pool.as_ref())
             .map(|pool| pool.block.get())
             .max()
             .or_else(|| {
@@ -251,7 +291,7 @@ impl State {
     /// What pooled holdings of `class` hold: the granules the class's
     /// pool's allocation serves.
     fn pooled_held(&self, class: PoolClass) -> u64 {
-        self.pooled[class.index()]
+        self.pools[class.index()].held
     }
 
     /// The spare granules `class`'s pool allocating `allocated` holds: what
@@ -263,14 +303,14 @@ impl State {
     /// The free granules of the pool of `class`: its entry's bytes, none
     /// before it opens.
     pub(super) fn spare_of(&self, class: PoolClass) -> u64 {
-        self.pools[class.index()].as_ref().map_or(0, |pool| self.held[&pool.entry].bytes)
+        self.pool(class).map_or(0, |pool| self.held[&pool.entry].bytes)
     }
 
     /// Keep `class`'s pool's entry holding its spare granules: what it
     /// allocated that no pooled holding of its class holds. Called on every
     /// change of either.
     fn repool(&mut self, class: PoolClass) {
-        let Some(entry_id) = self.pools[class.index()].as_ref().map(|pool| pool.entry) else {
+        let Some(entry_id) = self.pool(class).map(|pool| pool.entry) else {
             return;
         };
         let entry = self.held[&entry_id];
@@ -287,7 +327,7 @@ impl State {
     /// claim in process or shed to a shortage. Only what the pool allocated
     /// releases; none without a pool of `class`.
     fn release_pooled(&mut self, class: PoolClass, bytes: u64, taken: bool) {
-        let Some(entry_id) = self.pools[class.index()].as_ref().map(|pool| pool.entry) else {
+        let Some(entry_id) = self.pool(class).map(|pool| pool.entry) else {
             return;
         };
         let entry = self.entry(entry_id);
@@ -350,7 +390,7 @@ impl State {
             }
         }
         if let Some(class) = holding.pool_class().filter(|_| holding.pooled()) {
-            apply(&mut self.pooled[class.index()]);
+            apply(&mut self.pools[class.index()].held);
             self.repool(class);
         }
     }
@@ -477,9 +517,9 @@ impl State {
 
     /// Entry `id` was let go: its bytes are free.
     pub(super) fn release(&mut self, id: EntryId) {
-        for pool in &mut self.pools {
-            if pool.as_ref().is_some_and(|pool| pool.entry == id) {
-                *pool = None;
+        for slot in &mut self.pools {
+            if slot.pool.as_ref().is_some_and(|pool| pool.entry == id) {
+                slot.pool = None;
             }
         }
         self.reclaim.remove(&id);
@@ -501,7 +541,7 @@ impl State {
     /// a pooled holding the spare granules of its class's pool too, which it
     /// holds in place.
     pub(super) fn room_for(&self, store: &seismic::StoreIdentity, holding: Holding, bytes: u64) -> u64 {
-        let pool = holding.pool_class().filter(|_| holding.pooled()).and_then(|class| self.pools[class.index()].as_ref());
+        let pool = holding.pool_class().filter(|_| holding.pooled()).and_then(|class| self.pool(class));
         let spare = pool.map_or(0, |pool| self.held[&pool.entry].bytes);
         self.free_for(self.reading(store, None), holding, bytes).saturating_add(spare)
     }

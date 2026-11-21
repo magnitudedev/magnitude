@@ -831,7 +831,7 @@ fn without_harm_and_pressure_clean_cache_is_no_supply() {
 /// Others' wired bytes and the wired ceiling's grant at `machine`'s latest
 /// reading.
 fn wired(machine: &Machine) -> (Option<u64>, Option<u64>) {
-    let others = machine.ledger.state().wired_others;
+    let others = machine.ledger.state().folded.and_then(|folded| folded.wired_others);
     (others, machine.ledger.estimate().read.grant)
 }
 
