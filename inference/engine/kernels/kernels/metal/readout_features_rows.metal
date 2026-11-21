@@ -1,11 +1,11 @@
 // readout_features_rows: the final RMS normalization of the `out_rows` hidden
 // rows, published in the activation type. One threadgroup per output row.
 #define KERNEL_A SEISMIC_ELEMENT_A
-#include "lib/projection/projection.h"
+#include "lib/core/activation.h"
+#include "lib/core/reduce.h"
 
-typedef activation::Act activation_element;
-static_assert(activation_element::bytes == 2, "readout_features_rows requires a bf16 or f16 activation");
-typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
+typedef activation::Act Act;
+typedef ELEMENT_OF(SEISMIC_NORM) Norm;
 
 kernel void readout_features_rows(
     device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],
@@ -18,13 +18,77 @@ kernel void readout_features_rows(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partials[8];
-    const uint width = uint(SEISMIC_DIM_D);
-    projection::InputOf<activation_element, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type
-        in{hidden, SEISMIC_HIDDEN_STRIDE_0,
-        SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0,
-        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), width, {out_rows}};
-    const float inverse = projection::normalization_inverse<256>(in, row, 0, partials, thread_index);
-    const element::Out<activation_element> out(features);
-    for (uint i = thread_index; i < width; i += 256u)
-        out.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(i) * SEISMIC_RESULT_0_STRIDE_1, in.value(row, i, inverse));
+    const element::Out<Act> out(features);
+    const ulong width = SEISMIC_DIM_D;
+    const ulong width4 = width & ~3ul;
+    const ulong src_row = ulong(out_rows[ulong(row) * SEISMIC_OUT_ROWS_STRIDE_0]);
+    device const float *src = hidden + src_row * SEISMIC_HIDDEN_STRIDE_0;
+    const ulong out_row = ulong(row) * SEISMIC_RESULT_0_STRIDE_0;
+    if constexpr (SEISMIC_DIM_NM > 0) {
+        const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
+        float squares = 0.0f;
+        if (SEISMIC_HIDDEN_STRIDE_2 == 1ul) {
+            for (ulong i = ulong(thread_index) * 4ul; i < width4; i += 1024ul) {
+                const float4 v = float4(*reinterpret_cast<device const packed_float4 *>(src + i));
+                squares = metal::fma(v.x, v.x, squares);
+                squares = metal::fma(v.y, v.y, squares);
+                squares = metal::fma(v.z, v.z, squares);
+                squares = metal::fma(v.w, v.w, squares);
+            }
+            for (ulong i = width4 + thread_index; i < width; i += 256u) {
+                const float v = src[i];
+                squares = metal::fma(v, v, squares);
+            }
+        } else {
+            for (ulong i = thread_index; i < width; i += 256u) {
+                const float v = src[i * SEISMIC_HIDDEN_STRIDE_2];
+                squares = metal::fma(v, v, squares);
+            }
+        }
+        const float total = reduce::group_sum<8>(squares, partials, sg, lane);
+        const float inverse = metal::rsqrt(total / float(width) + epsilon);
+        if (SEISMIC_HIDDEN_STRIDE_2 == 1ul && SEISMIC_NORM_STRIDE_0 == 1ul && SEISMIC_RESULT_0_STRIDE_1 == 1ul) {
+            device const Norm::storage *norm_base = reinterpret_cast<device const Norm::storage *>(norm);
+            for (ulong i = ulong(thread_index) * 4ul; i < width4; i += 1024ul) {
+                const float4 v = float4(*reinterpret_cast<device const packed_float4 *>(src + i));
+                const float4 nv = Norm::load4(norm_base + i);
+                out.put4(out_row + i, (v * inverse) * nv);
+            }
+            for (ulong i = width4 + thread_index; i < width; i += 256u) {
+                out.put(out_row + i, (src[i] * inverse) * element::at<Norm>(norm, i));
+            }
+        } else {
+            for (ulong i = thread_index; i < width; i += 256u) {
+                out.put(out_row + i * SEISMIC_RESULT_0_STRIDE_1,
+                    (src[i * SEISMIC_HIDDEN_STRIDE_2] * inverse)
+                        * element::at<Norm>(norm, i * SEISMIC_NORM_STRIDE_0));
+            }
+        }
+    } else {
+        (void)partials;
+        if (SEISMIC_HIDDEN_STRIDE_2 == 1ul && SEISMIC_RESULT_0_STRIDE_1 == 1ul) {
+            for (ulong i = ulong(thread_index) * 4ul; i < width4; i += 1024ul) {
+                float4 sum = float4(0.0f);
+                for (ulong part = 0; part < SEISMIC_DIM_PT; ++part) {
+                    const float4 v = float4(*reinterpret_cast<device const packed_float4 *>(
+                        src + part * SEISMIC_HIDDEN_STRIDE_1 + i));
+                    sum += v;
+                }
+                out.put4(out_row + i, sum);
+            }
+            for (ulong i = width4 + thread_index; i < width; i += 256u) {
+                float sum = 0.0f;
+                for (ulong part = 0; part < SEISMIC_DIM_PT; ++part)
+                    sum += src[part * SEISMIC_HIDDEN_STRIDE_1 + i];
+                out.put(out_row + i, sum);
+            }
+        } else {
+            for (ulong i = thread_index; i < width; i += 256u) {
+                float sum = 0.0f;
+                for (ulong part = 0; part < SEISMIC_DIM_PT; ++part)
+                    sum += src[part * SEISMIC_HIDDEN_STRIDE_1 + i * SEISMIC_HIDDEN_STRIDE_2];
+                out.put(out_row + i * SEISMIC_RESULT_0_STRIDE_1, sum);
+            }
+        }
+    }
 }
