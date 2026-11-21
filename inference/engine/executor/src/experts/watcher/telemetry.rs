@@ -1076,12 +1076,12 @@ struct Recorded {
 
 /// One completed decode step's measured misses per token queued for
 /// `Shadows::executed` on `expert-residenc` without blocking `magnitude-main`.
+/// Epoch and clock are read under `self.shadows` in [`Telemetry::shadow`], so
+/// `Shadows::deltas` never receives a detached stale epoch or clock.
 struct ExecutedStep {
     verifies: bool,
     depth: usize,
     real: f64,
-    epoch: u64,
-    now: crate::experts::horizon::Tokens,
 }
 
 /// Short-locked bridge between `magnitude-main` and `Shadows` on
@@ -1957,10 +1957,6 @@ impl Telemetry {
                         if launch.verifies() {
                             self.shadow_state.lock().expect("watcher telemetry shadow state").pending_verify = Some((sequence, depth, missed_total));
                         } else {
-                            let (epoch, now) = {
-                                let times = self.horizon.lock();
-                                (times.bank_epoch(), times.clock.through_latest())
-                            };
                             // Plain and front passes emit 1.0 token per step on
                             // the clock (`Advance::Known(1.0)`), matching
                             // `Shadows::step`'s denominator.
@@ -1968,8 +1964,6 @@ impl Telemetry {
                                 verifies: false,
                                 depth,
                                 real: missed_total,
-                                epoch,
-                                now,
                             });
                         }
                     }
@@ -2467,16 +2461,10 @@ impl Telemetry {
             .pending_verify
             .take_if(|(pending_step, ..)| *pending_step == step);
         if let Some((_, depth, missed_total)) = pending {
-            let (epoch, now) = {
-                let times = self.horizon.lock();
-                (times.bank_epoch(), times.clock.through_latest())
-            };
             self.shadow_state.lock().expect("watcher telemetry shadow state").pending_executed.push(ExecutedStep {
                 verifies: true,
                 depth,
                 real: missed_total / emitted,
-                epoch,
-                now,
             });
         }
     }
@@ -2524,14 +2512,14 @@ impl Telemetry {
             }
             let shadows = guard.as_mut().expect("shadows initialized");
             shadows.read_log(fed);
-            for ev in executed {
-                shadows.executed(ev.verifies, ev.depth, ev.real, ev.epoch, ev.now);
-            }
-            let reentries = shadows.take_reentries();
             let (epoch, now) = {
                 let times = self.horizon.lock();
                 (times.bank_epoch(), times.clock.through_latest())
             };
+            for ev in executed {
+                shadows.executed(ev.verifies, ev.depth, ev.real, epoch, now);
+            }
+            let reentries = shadows.take_reentries();
             let gaps = shadows.gaps(epoch, now);
             self.shadow_state.lock().expect("watcher telemetry shadow state").gaps = gaps;
             reentries
