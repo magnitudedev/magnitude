@@ -159,6 +159,55 @@ inline ulong raw_index(ulong row, ulong head, ulong state_row, constant ulong *s
 // (an MTP verify slot gets the bits of one-row decode).
 #define RECURRENT_SEQUENTIAL_ROWS SEISMIC_CONST_SEQUENTIAL_ROWS
 
+// Loads a simdgroup's LANE_ROWS x COLUMNS state rows from `initial` (rows
+// `stride` floats apart, columns contiguous), using float4 loads when
+// COLUMNS is a multiple of 4 and every row is 16-byte aligned.
+template <uint LANE_ROWS, uint COLUMNS>
+inline void load_state_rows(device const float *initial, ulong stride, thread float (&state)[LANE_ROWS][COLUMNS]) {
+    if constexpr (COLUMNS % 4 == 0) {
+        if (((reinterpret_cast<ulong>(initial) & 15u) == 0) && ((stride & 3u) == 0)) {
+            RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
+                device const float *row = initial + r * stride;
+                RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; j += 4) {
+                    const float4 v = *reinterpret_cast<device const float4 *>(row + j);
+                    state[r][j + 0] = v.x;
+                    state[r][j + 1] = v.y;
+                    state[r][j + 2] = v.z;
+                    state[r][j + 3] = v.w;
+                }
+            }
+            return;
+        }
+    }
+    RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
+        RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+            state[r][j] = initial[r * stride + j];
+        }
+    }
+}
+
+// Stores a simdgroup's LANE_ROWS x COLUMNS state rows to `published` (rows
+// `stride` floats apart, columns contiguous), using 4-float vector stores
+// when COLUMNS is a multiple of 4.
+template <uint LANE_ROWS, uint COLUMNS>
+inline void store_state_rows(element::Out<element::F32> published, ulong stride,
+    thread const float (&state)[LANE_ROWS][COLUMNS]) {
+    if constexpr (COLUMNS % 4 == 0) {
+        RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
+            const ulong row = r * stride;
+            RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; j += 4) {
+                published.put4(row + j, float4(state[r][j + 0], state[r][j + 1], state[r][j + 2], state[r][j + 3]));
+            }
+        }
+        return;
+    }
+    RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
+        RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+            published.put(r * stride + j, state[r][j]);
+        }
+    }
+}
+
 // The row-sequential delta rule over the slot's rows [begin, hi) with value
 // head `head`'s gates `gates` (`HeadGates`): S <- S diag(d) + beta (v -
 // S diag(d) k) k^T, output S q, the arithmetic of the step entries (a
@@ -217,11 +266,7 @@ inline void advance_rows(Inputs inputs, RowGates gates,
     const element::Out<element::F32> published =
         versions::bank(delta, slot.target, SEISMIC_DELTA_STRIDE_0, seismic_words).offset(lane_state);
     float state[LANE_ROWS][COLUMNS];
-    RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
-        RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-            state[r][j] = initial[r * SEISMIC_DELTA_STRIDE_2 + j];
-        }
-    }
+    load_state_rows(initial, SEISMIC_DELTA_STRIDE_2, state);
     for (long entry = 0; begin == lo && entry < slot.taped; ++entry) {
         device const float *row = tape_view(tape, slot.source, entry, seismic_words);
         // One decay per value head is loaded once.
@@ -239,11 +284,7 @@ inline void advance_rows(Inputs inputs, RowGates gates,
         }
     }
     if (begin == lo && publish == lo) {
-        RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
-            RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                published.put(r * SEISMIC_DELTA_STRIDE_2 + j, state[r][j]);
-            }
-        }
+        store_state_rows(published, SEISMIC_DELTA_STRIDE_2, state);
     }
     const ulong value_channel = (2 * key_heads + head) * width + block_row0;
     for (long first = begin; first < hi; first += SPAN) {
@@ -342,14 +383,13 @@ inline void advance_rows(Inputs inputs, RowGates gates,
                 mixed[raw_index(ulong(row), head, row0 + lane, seismic_words)] = activation::Act::store(mine);
             }
             if (row + 1 == publish) {
-                RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
-                    RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                        published.put(r * SEISMIC_DELTA_STRIDE_2 + j, state[r][j]);
-                    }
-                }
+                store_state_rows(published, SEISMIC_DELTA_STRIDE_2, state);
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // The next span restages the threadgroup rows.
+        if (first + long(SPAN) < hi) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 }
 
@@ -376,6 +416,48 @@ inline GateInput projected_gate(device const Storage *projection, constant ulong
     return GateInput{projection + (2 * SEISMIC_DIM_NK + SEISMIC_DIM_NV) * SEISMIC_DIM_W, SEISMIC_PROJECTION_STRIDE_0};
 }
 
+// Eight contiguous elements of E as (even, odd) float4s: one 16-byte load for
+// 16-bit elements (two float4 loads for F32) when 16-byte aligned, scalar
+// fallback otherwise. Overloaded for plain and coherent device pointers.
+template <typename E>
+inline void load8_contiguous(device const typename E::storage *from, thread float4 &even, thread float4 &odd) {
+    if ((reinterpret_cast<ulong>(from) & 15u) == 0) {
+        if constexpr (E::bytes == 2) {
+            E::split8(*reinterpret_cast<device const uint4 *>(from), even, odd);
+        } else {
+            const float4 a = *reinterpret_cast<device const float4 *>(from);
+            const float4 b = *reinterpret_cast<device const float4 *>(from + 4);
+            even = float4(a.x, a.z, b.x, b.z);
+            odd = float4(a.y, a.w, b.y, b.w);
+        }
+        return;
+    }
+    RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
+        even[j] = E::load(from[2 * j]);
+        odd[j] = E::load(from[2 * j + 1]);
+    }
+}
+
+template <typename E>
+inline void load8_contiguous(arrive::coherent_device<const typename E::storage> from,
+    thread float4 &even, thread float4 &odd) {
+    if ((reinterpret_cast<ulong>(from) & 15u) == 0) {
+        if constexpr (E::bytes == 2) {
+            E::split8(*reinterpret_cast<arrive::coherent_device<const uint4>>(from), even, odd);
+        } else {
+            const float4 a = *reinterpret_cast<arrive::coherent_device<const float4>>(from);
+            const float4 b = *reinterpret_cast<arrive::coherent_device<const float4>>(from + 4);
+            even = float4(a.x, a.z, b.x, b.z);
+            odd = float4(a.y, a.w, b.y, b.w);
+        }
+        return;
+    }
+    RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
+        even[j] = E::load(from[2 * j]);
+        odd[j] = E::load(from[2 * j + 1]);
+    }
+}
+
 // The inputs of columns i..i+7 of (row, head) as (even, odd): raw outputs,
 // z and the norm weights.
 struct Gated8 {
@@ -390,13 +472,21 @@ inline Gated8 gated_inputs8(Mixed mixed, long covered, GateInput input,
     const bool slotted = long(row) < covered;
     device const Storage *z = input.first + row * input.stride + head * SEISMIC_DIM_W + i;
     Gated8 v;
-    RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
-        v.raw_even[j] = slotted ? activation::Act::load(raw[2 * j]) : 0.0f;
-        v.raw_odd[j] = slotted ? activation::Act::load(raw[2 * j + 1]) : 0.0f;
-        v.z_even[j] = activation::Act::load(z[2 * j]);
-        v.z_odd[j] = activation::Act::load(z[2 * j + 1]);
-        v.norm_even[j] = element::at<Norm>(norm, ulong(i + 2 * j) * SEISMIC_RECURRENT_NORM_STRIDE_0);
-        v.norm_odd[j] = element::at<Norm>(norm, ulong(i + 2 * j + 1) * SEISMIC_RECURRENT_NORM_STRIDE_0);
+    if (slotted) {
+        load8_contiguous<activation::Act>(raw, v.raw_even, v.raw_odd);
+    } else {
+        v.raw_even = float4(0.0f);
+        v.raw_odd = float4(0.0f);
+    }
+    load8_contiguous<activation::Act>(z, v.z_even, v.z_odd);
+    if (SEISMIC_RECURRENT_NORM_STRIDE_0 == 1) {
+        load8_contiguous<Norm>(reinterpret_cast<device const typename Norm::storage *>(norm) + i,
+            v.norm_even, v.norm_odd);
+    } else {
+        RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
+            v.norm_even[j] = element::at<Norm>(norm, ulong(i + 2 * j) * SEISMIC_RECURRENT_NORM_STRIDE_0);
+            v.norm_odd[j] = element::at<Norm>(norm, ulong(i + 2 * j + 1) * SEISMIC_RECURRENT_NORM_STRIDE_0);
+        }
     }
     return v;
 }
@@ -409,11 +499,20 @@ inline void store_gated8(thread const Gated8 &v, float inverse, element::Out<act
     const bool sigmoid = int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == functions::gate_sigmoid;
     const float4 ae = (sigmoid ? 1.0f : v.z_even) / (1.0f + metal::exp(-v.z_even));
     const float4 ao = (sigmoid ? 1.0f : v.z_odd) / (1.0f + metal::exp(-v.z_odd));
+    float4 out_even, out_odd;
+    RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
+        out_even[j] = activation::Act::round(e[j]) * activation::Act::round(ae[j]);
+        out_odd[j] = activation::Act::round(o[j]) * activation::Act::round(ao[j]);
+    }
     const element::Out<activation::Act> out = gated.offset(row * SEISMIC_RESULT_0_STRIDE_0
         + head * SEISMIC_RESULT_0_STRIDE_1);
-    RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
-        out.put((i + 2 * j) * SEISMIC_RESULT_0_STRIDE_2, activation::Act::round(e[j]) * activation::Act::round(ae[j]));
-        out.put((i + 2 * j + 1) * SEISMIC_RESULT_0_STRIDE_2, activation::Act::round(o[j]) * activation::Act::round(ao[j]));
+    if (SEISMIC_RESULT_0_STRIDE_2 == 1 && (reinterpret_cast<ulong>(out.stored(i)) & 15u) == 0) {
+        out.put8(i, out_even, out_odd);
+    } else {
+        RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
+            out.put((i + 2 * j) * SEISMIC_RESULT_0_STRIDE_2, out_even[j]);
+            out.put((i + 2 * j + 1) * SEISMIC_RESULT_0_STRIDE_2, out_odd[j]);
+        }
     }
 }
 

@@ -428,7 +428,10 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const RowGates &g
             for (int s = 0; s < ROWS; ++s) {
                 float sum = 0.0f;
 #pragma unroll
-                for (int c = 0; c < CPL; ++c) sum = __fmaf_rn(state[s][c] * factor[c], k[c], sum);
+                for (int c = 0; c < CPL; ++c) {
+                    state[s][c] *= factor[c];
+                    sum = __fmaf_rn(state[s][c], k[c], sum);
+                }
                 remembered[s] = sum;
             }
 #pragma unroll
@@ -454,7 +457,7 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const RowGates &g
                 float sum = 0.0f;
 #pragma unroll
                 for (int c = 0; c < CPL; ++c) {
-                    state[s][c] = __fmaf_rn(residual, k[c], state[s][c] * factor[c]);
+                    state[s][c] = __fmaf_rn(residual, k[c], state[s][c]);
                     sum = __fmaf_rn(state[s][c], q[c], sum);
                 }
                 output[s] = sum;
@@ -475,6 +478,49 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const RowGates &g
     }
 }
 
+// Gates (row, head) with one warp: each lane keeps its CPL = W / 32 raw
+// values in registers across the warp sum so `mixed` is read once. `COHERENT`
+// reads through L2 (`__ldcg`) for values other blocks published in the same
+// launch (`gate_head`).
+template <class NORM, bool COHERENT>
+__device__ __forceinline__ void gate_warp(const Inputs &in, const GateInput &input, const u8 *mixed, const u8 *norm,
+                                          float eps, const element::Out<Act> &gated, int row, int head, bool covered) {
+    static_assert(W % 32 == 0, "head width divides into warp lanes");
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+    const typename Act::storage *raw = reinterpret_cast<const typename Act::storage *>(mixed);
+    const int lane = threadIdx.x % 32;
+    float values[CPL];
+    float total = 0.0f;
+#pragma unroll
+    for (int c = 0; c < CPL; ++c) {
+        const int i = lane + c * 32;
+        float v = 0.0f;
+        if (covered) {
+            const u64 index = raw_index(row, head, i);
+            if constexpr (COHERENT) {
+                v = Act::load(__ldcg(raw + index));
+            } else {
+                v = Act::load(raw[index]);
+            }
+        }
+        values[c] = v;
+        total = __fmaf_rn(v, v, total);
+    }
+    // The butterfly leaves every lane the same sum.
+    total = seismic_warp_sum_f32(total);
+    const float inverse = rsqrtf(total / static_cast<float>(W) + eps);
+#pragma unroll
+    for (int c = 0; c < CPL; ++c) {
+        const int i = lane + c * 32;
+        const float normalized = Act::round(values[c] * inverse * element::at<NORM>(norm, i));
+        const float z = input.at(row, head * W + i);
+        const float activated = Act::round(functions::output_gate((int)SEISMIC_PARAM_GATE_FUNCTION, z));
+        gated.put(static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 + static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
+                      static_cast<u64>(i) * SEISMIC_RESULT_0_STRIDE_2,
+                  normalized * activated);
+    }
+}
+
 // The `gate` launch of every entry: block `row` forms the row's gated result
 // from its raw outputs `mixed`. Per value head (one warp each, lanes striding
 // the head's columns, then a warp sum),
@@ -485,33 +531,11 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const RowGates &g
 template <class NORM>
 __device__ __forceinline__ void gate_row(const Inputs &in, const GateInput &input, const u8 *mixed, const u8 *norm,
                                          float eps, const element::Out<Act> &gated, int row) {
-    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    __shared__ float inverses[NV];
     // A row no slot covers has zero raw outputs, which no block stores.
     const bool covered = row < covered_end(in);
-    auto raw_at = [&](int head, int i) { return covered ? element::at<Act>(mixed, raw_index(row, head, i)) : 0.0f; };
     const int warps = blockDim.x / 32;
-    for (int head = threadIdx.x / 32; head < NV; head += warps) {
-        float total = 0.0f;
-        for (int i = threadIdx.x % 32; i < W; i += 32) {
-            const float v = raw_at(head, i);
-            total = __fmaf_rn(v, v, total);
-        }
-        total = seismic_warp_sum_f32(total);
-        const float inverse = rsqrtf(total / static_cast<float>(W) + eps);
-        if (threadIdx.x % 32 == 0) inverses[head] = inverse;
-    }
-    __syncthreads();
-    for (int k = threadIdx.x; k < NV * W; k += blockDim.x) {
-        const int head = k / W, i = k % W;
-        const float v = raw_at(head, i);
-        const float normalized = Act::round(v * inverses[head] * element::at<NORM>(norm, i));
-        const float z = input.at(row, k);
-        const float activated = Act::round(functions::output_gate((int)SEISMIC_PARAM_GATE_FUNCTION, z));
-        gated.put(static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 + static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
-                      static_cast<u64>(i) * SEISMIC_RESULT_0_STRIDE_2,
-                  normalized * activated);
-    }
+    for (int head = threadIdx.x / 32; head < NV; head += warps)
+        gate_warp<NORM, false>(in, input, mixed, norm, eps, gated, row, head, covered);
 }
 
 // `gate_row`'s arithmetic for one value head over every row, one warp per
@@ -521,30 +545,9 @@ template <class NORM>
 __device__ __forceinline__ void gate_head(const Inputs &in, const GateInput &input, const u8 *mixed, const u8 *norm,
                                           float eps, const element::Out<Act> &gated, int head) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    const typename Act::storage *raw = reinterpret_cast<const typename Act::storage *>(mixed);
-    const int lane = threadIdx.x % 32;
     const int covered = covered_end(in);
-    for (int row = threadIdx.x / 32; row < static_cast<int>(SEISMIC_DIM_M); row += blockDim.x / 32) {
-        // A row no slot covers has zero raw outputs, which no block stores.
-        auto raw_at = [&](int i) { return row < covered ? Act::load(__ldcg(raw + raw_index(row, head, i))) : 0.0f; };
-        float total = 0.0f;
-        for (int i = lane; i < W; i += 32) {
-            const float v = raw_at(i);
-            total = __fmaf_rn(v, v, total);
-        }
-        // The butterfly leaves every lane the same sum.
-        total = seismic_warp_sum_f32(total);
-        const float inverse = rsqrtf(total / static_cast<float>(W) + eps);
-        for (int i = lane; i < W; i += 32) {
-            const float v = raw_at(i);
-            const float normalized = Act::round(v * inverse * element::at<NORM>(norm, i));
-            const float z = input.at(row, head * W + i);
-            const float activated = Act::round(functions::output_gate((int)SEISMIC_PARAM_GATE_FUNCTION, z));
-            gated.put(static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 + static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
-                          static_cast<u64>(i) * SEISMIC_RESULT_0_STRIDE_2,
-                      normalized * activated);
-        }
-    }
+    for (int row = threadIdx.x / 32; row < static_cast<int>(SEISMIC_DIM_M); row += blockDim.x / 32)
+        gate_warp<NORM, true>(in, input, mixed, norm, eps, gated, row, head, row < covered);
 }
 
 // The row-sequential step entries' body (`gated_delta_step`,
