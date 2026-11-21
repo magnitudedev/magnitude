@@ -20,6 +20,7 @@ use super::{
 use crate::device_table::{SelectedRead, SubmittedRead};
 use crate::host_tables::HostTableError;
 use crate::stored_table::{NoticeStep, StepRows, StoredTable};
+use crate::operators::attention::graph::{AttentionReadControls, IndexerHistoryPorts};
 use crate::operators::attention::pooled::ListPorts;
 use crate::operators::block::{BankPorts, HistoryPorts};
 use crate::operators::streams::ResidualCarry;
@@ -2415,12 +2416,9 @@ impl NativeTargetProgram {
             // controls.
             if let Some(HistoryPorts {
                 planes: ports,
-                indexer_planes,
                 coordinates,
-                visible,
-                fresh,
                 destinations,
-                history_tiles,
+                read: AttentionReadControls { visible, fresh, history_tiles },
                 indexer,
                 picked,
             }) = &graph.state.history
@@ -2491,44 +2489,40 @@ impl NativeTargetProgram {
                 // destinations in their Window read and destinations in
                 // their Block read, and where its class scores, its
                 // indexer's spans, complete units and unit lists there.
-                match (indexer_planes, indexer) {
-                    (Some(planes), Some(tables)) => {
-                        let [(window_read, window), (block_read, blocks)] =
-                            state.indexer(index as u32)?;
-                        let [window_keys, window_coordinates] = window.as_slice() else {
-                            return Err(invalid("a selected read's pending-key planes are not two"));
-                        };
-                        let [block_keys] = blocks.as_slice() else {
-                            return Err(invalid("a selected read's unit-key planes are not one"));
-                        };
-                        for (port, plane) in [
-                            (&planes.window_keys, window_keys),
-                            (&planes.window_coordinates, window_coordinates),
-                            (&planes.block_keys, block_keys),
-                        ] {
-                            bindings.set(&self.unallocating(), port, plane).map_err(device)?;
-                        }
-                        let read = |read| LaunchControl::Visible { read };
-                        let index_tables = tables.index.iter().flat_map(|index| {
-                            [
-                                (&index.block_visible, read(block_read)),
-                                (&index.complete, LaunchControl::Complete { read: block_read }),
-                                (&index.units, LaunchControl::Units { read: block_read }),
-                            ]
-                        });
-                        for (port, control) in [
-                            (&tables.window_visible, read(window_read)),
-                            (&tables.window_destinations, LaunchControl::Destinations { read: window_read }),
-                            (&tables.block_destinations, LaunchControl::Destinations { read: block_read }),
-                        ]
-                        .into_iter()
-                        .chain(index_tables)
-                        {
-                            bindings.set(&self.unallocating(), port, controls.bound(control)?).map_err(device)?;
-                        }
+                if let Some(IndexerHistoryPorts { planes, tables }) = indexer {
+                    let [(window_read, window), (block_read, blocks)] =
+                        state.indexer(index as u32)?;
+                    let [window_keys, window_coordinates] = window.as_slice() else {
+                        return Err(invalid("a selected read's pending-key planes are not two"));
+                    };
+                    let [block_keys] = blocks.as_slice() else {
+                        return Err(invalid("a selected read's unit-key planes are not one"));
+                    };
+                    for (port, plane) in [
+                        (&planes.window_keys, window_keys),
+                        (&planes.window_coordinates, window_coordinates),
+                        (&planes.block_keys, block_keys),
+                    ] {
+                        bindings.set(&self.unallocating(), port, plane).map_err(device)?;
                     }
-                    (None, None) => {}
-                    _ => return Err(invalid("a selected read's planes and tables disagree")),
+                    let read = |read| LaunchControl::Visible { read };
+                    let index_tables = tables.index.iter().flat_map(|index| {
+                        [
+                            (&index.block_visible, read(block_read)),
+                            (&index.complete, LaunchControl::Complete { read: block_read }),
+                            (&index.units, LaunchControl::Units { read: block_read }),
+                        ]
+                    });
+                    for (port, control) in [
+                        (&tables.window_visible, read(window_read)),
+                        (&tables.window_destinations, LaunchControl::Destinations { read: window_read }),
+                        (&tables.block_destinations, LaunchControl::Destinations { read: block_read }),
+                    ]
+                    .into_iter()
+                    .chain(index_tables)
+                    {
+                        bindings.set(&self.unallocating(), port, controls.bound(control)?).map_err(device)?;
+                    }
                 }
                 let (read, history) = state.history(LayerRef::Target(index as u32))?;
                 if history.len() != ports.len() {

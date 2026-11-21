@@ -4303,13 +4303,13 @@ fn write_controls(
     active
         .write_input(&ports.coordinates, &controls.coordinates)
         .map_err(device)?;
-    if let Some(visible) = &ports.visible {
+    if let Some(read) = &ports.read {
         active
-            .write_input(visible, &controls.visible)
+            .write_input(&read.visible, &controls.visible)
             .map_err(device)?;
-    }
-    if let Some(fresh) = &ports.fresh {
-        active.write_input(fresh, &controls.fresh).map_err(device)?;
+        active
+            .write_input(&read.fresh, &controls.fresh)
+            .map_err(device)?;
     }
     active
         .write_input(&ports.destinations, &controls.destinations)

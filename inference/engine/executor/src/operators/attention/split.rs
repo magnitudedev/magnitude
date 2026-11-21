@@ -11,9 +11,8 @@
 //!
 //! An optional part is an `Option` on each side: its reals in the topology,
 //! its numbers in the block. [`split`] is their only constructor (the part
-//! fields are private to the attention operator) and every map keeps an
-//! `Option`'s shape, so the two agree; a builder takes them together
-//! ([`both`]), and a disagreement is an invariant violation.
+//! fields are private to this module) and every map keeps an `Option`'s shape,
+//! so the two agree; builders view them paired once through [`AttentionPair`].
 
 use super::graph::{rotary_amplitudes, rotary_components, rotary_frequencies};
 use super::pooled::{PickedBlock, PickedPlane};
@@ -102,10 +101,10 @@ pub(crate) struct AttentionTopology<R = Argument<f64>, T = Table> {
     /// The optional parts' reals, each present exactly where
     /// [`AttentionBlock`] holds the part.
     /// Source 0's key rounding's floor (`KR`).
-    pub(in crate::operators::attention) key_rounding: Option<R>,
-    pub(in crate::operators::attention) low_rank_query: Option<LowRankReals<R>>,
-    pub(in crate::operators::attention) selection: Option<SelectionReals<R>>,
-    pub(in crate::operators::attention) picked: Option<PickedReals<R>>,
+    key_rounding: Option<R>,
+    low_rank_query: Option<LowRankReals<R>>,
+    selection: Option<SelectionReals<R>>,
+    picked: Option<PickedReals<R>>,
 }
 
 /// The rotary table's three columns: per rotated pair, its coordinate axis
@@ -119,51 +118,51 @@ pub(crate) struct RotaryTables<T> {
 
 /// A low-rank query's `qr` norm's epsilon.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct LowRankReals<R> {
-    pub epsilon: R,
+struct LowRankReals<R> {
+    epsilon: R,
 }
 
 /// A selected read's reals: its keys' norm's epsilon (`pool_rows`) and its
 /// indexer's.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct SelectionReals<R> {
-    pub key_epsilon: R,
-    pub indexer: IndexedReals<R>,
+struct SelectionReals<R> {
+    key_epsilon: R,
+    indexer: IndexedReals<R>,
 }
 
 /// An index-list source's reals: none for a reused one's.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum PickedReals<R> {
+enum PickedReals<R> {
     Reused,
     Indexed(IndexedReals<R>),
 }
 
 /// An indexing source's reals.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct IndexedReals<R> {
+struct IndexedReals<R> {
     /// Its query heads' own norm's epsilon, if they have one
     /// (`IndexerQuery::norm`).
-    pub query_norm: Option<R>,
+    query_norm: Option<R>,
     /// The epsilon of the norm of the keys it writes
     /// (`IndexerKeys::Latent`); none for keys it shares with their owner.
-    pub key_norm: Option<R>,
+    key_norm: Option<R>,
     /// Its score scale.
-    pub scale: R,
+    scale: R,
     /// Its query's and written keys' roundings' floors, each present
     /// exactly where [`IndexedSource`] holds the rounding.
-    pub(in crate::operators::attention) query_rounding: Option<R>,
-    pub(in crate::operators::attention) key_rounding: Option<R>,
+    query_rounding: Option<R>,
+    key_rounding: Option<R>,
     /// An own source's rows' reals, present exactly where
     /// [`IndexedSource::own`] is.
-    pub(in crate::operators::attention) own: Option<OwnReals<R>>,
+    own: Option<OwnReals<R>>,
 }
 
 /// An own source's rows' norm's epsilon and its rounding's floor, present
 /// exactly where [`OwnRows::rounding`] is.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct OwnReals<R> {
-    pub epsilon: R,
-    pub(in crate::operators::attention) rounding: Option<R>,
+struct OwnReals<R> {
+    epsilon: R,
+    rounding: Option<R>,
 }
 
 impl<R, T> Numbers<R> for AttentionTopology<R, T> {
@@ -244,14 +243,107 @@ impl<R, T> AttentionTopology<R, T> {
     }
 }
 
-/// An optional part's two sides together: its numbers and its reals, which
-/// [`split`] makes present together.
-///
-/// # Panics
-///
-/// Where one side holds the part and the other does not: no split makes
-/// such a pair.
-pub(in crate::operators::attention) fn both<'n, 'r, N, R>(
+/// A rounding specification's two sides together: its word axes (`D`) and
+/// its amax floor (`R`).
+pub(in crate::operators::attention) type RoundingPart<'a, D = Dim, R = Argument<f64>> =
+    (&'a RoundingWords<D>, &'a R);
+
+/// An attention block's optional parts paired once at the module boundary so
+/// every optional part's numbers and reals travel together.
+#[derive(Debug)]
+pub(in crate::operators::attention) struct AttentionPair<'a, D = Dim, R = Argument<f64>> {
+    pub key_rounding: Option<RoundingPart<'a, D, R>>,
+    pub low_rank_query: Option<LowRankPart<'a, D, R>>,
+    pub selection: Option<SelectionPart<'a, D, R>>,
+    pub picked: Option<PickedPart<'a, D, R>>,
+}
+
+impl<D, R> Clone for AttentionPair<'_, D, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<D, R> Copy for AttentionPair<'_, D, R> {}
+
+/// A low-rank query's rank and `qr` norm epsilon together.
+#[derive(Debug)]
+pub(in crate::operators::attention) struct LowRankPart<'a, D = Dim, R = Argument<f64>> {
+    pub rank: &'a D,
+    pub epsilon: &'a R,
+}
+
+impl<D, R> Clone for LowRankPart<'_, D, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<D, R> Copy for LowRankPart<'_, D, R> {}
+
+/// A selected read's numbers, key-norm epsilon and paired indexer together.
+#[derive(Debug)]
+pub(in crate::operators::attention) struct SelectionPart<'a, D = Dim, R = Argument<f64>> {
+    pub read: &'a SelectedRead<D>,
+    pub key_epsilon: &'a R,
+    pub indexer: IndexedPart<'a, D, R>,
+}
+
+impl<D, R> Clone for SelectionPart<'_, D, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<D, R> Copy for SelectionPart<'_, D, R> {}
+
+/// An index-list source's two sides together.
+#[derive(Debug)]
+pub(in crate::operators::attention) enum PickedPart<'a, D = Dim, R = Argument<f64>> {
+    Reused { plane: &'a Plane<D> },
+    Indexed(IndexedPart<'a, D, R>),
+}
+
+impl<D, R> Clone for PickedPart<'_, D, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<D, R> Copy for PickedPart<'_, D, R> {}
+
+/// An indexing source's numbers and reals paired together, including its
+/// roundings and optional own rows.
+#[derive(Debug)]
+pub(in crate::operators::attention) struct IndexedPart<'a, D = Dim, R = Argument<f64>> {
+    pub source: &'a IndexedSource<D>,
+    pub query_norm: Option<&'a R>,
+    pub key_norm: Option<&'a R>,
+    pub scale: &'a R,
+    pub query_rounding: Option<RoundingPart<'a, D, R>>,
+    pub key_rounding: Option<RoundingPart<'a, D, R>>,
+    pub own: Option<OwnPart<'a, D, R>>,
+}
+
+impl<D, R> Clone for IndexedPart<'_, D, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<D, R> Copy for IndexedPart<'_, D, R> {}
+
+/// An own source's rows, norm epsilon and optional rounding paired together.
+#[derive(Debug)]
+pub(in crate::operators::attention) struct OwnPart<'a, D = Dim, R = Argument<f64>> {
+    pub rows: &'a OwnRows<D>,
+    pub epsilon: &'a R,
+    pub rounding: Option<RoundingPart<'a, D, R>>,
+}
+
+impl<D, R> Clone for OwnPart<'_, D, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<D, R> Copy for OwnPart<'_, D, R> {}
+
+fn both<'n, 'r, N, R>(
     numbers: &'n Option<N>,
     reals: &'r Option<R>,
     part: &str,
@@ -263,27 +355,68 @@ pub(in crate::operators::attention) fn both<'n, 'r, N, R>(
     }
 }
 
-/// An index-list source's two sides together ([`both`]).
-pub(in crate::operators::attention) enum PickedPart<'n, D, R> {
-    Reused { plane: &'n Plane<D> },
-    Indexed { source: &'n IndexedSource<D>, reals: &'n IndexedReals<R> },
+fn own_part<'a, D, R>(rows: &'a OwnRows<D>, reals: &'a OwnReals<R>) -> OwnPart<'a, D, R> {
+    OwnPart {
+        rows,
+        epsilon: &reals.epsilon,
+        rounding: both(&rows.rounding, &reals.rounding, "own rows' rounding"),
+    }
 }
 
-/// A block's index-list source with its reals, if it has one.
-///
-/// # Panics
-///
-/// Where the two sides disagree: no split makes such a pair.
-pub(in crate::operators::attention) fn picked<'n, D, R, T>(
-    topology: &'n AttentionTopology<R, T>,
-    numbers: &'n AttentionBlock<D>,
-) -> Option<PickedPart<'n, D, R>> {
-    match both(&numbers.picked, &topology.picked, "index-list source")? {
-        (PickedSource::Reused { plane }, PickedReals::Reused) => Some(PickedPart::Reused { plane }),
-        (PickedSource::Indexed(source), PickedReals::Indexed(reals)) => {
-            Some(PickedPart::Indexed { source, reals })
+fn indexed_part<'a, D, R>(
+    source: &'a IndexedSource<D>,
+    reals: &'a IndexedReals<R>,
+) -> IndexedPart<'a, D, R> {
+    IndexedPart {
+        source,
+        query_norm: reals.query_norm.as_ref(),
+        key_norm: reals.key_norm.as_ref(),
+        scale: &reals.scale,
+        query_rounding: both(&source.query_rounding, &reals.query_rounding, "indexer query rounding"),
+        key_rounding: both(&source.key_rounding, &reals.key_rounding, "indexer key rounding"),
+        own: both(&source.own, &reals.own, "own rows").map(|(rows, reals)| own_part(rows, reals)),
+    }
+}
+
+impl<'a, D, R> AttentionPair<'a, D, R> {
+    /// Pair `topology` and `numbers` once, joining every optional part.
+    ///
+    /// # Panics
+    ///
+    /// Where the two sides disagree on any optional part: no [`split`] makes
+    /// such a pair.
+    pub(in crate::operators::attention) fn of<T>(
+        topology: &'a AttentionTopology<R, T>,
+        numbers: &'a AttentionBlock<D>,
+    ) -> Self {
+        let key_rounding = both(&numbers.key_rounding, &topology.key_rounding, "key rounding");
+        let low_rank_query = both(&numbers.low_rank_query, &topology.low_rank_query, "low-rank query")
+            .map(|(numbers, reals)| LowRankPart {
+                rank: &numbers.rank,
+                epsilon: &reals.epsilon,
+            });
+        let selection = both(&numbers.selection, &topology.selection, "selected read").map(
+            |(read, reals)| SelectionPart {
+                read,
+                key_epsilon: &reals.key_epsilon,
+                indexer: indexed_part(&read.source, &reals.indexer),
+            },
+        );
+        let picked = both(&numbers.picked, &topology.picked, "index-list source").map(
+            |pair| match pair {
+                (PickedSource::Reused { plane }, PickedReals::Reused) => PickedPart::Reused { plane },
+                (PickedSource::Indexed(source), PickedReals::Indexed(reals)) => {
+                    PickedPart::Indexed(indexed_part(source, reals))
+                }
+                _ => panic!("an attention block's index-list source numbers and reals disagree"),
+            },
+        );
+        Self {
+            key_rounding,
+            low_rank_query,
+            selection,
+            picked,
         }
-        _ => panic!("an attention block's index-list source numbers and reals disagree"),
     }
 }
 
@@ -305,12 +438,12 @@ pub(crate) struct AttentionBlock<D = Dim> {
     /// The entries' `gate_function` code.
     pub gate_function: D,
     /// Source 0's key rounding's scalars (`KR`).
-    pub(in crate::operators::attention) key_rounding: Option<RoundingWords<D>>,
-    pub(in crate::operators::attention) low_rank_query: Option<LowRankQuery<D>>,
+    key_rounding: Option<RoundingWords<D>>,
+    low_rank_query: Option<LowRankQuery<D>>,
     pub(in crate::operators::attention) grouped: Option<GroupedOutput<D>>,
     pub(in crate::operators::attention) absorbed: Option<AbsorbedQuery<D>>,
-    pub(in crate::operators::attention) selection: Option<SelectedRead<D>>,
-    pub(in crate::operators::attention) picked: Option<PickedSource<D>>,
+    selection: Option<SelectedRead<D>>,
+    picked: Option<PickedSource<D>>,
 }
 
 impl<D: Clone> AttentionBlock<D> {
@@ -349,8 +482,8 @@ impl AttentionBlock {
 
 /// A low-rank query's rank.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct LowRankQuery<D = Dim> {
-    pub rank: D,
+struct LowRankQuery<D = Dim> {
+    rank: D,
 }
 
 /// An absorbed query's `project_rows` axes (`AbsorbedQueryShape`).
@@ -406,7 +539,7 @@ pub(crate) struct Plane<D = Dim> {
 /// An index-list source: another layer's picks over a plane, or its own
 /// indexer's.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum PickedSource<D = Dim> {
+enum PickedSource<D = Dim> {
     Reused { plane: Plane<D> },
     Indexed(IndexedSource<D>),
 }
@@ -427,10 +560,10 @@ pub(crate) struct IndexedSource<D = Dim> {
     /// Whether its head weights are projected (`HeadWeights::Projected`).
     pub head_weights: bool,
     /// Its query's and written keys' roundings' scalars.
-    pub(in crate::operators::attention) query_rounding: Option<RoundingWords<D>>,
-    pub(in crate::operators::attention) key_rounding: Option<RoundingWords<D>>,
+    query_rounding: Option<RoundingWords<D>>,
+    key_rounding: Option<RoundingWords<D>>,
     /// An own source's rows; none for a Reindex source.
-    pub(in crate::operators::attention) own: Option<OwnRows<D>>,
+    own: Option<OwnRows<D>>,
 }
 
 /// The candidates an indexer scores: every complete unit, every unit while
@@ -447,7 +580,7 @@ pub(crate) enum Candidates<D = Dim> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct OwnRows<D = Dim> {
     pub gated: bool,
-    pub(in crate::operators::attention) rounding: Option<RoundingWords<D>>,
+    rounding: Option<RoundingWords<D>>,
     pub rate: D,
     pub window: Option<Plane<D>>,
 }

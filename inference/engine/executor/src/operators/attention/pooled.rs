@@ -34,7 +34,7 @@
 
 use super::graph::{IndexerWeights, PickedReads};
 use crate::operators::scalar;
-use super::split::{AttentionBlock, AttentionTopology, Candidates, IndexedReals, IndexedSource, OwnReals, OwnRows, Plane, both};
+use super::split::{AttentionBlock, AttentionTopology, Candidates, IndexedPart, IndexedSource, OwnPart, Plane};
 use crate::planning::{RoundingArguments, axis};
 use super::selection::{
     self, IndexerClass, IndexerElements, IndexerEntries, IndexerInputs, KeyWrite, Projection, ProjectionInput,
@@ -281,8 +281,7 @@ pub(crate) struct PooledWindow {
 /// with what it takes of the attention's input, or a reused source's plane.
 pub(crate) enum Picked<'o, 'v, 'a, G: GraphDraft + 'a> {
     Indexed {
-        source: &'o IndexedSource<Dim>,
-        reals: &'o IndexedReals<Argument<f64>>,
+        indexed: IndexedPart<'o>,
         inputs: PickedInputs<'v, 'a, G>,
     },
     Reused {
@@ -316,7 +315,7 @@ pub(crate) struct PickedInputs<'v, 'a, G: GraphDraft + 'a> {
 impl<'a, G: GraphDraft + 'a> Picked<'_, '_, 'a, G> {
     pub(crate) fn plane(&self) -> &Plane<Dim> {
         match self {
-            Self::Indexed { source, .. } => &source.plane,
+            Self::Indexed { indexed, .. } => &indexed.source.plane,
             Self::Reused { plane } => plane,
         }
     }
@@ -405,8 +404,7 @@ fn own_rows<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     topology: &AttentionTopology,
     numbers: &AttentionBlock,
-    own: &OwnRows<Dim>,
-    own_reals: &OwnReals<Argument<f64>>,
+    own: OwnPart<'_>,
     plane_numbers: &Plane<Dim>,
     plane: &mut NativePort,
     entries: PooledEntries<'a, G>,
@@ -419,9 +417,9 @@ fn own_rows<'a, G: GraphDraft + 'a>(
     let form = &topology.form;
     let (rows, width) = (&numbers.rows, &numbers.widths.width);
     let pairs = &numbers.widths.rotary_pairs;
-    let pooled_epsilon = own_reals.epsilon.f32();
+    let pooled_epsilon = own.epsilon.f32();
     let slab_rows = |plane: &Plane<Dim>| scalar::<u32>(&plane.slab_rows, "slab rows");
-    let gt = axis(own.gated);
+    let gt = axis(own.rows.gated);
     let gate_rows = &gt * width;
     // The tokens' `u` and `g` under the input norm, then in F32.
     let empty = weights.projection.weight.slice_leading(0, 0);
@@ -502,7 +500,7 @@ fn own_rows<'a, G: GraphDraft + 'a>(
         Some(_) => projected.r0.clone(),
         None => widen(graph, &projected.r0, width)?,
     };
-    let rounding = RoundingArguments::of(both(&own.rounding, &own_reals.rounding, "own rows' rounding"))?;
+    let rounding = RoundingArguments::of(own.rounding)?;
     let [components, frequencies, amplitudes] = rotary;
     let norm = weights.norm.reshape(&[Dim::from(1), width.clone()]);
     // The entry's `form`: the row's rotary layout (RA, RT), then `rest`.
@@ -526,7 +524,7 @@ fn own_rows<'a, G: GraphDraft + 'a>(
         ("RA", axis(form.rotary_adjacent)),
         ("RT", axis(form.rotary_trailing)),
     ];
-    let pooling = (entries.pool, own.window.as_ref());
+    let pooling = (entries.pool, own.rows.window.as_ref());
     let (pooled, block_destinations, window) = match pooling {
         // Groups of the rate, the incomplete group's tokens in the Window
         // domain, read through its spans.
@@ -545,7 +543,7 @@ fn own_rows<'a, G: GraphDraft + 'a>(
                     ("PR", Dim::from(0)),
                     ("TN", Dim::from(0)),
                     ("R", numbers.segments.clone()),
-                    ("RATE", own.rate.clone()),
+                    ("RATE", own.rows.rate.clone()),
                 ],
             ]
             .concat();
@@ -566,7 +564,7 @@ fn own_rows<'a, G: GraphDraft + 'a>(
             let mut block_rows = plane
                 .tensor_mut()
                 .reshape(&[plane_numbers.rows.clone(), width.clone()]);
-            let form = form_table(&[own.rate.clone(), gt]);
+            let form = form_table(&[own.rows.rate.clone(), gt]);
             let pooled = graph.enqueue(
                 entry,
                 &dimensions,
@@ -699,8 +697,8 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
     let form = &topology.form;
     let widths = &numbers.widths;
     let (rows, width, kv_heads) = (&numbers.rows, &widths.width, &widths.kv_heads);
-    let (index, reals, inputs) = match picked {
-        Picked::Indexed { source, reals, inputs } => (source, reals, inputs),
+    let (indexed, inputs) = match picked {
+        Picked::Indexed { indexed, inputs } => (indexed, inputs),
         Picked::Reused { plane: plane_numbers } => {
             let plane = plane_port(graph, topology.activation, plane_numbers, width)?;
             let picks = graph.port(Element::i32(), &[rows.clone(), widths.picks.clone()])?;
@@ -721,6 +719,7 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
             ));
         }
     };
+    let index = indexed.source;
     let IndexedSource {
         plane: plane_numbers,
         width: index_width,
@@ -732,14 +731,13 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
     let mut plane = plane_port(graph, topology.activation, plane_numbers, width)?;
     let weights = inputs.weights;
     // An own source makes its rows, whose keys its indexer writes.
-    let pooled = match (both(&index.own, &reals.own, "own rows"), inputs.entries.rows, &weights.rows) {
-        (Some((own, own_reals)), Some(entries), Some(rows_weights)) => {
+    let pooled = match (indexed.own, inputs.entries.rows, &weights.rows) {
+        (Some(own), Some(entries), Some(rows_weights)) => {
             let (pooled, ports) = own_rows(
                 graph,
                 topology,
                 numbers,
                 own,
-                own_reals,
                 plane_numbers,
                 &mut plane,
                 entries,
@@ -768,7 +766,7 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
     };
     let pairs = &widths.rotary_pairs;
     let class = IndexerClass {
-        source: index,
+        indexed,
         rows: rows.clone(),
         spans: list_spans.clone(),
         scores: list_scores.clone(),
@@ -895,7 +893,6 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
     let indexed = selection::indexer(
         graph,
         &class,
-        reals,
         entries,
         IndexerInputs {
             query_input: ProjectionInput {
