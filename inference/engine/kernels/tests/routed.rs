@@ -3984,9 +3984,8 @@ struct GroupedForm {
 /// (`routed_experts`', `routed_combine`'s), each of one GEMM with the other
 /// at its default. Metal: the expansion's (`TALL`, `INT8`, `PACK`), then the
 /// down GEMM's (`DOWN_TALL`, `DOWN_INT8`, `DOWN_PACK`), dense's forms: the
-/// tall tiles against the experts' staged default, the staged ones against
-/// the shared expert's tall default, INT8 and PACK each on the tall tiles.
-/// CUDA and the CPU: INT8, which takes both GEMMs.
+/// staged tiles against the tall default, INT8 and PACK each on the tall
+/// tiles. CUDA and the CPU: INT8, which takes both GEMMs.
 fn grouped_forms(device: &seismic::Device) -> Vec<[GroupedForm; 2]> {
     fn form(params: &[(&'static str, u64)], quantized: bool) -> GroupedForm {
         GroupedForm {
@@ -3999,7 +3998,7 @@ fn grouped_forms(device: &seismic::Device) -> Vec<[GroupedForm; 2]> {
             .into_iter()
             .flat_map(|(tall, int8, pack)| {
                 [
-                    [form(&[(tall, 1)], false), form(&[(tall, 0)], false)],
+                    [form(&[(tall, 0)], false), form(&[(tall, 0)], false)],
                     [form(&[(tall, 1), (int8, 1)], true), form(&[(int8, 1)], true)],
                     [form(&[(tall, 1), (pack, 1)], true), form(&[(pack, 1)], true)],
                 ]
