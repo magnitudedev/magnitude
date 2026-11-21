@@ -85,9 +85,21 @@ typedef head_layout::table rotary_table;
 inline void append(element::Out<activation::Act> history, int destination, uint kv_head, uint lane,
     thread const float (&x)[ATTENTION_E]) {
     const ulong target = (ulong(destination) * SEISMIC_DIM_KV + kv_head) * ATTENTION_W + lane * ATTENTION_E;
-    ATTENTION_UNROLL
-    for (uint i = 0; i < ATTENTION_E; ++i)
-        history.put(target + i, x[i]);
+    if constexpr (ATTENTION_E % 4 == 0) {
+        constexpr uint COUNT = ATTENTION_E % 4 == 0 ? ATTENTION_E : 0;
+        ATTENTION_UNROLL
+        for (uint i = 0; i < COUNT; i += 4)
+            history.put4(target + i, float4(x[i], x[i + 1], x[i + 2], x[i + 3]));
+    } else if constexpr (ATTENTION_E % 2 == 0) {
+        constexpr uint COUNT = ATTENTION_E % 2 == 0 ? ATTENTION_E : 0;
+        ATTENTION_UNROLL
+        for (uint i = 0; i < COUNT; i += 2)
+            history.put2(target + i, x[i], x[i + 1]);
+    } else {
+        ATTENTION_UNROLL
+        for (uint i = 0; i < ATTENTION_E; ++i)
+            history.put(target + i, x[i]);
+    }
 }
 
 // A dense plane as its owner's slab table, typed by the activation element: only the write path
