@@ -73,8 +73,12 @@ struct GatheredPublishEpi {
 
 #define ROUTED_OUTPUT_SUMMED_BODY(TPW, KSPLIT)                                                                     \
     using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                                \
+    using ExpertReaders = routed::DecodeReaders<packets::W0>;                                                      \
+    using SharedReaders = routed::DecodeReaders<packets::W1>;                                                      \
+    using Points = typename projection::PointsOf<                                                                  \
+        typename routed::DecodeUnion<ExpertReaders, SharedReaders>::type>::type;                                   \
     constexpr projection::u64 CHANNELS = Shape::GROUPS * TPW * 16;                                                 \
-    __shared__ projection::GemvShared<Shape, projection::SharedRow> shared;                                        \
+    __shared__ projection::GemvShared<Shape, projection::SharedRow, 0, Points> shared;                             \
     const projection::u64 H = SEISMIC_DIM_H, K = SEISMIC_DIM_K;                                                    \
     const projection::u64 m = blockIdx.y / (K + 1), slot = blockIdx.y % (K + 1);                                   \
     const projection::u64 group = Shape::tile_group();                                                             \
@@ -88,6 +92,7 @@ struct GatheredPublishEpi {
             seismic_dependency_start();                                                                            \
             routed::zero_block_rows<Shape>(H, [&](projection::u64 n) { epi.published.put(n * s2, 0.0f); });        \
         } else {                                                                                                   \
+            projection::stage_points(ExpertReaders{});                                                             \
             const Pro pro{EXPERT_ROWS + (m * EXPERT_STRIDE_0 + slot * EXPERT_STRIDE_1) * 2, 0,                     \
                           projection::AllRows{}};                                                                  \
             projection::gemv_segment_ready<Shape>(shared, projection::shared_row_after_dependency(pro, SEISMIC_DIM_F), \
@@ -96,6 +101,7 @@ struct GatheredPublishEpi {
                                                   projection::NoWeight{}, epi);                                    \
         }                                                                                                          \
     } else {                                                                                                       \
+        projection::stage_points(SharedReaders{});                                                                 \
         const Pro pro{SHARED_ROWS + m * SHARED_STRIDE_0 * 2, 0, projection::AllRows{}};                            \
         projection::gemv_segment_ready<Shape>(shared, projection::shared_row_after_dependency(pro, SEISMIC_DIM_S), \
                                               1u, SEISMIC_DIM_S / 64, group, H,                                    \
@@ -106,8 +112,12 @@ struct GatheredPublishEpi {
 
 #define ROUTED_OUTPUT_GATHERED_BODY(TPW, KSPLIT)                                                                   \
     using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                                \
+    using ExpertReaders = routed::DecodeReaders<packets::W0>;                                                      \
+    using SharedReaders = routed::DecodeReaders<packets::W1>;                                                      \
+    using Points = typename projection::PointsOf<                                                                  \
+        typename routed::DecodeUnion<ExpertReaders, SharedReaders>::type>::type;                                   \
     constexpr projection::u64 CHANNELS = Shape::GROUPS * TPW * 16;                                                 \
-    __shared__ projection::GemvShared<Shape, routed::GatheredRows> shared;                                         \
+    __shared__ projection::GemvShared<Shape, routed::GatheredRows, 0, Points> shared;                              \
     __shared__ projection::u64 rows_at[SEISMIC_CONST_VERIFY_ROWS], published_at[SEISMIC_CONST_VERIFY_ROWS];        \
     __shared__ unsigned count;                                                                                     \
     const projection::u64 H = SEISMIC_DIM_H, K = SEISMIC_DIM_K, M = SEISMIC_DIM_M;                                 \
@@ -150,12 +160,14 @@ struct GatheredPublishEpi {
                 for (unsigned r = 0; r < count; ++r)                                                               \
                     routed::zero_block_rows<Shape>(H, [&](projection::u64 n) { published.put(published_at[r] + n * s2, 0.0f); }); \
             } else {                                                                                               \
+                projection::stage_points(ExpertReaders{});                                                         \
                 const routed::GatheredRows rows{EXPERT_ROWS, rows_at};                                             \
                 projection::gemv_segment_ready<Shape>(                                                             \
                     shared, projection::after_dependency(rows), count, SEISMIC_DIM_F / 64, group, H,               \
                     PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{}, epi);                                 \
             }                                                                                                      \
         } else {                                                                                                   \
+            projection::stage_points(SharedReaders{});                                                             \
             const routed::GatheredRows rows{SHARED_ROWS, rows_at};                                                 \
             projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(rows), count,               \
                                                   SEISMIC_DIM_S / 64, group, H,                                    \

@@ -46,7 +46,8 @@ struct ChoiceProjectedEpi {
 
 #define ROUTED_DOWN_SUMMED_BODY(TPW, KSPLIT)                                                                       \
     using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                                \
-    __shared__ projection::GemvShared<Shape, projection::SharedRow> shared;                                        \
+    using Readers = routed::DecodeReaders<packets::W0>;                                                            \
+    __shared__ projection::GemvShared<Shape, projection::SharedRow, 0, routed::DecodePoints<packets::W0>> shared;  \
     const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;                          \
     const projection::SharedRow pro = projection::shared_row(                                                      \
         Pro{Raw{SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT) +                                                              \
@@ -62,6 +63,7 @@ struct ChoiceProjectedEpi {
         routed::zero_block_rows<Shape>(SEISMIC_DIM_H, [&](projection::u64 n) { projected.put(n * s2, 0.0f); });    \
         return;                                                                                                    \
     }                                                                                                              \
+    projection::stage_points(Readers{});                                                                           \
     const projection::u64 group = Shape::tile_group();                                                             \
     projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_F / 64, group, SEISMIC_DIM_H,                     \
                                     PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{},                       \
@@ -77,7 +79,8 @@ struct ChoiceProjectedEpi {
 
 #define ROUTED_DOWN_GATHERED_BODY(TPW, KSPLIT)                                                                     \
     using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                                \
-    __shared__ projection::GemvShared<Shape, Raw> shared;                                                          \
+    using Readers = routed::DecodeReaders<packets::W0>;                                                            \
+    __shared__ projection::GemvShared<Shape, Raw, 0, routed::DecodePoints<packets::W0>> shared;                    \
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                         \
     const unsigned choice = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;                                           \
     const auto record = [&](unsigned c) {                                                                          \
@@ -110,6 +113,7 @@ struct ChoiceProjectedEpi {
                                            [&](projection::u64 n) { projected.put(offsets_at[r] + n * s2, 0.0f); }); \
         return;                                                                                                    \
     }                                                                                                              \
+    projection::stage_points(Readers{});                                                                           \
     const projection::u64 group = Shape::tile_group();                                                             \
     const projection::u8 *rows =                                                                                   \
         NVFP4 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_EXPERT_DOWN_OPERANDS) : SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT);    \

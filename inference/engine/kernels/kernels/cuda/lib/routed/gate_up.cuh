@@ -58,7 +58,9 @@ constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, pac
 
 #define ROUTED_GATE_UP_CHOICE_BODY                                                                              \
     using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                             \
-    __shared__ projection::GemvShared<Shape, projection::SharedRow> shared;                                     \
+    using Readers = routed::DecodeReaders<packets::W0, packets::W1>;                                            \
+    __shared__ projection::GemvShared<Shape, projection::SharedRow, 0,                                          \
+                                      routed::DecodePoints<packets::W0, packets::W1>> shared;                   \
     const projection::u8 *normalized = SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED);                                  \
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                      \
     const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;                       \
@@ -80,6 +82,7 @@ constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, pac
         });                                                                                                     \
         return;                                                                                                 \
     }                                                                                                           \
+    projection::stage_points(Readers{});                                                                        \
     const projection::u64 group = Shape::tile_group();                                                          \
     const auto epi = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(                         \
         Epi{product, 0, (int)SEISMIC_PARAM_ACTIVATION},                                                         \
@@ -98,7 +101,8 @@ constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, pac
 
 #define ROUTED_GATE_UP_GATHERED_BODY                                                                            \
     using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                             \
-    __shared__ projection::GemvShared<Shape, Raw> shared;                                                       \
+    using Readers = routed::DecodeReaders<packets::W0, packets::W1>;                                            \
+    __shared__ projection::GemvShared<Shape, Raw, 0, routed::DecodePoints<packets::W0, packets::W1>> shared;    \
     __shared__ routed::Gathered table;                                                                          \
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                      \
     const unsigned at = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;                                            \
@@ -121,6 +125,7 @@ constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, pac
             });                                                                                                 \
         return;                                                                                                 \
     }                                                                                                           \
+    projection::stage_points(Readers{});                                                                        \
     const projection::u64 group = Shape::tile_group();                                                          \
     const auto epi = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(                         \
         routed::ChoiceRows<Epi>{Epi{ROUTED_GATE_UP_PRODUCT_OUT, 0, (int)SEISMIC_PARAM_ACTIVATION},              \
