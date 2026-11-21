@@ -2626,14 +2626,6 @@ impl SequenceState {
     pub fn history_start(&self, domain: HistoryDomainId) -> usize {
         self.snapshot.history_start(domain)
     }
-    /// Every domain's logical start position, in domain order.
-    fn history_starts(&self) -> Vec<usize> {
-        self.snapshot
-            .domains
-            .iter()
-            .map(|domain| domain.start)
-            .collect()
-    }
     /// The referenced rows of a domain at positions `from` and later: the
     /// visible rows of a query whose window begins at `from`.
     pub fn visible_ranges(&self, domain: HistoryDomainId, from: usize) -> Vec<(usize, usize)> {
