@@ -15,7 +15,7 @@
 //! merged across every caller of a rule.
 use crate::{
     language::Regexes,
-    lexeme::{EdgeKind, Plan},
+    lexeme::{EdgeKind, LexemeEdge, Plan},
     terminal::{intersects, union, Bytes, TermId, Terms},
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -26,8 +26,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 const CONTEXTS: usize = 1024;
 
 struct Occurrence {
-    rule: usize,
-    edge: usize,
+    edge: LexemeEdge,
     lexeme: TermId,
     end: usize,
     single: bool,
@@ -121,19 +120,15 @@ fn analyze(plan: &Plan, terms: &Terms, together: &BTreeSet<(usize, usize)>) -> A
 
     let mut occurrences = Vec::new();
     let mut direct = vec![Vec::new(); positions];
-    for (rule_index, rule) in plan.rules.iter().enumerate() {
-        for (edge_index, edge) in rule.edges.iter().enumerate() {
-            if let EdgeKind::Lexeme { lexeme, .. } = edge.kind {
-                direct[position(rule_index, edge.from)].push(occurrences.len());
-                occurrences.push(Occurrence {
-                    rule: rule_index,
-                    edge: edge_index,
-                    lexeme,
-                    end: position(rule_index, edge.to),
-                    single: terms.single_character(lexeme),
-                });
-            }
-        }
+    for (edge, lexeme, from, to) in plan.lexemes() {
+        let rule = edge.rule();
+        direct[position(rule, from)].push(occurrences.len());
+        occurrences.push(Occurrence {
+            edge,
+            lexeme,
+            end: position(rule, to),
+            single: terms.single_character(lexeme),
+        });
     }
     let empty = set_new(occurrences.len());
 
@@ -490,15 +485,15 @@ fn simultaneity(
     (sets, together)
 }
 
-/// Lexeme occurrences that must be rendered at character level, as
-/// (rule, edge) pairs; empty when the plan is certified.
+/// Lexeme occurrences that must be rendered at character level; empty when
+/// the plan is certified.
 fn conflicts(
     plan: &Plan,
     terms: &Terms,
     regexes: &mut Regexes,
     overlaps: &mut HashMap<(TermId, TermId), bool>,
     overruns: &mut HashMap<(TermId, TermId, Bytes), bool>,
-) -> BTreeSet<(usize, usize)> {
+) -> BTreeSet<LexemeEdge> {
     // Positions active together change which call sites share a callee, so
     // analysis and simultaneity are solved together.
     let mut together: BTreeSet<(usize, usize)> = BTreeSet::new();
@@ -579,10 +574,7 @@ fn conflicts(
                 if overruns.get(&key).copied().unwrap_or(false) {
                     for occurrence in [a, b] {
                         if !occurrences[occurrence].single {
-                            marked.insert((
-                                occurrences[occurrence].rule,
-                                occurrences[occurrence].edge,
-                            ));
+                            marked.insert(occurrences[occurrence].edge);
                         }
                     }
                 }
@@ -604,8 +596,8 @@ pub(crate) fn certify(plan: &mut Plan, terms: &mut Terms, regexes: &mut Regexes)
             return characters;
         }
         characters += marked.len();
-        for (rule, edge) in marked {
-            plan.characters(rule, edge, terms);
+        for edge in marked {
+            plan.characters(edge, terms);
         }
     }
 }
