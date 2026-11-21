@@ -617,22 +617,46 @@ fn system_role_content(content: Content) -> Result<Vec<UserPart>, ApiError> {
     nonempty_parts(values, "system message content")
 }
 
+enum UserContentBlock {
+    Text(String),
+    Image(ImageSource),
+    ToolResult {
+        tool_use_id: String,
+        content: Option<ToolResultContent>,
+    },
+}
+
+impl UserContentBlock {
+    fn parse(block: ContentBlock, invalid_message: &str) -> Result<Self, ApiError> {
+        match block {
+            ContentBlock::Text { text, .. } => Ok(Self::Text(text)),
+            ContentBlock::Image { source, .. } => Ok(Self::Image(source)),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => Ok(Self::ToolResult {
+                tool_use_id,
+                content,
+            }),
+            ContentBlock::Thinking { .. } | ContentBlock::ToolUse { .. } => {
+                Err(ApiError::invalid(invalid_message))
+            }
+        }
+    }
+}
+
 fn user_content(content: Content) -> Result<Vec<UserPart>, ApiError> {
     let mut values = Vec::new();
     for block in blocks(content) {
-        match block {
-            ContentBlock::Text { text, .. } => {
+        match UserContentBlock::parse(block, "invalid content block for a user message")? {
+            UserContentBlock::Text(text) => {
                 values.push(UserPart::Text(nonempty_text(text, "user text")?))
             }
-            ContentBlock::Image { source, .. } => values.push(UserPart::Image(image(source)?)),
-            ContentBlock::ToolResult { .. } => {
+            UserContentBlock::Image(source) => values.push(UserPart::Image(image(source)?)),
+            UserContentBlock::ToolResult { .. } => {
                 return Err(ApiError::invalid(
                     "tool_result blocks require a preceding assistant tool_use message",
-                ));
-            }
-            ContentBlock::Thinking { .. } | ContentBlock::ToolUse { .. } => {
-                return Err(ApiError::invalid(
-                    "invalid content block for a user message",
                 ));
             }
         }
@@ -685,54 +709,46 @@ fn tool_results(content: Content) -> Result<ToolResults, ApiError> {
     let mut results = BTreeMap::new();
     let mut trailing_content = Vec::new();
     for block in blocks(content) {
-        let ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            ..
-        } = block
-        else {
-            match block {
-                ContentBlock::Text { text, .. } => trailing_content.push(UserPart::Text(
-                    nonempty_text(text, "user text after tool results")?,
-                )),
-                ContentBlock::Image { source, .. } => {
-                    trailing_content.push(UserPart::Image(image(source)?))
-                }
-                ContentBlock::Thinking { .. } | ContentBlock::ToolUse { .. } => {
+        match UserContentBlock::parse(block, "invalid content block after tool_result blocks")? {
+            UserContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
+                if !trailing_content.is_empty() {
                     return Err(ApiError::invalid(
-                        "invalid content block after tool_result blocks",
+                        "tool_result blocks must precede other user content",
                     ));
                 }
-                ContentBlock::ToolResult { .. } => unreachable!("variant was matched above"),
-            }
-            continue;
-        };
-        if !trailing_content.is_empty() {
-            return Err(ApiError::invalid(
-                "tool_result blocks must precede other user content",
-            ));
-        }
-        let values = match content {
-            None => Vec::new(),
-            Some(ToolResultContent::Text(text)) => {
-                vec![ToolResultPart::Text(nonempty_text(text, "tool result")?)]
-            }
-            Some(ToolResultContent::Blocks(blocks)) => blocks
-                .into_iter()
-                .map(|block| match block {
-                    ToolResultBlock::Text { text, .. } => {
-                        Ok(ToolResultPart::Text(nonempty_text(text, "tool result text")?))
+                let values = match content {
+                    None => Vec::new(),
+                    Some(ToolResultContent::Text(text)) => {
+                        vec![ToolResultPart::Text(nonempty_text(text, "tool result")?)]
                     }
-                    ToolResultBlock::Image { source, .. } => {
-                        Ok(ToolResultPart::Image(image(source)?))
-                    }
-                })
-                .collect::<Result<Vec<_>, ApiError>>()?,
-        };
-        if results.insert(tool_use_id.clone(), values).is_some() {
-            return Err(ApiError::invalid(format!(
-                "duplicate tool_result for {tool_use_id}"
-            )));
+                    Some(ToolResultContent::Blocks(blocks)) => blocks
+                        .into_iter()
+                        .map(|block| match block {
+                            ToolResultBlock::Text { text, .. } => Ok(ToolResultPart::Text(
+                                nonempty_text(text, "tool result text")?,
+                            )),
+                            ToolResultBlock::Image { source, .. } => {
+                                Ok(ToolResultPart::Image(image(source)?))
+                            }
+                        })
+                        .collect::<Result<Vec<_>, ApiError>>()?,
+                };
+                if results.insert(tool_use_id.clone(), values).is_some() {
+                    return Err(ApiError::invalid(format!(
+                        "duplicate tool_result for {tool_use_id}"
+                    )));
+                }
+            }
+            UserContentBlock::Text(text) => trailing_content.push(UserPart::Text(nonempty_text(
+                text,
+                "user text after tool results",
+            )?)),
+            UserContentBlock::Image(source) => {
+                trailing_content.push(UserPart::Image(image(source)?))
+            }
         }
     }
     Ok((results, trailing_content))
@@ -906,15 +922,19 @@ type SseSender = mpsc::Sender<Result<Event, Infallible>>;
 /// The consumer disconnected; dropping the generation cancels it.
 struct Disconnected;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenBlock {
+    Thinking,
+    Text,
+    ToolUse { tool_index: usize },
+}
+
 struct StreamProjector {
     id: String,
     model: String,
     request_id: String,
     sender: SseSender,
-    next_index: usize,
-    reasoning_index: Option<usize>,
-    text_index: Option<usize>,
-    tools: BTreeMap<usize, usize>,
+    blocks: Vec<OpenBlock>,
 }
 
 impl StreamProjector {
@@ -952,9 +972,16 @@ impl StreamProjector {
         .await
     }
 
-    async fn begin_block(&mut self, block: StreamContentBlock) -> Result<usize, Disconnected> {
-        let index = self.next_index;
-        self.next_index += 1;
+    fn block_index(&self, kind: OpenBlock) -> Option<usize> {
+        self.blocks.iter().position(|&block| block == kind)
+    }
+
+    async fn begin_block(
+        &mut self,
+        kind: OpenBlock,
+        block: StreamContentBlock,
+    ) -> Result<usize, Disconnected> {
+        let index = self.blocks.len();
         self.send(
             "content_block_start",
             &StreamEvent::ContentBlockStart {
@@ -963,6 +990,7 @@ impl StreamProjector {
             },
         )
         .await?;
+        self.blocks.push(kind);
         Ok(index)
     }
 
@@ -978,53 +1006,56 @@ impl StreamProjector {
         match event {
             OutputEvent::Started | OutputEvent::ToolCallFinished { .. } => {}
             OutputEvent::ReasoningDelta(thinking) => {
-                let index = match self.reasoning_index {
+                let index = match self.block_index(OpenBlock::Thinking) {
                     Some(index) => index,
                     None => {
-                        let index = self
-                            .begin_block(StreamContentBlock::Thinking {
+                        self.begin_block(
+                            OpenBlock::Thinking,
+                            StreamContentBlock::Thinking {
                                 thinking: String::new(),
                                 signature: String::new(),
-                            })
-                            .await?;
-                        self.reasoning_index = Some(index);
-                        index
+                            },
+                        )
+                        .await?
                     }
                 };
                 self.delta(index, StreamDelta::ThinkingDelta { thinking })
                     .await?;
             }
             OutputEvent::TextDelta(text) => {
-                let index = match self.text_index {
+                let index = match self.block_index(OpenBlock::Text) {
                     Some(index) => index,
                     None => {
-                        let index = self
-                            .begin_block(StreamContentBlock::Text {
+                        self.begin_block(
+                            OpenBlock::Text,
+                            StreamContentBlock::Text {
                                 text: String::new(),
-                            })
-                            .await?;
-                        self.text_index = Some(index);
-                        index
+                            },
+                        )
+                        .await?
                     }
                 };
                 self.delta(index, StreamDelta::TextDelta { text }).await?;
             }
             OutputEvent::ToolCallStarted { index, id, name } => {
-                let output_index = self
-                    .begin_block(StreamContentBlock::ToolUse {
+                self.begin_block(
+                    OpenBlock::ToolUse { tool_index: index },
+                    StreamContentBlock::ToolUse {
                         id,
                         name,
                         input: Map::new(),
-                    })
-                    .await?;
-                self.tools.insert(index, output_index);
+                    },
+                )
+                .await?;
             }
             OutputEvent::ToolInputDelta { index, fragment } => {
-                let output_index = *self.tools.get(&index).ok_or_else(|| {
-                    ProjectionError::Failed(ServingError::Internal(
-                        "tool input arrived before tool start".into(),
-                    ))
-                })?;
+                let output_index = self
+                    .block_index(OpenBlock::ToolUse { tool_index: index })
+                    .ok_or_else(|| {
+                        ProjectionError::Failed(ServingError::Internal(
+                            "tool input arrived before tool start".into(),
+                        ))
+                    })?;
                 self.delta(
                     output_index,
                     StreamDelta::InputJsonDelta {
@@ -1038,16 +1069,16 @@ impl StreamProjector {
     }
 
     async fn finish(&self, completion: &Completion) -> Result<(), Disconnected> {
-        if let Some(index) = self.reasoning_index {
-            self.delta(
-                index,
-                StreamDelta::SignatureDelta {
-                    signature: LOCAL_THINKING_SIGNATURE.to_owned(),
-                },
-            )
-            .await?;
-        }
-        for index in 0..self.next_index {
+        for (index, block) in self.blocks.iter().enumerate() {
+            if matches!(block, OpenBlock::Thinking) {
+                self.delta(
+                    index,
+                    StreamDelta::SignatureDelta {
+                        signature: LOCAL_THINKING_SIGNATURE.to_owned(),
+                    },
+                )
+                .await?;
+            }
             self.send(
                 "content_block_stop",
                 &StreamEvent::ContentBlockStop { index },
@@ -1276,10 +1307,7 @@ async fn messages(
         model: response_model,
         request_id,
         sender,
-        next_index: 0,
-        reasoning_index: None,
-        text_index: None,
-        tools: BTreeMap::new(),
+        blocks: Vec::new(),
     };
     tokio::spawn(async move {
         if projector.start(input_tokens).await.is_ok() {
