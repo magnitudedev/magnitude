@@ -62,9 +62,12 @@ pub use resources::{
     max_image_cells, reads_decoded_history,
 };
 pub(crate) use resources::{class_bytes, graph_demand, serial_upload_regions, state_granule, state_pool_granule};
-pub(crate) use weights::{AttentionForm, AttentionWidths, GateForm, RoundingArguments, RoundingWords, SeparateGate, axis};
+pub(crate) use weights::{
+    AttentionForm, AttentionWidths, GateSpec, KeyValueSpec, RoundingArguments, RoundingWords,
+    SeparateGate, ValueSpec, axis,
+};
 pub use weights::{
-    AttentionBinding, AttentionShape, AttentionValues, CandidatePool, CandidatesBinding,
+    AttentionBinding, AttentionShape, CandidatePool, CandidatesBinding,
     DenseBinding, DenseBranchBinding, DenseScales,
     AbsorbedQueryBinding, AbsorbedQueryShape, DirectoryForm, EmbeddingBinding, FeaturesBinding, GroupedOutputBinding, GroupedOutputShape,
     HeadBinding, Holding, HostPeak, HostTablePlan, IndexerBinding, LowRankQueryBinding,

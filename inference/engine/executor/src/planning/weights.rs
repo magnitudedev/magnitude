@@ -620,18 +620,6 @@ pub struct EmbeddingBinding {
     pub activation: Element,
 }
 
-/// Where an attention layer's values come from (`ValueSource`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AttentionValues {
-    /// Their own projection (`V` rows). A Shared layer, which projects
-    /// none, reads its source's own values (`admit_shared`).
-    Projected,
-    /// The raw key projection, before key norm and rotary.
-    RawKey,
-    /// The stored key row (`VK = 1`): the history holds no value plane.
-    StoredKey,
-}
-
 /// A rounding as the entries take it (`rounding.seismic`'s four scalars):
 /// the one conversion of a [`RowRounding`] to them, for every entry that
 /// rounds a row. A graph holds its scalars as numbers
@@ -760,8 +748,8 @@ pub fn rounding_args(rounding: RowRounding) -> RoundingArgs {
 /// extent 0 or 1 (`attention.seismic`), which its [`AttentionForm`]
 /// decides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct AttentionShape {
-    pub form: AttentionForm,
+pub struct AttentionShape<T = (), A = ()> {
+    pub form: AttentionForm<T, A>,
     pub widths: AttentionWidths<u64>,
     /// The layer's trained key rounding (`ProjectedRows::rounding`), applied
     /// to each prepared key before it is attended and stored: the dense
@@ -770,15 +758,24 @@ pub struct AttentionShape {
     pub key_rounding: RoundingArgs,
 }
 
-impl AttentionShape {
-    /// Its numbers as constant dimensions, with its form: what every
-    /// arithmetic of it below is computed from ([`AttentionWidths`]).
-    fn dims(&self) -> (AttentionForm, AttentionWidths<Dim>) {
-        (self.form, constant(self.widths))
+impl<T, A> AttentionShape<T, A> {
+    /// Drop the form's payloads, keeping only its structural axes and widths.
+    pub fn unit(&self) -> AttentionShape {
+        AttentionShape {
+            form: self.form.unit(),
+            widths: self.widths,
+            key_rounding: self.key_rounding,
+        }
+    }
+
+    /// Its numbers as constant dimensions: what every arithmetic of it below
+    /// is computed from ([`AttentionWidths`]).
+    fn dims(&self) -> AttentionWidths<Dim> {
+        constant(self.widths)
     }
 
     pub fn heads(&self) -> u64 {
-        self.dims().1.heads().fixed()
+        self.dims().heads().fixed()
     }
 
     /// `KR` ∈ {0, 1}: whether the dense entries round each prepared key.
@@ -788,14 +785,12 @@ impl AttentionShape {
 
     /// `I` ∈ {0, W}: gate columns after each query head's W columns.
     pub fn interleaved_gate(&self) -> u64 {
-        let (form, widths) = self.dims();
-        widths.interleaved_gate(&form).fixed()
+        self.dims().interleaved_gate(&self.form).fixed()
     }
 
     /// `U` ∈ {0, 1, W}: separate gate values per query head.
     pub fn separate_gate(&self) -> u64 {
-        let (form, widths) = self.dims();
-        widths.separate_gate(&form).fixed()
+        self.dims().separate_gate(&self.form).fixed()
     }
 
     /// Whether the shape takes a form beyond the base dense mix every
@@ -807,7 +802,7 @@ impl AttentionShape {
         let form = &self.form;
         form.query_norm != form.key_norm
             || form.stored_key()
-            || form.absorbed_query
+            || form.is_absorbed()
             || form.rotary_adjacent
             || form.rotary_trailing
             || form.output_rotary
@@ -817,26 +812,22 @@ impl AttentionShape {
 
     /// `Q`: query (and interleaved gate) projection rows.
     pub fn query_rows(&self) -> u64 {
-        let (form, widths) = self.dims();
-        widths.query_rows(&form).fixed()
+        self.dims().query_rows(&self.form).fixed()
     }
 
     /// `GR`: separate gate projection rows.
     pub fn gate_rows(&self) -> u64 {
-        let (form, widths) = self.dims();
-        widths.gate_rows(&form).fixed()
+        self.dims().gate_rows(&self.form).fixed()
     }
 
     /// `K`: key projection rows.
     pub fn key_rows(&self) -> u64 {
-        let (form, widths) = self.dims();
-        widths.key_rows(&form).fixed()
+        self.dims().key_rows(&self.form).fixed()
     }
 
     /// `V`: value projection rows.
     pub fn value_rows(&self) -> u64 {
-        let (form, widths) = self.dims();
-        widths.value_rows(&form).fixed()
+        self.dims().value_rows(&self.form).fixed()
     }
 
     /// `VK` ∈ {0, 1}: whether the values are the stored keys.
@@ -846,43 +837,34 @@ impl AttentionShape {
 
     /// Unrotated columns of a head.
     pub fn static_width(&self) -> u64 {
-        self.dims().1.static_width().fixed()
+        self.dims().static_width().fixed()
     }
 
     /// The projection entry's dimensions at `rows` rows, its query segment
     /// projecting `query_segment` rows (`AttentionBinding::query_segment_rows`).
     pub fn project_dimensions(&self, rows: u64, query_segment: u64) -> [(&'static str, u64); 6] {
-        let (form, widths) = self.dims();
-        fixed(widths.project_dimensions(&form, Dim::from(rows), Dim::from(query_segment)))
+        fixed(self.dims().project_dimensions(&self.form, Dim::from(rows), Dim::from(query_segment)))
     }
 
     /// Projection of history rows has no query or gate outputs.
     pub fn key_value_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
-        let (form, widths) = self.dims();
-        fixed(widths.key_value_dimensions(&form, Dim::from(rows)))
+        fixed(self.dims().key_value_dimensions(&self.form, Dim::from(rows)))
     }
 
     /// The static axes of the fused attention entries.
     pub fn mix_statics(&self) -> [(&'static str, u64); 16] {
-        let (form, widths) = self.dims();
-        fixed(widths.mix_statics(&form))
+        fixed(self.dims().mix_statics(&self.form))
     }
 
     /// The static axes of the dense fused entries: the shared ones, then
     /// the key rounding and the second source's picks, which no K8/V4 entry
     /// holds.
     pub fn dense_mix_statics(&self) -> Vec<(&'static str, u64)> {
-        let widths = self.dims().1;
+        let widths = self.dims();
         self.mix_statics()
             .into_iter()
             .chain(fixed(widths.dense_statics(self.key_rounding.rounds())))
             .collect()
-    }
-
-    /// Whether the cache-publishing entries lack the fused entries' axis
-    /// `name`.
-    pub fn unread_by_appends(name: &str) -> bool {
-        matches!(name, "G" | "I" | "U" | "SK" | "NQ" | "RO" | "R" | "KS" | "TS" | "AB")
     }
 
     /// The dense fused entries' dimensions: [`Self::mix_dimensions`], the
@@ -894,7 +876,7 @@ impl AttentionShape {
         segments: u64,
         selected_rows: u64,
     ) -> Vec<(&'static str, u64)> {
-        let widths = self.dims().1;
+        let widths = self.dims();
         self.mix_dimensions(rows, history_rows, segments)
             .into_iter()
             .chain(fixed(widths.dense_statics(self.key_rounding.rounds())))
@@ -910,13 +892,20 @@ impl AttentionShape {
         history_rows: u64,
         segments: u64,
     ) -> [(&'static str, u64); 19] {
-        let (form, widths) = self.dims();
-        fixed(widths.mix_dimensions(
-            &form,
+        fixed(self.dims().mix_dimensions(
+            &self.form,
             Dim::from(rows),
             Dim::from(history_rows),
             Dim::from(segments),
         ))
+    }
+}
+
+impl AttentionShape {
+    /// Whether the cache-publishing entries lack the fused entries' axis
+    /// `name`.
+    pub fn unread_by_appends(name: &str) -> bool {
+        matches!(name, "G" | "I" | "U" | "SK" | "NQ" | "RO" | "R" | "KS" | "TS" | "AB")
     }
 }
 
@@ -927,12 +916,41 @@ fn fixed<const N: usize>(dimensions: [(&'static str, Dim); N]) -> [(&'static str
 
 /// Where an attention's gate values come from: none, `W` columns after each
 /// query head's in its projection (`I = W`), or a separate projection
-/// segment ([`SeparateGate`]).
+/// segment ([`SeparateGate`]) carrying `T` (`()` in a shape's form,
+/// `Element` in a kernel binding, `PackedWeight` in a graph's weights).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum GateForm {
+pub enum GateSpec<T = ()> {
     None,
     Interleaved,
-    Separate(SeparateGate),
+    Separate(SeparateGate, T),
+}
+
+impl<T> GateSpec<T> {
+    /// The separate gate's payload, when gated separately.
+    pub fn separate(&self) -> Option<&T> {
+        match self {
+            Self::Separate(_, value) => Some(value),
+            Self::None | Self::Interleaved => None,
+        }
+    }
+
+    /// Drop the payload, keeping only the gate structure.
+    pub fn unit(&self) -> GateSpec {
+        match self {
+            Self::None => GateSpec::None,
+            Self::Interleaved => GateSpec::Interleaved,
+            Self::Separate(unit, _) => GateSpec::Separate(*unit, ()),
+        }
+    }
+
+    /// Fallibly map the separate gate's payload.
+    pub fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<GateSpec<U>, E> {
+        Ok(match self {
+            Self::None => GateSpec::None,
+            Self::Interleaved => GateSpec::Interleaved,
+            Self::Separate(unit, value) => GateSpec::Separate(unit, f(value)?),
+        })
+    }
 }
 
 /// `U`: a separate gate's values per query head.
@@ -944,20 +962,119 @@ pub enum SeparateGate {
     Element,
 }
 
+/// Where an attention layer's keys and values come from: shared from an
+/// earlier layer (`F = 0`), or freshly projected (`F = 1`) with key `T` and
+/// values [`ValueSpec<T>`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyValueSpec<T = ()> {
+    Shared,
+    Fresh {
+        key: T,
+        value: ValueSpec<T>,
+    },
+}
+
+/// Where a fresh attention layer's values come from (`ValueSource`),
+/// carrying `T` when projected on their own (`V > 0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ValueSpec<T = ()> {
+    /// Their own projection (`V` rows).
+    Projected(T),
+    /// The raw key projection, before key norm and rotary.
+    RawKey,
+    /// The stored key row (`VK = 1`): the history holds no value plane.
+    StoredKey,
+}
+
+impl<T> KeyValueSpec<T> {
+    /// `F`: whether the layer projects and appends its own keys and values.
+    pub fn is_fresh(&self) -> bool {
+        matches!(self, Self::Fresh { .. })
+    }
+
+    /// The key projection's payload, when fresh.
+    pub fn key(&self) -> Option<&T> {
+        match self {
+            Self::Fresh { key, .. } => Some(key),
+            Self::Shared => None,
+        }
+    }
+
+    /// The value projection's payload, when fresh and projected on its own.
+    pub fn value(&self) -> Option<&T> {
+        match self {
+            Self::Fresh { value: ValueSpec::Projected(value), .. } => Some(value),
+            Self::Shared
+            | Self::Fresh { value: ValueSpec::RawKey | ValueSpec::StoredKey, .. } => None,
+        }
+    }
+
+    /// `VK`: whether the values are the stored keys.
+    pub fn is_stored_key(&self) -> bool {
+        matches!(self, Self::Fresh { value: ValueSpec::StoredKey, .. })
+    }
+
+    /// Drop the payloads, keeping only the key/value structure.
+    pub fn unit(&self) -> KeyValueSpec {
+        match self {
+            Self::Shared => KeyValueSpec::Shared,
+            Self::Fresh { value, .. } => KeyValueSpec::Fresh {
+                key: (),
+                value: value.unit(),
+            },
+        }
+    }
+
+    /// Fallibly map the key and (projected) value payloads.
+    pub fn try_map<U, E>(
+        self,
+        key_f: impl FnOnce(T) -> Result<U, E>,
+        value_f: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<KeyValueSpec<U>, E> {
+        Ok(match self {
+            Self::Shared => KeyValueSpec::Shared,
+            Self::Fresh { key, value } => KeyValueSpec::Fresh {
+                key: key_f(key)?,
+                value: value.try_map(value_f)?,
+            },
+        })
+    }
+}
+
+impl<T> ValueSpec<T> {
+    /// Drop the payload, keeping only the value source structure.
+    pub fn unit(&self) -> ValueSpec {
+        match self {
+            Self::Projected(_) => ValueSpec::Projected(()),
+            Self::RawKey => ValueSpec::RawKey,
+            Self::StoredKey => ValueSpec::StoredKey,
+        }
+    }
+
+    /// Fallibly map a projected value's payload.
+    pub fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<ValueSpec<U>, E> {
+        Ok(match self {
+            Self::Projected(value) => ValueSpec::Projected(f(value)?),
+            Self::RawKey => ValueSpec::RawKey,
+            Self::StoredKey => ValueSpec::StoredKey,
+        })
+    }
+}
+
 /// An [`AttentionShape`]'s structure: its flags and kinds, which decide its
 /// graphs' topology. It holds no number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct AttentionForm {
+pub struct AttentionForm<T = (), A = ()> {
     /// `I`, `U`: the gate.
-    pub gate: GateForm,
-    /// `F`: whether the layer projects and appends its own keys and values.
-    pub fresh: bool,
+    pub gate: GateSpec<T>,
+    /// `F`, `VK`: whether the layer projects its own keys and values, and
+    /// where its values come from.
+    pub key_value: KeyValueSpec<T>,
     /// `NQ`, `N`, `NV`: the per-head RMS norms (a Shared layer's `N` is its
     /// `NQ`).
     pub query_norm: bool,
     pub key_norm: bool,
     pub value_norm: bool,
-    pub values: AttentionValues,
     /// `SK`: a sink logit per query head.
     pub sinks: bool,
     /// `RA`, `RT`, `RO`: the rotary layout and output rotary.
@@ -966,23 +1083,44 @@ pub struct AttentionForm {
     pub output_rotary: bool,
     /// `AB`: whether the queries are absorbed into the latent keys
     /// (`QueryKeys::Absorbed`), a read no F16-staged form attends.
-    pub absorbed_query: bool,
+    pub absorbed: Option<A>,
 }
 
-impl AttentionForm {
-    /// Whether the projection has a separate gate segment (`GR > 0`).
-    pub(crate) fn gated_separately(&self) -> bool {
-        matches!(self.gate, GateForm::Separate(_))
+impl<T, A> AttentionForm<T, A> {
+    /// `F`: whether the layer projects and appends its own keys and values.
+    pub fn is_fresh(&self) -> bool {
+        self.key_value.is_fresh()
     }
 
     /// Whether the projection has a value segment (`V > 0`).
     pub(crate) fn projects_values(&self) -> bool {
-        self.fresh && self.values == AttentionValues::Projected
+        self.key_value.value().is_some()
     }
 
     /// `VK`: whether the values are the stored keys.
     pub(crate) fn stored_key(&self) -> bool {
-        self.values == AttentionValues::StoredKey
+        self.key_value.is_stored_key()
+    }
+
+    /// `AB`: whether the queries are absorbed into the latent keys.
+    pub fn is_absorbed(&self) -> bool {
+        self.absorbed.is_some()
+    }
+
+    /// Drop the payloads, keeping only the structural form.
+    pub fn unit(&self) -> AttentionForm {
+        AttentionForm {
+            gate: self.gate.unit(),
+            key_value: self.key_value.unit(),
+            query_norm: self.query_norm,
+            key_norm: self.key_norm,
+            value_norm: self.value_norm,
+            sinks: self.sinks,
+            rotary_adjacent: self.rotary_adjacent,
+            rotary_trailing: self.rotary_trailing,
+            output_rotary: self.output_rotary,
+            absorbed: self.absorbed.as_ref().map(|_| ()),
+        }
     }
 }
 
@@ -1034,29 +1172,29 @@ impl AttentionWidths<Dim> {
     }
 
     /// `I`: gate columns after each query head's.
-    pub(crate) fn interleaved_gate(&self, form: &AttentionForm) -> Dim {
+    pub(crate) fn interleaved_gate<T, A>(&self, form: &AttentionForm<T, A>) -> Dim {
         match form.gate {
-            GateForm::Interleaved => self.width.clone(),
-            GateForm::None | GateForm::Separate(_) => Dim::from(0),
+            GateSpec::Interleaved => self.width.clone(),
+            GateSpec::None | GateSpec::Separate(..) => Dim::from(0),
         }
     }
 
     /// `U`: separate gate values per query head.
-    pub(crate) fn separate_gate(&self, form: &AttentionForm) -> Dim {
+    pub(crate) fn separate_gate<T, A>(&self, form: &AttentionForm<T, A>) -> Dim {
         match form.gate {
-            GateForm::None | GateForm::Interleaved => Dim::from(0),
-            GateForm::Separate(SeparateGate::Head) => Dim::from(1),
-            GateForm::Separate(SeparateGate::Element) => self.width.clone(),
+            GateSpec::None | GateSpec::Interleaved => Dim::from(0),
+            GateSpec::Separate(SeparateGate::Head, _) => Dim::from(1),
+            GateSpec::Separate(SeparateGate::Element, _) => self.width.clone(),
         }
     }
 
     /// `Q`: query (and interleaved gate) projection rows.
-    pub(crate) fn query_rows(&self, form: &AttentionForm) -> Dim {
+    pub(crate) fn query_rows<T, A>(&self, form: &AttentionForm<T, A>) -> Dim {
         self.heads() * (&self.width + self.interleaved_gate(form))
     }
 
     /// `GR`: separate gate projection rows.
-    pub(crate) fn gate_rows(&self, form: &AttentionForm) -> Dim {
+    pub(crate) fn gate_rows<T, A>(&self, form: &AttentionForm<T, A>) -> Dim {
         self.heads() * self.separate_gate(form)
     }
 
@@ -1066,15 +1204,15 @@ impl AttentionWidths<Dim> {
     }
 
     /// `K`: key projection rows.
-    pub(crate) fn key_rows(&self, form: &AttentionForm) -> Dim {
-        match form.fresh {
+    pub(crate) fn key_rows<T, A>(&self, form: &AttentionForm<T, A>) -> Dim {
+        match form.is_fresh() {
             true => self.key_width(),
             false => Dim::from(0),
         }
     }
 
     /// `V`: value projection rows.
-    pub(crate) fn value_rows(&self, form: &AttentionForm) -> Dim {
+    pub(crate) fn value_rows<T, A>(&self, form: &AttentionForm<T, A>) -> Dim {
         match form.projects_values() {
             true => self.key_width(),
             false => Dim::from(0),
@@ -1089,9 +1227,9 @@ impl AttentionWidths<Dim> {
     /// The projection entry's dimensions at `rows` rows, its query segment
     /// projecting `query_segment` rows: the query projection's rows, or a
     /// low-rank query's `rank` rows of `qr`.
-    pub(crate) fn project_dimensions(
+    pub(crate) fn project_dimensions<T, A>(
         &self,
-        form: &AttentionForm,
+        form: &AttentionForm<T, A>,
         rows: Dim,
         query_segment: Dim,
     ) -> [(&'static str, Dim); 6] {
@@ -1106,9 +1244,9 @@ impl AttentionWidths<Dim> {
     }
 
     /// A projection of history rows alone: no query or gate outputs.
-    pub(crate) fn key_value_dimensions(
+    pub(crate) fn key_value_dimensions<T, A>(
         &self,
-        form: &AttentionForm,
+        form: &AttentionForm<T, A>,
         rows: Dim,
     ) -> [(&'static str, Dim); 6] {
         let mut dimensions = self.project_dimensions(form, rows, Dim::from(0));
@@ -1117,7 +1255,7 @@ impl AttentionWidths<Dim> {
     }
 
     /// The static axes of the fused attention entries.
-    pub(crate) fn mix_statics(&self, form: &AttentionForm) -> [(&'static str, Dim); 16] {
+    pub(crate) fn mix_statics<T, A>(&self, form: &AttentionForm<T, A>) -> [(&'static str, Dim); 16] {
         [
             ("KV", self.kv_heads.clone()),
             ("G", self.group.clone()),
@@ -1125,7 +1263,7 @@ impl AttentionWidths<Dim> {
             ("S", self.static_width()),
             ("I", self.interleaved_gate(form)),
             ("U", self.separate_gate(form)),
-            ("F", axis(form.fresh)),
+            ("F", axis(form.is_fresh())),
             ("NQ", axis(form.query_norm)),
             ("N", axis(form.key_norm)),
             ("NV", axis(form.value_norm)),
@@ -1134,7 +1272,7 @@ impl AttentionWidths<Dim> {
             ("RT", axis(form.rotary_trailing)),
             ("RO", axis(form.output_rotary)),
             ("VK", axis(form.stored_key())),
-            ("AB", axis(form.absorbed_query)),
+            ("AB", axis(form.is_absorbed())),
         ]
     }
 
@@ -1146,9 +1284,9 @@ impl AttentionWidths<Dim> {
 
     /// The fused entries' dimensions for `rows` rows over `history_rows`
     /// history rows read in `segments` visible spans.
-    pub(crate) fn mix_dimensions(
+    pub(crate) fn mix_dimensions<T, A>(
         &self,
-        form: &AttentionForm,
+        form: &AttentionForm<T, A>,
         rows: Dim,
         history_rows: Dim,
         segments: Dim,
@@ -1178,14 +1316,17 @@ impl AttentionWidths<Dim> {
     }
 }
 
-/// An attention operator's kernel binding. Weights a form lacks (a separate
-/// gate, own keys or values) are absent (`None`); their empty segments bind a
-/// zero-row view of the query segment's weight and resolve via
-/// [`Self::gate_segment`], [`Self::key_segment`], and [`Self::value_segment`]
-/// to [`Self::query_segment`].
+/// An attention operator's kernel binding. Structural segments (`gate`,
+/// `key`, `value`, `absorbed`) carry their weight elements inside `shape.form`
+/// ([`GateSpec<Element>`], [`KeyValueSpec<Element>`],
+/// `Option<AbsorbedQueryBinding>`), so absent segments have no element
+/// representation; their empty projection segments bind a zero-row view of the
+/// query segment's weight and resolve via [`Self::gate_segment`],
+/// [`Self::key_segment`], and [`Self::value_segment`] to
+/// [`Self::query_segment`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionBinding {
-    pub shape: AttentionShape,
+    pub shape: AttentionShape<Element, AbsorbedQueryBinding>,
     /// State-only projection omits query and gate segments statically.
     pub key_value_only: bool,
     pub norm: Element,
@@ -1195,15 +1336,6 @@ pub struct AttentionBinding {
     /// A low-rank query's `qr` row (`QueryProjection::LowRank`); none for a
     /// full query.
     pub low_rank_query: Option<LowRankQueryBinding>,
-    /// Separate gate projection's element; none when the form has no separate
-    /// gate (`shape.gate_rows() == 0`).
-    gate: Option<Element>,
-    /// Key projection's element; none when the layer projects no keys
-    /// (`shape.key_rows() == 0`).
-    key: Option<Element>,
-    /// Value projection's element; none when the layer projects no values
-    /// (`shape.value_rows() == 0`).
-    value: Option<Element>,
     /// The output projection's (the second, `b`, of a grouped output).
     pub output: Element,
     pub activation: Element,
@@ -1216,9 +1348,6 @@ pub struct AttentionBinding {
     /// A grouped output's first product (`OutputProjection::GroupedLowRank`'s
     /// `a`); none for a full output projection.
     pub grouped: Option<GroupedOutputBinding>,
-    /// An absorbed query's per-head products (`QueryKeys::Absorbed`); none
-    /// for queries that meet the keys directly.
-    pub absorbed: Option<AbsorbedQueryBinding>,
     /// The second source a row reads by its picks (`KS = shape.widths.picks`);
     /// none for a layer reading one source.
     pub picked: Option<PickedBinding>,
@@ -1405,97 +1534,34 @@ pub struct AbsorbedQueryShape {
 }
 
 impl AttentionBinding {
-    /// Construct an attention binding, panicking if the presence of `gate`,
-    /// `key`, or `value` disagrees with `shape`'s row counts.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        shape: AttentionShape,
-        key_value_only: bool,
-        norm: Element,
-        query: Element,
-        low_rank_query: Option<LowRankQueryBinding>,
-        gate: Option<Element>,
-        key: Option<Element>,
-        value: Option<Element>,
-        output: Element,
-        activation: Element,
-        history: magnitude_state::CodecSpec,
-        tail: SublayerTail,
-        selection: Option<SelectionBinding>,
-        grouped: Option<GroupedOutputBinding>,
-        absorbed: Option<AbsorbedQueryBinding>,
-        picked: Option<PickedBinding>,
-    ) -> Self {
-        assert_eq!(
-            gate.is_some(),
-            shape.gate_rows() > 0,
-            "attention gate element presence must match shape.gate_rows() > 0"
-        );
-        assert_eq!(
-            key.is_some(),
-            shape.key_rows() > 0,
-            "attention key element presence must match shape.key_rows() > 0"
-        );
-        assert_eq!(
-            value.is_some(),
-            shape.value_rows() > 0,
-            "attention value element presence must match shape.value_rows() > 0"
-        );
-        Self {
-            shape,
-            key_value_only,
-            norm,
-            query,
-            low_rank_query,
-            gate,
-            key,
-            value,
-            output,
-            activation,
-            history,
-            tail,
-            selection,
-            grouped,
-            absorbed,
-            picked,
-        }
-    }
-
     /// A key-value-only copy of this binding with `norm` as its input norm.
     pub fn as_key_value_only(self, norm: Element) -> Self {
-        Self::new(
-            self.shape,
-            true,
+        Self {
+            key_value_only: true,
             norm,
-            self.query,
-            self.low_rank_query,
-            self.gate,
-            self.key,
-            self.value,
-            self.output,
-            self.activation,
-            self.history,
-            self.tail,
-            self.selection,
-            self.grouped,
-            self.absorbed,
-            self.picked,
-        )
+            ..self
+        }
     }
 
     /// Separate gate projection's element; none when absent.
     pub fn gate(&self) -> Option<Element> {
-        self.gate
+        self.shape.form.gate.separate().copied()
     }
 
     /// Key projection's element; none when absent.
     pub fn key(&self) -> Option<Element> {
-        self.key
+        self.shape.form.key_value.key().copied()
     }
 
     /// Value projection's element; none when absent.
     pub fn value(&self) -> Option<Element> {
-        self.value
+        self.shape.form.key_value.value().copied()
+    }
+
+    /// An absorbed query's per-head products (`QueryKeys::Absorbed`); none
+    /// for queries that meet the keys directly.
+    pub fn absorbed(&self) -> Option<AbsorbedQueryBinding> {
+        self.shape.form.absorbed
     }
 
     /// The weight the projection's query segment reads: the query's, or a
@@ -1508,26 +1574,26 @@ impl AttentionBinding {
     /// The weight the projection's gate segment reads: its own, or the query
     /// segment's when absent.
     pub fn gate_segment(&self) -> Element {
-        self.gate.unwrap_or_else(|| self.query_segment())
+        self.gate().unwrap_or_else(|| self.query_segment())
     }
 
     /// The weight the projection's key segment reads: its own, or the query
     /// segment's when absent.
     pub fn key_segment(&self) -> Element {
-        self.key.unwrap_or_else(|| self.query_segment())
+        self.key().unwrap_or_else(|| self.query_segment())
     }
 
     /// The weight the projection's value segment reads: its own, or the query
     /// segment's when absent.
     pub fn value_segment(&self) -> Element {
-        self.value.unwrap_or_else(|| self.query_segment())
+        self.value().unwrap_or_else(|| self.query_segment())
     }
 
     /// `Q`: the rows its query projection (a low-rank query's up) yields:
     /// the attended query rows, or an absorbed query's heads at their own
     /// width (`AttentionBlock::query_projection_rows`).
     pub fn query_rows(&self) -> u64 {
-        self.absorbed
+        self.absorbed()
             .map_or(self.shape.query_rows(), |absorbed| absorbed.shape.heads * absorbed.shape.width)
     }
 

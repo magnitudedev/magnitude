@@ -3166,17 +3166,19 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         activation: Element::bf16(),
         shape: crate::AttentionShape {
             form: crate::planning::AttentionForm {
-                gate: crate::planning::GateForm::None,
-                fresh: true,
+                gate: crate::planning::GateSpec::None,
+                key_value: crate::planning::KeyValueSpec::Fresh {
+                    key: (),
+                    value: crate::planning::ValueSpec::Projected(()),
+                },
                 query_norm: true,
                 key_norm: true,
                 value_norm: false,
-                values: crate::AttentionValues::Projected,
                 sinks: false,
                 rotary_adjacent: false,
                 rotary_trailing: false,
                 output_rotary: false,
-                absorbed_query: false,
+                absorbed: None,
             },
             key_rounding: crate::RoundingArgs::NONE,
             widths: crate::planning::AttentionWidths {

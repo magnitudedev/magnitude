@@ -1442,7 +1442,7 @@ impl<'a> Preparation<'a> {
         let mix = || AttentionMix {
             codec: binding.history,
             activation,
-            shape,
+            shape: shape.unit(),
             scopes: scopes.clone(),
             epsilon: self.epsilon,
             listing: PrefillListing::Every,
@@ -1612,7 +1612,7 @@ impl<'a> Preparation<'a> {
         };
         // An absorbed query's per-head products publish the activation
         // rows the history entry attends with.
-        let absorbed = match binding.absorbed {
+        let absorbed = match binding.absorbed() {
             None => Some(None),
             Some(absorbed) => self
                 .projection(ProjectRowsTuning {
@@ -1630,7 +1630,7 @@ impl<'a> Preparation<'a> {
                 .projection(AttentionOutputTuning {
                     output,
                     activation,
-                    shape,
+                    shape: shape.unit(),
                     input: binding.output_input(),
                     scopes,
                 })?

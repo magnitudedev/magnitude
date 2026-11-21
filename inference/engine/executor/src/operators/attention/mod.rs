@@ -8,9 +8,9 @@ pub(crate) mod selection;
 pub(crate) mod split;
 
 use super::{PlanError, WeightPush, tail};
-use crate::planning::{AttentionForm, AttentionWidths, GateForm, SeparateGate};
+use crate::planning::{AttentionForm, AttentionWidths, GateSpec, KeyValueSpec, SeparateGate, ValueSpec};
 use crate::{
-    AbsorbedQueryBinding, AbsorbedQueryShape, AttentionBinding, AttentionShape, AttentionValues,
+    AbsorbedQueryBinding, AbsorbedQueryShape, AttentionBinding, AttentionShape,
     CandidatePool, CandidatesBinding,
     GroupedOutputBinding, GroupedOutputShape, IndexerBinding, LowRankQueryBinding, PickedBinding,
     PooledBinding, ScalableWeight, SelectionBinding, SelectionKeysBinding, SelectionShape,
@@ -497,7 +497,7 @@ pub(crate) fn admit(attention: &Attention, input_epsilon: f64) -> Result<(), Pla
     }
     // The entries turn the published attended row back, which a gate
     // would have already scaled (`attention.seismic`'s `output_rotary`).
-    if shape.form.output_rotary && shape.form.gate != GateForm::None {
+    if shape.form.output_rotary && shape.form.gate != GateSpec::None {
         return Err(PlanError::Unsupported(
             "gated attention with an inverse output rotary",
         ));
@@ -619,12 +619,15 @@ fn geometry(hidden: u64, attention: &Attention) -> Result<AttentionShape, PlanEr
     }
     let width = attention.width;
     let gate = match &attention.gate {
-        AttentionGate::None => GateForm::None,
-        AttentionGate::Interleaved { .. } => GateForm::Interleaved,
-        AttentionGate::Separate { granularity, .. } => GateForm::Separate(match granularity {
-            GateGranularity::Element => SeparateGate::Element,
-            GateGranularity::Head => SeparateGate::Head,
-        }),
+        AttentionGate::None => GateSpec::None,
+        AttentionGate::Interleaved { .. } => GateSpec::Interleaved,
+        AttentionGate::Separate { granularity, .. } => GateSpec::Separate(
+            match granularity {
+                GateGranularity::Element => SeparateGate::Element,
+                GateGranularity::Head => SeparateGate::Head,
+            },
+            (),
+        ),
     };
     // The rotary layout and output rotary (`RA`, `RT`, `RO`).
     let (rotary_adjacent, rotary_trailing, output_rotary) = match &attention.rotary {
@@ -642,33 +645,34 @@ fn geometry(hidden: u64, attention: &Attention) -> Result<AttentionShape, PlanEr
         ),
     };
     let query_norm = matches!(attention.query_norm, HeadNorm::Rms(_));
-    let (fresh, key_norm, value_norm, values) = match fresh_rows(attention) {
+    let (key_value, key_norm, value_norm) = match fresh_rows(attention) {
         FreshRows::Own(rows) => (
-            true,
+            KeyValueSpec::Fresh {
+                key: (),
+                value: match rows.value {
+                    ValueSource::Projected(_) => ValueSpec::Projected(()),
+                    ValueSource::RawKey => ValueSpec::RawKey,
+                    ValueSource::StoredKey => ValueSpec::StoredKey,
+                },
+            },
             matches!(rows.key_norm, HeadNorm::Rms(_)),
             matches!(rows.value_norm, ValueNorm::RmsUnweighted(_)),
-            match rows.value {
-                ValueSource::Projected(_) => AttentionValues::Projected,
-                ValueSource::RawKey => AttentionValues::RawKey,
-                ValueSource::StoredKey => AttentionValues::StoredKey,
-            },
         ),
         // A Shared layer projects no keys: its unread `N` is its `NQ`.
-        FreshRows::Shared(_) => (false, query_norm, false, AttentionValues::Projected),
+        FreshRows::Shared(_) => (KeyValueSpec::Shared, query_norm, false),
     };
     Ok(AttentionShape {
         form: AttentionForm {
             gate,
-            fresh,
+            key_value,
             query_norm,
             key_norm,
             value_norm,
-            values,
             sinks: attention.sinks.is_some(),
             rotary_adjacent,
             rotary_trailing,
             output_rotary,
-            absorbed_query: matches!(attention.query_keys, QueryKeys::Absorbed { .. }),
+            absorbed: matches!(attention.query_keys, QueryKeys::Absorbed { .. }).then_some(()),
         },
         widths: AttentionWidths {
             hidden,
@@ -1118,7 +1122,6 @@ pub(super) fn binding(
         }
     };
     let query = projection(query_kind(attention))?;
-    let segment = |present: bool, kind| present.then(|| projection(kind)).transpose();
     let selection = selected_read(&attention.fresh().reads)?
         .map(|read| {
             let gate = match read.keys.pool {
@@ -1157,21 +1160,46 @@ pub(super) fn binding(
             "a rounded or index-list layer's history planned other than dense",
         ));
     }
-    Ok(AttentionBinding::new(
-        shape,
-        false,
-        lookup(WeightKind::InputNorm)?,
+    let gate = shape.form.gate.try_map(|()| projection(WeightKind::AttentionGate))?;
+    let key_value = shape.form.key_value.try_map(
+        |()| projection(WeightKind::Key),
+        |()| projection(WeightKind::Value),
+    )?;
+    let absorbed = absorbed
+        .map(|shape| {
+            Ok::<_, PlanError>(AbsorbedQueryBinding {
+                shape,
+                element: projection(WeightKind::QueryKeys)?,
+            })
+        })
+        .transpose()?;
+    Ok(AttentionBinding {
+        shape: AttentionShape {
+            form: AttentionForm {
+                gate,
+                key_value,
+                query_norm: shape.form.query_norm,
+                key_norm: shape.form.key_norm,
+                value_norm: shape.form.value_norm,
+                sinks: shape.form.sinks,
+                rotary_adjacent: shape.form.rotary_adjacent,
+                rotary_trailing: shape.form.rotary_trailing,
+                output_rotary: shape.form.output_rotary,
+                absorbed,
+            },
+            widths: shape.widths,
+            key_rounding: shape.key_rounding,
+        },
+        key_value_only: false,
+        norm: lookup(WeightKind::InputNorm)?,
         query,
         low_rank_query,
-        segment(shape.gate_rows() > 0, WeightKind::AttentionGate)?,
-        segment(shape.key_rows() > 0, WeightKind::Key)?,
-        segment(shape.value_rows() > 0, WeightKind::Value)?,
-        projection(WeightKind::AttentionOutput)?,
+        output: projection(WeightKind::AttentionOutput)?,
         activation,
         history,
-        tail(output, &lookup)?,
+        tail: tail(output, &lookup)?,
         selection,
-        grouped_output(attention)
+        grouped: grouped_output(attention)
             .map(|shape| {
                 Ok::<_, PlanError>(GroupedOutputBinding {
                     shape,
@@ -1179,16 +1207,8 @@ pub(super) fn binding(
                 })
             })
             .transpose()?,
-        absorbed
-            .map(|shape| {
-                Ok::<_, PlanError>(AbsorbedQueryBinding {
-                    shape,
-                    element: projection(WeightKind::QueryKeys)?,
-                })
-            })
-            .transpose()?,
         picked,
-    ))
+    })
 }
 
 /// The history codec `attention` reads under the storage policy `history`
@@ -1666,7 +1686,7 @@ pub(crate) mod tests {
                     panic!("an attention block");
                 };
                 assert_eq!(
-                    binding.absorbed.map(|absorbed| absorbed.shape),
+                    binding.absorbed().map(|absorbed| absorbed.shape),
                     Some(crate::AbsorbedQueryShape { heads: 4, width: 64, keys: 128 })
                 );
                 assert_eq!((binding.query_rows(), binding.query_segment_rows()), (4 * 64, LOW_RANK));

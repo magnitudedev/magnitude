@@ -1673,7 +1673,7 @@ impl AttentionMix {
             .copied()
             .collect::<Vec<_>>();
         let (heads, width) = (shape.heads(), shape.widths.width);
-        let fresh_rows = [u64::from(shape.form.fresh), rows, shape.widths.kv_heads * width];
+        let fresh_rows = [u64::from(shape.form.is_fresh()), rows, shape.widths.kv_heads * width];
         let selected_rows = self.picks(
             point,
             &tables.coordinates[..rows as usize],
@@ -1699,7 +1699,7 @@ impl AttentionMix {
                 let query_norm = head_norm(shape.form.query_norm, WeightKind::QueryNorm)?;
                 // A Shared layer's unread key norm port takes its query norm
                 // (`graph::attention`).
-                let key_norm = if !shape.form.fresh {
+                let key_norm = if !shape.form.is_fresh() {
                     query_norm.clone()
                 } else {
                     head_norm(shape.form.key_norm, WeightKind::KeyNorm)?
@@ -1736,7 +1736,7 @@ impl AttentionMix {
                     value: inputs.activation(
                         self.activation,
                         &[
-                            u64::from(shape.form.fresh && !shape.form.stored_key()),
+                            u64::from(shape.form.is_fresh() && !shape.form.stored_key()),
                             rows,
                             shape.widths.kv_heads * width,
                         ],
@@ -1788,7 +1788,7 @@ impl AttentionMix {
                         ]
                         .into_iter()
                         .chain(self.dense().then_some(shape.rounds_keys()))
-                        .chain(self.dense().then_some(u64::from(shape.form.absorbed_query)))
+                        .chain(self.dense().then_some(u64::from(shape.form.is_absorbed())))
                         .collect::<Vec<_>>(),
                         &[],
                     )?,
@@ -2109,17 +2109,19 @@ mod tests {
                     activation: Element::bf16(),
                     shape: AttentionShape {
                         form: crate::planning::AttentionForm {
-                            gate: crate::planning::GateForm::Interleaved,
-                            fresh: true,
+                            gate: crate::planning::GateSpec::Interleaved,
+                            key_value: crate::planning::KeyValueSpec::Fresh {
+                                key: (),
+                                value: crate::planning::ValueSpec::Projected(()),
+                            },
                             query_norm: true,
                             key_norm: true,
                             value_norm: false,
-                            values: crate::AttentionValues::Projected,
                             sinks: false,
                             rotary_adjacent: false,
                             rotary_trailing: false,
                             output_rotary: false,
-                            absorbed_query: false,
+                            absorbed: None,
                         },
                         key_rounding: crate::RoundingArgs::NONE,
                         widths: crate::planning::AttentionWidths {
@@ -2226,17 +2228,19 @@ mod tests {
                 activation: Element::bf16(),
                 shape: AttentionShape {
                     form: crate::planning::AttentionForm {
-                        gate: crate::planning::GateForm::None,
-                        fresh: true,
+                        gate: crate::planning::GateSpec::None,
+                        key_value: crate::planning::KeyValueSpec::Fresh {
+                            key: (),
+                            value: crate::planning::ValueSpec::Projected(()),
+                        },
                         query_norm: true,
                         key_norm: true,
                         value_norm: true,
-                        values: crate::AttentionValues::Projected,
                         sinks: false,
                         rotary_adjacent: false,
                         rotary_trailing: false,
                         output_rotary: false,
-                        absorbed_query: false,
+                        absorbed: None,
                     },
                     key_rounding: crate::RoundingArgs::NONE,
                     widths: crate::planning::AttentionWidths {
@@ -2337,17 +2341,19 @@ mod tests {
                     activation: Element::bf16(),
                     shape: AttentionShape {
                         form: crate::planning::AttentionForm {
-                            gate: crate::planning::GateForm::None,
-                            fresh: true,
+                            gate: crate::planning::GateSpec::None,
+                            key_value: crate::planning::KeyValueSpec::Fresh {
+                                key: (),
+                                value: crate::planning::ValueSpec::Projected(()),
+                            },
                             query_norm: true,
                             key_norm: true,
                             value_norm: false,
-                            values: crate::AttentionValues::Projected,
                             sinks: false,
                             rotary_adjacent: false,
                             rotary_trailing: false,
                             output_rotary: false,
-                            absorbed_query: false,
+                            absorbed: None,
                         },
                         key_rounding: crate::RoundingArgs::NONE,
                         widths: crate::planning::AttentionWidths {
@@ -2442,17 +2448,19 @@ mod tests {
             activation: Element::bf16(),
             shape: AttentionShape {
                 form: crate::planning::AttentionForm {
-                    gate: crate::planning::GateForm::Interleaved,
-                    fresh: true,
+                    gate: crate::planning::GateSpec::Interleaved,
+                    key_value: crate::planning::KeyValueSpec::Fresh {
+                        key: (),
+                        value: crate::planning::ValueSpec::Projected(()),
+                    },
                     query_norm: true,
                     key_norm: true,
                     value_norm: false,
-                    values: crate::AttentionValues::Projected,
                     sinks: false,
                     rotary_adjacent: false,
                     rotary_trailing: false,
                     output_rotary: false,
-                    absorbed_query: false,
+                    absorbed: None,
                 },
                 key_rounding: crate::RoundingArgs::NONE,
                 widths: crate::planning::AttentionWidths {
@@ -2630,17 +2638,19 @@ mod tests {
             activation: Element::bf16(),
             shape: AttentionShape {
                 form: crate::planning::AttentionForm {
-                    gate: crate::planning::GateForm::None,
-                    fresh: true,
+                    gate: crate::planning::GateSpec::None,
+                    key_value: crate::planning::KeyValueSpec::Fresh {
+                        key: (),
+                        value: crate::planning::ValueSpec::Projected(()),
+                    },
                     query_norm: false,
                     key_norm: true,
                     value_norm: false,
-                    values: crate::AttentionValues::Projected,
                     sinks: false,
                     rotary_adjacent: false,
                     rotary_trailing: false,
                     output_rotary: false,
-                    absorbed_query: false,
+                    absorbed: None,
                 },
                 key_rounding: crate::RoundingArgs::NONE,
                 widths: crate::planning::AttentionWidths {
@@ -2730,17 +2740,19 @@ mod tests {
             activation: Element::bf16(),
             shape: AttentionShape {
                 form: crate::planning::AttentionForm {
-                    gate: crate::planning::GateForm::None,
-                    fresh: true,
+                    gate: crate::planning::GateSpec::None,
+                    key_value: crate::planning::KeyValueSpec::Fresh {
+                        key: (),
+                        value: crate::planning::ValueSpec::Projected(()),
+                    },
                     query_norm: true,
                     key_norm: true,
                     value_norm: false,
-                    values: crate::AttentionValues::Projected,
                     sinks: false,
                     rotary_adjacent: false,
                     rotary_trailing: false,
                     output_rotary: false,
-                    absorbed_query: false,
+                    absorbed: None,
                 },
                 key_rounding: crate::RoundingArgs::NONE,
                 widths: crate::planning::AttentionWidths {

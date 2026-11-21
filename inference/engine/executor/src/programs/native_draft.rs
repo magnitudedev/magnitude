@@ -1836,7 +1836,7 @@ fn draft_conditioning<'a, G: GraphDraft + 'a>(
                 .widths
                 .key_value_dimensions(&first_pass.topology.form, first_pass.numbers.rows.clone())
                 .as_slice(),
-            first_weights.operands.project_dimensions(true).as_slice(),
+            first_weights.project_dimensions(true).as_slice(),
             &InputForm::SINGLE.dimensions(first_pass.numbers.widths.hidden.clone()),
         ]
         .concat(),
@@ -2593,10 +2593,10 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
     // operands, the rest loading theirs.
     let project_attention = |graph: &mut G,
                              entry: G::Ranged<'a, project_rows::Entry>,
-                             operand: (&WorkflowTensor, &WeightOperands),
+                             operand: &crate::programs::native_target_graph::PackedWeight,
                              source: seismic::WorkflowTensorRef<'_>,
                              (inputs, outputs): (Dim, Dim)| {
-        project_planned(graph, entry, operand, source, (rows.clone(), inputs, outputs))
+        project_planned(graph, entry, (&operand.weight, &operand.operands), source, (rows.clone(), inputs, outputs))
     };
     let project = |graph: &mut G,
                    weights: &mut Vec<(WeightPort, NativePort)>,
@@ -2696,7 +2696,11 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
     let (heads, width) = (numbers.widths.heads(), &numbers.widths.width);
     let key_width = numbers.widths.key_width();
     let attention = layer.attention_weights;
-    let (Some(key_weight), Some(value_weight)) = (&attention.key, &attention.value) else {
+    let crate::planning::KeyValueSpec::Fresh {
+        key: key_weight,
+        value: crate::planning::ValueSpec::Projected(value_weight),
+    } = &attention.key_value
+    else {
         return Err("a convolved draft layer projects its keys and values".into());
     };
     if attention.low_rank_query.is_some() || attention.absorbed.is_some() {
@@ -2705,21 +2709,21 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
     let query = project_attention(
         graph,
         entries.query,
-        (&attention.query, &attention.operands.query),
+        &attention.query,
         (&convolved).into(),
         (hidden.clone(), &heads * width),
     )?;
     let key = project_attention(
         graph,
         entries.key,
-        (key_weight, &attention.operands.key),
+        key_weight,
         (&convolved).into(),
         (hidden.clone(), key_width.clone()),
     )?;
     let value = project_attention(
         graph,
         entries.value,
-        (value_weight, &attention.operands.value),
+        value_weight,
         (&convolved).into(),
         (hidden.clone(), key_width.clone()),
     )?;
@@ -2747,10 +2751,7 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
     let output = project_attention(
         graph,
         entries.output,
-        (
-            attention.output.as_ref().ok_or("draft block output weight is absent")?,
-            &attention.operands.output,
-        ),
+        attention.output.as_ref().ok_or("draft block output weight is absent")?,
         (&attended.reshape(&[rows, &(&heads * width)])).into(),
         (&heads * width, hidden.clone()),
     )?;

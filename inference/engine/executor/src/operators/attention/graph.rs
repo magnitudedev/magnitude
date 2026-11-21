@@ -30,9 +30,11 @@ use super::selection::{
     ProjectionInput,
 };
 use super::split::{AttentionBlock, AttentionTopology, PickedPart, Plane, SelectedRead, SelectionReals, both, picked as picked_part};
-use crate::planning::{RoundingArguments, axis};
-use crate::programs::native_target_graph::{PackedWeight, PlannedWeights, WeightOperands, WeightPort, weight};
-use crate::{AttentionBinding, AttentionShape, AttentionValues, SublayerTail};
+use crate::planning::{GateSpec, KeyValueSpec, RoundingArguments, ValueSpec, axis};
+use crate::programs::native_target_graph::{
+    PackedWeight, PlannedWeights, WeightOperands, WeightPort, packed_weight, weight,
+};
+use crate::{AttentionBinding, AttentionShape, SublayerTail};
 use crate::{
     native::{
         AttentionHistoryKernels, AttentionKernels, DenseDecodeKernels, PoolKernel,
@@ -40,7 +42,7 @@ use crate::{
     },
     programs::native_constants::GraphConstant,
 };
-use magnitude_family_contracts::{Rotary, WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{Rotary, WeightKind, WeightScope};
 use magnitude_kernels::{
     attention_append_dense, attention_append_k8v4, attention_decode, attention_decode_k8v4,
     attention_output, attention_prefill, attention_prefill_k8v4, attention_project, candidate_rows,
@@ -48,8 +50,7 @@ use magnitude_kernels::{
 };
 use magnitude_state::{CodecSpec, HistoryEncoding, HistoryValue};
 use seismic::{
-    Argument, Dim, Element, NativeGraph, NativePort, WorkflowTensor,
-    WorkflowTensorRef, WorkflowTensorView,
+    Argument, Dim, Element, NativeGraph, NativePort, WorkflowTensor, WorkflowTensorView,
 };
 
 /// An attention block's entries; each projection's by row range.
@@ -526,7 +527,7 @@ impl CheckedAttentionEntries {
                 ]
             }),
             // The absorbed queries are the attention entries' queries, in A.
-            absorbed: binding.absorbed.map(|absorbed| {
+            absorbed: binding.absorbed().map(|absorbed| {
                 [
                     ("A", binding.activation),
                     ("W", absorbed.element),
@@ -609,8 +610,8 @@ pub(crate) fn lists_history_tiles(binding: AttentionBinding) -> bool {
 /// rounding and picks or the affine planes' widths. The preparation's cases
 /// and the demand's calls read it alike; a launch variant (a prefill's tile
 /// listing) is the case's own beside it.
-pub(crate) fn form_statics(
-    shape: &AttentionShape,
+pub(crate) fn form_statics<T, A>(
+    shape: &AttentionShape<T, A>,
     codec: CodecSpec,
 ) -> Result<Vec<(&'static str, u64)>, String> {
     match codec.encoding() {
@@ -628,8 +629,8 @@ pub(crate) fn form_statics(
 
 /// The cache-publishing entries' form: [`form_statics`] without the axes
 /// they do not read.
-pub(crate) fn append_form_statics(
-    shape: &AttentionShape,
+pub(crate) fn append_form_statics<T, A>(
+    shape: &AttentionShape<T, A>,
     codec: CodecSpec,
 ) -> Result<Vec<(&'static str, u64)>, String> {
     Ok(form_statics(shape, codec)?
@@ -657,34 +658,34 @@ pub(crate) fn decodes(rows: impl Into<Dim>) -> bool {
     rows.into().at_most(magnitude_kernels::constants::VERIFY_ROWS)
 }
 
-/// The block's weight tensors, as ports of the graph being built. The
-/// operator's form decides which are present.
+/// The block's weight tensors and projection operands, as ports of the graph
+/// being built. The operator's form decides which segments are present.
 #[derive(Clone)]
 pub(crate) struct AttentionWeights {
     /// The input norm; absent for a mix site's partials.
     pub input_norm: Option<WorkflowTensor>,
     /// The projection's query segment: the query projection (with
     /// interleaved gate rows when gated so), or a low-rank query's `down`.
-    pub query: WorkflowTensor,
+    pub query: PackedWeight,
     /// A low-rank query's `qr` norm and `up`, where the block attends.
     pub low_rank_query: Option<LowRankQueryWeights>,
     /// An absorbed query's per-head key projections, where the block
     /// attends.
-    pub absorbed: Option<WorkflowTensor>,
-    pub gate: Option<WorkflowTensor>,
-    pub key: Option<WorkflowTensor>,
-    pub value: Option<WorkflowTensor>,
+    pub absorbed: Option<PackedWeight>,
+    /// The gate projection segment, when gated separately.
+    pub gate: GateSpec<PackedWeight>,
+    /// The key and value projection segments, when the layer projects its own
+    /// rows.
+    pub key_value: KeyValueSpec<PackedWeight>,
     pub query_norm: Option<WorkflowTensor>,
     pub key_norm: Option<WorkflowTensor>,
     /// The per-head sink logits (`[heads]`), when the operator has sinks.
     pub sinks: Option<WorkflowTensor>,
-    pub output: Option<WorkflowTensor>,
+    pub output: Option<PackedWeight>,
     /// A grouped output's first projection (`a`), when it is grouped.
-    pub grouped: Option<WorkflowTensor>,
+    pub grouped: Option<PackedWeight>,
     /// The sublayer's post-norm weight, when its tail is a post-norm.
     pub post_norm: Option<WorkflowTensor>,
-    /// The projections' scales and packing bounds.
-    pub operands: AttentionOperands,
     /// A selected read's weights, held apart: only an operator that selects
     /// has them.
     pub selection: Option<Box<SelectionWeights>>,
@@ -693,194 +694,20 @@ pub(crate) struct AttentionWeights {
     pub picked: Option<Box<PickedWeights>>,
 }
 
-/// The scales and packing bounds of an attention block's projections, in
-/// the order of `attention_project`'s and `attention_output`'s ports.
-#[derive(Clone)]
-pub(crate) struct AttentionOperands {
-    /// The query segment's weight's: the query's, or a low-rank query's
-    /// `down`.
-    pub query: WeightOperands,
-    /// A low-rank query's `up`, where the block attends.
-    pub low_rank_query: Option<WeightOperands>,
-    pub gate: WeightOperands,
-    pub key: WeightOperands,
-    pub value: WeightOperands,
-    pub output: WeightOperands,
-    pub grouped: WeightOperands,
-    pub absorbed: WeightOperands,
-    /// A selected read's projections', held apart: only an operator that
-    /// selects has them.
-    pub selection: Option<Box<SelectionOperands>>,
-    /// An indexing index-list source's projections', where the block
-    /// attends, held apart: only an operator with its own indexer has them.
-    pub picked: Option<Box<PickedOperands>>,
-}
-
-/// An indexing index-list source's projections' operands: an own source's
-/// rows' and its indexer's.
-#[derive(Clone)]
-pub(crate) struct PickedOperands {
-    pub rows: Option<PooledOperands>,
-    pub indexer: IndexerOperands,
-}
-
-/// An indexer's projections' operands: its query's and its head weights'.
-#[derive(Clone)]
-pub(crate) struct IndexerOperands {
-    pub query: WeightOperands,
-    pub head_weights: Option<WeightOperands>,
-}
-
-/// A selected read's projections' operands: its keys' `u` and (gated) `g`
-/// projections', and its indexer's where its class scores.
-#[derive(Clone)]
-pub(crate) struct SelectionOperands {
-    pub projection: WeightOperands,
-    pub gate: Option<WeightOperands>,
-    pub indexer: Option<IndexerOperands>,
-}
-
-/// An own source's rows' projections' operands: its `u` and `g`
-/// projections' and its index keys'.
-#[derive(Clone)]
-pub(crate) struct PooledOperands {
-    pub projection: WeightOperands,
-    pub gate: Option<WeightOperands>,
-    pub key: WeightOperands,
-}
-
-impl AttentionOperands {
-    /// The operands of the block's weights at `scope` its graph reads
-    /// (`attention_weights`): the query, gate and output's only where it
-    /// attends (`attends`), and none of an absent segment's.
-    #[allow(clippy::too_many_arguments)]
-    fn planned<G: GraphDraft>(
-        graph: &mut G,
-        weights: &(impl PlannedWeights + ?Sized),
-        scope: WeightScope,
-        topology: &AttentionTopology,
-        numbers: &AttentionBlock,
-        attends: bool,
-        ports: &mut Vec<(WeightPort, NativePort)>,
-        constants: &mut Vec<GraphConstant>,
-    ) -> Result<Self, GraphError> {
-        let mut operands = |graph: &mut G, read: bool, kind| match read {
-            true => {
-                WeightOperands::planned(graph, weights, WeightRole { scope, kind }, ports, constants)
-            }
-            false => WeightOperands::absent(graph, constants),
-        };
-        let form = &topology.form;
-        // An indexer's query and (projected) head weights.
-        macro_rules! indexer {
-            ($head_weights:expr) => {
-                IndexerOperands {
-                    query: operands(graph, true, WeightKind::IndexerQuery)?,
-                    head_weights: match $head_weights {
-                        true => Some(operands(graph, true, WeightKind::IndexerHeadWeights)?),
-                        false => None,
-                    },
-                }
-            };
-        }
-        // A selected read's keys are appended by every graph of the block,
-        // its indexer run by those that attend and score.
-        let selection = match &numbers.selection {
-            None => None,
-            Some(read) => Some(Box::new(SelectionOperands {
-                projection: operands(graph, true, WeightKind::IndexerKey)?,
-                gate: match read.keys.gated {
-                    true => Some(operands(graph, true, WeightKind::IndexerKeyGate)?),
-                    false => None,
-                },
-                indexer: match attends && read.scored {
-                    true => Some(indexer!(read.source.head_weights)),
-                    false => None,
-                },
-            })),
-        };
-        let picked = match picked_part(topology, numbers) {
-            Some(PickedPart::Indexed { source: index, .. }) if attends => Some(Box::new(PickedOperands {
-                rows: match &index.own {
-                    Some(own) => Some(PooledOperands {
-                        projection: operands(graph, true, WeightKind::PooledProjection)?,
-                        gate: match own.gated {
-                            true => Some(operands(graph, true, WeightKind::PooledGate)?),
-                            false => None,
-                        },
-                        key: operands(graph, true, WeightKind::IndexerKey)?,
-                    }),
-                    None => None,
-                },
-                indexer: indexer!(index.head_weights),
-            })),
-            _ => None,
-        };
-        Ok(Self {
-            picked,
-            selection,
-            query: operands(graph, attends, topology.query_segment_kind)?,
-            low_rank_query: match attends && numbers.low_rank_query.is_some() {
-                true => Some(operands(graph, true, topology.query_kind)?),
-                false => None,
-            },
-            gate: operands(
-                graph,
-                attends && form.gated_separately(),
-                WeightKind::AttentionGate,
-            )?,
-            key: operands(graph, form.fresh, WeightKind::Key)?,
-            value: operands(graph, form.projects_values(), WeightKind::Value)?,
-            output: operands(graph, attends, WeightKind::AttentionOutput)?,
-            grouped: operands(
-                graph,
-                attends && numbers.grouped.is_some(),
-                WeightKind::AttentionOutputGrouped,
-            )?,
-            absorbed: operands(graph, attends && numbers.absorbed.is_some(), WeightKind::QueryKeys)?,
-        })
-    }
-
-    /// The projection's scale and bound dimensions, in `attention_project`'s
-    /// order: a history injection (`inject_only`) projects only keys and
-    /// values.
-    pub(crate) fn project_dimensions(&self, inject_only: bool) -> [(&'static str, Dim); 8] {
-        let attended = |dim: Dim| if inject_only { Dim::from(0) } else { dim };
-        [
-            ("QS", attended(self.query.scale.extent.clone())),
-            ("GS", attended(self.gate.scale.extent.clone())),
-            ("KS", self.key.scale.extent.clone()),
-            ("VS", self.value.scale.extent.clone()),
-            ("QB", attended(self.query.bound.extent.clone())),
-            ("GB", attended(self.gate.bound.extent.clone())),
-            ("KB", self.key.bound.extent.clone()),
-            ("VB", self.value.bound.extent.clone()),
-        ]
-    }
-
-    /// A query segment's scale and bound dimensions alone, in
-    /// `attention_project`'s order, from its weight's `operands`: a
-    /// low-rank query's up projection, or an indexer's projection.
-    pub(crate) fn query_dimensions(operands: &WeightOperands) -> [(&'static str, Dim); 8] {
-        [
-            ("QS", operands.scale.extent.clone()),
-            ("GS", Dim::from(0)),
-            ("KS", Dim::from(0)),
-            ("VS", Dim::from(0)),
-            ("QB", operands.bound.extent.clone()),
-            ("GB", Dim::from(0)),
-            ("KB", Dim::from(0)),
-            ("VB", Dim::from(0)),
-        ]
-    }
-
-    /// The output projection's scale and bound dimensions.
-    pub(crate) fn output_dimensions(&self) -> [(&'static str, Dim); 2] {
-        [
-            ("OS", self.output.scale.extent.clone()),
-            ("OB", self.output.bound.extent.clone()),
-        ]
-    }
+/// A query segment's scale and bound dimensions alone, in
+/// `attention_project`'s order, from its weight's `operands`: a low-rank
+/// query's up projection, or an indexer's projection.
+pub(crate) fn query_operand_dimensions(operands: &WeightOperands) -> [(&'static str, Dim); 8] {
+    [
+        ("QS", operands.scale.extent.clone()),
+        ("GS", Dim::from(0)),
+        ("KS", Dim::from(0)),
+        ("VS", Dim::from(0)),
+        ("QB", operands.bound.extent.clone()),
+        ("GB", Dim::from(0)),
+        ("KB", Dim::from(0)),
+        ("VB", Dim::from(0)),
+    ]
 }
 
 /// A low-rank query's weights after its `down`: the norm of its `qr` row
@@ -888,7 +715,7 @@ impl AttentionOperands {
 #[derive(Clone)]
 pub(crate) struct LowRankQueryWeights {
     pub norm: WorkflowTensor,
-    pub up: WorkflowTensor,
+    pub up: PackedWeight,
 }
 
 /// An indexer's weights: its query, the query heads' own norm (if it has
@@ -913,27 +740,25 @@ pub(crate) struct SelectionWeights {
     pub indexer: Option<IndexerWeights>,
 }
 
-/// An indexer's weights through `operands`, its query heads normed where
-/// `query_norm`.
-fn indexer_weights(
-    operands: &IndexerOperands,
+/// An indexer's weights at `scope`, its query heads normed where `query_norm`
+/// and head weights projected where `head_weights`.
+fn indexer_weights<G: GraphDraft>(
+    graph: &mut G,
+    planned: &(impl PlannedWeights + ?Sized),
+    scope: WeightScope,
+    head_weights: bool,
     query_norm: bool,
-    weight: &mut impl FnMut(WeightKind) -> Result<WorkflowTensor, GraphError>,
+    ports: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
 ) -> Result<IndexerWeights, GraphError> {
-    let packed = |weight: WorkflowTensor, operands: &WeightOperands| PackedWeight {
-        weight,
-        operands: operands.clone(),
-    };
     Ok(IndexerWeights {
-        query: packed(weight(WeightKind::IndexerQuery)?, &operands.query),
-        query_norm: match query_norm {
-            true => Some(weight(WeightKind::IndexerQueryNorm)?),
-            false => None,
-        },
-        head_weights: match &operands.head_weights {
-            Some(head_weights) => Some(packed(weight(WeightKind::IndexerHeadWeights)?, head_weights)),
-            None => None,
-        },
+        query: packed_weight(graph, planned, scope, WeightKind::IndexerQuery, ports, constants)?,
+        query_norm: query_norm
+            .then(|| weight(graph, planned, scope, WeightKind::IndexerQueryNorm, ports))
+            .transpose()?,
+        head_weights: head_weights
+            .then(|| packed_weight(graph, planned, scope, WeightKind::IndexerHeadWeights, ports, constants))
+            .transpose()?,
     })
 }
 
@@ -1405,11 +1230,10 @@ pub(crate) fn history_tile_bytes(visible: &[u8], tiles: usize) -> Option<Vec<u8>
 }
 
 impl AttentionWeights {
-    /// The weights at `scope` of the block `topology` at `numbers` that its
-    /// graph over `form` reads, its output's only where it attends
-    /// (`attends`): their operands ([`AttentionOperands::planned`]), then
-    /// each weight's port, but the input norm `input_norm` gives where it
-    /// gives one.
+    /// The weights and projection operands at `scope` of the block `topology`
+    /// at `numbers` that its graph over `form` reads, its output's only where
+    /// it attends (`attends`), with `input_norm` replacing the input norm port
+    /// where given.
     pub(crate) fn planned<G: GraphDraft>(
         graph: &mut G,
         planned: &(impl PlannedWeights + ?Sized),
@@ -1419,10 +1243,197 @@ impl AttentionWeights {
         input_norm: Option<&WorkflowTensor>,
         (ports, constants): (&mut Vec<(WeightPort, NativePort)>, &mut Vec<GraphConstant>),
     ) -> Result<Self, GraphError> {
-        let operands = AttentionOperands::planned(graph, planned, scope, topology, numbers, attends, ports, constants)?;
-        attention_weights(topology, numbers, form, attends, operands, |kind| match (kind, input_norm) {
-            (WeightKind::InputNorm, Some(norm)) => Ok(norm.clone()),
-            (kind, _) => weight(graph, planned, scope, kind, ports),
+        let layer = &topology.form;
+        let query = if attends {
+            packed_weight(graph, planned, scope, topology.query_segment_kind, ports, constants)?
+        } else {
+            PackedWeight {
+                weight: weight(graph, planned, scope, topology.query_segment_kind, ports)?,
+                operands: WeightOperands::absent(graph, constants)?,
+            }
+        };
+        let gate = layer.gate.try_map(|()| {
+            if attends {
+                packed_weight(graph, planned, scope, WeightKind::AttentionGate, ports, constants)
+            } else {
+                Ok(PackedWeight {
+                    weight: weight(graph, planned, scope, WeightKind::AttentionGate, ports)?,
+                    operands: WeightOperands::absent(graph, constants)?,
+                })
+            }
+        })?;
+        let key_value = match layer.key_value {
+            KeyValueSpec::Shared => KeyValueSpec::Shared,
+            KeyValueSpec::Fresh { key: (), value } => KeyValueSpec::Fresh {
+                key: packed_weight(graph, planned, scope, WeightKind::Key, ports, constants)?,
+                value: value.try_map(|()| {
+                    packed_weight(graph, planned, scope, WeightKind::Value, ports, constants)
+                })?,
+            },
+        };
+        Ok(Self {
+            input_norm: form
+                .normalized
+                .then(|| match input_norm {
+                    Some(norm) => Ok(norm.clone()),
+                    None => weight(graph, planned, scope, WeightKind::InputNorm, ports),
+                })
+                .transpose()?,
+            query,
+            low_rank_query: (attends && numbers.low_rank_query.is_some())
+                .then(|| {
+                    Ok::<_, GraphError>(LowRankQueryWeights {
+                        norm: weight(graph, planned, scope, WeightKind::QueryDownNorm, ports)?,
+                        up: packed_weight(graph, planned, scope, topology.query_kind, ports, constants)?,
+                    })
+                })
+                .transpose()?,
+            absorbed: (attends && numbers.absorbed.is_some())
+                .then(|| packed_weight(graph, planned, scope, WeightKind::QueryKeys, ports, constants))
+                .transpose()?,
+            gate,
+            key_value,
+            query_norm: (attends && layer.query_norm)
+                .then(|| weight(graph, planned, scope, WeightKind::QueryNorm, ports))
+                .transpose()?,
+            // A Shared layer projects no keys, so it has no key norm.
+            key_norm: (layer.key_norm && layer.is_fresh())
+                .then(|| weight(graph, planned, scope, WeightKind::KeyNorm, ports))
+                .transpose()?,
+            sinks: (attends && layer.sinks)
+                .then(|| weight(graph, planned, scope, WeightKind::AttentionSinks, ports))
+                .transpose()?,
+            output: attends
+                .then(|| packed_weight(graph, planned, scope, WeightKind::AttentionOutput, ports, constants))
+                .transpose()?,
+            grouped: (attends && numbers.grouped.is_some())
+                .then(|| packed_weight(graph, planned, scope, WeightKind::AttentionOutputGrouped, ports, constants))
+                .transpose()?,
+            post_norm: topology
+                .post_norm
+                .is_some()
+                .then(|| weight(graph, planned, scope, WeightKind::PostNorm, ports))
+                .transpose()?,
+            picked: match picked_part(topology, numbers) {
+                Some(PickedPart::Indexed { source: index, reals }) if attends => {
+                    Some(Box::new(PickedWeights {
+                        rows: match &index.own {
+                            Some(own) => Some(PooledWeights {
+                                projection: packed_weight(
+                                    graph,
+                                    planned,
+                                    scope,
+                                    WeightKind::PooledProjection,
+                                    ports,
+                                    constants,
+                                )?,
+                                gate: own
+                                    .gated
+                                    .then(|| {
+                                        packed_weight(
+                                            graph,
+                                            planned,
+                                            scope,
+                                            WeightKind::PooledGate,
+                                            ports,
+                                            constants,
+                                        )
+                                    })
+                                    .transpose()?,
+                                norm: weight(graph, planned, scope, WeightKind::PooledNorm, ports)?,
+                                key: packed_weight(
+                                    graph,
+                                    planned,
+                                    scope,
+                                    WeightKind::IndexerKey,
+                                    ports,
+                                    constants,
+                                )?,
+                                key_norm: weight(
+                                    graph,
+                                    planned,
+                                    scope,
+                                    WeightKind::IndexerKeyNorm,
+                                    ports,
+                                )?,
+                            }),
+                            None => None,
+                        },
+                        indexer: indexer_weights(
+                            graph,
+                            planned,
+                            scope,
+                            index.head_weights,
+                            reals.query_norm.is_some(),
+                            ports,
+                            constants,
+                        )?,
+                    }))
+                }
+                _ => None,
+            },
+            selection: both(&numbers.selection, &topology.selection, "selected read")
+                .map(|(read, reals)| {
+                    Ok::<_, GraphError>(Box::new(SelectionWeights {
+                        projection: packed_weight(
+                            graph,
+                            planned,
+                            scope,
+                            WeightKind::IndexerKey,
+                            ports,
+                            constants,
+                        )?,
+                        gate: read
+                            .keys
+                            .gated
+                            .then(|| {
+                                packed_weight(
+                                    graph,
+                                    planned,
+                                    scope,
+                                    WeightKind::IndexerKeyGate,
+                                    ports,
+                                    constants,
+                                )
+                            })
+                            .transpose()?,
+                        norm: weight(graph, planned, scope, WeightKind::IndexerKeyNorm, ports)?,
+                        bias: read
+                            .keys
+                            .token_norm
+                            .then(|| {
+                                weight(graph, planned, scope, WeightKind::IndexerKeyNormBias, ports)
+                            })
+                            .transpose()?,
+                        position: read
+                            .keys
+                            .place
+                            .then(|| {
+                                weight(
+                                    graph,
+                                    planned,
+                                    scope,
+                                    WeightKind::IndexerKeyGatePosition,
+                                    ports,
+                                )
+                            })
+                            .transpose()?,
+                        indexer: (attends && read.scored)
+                            .then(|| {
+                                indexer_weights(
+                                    graph,
+                                    planned,
+                                    scope,
+                                    read.source.head_weights,
+                                    reals.indexer.query_norm.is_some(),
+                                    ports,
+                                    constants,
+                                )
+                            })
+                            .transpose()?,
+                    }))
+                })
+                .transpose()?,
         })
     }
 
@@ -1432,124 +1443,31 @@ impl AttentionWeights {
     pub(crate) fn for_block(&self, input_norm: WorkflowTensor) -> Self {
         Self {
             input_norm: Some(input_norm),
-            query: self.query.clone(),
-            low_rank_query: self.low_rank_query.clone(),
-            absorbed: self.absorbed.clone(),
-            gate: self.gate.clone(),
-            key: self.key.clone(),
-            value: self.value.clone(),
-            query_norm: self.query_norm.clone(),
-            key_norm: self.key_norm.clone(),
-            sinks: self.sinks.clone(),
-            output: self.output.clone(),
-            grouped: self.grouped.clone(),
             post_norm: None,
-            operands: self.operands.clone(),
             selection: None,
             picked: None,
+            ..self.clone()
         }
     }
-}
 
-/// The block's attention weights in the order and presence its topology,
-/// input form, sublayer tail and projection operands define.
-fn attention_weights(
-    topology: &AttentionTopology,
-    numbers: &AttentionBlock,
-    form: InputForm,
-    needs_output: bool,
-    operands: AttentionOperands,
-    mut weight: impl FnMut(WeightKind) -> Result<WorkflowTensor, GraphError>,
-) -> Result<AttentionWeights, GraphError> {
-    let layer = &topology.form;
-    let mut present = |present: bool, kind| present.then(|| weight(kind)).transpose();
-    Ok(AttentionWeights {
-        input_norm: present(form.normalized, WeightKind::InputNorm)?,
-        query: present(true, topology.query_segment_kind)?.ok_or("query")?,
-        low_rank_query: {
-            let low_rank = needs_output && numbers.low_rank_query.is_some();
-            present(low_rank, WeightKind::QueryDownNorm)?
-                .zip(present(low_rank, topology.query_kind)?)
-                .map(|(norm, up)| LowRankQueryWeights { norm, up })
-        },
-        absorbed: present(needs_output && numbers.absorbed.is_some(), WeightKind::QueryKeys)?,
-        gate: present(layer.gated_separately(), WeightKind::AttentionGate)?,
-        key: present(layer.fresh, WeightKind::Key)?,
-        value: present(layer.projects_values(), WeightKind::Value)?,
-        query_norm: present(needs_output && layer.query_norm, WeightKind::QueryNorm)?,
-        // A Shared layer projects no keys, so it has no key norm.
-        key_norm: present(layer.key_norm && layer.fresh, WeightKind::KeyNorm)?,
-        sinks: present(needs_output && layer.sinks, WeightKind::AttentionSinks)?,
-        output: present(needs_output, WeightKind::AttentionOutput)?,
-        grouped: present(
-            needs_output && numbers.grouped.is_some(),
-            WeightKind::AttentionOutputGrouped,
-        )?,
-        post_norm: present(topology.post_norm.is_some(), WeightKind::PostNorm)?,
-        picked: match (operands.picked.as_deref(), picked_part(topology, numbers)) {
-            (Some(picked), Some(PickedPart::Indexed { reals: index, .. })) => {
-                let packed = |weight: WorkflowTensor, operands: &WeightOperands| PackedWeight {
-                    weight,
-                    operands: operands.clone(),
-                };
-                Some(Box::new(PickedWeights {
-                    rows: match &picked.rows {
-                        Some(rows) => Some(PooledWeights {
-                            projection: packed(weight(WeightKind::PooledProjection)?, &rows.projection),
-                            gate: match &rows.gate {
-                                Some(gate) => Some(packed(weight(WeightKind::PooledGate)?, gate)),
-                                None => None,
-                            },
-                            norm: weight(WeightKind::PooledNorm)?,
-                            key: packed(weight(WeightKind::IndexerKey)?, &rows.key),
-                            key_norm: weight(WeightKind::IndexerKeyNorm)?,
-                        }),
-                        None => None,
-                    },
-                    indexer: indexer_weights(&picked.indexer, index.query_norm.is_some(), &mut weight)?,
-                }))
-            }
-            (None, _) => None,
-            (Some(_), _) => {
-                return Err("index-list operands of an operator without its own indexer".into());
-            }
-        },
-        selection: match (operands.selection.as_deref(), both(&numbers.selection, &topology.selection, "selected read")) {
-            (Some(selection), Some((read, reals))) => {
-                let packed = |weight: WorkflowTensor, operands: &WeightOperands| PackedWeight {
-                    weight,
-                    operands: operands.clone(),
-                };
-                Some(Box::new(SelectionWeights {
-                    projection: packed(weight(WeightKind::IndexerKey)?, &selection.projection),
-                    gate: match &selection.gate {
-                        Some(gate) => Some(packed(weight(WeightKind::IndexerKeyGate)?, gate)),
-                        None => None,
-                    },
-                    norm: weight(WeightKind::IndexerKeyNorm)?,
-                    bias: match read.keys.token_norm {
-                        true => Some(weight(WeightKind::IndexerKeyNormBias)?),
-                        false => None,
-                    },
-                    position: match read.keys.place {
-                        true => Some(weight(WeightKind::IndexerKeyGatePosition)?),
-                        false => None,
-                    },
-                    indexer: match &selection.indexer {
-                        Some(indexer) => Some(indexer_weights(
-                            indexer,
-                            reals.indexer.query_norm.is_some(),
-                            &mut weight,
-                        )?),
-                        None => None,
-                    },
-                }))
-            }
-            (None, None) => None,
-            _ => return Err("a selected read's operands and block disagree".into()),
-        },
-        operands,
-    })
+    /// The projection's scale and bound dimensions, in `attention_project`'s
+    /// order: a history injection (`inject_only`) projects only keys and
+    /// values.
+    pub(crate) fn project_dimensions(&self, inject_only: bool) -> [(&'static str, Dim); 8] {
+        let attended = |dim: Dim| if inject_only { Dim::from(0) } else { dim };
+        let scale = |w: Option<&PackedWeight>| w.map_or(Dim::from(0), |w| w.operands.scale.extent.clone());
+        let bound = |w: Option<&PackedWeight>| w.map_or(Dim::from(0), |w| w.operands.bound.extent.clone());
+        [
+            ("QS", attended(self.query.operands.scale.extent.clone())),
+            ("GS", attended(scale(self.gate.separate()))),
+            ("KS", scale(self.key_value.key())),
+            ("VS", scale(self.key_value.value())),
+            ("QB", attended(self.query.operands.bound.extent.clone())),
+            ("GB", attended(bound(self.gate.separate()))),
+            ("KB", bound(self.key_value.key())),
+            ("VB", bound(self.key_value.value())),
+        ]
+    }
 }
 
 /// The attention block `topology` at `numbers` over `input`: its
@@ -1575,22 +1493,52 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         Some(norm) => norm.clone(),
         None => GraphConstant::absent(graph, constants)?.tensor().clone(),
     };
-    // An absent projection segment reads zero rows of the query weight.
-    let empty_weight = weights.query.slice_leading(0, 0);
+    // An absent projection segment reads zero rows of the query weight (or the
+    // gate weight for an injected separate-gate layer, preserving `GW`).
+    let empty_weight = weights.query.weight.slice_leading(0, 0);
     let empty_gate_weight = weights
         .gate
-        .as_ref()
-        .map(|gate| gate.slice_leading(0, 0))
+        .separate()
+        .map(|gate| gate.weight.slice_leading(0, 0))
         .unwrap_or_else(|| empty_weight.clone());
-    let operands = &weights.operands;
     // A history injection reads neither the query's nor the gate's operands.
-    let (query, gate) = match inject_only {
-        true => {
-            let absent = WeightOperands::absent(graph, constants)?;
-            (absent.clone(), absent)
+    let active_query = (!inject_only).then_some(&weights.query);
+    let active_gate = (!inject_only).then(|| weights.gate.separate()).flatten();
+    let active_key = weights.key_value.key();
+    let active_value = weights.key_value.value();
+    let absent = (active_query.is_none()
+        || active_gate.is_none()
+        || active_key.is_none()
+        || active_value.is_none())
+    .then(|| GraphConstant::absent(graph, constants).map(|port| port.tensor().clone()))
+    .transpose()?;
+    fn opt_weight<'a>(
+        w: Option<&'a PackedWeight>,
+        empty: &'a WorkflowTensorView,
+    ) -> seismic::WorkflowTensorRef<'a> {
+        match w {
+            Some(w) => (&w.weight).into(),
+            None => empty.into(),
         }
-        false => (operands.query.clone(), operands.gate.clone()),
-    };
+    }
+    fn opt_scale<'a>(
+        w: Option<&'a PackedWeight>,
+        absent: Option<&'a WorkflowTensor>,
+    ) -> &'a WorkflowTensor {
+        w.map_or_else(
+            || absent.expect("absent constant for missing segment"),
+            |w| &w.operands.scale.tensor,
+        )
+    }
+    fn opt_bound<'a>(
+        w: Option<&'a PackedWeight>,
+        absent: Option<&'a WorkflowTensor>,
+    ) -> &'a WorkflowTensor {
+        w.map_or_else(
+            || absent.expect("absent constant for missing segment"),
+            |w| &w.operands.bound.tensor,
+        )
+    }
     // The query projection yields the attended query rows, or an absorbed
     // query's heads at their own width; a low-rank query's projection
     // segment projects its `rank` rows of `qr` (a history injection projects
@@ -1606,35 +1554,27 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 widths.project_dimensions(form, rows.clone(), segment.clone())
             }
             .as_slice(),
-            operands.project_dimensions(inject_only).as_slice(),
+            weights.project_dimensions(inject_only).as_slice(),
             &input.form.dimensions(hidden.clone()),
         ]
         .concat(),
         attention_project::WorkflowArgs {
             hidden: input.rows.into(),
             input_norm: (&input_norm).into(),
-            query_weight: if inject_only {
-                (&empty_weight).into()
-            } else {
-                (&weights.query).into()
-            },
-            gate_weight: if inject_only {
-                (&empty_gate_weight).into()
-            } else {
-                segment(&weights.gate, &empty_weight)
-            },
-            key_weight: segment(&weights.key, &empty_weight),
-            value_weight: segment(&weights.value, &empty_weight),
+            query_weight: opt_weight(active_query, &empty_weight),
+            gate_weight: opt_weight(active_gate, &empty_gate_weight),
+            key_weight: opt_weight(active_key, &empty_weight),
+            value_weight: opt_weight(active_value, &empty_weight),
             epsilon: topology.epsilon.f32(),
             project_mode: 0.into(),
-            query_scale: (&query.scale.tensor).into(),
-            gate_scale: (&gate.scale.tensor).into(),
-            key_scale: (&operands.key.scale.tensor).into(),
-            value_scale: (&operands.value.scale.tensor).into(),
-            query_bound: (&query.bound.tensor).into(),
-            gate_bound: (&gate.bound.tensor).into(),
-            key_bound: (&operands.key.bound.tensor).into(),
-            value_bound: (&operands.value.bound.tensor).into(),
+            query_scale: opt_scale(active_query, absent.as_ref()).into(),
+            gate_scale: opt_scale(active_gate, absent.as_ref()).into(),
+            key_scale: opt_scale(active_key, absent.as_ref()).into(),
+            value_scale: opt_scale(active_value, absent.as_ref()).into(),
+            query_bound: opt_bound(active_query, absent.as_ref()).into(),
+            gate_bound: opt_bound(active_gate, absent.as_ref()).into(),
+            key_bound: opt_bound(active_key, absent.as_ref()).into(),
+            value_bound: opt_bound(active_value, absent.as_ref()).into(),
         },
     )?;
     // A low-rank query's `qr` rows (`[rows, rank]`, the query segment),
@@ -1646,10 +1586,9 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         both(&numbers.low_rank_query, &topology.low_rank_query, "low-rank query"),
         kernels.low_rank_query,
         &weights.low_rank_query,
-        &operands.low_rank_query,
     ) {
-        (true, ..) | (false, None, None, None, None) => (projected.r0, None),
-        (false, Some((low_rank, low_rank_reals)), Some(entries), Some(up), Some(up_operands)) => {
+        (true, ..) | (false, None, None, None) => (projected.r0, None),
+        (false, Some((low_rank, low_rank_reals)), Some(entries), Some(up)) => {
             let rank = &low_rank.rank;
             let qr = graph
                 .enqueue(
@@ -1660,21 +1599,22 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                     },
                 )?
                 .value;
-            let empty = up.up.slice_leading(0, 0);
+            let empty = up.up.weight.slice_leading(0, 0);
             let absent = GraphConstant::absent(graph, constants)?.tensor().clone();
+            let up_operands = &up.up.operands;
             let query = graph
                 .enqueue(
                     G::pick(entries.project, &rows),
                     &[
                         query_projection_dimensions(rows.clone(), rank.clone(), query_rows.clone()).as_slice(),
-                        AttentionOperands::query_dimensions(up_operands).as_slice(),
+                        query_operand_dimensions(up_operands).as_slice(),
                         &InputForm::SINGLE.dimensions(rank.clone()),
                     ]
                     .concat(),
                     attention_project::WorkflowArgs {
                         hidden: (&qr).into(),
                         input_norm: (&up.norm).into(),
-                        query_weight: (&up.up).into(),
+                        query_weight: (&up.up.weight).into(),
                         gate_weight: (&empty).into(),
                         key_weight: (&empty).into(),
                         value_weight: (&empty).into(),
@@ -1695,8 +1635,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         }
         _ => {
             return Err(
-                "attention low-rank query entries, weights and operands disagree with its operator"
-                    .into(),
+                "attention low-rank query entries and weights disagree with its operator".into(),
             );
         }
     };
@@ -1705,7 +1644,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     // in A), the `W`-wide query the history entry attends with.
     let query = match (inject_only, &numbers.absorbed, kernels.absorbed, &weights.absorbed) {
         (true, ..) | (false, None, None, None) => query,
-        (false, Some(absorbed), Some(entry), Some(weight)) => {
+        (false, Some(absorbed), Some(entry), Some(packed)) => {
             graph
                 .enqueue(
                     G::pick(entry, &rows),
@@ -1714,14 +1653,14 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                         ("G", absorbed.heads.clone()),
                         ("K", absorbed.width.clone()),
                         ("N", absorbed.keys.clone()),
-                        ("WS", operands.absorbed.scale.extent.clone()),
-                        ("WB", operands.absorbed.bound.extent.clone()),
+                        ("WS", packed.operands.scale.extent.clone()),
+                        ("WB", packed.operands.bound.extent.clone()),
                     ],
                     project_rows::WorkflowArgs {
                         source: (&query.reshape(&[rows.clone(), query_rows])).into(),
-                        weight: weight.into(),
-                        weight_scale: (&operands.absorbed.scale.tensor).into(),
-                        weight_bound: (&operands.absorbed.bound.tensor).into(),
+                        weight: (&packed.weight).into(),
+                        weight_scale: (&packed.operands.scale.tensor).into(),
+                        weight_bound: (&packed.operands.bound.tensor).into(),
                     },
                 )?
                 .value
@@ -1730,7 +1669,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     };
     // The mix entries read the projection per head.
     let attended_heads = if inject_only { Dim::from(0) } else { heads.clone() };
-    let fresh = axis(form.fresh);
+    let fresh = axis(form.is_fresh());
     let key_width = widths.key_width();
     let projected = ProjectedRows {
         query: query.reshape(&[
@@ -1744,13 +1683,15 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         key: projected
             .r2
             .reshape(&[fresh.clone(), rows.clone(), key_width.clone()]),
-        value: match form.values {
-            AttentionValues::Projected => projected
-                .r3
-                .reshape(&[fresh, rows.clone(), key_width]),
-            AttentionValues::RawKey => projected.r2.reshape(&[fresh, rows.clone(), key_width]),
+        value: match form.key_value {
+            KeyValueSpec::Shared | KeyValueSpec::Fresh { value: ValueSpec::Projected(()), .. } => {
+                projected.r3.reshape(&[fresh, rows.clone(), key_width])
+            }
+            KeyValueSpec::Fresh { value: ValueSpec::RawKey, .. } => {
+                projected.r2.reshape(&[fresh, rows.clone(), key_width])
+            }
             // The entries take no value of their own (`VK`): zero layers.
-            AttentionValues::StoredKey => projected
+            KeyValueSpec::Fresh { value: ValueSpec::StoredKey, .. } => projected
                 .r2
                 .slice_leading(0, 0)
                 .reshape(&[Dim::from(0), rows.clone(), key_width]),
@@ -1862,7 +1803,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             attended.reshape(&[rows.clone(), heads.clone(), width.clone()]),
             (heads.clone(), width.clone()),
         ),
-        (Some(grouped), Some(entry), Some(weight)) => {
+        (Some(grouped), Some(entry), Some(packed)) => {
             let products = graph
                 .enqueue(
                     G::pick(entry, &rows),
@@ -1871,14 +1812,14 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                         ("G", grouped.groups.clone()),
                         ("K", grouped.inputs.clone()),
                         ("N", grouped.rank.clone()),
-                        ("WS", operands.grouped.scale.extent.clone()),
-                        ("WB", operands.grouped.bound.extent.clone()),
+                        ("WS", packed.operands.scale.extent.clone()),
+                        ("WB", packed.operands.bound.extent.clone()),
                     ],
                     project_rows::WorkflowArgs {
                         source: (&attended.reshape(&[rows.clone(), &heads * width])).into(),
-                        weight: weight.into(),
-                        weight_scale: (&operands.grouped.scale.tensor).into(),
-                        weight_bound: (&operands.grouped.bound.tensor).into(),
+                        weight: (&packed.weight).into(),
+                        weight_scale: (&packed.operands.scale.tensor).into(),
+                        weight_bound: (&packed.operands.bound.tensor).into(),
                     },
                 )?
                 .value;
@@ -1897,25 +1838,22 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 .enqueue(
                     G::pick(output, &rows),
                     &[
-                        [
-                            ("M", rows.clone()),
-                            ("D", hidden.clone()),
-                            streams,
-                            injected,
-                            ("Q", q),
-                            ("W", w),
-                        ]
-                        .as_slice(),
-                        operands.output_dimensions().as_slice(),
-                    ]
-                    .concat(),
+                        ("M", rows.clone()),
+                        ("D", hidden.clone()),
+                        streams,
+                        injected,
+                        ("Q", q),
+                        ("W", w),
+                        ("OS", output_weight.operands.scale.extent.clone()),
+                        ("OB", output_weight.operands.bound.extent.clone()),
+                    ],
                     attention_output::WorkflowArgs {
                         hidden: residual.into(),
                         inject: (&inject).into(),
                         gated: (&attended).into(),
-                        output_weight: output_weight.into(),
-                        output_scale: (&operands.output.scale.tensor).into(),
-                        output_bound: (&operands.output.bound.tensor).into(),
+                        output_weight: (&output_weight.weight).into(),
+                        output_scale: (&output_weight.operands.scale.tensor).into(),
+                        output_bound: (&output_weight.operands.bound.tensor).into(),
                     },
                 )?
                 .value
@@ -1928,10 +1866,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 entries,
                 residual,
                 (&attended.reshape(&[rows.clone(), inputs.clone()])).into(),
-                &PackedWeight {
-                    weight: output_weight.clone(),
-                    operands: operands.output.clone(),
-                },
+                output_weight,
                 norm,
                 out_rows.port().tensor(),
                 PostNormShape {
@@ -2157,7 +2092,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         ]
         .into_iter()
         .chain(rounded.clone())
-        .chain(dense.then(|| axis(form.absorbed_query)))
+        .chain(dense.then(|| axis(form.is_absorbed())))
         .collect::<Vec<_>>(),
     );
     let append_form = empty_table.reshape(
@@ -2228,7 +2163,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     };
     let query_norm = head_norm(query_norm);
     // A Shared layer's unread key norm port takes its query norm.
-    let key_norm = if form.fresh {
+    let key_norm = if form.is_fresh() {
         head_norm(key_norm)
     } else {
         query_norm.clone()
@@ -2475,7 +2410,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     // cannot publish rows other threadgroups read in the same launch, so
     // publish once first and suppress its later append. Prefill already has
     // an ordered prepare launch and needs no additional phase.
-    if topology.causal_cache && decode && rows.greater_than(1) && form.fresh {
+    if topology.causal_cache && decode && rows.greater_than(1) && form.is_fresh() {
         let published = match &history {
             AttentionHistoryEntries::AffineK8V4 { append, .. } => {
                 append!(
@@ -2645,18 +2580,6 @@ fn no_selection<G: GraphDraft>(
     Ok(tensor)
 }
 
-/// A projection segment's weight, or zero rows of the query weight when the
-/// form has no such segment.
-fn segment<'t>(
-    weight: &'t Option<WorkflowTensor>,
-    empty: &'t WorkflowTensorView,
-) -> WorkflowTensorRef<'t> {
-    match weight {
-        Some(weight) => weight.into(),
-        None => empty.into(),
-    }
-}
-
 /// Per rotary pair, the coordinate axis that drives it: the interleaved
 /// multi-axis layout assigns pairs to axes round-robin until each axis's
 /// section is exhausted; a table rotates by the text position, axis 0.
@@ -2732,7 +2655,7 @@ pub(crate) fn rotary_amplitudes(rotary: &Rotary) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planning::{AttentionForm, AttentionWidths, GateForm};
+    use crate::planning::{AttentionForm, AttentionWidths, GateSpec, KeyValueSpec, ValueSpec};
 
     /// A launch takes the class that lists its history row tiles exactly
     /// when its rows see at most that class's tiles: one request with a long
@@ -2822,47 +2745,62 @@ mod tests {
     fn decode_classes_attend_with_the_decode_entry_where_it_holds_them() {
         use seismic::{BackendName, DType};
         let binding = |shape: AttentionShape| {
-            AttentionBinding::new(
-                shape,
-                false,
-                Element::bf16(),
-                Element::bf16(),
-                None,
-                (shape.gate_rows() > 0).then_some(Element::bf16()),
-                (shape.key_rows() > 0).then_some(Element::bf16()),
-                (shape.value_rows() > 0).then_some(Element::bf16()),
-                Element::bf16(),
-                Element::bf16(),
-                match shape.form.values {
-                    AttentionValues::StoredKey => {
-                        CodecSpec::stored_key(DType::BF16, shape.widths.width as usize)
-                    }
-                    AttentionValues::Projected | AttentionValues::RawKey => CodecSpec::dense(
+            AttentionBinding {
+                shape: AttentionShape {
+                    form: AttentionForm {
+                        gate: shape.form.gate.try_map(|()| Ok::<_, ()>(Element::bf16())).unwrap(),
+                        key_value: shape
+                            .form
+                            .key_value
+                            .try_map(|()| Ok::<_, ()>(Element::bf16()), |()| Ok::<_, ()>(Element::bf16()))
+                            .unwrap(),
+                        query_norm: shape.form.query_norm,
+                        key_norm: shape.form.key_norm,
+                        value_norm: shape.form.value_norm,
+                        sinks: shape.form.sinks,
+                        rotary_adjacent: shape.form.rotary_adjacent,
+                        rotary_trailing: shape.form.rotary_trailing,
+                        output_rotary: shape.form.output_rotary,
+                        absorbed: None,
+                    },
+                    widths: shape.widths,
+                    key_rounding: shape.key_rounding,
+                },
+                key_value_only: false,
+                norm: Element::bf16(),
+                query: Element::bf16(),
+                low_rank_query: None,
+                output: Element::bf16(),
+                activation: Element::bf16(),
+                history: match shape.form.stored_key() {
+                    true => CodecSpec::stored_key(DType::BF16, shape.widths.width as usize),
+                    false => CodecSpec::dense(
                         DType::BF16,
                         shape.widths.width as usize,
                         shape.widths.width as usize,
                     ),
                 },
-                SublayerTail::Residual,
-                None,
-                None,
-                None,
-                None,
-            )
+                tail: SublayerTail::Residual,
+                selection: None,
+                grouped: None,
+                picked: None,
+            }
         };
         let v41 = AttentionShape {
             form: AttentionForm {
-                gate: GateForm::None,
-                fresh: true,
+                gate: GateSpec::None,
+                key_value: KeyValueSpec::Fresh {
+                    key: (),
+                    value: ValueSpec::StoredKey,
+                },
                 query_norm: false,
                 key_norm: true,
                 value_norm: false,
-                values: AttentionValues::StoredKey,
                 sinks: true,
                 rotary_adjacent: true,
                 rotary_trailing: true,
                 output_rotary: true,
-                absorbed_query: false,
+                absorbed: None,
             },
             key_rounding: crate::RoundingArgs::NONE,
             widths: AttentionWidths {
@@ -2876,9 +2814,12 @@ mod tests {
         };
         let qwen = AttentionShape {
             form: AttentionForm {
-                gate: GateForm::Interleaved,
+                gate: GateSpec::Interleaved,
+                key_value: KeyValueSpec::Fresh {
+                    key: (),
+                    value: ValueSpec::Projected(()),
+                },
                 query_norm: true,
-                values: AttentionValues::Projected,
                 sinks: false,
                 rotary_adjacent: false,
                 rotary_trailing: false,
@@ -2937,7 +2878,7 @@ mod tests {
             AttentionShape { form: AttentionForm { rotary_adjacent: true, ..qwen.form }, ..qwen },
             AttentionShape { form: AttentionForm { rotary_trailing: true, ..qwen.form }, ..qwen },
             AttentionShape {
-                form: AttentionForm { gate: GateForm::None, output_rotary: true, ..qwen.form },
+                form: AttentionForm { gate: GateSpec::None, output_rotary: true, ..qwen.form },
                 ..qwen
             },
             v41,
