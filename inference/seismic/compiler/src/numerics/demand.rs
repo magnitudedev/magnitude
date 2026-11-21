@@ -19,7 +19,7 @@
 use crate::content_classes::ContentClasses;
 use seismic_lang::entry::{
     CandidateKind, ParameterAccess, SemanticEventKind, SemanticFunction, SemanticNodeView,
-    SemanticProgram, SemanticType,
+    SemanticProgram, SemanticType, TensorAccess,
 };
 use seismic_lang::ids::{CapabilityId, FamilyId, FunctionId, NodeId, RegionId, SemanticValueId};
 use seismic_lang::registry::{representation_info, BackendName};
@@ -370,7 +370,7 @@ impl<'a, S: Fn(CapabilityId) -> bool> DemandSummarizer<'a, S> {
             graph.seed(*result, 1 + k as u32);
         }
         for (p, parameter) in semantic.parameters().iter().enumerate() {
-            if parameter.access == ParameterAccess::Mutable {
+            if parameter.access == ParameterAccess::Tensor(TensorAccess::Mutable) {
                 graph.seed(parameter.value, 1 + results + p as u32);
             }
         }
@@ -440,7 +440,7 @@ impl<'a, S: Fn(CapabilityId) -> bool> DemandSummarizer<'a, S> {
                     .iter()
                     .zip(&call.inputs)
                     .map(|(parameter, input)| {
-                        parameter.access == ParameterAccess::Mutable
+                        parameter.access == ParameterAccess::Tensor(TensorAccess::Mutable)
                             && body.floating_demanded(*input, &demand)
                     })
                     .collect(),

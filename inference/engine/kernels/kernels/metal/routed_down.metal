@@ -55,10 +55,9 @@
         routed::PublishedSlots published [[buffer(SEISMIC_BUFFER_SCRATCH_PUBLISHED)]], \
         device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]]
 
-// The gathered body (`routed::project_gathered` over `routed::down_project`):
-// threadgroup (x, m)'s simdgroups publish their projections of tile x; the
-// last of the tile's M threadgroups to arrive sums the tile's channels of
-// every row.
+// The gathered body (`routed::down_project_gathered`): threadgroup (x, m)'s
+// simdgroups publish their batched projections of tile x; the last of the
+// tile's M threadgroups to arrive sums the tile's channels of every row.
 #define ROUTED_DOWN_GATHERED_BODY                                                                                 \
     constexpr uint TILE = routed::down_tile<ROWS, LANES>();                                                       \
     constexpr uint REGION = routed::down_region<ROWS, LANES>();                                                   \
@@ -68,13 +67,8 @@
     threadgroup uint last;                                                                                        \
     const uint first = group.x * TILE;                                                                            \
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);                                          \
-    routed::project_gathered<TILE, SLOTS, SLOTS, H>(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,     \
-        sources, ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2,                          \
-        uint(SEISMIC_DIM_M), group.y, sg, first, lane, projected[sg], published,                                  \
-        [&](ulong m, uint k, threadgroup float *region) {                                                         \
-            routed::down_project<ROWS, LANES>(product, routes, sources, expert_down, tier_down, m, first, k, lane, \
-                region, seismic_words);                                                                           \
-        });                                                                                                       \
+    routed::down_project_gathered<ROWS, LANES>(product, routes, sources, expert_down, tier_down,                  \
+        uint(SEISMIC_DIM_M), group.y, first, sg, lane, projected[sg], published, seismic_words);                  \
     if (!arrive::last(arrivals + group.x, uint(SEISMIC_DIM_M), &last, tid))                                       \
         return;                                                                                                   \
     for (uint item = tid; item < uint(SEISMIC_DIM_M) * TILE; item += 32 * SLOTS) {                                \

@@ -120,18 +120,9 @@ fn expand_recipe<B: PhysicalDialect>(
                     get(b),
                 ),
             },
-            reference::ReferenceNode::Compare { op, a, b } => builder.cmp_terminal(
-                match op {
-                    reference::CmpOp::Eq => ops::CmpOp::Eq,
-                    reference::CmpOp::Ne => ops::CmpOp::Ne,
-                    reference::CmpOp::Lt => ops::CmpOp::Lt,
-                    reference::CmpOp::Le => ops::CmpOp::Le,
-                    reference::CmpOp::Gt => ops::CmpOp::Gt,
-                    reference::CmpOp::Ge => ops::CmpOp::Ge,
-                },
-                get(a),
-                get(b),
-            ),
+            reference::ReferenceNode::Compare { op, a, b } => {
+                builder.cmp_terminal(op, get(a), get(b))
+            }
             reference::ReferenceNode::And { a, b } => {
                 builder.logic(ops::LogicOp::And, get(a), get(b))
             }

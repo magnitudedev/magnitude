@@ -560,7 +560,7 @@ pub fn opening_rows<F: ProgramFamily>(domain: &ExecutorDomain<F>, rows: u64) -> 
 
 /// The rows `request`'s reservation holds, none where it holds none.
 pub fn reservation_rows<F: ProgramFamily>(domain: &ExecutorDomain<F>, request: RequestId) -> Option<u64> {
-    domain.state_claims.get(&request).map(crate::memory::ledger::Reservation::rows)
+    domain.resident(request).map(|resident| resident.claim.rows())
 }
 
 /// `make`, an allocation a load makes as it starts, under its claim of

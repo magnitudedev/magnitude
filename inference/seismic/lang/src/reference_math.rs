@@ -18,6 +18,7 @@
 pub mod conversion;
 mod primitive;
 
+pub use crate::expr::CmpOp;
 use crate::intrinsics::MathOp;
 use crate::syntax::ast;
 use crate::types::DType;
@@ -157,15 +158,6 @@ pub enum WordOp {
     Xor,
     Shl,
     Shr,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CmpOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
 }
 
 /// There is deliberately no floating terminal, division terminal or source-op

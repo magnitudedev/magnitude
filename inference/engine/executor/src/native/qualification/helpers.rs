@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::AttentionValues;
+use crate::planning::{KeyValueSpec, ValueSpec};
 use seismic::{Layout, OperandRecipe};
 
 pub(super) fn qualification(
@@ -307,7 +307,7 @@ impl AttentionFixture {
                 u64::from(shape.form.output_rotary),
                 shape.stored_key(),
                 shape.rounds_keys(),
-                u64::from(shape.form.absorbed_query),
+                u64::from(shape.form.is_absorbed()),
             ],
             &[],
             ATTENTION,
@@ -416,7 +416,7 @@ fn project_attention(
             low_rank_kernels.is_some()
         ),
     };
-    let query_rows = match (binding.absorbed, &kernels.absorbed) {
+    let query_rows = match (binding.absorbed(), &kernels.absorbed) {
         (None, None) => query_rows,
         (Some(absorbed), Some(kernel)) => absorb_query(charges, absorbed, kernel, &query_rows, label)?,
         (absorbed, kernel) => unreachable!(
@@ -427,13 +427,15 @@ fn project_attention(
     };
     let query = per_head(&query_rows, &[1, heads, width + shape.interleaved_gate()])?;
     let gate = per_head(&projected.r1, &[1, heads, shape.separate_gate()])?;
-    let fresh_rows = [u64::from(shape.form.fresh), 1, kv_heads * width];
+    let fresh_rows = [u64::from(shape.form.is_fresh()), 1, kv_heads * width];
     let key = per_head(&projected.r2, &fresh_rows)?;
-    let value = match shape.form.values {
-        AttentionValues::Projected => per_head(&projected.r3, &fresh_rows)?,
-        AttentionValues::RawKey => per_head(&projected.r2, &fresh_rows)?,
+    let value = match shape.form.key_value {
+        KeyValueSpec::Shared | KeyValueSpec::Fresh { value: ValueSpec::Projected(_), .. } => {
+            per_head(&projected.r3, &fresh_rows)?
+        }
+        KeyValueSpec::Fresh { value: ValueSpec::RawKey, .. } => per_head(&projected.r2, &fresh_rows)?,
         // Stored-key values take no value of their own (`VK`).
-        AttentionValues::StoredKey => {
+        KeyValueSpec::Fresh { value: ValueSpec::StoredKey, .. } => {
             semantic_zeros(charges, binding.activation, &[0, 1, kv_heads * width], ATTENTION, label)?
         }
     };

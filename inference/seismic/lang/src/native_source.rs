@@ -351,7 +351,7 @@ fn inherit_projection_gemm_domain(
     source: Option<&str>,
     tokens: &[(&str, usize)],
 ) -> Result<(), NativeReadError> {
-    use crate::checked::{NativeComparison, NativeCondition, NativeNatExpr};
+    use crate::checked::{CmpOp, NativeCondition, NativeNatExpr};
     let declares = ["SUB_M", "SUB_N"]
         .iter()
         .all(|name| implementation.params.iter().any(|parameter| parameter.name == *name));
@@ -402,7 +402,7 @@ fn inherit_projection_gemm_domain(
         }
     };
     let differs = |name: &str, value: u64| NativeCondition::Compare {
-        comparison: NativeComparison::Ne,
+        comparison: CmpOp::Ne,
         left: NativeNatExpr::Parameter(name.to_owned()),
         right: NativeNatExpr::Constant(value),
     };

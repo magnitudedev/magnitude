@@ -29,6 +29,7 @@ use crate::span::Span;
 use crate::types::DType;
 use num_bigint::BigUint;
 use num_traits::{CheckedSub, Zero};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -206,7 +207,7 @@ pub struct DimensionInferencePlan {
 struct DimensionInferenceStep {
     dimension: SymbolId,
     observation: usize,
-    operations: Vec<DimensionInferenceOp>,
+    operations: Vec<InferenceOp<DimensionInferenceKnown>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -216,18 +217,38 @@ pub(crate) enum DimensionInferenceKnown {
     Int(IntExpr),
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum DimensionInferenceOp {
-    Add(DimensionInferenceKnown),
-    Subtract(DimensionInferenceKnown),
-    DivideExact(DimensionInferenceKnown),
-    ReverseSubtract(DimensionInferenceKnown),
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum InferenceOp<K> {
+    Add(K),
+    Subtract(K),
+    ReverseSubtract(K),
+    DivideExact(K),
+}
+
+impl<K> InferenceOp<K> {
+    pub(crate) fn operand(&self) -> &K {
+        match self {
+            Self::Add(known)
+            | Self::Subtract(known)
+            | Self::ReverseSubtract(known)
+            | Self::DivideExact(known) => known,
+        }
+    }
+
+    pub(crate) fn map<U>(self, f: impl FnOnce(K) -> U) -> InferenceOp<U> {
+        match self {
+            Self::Add(known) => InferenceOp::Add(f(known)),
+            Self::Subtract(known) => InferenceOp::Subtract(f(known)),
+            Self::ReverseSubtract(known) => InferenceOp::ReverseSubtract(f(known)),
+            Self::DivideExact(known) => InferenceOp::DivideExact(f(known)),
+        }
+    }
 }
 
 impl DimensionInferencePlan {
     pub(crate) fn new(
         axes: Vec<NatExpr>,
-        steps: Vec<(SymbolId, usize, Vec<DimensionInferenceOp>)>,
+        steps: Vec<(SymbolId, usize, Vec<InferenceOp<DimensionInferenceKnown>>)>,
     ) -> Self {
         Self {
             axes,
@@ -285,13 +306,7 @@ impl DimensionInferencePlan {
                 "DimensionInferencePlan step names an absent tensor-axis observation"
             );
             for operation in &step.operations {
-                let known = match operation {
-                    DimensionInferenceOp::Add(known)
-                    | DimensionInferenceOp::Subtract(known)
-                    | DimensionInferenceOp::DivideExact(known)
-                    | DimensionInferenceOp::ReverseSubtract(known) => known,
-                };
-                match known {
+                match operation.operand() {
                     DimensionInferenceKnown::Observation(observation) => {
                         assert!(
                             *observation < self.axes.len(),
@@ -351,26 +366,7 @@ impl DimensionInferencePlan {
                     operations: step
                         .operations
                         .iter()
-                        .map(|operation| match operation {
-                            DimensionInferenceOp::Add(known) => CompiledDimensionInferenceOp::Add(
-                                compile_known(arena, fixed, *known),
-                            ),
-                            DimensionInferenceOp::Subtract(known) => {
-                                CompiledDimensionInferenceOp::Subtract(compile_known(
-                                    arena, fixed, *known,
-                                ))
-                            }
-                            DimensionInferenceOp::DivideExact(known) => {
-                                CompiledDimensionInferenceOp::DivideExact(compile_known(
-                                    arena, fixed, *known,
-                                ))
-                            }
-                            DimensionInferenceOp::ReverseSubtract(known) => {
-                                CompiledDimensionInferenceOp::ReverseSubtract(compile_known(
-                                    arena, fixed, *known,
-                                ))
-                            }
-                        })
+                        .map(|operation| operation.map(|known| compile_known(arena, fixed, known)))
                         .collect(),
                 })
                 .collect(),
@@ -408,7 +404,7 @@ pub struct CompiledDimensionInferencePlan {
 struct CompiledDimensionInferenceStep {
     dimension: SymbolId,
     observation: usize,
-    operations: Vec<CompiledDimensionInferenceOp>,
+    operations: Vec<InferenceOp<CompiledDimensionInferenceKnown>>,
 }
 
 #[derive(Debug)]
@@ -416,14 +412,6 @@ enum CompiledDimensionInferenceKnown {
     Observation(usize),
     Nat(CompiledNat),
     Int(CompiledInt),
-}
-
-#[derive(Debug)]
-enum CompiledDimensionInferenceOp {
-    Add(CompiledDimensionInferenceKnown),
-    Subtract(CompiledDimensionInferenceKnown),
-    DivideExact(CompiledDimensionInferenceKnown),
-    ReverseSubtract(CompiledDimensionInferenceKnown),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -465,22 +453,22 @@ impl CompiledDimensionInferencePlan {
                     observation: step.observation,
                 };
                 match operation {
-                    CompiledDimensionInferenceOp::Add(known) => {
+                    InferenceOp::Add(known) => {
                         let known =
                             evaluate_known(known, observations, values).ok_or_else(failure)?;
                         value += known;
                     }
-                    CompiledDimensionInferenceOp::Subtract(known) => {
+                    InferenceOp::Subtract(known) => {
                         let known =
                             evaluate_known(known, observations, values).ok_or_else(failure)?;
                         value = value.checked_sub(&known).ok_or_else(failure)?;
                     }
-                    CompiledDimensionInferenceOp::ReverseSubtract(known) => {
+                    InferenceOp::ReverseSubtract(known) => {
                         let known =
                             evaluate_known(known, observations, values).ok_or_else(failure)?;
                         value = known.checked_sub(&value).ok_or_else(failure)?;
                     }
-                    CompiledDimensionInferenceOp::DivideExact(known) => {
+                    InferenceOp::DivideExact(known) => {
                         let divisor =
                             evaluate_known(known, observations, values).ok_or_else(failure)?;
                         if divisor.is_zero() || (&value % &divisor) != BigUint::zero() {
@@ -570,7 +558,7 @@ pub enum ParameterKind {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TensorAccess {
     /// Moved into the call; the runtime consumes the caller's tensor.
     Owned,
@@ -2269,11 +2257,7 @@ pub enum FunctionParameterOrigin {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ParameterAccess {
-    Owned,
-    Shared,
-    Mutable,
-    /// A host port ([`TensorAccess::Host`]).
-    Host { write: bool },
+    Tensor(TensorAccess),
     Scalar,
 }
 
@@ -2388,7 +2372,7 @@ pub enum TensorStorage {
     /// An owned allocation created in this function.
     Owned,
     /// A parameter place (shared or mutable borrow, or owned input).
-    Parameter(ParameterAccess),
+    Parameter(TensorAccess),
 }
 
 /// A view transform over a base tensor.
@@ -4035,7 +4019,7 @@ mod dimension_inference_tests {
                 (
                     x_symbol,
                     0,
-                    vec![DimensionInferenceOp::Subtract(
+                    vec![InferenceOp::Subtract(
                         DimensionInferenceKnown::Observation(1),
                     )],
                 ),
@@ -4070,7 +4054,7 @@ mod dimension_inference_tests {
                 (
                     g_symbol,
                     1,
-                    vec![DimensionInferenceOp::DivideExact(
+                    vec![InferenceOp::DivideExact(
                         DimensionInferenceKnown::Nat(n),
                     )],
                 ),

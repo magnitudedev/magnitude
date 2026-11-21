@@ -928,6 +928,19 @@ pub enum CmpOp {
     Ge,
 }
 
+impl CmpOp {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eq => "==",
+            Self::Ne => "!=",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+        }
+    }
+}
+
 /// Scalar sorts admitted in `ScalarExpr<T>`.
 pub trait ScalarSort: 'static + Copy + fmt::Debug + private::Sealed {
     type Value: Copy + fmt::Debug + PartialEq;

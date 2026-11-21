@@ -34,9 +34,11 @@ use magnitude_engine::worker::measure::measure_line;
 use magnitude_executor::{
     assessment::{
         lookahead, Derived, DomainFit, ExecutionFit, ExecutionShortfall, ExecutorCosts, FormatRates,
-        HistoryCosts, MatrixCosts, MeasuredCost, WeightRate, MEASUREMENT_SECONDS,
+        HistoryCosts, MatrixCosts, MeasuredCost, Outstanding, PointRequests, StoredCosts,
+        WeightRate, MEASUREMENT_SECONDS,
     },
     platform::{DeviceRequest, ReleaseRate},
+    KernelCache,
 };
 use seismic::measure::pricing::{CallSeconds, Pricing, Storage};
 use seismic::{Devices, DiagnosticSource, Element, ExecutorSelector, StoreId, StoreIdentity};
@@ -248,6 +250,17 @@ fn parse() -> Result<Options, String> {
     })
 }
 
+/// Outcome of one measurement job process ([`bounded_job`]).
+struct JobOutcome {
+    seconds: f64,
+    /// Whether the job reported its outcome with no failures.
+    measured: bool,
+    /// Whether the job stored at least one record.
+    recorded: bool,
+    /// Whether the job hung or was lost without reporting its outcome.
+    ended_abnormally: bool,
+}
+
 /// Run the measurement job in a process of its own, reading its events as
 /// it reports them ([`report_measurement`]), until it reports its outcome
 /// or hangs: silent past [`hang_silence`], the one hang policy every host
@@ -255,9 +268,8 @@ fn parse() -> Result<Options, String> {
 /// a compile cannot be cancelled, so only the kill bounds it, whatever the
 /// kernel cache holds. What it stored stands; a point it was attempting
 /// counts as ended this job, and one that ends two is recorded unobtainable,
-/// so a point that hangs does not hang every job. The seconds it took, and
-/// whether it reported its outcome with nothing unmeasured.
-fn bounded_job(time: Duration, executor: ExecutorSelector, scope: Job) -> Result<(f64, bool), String> {
+/// so a point that hangs does not hang every job.
+fn bounded_job(time: Duration, executor: ExecutorSelector, scope: Job) -> Result<JobOutcome, String> {
     eprintln!("magnitude-assess: measuring this machine, {:.0} s", time.as_secs_f64());
     let started = Instant::now();
     let mut command = std::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
@@ -279,10 +291,12 @@ fn bounded_job(time: Duration, executor: ExecutorSelector, scope: Job) -> Result
     })
     .map_err(|error| format!("the measurement job's reader: {error}"))?;
     let mut opened = false;
+    let mut recorded = false;
     let hung = loop {
         match heard.recv_timeout(hang_silence(opened)) {
             Ok(MeasureEvent::Opened) => opened = true,
             Ok(MeasureEvent::Recorded(key, record)) => {
+                recorded = true;
                 eprintln!("magnitude-assess: {:.3} s: {key:?}: {record:?}", started.elapsed().as_secs_f64())
             }
             Ok(MeasureEvent::Attempting(_)) => {}
@@ -293,12 +307,12 @@ fn bounded_job(time: Duration, executor: ExecutorSelector, scope: Job) -> Result
     };
     let retire = |report| retire(report).map_err(|error| format!("the measurement job: {error}"));
     let joined = |reader: std::thread::JoinHandle<_>| reader.join().expect("the measurement job's reader's panic ends the process");
-    let measured = if hung {
+    let (measured, ended_abnormally) = if hung {
         // Killing it ends its stream, and so its reader.
         let ended = retire(WorkerReport::Unreported)?;
         let _ = joined(reader);
         eprintln!("magnitude-assess: the measurement job hung and was killed ({ended}); what it stored stands");
-        false
+        (false, true)
     } else {
         // Its stream ended, its outcome reported or not: it is waited for.
         let outcome = joined(reader);
@@ -311,17 +325,76 @@ fn bounded_job(time: Duration, executor: ExecutorSelector, scope: Job) -> Result
                 for failure in &failures {
                     eprintln!("magnitude-assess: not measured: {failure}");
                 }
-                failures.is_empty()
+                (failures.is_empty(), false)
             }
             Err(lost) => {
                 eprintln!("magnitude-assess: the measurement job was lost: {lost}; it {ended}");
-                false
+                (false, true)
             }
         }
     };
     let seconds = started.elapsed().as_secs_f64();
     eprintln!("magnitude-assess: measured in {seconds:.3} s");
-    Ok((seconds, measured))
+    Ok(JobOutcome { seconds, measured, recorded, ended_abnormally })
+}
+
+/// The requests a measurement job of `scope` still has points of left to
+/// measure, in its order.
+fn outstanding_requests(
+    topology: &seismic::DeviceTopology,
+    executor: &seismic::Executor,
+    options: &Options,
+    scope: Job,
+) -> Result<Outstanding, String> {
+    let records = KernelCache::measurement_records(&options.kernels);
+    let costs = StoredCosts::outstanding_of(&ExecutorCosts::stored(topology, executor, &records));
+    match scope {
+        Job::Machine => PointRequests::new(&options.kernels).outstanding(
+            topology,
+            executor,
+            &options.storage,
+            &records,
+            costs,
+        ),
+        #[cfg(feature = "machine-line")]
+        Job::Line => Ok(magnitude_executor::assessment::line_outstanding(
+            topology, executor, &records, costs,
+        )),
+    }
+}
+
+/// Run [`bounded_job`] for `scope` until nothing of `scope` remains
+/// outstanding, or a job makes no progress (recorded nothing and left the
+/// outstanding set unchanged) or ends abnormally.
+///
+/// Returns `(total_seconds, measured)` where `measured` is true only when
+/// every job reported no failures and nothing of `scope` remains outstanding.
+fn settle_bounded_jobs(
+    topology: &seismic::DeviceTopology,
+    executor: &seismic::Executor,
+    options: &Options,
+    scope: Job,
+) -> Result<(f64, bool), String> {
+    let mut total_seconds = 0.0;
+    let mut measured = true;
+    let mut before = outstanding_requests(topology, executor, options, scope)?;
+    loop {
+        let outcome = bounded_job(options.time, executor.selector(), scope)?;
+        total_seconds += outcome.seconds;
+        measured &= outcome.measured;
+        let after = outstanding_requests(topology, executor, options, scope)?;
+        if after.is_empty() {
+            return Ok((total_seconds, measured));
+        }
+        if outcome.ended_abnormally {
+            return Ok((total_seconds, false));
+        }
+        if !outcome.recorded && after == before {
+            eprintln!("magnitude-assess: not measured: a measurement job measured nothing of {after:?}");
+            return Ok((total_seconds, false));
+        }
+        before = after;
+    }
 }
 
 fn main() {
@@ -418,11 +491,14 @@ fn run() -> Result<bool, String> {
             )
         })
         .collect::<Vec<_>>();
+    let topology = catalog.topology();
     #[cfg_attr(not(feature = "machine-line"), allow(unused_mut))]
-    let (mut measure_seconds, mut measured) = bounded_job(options.time, executor.selector(), Job::Machine)?;
+    let (mut measure_seconds, mut measured) =
+        settle_bounded_jobs(&topology, executor, &options, Job::Machine)?;
     #[cfg(feature = "machine-line")]
     if options.line {
-        let (seconds, line_measured) = bounded_job(options.time, executor.selector(), Job::Line)?;
+        let (seconds, line_measured) =
+            settle_bounded_jobs(&topology, executor, &options, Job::Line)?;
         measure_seconds += seconds;
         measured &= line_measured;
     }
@@ -438,7 +514,6 @@ fn run() -> Result<bool, String> {
             Measurements::Pending(_) => json!("pending"),
             Measurements::Unavailable { reason } => json!({ "unavailable": reason }),
         };
-        let topology = catalog.topology();
         // Why a backend or adapter is absent from the graph (an absent
         // driver, an enumeration failure), as discovery retained it.
         let diagnostics = topology

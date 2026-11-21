@@ -6,7 +6,7 @@
 use crate::error::{ArtifactError, LoadError, ResolveError, UnsupportedModel};
 use crate::host::HostArtifacts;
 use crate::options::{ExecutionManifest, InputModalities, ModelPolicy, PackageOptions, ReadyInfo};
-use crate::execution::LoadAttempt;
+use crate::execution::{request_load_points, LoadAttempt};
 use crate::preview::now;
 use crate::worker::{
     connect_worker, load_prepared,
@@ -16,7 +16,7 @@ use crate::worker::{
     PricedFailure, WorkerConnection,
 };
 use magnitude_executor::UnpreparedUnits;
-use magnitude_artifacts::PackageIdentity;
+use magnitude_artifacts::{Package, PackageIdentity};
 use magnitude_executor::{
     image_cell_limit, max_image_cells,
     platform::{DeviceRequest, ReleaseRate},
@@ -25,6 +25,7 @@ use magnitude_executor::{
 use magnitude_scheduler::ServiceLimits;
 use std::fmt;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// Host-owned inputs to engine construction. Resolving this value performs all
@@ -258,6 +259,47 @@ pub fn in_process_priced<T>(
     }
 }
 
+/// Settle the machine's standing measurements and the load-scoped measurements
+/// (`PointRequest::Site`, `TierCopy`, `Volume`, etc.) that a load of `manifest`
+/// and `package` waits on, running [`InProcessJobs`] in this process until
+/// nothing remains outstanding or a job stalls.
+///
+/// Nothing to do without a kernel cache, where no measurement reaches a load.
+/// Standing figures required for planning settle first through
+/// [`in_process_priced`], then [`request_load_points`] registers the load's
+/// own points, and [`InProcessJobs`] loops until all standing and load
+/// requests are recorded or a job makes no progress ([`JobsStopped::Stalled`]).
+pub fn settle_load_measurements(
+    manifest: &ExecutionManifest,
+    package: &Package,
+) -> Result<(), LoadError> {
+    if manifest.kernel_cache.is_none() {
+        return Ok(());
+    }
+    let internal = |reason: String| LoadError::Internal { reason };
+    in_process_priced(manifest, || Ok(()))?;
+    let paths = vec![manifest.store().to_path_buf()];
+    let catalog = Rc::new(
+        seismic::Devices::discover(&paths).map_err(|error| internal(error.to_string()))?,
+    );
+    request_load_points(&catalog, manifest, package)?;
+    let mut jobs = InProcessJobs::of_load(&catalog, paths, manifest)
+        .map_err(internal)?
+        .expect("a load with a kernel cache has jobs");
+    let mut left = jobs.outstanding().map_err(internal)?;
+    while !left.is_empty() {
+        match jobs.run() {
+            Ok(run) => left = run.outstanding,
+            Err(stopped @ JobsStopped::Stalled { .. }) => {
+                tracing::warn!("in-process measurements stalled: {stopped}");
+                break;
+            }
+            Err(stopped) => return Err(internal(stopped.to_string())),
+        }
+    }
+    Ok(())
+}
+
 /// The model's Prepare, as a host that loads in its own process runs it
 /// for no load ([`prepare`]), settling pending prices through [`run_priced`].
 pub fn prepare_in_process(
@@ -274,16 +316,20 @@ pub fn prepare_in_process(
 /// load, and `worker` starts the host's executable in its worker role
 /// ([`crate::worker::serve_worker`] over its standard streams) for the
 /// model's Prepare when the load finds tuning units without a stored record.
+/// Standing and load-scoped measurements settle first through
+/// [`settle_load_measurements`] when a kernel cache is configured.
 /// A Prepare that does not finish is reported on the diagnostic stream; the
 /// load then serves canonical defaults for the units without a record. The
 /// stream also carries `kernel preparation began` when the Prepare's process
 /// is started and `kernel preparation ended in S s` once it is gone.
 pub fn load_in_process<L>(
     manifest: &ExecutionManifest,
+    package: &Package,
     mut load: impl FnMut(UnpreparedUnits) -> Result<LoadAttempt<L>, LoadError>,
     mut worker: std::process::Command,
     mut prepare_progress: impl FnMut(LoadProgress),
 ) -> Result<L, LoadError> {
+    settle_load_measurements(manifest, package)?;
     // The diagnostic stream says when the Prepare's process began and that it
     // is gone, so a log's reader can tell preparation from the load itself.
     let preparing = std::cell::Cell::new(None);
@@ -361,7 +407,7 @@ pub fn start_in_process(
             Err(error) => unloaded(Err(error)),
         }
     };
-    load_in_process(&manifest, attempt, worker, |update| {
+    load_in_process(&manifest, host.package(), attempt, worker, |update| {
         (progress.borrow_mut())(update)
     })
 }

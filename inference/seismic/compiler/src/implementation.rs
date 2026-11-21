@@ -36,7 +36,7 @@ use seismic_ir::storage::{
 };
 use seismic_lang::entry::{
     AliasRule, CallSchema, CandidateKind, ParameterAccess, ParameterKind, SemanticEventKind,
-    SemanticFunction, SemanticNodeView, SemanticProgram, SemanticType,
+    SemanticFunction, SemanticNodeView, SemanticProgram, SemanticType, TensorAccess,
 };
 use seismic_lang::expr::{
     AnyExpr, BoolExpr, DecisionId, ExprArena, FiniteDomain, NatExpr, NodeView, TargetPredicate,
@@ -938,7 +938,7 @@ impl<'a, B: seismic_native_target::TargetFamily> ImplementationBuilder<'a, B> {
             .any(|parameter| {
                 matches!(
                     parameter.access,
-                    ParameterAccess::Mutable | ParameterAccess::Owned
+                    ParameterAccess::Tensor(TensorAccess::Mutable | TensorAccess::Owned)
                 )
             })
     }
@@ -1169,7 +1169,6 @@ mod internals {
             .iter()
             .find(|actual| actual.source == *ordinal && actual.path == *path)
             .expect("checked body parameter has its entry ABI coordinate");
-        use seismic_lang::entry::TensorAccess;
         match (&parameter.ty, &actual.kind) {
             (
                 SemanticType::Tensor(tensor),
@@ -1181,15 +1180,7 @@ mod internals {
             ) => {
                 assert_eq!(tensor.representation, *representation);
                 assert_eq!(&tensor.axes, axes);
-                assert!(matches!(
-                    (parameter.access, access),
-                    (ParameterAccess::Owned, TensorAccess::Owned)
-                        | (ParameterAccess::Shared, TensorAccess::Shared)
-                        | (ParameterAccess::Mutable, TensorAccess::Mutable)
-                ) || matches!(
-                    (parameter.access, access),
-                    (ParameterAccess::Host { write: a }, TensorAccess::Host { write: b }) if a == *b
-                ));
+                assert_eq!(parameter.access, ParameterAccess::Tensor(*access));
             }
             (SemanticType::Scalar(expected), ParameterKind::Scalar { dtype, .. }) => {
                 assert_eq!(expected, dtype)

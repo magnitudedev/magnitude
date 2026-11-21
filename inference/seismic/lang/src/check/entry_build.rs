@@ -1437,20 +1437,7 @@ fn build_dimension_inference_plan(
         .map(|(dimension, observation, operations)| {
             let operations = operations
                 .into_iter()
-                .map(|operation| match operation {
-                    super::dimensions::InferenceOp::Add(known) => {
-                        DimensionInferenceOp::Add(final_known(known))
-                    }
-                    super::dimensions::InferenceOp::Subtract(known) => {
-                        DimensionInferenceOp::Subtract(final_known(known))
-                    }
-                    super::dimensions::InferenceOp::DivideExact(known) => {
-                        DimensionInferenceOp::DivideExact(final_known(known))
-                    }
-                    super::dimensions::InferenceOp::ReverseSubtract(known) => {
-                        DimensionInferenceOp::ReverseSubtract(final_known(known))
-                    }
-                })
+                .map(|operation| operation.map(final_known))
                 .collect();
             (dimension, observation, operations)
         })
@@ -1771,10 +1758,7 @@ fn build_schema_parameters(
         let kind = match ty {
             SemanticType::Tensor(tensor) => ParameterKind::Tensor {
                 access: match semantic.access {
-                    ParameterAccess::Owned => TensorAccess::Owned,
-                    ParameterAccess::Shared => TensorAccess::Shared,
-                    ParameterAccess::Mutable => TensorAccess::Mutable,
-                    ParameterAccess::Host { write } => TensorAccess::Host { write },
+                    ParameterAccess::Tensor(access) => access,
                     ParameterAccess::Scalar => {
                         panic!("checked tensor parameter has scalar access")
                     }
@@ -2279,16 +2263,21 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             return Ok(self.emit(root, NodeKind::TuplePack, inputs, vec![ty], span)[0]);
         }
         let leaf_access = match ownership {
-            ir::Ownership::Owned => ParameterAccess::Owned,
-            ir::Ownership::Shared => ParameterAccess::Shared,
-            ir::Ownership::Exclusive => ParameterAccess::Mutable,
-            ir::Ownership::Host { write } => ParameterAccess::Host { write: *write },
+            ir::Ownership::Owned => ParameterAccess::Tensor(TensorAccess::Owned),
+            ir::Ownership::Shared => ParameterAccess::Tensor(TensorAccess::Shared),
+            ir::Ownership::Exclusive => ParameterAccess::Tensor(TensorAccess::Mutable),
+            ir::Ownership::Host { write } => {
+                ParameterAccess::Tensor(TensorAccess::Host { write: *write })
+            }
             ir::Ownership::Value => ParameterAccess::Scalar,
             ir::Ownership::Tuple(_) => panic!("non-tuple parameter has tuple ownership"),
         };
         let mut ty = ty;
         if let SemanticType::Tensor(tensor) = &mut ty {
-            if leaf_access == ParameterAccess::Mutable
+            let ParameterAccess::Tensor(access) = leaf_access else {
+                panic!("checked tensor parameter has scalar access");
+            };
+            if access == TensorAccess::Mutable
                 && !crate::registry::record_writable(tensor.representation)
             {
                 return Err(SourceDiagnostic::new(
@@ -2301,7 +2290,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     ),
                 ));
             }
-            tensor.storage = TensorStorage::Parameter(leaf_access);
+            tensor.storage = TensorStorage::Parameter(access);
         }
         let value = self.value(ty, ValueOrigin::Parameter, span);
         let mut leaf_name = name.to_owned();
@@ -2593,9 +2582,11 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     .filter_map(|(parameter, input)| {
                         matches!(
                             parameter.access,
-                            ParameterAccess::Shared
-                                | ParameterAccess::Owned
-                                | ParameterAccess::Mutable
+                            ParameterAccess::Tensor(
+                                TensorAccess::Shared
+                                    | TensorAccess::Owned
+                                    | TensorAccess::Mutable
+                            )
                         )
                         .then_some(*input)
                     })
@@ -2605,7 +2596,8 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     .iter()
                     .zip(inputs)
                     .filter_map(|(parameter, input)| {
-                        (parameter.access == ParameterAccess::Mutable).then_some(*input)
+                        (parameter.access == ParameterAccess::Tensor(TensorAccess::Mutable))
+                            .then_some(*input)
                     })
                     .collect::<Vec<_>>();
                 Self::push_access_specs(self, &mut specs, reads, writes);
@@ -5016,11 +5008,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             }
             let mut value = self.runtime_int(observed_value);
             for operation in &step.operations {
-                let (dimensions::InverseOp::Add(known)
-                | dimensions::InverseOp::Subtract(known)
-                | dimensions::InverseOp::ReverseSubtract(known)
-                | dimensions::InverseOp::DivideExact(known)) = operation;
-                let known = match known {
+                let known = match operation.operand() {
                     dimensions::Known::Observation(axis) => {
                         let observed = self.observe_axis(region, &evaluated, order, axis, span);
                         self.runtime_int(observed)
@@ -5053,14 +5041,10 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     }
                 };
                 value = match operation {
-                    dimensions::InverseOp::Add(_) => self.builder.arena.int_add(value, known),
-                    dimensions::InverseOp::Subtract(_) => self.builder.arena.int_sub(value, known),
-                    dimensions::InverseOp::ReverseSubtract(_) => {
-                        self.builder.arena.int_sub(known, value)
-                    }
-                    dimensions::InverseOp::DivideExact(_) => {
-                        self.builder.arena.int_div(value, known)
-                    }
+                    InferenceOp::Add(_) => self.builder.arena.int_add(value, known),
+                    InferenceOp::Subtract(_) => self.builder.arena.int_sub(value, known),
+                    InferenceOp::ReverseSubtract(_) => self.builder.arena.int_sub(known, value),
+                    InferenceOp::DivideExact(_) => self.builder.arena.int_div(value, known),
                 };
             }
             captured_shapes[ordinal] = Some(

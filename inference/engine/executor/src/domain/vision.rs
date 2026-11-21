@@ -50,16 +50,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let Operation::Encode { request, image } = operation else {
             return Err("vision submission requires one Encode operation".into());
         };
-        let input = self
-            .input
-            .get(&request)
+        let entry = self
+            .requests
+            .get(request)
             .ok_or("vision request has no admitted input")?;
-        let slot = input
+        let (identity, _) = entry
             .images
-            .values()
-            .find(|slot| slot.image == *image)
+            .iter()
+            .find(|(_, candidate)| *candidate == image)
             .ok_or("image is not part of admitted input")?;
-        if slot.features.is_some() {
+        let resident = entry
+            .resident()
+            .ok_or("vision request is not resident")?;
+        if resident.image_features.contains_key(identity) {
             return Err("image is already encoded".into());
         }
         let prepared = image.prepared_input().map_err(|error| error.to_string())?;

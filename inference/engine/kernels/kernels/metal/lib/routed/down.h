@@ -3,10 +3,10 @@
 // threadgroup (x, m) owns the TILE output channels of tile x for row m and
 // runs K simdgroups side by side, simdgroup k projecting choice k through its
 // expert's down rows (`routed::project_channels`). The projections meet in
-// threadgroup memory; their sum is `lib/routed/down_sum.h`'s. Gathered
-// (`routed_down`'s GATHERED, `routed::project_gathered`), a simdgroup projects
-// each choice of its expert in turn, each as choice k's simdgroup of its row
-// projects it.
+// memory; their sum is `lib/routed/down_sum.h`'s. Gathered (`routed_down`'s
+// GATHERED, `routed::down_project_gathered`), each expert's first choice
+// simdgroup projects every choice of that expert in one weight pass,
+// publishing directly to `published`.
 
 #define KERNEL_W0 SEISMIC_EXPERT_DOWN
 // The includer defines ROUTED_SOURCE_ROWS, the sources' rows: the entry's
@@ -62,6 +62,23 @@ inline void down_project(device const uchar *product, device const int *routes, 
         in, uint(SEISMIC_DIM_F), lane);
     project_channels<packets::W0, ROWS, LANES, uint(SEISMIC_DIM_F), down_stage<LANES>()>(x, down, first,
         uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), projected, lane);
+}
+
+// Gathered decode down projections: projects every choice sharing `(m, sg)`'s
+// expert and source in one weight pass (`project_gathered_expert`), publishing
+// each choice's slot directly in A into `published`.
+template <uint ROWS, uint LANES, typename Published>
+inline void down_project_gathered(device const uchar *product, device const int *routes, device const int *sources,
+    device const ulong *expert_down, device const ulong *tier_down, uint m_rows, uint m, uint first, uint sg,
+    uint lane, threadgroup float *projected, Published published, constant ulong *seismic_words) {
+    constexpr uint K = uint(SEISMIC_DIM_K);
+    constexpr uint H = uint(SEISMIC_DIM_H);
+    constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
+    project_gathered_expert<packets::W0, ROWS, LANES, K, K, uint(SEISMIC_DIM_F), down_stage<LANES>(), H, NVFP4>(
+        product, SEISMIC_PRODUCT_STRIDE_0, SEISMIC_PRODUCT_STRIDE_1, SEISMIC_PRODUCT_STRIDE_2, routes,
+        SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, sources, ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1,
+        SEISMIC_SOURCES_STRIDE_2, expert_down, tier_down, KERNEL_W0_LAYOUT(SEISMIC_DIM_F), m_rows, m, first, sg, lane,
+        projected, published);
 }
 
 } // namespace routed

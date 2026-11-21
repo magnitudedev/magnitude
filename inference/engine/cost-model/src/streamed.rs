@@ -5,14 +5,14 @@
 //!
 //! - **Misses** ([`MissModel`]): the one generic model of how a bank of a
 //!   share `s` of a layer's experts misses its routed experts, the share
-//!   `m(s)` of a step's distinct routed experts it lacks, of that layer's `E`
-//!   and `k` alone: placement's fixed point at its bound, `1 − s`, the
-//!   uninformed routing's. A layer reads `D(r)` distinct experts a step of
-//!   `r` rows, so a bank of `slots` misses `m(slots/E)·D(r)` of them, spread
-//!   over steps as evenly as they fall; of those misses, the ones a host tier
-//!   also lacks (`m(host/E)·D(r)`, the tier inclusive of the bank) are read
-//!   from the file and the rest from the tier. A layer's misses of a step are
-//!   one request at its route, a share `q(s)` of a row's steps requesting.
+//!   `m(s, r)` of a step's distinct routed experts it lacks, from that layer's
+//!   `E` and `k` under a single Zipf locality assumption. A layer reads `D(r)`
+//!   distinct experts a step of `r` rows, so a bank of `slots` misses
+//!   `m(slots/E, r)·D(r)` of them, spread over steps as evenly as they fall;
+//!   of those misses, the ones a host tier also lacks (`m(host/E, r)·D(r)`,
+//!   the tier inclusive of the bank) are read from the file and the rest from
+//!   the tier. A layer's misses of a step are one request at its route, a
+//!   share `q(s)` of a row's steps requesting.
 //! - **Lines**: the GPU's over each layer's expert from the executor's
 //!   costs ([`crate::ExpertPass::lines`]), one expert's stored bytes from the plan,
 //!   a host tier's record read at the host memory's line, a CPU site's
@@ -244,10 +244,6 @@ impl StreamedLayers {
     /// across groups identifies each distinct step exactly.
     fn period(&self, live: Option<&LiveDecode>, held: HeldSlots, rows: f64) -> Vec<(Vec<LayerRun>, usize)> {
         let period = self.runs.iter().map(|run| run.experts).max().expect("a streamed plan streams a layer") as usize;
-        if !rows.is_finite() || rows <= 0. {
-            let quiet = self.runs.iter().map(|run| LayerRun { load: LayerLoad::default(), layers: run.layers }).collect();
-            return vec![(quiet, period)];
-        }
         let width = match live {
             None => self.runs.len(),
             Some(_) => self.layers(),
@@ -256,7 +252,7 @@ impl StreamedLayers {
         let mut col = 0;
         let mut layer = 0;
         for run in &self.runs {
-            let model = |slots: usize| generic_shares(&run.model, slots as f64 / run.experts as f64);
+            let model = |slots: usize| generic_shares(&run.model, slots as f64 / run.experts as f64, rows);
             match live {
                 None => {
                     fill_layer_period(&model, run.model.routed(rows), self.choices, held, rows, period, run.layers, &mut flat, width, col);
@@ -409,8 +405,8 @@ impl DecodePrice {
     /// each form at `live`'s rows and context).
     pub fn new(layers: StreamedLayers, live: LiveDecode, read: ReadLine, compute: FormSeconds) -> Self {
         assert_eq!(layers.layers(), live.layers.len(), "a decode's reads are of its streamed layers");
-        let rows = normalize_rows(live.rows);
-        Self { layers, rows, depth: live.depth, live: Some(live), read, compute }
+        assert!(live.rows.is_finite() && live.rows > 0., "a decode's mean rows must be finite and positive, got {}", live.rows);
+        Self { layers, rows: live.rows, depth: live.depth, live: Some(live), read, compute }
     }
 
     /// The decode before the load counted a step: the generic model's misses
@@ -419,7 +415,8 @@ impl DecodePrice {
     /// headers and the machine's figures, which the load's own reads
     /// replace at each layer it reads once it counts them ([`Self::new`]).
     pub fn prior(layers: StreamedLayers, rows: f64, read: ReadLine, compute: FormSeconds) -> Self {
-        Self { layers, live: None, rows: normalize_rows(rows), depth: 0, read, compute }
+        assert!(rows.is_finite() && rows > 0., "a decode's prior rows must be finite and positive, got {rows}");
+        Self { layers, live: None, rows, depth: 0, read, compute }
     }
 
     /// The context tokens a row of the counted decode reads.
@@ -444,17 +441,11 @@ impl DecodePrice {
     }
 }
 
-/// Normalize a decode row count to a positive finite value, matching
-/// [`LiveDecode::shares`]'s fallback when no valid row count was recorded.
-fn normalize_rows(rows: f64) -> f64 {
-    if !rows.is_finite() || rows <= 0. { 1. } else { rows }
-}
-
-/// What `model` gives a bank of a share `share` of its layer's experts, a
-/// bank past them holding them all.
-fn generic_shares(model: &MissModel, share: f64) -> Shares {
+/// What `model` gives a bank of a share `share` of its layer's experts at
+/// `rows` rows, a bank past them holding them all.
+fn generic_shares(model: &MissModel, share: f64, rows: f64) -> Shares {
     let share = share.min(1.);
-    Shares { misses: model.misses(share), requests: model.requests(share) }
+    Shares { misses: model.misses_for(share, rows), requests: model.requests(share) }
 }
 
 /// Fill column `col` of row-major `flat` (`period × width`) with a layer's
@@ -476,13 +467,6 @@ fn fill_layer_period(
     width: usize,
     col: usize,
 ) {
-    if !rows.is_finite() || rows <= 0. || !routed.is_finite() || routed <= 0. {
-        let quiet_run = LayerRun { load: LayerLoad::default(), layers };
-        for step in 0..period {
-            flat[step * width + col] = quiet_run;
-        }
-        return;
-    }
     let misses = |slots: usize| (shares(slots).misses * routed * period as f64).round() as usize;
     let total = misses(held.slots);
     let filed = misses(held.slots.max(held.host)).min(total);
@@ -555,7 +539,7 @@ mod tests {
     #[test]
     fn a_layer_misses_as_the_generic_model_gives() {
         let model = MissModel::of(32, 4);
-        let shares = |slots: usize| generic_shares(&model, slots as f64 / 32.);
+        let shares = |slots: usize| generic_shares(&model, slots as f64 / 32., 1.);
         let period = |held| layer_period(&shares, 4., 4, held, 1., 320);
         // 8 of 32 experts, a quarter: 4 a row, one row.
         let misses = (model.misses(0.25) * 4. * 320.).round() as u64;
@@ -689,58 +673,52 @@ mod tests {
         }
     }
 
-    /// Non-positive or non-finite `rows` (and non-positive/non-finite `routed`)
-    /// never produce NaN in `DecodePrice`, `StreamedLayers::prepare`,
-    /// `step_seconds`, `pass_reads`, or `fill_layer_period`.
+    /// Representative `Qwen3.8-Flash-Next` (`L = 48, E = 512, k = 10`) streamed
+    /// decode estimates on a 64 GiB M4 Max profile: strictly monotone in held
+    /// slots, continuous into near-residency, and avoiding the uniform model's
+    /// 7.5x cliff at 70% residency.
     #[test]
-    fn non_positive_or_non_finite_rows_never_poison_period_or_decode_price() {
-        let lines = ExpertLines::reference(1_000_000);
-        let compute = FormSeconds { resident: 0.010, streamed: 0.012 };
-        let held = HeldSlots { slots: 8, host: 16 };
-        let layers = StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines]));
-        let reads = LayerReads::of_depths(&[2, 1, 0, 0, 1], &[1, 1, 0, 0, 1]);
+    fn near_resident_moe_estimates_reflect_locality_without_cliff() {
+        use crate::expert_lines::{GpuLines, HostLines, LandingLine, Moves, Nanoseconds, PassLine};
+        use crate::lines::RecordLine;
 
-        let model = MissModel::of(32, 4);
-        let shares = |slots: usize| generic_shares(&model, slots as f64 / 32.);
-        for bad_rows in [0., -1., f64::NAN, f64::INFINITY] {
-            // `fill_layer_period` via `layer_period` guards invalid rows and routed.
-            let loads = layer_period(&shares, 4., 4, held, bad_rows, 32);
-            assert!(loads.iter().all(|load| *load == LayerLoad::default()));
+        let zero = PassLine { weights: Nanoseconds::try_from(0).unwrap(), row: Nanoseconds::try_from(0).unwrap() };
+        let unified_line = |record_bytes: u64| ExpertLines {
+            host: HostLines {
+                cpu: None,
+                memory: None,
+                landing: Some(LandingLine::Device(RecordLine::new(0., 5e-5).unwrap())),
+                record_bytes,
+            },
+            gpu: GpuLines { link: zero, resident: zero, moves: Moves::NONE },
+        };
+        let m4_max_ssd = ReadLine::new(3e-4, 1. / 5.5e9).unwrap();
 
-            // `StreamedLayers::prepare`, `step_seconds`, and `pass_reads` stay finite.
-            let live = LiveDecode { layers: vec![reads.clone(), reads.clone()], steps: 1, rows: bad_rows, depth: 100 };
-            for live_opt in [None, Some(&live)] {
-                let step = layers.prepare(live_opt, held, bad_rows).step_seconds(READ, compute);
-                assert!(step.compute_seconds.is_finite() && step.exposed_seconds.is_finite() && step.total_seconds.is_finite());
-                assert!(step.total_seconds >= compute.streamed);
-            }
-            assert_eq!(layers.pass_reads(READ, held, bad_rows), 0.);
+        // IQ3_S (~3.1 MB/expert, C_res ~15 ms, C_str ~17 ms): monotone across residency.
+        let iq3_lines = std::sync::Arc::from(vec![unified_line(3_100_000); 48]);
+        let iq3 = StreamedLayers::new(vec![512; 48], 10, iq3_lines);
+        let iq3_compute = FormSeconds { resident: 0.015, streamed: 0.017 };
+        let tps = |layers: &StreamedLayers, slots: usize, compute: FormSeconds| {
+            1. / layers.step_seconds(None, m4_max_ssd, HeldSlots::bank(slots), 1., compute).total_seconds
+        };
+        let tps_30 = tps(&iq3, 154, iq3_compute);
+        let tps_50 = tps(&iq3, 256, iq3_compute);
+        let tps_70 = tps(&iq3, 358, iq3_compute);
+        let tps_85 = tps(&iq3, 435, iq3_compute);
+        let tps_95 = tps(&iq3, 486, iq3_compute);
+        let tps_100 = tps(&iq3, 512, iq3_compute);
+        assert!(tps_30 < tps_50 && tps_50 < tps_70 && tps_70 < tps_85 && tps_85 < tps_95 && tps_95 < tps_100);
+        // At 70% residency, estimate is ~25 tok/s (not ~9 tok/s); at 95%, >45 tok/s.
+        assert!(tps_70 > 20., "70% resident IQ3_S should exceed 20 tok/s, got {tps_70:.2}");
+        assert!(tps_95 > 45., "95% resident IQ3_S should exceed 45 tok/s, got {tps_95:.2}");
+        assert!((tps_100 - 1. / 0.015).abs() < 1e-6);
 
-            // `DecodePrice::new` and `DecodePrice::prior` normalize invalid rows to 1.0.
-            let one_row_live = LiveDecode { layers: vec![reads.clone(), reads.clone()], steps: 1, rows: 1., depth: 100 };
-            let expected_prior = DecodePrice::prior(StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines])), 1., READ, compute).step(held);
-            let bad_prior = DecodePrice::prior(StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines])), bad_rows, READ, compute).step(held);
-            assert_eq!(bad_prior, expected_prior);
-
-            let bad_live_price = DecodePrice::new(StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines])), live, READ, compute).step(held);
-            assert!(bad_live_price.total_seconds.is_finite() && bad_live_price.exposed_seconds.is_finite());
-            // With invalid `live.rows`, `LiveDecode::shares` falls back to generic model
-            // while `live.routed` still reports the layer's counted distinct experts,
-            // priced at normalized `rows = 1.0`.
-            let expected_live = layers.step_seconds(
-                Some(&LiveDecode { rows: bad_rows, ..one_row_live }),
-                READ,
-                held,
-                1.,
-                compute,
-            );
-            assert_eq!(bad_live_price, expected_live);
-        }
-
-        // `fill_layer_period` also guards non-positive/non-finite `routed` with valid `rows`.
-        for bad_routed in [0., -2., f64::NAN, f64::INFINITY] {
-            let loads = layer_period(&shares, bad_routed, 4, held, 1., 32);
-            assert!(loads.iter().all(|load| *load == LayerLoad::default()));
-        }
+        // NVFP4 (~4.9 MB/expert, ~42% resident) and Q6_K_XL (~6.5 MB/expert, ~30% resident).
+        let nvfp4 = StreamedLayers::new(vec![512; 48], 10, std::sync::Arc::from(vec![unified_line(4_900_000); 48]));
+        let tps_nvfp4 = tps(&nvfp4, 215, FormSeconds { resident: 0.017, streamed: 0.019 });
+        let q6 = StreamedLayers::new(vec![512; 48], 10, std::sync::Arc::from(vec![unified_line(6_500_000); 48]));
+        let tps_q6 = tps(&q6, 154, FormSeconds { resident: 0.019, streamed: 0.021 });
+        assert!(tps_q6 < tps_nvfp4 && tps_nvfp4 < tps_70, "q6={tps_q6:.2}, nvfp4={tps_nvfp4:.2}, iq3={tps_70:.2}");
+        assert!(tps_nvfp4 > 8. && tps_q6 > 5., "nvfp4={tps_nvfp4:.2}, q6={tps_q6:.2}");
     }
 }

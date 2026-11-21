@@ -1673,7 +1673,7 @@ impl AttentionMix {
             .copied()
             .collect::<Vec<_>>();
         let (heads, width) = (shape.heads(), shape.widths.width);
-        let fresh_rows = [u64::from(shape.form.fresh), rows, shape.widths.kv_heads * width];
+        let fresh_rows = [u64::from(shape.form.is_fresh()), rows, shape.widths.kv_heads * width];
         let selected_rows = self.picks(
             point,
             &tables.coordinates[..rows as usize],
@@ -1699,7 +1699,7 @@ impl AttentionMix {
                 let query_norm = head_norm(shape.form.query_norm, WeightKind::QueryNorm)?;
                 // A Shared layer's unread key norm port takes its query norm
                 // (`graph::attention`).
-                let key_norm = if !shape.form.fresh {
+                let key_norm = if !shape.form.is_fresh() {
                     query_norm.clone()
                 } else {
                     head_norm(shape.form.key_norm, WeightKind::KeyNorm)?
@@ -1736,7 +1736,7 @@ impl AttentionMix {
                     value: inputs.activation(
                         self.activation,
                         &[
-                            u64::from(shape.form.fresh && !shape.form.stored_key()),
+                            u64::from(shape.form.is_fresh() && !shape.form.stored_key()),
                             rows,
                             shape.widths.kv_heads * width,
                         ],
@@ -1788,7 +1788,7 @@ impl AttentionMix {
                         ]
                         .into_iter()
                         .chain(self.dense().then_some(shape.rounds_keys()))
-                        .chain(self.dense().then_some(u64::from(shape.form.absorbed_query)))
+                        .chain(self.dense().then_some(u64::from(shape.form.is_absorbed())))
                         .collect::<Vec<_>>(),
                         &[],
                     )?,
@@ -2109,17 +2109,19 @@ mod tests {
                     activation: Element::bf16(),
                     shape: AttentionShape {
                         form: crate::planning::AttentionForm {
-                            gate: crate::planning::GateForm::Interleaved,
-                            fresh: true,
+                            gate: crate::planning::GateSpec::Interleaved,
+                            key_value: crate::planning::KeyValueSpec::Fresh {
+                                key: (),
+                                value: crate::planning::ValueSpec::Projected(()),
+                            },
                             query_norm: true,
                             key_norm: true,
                             value_norm: false,
-                            values: crate::AttentionValues::Projected,
                             sinks: false,
                             rotary_adjacent: false,
                             rotary_trailing: false,
                             output_rotary: false,
-                            absorbed_query: false,
+                            absorbed: None,
                         },
                         key_rounding: crate::RoundingArgs::NONE,
                         widths: crate::planning::AttentionWidths {
@@ -2226,17 +2228,19 @@ mod tests {
                 activation: Element::bf16(),
                 shape: AttentionShape {
                     form: crate::planning::AttentionForm {
-                        gate: crate::planning::GateForm::None,
-                        fresh: true,
+                        gate: crate::planning::GateSpec::None,
+                        key_value: crate::planning::KeyValueSpec::Fresh {
+                            key: (),
+                            value: crate::planning::ValueSpec::Projected(()),
+                        },
                         query_norm: true,
                         key_norm: true,
                         value_norm: true,
-                        values: crate::AttentionValues::Projected,
                         sinks: false,
                         rotary_adjacent: false,
                         rotary_trailing: false,
                         output_rotary: false,
-                        absorbed_query: false,
+                        absorbed: None,
                     },
                     key_rounding: crate::RoundingArgs::NONE,
                     widths: crate::planning::AttentionWidths {
@@ -2292,31 +2296,39 @@ mod tests {
     #[test]
     fn cuda_multirow_start_follows_served_rows_and_declared_domain() {
         use seismic::{BackendName, NativeSpecialization};
+        struct CudaDevice;
+        impl seismic::device::DeviceValues for CudaDevice {
+            fn value(&self, name: &str) -> u64 {
+                match name {
+                    "units" => 82,
+                    other => panic!("unexpected CUDA device property `{other}`"),
+                }
+            }
+            fn measured(&self, _name: &str) -> Option<u64> {
+                None
+            }
+        }
         let implementations = [
             seismic::generated::native_implementation_for_backend::<attention_decode::Entry>(
                 BackendName::Cuda,
             )
             .unwrap()
             .unwrap()
-            .device_independent()
-            .expect("the declaration reads no device property")
-            .owned(),
+            .at_device(&CudaDevice),
             seismic::generated::native_implementation_for_backend::<attention_decode_k8v4::Entry>(
                 BackendName::Cuda,
             )
             .unwrap()
             .unwrap()
-            .device_independent()
-            .expect("the declaration reads no device property")
-            .owned(),
+            .at_device(&CudaDevice),
         ];
         // Each entry's own history codec: the dense entry's dense, the affine
         // entry's K8/V4.
         let codecs = [magnitude_state::KvCodec::Dense, magnitude_state::KvCodec::AffineK8V4];
         for (implementation, codec) in implementations.into_iter().zip(codecs) {
-            // The affine entry's default SLICES: the fewest that hold a lane
-            // to 32 elements, or the most the group splits into.
-            for (group, width, max_rows, expected_warps, affine_slices) in [
+            // Default SLICES for both CUDA entries: the fewest that hold a lane
+            // to 32 elements, or the most the group splits into within default WARPS=4.
+            for (group, width, max_rows, expected_warps, expected_slices) in [
                 (2, 256, 8, 1, 1),
                 (6, 256, 8, 4, 2),
                 (8, 128, 8, 4, 1),
@@ -2329,17 +2341,19 @@ mod tests {
                     activation: Element::bf16(),
                     shape: AttentionShape {
                         form: crate::planning::AttentionForm {
-                            gate: crate::planning::GateForm::None,
-                            fresh: true,
+                            gate: crate::planning::GateSpec::None,
+                            key_value: crate::planning::KeyValueSpec::Fresh {
+                                key: (),
+                                value: crate::planning::ValueSpec::Projected(()),
+                            },
                             query_norm: true,
                             key_norm: true,
                             value_norm: false,
-                            values: crate::AttentionValues::Projected,
                             sinks: false,
                             rotary_adjacent: false,
                             rotary_trailing: false,
                             output_rotary: false,
-                            absorbed_query: false,
+                            absorbed: None,
                         },
                         key_rounding: crate::RoundingArgs::NONE,
                         widths: crate::planning::AttentionWidths {
@@ -2390,13 +2404,11 @@ mod tests {
                 assert_eq!(choice.param("WARPS"), Some(expected_warps));
                 assert_eq!(choice.param("COLUMNS"), Some(1));
                 assert_eq!(choice.param("STAGES"), Some(2));
-                // The default is the vector form, the group whole except on
-                // the affine entry, which splits it so a lane holds at most
-                // 32 elements where it can.
-                let affine = implementation.statics.iter().any(|name| name == "KC");
+                // The default is the vector form, splitting the group so a lane
+                // holds at most 32 elements where it can (within default WARPS=4).
                 let default = implementation.default_specialization(&statics).unwrap();
                 assert_eq!(default.param("MATRIX"), Some(0));
-                assert_eq!(default.param("SLICES"), Some(if affine { affine_slices } else { 1 }));
+                assert_eq!(default.param("SLICES"), Some(expected_slices));
 
                 // A unit bounded to one row has no multi-row seed.
                 let single = TuningLimits {
@@ -2436,17 +2448,19 @@ mod tests {
             activation: Element::bf16(),
             shape: AttentionShape {
                 form: crate::planning::AttentionForm {
-                    gate: crate::planning::GateForm::Interleaved,
-                    fresh: true,
+                    gate: crate::planning::GateSpec::Interleaved,
+                    key_value: crate::planning::KeyValueSpec::Fresh {
+                        key: (),
+                        value: crate::planning::ValueSpec::Projected(()),
+                    },
                     query_norm: true,
                     key_norm: true,
                     value_norm: false,
-                    values: crate::AttentionValues::Projected,
                     sinks: false,
                     rotary_adjacent: false,
                     rotary_trailing: false,
                     output_rotary: false,
-                    absorbed_query: false,
+                    absorbed: None,
                 },
                 key_rounding: crate::RoundingArgs::NONE,
                 widths: crate::planning::AttentionWidths {
@@ -2624,17 +2638,19 @@ mod tests {
             activation: Element::bf16(),
             shape: AttentionShape {
                 form: crate::planning::AttentionForm {
-                    gate: crate::planning::GateForm::None,
-                    fresh: true,
+                    gate: crate::planning::GateSpec::None,
+                    key_value: crate::planning::KeyValueSpec::Fresh {
+                        key: (),
+                        value: crate::planning::ValueSpec::Projected(()),
+                    },
                     query_norm: false,
                     key_norm: true,
                     value_norm: false,
-                    values: crate::AttentionValues::Projected,
                     sinks: false,
                     rotary_adjacent: false,
                     rotary_trailing: false,
                     output_rotary: false,
-                    absorbed_query: false,
+                    absorbed: None,
                 },
                 key_rounding: crate::RoundingArgs::NONE,
                 widths: crate::planning::AttentionWidths {
@@ -2724,17 +2740,19 @@ mod tests {
             activation: Element::bf16(),
             shape: AttentionShape {
                 form: crate::planning::AttentionForm {
-                    gate: crate::planning::GateForm::None,
-                    fresh: true,
+                    gate: crate::planning::GateSpec::None,
+                    key_value: crate::planning::KeyValueSpec::Fresh {
+                        key: (),
+                        value: crate::planning::ValueSpec::Projected(()),
+                    },
                     query_norm: true,
                     key_norm: true,
                     value_norm: false,
-                    values: crate::AttentionValues::Projected,
                     sinks: false,
                     rotary_adjacent: false,
                     rotary_trailing: false,
                     output_rotary: false,
-                    absorbed_query: false,
+                    absorbed: None,
                 },
                 key_rounding: crate::RoundingArgs::NONE,
                 widths: crate::planning::AttentionWidths {

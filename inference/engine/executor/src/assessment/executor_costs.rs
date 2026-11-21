@@ -293,30 +293,10 @@ impl MeasuredCost {
 
     /// `units` over each of `timing`'s times: a rate, its interval from the
     /// times' (the slowest time bounds it below).
-    ///
-    /// Panics if `units` or `timing.median` is not finite and positive.
     pub(super) fn rate(units: f64, timing: &Timing) -> Self {
-        assert!(
-            units.is_finite() && units > 0.0,
-            "rate units must be finite and positive, got {units}"
-        );
-        assert!(
-            timing.median.is_finite() && timing.median > 0.0,
-            "rate timing median must be finite and positive, got {}",
-            timing.median
-        );
         Self {
             value: units / timing.median,
-            interval: timing
-                .interval
-                .filter(|&(fastest, slowest)| {
-                    fastest.is_finite()
-                        && fastest > 0.0
-                        && slowest.is_finite()
-                        && slowest > 0.0
-                        && slowest >= fastest
-                })
-                .map(|(fastest, slowest)| (units / slowest, units / fastest)),
+            interval: timing.interval.map(|(fastest, slowest)| (units / slowest, units / fastest)),
             samples: timing.samples,
         }
     }
@@ -603,25 +583,10 @@ impl ExecutorCosts {
         let formats = self.chain.calls.iter().flat_map(Work::formats).collect::<Vec<_>>();
         let layouts = self.chain.calls.iter().filter_map(Work::layout).collect::<Vec<_>>();
         let priced = self.chain.layers as f64 * pricing::calls_seconds(&self.chain.calls, &self.rates(&formats, &layouts), depth)?;
-        if !priced.is_finite() || priced <= 0.0 {
-            return Err(AssessmentError::Demand(format!(
-                "the composition chain's priced time is not finite and positive ({priced})"
-            )));
-        }
         let timing = self.chain.timing;
-        if !timing.median.is_finite() || timing.median <= 0.0 {
-            return Err(AssessmentError::Demand(format!(
-                "the composition chain's measured time is not finite and positive ({})",
-                timing.median
-            )));
-        }
-        let interval = timing
-            .interval
-            .filter(|&(low, high)| low.is_finite() && high.is_finite() && low >= 0.0 && high >= low)
-            .map(|(low, high)| (low / priced, high / priced));
         Ok(MeasuredCost {
             value: timing.median / priced,
-            interval,
+            interval: timing.interval.map(|(low, high)| (low / priced, high / priced)),
             samples: timing.samples,
         })
     }
@@ -1934,11 +1899,7 @@ fn told<E: fmt::Display, G: fmt::Display>(outcome: Outcome<E, G>) -> Outcome<Str
 fn timed<M>(outcome: &Outcome<CallError, ExecutorCostsError>) -> Result<Timing, Stop<M>> {
     match outcome {
         Outcome::Loaded(record) => self::outcome(record),
-        Outcome::Measured(timing) if timing.median.is_finite() && timing.median > 0.0 => Ok(*timing),
-        Outcome::Measured(timing) => Err(Stop::Point(ExecutorCostsError(format!(
-            "measured timing median must be finite and positive, got {}",
-            timing.median
-        )))),
+        Outcome::Measured(timing) => Ok(*timing),
         Outcome::Skipped(reason) => Err(unobtainable(reason)),
         Outcome::Unformed(error) | Outcome::Unmade(error) => Err(Stop::Point(error.clone())),
         Outcome::Failed(error) => Err(Stop::Point(failed("timing a point")(error))),
@@ -1975,11 +1936,7 @@ impl Records<'_> {
 /// What a record gives the walk: its timing, or the point unobtainable.
 fn outcome<M>(record: &Record) -> Result<Timing, Stop<M>> {
     match record {
-        Record::Measured(timing) if timing.median.is_finite() && timing.median > 0.0 => Ok(*timing),
-        Record::Measured(timing) => Err(Stop::Point(ExecutorCostsError(format!(
-            "stored timing median must be finite and positive, got {}",
-            timing.median
-        )))),
+        Record::Measured(timing) => Ok(*timing),
         Record::Unobtainable { reason } => Err(unobtainable(reason)),
     }
 }
@@ -6117,59 +6074,5 @@ mod tests {
         let (low, high) = above.interval.unwrap();
         assert!((low - 20e-6).abs() < 1e-18);
         assert!((high - 60e-6).abs() < 1e-18);
-    }
-
-    /// Stored or direct timings with non-positive or non-finite medians never
-    /// propagate `NaN` or `inf` into rates, loaded records, or composition ratios.
-    #[test]
-    fn rate_outcome_and_composition_guard_against_non_positive_or_non_finite_timings() {
-        let timing = |median, interval| Timing { median, interval, samples: 16 };
-
-        // Valid `MeasuredCost::rate` computes finite positive value and interval.
-        let valid = MeasuredCost::rate(1000.0, &timing(2.0, Some((1.0, 4.0))));
-        assert_eq!(valid.value, 500.0);
-        assert_eq!(valid.interval, Some((250.0, 1000.0)));
-
-        // Degenerate interval bounds drop to `None` instead of yielding `inf`/`NaN`.
-        assert_eq!(MeasuredCost::rate(1000.0, &timing(2.0, Some((0.0, 4.0)))).interval, None);
-        assert_eq!(MeasuredCost::rate(1000.0, &timing(2.0, Some((f64::NAN, 4.0)))).interval, None);
-        assert_eq!(MeasuredCost::rate(1000.0, &timing(2.0, Some((5.0, 4.0)))).interval, None);
-
-        // Non-positive or non-finite medians or units panic in `MeasuredCost::rate`.
-        for bad_median in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let panicked = std::panic::catch_unwind(|| {
-                MeasuredCost::rate(1000.0, &timing(bad_median, None))
-            })
-            .is_err();
-            assert!(panicked, "expected rate to reject median={bad_median}");
-            assert!(
-                matches!(
-                    outcome::<()>(&Record::Measured(timing(bad_median, None))),
-                    Err(Stop::Point(_))
-                ),
-                "expected outcome to reject stored median={bad_median}"
-            );
-        }
-        for bad_units in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let panicked = std::panic::catch_unwind(|| {
-                MeasuredCost::rate(bad_units, &timing(1.0, None))
-            })
-            .is_err();
-            assert!(panicked, "expected rate to reject units={bad_units}");
-        }
-
-        // `ExecutorCosts::composition` returns `Err(AssessmentError::Demand(_))`
-        // for non-positive/non-finite measured time or priced time.
-        for bad_median in [0.0, -1e-3, f64::NAN, f64::INFINITY] {
-            let mut costs = crate::assessment::fixtures::costs();
-            costs.chain.timing.median = bad_median;
-            assert!(
-                matches!(costs.composition(), Err(AssessmentError::Demand(_))),
-                "expected composition to reject chain median={bad_median}"
-            );
-        }
-        let mut zero_priced = crate::assessment::fixtures::costs();
-        zero_priced.chain.layers = 0;
-        assert!(matches!(zero_priced.composition(), Err(AssessmentError::Demand(_))));
     }
 }

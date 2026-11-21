@@ -202,32 +202,38 @@ fn the_loads_own_commit_never_spends_the_guarantee() {
     }
 }
 
-/// A tiny domain whose `holder` opened on the request slot, with `idle`, an
-/// idle drafter of 4 KiB, held as cache beside it.
-fn holding_an_idle_drafter() -> (
-    Box<crate::domain::ExecutorDomain<crate::domain::fixtures::TestFamily>>,
+/// A drafted domain with an idle drafter of 4 KiB held as cache, and
+/// optionally a resident `holder` (`RequestId(1)`) occupying the request slot.
+fn holding_an_idle_drafter(
+    test: &str,
+    open_holder: bool,
+) -> (
+    std::path::PathBuf,
+    Box<crate::domain::ExecutorDomain>,
     crate::domain::StateBindings,
     Ledger,
 ) {
-    use crate::domain::fixtures::{fixture_over, limits, tiny_definition, tiny_manifest};
     use crate::memory::ledger::CacheKind;
-    let (mut domain, mut bindings) = fixture_over(
-        tiny_definition(),
-        tiny_manifest(&tiny_definition()),
-        limits(2, 1, false),
-        crate::PlannedMethod::Plain,
-        None,
-        false,
-        crate::platform::DeviceRequest::Automatic,
-    );
+    let (directory, _, mut domain, mut bindings) = crate::domain::fixtures::loaded::drafted(test);
     for request in [crate::RequestId(1), crate::RequestId(2)] {
         domain.install_input(request, magnitude_family_contracts::PreparedModelInput::continuation_only()).unwrap();
     }
-    assert!(domain.open_served(&mut bindings, crate::RequestId(1), None).unwrap().is_empty());
+    if open_holder {
+        assert!(domain.open_served(&mut bindings, crate::RequestId(1), None).unwrap().is_empty());
+    }
     let ledger = domain.resources.ledgers().device().clone();
-    let weights = ledger.cached(CacheKind::Drafter, 4096).expect("the drafter fits");
-    domain.idle_components.push(super::IdleComponent { component: super::OptionalComponent::Drafter, weights: vec![weights], binding: Vec::new() });
-    (domain, bindings, ledger)
+    let weights = ledger
+        .cached_with(CacheKind::Drafter, 4096, crate::memory::ledger::Reclaim::Deferred)
+        .expect("the drafter fits");
+    let loader = match std::mem::replace(&mut domain.head_component, super::OptionalSlot::Absent) {
+        super::OptionalSlot::Unloaded(loader) => loader,
+        _ => panic!("drafted fixture has an unloaded head loader"),
+    };
+    domain.head_component = super::OptionalSlot::Idle {
+        loader,
+        cache: super::IdleCache { weights: vec![weights], binding: Vec::new() },
+    };
+    (directory, domain, bindings, ledger)
 }
 
 /// An open keeps the idle optional components in its change's keep phase,
@@ -236,16 +242,18 @@ fn holding_an_idle_drafter() -> (
 #[test]
 fn an_open_refused_short_idles_the_components_it_kept() {
     use crate::memory::ledger::{CacheKind, CommittedKind};
-    let (mut domain, mut bindings, ledger) = holding_an_idle_drafter();
+    let (directory, mut domain, mut bindings, ledger) = holding_an_idle_drafter("refused-open-idles-kept", true);
     let (room, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::MIN, u64::MAX));
     assert!(
         matches!(domain.open_served(&mut bindings, crate::RequestId(2), None), Err(crate::domain::DomainError::Capacity(_))),
         "nothing is left for a second request"
     );
-    assert!(!domain.state_claims.contains_key(&crate::RequestId(2)), "a refused open holds nothing");
+    assert!(domain.resident(crate::RequestId(2)).is_none(), "a refused open holds nothing");
     assert_eq!(ledger.estimate().cache_of(CacheKind::Drafter), 4096, "the drafter idles whole as it was");
-    assert!(matches!(&domain.idle_components[..], [idle] if idle.component == super::OptionalComponent::Drafter && !idle.taken()));
+    assert!(domain.head_component.idle_cache().is_some_and(|idle| !idle.taken()));
     drop(room);
+    drop(domain);
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 /// An exogenous supply drop shrinking the bank suppresses immediate small
@@ -337,17 +345,16 @@ fn exogenous_shrink_damps_ping_pong_until_cooldown_or_large_release() {
 /// open keeps none of it and unloads it whole.
 #[test]
 fn an_open_unloads_a_component_an_earlier_claim_took() {
-    use crate::memory::ledger::{CacheKind, CommittedKind};
-    let (mut domain, mut bindings, ledger) = holding_an_idle_drafter();
-    domain.close(crate::RequestId(1)).unwrap();
-    let (room, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::MIN, u64::MAX));
-    let taken = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, 1)).expect("the drafter yields");
-    assert!(domain.idle_components[0].taken(), "the claim took the drafter's cache");
-    drop(room);
+    use crate::memory::ledger::{CacheKind, Frees, Relief};
+    let (directory, mut domain, mut bindings, ledger) = holding_an_idle_drafter("open-unloads-taken", false);
+    let plan = ledger.plan_relief(1, Relief::CacheOnly, Frees::Room).expect("the drafter yields");
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 1);
+    assert!(domain.head_component.idle_cache().is_some_and(super::IdleCache::taken), "relief took the drafter's cache");
     assert!(domain.open_served(&mut bindings, crate::RequestId(2), None).unwrap().is_empty(), "it opens");
-    assert!(domain.idle_components.is_empty(), "the drafter is unloaded whole");
+    assert!(domain.head_component.idle_cache().is_none(), "the drafter is unloaded whole");
     assert_eq!(ledger.estimate().cache_of(CacheKind::Drafter), 0);
-    drop(taken);
+    drop(domain);
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 /// A pass the host builds runs up to the regime's depth: no request

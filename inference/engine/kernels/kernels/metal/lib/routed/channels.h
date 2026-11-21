@@ -56,19 +56,13 @@ constexpr uint projection_region() {
 // shared by every lane group. In a chunk (the whole row without a stage) the
 // lanes of a group own its packets sub, sub + LANES, ..., summed in that
 // order, then across the group.
+// One-row accumulation of `project_channels` into `acc[ROWS]`, using `region`
+// as staging when `STAGE > 0`.
 template <typename W, uint ROWS, uint LANES, uint COLUMNS, uint STAGE, typename In>
-inline void project_channels(thread const In &in, thread const projection::Weights<W> &w, uint first,
-    uint rows, uint extent, threadgroup float *region, uint lane) {
-    constexpr uint G = 32u / LANES;
+inline void project_channels_one(thread const In &in, thread const projection::Weights<W> &w,
+    thread const uint (&n)[ROWS], uint P, threadgroup float *region, uint lane, thread float (&acc)[ROWS]) {
     constexpr uint COLUMN_PACKETS = (COLUMNS + 31u) / 32u;
-    // The packets read: those of the extent.
-    const uint P = min(COLUMN_PACKETS, (extent + 31u) / 32u);
-    const uint g = lane / LANES, sub = lane % LANES;
-    uint n[ROWS];
-    PROJECTION_UNROLL
-    for (uint r = 0; r < ROWS; ++r)
-        n[r] = min(first + g + G * r, rows - 1u);
-    float acc[ROWS];
+    const uint sub = lane % LANES;
     PROJECTION_UNROLL
     for (uint r = 0; r < ROWS; ++r)
         acc[r] = 0.0f;
@@ -150,6 +144,24 @@ inline void project_channels(thread const In &in, thread const projection::Weigh
                 }
             }
         }
+    }
+}
+
+template <typename W, uint ROWS, uint LANES, uint COLUMNS, uint STAGE, typename In>
+inline void project_channels(thread const In &in, thread const projection::Weights<W> &w, uint first,
+    uint rows, uint extent, threadgroup float *region, uint lane) {
+    constexpr uint G = 32u / LANES;
+    constexpr uint COLUMN_PACKETS = (COLUMNS + 31u) / 32u;
+    // The packets read: those of the extent.
+    const uint P = min(COLUMN_PACKETS, (extent + 31u) / 32u);
+    const uint g = lane / LANES, sub = lane % LANES;
+    uint n[ROWS];
+    PROJECTION_UNROLL
+    for (uint r = 0; r < ROWS; ++r)
+        n[r] = min(first + g + G * r, rows - 1u);
+    float acc[ROWS];
+    project_channels_one<W, ROWS, LANES, COLUMNS, STAGE>(in, w, n, P, region, lane, acc);
+    if constexpr (STAGE > 0) {
         // The last chunk's reads of the stage end before the projections
         // take its place.
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -160,6 +172,200 @@ inline void project_channels(thread const In &in, thread const projection::Weigh
         if (sub == 0)
             region[g + G * r] = total;
     }
+}
+
+// Operands of up to MAXM rows formed by one simdgroup alone (no threadgroup
+// barrier): plain rows unchanged, or NVFP4 rows with per-row global scales in
+// registers (`projection::RegGlobals<MAXM>`).
+template <bool NVFP4, uint MAXM>
+struct lone_operands;
+
+template <uint MAXM>
+struct lone_operands<false, MAXM> {
+    template <typename In>
+    static In form(In in, uint, uint, uint) {
+        return in;
+    }
+};
+
+template <uint MAXM>
+struct lone_operands<true, MAXM> {
+    template <typename In>
+    static projection::Nvfp4Rows<In, projection::RegGlobals<MAXM>> form(In in, uint m_rows, uint columns, uint lane) {
+        projection::RegGlobals<MAXM> globals = {};
+        for (uint m = 0; m < m_rows; ++m) {
+            uint amax = 0u;
+            for (uint k = 8u * lane; k < columns; k += 256u) {
+                float4 even, odd;
+                in.load8(m, k, 0.0f, even, odd);
+                amax = packets::magnitude_peak(amax, even, odd);
+            }
+            globals.g[m] = packets::nvfp4::global_scale(as_type<float>(simd_max(amax)));
+        }
+        return projection::Nvfp4Rows<In, projection::RegGlobals<MAXM>>{in, globals};
+    }
+};
+
+// Accumulate one loaded weight packet of ROWS channels into MAXM rows'
+// accumulators, decoding each weight once across all rows.
+template <typename W, uint ROWS, uint MAXM, typename In>
+inline void project_channels_step(thread const In &in, thread const typename W::packet (&pkt)[ROWS], uint col_base,
+    uint m_rows, thread float (&acc)[ROWS][MAXM]) {
+    PROJECTION_UNROLL
+    for (uint step = 0; step < 4; ++step) {
+        const uint col = col_base + 8u * step;
+        if constexpr (ROWS <= 4u) {
+            float4 we[ROWS], wo[ROWS];
+            PROJECTION_UNROLL
+            for (uint r = 0; r < ROWS; ++r)
+                projection::gemv_step_weights<W>(pkt[r], step, we[r], wo[r]);
+            PROJECTION_UNROLL
+            for (uint m = 0; m < MAXM; ++m) {
+                if (m < m_rows) {
+                    float4 xe, xo;
+                    Act::split8(in.words8(m, col), xe, xo);
+                    PROJECTION_UNROLL
+                    for (uint r = 0; r < ROWS; ++r)
+                        acc[r][m] = projection::gemv_step_add<W>(acc[r][m], pkt[r], step, we[r], wo[r], xe, xo);
+                }
+            }
+        } else {
+            uint4 xw[MAXM];
+            PROJECTION_UNROLL
+            for (uint m = 0; m < MAXM; ++m)
+                xw[m] = m < m_rows ? in.words8(m, col) : uint4(0);
+            PROJECTION_UNROLL
+            for (uint r = 0; r < ROWS; ++r) {
+                float4 we, wo;
+                projection::gemv_step_weights<W>(pkt[r], step, we, wo);
+                PROJECTION_UNROLL
+                for (uint m = 0; m < MAXM; ++m) {
+                    if (m < m_rows) {
+                        float4 xe, xo;
+                        Act::split8(xw[m], xe, xo);
+                        acc[r][m] = projection::gemv_step_add<W>(acc[r][m], pkt[r], step, we, wo, xe, xo);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Batched decode down projection of `m_rows` (<= MAXM) rows against one weight
+// matrix `w` in a single weight pass, publishing row m's channels directly to
+// `published_rows[m]` in `published`. Preserves `project_channels`' exact
+// chunking and per-lane summation order, so every row keeps its one-row bits.
+template <typename W, uint ROWS, uint LANES, uint MAXM, uint COLUMNS, uint STAGE, uint H, bool NVFP4, typename In,
+    typename Published>
+inline void project_channels_published(thread const In &raw, thread const projection::Weights<W> &w, uint m_rows,
+    thread const uint *published_rows, uint first, uint rows, uint extent, threadgroup float *region,
+    Published published, uint lane) {
+    constexpr uint G = 32u / LANES;
+    constexpr uint COLUMN_PACKETS = (COLUMNS + 31u) / 32u;
+    const uint P = min(COLUMN_PACKETS, (extent + 31u) / 32u);
+    const uint g = lane / LANES, sub = lane % LANES;
+    const auto in = lone_operands<NVFP4, MAXM>::form(raw, m_rows, COLUMNS, lane);
+    uint n[ROWS];
+    PROJECTION_UNROLL
+    for (uint r = 0; r < ROWS; ++r)
+        n[r] = min(first + g + G * r, rows - 1u);
+    if constexpr (MAXM == 1u) {
+        float acc[ROWS];
+        project_channels_one<W, ROWS, LANES, COLUMNS, STAGE>(in, w, n, P, region, lane, acc);
+        PROJECTION_UNROLL
+        for (uint r = 0; r < ROWS; ++r) {
+            const float total = projection::gemv_group_sum<LANES>(acc[r]);
+            const uint channel = first + g + G * r;
+            if (sub == r % LANES && channel < H)
+                publish_channel<H>(published, published_rows[0], channel, total);
+        }
+        return;
+    }
+    float acc[ROWS][MAXM];
+    PROJECTION_UNROLL
+    for (uint r = 0; r < ROWS; ++r) {
+        PROJECTION_UNROLL
+        for (uint m = 0; m < MAXM; ++m)
+            acc[r][m] = 0.0f;
+    }
+    constexpr uint CHUNK = (STAGE == 0u || COLUMN_PACKETS < STAGE) ? COLUMN_PACKETS : STAGE;
+    for (uint base = 0; base < P; base += CHUNK) {
+        const uint count = min(CHUNK, P - base);
+        if constexpr (ROWS <= 2u) {
+            typename W::packet current[ROWS], next[ROWS];
+            if (sub < count) {
+                PROJECTION_UNROLL
+                for (uint r = 0; r < ROWS; ++r)
+                    current[r] = w.packet(n[r], base + sub);
+            }
+            for (uint p = sub; p < count; p += LANES) {
+                if (p + LANES < count) {
+                    PROJECTION_UNROLL
+                    for (uint r = 0; r < ROWS; ++r)
+                        next[r] = w.packet(n[r], base + p + LANES);
+                }
+                project_channels_step<W, ROWS, MAXM>(in, current, 32u * (base + p), m_rows, acc);
+                if (p + LANES < count) {
+                    PROJECTION_UNROLL
+                    for (uint r = 0; r < ROWS; ++r)
+                        current[r] = next[r];
+                }
+            }
+        } else {
+            for (uint p = sub; p < count; p += LANES) {
+                typename W::packet pkt[ROWS];
+                PROJECTION_UNROLL
+                for (uint r = 0; r < ROWS; ++r)
+                    pkt[r] = w.packet(n[r], base + p);
+                project_channels_step<W, ROWS, MAXM>(in, pkt, 32u * (base + p), m_rows, acc);
+            }
+        }
+    }
+    PROJECTION_UNROLL
+    for (uint r = 0; r < ROWS; ++r) {
+        const uint channel = first + g + G * r;
+        PROJECTION_UNROLL
+        for (uint m = 0; m < MAXM; ++m) {
+            if (m < m_rows) {
+                const float total = projection::gemv_group_sum<LANES>(acc[r][m]);
+                if (sub == (r * MAXM + m) % LANES && channel < H)
+                    publish_channel<H>(published, published_rows[m], channel, total);
+            }
+        }
+    }
+}
+
+// Gathered routed expert down projection (`sg < K`): gathers every choice
+// sharing `(m, sg)`'s expert and record source and projects all of them in a
+// single weight pass, publishing each choice's slot directly into `published`.
+template <typename W, uint ROWS, uint LANES, uint K, uint SLOTS, uint COLUMNS, uint STAGE, uint H, bool NVFP4,
+    typename Published>
+inline void project_gathered_expert(device const uchar *product, ulong p0, ulong p1, ulong p2,
+    device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows, ulong src1, ulong src2,
+    device const ulong *expert_down, device const ulong *tier_down, packets::Rows16 layout, uint m_rows, uint m,
+    uint first, uint sg, uint lane, threadgroup float *region, Published published) {
+    constexpr uint TILE = (32u / LANES) * ROWS;
+    const Gathered chosen =
+        gather(routes, r0, r1, sources, source_rows, src1, src2, m_rows, K, m * K + sg, SLOTS, 1);
+    if (chosen.count == 0)
+        return;
+    const slab::Source source = decode_source(sources, source_rows, src1, src2, m, sg, chosen.expert);
+    if (source.none()) {
+        for (uint r = 0; r < chosen.count; ++r)
+            publish_zero<TILE, H>(published, chosen.products[r], first, lane);
+        return;
+    }
+    ulong offsets[SEISMIC_CONST_VERIFY_ROWS];
+    for (uint r = 0; r < chosen.count; ++r) {
+        const uint k = chosen.products[r] - chosen.rows[r] * SLOTS;
+        offsets[r] = ulong(chosen.rows[r]) * p0 + ulong(k) * p1;
+    }
+    const bool aligned = p2 == 1ul && (p0 & 7ul) == 0ul && (p1 & 7ul) == 0ul;
+    const GatheredProduct in{product, offsets, p2, COLUMNS, aligned};
+    const auto down = expert_matrix<W>(Experts{expert_down, tier_down}, source, layout, COLUMNS);
+    PROJECTION_FOR_ROWS(chosen.count,
+        (project_channels_published<W, ROWS, LANES, MAXM, COLUMNS, STAGE, H, NVFP4>(
+            in, down, chosen.count, chosen.products, first, H, COLUMNS, region, published, lane)));
 }
 
 } // namespace routed

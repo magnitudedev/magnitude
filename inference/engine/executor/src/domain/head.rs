@@ -360,7 +360,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Return the accepted target states a head reading them held.
     fn restore_target_reads(&mut self, operations: &[Operation], states: Vec<SequenceState>) {
         for (operation, state) in operations.iter().zip(states) {
-            self.target.insert(operation.request(), state);
+            self.put_target_state(operation.request(), state);
         }
     }
 
@@ -569,7 +569,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) {
         for ((request, _, _), advance) in metadata.iter().zip(advances) {
             if let TentativeAdvance::Accepted(advance) = advance {
-                self.head.insert(*request, advance.abort());
+                self.put_head_state(*request, advance.abort());
             }
         }
     }
@@ -849,10 +849,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let reads = core.into_target_reads().expect("invariant violated: a head flight lost its target reads");
             assert_eq!(reads.states.len(), requests.len(), "invariant violated: a head flight's target reads differ from its requests");
             for ((request, _, _), state) in requests.iter().zip(reads.states) {
-                assert!(
-                    self.target.insert(*request, state).is_none(),
-                    "invariant violated: a head flight's target state has another owner"
-                );
+                self.put_target_state(*request, state);
             }
             requests.iter().map(|_| None).collect::<Vec<_>>()
         } else {
@@ -907,12 +904,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         // A request whose drafter proposed verifies its round next: no
         // decode queues behind that launch (`queue::continuations`).
-        self.verifying.extend(
-            pending
-                .iter()
-                .filter(|item| matches!(&item.outcome, Outcome::Head { proposals, .. } if !proposals.is_empty()))
-                .map(|item| item.request),
-        );
+        for item in &pending {
+            if matches!(&item.outcome, Outcome::Head { proposals, .. } if !proposals.is_empty()) {
+                self.resident_mut(item.request)
+                    .expect("invariant violated: a head outcome's request is not resident")
+                    .verifying = true;
+            }
+        }
         self.begin_host_turn(pending.iter().map(|item| item.request));
         Ok((pending, bindings))
     }

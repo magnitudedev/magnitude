@@ -3565,7 +3565,7 @@ mod tests {
     /// The native condition that `left == right` checks to.
     fn equal(left: crate::checked::NativeNatExpr, right: u64) -> crate::checked::NativeCondition {
         crate::checked::NativeCondition::Compare {
-            comparison: crate::checked::NativeComparison::Eq,
+            comparison: crate::expr::CmpOp::Eq,
             left,
             right: crate::checked::NativeNatExpr::Constant(right),
         }
@@ -3574,7 +3574,7 @@ mod tests {
     /// The native condition a constant `true` or `false` checks to.
     fn holds(value: bool) -> crate::checked::NativeCondition {
         crate::checked::NativeCondition::Compare {
-            comparison: if value { crate::checked::NativeComparison::Eq } else { crate::checked::NativeComparison::Ne },
+            comparison: if value { crate::expr::CmpOp::Eq } else { crate::expr::CmpOp::Ne },
             left: crate::checked::NativeNatExpr::Constant(0),
             right: crate::checked::NativeNatExpr::Constant(0),
         }
@@ -3765,7 +3765,7 @@ mod tests {
         assert_eq!(names, ["quantized", "rows", "result_0_quantized", "result_0_rows", "result_0_arrivals"]);
         let norm = Some(NativeOperandNorm { weight: 1, epsilon: 3 });
         let bound = crate::checked::NativeCondition::Compare {
-            comparison: crate::checked::NativeComparison::Gt,
+            comparison: crate::expr::CmpOp::Gt,
             left: NativeNatExpr::Dimension("K".to_owned()),
             right: NativeNatExpr::Constant(0),
         };

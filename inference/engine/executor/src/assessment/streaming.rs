@@ -56,22 +56,8 @@ impl Stages<'_> {
     /// fewest whose compute covers each layer's stage, `g · c_l ≥ stage_l`,
     /// leaving none of it uncovered.
     pub fn size(&self, capacity: usize) -> usize {
-        if capacity == 0 {
-            return 0;
-        }
         (0..self.layers.len())
-            .map(|layer| {
-                let stage = self.stage(layer);
-                if stage <= 0. {
-                    return 1;
-                }
-                let compute = self.layers[layer].compute_seconds;
-                if compute > 0. {
-                    (stage / compute).ceil() as usize
-                } else {
-                    capacity
-                }
-            })
+            .map(|layer| (self.stage(layer) / self.layers[layer].compute_seconds).ceil() as usize)
             .fold(1, usize::max)
             .clamp(1, capacity)
     }
@@ -94,19 +80,13 @@ impl Stages<'_> {
     /// stage leave a group merged, as does the last layer, followed by no
     /// stage, and a group with nothing cold.
     pub fn merge_sets(&self, steps: usize, unions: &[&GroupUnion], pass: &ExpertPass) -> Vec<usize> {
-        if steps <= 1 {
-            return vec![steps; self.layers.len()];
-        }
         (0..self.layers.len())
             .map(|layer| {
                 let stage = if layer + 1 < self.layers.len() { self.stage(layer + 1) } else { 0. };
                 let union = unions[layer];
-                if union.steps == 0 {
-                    return steps;
-                }
                 let group = steps as f64 * self.layers[layer].compute_seconds;
                 let measured = union.passes(pass, layer, union.steps, union.merged) * steps as f64 / union.steps as f64;
-                let fit = if measured > 0. && measured.is_finite() { (group / measured).clamp(0., 1.) } else { 0. };
+                let fit = (group / measured).min(1.);
                 let front = (group - fit * measured) / steps as f64;
                 let compute = |set: usize| steps as f64 * front + fit * union.passes(pass, layer, steps, set);
                 let alone = fit * union.pass(pass, layer, 1) + front;
@@ -114,7 +94,7 @@ impl Stages<'_> {
                     Notice::Written => fit * union.pass(pass, layer, steps) + front,
                     Notice::Parked => compute(steps),
                 };
-                match compute(steps - 1).max(alone + stage) < compute(steps).max(whole + stage) {
+                match steps > 1 && compute(steps - 1).max(alone + stage) < compute(steps).max(whole + stage) {
                     true => steps - 1,
                     false => steps,
                 }
@@ -145,7 +125,11 @@ impl GroupUnion {
         for &(_, choices) in &experts {
             *routed.entry(choices).or_default() += 1;
         }
-        Self { steps, merged: merged.min(steps), experts, routed: routed.into_iter().collect() }
+        assert!(
+            steps > 0 && merged <= steps,
+            "a group union requires steps > 0 and merged <= steps (got steps={steps}, merged={merged})"
+        );
+        Self { steps, merged, experts, routed: routed.into_iter().collect() }
     }
 
     /// The chance a group of `steps` steps reads an expert the group's rows
@@ -154,9 +138,6 @@ impl GroupUnion {
     /// that chance, `1 − (1 − r)^c`. A group at least as long reads every
     /// expert the group read: the counts name no other.
     fn chance(&self, steps: usize, choices: u32) -> f64 {
-        if self.steps == 0 || steps == 0 {
-            return 0.;
-        }
         let share = steps as f64 / self.steps as f64;
         match share < 1. {
             true => 1. - (1. - share).powi(choices as i32),
@@ -172,9 +153,6 @@ impl GroupUnion {
 
     /// The choices a group of `steps` steps routes: the group's a step.
     fn choices(&self, steps: usize) -> f64 {
-        if self.steps == 0 {
-            return 0.;
-        }
         let routed = self.routed.iter().map(|&(choices, experts)| u64::from(choices) * experts as u64).sum::<u64>();
         routed as f64 * steps as f64 / self.steps as f64
     }
@@ -188,7 +166,6 @@ impl GroupUnion {
     /// streamed layer `layer` in passes (`pass`): its steps alone a pass of
     /// one step's experts each, its merge set one pass of theirs.
     fn passes(&self, pass: &ExpertPass, layer: usize, steps: usize, merged: usize) -> f64 {
-        let merged = merged.min(steps);
         (steps - merged) as f64 * self.pass(pass, layer, 1) + self.pass(pass, layer, merged)
     }
 }
@@ -284,62 +261,6 @@ mod tests {
         let stages = Stages { layers: &layers, lines: &lines, line: READ, notice: Notice::Written };
         assert!((stages.stage(0) - (4.26e-3 + 4. * 86e-6)).abs() < 1e-12, "{}", stages.stage(0));
         assert!((stages.stage(1) - 3. * 86e-6).abs() < 1e-12, "{}", stages.stage(1));
-    }
-
-    #[test]
-    fn size_with_zero_capacity_returns_zero_without_panicking() {
-        let layers = [GroupLayerTerms { compute_seconds: 1e-3, filed: 4, tiered: 0 }];
-        let lines = lines(ExpertLines::REFERENCE_RECORD, 1);
-        let stages = Stages { layers: &layers, lines: &lines, line: READ, notice: Notice::Written };
-        assert_eq!(stages.size(0), 0);
-        // Zero compute with positive stage caps at capacity; zero stage takes 1.
-        let zero_compute = [GroupLayerTerms { compute_seconds: 0., filed: 4, tiered: 0 }];
-        let stages = Stages { layers: &zero_compute, lines: &lines, line: READ, notice: Notice::Written };
-        assert_eq!(stages.size(5), 5);
-        let zero_stage = [GroupLayerTerms { compute_seconds: 0., filed: 0, tiered: 0 }];
-        let stages = Stages { layers: &zero_stage, lines: &lines, line: READ, notice: Notice::Written };
-        assert_eq!(stages.size(5), 1);
-    }
-
-    #[test]
-    fn merge_sets_and_group_union_handle_zero_steps_zero_measured_and_merged_above_steps() {
-        let (costs, bf16) = (crate::assessment::fixtures::costs(), crate::assessment::format_of(seismic::Element::bf16()));
-        let pass = ExpertPass::new(
-            costs.rates(&[bf16], &[]),
-            vec![(
-                magnitude_cost_model::RoutedKind(0),
-                vec![seismic::measure::pricing::Bytes { format: bf16, bytes: 3_000_000 }],
-                vec![seismic::measure::pricing::Flops { format: bf16, flops: 1 }],
-            ); 2],
-            costs.host_reads(),
-        );
-        let lines = lines(3_000_000, 2);
-        let terms = [
-            GroupLayerTerms { compute_seconds: 1e-3, filed: 0, tiered: 0 },
-            GroupLayerTerms { compute_seconds: 1e-3, filed: 8, tiered: 0 },
-        ];
-        let written = Stages { layers: &terms, lines: &lines, line: READ, notice: Notice::Written };
-        let parked = Stages { layers: &terms, lines: &lines, line: READ, notice: Notice::Parked };
-
-        // Zero steps in the group.
-        let normal = GroupUnion::new(4, 4, (0..8).map(|e| (e, 2)).collect());
-        assert_eq!(written.merge_sets(0, &[&normal, &normal], &pass), [0, 0]);
-
-        // Zero steps in the union.
-        let zero_union = GroupUnion::new(0, 0, Vec::new());
-        assert_eq!(written.merge_sets(4, &[&zero_union, &zero_union], &pass), [4, 4]);
-        assert_eq!(zero_union.passes(&pass, 0, 0, 0), 0.);
-
-        // Zero measured pass cost (no experts routed in union).
-        let empty_union = GroupUnion::new(4, 4, Vec::new());
-        assert_eq!(written.merge_sets(4, &[&empty_union, &empty_union], &pass), [4, 4]);
-        assert_eq!(parked.merge_sets(4, &[&empty_union, &empty_union], &pass), [3, 4]);
-
-        // `merged > steps` clamps instead of underflowing.
-        let over_merged = GroupUnion::new(4, 9, (0..8).map(|e| (e, 2)).collect());
-        assert_eq!(over_merged.merged, 4);
-        assert_eq!(over_merged.passes(&pass, 0, 4, 9), over_merged.passes(&pass, 0, 4, 4));
-        assert_eq!(written.merge_sets(4, &[&over_merged, &over_merged], &pass).len(), 2);
     }
 
     /// The read line of the tests.

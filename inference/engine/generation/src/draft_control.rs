@@ -801,15 +801,38 @@ impl RoundChoice {
     }
 }
 
+/// Per-depth acceptance estimate, confidence calibration, and whether a block
+/// scored this depth in the current round.
+#[derive(Clone, Debug)]
+struct DepthSlot {
+    means: DepthMeans,
+    calibration: Calibration,
+    scored: bool,
+}
+
+/// State of a deferred switch from plain decoding to drafting (see [`Switch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwitchStage {
+    /// No switch is in flight.
+    Ready,
+    /// Chosen by this round, which drafts nothing and whose queued decode
+    /// publishes its feature: the next round prepares, as that decode.
+    QueuedBehind(RoundChoice),
+    /// This round is preparing to draft: its target step publishes its feature
+    /// for the next round's draft.
+    Preparing(RoundChoice),
+    /// The preparing round ended; the next round drafts this choice if anchored
+    /// and within its limit.
+    Prepared(RoundChoice),
+}
+
 /// One request's draft width controller.
 #[derive(Clone, Debug)]
 pub struct DraftController {
     /// Candidate widths, increasing, without 0.
     ladder: Vec<usize>,
     load: Arc<DraftLoad>,
-    depths: Vec<DepthMeans>,
-    calibration: Vec<Calibration>,
-    scored: Vec<bool>,
+    depths: Vec<DepthSlot>,
     blocks: Vec<Block>,
     /// Rounds in a row whose verified proposals were all accepted, and the
     /// run of them that earns a look. A look that finds its block right
@@ -838,22 +861,7 @@ pub struct DraftController {
     context_class: usize,
     sequences: usize,
     choice: RoundChoice,
-    /// This round prepares to draft (see [`Switch`]): it publishes its
-    /// feature, and the next round drafts what `deferred` holds.
-    preparing: bool,
-    deferred: Option<Deferred>,
-}
-
-/// A choice to draft taken by a round whose drafter lacked its anchor's
-/// feature (see [`Switch`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Deferred {
-    /// Chosen by this round, which drafts nothing and whose queued decode
-    /// publishes its feature: the next round prepares, as that decode.
-    Behind(RoundChoice),
-    /// Prepared by this round, which publishes its feature: the next round
-    /// drafts it.
-    Prepared(RoundChoice),
+    switch: SwitchStage,
 }
 
 impl DraftController {
@@ -863,7 +871,7 @@ impl DraftController {
     pub fn new(widest: usize, load: Arc<DraftLoad>) -> Self {
         let seed = load.depths.lock().expect("draft load acceptance").clone();
         let look_run = load.look_run.lock().expect("draft load looks").unwrap_or(1);
-        let depths = seed
+        let means = seed
             .filter(|depths| depths.len() == widest)
             .unwrap_or_else(|| vec![DepthMeans::UNSCORED; widest]);
         let calibration = load
@@ -873,12 +881,19 @@ impl DraftController {
             .clone()
             .filter(|calibration| calibration.len() == widest)
             .unwrap_or_else(|| vec![Calibration::EMPTY; widest]);
+        let depths = means
+            .into_iter()
+            .zip(calibration)
+            .map(|(means, calibration)| DepthSlot {
+                means,
+                calibration,
+                scored: false,
+            })
+            .collect();
         Self {
             ladder: draft_ladder(widest),
             load,
             depths,
-            calibration,
-            scored: vec![false; widest],
             blocks: Vec::new(),
             accepted_run: 0,
             look_run,
@@ -894,8 +909,7 @@ impl DraftController {
             context_class: 1,
             sequences: 1,
             choice: RoundChoice::default(),
-            preparing: false,
-            deferred: None,
+            switch: SwitchStage::Ready,
         }
     }
 
@@ -906,13 +920,13 @@ impl DraftController {
     /// Whether this round prepares to draft: its target step publishes its
     /// feature for the next round's draft (see [`Switch`]).
     pub fn preparing(&self) -> bool {
-        self.preparing
+        matches!(self.switch, SwitchStage::Preparing(_))
     }
 
     /// Whether the decode queued behind this round, which drafts nothing,
     /// publishes its feature: the next round prepares (see [`Switch`]).
     pub fn publishes_behind(&self) -> bool {
-        matches!(self.deferred, Some(Deferred::Behind(_)))
+        matches!(self.switch, SwitchStage::QueuedBehind(_))
     }
 
     /// How often a block is expected to be right through each depth, from
@@ -923,8 +937,8 @@ impl DraftController {
         let mut bound = 1.0f64;
         self.depths
             .iter()
-            .map(|depth| {
-                bound = bound.min(depth.estimate());
+            .map(|slot| {
+                bound = bound.min(slot.means.estimate());
                 bound
             })
             .collect()
@@ -942,7 +956,7 @@ impl DraftController {
     /// estimate, which every drafting round depends on.
     fn costs(&self) -> RoundCosts<'_> {
         RoundCosts::of(&self.load, self.context_class, self.sequences, self.chosen)
-            .sharing_switches(self.depths.first().map_or(MEMORY, DepthMeans::weight))
+            .sharing_switches(self.depths.first().map_or(MEMORY, |slot| slot.means.weight()))
     }
 
     /// This round's drafted block, while it awaits verification.
@@ -1001,13 +1015,11 @@ impl DraftController {
         // Entries before a round chooses are no round's: the prompt's, or
         // pairs held past their bound by rounds that drafted nothing.
         self.entered = Some(0.0);
-        self.preparing = false;
-        match self.deferred.take() {
+        match std::mem::replace(&mut self.switch, SwitchStage::Ready) {
             // The round after the choice prepares: it is the decode queued
             // publishing its feature, and drafts nothing.
-            Some(Deferred::Behind(choice)) if !anchored => {
-                self.preparing = true;
-                self.deferred = Some(Deferred::Prepared(choice));
+            SwitchStage::QueuedBehind(choice) if !anchored => {
+                self.switch = SwitchStage::Preparing(choice);
                 self.choice = RoundChoice { generated: 0, verified: 0, look: choice.look };
                 self.timing_draft = None;
                 self.timing_target = true;
@@ -1015,7 +1027,9 @@ impl DraftController {
             }
             // The round after the one that prepared drafts the choice, where
             // the request still has room for it.
-            Some(Deferred::Prepared(choice)) if anchored && choice.generated <= limit => {
+            SwitchStage::Preparing(choice) | SwitchStage::Prepared(choice)
+                if anchored && choice.generated <= limit =>
+            {
                 self.chosen = Some(true);
                 self.choice = choice;
                 self.timing_draft = Some(choice.generated);
@@ -1025,7 +1039,7 @@ impl DraftController {
             _ => {}
         }
         let costs = RoundCosts::of(&self.load, self.context_class, self.sequences, self.chosen)
-            .sharing_switches(self.depths.first().map_or(MEMORY, DepthMeans::weight));
+            .sharing_switches(self.depths.first().map_or(MEMORY, |slot| slot.means.weight()));
         let right = self.right();
         // The fastest pair. Of equal rates the narrowest.
         let mut fastest = (0, 0, f64::NEG_INFINITY);
@@ -1179,7 +1193,9 @@ impl DraftController {
         // Without its anchor's feature the round drafts nothing; the decode
         // queued behind it prepares, and the round after drafts this choice.
         let generated = if anchored { generated } else { 0 };
-        self.deferred = (choice.generated > generated).then_some(Deferred::Behind(choice));
+        if choice.generated > generated {
+            self.switch = SwitchStage::QueuedBehind(choice);
+        }
         self.choice = RoundChoice { generated, ..choice };
         self.timing_draft = (generated > 0).then_some(generated);
         self.timing_target = generated == 0;
@@ -1222,11 +1238,11 @@ impl DraftController {
         right[..drafted]
             .iter()
             .zip(confidence)
-            .zip(&self.calibration)
-            .map(|((right, confidence), calibration)| {
+            .zip(&self.depths)
+            .map(|((right, confidence), slot)| {
                 let after = if before > 0.0 { right / before } else { 0.0 };
                 before = *right;
-                survival *= (after * calibration.lift(*confidence)).min(1.0);
+                survival *= (after * slot.calibration.lift(*confidence)).min(1.0);
                 survival
             })
             .collect()
@@ -1251,15 +1267,18 @@ impl DraftController {
     }
 
     fn score(&mut self, depth: usize, right: bool) {
-        self.depths[depth - 1].score(right);
-        self.scored[depth - 1] = true;
+        let slot = &mut self.depths[depth - 1];
+        slot.means.score(right);
+        slot.scored = true;
     }
 
     /// Score every open block against the tokens just committed, which end
     /// the round: a depth no block scored in it goes unscored for a round.
     pub fn committed(&mut self, tokens: &[TokenId]) {
         // The round ended: a round that does not choose prepares nothing.
-        self.preparing = false;
+        if let SwitchStage::Preparing(choice) = self.switch {
+            self.switch = SwitchStage::Prepared(choice);
+        }
         // A round that verified proposals and committed them all extends
         // the run; any other ends it.
         if self.choice.verified > 0 && tokens.len() == self.choice.verified + 1 {
@@ -1272,7 +1291,9 @@ impl DraftController {
             blocks.retain_mut(|block| {
                 let right = block.tokens[block.matched] == *token;
                 if let Some(confidence) = &block.confidence {
-                    self.calibration[block.matched].score(confidence[block.matched], right);
+                    self.depths[block.matched]
+                        .calibration
+                        .score(confidence[block.matched], right);
                 }
                 if right {
                     block.matched += 1;
@@ -1293,14 +1314,19 @@ impl DraftController {
             });
         }
         self.blocks = blocks;
-        for (depth, scored) in self.depths.iter_mut().zip(&mut self.scored) {
-            if !std::mem::take(scored) {
-                depth.unscored();
+        for slot in &mut self.depths {
+            if !std::mem::take(&mut slot.scored) {
+                slot.means.unscored();
             }
         }
-        *self.load.depths.lock().expect("draft load acceptance") = Some(self.depths.clone());
-        *self.load.calibration.lock().expect("draft load calibration") =
-            Some(self.calibration.clone());
+        *self.load.depths.lock().expect("draft load acceptance") =
+            Some(self.depths.iter().map(|slot| slot.means.clone()).collect());
+        *self.load.calibration.lock().expect("draft load calibration") = Some(
+            self.depths
+                .iter()
+                .map(|slot| slot.calibration.clone())
+                .collect(),
+        );
         *self.load.look_run.lock().expect("draft load looks") = Some(self.look_run);
     }
 
@@ -1350,7 +1376,7 @@ impl DraftController {
             return;
         };
         self.sequences = sequences.max(1);
-        let drafting = self.choice.drafting(self.preparing);
+        let drafting = self.choice.drafting(self.preparing());
         let generated_for_steady = if self.drafter.is_some() {
             self.choice.generated
         } else {
@@ -1424,7 +1450,7 @@ impl DraftController {
                 .switch_mut(switch)
                 .record(round, (took + drafter_took - steady).max(0.0), covering);
         }
-        if self.preparing {
+        if self.preparing() {
             prune_costs(&mut measured, key);
             return;
         }

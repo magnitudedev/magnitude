@@ -125,14 +125,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // A verify pass verifies its round whatever rows its chain left it:
         // no decode queues behind it (`queue::continuations`).
         let verifying = operations.iter().filter(|operation| self.verify_pass(operation)).map(Operation::request).collect::<Vec<_>>();
-        self.verifying.extend(verifying);
+        for request in verifying {
+            self.resident_mut(request)
+                .expect("invariant violated: a verifying target operation's request is not resident")
+                .verifying = true;
+        }
         let queued = self.queue_successor(&mut work, front, operations);
         // This launch was the round's verification: the next round's
         // drafter, if it proposes, marks its request again, as the next
         // round's method does a request whose round after prepares.
         for operation in operations {
-            self.verifying.remove(&operation.request());
-            self.publishing.remove(&operation.request());
+            let resident = self
+                .resident_mut(operation.request())
+                .expect("invariant violated: a target operation's request is not resident");
+            resident.verifying = false;
+            resident.publishing = false;
         }
         queued.map_err(SubmitFailure::Failed)?;
         Ok(TargetFlight { work, bindings })
@@ -144,10 +151,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// preparing round is that queued decode, discarding nothing
     /// (`queue::continuations`). Set before each round's launch.
     pub fn publish_behind(&mut self, request: RequestId, publishes: bool) {
-        match publishes {
-            true => self.publishing.insert(request),
-            false => self.publishing.remove(&request),
-        };
+        self.resident_mut(request)
+            .expect("invariant violated: publish_behind called on a non-resident request")
+            .publishing = publishes;
     }
 
     /// Launch the group's target step as the first of a chain: alone, or with
@@ -167,12 +173,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // drafter entry's.
         let abort = |domain: &mut Self, priming: Option<PrimingReservation>, front: Option<HeldFront>| {
             if let Some(front) = front {
-                front.release(&mut domain.head);
+                front.release(&mut domain.requests);
             }
             if let (Some(priming), [operation]) = (priming, operations) {
-                domain
-                    .head
-                    .insert(operation.request(), priming.advance.abort());
+                domain.put_head_state(operation.request(), priming.advance.abort());
             }
         };
         let (first, requests, spare) = match self.build_target_launch(operations, reservation) {
@@ -281,9 +285,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             panic!("invariant violated: a drafter entry was reserved for a group of other than one chunk");
         };
         let previous = self
-            .input
-            .get(&chunk.request())
-            .and_then(|input| input.boundary.clone());
+            .resident(chunk.request())
+            .and_then(|resident| resident.boundary.clone());
         self.launch_priming(
             work,
             chunk,
@@ -909,7 +912,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         for ((request, ..), failure) in flight.requests.iter().zip(failures) {
             if let Some(error) = failure {
-                self.poisoned.entry(*request).or_insert(error);
+                self.requests
+                    .get_mut(request)
+                    .expect("invariant violated: a finished target flight's request has no entry")
+                    .poisoned
+                    .get_or_insert(error);
             }
         }
         let upload = batch.upload();
@@ -1112,7 +1119,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             // any step's outcome is: its chain concludes with the chunks
             // reconciled before it, its holder's state again, and its head
             // advances return with it (`ExecutorDomain::abort`).
-            let outcome = match (self.poisoned.get(&request), &interrupted) {
+            let poisoned = self.requests.get(&request).and_then(|entry| entry.poisoned.as_ref());
+            let outcome = match (poisoned, &interrupted) {
                 (Some(error), _) => Outcome::WeightReadFailed(error.clone()),
                 (None, None) => Outcome::Forward { rows: result, guesses },
                 (None, Some(reason)) => Outcome::Interrupted { reason: reason.clone() },
@@ -1227,7 +1235,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) -> Result<(RequestId, StateBindings), DomainError> {
         let request = flight.work.request;
         if let Some((_, advance)) = self.finish_priming_work(flight.work)? {
-            assert!(!self.head.contains_key(&request), "invariant violated: a deferred drafter entry's state has another owner");
+            assert!(self.head_state(request).is_none(), "invariant violated: a deferred drafter entry's state has another owner");
             // The entry commits with its chunk: in the request's accepted
             // state, or in the chain under way that holds it.
             let accepted = self.target_end(request) == Some(flight.target_end);
@@ -1236,14 +1244,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let (OwnedAdvanceResolution::Aborted(state)
                 | OwnedAdvanceResolution::Committed(state)) =
                     advance.commit(rows).map_err(|(state, error)| {
-                        self.head.insert(request, state);
+                        self.put_head_state(request, state);
                         DomainError::from(error)
                     })?;
                 state
             } else {
                 advance.abort()
             };
-            self.head.insert(request, state);
+            self.put_head_state(request, state);
         }
         Ok((request, flight.bindings))
     }
@@ -1262,7 +1270,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         for ((request, _, _, _, _), advance) in metadata.into_iter().zip(advances) {
             match advance {
                 TentativeAdvance::Accepted(advance) => {
-                    self.target.insert(request, advance.abort());
+                    self.put_target_state(request, advance.abort());
                 }
                 // A successor's or chained chunk's source state stays with
                 // its predecessor; dropping it releases its rows and bank.

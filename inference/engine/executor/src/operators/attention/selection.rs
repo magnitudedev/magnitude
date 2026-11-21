@@ -18,7 +18,7 @@
 //! none for the latent, the producer's for rate-1 tokens), published in the activation element, from which
 //! the indexer entries compute in F32.
 
-use super::graph::{AttentionOperands, query_projection_dimensions};
+use super::graph::{query_operand_dimensions, query_projection_dimensions};
 use crate::operators::scalar;
 use super::split::{IndexedReals, IndexedSource, both};
 use crate::CandidatePool;
@@ -279,7 +279,7 @@ fn project<'a, G: GraphDraft + 'a>(
             G::pick(entry, rows),
             &[
                 query_projection_dimensions(rows.clone(), input.width.clone(), out).as_slice(),
-                AttentionOperands::query_dimensions(operands).as_slice(),
+                query_operand_dimensions(operands).as_slice(),
                 &input.form.dimensions(input.width.clone()),
             ]
             .concat(),

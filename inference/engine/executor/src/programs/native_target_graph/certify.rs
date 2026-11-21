@@ -1416,6 +1416,15 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
         untapped_launch_ids: &FxHashMap<usize, usize>,
         chain: Passes,
     ) -> Result<Passes, GraphError> {
+        // A banked load's pass is chosen by `execution_plan` (`settle_bank` /
+        // `place_whole`) over `pass_ladder`, which prices the full workspace
+        // arena and pass buffers of each pass size against `room` and
+        // `BankPrices`. Clamping it to the non-pass launch arena here would
+        // silently override that owner and collapse streamed MoE passes to 1
+        // launch whenever `OnceStage::Pass` exceeds the non-pass arena.
+        if chain.launches <= 1 || ctx.load.expert_bank().is_some() {
+            return Ok(chain);
+        }
         let arena = block_launch_ids
             .values()
             .chain(untapped_launch_ids.values())
@@ -1429,9 +1438,6 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             )
             .max()
             .expect("a target family has entry graphs");
-        if chain.launches <= 1 {
-            return Ok(chain);
-        }
         let mut routed_blocks: Vec<usize> = Vec::new();
         let mut routed_once_meta: FxHashMap<usize, (OnceGraphShape, bool)> = fx_map();
         for &index in distinct_blocks {

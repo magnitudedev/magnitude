@@ -2293,22 +2293,11 @@ fn physical_cast_expr(from: &ValueType, to: &ValueType, a: &str) -> String {
     }
 }
 
-fn cmp_symbol(op: CmpOp) -> &'static str {
-    match op {
-        CmpOp::Eq => "==",
-        CmpOp::Ne => "!=",
-        CmpOp::Lt => "<",
-        CmpOp::Le => "<=",
-        CmpOp::Gt => ">",
-        CmpOp::Ge => ">=",
-    }
-}
-
 fn compare_expr(op: CmpOp, ty: &ValueType, a: &str, b: &str) -> String {
     format!(
         "({} {} {})",
         numeric_operand(ty, a),
-        cmp_symbol(op),
+        op.as_str(),
         numeric_operand(ty, b)
     )
 }

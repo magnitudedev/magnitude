@@ -11,9 +11,9 @@
 use crate::BuildError;
 use seismic_lang::checked::{
     CheckedModule, ElementDomain, ElementQuery, ElementSummary, ElementTarget, ElementTerm,
-    ElementUses, Encoded, EntryInfo, NativeComparison, NativeCondition, NativeDefault,
-    NativeImplementation, NativeNatExpr, NativeOperand, NativeParameter, NativeScratch,
-    ParameterSummaryKind, ResultSummaryKind,
+    ElementUses, Encoded, EntryInfo, NativeCondition, NativeDefault, NativeImplementation,
+    NativeNatExpr, NativeOperand, NativeParameter, NativeScratch, ParameterSummaryKind,
+    ResultSummaryKind,
 };
 use seismic_lang::entry::{AliasRule, ElementBindings, ParameterKind, ResultKind, TensorAccess};
 use seismic_lang::expr::{AnyExpr, BinaryOp, BoolExpr, CmpOp, ExprArena, NaryOp, NatExpr, NodeView, SymbolId, UnaryOp};
@@ -847,15 +847,7 @@ fn lower_schema_any_bool(
         NodeView::Cmp { op, lhs, rhs } => {
             let l = lower_schema_any_nat(arena, lhs, sym_to_dim, used_dims.as_deref_mut());
             let r = lower_schema_any_nat(arena, rhs, sym_to_dim, used_dims);
-            let cmp = match op {
-                CmpOp::Eq => "==",
-                CmpOp::Ne => "!=",
-                CmpOp::Lt => "<",
-                CmpOp::Le => "<=",
-                CmpOp::Gt => ">",
-                CmpOp::Ge => ">=",
-            };
-            format!("(({l}) {cmp} ({r}))")
+            format!("(({l}) {} ({r}))", op.as_str())
         }
         other => panic!("unsupported boolean NodeView {other:?} in tensor axis expression"),
     }
@@ -1330,15 +1322,7 @@ impl<'a> ExprCtx<'a> {
             } => {
                 let l = self.lower_nat(left);
                 let r = self.lower_nat(right);
-                let op = match comparison {
-                    NativeComparison::Lt => "<",
-                    NativeComparison::Le => "<=",
-                    NativeComparison::Gt => ">",
-                    NativeComparison::Ge => ">=",
-                    NativeComparison::Eq => "==",
-                    NativeComparison::Ne => "!=",
-                };
-                format!("(({l}) {op} ({r}))")
+                format!("(({l}) {} ({r}))", comparison.as_str())
             }
             NativeCondition::And(l, r) => {
                 format!("(({}) && ({}))", self.lower_cond(l), self.lower_cond(r))
@@ -1947,15 +1931,15 @@ fn native_cond_is_non_decreasing_in(cond: &NativeCondition, dim: &str) -> bool {
                 return true;
             }
             match comparison {
-                NativeComparison::Gt | NativeComparison::Ge => {
+                CmpOp::Gt | CmpOp::Ge => {
                     native_nat_is_non_decreasing_in(left, dim)
                         && !native_nat_mentions_dim(right, dim)
                 }
-                NativeComparison::Lt | NativeComparison::Le => {
+                CmpOp::Lt | CmpOp::Le => {
                     !native_nat_mentions_dim(left, dim)
                         && native_nat_is_non_decreasing_in(right, dim)
                 }
-                NativeComparison::Eq | NativeComparison::Ne => false,
+                CmpOp::Eq | CmpOp::Ne => false,
             }
         }
     }
@@ -3970,9 +3954,9 @@ fn render_contract_launch_mask_helpers(
 mod tests {
     use super::*;
     use seismic_lang::checked::{
-        check_source, NativeComparison, NativeCondition, NativeDefault, NativeImplementation,
-        NativeNatExpr, NativeParameter, NativeParameterRole, NativeScratch, NativeSpecialization,
-        SourceFile, SourceSet,
+        check_source, NativeCondition, NativeDefault, NativeImplementation, NativeNatExpr,
+        NativeParameter, NativeParameterRole, NativeScratch, NativeSpecialization, SourceFile,
+        SourceSet,
     };
 
     fn param(name: &str, values: Vec<u64>) -> NativeParameter {
@@ -3988,7 +3972,7 @@ mod tests {
         }
     }
 
-    fn cmp(comparison: NativeComparison, left: NativeNatExpr, right: NativeNatExpr) -> NativeCondition {
+    fn cmp(comparison: CmpOp, left: NativeNatExpr, right: NativeNatExpr) -> NativeCondition {
         NativeCondition::Compare {
             comparison,
             left,
@@ -4027,17 +4011,17 @@ mod tests {
         // Satisfiable for OUT = 1 (A=2, B=4, C=2, D=4); unsatisfiable for OUT = 0 (C+D==99).
         let constraint = and(
             and(
-                or(cmp(NativeComparison::Eq, p("OUT"), c(0)), cmp(NativeComparison::Eq, p("A"), c(2))),
-                or(cmp(NativeComparison::Eq, p("OUT"), c(0)), cmp(NativeComparison::Eq, p("B"), c(4))),
+                or(cmp(CmpOp::Eq, p("OUT"), c(0)), cmp(CmpOp::Eq, p("A"), c(2))),
+                or(cmp(CmpOp::Eq, p("OUT"), c(0)), cmp(CmpOp::Eq, p("B"), c(4))),
             ),
             or(
                 and(
-                    cmp(NativeComparison::Eq, p("OUT"), c(1)),
-                    cmp(NativeComparison::Eq, add(p("C"), p("D")), c(6)),
+                    cmp(CmpOp::Eq, p("OUT"), c(1)),
+                    cmp(CmpOp::Eq, add(p("C"), p("D")), c(6)),
                 ),
                 and(
-                    cmp(NativeComparison::Eq, p("OUT"), c(0)),
-                    cmp(NativeComparison::Eq, add(p("C"), p("D")), c(99)),
+                    cmp(CmpOp::Eq, p("OUT"), c(0)),
+                    cmp(CmpOp::Eq, add(p("C"), p("D")), c(99)),
                 ),
             ),
         );

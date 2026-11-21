@@ -132,21 +132,50 @@ pub enum PublishError {
     ReceiverClosed,
 }
 
+enum ChannelState {
+    Open { receiver_waker: Option<Waker> },
+    SenderClosed(Publication),
+    ReceiverClosed,
+}
+
+enum RetirementState {
+    Active(Option<Waker>),
+    Retired,
+}
+
 struct State {
     data: VecDeque<Vec<OutputToken>>,
-    terminal: Option<Publication>,
     capacity: usize,
     reserved: usize,
     reservation_waiting: bool,
     credit: Option<u64>,
     next_credit_epoch: u64,
-    receiver_open: bool,
-    sender_open: bool,
-    receiver_waker: Option<Waker>,
-    retired: bool,
-    retirement_waker: Option<Waker>,
+    channel: ChannelState,
+    retirement: RetirementState,
     /// The request became resident: it began, before anything it publishes.
     began: bool,
+}
+
+impl State {
+    fn has_capacity(&self) -> bool {
+        matches!(self.channel, ChannelState::Open { .. })
+            && self.data.len().saturating_add(self.reserved) < self.capacity
+    }
+
+    fn try_issue_credit(&mut self) -> Option<u64> {
+        if matches!(self.channel, ChannelState::Open { .. }) && self.credit.is_none() {
+            self.reservation_waiting = false;
+            let epoch = self
+                .next_credit_epoch
+                .checked_add(1)
+                .expect("publication credit epoch exhausted");
+            self.next_credit_epoch = epoch;
+            self.credit = Some(epoch);
+            Some(epoch)
+        } else {
+            None
+        }
+    }
 }
 
 struct Shared {
@@ -176,17 +205,15 @@ impl PublicationQueue {
             id,
             state: Mutex::new(State {
                 data: VecDeque::with_capacity(capacity),
-                terminal: None,
                 capacity,
                 reserved: 0,
                 reservation_waiting: false,
                 credit: None,
                 next_credit_epoch: 0,
-                receiver_open: true,
-                sender_open: true,
-                receiver_waker: None,
-                retired: false,
-                retirement_waker: None,
+                channel: ChannelState::Open {
+                    receiver_waker: None,
+                },
+                retirement: RetirementState::Active(None),
                 began: false,
             }),
             wake_worker: Box::new(wake_worker),
@@ -194,7 +221,6 @@ impl PublicationQueue {
         Ok((
             PublicationSender {
                 shared: Arc::clone(&shared),
-                terminal_recorded: false,
             },
             PublicationReceiver {
                 shared,
@@ -206,50 +232,38 @@ impl PublicationQueue {
 
 pub struct PublicationSender {
     shared: Arc<Shared>,
-    terminal_recorded: bool,
 }
 
 /// One non-cloneable claim on a request's bounded output ring. Dropping an
 /// unused permit returns the slot; consuming it makes publication infallible
 /// with respect to queue capacity.
 pub struct PublicationPermit {
-    shared: Arc<Shared>,
-    active: bool,
+    shared: Option<Arc<Shared>>,
 }
 
 impl Drop for PublicationPermit {
     fn drop(&mut self) {
-        if self.active {
-            let wake = {
-                let mut state = self.shared.state.lock().unwrap();
-                state.reserved = state
-                    .reserved
-                    .checked_sub(1)
-                    .expect("publication permit underflow");
-                if state.reservation_waiting
-                    && state.sender_open
-                    && state.receiver_open
-                    && state.credit.is_none()
-                {
-                    state.reservation_waiting = false;
-                    let epoch = state
-                        .next_credit_epoch
-                        .checked_add(1)
-                        .expect("publication credit epoch exhausted");
-                    state.next_credit_epoch = epoch;
-                    state.credit = Some(epoch);
-                    Some(epoch)
-                } else {
-                    None
-                }
-            };
-            if let Some(credit_epoch) = wake {
-                (self.shared.wake_worker)(PublicationWake {
-                    kind: PublicationWakeKind::OutputCredit,
-                    queue_id: self.shared.id,
-                    credit_epoch,
-                });
+        let Some(shared) = self.shared.take() else {
+            return;
+        };
+        let wake = {
+            let mut state = shared.state.lock().unwrap();
+            state.reserved = state
+                .reserved
+                .checked_sub(1)
+                .expect("publication permit underflow");
+            if state.reservation_waiting {
+                state.try_issue_credit()
+            } else {
+                None
             }
+        };
+        if let Some(credit_epoch) = wake {
+            (shared.wake_worker)(PublicationWake {
+                kind: PublicationWakeKind::OutputCredit,
+                queue_id: shared.id,
+                credit_epoch,
+            });
         }
     }
 }
@@ -261,9 +275,12 @@ impl PublicationSender {
     pub fn began(&self) {
         let receiver_waker = {
             let mut state = self.shared.state.lock().unwrap();
-            match std::mem::replace(&mut state.began, true) {
-                true => None,
-                false => state.receiver_waker.take(),
+            if std::mem::replace(&mut state.began, true) {
+                None
+            } else if let ChannelState::Open { receiver_waker } = &mut state.channel {
+                receiver_waker.take()
+            } else {
+                None
             }
         };
         if let Some(waker) = receiver_waker {
@@ -280,7 +297,7 @@ impl PublicationSender {
             return Ok(Vec::new());
         }
         let mut state = self.shared.state.lock().unwrap();
-        if !state.receiver_open || state.terminal.is_some() {
+        if !matches!(state.channel, ChannelState::Open { .. }) {
             return Err(PublishError::ReceiverClosed);
         }
         if count > state.capacity {
@@ -297,8 +314,7 @@ impl PublicationSender {
         state.reserved += count;
         Ok((0..count)
             .map(|_| PublicationPermit {
-                shared: Arc::clone(&self.shared),
-                active: true,
+                shared: Some(Arc::clone(&self.shared)),
             })
             .collect())
     }
@@ -309,29 +325,29 @@ impl PublicationSender {
         mut permit: PublicationPermit,
     ) -> Result<(), (PublishError, Vec<OutputToken>)> {
         assert!(
-            Arc::ptr_eq(&self.shared, &permit.shared),
+            Arc::ptr_eq(
+                &self.shared,
+                permit.shared.as_ref().expect("publication permit active"),
+            ),
             "publication permit belongs to another queue"
         );
         let receiver_waker = {
             let mut state = self.shared.state.lock().unwrap();
-            if !state.receiver_open {
+            let state = &mut *state;
+            let ChannelState::Open { receiver_waker } = &mut state.channel else {
                 return Err((PublishError::ReceiverClosed, tokens));
-            }
-            assert!(
-                state.terminal.is_none(),
-                "output after terminal publication"
-            );
+            };
             state.reserved = state
                 .reserved
                 .checked_sub(1)
                 .expect("publication permit underflow");
-            permit.active = false;
+            permit.shared = None;
             assert!(
                 state.data.len() < state.capacity,
                 "reserved publication slot is unavailable"
             );
             state.data.push_back(tokens);
-            state.receiver_waker.take()
+            receiver_waker.take()
         };
         if let Some(waker) = receiver_waker {
             waker.wake();
@@ -346,18 +362,15 @@ impl PublicationSender {
     ) -> Result<(), (PublishError, Vec<OutputToken>)> {
         let receiver_waker = {
             let mut state = self.shared.state.lock().unwrap();
-            assert!(
-                state.terminal.is_none(),
-                "output after terminal publication"
-            );
-            if !state.receiver_open {
+            let state = &mut *state;
+            let ChannelState::Open { receiver_waker } = &mut state.channel else {
                 return Err((PublishError::ReceiverClosed, tokens));
-            }
+            };
             if state.data.len().saturating_add(state.reserved) == state.capacity {
                 return Err((PublishError::Full, tokens));
             }
             state.data.push_back(tokens);
-            state.receiver_waker.take()
+            receiver_waker.take()
         };
         if let Some(waker) = receiver_waker {
             waker.wake();
@@ -366,7 +379,7 @@ impl PublicationSender {
     }
 
     pub fn complete(
-        mut self,
+        self,
         finish: FinishReason,
         usage: DetailedUsage,
         method: String,
@@ -380,21 +393,22 @@ impl PublicationSender {
         });
     }
 
-    pub fn fail(mut self, error: RequestError) {
+    pub fn fail(self, error: RequestError) {
         self.record_terminal(Publication::Failed(error));
     }
 
-    fn record_terminal(&mut self, publication: Publication) {
+    fn record_terminal(&self, publication: Publication) {
         let receiver_waker = {
             let mut state = self.shared.state.lock().unwrap();
-            assert!(state.terminal.is_none(), "duplicate terminal publication");
-            if state.receiver_open {
-                state.terminal = Some(publication);
+            match &mut state.channel {
+                ChannelState::Open { receiver_waker } => {
+                    let waker = receiver_waker.take();
+                    state.channel = ChannelState::SenderClosed(publication);
+                    waker
+                }
+                ChannelState::SenderClosed(_) | ChannelState::ReceiverClosed => None,
             }
-            state.sender_open = false;
-            state.receiver_waker.take()
         };
-        self.terminal_recorded = true;
         if let Some(waker) = receiver_waker {
             waker.wake();
         }
@@ -412,9 +426,7 @@ impl PublicationSender {
         let mut state = self.shared.state.lock().unwrap();
         if state.credit == Some(wake.credit_epoch) {
             state.credit = None;
-            state.receiver_open
-                && state.terminal.is_none()
-                && state.data.len().saturating_add(state.reserved) < state.capacity
+            state.has_capacity()
         } else {
             false
         }
@@ -425,28 +437,25 @@ impl PublicationSender {
     pub fn process_cancelled(&self, wake: PublicationWake) -> bool {
         wake.kind == PublicationWakeKind::Cancelled
             && self.shared.id == wake.queue_id
-            && !self.shared.state.lock().unwrap().receiver_open
+            && !self.receiver_open()
     }
 
     pub fn receiver_open(&self) -> bool {
-        self.shared.state.lock().unwrap().receiver_open
+        !matches!(
+            self.shared.state.lock().unwrap().channel,
+            ChannelState::ReceiverClosed
+        )
     }
 
     /// The sole producer may schedule more output only while a receiver and
     /// data slot are available. Receiver drains can only increase this credit.
     pub fn has_capacity(&self) -> bool {
-        let state = self.shared.state.lock().unwrap();
-        state.receiver_open
-            && state.terminal.is_none()
-            && state.data.len().saturating_add(state.reserved) < state.capacity
+        self.shared.state.lock().unwrap().has_capacity()
     }
 }
 
 impl Drop for PublicationSender {
     fn drop(&mut self) {
-        if self.terminal_recorded {
-            return;
-        }
         self.record_terminal(Publication::Failed(RequestError::WorkerClosed));
     }
 }
@@ -465,9 +474,10 @@ impl Retirement {
     pub(crate) fn retire(self) {
         let wake = {
             let mut state = self.0.state.lock().unwrap();
-            assert!(!state.retired, "request retired twice");
-            state.retired = true;
-            state.retirement_waker.take()
+            match std::mem::replace(&mut state.retirement, RetirementState::Retired) {
+                RetirementState::Active(waker) => waker,
+                RetirementState::Retired => panic!("request retired twice"),
+            }
         };
         if let Some(waker) = wake {
             waker.wake();
@@ -476,11 +486,12 @@ impl Retirement {
 
     pub fn poll(&self, waker: &Waker) -> Poll<()> {
         let mut state = self.0.state.lock().unwrap();
-        if state.retired {
-            Poll::Ready(())
-        } else {
-            state.retirement_waker = Some(waker.clone());
-            Poll::Pending
+        match &mut state.retirement {
+            RetirementState::Retired => Poll::Ready(()),
+            RetirementState::Active(slot) => {
+                *slot = Some(waker.clone());
+                Poll::Pending
+            }
         }
     }
 }
@@ -506,32 +517,29 @@ impl PublicationReceiver {
             let mut state = self.shared.state.lock().unwrap();
             let was_full = state.data.len().saturating_add(state.reserved) == state.capacity;
             if let Some(tokens) = state.data.pop_front() {
-                if (was_full || state.reservation_waiting)
-                    && state.sender_open
-                    && state.credit.is_none()
-                {
-                    state.reservation_waiting = false;
-                    state.next_credit_epoch = state
-                        .next_credit_epoch
-                        .checked_add(1)
-                        .expect("publication credit epoch exhausted");
-                    let epoch = state.next_credit_epoch;
-                    state.credit = Some(epoch);
-                    (Some(Publication::Output(tokens)), Some(epoch))
+                let wake_credit = if was_full || state.reservation_waiting {
+                    state.try_issue_credit()
                 } else {
-                    (Some(Publication::Output(tokens)), None)
-                }
-            } else if let Some(terminal) = state.terminal.take() {
-                self.terminal_seen = true;
-                state.receiver_open = false;
-                (Some(terminal), None)
-            } else if !state.sender_open {
-                self.terminal_seen = true;
-                state.receiver_open = false;
-                (None, None)
+                    None
+                };
+                (Some(Publication::Output(tokens)), wake_credit)
             } else {
-                state.receiver_waker = Some(cx.waker().clone());
-                return Poll::Pending;
+                match std::mem::replace(&mut state.channel, ChannelState::ReceiverClosed) {
+                    ChannelState::Open { .. } => {
+                        state.channel = ChannelState::Open {
+                            receiver_waker: Some(cx.waker().clone()),
+                        };
+                        return Poll::Pending;
+                    }
+                    ChannelState::SenderClosed(terminal) => {
+                        self.terminal_seen = true;
+                        (Some(terminal), None)
+                    }
+                    ChannelState::ReceiverClosed => {
+                        self.terminal_seen = true;
+                        (None, None)
+                    }
+                }
             }
         };
         if let Some(credit_epoch) = wake_credit {
@@ -549,13 +557,12 @@ impl Drop for PublicationReceiver {
     fn drop(&mut self) {
         let wake_cancel = {
             let mut state = self.shared.state.lock().unwrap();
-            if !state.receiver_open {
-                false
-            } else {
-                state.receiver_open = false;
-                state.data.clear();
-                state.terminal.take();
-                true
+            match std::mem::replace(&mut state.channel, ChannelState::ReceiverClosed) {
+                ChannelState::ReceiverClosed => false,
+                ChannelState::Open { .. } | ChannelState::SenderClosed(_) => {
+                    state.data.clear();
+                    true
+                }
             }
         };
         if wake_cancel {

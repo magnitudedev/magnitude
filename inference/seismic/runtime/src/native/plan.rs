@@ -1404,12 +1404,12 @@ mod tests {
             Box::new(NativeCondition::Or(
                 Box::new(NativeCondition::Compare {
                     left: seismic_lang::checked::NativeNatExpr::Parameter("PACK".into()),
-                    comparison: seismic_lang::checked::NativeComparison::Eq,
+                    comparison: seismic_lang::checked::CmpOp::Eq,
                     right: seismic_lang::checked::NativeNatExpr::Constant(0),
                 }),
                 Box::new(NativeCondition::Compare {
                     left: seismic_lang::checked::NativeNatExpr::Parameter("TILE".into()),
-                    comparison: seismic_lang::checked::NativeComparison::Eq,
+                    comparison: seismic_lang::checked::CmpOp::Eq,
                     right: seismic_lang::checked::NativeNatExpr::Constant(128),
                 }),
             )),

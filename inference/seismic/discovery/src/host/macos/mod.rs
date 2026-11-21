@@ -34,6 +34,10 @@ pub(crate) trait Sys {
     /// `/usr/sbin/system_profiler SPHardwareDataType -json` stdout bytes;
     /// none where the binary is missing, refused, or exits non-zero.
     fn hardware_profiler_json(&self) -> Option<Vec<u8>>;
+    /// Apple Silicon IOGPU's `"In use system memory"` from IORegistry
+    /// `AGXAccelerator` → `PerformanceStatistics`, in bytes; none where
+    /// `AGXAccelerator` or the property is unavailable (Intel Mac or VM).
+    fn iogpu_in_use_memory(&self) -> Option<u64>;
 }
 
 /// The running OS's readings.
@@ -139,6 +143,10 @@ impl Sys for LiveSys {
                 output.status.success().then_some(output.stdout)
             })
             .clone()
+    }
+
+    fn iogpu_in_use_memory(&self) -> Option<u64> {
+        memory::iogpu_in_use_memory()
     }
 }
 

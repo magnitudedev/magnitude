@@ -185,59 +185,56 @@ struct ChoiceRows {
 // (`arrive::coherent_device`).
 typedef coherent(device) device Act::storage *PublishedSlots;
 
-// Channel `first` + c (c < TILE, below H) of a projection in `region`
-// (`project_channels`' layout, every lane group's sums stored) published in A
-// at row `row` of `published`, by the simdgroup that projected it. Its reads
-// follow the stores of the sums, and precede the simdgroup's next
-// projection's stores.
+// Channel `channel` of a projection published in A at row `row` of `published`.
 template <uint SLOTS>
 struct OutPublishedSlots {
     element::Out<Act> out;
     ulong s0, s1, s2;
 };
 
-template <uint TILE, uint H>
-inline void publish_slot(PublishedSlots published, uint row, uint first, threadgroup const float *region, uint lane) {
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint channel = lane; channel < TILE; channel += 32)
-        if (first + channel < H)
-            published[ulong(row) * H + first + channel] = Act::store(region[channel]);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+template <uint H>
+inline void publish_channel(PublishedSlots published, uint row, uint channel, float value) {
+    published[ulong(row) * H + channel] = Act::store(value);
 }
 
-template <uint TILE, uint H, uint SLOTS>
-inline void publish_slot(OutPublishedSlots<SLOTS> published, uint row, uint first, threadgroup const float *region,
-    uint lane) {
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+template <uint H, uint SLOTS>
+inline void publish_channel(OutPublishedSlots<SLOTS> published, uint row, uint channel, float value) {
     const ulong base = ulong(row / SLOTS) * published.s0 + ulong(row % SLOTS) * published.s1;
-    for (uint channel = lane; channel < TILE; channel += 32)
-        if (first + channel < H)
-            published.out.put(base + ulong(first + channel) * published.s2, region[channel]);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    published.out.put(base + ulong(channel) * published.s2, value);
 }
 
-template <uint TILE, uint K, uint SLOTS, uint H, typename Published, typename Project>
-inline void project_gathered(device const int *routes, ulong s0, ulong s1, device const int *sources, ulong source_rows,
-    ulong src1, ulong src2, uint m_rows, uint m, uint sg, uint first, uint lane, threadgroup float *region,
-    Published published, Project project) {
-    if (sg < K) {
-        // Each choice's place is its published row, m * SLOTS + k.
-        const Gathered chosen =
-            gather(routes, s0, s1, sources, source_rows, src1, src2, m_rows, K, m * K + sg, SLOTS, 1);
-        for (uint r = 0; r < chosen.count; ++r) {
-            project(ulong(chosen.rows[r]), chosen.products[r] - chosen.rows[r] * SLOTS, region);
-            publish_slot<TILE, H>(published, chosen.products[r], first, region, lane);
-        }
-    } else if (m == 0) {
-        for (uint row = 0; row < m_rows; ++row) {
-            project(ulong(row), K, region);
-            publish_slot<TILE, H>(published, row * SLOTS + K, first, region, lane);
-        }
-    }
+template <uint TILE, uint H, typename Published>
+inline void publish_zero(Published published, uint row, uint first, uint lane) {
+    for (uint channel = lane; channel < TILE; channel += 32)
+        if (first + channel < H)
+            publish_channel<H>(published, row, first + channel, 0.0f);
 }
+
+// Gathered rows of a [M, K, columns] A product tensor: row r lies at element
+// offset `offsets[r]`, elements `stride` apart. Vectorized when `stride == 1`
+// and every row offset is 8-element aligned (`aligned`).
+struct GatheredProduct {
+    typedef Act activation;
+    device const uchar *x;
+    thread const ulong *offsets;
+    ulong stride;
+    uint columns;
+    bool aligned;
+    uint width() const { return columns; }
+    void load8(uint m, uint k, float, thread float4 &even, thread float4 &odd) const {
+        device const typename Act::storage *row =
+            reinterpret_cast<device const typename Act::storage *>(x) + offsets[m];
+        projection::load8_storage<Act>(row, stride, k, columns, aligned, even, odd);
+    }
+    uint4 words8(uint m, uint k) const {
+        device const typename Act::storage *row =
+            reinterpret_cast<device const typename Act::storage *>(x) + offsets[m];
+        return projection::words8_storage<Act>(row, stride, k, columns, aligned);
+    }
+};
 
 // Channel n of row m's projections where a gathered decode down launch
-// published them (`project_gathered`), A-rounded, read by its last
+// published them (`project_channels_published`), A-rounded, read by its last
 // threadgroup to arrive.
 template <uint SLOTS, uint H>
 struct ArrivedProjections {

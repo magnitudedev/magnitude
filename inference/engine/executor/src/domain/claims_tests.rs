@@ -341,7 +341,7 @@ fn a_drafted_domains_provision_claims_through_its_draft_depth_in_both_stores() {
     };
     domain.provision(&mut bindings, &[prefill], None).unwrap();
     let through = (rows + method.draft_rows()) as u64;
-    let state = &domain.state_claims[&request];
+    let state = &domain.resident(request).unwrap().claim;
     assert_eq!(state.through(), through, "the claim reaches the rows and the draft depth");
     let shape = LoadShape::of(&domain.execution);
     let resources = domain.execution.resources();
@@ -375,8 +375,8 @@ fn a_reservation_draws_the_slot_first_and_gives_back_what_it_drew() {
         domain.install_input(request, magnitude_family_contracts::PreparedModelInput::continuation_only()).unwrap();
         assert!(domain.open_served(&mut bindings, request, None).unwrap().is_empty());
     }
-    let reserved = domain.state_claims[&first].bytes();
-    assert_eq!(domain.state_claims[&second].bytes(), reserved, "both reserved their whole requests");
+    let reserved = domain.resident(first).unwrap().claim.bytes();
+    assert_eq!(domain.resident(second).unwrap().claim.bytes(), reserved, "both reserved their whole requests");
     let drawn = slot.min(reserved);
     let left = slot - drawn;
     assert_eq!(committed_of(&domain, CommittedKind::RequestSlot), [left - left.min(reserved)], "each drew what the slot held, the first first");
@@ -413,7 +413,7 @@ fn an_open_refused_short_keeps_the_prefix_cache() {
         matches!(domain.open_served(&mut bindings, refused, None), Err(crate::domain::DomainError::Capacity(_))),
         "nothing is left for a second request"
     );
-    assert!(!domain.state_claims.contains_key(&refused), "a refused open holds nothing");
+    assert!(domain.resident(refused).is_none(), "a refused open holds nothing");
     assert_eq!(ledger.estimate().cache_of(CacheKind::Prefix), 4096, "a refused open yields no prefix");
     drop(room);
     assert!(domain.open_served(&mut bindings, refused, None).unwrap().is_empty(), "it opens once room frees");

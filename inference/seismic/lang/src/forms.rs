@@ -819,7 +819,7 @@ fn metal_matrix(weight: &Weight) -> Option<MetalMatrix> {
 mod tests {
     use super::*;
     use crate::checked::{
-        ElementQuery, ElementSummary, NativeComparison, NativeCondition, NativeNatExpr, ParameterSummaryKind,
+        CmpOp, ElementQuery, ElementSummary, NativeCondition, NativeNatExpr, ParameterSummaryKind,
     };
     use crate::native_name::native_macro;
 
@@ -1407,7 +1407,7 @@ mod tests {
     /// of any other shape prove nothing.
     fn admits_only_decoded(conjuncts: &[&NativeCondition], element: &str) -> bool {
         let admission = |condition: &NativeCondition| {
-            let NativeCondition::Compare { comparison: NativeComparison::Eq, left, right } = condition else {
+            let NativeCondition::Compare { comparison: CmpOp::Eq, left, right } = condition else {
                 return false;
             };
             matches!(

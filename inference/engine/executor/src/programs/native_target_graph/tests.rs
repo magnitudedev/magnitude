@@ -1215,13 +1215,15 @@ mod resource_template_tests {
         }
     }
 
-    /// A plan charges exactly the pass its load holds when its pass budget
-    /// exceeds what the arena fits (memory-failures item 8): the Qwen4Exp
-    /// fixture streamed on Metal in chains of 1024 launches, more than its arena fits, its bank built
-    /// at every place (a budget of the whole chain), holds passes the arena
-    /// caps (`group_pass_rows`), and the family the plan charges holds its
-    /// prompt groups' class at those passes' places, never at a pass above
-    /// the cap.
+    /// An unbanked plan charges exactly the pass its load holds when its pass
+    /// budget (`whole_chain`) exceeds what the arena fits (memory-failures item
+    /// 8): the Qwen4Exp fixture unbanked on Metal in chains of 1024 launches,
+    /// more than its arena fits, holds passes the arena caps
+    /// (`group_pass_rows`), and the family the plan charges holds its prompt
+    /// groups' class at those passes' places, never at a pass above the cap.
+    /// Conversely, a banked load whose pass was settled by `execution_plan`
+    /// honors its pass budget even when `OnceStage::Pass` exceeds the non-pass
+    /// launch arena, growing the workspace arena and charging it directly.
     #[test]
     fn a_budget_above_the_cap_charges_the_pass_the_load_holds() {
         use crate::planning::fixtures::{LIMITS, qwen4exp_fixture_definition_of, streamed_experts_manifest};
@@ -1232,23 +1234,31 @@ mod resource_template_tests {
         let manifest = streamed_experts_manifest(&definition);
         let selection = ComponentSelection { head: false, vision: false };
         let derived = ModelLoadPlan::derive(&manifest, &definition, selection, resident_layout(ExecutionPath::Native, backend), PlannedMethod::Plain, limits).unwrap();
-        let host = crate::planning::HostTier::Unified(crate::planning::Parking::of(backend));
-        let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
-        let floor = derived.bank_floor(&definition, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
-        let whole = derived.with_expert_bank(&definition, floor, None, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
         let capacity = ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT };
-        let state = ResourcePlanner::state_plan(&definition, &whole, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
-        let plan = whole.program_plan(&definition, KvCodec::Dense).unwrap();
-        let budget = whole.pass(limits);
+        let state = ResourcePlanner::state_plan(&definition, &derived, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
+        let plan = derived.program_plan(&definition, KvCodec::Dense).unwrap();
+        let budget = derived.pass(limits);
         let certificate =
-            certify_target_family::<seismic::NativeGraphLayout>(backend, &whole, &definition.decoder, &state, plan.target(), limits, budget).unwrap();
+            certify_target_family::<seismic::NativeGraphLayout>(backend, &derived, &definition.decoder, &state, plan.target(), limits, budget).unwrap();
         let passes = certificate.passes;
         let held = certificate.group.extents(&certificate.served, 1).pass_bytes().unwrap();
         let found = format!("budget {budget:?}, {passes:?}, {held} bytes held");
         assert!(budget.get() > passes.launches(), "setup: the budget is within the cap, so nothing here exceeds it: {found}");
         assert!(held > 0, "setup: no block of the fixture splits, so it holds no pass buffers: {found}");
-        let checked = super::super::certify::checked_target_family(backend, &whole, &definition.decoder, &state, plan.target(), limits, budget).unwrap();
+        let checked = super::super::certify::checked_target_family(backend, &derived, &definition.decoder, &state, plan.target(), limits, budget).unwrap();
         assert_eq!(checked.group_bytes.most().get(), passes.launches(), "{found}");
+
+        // A banked load whose settled pass exceeds the unbanked arena cap honors
+        // that pass rather than silently clamping back to the non-pass arena.
+        let host = crate::planning::HostTier::Unified(crate::planning::Parking::of(backend));
+        let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
+        let floor = derived.bank_floor(&definition, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
+        let banked = derived.with_expert_bank(&definition, floor, None, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
+        let banked_state = ResourcePlanner::state_plan(&definition, &banked, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
+        let banked_plan = banked.program_plan(&definition, KvCodec::Dense).unwrap();
+        let banked_budget = crate::PassLaunches::new(std::num::NonZeroUsize::new((passes.launches() + 1).min(chain)).unwrap());
+        let banked_checked = super::super::certify::checked_target_family(backend, &banked, &definition.decoder, &banked_state, banked_plan.target(), limits, banked_budget).unwrap();
+        assert_eq!(banked_checked.group_bytes.most(), banked_budget, "banked load must honor settled pass {banked_budget:?}");
     }
 }
 

@@ -347,36 +347,202 @@ impl HeadTransaction {
     }
 }
 
+/// How each round's draft and verify widths are chosen.
+#[derive(Clone)]
+enum WidthPolicy {
+    Fixed(DraftBudget),
+    Adaptive(DraftController),
+}
+
+/// One anchor token paired with the single target feature row that selected it.
+#[derive(Clone)]
+struct AnchorRow {
+    token: TokenId,
+    feature: FeatureRows,
+}
+
+impl AnchorRow {
+    fn new(token: TokenId, feature: FeatureRows) -> Result<Self, String> {
+        if feature.rows() != 1 {
+            return Err("drafter pairs differ from their feature rows".into());
+        }
+        Ok(Self { token, feature })
+    }
+
+    fn into_pending(self) -> PendingRows {
+        PendingRows {
+            tokens: vec![self.token],
+            features: self.feature,
+        }
+    }
+}
+
+/// History state of a target-conditioned drafter.
+#[derive(Clone)]
+enum HistoryState {
+    /// A head reading the target's history: keeps no history of its own, only
+    /// the target's position and the single anchor pair awaiting a draft.
+    TargetReading {
+        /// The target's position; only committed target rows move it.
+        position: usize,
+        /// The anchor token and the target feature row that selected it.
+        anchor: Option<AnchorRow>,
+    },
+    /// A drafter keeping its own history of committed target-conditioned pairs.
+    OwnHistory {
+        /// Drafter rows entered so far; the next entry row's position.
+        position: usize,
+        /// Complete pairs not yet entered; the last is the anchor when `anchored`.
+        pending: Option<PendingRows>,
+        /// A committed feature whose successor token is not known yet.
+        open: Option<OpenFeature>,
+        /// Whether the drafter holds its next anchor's pair: the round before
+        /// published its feature (or a prompt chunk closed). Under the
+        /// controller a round that drafts nothing publishes none, so the next
+        /// one cannot draft.
+        anchored: bool,
+        /// Target rows whose pairs an own-history drafter never entered: rows of
+        /// rounds that published no feature. Its history goes on from the next
+        /// pair it is given, so its positions trail the target's by these.
+        skipped: usize,
+    },
+}
+
+impl HistoryState {
+    fn round_state(&self, entry_bound: usize) -> DraftRoundState {
+        let (history, position, pending, open) = match self {
+            Self::TargetReading { position, anchor } => {
+                (DraftHistory::Target, *position, usize::from(anchor.is_some()), false)
+            }
+            Self::OwnHistory {
+                position,
+                pending,
+                open,
+                ..
+            } => (
+                DraftHistory::Own,
+                *position,
+                pending.as_ref().map_or(0, |pending| pending.tokens.len()),
+                open.is_some(),
+            ),
+        };
+        round_state_of(history, entry_bound, position, pending, open)
+    }
+
+    fn has_open(&self) -> bool {
+        matches!(self, Self::OwnHistory { open: Some(_), .. })
+    }
+
+    fn skipped(&self) -> usize {
+        match self {
+            Self::TargetReading { .. } => 0,
+            Self::OwnHistory { skipped, .. } => *skipped,
+        }
+    }
+
+    fn draft_pairs(&self) -> Option<PendingRows> {
+        match self {
+            Self::TargetReading { anchor, .. } => anchor.clone().map(AnchorRow::into_pending),
+            Self::OwnHistory { pending, .. } => pending.clone(),
+        }
+    }
+
+    fn clear_pending(&mut self) {
+        match self {
+            Self::TargetReading { anchor, .. } => *anchor = None,
+            Self::OwnHistory { pending, .. } => *pending = None,
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::TargetReading { position, anchor } => {
+                *position = 0;
+                *anchor = None;
+            }
+            Self::OwnHistory {
+                position,
+                pending,
+                open,
+                anchored,
+                skipped,
+            } => {
+                *position = 0;
+                *pending = None;
+                *open = None;
+                *anchored = false;
+                *skipped = 0;
+            }
+        }
+    }
+}
+
+fn round_state_of(
+    history: DraftHistory,
+    entry_bound: usize,
+    position: usize,
+    pending: usize,
+    open: bool,
+) -> DraftRoundState {
+    DraftRoundState::new(history, entry_bound, position, pending, open)
+        .expect("drafter state preserves its method boundary")
+}
+
+/// Lifecycle stage of the current round's drafter work.
+#[derive(Clone)]
+enum RoundStage {
+    /// No unresolved drafter work and no width chosen for this round yet.
+    Idle,
+    /// This round chose not to draft, so repeated `propose` calls in the same
+    /// round do not re-query the width policy.
+    Declined,
+    /// An entry-only head transaction (priming, maintenance, or catch-up) is
+    /// in flight. When triggered by catch-up in `propose`, `resume_draft`
+    /// holds the chosen width to draft once catch-up reconciles.
+    Entering {
+        transaction: HeadTransaction,
+        resume_draft: Option<usize>,
+    },
+    /// Catch-up finished; the next `propose` drafts this chosen width.
+    ResumeDraft(usize),
+    /// A drafting head transaction is in flight.
+    Drafting(HeadTransaction),
+    /// Reconciled proposals awaiting verification and observation.
+    Proposed {
+        proposal: Vec<TokenId>,
+        verified: Option<usize>,
+    },
+}
+
+impl RoundStage {
+    fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle | Self::Declined | Self::ResumeDraft(_))
+    }
+
+    fn has_transaction(&self) -> bool {
+        matches!(self, Self::Entering { .. } | Self::Drafting(_))
+    }
+
+    fn is_drafting(&self) -> bool {
+        matches!(
+            self,
+            Self::Entering {
+                resume_draft: Some(_),
+                ..
+            } | Self::ResumeDraft(_)
+                | Self::Drafting(_)
+                | Self::Proposed { .. }
+        )
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DrafterState {
     drafter: Drafter,
     proposals: usize,
-    /// Drafter rows entered so far; the next entry row's position.
-    position: usize,
-    /// Complete pairs not yet entered; the last is the anchor.
-    pending: Option<PendingRows>,
-    /// A committed feature whose successor token is not known yet.
-    open: Option<OpenFeature>,
-    /// The drafter transaction `propose` returned, until it reconciles.
-    head: Option<HeadTransaction>,
-    /// Reconciled proposals awaiting their verification.
-    proposal: Option<Vec<TokenId>>,
-    budget: DraftBudget,
-    /// The controller choosing each round's widths in place of `budget`.
-    control: Option<DraftController>,
-    /// This round's generated and verified widths, once chosen: a round
-    /// started again proposes what it proposed before.
-    generated: Option<usize>,
-    verified: Option<usize>,
-    /// Whether the drafter holds its next anchor's pair: the round before
-    /// published its feature (or a prompt chunk closed). Under the
-    /// controller a round that drafts nothing publishes none, so the next
-    /// one cannot draft.
-    anchored: bool,
-    /// Target rows whose pairs an own-history drafter never entered: rows of
-    /// rounds that published no feature. Its history goes on from the next
-    /// pair it is given, so its positions trail the target's by these.
-    skipped: usize,
+    width: WidthPolicy,
+    round: RoundStage,
+    history: HistoryState,
 }
 
 impl DrafterState {
@@ -404,26 +570,39 @@ impl DrafterState {
         let DraftTail::Trailing { pending, open } = checkpoint.tail else {
             return Err(format!("a drafting {} state enters no successor", drafter.name()));
         };
-        // A head reading the target's history retains nothing at a
-        // boundary: the next chunk's closing feature selects its anchor.
-        if !drafter.keeps_history() && (pending.is_some() || open.is_some()) {
-            return Err("a head reading the target's history restores no feature rows".into());
-        }
+        let history = match drafter {
+            Drafter::TargetReadingMtp => {
+                // A head reading the target's history retains nothing at a
+                // boundary: the next chunk's closing feature selects its anchor.
+                if pending.is_some() || open.is_some() {
+                    return Err(
+                        "a head reading the target's history restores no feature rows".into(),
+                    );
+                }
+                HistoryState::TargetReading {
+                    position: checkpoint.position,
+                    anchor: None,
+                }
+            }
+            Drafter::Mtp | Drafter::DFlash => HistoryState::OwnHistory {
+                position: checkpoint.position,
+                pending,
+                open,
+                // The next prompt chunk anchors it.
+                anchored: false,
+                skipped: checkpoint.skipped,
+            },
+        };
+        let width = match adaptive {
+            Some(load) => WidthPolicy::Adaptive(DraftController::new(proposals, load)),
+            None => WidthPolicy::Fixed(budget),
+        };
         Ok(Self {
             drafter,
             proposals,
-            position: checkpoint.position,
-            pending,
-            open,
-            head: None,
-            proposal: None,
-            budget,
-            control: adaptive.map(|load| DraftController::new(proposals, load)),
-            generated: None,
-            verified: None,
-            // The next prompt chunk anchors it.
-            anchored: false,
-            skipped: checkpoint.skipped,
+            width,
+            round: RoundStage::Idle,
+            history,
         })
     }
 
@@ -434,73 +613,7 @@ impl DrafterState {
     }
 
     fn round_state(&self) -> DraftRoundState {
-        DraftRoundState::new(
-            if self.drafter.keeps_history() {
-                DraftHistory::Own
-            } else {
-                DraftHistory::Target
-            },
-            self.entry_bound(),
-            self.position,
-            self.pending
-                .as_ref()
-                .map_or(0, |pending| pending.tokens.len()),
-            self.open.is_some(),
-        )
-        .expect("drafter state preserves its method boundary")
-    }
-
-    fn ensure_idle(&self) -> Result<(), String> {
-        if self.head.is_some() || self.proposal.is_some() {
-            return Err(format!(
-                "{} method already has unresolved work",
-                self.drafter.name()
-            ));
-        }
-        Ok(())
-    }
-
-    fn advance(&mut self, rows: usize) -> Result<(), String> {
-        // Target-reading heads advance only at target commitment; their
-        // physical head transactions enter no rows.
-        self.position = self
-            .position
-            .checked_add(rows)
-            .ok_or_else(|| format!("{} drafter position exhausted", self.drafter.name()))?;
-        Ok(())
-    }
-
-    /// Enter a committed target chunk into a head reading the target's
-    /// history: nothing enters it, the chunk moves its position, and the
-    /// closing chunk's final feature selected `next`, the first anchor.
-    fn prime_reading(
-        &mut self,
-        tokens: &[TokenId],
-        next: Option<TokenId>,
-        features: Option<FeatureRef>,
-        primed: Option<usize>,
-        reader: &mut dyn FeatureReader,
-    ) -> Result<(), String> {
-        if primed.is_some() || tokens.is_empty() {
-            return Err("a head reading the target's history primes nothing".into());
-        }
-        self.ensure_idle()?;
-        self.pending = None;
-        self.open = None;
-        self.advance(tokens.len())?;
-        self.anchored = next.is_some();
-        if let Some(next) = next {
-            let features =
-                features.ok_or("the chunk closing the prompt requires its final target feature")?;
-            let last = Self::read(reader, features, tokens.len() - 1, 1)?;
-            self.append(vec![next], last)?;
-        }
-        Ok(())
-    }
-
-    fn append(&mut self, tokens: Vec<TokenId>, features: FeatureRows) -> Result<(), String> {
-        self.pending = Some(PendingRows::joined(self.pending.take(), tokens, features)?);
-        Ok(())
+        self.history.round_state(self.entry_bound())
     }
 
     /// Enter every pending pair but the last `keep` as a drafter transaction
@@ -510,23 +623,25 @@ impl DrafterState {
         request: RequestId,
         keep: usize,
         phase: HeadPhase,
+        resume_draft: Option<usize>,
     ) -> Result<MethodEffects, String> {
-        let (call, _) = self.round_state().flushing(keep);
-        let Some(call) = call else {
+        let call = self.round_state().flushing(keep).0;
+        let (Some(call), HistoryState::OwnHistory { pending, .. }) = (call, &mut self.history)
+        else {
             return Ok(MethodEffects::default());
         };
-        let Some(pending) = self.pending.take() else {
-            unreachable!("a described head entry owns pending pairs");
-        };
+        let rows = pending
+            .take()
+            .expect("a described head entry owns pending pairs");
         let entered = call.entry_rows;
-        let conditioning = pending
+        let conditioning = rows
             .features
             .slice(0, entered)
             .map_err(|error| error.to_string())?;
         if keep > 0 {
-            self.pending = Some(PendingRows {
-                tokens: pending.tokens[entered..].to_vec(),
-                features: pending
+            *pending = Some(PendingRows {
+                tokens: rows.tokens[entered..].to_vec(),
+                features: rows
                     .features
                     .slice(entered, keep)
                     .map_err(|error| error.to_string())?,
@@ -536,7 +651,7 @@ impl DrafterState {
             request,
             phase,
             PendingRows {
-                tokens: pending.tokens[..entered].to_vec(),
+                tokens: rows.tokens[..entered].to_vec(),
                 features: conditioning,
             },
             call.position,
@@ -544,7 +659,10 @@ impl DrafterState {
             self.drafter.form(),
         )?;
         let operation = transaction.operation().clone();
-        self.head = Some(transaction);
+        self.round = RoundStage::Entering {
+            transaction,
+            resume_draft,
+        };
         Ok(MethodEffects {
             operations: vec![operation],
         })
@@ -584,13 +702,18 @@ impl MethodState for DrafterState {
         // A drafter without history has no entry to draft behind a chunk.
         // Its history's positions trail the target's past a gap, and a
         // device entry anchors at the target's (`Priming::draft_from`).
-        (self.drafter.keeps_history()
-            && self.skipped == 0
-            && self.pending.is_none()
-            && !matches!(self.open, Some(OpenFeature::Host(_)))
-            && self.head.is_none()
-            && self.proposal.is_none())
-        .then_some(self.position)
+        match &self.history {
+            HistoryState::OwnHistory {
+                position,
+                pending: None,
+                open,
+                skipped: 0,
+                ..
+            } if !matches!(open, Some(OpenFeature::Host(_))) && self.round.is_idle() => {
+                Some(*position)
+            }
+            _ => None,
+        }
     }
 
     fn prime(
@@ -603,147 +726,206 @@ impl MethodState for DrafterState {
         primed: Option<usize>,
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
-        if !self.drafter.keeps_history() {
-            self.prime_reading(tokens, next, features, primed, reader)?;
-            return Ok(MethodEffects::default());
-        }
-        let features = features.ok_or_else(|| {
-            format!(
-                "{} priming requires the chunk's target features",
-                self.drafter.name()
-            )
-        })?;
-        self.anchored = true;
-        // The first draft's anchor in the drafter's positions.
-        let draft_from = draft_from.saturating_sub(self.skipped);
-        if let Some(primed) = primed {
-            // The device entered complete causal pairs. MTP leaves the
-            // final feature open; a feature-only drafter may enter it now.
-            // A finishing chunk's last feature selects the draft anchor.
-            if self.priming_position() != Some(self.position) || primed > tokens.len() {
-                return Err(format!(
-                    "{} state cannot take a device-primed chunk",
-                    self.drafter.name()
-                ));
-            }
-            self.position = self
-                .position
-                .checked_add(primed)
-                .ok_or_else(|| format!("{} drafter position exhausted", self.drafter.name()))?;
-            self.open = None;
-            if self.drafter == Drafter::Mtp {
-                let boundary = features
-                    .boundary()
-                    .cloned()
-                    .ok_or("MTP priming requires an independently owned boundary feature")?;
-                if let Some(next) = next {
-                    self.append(vec![next], Self::read(reader, boundary, 0, 1)?)?;
-                } else {
-                    self.open = Some(OpenFeature::Device(boundary.downgrade()));
+        let is_idle = self.round.is_idle();
+        let priming_pos = self.priming_position();
+        let name = self.drafter.name();
+        let (keep, draft_from) = match &mut self.history {
+            // Enter a committed target chunk into a head reading the target's
+            // history: nothing enters it, the chunk moves its position, and the
+            // closing chunk's final feature selected `next`, the first anchor.
+            HistoryState::TargetReading { position, anchor } => {
+                if primed.is_some() || tokens.is_empty() {
+                    return Err("a head reading the target's history primes nothing".into());
                 }
-            } else if let Some(next) = next {
-                let last = Self::read(reader, features, tokens.len() - 1, 1)?;
-                self.append(vec![next], last)?;
+                if !is_idle {
+                    return Err(format!("{name} method already has unresolved work"));
+                }
+                let next_position = position
+                    .checked_add(tokens.len())
+                    .ok_or_else(|| format!("{name} drafter position exhausted"))?;
+                *anchor = match next {
+                    Some(next) => {
+                        let features = features.ok_or(
+                            "the chunk closing the prompt requires its final target feature",
+                        )?;
+                        let last = Self::read(reader, features, tokens.len() - 1, 1)?;
+                        Some(AnchorRow::new(next, last)?)
+                    }
+                    None => None,
+                };
+                *position = next_position;
+                return Ok(MethodEffects::default());
             }
-            return Ok(MethodEffects::default());
-        }
-        self.ensure_idle()?;
-        let Some((&first, rest)) = tokens.split_first() else {
-            return Err(format!(
-                "{} cannot prime an empty target chunk",
-                self.drafter.name()
-            ));
+            HistoryState::OwnHistory {
+                position,
+                pending,
+                open,
+                anchored,
+                skipped,
+            } => {
+                let features = features.ok_or_else(|| {
+                    format!("{name} priming requires the chunk's target features")
+                })?;
+                *anchored = true;
+                // The first draft's anchor in the drafter's positions.
+                let draft_from = draft_from.saturating_sub(*skipped);
+                if let Some(primed) = primed {
+                    // The device entered complete causal pairs. MTP leaves the
+                    // final feature open; a feature-only drafter may enter it now.
+                    // A finishing chunk's last feature selects the draft anchor.
+                    if priming_pos != Some(*position) || primed > tokens.len() {
+                        return Err(format!("{name} state cannot take a device-primed chunk"));
+                    }
+                    *position = position
+                        .checked_add(primed)
+                        .ok_or_else(|| format!("{name} drafter position exhausted"))?;
+                    *open = None;
+                    if self.drafter == Drafter::Mtp {
+                        let boundary = features
+                            .boundary()
+                            .cloned()
+                            .ok_or("MTP priming requires an independently owned boundary feature")?;
+                        if let Some(next) = next {
+                            *pending = Some(PendingRows::joined(
+                                pending.take(),
+                                vec![next],
+                                Self::read(reader, boundary, 0, 1)?,
+                            )?);
+                        } else {
+                            *open = Some(OpenFeature::Device(boundary.downgrade()));
+                        }
+                    } else if let Some(next) = next {
+                        let last = Self::read(reader, features, tokens.len() - 1, 1)?;
+                        *pending = Some(PendingRows::joined(pending.take(), vec![next], last)?);
+                    }
+                    return Ok(MethodEffects::default());
+                }
+                if !is_idle {
+                    return Err(format!("{name} method already has unresolved work"));
+                }
+                let Some((&first, rest)) = tokens.split_first() else {
+                    return Err(format!("{name} cannot prime an empty target chunk"));
+                };
+                let rows = Self::read(reader, features, 0, tokens.len())?;
+                // The open feature selected this chunk's first token; each chunk
+                // row's feature selected the token after it.
+                if let Some(open_feature) = open.take() {
+                    *pending = Some(PendingRows::joined(
+                        pending.take(),
+                        vec![first],
+                        Self::open_rows(reader, open_feature)?,
+                    )?);
+                }
+                if !rest.is_empty() {
+                    *pending = Some(PendingRows::joined(
+                        pending.take(),
+                        rest.to_vec(),
+                        rows.slice(0, rest.len())
+                            .map_err(|error| error.to_string())?,
+                    )?);
+                }
+                let last = rows
+                    .slice(tokens.len() - 1, 1)
+                    .map_err(|error| error.to_string())?;
+                match next {
+                    Some(next) => {
+                        *pending = Some(PendingRows::joined(pending.take(), vec![next], last)?);
+                        // Keep the anchor for the first draft.
+                        (1, draft_from)
+                    }
+                    None => {
+                        *open = Some(OpenFeature::Host(last));
+                        (0, draft_from)
+                    }
+                }
+            }
         };
-        let rows = Self::read(reader, features, 0, tokens.len())?;
-        // The open feature selected this chunk's first token; each chunk
-        // row's feature selected the token after it.
-        if let Some(open) = self.open.take() {
-            self.append(vec![first], Self::open_rows(reader, open)?)?;
-        }
-        if !rest.is_empty() {
-            self.append(
-                rest.to_vec(),
-                rows.slice(0, rest.len())
-                    .map_err(|error| error.to_string())?,
-            )?;
-        }
-        let last = rows
-            .slice(tokens.len() - 1, 1)
-            .map_err(|error| error.to_string())?;
-        match next {
-            Some(next) => {
-                self.append(vec![next], last)?;
-                // Keep the anchor for the first draft.
-                self.flush(request, 1, HeadPhase::Priming { draft_from })
-            }
-            None => {
-                self.open = Some(OpenFeature::Host(last));
-                self.flush(request, 0, HeadPhase::Priming { draft_from })
-            }
-        }
+        self.flush(request, keep, HeadPhase::Priming { draft_from }, None)
     }
 
     fn propose(&mut self, request: RequestId, selects: &[SelectSpec]) -> Propose {
-        if let Some(proposal) = self.proposal.as_ref() {
-            // The verified prefix is all a round offers the target.
-            let count = match (&mut self.control, self.verified) {
-                (_, Some(verified)) => verified,
-                (Some(control), None) => control.verify(selects.len()),
-                (None, None) => self.budget.verified,
+        let entry_bound = self.entry_bound();
+        let generated = match &mut self.round {
+            RoundStage::Proposed { proposal, verified } => {
+                // The verified prefix is all a round offers the target.
+                let count = match (&mut self.width, *verified) {
+                    (_, Some(verified)) => verified,
+                    (WidthPolicy::Adaptive(control), None) => control.verify(selects.len()),
+                    (WidthPolicy::Fixed(budget), None) => budget.verified,
+                }
+                .min(proposal.len())
+                .min(selects.len());
+                *verified = Some(count);
+                return Propose::Tokens(proposal[..count].to_vec());
             }
-            .min(proposal.len())
-            .min(selects.len());
-            self.verified = Some(count);
-            return Propose::Tokens(proposal[..count].to_vec());
-        }
-        let (None, None, false) = (&self.head, &self.open, selects.is_empty()) else {
-            return Propose::Tokens(Vec::new());
+            RoundStage::Declined | RoundStage::Entering { .. } | RoundStage::Drafting(_) => {
+                return Propose::Tokens(Vec::new());
+            }
+            RoundStage::ResumeDraft(generated) => {
+                if self.history.has_open() || selects.is_empty() {
+                    return Propose::Tokens(Vec::new());
+                }
+                *generated
+            }
+            stage @ RoundStage::Idle => {
+                if self.history.has_open() || selects.is_empty() {
+                    return Propose::Tokens(Vec::new());
+                }
+                // A round drafts a prepared width that fits what the request can
+                // still produce, or nothing; only from its anchor's pair. A
+                // fused-taps drafter under the controller that a round publishing no
+                // feature left without it asks the controller still, which prepares
+                // the next round's draft (`DraftController::generate`); any other
+                // drafter without its anchor's pair drafts nothing. Launch costs
+                // depend on the history the round reads, the target's position.
+                let (anchored, unanchored_for_prep) = match &self.history {
+                    HistoryState::TargetReading { anchor, .. } => {
+                        (anchor.is_some(), anchor.is_none())
+                    }
+                    HistoryState::OwnHistory {
+                        pending, anchored, ..
+                    } => (*anchored && pending.is_some(), !*anchored),
+                };
+                let prepares = unanchored_for_prep
+                    && self.drafter.fuses_taps()
+                    && matches!(self.width, WidthPolicy::Adaptive(_));
+                if !anchored && !prepares {
+                    return Propose::Tokens(Vec::new());
+                }
+                let position = self
+                    .history
+                    .round_state(entry_bound)
+                    .target_position()
+                    .expect("drafter state preserves its method boundary")
+                    + self.history.skipped();
+                let generated = match &mut self.width {
+                    WidthPolicy::Adaptive(control) => {
+                        control.generate(selects.len(), position, anchored)
+                    }
+                    WidthPolicy::Fixed(budget) => budget.generated_within(selects.len()),
+                };
+                if generated == 0 || generated > selects.len() {
+                    *stage = RoundStage::Declined;
+                    return Propose::Tokens(Vec::new());
+                }
+                generated
+            }
         };
-        // A round drafts a prepared width that fits what the request can
-        // still produce, or nothing; only from its anchor's pair. A
-        // fused-taps drafter under the controller that a round publishing no
-        // feature left without it asks the controller still, which prepares
-        // the next round's draft (`DraftController::generate`); any other
-        // drafter without its anchor's pair drafts nothing. Launch costs
-        // depend on the history the round reads, the target's position.
-        let anchored = self.anchored && self.pending.is_some();
-        let prepares = !self.anchored && self.drafter.fuses_taps() && self.control.is_some();
-        if !anchored && !prepares {
+        if generated == 0 || generated > selects.len() {
             return Propose::Tokens(Vec::new());
         }
         // Rounds that drafted nothing left their pairs pending: the drafter
-        // enters them before choosing a draft width, so a smaller allowance
-        // after catch-up cannot leave a cached choice wider than `selects`.
-        if anchored && self.round_state().catching_up().0.is_some() {
+        // enters them now, then this round drafts from its anchor.
+        if self.round_state().catching_up().0.is_some() {
             let effects = self
-                .flush(request, 1, HeadPhase::Generation)
+                .flush(request, 1, HeadPhase::Generation, Some(generated))
                 .expect("pending pairs slice by their own rows");
             return Propose::Pending(effects.operations);
         }
-        let position = self
-            .round_state()
-            .target_position()
-            .expect("drafter state preserves its method boundary")
-            + self.skipped;
-        if self
-            .generated
-            .is_some_and(|generated| generated > selects.len())
-        {
-            self.generated = None;
-        }
-        let generated = match (&mut self.control, self.generated) {
-            (_, Some(generated)) => generated,
-            (Some(control), None) => control.generate(selects.len(), position, anchored),
-            (None, None) => self.budget.generated_within(selects.len()),
-        };
-        if generated == 0 || generated > selects.len() {
-            self.generated = Some(0);
-            return Propose::Tokens(Vec::new());
-        }
-        self.generated = Some(generated);
-        let Some(pending) = &self.pending else {
-            unreachable!("a drafting round holds its anchor");
-        };
+        let pairs = self
+            .history
+            .draft_pairs()
+            .expect("a drafting round holds its anchor");
         let (Some(call), _) = self
             .round_state()
             .proposing(generated)
@@ -754,16 +936,16 @@ impl MethodState for DrafterState {
         let Ok(transaction) = HeadTransaction::new(
             request,
             HeadPhase::Generation,
-            pending.clone(),
+            pairs,
             call.position,
             selects[..generated].to_vec(),
             self.drafter.form(),
         ) else {
-            self.generated = Some(0);
+            self.round = RoundStage::ResumeDraft(generated);
             return Propose::Tokens(Vec::new());
         };
         let operation = transaction.operation().clone();
-        self.head = Some(transaction);
+        self.round = RoundStage::Drafting(transaction);
         Propose::Pending(vec![operation])
     }
 
@@ -774,22 +956,20 @@ impl MethodState for DrafterState {
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
         let name = self.drafter.name();
-        if self.head.is_some() {
+        if self.round.has_transaction() {
             return Err(format!(
                 "{name} cannot observe while a drafter transaction is unresolved"
             ));
         }
-        self.proposal = None;
         let accepted = verification.accepted;
         if verification.inputs.is_empty() || accepted == 0 || accepted > verification.inputs.len() {
             return Err(format!("{name} verification prefix is invalid"));
         }
-        if verification.features.is_none() && self.control.is_none() {
+        if verification.features.is_none() && matches!(self.width, WidthPolicy::Fixed(_)) {
             return Err(format!("{name} verification requires target features"));
         }
-        self.generated = None;
-        self.verified = None;
-        if let Some(control) = &mut self.control {
+        self.round = RoundStage::Idle;
+        if let WidthPolicy::Adaptive(control) = &mut self.width {
             let mut committed = verification.inputs[1..accepted].to_vec();
             committed.push(verification.next);
             control.committed(&committed);
@@ -806,58 +986,108 @@ impl MethodState for DrafterState {
                 );
             }
         }
-        // After a replay the last replayed row's feature selected the anchor.
-        if let Some(open) = self.open.take() {
-            self.append(vec![verification.inputs[0]], Self::open_rows(reader, open)?)?;
-            self.anchored = true;
-        }
-        if self.anchored
-            && self
-                .pending
-                .as_ref()
-                .and_then(|pending| pending.tokens.last())
-                .is_some_and(|anchor| *anchor != verification.inputs[0])
-        {
-            return Err(format!(
-                "{name} pending anchor differs from the verified anchor"
-            ));
-        }
-        // A round that published no feature (one drafting nothing under the
-        // controller) leaves the drafter without the pairs of its rows'
-        // successors: the next round cannot draft, and an own history goes
-        // on past them from the next pair it is given.
-        let Some(features) = verification.features else {
-            self.anchored = false;
-            match self.drafter.keeps_history() {
-                true => self.skipped += accepted,
-                false => {
-                    self.pending = None;
-                    self.advance(accepted)?;
+        let entry_bound = self.entry_bound();
+        let needs_maintenance = match &mut self.history {
+            HistoryState::TargetReading { position, anchor } => {
+                if anchor
+                    .as_ref()
+                    .is_some_and(|row| row.token != verification.inputs[0])
+                {
+                    return Err(format!(
+                        "{name} pending anchor differs from the verified anchor"
+                    ));
                 }
+                let Some(features) = verification.features else {
+                    *anchor = None;
+                    *position = position
+                        .checked_add(accepted)
+                        .ok_or_else(|| format!("{name} drafter position exhausted"))?;
+                    return Ok(MethodEffects::default());
+                };
+                let transition = round_state_of(
+                    DraftHistory::Target,
+                    entry_bound,
+                    *position,
+                    usize::from(anchor.is_some()),
+                    false,
+                )
+                .observed(accepted)?;
+                // The accepted rows moved the target; the last one's feature
+                // selected the next anchor.
+                let last = Self::read(reader, features, accepted - 1, 1)?;
+                *anchor = Some(AnchorRow::new(verification.next, last)?);
+                *position = transition.appended.position();
+                debug_assert_eq!(
+                    round_state_of(DraftHistory::Target, entry_bound, *position, 1, false),
+                    transition.appended
+                );
+                false
             }
-            return Ok(MethodEffects::default());
+            HistoryState::OwnHistory {
+                position,
+                pending,
+                open,
+                anchored,
+                skipped,
+            } => {
+                // After a replay the last replayed row's feature selected the anchor.
+                if let Some(open_feature) = open.take() {
+                    *pending = Some(PendingRows::joined(
+                        pending.take(),
+                        vec![verification.inputs[0]],
+                        Self::open_rows(reader, open_feature)?,
+                    )?);
+                    *anchored = true;
+                }
+                if *anchored
+                    && pending
+                        .as_ref()
+                        .and_then(|pending| pending.tokens.last())
+                        .is_some_and(|anchor| *anchor != verification.inputs[0])
+                {
+                    return Err(format!(
+                        "{name} pending anchor differs from the verified anchor"
+                    ));
+                }
+                // A round that published no feature (one drafting nothing under the
+                // controller) leaves the drafter without the pairs of its rows'
+                // successors: the next round cannot draft, and an own history goes
+                // on past them from the next pair it is given.
+                let Some(features) = verification.features else {
+                    *anchored = false;
+                    *skipped += accepted;
+                    return Ok(MethodEffects::default());
+                };
+                *anchored = true;
+                let transition = round_state_of(
+                    DraftHistory::Own,
+                    entry_bound,
+                    *position,
+                    pending.as_ref().map_or(0, |pending| pending.tokens.len()),
+                    false,
+                )
+                .observed(accepted)?;
+                // Committed row i's feature selected the token after it: the next
+                // accepted input, or the round's successor after the last row.
+                let rows = Self::read(reader, features, 0, accepted)?;
+                let mut tokens = verification.inputs[1..accepted].to_vec();
+                tokens.push(verification.next);
+                *pending = Some(PendingRows::joined(pending.take(), tokens, rows)?);
+                debug_assert_eq!(
+                    round_state_of(
+                        DraftHistory::Own,
+                        entry_bound,
+                        *position,
+                        pending.as_ref().map_or(0, |pending| pending.tokens.len()),
+                        false,
+                    ),
+                    transition.appended
+                );
+                transition.maintenance.is_some()
+            }
         };
-        self.anchored = true;
-        let transition = self.round_state().observed(accepted)?;
-        if !self.drafter.keeps_history() {
-            // The accepted rows moved the target; the last one's feature
-            // selected the next anchor.
-            let last = Self::read(reader, features, accepted - 1, 1)?;
-            self.pending = None;
-            self.position = transition.appended.position();
-            self.append(vec![verification.next], last)?;
-            debug_assert_eq!(self.round_state(), transition.appended);
-            return Ok(MethodEffects::default());
-        }
-        // Committed row i's feature selected the token after it: the next
-        // accepted input, or the round's successor after the last row.
-        let rows = Self::read(reader, features, 0, accepted)?;
-        let mut tokens = verification.inputs[1..accepted].to_vec();
-        tokens.push(verification.next);
-        self.append(tokens, rows)?;
-        debug_assert_eq!(self.round_state(), transition.appended);
-        if transition.maintenance.is_some() {
-            return self.flush(request, 1, HeadPhase::Generation);
+        if needs_maintenance {
+            return self.flush(request, 1, HeadPhase::Generation, None);
         }
         Ok(MethodEffects::default())
     }
@@ -868,37 +1098,69 @@ impl MethodState for DrafterState {
     /// drafted (its rows' successors are the next draft's pairs) or one
     /// preparing to draft, so a round drafting nothing costs a plain step.
     fn taps(&self) -> bool {
-        match &self.control {
-            Some(control) if self.drafter.fuses_taps() => {
-                self.generated.is_some_and(|generated| generated > 0) || control.preparing()
+        match &self.width {
+            WidthPolicy::Adaptive(control) if self.drafter.fuses_taps() => {
+                self.round.is_drafting() || control.preparing()
             }
             _ => true,
         }
     }
 
     fn publishes_behind(&self) -> bool {
-        self.drafter.fuses_taps() && self.control.as_ref().is_some_and(DraftController::publishes_behind)
+        self.drafter.fuses_taps()
+            && matches!(
+                &self.width,
+                WidthPolicy::Adaptive(control) if control.publishes_behind()
+            )
     }
 
     fn reconcile(&mut self, operation: &Operation, outcome: Outcome) -> Result<(), String> {
+        enum ReconcileKind {
+            Enter(Option<usize>),
+            Draft,
+        }
         let name = self.drafter.name();
-        let drafted = self
-            .head
-            .take()
-            .ok_or_else(|| format!("{name} has no pending drafter transaction"))?
+        let (transaction, kind) = match std::mem::replace(&mut self.round, RoundStage::Idle) {
+            RoundStage::Entering {
+                transaction,
+                resume_draft,
+            } => (transaction, ReconcileKind::Enter(resume_draft)),
+            RoundStage::Drafting(transaction) => (transaction, ReconcileKind::Draft),
+            other => {
+                self.round = other;
+                return Err(format!("{name} has no pending drafter transaction"));
+            }
+        };
+        let drafted = transaction
             .reconcile(operation, outcome)
             .map_err(|error| format!("{name}: {error}"))?;
         // A drafter without history entered nothing: its position is the
         // target's, which only committed target rows move.
-        if self.drafter.keeps_history() {
-            self.position = self.round_state().entered(drafted.entered)?.position();
-        }
-        if drafted.requested > 0 {
-            self.pending = None;
-            if let Some(control) = &mut self.control {
-                control.drafted(drafted.requested, &drafted.proposal, drafted.confidence.as_deref());
+        if let HistoryState::OwnHistory { .. } = &self.history {
+            let new_position = self.round_state().entered(drafted.entered)?.position();
+            if let HistoryState::OwnHistory { position, .. } = &mut self.history {
+                *position = new_position;
             }
-            self.proposal = Some(drafted.proposal);
+        }
+        match kind {
+            ReconcileKind::Enter(Some(generated)) => {
+                self.round = RoundStage::ResumeDraft(generated);
+            }
+            ReconcileKind::Enter(None) => {}
+            ReconcileKind::Draft => {
+                self.history.clear_pending();
+                if let WidthPolicy::Adaptive(control) = &mut self.width {
+                    control.drafted(
+                        drafted.requested,
+                        &drafted.proposal,
+                        drafted.confidence.as_deref(),
+                    );
+                }
+                self.round = RoundStage::Proposed {
+                    proposal: drafted.proposal,
+                    verified: None,
+                };
+            }
         }
         Ok(())
     }
@@ -910,70 +1172,82 @@ impl MethodState for DrafterState {
         sequences: usize,
         rows: usize,
     ) {
-        if let Some(control) = &mut self.control {
+        if let WidthPolicy::Adaptive(control) = &mut self.width {
             control.timed(launch, duration, sequences, rows);
         }
     }
 
     fn outlook(&self) -> Option<DraftOutlook> {
-        match (&self.control, &self.proposal, self.verified) {
-            (Some(control), Some(_), None) => control.outlook(),
+        match (&self.width, &self.round) {
+            (WidthPolicy::Adaptive(control), RoundStage::Proposed { verified: None, .. }) => {
+                control.outlook()
+            }
             _ => None,
         }
     }
 
     fn checkpoint(&self) -> Result<MethodCheckpoint, MethodCheckpointError> {
-        if self.head.is_some() || self.proposal.is_some() {
+        if !self.round.is_idle() {
             return Err(MethodCheckpointError::Unresolved);
         }
-        if !self.drafter.keeps_history() {
-            // The pending anchor is the sampled successor, outside the
-            // retained prefix; its request's next chunk selects its own.
-            return Ok(self.drafter.checkpoint(DraftCheckpoint {
-                position: self.position,
-                tail: DraftTail::EMPTY,
-                skipped: 0,
-            }));
-        }
-        let mut pending = self.pending.clone();
-        let mut open = self.open.clone();
-        // The final pending token is the sampled successor, outside the
-        // retained target prefix. Export its feature without that token;
-        // each restored request supplies its own successor. A drafter
-        // without its anchor's pair holds no successor: its pairs are all
-        // inside the prefix.
-        if open.is_none() && self.anchored {
-            if let Some(rows) = pending.take() {
-                let (rest, last) = rows.opened();
-                pending = rest;
-                open = Some(OpenFeature::Host(last));
+        let state = match &self.history {
+            HistoryState::TargetReading { position, .. } => {
+                // The pending anchor is the sampled successor, outside the
+                // retained prefix; its request's next chunk selects its own.
+                DraftCheckpoint {
+                    position: *position,
+                    tail: DraftTail::EMPTY,
+                    skipped: 0,
+                }
             }
-        }
-        Ok(self.drafter.checkpoint(DraftCheckpoint {
-            position: self.position,
-            tail: DraftTail::Trailing { pending, open },
-            skipped: self.skipped,
-        }))
+            HistoryState::OwnHistory {
+                position,
+                pending,
+                open,
+                anchored,
+                skipped,
+            } => {
+                let mut pending = pending.clone();
+                let mut open = open.clone();
+                // The final pending token is the sampled successor, outside the
+                // retained target prefix. Export its feature without that token;
+                // each restored request supplies its own successor. A drafter
+                // without its anchor's pair holds no successor: its pairs are all
+                // inside the prefix.
+                if open.is_none() && *anchored {
+                    if let Some(rows) = pending.take() {
+                        let (rest, last) = rows.opened();
+                        pending = rest;
+                        open = Some(OpenFeature::Host(last));
+                    }
+                }
+                DraftCheckpoint {
+                    position: *position,
+                    tail: DraftTail::Trailing { pending, open },
+                    skipped: *skipped,
+                }
+            }
+        };
+        Ok(self.drafter.checkpoint(state))
     }
 
     fn evict(&mut self) {
-        self.position = 0;
-        self.pending = None;
-        self.open = None;
-        self.anchored = false;
-        self.skipped = 0;
-        self.head = None;
-        self.proposal = None;
-        self.generated = None;
-        self.verified = None;
+        self.history.reset();
+        self.round = RoundStage::Idle;
     }
 
     fn reclaimable(&self) -> u64 {
-        let pending = self
-            .pending
-            .as_ref()
-            .map_or(0, |rows| rows.features.bytes().len());
-        let open = self.open.as_ref().map_or(0, OpenFeature::host_bytes);
-        (pending + open) as u64
+        match &self.history {
+            HistoryState::TargetReading { anchor, .. } => {
+                anchor.as_ref().map_or(0, |row| row.feature.bytes().len()) as u64
+            }
+            HistoryState::OwnHistory { pending, open, .. } => {
+                let pending = pending
+                    .as_ref()
+                    .map_or(0, |rows| rows.features.bytes().len());
+                let open = open.as_ref().map_or(0, OpenFeature::host_bytes);
+                (pending + open) as u64
+            }
+        }
     }
 }

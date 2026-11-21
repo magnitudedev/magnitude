@@ -2345,18 +2345,10 @@ mod internals {
 
     /// `condition` as a CPU kernel's `bool` ([`cpu_nat`]).
     fn cpu_condition(condition: &seismic_lang::checked::NativeCondition) -> Option<String> {
-        use seismic_lang::checked::{NativeComparison as C, NativeCondition};
+        use seismic_lang::checked::NativeCondition;
         Some(match condition {
             NativeCondition::Compare { comparison, left, right } => {
-                let op = match comparison {
-                    C::Lt => "<",
-                    C::Le => "<=",
-                    C::Gt => ">",
-                    C::Ge => ">=",
-                    C::Eq => "==",
-                    C::Ne => "!=",
-                };
-                format!("({} {op} {})", cpu_nat(left)?, cpu_nat(right)?)
+                format!("({} {} {})", cpu_nat(left)?, comparison.as_str(), cpu_nat(right)?)
             }
             NativeCondition::And(left, right) => format!("({} && {})", cpu_condition(left)?, cpu_condition(right)?),
             NativeCondition::Or(left, right) => format!("({} || {})", cpu_condition(left)?, cpu_condition(right)?),

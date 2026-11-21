@@ -146,7 +146,7 @@ pub use planning::{
     growth_target,
     ArtifactComponent, ArtifactComponentKind, AssessmentFit, AssessmentFitVerdict,
     AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryBounds, TargetGraphBounds, UndraftedBounds, VisionGraphBounds,
-    AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, AttentionValues, StoreDemands, prompt_places_at,
+    AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, StoreDemands, prompt_places_at,
     RoundingArgs,
     BackendPlan,
     BankAllocation, BankBinding, BankTier, ConveyorCarrier, ExpertBankPlan, Holding, StoredPart, StoredStack,

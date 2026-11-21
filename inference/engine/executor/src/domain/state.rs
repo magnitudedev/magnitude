@@ -136,10 +136,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         })
     }
 
-    /// Whether no request is resident: only then may the optional
+    /// Whether no request is open: only then may the optional
     /// components, which its steps draft and encode with, be released.
     pub(super) fn optional_idle(&self) -> bool {
-        self.target.is_empty() && self.head.is_empty() && self.input.is_empty()
+        self.requests.is_empty()
     }
 
     /// Value each resident request's reservation by what its replay costs
@@ -153,7 +153,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let Some(prices) = self.launch_prices() else {
             return Ok(());
         };
-        for (sequence, state) in &self.state_claims {
+        for (sequence, resident) in self.resident_requests() {
+            let state = &resident.claim;
             let Some(bytes) = std::num::NonZeroU64::new(state.bytes()).filter(|_| state.through() > 0) else {
                 continue;
             };
@@ -180,11 +181,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let before = self.held_bytes();
         self.idle_optional();
-        let (released, kept): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.idle_components).into_iter().partition(|idle| components.contains(&idle.component));
-        self.idle_components = kept;
-        for idle in released {
-            self.unload_component(idle.component, idle);
+        if components.contains(&super::OptionalComponent::Drafter) {
+            if let Some(cache) = self.head_component.take_idle_if(|_| true) {
+                self.unload_component(super::OptionalComponent::Drafter, cache);
+            }
+        }
+        if components.contains(&super::OptionalComponent::Vision) {
+            if let Some(cache) = self.vision_component.take_idle_if(|_| true) {
+                self.unload_component(super::OptionalComponent::Vision, cache);
+            }
         }
         before
             .checked_sub(self.held_bytes())
@@ -244,12 +249,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let target_weights = self.family.target_weight_bytes()?;
         // Vision has its own cache; the head shares the target's.
         let head_weights = self.head_weight_bytes()?;
-        let vision_weights = self
-            .vision_loader
-            .as_ref()
-            .map(|loader| loader.own_bytes())
-            .transpose()?
-            .unwrap_or(0);
+        let vision_weights = self.vision_component.own_bytes()?;
         let optional_weights = head_weights
             .checked_add(vision_weights)
             .ok_or("optional resident charge overflows")?;
@@ -353,7 +353,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .chain(queued.iter().copied())
                         .filter(|operation| operation.chain().is_some())
                         .count();
-                    if let (false, Some(state)) = (entries.is_empty() && fronts == 0, self.head.get(request)) {
+                    if let (false, Some(state)) = (entries.is_empty() && fronts == 0, self.head_state(*request)) {
                         let own = entry + operation.entry_rows();
                         let ahead = entries.iter().sum::<usize>() - entry
                             + queued.iter().copied().map(Operation::entry_rows).sum::<usize>();
@@ -361,7 +361,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         head_queued.extend(state.queued_demands(own, ahead));
                         head_banks += entries.len() + fronts;
                     }
-                    if let Some(state) = self.target.get(request) {
+                    if let Some(state) = self.target_state(*request) {
                         let ahead = queued.iter().copied().map(Operation::row_count).sum::<usize>();
                         state_rows.push((*request, claimed_through(state.position(), rows + ahead, method)));
                         target.extend(state.demands(rows));
@@ -370,7 +370,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     }
                 }
                 Operation::Head { request, .. } => {
-                    if let Some(state) = self.head.get(request) {
+                    if let Some(state) = self.head_state(*request) {
                         head.extend(state.demands(rows));
                         head_banks += 1;
                     }
@@ -414,13 +414,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let rule = crate::memory::ledger::RequestRows::of(&self.execution);
         for &(sequence, through) in &state_rows {
             let held = self
-                .state_claims
-                .get(&sequence)
-                .expect("invariant violated: a resident request holds no reservation")
+                .resident(sequence)
+                .expect("invariant violated: a resident request is missing")
+                .claim
                 .rows();
             if through > held {
                 self.change_state(|this, keeping| {
-                    let reservation = this.state_claims.get_mut(&sequence).expect("a resident request's reservation, read above");
+                    let reservation = &mut this
+                        .requests
+                        .get_mut(&sequence)
+                        .and_then(RequestEntry::resident_mut)
+                        .expect("a resident request's reservation, read above")
+                        .claim;
                     this.resources.ledgers().device().extend(&keeping.claims(), &this.request_slot, reservation, rule.reach(through))
                 })
                 .map_err(DomainError::request_short)?;
@@ -467,9 +472,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // `Reservation::through()`.
         self.change_state(|this, _| {
             for (sequence, through) in state_rows {
-                this.state_claims
-                    .get_mut(&sequence)
-                    .expect("invariant violated: a resident request holds no reservation")
+                this.resident_mut(sequence)
+                    .expect("invariant violated: a resident request is missing")
+                    .claim
                     .grow(through);
             }
         });
@@ -585,15 +590,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// as it opens and as it extends, within the room its reservation
     /// committed, and no row it writes allocates mid-launch.
     pub(super) fn back_reservation(&mut self, bindings: &mut StateBindings, request: RequestId) -> Result<(), DomainError> {
-        let unwritten = self.unwritten_rows(request);
-        let target = self
+        let resident = self
+            .resident(request)
+            .expect("invariant violated: a reserved request is not resident");
+        let unwritten = resident.unwritten_rows();
+        let target = resident
             .target
-            .get(&request)
+            .as_ref()
             .expect("invariant violated: a reserved request holds no target state")
             .queued_demands(0, unwritten);
+        let head = self
+            .head_store
+            .is_some()
+            .then(|| resident.head.as_ref().map(|head| head.queued_demands(0, unwritten)))
+            .flatten();
         self.grant_state_growth(bindings, false, &[], &target, 0)?;
-        if let (Some(head), true) = (self.head.get(&request), self.head_store.is_some()) {
-            let head = head.queued_demands(0, unwritten);
+        if let Some(head) = head {
             self.grant_state_growth(bindings, true, &[], &head, 0)?;
         }
         Ok(())
@@ -603,18 +615,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// ledger: resident, in a flight or not, so its end or eviction frees
     /// memory.
     pub fn holds_state_beside(&self, own: &std::collections::BTreeSet<RequestId>) -> bool {
-        self.state_claims.keys().any(|request| !own.contains(request))
-    }
-
-    /// The rows `request`'s reservation holds past its target position.
-    fn unwritten_rows(&self, request: RequestId) -> usize {
-        let reservation = self.state_claims.get(&request).expect("invariant violated: a resident request holds no reservation");
-        let position = self.target.get(&request).map_or(0, SequenceState::position) as u64;
-        usize::try_from(reservation.rows().saturating_sub(position)).expect("invariant violated: a reservation's rows exceed the host's")
-    }
-
-    pub(super) fn drop_state_claim(&mut self, sequence: RequestId) {
-        self.state_claims.remove(&sequence);
+        self.resident_requests().any(|(request, _)| !own.contains(&request))
     }
 
     /// Grant elastic state growth of the target or `head` store from a fresh
@@ -735,7 +736,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 error => DomainError::invariant(error.to_string()),
             });
         }
-        self.head_binding.extend(held.into_claims());
+        self.head_component.extend_binding(held.into_claims());
         Ok(())
     }
 
@@ -746,8 +747,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         changes.change(|_| {
             self.family.unbind_optional(component);
             match component {
-                super::OptionalComponent::Drafter => self.head_binding.clear(),
-                super::OptionalComponent::Vision => self.vision_binding.clear(),
+                super::OptionalComponent::Drafter => self.head_component.clear_binding(),
+                super::OptionalComponent::Vision => self.vision_component.clear_binding(),
             }
         });
     }
@@ -789,7 +790,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         // `provision` resolved the queued steps: only another history can
         // block.
-        let Some(state) = self.lane_states(head).get(&request) else {
+        let Some(state) = self.resident(request).and_then(|resident| resident.lane(head)) else {
             return Ok(());
         };
         let demands = state.relocation_demands();
@@ -799,32 +800,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.grant_state_growth(bindings, head, &demands, &[], 0)?;
         for demand in demands {
             let state = self
-                .lane_states(head)
-                .remove(&request)
+                .resident_mut(request)
+                .and_then(|resident| resident.lane_mut(head).take())
                 .expect("state checked above");
             let relocation = match OwnedTailRelocation::prepare(state, demand.domain) {
                 Ok(relocation) => relocation,
                 Err((state, error)) => {
-                    self.lane_states(head).insert(request, state);
+                    *self.resident_mut(request).expect("state checked above").lane_mut(head) = Some(state);
                     return Err(error.into());
                 }
             };
             if let Err(error) = self.submit_store_copy(&store, relocation.copy()) {
-                self.lane_states(head).insert(request, relocation.abort());
+                *self.resident_mut(request).expect("state checked above").lane_mut(head) = Some(relocation.abort());
                 return Err(error);
             }
-            self.lane_states(head).insert(request, relocation.commit());
+            *self.resident_mut(request).expect("state checked above").lane_mut(head) = Some(relocation.commit());
         }
         Ok(())
-    }
-
-    /// The accepted states of the head or target lane.
-    fn lane_states(&mut self, head: bool) -> &mut BTreeMap<RequestId, SequenceState> {
-        if head {
-            &mut self.head
-        } else {
-            &mut self.target
-        }
     }
 
     /// Commit the successor banks a newly opened request needs. Free banks
@@ -1265,12 +1257,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // backed from its open ([`Self::back_reservation`]): room the
         // shrink keeps, as no surplus.
         let steps = self.execution.policy().limits().target_successor_banks();
-        let live = if head { &self.head } else { &self.target };
         let mut rows = Vec::new();
-        for (request, state) in live {
-            rows.extend(state.demands(self.unwritten_rows(*request).max(steps)));
+        let mut count = 0usize;
+        for (_, resident) in self.resident_requests() {
+            if let Some(state) = resident.lane(head) {
+                rows.extend(state.demands(resident.unwritten_rows().max(steps)));
+                count += 1;
+            }
         }
-        let next = magnitude_state::NextSteps { rows, banks: steps * live.len() };
+        let next = magnitude_state::NextSteps { rows, banks: steps * count };
         Ok(bindings.store(head).shrink(&next)?)
     }
 
@@ -1403,11 +1398,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let referenced = self.target_store.referenced_slab_bytes() + self.head_store.as_ref().map_or(0, |store| store.referenced_slab_bytes());
             let ledger = self.resources.ledgers().device();
             let written = self
-                .state_claims
-                .iter()
-                .map(|(sequence, state)| ledger.bytes(&crate::memory::ledger::Need::Request { sequence: *sequence, rows: state.through() }))
+                .resident_requests()
+                .map(|(sequence, resident)| ledger.bytes(&crate::memory::ledger::Need::Request { sequence, rows: resident.claim.through() }))
                 .sum::<u64>();
-            let committed = self.state_claims.values().map(crate::memory::ledger::Reservation::bytes).sum::<u64>() + self.request_slot.bytes();
+            let committed = self.resident_requests().map(|(_, resident)| resident.claim.bytes()).sum::<u64>() + self.request_slot.bytes();
             self.state_slabs.settle(ledger, backed, referenced, written, committed);
             changed
         })
@@ -1654,7 +1648,7 @@ mod group_demand_tests {
             .install_input(request, PreparedModelInput::continuation_only())
             .unwrap();
         domain.open_served(&mut bindings, request, None).unwrap();
-        assert_eq!(domain.state_claims[&request].through(), 0);
+        assert_eq!(domain.resident(request).unwrap().claim.through(), 0);
         // Priming requires binding the head component, which is disabled on
         // this fixture, so `provision` fails after `grant_state_growth`.
         let op = Operation::Forward {
@@ -1678,7 +1672,7 @@ mod group_demand_tests {
         let err = domain.provision(&mut bindings, &[op], None).unwrap_err();
         assert!(matches!(err, DomainError::Input(_)), "unexpected error: {err:?}");
         assert_eq!(
-            domain.state_claims[&request].through(),
+            domain.resident(request).unwrap().claim.through(),
             0,
             "a refused provision must not inflate Reservation::through()"
         );

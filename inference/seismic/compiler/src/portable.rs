@@ -4406,15 +4406,7 @@ fn lower_captured_expr_with<B: seismic_native_target::TargetFamily>(
         CapturedExpr::Cmp(op, a, b) => {
             let a = lower_captured_expr_with(kernel, a, binders);
             let b = lower_captured_expr_with(kernel, b, binders);
-            let op = match op {
-                seismic_lang::expr::CmpOp::Eq => CmpOp::Eq,
-                seismic_lang::expr::CmpOp::Ne => CmpOp::Ne,
-                seismic_lang::expr::CmpOp::Lt => CmpOp::Lt,
-                seismic_lang::expr::CmpOp::Le => CmpOp::Le,
-                seismic_lang::expr::CmpOp::Gt => CmpOp::Gt,
-                seismic_lang::expr::CmpOp::Ge => CmpOp::Ge,
-            };
-            kernel.cmp(op, a, b)
+            kernel.cmp(*op, a, b)
         }
         CapturedExpr::In(operand, values) => {
             let operand = lower_captured_expr_with(kernel, operand, binders);

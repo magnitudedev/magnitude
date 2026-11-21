@@ -7,7 +7,7 @@
 //! the seconds its holding saves per byte, counted over its uses since it
 //! was retained and never decayed, the order the ledger takes cache in.
 
-use super::{BankHolding, BankStep, DomainError, ExogenousShrink, ExecutorDomain, OptionalComponent, ProgramFamily, StateBindings};
+use super::{BankHolding, BankStep, ComponentLoader, DomainError, ExogenousShrink, ExecutorDomain, OptionalComponent, ProgramFamily, StateBindings};
 use crate::experts::derived::BankMove;
 use crate::memory::ledger::{CacheKind, Cached, Claim, CommittedKind, Keeping, Value};
 use magnitude_cost_model::WorkloadRates;
@@ -203,13 +203,40 @@ pub enum Yielded {
     Nothing,
 }
 
-/// An optional component held as cache while no request is resident: its
-/// weights' claims, which its loader keeps while it is in use, and its
-/// binding's.
-pub(super) struct IdleComponent {
-    pub(super) component: OptionalComponent,
-    weights: Vec<Cached>,
-    binding: Vec<Cached>,
+/// The claims of a bound optional component held as cache while no request
+/// is resident: its weights' claims, which its loader keeps while it is in
+/// use, and its binding's.
+pub(super) struct IdleCache {
+    pub(super) weights: Vec<Cached>,
+    pub(super) binding: Vec<Cached>,
+}
+
+/// Lifecycle of an optional component (drafter head or vision encoder).
+/// A component without a loader is [`Self::Absent`] and can never hold
+/// binding claims or idle cache.
+pub(super) enum OptionalSlot<T: Clone> {
+    /// This load has no such optional component.
+    Absent,
+    /// Present in the load, not currently bound.
+    Unloaded(ComponentLoader<T>),
+    /// Imported and bound for active use.
+    Bound {
+        loader: ComponentLoader<T>,
+        binding: Vec<Claim>,
+    },
+    /// Bound while no request is resident; its weight and binding claims
+    /// are held as cache on the ledger so they may be yielded under pressure.
+    Idle {
+        loader: ComponentLoader<T>,
+        cache: IdleCache,
+    },
+    /// Temporarily kept in an open's keep phase before it either activates
+    /// (`Bound`) or rolls back (`Idle`).
+    Kept {
+        loader: ComponentLoader<T>,
+        weights: Vec<Claim>,
+        binding: Vec<Claim>,
+    },
 }
 
 /// What the load served since it opened, counted and never decayed: the
@@ -226,28 +253,12 @@ pub(super) struct Served {
     vision: u64,
 }
 
-/// An idle optional component kept for a request that opens
-/// ([`ExecutorDomain::keep_components`]): its weights' and binding's
-/// claims, committed again in place, until the open stands
-/// ([`ExecutorDomain::activate_components`]) or is refused
-/// ([`ExecutorDomain::idle_kept`]).
-pub(super) struct KeptComponent {
-    component: OptionalComponent,
-    weights: Vec<Claim>,
-    binding: Vec<Claim>,
-}
-
-impl IdleComponent {
-    /// `component` idling as cache: its weights' and binding's claims
-    /// turned in place, so the ledger may take them; none where it holds
-    /// neither.
-    fn of(component: OptionalComponent, weights: Vec<Claim>, binding: Vec<Claim>) -> Option<Self> {
-        let kind = match component {
-            OptionalComponent::Drafter => CacheKind::Drafter,
-            OptionalComponent::Vision => CacheKind::Vision,
-        };
+impl IdleCache {
+    /// `kind` idling as cache: its weights' and binding's claims turned in
+    /// place, so the ledger may take them; none where it holds neither.
+    fn of(kind: CacheKind, weights: Vec<Claim>, binding: Vec<Claim>) -> Option<Self> {
         let cache = |claims: Vec<Claim>| claims.into_iter().map(|claim| claim.into_cache(kind, crate::memory::ledger::Reclaim::Deferred)).collect::<Vec<_>>();
-        (!weights.is_empty() || !binding.is_empty()).then(|| Self { component, weights: cache(weights), binding: cache(binding) })
+        (!weights.is_empty() || !binding.is_empty()).then(|| Self { weights: cache(weights), binding: cache(binding) })
     }
 
     /// Its bytes on the ledger.
@@ -256,8 +267,148 @@ impl IdleComponent {
     }
 
     /// Whether the ledger took any of it: its holder frees it whole.
-    fn taken(&self) -> bool {
+    pub(super) fn taken(&self) -> bool {
         self.weights.iter().chain(&self.binding).any(|cached| cached.releasing() > 0)
+    }
+
+    /// Value every cached claim held for this component.
+    fn value(&self, value: Value) {
+        self.weights.iter().chain(&self.binding).for_each(|cached| cached.value(value));
+    }
+}
+
+impl<T: Clone> OptionalSlot<T> {
+    pub(super) fn from_loader(loader: Option<ComponentLoader<T>>) -> Self {
+        match loader {
+            Some(loader) => Self::Unloaded(loader),
+            None => Self::Absent,
+        }
+    }
+
+    pub(super) fn loader(&self) -> Option<&ComponentLoader<T>> {
+        match self {
+            Self::Absent => None,
+            Self::Unloaded(loader)
+            | Self::Bound { loader, .. }
+            | Self::Idle { loader, .. }
+            | Self::Kept { loader, .. } => Some(loader),
+        }
+    }
+
+    pub(super) fn imported(&self) -> bool {
+        self.loader().is_some_and(ComponentLoader::imported)
+    }
+
+    pub(super) fn own_bytes(&self) -> Result<u64, &'static str> {
+        self.loader().map_or(Ok(0), ComponentLoader::own_bytes)
+    }
+
+    pub(super) fn mark_bound(&mut self, binding: Vec<Claim>) {
+        let Self::Unloaded(loader) = std::mem::replace(self, Self::Absent) else {
+            panic!("invariant violated: binding an optional component that is not unloaded");
+        };
+        *self = Self::Bound { loader, binding };
+    }
+
+    pub(super) fn extend_binding(&mut self, claims: Vec<Claim>) {
+        let Self::Bound { binding, .. } = self else {
+            panic!("invariant violated: extending binding claims of an unbound optional component");
+        };
+        binding.extend(claims);
+    }
+
+    pub(super) fn clear_binding(&mut self) {
+        if !matches!(self, Self::Bound { .. }) {
+            return;
+        }
+        let Self::Bound { loader, .. } = std::mem::replace(self, Self::Absent) else {
+            unreachable!()
+        };
+        *self = Self::Unloaded(loader);
+    }
+
+    pub(super) fn unload(&mut self) {
+        self.clear_binding();
+        if let Some(loader) = self.loader() {
+            loader.unload();
+        }
+    }
+
+    pub(super) fn idle(&mut self, kind: CacheKind) {
+        if !matches!(self, Self::Bound { .. }) {
+            return;
+        }
+        let Self::Bound { loader, binding } = std::mem::replace(self, Self::Absent) else {
+            unreachable!()
+        };
+        let weights = loader.take_claims();
+        *self = match IdleCache::of(kind, weights, binding) {
+            Some(cache) => Self::Idle { loader, cache },
+            None => Self::Bound { loader, binding: Vec::new() },
+        };
+    }
+
+    pub(super) fn idle_cache(&self) -> Option<&IdleCache> {
+        match self {
+            Self::Idle { cache, .. } => Some(cache),
+            _ => None,
+        }
+    }
+
+    pub(super) fn take_idle_if(&mut self, predicate: impl FnOnce(&IdleCache) -> bool) -> Option<IdleCache> {
+        if !matches!(self, Self::Idle { cache, .. } if predicate(cache)) {
+            return None;
+        }
+        let Self::Idle { loader, cache } = std::mem::replace(self, Self::Absent) else {
+            unreachable!()
+        };
+        *self = Self::Unloaded(loader);
+        Some(cache)
+    }
+
+    pub(super) fn keep(&mut self, keeping: &Keeping) -> Option<Vec<Cached>> {
+        if !matches!(self, Self::Idle { .. }) {
+            return None;
+        }
+        let Self::Idle { loader, cache: IdleCache { weights, binding } } = std::mem::replace(self, Self::Absent) else {
+            unreachable!()
+        };
+        let split = weights.len();
+        match keeping.keep(weights.into_iter().chain(binding).collect(), CommittedKind::Component) {
+            Ok(mut weights) => {
+                let binding = weights.split_off(split);
+                *self = Self::Kept { loader, weights, binding };
+                None
+            }
+            Err(taken) => {
+                *self = Self::Unloaded(loader);
+                Some(taken)
+            }
+        }
+    }
+
+    pub(super) fn activate(&mut self) {
+        if !matches!(self, Self::Kept { .. }) {
+            return;
+        }
+        let Self::Kept { loader, weights, binding } = std::mem::replace(self, Self::Absent) else {
+            unreachable!()
+        };
+        loader.restore_claims(weights);
+        *self = Self::Bound { loader, binding };
+    }
+
+    pub(super) fn idle_kept(&mut self, kind: CacheKind) {
+        if !matches!(self, Self::Kept { .. }) {
+            return;
+        }
+        let Self::Kept { loader, weights, binding } = std::mem::replace(self, Self::Absent) else {
+            unreachable!()
+        };
+        *self = match IdleCache::of(kind, weights, binding) {
+            Some(cache) => Self::Idle { loader, cache },
+            None => Self::Bound { loader, binding: Vec::new() },
+        };
     }
 }
 
@@ -335,7 +486,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None => BankStep::Deferred,
             Some(_) => {
                 let experts = self.measures.as_ref().and_then(|measures| measures.experts.as_ref());
-                bank.shrink(holding, to, &mut || self.queue.conclude(&mut self.target, experts, Some(bank)), wake)?
+                bank.shrink(holding, to, &mut || self.queue.conclude(&mut self.requests, experts, Some(bank)), wake)?
             }
         };
         match step {
@@ -372,8 +523,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// A request arrived, its input encoded by the vision projector where
     /// `vision`: a use of the drafter, and of the projector with images.
     pub fn served_request(&mut self, vision: bool) {
-        self.served.drafter += u64::from(self.head_loader.as_ref().is_some_and(|loader| loader.imported()));
-        self.served.vision += u64::from(vision && self.vision_loader.as_ref().is_some_and(|loader| loader.imported()));
+        self.served.drafter += u64::from(self.head_component.imported());
+        self.served.vision += u64::from(vision && self.vision_component.imported());
     }
 
     /// The slots the bank and its host tier hold now, as the decode
@@ -439,14 +590,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         if let Some(read) = self.expert_measures().and_then(|measures| measures.read.measured().copied()) {
             let served = self.served;
-            for idle in &mut self.idle_components {
-                let uses = match idle.component {
-                    OptionalComponent::Drafter => served.drafter,
-                    OptionalComponent::Vision => served.vision,
-                };
-                let Some(bytes) = std::num::NonZeroU64::new(idle.bytes()) else { continue };
-                let value = Value::recompute(read.seconds(bytes.get()), uses, bytes);
-                idle.weights.iter().chain(&idle.binding).for_each(|cached| cached.value(value));
+            for (cache, uses) in [
+                (self.head_component.idle_cache(), served.drafter),
+                (self.vision_component.idle_cache(), served.vision),
+            ] {
+                let Some(cache) = cache else { continue };
+                let Some(bytes) = std::num::NonZeroU64::new(cache.bytes()) else { continue };
+                cache.value(Value::recompute(read.seconds(bytes.get()), uses, bytes));
             }
         }
         Ok(())
@@ -463,12 +613,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn release_yielded(&mut self, bindings: &mut StateBindings, wake: crate::CompletionWake) -> Result<Yielded, DomainError> {
         self.idle_optional();
         let mut freed = false;
-        if self.idle_components.iter().any(IdleComponent::taken) {
-            let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.idle_components).into_iter().partition(IdleComponent::taken);
-            self.idle_components = kept;
-            for idle in taken {
-                self.unload_component(idle.component, idle);
-            }
+        if let Some(cache) = self.head_component.take_idle_if(IdleCache::taken) {
+            self.unload_component(OptionalComponent::Drafter, cache);
+            freed = true;
+        }
+        if let Some(cache) = self.vision_component.take_idle_if(IdleCache::taken) {
+            self.unload_component(OptionalComponent::Vision, cache);
             freed = true;
         }
         let (mut released, mut returned) = (0, 0);
@@ -527,14 +677,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if !self.optional_idle() {
             return;
         }
-        if let Some(loader) = self.head_loader.as_ref().filter(|loader| loader.imported()) {
-            let binding = std::mem::take(&mut self.head_binding);
-            self.idle_components.extend(IdleComponent::of(OptionalComponent::Drafter, loader.take_claims(), binding));
-        }
-        if let Some(loader) = self.vision_loader.as_ref().filter(|loader| loader.imported()) {
-            let binding = std::mem::take(&mut self.vision_binding);
-            self.idle_components.extend(IdleComponent::of(OptionalComponent::Vision, loader.take_claims(), binding));
-        }
+        self.head_component.idle(CacheKind::Drafter);
+        self.vision_component.idle(CacheKind::Vision);
     }
 
     /// As a request opens, in its change's keep phase, before its
@@ -542,44 +686,27 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// place ([`Keeping::keep`]), each whole where an earlier claim took
     /// none of it; one it took any of is unloaded whole, and its next use
     /// loads it again.
-    pub(super) fn keep_components(&mut self, keeping: &Keeping) -> Vec<KeptComponent> {
-        let mut kept = Vec::new();
-        for IdleComponent { component, weights, binding } in std::mem::take(&mut self.idle_components) {
-            let split = weights.len();
-            match keeping.keep(weights.into_iter().chain(binding).collect(), CommittedKind::Component) {
-                Ok(mut weights) => {
-                    let binding = weights.split_off(split);
-                    kept.push(KeptComponent { component, weights, binding });
-                }
-                Err(taken) => self.unload_component(component, taken),
-            }
+    pub(super) fn keep_components(&mut self, keeping: &Keeping) {
+        if let Some(taken) = self.head_component.keep(keeping) {
+            self.unload_component(OptionalComponent::Drafter, taken);
         }
-        kept
+        if let Some(taken) = self.vision_component.keep(keeping) {
+            self.unload_component(OptionalComponent::Vision, taken);
+        }
     }
 
     /// The open stands: the kept components are its loaders' and
     /// bindings' again, to draft and encode with.
-    pub(super) fn activate_components(&mut self, kept: Vec<KeptComponent>) {
-        for KeptComponent { component, weights, binding } in kept {
-            match component {
-                OptionalComponent::Drafter => {
-                    self.head_loader.as_ref().expect("an idle drafter has its loader").restore_claims(weights);
-                    self.head_binding = binding;
-                }
-                OptionalComponent::Vision => {
-                    self.vision_loader.as_ref().expect("an idle vision encoder has its loader").restore_claims(weights);
-                    self.vision_binding = binding;
-                }
-            }
-        }
+    pub(super) fn activate_components(&mut self) {
+        self.head_component.activate();
+        self.vision_component.activate();
     }
 
     /// The open is refused: the kept components idle as cache again, as
     /// they were, values and all.
-    pub(super) fn idle_kept(&mut self, kept: Vec<KeptComponent>) {
-        for KeptComponent { component, weights, binding } in kept {
-            self.idle_components.extend(IdleComponent::of(component, weights, binding));
-        }
+    pub(super) fn idle_kept(&mut self) {
+        self.head_component.idle_kept(CacheKind::Drafter);
+        self.vision_component.idle_kept(CacheKind::Vision);
     }
 
     /// Unload `component` whole: unbound, its imports released, and `held`,
@@ -594,9 +721,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         changes.change(|_| {
             self.unbind(component);
             match component {
-                OptionalComponent::Drafter => self.head_loader.as_ref().map(|loader| loader.unload()),
-                OptionalComponent::Vision => self.vision_loader.as_ref().map(|loader| loader.unload()),
-            };
+                OptionalComponent::Drafter => self.head_component.unload(),
+                OptionalComponent::Vision => self.vision_component.unload(),
+            }
             drop(held);
         });
     }

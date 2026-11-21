@@ -36,11 +36,16 @@
 //!     - Outside a growth step, lowers B by the sustained thrash excess, once
 //!       per confirmed streak, tightening an existing cap in place without
 //!       snapping down to lower held bytes.
-//!   - Regrowth past B needs a real exogenous change with calm paging and
-//!     `Normal` pressure: the store's `room` risen by `step` since B was set,
-//!     others' cold pages risen by `step`, or free supply risen by
-//!     `step.max(unit)` while `held + free` also exceeds `cap.anchor`
-//!     (invariant under our own shrinks, since `-Δheld + Δfree == 0`).
+//!   - Regrowth past B never clears B to `None` across an unverified cold
+//!     overhang:
+//!     - Exogenous free release (`held + free` rising above `cap.anchor` by
+//!       `min_gain`, invariant under our own shrinks since `-Δheld + Δfree == 0`
+//!       and immune to inactive `cold` page re-aging) raises B by that exact
+//!       gain, clearing B to `None` only when no unverified cold overhang sits
+//!       above the raised ceiling.
+//!     - On judged OSes, sustained uninterrupted calm (`CALM_PROBE_BASE` with
+//!       exponential backoff per consecutive wall strike) raises B by one
+//!       bounded probe increment, never jumping straight to `None`.
 //!   - Each OS pressure event (`seismic::PressureEvents`) while pressure is
 //!     above `Normal` lowers B by one block (`unit`) per event; if pressure
 //!     persists silently under immediate scarcity (`free <= scarcity_cushion`)
@@ -69,6 +74,12 @@ const EXOGENOUS_RELIEF_TOLERANCE: u64 = 64 * (1 << 20);
 /// steps `cap` down by one block (`unit`).
 const STANDING_WARN_DWELL: Duration = Duration::from_secs(1);
 const STANDING_CRITICAL_DWELL: Duration = Duration::from_millis(250);
+
+/// Base uninterrupted calm duration before probing a standing `Harm` cap upward
+/// by one bounded increment; doubles on each consecutive probe strike up to 16x.
+const CALM_PROBE_BASE: Duration = Duration::from_secs(30);
+const CALM_PROBE_MAX_SHIFT: u32 = 4;
+const CALM_PROBE_MIN_BYTES: u64 = 256 * (1 << 20);
 
 /// Immediate free + clean cache threshold at or below which the host is
 /// considered scarce (relying on compression/swap), so sustained high-rate
@@ -386,21 +397,28 @@ struct Step {
     from: u64,
     /// The reading that last saw it grow.
     grown: Instant,
+    /// Whether this growth step triggered `Harm` before closing.
+    harmed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Cap {
     /// The most the process may hold.
     bytes: u64,
-    /// The step's bytes: the evidence a regrowth needs.
+    /// The step's bytes: minimum exogenous gain before raising `bytes`.
     step: u64,
-    /// The room, others' cold pages, immediate free supply, and total
-    /// `held + free` anchor captured when this cap was created (never mutated
-    /// on own shrinks so `-Δheld + Δfree` cannot self-lift B).
-    room: u64,
-    cold: u64,
+    /// Immediate free supply and `held + free` anchor captured when this cap
+    /// was created (tracking the trough on others' growth, invariant under our
+    /// own shrinks since `-Δheld + Δfree == 0`, and excluding `cold` so
+    /// inactive page re-aging never self-lifts B).
     free: u64,
     anchor: u64,
+    /// When the current uninterrupted calm stretch under this cap began.
+    calm_since: Option<Instant>,
+    /// Consecutive times a probe past this wall re-triggered Harm; doubles the
+    /// calm dwell before the next probe (up to `1 << CALM_PROBE_MAX_SHIFT`) and
+    /// resets on a calm completed growth step or exogenous free release.
+    strikes: u32,
 }
 
 impl Boundary {
@@ -409,7 +427,6 @@ impl Boundary {
         let Observed { paging, total, allocated, held, room, free, unit, events, committed } = now;
         self.committed = committed;
         let seismic::Counted { at, lag } = paging.counted;
-        let cold = paging.cold;
         self.harmed = None;
         let scarce_free = free <= scarcity_cushion(total, unit);
         // When over half of total RAM is immediately free + clean cache
@@ -459,21 +476,20 @@ impl Boundary {
                     Cap {
                         bytes: next,
                         step: cap.step.saturating_add(lowered),
+                        calm_since: None,
                         ..cap
                     }
                 }
-                None => Cap { bytes, step: blocks, room, cold, free, anchor },
+                None => Cap { bytes, step: blocks, free, anchor, calm_since: None, strikes: 0 },
             };
             self.cap = Some(cap);
         }
-        // Track the trough of exogenous room/cold/anchor while `cap` stands:
-        // our own shrinks preserve `room` (`-Δin_use + Δsupply == 0`) and
-        // `held + free` (`-Δheld + Δfree == 0`), so only others' growth lowers
-        // these troughs. Recording the trough ensures that once a competing app
-        // exits after pushing `room` down, recovery from the trough lifts `cap`.
+        // Track the trough of immediate `free` and `held + free` while `cap`
+        // stands: our own shrinks preserve `held + free` (`-Δheld + Δfree == 0`)
+        // and other apps' pages cycling `active <-> inactive` never enter `free`,
+        // so only others' genuine growth lowers `anchor`, and their exit lifts it.
         if let Some(cap) = self.cap.as_mut() {
-            cap.room = cap.room.min(room);
-            cap.cold = cap.cold.min(cold);
+            cap.free = cap.free.min(free);
             cap.anchor = cap.anchor.min(held.saturating_add(free));
         }
         let pressure_calm = self.level.is_none()
@@ -482,21 +498,14 @@ impl Boundary {
                     || (self.level == Some(seismic::PressureLevel::Warn)
                         && paging.harm.is_some()
                         && !scarce_free)));
-        let max_lift_gain = scarcity_cushion(total, unit).max(unit);
-        let lifted = |cap: &Cap| {
-            let min_gain = cap.step.min(max_lift_gain).max(unit);
-            room >= cap.room.saturating_add(min_gain)
-                || cold >= cap.cold.saturating_add(min_gain)
-                || (pressure_calm
-                    && free >= cap.free.saturating_add(min_gain)
-                    && held.saturating_add(free) >= cap.anchor.saturating_add(min_gain))
-        };
         let Some(harm) = paging.harm else {
             // No share of the process's is counted: nothing judges harm,
             // growth or a step; B, where pressure set it, lifts on others' release.
             self.unjudged = true;
-            if pressure_calm && self.cap.as_ref().is_some_and(lifted) {
-                self.cap = None;
+            if pressure_calm {
+                self.raise_on_exogenous_release(held, free, room, unit, total, at);
+            } else if let Some(cap) = self.cap.as_mut() {
+                cap.calm_since = None;
             }
             return;
         };
@@ -541,8 +550,8 @@ impl Boundary {
             None
         };
         if allocated > last.allocated {
-            let from = self.step.map_or(last.held, |step| step.from);
-            self.step = Some(Step { from, grown: at });
+            let (from, harmed) = self.step.map_or((last.held, false), |step| (step.from, step.harmed));
+            self.step = Some(Step { from, grown: at, harmed });
             self.quiet_since = None;
         }
         let thrashing = confirmed_excess.is_some();
@@ -550,20 +559,26 @@ impl Boundary {
             Some(step) if thrashing => {
                 // Sustained thrashing within our growth step's window: return
                 // B to the holding before the step began, never below committed.
+                self.step = Some(Step { harmed: true, ..step });
                 let floor_from = step.from.max(self.committed);
                 let delta = held.saturating_sub(floor_from).max(unit).max(paging.page_bytes);
                 self.settle(Cap {
                     bytes: floor_from,
                     step: delta,
-                    room,
-                    cold,
                     free,
                     anchor: held.saturating_add(free),
+                    calm_since: None,
+                    strikes: 0,
                 });
             }
             Some(step) if allocated <= last.allocated && last.at >= step.grown + window => {
                 self.step = None;
                 self.judged = true;
+                if !step.harmed {
+                    if let Some(cap) = self.cap.as_mut() {
+                        cap.strikes = 0;
+                    }
+                }
             }
             Some(_) => {}
             None => {
@@ -581,16 +596,17 @@ impl Boundary {
                             Cap {
                                 bytes: next,
                                 step: cap.step.saturating_add(lowered),
+                                calm_since: None,
                                 ..cap
                             }
                         }
                         None => Cap {
                             bytes: held.saturating_sub(excess).max(self.committed),
                             step: excess.max(unit).max(paging.page_bytes),
-                            room,
-                            cold,
                             free,
                             anchor,
+                            calm_since: None,
+                            strikes: 0,
                         },
                     });
                 }
@@ -601,16 +617,82 @@ impl Boundary {
             }
         }
         let calm = !thrashing && self.thrash.is_none() && self.step.is_none() && pressure_calm;
-        if calm && self.cap.as_ref().is_some_and(lifted) {
+        if calm {
+            if !self.raise_on_exogenous_release(held, free, room, unit, total, at) {
+                self.probe_after_calm(held, room, unit, total, at);
+            }
+        } else if let Some(cap) = self.cap.as_mut() {
+            cap.calm_since = None;
+        }
+    }
+
+    /// Raise (or clear) a standing cap when genuine exogenous free supply
+    /// (`held + free`, excluding `cold_reclaimable`) rises above `cap.anchor`
+    /// by at least `min_gain`. Clears `cap` to `None` only when no unverified
+    /// `cold` overhang remains above the raised ceiling (`raised >= room` or
+    /// `room <= held + free + unit`), so an exogenous release never triggers an
+    /// unbounded leap into a known `Harm` wall. Returns whether `cap` moved.
+    fn raise_on_exogenous_release(&mut self, held: u64, free: u64, room: u64, unit: u64, total: u64, at: Instant) -> bool {
+        let Some(cap) = self.cap else { return false };
+        let max_lift_gain = scarcity_cushion(total, unit).max(unit);
+        let min_gain = cap.step.min(max_lift_gain).max(unit);
+        let held_plus_free = held.saturating_add(free);
+        let gain = held_plus_free.saturating_sub(cap.anchor);
+        let free_gain = free.saturating_sub(cap.free);
+        if gain < min_gain || free_gain < min_gain {
+            return false;
+        }
+        let raised = cap.bytes.saturating_add(gain);
+        let no_cold_overhang = room <= held_plus_free.saturating_add(unit);
+        if no_cold_overhang || raised >= room {
             self.cap = None;
+        } else {
+            self.cap = Some(Cap {
+                bytes: raised,
+                free,
+                anchor: held_plus_free,
+                calm_since: Some(at),
+                strikes: 0,
+                ..cap
+            });
+        }
+        true
+    }
+
+    /// After sustained uninterrupted calm under a standing cap on a judged OS,
+    /// raise `cap.bytes` by one bounded probe increment (never clearing to
+    /// `None`) with exponential backoff across consecutive wall-hit strikes.
+    fn probe_after_calm(&mut self, held: u64, room: u64, unit: u64, total: u64, at: Instant) {
+        let Some(cap) = self.cap.as_mut() else { return };
+        if unit == 0 {
+            return;
+        }
+        let since = *cap.calm_since.get_or_insert(at);
+        let dwell = CALM_PROBE_BASE.saturating_mul(1u32 << cap.strikes.min(CALM_PROBE_MAX_SHIFT));
+        if at.saturating_duration_since(since) < dwell {
+            return;
+        }
+        let probe = unit.max(CALM_PROBE_MIN_BYTES).min(scarcity_cushion(total, unit).max(unit));
+        let next = cap.bytes.saturating_add(probe);
+        if held.saturating_add(probe) > cap.bytes && room >= next {
+            cap.bytes = next;
+            cap.calm_since = Some(at);
         }
     }
 
     /// Hold no more than `cap` allows from now, a lower boundary standing.
-    fn settle(&mut self, cap: Cap) {
+    fn settle(&mut self, mut cap: Cap) {
         self.cap = Some(match self.cap {
-            Some(standing) if standing.bytes <= cap.bytes => standing,
-            _ => cap,
+            Some(standing) if standing.bytes <= cap.bytes => Cap {
+                calm_since: None,
+                strikes: standing.strikes.saturating_add(1),
+                ..standing
+            },
+            Some(standing) => {
+                cap.strikes = standing.strikes.saturating_add(1);
+                cap
+            }
+            None => cap,
         });
     }
 
@@ -646,6 +728,9 @@ impl Boundary {
         self.thrash = None;
         self.harmed = None;
         self.pressed = None;
+        if let Some(cap) = self.cap.as_mut() {
+            cap.calm_since = None;
+        }
     }
 
     /// Whether a growth step's window λ_h is open, so only a later reading
@@ -970,5 +1055,114 @@ mod tests {
         lower_committed.committed = 16 * GB;
         floored.observe(lower_committed);
         assert_eq!(floored.cap(), Some(20 * GB), "cap.bytes must never have ratcheted below the committed floor");
+    }
+
+    /// Reproduces the 64 GiB M4 Max sawtooth oscillation (`PID 91361`):
+    /// growing into `cold_reclaimable` triggers `Harm` at the working-set wall
+    /// while other apps' pages wake up (`cold` and `room` dip); shrinking back
+    /// returns our own bytes to `free`, and 2 s later those apps' pages age
+    /// back to `cold` (`cold` and `room` jump +3.5 GiB). `Cap` must NOT clear
+    /// to `None` on own shrink or `cold`/`room` re-aging; calm probing must
+    /// step up in bounded increments with exponential backoff on repeated wall
+    /// hits; and a genuine exogenous free release must raise `Cap` smoothly by
+    /// the freed bytes without leaping into an unverified `cold` overhang.
+    #[test]
+    fn harm_wall_never_sawtooths_on_cold_reaging_or_own_shrink_and_backs_off_probes() {
+        let mut boundary = Boundary::default();
+        let start = Instant::now();
+        let total = 64 * GB;
+        let unit = 68 * MB;
+        let committed = 7 * GB;
+        let page = 16 * 1024;
+        let obs_with_cold = |at: Instant, machine: u64, held: u64, free: u64, cold: u64| Observed {
+            paging: Paging {
+                harm: Some(seismic::Harm { machine, own: 0 }),
+                page_bytes: page,
+                cold,
+                own_cold: None,
+                pressure: Some(seismic::PressureLevel::Normal),
+                counted: seismic::Counted { at, lag: LAG },
+            },
+            total,
+            allocated: held,
+            held,
+            room: held + free + cold,
+            free,
+            unit,
+            events: 0,
+            committed,
+        };
+
+        // Calm baseline at 35.7 GiB held with 3.5 GiB of inactive desktop pages (`cold`).
+        let wall = 35 * GB + 700 * MB;
+        boundary.observe(obs_with_cold(start, 0, wall, 2 * GB, 3500 * MB));
+        boundary.observe(obs_with_cold(start + Duration::from_secs(1), 0, wall, 2 * GB, 3500 * MB));
+        assert!(boundary.judges());
+
+        // Bank grows +3.3 GiB into `cold_reclaimable`; apps wake their pages (`cold` dips to 500 MiB)
+        // and thrash at 256 MiB/s across 2 spans -> Harm sets `cap = Some(wall)`.
+        let grown = wall + 3300 * MB;
+        let rate_pages = (256 * MB) / page;
+        boundary.observe(obs_with_cold(start + Duration::from_secs(2), rate_pages, grown, 0, 500 * MB));
+        boundary.observe(obs_with_cold(start + Duration::from_secs(3), 2 * rate_pages, grown, 0, 500 * MB));
+        assert_eq!(boundary.cap(), Some(wall), "growth-step Harm must cap at pre-step holding");
+
+        // Bank shrinks -3.3 GiB back to `wall`, returning 3.3 GiB to `free` (`held + free == anchor`).
+        // 2 s later, other apps' pages age back to inactive (`cold` jumps +3.5 GiB, `room` jumps +3.5 GiB).
+        for sec in 4..=25 {
+            let cold = if sec <= 5 { 500 * MB } else { 4000 * MB };
+            boundary.observe(obs_with_cold(start + Duration::from_secs(sec), 2 * rate_pages, wall, 3300 * MB, cold));
+            assert_eq!(
+                boundary.cap(),
+                Some(wall),
+                "own shrink and cold/room re-aging at sec {sec} must never clear Cap to None"
+            );
+        }
+
+        // After CALM_PROBE_BASE (30 s) of uninterrupted calm (starting from step close at sec 4),
+        // `cap` probes upward by one bounded increment (256 MiB), never clearing to `None`.
+        boundary.observe(obs_with_cold(start + Duration::from_secs(35), 2 * rate_pages, wall, 3300 * MB, 4000 * MB));
+        let probed = wall + CALM_PROBE_MIN_BYTES;
+        assert_eq!(boundary.cap(), Some(probed), "sustained calm probes by one bounded increment");
+
+        // Probe grows +256 MiB and hits the exact same Harm wall -> snaps back to `wall` with backoff strike 1.
+        let mut pages = 2 * rate_pages;
+        pages += rate_pages;
+        boundary.observe(obs_with_cold(start + Duration::from_secs(36), pages, probed, 0, 500 * MB));
+        pages += rate_pages;
+        boundary.observe(obs_with_cold(start + Duration::from_secs(37), pages, probed, 0, 500 * MB));
+        assert_eq!(boundary.cap(), Some(wall), "failed probe snaps back to wall");
+
+        // Shrink back -256 MiB (returning 256 MiB to `free`, preserving `held + free == anchor`)
+        // and wait 40 s (> 30 s base, < 60 s backed-off dwell): must NOT probe yet.
+        let free_after_probe_shrink = CALM_PROBE_MIN_BYTES;
+        boundary.observe(obs_with_cold(start + Duration::from_secs(38), pages, wall, free_after_probe_shrink, 4000 * MB));
+        boundary.observe(obs_with_cold(start + Duration::from_secs(78), pages, wall, free_after_probe_shrink, 4000 * MB));
+        assert_eq!(boundary.cap(), Some(wall), "backed-off dwell (60 s) holds steady at +40 s");
+
+        // At +60 s of calm (sec 99), second bounded probe fires.
+        boundary.observe(obs_with_cold(start + Duration::from_secs(99), pages, wall, free_after_probe_shrink, 4000 * MB));
+        assert_eq!(boundary.cap(), Some(probed), "second probe fires once 60 s backoff dwell elapses");
+
+        // Genuine exogenous app exit frees +2 GiB of real RAM while 4 GiB of `cold` still overhangs:
+        // `cap` rises smoothly by +2 GiB (NOT `None`), preventing a +4 GiB leap into the cold wall.
+        boundary.observe(obs_with_cold(start + Duration::from_secs(100), pages, wall, free_after_probe_shrink + 2 * GB, 4000 * MB));
+        assert_eq!(
+            boundary.cap(),
+            Some(probed + 2 * GB),
+            "exogenous free release under cold overhang raises cap by the exact freed bytes"
+        );
+
+        // Another +6 GiB exogenous exit while 4 GiB of `cold` still overhangs raises cap by +6 GiB
+        // without leaping into the unverified cold overhang; once `cold` clears, an exogenous release
+        // clears `cap` cleanly to `None`.
+        boundary.observe(obs_with_cold(start + Duration::from_secs(101), pages, wall, free_after_probe_shrink + 8 * GB, 4000 * MB));
+        assert_eq!(
+            boundary.cap(),
+            Some(probed + 8 * GB),
+            "exogenous release under remaining cold overhang still bounds cap by exact freed bytes"
+        );
+        boundary.observe(obs_with_cold(start + Duration::from_secs(102), pages, wall, free_after_probe_shrink + 10 * GB, 0));
+        assert_eq!(boundary.cap(), None, "exogenous release with no cold overhang clears cap to None");
     }
 }

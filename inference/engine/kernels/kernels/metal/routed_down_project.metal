@@ -45,18 +45,12 @@ template <uint ROWS, uint LANES>
 kernel void routed_down_project_gathered(ROUTED_DOWN_PROJECT_PORTS) {
     constexpr uint TILE = routed::down_tile<ROWS, LANES>();
     constexpr uint SLOTS = uint(SEISMIC_DIM_K);
-    constexpr uint H = uint(SEISMIC_DIM_H);
     threadgroup float projected[SLOTS][routed::down_region<ROWS, LANES>()];
     const uint first = group.x * TILE;
     const routed::OutPublishedSlots<SLOTS> published{
         element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(published_cells),
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2};
-    routed::project_gathered<TILE, SLOTS, SLOTS, H>(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
-        sources, ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2,
-        uint(SEISMIC_DIM_M), group.y, sg, first, lane, projected[sg], published,
-        [&](ulong m, uint k, threadgroup float *region) {
-            routed::down_project<ROWS, LANES>(product, routes, sources, expert_down, tier_down, m, first, k, lane,
-                region, seismic_words);
-        });
+    routed::down_project_gathered<ROWS, LANES>(product, routes, sources, expert_down, tier_down, uint(SEISMIC_DIM_M),
+        group.y, first, sg, lane, projected[sg], published, seismic_words);
 }
 #endif
