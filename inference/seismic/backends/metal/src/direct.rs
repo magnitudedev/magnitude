@@ -579,31 +579,95 @@ impl Held {
     }
 }
 
-/// How a batch places its launches in compute encoders.
-enum Encoding {
-    /// The production form: each group of launches ([`DirectBatch::group`])
-    /// in a concurrent encoder of its own, except that consecutive groups of
-    /// one launch share a serial encoder, which runs them in order. Each
-    /// encoder runs after the one before ([`ordered`]). `open` is `None`
-    /// after an event command or a group boundary, until the next launch
-    /// opens an encoder of the `next` dispatch type. An indirect launch the
-    /// current command buffer does not admit ([`Held`]) begins the next.
-    Grouped {
-        open: Option<(
-            Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+/// Encoder state shared by grouped production batches (observed or not): each
+/// group of launches ([`DirectBatch::group`]) runs in a concurrent encoder of
+/// its own, except that consecutive groups of one launch share a serial
+/// encoder, which runs them in order. Each encoder runs after the one before
+/// ([`ordered`]). `open` is `None` after an event command or a group boundary,
+/// until the next launch opens an encoder of the `next` dispatch type. An
+/// indirect launch the current command buffer does not admit ([`Held`]) begins
+/// the next.
+struct GroupedState {
+    open: Option<(
+        Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+        MTLDispatchType,
+    )>,
+    next: MTLDispatchType,
+    /// The current command buffer's encoders' types.
+    held: Held,
+}
+
+impl GroupedState {
+    fn new() -> Self {
+        Self {
+            open: None,
+            // The first group sets it.
+            next: MTLDispatchType::Serial,
+            held: Held::Nothing,
+        }
+    }
+
+    fn end_open(&mut self) {
+        if let Some((encoder, _)) = self.open.take() {
+            crate::pooled(|| encoder.endEncoding());
+        }
+    }
+
+    fn group(&mut self, launches: usize) {
+        let dispatch = if launches > 1 {
+            MTLDispatchType::Concurrent
+        } else {
+            MTLDispatchType::Serial
+        };
+        if dispatch == MTLDispatchType::Serial
+            && self
+                .open
+                .as_ref()
+                .is_some_and(|(_, open)| *open == MTLDispatchType::Serial)
+        {
+            return;
+        }
+        self.next = dispatch;
+        self.end_open();
+    }
+
+    fn encoder(
+        &mut self,
+        open: impl FnOnce(
             MTLDispatchType,
-        )>,
-        next: MTLDispatchType,
-        /// The current command buffer's encoders' types.
-        held: Held,
-        /// An observed batch's ([`DirectBatch::observed`]) span pages, and
-        /// the pair the current command buffer leased at its first encoder.
-        spans: Option<(&'static LaunchTimestamps, Option<std::sync::Arc<SpanPair>>)>,
+        ) -> Result<
+            Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+            ExecutionError,
+        >,
+    ) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>, ExecutionError> {
+        if self.open.is_none() {
+            let encoder = open(self.next)?;
+            self.held = self.held.with(self.next);
+            self.open = Some((encoder, self.next));
+        }
+        let (encoder, _) = self.open.as_ref().expect("grouped encoder is open");
+        Ok(&**encoder)
+    }
+}
+
+/// How a batch places its launches in compute encoders and observes them.
+enum BatchMode {
+    /// The production form: grouped encoders, no timestamp observation.
+    Grouped(GroupedState),
+    /// Production grouped encoding whose device interval is observed
+    /// ([`DirectBatch::observed`]): each command buffer leases a [`SpanPair`]
+    /// at its first encoder.
+    Observed {
+        grouped: GroupedState,
+        timestamps: &'static LaunchTimestamps,
+        /// The pair the current command buffer leased at its first encoder.
+        span: Option<std::sync::Arc<SpanPair>>,
+        recording: Recording<std::sync::Arc<SpanPair>>,
     },
     /// Every launch in its own encoder, with the encoder's start and end
     /// timestamps sampled at stage boundaries into the page its command
-    /// buffer leased from `timestamps`; each encoder runs after the one
-    /// before ([`ordered`]). A command buffer whose page is full is
+    /// buffer leased from `timing.timestamps`; each encoder runs after the
+    /// one before ([`ordered`]). A command buffer whose page is full is
     /// committed and the next leases another.
     Timed {
         timing: Box<LaunchTiming>,
@@ -612,36 +676,26 @@ enum Encoding {
         /// The batch's host gates, in order.
         gates: Vec<Gate>,
         encoded: usize,
+        recording: Recording<usize>,
     },
 }
 
 /// What an observed or timed batch records of each command buffer it
-/// commits, read once the batch completes.
-struct CommandRecord {
+/// commits, read once the batch completes. `samples` is `None` when the
+/// command buffer encoded no launch.
+struct CommandRecord<S> {
     /// The host clock immediately before its commit.
     committed: f64,
     /// The values of the host gates it waited on before its first launch.
     gates: Vec<u64>,
-    samples: CommandSamples,
-}
-
-/// Where a command buffer's first launch's start and last launch's end are
-/// sampled.
-enum CommandSamples {
-    /// Nowhere: it encoded no launch.
-    None,
-    /// An observed batch's: the pair it leased at its first encoder.
-    Span(std::sync::Arc<SpanPair>),
-    /// A timed batch's: its launches' samples, part `n` of the batch's
-    /// launch timing.
-    Part(usize),
+    samples: Option<S>,
 }
 
 /// What an observed or timed batch records while it is encoded.
-struct Recording {
+struct Recording<S> {
     /// The GPU and host clocks when the batch was formed.
     calibration: TimestampPair,
-    committed: Vec<CommandRecord>,
+    committed: Vec<CommandRecord<S>>,
     /// The gates the current command buffer waits on.
     gates: Vec<u64>,
 }
@@ -669,55 +723,71 @@ fn blocked_parts(gates: &[Gate], parts: &[PartTicks]) -> usize {
         })
 }
 
-impl Recording {
+impl<S> Recording<S> {
     fn new(device: &MetalDevice) -> Self {
         Self { calibration: sample_timestamps(device), committed: Vec::new(), gates: Vec::new() }
     }
+
+    fn record(&mut self, samples: Option<S>) {
+        self.committed.push(CommandRecord {
+            committed: host_seconds(),
+            gates: std::mem::take(&mut self.gates),
+            samples,
+        });
+    }
 }
 
-impl Encoding {
-    /// Commit `command`, recording it in `recording` (an observed or timed
-    /// batch's): the samples of its launches go in flight with it.
+impl BatchMode {
+    fn grouped_mut(&mut self) -> Option<&mut GroupedState> {
+        match self {
+            Self::Grouped(grouped) | Self::Observed { grouped, .. } => Some(grouped),
+            Self::Timed { .. } => None,
+        }
+    }
+
+    /// Commit `command`, recording it in an observed or timed batch: the
+    /// samples of its launches go in flight with it.
     fn commit(
         &mut self,
         command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-        recording: Option<&mut Recording>,
     ) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
-        let samples = match self {
-            Self::Grouped { held, spans, .. } => {
-                *held = Held::Nothing;
-                match spans.as_mut().and_then(|(_, pair)| pair.take()) {
-                    Some(pair) => {
-                        pair.hold_until_completed(&command);
-                        CommandSamples::Span(pair)
-                    }
-                    None => CommandSamples::None,
-                }
+        match self {
+            Self::Grouped(grouped) => {
+                grouped.held = Held::Nothing;
             }
-            Self::Timed { timing, lease, .. } => match lease.take() {
-                Some(lease) => {
+            Self::Observed { grouped, span, recording, .. } => {
+                grouped.held = Held::Nothing;
+                let samples = span.take().map(|pair| {
+                    pair.hold_until_completed(&command);
+                    pair
+                });
+                recording.record(samples);
+            }
+            Self::Timed { timing, lease, recording, .. } => {
+                let samples = lease.take().map(|lease| {
                     timing.parts.push(timing.timestamps.commit(lease, &command));
-                    CommandSamples::Part(timing.parts.len() - 1)
-                }
-                None => CommandSamples::None,
-            },
-        };
-        if let Some(recording) = recording {
-            recording.committed.push(CommandRecord {
-                committed: host_seconds(),
-                gates: std::mem::take(&mut recording.gates),
-                samples,
-            });
+                    timing.parts.len() - 1
+                });
+                recording.record(samples);
+            }
         }
         crate::pooled(|| command.commit());
         command
     }
 
-    /// A timed batch's launch attribution.
-    fn launch_timing(self) -> Option<Box<LaunchTiming>> {
+    /// Consume the mode into the submission's observation, if any.
+    fn into_observed(self) -> Option<Observed> {
         match self {
-            Self::Grouped { .. } => None,
-            Self::Timed { timing, .. } => Some(timing),
+            Self::Grouped(_) => None,
+            Self::Observed { recording, .. } => Some(Observed::Span {
+                calibration: recording.calibration,
+                commands: recording.committed,
+            }),
+            Self::Timed { timing, recording, .. } => Some(Observed::Timed {
+                calibration: recording.calibration,
+                commands: recording.committed,
+                timing,
+            }),
         }
     }
 }
@@ -733,13 +803,11 @@ pub struct DirectBatch {
     device: MetalDevice,
     /// The command buffers committed before the current one, in order.
     committed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
-    /// An observed or timed batch's record of its command buffers.
-    recording: Option<Recording>,
     /// The open uncommitted command buffer (`None` only after `commit` takes it).
     command: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     /// Whether anything is encoded in `command`.
     used: bool,
-    encoding: Encoding,
+    mode: BatchMode,
 }
 
 impl Drop for DirectBatch {
@@ -808,41 +876,43 @@ pub(crate) fn sampled_pass(
     pass
 }
 
-/// A grouped encoder of `dispatch` type. An observed batch's command
-/// buffer leases a span pair at its first encoder, which samples its start;
-/// each of its encoders samples its end.
-fn grouped_encoder(
+fn open_compute_encoder(
     device: &MetalDevice,
     command: &ProtocolObject<dyn MTLCommandBuffer>,
-    dispatch: MTLDispatchType,
-    spans: Option<&mut (&'static LaunchTimestamps, Option<std::sync::Arc<SpanPair>>)>,
-    held_spans: usize,
+    kind: crate::device::EncoderKind<'_>,
 ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, ExecutionError> {
-    let (pass, leased) = match spans.as_deref() {
-        Some((_, Some(pair))) => {
-            (Some(crate::pooled(|| sampled_pass(dispatch, pair, false))), None)
-        }
-        Some((timestamps, None)) => {
-            let pair = std::sync::Arc::new(timestamps.span(device, || held_spans)?);
-            let pass = crate::pooled(|| sampled_pass(dispatch, &pair, true));
-            (Some(pass), Some(pair))
-        }
-        None => (None, None),
-    };
-    let encoder = crate::pooled(|| {
-        let kind = match &pass {
-            None => crate::device::EncoderKind::Dispatch(dispatch),
-            Some(pass) => crate::device::EncoderKind::Pass(pass),
-        };
+    crate::pooled(|| {
         let encoder = device.compute_encoder(command, kind)?;
         ordered(device, &encoder);
         Some(encoder)
     })
     .ok_or_else(|| {
         ExecutionError::SubmissionFailed("Metal could not create a native compute encoder".into())
-    })?;
-    if let (Some((_, current)), Some(pair)) = (spans, leased) {
-        *current = Some(pair);
+    })
+}
+
+/// A grouped encoder of `dispatch` type for an observed batch. Its command
+/// buffer leases a span pair at its first encoder, which samples its start;
+/// each of its encoders samples its end.
+fn observed_encoder(
+    device: &MetalDevice,
+    command: &ProtocolObject<dyn MTLCommandBuffer>,
+    dispatch: MTLDispatchType,
+    timestamps: &'static LaunchTimestamps,
+    span: &mut Option<std::sync::Arc<SpanPair>>,
+    held_spans: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, ExecutionError> {
+    let (pass, leased) = match span.as_ref() {
+        Some(pair) => (crate::pooled(|| sampled_pass(dispatch, pair, false)), None),
+        None => {
+            let pair = std::sync::Arc::new(timestamps.span(device, || held_spans)?);
+            let pass = crate::pooled(|| sampled_pass(dispatch, &pair, true));
+            (pass, Some(pair))
+        }
+    };
+    let encoder = open_compute_encoder(device, command, crate::device::EncoderKind::Pass(&pass))?;
+    if let Some(pair) = leased {
+        *span = Some(pair);
     }
     Ok(encoder)
 }
@@ -897,7 +967,7 @@ impl DirectBatch {
     /// A production batch. Each launch belongs to a group its caller begins
     /// ([`Self::group`]) before encoding it.
     pub fn new(device: &MetalDevice) -> Result<Self, ExecutionError> {
-        Self::grouped(device, None)
+        Self::with_mode(device, BatchMode::Grouped(GroupedState::new()))
     }
 
     /// Production encoding whose device interval is observed: from its
@@ -912,23 +982,24 @@ impl DirectBatch {
     /// commit, while the first, ahead of it on the queue, started after it.
     pub fn observed(device: &MetalDevice) -> Result<Self, ExecutionError> {
         let timestamps = LaunchTimestamps::shared(device)?;
-        Self::grouped(device, Some(timestamps))
+        Self::with_mode(
+            device,
+            BatchMode::Observed {
+                grouped: GroupedState::new(),
+                timestamps,
+                span: None,
+                recording: Recording::new(device),
+            },
+        )
     }
 
-    fn grouped(device: &MetalDevice, spans: Option<&'static LaunchTimestamps>) -> Result<Self, ExecutionError> {
+    fn with_mode(device: &MetalDevice, mode: BatchMode) -> Result<Self, ExecutionError> {
         Ok(Self {
             device: device.clone(),
             committed: Vec::new(),
-            recording: spans.map(|_| Recording::new(device)),
             command: Some(command_buffer(device)?),
             used: false,
-            encoding: Encoding::Grouped {
-                open: None,
-                // The first group sets it.
-                next: MTLDispatchType::Serial,
-                held: Held::Nothing,
-                spans: spans.map(|timestamps| (timestamps, None)),
-            },
+            mode,
         })
     }
 
@@ -959,15 +1030,19 @@ impl DirectBatch {
                 .expect("DirectBatch holds its command buffer until consumed")
                 .encodeWaitForEvent_value(event.as_event(), value)
         });
-        if let Some(recording) = &mut self.recording {
-            recording.gates.push(value);
-        }
-        if let Encoding::Timed { timing, gates, .. } = &mut self.encoding {
-            gates.push(Gate {
-                event: event.event.clone(),
-                value,
-                first_part: timing.parts.len(),
-            });
+        match &mut self.mode {
+            BatchMode::Grouped(_) => {}
+            BatchMode::Observed { recording, .. } => {
+                recording.gates.push(value);
+            }
+            BatchMode::Timed { timing, gates, recording, .. } => {
+                recording.gates.push(value);
+                gates.push(Gate {
+                    event: event.event.clone(),
+                    value,
+                    first_part: timing.parts.len(),
+                });
+            }
         }
         Ok(())
     }
@@ -981,7 +1056,7 @@ impl DirectBatch {
             .command
             .replace(next)
             .expect("DirectBatch holds its command buffer until consumed");
-        let committed = self.encoding.commit(previous, self.recording.as_mut());
+        let committed = self.mode.commit(previous);
         self.committed.push(committed);
         Ok(())
     }
@@ -1001,10 +1076,8 @@ impl DirectBatch {
 
     /// End the open encoder: an event command is encoded between encoders.
     fn end_open(&mut self) {
-        if let Encoding::Grouped { open, .. } = &mut self.encoding {
-            if let Some((encoder, _)) = open.take() {
-                crate::pooled(|| encoder.endEncoding());
-            }
+        if let Some(grouped) = self.mode.grouped_mut() {
+            grouped.end_open();
         }
     }
 
@@ -1018,23 +1091,9 @@ impl DirectBatch {
     /// (`tests/barrier.rs`). A timed batch's launches each have an encoder
     /// of their own already.
     pub fn group(&mut self, launches: usize) {
-        let Encoding::Grouped { open, next, .. } = &mut self.encoding else {
-            return;
-        };
-        let dispatch = if launches > 1 {
-            MTLDispatchType::Concurrent
-        } else {
-            MTLDispatchType::Serial
-        };
-        if dispatch == MTLDispatchType::Serial
-            && open
-                .as_ref()
-                .is_some_and(|(_, open)| *open == MTLDispatchType::Serial)
-        {
-            return;
+        if let Some(grouped) = self.mode.grouped_mut() {
+            grouped.group(launches);
         }
-        *next = dispatch;
-        self.end_open();
     }
 
     /// A measurement batch: each launch gets its own encoder, whose GPU
@@ -1046,13 +1105,9 @@ impl DirectBatch {
         device: &MetalDevice,
         timestamps: &'static LaunchTimestamps,
     ) -> Result<Self, ExecutionError> {
-        Ok(Self {
-            device: device.clone(),
-            committed: Vec::new(),
-            recording: Some(Recording::new(device)),
-            command: Some(command_buffer(device)?),
-            used: false,
-            encoding: Encoding::Timed {
+        Self::with_mode(
+            device,
+            BatchMode::Timed {
                 timing: Box::new(LaunchTiming {
                     timestamps,
                     parts: Vec::new(),
@@ -1061,15 +1116,16 @@ impl DirectBatch {
                 lease: None,
                 gates: Vec::new(),
                 encoded: 0,
+                recording: Recording::new(device),
             },
-        })
+        )
     }
 
     /// Record a launch that does no device work (inactive, or an empty
     /// grid): nothing is encoded, and a timed batch keeps its place with no
     /// interval.
     pub fn skip(&mut self) {
-        if let Encoding::Timed { timing, .. } = &mut self.encoding {
+        if let BatchMode::Timed { timing, .. } = &mut self.mode {
             timing.launches.push(None);
         }
     }
@@ -1119,48 +1175,48 @@ impl DirectBatch {
             self.skip();
             return Ok(());
         }
-        if let Encoding::Timed {
-            lease: Some(lease), ..
-        } = &self.encoding
-        {
-            if lease.full() {
+        match &self.mode {
+            BatchMode::Timed { lease: Some(lease), .. } if lease.full() => {
                 self.cut()?;
             }
-        }
-        // An indirect launch in a command buffer that holds an encoder of
-        // the other type than its own begins the next command buffer.
-        if let Encoding::Grouped { next, held, .. } = &self.encoding {
-            if launch.grid.is_some() && !held.admits(*next) {
+            // An indirect launch in a command buffer that holds an encoder of
+            // the other type than its own begins the next command buffer.
+            BatchMode::Grouped(grouped) | BatchMode::Observed { grouped, .. }
+                if launch.grid.is_some() && !grouped.held.admits(grouped.next) =>
+            {
                 self.end_open();
                 self.cut()?;
             }
+            _ => {}
         }
         let command = self
             .command
             .as_ref()
             .expect("DirectBatch holds its command buffer until consumed");
         let device = &self.device;
-        let recording = self.recording.as_ref();
-        match &mut self.encoding {
-            Encoding::Grouped { open, next, held, spans } => {
-                let (encoder, _) = match open {
-                    Some(open) => open,
-                    None => {
-                        let held_spans = recording.map_or(0, |recording| {
-                            recording
-                                .committed
-                                .iter()
-                                .filter(|record| matches!(record.samples, CommandSamples::Span(_)))
-                                .count()
-                        });
-                        let encoder = grouped_encoder(device, command, *next, spans.as_mut(), held_spans)?;
-                        *held = held.with(*next);
-                        open.insert((encoder, *next))
-                    }
-                };
-                crate::pooled(|| encode_launch(encoder, launch))
+        match &mut self.mode {
+            BatchMode::Grouped(grouped) => {
+                let encoder = grouped.encoder(|dispatch| {
+                    open_compute_encoder(
+                        device,
+                        command,
+                        crate::device::EncoderKind::Dispatch(dispatch),
+                    )
+                })?;
+                crate::pooled(|| encode_launch(encoder, launch));
             }
-            Encoding::Timed { timing, lease, gates, encoded } => {
+            BatchMode::Observed { grouped, timestamps, span, recording } => {
+                let encoder = grouped.encoder(|dispatch| {
+                    let held_spans = recording
+                        .committed
+                        .iter()
+                        .filter(|record| record.samples.is_some())
+                        .count();
+                    observed_encoder(device, command, dispatch, *timestamps, span, held_spans)
+                })?;
+                crate::pooled(|| encode_launch(encoder, launch));
+            }
+            BatchMode::Timed { timing, lease, gates, encoded, .. } => {
                 let LaunchTiming { timestamps, parts, launches, .. } = &mut **timing;
                 let leased = match lease {
                     Some(_) => None,
@@ -1214,26 +1270,14 @@ impl DirectBatch {
             .command
             .take()
             .expect("DirectBatch holds its command buffer until consumed");
-        let last = self.encoding.commit(command, self.recording.as_mut());
+        let last = self.mode.commit(command);
         let mut commands = std::mem::take(&mut self.committed);
         commands.push(last);
-        let encoding = std::mem::replace(
-            &mut self.encoding,
-            Encoding::Grouped {
-                open: None,
-                next: MTLDispatchType::Serial,
-                held: Held::Nothing,
-                spans: None,
-            },
-        );
+        let mode = std::mem::replace(&mut self.mode, BatchMode::Grouped(GroupedState::new()));
         DirectSubmission {
             device: self.device.clone(),
             commands,
-            observed: self.recording.take().map(|recording| Observed {
-                calibration: recording.calibration,
-                commands: recording.committed,
-                timing: encoding.launch_timing(),
-            }),
+            observed: mode.into_observed(),
         }
     }
 
@@ -1334,12 +1378,73 @@ pub struct DirectSubmission {
 /// What an observed or timed batch recorded of its command buffers, one
 /// record each, in commit order: GPU timestamp samples, the one source of
 /// every Metal device interval.
-struct Observed {
-    /// The GPU and host clocks when the batch was formed.
-    calibration: TimestampPair,
-    commands: Vec<CommandRecord>,
-    /// A timed batch's launch attribution ([`DirectBatch::timed`]).
-    timing: Option<Box<LaunchTiming>>,
+enum Observed {
+    /// An observed production batch ([`DirectBatch::observed`]): each command
+    /// buffer's leased [`SpanPair`], when it encoded a launch.
+    Span {
+        /// The GPU and host clocks when the batch was formed.
+        calibration: TimestampPair,
+        commands: Vec<CommandRecord<std::sync::Arc<SpanPair>>>,
+    },
+    /// A timed measurement batch ([`DirectBatch::timed`]): each command
+    /// buffer's part index into `timing.parts`, when it encoded a launch.
+    Timed {
+        /// The GPU and host clocks when the batch was formed.
+        calibration: TimestampPair,
+        commands: Vec<CommandRecord<usize>>,
+        timing: Box<LaunchTiming>,
+    },
+}
+
+fn resolve_interval<S>(
+    commands: &[CommandRecord<S>],
+    host: &HostClock,
+    mut resolve: impl FnMut(&S) -> Result<(u64, u64), ExecutionError>,
+) -> Result<(f64, f64), ExecutionError> {
+    let failed = |detail: String| ExecutionError::SubmissionFailed(detail);
+    let sampled = commands
+        .iter()
+        .map(|command| {
+            let Some(samples) = &command.samples else {
+                return Ok(None);
+            };
+            let (start, end) = resolve(samples)?;
+            Ok(Some((host.seconds(start), host.seconds(end))))
+        })
+        .collect::<Result<Vec<_>, ExecutionError>>()?;
+    let mut launched = sampled.iter().flatten();
+    let first = launched.next().ok_or_else(|| {
+        failed("an observed Metal batch that encoded no launch has no device interval".into())
+    })?;
+    let end = launched.last().unwrap_or(first).1;
+    checked_interval(
+        commands[0].committed,
+        first.0,
+        end,
+        host_seconds(),
+        host.uncertainty,
+    )
+    .map_err(|error| {
+        let count = commands.len();
+        let details = commands
+            .iter()
+            .zip(&sampled)
+            .enumerate()
+            .map(|(index, (command, sampled))| {
+                let sampled = match sampled {
+                    Some((start, end)) => format!("sampled [{start}, {end}]"),
+                    None => "no launch".into(),
+                };
+                format!(
+                    "command buffer {} of {count}: committed at {}, after gates {:?}, {sampled}",
+                    index + 1,
+                    command.committed,
+                    command.gates
+                )
+            })
+            .collect::<Vec<_>>();
+        failed(format!("{error}; {}", details.join("; ")))
+    })
 }
 
 // Waiting on and querying a committed command buffer is thread-safe.
@@ -1419,63 +1524,36 @@ impl DirectSubmission {
             .observed
             .as_ref()
             .ok_or_else(|| failed("Metal submission interval observation was not requested".into()))?;
-        let host = host_clock(&self.device, observed.calibration)?;
-        let sampled = observed
-            .commands
-            .iter()
-            .map(|command| {
-                let ticks = match command.samples {
-                    CommandSamples::None => return Ok(None),
-                    CommandSamples::Span(ref pair) => pair.resolve()?,
-                    CommandSamples::Part(part) => {
-                        let timing = observed.timing.as_deref().expect("a timed batch's part");
-                        let ticks = timing
-                            .timestamps
-                            .resolved(&timing.parts[part])
-                            .ok_or_else(|| failed("Metal did not resolve the timed batch's samples".into()))?;
-                        match (ticks.first(), ticks.last()) {
-                            (Some(&start), Some(&end)) if start != u64::MAX && end != u64::MAX => (start, end),
-                            _ => return Err(failed("Metal dropped a timed launch's timestamp".into())),
+        match observed {
+            Observed::Span { calibration, commands } => {
+                let host = host_clock(&self.device, *calibration)?;
+                resolve_interval(commands, &host, |pair| pair.resolve())
+            }
+            Observed::Timed { calibration, commands, timing } => {
+                let host = host_clock(&self.device, *calibration)?;
+                resolve_interval(commands, &host, |&part| {
+                    let ticks = timing
+                        .timestamps
+                        .resolved(&timing.parts[part])
+                        .ok_or_else(|| {
+                            failed("Metal did not resolve the timed batch's samples".into())
+                        })?;
+                    match (ticks.first(), ticks.last()) {
+                        (Some(&start), Some(&end)) if start != u64::MAX && end != u64::MAX => {
+                            Ok((start, end))
                         }
+                        _ => Err(failed("Metal dropped a timed launch's timestamp".into())),
                     }
-                };
-                Ok(Some((host.seconds(ticks.0), host.seconds(ticks.1))))
-            })
-            .collect::<Result<Vec<_>, ExecutionError>>()?;
-        let mut launched = sampled.iter().flatten();
-        let first = launched
-            .next()
-            .ok_or_else(|| failed("an observed Metal batch that encoded no launch has no device interval".into()))?;
-        let end = launched.last().unwrap_or(first).1;
-        checked_interval(observed.commands[0].committed, first.0, end, host_seconds(), host.uncertainty).map_err(|error| {
-            let count = observed.commands.len();
-            let commands = observed
-                .commands
-                .iter()
-                .zip(&sampled)
-                .enumerate()
-                .map(|(index, (command, sampled))| {
-                    let sampled = match sampled {
-                        Some((start, end)) => format!("sampled [{start}, {end}]"),
-                        None => "no launch".into(),
-                    };
-                    format!(
-                        "command buffer {} of {count}: committed at {}, after gates {:?}, {sampled}",
-                        index + 1,
-                        command.committed,
-                        command.gates
-                    )
                 })
-                .collect::<Vec<_>>();
-            failed(format!("{error}; {}", commands.join("; ")))
-        })
+            }
+        }
     }
 
     /// For a timed batch, each `encode` call's device interval on the
     /// [`host_seconds`] clock, in encode order (`None` for an empty launch).
     /// `None` for any other batch. Call after completion.
     pub fn launch_intervals(&self) -> Result<Option<Vec<Option<(f64, f64)>>>, ExecutionError> {
-        let Some(Observed { calibration, timing: Some(timing), .. }) = &self.observed else {
+        let Some(Observed::Timed { calibration, timing, .. }) = &self.observed else {
             return Ok(None);
         };
         let failed = |detail: &str| ExecutionError::SubmissionFailed(detail.into());
@@ -1587,9 +1665,14 @@ mod tests {
             // Open an encoder on the uncommitted second command buffer so Drop
             // must call `endEncoding()` before releasing it.
             let command = batch.command.as_ref().unwrap();
-            let encoder = grouped_encoder(&device, command, MTLDispatchType::Serial, None, 0).unwrap();
-            if let Encoding::Grouped { open, .. } = &mut batch.encoding {
-                *open = Some((encoder, MTLDispatchType::Serial));
+            let encoder = open_compute_encoder(
+                &device,
+                command,
+                crate::device::EncoderKind::Dispatch(MTLDispatchType::Serial),
+            )
+            .unwrap();
+            if let BatchMode::Grouped(grouped) = &mut batch.mode {
+                grouped.open = Some((encoder, MTLDispatchType::Serial));
             }
             // Drop `batch` without commit() or abandon(): must end the open
             // encoder and wait for the committed prefix (`done == 1`).
