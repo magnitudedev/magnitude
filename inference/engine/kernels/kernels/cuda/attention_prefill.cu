@@ -17,6 +17,8 @@
 #define ATTENTION_COLUMNS SEISMIC_TUNE_COLUMNS
 #define ATTENTION_Q_REGISTERS SEISMIC_TUNE_QREG
 #define ATTENTION_PRODUCER_WARPS 0
+// Two or more column warps over a head wider than 256 split the scores by column span.
+#define ATTENTION_SPLIT_SCORES 1
 #define ATTENTION_PICKS SEISMIC_DIM_KS
 #include "lib/attention/prefill.cuh"
 

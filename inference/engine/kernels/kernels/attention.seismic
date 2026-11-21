@@ -972,9 +972,16 @@ native attention_prefill for metal from "metal/attention_prefill.metal":
 # CUDA: flash attention on m16n8k16 tensor cores. A block owns WARPS * 16
 # matrix rows (WARPS * 16 / G tokens x G query heads) of one kv head; K/V
 # tiles of 32 keys are double-buffered next to the query tile in shared
-# memory. A head wider than 256 takes 16-key tiles and one pass per 256-column
-# output window, staging each key tile in 256-column pieces and the window's
-# values with its last piece (WARPS = 4 fits W = 512). As on Metal, a query tile's key
+# memory. A head wider than 256 takes 16-key tiles and either one pass per
+# 256-column output window (COLUMNS = 1, staging each key tile in 256-column
+# pieces and the window's values with its last piece; WARPS = 4 fits W = 512)
+# or, with COLUMNS >= 2, split scores: whole key tiles staged once, each
+# column warp scoring its own W / COLUMNS query columns (held in registers
+# when QREG = 1) and adding partials through a COLUMNS * WARPS * 1024-byte
+# shared exchange, so all columns finish in one pass. Stored-key values
+# (VK = 1) over a whole-head stage (one piece, one window) alias V onto K so
+# each stage holds one [KEYS][W] tile and copies it once. As on Metal, a query
+# tile's key
 # tiles split over up to SPLIT_GROUPS / (tiles x KV) partitions of at least
 # 16 tiles (so long histories fill the device) and a merge launch combines
 # them; SPLIT_GROUPS = 1 never splits, and the default splits, as Metal's and
@@ -998,8 +1005,16 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
     # and kv heads, and for the decode row classes (M <= VERIFY_ROWS, no
     # WorkList) over the kv heads alone, as one row's.
     let PARTITIONS = max(1, ceil_div(SPLIT_GROUPS, max(1, ceil_div(M, WARPS * 16 / G) * min(1, M / (VERIFY_ROWS + 1) + B)) * KV))
-    let ATTEND_REGION = ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2
-    where KR <= 1 and (KS == 0 or B == 0) and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and G <= WARPS * 16 and (QREG == 0 or 2 * P + S <= 256) and min(2 * P + S, 256 * COLUMNS) % (16 * COLUMNS) == 0 and ATTEND_REGION <= device.shared_bytes_per_group
+    let WIDTH = 2 * P + S
+    let WIDE = min(1, WIDTH / 257)
+    let SPLIT = WIDE * min(1, COLUMNS - 1)
+    let PIECE = min(WIDTH, 256) + SPLIT * (WIDTH - min(WIDTH, 256))
+    let WINDOW = min(WIDTH, 256 * COLUMNS)
+    let SHARED_KV = VK * (1 - WIDE + SPLIT) * (1 - min(1, WIDTH / (256 * COLUMNS + 1)))
+    let Q_BYTES = WARPS * 16 * WIDTH * 2
+    let STAGED_BYTES = STAGES * (32 - 16 * WIDE) * (PIECE + (1 - SHARED_KV) * WINDOW) * 2
+    let ATTEND_REGION = (1 - QREG) * (Q_BYTES + STAGED_BYTES) + QREG * max(Q_BYTES, STAGED_BYTES) + SPLIT * COLUMNS * WARPS * 1024
+    where KR <= 1 and (KS == 0 or B == 0) and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == WIDTH) and (U == 0 or U == 1 or U == WIDTH) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and WIDTH % 32 == 0 and (WIDTH <= 256 or WIDTH % 256 == 0) and G <= WARPS * 16 and (QREG == 0 or WIDTH <= 256 or COLUMNS >= 2) and WINDOW % (16 * COLUMNS) == 0 and ATTEND_REGION <= device.shared_bytes_per_group
     scratch queries bytes (M * KV * G * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
     scratch values bytes (M * KV * (2 * P + S) * 2)

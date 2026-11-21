@@ -101,6 +101,10 @@ constexpr int WINDOW = W > 256 * COLUMNS ? 256 * COLUMNS : W;
 constexpr int WINDOWS = W / WINDOW;
 constexpr int PIECE = W > 256 && !SPLIT_SCORES ? 256 : W;
 constexpr int PIECES = W / PIECE;
+// Stored-key values (VK = 1) over a whole-head stage (one piece, one window):
+// keys and values are identical, so each stage holds one [KEYS][W] tile and
+// every stager copies it once.
+constexpr bool SHARED_KV = STORED_KEY && PIECES == 1 && WINDOWS == 1;
 // 8-column output fragments per warp: its column warp's share of the window.
 constexpr int OUT = WINDOW / 8 / COLUMNS;
 constexpr int CHUNKS = W / 8;  // 16-byte chunks per 16-bit row
@@ -260,7 +264,7 @@ __device__ __forceinline__ void stage_history(const DenseReads &history, u8 *k_t
         const int token = keys(r);
         return token >= 0 ? history.key_vector(token, kv) + piece * PIECE * Act::bytes : nullptr;
     }, threadIdx.x, MMA_THREADS);
-    if (piece + 1 < PIECES) return;
+    if (SHARED_KV || piece + 1 < PIECES) return;
     stage_slab<F32_ACTIVATION, WINDOW_CHUNKS>(v_tile, rows, [&](int r) -> const u8 * {
         const int token = keys(r);
         return token >= 0 ? history.value_vector(token, kv) + column0 * Act::bytes : nullptr;
@@ -488,7 +492,7 @@ struct PrefillRows {
             const long long at = row(r);
             return at >= 0 ? at + piece * PIECE : -1;
         }, thread, threads, r0);
-        if (piece + 1 < PIECES) return;
+        if (SHARED_KV || piece + 1 < PIECES) return;
         stage<false, WINDOW_CHUNKS>(v_tile, values, KEYS, [&](int r) -> long long {
             const long long at = row(r);
             return at >= 0 ? at + column0 : -1;
@@ -621,7 +625,7 @@ struct DecodeRows {
                 for (int d = 0; d < DPL; ++d) k[d] = v[d] = 0.0f;
             }
             put_row<Ops, PIECE_CHUNKS>(k_tile, r, piece * PIECE, k, lane);
-            if (piece + 1 == PIECES) put_row<Ops, WINDOW_CHUNKS>(v_tile, r, column0, v, lane);
+            if (!SHARED_KV && piece + 1 == PIECES) put_row<Ops, WINDOW_CHUNKS>(v_tile, r, column0, v, lane);
         }
     }
 
@@ -958,7 +962,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     // read into registers before the first K/V tile arrives, so the stages
     // and the query tile share the region.
     constexpr int Q_BYTES = ROWS * W * 2;
-    constexpr int STAGE_BYTES = KEYS * (PIECE + WINDOW) * 2;
+    constexpr int STAGE_BYTES = KEYS * (PIECE + (SHARED_KV ? 0 : WINDOW)) * 2;
     // Inline decoding adds STAGES code stages after the operand stages.
     // Split scores decode inline from a single code stage: a unit's codes
     // are copied once the previous unit's are decoded, while its products run.
@@ -973,7 +977,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     u8 *q_tile = shared;
     u8 *kv_tiles = shared + (Q_REGISTERS ? 0 : Q_BYTES);
     auto k_tile = [&](int b) { return kv_tiles + b * STAGE_BYTES; };
-    auto v_tile = [&](int b) { return kv_tiles + b * STAGE_BYTES + KEYS * PIECE * 2; };
+    auto v_tile = [&](int b) { return SHARED_KV ? k_tile(b) : kv_tiles + b * STAGE_BYTES + KEYS * PIECE * 2; };
 #ifdef ATTENTION_AFFINE_HISTORY
     auto code_tile = [&](int b) { return kv_tiles + STAGES * STAGE_BYTES + (b % CODE_STAGES) * Affine::CODE_STAGE_BYTES; };
 #endif
@@ -1596,7 +1600,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
             const u8 *at = vector(r);
             return at != nullptr ? at + piece * PIECE * Act::bytes : nullptr;
         }, threadIdx.x, MMA_THREADS);
-        if (piece + 1 < PIECES) return;
+        if (SHARED_KV || piece + 1 < PIECES) return;
         stage_slab<F32_ACTIVATION, WINDOW_CHUNKS>(v_tile(buffer), KEYS, [&](int r) -> const u8 * {
             const u8 *at = vector(r);
             return at != nullptr ? at + column0 * Act::bytes : nullptr;

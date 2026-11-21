@@ -5160,3 +5160,85 @@ fn cuda_wide_mla_decode_split_scores_and_tokens() {
         }
     }
 }
+
+/// CUDA `attention_prefill` split scores (`COLUMNS` 2 with `QREG` 1) and
+/// stored-key tile aliasing (`VK` 1) over 512-wide heads match the host model
+/// in both prefill (`M > VERIFY_ROWS`) and decode-row (`M <= VERIFY_ROWS`) launches.
+#[test]
+fn cuda_prefill_wide_split_scores_and_shared_kv_match_reference() {
+    const MLA_S512: Form = Form {
+        kv: 1,
+        g: 64,
+        p: 0,
+        s: 512,
+        interleaved: false,
+        separate: 0,
+        softplus: false,
+        fresh: true,
+        query_norm: false,
+        norm: true,
+        value_norm: false,
+        rotary: Rotary::HALF_SPLIT_LEADING,
+        stored_key: true,
+    };
+    const WIDE_G64_SEPARATE: Form = Form {
+        stored_key: false,
+        ..MLA_S512
+    };
+    let rows = window_rows(20, 80, 128);
+    let mla_case = Case::new(MLA_S512, 160, rows.clone(), 64, 1.0, 1.0 / (512f32).sqrt(), 71);
+    let mla_decode_rows = Case::new(
+        MLA_S512,
+        160,
+        window_rows(4, 80, 128),
+        64,
+        1.0,
+        1.0 / (512f32).sqrt(),
+        73,
+    );
+    let sep_case = Case::new(WIDE_G64_SEPARATE, 160, rows, 64, 1.0, 1.0 / (512f32).sqrt(), 72);
+    let mla_expected = mla_case.expected();
+    let mla_decode_expected = mla_decode_rows.expected();
+    let sep_expected = sep_case.expected();
+    for device in devices()
+        .into_iter()
+        .filter(|device| device.backend() == BackendName::Cuda)
+    {
+        for (cols, qreg, stages) in [(1, 0, 2), (2, 1, 2), (2, 1, 3)] {
+            let label = format!("cuda prefill mla s512 vk1 C={cols} QREG={qreg} S={stages}");
+            let spec = statics(&device, MLA_S512, 0)
+                .with_static("B", 0)
+                .with_static("KR", 0)
+                .with_static("KS", 0)
+                .with_static("AB", 1)
+                .with_param("WARPS", 4)
+                .with_param("SPLIT_GROUPS", 256)
+                .with_param("STAGES", stages)
+                .with_param("COLUMNS", cols)
+                .with_param("QREG", qreg);
+            let result = run(&device, false, &spec, &mla_case)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            check(&label, &result, &mla_expected, &mla_case);
+            let decode_label = format!("cuda prefill-rows mla s512 vk1 C={cols} QREG={qreg} S={stages}");
+            let decode_result = run(&device, false, &spec, &mla_decode_rows)
+                .unwrap_or_else(|error| panic!("{decode_label}: {error}"));
+            check(&decode_label, &decode_result, &mla_decode_expected, &mla_decode_rows);
+        }
+        for (cols, qreg, stages) in [(1, 0, 2), (2, 1, 2)] {
+            let label = format!("cuda prefill wide s512 vk0 C={cols} QREG={qreg} S={stages}");
+            let spec = statics(&device, WIDE_G64_SEPARATE, 0)
+                .with_static("B", 0)
+                .with_static("KR", 0)
+                .with_static("KS", 0)
+                .with_static("AB", 0)
+                .with_param("WARPS", 4)
+                .with_param("SPLIT_GROUPS", 256)
+                .with_param("STAGES", stages)
+                .with_param("COLUMNS", cols)
+                .with_param("QREG", qreg);
+            let result = run(&device, false, &spec, &sep_case)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            check(&label, &result, &sep_expected, &sep_case);
+        }
+    }
+}
