@@ -620,21 +620,101 @@ impl DomainReservation {
     }
 }
 
-struct InputImage {
-    image: ImageRef,
-    features: Option<FeatureRef>,
+/// A request's prepared input and lifecycle state, owned from admission
+/// ([`ExecutorDomain::install_input`]) until [`ExecutorDomain::close`].
+/// Residency (numerical state, reservation, token history, boundary, encoded
+/// image features, and round flags) comes and goes within that lifetime via
+/// [`RequestResidency`]; a dormant request holds none of it by construction.
+pub(super) struct RequestEntry {
+    pub(super) input: PreparedModelInput,
+    pub(super) images: BTreeMap<String, ImageRef>,
+    /// Set if a step could not read its weights: every later outcome fails
+    /// (`Outcome::WeightReadFailed`) until the request closes.
+    pub(super) poisoned: Option<crate::WeightReadError>,
+    pub(super) residency: RequestResidency,
 }
 
-/// A request's prepared input, owned from admission until the request
-/// closes. Residency (numerical state in this domain) comes and goes within
-/// that lifetime; encoded features are released with it and re-encoded.
-struct RequestInput {
-    input: PreparedModelInput,
-    images: BTreeMap<String, InputImage>,
-    resident: bool,
-    boundary: Option<FeatureRef>,
+pub(super) enum RequestResidency {
+    Dormant,
+    Resident(ResidentRequest),
+}
+
+/// All state that exists strictly while a request is resident in this domain.
+/// Eviction (`release_state`) transitions `residency` to `Dormant`, dropping
+/// all of this atomically.
+pub(super) struct ResidentRequest {
+    /// The request's state reservation on the device's ledger, reserved as
+    /// it opens (`open_state`), extended ahead of its steps and its rows
+    /// drawn within it as it advances (`provision`), and dropped as it
+    /// closes or is evicted.
+    pub(super) claim: crate::memory::ledger::Reservation,
+    /// Accepted target sequence state; `None` while a target advance, target
+    /// read, or chain holds it.
+    pub(super) target: Option<SequenceState>,
+    /// Accepted head sequence state; `None` while a head/priming/front
+    /// advance holds it, or when this domain has no head store.
+    pub(super) head: Option<SequenceState>,
     /// The tokens of the resident sequence.
-    tokens: input::TokenHistory,
+    pub(super) tokens: input::TokenHistory,
+    /// Boundary feature of the last reconciled target forward.
+    pub(super) boundary: Option<FeatureRef>,
+    /// Encoded image features for this residency, keyed by image identity.
+    pub(super) image_features: BTreeMap<String, FeatureRef>,
+    /// Next target launch is this round's verification: its drafter proposed
+    /// since its last target launch, or that launch is a verify pass. That
+    /// launch queues no decode behind it (`queue::continuations`).
+    pub(super) verifying: bool,
+    /// Next round prepares to draft from a separate draft's fused taps: its
+    /// next target launch's decode continuation publishes its feature
+    /// (`queue::continuations`, `ExecutorDomain::publish_behind`).
+    pub(super) publishing: bool,
+}
+
+impl RequestEntry {
+    pub(super) fn resident(&self) -> Option<&ResidentRequest> {
+        match &self.residency {
+            RequestResidency::Resident(resident) => Some(resident),
+            RequestResidency::Dormant => None,
+        }
+    }
+
+    pub(super) fn resident_mut(&mut self) -> Option<&mut ResidentRequest> {
+        match &mut self.residency {
+            RequestResidency::Resident(resident) => Some(resident),
+            RequestResidency::Dormant => None,
+        }
+    }
+}
+
+impl ResidentRequest {
+    pub(super) fn put_target(&mut self, state: SequenceState) {
+        assert!(
+            self.target.replace(state).is_none(),
+            "invariant violated: target state already has an owner"
+        );
+    }
+
+    pub(super) fn put_head(&mut self, state: SequenceState) {
+        assert!(
+            self.head.replace(state).is_none(),
+            "invariant violated: head state already has an owner"
+        );
+    }
+
+    pub(super) fn lane(&self, head: bool) -> Option<&SequenceState> {
+        if head { self.head.as_ref() } else { self.target.as_ref() }
+    }
+
+    pub(super) fn lane_mut(&mut self, head: bool) -> &mut Option<SequenceState> {
+        if head { &mut self.head } else { &mut self.target }
+    }
+
+    /// The rows this request's reservation holds past its target position.
+    pub(super) fn unwritten_rows(&self) -> usize {
+        let position = self.target.as_ref().map_or(0, SequenceState::position) as u64;
+        usize::try_from(self.claim.rows().saturating_sub(position))
+            .expect("invariant violated: a reservation's rows exceed the host's")
+    }
 }
 
 /// Everything needed to make a request resident at a position without
@@ -697,11 +777,11 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// What the load allocated as it started that no holding names (its
     /// weights, tables, state and programs' storage): held for the load.
     _recorded: Vec<crate::memory::ledger::Claim>,
-    /// Each resident request's state on the device's ledger, reserved as
-    /// it opens ([`Self::open_state`]), extended ahead of its steps and its
-    /// rows drawn within it as it advances ([`Self::provision`]), and
-    /// dropped as it closes or is evicted.
-    state_claims: BTreeMap<RequestId, crate::memory::ledger::Reservation>,
+    /// Every open request's single-owner entry: prepared input, poison status,
+    /// and (when resident) its ledger reservation, accepted target/head
+    /// sequence states, token history, boundary, encoded image features, and
+    /// round flags.
+    requests: BTreeMap<RequestId, RequestEntry>,
     /// The priming boundary of the group provisioned last
     /// ([`Self::provision`]), which reserving it takes ([`Self::reserve`]).
     boundary: Option<FeatureRef>,
@@ -717,30 +797,19 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     target_store: Rc<StateStore>,
     head_store: Option<Rc<StateStore>>,
     family: F,
-    head_loader: Option<ComponentLoader<ResidentHead>>,
-    vision_loader: Option<ComponentLoader<ResidentVision>>,
-    /// The claims of what the bound head allocates beside its imports: its
-    /// graph constants and its stagings beyond the floor, released as it
-    /// unbinds.
-    head_binding: Vec<crate::memory::ledger::Claim>,
-    /// The claims of the bound vision component's graph constants, released
-    /// as it unbinds.
-    vision_binding: Vec<crate::memory::ledger::Claim>,
-    /// The bound optional components held as cache while no request is
-    /// resident (`ExecutorDomain::release_yielded`), kept again as one opens
-    /// (`ExecutorDomain::keep_components`).
-    idle_components: Vec<serving_heap::IdleComponent>,
+    /// Optional drafter head component lifecycle (absent, unloaded, bound,
+    /// idle cache, or kept during open).
+    head_component: serving_heap::OptionalSlot<ResidentHead>,
+    /// Optional vision encoder component lifecycle.
+    vision_component: serving_heap::OptionalSlot<ResidentVision>,
     /// The latest reading's answer ([`MemoryProbe::answer`]): each store's
     /// generation at it, and the response the owner owes.
     answered: RefCell<Answered>,
-    target: BTreeMap<RequestId, SequenceState>,
     /// The steps queued behind the last flight: the rest of a chain, with
     /// the chain under way, or one successor, with their drafter primings
     /// (`queue`). They are the only work that holds bindings between
     /// flights, so every binding change resolves them first.
     queue: queue::Queue<F>,
-    head: BTreeMap<RequestId, SequenceState>,
-    input: BTreeMap<RequestId, RequestInput>,
     /// When the last target selection was read to the host.
     selection_read: Option<Instant>,
     target_timing: Option<TargetHostTiming>,
@@ -779,21 +848,6 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// The host's turns after verify passes, whose mean the regime prices a
     /// verify pass by ([`in_flight::VerifyTurns`]).
     verify_turns: in_flight::VerifyTurns,
-    /// Requests whose next target launch is their round's verification:
-    /// their drafter proposed since their last target launch, or that
-    /// launch is a verify pass (`Self::verify_pass`, marked as it launches).
-    /// That launch,
-    /// however many rows it verifies (none, of a chain cut empty), queues no
-    /// decode behind it (`queue::continuations`).
-    verifying: BTreeSet<RequestId>,
-    /// Requests whose next round prepares to draft from a separate draft's
-    /// fused taps: their next target launch's decode continuation publishes
-    /// its feature (`queue::continuations`, `Self::publish_behind`).
-    publishing: BTreeSet<RequestId>,
-    /// Sequences a step of which could not read its weights: every later
-    /// outcome of theirs fails (`Outcome::WeightReadFailed`) until they
-    /// close.
-    poisoned: BTreeMap<RequestId, crate::WeightReadError>,
     /// What the load is priced on once its warm-up ended
     /// ([`Self::measure_load`]); none before, so a warm-up's steps are not
     /// counted.
@@ -1917,10 +1971,49 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`ComponentLoader::own_bytes`), none of the target's it found there.
     /// None without a head.
     pub(super) fn head_weight_bytes(&self) -> Result<u64, String> {
-        match &self.head_loader {
-            None => Ok(0),
-            Some(loader) => Ok(loader.own_bytes()?),
-        }
+        Ok(self.head_component.own_bytes()?)
+    }
+
+    pub(super) fn resident(&self, request: RequestId) -> Option<&ResidentRequest> {
+        self.requests.get(&request).and_then(RequestEntry::resident)
+    }
+
+    pub(super) fn resident_mut(&mut self, request: RequestId) -> Option<&mut ResidentRequest> {
+        self.requests.get_mut(&request).and_then(RequestEntry::resident_mut)
+    }
+
+    pub(super) fn resident_requests(&self) -> impl Iterator<Item = (RequestId, &ResidentRequest)> {
+        self.requests
+            .iter()
+            .filter_map(|(&id, entry)| entry.resident().map(|resident| (id, resident)))
+    }
+
+    pub(super) fn target_state(&self, request: RequestId) -> Option<&SequenceState> {
+        self.resident(request).and_then(|resident| resident.target.as_ref())
+    }
+
+    pub(super) fn head_state(&self, request: RequestId) -> Option<&SequenceState> {
+        self.resident(request).and_then(|resident| resident.head.as_ref())
+    }
+
+    pub(super) fn take_target_state(&mut self, request: RequestId) -> Option<SequenceState> {
+        self.resident_mut(request).and_then(|resident| resident.target.take())
+    }
+
+    pub(super) fn take_head_state(&mut self, request: RequestId) -> Option<SequenceState> {
+        self.resident_mut(request).and_then(|resident| resident.head.take())
+    }
+
+    pub(super) fn put_target_state(&mut self, request: RequestId, state: SequenceState) {
+        self.resident_mut(request)
+            .expect("invariant violated: returning target state to a non-resident request")
+            .put_target(state);
+    }
+
+    pub(super) fn put_head_state(&mut self, request: RequestId, state: SequenceState) {
+        self.resident_mut(request)
+            .expect("invariant violated: returning head state to a non-resident request")
+            .put_head(state);
     }
 
     /// A reading at an event (a flight boundary, an own change, an OS
@@ -2256,8 +2349,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         for operation in operations {
             if let (Operation::Forward { request, kind: WorkKind::Decode, .. }, Some(chain)) = (operation, operation.chain()) {
                 let state = self
-                    .head
-                    .get(request)
+                    .head_state(*request)
                     .ok_or_else(|| DomainError::Input("a chained forward's head is not idle".into()))?;
                 if state.position() != chain.position {
                     return Err(DomainError::Input("chain entry position differs from accepted head state".into()));
@@ -2275,7 +2367,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 if self.head_reads_target() {
                     panic!("invariant violated: a head reading target history keeps no history to prime");
                 }
-                let state = self.head.get(request).ok_or_else(|| {
+                let resident = self.resident(*request).ok_or_else(|| {
+                    DomainError::Input("a primed prompt chunk's drafter is not idle".into())
+                })?;
+                let state = resident.head.as_ref().ok_or_else(|| {
                     DomainError::Input("a primed prompt chunk's drafter is not idle".into())
                 })?;
                 if state.position() != prime.position {
@@ -2289,9 +2384,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 // only pairs inside the chunk reads none, whatever the
                 // prefix holds: the first chunk, or one resumed past rows a
                 // pass's entry already paired.
-                if prime.pairs_previous(tokens.len())
-                    && self.input.get(request).and_then(|input| input.boundary.as_ref()).is_none()
-                {
+                if prime.pairs_previous(tokens.len()) && resident.boundary.is_none() {
                     return Err(DomainError::Input(
                         "a drafter entry pairs across its chunk's boundary with no boundary feature".into(),
                     ));
@@ -2349,11 +2442,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .expect("invariant violated: a reserved group's rows overflow");
                     demand |= operation.demand();
                     let state = match lane {
-                        ReservationLane::Target => self.target.get(&operation.request()),
+                        ReservationLane::Target => self.target_state(operation.request()),
                         ReservationLane::Head if reads_target => {
-                            self.target.get(&operation.request())
+                            self.target_state(operation.request())
                         }
-                        ReservationLane::Head => self.head.get(&operation.request()),
+                        ReservationLane::Head => self.head_state(operation.request()),
                         _ => unreachable!(),
                     }
                     .ok_or_else(|| DomainError::Input("reservation request is not idle".into()))?;
@@ -2452,17 +2545,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         "vision reservation must contain one image".into(),
                     ));
                 };
-                let input = self.input.get(&first.request()).ok_or_else(|| {
+                let entry = self.requests.get(&first.request()).ok_or_else(|| {
                     DomainError::Input("vision request has no admitted input".into())
                 })?;
-                let slot = input
+                let (identity, _) = entry
                     .images
-                    .values()
-                    .find(|slot| slot.image == *image)
+                    .iter()
+                    .find(|(_, candidate)| *candidate == image)
                     .ok_or_else(|| {
                         DomainError::Input("image is not part of admitted input".into())
                     })?;
-                if slot.features.is_some() {
+                let resident = entry.resident().ok_or_else(|| {
+                    DomainError::Input("vision request is not resident".into())
+                })?;
+                if resident.image_features.contains_key(identity) {
                     return Err(DomainError::Input("image is already encoded".into()));
                 }
                 (
@@ -2633,8 +2729,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             match lane {
                 ReservationLane::Head if !self.family.head_is_bound() => {
                     let loader = self
-                        .head_loader
-                        .as_ref()
+                        .head_component
+                        .loader()
                         .ok_or_else(|| DomainError::Input("head component is disabled".into()))?;
                     let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
                     let (resident, fresh) = self.import_component(
@@ -2650,18 +2746,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             crate::memory::ClaimDemand { device: constants, ..Default::default() },
                         )?;
                         binding.allocate(&device, |charges| self.family.bind_head(charges, resident, &self.definition))?;
-                        self.head_binding = binding.into_claims();
+                        self.head_component.mark_bound(binding.into_claims());
                         self.hold_bound_head(claiming)
                     })();
                     if bound.is_err() && fresh {
-                        self.head_loader.as_ref().expect("head loader checked above").unload();
+                        self.head_component.unload();
                     }
                     bound
                 }
                 ReservationLane::Vision if !self.family.vision_is_bound() => {
                     let loader = self
-                        .vision_loader
-                        .as_ref()
+                        .vision_component
+                        .loader()
                         .ok_or_else(|| DomainError::Input("vision component is disabled".into()))?;
                     let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
                     let (resident, fresh) = self.import_component(
@@ -2677,11 +2773,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             crate::memory::ClaimDemand { device: constants, ..Default::default() },
                         )?;
                         binding.allocate(&device, |charges| self.family.bind_vision(charges, resident, &self.definition))?;
-                        self.vision_binding = binding.into_claims();
+                        self.vision_component.mark_bound(binding.into_claims());
                         Ok(())
                     })();
                     if bound.is_err() && fresh {
-                        self.vision_loader.as_ref().expect("vision loader checked above").unload();
+                        self.vision_component.unload();
                     }
                     bound
                 }
@@ -2887,8 +2983,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             .acquire_output()
                             .unwrap_or_else(|error| invariant("drafter entry output", error));
                         let state = self
-                            .head
-                            .remove(request)
+                            .take_head_state(*request)
                             .expect("reservation preflight established drafter ownership");
                         let rows = prime.tokens.len();
                         match OwnedStateAdvance::begin(state, rows) {
@@ -2906,8 +3001,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 for operation in operations {
                     let request = operation.request();
                     let state = self
-                        .target
-                        .remove(&request)
+                        .take_target_state(request)
                         .expect("reservation preflight established target ownership");
                     advances.push(begin_rows(state, operation, "target"));
                 }
@@ -2916,10 +3010,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         Ok(head) => *front = Some(head),
                         Err(error) => {
                             for (operation, advance) in operations.iter().zip(advances.drain(..)) {
-                                self.target.insert(operation.request(), advance.abort());
+                                self.put_target_state(operation.request(), advance.abort());
                             }
                             if let (Some(priming), [operation]) = (priming.take(), operations) {
-                                self.head.insert(operation.request(), priming.advance.abort());
+                                self.put_head_state(operation.request(), priming.advance.abort());
                             }
                             return Err(error);
                         }
@@ -2929,8 +3023,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ReservedResources::Head(_, _, HeadReservation::TargetReads(states)) => {
                 for operation in operations {
                     states.push(
-                        self.target
-                            .remove(&operation.request())
+                        self.take_target_state(operation.request())
                             .expect("reservation preflight established target ownership"),
                     );
                 }
@@ -2939,8 +3032,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 for operation in operations {
                     let request = operation.request();
                     let state = self
-                        .head
-                        .remove(&request)
+                        .take_head_state(request)
                         .expect("reservation preflight established head ownership");
                     advances.push(begin_rows(state, operation, "head"));
                 }
@@ -2993,14 +3085,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             // outcome's reconcile or abort (`FrontAdvance`), or here on
             // refusal (`HeldFront::release`).
             let state = self
-                .head
-                .remove(&request)
+                .take_head_state(request)
                 .expect("reservation preflight established head ownership");
             match OwnedStateAdvance::begin_rows(state, 1, 0, operation.front_rows()) {
                 Ok(advance) => head.slots.push(SecuredFrontSlot { request, advance, selects: front_selects(operation) }),
                 Err((state, error)) => {
-                    self.head.insert(request, state);
-                    HeldFront::Accepted(head).release(&mut self.head);
+                    self.put_head_state(request, state);
+                    HeldFront::Accepted(head).release(&mut self.requests);
                     return Err(changed("head state capacity", error.to_string()));
                 }
             }
@@ -3062,7 +3153,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             resources,
             arena,
             _recorded: recorded.into_claims(),
-            state_claims: BTreeMap::new(),
+            requests: BTreeMap::new(),
             boundary: None,
             request_slot,
             state_slabs: state::StateSlabs::default(),
@@ -3071,14 +3162,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             target_store: Rc::clone(&target_state),
             head_store: head_state.as_ref().map(|state| Rc::clone(state)),
             family,
-            head_loader,
-            vision_loader,
-            head_binding: Vec::new(),
-            vision_binding: Vec::new(),
-            target: BTreeMap::new(),
+            head_component: serving_heap::OptionalSlot::from_loader(head_loader),
+            vision_component: serving_heap::OptionalSlot::from_loader(vision_loader),
             queue: queue::Queue::Empty,
-            head: BTreeMap::new(),
-            input: BTreeMap::new(),
             selection_read: None,
             target_timing: None,
             trace_host_steps: std::env::var_os("MAGNITUDE_TRACE_HOST_STEP").is_some(),
@@ -3087,14 +3173,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             measurement_claim: None,
             group_class: None,
             idle_class: state::IdleClass::default(),
-            idle_components: Vec::new(),
             answered: RefCell::default(),
             next_flight: 0,
             host_turn: None,
             verify_turns: in_flight::VerifyTurns::default(),
-            verifying: BTreeSet::new(),
-            publishing: BTreeSet::new(),
-            poisoned: BTreeMap::new(),
             measures: None,
             resize_held: ResizeHeld::default(),
             shrink_step: false,

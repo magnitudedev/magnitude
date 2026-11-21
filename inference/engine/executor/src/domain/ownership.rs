@@ -71,9 +71,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         from: Option<&ResumeState>,
         rows: u64,
     ) -> Result<Vec<Operation>, DomainError> {
-        let installed = self.input.get(&request).expect("invariant violated: an opened request has no installed input");
+        let entry = self.requests.get(&request).expect("invariant violated: an opened request has no installed input");
         assert!(
-            !installed.resident && !self.target.contains_key(&request) && !self.head.contains_key(&request),
+            matches!(entry.residency, RequestResidency::Dormant),
             "invariant violated: request {} opens already resident",
             request.0
         );
@@ -85,13 +85,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         );
         let reserved = crate::memory::ledger::RequestRows::of(&self.execution).opening(rows);
         let changes = self.resources.ledgers().changes().clone();
-        let (mut reservation, kept) = changes
+        let mut reservation = changes
             .change(|keeping| {
-                let kept = self.keep_components(&keeping);
+                self.keep_components(&keeping);
                 match self.resources.ledgers().device().reserve(&keeping.claims(), &self.request_slot, request, reserved) {
-                    Ok(reservation) => Ok((reservation, kept)),
+                    Ok(reservation) => Ok(reservation),
                     Err(short) => {
-                        self.idle_kept(kept);
+                        self.idle_kept();
                         Err(short)
                     }
                 }
@@ -109,56 +109,72 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Err(error) => {
                 changes.change(|_| {
                     drop(reservation);
-                    self.idle_kept(kept);
+                    self.idle_kept();
                 });
                 return Err(error);
             }
         };
         let position = target.position();
         reservation.grow(position as u64);
-        self.change_state(|this, _| this.state_claims.insert(request, reservation));
-        self.target.insert(request, target);
-        if let Some(head) = head {
-            self.head.insert(request, head);
-        }
+        let boundary = from.and_then(|from| from.boundary.clone());
+        // A resumed sequence holds the tokens of the state it resumes.
+        let tokens = from.map_or_else(Default::default, |from| {
+            input::TokenHistory::starting(&from.tokens)
+        });
+        let (image_features, encodes) = {
+            let entry = self.requests.get(&request).expect("request checked above");
+            let spans = entry.input.layout().spans();
+            let mut image_features = BTreeMap::new();
+            let mut encodes = Vec::new();
+            for (identity, image) in &entry.images {
+                // Spans are ordered and disjoint: only an image's next placement
+                // can straddle the position.
+                let Some(next) = spans
+                    .iter()
+                    .find(|span| span.identity == *identity && position < span.end)
+                else {
+                    continue;
+                };
+                if next.start < position {
+                    if let Some(features) = from.and_then(|from| from.features.get(identity).cloned()) {
+                        image_features.insert(identity.clone(), features);
+                    }
+                }
+                if !image_features.contains_key(identity) {
+                    encodes.push(Operation::Encode {
+                        request,
+                        image: image.clone(),
+                    });
+                }
+            }
+            (image_features, encodes)
+        };
+        self.change_state(|this, _| {
+            this.requests
+                .get_mut(&request)
+                .expect("request checked above")
+                .residency = RequestResidency::Resident(ResidentRequest {
+                claim: reservation,
+                target: Some(target),
+                head,
+                tokens,
+                boundary,
+                image_features,
+                verifying: false,
+                publishing: false,
+            });
+        });
         if let Err(error) = self.back_reservation(unchained.bindings(), request) {
-            self.target.remove(&request);
-            self.head.remove(&request);
             self.change_state(|this, _| {
-                this.drop_state_claim(request);
-                this.idle_kept(kept);
+                this.requests
+                    .get_mut(&request)
+                    .expect("request checked above")
+                    .residency = RequestResidency::Dormant;
+                this.idle_kept();
             });
             return Err(error);
         }
-        self.activate_components(kept);
-        let installed = self.input.get_mut(&request).expect("input checked above");
-        installed.resident = true;
-        installed.boundary = from.and_then(|from| from.boundary.clone());
-        // A resumed sequence holds the tokens of the state it resumes.
-        installed.tokens = from.map_or_else(Default::default, |from| {
-            input::TokenHistory::starting(&from.tokens)
-        });
-        let spans = installed.input.layout().spans();
-        let mut encodes = Vec::new();
-        for (identity, slot) in &mut installed.images {
-            // Spans are ordered and disjoint: only an image's next placement
-            // can straddle the position.
-            let Some(next) = spans
-                .iter()
-                .find(|span| span.identity == *identity && position < span.end)
-            else {
-                continue;
-            };
-            if next.start < position {
-                slot.features = from.and_then(|from| from.features.get(identity).cloned());
-            }
-            if slot.features.is_none() {
-                encodes.push(Operation::Encode {
-                    request,
-                    image: slot.image.clone(),
-                });
-            }
-        }
+        self.activate_components();
         Ok(encodes)
     }
 
@@ -223,41 +239,44 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The request's reconciled state as a resume state: both lanes and the
     /// features of spans straddling its position.
     pub fn resume_state(&self, request: RequestId) -> Result<ResumeState, String> {
-        let target = self
-            .target
+        let entry = self
+            .requests
             .get(&request)
+            .ok_or_else(|| format!("request {} has in-flight work or is not open", request.0))?;
+        let resident = entry
+            .resident()
+            .ok_or_else(|| format!("request {} has in-flight work or is not open", request.0))?;
+        let target = resident
+            .target
+            .as_ref()
             .ok_or_else(|| format!("request {} has in-flight work or is not open", request.0))?
             .checkpoint();
-        if self.head_store.is_some() && !self.head.contains_key(&request) {
+        if self.head_store.is_some() && resident.head.is_none() {
             return Err("request has unresolved head work".into());
         }
-        let head = self.head.get(&request).map(SequenceState::checkpoint);
-        let installed = self
-            .input
-            .get(&request)
-            .ok_or("resident request has no installed input")?;
+        let head = resident.head.as_ref().map(SequenceState::checkpoint);
         let position = target.position();
-        let features = installed
+        let features = entry
             .input
             .layout()
             .spans()
             .iter()
             .filter(|span| span.start < position && position < span.end)
             .map(|span| {
-                let features = installed
-                    .images
+                let features = resident
+                    .image_features
                     .get(&span.identity)
-                    .and_then(|slot| slot.features.clone())
+                    .cloned()
                     .ok_or("resident rows condition on an unencoded image")?;
                 Ok((span.identity.clone(), features))
             })
             .collect::<Result<_, String>>()?;
         Ok(ResumeState {
-            tokens: installed.tokens.before(position)?.into(),
+            tokens: resident.tokens.before(position)?.into(),
             target,
             head,
             features,
-            boundary: installed.boundary.clone(),
+            boundary: resident.boundary.clone(),
         })
     }
 
@@ -269,21 +288,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.chain_holder() == Some(request) {
             self.conclude_chain().map_err(|error| error.to_string())?;
         }
-        let installed = self.input.get(&request).ok_or("request is not open")?;
-        if installed.resident
-            && (!self.target.contains_key(&request)
-                || (self.head_store.is_some() && !self.head.contains_key(&request)))
-        {
-            return Err("request has unresolved work".into());
+        let entry = self.requests.get(&request).ok_or("request is not open")?;
+        if let RequestResidency::Resident(resident) = &entry.residency {
+            if resident.target.is_none() || (self.head_store.is_some() && resident.head.is_none()) {
+                return Err("request has unresolved work".into());
+            }
         }
         self.release_prefetches(&[request])?;
-        self.head.remove(&request);
-        self.verifying.remove(&request);
-        self.publishing.remove(&request);
-        self.input.remove(&request);
-        self.target.remove(&request);
-        self.change_state(|this, _| this.drop_state_claim(request));
-        self.poisoned.remove(&request);
+        self.change_state(|this, _| {
+            this.requests.remove(&request);
+        });
         if let Some(bank) = self.family.expert_bank() {
             bank.closed(request);
         }
@@ -299,35 +313,32 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.chain_holder().is_some_and(|holder| requests.contains(&holder)) {
             self.conclude_chain().map_err(|error| error.to_string())?;
         }
-        if !requests.iter().all(|request| self.input.contains_key(request)) {
-            return Err("evicted request has no installed input".into());
-        }
-        if !requests.iter().all(|request| self.target.contains_key(request)) {
-            return Err("an evicted request has unresolved or absent target state".into());
-        }
-        if self.head_store.is_some() && !requests.iter().all(|request| self.head.contains_key(request)) {
-            return Err("an evicted request has unresolved or absent head state".into());
+        for request in requests {
+            let entry = self
+                .requests
+                .get(request)
+                .ok_or("evicted request has no installed input")?;
+            let resident = entry
+                .resident()
+                .ok_or("an evicted request has unresolved or absent target state")?;
+            if resident.target.is_none() {
+                return Err("an evicted request has unresolved or absent target state".into());
+            }
+            if self.head_store.is_some() && resident.head.is_none() {
+                return Err("an evicted request has unresolved or absent head state".into());
+            }
         }
         // Prefetched for the residency that ends; a state opened again
         // prefetches its own.
         self.release_prefetches(requests)?;
-        for request in requests {
-            let installed = self
-                .input
-                .get_mut(request)
-                .expect("input checked above");
-            installed.resident = false;
-            installed.boundary = None;
-            installed.tokens = Default::default();
-            for slot in installed.images.values_mut() {
-                slot.features = None;
+        self.change_state(|this, _| {
+            for request in requests {
+                this.requests
+                    .get_mut(request)
+                    .expect("request checked above")
+                    .residency = RequestResidency::Dormant;
             }
-            self.verifying.remove(request);
-            self.publishing.remove(request);
-            self.target.remove(request);
-            self.head.remove(request);
-        }
-        self.change_state(|this, _| requests.iter().for_each(|request| this.drop_state_claim(*request)));
+        });
         if let Some(bank) = self.family.expert_bank() {
             for &request in requests {
                 bank.closed(request);
@@ -349,26 +360,14 @@ mod tests {
             .install_input(request, PreparedModelInput::continuation_only())
             .unwrap();
         domain.open_served(&mut bindings, request, None).unwrap();
-        domain.verifying.insert(request);
-        domain.publishing.insert(request);
-        domain
-            .input
-            .get_mut(&request)
-            .unwrap()
-            .tokens
-            .feed(0, &[TokenId(7), TokenId(8)])
-            .unwrap();
+        let resident = domain.resident_mut(request).unwrap();
+        resident.verifying = true;
+        resident.publishing = true;
+        resident.tokens.feed(0, &[TokenId(7), TokenId(8)]).unwrap();
 
         domain.release_state(&[request]).unwrap();
 
-        assert!(!domain.verifying.contains(&request));
-        assert!(!domain.publishing.contains(&request));
-        assert!(!domain.target.contains_key(&request));
-        assert!(!domain.state_claims.contains_key(&request));
-        let installed = &domain.input[&request];
-        assert!(!installed.resident);
-        assert!(installed.boundary.is_none());
-        assert!(installed.tokens.before(1).is_err());
+        assert!(matches!(domain.requests[&request].residency, RequestResidency::Dormant));
     }
 
     #[test]
@@ -376,25 +375,20 @@ mod tests {
         let (mut domain, mut bindings) = super::fixtures::fixture(None);
         let first = RequestId(1);
         let second = RequestId(2);
-        for request in [first, second] {
-            domain
-                .install_input(request, PreparedModelInput::continuation_only())
-                .unwrap();
-            domain.open_served(&mut bindings, request, None).unwrap();
-        }
-        domain.verifying.insert(first);
-        domain.publishing.insert(first);
-        // Drop `second`'s input while leaving its target state intact so only
-        // the input check rejects the batch.
-        domain.input.remove(&second);
+        domain
+            .install_input(first, PreparedModelInput::continuation_only())
+            .unwrap();
+        domain.open_served(&mut bindings, first, None).unwrap();
+        let resident = domain.resident_mut(first).unwrap();
+        resident.verifying = true;
+        resident.publishing = true;
 
         let err = domain.release_state(&[first, second]).unwrap_err();
         assert!(err.contains("no installed input"), "unexpected error: {err}");
 
-        assert!(domain.input[&first].resident);
-        assert!(domain.target.contains_key(&first));
-        assert!(domain.state_claims.contains_key(&first));
-        assert!(domain.verifying.contains(&first));
-        assert!(domain.publishing.contains(&first));
+        let resident = domain.resident(first).expect("first remains resident");
+        assert!(resident.target.is_some());
+        assert!(resident.verifying);
+        assert!(resident.publishing);
     }
 }

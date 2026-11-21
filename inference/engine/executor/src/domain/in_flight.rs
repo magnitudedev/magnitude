@@ -234,11 +234,15 @@ impl HeldFront {
     /// Return what it secured, unlaunched, to `head`: an advance over a
     /// request's accepted head state returns that state; one following a
     /// drafter entry drops, its rows and bank with it.
-    pub(super) fn release(self, head: &mut BTreeMap<RequestId, SequenceState>) {
+    pub(super) fn release(self, requests: &mut BTreeMap<RequestId, RequestEntry>) {
         match self {
             Self::Accepted(front) => {
                 for slot in front.slots {
-                    head.insert(slot.request, slot.advance.abort());
+                    requests
+                        .get_mut(&slot.request)
+                        .and_then(RequestEntry::resident_mut)
+                        .expect("invariant violated: a released front head's request is not resident")
+                        .put_head(slot.advance.abort());
                 }
             }
             Self::Entry(front) => drop(front),

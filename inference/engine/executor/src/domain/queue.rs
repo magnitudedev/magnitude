@@ -288,7 +288,7 @@ impl<F: ProgramFamily> Queue<F> {
     /// steps is reported once the holder's state is back.
     pub(super) fn conclude(
         &mut self,
-        target: &mut BTreeMap<RequestId, SequenceState>,
+        requests: &mut BTreeMap<RequestId, RequestEntry>,
         experts: Option<&ExpertMeasures>,
         bank: Option<&dyn ElasticBank>,
     ) -> Result<(), DomainError> {
@@ -304,7 +304,11 @@ impl<F: ProgramFamily> Queue<F> {
             outcome.and(orphaned)
         });
         if let Some((holder, joined)) = chain {
-            target.insert(holder, joined.commit());
+            requests
+                .get_mut(&holder)
+                .and_then(RequestEntry::resident_mut)
+                .expect("invariant violated: a concluded chain's holder is not resident")
+                .put_target(joined.commit());
         }
         drained
     }
@@ -394,8 +398,8 @@ fn fitting<T>(result: Result<T, magnitude_state::Error>) -> Result<Option<T>, Do
 /// its feature, so that round is the queued decode, discarding nothing.
 pub(super) fn continuations(
     operations: &[Operation],
-    verifying: &BTreeSet<RequestId>,
-    publishing: &BTreeSet<RequestId>,
+    verifying: impl Fn(RequestId) -> bool,
+    publishing: impl Fn(RequestId) -> bool,
     fuses_draft_taps: bool,
     context: usize,
 ) -> Option<Vec<Operation>> {
@@ -403,11 +407,11 @@ pub(super) fn continuations(
         .iter()
         .map(|operation| {
             let request = operation.request();
-            let drafts_next = verifying.contains(&request)
+            let drafts_next = verifying(request)
                 || (fuses_draft_taps && operation.demand().computes_features());
             match drafts_next {
                 true => None,
-                false => continuation_of(operation, publishing.contains(&request), context),
+                false => continuation_of(operation, publishing(request), context),
             }
         })
         .collect()
@@ -654,7 +658,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 Some(joined.end())
             }
             Queue::Empty | Queue::Opening(_) | Queue::Chain(_) | Queue::Successor(_) => {
-                self.target.get(&request).map(SequenceState::position)
+                self.target_state(request).map(SequenceState::position)
             }
         }
     }
@@ -678,7 +682,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// claim the rest of its chain (it ended).
     pub fn conclude_chain(&mut self) -> Result<(), DomainError> {
         let experts = self.measures.as_ref().and_then(|measures| measures.experts.as_ref());
-        let concluded = self.queue.conclude(&mut self.target, experts, self.family.expert_bank());
+        let concluded = self.queue.conclude(&mut self.requests, experts, self.family.expert_bank());
         concluded.and_then(|()| self.close_group())
     }
 
@@ -714,7 +718,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 true
             }
             Queue::Empty | Queue::Opening(_) | Queue::Chain(_) | Queue::Successor(_) => {
-                self.target.insert(request, joined.commit());
+                self.put_target_state(request, joined.commit());
                 false
             }
         }
@@ -734,10 +738,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let rows = first.rows();
             let (OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) =
                 first.commit(rows).map_err(|(state, error)| {
-                    self.target.insert(request, state);
+                    self.put_target_state(request, state);
                     DomainError::from(error)
                 })?;
-            self.target.insert(request, state);
+            self.put_target_state(request, state);
             return Ok(());
         };
         match OwnedChainAdvance::begin(first) {
@@ -749,7 +753,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 // The queued chunks follow its rows: they go first.
                 self.queue = Queue::Opening(steps);
                 let concluded = self.conclude_chain();
-                self.target.insert(request, first.abort());
+                self.put_target_state(request, first.abort());
                 concluded.and(Err(DomainError::from(error)))
             }
         }
@@ -793,7 +797,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // chain rather than queueing alone behind this one.
         let context = self.execution.resources().target_state().context_rows;
         let fuses_draft_taps = self.execution.load().draft_fusion().is_some();
-        if let Some(operations) = continuations(operations, &self.verifying, &self.publishing, fuses_draft_taps, context) {
+        if let Some(operations) = continuations(
+            operations,
+            |request| self.resident(request).is_some_and(|resident| resident.verifying),
+            |request| self.resident(request).is_some_and(|resident| resident.publishing),
+            fuses_draft_taps,
+            context,
+        ) {
             return Behind::Continuation { operations };
         }
         if self.chain_capacity() > std::num::NonZeroUsize::MIN {
@@ -1299,7 +1309,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     Queue::Empty | Queue::Opening(_) | Queue::Chain(_) | Queue::Successor(_) => false,
                 },
                 TentativeAdvance::Accepted(_) | TentativeAdvance::Successor(_) => follows_state(
-                    self.target.get(&operation.request())?,
+                    self.target_state(operation.request())?,
                     advance.position(),
                     advance.bindings(),
                     advance.domain_ranges(),
@@ -1310,7 +1320,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let head_follows = match (&step.front, operation) {
                 (Some(front), Operation::Forward { prime: None, .. }) => {
                     let advance = &front.slots[slot].advance;
-                    self.head.get(&operation.request()).is_some_and(|state| {
+                    self.head_state(operation.request()).is_some_and(|state| {
                         follows_state(state, advance.position(), advance.bindings(), advance.domain_ranges())
                     })
                 }
@@ -1320,8 +1330,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 Operation::Forward {
                     prime: Some(prime), ..
                 } => self
-                    .head
-                    .get(&operation.request())
+                    .head_state(operation.request())
                     .is_some_and(|head| head.position() == prime.position),
                 _ => true,
             };
@@ -1381,21 +1390,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
                 TentativeAdvance::Accepted(_) | TentativeAdvance::Successor(_) => {
                     let state = self
-                        .target
-                        .remove(&operation.request())
+                        .take_target_state(operation.request())
                         .expect("invariant violated: a claimed slot's accepted state is absent");
                     Source::Accepted(state)
                 }
             };
             if let Some(heads) = &mut heads {
-                heads[slot] = self.head.remove(&operation.request());
+                heads[slot] = self.take_head_state(operation.request());
             }
         }
         flight.continuation = Some(sources);
         // Take-out: the drafter entry's accepted head state, returned as it
         // finishes (`finish_priming_work` attaches it).
         if let Some(priming) = &mut flight.priming {
-            priming.continuation = Some(self.head.remove(&priming.request));
+            priming.continuation = Some(self.take_head_state(priming.request));
         }
         let front = front.map(|head| match heads {
             Some(states) => DueFront::Claimed(*head, states),
@@ -1662,11 +1670,8 @@ mod tests {
     #[test]
     fn a_round_whose_drafter_proposed_queues_no_decode_behind_it() {
         let declined = decode(Demand::SELECT | Demand::FEATURES, vec![TokenId(5)]);
-        let plain = std::collections::BTreeSet::new();
-        let none = std::collections::BTreeSet::new();
-        assert!(continuations(std::slice::from_ref(&declined), &plain, &none, false, 9).is_some());
-        let proposed = std::collections::BTreeSet::from([RequestId(3)]);
-        assert!(continuations(std::slice::from_ref(&declined), &proposed, &none, false, 9).is_none());
+        assert!(continuations(std::slice::from_ref(&declined), |_| false, |_| false, false, 9).is_some());
+        assert!(continuations(std::slice::from_ref(&declined), |id| id == RequestId(3), |_| false, false, 9).is_none());
     }
 
     /// On a load whose features are a separate draft's fused taps, a round
@@ -1676,14 +1681,12 @@ mod tests {
     /// where the next round prepares.
     #[test]
     fn a_decode_preparing_a_fused_draft_queues_no_decode_behind_it() {
-        let none = std::collections::BTreeSet::new();
         let preparing = decode(Demand::SELECT | Demand::FEATURES, vec![TokenId(5)]);
-        assert!(continuations(std::slice::from_ref(&preparing), &none, &none, true, 9).is_none());
+        assert!(continuations(std::slice::from_ref(&preparing), |_| false, |_| false, true, 9).is_none());
         let plain = decode(Demand::SELECT, vec![TokenId(5)]);
-        let queued = continuations(std::slice::from_ref(&plain), &none, &none, true, 9).unwrap();
+        let queued = continuations(std::slice::from_ref(&plain), |_| false, |_| false, true, 9).unwrap();
         assert_eq!(queued[0].demand(), Demand::SELECT);
-        let publishing = std::collections::BTreeSet::from([plain.request()]);
-        let queued = continuations(std::slice::from_ref(&plain), &none, &publishing, true, 9).unwrap();
+        let queued = continuations(std::slice::from_ref(&plain), |_| false, |id| id == plain.request(), true, 9).unwrap();
         assert_eq!(queued[0].demand(), Demand::SELECT | Demand::FEATURES);
     }
 

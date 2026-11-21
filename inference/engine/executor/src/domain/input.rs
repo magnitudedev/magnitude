@@ -51,10 +51,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         request: RequestId,
         input: PreparedModelInput,
     ) -> Result<(), String> {
-        if self.input.contains_key(&request)
-            || self.target.contains_key(&request)
-            || self.head.contains_key(&request)
-        {
+        if self.requests.contains_key(&request) {
             return Err(format!("request {} is already open", request.0));
         }
         if input.vision().len() > self.execution.policy().limits().max_images_per_request {
@@ -71,23 +68,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .map(|(identity, prepared)| {
                 let image = ImageRef::prepared(self.domain.id().clone(), prepared.clone())
                     .map_err(|error| error.to_string())?;
-                Ok((
-                    identity.clone(),
-                    InputImage {
-                        image,
-                        features: None,
-                    },
-                ))
+                Ok((identity.clone(), image))
             })
             .collect::<Result<_, String>>()?;
-        self.input.insert(
+        self.requests.insert(
             request,
-            RequestInput {
-                boundary: None,
+            RequestEntry {
                 input,
                 images,
-                resident: false,
-                tokens: TokenHistory::default(),
+                poisoned: None,
+                residency: RequestResidency::Dormant,
             },
         );
         Ok(())
@@ -103,7 +93,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         position: usize,
         count: usize,
     ) -> Result<&[crate::TokenId], String> {
-        let before = self.installed_input(request)?.tokens.before(position)?;
+        let resident = self
+            .installed_request(request)?
+            .resident()
+            .ok_or_else(|| format!("request {} is not resident", request.0))?;
+        let before = resident.tokens.before(position)?;
         Ok(&before[before.len().saturating_sub(count)..])
     }
 
@@ -170,17 +164,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             else {
                 return Err("non-forward target operation".into());
             };
-            self.input
-                .get_mut(request)
-                .ok_or_else(|| format!("request {} feeds rows without installed input", request.0))?
+            self.resident_mut(*request)
+                .ok_or_else(|| format!("request {} feeds rows without residency", request.0))?
                 .tokens
                 .feed(*position, tokens)?;
         }
         Ok(())
     }
 
-    fn installed_input(&self, request: RequestId) -> Result<&RequestInput, String> {
-        self.input
+    fn installed_request(&self, request: RequestId) -> Result<&RequestEntry, String> {
+        self.requests
             .get(&request)
             .ok_or_else(|| format!("request {} lowers rows without installed input", request.0))
     }
@@ -194,7 +187,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         count: usize,
     ) -> Result<Vec<[i32; 4]>, String> {
         Ok(self
-            .installed_input(request)?
+            .installed_request(request)?
             .input
             .coordinates_at(position, count)
             .map_err(|error| error.to_string())?
@@ -210,15 +203,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         tokens: &[crate::TokenId],
     ) -> Result<(Vec<[i32; 4]>, Vec<crate::ConditioningSlice>), String> {
         let coordinates = self.input_coordinates(request, position, tokens.len())?;
-        let state = self.installed_input(request)?;
+        let entry = self.installed_request(request)?;
+        let resident = entry
+            .resident()
+            .ok_or_else(|| format!("request {} lowers rows without residency", request.0))?;
         let end = position
             .checked_add(tokens.len())
             .ok_or("input end overflows")?;
-        if !state.input.layout().boundary(position)
-            || !state.input.layout().boundary(end)
-            || (position < state.input.tokens().len() && end > state.input.tokens().len())
+        if !entry.input.layout().boundary(position)
+            || !entry.input.layout().boundary(end)
+            || (position < entry.input.tokens().len() && end > entry.input.tokens().len())
             || tokens.iter().enumerate().any(|(index, token)| {
-                state
+                entry
                     .input
                     .tokens()
                     .get(position + index)
@@ -228,20 +224,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Err("target rows differ from admitted prepared input".into());
         }
         let mut slices = Vec::new();
-        for span in state
+        for span in entry
             .input
             .layout()
             .spans()
             .iter()
             .filter(|span| span.start < end && position < span.end)
         {
-            let image = state
-                .images
+            if !entry.images.contains_key(&span.identity) {
+                return Err("prepared input image is absent".into());
+            }
+            let features = resident
+                .image_features
                 .get(&span.identity)
-                .ok_or("prepared input image is absent")?;
-            let features = image
-                .features
-                .clone()
+                .cloned()
                 .ok_or("prepared input image has not been encoded")?;
             let start = position.max(span.start);
             let stop = end.min(span.end);

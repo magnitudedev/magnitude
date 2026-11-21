@@ -381,7 +381,7 @@ fn drafter_work_resolves_its_requests_lookahead_before_provisioning() {
     open(&mut domain, &mut bindings, request);
     let mut bindings = queue_lookahead(&mut domain, bindings, request);
     assert!(
-        !domain.target[&request].blocked_tails().is_empty(),
+        !domain.target_state(request).unwrap().blocked_tails().is_empty(),
         "the lookahead's rows read as another history's"
     );
     let draft = Operation::Head {
@@ -404,7 +404,7 @@ fn drafter_work_resolves_its_requests_lookahead_before_provisioning() {
         domain.queue.is_empty(),
         "drafter work resolved the lookahead"
     );
-    assert!(domain.target[&request].blocked_tails().is_empty());
+    assert!(domain.target_state(request).unwrap().blocked_tails().is_empty());
 }
 
 /// [`chained`] on the device `Automatic` prefers, priced ([`measure_load`])
@@ -504,7 +504,7 @@ fn an_open_during_a_chain_waits_for_its_end() {
     for position in 1..3 {
         assert_eq!(domain.chain_holder(), Some(holder));
         assert!(domain.unchained(&mut bindings).is_none(), "the open waits while the chain is under way");
-        assert!(!domain.state_claims.contains_key(&waiting), "a waiting open holds nothing");
+        assert!(domain.resident(waiting).is_none(), "a waiting open holds nothing");
         let flight = submit_claimed(&mut domain, bindings, vec![prefill(holder, position)]);
         let (pending, returned) = finish_one(&mut domain, flight);
         bindings = returned;
@@ -514,7 +514,7 @@ fn an_open_during_a_chain_waits_for_its_end() {
     let unchained = domain.unchained(&mut bindings).expect("the chain ended: the queue is free");
     let rows = domain.execution.resources().target_state().context_rows as u64;
     assert!(domain.open_state(unchained, waiting, None, rows).unwrap().is_empty(), "the open succeeds once the chain ends");
-    assert!(domain.state_claims.contains_key(&waiting));
+    assert!(domain.resident(waiting).is_some());
 }
 
 /// A prompt group's places are the plan's: where the plan holds its
@@ -804,7 +804,7 @@ fn spare_slabs_owed_wait_for_a_held_chain_and_release_once_it_ends() {
     let unchained = domain.unchained(&mut bindings).expect("no chain is under way");
     assert!(domain.open_state(unchained, request, None, 3).unwrap().is_empty());
     let backed = domain.target_store.backed_slab_bytes();
-    let reserved = domain.state_claims[&request].bytes() + domain.request_slot.bytes();
+    let reserved = domain.resident(request).unwrap().claim.bytes() + domain.request_slot.bytes();
     assert!(backed > reserved, "the closed history's slabs, {backed} bytes, exceed the {reserved} the request and the slot hold");
     domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
     let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
@@ -929,7 +929,7 @@ fn reservation_recomputes_row_demand_after_shared_tail_relocation() {
     domain
         .open_served(&mut bindings, copy, Some(&checkpoint))
         .unwrap();
-    assert!(!domain.target[&copy].blocked_tails().is_empty());
+    assert!(!domain.target_state(copy).unwrap().blocked_tails().is_empty());
     let operations = [forward(copy, 1)];
     let before = domain.requirements(&operations).unwrap();
     assert!(before.state_demand.iter().any(|demand| demand.rows > 0));
@@ -969,7 +969,7 @@ fn one_launch_advances_two_continuations_of_a_shared_tail() {
             .unwrap();
     }
     for copy in copies {
-        assert!(!domain.target[&copy].blocked_tails().is_empty());
+        assert!(!domain.target_state(copy).unwrap().blocked_tails().is_empty());
     }
     let flight = submit_reserved_target(
         &mut domain,
@@ -1496,7 +1496,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
 
     // A head advance is independent from the accepted target lane. The target
     // state remaining resident must not be mistaken for a conflicting owner.
-    let head_source = domain.target.get(&request).unwrap().checkpoint().fork();
+    let head_source = domain.target_state(request).unwrap().checkpoint().fork();
     let head_advance = OwnedStateAdvance::begin(head_source, 1).ok().unwrap();
     domain
         .abort(PendingOperationOutcome {
@@ -1517,8 +1517,8 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             awaited: None,
         })
         .unwrap();
-    assert_eq!(domain.target.get(&request).unwrap().position(), 0);
-    assert_eq!(domain.head.remove(&request).unwrap().position(), 0);
+    assert_eq!(domain.target_state(request).unwrap().position(), 0);
+    assert_eq!(domain.take_head_state(request).unwrap().position(), 0);
 
     // Vision output is stateless until reconciliation installs it. Cancelling
     // the request simply drops the retained feature claim.
@@ -1547,7 +1547,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             awaited: None,
         })
         .unwrap();
-    assert_eq!(domain.target.get(&request).unwrap().position(), 0);
+    assert_eq!(domain.target_state(request).unwrap().position(), 0);
 }
 
 /// The tiny model with a minimal vision description: 2 x 2 patches of two
@@ -1783,7 +1783,7 @@ fn placements<F: ProgramFamily>(
     request: RequestId,
     position: usize,
 ) -> Vec<(usize, FeatureRef, usize, usize)> {
-    let tokens = domain.input[&request].input.tokens()[position..].to_vec();
+    let tokens = domain.requests[&request].input.tokens()[position..].to_vec();
     let (_, slices) = domain.input_rows(request, position, &tokens).unwrap();
     slices
         .into_iter()
@@ -1811,7 +1811,7 @@ fn a_repeated_image_is_encoded_once_and_placed_at_every_occurrence() {
             vision_input(&[(1, "repeated"), (3, "other"), (5, "repeated")], 7),
         )
         .unwrap();
-    assert_eq!(domain.input[&request].images.len(), 2);
+    assert_eq!(domain.requests[&request].images.len(), 2);
 
     let images = encoded_images(&domain.open_served(&mut bindings, request, None).unwrap());
     let [first, second] = images.as_slice() else {
@@ -1820,7 +1820,7 @@ fn a_repeated_image_is_encoded_once_and_placed_at_every_occurrence() {
     assert_ne!(first, second);
     let features =
         [first, second].map(|image| reconcile_encode(&mut domain, request, image.clone()));
-    let repeated_features = if domain.input[&request].images["repeated"].image == *first {
+    let repeated_features = if domain.requests[&request].images["repeated"] == *first {
         &features[0]
     } else {
         &features[1]
@@ -1982,7 +1982,7 @@ fn attach_pending_priming(
     token: TokenId,
 ) -> PendingControl {
     let advance = TentativeAdvance::Accepted(
-        OwnedStateAdvance::begin(domain.head.remove(&request).unwrap(), 1)
+        OwnedStateAdvance::begin(domain.take_head_state(request).unwrap(), 1)
             .ok()
             .unwrap(),
     );
@@ -2058,8 +2058,8 @@ fn deferred_priming_commits_after_target_publication_and_releases_leases() {
     domain
         .reconcile(pending, PhysicalDecision::rows(2))
         .unwrap();
-    assert_eq!(domain.target[&request].position(), 2);
-    assert!(!domain.head.contains_key(&request));
+    assert_eq!(domain.target_state(request).unwrap().position(), 2);
+    assert!(domain.head_state(request).is_none());
     assert!(
         domain.resume_state(request).is_err(),
         "no half-resolved checkpoint"
@@ -2123,7 +2123,7 @@ fn a_deferred_entry_commits_with_the_chain_its_chunk_opens() {
     assert_eq!(domain.chain_holder(), Some(request));
     control.resolve(Ok(()));
     let (_, mut bindings) = domain.finish_priming(priming).unwrap();
-    assert_eq!(domain.head[&request].position(), 1, "the entry committed with its chunk");
+    assert_eq!(domain.head_state(request).unwrap().position(), 1, "the entry committed with its chunk");
     for position in 1..3 {
         let flight = submit_claimed(&mut domain, bindings, vec![prefill(request, position)]);
         let (pending, returned) = finish_one(&mut domain, flight);
@@ -2146,7 +2146,7 @@ fn deferred_priming_aborts_when_its_target_chunk_is_rejected() {
     let (mut domain, flight, control) = target_with_pending_priming(request);
     let (pending, priming) = publish_before_priming(&mut domain, flight);
     domain.abort(pending).unwrap();
-    assert_eq!(domain.target[&request].position(), 0);
+    assert_eq!(domain.target_state(request).unwrap().position(), 0);
     assert!(domain.resume_state(request).is_err());
     control.resolve(Ok(()));
     let (_, bindings) = domain.finish_priming(priming).unwrap();
@@ -2176,14 +2176,12 @@ fn deferred_priming_prevents_cancelled_request_retirement_until_completion() {
         domain.close(request).unwrap_err(),
         "request has unresolved work"
     );
-    assert!(domain.input.contains_key(&request));
-    assert_eq!(domain.target[&request].position(), 2);
+    assert!(domain.requests.contains_key(&request));
+    assert_eq!(domain.target_state(request).unwrap().position(), 2);
     control.resolve(Ok(()));
     let (_, mut bindings) = domain.finish_priming(priming).unwrap();
     domain.close(request).unwrap();
-    assert!(!domain.input.contains_key(&request));
-    assert!(!domain.target.contains_key(&request));
-    assert!(!domain.head.contains_key(&request));
+    assert!(!domain.requests.contains_key(&request));
     // Retirement leaves both stores usable by a different request.
     let next = RequestId(96);
     open(&mut domain, &mut bindings, next);
@@ -2235,9 +2233,11 @@ fn boundary_features_commit_fork_and_abort_with_numerical_state() {
         .open_served(&mut bindings, fork, Some(&checkpoint))
         .unwrap();
     domain.release_state(&[request]).unwrap();
-    assert!(domain.input[&request].boundary.is_none());
+    assert!(domain.resident(request).is_none());
     assert!(
-        domain.input[&fork]
+        domain
+            .resident(fork)
+            .unwrap()
             .boundary
             .as_ref()
             .unwrap()

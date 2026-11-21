@@ -43,10 +43,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 advance
                     .commit(decision.accepted_rows)
                     .map_err(|(state, error)| {
-                        self.head.insert(pending.request, state);
+                        self.put_head_state(pending.request, state);
                         DomainError::from(error)
                     })?;
-            self.head.insert(pending.request, state);
+            self.put_head_state(pending.request, state);
             return Ok(());
         }
         if matches!(pending.outcome, Outcome::Encode { .. }) {
@@ -55,16 +55,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             if let (Outcome::Encode { features }, Some(image)) = (&pending.outcome, &pending.image)
             {
-                let slot = self
-                    .input
+                let entry = self
+                    .requests
                     .get_mut(&pending.request)
-                    .expect("invariant violated: a vision outcome's request has no admitted input")
+                    .expect("invariant violated: a vision outcome's request has no admitted input");
+                let identity = entry
                     .images
-                    .values_mut()
-                    .find(|slot| &slot.image == image)
+                    .iter()
+                    .find_map(|(identity, candidate)| (candidate == image).then(|| identity.clone()))
                     .expect("invariant violated: an encoded image is absent from its admitted input");
-                assert!(slot.features.is_none(), "invariant violated: an encoded image's features are already installed");
-                slot.features = Some(features.clone());
+                let resident = entry
+                    .resident_mut()
+                    .expect("invariant violated: a vision outcome's request is not resident");
+                assert!(
+                    resident.image_features.insert(identity, features.clone()).is_none(),
+                    "invariant violated: an encoded image's features are already installed"
+                );
             }
             return Ok(());
         }
@@ -78,9 +84,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // Its state is the outcome's alone until it reconciles, a chain it
         // carries with it: no other owner can hold it.
         assert!(
-            !self.target.contains_key(&request)
+            self.target_state(request).is_none()
                 && !((pending.primed.is_some() || matches!(pending.front, Some(FrontAdvance::Step(_))))
-                    && self.head.contains_key(&request)),
+                    && self.head_state(request).is_some()),
             "invariant violated: a reconciled request has another physical state owner"
         );
         let advance = pending.advance.take().expect("invariant violated: a target outcome owns no target advance");
@@ -101,11 +107,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     OwnedAdvanceResolution::Aborted(state)
                     | OwnedAdvanceResolution::Committed(state),
                 ) => {
-                    self.target.insert(request, state);
+                    self.put_target_state(request, state);
                     Ok(())
                 }
                 Err((state, error)) => {
-                    self.target.insert(request, state);
+                    self.put_target_state(request, state);
                     self.return_head_advances(request, pending.primed.take(), pending.front.take());
                     return Err(error.into());
                 }
@@ -127,7 +133,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let rows = primed.rows();
             match primed.commit(rows) {
                 Ok(OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) => {
-                    self.head.insert(request, state);
+                    self.put_head_state(request, state);
                 }
                 Err((_, error)) => broken(error),
             }
@@ -137,15 +143,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 FrontAdvance::Step(front) => front,
                 FrontAdvance::Entry(front) => {
                     let state = self
-                        .head
-                        .remove(&request)
+                        .take_head_state(request)
                         .expect("invariant violated: a closing chunk's front head advance follows no drafter entry");
                     front.attach(state).unwrap_or_else(|(_, error)| broken(error))
                 }
             };
             match front.commit(1) {
                 Ok(OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) => {
-                    self.head.insert(request, state);
+                    self.put_head_state(request, state);
                 }
                 Err((_, error)) => broken(error),
             }
@@ -159,9 +164,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .cloned(),
             _ => None,
         };
-        self.input
-            .get_mut(&request)
-            .expect("resident request has input")
+        self.resident_mut(request)
+            .expect("resident request has entry")
             .boundary = boundary;
         Ok(())
     }
@@ -172,11 +176,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`ElasticBank::discarded`).
     pub fn abort(&mut self, pending: PendingOperationOutcome) -> Result<(), DomainError> {
         let conflicting_owner = match &pending.outcome {
-            Outcome::Head { .. } => self.head.contains_key(&pending.request),
+            Outcome::Head { .. } => self.head_state(pending.request).is_some(),
             Outcome::Forward { .. } | Outcome::WeightReadFailed(_) | Outcome::Interrupted { .. } => {
-                self.target.contains_key(&pending.request)
+                self.target_state(pending.request).is_some()
                     || ((pending.primed.is_some() || matches!(pending.front, Some(FrontAdvance::Step(_))))
-                        && self.head.contains_key(&pending.request))
+                        && self.head_state(pending.request).is_some())
             }
             Outcome::Encode { .. } => false,
         };
@@ -193,7 +197,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         match (&pending.outcome, advance) {
             (Outcome::Head { .. }, Advance::Step(advance)) => {
-                self.head.insert(pending.request, advance.abort());
+                self.put_head_state(pending.request, advance.abort());
                 Ok(())
             }
             (Outcome::Forward { .. } | Outcome::WeightReadFailed(_) | Outcome::Interrupted { .. }, advance) => {
@@ -213,7 +217,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     fn abort_target(&mut self, request: RequestId, advance: Advance) -> Result<(), DomainError> {
         match advance {
             Advance::Step(advance) => {
-                self.target.insert(request, advance.abort());
+                self.put_target_state(request, advance.abort());
                 Ok(())
             }
             // A chain's first chunk: the chunks queued behind it follow its
@@ -223,7 +227,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     true => self.conclude_chain(),
                     false => Ok(()),
                 };
-                self.target.insert(request, first.abort());
+                self.put_target_state(request, first.abort());
                 concluded
             }
             // A chunk of a chain: the chain cannot run past it, so it
@@ -245,11 +249,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// and drops.
     fn return_head_advances(&mut self, request: RequestId, primed: Option<OwnedStateAdvance>, front: Option<FrontAdvance>) {
         if let Some(primed) = primed {
-            self.head.insert(request, primed.abort());
+            self.put_head_state(request, primed.abort());
         }
         match front {
             Some(FrontAdvance::Step(front)) => {
-                self.head.insert(request, front.abort());
+                self.put_head_state(request, front.abort());
             }
             Some(FrontAdvance::Entry(front)) => drop(front),
             None => {}
