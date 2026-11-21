@@ -6775,11 +6775,15 @@ impl NativeGraphSequence {
             }
             first += run.plan.topology.nodes.len();
         }
+        #[cfg(any(test, target_os = "macos"))]
+        let access_summary = SequenceAccessSummary::of(&self.runs, &nodes);
         let list = SequenceList {
             runs: &self.runs,
             nodes,
             boundaries,
             stamps,
+            #[cfg(any(test, target_os = "macos"))]
+            access_summary,
         };
         let mut submission = submit(&list, &access, retained, 1, observed, self.queue)?;
         // The runs own the storage their work reaches; it retires with this
@@ -6949,6 +6953,154 @@ struct SequenceList<'a> {
     boundaries: Vec<Vec<TimelineOperation>>,
     /// Per dispatch boundary, the sampled runs' stamps there, in run order.
     stamps: Vec<Vec<Stamp>>,
+    /// Per-sequence access summary for Metal hazard scheduling:
+    /// - `written_groups`: access groups written by at least one dispatch.
+    ///   Strictly read-only sites are omitted from `reaches`.
+    /// - `plain_groups`: access groups touched by any non-slab binding.
+    /// - `shared_lender_groups`: lent-slab lender groups touched by more than
+    ///   one distinct `(Slots, region)` in the sequence.
+    /// A slab site whose access groups are disjoint from `plain_groups` and
+    /// `shared_lender_groups` is summarized in O(1) via `SlabReach::extend_logical`.
+    #[cfg(any(test, target_os = "macos"))]
+    access_summary: SequenceAccessSummary,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+struct SequenceAccessSummary {
+    written_groups: std::collections::HashSet<usize>,
+    plain_groups: std::collections::HashSet<usize>,
+    shared_lender_groups: std::collections::HashSet<usize>,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+impl SequenceAccessSummary {
+    fn of(runs: &[QueuedRun], nodes: &[(usize, usize)]) -> Self {
+        let mut written_groups = std::collections::HashSet::new();
+        let mut plain_groups = std::collections::HashSet::new();
+        let mut lender_owner = std::collections::HashMap::<usize, u64>::new();
+        let mut shared_lender_groups = std::collections::HashSet::new();
+        for &(run_idx, node_idx) in nodes {
+            let run = &runs[run_idx];
+            let static_node = &run.plan.topology.nodes[node_idx];
+            let kernel = &run.plan.kernels[node_idx];
+            if let Some(scalars) = &kernel.scalars {
+                let g = scalars.slots.access_identity();
+                written_groups.insert(g);
+                plain_groups.insert(g);
+            }
+            for (buffer, site) in static_node.sites.iter().enumerate() {
+                let writes = kernel.writes(buffer);
+                let idx = static_node.site_base + buffer;
+                match (site.region, run.plan.site_records[idx]) {
+                    (Region::External(port), SiteRecords::Port(_)) => {
+                        let records = run.records(port);
+                        if let Some(slab) = run.slab(port) {
+                            if writes {
+                                written_groups.insert(records.table.access_identity());
+                                written_groups.extend(slab.lender_groups.iter().copied());
+                            }
+                            for &g in &slab.lender_groups {
+                                if let Some(&prev) = lender_owner.get(&g) {
+                                    if prev != slab.logical_allocation {
+                                        shared_lender_groups.insert(g);
+                                    }
+                                } else {
+                                    lender_owner.insert(g, slab.logical_allocation);
+                                }
+                            }
+                        } else if let Some((storage, _)) = &records.storage {
+                            let g = storage.access_identity();
+                            plain_groups.insert(g);
+                            if writes {
+                                written_groups.insert(g);
+                            }
+                        }
+                    }
+                    (Region::External(port), SiteRecords::None) => {
+                        let g = run.external(port).allocation.access_identity();
+                        if let Some(slab) = run.slab(port) {
+                            if writes {
+                                written_groups.insert(g);
+                                written_groups.extend(slab.lender_groups.iter().copied());
+                            }
+                            for &lg in &slab.lender_groups {
+                                if let Some(&prev) = lender_owner.get(&lg) {
+                                    if prev != slab.logical_allocation {
+                                        shared_lender_groups.insert(lg);
+                                    }
+                                } else {
+                                    lender_owner.insert(lg, slab.logical_allocation);
+                                }
+                            }
+                        } else {
+                            plain_groups.insert(g);
+                            if writes {
+                                written_groups.insert(g);
+                            }
+                        }
+                    }
+                    (Region::Workspace, _) => {
+                        if let Some(allocation) = &run.workspace {
+                            let g = allocation.access_identity();
+                            plain_groups.insert(g);
+                            if writes {
+                                written_groups.insert(g);
+                            }
+                        }
+                    }
+                    (Region::Sync, _) => {
+                        if let Some(allocation) = &run.sync {
+                            let g = allocation.access_identity();
+                            plain_groups.insert(g);
+                            if writes {
+                                written_groups.insert(g);
+                            }
+                        }
+                    }
+                    (Region::Upload, _) => {
+                        if let Some(allocation) = &run.upload {
+                            let g = allocation.access_identity();
+                            plain_groups.insert(g);
+                            if writes {
+                                written_groups.insert(g);
+                            }
+                        }
+                    }
+                    (Region::Outputs, SiteRecords::None) => {
+                        if let Some(allocation) = &run.outputs {
+                            let g = allocation.access_identity();
+                            plain_groups.insert(g);
+                            if writes {
+                                written_groups.insert(g);
+                            }
+                        }
+                    }
+                    (region, records) => unreachable!("a {records:?} record site in {region:?}"),
+                }
+            }
+        }
+        Self {
+            written_groups,
+            plain_groups,
+            shared_lender_groups,
+        }
+    }
+
+    fn slab_written(&self, table_group: usize, slab: &crate::api::tensor::SlabReach) -> bool {
+        self.written_groups.contains(&table_group)
+            || slab
+                .lender_groups
+                .iter()
+                .any(|group| self.written_groups.contains(group))
+    }
+
+    fn slab_is_logical(&self, table_group: usize, slab: &crate::api::tensor::SlabReach) -> bool {
+        !self.plain_groups.contains(&table_group)
+            && !slab
+                .lender_groups
+                .iter()
+                .any(|group| self.plain_groups.contains(group) || self.shared_lender_groups.contains(group))
+    }
 }
 
 /// Record the CUDA graph of a run of `layout`, whose nodes are the
@@ -7066,6 +7218,23 @@ impl DispatchList for SequenceList<'_> {
                 .expect("a planned graph storage region is present")
                 .identity()
         };
+        let extend_slab = |buffer: usize,
+                           slab: &crate::api::tensor::SlabReach,
+                           table: &Allocation,
+                           table_offset: u64,
+                           offset: u64,
+                           bytes: u64,
+                           reaches: &mut Vec<Reach>| {
+            let group = table.access_identity();
+            if !self.access_summary.slab_written(group, slab) {
+                return;
+            }
+            if self.access_summary.slab_is_logical(group, slab) {
+                slab.extend_logical(buffer, table, table_offset, offset, bytes, reaches);
+            } else {
+                slab.extend(buffer, table, table_offset, offset, bytes, reaches);
+            }
+        };
         let static_node = &run.plan.topology.nodes[node];
         for (buffer, site) in static_node.sites.iter().enumerate() {
             let idx = static_node.site_base + buffer;
@@ -7076,17 +7245,24 @@ impl DispatchList for SequenceList<'_> {
                 (Region::External(port), SiteRecords::Port(count)) => {
                     let records = run.records(port);
                     match run.slab(port) {
-                        // A slab view's records, one a slab: the site's,
-                        // wherever their slabs lie now.
-                        Some(slab) => slab.extend(
+                        Some(slab) => extend_slab(
                             buffer,
+                            slab,
                             &records.table,
                             records.table_offset,
                             site_offset,
                             count * records.record,
                             reaches,
                         ),
-                        None => records.extend(buffer, site_offset / records.record, count, reaches),
+                        None => {
+                            if records.storage.as_ref().is_none_or(|(storage, _)| {
+                                self.access_summary
+                                    .written_groups
+                                    .contains(&storage.access_identity())
+                            }) {
+                                records.extend(buffer, site_offset / records.record, count, reaches);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -7105,7 +7281,14 @@ impl DispatchList for SequenceList<'_> {
                 (Region::External(port), SiteRecords::None) => {
                     let External { allocation, offset: start, .. } = run.external(port);
                     if let Some(slab) = run.slab(port) {
-                        slab.extend(buffer, allocation, *start, site_offset, site_bytes, reaches);
+                        extend_slab(buffer, slab, allocation, *start, site_offset, site_bytes, reaches);
+                        continue;
+                    }
+                    if !self
+                        .access_summary
+                        .written_groups
+                        .contains(&allocation.access_identity())
+                    {
                         continue;
                     }
                     (allocation.identity(), start + site_offset, site_bytes)

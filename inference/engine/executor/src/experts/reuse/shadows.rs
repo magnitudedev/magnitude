@@ -52,16 +52,18 @@ pub(crate) enum Delta {
 }
 
 impl Gap {
-    /// `U(j) = U_shadow(j) + Δ_j` (`Δ_j = 0` while unmeasured). Panics where
-    /// the result is not finite.
+    /// `U(j) = max(0, U_shadow(j) + Δ_j)` (`Δ_j = 0` while unmeasured).
+    /// Misses per token are physically non-negative; clamping prevents a
+    /// cold-start negative `Δ_j` from turning `U(j)` negative once the shadow
+    /// warms up. Panics where the result is not finite.
     pub(crate) fn needed(self) -> f64 {
         let delta = match self.delta {
             Delta::Unmeasured => 0.0,
             Delta::Measured { delta, .. } => delta,
         };
-        let needed = self.shadow + delta;
-        assert!(needed.is_finite(), "non-finite gap: {self:?}");
-        needed
+        let raw = self.shadow + delta;
+        assert!(raw.is_finite(), "non-finite gap: {self:?}");
+        raw.max(0.0)
     }
 }
 
@@ -759,5 +761,17 @@ mod tests {
 
         // Memory charge is constant in run length.
         assert_eq!(shadows.bytes(), initial_bytes);
+    }
+
+    #[test]
+    fn gap_needed_clamps_negative_cold_start_delta_to_zero() {
+        let gap = Gap {
+            shadow: 21.5,
+            delta: Delta::Measured {
+                delta: -117.0,
+                age: Tokens::new(10.0),
+            },
+        };
+        assert_eq!(gap.needed(), 0.0);
     }
 }

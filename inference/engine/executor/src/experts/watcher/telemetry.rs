@@ -1152,6 +1152,9 @@ pub(super) struct Telemetry {
     /// step's end only raises it, so the thread ending steps never waits
     /// on the stack.
     feedable: AtomicU64,
+    /// Monotonic counter incremented whenever a bank resize publishes, so a
+    /// decode step whose wall time spanned a resize does not poison `Passes`.
+    resize_generation: AtomicU64,
     /// The break-even reads ahead are admitted at in place of the measured
     /// one ([`Self::admit_at`]).
     #[cfg(test)]
@@ -1357,6 +1360,7 @@ impl Telemetry {
             shadow_state,
             whole: layers.iter().map(|_| AtomicBool::new(false)).collect(),
             feedable: AtomicU64::new(0),
+            resize_generation: AtomicU64::new(0),
             #[cfg(test)]
             even: Mutex::new(None),
             spans,
@@ -1367,6 +1371,14 @@ impl Telemetry {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Recorded> {
         self.recorded.lock().expect("watcher telemetry")
+    }
+
+    pub(super) fn resize_generation(&self) -> u64 {
+        self.resize_generation.load(Ordering::Acquire)
+    }
+
+    pub(super) fn note_resized(&self) {
+        self.resize_generation.fetch_add(1, Ordering::Release);
     }
 
     /// The drive's line now: the one line of the volumes the model's files
@@ -1705,7 +1717,7 @@ impl Telemetry {
         sited: &dyn Fn(usize) -> (u64, u64, Duration),
         priced: Option<&[ExpertLines]>,
     ) -> Result<Option<DecodeRouting>, CompletionError> {
-        let CompletedStep { work, begun, route } = completion;
+        let CompletedStep { work, begun, resized, route } = completion;
         // A decode step's routing at each streamed layer, read from its
         // records before anything is recorded.
         let decoded = match route {
@@ -1934,25 +1946,30 @@ impl Telemetry {
                     let missed_total = (absent.iter().sum::<u64>() + tier + landed) as f64;
                     let depth = launch.depth();
                     let pass_rows = u32::try_from(launch.rows).expect("a launch's rows fit u32");
-                    costs.passes.timed(Pass {
-                        rows: pass_rows,
-                        depth,
-                        verifies: launch.verifies(),
-                        seconds: cost.seconds,
-                        parked: cost.parked.as_secs_f64(),
-                        misses: absent.iter().sum::<u64>() as f64,
-                        missed: missed_total,
-                        reads: (absent.iter().sum::<u64>() + used) as f64,
-                        unused: cost.ahead.unused(),
-                        drive,
-                        link,
-                        moved: moved.0,
-                        moved_records: moved.1,
-                        cpu,
-                        memory,
-                        served,
-                        routed,
-                    });
+                    // A pass whose wall time spanned a bank resize includes
+                    // the resize's install pause, not resident compute: do not
+                    // let it poison `Passes` (`resident[depth]`).
+                    if !resized {
+                        costs.passes.timed(Pass {
+                            rows: pass_rows,
+                            depth,
+                            verifies: launch.verifies(),
+                            seconds: cost.seconds,
+                            parked: cost.parked.as_secs_f64(),
+                            misses: absent.iter().sum::<u64>() as f64,
+                            missed: missed_total,
+                            reads: (absent.iter().sum::<u64>() + used) as f64,
+                            unused: cost.ahead.unused(),
+                            drive,
+                            link,
+                            moved: moved.0,
+                            moved_records: moved.1,
+                            cpu,
+                            memory,
+                            served,
+                            routed,
+                        });
+                    }
                     if depth < DEPTHS && pass_rows > 0 && self.shadows_needed.load(Ordering::Acquire) {
                         if launch.verifies() {
                             self.shadow_state.lock().expect("watcher telemetry shadow state").pending_verify = Some((sequence, depth, missed_total));

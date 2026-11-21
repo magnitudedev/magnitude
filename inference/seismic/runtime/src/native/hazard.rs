@@ -29,10 +29,10 @@
 
 use super::Dispatch;
 use super::DispatchList;
-use crate::api::tensor::{meet, Records, SlabReach};
+use crate::api::tensor::{Records, SlabReach};
 use crate::driver::Allocation;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
 /// One step of encoding a submission ([`schedule`]).
@@ -80,9 +80,8 @@ pub(crate) fn schedule(list: &impl DispatchList, repetitions: usize) -> Vec<Sche
                 if dispatch.launches[ordinal].is_none_or(|launch| launch.is_empty()) {
                     continue;
                 }
-                let after = order.after(&accesses);
                 let alone = dispatch.launches[ordinal].is_some_and(|launch| launch.barrier.is_some());
-                segment.push((order.place(&accesses, &after, alone), index, ordinal));
+                segment.push((order.place_next(&accesses, alone), index, ordinal));
             }
         }
     }
@@ -266,6 +265,42 @@ impl SlabReach {
         }));
     }
 
+    /// O(1) logical summary of [`Self::extend`] when no non-slab binding in
+    /// the submission touches this view's access groups and no other
+    /// `(Slots, region)` in the submission shares a lender with it: one
+    /// `Through::Table` reach plus at most one `Through::Slab` reach over
+    /// the view's logical byte range `[first_slot * slab_bytes + offset, +bytes)`
+    /// in `self.logical_allocation`.
+    #[cfg(any(test, target_os = "macos"))]
+    pub(crate) fn extend_logical(
+        &self,
+        buffer: usize,
+        table: &Allocation,
+        table_offset: u64,
+        offset: u64,
+        bytes: u64,
+        reaches: &mut Vec<Reach>,
+    ) {
+        use seismic_lang::registry::record_table_entry;
+        let slots = self.slots(offset, bytes);
+        reaches.push(Reach {
+            buffer,
+            allocation: table.identity(),
+            offset: table_offset + record_table_entry(slots.start as u64),
+            bytes: record_table_entry(slots.len() as u64),
+            through: Through::Table,
+        });
+        if self.any_backed(slots) {
+            reaches.push(Reach {
+                buffer,
+                allocation: self.logical_allocation,
+                offset: self.first_slot as u64 * self.slab_bytes + offset,
+                bytes,
+                through: Through::Slab,
+            });
+        }
+    }
+
     /// The reaches of the whole view, as [`Self::extend`].
     pub(crate) fn extend_whole(&self, buffer: usize, table: &Allocation, table_offset: u64, reaches: &mut Vec<Reach>) {
         self.extend(buffer, table, table_offset, 0, self.regions.len() as u64 * self.slab_bytes, reaches);
@@ -354,44 +389,150 @@ pub(crate) fn dispatch_accesses(
     }
 }
 
-/// Bytes an earlier launch of the segment reached: the launch, by its
-/// place among the segment's placed launches.
-#[derive(Clone, Debug)]
-struct Reached {
-    bytes: Range<u64>,
-    launch: usize,
+/// Disjoint non-empty half-open byte intervals `[start, end)` mapped to their
+/// maximum launch level (`start -> (end, level)`), supporting O(log K) overlap
+/// queries and updates across large slab views instead of O(N) linear scans.
+#[derive(Default)]
+struct IntervalLevels {
+    intervals: BTreeMap<u64, (u64, usize)>,
 }
 
-impl Reached {
-    /// Whether these bytes contain `other`'s.
-    fn contains(&self, other: &Reached) -> bool {
-        self.bytes.start <= other.bytes.start && other.bytes.end <= self.bytes.end
+impl IntervalLevels {
+    /// Maximum level among all stored intervals meeting `range`.
+    fn max_overlap(&self, range: &Range<u64>) -> Option<usize> {
+        if range.is_empty() || self.intervals.is_empty() {
+            return None;
+        }
+        let mut best = None;
+        if let Some((_, &(end, level))) = self.intervals.range(..range.start).next_back() {
+            if end > range.start {
+                best = Some(level);
+            }
+        }
+        for (_, &(_, level)) in self.intervals.range(range.start..range.end) {
+            best = Some(best.map_or(level, |b| b.max(level)));
+        }
+        best
     }
 
-    /// Whether these bytes meet `bytes`.
-    fn meets(&self, bytes: &Range<u64>) -> bool {
-        meet(&self.bytes, bytes)
+    /// Remove `range` from the stored intervals, splitting any interval that
+    /// extends past either end.
+    fn clear(&mut self, range: &Range<u64>) {
+        if range.is_empty() || self.intervals.is_empty() {
+            return;
+        }
+        let mut suffix = None;
+        if let Some((&start, &(end, level))) = self.intervals.range(..range.start).next_back() {
+            if end > range.start {
+                self.intervals.insert(start, (range.start, level));
+                if end > range.end {
+                    suffix = Some((range.end, end, level));
+                }
+            }
+        }
+        let keys: Vec<u64> = self
+            .intervals
+            .range(range.start..range.end)
+            .map(|(&k, _)| k)
+            .collect();
+        for key in keys {
+            let (end, level) = self.intervals.remove(&key).expect("key from range");
+            if end > range.end {
+                suffix = Some((range.end, end, level));
+            }
+        }
+        if let Some((s, e, level)) = suffix {
+            self.intervals.insert(s, (e, level));
+        }
+    }
+
+    /// Replace `range` with `level` (for a write, which supersedes every
+    /// earlier access to those bytes).
+    fn set(&mut self, range: Range<u64>, level: usize) {
+        if range.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.intervals.get_mut(&range.start) {
+            if entry.0 == range.end {
+                entry.1 = level;
+                return;
+            }
+        }
+        self.clear(&range);
+        self.intervals.insert(range.start, (range.end, level));
+    }
+
+    /// Raise every byte in `range` to at least `level` (for a read, preserving
+    /// higher levels on any sub-range already read at a deeper level).
+    fn raise(&mut self, range: Range<u64>, level: usize) {
+        if range.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.intervals.get_mut(&range.start) {
+            if entry.0 == range.end {
+                entry.1 = entry.1.max(level);
+                return;
+            }
+        }
+        let mut overlapping = Vec::new();
+        if let Some((&start, &(end, old))) = self.intervals.range(..range.start).next_back() {
+            if end > range.start {
+                overlapping.push((start, end, old));
+            }
+        }
+        for (&start, &(end, old)) in self.intervals.range(range.start..range.end) {
+            overlapping.push((start, end, old));
+        }
+        if overlapping.is_empty() {
+            self.intervals.insert(range.start, (range.end, level));
+            return;
+        }
+        if overlapping.len() == 1
+            && overlapping[0].0 <= range.start
+            && overlapping[0].1 >= range.end
+            && overlapping[0].2 >= level
+        {
+            return;
+        }
+        for &(start, _, _) in &overlapping {
+            self.intervals.remove(&start);
+        }
+        let mut cursor = range.start;
+        for (start, end, old) in overlapping {
+            if start < range.start {
+                self.intervals.insert(start, (range.start, old));
+            }
+            let ov_start = start.max(range.start);
+            let ov_end = end.min(range.end);
+            if cursor < ov_start {
+                self.intervals.insert(cursor, (ov_start, level));
+            }
+            self.intervals.insert(ov_start, (ov_end, old.max(level)));
+            cursor = ov_end;
+            if end > range.end {
+                self.intervals.insert(range.end, (end, old));
+            }
+        }
+        if cursor < range.end {
+            self.intervals.insert(cursor, (range.end, level));
+        }
     }
 }
 
 /// The ranges of one allocation earlier launches of the segment reached that
 /// a later launch can still depend on. A later read depends on the writes
-/// it meets; a later write on the reads and writes. A write that contains a
-/// range reached before decides for its bytes: whatever later meets them
-/// meets the write, which depends on that range's launch.
+/// it meets; a later write on the reads and writes. A write supersedes every
+/// earlier read and write of its bytes.
 #[derive(Default)]
 struct Allocated {
-    reads: Vec<Reached>,
-    writes: Vec<Reached>,
+    reads: IntervalLevels,
+    writes: IntervalLevels,
 }
 
-/// The dependencies and levels of one segment's launches, in submission
-/// order ([`schedule`]; CUDA's graphs, `cuda::issue`).
+/// The levels of one segment's launches, in submission order ([`schedule`]).
 #[derive(Default)]
 pub(crate) struct Order {
     reached: HashMap<u64, Allocated>,
-    /// Each placed launch's level.
-    levels: Vec<usize>,
     /// One past the highest level placed.
     top: usize,
     /// The lowest level a later launch may take: one past the last resident
@@ -400,55 +541,37 @@ pub(crate) struct Order {
 }
 
 impl Order {
-    /// The earlier placed launches the next one, which reaches `accesses`,
-    /// depends on, ascending.
-    pub(crate) fn after(&self, accesses: &[Access]) -> Vec<usize> {
-        let mut after = Vec::new();
+    /// Place the next launch, which reaches `accesses`: its level, one past
+    /// the highest of its conflicting earlier launches' (0 with none), and
+    /// past the last resident launch's. An `alone` (resident) launch takes a
+    /// level above every placed one, and no later launch shares it.
+    pub(crate) fn place_next(&mut self, accesses: &[Access], alone: bool) -> usize {
+        let mut needed = 0usize;
         for access in accesses {
             let Some(allocated) = self.reached.get(&access.allocation) else {
                 continue;
             };
-            let reads = access.write.then_some(&allocated.reads).into_iter().flatten();
-            after.extend(
-                allocated
-                    .writes
-                    .iter()
-                    .chain(reads)
-                    .filter(|reached| reached.meets(&access.bytes))
-                    .map(|reached| reached.launch),
-            );
+            if let Some(level) = allocated.writes.max_overlap(&access.bytes) {
+                needed = needed.max(level + 1);
+            }
+            if access.write {
+                if let Some(level) = allocated.reads.max_overlap(&access.bytes) {
+                    needed = needed.max(level + 1);
+                }
+            }
         }
-        after.sort_unstable();
-        after.dedup();
-        after
-    }
-
-    /// Place the next launch, which reaches `accesses` and depends on
-    /// `after` (its [`Self::after`]): its level, one past the highest of
-    /// those launches' (0 with none), and past the last resident launch's.
-    /// An `alone` (resident) launch takes a level above every placed one,
-    /// and no later launch shares it.
-    pub(crate) fn place(&mut self, accesses: &[Access], after: &[usize], alone: bool) -> usize {
-        let needed = after.iter().map(|&launch| self.levels[launch] + 1).max().unwrap_or(0);
         let level = if alone { needed.max(self.top) } else { needed.max(self.floor) };
         if alone {
             self.floor = level + 1;
         }
         self.top = self.top.max(level + 1);
-        let launch = self.levels.len();
-        self.levels.push(level);
         for access in accesses {
-            let new = Reached {
-                bytes: access.bytes.clone(),
-                launch,
-            };
             let allocated = self.reached.entry(access.allocation).or_default();
             if access.write {
-                allocated.reads.retain(|earlier| !new.contains(earlier));
-                allocated.writes.retain(|earlier| !new.contains(earlier));
-                allocated.writes.push(new);
+                allocated.reads.clear(&access.bytes);
+                allocated.writes.set(access.bytes.clone(), level);
             } else {
-                allocated.reads.push(new);
+                allocated.reads.raise(access.bytes.clone(), level);
             }
         }
         level
@@ -480,25 +603,39 @@ mod tests {
         let mut order = Order::default();
         launches
             .iter()
-            .map(|launch| {
-                let after = order.after(launch);
-                order.place(launch, &after, false)
-            })
+            .map(|launch| order.place_next(launch, false))
             .collect()
     }
 
-    /// The launches each launch of `launches` depends on, in submission
-    /// order.
-    fn dependencies(launches: &[Vec<Access>]) -> Vec<Vec<usize>> {
-        let mut order = Order::default();
-        launches
-            .iter()
-            .map(|launch| {
-                let after = order.after(launch);
-                order.place(launch, &after, false);
-                after
-            })
-            .collect()
+    /// Reference O(N^2) level computation for equivalence testing.
+    fn naive_levels(launches: &[(Vec<Access>, bool)]) -> Vec<usize> {
+        let mut placed: Vec<(usize, &[Access])> = Vec::new();
+        let mut top = 0usize;
+        let mut floor = 0usize;
+        let mut out = Vec::with_capacity(launches.len());
+        for (accesses, alone) in launches {
+            let mut needed = 0usize;
+            for &(prev_level, prev_accesses) in &placed {
+                let conflicts = accesses.iter().any(|a| {
+                    prev_accesses.iter().any(|b| {
+                        a.allocation == b.allocation
+                            && (a.write || b.write)
+                            && crate::api::tensor::meet(&a.bytes, &b.bytes)
+                    })
+                });
+                if conflicts {
+                    needed = needed.max(prev_level + 1);
+                }
+            }
+            let level = if *alone { needed.max(top) } else { needed.max(floor) };
+            if *alone {
+                floor = level + 1;
+            }
+            top = top.max(level + 1);
+            placed.push((level, accesses));
+            out.push(level);
+        }
+        out
     }
 
     /// A resident launch shares its level with no launch, earlier or
@@ -507,11 +644,7 @@ mod tests {
     fn a_resident_launch_is_alone_in_its_level() {
         let mut order = Order::default();
         let placed = [(1, false), (2, true), (3, false), (4, false)]
-            .map(|(allocation, alone)| {
-                let launch = [write(allocation, 0..64)];
-                let after = order.after(&launch);
-                order.place(&launch, &after, alone)
-            });
+            .map(|(allocation, alone)| order.place_next(&[write(allocation, 0..64)], alone));
         assert_eq!(placed, [0, 1, 2, 2]);
     }
 
@@ -647,35 +780,71 @@ mod tests {
         );
     }
 
-    /// A launch depends on exactly the earlier launches it conflicts with:
-    /// a long independent launch beside a chain is no dependency of the
-    /// chain, and the launch that reads both depends on both.
+    /// `Order::place_next` matches the naive O(N^2) pairwise hazard oracle
+    /// across overlapping reads, writes, partial sub-ranges, and resident
+    /// barriers.
     #[test]
-    fn a_launch_depends_on_exactly_the_launches_it_conflicts_with() {
-        assert_eq!(
-            dependencies(&[
-                // A route: writes its choices and a placement word.
-                vec![write(1, 0..8), write(9, 0..4)],
-                // A prefetch beside it: reads the choices, rewrites the word.
-                vec![read(1, 0..8), write(9, 0..4)],
-                // The layer's entries: read the choices only.
-                vec![read(1, 0..8), write(2, 0..8)],
-                vec![read(2, 0..8), write(3, 0..8)],
-                // The next route reads the entries' output and the word.
-                vec![read(3, 0..8), read(9, 0..4), write(4, 0..8)],
-            ]),
-            [vec![], vec![0], vec![0], vec![2], vec![1, 3]]
-        );
-        // A read contained in a later write is decided by the write: a
-        // later write depends on the write alone.
-        assert_eq!(
-            dependencies(&[vec![read(1, 8..16)], vec![write(1, 0..64)], vec![write(1, 0..8)]]),
-            [vec![], vec![0], vec![1]]
-        );
-        // Reads of one range are each a later write's dependency.
-        assert_eq!(
-            dependencies(&[vec![read(1, 0..64)], vec![read(1, 0..64)], vec![write(1, 0..8)]]),
-            [vec![], vec![], vec![0, 1]]
+    fn interval_order_matches_naive_oracle() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..40 {
+            let mut launches = Vec::new();
+            for _ in 0..32 {
+                let count = (next() % 5) as usize + 1;
+                let mut accesses = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let alloc = (next() % 3) + 1;
+                    let start = (next() % 64) * 8;
+                    let len = ((next() % 16) + 1) * 8;
+                    let is_write = (next() % 4) == 0;
+                    accesses.push(access(alloc, start..start + len, is_write));
+                }
+                let alone = (next() % 16) == 0;
+                launches.push((accesses, alone));
+            }
+            let expected = naive_levels(&launches);
+            let mut order = Order::default();
+            let actual: Vec<usize> = launches
+                .iter()
+                .map(|(accesses, alone)| order.place_next(accesses, *alone))
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    /// Streamed MoE scale test: 48 layers each reading 413 expert slabs and
+    /// reading/writing 49 table slabs in a single allocation completes in a
+    /// few milliseconds (previously ~500 ms quadratic).
+    #[test]
+    fn large_slab_view_order_stays_linear_logarithmic() {
+        let expert_reads: Vec<Access> = (0..413u64)
+            .map(|s| read(1, s * 4096..(s + 1) * 4096))
+            .collect();
+        let table_writes: Vec<Access> = (0..49u64)
+            .map(|s| write(2, s * 4096..(s + 1) * 4096))
+            .collect();
+        let table_reads: Vec<Access> = (0..49u64)
+            .map(|s| read(2, s * 4096..(s + 1) * 4096))
+            .collect();
+        let mut order = Order::default();
+        let start = std::time::Instant::now();
+        for layer in 0..48usize {
+            let l_write = order.place_next(&table_writes, false);
+            let l_read = order.place_next(&table_reads, false);
+            let l_expert = order.place_next(&expert_reads, false);
+            assert_eq!(l_write, 2 * layer);
+            assert_eq!(l_read, 2 * layer + 1);
+            assert_eq!(l_expert, 0);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(250),
+            "48-layer slab schedule took {:?}",
+            start.elapsed(),
         );
     }
 

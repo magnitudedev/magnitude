@@ -450,6 +450,7 @@ impl Residency {
         self.publish_policy();
         self.shared.write_staged();
         self.publish_lines();
+        self.shared.telemetry.note_resized();
         Published(())
     }
 

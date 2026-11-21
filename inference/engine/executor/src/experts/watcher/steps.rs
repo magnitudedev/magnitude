@@ -1353,6 +1353,7 @@ impl Shared {
                 shared: self.clone(),
                 launch: None,
                 recorded: None,
+                resize_generation: self.telemetry.resize_generation(),
                 ending: Ending::Unrun,
             };
             admission.remaining -= 1;
@@ -1386,6 +1387,9 @@ pub(crate) struct ExpertStep {
     /// (`Telemetry::samples`), decided as it begins; none of a step not
     /// sampled.
     sampled: Option<Arc<[ExpertLines]>>,
+    /// `Telemetry::resize_generation` snapshotted when this step began, so a
+    /// pass whose wall time spanned a bank resize does not poison `Passes`.
+    resize_generation: u64,
     /// How it ends, as the interest ledger is told ([`Ending`]).
     ending: Ending,
 }
@@ -1415,6 +1419,7 @@ pub(crate) struct Recording;
 pub(super) struct CompletedStep {
     pub(super) work: LaunchWork,
     pub(super) begun: Instant,
+    pub(super) resized: bool,
     pub(super) route: CompletedRoute,
 }
 
@@ -1611,7 +1616,8 @@ impl ExpertStep {
                 sampled: self.sampled.take(),
             }),
         };
-        let completion = CompletedStep { work: self.work, begun, route };
+        let resized = self.resize_generation != shared.telemetry.resize_generation();
+        let completion = CompletedStep { work: self.work, begun, resized, route };
         let sequence = self.sequence;
         // Told as the step ends, once its group's reads are feedable.
         self.ending = Ending::Completed(
