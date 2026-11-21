@@ -49,6 +49,15 @@ __device__ __forceinline__ void group_sum_n(float (&values)[N], float *partials)
     }
 }
 
+template <int N>
+__device__ __forceinline__ void group_sum_n(const float (&values)[N], float (&totals)[N], float *partials) {
+    static_assert(N > 0, "group_sum_n requires at least one value");
+#pragma unroll
+    for (int i = 0; i < N; ++i)
+        totals[i] = values[i];
+    group_sum_n<static_cast<unsigned>(N)>(totals, partials);
+}
+
 // Maximum of one value per thread, as `group_sum`.
 __device__ __forceinline__ float group_max(float value, float *partials) {
     value = seismic_warp_max_f32(value);

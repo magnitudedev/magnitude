@@ -167,9 +167,9 @@ native readout_selected_rows for metal from "metal/readout_selected_rows.metal":
         threads_per_threadgroup (256, 1, 1)
 
 # CUDA: `stage` writes the final RMS rows as A to scratch; `logits` (one
-# block per selected vocabulary row) decodes that weight row once per feature
-# row (mma16 lane chunks) and sums the products in a fixed thread order.
-# (Metal: the K1 projection.)
+# block per selected vocabulary row) decodes that weight row once per tile of
+# feature rows (mma16 lane chunks) and sums the products in a fixed thread
+# order. (Metal: the K1 projection.)
 native readout_selected_rows for cuda from "cuda/readout_selected_rows.cu":
     static (V, D, PT, NM)
     where D % 64 == 0
