@@ -360,13 +360,14 @@ const SINKHORN_TILE = 16
 # prefill tiles' staged columns, and the finishing launch's sums and comb.
 native stream_mix_sinkhorn for metal from "metal/stream_mix_sinkhorn.metal":
     static (H, S, P)
+    params (arithmetic SPLIT in [16, 32, 64, 128] default least where SPLIT >= device.units or SPLIT == 128)
     where S <= 8
-    scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
+    scratch partials bytes (M * SPLIT * (1 + (2 + S) * S) * 4)
     launch stream_mix_sinkhorn_split when M <= VERIFY_ROWS:
-        threadgroups (SINKHORN_SPLIT, M, 1)
+        threadgroups (SPLIT, M, 1)
         threads_per_threadgroup (256, 1, 1)
     launch stream_mix_sinkhorn_tiles when M > VERIFY_ROWS:
-        threadgroups (SINKHORN_SPLIT, ceil_div(M, SINKHORN_TILE), 1)
+        threadgroups (SPLIT, ceil_div(M, SINKHORN_TILE), 1)
         threads_per_threadgroup (256, 1, 1)
     launch stream_mix_sinkhorn_finish:
         threadgroups (M, 1, 1)
@@ -374,13 +375,14 @@ native stream_mix_sinkhorn for metal from "metal/stream_mix_sinkhorn.metal":
 
 native stream_mix_sinkhorn for cuda from "cuda/stream_mix_sinkhorn.cu":
     static (H, S, P)
+    params (arithmetic SPLIT in [16, 32, 64, 128] default least where SPLIT >= device.units or SPLIT == 128)
     where S <= 8
-    scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
+    scratch partials bytes (M * SPLIT * (1 + (2 + S) * S) * 4)
     launch stream_mix_sinkhorn_split when M <= VERIFY_ROWS:
-        threadgroups (SINKHORN_SPLIT, M, 1)
+        threadgroups (SPLIT, M, 1)
         threads_per_threadgroup (256, 1, 1)
     launch stream_mix_sinkhorn_tiles when M > VERIFY_ROWS:
-        threadgroups (SINKHORN_SPLIT, ceil_div(M, SINKHORN_TILE), 1)
+        threadgroups (SPLIT, ceil_div(M, SINKHORN_TILE), 1)
         threads_per_threadgroup (256, 1, 1)
     launch stream_mix_sinkhorn_finish:
         threadgroups (M, 1, 1)

@@ -4693,13 +4693,14 @@ impl<'a> Tuner<'a> {
             bindings: bindings.clone(),
             outcome,
         };
-        // The statics lie inside the declaration's domain.
-        implementation
-            .admits(statics)
-            .map_err(|error| failure(error.to_string()))?;
         // The implementation as the device offers it, bound once for the
         // unit, and its canonical default, as a stored fallback holds it.
         let offered = offered(case, &self.charges.device()).map_err(failure)?;
+        // The statics lie inside the declaration's domain on this device.
+        offered
+            .admits(statics)
+            .map_err(|error| failure(error.to_string()))?;
+        let _ = implementation;
         let defaults = offered
             .default_specialization(statics)
             .map_err(|error| failure(format!("the device offers no default at these statics: {error}")))?;

@@ -387,7 +387,8 @@ fn stored_cpu_choice_accepts_device_owned_parameters() {
         .with_param("cpu.workers.1", 0);
     let declared = seismic::generated::native_implementation_for_backend::<shape_rows::Entry>(BackendName::Cpu)
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .at_device(device.properties());
     assert!(
         matches!(declared.validate(&choice), Err(seismic::NativeSpecializationError::UnknownParameter(_))),
         "the declaration names no Seismic-owned parameter"
@@ -3641,7 +3642,8 @@ fn stored_cpu_fallback_matches_the_device_default() {
     }
     let declared = seismic::generated::native_implementation_for_backend::<shape_rows::Entry>(BackendName::Cpu)
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .at_device(device.properties());
     assert!(
         matches!(declared.validate(&stored), Err(seismic::NativeSpecializationError::UnknownParameter(_))),
         "the declaration names no Seismic-owned parameter"

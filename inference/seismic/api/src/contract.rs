@@ -210,6 +210,7 @@ pub struct ScratchConfigs {
 pub trait EntryContract: crate::Entry {
     fn contract_admit(
         backend: BackendName,
+        device: Option<&dyn crate::device::DeviceValues>,
         elements: &[(&str, Element)],
         dims: &[(&str, u64)],
         params: &[(&str, u64)],
@@ -217,12 +218,14 @@ pub trait EntryContract: crate::Entry {
 
     fn contract_default_params(
         backend: BackendName,
+        device: Option<&dyn crate::device::DeviceValues>,
         elements: &[(&str, Element)],
         dims: &[(&str, u64)],
     ) -> Result<Vec<(&'static str, u64)>, ContractError>;
 
     fn contract_sizing(
         backend: BackendName,
+        device: Option<&dyn crate::device::DeviceValues>,
         elements: &[(&str, Element)],
         dims: &[(&str, u64)],
         params: &[(&str, u64)],
@@ -250,6 +253,7 @@ pub trait EntryContract: crate::Entry {
     /// configurations, matching `NativeImplementation::scratch_bound`).
     fn contract_sizing_bound(
         backend: BackendName,
+        device: Option<&dyn crate::device::DeviceValues>,
         elements: &[(&str, Element)],
         dims: &[(&str, u64)],
     ) -> Result<EntrySizing, ContractError>;
@@ -258,6 +262,7 @@ pub trait EntryContract: crate::Entry {
     /// from its statics and elements alone (exact match with `NativeImplementation::scratch_configurations`).
     fn contract_scratch_configs(
         backend: BackendName,
+        device: Option<&dyn crate::device::DeviceValues>,
         elements: &[(&str, Element)],
         dims: &[(&str, u64)],
     ) -> Result<ScratchConfigs, ContractError>;
@@ -267,6 +272,7 @@ pub trait EntryContract: crate::Entry {
     /// `max_scratch[j] = max_scratch[j].max(bytes)` in place with ZERO heap allocations.
     fn contract_sizing_at_point(
         backend: BackendName,
+        device: Option<&dyn crate::device::DeviceValues>,
         elements: &[(&str, Element)],
         dims: &[(&str, u64)],
         configs: &ScratchConfigs,
@@ -280,6 +286,7 @@ pub trait EntryContract: crate::Entry {
     /// and `repeat`).
     fn contract_active_launches(
         backend: BackendName,
+        device: Option<&dyn crate::device::DeviceValues>,
         elements: &[(&str, Element)],
         dims: &[(&str, u64)],
         params: &[(&str, u64)],
@@ -291,6 +298,7 @@ pub trait EntryContract: crate::Entry {
     /// On non-CUDA backends, returns `Ok(vec![Vec::new()])`.
     fn contract_launch_configs(
         backend: BackendName,
+        device: Option<&dyn crate::device::DeviceValues>,
         elements: &[(&str, Element)],
         dims: &[(&str, u64)],
     ) -> Result<Vec<Vec<u64>>, ContractError>;
@@ -301,6 +309,7 @@ pub trait EntryContract: crate::Entry {
     /// active. On non-CUDA backends, returns `Ok(0)`.
     fn contract_launch_mask(
         backend: BackendName,
+        device: Option<&dyn crate::device::DeviceValues>,
         elements: &[(&str, Element)],
         dims: &[(&str, u64)],
         params: &[u64],

@@ -186,7 +186,7 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
     static_assert(WARPS % GROUPS == 0 && TILE % GROUPS == 0, "a tile's rows are whole warps' rows");
     static_assert(TILE == 1u || (STRIPES == 1u && CHUNK % PASS == 0u),
                   "a staged tile's warps each take whole rows, a chunk whole passes");
-    const unsigned h = SEISMIC_DIM_H, width = STREAMS * h, split = (unsigned)SEISMIC_CONST_SINKHORN_SPLIT;
+    const unsigned h = SEISMIC_DIM_H, width = STREAMS * h, split = (unsigned)SEISMIC_TUNE_SPLIT;
     const unsigned rows = (unsigned)SEISMIC_DIM_M, row0 = blockIdx.y * TILE, span = (width + split - 1u) / split;
     const unsigned first = blockIdx.x * span, last = min(first + span, width);
     const unsigned warp = threadIdx.x / 32u, lane = threadIdx.x % 32u;
@@ -430,7 +430,7 @@ extern "C" __global__ void stream_mix_sinkhorn_finish(SEISMIC_KERNEL_PARAMS) {
     const float *partials = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS));
     const unsigned row = blockIdx.x;
     const element::Out<element::F32> join = SEISMIC_RESULT_2_OUT.offset((u64)row * SEISMIC_RESULT_2_STRIDE_0);
-    const unsigned width = STREAMS * SEISMIC_DIM_H, split = (unsigned)SEISMIC_CONST_SINKHORN_SPLIT;
+    const unsigned width = STREAMS * SEISMIC_DIM_H, split = (unsigned)SEISMIC_TUNE_SPLIT;
     const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
     const float norm_epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_NORM_EPSILON);
     const unsigned iterations = (unsigned)SEISMIC_PARAM_ITERATIONS;

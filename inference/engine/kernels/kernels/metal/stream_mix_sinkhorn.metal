@@ -186,7 +186,7 @@ inline void reduce_slice(device const float *hidden, device const float *previou
     static_assert(SIMDGROUPS % GROUPS == 0 && TILE % GROUPS == 0, "a tile's rows are whole simdgroups' rows");
     static_assert(TILE == 1u || (STRIPES == 1u && CHUNK % PASS == 0u),
         "a staged tile's simdgroups each take whole rows, a chunk whole passes");
-    const uint h = uint(SEISMIC_DIM_H), width = STREAMS * h, split = uint(SEISMIC_CONST_SINKHORN_SPLIT);
+    const uint h = uint(SEISMIC_DIM_H), width = STREAMS * h, split = uint(SEISMIC_TUNE_SPLIT);
     const uint rows = uint(SEISMIC_DIM_M), row0 = group.y * TILE, span = (width + split - 1u) / split;
     const uint first = group.x * span, last = metal::min(first + span, width);
     const uint stripe = sg / GROUPS;
@@ -408,7 +408,7 @@ kernel void stream_mix_sinkhorn_finish(
     uint thread_index [[thread_index_in_threadgroup]]) {
     threadgroup float reduced[SUMS];
     threadgroup float comb[STREAMS * STREAMS <= 32u ? 1u : STREAMS * STREAMS];
-    const uint h = uint(SEISMIC_DIM_H), width = STREAMS * h, split = uint(SEISMIC_CONST_SINKHORN_SPLIT);
+    const uint h = uint(SEISMIC_DIM_H), width = STREAMS * h, split = uint(SEISMIC_TUNE_SPLIT);
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     const float norm_epsilon = as_type<float>(uint(SEISMIC_PARAM_NORM_EPSILON));
     const uint iterations = uint(SEISMIC_PARAM_ITERATIONS);

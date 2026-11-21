@@ -180,7 +180,7 @@ native indexer_keys for cpu from "cpu/indexer_keys.rs":
 # across 32 / HEAD_TILE lanes.
 native indexer_score for metal from "metal/indexer_score.metal":
     static (H, P, S, NQ, HW, RA, RT)
-    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and 9 * (2 * P + S) * 4 <= 32768 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
+    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and 9 * (2 * P + S) * 4 <= device.shared_bytes_per_group and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
     launch indexer_score:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -193,7 +193,7 @@ native indexer_score for metal from "metal/indexer_score.metal":
 # chunks fitting 48 KiB.
 native indexer_score for cuda from "cuda/indexer_score.cu":
     static (H, P, S, NQ, HW, RA, RT)
-    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and (9 * (2 * P + S) + 4) * 4 <= 98304 and (2 * P + S) % 32 == 0
+    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and (9 * (2 * P + S) + 4) * 4 <= device.shared_bytes_per_group and (2 * P + S) % 32 == 0
     launch indexer_score:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -203,7 +203,7 @@ native indexer_score for cuda from "cuda/indexer_score.cu":
 # stores the prepared head in group memory.
 native indexer_score for vulkan from "vulkan/indexer_score.comp":
     static (H, P, S, NQ, HW, RA, RT)
-    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and H * (2 * P + S) * 4 <= 32768 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
+    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and H * (2 * P + S) * 4 <= device.shared_bytes_per_group and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
     launch indexer_score:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)

@@ -960,7 +960,7 @@ impl NativeHandoffKey {
 /// and nothing of it is formed or evaluated: a guarded launch's extents
 /// mean something only where its guard holds.
 fn formed_launches(
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     specialization: &NativeSpecialization,
 ) -> Vec<bool> {
     (0..implementation.launches.len())
@@ -1618,7 +1618,7 @@ fn rendered_programs(
     entry: EntryId,
     logical: &LogicalEntry,
     bindings: &ElementBindings,
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     specialization: &NativeSpecialization,
 ) -> Result<(Vec<ProgramSource>, Vec<Option<(usize, ProgramEntry)>>), PrepareError> {
     let reachable = formed_launches(implementation, specialization);
@@ -4623,13 +4623,14 @@ mod admission_tests {
         let entry = module.entry_named("rotate").expect("rotate entry");
         let implementation = module
             .native_implementation(entry, BackendName::Vulkan)
-            .expect("Vulkan implementation");
+            .expect("Vulkan implementation")
+            .at_device(&seismic_lang::device::BackendFloor(BackendName::Vulkan));
         let geometry = |pairs, rotates| {
             let specialization = NativeSpecialization::new()
                 .with_static("P", pairs)
                 .with_static("RO", rotates);
-            let formed = formed_launches(implementation, &specialization);
-            pipeline_geometry("rotate", implementation, &specialization, &formed)
+            let formed = formed_launches(&implementation, &specialization);
+            pipeline_geometry("rotate", &implementation, &specialization, &formed)
                 .expect("every formed launch has threads")
         };
         let body = Some(PipelineGeometry { threads: [64, 1, 1], shared_bytes: 0 });

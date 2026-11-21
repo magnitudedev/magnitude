@@ -748,7 +748,7 @@ fn kimi_delta_step[M, B, S, NK, NV, W, C, T](
 native kimi_delta_step for metal from "metal/kimi_delta_step.metal":
     static (NK, NV, W, C)
     params (ROWS in [32, 16, 64] default 32)
-    where W % 32 == 0 and W <= 256 and ROWS <= W and W % ROWS == 0 and (2048 / W) * (3 * W + ROWS + 1) * 4 + 4 <= 32768
+    where W % 32 == 0 and W <= 256 and ROWS <= W and W % ROWS == 0 and (2048 / W) * (3 * W + ROWS + 1) * 4 + 4 <= device.shared_bytes_per_group
     scratch mixed bytes (M * NV * W * 4)
     scratch arrivals bytes (NV * 4) sync
     launch kimi_delta_step:

@@ -94,7 +94,7 @@ fn launch_error(message: impl Into<String>) -> AssessmentError {
 /// the load prepares it with.
 #[derive(Clone, Debug)]
 struct Prepared {
-    implementation: &'static NativeImplementation,
+    implementation: seismic::OnDevice,
     specialization: NativeSpecialization,
 }
 
@@ -185,54 +185,13 @@ impl Declarations {
                     .fold(NativeSpecialization::new(), |statics, (name, value)| {
                         statics.with_static(name.clone(), *value)
                     });
-                // An assessment names a backend, not a device: when a
-                // parameter's default reads the device, fall back to the first
-                // admissible specialization if neither the admission constraint
-                // nor any launch-activation expression (`repeat`, `when`) reads
-                // a device property or tuning parameter.
-                let specialization = match implementation
-                    .default_specialization_without_device(&statics)
-                {
-                    Some(result) => {
-                        result.map_err(|error| launch_error(format!("{request}: {error}")))?
-                    }
-                    None => {
-                        let constraint_reads_device =
-                            implementation.constraint.as_ref().is_some_and(|constraint| {
-                                let mut reads = Vec::new();
-                                constraint.device_reads(&mut reads);
-                                !reads.is_empty()
-                            });
-                        let mut launch_params = Vec::new();
-                        if let Some(repeat) = &implementation.repeat {
-                            repeat.count.parameters(&mut launch_params);
-                        }
-                        for launch in &implementation.launches {
-                            if let Some(when) = &launch.when {
-                                when.parameters(&mut launch_params);
-                            }
-                        }
-                        if constraint_reads_device || !launch_params.is_empty() {
-                            return Err(launch_error(format!(
-                                "`{}`'s defaults read the device's properties, and an assessment has no device",
-                                kernel.name
-                            )));
-                        }
-                        let mut first = None;
-                        implementation
-                            .walk_admissible(&statics, |configuration| {
-                                first = Some(configuration.clone());
-                                false
-                            })
-                            .map_err(|error| launch_error(format!("{request}: {error}")))?;
-                        first.ok_or_else(|| {
-                            launch_error(format!(
-                                "{request}: {}",
-                                seismic::NativeSpecializationError::Inadmissible
-                            ))
-                        })?
-                    }
-                };
+                let (implementation, specialization) =
+                    crate::programs::graph::sizing::eval_with_device(self.backend, |dev| {
+                        let bound = implementation.at_device(dev);
+                        let spec = bound.default_specialization(&statics)?;
+                        Ok::<_, seismic::NativeSpecializationError>((bound, spec))
+                    })
+                    .map_err(|error| launch_error(format!("{request}: {error}")))?;
                 Ok(Prepared {
                     implementation,
                     specialization,
@@ -443,7 +402,7 @@ impl Launches {
         let specialization = &prepared.specialization;
         let name = self.kernel.name;
         let failed = move |error| launch_error(format!("`{name}` at {rows} rows: {error}"));
-        let implementation = &prepared.implementation;
+        let implementation = prepared.implementation.implementation();
         let rounds = match &implementation.repeat {
             Some(repeat) => repeat
                 .count

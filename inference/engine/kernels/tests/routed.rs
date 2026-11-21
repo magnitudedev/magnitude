@@ -8633,7 +8633,6 @@ fn hint_rings_publish_each_leads_ranked_experts() {
         let statics = statics_of(&implementation.statics, &[("H", h), ("NM", h), ("K", k), ("AHEAD", ahead), ("EN", e)]);
         let mut configurations = Vec::new();
         implementation
-            .implementation()
             .walk_admissible(&implementation.implementation().with_owned_defaults(statics), |configuration| {
                 configurations.push(configuration.clone());
                 true
@@ -8672,7 +8671,6 @@ fn hint_rings_publish_each_leads_ranked_experts() {
         let statics = statics_of(&implementation.statics, &[("H", h), ("K", k), ("AHEAD", ahead), ("EN", e)]);
         let mut configurations = Vec::new();
         implementation
-            .implementation()
             .walk_admissible(&implementation.implementation().with_owned_defaults(statics), |configuration| {
                 configurations.push(configuration.clone());
                 true

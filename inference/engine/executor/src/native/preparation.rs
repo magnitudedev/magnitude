@@ -2360,7 +2360,7 @@ impl<'a> Preparation<'a> {
             let carried = binding.carried();
             let label = format!("H={hidden} S={streams} P={carried}");
             let spec = &mut self.spec;
-            let site = spec.fixed(
+            let site = spec.at_defaults(
                 &label,
                 &[("H", hidden), ("S", streams), ("P", carried)],
                 stream_mix_sinkhorn::native_entry(),

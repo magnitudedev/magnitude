@@ -58,6 +58,10 @@ impl PlannedDevice {
         self.backend
     }
 
+    pub fn properties(&self) -> Option<seismic::device::DeviceProperties> {
+        self.executor.properties()
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -2695,9 +2699,13 @@ impl ExecutionPlanDraft {
                 let (primary_out, resident_res) = match after_primary {
                     Some(after_primary) => {
                         let bank_form = &bank.form;
+                        let device_props = bank_form.draft.device().properties();
                         let (out, res) = crate::assessment::pool::join(
                             move || {
-                                let _sizing = crate::programs::graph::sizing::SizingScope::enter();
+                                let _sizing =
+                                    crate::programs::graph::sizing::SizingScope::enter_with_device(
+                                        device_props,
+                                    );
                                 after_primary(bank_form)
                             },
                             certify_resident,

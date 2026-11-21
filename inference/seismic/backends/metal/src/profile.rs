@@ -99,6 +99,7 @@ fn discover_device(
     let MetalProbeAnswers::Accepted {
         language,
         max_total_threads_per_threadgroup,
+        thread_execution_width,
         scalar_collective_dtypes,
         bfloat_arithmetic,
         matrix_dtypes,
@@ -132,7 +133,12 @@ fn discover_device(
         bfloat_arithmetic,
         matrix_dtypes,
         matrix_combinations,
-        properties: properties_at(raw, tensor_matmul_forms),
+        properties: properties_at(
+            raw,
+            thread_execution_width,
+            max_total_threads_per_threadgroup,
+            tensor_matmul_forms,
+        ),
         argument_table_entries: ARGUMENT_TABLE_ENTRIES,
         reserved_argument_entries: RESERVED_ARGUMENT_ENTRIES,
         backend_revision: BACKEND_REVISION,
@@ -537,6 +543,9 @@ pub enum MetalProbeAnswers {
         /// Device-wide `maxTotalThreadsPerThreadgroup` reflected from the
         /// trivial language-probe pipeline (<= 1024).
         max_total_threads_per_threadgroup: u64,
+        /// Device-wide `threadExecutionWidth` reflected from the trivial
+        /// language-probe pipeline (SIMD-group width).
+        thread_execution_width: u64,
         /// Scalar dtypes whose SIMD-group reductions and shuffles form.
         scalar_collective_dtypes: BTreeSet<DType>,
         bfloat_arithmetic: bool,
@@ -562,17 +571,31 @@ impl MetalProbeAnswers {
         }
     }
 
+    /// Hardware properties of `device`, whose probes these answers are, from
+    /// the same queries and answers as the opened device (`properties_at`).
+    pub fn properties(&self, device: &crate::DeviceHandle) -> Option<Properties> {
+        match self {
+            Self::Accepted {
+                max_total_threads_per_threadgroup,
+                thread_execution_width,
+                tensor_matmul_forms,
+                ..
+            } => Some(properties_at(
+                device.raw(),
+                *thread_execution_width,
+                *max_total_threads_per_threadgroup,
+                *tensor_matmul_forms,
+            )),
+            Self::Unsupported => None,
+        }
+    }
+
     /// Whether `device`, whose probes these answers are, forms tensor
     /// operations: the property its opened description holds, from the
     /// same queries and answers, so planning before a device is opened and
     /// the opened device agree.
     pub fn forms_tensor_operations(&self, device: &crate::DeviceHandle) -> bool {
-        match self {
-            Self::Accepted { tensor_matmul_forms, .. } => {
-                properties_at(device.raw(), *tensor_matmul_forms).tensor_ops.holds()
-            }
-            Self::Unsupported => false,
-        }
+        self.properties(device).is_some_and(|properties| properties.tensor_ops.holds())
     }
 
     /// Whether this host's Metal compiler forms tensor-operation types and
@@ -650,21 +673,25 @@ impl MetalProbeAnswers {
                 .max()
                 .unwrap_or(0)
         };
-        let max_total_threads_per_threadgroup =
+        let (max_total_threads_per_threadgroup, thread_execution_width) =
             match probe_pipeline(raw, language, "seismic_language_probe", &language_probe) {
-                Ok(state) => (state.maxTotalThreadsPerThreadgroup() as u64).min(axis_max),
+                Ok(state) => (
+                    (state.maxTotalThreadsPerThreadgroup() as u64).min(axis_max),
+                    (state.threadExecutionWidth() as u64).max(1),
+                ),
                 Err(Probe::NotRun(error)) => {
                     not_run.push(format!(
                         "seismic_language_probe (msl-{}: {error})",
                         language.label()
                     ));
-                    axis_max
+                    (axis_max, 32)
                 }
-                Err(Probe::Rejected | Probe::Formed) => axis_max,
+                Err(Probe::Rejected | Probe::Formed) => (axis_max, 32),
             };
         let answers = Self::Accepted {
             language,
             max_total_threads_per_threadgroup,
+            thread_execution_width,
             scalar_collective_dtypes,
             bfloat_arithmetic,
             matrix_dtypes,
@@ -948,6 +975,8 @@ fn matrix_combination_probe(accumulator: ProbeDtype, left: ProbeDtype, right: Pr
 /// the tensor query answered by its probe ([`MetalProbeAnswers`]).
 struct Queries<'d> {
     device: &'d ProtocolObject<dyn MTLDevice>,
+    thread_execution_width: u64,
+    max_threads_per_threadgroup: u64,
     tensor_matmul_forms: bool,
 }
 
@@ -960,6 +989,12 @@ impl seismic_lang::device::metal::Queries for Queries<'_> {
     fn gpu_cores(&self) -> Option<u64> {
         Some(crate::registry_entry::gpu_cores(self.device.registryID()))
     }
+    fn thread_execution_width(&self) -> Option<u64> {
+        Some(self.thread_execution_width)
+    }
+    fn max_threads_per_threadgroup(&self) -> Option<u64> {
+        Some(self.max_threads_per_threadgroup)
+    }
     fn apple10_family(&self) -> Option<bool> {
         Some(crate::pooled(|| self.device.supportsFamily(MTLGPUFamily::Apple10)))
     }
@@ -970,9 +1005,22 @@ impl seismic_lang::device::metal::Queries for Queries<'_> {
 
 /// The device's properties, its tensor query answered by
 /// `tensor_matmul_forms` (Metal declares no probes).
-fn properties_at(device: &ProtocolObject<dyn MTLDevice>, tensor_matmul_forms: bool) -> Properties {
-    seismic_lang::device::metal::describe(&Queries { device, tensor_matmul_forms }, &Default::default())
-        .expect("every Metal property's query answers")
+fn properties_at(
+    device: &ProtocolObject<dyn MTLDevice>,
+    thread_execution_width: u64,
+    max_threads_per_threadgroup: u64,
+    tensor_matmul_forms: bool,
+) -> Properties {
+    seismic_lang::device::metal::describe(
+        &Queries {
+            device,
+            thread_execution_width,
+            max_threads_per_threadgroup,
+            tensor_matmul_forms,
+        },
+        &Default::default(),
+    )
+    .expect("every Metal property's query answers")
 }
 
 /// A `matmul2d` over a device and a threadgroup tensor into a cooperative

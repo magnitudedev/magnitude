@@ -896,7 +896,8 @@ impl StructuralCharge {
     /// family certified at that pass beside everything else as it is
     /// (`AssessmentGraphResourceBounds::at_pass_with_cache`), which no pass moves.
     pub fn at_pass(&self, definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<Self, AssessmentError> {
-        let _scope = crate::programs::graph::sizing::SizingScope::enter();
+        let _scope =
+            crate::programs::graph::sizing::SizingScope::enter_with_device(draft.device().properties());
         let policy = draft.policy();
         let (graph, cache) = self
             .graph
@@ -947,7 +948,8 @@ impl StructuralCharge {
             crate::GraphError,
         >,
     ) -> Result<(Self, T), AssessmentError> {
-        let _scope = crate::programs::graph::sizing::SizingScope::enter();
+        let _scope =
+            crate::programs::graph::sizing::SizingScope::enter_with_device(draft.device().properties());
         let policy = draft.policy();
         let backend = draft.device().backend();
         let load = draft.load();
@@ -1178,6 +1180,8 @@ fn state_plan(definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Resul
 /// under its planned history codec, derived directly from `SizingDraft`'s
 /// decode-regime launch census.
 pub fn decode_demand(definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<DecodeDemand, AssessmentError> {
+    let _scope =
+        crate::programs::graph::sizing::SizingScope::enter_with_device(draft.device().properties());
     let policy = draft.policy();
     let capacity = resource_capacity(draft)?;
     super::demand::decode_demand_direct(
@@ -1670,7 +1674,9 @@ pub fn assess_execution_fit_with_priced_bank(
                 Err(shortfall) => shortfall,
             };
             if !bank.windowed.is_empty() {
-                let _scope = crate::programs::graph::sizing::SizingScope::enter();
+                let _scope = crate::programs::graph::sizing::SizingScope::enter_with_device(
+                    bank.form.draft.device().properties(),
+                );
                 // `bank.windowed` is ordered by descending `window_slots`, so
                 // floor memory falls monotonically toward the last rung. Probe
                 // the smallest window first: if even it does not fit, no larger

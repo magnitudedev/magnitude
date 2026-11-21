@@ -189,11 +189,28 @@ pub(crate) struct HostReports {
 /// sources in order or its documented value.
 pub(crate) fn host_reports(sys: &impl host::Sys) -> HostReports {
     let cache = host::last_level_cache(sys);
+    let processors = host::processors(sys);
+    struct HostCores(u64);
+    impl seismic_lang::device::cpu::Queries for HostCores {
+        fn worker_cores(&self) -> Option<u64> {
+            Some(self.0)
+        }
+    }
+    let cpu_properties = seismic_lang::device::cpu::describe(
+        &HostCores(
+            processors
+                .cores()
+                .map_or(1, |cores| u64::try_from(cores.get()).unwrap_or(1)),
+        ),
+        &Default::default(),
+    )
+    .ok()
+    .map(seismic_lang::device::DeviceProperties::Cpu);
     HostReports {
         host: host::capacity(sys),
         cpu_model: host::cpu_model(sys),
         os_build: host::os_build(sys),
-        processors: host::processors(sys),
+        processors,
         system: SystemIdentity::from_firmware(host::firmware(sys)),
         cpu: CpuReport {
             name: format!("Host CPU ({})", std::env::consts::ARCH),
@@ -202,6 +219,7 @@ pub(crate) fn host_reports(sys: &impl host::Sys) -> HostReports {
             availability: cpu_availability(seismic_native_cpu::Tier::detected()),
             max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,
             kind: seismic_cpu::topology::kind(),
+            properties: cpu_properties,
         },
     }
 }

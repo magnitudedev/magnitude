@@ -82,7 +82,7 @@ pub(crate) const EVERY_ROW: Range<u64> = 1..u64::MAX;
 /// does not part are parted past the lower one ([`point_cuts`]): each
 /// measured row count is a range of its own.
 pub(crate) fn row_cuts(
-    implementation: &NativeImplementation,
+    implementation: &seismic::OnDevice,
     statics: &NativeSpecialization,
     row_dim: &str,
     served: &Range<u64>,
@@ -702,6 +702,7 @@ mod tests {
             seismic::generated::native_implementation_for_backend::<magnitude_kernels::project_rows::Entry>(backend)
                 .unwrap()
                 .unwrap()
+                .at_device(&seismic::device::BackendFloor(backend))
         };
         let cpu = project(seismic::BackendName::Cpu);
         assert!(cpu.has_tuning_parameters());
@@ -852,7 +853,8 @@ mod tests {
             expand.elements(),
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .at_device(&seismic::device::BackendFloor(seismic::BackendName::Cuda));
         let cuda_statics = NativeSpecialization::new()
             .with_static("H", 2048)
             .with_static("F", 8192)
@@ -874,7 +876,8 @@ mod tests {
             expand.elements(),
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .at_device(&seismic::device::BackendFloor(seismic::BackendName::Metal));
         let metal_statics = cuda_statics.with_static("GB", 0).with_static("UB", 0);
         let metal_cuts = row_cuts(&metal_expand, &metal_statics, "O", &EVERY_ROW, &points(512));
         assert!(metal_cuts.contains(&2), "Metal dense_expand cuts O=1: {metal_cuts:?}");

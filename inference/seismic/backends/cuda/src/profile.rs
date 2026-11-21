@@ -479,6 +479,9 @@ pub struct DeviceDescriptor {
     /// `CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID`, `_PCI_BUS_ID`, `_PCI_DEVICE_ID`:
     /// where the device sits on its bus (domain, bus, device).
     pub pci: [u32; 3],
+    /// The device's hardware properties (`seismic_lang::device::cuda`),
+    /// read from CUDA device attributes without creating a context.
+    pub properties: Properties,
 }
 
 impl DeviceDescriptor {
@@ -604,7 +607,35 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
         numa_node: numa_node(&driver, handle)?,
         luid: luid(&driver, handle)?,
         pci: [pci(attr::PCI_DOMAIN_ID)?, pci(attr::PCI_BUS_ID)?, pci(attr::PCI_DEVICE_ID)?],
+        properties: read_properties(&driver, handle)?,
     })
+}
+
+fn read_properties(driver: &Driver, handle: c_int) -> Result<Properties, TargetError> {
+    let unsigned = |key: c_int| -> Result<u32, TargetError> {
+        let value = driver.attribute(key, handle).map_err(unavailable)?;
+        u32::try_from(value).map_err(|_| {
+            TargetError::UnsupportedDevice(format!("device attribute {key} reports {value}"))
+        })
+    };
+    Ok(seismic_lang::device::cuda::describe(
+        &Attributes {
+            multiprocessor_count: u64::from(unsigned(attr::MULTIPROCESSOR_COUNT)?),
+            warp_size: u64::from(unsigned(attr::WARP_SIZE)?),
+            max_threads_per_block: u64::from(unsigned(attr::MAX_THREADS_PER_BLOCK)?),
+            max_threads_per_multiprocessor: u64::from(unsigned(
+                attr::MAX_THREADS_PER_MULTIPROCESSOR,
+            )?),
+            max_shared_memory_per_block_optin: u64::from(unsigned(
+                attr::MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            )?),
+            l2_cache_size: u64::from(unsigned(attr::L2_CACHE_SIZE)?),
+            cooperative_launch: unsigned(attr::COOPERATIVE_LAUNCH)? == 1,
+            max_registers_per_block: u64::from(unsigned(attr::MAX_REGISTERS_PER_BLOCK)?),
+        },
+        &Default::default(),
+    )
+    .expect("every CUDA property's source is an attribute the driver reports"))
 }
 
 /// `CUDA_ERROR_INVALID_VALUE`.
@@ -714,17 +745,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
     } else {
         TensorMemory::Unavailable
     };
-    let properties = seismic_lang::device::cuda::describe(&Attributes {
-        multiprocessor_count: u64::from(unsigned(attr::MULTIPROCESSOR_COUNT)?),
-        warp_size: u64::from(unsigned(attr::WARP_SIZE)?),
-        max_threads_per_block: u64::from(unsigned(attr::MAX_THREADS_PER_BLOCK)?),
-        max_threads_per_multiprocessor: u64::from(unsigned(attr::MAX_THREADS_PER_MULTIPROCESSOR)?),
-        max_shared_memory_per_block_optin: u64::from(unsigned(attr::MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?),
-        l2_cache_size: u64::from(unsigned(attr::L2_CACHE_SIZE)?),
-        cooperative_launch: unsigned(attr::COOPERATIVE_LAUNCH)? == 1,
-        max_registers_per_block: u64::from(unsigned(attr::MAX_REGISTERS_PER_BLOCK)?),
-    }, &Default::default())
-    .expect("every CUDA property's source is an attribute the driver reports");
+    let properties = read_properties(&driver, handle)?;
     let kernel_parameter_bytes = kernel_parameter_bytes(driver_api);
     let global_memory_bytes = memory as u64;
     let specs = CudaDeviceInfo {

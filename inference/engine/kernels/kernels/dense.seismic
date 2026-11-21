@@ -459,7 +459,7 @@ projection dense for cuda:
     let ZSPLIT = 1 for paired | segmented
     let ZSPLIT = 1 + (SPLIT - 1) * min(1, 128 / M) for single
     let OPERANDS = min(1, sum(W, operands(W)))
-    let HALF_SM_SHARED = 49152
+    let HALF_SM_SHARED = device.shared_bytes_per_group / 2
     # The shared bytes that bound the int8 GEMM's layout of the weights, the
     # most of any one's (`projection::GemmShape::LAYOUT_BYTES` of the 128-row
     # band, `LargeGemm`: 2 stages, 8 warps of one weight tile each), 0 for a

@@ -1019,7 +1019,7 @@ const GROUP_CHOICES = 8192
 # chunks past the grouped rows exit.
 native routed_group for metal from "metal/routed_group.metal":
     static (E, K)
-    where E <= 1024
+    where E <= device.max_group_threads
     scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4) when M * K > GROUP_CHOICES
     launch routed_group_count when M * K > GROUP_CHOICES:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
@@ -1032,7 +1032,7 @@ native routed_group for metal from "metal/routed_group.metal":
 
 native routed_group for cuda from "cuda/routed_group.cu":
     static (E, K)
-    where E <= 1024
+    where E <= device.max_group_threads
     scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4) when M * K > GROUP_CHOICES
     launch routed_group_count when M * K > GROUP_CHOICES:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
@@ -1048,7 +1048,7 @@ native routed_group for cuda from "cuda/routed_group.cu":
 native routed_group for vulkan from "vulkan/routed_group.comp":
     static (E, K)
     params (PARTS in [1, 2, 4] default 1)
-    where E * PARTS <= 1024
+    where E * PARTS <= device.max_group_threads
     scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4)
     launch routed_group_count:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)

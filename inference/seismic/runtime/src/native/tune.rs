@@ -27,6 +27,7 @@ pub use super::admission::{
     Reselection, Violation, admit, governing_ratio, reselect,
 };
 use super::budget::{Footprint, Linear, Observed, PointPrices, Quote};
+use seismic_lang::checked::OnDevice;
 pub use super::comparison::{
     COMPARISON_VERSION, Difference, StepPower, SubjectComparison, SubjectMeasurement,
 };
@@ -1139,7 +1140,7 @@ struct Formation<'s, 'm> {
     logical: &'s Arc<LogicalEntry>,
     bindings: &'s ElementBindings,
     cpu: Option<&'static CpuNativeKernels>,
-    implementation: &'s NativeImplementation,
+    implementation: &'s OnDevice,
     /// The unit's defaults: what a launch's source is rendered at.
     default: &'s NativeSpecialization,
     /// The served shapes beyond the points' ([`PointSource::served`]).
@@ -1608,7 +1609,7 @@ impl<'m> Formation<'_, 'm> {
             bindings: self.bindings.clone(),
             default: self.default.clone(),
             cpu: self.cpu,
-            implementation: self.implementation.clone(),
+            implementation: self.implementation.implementation().clone(),
             served: self.served.to_vec(),
             work: formables
                 .into_iter()
@@ -2536,7 +2537,7 @@ impl Keying {
 /// configurations, and a change is forecast to run the launches the
 /// configuration it changes ran.
 struct Declared<'s> {
-    implementation: &'s NativeImplementation,
+    implementation: &'s OnDevice,
     keying: &'s Keying,
 }
 
@@ -3642,7 +3643,7 @@ pub struct UnitSearch<'m, 'a> {
     statics: NativeSpecialization,
     cpu: Option<&'static CpuNativeKernels>,
     backend: seismic_lang::registry::BackendName,
-    implementation: NativeImplementation,
+    implementation: OnDevice,
     logical: Arc<LogicalEntry>,
     mutable: Vec<(usize, String)>,
     default: NativeSpecialization,
@@ -3762,7 +3763,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             cpu,
             backend,
             clock,
-            implementation: implementation.into_implementation(),
+            implementation,
             logical,
             mutable,
             default,
@@ -3851,7 +3852,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             bindings: self.bindings.clone(),
             default: self.default.clone(),
             cpu: self.cpu,
-            implementation: self.implementation.clone(),
+            implementation: self.implementation.implementation().clone(),
             served: self.served.clone(),
         }))
     }
@@ -5339,7 +5340,7 @@ fn discover_point<'a>(
 /// without timing demand.
 #[allow(clippy::too_many_arguments)]
 fn open_search<'a>(
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     backend: seismic_lang::registry::BackendName,
     statics: &NativeSpecialization,
     default: &NativeSpecialization,
@@ -5425,7 +5426,7 @@ fn open_search<'a>(
 /// are not search inputs.
 #[allow(clippy::too_many_arguments)]
 fn open_run(
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     backend: seismic_lang::registry::BackendName,
     statics: &NativeSpecialization,
     default: &NativeSpecialization,
@@ -5482,7 +5483,7 @@ fn open_run(
 
 /// Plan the next challenger work of `run`.
 fn plan_next(
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     charges: &Charges,
     run: &mut Run,
     planning: &mut Linear,
@@ -5932,7 +5933,7 @@ impl Programs {
     /// up the held programs gives none of them up.
     fn grounded(
         &mut self,
-        implementation: &NativeImplementation,
+        implementation: &OnDevice,
         default: &NativeSpecialization,
         kernel: &Arc<NativePrepared>,
     ) {
@@ -5961,7 +5962,7 @@ impl Programs {
     /// everything is held.
     fn formables(
         &self,
-        implementation: &NativeImplementation,
+        implementation: &OnDevice,
         specializations: &[NativeSpecialization],
         ahead: &[NativeSpecialization],
     ) -> Vec<Formable> {
@@ -6100,7 +6101,7 @@ impl Programs {
                     formation.bindings.clone(),
                     specialization.clone(),
                     formation.cpu,
-                    implementation.clone(),
+                    implementation.implementation().clone(),
                 )
                 .map_err(|error| Exclusion::Formation(prepare_message(error)))
                 .and_then(|kernel| serving(kernel, formation.served)),
@@ -6186,7 +6187,7 @@ struct LaunchPrograms {
 /// configuration runs only the launches it reaches
 /// ([`NativeImplementation::reachable`]), as preparation forms it.
 fn launch_variants(
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     specializations: &[NativeSpecialization],
 ) -> BTreeMap<usize, BTreeSet<plan::LaunchVariant>> {
     let mut variants = BTreeMap::<usize, BTreeSet<plan::LaunchVariant>>::new();
@@ -6229,7 +6230,7 @@ impl LaunchPrograms {
     /// is formed for it in no variant.
     fn sources(
         &self,
-        implementation: &NativeImplementation,
+        implementation: &OnDevice,
         specializations: &[NativeSpecialization],
         ahead: &[NativeSpecialization],
     ) -> Vec<plan::LaunchSource> {
@@ -8314,7 +8315,7 @@ fn planning(error: plan::PlanError) -> TuneError {
 /// ([`unserved_parameters`]), where it is formed whole. A search plans by
 /// it, and a survey records it for a replay of the search.
 fn search_plan(
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     statics: &NativeSpecialization,
     shapes: &[PointShape],
 ) -> Result<(plan::TuningPartition, Keying), TuneError> {
@@ -8343,7 +8344,7 @@ fn search_plan(
 /// no launch reads affects every launch and is never one of them. With them,
 /// the launches each of `shapes` can run.
 fn unserved_parameters(
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     statics: &NativeSpecialization,
     shapes: &[PointShape],
 ) -> Result<(Vec<plan::ParameterAddress>, Vec<plan::PlannedPoint>), TuneError> {
@@ -8397,7 +8398,7 @@ fn unserved_parameters(
 /// point ([`unserved_parameters`]) at its default.
 struct SurveyDomain {
     /// The unit's implementation with its unserved parameters fixed.
-    implementation: NativeImplementation,
+    implementation: OnDevice,
     influence: Influence,
     /// How the unit's points are keyed, as its surveyor keys them.
     keying: Keying,
@@ -8427,30 +8428,35 @@ struct SurveyedAssignment {
 
 impl SurveyDomain {
     fn of(
-        implementation: &NativeImplementation,
+        implementation: &OnDevice,
         statics: &NativeSpecialization,
         default: &NativeSpecialization,
         shapes: Vec<PointShape>,
     ) -> Result<Self, TuneError> {
         let (unserved, _) = unserved_parameters(implementation, statics, &shapes)?;
         let (plan, _) = search_plan(implementation, statics, &shapes)?;
-        let mut walked = implementation.clone();
-        for address in &unserved {
-            let parameter = match address {
-                plan::ParameterAddress::Entry(name) => walked
-                    .params
-                    .iter_mut()
-                    .find(|parameter| parameter.name == *name),
-                plan::ParameterAddress::Launch { ordinal, name } => walked.launches[*ordinal]
-                    .params
-                    .iter_mut()
-                    .find(|parameter| parameter.name == *name),
-            }
-            .expect("an unserved parameter is declared");
-            let value = address.value(default);
-            parameter.values = vec![value];
-            parameter.default = NativeDefault::Value(NativeNatExpr::Constant(value));
-        }
+        let walked = implementation
+            .owned()
+            .adjusted::<std::convert::Infallible>(|walked| {
+                for address in &unserved {
+                    let parameter = match address {
+                        plan::ParameterAddress::Entry(name) => walked
+                            .params
+                            .iter_mut()
+                            .find(|parameter| parameter.name == *name),
+                        plan::ParameterAddress::Launch { ordinal, name } => walked.launches[*ordinal]
+                            .params
+                            .iter_mut()
+                            .find(|parameter| parameter.name == *name),
+                    }
+                    .expect("an unserved parameter is declared");
+                    let value = address.value(default);
+                    parameter.values = vec![value];
+                    parameter.default = NativeDefault::Value(NativeNatExpr::Constant(value));
+                }
+                Ok(())
+            })
+            .unwrap();
         Ok(Self {
             influence: Influence::of(&walked),
             keying: Keying::of(&walked),
@@ -9782,6 +9788,8 @@ mod tests {
                 dimensions: BTreeMap::from([("M".into(), *rows), ("O".into(), *rows)]),
             })
             .collect::<Vec<_>>();
+        let implementation = implementation
+            .at_device(&seismic_lang::device::BackendFloor(implementation.backend));
         let partition = Rc::new(plan::partition(&implementation, &statics, &shapes).unwrap());
         // The launches a configuration runs at a point, and a time there
         // that only the packing form improves, at prefill rows.
@@ -10315,7 +10323,7 @@ mod tests {
         parameters: usize,
         values: u64,
     ) -> (
-        NativeImplementation,
+        OnDevice,
         GroupSearch,
         impl Fn(&NativeImplementation, &NativeSpecialization) -> PointMeasurement,
     ) {
@@ -10358,7 +10366,7 @@ mod tests {
     /// the leaders' neighbourhoods (what is asked after them is the rest of
     /// the domain). Returns the requests the planning made of the domain.
     fn planned_and_measured(
-        implementation: &NativeImplementation,
+        implementation: &OnDevice,
         run: &mut GroupSearch,
         measurement: &impl Fn(&NativeImplementation, &NativeSpecialization) -> PointMeasurement,
     ) -> Option<usize> {

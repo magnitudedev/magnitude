@@ -95,15 +95,9 @@ fn base_specialization(
     native: &NativeImplementation,
     statics: &NativeSpecialization,
 ) -> Result<NativeSpecialization, seismic_lang::checked::NativeSpecializationError> {
-    if let Some(result) = native.default_specialization_without_device(statics) {
-        return result;
-    }
-    let mut first = None;
-    native.walk_admissible(statics, |configuration| {
-        first = Some(configuration.clone());
-        false
-    })?;
-    first.ok_or(seismic_lang::checked::NativeSpecializationError::Inadmissible)
+    native
+        .at_device(&seismic_lang::device::BackendFloor(native.backend))
+        .default_specialization(statics)
 }
 
 /// A deterministic admissible specialization of `native`.
@@ -413,6 +407,7 @@ fn kernel_sources_render_their_named_constants_in_one_pass() {
             };
             let mut configurations = Vec::new();
             native
+                .at_device(&seismic_lang::device::BackendFloor(*backend))
                 .walk_admissible(&statics, |specialization| {
                     if let Ok(prepared) = native.prepared(specialization.clone()) {
                         configurations.push(prepared);

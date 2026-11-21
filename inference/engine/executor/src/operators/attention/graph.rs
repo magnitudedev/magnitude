@@ -183,11 +183,14 @@ pub(crate) fn dense_decodes(
     }
     let elements = [("A", binding.activation)];
     let statics = binding.shape.dense_mix_statics();
-    match <attention_decode::Entry as seismic::EntryContract>::contract_scratch_configs(
-        backend,
-        &elements,
-        &statics,
-    ) {
+    match crate::programs::graph::sizing::eval_with_device(backend, |dev| {
+        <attention_decode::Entry as seismic::EntryContract>::contract_scratch_configs(
+            backend,
+            Some(dev),
+            &elements,
+            &statics,
+        )
+    }) {
         Ok(_) => Ok(true),
         Err(seismic::ContractError::DomainViolation) => Ok(false),
         Err(error) => Err(crate::native::CatalogFailure::Preparation {
