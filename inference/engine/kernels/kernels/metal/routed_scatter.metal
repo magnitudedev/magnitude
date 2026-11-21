@@ -29,24 +29,40 @@ kernel void routed_scatter(
         return;
     const bool vector = SEISMIC_EXPERT_OUTPUT_STRIDE_2 == 1 && (SEISMIC_EXPERT_OUTPUT_STRIDE_1 & 7u) == 0
         && (SEISMIC_EXPERT_OUTPUT_STRIDE_0 & 7u) == 0;
+    const uint t_dim = uint(SEISMIC_DIM_T);
+    const uint k_dim = uint(SEISMIC_DIM_K);
+    device const int *inv_row = inverse + ulong(m) * SEISMIC_INVERSE_STRIDE_0;
+    device const float *w_row = weights + ulong(m) * SEISMIC_WEIGHTS_STRIDE_0;
     float4 selected_even = float4(0.0f), selected_odd = float4(0.0f);
-    for (ulong k = 0; k < SEISMIC_DIM_K; ++k) {
-        const ulong position = ulong(inverse[m * SEISMIC_INVERSE_STRIDE_0 + k * SEISMIC_INVERSE_STRIDE_1]);
-        const float weight = weights[m * SEISMIC_WEIGHTS_STRIDE_0 + k * SEISMIC_WEIGHTS_STRIDE_1];
+    for (uint k = 0; k < k_dim; ++k) {
+        const uint position = uint(inv_row[ulong(k) * SEISMIC_INVERSE_STRIDE_1]);
+        const float weight = w_row[ulong(k) * SEISMIC_WEIGHTS_STRIDE_1];
+        const uint bucket = position / t_dim;
+        const uint slot = position - bucket * t_dim;
         device const S *row = reinterpret_cast<device const S *>(expert_output)
-            + (position / SEISMIC_DIM_T) * SEISMIC_EXPERT_OUTPUT_STRIDE_0
-            + (position % SEISMIC_DIM_T) * SEISMIC_EXPERT_OUTPUT_STRIDE_1;
+            + ulong(bucket) * SEISMIC_EXPERT_OUTPUT_STRIDE_0
+            + ulong(slot) * SEISMIC_EXPERT_OUTPUT_STRIDE_1;
         float4 even, odd;
         projection::load8_storage<A>(row, SEISMIC_EXPERT_OUTPUT_STRIDE_2, n, columns, vector, even, odd);
         selected_even = metal::fma(float4(weight), even, selected_even);
         selected_odd = metal::fma(float4(weight), odd, selected_odd);
     }
-    const float selected[8] = {selected_even.x, selected_odd.x, selected_even.y, selected_odd.y,
-        selected_even.z, selected_odd.z, selected_even.w, selected_odd.w};
-    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);
-    for (uint i = 0; i < 8u && n + i < columns; ++i) {
-        const ulong column = n + i;
-        value.put(m * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-            base[m * SEISMIC_BASE_STRIDE_0 + column * SEISMIC_BASE_STRIDE_1] + selected[i]);
+    const float4 selected_low = float4(selected_even.x, selected_odd.x, selected_even.y, selected_odd.y);
+    const float4 selected_high = float4(selected_even.z, selected_odd.z, selected_even.w, selected_odd.w);
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> out_row =
+        element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(value_cells).offset(ulong(m) * SEISMIC_RESULT_0_STRIDE_0);
+    device const float *base_row = base + ulong(m) * SEISMIC_BASE_STRIDE_0;
+    if (SEISMIC_BASE_STRIDE_1 == 1 && SEISMIC_RESULT_0_STRIDE_1 == 1 && n + 8u <= columns) {
+        device const packed_float4 *from = reinterpret_cast<device const packed_float4 *>(base_row + n);
+        out_row.put4(n, float4(from[0]) + selected_low);
+        out_row.put4(n + 4u, float4(from[1]) + selected_high);
+    } else {
+        const float selected[8] = {selected_low.x, selected_low.y, selected_low.z, selected_low.w,
+            selected_high.x, selected_high.y, selected_high.z, selected_high.w};
+        for (uint i = 0; i < 8u && n + i < columns; ++i) {
+            const uint column = n + i;
+            out_row.put(ulong(column) * SEISMIC_RESULT_0_STRIDE_1,
+                base_row[ulong(column) * SEISMIC_BASE_STRIDE_1] + selected[i]);
+        }
     }
 }

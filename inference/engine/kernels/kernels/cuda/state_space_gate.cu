@@ -2,24 +2,46 @@
 // state-space output rows, y * SiLU(z) RMS-normalized over each group of U
 // heads and scaled by the state norm. The CUDA form of
 // `metal/state_space_gate.metal`: a block of 256 threads per (row, group),
-// strided lane chains, a warp reduction, then the warp sums in order.
+// `vec4` lane chains on canonical strides, `reduce::group_sum`, and
+// `row_norm` RMS normalization.
 
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.cuh"
+#include "lib/core/norm.cuh"
+#include "lib/core/reduce.cuh"
 
 namespace state_space_gate_detail {
 
-typedef unsigned long long u64;
+using activation::Act;
+using element::u32;
+using element::u64;
 
-// The gated value of `channel` (in the row's flat head-major order).
-__device__ __forceinline__ float gated_value(const element::u8 *mixed, const element::u8 *projection, u64 row,
-                                             u64 channel, const seismic_words_t &seismic_words_value) {
-    const u64 head = channel / SEISMIC_DIM_P;
-    const float gate = element::at<activation::Act>(projection, row * SEISMIC_PROJECTION_STRIDE_0 +
-                                                                 channel * SEISMIC_PROJECTION_STRIDE_1);
-    const float value = element::at<activation::Act>(mixed, row * SEISMIC_MIXED_STRIDE_0 + head * SEISMIC_MIXED_STRIDE_1 +
-                                                             (channel % SEISMIC_DIM_P) * SEISMIC_MIXED_STRIDE_2);
+__device__ __forceinline__ float silu_mul(float value, float gate) {
     return seismic_mul_rn(value, gate / (1.0f + expf(-gate)));
+}
+
+// The gated value of `column` within `(row, group)` (head = group * U + column / P).
+__device__ __forceinline__ float gated_value(const element::u8 *mixed, const element::u8 *projection, u64 mixed_row,
+                                             u64 proj_row, u32 head_base, u32 first, u32 p_dim, u32 column,
+                                             const seismic_words_t &seismic_words_value) {
+    const u32 local = column / p_dim;
+    const u32 p = column - local * p_dim;
+    const u32 head = head_base + local;
+    const u32 channel = first + column;
+    const float gate =
+        element::at<Act>(projection, proj_row + static_cast<u64>(channel) * SEISMIC_PROJECTION_STRIDE_1);
+    const float value = element::at<Act>(
+        mixed, mixed_row + static_cast<u64>(head) * SEISMIC_MIXED_STRIDE_1 + static_cast<u64>(p) * SEISMIC_MIXED_STRIDE_2);
+    return silu_mul(value, gate);
+}
+
+// Four contiguous gated values starting at `column` (canonical strides, aligned).
+__device__ __forceinline__ float4 gated_value4(const element::u8 *mixed, const element::u8 *projection, u64 mixed_base,
+                                               u64 proj_base, u32 column) {
+    float g[4], v[4];
+    element::span<Act, 4, false>(projection, proj_base + column, g);
+    element::span<Act, 4, false>(mixed, mixed_base + column, v);
+    return make_float4(silu_mul(v[0], g[0]), silu_mul(v[1], g[1]), silu_mul(v[2], g[2]), silu_mul(v[3], g[3]));
 }
 
 } // namespace state_space_gate_detail
@@ -29,32 +51,82 @@ extern "C" __global__ void state_space_gate(SEISMIC_KERNEL_PARAMS) {
     const element::u8 *mixed = SEISMIC_PTR(SEISMIC_BUFFER_MIXED);
     const element::u8 *projection = SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION);
     const float *state_norm = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_STATE_NORM));
-    const element::Out<activation::Act> normalized = SEISMIC_RESULT_0_OUT;
+    const element::Out<Act> normalized = SEISMIC_RESULT_0_OUT;
     __shared__ float partials[32];
     const u64 row = blockIdx.x;
-    const u64 width = SEISMIC_DIM_U * SEISMIC_DIM_P;
-    const u64 first = static_cast<u64>(blockIdx.y) * width;
+    const u32 group = blockIdx.y;
+    const u32 u_dim = static_cast<u32>(SEISMIC_DIM_U);
+    const u32 p_dim = static_cast<u32>(SEISMIC_DIM_P);
+    const u32 width = u_dim * p_dim;
+    const u32 vec_width = width & ~3u;
+    const u32 head_base = group * u_dim;
+    const u32 first = group * width;
+    const u32 tid = threadIdx.x;
+    const u32 threads = blockDim.x;
     const float epsilon = element::word_f32(SEISMIC_PARAM_EPSILON);
+    const u64 mixed_row = row * SEISMIC_MIXED_STRIDE_0;
+    const u64 proj_row = row * SEISMIC_PROJECTION_STRIDE_0;
+    const u64 mixed_base = mixed_row + first;
+    const u64 proj_base = proj_row + first;
+    constexpr u32 act_align = 4u * Act::bytes - 1u;
+    const bool vec_in = SEISMIC_PROJECTION_STRIDE_1 == 1 && SEISMIC_MIXED_STRIDE_1 == SEISMIC_DIM_P
+                        && SEISMIC_MIXED_STRIDE_2 == 1
+                        && (((reinterpret_cast<u64>(mixed + mixed_base * Act::bytes)
+                              | reinterpret_cast<u64>(projection + proj_base * Act::bytes))
+                             & act_align)
+                            == 0u);
     float squares = 0.0f;
-    for (u64 column = threadIdx.x; column < width; column += blockDim.x) {
-        const float value = gated_value(mixed, projection, row, first + column, seismic_words_value);
-        squares = seismic_fma_rn(value, value, squares);
+    if (vec_in) {
+        float4 sq4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (u32 column = 4u * tid; column < vec_width; column += 4u * threads)
+            sq4 = row_norm::square4(gated_value4(mixed, projection, mixed_base, proj_base, column), sq4);
+        squares = row_norm::sum4(sq4);
+        for (u32 column = vec_width + tid; column < width; column += threads) {
+            const float value =
+                silu_mul(element::at<Act>(mixed, mixed_base + column), element::at<Act>(projection, proj_base + column));
+            squares = row_norm::square(value, squares);
+        }
+    } else {
+        for (u32 column = tid; column < width; column += threads) {
+            const float value =
+                gated_value(mixed, projection, mixed_row, proj_row, head_base, first, p_dim, column, seismic_words_value);
+            squares = row_norm::square(value, squares);
+        }
     }
-    const float total = seismic_warp_sum_f32(squares);
-    if (threadIdx.x % 32 == 0)
-        partials[threadIdx.x / 32] = total;
-    __syncthreads();
-    float sum = 0.0f;
-    for (unsigned index = 0; index < blockDim.x / 32; ++index) sum = seismic_add_rn(sum, partials[index]);
-    const float inverse = rsqrtf(sum / static_cast<float>(width) + epsilon);
-    for (u64 column = threadIdx.x; column < width; column += blockDim.x) {
-        const u64 channel = first + column;
-        const float weight = state_norm[static_cast<u64>(blockIdx.y) * SEISMIC_STATE_NORM_STRIDE_0 +
-                                        (column / SEISMIC_DIM_P) * SEISMIC_STATE_NORM_STRIDE_1 +
-                                        (column % SEISMIC_DIM_P) * SEISMIC_STATE_NORM_STRIDE_2];
-        const float value = gated_value(mixed, projection, row, channel, seismic_words_value);
-        normalized.put(row * SEISMIC_RESULT_0_STRIDE_0 + (channel / SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_1 +
-                           (channel % SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_2,
-                       seismic_mul_rn(seismic_mul_rn(value, inverse), weight));
+    const float inverse = row_norm::inverse(reduce::group_sum(squares, partials), width, epsilon);
+    const float *norm_group = state_norm + static_cast<u64>(group) * SEISMIC_STATE_NORM_STRIDE_0;
+    const u64 out_row = row * SEISMIC_RESULT_0_STRIDE_0;
+    const element::Out<Act> out_group = normalized.offset(out_row + first);
+    const bool vec_out = vec_in && SEISMIC_STATE_NORM_STRIDE_1 == SEISMIC_DIM_P && SEISMIC_STATE_NORM_STRIDE_2 == 1
+                         && SEISMIC_RESULT_0_STRIDE_1 == SEISMIC_DIM_P && SEISMIC_RESULT_0_STRIDE_2 == 1
+                         && ((reinterpret_cast<u64>(norm_group) & 15u) == 0u)
+                         && ((reinterpret_cast<u64>(out_group.stored(0)) & act_align) == 0u);
+    if (vec_out) {
+        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (u32 column = 4u * tid; column < vec_width; column += 4u * threads) {
+            const float4 weight = *reinterpret_cast<const float4 *>(norm_group + column);
+            const float4 value = gated_value4(mixed, projection, mixed_base, proj_base, column);
+            const float4 scaled = row_norm::apply4<true, false>(value, inverse, weight, zero);
+            const float out[4] = {scaled.x, scaled.y, scaled.z, scaled.w};
+            out_group.put_span<4>(column, out);
+        }
+        for (u32 column = vec_width + tid; column < width; column += threads) {
+            const float value =
+                silu_mul(element::at<Act>(mixed, mixed_base + column), element::at<Act>(projection, proj_base + column));
+            out_group.put(column, row_norm::apply<true, false>(value, inverse, norm_group[column], 0.0f));
+        }
+    } else {
+        for (u32 column = tid; column < width; column += threads) {
+            const u32 local = column / p_dim;
+            const u32 p = column - local * p_dim;
+            const u32 head = head_base + local;
+            const float weight = norm_group[static_cast<u64>(local) * SEISMIC_STATE_NORM_STRIDE_1
+                                            + static_cast<u64>(p) * SEISMIC_STATE_NORM_STRIDE_2];
+            const float value =
+                gated_value(mixed, projection, mixed_row, proj_row, head_base, first, p_dim, column, seismic_words_value);
+            normalized.put(out_row + static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1
+                               + static_cast<u64>(p) * SEISMIC_RESULT_0_STRIDE_2,
+                           row_norm::apply<true, false>(value, inverse, weight, 0.0f));
+        }
     }
 }

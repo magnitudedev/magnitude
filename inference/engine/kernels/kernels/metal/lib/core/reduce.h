@@ -3,6 +3,7 @@
 // combines the simdgroup partials in index order, so its result depends only
 // on the threadgroup's width, never on scheduling. Every thread receives the
 // result.
+#pragma once
 
 namespace reduce {
 
@@ -53,6 +54,68 @@ template <typename TIES>
 inline int argmax(float score, int index, thread float &best) {
     best = simd_max(score);
     return TIES::pick(score == best ? index : TIES::none);
+}
+
+// Integer prefix sums over a threadgroup, exact in any order, and the
+// simdgroup-cooperative walks over a table of span lengths built on them.
+
+// The sum of `value` over the threadgroup's threads before this one, and in
+// `total` the sum over all of them. `partials` holds SIMDGROUPS uints (at
+// most 32); the leading barrier lets consecutive calls share it. Every
+// thread of the threadgroup must call it.
+template <uint SIMDGROUPS>
+inline uint group_exclusive_add(uint value, threadgroup uint *partials, uint sg, uint lane, thread uint &total) {
+    static_assert(SIMDGROUPS >= 1 && SIMDGROUPS <= 32, "at most 32 simdgroups");
+    const uint inclusive = simd_prefix_inclusive_sum(value);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 31)
+        partials[sg] = inclusive;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint sg_sum = lane < SIMDGROUPS ? partials[lane] : 0u;
+    const uint sg_before = simd_prefix_exclusive_sum(sg_sum);
+    total = simd_sum(sg_sum);
+    const uint before = simd_shuffle(sg_before, ushort(sg));
+    return before + inclusive - value;
+}
+
+// Walks over spans 0..count-1 whose lengths are `length(s)` (in any unit:
+// rows, keys, key tiles). Every lane of the simdgroup calls them with the
+// same arguments, convergent, and receives the same result.
+
+// The sum of the lengths: lane l sums spans l, l + 32, ..., then `simd_sum`.
+template <typename Length>
+inline uint span_total(ulong count, Length length, uint lane) {
+    uint total = 0;
+    for (ulong s = lane; s < count; s += 32)
+        total += length(s);
+    return simd_sum(total);
+}
+
+// A span and its offset: the lengths of the spans before it.
+struct Located {
+    ulong span;
+    uint offset;
+};
+
+// The first span s with offset(s) + length(s) > `at`, and offset(s); (count,
+// total) when there is none. Spans are taken 32 at a time: an exclusive
+// simdgroup prefix of their lengths plus the offset carried from earlier
+// chunks, a ballot of the spans ending past `at`, the first of them broadcast.
+template <typename Length>
+inline Located span_locate(ulong count, uint at, Length length, uint lane) {
+    uint carried = 0;
+    for (ulong base = 0; base < count; base += 32) {
+        const ulong s = base + lane;
+        const uint own = s < count ? length(s) : 0u;
+        const uint before = carried + simd_prefix_exclusive_sum(own);
+        const uint hits = uint(uint64_t(simd_ballot(s < count && at < before + own)));
+        if (hits != 0u) {
+            const uint first = metal::ctz(hits);
+            return Located{base + first, simd_shuffle(before, ushort(first))};
+        }
+        carried += simd_sum(own);
+    }
+    return Located{count, carried};
 }
 
 } // namespace reduce

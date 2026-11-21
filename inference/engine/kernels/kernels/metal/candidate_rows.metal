@@ -25,6 +25,7 @@
 //
 // Dynamic extents read `seismic_words`.
 
+#include "lib/core/reduce.h"
 #include "lib/indexer/indexer.h"
 
 kernel void candidate_rows(
@@ -67,7 +68,7 @@ kernel void candidate_rows(
             const uint span = base + thread_index;
             const uint length = span < r ? indexer::span_length(row_spans[span * 2], row_spans[span * 2 + 1]) : 0u;
             uint chunk = 0;
-            const uint before = indexer::group_exclusive(length, totals, simd, lane, chunk);
+            const uint before = reduce::group_exclusive_add<8>(length, totals, simd, lane, chunk);
             if (span < r) {
                 if (use_span_cache)
                     span_cache[span] = units + before;
@@ -130,7 +131,7 @@ kernel void candidate_rows(
         for (uint s = lo; s < hi; ++s)
             gaps += gap_end(s) - gap_first(s);
         uint total = 0;
-        uint before = indexer::group_exclusive(gaps, totals, simd, lane, total);
+        uint before = reduce::group_exclusive_add<8>(gaps, totals, simd, lane, total);
         for (uint s = lo; s < hi; ++s) {
             const uint first = gap_first(s), end = gap_end(s);
             if (before < fill && fill <= before + end - first) {
@@ -199,7 +200,7 @@ kernel void candidate_rows(
     uint opened = 0;
     ranges([&](uint, uint, uint, uint, bool opens, bool) { opened += opens ? 1u : 0u; });
     uint count = 0;
-    uint entry = indexer::group_exclusive(opened, totals, simd, lane, count);
+    uint entry = reduce::group_exclusive_add<8>(opened, totals, simd, lane, count);
     ranges([&](uint at, uint stop, uint span, uint offset, bool opens, bool closes) {
         const int row_lo = row_spans[span * 2];
         if (opens) {

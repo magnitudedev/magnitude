@@ -324,6 +324,53 @@ __device__ __forceinline__ void routed_join_pair(element::Out<element::F32> out,
     }
 }
 
+// Four adjacent columns n .. n + 3 joining their row's residual: `float4`
+// residual loads and `out.put_span<4>` stores when 16-byte aligned, hoisting
+// `inject[s]` once per quad.
+template <u32 STREAMS, bool INJECTED>
+__device__ __forceinline__ void routed_join_quad(element::Out<element::F32> out, const float *residual,
+                                                 const float *inject, u64 width, u64 n, float4 selected,
+                                                 float4 shared) {
+    if constexpr (!INJECTED) {
+        const float4 base = ((reinterpret_cast<u64>(residual + n) & 15u) == 0u)
+                                ? *reinterpret_cast<const float4 *>(residual + n)
+                                : make_float4(residual[n], residual[n + 1], residual[n + 2], residual[n + 3]);
+        const float result[4] = {base.x + selected.x + shared.x, base.y + selected.y + shared.y,
+                                 base.z + selected.z + shared.z, base.w + selected.w + shared.w};
+        if ((reinterpret_cast<u64>(out.stored(n)) & 15u) == 0u) {
+            out.put_span<4>(n, result);
+        } else {
+            out.put(n, result[0]);
+            out.put(n + 1, result[1]);
+            out.put(n + 2, result[2]);
+            out.put(n + 3, result[3]);
+        }
+    } else {
+        const float total0 = selected.x + shared.x;
+        const float total1 = selected.y + shared.y;
+        const float total2 = selected.z + shared.z;
+        const float total3 = selected.w + shared.w;
+#pragma unroll
+        for (u32 s = 0; s < STREAMS; ++s) {
+            const float gain = inject[s];
+            const u64 at = s * width + n;
+            const float4 base = ((reinterpret_cast<u64>(residual + at) & 15u) == 0u)
+                                    ? *reinterpret_cast<const float4 *>(residual + at)
+                                    : make_float4(residual[at], residual[at + 1], residual[at + 2], residual[at + 3]);
+            const float result[4] = {base.x + total0 * gain, base.y + total1 * gain, base.z + total2 * gain,
+                                     base.w + total3 * gain};
+            if ((reinterpret_cast<u64>(out.stored(at)) & 15u) == 0u) {
+                out.put_span<4>(at, result);
+            } else {
+                out.put(at, result[0]);
+                out.put(at + 1, result[1]);
+                out.put(at + 2, result[2]);
+                out.put(at + 3, result[3]);
+            }
+        }
+    }
+}
+
 // An output entry's epilogue: `Residual`, or `Scatter` over STREAMS streams
 // when the entry takes inject values (COMBED: and a comb after them). `make`
 // forms either from every field (`Residual` reads the leading ones).

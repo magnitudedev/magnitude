@@ -30,6 +30,7 @@
 
 #include "../core/activation.h"
 #include "../core/head.h"
+#include "../core/reduce.h"
 #include "../core/rotary.h"
 #include "../core/rounding.h"
 #include <seismic/slab.h>
@@ -446,42 +447,24 @@ inline key_span form_span(device const int *visible, device const int *fresh, ul
 // R spans (a selected read's decode rows see hundreds of runs) costs R / 32
 // loads a lane rather than a serial walk.
 
-// The total number of keys a row sees under `form_span`.
+// The total number of keys a row sees under `form_span` (`reduce::span_total`).
 inline uint form_total(device const int *visible, device const int *fresh, ulong row, ulong spans, uint lane) {
-    uint total = 0;
-    for (ulong index = lane; index <= spans; index += 32) {
+    return reduce::span_total(spans + 1, [&](ulong index) {
         const key_span keys = form_span(visible, fresh, row, spans, index);
-        total += uint(metal::max(keys.hi - keys.lo, 0));
-    }
-    return simd_sum(total);
+        return uint(metal::max(keys.hi - keys.lo, 0));
+    }, lane);
 }
 
-// Where key `key` of a row's keys under `form_span` lies: the first span
-// whose keys reach past it and the keys before that span. Past the last key,
-// span spans + 1 and the row's key count.
-struct span_start {
-    ulong span;
-    uint offset;
-};
+// Where key `key` of a row's keys under `form_span` lies (`reduce::span_locate`):
+// the first span whose keys reach past it and the keys before that span. Past
+// the last key, span spans + 1 and the row's key count.
+typedef reduce::Located span_start;
 inline span_start form_locate(device const int *visible, device const int *fresh, ulong row, ulong spans, uint key,
     uint lane) {
-    uint offset = 0;
-    for (ulong base = 0; base <= spans; base += 32) {
-        const ulong index = base + lane;
-        uint length = 0;
-        if (index <= spans) {
-            const key_span keys = form_span(visible, fresh, row, spans, index);
-            length = uint(metal::max(keys.hi - keys.lo, 0));
-        }
-        const uint before = offset + simd_prefix_exclusive_sum(length);
-        const uint hits = uint(uint64_t(simd_ballot(index <= spans && key < before + length)));
-        if (hits != 0) {
-            const uint at = metal::ctz(hits);
-            return span_start{base + at, simd_shuffle(before, ushort(at))};
-        }
-        offset += simd_sum(length);
-    }
-    return span_start{spans + 1, offset};
+    return reduce::span_locate(spans + 1, key, [&](ulong index) {
+        const key_span keys = form_span(visible, fresh, row, spans, index);
+        return uint(metal::max(keys.hi - keys.lo, 0));
+    }, lane);
 }
 
 // Whether row `row`'s key sequence is a prefix of row `lead`'s: the same keys

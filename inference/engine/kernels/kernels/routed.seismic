@@ -1893,9 +1893,8 @@ native routed_experts_up for cpu from "cpu/routed_experts_up.rs":
         grid (down_grid)
         threads_per_threadgroup (1, 1, 1)
 
-# Prefill output. Metal and Vulkan: a thread owns 8 consecutive columns of a
-# row (one 16-byte gather per choice). CUDA: a thread per column. CPU: a work
-# item per row.
+# Prefill output. Metal, CUDA and Vulkan: a thread owns 8 consecutive columns
+# of a row (one 16-byte gather per choice). CPU: a work item per row.
 native routed_scatter for metal from "metal/routed_scatter.metal":
     launch routed_scatter:
         threadgroups (ceil_div(H, 2048), M, 1)
@@ -1903,7 +1902,7 @@ native routed_scatter for metal from "metal/routed_scatter.metal":
 
 native routed_scatter for cuda from "cuda/routed_scatter.cu":
     launch routed_scatter:
-        threadgroups (ceil_div(H, 256), M, 1)
+        threadgroups (ceil_div(H, 2048), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native routed_scatter for vulkan from "vulkan/routed_scatter.comp":

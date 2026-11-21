@@ -467,15 +467,16 @@ native stream_join for cpu from "cpu/stream_join.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# One thread per value.
+# Four columns across all S streams per thread on Metal and CUDA; one thread
+# per value on Vulkan; one work item per row on CPU.
 native repeat_rows for metal from "metal/repeat_rows.metal":
     launch repeat_rows:
-        threadgroups (ceil_div(M * S * H, 256), 1, 1)
+        threadgroups (ceil_div(M * ceil_div(H, 4), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native repeat_rows for cuda from "cuda/repeat_rows.cu":
     launch repeat_rows:
-        threadgroups (ceil_div(M * S * H, 256), 1, 1)
+        threadgroups (ceil_div(M * ceil_div(H, 4), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native repeat_rows for vulkan from "vulkan/repeat_rows.comp":

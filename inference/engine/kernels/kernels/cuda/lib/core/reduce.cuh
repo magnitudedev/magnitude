@@ -3,6 +3,7 @@
 // then combines the warp partials in index order, so its result depends only
 // on the block's width, never on scheduling. Every thread receives the
 // result.
+#pragma once
 
 namespace reduce {
 

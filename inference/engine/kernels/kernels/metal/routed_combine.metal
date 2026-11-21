@@ -341,23 +341,11 @@ kernel void routed_combine(COMBINE_ARGUMENTS,
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> out_row = value.offset(m * SEISMIC_RESULT_0_STRIDE_0);
     device const float *residual_row = residual + m * SEISMIC_RESIDUAL_STRIDE_0;
     device const float *inject_row = inject + m * SEISMIC_INJECT_STRIDE_0;
-    if (SEISMIC_RESIDUAL_STRIDE_1 == 1 && SEISMIC_RESULT_0_STRIDE_1 == 1 && n + 8u <= columns) {
-        if constexpr (SEISMIC_DIM_IN == 0) {
-            device const packed_float4 *from = reinterpret_cast<device const packed_float4 *>(residual_row + n);
-            out_row.put4(n, (float4(from[0]) + selected_low) + shared_low);
-            out_row.put4(n + 4u, (float4(from[1]) + selected_high) + shared_high);
-        } else {
-            const float4 sum_low = selected_low + shared_low;
-            const float4 sum_high = selected_high + shared_high;
-            PROJECTION_UNROLL
-            for (uint s = 0; s < SEISMIC_DIM_SN; ++s) {
-                const float inj = inject_row[s];
-                const ulong base = ulong(s) * columns + n;
-                device const packed_float4 *from = reinterpret_cast<device const packed_float4 *>(residual_row + base);
-                out_row.put4(base, float4(from[0]) + sum_low * inj);
-                out_row.put4(base + 4u, float4(from[1]) + sum_high * inj);
-            }
-        }
+    if (n + 8u <= columns) {
+        projection::routed_join_quad<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(out_row, SEISMIC_RESULT_0_STRIDE_1,
+            residual_row, SEISMIC_RESIDUAL_STRIDE_1, inject_row, columns, n, selected_low, shared_low);
+        projection::routed_join_quad<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(out_row, SEISMIC_RESULT_0_STRIDE_1,
+            residual_row, SEISMIC_RESIDUAL_STRIDE_1, inject_row, columns, n + 4u, selected_high, shared_high);
     } else {
         const float selected[8] = {selected_low.x, selected_low.y, selected_low.z, selected_low.w,
             selected_high.x, selected_high.y, selected_high.z, selected_high.w};

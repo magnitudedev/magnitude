@@ -25,6 +25,7 @@
 // select state [4]. Dynamic extents read `seismic_words`.
 
 #include "lib/core/order.h"
+#include "lib/core/reduce.h"
 #include "lib/indexer/indexer.h"
 
 namespace topk {
@@ -32,22 +33,6 @@ namespace topk {
 constant constexpr uint THREADS = 1024;
 constant constexpr uint ITEMS = 8;
 constant constexpr uint CHUNK = THREADS * ITEMS;
-
-// Exclusive prefix sum of `value` over the 1024 threads (32 simdgroups of 32
-// lanes) of a threadgroup in thread order, and in `total` their sum. Every
-// thread calls it; `totals` holds the 32 simdgroups' sums.
-inline uint group_exclusive_1024(uint value, threadgroup uint *totals, uint simd, uint lane, thread uint &total) {
-    const uint inclusive = simd_prefix_inclusive_sum(value);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 31)
-        totals[simd] = inclusive;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint sg_sum = totals[lane];
-    const uint sg_before = simd_prefix_exclusive_sum(sg_sum);
-    total = simd_sum(sg_sum);
-    const uint before = simd_shuffle(sg_before, ushort(simd));
-    return before + inclusive - value;
-}
 
 // One threadgroup atomic per distinct digit of a simdgroup.
 inline void simd_histogram_add(threadgroup uint *bins, uint key, uint shift, bool pending, uint lane) {
@@ -120,7 +105,7 @@ kernel void rows_topk(
         const uint span = base + thread_index;
         const uint length = span < r ? indexer::span_length(row_spans[span * 2], row_spans[span * 2 + 1]) : 0u;
         uint chunk = 0;
-        const uint before = group_exclusive_1024(length, totals, simd, lane, chunk);
+        const uint before = reduce::group_exclusive_add<32>(length, totals, simd, lane, chunk);
         if (span < r)
             span_first[span] = listed + before;
         listed += chunk;
@@ -178,7 +163,7 @@ kernel void rows_topk(
             // `remaining`-th best takes the digit.
             const uint bin = thread_index < 256 ? 255u - thread_index : 0u;
             const uint count = thread_index < 256 ? bins[bin] : 0u;
-            const uint above = group_exclusive_1024(count, totals, simd, lane, total);
+            const uint above = reduce::group_exclusive_add<32>(count, totals, simd, lane, total);
             if (thread_index < 256 && above < remaining && remaining <= above + count) {
                 state[0] = prefix_bits | (bin << shift);
                 state[1] = remaining - above;
@@ -208,7 +193,7 @@ kernel void rows_topk(
             for (uint i = 0; i < ITEMS; ++i)
                 equal += lo + i < hi && keys[i] == threshold ? 1u : 0u;
             uint chunk_equal = 0;
-            rank = ranked + group_exclusive_1024(equal, totals, simd, lane, chunk_equal);
+            rank = ranked + reduce::group_exclusive_add<32>(equal, totals, simd, lane, chunk_equal);
             ranked += chunk_equal;
         }
         uint picked_mask = 0;
@@ -224,7 +209,7 @@ kernel void rows_topk(
             }
         }
         uint chunk_picks = 0;
-        uint position = placed + group_exclusive_1024(picks, totals, simd, lane, chunk_picks);
+        uint position = placed + reduce::group_exclusive_add<32>(picks, totals, simd, lane, chunk_picks);
         placed += chunk_picks;
         if (picks > 0) {
             // The span holding `lo`: the last whose offset is at most it.
