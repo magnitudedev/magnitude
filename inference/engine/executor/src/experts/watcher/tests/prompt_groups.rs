@@ -1389,3 +1389,186 @@ fn windowed_pass_sets_pipeline_next_set_reads_while_open_set_runs() {
     }
     harness.retired();
 }
+
+/// Once `fix_rounds` commits a cold expert to a conveyor round
+/// (`ColdStage::Scheduled`), the request's tier copy list is already published
+/// and only the conveyor can deliver it: even if the expert subsequently lands
+/// in (or begins landing into) the host tier (`tier_serves == true`),
+/// `Scratch::waits` must return false so `convey()` still reads it and
+/// `Scratch::awaited` must not report it as awaiting a host-tier landing.
+#[test]
+fn scheduled_cold_experts_are_conveyed_even_after_landing_in_host_tier() {
+    let harness = lending("sched-after-tier", EXPERTS, 2, 1, STAGING, Conveying::of(ROUND_RECORDS), TIER, Placer::Tier, false);
+    let step = harness.prompt_step();
+    let seq = step.sequence();
+    harness.publish(&step, 0, &[0, 1, 2, 3]);
+    // Request round 0 so `fix_rounds` schedules all 4 cold experts across 2
+    // rounds of 2; round 1's two experts remain `Scheduled(1)` + `Deferred`.
+    let scratch = &harness.layers[0].2;
+    scratch.request(seq, round(0));
+    assert_eq!(until_answered(scratch, seq, round(0)), Answer::Answered);
+    let round0 = Harness::experts(&harness.round_listed(&step, 0, 0));
+    assert_eq!(round0.len(), 2);
+    let deferred: Vec<usize> = (0..4).filter(|e| !round0.contains(&(*e as i32))).collect();
+    assert_eq!(deferred.len(), 2, "two experts must remain scheduled for round 1: round0={round0:?}");
+    let (e_kept, e_landing) = (deferred[0], deferred[1]);
+
+    // Put `e_kept` whole into the host tier and start an in-flight host-tier
+    // landing for `e_landing`, so `tier_serves` becomes true for both.
+    let landing_record = {
+        let mut state = residency::lock(&harness.watcher.state);
+        let crate::experts::host_records::Claim::Taken(kept_grant) = state.core.directory.claim_landing(
+            0,
+            e_kept,
+            0,
+            crate::experts::host_records::Taking::Out,
+            crate::experts::host_records::Refuses,
+        ) else {
+            panic!("host tier must have a ready record for e_kept={e_kept}");
+        };
+        let kept_rec = crate::experts::directory::HostRecord(kept_grant.record());
+        state.core.directory.landed(0, kept_rec, e_kept, None);
+
+        let crate::experts::host_records::Claim::Taken(landing_grant) = state.core.directory.claim_landing(
+            0,
+            e_landing,
+            0,
+            crate::experts::host_records::Taking::Out,
+            crate::experts::host_records::Refuses,
+        ) else {
+            panic!("host tier must have a ready record for e_landing={e_landing}");
+        };
+        let landing_rec = crate::experts::directory::HostRecord(landing_grant.record());
+
+        assert!(state.core.directory.tier_serves(0, e_kept, seq));
+        assert!(state.core.directory.tier_serves(0, e_landing, seq));
+        assert!(state.core.directory.lands(0, e_landing));
+        assert!(
+            state.scratch.awaited(&state.core).next().is_none(),
+            "scheduled cold experts must not be reported as awaited"
+        );
+        landing_rec
+    };
+
+    // Request round 1: frees round 0's conveyor records and must convey both
+    // `e_kept` and `e_landing` instead of skipping them via `waits()`.
+    scratch.request(seq, round(1));
+    assert_eq!(until_answered(scratch, seq, round(1)), Answer::Answered);
+    let round1 = Harness::experts(&harness.round_listed(&step, 0, 1));
+    let mut expected = vec![e_kept as i32, e_landing as i32];
+    expected.sort_unstable();
+    assert_eq!(round1, expected, "round 1 must convey both scheduled experts despite host-tier presence");
+
+    // Arrive past round 1 to release its conveyor records, clean up the
+    // synthetic in-flight landing, and retire the step.
+    scratch.request(seq, round(2));
+    assert_eq!(until_answered(scratch, seq, round(2)), Answer::Answered);
+    {
+        let mut state = residency::lock(&harness.watcher.state);
+        state.core.directory.unlanded(0, landing_record);
+    }
+    step.complete().unwrap();
+    harness.retired();
+}
+
+/// When an expert is already in the host tier (`tier_serves == true`) before
+/// `fix_rounds`, but another cold expert borrows its scratch slot
+/// (`borrower(expert % lw).is_some()`), `fix_rounds` cannot tier-copy it and
+/// instead schedules it in a conveyor round while still `ColdRead::Deferred`.
+/// `convey()` must still read that scheduled expert rather than skipping it
+/// via `waits()` and deadlocking the round.
+#[test]
+fn host_tier_expert_whose_slot_was_borrowed_before_fix_rounds_still_conveys() {
+    let conveying = Conveying::of(ROUND_RECORDS).lending_scratch();
+    let harness = lending("sched-borrow-tier", EXPERTS, 2, 1, STAGING, conveying, TIER, Placer::Tier, false);
+    // Keep [1, 3, 5, 6, 7] in the host tier (and absent from the bank) so they
+    // have `tier_serves == true`, while [0, 2, 4] must be read from the file.
+    // With all `EXPERTS` routed, no slot is unrouted, so 0 borrows slot 1, 2
+    // borrows slot 3, and 4 borrows slot 5 — forcing host-tier experts 1, 3, 5
+    // into scheduled conveyor rounds while still `ColdRead::Deferred`.
+    {
+        let mut state = residency::lock(&harness.watcher.state);
+        for expert in [1, 3, 5, 6, 7] {
+            let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(
+                0,
+                expert,
+                0,
+                crate::experts::host_records::Taking::Out,
+                crate::experts::host_records::Refuses,
+            ) else {
+                panic!("host tier must have a ready record for expert {expert}");
+            };
+            let record = crate::experts::directory::HostRecord(grant.record());
+            state.core.directory.landed(0, record, expert, None);
+        }
+    }
+
+    let step = harness.prompt_step();
+    let every: Vec<usize> = (0..EXPERTS).collect();
+    harness.publish(&step, 0, &every);
+    // Wait until 0, 2, and 4 have been read into lent scratch slots before
+    // `fix_rounds` runs.
+    eventually("experts 0, 2, 4 never borrowed scratch slots", || {
+        let state = residency::lock(&harness.watcher.state);
+        state.scratch.conveyor.whole(0, 0)
+            && state.scratch.conveyor.whole(0, 2)
+            && state.scratch.conveyor.whole(0, 4)
+    });
+
+    let rounds = harness.rounds_checked(&step, 0);
+    let converted = Harness::experts(&rounds.concat());
+    let lent = Harness::from_slots(&rounds.concat());
+    assert!(!lent.is_empty(), "experts 0, 2, 4 must borrow scratch slots: rounds={rounds:?}");
+    for &(expert, slot) in &lent {
+        assert!(
+            converted.contains(&slot),
+            "host-tier expert {slot} whose slot was borrowed by {expert} must be conveyed by a round: rounds={rounds:?}"
+        );
+    }
+    step.complete().unwrap();
+    harness.retired();
+}
+
+/// When a borrower and its slot's owner end up in the same round,
+/// `reclaim_slots` yields the `Held` borrower back to `ColdRead::Deferred`.
+/// `Scratch::round` must immediately re-run `convey()` so the yielded borrower
+/// is re-read into a conveyor record instead of stranding the round with no
+/// in-flight reads to wake the watcher.
+#[test]
+fn reclaim_slots_yielded_borrower_in_same_round_re_conveys_immediately() {
+    let conveying = Conveying::of(ROUND_RECORDS).lending_scratch();
+    let harness = lending("reclaim-reconvey", EXPERTS, 2, 1, STAGING, conveying, TIER, Placer::Tier, false);
+    // Keep 1..EXPERTS in the host tier so only expert 0 reads before
+    // `fix_rounds`, borrowing slot 1. `fix_rounds` then puts [0, 1] into a
+    // single round 0, forcing `reclaim_slots` to yield 0 and re-convey both.
+    {
+        let mut state = residency::lock(&harness.watcher.state);
+        for expert in 1..EXPERTS {
+            let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(
+                0,
+                expert,
+                0,
+                crate::experts::host_records::Taking::Out,
+                crate::experts::host_records::Refuses,
+            ) else {
+                panic!("host tier must have a ready record for expert {expert}");
+            };
+            let record = crate::experts::directory::HostRecord(grant.record());
+            state.core.directory.landed(0, record, expert, None);
+        }
+    }
+
+    let step = harness.prompt_step();
+    let every: Vec<usize> = (0..EXPERTS).collect();
+    harness.publish(&step, 0, &every);
+    eventually("expert 0 never borrowed slot 1", || {
+        let state = residency::lock(&harness.watcher.state);
+        state.scratch.conveyor.whole(0, 0) && state.scratch.conveyor.borrower(1) == Some((0, 0))
+    });
+
+    let rounds = harness.rounds_checked(&step, 0);
+    let converted = Harness::experts(&rounds.concat());
+    assert_eq!(converted, [0, 1], "both reclaimed borrower 0 and host-tier slot owner 1 must convey: rounds={rounds:?}");
+    step.complete().unwrap();
+    harness.retired();
+}

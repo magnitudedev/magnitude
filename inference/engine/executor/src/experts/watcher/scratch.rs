@@ -945,7 +945,7 @@ impl Scratch {
             // conveyor record each (all staging pools share one conveyor).
             let lack_read = self.tiers[..index]
                 .iter()
-                .map(|tier| tier.deferred_experts().filter(|&(_, expert)| !self.waits(core, tier, expert)).count())
+                .map(|tier| tier.deferred_experts().filter(|&(set_idx, expert)| !self.waits(core, tier, set_idx, expert)).count())
                 .sum::<usize>();
             let free_conveyor = |conveyor: &Conveyor, core: &Core| {
                 conveyor.free_conveyor(layer, |record| Self::admits_conveyor(conveyor, core, layer, record))
@@ -953,7 +953,7 @@ impl Scratch {
             // Those the host tier keeps whole, or lands, take no record.
             let mut deferred = self.tiers[index]
                 .deferred_experts()
-                .filter(|&(_, expert)| !self.waits(core, &self.tiers[index], expert))
+                .filter(|&(set_idx, expert)| !self.waits(core, &self.tiers[index], set_idx, expert))
                 .collect::<Vec<_>>();
             let tier = &self.tiers[index];
             deferred.sort_by_key(|&(set_idx, expert)| tier.order(set_idx, expert));
@@ -1145,8 +1145,9 @@ impl Scratch {
     /// ([`Self::lendable_slot`], [`compose_rounds`]), but for a round
     /// that could not be filled otherwise, or a failed step's experts moved
     /// to later steps.
-    fn reclaim_slots(&mut self, chunk: &[usize], lw: usize) -> bool {
+    fn reclaim_slots(&mut self, chunk: &[usize], lw: usize) -> (bool, bool) {
         let mut free = true;
+        let mut yielded = false;
         for &expert in chunk {
             let slot = expert % lw;
             let Some((layer, borrower)) = self.conveyor.borrower(slot) else {
@@ -1157,23 +1158,27 @@ impl Scratch {
                 Some(State::Held { .. }) => {
                     let index = self.tiers.iter().position(|tier| tier.layer == layer).expect("a carried expert's tier");
                     self.yield_record(index, borrower);
+                    yielded = true;
                 }
                 Some(State::Reading { .. }) => free = false,
                 None => unreachable!("scratch slot {slot} carries expert {borrower} of layer {layer}, which the conveyor does not"),
             }
         }
-        free
+        (free, yielded)
     }
 
-    /// Whether deferred expert `expert` of `tier` comes from the host tier,
-    /// taking no record: beside a host tier (where the device places), the
-    /// tier keeps it whole, or a landing into it is in flight (a read
-    /// ahead's, `Scratch::awaited`), which the tier copy reads once landed,
-    /// in a record the group may read (`Directory::tier_serves`: none a
-    /// decode step cut in during the group landed). No expert is read
-    /// twice.
-    fn waits(&self, core: &Core, tier: &Tier, expert: usize) -> bool {
-        copies_from_tier(core)
+    /// Whether deferred expert `(set_idx, expert)` of `tier` comes from the
+    /// host tier, taking no conveyor record: it has not yet been committed to
+    /// a conveyor round (`fix_rounds`), and beside a host tier (where the
+    /// device places), the tier keeps it whole or a landing into it is in
+    /// flight (a read ahead's, `Scratch::awaited`), which the tier copy reads
+    /// once landed, in a record the group may read (`Directory::tier_serves`:
+    /// none a decode step cut in during the group landed). Once `fix_rounds`
+    /// schedules an expert into a round (`ColdStage::Scheduled`), the tier
+    /// copy list is already published and only the conveyor can deliver it.
+    fn waits(&self, core: &Core, tier: &Tier, set_idx: usize, expert: usize) -> bool {
+        tier.sets[set_idx].experts[expert].round().is_none()
+            && copies_from_tier(core)
             && self.conveyor.serving.is_some_and(|serving| core.directory.tier_serves(tier.layer, expert, serving.group.last()))
     }
 
@@ -1190,7 +1195,7 @@ impl Scratch {
     pub(super) fn awaited<'a>(&'a self, core: &'a Core) -> impl Iterator<Item = Staged> + 'a {
         self.tiers.iter().flat_map(move |tier| {
             tier.deferred_experts()
-                .filter(move |&(_, expert)| copies_from_tier(core) && core.directory.lands(tier.layer, expert))
+                .filter(move |&(set_idx, expert)| self.waits(core, tier, set_idx, expert) && core.directory.lands(tier.layer, expert))
                 .map(move |(_, expert)| (tier.layer, expert))
         })
     }
@@ -1726,8 +1731,14 @@ impl Scratch {
             // A slot carrying a borrower's stored bytes is reclaimed before
             // the round's first entry, which may convert into it; once one
             // is appended, its borrowers are listed, at an earlier round.
-            if rounds.appended.is_empty() && !self.reclaim_slots(&chunk, lw) {
-                return self.unfinished(at, rounds, &chunk, shared);
+            if rounds.appended.is_empty() {
+                let (free, yielded) = self.reclaim_slots(&chunk, lw);
+                if yielded {
+                    self.convey(core, shared);
+                }
+                if !free {
+                    return self.unfinished(at, rounds, &chunk, shared);
+                }
             }
             for &expert in &chunk {
                 if rounds.appended.contains(&expert) || !self.conveyor.whole(layer, expert) {
