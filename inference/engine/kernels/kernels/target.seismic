@@ -100,12 +100,12 @@ fn conditioning_overlay[M, D](input: &tensor[M, D] f32, out: &mut tensor[M, D] f
 
 native conditioning_overlay for metal from "metal/conditioning_overlay.metal":
     launch conditioning_overlay:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threadgroups (ceil_div(D, 1024), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native conditioning_overlay for cuda from "cuda/conditioning_overlay.cu":
     launch conditioning_overlay:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threadgroups (ceil_div(D, 1024), min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)
 
 # Vulkan: the RMS inverse is a launch of its own (it returns at once when

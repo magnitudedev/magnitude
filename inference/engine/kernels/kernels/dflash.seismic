@@ -359,12 +359,12 @@ native draft_convolve_residual for cpu from "cpu/draft_convolve_residual.rs":
 
 native draft_gated_rows for metal from "metal/draft_gated_rows.metal":
     launch draft_gated_rows:
-        threadgroups (ceil_div(M * F, 256), 1, 1)
+        threadgroups (ceil_div(F, 1024), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_gated_rows for cuda from "cuda/draft_gated_rows.cu":
     launch draft_gated_rows:
-        threadgroups (ceil_div(M * F, 256), 1, 1)
+        threadgroups (ceil_div(F, 1024), min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_gated_rows for vulkan from "vulkan/draft_gated_rows.comp":
