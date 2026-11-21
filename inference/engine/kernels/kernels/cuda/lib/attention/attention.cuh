@@ -459,24 +459,55 @@ __device__ __forceinline__ void publish(const Heads<H> &state, float *exchange, 
             warp_stats[(warp * H + h) * 2 + 1] = state.denominator[h];
         }
     }
+    constexpr int STAT_STRIDE = SLICES * H * 2;
 #pragma unroll
     for (int h = 0; h < H; ++h) {
         __syncthreads();
         element::f32_span_store(exchange + warp * W + lane * DPL, state.accumulator[h]);
+        if (threadIdx.x < SLICES) {
+            const int slice = static_cast<int>(threadIdx.x);
+            float *stats = warp_stats + (slice * H + h) * 2;
+            float group_max[GROUPS];
+            float group_denom[GROUPS];
+            float maximum = -__int_as_float(0x7f800000);
+#pragma unroll
+            for (int g = 0; g < GROUPS; ++g) {
+                const float m = stats[g * STAT_STRIDE + 0];
+                const float l = stats[g * STAT_STRIDE + 1];
+                group_max[g] = m;
+                group_denom[g] = l;
+                if (l > 0.0f) maximum = fmaxf(maximum, m);
+            }
+            float denominator = 0.0f;
+#pragma unroll
+            for (int g = 0; g < GROUPS; ++g) {
+                const float l = group_denom[g];
+                float weight = 0.0f;
+                if (l > 0.0f) {
+                    weight = seismic_ex2_approx(group_max[g] - maximum);
+                    denominator = __fmaf_rn(l, weight, denominator);
+                }
+                stats[g * STAT_STRIDE] = weight;
+            }
+            const u64 at = (row * KV * G + kv * G + slice * H + h) * PARTS + part;
+            reinterpret_cast<float2 *>(statistics)[at] = make_float2(maximum, denominator);
+        }
         __syncthreads();
         for (int item = threadIdx.x; item < SLICES * W; item += WARPS * 32) {
             const int slice = item / W;
             const int column = item % W;
             const u64 at = (row * KV * G + kv * G + slice * H + h) * PARTS + part;
-            float denominator, accumulator;
-            const float maximum = merge(warp_stats + (slice * H + h) * 2, SLICES * H * 2,
-                                        exchange + slice * W + column, SLICES * W, GROUPS,
-                                        denominator, accumulator);
-            partials[at * W + column] = accumulator;
-            if (column == 0) {
-                statistics[at * 2 + 0] = maximum;
-                statistics[at * 2 + 1] = denominator;
+            const float *weights = warp_stats + (slice * H + h) * 2;
+            const float *values = exchange + slice * W + column;
+            float accumulator = 0.0f;
+#pragma unroll
+            for (int g = 0; g < GROUPS; ++g) {
+                const float weight = weights[g * STAT_STRIDE];
+                if (weight > 0.0f) {
+                    accumulator = __fmaf_rn(weight, values[g * SLICES * W], accumulator);
+                }
             }
+            partials[at * W + column] = accumulator;
         }
     }
 }
