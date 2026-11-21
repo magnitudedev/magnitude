@@ -654,9 +654,10 @@ __device__ __forceinline__ void prepare(const Inputs &in, const History &history
                                         u16 *keys, u16 *values, rounding::Rounding trained) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     typedef Operands<History> Ops;
-    __shared__ float exchange[8][W];
+    __shared__ float exchange[head_layout::NEEDS_EXCHANGE ? 8 * W : 1];
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
+    float *own = head_layout::NEEDS_EXCHANGE ? exchange + warp * W : exchange;
     const u64 item = static_cast<u64>(blockIdx.x) * 8 + warp;
     const u64 heads = KV * (G + 1);
     if (item >= SEISMIC_DIM_M * heads) return;
@@ -664,7 +665,7 @@ __device__ __forceinline__ void prepare(const Inputs &in, const History &history
     const int head = static_cast<int>(item % heads);
     if (head < KV * G) {
         float x[DPL];
-        prepared_query(in, row, head, x, exchange[warp], lane);
+        prepared_query(in, row, head, x, own, lane);
         u16 *to = queries + (row * KV * G + head) * W + lane * DPL;
 #pragma unroll
         for (int d = 0; d < DPL; ++d) to[d] = Ops::operand(x[d]);
@@ -674,7 +675,7 @@ __device__ __forceinline__ void prepare(const Inputs &in, const History &history
     const int kv = head - KV * G;
     float k[DPL];
     float v[DPL];
-    prepared_key(in, row, kv, k, exchange[warp], lane, trained);
+    prepared_key(in, row, kv, k, own, lane, trained);
     // A stored-key value is the prepared key.
     if constexpr (STORED_KEY) {
 #pragma unroll
