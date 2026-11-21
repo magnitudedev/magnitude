@@ -3421,13 +3421,17 @@ inline void prefill_attend(History history, device const Scalar *query, device c
 // round (one per key partition the round's keys took) fold into the state
 // the window keeps of the rounds before it, by the merge launch's rule
 // (`merge`): a row's state is its rounds' partitions merged in round then
-// partition order. The last round stores the gated output, and the merge
-// launch leaves such a call alone.
+// partition order. Simdgroup 0 computes each row's maximum, prior weight,
+// 32-partition weight chunks in `weights`, and denominator/divisor once per
+// row so all W column threads accumulate partials in ascending partition
+// order. The last round stores the gated output, and the merge launch leaves
+// such a call alone.
 template <uint QT>
 inline void prefill_fold(history_window window, prefill_held held, uint round, device const Scalar *query,
     device const Scalar *gate, element::Out<activation::Act> result, device const float *partials,
-    device const float *statistics, device const uint *counts, ulong M, uint tile, ulong head, uint column,
-    bool softplus, device const float *sinks = nullptr) {
+    device const float *statistics, device const uint *counts, threadgroup float *weights,
+    threadgroup float &shared_kept_weight, threadgroup float &shared_divisor, ulong M, uint tile, ulong head,
+    uint column, bool softplus, device const float *sinks = nullptr) {
     constexpr uint W = ATTENTION_W;
     constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
     // A call of one round stored its results in the attend launch.
@@ -3436,41 +3440,93 @@ inline void prefill_fold(history_window window, prefill_held held, uint round, d
     const uint count = counts[tile];
     device const float *before = window.kept_statistics + (round % 2) * M * H * 2;
     device float *after = window.kept_statistics + ((round + 1) % 2) * M * H * 2;
-    for (ulong row = ulong(tile) * QT; row < metal::min(ulong(tile + 1) * QT, M); ++row) {
+    const ulong start = ulong(tile) * QT;
+    const ulong stop = metal::min(ulong(tile + 1) * QT, M);
+    for (ulong row = start; row < stop; ++row) {
+        if (row > start)
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         const ulong state = row * H + head;
-        const float kept = held.first ? 0.0f : before[state * 2 + 1];
-        float maximum = kept > 0.0f ? before[state * 2] : -INFINITY;
-        for (uint partition = 0; partition < count; ++partition) {
-            const ulong slot = ulong(partition) * M * H + state;
-            if (statistics[slot * 2 + 1] > 0.0f)
-                maximum = metal::max(maximum, statistics[slot * 2]);
-        }
+        float maximum = -INFINITY;
         float denominator = 0.0f;
-        float accumulated = 0.0f;
-        if (kept > 0.0f) {
-            const float weight = metal::fast::exp2(before[state * 2] - maximum);
-            denominator = kept * weight;
-            accumulated = window.kept[state * W + column] * weight;
+        if (column < 32) {
+            const float kept = (column == 0 && !held.first) ? before[state * 2 + 1] : 0.0f;
+            const float kept_max = kept > 0.0f ? before[state * 2] : -INFINITY;
+            maximum = kept_max;
+            for (uint partition = column; partition < count; partition += 32) {
+                const ulong slot = ulong(partition) * M * H + state;
+                if (statistics[slot * 2 + 1] > 0.0f)
+                    maximum = metal::max(maximum, statistics[slot * 2]);
+            }
+            maximum = simd_max(maximum);
+            if (column == 0) {
+                float kept_weight = 0.0f;
+                if (kept > 0.0f) {
+                    kept_weight = metal::fast::exp2(kept_max - maximum);
+                    denominator = kept * kept_weight;
+                }
+                shared_kept_weight = kept_weight;
+                if (count == 0) {
+                    if (held.last)
+                        shared_divisor = divisor(sinks, head, maximum, denominator);
+                    else {
+                        after[state * 2] = maximum;
+                        after[state * 2 + 1] = denominator;
+                    }
+                }
+            }
         }
-        for (uint partition = 0; partition < count; ++partition) {
-            const ulong slot = ulong(partition) * M * H + state;
-            const float d = statistics[slot * 2 + 1];
-            if (d > 0.0f) {
-                const float weight = metal::fast::exp2(statistics[slot * 2] - maximum);
-                denominator = metal::fma(d, weight, denominator);
-                accumulated = metal::fma(partials[slot * W + column], weight, accumulated);
+        float accumulated = 0.0f;
+        if (count == 0) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float kept_weight = shared_kept_weight;
+            if (kept_weight > 0.0f)
+                accumulated = window.kept[state * W + column] * kept_weight;
+        }
+        for (uint base = 0; base < count; base += 32) {
+            if (base > 0)
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (column < 32) {
+                const uint p = base + column;
+                float contrib = 0.0f;
+                if (p < count) {
+                    const ulong slot = ulong(p) * M * H + state;
+                    const float d = statistics[slot * 2 + 1];
+                    const float w = d > 0.0f ? metal::fast::exp2(statistics[slot * 2] - maximum) : 0.0f;
+                    weights[column] = w;
+                    contrib = d > 0.0f ? d * w : 0.0f;
+                }
+                const float chunk_denom = simd_sum(contrib);
+                if (column == 0) {
+                    denominator += chunk_denom;
+                    if (count - base <= 32) {
+                        if (held.last)
+                            shared_divisor = divisor(sinks, head, maximum, denominator);
+                        else {
+                            after[state * 2] = maximum;
+                            after[state * 2 + 1] = denominator;
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (base == 0) {
+                const float kept_weight = shared_kept_weight;
+                if (kept_weight > 0.0f)
+                    accumulated = window.kept[state * W + column] * kept_weight;
+            }
+            const uint chunk = metal::min(count - base, 32u);
+            for (uint i = 0; i < chunk; ++i) {
+                const float w = weights[i];
+                if (w > 0.0f)
+                    accumulated = metal::fma(partials[(ulong(base + i) * M * H + state) * W + column], w, accumulated);
             }
         }
         if (held.last) {
             result.put(state * W + column, gate_output(query, gate, row, head, column,
-                accumulated / divisor(sinks, head, maximum, denominator), softplus));
+                accumulated / shared_divisor, softplus));
             continue;
         }
         window.kept[state * W + column] = accumulated;
-        if (column == 0) {
-            after[state * 2] = maximum;
-            after[state * 2 + 1] = denominator;
-        }
     }
 }
 
