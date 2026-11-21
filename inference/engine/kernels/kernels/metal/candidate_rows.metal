@@ -38,9 +38,12 @@ kernel void candidate_rows(
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint THREADS = 256;
+    constexpr uint SPAN_CACHE_MAX = 1023;
     threadgroup uint totals[8];
+    threadgroup uint pick_sums[2][8];
     // X, and whether the unit X is taken.
     threadgroup uint fill_end[2];
+    threadgroup uint span_cache[SPAN_CACHE_MAX + 1];
     const ulong row = group.x;
     const uint r = uint(SEISMIC_DIM_R);
     const uint b = uint(SEISMIC_DIM_B);
@@ -50,24 +53,37 @@ kernel void candidate_rows(
     device const int *row_spans = spans + row * r * 2;
     device const int *picks = blocks + row * b;
     device int *out = pool + row * ulong(capacity) * 2;
-    uint total = 0;
 
     // The span offsets [R + 1]: the units before each span, then the row's.
-    device uint *span_first = offsets + row * ulong(r + 1);
+    // R == 1 needs no scan or offset table; 1 < R <= 1023 fits in threadgroup
+    // memory; larger R falls back to global scratch.
+    device uint *global_span_first = offsets + row * ulong(r + 1);
+    const bool use_span_cache = r <= SPAN_CACHE_MAX;
     uint units = 0;
-    for (uint base = 0; base < r; base += THREADS) {
-        const uint span = base + thread_index;
-        const uint length = span < r ? indexer::span_length(row_spans[span * 2], row_spans[span * 2 + 1]) : 0u;
-        uint chunk = 0;
-        const uint before = indexer::group_exclusive(length, totals, simd, lane, chunk);
-        if (span < r)
-            span_first[span] = units + before;
-        units += chunk;
-    }
-    if (thread_index == 0) {
-        span_first[r] = units;
-        fill_end[0] = 0;
-        fill_end[1] = 0;
+    if (r == 1) {
+        units = indexer::span_length(row_spans[0], row_spans[1]);
+    } else if (r > 1) {
+        for (uint base = 0; base < r; base += THREADS) {
+            const uint span = base + thread_index;
+            const uint length = span < r ? indexer::span_length(row_spans[span * 2], row_spans[span * 2 + 1]) : 0u;
+            uint chunk = 0;
+            const uint before = indexer::group_exclusive(length, totals, simd, lane, chunk);
+            if (span < r) {
+                if (use_span_cache)
+                    span_cache[span] = units + before;
+                else
+                    global_span_first[span] = units + before;
+            }
+            units += chunk;
+        }
+        if (thread_index == 0) {
+            if (use_span_cache)
+                span_cache[r] = units;
+            else
+                global_span_first[r] = units;
+        }
+        if (!use_span_cache)
+            threadgroup_barrier(mem_flags::mem_device);
     }
 
     // Pick s's block's units [first_unit(s), end_unit(s)), clipped to the row's.
@@ -82,8 +98,18 @@ kernel void candidate_rows(
                 ++count;
                 sum += end_unit(s) - first_unit(s);
             }
-        indexer::group_exclusive(count, totals, simd, lane, valid);
-        indexer::group_exclusive(sum, totals, simd, lane, pooled);
+        const uint simd_valid = simd_sum(count);
+        const uint simd_pooled = simd_sum(sum);
+        if (lane == 0) {
+            pick_sums[0][simd] = simd_valid;
+            pick_sums[1][simd] = simd_pooled;
+        }
+        // Also publishes span_cache[0..r] to the threadgroup.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint w = 0; w < 8; ++w) {
+            valid += pick_sums[0][w];
+            pooled += pick_sums[1][w];
+        }
     }
     const uint wanted = metal::min(k, units);
     const uint fill = wanted > pooled ? wanted - pooled : 0u;
@@ -91,6 +117,8 @@ kernel void candidate_rows(
     // X: the gap of slot s (s <= valid) is the units between the previous
     // pick's block (or 0) and pick s's block (or, for s == valid, the row's
     // end); the F-th unpicked unit lies in the gap whose scan holds F.
+    uint x = 0;
+    bool x_followed = false;
     if (fill > 0) {
         const uint slots = valid + 1;
         const uint share = (slots + THREADS - 1) / THREADS;
@@ -101,47 +129,54 @@ kernel void candidate_rows(
         uint gaps = 0;
         for (uint s = lo; s < hi; ++s)
             gaps += gap_end(s) - gap_first(s);
+        uint total = 0;
         uint before = indexer::group_exclusive(gaps, totals, simd, lane, total);
         for (uint s = lo; s < hi; ++s) {
             const uint first = gap_first(s), end = gap_end(s);
             if (before < fill && fill <= before + end - first) {
-                const uint x = first + (fill - before);
-                fill_end[0] = x;
-                fill_end[1] = x == end && s < valid && x < units ? 1u : 0u;
+                const uint fx = first + (fill - before);
+                fill_end[0] = fx;
+                fill_end[1] = fx == end && s < valid && fx < units ? 1u : 0u;
             }
             before += end - first;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        x = fill_end[0];
+        x_followed = fill_end[1] != 0;
     }
-    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-    const uint x = fill_end[0];
-    const bool x_followed = fill_end[1] != 0;
 
     // This thread's picks [lo, hi) and their ranges; thread 0 first owns
     // [0, X).
     const uint share = (valid + THREADS - 1) / THREADS;
     const uint lo = metal::min(thread_index * share, valid);
     const uint hi = metal::min(lo + share, valid);
+    auto span_at = [&](uint i) -> uint { return use_span_cache ? span_cache[i] : global_span_first[i]; };
     // Visits each piece of the range [a, e) in unit order: its units [at,
-    // stop), its span, and whether it opens and closes an entry.
+    // stop), its span and offset, and whether it opens and closes an entry.
     auto pieces = [&](uint a, uint e, bool preceded, bool followed, auto visit) {
+        if (r == 1) {
+            visit(a, e, 0u, 0u, !preceded, !followed);
+            return;
+        }
         // The span holding `a` (a < units): the last whose offset is at most
         // it, which holds units.
         uint span = 0;
         for (uint high = r - 1; span < high;) {
             const uint middle = (span + high + 1) / 2;
-            if (span_first[middle] <= a)
+            if (span_at(middle) <= a)
                 span = middle;
             else
                 high = middle - 1;
         }
         for (uint at = a; at < e;) {
-            while (at >= span_first[span + 1])
+            while (at >= span_at(span + 1))
                 ++span;
-            const uint span_end = span_first[span + 1];
+            const uint offset = span_at(span);
+            const uint span_end = span_at(span + 1);
             const uint stop = metal::min(e, span_end);
-            const bool opens = at == span_first[span] || (at == a && !preceded);
+            const bool opens = at == offset || (at == a && !preceded);
             const bool closes = stop == span_end || !followed;
-            visit(at, stop, span, opens, closes);
+            visit(at, stop, span, offset, opens, closes);
             at = stop;
         }
     };
@@ -162,12 +197,11 @@ kernel void candidate_rows(
     };
 
     uint opened = 0;
-    ranges([&](uint, uint, uint, bool opens, bool) { opened += opens ? 1u : 0u; });
+    ranges([&](uint, uint, uint, uint, bool opens, bool) { opened += opens ? 1u : 0u; });
     uint count = 0;
     uint entry = indexer::group_exclusive(opened, totals, simd, lane, count);
-    ranges([&](uint at, uint stop, uint span, bool opens, bool closes) {
+    ranges([&](uint at, uint stop, uint span, uint offset, bool opens, bool closes) {
         const int row_lo = row_spans[span * 2];
-        const uint offset = span_first[span];
         if (opens) {
             if (entry < capacity)
                 out[entry * 2] = row_lo + int(at - offset);
