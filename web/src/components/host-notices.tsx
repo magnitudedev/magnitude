@@ -5,7 +5,7 @@ import type { HostNotice } from "@magnitudedev/client-common"
 import { useSession } from "../session"
 import { ErrorNotice, NoticeAction } from "./error-notice"
 
-/** Above every dialog layer (dialogs use z-50), so a notice raised while the Add dialog is open, like an invalid magnitude:// link, stays visible and dismissable. */
+/** Above every dialog layer (dialogs use z-50), so a notice raised while the Add dialog is open stays visible and dismissable. */
 export const hostNoticeLayer = "z-[60]"
 
 export function HostNoticeStack({ notices, onDismiss }: { notices: readonly HostNotice[]; onDismiss: (notice: HostNotice) => void }) {

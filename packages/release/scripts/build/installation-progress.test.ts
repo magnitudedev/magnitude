@@ -26,7 +26,8 @@ describe.skipIf(process.platform === "win32")("Unix installer progress", () => {
       writeFileSync(join(bin, "launchctl"), '#!/bin/sh\nexit "${TEST_NO_GUI:-0}"\n', { mode: 0o700 })
       writeFileSync(join(resources, "magnitude"), '#!/bin/sh\nprintf "%s\n" "$*" > "$TEST_LAUNCH"\nexit "${TEST_LAUNCH_FAILS:-0}"\n', { mode: 0o700 })
       symlinkSync(join(resources, "magnitude"), join(bin, "magnitude"))
-      const open = template.slice(template.indexOf("open_desktop() {"), template.indexOf('\ncase "$(uname -s)" in')).replace("/bin/launchctl", "launchctl")
+      const start = template.indexOf("open_desktop() {")
+      const open = template.slice(start, template.indexOf("\n}\n", start) + 3).replace("/bin/launchctl", "launchctl")
       const body = `scratch=$TEST_SCRATCH\ndestination=$TEST_DESTINATION\n${open}\nopen_desktop macos`
       const environment = { PATH: `${bin}:${process.env.PATH}`, TEST_SCRATCH: root, TEST_DESTINATION: join(root, "Magnitude.app"), TEST_LAUNCH: join(root, "launched"), SSH_CONNECTION: "", SSH_CLIENT: "", SSH_TTY: "" }
       const skipped = shell(body, { ...environment, TEST_NO_GUI: "1" })

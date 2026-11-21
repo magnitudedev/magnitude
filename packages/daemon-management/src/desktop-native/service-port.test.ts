@@ -2,7 +2,7 @@ import { createServer } from "node:http"
 import { Effect, Either, Option } from "effect"
 import { expect, it } from "vitest"
 import { OwnedChildSpawner, OwnedChildSpawnFailed } from "./owned-child"
-import { occupiedMessage, requireServicePort } from "./service-port"
+import { occupiedMessage, requireServicePort, servicePortLingering } from "./service-port"
 
 const command = { output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test-service", arguments: [], environment: {} }
 const reachedChild = new OwnedChildSpawnFailed({ executable: command.executable, message: "Reached child creation" })
@@ -73,6 +73,18 @@ it("words another Magnitude server's advice for the platform", () => {
   expect(occupiedMessage(10100, true, "win32")).toContain("nssm stop Magnitude")
   expect(occupiedMessage(10100, true, "linux")).toContain("sudo systemctl stop magnitude")
   expect(occupiedMessage(10100, true, "linux")).not.toContain("NSSM")
-  expect(occupiedMessage(10100, true, "darwin")).toContain("magnitude server remove")
+  expect(occupiedMessage(10100, true, "darwin")).toContain("stop its service")
+  expect(occupiedMessage(10100, true, "darwin")).not.toContain("server remove")
   expect(occupiedMessage(10100, true, "darwin")).not.toContain("NSSM")
+})
+
+it("does not take a free port or a listening one for a port that is still being released", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const server = yield* listener
+    const address = server.address()
+    const port = typeof address === "object" && address ? address.port : 0
+    expect(yield* servicePortLingering(port)).toBe(false)
+    yield* Effect.async<void>(resume => { server.close(() => resume(Effect.void)) })
+    expect(yield* servicePortLingering(port)).toBe(false)
+  })))
 })

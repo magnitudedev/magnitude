@@ -18,8 +18,8 @@ export const parseDockerArchitecture = (value: string): Effect.Effect<DockerArch
 export const releaseHostOf = (architecture: DockerArchitecture) =>
   architecture === "amd64" ? "linux-x64-gnu" as const : "linux-arm64-gnu" as const
 
-/** The release manifest's id for a host's Debian package. */
-export const debArtifactId = (architecture: DockerArchitecture) => `desktop-${releaseHostOf(architecture)}-deb`
+/** The release manifest's id for a host's CLI-only payload, which the image installs. */
+export const cliOnlyArtifactId = (architecture: DockerArchitecture) => `cli-only-${releaseHostOf(architecture)}`
 
 /**
  * Every release is tagged with its version. A stable release also moves `latest`; a prerelease moves

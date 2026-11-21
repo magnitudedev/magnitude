@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { Chunk, Effect, Fiber, Option, Stream } from "effect"
-import { HuggingFaceRepositoryIdSchema } from "@magnitudedev/sdk/desktop-host"
+import { Chunk, Effect, Fiber, Stream } from "effect"
 import { makeHostActions } from "./host-actions"
 
 const first = <A, E>(stream: Stream.Stream<A, E>, count: number) => Stream.runCollect(Stream.take(stream, count)).pipe(Effect.map(Chunk.toArray))
@@ -11,7 +10,6 @@ const nothingWithin = <A, E>(stream: Stream.Stream<A, E>) => Effect.scoped(Effec
   yield* Fiber.interrupt(fiber)
   return done._tag === "None"
 }))
-const repository = HuggingFaceRepositoryIdSchema.make("owner/repo")
 
 describe("host actions", () => {
   it("asks a renderer for no page until one is asked for, so the renderer decides where it opens", () => Effect.runPromise(Effect.gen(function* () {
@@ -35,11 +33,4 @@ describe("host actions", () => {
     expect(yield* nothingWithin(actions.subscribe)).toBe(true)
   }))))
 
-  it("gives a model link and its page to a renderer that subscribes after them", () => Effect.runPromise(Effect.gen(function* () {
-    const actions = yield* makeHostActions
-    const open = { _tag: "OpenHuggingFaceModel" as const, repository, file: Option.none() }
-    yield* actions.navigate("models")
-    yield* actions.openModel(open)
-    expect(yield* first(actions.subscribe, 2)).toEqual([{ _tag: "Navigate", page: "models" }, open])
-  })))
 })

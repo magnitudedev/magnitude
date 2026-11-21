@@ -14,20 +14,32 @@ artifacts.push(Schema.decodeUnknownSync(ReleaseArtifactSchema)({
   id: "desktop-windows-x64-msvc", kind: "desktop", host: "windows-x64-msvc",
   filename: "magnitude-desktop-windows-x64-2.0.0.exe", bytes: 123, sha256: "b".repeat(64),
 }))
+const windows = artifacts.length - 1
+const hosts = ["darwin-arm64", "darwin-x64", "linux-arm64-gnu", "linux-x64-gnu", "windows-x64-msvc"] as const
+artifacts.push(...hosts.map(host => Schema.decodeUnknownSync(ReleaseArtifactSchema)({
+  id: `cli-only-${host}`, kind: "desktop", host, filename: `magnitude-cli-only-${host}.tar.gz`, bytes: 123, sha256: "b".repeat(64),
+})))
+const cliOnly = (host: typeof hosts[number]) => artifacts.findIndex(artifact => artifact.id === `cli-only-${host}`)
 const release = { version: "2.0.0", sourceCommit: commit, artifacts }
 describe("production desktop publication admission", () => {
   it("preserves exact accepted byte identities across Mac, Linux, and Windows transports", async () => {
     const result = await Effect.runPromise(hostedDesktopManifests(release, commit))
-    expect(result).toHaveLength(10)
-    expect(new Set(result.map(m => `${m.artifact.target.os}/${m.artifact.target.arch}/${m.artifact.target.package}`)).size).toBe(10)
+    expect(result).toHaveLength(15)
+    expect(new Set(result.map(m => `${m.artifact.target.os}/${m.artifact.target.arch}/${m.artifact.target.package}`)).size).toBe(15)
     expect(result[pacman]!.artifact.target).toEqual({ os: "linux", arch: "x64", package: "pacman" })
-    expect(result.at(-1)!.artifact.target).toEqual({ os: "windows", arch: "x64", package: "windows-exe" })
+    expect(result[windows]!.artifact.target).toEqual({ os: "windows", arch: "x64", package: "windows-exe" })
+    expect(result[cliOnly("darwin-x64")]!.artifact.target).toEqual({ os: "darwin", arch: "x64", package: "cli-only" })
+    expect(result[cliOnly("linux-arm64-gnu")]!.artifact.target).toEqual({ os: "linux", arch: "arm64", package: "cli-only" })
+    expect(result[cliOnly("windows-x64-msvc")]!.artifact.target).toEqual({ os: "windows", arch: "x64", package: "cli-only" })
     result.forEach((manifest, index) => expect(manifest.artifact).toMatchObject({ id: artifacts[index]!.id, bytes: 123, sha256: "b".repeat(64), filename: artifacts[index]!.filename }))
   })
   it.each([
     ["missing transport", artifacts.slice(1)],
-    ["missing Windows installer", artifacts.slice(0, -1)],
-    ["wrong Windows format", [...artifacts.slice(0, -1), { ...artifacts.at(-1)!, filename: "magnitude.windows-exe" }]],
+    ["missing Windows installer", artifacts.filter((_, index) => index !== windows)],
+    ["wrong Windows format", artifacts.map((artifact, index) => index === windows ? { ...artifact, filename: "magnitude.windows-exe" } : artifact)],
+    ["missing CLI-only payload", artifacts.filter((_, index) => index !== cliOnly("linux-x64-gnu"))],
+    ["CLI-only payload without its archive suffix", artifacts.map((artifact, index) => index === cliOnly("darwin-arm64") ? { ...artifact, filename: "magnitude-cli-only.zip" } : artifact)],
+    ["CLI-only payload on another host", artifacts.map((artifact, index) => index === cliOnly("windows-x64-msvc") ? { ...artifact, host: artifacts[cliOnly("linux-x64-gnu")]!.host } : artifact)],
     ["duplicate identity", [...artifacts.slice(1), artifacts[1]!]],
     ["mismatched host", [{ ...artifacts[0]!, host: artifacts[2]!.host }, ...artifacts.slice(1)]],
     ["wrong format", [{ ...artifacts[0]!, filename: "magnitude.zip" }, ...artifacts.slice(1)]],

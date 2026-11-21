@@ -17,7 +17,7 @@ const terminalMessage: Record<typeof ForegroundFailureReason.Type, string> = {
   install: "The package manager could not install the update. Check the package manager status before retrying `magnitude update install`.",
 }
 const serverMessage: Record<typeof ForegroundFailureReason.Type, string> = {
-  authorization: "The server's permission to run the update installer was refused. Run `magnitude server setup` to restore it, then `magnitude update download` to retry.",
+  authorization: "The server's permission to run the update installer was refused. Stop the server and run `magnitude update install` as an administrator.",
   verify: "The downloaded update failed verification. Run `magnitude update download` to download it again.",
   install: "The package manager could not install the update. Check the package manager status, then run `magnitude update download` to retry; the server installs it once it is idle.",
 }

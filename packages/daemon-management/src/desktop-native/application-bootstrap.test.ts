@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest"
-import { mkdtemp, mkdir, writeFile, symlink, rm } from "node:fs/promises"
+import { mkdtemp, mkdir, writeFile, symlink, rm, realpath } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { NodeContext } from "@effect/platform-node"
 import { Effect } from "effect"
 import { applicationNativeHostPath, applicationServiceCommand, resolveApplicationProfile, resolveInstalledApplicationRuntime, type ApplicationRuntime } from "./application-bootstrap"
 
-const installed: ApplicationRuntime = { _tag: "Installed", resourcesDirectory: "/Applications/Magnitude.app/Contents/Resources" }
+const installed: ApplicationRuntime = { _tag: "Installed", resourcesDirectory: "/Applications/Magnitude.app/Contents/Resources", layout: "Desktop" }
 const development: ApplicationRuntime = { _tag: "Development", repository: "/work/Magnitude Source" }
 
 describe("application bootstrap selection", () => {
@@ -28,23 +28,33 @@ describe("application bootstrap selection", () => {
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
+  it("recognises a standalone installation through its command link, and only with its service beside it", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "magnitude-standalone-runtime-")))
+    try {
+      const version = join(root, "cli", "1.0.0")
+      await mkdir(version, { recursive: true })
+      await mkdir(join(root, "bin"))
+      await writeFile(join(version, "magnitude"), "")
+      await symlink(join(version, "magnitude"), join(root, "bin", "magnitude"))
+      const resolve = () => Effect.runPromise(resolveInstalledApplicationRuntime(join(root, "bin", "magnitude"), "linux").pipe(Effect.either, Effect.provide(NodeContext.layer)))
+      expect((await resolve())._tag).toBe("Left")
+      await writeFile(join(version, "magnitude-service"), "")
+      const resolved = await resolve()
+      expect(resolved._tag === "Right" && resolved.right).toEqual({ _tag: "Installed", resourcesDirectory: version, layout: "Standalone" })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it("preserves production, development and acceptance profile isolation", () => {
     const select = (runtime: ApplicationRuntime, acceptance = false, environment: Record<string, string> = {}) =>
-      resolveApplicationProfile({ runtime, acceptance, environment, home: "/home/user", platform: "linux", server: false })
-    expect(select(installed)).toEqual({ dataDirectory: "/home/user/.magnitude", isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100", sharedControl: false })
+      resolveApplicationProfile({ runtime, acceptance, environment, home: "/home/user", platform: "linux" })
+    expect(select(installed)).toEqual({ dataDirectory: "/home/user/.magnitude", isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100" })
     expect(select(development)).toMatchObject({ dataDirectory: "/home/user/.magnitude-desktop-dev", isolated: true, port: 11101 })
     expect(select(installed, true)).toMatchObject({ dataDirectory: "/home/user/.magnitude-update-acceptance", isolated: true, port: 11143 })
     expect(select(installed, false, { MAGNITUDE_DEV_DATA_DIR: "/isolated", MAGNITUDE_DEV_PORT: "12345" }))
-      .toEqual({ dataDirectory: "/isolated", isolated: true, port: 12345, endpoint: "http://127.0.0.1:12345", sharedControl: false })
+      .toEqual({ dataDirectory: "/isolated", isolated: true, port: 12345, endpoint: "http://127.0.0.1:12345" })
     expect(select(installed, false, { MAGNITUDE_DEV_PORT: "12345" }).port).toBe(10100)
-  })
-
-  it("selects the shared server profile only for an installed, non-acceptance runtime", () => {
-    const select = (runtime: ApplicationRuntime, acceptance = false) =>
-      resolveApplicationProfile({ runtime, acceptance, environment: {}, home: "/home/user", platform: "linux", server: true })
-    expect(select(installed)).toEqual({ dataDirectory: "/var/lib/magnitude", isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100", sharedControl: true })
-    expect(select(development).dataDirectory).toBe("/home/user/.magnitude-desktop-dev")
-    expect(select(installed, true).dataDirectory).toBe("/home/user/.magnitude-update-acceptance")
   })
 
   it.each([
@@ -52,9 +62,9 @@ describe("application bootstrap selection", () => {
     ["linux", "/usr/lib/magnitude-desktop/resources", "/usr/lib/magnitude-desktop/resources/magnitude-service"],
     ["win32", "C:\\Users\\Test User\\Magnitude\\resources", "C:\\Users\\Test User\\Magnitude\\resources\\magnitude-service.exe"],
   ])("uses matched installed resources on %s", (platform, resourcesDirectory, executable) => {
-    const runtime: ApplicationRuntime = { _tag: "Installed", resourcesDirectory }
+    const runtime: ApplicationRuntime = { _tag: "Installed", resourcesDirectory, layout: "Desktop" }
     const environment = Object.freeze({ KEEP: "unchanged", MAGNITUDE_ICN_PATH: "/explicit/engine" })
-    const profile = resolveApplicationProfile({ runtime, platform, home: platform === "win32" ? "C:\\Users\\Test User" : "/home/user", acceptance: false, environment, server: false })
+    const profile = resolveApplicationProfile({ runtime, platform, home: platform === "win32" ? "C:\\Users\\Test User" : "/home/user", acceptance: false, environment })
     const command = applicationServiceCommand({ output: "DiagnosticTail", runtime, profile, platform, architecture: "x64", environment })
     expect(command.executable).toBe(executable)
     expect(command.arguments).toEqual(["serve", "--data-dir", profile.dataDirectory, "--port", "10100"])
@@ -62,17 +72,8 @@ describe("application bootstrap selection", () => {
     expect(environment).not.toHaveProperty("MAGNITUDE_NATIVE_HOST")
   })
 
-  it("marks the server profile's service so it never writes harness configuration", () => {
-    const runtime: ApplicationRuntime = { _tag: "Installed", resourcesDirectory: "/usr/lib/magnitude-desktop/resources" }
-    const command = (server: boolean) => applicationServiceCommand({ output: "Foreground", runtime, platform: "linux", architecture: "x64", environment: {},
-      profile: resolveApplicationProfile({ runtime, home: "/home/ada", platform: "linux", acceptance: false, environment: {}, server }) })
-    expect(command(true).environment.MAGNITUDE_SERVER_SERVICE).toBe("1")
-    expect(command(true).arguments).toEqual(["serve", "--data-dir", "/var/lib/magnitude", "--port", "10100"])
-    expect(command(false).environment).not.toHaveProperty("MAGNITUDE_SERVER_SERVICE")
-  })
-
   it("runs development source with the chosen runtime and preserves explicit engine selection", () => {
-    const profile = resolveApplicationProfile({ runtime: development, home: "/home/user", platform: "darwin", acceptance: false, environment: {}, server: false })
+    const profile = resolveApplicationProfile({ runtime: development, home: "/home/user", platform: "darwin", acceptance: false, environment: {} })
     const options = { output: "DiagnosticTail" as const, runtime: development, profile, platform: "darwin", architecture: "arm64" }
     const command = applicationServiceCommand({ ...options, environment: { MAGNITUDE_BUN_PATH: "/tools/bun" } })
     expect(command.executable).toBe("/tools/bun")

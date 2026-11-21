@@ -4,15 +4,15 @@ import { LinuxPackageFormat } from "../linux-package"
 import { isNewerVersion, isValidVersion, admittedChannels, releaseChannelOf } from "../client-update/release-channels"
 
 export const ReleaseTarget = Schema.Union(
-  Schema.Struct({ os: Schema.Literal("darwin"), arch: Schema.Literal("arm64", "x64"), package: Schema.Literal("mac-zip", "dmg") }),
-  Schema.Struct({ os: Schema.Literal("windows"), arch: Schema.Literal("x64"), package: Schema.Literal("windows-exe") }),
-  Schema.Struct({ os: Schema.Literal("linux"), arch: Schema.Literal("arm64", "x64"), package: LinuxPackageFormat }),
+  Schema.Struct({ os: Schema.Literal("darwin"), arch: Schema.Literal("arm64", "x64"), package: Schema.Literal("mac-zip", "dmg", "cli-only") }),
+  Schema.Struct({ os: Schema.Literal("windows"), arch: Schema.Literal("x64"), package: Schema.Literal("windows-exe", "cli-only") }),
+  Schema.Struct({ os: Schema.Literal("linux"), arch: Schema.Literal("arm64", "x64"), package: Schema.Union(LinuxPackageFormat, Schema.Literal("cli-only")) }),
 )
 export type ReleaseTarget = typeof ReleaseTarget.Type
 
-/** The release an installation is offered. A Docker image is built from the DEB, so it is offered the DEB's release. */
+/** The release an installation is offered. A Docker image is built from the CLI-only payload, so it is offered that release. */
 export const releaseTargetOf = (installation: { readonly os: string; readonly arch: string; readonly package: string }) =>
-  Schema.decodeUnknown(ReleaseTarget)({ os: installation.os, arch: installation.arch, package: installation.package === "docker" ? "deb" : installation.package })
+  Schema.decodeUnknown(ReleaseTarget)({ os: installation.os, arch: installation.arch, package: installation.package === "docker" ? "cli-only" : installation.package })
 
 const ReleaseContent = Schema.Struct({
   version: Schema.String.pipe(Schema.maxLength(96), Schema.pattern(/^[a-zA-Z0-9.+-]+$/), Schema.filter(isValidVersion)),
@@ -67,6 +67,7 @@ export const updateInstallerFilename = (target: ReleaseTarget): string => {
   switch (target.package) {
     case "mac-zip": return "magnitude.zip"
     case "windows-exe": return "magnitude-setup.exe"
+    case "cli-only": return "magnitude-cli-only.tar.gz"
     default: return `magnitude.${target.package}`
   }
 }

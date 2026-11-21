@@ -12,7 +12,7 @@ export interface ApplicationRouter {
    */
   readonly visit: Atom.Atom<number>
   readonly navigate: (page: ApplicationPage) => Effect.Effect<void>
-  /** Opens the page the app starts on, unless something has navigated already or the window opened on a deep link. */
+  /** Opens the page the app starts on, unless something has navigated already, such as the tray asking for a page. */
   readonly land: (page: ApplicationPage) => Effect.Effect<void>
 }
 export const ApplicationRouter = Context.GenericTag<ApplicationRouter>("client/ApplicationRouter")

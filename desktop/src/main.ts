@@ -1,12 +1,11 @@
-import { isServerRunning, resolveServerConflict } from "./server-conflict"
 import { windowChrome, windowControlColors } from "./window-chrome"
 import { raiseWindow } from "./window-raise"
-import { makeMacCliRegistration } from "@magnitudedev/daemon-management/desktop-native"
+import { absorbStandaloneInstallation, makeMacCliRegistration } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
 import { makeHostActions } from "./host-actions"
 import { UpdateSetupRefused, updateSetupReason } from "./update-setup"
-import { startupFailureDetail } from "./startup-failure"
+import { runsFromDiskImage, startupFailureDetail } from "./startup-failure"
 import { nativeQuitFailureDecision, resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
 import { buildTrayMenu, MODEL_STATUS_ITEM } from "./tray-menu"
@@ -31,7 +30,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, po
 import { join, resolve, dirname } from "node:path"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
-import { Cause, Context, Deferred, Duration, Effect, Either, Exit, Fiber, FiberId, Layer, Option, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
+import { Cause, Context, Deferred, Duration, Effect, Either, Exit, Fiber, Layer, Option, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import {
   acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, NativeHost, nativeHostLayer,
@@ -55,8 +54,6 @@ import { resolveHarnessEnvironment } from "@magnitudedev/harness-connections"
 import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { MAGNITUDE_VERSION } from "@magnitudedev/version"
 import { desktopLogLayer } from "./desktop-log"
-import { deepLinkArgument, isDeepLinkArgument, parseDeepLink } from "./deep-link"
-import { registerDevelopmentProtocolClient } from "./protocol-registration"
 
 app.setName("Magnitude")
 if (process.platform === "win32") app.setAppUserModelId(WINDOWS_APPLICATION_ID)
@@ -64,11 +61,10 @@ const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, "../../..")
 const background = process.argv.includes("--background") || (process.platform === "darwin" && app.isPackaged && app.getLoginItemSettings({ type: "mainAppService" }).wasOpenedAtLogin)
 const applicationRuntime: ApplicationRuntime = app.isPackaged
-  ? { _tag: "Installed", resourcesDirectory: process.resourcesPath }
+  ? { _tag: "Installed", resourcesDirectory: process.resourcesPath, layout: "Desktop" }
   : { _tag: "Development", repository: root }
-// The desktop app always uses the person's own profile, even where the server profile is set up.
 const profile = resolveApplicationProfile({ runtime: applicationRuntime, home: homedir(), platform: process.platform,
-  acceptance: isUpdateAcceptanceBuild, environment: process.env, server: false })
+  acceptance: isUpdateAcceptanceBuild, environment: process.env })
 const { isolated: isolatedProfile, dataDirectory: dataDir, port, endpoint } = profile
 const stateOverride = process.env.MAGNITUDE_DESKTOP_STATE_DIR
 // Chromium can create its profile before native ownership is acquired. Keep it outside the
@@ -85,20 +81,12 @@ let startupMacUpdate = false
 let macUpdateOperation: "Install" | "Recover" = "Install"
 let startupUpdateDeferred = false
 let reopenAfterUpdate = false
-// Quit before the main runtime starts, including from the server conflict screen.
-const earlyQuit = Deferred.unsafeMake<void>(FiberId.none)
-let requestQuit: () => void = () => { earlyQuitRequested = true; Deferred.unsafeDone(earlyQuit, Exit.void) }
+// Quit before the main runtime starts.
+let requestQuit: () => void = () => { earlyQuitRequested = true }
 app.on("before-quit", event => { if (!exiting) { event.preventDefault(); requestQuit() } })
 // OS-requested termination must retire the owned service before Electron exits.
 if (process.platform !== "win32") process.on("SIGTERM", () => requestQuit())
 app.on("window-all-closed", () => {})
-// Windows and Linux pass a `magnitude://` link to a new launch; macOS delivers it as an event, even at
-// cold start, before the app is ready. A link received before the owner can open it waits, like
-// the requested page.
-const launchLink = deepLinkArgument(process.argv)
-let pendingLink = launchLink
-let receiveLink: (url: string) => void = url => { pendingLink = Option.some(url) }
-app.on("open-url", (event, url) => { event.preventDefault(); receiveLink(url) })
 const program = Effect.scoped(Effect.gen(function* () {
   const native = yield* NativeHost
   if (process.platform === "linux" && app.isPackaged) yield* adoptLinuxInstallationLease(addonPath)
@@ -109,33 +97,10 @@ const program = Effect.scoped(Effect.gen(function* () {
   const stateDir = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: dataDir, override: Option.fromNullable(stateOverride) })
   yield* Effect.promise(() => app.whenReady())
   yield* Effect.sync(() => handleAppProtocol(resolveRendererDir(here)))
-  // The app and the server can't run at once. While the server runs, the window is one screen;
-  // a background launch at login leaves the server alone.
-  if (app.isPackaged && (process.platform === "linux" || process.platform === "darwin")) {
-    const decision = background
-      ? (yield* isServerRunning(stateDir)) ? "Quit" as const : "Proceed" as const
-      : yield* resolveServerConflict({ personalStateDirectory: stateDir,
-        pageUrl: `${process.env.ELECTRON_RENDERER_URL ?? DESKTOP_APP_ORIGIN}/server-conflict.html`,
-        preload: join(here, "../preload/server-conflict-preload.mjs"),
-        icon: join(process.resourcesPath, "application-icon.png"),
-        quitRequested: Deferred.await(earlyQuit) })
-    if (decision === "Quit") {
-      // A Mac serving with `magnitude server setup` needs no desktop at login; Settings can turn it back on.
-      if (process.platform === "darwin") yield* makeLoginStartup(isolatedProfile).pipe(Effect.flatMap(startup => startup.set(false)),
-        Effect.catchAll(error => Effect.logWarning(error.message)))
-      return "Quit" as const
-    }
-  }
-  const owner = yield* acquireApplicationOwner(stateDir, { _tag: "Desktop", intent: Option.match(launchLink, {
-    onNone: () => background ? "EnsureRunning" as const : "ShowWindow" as const,
-    onSome: url => ({ _tag: "OpenUrl" as const, url }),
-  }) }).pipe(Effect.catchTag("ApplicationServiceRunning", error => Effect.sync(() => {
-    if (!background) dialog.showErrorBox("Magnitude can’t start", error.message)
-    return { _tag: "ServiceRunning" as const }
-  })))
-  if (owner._tag === "ServiceRunning") return "Quit" as const
+  const owner = yield* acquireApplicationOwner(stateDir, { _tag: "Desktop", intent: background ? "EnsureRunning" : "ShowWindow" })
   if (owner._tag === "Forwarded") { exiting = true; app.quit(); return }
   if (yield* isUpdateInstallationActive(stateDir)) return "Quit" as const
+  if (app.isPackaged && !isolatedProfile) yield* absorbStandaloneInstallation({ home: homedir(), platform: process.platform }).pipe(Effect.provide(NodeContext.layer))
   if (process.platform === "darwin" && app.isPackaged) {
     startupUpdateDeferred = yield* Effect.gen(function* () {
       const installation = yield* MacApplicationInstallation
@@ -183,7 +148,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       const preferences = yield* makeUpdatePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
       const { trustedPublishers, origin } = updateConfiguration.value
       const metadata = process.platform === "linux"
-        ? yield* readLinuxUpdateMetadata(process.resourcesPath, app.getVersion(), process.getSystemVersion(), "desktop").pipe(Effect.provide(NodeContext.layer))
+        ? yield* readLinuxUpdateMetadata(process.resourcesPath, "Desktop", app.getVersion(), process.getSystemVersion(), "desktop").pipe(Effect.provide(NodeContext.layer))
         : yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: app.getVersion(), owner: "desktop", os: process.platform === "win32" ? "windows" : "darwin",
             os_version: process.getSystemVersion(), arch: process.arch, package: process.platform === "win32" ? "windows-exe" : "mac-zip" })
       const target = yield* Schema.decodeUnknown(ReleaseTarget)({ os: metadata.os, arch: metadata.arch, package: metadata.package })
@@ -320,17 +285,6 @@ const program = Effect.scoped(Effect.gen(function* () {
     // Raising the retained window must preserve the renderer's current page.
     if (page !== undefined) yield* hostActions.navigate(page)
   })))
-  /** Links are validated again here: a forwarded one comes from another process. */
-  const openLink = (url: string) => Either.match(parseDeepLink(url), {
-    onLeft: error => Effect.logWarning(`Ignored link: ${error.message}`).pipe(
-      Effect.zipRight(show()),
-      Effect.zipRight(showNotice({ title: "Couldn’t open this link", description: `${error.message} Magnitude opens model links from “Use this model” on Hugging Face.` }))),
-    onRight: link => Effect.gen(function* () {
-      const action = { _tag: "OpenHuggingFaceModel" as const, repository: link.repository, file: link.file }
-      yield* show("models")
-      yield* hostActions.openModel(action)
-    }),
-  })
   const tray = Context.get(yield* Layer.build(TrayOwnerLive.pipe(Layer.provide(nativeTray))), TrayOwner)
   const refreshTray = Effect.gen(function* () {
     const current = yield* Ref.get(state)
@@ -378,7 +332,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     },
   }
   const service = yield* makeApplicationService({ owner: ownerAgent, output: "DiagnosticTail", admission: "Supervised", runtime: applicationRuntime, profile,
-    stateDirectory: stateDir, home: homedir(), environment: process.env }).pipe(Effect.provide([NodeSqliteDriverLayer, NodeContext.layer]))
+    takeOverPort: !profile.isolated, stateDirectory: stateDir, home: homedir(), environment: process.env }).pipe(Effect.provide([NodeSqliteDriverLayer, NodeContext.layer]))
   const snapshot = Effect.all({ service: service.state, tray: tray.state }).pipe(Effect.map(value => ({ version: 1 as const, pid: process.pid, endpoint, service: value.service, owner: { _tag: "Desktop" as const, tray: value.tray } })))
   const snapshots = Stream.zipLatest(service.changes, tray.changes).pipe(Stream.map(([service, tray]) => ({ version: 1 as const, pid: process.pid, endpoint, service, owner: { _tag: "Desktop" as const, tray } })))
   yield* service.changes.pipe(Stream.runForEach(current => Ref.set(state, current).pipe(Effect.zipRight(refreshTray))), Effect.forkScoped)
@@ -391,7 +345,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     if (action === "discard") yield* updates.discard
     if (action === "install") yield* updates.requireReady
     return { state: yield* updates.state, afterReply: action === "install" ? Queue.offer(quit, "RestartUpdate").pipe(Effect.asVoid) : Effect.void }
-  }).pipe(Effect.mapError(error => new ApplicationUpdateControlFailed({ message: error.message }))), login: action => action === "read" ? loginStartup.read : loginStartup.set(action === "enable"), dispatch: intent => typeof intent === "object" ? openLink(intent.url) : intent === "Quit" ? Queue.offer(quit, "Quit").pipe(Effect.asVoid) : intent === "ShowWindow" ? show() : intent === "Retry" ? service.retry : Effect.void }
+  }).pipe(Effect.mapError(error => new ApplicationUpdateControlFailed({ message: error.message }))), login: action => action === "read" ? loginStartup.read : loginStartup.set(action === "enable"), dispatch: intent => intent === "Quit" ? Queue.offer(quit, "Quit").pipe(Effect.asVoid) : intent === "ShowWindow" ? show() : intent === "Retry" ? service.retry : Effect.void }
   if (process.platform === "win32") {
     const name = yield* Schema.decodeUnknown(WindowsPipeName)(owner.socketPath)
     yield* serveWindowsApplicationControl(name, control).pipe(Effect.provide(nativeWindowsPrivatePipesLayer(addonPath)))
@@ -476,9 +430,6 @@ const program = Effect.scoped(Effect.gen(function* () {
   const activate = () => run(show())
   app.on("activate", activate)
   yield* Effect.addFinalizer(() => Effect.sync(() => app.removeListener("activate", activate)))
-  receiveLink = url => run(openLink(url))
-  if (Option.isSome(pendingLink)) yield* openLink(pendingLink.value)
-  if (!app.isPackaged) yield* registerDevelopmentProtocolClient({ app, platform: process.platform, environment: process.env, argv: process.argv })
   if (wantsWindow) yield* show()
   if (cliLink && wantsWindow && !startupUpdateDeferred) yield* installCli.pipe(
     Effect.catchAll(error => Effect.logWarning("Could not install the magnitude command", error.message)),
@@ -515,9 +466,8 @@ Effect.runPromiseExit(program.pipe(
     if (intent === "Relaunch") {
       // The renderer dev server dies with this process; its supervising script performs the relaunch.
       if (rendererServedByDevServer(process.env)) { app.exit(developmentRelaunchExitCode({ showWindow: reopenAfterUpdate })); return }
-      // `args` replaces the argument list, so keep the original ones (the app directory in development),
-      // except a link the launch already opened.
-      const args = [...process.argv.slice(1).filter(argument => argument !== "--background" && !isDeepLinkArgument(argument)), ...(reopenAfterUpdate ? [] : ["--background"])]
+      // `args` replaces the argument list, so keep the original ones (the app directory in development).
+      const args = [...process.argv.slice(1).filter(argument => argument !== "--background"), ...(reopenAfterUpdate ? [] : ["--background"])]
       // The packaged Linux app must start through its launcher, which passes the installation admission it adopts,
       // and without Electron's relauncher, whose no-new-privileges flag leaves Chromium without a sandbox.
       if (process.platform === "linux" && app.isPackaged) relaunchLinuxPackage(LINUX_DESKTOP_EXECUTABLE_PATH, args)
@@ -547,7 +497,7 @@ Effect.runPromiseExit(program.pipe(
     const message = Cause.pretty(cause)
     console.error(message)
     if (!canPresentErrors) { exiting = true; app.exit(1); return }
-    const detail = startupFailureDetail(cause)
+    const detail = startupFailureDetail(cause, process.platform === "darwin" && app.isPackaged && runsFromDiskImage(app.getPath("exe")))
     void app.whenReady().then(() => {
       if (!background && !systemShutdownRequested) dialog.showErrorBox("Magnitude couldn’t continue", detail)
       exiting = true

@@ -57,6 +57,17 @@ describe("Recommended for your machine", () => {
     expect(html).toContain("opacity-45")
   })
 
+  it("chooses the quant already on this computer over the recommended one", () => {
+    const chosen = (owned: ReadonlySet<string>) => {
+      let quant: string | undefined
+      function Probe() { quant = useRecommendedSelection(recommendations, owned).pickedQuant?.key; return null }
+      renderToStaticMarkup(<Probe />)
+      return quant
+    }
+    expect(chosen(new Set())).toBe("flash:gguf:q4")
+    expect(chosen(new Set(["flash:gguf:q6"]))).toBe("flash:gguf:q6")
+  })
+
   it("maps every benchmark phase and edge state consistently", () => {
     expect(hardwareBenchmarkView({ _tag: "Measuring", progress: Option.none() }, false)?.subtitle).toBe("Testing baseline compute")
     expect(hardwareBenchmarkView({ _tag: "Measuring", progress: Option.some({ completed: 10, total: 100, phase: "Baseline" }) }, false)?.subtitle).toBe("Testing baseline compute")

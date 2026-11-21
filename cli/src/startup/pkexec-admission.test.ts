@@ -5,13 +5,13 @@ describe("pkexec command admission", () => {
   const pkexec = { PKEXEC_UID: "1000" }
   it.each([
     [["_install-application-update", "/home/ada/.magnitude/updates/update.json"]],
-    [["_server-remove"]],
   ])("admits %j as root under pkexec", argv => {
     expect(admitsPkexecCommand(argv, 0, pkexec)).toBe(true)
   })
   it.each([
     [[]],
-    [["_server-install"]],
+    [["_server-remove"]],
+    [["_convert-server"]],
     [["serve"]],
     [["status"]],
     [["update"]],

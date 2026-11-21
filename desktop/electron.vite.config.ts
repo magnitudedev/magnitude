@@ -83,7 +83,6 @@ export default defineConfig({
       rollupOptions: {
         input: {
           preload: resolve(__dirname, "src/preload.ts"),
-          "server-conflict-preload": resolve(__dirname, "src/server-conflict-preload.ts"),
         },
       },
     },
@@ -94,7 +93,6 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: resolve(__dirname, "index.html"),
-          "server-conflict": resolve(__dirname, "server-conflict.html"),
         },
       },
     },
@@ -132,7 +130,6 @@ export default defineConfig({
       // dependencies are found mid-load and the re-optimization leaves the first window blank.
       entries: [
         "index.html",
-        "server-conflict.html",
         "../web/src/**/*.{ts,tsx}",
         "../packages/{client-common,sdk,acn-protocol,effect-query,utils,generate-id}/src/**/*.{ts,tsx}",
         "!**/*.test.{ts,tsx}",

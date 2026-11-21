@@ -3,19 +3,19 @@ import { dirname, join } from "node:path"
 import { Effect, Option, Schema } from "effect"
 import { NativeHost } from "./index"
 import { DataFolderUnusable, requestApplication } from "./application-control"
-import { ApplicationOpenUrl } from "@magnitudedev/sdk/desktop-host"
 import { isUpdateInstallationActive } from "./update-installation-lease"
-import { occupiedMessage } from "./service-port"
 
 export class ApplicationOwnershipFailed extends Schema.TaggedError<ApplicationOwnershipFailed>()("ApplicationOwnershipFailed", { message: Schema.String }) {}
-export class ApplicationServiceRunning extends Schema.TaggedError<ApplicationServiceRunning>()("ApplicationServiceRunning", { message: Schema.String }) {}
+/** Which kind of application owns `directory`, or none when no owner answers within a second. */
+export const observeApplicationOwner = (directory: string) => Effect.gen(function* () {
+  const native = yield* NativeHost
+  const endpoint = yield* native.inspectEndpoint(directory)
+  if (Option.isNone(endpoint)) return Option.none<"Desktop" | "Headless">()
+  return Option.some((yield* requestApplication(endpoint.value, "Observe")).owner._tag)
+}).pipe(Effect.timeout("1 second"), Effect.catchAll(() => Effect.succeed(Option.none<"Desktop" | "Headless">())))
+
 const applicationAlreadyRunning = (directory: string) => Effect.gen(function* () {
-  const owner = yield* Effect.gen(function* () {
-    const native = yield* NativeHost
-    const endpoint = yield* native.inspectEndpoint(directory)
-    if (Option.isNone(endpoint)) return Option.none()
-    return Option.some((yield* requestApplication(endpoint.value, "Observe")).owner._tag)
-  }).pipe(Effect.timeout("1 second"), Effect.catchAll(() => Effect.succeed(Option.none())))
+  const owner = yield* observeApplicationOwner(directory)
   return yield* new ApplicationOwnershipFailed({ message: Option.match(owner, {
     onNone: () => "Magnitude is already running. Stop the existing application or server before retrying.",
     onSome: owner => owner === "Desktop"
@@ -24,26 +24,21 @@ const applicationAlreadyRunning = (directory: string) => Effect.gen(function* ()
   }) })
 })
 export const ApplicationOwnerRequest = Schema.Union(
-  Schema.TaggedStruct("Desktop", { intent: Schema.Union(Schema.Literal("EnsureRunning", "ShowWindow"), ApplicationOpenUrl) }),
+  Schema.TaggedStruct("Desktop", { intent: Schema.Literal("EnsureRunning", "ShowWindow") }),
   Schema.TaggedStruct("Headless", {}),
 )
 export type ApplicationOwnerRequest = typeof ApplicationOwnerRequest.Type
 
-/**
- * Private profiles keep the ownership directory owner-only. The server profile lets every local
- * account traverse it to reach the control socket, without listing it or opening the lock.
- */
-const ownershipDirectoryMode = (sharedControl: boolean) => sharedControl ? 0o711 : 0o700
 
 const USABLE_FOLDER = "Check that the folder is on a local drive you can write to."
 
-const prepareOwnershipDirectory = (directory: string, sharedControl = false) => Effect.tryPromise({ try: async () => {
+const prepareOwnershipDirectory = (directory: string) => Effect.tryPromise({ try: async () => {
     // Windows creates the final directory with its private ACL inside native acquisition.
-    await mkdir(process.platform === "win32" ? dirname(directory) : directory, { recursive: true, mode: ownershipDirectoryMode(sharedControl) })
+    await mkdir(process.platform === "win32" ? dirname(directory) : directory, { recursive: true, mode: 0o700 })
     if (process.platform !== "win32") {
       const info = await lstat(directory)
       if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid!()) throw new Error("Application directory must belong to the current user")
-      await chmod(directory, ownershipDirectoryMode(sharedControl))
+      await chmod(directory, 0o700)
     }
   }, catch: error => new DataFolderUnusable({
     reason: `Magnitude couldn’t prepare its data folder ${directory}. ${USABLE_FOLDER}`,
@@ -62,9 +57,9 @@ const ownershipLock = (native: NativeHost, directory: string) => native.acquireO
 )
 
 /** A handoff requests cooperation; only acquisition of the retained kernel lock admits a new owner. */
-export const acquireApplicationOwner = (directory: string, request: ApplicationOwnerRequest, sharedControl = false) => Effect.gen(function* () {
+export const acquireApplicationOwner = (directory: string, request: ApplicationOwnerRequest) => Effect.gen(function* () {
   const native = yield* NativeHost
-  yield* prepareOwnershipDirectory(directory, sharedControl)
+  yield* prepareOwnershipDirectory(directory)
   for (;;) {
     const lock = yield* ownershipLock(native, directory)
     if (Option.isSome(lock)) return { _tag: "Owner" as const, socketPath: yield* native.ownedEndpoint(lock.value, directory), lock: lock.value }
@@ -79,10 +74,6 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
     )
     if (Option.isNone(observed)) { yield* Effect.sleep("100 millis"); continue }
     const response = observed.value
-    // A service manager would restart a service the desktop stopped, so only a terminal serve yields.
-    if (response.owner._tag === "Headless" && response.owner.service) {
-      return yield* new ApplicationServiceRunning({ message: occupiedMessage(Number(new URL(response.endpoint).port), true) })
-    }
     const forwarded = yield* requestApplication(socketPath, response.owner._tag === "Desktop" ? request.intent : "Yield").pipe(
       Effect.map(Option.some), Effect.catchTags({ ApplicationControlUnavailable: () => Effect.succeed(Option.none()),
         ApplicationControlClosed: () => Effect.succeed(Option.none()) }),
@@ -97,13 +88,37 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
   message: "The existing Magnitude owner has not finished stopping; it has not been replaced.",
 }) }))
 
-/** Finite mutations use the same kernel ownership, with no control listener, takeover or service. */
-export const acquireApplicationMaintenance = (directory: string, sharedControl = false) => Effect.gen(function* () {
-  const native = yield* NativeHost
-  yield* prepareOwnershipDirectory(directory, sharedControl)
-  const lock = yield* ownershipLock(native, directory)
-  if (Option.isNone(lock)) return yield* applicationAlreadyRunning(directory)
+const refuseDuringUpdateInstallation = (directory: string) => Effect.gen(function* () {
   if (yield* isUpdateInstallationActive(directory)) return yield* new ApplicationOwnershipFailed({
     message: "A Magnitude update is being installed. Retry the command when it finishes.",
   })
 })
+
+/** Finite mutations use the same kernel ownership, with no control listener, takeover or service. */
+export const acquireApplicationMaintenance = (directory: string) => Effect.gen(function* () {
+  const native = yield* NativeHost
+  yield* prepareOwnershipDirectory(directory)
+  const lock = yield* ownershipLock(native, directory)
+  if (Option.isNone(lock)) return yield* applicationAlreadyRunning(directory)
+  yield* refuseDuringUpdateInstallation(directory)
+})
+
+/**
+ * The desktop installer's ownership. A running `magnitude serve` is asked to yield, as it does when the desktop
+ * opens, and serves again once the installed app has started and quit; a running desktop app is refused.
+ */
+export const acquireDesktopInstallation = (directory: string) => Effect.gen(function* () {
+  const native = yield* NativeHost
+  yield* prepareOwnershipDirectory(directory)
+  for (;;) {
+    const lock = yield* ownershipLock(native, directory)
+    if (Option.isSome(lock)) return yield* refuseDuringUpdateInstallation(directory)
+    const owner = yield* observeApplicationOwner(directory)
+    if (!Option.contains(owner, "Headless")) return yield* applicationAlreadyRunning(directory)
+    const endpoint = yield* native.inspectEndpoint(directory)
+    if (Option.isSome(endpoint)) yield* requestApplication(endpoint.value, "Yield").pipe(Effect.ignore)
+    yield* Effect.sleep("100 millis")
+  }
+}).pipe(Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => new ApplicationOwnershipFailed({
+  message: "The running `magnitude serve` has not stopped serving; the desktop app has not been installed.",
+}) }))

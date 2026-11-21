@@ -89,6 +89,6 @@ export const makeApplicationClient = (options: ApplicationClientOptions) => {
       yield* Effect.sleep("100 millis")
       snapshot = yield* request("Observe")
     }
-  }).pipe(Effect.timeoutFail({ duration: "5 minutes", onTimeout: () => new ApplicationLaunchFailed({ message: "Magnitude service startup timed out. Open Status in the desktop app." }) }))
+  }).pipe(Effect.timeoutFail({ duration: "5 minutes", onTimeout: () => new ApplicationLaunchFailed({ message: "Magnitude service startup timed out. Check `magnitude status`, or Settings → General → Status in the app." }) }))
   return { ensure, awaitReady, observe: request("Observe"), quit: request("Quit") }
 }

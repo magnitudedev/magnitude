@@ -17,8 +17,8 @@ describe("installation script generation", () => {
     const scratch = mkdtempSync(join(tmpdir(), "magnitude request ' "))
     try {
       const script = await Effect.runPromise(render())
-      const start = script.indexOf("    /usr/bin/plutil -create ")
-      const end = script.indexOf("    run_step 'Installing app", start)
+      const start = script.indexOf("/usr/bin/plutil -create ")
+      const end = script.indexOf("run_step 'Installing app", start)
       expect(start).toBeGreaterThan(0)
       expect(end).toBeGreaterThan(start)
       const offer = { release: { version: "1.2.3", bytes: 123, sha256: "abc", signature: "proof" }, download: "https://github.com/magnitudedev/magnitude/releases/download/v1.2.3/app.zip" }
@@ -40,7 +40,8 @@ describe("installation script generation", () => {
       mkdirSync(bin); mkdirSync(temporary); symlinkSync(temporary, alias)
       writeFileSync(join(bin, "curl"), '#!/bin/sh\nprintf "%s\\n" "$@" > "$TEST_CURL_ARGUMENTS"\nexit 73\n', { mode: 0o700 })
       const script = await Effect.runPromise(render())
-      const result = spawnSync("/bin/sh", ["-s"], { input: script, encoding: "utf8", timeout: 15000,
+      // The desktop path downloads on every machine; the CLI-only path stops where a desktop is installed.
+      const result = spawnSync("/bin/sh", ["-s", "--", "--desktop"], { input: script, encoding: "utf8", timeout: 15000,
         env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: `${alias}/`, TEST_CURL_ARGUMENTS: receipt } })
       expect(result.status, result.stderr).toBe(1)
       expect(result.stderr).toContain("Check the network connection")

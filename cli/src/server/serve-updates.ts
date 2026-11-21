@@ -5,12 +5,17 @@ import { dirname, join } from "node:path"
 import { release } from "node:os"
 import type { UpdateOwner } from "@magnitudedev/release/hosted-update"
 import { type ApplicationRuntime, type ApplicationProfile, PreparedUpdateStore, UpdatePreferences, type UnattendedHold, makeUnixProcessContinuation, acquireUpdateInstallationLease,
-  acquireApplicationMaintenance, nativeHostLayer, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, nodeTerminalCommand, linuxInstallationLockHeldByOthers } from "@magnitudedev/daemon-management/desktop-native"
+  acquireApplicationMaintenance, nativeHostLayer, standaloneInstallationRoot, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, nodeTerminalCommand, linuxInstallationLockHeldByOthers } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateSource, makeInstalledUpdatePreparation, makeApplicationUpdate,
   reconcilePreparedUpdate, unavailableApplicationUpdate, completeLinuxForegroundUpdate, prepareMacForegroundStartup,
   startMacForegroundInstallation, recordStartupFailure, makeContainerApplicationUpdate, recordContainerUpgrade, containerImageVersions,
-  containerImage, containerUpdateNotice, type ApplicationUpdate } from "@magnitudedev/daemon-management/application-update"
+  containerImage, containerUpdateNotice, completeStandaloneUpdate, nativeStandaloneCodeVerifier, readInstalledUpdateConfiguration,
+  type ApplicationUpdate } from "@magnitudedev/daemon-management/application-update"
+import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { CLI_VERSION } from "../version"
+
+/** The Windows command launcher starts the command again after this exit status (`MAGNITUDE_CLI_CONTINUE`). */
+const WINDOWS_LAUNCHER_CONTINUE = 75
 import { withLocalService } from "./server-reach"
 
 const linuxInstalledCli = "/usr/lib/magnitude-desktop/resources/magnitude"
@@ -30,7 +35,7 @@ const osVersion = (platform: "darwin" | "linux" | "win32") => platform === "darw
 
 const preparation = (runtime: Extract<ApplicationRuntime, { _tag: "Installed" }>, profile: ApplicationProfile, addon: string, owner: UpdateOwner) => Effect.gen(function* () {
   const platform = yield* Schema.decodeUnknown(Schema.Literal("darwin", "linux", "win32"))(process.platform)
-  return yield* makeInstalledUpdatePreparation({ resources: runtime.resourcesDirectory, addonPath: addon,
+  return yield* makeInstalledUpdatePreparation({ resources: runtime.resourcesDirectory, layout: runtime.layout, addonPath: addon,
     dataDirectory: profile.dataDirectory, version: CLI_VERSION, osVersion: yield* osVersion(platform), platform,
     architecture: yield* architectureOf(process.arch), isolated: profile.isolated, owner })
 })
@@ -67,7 +72,7 @@ export const initializeContainerUpdates = (runtime: Extract<ApplicationRuntime, 
 
 /** Startup only completes an interrupted macOS transaction; downloaded updates install at an idle point. */
 export const prepareServeStartup = (runtime: ApplicationRuntime, profile: ApplicationProfile, stateDirectory: string) => Effect.gen(function* () {
-  if (runtime._tag !== "Installed" || process.platform !== "darwin") return
+  if (runtime._tag !== "Installed" || runtime.layout !== "Desktop" || process.platform !== "darwin") return
   return yield* prepareMacForegroundStartup({ resources: runtime.resourcesDirectory,
     stateDirectory, dataDirectory: profile.dataDirectory, version: CLI_VERSION, architecture: yield* architectureOf(process.arch), arguments: process.argv.slice(2) })
 }).pipe(Effect.provide([unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer))]))
@@ -85,7 +90,29 @@ const makeVersionNotice = (notify: (line: string) => Effect.Effect<void>, line: 
 
 /** The one line a server that cannot install by itself prints for each downloaded version. */
 export const makeDownloadedNotice = (notify: (line: string) => Effect.Effect<void>) =>
-  makeVersionNotice(notify, version => `Magnitude ${version} is downloaded. Install it with \`magnitude update install\`.`)
+  makeVersionNotice(notify, version => `Magnitude ${version} is downloaded. To install it, stop \`magnitude serve\` and run \`magnitude update install\`.`)
+
+/**
+ * The line printed once per version a newer release is available while automatic downloads are off:
+ * a CLI-only installation installs it on request, any other installation downloads it first.
+ */
+export const makeAvailableNotice = (notify: (line: string) => Effect.Effect<void>, standalone: boolean) =>
+  makeVersionNotice(notify, version => standalone
+    ? `Magnitude ${version} is available. Install it with \`magnitude update install\`.`
+    : `Magnitude ${version} is available. Download it with \`magnitude update download\`.`)
+
+/** Gives `notice` each version offered while automatic downloads are off. */
+export const announceAvailableUpdates = (updates: ApplicationUpdate, notice: (version: string) => Effect.Effect<void>) => updates.changes.pipe(
+  Stream.filterMap(state => state.transfer._tag === "Available" && state.preference._tag === "Known" && !state.preference.autoDownload
+    ? Option.some(state.transfer.version) : Option.none()),
+  Stream.runForEach(notice))
+
+/** Prints why each download or preparation failed, as serve's output is where an unattended failure is looked for. */
+export const announceFailedUpdates = (updates: ApplicationUpdate, notify: (line: string) => Effect.Effect<void>) => updates.changes.pipe(
+  Stream.map(state => state.transfer._tag === "Failed" ? Option.some(state.transfer.message) : Option.none()),
+  Stream.changes,
+  Stream.filterMap(message => message),
+  Stream.runForEach(notify))
 
 /** The one line a container prints for each newer release, which a newer image provides. */
 export const makeImageNotice = (notify: (line: string) => Effect.Effect<void>) =>
@@ -94,8 +121,8 @@ export const makeImageNotice = (notify: (line: string) => Effect.Effect<void>) =
 /** The machine an idle installation acts on; replaced by fakes to exercise the decisions. */
 export interface IdleInstallationSystem {
   /**
-   * Whether this server may install without asking anyone: on Linux, sudo admits the installer
-   * without a password (the service's sudoers rule, or the person's own); on macOS, a writable app folder.
+   * Whether this server may install without asking anyone: a CLI-only installation whose folder it may
+   * write; for the Linux package, sudo admitting its installer without a password; on macOS, a writable app folder.
    */
   readonly canInstallUnattended: Effect.Effect<boolean>
   readonly isIdle: Effect.Effect<boolean>
@@ -109,9 +136,9 @@ export interface IdleInstallationSystem {
 export const IdleInstallationSystem = Context.GenericTag<IdleInstallationSystem>("@magnitudedev/cli/IdleInstallationSystem")
 
 /**
- * Install when idle: a server, the system service or `serve` run by hand, installs a downloaded
- * update only between turns whenever it can without a password. Otherwise it keeps serving and says
- * how to install; a held installation lock defers. A failed attempt, or an installed version that
+ * Install when idle: `serve` installs a downloaded update only between turns, whenever it may install
+ * unattended (see `canInstallUnattended`). Otherwise it keeps serving and says how to install; a held
+ * installation lock defers. A failed attempt, or an installed version that
  * never starts, holds back unattended installation for `failureBackoff`, and the version that failed
  * is not downloaded or installed unattended again (see `UnattendedHold`), so restarts never loop.
  */
@@ -220,16 +247,32 @@ export const idleInstallationSystem = (options: {
 }) => Layer.effect(IdleInstallationSystem, Effect.gen(function* () {
   const executor = yield* CommandExecutor.CommandExecutor
   const fs = yield* FileSystem.FileSystem
-  const privateFiles = unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer))
+  const privateFiles = (process.platform === "win32" ? windowsPrivateFilePermissions(options.addon) : unixPrivateFilePermissions).pipe(Layer.provideMerge(BunContext.layer))
   const store = preparation(options.runtime, options.profile, options.addon, options.owner).pipe(
     Effect.map(prepared => prepared.store), Effect.provide(privateFiles))
   const installLinux = Effect.scoped(Effect.gen(function* () {
-    yield* acquireApplicationMaintenance(options.stateDirectory, options.profile.sharedControl)
+    yield* acquireApplicationMaintenance(options.stateDirectory)
     const continuation = yield* makeUnixProcessContinuation(options.addon)
     yield* acquireUpdateInstallationLease(options.stateDirectory)
     const version = yield* completeLinuxForegroundUpdate(options.profile.dataDirectory, "Server").pipe(Effect.provideServiceEffect(PreparedUpdateStore, store), Effect.provide(nodeTerminalCommand))
     yield* options.notify(`Installed Magnitude ${version}. Restarting.`)
     return yield* continuation.replace(process.execPath, process.argv.slice(2), process.env)
+  }))
+  const platform = yield* Schema.decodeUnknown(Schema.Literal("darwin", "linux", "win32"))(process.platform).pipe(Effect.orDie)
+  const standaloneRoot = standaloneInstallationRoot(options.runtime, platform)
+  /** Unpacks beside the running version, makes it current and restarts into it; Windows asks its launcher to restart. */
+  const installStandalone = Effect.scoped(Effect.gen(function* () {
+    yield* acquireApplicationMaintenance(options.stateDirectory)
+    const continuation = platform === "win32" ? Option.none() : Option.some(yield* makeUnixProcessContinuation(options.addon))
+    yield* acquireUpdateInstallationLease(options.stateDirectory)
+    const prepared = yield* store
+    const configuration = yield* readInstalledUpdateConfiguration(options.runtime.resourcesDirectory)
+    const installed = yield* completeStandaloneUpdate({ root: standaloneRoot, runningVersion: CLI_VERSION, platform, environment: process.env }).pipe(
+      Effect.provideService(PreparedUpdateStore, prepared),
+      Effect.provide(nativeStandaloneCodeVerifier(platform, options.addon, configuration.windowsPublisher)))
+    yield* options.notify(`Installed Magnitude ${installed.version}. Restarting.`)
+    if (Option.isSome(continuation)) return yield* continuation.value.replace(installed.executable, process.argv.slice(2), process.env)
+    return yield* Effect.sync(() => process.exit(WINDOWS_LAUNCHER_CONTINUE))
   }))
   const installMac = Effect.scoped(Effect.gen(function* () {
     yield* acquireApplicationMaintenance(options.stateDirectory)
@@ -238,8 +281,11 @@ export const idleInstallationSystem = (options: {
       dataDirectory: options.profile.dataDirectory, version: CLI_VERSION, architecture: yield* architectureOf(process.arch),
       operation: "Install", continuation: { _tag: "Foreground", arguments: process.argv.slice(2) } }).pipe(Effect.provideServiceEffect(PreparedUpdateStore, store))
   }))
+  const standalone = options.runtime.layout === "Standalone"
   return IdleInstallationSystem.of({
-    canInstallUnattended: process.platform === "linux"
+    canInstallUnattended: standalone
+      ? fs.access(standaloneRoot, { writable: true }).pipe(Effect.as(true), Effect.orElseSucceed(() => false))
+      : process.platform === "linux"
       ? executor.exitCode(Command.make("/usr/bin/sudo", "-n", "-l", "--", linuxInstalledCli, "_install-application-update",
         join(options.profile.dataDirectory, "updates", "update.json"), "--parent-stdin")).pipe(Effect.map(code => code === 0), Effect.orElseSucceed(() => false))
       : fs.access(dirname(dirname(dirname(options.runtime.resourcesDirectory))), { writable: true }).pipe(Effect.as(true), Effect.orElseSucceed(() => false)),
@@ -247,14 +293,16 @@ export const idleInstallationSystem = (options: {
     // macOS exclusion is the installation lease the installer itself acquires.
     // This process holds its own shared lease on the lock for as long as it serves, so ask whether
     // anyone else holds or awaits it.
-    installationLockFree: process.platform !== "linux" ? Effect.succeed(true)
+    installationLockFree: standalone || process.platform !== "linux" ? Effect.succeed(true)
       : linuxInstallationLockHeldByOthers(linuxInstallationLock).pipe(Effect.map(held => !held), Effect.provideService(FileSystem.FileSystem, fs),
         Effect.orElseSucceed(() => false)),
     store,
     installPrepared: Effect.gen(function* () {
+      if (standalone) return yield* installStandalone
       if (process.platform === "darwin") return yield* installMac
       return yield* installLinux
-    }).pipe(Effect.provide([nativeHostLayer(options.addon), privateFiles])),
+    }).pipe(Effect.provide([process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(options.addon),
+      privateFiles])),
     notify: options.notify,
   })
 })).pipe(Layer.provide(BunContext.layer))

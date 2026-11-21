@@ -25,7 +25,7 @@ describe.skipIf(process.platform !== "darwin")("Installed macOS headless admissi
         '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>dev.magnitude.admission-fixture</string></dict></plist>')
       const initialized = yield* Deferred.make<void>()
       const options = {
-        runtime: { _tag: "Installed" as const, resourcesDirectory },
+        runtime: { _tag: "Installed" as const, resourcesDirectory, layout: "Desktop" as const },
         profile: { dataDirectory: join(root, "data"), isolated: true, port: 11101, endpoint: "http://127.0.0.1:11101", sharedControl: false },
         stateDirectory: join(root, "state"), home: root, environment: {}, stop: Effect.never,
         observe: () => Effect.void,

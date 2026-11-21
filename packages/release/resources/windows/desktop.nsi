@@ -182,15 +182,11 @@ stageFailed:
   SetErrorLevel 1
   Abort "Setup could not complete. Installation files were retained for recovery. Close applications using them and run setup again."
 installed:
-  ; magnitude:// links open the app, which forwards them to a running Magnitude. Links are optional,
-  ; so a failure here leaves the installation complete.
-  ClearErrors
-  WriteRegStr HKCU "${PROTOCOLKEY}" "" "URL:Magnitude"
-  WriteRegStr HKCU "${PROTOCOLKEY}" "URL Protocol" ""
-  WriteRegStr HKCU "${PROTOCOLKEY}\DefaultIcon" "" '"$INSTDIR\Magnitude.exe",0'
-  WriteRegStr HKCU "${PROTOCOLKEY}\shell\open\command" "" '"$INSTDIR\Magnitude.exe" "%1"'
-  IfErrors 0 +2
-  DetailPrint "Magnitude links from Hugging Face could not be registered. Run setup again to repair them."
+  ; Earlier versions registered magnitude:// links; remove that registration while it still names this installation.
+  ReadRegStr $9 HKCU "${PROTOCOLKEY}\shell\open\command" ""
+  ${If} $9 == '"$INSTDIR\Magnitude.exe" "%1"'
+    DeleteRegKey HKCU "${PROTOCOLKEY}"
+  ${EndIf}
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::InstallCliLauncher(w "$INSTDIR\resources\magnitude-launcher.exe", w "$LOCALAPPDATA\Programs\Magnitude CLI") i .r0'
   ${If} $0 != 0
     SetErrorLevel 1
@@ -249,11 +245,6 @@ Section "Uninstall"
     MessageBox MB_OK|MB_ICONSTOP "Startup registration could not be removed (code $0). Application files were preserved." /SD IDOK
     SetErrorLevel 1
     Abort
-  ${EndIf}
-  ; Remove the link handler only while it still names this installation.
-  ReadRegStr $9 HKCU "${PROTOCOLKEY}\shell\open\command" ""
-  ${If} $9 == '"$INSTDIR\Magnitude.exe" "%1"'
-    DeleteRegKey HKCU "${PROTOCOLKEY}"
   ${EndIf}
 @REMOVE_FILES@
 @REMOVE_DIRECTORIES@

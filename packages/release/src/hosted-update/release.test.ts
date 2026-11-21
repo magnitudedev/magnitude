@@ -1,7 +1,7 @@
 import { generateKeyPairSync, sign } from "node:crypto"
 import { Effect, Either } from "effect"
 import { describe, expect, it } from "vitest"
-import { acceptsUpdateRelease, signUpdateRelease, verifyUpdateRelease, type ReleaseTarget } from "./release"
+import { acceptsUpdateRelease, releaseTargetOf, signUpdateRelease, updateInstallerFilename, verifyUpdateRelease, type ReleaseTarget } from "./release"
 
 const publisher = generateKeyPairSync("ed25519")
 const trust = new Map([["current", publisher.publicKey]])
@@ -12,6 +12,12 @@ const rejects = async (input: unknown, destination: ReleaseTarget = target) =>
   expect(Either.isLeft(await Effect.runPromise(Effect.either(verifyUpdateRelease(input, destination, trust))))).toBe(true)
 
 describe("public update release", () => {
+  it("offers a Docker installation the Linux CLI-only release and names the CLI-only download", async () => {
+    expect(await Effect.runPromise(releaseTargetOf({ os: "linux", arch: "arm64", package: "docker" }))).toEqual({ os: "linux", arch: "arm64", package: "cli-only" })
+    expect(await Effect.runPromise(releaseTargetOf({ os: "windows", arch: "x64", package: "cli-only" }))).toEqual({ os: "windows", arch: "x64", package: "cli-only" })
+    expect(Either.isLeft(await Effect.runPromise(Effect.either(releaseTargetOf({ os: "windows", arch: "arm64", package: "cli-only" }))))).toBe(true)
+    expect(updateInstallerFilename({ os: "darwin", arch: "x64", package: "cli-only" })).toBe("magnitude-cli-only.tar.gz")
+  })
   it("has four fields and signs a fixed domain-separated representation independent of JSON order", async () => {
     const release = await signed()
     expect(Object.keys(release).sort()).toEqual(["bytes", "sha256", "signature", "version"])
@@ -25,6 +31,7 @@ describe("public update release", () => {
     await rejects(release, { os: "darwin", arch: "x64", package: "mac-zip" })
     await rejects(release, { os: "darwin", arch: "arm64", package: "dmg" })
     await rejects(release, { os: "linux", arch: "arm64", package: "deb" })
+    await rejects(release, { os: "darwin", arch: "arm64", package: "cli-only" })
   })
   it("tries bundled keys without accepting a key selector or embedded trust", async () => {
     const release = await signed()

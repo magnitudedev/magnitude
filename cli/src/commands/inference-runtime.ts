@@ -15,6 +15,7 @@ import {
   CountryCodeSchema,
   LocalModelFamilySchema,
   ModelIdSchema,
+  TARGET_TOKENS_PER_SECOND,
   localModelIntelligence,
   type CatalogLocalModel,
   type CountryCode,
@@ -81,19 +82,15 @@ export * from "./models-status-runtime"
 const catalogModels = (catalog: ModelCatalogState): readonly CatalogLocalModel[] =>
   catalogProducts(catalog).flatMap((model) => model._tag === "Catalog" ? [model] : [])
 
-const assessingCount = (models: readonly CatalogLocalModel[]): { assessing: number; failed: number } => {
-  const offered = models.filter((model) => model.catalogData.support._tag === "Supported")
-  return {
-    assessing: offered.filter((model) => model.servingState._tag === "Assessing").length,
-    failed: offered.filter((model) => model.servingState._tag === "Failed").length,
-  }
-}
+const failedCount = (models: readonly CatalogLocalModel[]): number => models.filter((model) =>
+  model.catalogData.support._tag === "Supported" && model.servingState._tag === "Failed").length
 
-const assessmentNotice = (models: readonly CatalogLocalModel[]): string[] => {
-  const { assessing, failed } = assessingCount(models)
+/** Recommendations wait for each quant's speed measurement, which continues after the model itself is assessed. */
+const assessmentNotice = (models: readonly CatalogLocalModel[], unmeasured: number): string[] => {
+  const failed = failedCount(models)
   return [
-    ...(assessing > 0 ? [`Assessing ${plural(assessing, "additional catalog model")}; recommendations may change.`] : []),
-    ...(failed > 0 ? [`Assessment failed for ${plural(failed, "catalog model")}.`] : []),
+    ...(unmeasured > 0 ? [`Measuring ${plural(unmeasured, "more quant")}; recommendations may change.`] : []),
+    ...(failed > 0 ? [`Assessment failed for ${plural(failed, "model")}.`] : []),
   ]
 }
 
@@ -142,7 +139,7 @@ const renderRecommendation = (hardware: LocalInferenceHardware) => (
   return [
     `${index + 1}. ${formatLocalModelDisplayName(model)} - ${developer.name} (${developer.country}) - Intelligence ${intelligenceLabel(model)}`,
     `   ${modelQuant(model)} - ${formatStorageSize(model.storageBytes)} - ${assessmentSpeed(assessment)} - ${assessmentContext(assessment)} context - ${assessmentPlacement(assessment, memory)}`,
-    `   Model ID: ${model.modelId}${recommendation.meetsTarget || !assessmentSpeedKnown(assessment) ? "" : " - below 20 tok/s on this computer"}`,
+    `   Model ID: ${model.modelId}${recommendation.meetsTarget || !assessmentSpeedKnown(assessment) ? "" : ` - below ${TARGET_TOKENS_PER_SECOND} tok/s on this computer`}`,
     ...(expertFields.length > 0 ? [`   ${expertFields.map(([label, value]) => `${label} ${value}`).join(" - ")}`] : []),
     `   Acceleration ${accelerationLabel(model)}${capabilities.length > 0 ? ` - ${capabilities.join(", ")}` : ""}`,
     indent(renderQuantLadder(rungs, Option.some(model.modelId), memory), "   "),
@@ -158,6 +155,7 @@ export interface RecommendationsView {
   readonly hardware: LocalInferenceHardware
   readonly developerCountry: Option.Option<CountryCode>
   readonly recommended: readonly RecommendedCatalogModel[]
+  readonly unmeasured: number
 }
 
 export const RecommendationsJsonSchema = Schema.Struct({
@@ -221,6 +219,7 @@ export const showRecommendations = (
         hardware,
         developerCountry,
         recommended: recommendedCatalogModels(recommendations, models, limit),
+        unmeasured: recommendations.rungs - recommendations.measured,
       }
     }))),
   ),
@@ -230,7 +229,7 @@ export const showRecommendations = (
 
 const catalogWarnings = (catalog: ModelCatalogState): string[] => catalog._tag === "Initializing"
   ? []
-  : [...new Set(catalog.failures.map(({ message }) => message.trim()).filter(Boolean))].map((message) => `Catalog warning: ${message}`)
+  : [...new Set(catalog.failures.map(({ message }) => message.trim()).filter(Boolean))].map((message) => `Model warning: ${message}`)
 
 export function renderRecommendations({
   catalog,
@@ -238,13 +237,16 @@ export function renderRecommendations({
   hardware,
   developerCountry,
   recommended,
+  unmeasured,
 }: RecommendationsView): string {
-  if (catalog._tag === "Initializing") return "The local model catalog is initializing.\n"
+  if (catalog._tag === "Initializing") return "Magnitude is still preparing its recommendations.\n"
   const system = describeLocalHardware(hardware).system.name
-  const notice = [...assessmentNotice(models), ...catalogWarnings(catalog)]
+  const notice = [...assessmentNotice(models, unmeasured), ...catalogWarnings(catalog)]
   const scope = Option.match(developerCountry, { onNone: () => "", onSome: (country) => ` from ${country} developers` })
   if (recommended.length === 0) return ensureTrailingNewline([
-    `No models${scope} run on this computer.`,
+    unmeasured > 0
+      ? `Magnitude is still measuring how models${scope} run on this computer.`
+      : `No models${scope} run on this computer.`,
     ...notice,
     "",
     HUGGING_FACE_HINT,

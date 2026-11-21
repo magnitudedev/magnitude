@@ -49,7 +49,7 @@ export const UpdateRequestFields = Schema.Struct({
   os: Schema.Literal("darwin", "windows", "linux"),
   os_version: PlatformVersion,
   arch: Schema.Literal("arm64", "x64"),
-  package: Schema.Union(Schema.Literal("mac-zip", "windows-exe"), LinuxInstallationKind),
+  package: Schema.Union(Schema.Literal("mac-zip", "windows-exe", "cli-only"), LinuxInstallationKind),
   channel: Schema.Literal("stable", "beta", "alpha"),
   ts: Schema.NumberFromString.pipe(Schema.int(), Schema.nonNegative()),
   nonce: RequestNonce,
@@ -88,9 +88,9 @@ export const decodeUpdateRequest = (url: URL, nowSeconds: number) => Effect.gen(
   }
   const request = yield* Schema.decodeUnknown(UpdateRequest)(fields, { onExcessProperty: "error" }).pipe(Effect.mapError(() => new InvalidUpdateRequest()))
   if (Math.abs(nowSeconds - request.ts) > 300) return yield* new ExpiredUpdateRequest()
-  const compatible = request.os === "darwin" ? request.package === "mac-zip"
-    : request.os === "windows" ? request.package === "windows-exe" && request.arch === "x64"
-    : Schema.is(LinuxInstallationKind)(request.package)
+  const compatible = request.os === "darwin" ? request.package === "mac-zip" || request.package === "cli-only"
+    : request.os === "windows" ? (request.package === "windows-exe" || request.package === "cli-only") && request.arch === "x64"
+    : request.package === "cli-only" || Schema.is(LinuxInstallationKind)(request.package)
   if (!compatible) return yield* new InvalidUpdateRequest()
   return request
 })

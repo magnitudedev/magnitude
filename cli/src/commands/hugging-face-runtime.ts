@@ -302,7 +302,7 @@ const inspectedRepository = (inspection: CandidateInspection): string =>
 const acquireLine = (inspection: CandidateInspection, version: CandidateVersion): string =>
   Option.match(version.catalogModel, {
     onNone: () => `Download: ${acquireCommand(inspectedRepository(inspection), version)}`,
-    onSome: (catalogModel) => `This is the catalog model ${catalogModel}, which comes with its drafter. Download: magnitude models pull ${catalogModel}`,
+    onSome: (catalogModel) => `This is the recommended model ${catalogModel}, which comes with its drafter. Download: magnitude models pull ${catalogModel}`,
   })
 
 /** Why the version a reference named doesn't run here: its own verdict, never a statement about the whole repository. */
@@ -572,12 +572,12 @@ export const renderPull = (result: PullResult): string => {
   const choice = result.versionRequested ? "" : " (the recommended version)"
   if (added._tag === "Catalog") return ensureTrailingNewline(added.outcome === "Started"
     ? [
-        `${name}${choice} is the catalog model ${added.modelId}, so Magnitude installs that model with its drafter.`,
+        `${name}${choice} is the recommended model ${added.modelId}, so Magnitude installs that model with its drafter.`,
         `Model ID: ${added.modelId}`,
         `Check progress: magnitude models show ${added.modelId}`,
       ].join("\n")
     : [
-        `${name}${choice} is the catalog model ${added.modelId}, which is already on this computer. Nothing to download.`,
+        `${name}${choice} is the recommended model ${added.modelId}, which is already on this computer. Nothing to download.`,
         `Model ID: ${added.modelId}`,
         `Load it: magnitude models load ${added.modelId}`,
       ].join("\n"))
@@ -703,13 +703,13 @@ export const pullModel = (
     if (options.only !== undefined) {
       const component = yield* parseCatalogComponent(options.only)
       if (reference._tag !== "Catalog" || options.drafter !== undefined || options.force === true) {
-        return yield* new ModelCommandError({ message: "--only applies only to a catalog model, without --drafter or --force." })
+        return yield* new ModelCommandError({ message: "--only applies only to a recommended model, without --drafter or --force." })
       }
       return yield* withClient((client) => pullComponent(client, reference.modelId, component))
     }
     if (reference._tag === "Catalog" && options.drafter !== undefined) {
       return yield* new ModelCommandError({
-        message: "Catalog models come with their drafter; --drafter applies only to models from Hugging Face.",
+        message: "Recommended models come with their drafter; --drafter applies only to other models from Hugging Face.",
       })
     }
     if (reference._tag === "Custom" && options.drafter !== undefined) {

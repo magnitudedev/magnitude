@@ -62,7 +62,7 @@ describe("a version that is exactly a catalog model", () => {
       versions: [{ ...recommended!, catalogModel: Option.some(catalogModel), assessment: Option.some(fitsAssessment()) }],
     })
     expect(acquisitionHint(inspection))
-      .toBe(`This is the catalog model ${catalogModel}, which comes with its drafter. Download: magnitude models pull ${catalogModel}`)
+      .toBe(`This is the recommended model ${catalogModel}, which comes with its drafter. Download: magnitude models pull ${catalogModel}`)
   })
 
   const routed = (outcome: "Started" | "AlreadyOnThisComputer"): PullResult => ({
@@ -74,13 +74,13 @@ describe("a version that is exactly a catalog model", () => {
 
   it("says models pull installed the catalog model instead of adding a Hugging Face model", () => {
     expect(renderPull(routed("Started"))).toBe([
-      `${TEST_REPOSITORY}:Q4_K_P (the recommended version) is the catalog model ${catalogModel}, so Magnitude installs that model with its drafter.`,
+      `${TEST_REPOSITORY}:Q4_K_P (the recommended version) is the recommended model ${catalogModel}, so Magnitude installs that model with its drafter.`,
       `Model ID: ${catalogModel}`,
       `Check progress: magnitude models show ${catalogModel}`,
       "",
     ].join("\n"))
     expect(renderPull(routed("AlreadyOnThisComputer"))).toBe([
-      `${TEST_REPOSITORY}:Q4_K_P (the recommended version) is the catalog model ${catalogModel}, which is already on this computer. Nothing to download.`,
+      `${TEST_REPOSITORY}:Q4_K_P (the recommended version) is the recommended model ${catalogModel}, which is already on this computer. Nothing to download.`,
       `Model ID: ${catalogModel}`,
       `Load it: magnitude models load ${catalogModel}`,
       "",

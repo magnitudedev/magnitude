@@ -12,7 +12,7 @@ import { LINUX_GLIBC_MINIMUM } from "../../src/linux-package"
 
 // The script selects its package manager by availability, so each case sees only its own.
 const setsid = spawnSync("/bin/sh", ["-c", "command -v setsid"], { encoding: "utf8" }).stdout.trim()
-const systemTools = ["awk", "date", "cat", "chmod", "cp", "cut", "getconf", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
+const systemTools = ["awk", "date", "cat", "chmod", "cp", "cut", "getconf", "grep", "id", "kill", "mkdir", "mktemp", "openssl", "rm", "sed", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
 const managers = [
   { manager: "apt-get", package: "deb", receipt: /^update\ninstall\n-y\n-o\nDPkg::Lock::Timeout=300\n.*magnitude\.deb\n$/ },
   { manager: "pacman", package: "pacman", receipt: /^-Q\nmagnitude-desktop\n-U\n--noconfirm\n.*magnitude\.pacman\n-Q\nmagnitude-desktop\n$/ },
@@ -51,8 +51,8 @@ describe.skipIf(process.platform !== "linux").each(managers)("Linux installation
         publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }).pipe(Effect.provide(NodeContext.layer)))
       const isolated = script.replace("server_marker=/etc/magnitude/server", `server_marker="${join(root, "server")}"`)
       // setsid: no controlling terminal, as when an agent runs the installer.
-      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s"], { input: isolated, encoding: "utf8", timeout: 15000,
-        env: { ...process.env, PATH: `${bin}:${tools}`, TEST_OFFER: offerPath, TEST_PACKAGE: packagePath, TEST_APT_RECEIPT: receipt } })
+      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s", "--", "--desktop"], { input: isolated, encoding: "utf8", timeout: 15000,
+        env: { ...process.env, PATH: `${bin}:${tools}`, HOME: root, TEST_OFFER: offerPath, TEST_PACKAGE: packagePath, TEST_APT_RECEIPT: receipt } })
       if (scenario === "valid") {
         expect(result.status, result.stderr).toBe(0)
         expect(readFileSync(receipt, "utf8")).toMatch(expected)
@@ -74,13 +74,13 @@ describe.skipIf(process.platform !== "linux")("Linux installation shell architec
       executable("uname", '#!/bin/sh\ncase "$1" in -m) echo aarch64;; *) echo Linux;; esac\n')
       executable("pacman", "#!/bin/sh\nexit 1\n")
       executable("curl", `#!/bin/sh\ntouch ${JSON.stringify(join(root, "downloaded"))}\nexit 1\n`)
-      for (const tool of ["getconf", "python3", "openssl", "mktemp", "rm", "timeout"]) {
+      for (const tool of ["getconf", "openssl", "mktemp", "rm", "timeout"]) {
         const found = spawnSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim()
         if (found) symlinkSync(found, join(bin, tool))
       }
       const script = readFileSync(join(import.meta.dirname, "../../resources/install.sh"), "utf8").replace("@MAGNITUDE_INSTALL_ORIGIN@", "https://magnitude.dev")
       // setsid: no controlling terminal, as when an agent runs the installer.
-      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s"], { input: script, encoding: "utf8", timeout: 15000, env: { PATH: bin } })
+      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s", "--", "--desktop"], { input: script, encoding: "utf8", timeout: 15000, env: { PATH: bin } })
       expect(result.status).not.toBe(0)
       expect(result.stderr).toContain("x86-64 only")
       expect(existsSync(join(root, "downloaded"))).toBe(false)
@@ -102,53 +102,22 @@ describe.skipIf(process.platform !== "linux")("Linux installation shell architec
         if (found && !(tool in stubs) && !existsSync(join(bin, tool))) symlinkSync(found, join(bin, tool))
       }
       const script = readFileSync(join(import.meta.dirname, "../../resources/install.sh"), "utf8").replace("@MAGNITUDE_INSTALL_ORIGIN@", "https://magnitude.dev")
-      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s"], { input: script, encoding: "utf8", timeout: 15000, env: { PATH: bin } })
+      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s", "--", "--desktop"], { input: script, encoding: "utf8", timeout: 15000, env: { PATH: bin } })
       return { ...result, downloaded: existsSync(join(root, "downloaded")), sudo: existsSync(join(root, "sudo")) }
     } finally { rmSync(root, { recursive: true, force: true }) }
   }
 
   it("refuses a glibc below the packages' floor before sudo or downloading", () => {
-    const result = refusal({ getconf: "#!/bin/sh\necho glibc 2.31\n", "apt-get": "#!/bin/sh\nexit 1\n" }, ["python3", "openssl", "timeout"])
+    const result = refusal({ getconf: "#!/bin/sh\necho glibc 2.31\n", "apt-get": "#!/bin/sh\nexit 1\n" }, ["openssl", "timeout"])
     expect(result.status).not.toBe(0)
     expect(result.stderr).toContain(`needs glibc ${LINUX_GLIBC_MINIMUM} or later, and this system has glibc 2.31`)
     expect(result.downloaded || result.sudo).toBe(false)
   })
 
   it("admits the packages' glibc floor", () => {
-    expect(readFileSync(join(import.meta.dirname, "../../resources/install.sh"), "utf8")).toContain(`\n    glibc_minimum=${LINUX_GLIBC_MINIMUM}\n`)
-    const result = refusal({ getconf: `#!/bin/sh\necho glibc ${LINUX_GLIBC_MINIMUM}\n`, "apt-get": "#!/bin/sh\nexit 1\n" }, ["id", "python3", "openssl", "timeout"])
+    expect(readFileSync(join(import.meta.dirname, "../../resources/install.sh"), "utf8")).toContain(`\n  glibc_minimum=${LINUX_GLIBC_MINIMUM}\n`)
+    const result = refusal({ getconf: `#!/bin/sh\necho glibc ${LINUX_GLIBC_MINIMUM}\n`, "apt-get": "#!/bin/sh\nexit 1\n" }, ["id", "openssl", "timeout"])
     expect(result.stderr).not.toContain("needs glibc")
     expect(result.sudo, result.stderr).toBe(true)
-  })
-
-  it("names Arch's python package", () => {
-    if (process.arch !== "x64") return
-    const result = refusal({ getconf: "#!/bin/sh\necho glibc 2.42\n", pacman: "#!/bin/sh\nexit 1\n" }, ["openssl", "timeout"])
-    expect(result.stderr).toContain("pacman -S python")
-    expect(result.downloaded || result.sudo).toBe(false)
-  })
-})
-
-describe.skipIf(process.platform === "win32")("macOS installation shell with the server set up", () => {
-  it("refuses before downloading and says how to reinstall", () => {
-    const root = mkdtempSync(join(tmpdir(), "magnitude-shell-mac-server-"))
-    try {
-      const bin = join(root, "bin"), plist = join(root, "dev.magnitude.server.plist")
-      mkdirSync(bin)
-      writeFileSync(plist, "")
-      const executable = (name: string, contents: string) => writeFileSync(join(bin, name), contents, { mode: 0o700 })
-      executable("uname", '#!/bin/sh\ncase "$1" in -m) echo arm64;; *) echo Darwin;; esac\n')
-      executable("curl", `#!/bin/sh\ntouch ${JSON.stringify(join(root, "downloaded"))}\nexit 1\n`)
-      for (const tool of ["mktemp", "rm"]) {
-        const found = spawnSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim()
-        if (found) symlinkSync(found, join(bin, tool))
-      }
-      const script = readFileSync(join(import.meta.dirname, "../../resources/install.sh"), "utf8").replace("@MAGNITUDE_INSTALL_ORIGIN@", "https://magnitude.dev")
-        .replace("mac_server=/Library/LaunchDaemons/dev.magnitude.server.plist", `mac_server=${plist}`)
-      const result = spawnSync("/bin/sh", ["-s"], { input: script, encoding: "utf8", timeout: 15000, env: { PATH: bin } })
-      expect(result.status).not.toBe(0)
-      expect(result.stderr).toContain("magnitude server remove")
-      expect(existsSync(join(root, "downloaded"))).toBe(false)
-    } finally { rmSync(root, { recursive: true, force: true }) }
   })
 })

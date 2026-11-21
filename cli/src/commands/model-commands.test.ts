@@ -623,7 +623,7 @@ describe("--json never leaks internals", () => {
     for (const model of all) expect(JSON.stringify(model), model.modelId).toMatch(internalKey)
 
     const documents: Record<string, unknown>[] = [
-      encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), developerCountry: Option.none(), recommended: [catalog, ...catalogs].map(recommendedModel) }),
+      encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), developerCountry: Option.none(), recommended: [catalog, ...catalogs].map(recommendedModel), unmeasured: 0 }),
       encode(modelsListJson, statusView({ models: all, hidden: [withEvidence(makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") }))] })),
       ...all.map((model) => encode(modelDetailJson, { model, models: all, hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })),
       encode(hardwareJson, { hardware: makeHardware(), models: [loadingFound] }),
@@ -642,7 +642,7 @@ describe("--json never leaks internals", () => {
     const { catalog, catalogs } = leakyModels()
     const state = catalogState([catalog, ...catalogs])
     const documents = [
-      encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), developerCountry: Option.none(), recommended: [catalog].map(recommendedModel) }),
+      encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), developerCountry: Option.none(), recommended: [catalog].map(recommendedModel), unmeasured: 0 }),
     ]
     for (const document of documents) expect(JSON.stringify(document)).not.toMatch(/"(acquisitionState|residencyState|installation)"/)
   })
@@ -665,7 +665,7 @@ describe("--json never leaks internals", () => {
     expect(loading.model).toMatchObject({ acquisitionState: { residencyState: { plannedAllocation: { device: { backend: "cuda" } } } } })
     const detail = encode(modelDetailJson, { model: tooLarge, models: [], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false })
     expect(detail.model).toMatchObject({ servingState: { assessment: { _tag: "DoesNotFit", totalRequiredBytes: 10, deficitBytes: 4 } } })
-    const shown = encode(recommendationsJson, { catalog: catalogState([catalog]), models: [catalog], hardware: makeHardware(), developerCountry: Option.none(), recommended: [catalog].map(recommendedModel) }).models as Record<string, unknown>[]
+    const shown = encode(recommendationsJson, { catalog: catalogState([catalog]), models: [catalog], hardware: makeHardware(), developerCountry: Option.none(), recommended: [catalog].map(recommendedModel), unmeasured: 0 }).models as Record<string, unknown>[]
     expect(shown[0]!.model).toMatchObject({
       catalogData: { intelligence: 75, quantizationAware: false },
       servingState: { assessment: { _tag: "Fits", memory: { totalRequiredBytes: 10, breakdown: { weightsBytes: 7, contextBytes: 2, overheadBytes: 1 } } } },

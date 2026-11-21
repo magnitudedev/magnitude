@@ -745,7 +745,7 @@ describe("adding models", () => {
     }).pipe(Effect.either))
     expect(result._tag === "Left" && result.left).toMatchObject({
       _tag: "InvalidModelReference",
-      message: "owner/model-GGUF is the catalog model qwen3.6-35b-a3b:gguf:q4, which comes with its drafter.",
+      message: "owner/model-GGUF is the recommended model qwen3.6-35b-a3b:gguf:q4, which comes with its drafter.",
     })
     expect(recorded.catalogSyncs).toEqual([])
   })
@@ -1485,7 +1485,7 @@ describe("catalog models found elsewhere", () => {
     expect(result.files).toEqual(Option.some({ path: cachePath, location: Option.some("HuggingFaceCache") }))
     expect(result.hidden).toEqual([external])
     expect(result.afterAliasUnhide).toEqual([])
-    expect(result.refused.message).toBe(`${owned} is a catalog model. Remove it with \`magnitude models rm ${owned}\` instead.`)
+    expect(result.refused.message).toBe(`${owned} is a recommended model. Remove it with \`magnitude models rm ${owned}\` instead.`)
     expect(result.afterUnhide).toEqual([])
   })
 

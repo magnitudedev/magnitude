@@ -6,7 +6,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { ApplicationUpdateFailed } from "./application-update"
 import { installMacApplicationArchive } from "./mac-archive-installation"
 import { readInstalledUpdateConfiguration } from "./update-configuration"
-import { acquireApplicationMaintenance } from "../desktop-native/application-owner"
+import { acquireDesktopInstallation } from "../desktop-native/application-owner"
 import { nativeHostLayer } from "../desktop-native/index"
 import { nativeMacUpdateAdmission } from "../desktop-native/mac-update-lease"
 import { nativeMacUpdateFilesystem } from "../desktop-native/mac-update-filesystem"
@@ -52,7 +52,7 @@ export const runMacArchiveInstallerCommand = (payload: string, stateDirectory: s
     const configuration = yield* readInstalledUpdateConfiguration(resources)
     const offer = yield* verifyInstallationOffer(request.offer, { os: "darwin", arch: architecture, package: "mac-zip" },
       request.channel, configuration.trustedPublishers)
-    yield* acquireApplicationMaintenance(stateDirectory)
+    yield* acquireDesktopInstallation(stateDirectory)
     const stager = yield* makeMacUpdateArchiveStager({ helper: join(resources, "magnitude-extract"), architecture,
       trustedPublishers: configuration.trustedPublishers })
     yield* installMacApplicationArchive({ bundle, archive: request.archive, release: offer.release, architecture }).pipe(Effect.provideService(MacUpdateArchiveStager, stager))

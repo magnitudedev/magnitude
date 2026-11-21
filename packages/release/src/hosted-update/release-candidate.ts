@@ -17,6 +17,8 @@ export const hostedDesktopManifests = (
   const expected = new Map<string, { host: HostId; target: typeof UpdateManifest.Type.artifact.target }>()
   for (const host of releaseHosts) {
     const arch = host.id.includes("arm64") ? "arm64" : "x64"
+    const os = host.id.startsWith("darwin-") ? "darwin" : host.id.startsWith("linux-") ? "linux" : "windows"
+    expected.set(`cli-only-${host.id}`, { host: host.id, target: os === "windows" ? { os, arch: "x64", package: "cli-only" } : { os, arch, package: "cli-only" } })
     if (host.id.startsWith("darwin-")) {
       expected.set(`desktop-${host.id}`, { host: host.id, target: { os: "darwin", arch, package: "dmg" } })
       expected.set(`desktop-update-${host.id}`, { host: host.id, target: { os: "darwin", arch, package: "mac-zip" } })
@@ -33,7 +35,8 @@ export const hostedDesktopManifests = (
     const entry = expected.get(artifact.id)
     if (!entry || Option.getOrUndefined(artifact.host) !== entry.host) return yield* new HostedCandidateInvalid({ message: "Unexpected desktop artifact identity or host" })
     expected.delete(artifact.id)
-    const suffix = entry.target.os === "linux" ? linuxPackageExtension(entry.target.package)
+    const suffix = entry.target.package === "cli-only" ? ".tar.gz"
+      : entry.target.os === "linux" ? linuxPackageExtension(entry.target.package)
       : entry.target.package === "mac-zip" ? ".zip" : entry.target.package === "windows-exe" ? ".exe" : `.${entry.target.package}`
     if (!artifact.filename.endsWith(suffix)) return yield* new HostedCandidateInvalid({ message: "Desktop artifact filename differs from its package format" })
     manifests.push(yield* Schema.decodeUnknown(UpdateManifest)({

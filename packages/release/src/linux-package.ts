@@ -13,8 +13,8 @@ export const LinuxPackageFormat = Schema.Literal("deb", "rpm", "pacman")
 export type LinuxPackageFormat = typeof LinuxPackageFormat.Type
 /**
  * How an installed Linux payload was delivered: one of the packages, or the Docker image that installs
- * the DEB. Only the packages take part in the release matrices; a Docker installation's update checks
- * are answered with the DEB's signed release, which its image is built from.
+ * the CLI-only payload. Only the packages take part in the release matrices; a Docker installation's
+ * update checks are answered with the CLI-only payload's signed release, which its image is built from.
  */
 export const LinuxInstallationKind = Schema.Literal(...LinuxPackageFormat.literals, "docker")
 export type LinuxInstallationKind = typeof LinuxInstallationKind.Type

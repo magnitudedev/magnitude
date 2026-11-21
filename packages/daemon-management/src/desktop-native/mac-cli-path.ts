@@ -16,14 +16,18 @@ const fishBlock = `\n${begin}
 fish_add_path --path --move --prepend "$HOME/${MAC_CLI_DIRECTORY}"
 ${end}\n`
 
-export const makeMacCliPath = (home: string, environment: Readonly<Record<string, string>>) => Effect.gen(function* () {
+/** `zshWhenPresent`: outside macOS, where zsh is not the default shell, its startup files are only edited when zsh is in use. */
+export const makeMacCliPath = (home: string, environment: Readonly<Record<string, string>>, zshWhenPresent = false) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const read = (path: string) => fs.readFileString(path).pipe(
     Effect.catchAll(error => error._tag === "SystemError" && error.reason === "NotFound"
       ? Effect.succeed("") : Effect.fail(error)),
   )
   const zsh = environment.ZDOTDIR || home
-  const files = [join(zsh, ".zprofile"), join(zsh, ".zshrc")]
+  const files: string[] = []
+  for (const path of [join(zsh, ".zprofile"), join(zsh, ".zshrc")]) {
+    if (!zshWhenPresent || environment.SHELL?.endsWith("/zsh") || (yield* fs.exists(path))) files.push(path)
+  }
   // Do not create a higher-priority login profile that hides existing user configuration.
   let bashProfile = join(home, ".bash_profile")
   for (const name of [".bash_profile", ".bash_login", ".profile"]) {

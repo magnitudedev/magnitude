@@ -14,7 +14,7 @@ const write = (path: string, value: unknown) => writeFile(path, JSON.stringify(v
 const notary = (unit: string) => ({ id: `accepted-${unit}`, unit, status: "Accepted", inputSha256: "b".repeat(64) })
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "magnitude-apple-receipts-"))
-  const groups = releaseHosts.filter((host) => host.id.startsWith("darwin-")).map((host) => ({ directory: host.id, host: host.id, ids: [...["cli", "acn", "icn-base", "desktop"].map((kind) => ({ id: `${kind}-${host.id}`, kind })), { id: `desktop-update-${host.id}`, kind: "desktop" }], units: ["cli", "inference", "app", "desktop"], stapledApp: true }))
+  const groups = releaseHosts.filter((host) => host.id.startsWith("darwin-")).map((host) => ({ directory: host.id, host: host.id, ids: [...["cli", "acn", "icn-base", "desktop"].map((kind) => ({ id: `${kind}-${host.id}`, kind })), { id: `desktop-update-${host.id}`, kind: "desktop" }, { id: `cli-only-${host.id}`, kind: "desktop" }], units: ["cli", "inference", "app", "desktop", "cli-only"], stapledApp: true }))
   for (const group of groups) {
     const directory = join(root, group.directory)
     await mkdir(directory)
@@ -22,7 +22,7 @@ beforeEach(async () => {
     for (const { id, kind } of group.ids) {
       const sha256 = createHash("sha256").update(id).digest("hex")
       artifacts.push({ id, sha256 })
-      const filename = `${id}.${id.startsWith("desktop-update-") ? "zip" : kind === "desktop" ? "dmg" : "tar.gz"}`
+      const filename = `${id}.${id.startsWith("desktop-update-") ? "zip" : id.startsWith("cli-only-") ? "tar.gz" : kind === "desktop" ? "dmg" : "tar.gz"}`
       await writeFile(join(directory, filename), id)
       await write(join(directory, `${id}.artifact.json`), { id, kind, host: group.host, filename, bytes: id.length, sha256 })
     }

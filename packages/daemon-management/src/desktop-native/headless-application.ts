@@ -4,7 +4,7 @@ import { LoginStartupFailed, type OwnedServiceState } from "@magnitudedev/sdk/de
 import type { OwnerCapability } from "@magnitudedev/acn-protocol"
 import type { UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 import { unavailableApplicationUpdate, type ApplicationUpdate } from "../application-update/application-update"
-import { makeHeadlessUpdateControl, reportUpdateOutcome } from "../application-update/headless-update"
+import { makeHeadlessUpdateControl, packageInstallRefusal, reportUpdateOutcome, type HeadlessInstall } from "../application-update/headless-update"
 import { containerUpdateRefusal } from "../application-update/container-update"
 import { UpdateHardwareSource, updateHardwareFromService } from "../application-update/update-hardware"
 import { WindowsPipeName, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native"
@@ -25,8 +25,8 @@ import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/n
 export class HeadlessApplicationFailed extends Schema.TaggedError<HeadlessApplicationFailed>()("HeadlessApplicationFailed", { message: Schema.String }) {}
 
 const windowsUncontainedServe = "On Windows, start `magnitude serve` with the Magnitude command, "
-  + "%LOCALAPPDATA%\\Programs\\Magnitude CLI\\magnitude.exe, not the app's resources\\magnitude.exe. "
-  + "Service wrappers such as NSSM and scheduled tasks must start that command too."
+  + "%LOCALAPPDATA%\\Programs\\Magnitude CLI\\magnitude.exe, which contains the server's processes, "
+  + "not a magnitude.exe inside the app's resources or a CLI-only version folder. Scheduled tasks and service wrappers such as NSSM must start that command too."
 
 /**
  * In a Docker installation the image is the installation and the container's lifecycle is the
@@ -75,13 +75,13 @@ export const runHeadlessApplication = (options: {
   // Only the Magnitude command launcher contains a Windows server's process tree.
   if (process.platform === "win32") yield* native.guardParent(0).pipe(Effect.mapError(() => new HeadlessApplicationFailed({ message: windowsUncontainedServe })))
   const serviceStarted = yield* native.isServiceSession.pipe(Effect.mapError(error => new HeadlessApplicationFailed({ message: error.message })))
-  const owner = yield* acquireApplicationOwner(options.stateDirectory, { _tag: "Headless" }, options.profile.sharedControl)
+  const owner = yield* acquireApplicationOwner(options.stateDirectory, { _tag: "Headless" })
   if (owner._tag !== "Owner") return yield* new HeadlessApplicationFailed({ message: "Magnitude is already running." })
   if (yield* isUpdateInstallationActive(options.stateDirectory)) return yield* new HeadlessApplicationFailed({ message: "A Magnitude update is being installed. Run `magnitude serve` when it finishes." })
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   if (options.prepareStartup) yield* Effect.raceFirst(options.prepareStartup, Deferred.await(stop))
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
-  if (options.runtime._tag === "Installed") {
+  if (options.runtime._tag === "Installed" && options.runtime.layout === "Desktop") {
     if (process.platform === "linux") yield* acquireLinuxInstallationLease(addon)
     if (process.platform === "darwin") {
       const bundle = dirname(dirname(options.runtime.resourcesDirectory))
@@ -98,7 +98,9 @@ export const runHeadlessApplication = (options: {
   // Update checks start once the service is ready, so a new version reports `applied` only after it starts.
   const firstReady = yield* Deferred.make<void>()
   const report = (reason: UpdateCheckReason) => reportUpdateOutcome(updates, reason)
-  const update = yield* makeHeadlessUpdateControl(updates, Deferred.await(firstReady), options.container ? containerUpdateRefusal(options.container.image) : undefined)
+  const install: HeadlessInstall = options.container ? { _tag: "Refuse", message: containerUpdateRefusal(options.container.image) }
+    : options.runtime._tag === "Installed" && options.runtime.layout === "Standalone" && options.installWhenIdle ? { _tag: "WhenIdle" } : packageInstallRefusal
+  const update = yield* makeHeadlessUpdateControl(updates, Deferred.await(firstReady), install)
   if (options.updateReady) {
     const notify = options.updateReady
     yield* updates.changes.pipe(Stream.map(state => state.transfer), Stream.changesWith((a, b) =>
@@ -114,7 +116,9 @@ export const runHeadlessApplication = (options: {
         case "DiscardUpdate": return ownerResult(update("discard"))
         case "InstallUpdate": return ownerResult(update("install"))
         case "SetAutoDownload": return ownerResult(updates.setAutoDownload(request.enabled))
-        case "Quit": return options.container ? ownerUnsupported : Effect.succeed(ownerDone(Deferred.succeed(stop, "Requested").pipe(Effect.asVoid)))
+        // The desktop in another account sends Quit to take the port (`takeOverServicePort`). The server waits as it does
+        // for a Yield, instead of exiting into a service manager's restart that would take the port back before the desktop binds it.
+        case "Quit": return options.container ? ownerUnsupported : Effect.succeed(ownerDone(Deferred.succeed(stop, "DesktopTakeover").pipe(Effect.asVoid)))
         // Restarting re-admits the owner, so settings that apply at service start take effect.
         case "RestartService": return Effect.succeed(ownerDone(Deferred.succeed(stop, "Restart").pipe(Effect.asVoid)))
         case "SetLoginStartup": return ownerUnsupported
@@ -132,7 +136,7 @@ export const runHeadlessApplication = (options: {
   if (process.platform === "win32") {
     const name = yield* Schema.decodeUnknown(WindowsPipeName)(owner.socketPath)
     yield* serveWindowsApplicationControl(name, control).pipe(Effect.provide(nativeWindowsPrivatePipesLayer(addon)))
-  } else yield* serveApplicationControl(owner.socketPath, control, options.profile.sharedControl)
+  } else yield* serveApplicationControl(owner.socketPath, control)
   yield* service.changes.pipe(Stream.runForEach(state => (state._tag === "Ready" ? Deferred.succeed(firstReady, undefined) : Effect.void).pipe(
     Effect.zipRight(options.observe(state)))), Effect.forkScoped)
   if (options.installWhenIdle) {

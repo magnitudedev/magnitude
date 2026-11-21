@@ -135,7 +135,6 @@ const makeApplicationSession = Effect.gen(function* () {
           case "StopModel": return models.stop.pipe(Effect.asVoid, Effect.catchAll(Effect.logError))
           case "ShowNotice": return Effect.sync(() => registry.set(notices, [...registry.get(notices), action.notice]))
           case "QuitFailed": return Effect.sync(() => registry.set(quitFailed, true))
-          case "OpenHuggingFaceModel": return requestAddModel({ _tag: "HuggingFace", repository: action.repository, file: action.file })
         }
       }),
       Effect.catchAll(Effect.logError),

@@ -8,10 +8,12 @@ import { hostedUpdateSource } from "./hosted-update-source"
 import { makeUpdateIdentity } from "./update-identity"
 import { readLinuxUpdateMetadata } from "./update-metadata"
 import { readInstalledUpdateConfiguration } from "./update-configuration"
+import type { InstallationLayout } from "../desktop-native/application-bootstrap"
 
 /** Construction is observational. Source acquisition belongs after application or maintenance admission. */
 export const makeInstalledUpdatePreparation = (options: {
   readonly resources: string
+  readonly layout: InstallationLayout
   readonly addonPath: string
   readonly dataDirectory: string
   readonly version: string
@@ -24,10 +26,10 @@ export const makeInstalledUpdatePreparation = (options: {
 }) => Effect.gen(function* () {
   const configuration = yield* readInstalledUpdateConfiguration(options.resources)
   const metadata = options.platform === "linux"
-    ? yield* readLinuxUpdateMetadata(options.resources, options.version, options.osVersion, options.owner)
+    ? yield* readLinuxUpdateMetadata(options.resources, options.layout, options.version, options.osVersion, options.owner)
     : yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: options.version, os_version: options.osVersion, owner: options.owner,
       os: options.platform === "win32" ? "windows" : "darwin", arch: options.architecture,
-      package: options.platform === "win32" ? "windows-exe" : "mac-zip" })
+      package: options.layout === "Standalone" ? "cli-only" : options.platform === "win32" ? "windows-exe" : "mac-zip" })
   const target = yield* releaseTargetOf(metadata)
   const store = yield* makePreparedUpdateStore({ dataDirectory: options.dataDirectory, target, trustedPublishers: configuration.trustedPublishers })
   const preferences = yield* makeUpdatePreferences(options.dataDirectory)
@@ -37,7 +39,7 @@ export const makeInstalledUpdatePreparation = (options: {
     })
     const identity = yield* makeUpdateIdentity(options.dataDirectory)
     const stage = (archive: string, release: Parameters<typeof store.prepare>[1]) => Effect.gen(function* () {
-      if (options.platform === "win32") {
+      if (options.platform === "win32" && options.layout === "Desktop") {
         if (Option.isNone(configuration.windowsPublisher)) return yield* new ApplicationUpdateFailed({ message: "The Windows update publisher is missing." })
         yield* Effect.flatMap(WindowsInstallerVerifier, verifier => verifier.verify(archive)).pipe(
           Effect.provide(nativeWindowsInstallerVerifier(options.addonPath, configuration.windowsPublisher.value)))

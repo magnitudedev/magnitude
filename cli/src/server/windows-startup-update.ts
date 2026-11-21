@@ -11,7 +11,7 @@ export const runWindowsInstalledUpdate = (runtime: ApplicationRuntime, profile: 
   if (runtime._tag !== "Installed" || process.platform !== "win32") return false
   const addon = applicationNativeHostPath(runtime, "win32", "x64")
   return yield* Effect.gen(function* () {
-    const preparation = yield* makeInstalledUpdatePreparation({ resources: runtime.resourcesDirectory, addonPath: addon,
+    const preparation = yield* makeInstalledUpdatePreparation({ resources: runtime.resourcesDirectory, layout: runtime.layout, addonPath: addon,
       dataDirectory: profile.dataDirectory, version: CLI_VERSION, osVersion: release(), platform: "win32", architecture: "x64", isolated: profile.isolated, owner: "headless" })
     const publisher = preparation.configuration.windowsPublisher
     if (Option.isNone(publisher)) return yield* new ApplicationUpdateFailed({ message: "The Windows update publisher is missing." })

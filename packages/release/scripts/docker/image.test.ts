@@ -1,6 +1,6 @@
 import { Effect, Exit } from "effect"
 import { describe, expect, it } from "vitest"
-import { debArtifactId, imageTags, parseDockerArchitecture } from "./image"
+import { cliOnlyArtifactId, imageTags, parseDockerArchitecture } from "./image"
 
 describe("Docker image", () => {
   it("tags a stable release with its version and latest", () => {
@@ -27,9 +27,9 @@ describe("Docker image", () => {
     }
   })
 
-  it("maps Docker architectures to the release's Debian packages", () => {
-    expect(debArtifactId(Effect.runSync(parseDockerArchitecture("amd64")))).toBe("desktop-linux-x64-gnu-deb")
-    expect(debArtifactId(Effect.runSync(parseDockerArchitecture("arm64")))).toBe("desktop-linux-arm64-gnu-deb")
+  it("maps Docker architectures to the release's CLI-only payloads", () => {
+    expect(cliOnlyArtifactId(Effect.runSync(parseDockerArchitecture("amd64")))).toBe("cli-only-linux-x64-gnu")
+    expect(cliOnlyArtifactId(Effect.runSync(parseDockerArchitecture("arm64")))).toBe("cli-only-linux-arm64-gnu")
     expect(Exit.isFailure(Effect.runSyncExit(parseDockerArchitecture("x86_64")))).toBe(true)
   })
 })

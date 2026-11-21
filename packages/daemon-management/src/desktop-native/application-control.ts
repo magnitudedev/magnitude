@@ -37,7 +37,7 @@ export interface ApplicationControlOptions {
 }
 
 /** The server profile admits every local account to its control socket, as loopback HTTP already does. */
-export const serveApplicationControl = (path: string, options: ApplicationControlOptions, sharedControl = false) => Effect.gen(function* () {
+export const serveApplicationControl = (path: string, options: ApplicationControlOptions) => Effect.gen(function* () {
   if (process.platform === "win32") return yield* new ApplicationControlFailed({ message: "Windows application control requires the named-pipe ACL adapter" })
   yield* validateUnixControlPath(path)
   yield* Effect.tryPromise({ try: async () => {
@@ -69,7 +69,7 @@ export const serveApplicationControl = (path: string, options: ApplicationContro
       await new Promise<void>(resolve => server.close(() => resolve()))
       await unlink(path).catch(error => { if (error.code !== "ENOENT") throw error })
     }),
-  ).pipe(Effect.tap(() => Effect.tryPromise({ try: () => chmod(path, sharedControl ? 0o666 : 0o600), catch: failure })), Effect.tap(() => Deferred.succeed(listening, undefined))))
+  ).pipe(Effect.tap(() => Effect.tryPromise({ try: () => chmod(path, 0o600), catch: failure })), Effect.tap(() => Deferred.succeed(listening, undefined))))
   const worker = yield* serveApplicationRequests(connections.pipe(Stream.tapError(error => Deferred.fail(listening, error))), options)
   yield* Deferred.await(listening)
   return worker

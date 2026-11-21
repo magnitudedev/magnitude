@@ -112,6 +112,13 @@ describe.skipIf(process.platform === "win32")("legacy Linux user service", () =>
     await expect(run(f.adapter.inspect)).rejects.toThrow()
     expect(mutations(f.calls)).toEqual([])
   })
+  it("leaves the person's own magnitude.service alone, whatever its overrides", async () => {
+    const f = await fixture()
+    await writeFile(path, "[Unit]\nDescription=Magnitude (magnitude serve)\n\n[Service]\nExecStart=%h/.magnitude/bin/magnitude serve\nRestart=always\n\n[Install]\nWantedBy=default.target\n")
+    f.state.DropInPaths = "/home/someone/.config/systemd/user/magnitude.service.d/engine.conf"
+    expect(Option.isNone(await run(f.adapter.inspect))).toBe(true)
+    expect(mutations(f.calls)).toEqual([])
+  })
   it("rejects custom hooks and changed source before any manager mutation", async () => {
     const f = await fixture()
     const snapshot = Option.getOrThrow(await run(f.adapter.inspect))

@@ -1,14 +1,11 @@
 import { applicationDataDirectory, desktopApplication, desktopIsolatedProfile, desktopServiceOrigin, readDesktopLoginStartup, updateDesktopApplication } from "../server/application"
 import { containerUpdateNotice } from "@magnitudedev/daemon-management/application-update"
-import { isServerSetUp } from "../server/serve-owner"
-import { serverLogs, serverNotRunning, serviceFailureLine } from "../server/server-setup"
 import { readServerReach, renderServerReach, type ServerReach } from "../server/server-reach"
 import { formatLocalModelDisplayName, localModelResidency } from "@magnitudedev/client-common"
 import type { ApplicationOwner } from "@magnitudedev/sdk/desktop-host"
 import { Command, CommandExecutor, FetchHttpClient, FileSystem, HttpClient, HttpClientResponse } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { Clock, Effect, Option } from "effect"
-import { MAC_SERVER_LABEL, MAC_SERVER_PLIST } from "@magnitudedev/daemon-management/desktop-native"
 import { AcnHealthResponseSchema, type AcnHealthResponse } from "@magnitudedev/sdk"
 import { isIP } from "node:net"
 import { userInfo } from "node:os"
@@ -28,9 +25,6 @@ interface ServiceStatusPresentation {
   readonly activeModel: { readonly _tag: "Unavailable" } | { readonly _tag: "Observed"; readonly model: Option.Option<ActiveModel> }
   readonly owner: Option.Option<ApplicationOwner>
   readonly reach: Option.Option<ServerReach>
-  readonly server: boolean
-  readonly failing: Option.Option<ServerFailing>
-  readonly loaded: Option.Option<boolean>
   readonly elsewhere: Option.Option<Elsewhere>
   readonly retrying: Option.Option<StartupRetry>
   readonly imageNotice: Option.Option<string>
@@ -53,26 +47,6 @@ const startupRetry = (health: AcnHealthResponse, now: number): Option.Option<Sta
  */
 export type Elsewhere = { readonly _tag: "OtherAccount"; readonly account: string } | { readonly _tag: "Unknown" }
 
-/** A system service that systemd keeps restarting, with the service's own last error when the journal is readable. */
-interface ServerFailing {
-  readonly restarts: number
-  readonly lastError: Option.Option<string>
-}
-
-const readServerFailing = Effect.gen(function* () {
-  const executor = yield* CommandExecutor.CommandExecutor
-  const output = (command: string, ...args: string[]) => executor.string(Command.make(command, ...args)).pipe(
-    Effect.timeout("3 seconds"), Effect.orElseSucceed(() => ""))
-  const unit = new Map((yield* output("/usr/bin/systemctl", "show", "magnitude.service", "--property=NRestarts,Result,ActiveState"))
-    .split("\n").map(line => line.split("=", 2) as [string, string | undefined]))
-  const restarts = Number(unit.get("NRestarts"))
-  // An administrator's stop leaves the restart count but a successful result.
-  const failed = (unit.get("Result") ?? "success") !== "success" || (restarts > 0 && unit.get("ActiveState") !== "inactive")
-  if (!Number.isInteger(restarts) || !failed) return Option.none<ServerFailing>()
-  const journal = yield* output("/usr/bin/journalctl", "-u", "magnitude.service", "-n", "300", "-o", "cat", "--no-pager", "--quiet")
-  return Option.some({ restarts, lastError: serviceFailureLine(journal.split("\n")) })
-}).pipe(Effect.provide(BunContext.layer))
-
 /** The uid that owns the socket listening on a loopback or wildcard address at `port`, from `/proc/net/tcp` or `tcp6`. */
 export const listeningUid = (table: string, port: number): Option.Option<number> => {
   const hexPort = port.toString(16).toUpperCase().padStart(4, "0")
@@ -81,13 +55,10 @@ export const listeningUid = (table: string, port: number): Option.Option<number>
   return Option.fromNullable(row?.[7]).pipe(Option.map(Number), Option.filter(Number.isInteger))
 }
 
-/** Who owns the service answering on the port, where the system says: the macOS server plist, or Linux's socket table. */
+/** Who owns the service answering on the port, where the system says: Linux's socket table. */
 const portAccount = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const read = (path: string) => fs.readFileString(path).pipe(Effect.orElseSucceed(() => ""))
-  if (process.platform === "darwin") {
-    return Option.fromNullable(/<key>UserName<\/key>\s*<string>([^<]+)<\/string>/.exec(yield* read(MAC_SERVER_PLIST))?.[1])
-  }
   if (process.platform !== "linux") return Option.none<string>()
   const port = Number(new URL(desktopServiceOrigin).port)
   const tables = [yield* read("/proc/net/tcp"), yield* read("/proc/net/tcp6")]
@@ -112,12 +83,6 @@ const readElsewhere: Effect.Effect<Option.Option<{ readonly health: AcnHealthRes
   const elsewhere: Elsewhere = Option.match(account, { onNone: () => ({ _tag: "Unknown" }), onSome: account => ({ _tag: "OtherAccount", account }) })
   return Option.some({ health, elsewhere })
 }).pipe(Effect.scoped, Effect.timeout("2 seconds"), Effect.orElseSucceed(() => Option.none()), Effect.provide([FetchHttpClient.layer, BunContext.layer]))
-
-/** Whether launchd has the macOS server daemon loaded, which decides how it is started again. */
-const readMacServerLoaded = Effect.flatMap(CommandExecutor.CommandExecutor, executor =>
-  executor.exitCode(Command.make("/bin/launchctl", "print", `system/${MAC_SERVER_LABEL}`).pipe(Command.stdout("pipe"), Command.stderr("pipe")))).pipe(
-  Effect.timeout("3 seconds"), Effect.map(code => Option.some(code === 0)), Effect.orElseSucceed(() => Option.none<boolean>()),
-  Effect.provide(BunContext.layer))
 
 const serviceAddress = new URL(desktopServiceOrigin).host
 
@@ -151,20 +116,18 @@ const ownStatus = desktopApplication.observe.pipe(
       Effect.timeout("2 seconds"),
       Effect.orElseSucceed(() => ({ _tag: "Unavailable" } as const)),
     ) : Effect.succeed({ _tag: "Unavailable" } as const)
-    const reach = state?._tag === "Ready" ? Effect.all([applicationDataDirectory, isServerSetUp]).pipe(
-      Effect.flatMap(([dataDirectory, service]) => readServerReach({ endpoint: desktopServiceOrigin, dataDirectory, service })), Effect.option)
+    const reach = state?._tag === "Ready" ? applicationDataDirectory.pipe(
+      Effect.flatMap(dataDirectory => readServerReach({ endpoint: desktopServiceOrigin, dataDirectory, service: false })), Effect.option)
       : Effect.succeed(Option.none<ServerReach>())
-    const failing = (server: boolean) => server && process.platform === "linux" && state?._tag !== "Ready" ? readServerFailing : Effect.succeed(Option.none<ServerFailing>())
-    const loaded = (server: boolean) => server && process.platform === "darwin" && Option.isNone(snapshot) ? readMacServerLoaded : Effect.succeed(Option.none<boolean>())
     // A container announces a newer image instead of installing it; nothing else reports it.
     const imageNotice = Option.isSome(snapshot) ? updateDesktopApplication("status").pipe(
       Effect.map(state => state.transfer._tag === "ImageAvailable" ? Option.some(containerUpdateNotice(state.transfer.version, state.transfer.image)) : Option.none<string>()),
       Effect.timeout("2 seconds"), Effect.orElseSucceed(() => Option.none<string>())) : Effect.succeed(Option.none<string>())
-    return Effect.all({ model: activeModel, reach, imageNotice, now: Clock.currentTimeMillis, server: isServerSetUp.pipe(Effect.flatMap(server => Effect.all({ server: Effect.succeed(server), failing: failing(server), loaded: loaded(server) }))), login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach, imageNotice, now, server: { server, failing, loaded } }): ServiceStatusPresentation => ({
+    return Effect.all({ model: activeModel, reach, imageNotice, now: Clock.currentTimeMillis, login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach, imageNotice, now }): ServiceStatusPresentation => ({
       status: state?._tag ?? "Stopped", address: serviceAddress,
       version: state?._tag === "Ready" ? Option.some(String(state.health.version)) : Option.none(),
       startsAutomaticallyOnLogin: login, activeModel: model,
-      owner: Option.map(snapshot, value => value.owner), reach, server, failing, loaded, elsewhere: Option.none(), imageNotice,
+      owner: Option.map(snapshot, value => value.owner), reach, elsewhere: Option.none(), imageNotice,
       retrying: state?._tag === "Starting" ? Option.flatMap(state.health, health => startupRetry(health, now)) : Option.none(),
     })))
   }),
@@ -174,15 +137,14 @@ const publicServiceStatus = ownStatus.pipe(Effect.flatMap(status => Option.isSom
   : Effect.all([readElsewhere, Clock.currentTimeMillis]).pipe(Effect.map(([found, now]) => Option.match(found, {
     onNone: () => status,
     onSome: ({ health, elsewhere }): ServiceStatusPresentation => ({
-      ...status, status: health.state._tag, version: Option.some(String(health.version)), failing: Option.none(),
+      ...status, status: health.state._tag, version: Option.some(String(health.version)),
       elsewhere: Option.some(elsewhere), retrying: startupRetry(health, now),
     }),
   })))))
 
-/** Where the system service is set up, a Headless owner is that service rather than someone's `serve`. */
 const ownerName = (status: ServiceStatusPresentation) => Option.match(status.owner, {
   onNone: () => Option.match(status.elsewhere, { onNone: () => "None",
-    onSome: other => other._tag === "OtherAccount" ? `Another account (${other.account})` : "Not this profile" }), onSome: owner => owner._tag === "Headless" && status.server ? "Server" : owner._tag })
+    onSome: other => other._tag === "OtherAccount" ? `Another account (${other.account})` : "Not this profile" }), onSome: owner => owner._tag })
 
 /** With network access active the service also listens on all interfaces or its configured address, as ACN resolves it. */
 const listeningAddress = (status: ServiceStatusPresentation) => {
@@ -193,7 +155,7 @@ const listeningAddress = (status: ServiceStatusPresentation) => {
   return `${status.address}, ${isIP(configured) === 6 ? `[${configured}]` : configured}:${network.port}`
 }
 
-export const renderStatus =(status: ServiceStatusPresentation, platform: NodeJS.Platform = process.platform): string => [
+export const renderStatus = (status: ServiceStatusPresentation): string => [
   "Magnitude service",
   `  Runtime         ${status.status}`,
   ...Option.match(status.retrying, { onNone: () => [], onSome: retry => [
@@ -217,17 +179,11 @@ export const renderStatus =(status: ServiceStatusPresentation, platform: NodeJS.
   ...Option.match(status.imageNotice, { onNone: () => [], onSome: notice => ["", notice] }),
   ...Option.match(status.elsewhere, { onNone: () => [], onSome: other => other._tag === "OtherAccount" ? ["",
     `Magnitude is running on this computer for another account (${other.account}). This account can't see or control it;`,
-    status.server ? "that account can stop it, or remove the server with `magnitude server remove`." : "that account can quit it."]
+    "that account can quit it."]
     : ["", "Another Magnitude is answering on this computer's port, outside this profile. This account can't see or control it."] }),
-  ...Option.match(status.failing, {
-    onSome: failing => ["", "Keeps failing to start",
-      `The Magnitude server keeps stopping as it starts (restarted ${failing.restarts} ${failing.restarts === 1 ? "time" : "times"}).`,
-      ...Option.match(failing.lastError, { onNone: () => [], onSome: line => [`Its last error: ${line}`] }),
-      `See its log: ${serverLogs(platform)}`],
-    onNone: () => Option.isNone(status.owner) && Option.isNone(status.elsewhere) ? [
-      "", "Not running", status.server ? serverNotRunning(platform, status.loaded) : "Open the Magnitude desktop app or run `magnitude serve`.",
-    ] : [],
-  }),
+  ...(Option.isNone(status.owner) && Option.isNone(status.elsewhere) ? [
+    "", "Not running", "Run `magnitude serve`, or open the Magnitude desktop app if it's installed.",
+  ] : []),
   "",
 ].join("\n")
 

@@ -99,8 +99,8 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
       yield* gate.withPermits(1)(SubscriptionRef.update(state, (current): State => current.transfer._tag === "Staging"
         ? { ...current, transfer: { _tag: "Ready", version: candidate.version } } : current))
     })).pipe(
+      Effect.catchAllDefect(() => Effect.fail(new ApplicationUpdateFailed({ message: "The update could not finish. Check again to retry." }))),
       Effect.catchAll(failTransfer),
-      Effect.catchAllDefect(() => failTransfer(new ApplicationUpdateFailed({ message: "The application update could not finish. Check again to retry." }))),
       Effect.ensuring(gate.withPermits(1)(Effect.gen(function* () {
         const current = yield* SubscriptionRef.get(state)
         if (current.transfer._tag !== "Cancelling") return

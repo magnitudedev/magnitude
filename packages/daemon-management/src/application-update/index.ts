@@ -15,6 +15,7 @@ export * from "./headless-update"
 export * from "./container-update"
 export * from "./linux-foreground-update"
 export * from "./windows-foreground-update"
+export * from "./standalone-installation"
 
 export { runMacInstallerCommand, MacInstallerRequest } from "./mac-installer-command"
 export { runMacArchiveInstallerCommand } from "./mac-archive-installer-command"

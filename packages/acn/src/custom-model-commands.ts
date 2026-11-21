@@ -118,7 +118,7 @@ const baseRelation: Record<Native.HuggingFaceBaseRelation, HuggingFaceBaseRelati
 
 const catalogHideRefusal = (modelId: ModelId) => new LocalModelMutationFailed({
   code: "catalog_model_not_hideable",
-  message: `${modelId} is a catalog model. Remove it with \`magnitude models rm ${modelId}\` instead.`,
+  message: `${modelId} is a recommended model. Remove it with \`magnitude models rm ${modelId}\` instead.`,
   retryable: false,
 })
 
@@ -899,7 +899,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         if (drafter._tag !== "Auto") {
           return yield* new InvalidModelReference({
             reference,
-            message: `${reference} is the catalog model ${catalogModel}, which comes with its drafter.`,
+            message: `${reference} is the recommended model ${catalogModel}, which comes with its drafter.`,
           })
         }
         if (yield* catalogSync.installed(catalogModel)) {

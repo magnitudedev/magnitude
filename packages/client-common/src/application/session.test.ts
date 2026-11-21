@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Context, Deferred, Effect, Either, Layer, Option, Schema, Stream } from "effect"
-import { HuggingFaceArtifactSelectorSchema, HuggingFaceRepositoryIdSchema } from "@magnitudedev/sdk/desktop-host"
 import { ApplicationSession, ApplicationSessionLive, HostAction, modelTrayPresentation } from "./session"
 import { ApplicationHost } from "./host"
 import { ApplicationRouterMemory } from "./router"
@@ -57,8 +56,6 @@ describe("tray model line", () => {
 })
 
 describe("host actions", () => {
-  const repository = HuggingFaceRepositoryIdSchema.make("unsloth/Qwen3.6-27B-GGUF")
-  const file = HuggingFaceArtifactSelectorSchema.make("Qwen3.6-27B-Q4_K_M.gguf")
   const withSession = <A, E>(
     actions: ReadonlyArray<HostAction>,
     use: (session: ApplicationSession, registry: Registry.Registry) => Effect.Effect<A, E>,
@@ -236,11 +233,6 @@ describe("host actions", () => {
     expect(registry.get(session.addModelRequest)).toEqual(Option.none())
   })))
 
-  it("opens a Hugging Face link on Models with the add request set", () => withSession([{ _tag: "OpenHuggingFaceModel", repository, file: Option.some(file) }], (session, registry) => Effect.sync(() => {
-    expect(registry.get(session.page)).toBe("models")
-    expect(registry.get(session.addModelRequest)).toEqual(Option.some({ _tag: "HuggingFace", repository, file: Option.some(file) }))
-  })))
-
   it("sets and clears a search request from the app itself", () => withSession([], (session, registry) => Effect.gen(function* () {
     yield* session.navigate("chat")
     expect(registry.get(session.addModelRequest)).toEqual(Option.none())
@@ -251,12 +243,8 @@ describe("host actions", () => {
     expect(registry.get(session.addModelRequest)).toEqual(Option.none())
   })))
 
-  it("decodes the wire form with and without a file and rejects unsafe values", () => {
+  it("rejects an unknown page on the wire", () => {
     const decode = Schema.decodeUnknownEither(HostAction)
-    expect(decode({ _tag: "OpenHuggingFaceModel", repository: "owner/repo" })).toEqual(Either.right({ _tag: "OpenHuggingFaceModel", repository: "owner/repo", file: Option.none() }))
-    expect(Either.isRight(decode({ _tag: "OpenHuggingFaceModel", repository: "owner/repo", file: "dir/model.gguf" }))).toBe(true)
-    expect(Either.isLeft(decode({ _tag: "OpenHuggingFaceModel", repository: "owner/repo/extra" }))).toBe(true)
-    expect(Either.isLeft(decode({ _tag: "OpenHuggingFaceModel", repository: "owner/repo", file: "../model.gguf" }))).toBe(true)
     expect(Either.isLeft(decode({ _tag: "Navigate", page: "discover" }))).toBe(true)
   })
 })

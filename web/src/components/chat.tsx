@@ -101,12 +101,12 @@ function ChatView({
         (error) => error._tag === "ChatNotFound"
       ))
   const messages = chat ? chatMessages(chat) : []
-  const { result: modelResult, models, localFor, nameOf, contextFor, contextLimitFor } = useChatModels()
+  const { result: modelResult, models, preferred, localFor, nameOf, contextFor, contextLimitFor } = useChatModels()
   const savedResult = useAtomValue(client.Chat.ListChatModelDefaults({})).result
   const saved = Result.isSuccess(savedResult) ? savedResult.value : {}
   const transcript = chatRequestSettings(chat?.messages ?? [])
   const modelId =
-    Option.getOrUndefined(draft.settings.model ?? transcript.model) ?? models[0]?.id
+    Option.getOrUndefined(draft.settings.model ?? transcript.model) ?? preferred
   const model = models.find((m) => m.id === modelId)
   // Each model's settings live in Settings → Chat; a chat chooses its model and thinking level, keeping the level
   // its latest response used until it chooses another.

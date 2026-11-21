@@ -17,7 +17,7 @@ export interface ServerReach {
   readonly endpoint: string
   readonly network: Option.Option<Pick<NetworkAccessSettings, "enabled" | "bind" | "interfaces" | "port" | "pending" | "container">>
   readonly configPath: string
-  /** Running as the system service: stopping it means removing the server, not Ctrl+C. */
+  /** Started by a service manager, which restarts it after Ctrl+C or a kill. */
   readonly service: boolean
   /** Running in a Kubernetes pod, where the container is reached and stopped through kubectl, not Docker. */
   readonly kubernetes: boolean
@@ -49,8 +49,8 @@ export const renderServerReach = (reach: ServerReach): readonly string[] => {
     lines.push(`From other devices: http://<this machine>:${network.port}; the browser app asks for the network access key.`)
   } else {
     lines.push(
-      "Only this computer can reach it. To use it from other devices, turn on network access in",
-      `Settings → Network access, or set "network": { "enabled": true } in ${reach.configPath} and restart.`,
+      "Only this computer can reach it. To use it from other devices, turn on network access in the browser app",
+      `(${reach.endpoint}, Settings → Network), or set "network": { "enabled": true } in ${reach.configPath} and restart.`,
       `Or reach it through an SSH tunnel: ${sshTunnel(reach.endpoint)}`,
     )
   }
@@ -91,10 +91,14 @@ export const readServerReach = (options: { readonly endpoint: string; readonly d
       endpoint: options.endpoint, network, configPath: join(options.dataDirectory, "config.json"), service: options.service, kubernetes: Option.isSome(kubernetes),
     })))
 
-/** How to stop the system service: systemd stops a Linux service in place; the macOS daemon is removed. */
+/**
+ * A service manager restarts a stopped `serve`, so it is stopped through its service. Windows tells a service only by
+ * its session, which a command run over SSH shares, so both are named.
+ */
 const stopService = (platform: NodeJS.Platform) => platform === "linux"
-  ? "Stop it with `sudo systemctl stop magnitude`; `magnitude server remove` removes the server."
-  : "Stop it with `magnitude server remove`."
+  ? "It runs as a systemd service; stop it with `systemctl stop` on its unit (for a user unit, `systemctl --user stop magnitude`)."
+  : platform === "darwin" ? "It runs as a launchd job; stop it with `launchctl bootout` on its job."
+  : "Started by its scheduled task, stop it with `Stop-ScheduledTask -TaskName \"Magnitude\"`; started over SSH, press Ctrl+C."
 
 /** Deleting a pod only makes its workload start another, so a pod is stopped by scaling the workload down. */
 const stopContainer = (reach: ServerReach) => reach.kubernetes

@@ -25,6 +25,8 @@ import releasePlan from "../release-plan.json"
 import {
   acnArchive,
   cliArchive,
+  cliOnlyArchive,
+  cliOnlyPayloadPaths,
   desktopInstaller,
   desktopUpdateArchive,
   hostById,
@@ -91,6 +93,7 @@ const expectedArtifacts = new Map<string, string>([
     [`cli-${host.id}`, cliArchive(host.id)] as const,
     [`acn-${host.id}`, acnArchive(host.id)] as const,
     [`icn-base-${host.id}`, icnBaseArchive(host.id)] as const,
+    [`cli-only-${host.id}`, cliOnlyArchive(host.id)] as const,
     ...(host.id === "darwin-arm64" || host.id === "darwin-x64" ? [[`desktop-${host.id}`, desktopInstaller(host.id)] as const, [`desktop-update-${host.id}`, desktopUpdateArchive(host.id)] as const] : []),
     ...(host.id === "linux-arm64-gnu" || host.id === "linux-x64-gnu"
       ? linuxPackageFormats(host.id === "linux-arm64-gnu" ? "arm64" : "x64").map(format => [`desktop-${host.id}-${format}`, linuxDesktopInstaller(host.id as "linux-arm64-gnu" | "linux-x64-gnu", format, version, ACN_COORDINATION_REVISION)] as const)
@@ -111,6 +114,11 @@ const validateLayout = async (
 ): Promise<void> => {
   if (artifact.kind === "desktop") {
     const host = Option.getOrThrow(artifact.host)
+    if (artifact.id === `cli-only-${host}`) {
+      // The payload runs from one directory, so its files are exactly the archive's root entries.
+      if (JSON.stringify(await archiveListing(archive)) !== JSON.stringify(cliOnlyPayloadPaths(host))) throw new Error(`${artifact.id} has an invalid CLI-only payload layout`)
+      return
+    }
     if (host === "windows-x64-msvc") {
       // Native Windows consumption validates the installer and its final payload.
       // Assembly only checks the container; a renamed arbitrary file is not an installer.
@@ -254,6 +262,7 @@ for (const host of candidateHosts.filter((candidate) => candidate.id.startsWith(
     archiveById.get(`cli-${host.id}`)!,
     archiveById.get(`acn-${host.id}`)!,
     archiveById.get(`icn-base-${host.id}`)!,
+    archiveById.get(`cli-only-${host.id}`)!,
   ])
 }
 

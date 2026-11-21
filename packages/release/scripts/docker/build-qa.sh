@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Builds a QA image on a Linux build host from a locally built .deb and the published engine of a
-# base release, for this host's architecture, and prints its digest.
+# Builds a QA image on a Linux build host from a locally built CLI-only payload
+# (magnitude-cli-only-<host>.tar.gz) and the published engine of a base release, for this host's
+# architecture, and prints its digest.
 #
-#   build-qa.sh --deb PATH --engine-version VERSION --tag IMAGE[:TAG] \
+#   build-qa.sh --payload PATH --engine-version VERSION --tag IMAGE[:TAG] \
 #     [--update-configuration PATH] [--push] [--smoke]
 #
 # Without --push the image is loaded into the local Docker engine; with --push it goes to the
@@ -10,11 +11,11 @@
 # acceptance/test-docker.sh against the built image. Needs bun (with `bun install` done in the
 # repository), docker with buildx, and git.
 set -euo pipefail
-usage() { echo 'Usage: build-qa.sh --deb PATH --engine-version VERSION --tag IMAGE[:TAG] [--update-configuration PATH] [--push] [--smoke]' >&2; exit 2; }
-deb='' engine_version='' tag='' update_configuration='' push=0 smoke=0
+usage() { echo 'Usage: build-qa.sh --payload PATH --engine-version VERSION --tag IMAGE[:TAG] [--update-configuration PATH] [--push] [--smoke]' >&2; exit 2; }
+payload='' engine_version='' tag='' update_configuration='' push=0 smoke=0
 while test "$#" -gt 0; do
   case "$1" in
-    --deb) deb=$(realpath "$2"); shift 2 ;;
+    --payload) payload=$(realpath "$2"); shift 2 ;;
     --engine-version) engine_version=$2; shift 2 ;;
     --tag) tag=$2; shift 2 ;;
     --update-configuration) update_configuration=$(realpath "$2"); shift 2 ;;
@@ -23,7 +24,7 @@ while test "$#" -gt 0; do
     *) usage ;;
   esac
 done
-test -n "$deb" && test -n "$engine_version" && test -n "$tag" || usage
+test -n "$payload" && test -n "$engine_version" && test -n "$tag" || usage
 
 case "$(uname -m)" in
   x86_64) arch=amd64 ;;
@@ -34,12 +35,14 @@ repository=$(cd "$(dirname "$0")/../../../.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/magnitude-docker-qa.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
 
-prepare=(--version "$engine_version" --arch "$arch" --output "$work/context" --deb "$deb")
+prepare=(--version "$engine_version" --arch "$arch" --output "$work/context" --payload "$payload")
 test -z "$update_configuration" || prepare+=(--update-configuration "$update_configuration")
 "${BUN:-bun}" "$repository/packages/release/scripts/docker/prepare-context.ts" "${prepare[@]}"
 
-# The package version is `<semver>-<revision>`, with `~` in place of a prerelease's `-`.
-version=$(dpkg-deb --field "$deb" Version 2>/dev/null | sed 's/-[0-9]*$//; s/~/-/' || true)
+# The payload's CLI runs on this host, which has the image's architecture.
+mkdir "$work/payload"
+tar -xzf "$payload" -C "$work/payload" magnitude
+version=$("$work/payload/magnitude" --version 2>/dev/null || true)
 build=(docker buildx build
   --platform "linux/$arch"
   --file "$repository/packaging/docker/Dockerfile"

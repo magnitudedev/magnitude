@@ -27,7 +27,7 @@ export const verifyAppleReceipts = (root: string, candidate?: string) => Effect.
     const receipt = yield* fs.readFileString(file).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(AppleDistributionReceipt))))
     if (receipt.sourceCommit !== expectedCommit || receipt.team !== team) return yield* fail("Apple receipt does not match the selected commit and publisher")
     const units = receipt.notarizations.map((value) => value.unit)
-    const requiredUnits = ["cli", "inference", "app", "desktop"]
+    const requiredUnits = ["cli", "inference", "app", "desktop", "cli-only"]
     if (units.length !== requiredUnits.length || requiredUnits.some((unit) => !units.includes(unit))) return yield* fail("Apple receipt is missing a native software submission")
     for (const artifact of receipt.artifacts) {
       if (accepted.has(artifact.id)) return yield* fail(`Duplicate Apple receipt for ${artifact.id}`)
@@ -39,7 +39,7 @@ export const verifyAppleReceipts = (root: string, candidate?: string) => Effect.
     }
   }
   const expected = releaseHosts.filter((host) => host.id.startsWith("darwin-")).flatMap((host) =>
-    [`cli-${host.id}`, `acn-${host.id}`, `icn-base-${host.id}`, `desktop-${host.id}`, `desktop-update-${host.id}`])
+    [`cli-${host.id}`, `acn-${host.id}`, `icn-base-${host.id}`, `desktop-${host.id}`, `desktop-update-${host.id}`, `cli-only-${host.id}`])
   if (expected.some((id) => !accepted.has(id)) || accepted.size !== expected.length) return yield* fail("Publication requires the complete Developer ID and notarization receipt graph")
   const consumed = new Set<string>()
   for (const file of files.filter((path) => path.endsWith("/apple-consumer.receipt.json"))) {

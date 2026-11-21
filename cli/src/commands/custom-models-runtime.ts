@@ -33,7 +33,7 @@ const requirePath = (input: string, what: string): Effect.Effect<string, ModelCo
 }
 
 export const catalogDrafterRefusal = (modelId: string): string =>
-  `${modelId} is a catalog model. Catalog models keep the drafter Magnitude ships with them; it changes only when you update with \`magnitude models pull ${modelId}\`.`
+  `${modelId} is a recommended model. Recommended models keep the drafter Magnitude ships with them; it changes only when you update with \`magnitude models pull ${modelId}\`.`
 
 export const SetDrafterResultSchema = Schema.extend(
   Schema.Struct({ modelId: CustomFormModelIdSchema }),

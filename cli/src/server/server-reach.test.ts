@@ -40,8 +40,8 @@ describe("serve ready output", () => {
   it("tells the service how to stop instead of Ctrl+C", () => {
     const linux = renderServeReady(reach({ service: true }), "linux")
     expect(linux).not.toContain("Ctrl+C")
-    expect(linux).toContain("Stop it with `sudo systemctl stop magnitude`; `magnitude server remove` removes the server.")
-    expect(renderServeReady(reach({ service: true }), "darwin")).toContain("Stop it with `magnitude server remove`.")
+    expect(linux).toContain("systemctl --user stop magnitude")
+    expect(renderServeReady(reach({ service: true }), "darwin")).toContain("launchctl bootout")
   })
   it("never prints the network access key", () => {
     const settings = { enabled: true, bind: Option.none(), port: 10100, pending: false, container: false, interfaces: [], apiKey: Option.some("secret-key"), requireApiKey: true }

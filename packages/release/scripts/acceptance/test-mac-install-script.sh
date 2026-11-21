@@ -67,7 +67,7 @@ if script.count(assignment) != 1:
 path.write_text(script.replace(assignment, 'destination=' + shlex.quote(sys.argv[2]) + '\n', 1))
 PY
 for pass in fresh repeat; do
-  bash "$root/install.sh" > "$root/$pass-install.log" 2>&1
+  bash "$root/install.sh" --desktop > "$root/$pass-install.log" 2>&1
   test "$("$HOME/.magnitude/bin/magnitude" --version)" = "$version"
   "$HOME/.magnitude/bin/magnitude" status > "$root/$pass-status.txt"
   grep -Eq 'Runtime[[:space:]]+Stopped' "$root/$pass-status.txt"
@@ -84,7 +84,7 @@ offer = json.loads(path.read_text())
 offer['release']['signature'] = base64.b64encode(bytes(64)).decode()
 path.write_text(json.dumps(offer))
 PY
-if bash "$root/install.sh" > "$root/rejected-install.log" 2>&1; then
+if bash "$root/install.sh" --desktop > "$root/rejected-install.log" 2>&1; then
   echo 'Invalid publisher signature was accepted' >&2; exit 1
 fi
 test "$("$HOME/.magnitude/bin/magnitude" --version)" = "$version"

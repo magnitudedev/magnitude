@@ -16,6 +16,40 @@ describe("Magnitude documentation", () => {
     }
   })
 
+  it("lists the headless topic first", () => {
+    expect(documentationTopics[0]?.id).toBe("headless")
+    const rows = renderDocumentationDirectory().split("\n").filter((line) => /^\S+\s{2,}\S/.test(line))
+    expect(rows[1]?.startsWith("headless ")).toBe(true)
+  })
+
+  it("documents background serving through the magnitude command on every OS", () => {
+    const result = resolveDocumentationCommand("headless")
+
+    expect(result._tag).toBe("Success")
+    if (result._tag === "Failure") return
+    expect(result.output).toContain("Ask your user before setting this up.")
+    expect(result.output).toContain("<string>$HOME/.magnitude/bin/magnitude</string><string>serve</string>")
+    expect(result.output).toContain("sudo launchctl bootstrap system /Library/LaunchDaemons/dev.magnitude.serve.plist")
+    expect(result.output).not.toContain("LaunchAgents")
+    expect(result.output).toContain("<key>UserName</key>")
+    expect(result.output).toContain("ExecStart=%h/.magnitude/bin/magnitude serve")
+    expect(result.output).toContain("sudo loginctl enable-linger $USER")
+    expect(result.output).toContain("New-ScheduledTaskTrigger -AtStartup")
+    expect(result.output).toContain("-RepetitionInterval (New-TimeSpan -Minutes 1)")
+    expect(result.output).not.toContain("-AtLogOn")
+    expect(result.output).toContain("-ExecutionTimeLimit ([TimeSpan]::Zero)")
+    expect(result.output).toContain("Unregister-ScheduledTask")
+    expect(result.output).toContain("autoDownloadUpdates")
+    expect(result.output).not.toMatch(/cli\/(current|<version>|\d)[^`\n]*magnitude serve/)
+  })
+
+  it("no longer documents server mode", () => {
+    for (const topic of documentationTopics) {
+      expect(topic.markdown).not.toContain("server setup")
+      expect(topic.markdown).not.toContain("server remove")
+    }
+  })
+
   it("returns bundled Markdown with exactly one trailing newline", () => {
     const result = resolveDocumentationCommand("custom-endpoints")
 
@@ -40,7 +74,7 @@ describe("Magnitude documentation", () => {
     if (result._tag === "Failure") return
     expect(result.output).toContain("# Speculative decoding methods")
     expect(result.output).toContain(
-      "None (usually slowest) -> MTP -> DFlash -> DSpark -> LiLiCorr (usually fastest)",
+      "None (usually slowest) -> MTP -> DFlash -> DSpark -> DFlash2 -> LiLiCorr (usually fastest)",
     )
     expect(result.output).toContain("Magnitude then activates the method automatically")
     expect(result.output).toContain("typical ordering, not a guarantee")
@@ -52,14 +86,14 @@ describe("Magnitude documentation", () => {
     expect(result._tag).toBe("Success")
     if (result._tag === "Failure") return
     expect(result.output).toContain("# Model recommendations")
-    expect(result.output).toContain("Artificial Analysis Intelligence Index")
+    expect(result.output).toContain("Epoch AI's Capabilities Index")
     expect(result.output).toContain("estimated to decode at 20 tokens per second or more")
     expect(result.output).toContain("`--country US` recommends only")
     expect(result.output).toContain("each assessed context")
-    expect(result.output).toContain("useful reference points")
+    expect(result.output).toContain("How intelligence is measured")
     expect(result.output).toContain("magnitude docs speculative-methods")
-    expect(result.output).toContain("GPT-5.6 Sol")
-    expect(result.output).toContain("Claude Opus 5")
+    expect(result.output).toContain("Epoch published")
+    expect(result.output).toContain("Bridged")
     expect(result.output).not.toContain("utility =")
     expect(result.output).not.toContain("25K")
     expect(result.output).not.toContain("50K")

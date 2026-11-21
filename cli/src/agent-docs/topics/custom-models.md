@@ -1,6 +1,6 @@
 # Custom models
 
-Magnitude runs any GGUF whose model family the engine has kernels for, not only catalog models:
+Magnitude runs any GGUF whose model family the engine has kernels for, not only the models it recommends:
 other quantizations, finetunes, merges, and abliterated or uncensored versions. Models come from
 two places:
 
@@ -29,7 +29,7 @@ magnitude models load <model-id>
 `models search` lists repositories with the base model each derives from (fine-tune, merge, adapter
 or quant of it), the recommended quant with its size, estimated speed and placement on this
 computer, and downloads. Results whose architecture Magnitude doesn't run follow in their own table
-with the architecture and the reason. `models show <model-id>` of a catalog model lists its other
+with the architecture and the reason. `models show <model-id>` of a recommended model lists its other
 quants and prints the search that finds other versions.
 
 `models show` with a huggingface.co link, `owner/repo`, or `owner/repo:QUANT` changes nothing. It
@@ -44,9 +44,9 @@ current commit and prints the model ID. If that version is already on this compu
 drafter downloads. A version Magnitude can't run is refused with the reason; one that needs more
 memory than this computer can provide is refused unless you pass `--force`. A gated repository
 says what it needs: run `magnitude hf login` to sign in, or accept the model's terms on
-its Hugging Face page (some models also need the author's approval), then try again. A catalog model ID keeps working exactly as before. A custom model ID updates
+its Hugging Face page (some models also need the author's approval), then try again. A recommended model's ID downloads or updates that model. A custom model ID updates
 that model: an added model to its repository's newer commit, and any model to a newer revision of
-its catalog drafter.
+its recommended model's drafter.
 
 ## Drafters
 
@@ -55,11 +55,11 @@ stand behind are chosen automatically, and the first one the engine binds, in th
 preselected:
 
 1. a separate drafter in the model's own repository, or its folder for a local file;
-2. the catalog drafter trained for the matching catalog model;
+2. the drafter trained for the matching recommended model;
 3. MTP heads built into the model;
 4. no drafter.
 
-Within one source, methods go DFlash2, DSpark, DFlash, a separate MTP file, then built-in MTP heads,
+Within one source, methods go LiLiCorr, DFlash2, DSpark, DFlash, a separate MTP file, then built-in MTP heads,
 and ties go to the smaller download. Magnitude never searches Hugging Face for drafters. A drafter
 you name is checked like the others but is never chosen automatically.
 
@@ -68,22 +68,22 @@ you name is checked like the others but is never chosen automatically.
 - `auto`: the preselected drafter (the default);
 - `none`: no drafter;
 - `built-in`: MTP heads inside the model;
-- a catalog model ID, which uses that model's drafter;
+- a recommended model's ID, which uses that model's drafter;
 - a Hugging Face file (a huggingface.co link, `owner/repo/path.gguf`, `hf:owner/repo/path.gguf`, or
   `owner/repo:path.gguf`) or a local GGUF path.
 
 A drafter the engine rejects for the model is refused with the reason. One whose lineage doesn't
-match is allowed and marked untested. Catalog models keep the drafter Magnitude ships with them, so
+match is allowed and marked untested. Recommended models keep the drafter Magnitude ships with them, so
 `models drafter` refuses them. `models show <model-id>` shows the drafter in use and every choice
 with its label, its verdict, and the argument that selects it. A found or added model whose
 recommended drafter isn't on this computer shows "Faster with a drafter · Add"; `models drafter
 <model-id> auto` downloads only the drafter. A drafter whose bytes are already in any location, another
-app's included, is used where it is and never downloaded. When a catalog drafter gets a new revision,
+app's included, is used where it is and never downloaded. When a recommended model's drafter gets a new revision,
 `models list` shows Update for every model using it; `models pull <model-id>` downloads it.
 
 ## What's on this computer
 
-`models list` lists catalog models on this computer and every custom model with its quant, size,
+`models list` lists recommended models on this computer and every custom model with its quant, size,
 estimated speed, served context (marked when below the model's own), source (Magnitude, HF cache,
 LM Studio, llama.cpp, Ollama, or folder) and status, then counts the models that can't run in
 Magnitude and hidden models, and ends with the assessment progress. `--all` lists both: models that

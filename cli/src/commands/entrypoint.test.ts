@@ -69,7 +69,7 @@ describe("headless CLI entrypoint", () => {
       const result = await invoke(args, { MAGNITUDE_DEV_DATA_DIR: profile, MAGNITUDE_DEV_PORT: "11168" })
       expect(result).toEqual({
         code: 1, stdout: "",
-        stderr: "No Magnitude service is running. Open the Magnitude desktop app or run `magnitude serve`.\n",
+        stderr: "No Magnitude service is running. Run `magnitude serve`, or open the Magnitude desktop app if it's installed.\n",
       })
       await expect(stat(profile)).rejects.toMatchObject({ code: "ENOENT" })
     } finally { await rm(root, { recursive: true, force: true }) }

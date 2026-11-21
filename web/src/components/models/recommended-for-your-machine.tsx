@@ -18,14 +18,15 @@ export const selectedModel = (selection: string | null | undefined, recommendati
 /**
  * Which recommended model is open and which of its quants is chosen. The first model opens until one is chosen or
  * closed; a choice holds while its model is still offered, whatever else measuring or a filter adds or takes away, and
- * the first opens again only once it isn't. Choosing another model returns to the quant recommended for it.
+ * the first opens again only once it isn't. Choosing another model returns to the quant already on this computer, else
+ * the one recommended for it.
  */
-export function useRecommendedSelection(recommendations: readonly Recommendation[]) {
+export function useRecommendedSelection(recommendations: readonly Recommendation[], owned: ReadonlySet<string> = new Set()) {
   const [selection, setSelection] = useState<string | null | undefined>(undefined)
   const [quantChoice, setQuantChoice] = useState<string | null>(null)
   const selected = selectedModel(selection, recommendations)
   const picked = recommendations.find(entry => entry.model.key === selected)?.model
-  const pickedQuant = picked ? picked.quants.find(quant => quant.key === quantChoice) ?? picked.quants.find(quant => quant.key === picked.recommended) : undefined
+  const pickedQuant = picked ? picked.quants.find(quant => quant.key === quantChoice) ?? picked.quants.find(quant => owned.has(quant.key)) ?? picked.quants.find(quant => quant.key === picked.recommended) : undefined
   return {
     selected, quantChoice, picked, pickedQuant,
     toggle: (key: string) => { setSelection(selected === key ? null : key); setQuantChoice(null) },
