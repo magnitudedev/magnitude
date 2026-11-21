@@ -554,3 +554,31 @@ fn last_level_cache_is_unreported_without_sysfs() {
     let machine = Machine::new("no-cacheinfo");
     assert_eq!(last_level_cache(&*machine), CacheSize::UNREPORTED);
 }
+
+/// A binding cgroup charges `memory.current` synchronously: `lag.growth` is
+/// `Duration::ZERO` when its clean file cache is 0, and `FLUSH_TIME` (2 s)
+/// only when its binding supply carries clean cache from `memory.stat`.
+#[test]
+fn cgroup_growth_lag_is_zero_without_clean_cache() {
+    let machine = Machine::in_cgroup("cgroup-lag", "0::/worker\n", V2_MOUNT);
+    machine.file("/proc/meminfo", MEMINFO);
+    machine.file("/sys/fs/cgroup/worker/memory.max", &format!("{}\n", 4 * GB));
+    machine.file("/sys/fs/cgroup/worker/memory.current", &format!("{}\n", GB));
+    machine.file(
+        "/sys/fs/cgroup/worker/memory.stat",
+        "active_file 0\ninactive_file 0\nfile_dirty 0\nfile_writeback 0\n",
+    );
+    let no_cache = sample(&*machine);
+    assert_eq!(no_cache.total, 4 * GB, "cgroup binds over host");
+    assert_eq!(no_cache.supply.clean_cache, 0);
+    assert_eq!(no_cache.lag.growth, Duration::ZERO);
+
+    machine.file(
+        "/sys/fs/cgroup/worker/memory.stat",
+        "active_file 4096\ninactive_file 0\nfile_dirty 0\nfile_writeback 0\n",
+    );
+    let with_cache = sample(&*machine);
+    assert_eq!(with_cache.total, 4 * GB, "cgroup binds over host");
+    assert_eq!(with_cache.supply.clean_cache, 4096);
+    assert_eq!(with_cache.lag.growth, Duration::from_secs(2));
+}

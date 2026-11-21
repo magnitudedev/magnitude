@@ -125,11 +125,14 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
             // `memory.current` uncharges them in it.
             release: Duration::ZERO,
             // The host's supply, a node's and the address space show a
-            // growth in the call; a cgroup's clean cache, read from its
-            // `memory.stat`, within memcg's flush, and only where that
-            // cgroup's supply binds.
+            // growth in the call; a cgroup's `memory.current` charges in
+            // the call too, and only its clean cache (read from
+            // `memory.stat`) lags within memcg's flush, where that
+            // cgroup's supply binds and carries clean cache.
             growth: match binding.supplier.map(|index| &limits[index].kind) {
-                Some(ProcessLimitKind::CgroupV1 { .. } | ProcessLimitKind::CgroupV2 { .. }) => {
+                Some(ProcessLimitKind::CgroupV1 { .. } | ProcessLimitKind::CgroupV2 { .. })
+                    if binding.scope.supply.clean_cache > 0 =>
+                {
                     FLUSH_TIME
                 }
                 _ => Duration::ZERO,

@@ -2156,6 +2156,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.resources.ledgers().device().estimate().allocated()
     }
 
+    /// What the process holds in `tier`'s store now, by its ledger
+    /// (`Estimate::allocated`): what a resize of `tier` is recorded beside.
+    pub fn held_bytes_of(&self, tier: crate::planning::BankTier) -> u64 {
+        self.resources.ledgers().of(tier).estimate().allocated()
+    }
+
     /// Observe every domain the device uses from a reading taken now: the
     /// worker's report of them.
     pub fn observe_memory(&self) -> Vec<DomainReading> {

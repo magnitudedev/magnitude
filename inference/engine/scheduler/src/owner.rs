@@ -1089,8 +1089,8 @@ pub struct Ran {
     pub reread: Reread,
 }
 
-/// A running expert bank resize: what the process held in the device's
-/// store when it began (`ExecutorDomain::held_bytes`), and why it began:
+/// A running expert bank resize: what the process held in the tier's
+/// store when it began (`ExecutorDomain::held_bytes_of`), and why it began:
 /// the reading its store's target was derived from, the generation of the
 /// reading the store's previous resize began on (`before`), and the terms
 /// that moved between the two, with the one whose change set the target
@@ -2066,7 +2066,7 @@ trait MemoryStep: MemoryHost + Sized {
         // this owner holds as begun: the advance that finishes it reports
         // it as any.
         if let Some(tier) = self.domain().take_running_release() {
-            let held = self.domain().held_bytes();
+            let held = self.domain().held_bytes_of(tier);
             let reading = self.domain().sizing_terms(tier);
             self.begin_resize(tier, BankBegunFor::Shrink, held, reading)?;
         }
@@ -2203,7 +2203,9 @@ trait MemoryStep: MemoryHost + Sized {
         bindings: &mut StateBindings,
         sizing: [magnitude_executor::SizingTerms; 2],
     ) -> Result<bool, RequestError> {
-        let (before, wake) = (self.domain().held_bytes(), self.completion());
+        let [before_bank, before_host] =
+            [BankTier::Bank, BankTier::Host].map(|tier| self.domain().held_bytes_of(tier));
+        let wake = self.completion();
         let followed = self.domain().follow_cache_targets(bindings, wake).map_err(classify_domain_error)?;
         let (tier, cause) = match followed {
             Followed::Grew(BankStep::Begun(tier)) => (tier, BankBegunFor::Growth),
@@ -2212,9 +2214,9 @@ trait MemoryStep: MemoryHost + Sized {
             Followed::Holds | Followed::Grew(_) | Followed::Shrank(BankStep::AtLimit) => return Ok(false),
         };
         let [bank, host] = sizing;
-        let reading = match tier {
-            BankTier::Bank => bank,
-            BankTier::Host => host,
+        let (before, reading) = match tier {
+            BankTier::Bank => (before_bank, bank),
+            BankTier::Host => (before_host, host),
         };
         self.begin_resize(tier, cause, before, reading)?;
         Ok(cause == BankBegunFor::Shrink)
@@ -2277,8 +2279,8 @@ trait MemoryStep: MemoryHost + Sized {
         let Some((finished, held)) = self.domain().advance_expert_bank(wake).map_err(classify_domain_error)? else {
             return Ok(false);
         };
-        let after = self.domain().held_bytes();
         let tier = self.domain().expert_holding_storage(finished.holding()).map_err(classify_domain_error)?;
+        let after = self.domain().held_bytes_of(tier);
         let BankBegun { held: before, cause, reading, before: before_generation, moved, term } = self.memory().bank_began[tier.index()]
             .take()
             .ok_or_else(|| invariant("expert bank")(format!("a {tier:?} resize finished that never began")))?;
