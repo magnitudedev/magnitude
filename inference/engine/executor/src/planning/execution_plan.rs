@@ -591,16 +591,21 @@ impl ExecutionPlanDraft {
         }
         let experts = ceiling.whole.bank().slots;
         if ceiling.ceiling == experts {
-            for &pass in super::pass_ladder(ceiling.places).iter().rev() {
+            let mut fitting = Vec::new();
+            for pass in super::pass_ladder(ceiling.places) {
                 let draft = ceiling.whole.resized(experts, experts, pass)?;
                 let charge = held.charge(definition, &draft)?;
                 let fit = room.fit_whole(&draft, charge.charge())?;
                 figures.bank = Some(Need { fit: Some(fit), terms: NeedTerms::of(&draft, charge.charge())? });
-                if fit.short.is_none() {
-                    if let Ok(found) = confirm(&draft, charge.charge())? {
-                        figures.form = Some(WholeForm::Bank);
-                        return placed(figures, Placing::Whole { draft, charge, found });
-                    }
+                if fit.short.is_some() {
+                    break;
+                }
+                fitting.push((draft, charge));
+            }
+            for (draft, charge) in fitting.into_iter().rev() {
+                if let Ok(found) = confirm(&draft, charge.charge())? {
+                    figures.form = Some(WholeForm::Bank);
+                    return placed(figures, Placing::Whole { draft, charge, found });
                 }
             }
         }
@@ -721,6 +726,7 @@ impl ExecutionPlanDraft {
                         ahead = records.ahead,
                         reserve = records.reserve,
                         settles,
+                        pass = draft.bank().pass.get(),
                         "the bank's path records are settled"
                     );
                 }
@@ -1224,7 +1230,7 @@ impl ExecutionPlanDraft {
             // The smallest pass leaves the most slots.
             let most = *most.get_or_insert(held);
             let seconds = rates.decode_steps_per_s * prices.step_seconds(held)
-                + rates.requests_per_s * prices.prompt_seconds(pass.get() as u64, most);
+                + rates.requests_per_s * prices.prompt_seconds(charge.held_pass.get() as u64, most);
             if chosen.as_ref().is_none_or(|(_, _, least)| seconds <= *least) {
                 chosen = Some((pass, mandatory_bytes, seconds));
             }
@@ -3900,6 +3906,7 @@ mod tests {
         let held = planned.draft().load().expert_bank().unwrap();
         assert!(held.slots < held.widest().get(), "{} of {} slots", held.slots, held.widest());
         assert!(held.pass > PassLaunches::FLOOR, "{:?} beside {} streamed slots", held.pass, held.widest().get() - held.slots);
+        assert_eq!(planned.charge().held_pass, held.pass, "settled pass must match held_pass");
         let load = planned.draft().load();
         let resident = load
             .target
