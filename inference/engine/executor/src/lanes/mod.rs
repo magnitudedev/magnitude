@@ -5,8 +5,8 @@ mod target;
 mod vision;
 
 pub use head::{
-    FrontFeatures, FrontReads, HeadConditioning, HeadLaunchCore, HeadLaunchInputs, TargetHistoryRead, TargetReads,
-    ValidatedHeadLaunch,
+    FrontFeatures, FrontReads, HeadConditioning, HeadLaunchCore, HeadLaunchInputs, HeadState, TargetHistoryRead,
+    TargetReads, ValidatedHeadLaunch,
 };
 pub use import::{ImportLaunchCore, ImportLaunchInputs, ResidentWeightSlot, ValidatedImportLaunch};
 pub use state::{StateLaunchCore, StateLaunchInputs, StateWork, ValidatedStateLaunch};

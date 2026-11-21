@@ -503,7 +503,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .front()
             .expect("invariant violated: a front head launch makes no chain")
             .read_guesses()?;
-        let (_, advances, _) = core.into_parts();
+        let HeadState::Owned { advances, .. } = core.into_state() else {
+            panic!("invariant violated: a front head launch owns no advances");
+        };
         let returned = || -> ! { panic!("invariant violated: a front head launch returned another advance than it launched") };
         let finished = match front.joins {
             FrontJoins::Accepted => advances
@@ -1187,7 +1189,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) -> Result<Option<(RequestId, OwnedStateAdvance)>, DomainError> {
         let completed = priming.submission.finish().map_err(DomainError::Device)?;
         let (core, _) = completed.into_parts();
-        let (_, advances, _) = core.into_parts();
+        let HeadState::Owned { advances, .. } = core.into_state() else {
+            panic!("invariant violated: a drafter entry owns no advances");
+        };
         let Ok([advance]) = <[TentativeAdvance; 1]>::try_from(advances) else {
             panic!("invariant violated: a drafter entry has other than one slot");
         };

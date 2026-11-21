@@ -107,9 +107,9 @@ pub use kernel_cache::{
 };
 pub use lanes::ConditioningSlice;
 pub use lanes::{
-    FrontFeatures, FrontReads, HeadConditioning, HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore, ImportLaunchInputs,
-    ResidentWeightSlot, SlotGuess, StateLaunchCore, StateLaunchInputs, StateWork, TargetHistoryRead,
-    TargetLaunchCore, TargetLaunchInputs, TargetLaunchWorkspace, TargetReads, TargetTokens,
+    FrontFeatures, FrontReads, HeadConditioning, HeadLaunchCore, HeadLaunchInputs, HeadState, ImportLaunchCore,
+    ImportLaunchInputs, ResidentWeightSlot, SlotGuess, StateLaunchCore, StateLaunchInputs, StateWork,
+    TargetHistoryRead, TargetLaunchCore, TargetLaunchInputs, TargetLaunchWorkspace, TargetReads, TargetTokens,
     ValidatedHeadLaunch, ValidatedImportLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
     ValidatedVisionLaunch, VisionLaunchCore, VisionLaunchInputs,
 };

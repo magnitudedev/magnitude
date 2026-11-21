@@ -2462,8 +2462,15 @@ impl NativeHeadProgram {
             .chain(&chain)
             .any(|pass| pass.shaping[..pass.select_rows.len()].iter().any(shapes));
         let geometry = self.graphs.history()?;
-        let bound_planes = core
-            .advances()
+        let crate::HeadState::Owned {
+            advances,
+            conditioning,
+            ..
+        } = core.state()
+        else {
+            return Err(invalid("head batch has no state advance"));
+        };
+        let bound_planes = advances
             .first()
             .ok_or_else(|| invalid("head batch has no state advance"))?
             .bindings()
@@ -2508,7 +2515,7 @@ impl NativeHeadProgram {
             None => false,
         };
         let scored = scored && steps > 0;
-        let launch = match core.conditioning() {
+        let launch = match conditioning {
             crate::HeadConditioning::Front(reads) => HeadLaunchClass::Front {
                 shaped,
                 scored,
@@ -2557,7 +2564,7 @@ impl NativeHeadProgram {
             }
         }
         let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
-        match core.conditioning() {
+        match conditioning {
             // Host rows in entry-row order (the launch checked each slot's
             // rows against the activation width), padded with zeros.
             crate::HeadConditioning::Rows(rows) => {
@@ -2800,10 +2807,7 @@ impl HeadProgram for NativeHeadProgram {
     ) -> Result<Self::Submission, (SubmitError, ValidatedHeadLaunch)> {
         let queued = {
             let (core, workspace, output) = launch.execution_parts_mut();
-            match output.as_mut() {
-                Some(output) => self.queue(core, workspace, output),
-                None => Err(invalid("head graph output lease is absent")),
-            }
+            self.queue(core, workspace, output)
         };
         let (completion, output) = match queued {
             Ok(queued) => queued,

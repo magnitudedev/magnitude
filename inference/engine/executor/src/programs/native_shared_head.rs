@@ -1436,9 +1436,13 @@ impl NativeSharedHeadProgram {
         workspace: &mut NativeGraphWorkspaceLease,
         output: &mut NativeGraphOutputLease,
     ) -> Result<(seismic::NativeGraphCompletion, HeadOutput), SubmitError> {
-        let reads = core
-            .target_reads()
-            .ok_or_else(|| invalid("a head without a store reads target history"))?;
+        let crate::HeadState::TargetReads {
+            reads,
+            conditioning: rows,
+        } = core.state()
+        else {
+            return Err(invalid("a head without a store reads target history"));
+        };
         let batch = core.batch();
         let entry = batch.upload();
         let chain = batch.chain().collect::<Vec<_>>();
@@ -1475,11 +1479,6 @@ impl NativeSharedHeadProgram {
             }
         }
         // Conditioning rows in slot order, widened to F32 and padded.
-        let crate::HeadConditioning::Rows(rows) = core.conditioning() else {
-            return Err(invalid(
-                "a head reading target history enters host conditioning rows",
-            ));
-        };
         let row_bytes = self.geometry.hidden as usize * 4;
         let mut conditioning = Vec::with_capacity(slots * row_bytes);
         for rows in rows {
@@ -1583,10 +1582,7 @@ impl HeadProgram for NativeSharedHeadProgram {
     ) -> Result<Self::Submission, (SubmitError, ValidatedHeadLaunch)> {
         let queued = {
             let (core, workspace, output) = launch.execution_parts_mut();
-            match output.as_mut() {
-                Some(output) => self.queue(core, workspace, output),
-                None => Err(invalid("head graph output lease is absent")),
-            }
+            self.queue(core, workspace, output)
         };
         let (completion, output) = match queued {
             Ok(queued) => queued,

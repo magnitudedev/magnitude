@@ -12,7 +12,7 @@ use crate::programs::graph::readout;
 use crate::{
     AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader, ExecutionPlan,
     FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Guess, HeadConditioning,
-    HeadLaunchInputs, ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation,
+    HeadLaunchInputs, HeadState, ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation,
     Outcome, PoolClass, Priming, RequestId, ResidentHead, ResidentVision,
     ResourceDomain, ResourceDomainId, ResourceKind, RowResult, SelectSpec, Selected,
     StateLaunchInputs, StateWork, TargetLaunchInputs, TargetTokens, TokenId, ValidatedHeadLaunch,

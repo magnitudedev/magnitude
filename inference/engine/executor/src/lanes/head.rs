@@ -69,19 +69,30 @@ pub struct TargetHistoryRead {
     pub planes: Vec<seismic::Tensor>,
 }
 
+/// The state and conditioning a head launch addresses.
+pub enum HeadState {
+    /// A head with its own state store: tentative advances per slot, entry-row
+    /// conditioning, and whether windowed history domains keep the entry rows.
+    Owned {
+        advances: Vec<TentativeAdvance>,
+        conditioning: HeadConditioning,
+        /// Whether windowed history domains keep these entry rows: false for
+        /// priming rows every window drops before the first draft reads it.
+        windowed: bool,
+    },
+    /// A head without a store: accepted target history held unchanged while
+    /// the launch is in flight, conditioned by host feature rows per slot.
+    TargetReads {
+        reads: TargetReads,
+        conditioning: Vec<FeatureRows>,
+    },
+}
+
 pub struct HeadLaunchInputs {
     batch: ValidatedHeadBatch,
-    /// The tentative advances of the head's own store, one per slot; empty
-    /// for a launch reading target history.
-    advances: Vec<TentativeAdvance>,
-    /// The target history a head without a store reads.
-    reads: Option<TargetReads>,
-    conditioning: HeadConditioning,
-    /// Whether windowed history domains keep these entry rows: false for
-    /// priming rows every window drops before the first draft reads it.
-    windowed: bool,
+    state: HeadState,
     graph_workspace: NativeGraphWorkspaceLease,
-    graph_output: Option<NativeGraphOutputLease>,
+    graph_output: NativeGraphOutputLease,
 }
 
 impl HeadLaunchInputs {
@@ -95,12 +106,13 @@ impl HeadLaunchInputs {
     ) -> Self {
         Self {
             batch,
-            advances,
-            reads: None,
-            conditioning,
-            windowed,
+            state: HeadState::Owned {
+                advances,
+                conditioning,
+                windowed,
+            },
             graph_workspace,
-            graph_output: Some(graph_output),
+            graph_output,
         }
     }
 
@@ -109,24 +121,49 @@ impl HeadLaunchInputs {
     pub fn reading_target(
         batch: ValidatedHeadBatch,
         reads: TargetReads,
-        conditioning: HeadConditioning,
+        conditioning: Vec<FeatureRows>,
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
     ) -> Self {
         Self {
             batch,
-            advances: Vec::new(),
-            reads: Some(reads),
-            conditioning,
-            windowed: true,
+            state: HeadState::TargetReads {
+                reads,
+                conditioning,
+            },
             graph_workspace,
-            graph_output: Some(graph_output),
+            graph_output,
         }
     }
 
-    /// The target states a refused launch returns.
-    pub(crate) fn into_target_reads(self) -> Option<TargetReads> {
-        self.reads
+    /// The state a refused launch returns to its owner.
+    pub(crate) fn into_state(self) -> HeadState {
+        self.state
+    }
+
+    fn validate(
+        &self,
+        store: &Rc<StateStore>,
+        domain: &ResourceDomainId,
+        row_bytes: usize,
+    ) -> Result<(), InvariantError> {
+        if self.graph_workspace.domain() != domain || self.graph_output.domain() != domain {
+            return Err(InvariantError {
+                context: "head launch",
+                detail: "workspace or output lease differs from head domain/class".into(),
+            });
+        }
+        match &self.state {
+            HeadState::Owned {
+                advances,
+                conditioning,
+                windowed: _,
+            } => self.validate_owned(advances, conditioning, store, domain, row_bytes),
+            HeadState::TargetReads {
+                reads,
+                conditioning,
+            } => self.validate_reads(reads, conditioning, store, row_bytes),
+        }
     }
 
     /// Check a launch reading target history: one entry row per slot at its
@@ -134,22 +171,14 @@ impl HeadLaunchInputs {
     /// stored domain and appending nowhere.
     fn validate_reads(
         &self,
+        reads: &TargetReads,
+        conditioning: &[FeatureRows],
         store: &Rc<StateStore>,
-        domain: &ResourceDomainId,
         row_bytes: usize,
     ) -> Result<(), InvariantError> {
         let invalid = |detail: String| InvariantError {
             context: "head launch",
             detail,
-        };
-        let reads = self
-            .reads
-            .as_ref()
-            .ok_or_else(|| invalid("a launch reading target history has none".into()))?;
-        let HeadConditioning::Rows(conditioning) = &self.conditioning else {
-            return Err(invalid(
-                "a head reading target history enters host conditioning rows".into(),
-            ));
         };
         if self.batch.passes() != HeadPasses::Chained
             || self.batch.steps() == 0
@@ -159,16 +188,6 @@ impl HeadLaunchInputs {
         {
             return Err(invalid(
                 "slot, target state, and conditioning counts disagree".into(),
-            ));
-        }
-        if self.graph_workspace.domain() != domain
-            || self
-                .graph_output
-                .as_ref()
-                .is_none_or(|output| output.domain() != domain)
-        {
-            return Err(invalid(
-                "workspace or output lease differs from head domain/class".into(),
             ));
         }
         let domains = store.history_domains().collect::<Vec<_>>();
@@ -286,26 +305,10 @@ impl HeadLaunchInputs {
         Ok(())
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        ValidatedHeadBatch,
-        Vec<TentativeAdvance>,
-        HeadConditioning,
-        NativeGraphWorkspaceLease,
-        Option<NativeGraphOutputLease>,
-    ) {
-        (
-            self.batch,
-            self.advances,
-            self.conditioning,
-            self.graph_workspace,
-            self.graph_output,
-        )
-    }
-
-    fn validate(
+    fn validate_owned(
         &self,
+        advances: &[TentativeAdvance],
+        conditioning: &HeadConditioning,
         store: &Rc<StateStore>,
         domain: &ResourceDomainId,
         row_bytes: usize,
@@ -316,12 +319,12 @@ impl HeadLaunchInputs {
         };
         // A front launch's slots are conditioned by its step's rows
         // (`validate_front`).
-        let conditioned = match &self.conditioning {
+        let conditioned = match conditioning {
             HeadConditioning::Rows(rows) => Some(rows.len()),
             HeadConditioning::Features { .. } => Some(1),
             HeadConditioning::Front(_) => None,
         };
-        if self.batch.actual_slots() != self.advances.len()
+        if self.batch.actual_slots() != advances.len()
             || conditioned.is_some_and(|conditioned| conditioned != self.batch.actual_slots())
         {
             return Err(invalid(
@@ -329,24 +332,14 @@ impl HeadLaunchInputs {
             ));
         }
         // A front batch is a front launch's alone.
-        match (&self.conditioning, self.batch.continuing()) {
+        match (conditioning, self.batch.continuing()) {
             (HeadConditioning::Front(reads), Some(continuing)) => {
                 self.validate_front(reads, continuing, domain).map_err(invalid)?;
             }
             (HeadConditioning::Rows(_) | HeadConditioning::Features { .. }, None) => {}
             _ => return Err(invalid("a front launch and its batch disagree".into())),
         }
-        if self.graph_workspace.domain() != domain
-            || self
-                .graph_output
-                .as_ref()
-                .is_none_or(|output| output.domain() != domain)
-        {
-            return Err(invalid(
-                "workspace or output lease differs from head domain/class".into(),
-            ));
-        }
-        for (index, (slot, advance)) in self.batch.slots().zip(&self.advances).enumerate() {
+        for (index, (slot, advance)) in self.batch.slots().zip(advances).enumerate() {
             let binding = advance.bindings();
             if i32::try_from(binding.previous_bank).ok() != Some(slot.bank())
                 || i32::try_from(binding.following_bank).ok() != Some(slot.following_bank())
@@ -355,7 +348,7 @@ impl HeadLaunchInputs {
             }
             // Bound features' width is checked where the graph binds them;
             // `validate_front` checked a front launch's step outputs.
-            let conditioned = match &self.conditioning {
+            let conditioned = match conditioning {
                 HeadConditioning::Rows(rows) => Some((
                     rows[index].rows(),
                     rows[index].rows() == slot.rows() && rows[index].row_bytes() == row_bytes,
@@ -524,7 +517,7 @@ fn boundary_feature(feature: &crate::FeatureRef, domain: &ResourceDomainId) -> b
 pub struct ValidatedHeadLaunch {
     core: HeadLaunchCore,
     graph_workspace: NativeGraphWorkspaceLease,
-    graph_output: Option<NativeGraphOutputLease>,
+    graph_output: NativeGraphOutputLease,
 }
 
 impl ValidatedHeadLaunch {
@@ -536,30 +529,19 @@ impl ValidatedHeadLaunch {
         domain: &ResourceDomainId,
         row_bytes: usize,
     ) -> Result<Self, (HeadLaunchInputs, InvariantError)> {
-        let validated = if inputs.reads.is_some() {
-            inputs.validate_reads(store, domain, row_bytes)
-        } else {
-            inputs.validate(store, domain, row_bytes)
-        };
-        if let Err(error) = validated {
+        if let Err(error) = inputs.validate(store, domain, row_bytes) {
             return Err((inputs, error));
         }
         let HeadLaunchInputs {
             batch,
-            advances,
-            reads,
-            conditioning,
-            windowed,
+            state,
             graph_workspace,
             graph_output,
         } = inputs;
         Ok(Self {
             core: HeadLaunchCore {
                 batch,
-                advances,
-                reads,
-                conditioning,
-                windowed,
+                state,
                 domain: domain.clone(),
             },
             graph_workspace,
@@ -578,7 +560,7 @@ impl ValidatedHeadLaunch {
     ) -> (
         &HeadLaunchCore,
         &mut NativeGraphWorkspaceLease,
-        &mut Option<NativeGraphOutputLease>,
+        &mut NativeGraphOutputLease,
     ) {
         (
             &self.core,
@@ -591,7 +573,7 @@ impl ValidatedHeadLaunch {
     ) -> (
         HeadLaunchCore,
         NativeGraphWorkspaceLease,
-        Option<NativeGraphOutputLease>,
+        NativeGraphOutputLease,
     ) {
         (self.core, self.graph_workspace, self.graph_output)
     }
@@ -599,10 +581,7 @@ impl ValidatedHeadLaunch {
 
 pub struct HeadLaunchCore {
     batch: ValidatedHeadBatch,
-    advances: Vec<TentativeAdvance>,
-    reads: Option<TargetReads>,
-    conditioning: HeadConditioning,
-    windowed: bool,
+    state: HeadState,
     domain: ResourceDomainId,
 }
 
@@ -610,25 +589,13 @@ impl HeadLaunchCore {
     pub fn batch(&self) -> &ValidatedHeadBatch {
         &self.batch
     }
-    pub fn advances(&self) -> &[TentativeAdvance] {
-        &self.advances
+    pub fn state(&self) -> &HeadState {
+        &self.state
     }
-    /// The target history a launch of a head without a store reads.
-    pub fn target_reads(&self) -> Option<&TargetReads> {
-        self.reads.as_ref()
+    pub fn into_state(self) -> HeadState {
+        self.state
     }
-    /// The target states a finished or failed launch returns.
-    pub fn into_target_reads(self) -> Option<TargetReads> {
-        self.reads
-    }
-    pub fn conditioning(&self) -> &HeadConditioning {
-        &self.conditioning
-    }
-    /// Whether windowed history domains keep the entry rows.
-    pub fn windowed(&self) -> bool {
-        self.windowed
-    }
-    pub fn into_parts(self) -> (ValidatedHeadBatch, Vec<TentativeAdvance>, HeadConditioning) {
-        (self.batch, self.advances, self.conditioning)
+    pub fn into_parts(self) -> (ValidatedHeadBatch, HeadState) {
+        (self.batch, self.state)
     }
 }

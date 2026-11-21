@@ -930,9 +930,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .as_ref()
                     .expect("invariant violated: a chained continuation's predecessor ran no front head launch");
                 let chain = front.submission.output().front().expect("invariant violated: a front head launch makes no chain");
+                let HeadState::Owned { advances, .. } = front.submission.launch().state() else {
+                    panic!("invariant violated: a front head launch owns no advances");
+                };
                 (
                     TargetTokens::Selected { selected: chain.next_selected.clone(), guesses: Some(chain.next_guesses.clone()) },
-                    Some(front.submission.launch().advances()),
+                    Some(advances.as_slice()),
                 )
             }
             TokenSource::Selected(selected) => (TargetTokens::Selected { selected, guesses: None }, None),
@@ -944,7 +947,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .priming
             .as_ref()
             .filter(|priming| matches!(predicted.as_slice(), [operation] if operation.request() == priming.request))
-            .and_then(|priming| priming.submission.launch().advances().first());
+            .and_then(|priming| match priming.submission.launch().state() {
+                HeadState::Owned { advances, .. } => advances.first(),
+                HeadState::TargetReads { .. } => {
+                    panic!("invariant violated: a drafter entry owns no advances")
+                }
+            });
         let entry_before = |count| entry_before.map_or(Ok(None), |advance| fitting(advance.successor(count)));
         let entry = self.queued_priming(&predicted, entry_before)?;
         let Some(entry) = entry else {

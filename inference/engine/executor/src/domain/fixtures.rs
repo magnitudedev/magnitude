@@ -996,7 +996,7 @@ impl<L, W, O> ProgramSubmission for PendingSubmission<L, W, O> {
 
 type HeadTestWork = PendingSubmission<
     crate::HeadLaunchCore,
-    (NativeGraphWorkspaceLease, Option<NativeGraphOutputLease>),
+    (NativeGraphWorkspaceLease, NativeGraphOutputLease),
     crate::programs::HeadOutput,
 >;
 
