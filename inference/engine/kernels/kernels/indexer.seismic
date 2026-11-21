@@ -215,20 +215,22 @@ native indexer_score for cpu from "cpu/indexer_score.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes ((2 * P + (H + 1) * (2 * P + S)) * 4)
 
-# Metal: a threadgroup of 256 threads per row. A selecting row finds its
-# K-th best score T by a radix select over the scores' order keys
-# (`ordered_key`), takes every score above T and the first equal ones in
-# ordinal order, then emits its picks in ordinal order: each thread counts
-# the picks of its share of the ordinals, a scan places them, and a walk of
-# the row's span offsets (scanned into scratch) maps each to its row.
-# Threadgroup memory: the bins [256], the scans' 8 simdgroup sums and the
+# Metal: a threadgroup of 1024 threads per row (matching CUDA: 8 items per
+# thread, CHUNK = 8192). A selecting row finds its K-th best score T by a
+# radix select over the scores' order keys (`ordered_key`), takes every score
+# above T and the first equal ones in ordinal order, then emits its picks in
+# ordinal order: each thread counts the picks of its share of the ordinals, a
+# scan places them, and a walk of the row's span offsets (scanned into
+# scratch) maps each to its row. Rows with at most 8192 scored ordinals hold
+# their 8 keys per thread in registers across all radix passes and emit.
+# Threadgroup memory: the bins [256], the scans' 32 simdgroup sums and the
 # select state [4].
 native rows_topk for metal from "metal/rows_topk.metal":
     scratch spans bytes (M * (R + 1) * 4)
     launch rows_topk:
         threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((256 + 8 + 4) * 4)
+        threads_per_threadgroup (1024, 1, 1)
+        shared_bytes ((256 + 32 + 4) * 4)
 
 # CUDA: Metal's form at a block of 1024 threads per row, each walk over the
 # row a chunk of 8192 ordinals at a time with every thread's 8 loads issued
@@ -310,9 +312,10 @@ native unit_reads for cpu from "cpu/unit_reads.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Metal: a threadgroup of 256 threads per row, a thread per bitmap word,
-# each finding its word's picks by a binary search of the ascending picks;
-# thread 0 writes the units.
+# Metal: a threadgroup of 256 threads per row, thread 0 broadcasting the
+# valid-pick count, all 256 threads writing `units` in parallel, and a thread
+# per bitmap word finding its word's picks by a binary search of the ascending
+# picks.
 native unit_reads for metal from "metal/unit_reads.metal":
     launch unit_reads:
         threadgroups (M, 1, 1)
