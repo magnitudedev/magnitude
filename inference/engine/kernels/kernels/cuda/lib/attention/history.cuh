@@ -127,7 +127,13 @@ template <int B> struct LaneCodes {
     // This lane's codes of a code row, shifted so its code i sits at bits
     // B * i of word i * B / 32.
     __device__ static __forceinline__ void load(const u32 *row, int lane, u32 (&w)[words]) {
-        if constexpr (bits == 64) {
+        if constexpr (bits == 128) {
+            const uint4 quad = *reinterpret_cast<const uint4 *>(row + lane * 4);
+            w[0] = quad.x;
+            w[1] = quad.y;
+            w[2] = quad.z;
+            w[3] = quad.w;
+        } else if constexpr (bits == 64) {
             const uint2 pair = *reinterpret_cast<const uint2 *>(row + lane * 2);
             w[0] = pair.x;
             w[1] = pair.y;

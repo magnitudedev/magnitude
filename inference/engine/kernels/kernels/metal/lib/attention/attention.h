@@ -613,88 +613,85 @@ inline float turned_back(float attended, float other, uint column, ulong row, de
     return head_layout::leads(column) ? attended * cosine - other * sine : attended * cosine + other * sine;
 }
 
-// The decode merge of one (query head, row): one lane per column, over 32
-// of its columns in one simdgroup, or with ROTATED (the output rotary, RO =
-// 1) over the whole head row in W / 32 simdgroups, whose first is the
-// `writer`. The row's non-empty partitions merge in partition order, then the
-// output rotary (in F32, from the merged row in `row_values`, W floats of
-// threadgroup memory) and the gate. The partition weights
-// exp2(maximum_p - maximum) are formed once per threadgroup in `weights`
-// (2 * PARTS floats: weight, denominator); every lane then carries `merge`'s
-// ordered chains for its column, so the result is `merge`'s (with the head's
-// sink, if any, against the merged maximum). A row that sees no key attends
-// to zero. The partitions split the row's key sequence: its visible keys,
-// then its PICKS index-list picks (`decode_matrix`, `decode_shared`).
+// The decode merge of one (query head, row): one threadgroup of W threads
+// (W / 32 simdgroups, one thread per column), whose first simdgroup computes
+// the active partition count, partition weights exp2(maximum_p - maximum) in
+// `weights` (PARTS floats, 0 for empty partitions), and inverse divisor once
+// per head row; every thread then accumulates its column's partials in
+// partition order, normalizes by `shared_inv_divisor`, and applies the output
+// rotary (with ROTATED, in F32 via `row_values`, W floats of threadgroup
+// memory) and the gate. A row that sees no key attends to zero. The partitions
+// split the row's key sequence: its visible keys, then its PICKS index-list
+// picks (`decode_matrix`, `decode_shared`).
 //
-// Few threads cover a whole launch, so a load at a time would leave every
-// partition a memory round trip: once the row's partitions are known, the
-// gate, the statistics and the first BATCH partitions' partials issue
-// together, and each later batch issues all its loads before its chains
-// consume them.
+// Each batch issues up to BATCH loads of `partials` before accumulating them
+// so memory latency is hidden across partitions.
 template <uint SPAN, uint PARTS, uint GRID_KEYS, uint PICKS = 0, bool ROTATED = false>
 inline void decode_output(device const Scalar *query, device const Scalar *gate, device const int *visible,
     device const int *fresh, element::Out<activation::Act> result, device const float *partials,
-    device const float *statistics, threadgroup float *weights, ulong spans, ulong head, ulong row,
-    uint column, uint lane, bool softplus, device const float *sinks = nullptr, bool writer = true,
-    threadgroup float *row_values = nullptr, device const int *coordinates = nullptr,
-    device const int *components = nullptr, device const float *frequencies = nullptr,
-    device const float *amplitudes = nullptr) {
+    device const float *statistics, threadgroup float *weights, threadgroup uint &shared_active,
+    threadgroup float &shared_inv_divisor, ulong spans, ulong head, ulong row, uint column, uint lane,
+    bool softplus, device const float *sinks = nullptr, threadgroup float *row_values = nullptr,
+    device const int *coordinates = nullptr, device const int *components = nullptr,
+    device const float *frequencies = nullptr, device const float *amplitudes = nullptr) {
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
     constexpr uint G = ATTENTION_QUERY_GROUP;
-    // The row's partitions that hold its keys (`decode_active`): the matrix
-    // form's (GRID_KEYS the tile's keys, else 0) runs of its tiles, its
-    // visible tiles then its picks' (each GRID_KEYS picks a tile), at least
-    // SPAN keys a partition; the other forms' runs of its keys.
-    const uint total = form_total(visible, fresh, row, spans, lane);
-    uint active;
-    if constexpr (GRID_KEYS > 0) {
-        static_assert(SPAN % GRID_KEYS == 0, "a partition's floor is whole key tiles");
-        const uint tiles = (total + GRID_KEYS - 1) / GRID_KEYS + (PICKS + GRID_KEYS - 1) / GRID_KEYS;
-        active = decode_active(tiles, SPAN / GRID_KEYS, PARTS);
-    } else {
-        active = decode_active(total + PICKS, SPAN, PARTS);
-    }
     const ulong first = (row * KV * G + head) * PARTS;
-    constexpr uint BATCH = PARTS < 64 ? PARTS : 64;
     const float g = gate_logit(query, gate, row, head, column);
-    float values[BATCH];
-    ATTENTION_UNROLL
-    for (uint i = 0; i < BATCH; ++i)
-        values[i] = i < active ? partials[(first + i) * W + column] : 0.0f;
-    float maximum = -INFINITY;
-    for (uint p = lane; p < active; p += 32) {
-        if (statistics[(first + p) * 2 + 1] > 0.0f)
-            maximum = metal::max(maximum, statistics[(first + p) * 2]);
-    }
-    maximum = simd_max(maximum);
-    if (writer) {
+    if (column < 32) {
+        // The row's partitions that hold its keys (`decode_active`): the matrix
+        // form's (GRID_KEYS the tile's keys, else 0) runs of its tiles, its
+        // visible tiles then its picks' (each GRID_KEYS picks a tile), at least
+        // SPAN keys a partition; the other forms' runs of its keys.
+        const uint total = form_total(visible, fresh, row, spans, lane);
+        uint active;
+        if constexpr (GRID_KEYS > 0) {
+            static_assert(SPAN % GRID_KEYS == 0, "a partition's floor is whole key tiles");
+            const uint tiles = (total + GRID_KEYS - 1) / GRID_KEYS + (PICKS + GRID_KEYS - 1) / GRID_KEYS;
+            active = decode_active(tiles, SPAN / GRID_KEYS, PARTS);
+        } else {
+            active = decode_active(total + PICKS, SPAN, PARTS);
+        }
+        float maximum = -INFINITY;
+        for (uint p = lane; p < active; p += 32) {
+            if (statistics[(first + p) * 2 + 1] > 0.0f)
+                maximum = metal::max(maximum, statistics[(first + p) * 2]);
+        }
+        maximum = simd_max(maximum);
+        float denominator = 0.0f;
         for (uint p = lane; p < active; p += 32) {
             const float d = statistics[(first + p) * 2 + 1];
-            weights[2 * p] = d > 0.0f ? metal::fast::exp2(statistics[(first + p) * 2] - maximum) : 0.0f;
-            weights[2 * p + 1] = d;
+            const float w = d > 0.0f ? metal::fast::exp2(statistics[(first + p) * 2] - maximum) : 0.0f;
+            weights[p] = w;
+            denominator = metal::fma(d, w, denominator);
+        }
+        denominator = simd_sum(denominator);
+        if (lane == 0) {
+            shared_active = active;
+            shared_inv_divisor = 1.0f / divisor(sinks, head, maximum, denominator);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float denominator = 0.0f;
+    const uint active = shared_active;
+    constexpr uint BATCH = PARTS < 64 ? PARTS : 64;
     float accumulated = 0.0f;
     for (uint p0 = 0; p0 < active; p0 += BATCH) {
-        if (p0 > 0) {
-            ATTENTION_UNROLL
-            for (uint i = 0; i < BATCH; ++i)
-                values[i] = p0 + i < active ? partials[(first + p0 + i) * W + column] : 0.0f;
-        }
+        float values[BATCH];
+        ATTENTION_UNROLL
+        for (uint i = 0; i < BATCH; ++i)
+            values[i] = p0 + i < active ? partials[(first + p0 + i) * W + column] : 0.0f;
         ATTENTION_UNROLL
         for (uint i = 0; i < BATCH; ++i) {
             const uint p = p0 + i;
-            if (p < active && weights[2 * p + 1] > 0.0f) {
-                const float weight = weights[2 * p];
-                denominator = metal::fma(weights[2 * p + 1], weight, denominator);
-                accumulated = metal::fma(values[i], weight, accumulated);
+            if (p < active) {
+                const float weight = weights[p];
+                if (weight > 0.0f)
+                    accumulated = metal::fma(values[i], weight, accumulated);
             }
         }
     }
-    float attended = accumulated / divisor(sinks, head, maximum, denominator);
+    float attended = accumulated * shared_inv_divisor;
     if (ROTATED) {
         // The merged row's pair of this column, turned back by the row's
         // negated angles (`output_rotary`).
