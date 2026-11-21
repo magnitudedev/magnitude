@@ -594,24 +594,33 @@ impl WiredAllocation {
 pub struct MetalBuffer {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: u64,
-    storage: Storage,
-    _host_owner: Option<Arc<dyn Any + Send + Sync>>,
-    /// Absent for a read-only host mapping, whose pages stay file-backed
-    /// and outside the residency set: resident only where it is bound, so
-    /// no record table addresses it.
-    _wired: Option<Arc<WiredAllocation>>,
+    /// Declared after `buffer` so the `MTLBuffer` handle drops before its
+    /// backing owner or wired allocation.
+    backing: BufferBacking,
 }
 
-/// How the host reaches a buffer's bytes.
+/// How a [`MetalBuffer`] is backed and how the host reaches its bytes.
 #[derive(Clone)]
-enum Storage {
-    /// Shared storage: `contents()`, host-visible for the buffer's whole
-    /// lifetime.
-    Shared,
-    /// Private storage, the device's own memory, which the host cannot map:
-    /// through a blit of the device's queue, staged in shared storage
-    /// ([`Staging`]).
-    Private(Arc<Staging>),
+enum BufferBacking {
+    /// Shared storage allocated by Metal: `contents()` is host-visible for the
+    /// buffer's whole lifetime, kept resident and charged until the last handle
+    /// drops.
+    Shared {
+        _wired: Arc<WiredAllocation>,
+    },
+    /// Private storage in the device's own memory, which the host cannot map:
+    /// reached through a staging blit on the device's queue ([`Staging`]), kept
+    /// resident and charged until the last handle drops.
+    Private {
+        staging: Arc<Staging>,
+        _wired: Arc<WiredAllocation>,
+    },
+    /// Read-only host mapping in shared storage: `contents()` is host-readable,
+    /// and its pages stay file-backed outside the residency set (resident only
+    /// where bound, so no record table addresses it).
+    HostMapped {
+        _owner: Arc<dyn Any + Send + Sync>,
+    },
 }
 
 /// The most bytes one staging copy holds in host RAM: each chunk is charged
@@ -799,9 +808,11 @@ impl MetalBuffer {
     /// host-visible for the buffer's whole lifetime; none for private
     /// storage, which the host cannot map.
     fn host_base(&self) -> Option<NonNull<u8>> {
-        match self.storage {
-            Storage::Shared => NonNull::new(self.contents()),
-            Storage::Private(_) => None,
+        match self.backing {
+            BufferBacking::Shared { .. } | BufferBacking::HostMapped { .. } => {
+                NonNull::new(self.contents())
+            }
+            BufferBacking::Private { .. } => None,
         }
     }
 
@@ -818,11 +829,14 @@ impl MetalBuffer {
     /// The schedule plans these bytes as written by this work, so the
     /// buffer is one Metal allocated, never a read-only host mapping.
     pub(crate) unsafe fn write_device_bytes(&self, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
-        match &self.storage {
-            Storage::Private(staging) => staging.write(&self.buffer, self.len, offset, bytes),
-            Storage::Shared => {
+        match &self.backing {
+            BufferBacking::Private { staging, .. } => staging.write(&self.buffer, self.len, offset, bytes),
+            BufferBacking::Shared { .. } => {
                 unsafe { host_write(self.contents(), self.len, offset, bytes) };
                 Ok(())
+            }
+            BufferBacking::HostMapped { .. } => {
+                panic!("invariant violated: write to a read-only host-mapped Metal buffer")
             }
         }
     }
@@ -830,12 +844,20 @@ impl MetalBuffer {
     /// Read `into` from `offset`; through a staging blit for private
     /// storage.
     pub(crate) fn read_bytes(&self, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError> {
-        match &self.storage {
-            Storage::Private(staging) => staging.read(&self.buffer, self.len, offset, into),
-            Storage::Shared => {
+        match &self.backing {
+            BufferBacking::Private { staging, .. } => staging.read(&self.buffer, self.len, offset, into),
+            BufferBacking::Shared { .. } | BufferBacking::HostMapped { .. } => {
                 unsafe { host_read(self.contents(), self.len, offset, into) };
                 Ok(())
             }
+        }
+    }
+
+    #[cfg(test)]
+    fn wired(&self) -> Option<&WiredAllocation> {
+        match &self.backing {
+            BufferBacking::Shared { _wired } | BufferBacking::Private { _wired, .. } => Some(_wired),
+            BufferBacking::HostMapped { .. } => None,
         }
     }
 }
@@ -906,7 +928,7 @@ pub struct MetalDevice {
     /// ([`crate::topology::own_kind`]): the embedder's ledger of it, whose own entry holds what the device
     /// allocates that no caller names.
     store: Arc<dyn Store>,
-    /// The host's way to the device's private buffers ([`Storage::Private`]).
+    /// The host's way to the device's private buffers ([`BufferBacking::Private`]).
     staging: Arc<Staging>,
 }
 
@@ -1118,7 +1140,7 @@ impl MetalDevice {
         // observable together. Backed::take joins this change.
         let _change = entry.change();
         let (charged, mapping) = shared_buffer(&self.handle, length, entry, wiring, block)?;
-        Ok(self.held(charged, mapping, bytes, Storage::Shared))
+        Ok(self.held(charged, mapping, bytes, None))
     }
 
     /// A private buffer of `bytes` in the device's own memory, its bytes as
@@ -1137,21 +1159,25 @@ impl MetalDevice {
         if fill == seismic_memory::SlabFill::Zeroed {
             self.staging.zero(&charged, length)?;
         }
-        Ok(self.held(charged, None, bytes, Storage::Private(self.staging.clone())))
+        Ok(self.held(charged, None, bytes, Some(self.staging.clone())))
     }
 
     /// `charged`, of `len` requested bytes, kept resident until its last
     /// handle drops ([`WiredAllocation`]).
-    fn held(&self, charged: ChargedBuffer, mapping: Option<Mapping>, len: u64, storage: Storage) -> WritableMetalBuffer {
+    fn held(
+        &self,
+        charged: ChargedBuffer,
+        mapping: Option<Mapping>,
+        len: u64,
+        staging: Option<Arc<Staging>>,
+    ) -> WritableMetalBuffer {
         let buffer = Retained::clone(&charged);
-        let wired = WiredAllocation::wire(&self.residency, charged, mapping);
-        WritableMetalBuffer(MetalBuffer {
-            buffer,
-            len,
-            storage,
-            _host_owner: None,
-            _wired: Some(Arc::new(wired)),
-        })
+        let wired = Arc::new(WiredAllocation::wire(&self.residency, charged, mapping));
+        let backing = match staging {
+            None => BufferBacking::Shared { _wired: wired },
+            Some(staging) => BufferBacking::Private { staging, _wired: wired },
+        };
+        WritableMetalBuffer(MetalBuffer { buffer, len, backing })
     }
 
     /// A buffer of `bytes` of `kind`, one of the device's kinds
@@ -1207,11 +1233,7 @@ impl MetalDevice {
         length: usize,
         owner: Arc<dyn Any + Send + Sync>,
     ) -> Result<MetalBuffer, ExecutionError> {
-        let page = seismic_memory::host_page()
-            .map_err(|error| ExecutionError::AllocationFailed(error.to_string()))?;
-        let page = usize::try_from(page).map_err(|_| {
-            ExecutionError::AllocationFailed("host page size exceeds the host address space".into())
-        })?;
+        let page = host_page_usize()?;
         if length == 0 || pointer.as_ptr() as usize % page != 0 || length % page != 0 {
             return Err(ExecutionError::AllocationFailed(
                 "Metal host mapping is not page-aligned".into(),
@@ -1238,9 +1260,7 @@ impl MetalDevice {
         Ok(MetalBuffer {
             buffer,
             len: length as u64,
-            storage: Storage::Shared,
-            _host_owner: Some(owner),
-            _wired: None,
+            backing: BufferBacking::HostMapped { _owner: owner },
         })
     }
 }
@@ -1697,7 +1717,7 @@ mod mapped_tests {
         let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
         let entry = crate::test_support::entry();
         let buffer = device.allocate_bytes(1 << 16, &entry).unwrap();
-        let wired = buffer._wired.as_ref().expect("an allocated buffer is in the set");
+        let wired = buffer.wired().expect("an allocated buffer is in the set");
         assert_eq!(wired.buffer().charge().wiring(), Wiring::Wired);
         assert_eq!(device.order.charge().wiring(), Wiring::Pageable);
     }
