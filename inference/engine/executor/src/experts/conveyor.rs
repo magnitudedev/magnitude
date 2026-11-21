@@ -116,7 +116,8 @@ pub(super) struct Settled {
 /// An expert held whole in conveyor record `record` of its layer's form,
 /// landing from it into its host tier's record `tier`, read for step `read`
 /// (`Conveyor::land`): the conveyor record takes no read until its landing
-/// ends, as `ended` records (landed: its bytes are whole).
+/// ends, as `ended` records (landed: its bytes are whole; unlanded if
+/// cancelled via `cancel`).
 pub(super) struct ConveyorLanding {
     pub layer: usize,
     pub expert: usize,
@@ -124,6 +125,7 @@ pub(super) struct ConveyorLanding {
     pub tier: u32,
     pub read: Option<Step>,
     pub ended: crate::experts::landing::Ended,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What carries the conveyor: `records` records of each form, where they
@@ -293,8 +295,42 @@ impl Conveyor {
         self.landings.push(landing);
     }
 
-    /// Take the conveyor landings that ended: each landed, as a landing
-    /// from a record whose bytes are whole always does.
+    /// Cancel every in-flight landing from a conveyor record into the host
+    /// tier so the next group never stalls behind previous-group CPU repacks.
+    pub fn cancel_landings(&mut self) {
+        for landing in &self.landings {
+            landing.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Cancel any in-flight landing holding conveyor record `record` of
+    /// `layer`'s form.
+    pub fn cancel_landing_for(&mut self, layer: usize, record: u32) {
+        let form = self.form_of[layer];
+        for landing in &self.landings {
+            if self.form_of[landing.layer] == form && landing.record == record {
+                landing.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    /// A conveyor record of `layer`'s form that `admits` and is occupied by
+    /// no active GPU round (`occupant` is none), held only by an uncancelled
+    /// [`ConveyorLanding`].
+    pub fn landing_only_record(&self, layer: usize, admits: impl Fn(u32) -> bool) -> Option<u32> {
+        let form = self.form_of[layer];
+        Self::free(&self.occupant[form]).find(|&record| {
+            admits(record)
+                && self.landings.iter().any(|landing| {
+                    self.form_of[landing.layer] == form
+                        && landing.record == record
+                        && !landing.cancel.load(std::sync::atomic::Ordering::Acquire)
+                })
+        })
+    }
+
+    /// Take the conveyor landings that ended: each ended with `Some(true)`
+    /// (landed) or `Some(false)` (cancelled).
     pub fn landed(&mut self) -> Vec<ConveyorLanding> {
         let (ended, running): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.landings).into_iter().partition(|landing| landing.ended.get().is_some());
@@ -454,5 +490,81 @@ impl Conveyor {
             records.iter_mut().for_each(|record| *record = None);
         }
         self.slots.iter_mut().for_each(|slot| *slot = None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::experts::events::Events;
+    use crate::experts::landing::Ended;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn test_conveyor(form_of: Vec<usize>, records: usize) -> Conveyor {
+        let experts = vec![4; form_of.len()];
+        let carrier = Carrier {
+            records,
+            slots: 0,
+            lending: Lending { group: 0, pools: Vec::new() },
+            pools: Vec::new(),
+        };
+        Conveyor::new(form_of, &experts, carrier)
+    }
+
+    fn dummy_landing(events: &Arc<Events>, layer: usize, expert: usize, record: u32, tier: u32) -> (ConveyorLanding, Arc<AtomicBool>, Ended) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ended = Ended::new(events);
+        let landing = ConveyorLanding {
+            layer,
+            expert,
+            record,
+            tier,
+            read: Some(1),
+            ended: ended.clone(),
+            cancel: cancel.clone(),
+        };
+        (landing, cancel, ended)
+    }
+
+    /// `landing_only_record` identifies conveyor records unoccupied by any GPU
+    /// round and held only by an uncancelled `ConveyorLanding`; `cancel_landing_for`
+    /// cancels matching form+record landings, and `cancel_landings` cancels all.
+    #[test]
+    fn conveyor_landing_cancellation_and_lookup() {
+        let events = Arc::new(Events::default());
+        // Layers 0 and 1 share form 0; layer 2 has form 1.
+        let mut conveyor = test_conveyor(vec![0, 0, 1], 2);
+        let (l0, c0, e0) = dummy_landing(&events, 0, 0, 0, 0);
+        let (l1, c1, e1) = dummy_landing(&events, 1, 1, 1, 1);
+        let (l2, c2, e2) = dummy_landing(&events, 2, 0, 0, 2);
+        conveyor.land(l0);
+        conveyor.land(l1);
+        conveyor.land(l2);
+
+        // Occupy record 0 of form 0 with an active GPU round: only record 1 is landing-only.
+        conveyor.take(0, 2, 0);
+        assert_eq!(conveyor.landing_only_record(1, |_| true), Some(1));
+        assert_eq!(conveyor.landing_only_record(2, |_| true), Some(0));
+
+        // Cancel record 1 via layer 0 (same form 0): cancels l1 only.
+        conveyor.cancel_landing_for(0, 1);
+        assert!(!c0.load(Ordering::Acquire));
+        assert!(c1.load(Ordering::Acquire));
+        assert!(!c2.load(Ordering::Acquire));
+        assert_eq!(conveyor.landing_only_record(1, |_| true), None, "already-cancelled landing skipped");
+
+        // `cancel_landings` cancels every remaining in-flight landing.
+        conveyor.cancel_landings();
+        assert!(c0.load(Ordering::Acquire));
+        assert!(c2.load(Ordering::Acquire));
+
+        // Settling ended landings drains them cleanly.
+        e0.set(false);
+        e1.set(false);
+        e2.set(true);
+        let drained = conveyor.landed();
+        assert_eq!(drained.len(), 3);
+        assert!(conveyor.quiet());
     }
 }

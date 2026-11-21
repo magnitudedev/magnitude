@@ -357,23 +357,20 @@ fn a_wavefront_reads_the_next_layers_experts_as_their_records_free() {
         for step in steps {
             step.complete().unwrap();
         }
-        // Each read lands into the host tier too, its bytes the file's: no
-        // later miss reads it again. The tier's reserve of 4 refills beside
-        // the lent records the group holds (its lend takes them out of the
-        // capacity, not into the reserve), and the tier keeps the 5 and the
-        // reserve: none is unmapped.
-        for (layer, expert) in [(0, 0), (0, 1), (0, 3), (1, 3), (1, 4)] {
-            eventually("a prompt's read never landed into the tier", || harness.in_tier(layer, expert).is_some());
-        }
         // A decode step after them runs residency's refill as its requests
-        // arrive (`Residency::advance`): the tier serves all five, none
-        // unmapped for the reserve.
+        // arrive (`Residency::advance`): whether each expert landed from the
+        // conveyor (when free conveyor records exceeded the measured knee) or
+        // reads on demand, the tier's reserve of 4 refills beside the lent
+        // records and keeps all 5 without unmapping any for lent records.
         let next = harness.step();
-        assert!(!harness.ask_at(&next, 0, &[0, 1, 3]), "the tier serves layer 0's");
-        assert!(!harness.ask_at(&next, 1, &[3, 4]), "the tier serves layer 1's");
+        for (layer, experts) in [(0, &[0, 1, 3][..]), (1, &[3, 4][..])] {
+            if harness.ask_at(&next, layer, experts) {
+                assert_eq!(until_answered(&harness.layers[layer].1, next.sequence(), 0), Answer::Answered);
+            }
+        }
         next.complete().unwrap();
         for (layer, expert) in [(0, 0), (0, 1), (0, 3), (1, 3), (1, 4)] {
-            assert!(harness.in_tier(layer, expert).is_some(), "the reserve unmapped {expert} of layer {layer} for the lent records");
+            eventually("decode landing never kept expert in tier", || harness.in_tier(layer, expert).is_some());
         }
     }
 }
@@ -614,10 +611,15 @@ fn a_hit_the_layer_befores_seeding_evicts_is_read() {
         for kind in 0..3 {
             unsafe { harness.scratch[kind].write_shared(5 * RECORD, &[0; RECORD as usize]) }.unwrap();
         }
-        // The tier keeps 5, which its seeding group read: the demoted hit
-        // is copied from it whole, and only 4 is converted.
-        assert_eq!(harness.from_conveyor(&harness.rounds(&steps[0], 1).concat()), [4]);
-        assert!((0..3).all(|kind| slot(kind) == [(100 * kind + 5) as u8; RECORD as usize]), "the demoted hit is copied from the tier");
+        // The demoted hit 5 is either copied whole from the host tier (if
+        // already landed there) or read and converted from the conveyor.
+        let mut converted = harness.from_conveyor(&harness.rounds(&steps[0], 1).concat());
+        converted.sort_unstable();
+        let copied = (0..3).all(|kind| slot(kind) == [(100 * kind + 5) as u8; RECORD as usize]);
+        assert!(
+            converted == [4, 5] || (converted == [4] && copied),
+            "demoted hit 5 neither converted from conveyor nor copied from tier: converted={converted:?} copied={copied}"
+        );
         // Step 1's 3, cold (6 is banked), is read ahead as its request was
         // taken, into the conveyor and on into the tier. Its round converts
         // it from the conveyor, or where that landing ended and the conveyor
@@ -1312,4 +1314,90 @@ fn a_windowed_scratch_tier_streams_more_cold_experts_than_slots_without_deadlock
     for w in 1..4 {
         assert_eq!(window_row(w), [-1; EXPERTS], "windows[{w}] cleared after windowed group");
     }
+}
+
+/// `Scratch::land_conveyed` is gated on free conveyor records strictly
+/// exceeding `knee_records = source.knee().div_ceil(expert_bytes)`: when
+/// conveyor records are scarce (equal to or below the knee), cold experts
+/// convert through the conveyor without spawning background CPU repacks into
+/// the host tier; when free conveyor records strictly exceed `knee_records`
+/// and the tier covers every expert, cold experts land into the host tier in
+/// the background.
+#[test]
+fn land_conveyed_is_gated_on_measured_knee_records() {
+    // Scarce conveyor (2 records): free records can never strictly exceed
+    // `knee_records` (>= 1 on any volume), so no host-tier landing is spawned.
+    let scarce = lending("knee-scarce", EXPERTS, 2, 1, STAGING, Conveying::of(ROUND_RECORDS), TIER, Placer::Tier, false);
+    let step = scarce.prompt_step();
+    let mut converted = scarce.converted(&step, 0, &[0, 1]).concat();
+    converted.sort_unstable();
+    assert_eq!(converted, [0, 1]);
+    step.complete().unwrap();
+    scarce.retired();
+    assert_eq!(scarce.host.maps[0].load(0), -1, "scarce conveyor must not spawn background tier landing for expert 0");
+    assert_eq!(scarce.host.maps[0].load(1), -1, "scarce conveyor must not spawn background tier landing for expert 1");
+}
+
+/// With `windows > 1` and multiple pass sets (`pass_launches = 1` over a
+/// 2-step group -> sets `[0..1, 1..2]`), `Scratch::publish` ingests step 1's
+/// request into `sets[1]` immediately and pipelines its window-0 NVMe reads
+/// into free conveyor records while `open_set` is still 0 (before step 0's
+/// rounds even start). Shared experts between `sets[0]` and `sets[1]` wait
+/// for `sets[0]` to release them, then re-read cleanly for `sets[1]`, and
+/// `windows` tables clear when `open_set` advances to `1`.
+#[test]
+fn windowed_pass_sets_pipeline_next_set_reads_while_open_set_runs() {
+    let conveying = Conveying::of(4);
+    let harness = lending_windowed_passes(
+        "windowed-pass-sets",
+        EXPERTS,
+        4,
+        1,
+        STAGING,
+        conveying,
+        0,
+        Placer::Tier,
+        false,
+        0,
+        false,
+        ROUND_RECORDS as usize,
+        1,
+    );
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
+    // Publish set 0 (place 0) with [0, 4] and set 1 (place 1) with [0, 1]
+    // before step 0 runs any round.
+    harness.publish(&steps[0], 0, &[0, 4]);
+    harness.publish(&steps[1], 0, &[0, 1]);
+    // Set 1's window-0 expert 1 must pipeline into a free conveyor record
+    // immediately while open_set is still 0!
+    harness.conveying(1);
+
+    let window_row = |w: usize| (0..EXPERTS).map(|e| harness.windows[0][w].load(e)).collect::<Vec<_>>();
+
+    // Drain set 0 across all 4 windows.
+    let mut set0_converted = Vec::new();
+    for w in 0..harness.window_count {
+        set0_converted.extend(harness.rounds_window(&steps[0], 0, w));
+    }
+    set0_converted.sort_unstable();
+    assert_eq!(set0_converted, [0, 4]);
+    assert_eq!(window_row(2), [-1, -1, -1, -1, 0, -1, -1, -1], "set 0 populated window 2");
+
+    // Drain set 1 across all 4 windows: window 0 clears set 0's window tables
+    // and converts both shared expert 0 and pre-pipelined expert 1.
+    let mut set1_converted = Vec::new();
+    for w in 0..harness.window_count {
+        set1_converted.extend(harness.rounds_window(&steps[1], 0, w));
+        if w == 0 {
+            assert_eq!(window_row(2), [-1; EXPERTS], "clear_windows ran when open_set advanced to 1");
+            assert_eq!(window_row(0), [0, 1, -1, -1, -1, -1, -1, -1], "set 1 populated window 0");
+        }
+    }
+    set1_converted.sort_unstable();
+    assert_eq!(set1_converted, [0, 1]);
+
+    for step in steps {
+        step.complete().unwrap();
+    }
+    harness.retired();
 }

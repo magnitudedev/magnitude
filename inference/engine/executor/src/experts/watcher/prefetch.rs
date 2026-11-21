@@ -71,18 +71,8 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Which party of a read's join ran its landing ([`Join`]): the read's
-/// end, on the read worker that ended it (which works its landing's pieces
-/// beside the executor's), or the claim of its records, on the request
-/// service (which leaves them to the executor).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Party {
-    Read,
-    Claim,
-}
-
 /// What lands a read once it ended and its records are claimed.
-type Lands = Box<dyn FnOnce(Outcome, &[usize], Party) + Send>;
+type Lands = Box<dyn FnOnce(Outcome, &[usize]) + Send>;
 
 /// A read's join ([`Join`]): what the claims registered while it ran, or
 /// how it ended.
@@ -114,20 +104,20 @@ impl Join {
             unreachable!("a read ends once");
         };
         for land in claims {
-            land(outcome.clone(), failed, Party::Read);
+            land(outcome.clone(), failed);
         }
     }
 
     /// Records are claimed for some of its experts: `land` lands them once
     /// its read ended, now where it has. It must not wait for a read.
-    pub(super) fn claimed(&self, land: impl FnOnce(Outcome, &[usize], Party) + Send + 'static) {
+    pub(super) fn claimed(&self, land: impl FnOnce(Outcome, &[usize]) + Send + 'static) {
         let mut parties = self.parties();
         match &mut *parties {
             Parties::Reading(claims) => claims.push(Box::new(land)),
             Parties::Ended(outcome, failed) => {
                 let (outcome, failed) = (outcome.clone(), failed.clone());
                 drop(parties);
-                land(outcome, &failed, Party::Claim);
+                land(outcome, &failed);
             }
         }
     }
@@ -176,7 +166,7 @@ pub(super) fn account(postings: &[&Posting], naming: Naming, timed: Option<(u64,
     });
     for posting in postings {
         let (shared, accounted) = (shared.clone(), accounted.clone());
-        posting.join.claimed(move |outcome, _, _| {
+        posting.join.claimed(move |outcome, _| {
             unpanicked(&outcome);
             let mut left = accounted.left.lock().expect("a request's reads' account");
             left.0 -= 1;
@@ -557,10 +547,8 @@ impl Prefetch {
     /// under the step's ownership, then answered) or else on the host
     /// (submitted to the executor, which converts and maps its record,
     /// records its end, then answers; one of the request's host `landings`,
-    /// whose line it measures), or fails it. Where the read's end ran the
-    /// host's landing (`party`), its read worker works its pieces beside the
-    /// executor's, so no wake stands between the read and its landing. A
-    /// request's reads are accounted apart, once ([`account`]).
+    /// whose line it measures), or fails it. A request's reads are
+    /// accounted apart, once ([`account`]).
     pub(super) fn demand(&mut self, core: &Core, named: Named, naming: Naming, at: Point, landings: &Arc<Landings>, shared: &Arc<Shared>) {
         let Named { expert, posting: Posting { ticket, join }, staged, grant, rows, answer } = named;
         let (ended, urgency, tier) = (Ended::new(shared.events()), Urgency::waited(), grant.record());
@@ -572,7 +560,7 @@ impl Prefetch {
         match &device {
             Some(device) => {
                 let device = device.clone();
-                join.claimed(move |outcome, failed, _| {
+                join.claimed(move |outcome, failed| {
                     if !read_named(&serving, naming, (&rows, &answer), &outcome, failed, &end) {
                         return;
                     }
@@ -590,7 +578,7 @@ impl Prefetch {
             None => {
                 let landing = core.landing(grant, staged);
                 let (landings, urgent) = (landings.clone(), urgency.clone());
-                join.claimed(move |outcome, failed, party| {
+                join.claimed(move |outcome, failed| {
                     if !read_named(&serving, naming, (&rows, &answer), &outcome, failed, &end) {
                         return;
                     }
@@ -606,10 +594,7 @@ impl Prefetch {
                             landings.ended(&completed);
                         })
                     };
-                    match party {
-                        Party::Read => serving.compute.run(Arc::new(converting)),
-                        Party::Claim => serving.compute.submit(Arc::new(converting)),
-                    }
+                    serving.compute.submit(Arc::new(converting));
                 });
             }
         }
@@ -1319,7 +1304,7 @@ impl Prefetch {
                 // A read ahead's end: read, its landing is submitted, whose
                 // end maps its tier record; failed, it fails nothing (a step
                 // waiting for it reads its expert anew).
-                join.claimed(move |outcome, failed, _| {
+                join.claimed(move |outcome, failed| {
                     unpanicked(&outcome);
                     let read = failed.is_empty() && matches!(outcome, Outcome::Read);
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead_read"), 0, (target as i64, expert as i64, read as i64));

@@ -894,6 +894,23 @@ impl Directory {
         self.host[group].claim((layer, expert), keep, taking, outranking(ranker, &self.prompt_reads, candidate))
     }
 
+    /// Claim a background host-tier landing for a cold expert read into the
+    /// conveyor (`Scratch::land_conveyed`): admitted whenever the tier covers
+    /// every expert (`HostRecords::covers`); otherwise takes a free ready
+    /// record or displaces a kept record only when the expert outranks its
+    /// victim in the reuse ranking (beside `read` and pending prompt reads).
+    pub fn claim_conveyed(&mut self, layer: usize, expert: usize, read: Option<Step>) -> Claim {
+        let group = self.bank.group(layer);
+        if self.host[group].covers() {
+            return self.host[group].claim((layer, expert), 0, Taking::Out, (|_, _| (), |_, _| true));
+        }
+        let tier = self.host_tier();
+        let reuse = Reuse::of(&self.ranking);
+        let ranker = reuse.ranker(group, tier, Reader::Move);
+        let candidate = store_rank(ranker, &self.prompt_reads)((layer, expert), read);
+        self.host[group].claim((layer, expert), 0, Taking::Out, outranking(ranker, &self.prompt_reads, candidate))
+    }
+
     /// Where `layer`'s `expert` is in its group's host tier: lacked
     /// without a tier.
     pub fn located(&self, layer: usize, expert: usize) -> Located {
