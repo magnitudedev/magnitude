@@ -222,6 +222,12 @@ const CHAIN_LAYER_CALLS: usize = 4;
 /// begun is the job's time alone ([`super::requests::JobDeadlines::ends`]).
 pub const MEASUREMENT_SECONDS: f64 = 10.0;
 
+/// The fewest samples any persisted assessment point takes before its budget
+/// may stop sampling, so a stored median never collapses to a single noisy
+/// sample. Critical scaling baselines and multi-point line endpoints further
+/// require [`seismic::measure::Stop::Bounded`].
+const MIN_MEDIAN_SAMPLES: usize = 3;
+
 /// The depths a history layout's ladder is read at, in tokens, as far as
 /// its rungs fit ([`Walk::rung`]): from below the shortest context a model
 /// serves to 256K, doubling. Estimates read 8K to 1M tokens (25K, 50K and
@@ -1832,6 +1838,10 @@ struct Share {
     /// memory, so a compile running beside it would be timed too: it is
     /// timed only while no program forms ([`Programs::quiet`]).
     host: bool,
+    /// Whether this point's median must be bounded ([`Measure::bounded`])
+    /// regardless of its share of the budget (e.g. scaling baselines like the
+    /// probe and composition chain).
+    bounded: bool,
 }
 
 /// What sampling a point is forecast to take: the seconds of one pass of
@@ -1859,7 +1869,7 @@ impl Share {
     /// No forecast, of itself or of the points after it. A point nothing
     /// forecasts (one before the probe, the launch graph's, a figure's other
     /// than the walk's) reserves none of the budget.
-    const UNFORECAST: Self = Self { forecast: None, after: Forecast::NONE, host: false };
+    const UNFORECAST: Self = Self { forecast: None, after: Forecast::NONE, host: false, bounded: false };
 
     /// This share where reading its point is forecast as `forecast`.
     fn forecast(self, forecast: Forecast) -> Self {
@@ -1874,6 +1884,11 @@ impl Share {
     /// This share of a point that touches the host ([`Self::host`]).
     fn on_host(self) -> Self {
         Self { host: true, ..self }
+    }
+
+    /// This share of a point whose median must be bounded ([`Self::bounded`]).
+    fn bounded(self) -> Self {
+        Self { bounded: true, ..self }
     }
 }
 
@@ -2075,20 +2090,21 @@ impl Measured<'_, '_> {
     /// least one sample, each covering at least tuning's least device time
     /// (which sets its repetitions: tuning's, the one owner). A part spent
     /// takes the point's samples down to one, never the point.
-    fn within(&self, own: f64) -> Measure {
+    fn within(&self, own: f64, bounded: bool) -> Measure {
         let left = self.left.max(1) as f64;
         let seconds = match self.whose {
             Whose::Standing => own + (MEASUREMENT_SECONDS - self.sampled - own - Self::least(self.ahead)).max(0.) / left,
             Whose::Loads => self.deadlines.remaining().as_secs_f64() / left,
         };
         let measure = Measure {
-            stop: seismic::measure::Stop::Within {
+            stop: seismic::measure::Stop::Floor {
                 error_rate: crate::SEARCH_SETTINGS.error_rate,
                 seconds,
+                floor: std::num::NonZeroUsize::new(MIN_MEDIAN_SAMPLES).expect("MIN_MEDIAN_SAMPLES is non-zero"),
             },
             min_sample_seconds: crate::MIN_SAMPLE_SECONDS,
         };
-        if self.bounded {
+        if self.bounded || bounded {
             measure.bounded()
         } else {
             measure
@@ -2098,8 +2114,8 @@ impl Measured<'_, '_> {
     /// Visit the next point, forecast to take `own` seconds at least: how it
     /// is sampled ([`Self::within`]) and when the job begins no more points
     /// ([`Self::ends`]), counted off the points left.
-    fn next(&mut self, own: f64) -> (Measure, std::time::Instant) {
-        let visit = (self.within(own), self.ends());
+    fn next(&mut self, own: f64, bounded: bool) -> (Measure, std::time::Instant) {
+        let visit = (self.within(own, bounded), self.ends());
         self.left = self.left.saturating_sub(1);
         visit
     }
@@ -2167,7 +2183,7 @@ impl Times for Measured<'_, '_> {
         let key = self.records.key(spec);
         let began = std::time::Instant::now();
         self.ahead = share.after;
-        let (how, ends) = self.next(share.forecast.map_or(0., Self::least));
+        let (how, ends) = self.next(share.forecast.map_or(0., Self::least), share.bounded);
         // The point is made only when no record holds it and the host
         // attempts it, so a stored or skipped point is never made. Every
         // program is formed, all at once, when the first point no record
@@ -4353,7 +4369,7 @@ impl Walk<'_> {
             self.cache,
             true,
             times,
-            share,
+            share.bounded(),
         )
     }
 
@@ -4520,7 +4536,7 @@ impl Walk<'_> {
                     .and_then(|chain| chain.point(charges, GraphTiming::Device))
                     .map_err(Unformed::Now)
             },
-            share.forecast(forecast),
+            share.forecast(forecast).bounded(),
         )?;
         Ok(ChainRead { timing, layers })
     }
@@ -5070,7 +5086,6 @@ impl<'a, 'd> Walks<'a, 'd> {
     /// bound their medians whatever their part of the time, only the job's
     /// deadline ending one sooner ([`Measure::bounded`]): for a figure whose
     /// interval its reading needs.
-    #[cfg(feature = "machine-line")]
     pub(super) fn bounded(&mut self) {
         self.measured.bounded = true;
     }
@@ -5113,7 +5128,7 @@ impl<'a, 'd> Walks<'a, 'd> {
     /// is told, nothing stored, and the next job attempts it again.
     pub(super) fn record(&mut self, key: PointKey, make: impl FnOnce(&seismic::Charges) -> Result<Record, String>) {
         let began = std::time::Instant::now();
-        let _ = self.measured.next(0.);
+        let _ = self.measured.next(0., false);
         let measured = &mut self.measured;
         let store = measured.records.store;
         if measured.deadlines.remaining().is_zero() {
@@ -5141,18 +5156,29 @@ impl<'a, 'd> Walks<'a, 'd> {
     }
 
     /// Time a convert point under `key`, consuming `form`'s kernel from the
-    /// job's single `ProgramSet` worker-pool formation.
-    pub(super) fn time_convert<F>(&mut self, key: PointKey, form: &ConvertForm, build: F)
+    /// job's single `ProgramSet` worker-pool formation, its record kept in
+    /// `store`. Returns whether the point was freshly measured.
+    ///
+    /// Holds parallel shader formation (`quiet(true)`) while timing because
+    /// `routed_land` reads host-shared control words under `system_scope`
+    /// fences, which contend with concurrent Metal shader compiles on unified
+    /// memory.
+    pub(super) fn time_convert_in<F>(
+        &mut self,
+        key: PointKey,
+        form: &ConvertForm,
+        store: &dyn RecordStore<PointKey>,
+        build: F,
+    ) -> bool
     where
         F: FnOnce(&NativeKernel<routed_land::Entry>) -> Result<Point, ExecutorCostsError>,
     {
         let began = std::time::Instant::now();
-        let (how, ends) = self.measured.next(0.);
+        let (how, ends) = self.measured.next(0., false);
         let measured = &mut self.measured;
         let device = measured.device;
         let program_set = &measured.program_set;
         let programs = &measured.programs;
-        let store = measured.records.store;
         let host = &mut *measured.attempting;
         let (mut quiet, mut made) = (None, None);
         let mut outcomes = measured.measurer.measure_all(
@@ -5168,7 +5194,7 @@ impl<'a, 'd> Walks<'a, 'd> {
                     .as_ref()
                     .map_err(|error| Unformed::Never(error.clone()))?;
                 let point = build(kernel).map_err(Unformed::Now)?;
-                quiet = formed.quiet(false);
+                quiet = formed.quiet(true);
                 made = Some(std::time::Instant::now());
                 Ok(point)
             })],
@@ -5182,7 +5208,9 @@ impl<'a, 'd> Walks<'a, 'd> {
         );
         drop(quiet);
         let (key, outcome) = outcomes.pop().expect("one point is measured");
+        let fresh = matches!(outcome, Outcome::Measured(_));
         self.measured.tell(key, outcome, began, made);
+        fresh
     }
 
     /// Time the device point `build` makes under `key`, as the job times a
@@ -5195,17 +5223,18 @@ impl<'a, 'd> Walks<'a, 'd> {
         F: FnOnce() -> Result<Point, Unformed<ExecutorCostsError>>,
     {
         let store = self.measured.records.store;
-        self.time_in(key, host, store, build);
+        let _ = self.time_in(key, host, store, build);
     }
 
     /// [`Self::time`], its record kept in `store` (the job's,
-    /// [`Self::store`], or one that guards it).
-    pub(super) fn time_in<F>(&mut self, key: PointKey, host: bool, store: &dyn RecordStore<PointKey>, build: F)
+    /// [`Self::store`], or one that guards it). Returns whether the point was
+    /// freshly measured.
+    pub(super) fn time_in<F>(&mut self, key: PointKey, host: bool, store: &dyn RecordStore<PointKey>, build: F) -> bool
     where
         F: FnOnce() -> Result<Point, Unformed<ExecutorCostsError>>,
     {
         let began = std::time::Instant::now();
-        let (how, ends) = self.measured.next(0.);
+        let (how, ends) = self.measured.next(0., false);
         let measured = &mut self.measured;
         let programs = &measured.programs;
         let (mut quiet, mut made) = (None, None);
@@ -5223,7 +5252,9 @@ impl<'a, 'd> Walks<'a, 'd> {
         );
         drop(quiet);
         let (key, outcome) = outcomes.pop().expect("one point is measured");
+        let fresh = matches!(outcome, Outcome::Measured(_));
         self.measured.tell(key, outcome, began, made);
+        fresh
     }
 
     /// A hold on the walks' formation, where one is forming, for a point
@@ -5240,11 +5271,21 @@ impl<'a, 'd> Walks<'a, 'd> {
         W: seismic::measure::Work<Error = String, Clock = ()>,
         F: FnOnce() -> Result<W, Unformed<ExecutorCostsError>>,
     {
+        let store = self.measured.records.store;
+        let _ = self.time_host_in(key, store, build);
+    }
+
+    /// [`Self::time_host`], its record kept in `store`. Returns whether the
+    /// point was freshly measured.
+    pub(super) fn time_host_in<W, F>(&mut self, key: PointKey, store: &dyn RecordStore<PointKey>, build: F) -> bool
+    where
+        W: seismic::measure::Work<Error = String, Clock = ()>,
+        F: FnOnce() -> Result<W, Unformed<ExecutorCostsError>>,
+    {
         let began = std::time::Instant::now();
-        let (how, ends) = self.measured.next(0.);
+        let (how, ends) = self.measured.next(0., false);
         let measured = &mut self.measured;
         let programs = &measured.programs;
-        let store = measured.records.store;
         let (mut quiet, mut made) = (None, None);
         let mut clocks = seismic::measure::HeldClocks::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
         let mut outcomes = seismic::measure::measure_all(
@@ -5262,7 +5303,9 @@ impl<'a, 'd> Walks<'a, 'd> {
         );
         drop(quiet);
         let (key, outcome) = outcomes.pop().expect("one point is measured");
+        let fresh = matches!(outcome, Outcome::Measured(_));
         self.measured.tell(key, outcome, began, made);
+        fresh
     }
 
     /// What the walks' points were made in and from, which the job's caller

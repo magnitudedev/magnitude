@@ -70,4 +70,33 @@ describe("local model radar", () => {
     expect(axis(makeSetupModel(true), "INTELLIGENCE").detail).toBe("1%")
     expect(axis(makeSetupModel(true), "FIDELITY").detail).toBe("Medium (Q4)")
   })
+
+  it("never leaks internal measurement error text when speed is unavailable", () => {
+    const serving = makeFoundModel().servingState
+    if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") throw new Error("fixture fits")
+    const unavailable = makeFoundModel({
+      servingState: {
+        ...serving,
+        assessment: {
+          ...serving.assessment,
+          residency: {
+            ...serving.assessment.residency,
+            performance: {
+              _tag: "Unavailable",
+              failure: {
+                code: "performance_unavailable",
+                message: "convert ceiling: [(1, 0.5), (64, 0.4)] did not rise",
+                retryable: false,
+              },
+            },
+          },
+        },
+      },
+    })
+    expect(axis(unavailable, "SPEED")).toEqual({
+      label: "SPEED",
+      value: Option.none(),
+      detail: "Speed unavailable",
+    })
+  })
 })

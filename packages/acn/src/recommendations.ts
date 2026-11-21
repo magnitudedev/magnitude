@@ -25,6 +25,8 @@ import { LocalInferenceHardware } from "./local-inference-hardware"
 import { LocalModelSources, type CatalogModelSource } from "./local-model-sources"
 import { LocalModels } from "./local-models"
 
+/** The decode speed below which a fitting model is practically unusable (e.g. 0 tok/s). */
+export const USABLE_TOKENS_PER_SECOND = 1
 export interface RecommendationInputs {
   readonly models: LocalModelsState["models"]
   readonly catalog: readonly CatalogModelSource[]
@@ -97,17 +99,31 @@ const chooseRung = (ladder: readonly Rung[]): Option.Option<Rung> => {
   )
 }
 
+interface RankedModel {
+  readonly model: RecommendedModel
+  readonly speed: Option.Option<number>
+}
+
 const byIntelligence = Order.mapInput(
   Order.reverse(Option.getOrder(Order.number)),
-  (model: RecommendedModel) => model.intelligence,
+  ({ model }: RankedModel) => model.intelligence,
 )
 
 /**
- * Models whose chosen rung reaches the target first, then those reaching the onboarding floor, then the rest with a
- * fitting rung, then those with none: a smarter model too slow to use never leads one that is usable.
+ * Models whose chosen rung reaches the target first, then those reaching the onboarding floor,
+ * then usable ones (>= 1 tok/s), then fitting models below 1 tok/s or without a speed estimate,
+ * then those with no fitting rung.
  */
-const standing = (model: RecommendedModel): number =>
-  model.meetsTarget ? 0 : model.meetsOnboardingFloor ? 1 : Option.isSome(model.chosen) ? 2 : 3
+const standing = ({ model, speed }: RankedModel): number =>
+  model.meetsTarget
+    ? 0
+    : model.meetsOnboardingFloor
+      ? 1
+      : Option.exists(speed, (tokensPerSecond) => tokensPerSecond >= USABLE_TOKENS_PER_SECOND)
+        ? 2
+        : Option.isSome(model.chosen)
+          ? 3
+          : 4
 
 const recommendationOrder = Order.combine(
   Order.mapInput(Order.number, standing),
@@ -142,7 +158,7 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
   const ranked = (freeBytes: Option.Option<number>) => {
     let measured = 0
     let rungs = 0
-    const models = Object.entries(ladders).flatMap(([base, variants]): readonly RecommendedModel[] => {
+    const models = Object.entries(ladders).flatMap(([base, variants]): readonly RankedModel[] => {
       const ladder = Array.sort(variants, Order.mapInput(Order.number, (model: CatalogLocalModel) => model.storageBytes))
         .map((model) => rung(model, freeBytes))
       if (!Array.isNonEmptyReadonlyArray(ladder)) return []
@@ -153,17 +169,20 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
       }
       const chosen = comingSoon(first) ? Option.none() : chooseRung(ladder)
       return [{
-        base: base as CatalogBaseId,
-        name: first.presentation.displayName,
-        developer: first.catalogData.developer,
-        intelligence: localModelIntelligence(first),
-        chosen: Option.map(chosen, ({ model }) => model.modelId),
-        rungs: Array.map(ladder, ({ model }) => model.modelId),
-        meetsTarget: Option.exists(chosen, (candidate) => reaches(candidate, TARGET_TOKENS_PER_SECOND)),
-        meetsOnboardingFloor: Option.exists(chosen, (candidate) => reaches(candidate, ONBOARDING_FLOOR_TOKENS_PER_SECOND)),
+        model: {
+          base: base as CatalogBaseId,
+          name: first.presentation.displayName,
+          developer: first.catalogData.developer,
+          intelligence: localModelIntelligence(first),
+          chosen: Option.map(chosen, ({ model }) => model.modelId),
+          rungs: Array.map(ladder, ({ model }) => model.modelId),
+          meetsTarget: Option.exists(chosen, (candidate) => reaches(candidate, TARGET_TOKENS_PER_SECOND)),
+          meetsOnboardingFloor: Option.exists(chosen, (candidate) => reaches(candidate, ONBOARDING_FLOOR_TOKENS_PER_SECOND)),
+        },
+        speed: Option.flatMap(chosen, (candidate) => candidate.speed),
       }]
     })
-    return { measured, rungs, models: Array.sort(models, recommendationOrder) }
+    return { measured, rungs, models: Array.sort(models, recommendationOrder).map(({ model }) => model) }
   }
   const freeBytes = Option.map(inputs.hardware.modelStorage, ({ freeBytes }) => freeBytes)
   const { measured, rungs, models } = ranked(freeBytes)

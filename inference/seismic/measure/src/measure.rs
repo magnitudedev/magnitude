@@ -24,6 +24,14 @@ pub enum Stop {
     /// whether it has one, and a median it ends after one sample has no
     /// interval.
     Within { error_rate: f64, seconds: f64 },
+    /// As [`Stop::Within`], the budget unable to end sampling before `floor`
+    /// samples are read: a point's median always rests on at least `floor`
+    /// samples.
+    Floor {
+        error_rate: f64,
+        seconds: f64,
+        floor: NonZeroUsize,
+    },
     /// As [`Stop::Within`], the budget unable to end sampling before the
     /// fewest samples that bound the median ([`fewest_bounding`]): a point
     /// whose figure needs an interval has one whatever a call takes.
@@ -42,11 +50,14 @@ pub struct Measure {
 }
 
 impl Measure {
-    /// This measurement with a [`Stop::Within`] made [`Stop::Bounded`].
-    /// Another stop is unchanged.
+    /// This measurement with a [`Stop::Within`] or [`Stop::Floor`] made
+    /// [`Stop::Bounded`]. Another stop is unchanged.
     pub fn bounded(mut self) -> Self {
-        if let Stop::Within { error_rate, seconds } = self.stop {
-            self.stop = Stop::Bounded { error_rate, seconds };
+        match self.stop {
+            Stop::Within { error_rate, seconds } | Stop::Floor { error_rate, seconds, .. } => {
+                self.stop = Stop::Bounded { error_rate, seconds };
+            }
+            Stop::Count(_) | Stop::Resolved { .. } | Stop::Bounded { .. } => {}
         }
         self
     }
@@ -79,6 +90,7 @@ pub fn measure<W: Work>(
         Stop::Count(samples) => (Stopping::Count(samples.get()), None),
         Stop::Resolved { error_rate } => (Stopping::resolved(error_rate), Some(error_rate)),
         Stop::Within { error_rate, seconds } => (Stopping::within(error_rate, seconds, 1), Some(error_rate)),
+        Stop::Floor { error_rate, seconds, floor } => (Stopping::within(error_rate, seconds, floor.get()), Some(error_rate)),
         Stop::Bounded { error_rate, seconds } => (
             Stopping::within(error_rate, seconds, fewest_bounding(error_rate)),
             Some(error_rate),
@@ -414,6 +426,19 @@ mod tests {
         assert!(bounded.timing().interval.is_some());
         let counted = Measure { stop: Stop::Count(NonZeroUsize::new(3).unwrap()), min_sample_seconds: 0. };
         assert_eq!(counted.bounded(), counted);
+        let floored = Measure {
+            stop: Stop::Floor {
+                error_rate: 0.05,
+                seconds: 0.,
+                floor: NonZeroUsize::new(3).unwrap(),
+            },
+            min_sample_seconds: 0.,
+        };
+        assert_eq!(measure(Fixed(Ok(1.)), &floored, None).unwrap().samples.len(), 3);
+        assert_eq!(
+            measure(Fixed(Ok(1.)), &floored.bounded(), None).unwrap().samples.len(),
+            fewest_bounding(0.05),
+        );
     }
 
     /// A stored point is loaded and neither attempted nor formed; the others

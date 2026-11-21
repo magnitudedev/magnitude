@@ -200,6 +200,23 @@ describe("recommendations", () => {
     expect(models.map(({ chosen }) => Option.isSome(chosen))).toEqual([true, true, true, true, false])
   })
 
+  it("ranks usable models ahead of sub-1 tok/s models when none reaches the target speed", () => {
+    const { models } = project([
+      rung({ id: "crawling-27b:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 0.3, intelligence: 85 }),
+      rung({ id: "usable-slow:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 3, intelligence: 55 }),
+      rung({ id: "usable-floor:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 12, intelligence: 40 }),
+      rung({ id: "unmeasured:gguf:q4", storageBytes: 1 * GB, speedUnavailable: true, intelligence: 70 }),
+      rung({ id: "too-big:gguf:q4", storageBytes: 1 * GB, fits: false, intelligence: 95 }),
+    ])
+    expect(models.map(({ base }) => base)).toEqual([
+      "usable-floor",
+      "usable-slow",
+      "crawling-27b",
+      "unmeasured",
+      "too-big",
+    ])
+  })
+
   it("leaves out disabled models except those of a family that is coming soon, which have no chosen rung", () => {
     const { models } = project([
       rung({ id: "qwen:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 50 }),

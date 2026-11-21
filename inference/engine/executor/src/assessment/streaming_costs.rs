@@ -236,6 +236,26 @@ impl ConvertForm {
     }
 }
 
+/// A record store view that treats stored [`Record::Measured`] entries as
+/// absent so `measure_all` re-measures and overwrites them, while still
+/// honoring [`Record::Unobtainable`]. Used when a stored multi-point line
+/// fails its monotonicity / sanity check so a transient measurement glitch
+/// can recover instead of locking estimates unavailable permanently.
+struct Remeasure<'s>(&'s dyn RecordStore<PointKey>);
+
+impl RecordStore<PointKey> for Remeasure<'_> {
+    fn load(&self, key: &PointKey) -> Result<Option<Record>, StoreError> {
+        match self.0.load(key)? {
+            Some(Record::Measured(_)) => Ok(None),
+            other => Ok(other),
+        }
+    }
+
+    fn store(&self, key: &PointKey, record: &Record) -> Result<(), StoreError> {
+        self.0.store(key, record)
+    }
+}
+
 /// One landing launch's graph (`routed_land`): the first `converted`
 /// entries of its landing list, staging record `i` into record `i`, both
 /// zero and in the device's own memory, every entry landed and the step's
@@ -247,7 +267,7 @@ fn convert_point(
     converted: u64,
 ) -> Result<Point, ExecutorCostsError> {
     let error = failed("convert point");
-    let records = CONVERTED_RECORDS;
+    let records = converted.max(1);
     let sequence = 1;
     let shared = |extents: &[u64], set: &[(u64, i32)]| {
         let tensor = Tensor::shared(charges, Element::i32(), extents).map_err(|cause| error(&cause))?;
@@ -386,7 +406,7 @@ impl ConvertCosts {
     ) -> super::Priced<Self> {
         match Self::stored(topology, executor, form, store) {
             Ok(costs) => super::Priced::Measured(costs),
-            Err(CeilingError::Unrecorded { .. }) => {
+            Err(CeilingError::Unrecorded { .. } | CeilingError::Flat { .. }) => {
                 super::Priced::Pending(super::PendingPrices::standing(super::PointRequest::Convert(form)))
             }
             Err(error) => super::Priced::Unavailable(error.to_string()),
@@ -492,12 +512,32 @@ impl ConvertForm {
     /// launches of one record and of [`CONVERTED_RECORDS`], consuming the
     /// kernel formed on the job's worker pool.
     pub(super) fn measure(&self, walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
+        walks.bounded();
         let (device, charges) = (walks.device(), walks.charges());
+        let store = walks.store();
+        let remeasuring = matches!(
+            ConvertCosts::stored(device.topology(), device.info(), *self, store),
+            Err(CeilingError::Flat { .. })
+        );
+        let remeasure = Remeasure(store);
+        let target: &dyn RecordStore<PointKey> = if remeasuring { &remeasure } else { store };
+        let mut all_measured = true;
+        let mut last_key = None;
         for converted in [1, CONVERTED_RECORDS] {
             let key = self.key(&walks.identity(), device.backend(), device.info().forms_tensor_operations(), converted)?;
-            walks.time_convert(key, self, move |kernel| {
+            last_key = Some(key.clone());
+            all_measured &= walks.time_convert_in(key, self, target, move |kernel| {
                 convert_point(charges, kernel, self, converted)
             });
+        }
+        if remeasuring && all_measured {
+            if let Err(error @ CeilingError::Flat { .. }) =
+                ConvertCosts::stored(device.topology(), device.info(), *self, store)
+            {
+                if let Some(key) = last_key {
+                    let _ = store.store(&key, &Record::Unobtainable { reason: Reason::new(error.to_string()) });
+                }
+            }
         }
         Ok(())
     }
@@ -769,7 +809,7 @@ impl TierCopyCosts {
     ) -> super::Priced<Self> {
         match Self::stored(topology, executor, store) {
             Ok(costs) => super::Priced::Measured(costs),
-            Err(TierCopyError::Unrecorded { .. }) => {
+            Err(TierCopyError::Unrecorded { .. } | TierCopyError::FasterBeside { .. } | TierCopyError::Transfer(_)) => {
                 super::Priced::Pending(super::PendingPrices::load(super::PointRequest::TierCopy))
             }
             Err(error) => super::Priced::Unavailable(error.to_string()),
@@ -809,8 +849,13 @@ impl TierCopyCosts {
     /// transfer queue runs throughout ([`Self::stall_share`]). Why the
     /// device has no transfer queue fails it.
     pub(super) fn measure(walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
-        let (device, charges) = (walks.device(), walks.charges().clone());
-        let charges = &charges;
+        walks.bounded();
+        let (device, charges) = (walks.device(), walks.charges());
+        let store = walks.store();
+        let initial = Self::stored(device.topology(), device.info(), store);
+        let remeasuring_transfer = matches!(initial, Err(TierCopyError::Transfer(_)));
+        let remeasuring_stall = matches!(initial, Err(TierCopyError::FasterBeside { .. }));
+        let remeasure = Remeasure(store);
         let formed = OnceCell::<Result<NativeKernel<routed_copy::Entry>, ExecutorCostsError>>::new();
         for blocks in [1, magnitude_kernels::LIST_BLOCKS] {
             let key = Self::key(&walks.identity(), device.backend(), device.info().forms_tensor_operations(), blocks)?;
@@ -831,6 +876,9 @@ impl TierCopyCosts {
         let into = Tensor::zeros(charges, Element::bool(), &shape).map_err(|cause| error(&cause))?;
         // The transfer queue's batches each way, of one record and of every
         // one, each timed from its issue to its completion.
+        let transfer_store: &dyn RecordStore<PointKey> = if remeasuring_transfer { &remeasure } else { store };
+        let mut all_transfer_measured = true;
+        let mut last_transfer_key = None;
         for direction in [Direction::In, Direction::Out] {
             let (source, destination) = match direction {
                 Direction::In => (&copied, &into),
@@ -838,13 +886,28 @@ impl TierCopyCosts {
             };
             for batch in [1, records] {
                 let transfer = &transfer;
-                walks.time_host(Self::transfer_key(&walks.identity(), batch, direction), move || Ok(TransferBatches { transfer, source, destination, records: batch }));
+                let key = Self::transfer_key(&walks.identity(), batch, direction);
+                last_transfer_key = Some(key.clone());
+                all_transfer_measured &= walks.time_host_in(key, transfer_store, move || {
+                    Ok(TransferBatches { transfer, source, destination, records: batch })
+                });
+            }
+        }
+        if remeasuring_transfer && all_transfer_measured {
+            if let Err(error @ TierCopyError::Transfer(_)) = Self::stored(device.topology(), device.info(), store) {
+                if let Some(key) = last_transfer_key {
+                    let _ = store.store(&key, &Record::Unobtainable { reason: Reason::new(error.to_string()) });
+                }
             }
         }
         // The device's work queued alone, then beside a copy the transfer
         // queue runs throughout its timing.
+        let stall_store: &dyn RecordStore<PointKey> = if remeasuring_stall { &remeasure } else { store };
+        let mut all_stall_measured = true;
+        let mut last_stall_key = None;
         for beside in [Beside::Alone, Beside::Copy] {
             let key = Self::stall_key(&walks.identity(), device.backend(), device.info().forms_tensor_operations(), beside)?;
+            last_stall_key = Some(key.clone());
             let formed = &formed;
             let point = move || {
                 let kernel = formed
@@ -855,13 +918,19 @@ impl TierCopyCosts {
             };
             // Timed with no compile beside it; beside a copy, its record kept
             // only where the copy ran throughout ([`Copying`]).
-            let store = walks.store();
             match beside {
-                Beside::Alone => walks.time_in(key, true, store, point),
+                Beside::Alone => all_stall_measured &= walks.time_in(key, true, stall_store, point),
                 Beside::Copy => {
-                    let copying = Copying::start(&transfer, &copied, &into, store);
-                    walks.time_in(key, true, &copying, point);
+                    let copying = Copying::start(&transfer, &copied, &into, stall_store);
+                    all_stall_measured &= walks.time_in(key, true, &copying, point);
                     copying.stop().map_err(|cause| error(&cause))?;
+                }
+            }
+        }
+        if remeasuring_stall && all_stall_measured {
+            if let Err(error @ TierCopyError::FasterBeside { .. }) = Self::stored(device.topology(), device.info(), store) {
+                if let Some(key) = last_stall_key {
+                    let _ = store.store(&key, &Record::Unobtainable { reason: Reason::new(error.to_string()) });
                 }
             }
         }
@@ -1833,7 +1902,7 @@ impl MemoryCosts {
     ) -> super::Priced<Self> {
         match Self::stored(topology, executor, readers, store) {
             Ok(costs) => super::Priced::Measured(costs),
-            Err(MemoryError::Unrecorded { .. }) => {
+            Err(MemoryError::Unrecorded { .. } | MemoryError::Flat { .. }) => {
                 super::Priced::Pending(super::PendingPrices::standing(super::PointRequest::HostMemory { readers }))
             }
             Err(error) => super::Priced::Unavailable(error.to_string()),
@@ -1845,16 +1914,33 @@ impl MemoryCosts {
     /// in `readers` shares ([`Sweeps::written`]; an untouched page reads as
     /// the one zero page).
     pub(super) fn measure(readers: u64, walks: &mut Walks<'_, '_>) {
+        walks.bounded();
         let topology = walks.device().topology().clone();
+        let executor = walks.device().info().clone();
+        let store = walks.store();
+        let remeasuring = matches!(Self::stored(&topology, &executor, readers, store), Err(MemoryError::Flat { .. }));
+        let remeasure = Remeasure(store);
+        let target: &dyn RecordStore<PointKey> = if remeasuring { &remeasure } else { store };
         let span = Self::span(&topology);
         let words = OnceCell::new();
+        let mut all_measured = true;
+        let mut last_key = None;
         for bytes in [0, span] {
             let words = &words;
-            walks.time_host(Self::key(&topology, readers, span, bytes), move || {
+            let key = Self::key(&topology, readers, span, bytes);
+            last_key = Some(key.clone());
+            all_measured &= walks.time_host_in(key, target, move || {
                 let readers = usize::try_from(readers).map_err(|_| Unformed::Never(ExecutorCostsError(format!("{readers} readers exceed the host"))))?;
                 let words = words.get_or_init(|| Sweeps::written((span / 8) as usize, readers));
                 Ok(Sweeps { words: &words[..(bytes / 8) as usize], readers })
             });
+        }
+        if remeasuring && all_measured {
+            if let Err(error @ MemoryError::Flat { .. }) = Self::stored(&topology, &executor, readers, store) {
+                if let Some(key) = last_key {
+                    let _ = store.store(&key, &Record::Unobtainable { reason: Reason::new(error.to_string()) });
+                }
+            }
         }
     }
 }
@@ -2312,6 +2398,29 @@ mod tests {
             [expected, 2 * expected],
             "machine-line host_readers must derive from topology processors"
         );
+    }
+
+    #[test]
+    fn flat_host_memory_line_is_pending_for_remeasure_and_unobtainable_settles_unavailable() {
+        let topology = seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap().topology();
+        let executor = topology.executors().first().expect("host topology has an executor");
+        let readers = MemoryCosts::readers(&topology);
+        let span = MemoryCosts::span(&topology);
+        let store = seismic::measure::HeldStore::default();
+        let zero_key = MemoryCosts::key(&topology, readers, span, 0);
+        let span_key = MemoryCosts::key(&topology, readers, span, span);
+        // A non-rising line (e.g. from a transient stall) stays Pending so a measurement job can overwrite it.
+        RecordStore::store(&store, &zero_key, &Record::Measured(Timing { median: 5e-3, interval: None, samples: 1 })).unwrap();
+        RecordStore::store(&store, &span_key, &Record::Measured(Timing { median: 4e-3, interval: None, samples: 1 })).unwrap();
+        assert!(matches!(MemoryCosts::priced(&topology, executor, readers, &store), super::super::Priced::Pending(_)));
+        assert!(super::super::PointRequest::HostMemory { readers }.outstanding(&topology, executor, &store, None));
+        // Remeasure hides Measured records so measure_all re-measures them, while preserving Unobtainable.
+        let remeasure = Remeasure(&store);
+        assert_eq!(RecordStore::load(&remeasure, &zero_key).unwrap(), None);
+        RecordStore::store(&store, &span_key, &Record::Unobtainable { reason: Reason::new("flat twice") }).unwrap();
+        assert!(matches!(RecordStore::load(&remeasure, &span_key).unwrap(), Some(Record::Unobtainable { .. })));
+        assert!(matches!(MemoryCosts::priced(&topology, executor, readers, &store), super::super::Priced::Unavailable(_)));
+        assert!(!super::super::PointRequest::HostMemory { readers }.outstanding(&topology, executor, &store, None));
     }
 
     }

@@ -144,7 +144,7 @@ export const performanceRangeSpeedLabel = (
 ): string => {
   switch (performance._tag) {
     case "Pending": return measurementLabel(performance.measurement)
-    case "Unavailable": return performance.failure.message
+    case "Unavailable": return "Speed unavailable"
     case "Estimated": {
       const speeds = localModelSpeedRangeContexts
         .map((contextTokens) => nearestSample(performance.samples, Math.min(contextTokens, contextLength)))

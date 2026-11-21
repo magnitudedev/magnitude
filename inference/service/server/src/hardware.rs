@@ -150,7 +150,16 @@ impl HardwareProvider for HardwareInventory {
         let volumes = Arc::clone(&self.volumes);
         let serving = self.serving;
         Box::pin(async move {
-            let resident = self.resident.observe().await.map_err(observation_error)?;
+            let resident = match self.resident.observe().await {
+                Ok(resident) => resident,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "resident memory observation failed during hardware snapshot; omitting resident device headroom"
+                    );
+                    None
+                }
+            };
             magnitude_service_utils::blocking::run(move || {
                 Self::snapshot_with(&inventory, &volumes, serving, resident.as_ref())
             })
@@ -504,5 +513,31 @@ mod tests {
                 .flat_map(|physical| &physical.executors)
                 .any(|executor| executor.id == observed.selected_executor)
         );
+    }
+
+    struct FailingResidentMemory;
+
+    impl ResidentMemory for FailingResidentMemory {
+        fn observe(&self) -> BoxFuture<'_, Result<Option<MemoryObservation>, RequestError>> {
+            Box::pin(async {
+                Err(RequestError::MemoryObservationUnavailable {
+                    reason: "worker unloading".to_owned(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_succeeds_when_resident_memory_observation_fails() {
+        let inventory = Arc::new(Inventory::discover(&[], seismic::ProgramStore::user()).unwrap());
+        let provider = HardwareInventory::new(
+            inventory,
+            ServedVolumes::new(Arc::new(VolumeReserves::new(None))),
+            ServingDevice::of(seismic::ExecutorSelector::HostCpu),
+            Arc::new(FailingResidentMemory),
+        )
+        .unwrap();
+        let observed = provider.snapshot().await.unwrap();
+        assert_eq!(observed.selected_executor.as_str(), "host-cpu");
     }
 }
