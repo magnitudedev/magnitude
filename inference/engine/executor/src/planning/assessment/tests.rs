@@ -2204,7 +2204,7 @@ fn worker_host_bytes_price_the_plans_vocabulary_and_kernels() {
             &programs,
             &definition,
             &load,
-            crate::TuningLimits::of(limits, &definition),
+            crate::TuningLimits::of(limits, &load, &definition),
         )
         .unwrap()
         .len() as u64;

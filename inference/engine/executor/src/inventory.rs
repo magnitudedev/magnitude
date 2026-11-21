@@ -18,7 +18,7 @@ pub fn kernel_inventory(
         plan.programs(),
         definition,
         plan.load(),
-        TuningLimits::of(plan.policy().limits(), definition),
+        TuningLimits::of(plan.policy().limits(), plan.load(), definition),
     )
     .map_err(|failure| CatalogError::native(plan.backend(), failure))
 }

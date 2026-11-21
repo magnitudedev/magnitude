@@ -2566,6 +2566,36 @@ impl<'a> Preparation<'a> {
         self.spec.tuned_ranges(&mut self.tuning, served, case)
     }
 
+    /// [`Self::served_projection`] for a grouped routed-experts entry that
+    /// executes across merged prompt passes (`routed_experts`,
+    /// `routed_experts_up`): when the entry serves target layers, its demand
+    /// walk uses `graph_demand.target_pass` over those target layers rather
+    /// than per-launch `target` demand.
+    fn served_pass_projection<T: EntryTuning>(
+        &mut self,
+        served: Range<u64>,
+        scopes: &[WeightScope],
+        case: T,
+    ) -> Result<Option<RangedKernels<T::Entry>>, CatalogFailure> {
+        let target_layers = scopes
+            .iter()
+            .filter(|scope| matches!(scope, WeightScope::TargetSublayer(_)))
+            .count();
+        let previous = self
+            .graph_demand
+            .as_ref()
+            .filter(|_| target_layers > 0)
+            .and_then(|demand| {
+                self.tuning
+                    .swap_invocations(demand.target_pass.scaled(target_layers), false)
+            });
+        let result = self.served_projection(served, case);
+        if let Some((calls, repeat_case)) = previous {
+            self.tuning.set_invocations(calls, repeat_case);
+        }
+        result
+    }
+
     /// [`Self::served_projection`] of a dependant of `prerequisite`'s
     /// ranges over the same rows ([`Specializer::tuned_ranges_following`]):
     /// each range keeps the bits of the prerequisite's kernel of its rows.
@@ -2651,13 +2681,15 @@ impl<'a> Preparation<'a> {
             let resident_gate_up = RoutedGateUpTuning(decode());
             let decode = self.served_projection(DECODE_SERVED, resident_gate_up.clone())?;
             self.resident_gate_ups.insert(binding, resident_gate_up);
-            let grouped = self.served_projection(GROUPED_SERVED, RoutedGatedTilesTuning(tiles()))?;
+            let grouped =
+                self.served_pass_projection(GROUPED_SERVED, &scopes, RoutedGatedTilesTuning(tiles()))?;
             decode
                 .zip(grouped)
                 .map(|(decode, grouped)| ExpertKernels::Gated { decode, grouped })
         } else {
             let decode = self.served_projection(DECODE_SERVED, RoutedUpTuning(decode()))?;
-            let grouped = self.served_projection(GROUPED_SERVED, RoutedUpTilesTuning(tiles()))?;
+            let grouped =
+                self.served_pass_projection(GROUPED_SERVED, &scopes, RoutedUpTilesTuning(tiles()))?;
             decode
                 .zip(grouped)
                 .map(|(decode, grouped)| ExpertKernels::Plain { decode, grouped })
@@ -3197,8 +3229,9 @@ impl<'a> Preparation<'a> {
         };
         let output = self.served_projection(DECODE_SERVED, resident_output.clone())?;
         self.resident_outputs.insert(b, resident_output);
-        let experts = self.served_projection(
+        let experts = self.served_pass_projection(
             GROUPED_SERVED,
+            &scopes,
             RoutedExpertsTuning {
                 expert_gate: b.expert_gate,
                 expert_up: b.expert_up,

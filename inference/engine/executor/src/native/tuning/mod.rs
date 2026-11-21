@@ -204,7 +204,7 @@ use std::time::{Duration, Instant};
 
 /// The row classes units are tuned at; a load's launches are represented at
 /// them ([`EntryTuning::invocation_rows`]).
-pub const TUNING_ROWS: [u64; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+pub const TUNING_ROWS: [u64; 13] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 /// Numerical history witnesses, supplemented by each layer's longest
 /// retained history ([`with_contexts`]). Performance demand selects its
 /// representatives independently in [`apply_invocation_counts`].
@@ -479,6 +479,9 @@ impl PointShape {
 pub struct TuningLimits {
     /// Rows of the largest target batch class.
     pub max_rows: u64,
+    /// Rows of the largest merged-expert prompt pass (at least `max_rows`,
+    /// capped at the largest tuning row class and the served context).
+    pub max_pass_rows: u64,
     /// Rows of the largest launch that projects logits.
     pub max_projected_rows: u64,
     /// The served context: the longest history a row attends to.
@@ -491,9 +494,21 @@ pub struct TuningLimits {
 
 impl TuningLimits {
     /// The bounds a load under `limits` tunes `definition`'s entries within.
-    pub(crate) fn of(limits: crate::ResourceLimits, definition: &ModelDefinition) -> Self {
+    pub(crate) fn of(
+        limits: crate::ResourceLimits,
+        load: &ModelLoadPlan,
+        definition: &ModelDefinition,
+    ) -> Self {
+        let max_rows = limits.max_launch_rows as u64;
+        let max_tuning_rows = *TUNING_ROWS.last().expect("TUNING_ROWS is non-empty");
+        let max_pass_rows = (load.pass(limits).get() as u64)
+            .saturating_mul(max_rows)
+            .min(definition.decoder.context_limit)
+            .min(max_tuning_rows)
+            .max(max_rows);
         Self {
-            max_rows: limits.max_launch_rows as u64,
+            max_rows,
+            max_pass_rows,
             max_projected_rows: crate::programs::graph::readout::max_projected_rows(limits) as u64,
             context_tokens: definition.decoder.context_limit,
             image_cells: magnitude_batching::image_cell_class(limits.max_image_cells)
@@ -776,11 +791,11 @@ pub fn row_points(limits: TuningLimits) -> Vec<PointShape> {
     served_row_points(limits, |_| true)
 }
 
-/// Every row point an entry serves up to the row bound of `limits`. An entry
-/// whose served rows all lie beyond the bound is still prepared (its graph
-/// classes do not exist, but the kernel set is complete); its smallest served
-/// row count stands in as the single point.
-pub fn served_row_points(limits: TuningLimits, serves: impl Fn(u64) -> bool) -> Vec<PointShape> {
+/// Every row point an entry serves up to `max_rows`. An entry whose served
+/// rows all lie beyond the bound is still prepared (its graph classes do not
+/// exist, but the kernel set is complete); its smallest served row count
+/// stands in as the single point.
+pub fn served_row_points_up_to(max_rows: u64, serves: impl Fn(u64) -> bool) -> Vec<PointShape> {
     let served = TUNING_ROWS
         .into_iter()
         .filter(|rows| serves(*rows))
@@ -788,7 +803,7 @@ pub fn served_row_points(limits: TuningLimits, serves: impl Fn(u64) -> bool) -> 
     let within = served
         .iter()
         .copied()
-        .filter(|rows| *rows <= limits.max_rows)
+        .filter(|rows| *rows <= max_rows)
         .collect::<Vec<_>>();
     if within.is_empty() {
         return served
@@ -798,6 +813,11 @@ pub fn served_row_points(limits: TuningLimits, serves: impl Fn(u64) -> bool) -> 
             .collect();
     }
     points_at(within)
+}
+
+/// Every row point an entry serves up to the row bound of `limits`.
+pub fn served_row_points(limits: TuningLimits, serves: impl Fn(u64) -> bool) -> Vec<PointShape> {
+    served_row_points_up_to(limits.max_rows, serves)
 }
 
 /// A point of one sequence at each of `rows`, alike in weight.
@@ -1120,6 +1140,15 @@ pub(crate) trait EntryTuning: Clone + 'static {
     /// entries operating on an `out_rows` subset.
     fn row_dimension(&self) -> &'static str {
         "M"
+    }
+    /// Additional row boundaries where this entry's execution regime changes
+    /// independently of its kernel declaration (e.g. small-grouped vs
+    /// merged-pass prefill for `routed_experts` / `routed_experts_up`).
+    /// [`ranged::row_ranges`] retains a cut only when the case has measured
+    /// points on both sides of it, so range boundaries and tuning points agree
+    /// by construction.
+    fn row_regime_cuts(&self) -> &'static [u64] {
+        &[]
     }
     /// Project a logical graph launch onto this entry's performance
     /// representative: the rows of the point that times it, none where the

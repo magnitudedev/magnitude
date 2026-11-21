@@ -900,7 +900,7 @@ pub(crate) mod tests {
             &program,
             definition,
             load,
-            crate::native::TuningLimits::of(crate::assessment::assess::tests::LIMITS, definition),
+            crate::native::TuningLimits::of(crate::assessment::assess::tests::LIMITS, load, definition),
         )
     }
 

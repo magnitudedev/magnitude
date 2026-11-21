@@ -370,7 +370,7 @@ impl HostProcessBytes {
             programs,
             definition,
             load,
-            crate::TuningLimits::of(limits, definition),
+            crate::TuningLimits::of(limits, load, definition),
         )
         .map_err(|failure| crate::CatalogError::native(backend, failure).to_string())?
         .len() as u64;

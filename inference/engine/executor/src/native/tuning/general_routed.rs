@@ -8,9 +8,9 @@
 
 use super::cases::scale_extent;
 use super::routed::{
-    BankOperands, ExpansionScales, GroupedTables, ResidentGateUp, RoutedShape, bank_sources, bank_statics,
-    decode_points, group, grouped_points, lead_ports, no_sources, no_tier, routes, streamed_hint,
-    words, written,
+    BankOperands, ExpansionScales, GroupedTables, MERGED_PASS_FROM, ResidentGateUp, RoutedShape,
+    bank_sources, bank_statics, decode_points, group, grouped_pass_points, grouped_points,
+    lead_ports, no_sources, no_tier, routes, streamed_hint, words, written,
 };
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, experts_text, row_points,
@@ -928,7 +928,11 @@ impl EntryTuning for RoutedGatedTilesTuning {
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        grouped_points(limits)
+        grouped_pass_points(limits)
+    }
+
+    fn row_regime_cuts(&self) -> &'static [u64] {
+        &[MERGED_PASS_FROM]
     }
 
     fn rotation(
@@ -997,7 +1001,11 @@ impl EntryTuning for RoutedUpTilesTuning {
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        grouped_points(limits)
+        grouped_pass_points(limits)
+    }
+
+    fn row_regime_cuts(&self) -> &'static [u64] {
+        &[MERGED_PASS_FROM]
     }
 
     fn rotation(

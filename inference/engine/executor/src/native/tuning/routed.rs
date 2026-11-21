@@ -16,7 +16,7 @@
 use super::cases::scale_extent;
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, experts_text, row_points,
-    served_row_points,
+    served_row_points, served_row_points_up_to,
 };
 use crate::operators::routed::fused_graph::{TILE_ROWS, grouped_blocks};
 use crate::planning::{BankBinding, HINT_LEADS, HintWeight, RoutedBinding};
@@ -61,14 +61,27 @@ pub(crate) const DECODE_SERVED: Range<u64> = 1..VERIFY_ROWS + 1;
 /// The rows the grouped form serves: every row past the decode form.
 pub(crate) const GROUPED_SERVED: Range<u64> = VERIFY_ROWS + 1..u64::MAX;
 
+/// The smallest row count of a merged-pass grouped expert invocation:
+/// above `1024` rows, merged prompt passes amortize per-expert setup across
+/// multiple blocks per expert and compete in a different form regime from
+/// small-grouped launches (`9..1025`).
+pub(crate) const MERGED_PASS_FROM: u64 = 1025;
+
 /// The decode points: row counts the decode form serves.
 pub(crate) fn decode_points(limits: TuningLimits) -> Vec<PointShape> {
     served_row_points(limits, |rows| DECODE_SERVED.contains(&rows))
 }
 
-/// The grouped points: row counts past the decode form.
+/// The grouped points: row counts past the decode form, up to `limits.max_rows`.
 pub(crate) fn grouped_points(limits: TuningLimits) -> Vec<PointShape> {
     served_row_points(limits, |rows| GROUPED_SERVED.contains(&rows))
+}
+
+/// The grouped points for entries that execute merged prompt passes
+/// (`routed_experts`, `routed_experts_up`): row counts past the decode form,
+/// up to `limits.max_pass_rows`.
+pub(crate) fn grouped_pass_points(limits: TuningLimits) -> Vec<PointShape> {
+    served_row_points_up_to(limits.max_pass_rows, |rows| GROUPED_SERVED.contains(&rows))
 }
 
 /// Distinct experts per row with the uneven expert loads of real routing: the
@@ -1699,7 +1712,11 @@ impl EntryTuning for RoutedExpertsTuning {
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        grouped_points(limits)
+        grouped_pass_points(limits)
+    }
+
+    fn row_regime_cuts(&self) -> &'static [u64] {
+        &[MERGED_PASS_FROM]
     }
 
     fn rotation(

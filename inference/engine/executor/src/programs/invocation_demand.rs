@@ -93,6 +93,10 @@ pub(crate) struct GraphInvocationDemand {
     /// The objective's terms, by index.
     pub terms: Vec<Term>,
     pub target: InvocationCounts,
+    /// The target's merged-expert prompt passes (`routed_experts`,
+    /// `routed_experts_up`): prefill grouped up to `max_pass_rows` rows per
+    /// pass (identical to `target` when `max_pass_rows == max_rows`).
+    pub target_pass: InvocationCounts,
     /// A draft head's decoder steps: one per proposal it drafts.
     pub head: InvocationCounts,
     /// A draft head priming its history with every prompt row the target
@@ -138,10 +142,12 @@ impl GraphInvocationDemand {
         terms: Vec<Term>,
         draft_definition: Option<&magnitude_family_contracts::DraftDefinition>,
         max_rows: u64,
+        max_pass_rows: u64,
     ) -> Self {
         let mut demand = Self {
             terms: Vec::new(),
             target: InvocationCounts::default(),
+            target_pass: InvocationCounts::default(),
             head: InvocationCounts::default(),
             head_prefix: InvocationCounts::default(),
             draft: InvocationCounts::default(),
@@ -152,6 +158,11 @@ impl GraphInvocationDemand {
             .filter(|rows| *rows <= max_rows)
             .max()
             .unwrap_or(1);
+        let pass_chunk = crate::TUNING_ROWS
+            .into_iter()
+            .filter(|rows| *rows <= max_pass_rows)
+            .max()
+            .unwrap_or(chunk);
         for (term, spec) in terms.iter().enumerate() {
             let metric = spec.metric;
             let at = |rows: u64, sequences: u64, history: u64, projected: u64| Launch {
@@ -178,21 +189,29 @@ impl GraphInvocationDemand {
                         demand.draft.launch(Launch { projected: 0, ..launch }, count);
                         history += rows;
                     }
+                    let mut pass_history = 0;
+                    while pass_history < metric.context {
+                        let rows = pass_chunk.min(metric.context - pass_history);
+                        let ends = pass_history + rows == metric.context;
+                        let launch = at(rows, 1, pass_history, u64::from(ends));
+                        demand.target_pass.launch(launch, metric.sequences as f64);
+                        pass_history += rows;
+                    }
                 }
                 Phase::Vision => demand.images.push((term, metric.context)),
                 Phase::Decode => {
                     let (sequences, history) = (metric.sequences, metric.context);
                     match (method, spec.width) {
                         (PlannedMethod::Plain, _) | (_, None | Some(0)) => {
-                            demand
-                                .target
-                                .launch(at(sequences, sequences, history, sequences), 1.);
+                            let launch = at(sequences, sequences, history, sequences);
+                            demand.target.launch(launch, 1.);
+                            demand.target_pass.launch(launch, 1.);
                         }
                         (PlannedMethod::Mtp { .. }, Some(width)) => {
                             let verified = (width + 1) * sequences;
-                            demand
-                                .target
-                                .launch(at(verified, sequences, history, verified), 1.);
+                            let launch = at(verified, sequences, history, verified);
+                            demand.target.launch(launch, 1.);
+                            demand.target_pass.launch(launch, 1.);
                             demand
                                 .head
                                 .launch(at(sequences, sequences, history, sequences), width as f64);
@@ -203,9 +222,9 @@ impl GraphInvocationDemand {
                                 .block_rows(width);
                             let verified = width.min(u64::from(proposals));
                             let checked = (verified + 1) * sequences;
-                            demand
-                                .target
-                                .launch(at(checked, sequences, history, checked), 1.);
+                            let launch = at(checked, sequences, history, checked);
+                            demand.target.launch(launch, 1.);
+                            demand.target_pass.launch(launch, 1.);
                             demand.draft.launch(
                                 at(block * sequences, sequences, history, verified * sequences),
                                 1.,
@@ -246,6 +265,7 @@ mod tests {
             vec![term(Phase::Prefill, 1300, None)],
             None,
             512,
+            512,
         );
         let launches = demand.target.launches().collect::<Vec<_>>();
         assert_eq!(
@@ -255,7 +275,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(276, 1024, 1.), (512, 0, 1.), (512, 512, 1.)]
         );
+        assert_eq!(demand.target_pass, demand.target);
         assert_eq!(demand.head_prefix, demand.target);
+
+        // With merged passes up to 4096 rows, a 4096-token prompt runs as one
+        // 4096-row pass while per-launch target ops still run eight 512-row
+        // chunks.
+        let merged = GraphInvocationDemand::new(
+            PlannedMethod::Plain,
+            vec![term(Phase::Prefill, 4096, None)],
+            None,
+            512,
+            4096,
+        );
+        assert_eq!(merged.target.count(512), 8.);
+        assert_eq!(merged.target_pass.count(4096), 1.);
+        assert_eq!(merged.target_pass.count(512), 0.);
     }
 
     /// A drafted decode step at width w is the head's w proposals and the
@@ -267,8 +302,13 @@ mod tests {
             sampled_proposals: 1,
             widths: crate::DraftWidths::Adaptive,
         };
-        let demand =
-            GraphInvocationDemand::new(method, vec![term(Phase::Decode, 4096, Some(3))], None, 512);
+        let demand = GraphInvocationDemand::new(
+            method,
+            vec![term(Phase::Decode, 4096, Some(3))],
+            None,
+            512,
+            512,
+        );
         assert_eq!(demand.target.count(4), 1.);
         assert_eq!(demand.head.count(1), 3.);
         assert!(
@@ -298,6 +338,7 @@ mod tests {
         };
         let limits = crate::TuningLimits {
             max_rows: 512,
+            max_pass_rows: 512,
             max_projected_rows: 8,
             context_tokens: 8192,
             image_cells: 64,
@@ -307,6 +348,7 @@ mod tests {
                 method,
                 crate::native::tuning_workload::terms(limits, &[1, 3], images),
                 None,
+                512,
                 512,
             )
         };
