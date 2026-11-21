@@ -864,7 +864,7 @@ impl<'a> Preparation<'a> {
     fn walk(&mut self, plan: &ProgramPlan) -> Result<GlueKernels, CatalogFailure> {
         if let Some(demand) = &self.graph_demand {
             let mut selection = demand.target.clone();
-            if plan.head().is_some() || plan.shared_head().is_some() {
+            if plan.drafts_with_head() {
                 selection.add(&demand.head);
             }
             self.tuning.set_invocations(selection, true);
@@ -910,7 +910,7 @@ impl<'a> Preparation<'a> {
             )?,
             // Every drafter's proposals, a fronting load's head's among
             // them: it drafts a verify pass's (§7.1).
-            token_confidence: match plan.drafts_with_head() || plan.draft().is_some() {
+            token_confidence: match plan.drafter().is_some() {
                 true => fixed!(self.spec, token_confidence, String::new()),
                 false => None,
             },

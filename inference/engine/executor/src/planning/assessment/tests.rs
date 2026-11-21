@@ -876,7 +876,7 @@ fn target_reading_head_plans_its_program_weights_and_charge() {
     .unwrap();
     // Every head weight, its own vocabulary table and both projections
     // included, is the draft component's.
-    let head_weights = load.head.as_ref().unwrap();
+    let head_weights = load.head().unwrap();
     assert_eq!(
         head_weights.len(),
         crate::operators::head_weights(definition.head.as_ref().unwrap())

@@ -556,6 +556,17 @@ impl StateProgramPlan {
     }
 }
 
+/// The active drafter's program, when the plan drafts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DrafterProgramPlan {
+    /// An embedded draft head with its own history.
+    Head(HeadProgramPlan),
+    /// A draft head reading target history.
+    SharedHead(SharedHeadProgramPlan),
+    /// A separate draft model.
+    Draft(DraftProgramPlan),
+}
+
 /// Exact program slots in execution order. The private constructor checks
 /// family topology before any program factory can attest callable slots.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -566,38 +577,58 @@ pub struct ProgramPlan {
     /// rows the device selects copies its selection for the host.
     copies_token_rows: bool,
     target: TargetProgramPlan,
-    head: Option<HeadProgramPlan>,
-    shared_head: Option<SharedHeadProgramPlan>,
-    draft: Option<DraftProgramPlan>,
+    drafter: Option<Box<DrafterProgramPlan>>,
     vision: Option<VisionProgramPlan>,
     state: StateProgramPlan,
 }
 
 impl ProgramPlan {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         definition: &ModelDefinition,
         imports: Vec<ImportProgramSlot>,
         copies_token_rows: bool,
         target: TargetProgramPlan,
-        head: Option<HeadProgramPlan>,
-        shared_head: Option<SharedHeadProgramPlan>,
-        draft: Option<DraftProgramPlan>,
+        drafter: Option<DrafterProgramPlan>,
         vision: Option<VisionProgramPlan>,
         state: StateProgramPlan,
     ) -> Result<Self, PlanError> {
-        if draft.as_ref().is_some_and(|draft| {
-            definition
+        let is_draft = matches!(drafter, Some(DrafterProgramPlan::Draft(_)));
+        if let Some(DrafterProgramPlan::Draft(draft)) = &drafter {
+            if definition
                 .draft
                 .as_ref()
                 .map(|description| description.blocks.len())
                 != Some(draft.blocks.len())
-        }) || draft.is_some() != target.taps.is_some()
-        {
+            {
+                return Err(PlanError::Topology(
+                    "draft program slots disagree with the draft and its taps",
+                ));
+            }
+        }
+        if is_draft != target.taps.is_some() {
             return Err(PlanError::Topology(
                 "draft program slots disagree with the draft and its taps",
             ));
         }
+        let drafter_matches = match &drafter {
+            None | Some(DrafterProgramPlan::Draft(_)) => true,
+            Some(DrafterProgramPlan::Head(head)) => {
+                definition
+                    .head
+                    .as_ref()
+                    .map(|description| description.blocks.len())
+                    == Some(head.blocks.len())
+            }
+            Some(DrafterProgramPlan::SharedHead(shared)) => {
+                definition.head.as_ref().map(|description| {
+                    description
+                        .blocks
+                        .iter()
+                        .map(|block| block.blocks.len())
+                        .sum::<usize>()
+                }) == Some(shared.blocks.len())
+            }
+        };
         if target.blocks.len() != definition.decoder.blocks.len()
             || target
                 .blocks
@@ -607,23 +638,7 @@ impl ProgramPlan {
                     paired_block(block)
                         .map_or(true, |paired| !operators::slot_matches(&paired, slot))
                 })
-            || head.as_ref().is_some_and(|head| {
-                definition
-                    .head
-                    .as_ref()
-                    .map(|description| description.blocks.len())
-                    != Some(head.blocks.len())
-            })
-            || shared_head.as_ref().is_some_and(|shared| {
-                head.is_some()
-                    || definition.head.as_ref().map(|description| {
-                        description
-                            .blocks
-                            .iter()
-                            .map(|block| block.blocks.len())
-                            .sum::<usize>()
-                    }) != Some(shared.blocks.len())
-            })
+            || !drafter_matches
             || vision.is_some() != definition.vision.is_some()
         {
             return Err(PlanError::Topology(
@@ -634,9 +649,7 @@ impl ProgramPlan {
             imports,
             copies_token_rows,
             target,
-            head,
-            shared_head,
-            draft,
+            drafter: drafter.map(Box::new),
             vision,
             state,
         })
@@ -657,24 +670,41 @@ impl ProgramPlan {
         &self.target
     }
 
+    /// The active drafter's program, when the plan drafts.
+    pub fn drafter(&self) -> Option<&DrafterProgramPlan> {
+        self.drafter.as_deref()
+    }
+
     /// The embedded draft head's program, when it drafts.
     pub fn head(&self) -> Option<&HeadProgramPlan> {
-        self.head.as_ref()
+        match self.drafter.as_deref() {
+            Some(DrafterProgramPlan::Head(head)) => Some(head),
+            _ => None,
+        }
     }
 
     /// The program of a draft head reading target history, when it drafts.
     pub fn shared_head(&self) -> Option<&SharedHeadProgramPlan> {
-        self.shared_head.as_ref()
+        match self.drafter.as_deref() {
+            Some(DrafterProgramPlan::SharedHead(shared)) => Some(shared),
+            _ => None,
+        }
     }
 
     /// Whether a draft head of either form drafts (MTP).
     pub fn drafts_with_head(&self) -> bool {
-        self.head.is_some() || self.shared_head.is_some()
+        matches!(
+            self.drafter.as_deref(),
+            Some(DrafterProgramPlan::Head(_) | DrafterProgramPlan::SharedHead(_))
+        )
     }
 
     /// The separate draft's program, when it drafts.
     pub fn draft(&self) -> Option<&DraftProgramPlan> {
-        self.draft.as_ref()
+        match self.drafter.as_deref() {
+            Some(DrafterProgramPlan::Draft(draft)) => Some(draft),
+            _ => None,
+        }
     }
 
     pub fn vision(&self) -> Option<&VisionProgramPlan> {
@@ -919,121 +949,109 @@ pub(super) fn derive_program_plan(
         activation,
     )
     .with_per_layer(per_layer_entry);
-    let draft_program = separate
-        .zip(head)
-        .map(|(draft, weights)| {
-            draft_program_plan(
+    let drafter = match head {
+        None => None,
+        Some(weights) => match (definition.draft.as_ref(), definition.head.as_ref()) {
+            (Some(draft), _) => Some(DrafterProgramPlan::Draft(draft_program_plan(
                 draft,
                 decoder.hidden,
                 target,
                 weights,
                 active_element,
                 readout_choices,
-            )
-        })
-        .transpose()?;
-    // A selected head is embedded in the target or reads its history.
-    let head_form = match (head, separate, definition.head.as_ref()) {
-        (Some(_), None, Some(head)) => Some(operators::head_form(head, decoder)?),
-        (Some(_), None, None) => {
-            return Err(PlanError::Topology(
-                "head weights without a head definition",
-            ));
-        }
-        _ => None,
-    };
-    let shared_head_program = match (head, head_form) {
-        (Some(weights), Some(operators::HeadForm::Shared(shared))) => {
-            Some(shared_head_program_plan(
-                &shared,
-                embedding,
-                weights,
-                active_element,
-                readout_choices,
-                history,
-            )?)
-        }
-        _ => None,
-    };
-    let head_program = head
-        .filter(|_| matches!(head_form, Some(operators::HeadForm::Causal)))
-        .map(|weights| {
-            let head = definition.head.as_ref().ok_or(PlanError::Topology(
-                "head weights without a head definition",
-            ))?;
-            let mut slots = Vec::with_capacity(head.depth());
-            for (index, head_block) in head.blocks.iter().enumerate() {
-                let index = u32::try_from(index)
-                    .map_err(|_| PlanError::Arithmetic("head block index exceeds u32"))?;
-                let scope = WeightScope::HeadBlock(index);
-                let paired = paired_block(CausalHeadBlock::of(head, head_block)?.block)?;
-                let [mixer, feed_forward] = paired_scopes(index, WeightScope::HeadSublayer);
-                let attention = attention_slot(
-                    &paired,
-                    decoder.hidden,
-                    |kind| lookup(weights, mixer, kind),
-                    |kind| planned_scalable(weights, mixer, kind),
-                    active_element,
-                    KvCodec::Dense,
-                    Some(decoder.context_limit),
-                )?;
-                let streams = operators::streams::StreamsGeometry::from_residual(
-                    decoder.hidden,
-                    &head_block.residual,
-                )?
-                .map(|geometry| {
-                    // Admission runs heads over low-rank streams only.
-                    let geometry = geometry.low_rank().ok_or(PlanError::Unsupported(
-                        operators::SINKHORN_HEAD,
-                    ))?;
-                    operators::streams::binding(
-                        geometry,
-                        mixer,
-                        Some(feed_forward),
-                        Some(scope),
-                        |scope, kind| lookup(weights, scope, kind),
+            )?)),
+            (None, Some(head)) => match operators::head_form(head, decoder)? {
+                operators::HeadForm::Shared(shared) => Some(DrafterProgramPlan::SharedHead(
+                    shared_head_program_plan(
+                        &shared,
+                        embedding,
+                        weights,
                         active_element,
-                    )
-                })
-                .transpose()?;
-                slots.push(HeadBinding {
-                    streams,
-                    conditioning: if head.residual_conditioning() {
-                        Element::f32()
-                    } else {
-                        active_element
-                    },
-                    embedding_table: lookup(target, WeightScope::Target, WeightKind::Embedding)?,
-                    embedding_norm: lookup(weights, scope, WeightKind::HeadEmbeddingNorm)?,
-                    hidden_norm: lookup(weights, scope, WeightKind::HeadHiddenNorm)?,
-                    combine: lookup(weights, scope, WeightKind::HeadCombine)?,
-                    attention,
-                    feed_forward: feed_forward_slot(
-                        &paired.feed_forward.ok_or(PlanError::Unsupported(
-                            "draft head block without feed-forward",
-                        ))?,
-                        decoder.hidden,
-                        feed_forward,
-                        |scope, kind| lookup(weights, scope, kind),
-                        |scope, kind| planned_scalable(weights, scope, kind),
-                        active_element,
-                    )?,
-                    output_norm: if streams.is_some() {
-                        active_element
-                    } else {
-                        lookup(weights, scope, WeightKind::OutputNorm)?
-                    },
-                    projection: planned_readout_recipe(
-                        target,
-                        WeightScope::Target,
                         readout_choices,
+                        history,
                     )?,
-                    activation: active_element,
-                });
+                )),
+                operators::HeadForm::Causal => {
+                    let mut slots = Vec::with_capacity(head.depth());
+                    for (index, head_block) in head.blocks.iter().enumerate() {
+                        let index = u32::try_from(index)
+                            .map_err(|_| PlanError::Arithmetic("head block index exceeds u32"))?;
+                        let scope = WeightScope::HeadBlock(index);
+                        let paired = paired_block(CausalHeadBlock::of(head, head_block)?.block)?;
+                        let [mixer, feed_forward] = paired_scopes(index, WeightScope::HeadSublayer);
+                        let attention = attention_slot(
+                            &paired,
+                            decoder.hidden,
+                            |kind| lookup(weights, mixer, kind),
+                            |kind| planned_scalable(weights, mixer, kind),
+                            active_element,
+                            KvCodec::Dense,
+                            Some(decoder.context_limit),
+                        )?;
+                        let streams = operators::streams::StreamsGeometry::from_residual(
+                            decoder.hidden,
+                            &head_block.residual,
+                        )?
+                        .map(|geometry| {
+                            // Admission runs heads over low-rank streams only.
+                            let geometry = geometry.low_rank().ok_or(PlanError::Unsupported(
+                                operators::SINKHORN_HEAD,
+                            ))?;
+                            operators::streams::binding(
+                                geometry,
+                                mixer,
+                                Some(feed_forward),
+                                Some(scope),
+                                |scope, kind| lookup(weights, scope, kind),
+                                active_element,
+                            )
+                        })
+                        .transpose()?;
+                        slots.push(HeadBinding {
+                            streams,
+                            conditioning: if head.residual_conditioning() {
+                                Element::f32()
+                            } else {
+                                active_element
+                            },
+                            embedding_table: lookup(target, WeightScope::Target, WeightKind::Embedding)?,
+                            embedding_norm: lookup(weights, scope, WeightKind::HeadEmbeddingNorm)?,
+                            hidden_norm: lookup(weights, scope, WeightKind::HeadHiddenNorm)?,
+                            combine: lookup(weights, scope, WeightKind::HeadCombine)?,
+                            attention,
+                            feed_forward: feed_forward_slot(
+                                &paired.feed_forward.ok_or(PlanError::Unsupported(
+                                    "draft head block without feed-forward",
+                                ))?,
+                                decoder.hidden,
+                                feed_forward,
+                                |scope, kind| lookup(weights, scope, kind),
+                                |scope, kind| planned_scalable(weights, scope, kind),
+                                active_element,
+                            )?,
+                            output_norm: if streams.is_some() {
+                                active_element
+                            } else {
+                                lookup(weights, scope, WeightKind::OutputNorm)?
+                            },
+                            projection: planned_readout_recipe(
+                                target,
+                                WeightScope::Target,
+                                readout_choices,
+                            )?,
+                            activation: active_element,
+                        });
+                    }
+                    Some(DrafterProgramPlan::Head(HeadProgramPlan::new(slots)))
+                }
+            },
+            (None, None) => {
+                return Err(PlanError::Topology(
+                    "head weights without a head definition",
+                ));
             }
-            Ok::<_, PlanError>(HeadProgramPlan::new(slots))
-        })
-        .transpose()?;
+        },
+    };
     let vision_program = match (definition.vision.as_deref(), vision) {
         (Some(description), Some(weights)) => {
             let program = operators::vision::vision_program(description, &|role| {
@@ -1073,9 +1091,7 @@ pub(super) fn derive_program_plan(
         imports,
         copies_token_rows,
         target_program,
-        head_program,
-        shared_head_program,
-        draft_program,
+        drafter,
         vision_program,
         state,
     )

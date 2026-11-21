@@ -1437,9 +1437,7 @@ impl ExecutionPlanDraft {
             ));
         }
         let mut load = (*self.load).clone();
-        load.residual_conditioning = None;
         load.head = None;
-        load.own_history_head = false;
         load.target
             .retain(|weight| weight.component.kind != ArtifactComponentKind::Draft);
         load.unplaced_output.retain(|weight| {

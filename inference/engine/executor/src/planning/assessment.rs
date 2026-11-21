@@ -480,7 +480,7 @@ impl HostProcessBytes {
             .and_then(|head| head.blocks().first())
             .map_or(programs.target().embedding().activation, |head| head.conditioning);
         add("feature_copy", &[("A", feature_activation)]);
-        if programs.drafts_with_head() || programs.draft().is_some() {
+        if programs.drafter().is_some() {
             add("token_confidence", &[]);
         }
         if programs.copies_token_rows() {
@@ -1057,8 +1057,7 @@ impl AssessmentGraphResourceBounds {
         ),
         GraphError,
     > {
-        let has_drafter =
-            plan.head().is_some() || plan.draft().is_some() || plan.shared_head().is_some();
+        let has_drafter = plan.drafter().is_some();
         let ((vrs_result, drafter_result), target_result) = crate::assessment::pool::join(
             || {
                 let _sizing = crate::programs::graph::sizing::SizingScope::enter();
@@ -1230,13 +1229,10 @@ impl AssessmentGraphResourceBounds {
         backend: BackendName,
     ) -> Result<DrafterBounds, GraphError> {
         let slots = limits.startup_slots(load.fronts());
-        match (plan.head(), plan.draft(), state.head_state()) {
+        match (plan.drafter(), state.head_state()) {
             // A head reading target history keeps no state of its own.
-            (None, None, None) if plan.shared_head().is_some() => {
+            (Some(super::DrafterProgramPlan::SharedHead(shared)), None) => {
                 stage_timer::time_stage(|t, ns| t.other_drafter_ns += ns, || -> Result<_, GraphError> {
-                    let shared = plan
-                        .shared_head()
-                        .ok_or("a shared head program is absent")?;
                     let geometry = crate::programs::native_shared_head::SharedHeadGeometry::new(
                         definition, state, shared,
                     )?;
@@ -1258,7 +1254,7 @@ impl AssessmentGraphResourceBounds {
                     })
                 })
             }
-            (None, Some(draft_plan), Some(head_state)) => {
+            (Some(super::DrafterProgramPlan::Draft(draft_plan)), Some(head_state)) => {
                 stage_timer::time_stage(|t, ns| t.other_drafter_ns += ns, || -> Result<_, GraphError> {
                     let draft = definition
                         .draft
@@ -1286,7 +1282,7 @@ impl AssessmentGraphResourceBounds {
                     })
                 })
             }
-            (Some(head), None, Some(head_state)) => {
+            (Some(super::DrafterProgramPlan::Head(head)), Some(head_state)) => {
                 stage_timer::time_stage(|t, ns| t.native_head_ns += ns, || -> Result<_, GraphError> {
                     let binding = *head.blocks().first().ok_or("head program has no block")?;
                     let head = definition
@@ -1321,7 +1317,7 @@ impl AssessmentGraphResourceBounds {
                     })
                 })
             }
-            (None, None, None) => Ok(DrafterBounds::default()),
+            (None, None) => Ok(DrafterBounds::default()),
             _ => Err("drafter program and state disagree".into()),
         }
     }
@@ -1343,8 +1339,7 @@ impl AssessmentGraphResourceBounds {
         readout: (NativeGraphCharge, crate::programs::graph::sizing::ReadoutSizingCensus),
     ) -> Result<Self, GraphError> {
         let (readout, readout_census) = readout;
-        let has_drafter =
-            plan.head().is_some() || plan.draft().is_some() || plan.shared_head().is_some();
+        let has_drafter = plan.drafter().is_some();
         let (drafter, state_bounds) = if has_drafter {
             crate::assessment::pool::join(
                 || {

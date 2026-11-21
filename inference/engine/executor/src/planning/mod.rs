@@ -50,7 +50,7 @@ pub use execution_plan::{
 };
 pub use programs::{
     BankedFeedForward, ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,
-    DraftBlockBinding, DraftProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
+    DraftBlockBinding, DraftProgramPlan, DrafterProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
     ImportProgramSlot, MarkovBinding, MixerProgramSlot, ProgramPlan, SelectorBinding,
     SharedHeadProgramPlan, StateProgramPlan, TapProgramPlan, TargetBlockProgramSlot,
     TargetProgramPlan, VisionProgramPlan,

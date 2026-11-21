@@ -153,7 +153,7 @@ pub use planning::{
     CONVERSATION_CHECKPOINTS, CPU_IMAGE_CELLS, CapabilityPlan, ComponentPlan, ComponentSelection,
     ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,
     DenseBinding, DenseBranchBinding, DenseScales, DeviceProcessBytes, DraftBlockBinding,
-    DraftProgramPlan, DraftWidths,
+    DraftProgramPlan, DrafterProgramPlan, DraftWidths,
     BankForm, ChargedDraft, EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding, FloorForms, HeldForm, HeldBound, HeldCharge, Placed, Unplaced, WeightBound,
     FeedForwardProgramSlot, FlightDepth, GraphSlots, HeadBinding, HeadProgramPlan, HostProcessBytes,
     CandidatePool, CandidatesBinding, HostTablePlan, ImportProgramSlot, IndexerBinding,
