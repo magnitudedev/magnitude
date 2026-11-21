@@ -69,6 +69,19 @@ export const tomlTopLevelValue = (source: string, key: string): unknown => {
 
 const tomlScalar = (value: string): string => JSON.stringify(value)
 
+/** A line starts a statement only when the text before it is complete TOML, not inside a multi-line value. */
+const startsTomlStatement = (lines: ReadonlyArray<string>, index: number): boolean => {
+  try {
+    parseToml(lines.slice(0, index).join("\n"))
+    return true
+  } catch {
+    return false
+  }
+}
+
+const firstTomlTable = (lines: ReadonlyArray<string>): number =>
+  lines.findIndex((line, index) => /^\s*\[/.test(line) && startsTomlStatement(lines, index))
+
 /** Update string-valued top-level TOML keys while preserving unrelated text and tables. */
 export const updateTomlTopLevel = (
   source: string,
@@ -78,9 +91,10 @@ export const updateTomlTopLevel = (
   const additions: string[] = []
   for (const [key, value] of changes) {
     const matcher = new RegExp(`^\\s*${key}\\s*=`)
-    const firstTable = lines.findIndex((line) => /^\s*\[/.test(line))
+    const firstTable = firstTomlTable(lines)
     const boundary = firstTable === -1 ? lines.length : firstTable
-    const index = lines.slice(0, boundary).findIndex((line) => matcher.test(line))
+    const index = lines.slice(0, boundary)
+      .findIndex((line, position) => matcher.test(line) && startsTomlStatement(lines, position))
     if (index >= 0) {
       if (value === undefined) lines.splice(index, 1)
       else lines[index] = `${key} = ${tomlScalar(value)}`
@@ -89,7 +103,7 @@ export const updateTomlTopLevel = (
     }
   }
   if (additions.length > 0) {
-    const insertion = lines.findIndex((line) => /^\s*\[/.test(line))
+    const insertion = firstTomlTable(lines)
     lines.splice(insertion === -1 ? Math.max(0, lines.length - 1) : insertion, 0, ...additions)
   }
   return lines.join("\n")
