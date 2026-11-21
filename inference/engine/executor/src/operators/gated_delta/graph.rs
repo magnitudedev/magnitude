@@ -28,7 +28,7 @@ use crate::{
     native::{RecurrentFormKernels, RecurrentKernels, RecurrentStepKernels},
 };
 use magnitude_family_contracts::{
-    GatedDelta, RecurrentHeadMapping, WeightKind, WeightRole, WeightScope,
+    RecurrentHeadMapping, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::{
     attention_output, attention_project, gated_delta_chunk, gated_delta_project,
@@ -391,7 +391,7 @@ impl<D> Numbers<D> for RecurrentBlock<D> {
 /// `hidden`-wide residual at a class of `rows` rows and `slots` slots, its
 /// bank `state`'s components from `component_index` on.
 pub(crate) fn split(
-    delta: &GatedDelta,
+    delta: super::AdmittedGatedDelta<'_>,
     hidden: u64,
     rows: u64,
     slots: u64,
@@ -400,13 +400,14 @@ pub(crate) fn split(
     component_index: usize,
     controls: ControlSource,
 ) -> Result<(RecurrentTopology<f64>, RecurrentBlock<u64>), GraphError> {
+    let operator = delta.operator();
     let (elements, bank) = split_bank(state, component_index)?;
     Ok((
         RecurrentTopology {
-            grouped: matches!(delta.head_mapping, RecurrentHeadMapping::Grouped),
+            grouped: matches!(operator.head_mapping, RecurrentHeadMapping::Grouped),
             epsilon: f64::from(epsilon),
-            key_norm_epsilon: delta.key_norm_epsilon,
-            decay_lower: super::decay_lower(delta).map(f64::from),
+            key_norm_epsilon: operator.key_norm_epsilon,
+            decay_lower: delta.decay_lower().map(f64::from),
             bank: elements,
             controls,
         },
@@ -414,12 +415,12 @@ pub(crate) fn split(
             rows,
             hidden,
             slots,
-            key_heads: delta.key_heads,
-            value_heads: delta.value_heads,
-            width: delta.width,
-            convolution_width: delta.convolution_width,
-            gate_function: crate::operators::code(super::gate_function(delta)),
-            ranks: super::ranks(delta),
+            key_heads: operator.key_heads,
+            value_heads: operator.value_heads,
+            width: operator.width,
+            convolution_width: operator.convolution_width,
+            gate_function: crate::operators::code(delta.gate_function().code()),
+            ranks: delta.ranks(),
             bank,
         },
     ))

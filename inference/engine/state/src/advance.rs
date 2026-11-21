@@ -28,18 +28,18 @@ pub struct OwnedAdvanceBindings<'a> {
     pub destinations: &'a [Vec<usize>],
 }
 
+/// One domain's reserved rows, as row indices in logical order.
+fn domain_destinations(claims: &Claims) -> Vec<usize> {
+    claims
+        .ranges()
+        .into_iter()
+        .flat_map(|(start, count)| start..start + count)
+        .collect()
+}
+
 /// Each domain's reserved rows, as row indices in logical order.
 fn destinations(claims: &[Claims]) -> Vec<Vec<usize>> {
-    claims
-        .iter()
-        .map(|claims| {
-            claims
-                .ranges()
-                .into_iter()
-                .flat_map(|(start, count)| start..start + count)
-                .collect()
-        })
-        .collect()
+    claims.iter().map(domain_destinations).collect()
 }
 
 /// Tentative successor state. Moving this value into a launch and submission
@@ -133,7 +133,7 @@ impl OwnedCodecAdvance {
                 let claims = match destination
                     .snapshot
                     .store
-                    .reserve_rows(&vec![Tail::NEW; counts.len()], &counts)
+                    .reserve_rows(&vec![Tail::New; counts.len()], &counts)
                 {
                     Ok(claims) => claims,
                     Err(error) => return Err((source, destination, error)),
@@ -755,15 +755,11 @@ impl OwnedStateAdvance {
         if self.acceptable != self.committed {
             return Err(Error::from("a successor follows an advance whose commit is decided by its reconciliation"));
         }
-        let starts = self.state.history_starts();
         Ok(Predecessor::of(
             &self.state.snapshot.store,
             self.state.snapshot.position,
             self.committed,
-            &self.claims,
             self.state.snapshot.history_start,
-            &starts,
-            self.state.domain_ranges(),
             self.following.index(),
             &self.history,
             &self.recurrent,
@@ -771,36 +767,26 @@ impl OwnedStateAdvance {
                 .snapshot
                 .domains
                 .iter()
-                .map(|domain| domain.claims.id)
-                .collect(),
+                .zip(&self.claims)
+                .map(|(domain, claims)| {
+                    (domain.start, domain.claims.ranges(), claims, domain.claims.id)
+                }),
         ))
     }
 }
 
-/// Each domain's history once a predecessor ending at `end` commits: its
-/// accepted `ranges` (from `starts`) followed by the predecessor's committed
-/// rows `committed` (in the domain's slabs), less the rows the domain no
-/// longer references at `end` (exactly what committing trims).
-fn following_history(
-    store: &StateStore,
-    floor: usize,
-    starts: &[usize],
-    ranges: Vec<Vec<(usize, usize)>>,
-    committed: Vec<Vec<(usize, usize)>>,
-    end: usize,
-) -> (Vec<usize>, Vec<Vec<(usize, usize)>>) {
-    store
-        .domains
-        .iter()
-        .zip(starts)
-        .zip(ranges)
-        .zip(committed)
-        .map(|(((domain, &start), mut ranges), committed)| {
-            append_ranges(&mut ranges, committed, domain.slab_rows);
-            let retained = domain.history_start(end, floor).max(start);
-            (retained, ranges_from(&ranges, start, retained))
-        })
-        .unzip()
+/// Per-domain state a successor inherits from its predecessor once the
+/// predecessor's committed rows commit.
+struct DomainPredecessor {
+    /// First logical position of the history once the predecessor commits.
+    start: usize,
+    /// Rows of the history once the predecessor commits.
+    ranges: Vec<(usize, usize)>,
+    /// A reference of the successor's own on the predecessor's rows past
+    /// its committed rows, in logical order.
+    front: Claims,
+    /// The live history (its arena entry) the rows extend.
+    live: u64,
 }
 
 /// What a successor needs of the tentative rows it follows: the state they
@@ -816,65 +802,83 @@ struct Predecessor<'a> {
     /// commit: its successor bank, at tape 0 (every row after the committed
     /// ones is a front row, recorded on the tape but never accepted).
     bank: usize,
-    /// The trim floor, and per domain the first position and the rows of
-    /// the history once the predecessor commits.
+    /// The trim floor.
     floor: usize,
-    starts: Vec<usize>,
-    ranges: Vec<Vec<(usize, usize)>>,
-    /// Per domain, a reference of the successor's own on the predecessor's
-    /// rows past its committed rows, in logical order.
-    front: Vec<Claims>,
+    /// Per stored domain, the history once the predecessor commits, its
+    /// inherited front rows, and the live history entry its rows extend.
+    domains: Vec<DomainPredecessor>,
     history: &'a [PlaneBuffer],
     recurrent: &'a Rc<[Tensor]>,
-    /// Per domain, the live history (its arena entry) the rows extend.
-    live: Vec<u64>,
 }
 
 impl<'a> Predecessor<'a> {
-    /// The predecessor an advance from `position` holding `claims` makes of
-    /// its first `committed` rows, read from accepted `ranges` (from
-    /// `starts`, above `floor`) and publishing `bank`.
+    /// The predecessor an advance from `position` makes of its first
+    /// `committed` rows, read from each domain's accepted `(start, ranges,
+    /// claims, live)` above trim `floor` and publishing `bank`. Each
+    /// domain's history is its accepted `ranges` (from `start`) followed by
+    /// the predecessor's committed rows, less the rows the domain no longer
+    /// references at `position + committed` (exactly what committing trims).
     #[allow(clippy::too_many_arguments)]
-    fn of(
+    fn of<'d>(
         store: &'a Rc<StateStore>,
         position: usize,
         committed: usize,
-        claims: &[Claims],
         floor: usize,
-        starts: &[usize],
-        ranges: Vec<Vec<(usize, usize)>>,
         bank: usize,
         history: &'a [PlaneBuffer],
         recurrent: &'a Rc<[Tensor]>,
-        live: Vec<u64>,
+        domains: impl IntoIterator<Item = (usize, Vec<(usize, usize)>, &'d Claims, u64)>,
     ) -> Self {
         let end = position + committed;
-        let (kept, front): (Vec<_>, Vec<_>) = claims
+        let domains = store
+            .domains
             .iter()
-            .zip(&store.domains)
-            .map(|(claims, domain)| {
+            .zip(domains)
+            .map(|(store_domain, (start, mut ranges, claims, live))| {
                 // A reference of its own on every row, the committed rows'
                 // dropped again with `kept`.
                 let mut kept = claims.clone();
-                let front = kept.split_off(domain.kind.advance_rows(position, committed));
-                (kept.ranges(), front)
+                let front = kept.split_off(store_domain.kind.advance_rows(position, committed));
+                append_ranges(&mut ranges, kept.ranges(), store_domain.slab_rows);
+                let retained = store_domain.history_start(end, floor).max(start);
+                let ranges = ranges_from(&ranges, start, retained);
+                DomainPredecessor {
+                    start: retained,
+                    ranges,
+                    front,
+                    live,
+                }
             })
-            .unzip();
-        let (starts, ranges) = following_history(store, floor, starts, ranges, kept, end);
-        Self { store, end, bank, floor, starts, ranges, front, history, recurrent, live }
+            .collect();
+        Self {
+            store,
+            end,
+            bank,
+            floor,
+            domains,
+            history,
+            recurrent,
+        }
     }
 
     /// Per domain, where its successor's own rows grow, as the committed
     /// state would once its front rows' rows are taken over: after them,
     /// else after the history's last row, extending the live history.
     fn tails(&self) -> Vec<Tail> {
-        self.ranges
+        self.domains
             .iter()
-            .zip(&self.front)
-            .zip(&self.live)
-            .map(|((ranges, front), &history)| Tail {
-                end: front.end().or(ranges.last().map(|(start, count)| start + count)),
-                history: Some(history),
+            .map(|domain| {
+                match domain
+                    .front
+                    .end()
+                    .or_else(|| domain.ranges.last().map(|(start, count)| start + count))
+                {
+                    Some(end) => Tail::Extending {
+                        end,
+                        history: domain.live,
+                    },
+                    None => Tail::New,
+                }
             })
             .collect()
     }
@@ -884,10 +888,10 @@ impl<'a> Predecessor<'a> {
     /// drop (the running predecessor keeps its own), so a successor
     /// shallower than its predecessor's front costs nothing more.
     fn fit(&mut self, count: usize) {
-        for (domain, front) in self.store.domains.iter().zip(&mut self.front) {
-            let reached = domain.kind.advance_rows(self.end, count);
-            if front.rows() > reached {
-                drop(front.split_off(reached));
+        for (store_domain, domain) in self.store.domains.iter().zip(&mut self.domains) {
+            let reached = store_domain.kind.advance_rows(self.end, count);
+            if domain.front.rows() > reached {
+                drop(domain.front.split_off(reached));
             }
         }
     }
@@ -898,12 +902,12 @@ impl<'a> Predecessor<'a> {
         self.store
             .domains
             .iter()
-            .zip(&self.front)
-            .map(|(domain, front)| {
-                domain
+            .zip(&self.domains)
+            .map(|(store_domain, domain)| {
+                store_domain
                     .kind
                     .advance_rows(self.end, count)
-                    .checked_sub(front.rows())
+                    .checked_sub(domain.front.rows())
                     .expect("invariant violated: a fitted successor takes over more front rows than it reaches")
             })
             .collect()
@@ -995,6 +999,19 @@ impl Drop for Admission {
     }
 }
 
+/// Per-domain history and tentative row claims of a queued successor advance.
+struct DomainSuccessor {
+    /// First logical position of the history once the predecessor commits.
+    start: usize,
+    /// Rows of the history once the predecessor commits.
+    ranges: Vec<(usize, usize)>,
+    /// This successor's tentative rows (inherited front rows plus newly
+    /// reserved rows), in logical order.
+    claims: Claims,
+    /// The live history (its arena entry) its rows extend.
+    live: u64,
+}
+
 /// Tentative rows that follow an in-flight advance (or successor) before it
 /// is reconciled, so the next step can be submitted while the previous one
 /// executes. It reads the version the predecessor publishes once its
@@ -1012,17 +1029,15 @@ pub struct OwnedSuccessorAdvance {
     position: usize,
     previous_bank: usize,
     floor: usize,
-    starts: Vec<usize>,
-    ranges: Vec<Vec<(usize, usize)>>,
+    domains: Vec<DomainSuccessor>,
     count: usize,
     committed: usize,
-    claims: Vec<Claims>,
     following: BankHandle,
     history: Vec<PlaneBuffer>,
     recurrent: Rc<[Tensor]>,
+    /// Per domain, the advance's reserved row indices in logical order,
+    /// stored contiguously to back [`OwnedAdvanceBindings::destinations`].
     destinations: Vec<Vec<usize>>,
-    /// Per domain, the live history (its arena entry) its rows extend.
-    live: Vec<u64>,
     /// Dropped last, after the rows it may return to reserve.
     admission: Rc<Admission>,
 }
@@ -1041,26 +1056,45 @@ impl OwnedSuccessorAdvance {
             Some(bank) => bank,
             None => store.successor_bank()?,
         };
-        let Predecessor { end, bank, floor, starts, ranges, front: mut claims, history, recurrent, live, .. } = predecessor;
-        for (claims, reserved) in claims.iter_mut().zip(reserved) {
-            claims.append(reserved);
-        }
-        let destinations = destinations(&claims);
+        let Predecessor {
+            end,
+            bank,
+            floor,
+            domains,
+            history,
+            recurrent,
+            ..
+        } = predecessor;
+        let domains: Vec<DomainSuccessor> = domains
+            .into_iter()
+            .zip(reserved)
+            .map(|(domain, reserved)| {
+                let mut claims = domain.front;
+                claims.append(reserved);
+                DomainSuccessor {
+                    start: domain.start,
+                    ranges: domain.ranges,
+                    claims,
+                    live: domain.live,
+                }
+            })
+            .collect();
+        let destinations = domains
+            .iter()
+            .map(|domain| domain_destinations(&domain.claims))
+            .collect();
         Ok(Self {
             store: store.clone(),
             position: end,
             previous_bank: bank,
             floor,
-            starts,
-            ranges,
+            domains,
             count,
             committed,
-            claims,
             following,
             history: history.to_vec(),
             recurrent: recurrent.clone(),
             destinations,
-            live,
             admission: admission.clone(),
         })
     }
@@ -1076,14 +1110,13 @@ impl OwnedSuccessorAdvance {
             &self.store,
             self.position,
             self.committed,
-            &self.claims,
             self.floor,
-            &self.starts,
-            self.ranges.clone(),
             self.following.index(),
             &self.history,
             &self.recurrent,
-            self.live.clone(),
+            self.domains
+                .iter()
+                .map(|domain| (domain.start, domain.ranges.clone(), &domain.claims, domain.live)),
         )
     }
 
@@ -1102,19 +1135,24 @@ impl OwnedSuccessorAdvance {
     /// The rows the successor reads in a domain once its predecessor
     /// commits, from position [`OwnedSuccessorAdvance::history_start`].
     pub fn history_ranges(&self, domain: HistoryDomainId) -> Vec<(usize, usize)> {
-        self.ranges[domain.0].clone()
+        self.domains[domain.0].ranges.clone()
     }
     pub fn domain_ranges(&self) -> Vec<Vec<(usize, usize)>> {
-        self.ranges.clone()
+        self.domains.iter().map(|domain| domain.ranges.clone()).collect()
     }
     pub fn history_start(&self, domain: HistoryDomainId) -> usize {
-        self.starts[domain.0]
+        self.domains[domain.0].start
     }
     pub fn visible_ranges(&self, domain: HistoryDomainId, from: usize) -> Vec<(usize, usize)> {
-        ranges_from(&self.ranges[domain.0], self.starts[domain.0], from)
+        let domain = &self.domains[domain.0];
+        ranges_from(&domain.ranges, domain.start, from)
     }
     pub fn span_count(&self) -> usize {
-        self.ranges.iter().map(Vec::len).max().unwrap_or(0)
+        self.domains
+            .iter()
+            .map(|domain| domain.ranges.len())
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn bindings(&self) -> OwnedAdvanceBindings<'_> {
@@ -1137,8 +1175,15 @@ impl OwnedSuccessorAdvance {
             || state.position() != self.position
             || state.bank_index() != self.previous_bank
             || state.tape_rows() != 0
-            || state.history_starts() != self.starts
-            || state.domain_ranges() != self.ranges
+            || state.snapshot.domains.len() != self.domains.len()
+            || state
+                .snapshot
+                .domains
+                .iter()
+                .zip(&self.domains)
+                .any(|(actual, expected)| {
+                    actual.start != expected.start || actual.claims.ranges() != expected.ranges
+                })
         {
             return Err((
                 state,
@@ -1150,13 +1195,14 @@ impl OwnedSuccessorAdvance {
         let Self {
             count,
             committed,
-            claims,
+            domains,
             following,
             history,
             recurrent,
             destinations,
             ..
         } = self;
+        let claims = domains.into_iter().map(|domain| domain.claims).collect();
         Ok(OwnedStateAdvance {
             state,
             count,
@@ -1303,13 +1349,19 @@ impl OwnedChainAdvance {
             let OwnedSuccessorAdvance {
                 position,
                 count,
-                claims: mut chunk_claims,
+                domains,
                 following: written,
                 ..
             } = chunk.advance;
-            keep_accepted(&store, &mut chunk_claims, position, count);
-            for (history, chunk_claims) in claims.iter_mut().zip(chunk_claims) {
-                history.append(chunk_claims);
+            for ((history, store_domain), mut domain) in
+                claims.iter_mut().zip(&store.domains).zip(domains)
+            {
+                drop(
+                    domain
+                        .claims
+                        .split_off(store_domain.kind.advance_rows(position, count)),
+                );
+                history.append(domain.claims);
             }
             rows += count;
             following = written;

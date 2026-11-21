@@ -489,8 +489,9 @@ impl Certified for seismic::NativeGraphLayout {
         }
         let mut drafts = Vec::with_capacity(classes.len());
         let mut auxes = Vec::with_capacity(classes.len());
+        let device = super::sizing::current_sizing_device();
         for &class in classes {
-            let (draft, aux) = build(NativeGraphMetadata::new(backend), class)?;
+            let (draft, aux) = build(NativeGraphMetadata::new_for_device(backend, device), class)?;
             drafts.push(draft);
             auxes.push(aux);
         }

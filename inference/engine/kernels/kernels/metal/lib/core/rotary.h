@@ -30,7 +30,11 @@ inline float sincos(float angle, thread float &cosine) {
 template <uint W, uint P, uint FIRST, bool ADJACENT>
 struct layout {
     // An enumerator: Metal admits no static data member at program scope.
-    enum : uint { E = W / 32 };
+    enum : uint {
+        E = W / 32,
+        IN_LANE = (ADJACENT && E > 1 && (E % 2 == 0)) ? 1u : 0u,
+        PAIRS = IN_LANE ? (E / 2) : E,
+    };
     static_assert(W % 32 == 0, "a head row must cover whole lanes");
     static_assert(P % E == 0, "each rotary half must cover whole lanes");
     static_assert(!ADJACENT || E % 2 == 0 || E == 1, "an adjacent pair must lie within one lane or span two");
@@ -64,20 +68,26 @@ struct layout {
     // One row's table for lane `lane`'s rotated columns: pair p turns by
     // coordinate axis components[p] at frequencies[p], its cosine and sine
     // scaled by amplitudes[p]. The same table rotates every head of the row.
+    // When adjacent pairs lie within one lane, both columns of a pair share
+    // one entry (`PAIRS = E / 2`).
     struct table {
-        float cosine[E];
-        float sine[E];
+        float cosine[PAIRS];
+        float sine[PAIRS];
         table(device const int *coordinates, device const int *components, device const float *frequencies,
             device const float *amplitudes, uint lane) {
-            if (P == 0 || !rotated(lane * E))
+            if constexpr (P == 0) {
                 return;
-            _Pragma("clang loop unroll(full)")
-            for (uint i = 0; i < E; ++i) {
-                const uint p = pair(lane * E + i);
-                float c;
-                const float s = sincos(float(coordinates[components[p]]) * frequencies[p], c);
-                cosine[i] = c * amplitudes[p];
-                sine[i] = s * amplitudes[p];
+            } else {
+                if (!rotated(lane * E))
+                    return;
+                _Pragma("clang loop unroll(full)")
+                for (uint k = 0; k < PAIRS; ++k) {
+                    const uint p = pair(lane * E + (IN_LANE ? 2 * k : k));
+                    float c;
+                    const float s = sincos(float(coordinates[components[p]]) * frequencies[p], c);
+                    cosine[k] = c * amplitudes[p];
+                    sine[k] = s * amplitudes[p];
+                }
             }
         }
     };
@@ -87,26 +97,36 @@ struct layout {
     // P / E lanes away, an adjacent pair's in the same lane (or, at one
     // column a lane, the neighbouring one). The whole simdgroup calls it.
     static void rotate(thread const table &t, uint lane, thread float (&x)[E]) {
-        if (P == 0)
+        if constexpr (P == 0) {
             return;
-        const bool turned = rotated(lane * E);
-        float other[E];
-        if (ADJACENT && E > 1) {
-            _Pragma("clang loop unroll(full)")
-            for (uint i = 0; i < E; ++i)
-                other[i] = x[i ^ 1u];
         } else {
-            const uint partner_lane = turned ? partner(lane * E) / E : lane;
-            _Pragma("clang loop unroll(full)")
-            for (uint i = 0; i < E; ++i)
-                other[i] = simd_shuffle(x[i], ushort(partner_lane));
-        }
-        if (!turned)
-            return;
-        _Pragma("clang loop unroll(full)")
-        for (uint i = 0; i < E; ++i) {
-            x[i] = leads(lane * E + i) ? x[i] * t.cosine[i] - other[i] * t.sine[i]
-                                       : x[i] * t.cosine[i] + other[i] * t.sine[i];
+            const bool turned = rotated(lane * E);
+            if constexpr (IN_LANE != 0) {
+                if (!turned)
+                    return;
+                _Pragma("clang loop unroll(full)")
+                for (uint k = 0; k < PAIRS; ++k) {
+                    const float x0 = x[2 * k];
+                    const float x1 = x[2 * k + 1];
+                    const float c = t.cosine[k];
+                    const float s = t.sine[k];
+                    x[2 * k] = x0 * c - x1 * s;
+                    x[2 * k + 1] = x1 * c + x0 * s;
+                }
+            } else {
+                float other[E];
+                const uint partner_lane = turned ? partner(lane * E) / E : lane;
+                _Pragma("clang loop unroll(full)")
+                for (uint i = 0; i < E; ++i)
+                    other[i] = simd_shuffle(x[i], ushort(partner_lane));
+                if (!turned)
+                    return;
+                _Pragma("clang loop unroll(full)")
+                for (uint i = 0; i < E; ++i) {
+                    x[i] = leads(lane * E + i) ? x[i] * t.cosine[i] - other[i] * t.sine[i]
+                                               : x[i] * t.cosine[i] + other[i] * t.sine[i];
+                }
+            }
         }
     }
 };

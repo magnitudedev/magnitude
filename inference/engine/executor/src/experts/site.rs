@@ -582,17 +582,17 @@ fn rounding(terms: usize) -> f32 {
 }
 
 /// Each of `values`' departure bound under the site's q8 quantization
-/// (`quant::quantize`): half the step of its block of `quant::Q8_BLOCK`
-/// values, the block's largest magnitude over 127. `magnitudes` bound the
+/// (`quant::quantize`): half the step of its sub-block of `quant::Q8_GROUP`
+/// values, the sub-block's largest magnitude over 127. `magnitudes` bound the
 /// quantized values' magnitudes (the values themselves, or what may depart
 /// from them before quantization).
 #[cfg(test)]
 fn q8_departures(magnitudes: &[f32]) -> Vec<f32> {
     magnitudes
-        .chunks(quant::Q8_BLOCK)
-        .flat_map(|block| {
-            let step = block.iter().fold(0.0f32, |most, value| most.max(value.abs())) / 127.0;
-            std::iter::repeat_n(step * HALF_STEP, block.len())
+        .chunks(quant::Q8_GROUP)
+        .flat_map(|group| {
+            let step = group.iter().fold(0.0f32, |most, value| most.max(value.abs())) / 127.0;
+            std::iter::repeat_n(step * HALF_STEP, group.len())
         })
         .collect()
 }

@@ -29,7 +29,7 @@ fn assert_contract_parity<E: EntryContract>(
             .expect("bundle decodes cleanly");
 
         let Some(implementation) = impl_opt else {
-            let err = E::contract_default_params(backend, elements, dims).unwrap_err();
+            let err = E::contract_default_params(backend, None, elements, dims).unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -37,7 +37,7 @@ fn assert_contract_parity<E: EntryContract>(
                 ),
                 "{label} ({backend:?}): expected NoImplementation/UnsupportedElements, got {err:?}"
             );
-            let err = E::contract_admit(backend, elements, dims, &[]).unwrap_err();
+            let err = E::contract_admit(backend, None, elements, dims, &[]).unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -49,7 +49,7 @@ fn assert_contract_parity<E: EntryContract>(
         };
 
         let Ok(checked) = checked_bind else {
-            let err = E::contract_default_params(backend, elements, dims).unwrap_err();
+            let err = E::contract_default_params(backend, None, elements, dims).unwrap_err();
             assert_eq!(
                 err,
                 ContractError::UnsupportedElements,
@@ -74,7 +74,7 @@ fn assert_contract_parity<E: EntryContract>(
 
         // 1. Compare contract_default_params against default_specialization_without_device.
         let expected_default = implementation.default_specialization_without_device(&statics);
-        let actual_default = E::contract_default_params(backend, elements, dims);
+        let actual_default = E::contract_default_params(backend, None, elements, dims);
 
         let (spec, device_dependent) = match expected_default {
             None => {
@@ -93,10 +93,12 @@ fn assert_contract_parity<E: EntryContract>(
                     continue;
                 }
                 let mut first = None;
-                let walked = implementation.walk_admissible(&statics, |configuration| {
-                    first = Some(configuration.clone());
-                    false
-                });
+                let walked = implementation
+                    .at_device(&seismic::device::BackendFloor(backend))
+                    .walk_admissible(&statics, |configuration| {
+                        first = Some(configuration.clone());
+                        false
+                    });
                 match (walked, first) {
                     (Ok(()), Some(spec)) => (spec, true),
                     _ => continue,
@@ -168,12 +170,14 @@ fn assert_contract_parity<E: EntryContract>(
 
         // 2. Compare contract_admit against implementation.validate(&spec).
         assert_eq!(
-            implementation.validate(&spec),
+            implementation
+                .at_device(&seismic::device::BackendFloor(backend))
+                .validate(&spec),
             Ok(()),
             "{label} ({backend:?}): runtime validate should accept default spec"
         );
         assert_eq!(
-            E::contract_admit(backend, elements, dims, &params),
+            E::contract_admit(backend, None, elements, dims, &params),
             Ok(()),
             "{label} ({backend:?}): contract_admit should accept default params"
         );
@@ -183,7 +187,7 @@ fn assert_contract_parity<E: EntryContract>(
         with_unknown.push(("__NO_SUCH_PARAM__", 1));
         assert!(
             matches!(
-                E::contract_admit(backend, elements, dims, &with_unknown),
+                E::contract_admit(backend, None, elements, dims, &with_unknown),
                 Err(ContractError::InvalidParameter(_))
             ),
             "{label} ({backend:?}): unknown param must fail"
@@ -194,7 +198,7 @@ fn assert_contract_parity<E: EntryContract>(
             out_of_domain[0].1 = u64::MAX;
             assert!(
                 matches!(
-                    E::contract_admit(backend, elements, dims, &out_of_domain),
+                    E::contract_admit(backend, None, elements, dims, &out_of_domain),
                     Err(ContractError::ParameterOutsideDomain { .. })
                 ),
                 "{label} ({backend:?}): out-of-domain param must fail"
@@ -208,14 +212,14 @@ fn assert_contract_parity<E: EntryContract>(
                 .filter(|(name, _)| *name != first_static.as_str())
                 .collect();
             assert_eq!(
-                E::contract_admit(backend, elements, &missing_dims, &params),
+                E::contract_admit(backend, None, elements, &missing_dims, &params),
                 Err(ContractError::MissingDimension(first_static.as_str())),
                 "{label} ({backend:?}): missing static must fail"
             );
         }
 
         // 3. Compare contract_sizing against CheckedModule / NativeGraphCheckedEntry.
-        let sizing = E::contract_sizing(backend, elements, dims, &params).unwrap_or_else(|err| {
+        let sizing = E::contract_sizing(backend, None, elements, dims, &params).unwrap_or_else(|err| {
             panic!("{label} ({backend:?}): contract_sizing failed: {err:?}")
         });
 
@@ -503,11 +507,11 @@ fn packed_and_non_float_element_admission_parity() {
     ) {
         assert_contract_parity::<E>(label, elements, dims);
         for &backend in backends {
-            let params = E::contract_default_params(backend, elements, dims).unwrap_or_else(|err| {
+            let params = E::contract_default_params(backend, None, elements, dims).unwrap_or_else(|err| {
                 panic!("{label} ({backend:?}): contract_default_params failed: {err:?}")
             });
             assert_eq!(
-                E::contract_admit(backend, elements, dims, &params),
+                E::contract_admit(backend, None, elements, dims, &params),
                 Ok(()),
                 "{label} ({backend:?}): contract_admit should succeed"
             );

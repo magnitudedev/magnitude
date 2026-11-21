@@ -100,7 +100,7 @@ impl Ledger {
     pub fn read_after(&self, at: Sampled, reading: Reading, after_idle: bool) -> Estimate {
         let footprints = self.footprints();
         let mut state = self.state();
-        if !state.read.is_some_and(|latest| !latest.at.precedes(&at)) {
+        if !state.folded.is_some_and(|latest| !latest.read.at.precedes(&at)) {
             state.read(&self.store.identity, at, reading, self.store.pressure.take(), after_idle, &footprints);
         }
         state.judged(&self.store.identity)
@@ -235,11 +235,15 @@ impl Ledger {
     /// requests the owner can evict now.
     pub fn shortage(&self, evictable: &std::collections::BTreeSet<crate::operation::RequestId>) -> Option<Shortage> {
         let mut state = self.state();
-        let estimate = state.estimate()?;
-        if state.answered == Some(estimate.at()) {
-            return None;
-        }
-        state.answered = Some(estimate.at());
+        let read = {
+            let folded = state.folded.as_mut()?;
+            if folded.answered == Some(folded.read.at) {
+                return None;
+            }
+            folded.answered = Some(folded.read.at);
+            folded.read
+        };
+        let estimate = state.estimate_at(read);
         let cause = shortage::cause(&estimate, state.boundary.harmed(), state.boundary.pressed())?;
         let need = shortage::lacks(&estimate, cause);
         let relief = state

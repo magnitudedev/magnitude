@@ -87,6 +87,7 @@ typedef projection::operands<NVFP4> Operands;
 #define PROJECTION_BOUND_TABLES {gate_bound, up_bound}
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_NORMALIZE
+template <uint MATRIX>
 kernel void dense_expand_normalize(PROJECTION_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -108,19 +109,19 @@ kernel void dense_expand_normalize_tall(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void dense_expand_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_PAIRED_GEMV(ONE, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV_PAIR
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void dense_expand_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_PAIRED_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV_ROWS
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void dense_expand_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_PAIRED_GEMV(SEVERAL, TILED);
 }

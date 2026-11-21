@@ -73,16 +73,9 @@ pub(super) struct Suspended<B: seismic_native_target::TargetFamily> {
     source: SourceConstruction<B>,
     selected: Vec<(CallPath, BodySelection)>,
 }
-pub(super) enum Progress<B: seismic_native_target::TargetFamily> {
-    Suspended(Suspended<B>),
-    Complete(ConstructionCoordinate),
-}
-impl<B: seismic_native_target::TargetFamily> std::fmt::Debug for Progress<B> {
+impl<B: seismic_native_target::TargetFamily> std::fmt::Debug for Suspended<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Suspended(_) => f.write_str("Suspended source construction"),
-            Self::Complete(identity) => f.debug_tuple("Complete").field(identity).finish(),
-        }
+        f.write_str("Suspended source construction")
     }
 }
 
@@ -165,41 +158,24 @@ impl<B: seismic_native_target::TargetFamily> CandidateDomain<'_, B> {
         if !self.root_selections().contains(&coordinate.root) {
             return Materialization::Excluded(ConstructionExclusion::UnsupportedMapping);
         }
-        let mut progress = self.materializations.remove(coordinate);
+        if let Some(canonical) = self.completed.get(coordinate) {
+            if self.family(canonical).is_ok() {
+                return Materialization::Ready(canonical.clone());
+            }
+            self.completed.remove(coordinate);
+        }
+        let mut progress = self.suspended.remove(coordinate);
         // A selected successor consumes the very same parent continuation. A
         // later sibling reconstructs its prefix under its own charged allowance.
         if progress.is_none() && !coordinate.calls.is_empty() {
             let mut prefix = coordinate.clone();
             prefix.calls.pop();
-            progress = self
-                .materializations
-                .remove(&prefix)
-                .and_then(|progress| match progress {
-                    Progress::Suspended(progress) => Some(Progress::Suspended(progress)),
-                    complete => {
-                        self.materializations.insert(prefix, complete);
-                        None
-                    }
-                });
+            progress = self.suspended.remove(&prefix);
         }
-        if let Some(Progress::Complete(canonical)) = progress {
-            if self.family(&canonical).is_ok() {
-                self.materializations
-                    .insert(coordinate.clone(), Progress::Complete(canonical.clone()));
-                return Materialization::Ready(canonical);
-            }
-            progress = None;
-        }
-        let mut progress = match progress {
-            Some(Progress::Suspended(progress)) => Some(progress),
-            None => None,
-            Some(Progress::Complete(_)) => unreachable!(),
-        };
         loop {
             if *work_units >= allowance.work_units || started.elapsed() >= allowance.wall_time {
                 if let Some(progress) = progress {
-                    self.materializations
-                        .insert(coordinate.clone(), Progress::Suspended(progress));
+                    self.suspended.insert(coordinate.clone(), progress);
                 }
                 return Materialization::Pending(ConstructionPending::WorkAllowance);
             }
@@ -265,23 +241,20 @@ impl<B: seismic_native_target::TargetFamily> CandidateDomain<'_, B> {
                             selected: choices,
                         });
                     } else {
-                        self.materializations.insert(
+                        self.suspended.insert(
                             coordinate.clone(),
-                            Progress::Suspended(Suspended {
+                            Suspended {
                                 source: next,
                                 selected: current_choices,
-                            }),
+                            },
                         );
                         return Materialization::Choice(choice);
                     }
                 }
                 ConstructionStep::Unresolved(next, reason) => {
-                    self.materializations.insert(
+                    self.suspended.insert(
                         coordinate.clone(),
-                        Progress::Suspended(Suspended {
-                            source: next,
-                            selected,
-                        }),
+                        Suspended { source: next, selected },
                     );
                     return Materialization::Pending(reason);
                 }
@@ -315,8 +288,9 @@ impl<B: seismic_native_target::TargetFamily> CandidateDomain<'_, B> {
                         );
                         self.materialized.push(candidate);
                     }
-                    self.materializations
-                        .insert(coordinate.clone(), Progress::Complete(canonical.clone()));
+                    self.suspended.remove(coordinate);
+                    self.completed
+                        .insert(coordinate.clone(), canonical.clone());
                     return Materialization::Ready(canonical);
                 }
             }

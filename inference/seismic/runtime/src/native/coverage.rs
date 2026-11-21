@@ -871,15 +871,9 @@ fn base_specialization(
     implementation: &NativeImplementation,
     statics: &NativeSpecialization,
 ) -> Result<NativeSpecialization, seismic_lang::checked::NativeSpecializationError> {
-    if let Some(result) = implementation.default_specialization_without_device(statics) {
-        return result;
-    }
-    let mut first = None;
-    implementation.walk_admissible(statics, |configuration| {
-        first = Some(configuration.clone());
-        false
-    })?;
-    first.ok_or(seismic_lang::checked::NativeSpecializationError::Inadmissible)
+    implementation
+        .at_device(&seismic_lang::device::BackendFloor(implementation.backend))
+        .default_specialization(statics)
 }
 
 /// The checked inputs of one entry's implementation on one backend.
@@ -1031,7 +1025,10 @@ impl<'m> Subject<'m> {
     /// bindings admit no configuration at its statics.
     fn rebound(&self, row: &Row, bindings: ElementBindings) -> Option<Row> {
         let implementation = self.implementation(&bindings);
-        let specialization = match implementation.validate(&row.specialization) {
+        let specialization = match implementation
+            .at_device(&seismic_lang::device::BackendFloor(implementation.backend))
+            .validate(&row.specialization)
+        {
             Ok(()) => row.specialization.clone(),
             Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
                 match base_specialization(implementation, &statics_of(&row.specialization)) {
@@ -1142,7 +1139,11 @@ impl<'m> Subject<'m> {
         let implementation = self.implementation(&row.bindings);
         Ok(match dialect {
             Dialect::Vulkan(_) => {
-                let formed = super::formed_launches(implementation, &row.specialization);
+                let formed = super::formed_launches(
+                    &implementation
+                        .at_device(&seismic_lang::device::BackendFloor(implementation.backend)),
+                    &row.specialization,
+                );
                 let entries = super::vulkan_entries(&self.info.name, implementation, &row.specialization, &formed)?;
                 vec![ProgramSource {
                     text: render_source(
@@ -1340,13 +1341,15 @@ impl<'m> Admissible<'m> {
             }
         ];
         let mut first = None;
-        implementation
+        let bound = implementation
+            .at_device(&seismic_lang::device::BackendFloor(implementation.backend));
+        bound
             .walk_admissible(statics, |candidate| {
                 if first.is_none() {
                     first = Some(candidate.clone());
                 }
                 for (ordinal, variants) in admissible.variants.iter_mut().enumerate() {
-                    if !implementation.reachable(candidate, ordinal) {
+                    if !bound.reachable(candidate, ordinal) {
                         continue;
                     }
                     let variant = variant_of(implementation, candidate, ordinal);
@@ -1394,6 +1397,7 @@ impl<'m> Admissible<'m> {
         let within = within.narrowed(&self.statics)?;
         let mut first = None;
         within
+            .at_device(&seismic_lang::device::BackendFloor(within.backend))
             .walk_admissible(&self.statics, |configuration| {
                 first = Some(configuration.clone());
                 false
@@ -1442,7 +1446,11 @@ impl<'m> Admissible<'m> {
                 .collect::<Vec<_>>();
             if let Some(first) = self
                 .first_within(&values)
-                .filter(|first| self.implementation.reachable(first, launch))
+                .filter(|first| {
+                    self.implementation
+                        .at_device(&seismic_lang::device::BackendFloor(self.implementation.backend))
+                        .reachable(first, launch)
+                })
             {
                 firsts.push((
                     self.codes_of(&first),
@@ -1502,6 +1510,7 @@ impl<'m> Admissible<'m> {
             .collect::<Vec<Vec<Option<(usize, NativeSpecialization)>>>>();
         let mut nearest = vec![empty; helds.len()];
         self.implementation
+            .at_device(&seismic_lang::device::BackendFloor(self.implementation.backend))
             .walk_admissible(&self.statics, |candidate| {
                 let codes = self.codes_of(candidate);
                 debug_assert_eq!(
@@ -2184,7 +2193,11 @@ fn form_values(
             .chain(rows.iter().map(|(_, row)| row))
             .map(|row| &row.specialization)
             .find(|specialization| {
-                holds(specialization, *form) && implementation.validate(specialization).is_ok()
+                holds(specialization, *form)
+                    && implementation
+                        .at_device(&seismic_lang::device::BackendFloor(implementation.backend))
+                        .validate(specialization)
+                        .is_ok()
             })
             .cloned()
             .or_else(|| {

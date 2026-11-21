@@ -421,6 +421,9 @@ pub struct Executor {
     driver: String,
     limits: Limits,
     tensor_operations: bool,
+    /// Hardware properties queried from the backend API for contract evaluation
+    /// (shared memory, threadgroup size, subgroup width, compute units).
+    properties: Option<seismic_lang::device::DeviceProperties>,
     /// Each contract's placement, in [`Contract::ALL`] order.
     placed: [Placed; Contract::COUNT],
 }
@@ -470,6 +473,10 @@ impl Executor {
     /// other backends, whose kernels have no such form.
     pub fn forms_tensor_operations(&self) -> bool {
         self.tensor_operations
+    }
+    /// Hardware properties queried from the backend API, when reported.
+    pub fn properties(&self) -> Option<seismic_lang::device::DeviceProperties> {
+        self.properties
     }
     /// The kinds a buffer of `contract` is allocated from, in order: an
     /// allocation lands on the first with room along its paths
@@ -977,6 +984,7 @@ impl Builder {
             driver: executor.driver,
             limits: executor.limits,
             tensor_operations: executor.tensor_operations,
+            properties: executor.properties,
             placed: Default::default(),
         });
         ExecutorBuilder {
@@ -1021,6 +1029,8 @@ pub(crate) struct ExecutorReport {
     pub(crate) limits: Limits,
     /// Metal tensor operations; false for every other backend.
     pub(crate) tensor_operations: bool,
+    /// Hardware properties queried from the backend API, when reported.
+    pub(crate) properties: Option<seismic_lang::device::DeviceProperties>,
 }
 
 /// Adds one executor's access paths and kinds, and places its storage in

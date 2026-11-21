@@ -209,12 +209,16 @@ kernel void attention_prefill_k8v4_fold(
     // The round the attend launch before it took.
     const attention::history_window window = prefill_window(partials, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_HT));
     const uint round = window.words[attention::history_window::ATTEND];
+    threadgroup float weights[32];
+    threadgroup float shared_kept_weight;
+    threadgroup float shared_divisor;
     attention::prefill_fold<SEISMIC_TUNE_QT>(window,
         attention::decoded_history::of(window,
             attention::held_tiles{tiles, window.words[attention::history_window::TILES]}, round,
             uint(SEISMIC_PARAM_SLAB_ROWS)).held(),
         round, query, gate, element::Out<activation::Act>(result_cells), partials, PREFILL_STATISTICS(scratch),
-        PREFILL_COUNTS(scratch), SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
+        PREFILL_COUNTS(scratch), weights, shared_kept_weight, shared_divisor, SEISMIC_DIM_M, group.x, group.y, column,
+        SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 #endif
 }
 
@@ -236,8 +240,11 @@ kernel void attention_prefill_k8v4_merge(
     if (window.rounds(window.words[attention::history_window::TILES]) > 1)
         return;
 #endif
+    threadgroup float weights[attention::PREFILL_MERGE_MAX_PARTS];
+    threadgroup float shared_inv_divisor;
     attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, element::Out<activation::Act>(result_cells), partials,
-        PREFILL_STATISTICS(scratch), PREFILL_COUNTS(scratch), SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
+        PREFILL_STATISTICS(scratch), PREFILL_COUNTS(scratch), weights, shared_inv_divisor, SEISMIC_DIM_M, group.x,
+        group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 }
 
 // The WorkList's list launch (B > 0): each query tile's read key tiles

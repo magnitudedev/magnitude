@@ -266,23 +266,23 @@ native ngram_gate for cpu from "cpu/ngram_gate.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (S * H * 8)
 
-# Metal: a thread per (channel, row) for grid y < M, each forming its taps'
-# u values from the scales, value and norm; grid y = M + b publishes slot b's
-# successor window. The successor window is no slot's source, so the
-# publishing threads run beside the row threads.
+# Metal: a thread per (4-column chunk, row, stream) for grid y < M, each
+# forming its taps' u values from the scales, value and hoisted norm; grid
+# y = M + b publishes slot b's successor window. The successor window is no
+# slot's source, so the publishing threads run beside the row threads.
 native ngram_inject for metal from "metal/ngram_inject.metal":
     static (H, S, K)
     launch ngram_inject:
-        threadgroups (ceil_div(S * H, 256), M + B, 1)
-        threads_per_threadgroup (256, 1, 1)
+        threadgroups (ceil_div(ceil_div(H, 4), 128), M + B, S)
+        threads_per_threadgroup (128, 1, 1)
 
-# CUDA and Vulkan: the Metal items, visited by a grid-stride loop over y
-# because both cap the y grid at 65535 groups.
+# CUDA: the Metal items, visited by a grid-stride loop over y because CUDA
+# caps the y grid at 65535 groups.
 native ngram_inject for cuda from "cuda/ngram_inject.cu":
     static (H, S, K)
     launch ngram_inject:
-        threadgroups (ceil_div(S * H, 256), min(M + B, 65535), 1)
-        threads_per_threadgroup (256, 1, 1)
+        threadgroups (ceil_div(ceil_div(H, 4), 128), min(M + B, 65535), S)
+        threads_per_threadgroup (128, 1, 1)
 
 native ngram_inject for vulkan from "vulkan/ngram_inject.comp":
     static (H, S, K)
@@ -298,20 +298,21 @@ native ngram_inject for cpu from "cpu/ngram_inject.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (S * H * 4)
 
-# Metal: a thread per (channel, row).
+# Metal: a thread per (4-column chunk, row), looping over all S streams so
+# each value chunk is read once.
 native ngram_add for metal from "metal/ngram_add.metal":
     static (H, S)
     launch ngram_add:
-        threadgroups (ceil_div(S * H, 256), M, 1)
-        threads_per_threadgroup (256, 1, 1)
+        threadgroups (ceil_div(ceil_div(H, 4), 128), M, 1)
+        threads_per_threadgroup (128, 1, 1)
 
-# CUDA and Vulkan: the Metal threads, visiting the rows by a grid-stride
-# loop over y because both cap the y grid at 65535 groups.
+# CUDA: the Metal threads, visiting the rows by a grid-stride loop over y
+# because CUDA caps the y grid at 65535 groups.
 native ngram_add for cuda from "cuda/ngram_add.cu":
     static (H, S)
     launch ngram_add:
-        threadgroups (ceil_div(S * H, 256), min(M, 65535), 1)
-        threads_per_threadgroup (256, 1, 1)
+        threadgroups (ceil_div(ceil_div(H, 4), 128), min(M, 65535), 1)
+        threads_per_threadgroup (128, 1, 1)
 
 native ngram_add for vulkan from "vulkan/ngram_add.comp":
     static (H, S)

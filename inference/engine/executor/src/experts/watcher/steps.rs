@@ -26,7 +26,7 @@ use crate::operation::{LaunchWork, RequestId};
 use magnitude_kernels::constants::VERIFY_ROWS;
 use crate::programs::Chain;
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::{NonZeroU64, NonZeroU8};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -655,6 +655,12 @@ impl From<ParkFrom> for MapStep {
 impl From<&Unbegun> for MapStep {
     fn from(at: &Unbegun) -> Self {
         Self(at.next)
+    }
+}
+
+impl From<ScratchGroup> for MapStep {
+    fn from(group: ScratchGroup) -> Self {
+        Self(group.first)
     }
 }
 
@@ -1373,26 +1379,32 @@ impl Shared {
         // unwind, it ends them, so none keeps its routing record.
         let mut admission = Admission { shared: self, next: first, remaining: launches.len() };
         let steps = launches.map(|launch| {
-            let route = route(&launch);
             let work = work(&launch);
+            let form = match route(&launch) {
+                StepRoute::Grouped => StepForm::Grouped,
+                StepRoute::Decode => StepForm::Decode(DecodeStep {
+                    launch: None,
+                    recorded: None,
+                    // A decode step issues a site flight, through which one of
+                    // the executor's workers polls the site's requests: none
+                    // where no layer's split leaves the CPU features, nor while
+                    // every sited layer is whole, which asks the CPU nothing.
+                    _flight: self
+                        .sites_served
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        .then(|| self.compute.flight())
+                        .flatten(),
+                    // A decode step on its flight's stamp times its blocks by
+                    // the lines it begins under, once they are priced.
+                    sampled: self.telemetry.samples(admission.next).then(|| self.priced()).flatten(),
+                }),
+            };
             let step = ExpertStep {
-                // A decode step issues a site flight, through which one of
-                // the executor's workers polls the site's requests: none
-                // where no layer's split leaves the CPU features, nor while
-                // every sited layer is whole, which asks the CPU nothing.
-                _flight: (route == StepRoute::Decode && self.sites_served.load(std::sync::atomic::Ordering::Acquire))
-                    .then(|| self.compute.flight())
-                    .flatten(),
-                // A decode step on its flight's stamp times its blocks by
-                // the lines it begins under, once they are priced.
-                sampled: (route == StepRoute::Decode && self.telemetry.samples(admission.next)).then(|| self.priced()).flatten(),
-                route,
                 work,
                 reads: index,
                 sequence: admission.next,
                 shared: self.clone(),
-                launch: None,
-                recorded: None,
+                form,
                 resize_generation: self.telemetry.resize_generation(),
                 ending: Ending::Unrun,
             };
@@ -1411,13 +1423,29 @@ impl Shared {
 #[must_use = "a step's completion is how its read failures reach its sequences"]
 pub(crate) struct ExpertStep {
     sequence: Step,
-    route: StepRoute,
     /// Its launch's work, a prompt's or generation's.
     work: LaunchWork,
     /// Its group's group reads record, of a group with a grouped step.
     reads: Option<usize>,
     shared: Arc<Shared>,
-    /// Its decode launch's rows and context; none of a grouped step.
+    form: StepForm,
+    /// `Telemetry::resize_generation` snapshotted when this step began, so a
+    /// pass whose wall time spanned a bank resize does not poison `Passes`.
+    resize_generation: u64,
+    /// How it ends, as the interest ledger is told ([`Ending`]).
+    ending: Ending,
+}
+
+/// A step's route form and its form-specific state: a grouped step carries
+/// none; a decode step owns its launch, recording flag, site flight, and
+/// block-timing sample lines.
+enum StepForm {
+    Grouped,
+    Decode(DecodeStep),
+}
+
+struct DecodeStep {
+    /// Its decode launch's rows and context.
     launch: Option<DecodeLaunch>,
     recorded: Option<Recording>,
     /// The site flight a decode step issues while it runs, where the load
@@ -1427,11 +1455,6 @@ pub(crate) struct ExpertStep {
     /// (`Telemetry::samples`), decided as it begins; none of a step not
     /// sampled.
     sampled: Option<Arc<[ExpertLines]>>,
-    /// `Telemetry::resize_generation` snapshotted when this step began, so a
-    /// pass whose wall time spanned a bank resize does not poison `Passes`.
-    resize_generation: u64,
-    /// How it ends, as the interest ledger is told ([`Ending`]).
-    ending: Ending,
 }
 
 /// How a step ends, as the interest ledger is told
@@ -1471,20 +1494,46 @@ pub(super) enum CompletedRoute {
     Decode(Decoded),
 }
 
+/// The guessed rows of a decode launch: none (`Plain`), front rows
+/// (`Front`, STEP_FRONT's bits: bit r where row r is a front row), or
+/// acceptable verify rows (`Acceptable`, bit r where row r is a verify row,
+/// accepted where its guess stands). A launch's passes are of one form:
+/// front rows or acceptable rows, never both (`crate::BuiltForm`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GuessedRows {
+    Plain,
+    Front(NonZeroU32),
+    Acceptable(NonZeroU32),
+}
+
+impl GuessedRows {
+    /// The bitmask of all guessed rows (front or acceptable), 0 if plain.
+    pub(super) fn mask(self) -> u32 {
+        match self {
+            Self::Plain => 0,
+            Self::Front(bits) | Self::Acceptable(bits) => bits.get(),
+        }
+    }
+
+    /// The bitmask of front rows (STEP_FRONT's bits), 0 if none.
+    pub(super) fn front(self) -> u32 {
+        match self {
+            Self::Front(bits) => bits.get(),
+            Self::Plain | Self::Acceptable(_) => 0,
+        }
+    }
+}
+
 /// A decode launch: its rows; the mean tokens its rows that read (all
 /// but its front rows, whose reads are a later step's) read (`tokens`);
-/// its front rows (STEP_FRONT's bits: bit r where row r is a front row);
-/// and its acceptable rows (bit r where row r is a verify row, accepted
-/// where its guess stands). A launch's passes are of one form: front rows
-/// or acceptable rows, never both (`crate::BuiltForm`).
+/// and its guessed rows ([`GuessedRows`]).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DecodeLaunch {
     pub(super) rows: usize,
     /// Its rows' requests and positions, the first `rows` ([`Self::placed`]).
     placed: [(RequestId, u64); VERIFY_ROWS as usize],
     pub(super) tokens: u64,
-    pub(super) front: u32,
-    pub(super) acceptable: u32,
+    pub(super) guessed: GuessedRows,
 }
 
 impl DecodeLaunch {
@@ -1494,11 +1543,17 @@ impl DecodeLaunch {
         &self.placed[..self.rows]
     }
 
+    /// Its front rows (STEP_FRONT's bits: bit r where row r is a front row),
+    /// 0 of a launch without front rows.
+    pub(super) fn front(&self) -> u32 {
+        self.guessed.front()
+    }
+
     /// Its depth: the most guessed rows it ran a sequence, front or
     /// acceptable, the longest run of them (each sequence's follow its
     /// exact row, `decode_rows`), 0 of a launch of none.
     pub(super) fn depth(&self) -> usize {
-        let (mut guessed, mut depth) = (self.front | self.acceptable, 0);
+        let (mut guessed, mut depth) = (self.guessed.mask(), 0);
         while guessed != 0 {
             guessed &= guessed << 1;
             depth += 1;
@@ -1508,7 +1563,7 @@ impl DecodeLaunch {
 
     /// Whether its passes are verify passes: it ran acceptable rows.
     pub(super) fn verifies(&self) -> bool {
-        self.acceptable != 0
+        matches!(self.guessed, GuessedRows::Acceptable(_))
     }
 }
 
@@ -1536,7 +1591,7 @@ impl ExpertStep {
     /// Whether the step's runs time their blocks, each whose ends are
     /// marked (`Telemetry::samples`).
     pub fn samples(&self) -> bool {
-        self.sampled.is_some()
+        matches!(&self.form, StepForm::Decode(decode) if decode.sampled.is_some())
     }
 
     /// The group reads record its group's passes write their reads to
@@ -1564,6 +1619,9 @@ impl ExpertStep {
     /// takes their mean history alone: a verification's acceptable rows are
     /// rows of its sequence, not sequences of their own.
     pub fn decoding(mut self, rows: impl ExactSizeIterator<Item = DecodeRow>, padding: usize) -> Self {
+        let StepForm::Decode(decode) = &mut self.form else {
+            panic!("a grouped step has no decode launch (`Self::guessing`)");
+        };
         let count = rows.len();
         assert!(count > 0, "a decode launch runs a row");
         assert!((count + padding) as u64 <= magnitude_kernels::constants::VERIFY_ROWS, "a decode launch of {count} rows and {padding} padding");
@@ -1600,15 +1658,23 @@ impl ExpertStep {
         // Every pass runs its exact row in its launch (`AheadOf::new`), so a
         // launch has a sequence, and a row that reads.
         assert!(sequences > 0, "a decode launch of {count} rows runs no exact row");
-        assert!(front == 0 || acceptable == 0, "a decode launch's passes are of one form: front rows {front:#b}, acceptable rows {acceptable:#b}");
-        let advance = if acceptable != 0 {
-            crate::experts::horizon::Advance::Pending { requests: verifying_requests as u32 }
-        } else {
-            crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0))
+        let guessed = match (NonZeroU32::new(front), NonZeroU32::new(acceptable)) {
+            (None, None) => GuessedRows::Plain,
+            (Some(front), None) => GuessedRows::Front(front),
+            (None, Some(acceptable)) => GuessedRows::Acceptable(acceptable),
+            (Some(front), Some(acceptable)) => {
+                panic!("a decode launch's passes are of one form: front rows {front:#b}, acceptable rows {acceptable:#b}");
+            }
+        };
+        let advance = match guessed {
+            GuessedRows::Acceptable(_) => crate::experts::horizon::Advance::Pending { requests: verifying_requests as u32 },
+            GuessedRows::Plain | GuessedRows::Front(_) => {
+                crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0))
+            }
         };
         self.shared.register_step(self.sequence, advance);
         self.shared.tell(crate::experts::interest::Told::Began { step: self.sequence, launch: crate::experts::interest::Launched::Decode { rows, padding } });
-        self.launch = Some(DecodeLaunch { rows: count, placed, tokens: tokens / reading, front, acceptable });
+        decode.launch = Some(DecodeLaunch { rows: count, placed, tokens: tokens / reading, guessed });
         self
     }
 
@@ -1619,7 +1685,7 @@ impl ExpertStep {
     /// Its rows name nothing ahead. Nothing is told of a launch without
     /// one (a prompt chunk's).
     pub fn guessing(self, requests: impl Iterator<Item = RequestId>) -> Self {
-        assert_eq!(self.route, StepRoute::Grouped, "a decode launch's rows ahead are its rows' (`Self::decoding`)");
+        assert!(matches!(self.form, StepForm::Grouped), "a decode launch's rows ahead are its rows' (`Self::decoding`)");
         let requests = requests.collect::<Box<[_]>>();
         if !requests.is_empty() {
             self.shared.tell(crate::experts::interest::Told::Began { step: self.sequence, launch: crate::experts::interest::Launched::Grouped(requests) });
@@ -1630,12 +1696,17 @@ impl ExpertStep {
     /// Its front rows (STEP_FRONT's bits): none but of a decode launch
     /// that has them.
     pub fn front(&self) -> u32 {
-        self.launch.map_or(0, |launch| launch.front)
+        match &self.form {
+            StepForm::Decode(decode) => decode.launch.map_or(0, |launch| launch.front()),
+            StepForm::Grouped => 0,
+        }
     }
 
     /// The step's load counts its decode.
     pub fn recorded(mut self, recording: Recording) -> Self {
-        self.recorded = Some(recording);
+        if let StepForm::Decode(decode) = &mut self.form {
+            decode.recorded = Some(recording);
+        }
         self
     }
 
@@ -1647,13 +1718,13 @@ impl ExpertStep {
     pub fn complete(mut self) -> Result<(), StepFailure> {
         let shared = &self.shared;
         let (group, begun) = shared.steps.begun(self.sequence);
-        let route = match self.route {
-            StepRoute::Grouped => CompletedRoute::Grouped,
-            StepRoute::Decode => CompletedRoute::Decode(Decoded {
-                recording: self.recorded.take(),
-                launch: self.launch,
+        let route = match &mut self.form {
+            StepForm::Grouped => CompletedRoute::Grouped,
+            StepForm::Decode(decode) => CompletedRoute::Decode(Decoded {
+                recording: decode.recorded.take(),
+                launch: decode.launch,
                 group,
-                sampled: self.sampled.take(),
+                sampled: decode.sampled.take(),
             }),
         };
         let resized = self.resize_generation != shared.telemetry.resize_generation();

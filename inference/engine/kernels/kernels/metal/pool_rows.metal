@@ -4,20 +4,22 @@
 //           and coordinates to the window planes.
 // complete: one simdgroup per row, lane l holding columns [l E, (l + 1) E);
 //           a completing row gathers its group (the last RATE - 1 rows of
-//           its window spans, then its own inputs, its gates plus their
-//           place terms), pools it, RMS-norms it with `norm` when TN = 0
-//           (the latent, published), rotates it at the
-//           coordinates stored with the group's first token
-//           (`rotary::layout`), rounds it (`rounding::round_lanes`; a
-//           rounded row held in A after its pooling, norm and rotation) and
-//           stores it in the block plane, publishing the latent, its block
-//           row and the origin coordinates. Other rows publish a zero latent,
-//           block row -1 and zero coordinates.
+//           its window spans, located cooperatively via `reduce::span_total`
+//           and `reduce::span_locate`, then its own inputs, its gates plus
+//           their place terms), pools it, RMS-norms it with `norm` when
+//           TN = 0 (the latent, published), rotates it at the coordinates
+//           stored with the group's first token (`rotary::layout`), rounds it
+//           (`rounding::round_lanes`; a rounded row held in A after its
+//           pooling, norm and rotation) and stores it in the block plane,
+//           publishing the latent, its block row and the origin coordinates.
+//           Other rows publish a zero latent, block row -1 and zero
+//           coordinates.
 
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 #include "lib/core/head.h"
 #include "lib/core/norm.h"
+#include "lib/core/reduce.h"
 #include "lib/core/rotary.h"
 #include "lib/core/rounding.h"
 #include "lib/indexer/indexer.h"
@@ -40,37 +42,72 @@ typedef rotary::layout<POOL_W, SEISMIC_DIM_P, (SEISMIC_DIM_RT != 0 ? SEISMIC_DIM
 // The row element Y: A for a history source's rows, F32 for indexer keys.
 typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) Row;
 
-// Lane `lane`'s k-th column: l + 32 k (`strided`, append's) or l E + k
-// (complete's).
-inline uint own_column(uint lane, uint k, bool strided) {
-    return strided ? lane + 32 * k : lane * POOL_E + k;
-}
-
-// A row's own u, the lane holding its `own_column`s in x, LayerNorm-ed per
-// token with `weight` and `bias` when TN = 1 (`token_norm`): `row_norm`'s
-// arithmetic over the simdgroup's partials.
+// A row's own u, the lane holding contiguous columns [lane * E, (lane + 1) * E)
+// (`CONTIGUOUS`) or strided columns lane + 32 * k, LayerNorm-ed per token with
+// `weight` and `bias` when TN = 1 (`token_norm`): `row_norm`'s arithmetic over
+// the simdgroup's partials (vec4 on contiguous lanes when E % 4 == 0).
+template <bool CONTIGUOUS>
 inline void own_row(thread float (&x)[POOL_E], device const float *u, device const float *weight,
-                    device const float *bias, float epsilon, uint lane, bool strided) {
-    POOL_UNROLL
-    for (uint k = 0; k < POOL_E; ++k)
-        x[k] = u[own_column(lane, k, strided)];
-    if (POOL_TOKEN_NORM) {
+                    device const float *bias, float epsilon, uint lane) {
+    const uint base = lane * POOL_E;
+    if constexpr (CONTIGUOUS && (POOL_E % 4 == 0)) {
+        POOL_UNROLL
+        for (uint k = 0; k < POOL_E; k += 4) {
+            const float4 v = float4(*reinterpret_cast<device const packed_float4 *>(u + base + k));
+            x[k] = v.x;
+            x[k + 1] = v.y;
+            x[k + 2] = v.z;
+            x[k + 3] = v.w;
+        }
+    } else {
+        POOL_UNROLL
+        for (uint k = 0; k < POOL_E; ++k)
+            x[k] = u[CONTIGUOUS ? base + k : lane + 32u * k];
+    }
+    if constexpr (POOL_TOKEN_NORM) {
         float sum = 0.0f;
         POOL_UNROLL
         for (uint k = 0; k < POOL_E; ++k)
             sum += x[k];
         const float mean = row_norm::mean(simd_sum(sum), POOL_W);
         float squares = 0.0f;
-        POOL_UNROLL
-        for (uint k = 0; k < POOL_E; ++k) {
-            x[k] -= mean;
-            squares = row_norm::square(x[k], squares);
+        if constexpr (CONTIGUOUS && (POOL_E % 4 == 0)) {
+            float4 sq4 = float4(0.0f);
+            POOL_UNROLL
+            for (uint k = 0; k < POOL_E; k += 4) {
+                x[k] -= mean;
+                x[k + 1] -= mean;
+                x[k + 2] -= mean;
+                x[k + 3] -= mean;
+                sq4 = row_norm::square4(float4(x[k], x[k + 1], x[k + 2], x[k + 3]), sq4);
+            }
+            squares = row_norm::sum4(sq4);
+        } else {
+            POOL_UNROLL
+            for (uint k = 0; k < POOL_E; ++k) {
+                x[k] -= mean;
+                squares = row_norm::square(x[k], squares);
+            }
         }
         const float inverse = row_norm::inverse(simd_sum(squares), POOL_W, epsilon);
-        POOL_UNROLL
-        for (uint k = 0; k < POOL_E; ++k) {
-            const uint column = own_column(lane, k, strided);
-            x[k] = row_norm::apply<true, true>(x[k], inverse, weight[column], bias[column]);
+        if constexpr (CONTIGUOUS && (POOL_E % 4 == 0)) {
+            POOL_UNROLL
+            for (uint k = 0; k < POOL_E; k += 4) {
+                const float4 w4 = float4(*reinterpret_cast<device const packed_float4 *>(weight + base + k));
+                const float4 b4 = float4(*reinterpret_cast<device const packed_float4 *>(bias + base + k));
+                const float4 y4 =
+                    row_norm::apply4<true, true>(float4(x[k], x[k + 1], x[k + 2], x[k + 3]), inverse, w4, b4);
+                x[k] = y4.x;
+                x[k + 1] = y4.y;
+                x[k + 2] = y4.z;
+                x[k + 3] = y4.w;
+            }
+        } else {
+            POOL_UNROLL
+            for (uint k = 0; k < POOL_E; ++k) {
+                const uint column = CONTIGUOUS ? base + k : lane + 32u * k;
+                x[k] = row_norm::apply<true, true>(x[k], inverse, weight[column], bias[column]);
+            }
         }
     }
 }
@@ -97,14 +134,16 @@ kernel void pool_rows_append(
     constexpr uint width = (POOL_GATED ? 2 : 1) * POOL_W;
     const element::Out<element::F32> target = slab::out_row(window_rows, ulong(destination), slab_rows, width);
     float x[POOL_E];
-    pooled::own_row(x, u + row * POOL_W, norm, bias, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane, true);
+    pooled::own_row<false>(x, u + row * POOL_W, norm, bias, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane);
     POOL_UNROLL
     for (uint k = 0; k < POOL_E; ++k)
-        target.put(lane + 32 * k, x[k]);
-    if (POOL_GATED)
-        for (uint column = lane; column < POOL_W; column += 32)
-            target.put(POOL_W + column, g[row * POOL_W + column]);
-    if (lane < 4)
+        target.put(lane + 32u * k, x[k]);
+    if (POOL_GATED) {
+        device const float *g_row = g + row * POOL_W;
+        for (uint column = lane; column < POOL_W; column += 32u)
+            target.put(POOL_W + column, g_row[column]);
+    }
+    if (lane < 4u)
         slab::row<int>(window_coordinates, ulong(destination), slab_rows, 4)[lane] = coordinates[row * 4 + lane];
 }
 
@@ -133,36 +172,64 @@ kernel void pool_rows_complete(
     constexpr uint W = POOL_W;
     constexpr uint width = (POOL_GATED ? 2 : 1) * W;
     const ulong row = group.x;
+    const uint lane_base = lane * E;
     const int destination = block_destinations[row];
     const element::Out<element::F32> published =
         element::Out<element::F32>(latent).offset(row * SEISMIC_RESULT_0_STRIDE_0);
     if (destination < 0) {
-        POOL_UNROLL
-        for (uint i = 0; i < E; ++i)
-            published.put((lane * E + i) * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
-        if (lane == 0)
+        if constexpr (E % 4 == 0) {
+            if (SEISMIC_RESULT_0_STRIDE_1 == 1) {
+                POOL_UNROLL
+                for (uint i = 0; i < E; i += 4)
+                    published.put4(lane_base + i, float4(0.0f));
+            } else {
+                POOL_UNROLL
+                for (uint i = 0; i < E; ++i)
+                    published.put(ulong(lane_base + i) * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
+            }
+        } else {
+            POOL_UNROLL
+            for (uint i = 0; i < E; ++i)
+                published.put(ulong(lane_base + i) * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
+        }
+        if (lane == 0u)
             latent_rows[row * SEISMIC_RESULT_1_STRIDE_0] = -1;
-        if (lane < 4)
-            latent_coordinates[row * SEISMIC_RESULT_2_STRIDE_0 + lane * SEISMIC_RESULT_2_STRIDE_1] = 0;
+        if (lane < 4u)
+            latent_coordinates[row * SEISMIC_RESULT_2_STRIDE_0 + ulong(lane) * SEISMIC_RESULT_2_STRIDE_1] = 0;
         return;
     }
     const ulong window_slab_rows = ulong(SEISMIC_PARAM_WINDOW_SLAB_ROWS);
-    // The group's earlier tokens: the last RATE - 1 rows of the window spans.
+    // The group's earlier tokens: the last RATE - 1 rows of the window spans,
+    // located cooperatively across the simdgroup.
     const uint spans = uint(SEISMIC_DIM_R);
-    device const int *row_spans = window_visible + row * spans * 2;
-    uint earlier = 0;
-    for (uint span = 0; span < spans; ++span)
-        earlier += indexer::span_length(row_spans[span * 2], row_spans[span * 2 + 1]);
+    device const int *row_spans = window_visible + row * ulong(spans) * 2;
+    auto span_len = [&](ulong s) { return indexer::span_length(row_spans[s * 2], row_spans[s * 2 + 1]); };
+    const uint earlier = reduce::span_total(spans, span_len, lane);
+    const uint first_member = earlier - (POOL_RATE - 1);
+    const reduce::Located start = reduce::span_locate(spans, first_member, span_len, lane);
     device const float *members[POOL_RATE - 1];
+    int first_row = 0;
+    ulong span = start.span;
+    uint offset = start.offset;
     for (uint member = 0; member + 1 < POOL_RATE; ++member) {
-        const int at = indexer::span_row(row_spans, spans, earlier - (POOL_RATE - 1) + member);
+        const uint ord = first_member + member;
+        for (;;) {
+            const uint len = span_len(span);
+            if (ord < offset + len)
+                break;
+            offset += len;
+            ++span;
+        }
+        const int at = row_spans[span * 2] + int(ord - offset);
+        if (member == 0)
+            first_row = at;
         members[member] = slab::row<float>(window_rows, ulong(at), window_slab_rows, width);
     }
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     // The row's own u (normed per token when TN = 1), beside its window
     // members'.
     float own[E];
-    pooled::own_row(own, u + row * W, norm, bias, epsilon, lane, false);
+    pooled::own_row<true>(own, u + row * W, norm, bias, epsilon, lane);
     // A member's gate scores follow its u in the window; the row's own are
     // g. Each takes its place's term (PR = RATE; none at PR = 0).
     device const float *own_gates = g + row * W;
@@ -180,8 +247,8 @@ kernel void pool_rows_complete(
             device const float *gates = member + 1 < POOL_RATE ? members[member] + W : own_gates;
             POOL_UNROLL
             for (uint i = 0; i < E; ++i) {
-                const float place = member < POOL_PLACES ? position[member * W + lane * E + i] : 0.0f;
-                scores[member][i] = gates[lane * E + i] + place;
+                const float place = member < POOL_PLACES ? position[member * W + lane_base + i] : 0.0f;
+                scores[member][i] = gates[lane_base + i] + place;
                 top[i] = metal::max(top[i], scores[member][i]);
             }
         }
@@ -193,7 +260,7 @@ kernel void pool_rows_complete(
         for (uint member = 0; member < POOL_RATE; ++member) {
             POOL_UNROLL
             for (uint i = 0; i < E; ++i) {
-                const float value = member + 1 < POOL_RATE ? members[member][lane * E + i] : own[i];
+                const float value = member + 1 < POOL_RATE ? members[member][lane_base + i] : own[i];
                 x[i] += metal::precise::exp(scores[member][i] - top[i]) / total[i] * value;
             }
         }
@@ -204,7 +271,7 @@ kernel void pool_rows_complete(
         for (uint member = 0; member < POOL_RATE; ++member) {
             POOL_UNROLL
             for (uint i = 0; i < E; ++i)
-                x[i] += member + 1 < POOL_RATE ? members[member][lane * E + i] : own[i];
+                x[i] += member + 1 < POOL_RATE ? members[member][lane_base + i] : own[i];
         }
         POOL_UNROLL
         for (uint i = 0; i < E; ++i)
@@ -221,16 +288,28 @@ kernel void pool_rows_complete(
         head::rms_norm(x, norm, epsilon, lane);
         rounding::hold_lanes<activation::Act>(x, trained);
     }
-    POOL_UNROLL
-    for (uint i = 0; i < E; ++i)
-        published.put((lane * E + i) * SEISMIC_RESULT_0_STRIDE_1, x[i]);
-    if (lane == 0)
+    if constexpr (E % 4 == 0) {
+        if (SEISMIC_RESULT_0_STRIDE_1 == 1) {
+            POOL_UNROLL
+            for (uint i = 0; i < E; i += 4)
+                published.put4(lane_base + i, float4(x[i], x[i + 1], x[i + 2], x[i + 3]));
+        } else {
+            POOL_UNROLL
+            for (uint i = 0; i < E; ++i)
+                published.put(ulong(lane_base + i) * SEISMIC_RESULT_0_STRIDE_1, x[i]);
+        }
+    } else {
+        POOL_UNROLL
+        for (uint i = 0; i < E; ++i)
+            published.put(ulong(lane_base + i) * SEISMIC_RESULT_0_STRIDE_1, x[i]);
+    }
+    if (lane == 0u)
         latent_rows[row * SEISMIC_RESULT_1_STRIDE_0] = destination;
     // Rotated at the group's first token, rounded, stored.
-    device const int *origin = reinterpret_cast<device const int *>(slab::row<int>(window_coordinates,
-        ulong(indexer::span_row(row_spans, spans, earlier - (POOL_RATE - 1))), window_slab_rows, 4));
-    if (lane < 4)
-        latent_coordinates[row * SEISMIC_RESULT_2_STRIDE_0 + lane * SEISMIC_RESULT_2_STRIDE_1] = origin[lane];
+    device const int *origin = reinterpret_cast<device const int *>(
+        slab::row<int>(window_coordinates, ulong(first_row), window_slab_rows, 4));
+    if (lane < 4u)
+        latent_coordinates[row * SEISMIC_RESULT_2_STRIDE_0 + ulong(lane) * SEISMIC_RESULT_2_STRIDE_1] = origin[lane];
     const pooled::row_layout::table table(origin, rotary_components, rotary_frequencies, rotary_amplitudes, lane);
     pooled::row_layout::rotate(table, lane, x);
     rounding::hold_lanes<activation::Act>(x, trained);
@@ -239,7 +318,13 @@ kernel void pool_rows_complete(
     // hold every value).
     const element::Out<pooled::Row> target =
         slab::out_row(block_rows, ulong(destination), ulong(SEISMIC_PARAM_BLOCK_SLAB_ROWS), W);
-    POOL_UNROLL
-    for (uint i = 0; i < E; ++i)
-        target.put(lane * E + i, x[i]);
+    if constexpr (E % 4 == 0) {
+        POOL_UNROLL
+        for (uint i = 0; i < E; i += 4)
+            target.put4(lane_base + i, float4(x[i], x[i + 1], x[i + 2], x[i + 3]));
+    } else {
+        POOL_UNROLL
+        for (uint i = 0; i < E; ++i)
+            target.put(lane_base + i, x[i]);
+    }
 }

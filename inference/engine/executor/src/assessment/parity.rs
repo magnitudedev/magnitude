@@ -803,3 +803,185 @@ fn glm_5_3_flash_at_32k_fits_on_an_rtx3090_by_windowing_its_scratch_and_not_on_a
         );
     }
 }
+
+/// Device-dependent `.seismic` contracts (`device.shared_bytes_per_group`,
+/// `device.units`, `device.max_group_threads`, `device.subgroup_width`) must
+/// evaluate cleanly with zero `ContractError::DeviceDependent` failures during
+/// both direct `EntryContract` evaluation (with `Some(&device)`) and full
+/// assessment graph construction (`StructuralCharge::of`) across CUDA and Metal.
+#[test]
+fn device_dependent_contracts_build_assessment_graphs_without_device_dependent_errors() {
+    use seismic::{ContractError, Element, EntryContract};
+
+    struct StubDevice {
+        units: u64,
+        shared_bytes_per_group: u64,
+        max_group_threads: u64,
+        subgroup_width: u64,
+    }
+    impl seismic::device::DeviceValues for StubDevice {
+        fn value(&self, name: &str) -> u64 {
+            match name {
+                "units" => self.units,
+                "shared_bytes_per_group" => self.shared_bytes_per_group,
+                "max_group_threads" => self.max_group_threads,
+                "subgroup_width" => self.subgroup_width,
+                other => panic!("unexpected device property {other:?}"),
+            }
+        }
+
+        fn measured(&self, name: &str) -> Option<u64> {
+            Some(self.value(name))
+        }
+    }
+
+    let rtx3090_dev = StubDevice {
+        units: 82,
+        shared_bytes_per_group: 98_304,
+        max_group_threads: 1024,
+        subgroup_width: 32,
+    };
+    let m4_pro_dev = StubDevice {
+        units: 20,
+        shared_bytes_per_group: 32_768,
+        max_group_threads: 1024,
+        subgroup_width: 32,
+    };
+
+    let bf16 = Element::bf16();
+
+    // 1. Direct `EntryContract` checks across attention_prefill, dense, routed,
+    //    streams, and sampling: `Some(&dev)` succeeds with zero DeviceDependent
+    //    errors; `None` still reports `DeviceDependent` when a property is read.
+    let prefill_dims = [
+        ("M", 128),
+        ("T", 4096),
+        ("KV", 8),
+        ("G", 4),
+        ("P", 64),
+        ("S", 0),
+        ("I", 0),
+        ("U", 0),
+        ("F", 1),
+        ("NQ", 1),
+        ("N", 1),
+        ("NV", 0),
+        ("R", 1),
+        ("B", 0),
+        ("BR", 1),
+        ("SK", 0),
+        ("RA", 0),
+        ("RT", 0),
+        ("RO", 0),
+        ("VK", 0),
+        ("KR", 0),
+        ("AB", 0),
+        ("KS", 0),
+        ("TS", 0),
+    ];
+    assert!(
+        matches!(
+            magnitude_kernels::attention_prefill::Entry::contract_default_params(
+                BackendName::Cuda,
+                None,
+                &[("A", bf16)],
+                &prefill_dims,
+            ),
+            Err(ContractError::DeviceDependent(_))
+        ),
+        "attention_prefill on CUDA without a device must report DeviceDependent"
+    );
+    for (backend, dev) in [(BackendName::Cuda, &rtx3090_dev), (BackendName::Metal, &m4_pro_dev)] {
+        magnitude_kernels::attention_prefill::Entry::contract_default_params(
+            backend,
+            Some(dev),
+            &[("A", bf16)],
+            &prefill_dims,
+        )
+        .unwrap_or_else(|e| panic!("attention_prefill default_params on {backend:?}: {e:?}"));
+        magnitude_kernels::attention_prefill::Entry::contract_scratch_configs(
+            backend,
+            Some(dev),
+            &[("A", bf16)],
+            &prefill_dims,
+        )
+        .unwrap_or_else(|e| panic!("attention_prefill scratch_configs on {backend:?}: {e:?}"));
+
+        magnitude_kernels::dense_output::Entry::contract_default_params(
+            backend,
+            Some(dev),
+            &[("A", bf16), ("DW", bf16)],
+            &[("M", 32), ("O", 32), ("H", 2048), ("F", 5632), ("DS", 0), ("DB", 0)],
+        )
+        .unwrap_or_else(|e| panic!("dense_output default_params on {backend:?}: {e:?}"));
+
+        magnitude_kernels::routed_expand::Entry::contract_default_params(
+            backend,
+            Some(dev),
+            &[("A", bf16), ("EGW", bf16), ("EUW", bf16), ("SGW", bf16), ("SUW", bf16)],
+            &[("M", 16), ("H", 2048), ("E", 64), ("K", 8), ("F", 1536), ("S", 0), ("GS", 0), ("US", 0)],
+        )
+        .unwrap_or_else(|e| panic!("routed_expand default_params on {backend:?}: {e:?}"));
+
+        magnitude_kernels::stream_mix_sinkhorn::Entry::contract_default_params(
+            backend,
+            Some(dev),
+            &[],
+            &[("M", 16), ("H", 2048), ("S", 4), ("P", 4)],
+        )
+        .unwrap_or_else(|e| panic!("stream_mix_sinkhorn default_params on {backend:?}: {e:?}"));
+
+        magnitude_kernels::sample_rows::Entry::contract_default_params(
+            backend,
+            Some(dev),
+            &[],
+            &[("M", 1), ("V", 151_936)],
+        )
+        .unwrap_or_else(|e| panic!("sample_rows default_params on {backend:?}: {e:?}"));
+    }
+
+    // 2. Full assessment graph construction (`StructuralCharge::of`) for
+    //    `glm-5.3-flash-fp8` and a served Qwen3.8/Qwen3.6 MoE model on both
+    //    RTX 3090 (CUDA) and M4 Pro (Metal).
+    let mut models = vec![super::catalog::artifact_target("glm-5.3-flash-fp8")];
+    let served = served_targets();
+    if let Some(qwen) = served
+        .iter()
+        .find(|(id, _, _)| id == "qwen3.8-flash-next:gguf:q6")
+        .or_else(|| served.iter().find(|(id, _, _)| id.starts_with("qwen3.8")))
+        .or_else(|| served.iter().find(|(id, _, _)| id.starts_with("qwen3.6")))
+    {
+        models.push(qwen.clone());
+    }
+
+    let release = ReleaseRate::of_machine(None);
+    for (name, base_definition, manifest) in &models {
+        let mut definition = base_definition.clone();
+        definition.decoder.context_limit = 4096;
+        for (machine, topology, backend) in [
+            ("rtx3090", recorded::rtx3090(), BackendName::Cuda),
+            ("m4_pro", recorded::m4_pro(), BackendName::Metal),
+        ] {
+            let status = unopened(&topology);
+            let executor = topology
+                .executors()
+                .iter()
+                .find(|executor| executor.backend() == backend)
+                .unwrap();
+            let pricing = pricing(machine, backend).unwrap();
+            let device = crate::platform::selected(&topology, &status, &release, executor.clone(), pricing);
+            let limits = service(backend, &definition);
+            let draft = plan(&definition, manifest, &device, limits)
+                .unwrap_or_else(|e| panic!("{name} on {machine}: plan failed: {e}"));
+            let structure = super::StructuralCharge::of(&definition, &draft)
+                .unwrap_or_else(|e| panic!("{name} on {machine}: StructuralCharge::of failed: {e:?}"));
+            let charge = structure
+                .charge(&definition, &draft)
+                .unwrap_or_else(|e| panic!("{name} on {machine}: StructuralCharge::charge failed: {e:?}"));
+            assert!(
+                charge.allocation_bytes > 0,
+                "{name} on {machine}: expected non-zero allocation_bytes"
+            );
+        }
+    }
+}

@@ -45,6 +45,10 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         "packets.h",
         include_str!("../native-library/metal/packets.h"),
     ),
+    (
+        "gather.h",
+        include_str!("../native-library/metal/gather.h"),
+    ),
     ("slab.h", include_str!("../native-library/metal/slab.h")),
     ("forms.h", include_str!("../native-library/metal/forms.h")),
     (

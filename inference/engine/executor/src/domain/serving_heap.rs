@@ -168,7 +168,17 @@ impl TwoRowPricing {
             })
             .collect::<Result<Vec<_>, DomainError>>()?;
         let accepts = measured.accepts[..self.verifies.min(measured.accepts.len())].to_vec();
-        let regime = magnitude_cost_model::Regime { resident, needed, stand: measured.stand, accepts, stall, overhead: self.overhead, paths };
+        let verify_routes = magnitude_cost_model::VerifyRoutes { layers: measured.layers, fresh: routes.fresh };
+        let regime = magnitude_cost_model::Regime {
+            resident,
+            needed,
+            stand: measured.stand,
+            accepts,
+            stall,
+            overhead: self.overhead,
+            paths,
+            routes: verify_routes,
+        };
         let (depth, pass) = (regime.depth(), regime.pass());
         Ok(Some(FrontRegime { regime, running: measured.depth.min(deepest), depth, pass }))
     }
@@ -811,14 +821,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(None);
         };
         let verifies = regime.accepts.len().min(regime.resident.len().saturating_sub(1));
-        let mut verify_seconds = Vec::with_capacity(1 + verifies);
-        verify_seconds.push(regime.time(0));
-        for k in 1..=verifies {
-            verify_seconds.push(regime.verify_pass_time(k));
-        }
         Ok(Some(StreamedVerifyPrior {
             bank_epoch: bank.bank_epoch(),
-            verify_seconds,
+            verify_seconds: regime.verify_prior(verifies),
         }))
     }
 

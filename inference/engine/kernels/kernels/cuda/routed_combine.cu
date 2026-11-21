@@ -26,60 +26,88 @@ using activation::Act;
 #define EXPAND_ENTRIES (projection::gemm_s8_entries<GROUPED_S8, packets::W1, packets::W2>())
 #define DOWN_ENTRIES (projection::gemm_s8_entries<GROUPED_S8, packets::W0>())
 
+// Exact unsigned 32-bit divmod by a runtime-invariant divisor >= 1:
+// shift/mask for powers of two (`magic == 0`), Granlund-Montgomery `__umulhi`
+// reciprocal otherwise.
+struct FastDiv32 {
+    projection::u32 d;
+    projection::u32 magic;
+    projection::u32 shift;
+
+    __device__ __forceinline__ static FastDiv32 make(projection::u32 divisor) {
+        const projection::u32 s = 31u - (projection::u32)__clz((int)divisor);
+        if ((divisor & (divisor - 1u)) == 0u)
+            return FastDiv32{divisor, 0u, s};
+        const projection::u64 rem = ((projection::u64)1 << (s + 1u)) - (projection::u64)divisor;
+        const projection::u32 m = (projection::u32)((rem << 32) / (projection::u64)divisor) + 1u;
+        return FastDiv32{divisor, m, s};
+    }
+
+    __device__ __forceinline__ void divmod(projection::u32 n, projection::u32 &q, projection::u32 &r) const {
+        if (magic == 0u) {
+            q = n >> shift;
+            r = n & (d - 1u);
+        } else {
+            const projection::u32 t = __umulhi(n, magic);
+            q = (t + ((n - t) >> 1u)) >> shift;
+            r = n - q * d;
+        }
+    }
+};
+
 struct CombineEpi {
     element::Out<element::F32> out;
     projection::u64 out_stride;
     const float *residual;
     projection::u64 residual_stride;
-    const projection::u8 *expert_output;
-    projection::u64 tile;
+    const projection::u8 *__restrict__ expert_output;
+    FastDiv32 tile_div;
     projection::u64 block_stride;
     projection::u64 lane_stride;
-    const int *inverse;
+    const int *__restrict__ inverse;
     projection::u64 inverse_stride;
-    const float *scores;
+    const float *__restrict__ scores;
     projection::u64 scores_stride;
-    const float *coefficient;
-    const float *inject;
+    const float *__restrict__ coefficient;
+    const float *__restrict__ inject;
     projection::u64 inject_stride;
     __device__ __forceinline__ void operator()(unsigned m, projection::u64 n, float value, float) const {
-        const projection::u32 tile32 = (projection::u32)tile;
-        const int *inv_row = inverse + m * inverse_stride;
-        const float *score_row = scores + m * scores_stride;
+        const int *__restrict__ inv_row = inverse + m * inverse_stride;
+        const float *__restrict__ score_row = scores + m * scores_stride;
+        const float coeff = __ldg(&coefficient[m]);
         float selected = 0.0f;
         for (projection::u64 k = 0; k < SEISMIC_DIM_K; ++k) {
-            const projection::u32 position = (projection::u32)inv_row[k];
-            const projection::u32 bucket = position / tile32;
-            const projection::u32 lane = position - bucket * tile32;
+            const projection::u32 position = (projection::u32)__ldg(&inv_row[k]);
+            projection::u32 bucket, lane;
+            tile_div.divmod(position, bucket, lane);
             const float projected = element::at<Act>(
                 expert_output, (projection::u64)bucket * block_stride + (projection::u64)lane * lane_stride + n);
-            selected = __fmaf_rn(score_row[k], projected, selected);
+            selected = __fmaf_rn(__ldg(&score_row[k]), projected, selected);
         }
         projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(
             out.offset(m * out_stride), residual + m * residual_stride, inject + m * inject_stride, SEISMIC_DIM_H, n,
-            selected, Act::round(value) * coefficient[m]);
+            selected, Act::round(value) * coeff);
     }
     __device__ __forceinline__ void pair(projection::u32 m, projection::u64 n, float a0, float a1, float, float) const {
-        const projection::u32 tile32 = (projection::u32)tile;
-        const int *inv_row = inverse + m * inverse_stride;
-        const float *score_row = scores + m * scores_stride;
+        const int *__restrict__ inv_row = inverse + m * inverse_stride;
+        const float *__restrict__ score_row = scores + m * scores_stride;
+        const float coeff = __ldg(&coefficient[m]);
         float selected0 = 0.0f;
         float selected1 = 0.0f;
         for (projection::u64 k = 0; k < SEISMIC_DIM_K; ++k) {
-            const projection::u32 position = (projection::u32)inv_row[k];
-            const projection::u32 bucket = position / tile32;
-            const projection::u32 lane = position - bucket * tile32;
+            const projection::u32 position = (projection::u32)__ldg(&inv_row[k]);
+            projection::u32 bucket, lane;
+            tile_div.divmod(position, bucket, lane);
             const projection::u64 base = (projection::u64)bucket * block_stride + (projection::u64)lane * lane_stride + n;
             const projection::u8 *address = expert_output + base * Act::bytes;
             const float2 projected = ((reinterpret_cast<projection::u64>(address) & 3u) == 0u)
                                          ? Act::unpack2(*reinterpret_cast<const projection::u32 *>(address))
                                          : make_float2(element::at<Act>(expert_output, base),
                                                        element::at<Act>(expert_output, base + 1));
-            const float score = score_row[k];
+            const float score = __ldg(&score_row[k]);
             selected0 = __fmaf_rn(score, projected.x, selected0);
             selected1 = __fmaf_rn(score, projected.y, selected1);
         }
-        const float coeff = coefficient[m];
         projection::routed_join_pair<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(
             out.offset(m * out_stride), residual + m * residual_stride, inject + m * inject_stride, SEISMIC_DIM_H, n,
             selected0, selected1, Act::round(a0) * coeff, Act::round(a1) * coeff);
@@ -143,8 +171,8 @@ __global__ void routed_combine_down(SEISMIC_KERNEL_PARAMS) {
         return;
     const CombineEpi epi{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0,
-                         SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_OUTPUT), SEISMIC_DIM_T, SEISMIC_EXPERT_OUTPUT_STRIDE_0,
-                         SEISMIC_EXPERT_OUTPUT_STRIDE_1,
+                         SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_OUTPUT), FastDiv32::make((projection::u32)SEISMIC_DIM_T),
+                         SEISMIC_EXPERT_OUTPUT_STRIDE_0, SEISMIC_EXPERT_OUTPUT_STRIDE_1,
                          reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_INVERSE)), SEISMIC_INVERSE_STRIDE_0,
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)), SEISMIC_SCORES_STRIDE_0,
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT)),

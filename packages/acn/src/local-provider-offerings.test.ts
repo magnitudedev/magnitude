@@ -250,6 +250,7 @@ describe("local provider offerings", () => {
       preparation: {
         discovery: { complete: true, modelsFound: 1 },
         assessment: { complete: true, settledModels: 1, totalModels: 1 },
+        measurement: { _tag: "Measured" },
       },
       models: [model],
       unsupported: [],
@@ -262,12 +263,14 @@ describe("local provider offerings", () => {
       preparation: {
         discovery: { complete: true, modelsFound: 1 },
         assessment: { complete: false, settledModels: 0, totalModels: 1 },
+        measurement: { _tag: "Measured" },
       },
     }))).toBe(false)
     expect(localProviderOfferingsReady(state({
       preparation: {
         discovery: { complete: true, modelsFound: 1 },
         assessment: { complete: false, settledModels: 0, totalModels: 1 },
+        measurement: { _tag: "Measured" },
       },
     }))).toBe(false)
   })

@@ -407,7 +407,7 @@ fn give_up(core: &mut Core, prefetch: &Prefetch, shared: &Shared, (layer, expert
         None => free(),
         Some(Posting { mut ticket, join }) => {
             ticket.cancel();
-            join.claimed(move |_, _, _| {
+            join.claimed(move |_, _| {
                 // Every request of the ticket has ended: dropping it waits
                 // for none.
                 drop(ticket);

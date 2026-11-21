@@ -289,6 +289,37 @@ __device__ __forceinline__ void store_rows(const Operands &in, const element::Ou
         state_row(in, bank, head, row0 + r).put_span(lane * COLUMNS, rows.values[r]);
 }
 
+// Loads `COLUMNS` contiguous F32 elements from `src` at `offset`, using
+// 16-byte vector loads when `COLUMNS % 4 == 0` and the address is 16-byte
+// aligned, with scalar fallback otherwise.
+__device__ __forceinline__ void load_f32_columns(const element::Stored<element::F32> &src, u64 offset,
+                                                 float (&out)[COLUMNS]) {
+    if constexpr (COLUMNS % 4 == 0) {
+        const u8 *address = src.bytes(offset);
+        if ((reinterpret_cast<u64>(address) & 15u) == 0) {
+            element::f32_span<COLUMNS>(reinterpret_cast<const float *>(address), out);
+            return;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < COLUMNS; ++c) out[c] = src.at(offset + c);
+}
+
+// Stores `COLUMNS` contiguous F32 elements to `dst` at `offset`, using
+// 16-byte vector stores when `COLUMNS % 4 == 0` and the address is 16-byte
+// aligned, with scalar fallback otherwise.
+__device__ __forceinline__ void store_f32_columns(const element::Out<element::F32> &dst, u64 offset,
+                                                  const float (&values)[COLUMNS]) {
+    if constexpr (COLUMNS % 4 == 0) {
+        if ((reinterpret_cast<u64>(dst.stored(offset)) & 15u) == 0) {
+            dst.put_span<COLUMNS>(offset, values);
+            return;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < COLUMNS; ++c) dst.put(offset + c, values[c]);
+}
+
 // The rows of the slot's source version: the bank's state advanced by its
 // first `taped` tape rows with the step's update, so the bits equal a run that
 // published after those rows.
@@ -303,8 +334,7 @@ __device__ __forceinline__ void load_version(const Operands &in, const Slot &slo
         const element::Stored<element::F32> tape = tape_row(in, slot.tape, entry);
         const float decay = tape.at(TAPE_D + head);
         float b[COLUMNS];
-#pragma unroll
-        for (int c = 0; c < COLUMNS; ++c) b[c] = tape.at(TAPE_B + group * N + lane * COLUMNS + c);
+        load_f32_columns(tape, static_cast<u64>(TAPE_B + group * N + lane * COLUMNS), b);
 #pragma unroll
         for (int r = 0; r < LANE_ROWS; ++r) {
             const float input = tape.at(TAPE_U + head * P + row0 + r);
@@ -417,8 +447,7 @@ __device__ __forceinline__ void advance_rows(const Operands &in, const Slot &slo
             const element::Out<element::F32> entry =
                 recording ? tape_row(in, slot.next_tape, row - publish) : element::Out<element::F32>(nullptr);
             if (recording && records_b) {
-#pragma unroll
-                for (int j = 0; j < COLUMNS; ++j) entry.put(TAPE_B + group * N + lane * COLUMNS + j, b[j]);
+                store_f32_columns(entry, static_cast<u64>(TAPE_B + group * N + lane * COLUMNS), b);
             }
             if (recording && records && lane == 0)
                 entry.put(TAPE_D + head, decay);
@@ -445,7 +474,8 @@ __device__ __forceinline__ void advance_rows(const Operands &in, const Slot &slo
             if (row + 1 == publish)
                 store_rows<LANE_ROWS>(in, slot.next_state, head, row0, lane, rows);
         }
-        __syncthreads();
+        // The next span restages the shared rows.
+        if (first + SPAN < slot.hi) __syncthreads();
     }
 }
 

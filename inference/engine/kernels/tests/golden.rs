@@ -2565,7 +2565,10 @@ fn configurations(
                 .collect::<Vec<_>>()
         })
         .filter(
-            |config| match native.validate(&specialization(statics, config)) {
+            |config| match native
+                .at_device(&seismic::device::BackendFloor(native.backend))
+                .validate(&specialization(statics, config))
+            {
                 Ok(_) => true,
                 Err(error) => {
                     if std::env::var_os("GOLDEN_VERBOSE").is_some() {

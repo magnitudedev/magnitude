@@ -281,32 +281,59 @@ fn the_minimum_is_what_progress_holds_at_once() {
     assert_eq!((linked.records_at(0, 11), linked.records_at(1, 1)), (37 * 11, 3));
 }
 
-/// The lent conveyors lie in their carriers' lent records
-/// (`RecordForm::carrier`) end to end, each pool from the first byte past
-/// the last that its layout's alignment admits, and each carrier's bytes
-/// end where its last pool's last record does.
+/// All staging pools carried by the same tensor share one conveyor region
+/// starting at offset 0 (mirroring `ScratchLayout`), so each carrier's bytes
+/// equal `records * max_pool_record_bytes` rather than the sum across pools.
 #[test]
-fn the_lent_conveyors_lie_end_to_end_in_their_carriers() {
+fn the_lent_conveyors_share_one_region_in_their_carriers() {
     let plan = restructured(bank(&[37, 3], 64), |host, groups| {
         *host = HostTier::Unified(Parking::InKernels);
-        // The lender stores down in Q5_K and holds it in Q4_K, so a Q5_K
-        // conveyor follows the Q4_K one in down's carrier.
+        // Mixed-quant down tensors across groups: Q5_K and Q6_K beside Q4_K.
         groups[0].record.down = tensor("gguf_q5_k", "q4k");
     });
     let pools = plan.staging_pools().0;
     let form = plan.form();
-    let records = plan.widest().get();
+    let records = plan.conveyor_records();
     let conveyor = plan.structure().conveyor_layout(&pools, records).unwrap();
-    let mut end = [0u64; 3];
+    let mut max_end = [0u64; 3];
     for (pool, &offset) in pools.iter().zip(&conveyor.offsets) {
-        let (_, alignment) = seismic::Tensor::canonical_layout(pool.source, &[records, pool.matrix[0], pool.matrix[1]]).unwrap();
-        let end = &mut end[form.carrier(pool.kind) as usize];
-        assert_eq!(offset, end.next_multiple_of(alignment.max(1)));
-        *end = offset + records * pool.record_bytes().unwrap();
+        assert_eq!(offset, 0, "every pool shares its carrier from offset 0");
+        let end = &mut max_end[form.carrier(pool.kind) as usize];
+        *end = (*end).max(records * pool.record_bytes().unwrap());
     }
     for (kind, &bytes) in conveyor.bytes.iter() {
-        assert_eq!(bytes, end[kind as usize], "{kind:?}'s conveyors end at their last record");
+        assert_eq!(bytes, max_end[kind as usize], "{kind:?}'s conveyor reaches its largest pool's records");
     }
+}
+
+/// Multi-quant (`P >= 3` staging pools on one carrier) shares one slot array
+/// (`total_bytes == conveyor_records * max_pool_record_bytes`, not `P * ...`)
+/// and `HostTier::Linked` uses `2 * round_records` (not `widest`).
+#[test]
+fn multi_quant_conveyor_shares_one_slot_array_and_linked_uses_two_rounds() {
+    let base = bank(&[37, 3], 64);
+    let plan = restructured(base, |host, _| {
+        *host = HostTier::Linked;
+    });
+    assert_eq!(plan.conveyor_records(), (2 * plan.round_records()).min(plan.window_slots()));
+    assert!(plan.conveyor_records() < plan.widest().get(), "linked uses 2 * round_records, not widest");
+    let q4 = tensor("gguf_q4_k", "q4k");
+    let q5 = tensor("gguf_q5_k", "q4k");
+    let q6 = tensor("gguf_q6_k", "q6k");
+    let pools = vec![
+        StagingPool::of(RoutedTensor::Gate, q4),
+        StagingPool::of(RoutedTensor::Up, q4),
+        StagingPool::of(RoutedTensor::Down, q4),
+        StagingPool::of(RoutedTensor::Down, q5),
+        StagingPool::of(RoutedTensor::Down, q6),
+    ];
+    let records = plan.conveyor_records();
+    let layout = plan.structure().conveyor_layout(&pools, records).unwrap();
+    assert_eq!(layout.offsets, vec![0; pools.len()]);
+    let max_down = q4.stored_bytes().unwrap().max(q5.stored_bytes().unwrap()).max(q6.stored_bytes().unwrap());
+    let sum_down = q4.stored_bytes().unwrap() + q5.stored_bytes().unwrap() + q6.stored_bytes().unwrap();
+    assert_eq!(layout.bytes.gate, Some(records * max_down));
+    assert!(layout.bytes.gate.unwrap() < records * sum_down, "3 down pools share one slot array, not end-to-end");
 }
 
 /// A bank's granule holds a record of every group, a slab of its regions
@@ -1047,17 +1074,18 @@ fn the_conveyor_lies_in_the_store_the_host_reads_into() {
     // Gate and up have one stored form, down two: Q4_K then Q6_K.
     let q4 = tensor("gguf_q4_k", "q4k").stored_bytes().unwrap();
     let q6 = tensor("gguf_q6_k", "q6k").stored_bytes().unwrap();
-    // Beside a host tier a whole layer; on the one store two rounds.
-    assert_eq!((discrete.conveyor_records(), unified.conveyor_records()), (256, 2 * unified.round_records()));
+    // Both linked and unified use two rounds' records bounded by window_slots.
+    let expected = (2 * unified.round_records()).min(unified.window_slots());
+    assert_eq!((discrete.conveyor_records(), unified.conveyor_records()), (expected, expected));
     for plan in [&discrete, &unified] {
         let records = plan.conveyor_records();
         let conveyor = plan.conveyor();
         assert_eq!(conveyor.carrier.lender().group, 0, "the group of the most experts lends");
         // Each tensor's conveyor in the next tensor's records: gate's in
-        // up's, up's in down's, down's in gate's.
+        // up's, up's in down's, down's in gate's, pools sharing offset 0.
         assert_eq!(
             conveyor.conveyor.bytes,
-            RecordTensors { gate: Some(records * (q4 + q6)), up: records * q4, down: records * q4 }
+            RecordTensors { gate: Some(records * q4.max(q6)), up: records * q4, down: records * q4 }
         );
         assert_eq!(plan.binding(0).unwrap().conveyor, records);
     }

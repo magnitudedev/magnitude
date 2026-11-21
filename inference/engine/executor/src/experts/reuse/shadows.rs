@@ -433,6 +433,12 @@ impl Shadows {
             shadow.pools.fit(group, records);
             shadow.time.lock().resized(group, Tier::Compute, records as u64);
         }
+        // Additive deltas `Δ = U_real − U_shadow` measured at the previous slot
+        // count are invalid after a resize; clearing them returns unexecuted
+        // depths to `Needed::Shadow(U_shadow(k))` priced at the new bank size.
+        self.deltas = std::array::from_fn(|_| std::array::from_fn(|_| horizon::Aged::new(0)));
+        self.pending_reentry = [[None; DEPTHS]; 2];
+        self.last_executed = None;
     }
 
     /// Log `logged` as the ranking logged it, its step at `clock`: a read of a
@@ -773,5 +779,35 @@ mod tests {
             },
         };
         assert_eq!(gap.needed(), 0.0);
+    }
+
+    /// Resizing the bank invalidates additive `Δ = U_real − U_shadow` measured
+    /// at the previous slot count, so `Shadows::resize` clears `deltas` and
+    /// `pending_reentry`, returning unexecuted depths to `Delta::Unmeasured`
+    /// (`Needed::Shadow(U_shadow(k))` at the new bank size).
+    #[test]
+    fn resize_clears_stale_deltas_and_pending_reentry() {
+        let mut shadows = Shadows::new(&[8], &[0], &[2]);
+        feed_cycle(&mut shadows, 1..=20, 4, 8);
+        let u1 = shadows.misses()[1].expect("depth 1 shadow");
+        let u0 = shadows.misses()[0].expect("depth 0 shadow");
+        shadows.executed(true, 1, u1 + 4.0, 0, Tokens::new(10.0));
+        shadows.executed(false, 0, u0, 0, Tokens::new(11.0));
+        // Re-enter verify depth 1 to arm `pending_reentry`.
+        shadows.executed(true, 1, u1 + 4.0, 0, Tokens::new(12.0));
+        assert!(matches!(shadows.gaps(0, Tokens::new(12.0))[1][1].unwrap().delta, Delta::Measured { .. }));
+        assert!(shadows.pending_reentry[1][1].is_some());
+
+        // Resize group 0 from 2 to 4 slots.
+        shadows.read_log(vec![ShadowFeed::Resize { group: 0, records: 4 }]);
+        assert!(shadows.pending_reentry.iter().flatten().all(Option::is_none));
+        assert!(shadows.last_executed.is_none());
+
+        // After new steps at the larger bank size, previously measured deltas
+        // are unmeasured (`Delta::Unmeasured`) instead of carrying the old +4.0.
+        feed_cycle(&mut shadows, 21..=35, 4, 8);
+        let gaps = shadows.gaps(1, Tokens::new(30.0));
+        assert_eq!(gaps[1][1].expect("verify depth 1").delta, Delta::Unmeasured);
+        assert_eq!(gaps[0][0].expect("front depth 0").delta, Delta::Unmeasured);
     }
 }

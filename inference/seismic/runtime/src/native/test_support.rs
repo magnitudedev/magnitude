@@ -4,14 +4,14 @@
 
 use super::plan::{self, ParameterAddress, PlanError};
 use super::search::LaunchKey;
-use seismic_lang::checked::{NativeImplementation, NativeSpecialization, SourceFile, SourceSet};
+use seismic_lang::checked::{NativeSpecialization, OnDevice, SourceFile, SourceSet};
 use seismic_lang::registry::BackendName;
 use std::cell::Cell;
 
 /// The Metal implementation of a one-entry module whose native declaration
 /// body is `body`, checked with a source whose kernels take no template
 /// parameters.
-pub(crate) fn declared(body: &str) -> NativeImplementation {
+pub(crate) fn declared(body: &str) -> OnDevice {
     let module = seismic_lang::native_source::check_fixture(
         SourceSet::new(vec![SourceFile {
             path: "scale.seismic".into(),
@@ -26,7 +26,7 @@ pub(crate) fn declared(body: &str) -> NativeImplementation {
     module
         .native_implementation(module.entries()[0].id, BackendName::Metal)
         .unwrap()
-        .clone()
+        .at_device(&seismic_lang::device::BackendFloor(BackendName::Metal))
 }
 
 /// V4.1's Metal attention_decode parameters as declared, restricted as

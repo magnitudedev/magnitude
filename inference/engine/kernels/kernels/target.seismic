@@ -75,8 +75,9 @@ fn embedding_rows[M, V, D, R, F](table: &tensor[V, D] EW, tokens: &tensor[M, 2] 
                 embedded[row, column] = 0.0
     return embedded, f32(embedded)
 
-# Metal: 256 threads, each decoding whole 32-value rows16 packets. (CUDA: 128
-# threads over mma16 lane chunks.)
+# Metal: 256 threads (8 simdgroups), each simdgroup cooperatively decoding
+# 32-value rows16/rows32 packets (<seismic/gather.h>). (CUDA: 128 threads
+# over mma16 lane chunks.)
 native embedding_rows for metal from "metal/embedding_rows.metal":
     static (D)
     launch embedding_rows:
@@ -100,12 +101,12 @@ fn conditioning_overlay[M, D](input: &tensor[M, D] f32, out: &mut tensor[M, D] f
 
 native conditioning_overlay for metal from "metal/conditioning_overlay.metal":
     launch conditioning_overlay:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threadgroups (ceil_div(D, 1024), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native conditioning_overlay for cuda from "cuda/conditioning_overlay.cu":
     launch conditioning_overlay:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threadgroups (ceil_div(D, 1024), min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)
 
 # Vulkan: the RMS inverse is a launch of its own (it returns at once when
@@ -231,12 +232,12 @@ fn feature_copy[M, D](input: &tensor[M, D] A, out: &mut tensor[M, D] A):
 
 native feature_copy for metal from "metal/feature_copy.metal":
     launch feature_copy:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threadgroups (ceil_div(M * ceil_div(D, max(1, 16 / max(1, dense_bytes(A)))), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native feature_copy for cuda from "cuda/feature_copy.cu":
     launch feature_copy:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threadgroups (ceil_div(M * ceil_div(D, max(1, 16 / max(1, dense_bytes(A)))), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native feature_copy for vulkan from "vulkan/feature_copy.comp":

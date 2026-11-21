@@ -27,6 +27,7 @@ pub use super::admission::{
     Reselection, Violation, admit, governing_ratio, reselect,
 };
 use super::budget::{Footprint, Linear, Observed, PointPrices, Quote};
+use seismic_lang::checked::OnDevice;
 pub use super::comparison::{
     COMPARISON_VERSION, Difference, StepPower, SubjectComparison, SubjectMeasurement,
 };
@@ -92,11 +93,11 @@ pub struct PointSpec {
     pub census: bool,
 }
 
-fn discovery_selected(specs: &[PointSpec], index: usize) -> bool {
-    if specs.iter().any(|spec| spec.census) {
-        specs[index].census
+fn discovery_selected(points: &[PointState], index: usize) -> bool {
+    if points.iter().any(|point| point.spec.census) {
+        points[index].spec.census
     } else {
-        specs[index].weight > 0.0
+        points[index].spec.weight > 0.0
     }
 }
 
@@ -1139,7 +1140,7 @@ struct Formation<'s, 'm> {
     logical: &'s Arc<LogicalEntry>,
     bindings: &'s ElementBindings,
     cpu: Option<&'static CpuNativeKernels>,
-    implementation: &'s NativeImplementation,
+    implementation: &'s OnDevice,
     /// The unit's defaults: what a launch's source is rendered at.
     default: &'s NativeSpecialization,
     /// The served shapes beyond the points' ([`PointSource::served`]).
@@ -1147,25 +1148,6 @@ struct Formation<'s, 'm> {
     /// What formations of this unit took: the one price of every formation
     /// of it, wherever it is quoted.
     price: &'s Mutex<FormationPrice>,
-}
-
-/// The formation of a unit ([`UnitSearch`]), read field by field: what
-/// forms into the unit's programs borrows them apart from it.
-macro_rules! formation {
-    ($unit:expr) => {
-        Formation {
-            charges: &$unit.charges,
-            module: $unit.module,
-            entry: $unit.entry,
-            logical: &$unit.logical,
-            bindings: &$unit.bindings,
-            cpu: $unit.cpu,
-            implementation: &$unit.implementation,
-            default: &$unit.default,
-            served: &$unit.served,
-            price: &$unit.formation_price,
-        }
-    };
 }
 
 /// What one formation call of a unit's challengers forms: the launch
@@ -1443,14 +1425,21 @@ impl UnitSearch<'_, '_> {
     /// writes nothing.
     pub fn inputs_built(&self) -> Quote {
         let resident: Box<dyn Iterator<Item = usize> + '_> = match &self.progress {
-            Progress::Discovering(slots) => Box::new(
+            Progress::Ungrounded { .. } => return Quote::default(),
+            Progress::Grounded {
+                phase: SearchPhase::Discovering { slots, .. },
+                ..
+            } => Box::new(
                 slots
                     .iter()
                     .enumerate()
                     .filter(|(_, timed)| timed.as_ref().is_some_and(|timed| timed.point.resident()))
                     .map(|(index, _)| index),
             ),
-            Progress::Searching(searching) => Box::new(
+            Progress::Grounded {
+                phase: SearchPhase::Searching(searching),
+                ..
+            } => Box::new(
                 searching
                     .timed
                     .iter()
@@ -1462,7 +1451,7 @@ impl UnitSearch<'_, '_> {
         };
         let mut built = Quote::default();
         for index in resident {
-            built.add(self.builds[index].price(), 1);
+            built.add(self.points[index].build.price(), 1);
         }
         built
     }
@@ -1620,7 +1609,7 @@ impl<'m> Formation<'_, 'm> {
             bindings: self.bindings.clone(),
             default: self.default.clone(),
             cpu: self.cpu,
-            implementation: self.implementation.clone(),
+            implementation: self.implementation.implementation().clone(),
             served: self.served.to_vec(),
             work: formables
                 .into_iter()
@@ -2548,7 +2537,7 @@ impl Keying {
 /// configurations, and a change is forecast to run the launches the
 /// configuration it changes ran.
 struct Declared<'s> {
-    implementation: &'s NativeImplementation,
+    implementation: &'s OnDevice,
     keying: &'s Keying,
 }
 
@@ -3290,7 +3279,7 @@ impl Ledger {
 struct ScopeQualification<'s, 'a> {
     deadline: Deadline,
     source: &'s mut dyn PointSource<'a>,
-    specs: &'s [PointSpec],
+    points: &'s mut [PointState],
     indices: &'s [usize],
     validator: &'s Validator,
     /// The artifacts admitted at every untimed witness.
@@ -3299,8 +3288,6 @@ struct ScopeQualification<'s, 'a> {
     /// The key of the checked configuration at a point where the given
     /// launches work.
     key: &'s dyn Fn(Vec<usize>) -> LaunchKey,
-    /// The whole check of each untimed point, by point: its class.
-    checks: &'s mut [Observed],
     building_seconds: f64,
     validating_seconds: f64,
     reference_seconds: f64,
@@ -3320,13 +3307,12 @@ impl ScopeQualification<'_, '_> {
         }
         for &index in self.indices {
             self.deadline.check(Duration::ZERO)?;
-            let spec = &self.specs[index];
             let began = Instant::now();
             let built = self.source.build(index);
             self.building_seconds += began.elapsed().as_secs_f64();
             let result = (|| {
                 let inputs = built.map_err(Exclusion::from)?;
-                let mut point = TuningPoint::new(spec, inputs)
+                let mut point = TuningPoint::new(&self.points[index].spec, inputs)
                     .and_then(|point| self.validator.point(point))
                     .map_err(|error| Exclusion::Execution(error.to_string()))?;
                 let validating = Instant::now();
@@ -3340,7 +3326,7 @@ impl ScopeQualification<'_, '_> {
                 admitted
             })();
             self.source.release(index);
-            self.checks[index].observe(began.elapsed().as_secs_f64());
+            self.points[index].check.observe(began.elapsed().as_secs_f64());
             result?;
         }
         self.covered.insert(artifact.clone());
@@ -3446,16 +3432,81 @@ struct Timed<'a> {
     shape: PointShape,
 }
 
-/// How far a unit's optional work is.
+/// Per-point specification and observed operation classes for a unit.
+struct PointState {
+    spec: PointSpec,
+    /// Building this point's inputs: its class.
+    build: Observed,
+    /// The whole check of this untimed point: its class.
+    check: Observed,
+    /// What making this point's inputs resident added to the bytes held:
+    /// its class, observed when the point is discovered and whenever its
+    /// inputs are built again.
+    resident_bytes: Observed,
+}
+
+impl PointState {
+    fn new(spec: PointSpec) -> Self {
+        Self {
+            spec,
+            build: Observed::default(),
+            check: Observed::default(),
+            resident_bytes: Observed::default(),
+        }
+    }
+}
+
+/// Cached result of [`UnitSearch::next`], together with the formation
+/// classes its compile quote read so external cache changes invalidate it.
+enum OfferCache {
+    Stale,
+    Cached {
+        work: Option<Work>,
+        forming: Vec<(Formable, Formative)>,
+    },
+}
+
+/// Which leader a conversion piece acts on.
+#[derive(Clone, Copy)]
+enum Conversion {
+    Promote,
+    Confirm,
+}
+
+/// How far a unit's tuning has progressed.
 enum Progress<'a> {
-    /// Measuring the defaults: each point's slot, by its position among
-    /// the unit's points.
-    Discovering(Vec<Option<Timed<'a>>>),
+    /// Opened, before canonical defaults are formed and handed to serving.
+    Ungrounded {
+        plan: Option<UnitPlan>,
+    },
+    /// Canonical defaults are formed and served; optional work advances
+    /// through discovery and then search.
+    Grounded {
+        ground: Ground,
+        /// Whether a deadline cut off optional work; no further work is
+        /// offered, while the served choice and completed evidence remain
+        /// readable ([`UnitSearch::terminal`], [`UnitSearch::release`]).
+        expired: bool,
+        phase: SearchPhase<'a>,
+    },
+}
+
+/// How far a grounded unit's optional work is.
+enum SearchPhase<'a> {
+    /// Measuring the defaults: the surveyor, optional search plan, and each
+    /// point's slot by its position among the unit's points.
+    Discovering {
+        plan: Option<UnitPlan>,
+        surveyor: PointSurveyor,
+        slots: Vec<Option<Timed<'a>>>,
+    },
     Searching(Box<Searching<'a>>),
 }
 
 /// A unit searching at its timed points.
 struct Searching<'a> {
+    /// How the unit's search measures and searches.
+    plan: UnitPlan,
     /// The timed points. Each keeps what was learned at it; its inputs are
     /// resident only while the unit's work uses them
     /// ([`UnitSearch::release`]).
@@ -3585,7 +3636,6 @@ struct Run {
 /// - [`Stage::Confirm`]: more matched rounds for the leader among those
 ///   whose lead is nominal, and its conversion if they resolve it.
 pub struct UnitSearch<'m, 'a> {
-    expired: bool,
     charges: Charges,
     module: &'m CheckedModule,
     entry: EntryId,
@@ -3593,40 +3643,28 @@ pub struct UnitSearch<'m, 'a> {
     statics: NativeSpecialization,
     cpu: Option<&'static CpuNativeKernels>,
     backend: seismic_lang::registry::BackendName,
-    implementation: NativeImplementation,
+    implementation: OnDevice,
     logical: Arc<LogicalEntry>,
     mutable: Vec<(usize, String)>,
     default: NativeSpecialization,
     unit: Unit,
-    /// The unit's points, once a step was given their source.
-    specs: Vec<PointSpec>,
+    /// The unit's points and their per-point observed classes, once a step
+    /// was given their source.
+    points: Vec<PointState>,
     /// The served shapes beyond the points', learned with them.
     served: Vec<BTreeMap<String, u64>>,
-    ground: Option<Ground>,
     /// The programs the unit has formed, the canonical program's among
     /// them from when it is formed: their one owner, whoever forms them.
     programs: Programs,
-    /// Measures the defaults as points are discovered; none once the
-    /// search is open, which places into its own result storage.
-    surveyor: Option<PointSurveyor>,
     /// The device's sustained clock, shared by all tuning units on the same
     /// device so it is established once per load instead of once per unit.
     clock: ClockSlot,
-    plan: Option<UnitPlan>,
     progress: Progress<'a>,
-    /// Building each point's inputs, by point: its class.
-    builds: Vec<Observed>,
-    /// The whole check of each untimed point, by point: its class.
-    checks: Vec<Observed>,
     /// Measuring the defaults at one discovery point: its class.
     discovering: Observed,
     /// The longest planning of the search: an operation of no repeated
     /// class.
     longest: f64,
-    /// What making each point's inputs resident added to the bytes held,
-    /// by point: its class, observed when the point is discovered and
-    /// whenever its inputs are built again.
-    resident_bytes: Vec<Observed>,
     /// What measuring one challenger added at its most to the bytes held
     /// with the unit's inputs resident, and what one conversion did: the
     /// classes a challenger piece's and a conversion's bytes are priced by.
@@ -3652,11 +3690,10 @@ pub struct UnitSearch<'m, 'a> {
     forming: f64,
     replanning: f64,
     releasing: f64,
-    /// The next piece of work as last derived ([`UnitSearch::next`]); none
+    /// The next piece of work as last derived ([`UnitSearch::next`]); stale
     /// since the unit's state last changed. With it, what each formation
     /// its price read does as it was read then.
-    offered: std::cell::Cell<Option<Option<Work>>>,
-    offered_forming: std::cell::RefCell<Vec<(Formable, Formative)>>,
+    offer: std::cell::RefCell<OfferCache>,
 }
 
 impl<'m, 'a> UnitSearch<'m, 'a> {
@@ -3710,7 +3747,6 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let launch_scoped = implementation.launch_scoped();
         let clock = shared_clock(device);
         Ok(Self {
-            expired: false,
             unit: Unit {
                 tuning_identity: device.tuning_identity(),
                 entry: entry_name,
@@ -3726,28 +3762,17 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             statics,
             cpu,
             backend,
-            surveyor: Some(PointSurveyor::with_clock(
-                &implementation,
-                true,
-                charges,
-                clock.clone(),
-            )),
             clock,
-            implementation: implementation.into_implementation(),
+            implementation,
             logical,
             mutable,
             default,
-            specs: Vec::new(),
+            points: Vec::new(),
             served: Vec::new(),
-            ground: None,
             programs: Programs::of(launch_scoped),
-            plan: None,
-            progress: Progress::Discovering(Vec::new()),
-            builds: Vec::new(),
-            checks: Vec::new(),
+            progress: Progress::Ungrounded { plan: None },
             discovering: Observed::default(),
             longest: 0.,
-            resident_bytes: Vec::new(),
             measure_bytes: Observed::default(),
             conversion_bytes: Observed::default(),
             largest_bytes: None,
@@ -3756,24 +3781,45 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             forming: 0.,
             replanning: 0.,
             releasing: 0.,
-            offered: std::cell::Cell::new(None),
-            offered_forming: std::cell::RefCell::default(),
+            offer: std::cell::RefCell::new(OfferCache::Stale),
         })
+    }
+
+    fn invalidate_offer(&mut self) {
+        *self.offer.get_mut() = OfferCache::Stale;
+    }
+
+    fn ground(&self) -> Option<&Ground> {
+        match &self.progress {
+            Progress::Ungrounded { .. } => None,
+            Progress::Grounded { ground, .. } => Some(ground),
+        }
+    }
+
+    fn searching(&self) -> Option<&Searching<'a>> {
+        match &self.progress {
+            Progress::Grounded {
+                phase: SearchPhase::Searching(searching),
+                ..
+            } => Some(searching),
+            _ => None,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        matches!(self.progress, Progress::Grounded { expired: true, .. })
     }
 
     /// Learn the unit's points from `source`, at the first step given one.
     fn describe(&mut self, source: &dyn PointSource<'a>) -> Result<(), TuneError> {
-        if self.specs.is_empty() {
-            self.specs = source.points();
-            if self.specs.is_empty() {
+        if self.points.is_empty() {
+            let specs = source.points();
+            if specs.is_empty() {
                 return Err(TuneError::NoPoints);
             }
             self.served = source.served();
-            self.progress = Progress::Discovering(self.specs.iter().map(|_| None).collect());
-            self.offered.set(None);
-            self.builds = vec![Observed::default(); self.specs.len()];
-            self.checks = vec![Observed::default(); self.specs.len()];
-            self.resident_bytes = vec![Observed::default(); self.specs.len()];
+            self.points = specs.into_iter().map(PointState::new).collect();
+            self.invalidate_offer();
         }
         Ok(())
     }
@@ -3798,7 +3844,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         source: &dyn PointSource<'a>,
     ) -> Result<Option<Grounding<'m>>, TuneError> {
         self.describe(source)?;
-        Ok(self.ground.is_none().then(|| Grounding {
+        Ok(matches!(self.progress, Progress::Ungrounded { .. }).then(|| Grounding {
             charges: self.charges.clone(),
             module: self.module,
             entry: self.entry,
@@ -3806,7 +3852,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             bindings: self.bindings.clone(),
             default: self.default.clone(),
             cpu: self.cpu,
-            implementation: self.implementation.clone(),
+            implementation: self.implementation.implementation().clone(),
             served: self.served.clone(),
         }))
     }
@@ -3826,14 +3872,33 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .hand_off()
             .map_err(|error| TuneError::Handoff(error.to_string()))?;
         self.programs.grounded(&self.implementation, &self.default, &kernel);
-        self.ground = Some(Ground { kernel, validator });
         self.time.forming_seconds += grounded.elapsed.as_secs_f64();
         // Every launch of the canonical program, or the one program.
         self.formation_price
             .get_mut()
             .expect("formation price lock")
             .canonical = grounded.elapsed;
-        self.offered.set(None);
+        let plan = match &mut self.progress {
+            Progress::Ungrounded { plan } => plan.take(),
+            Progress::Grounded { .. } => panic!("canonical defaults were already prepared"),
+        };
+        let surveyor = PointSurveyor::with_clock(
+            &self.implementation,
+            true,
+            &self.charges,
+            self.clock.clone(),
+        );
+        let slots = self.points.iter().map(|_| None).collect();
+        self.progress = Progress::Grounded {
+            ground: Ground { kernel, validator },
+            expired: false,
+            phase: SearchPhase::Discovering {
+                plan,
+                surveyor,
+                slots,
+            },
+        };
+        self.invalidate_offer();
         Ok(())
     }
 
@@ -3848,7 +3913,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// (6 s on an EPYC 9V45 tuning gemma-4-e2b), and every unit's first
     /// piece waited behind that forecast while a unit whose formation had
     /// been observed took the device for the rest of the minute.
-    fn compiled_ahead(&self, searching: &Searching<'a>, piece: &Piece) -> Vec<Formable> {
+    fn compiled_ahead(&self, piece: &Piece) -> Vec<Formable> {
         let formation = self.formation();
         self.programs
             .formables(&self.implementation, piece.challengers(), piece.ahead())
@@ -3862,21 +3927,19 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// device does other work; none when the piece compiles nothing ahead.
     /// The piece then forms nothing ([`UnitSearch::formed`]).
     pub fn forming(&self) -> Option<Forming<'m>> {
-        let Progress::Searching(searching) = &self.progress else {
-            return None;
-        };
+        let searching = self.searching()?;
         if !matches!(self.next()?.stage, Stage::Form | Stage::Measure) {
             return None;
         }
         self.formation()
-            .forming(self.compiled_ahead(searching, searching.planned.as_ref()?))
+            .forming(self.compiled_ahead(searching.planned.as_ref()?))
     }
 
     /// Hold the programs of the next piece's compile, which ran
     /// ([`UnitSearch::forming`]). Returns what the compile took.
     pub fn formed(&mut self, formed: Formed) -> Result<Duration, TuneError> {
         assert!(
-            matches!(self.progress, Progress::Searching(_)),
+            self.searching().is_some(),
             "only a search's piece compiles ahead"
         );
         let elapsed = self.programs.hold(
@@ -3886,40 +3949,65 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 .expect("formation price lock"),
         )?;
         self.time.forming_seconds += elapsed.as_secs_f64();
-        self.offered.set(None);
+        self.invalidate_offer();
         Ok(elapsed)
     }
 
     /// How the unit's optional work measures and searches.
     pub fn plan(&mut self, plan: UnitPlan) {
-        // The same plan again changes nothing the unit offers.
-        if self.plan.as_ref() == Some(&plan) {
-            return;
+        match &mut self.progress {
+            Progress::Ungrounded { plan: slot }
+            | Progress::Grounded {
+                phase: SearchPhase::Discovering { plan: slot, .. },
+                ..
+            } => {
+                // The same plan again changes nothing the unit offers.
+                if slot.as_ref() == Some(&plan) {
+                    return;
+                }
+                *slot = Some(plan);
+            }
+            Progress::Grounded {
+                phase: SearchPhase::Searching(searching),
+                ..
+            } => {
+                if searching.plan == plan {
+                    return;
+                }
+                searching.ledger.settings(&plan.settings);
+                searching.plan = plan;
+            }
         }
-        if let Progress::Searching(searching) = &mut self.progress {
-            searching.ledger.settings(&plan.settings);
-        }
-        self.plan = Some(plan);
-        self.offered.set(None);
-    }
-
-    fn planned(&self) -> &UnitPlan {
-        self.plan
-            .as_ref()
-            .expect("a unit is given its plan before its optional work")
+        self.invalidate_offer();
     }
 
     fn formation(&self) -> Formation<'_, 'm> {
-        formation!(self)
+        Formation {
+            charges: &self.charges,
+            module: self.module,
+            entry: self.entry,
+            logical: &self.logical,
+            bindings: &self.bindings,
+            cpu: self.cpu,
+            implementation: &self.implementation,
+            default: &self.default,
+            served: &self.served,
+            price: &self.formation_price,
+        }
     }
 
     /// The timed points built so far.
-    fn points(&self) -> Box<dyn Iterator<Item = &PreparedPoint<'a>> + '_> {
+    fn prepared_points(&self) -> Box<dyn Iterator<Item = &PreparedPoint<'a>> + '_> {
         match &self.progress {
-            Progress::Discovering(slots) => {
-                Box::new(slots.iter().flatten().map(|timed| &timed.point))
-            }
-            Progress::Searching(searching) => Box::new(searching.points.iter()),
+            Progress::Ungrounded { .. } => Box::new(std::iter::empty()),
+            Progress::Grounded {
+                phase: SearchPhase::Discovering { slots, .. },
+                ..
+            } => Box::new(slots.iter().flatten().map(|timed| &timed.point)),
+            Progress::Grounded {
+                phase: SearchPhase::Searching(searching),
+                ..
+            } => Box::new(searching.points.iter()),
         }
     }
 
@@ -3940,21 +4028,21 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 .lock()
                 .expect("formation price lock")
                 .total(),
-            building: self.builds.iter().map(Observed::total).sum(),
-            checking: self.checks.iter().map(Observed::total).sum(),
+            building: self.points.iter().map(|point| point.build.total()).sum(),
+            checking: self.points.iter().map(|point| point.check.total()).sum(),
             forming: self.forming,
             replanning: self.replanning,
             releasing: self.releasing,
             ..Spent::default()
         };
-        for point in self.points() {
+        for point in self.prepared_points() {
             let prices = point.prices();
             spent.placing += prices.placement.total();
             spent.witnessing += prices.witness.total();
             spent.warming += prices.warm.total();
             spent.sampling += prices.sample.total();
         }
-        if let Progress::Searching(searching) = &self.progress {
+        if let Some(searching) = self.searching() {
             spent.planning = searching.planning.total();
         }
         spent
@@ -3977,12 +4065,14 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     pub fn release(&mut self, source: &mut dyn PointSource<'a>) {
         let exhausted = self.next().is_none();
         // A piece that follows builds the inputs again.
-        self.offered.set(None);
-        if let Some(surveyor) = &mut self.surveyor {
-            surveyor.outputs.release();
-        }
+        self.invalidate_offer();
         match &mut self.progress {
-            Progress::Discovering(slots) => {
+            Progress::Ungrounded { .. } => {}
+            Progress::Grounded {
+                phase: SearchPhase::Discovering { surveyor, slots, .. },
+                ..
+            } => {
+                surveyor.outputs.release();
                 for (index, timed) in slots.iter_mut().enumerate() {
                     if let Some(timed) = timed.as_mut().filter(|timed| timed.point.resident()) {
                         timed.point.release();
@@ -3990,7 +4080,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     }
                 }
             }
-            Progress::Searching(searching) => {
+            Progress::Grounded {
+                phase: SearchPhase::Searching(searching),
+                ..
+            } => {
                 for (point, index) in searching.points.iter_mut().zip(&searching.timed) {
                     if point.resident() {
                         point.release();
@@ -4012,7 +4105,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// seconds do not fit what remains, so that the last piece of a budget
     /// is the largest that fits it.
     pub fn narrow(&mut self) -> bool {
-        let Progress::Searching(searching) = &mut self.progress else {
+        let Progress::Grounded {
+            phase: SearchPhase::Searching(searching),
+            ..
+        } = &mut self.progress
+        else {
             return false;
         };
         let narrowed = match &mut searching.planned {
@@ -4028,14 +4125,14 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             _ => false,
         };
         if narrowed {
-            self.offered.set(None);
+            self.invalidate_offer();
         }
         narrowed
     }
 
     /// Whether any of the unit's points has its inputs resident.
     pub fn holds_inputs(&self) -> bool {
-        self.points().any(|point| point.resident())
+        self.prepared_points().any(|point| point.resident())
     }
 
     /// The allocations the unit's resident inputs bind, each once: its
@@ -4044,7 +4141,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// giving it up returns is for whoever holds every binding to say.
     pub fn bound_allocations(&self) -> Option<Vec<(u64, u64)>> {
         self.holds_inputs().then(|| {
-            self.points()
+            self.prepared_points()
                 .filter(|point| point.resident())
                 .flat_map(PreparedPoint::tensors)
                 .map(|tensor| tensor.allocation_bytes())
@@ -4071,9 +4168,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// programs of the served choice and of a leader are their kernels',
     /// not among these.
     pub fn programs_held(&self) -> usize {
-        match &self.progress {
-            Progress::Discovering(_) => 0,
-            Progress::Searching(_) => self.programs.holding(),
+        if self.searching().is_some() {
+            self.programs.holding()
+        } else {
+            0
         }
     }
 
@@ -4094,19 +4192,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// sees both across units.
     pub fn give_up_programs(&mut self) {
         self.programs.clear();
-        self.offered.set(None);
+        self.invalidate_offer();
     }
 
     /// The bytes held now ([`held_bytes`]).
     fn held(&self) -> u64 {
-        held_bytes(
-            self.charges.device(),
-            self.charges.device().allocated(),
-            self.ground
-                .as_ref()
-                .map_or(0, |ground| ground.validator.retained_bytes()),
-            ProcessMemory::footprint_now(),
-        )
+        held_with(&self.charges, self.ground())
     }
 
     /// The most a single piece of this unit's operations has added to the
@@ -4117,76 +4208,15 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         self.largest_bytes
     }
 
-    /// Build again the inputs of every timed point that gave its own up,
-    /// for the piece about to run. Each build is observed in its point's
-    /// classes, seconds and bytes: what the piece was quoted. False when
-    /// the device's memory limit refused a build ([`build_point`]): the
-    /// piece cannot run.
-    fn restore(
-        &mut self,
-        source: &mut dyn PointSource<'a>,
-        deadline: Deadline,
-    ) -> Result<bool, WorkError<TuneError>> {
-        let Self {
-            progress,
-            ground,
-            specs,
-            builds,
-            resident_bytes,
-            time,
-            charges,
-            ..
-        } = self;
-        let device = charges.device();
-        let Progress::Searching(searching) = progress else {
-            return Ok(true);
-        };
-        let validator = &ground
-            .as_ref()
-            .expect("canonical preparation precedes the search")
-            .validator;
-        let held = || {
-            held_bytes(
-                device,
-                device.allocated(),
-                validator.retained_bytes(),
-                ProcessMemory::footprint_now(),
-            )
-        };
-        for (point, &index) in searching.points.iter_mut().zip(&searching.timed) {
-            if point.resident() {
-                continue;
-            }
-            deadline.check(Duration::ZERO)?;
-            let before = held();
-            let building = Instant::now();
-            let Some(built_point) = build_point(
-                charges,
-                source,
-                &specs[index],
-                index,
-                &mut resident_bytes[index],
-            )?
-            else {
-                return Ok(false);
-            };
-            let built = building.elapsed().as_secs_f64();
-            builds[index].observe(built);
-            time.building_seconds += built;
-            validator.restore(point, built_point)?;
-            resident_bytes[index].observe(held().saturating_sub(before) as f64);
-        }
-        Ok(true)
-    }
-
     /// What making resident the timed points that are not costs the next
     /// piece: each one's building, in seconds and in bytes.
     fn rebuild(&self, searching: &Searching<'a>) -> (Quote, Footprint) {
         let (mut quote, mut footprint) = (Quote::default(), Footprint::default());
         for (point, index) in searching.points.iter().zip(&searching.timed) {
             if !point.resident() {
-                quote.add(self.builds[*index].price(), 1);
-                footprint.add(most_bytes(&self.resident_bytes[*index]), 1);
+                let state = &self.points[*index];
+                quote.add(state.build.price(), 1);
+                footprint.add(most_bytes(&state.resident_bytes), 1);
             }
         }
         (quote, footprint)
@@ -4196,27 +4226,15 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// [`Quote::fits`] holds an unpriced operation to.
     pub fn longest_operation(&self) -> Duration {
         let observed = self
-            .points()
+            .prepared_points()
             .map(|point| point.prices().longest())
-            .chain(self.builds.iter().map(Observed::longest))
-            .chain(self.checks.iter().map(Observed::longest))
+            .chain(self.points.iter().map(|point| point.build.longest()))
+            .chain(self.points.iter().map(|point| point.check.longest()))
             .chain([self.discovering.longest()])
-            .chain(match &self.progress {
-                Progress::Searching(searching) => Some(searching.planning.longest()),
-                Progress::Discovering(_) => None,
-            })
+            .chain(self.searching().map(|searching| searching.planning.longest()))
             .fold(self.longest, f64::max);
         let price = self.formation_price.lock().expect("formation price lock");
         Duration::from_secs_f64(observed).max(price.longest())
-    }
-
-    /// The next discovery point: the first whose defaults are unmeasured.
-    fn undiscovered(&self) -> Option<usize> {
-        let Progress::Discovering(slots) = &self.progress else {
-            return None;
-        };
-        (0..self.specs.len())
-            .find(|index| discovery_selected(&self.specs, *index) && slots[*index].is_none())
     }
 
     /// The unit's next piece of work with its whole price; none when it has
@@ -4230,28 +4248,31 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// consumer asking every unit before each piece of any pays for the
     /// units whose piece changed.
     pub fn next(&self) -> Option<Work> {
-        if self.expired {
+        let Progress::Grounded {
+            expired: false,
+            phase,
+            ..
+        } = &self.progress
+        else {
             return None;
-        }
-        if let Some(offered) = self.offered.get() {
+        };
+        if let OfferCache::Cached { work, forming } = &*self.offer.borrow() {
             let formation = self.formation();
-            let standing = self
-                .offered_forming
-                .borrow()
+            let standing = forming
                 .iter()
                 .all(|(formable, class)| formation.class(formable) == *class);
             if standing {
-                return offered;
+                return *work;
             }
         }
-        let offered = self.offer();
-        *self.offered_forming.borrow_mut() = match &self.progress {
-            Progress::Searching(searching) => searching
+        let work = self.offer(phase);
+        let forming = match phase {
+            SearchPhase::Searching(searching) => searching
                 .planned
                 .as_ref()
                 .map(|piece| {
                     let formation = self.formation();
-                    self.compiled_ahead(searching, piece)
+                    self.compiled_ahead(piece)
                         .into_iter()
                         .map(|formable| {
                             let class = formation.class(&formable);
@@ -4260,17 +4281,17 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                         .collect()
                 })
                 .unwrap_or_default(),
-            Progress::Discovering(_) => Vec::new(),
+            SearchPhase::Discovering { .. } => Vec::new(),
         };
-        self.offered.set(Some(offered));
-        offered
+        *self.offer.borrow_mut() = OfferCache::Cached { work, forming };
+        work
     }
 
     /// Derive the unit's next piece of work and its price.
-    fn offer(&self) -> Option<Work> {
-        match &self.progress {
-            Progress::Discovering(slots) => {
-                let index = self.undiscovered()?;
+    fn offer(&self, phase: &SearchPhase<'a>) -> Option<Work> {
+        match phase {
+            SearchPhase::Discovering { slots, .. } => {
+                let index = undiscovered(&self.points, slots)?;
                 // Building a point's inputs is priced at what building them
                 // took at the unit's last point discovered, and measuring
                 // the defaults at what measuring them has taken at its
@@ -4280,15 +4301,19 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 // what another unit builds says nothing of them. The first
                 // point's are unpriced, and discovering the last point
                 // also plans the search, which the unit has not run.
-                let last = (index + 1..self.specs.len())
-                    .all(|later| !discovery_selected(&self.specs, later) || slots[later].is_some());
+                let last = (index + 1..self.points.len()).all(|later| {
+                    !discovery_selected(&self.points, later) || slots[later].is_some()
+                });
                 let built = (0..index).rev().find(|earlier| slots[*earlier].is_some());
                 let mut quote = Quote::default();
-                quote.add(built.and_then(|earlier| self.builds[earlier].price()), 1);
+                quote.add(
+                    built.and_then(|earlier| self.points[earlier].build.price()),
+                    1,
+                );
                 quote.add(self.discovering.price(), 1);
                 quote.add(None, usize::from(last));
                 let mut footprint = Footprint::default();
-                footprint.add(most_bytes(&self.resident_bytes[index]), 1);
+                footprint.add(most_bytes(&self.points[index].resident_bytes), 1);
                 Some(Work {
                     stage: Stage::Discovery,
                     quote,
@@ -4297,7 +4322,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     footprint,
                 })
             }
-            Progress::Searching(searching) => {
+            SearchPhase::Searching(searching) => {
                 let incumbent = searching.ledger.incumbent();
                 // A piece of a unit whose inputs were given up builds them
                 // again first.
@@ -4344,7 +4369,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     // The programs its compile forms stay held after it:
                     // their class, once a compile of the unit was observed.
                     let forming = self
-                        .compiled_ahead(searching, piece)
+                        .compiled_ahead(piece)
                         .iter()
                         .map(Formable::programs)
                         .sum::<usize>();
@@ -4358,9 +4383,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                             Stage::Measure
                         },
                         quote: self.measurement_quote(searching, piece).and(rebuilding),
-                        forming: self
-                            .formation()
-                            .quote(&self.compiled_ahead(searching, piece)),
+                        forming: self.formation().quote(&self.compiled_ahead(piece)),
                         // Remaining measured cost, an opportunity ceiling rather
                         // than a prediction of the next configuration's gain.
                         opportunity: incumbent.cost.total(),
@@ -4421,7 +4444,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let formation = self.formation();
         let incumbent = searching.ledger.incumbent();
         let run = &searching.run;
-        let mut quote = formation.quote(&self.compiled_ahead(searching, piece));
+        let mut quote = formation.quote(&self.compiled_ahead(piece));
         // The slots sampled, a challenger's by point and key and the served
         // choice's by point.
         let mut slots = BTreeSet::new();
@@ -4539,7 +4562,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         incumbent: &Contender,
         leader: &Configuration,
     ) -> Quote {
-        let rate = self.planned().settings.error_rate;
+        let rate = searching.plan.settings.error_rate;
         let mut quote = Quote::default();
         let contender = searching.ledger.contender(leader);
         let evidence = searching.ledger.evidence(contender);
@@ -4577,13 +4600,13 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             let observed = searching
                 .untimed
                 .iter()
-                .filter_map(|index| self.checks[*index].price())
+                .filter_map(|index| self.points[*index].check.price())
                 .collect::<Vec<_>>();
             let nearest = (!observed.is_empty())
                 .then(|| observed.iter().sum::<f64>() / observed.len() as f64);
             let mut unseen = 0;
             for index in &searching.untimed {
-                match self.checks[*index].price().or(nearest) {
+                match self.points[*index].check.price().or(nearest) {
                     Some(price) => quote.add(Some(price), 1),
                     None => unseen += 1,
                 }
@@ -4613,7 +4636,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let work = self
             .next()
             .expect("a unit performs the work it named as its next");
-        self.offered.set(None);
+        self.invalidate_offer();
         let began = Instant::now();
         let before = self.spent();
         // The piece's raises are those recorded from here to its end.
@@ -4622,7 +4645,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // started again here: what it took and gave back within itself is
         // seen.
         self.charges.device().restart_high_water();
-        if let Some(ground) = &self.ground {
+        if let Some(ground) = self.ground() {
             ground.validator.restart_retained_high_water();
         }
         let mut host = ProcessMemory::footprint_now();
@@ -4632,7 +4655,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let ledgers = |unit: &Self| {
             (
                 (unit.charges.device().allocated(), unit.charges.device().high_water()),
-                unit.ground.as_ref().map_or((0, 0), |ground| {
+                unit.ground().map_or((0, 0), |ground| {
                     (
                         ground.validator.retained_bytes(),
                         ground.validator.retained_high_water(),
@@ -4642,14 +4665,17 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         };
         let (usage_began, (retained_began, _)) = ledgers(self);
         let began_bytes = self.held();
-        let discovered = self.undiscovered();
-        let challengers = match &self.progress {
-            Progress::Searching(searching) => searching
-                .planned
-                .as_ref()
-                .map_or(0, |piece| piece.challengers().len()),
-            Progress::Discovering(_) => 0,
+        let discovered = match &self.progress {
+            Progress::Grounded {
+                phase: SearchPhase::Discovering { slots, .. },
+                ..
+            } => undiscovered(&self.points, slots),
+            _ => None,
         };
+        let challengers = self
+            .searching()
+            .and_then(|searching| searching.planned.as_ref())
+            .map_or(0, |piece| piece.challengers().len());
         // A piece whose inputs the device's memory limit refused ends
         // there, its point priced at what the build demanded: the piece is
         // offered again at that price ([`build_point`]).
@@ -4657,36 +4683,159 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let mut resident_footprint = None;
         let attempted = (|| -> Result<(bool, bool), WorkError<TuneError>> {
             deadline.check(Duration::ZERO)?;
-            let restored = work.stage == Stage::Discovery || self.restore(source, deadline)?;
-            let restored_footprint = ProcessMemory::footprint_now();
-            host = host.max(restored_footprint);
-            resident = self.held();
-            resident_footprint = restored_footprint;
-            Ok(match work.stage {
-                _ if !restored => (false, false),
-                Stage::Discovery => match self.discover(source, deadline)? {
+            let Self {
+                charges,
+                module,
+                entry,
+                bindings,
+                statics,
+                cpu,
+                backend,
+                implementation,
+                logical,
+                default,
+                points,
+                served,
+                programs,
+                clock,
+                progress,
+                discovering,
+                longest,
+                formation_price,
+                time,
+                forming,
+                replanning,
+                ..
+            } = self;
+            let Progress::Grounded { ground, phase, .. } = progress else {
+                return Ok((false, false));
+            };
+            match phase {
+                SearchPhase::Discovering {
+                    plan,
+                    surveyor,
+                    slots,
+                } => {
+                    let restored_footprint = ProcessMemory::footprint_now();
+                    host = host.max(restored_footprint);
+                    resident = held_with(charges, Some(ground));
+                    resident_footprint = restored_footprint;
+                    let plan = plan
+                        .as_ref()
+                        .expect("a unit is given its plan before its optional work");
+                    let Some((inputs, footprint)) = discover_point(
+                        charges,
+                        implementation,
+                        logical,
+                        default,
+                        points,
+                        ground,
+                        plan,
+                        surveyor,
+                        slots,
+                        discovering,
+                        time,
+                        source,
+                        deadline,
+                    )?
+                    else {
+                        return Ok((false, false));
+                    };
+                    if undiscovered(points, slots).is_none() {
+                        deadline.check(Duration::ZERO)?;
+                        let planning = Instant::now();
+                        let opened = open_search(
+                            implementation,
+                            *backend,
+                            statics,
+                            default,
+                            charges,
+                            clock,
+                            points,
+                            ground,
+                            plan,
+                            slots,
+                        );
+                        *longest = longest.max(planning.elapsed().as_secs_f64());
+                        *phase = SearchPhase::Searching(Box::new(opened?));
+                    }
                     // Its inputs, once built, are resident: what the
                     // defaults' measurement adds is over them.
-                    Some((inputs, footprint)) => {
-                        resident = inputs;
-                        resident_footprint = footprint;
-                        (true, false)
+                    resident = inputs;
+                    resident_footprint = footprint;
+                    Ok((true, false))
+                }
+                SearchPhase::Searching(searching) => {
+                    let restored = restore_points(
+                        charges,
+                        &ground.validator,
+                        points,
+                        time,
+                        searching,
+                        source,
+                        deadline,
+                    )?;
+                    let restored_footprint = ProcessMemory::footprint_now();
+                    host = host.max(restored_footprint);
+                    resident = held_with(charges, Some(ground));
+                    resident_footprint = restored_footprint;
+                    if !restored {
+                        return Ok((false, false));
                     }
-                    None => (false, false),
-                },
-                Stage::Form | Stage::Measure => {
-                    self.measure(deadline)?;
-                    (true, false)
+                    let formation = Formation {
+                        charges,
+                        module: *module,
+                        entry: *entry,
+                        logical,
+                        bindings,
+                        cpu: *cpu,
+                        implementation,
+                        default,
+                        served,
+                        price: formation_price,
+                    };
+                    if matches!(work.stage, Stage::Promote | Stage::Confirm) {
+                        let conversion = if work.stage == Stage::Promote {
+                            Conversion::Promote
+                        } else {
+                            Conversion::Confirm
+                        };
+                        Ok((
+                            true,
+                            promote_leader(
+                                &formation,
+                                programs,
+                                points,
+                                ground,
+                                searching,
+                                time,
+                                forming,
+                                source,
+                                conversion,
+                                deadline,
+                            )?,
+                        ))
+                    } else {
+                        measure_piece(
+                            &formation,
+                            programs,
+                            searching,
+                            time,
+                            forming,
+                            replanning,
+                            deadline,
+                        )?;
+                        Ok((true, false))
+                    }
                 }
-                Stage::Promote | Stage::Confirm => {
-                    (true, self.promote(source, work.stage, deadline)?)
-                }
-            })
+            }
         })();
         let (built, promoted) = match attempted {
             Ok(performed) => performed,
             Err(WorkError::Expired) => {
-                self.expired = true;
+                if let Progress::Grounded { expired, .. } = &mut self.progress {
+                    *expired = true;
+                }
                 (false, false)
             }
             Err(WorkError::Failed(error)) => return Err(error),
@@ -4694,7 +4843,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // What the piece formed and no longer needs leaves the device with
         // it: only the served choice and a leader keep their kernels.
         if built && work.stage != Stage::Discovery {
-            if let Progress::Searching(searching) = &mut self.progress {
+            if let Progress::Grounded {
+                phase: SearchPhase::Searching(searching),
+                ..
+            } = &mut self.progress
+            {
                 // A conversion changed what the challengers are ranked
                 // against: its leader's standing, measurement and rounds,
                 // or the served choice.
@@ -4726,23 +4879,20 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             peak_bytes: held_bytes(
                 self.charges.device(),
                 self.charges.device().high_water(),
-                self.ground
-                    .as_ref()
+                self.ground()
                     .map_or(0, |ground| ground.validator.retained_high_water()),
                 host,
             ),
             ended_bytes: held_bytes(
                 self.charges.device(),
                 self.charges.device().allocated(),
-                self.ground
-                    .as_ref()
+                self.ground()
                     .map_or(0, |ground| ground.validator.retained_bytes()),
                 ended,
             ),
             ledger_peak_bytes: self.charges.device().high_water()
                 + self
-                    .ground
-                    .as_ref()
+                    .ground()
                     .map_or(0, |ground| ground.validator.retained_high_water()),
             resident_footprint,
         };
@@ -4755,7 +4905,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             _ if !built => {}
             Stage::Discovery => {
                 let index = discovered.expect("discovery discovers a point");
-                self.resident_bytes[index].observe(memory.added() as f64);
+                self.points[index].resident_bytes.observe(memory.added() as f64);
             }
             Stage::Form | Stage::Measure => self
                 .measure_bytes
@@ -4769,7 +4919,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             stage: work.stage,
             quote: work.quote,
             actual: began.elapsed(),
-            interrupted: self.expired,
+            interrupted: self.is_expired(),
             spent: self.spent().since(before),
             raises: self.raises(),
             promoted,
@@ -4778,511 +4928,21 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         })
     }
 
-    /// Build the next discovery point and measure the defaults there; with
-    /// the last, plan the search. Returns what was held once the point's
-    /// inputs were built, and none when the device refused the point's
-    /// build ([`build_point`]) or the measurement of its defaults
-    /// ([`Exclusion::Refused`]): nothing was measured, and the point is
-    /// priced at what the piece demanded.
-    fn discover(
-        &mut self,
-        source: &mut dyn PointSource<'a>,
-        deadline: Deadline,
-    ) -> Result<Option<(u64, Option<u64>)>, WorkError<TuneError>> {
-        let index = self
-            .undiscovered()
-            .expect("discovery has an unmeasured point");
-        // What the device's storage can take as the piece begins: a refusal
-        // within it is priced from what the piece took of it.
-        let before = self
-            .charges
-            .device()
-            .room(seismic_topology::Contract::DeviceOnly);
-        let building = Instant::now();
-        let Some(point) = build_point(
-            &self.charges,
-            source,
-            &self.specs[index],
-            index,
-            &mut self.resident_bytes[index],
-        )?
-        else {
-            return Ok(None);
-        };
-        let built = building.elapsed().as_secs_f64();
-        let resident = self.held();
-        let resident_footprint = ProcessMemory::footprint_now();
-        self.builds[index].observe(built);
-        self.time.building_seconds += built;
-        let ground = self
-            .ground
-            .as_ref()
-            .expect("canonical preparation precedes discovery");
-        for args in &point.rotation {
-            ground.kernel.shape(&args.values()).map_err(|error| {
-                TuneError::DefaultUnusable(Exclusion::Execution(format!(
-                    "at point `{}`: {error}",
-                    point.label
-                )))
-            })?;
-        }
-        let mut point = ground.validator.point(point)?;
-        let shape =
-            point_shapes(self.charges.device(), &self.logical, std::slice::from_ref(&point))?
-                .remove(0);
-        // The defaults' time here is the unit of every time the unit
-        // records and the point's weight in what it optimises: the median
-        // of three samples, the fewest whose median one sample cannot
-        // move, whatever that sample read.
-        let options = Sampling {
-            samples: 3,
-            min_sample_seconds: self.planned().min_sample_seconds,
-        };
-        let settings = self.planned().settings.clone();
-        let measuring = Instant::now();
-        let measured = self
-            .surveyor
-            .as_mut()
-            .expect("the surveyor serves discovery until a search takes it")
-            .measure(
-                &self.implementation,
-                &ground.kernel,
-                std::slice::from_ref(&point),
-                &self.default,
-                &options,
-                &settings,
-                None,
-                deadline,
-            );
-        let defaults = match measured {
-            Ok(mut defaults) => defaults.remove(0),
-            // The point's inputs fit, but what measuring its defaults needs
-            // beside them does not: as a refused build, the point is priced
-            // at the piece's demand and offered again.
-            Err(WorkError::Expired) => {
-                point.release();
-                source.release(index);
-                return Err(WorkError::Expired);
-            }
-            Err(WorkError::Failed(Exclusion::Refused {
-                required,
-                available,
-            })) => {
-                let taken = before.saturating_sub(available);
-                self.resident_bytes[index].observe(taken.saturating_add(required) as f64);
-                point.release();
-                source.release(index);
-                return Ok(None);
-            }
-            Err(WorkError::Failed(exclusion)) => {
-                return Err(TuneError::DefaultUnusable(exclusion).into());
-            }
-        };
-        let measured = measuring.elapsed().as_secs_f64();
-        self.discovering.observe(measured);
-        self.time.measuring_seconds += measured;
-        let Progress::Discovering(slots) = &mut self.progress else {
-            unreachable!("discovery precedes the search");
-        };
-        slots[index] = Some(Timed {
-            point,
-            defaults,
-            shape,
-        });
-        if self.undiscovered().is_none() {
-            deadline.check(Duration::ZERO)?;
-            let planning = Instant::now();
-            let opened = self.open_search();
-            self.longest = self.longest.max(planning.elapsed().as_secs_f64());
-            opened?;
-        }
-        Ok(Some((resident, resident_footprint)))
-    }
-
-    /// Every discovery point is measured: fix the objective and plan the
-    /// search over it. The other served points remain numerical witnesses
-    /// without timing demand.
-    fn open_search(&mut self) -> Result<(), TuneError> {
-        let Progress::Discovering(slots) =
-            std::mem::replace(&mut self.progress, Progress::Discovering(Vec::new()))
-        else {
-            unreachable!("discovery precedes the search");
-        };
-        let records = point_records(&self.specs);
-        let mut timed = Vec::new();
-        let mut points = Vec::new();
-        let mut canonical = Vec::new();
-        let mut shapes = Vec::new();
-        let mut untimed = Vec::new();
-        for (index, slot) in slots.into_iter().enumerate() {
-            match slot {
-                Some(Timed {
-                    mut point,
-                    defaults,
-                    shape,
-                }) => {
-                    point.reweigh(records[index].weight);
-                    timed.push(index);
-                    points.push(point);
-                    canonical.push(defaults);
-                    shapes.push(shape);
-                }
-                None => untimed.push(index),
-            }
-        }
-        let weights = points.iter().map(|point| point.weight).collect::<Vec<_>>();
-        let kernel = self
-            .ground
-            .as_ref()
-            .expect("canonical preparation precedes discovery")
-            .kernel
-            .clone();
-        let plan = self.planned().clone();
-        match self.open_run(&shapes, &weights, &plan, canonical.clone()) {
-            Ok((run, canonical)) => {
-                let cost = Weighing::of(&points).cost(&canonical, &canonical);
-                let mut searching = Searching {
-                    ledger: Ledger::new(
-                        &self.default,
-                        kernel,
-                        canonical.clone(),
-                        cost,
-                        plan.settings.clone(),
-                    ),
-                    points,
-                    timed,
-                    untimed,
-                    covered: BTreeSet::new(),
-                    canonical,
-                    run,
-                    planned: None,
-                    admission: Admission::default(),
-                    rates: Rates::default(),
-                    planning: Linear::default(),
-                };
-                self.replan(&mut searching)?;
-                self.progress = Progress::Searching(Box::new(searching));
-                Ok(())
-            }
-            Err(error) => {
-                // The defaults stay measured and served.
-                let mut slots = self.specs.iter().map(|_| None).collect::<Vec<_>>();
-                for (((index, point), defaults), shape) in
-                    timed.into_iter().zip(points).zip(canonical).zip(shapes)
-                {
-                    slots[index] = Some(Timed {
-                        point,
-                        defaults,
-                        shape,
-                    });
-                }
-                self.progress = Progress::Discovering(slots);
-                Err(error)
-            }
-        }
-    }
-
-    /// Plan the next challenger work of `searching`.
-    fn replan(&self, searching: &mut Searching<'a>) -> Result<(), TuneError> {
-        let Run { search, keying, .. } = &mut searching.run;
-        // Planning asks the declared domain for assignments, admissible or
-        // not, and what it takes follows how many it asks: observed as one
-        // call with its requests, the class the next piece's planning is
-        // priced by.
-        let (began, asked) = (Instant::now(), search.requests);
-        let planned = search.plan(&Declared {
-            implementation: &self.implementation,
-            keying,
-        });
-        searching
-            .planning
-            .observe(search.requests - asked, began.elapsed().as_secs_f64());
-        searching.planned = planned?;
-        // A sweep's chunk shares one compile among its challengers. A CPU
-        // unit compiles nothing (its kernels are in the binary), so its
-        // pieces measure one challenger each: a chunk would only take the
-        // device from every other unit for its whole session and, cut off
-        // at the deadline, keep none of its challengers. Its matched rounds
-        // sample the served choice beside each challenger either way. On an
-        // EPYC 9V45 a 12-challenger dense_expand chunk of gemma-4-e2b,
-        // priced 21 s from the default's samples, ran 39 s to the cutoff
-        // without completing a round (its single-participant challengers
-        // sample 7 s at 512 rows) and recorded nothing.
-        if matches!(self.charges.device().kind, crate::backends::OpenedKind::Cpu(_)) {
-            if let Some(piece) = &mut searching.planned {
-                piece.keep_first();
-            }
-        }
-        Ok(())
-    }
-
-    /// Form the planned challengers and measure and admit them at the
-    /// timed points. Each is recorded, whatever it measures.
-    fn measure(&mut self, deadline: Deadline) -> Result<(), WorkError<TuneError>> {
-        let Progress::Searching(mut searching) =
-            std::mem::replace(&mut self.progress, Progress::Discovering(Vec::new()))
-        else {
-            unreachable!("challengers are measured by a search");
-        };
-        let performed = self.measure_piece(&mut searching, deadline);
-        let replanning = Instant::now();
-        let replanned = performed.and_then(|()| {
-            deadline.check(Duration::ZERO)?;
-            Ok(self.replan(&mut searching)?)
-        });
-        self.replanning += replanning.elapsed().as_secs_f64();
-        self.progress = Progress::Searching(searching);
-        replanned
-    }
-
-    fn measure_piece(
-        &mut self,
-        searching: &mut Searching<'a>,
-        deadline: Deadline,
-    ) -> Result<(), WorkError<TuneError>> {
-        let piece = searching
-            .planned
-            .take()
-            .expect("a measurement performs a planned piece");
-        // Read field by field: the piece forms into the unit's programs
-        // while its formation is borrowed.
-        let plan = self
-            .plan
-            .as_ref()
-            .expect("a unit is given its plan before its optional work");
-        let formation = formation!(self);
-        let compiled = formation.price.lock().expect("formation price lock").total();
-        let weighing = Weighing::of(&searching.points);
-        let mut forming = 0.;
-        let mut measuring = 0.;
-        let Searching {
-            points,
-            ledger,
-            run,
-            admission,
-            rates,
-            ..
-        } = searching;
-        let performed = run.perform(
-            piece,
-            &mut self.programs,
-            &formation,
-            points,
-            &plan.settings,
-            plan.min_sample_seconds,
-            rates,
-            &weighing,
-            ledger,
-            admission,
-            &mut forming,
-            &mut measuring,
-            deadline,
-        );
-        let compiled = formation.price.lock().expect("formation price lock").total() - compiled;
-        drop(formation);
-        self.time.forming_seconds += forming;
-        self.forming += (forming - compiled).max(0.);
-        self.time.measuring_seconds += measuring;
-        performed
-    }
-
-    /// Convert the leader: give its comparison with the served choice the
-    /// matched rounds it lacks to resolve, and once its lead is resolved,
-    /// check it at the untimed points and serve it. Whether it was
-    /// promoted; what the rounds showed is recorded either way.
-    fn promote(
-        &mut self,
-        source: &mut dyn PointSource<'a>,
-        stage: Stage,
-        deadline: Deadline,
-    ) -> Result<bool, WorkError<TuneError>> {
-        let plan = self.planned().clone();
-        let ground = self
-            .ground
-            .as_ref()
-            .expect("canonical preparation precedes the search");
-        let Progress::Searching(searching) = &mut self.progress else {
-            unreachable!("a lead is converted by a search");
-        };
-        let Searching {
-            points,
-            untimed,
-            covered,
-            canonical,
-            ledger,
-            run,
-            rates,
-            ..
-        } = &mut **searching;
-        let leader = match stage {
-            Stage::Promote => ledger.leader(),
-            _ => ledger.nominal().map(|(leader, _)| leader),
-        }
-        .expect("a conversion converts the leader its work named")
-        .clone();
-        // A leader that gave up its kernel is formed again; one that can
-        // no longer be formed is recorded so and gives way to the next.
-        if ledger.kernel(&leader).is_none() {
-            let formation = formation!(self);
-            let specialization = ledger.contender(&leader).specialization.clone();
-            let compiled = formation.price.lock().expect("formation price lock").total();
-            let began = Instant::now();
-            let formed = self
-                .programs
-                .form(&formation, &[specialization], &[])?
-                .pop()
-                .expect("one configuration was formed");
-            let forming = began.elapsed().as_secs_f64();
-            let mut price = formation.price.lock().expect("formation price lock");
-            let compiled = price.total() - compiled;
-            // Its record states how it was first formed, not this.
-            price.calls.clear();
-            drop(price);
-            self.time.forming_seconds += forming;
-            self.forming += (forming - compiled).max(0.);
-            match formed {
-                Ok(kernel) => ledger.hold(&leader, kernel),
-                Err(exclusion) => {
-                    ledger.reject(&leader, exclusion);
-                    return Ok(false);
-                }
-            }
-        }
-        let keying = &run.keying;
-        let kernel = ledger
-            .kernel(&leader)
-            .cloned()
-            .expect("the leader holds its kernel");
-        let leading = ledger.contender(&leader).specialization.clone();
-        let rate = plan.settings.error_rate;
-        let before = ledger.evidence(ledger.contender(&leader));
-        if before.verdict(rate).is_none() {
-            let began = Instant::now();
-            let served = ledger.incumbent();
-            let (served_kernel, served_points) = (
-                ledger.incumbent_kernel().clone(),
-                served.points.clone(),
-            );
-            // Nothing is reused: every point that tells the two apart is
-            // sampled in every round, so the rounds are evidence.
-            let compared = measure_matched(
-                &|working, specialization| {
-                    keying.key(&self.implementation, working, specialization)
-                },
-                &[Candidate {
-                    specialization: leading.clone(),
-                    kernel: kernel.clone(),
-                    evidence: before,
-                }],
-                &Incumbent {
-                    specialization: &served.specialization,
-                    kernel: &served_kernel,
-                    points: &served_points,
-                },
-                points,
-                Matching {
-                    deadline,
-                    settings: &plan.settings,
-                    min_sample_seconds: plan.min_sample_seconds,
-                    rates,
-                    shuffle: &mut run.shuffle,
-                    clock: &run.clock,
-                    sequence: &mut run.sequence,
-                },
-                None,
-                &served_points,
-                None,
-                &mut run.outputs,
-                // It is no longer new to the unit: it is witnessed where it
-                // has not been, before its rounds, and its placement is
-                // repeated.
-                None,
-            )
-            .pop()
-            .expect("one challenger was compared");
-            self.time.measuring_seconds += began.elapsed().as_secs_f64();
-            let served = ledger.incumbent.clone();
-            match compared {
-                Err(exclusion) => {
-                    ledger.reject(&leader, exclusion);
-                    return Ok(false);
-                }
-                Ok(None) => return Err(WorkError::Expired),
-                Ok(Some((measured, evidence))) => {
-                    let contender = ledger.contender_mut(&leader);
-                    contender.cost = Weighing::of(points).cost(&measured, canonical);
-                    contender.points = measured.clone();
-                    contender.confirmed = measured;
-                    contender.standing = ContenderStanding::Measured {
-                        against: served,
-                        evidence,
-                    };
-                    // A trail is recorded when the challengers are ranked
-                    // again, as this piece ends; an unresolved lead stays
-                    // as it is.
-                    if evidence.verdict(rate) != Some(Verdict::Leads) {
-                        return Ok(false);
-                    }
-                }
-            }
-        }
-        let key = |working| keying.key(&self.implementation, working, &leading);
-        let mut scope = ScopeQualification {
-            deadline,
-            source,
-            specs: &self.specs,
-            indices: untimed,
-            validator: &ground.validator,
-            covered,
-            default: &ground.kernel.artifact().0,
-            key: &key,
-            checks: &mut self.checks,
-            building_seconds: 0.,
-            validating_seconds: 0.,
-            reference_seconds: 0.,
-        };
-        let covered = scope.qualify(&kernel);
-        self.time.building_seconds += scope.building_seconds;
-        self.time.validating_seconds += scope.validating_seconds;
-        self.time.scope_validation_seconds +=
-            (scope.validating_seconds - scope.reference_seconds).max(0.0);
-        if let Err(exclusion) = covered {
-            let exclusion = match exclusion {
-                WorkError::Expired => return Err(WorkError::Expired),
-                WorkError::Failed(exclusion) => exclusion,
-            };
-            ledger.failed += 1;
-            ledger.reject(&leader, exclusion);
-            return Ok(false);
-        }
-        // Serving prepares the chosen kernel as formed here. The unit's
-        // handoff is its one served choice: the leader's replaces the
-        // choice's it supersedes, which serving will never take.
-        deadline.check(Duration::ZERO)?;
-        kernel
-            .hand_off_replacing(ledger.kernel(&ledger.incumbent).map(AsRef::as_ref))
-            .map_err(|error| TuneError::Handoff(error.to_string()))?;
-        // The choice it supersedes still holds its kernel in `ledger.kernels`
-        // until the piece ends (`Ledger::release`).
-        ledger.promote(leader);
-        Ok(true)
-    }
-
     /// The unit's complete record as it stands: its served choice, every
     /// configuration reached with its measurements, and the evidence. Legal
     /// at every instant from [`UnitSearch::prepare_defaults`] on.
     pub fn terminal(&self) -> Result<TuningResult, TuneError> {
-        let ground = self.ground.as_ref().ok_or_else(|| {
-            TuneError::Declaration(
+        let Progress::Grounded { ground, phase, .. } = &self.progress else {
+            return Err(TuneError::Declaration(
                 "canonical defaults were not prepared before their record".into(),
-            )
-        })?;
+            ));
+        };
         let mut time = self.time.clone();
         time.reference_seconds = ground.validator.reference_seconds();
-        let searching = match &self.progress {
-            Progress::Discovering(slots) => {
+        let searching = match phase {
+            SearchPhase::Discovering { slots, .. } => {
                 return Ok(self.unit.census(
-                    point_records(&self.specs),
+                    point_records(&self.points),
                     &self.default,
                     ground,
                     slots
@@ -5293,7 +4953,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     time,
                 ));
             }
-            Progress::Searching(searching) => searching,
+            SearchPhase::Searching(searching) => searching,
         };
         time.validating_seconds += searching
             .points
@@ -5315,7 +4975,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             // partial untimed scopes' too. Their presence makes no
             // configuration eligible.
             Records {
-                points: point_records(&self.specs),
+                points: point_records(&self.points),
                 records: ledger.records(&ground.validator),
                 served: ledger.served.clone(),
                 observations: ground.validator.observations(),
@@ -5347,19 +5007,23 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// Change objective weights after baseline discovery and before any candidate.
     /// Every later comparison uses this same measured cohort and frozen objective.
     pub fn reweigh(&mut self, weights: &[f64]) -> bool {
-        let Progress::Searching(searching) = &mut self.progress else {
+        let Progress::Grounded {
+            phase: SearchPhase::Searching(searching),
+            ..
+        } = &mut self.progress
+        else {
             return false;
         };
         if searching.ledger.order.len() > 1
-            || weights.len() != self.specs.len()
+            || weights.len() != self.points.len()
             || weights
                 .iter()
                 .any(|weight| !weight.is_finite() || *weight < 0.)
         {
             return false;
         }
-        for (spec, weight) in self.specs.iter_mut().zip(weights) {
-            spec.weight = *weight;
+        for (point, weight) in self.points.iter_mut().zip(weights) {
+            point.spec.weight = *weight;
         }
         for (point, index) in searching.points.iter_mut().zip(&searching.timed) {
             point.reweigh(weights[*index]);
@@ -5368,94 +5032,39 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let cost = Weighing::of(&searching.points).cost(&searching.canonical, &searching.canonical);
         let incumbent = searching.ledger.incumbent.clone();
         searching.ledger.contender_mut(&incumbent).cost = cost;
-        self.offered.set(None);
+        self.invalidate_offer();
         true
     }
 
     /// All selected baseline points have been measured.
     pub fn discovered(&self) -> bool {
-        matches!(self.progress, Progress::Searching(_))
+        self.searching().is_some()
     }
 
     /// The defaults' measurements at the points discovered so far: what
     /// the unit's default service is known to take.
     pub fn service_measurements(&self) -> Vec<PointMeasurement> {
         match &self.progress {
-            Progress::Discovering(slots) => slots
+            Progress::Ungrounded { .. } => Vec::new(),
+            Progress::Grounded {
+                phase: SearchPhase::Discovering { slots, .. },
+                ..
+            } => slots
                 .iter()
                 .flatten()
                 .map(|timed| timed.defaults.clone())
                 .collect(),
-            Progress::Searching(searching) => searching.canonical.clone(),
+            Progress::Grounded {
+                phase: SearchPhase::Searching(searching),
+                ..
+            } => searching.canonical.clone(),
         }
-    }
-
-    /// The search of a unit whose defaults are measured, and their
-    /// measurement as the search keys it: over the groups of launches that
-    /// run together where launches are formed separately, over the one
-    /// group of the whole program where it is formed whole. Stored results
-    /// are not search inputs.
-    fn open_run(
-        &mut self,
-        shapes: &[PointShape],
-        weights: &[f64],
-        plan: &UnitPlan,
-        mut canonical: Vec<PointMeasurement>,
-    ) -> Result<(Run, Vec<PointMeasurement>), TuneError> {
-        let implementation = &self.implementation;
-        if implementation.launch_scoped()
-            && !matches!(
-                self.backend,
-                seismic_lang::registry::BackendName::Metal
-                    | seismic_lang::registry::BackendName::Cuda
-            )
-        {
-            return Err(TuneError::Declaration(format!(
-                "launch-scoped native tuning is not yet available on `{}`",
-                self.backend.as_str(),
-            )));
-        }
-        let (partition, keying) = search_plan(implementation, &self.statics, shapes)?;
-        // The defaults' measurement, keyed as the search keys its own.
-        for measured in &mut canonical {
-            measured.key = keying.key(implementation, measured.key.launches.clone(), &self.default);
-        }
-        // A point with the same active launches and parameters runs the
-        // same work under every candidate: its measurement is reused. A
-        // conversion's session reuses none.
-        let samples = canonical
-            .iter()
-            .enumerate()
-            .map(|(point, measurement)| ((point, measurement.key.clone()), measurement.clone()))
-            .collect();
-        // The run places into its own result storage, and shares the device
-        // clock slot held by the unit.
-        self.surveyor.take();
-        let clock = self.clock.clone();
-        Ok((
-            Run {
-                search: GroupSearch::new(
-                    partition,
-                    self.default.clone(),
-                    canonical.clone(),
-                    weights.to_vec(),
-                    plan.start.clone(),
-                ),
-                keying,
-                outputs: OutputPool::new(self.charges.clone()),
-                samples,
-                shuffle: Shuffle::default(),
-                clock,
-                sequence: Sequence::default(),
-            },
-            canonical,
-        ))
     }
 
     /// Where the unit's tuning stands.
     pub fn standing(&self) -> Standing {
-        match &self.progress {
-            Progress::Discovering(_) => Standing {
+        match self.searching() {
+            None => Standing {
                 cost: 1.,
                 measured: 0,
                 generated: 1,
@@ -5465,7 +5074,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 programs: self.programs.formed(),
                 forming_seconds: self.time.forming_seconds,
             },
-            Progress::Searching(searching) => Standing {
+            Some(searching) => Standing {
                 cost: searching.ledger.incumbent().cost.total().min(1.),
                 measured: searching.ledger.order.len(),
                 generated: 1 + searching.run.search.generated.len(),
@@ -5487,11 +5096,16 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         plan: SurveyPlan,
     ) -> Result<TuningResult, TuneError> {
         self.prepare_defaults(source)?;
-        let ground = self.ground.take().expect("the defaults were just prepared");
+        let Progress::Grounded { ground, .. } = self.progress else {
+            return Err(TuneError::Declaration(
+                "canonical defaults were not prepared before their record".into(),
+            ));
+        };
         // A survey builds and times every point whatever it costs.
-        let records = point_records(&self.specs);
-        let mut points = Vec::with_capacity(self.specs.len());
-        for (index, spec) in self.specs.iter().enumerate() {
+        let records = point_records(&self.points);
+        let mut points = Vec::with_capacity(self.points.len());
+        for (index, state) in self.points.iter().enumerate() {
+            let spec = &state.spec;
             let began = Instant::now();
             let inputs = source.build(index).map_err(|error| TuneError::Inputs {
                 point: spec.label.clone(),
@@ -5544,6 +5158,604 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         result.time.reference_seconds += ground.validator.reference_seconds();
         Ok(result)
     }
+}
+
+/// The bytes held now ([`held_bytes`]).
+fn held_with(charges: &Charges, ground: Option<&Ground>) -> u64 {
+    held_bytes(
+        charges.device(),
+        charges.device().allocated(),
+        ground.map_or(0, |ground| ground.validator.retained_bytes()),
+        ProcessMemory::footprint_now(),
+    )
+}
+
+/// The next discovery point: the first whose defaults are unmeasured.
+fn undiscovered(points: &[PointState], slots: &[Option<Timed<'_>>]) -> Option<usize> {
+    (0..points.len()).find(|index| discovery_selected(points, *index) && slots[*index].is_none())
+}
+
+/// Build again the inputs of every timed point that gave its own up,
+/// for the piece about to run. Each build is observed in its point's
+/// classes, seconds and bytes: what the piece was quoted. False when
+/// the device's memory limit refused a build ([`build_point`]): the
+/// piece cannot run.
+fn restore_points<'a>(
+    charges: &Charges,
+    validator: &Validator,
+    points: &mut [PointState],
+    time: &mut TuningTime,
+    searching: &mut Searching<'a>,
+    source: &mut dyn PointSource<'a>,
+    deadline: Deadline,
+) -> Result<bool, WorkError<TuneError>> {
+    let device = charges.device();
+    let held = || {
+        held_bytes(
+            device,
+            device.allocated(),
+            validator.retained_bytes(),
+            ProcessMemory::footprint_now(),
+        )
+    };
+    for (point, &index) in searching.points.iter_mut().zip(&searching.timed) {
+        if point.resident() {
+            continue;
+        }
+        deadline.check(Duration::ZERO)?;
+        let before = held();
+        let building = Instant::now();
+        let state = &mut points[index];
+        let Some(built_point) = build_point(
+            charges,
+            source,
+            &state.spec,
+            index,
+            &mut state.resident_bytes,
+        )?
+        else {
+            return Ok(false);
+        };
+        let built = building.elapsed().as_secs_f64();
+        state.build.observe(built);
+        time.building_seconds += built;
+        validator.restore(point, built_point)?;
+        state.resident_bytes.observe(held().saturating_sub(before) as f64);
+    }
+    Ok(true)
+}
+
+/// Build the next discovery point and measure the defaults there. Returns
+/// what was held once the point's inputs were built, and none when the
+/// device refused the point's build ([`build_point`]) or the measurement of
+/// its defaults ([`Exclusion::Refused`]): nothing was measured, and the
+/// point is priced at what the piece demanded.
+#[allow(clippy::too_many_arguments)]
+fn discover_point<'a>(
+    charges: &Charges,
+    implementation: &NativeImplementation,
+    logical: &LogicalEntry,
+    default: &NativeSpecialization,
+    points: &mut [PointState],
+    ground: &Ground,
+    plan: &UnitPlan,
+    surveyor: &mut PointSurveyor,
+    slots: &mut [Option<Timed<'a>>],
+    discovering: &mut Observed,
+    time: &mut TuningTime,
+    source: &mut dyn PointSource<'a>,
+    deadline: Deadline,
+) -> Result<Option<(u64, Option<u64>)>, WorkError<TuneError>> {
+    let index = undiscovered(points, slots).expect("discovery has an unmeasured point");
+    // What the device's storage can take as the piece begins: a refusal
+    // within it is priced from what the piece took of it.
+    let before = charges
+        .device()
+        .room(seismic_topology::Contract::DeviceOnly);
+    let building = Instant::now();
+    let state = &mut points[index];
+    let Some(point) = build_point(
+        charges,
+        source,
+        &state.spec,
+        index,
+        &mut state.resident_bytes,
+    )?
+    else {
+        return Ok(None);
+    };
+    let built = building.elapsed().as_secs_f64();
+    let resident = held_with(charges, Some(ground));
+    let resident_footprint = ProcessMemory::footprint_now();
+    state.build.observe(built);
+    time.building_seconds += built;
+    for args in &point.rotation {
+        ground.kernel.shape(&args.values()).map_err(|error| {
+            TuneError::DefaultUnusable(Exclusion::Execution(format!(
+                "at point `{}`: {error}",
+                point.label
+            )))
+        })?;
+    }
+    let mut point = ground.validator.point(point)?;
+    let shape = point_shapes(charges.device(), logical, std::slice::from_ref(&point))?.remove(0);
+    // The defaults' time here is the unit of every time the unit
+    // records and the point's weight in what it optimises: the median
+    // of three samples, the fewest whose median one sample cannot
+    // move, whatever that sample read.
+    let options = Sampling {
+        samples: 3,
+        min_sample_seconds: plan.min_sample_seconds,
+    };
+    let measuring = Instant::now();
+    let measured = surveyor.measure(
+        implementation,
+        &ground.kernel,
+        std::slice::from_ref(&point),
+        default,
+        &options,
+        &plan.settings,
+        None,
+        deadline,
+    );
+    let defaults = match measured {
+        Ok(mut defaults) => defaults.remove(0),
+        // The point's inputs fit, but what measuring its defaults needs
+        // beside them does not: as a refused build, the point is priced
+        // at the piece's demand and offered again.
+        Err(WorkError::Expired) => {
+            point.release();
+            source.release(index);
+            return Err(WorkError::Expired);
+        }
+        Err(WorkError::Failed(Exclusion::Refused {
+            required,
+            available,
+        })) => {
+            let taken = before.saturating_sub(available);
+            points[index]
+                .resident_bytes
+                .observe(taken.saturating_add(required) as f64);
+            point.release();
+            source.release(index);
+            return Ok(None);
+        }
+        Err(WorkError::Failed(exclusion)) => {
+            return Err(TuneError::DefaultUnusable(exclusion).into());
+        }
+    };
+    let measured = measuring.elapsed().as_secs_f64();
+    discovering.observe(measured);
+    time.measuring_seconds += measured;
+    slots[index] = Some(Timed {
+        point,
+        defaults,
+        shape,
+    });
+    Ok(Some((resident, resident_footprint)))
+}
+
+/// Every discovery point is measured: fix the objective and plan the
+/// search over it. The other served points remain numerical witnesses
+/// without timing demand.
+#[allow(clippy::too_many_arguments)]
+fn open_search<'a>(
+    implementation: &OnDevice,
+    backend: seismic_lang::registry::BackendName,
+    statics: &NativeSpecialization,
+    default: &NativeSpecialization,
+    charges: &Charges,
+    clock: &ClockSlot,
+    point_states: &[PointState],
+    ground: &Ground,
+    plan: &UnitPlan,
+    slots: &mut Vec<Option<Timed<'a>>>,
+) -> Result<Searching<'a>, TuneError> {
+    let records = point_records(point_states);
+    let shapes: Vec<PointShape> = slots
+        .iter()
+        .flatten()
+        .map(|timed| timed.shape.clone())
+        .collect();
+    let weights: Vec<f64> = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| slot.as_ref().map(|_| records[index].weight))
+        .collect();
+    let canonical: Vec<PointMeasurement> = slots
+        .iter()
+        .flatten()
+        .map(|timed| timed.defaults.clone())
+        .collect();
+    let (mut run, canonical) = open_run(
+        implementation,
+        backend,
+        statics,
+        default,
+        charges,
+        clock,
+        &shapes,
+        &weights,
+        plan,
+        canonical,
+    )?;
+    let mut planning = Linear::default();
+    let planned = plan_next(implementation, charges, &mut run, &mut planning)?;
+    // Both `open_run` and initial planning succeeded: consume `slots`
+    // infallibly so a failure above leaves discovery untouched.
+    let mut timed = Vec::new();
+    let mut points = Vec::new();
+    let mut untimed = Vec::new();
+    for (index, slot) in std::mem::take(slots).into_iter().enumerate() {
+        match slot {
+            Some(Timed { mut point, .. }) => {
+                point.reweigh(records[index].weight);
+                timed.push(index);
+                points.push(point);
+            }
+            None => untimed.push(index),
+        }
+    }
+    let cost = Weighing::of(&points).cost(&canonical, &canonical);
+    Ok(Searching {
+        plan: plan.clone(),
+        ledger: Ledger::new(
+            default,
+            ground.kernel.clone(),
+            canonical.clone(),
+            cost,
+            plan.settings.clone(),
+        ),
+        points,
+        timed,
+        untimed,
+        covered: BTreeSet::new(),
+        canonical,
+        run,
+        planned,
+        admission: Admission::default(),
+        rates: Rates::default(),
+        planning,
+    })
+}
+
+/// The search of a unit whose defaults are measured, and their
+/// measurement as the search keys it: over the groups of launches that
+/// run together where launches are formed separately, over the one
+/// group of the whole program where it is formed whole. Stored results
+/// are not search inputs.
+#[allow(clippy::too_many_arguments)]
+fn open_run(
+    implementation: &OnDevice,
+    backend: seismic_lang::registry::BackendName,
+    statics: &NativeSpecialization,
+    default: &NativeSpecialization,
+    charges: &Charges,
+    clock: &ClockSlot,
+    shapes: &[PointShape],
+    weights: &[f64],
+    plan: &UnitPlan,
+    mut canonical: Vec<PointMeasurement>,
+) -> Result<(Run, Vec<PointMeasurement>), TuneError> {
+    if implementation.launch_scoped()
+        && !matches!(
+            backend,
+            seismic_lang::registry::BackendName::Metal | seismic_lang::registry::BackendName::Cuda
+        )
+    {
+        return Err(TuneError::Declaration(format!(
+            "launch-scoped native tuning is not yet available on `{}`",
+            backend.as_str(),
+        )));
+    }
+    let (partition, keying) = search_plan(implementation, statics, shapes)?;
+    // The defaults' measurement, keyed as the search keys its own.
+    for measured in &mut canonical {
+        measured.key = keying.key(implementation, measured.key.launches.clone(), default);
+    }
+    // A point with the same active launches and parameters runs the
+    // same work under every candidate: its measurement is reused. A
+    // conversion's session reuses none.
+    let samples = canonical
+        .iter()
+        .enumerate()
+        .map(|(point, measurement)| ((point, measurement.key.clone()), measurement.clone()))
+        .collect();
+    Ok((
+        Run {
+            search: GroupSearch::new(
+                partition,
+                default.clone(),
+                canonical.clone(),
+                weights.to_vec(),
+                plan.start.clone(),
+            ),
+            keying,
+            outputs: OutputPool::new(charges.clone()),
+            samples,
+            shuffle: Shuffle::default(),
+            clock: clock.clone(),
+            sequence: Sequence::default(),
+        },
+        canonical,
+    ))
+}
+
+/// Plan the next challenger work of `run`.
+fn plan_next(
+    implementation: &OnDevice,
+    charges: &Charges,
+    run: &mut Run,
+    planning: &mut Linear,
+) -> Result<Option<Piece>, TuneError> {
+    let Run { search, keying, .. } = run;
+    // Planning asks the declared domain for assignments, admissible or
+    // not, and what it takes follows how many it asks: observed as one
+    // call with its requests, the class the next piece's planning is
+    // priced by.
+    let (began, asked) = (Instant::now(), search.requests);
+    let planned = search.plan(&Declared {
+        implementation,
+        keying,
+    });
+    planning.observe(search.requests - asked, began.elapsed().as_secs_f64());
+    let mut planned = planned?;
+    // A sweep's chunk shares one compile among its challengers. A CPU
+    // unit compiles nothing (its kernels are in the binary), so its
+    // pieces measure one challenger each: a chunk would only take the
+    // device from every other unit for its whole session and, cut off
+    // at the deadline, keep none of its challengers. Its matched rounds
+    // sample the served choice beside each challenger either way. On an
+    // EPYC 9V45 a 12-challenger dense_expand chunk of gemma-4-e2b,
+    // priced 21 s from the default's samples, ran 39 s to the cutoff
+    // without completing a round (its single-participant challengers
+    // sample 7 s at 512 rows) and recorded nothing.
+    if matches!(charges.device().kind, crate::backends::OpenedKind::Cpu(_)) {
+        if let Some(piece) = &mut planned {
+            piece.keep_first();
+        }
+    }
+    Ok(planned)
+}
+
+/// Form the planned challengers, measure and admit them at the timed points,
+/// and plan the next piece. Each is recorded, whatever it measures.
+fn measure_piece<'a>(
+    formation: &Formation<'_, '_>,
+    programs: &mut Programs,
+    searching: &mut Searching<'a>,
+    time: &mut TuningTime,
+    forming: &mut f64,
+    replanning: &mut f64,
+    deadline: Deadline,
+) -> Result<(), WorkError<TuneError>> {
+    let piece = searching
+        .planned
+        .take()
+        .expect("a measurement performs a planned piece");
+    let compiled = formation.price.lock().expect("formation price lock").total();
+    let weighing = Weighing::of(&searching.points);
+    let mut piece_forming = 0.;
+    let mut piece_measuring = 0.;
+    let Searching {
+        plan,
+        points,
+        ledger,
+        run,
+        admission,
+        rates,
+        ..
+    } = searching;
+    let performed = run.perform(
+        piece,
+        programs,
+        formation,
+        points,
+        &plan.settings,
+        plan.min_sample_seconds,
+        rates,
+        &weighing,
+        ledger,
+        admission,
+        &mut piece_forming,
+        &mut piece_measuring,
+        deadline,
+    );
+    let compiled = formation.price.lock().expect("formation price lock").total() - compiled;
+    time.forming_seconds += piece_forming;
+    *forming += (piece_forming - compiled).max(0.);
+    time.measuring_seconds += piece_measuring;
+    let replanning_began = Instant::now();
+    let replanned = performed.and_then(|()| {
+        deadline.check(Duration::ZERO)?;
+        searching.planned = plan_next(
+            formation.implementation,
+            formation.charges,
+            &mut searching.run,
+            &mut searching.planning,
+        )?;
+        Ok(())
+    });
+    *replanning += replanning_began.elapsed().as_secs_f64();
+    replanned
+}
+
+/// Convert the leader: give its comparison with the served choice the
+/// matched rounds it lacks to resolve, and once its lead is resolved,
+/// check it at the untimed points and serve it. Whether it was
+/// promoted; what the rounds showed is recorded either way.
+#[allow(clippy::too_many_arguments)]
+fn promote_leader<'a>(
+    formation: &Formation<'_, '_>,
+    programs: &mut Programs,
+    point_states: &mut [PointState],
+    ground: &Ground,
+    searching: &mut Searching<'a>,
+    time: &mut TuningTime,
+    forming: &mut f64,
+    source: &mut dyn PointSource<'a>,
+    conversion: Conversion,
+    deadline: Deadline,
+) -> Result<bool, WorkError<TuneError>> {
+    let implementation = formation.implementation;
+    let Searching {
+        plan,
+        points,
+        untimed,
+        covered,
+        canonical,
+        ledger,
+        run,
+        rates,
+        ..
+    } = searching;
+    let leader = match conversion {
+        Conversion::Promote => ledger.leader(),
+        Conversion::Confirm => ledger.nominal().map(|(leader, _)| leader),
+    }
+    .expect("a conversion converts the leader its work named")
+    .clone();
+    // A leader that gave up its kernel is formed again; one that can
+    // no longer be formed is recorded so and gives way to the next.
+    if ledger.kernel(&leader).is_none() {
+        let specialization = ledger.contender(&leader).specialization.clone();
+        let compiled = formation.price.lock().expect("formation price lock").total();
+        let began = Instant::now();
+        let formed = programs
+            .form(formation, &[specialization], &[])?
+            .pop()
+            .expect("one configuration was formed");
+        let piece_forming = began.elapsed().as_secs_f64();
+        let mut price = formation.price.lock().expect("formation price lock");
+        let compiled = price.total() - compiled;
+        // Its record states how it was first formed, not this.
+        price.calls.clear();
+        drop(price);
+        time.forming_seconds += piece_forming;
+        *forming += (piece_forming - compiled).max(0.);
+        match formed {
+            Ok(kernel) => ledger.hold(&leader, kernel),
+            Err(exclusion) => {
+                ledger.reject(&leader, exclusion);
+                return Ok(false);
+            }
+        }
+    }
+    let keying = &run.keying;
+    let kernel = ledger
+        .kernel(&leader)
+        .cloned()
+        .expect("the leader holds its kernel");
+    let leading = ledger.contender(&leader).specialization.clone();
+    let rate = plan.settings.error_rate;
+    let before = ledger.evidence(ledger.contender(&leader));
+    if before.verdict(rate).is_none() {
+        let began = Instant::now();
+        let served = ledger.incumbent();
+        let (served_kernel, served_points) = (
+            ledger.incumbent_kernel().clone(),
+            served.points.clone(),
+        );
+        // Nothing is reused: every point that tells the two apart is
+        // sampled in every round, so the rounds are evidence.
+        let compared = measure_matched(
+            &|working, specialization| keying.key(implementation, working, specialization),
+            &[Candidate {
+                specialization: leading.clone(),
+                kernel: kernel.clone(),
+                evidence: before,
+            }],
+            &Incumbent {
+                specialization: &served.specialization,
+                kernel: &served_kernel,
+                points: &served_points,
+            },
+            points,
+            Matching {
+                deadline,
+                settings: &plan.settings,
+                min_sample_seconds: plan.min_sample_seconds,
+                rates,
+                shuffle: &mut run.shuffle,
+                clock: &run.clock,
+                sequence: &mut run.sequence,
+            },
+            None,
+            &served_points,
+            None,
+            &mut run.outputs,
+            // It is no longer new to the unit: it is witnessed where it
+            // has not been, before its rounds, and its placement is
+            // repeated.
+            None,
+        )
+        .pop()
+        .expect("one challenger was compared");
+        time.measuring_seconds += began.elapsed().as_secs_f64();
+        let served = ledger.incumbent.clone();
+        match compared {
+            Err(exclusion) => {
+                ledger.reject(&leader, exclusion);
+                return Ok(false);
+            }
+            Ok(None) => return Err(WorkError::Expired),
+            Ok(Some((measured, evidence))) => {
+                let contender = ledger.contender_mut(&leader);
+                contender.cost = Weighing::of(points).cost(&measured, canonical);
+                contender.points = measured.clone();
+                contender.confirmed = measured;
+                contender.standing = ContenderStanding::Measured {
+                    against: served,
+                    evidence,
+                };
+                // A trail is recorded when the challengers are ranked
+                // again, as this piece ends; an unresolved lead stays
+                // as it is.
+                if evidence.verdict(rate) != Some(Verdict::Leads) {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    let key = |working| keying.key(implementation, working, &leading);
+    let mut scope = ScopeQualification {
+        deadline,
+        source,
+        points: point_states,
+        indices: untimed,
+        validator: &ground.validator,
+        covered,
+        default: &ground.kernel.artifact().0,
+        key: &key,
+        building_seconds: 0.,
+        validating_seconds: 0.,
+        reference_seconds: 0.,
+    };
+    let covered = scope.qualify(&kernel);
+    time.building_seconds += scope.building_seconds;
+    time.validating_seconds += scope.validating_seconds;
+    time.scope_validation_seconds +=
+        (scope.validating_seconds - scope.reference_seconds).max(0.0);
+    if let Err(exclusion) = covered {
+        let exclusion = match exclusion {
+            WorkError::Expired => return Err(WorkError::Expired),
+            WorkError::Failed(exclusion) => exclusion,
+        };
+        ledger.failed += 1;
+        ledger.reject(&leader, exclusion);
+        return Ok(false);
+    }
+    // Serving prepares the chosen kernel as formed here. The unit's
+    // handoff is its one served choice: the leader's replaces the
+    // choice's it supersedes, which serving will never take.
+    deadline.check(Duration::ZERO)?;
+    kernel
+        .hand_off_replacing(ledger.kernel(&ledger.incumbent).map(AsRef::as_ref))
+        .map_err(|error| TuneError::Handoff(error.to_string()))?;
+    // The choice it supersedes still holds its kernel in `ledger.kernels`
+    // until the piece ends (`Ledger::release`).
+    ledger.promote(leader);
+    Ok(true)
 }
 
 /// What every result of one unit records about it.
@@ -5721,7 +5933,7 @@ impl Programs {
     /// up the held programs gives none of them up.
     fn grounded(
         &mut self,
-        implementation: &NativeImplementation,
+        implementation: &OnDevice,
         default: &NativeSpecialization,
         kernel: &Arc<NativePrepared>,
     ) {
@@ -5750,7 +5962,7 @@ impl Programs {
     /// everything is held.
     fn formables(
         &self,
-        implementation: &NativeImplementation,
+        implementation: &OnDevice,
         specializations: &[NativeSpecialization],
         ahead: &[NativeSpecialization],
     ) -> Vec<Formable> {
@@ -5889,7 +6101,7 @@ impl Programs {
                     formation.bindings.clone(),
                     specialization.clone(),
                     formation.cpu,
-                    implementation.clone(),
+                    implementation.implementation().clone(),
                 )
                 .map_err(|error| Exclusion::Formation(prepare_message(error)))
                 .and_then(|kernel| serving(kernel, formation.served)),
@@ -5975,7 +6187,7 @@ struct LaunchPrograms {
 /// configuration runs only the launches it reaches
 /// ([`NativeImplementation::reachable`]), as preparation forms it.
 fn launch_variants(
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     specializations: &[NativeSpecialization],
 ) -> BTreeMap<usize, BTreeSet<plan::LaunchVariant>> {
     let mut variants = BTreeMap::<usize, BTreeSet<plan::LaunchVariant>>::new();
@@ -6018,7 +6230,7 @@ impl LaunchPrograms {
     /// is formed for it in no variant.
     fn sources(
         &self,
-        implementation: &NativeImplementation,
+        implementation: &OnDevice,
         specializations: &[NativeSpecialization],
         ahead: &[NativeSpecialization],
     ) -> Vec<plan::LaunchSource> {
@@ -6171,10 +6383,12 @@ struct Sweep {
     /// keeps it.
     best: (Vec<u64>, f64),
     /// What the leaders' neighbourhoods do not reach, walked from what the
-    /// domain admits as it is asked for ([`RestWalk`]) from the seed, and
-    /// whether all of it was asked for: the group's admissible assignments
-    /// are then all measured, passed over as inert, or awaiting measurement.
-    rest: RestWalk,
+    /// domain admits as it is asked for ([`RestWalk`]) from the seed over
+    /// coordinates that are not inert, initialized when the walk begins, and
+    /// whether all of it was asked for: the group's active admissible
+    /// assignments are then all measured, passed over as inert, or awaiting
+    /// measurement.
+    rest: Option<RestWalk>,
     exhausted: bool,
     /// What awaits measurement was asked for from the rest, not by a
     /// leader's round.
@@ -6229,10 +6443,15 @@ struct RestWalk {
 }
 
 impl RestWalk {
+    #[cfg(test)]
     fn new(values: &[Vec<u64>], start: &[u64]) -> Self {
         let movable = (0..start.len())
             .filter(|&coordinate| values[coordinate].iter().any(|value| *value != start[coordinate]))
             .collect::<Vec<_>>();
+        Self::over(movable)
+    }
+
+    fn over(movable: Vec<usize>) -> Self {
         Self {
             sets: plan::Subsets::nearest_first(movable.len()),
             movable,
@@ -6321,7 +6540,7 @@ impl Sweep {
             expanded: BTreeSet::new(),
             round: None,
             best: (seed.clone(), cost),
-            rest: RestWalk::new(&group.values, &seed),
+            rest: None,
             exhausted: false,
             resting: false,
             seed,
@@ -6512,6 +6731,102 @@ impl GroupSearch {
                     *weight <= 0.
                         || domain.forecast(point, &measured.key, candidate) == measured.key
                 })
+    }
+
+    /// Whether moving `address` to `value` from `reference` (measured at
+    /// `reference_baseline`) can change the forecasted work at any weighted
+    /// point. Only admissible configurations are passed to `domain.forecast`.
+    fn coordinate_active(
+        &self,
+        domain: &dyn plan::Domain,
+        address: &plan::ParameterAddress,
+        value: u64,
+        reference: &NativeSpecialization,
+        reference_baseline: &[PointMeasurement],
+    ) -> Result<bool, TuneError> {
+        let single = std::slice::from_ref(address);
+        if let Some(placed) = domain.place(reference, single, &[value]).map_err(planning)? {
+            return Ok(!self.inert(domain, &placed, reference, reference_baseline));
+        }
+        let Some(witness) = domain.nearest(reference, single, &[value]).map_err(planning)? else {
+            return Ok(false);
+        };
+        let current = address.value(reference);
+        if let Some(without) = domain.place(&witness, single, &[current]).map_err(planning)? {
+            return Ok(
+                self.partition.boundary_of(&witness) != self.partition.boundary_of(&without)
+                    || reference_baseline.iter().zip(&self.weights).enumerate().any(
+                        |(point, (measured, weight))| {
+                            *weight > 0.
+                                && domain.forecast(point, &measured.key, &witness)
+                                    != domain.forecast(point, &measured.key, &without)
+                        },
+                    ),
+            );
+        }
+        Ok(!self.inert(domain, &witness, reference, reference_baseline))
+    }
+
+    /// The coordinates of `group` that have another declared value from
+    /// `seed` and are not inert at `base` or at any measured form leader of
+    /// `sweep`. Coordinates inert at every measured form cannot change the
+    /// service cost and are excluded from [`RestWalk`] so it never enumerates
+    /// their Cartesian product.
+    fn active_coordinates(
+        &self,
+        domain: &dyn plan::Domain,
+        group: &plan::Group,
+        base: &NativeSpecialization,
+        baseline: &[PointMeasurement],
+        seed: &[u64],
+        leaders: &BTreeMap<Vec<u64>, (Vec<u64>, f64, usize)>,
+    ) -> Result<Vec<usize>, TuneError> {
+        let mut references = vec![(base.clone(), baseline)];
+        for (leader, _, _) in leaders.values() {
+            if leader == seed {
+                continue;
+            }
+            if let Some(placed) = domain
+                .place(base, &group.parameters, leader)
+                .map_err(planning)?
+            {
+                if let Some(Some(measured)) = self.swept.get(&Configuration::of(&placed)) {
+                    references.push((placed, measured.as_slice()));
+                }
+            }
+        }
+        let mut active = Vec::new();
+        for coordinate in 0..seed.len() {
+            let address = &group.parameters[coordinate];
+            if !group.values[coordinate]
+                .iter()
+                .any(|&value| value != seed[coordinate])
+            {
+                continue;
+            }
+            let mut moves = false;
+            'refs: for (reference, reference_baseline) in &references {
+                let current = address.value(reference);
+                for &value in &group.values[coordinate] {
+                    if value != current
+                        && self.coordinate_active(
+                            domain,
+                            address,
+                            value,
+                            reference,
+                            reference_baseline,
+                        )?
+                    {
+                        moves = true;
+                        break 'refs;
+                    }
+                }
+            }
+            if moves {
+                active.push(coordinate);
+            }
+        }
+        Ok(active)
     }
 
     /// The consumer's hints the domain admits, as whole configurations:
@@ -6784,12 +7099,12 @@ impl GroupSearch {
             return;
         };
         let assignment = group.assignment(&specialization);
-        if !sweep.asked.insert(assignment.clone()) {
+        if sweep.asked.contains(&assignment)
+            || self.inert(domain, &specialization, base, baseline)
+        {
             return;
         }
-        if self.inert(domain, &specialization, base, baseline) {
-            return;
-        }
+        sweep.asked.insert(assignment.clone());
         let sequence = sweep.asked.len() - 1;
         let configuration = Configuration::of(&specialization);
         self.generated.insert(configuration.clone());
@@ -6907,10 +7222,23 @@ impl GroupSearch {
                             .iter()
                             .zip(&sweep.seed)
                             .fold(base.clone(), |held, (address, value)| address.set(held, *value));
+                        if sweep.rest.is_none() {
+                            let movable = self.active_coordinates(
+                                domain,
+                                group,
+                                base,
+                                baseline,
+                                &sweep.seed,
+                                &sweep.leaders,
+                            )?;
+                            sweep.rest = Some(RestWalk::over(movable));
+                        }
                         let asked = sweep.asked.len();
                         while sweep.pending.len() < wanted {
                             let Some(assignment) = sweep
                                 .rest
+                                .as_mut()
+                                .expect("rest walk initialized above")
                                 .next(domain, group, &at_start, &sweep.seed, wanted)
                                 .map_err(planning)?
                             else {
@@ -7964,13 +8292,13 @@ impl Tuned<'_> {
 }
 
 /// The declared invocation demand never changes when discovery is incomplete.
-fn point_records(points: &[PointSpec]) -> Vec<PointRecord> {
+fn point_records(points: &[PointState]) -> Vec<PointRecord> {
     points
         .iter()
         .map(|point| PointRecord {
-            label: point.label.clone(),
-            weight: point.weight,
-            class: point.class.clone(),
+            label: point.spec.label.clone(),
+            weight: point.spec.weight,
+            class: point.spec.class.clone(),
         })
         .collect()
 }
@@ -7987,7 +8315,7 @@ fn planning(error: plan::PlanError) -> TuneError {
 /// ([`unserved_parameters`]), where it is formed whole. A search plans by
 /// it, and a survey records it for a replay of the search.
 fn search_plan(
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     statics: &NativeSpecialization,
     shapes: &[PointShape],
 ) -> Result<(plan::TuningPartition, Keying), TuneError> {
@@ -8016,7 +8344,7 @@ fn search_plan(
 /// no launch reads affects every launch and is never one of them. With them,
 /// the launches each of `shapes` can run.
 fn unserved_parameters(
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     statics: &NativeSpecialization,
     shapes: &[PointShape],
 ) -> Result<(Vec<plan::ParameterAddress>, Vec<plan::PlannedPoint>), TuneError> {
@@ -8070,7 +8398,7 @@ fn unserved_parameters(
 /// point ([`unserved_parameters`]) at its default.
 struct SurveyDomain {
     /// The unit's implementation with its unserved parameters fixed.
-    implementation: NativeImplementation,
+    implementation: OnDevice,
     influence: Influence,
     /// How the unit's points are keyed, as its surveyor keys them.
     keying: Keying,
@@ -8100,30 +8428,35 @@ struct SurveyedAssignment {
 
 impl SurveyDomain {
     fn of(
-        implementation: &NativeImplementation,
+        implementation: &OnDevice,
         statics: &NativeSpecialization,
         default: &NativeSpecialization,
         shapes: Vec<PointShape>,
     ) -> Result<Self, TuneError> {
         let (unserved, _) = unserved_parameters(implementation, statics, &shapes)?;
         let (plan, _) = search_plan(implementation, statics, &shapes)?;
-        let mut walked = implementation.clone();
-        for address in &unserved {
-            let parameter = match address {
-                plan::ParameterAddress::Entry(name) => walked
-                    .params
-                    .iter_mut()
-                    .find(|parameter| parameter.name == *name),
-                plan::ParameterAddress::Launch { ordinal, name } => walked.launches[*ordinal]
-                    .params
-                    .iter_mut()
-                    .find(|parameter| parameter.name == *name),
-            }
-            .expect("an unserved parameter is declared");
-            let value = address.value(default);
-            parameter.values = vec![value];
-            parameter.default = NativeDefault::Value(NativeNatExpr::Constant(value));
-        }
+        let walked = implementation
+            .owned()
+            .adjusted::<std::convert::Infallible>(|walked| {
+                for address in &unserved {
+                    let parameter = match address {
+                        plan::ParameterAddress::Entry(name) => walked
+                            .params
+                            .iter_mut()
+                            .find(|parameter| parameter.name == *name),
+                        plan::ParameterAddress::Launch { ordinal, name } => walked.launches[*ordinal]
+                            .params
+                            .iter_mut()
+                            .find(|parameter| parameter.name == *name),
+                    }
+                    .expect("an unserved parameter is declared");
+                    let value = address.value(default);
+                    parameter.values = vec![value];
+                    parameter.default = NativeDefault::Value(NativeNatExpr::Constant(value));
+                }
+                Ok(())
+            })
+            .unwrap();
         Ok(Self {
             influence: Influence::of(&walked),
             keying: Keying::of(&walked),
@@ -9455,6 +9788,8 @@ mod tests {
                 dimensions: BTreeMap::from([("M".into(), *rows), ("O".into(), *rows)]),
             })
             .collect::<Vec<_>>();
+        let implementation = implementation
+            .at_device(&seismic_lang::device::BackendFloor(implementation.backend));
         let partition = Rc::new(plan::partition(&implementation, &statics, &shapes).unwrap());
         // The launches a configuration runs at a point, and a time there
         // that only the packing form improves, at prefill rows.
@@ -9988,7 +10323,7 @@ mod tests {
         parameters: usize,
         values: u64,
     ) -> (
-        NativeImplementation,
+        OnDevice,
         GroupSearch,
         impl Fn(&NativeImplementation, &NativeSpecialization) -> PointMeasurement,
     ) {
@@ -10031,7 +10366,7 @@ mod tests {
     /// the leaders' neighbourhoods (what is asked after them is the rest of
     /// the domain). Returns the requests the planning made of the domain.
     fn planned_and_measured(
-        implementation: &NativeImplementation,
+        implementation: &OnDevice,
         run: &mut GroupSearch,
         measurement: &impl Fn(&NativeImplementation, &NativeSpecialization) -> PointMeasurement,
     ) -> Option<usize> {
@@ -11010,6 +11345,105 @@ mod tests {
         assert!(
             ended > budget,
             "one mean over both classes overruns: {ended}"
+        );
+    }
+
+    #[test]
+    fn group_search_does_not_explode_on_inert_axes() {
+        // Two active launches in one group (coupled via shared LANES): launch 0
+        // serves N == 1 (weighted 1.0), launch 1 serves N == 32 (weighted 0.0)
+        // and owns 12 local parameters of 4 values each (4^12 = 16,777,216 inert
+        // combinations). GroupSearch must exhaust the active subspace in
+        // milliseconds without enumerating the inert Cartesian product or
+        // storing inert assignments in sweep.asked.
+        let inert_params = (0..12)
+            .map(|i| format!("INERT_{i} in [1, 2, 4, 8] default 1"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let inert_product = (0..12)
+            .map(|i| format!("INERT_{i}"))
+            .collect::<Vec<_>>()
+            .join(" * ");
+        let body = format!(
+            "    params (LANES in [16, 32] default 32)\n\
+             \x20   launch active when N <= 8:\n\
+             \x20       params (ROWS in [1, 2] default 1)\n\
+             \x20       threadgroups (ceil_div(N, ROWS * 32 / LANES), 1, 1)\n\
+             \x20       threads_per_threadgroup (32, 1, 1)\n\
+             \x20   launch untimed when N > 8:\n\
+             \x20       params ({inert_params})\n\
+             \x20       reads (LANES)\n\
+             \x20       threadgroups (ceil_div(N, {inert_product}), 1, 1)\n\
+             \x20       threads_per_threadgroup (32, 1, 1)\n"
+        );
+        let implementation = declared(&body);
+        let statics = NativeSpecialization::new();
+        let seed = implementation
+            .default_specialization_without_device(&statics)
+            .unwrap()
+            .unwrap();
+        let points = shapes(&[1, 32]);
+        let partition = plan::partition(&implementation, &statics, &points).unwrap();
+        assert_eq!(partition.groups.len(), 1);
+        assert_eq!(partition.groups[0].declared(), 4u128 * (1u128 << 24));
+        let keying = Keying::Launches(partition.boundary.clone());
+        let domain = Declared {
+            implementation: &implementation,
+            keying: &keying,
+        };
+        let measure = |spec: &NativeSpecialization| {
+            vec![
+                PointMeasurement {
+                    point: "m1".into(),
+                    key: keying.key(&implementation, vec![0], spec),
+                    ..measured(1.0, 0.0)
+                },
+                PointMeasurement {
+                    point: "m32".into(),
+                    key: keying.key(&implementation, vec![1], spec),
+                    ..measured(1.0, 0.0)
+                },
+            ]
+        };
+        let reference = measure(&seed);
+        let mut search = GroupSearch::new(
+            partition,
+            seed.clone(),
+            reference,
+            vec![1.0, 0.0],
+            Vec::new(),
+        );
+        let mut measured_count = 0usize;
+        while let Some(piece) = search.plan(&domain).unwrap() {
+            let specs = match piece {
+                Piece::Whole(specs) => specs,
+                Piece::Sweep { ready, .. } => ready,
+            };
+            for spec in specs {
+                search.record(&spec, Some(measure(&spec)));
+                measured_count += 1;
+            }
+            assert!(
+                measured_count <= 4,
+                "only the 3 non-seed active combinations should be measured, got {measured_count}"
+            );
+        }
+        assert!(search.exhausted());
+        assert_eq!(measured_count, 3);
+        let max_asked = search
+            .sweeps
+            .values()
+            .map(|sweep| sweep.asked.len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_asked <= 4,
+            "inert assignments must not grow sweep.asked (got {max_asked})"
+        );
+        assert!(
+            search.requests < 500,
+            "RestWalk must not enumerate inert Cartesian product (got {} requests)",
+            search.requests
         );
     }
 }

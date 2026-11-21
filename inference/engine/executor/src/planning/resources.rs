@@ -96,8 +96,8 @@ pub struct ResourceLimits {
 /// sealed at each length up to it; a group of more launches runs several
 /// passes. It is a priced holding: one
 /// launch is the least that is a pass, and each larger count is worth the
-/// prefill seconds its fewer passes save. The arena the launches' own graphs
-/// fix still bounds it (`group_pass_rows`), as do the chain's places.
+/// prefill seconds its fewer passes save. `execution_plan` is its single
+/// owner, bounded by the chain's places.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PassLaunches(NonZeroUsize);
 

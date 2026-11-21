@@ -145,11 +145,13 @@ impl<'a> QualificationView<'a> {
                 widened = true;
             }
         }
-        for block in self.programs.head.iter().flat_map(|head| &head.blocks) {
-            if let Some((binding, kernels)) = block.binding.streams.zip(block.streams.as_ref()) {
-                qualify_stream_binding(charges, binding, kernels, &mut QualifiedSites::default())?;
-                let label = format!("{binding:?}");
-                qualify_widening(charges, binding.geometry.hidden, binding.geometry.streams, kernels, &label)?;
+        if let Some(AttestedDrafter::Head(head)) = &self.programs.drafter {
+            for block in &head.blocks {
+                if let Some((binding, kernels)) = block.binding.streams.zip(block.streams.as_ref()) {
+                    qualify_stream_binding(charges, binding, kernels, &mut QualifiedSites::default())?;
+                    let label = format!("{binding:?}");
+                    qualify_widening(charges, binding.geometry.hidden, binding.geometry.streams, kernels, &label)?;
+                }
             }
         }
         Ok(())

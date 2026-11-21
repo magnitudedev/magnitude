@@ -28,19 +28,21 @@ export function OnboardingScreen() {
   const observation = useServiceObservation()
   const preparation = local?.preparation
   const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`
-  const progress: readonly { label: string; done: boolean; detail: string | null; fraction: number | null }[] = [
+  const benchmark = recommendations.benchmark
+  const progress: readonly { label: string; subtitle?: string | null; done: boolean; detail: string | null; fraction: number | null }[] = [
     { label: preparationLabels[0], done: Result.isSuccess(observation.service) && observation.service.value._tag === "Ready", detail: null, fraction: null },
     { label: preparationLabels[1], done: Result.isSuccess(hardware), detail: null, fraction: null },
     { label: preparationLabels[2], done: preparation?.discovery.complete ?? false,
       detail: preparation && (preparation.discovery.complete || found.length > 0) ? `${plural(found.length, "model")} found` : null, fraction: null },
-    // The models are offered once every quant has been measured, so the list never changes under the reader.
+    // The models are offered once the hardware benchmark and ranking complete, so the list never shifts under the reader.
     { label: preparationLabels[3], done: recommendationsSettled(recommendations),
-      detail: recommendations.measuring && recommendations.measuring.total > 0 ? `${recommendations.measuring.settled} of ${plural(recommendations.measuring.total, "quant")}` : null,
-      fraction: recommendations.measuring && recommendations.measuring.total > 0 ? recommendations.measuring.settled / recommendations.measuring.total : null },
+      subtitle: benchmark?.subtitle ?? null,
+      detail: benchmark && benchmark.percent !== null ? `${benchmark.percent}%` : null,
+      fraction: benchmark?.fraction ?? null },
   ]
   const active = progress.findIndex(step => !step.done)
   const steps: readonly PreparationStep[] | null = active === -1 ? null
-    : progress.map((step, index) => ({ label: step.label, detail: step.detail, fraction: step.fraction, state: step.done ? "done" : index === active ? "active" : "pending" }))
+    : progress.map((step, index) => ({ label: step.label, subtitle: step.subtitle, detail: step.detail, fraction: step.fraction, state: step.done ? "done" : index === active ? "active" : "pending" }))
   const measuring = steps !== null
   return <Onboarding
     machine={Result.isSuccess(hardware) ? machineView(hardware.value) : null}

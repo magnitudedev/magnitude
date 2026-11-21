@@ -2,30 +2,39 @@
 //! products (below), and rows as NVFP4 operands ([`nvfp4`]).
 //!
 //! A row of activations is quantized once per call into blocks of
-//! [`Q8_BLOCK`] values: an `f32` scale `d`, the codes `round(x / d)` in
+//! [`Q8_BLOCK`] values: eight [`Q8_GROUP`]-value (32-value) sub-blocks, each
+//! with its own `f32` scale `d[g]` and codes `round(x / d[g])` in
 //! `[-127, 127]`, and the sums of each 16 consecutive codes (which the
-//! k-quant min terms use). A final partial block is padded with zero codes.
+//! k-quant min terms use). A final partial block is padded with zero codes
+//! and zero scales.
 //!
-//! The scale is `max|x| / 127` rounded to nearest; where that is subnormal
-//! (`max|x| < 127 · 2^-126`) it is rounded up onto the subnormal grid
-//! instead, so that every `|x / d| ≤ 127` and `d` is zero only when the block
-//! is. Each code is the stored scale's exact quotient rounded once, half away
-//! from zero. A NaN or ±Inf value makes its block's scale NaN and every code
-//! 0, so the product is NaN. Every step is scalar-exact, so every tier
-//! produces the same block, and CUDA's and Metal's INT8 staging (over groups
-//! of 32, Metal's scale on F16's grid) follow the same rule, which
-//! `tests/int8_rule` in `magnitude-kernels` checks against this quantizer.
+//! Each sub-block's scale is `max|x| / 127` rounded to nearest; where that is
+//! subnormal (`max|x| < 127 · 2^-126`) it is rounded up onto the subnormal grid
+//! instead, so that every `|x / d| ≤ 127` and `d` is zero only when the
+//! sub-block is. Each code is the stored scale's exact quotient rounded once,
+//! half away from zero. A NaN or ±Inf value makes its sub-block's scale NaN
+//! and every code in that sub-block 0, so the product is NaN. Every step is
+//! scalar-exact, so every tier produces the same block, and CUDA's and
+//! Metal's INT8 staging (over groups of 32, Metal's scale on F16's grid)
+//! follow the same rule, which `tests/int8_rule` in `magnitude-kernels`
+//! checks against this quantizer.
 //!
 //! Quantizing activations changes a projection's arithmetic: an entry offers
 //! it as an `arithmetic` tuning parameter, validated like any other.
 
 use crate::element::{f16_to_f32, f32_to_f16};
-use seismic_lang::cpu::{CPU_Q8_ALIGNMENT, CPU_Q8_BYTES, CPU_Q8_ROWS, CPU_Q8_VALUES};
+use seismic_lang::cpu::{CPU_Q8_ALIGNMENT, CPU_Q8_BYTES, CPU_Q8_GROUP, CPU_Q8_ROWS, CPU_Q8_VALUES};
 
 pub mod nvfp4;
 
 /// Values per quantized activation block (the k-quant super block).
 pub const Q8_BLOCK: usize = CPU_Q8_VALUES as usize;
+
+/// Values per quantized activation scale group (one packet).
+pub const Q8_GROUP: usize = CPU_Q8_GROUP as usize;
+
+/// Scale groups per quantized activation block.
+pub const Q8_GROUPS: usize = Q8_BLOCK / Q8_GROUP;
 
 /// Bytes of one quantized activation block, which declarations size their
 /// scratch by as `Q8_BYTES`.
@@ -41,7 +50,8 @@ pub struct Q8Block {
     pub(crate) codes: [i8; Q8_BLOCK],
     /// Sums of codes `16 j .. 16 j + 16`.
     pub(crate) sums: [i16; Q8_BLOCK / 16],
-    pub(crate) d: f32,
+    /// Scale of each 32-value sub-block (`32 g .. 32 g + 32`).
+    pub(crate) d: [f32; Q8_GROUPS],
 }
 
 const _: () = assert!(
@@ -59,7 +69,7 @@ impl Q8Block {
     pub const ZERO: Q8Block = Q8Block {
         codes: [0; Q8_BLOCK],
         sums: [0; Q8_BLOCK / 16],
-        d: 0.0,
+        d: [0.0; Q8_GROUPS],
     };
 
     /// The block's codes.
@@ -67,9 +77,9 @@ impl Q8Block {
         &self.codes
     }
 
-    /// The block's scale.
-    pub fn scale(&self) -> f32 {
-        self.d
+    /// The block's per-sub-block scales (one per [`Q8_GROUP`] values).
+    pub fn scales(&self) -> &[f32; Q8_GROUPS] {
+        &self.d
     }
 
     /// Blocks as the one-row tiles they are: a block's codes, sums and
@@ -107,7 +117,8 @@ pub struct Q8Tile<const R: usize = TILE_ROWS> {
     pub(crate) codes: [[[i8; 8]; R]; Q8_BLOCK / 8],
     /// `sums[r]`: row `r`'s `Q8Block::sums`.
     pub(crate) sums: [[i16; Q8_BLOCK / 16]; R],
-    pub(crate) d: [f32; R],
+    /// `d[r]`: row `r`'s `Q8Block::d`.
+    pub(crate) d: [[f32; Q8_GROUPS]; R],
 }
 
 const _: () = assert!(
@@ -119,7 +130,7 @@ impl Q8Tile {
     pub const ZERO: Q8Tile = Q8Tile {
         codes: [[[0; 8]; TILE_ROWS]; Q8_BLOCK / 8],
         sums: [[0; Q8_BLOCK / 16]; TILE_ROWS],
-        d: [0.0; TILE_ROWS],
+        d: [[0.0; Q8_GROUPS]; TILE_ROWS],
     };
 
     /// Places `block` as row `row` of the tile at `tile`, writing that row's
@@ -171,9 +182,20 @@ pub const fn blocks(k: usize) -> usize {
 pub fn quantize(x: &[f32], out: &mut [Q8Block]) {
     let out = &mut out[..blocks(x.len())];
     for (values, block) in x.chunks(Q8_BLOCK).zip(out.iter_mut()) {
-        block.d = quantize_group::<F32Grid>(values, &mut block.codes[..values.len()]);
-        for code in &mut block.codes[values.len()..] {
-            *code = 0;
+        for (g, d) in block.d.iter_mut().enumerate() {
+            let start = g * Q8_GROUP;
+            let codes = &mut block.codes[start..start + Q8_GROUP];
+            if start < values.len() {
+                let end = (start + Q8_GROUP).min(values.len());
+                let group = &values[start..end];
+                *d = quantize_group::<F32Grid>(group, &mut codes[..group.len()]);
+                for code in &mut codes[group.len()..] {
+                    *code = 0;
+                }
+            } else {
+                *d = 0.0;
+                codes.fill(0);
+            }
         }
         for (j, sum) in block.sums.iter_mut().enumerate() {
             *sum = block.codes[16 * j..16 * j + 16]
@@ -349,35 +371,49 @@ pub(crate) mod tests {
         }
     }
 
-    /// Asserts each of `blocks` is `x`'s exactly: the scale rule, every code
-    /// the exact quotient by the stored scale rounded half away from zero
-    /// (checked in F64, whose quotient of F32 values rounds the same), and
-    /// the code sums. A block with a NaN or ±Inf has a NaN scale and zero
-    /// codes.
+    /// Asserts each of `blocks` is `x`'s exactly: the scale rule per 32-value
+    /// sub-block, every code the exact quotient by the stored sub-block scale
+    /// rounded half away from zero (checked in F64, whose quotient of F32
+    /// values rounds the same), and the code sums. A sub-block with a NaN or
+    /// ±Inf has a NaN scale and zero codes.
     pub(crate) fn assert_exact(x: &[f32], blocks: &[Q8Block]) {
         for (b, (values, block)) in x.chunks(Q8_BLOCK).zip(blocks).enumerate() {
-            if values.iter().any(|value| !value.is_finite()) {
-                assert!(block.d.is_nan(), "block {b}: scale {:e} of a non-finite block", block.d);
-                assert!(block.codes.iter().all(|code| *code == 0) && block.sums.iter().all(|sum| *sum == 0), "block {b}");
-                continue;
-            }
-            let maximum = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            let (d, top) = (f64::from(block.d), f64::from(maximum));
-            assert_eq!(block.d == 0.0, maximum == 0.0, "block {b}: scale {:e} of maximum {maximum:e}", block.d);
-            if block.d < f32::MIN_POSITIVE {
-                // Rounded up onto the subnormal grid: the least step at or
-                // above maximum / 127.
-                assert!(d * 127.0 >= top, "block {b}");
-                assert!(block.d == 0.0 || f64::from(f32::from_bits(block.d.to_bits() - 1)) * 127.0 < top, "block {b}");
-            } else {
-                assert_eq!(block.d.to_bits(), (maximum / 127.0).to_bits(), "block {b}");
-            }
-            for (i, code) in block.codes.iter().enumerate() {
-                // 0 / 0 codes 0.
-                let quotient = values.get(i).map_or(0.0, |x| (f64::from(*x) / d).round());
-                let expected = if quotient.is_nan() { 0.0 } else { quotient };
-                assert!(expected.abs() <= 127.0, "block {b} code {i}");
-                assert_eq!(f64::from(*code), expected, "block {b} code {i}: {:?} / {d:e}", values.get(i));
+            for (g, &scale) in block.d.iter().enumerate() {
+                let start = g * Q8_GROUP;
+                let group = if start < values.len() {
+                    &values[start..(start + Q8_GROUP).min(values.len())]
+                } else {
+                    &[]
+                };
+                let codes = &block.codes[start..start + Q8_GROUP];
+                if group.iter().any(|value| !value.is_finite()) {
+                    assert!(scale.is_nan(), "block {b} group {g}: scale {:e} of a non-finite group", scale);
+                    assert!(
+                        codes.iter().all(|code| *code == 0)
+                            && block.sums[2 * g] == 0
+                            && block.sums[2 * g + 1] == 0,
+                        "block {b} group {g}"
+                    );
+                    continue;
+                }
+                let maximum = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let (d, top) = (f64::from(scale), f64::from(maximum));
+                assert_eq!(scale == 0.0, maximum == 0.0, "block {b} group {g}: scale {:e} of maximum {maximum:e}", scale);
+                if scale < f32::MIN_POSITIVE {
+                    // Rounded up onto the subnormal grid: the least step at or
+                    // above maximum / 127.
+                    assert!(d * 127.0 >= top, "block {b} group {g}");
+                    assert!(scale == 0.0 || f64::from(f32::from_bits(scale.to_bits() - 1)) * 127.0 < top, "block {b} group {g}");
+                } else {
+                    assert_eq!(scale.to_bits(), (maximum / 127.0).to_bits(), "block {b} group {g}");
+                }
+                for (i, code) in codes.iter().enumerate() {
+                    // 0 / 0 codes 0.
+                    let quotient = group.get(i).map_or(0.0, |x| (f64::from(*x) / d).round());
+                    let expected = if quotient.is_nan() { 0.0 } else { quotient };
+                    assert!(expected.abs() <= 127.0, "block {b} group {g} code {i}");
+                    assert_eq!(f64::from(*code), expected, "block {b} group {g} code {i}: {:?} / {d:e}", group.get(i));
+                }
             }
             for (j, sum) in block.sums.iter().enumerate() {
                 assert_eq!(*sum, block.codes[16 * j..16 * j + 16].iter().map(|c| i16::from(*c)).sum::<i16>());
@@ -385,8 +421,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A NaN or ±Inf value makes its block's scale NaN and every code 0, so
-    /// the product is NaN; the row's other blocks are unaffected.
+    /// A NaN or ±Inf value makes its sub-block's scale NaN and every code 0,
+    /// so the product is NaN; the row's other sub-blocks are unaffected.
     #[test]
     fn non_finite_values_make_their_block_nan() {
         for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
@@ -394,7 +430,12 @@ pub(crate) mod tests {
             x[Q8_BLOCK + 70] = non_finite;
             let mut blocks = vec![Q8Block::ZERO; blocks(x.len())];
             quantize(&x, &mut blocks);
-            assert!(blocks[1].d.is_nan() && blocks[0].d.is_finite() && blocks[2].d.is_finite(), "{non_finite}");
+            assert!(
+                blocks[1].d[70 / Q8_GROUP].is_nan()
+                    && blocks[0].d.iter().all(|d| d.is_finite())
+                    && blocks[2].d.iter().all(|d| d.is_finite()),
+                "{non_finite}"
+            );
             assert_exact(&x, &blocks);
         }
     }
@@ -409,8 +450,9 @@ pub(crate) mod tests {
         assert_exact(&x, &blocks);
         for (i, value) in x.iter().enumerate() {
             let block = &blocks[i / Q8_BLOCK];
-            let decoded = block.d * f32::from(block.codes[i % Q8_BLOCK]);
-            assert!((decoded - value).abs() <= block.d * 0.5 + 1e-7, "{i}");
+            let d = block.d[(i % Q8_BLOCK) / Q8_GROUP];
+            let decoded = d * f32::from(block.codes[i % Q8_BLOCK]);
+            assert!((decoded - value).abs() <= d * 0.5 + 1e-7, "{i}");
         }
         assert!(blocks[2].codes[600 - 512..].iter().all(|code| *code == 0));
     }
@@ -432,8 +474,8 @@ pub(crate) mod tests {
     /// Blocks whose scales are subnormal, from just under the normal range
     /// to maxima below 64 · 2^-149 (where `maximum / 127` rounds to zero),
     /// code every value by the stored scale within [-127, 127], and no
-    /// nonzero block stores a zero scale. Each block also carries ±0 and the
-    /// least subnormal.
+    /// nonzero sub-block stores a zero scale. Each block also carries ±0 and
+    /// the least subnormal.
     #[test]
     fn subnormal_scales_code_by_the_stored_scale() {
         let mut x = Vec::new();
@@ -449,7 +491,7 @@ pub(crate) mod tests {
         let mut blocks = vec![Q8Block::ZERO; blocks(x.len())];
         quantize(&x, &mut blocks);
         assert_exact(&x, &blocks);
-        assert!(blocks.iter().all(|block| block.d > 0.0 && block.d < f32::MIN_POSITIVE));
+        assert!(blocks.iter().all(|block| block.d.iter().all(|&d| d > 0.0 && d < f32::MIN_POSITIVE)));
     }
 
     #[test]

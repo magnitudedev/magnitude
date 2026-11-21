@@ -65,20 +65,21 @@ fn short_conv_rows[M, B, S, CH, C, T](projection: &tensor[M, 2 * CH] f32,
                             window[target, tap, channel] = projection[publish + tap - (C - 1), channel]
     return gated
 
-# Metal: a thread per (channel, row) for grid y < M; grid y = M + b
-# publishes slot b's successor window. The tap loop is the body's chain, so
-# the bits match on every backend and row class.
+# Metal: a thread owns 4 contiguous channels over a 16-row tile for grid y <
+# ceil_div(M, 16); grid y = ceil_div(M, 16) + b publishes slot b's successor
+# window. The tap loop is the body's chain, so the bits match on every backend
+# and row class.
 native short_conv_rows for metal from "metal/short_conv_rows.metal":
     launch short_conv_rows:
-        threadgroups (ceil_div(CH, 256), M + B, 1)
-        threads_per_threadgroup (256, 1, 1)
+        threadgroups (ceil_div(CH, 512), ceil_div(M, 16) + B, 1)
+        threads_per_threadgroup (128, 1, 1)
 
-# CUDA and Vulkan: the Metal items, visited by a grid-stride loop over y
-# because both cap the y grid at 65535 groups.
+# CUDA: the Metal items, visited by a grid-stride loop over y because CUDA
+# caps the y grid at 65535 groups.
 native short_conv_rows for cuda from "cuda/short_conv_rows.cu":
     launch short_conv_rows:
-        threadgroups (ceil_div(CH, 256), min(M + B, 65535), 1)
-        threads_per_threadgroup (256, 1, 1)
+        threadgroups (ceil_div(CH, 512), min(ceil_div(M, 16) + B, 65535), 1)
+        threads_per_threadgroup (128, 1, 1)
 
 native short_conv_rows for vulkan from "vulkan/short_conv_rows.comp":
     launch short_conv_rows:
@@ -136,8 +137,8 @@ native short_conv_project for metal from "metal/short_conv_project.metal":
     where H > 0 and BS <= 1 and CS <= 1 and XS <= 1
     project dense segmented ((b_weight, x_weight), c_weight)
     restate single_gemv
-    scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * H * 2) when M > VERIFY_ROWS and (M > 16 or MATRIX == 1)
-    launch short_conv_project_normalize before batch when M > VERIFY_ROWS and (M > 16 or MATRIX == 1) and (M <= 64 or TALL == 0 or PACK == 1):
+    scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * H * 2) when M > 16 or MATRIX == 1
+    launch short_conv_project_normalize before batch when (M > 16 or MATRIX == 1) and (M <= 64 or TALL == 0 or PACK == 1):
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)

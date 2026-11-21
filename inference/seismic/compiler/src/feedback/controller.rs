@@ -68,16 +68,73 @@ impl FeedbackReport {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateState {
+    Unprepared,
+    Prepared(PreparedCandidateId),
+    Rejected,
+}
+
+impl CandidateState {
+    fn executable(self) -> Option<PreparedCandidateId> {
+        match self {
+            Self::Prepared(executable) => Some(executable),
+            Self::Unprepared | Self::Rejected => None,
+        }
+    }
+
+    fn is_prepared(self) -> bool {
+        matches!(self, Self::Prepared(_))
+    }
+
+    fn is_rejected(self) -> bool {
+        matches!(self, Self::Rejected)
+    }
+}
+
 struct Candidate {
     coordinate: CandidateCoordinate,
-    executable: Option<PreparedCandidateId>,
-    rejected: bool,
+    state: CandidateState,
 }
+
+impl Candidate {
+    fn new(coordinate: CandidateCoordinate) -> Self {
+        Self {
+            coordinate,
+            state: CandidateState::Unprepared,
+        }
+    }
+
+    fn executable(&self) -> Option<PreparedCandidateId> {
+        self.state.executable()
+    }
+
+    fn is_prepared(&self) -> bool {
+        self.state.is_prepared()
+    }
+
+    fn is_rejected(&self) -> bool {
+        self.state.is_rejected()
+    }
+}
+
 enum ExperimentOutcome {
     Measured(Observation),
     Inapplicable,
     Deferred,
 }
+
+enum ConfirmationStage {
+    Active { stage: u32 },
+    Queued,
+    Idle,
+}
+
+enum NextPromotion {
+    Resume(Promotion),
+    Start { incumbent: usize, challenger: usize },
+}
+
 struct PointPopulation {
     point: Point,
     cases: [ObservationCase; 2],
@@ -93,13 +150,111 @@ struct PointPopulation {
     confirmation_cost: ObservedCost,
 }
 impl PointPopulation {
+    fn new(point: Point, cases: [ObservationCase; 2]) -> Self {
+        Self {
+            point,
+            cases,
+            incumbent: 0,
+            screens: HashMap::new(),
+            attempted: HashSet::new(),
+            deferred: HashSet::new(),
+            refinement_deferred: false,
+            refinement_visits: 0,
+            pending: VecDeque::new(),
+            comparison: None,
+            cost: ObservedCost::default(),
+            confirmation_cost: ObservedCost::default(),
+        }
+    }
+
+    fn confirmation_stage(&self) -> ConfirmationStage {
+        if let Some(promotion) = &self.comparison {
+            ConfirmationStage::Active {
+                stage: promotion.comparison.stage(),
+            }
+        } else if !self.pending.is_empty() {
+            ConfirmationStage::Queued
+        } else {
+            ConfirmationStage::Idle
+        }
+    }
+
+    fn has_confirmation_work(&self) -> bool {
+        !matches!(self.confirmation_stage(), ConfirmationStage::Idle)
+    }
+
     fn next_stage_cost(&self) -> Option<Duration> {
-        if self.comparison.is_some() || !self.pending.is_empty() {
+        if self.has_confirmation_work() {
             self.confirmation_cost.admission()
         } else {
             self.cost.admission()
         }
     }
+
+    fn next_promotion(&mut self) -> Option<NextPromotion> {
+        if let Some(promotion) = self.comparison.take() {
+            Some(NextPromotion::Resume(promotion))
+        } else {
+            self.pending
+                .pop_front()
+                .map(|challenger| NextPromotion::Start {
+                    incumbent: self.incumbent,
+                    challenger,
+                })
+        }
+    }
+
+    fn park_promotion(&mut self, promotion: Promotion) {
+        debug_assert!(self.comparison.is_none());
+        self.comparison = Some(promotion);
+    }
+
+    fn defer_promotion(&mut self, promotion: Promotion) {
+        self.refinement_deferred = true;
+        self.park_promotion(promotion);
+    }
+
+    fn record_screen(&mut self, candidate: usize, score: f64) {
+        self.screens.insert(candidate, score);
+        if self
+            .screens
+            .get(&self.incumbent)
+            .is_some_and(|incumbent| score < *incumbent)
+        {
+            self.pending.push_back(candidate);
+        }
+        self.retain_donors();
+    }
+
+    fn promote(&mut self, challenger: usize) {
+        self.incumbent = challenger;
+        self.pending.clear();
+        self.retain_donors();
+    }
+
+    fn reset_for_environment(&mut self) {
+        self.incumbent = 0;
+        self.screens.clear();
+        self.attempted.clear();
+        self.deferred.clear();
+        self.refinement_deferred = false;
+        self.pending.clear();
+        self.comparison = None;
+    }
+
+    fn best_pending_gain(&self) -> f64 {
+        self.screens
+            .get(&self.incumbent)
+            .map(|incumbent| {
+                self.pending
+                    .iter()
+                    .filter_map(|candidate| self.screens.get(candidate))
+                    .map(|score| (incumbent - score) / incumbent.max(f64::MIN_POSITIVE))
+                    .fold(0.0_f64, f64::max)
+            })
+            .unwrap_or(0.0)
+    }
+
     fn retain_donors(&mut self) {
         let mut protected = HashSet::from([0, self.incumbent]);
         if let Some(comparison) = &self.comparison {
@@ -293,11 +448,7 @@ impl<O> FeedbackEvaluator<O> {
         }
         let index = self.candidates.len();
         self.coordinates.insert(coordinate.clone(), index);
-        self.candidates.push(Candidate {
-            coordinate,
-            executable: None,
-            rejected: false,
-        });
+        self.candidates.push(Candidate::new(coordinate));
         Some(index)
     }
 
@@ -305,13 +456,11 @@ impl<O> FeedbackEvaluator<O> {
         &mut self,
         session: &mut EvaluationSession<'_, T, C>,
         index: usize,
-    ) -> Result<Option<PreparedCandidateId>, PreparationError> {
+    ) -> Result<CandidateState, PreparationError> {
         let candidate = &mut self.candidates[index];
-        if candidate.rejected {
-            return Ok(None);
-        }
-        if let Some(executable) = candidate.executable {
-            return Ok(Some(executable));
+        match candidate.state {
+            CandidateState::Prepared(_) | CandidateState::Rejected => return Ok(candidate.state),
+            CandidateState::Unprepared => {}
         }
         let start = Instant::now();
         let requirements = session.inspect(&candidate.coordinate)?;
@@ -324,23 +473,19 @@ impl<O> FeedbackEvaluator<O> {
         self.formation_costs.record(&requirements.missing, elapsed);
         match admitted {
             RealizationAdmission::Ready(executable) => {
-                candidate.executable = Some(executable);
-                Ok(Some(executable))
+                candidate.state = CandidateState::Prepared(executable);
             }
             RealizationAdmission::Rejected(_) => {
-                candidate.rejected = true;
-                Ok(None)
+                candidate.state = CandidateState::Rejected;
             }
             RealizationAdmission::Pending(
                 crate::evaluation::RealizationPending::NumericalAnalysis,
             ) => {
                 self.report.numerical_pending_attempts += 1;
-                Ok(None)
             }
-            RealizationAdmission::Pending(crate::evaluation::RealizationPending::NativeBudget) => {
-                Ok(None)
-            }
+            RealizationAdmission::Pending(crate::evaluation::RealizationPending::NativeBudget) => {}
         }
+        Ok(candidate.state)
     }
 
     fn observe<T: TargetFamily, C: NativeCompiler<T>>(
@@ -354,13 +499,14 @@ impl<O> FeedbackEvaluator<O> {
     where
         O: ControlledObserver<T, C::Handle>,
     {
-        if !session
-            .domain()
-            .contains(&CandidatePoint::new(
-                self.candidates[candidate].coordinate.clone(),
-                self.points[point].cases[case].values.clone(),
-            ))
-            .unwrap_or(false)
+        if self.candidates[candidate].is_rejected()
+            || !session
+                .domain()
+                .contains(&CandidatePoint::new(
+                    self.candidates[candidate].coordinate.clone(),
+                    self.points[point].cases[case].values.clone(),
+                ))
+                .unwrap_or(false)
         {
             return Ok(ExperimentOutcome::Inapplicable);
         }
@@ -369,7 +515,7 @@ impl<O> FeedbackEvaluator<O> {
         } else {
             self.points[point].confirmation_cost.admission()
         };
-        let formation_cost = if self.candidates[candidate].executable.is_some() {
+        let formation_cost = if self.candidates[candidate].is_prepared() {
             Some(Duration::ZERO)
         } else {
             let requirements = session.inspect(&self.candidates[candidate].coordinate)?;
@@ -385,12 +531,10 @@ impl<O> FeedbackEvaluator<O> {
         {
             return Ok(ExperimentOutcome::Deferred);
         }
-        let Some(executable) = self.prepare(session, candidate)? else {
-            return Ok(if self.candidates[candidate].rejected {
-                ExperimentOutcome::Inapplicable
-            } else {
-                ExperimentOutcome::Deferred
-            });
+        let executable = match self.prepare(session, candidate)? {
+            CandidateState::Prepared(executable) => executable,
+            CandidateState::Rejected => return Ok(ExperimentOutcome::Inapplicable),
+            CandidateState::Unprepared => return Ok(ExperimentOutcome::Deferred),
         };
         if !self.ledger.allows(None) {
             return Ok(ExperimentOutcome::Deferred);
@@ -505,13 +649,7 @@ impl<O> FeedbackEvaluator<O> {
                 .update(b"seismic-feedback-environment-change-v1");
             self.evidence.update(environment);
             for population in &mut self.points {
-                population.incumbent = 0;
-                population.screens.clear();
-                population.attempted.clear();
-                population.deferred.clear();
-                population.refinement_deferred = false;
-                population.pending.clear();
-                population.comparison = None;
+                population.reset_for_environment();
             }
         }
         self.environment = Some(environment);
@@ -553,16 +691,7 @@ impl<O> FeedbackEvaluator<O> {
                     .map(Duration::as_secs_f64)
                     .collect::<Vec<_>>(),
             );
-            let population = &mut self.points[point];
-            population.screens.insert(candidate, score);
-            if population
-                .screens
-                .get(&population.incumbent)
-                .is_some_and(|incumbent| score < *incumbent)
-            {
-                population.pending.push_back(candidate);
-            }
-            population.retain_donors();
+            self.points[point].record_screen(candidate, score);
         }
         let coordinate = self.candidates[candidate].coordinate.clone();
         self.navigator
@@ -611,20 +740,8 @@ impl<O> FeedbackEvaluator<O> {
                             ObservationError::InvalidCase(error),
                         ))
                     })?;
-                self.points.push(PointPopulation {
-                    point,
-                    cases: cases.try_into().unwrap(),
-                    incumbent: 0,
-                    screens: HashMap::new(),
-                    attempted: HashSet::new(),
-                    deferred: HashSet::new(),
-                    refinement_deferred: false,
-                    refinement_visits: 0,
-                    pending: VecDeque::new(),
-                    comparison: None,
-                    cost: ObservedCost::default(),
-                    confirmation_cost: ObservedCost::default(),
-                });
+                self.points
+                    .push(PointPopulation::new(point, cases.try_into().unwrap()));
                 return Ok(Some((self.points.len() - 1, 0)));
             }
         }
@@ -676,7 +793,7 @@ impl<O> FeedbackEvaluator<O> {
         let mut ready = Vec::new();
         for (index, age, &(point, candidate)) in self.discovery_window.iter() {
             let requirements = session.inspect(&self.candidates[candidate].coordinate)?;
-            let formation = if self.candidates[candidate].executable.is_some() {
+            let formation = if self.candidates[candidate].is_prepared() {
                 Some(Duration::ZERO)
             } else {
                 self.formation_costs.estimate(&requirements.missing, false)
@@ -755,7 +872,7 @@ impl<O> FeedbackEvaluator<O> {
             if self
                 .coordinates
                 .get(*coordinate)
-                .is_some_and(|index| self.candidates[*index].executable.is_some())
+                .is_some_and(|index| self.candidates[*index].is_prepared())
             {
                 continue;
             }
@@ -819,38 +936,23 @@ impl<O> FeedbackEvaluator<O> {
         }
         let priority = |index: usize| {
             let point = &self.points[index];
-            let class = if point.comparison.is_some() {
-                0
-            } else if !point.pending.is_empty() {
-                1
-            } else {
-                2
-            };
-            let cost = if point.comparison.is_some() || !point.pending.is_empty() {
-                let stage = point
-                    .comparison
-                    .as_ref()
-                    .map(|promotion| promotion.comparison.stage())
-                    .unwrap_or(0);
-                point
-                    .confirmation_cost
-                    .ordering()
-                    .map(|cost| cost.saturating_mul(16u32.checked_shl(stage).unwrap_or(u32::MAX)))
-            } else {
-                point.cost.ordering()
-            };
-            let gain = point
-                .screens
-                .get(&point.incumbent)
-                .map(|incumbent| {
+            let (class, cost) = match point.confirmation_stage() {
+                ConfirmationStage::Active { stage } => (
+                    0,
+                    point.confirmation_cost.ordering().map(|cost| {
+                        cost.saturating_mul(16u32.checked_shl(stage).unwrap_or(u32::MAX))
+                    }),
+                ),
+                ConfirmationStage::Queued => (
+                    1,
                     point
-                        .pending
-                        .iter()
-                        .filter_map(|candidate| point.screens.get(candidate))
-                        .map(|score| (incumbent - score) / incumbent.max(f64::MIN_POSITIVE))
-                        .fold(0.0_f64, f64::max)
-                })
-                .unwrap_or(0.0);
+                        .confirmation_cost
+                        .ordering()
+                        .map(|cost| cost.saturating_mul(16)),
+                ),
+                ConfirmationStage::Idle => (2, point.cost.ordering()),
+            };
+            let gain = point.best_pending_gain();
             let gain_per_cost = cost
                 .map(|cost| gain / cost.as_secs_f64().max(f64::MIN_POSITIVE))
                 .unwrap_or(0.0);
@@ -897,7 +999,7 @@ impl<O> FeedbackEvaluator<O> {
         if !self.points[point].screens.contains_key(&0) {
             return self.screen(session, point, 0);
         }
-        if self.points[point].comparison.is_some() || !self.points[point].pending.is_empty() {
+        if self.points[point].has_confirmation_work() {
             if !self.points[point].refinement_deferred {
                 return self.confirm(session, point);
             }
@@ -915,7 +1017,7 @@ impl<O> FeedbackEvaluator<O> {
             .iter()
             .enumerate()
             .find(|(index, candidate)| {
-                candidate.executable.is_some()
+                candidate.is_prepared()
                     && !self.points[point].attempted.contains(index)
                     && !self.points[point].deferred.contains(index)
             })
@@ -996,16 +1098,20 @@ impl<O> FeedbackEvaluator<O> {
     where
         O: ControlledObserver<T, C::Handle>,
     {
-        let mut promotion = if let Some(promotion) = self.points[point].comparison.take() {
-            promotion
-        } else {
-            let challenger = self.points[point].pending.pop_front().unwrap();
-            Promotion {
-                incumbent: self.points[point].incumbent,
+        let Some(next) = self.points[point].next_promotion() else {
+            return Ok(());
+        };
+        let mut promotion = match next {
+            NextPromotion::Resume(promotion) => promotion,
+            NextPromotion::Start {
+                incumbent,
+                challenger,
+            } => Promotion {
+                incumbent,
                 challenger,
                 case: 0,
                 comparison: self.event(point, 0),
-            }
+            },
         };
         debug_assert_eq!(
             promotion.comparison.seed(),
@@ -1039,8 +1145,7 @@ impl<O> FeedbackEvaluator<O> {
                 ExperimentOutcome::Measured(observation) => observation,
                 ExperimentOutcome::Inapplicable => return Ok(()),
                 ExperimentOutcome::Deferred => {
-                    self.points[point].refinement_deferred = true;
-                    self.points[point].comparison = Some(promotion);
+                    self.points[point].defer_promotion(promotion);
                     return Ok(());
                 }
             };
@@ -1055,12 +1160,10 @@ impl<O> FeedbackEvaluator<O> {
             Verdict::Improved if promotion.case == 0 => {
                 promotion.case = 1;
                 promotion.comparison = self.event(point, 1);
-                self.points[point].comparison = Some(promotion);
+                self.points[point].park_promotion(promotion);
             }
             Verdict::Improved => {
-                self.points[point].incumbent = promotion.challenger;
-                self.points[point].pending.clear();
-                self.points[point].retain_donors();
+                self.points[point].promote(promotion.challenger);
                 for other in &self.points {
                     if other.incumbent != promotion.challenger {
                         self.navigator
@@ -1069,7 +1172,7 @@ impl<O> FeedbackEvaluator<O> {
                 }
             }
             Verdict::Pending => {
-                self.points[point].comparison = Some(promotion);
+                self.points[point].park_promotion(promotion);
             }
             Verdict::Inconclusive => self.report.inconclusive_comparisons += 1,
             Verdict::Inferior | Verdict::EnvironmentChanged => {}
@@ -1112,7 +1215,7 @@ impl<O> FeedbackEvaluator<O> {
                 .map(|index| {
                     (
                         self.candidates[*index]
-                            .executable
+                            .executable()
                             .expect("only prepared winners are retained"),
                         (),
                     )
@@ -1181,7 +1284,7 @@ impl<O> FeedbackEvaluator<O> {
             prepared_candidates: self
                 .candidates
                 .iter()
-                .filter(|candidate| candidate.executable.is_some())
+                .filter(|candidate| candidate.is_prepared())
                 .count(),
             confirmation_events: self.next_event,
             construction_pending_paths: self.construction.pending_paths(),
@@ -1212,7 +1315,7 @@ impl<T: TargetFamily, C: NativeCompiler<T>, O: ControlledObserver<T, C::Handle>>
                 .canonicalize(session.domain().universal_proposal())
                 .expect("universal coordinate is canonical");
             self.add_candidate(coordinate);
-            if self.prepare(session, 0)?.is_none() {
+            if !self.prepare(session, 0)?.is_prepared() {
                 return Err(PreparationError::UniversalClosure(
                     "feedback could not establish its general implementation".into(),
                 ));
@@ -1340,24 +1443,14 @@ mod tests {
     }
 
     fn population(index: usize) -> PointPopulation {
-        PointPopulation {
-            point: Point(vec![index as u64]),
-            cases: std::array::from_fn(|seed| ObservationCase {
+        PointPopulation::new(
+            Point(vec![index as u64]),
+            std::array::from_fn(|seed| ObservationCase {
                 values: InvocationValues::new(),
                 arguments: Vec::new(),
                 seed: seed as u64,
             }),
-            incumbent: 0,
-            screens: HashMap::new(),
-            attempted: HashSet::new(),
-            deferred: HashSet::new(),
-            refinement_deferred: false,
-            refinement_visits: 0,
-            pending: VecDeque::new(),
-            comparison: None,
-            cost: ObservedCost::default(),
-            confirmation_cost: ObservedCost::default(),
-        }
+        )
     }
 
     /// Equal wall-time checkpoints exercise the delivered policy, not a later
@@ -1638,7 +1731,7 @@ mod tests {
             ))) if reason == "wrong final state"
         ));
         assert!(
-            !evaluator.candidates[optional].rejected,
+            !evaluator.candidates[optional].is_rejected(),
             "a compiler/backend defect must not be hidden as ordinary candidate rejection"
         );
     }

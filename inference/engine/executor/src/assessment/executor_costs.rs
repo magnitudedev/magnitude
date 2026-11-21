@@ -2045,7 +2045,7 @@ struct Measured<'a, 'd> {
 /// begins until the job's time ends ([`JobDeadlines`]), and what it does
 /// not reach is the next job's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Whose {
+pub enum Whose {
     Standing,
     Loads,
 }

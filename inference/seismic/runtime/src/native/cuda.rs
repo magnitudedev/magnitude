@@ -56,15 +56,17 @@
 use super::graph_replays::{Replays, Shaped};
 use super::timeline::{TimelineAction, TimelineKind, TimelineNode, TimelineOperation};
 use super::{graph_segments, DispatchList, EncodeFailure, Encoding, NativeRoute, ReplayKeys};
-use crate::completion::Committed;
-use seismic_cuda::NativeStream;
-use std::ops::Range;
 use crate::api::CallError;
+use crate::completion::{Committed, DeviceCompletion};
 use crate::driver::{Allocation, typed_buffer};
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::graph_cost::GraphCensus;
-use seismic_cuda::direct::{DirectBatch, DirectGraph, DirectGraphBuilder, DirectLaunch, HostWord};
+use seismic_cuda::direct::{DirectBatch, DirectGraph, DirectGraphBuilder, DirectLaunch, DirectSubmission, HostWord};
+use seismic_cuda::NativeStream;
 use seismic_lang::registry::BackendName;
+use std::any::Any;
+use std::ops::Range;
+use std::sync::Arc;
 
 type Cuda = seismic_cuda::Cuda;
 type Executor = seismic_cuda::Executor;
@@ -113,15 +115,8 @@ pub(super) fn encode(
     }
     .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
     // Nothing is issued yet: a failed wait abandons no work.
-    for fence in work.after {
-        let route = fence.native().expect("a native queue's fence is native work");
-        let Committed::Cuda(submission) = route.committed() else {
-            unreachable!("one device's native work is of its backend");
-        };
-        batch
-            .follow(submission)
-            .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
-    }
+    follow_fences(&mut batch, work.after)
+        .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
     match issue(&mut batch, device, replays, budget, work) {
         Ok(()) => batch
             .commit()
@@ -151,19 +146,13 @@ pub(super) fn encode(
 /// Where issuing failed after a step was issued (`super::moves::submit`).
 pub(super) fn encode_moves(
     device: &seismic_cuda::Device,
-    after: &[std::sync::Arc<dyn crate::completion::DeviceCompletion>],
+    after: &[Arc<dyn DeviceCompletion>],
     steps: &[super::moves::MoveStep<'_>],
-    address: impl Fn(&std::sync::Arc<Allocation>, u64) -> u64,
+    address: impl Fn(&Arc<Allocation>, u64) -> u64,
 ) -> Result<Committed, ExecutionError> {
     use super::moves::MoveStep;
     let mut batch = DirectBatch::new(device, NativeStream::Compute)?;
-    for fence in after {
-        let route = fence.native().expect("a native queue's fence is native work");
-        let Committed::Cuda(submission) = route.committed() else {
-            unreachable!("one device's native work is of its backend");
-        };
-        batch.follow(submission)?;
-    }
+    follow_fences(&mut batch, after)?;
     for (index, step) in steps.iter().enumerate() {
         let issued = match *step {
             MoveStep::Copy { source, source_offset, destination, destination_offset, bytes } => {
@@ -183,6 +172,27 @@ pub(super) fn encode_moves(
         .commit()
         .unwrap_or_else(|error| panic!("invariant violated: ordered moves were issued but their end was not recorded: {error}"));
     Ok(Committed::Cuda(committed))
+}
+
+/// One segment of a sealed-plan submission: its work (if any) and the
+/// boundary after it whose stamps and timelines follow.
+struct Segment<'l> {
+    work: SegmentWork<'l>,
+    boundary: usize,
+}
+
+enum SegmentWork<'l> {
+    Empty,
+    Direct(Range<usize>),
+    Graphed(GraphedSegment<'l>),
+}
+
+/// A graphed run segment resolved to its shape and recorded graph identity.
+struct GraphedSegment<'l> {
+    calls: Range<usize>,
+    words: Vec<(&'l HostWord, u32)>,
+    shaped: Shaped,
+    identity: u64,
 }
 
 /// Issue `work` on `batch`'s stream.
@@ -206,68 +216,24 @@ fn issue(
             // ([`instantiate`]), except a launched plan's, launched call by
             // call in their place; the stream waits on or writes the words
             // of the boundaries between graphs.
-            let segments = graph_segments(list, Some(&runs));
             let keys = ReplayKeys { runs, encoded: None };
-            let (graphed, shaped): (Vec<_>, Vec<Shaped>) = segments
-                .iter()
-                .filter(|(calls, _)| !calls.is_empty() && !keys.launched(calls))
-                .map(|(calls, _)| {
-                    assert_eq!(*calls, keys.run(calls).calls, "a graphed run is one graph");
-                    let words = held_operations(list, &keys, calls);
-                    let shaped = shaped(list, &keys, calls, &encoded, &words);
-                    ((calls.clone(), words), shaped)
-                })
-                .unzip();
-            // A run that finds no graph of its shape it may take records its
-            // layout's, once the device's queued work has drained.
-            let taken = replays.record(
-                &shaped,
-                budget,
-                retained,
-                || device.drain().map_err(CallError::Execution),
-                |index| {
-                    let ((calls, _), shaped) = (&graphed[index], &shaped[index]);
-                    let (key, graph) = super::graph::record_layout(&keys.run(calls).graph).map_err(CallError::Execution)?;
-                    assert_eq!(key, shaped.key, "a run's graph is its layout's");
-                    Ok(graph)
-                },
-            )?;
+            let segments = plan_segments(device, replays, budget, list, &keys, &encoded, retained)?;
             for _ in 0..repetitions {
-                let mut graphs = graphed.iter().zip(&shaped).zip(&taken);
-                for (calls, boundary) in &segments {
-                    if !calls.is_empty() && keys.launched(calls) {
-                        launch(batch, list, calls.clone(), &encoded)?;
-                    } else if !calls.is_empty() {
-                        let (((calls, words), shaped), &identity) = graphs.next().expect("a graph per segment of calls");
-                        replays.replay(
-                            shaped,
-                            identity,
-                            // The graph's launches, in the order its nodes
-                            // were added, bound to this run's storage and
-                            // run where encoded, unless they bind what they
-                            // bound before; then its words, to this run's.
-                            |graph, before| {
-                                let launches = shaped.bound.len() - 2 * words.len();
-                                if before.is_none_or(|before| before.get(..launches) != shaped.bound.get(..launches)) {
-                                    bind_launches(device, graph, list, &keys, calls, &encoded)?;
-                                }
-                                assert_eq!(words.len(), graph.words(), "a run's timeline nodes are its graph's words");
-                                for (index, &(word, value)) in words.iter().enumerate() {
-                                    graph.bind_word(index, word, value).map_err(CallError::Execution)?;
-                                }
-                                Ok(())
-                            },
-                            |graph| batch.replay(graph).map_err(CallError::Execution),
-                        )?;
+                for segment in &segments {
+                    match &segment.work {
+                        SegmentWork::Empty => {}
+                        SegmentWork::Direct(calls) => launch(batch, list, calls.clone(), &encoded)?,
+                        SegmentWork::Graphed(graph) => replay_segment(batch, device, replays, list, &keys, &encoded, graph)?,
                     }
-                    stamps(batch, list.stamps(*boundary))?;
-                    timelines(batch, list.timelines(*boundary))?;
+                    stamps(batch, list.stamps(segment.boundary))?;
+                    timelines(batch, list.timelines(segment.boundary))?;
                 }
             }
         }
         None => {
+            let segments = graph_segments(list, None);
             for _ in 0..repetitions {
-                for (calls, boundary) in &graph_segments(list, None) {
+                for (calls, boundary) in &segments {
                     launch(batch, list, calls.clone(), &encoded)?;
                     stamps(batch, list.stamps(*boundary))?;
                     timelines(batch, list.timelines(*boundary))?;
@@ -276,6 +242,113 @@ fn issue(
         }
     }
     Ok(())
+}
+
+/// Classify each segment of a sealed-plan submission once, record any missing
+/// layout graphs, and bind every graphed segment to its resolved graph
+/// identity.
+fn plan_segments<'l>(
+    device: &seismic_cuda::Device,
+    replays: &CudaReplays,
+    budget: GraphCensus,
+    list: &'l impl DispatchList,
+    keys: &ReplayKeys<'_>,
+    encoded: &[Vec<bool>],
+    retained: &Arc<dyn Any + Send + Sync>,
+) -> Result<Vec<Segment<'l>>, CallError> {
+    enum Pending<'l> {
+        Empty,
+        Direct(Range<usize>),
+        Graphed {
+            calls: Range<usize>,
+            words: Vec<(&'l HostWord, u32)>,
+        },
+    }
+
+    let raw = graph_segments(list, Some(&keys.runs));
+    let mut pending = Vec::with_capacity(raw.len());
+    let mut graphed_layouts = Vec::new();
+    let mut shaped_graphs = Vec::new();
+    for (calls, boundary) in raw {
+        let work = if calls.is_empty() {
+            Pending::Empty
+        } else if keys.launched(&calls) {
+            Pending::Direct(calls)
+        } else {
+            let run = keys.run(&calls);
+            assert_eq!(calls, run.calls, "a graphed run is one graph");
+            let words = held_operations(list, keys, &calls);
+            shaped_graphs.push(shaped(list, keys, &calls, encoded, &words));
+            graphed_layouts.push(&run.graph);
+            Pending::Graphed { calls, words }
+        };
+        pending.push((work, boundary));
+    }
+    // A run that finds no graph of its shape it may take records its
+    // layout's, once the device's queued work has drained.
+    let taken = replays.record(
+        &shaped_graphs,
+        budget,
+        retained,
+        || device.drain().map_err(CallError::Execution),
+        |index| {
+            let (key, graph) = super::graph::record_layout(graphed_layouts[index]).map_err(CallError::Execution)?;
+            assert_eq!(key, shaped_graphs[index].key, "a run's graph is its layout's");
+            Ok(graph)
+        },
+    )?;
+    let mut resolved = shaped_graphs.into_iter().zip(taken);
+    let segments = pending
+        .into_iter()
+        .map(|(work, boundary)| {
+            let work = match work {
+                Pending::Empty => SegmentWork::Empty,
+                Pending::Direct(calls) => SegmentWork::Direct(calls),
+                Pending::Graphed { calls, words } => {
+                    let (shaped, identity) = resolved
+                        .next()
+                        .expect("one recorded graph per graphed segment");
+                    SegmentWork::Graphed(GraphedSegment { calls, words, shaped, identity })
+                }
+            };
+            Segment { work, boundary }
+        })
+        .collect();
+    debug_assert!(resolved.next().is_none());
+    Ok(segments)
+}
+
+/// Replay one graphed segment on `batch`'s stream, rebinding its launches
+/// where its storage or encoded launches changed and its word nodes to this
+/// run's words.
+fn replay_segment(
+    batch: &mut DirectBatch,
+    device: &seismic_cuda::Device,
+    replays: &CudaReplays,
+    list: &impl DispatchList,
+    keys: &ReplayKeys<'_>,
+    encoded: &[Vec<bool>],
+    segment: &GraphedSegment<'_>,
+) -> Result<(), CallError> {
+    replays.replay(
+        &segment.shaped,
+        segment.identity,
+        // The graph's launches, in the order its nodes were added, bound to
+        // this run's storage and run where encoded, unless they bind what
+        // they bound before; then its words, to this run's.
+        |graph, before| {
+            let launches = segment.shaped.bound.len() - 2 * segment.words.len();
+            if before.is_none_or(|before| before.get(..launches) != segment.shaped.bound.get(..launches)) {
+                bind_launches(device, graph, list, keys, &segment.calls, encoded)?;
+            }
+            assert_eq!(segment.words.len(), graph.words(), "a run's timeline nodes are its graph's words");
+            for (index, &(word, value)) in segment.words.iter().enumerate() {
+                graph.bind_word(index, word, value).map_err(CallError::Execution)?;
+            }
+            Ok(())
+        },
+        |graph| batch.replay(graph).map_err(CallError::Execution),
+    )
 }
 
 /// Bind `graph`'s launches, in the order its nodes were added, to the run
@@ -345,16 +418,7 @@ fn held_operations<'l>(list: &'l impl DispatchList, keys: &ReplayKeys<'_>, calls
     held_boundaries(keys, calls)
         .into_iter()
         .flat_map(|boundary| list.timelines(boundary))
-        .map(|operation| {
-            let TimelineKind::Cuda(timeline) = operation.timeline.kind() else {
-                unreachable!("a run binds timelines of its own device");
-            };
-            let word = match operation.action {
-                TimelineAction::Wait => &timeline.gate,
-                TimelineAction::Signal => &timeline.reached,
-            };
-            (word, operation.value as u32)
-        })
+        .map(cuda_timeline_word)
         .collect()
 }
 
@@ -484,13 +548,34 @@ pub(super) fn run_key<L: DispatchList>(lists: &[L]) -> Vec<u64> {
     shaped(list, &keys, &(0..list.count()), &list.encoded(), &[]).key
 }
 
-/// Stamp a boundary's marks on the stream, once the work before them
-/// completes (`spans`).
-fn stamps(batch: &mut DirectBatch, stamps: &[super::spans::Stamp]) -> Result<(), CallError> {
-    for stamp in stamps {
-        batch.stamp(cuda_stamps(stamp), stamp.mark).map_err(CallError::Execution)?;
+/// Queue waits on `batch` for every prior native submission in `after`.
+fn follow_fences(batch: &mut DirectBatch, after: &[Arc<dyn DeviceCompletion>]) -> Result<(), ExecutionError> {
+    for fence in after {
+        batch.follow(cuda_submission(fence.as_ref()))?;
     }
     Ok(())
+}
+
+/// A native queue fence's CUDA submission.
+fn cuda_submission(fence: &dyn DeviceCompletion) -> &DirectSubmission {
+    let route = fence.native().expect("a native queue's fence is native work");
+    let Committed::Cuda(submission) = route.committed() else {
+        unreachable!("one device's native work is of its backend");
+    };
+    submission
+}
+
+/// A timeline operation's CUDA host word (a gate's for a wait, a signal's
+/// reached word for a signal) and its low 32-bit value (`timeline`).
+fn cuda_timeline_word(operation: &TimelineOperation) -> (&HostWord, u32) {
+    let TimelineKind::Cuda(timeline) = operation.timeline.kind() else {
+        unreachable!("a run binds timelines of its own device");
+    };
+    let word = match operation.action {
+        TimelineAction::Wait => &timeline.gate,
+        TimelineAction::Signal => &timeline.reached,
+    };
+    (word, operation.value as u32)
 }
 
 /// A stamp's CUDA stamps.
@@ -503,17 +588,22 @@ fn cuda_stamps(stamp: &super::spans::Stamp) -> &seismic_cuda::direct::Stamps {
     stamps
 }
 
+/// Stamp a boundary's marks on the stream, once the work before them
+/// completes (`spans`).
+fn stamps(batch: &mut DirectBatch, stamps: &[super::spans::Stamp]) -> Result<(), CallError> {
+    for stamp in stamps {
+        batch.stamp(cuda_stamps(stamp), stamp.mark).map_err(CallError::Execution)?;
+    }
+    Ok(())
+}
+
 /// Queue a boundary's timeline operations on the stream.
 fn timelines(batch: &mut DirectBatch, operations: &[TimelineOperation]) -> Result<(), CallError> {
     for operation in operations {
-        let TimelineKind::Cuda(timeline) = operation.timeline.kind() else {
-            unreachable!("a run binds timelines of its own device");
-        };
-        // The word holds a value's low 32 bits (`timeline`).
-        let value = operation.value as u32;
+        let (word, value) = cuda_timeline_word(operation);
         match operation.action {
-            TimelineAction::Wait => batch.wait_word(&timeline.gate, value),
-            TimelineAction::Signal => batch.write_word(&timeline.reached, value),
+            TimelineAction::Wait => batch.wait_word(word, value),
+            TimelineAction::Signal => batch.write_word(word, value),
         }
         .map_err(CallError::Execution)?;
     }

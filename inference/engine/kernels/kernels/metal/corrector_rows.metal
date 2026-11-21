@@ -1,7 +1,7 @@
-// corrector_rows: one threadgroup of 256 threads per row: values plus bias,
-// then by form the identity (0), silu (1) or unit length (2, its squared
-// length reduced over the threadgroup), plus the residual row when R = 1,
-// published to Y.
+// corrector_rows: one threadgroup of 256 threads per row (4 elements per
+// thread per iteration): values plus bias, then by form the identity (0),
+// silu (1) or unit length (2, its squared length reduced over the
+// threadgroup), plus the residual row when R = 1, published to Y.
 #include <seismic/element.h>
 #include "lib/core/reduce.h"
 
@@ -22,27 +22,74 @@ kernel void corrector_rows(
     threadgroup float partials[ROWS_THREADS / 32u];
     const element::Out<output_element> result(result_cells);
     const ulong width = SEISMIC_DIM_N;
+    const ulong width4 = width & ~3ul;
     const int form = int(SEISMIC_PARAM_FORM);
     device const float *line = values + ulong(row) * SEISMIC_VALUES_STRIDE_0;
+    device const float *res_line = residual + ulong(row) * SEISMIC_RESIDUAL_STRIDE_1;
+    const ulong result_row = ulong(row) * SEISMIC_RESULT_0_STRIDE_0;
+    const bool bias_vec = SEISMIC_VALUES_STRIDE_1 == 1ul && SEISMIC_BIAS_STRIDE_0 == 1ul;
     float scale = 1.0f;
     if (form == 2) {
         float partial = 0.0f;
-        for (ulong column = thread_index; column < width; column += ROWS_THREADS) {
-            const float biased = line[column * SEISMIC_VALUES_STRIDE_1] + bias[column * SEISMIC_BIAS_STRIDE_0];
-            partial = metal::fma(biased, biased, partial);
+        if (bias_vec) {
+            for (ulong column = ulong(thread_index) * 4ul; column < width4; column += ROWS_THREADS * 4ul) {
+                const float4 biased = float4(*reinterpret_cast<device const packed_float4 *>(line + column)) +
+                                      float4(*reinterpret_cast<device const packed_float4 *>(bias + column));
+                partial = metal::fma(biased.x, biased.x, partial);
+                partial = metal::fma(biased.y, biased.y, partial);
+                partial = metal::fma(biased.z, biased.z, partial);
+                partial = metal::fma(biased.w, biased.w, partial);
+            }
+            for (ulong column = width4 + thread_index; column < width; column += ROWS_THREADS) {
+                const float biased = line[column] + bias[column];
+                partial = metal::fma(biased, biased, partial);
+            }
+        } else {
+            for (ulong column = thread_index; column < width; column += ROWS_THREADS) {
+                const float biased = line[column * SEISMIC_VALUES_STRIDE_1] + bias[column * SEISMIC_BIAS_STRIDE_0];
+                partial = metal::fma(biased, biased, partial);
+            }
         }
         const float length = metal::sqrt(reduce::group_sum<ROWS_THREADS / 32u>(partial, partials, sg, lane));
         scale = 1.0f / metal::max(length, as_type<float>(uint(SEISMIC_PARAM_EPSILON)));
     }
-    for (ulong column = thread_index; column < width; column += ROWS_THREADS) {
-        const float biased = line[column * SEISMIC_VALUES_STRIDE_1] + bias[column * SEISMIC_BIAS_STRIDE_0];
-        float out = biased;
-        if (form == 1)
-            out = biased / (1.0f + metal::exp(-biased));
-        else if (form == 2)
-            out = biased * scale;
-        if (SEISMIC_DIM_R == 1)
-            out += residual[ulong(row) * SEISMIC_RESIDUAL_STRIDE_1 + column * SEISMIC_RESIDUAL_STRIDE_2];
-        result.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, out);
+    const bool out_vec =
+        bias_vec && SEISMIC_RESULT_0_STRIDE_1 == 1ul && (SEISMIC_DIM_R == 0 || SEISMIC_RESIDUAL_STRIDE_2 == 1ul);
+    if (out_vec) {
+        for (ulong column = ulong(thread_index) * 4ul; column < width4; column += ROWS_THREADS * 4ul) {
+            const float4 biased = float4(*reinterpret_cast<device const packed_float4 *>(line + column)) +
+                                  float4(*reinterpret_cast<device const packed_float4 *>(bias + column));
+            float4 out = biased;
+            if (form == 1)
+                out = biased / (1.0f + metal::exp(-biased));
+            else if (form == 2)
+                out = biased * scale;
+            if (SEISMIC_DIM_R == 1)
+                out += float4(*reinterpret_cast<device const packed_float4 *>(res_line + column));
+            result.put4(result_row + column, out);
+        }
+        for (ulong column = width4 + thread_index; column < width; column += ROWS_THREADS) {
+            const float biased = line[column] + bias[column];
+            float out = biased;
+            if (form == 1)
+                out = biased / (1.0f + metal::exp(-biased));
+            else if (form == 2)
+                out = biased * scale;
+            if (SEISMIC_DIM_R == 1)
+                out += res_line[column];
+            result.put(result_row + column, out);
+        }
+    } else {
+        for (ulong column = thread_index; column < width; column += ROWS_THREADS) {
+            const float biased = line[column * SEISMIC_VALUES_STRIDE_1] + bias[column * SEISMIC_BIAS_STRIDE_0];
+            float out = biased;
+            if (form == 1)
+                out = biased / (1.0f + metal::exp(-biased));
+            else if (form == 2)
+                out = biased * scale;
+            if (SEISMIC_DIM_R == 1)
+                out += res_line[column * SEISMIC_RESIDUAL_STRIDE_2];
+            result.put(result_row + column * SEISMIC_RESULT_0_STRIDE_1, out);
+        }
     }
 }

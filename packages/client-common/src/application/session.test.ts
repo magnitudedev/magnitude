@@ -13,7 +13,7 @@ import { fakeAcnImplementationsLayer } from "../state/fake-acn-implementations"
 import { LocalInferenceDeviceIdSchema, LocalInferenceMemoryDomainIdSchema, type CatalogLocalModel, type LocalModelsState } from "@magnitudedev/sdk"
 
 const observed = (residencyState: Extract<CatalogLocalModel["acquisitionState"], { _tag: "Installed" }>["residencyState"]): LocalModelsState => ({
-  preparation: { discovery: { complete: true, modelsFound: 1 }, assessment: { complete: true, settledModels: 1, totalModels: 1 } },
+  preparation: { discovery: { complete: true, modelsFound: 1 }, assessment: { complete: true, settledModels: 1, totalModels: 1 }, measurement: { _tag: "Measured" } },
   unsupported: [],
   hidden: [],
   models: [{ ...makeSetupModel(true), acquisitionState: {

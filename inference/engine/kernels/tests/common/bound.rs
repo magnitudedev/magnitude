@@ -113,11 +113,12 @@ pub fn gemv_rows(backend: BackendName) -> usize {
     if gemms.is_empty() {
         return usize::MAX;
     }
+    let bound = native.at_device(&seismic::device::BackendFloor(backend));
     // Every declared GEMM starts within 4096 rows.
     let first = (1..=4096u64)
         .find(|&rows| {
             let at = seismic::NativeSpecialization::new().with_range("M", rows, rows);
-            gemms.iter().any(|&launch| native.reachable(&at, launch))
+            gemms.iter().any(|&launch| bound.reachable(&at, launch))
         })
         .unwrap_or_else(|| panic!("{backend:?}: `project_rows` declares a GEMM no row count up to 4096 runs"));
     usize::try_from(first - 1).expect("a row count fits usize")

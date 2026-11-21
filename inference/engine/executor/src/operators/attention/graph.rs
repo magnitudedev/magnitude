@@ -29,7 +29,7 @@ use super::selection::{
     self, CandidateEntries, IndexerClass, IndexerElements, IndexerEntries, IndexerInputs, Projection,
     ProjectionInput,
 };
-use super::split::{AttentionBlock, AttentionTopology, PickedPart, Plane, SelectedRead, SelectionReals, both, picked as picked_part};
+use super::split::{AttentionBlock, AttentionPair, AttentionTopology, PickedPart, Plane, SelectionPart};
 use crate::planning::{GateSpec, KeyValueSpec, RoundingArguments, ValueSpec, axis};
 use crate::programs::native_target_graph::{
     PackedWeight, PlannedWeights, WeightOperands, WeightPort, packed_weight, weight,
@@ -183,11 +183,14 @@ pub(crate) fn dense_decodes(
     }
     let elements = [("A", binding.activation)];
     let statics = binding.shape.dense_mix_statics();
-    match <attention_decode::Entry as seismic::EntryContract>::contract_scratch_configs(
-        backend,
-        &elements,
-        &statics,
-    ) {
+    match crate::programs::graph::sizing::eval_with_device(backend, |dev| {
+        <attention_decode::Entry as seismic::EntryContract>::contract_scratch_configs(
+            backend,
+            Some(dev),
+            &elements,
+            &statics,
+        )
+    }) {
         Ok(_) => Ok(true),
         Err(seismic::ContractError::DomainViolation) => Ok(false),
         Err(error) => Err(crate::native::CatalogFailure::Preparation {
@@ -805,8 +808,7 @@ pub(crate) struct SelectionInputs<'n, 'v, 'a, G: GraphDraft + 'a> {
     pub input_norm: &'v WorkflowTensorView,
     pub epsilon: Argument<f32>,
     pub qr: Option<(ProjectionInput<'v>, &'v WorkflowTensorView, Argument<f32>)>,
-    pub read: &'n SelectedRead<Dim>,
-    pub reals: &'n SelectionReals<Argument<f64>>,
+    pub selection: SelectionPart<'n>,
 }
 
 /// What a selected read's attention reads: a prefill row's WorkList bitmap
@@ -837,8 +839,9 @@ fn select<'a, G: GraphDraft + 'a>(
     segments: bool,
     rotary: [&WorkflowTensor; 3],
     constants: &mut Vec<GraphConstant>,
-) -> Result<(Option<Selected>, IndexerStatePorts, IndexerControlPorts), GraphError> {
-    let SelectionInputs { entries, weights, read, reals, .. } = selection;
+) -> Result<(Option<Selected>, IndexerHistoryPorts), GraphError> {
+    let SelectionInputs { entries, weights, selection: part, .. } = selection;
+    let read = part.read;
     let (form, rows, pairs) = (&topology.form, &numbers.rows, &numbers.widths.rotary_pairs);
     let source = &read.source;
     let width = &source.width;
@@ -990,7 +993,7 @@ fn select<'a, G: GraphDraft + 'a>(
             window_coordinates: planes.window_coordinates.tensor_mut().into(),
             block_rows: planes.block_keys.tensor_mut().into(),
             form: (&pool_form).into(),
-            epsilon: reals.key_epsilon.f32(),
+            epsilon: part.key_epsilon.f32(),
             window_slab_rows: slab_rows(&read.window)?,
             block_slab_rows: slab_rows(&source.plane)?,
             block: rounding.block,
@@ -1007,12 +1010,12 @@ fn select<'a, G: GraphDraft + 'a>(
             block_destinations,
             index: None,
         };
-        return Ok((None, planes, tables));
+        return Ok((None, IndexerHistoryPorts { planes, tables }));
     };
     // The indexer over the Block read's visible spans: each row's picked
     // units, over its unit list `[0, c)`.
     let class = IndexerClass {
-        source,
+        indexed: part.indexer,
         rows: rows.clone(),
         spans: source.spans.clone(),
         scores: source.scores.clone(),
@@ -1069,7 +1072,6 @@ fn select<'a, G: GraphDraft + 'a>(
     let indexed = selection::indexer(
         graph,
         &class,
-        &reals.indexer,
         entries.indexer,
         IndexerInputs {
             query_input: ProjectionInput {
@@ -1113,7 +1115,11 @@ fn select<'a, G: GraphDraft + 'a>(
     let segments = match segments {
         false => None,
         true => {
-            let visible = controls.visible.as_ref().ok_or("attention visibility is absent")?;
+            let visible = &controls
+                .read
+                .as_ref()
+                .ok_or("attention read controls are absent")?
+                .visible;
             let picked = top.clone() + 1;
             Some(
                 graph
@@ -1145,7 +1151,10 @@ fn select<'a, G: GraphDraft + 'a>(
         block_destinations,
         index: Some(index),
     };
-    Ok((Some(Selected { bitmap: reads.r0, segments }), planes, tables))
+    Ok((
+        Some(Selected { bitmap: reads.r0, segments }),
+        IndexerHistoryPorts { planes, tables },
+    ))
 }
 
 /// The layer's history planes, bound to the state store's planes per run, in
@@ -1155,10 +1164,18 @@ fn select<'a, G: GraphDraft + 'a>(
 #[derive(Clone)]
 pub(crate) struct AttentionStatePorts {
     pub planes: Vec<NativePort>,
-    /// A selected read's indexer planes.
-    pub indexer: Option<IndexerStatePorts>,
+    /// A selected read's indexer planes and tables.
+    pub indexer: Option<IndexerHistoryPorts>,
     /// An index-list source's planes and tables.
     pub picked: Option<PickedPorts>,
+}
+
+/// A selected read's indexer planes and per-run tables, present together by
+/// construction.
+#[derive(Clone)]
+pub(crate) struct IndexerHistoryPorts {
+    pub planes: IndexerStatePorts,
+    pub tables: IndexerControlPorts,
 }
 
 /// A selected read's key planes, bound to its two history domains' planes
@@ -1191,19 +1208,25 @@ pub(crate) struct IndexControlPorts {
     pub units: NativePort,
 }
 
-/// Per-run row tables: rotary coordinates, visible history spans, fresh
-/// spans over the batch rows and the history row each row's K/V appends to.
+/// Per-run read tables of an attending (non-`inject_only`) attention graph:
+/// visible history spans, fresh spans over the batch rows, and (for an
+/// affine prefill that lists them) the history row tiles the launch's rows see.
 #[derive(Clone)]
-pub(crate) struct AttentionControlPorts {
-    pub coordinates: NativePort,
-    pub visible: Option<NativePort>,
-    pub fresh: Option<NativePort>,
-    pub destinations: NativePort,
+pub(crate) struct AttentionReadControls {
+    pub visible: NativePort,
+    pub fresh: NativePort,
     /// The history row tiles the launch's rows see, for an entry that takes
     /// them (the affine prefill).
     pub history_tiles: Option<HistoryTilesPort>,
-    /// A selected read's indexer tables.
-    pub indexer: Option<IndexerControlPorts>,
+}
+
+/// Per-run row tables: rotary coordinates, the history row each row's K/V
+/// appends to, and (where the graph attends) its read tables.
+#[derive(Clone)]
+pub(crate) struct AttentionControlPorts {
+    pub coordinates: NativePort,
+    pub destinations: NativePort,
+    pub read: Option<AttentionReadControls>,
 }
 
 /// The `history_tiles` input of a graph class that lists the history row
@@ -1243,6 +1266,7 @@ impl AttentionWeights {
         input_norm: Option<&WorkflowTensor>,
         (ports, constants): (&mut Vec<(WeightPort, NativePort)>, &mut Vec<GraphConstant>),
     ) -> Result<Self, GraphError> {
+        let block = AttentionPair::of(topology, numbers);
         let layer = &topology.form;
         let query = if attends {
             packed_weight(graph, planned, scope, topology.query_segment_kind, ports, constants)?
@@ -1280,7 +1304,7 @@ impl AttentionWeights {
                 })
                 .transpose()?,
             query,
-            low_rank_query: (attends && numbers.low_rank_query.is_some())
+            low_rank_query: (attends && block.low_rank_query.is_some())
                 .then(|| {
                     Ok::<_, GraphError>(LowRankQueryWeights {
                         norm: weight(graph, planned, scope, WeightKind::QueryDownNorm, ports)?,
@@ -1314,10 +1338,11 @@ impl AttentionWeights {
                 .is_some()
                 .then(|| weight(graph, planned, scope, WeightKind::PostNorm, ports))
                 .transpose()?,
-            picked: match picked_part(topology, numbers) {
-                Some(PickedPart::Indexed { source: index, reals }) if attends => {
+            picked: match block.picked {
+                Some(PickedPart::Indexed(indexed)) if attends => {
+                    let index = indexed.source;
                     Some(Box::new(PickedWeights {
-                        rows: match &index.own {
+                        rows: match indexed.own {
                             Some(own) => Some(PooledWeights {
                                 projection: packed_weight(
                                     graph,
@@ -1328,6 +1353,7 @@ impl AttentionWeights {
                                     constants,
                                 )?,
                                 gate: own
+                                    .rows
                                     .gated
                                     .then(|| {
                                         packed_weight(
@@ -1364,7 +1390,7 @@ impl AttentionWeights {
                             planned,
                             scope,
                             index.head_weights,
-                            reals.query_norm.is_some(),
+                            indexed.query_norm.is_some(),
                             ports,
                             constants,
                         )?,
@@ -1372,8 +1398,10 @@ impl AttentionWeights {
                 }
                 _ => None,
             },
-            selection: both(&numbers.selection, &topology.selection, "selected read")
-                .map(|(read, reals)| {
+            selection: block
+                .selection
+                .map(|selection| {
+                    let read = selection.read;
                     Ok::<_, GraphError>(Box::new(SelectionWeights {
                         projection: packed_weight(
                             graph,
@@ -1425,7 +1453,7 @@ impl AttentionWeights {
                                     planned,
                                     scope,
                                     read.source.head_weights,
-                                    reals.indexer.query_norm.is_some(),
+                                    selection.indexer.query_norm.is_some(),
                                     ports,
                                     constants,
                                 )
@@ -1485,6 +1513,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     residual: &WorkflowTensor,
     join: &Join,
 ) -> Result<(WorkflowTensor, AttentionStatePorts, AttentionControlPorts), GraphError> {
+    let block = AttentionPair::of(topology, numbers);
     let (form, widths) = (&topology.form, &numbers.widths);
     let (rows, width, heads) = (&numbers.rows, &widths.width, widths.heads());
     let hidden = &widths.hidden;
@@ -1550,7 +1579,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             if inject_only {
                 widths.key_value_dimensions(form, rows.clone())
             } else {
-                let segment = numbers.low_rank_query.as_ref().map_or(&query_rows, |low_rank| &low_rank.rank);
+                let segment = block.low_rank_query.map_or(&query_rows, |low_rank| low_rank.rank);
                 widths.project_dimensions(form, rows.clone(), segment.clone())
             }
             .as_slice(),
@@ -1583,13 +1612,13 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     // heads.
     let (query, qr) = match (
         inject_only,
-        both(&numbers.low_rank_query, &topology.low_rank_query, "low-rank query"),
+        block.low_rank_query,
         kernels.low_rank_query,
         &weights.low_rank_query,
     ) {
         (true, ..) | (false, None, None, None) => (projected.r0, None),
-        (false, Some((low_rank, low_rank_reals)), Some(entries), Some(up)) => {
-            let rank = &low_rank.rank;
+        (false, Some(low_rank), Some(entries), Some(up)) => {
+            let rank = low_rank.rank;
             let qr = graph
                 .enqueue(
                     entries.widen,
@@ -1618,7 +1647,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                         gate_weight: (&empty).into(),
                         key_weight: (&empty).into(),
                         value_weight: (&empty).into(),
-                        epsilon: low_rank_reals.epsilon.f32(),
+                        epsilon: low_rank.epsilon.f32(),
                         project_mode: 0.into(),
                         query_scale: (&up_operands.scale.tensor).into(),
                         gate_scale: (&absent).into(),
@@ -1631,7 +1660,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                     },
                 )?
                 .r0;
-            (query, Some((qr, rank.clone(), low_rank_reals.epsilon.f32(), &up.norm)))
+            (query, Some((qr, rank.clone(), low_rank.epsilon.f32(), &up.norm)))
         }
         _ => {
             return Err(
@@ -1714,17 +1743,17 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     let selection = match (
         kernels.selection,
         weights.selection.as_deref(),
-        both(&numbers.selection, &topology.selection, "selected read"),
+        block.selection,
     ) {
         (None, None, None) => None,
-        (Some(entries), Some(weights), Some((read, reals))) => Some(SelectionInputs {
+        (Some(entries), Some(weights), Some(selection)) => Some(SelectionInputs {
             entries,
             weights,
             x: x_input(),
             input_norm: &x_norm,
             epsilon: topology.epsilon.f32(),
             // Only a graph that runs the indexer reads them.
-            qr: match (read.query_rank && weights.indexer.is_some(), &qr_rows) {
+            qr: match (selection.read.query_rank && weights.indexer.is_some(), &qr_rows) {
                 (false, _) => None,
                 (true, Some((qr, rank, qr_epsilon, qr_norm))) => Some((
                     ProjectionInput { rows: qr, width: rank.clone(), form: InputForm::SINGLE },
@@ -1733,15 +1762,14 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 )),
                 (true, None) => return Err("a selected read's query over the absent `qr` rows".into()),
             },
-            read,
-            reals,
+            selection,
         }),
         _ => return Err("attention selection entries, weights and block disagree".into()),
     };
-    let picked = match picked_part(topology, numbers) {
+    let picked = match block.picked {
         None => None,
         Some(PickedPart::Reused { plane }) => Some(Picked::Reused { plane }),
-        Some(PickedPart::Indexed { source, reals }) => {
+        Some(PickedPart::Indexed(indexed)) => {
             let (Some(entries), Some(weights), Some((qr, rank, qr_epsilon, qr_norm))) =
                 (kernels.picked, weights.picked.as_deref(), &qr_rows)
             else {
@@ -1751,8 +1779,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 );
             };
             Some(Picked::Indexed {
-                source,
-                reals,
+                indexed,
                 inputs: PickedInputs {
                     entries,
                     weights,
@@ -1942,12 +1969,12 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     // A selected read's class that scores reads through the indexer's
     // selection: its prefill through a bitmap of `B` words of `BR`-key
     // blocks.
-    let scoring = selection.as_ref().filter(|selection| selection.read.scored);
-    let words = scoring.map_or(Dim::from(0), |selection| selection.read.words.clone());
-    let block_keys = scoring.map_or(Dim::from(1), |selection| selection.read.block.clone());
+    let scoring = selection.as_ref().filter(|selection| selection.selection.read.scored);
+    let words = scoring.map_or(Dim::from(0), |selection| selection.selection.read.words.clone());
+    let block_keys = scoring.map_or(Dim::from(1), |selection| selection.selection.read.block.clone());
     let selected_prefill = scoring.map(|selection| selection.entries.prefill);
     let dense = matches!(&history, AttentionHistoryEntries::Dense { .. });
-    let key_rounding = both(&numbers.key_rounding, &topology.key_rounding, "key rounding");
+    let key_rounding = AttentionPair::of(topology, numbers).key_rounding;
     if !dense && (key_rounding.is_some() || picked.is_some()) {
         unreachable!("the binding admits a rounded or index-list source beside a dense history alone");
     }
@@ -2051,21 +2078,20 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             })
         })
         .transpose()?;
-    let mut controls = AttentionControlPorts {
-        coordinates: input(graph, "coordinates")?,
-        visible: if inject_only {
-            None
-        } else {
-            Some(input(graph, "visible")?)
-        },
-        fresh: if inject_only {
-            None
-        } else {
-            Some(input(graph, "fresh")?)
-        },
+    let coordinates = input(graph, "coordinates")?;
+    let read = (!inject_only)
+        .then(|| {
+            Ok::<_, GraphError>(AttentionReadControls {
+                visible: input(graph, "visible")?,
+                fresh: input(graph, "fresh")?,
+                history_tiles,
+            })
+        })
+        .transpose()?;
+    let controls = AttentionControlPorts {
+        coordinates,
         destinations: input(graph, "destinations")?,
-        history_tiles,
-        indexer: None,
+        read,
     };
     let pairs = [numbers.widths.rotary_pairs.clone()];
     let rotary = &topology.rotary;
@@ -2208,61 +2234,6 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     let gate_function = scalar::<i32>(&numbers.gate_function, "an attention gate code")?;
     let slab_rows = scalar::<u32>(&numbers.slab_rows, "slab rows")?;
     let mut destinations = controls.destinations.tensor().clone();
-    // What the entry reads: the host's visible spans and fresh rows, or for
-    // a selected read's decode rows the indexer's segments.
-    let mut visible = controls
-        .visible
-        .as_ref()
-        .map(|port| port.tensor().reshape(&[rows.clone(), numbers.segments.clone(), Dim::from(2)]));
-    let fresh = controls
-        .fresh
-        .as_ref()
-        .map(|port| port.tensor().reshape(&[rows.clone(), Dim::from(2)]));
-    let mut attend_dimensions = dimensions.clone();
-    // Every entry takes the same arguments but its history planes.
-    macro_rules! mix {
-        ($kernel:expr, $module:ident, $($plane:ident),*) => {
-            mix!(@enqueue $kernel, $module, &attend_dimensions, {}, $($plane),*)
-        };
-        (@enqueue $kernel:expr, $module:ident, $dimensions:expr, {$($extra:ident: $value:expr),*},
-            $($plane:ident),*) => {
-            mix!(@phase $kernel, $module, $dimensions, {$($extra: $value),*}, $($plane),*).value
-        };
-        (@phase $kernel:expr, $module:ident, $dimensions:expr, {$($extra:ident: $value:expr),*},
-            $($plane:ident),*) => {{
-            let [$($plane),*] = entry_planes(&mut planes, absent_values.as_mut())?;
-            graph
-                .enqueue(
-                    *$kernel,
-                    $dimensions,
-                    $module::WorkflowArgs {
-                        query: (&query).into(),
-                        gate: (&gate).into(),
-                        key: (&key).into(),
-                        value: (&value).into(),
-                        query_norm: (&query_norm).into(),
-                        key_norm: (&key_norm).into(),
-                        value_norm: (&value_norm).into(),
-                        sinks: (&sinks).into(),
-                        rotary_components: components.port().tensor().into(),
-                        rotary_frequencies: frequencies.port().tensor().into(),
-                        rotary_amplitudes: amplitudes.port().tensor().into(),
-                        coordinates: controls.coordinates.tensor().into(),
-                        visible: visible.as_ref().ok_or("attention visibility is absent")?.into(),
-                        fresh: fresh.as_ref().ok_or("attention fresh rows are absent")?.into(),
-                        destinations: (&destinations).into(),
-                        $($extra: $value,)*
-                        $($plane: $plane.tensor_mut().into(),)*
-                        form: (&form_table).into(),
-                        epsilon: topology.head_epsilon.f32(),
-                        scale,
-                        gate_function,
-                        slab_rows,
-                    },
-                )?
-
-        }};
-    }
     // State-only entries bind no query, gate, visibility or selection values.
     macro_rules! append {
         ($kernel:expr, $module:ident, {$($extra:ident: $value:expr),*}, $($plane:ident),*) => {{
@@ -2296,23 +2267,6 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             }, history_key, history_value)
         };
     }
-    macro_rules! dense_mix {
-        ($kernel:expr, $module:ident, $dimensions:expr $(, $extra:ident: $value:expr)*) => {{
-            let (picked_rows, picked_plane, picked_slab_rows) = picks
-                .as_ref()
-                .ok_or("a dense attention's index-list arguments are absent")?;
-            mix!(@enqueue $kernel, $module, $dimensions, {
-                selected_rows: picked_rows.into(),
-                selected: picked_plane.into(),
-                selected_slab_rows: *picked_slab_rows,
-                key_block: key_rounding.block,
-                key_element: key_rounding.element,
-                key_scale: key_rounding.scale,
-                key_amax_floor: key_rounding.amax_floor
-                $(, $extra: $value)*
-            }, history_key, history_value)
-        }};
-    }
     // Priming only publishes context K/V, and a selected read's keys: the
     // indexer that picks among them runs only where the layer attends.
     // Select the state-only entry at graph formation to omit
@@ -2321,7 +2275,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     if inject_only {
         let mut indexer = None;
         if let Some(selection) = &selection {
-            let (selected, planes, tables) = select(
+            let (selected, indexer_ports) = select(
                 graph,
                 selection,
                 topology,
@@ -2338,8 +2292,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             if selected.is_some() {
                 return Err("a history injection scores a selected read".into());
             }
-            controls.indexer = Some(tables);
-            indexer = Some(planes);
+            indexer = Some(indexer_ports);
         }
         match &history {
             AttentionHistoryEntries::Dense { append, .. } => {
@@ -2368,12 +2321,85 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             controls,
         ));
     }
+    // What the entry reads: the host's visible spans and fresh rows, or for
+    // a selected read's decode rows the indexer's segments.
+    let read = controls
+        .read
+        .as_ref()
+        .expect("attending attention graph has read controls");
+    let mut visible = read
+        .visible
+        .tensor()
+        .reshape(&[rows.clone(), numbers.segments.clone(), Dim::from(2)]);
+    let fresh = read.fresh.tensor().reshape(&[rows.clone(), Dim::from(2)]);
+    let mut attend_dimensions = dimensions.clone();
+    // Every entry takes the same arguments but its history planes.
+    macro_rules! mix {
+        ($kernel:expr, $module:ident, $($plane:ident),*) => {
+            mix!(@enqueue $kernel, $module, &attend_dimensions, {}, $($plane),*)
+        };
+        (@enqueue $kernel:expr, $module:ident, $dimensions:expr, {$($extra:ident: $value:expr),*},
+            $($plane:ident),*) => {
+            mix!(@phase $kernel, $module, $dimensions, {$($extra: $value),*}, $($plane),*).value
+        };
+        (@phase $kernel:expr, $module:ident, $dimensions:expr, {$($extra:ident: $value:expr),*},
+            $($plane:ident),*) => {{
+            let [$($plane),*] = entry_planes(&mut planes, absent_values.as_mut())?;
+            graph
+                .enqueue(
+                    *$kernel,
+                    $dimensions,
+                    $module::WorkflowArgs {
+                        query: (&query).into(),
+                        gate: (&gate).into(),
+                        key: (&key).into(),
+                        value: (&value).into(),
+                        query_norm: (&query_norm).into(),
+                        key_norm: (&key_norm).into(),
+                        value_norm: (&value_norm).into(),
+                        sinks: (&sinks).into(),
+                        rotary_components: components.port().tensor().into(),
+                        rotary_frequencies: frequencies.port().tensor().into(),
+                        rotary_amplitudes: amplitudes.port().tensor().into(),
+                        coordinates: controls.coordinates.tensor().into(),
+                        visible: (&visible).into(),
+                        fresh: (&fresh).into(),
+                        destinations: (&destinations).into(),
+                        $($extra: $value,)*
+                        $($plane: $plane.tensor_mut().into(),)*
+                        form: (&form_table).into(),
+                        epsilon: topology.head_epsilon.f32(),
+                        scale,
+                        gate_function,
+                        slab_rows,
+                    },
+                )?
+
+        }};
+    }
+    macro_rules! dense_mix {
+        ($kernel:expr, $module:ident, $dimensions:expr $(, $extra:ident: $value:expr)*) => {{
+            let (picked_rows, picked_plane, picked_slab_rows) = picks
+                .as_ref()
+                .ok_or("a dense attention's index-list arguments are absent")?;
+            mix!(@enqueue $kernel, $module, $dimensions, {
+                selected_rows: picked_rows.into(),
+                selected: picked_plane.into(),
+                selected_slab_rows: *picked_slab_rows,
+                key_block: key_rounding.block,
+                key_element: key_rounding.element,
+                key_scale: key_rounding.scale,
+                key_amax_floor: key_rounding.amax_floor
+                $(, $extra: $value)*
+            }, history_key, history_value)
+        }};
+    }
     // A selected read's indexer appends and selects first.
-    let mut indexer_planes = None;
+    let mut indexer = None;
     let selected = match &selection {
         None => None,
         Some(selection) => {
-            let (selected, planes, tables) = select(
+            let (selected, indexer_ports) = select(
                 graph,
                 selection,
                 topology,
@@ -2387,18 +2413,23 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                 ],
                 constants,
             )?;
-            controls.indexer = Some(tables);
-            indexer_planes = Some(planes);
+            indexer = Some(indexer_ports);
             selected
         }
     };
     // A selected decode row reads its units' segments of its visible spans
     // (its launch's earlier rows among them, `cached_causal_domain`) and its
     // own row fresh, as a dense decode row does.
-    if let Some(Selected { segments: Some(read), .. }) = &selected {
-        let top = &selection.as_ref().ok_or("selected segments without a selection")?.read.source.top;
+    if let Some(Selected { segments: Some(read_segments), .. }) = &selected {
+        let top = &selection
+            .as_ref()
+            .ok_or("selected segments without a selection")?
+            .selection
+            .read
+            .source
+            .top;
         let segments = selected_segments(top.clone(), numbers.segments.clone());
-        visible = Some(read.reshape(&[rows.clone(), segments.clone(), Dim::from(2)]));
+        visible = read_segments.reshape(&[rows.clone(), segments.clone(), Dim::from(2)]);
         for (name, value) in &mut attend_dimensions {
             if *name == "R" {
                 *value = segments.clone();
@@ -2498,7 +2529,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             {
                 selection: (&bitmap).into(),
                 block_slots: (&block_slots).into(),
-                history_tiles: match &controls.history_tiles {
+                history_tiles: match &read.history_tiles {
                     Some(tiles) => tiles.port.tensor().into(),
                     None => (&unlisted).into(),
                 }
@@ -2515,7 +2546,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         Some(attended),
         AttentionStatePorts {
             planes,
-            indexer: indexer_planes,
+            indexer,
             picked: picked_state,
         },
         controls,

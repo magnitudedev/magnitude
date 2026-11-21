@@ -3,7 +3,6 @@
 //! non-streaming output from exactly the same events.
 use super::request::ToolCall;
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
 
 /// Semantic output in publication order. A stream starts once, then moves
 /// through reasoning, text and tool calls without returning to an earlier phase.
@@ -181,68 +180,86 @@ struct OpenCall {
     input: String,
 }
 
+#[derive(Debug)]
+enum ToolCallSlot {
+    Open(OpenCall),
+    Finished(ToolCall),
+}
+
+#[derive(Debug, Default)]
+enum JournalState {
+    #[default]
+    Unstarted,
+    Active {
+        phase: Phase,
+        reasoning: String,
+        text: String,
+        calls: Vec<ToolCallSlot>,
+    },
+}
+
 /// Validates the semantic stream and assembles its aggregate output.
 #[derive(Debug, Default)]
 pub struct OutputJournal {
-    phase: Option<Phase>,
-    reasoning: String,
-    text: String,
-    calls: Vec<Option<ToolCall>>,
-    open: BTreeMap<usize, OpenCall>,
+    state: JournalState,
 }
 
 impl OutputJournal {
     pub fn push(&mut self, event: &OutputEvent) -> Result<(), JournalError> {
         match event {
-            OutputEvent::Started => {
-                if self.phase.is_some() {
-                    return Err(JournalError::DuplicateStart);
+            OutputEvent::Started => match &self.state {
+                JournalState::Unstarted => {
+                    self.state = JournalState::Active {
+                        phase: Phase::Start,
+                        reasoning: String::new(),
+                        text: String::new(),
+                        calls: Vec::new(),
+                    };
                 }
-                self.phase = Some(Phase::Start);
+                JournalState::Active { .. } => return Err(JournalError::DuplicateStart),
+            },
+            OutputEvent::ReasoningDelta(delta) => {
+                let (reasoning, _, _) = self.advance(Phase::Reasoning)?;
+                reasoning.push_str(delta);
             }
-            OutputEvent::ReasoningDelta(text) => {
-                self.advance(Phase::Reasoning)?;
-                self.reasoning.push_str(text);
-            }
-            OutputEvent::TextDelta(text) => {
-                self.advance(Phase::Text)?;
-                self.text.push_str(text);
+            OutputEvent::TextDelta(delta) => {
+                let (_, text, _) = self.advance(Phase::Text)?;
+                text.push_str(delta);
             }
             OutputEvent::ToolCallStarted { index, id, name } => {
-                self.advance(Phase::Tools)?;
-                if *index != self.calls.len() {
+                let (_, _, calls) = self.advance(Phase::Tools)?;
+                if *index != calls.len() {
                     return Err(JournalError::UnexpectedToolIndex { index: *index });
                 }
-                let call = OpenCall {
+                calls.push(ToolCallSlot::Open(OpenCall {
                     id: id.clone(),
                     name: name.clone(),
                     input: String::new(),
-                };
-                if self.open.insert(*index, call).is_some() {
-                    return Err(JournalError::ToolCallAlreadyOpen);
-                }
-                self.calls.push(None);
+                }));
             }
             OutputEvent::ToolInputDelta { index, fragment } => {
-                let call = self
-                    .open
-                    .get_mut(index)
-                    .ok_or(JournalError::ToolCallNotOpen { index: *index })?;
+                let Some(ToolCallSlot::Open(call)) = self.tool_slot_mut(*index) else {
+                    return Err(JournalError::ToolCallNotOpen { index: *index });
+                };
                 call.input.push_str(fragment);
             }
             OutputEvent::ToolCallFinished { index } => {
-                let call = self
-                    .open
-                    .remove(index)
+                let slot = self
+                    .tool_slot_mut(*index)
                     .ok_or(JournalError::ToolCallNotOpen { index: *index })?;
+                let ToolCallSlot::Open(call) = slot else {
+                    return Err(JournalError::ToolCallNotOpen { index: *index });
+                };
                 let arguments = serde_json::from_str::<Map<String, Value>>(&call.input)
                     .map_err(|error| JournalError::InvalidToolInput {
                         index: *index,
                         message: error.to_string(),
                     })?;
-                self.calls[*index] = Some(ToolCall {
-                    id: call.id,
-                    name: call.name,
+                let id = std::mem::take(&mut call.id);
+                let name = std::mem::take(&mut call.name);
+                *slot = ToolCallSlot::Finished(ToolCall {
+                    id,
+                    name,
                     arguments,
                 });
             }
@@ -255,31 +272,59 @@ impl OutputJournal {
     /// call; that call is incomplete and is not part of the output. Any other
     /// ending with an open call violates the stream contract.
     pub fn finish(self, termination: &Termination) -> Result<Output, JournalError> {
-        if self.phase.is_none() {
+        let JournalState::Active {
+            reasoning,
+            text,
+            calls,
+            ..
+        } = self.state
+        else {
             return Err(JournalError::MissingStart);
-        }
+        };
         let truncated = matches!(
             termination,
             Termination::OutputLimit | Termination::StopSequence(_)
         );
-        if !self.open.is_empty() && !truncated {
-            return Err(JournalError::OpenToolCall);
+        let mut tool_calls = Vec::with_capacity(calls.len());
+        for slot in calls {
+            match slot {
+                ToolCallSlot::Finished(call) => tool_calls.push(call),
+                ToolCallSlot::Open(_) if truncated => {}
+                ToolCallSlot::Open(_) => return Err(JournalError::OpenToolCall),
+            }
         }
-        let tool_calls = self.calls.into_iter().flatten().collect();
         Ok(Output {
-            reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
-            text: (!self.text.is_empty()).then_some(self.text),
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            text: (!text.is_empty()).then_some(text),
             tool_calls,
         })
     }
 
-    fn advance(&mut self, next: Phase) -> Result<(), JournalError> {
-        let current = self.phase.ok_or(JournalError::NotStarted)?;
-        if next < current {
+    fn advance(
+        &mut self,
+        next: Phase,
+    ) -> Result<(&mut String, &mut String, &mut Vec<ToolCallSlot>), JournalError> {
+        let JournalState::Active {
+            phase,
+            reasoning,
+            text,
+            calls,
+        } = &mut self.state
+        else {
+            return Err(JournalError::NotStarted);
+        };
+        if next < *phase {
             return Err(JournalError::PhaseRegression);
         }
-        self.phase = Some(next);
-        Ok(())
+        *phase = next;
+        Ok((reasoning, text, calls))
+    }
+
+    fn tool_slot_mut(&mut self, index: usize) -> Option<&mut ToolCallSlot> {
+        match &mut self.state {
+            JournalState::Active { calls, .. } => calls.get_mut(index),
+            JournalState::Unstarted => None,
+        }
     }
 }
 

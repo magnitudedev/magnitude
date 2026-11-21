@@ -4,6 +4,7 @@ import { ModelIdSchema } from "@magnitudedev/acn-protocol"
 import type {
   CatalogInstallationOperation,
   CatalogModel,
+  ModelAssessment,
   ModelAssessmentsSnapshot,
   ReadyModel,
 } from "@magnitudedev/icn-protocol/schemas"
@@ -13,6 +14,7 @@ import {
   catalogModelServingState,
   catalogRemovalAcquisition,
   coordinatedAssessment,
+  projectAssessment,
   projectLocalModelPreparation,
 } from "./local-models"
 import type { LocalModelSourcesState } from "./local-model-sources"
@@ -37,7 +39,7 @@ describe("local model serving projection", () => {
         _tag: "Fits",
         profile: { contextLength: 32_768 },
         served: { contextLength: 32_768 },
-        residency: { _tag: "Resident", performance: { _tag: "Pending", measurement: { _tag: "Measuring" } } },
+        residency: { _tag: "Resident", performance: { _tag: "Pending", measurement: { _tag: "Measuring", progress: Option.none() } } },
       },
       capabilities: {
         vision: false,
@@ -210,6 +212,39 @@ describe("automatic assessment projection", () => {
     expect(coordinatedAssessment(snapshot, "catalog", badId)).toEqual({ _tag: "Dropped" })
   })
 
+  it("decodes pending assessments during Measuring with and without progress", () => {
+    for (const progress of [
+      Option.none(),
+      Option.some({ completed: 15, total: 113, phase: "MemoryAndStorage" as const }),
+    ]) {
+      const measuring = projectAssessment(
+        {
+          revision: 2,
+          environmentId: "env",
+          catalog: { _tag: "Pending", sourceRevision: 1 },
+          custom: { _tag: "Pending", sourceRevision: 1 },
+          measurement: { _tag: "Measuring", progress },
+        } as unknown as ModelAssessmentsSnapshot,
+        {
+          _tag: "Fits",
+          assessmentId: "assessment-2",
+          profile: { contextLength: 32_768 },
+          served: { contextLength: 32_768 },
+          memory: [{ memoryDomainId: "system", capacityBytes: 64, requiredBytes: 32, remainingBytes: 32 }],
+          memoryBreakdown: { weightsBytes: 24, contextBytes: 4, overheadBytes: 4 },
+          placement: { deviceBytes: 24, hostBytes: 0, diskBytes: 0, lookupDiskBytes: 0 },
+          residency: { _tag: "Resident", performance: { _tag: "Pending" } },
+          projector: { _tag: "None" },
+          drafter: { _tag: "None" },
+        } as unknown as ModelAssessment,
+      )
+      expect(measuring._tag === "Fits" && measuring.residency.performance).toEqual({
+        _tag: "Pending",
+        measurement: { _tag: "Measuring", progress },
+      })
+    }
+  })
+
   it("carries the machine's measurement progress into a pending speed", () => {
     const snapshot = {
       revision: 4,
@@ -325,10 +360,12 @@ describe("local model preparation projection", () => {
     expect(discovering).toEqual({
       discovery: { complete: false, modelsFound: 1 },
       assessment: { complete: false, settledModels: 2, totalModels: 4 },
+      measurement: { _tag: "Measured" },
     })
     expect(discovered).toEqual({
       discovery: { complete: true, modelsFound: 3 },
       assessment: { complete: false, settledModels: 5, totalModels: 7 },
+      measurement: { _tag: "Measured" },
     })
   })
 
@@ -353,6 +390,7 @@ describe("local model preparation projection", () => {
     )).toEqual({
       discovery: { complete: true, modelsFound: 1 },
       assessment: { complete: true, settledModels: 3, totalModels: 3 },
+      measurement: { _tag: "Measured" },
     })
   })
 
@@ -377,6 +415,29 @@ describe("local model preparation projection", () => {
     )).toEqual({
       discovery: { complete: true, modelsFound: 1 },
       assessment: { complete: true, settledModels: 3, totalModels: 3 },
+      measurement: { _tag: "Measured" },
+    })
+  })
+
+  it("projects standing hardware benchmark progress into preparation.measurement", () => {
+    const progress = { completed: 42, total: 113, phase: "PromptProcessing" as const }
+    expect(projectLocalModelPreparation(
+      sources(true, 4, 0),
+      {
+        revision: 3,
+        environmentId: "environment",
+        measurement: { _tag: "Measuring", progress: Option.some(progress) },
+        catalog: {
+          _tag: "Available",
+          sourceRevision: 1,
+          entries: entries(4, 4, "measuring-catalog"),
+        },
+        custom: { _tag: "Available", sourceRevision: 1, entries: [] },
+      } as unknown as ModelAssessmentsSnapshot,
+    )).toEqual({
+      discovery: { complete: true, modelsFound: 0 },
+      assessment: { complete: true, settledModels: 4, totalModels: 4 },
+      measurement: { _tag: "Measuring", progress: Option.some(progress) },
     })
   })
 })

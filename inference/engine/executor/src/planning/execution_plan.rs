@@ -58,6 +58,10 @@ impl PlannedDevice {
         self.backend
     }
 
+    pub fn properties(&self) -> Option<seismic::device::DeviceProperties> {
+        self.executor.properties()
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -2344,11 +2348,11 @@ fn refusal(no: NoBank, capacity: u64) -> PlanError {
     match no {
         NoBank::Unstreamed(reason) => PlanError::Unstreamed(reason),
         NoBank::Bound { bound, needed } => PlanError::WeightBound { bound, needed },
-        NoBank::Short { deficit_bytes } => PlanError::Resource(crate::CapacityError {
-            resource: crate::ResourceKind::DeviceMemory,
-            required: capacity + deficit_bytes.get(),
-            available: capacity,
-        }),
+        NoBank::Short { deficit_bytes } => PlanError::Resource(crate::CapacityError::new(
+            crate::ResourceKind::DeviceMemory,
+            capacity + deficit_bytes.get(),
+            capacity,
+        )),
     }
 }
 
@@ -2695,9 +2699,13 @@ impl ExecutionPlanDraft {
                 let (primary_out, resident_res) = match after_primary {
                     Some(after_primary) => {
                         let bank_form = &bank.form;
+                        let device_props = bank_form.draft.device().properties();
                         let (out, res) = crate::assessment::pool::join(
                             move || {
-                                let _sizing = crate::programs::graph::sizing::SizingScope::enter();
+                                let _sizing =
+                                    crate::programs::graph::sizing::SizingScope::enter_with_device(
+                                        device_props,
+                                    );
                                 after_primary(bank_form)
                             },
                             certify_resident,
@@ -4406,5 +4414,92 @@ mod tests {
         assert_eq!(value, envelope.records());
         assert_eq!(count, 3);
         assert_eq!(visited, vec![p_a, p_b, envelope]);
+    }
+
+    /// A `WholeForm::Resident` routed load retains its merged pass (`held_pass > 1`)
+    /// when memory allows, and steps down `chain_capacity` / `held_pass` cleanly
+    /// along `whole_chains` when room is tight so it never OOMs.
+    #[test]
+    fn resident_retains_merged_pass_and_steps_down_when_room_is_tight() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+        let (topology, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Cpu, 0, seismic::GraphCost::None);
+        let mut definition = routed_fixture_definition(RoutedShape {
+            layers: 4,
+            experts: 32,
+            selected: 4,
+            hidden: 1024,
+            intermediate: 512,
+        });
+        definition.decoder.context_limit = 8192;
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        let executor = draft.device().executor();
+        let bytes_at = |places: u64| {
+            let candidate = draft.held_whole_at(&definition, places).unwrap();
+            let charge = candidate.memory_charge(&definition).unwrap();
+            assert_eq!(charge.held_pass.get(), places as usize, "resident charge must honor places={places}");
+            charge.store_demands(&topology, executor).unwrap().allocation_bytes()
+        };
+        let full_places = draft.whole_places(&definition).unwrap();
+        assert!(full_places >= 8, "setup: expected multi-chunk prompt places, got {full_places}");
+        let floor_bytes = bytes_at(1);
+        let mid_places = full_places / 2;
+        let mid_bytes = bytes_at(mid_places);
+        let full_bytes = bytes_at(full_places);
+        assert!(
+            full_bytes > floor_bytes,
+            "merged pass ({full_bytes} bytes at {full_places} places) must charge more than floor ({floor_bytes} bytes)",
+        );
+
+        let place_in = |room_bytes: u64| {
+            draft
+                .with_held_experts(
+                    &definition,
+                    HeldBound::room(room_bytes),
+                    &synthetic(),
+                    move |mandatory: u64| {
+                        let left = room_bytes.saturating_sub(mandatory);
+                        PlanRoom { free: left, ceiling: left }
+                    },
+                    |_, _| Ok::<_, PlanError>(Ok(())),
+                )
+                .unwrap()
+                .unwrap()
+                .0
+        };
+
+        // Generous room retains the full merged pass.
+        let wide = place_in(full_bytes + (64 << 20));
+        assert!(wide.draft().load().expert_bank().is_none(), "CPU load is WholeForm::Resident");
+        assert_eq!(wide.draft().policy().limits().chain_capacity.get(), full_places as usize);
+        assert_eq!(wide.charge().held_pass.get(), full_places as usize);
+
+        // Tight room below `full_bytes` but holding `mid_bytes` steps down cleanly.
+        if mid_bytes < full_bytes {
+            let tight = place_in(mid_bytes);
+            assert!(tight.draft().load().expert_bank().is_none());
+            assert_eq!(tight.draft().policy().limits().chain_capacity.get(), mid_places as usize);
+            assert_eq!(tight.charge().held_pass.get(), mid_places as usize);
+            assert!(
+                tight.charge().store_demands(&topology, executor).unwrap().allocation_bytes() <= mid_bytes,
+                "stepped-down resident plan must fit within tight room",
+            );
+        }
+
+        // Room equal to floor steps all the way down to 1 launch.
+        let floor = place_in(floor_bytes);
+        assert!(floor.draft().load().expert_bank().is_none());
+        assert_eq!(floor.draft().policy().limits().chain_capacity.get(), 1);
+        assert_eq!(floor.charge().held_pass, PassLaunches::FLOOR);
     }
 }

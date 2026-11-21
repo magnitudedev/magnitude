@@ -799,24 +799,22 @@ impl<E: Dense> Format for DenseRows<E> {
         if valid == Q8_BLOCK {
             // A whole block: each packet widens once for every activation
             // block and accumulates in the tier's vectors, value `i` into lane
-            // `i % LANES` in index order as below.
+            // `i % LANES` in index order as below, scaled by the packet's `d`.
             for (row, out) in rows.iter().zip(&mut out) {
-                let mut lanes = [[0.0f32; LANES]; M];
                 for local in 0..Q8_BLOCK / PACKET {
                     let mut values = V::ZERO;
                     let values = V::packet(&mut values);
                     unsafe { Self::decode::<V>(row, b * (Q8_BLOCK / PACKET) + local, k, values) };
-                    for (lanes, x) in lanes.iter_mut().zip(x.iter()) {
+                    for (out, x) in out.iter_mut().zip(x.iter()) {
+                        let mut lanes = [0.0f32; LANES];
                         let mut codes = V::ZERO;
                         let codes = V::packet(&mut codes);
                         for (code, x) in codes.iter_mut().zip(&x.codes[PACKET * local..]) {
                             *code = f32::from(*x);
                         }
-                        unsafe { accumulate::<V>(lanes, values, codes) };
+                        unsafe { accumulate::<V>(&mut lanes, values, codes) };
+                        *out = x.d[local].mul_add(combine(lanes), *out);
                     }
-                }
-                for ((out, lanes), x) in out.iter_mut().zip(lanes).zip(x.iter()) {
-                    *out = x.d * combine(lanes);
                 }
             }
             return out;
@@ -826,11 +824,15 @@ impl<E: Dense> Format for DenseRows<E> {
                 std::slice::from_raw_parts(row.start.cast::<E::Storage>().add(first), valid)
             };
             for (out, x) in out.iter_mut().zip(x.iter()) {
-                let mut lanes = [0.0f32; LANES];
-                for (i, (value, code)) in values.iter().zip(&x.codes).enumerate() {
-                    lanes[i % LANES] = E::widen(*value).mul_add(f32::from(*code), lanes[i % LANES]);
+                let mut sum = 0.0f32;
+                for (local, chunk) in values.chunks(PACKET).enumerate() {
+                    let mut lanes = [0.0f32; LANES];
+                    for (i, (value, code)) in chunk.iter().zip(&x.codes[PACKET * local..]).enumerate() {
+                        lanes[i % LANES] = E::widen(*value).mul_add(f32::from(*code), lanes[i % LANES]);
+                    }
+                    sum = x.d[local].mul_add(combine(lanes), sum);
                 }
-                *out = x.d * combine(lanes);
+                *out = sum;
             }
         }
         out
@@ -2470,18 +2472,6 @@ fn activation_sum(x: &Q8Block, local: usize, half: usize, whole: bool) -> i32 {
     }
 }
 
-/// The sum of the eight i32 lanes of `lanes`.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn sum_lanes(lanes: std::arch::x86_64::__m256i) -> i32 {
-    use std::arch::x86_64::*;
-    unsafe {
-        let half = _mm_add_epi32(_mm256_castsi256_si128(lanes), _mm256_extracti128_si256::<1>(lanes));
-        let pair = _mm_add_epi32(half, _mm_shuffle_epi32::<0b01_00_11_10>(half));
-        _mm_cvtsi128_si32(_mm_add_epi32(pair, _mm_shuffle_epi32::<0b10_11_00_01>(pair)))
-    }
-}
-
 /// A k-block's 64 activation codes at `x` in the byte order of an `mma16`
 /// lane pair's code bytes (`Hier::dot_tile16`): register `p` holds lanes
 /// `2p` and `2p + 1`, byte `16t + 4s + j` column `16s + [2t, 2t + 8, 2t +
@@ -2836,6 +2826,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
                     [low, high]
                 };
                 let coefficients = unsafe { Self::decode::<STORAGE>(at) };
+                let d = unsafe { _mm_setr_ps(x[0].d[local], x[1].d[local], x[2].d[local], x[3].d[local]) };
                 for h in 0..halves {
                     let (exact, (scale, bias)) = (exact[h], coefficients[h]);
                     let mut codes = [0i32; 4];
@@ -2844,19 +2835,19 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
                     }
                     let codes = unsafe { _mm_loadu_si128(codes.as_ptr().cast()) };
                     let exact = if least != 0 { unsafe { _mm_add_epi32(exact, _mm_mullo_epi32(_mm_set1_epi32(least), codes)) } } else { exact };
-                    sums =
-                        unsafe { _mm_fmadd_ps(_mm_set1_ps(scale), _mm_cvtepi32_ps(exact), sums) };
+                    let mut term = unsafe { _mm_mul_ps(_mm_set1_ps(scale), _mm_cvtepi32_ps(exact)) };
                     if BIAS {
-                        sums = unsafe {
-                            _mm_fmadd_ps(_mm_set1_ps(bias), _mm_cvtepi32_ps(codes), sums)
+                        term = unsafe {
+                            _mm_fmadd_ps(_mm_set1_ps(bias), _mm_cvtepi32_ps(codes), term)
                         };
                     }
+                    sums = unsafe { _mm_fmadd_ps(d, term, sums) };
                 }
             }
             let mut lanes = [0.0f32; 4];
             unsafe { _mm_storeu_ps(lanes.as_mut_ptr(), sums) };
-            for ((out, lane), x) in out.iter_mut().zip(lanes).zip(x.iter()) {
-                *out = x.d * lane;
+            for (out, lane) in out.iter_mut().zip(lanes) {
+                *out = lane;
             }
         }
         out
@@ -2908,6 +2899,8 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
                     }
                 }
                 let coefficients = unsafe { Self::decode::<STORAGE>(at) };
+                let d = [x[0].d[local], x[1].d[local], x[2].d[local], x[3].d[local]];
+                let d = unsafe { vld1q_f32(d.as_ptr()) };
                 for (h, products) in products.iter().enumerate().take(halves) {
                     let exact = unsafe {
                         vcvtq_f32_s32(vpaddq_s32(
@@ -2916,20 +2909,21 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
                         ))
                     };
                     let (scale, bias) = coefficients[h];
-                    sums = unsafe { vfmaq_n_f32(sums, exact, scale) };
+                    let mut term = unsafe { vmulq_n_f32(exact, scale) };
                     if BIAS {
                         let mut codes = [0.0f32; 4];
                         for m in 0..4 {
                             codes[m] = activation_sum(x[m], local, h, halves == 1) as f32;
                         }
-                        sums = unsafe { vfmaq_n_f32(sums, vld1q_f32(codes.as_ptr()), bias) };
+                        term = unsafe { vfmaq_n_f32(term, vld1q_f32(codes.as_ptr()), bias) };
                     }
+                    sums = unsafe { vfmaq_f32(sums, d, term) };
                 }
             }
             let mut lanes = [0.0f32; 4];
             unsafe { vst1q_f32(lanes.as_mut_ptr(), sums) };
-            for ((out, lane), x) in out.iter_mut().zip(lanes).zip(x.iter()) {
-                *out = x.d * lane;
+            for (out, lane) in out.iter_mut().zip(lanes) {
+                *out = lane;
             }
         }
         out
@@ -2996,37 +2990,34 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
     }
 
     #[inline(always)]
-    fn tile_combine<const W: usize, const R: usize>(_: &tile::Side, units: &tile::Sums<W>, x: &Q8Tile<R>) -> [[f32; 8]; W] {
+    fn tile_combine<const W: usize, const R: usize>(_: &tile::Side, units: &tile::Sums<W>, _: &Q8Tile<R>) -> [[f32; 8]; W] {
         // Each row's fused sum in group order, as `Coefficients::dot_q8`,
-        // formed unit by unit (`tile::Sums`), then the activation scale.
-        let mut out = [[0.0f32; 8]; W];
-        for (a, out) in out.iter_mut().enumerate() {
-            for (out, sum) in out.iter_mut().zip(units.values[a]) {
-                *out = x.d[a] * sum;
-            }
-        }
-        out
+        // already scaled per packet (`tile::Sums`).
+        units.values
     }
 
     #[cfg(test)]
     unsafe fn reference<C: Codes, const STORAGE: usize>(row: &Row, b: usize, packets: usize, x: &Q8Block) -> f32 {
-        // Per unit in group order: `fma(scale, Σ v a, sum)`, then
-        // `fma(bias, Σ a, sum)`; then `d * sum`.
+        // Per unit in group order: `fma(d[local], scale * Σ v a + bias * Σ a, sum)`.
         let (block, mut sum) = (Block::of::<STORAGE>(row, b), 0.0f32);
         for local in packets_of(packets) {
             let at = block.at::<STORAGE>(local);
             let (coefficients, values) = unsafe { (Self::decode::<STORAGE>(at), C::values(at)) };
+            let d = x.d[local];
             for (h, (scale, bias)) in coefficients.into_iter().enumerate().take(PACKET / Self::UNIT) {
                 let unit = h * Self::UNIT..(h + 1) * Self::UNIT;
                 let codes = |i: usize| i32::from(x.codes[PACKET * local + i]);
                 let exact: i32 = unit.clone().map(|i| i32::from(values[i]) * codes(i)).sum();
-                sum = scale.mul_add(exact as f32, sum);
-                if BIAS {
-                    sum = bias.mul_add(unit.map(codes).sum::<i32>() as f32, sum);
-                }
+                let term = scale * exact as f32;
+                let term = if BIAS {
+                    bias.mul_add(unit.map(codes).sum::<i32>() as f32, term)
+                } else {
+                    term
+                };
+                sum = d.mul_add(term, sum);
             }
         }
-        x.d * sum
+        sum
     }
 
     #[inline(always)]
@@ -3065,18 +3056,22 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
             for local in packets_of(packets) {
                 let coefficients = unsafe { Self::decode::<STORAGE>(block.at::<STORAGE>(local)) };
                 for m in 0..M {
+                    let d = x[m].d[local];
                     for h in 0..halves {
                         let (scale, bias) = coefficients[h];
-                        sums[m] = scale.mul_add(exact[m][h][local], sums[m]);
-                        if BIAS {
+                        let term = scale * exact[m][h][local];
+                        let term = if BIAS {
                             let codes = activation_sum(x[m], local, h, halves == 1);
-                            sums[m] = bias.mul_add(codes as f32, sums[m]);
-                        }
+                            bias.mul_add(codes as f32, term)
+                        } else {
+                            term
+                        };
+                        sums[m] = d.mul_add(term, sums[m]);
                     }
                 }
             }
-            for ((out, sum), x) in out.iter_mut().zip(sums).zip(x.iter()) {
-                *out = x.d * sum;
+            for (out, sum) in out.iter_mut().zip(sums) {
+                *out = sum;
             }
         }
         out
@@ -3596,8 +3591,8 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         for n in 1..N {
             codes[n] = unsafe { L::block::<GROUP>(groups[n]) };
         }
-        let mut scaled = [[0i32; M]; N];
-        let mut minimums = [[0i32; M]; N];
+        let mut scaled = [[[0i32; 8]; M]; N];
+        let mut minimums = [[[0i32; 8]; M]; N];
         // x86 takes the codes less `least` (`packed_x86::shift`), and adds
         // back `least Σ scale Σ a` per group with the minimum terms.
         #[cfg(target_arch = "x86_64")]
@@ -3620,10 +3615,10 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                         for h in 0..halves {
                             let ((scale, minimum), sum) = (codes[n][local][h], sums[m][local][h]);
                             if Self::BIASED {
-                                minimums[n][m] += minimum * sum;
+                                minimums[n][m][local] += minimum * sum;
                             }
                             if least != 0 {
-                                scaled[n][m] += least * scale * sum;
+                                scaled[n][m][local] += least * scale * sum;
                             }
                         }
                     }
@@ -3634,10 +3629,6 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         if V::QUANTIZED_DOTS >= 1 {
             unsafe {
                 use std::arch::aarch64::*;
-                // Each half accumulates in its own lanes: one multiply-add per
-                // half, which the compiler cannot reassociate into a multiply,
-                // a multiply-add and an add.
-                let mut lanes = [[[vdupq_n_s32(0); 2]; M]; N];
                 // A k-block's two packets read together (`Codes::neon_pair`;
                 // the group's packets are whole k-blocks), of both rows of a
                 // pair at once.
@@ -3653,35 +3644,24 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                         for (local, weights) in (first..(first + 2).min(packets)).zip(weights[n]) {
                             let [first_code, second_code] = Self::packet_scales(groups[n].packet(local));
                             let zero = vdupq_n_s32(0);
-                            for (lanes, x) in lanes[n].iter_mut().zip(x.iter()) {
+                            for (m, x) in x.iter().enumerate() {
                                 let activations = x.codes[PACKET * local..].as_ptr();
                                 let (first, second) = (vld1q_s8(activations), vld1q_s8(activations.add(16)));
-                                if whole {
+                                let sum = if whole {
                                     let products = packed_neon::sdot(
                                         packed_neon::sdot(zero, weights[0], first),
                                         weights[1],
                                         second,
                                     );
-                                    lanes[0] = vmlaq_n_s32(lanes[0], products, first_code);
+                                    first_code * vaddvq_s32(products)
                                 } else {
-                                    lanes[0] = vmlaq_n_s32(
-                                        lanes[0],
-                                        packed_neon::sdot(zero, weights[0], first),
-                                        first_code,
-                                    );
-                                    lanes[1] = vmlaq_n_s32(
-                                        lanes[1],
-                                        packed_neon::sdot(zero, weights[1], second),
-                                        second_code,
-                                    );
-                                }
+                                    let first_sum = vaddvq_s32(packed_neon::sdot(zero, weights[0], first));
+                                    let second_sum = vaddvq_s32(packed_neon::sdot(zero, weights[1], second));
+                                    first_code * first_sum + second_code * second_sum
+                                };
+                                scaled[n][m][local] += sum;
                             }
                         }
-                    }
-                }
-                for (scaled, lanes) in scaled.iter_mut().zip(lanes) {
-                    for (scaled, [first, second]) in scaled.iter_mut().zip(lanes) {
-                        *scaled += vaddvq_s32(vaddq_s32(first, second));
                     }
                 }
             }
@@ -3692,7 +3672,6 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 use std::arch::x86_64::*;
                 // The pair products take one 16-bit scale code per half.
                 let shift = const { packed_x86::row_shift::<C>() };
-                let mut lanes = [[_mm256_setzero_si256(); M]; N];
                 // A k-block's two packets read together (`Codes::x86_pair`;
                 // the group's packets are whole k-blocks), of both rows of a
                 // pair at once: each packet as its unsigned operand and,
@@ -3733,14 +3712,10 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                                 let activations =
                                     packed_x86::load(x[m].codes.as_ptr().add(PACKET * local));
                                 let activations = if shift.is_some() { activations } else { _mm256_sign_epi8(activations, signs) };
-                                lanes[n][m] = packed_x86::dot_scaled(lanes[n][m], weights, activations, scales);
+                                let lanes = packed_x86::dot_scaled(_mm256_setzero_si256(), weights, activations, scales);
+                                scaled[n][m][local] += packed_x86::sum(lanes);
                             }
                         }
-                    }
-                }
-                for (scaled, lanes) in scaled.iter_mut().zip(lanes) {
-                    for (scaled, lanes) in scaled.iter_mut().zip(lanes) {
-                        *scaled += packed_x86::sum(lanes);
                     }
                 }
             }
@@ -3752,7 +3727,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                     let exact = scalar_dots::<M, GROUP, V>(&values, x, local);
                     for m in 0..M {
                         for h in 0..halves {
-                            scaled[n][m] += codes[n][local][h].0 * exact[m][h];
+                            scaled[n][m][local] += codes[n][local][h].0 * exact[m][h];
                         }
                     }
                 }
@@ -3762,7 +3737,15 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         for n in 0..N {
             let factors = unsafe { Self::factors(groups[n]) };
             for m in 0..M {
-                out[n][m] = x[m].d * Self::combine(factors, scaled[n][m], minimums[n][m]);
+                let (mut s, mut min) = (0.0f32, 0.0f32);
+                for local in packets_of(packets) {
+                    let d = x[m].d[local];
+                    s = d.mul_add(scaled[n][m][local] as f32, s);
+                    if Self::BIASED {
+                        min = d.mul_add(minimums[n][m][local] as f32, min);
+                    }
+                }
+                out[n][m] = Self::combine(factors, s, min);
             }
         }
         out
@@ -3860,7 +3843,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 }
             }
         }
-        unsafe { Self::combine_tile16(row, stride, b, x, &steps, groups, offset) }
+        unsafe { Self::combine_tile16(row, stride, b, packets, x, &steps, groups, offset) }
     }
 
     /// The 16 rows' block `b` sums of a tile from each row's exact code
@@ -3870,28 +3853,30 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     /// the block's activation code sum of each coefficient group. Each
     /// row's coefficient codes are decoded as vectors (`Locals::x86_groups`)
     /// and applied to its sixteen step sums, its minimum and offset terms to
-    /// the group sums, all in i32 (the exact integers [`Hier::dot_rows`]
-    /// sums), then eight rows' factors read and combined at once, each
-    /// lane's arithmetic `Self::combine`'s: [`Hier::dot_rows`]'s result bit
-    /// for bit.
+    /// the group sums, all in i32 per packet (the exact integers
+    /// [`Hier::dot_rows`] sums), then accumulated per packet with `x.d[local]`
+    /// and eight rows' factors read and combined at once, each lane's
+    /// arithmetic `Self::combine`'s: [`Hier::dot_rows`]'s result bit for bit.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn combine_tile16(
         row: &Row,
         stride: usize,
         b: usize,
+        packets: usize,
         x: &Q8Block,
         steps: &[[std::arch::x86_64::__m128i; 4]; 16],
         groups: &[std::arch::x86_64::__m256i; 2],
         offset: i32,
     ) -> [f32; 16] {
         use std::arch::x86_64::*;
-        // Each row's coefficient terms in i32, then eight rows' factors and
-        // combine at once, each lane as `Self::combine` computes it.
+        // Collapse two vectors of 8 step values (4 packets x 2 halves each)
+        // into one vector of 8 packet sums in packet order [p0..p7].
         let group = At::group(row, b);
         let (scales_plane, supers) = (group.plane(RowPlaneRole::Scales), group.plane(RowPlaneRole::Supers));
-        let mut scaled = [0i32; 16];
-        let mut minimums = [0i32; 16];
+        let mut scaled = [0.0f32; 16];
+        let mut minimums = [0.0f32; 16];
         for r in 0..16 {
             unsafe {
                 let [scales, minimum_codes] = L::x86_groups::<GROUP>(scales_plane.add(r * stride)).expect("vector coefficient codes");
@@ -3904,22 +3889,42 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                         _mm256_permutevar8x32_epi32(scales[0], _mm256_setr_epi32(4, 4, 5, 5, 6, 6, 7, 7)),
                     ]
                 };
-                let mut sum = _mm256_setzero_si256();
-                for (pair, step_scales) in step_scales.iter().enumerate() {
-                    let sums = _mm256_set_m128i(steps[r][2 * pair + 1], steps[r][2 * pair]);
-                    sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(sums, *step_scales));
+                let prod0 = _mm256_mullo_epi32(_mm256_set_m128i(steps[r][1], steps[r][0]), step_scales[0]);
+                let prod1 = _mm256_mullo_epi32(_mm256_set_m128i(steps[r][3], steps[r][2]), step_scales[1]);
+                let mut packet_scaled = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_hadd_epi32(prod0, prod1));
+                if offset != 0 {
+                    let offset_terms = if GROUP == 16 {
+                        let t0 = _mm256_mullo_epi32(scales[0], groups[0]);
+                        let t1 = _mm256_mullo_epi32(scales[1], groups[1]);
+                        _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_hadd_epi32(t0, t1))
+                    } else {
+                        _mm256_mullo_epi32(scales[0], groups[0])
+                    };
+                    packet_scaled = _mm256_add_epi32(packet_scaled, _mm256_mullo_epi32(_mm256_set1_epi32(offset), offset_terms));
                 }
-                let mut terms = [_mm256_setzero_si256(); 2];
-                for half in 0..32 / GROUP {
-                    if offset != 0 {
-                        terms[0] = _mm256_add_epi32(terms[0], _mm256_mullo_epi32(scales[half], groups[half]));
-                    }
+                let mut ps = [0i32; 8];
+                _mm256_storeu_si256(ps.as_mut_ptr().cast(), packet_scaled);
+                let mut pm = [0i32; 8];
+                if Self::BIASED {
+                    let packet_min = if GROUP == 16 {
+                        let m0 = _mm256_mullo_epi32(minimum_codes[0], groups[0]);
+                        let m1 = _mm256_mullo_epi32(minimum_codes[1], groups[1]);
+                        _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_hadd_epi32(m0, m1))
+                    } else {
+                        _mm256_mullo_epi32(minimum_codes[0], groups[0])
+                    };
+                    _mm256_storeu_si256(pm.as_mut_ptr().cast(), packet_min);
+                }
+                let (mut s, mut min) = (0.0f32, 0.0f32);
+                for local in packets_of(packets) {
+                    let d = x.d[local];
+                    s = d.mul_add(ps[local] as f32, s);
                     if Self::BIASED {
-                        terms[1] = _mm256_add_epi32(terms[1], _mm256_mullo_epi32(minimum_codes[half], groups[half]));
+                        min = d.mul_add(pm[local] as f32, min);
                     }
                 }
-                scaled[r] = sum_lanes(sum) + offset * sum_lanes(terms[0]);
-                minimums[r] = sum_lanes(terms[1]);
+                scaled[r] = s;
+                minimums[r] = min;
             }
         }
         let mut out = [0.0f32; 16];
@@ -3932,9 +3937,9 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 } else {
                     _mm256_mul_ps(factor, _mm256_set1_ps(Self::SCALE_POWER))
                 };
-                // Lanes 8 * eight.. of the i32 sums, as f32 (no closure: it
-                // would not take the caller's features).
-                let mut value = _mm256_mul_ps(scale, _mm256_cvtepi32_ps(_mm256_loadu_si256(scaled.as_ptr().add(8 * eight).cast())));
+                // Lanes 8 * eight.. of the f32 sums (no closure: it would
+                // not take the caller's features).
+                let mut value = _mm256_mul_ps(scale, _mm256_loadu_ps(scaled.as_ptr().add(8 * eight)));
                 if Self::BIASED {
                     let bias = match L::BIAS {
                         Some(LocalBias::Minimum(_)) => {
@@ -3944,10 +3949,10 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                         Some(LocalBias::Signed { .. }) => _mm256_mul_ps(factor, _mm256_set1_ps(Self::BIAS_POWER)),
                         None => _mm256_setzero_ps(),
                     };
-                    let term = _mm256_mul_ps(bias, _mm256_cvtepi32_ps(_mm256_loadu_si256(minimums.as_ptr().add(8 * eight).cast())));
+                    let term = _mm256_mul_ps(bias, _mm256_loadu_ps(minimums.as_ptr().add(8 * eight)));
                     value = if Self::SUBTRACT { _mm256_sub_ps(value, term) } else { _mm256_add_ps(value, term) };
                 }
-                _mm256_storeu_ps(out.as_mut_ptr().add(8 * eight), _mm256_mul_ps(_mm256_set1_ps(x.d), value));
+                _mm256_storeu_ps(out.as_mut_ptr().add(8 * eight), value);
             }
         }
         out
@@ -4003,7 +4008,8 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         for (tile, out) in out.chunks_exact_mut(16).enumerate() {
             let rows = geometry.rows::<16>(first.wrapping_add(16 * tile * geometry.stride));
             for (b, block) in x.iter().enumerate() {
-                let kblocks = block_packets(b, k).len() / 2;
+                let packets = block_packets(b, k).len();
+                let kblocks = packets / 2;
                 // No closures here: a closure would not take the caller's
                 // features, and its intrinsics would compile as calls.
                 let mut activations = [unsafe { _mm256_setzero_si256() }; Q8_BLOCK / PACKET];
@@ -4033,7 +4039,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                     }
                 }
                 let values =
-                    unsafe { Self::combine_tile16(&rows[0], geometry.stride, b, block, &steps, &Self::group_sums(block), least) };
+                    unsafe { Self::combine_tile16(&rows[0], geometry.stride, b, packets, block, &steps, &Self::group_sums(block), least) };
                 for (sum, value) in out.iter_mut().zip(values) {
                     *sum += value;
                 }
@@ -4113,14 +4119,14 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     /// `factor * scaled ± bias factor * biases`, the bias term's product
     /// rounded on its own.
     #[inline(always)]
-    fn combine(factors: (f32, f32), scaled: i32, minimums: i32) -> f32 {
-        let scaled = factors.0 * scaled as f32;
+    fn combine(factors: (f32, f32), scaled: f32, minimums: f32) -> f32 {
+        let scaled = factors.0 * scaled;
         if !Self::BIASED {
             scaled
         } else if Self::SUBTRACT {
-            scaled - factors.1 * minimums as f32
+            scaled - factors.1 * minimums
         } else {
-            scaled + factors.1 * minimums as f32
+            scaled + factors.1 * minimums
         }
     }
 }
@@ -4176,13 +4182,13 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     }
 
     #[inline(always)]
-    fn tile_combine<const W: usize, const R: usize>(side: &tile::Side, units: &tile::Scaled<W>, x: &Q8Tile<R>) -> [[f32; 8]; W] {
+    fn tile_combine<const W: usize, const R: usize>(side: &tile::Side, units: &tile::Scaled<W>, _: &Q8Tile<R>) -> [[f32; 8]; W] {
         let mut out = [[0.0f32; 8]; W];
         for (a, out) in out.iter_mut().enumerate() {
-            // Each row's exact `scaled` and `minimums`, as `Hier::dot_rows`.
+            // Each row's `scaled` and `minimums`, already scaled per packet, as `Hier::dot_rows`.
             let (scaled, minimums) = (&units.scaled[a], &units.minimums[a]);
             for r in 0..8 {
-                out[r] = x.d[a] * Self::combine((side.factors[0][r], side.factors[1][r]), scaled[r], minimums[r]);
+                out[r] = Self::combine((side.factors[0][r], side.factors[1][r]), scaled[r], minimums[r]);
             }
         }
         out
@@ -4220,21 +4226,28 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
 
     #[cfg(test)]
     unsafe fn reference<C: Codes, const STORAGE: usize>(row: &Row, b: usize, packets: usize, x: &Q8Block) -> f32 {
-        // `scaled = Σ_g s_g Σ v a` and `minimums = Σ_g m_g Σ a` exactly,
-        // then `d * combine`.
+        // Per packet `local`: `packet_scaled = Σ_h s_h Σ v a` and
+        // `packet_minimums = Σ_h m_h Σ a` exactly, accumulated with
+        // `fma(d[local], sum, acc)`, then `combine`.
         let group = At::group(row, b);
-        let (mut scaled, mut minimums) = (0i32, 0i32);
+        let (mut scaled, mut minimums) = (0.0f32, 0.0f32);
         for local in packets_of(packets) {
             let at = group.packet(local);
             let values = unsafe { C::values(at) };
+            let (mut packet_scaled, mut packet_minimums) = (0i32, 0i32);
             for (i, value) in values.into_iter().enumerate() {
                 let (scale, minimum) = unsafe { L::read::<GROUP>(at, at.local::<GROUP>(i / 16)) };
                 let code = i32::from(x.codes[PACKET * local + i]);
-                scaled += scale * i32::from(value) * code;
-                minimums += minimum * code;
+                packet_scaled += scale * i32::from(value) * code;
+                packet_minimums += minimum * code;
+            }
+            let d = x.d[local];
+            scaled = d.mul_add(packet_scaled as f32, scaled);
+            if Self::BIASED {
+                minimums = d.mul_add(packet_minimums as f32, minimums);
             }
         }
-        x.d * Self::combine(unsafe { Self::factors(group) }, scaled, minimums)
+        Self::combine(unsafe { Self::factors(group) }, scaled, minimums)
     }
 
     #[inline(always)]

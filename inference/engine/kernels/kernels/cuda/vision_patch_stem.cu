@@ -26,16 +26,62 @@ constexpr u32 H = SEISMIC_DIM_H;
 #define CONVERTED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_CONVERTED)
 #define PARTIAL reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIAL))
 
+template <class E> __device__ __forceinline__ float2 load2(const u8 *base, u64 index) {
+    if constexpr (E::bytes == 4) {
+        const u8 *address = base + index * 4;
+        if ((reinterpret_cast<u64>(address) & 7u) == 0)
+            return *reinterpret_cast<const float2 *>(address);
+    } else {
+        const u8 *address = base + index * 2;
+        if ((reinterpret_cast<u64>(address) & 3u) == 0)
+            return E::unpack2(*reinterpret_cast<const u32 *>(address));
+    }
+    return make_float2(element::at<E>(base, index), element::at<E>(base, index + 1));
+}
+
 extern "C" __global__ void vision_patch_stem_convert(SEISMIC_KERNEL_PARAMS) {
-    const u64 index = (u64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= SEISMIC_DIM_M * FRAMES * KP)
+    const u32 row = blockIdx.x;
+    const u32 frame = blockIdx.y;
+    const u32 col0 = (blockIdx.z * blockDim.x + threadIdx.x) * 4u;
+    if (col0 >= (u32)KP)
         return;
-    const u64 row = index / (FRAMES * KP), frame = (index / KP) % FRAMES, column = index % KP;
-    const u64 channel = column / AREA, within = column % AREA;
-    const float *pixels = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_PIXELS));
-    element::put<Pixel>(CONVERTED, index,
-                        column < K ? pixels[row * SEISMIC_PIXELS_STRIDE_0 + (channel * FRAMES + frame) * AREA + within]
-                                   : 0.0f);
+    float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (col0 < (u32)K) {
+        const float *row_pixels =
+            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_PIXELS)) + (u64)row * SEISMIC_PIXELS_STRIDE_0;
+        u32 channel = col0 / (u32)AREA;
+        u32 within = col0 % (u32)AREA;
+        if (within + 4u <= (u32)AREA) {
+            const float *src = row_pixels + ((u64)channel * FRAMES + frame) * AREA + within;
+            if ((reinterpret_cast<u64>(src) & 15u) == 0) {
+                const float4 f = *reinterpret_cast<const float4 *>(src);
+                v[0] = f.x;
+                v[1] = f.y;
+                v[2] = f.z;
+                v[3] = f.w;
+            } else {
+                v[0] = src[0];
+                v[1] = src[1];
+                v[2] = src[2];
+                v[3] = src[3];
+            }
+        } else {
+            const u32 count = min(4u, (u32)K - col0);
+#pragma unroll
+            for (u32 i = 0; i < 4u; ++i) {
+                if (i < count) {
+                    v[i] = row_pixels[((u64)channel * FRAMES + frame) * AREA + within];
+                    if (++within == (u32)AREA) {
+                        within = 0u;
+                        ++channel;
+                    }
+                }
+            }
+        }
+    }
+    const u64 out_index = ((u64)row * FRAMES + frame) * KP + col0;
+    *reinterpret_cast<uint2 *>(CONVERTED + out_index * Pixel::bytes) =
+        make_uint2(Pixel::pack2(v[0], v[1]), Pixel::pack2(v[2], v[3]));
 }
 
 // The first frame's F32 product.
@@ -58,23 +104,54 @@ struct Stem {
     const int *indices;
     const float *coefficients;
     u64 columns;
-    __device__ __forceinline__ float value(u32 m, u32 n, float acc) const {
-        float projected = acc;
-        if constexpr (SEISMIC_DIM_S == 1)
-            projected = partial[(u64)m * columns + n] + acc;
-        if constexpr (SEISMIC_DIM_NB == 1)
-            projected = projected + element::at<BiasElement>(bias, n);
-        float blended = 0.0f;
-        if constexpr (SEISMIC_DIM_NT == 1) {
-#pragma unroll
-            for (u32 i = 0; i < 4; ++i)
-                blended +=
-                    element::at<TableElement>(table, (u64)indices[m * 4 + i] * columns + n) * coefficients[m * 4 + i];
-        }
-        return projected + blended;
-    }
     __device__ __forceinline__ void operator()(u32 m, u32 n, float first, float second) const {
-        y.put2((u64)m * stride + n, value(m, n, first), value(m, n + 1, second));
+        float p0 = first, p1 = second;
+        if constexpr (SEISMIC_DIM_S == 1) {
+            const float2 p = *reinterpret_cast<const float2 *>(partial + (u64)m * columns + n);
+            p0 = p.x + first;
+            p1 = p.y + second;
+        }
+        if constexpr (SEISMIC_DIM_NB == 1) {
+            const float2 b = load2<BiasElement>(bias, n);
+            p0 = p0 + b.x;
+            p1 = p1 + b.y;
+        }
+        float b0 = 0.0f, b1 = 0.0f;
+        if constexpr (SEISMIC_DIM_NT == 1) {
+            const int *idx_ptr = indices + (u64)m * 4;
+            const float *coef_ptr = coefficients + (u64)m * 4;
+            int idx[4];
+            float coef[4];
+            if ((reinterpret_cast<u64>(idx_ptr) & 15u) == 0) {
+                const int4 v = *reinterpret_cast<const int4 *>(idx_ptr);
+                idx[0] = v.x;
+                idx[1] = v.y;
+                idx[2] = v.z;
+                idx[3] = v.w;
+            } else {
+#pragma unroll
+                for (u32 i = 0; i < 4; ++i)
+                    idx[i] = idx_ptr[i];
+            }
+            if ((reinterpret_cast<u64>(coef_ptr) & 15u) == 0) {
+                const float4 v = *reinterpret_cast<const float4 *>(coef_ptr);
+                coef[0] = v.x;
+                coef[1] = v.y;
+                coef[2] = v.z;
+                coef[3] = v.w;
+            } else {
+#pragma unroll
+                for (u32 i = 0; i < 4; ++i)
+                    coef[i] = coef_ptr[i];
+            }
+#pragma unroll
+            for (u32 i = 0; i < 4; ++i) {
+                const float2 t = load2<TableElement>(table, (u64)idx[i] * columns + n);
+                b0 += t.x * coef[i];
+                b1 += t.y * coef[i];
+            }
+        }
+        y.put2((u64)m * stride + n, p0 + b0, p1 + b1);
     }
 };
 

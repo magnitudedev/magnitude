@@ -6,7 +6,7 @@ use crate::memory::shortage;
 use crate::memory::supply::{Ceiling, HostGrant, Observed, Reading};
 
 use super::changes::Sampled;
-use super::state::State;
+use super::state::{FoldedReading, State};
 use super::vocabulary::CacheKind;
 
 /// A reading as the ledger estimated it (§4.1-4.3): every figure of one
@@ -340,7 +340,7 @@ impl Estimate {
 impl State {
     /// The estimate of the store now; none before its first reading.
     pub(super) fn estimate(&self) -> Option<Estimate> {
-        self.read.map(|read| self.estimate_at(read))
+        self.folded.map(|folded| self.estimate_at(folded.read))
     }
 
     /// The estimate of the store at `read`'s OS figures with what the
@@ -375,7 +375,8 @@ impl State {
     /// # Panics
     /// Where the store was never read: no ledger that judges exists then.
     pub(super) fn reading(&self, store: &seismic::StoreIdentity, at: Option<Read>) -> Read {
-        at.or(self.read).unwrap_or_else(|| panic!("invariant violated: {store:?} admits before its first reading"))
+        at.or(self.folded.map(|folded| folded.read))
+            .unwrap_or_else(|| panic!("invariant violated: {store:?} admits before its first reading"))
     }
 
     /// The estimate at the latest reading ([`Self::reading`]).
@@ -475,8 +476,10 @@ impl State {
         // `budget()`, `free()`, `allocatable()`, `hold_room()`, and
         // `import_room()` never double-subtract our own growth while staying
         // exact (zero double-spending) when the OS has not flushed yet.
+        let prev = self.folded;
+        let prev_read = prev.map(|folded| folded.read);
         let unshown_growth = own.allocated.saturating_sub(visible.allocated);
-        let flushed = match self.read.filter(|_| !settled && unshown_growth > 0) {
+        let flushed = match prev_read.filter(|_| !settled && unshown_growth > 0) {
             None => 0,
             Some(before) => {
                 let risen = raw_others.saturating_sub(before.others);
@@ -518,7 +521,7 @@ impl State {
         // second stale, left 285 of 1,184 readings unshown on an M4 Pro,
         // and each one regrew a slot just shed into that rise). A reading
         // after an idle sleep judges none: the rise is none.
-        let rise = match self.read.filter(|_| !settled) {
+        let rise = match prev_read.filter(|_| !settled) {
             None => 0,
             Some(before) if !(before.shown && shown) => before.rise,
             Some(before) => {
@@ -532,18 +535,19 @@ impl State {
                 }
             }
         };
+        let mut wired_others = prev.and_then(|before| before.wired_others);
         let mut unwired = 0;
         let grant = match reading.grant() {
             Some(HostGrant::Wired(ceiling)) => {
                 // Others' wired bytes: what the OS wires beyond the process's
                 // own wired bytes as the counters show them. The process's
                 // pageable memory is never in the count.
-                let (wired_others, wired_rise) = match ceiling.wired.checked_sub(counted.wired) {
-                    Some(wired_others) => {
-                        let judged = !settled && self.read.is_some_and(|before| before.shown) && shown;
-                        let wired_rise = self.wired_others.filter(|_| judged).map_or(0, |before| wired_others.saturating_sub(before));
-                        self.wired_others = Some(wired_others);
-                        (wired_others, wired_rise)
+                let (others_wired, wired_rise) = match ceiling.wired.checked_sub(counted.wired) {
+                    Some(others_wired) => {
+                        let judged = !settled && prev_read.is_some_and(|before| before.shown) && shown;
+                        let wired_rise = wired_others.filter(|_| judged).map_or(0, |before| others_wired.saturating_sub(before));
+                        wired_others = Some(others_wired);
+                        (others_wired, wired_rise)
                     }
                     // The count shows less than the process wires: a residency
                     // set the OS let lapse, not yet wired again when the
@@ -556,23 +560,24 @@ impl State {
                     None => {
                         unwired = counted.wired - ceiling.wired;
                         self.unwired_readings += 1;
-                        (self.wired_others.unwrap_or(ceiling.wired), 0)
+                        (wired_others.unwrap_or(ceiling.wired), 0)
                     }
                 };
-                Some(ceiling.limit.saturating_sub(wired_others).saturating_sub(wired_rise))
+                Some(ceiling.limit.saturating_sub(others_wired).saturating_sub(wired_rise))
             }
             Some(HostGrant::Limit(limit)) => Some(limit),
             Some(HostGrant::Budget { capacity, left }) => Some(visible_allocated.saturating_add(left).min(capacity)),
             None => None,
         };
-        if let Some(before) = self.read.filter(|before| !settled && before.others != others) {
+        if let Some(before) = prev_read.filter(|before| !settled && before.others != others) {
             let interval = at.at().duration_since(before.at.at());
             self.others_interval = Some(self.others_interval.map_or(interval, |shortest| shortest.min(interval)));
         }
         let paged = reading.paging().is_some();
         let (cap, grows) = (self.boundary.cap(), !paged || self.boundary.admits_growth());
-        self.read = Some(Read { at, capacity: reading.capacity(), supply, visible: visible_allocated, nonresident, unobserved, credited, others, rise, grant, ceiling: reading.ceiling(), unwired, lag, shown, cap, grows });
-        let estimate = self.estimate().expect("a store just read is estimated");
+        let read = Read { at, capacity: reading.capacity(), supply, visible: visible_allocated, nonresident, unobserved, credited, others, rise, grant, ceiling: reading.ceiling(), unwired, lag, shown, cap, grows };
+        self.folded = Some(FoldedReading { read, wired_others, answered: prev.and_then(|before| before.answered) });
+        let estimate = self.estimate_at(read);
         let cause = shortage::cause(&estimate, self.boundary.harmed(), self.boundary.pressed());
         // Only a floor shortfall unloads: its persistence alone is kept,
         // so a rise, harm or pressure that stood before it never makes it

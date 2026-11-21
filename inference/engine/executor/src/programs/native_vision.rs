@@ -24,8 +24,8 @@ use super::{ReadySubmission, VisionProgram};
 use crate::error::PlanError;
 use crate::native::{AttestedVision, VisionKernels};
 use crate::operators::vision::{
-    LinearBounds, VisionEntry, VisionKernel, VisionOp, VisionOperands, VisionProgram as VisionOps,
-    VisionRows, VisionValue, vision_program,
+    LinearBounds, LinearTail, VisionEntry, VisionKernel, VisionNormKind, VisionOp, VisionOperands,
+    VisionProgram as VisionOps, VisionRows, VisionValue, vision_program,
 };
 use crate::{
     DeviceError, GraphOutputTensor, InvariantError, ModelLoadPlan, NativeGraphOutputLease,
@@ -33,7 +33,7 @@ use crate::{
     VisionLaunchCore, VisionProgramPlan,
 };
 use magnitude_family_contracts::{
-    VisionAttentionSpan, VisionDescription, WeightKind, WeightRole, WeightScope,
+    VisionActivation, VisionAttentionSpan, VisionDescription, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::{
     post_norm_residual, vision_attention, vision_clamp, vision_gated_convolution, vision_linear,
@@ -56,6 +56,18 @@ fn invalid(detail: impl Into<String>) -> SubmitError {
         context: "native vision program",
         detail: detail.into(),
     })
+}
+
+/// The kernel's integer code for a vision activation (`0` for none).
+fn vision_activation_code(activation: Option<VisionActivation>) -> i32 {
+    match activation {
+        None => 0,
+        Some(VisionActivation::GeluTanh) => 1,
+        Some(VisionActivation::GeluErf) => 2,
+        Some(VisionActivation::GeluQuick) => 3,
+        Some(VisionActivation::ReluSquared) => 4,
+        Some(VisionActivation::Silu) => 5,
+    }
 }
 
 fn device(error: impl ToString) -> SubmitError {
@@ -680,19 +692,17 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
             VisionOperands::Norm {
                 source,
                 rows: row_kind,
-                weight,
-                bias,
+                kind,
                 gathered,
                 epsilon,
-                centered,
                 interleave,
                 activation,
             } => {
                 let (g, h) = (statics("G")?, statics("H")?);
                 // A norm of G > 1 member rows per cell reads patch rows and
                 // publishes cells.
-                let kind = if g.equals(1u64) { *row_kind } else { VisionRows::Cells };
-                let cells = self.count(kind);
+                let row_kind = if g.equals(1u64) { *row_kind } else { VisionRows::Cells };
+                let cells = self.count(row_kind);
                 let dims = [
                     ("C", cells.clone()),
                     ("G", g.clone()),
@@ -706,8 +716,8 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                     self.pixels = Some(self.graph.input_for(binding, "source", &dims)?);
                 }
                 let source = self.value(*source, &[cells.clone(), g.clone(), h.clone()])?;
-                let weight = self.rows_of(*weight, &[h.clone()])?;
-                let bias = self.rows_of(*bias, &[h])?;
+                let weight = self.rows_of(kind.weight(), &[h.clone()])?;
+                let bias = self.rows_of(kind.bias(), &[h])?;
                 let members = &cells * &g;
                 let order = if *gathered {
                     let port = self.graph.input_for(binding, "order", &dims)?;
@@ -727,9 +737,9 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                             bias: (&bias).into(),
                             order: (&order).into(),
                             epsilon: epsilon.f32(),
-                            centered: i32::from(*centered).into(),
+                            centered: i32::from(kind.centered()).into(),
                             interleave: i32::from(*interleave).into(),
-                            activation: (*activation).into(),
+                            activation: vision_activation_code(*activation).into(),
                         },
                     )?
                     .value
@@ -739,10 +749,8 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                 rows: row_kind,
                 weight,
                 bias,
-                residual,
-                gate,
+                tail,
                 bounds,
-                activation,
             } => {
                 let (n, k) = (statics("N")?, statics("K")?);
                 let m = self.count(*row_kind);
@@ -759,13 +767,19 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                 let x = self.value(*x, &[m.clone(), k.clone()])?;
                 let weight = self.weight(*weight, &[n.clone(), k])?;
                 let bias = self.rows_of(*bias, &[n.clone()])?;
+                let (residual, gate, activation) = match *tail {
+                    LinearTail::Plain => (None, None, None),
+                    LinearTail::Residual(value) => (Some(value), None, None),
+                    LinearTail::Gate(value) => (None, Some(value), None),
+                    LinearTail::Activated(activation) => (None, None, Some(activation)),
+                };
                 let rows_by_width = [Dim::from(1u64), m.clone(), n.clone()];
                 let residual = match residual {
-                    Some(value) => self.value(*value, &rows_by_width)?,
+                    Some(value) => self.value(value, &rows_by_width)?,
                     None => self.empty(Constant::EmptyF32, &[m.clone(), n.clone()])?,
                 };
                 let gate = match gate {
-                    Some(value) => self.value(*value, &rows_by_width)?,
+                    Some(value) => self.value(value, &rows_by_width)?,
                     None => x.slice_leading(0u64, 0u64).reshape(&[Dim::from(0u64), m, n]),
                 };
                 let unit = [Dim::from(1u64)];
@@ -795,7 +809,7 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                             gate: (&gate).into(),
                             minimum: (&minimum).into(),
                             maximum: (&maximum).into(),
-                            activation: (*activation).into(),
+                            activation: vision_activation_code(activation).into(),
                         },
                     )?
                     .value
@@ -1153,6 +1167,12 @@ enum RelativeValue {
     PatchLocal(usize),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RelativeNormKind {
+    Layer,
+    Rms { weighted: bool },
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum RelativeBounds {
     Stored,
@@ -1169,22 +1189,18 @@ enum RelativeOperands {
     Norm {
         source: RelativeValue,
         rows: VisionRows,
-        has_weight: bool,
-        has_bias: bool,
+        kind: RelativeNormKind,
         gathered: bool,
         epsilon_bits: u32,
-        centered: bool,
         interleave: bool,
-        activation: i32,
+        activation: Option<VisionActivation>,
     },
     Linear {
         x: RelativeValue,
         rows: VisionRows,
         has_bias: bool,
-        residual: Option<RelativeValue>,
-        gate: Option<RelativeValue>,
+        tail: LinearTail<RelativeValue>,
         bounds: Option<RelativeBounds>,
-        activation: i32,
     },
     Clamp {
         x: RelativeValue,
@@ -1240,13 +1256,11 @@ fn for_each_operand_value(operands: &VisionOperands, mut f: impl FnMut(VisionVal
         | VisionOperands::Pool { source, .. }
         | VisionOperands::Position { source, .. }
         | VisionOperands::Registers { source, .. } => f(*source),
-        VisionOperands::Linear { x, residual, gate, .. } => {
+        VisionOperands::Linear { x, tail, .. } => {
             f(*x);
-            if let Some(residual) = residual {
-                f(*residual);
-            }
-            if let Some(gate) = gate {
-                f(*gate);
+            match tail {
+                LinearTail::Residual(v) | LinearTail::Gate(v) => f(*v),
+                LinearTail::Plain | LinearTail::Activated(_) => {}
             }
         }
         VisionOperands::Clamp { x, .. } => f(*x),
@@ -1277,21 +1291,17 @@ fn remap_operand_values(
         VisionOperands::Norm {
             source,
             rows,
-            weight,
-            bias,
+            kind,
             gathered,
             epsilon,
-            centered,
             interleave,
             activation,
         } => VisionOperands::Norm {
             source: remap(source),
             rows,
-            weight,
-            bias,
+            kind,
             gathered,
             epsilon,
-            centered,
             interleave,
             activation,
         },
@@ -1300,19 +1310,15 @@ fn remap_operand_values(
             rows,
             weight,
             bias,
-            residual,
-            gate,
+            tail,
             bounds,
-            activation,
         } => VisionOperands::Linear {
             x: remap(x),
             rows,
             weight,
             bias,
-            residual: residual.map(&mut remap),
-            gate: gate.map(&mut remap),
+            tail: tail.map(&mut remap),
             bounds,
-            activation,
         },
         VisionOperands::Clamp { x, rows, minimum, maximum } => {
             VisionOperands::Clamp { x: remap(x), rows, minimum, maximum }
@@ -1424,7 +1430,10 @@ fn partition_vision_stages(program: &VisionOps) -> Option<VisionStages> {
                 return None;
             }
             match op.operands {
-                VisionOperands::Linear { residual: Some(VisionValue::Result(r)), .. }
+                VisionOperands::Linear {
+                    tail: LinearTail::Residual(VisionValue::Result(r)),
+                    ..
+                }
                 | VisionOperands::PostNormResidual { residual: VisionValue::Result(r), .. }
                     if r < idx =>
                 {
@@ -1526,21 +1535,22 @@ fn block_signature(
             VisionOperands::Norm {
                 source,
                 rows,
-                weight,
-                bias,
+                kind,
                 gathered,
                 epsilon,
-                centered,
                 interleave,
                 activation,
             } => RelativeOperands::Norm {
                 source: rel(*source)?,
                 rows: *rows,
-                has_weight: weight.is_some(),
-                has_bias: bias.is_some(),
+                kind: match kind {
+                    VisionNormKind::Layer { .. } => RelativeNormKind::Layer,
+                    VisionNormKind::Rms { weight } => RelativeNormKind::Rms {
+                        weighted: weight.is_some(),
+                    },
+                },
                 gathered: *gathered,
                 epsilon_bits: epsilon.to_bits(),
-                centered: *centered,
                 interleave: *interleave,
                 activation: *activation,
             },
@@ -1548,30 +1558,20 @@ fn block_signature(
                 x,
                 rows,
                 bias,
-                residual,
-                gate,
+                tail,
                 bounds,
-                activation,
                 ..
             } => RelativeOperands::Linear {
                 x: rel(*x)?,
                 rows: *rows,
                 has_bias: bias.is_some(),
-                residual: match residual {
-                    Some(v) => Some(rel(*v)?),
-                    None => None,
-                },
-                gate: match gate {
-                    Some(v) => Some(rel(*v)?),
-                    None => None,
-                },
+                tail: tail.try_map(rel)?,
                 bounds: bounds.map(|b| match b {
                     LinearBounds::Stored { .. } => RelativeBounds::Stored,
                     LinearBounds::Fixed { minimum, maximum } => {
                         RelativeBounds::Fixed { minimum, maximum }
                     }
                 }),
-                activation: *activation,
             },
             VisionOperands::Clamp { x, rows, .. } => {
                 RelativeOperands::Clamp { x: rel(*x)?, rows: *rows }

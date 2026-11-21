@@ -216,11 +216,11 @@ impl NativeGraphPool {
     }
 
     pub fn acquire_workspace(&self) -> Result<NativeGraphWorkspaceLease, CapacityError> {
-        let slot = self.workspace.borrow_mut().pop().ok_or(CapacityError {
-            resource: ResourceKind::Workspace,
-            required: 1,
-            available: 0,
-        })?;
+        let slot = self
+            .workspace
+            .borrow_mut()
+            .pop()
+            .ok_or_else(|| CapacityError::new(ResourceKind::Workspace, 1, 0))?;
         Ok(NativeGraphWorkspaceLease {
             domain: self.domain.clone(),
             slot: Some(slot),
@@ -229,11 +229,11 @@ impl NativeGraphPool {
     }
 
     pub fn acquire_output(&self) -> Result<NativeGraphOutputLease, CapacityError> {
-        let slot = self.output.borrow_mut().pop().ok_or(CapacityError {
-            resource: ResourceKind::Output,
-            required: 1,
-            available: 0,
-        })?;
+        let slot = self
+            .output
+            .borrow_mut()
+            .pop()
+            .ok_or_else(|| CapacityError::new(ResourceKind::Output, 1, 0))?;
         let Claimed { slot, claims } = slot;
         Ok(NativeGraphOutputLease {
             domain: self.domain.clone(),
@@ -301,22 +301,14 @@ impl VisionGraphPool {
         self.classes
             .iter()
             .find(|class| class.patch_rows == patch_rows)
-            .ok_or(CapacityError {
-                resource: ResourceKind::Workspace,
-                required: 1,
-                available: 0,
-            })
+            .ok_or_else(|| CapacityError::new(ResourceKind::Workspace, 1, 0))
     }
 
     fn class_mut(&mut self, patch_rows: u64) -> Result<&mut VisionGraphClass, CapacityError> {
         self.classes
             .iter_mut()
             .find(|class| class.patch_rows == patch_rows)
-            .ok_or(CapacityError {
-                resource: ResourceKind::Workspace,
-                required: 1,
-                available: 0,
-            })
+            .ok_or_else(|| CapacityError::new(ResourceKind::Workspace, 1, 0))
     }
 
     /// The charge of one activation of the class of `patch_rows`: its own
@@ -380,11 +372,11 @@ impl VisionGraphPool {
         patch_rows: u64,
     ) -> Result<NativeGraphWorkspaceLease, CapacityError> {
         let class = self.class(patch_rows)?;
-        let slot = class.workspace.borrow_mut().pop().ok_or(CapacityError {
-            resource: ResourceKind::Workspace,
-            required: 1,
-            available: 0,
-        })?;
+        let slot = class
+            .workspace
+            .borrow_mut()
+            .pop()
+            .ok_or_else(|| CapacityError::new(ResourceKind::Workspace, 1, 0))?;
         Ok(NativeGraphWorkspaceLease {
             domain: self.domain.clone(),
             slot: Some(slot),
@@ -394,11 +386,11 @@ impl VisionGraphPool {
 
     pub fn acquire_output(&self, patch_rows: u64) -> Result<NativeGraphOutputLease, CapacityError> {
         let class = self.class(patch_rows)?;
-        let slot = class.output.borrow_mut().pop().ok_or(CapacityError {
-            resource: ResourceKind::Output,
-            required: 1,
-            available: 0,
-        })?;
+        let slot = class
+            .output
+            .borrow_mut()
+            .pop()
+            .ok_or_else(|| CapacityError::new(ResourceKind::Output, 1, 0))?;
         let Claimed { slot, claims } = slot;
         Ok(NativeGraphOutputLease {
             domain: self.domain.clone(),

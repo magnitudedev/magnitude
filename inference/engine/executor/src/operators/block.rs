@@ -5,8 +5,8 @@
 //! the mixer, the feed-forward and the per-layer input in order.
 
 use super::attention::graph::{
-    AttentionGraphEntries, AttentionWeights, CheckedAttentionEntries, HistoryTilesPort,
-    IndexerControlPorts, IndexerStatePorts, attention,
+    AttentionGraphEntries, AttentionReadControls, AttentionWeights, CheckedAttentionEntries,
+    IndexerHistoryPorts, attention,
 };
 use super::attention::split::{
     AttentionBlock, AttentionSite, AttentionTopology, SelectionSite, split as attention_split,
@@ -99,15 +99,11 @@ pub(crate) struct BlockState {
 pub(crate) struct HistoryPorts {
     /// The planes in the codec's plane-descriptor order.
     pub planes: Vec<NativePort>,
-    /// A selected read's indexer planes.
-    pub indexer_planes: Option<IndexerStatePorts>,
     pub coordinates: NativePort,
-    pub visible: NativePort,
-    pub fresh: NativePort,
     pub destinations: NativePort,
-    pub history_tiles: Option<HistoryTilesPort>,
-    /// A selected read's indexer tables.
-    pub indexer: Option<IndexerControlPorts>,
+    pub read: AttentionReadControls,
+    /// A selected read's indexer planes and tables.
+    pub indexer: Option<IndexerHistoryPorts>,
     /// An index-list source's planes and tables.
     pub picked: Option<PickedPorts>,
 }
@@ -1086,18 +1082,16 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 )?;
                 let (mixed, ports, controls) =
                     attention(graph, entries, topology, numbers, &attention_weights, constants, input, hidden, &join)?;
+                let read = controls.read.ok_or("attention read controls are absent")?;
                 (
                     mixed,
                     BlockState {
                         history: Some(HistoryPorts {
                             planes: ports.planes,
-                            indexer_planes: ports.indexer,
                             coordinates: controls.coordinates,
-                            visible: controls.visible.ok_or("attention visibility is absent")?,
-                            fresh: controls.fresh.ok_or("attention fresh rows are absent")?,
                             destinations: controls.destinations,
-                            history_tiles: controls.history_tiles,
-                            indexer: controls.indexer,
+                            read,
+                            indexer: ports.indexer,
                             picked: ports.picked,
                         }),
                         bank: None,

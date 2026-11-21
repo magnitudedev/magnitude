@@ -20,29 +20,35 @@ pub struct FeedbackCosts {
     pub refinement: Duration,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ClockState {
+    Running { since: Instant, prior: Duration },
+    Suspended { elapsed: Duration },
+}
+
 pub(super) struct Ledger {
-    started: Option<Instant>,
+    clock: ClockState,
     allowance: Duration,
-    previous_elapsed: Duration,
     publication_reserve: Duration,
     pub costs: FeedbackCosts,
 }
 impl Ledger {
     pub fn new(started: Instant, allowance: Duration) -> Self {
         Self {
-            started: Some(started),
+            clock: ClockState::Running {
+                since: started,
+                prior: Duration::ZERO,
+            },
             allowance,
-            previous_elapsed: Duration::ZERO,
             publication_reserve: Duration::ZERO,
             costs: FeedbackCosts::default(),
         }
     }
     pub fn elapsed(&self) -> Duration {
-        self.previous_elapsed
-            + self
-                .started
-                .map(|start| start.elapsed())
-                .unwrap_or_default()
+        match self.clock {
+            ClockState::Running { since, prior } => prior + since.elapsed(),
+            ClockState::Suspended { elapsed } => elapsed,
+        }
     }
     pub fn remaining(&self) -> Duration {
         self.allowance
@@ -50,15 +56,18 @@ impl Ledger {
             .saturating_sub(self.publication_reserve)
     }
     pub fn deadline(&self) -> Option<Instant> {
-        self.started.map(|start| {
-            start
-                .checked_add(
-                    self.allowance
-                        .saturating_sub(self.previous_elapsed)
-                        .saturating_sub(self.publication_reserve),
-                )
-                .expect("campaign deadline exceeds monotonic clock range")
-        })
+        match self.clock {
+            ClockState::Running { since, prior } => Some(
+                since
+                    .checked_add(
+                        self.allowance
+                            .saturating_sub(prior)
+                            .saturating_sub(self.publication_reserve),
+                    )
+                    .expect("campaign deadline exceeds monotonic clock range"),
+            ),
+            ClockState::Suspended { .. } => None,
+        }
     }
     pub fn allows(&self, estimate: Option<Duration>) -> bool {
         let remaining = self.remaining();
@@ -86,19 +95,22 @@ impl Ledger {
     /// Time between explicit preparation calls is not charged. The next call
     /// starts its clock before compatibility checks, preserving prior spending.
     pub fn resume(&mut self, additional: Duration) {
+        let ClockState::Suspended { elapsed } = self.clock else {
+            panic!("only suspended preparation can resume");
+        };
         self.allowance += additional;
-        assert!(
-            self.started.is_none(),
-            "only suspended preparation can resume"
-        );
-        self.started = Some(Instant::now());
+        self.clock = ClockState::Running {
+            since: Instant::now(),
+            prior: elapsed,
+        };
     }
     pub fn suspend(&mut self) {
-        self.previous_elapsed += self
-            .started
-            .take()
-            .expect("preparation already suspended")
-            .elapsed();
+        let ClockState::Running { since, prior } = self.clock else {
+            panic!("preparation already suspended");
+        };
+        self.clock = ClockState::Suspended {
+            elapsed: prior + since.elapsed(),
+        };
     }
 }
 

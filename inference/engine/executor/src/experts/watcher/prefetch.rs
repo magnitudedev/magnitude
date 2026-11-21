@@ -71,18 +71,8 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Which party of a read's join ran its landing ([`Join`]): the read's
-/// end, on the read worker that ended it (which works its landing's pieces
-/// beside the executor's), or the claim of its records, on the request
-/// service (which leaves them to the executor).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Party {
-    Read,
-    Claim,
-}
-
 /// What lands a read once it ended and its records are claimed.
-type Lands = Box<dyn FnOnce(Outcome, &[usize], Party) + Send>;
+type Lands = Box<dyn FnOnce(Outcome, &[usize]) + Send>;
 
 /// A read's join ([`Join`]): what the claims registered while it ran, or
 /// how it ended.
@@ -114,20 +104,20 @@ impl Join {
             unreachable!("a read ends once");
         };
         for land in claims {
-            land(outcome.clone(), failed, Party::Read);
+            land(outcome.clone(), failed);
         }
     }
 
     /// Records are claimed for some of its experts: `land` lands them once
     /// its read ended, now where it has. It must not wait for a read.
-    pub(super) fn claimed(&self, land: impl FnOnce(Outcome, &[usize], Party) + Send + 'static) {
+    pub(super) fn claimed(&self, land: impl FnOnce(Outcome, &[usize]) + Send + 'static) {
         let mut parties = self.parties();
         match &mut *parties {
             Parties::Reading(claims) => claims.push(Box::new(land)),
             Parties::Ended(outcome, failed) => {
                 let (outcome, failed) = (outcome.clone(), failed.clone());
                 drop(parties);
-                land(outcome, &failed, Party::Claim);
+                land(outcome, &failed);
             }
         }
     }
@@ -176,7 +166,7 @@ pub(super) fn account(postings: &[&Posting], naming: Naming, timed: Option<(u64,
     });
     for posting in postings {
         let (shared, accounted) = (shared.clone(), accounted.clone());
-        posting.join.claimed(move |outcome, _, _| {
+        posting.join.claimed(move |outcome, _| {
             unpanicked(&outcome);
             let mut left = accounted.left.lock().expect("a request's reads' account");
             left.0 -= 1;
@@ -487,16 +477,16 @@ impl IdleBudget {
             return rem;
         }
         let c_layer = if self.layers == 0 { 0.0 } else { price.compute() / self.layers as f64 };
-        let queued: f64 = self.queued_bytes.iter().map(|&bytes| price.read_seconds(bytes)).sum();
+        let queued: f64 = self.queued_bytes.iter().map(|&bytes| price.transfer_seconds(bytes)).sum();
         let rem = (c_layer - queued).max(0.0);
         self.remaining.set(Some(rem));
         rem
     }
 
-    fn consume(&self, price: &super::telemetry::ReadPrice, read_seconds: f64) {
+    fn consume(&self, price: &super::telemetry::ReadPrice, transfer_seconds: f64) {
         let rem = self.get(price);
         if rem > 0.0 {
-            self.remaining.set(Some((rem - read_seconds).max(0.0)));
+            self.remaining.set(Some((rem - transfer_seconds).max(0.0)));
         }
     }
 }
@@ -515,7 +505,7 @@ impl Admit for Admitting<'_> {
         let price = self.priced.get();
         let admitted = price.admits_with_idle(p, self.bytes, self.idle.get(price));
         if admitted {
-            self.idle.consume(price, price.read_seconds(self.bytes));
+            self.idle.consume(price, price.transfer_seconds(self.bytes));
         }
         admitted
     }
@@ -557,10 +547,8 @@ impl Prefetch {
     /// under the step's ownership, then answered) or else on the host
     /// (submitted to the executor, which converts and maps its record,
     /// records its end, then answers; one of the request's host `landings`,
-    /// whose line it measures), or fails it. Where the read's end ran the
-    /// host's landing (`party`), its read worker works its pieces beside the
-    /// executor's, so no wake stands between the read and its landing. A
-    /// request's reads are accounted apart, once ([`account`]).
+    /// whose line it measures), or fails it. A request's reads are
+    /// accounted apart, once ([`account`]).
     pub(super) fn demand(&mut self, core: &Core, named: Named, naming: Naming, at: Point, landings: &Arc<Landings>, shared: &Arc<Shared>) {
         let Named { expert, posting: Posting { ticket, join }, staged, grant, rows, answer } = named;
         let (ended, urgency, tier) = (Ended::new(shared.events()), Urgency::waited(), grant.record());
@@ -572,7 +560,7 @@ impl Prefetch {
         match &device {
             Some(device) => {
                 let device = device.clone();
-                join.claimed(move |outcome, failed, _| {
+                join.claimed(move |outcome, failed| {
                     if !read_named(&serving, naming, (&rows, &answer), &outcome, failed, &end) {
                         return;
                     }
@@ -590,7 +578,7 @@ impl Prefetch {
             None => {
                 let landing = core.landing(grant, staged);
                 let (landings, urgent) = (landings.clone(), urgency.clone());
-                join.claimed(move |outcome, failed, party| {
+                join.claimed(move |outcome, failed| {
                     if !read_named(&serving, naming, (&rows, &answer), &outcome, failed, &end) {
                         return;
                     }
@@ -606,10 +594,7 @@ impl Prefetch {
                             landings.ended(&completed);
                         })
                     };
-                    match party {
-                        Party::Read => serving.compute.run(Arc::new(converting)),
-                        Party::Claim => serving.compute.submit(Arc::new(converting)),
-                    }
+                    serving.compute.submit(Arc::new(converting));
                 });
             }
         }
@@ -703,9 +688,10 @@ impl Prefetch {
         for layer in 0..core.layers.len() {
             let (routed, file) = (self.ledger.routed(layer), &core.layers[layer].file);
             let passed = self.ledger.pass(layer, Instant::now(), |interest| {
-                served.is_some_and(|(sequence, at)| (interest.step, layer) <= (sequence, at))
-                    || steps.ended(interest.step)
-                    || (routed >= interest.step && !file.requested(interest.step, 0))
+                let step = interest.step();
+                served.is_some_and(|(sequence, at)| (step, layer) <= (sequence, at))
+                    || steps.ended(step)
+                    || (routed >= step && !file.requested(step, 0))
             });
             changed.extend(passed.into_iter().map(|expert| (layer, expert)));
         }
@@ -1196,7 +1182,7 @@ impl Prefetch {
                     match self.read_ahead(core, shared, staged, wanted(class), ahead, expected, reserve) {
                         Ok(bytes) => {
                             self.ledger.issued(layer, expert, &interest, bytes, Instant::now());
-                            shared.telemetry.read_ahead(interest.source, interest.step, staged, interest.from.point.layer, bytes);
+                            shared.telemetry.read_ahead(interest.source, interest.step(), staged, interest.from.point.layer, bytes);
                             read = true;
                             if seismic_io::timeline::recording() {
                                 Fate::Read.note(interest.from.point.sequence, layer, interest.source, (expert, interest.rank), self.staging.free());
@@ -1318,7 +1304,7 @@ impl Prefetch {
                 // A read ahead's end: read, its landing is submitted, whose
                 // end maps its tier record; failed, it fails nothing (a step
                 // waiting for it reads its expert anew).
-                join.claimed(move |outcome, failed, _| {
+                join.claimed(move |outcome, failed| {
                     unpanicked(&outcome);
                     let read = failed.is_empty() && matches!(outcome, Outcome::Read);
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead_read"), 0, (target as i64, expert as i64, read as i64));
@@ -1419,14 +1405,15 @@ mod tests {
     #[test]
     fn shared_drive_idle_budget_counts_demand_and_cross_layer_reads() {
         let layers = 35;
-        let bytes = 1_000_000_u64; // 1 MB -> 1.0 ms on 1 GB/s line
-        let line = ReadLine::new(0., 1e-9).expect("a line");
+        let bytes = 1_000_000_u64; // 1 MB -> t_bw = 1.0 ms on 1 GB/s line (plus 0.3 ms latency, ignored by pipelined IdleBudget)
+        let line = ReadLine::new(0.3e-3, 1e-9).expect("a line");
         let mut passes = Passes::new(Time::new(&[vec![1]], 8));
         // compute = 0.1 - 0.065 = 0.035 s -> c_layer = 0.035 / 35 = 0.001 s (1.0 ms).
-        // Drive-bound (0.068 > 0.035), stall = 0.065 / 68 ≈ 0.956 ms <= read = 1.0 ms ->
-        // break_even(1.0 ms, 0.0) = 1.0 (only a certain read pays with no idle window).
+        // Drive-bound (0.068 > 0.035), stall = 0.065 / 68 ≈ 0.956 ms <= t_bw = 1.0 ms ->
+        // break_even(1.0 ms, 0.0) = (1.0 / 0.956).min(1.0) = 1.0 (only a certain read pays with no idle window).
         passes.timed(Pass { rows: 1, depth: 0, seconds: 0.1, parked: 0.065, misses: 68., drive: 0.068, ..Pass::default() });
-        let price = ReadPrice::priced(passes.miss_cost(), line);
+        let price = ReadPrice::priced(passes.read_admission(Some(line)));
+        assert!((price.transfer_seconds(bytes) - 1e-3).abs() < 1e-12, "IdleBudget uses pipelined t_bw, not lambda + t_bw");
         assert!(!price.admits_with_idle(0.30, bytes, 0.0) && !price.admits_with_idle(0.52, bytes, 0.0) && price.admits_with_idle(1.0, bytes, 0.0));
 
         let time = Time::new(&[vec![2, 2]], 32);
@@ -1436,11 +1423,11 @@ mod tests {
         let seen = HashSet::from([(1, 0)]);
 
         // Empty drive: `idle == c_layer == 1.0 ms`, so one 30% hint is admitted
-        // and consumes the shared budget, leaving 0.0 for the next candidate.
+        // and consumes the shared budget (`t_bw = 1.0 ms`), leaving 0.0 for the next candidate.
         let idle = IdleBudget::new(layers, prefetch.drive_queued_bytes(|_| bytes, &seen));
         assert!((idle.get(&price) - 1e-3).abs() < 1e-12);
         assert!(price.admits_with_idle(0.30, bytes, idle.get(&price)));
-        idle.consume(&price, price.read_seconds(bytes));
+        idle.consume(&price, price.transfer_seconds(bytes));
         assert_eq!(idle.get(&price), 0.0);
         assert!(!price.admits_with_idle(0.30, bytes, idle.get(&price)));
 

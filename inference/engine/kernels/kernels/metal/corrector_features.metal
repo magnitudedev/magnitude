@@ -24,19 +24,29 @@ kernel void corrector_features(
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float partials[FEATURES_THREADS / 32u];
+    threadgroup reduce::OnlineSoftmax partials[FEATURES_THREADS / 32u];
     const element::Out<activation_element> result(result_cells);
     const ulong vocabulary = SEISMIC_DIM_V, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
     device const float *line = logits + ulong(row) * SEISMIC_LOGITS_STRIDE_0;
-    float local = -INFINITY;
-    for (ulong i = thread_index; i < vocabulary; i += FEATURES_THREADS)
-        local = metal::max(local, line[i * SEISMIC_LOGITS_STRIDE_1]);
-    const float maximum = reduce::group_max<FEATURES_THREADS / 32u>(local, partials, sg, lane);
-    float partial = 0.0f;
-    for (ulong i = thread_index; i < vocabulary; i += FEATURES_THREADS)
-        partial += metal::exp(line[i * SEISMIC_LOGITS_STRIDE_1] - maximum);
-    const float normalizer =
-        maximum + metal::log(reduce::group_sum<FEATURES_THREADS / 32u>(partial, partials, sg, lane));
+    reduce::OnlineSoftmax state = reduce::OnlineSoftmax::empty();
+    if (SEISMIC_LOGITS_STRIDE_1 == 1ul) {
+        const ulong vocabulary4 = vocabulary & ~3ul;
+        for (ulong i = ulong(thread_index) * 4ul; i < vocabulary4; i += ulong(FEATURES_THREADS) * 4ul) {
+            const float4 v = float4(*reinterpret_cast<device const packed_float4 *>(line + i));
+            state.add(v.x);
+            state.add(v.y);
+            state.add(v.z);
+            state.add(v.w);
+        }
+        for (ulong i = vocabulary4 + thread_index; i < vocabulary; i += FEATURES_THREADS)
+            state.add(line[i]);
+    } else {
+        for (ulong i = thread_index; i < vocabulary; i += FEATURES_THREADS)
+            state.add(line[i * SEISMIC_LOGITS_STRIDE_1]);
+    }
+    const reduce::OnlineSoftmax softmax =
+        reduce::group_online_softmax<FEATURES_THREADS / 32u>(state, partials, sg, lane);
+    const float normalizer = softmax.max + metal::log(softmax.sum);
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     device const float *candidates = unary + ulong(row) * SEISMIC_UNARY_STRIDE_0;
     const float first = candidates[0];

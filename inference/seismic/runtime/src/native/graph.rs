@@ -355,10 +355,10 @@ fn add_store(
 
 /// Every stored result is the exact tensor its port describes, and none is
 /// exported: the run's binding of the port is where it lives.
-fn validate_stores(
+fn validate_stores<R: AsRef<[Option<NativeTensorSpec>]>>(
     stores: &[Store],
     ports: &[PortSpec],
-    results: &[Vec<Option<NativeTensorSpec>>],
+    results: &[R],
     exports: &[WorkflowResultRef],
 ) -> Result<(), WorkflowError> {
     for store in stores {
@@ -1130,6 +1130,50 @@ impl NativeGraphDraft {
     }
 }
 
+/// Per-node metadata recorded in [`NativeGraphMetadataDraft`].
+struct MetadataNode {
+    planned: PlannedNode,
+    /// The name of this node's checked entry, which a mismatch names.
+    entry: &'static str,
+    /// The lengths of this node's sealed form's vectors.
+    shape: SealedNodeShape,
+    results: Vec<Option<NativeTensorSpec>>,
+    /// The active-launch bitmask at this node's enqueued dimensions
+    /// ([`recorded_census`]).
+    active_launches: u64,
+}
+
+impl MetadataNode {
+    fn plan_heap_node(&self) -> PlanHeapNode {
+        PlanHeapNode {
+            buffers: self.shape.buffers,
+            arguments: self.shape.arguments,
+            words: self.shape.words,
+            launches: self.shape.launches,
+            conditions: self.shape.conditions
+                + if self.planned.condition.is_some() { self.shape.launches } else { 0 },
+        }
+    }
+}
+
+impl AsRef<PlannedNode> for MetadataNode {
+    fn as_ref(&self) -> &PlannedNode {
+        &self.planned
+    }
+}
+
+impl AsMut<PlannedNode> for MetadataNode {
+    fn as_mut(&mut self) -> &mut PlannedNode {
+        &mut self.planned
+    }
+}
+
+impl AsRef<[Option<NativeTensorSpec>]> for MetadataNode {
+    fn as_ref(&self) -> &[Option<NativeTensorSpec>] {
+        &self.results
+    }
+}
+
 /// Storage-only graph construction from checked entry metadata. It uses the
 /// same port identities and interval allocator as a prepared native graph,
 /// but owns no device, formed kernel, or executable node.
@@ -1138,12 +1182,7 @@ pub struct NativeGraphMetadataDraft {
     backend: BackendName,
     identity: u64,
     ports: Vec<PortSpec>,
-    nodes: Vec<PlannedNode>,
-    /// Per node, the name of its checked entry, which a mismatch names.
-    entries: Vec<&'static str>,
-    /// Per node, the lengths of its sealed form's vectors.
-    shapes: Vec<SealedNodeShape>,
-    results: Vec<Vec<Option<NativeTensorSpec>>>,
+    nodes: Vec<MetadataNode>,
     exports: Vec<WorkflowResultRef>,
     stores: Vec<Store>,
     /// Operands carried out to and in from other graphs
@@ -1151,9 +1190,6 @@ pub struct NativeGraphMetadataDraft {
     carries: Vec<Carry>,
     timelines: Vec<(usize, TimelineNode)>,
     marks: Vec<usize>,
-    /// Per node, the active-launch bitmask at its enqueued dimensions
-    /// ([`recorded_census`]).
-    active_launches: Vec<u64>,
 }
 
 /// A Seismic placement for a dominating graph class. Exact graphs with the
@@ -1226,12 +1262,12 @@ impl NativeGraphLayout {
     /// unless its topology (its edges and carries among them, so each
     /// carried buffer lies on the same port) is the layout's and every
     /// buffer fits its capacity.
-    fn storage_for(
+    fn storage_for<N: AsRef<PlannedNode>, R: AsRef<[Option<NativeTensorSpec>]>>(
         &self,
         ports: &[PortSpec],
-        nodes: &[PlannedNode],
+        nodes: &[N],
         links: &OperandLinks,
-        results: &[Vec<Option<NativeTensorSpec>>],
+        results: &[R],
         exports: &[WorkflowResultRef],
         stores: &[Store],
     ) -> Result<StoragePlan, WorkflowError> {
@@ -1260,6 +1296,7 @@ impl NativeGraphLayout {
             }
         }
         for (launch, (row, capacities)) in results.iter().zip(&self.result_capacity).enumerate() {
+            let row = row.as_ref();
             if row.len() != capacities.len() {
                 return Err(topology());
             }
@@ -1279,6 +1316,7 @@ impl NativeGraphLayout {
             }
         }
         for (launch, (node, capacities)) in nodes.iter().zip(&self.scratch_capacity).enumerate() {
+            let node = node.as_ref();
             if node.scratch.len() != capacities.len() {
                 return Err(topology());
             }
@@ -1311,11 +1349,11 @@ struct StorageSignature {
     carried: Vec<(usize, usize, u32)>,
 }
 
-fn storage_signature(
+fn storage_signature<N: AsRef<PlannedNode>, R: AsRef<[Option<NativeTensorSpec>]>>(
     ports: &[PortSpec],
-    nodes: &[PlannedNode],
+    nodes: &[N],
     links: &OperandLinks,
-    results: &[Vec<Option<NativeTensorSpec>>],
+    results: &[R],
     exports: &[WorkflowResultRef],
     stores: &[Store],
 ) -> StorageSignature {
@@ -1334,7 +1372,8 @@ fn storage_signature(
         results: results
             .iter()
             .map(|row| {
-                row.iter()
+                row.as_ref()
+                    .iter()
                     .map(|result| result.as_ref().map(|result| result.representation))
                     .collect()
             })
@@ -1342,7 +1381,8 @@ fn storage_signature(
         edges: nodes
             .iter()
             .map(|node| {
-                node.args
+                node.as_ref()
+                    .args
                     .arguments()
                     .iter()
                     .map(|argument| {
@@ -1362,7 +1402,10 @@ fn storage_signature(
             .collect(),
         conditions: nodes
             .iter()
-            .map(|node| (node.condition, node.share.map(|(ordinal, primary)| (ordinal, primary.node, primary.result))))
+            .map(|node| {
+                let node = node.as_ref();
+                (node.condition, node.share.map(|(ordinal, primary)| (ordinal, primary.node, primary.result)))
+            })
             .collect(),
         carried: links.carried.iter().map(|carried| (carried.node, carried.scratch, carried.port)).collect(),
     }
@@ -1695,15 +1738,11 @@ impl NativeGraphMetadataDraft {
             identity: NEXT_NATIVE_GRAPH.fetch_add(1, Ordering::Relaxed),
             ports: Vec::new(),
             nodes: Vec::new(),
-            entries: Vec::new(),
-            shapes: Vec::new(),
-            results: Vec::new(),
             exports: Vec::new(),
             stores: Vec::new(),
             carries: Vec::new(),
             timelines: Vec::new(),
             marks: Vec::new(),
-            active_launches: Vec::new(),
         }
     }
 
@@ -1733,23 +1772,13 @@ impl NativeGraphMetadataDraft {
                 port.extents.len()
             })
             .collect();
-        let nodes: Vec<PlanHeapNode> = self
-            .shapes
-            .iter()
-            .zip(&self.nodes)
-            .map(|(shape, node)| PlanHeapNode {
-                buffers: shape.buffers,
-                arguments: shape.arguments,
-                words: shape.words,
-                launches: shape.launches,
-                conditions: shape.conditions + if node.condition.is_some() { shape.launches } else { 0 },
-            })
-            .collect();
+        let nodes: Vec<PlanHeapNode> = self.nodes.iter().map(MetadataNode::plan_heap_node).collect();
         let result_rows: Vec<Vec<Option<usize>>> = self
-            .results
+            .nodes
             .iter()
-            .map(|row| {
-                row.iter()
+            .map(|node| {
+                node.results
+                    .iter()
                     .map(|spec| {
                         spec.as_ref().map(|s| {
                             debug_assert_eq!(s.extents.len(), s.strides.len());
@@ -1766,23 +1795,12 @@ impl NativeGraphMetadataDraft {
     /// The host heap of one shared [`SealedTopology`] allocation for this
     /// topology (`NativeGraphPlan::topology_heap`).
     pub fn topology_heap(&self) -> HostHeap {
-        let nodes: Vec<PlanHeapNode> = self
-            .shapes
-            .iter()
-            .zip(&self.nodes)
-            .map(|(shape, node)| PlanHeapNode {
-                buffers: shape.buffers,
-                arguments: shape.arguments,
-                words: shape.words,
-                launches: shape.launches,
-                conditions: shape.conditions + if node.condition.is_some() { shape.launches } else { 0 },
-            })
-            .collect();
-        let total_results: usize = self.results.iter().map(Vec::len).sum();
+        let nodes: Vec<PlanHeapNode> = self.nodes.iter().map(MetadataNode::plan_heap_node).collect();
+        let total_results: usize = self.nodes.iter().map(|node| node.results.len()).sum();
         topology_heap_of(
             self.ports.len(),
             &nodes,
-            self.results.len(),
+            self.nodes.len(),
             total_results,
             self.exports.len(),
             self.timelines.len(),
@@ -1832,7 +1850,7 @@ impl NativeGraphMetadataDraft {
         let node = u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
         validate_node_references(self.identity, self.ports.len(), node, &args)
             .map_err(CallError::Workflow)?;
-        validate_metadata_arguments(entry, &args, &parameter_shapes, &self.ports, &self.results, None)?;
+        validate_metadata_arguments(entry, &args, &parameter_shapes, &self.ports, &self.nodes, None)?;
         validate_park(&self.timelines, self.nodes.len(), shape.parks).map_err(CallError::Workflow)?;
         let results = result_shapes
             .into_iter()
@@ -1852,11 +1870,19 @@ impl NativeGraphMetadataDraft {
             .collect::<Result<Vec<_>, CallError>>()?;
         let count = u32::try_from(results.len()).expect("native result ordinal exhausted");
         let default_mask = if shape.launches >= 64 { u64::MAX } else { (1u64 << shape.launches) - 1 };
-        self.active_launches.push(active_launches.unwrap_or(default_mask));
-        self.nodes.push(PlannedNode { args: Arc::new(args), scratch, activation, condition: None, share: None });
-        self.entries.push(entry);
-        self.shapes.push(shape);
-        self.results.push(results);
+        self.nodes.push(MetadataNode {
+            planned: PlannedNode {
+                args: Arc::new(args),
+                scratch,
+                activation,
+                condition: None,
+                share: None,
+            },
+            entry,
+            shape,
+            results,
+            active_launches: active_launches.unwrap_or(default_mask),
+        });
         Ok(PendingWorkflowResults::new(self.identity, node, count))
     }
 
@@ -1882,7 +1908,8 @@ impl NativeGraphMetadataDraft {
     ) -> Result<PendingWorkflowResults, CallError> {
         let port = condition_port(self.identity, &self.ports, self.nodes.len(), condition).map_err(CallError::Workflow)?;
         let pending = self.enqueue(entry, args, parameter_shapes, result_shapes, scratch, activation, shape, active_launches)?;
-        self.nodes.last_mut().expect("the node just enqueued").condition = Some((port, condition.index, condition.encoded));
+        self.nodes.last_mut().expect("the node just enqueued").planned.condition =
+            Some((port, condition.index, condition.encoded));
         Ok(pending)
     }
 
@@ -1891,9 +1918,9 @@ impl NativeGraphMetadataDraft {
         let node = (other.workflow == self.identity && primary.workflow == self.identity)
             .then(|| self.nodes.get_mut(other.node as usize))
             .flatten()
-            .filter(|node| node.share.is_none())
+            .filter(|node| node.planned.share.is_none())
             .ok_or(WorkflowError::SharedResult { node: other.node as usize })?;
-        node.share = Some((other.result, primary));
+        node.planned.share = Some((other.result, primary));
         Ok(())
     }
 
@@ -1936,7 +1963,7 @@ impl NativeGraphMetadataDraft {
             &self.ports,
             &self.nodes,
             &links,
-            &self.results,
+            &self.nodes,
             &self.exports,
             &self.stores,
         );
@@ -1951,21 +1978,27 @@ impl NativeGraphMetadataDraft {
 
     /// What recording one run of this graph takes when each node makes the
     /// launches in `masks` ([`recorded_census`]).
-    fn recorded_for(&self, masks: &[u64]) -> GraphCensus {
-        debug_assert_eq!(masks.len(), self.shapes.len());
+    fn recorded_with(&self, masks: impl Iterator<Item = u64>) -> GraphCensus {
         let launches = self
-            .shapes
+            .nodes
             .iter()
             .zip(masks)
-            .map(|(shape, &mask)| shape.launch_census(self.backend, u64::from(mask.count_ones())))
+            .map(|(node, mask)| node.shape.launch_census(self.backend, u64::from(mask.count_ones())))
             .try_fold(GraphCensus::default(), GraphCensus::plus)
             .expect("a graph's launch census fits u64");
         recorded_census(self.backend, self.nodes.len(), launches, &self.timelines, &self.marks)
     }
 
+    /// What recording one run of this graph takes when each node makes the
+    /// launches in `masks` ([`recorded_census`]).
+    fn recorded_for(&self, masks: &[u64]) -> GraphCensus {
+        debug_assert_eq!(masks.len(), self.nodes.len());
+        self.recorded_with(masks.iter().copied())
+    }
+
     /// What recording one run of this graph takes ([`recorded_census`]).
     fn recorded(&self) -> GraphCensus {
-        self.recorded_for(&self.active_launches)
+        self.recorded_with(self.nodes.iter().map(|node| node.active_launches))
     }
 
     /// Verify an exact checked metadata graph against the storage certificate
@@ -1980,7 +2013,7 @@ impl NativeGraphMetadataDraft {
             &self.ports,
             &self.nodes,
             &links,
-            &self.results,
+            &self.nodes,
             &self.exports,
             &self.stores,
         )?;
@@ -2015,19 +2048,21 @@ impl NativeGraphMetadataDraft {
         }
         validate_used_ports(
             self.ports.len(),
-            self.nodes.iter().map(|node| (&*node.args, node.condition.map(|(port, _, _)| port))),
+            self.nodes
+                .iter()
+                .map(|node| (&*node.planned.args, node.planned.condition.map(|(port, _, _)| port))),
             &self.exports,
             &self.stores,
             &self.carries,
         )?;
         validate_park(&self.timelines, self.nodes.len(), false)?;
         for reference in &self.exports {
-            if reference.node != INPUT_NODE && result_spec(&self.results, *reference).is_none() {
+            if reference.node != INPUT_NODE && result_spec(&self.nodes, *reference).is_none() {
                 return Err(WorkflowError::MissingProducerResult);
             }
         }
-        validate_stores(&self.stores, &self.ports, &self.results, &self.exports)?;
-        validate_shares(&self.nodes, &self.results, &self.exports, &self.stores)?;
+        validate_stores(&self.stores, &self.ports, &self.nodes, &self.exports)?;
+        validate_shares(&self.nodes, &self.nodes, &self.exports, &self.stores)?;
         operand_links(&self.nodes, &self.carries)
     }
 }
@@ -2064,7 +2099,10 @@ impl ValidatedMetadataDraft {
         results: &[Vec<Option<(RepresentationId, Vec<u64>)>>],
     ) -> Result<(), CallError> {
         let topology = || CallError::Workflow(WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Topology));
-        if ports.len() != self.draft.ports.len() || parameters.len() != self.draft.nodes.len() || results.len() != self.draft.results.len() {
+        if ports.len() != self.draft.ports.len()
+            || parameters.len() != self.draft.nodes.len()
+            || results.len() != self.draft.nodes.len()
+        {
             return Err(topology());
         }
         let ports = self
@@ -2084,14 +2122,15 @@ impl ValidatedMetadataDraft {
             .collect::<Result<Vec<_>, CallError>>()?;
         let results = self
             .draft
-            .results
+            .nodes
             .iter()
             .zip(results)
-            .map(|(row, shapes)| {
-                if row.len() != shapes.len() {
+            .map(|(node, shapes)| {
+                if node.results.len() != shapes.len() {
                     return Err(topology());
                 }
-                row.iter()
+                node.results
+                    .iter()
                     .zip(shapes)
                     .map(|(recorded, shape)| match (recorded, shape) {
                         (Some(recorded), Some((representation, extents))) if recorded.representation == *representation => {
@@ -2109,8 +2148,8 @@ impl ValidatedMetadataDraft {
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        for ((node, entry), parameters) in self.draft.nodes.iter().zip(&self.draft.entries).zip(parameters) {
-            validate_metadata_arguments(entry, &node.args, parameters, &ports, &results, Some(facts))?;
+        for (node, parameters) in self.draft.nodes.iter().zip(parameters) {
+            validate_metadata_arguments(node.entry, &node.planned.args, parameters, &ports, &results, Some(facts))?;
         }
         validate_stores(&self.draft.stores, &ports, &results, &self.draft.exports).map_err(CallError::Workflow)?;
         validate_shares(&self.draft.nodes, &results, &self.draft.exports, &self.draft.stores).map_err(CallError::Workflow)
@@ -2134,36 +2173,47 @@ impl ValidatedMetadataDraft {
             &validated.draft.ports,
             &validated.draft.nodes,
             &validated.links,
-            &validated.draft.results,
+            &validated.draft.nodes,
             &validated.draft.exports,
             &validated.draft.stores,
         );
         let mut ports: Vec<u64> = validated.draft.ports.iter().map(|p| p.byte_len).collect();
         let mut results: Vec<Vec<u64>> = validated
             .draft
-            .results
+            .nodes
             .iter()
-            .map(|row| row.iter().map(|r| r.as_ref().map_or(0, |s| s.byte_len)).collect())
+            .map(|node| node.results.iter().map(|r| r.as_ref().map_or(0, |s| s.byte_len)).collect())
             .collect();
         let mut scratch: Vec<Vec<ScratchNeed>> = validated
             .draft
             .nodes
             .iter()
-            .map(|node| node.scratch.clone())
+            .map(|node| node.planned.scratch.clone())
             .collect();
-        let mut active_launches = validated.draft.active_launches.clone();
+        let mut active_launches: Vec<u64> = validated
+            .draft
+            .nodes
+            .iter()
+            .map(|node| node.active_launches)
+            .collect();
 
         for draft in iter {
             let links = draft.validate_topology()?;
+            let same_entries = draft.nodes.len() == validated.draft.nodes.len()
+                && draft
+                    .nodes
+                    .iter()
+                    .zip(&validated.draft.nodes)
+                    .all(|(a, b)| a.entry == b.entry);
             if draft.backend != validated.draft.backend
-                || draft.entries != validated.draft.entries
+                || !same_entries
                 || draft.timelines != validated.draft.timelines
                 || draft.marks != validated.draft.marks
                 || storage_signature(
                     &draft.ports,
                     &draft.nodes,
                     &links,
-                    &draft.results,
+                    &draft.nodes,
                     &draft.exports,
                     &draft.stores,
                 ) != base_sig
@@ -2173,29 +2223,26 @@ impl ValidatedMetadataDraft {
             for (cap, port) in ports.iter_mut().zip(&draft.ports) {
                 *cap = (*cap).max(port.byte_len);
             }
-            for (row_cap, row) in results.iter_mut().zip(&draft.results) {
-                for (cap, result) in row_cap.iter_mut().zip(row) {
+            for (row_cap, node) in results.iter_mut().zip(&draft.nodes) {
+                for (cap, result) in row_cap.iter_mut().zip(&node.results) {
                     if let Some(spec) = result {
                         *cap = (*cap).max(spec.byte_len);
                     }
                 }
             }
             for (node_cap, node) in scratch.iter_mut().zip(&draft.nodes) {
-                if node_cap.len() != node.scratch.len() {
+                if node_cap.len() != node.planned.scratch.len() {
                     return Err(topology());
                 }
-                for (cap, need) in node_cap.iter_mut().zip(&node.scratch) {
+                for (cap, need) in node_cap.iter_mut().zip(&node.planned.scratch) {
                     if cap.sync != need.sync || cap.operand != need.operand {
                         return Err(topology());
                     }
                     cap.bytes = cap.bytes.max(need.bytes);
                 }
             }
-            if active_launches.len() != draft.active_launches.len() {
-                return Err(topology());
-            }
-            for (cap, &active) in active_launches.iter_mut().zip(&draft.active_launches) {
-                *cap |= active;
+            for (cap, node) in active_launches.iter_mut().zip(&draft.nodes) {
+                *cap |= node.active_launches;
             }
         }
         validated.capacity_layout(&ports, &results, scratch, Some(&active_launches))
@@ -2286,16 +2333,16 @@ impl ValidatedMetadataDraft {
         scratch: Vec<Vec<ScratchNeed>>,
     ) -> Result<(Vec<PortSpec>, Vec<PlannedNode>, Vec<Vec<Option<NativeTensorSpec>>>), WorkflowError> {
         let shaped = ports.len() == self.draft.ports.len()
-            && results.len() == self.draft.results.len()
+            && results.len() == self.draft.nodes.len()
             && results
                 .iter()
-                .zip(&self.draft.results)
-                .all(|(capacities, row)| capacities.len() == row.len())
+                .zip(&self.draft.nodes)
+                .all(|(capacities, node)| capacities.len() == node.results.len())
             && scratch.len() == self.draft.nodes.len()
             && scratch
                 .iter()
                 .zip(&self.draft.nodes)
-                .all(|(capacities, node)| capacities.len() == node.scratch.len());
+                .all(|(capacities, node)| capacities.len() == node.planned.scratch.len());
         if !shaped {
             return Err(WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Topology));
         }
@@ -2311,11 +2358,12 @@ impl ValidatedMetadataDraft {
             .collect::<Vec<_>>();
         let results = self
             .draft
-            .results
+            .nodes
             .iter()
             .zip(results)
-            .map(|(row, capacities)| {
-                row.iter()
+            .map(|(node, capacities)| {
+                node.results
+                    .iter()
                     .zip(capacities)
                     .map(|(result, &byte_len)| {
                         result.as_ref().map(|result| NativeTensorSpec {
@@ -2332,11 +2380,11 @@ impl ValidatedMetadataDraft {
             .iter()
             .zip(scratch)
             .map(|(node, scratch)| PlannedNode {
-                args: Arc::clone(&node.args),
+                args: Arc::clone(&node.planned.args),
                 scratch,
-                activation: node.activation,
-                condition: node.condition,
-                share: node.share,
+                activation: node.planned.activation,
+                condition: node.planned.condition,
+                share: node.planned.share,
             })
             .collect::<Vec<_>>();
         charge_node_emissions(&mut nodes, &self.links);
@@ -2382,12 +2430,12 @@ fn make_layout(
 /// Check each argument of a node against its parameter's shape: at the
 /// recording, or, with `facts`, each view's operations at a graph trace's
 /// facts (`NativeGraphMetadataDraft::validate_at`).
-fn validate_metadata_arguments(
+fn validate_metadata_arguments<R: AsRef<[Option<NativeTensorSpec>]>>(
     entry: &'static str,
     args: &EncodedWorkflowArgs,
     parameter_shapes: &[Option<(RepresentationId, Vec<u64>)>],
     ports: &[PortSpec],
-    results: &[Vec<Option<NativeTensorSpec>>],
+    results: &[R],
     facts: Option<&[u64]>,
 ) -> Result<(), CallError> {
     let mismatch = |parameter: usize, expected: String, bound: String| {
@@ -2428,12 +2476,12 @@ fn validate_metadata_arguments(
     Ok(())
 }
 
-fn metadata_argument_shape(
+fn metadata_argument_shape<R: AsRef<[Option<NativeTensorSpec>]>>(
     entry: &'static str,
     argument: &WorkflowTensorArgument,
     ordinal: usize,
     ports: &[PortSpec],
-    results: &[Vec<Option<NativeTensorSpec>>],
+    results: &[R],
     facts: Option<&[u64]>,
 ) -> Result<(RepresentationId, Vec<u64>), CallError> {
     let (reference, operations) = match argument {
@@ -2607,12 +2655,13 @@ pub fn argument_reference(argument: &EncodedWorkflowArgument) -> Option<Workflow
     }
 }
 
-fn result_spec(
-    results: &[Vec<Option<NativeTensorSpec>>],
+fn result_spec<R: AsRef<[Option<NativeTensorSpec>]>>(
+    results: &[R],
     reference: WorkflowResultRef,
 ) -> Option<&NativeTensorSpec> {
     results
         .get(reference.node as usize)?
+        .as_ref()
         .get(reference.result as usize)?
         .as_ref()
 }
@@ -2746,6 +2795,18 @@ struct PlannedNode {
     /// Its result that shares an earlier or later node's result storage
     /// (`NativeGraphDraft::share`): its ordinal and that result.
     share: Option<(u32, WorkflowResultRef)>,
+}
+
+impl AsRef<PlannedNode> for PlannedNode {
+    fn as_ref(&self) -> &PlannedNode {
+        self
+    }
+}
+
+impl AsMut<PlannedNode> for PlannedNode {
+    fn as_mut(&mut self) -> &mut PlannedNode {
+        self
+    }
 }
 
 /// Plain descriptor of one graph node for [`resolve_operand_links`].
@@ -3016,13 +3077,16 @@ pub fn resolve_operand_links(
 
 /// The operand links of `nodes` and `carries`: delegates to
 /// [`resolve_operand_links`], ignoring any carry forms `F`.
-fn operand_links<F>(nodes: &[PlannedNode], carries: &[Carry<F>]) -> Result<OperandLinks, WorkflowError> {
+fn operand_links<F, N: AsRef<PlannedNode>>(nodes: &[N], carries: &[Carry<F>]) -> Result<OperandLinks, WorkflowError> {
     let node_specs = nodes
         .iter()
-        .map(|node| OperandNode {
-            args: &node.args,
-            scratch: &node.scratch,
-            activation: node.activation,
+        .map(|node| {
+            let node = node.as_ref();
+            OperandNode {
+                args: &node.args,
+                scratch: &node.scratch,
+                activation: node.activation,
+            }
         })
         .collect::<Vec<_>>();
     let carry_specs = carries
@@ -3042,9 +3106,9 @@ fn operand_links<F>(nodes: &[PlannedNode], carries: &[Carry<F>]) -> Result<Opera
 /// unpaired and uncarried producers reserve what a call alone does
 /// (`charge_emissions`). Every class of a topology is charged alike, so a
 /// layout's capacities bound its classes'.
-fn charge_node_emissions(nodes: &mut [PlannedNode], links: &OperandLinks) {
+fn charge_node_emissions<N: AsMut<PlannedNode>>(nodes: &mut [N], links: &OperandLinks) {
     for (node, planned) in nodes.iter_mut().enumerate() {
-        links.charge_node_emissions(node, &mut planned.scratch);
+        links.charge_node_emissions(node, &mut planned.as_mut().scratch);
     }
 }
 
@@ -3115,18 +3179,19 @@ fn exclusive(a: Option<Condition>, b: Option<Condition>) -> bool {
 /// reads, exports or stores it (its readers read the result it shares), the
 /// node does not read the result it shares (the two take the same bytes), and
 /// the result it shares is neither stored nor itself shared.
-fn validate_shares(
-    nodes: &[PlannedNode],
-    results: &[Vec<Option<NativeTensorSpec>>],
+fn validate_shares<N: AsRef<PlannedNode>, R: AsRef<[Option<NativeTensorSpec>]>>(
+    nodes: &[N],
+    results: &[R],
     exports: &[WorkflowResultRef],
     stores: &[Store],
 ) -> Result<(), WorkflowError> {
     for (node, planned) in nodes.iter().enumerate() {
+        let planned = planned.as_ref();
         let Some((ordinal, primary)) = planned.share else { continue };
         let other = WorkflowResultRef { workflow: primary.workflow, node: node as u32, result: ordinal };
         let spec = |reference: WorkflowResultRef| {
             (reference.node != INPUT_NODE)
-                .then(|| results.get(reference.node as usize)?.get(reference.result as usize)?.as_ref())
+                .then(|| result_spec(results, reference))
                 .flatten()
         };
         let (Some(own), Some(shared)) = (spec(other), spec(primary)) else {
@@ -3136,9 +3201,13 @@ fn validate_shares(
             && own.extents == shared.extents
             && own.strides == shared.strides
             && own.byte_len == shared.byte_len;
-        let primary_node = &nodes[primary.node as usize];
+        let primary_node = nodes[primary.node as usize].as_ref();
         let read = nodes.iter().any(|node| {
-            node.args.arguments().iter().any(|argument| argument_reference(argument) == Some(other))
+            node.as_ref()
+                .args
+                .arguments()
+                .iter()
+                .any(|argument| argument_reference(argument) == Some(other))
         }) || planned.args.arguments().iter().any(|argument| argument_reference(argument) == Some(primary));
         let held = exports.contains(&other)
             || stores.iter().any(|store| store.result == other || store.result == primary)
@@ -4447,11 +4516,11 @@ pub fn plan_storage_sizes(
 /// per-submission upload region so a later host write cannot race an
 /// earlier submission still reading them. Every buffer starts at a
 /// [`BUFFER_ALIGNMENT`] offset of its region.
-fn plan_storage(
+fn plan_storage<N: AsRef<PlannedNode>, R: AsRef<[Option<NativeTensorSpec>]>>(
     ports: &[PortSpec],
-    nodes: &[PlannedNode],
+    nodes: &[N],
     links: &OperandLinks,
-    results: &[Vec<Option<NativeTensorSpec>>],
+    results: &[R],
     exports: &[WorkflowResultRef],
     stores: &[Store],
 ) -> StoragePlan {
@@ -4466,17 +4535,20 @@ fn plan_storage(
         .collect();
     let result_bytes: Vec<Vec<Option<u64>>> = results
         .iter()
-        .map(|row| row.iter().map(|spec| spec.as_ref().map(|s| s.byte_len)).collect())
+        .map(|row| row.as_ref().iter().map(|spec| spec.as_ref().map(|s| s.byte_len)).collect())
         .collect();
     let storage_nodes: Vec<StorageNode<'_>> = nodes
         .iter()
         .zip(&result_bytes)
-        .map(|(node, results)| StorageNode {
-            args: &node.args,
-            results,
-            scratch: &node.scratch,
-            activation: node.activation,
-            share: node.share,
+        .map(|(node, results)| {
+            let node = node.as_ref();
+            StorageNode {
+                args: &node.args,
+                results,
+                scratch: &node.scratch,
+                activation: node.activation,
+                share: node.share,
+            }
         })
         .collect();
     let storage_stores: Vec<(WorkflowResultRef, u32)> = stores
@@ -5261,43 +5333,66 @@ impl NativeGraphPlan {
         arena: Option<Arc<Allocation>>,
         family: Option<Arc<NativeGraphFamily>>,
     ) -> NativeGraphOutputs {
-        let mut locals = Vec::with_capacity(self.topology.ports.len());
-        for ordinal in 0..self.topology.ports.len() {
-            let tensor = if let Some(Placement::Export(offset)) = self.topology.port_placements[ordinal] {
-                Some(self.port_view(
-                    ordinal,
-                    arena.as_ref().expect("planned output arena absent"),
-                    offset,
-                ))
-            } else {
-                None
-            };
-            locals.push(tensor);
-        }
-        let mut outputs = Vec::with_capacity(self.topology.results.nodes.len());
-        for row_range in &self.topology.results.nodes {
-            let mut output_row = Vec::with_capacity(row_range.len());
-            for flat_idx in row_range.clone() {
-                let Some((representation, ref ext_range)) = self.topology.results.entries[flat_idx] else {
-                    output_row.push(None);
-                    continue;
-                };
-                let Placement::Export(offset) = self.topology.placements[flat_idx] else {
-                    output_row.push(None);
-                    continue;
-                };
-                output_row.push(Some(Arc::new(TensorInner::new_view(
-                    self.device.clone(),
-                    arena.as_ref().expect("planned output arena absent").clone(),
-                    offset,
-                    self.result_byte_lens[flat_idx],
-                    representation,
-                    self.extents(ext_range).to_vec(),
-                    self.strides(ext_range).to_vec(),
-                ))));
-            }
-            outputs.push(output_row);
-        }
+        let has_exports = self
+            .topology
+            .port_placements
+            .iter()
+            .any(|placement| matches!(placement, Some(Placement::Export(_))))
+            || self
+                .topology
+                .placements
+                .iter()
+                .zip(&self.topology.results.entries)
+                .any(|(placement, entry)| entry.is_some() && matches!(placement, Placement::Export(_)));
+        let (locals, outputs) = if has_exports {
+            let export_arena = arena.as_ref().expect("planned output arena absent");
+            let locals = (0..self.topology.ports.len())
+                .map(|ordinal| {
+                    let Some(Placement::Export(offset)) = self.topology.port_placements[ordinal] else {
+                        return None;
+                    };
+                    Some(self.port_view(ordinal, export_arena, offset))
+                })
+                .collect();
+            let outputs = self
+                .topology
+                .results
+                .nodes
+                .iter()
+                .map(|row_range| {
+                    row_range
+                        .clone()
+                        .map(|flat_idx| {
+                            let (representation, ext_range) =
+                                self.topology.results.entries[flat_idx].as_ref()?;
+                            let Placement::Export(offset) = self.topology.placements[flat_idx] else {
+                                return None;
+                            };
+                            Some(Arc::new(TensorInner::new_view(
+                                self.device.clone(),
+                                export_arena.clone(),
+                                offset,
+                                self.result_byte_lens[flat_idx],
+                                *representation,
+                                self.extents(ext_range).to_vec(),
+                                self.strides(ext_range).to_vec(),
+                            )))
+                        })
+                        .collect()
+                })
+                .collect();
+            (locals, outputs)
+        } else {
+            let locals = vec![None; self.topology.ports.len()];
+            let outputs = self
+                .topology
+                .results
+                .nodes
+                .iter()
+                .map(|row_range| vec![None; row_range.len()])
+                .collect();
+            (locals, outputs)
+        };
         NativeGraphOutputs {
             plan: self.clone(),
             locals,
@@ -7395,7 +7490,7 @@ mod layout_certificate_tests {
     #[test]
     fn dominating_layout_accepts_smaller_exact_graph_and_rejects_larger_one() {
         let (ports, nodes, results) = class(16);
-        let links = operand_links::<()>(&nodes, &[]).unwrap();
+        let links = operand_links::<(), _>(&nodes, &[]).unwrap();
         let certified =
             make_layout(&ports, &nodes, &links, &results, &[], &[], HostHeap::default(), HostHeap::default(), 0, GraphCensus::default());
         let charge = certified.storage_bytes();
@@ -7618,7 +7713,7 @@ mod operand_pairing_tests {
                 node(source, needs.collect())
             })
             .collect::<Vec<_>>();
-        let links = operand_links::<()>(&nodes, &[]).unwrap();
+        let links = operand_links::<(), _>(&nodes, &[]).unwrap();
         let ports = [port("f32", &[64], true)];
         let results = vec![vec![Some(spec(1024))]; nodes.len()];
         plan_storage(&ports, &nodes, &links, &results, &[], &[])
@@ -7674,7 +7769,7 @@ mod operand_pairing_tests {
             node((0, 0), vec![need(2176, formed), need(512, None)]),
             node((0, 0), vec![need(8192, formed)]),
         ];
-        let links = operand_links::<()>(&nodes, &[]).unwrap();
+        let links = operand_links::<(), _>(&nodes, &[]).unwrap();
         assert_eq!(links.pairs, [OperandPair { consumer: 2, formed: 0, producer: 0, emitted: 0 }]);
         assert!(!links.linked(3, 0), "a second consumer forms its own");
         assert_eq!(formations_left_out(2, &nodes[2].scratch, &[at(true, true), None], &links), [0]);
@@ -7714,7 +7809,7 @@ mod operand_pairing_tests {
     #[test]
     fn a_formation_is_left_out_on_the_forms_it_writes() {
         let nodes = vec![producer(), consumer((0, 0))];
-        let links = operand_links::<()>(&nodes, &[]).unwrap();
+        let links = operand_links::<(), _>(&nodes, &[]).unwrap();
         assert_eq!(links.pairs.len(), 2, "both forms pair");
         let scratch = &nodes[1].scratch;
         let left_out = |forms: [Option<FormedAt>; 2]| formations_left_out(1, scratch, &[forms[0], forms[1], None], &links);
@@ -7727,7 +7822,7 @@ mod operand_pairing_tests {
         let mut unpaired = consumer((0, 0));
         unpaired.scratch[1].operand = Some(ScratchOperand::Formed { parameter: 0, formation: 0, rows: false, norm: None });
         let nodes = vec![producer(), unpaired];
-        let links = operand_links::<()>(&nodes, &[]).unwrap();
+        let links = operand_links::<(), _>(&nodes, &[]).unwrap();
         let scratch = &nodes[1].scratch;
         assert!(formations_left_out(1, scratch, &[at(true, true), at(true, true), None], &links).is_empty());
         assert_eq!(formations_left_out(1, scratch, &[at(true, true), at(true, false), None], &links), [0]);
@@ -7740,12 +7835,12 @@ mod operand_pairing_tests {
     fn unread_emissions_reserve_the_minimum() {
         let minimum = |nodes: &[PlannedNode]| nodes[0].scratch.iter().map(|need| need.bytes).collect::<Vec<_>>();
         let mut alone = vec![producer(), node((0, 0), vec![need(64, None)])];
-        let links = operand_links::<()>(&alone, &[]).unwrap();
+        let links = operand_links::<(), _>(&alone, &[]).unwrap();
         charge_node_emissions(&mut alone, &links);
         assert_eq!(minimum(&alone), [1, 1, 1]);
 
         let mut paired = vec![producer(), consumer((0, 0))];
-        let links = operand_links::<()>(&paired, &[]).unwrap();
+        let links = operand_links::<(), _>(&paired, &[]).unwrap();
         charge_node_emissions(&mut paired, &links);
         assert_eq!(minimum(&paired), [4096, 320, 16]);
 
@@ -7786,7 +7881,7 @@ mod operand_pairing_tests {
         assert_eq!(storage.node_scratch[0][0], Placement::Port(2));
         assert_eq!(storage.node_scratch[0][1], Placement::Port(3));
         assert!(matches!(storage.node_scratch[0][2], Placement::Scratch(_)), "its staging stays in the workspace");
-        let uncarried = operand_links::<()>(&consuming, &[]).unwrap();
+        let uncarried = operand_links::<(), _>(&consuming, &[]).unwrap();
         let formed = plan_storage(&ports, &consuming, &uncarried, &results, &[], &[]);
         assert!(storage.scratch_bytes < formed.scratch_bytes, "carried buffers take no workspace");
 
@@ -7916,7 +8011,7 @@ mod operand_pairing_tests {
         );
         let mut other = consumer((0, 0));
         other.activation = f32;
-        assert_eq!(operand_links::<()>(&[producer(), other], &[]).err(), Some(WorkflowError::OperandElement { node: 1 }));
+        assert_eq!(operand_links::<(), _>(&[producer(), other], &[]).err(), Some(WorkflowError::OperandElement { node: 1 }));
     }
 
     /// A reader's kernel reads a carry only in the forms the carry holds:

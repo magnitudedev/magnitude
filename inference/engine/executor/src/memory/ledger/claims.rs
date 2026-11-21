@@ -179,7 +179,7 @@ impl Ledger {
     /// more: the exact `lacks` `State::entry_take` checks on the pool's entry.
     pub fn pool_shortfall(&self, class: PoolClass, bytes: u64) -> u64 {
         let state = self.state();
-        match state.pools[class.index()].as_ref() {
+        match state.pool(class) {
             Some(pool) => {
                 let entry = state.held[&pool.entry];
                 let allocated = entry.allocated.checked_add(bytes).expect("a store's bytes fit u64");

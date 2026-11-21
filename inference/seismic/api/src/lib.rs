@@ -2775,6 +2775,7 @@ pub struct NativeGraph {
 /// checked charge across the declaration's finite tuning choices.
 pub struct NativeGraphMetadata {
     backend: BackendName,
+    device: Option<crate::device::DeviceProperties>,
     inner: seismic_runtime::native::graph::NativeGraphMetadataDraft,
 }
 
@@ -2931,13 +2932,16 @@ struct CallKey {
     implementation: usize,
     entry: &'static str,
     backend: BackendName,
+    device: Option<crate::device::DeviceProperties>,
     dimensions: Vec<(String, u64)>,
 }
 
 type CheckedCallsCache =
     std::collections::HashMap<CallKey, Result<Arc<CheckedNode>, NativeGraphMetadataError>>;
-type WalkedConfigsCache =
-    std::collections::HashMap<(usize, Vec<u64>), Arc<Vec<NativeSpecialization>>>;
+type WalkedConfigsCache = std::collections::HashMap<
+    (usize, Option<crate::device::DeviceProperties>, Vec<u64>),
+    Arc<Vec<NativeSpecialization>>,
+>;
 
 /// Process-wide graph metadata caches reclaimed together with evaluated entry
 /// shapes by [`forget_evaluated_entry_shapes`].
@@ -2978,20 +2982,24 @@ fn checked_call(
     checked: &generated::NativeGraphCheckedEntry,
     entry: &'static str,
     backend: BackendName,
+    device: Option<crate::device::DeviceProperties>,
     dimensions: &[(String, u64)],
 ) -> Result<Arc<CheckedNode>, NativeGraphMetadataError> {
+    let device = device.filter(|d| d.backend() == backend);
     let key = CallKey {
         contract: checked.identity(),
         implementation: std::ptr::from_ref(checked.implementation()) as usize,
         entry,
         backend,
+        device,
         dimensions: dimensions.to_vec(),
     };
     let calls = CHECKED_CALLS.get_or_init(Default::default);
     if let Some(call) = calls.read().expect("checked calls are never poisoned").get(&key) {
         return call.clone();
     }
-    let call = check_node(checked.clone(), entry, backend, &borrowed(dimensions)).map(Arc::new);
+    let call =
+        check_node(checked.clone(), entry, backend, device, &borrowed(dimensions)).map(Arc::new);
     calls.write().expect("checked calls are never poisoned").insert(key, call.clone());
     call
 }
@@ -3172,8 +3180,18 @@ fn record(request: impl FnOnce() -> KernelRequest) {
 
 impl NativeGraphMetadata {
     pub fn new(backend: BackendName) -> Self {
+        Self::new_for_device(backend, None)
+    }
+
+    /// Construct a metadata graph bound to `device`'s hardware properties when
+    /// known (falling back to conservative backend floor properties when `None`).
+    pub fn new_for_device(
+        backend: BackendName,
+        device: Option<crate::device::DeviceProperties>,
+    ) -> Self {
         Self {
             backend,
+            device: device.filter(|d| d.backend() == backend),
             inner: seismic_runtime::native::graph::NativeGraphMetadataDraft::new(backend),
         }
     }
@@ -3400,7 +3418,7 @@ impl NativeGraphMetadata {
         dimensions: &[(&str, u64)],
     ) -> Result<Arc<CheckedNode>, NativeGraphMetadataError> {
         let checked = self.bind_checked::<E>(elements)?;
-        checked_call(&checked, E::NAME, self.backend, &owned_dimensions(dimensions))
+        checked_call(&checked, E::NAME, self.backend, self.device, &owned_dimensions(dimensions))
     }
 
     pub fn export(&mut self, result: &WorkflowTensor) -> Result<(), NativeGraphMetadataError> {
@@ -3526,27 +3544,29 @@ impl NativeGraphMetadata {
 /// every point at statics already walked is each configuration's charges,
 /// arithmetic.
 fn scratch_bound(
-    implementation: &'static NativeImplementation,
+    implementation_key: usize,
+    device: Option<crate::device::DeviceProperties>,
+    bound: &seismic_lang::checked::OnDevice,
     dimension: &impl Fn(&str) -> Option<u64>,
 ) -> Result<Vec<u64>, String> {
-    let statics = implementation
+    let statics = bound
         .statics
         .iter()
         .map(|name| dimension(name).ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()).to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    let key = (std::ptr::from_ref(implementation) as usize, statics);
+    let key = (implementation_key, device, statics);
     let walked = SCRATCH_WALKED.get_or_init(Default::default);
     let known = walked.read().expect("walked configurations are never poisoned").get(&key).cloned();
     let configurations = match known {
         Some(configurations) => configurations,
         None => {
-            let statics = implementation
+            let statics = bound
                 .statics
                 .iter()
-                .zip(&key.1)
+                .zip(&key.2)
                 .fold(NativeSpecialization::new(), |statics, (name, &value)| statics.with_static(name.clone(), value));
             let configurations =
-                Arc::new(implementation.scratch_configurations(&statics).map_err(|error| error.to_string())?);
+                Arc::new(bound.scratch_configurations(&statics).map_err(|error| error.to_string())?);
             walked
                 .write()
                 .expect("walked configurations are never poisoned")
@@ -3554,37 +3574,39 @@ fn scratch_bound(
             configurations
         }
     };
-    implementation
+    bound
         .scratch_bound_over(&configurations, dimension)
         .map_err(|error| error.to_string())
 }
 
 /// Active-launch bitmasks per admitted launch-guard configuration at `dimension`
-/// ([`NativeImplementation::launch_masks_over`]), with the declaration's
+/// ([`OnDevice::launch_masks_over`]), with the declaration's
 /// admitted configurations cached until [`forget_evaluated_entry_shapes`] for
-/// each value of its statics ([`NativeImplementation::launch_configurations`]).
+/// each value of its statics ([`OnDevice::launch_configurations`]).
 fn launch_masks_bound(
-    implementation: &'static NativeImplementation,
+    implementation_key: usize,
+    device: Option<crate::device::DeviceProperties>,
+    bound: &seismic_lang::checked::OnDevice,
     dimension: &impl Fn(&str) -> Option<u64>,
 ) -> Result<Vec<u64>, String> {
-    let statics = implementation
+    let statics = bound
         .statics
         .iter()
         .map(|name| dimension(name).ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()).to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    let key = (std::ptr::from_ref(implementation) as usize, statics);
+    let key = (implementation_key, device, statics);
     let walked = LAUNCH_WALKED.get_or_init(Default::default);
     let known = walked.read().expect("walked launch configurations are never poisoned").get(&key).cloned();
     let configurations = match known {
         Some(configurations) => configurations,
         None => {
-            let statics = implementation
+            let statics = bound
                 .statics
                 .iter()
-                .zip(&key.1)
+                .zip(&key.2)
                 .fold(NativeSpecialization::new(), |statics, (name, &value)| statics.with_static(name.clone(), value));
             let configurations =
-                Arc::new(implementation.launch_configurations(&statics).map_err(|error| error.to_string())?);
+                Arc::new(bound.launch_configurations(&statics).map_err(|error| error.to_string())?);
             walked
                 .write()
                 .expect("walked launch configurations are never poisoned")
@@ -3592,7 +3614,7 @@ fn launch_masks_bound(
             configurations
         }
     };
-    implementation
+    bound
         .launch_masks_over(&configurations, dimension)
         .map_err(|error| error.to_string())
 }
@@ -3604,16 +3626,22 @@ fn check_node(
     checked: generated::NativeGraphCheckedEntry,
     entry: &'static str,
     backend: BackendName,
+    device: Option<crate::device::DeviceProperties>,
     dimensions: &[(&str, u64)],
 ) -> Result<CheckedNode, NativeGraphMetadataError> {
     let (parameters, results) = checked
         .shapes(dimensions)
         .map_err(NativeGraphMetadataError::Unsupported)?;
     let implementation = checked.implementation();
+    let implementation_key = std::ptr::from_ref(implementation) as usize;
+    let bound = match device.filter(|d| d.backend() == backend) {
+        Some(props) => implementation.at_device(&props),
+        None => implementation.at_device(&crate::device::BackendFloor(backend)),
+    };
     // A graph can only call an entry at statics its implementation
     // admits, so every checked call can be prepared.
     let mut statics = NativeSpecialization::new();
-    for name in &implementation.statics {
+    for name in &bound.statics {
         let value = dimensions
             .iter()
             .find(|(candidate, _)| candidate == name)
@@ -3626,7 +3654,7 @@ fn check_node(
             })?;
         statics = statics.with_static(name.clone(), value);
     }
-    match implementation.admits(&statics) {
+    match bound.admits(&statics) {
         Ok(()) => {}
         Err(NativeSpecializationError::Inadmissible) => {
             return Err(NativeGraphMetadataError::Inadmissible(
@@ -3654,7 +3682,7 @@ fn check_node(
             .find(|(candidate, _)| *candidate == name)
             .map(|(_, value)| *value)
     };
-    let scratch = scratch_bound(implementation, &dim_lookup)
+    let scratch = scratch_bound(implementation_key, device, &bound, &dim_lookup)
         .map_err(|reason| {
             NativeGraphMetadataError::Unsupported(format!(
                 "`{}` scratch bound at {dimensions:?}: {reason}",
@@ -3662,16 +3690,17 @@ fn check_node(
             ))
         })?
         .into_iter()
-        .zip(&implementation.scratch)
+        .zip(&bound.scratch)
         .map(|(bytes, buffer)| seismic_runtime::native::ScratchNeed::of(buffer, bytes))
         .collect();
     let cuda_launches = if backend == BackendName::Cuda {
-        let masks = launch_masks_bound(implementation, &dim_lookup).map_err(|reason| {
-            NativeGraphMetadataError::Unsupported(format!(
-                "`{}` launch masks at {dimensions:?}: {reason}",
-                entry
-            ))
-        })?;
+        let masks = launch_masks_bound(implementation_key, device, &bound, &dim_lookup)
+            .map_err(|reason| {
+                NativeGraphMetadataError::Unsupported(format!(
+                    "`{}` launch masks at {dimensions:?}: {reason}",
+                    entry
+                ))
+            })?;
         // Union of active launch bits across every admissible specialization:
         // matches `NativeGraphFamily::with_launches` bitwise-OR layout form.
         Some(masks.into_iter().fold(0u64, |acc, m| acc | m))

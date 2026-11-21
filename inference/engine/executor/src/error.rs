@@ -186,6 +186,49 @@ pub struct CapacityError {
     pub resource: ResourceKind,
     pub required: u64,
     pub available: u64,
+    /// Total units (or bytes) that must be freed to satisfy the refused claim.
+    /// Always `>= required.saturating_sub(available)`, and strictly larger
+    /// when a store was already past its budget or boundary cap before the
+    /// claim arrived.
+    shortfall: u64,
+}
+
+impl CapacityError {
+    /// A capacity deficit where `available` of `required` units are present.
+    /// When `required > 0` and `available >= required` (e.g. fragmentation or
+    /// a contiguous-allocation refusal), `available` is clamped to `0` so
+    /// `available < required` holds by construction.
+    pub fn new(resource: ResourceKind, required: u64, available: u64) -> Self {
+        let available = if required > 0 && available >= required { 0 } else { available };
+        Self {
+            resource,
+            required,
+            available,
+            shortfall: required.saturating_sub(available),
+        }
+    }
+
+    /// A capacity deficit from a ledger [`Short`](crate::memory::ledger::Short):
+    /// preserves the full `short.over` shortfall (which may exceed
+    /// `short.required` when the store is already over budget or boundary cap)
+    /// while reporting `available = short.available()` without underflow.
+    pub fn from_short(resource: ResourceKind, short: &crate::memory::ledger::Short) -> Self {
+        let available = short.available();
+        Self {
+            resource,
+            required: short.required,
+            available,
+            shortfall: short.over.max(short.required.saturating_sub(available)),
+        }
+    }
+
+    /// Units (or bytes) that must be freed to satisfy the refused claim.
+    /// Equals `required.saturating_sub(available)` normally, and the full
+    /// over-budget deficit `short.over` when the store was already past its
+    /// budget or boundary cap.
+    pub fn lacks(&self) -> u64 {
+        self.shortfall.max(self.required.saturating_sub(self.available))
+    }
 }
 
 impl fmt::Display for CapacityError {

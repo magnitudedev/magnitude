@@ -79,11 +79,10 @@ inline void draft_join(
     // Fixed-order threadgroup sums (simdgroup sums, then the simdgroup
     // partials in index order); their barriers order every joined write
     // before these reads.
-    const float embedding_inverse = metal::rsqrt(
-        reduce::group_sum<draft_simdgroups>(embedding_squares, partials, sg, lane) / float(width) + epsilon);
-    const float hidden_inverse = metal::rsqrt(
-        reduce::group_sum<draft_simdgroups>(hidden_squares, partials + draft_simdgroups, sg, lane) / float(width)
-        + epsilon);
+    float squares[2] = {embedding_squares, hidden_squares};
+    reduce::group_sum_n<2, draft_simdgroups>(squares, partials, sg, lane);
+    const float embedding_inverse = metal::rsqrt(squares[0] / float(width) + epsilon);
+    const float hidden_inverse = metal::rsqrt(squares[1] / float(width) + epsilon);
     for (uint column = thread_index; column < width; column += draft_threads) {
         const float embedded = activation_element::load(joined[column]) * embedding_inverse
             * element::at<embedding_norm_element>(embedding_norm, ulong(column) * SEISMIC_EMBEDDING_NORM_STRIDE_0);

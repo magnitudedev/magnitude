@@ -44,7 +44,7 @@ impl StreamedFigures {
     ) -> (Priced<Self>, Vec<(PointKey, Record)>) {
         let reading = Reading { store, read: RefCell::default() };
         let read = StorageCosts::priced(topology, executor, storage, &reading);
-        let readers = seismic::threads::quota().get() as u64;
+        let readers = MemoryCosts::readers(topology);
         let memory = match topology.shared_ranges_lie_in_device_memory(executor) {
             true => Priced::Measured(None),
             false => MemoryCosts::priced(topology, executor, readers, &reading).and_then(|costs| Priced::Measured(Some(costs.byte_seconds))),

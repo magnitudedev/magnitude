@@ -10,6 +10,7 @@ import { MachineCardSkeleton, OfferedModelsSkeleton } from "./skeletons"
 import type { OfferedModel } from "./expanding-model"
 import { RecommendedForYourMachine, useRecommendedSelection } from "./recommended-for-your-machine"
 import type { Recommendation } from "./recommendations"
+import { HARDWARE_BENCHMARK_TITLE } from "./benchmark"
 import { downloadContents } from "./data"
 import type { UnrunnableFile } from "./your-models"
 import type { MachineView, QuantView } from "./view"
@@ -28,6 +29,7 @@ export interface DiscoveredModel {
 /** One thing the service does before it can recommend: done, under way (with how far, when it knows), or still to come. */
 export interface PreparationStep {
   readonly label: string
+  readonly subtitle?: string | null
   readonly detail: string | null
   readonly state: "done" | "active" | "pending"
   readonly fraction: number | null
@@ -38,25 +40,26 @@ export const preparationLabels = [
   "Starting Magnitude",
   "Reading your hardware",
   "Looking for models already on this computer",
-  "Measuring how models run on your machine",
+  HARDWARE_BENCHMARK_TITLE,
 ] as const
 
-function PreparationProgress({ steps }: { steps: readonly PreparationStep[] }) {
+export function PreparationProgress({ steps }: { steps: readonly PreparationStep[] }) {
   return <div role="status" aria-live="polite" className={cn(cardClass, "mt-3 px-5 py-4")}>
     <ol className="space-y-2">
-      {steps.map(step => <li key={step.label}>
-        <div className="flex items-center gap-2.5 text-[13px]">
-          <span className="flex size-4 shrink-0 items-center justify-center">
-            {step.state === "done" ? <CheckIcon weight="bold" className="size-3.5 text-green-600 dark:text-green-400" />
-              : step.state === "active" ? <CircleNotchIcon className="size-4 text-blue-600 motion-safe:animate-spin dark:text-blue-400" />
-              : <span className="size-1.5 rounded-full bg-slate-300 dark:bg-slate-600" />}
-          </span>
-          <span className={cn(step.state === "pending" ? "text-slate-500" : step.state === "active" ? "font-medium" : "text-slate-700 dark:text-slate-300")}>{step.label}</span>
-          {step.detail && <span className="ml-auto text-xs tabular-nums text-slate-500">{step.detail}</span>}
-        </div>
-        {step.state === "active" && step.fraction !== null && <div className="ml-[26px] mt-1.5 h-1 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-750">
-          <div className="h-full rounded-full bg-blue-600 transition-[width] duration-500 dark:bg-blue-400" style={{ width: `${Math.max(0.04, step.fraction) * 100}%` }} />
-        </div>}
+      {steps.map(step => <li key={step.label} className="flex items-center gap-2.5 text-[13px]">
+        <span className="flex size-4 shrink-0 items-center justify-center">
+          {step.state === "done" ? <CheckIcon weight="bold" className="size-3.5 text-green-600 dark:text-green-400" />
+            : step.state === "active" ? <CircleNotchIcon className="size-4 text-blue-600 motion-safe:animate-spin dark:text-blue-400" />
+            : <span className="size-1.5 rounded-full bg-slate-300 dark:bg-slate-600" />}
+        </span>
+        <span className={cn("shrink-0", step.state === "pending" ? "text-slate-500" : step.state === "active" ? "font-medium" : "text-slate-700 dark:text-slate-300")}>{step.label}</span>
+        {step.state === "active" && step.subtitle && <span className="min-w-0 truncate text-xs text-slate-500 dark:text-slate-400">· {step.subtitle}</span>}
+        <span className="ml-auto flex shrink-0 items-center gap-2.5">
+          {step.state === "active" && step.fraction !== null && <span aria-hidden="true" className="h-1 w-20 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-750">
+            <span className="block h-full rounded-full bg-blue-600 transition-[width] duration-300 dark:bg-blue-400" style={{ width: `${Math.max(0.04, step.fraction) * 100}%` }} />
+          </span>}
+          {step.detail && <span className={cn("text-xs tabular-nums text-slate-500", step.state === "active" && step.fraction !== null && "w-8 text-right")}>{step.detail}</span>}
+        </span>
       </li>)}
     </ol>
   </div>
@@ -113,7 +116,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
         </div>}
       </div>}
 
-      <RecommendedForYourMachine recommendations={recommendations} placeholder={measuring ? <OfferedModelsSkeleton firstOpened /> : null} measuring={null}
+      <RecommendedForYourMachine recommendations={recommendations} placeholder={measuring ? <OfferedModelsSkeleton firstOpened /> : null} benchmark={null}
         usOnly={usOnly} setUsOnly={setUsOnly} owned={owned} selection={selection} className={roomNote && !preparation && discovered.length === 0 ? "mt-5" : "mt-8"} />
 
     </div>

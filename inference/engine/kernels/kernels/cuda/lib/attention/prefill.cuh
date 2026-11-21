@@ -645,6 +645,49 @@ struct DecodeRows {
     }
 };
 
+// Store a lane's DPL operand elements to `dst` using the widest aligned vector
+// store (`uint4`, `uint2`, `u32`) when DPL is even, with scalar fallback.
+template <class Ops>
+__device__ __forceinline__ void store_operands(u16 *dst, const float (&x)[DPL]) {
+    if constexpr (DPL % 2 == 0) {
+        const u64 addr = reinterpret_cast<u64>(dst);
+        if constexpr (DPL % 8 == 0) {
+            if ((addr & 15u) == 0) {
+                uint4 *out = reinterpret_cast<uint4 *>(dst);
+#pragma unroll
+                for (int d = 0; d < DPL; d += 8) {
+                    out[d / 8] = make_uint4(Ops::pair(x[d + 0], x[d + 1]),
+                                            Ops::pair(x[d + 2], x[d + 3]),
+                                            Ops::pair(x[d + 4], x[d + 5]),
+                                            Ops::pair(x[d + 6], x[d + 7]));
+                }
+                return;
+            }
+        }
+        if constexpr (DPL % 4 == 0) {
+            if ((addr & 7u) == 0) {
+                uint2 *out = reinterpret_cast<uint2 *>(dst);
+#pragma unroll
+                for (int d = 0; d < DPL; d += 4) {
+                    out[d / 4] = make_uint2(Ops::pair(x[d + 0], x[d + 1]),
+                                            Ops::pair(x[d + 2], x[d + 3]));
+                }
+                return;
+            }
+        }
+        if ((addr & 3u) == 0) {
+            u32 *out = reinterpret_cast<u32 *>(dst);
+#pragma unroll
+            for (int d = 0; d < DPL; d += 2) {
+                out[d / 2] = Ops::pair(x[d + 0], x[d + 1]);
+            }
+            return;
+        }
+    }
+#pragma unroll
+    for (int d = 0; d < DPL; ++d) dst[d] = Ops::operand(x[d]);
+}
+
 // Prefill L1 over `M` rows: 8 warps per block (launch with 256 threads). Queries,
 // and keys and values as history holds them (`hold`), go to scratch as the
 // history policy's operands ([M, KV * G, W], [M, KV, W] and [M, KV, W]); a row
@@ -654,27 +697,35 @@ __device__ __forceinline__ void prepare(const Inputs &in, const History &history
                                         u16 *keys, u16 *values, rounding::Rounding trained) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     typedef Operands<History> Ops;
-    __shared__ float exchange[8][W];
+    __shared__ float exchange[head_layout::NEEDS_EXCHANGE ? 8 * W : 1];
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
+    float *own = head_layout::NEEDS_EXCHANGE ? exchange + warp * W : exchange;
     const u64 item = static_cast<u64>(blockIdx.x) * 8 + warp;
-    const u64 heads = KV * (G + 1);
+    constexpr u64 heads = static_cast<u64>(KV) * (G + 1);
     if (item >= SEISMIC_DIM_M * heads) return;
-    const u64 row = item / heads;
-    const int head = static_cast<int>(item % heads);
+    u64 row;
+    int head;
+    if (item <= 0xffffffffull) {
+        const u32 item32 = static_cast<u32>(item);
+        constexpr u32 heads32 = static_cast<u32>(KV * (G + 1));
+        row = item32 / heads32;
+        head = static_cast<int>(item32 % heads32);
+    } else {
+        row = item / heads;
+        head = static_cast<int>(item % heads);
+    }
     if (head < KV * G) {
         float x[DPL];
-        prepared_query(in, row, head, x, exchange[warp], lane);
-        u16 *to = queries + (row * KV * G + head) * W + lane * DPL;
-#pragma unroll
-        for (int d = 0; d < DPL; ++d) to[d] = Ops::operand(x[d]);
+        prepared_query(in, row, head, x, own, lane);
+        store_operands<Ops>(queries + (row * KV * G + head) * W + lane * DPL, x);
         return;
     }
     if (!FRESH) return;
     const int kv = head - KV * G;
     float k[DPL];
     float v[DPL];
-    prepared_key(in, row, kv, k, exchange[warp], lane, trained);
+    prepared_key(in, row, kv, k, own, lane, trained);
     // A stored-key value is the prepared key.
     if constexpr (STORED_KEY) {
 #pragma unroll
@@ -684,11 +735,8 @@ __device__ __forceinline__ void prepare(const Inputs &in, const History &history
     }
     hold(history, ATTENTION_DESTINATION(in, row), kv, k, v, lane);
     const u64 at = (row * KV + kv) * W + lane * DPL;
-#pragma unroll
-    for (int d = 0; d < DPL; ++d) {
-        keys[at + d] = Ops::operand(k[d]);
-        values[at + d] = Ops::operand(v[d]);
-    }
+    store_operands<Ops>(keys + at, k);
+    store_operands<Ops>(values + at, v);
 }
 
 // Block `block`: WARPS MMA warps, plus WARPS producer warps for affine
@@ -2073,14 +2121,75 @@ __device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &
     if (count <= 1) return;
     const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
     const u64 heads = KV * G;
-    for (long long token = static_cast<long long>(tile) * QT;
-         token < min(static_cast<long long>(tile + 1) * QT, rows_total); ++token) {
+    const u64 stat_stride = static_cast<u64>(rows_total) * heads;
+    const u64 partial_stride = stat_stride * W;
+    const long long start = static_cast<long long>(tile) * QT;
+    const long long stop = min(static_cast<long long>(tile + 1) * QT, rows_total);
+    constexpr int MAX_SHARED_PARTS = 256;
+    if (count <= MAX_SHARED_PARTS) {
+        __shared__ float shared_weights[MAX_SHARED_PARTS];
+        __shared__ float shared_inv_norm;
+        for (long long token = start; token < stop; ++token) {
+            if (token > start) __syncthreads();
+            const u64 slot = static_cast<u64>(token) * heads + query_head;
+            if (column < 32) {
+                constexpr int MAX_PER_LANE = MAX_SHARED_PARTS / 32;
+                float2 stat[MAX_PER_LANE];
+                const float2 *stats = reinterpret_cast<const float2 *>(split.statistics) + slot;
+                float local_max = -__int_as_float(0x7f800000);
+#pragma unroll
+                for (int i = 0; i < MAX_PER_LANE; ++i) {
+                    if (i * 32 >= count) break;
+                    const int p = column + i * 32;
+                    if (p < count) {
+                        const float2 s = stats[static_cast<u64>(p) * stat_stride];
+                        stat[i] = s;
+                        if (s.y > 0.0f) local_max = fmaxf(local_max, s.x);
+                    }
+                }
+                const float maximum = seismic_warp_max_f32(local_max);
+                float local_denom = 0.0f;
+#pragma unroll
+                for (int i = 0; i < MAX_PER_LANE; ++i) {
+                    if (i * 32 >= count) break;
+                    const int p = column + i * 32;
+                    if (p < count) {
+                        const float l = stat[i].y;
+                        float weight = 0.0f;
+                        if (l > 0.0f) {
+                            weight = seismic_ex2_approx(stat[i].x - maximum);
+                            local_denom = __fmaf_rn(l, weight, local_denom);
+                        }
+                        shared_weights[p] = weight;
+                    }
+                }
+                const float denominator = seismic_warp_sum_f32(local_denom);
+                if (column == 0) {
+                    shared_inv_norm = 1.0f / normalizer(in, query_head, maximum, denominator);
+                }
+            }
+            __syncthreads();
+            float accumulated = 0.0f;
+            const float *values = split.partials + slot * W + column;
+            for (int p = 0; p < count; ++p) {
+                const float weight = shared_weights[p];
+                if (weight > 0.0f) {
+                    accumulated = __fmaf_rn(weight, values[static_cast<u64>(p) * partial_stride], accumulated);
+                }
+            }
+            gated.put(static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
+                          static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1 +
+                          static_cast<u64>(column) * SEISMIC_RESULT_0_STRIDE_2,
+                      attention::gated(in, token, query_head, column, accumulated * shared_inv_norm));
+        }
+        return;
+    }
+    for (long long token = start; token < stop; ++token) {
         const u64 slot = static_cast<u64>(token) * heads + query_head;
         float denominator, accumulated;
-        const float maximum =
-            merge(split.statistics + slot * 2, static_cast<u64>(rows_total) * heads * 2,
-                  split.partials + slot * W + column, static_cast<u64>(rows_total) * heads * W, count,
-                  denominator, accumulated);
+        const float maximum = merge(split.statistics + slot * 2, stat_stride * 2,
+                                    split.partials + slot * W + column, partial_stride, count,
+                                    denominator, accumulated);
         gated.put(static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
                       static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1 +
                       static_cast<u64>(column) * SEISMIC_RESULT_0_STRIDE_2,

@@ -63,6 +63,8 @@ pub struct CpuReport {
     pub max_allocation: u64,
     /// Its one kind, which every contract is allocated in.
     pub kind: KindReport,
+    /// Hardware properties queried from the host, when reported.
+    pub properties: Option<seismic_lang::device::DeviceProperties>,
 }
 
 #[derive(Debug)]
@@ -84,6 +86,8 @@ pub struct MetalReport {
     /// Its kinds: shared storage, and on a device whose memory is its own
     /// private storage too (`seismic_metal::topology::kinds`).
     pub kinds: Vec<KindReport>,
+    /// Hardware properties queried from the Metal device, when reported.
+    pub properties: Option<seismic_lang::device::DeviceProperties>,
 }
 
 #[derive(Debug)]
@@ -113,6 +117,8 @@ pub struct CudaReport {
     pub memory: CudaMemory,
     /// The kinds it allocates.
     pub kinds: Vec<KindReport>,
+    /// Hardware properties queried from the CUDA device, when reported.
+    pub properties: Option<seismic_lang::device::DeviceProperties>,
 }
 
 /// Whose memory a CUDA device reports its memory is.
@@ -151,6 +157,8 @@ pub struct VulkanReport {
     /// The kinds it allocates: its memory types, each on its heap, and
     /// imported host pages where it imports them.
     pub kinds: Vec<KindReport>,
+    /// Hardware properties queried from the Vulkan device, when reported.
+    pub properties: Option<seismic_lang::device::DeviceProperties>,
 }
 
 /// A Vulkan device's memory as the backend reports it.
@@ -414,6 +422,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 allocations: Ok(NativeAllocations { least: 0, granularity: reports.page }),
             },
             tensor_operations: false,
+            properties: reports.cpu.properties,
         });
         if reports.cpu.availability == Availability::Available {
             let path = executor.ungranted(host_ram);
@@ -457,6 +466,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 allocations: Ok(NativeAllocations { least: 0, granularity: reports.page }),
             },
             tensor_operations: metal.tensor_operations,
+            properties: metal.properties,
         });
         if metal.admission.is_err() {
             continue;
@@ -522,6 +532,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 allocations: Ok(NativeAllocations { least: 0, granularity: cuda.allocation_granularity }),
             },
             tensor_operations: false,
+            properties: cuda.properties,
         });
         let paths = match placement {
             Ok(None) => KindPaths::Alike(host_class_paths(
@@ -588,6 +599,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 allocations: vulkan.least_object.clone().map(|least| NativeAllocations { least, granularity: 1 }),
             },
             tensor_operations: false,
+            properties: vulkan.properties,
         });
         // A device whose memory is the host's: its heaps together state one
         // total, split across heaps only as a presentation; the heaps'
@@ -868,6 +880,7 @@ mod tests {
                     bytes: WINDOW_BYTES,
                 },
             }],
+            properties: None,
         });
 
         let topology = build(Revision::next(), &reports);

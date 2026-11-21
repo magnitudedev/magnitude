@@ -49,7 +49,7 @@ use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::graph_cost::GraphCensus;
 use seismic_vulkan::direct::{
     DirectBatch, DirectGraph, DirectGraphBuilder, DirectLaunch, DirectSubmission, Gate, HostTimeline, LaunchKind, Reached,
-    Measured, TimelineAnchor, Unmeasured,
+    Measured, Timed, TimelineAnchor, Timing, Unmeasured,
 };
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -166,52 +166,27 @@ pub(super) fn encode(
     let encoded = list.encoded();
     let Some(runs) = list.runs().filter(|_| timed.is_none()) else {
         let segments = graph_segments(list, None);
-        let new_batch = || {
-            match timed {
-                Some(launches) => DirectBatch::timed(device, launches),
-                None => DirectBatch::new(device),
-            }
-            .map_err(CallError::Execution)
-        };
         let mut submissions = Issuing::default();
-        let issued = (|| {
-            let mut batch = new_batch()?;
-            for _ in 0..repetitions {
-                for (calls, boundary) in &segments {
-                    each_launch(list, calls.clone(), &encoded, |launch| match launch {
-                        Some(launch) => batch.launch(launch),
-                        None => {
-                            batch.skip();
-                            Ok(())
-                        }
-                    })?;
-                    for stamp in list.stamps(*boundary) {
-                        batch.stamp(vulkan_stamps(stamp), stamp.mark);
-                    }
-                    let operations = list.timelines(*boundary);
-                    if operations.is_empty() {
-                        continue;
-                    }
-                    for operation in operations {
-                        if operation.action == TimelineAction::Signal {
-                            batch.signal_timeline(&vulkan_timeline(operation).reached, operation.value);
-                        }
-                    }
-                    submissions.push(QueueSubmission::Measured(
-                        std::mem::replace(&mut batch, new_batch()?)
-                            .commit()
-                            .map_err(CallError::Execution)?,
-                    ));
-                    for operation in operations {
-                        if operation.action == TimelineAction::Wait {
-                            batch.wait_timeline(&vulkan_timeline(operation).gate, operation.value);
-                        }
-                    }
-                }
-            }
-            submissions.push(QueueSubmission::Measured(batch.commit().map_err(CallError::Execution)?));
-            Ok::<(), CallError>(())
-        })();
+        let issued = match timed {
+            Some(launches) => encode_ungraphed(
+                list,
+                repetitions,
+                &segments,
+                &encoded,
+                &mut submissions,
+                || DirectBatch::timed(device, launches),
+                QueueSubmission::Timed,
+            ),
+            None => encode_ungraphed(
+                list,
+                repetitions,
+                &segments,
+                &encoded,
+                &mut submissions,
+                || DirectBatch::new(device),
+                QueueSubmission::Measured,
+            ),
+        };
         if let Err(error) = issued {
             return Err(submissions.failed(error));
         }
@@ -794,11 +769,62 @@ pub(crate) struct VulkanSubmission {
     feedback: Mutex<Option<Feedback>>,
 }
 
+/// Encode an ungraphed list (timed or plain measured) into one or more queue
+/// submissions split at timeline boundaries.
+fn encode_ungraphed<T: Timing>(
+    list: &impl DispatchList,
+    repetitions: usize,
+    segments: &[(Range<usize>, usize)],
+    encoded: &[Vec<bool>],
+    submissions: &mut Issuing,
+    mut new_batch: impl FnMut() -> Result<DirectBatch<T>, ExecutionError>,
+    wrap: impl Fn(DirectSubmission<T>) -> QueueSubmission,
+) -> Result<(), CallError> {
+    let mut batch = new_batch().map_err(CallError::Execution)?;
+    for _ in 0..repetitions {
+        for (calls, boundary) in segments {
+            each_launch(list, calls.clone(), encoded, |launch| match launch {
+                Some(launch) => batch.launch(launch),
+                None => {
+                    batch.skip();
+                    Ok(())
+                }
+            })?;
+            for stamp in list.stamps(*boundary) {
+                batch.stamp(vulkan_stamps(stamp), stamp.mark);
+            }
+            let operations = list.timelines(*boundary);
+            if operations.is_empty() {
+                continue;
+            }
+            for operation in operations {
+                if operation.action == TimelineAction::Signal {
+                    batch.signal_timeline(&vulkan_timeline(operation).reached, operation.value);
+                }
+            }
+            let next = new_batch().map_err(CallError::Execution)?;
+            submissions.push(wrap(
+                std::mem::replace(&mut batch, next)
+                    .commit()
+                    .map_err(CallError::Execution)?,
+            ));
+            for operation in operations {
+                if operation.action == TimelineAction::Wait {
+                    batch.wait_timeline(&vulkan_timeline(operation).gate, operation.value);
+                }
+            }
+        }
+    }
+    submissions.push(wrap(batch.commit().map_err(CallError::Execution)?));
+    Ok(())
+}
+
 /// One queue submission of a [`VulkanSubmission`]: measured (its device
 /// interval read once it completes: its kinds' costs learned from it, a
-/// trace placed by it) or not.
+/// trace placed by it), timed (each launch's device interval read too), or not.
 enum QueueSubmission {
     Measured(DirectSubmission<Measured>),
+    Timed(DirectSubmission<Timed>),
     Unmeasured(DirectSubmission<Unmeasured>),
 }
 
@@ -806,6 +832,7 @@ impl QueueSubmission {
     fn completed(&self) -> Result<bool, ExecutionError> {
         match self {
             Self::Measured(submission) => submission.completed(),
+            Self::Timed(submission) => submission.completed(),
             Self::Unmeasured(submission) => submission.completed(),
         }
     }
@@ -813,6 +840,7 @@ impl QueueSubmission {
     fn finish(&self) -> Result<(), ExecutionError> {
         match self {
             Self::Measured(submission) => submission.finish(),
+            Self::Timed(submission) => submission.finish(),
             Self::Unmeasured(submission) => submission.finish(),
         }
     }
@@ -820,6 +848,7 @@ impl QueueSubmission {
     fn handed(&self) -> Option<(std::time::Instant, std::time::Instant)> {
         match self {
             Self::Measured(submission) => submission.handed(),
+            Self::Timed(submission) => submission.handed(),
             Self::Unmeasured(submission) => submission.handed(),
         }
     }
@@ -827,15 +856,38 @@ impl QueueSubmission {
     fn opened(&self) -> Option<(std::time::Instant, seismic_native_target::GateOpening)> {
         match self {
             Self::Measured(submission) => submission.opened(),
+            Self::Timed(submission) => submission.opened(),
             Self::Unmeasured(submission) => submission.opened(),
         }
     }
 
-    /// The measured submission, or the error a reading of an unmeasured
-    /// one's device time is: an observed run measures every one.
-    fn measured(&self) -> Result<&DirectSubmission<Measured>, ExecutionError> {
+    fn device_seconds(&self) -> Result<f64, ExecutionError> {
         match self {
-            Self::Measured(submission) => Ok(submission),
+            Self::Measured(submission) => submission.device_seconds(),
+            Self::Timed(submission) => submission.device_seconds(),
+            Self::Unmeasured(_) => Err(ExecutionError::SubmissionFailed(
+                "an unobserved Vulkan submission's device time was read".into(),
+            )),
+        }
+    }
+
+    fn device_interval(&self, anchor: &TimelineAnchor) -> Result<(f64, f64), ExecutionError> {
+        match self {
+            Self::Measured(submission) => submission.device_interval(anchor),
+            Self::Timed(submission) => submission.device_interval(anchor),
+            Self::Unmeasured(_) => Err(ExecutionError::SubmissionFailed(
+                "an unobserved Vulkan submission's device time was read".into(),
+            )),
+        }
+    }
+
+    fn launch_intervals(
+        &self,
+        anchor: &TimelineAnchor,
+    ) -> Result<Option<Vec<Option<(f64, f64)>>>, ExecutionError> {
+        match self {
+            Self::Timed(submission) => submission.launch_intervals(anchor).map(Some),
+            Self::Measured(_) => Ok(None),
             Self::Unmeasured(_) => Err(ExecutionError::SubmissionFailed(
                 "an unobserved Vulkan submission's device time was read".into(),
             )),
@@ -980,7 +1032,7 @@ impl VulkanSubmission {
 
     pub(crate) fn device_seconds(&self) -> Result<f64, ExecutionError> {
         self.submissions.iter().try_fold(0.0, |total, submission| {
-            Ok(total + submission.measured()?.device_seconds()?)
+            Ok(total + submission.device_seconds()?)
         })
     }
 
@@ -988,8 +1040,8 @@ impl VulkanSubmission {
         &self,
         anchor: &TimelineAnchor,
     ) -> Result<(f64, f64), ExecutionError> {
-        let (start, _) = self.submissions[0].measured()?.device_interval(anchor)?;
-        let (_, end) = self.last().measured()?.device_interval(anchor)?;
+        let (start, _) = self.submissions[0].device_interval(anchor)?;
+        let (_, end) = self.last().device_interval(anchor)?;
         Ok((start, end))
     }
 
@@ -1003,7 +1055,7 @@ impl VulkanSubmission {
         self.submissions
             .iter()
             .map(|submission| {
-                let device = submission.measured()?.device_interval(anchor)?;
+                let device = submission.device_interval(anchor)?;
                 let (handed, taken) = submission
                     .handed()
                     .expect("a completed queue submission was handed to the queue");
@@ -1028,7 +1080,7 @@ impl VulkanSubmission {
     ) -> Result<Option<Vec<Option<(f64, f64)>>>, ExecutionError> {
         let mut intervals = Vec::new();
         for submission in &self.submissions {
-            let Some(own) = submission.measured()?.launch_intervals(anchor)? else {
+            let Some(own) = submission.launch_intervals(anchor)? else {
                 return Ok(None);
             };
             intervals.extend(own);

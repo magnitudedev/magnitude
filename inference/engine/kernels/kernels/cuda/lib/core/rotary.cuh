@@ -90,26 +90,67 @@ struct layout {
     // The leading column of pair `p`.
     __device__ static __forceinline__ int leading(int p) { return FIRST + (ADJACENT ? 2 * p : p); }
 
+    // Whether `rotate` needs the caller's per-warp shared-memory `exchange[W]`:
+    // adjacent pairs at even E stay in registers; lane-aligned split-half pairs
+    // and adjacent pairs at E = 1 exchange through warp shuffles.
+    static constexpr bool PURE_REGISTER = P > 0 && ADJACENT && (E % 2 == 0);
+    static constexpr bool WARP_SHUFFLE =
+        P > 0 && !PURE_REGISTER && (!ADJACENT || E == 1) && (P % E == 0) && (FIRST % E == 0);
+    static constexpr bool NEEDS_EXCHANGE = P > 0 && !PURE_REGISTER && !WARP_SHUFFLE;
+
     // Lane `lane`'s columns `x` of the row, its pairs rotated by `t`.
-    // `exchange` is W floats of shared memory private to the warp, through
-    // which each column reads its partner. The whole warp calls it.
-    __device__ static __forceinline__ void rotate(float (&x)[E], const table &t, float *exchange, int lane) {
-        if constexpr (P == 0) return;
-        const int first = lane * E;
+    // `exchange` is W floats of shared memory private to the warp, used only
+    // when `NEEDS_EXCHANGE` is true. The whole warp calls it.
+    __device__ static __forceinline__ void rotate(float (&x)[E], const table &t,
+                                                  [[maybe_unused]] float *exchange, int lane) {
+        if constexpr (P == 0) {
+            return;
+        } else if constexpr (PURE_REGISTER) {
+            const int first = lane * E;
 #pragma unroll
-        for (int i = 0; i < E; ++i) exchange[first + i] = x[i];
-        __syncwarp();
-#pragma unroll
-        for (int i = 0; i < E; ++i) {
-            const int column = first + i;
-            if (rotated(column)) {
-                float cosine, sine;
-                t.turn(pair(column), cosine, sine);
-                const float other = exchange[partner(column)];
-                x[i] = leads(column) ? x[i] * cosine - other * sine : x[i] * cosine + other * sine;
+            for (int i = 0; i < E; i += 2) {
+                const int column = first + i;
+                if (rotated(column)) {
+                    float cosine, sine;
+                    t.turn(pair(column), cosine, sine);
+                    const float a = x[i];
+                    const float b = x[i + 1];
+                    x[i] = a * cosine - b * sine;
+                    x[i + 1] = b * cosine + a * sine;
+                }
             }
+        } else if constexpr (WARP_SHUFFLE) {
+            const int first = lane * E;
+            const bool turned = rotated(first);
+            const bool lead = leads(first);
+            const int peer_lane =
+                turned ? (ADJACENT ? (lane ^ 1) : (lead ? lane + P / E : lane - P / E)) : lane;
+#pragma unroll
+            for (int i = 0; i < E; ++i) {
+                const float other = __shfl_sync(0xffffffffu, x[i], peer_lane);
+                if (turned) {
+                    float cosine, sine;
+                    t.turn(pair(first + i), cosine, sine);
+                    x[i] = lead ? x[i] * cosine - other * sine : x[i] * cosine + other * sine;
+                }
+            }
+        } else {
+            const int first = lane * E;
+#pragma unroll
+            for (int i = 0; i < E; ++i) exchange[first + i] = x[i];
+            __syncwarp();
+#pragma unroll
+            for (int i = 0; i < E; ++i) {
+                const int column = first + i;
+                if (rotated(column)) {
+                    float cosine, sine;
+                    t.turn(pair(column), cosine, sine);
+                    const float other = exchange[partner(column)];
+                    x[i] = leads(column) ? x[i] * cosine - other * sine : x[i] * cosine + other * sine;
+                }
+            }
+            __syncwarp();
         }
-        __syncwarp();
     }
 };
 

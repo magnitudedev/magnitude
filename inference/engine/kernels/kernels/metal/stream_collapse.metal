@@ -24,12 +24,7 @@ kernel void stream_collapse(device const float *hidden [[buffer(SEISMIC_BUFFER_H
         float ones[STREAMS];
         for (uint stream = 0; stream < STREAMS; ++stream)
             ones[stream] = 1.0f;
-        streams::collapse<STREAMS>(streams, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2, ones, out,
+        streams::collapse<STREAMS, true>(streams, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2, ones, out,
             SEISMIC_RESULT_0_STRIDE_1, uint(SEISMIC_DIM_H), thread_index, threads);
-        // Each thread divides the columns it wrote.
-        for (uint column = thread_index; column < uint(SEISMIC_DIM_H); column += threads) {
-            const ulong at = ulong(column) * SEISMIC_RESULT_0_STRIDE_1;
-            out.put(at, out.at(at) / float(STREAMS));
-        }
     }
 }

@@ -146,13 +146,13 @@ projection routed for metal:
     let PACK_BYTES = PADDED * (WIDEST * 2 + WIDEST / 8 * (1 + most(W, form(W, PACK_SUMS))) + 4) + 1024 for grouped
     let EXPANSION_OPERAND = (TALL - INT8 - PACK) * FRAGMENT_BYTES + INT8 * INT8_BYTES + PACK * PACK_BYTES for grouped
     let DOWN_OPERAND = (DOWN_TALL - DOWN_INT8 - DOWN_PACK) * FRAGMENT_BYTES + DOWN_INT8 * INT8_BYTES + DOWN_PACK * PACK_BYTES for grouped
-    let EXPANSION_TABLES = sum(W, FIRST * (INT8 * (N * (WIDTH / 32) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + PACK * (N * (WIDTH / 32) * 4 * (1 + form(W, PACK_SUMS)) + N * 4))) for grouped
-    let DOWN_TABLES = sum(W, (1 - FIRST) * (DOWN_INT8 * (N * (WIDTH / 32) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + DOWN_PACK * (N * (WIDTH / 32) * 4 * (1 + form(W, PACK_SUMS)) + N * 4))) for grouped
+    let EXPANSION_TABLES = sum(W, FIRST * (INT8 * (N * max(WIDTH / 32, 3) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + PACK * (N * (WIDTH / 32) * 4 * (1 + form(W, PACK_SUMS)) + N * 4))) for grouped
+    let DOWN_TABLES = sum(W, (1 - FIRST) * (DOWN_INT8 * (N * max(WIDTH / 32, 3) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + DOWN_PACK * (N * (WIDTH / 32) * 4 * (1 + form(W, PACK_SUMS)) + N * 4))) for grouped
     let USED_EXPERTS = STACKED * min(E, B) + 1 - STACKED for grouped
     let ORDINAL_BYTES = STACKED * ceil_div(B, 4) * 16 for grouped
     params (SIMDGROUPS in [2, 4, 8, 16] default 2 for choice, ROWS in [1, 2, 4] default 1 for choice,
         arithmetic LANES in [32, 16] default 32 for choice, form GATHERED in [0, 1] default 1 for choice,
-        ROWS in [2, 1, 4, 8] default 2 for summed, arithmetic LANES in [16, 32, 8, 4] default 16 for summed,
+        ROWS in [2, 1, 4, 8] default 2 for summed, arithmetic LANES in [8, 16, 32, 4] default 8 for summed,
         form GATHERED in [0, 1] default 1 for summed,
         TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
         form TALL in [0, 1] default (1 - STACKED) for grouped, arithmetic form INT8 in [0, 1] default 0 for grouped,
@@ -161,12 +161,12 @@ projection routed for metal:
     where K + SHARED <= 32 for summed
     where ROWS * ceil_div(SUMMED_PACKETS - (1 - min(1, LANES / 16) + (min(1, LANES / 16) - LANES / 32) * SUMMED_STAGES_16) * (SUMMED_PACKETS - SUMMED_STAGE), LANES) <= 8 for summed
     where (SHARED == 1 or 2 * ceil_div(SUMMED_PACKETS - SUMMED_STAGES_16 * (SUMMED_PACKETS - SUMMED_STAGE), 16) <= 8) for summed
-    where (TALL == 0 or (WIDTH % 64 == 0 and (STACKED == 0 or T % 32 == 0))) for grouped
+    where (TALL == 0 or ((WIDTH % 64 == 0 or INT8 == 1) and (STACKED == 0 or T % 32 == 0))) for grouped
     where (TALL == 0 or WIDTH % 128 == 0 or TALL_K == 64) for grouped
-    where (DOWN_TALL == 0 or (each(W, FIRST == 1 or WIDTH % 64 == 0) and (STACKED == 0 or T % 32 == 0))) for grouped
+    where (DOWN_TALL == 0 or (each(W, FIRST == 1 or WIDTH % 64 == 0 or DOWN_INT8 == 1) and (STACKED == 0 or T % 32 == 0))) for grouped
     where (DOWN_TALL == 0 or each(W, FIRST == 1 or WIDTH % 128 == 0) or DOWN_TALL_K == 64) for grouped
-    where (INT8 == 0 or (TALL == 1 and (STACKED == 1 or SERVED == 2) and WIDTH % 512 == 0 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, INT8) == 1) and sum(W, FIRST * form(W, INT8_INTERLEAVED)) % SERVED == 0)) for grouped
-    where (DOWN_INT8 == 0 or (DOWN_TALL == 1 and each(W, FIRST == 1 or (WIDTH % 512 == 0 and N % 64 == 0 and form(W, INT8) == 1)))) for grouped
+    where (INT8 == 0 or (TALL == 1 and (STACKED == 1 or SERVED == 2) and WIDTH % 32 == 0 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, INT8) == 1) and sum(W, FIRST * form(W, INT8_INTERLEAVED)) % SERVED == 0)) for grouped
+    where (DOWN_INT8 == 0 or (DOWN_TALL == 1 and each(W, FIRST == 1 or (WIDTH % 32 == 0 and N % 64 == 0 and form(W, INT8) == 1)))) for grouped
     where (DOWN_INT8 == 1 or STACKED == 1 or INT8_TILE == 128) for grouped
     where (PACK == 0 or (TALL == 1 and INT8 == 0 and WIDTH % 128 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0)) for grouped
     where (DOWN_PACK == 0 or (DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1)))) for grouped
@@ -276,7 +276,7 @@ projection routed for metal:
         grid (expand_grid)
         threads_per_threadgroup (256, 1, 1)
     launch int8_coefficients for grouped when INT8 == 1 and (STACKED == 1 or M > 64):
-        threadgroups (ceil_div(N * (WIDTH / 256), 1024), BLOCKS, 1)
+        threadgroups (ceil_div(N * ceil_div(WIDTH, 256), 1024), BLOCKS, 1)
         grid (table_grid)
         threads_per_threadgroup (256, 1, 1)
     launch int8 for grouped when STACKED == 0 and INT8 == 1 and M > 64:
@@ -340,7 +340,7 @@ projection routed for metal:
         grid (down_grid)
         threads_per_threadgroup (256, 1, 1)
     launch down_int8_coefficients for grouped when DOWN_INT8 == 1 and (STACKED == 1 or M > 64):
-        threadgroups (ceil_div(WIDTH * (N / 256), 1024), BLOCKS, 1)
+        threadgroups (ceil_div(WIDTH * ceil_div(N, 256), 1024), BLOCKS, 1)
         grid (table_grid)
         threads_per_threadgroup (256, 1, 1)
     launch down_int8 for grouped when STACKED == 0 and DOWN_INT8 == 1 and M > 64:
@@ -1019,7 +1019,7 @@ const GROUP_CHOICES = 8192
 # chunks past the grouped rows exit.
 native routed_group for metal from "metal/routed_group.metal":
     static (E, K)
-    where E <= 1024
+    where E <= device.max_group_threads
     scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4) when M * K > GROUP_CHOICES
     launch routed_group_count when M * K > GROUP_CHOICES:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
@@ -1032,7 +1032,7 @@ native routed_group for metal from "metal/routed_group.metal":
 
 native routed_group for cuda from "cuda/routed_group.cu":
     static (E, K)
-    where E <= 1024
+    where E <= device.max_group_threads
     scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4) when M * K > GROUP_CHOICES
     launch routed_group_count when M * K > GROUP_CHOICES:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
@@ -1048,7 +1048,7 @@ native routed_group for cuda from "cuda/routed_group.cu":
 native routed_group for vulkan from "vulkan/routed_group.comp":
     static (E, K)
     params (PARTS in [1, 2, 4] default 1)
-    where E * PARTS <= 1024
+    where E * PARTS <= device.max_group_threads
     scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4)
     launch routed_group_count:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
@@ -1893,9 +1893,8 @@ native routed_experts_up for cpu from "cpu/routed_experts_up.rs":
         grid (down_grid)
         threads_per_threadgroup (1, 1, 1)
 
-# Prefill output. Metal and Vulkan: a thread owns 8 consecutive columns of a
-# row (one 16-byte gather per choice). CUDA: a thread per column. CPU: a work
-# item per row.
+# Prefill output. Metal, CUDA and Vulkan: a thread owns 8 consecutive columns
+# of a row (one 16-byte gather per choice). CPU: a work item per row.
 native routed_scatter for metal from "metal/routed_scatter.metal":
     launch routed_scatter:
         threadgroups (ceil_div(H, 2048), M, 1)
@@ -1903,7 +1902,7 @@ native routed_scatter for metal from "metal/routed_scatter.metal":
 
 native routed_scatter for cuda from "cuda/routed_scatter.cu":
     launch routed_scatter:
-        threadgroups (ceil_div(H, 256), M, 1)
+        threadgroups (ceil_div(H, 2048), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native routed_scatter for vulkan from "vulkan/routed_scatter.comp":

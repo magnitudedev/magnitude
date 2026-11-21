@@ -308,23 +308,58 @@ template <class A, class B, class Y, bool BIAS, bool RESIDUAL, bool GATE, bool C
 template <class Y, class WN, class BN, bool WEIGHT, bool BIAS>
 __device__ __forceinline__ void norm(const float *row, const element::Out<Y> &out, u64 stride, const u8 *weight, const u8 *bias,
                                      u32 width, bool centered, float epsilon, int activation, float *partials) {
+    constexpr u32 CACHE = 8;
+    float cached[CACHE];
     float mean = 0.0f;
+    float squares = 0.0f;
     if (centered) {
         float sum = 0.0f;
-        for (u32 i = threadIdx.x; i < width; i += blockDim.x)
+#pragma unroll
+        for (u32 slot = 0; slot < CACHE; ++slot) {
+            const u32 i = threadIdx.x + slot * blockDim.x;
+            if (i < width) {
+                const float x = row[i];
+                cached[slot] = x;
+                sum += x;
+            }
+        }
+        for (u32 i = threadIdx.x + CACHE * blockDim.x; i < width; i += blockDim.x)
             sum += row[i];
         mean = row_norm::mean(reduce::group_sum(sum, partials), width);
+#pragma unroll
+        for (u32 slot = 0; slot < CACHE; ++slot) {
+            const u32 i = threadIdx.x + slot * blockDim.x;
+            if (i < width)
+                squares = row_norm::square(cached[slot] - mean, squares);
+        }
+    } else {
+#pragma unroll
+        for (u32 slot = 0; slot < CACHE; ++slot) {
+            const u32 i = threadIdx.x + slot * blockDim.x;
+            if (i < width) {
+                const float x = row[i];
+                cached[slot] = x;
+                squares = row_norm::square(x, squares);
+            }
+        }
     }
-    float squares = 0.0f;
-    for (u32 i = threadIdx.x; i < width; i += blockDim.x)
+    for (u32 i = threadIdx.x + CACHE * blockDim.x; i < width; i += blockDim.x)
         squares = row_norm::square(row[i] - mean, squares);
     const float inverse = row_norm::inverse(reduce::group_sum(squares, partials), width, epsilon);
-    for (u32 i = threadIdx.x; i < width; i += blockDim.x) {
+    const auto publish = [&](u32 i, float x) {
         const float w = WEIGHT ? element::at<WN>(weight, i) : 0.0f;
         const float b = BIAS ? element::at<BN>(bias, i) : 0.0f;
-        const float normalized = row_norm::apply<WEIGHT, BIAS>(row[i] - mean, inverse, w, b);
+        const float normalized = row_norm::apply<WEIGHT, BIAS>(x - mean, inverse, w, b);
         out.put((u64)i * stride, activation != 0 ? activate(activation, normalized) : normalized);
+    };
+#pragma unroll
+    for (u32 slot = 0; slot < CACHE; ++slot) {
+        const u32 i = threadIdx.x + slot * blockDim.x;
+        if (i < width)
+            publish(i, cached[slot]);
     }
+    for (u32 i = threadIdx.x + CACHE * blockDim.x; i < width; i += blockDim.x)
+        publish(i, row[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -356,19 +391,20 @@ __device__ __forceinline__ void prepare_head(const u8 *source, u8 *target, bool 
         const float x = element::at<A>(source, i);
         return normed ? (norm ? x * inverse * norm[i] : x * inverse) : x;
     };
-    for (u32 i = lane; i < W; i += 32) {
-        const float x = value(i);
-        float published = x;
-        if (rotated) {
-            const u32 pair = i % (2 * P);
-            const float frequency = expf(-log_base * float(pair % P) / float(P));
-            const float angle = float(coordinates[pair / P]) * frequency;
+    if (rotated) {
+        for (u32 i = lane; i < 2 * P; i += 32) {
+            const float x = value(i);
+            const float y = value(i + 2 * P);
+            const float frequency = expf(-log_base * float(i % P) / float(P));
+            const float angle = float(coordinates[i / P]) * frequency;
             float s, c;
             sincosf(angle, &s, &c);
-            const float partner = value(i < 2 * P ? i + 2 * P : i - 2 * P);
-            published = i < 2 * P ? x * c - partner * s : x * c + partner * s;
+            element::put<A>(target, i, x * c - y * s);
+            element::put<A>(target, i + 2 * P, y * c + x * s);
         }
-        element::put<A>(target, i, published);
+    } else {
+        for (u32 i = lane; i < W; i += 32)
+            element::put<A>(target, i, value(i));
     }
     for (u32 i = W + lane; i < WP; i += 32)
         element::put<A>(target, i, 0.0f);

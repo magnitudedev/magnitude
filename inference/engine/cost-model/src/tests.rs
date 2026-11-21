@@ -325,7 +325,7 @@ mod front_pass {
         let regime = |routes: &FrontRoutes, plain: f64, deepest: f64, unused: f64| {
             let wasted = (0..8).map(|depth| Some(if depth == 0 { 0. } else { unused * 1e-3 })).collect();
             let needed = crate::NeededByForm::both((0..8).map(|k| crate::Needed::Executed(plain - (plain - deepest) * k as f64 / 7.)).collect());
-            Regime { resident: passes(routes), needed, stand: Some(0.997), accepts: vec![None; 7], stall: None, overhead: None, paths: vec![PathTerm { seconds: 1e-3, wasted: crate::Waste { front: wasted, verify: vec![None; 8] } }] }
+            Regime { resident: passes(routes), needed, stand: Some(0.997), accepts: vec![None; 7], stall: None, overhead: None, paths: vec![PathTerm { seconds: 1e-3, wasted: crate::Waste { front: wasted, verify: vec![None; 8] } }], routes: crate::VerifyRoutes::default() }
         };
         assert_eq!(regime(&code, 245.3, 214.6, 16.).depth(), 0);
         assert_eq!(regime(&code, 245.3, 214.6, 1.6).depth(), 7);

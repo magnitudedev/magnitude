@@ -390,8 +390,11 @@ inline device uchar *block_fragments(device uchar *fragments, uint block, uint t
 inline device int *ordinals(device uchar *tables) {
     return reinterpret_cast<device int *>(tables);
 }
+inline ulong int8_coef_bytes(uint rows, uint columns) {
+    return ulong(rows) * metal::max(columns / 32u, 3u) * 4u;
+}
 inline ulong int8_table_bytes(uint rows, uint columns) {
-    return ulong(rows) * (columns / 32u) * 4u + ulong((rows + 31u) / 32u * 32u) * ((columns + 1023u) / 1024u) * 64u;
+    return int8_coef_bytes(rows, columns) + ulong((rows + 31u) / 32u * 32u) * ((columns + 1023u) / 1024u) * 64u;
 }
 inline ulong packing_table_bytes(uint rows, uint columns, bool sums) {
     return ulong(rows) * (columns / 32u) * (sums ? 8u : 4u) + ulong(rows) * 4u;
@@ -412,7 +415,7 @@ inline projection::int8_scratch int8_forms(device uchar *operand, ulong operand_
     device uchar *block_sums = row_scales + operand_rows * (columns / 32u) * 2u;
     return projection::int8_scratch{operand, reinterpret_cast<device half *>(row_scales),
         reinterpret_cast<device half *>(block_sums), reinterpret_cast<device float *>(table),
-        reinterpret_cast<device half *>(table + ulong(rows) * (columns / 32u) * 4u)};
+        reinterpret_cast<device half *>(table + int8_coef_bytes(rows, columns))};
 }
 template <typename Packing>
 inline Packing packing_table(device uchar *table, uint rows, uint columns, bool sums) {
@@ -489,7 +492,7 @@ inline void form_grids(gemm_form form, uint used, uint tile_rows, uint n, uint w
         return;
     case gemm_form::int8:
         write_grid(own, used * tile_rows, 1);
-        write_grid(tables, (n * (width / 256u) + 1023u) / 1024u, used);
+        write_grid(tables, (n * ((width + 255u) / 256u) + 1023u) / 1024u, used);
         break;
     case gemm_form::pack:
         write_grid(own, used * tile_rows / 4u, 1);

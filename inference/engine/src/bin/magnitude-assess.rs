@@ -299,7 +299,7 @@ fn bounded_job(time: Duration, executor: ExecutorSelector, scope: Job) -> Result
                 recorded = true;
                 eprintln!("magnitude-assess: {:.3} s: {key:?}: {record:?}", started.elapsed().as_secs_f64())
             }
-            Ok(MeasureEvent::Attempting(_)) => {}
+            Ok(MeasureEvent::Attempting(_) | MeasureEvent::Progress(_)) => {}
             // The reader ended: the job reported its outcome, or its stream ended.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break true,

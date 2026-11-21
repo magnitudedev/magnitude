@@ -4,6 +4,17 @@ use magnitude_kernels::{
 };
 use seismic::NativeKernel;
 
+/// The four clustered-readout entries of a draft head reading target history,
+/// present all together when the head uses clustered readout and absent
+/// together otherwise.
+#[derive(Clone, Debug)]
+pub(crate) struct ClusteredReadoutKernels {
+    pub centroids: super::RangedKernels<readout_project_rows::Entry>,
+    pub selection: NativeKernel<draft_top_k::Entry>,
+    pub rows: NativeKernel<cluster_token_rows::Entry>,
+    pub placement: NativeKernel<place_logits_rows::Entry>,
+}
+
 /// The specializations of a draft head reading target history apart from its
 /// decoder blocks: joining the embedding and hidden rows, the projection
 /// into the head's width, its normalized output, its own vocabulary table
@@ -16,9 +27,6 @@ pub struct SharedHeadKernels {
     pub(super) input: Option<super::RangedKernels<project_rows::Entry>>,
     pub(super) features: Option<NativeKernel<readout_features_rows::Entry>>,
     pub(super) projection: Option<super::ProjectionKernels>,
-    pub(super) centroids: Option<super::RangedKernels<readout_project_rows::Entry>>,
-    pub(super) cluster_selection: Option<NativeKernel<draft_top_k::Entry>>,
-    pub(super) cluster_rows: Option<NativeKernel<cluster_token_rows::Entry>>,
-    pub(super) placement: Option<NativeKernel<place_logits_rows::Entry>>,
+    pub(super) clustered: Option<ClusteredReadoutKernels>,
     pub(super) chain: Option<super::RangedKernels<project_rows::Entry>>,
 }

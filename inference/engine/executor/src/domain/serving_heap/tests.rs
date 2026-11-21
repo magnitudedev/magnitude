@@ -395,6 +395,7 @@ fn whole_bank_and_zero_miss_loads_price_verify_passes_and_transition_cleanly() {
     let mut plain_terms = [None; crate::experts::DEPTHS];
     plain_terms[0] = Some(compute(0.032));
     let zero_miss = crate::experts::Measured {
+        layers: 48,
         depth: 0,
         verifying: false,
         terms: plain_terms,

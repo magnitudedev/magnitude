@@ -143,7 +143,7 @@ use promotions::Promotions;
 use requests::Requests;
 use residency::Residency;
 use resize::{Joins, ResizeHandoff};
-use scratch::{Scratch, conveyor_forms};
+use scratch::Scratch;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -787,13 +787,10 @@ impl Watcher {
         // the records reads land into, and the largest expert.
         let in_flight = u64::from(staging) + carrier.records as u64;
         let largest = layers.iter().map(Layer::expert_bytes).max().unwrap_or(0);
-        let form_of = conveyor_forms(
-            pools.len(),
-            &layers
-                .iter()
-                .map(|layer| layer.stored.iter().map(|stored| stored.pool).collect())
-                .collect::<Vec<_>>(),
-        );
+        let layer_pools = layers
+            .iter()
+            .map(|layer| layer.stored.iter().map(|stored| stored.pool).collect())
+            .collect::<Vec<_>>();
         let experts = layers.iter().map(|layer| layer.experts).collect::<Vec<_>>();
         let records = groups.iter().map(|group| group.records).collect::<Vec<_>>();
         let mut directory = Directory::new(
@@ -927,7 +924,7 @@ impl Watcher {
             scratch: Scratch::new(
                 count,
                 flags,
-                Conveyor::new(form_of, &experts, carrier),
+                Conveyor::new(layer_pools, &experts, carrier),
             ),
             promotions: Promotions::new(),
             asked: None,

@@ -23,7 +23,7 @@ pub(crate) mod vision;
 use crate::SublayerTail;
 use crate::error::PlanError;
 use magnitude_family_contracts::{
-    Attention, Block, BranchOutput, Decoder, DenseFfn, ExitNorm, GatedDelta, Head, HeadBlock,
+    Attention, Block, BranchOutput, Decoder, DenseFfn, ExitNorm, Head, HeadBlock,
     ExitSite, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout, HyperConnectionExit,
     HyperConnectionInput, HyperConnectionWeights, InputNorm, LayerNorm, LowRankGatedSite,
     ModelDefinition, Operator, OutputForm, ProposalReadoutPolicy,
@@ -847,7 +847,7 @@ pub(crate) fn resident_dtype(kind: WeightKind, activation: seismic::DType) -> se
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Mixer<'a> {
     Attention(&'a Attention),
-    GatedDelta(&'a GatedDelta),
+    GatedDelta(gated_delta::AdmittedGatedDelta<'a>),
     StateSpace(&'a StateSpace),
     ShortConv(&'a ShortConv),
 }
@@ -1421,8 +1421,7 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
             Mixer::Attention(operator)
         }
         Operator::GatedDelta(operator) => {
-            gated_delta::admit(operator, mixer_input.epsilon())?;
-            Mixer::GatedDelta(operator)
+            Mixer::GatedDelta(gated_delta::admit(operator, mixer_input.epsilon())?)
         }
         Operator::StateSpace(space) => {
             state_space::admit(space)?;

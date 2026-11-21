@@ -222,7 +222,25 @@ mod internals {
         identity: ConstructedCandidateIdentity,
         decisions: Vec<DecisionId>,
         planning: PlanningExpr<BoolExpr>,
-        objective: Option<RationalSymbolAffine>,
+    }
+
+    enum PendingImplementations {
+        Empty,
+        Feasibility(Vec<PendingImplementation>),
+        Objective {
+            scale: u64,
+            items: Vec<(PendingImplementation, RationalSymbolAffine)>,
+        },
+    }
+
+    impl PendingImplementations {
+        fn contains_index(&self, index: u32) -> bool {
+            match self {
+                Self::Empty => false,
+                Self::Feasibility(items) => items.iter().any(|item| item.index == index),
+                Self::Objective { items, .. } => items.iter().any(|(item, _)| item.index == index),
+            }
+        }
     }
 
     struct Implementation {
@@ -259,8 +277,7 @@ mod internals {
         arena: &'a mut ExprArena,
         targets: PartialAssignment,
         bound_targets: HashSet<SymbolId>,
-        implementations: Vec<PendingImplementation>,
-        objective_scale: Option<u64>,
+        implementations: PendingImplementations,
     }
 
     impl<'a> ModelBuilder<'a> {
@@ -269,8 +286,7 @@ mod internals {
                 arena,
                 targets: PartialAssignment::new(),
                 bound_targets: HashSet::new(),
-                implementations: Vec::new(),
-                objective_scale: None,
+                implementations: PendingImplementations::Empty,
             }
         }
 
@@ -295,10 +311,29 @@ mod internals {
             decisions: &[DecisionId],
             planning: PlanningExpr<BoolExpr>,
         ) {
-            self.register_implementation(index, identity, decisions, planning, None)
-                .unwrap_or_else(|error| {
-                    panic!("mixed objective modes in private solver adapter: {error:?}")
-                });
+            if self.implementations.contains_index(index) {
+                panic!("SolverModelBuilder implementation index was registered twice");
+            }
+            match &mut self.implementations {
+                implementations @ PendingImplementations::Empty => {
+                    let pending = validate_pending_implementation(
+                        self.arena, index, identity, decisions, planning,
+                    );
+                    *implementations = PendingImplementations::Feasibility(vec![pending]);
+                }
+                PendingImplementations::Feasibility(items) => {
+                    let pending = validate_pending_implementation(
+                        self.arena, index, identity, decisions, planning,
+                    );
+                    items.push(pending);
+                }
+                PendingImplementations::Objective { .. } => {
+                    panic!(
+                        "mixed objective modes in private solver adapter: {:?}",
+                        UnsupportedObjective::MixedObjectiveModes
+                    );
+                }
+            }
         }
 
         pub(super) fn implementation_with_objective(
@@ -331,91 +366,55 @@ mod internals {
             let planning = PlanningExpr::new(self.arena, planning_node)
                 .expect("objective side conditions use only declared planning symbols");
             let objective = rational_duration_affine(self.arena, objective, &declared)?;
-            let scale = self
-                .objective_scale
-                .map_or(Ok(objective.denominator), |scale| {
-                    checked_lcm(scale, objective.denominator)
-                })?;
-            for implementation in &self.implementations {
-                let Some(existing) = &implementation.objective else {
+            match &mut self.implementations {
+                PendingImplementations::Feasibility(_) => {
                     return Err(UnsupportedObjective::MixedObjectiveModes);
-                };
-                existing.validate_solver_range(scale, self.arena)?;
-            }
-            objective.validate_solver_range(scale, self.arena)?;
-            self.register_implementation(index, identity, decisions, planning, Some(objective))?;
-            self.objective_scale = Some(scale);
-            Ok(())
-        }
-
-        fn register_implementation(
-            &mut self,
-            index: u32,
-            identity: ConstructedCandidateIdentity,
-            decisions: &[DecisionId],
-            planning: PlanningExpr<BoolExpr>,
-            objective: Option<RationalSymbolAffine>,
-        ) -> Result<(), UnsupportedObjective> {
-            if self
-                .implementations
-                .iter()
-                .any(|implementation| implementation.index == index)
-            {
-                panic!("SolverModelBuilder implementation index was registered twice");
-            }
-            if !self.implementations.is_empty()
-                && self.implementations[0].objective.is_some() != objective.is_some()
-            {
-                return Err(UnsupportedObjective::MixedObjectiveModes);
-            }
-            let mut unique = HashSet::new();
-            for decision in decisions {
-                if !unique.insert(*decision) {
-                    panic!("SolverModelBuilder implementation repeats a decision");
                 }
-                self.arena.decision_domain(*decision);
-            }
-            let declared_symbols = unique
-                .iter()
-                .map(|decision| self.arena.decision_symbol(*decision))
-                .collect::<HashSet<_>>();
-            for expression in [AnyExpr::Bool(planning.node())] {
-                for symbol in self.arena.free_symbols(expression) {
-                    match self.arena.symbol_kind(symbol) {
-                        SymbolKind::TargetConstant(_) => {}
-                        SymbolKind::Decision(_) if declared_symbols.contains(&symbol) => {}
-                        SymbolKind::Decision(_) => panic!(
-                            "implementation expression references a decision it did not declare"
-                        ),
-                        SymbolKind::CallDimension(_)
-                        | SymbolKind::CallScalar(_)
-                        | SymbolKind::CallStride(..) => {
-                            panic!("planning expression contains an invocation symbol")
-                        }
-                        SymbolKind::RuntimeValue(_)
-                        | SymbolKind::TemplateDimension(_)
-                        | SymbolKind::LoopBinder(_)
-                        | SymbolKind::ScheduleSlot(_)
-                        | SymbolKind::CheckerVariable(_) => {
-                            panic!("planning expression contains a non-planning symbol")
-                        }
+                implementations @ PendingImplementations::Empty => {
+                    let scale = objective.denominator;
+                    objective.validate_solver_range(scale, self.arena)?;
+                    let pending = validate_pending_implementation(
+                        self.arena, index, identity, decisions, planning,
+                    );
+                    *implementations = PendingImplementations::Objective {
+                        scale,
+                        items: vec![(pending, objective)],
+                    };
+                }
+                PendingImplementations::Objective { scale, items } => {
+                    let next_scale = checked_lcm(*scale, objective.denominator)?;
+                    for (_, existing) in items.iter() {
+                        existing.validate_solver_range(next_scale, self.arena)?;
                     }
+                    objective.validate_solver_range(next_scale, self.arena)?;
+                    if items.iter().any(|(item, _)| item.index == index) {
+                        panic!("SolverModelBuilder implementation index was registered twice");
+                    }
+                    let pending = validate_pending_implementation(
+                        self.arena, index, identity, decisions, planning,
+                    );
+                    *scale = next_scale;
+                    items.push((pending, objective));
                 }
             }
-            self.implementations.push(PendingImplementation {
-                index,
-                identity,
-                decisions: decisions.to_vec(),
-                planning,
-                objective,
-            });
             Ok(())
         }
 
         pub(super) fn build(self) -> Option<Model> {
-            if self.implementations.is_empty() {
-                return None;
-            }
+            let (units, pending_items) = match self.implementations {
+                PendingImplementations::Empty => return None,
+                PendingImplementations::Feasibility(items) => (
+                    "feasibility",
+                    items.into_iter().map(|item| (item, None)).collect::<Vec<_>>(),
+                ),
+                PendingImplementations::Objective { scale, items } => (
+                    "analytical upper duration (exact shared rational scale)",
+                    items
+                        .into_iter()
+                        .map(|(item, objective)| (item, Some((scale, objective))))
+                        .collect::<Vec<_>>(),
+                ),
+            };
             for symbol in self.arena.symbols() {
                 if matches!(
                     self.arena.symbol_kind(symbol),
@@ -426,11 +425,6 @@ mod internals {
                 }
             }
 
-            let units = if self.objective_scale.is_some() {
-                "analytical upper duration (exact shared rational scale)"
-            } else {
-                "feasibility"
-            };
             let mut builder = GenericBuilder::new();
             builder.units(units);
             let mut decision_vars = HashMap::<DecisionId, VarId>::new();
@@ -438,10 +432,9 @@ mod internals {
             let mut decision_bounds = HashMap::<VarId, (i64, i64)>::new();
             let mut ordered_decision_vars = Vec::new();
             let mut implementations = Vec::new();
-            let selection_vars = self
-                .implementations
+            let selection_vars = pending_items
                 .iter()
-                .map(|implementation| {
+                .map(|(implementation, _)| {
                     builder.variable(
                         format!("implementation.{}.selected", implementation.index),
                         Domain::boolean(),
@@ -452,8 +445,7 @@ mod internals {
                 variables: selection_vars.clone(),
             });
 
-            for (pending, selected) in self
-                .implementations
+            for ((pending, objective), selected) in pending_items
                 .into_iter()
                 .zip(selection_vars.iter().copied())
             {
@@ -510,10 +502,7 @@ mod internals {
                         });
                     }
                 }
-                if let Some(objective) = pending.objective {
-                    let scale = self
-                        .objective_scale
-                        .expect("objective-bearing implementations have a shared scale");
+                if let Some((scale, objective)) = objective {
                     let cost = objective
                         .solver_cost(scale, &decision_symbols)
                         .expect("objective range was certified during registration");
@@ -556,6 +545,55 @@ mod internals {
                 assignment_variables,
                 retained_bytes,
             })
+        }
+    }
+
+    fn validate_pending_implementation(
+        arena: &ExprArena,
+        index: u32,
+        identity: ConstructedCandidateIdentity,
+        decisions: &[DecisionId],
+        planning: PlanningExpr<BoolExpr>,
+    ) -> PendingImplementation {
+        let mut unique = HashSet::new();
+        for decision in decisions {
+            if !unique.insert(*decision) {
+                panic!("SolverModelBuilder implementation repeats a decision");
+            }
+            arena.decision_domain(*decision);
+        }
+        let declared_symbols = unique
+            .iter()
+            .map(|decision| arena.decision_symbol(*decision))
+            .collect::<HashSet<_>>();
+        for expression in [AnyExpr::Bool(planning.node())] {
+            for symbol in arena.free_symbols(expression) {
+                match arena.symbol_kind(symbol) {
+                    SymbolKind::TargetConstant(_) => {}
+                    SymbolKind::Decision(_) if declared_symbols.contains(&symbol) => {}
+                    SymbolKind::Decision(_) => panic!(
+                        "implementation expression references a decision it did not declare"
+                    ),
+                    SymbolKind::CallDimension(_)
+                    | SymbolKind::CallScalar(_)
+                    | SymbolKind::CallStride(..) => {
+                        panic!("planning expression contains an invocation symbol")
+                    }
+                    SymbolKind::RuntimeValue(_)
+                    | SymbolKind::TemplateDimension(_)
+                    | SymbolKind::LoopBinder(_)
+                    | SymbolKind::ScheduleSlot(_)
+                    | SymbolKind::CheckerVariable(_) => {
+                        panic!("planning expression contains a non-planning symbol")
+                    }
+                }
+            }
+        }
+        PendingImplementation {
+            index,
+            identity,
+            decisions: decisions.to_vec(),
+            planning,
         }
     }
 

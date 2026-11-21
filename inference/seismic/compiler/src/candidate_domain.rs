@@ -379,7 +379,8 @@ pub struct CandidateDomain<'ctx, B: seismic_native_target::TargetFamily> {
     /// materializations append after it and may be evicted independently.
     materialized: NonEmpty<DomainCandidate<B>>,
     precision: PrecisionPolicy,
-    materializations: HashMap<ConstructionCoordinate, materialization::Progress<B>>,
+    completed: HashMap<ConstructionCoordinate, ConstructionCoordinate>,
+    suspended: HashMap<ConstructionCoordinate, materialization::Suspended<B>>,
 }
 
 impl<'ctx, B: seismic_native_target::TargetFamily> CandidateDomain<'ctx, B> {
@@ -627,7 +628,8 @@ impl<'ctx, B: seismic_native_target::TargetFamily> CandidateDomain<'ctx, B> {
             arena: Arc::new(RwLock::new(parts.arena)),
             materialized: parts.materialized,
             precision: parts.precision,
-            materializations: HashMap::new(),
+            completed: HashMap::new(),
+            suspended: HashMap::new(),
         }
     }
 

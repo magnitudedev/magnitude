@@ -87,12 +87,21 @@ struct DenseHistory {
     __device__ __forceinline__ void append(int destination, int kv_head, const float (&k)[DPL],
                                            const float (&v)[DPL], int lane) const {
         const element::Out<Act> k_row = key_out(destination, kv_head);
-        const element::Out<Act> v_row = value_out(destination, kv_head);
+        const u64 offset = static_cast<u64>(lane) * DPL;
+        auto store = [&](const element::Out<Act> &row, const float (&values)[DPL]) {
+            if constexpr (DPL % 2 == 0) {
+                constexpr u64 align =
+                    (Act::bytes == 4 && DPL % 4 == 0) ? 16u : (DPL % 4 == 0 ? 8u : 2u * Act::bytes);
+                if ((reinterpret_cast<u64>(row.stored()) & (align - 1u)) == 0) {
+                    row.put_span(offset, values);
+                    return;
+                }
+            }
 #pragma unroll
-        for (int d = 0; d < DPL; ++d) {
-            k_row.put(lane * DPL + d, k[d]);
-            if constexpr (!STORED_KEY) v_row.put(lane * DPL + d, v[d]);
-        }
+            for (int d = 0; d < DPL; ++d) row.put(offset + d, values[d]);
+        };
+        store(k_row, k);
+        if constexpr (!STORED_KEY) store(value_out(destination, kv_head), v);
     }
 };
 
@@ -210,8 +219,32 @@ __device__ __forceinline__ void store_encoding(const LaneEncoding<B> &e, u32 *ro
                                                const element::Out<element::F16> &pairs, int lane) {
     typedef LaneCodes<B> Codes;
     if constexpr (Codes::bits >= 32) {
+        u32 *dst = row + lane * Codes::words;
+        if constexpr (Codes::words % 4 == 0) {
+            if ((reinterpret_cast<u64>(dst) & 15u) == 0) {
 #pragma unroll
-        for (int j = 0; j < Codes::words; ++j) row[lane * Codes::words + j] = e.codes[j];
+                for (int j = 0; j < Codes::words; j += 4) {
+                    *reinterpret_cast<uint4 *>(dst + j) =
+                        make_uint4(e.codes[j], e.codes[j + 1], e.codes[j + 2], e.codes[j + 3]);
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < Codes::words; ++j) dst[j] = e.codes[j];
+            }
+        } else if constexpr (Codes::words % 2 == 0) {
+            if ((reinterpret_cast<u64>(dst) & 7u) == 0) {
+#pragma unroll
+                for (int j = 0; j < Codes::words; j += 2) {
+                    *reinterpret_cast<uint2 *>(dst + j) = make_uint2(e.codes[j], e.codes[j + 1]);
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < Codes::words; ++j) dst[j] = e.codes[j];
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < Codes::words; ++j) dst[j] = e.codes[j];
+        }
     } else {
         // 32 / bits neighbouring lanes share a word: join their parts.
         constexpr int sharing = 32 / Codes::bits;

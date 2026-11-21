@@ -65,6 +65,14 @@ pub struct Short {
     pub over: u64,
 }
 
+impl Short {
+    /// Bytes of `required` available in `store`: zero when the store is
+    /// already at or past its budget or boundary cap (`over >= required`).
+    pub fn available(&self) -> u64 {
+        self.required.saturating_sub(self.over)
+    }
+}
+
 /// A need refused: committed memory it may not preempt, with the need,
 /// exceeds the budget by `bytes`. Cache never refuses a claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,7 +181,7 @@ impl State {
     /// first, as it yields to a claim ([`Self::give`]): the bank owes it.
     /// What others' movement took of the room is no part of it.
     pub(super) fn keep_guarantee(&mut self, holding: Holding, took: u64, of: impl Fn(CacheKind) -> bool) {
-        let Some(at) = self.read else {
+        let Some(folded) = self.folded else {
             return;
         };
         // A pool's entry grows by block slack, its own spare granules: no
@@ -181,7 +189,7 @@ impl State {
         if matches!(holding, Holding::Pool(_)) {
             return;
         }
-        let lacks = self.estimate_at(at).over_guarantee().min(took).min(self.cache);
+        let lacks = self.estimate_at(folded.read).over_guarantee().min(took).min(self.cache);
         if lacks > 0 {
             self.give(lacks, of, Some(holding));
         }
@@ -397,7 +405,7 @@ impl State {
             return ReclaimStep::Done(Ok(self.insert(holding, policy.bytes)));
         }
         let alloc_needed = match holding {
-            Holding::Committed(CommittedKind::Backing(class)) => match self.pools[class.index()].as_ref() {
+            Holding::Committed(CommittedKind::Backing(class)) => match self.pool(class) {
                 Some(pool) => external.div_ceil(pool.block.get()).saturating_mul(pool.block.get()),
                 None => external,
             },
@@ -480,7 +488,7 @@ impl Ledger {
     /// the pool's lifetime and stored as [`Reclaim::Backed`].
     pub(super) fn register_pool_reclaimer(&self, class: PoolClass, reclaimer: Arc<dyn CacheReclaimer>) {
         let mut state = self.state();
-        if let Some(pool) = state.pools[class.index()].as_mut() {
+        if let Some(pool) = state.pool_mut(class) {
             let entry = pool.entry;
             let weak = Arc::downgrade(&reclaimer);
             pool.reclaimer = Some(reclaimer);

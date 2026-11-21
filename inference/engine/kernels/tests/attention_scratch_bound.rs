@@ -98,7 +98,9 @@ fn metal_attention_scratch_bounds_at_deepseek_v41_take_a_moment() {
                 name => statics.static_value(name).or(Some(4096)),
             };
             let started = Instant::now();
-            let bound = native.scratch_bound(&dimension);
+            let bound = native
+                .at_device(&seismic::device::BackendFloor(native.backend))
+                .scratch_bound(&dimension);
             let elapsed = started.elapsed();
             eprintln!("`{}` at M = {rows}: {bound:?} in {elapsed:?}", entry.name);
             bound.unwrap_or_else(|error| panic!("`{}` at M = {rows}: {error}", entry.name));

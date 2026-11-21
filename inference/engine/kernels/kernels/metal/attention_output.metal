@@ -88,19 +88,19 @@ kernel void attention_output_stage(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_output_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(ONE, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_PAIR
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_output_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_ROWS
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_output_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
 }

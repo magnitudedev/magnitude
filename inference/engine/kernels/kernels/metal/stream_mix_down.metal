@@ -81,18 +81,7 @@ typedef projection::operands<NVFP4> Operands;
             SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, sg * 32 + lane, simdgroups * 32); \
     }                                                                                   \
     const auto rows_var = projection::shared_norm(stream, squares)
-
-// The batched rows: every stream's square sums over the threadgroup, the
-// norm applied as they stage; the first threadgroup publishes the inverses.
-#define PROJECTION_GEMV_INPUT(rows_var)                                                 \
-    PROJECTION_SQUARES_SHARED(squares, SEISMIC_DIM_S * decltype(raw)::parts);           \
-    projection::threadgroup_squares_runtime(raw, m, squares, simdgroups, sg, lane);     \
-    if (position.x == 0) {                                                              \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                                \
-        projection::publish_inverses(raw, m, squares, inverse, SEISMIC_RESULT_2_STRIDE_0, \
-            SEISMIC_RESULT_2_STRIDE_1, sg * 32 + lane, simdgroups * 32);                \
-    }                                                                                   \
-    const auto rows_var = projection::shared_norm(raw, squares)
+#define PROJECTION_GEMV_INPUT(rows_var)
 #define PROJECTION_FRAGMENTS normalized
 #define PROJECTION_ZEROED(s) false
 #define PROJECTION_BOUNDED 0u
@@ -136,7 +125,7 @@ kernel void stream_mix_down_stage_tall(PROJECTION_ARGUMENTS,
 // The `dense` projection's launches (`lib/projection/operator.h`); every
 // GEMV row class is the parts GEMV.
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void stream_mix_down_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_PARTS_GEMV;
 }
@@ -144,7 +133,7 @@ kernel void stream_mix_down_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS)
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_BATCH
 template <uint MATRIX, uint BATCH_ROWS, uint BATCH_PARTS>
 kernel void stream_mix_down_batch(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
-    PROJECTION_SEGMENTED_BATCH;
+    PROJECTION_SEGMENTED_PARTS_BATCH;
 }
 #endif
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMM_SMALL
@@ -165,13 +154,13 @@ kernel void stream_mix_down_tall(PROJECTION_ARGUMENTS, PROJECTION_TILE_ARGUMENTS
 }
 #endif
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV_ROWS
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void stream_mix_down_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_PARTS_GEMV;
 }
 #endif
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV_PAIR
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void stream_mix_down_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_PARTS_GEMV;
 }

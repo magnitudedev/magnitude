@@ -126,8 +126,8 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
     (
         "lib/projection/join",
-        &[BackendName::Cuda, BackendName::Vulkan],
-        "the residual and stream joins are separate from the projection header (CUDA's requires an activation element; Vulkan's binds weight packets), so `stream_join` (which binds neither) joins through the same code; Metal keeps them in `projection.h`",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "the residual and stream joins are separate from the projection header (Metal's compiles the full projection library; CUDA's requires an activation element; Vulkan's binds weight packets), so `stream_join` (which binds none of them) joins through the same code",
     ),
     (
         "lib/attention/decode_merge",
@@ -187,7 +187,7 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     (
         "lib/indexer/indexer",
         &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
-        "the general indexer's lane helpers (Metal: the simdgroup head preparation and threadgroup scan; CUDA and Vulkan: the span walk, the head norm, rotation and scans in `head`, `rotary` and `reduce`), shared by `indexer_keys`, `indexer_score`, `rows_topk`, `candidate_rows` and `pool_rows`; the CPU's are `lib/core/spans`",
+        "the general indexer's span walk (`span_length`, `span_row`, Metal's `simd_span_row`; head norm, rotation and scans live in `head`, `rotary` and `reduce`), shared by `indexer_keys`, `indexer_score`, `rows_topk`, `candidate_rows` and `pool_rows`; the CPU's are `lib/core/spans`",
     ),
     (
         "lib/readout/progressive",

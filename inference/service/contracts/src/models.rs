@@ -30,7 +30,8 @@ pub use schema::{
     HuggingFaceArtifactSelector, HuggingFaceRepositoryId, InstalledCatalogAttribution,
     InstalledModelPackage, InstalledModelPackagesResponse, KernelStatic, KnownUnsupportedReason,
     LabId, LocalModelHash, LocalModelLabel, LocalModelRemoval, LocalModelsConfiguration,
-    LocalModelsResponse, MeasurementState, MemoryAssessment, MemoryBreakdown, MemoryShortage,
+    LocalModelsResponse, MeasurementPhase, MeasurementProgress, MeasurementState, MemoryAssessment,
+    MemoryBreakdown, MemoryShortage,
     ModelAssessment, ModelAssessmentDomainSnapshot, ModelAssessmentEntry,
     ModelAssessmentEntryState, ModelAssessmentId, ModelAssessmentProfile, ModelAssessmentSubject,
     ModelAssessmentsSnapshot, ModelBundleInput, ModelCandidate, ModelCapabilities, ModelDeveloper,
@@ -1905,6 +1906,33 @@ mod schema {
     /// once that model has made room for it. It moves from `Unmeasured` to `Measuring`, then to
     /// `Measured`, or to `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when
     /// a load or a request preempts the job.
+    /// Phase of the one-time hardware benchmark job, advancing monotonically.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub enum MeasurementPhase {
+        /// Baseline GPU/CPU compute, attention, and dispatch probes.
+        Baseline,
+        /// Memory transfer, expert conversion, and SSD read speed probes.
+        MemoryAndStorage,
+        /// Decode token-generation kernel probes.
+        TokenGeneration,
+        /// Prompt-processing kernel probes.
+        PromptProcessing,
+        /// Long-context KV-cache attention probes.
+        LongContextAttention,
+    }
+
+    /// Standing progress reported while the hardware benchmark job runs.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct MeasurementProgress {
+        pub completed: u32,
+        pub total: u32,
+        pub phase: MeasurementPhase,
+    }
+
     #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
@@ -1912,7 +1940,12 @@ mod schema {
         /// Measurements are missing and no job has run yet: it waits for the device to be free.
         Unmeasured,
         /// A job is measuring this machine.
-        Measuring,
+        #[serde(rename_all = "camelCase")]
+        Measuring {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[cfg_attr(feature = "openapi", schema(nullable = false))]
+            progress: Option<MeasurementProgress>,
+        },
         /// Every measurement that estimates read is stored, or recorded as unobtainable on this
         /// machine.
         Measured,

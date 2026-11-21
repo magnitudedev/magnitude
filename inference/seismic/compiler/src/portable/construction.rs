@@ -7,7 +7,7 @@
 use super::*;
 use crate::implementation::{BuilderState, CallConstruction, ConstructionContext, ScheduleBranch};
 
-pub(crate) struct SourceConstruction<B: seismic_native_target::TargetFamily> {
+struct ConstructionState<B: seismic_native_target::TargetFamily> {
     /// Boxed: most of a construction's bytes, which every step that moves
     /// the construction on (`advance`, each a new [`ConstructionStep`])
     /// would otherwise copy through its frame.
@@ -15,8 +15,12 @@ pub(crate) struct SourceConstruction<B: seismic_native_target::TargetFamily> {
     values: SemanticBindings,
     mode: SemanticMode,
     computed_producers: BTreeSet<SemanticValueId>,
-    next: SourceStep<B>,
     regions: Vec<RegionReturn>,
+}
+
+pub(crate) struct SourceConstruction<B: seismic_native_target::TargetFamily> {
+    state: ConstructionState<B>,
+    next: SourceStep<B>,
 }
 
 #[derive(Clone, Copy)]
@@ -40,7 +44,7 @@ impl RegionCursor {
     }
 }
 
-enum SourceStep<B: seismic_native_target::TargetFamily> {
+enum LowerStep<B: seismic_native_target::TargetFamily> {
     Body(RegionCursor),
     Node {
         node: NodeId,
@@ -52,11 +56,20 @@ enum SourceStep<B: seismic_native_target::TargetFamily> {
         progress: SegmentConstruction,
     },
     Publish,
-    Call {
+    CallNext {
         resume: Continuation,
         progress: CallConstruction<B>,
         bounds: Vec<Bound>,
-        child: Option<Box<SourceConstruction<B>>>,
+    },
+}
+
+enum SourceStep<B: seismic_native_target::TargetFamily> {
+    Lower(LowerStep<B>),
+    CallChild {
+        resume: Continuation,
+        progress: CallConstruction<B>,
+        bounds: Vec<Bound>,
+        child: Box<SourceConstruction<B>>,
     },
     Close,
 }
@@ -70,8 +83,8 @@ enum Continuation {
 impl Continuation {
     fn step<B: seismic_native_target::TargetFamily>(self) -> SourceStep<B> {
         match self {
-            Self::Body(cursor) => SourceStep::Body(cursor),
-            Self::SelectedArm => SourceStep::SelectedArm,
+            Self::Body(cursor) => SourceStep::Lower(LowerStep::Body(cursor)),
+            Self::SelectedArm => SourceStep::Lower(LowerStep::SelectedArm),
             Self::Close => SourceStep::Close,
         }
     }
@@ -85,11 +98,11 @@ enum SelectedAction {
 impl SelectedAction {
     fn step<B: seismic_native_target::TargetFamily>(self) -> SourceStep<B> {
         match self {
-            Self::Node(node) => SourceStep::Node {
+            Self::Node(node) => SourceStep::Lower(LowerStep::Node {
                 node,
                 resume: Continuation::SelectedArm,
-            },
-            Self::Publish => SourceStep::Publish,
+            }),
+            Self::Publish => SourceStep::Lower(LowerStep::Publish),
         }
     }
 }
@@ -154,11 +167,11 @@ pub(super) struct SegmentConstruction {
     pub(super) domain: SegmentLaunchDomain,
     pub(super) logical_base: Option<seismic_ir::kernel::dynamic::LogicalIndexBinding>,
     pub(super) completion: SegmentCompletion,
-    pub(super) capacity_pending: Option<capacity::CapacityPending>,
 }
 
 pub(super) enum SegmentStep {
     Pending(SegmentConstruction),
+    Unresolved(SegmentConstruction, capacity::CapacityPending),
     Complete {
         kernel: seismic_ir::kernel::KernelId,
         domain: SegmentLaunchDomain,
@@ -183,7 +196,6 @@ impl SegmentConstruction {
             domain,
             logical_base,
             completion,
-            capacity_pending,
         } = self;
         let program = builder.portable_program_ref();
         let target = builder.portable_target_ref();
@@ -219,13 +231,9 @@ impl SegmentConstruction {
             quantity_bounds: environment.quantity_bounds,
             lexical: environment.lexical,
         };
-        assert!(
-            capacity_pending.is_none(),
-            "unavailable shape construction is not work-budget progress"
-        );
-        let capacity_pending = segment.lower_frame(&mut frames).err();
+        let result = segment.lower_frame(&mut frames);
         let environment = segment.into_environment();
-        SegmentStep::Pending(Self {
+        let next = Self {
             cursor: kernel.suspend(),
             environment,
             branch,
@@ -236,8 +244,11 @@ impl SegmentConstruction {
             domain,
             logical_base,
             completion,
-            capacity_pending,
-        })
+        };
+        match result {
+            Ok(()) => SegmentStep::Pending(next),
+            Err(reason) => SegmentStep::Unresolved(next, reason),
+        }
     }
 }
 
@@ -249,6 +260,25 @@ pub(crate) enum ConstructionStep<B: seismic_native_target::TargetFamily> {
         crate::candidate_domain::ConstructionPending,
     ),
     Complete(ConstructedCandidate<B>),
+}
+
+enum ReadyStep<B: seismic_native_target::TargetFamily> {
+    Pending(SourceConstruction<B>),
+    Unresolved(
+        SourceConstruction<B>,
+        crate::candidate_domain::ConstructionPending,
+    ),
+    Complete(ConstructedCandidate<B>),
+}
+
+impl<B: seismic_native_target::TargetFamily> From<ReadyStep<B>> for ConstructionStep<B> {
+    fn from(step: ReadyStep<B>) -> Self {
+        match step {
+            ReadyStep::Pending(next) => Self::Pending(next),
+            ReadyStep::Unresolved(next, reason) => Self::Unresolved(next, reason),
+            ReadyStep::Complete(candidate) => Self::Complete(candidate),
+        }
+    }
 }
 
 impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
@@ -267,12 +297,14 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
         let (builder, context) = builder.into_parts();
         (
             Self {
-                builder: Box::new(builder),
-                values,
-                mode,
-                computed_producers,
-                next: SourceStep::Body(RegionCursor::begin(root)),
-                regions: Vec::new(),
+                state: ConstructionState {
+                    builder: Box::new(builder),
+                    values,
+                    mode,
+                    computed_producers,
+                    regions: Vec::new(),
+                },
+                next: SourceStep::Lower(LowerStep::Body(RegionCursor::begin(root))),
             },
             context,
         )
@@ -280,20 +312,14 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
 
     fn next_choice(&self) -> Option<crate::candidate_domain::BodyChoice> {
         match &self.next {
-            SourceStep::Call {
-                progress,
-                child: Some(child),
-                ..
+            SourceStep::CallChild {
+                progress, child, ..
             } => {
                 let mut choice = child.next_choice()?;
                 choice.path.0.insert(0, progress.location().clone());
                 Some(choice)
             }
-            SourceStep::Call {
-                progress,
-                child: None,
-                ..
-            } => progress.choice(),
+            SourceStep::Lower(LowerStep::CallNext { progress, .. }) => progress.choice(),
             _ => None,
         }
     }
@@ -302,38 +328,20 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
         &self,
     ) -> Option<seismic_lang::initialization::InitializationFailure> {
         match &self.next {
-            SourceStep::Call {
-                child: Some(child), ..
-            } => child.initialization_pending(),
-            SourceStep::Call {
-                progress,
-                child: None,
-                ..
-            } if progress.choice().is_none() => progress.initialization_pending(),
-            _ => None,
-        }
-    }
-
-    fn capacity_pending(&self) -> Option<capacity::CapacityPending> {
-        match &self.next {
-            SourceStep::Call {
-                child: Some(child), ..
-            } => child.capacity_pending(),
-            SourceStep::Segment { progress, .. } => progress.capacity_pending.clone(),
+            SourceStep::CallChild { child, .. } => child.initialization_pending(),
+            SourceStep::Lower(LowerStep::CallNext { progress, .. })
+                if progress.choice().is_none() =>
+            {
+                progress.initialization_pending()
+            }
             _ => None,
         }
     }
 
     pub(crate) fn select(&mut self, selection: crate::candidate_domain::BodySelection) {
         match &mut self.next {
-            SourceStep::Call {
-                child: Some(child), ..
-            } => child.select(selection),
-            SourceStep::Call {
-                progress,
-                child: None,
-                ..
-            } => progress.select(selection),
+            SourceStep::CallChild { child, .. } => child.select(selection),
+            SourceStep::Lower(LowerStep::CallNext { progress, .. }) => progress.select(selection),
             _ => panic!("construction is not paused at a body choice"),
         }
     }
@@ -348,119 +356,97 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
                 crate::candidate_domain::ConstructionPending::Initialization(reason),
             );
         }
-        if let Some(reason) = self.capacity_pending() {
-            return ConstructionStep::Unresolved(
-                self,
-                crate::candidate_domain::ConstructionPending::Capacity(reason),
-            );
+        self.advance_ready(context).into()
+    }
+
+    fn advance_ready(self, context: &mut ConstructionContext<'_, B>) -> ReadyStep<B> {
+        let Self { state, next } = self;
+        match next {
+            // The parent's physical owner is suspended while its child borrows the
+            // same expression owner. Completing a child consumes it exactly once.
+            SourceStep::CallChild {
+                resume,
+                progress,
+                bounds,
+                child,
+            } => Self::advance_child(state, resume, progress, bounds, child, context),
+            SourceStep::Close => {
+                assert!(
+                    state.regions.is_empty(),
+                    "source closure still has an unfinished region"
+                );
+                let builder = ImplementationBuilder::resume(context, *state.builder);
+                ReadyStep::Complete(builder.close(state.mode))
+            }
+            SourceStep::Lower(step) => Self::lower(state, step, context),
         }
-        // The parent's physical owner is suspended while its child borrows the
-        // same expression owner. Completing a child consumes it exactly once.
-        if let SourceStep::Call { child: Some(_), .. } = self.next {
-            return self.advance_child(context);
-        }
-        self.lower(context)
     }
 
     /// [`Self::advance`] of a construction paused in a call: its child
     /// advances, and the call completes once the child does. Each half of
     /// an advance is a frame of its own, as each holds a resumed builder
     /// and the parts of the construction it rebuilds.
-    fn advance_child(self, context: &mut ConstructionContext<'_, B>) -> ConstructionStep<B> {
-        let Self {
-            builder,
-            values,
-            mode,
-            computed_producers,
-            next,
-            regions,
-        } = self;
-        let SourceStep::Call {
-            resume,
-            mut progress,
-            bounds,
-            child: Some(child),
-        } = next
-        else {
-            unreachable!("only a construction paused in a running call advances its child")
-        };
-        let child = match child.advance(context) {
-            ConstructionStep::Pending(child) => Some(Box::new(child)),
-            ConstructionStep::Unresolved(child, reason) => {
-                return ConstructionStep::Unresolved(
-                    Self {
-                        builder,
-                        values,
-                        mode,
-                        computed_producers,
-                        regions,
-                        next: SourceStep::Call {
-                            resume,
-                            progress,
-                            bounds,
-                            child: Some(Box::new(child)),
-                        },
-                    },
-                    reason,
-                );
-            }
-            ConstructionStep::Choice(..) => {
-                unreachable!(
-                    "parent inspected the unchanged child's pending choice before resuming"
-                )
-            }
-            ConstructionStep::Complete(candidate) => {
-                let mut parent = ImplementationBuilder::resume(context, *builder);
-                parent.complete_call_child(&mut progress, candidate);
-                return ConstructionStep::Pending(Self {
-                    builder: Box::new(parent.suspend()),
-                    values,
-                    mode,
-                    computed_producers,
-                    regions,
-                    next: SourceStep::Call {
+    fn advance_child(
+        mut state: ConstructionState<B>,
+        resume: Continuation,
+        mut progress: CallConstruction<B>,
+        bounds: Vec<Bound>,
+        child: Box<SourceConstruction<B>>,
+        context: &mut ConstructionContext<'_, B>,
+    ) -> ReadyStep<B> {
+        match child.advance_ready(context) {
+            ReadyStep::Pending(child) => ReadyStep::Pending(Self {
+                state,
+                next: SourceStep::CallChild {
+                    resume,
+                    progress,
+                    bounds,
+                    child: Box::new(child),
+                },
+            }),
+            ReadyStep::Unresolved(child, reason) => ReadyStep::Unresolved(
+                Self {
+                    state,
+                    next: SourceStep::CallChild {
                         resume,
                         progress,
                         bounds,
-                        child: None,
+                        child: Box::new(child),
                     },
-                });
+                },
+                reason,
+            ),
+            ReadyStep::Complete(candidate) => {
+                let mut parent = ImplementationBuilder::resume(context, *state.builder);
+                parent.complete_call_child(&mut progress, candidate);
+                state.builder = Box::new(parent.suspend());
+                ReadyStep::Pending(Self {
+                    state,
+                    next: SourceStep::Lower(LowerStep::CallNext {
+                        resume,
+                        progress,
+                        bounds,
+                    }),
+                })
             }
-        };
-        ConstructionStep::Pending(Self {
-            builder,
-            values,
-            mode,
-            computed_producers,
-            regions,
-            next: SourceStep::Call {
-                resume,
-                progress,
-                bounds,
-                child,
-            },
-        })
+        }
     }
 
     /// [`Self::advance`] of a construction at its next step of lowering.
-    fn lower(self, context: &mut ConstructionContext<'_, B>) -> ConstructionStep<B> {
-        let Self {
+    fn lower(
+        state: ConstructionState<B>,
+        step: LowerStep<B>,
+        context: &mut ConstructionContext<'_, B>,
+    ) -> ReadyStep<B> {
+        let ConstructionState {
             builder,
             values,
             mode,
             computed_producers,
-            next,
             mut regions,
-        } = self;
+        } = state;
         let function = context.program().function(builder.function());
         let mut builder = ImplementationBuilder::resume(context, *builder);
-        if let SourceStep::Close = next {
-            assert!(
-                regions.is_empty(),
-                "source closure still has an unfinished region"
-            );
-            return ConstructionStep::Complete(builder.close(mode));
-        }
         let mut lowerer = Lowerer {
             function,
             builder: &mut builder,
@@ -469,13 +455,13 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
             computed_producers,
         };
         let mut unresolved = None;
-        let next = match next {
-            SourceStep::Body(cursor) => {
+        let next = match step {
+            LowerStep::Body(cursor) => {
                 if let Some((node, _)) = function.nodes(cursor.region).nth(cursor.next_node) {
-                    SourceStep::Node {
+                    SourceStep::Lower(LowerStep::Node {
                         node,
                         resume: Continuation::Body(cursor.next()),
-                    }
+                    })
                 } else {
                     match regions.pop() {
                         Some(RegionReturn::Loop { resume, progress }) => {
@@ -486,7 +472,7 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
                             lowerer.next_if(&mut branch);
                             let next = RegionCursor::begin(branch.else_region);
                             regions.push(RegionReturn::Otherwise { resume, branch });
-                            SourceStep::Body(next)
+                            SourceStep::Lower(LowerStep::Body(next))
                         }
                         Some(RegionReturn::Otherwise { resume, branch }) => {
                             lowerer.finish_if(branch);
@@ -495,15 +481,23 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
                         Some(RegionReturn::Selected { .. }) => {
                             unreachable!("a selected action has its own completion step")
                         }
-                        None => SourceStep::Publish,
+                        None => SourceStep::Lower(LowerStep::Publish),
                     }
                 }
             }
-            SourceStep::Node { node, resume } => {
+            LowerStep::Node { node, resume } => {
                 node_step(&mut lowerer, &mut regions, &mut unresolved, node, resume)
             }
-            SourceStep::Segment { resume, progress } => match progress.advance(lowerer.builder) {
-                SegmentStep::Pending(progress) => SourceStep::Segment { resume, progress },
+            LowerStep::Segment { resume, progress } => match progress.advance(lowerer.builder) {
+                SegmentStep::Pending(progress) => {
+                    SourceStep::Lower(LowerStep::Segment { resume, progress })
+                }
+                SegmentStep::Unresolved(progress, reason) => {
+                    unresolved = Some(crate::candidate_domain::ConstructionPending::Capacity(
+                        reason,
+                    ));
+                    SourceStep::Lower(LowerStep::Segment { resume, progress })
+                }
                 SegmentStep::Complete {
                     kernel,
                     domain,
@@ -514,7 +508,7 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
                     resume.step()
                 }
             },
-            SourceStep::SelectedArm => {
+            LowerStep::SelectedArm => {
                 let Some(RegionReturn::Selected {
                     resume,
                     action,
@@ -534,7 +528,7 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
                     resume.step()
                 }
             }
-            SourceStep::Publish => {
+            LowerStep::Publish => {
                 if let Some(selector) = lowerer.publication_selection() {
                     let progress = lowerer.begin_selected_binding(selector);
                     let action = SelectedAction::Publish;
@@ -552,17 +546,16 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
                 } else {
                     lowerer.publish_results();
                     if matches!(regions.last(), Some(RegionReturn::Selected { .. })) {
-                        SourceStep::SelectedArm
+                        SourceStep::Lower(LowerStep::SelectedArm)
                     } else {
                         SourceStep::Close
                     }
                 }
             }
-            SourceStep::Call {
+            LowerStep::CallNext {
                 resume,
                 mut progress,
                 bounds,
-                child: None,
             } => {
                 let child = lowerer.builder.begin_call_child(
                     &mut progress,
@@ -571,18 +564,17 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
                     &lowerer.values.binders,
                 );
                 if let Some(child) = child {
-                    SourceStep::Call {
+                    SourceStep::CallChild {
                         resume,
                         progress,
                         bounds,
-                        child: Some(Box::new(child)),
+                        child: Box::new(child),
                     }
                 } else {
                     lowerer.finish_call(progress, &bounds);
                     resume.step()
                 }
             }
-            _ => unreachable!("running child and close are handled before resuming the parent"),
         };
         let Lowerer {
             values,
@@ -590,16 +582,18 @@ impl<B: seismic_native_target::TargetFamily> SourceConstruction<B> {
             ..
         } = lowerer;
         let next = Self {
-            builder: Box::new(builder.suspend()),
-            values,
-            mode,
-            computed_producers,
+            state: ConstructionState {
+                builder: Box::new(builder.suspend()),
+                values,
+                mode,
+                computed_producers,
+                regions,
+            },
             next,
-            regions,
         };
         match unresolved {
-            Some(reason) => ConstructionStep::Unresolved(next, reason),
-            None => ConstructionStep::Pending(next),
+            Some(reason) => ReadyStep::Unresolved(next, reason),
+            None => ReadyStep::Pending(next),
         }
     }
 }
@@ -630,19 +624,18 @@ fn node_step<B: seismic_native_target::TargetFamily>(
                 representation,
             },
         );
-        SourceStep::Node { node, resume }
+        SourceStep::Lower(LowerStep::Node { node, resume })
     } else {
         let data = function.node(node);
         match data.view() {
             SemanticNodeView::Call { inputs, .. } => {
                 lowerer.snapshot_before_write(node);
                 let (progress, bounds) = lowerer.prepare_call(node, inputs);
-                SourceStep::Call {
+                SourceStep::Lower(LowerStep::CallNext {
                     resume,
                     progress,
                     bounds,
-                    child: None,
-                }
+                })
             }
             SemanticNodeView::Loop {
                 kind: LoopKind::Parallel,
@@ -671,7 +664,7 @@ fn node_step<B: seismic_native_target::TargetFamily>(
                     seismic_ir::schedule::RepeatVisits::Independent,
                 );
                 regions.push(RegionReturn::Loop { resume, progress });
-                SourceStep::Body(RegionCursor::begin(body))
+                SourceStep::Lower(LowerStep::Body(RegionCursor::begin(body)))
             }
             SemanticNodeView::Loop {
                 kind: LoopKind::Parallel,
@@ -688,7 +681,7 @@ fn node_step<B: seismic_native_target::TargetFamily>(
                 }
                 let progress =
                     lowerer.begin_parallel_segment(start, end, captures, body, carries, &[]);
-                SourceStep::Segment { resume, progress }
+                SourceStep::Lower(LowerStep::Segment { resume, progress })
             }
             SemanticNodeView::Loop {
                 start,
@@ -711,7 +704,7 @@ fn node_step<B: seismic_native_target::TargetFamily>(
                     seismic_ir::schedule::RepeatVisits::Ordered,
                 );
                 regions.push(RegionReturn::Loop { resume, progress });
-                SourceStep::Body(RegionCursor::begin(body))
+                SourceStep::Lower(LowerStep::Body(RegionCursor::begin(body)))
             }
             SemanticNodeView::If {
                 condition,
@@ -726,7 +719,7 @@ fn node_step<B: seismic_native_target::TargetFamily>(
                 }
                 let branch = lowerer.begin_if(condition, captures, outputs, then, otherwise);
                 regions.push(RegionReturn::Then { resume, branch });
-                SourceStep::Body(RegionCursor::begin(then))
+                SourceStep::Lower(LowerStep::Body(RegionCursor::begin(then)))
             }
             _ => {
                 lowerer.lower_node_resolved(node);

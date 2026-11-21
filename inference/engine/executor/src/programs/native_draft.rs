@@ -313,10 +313,16 @@ pub(crate) struct DraftGraphEntries<'a, G: GraphDraft + 'a> {
     pub confidence: G::Binding<'a, token_confidence::Entry>,
     /// Widens a device-conditioned entry's target features to F32.
     pub widen: G::Binding<'a, widen_rows::Entry>,
-    pub markov: Option<MarkovEntries<'a, G>>,
     pub convolved: Option<ConvolvedEntries<'a, G>>,
-    pub selector: Option<SelectorEntries<'a, G>>,
-    pub corrector: Option<CorrectorEntries<'a, G>>,
+    pub method: MethodEntries<'a, G>,
+}
+
+/// The method-specific entries of a draft graph.
+pub(crate) enum MethodEntries<'a, G: GraphDraft + 'a> {
+    DFlash,
+    DSpark(MarkovEntries<'a, G>),
+    DFlash2(SelectorEntries<'a, G>),
+    LiLiCorr(CorrectorEntries<'a, G>),
 }
 
 /// A convolved backbone's unfused layer entries.
@@ -401,51 +407,17 @@ pub(crate) struct MarkovEntries<'a, G: GraphDraft + 'a> {
 }
 
 impl<'a> DraftGraphEntries<'a, NativeGraph> {
-    fn prepared(draft: &'a AttestedDraft, landing: Option<&'a AttestedLanding>) -> Self {
-        Self {
-            landing: landing.map(LandingEntries::native),
-            layers: draft
-                .blocks
-                .iter()
-                .map(|block| DraftLayerEntries {
-                    attention: (&block.attention).into(),
-                    injection: (&block.injection).into(),
-                    dense: (&block.dense).into(),
-                })
-                .collect(),
-            embedding: &draft.embedding,
-            head: readout::ProjectionEntries::prepared(&draft.head),
-            shape: &draft.shape,
-            sample: &draft.sample,
-            confidence: &draft.confidence,
-            widen: &draft.widen,
-            markov: draft.markov.as_ref().map(|markov| MarkovEntries {
+    fn prepared(
+        draft: &'a AttestedDraft,
+        landing: Option<&'a AttestedLanding>,
+    ) -> Result<Self, GraphError> {
+        let method = match (&draft.markov, &draft.selector, &draft.corrector) {
+            (None, None, None) => MethodEntries::DFlash,
+            (Some(markov), None, None) => MethodEntries::DSpark(MarkovEntries {
                 embedding: &markov.embedding,
                 projection: &markov.projection,
             }),
-            convolved: draft.convolved.as_ref().map(|convolved| ConvolvedEntries {
-                layers: convolved
-                    .layers
-                    .iter()
-                    .map(|layer| ConvolvedLayerEntries {
-                        attention_norm: &layer.attention_norm,
-                        attention_coefficients: &layer.attention_coefficients,
-                        query: &layer.query,
-                        key: &layer.key,
-                        value: &layer.value,
-                        output: &layer.output,
-                        feed_forward_norm: &layer.feed_forward_norm,
-                        feed_forward_coefficients: &layer.feed_forward_coefficients,
-                        gate: &layer.gate,
-                        up: &layer.up,
-                        down: &layer.down,
-                    })
-                    .collect(),
-                convolve_input: &convolved.convolve_input,
-                convolve_residual: &convolved.convolve_residual,
-                gated: &convolved.gated,
-            }),
-            selector: draft.selector.as_ref().map(|selector| SelectorEntries {
+            (None, Some(selector), None) => MethodEntries::DFlash2(SelectorEntries {
                 features: &selector.features,
                 hidden: &selector.hidden,
                 top_k: &selector.top_k,
@@ -453,7 +425,7 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
                 successor: &selector.successor,
                 path: &selector.path,
             }),
-            corrector: draft.corrector.as_ref().map(|corrector| CorrectorEntries {
+            (None, None, Some(corrector)) => MethodEntries::LiLiCorr(CorrectorEntries {
                 pass_norm: &corrector.pass_norm,
                 anchor_rows: &corrector.anchor_rows,
                 top_k: &corrector.top_k,
@@ -491,7 +463,49 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
                 unit: &corrector.unit,
                 path: &corrector.path,
             }),
-        }
+            _ => return Err("attested draft specifies multiple draft methods".into()),
+        };
+        Ok(Self {
+            landing: landing.map(LandingEntries::native),
+            layers: draft
+                .blocks
+                .iter()
+                .map(|block| DraftLayerEntries {
+                    attention: (&block.attention).into(),
+                    injection: (&block.injection).into(),
+                    dense: (&block.dense).into(),
+                })
+                .collect(),
+            embedding: &draft.embedding,
+            head: readout::ProjectionEntries::prepared(&draft.head),
+            shape: &draft.shape,
+            sample: &draft.sample,
+            confidence: &draft.confidence,
+            widen: &draft.widen,
+            convolved: draft.convolved.as_ref().map(|convolved| ConvolvedEntries {
+                layers: convolved
+                    .layers
+                    .iter()
+                    .map(|layer| ConvolvedLayerEntries {
+                        attention_norm: &layer.attention_norm,
+                        attention_coefficients: &layer.attention_coefficients,
+                        query: &layer.query,
+                        key: &layer.key,
+                        value: &layer.value,
+                        output: &layer.output,
+                        feed_forward_norm: &layer.feed_forward_norm,
+                        feed_forward_coefficients: &layer.feed_forward_coefficients,
+                        gate: &layer.gate,
+                        up: &layer.up,
+                        down: &layer.down,
+                    })
+                    .collect(),
+                convolve_input: &convolved.convolve_input,
+                convolve_residual: &convolved.convolve_residual,
+                gated: &convolved.gated,
+            }),
+            method,
+        })
     }
 }
 
@@ -506,10 +520,16 @@ struct CheckedDraftEntries {
     head: readout::CheckedProjectionEntries,
     selection: Assignments<0>,
     widen: Assignments<1>,
-    markov: Option<CheckedMarkovEntries>,
     convolved: Option<CheckedConvolvedEntries>,
-    selector: Option<CheckedSelectorEntries>,
-    corrector: Option<CheckedCorrectorEntries>,
+    method: CheckedMethodEntries,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum CheckedMethodEntries {
+    DFlash,
+    DSpark(CheckedMarkovEntries),
+    DFlash2(CheckedSelectorEntries),
+    LiLiCorr(CheckedCorrectorEntries),
 }
 
 
@@ -757,6 +777,33 @@ struct CheckedMarkovEntries {
     projection: [(&'static str, Element); 2],
 }
 
+impl CheckedMethodEntries {
+    fn new(plan: &DraftProgramPlan, activation: Element) -> Result<Self, String> {
+        match (plan.markov(), plan.selector(), plan.corrector()) {
+            (None, None, None) => Ok(Self::DFlash),
+            (Some(markov), None, None) => Ok(Self::DSpark(CheckedMarkovEntries {
+                embedding: [("EW", markov.embedding), ("A", activation)],
+                projection: [("DW", markov.projection), ("A", activation)],
+            })),
+            (None, Some(binding), None) => Ok(Self::DFlash2(CheckedSelectorEntries::new(plan, binding))),
+            (None, None, Some(binding)) => Ok(Self::LiLiCorr(CheckedCorrectorEntries::new(plan, binding))),
+            _ => Err("draft program plan specifies multiple draft methods".into()),
+        }
+    }
+
+    fn entries<G: ElementBoundDraft>(&self) -> MethodEntries<'_, G> {
+        match self {
+            Self::DFlash => MethodEntries::DFlash,
+            Self::DSpark(markov) => MethodEntries::DSpark(MarkovEntries {
+                embedding: G::bind(&markov.embedding[..]),
+                projection: G::bind_ranged(&markov.projection[..]),
+            }),
+            Self::DFlash2(selector) => MethodEntries::DFlash2(selector.entries::<G>()),
+            Self::LiLiCorr(corrector) => MethodEntries::LiLiCorr(corrector.entries::<G>()),
+        }
+    }
+}
+
 impl CheckedDraftEntries {
     /// `landing`: of the block's token table, when it has landing slots.
     fn new(plan: &DraftProgramPlan, backend: BackendName, landing: Option<CheckedLandingEntries>) -> Result<Self, String> {
@@ -778,13 +825,8 @@ impl CheckedDraftEntries {
             head: readout::CheckedProjectionEntries::new(plan.projection(), plan.output_norm(), activation, false),
             selection: [],
             widen: [("A", activation)],
-            markov: plan.markov().map(|markov| CheckedMarkovEntries {
-                embedding: [("EW", markov.embedding), ("A", activation)],
-                projection: [("DW", markov.projection), ("A", activation)],
-            }),
             convolved: plan.convolutions().map(|binding| CheckedConvolvedEntries::new(plan, binding)),
-            selector: plan.selector().map(|binding| CheckedSelectorEntries::new(plan, binding)),
-            corrector: plan.corrector().map(|binding| CheckedCorrectorEntries::new(plan, binding)),
+            method: CheckedMethodEntries::new(plan, activation)?,
         })
     }
 
@@ -808,13 +850,8 @@ impl CheckedDraftEntries {
             sample: G::bind(&self.selection[..]),
             confidence: G::bind(&self.selection[..]),
             widen: G::bind(&self.widen[..]),
-            markov: self.markov.as_ref().map(|markov| MarkovEntries {
-                embedding: G::bind(&markov.embedding[..]),
-                projection: G::bind_ranged(&markov.projection[..]),
-            }),
             convolved: self.convolved.as_ref().map(CheckedConvolvedEntries::entries::<G>),
-            selector: self.selector.as_ref().map(CheckedSelectorEntries::entries::<G>),
-            corrector: self.corrector.as_ref().map(CheckedCorrectorEntries::entries::<G>),
+            method: self.method.entries::<G>(),
         })
     }
 }
@@ -1073,9 +1110,6 @@ struct DraftModelTopology {
     mask_rows: u64,
     /// Each layer's dense feed-forward expansion.
     expansions: Vec<operators::routed::ExpansionForm>,
-    /// Whether the method samples its proposals, publishing each one's
-    /// probability (`DraftMethodVariant::samples_proposals`).
-    samples: bool,
     /// The draft's element assignments.
     entries: CheckedDraftEntries,
     token_scope: WeightScope,
@@ -1202,7 +1236,6 @@ impl<'d> DraftSplit<'d> {
             activation: activation(decoder.activation_dtype),
             mask_rows: draft.max_proposals(),
             expansions,
-            samples: draft.method.variant().samples_proposals(),
             entries: CheckedDraftEntries::new(plan, backend, CheckedLandingEntries::of(load, token_table(draft))?)?,
             token_scope: token_table(draft).scope,
             projection: readout::HeadPlans::of(
@@ -1616,27 +1649,12 @@ struct BlockPorts {
     /// (a corrector's) every mask row, slot-major.
     head_rows: NativePort,
     layers: Vec<LayerPorts>,
-    /// One selection for every proposal (DFlash), or one per step (DSpark);
-    /// none when a selector or corrector selects.
-    selections: Vec<SelectionPorts>,
-    /// DSpark and DFlash2: each slot's anchor, the token its first step
-    /// conditions on.
-    anchors: Option<NativePort>,
-    /// A corrector's: each slot's last entry row, whose conditioning row is
-    /// the fused feature that selected its anchor.
-    anchor_rows: Option<NativePort>,
-    /// A corrector's landed read of its candidates' token-table rows, of a
-    /// table with landing slots.
-    landed: Option<LandedReadPorts>,
+    method: MethodPorts,
     /// Weights whose rows are vocabulary entries of the readout (the target's
     /// projection, DSpark's Markov projection), bound to their leading
     /// `readout_vocabulary` rows.
     leading: Vec<(WeightRole, NativePort)>,
     readout_vocabulary: Dim,
-    /// `[proposals · slots]`, step-major: each proposal's probability under
-    /// the logits it was sampled from; absent for a method choosing by path
-    /// scores.
-    confidence: Option<WorkflowTensor>,
 }
 
 /// A head projection's ports over its leading `vocabulary` rows, kept as
@@ -1881,6 +1899,26 @@ fn inject<'a, G: GraphDraft + 'a>(
     Ok((injection, injected.ok_or("a draft has no layers")?))
 }
 
+/// The draft method's numbers paired with its graph entries, validated once
+/// when constructing [`BlockPass`].
+enum BlockMethod<'r, 'a, G: GraphDraft + 'a> {
+    DFlash,
+    DSpark {
+        rank: &'r Dim,
+        entries: &'r MarkovEntries<'a, G>,
+    },
+    DFlash2 {
+        top_k: &'r Dim,
+        rank: &'r Dim,
+        entries: &'r SelectorEntries<'a, G>,
+    },
+    LiLiCorr {
+        topology: &'r CorrectorTopology<RealIndex>,
+        widths: &'r CorrectorNumbers<Dim>,
+        entries: &'r CorrectorEntries<'a, G>,
+    },
+}
+
 /// A drafting class's block pass: what each of its phases reads beside the
 /// graph, its weights and its constants. Its rows, proposals and selections
 /// are counts of the class and the draft's block (its topology's), its
@@ -1890,6 +1928,7 @@ struct BlockPass<'r, 'a, G: GraphDraft + 'a> {
     entries: &'r DraftGraphEntries<'a, G>,
     model: &'r DraftModelTopology,
     numbers: &'r DraftModelNumbers<Dim>,
+    method: BlockMethod<'r, 'a, G>,
     reals: &'r Facts<'r>,
     class: ClassTopology,
     slots: u64,
@@ -1912,7 +1951,7 @@ struct BlockPass<'r, 'a, G: GraphDraft + 'a> {
 
 /// A drafting class's readout: its block's last residual, output-normed and
 /// projected to logits over the readout vocabulary, and where its
-/// selections and their confidences are written.
+/// selections are written.
 struct BlockReadout {
     residual: WorkflowTensor,
     output_norm: WorkflowTensor,
@@ -1922,31 +1961,62 @@ struct BlockReadout {
     logits: WorkflowTensor,
     /// The selections `[proposals · slots, 2]`, step-major.
     result: NativePort,
-    /// `[proposals · slots]`, step-major: each proposal's probability under
-    /// the logits it was sampled from; absent for a method choosing by path
-    /// scores.
-    confidence: Option<WorkflowTensor>,
     /// Weights whose rows are vocabulary entries of the readout, bound to
     /// their leading readout vocabulary rows.
     leading: Vec<(WeightRole, NativePort)>,
 }
 
-impl BlockReadout {
-    /// The proposals' confidences, of a method that samples them.
-    fn sampled(&self) -> Result<&WorkflowTensor, GraphError> {
-        self.confidence
-            .as_ref()
-            .ok_or_else(|| GraphError::from("a sampling draft has no confidences".to_owned()))
-    }
+/// What a drafting class's method selects with: its selections, path inputs,
+/// and proposal confidences, by draft method.
+enum MethodPorts {
+    DFlash {
+        /// One selection for every proposal, step-major.
+        selection: SelectionPorts,
+        /// `[proposals · slots]`, step-major: each proposal's probability under
+        /// the logits it was sampled from.
+        confidence: WorkflowTensor,
+    },
+    DSpark {
+        /// One selection per step.
+        selections: Vec<SelectionPorts>,
+        /// Each slot's anchor, the token its first step conditions on.
+        anchors: NativePort,
+        /// `[proposals · slots]`, step-major: each proposal's probability under
+        /// the Markov-biased logits it was sampled from.
+        confidence: WorkflowTensor,
+    },
+    DFlash2 {
+        /// Each slot's anchor, the token its first step conditions on.
+        anchors: NativePort,
+    },
+    LiLiCorr {
+        /// Each slot's last entry row, whose conditioning row is the fused
+        /// feature that selected its anchor.
+        anchor_rows: NativePort,
+        /// Landed read of candidates' token-table rows, of a table with
+        /// landing slots.
+        landed: Option<LandedReadPorts>,
+    },
 }
 
-/// What a drafting class's method selects with: its selections, and the
-/// ports its path reads.
-struct MethodPorts {
-    selections: Vec<SelectionPorts>,
-    anchors: Option<NativePort>,
-    anchor_rows: Option<NativePort>,
-    landed: Option<LandedReadPorts>,
+impl MethodPorts {
+    /// Each proposal's probability under the logits it was sampled from;
+    /// absent for a method choosing by path scores.
+    fn confidence(&self) -> Option<&WorkflowTensor> {
+        match self {
+            Self::DFlash { confidence, .. } | Self::DSpark { confidence, .. } => Some(confidence),
+            Self::DFlash2 { .. } | Self::LiLiCorr { .. } => None,
+        }
+    }
+
+    /// The landed read ports, when the method reads device-selected rows of a
+    /// table with landing slots.
+    fn landed(&self) -> Option<&LandedReadPorts> {
+        match self {
+            Self::LiLiCorr { landed, .. } => landed.as_ref(),
+            Self::DFlash { .. } | Self::DSpark { .. } | Self::DFlash2 { .. } => None,
+        }
+    }
 }
 
 impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
@@ -1961,22 +2031,33 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         (fusion_norm, conditioning): (&'r WorkflowTensor, &'r WorkflowTensor),
     ) -> Result<Self, GraphError> {
         let class = draft_class.topology;
-        let corrects = match (&numbers.method, &entries.corrector) {
-            (MethodNumbers::LiLiCorr { .. }, Some(_)) => true,
-            (MethodNumbers::LiLiCorr { .. }, None) | (_, Some(_)) => {
-                return Err("draft method and corrector entries disagree".into());
+        let method = match (&numbers.method, &entries.method) {
+            (MethodNumbers::DFlash, MethodEntries::DFlash) => BlockMethod::DFlash,
+            (MethodNumbers::DSpark { rank }, MethodEntries::DSpark(entries)) => {
+                BlockMethod::DSpark { rank, entries }
             }
-            _ => false,
+            (MethodNumbers::DFlash2 { top_k, rank }, MethodEntries::DFlash2(entries)) => {
+                BlockMethod::DFlash2 { top_k, rank, entries }
+            }
+            (MethodNumbers::LiLiCorr { topology, widths }, MethodEntries::LiLiCorr(entries)) => {
+                BlockMethod::LiLiCorr { topology, widths, entries }
+            }
+            _ => return Err("draft method and entries disagree".into()),
         };
         // The selections, step-major; a corrector projects every mask row of
         // every slot (slot-major), the rest each proposing row.
         let slots = draft_class.slots;
         let selected = class.proposals * slots;
+        let outputs = match method {
+            BlockMethod::LiLiCorr { .. } => slots * model.mask_rows,
+            BlockMethod::DFlash | BlockMethod::DSpark { .. } | BlockMethod::DFlash2 { .. } => selected,
+        };
         let scalars = reals.arguments(model.scalars);
         Ok(Self {
             entries,
             model,
             numbers,
+            method,
             reals,
             class,
             slots,
@@ -1988,10 +2069,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
             conditioning,
             rows: slots * class.block_rows,
             selected,
-            outputs: match corrects {
-                true => slots * model.mask_rows,
-                false => selected,
-            },
+            outputs,
         })
     }
 
@@ -2018,7 +2096,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         let method = self.select(graph, (&mut table, &direct), &mut projected, weights, constants)?;
         // A selector's or corrector's proposals are chosen by path scores over
         // a few candidates, which give no probability: they carry none.
-        if let Some(confidence) = &projected.confidence {
+        if let Some(confidence) = method.confidence() {
             graph.export(confidence)?;
         }
         let output = projected.result.tensor().clone();
@@ -2028,13 +2106,9 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                 tokens,
                 head_rows: projected.head_rows,
                 layers,
-                selections: method.selections,
-                anchors: method.anchors,
-                anchor_rows: method.anchor_rows,
-                landed: method.landed,
+                method,
                 leading: projected.leading,
                 readout_vocabulary: self.numbers.vocabulary.clone(),
-                confidence: projected.confidence,
             },
             output,
         ))
@@ -2229,25 +2303,24 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         .logits;
         let result =
             graph.local_for(entries.sample, "result", &[("M", Dim::from(selected)), ("V", vocabulary.clone())])?;
-        // Each proposal's probability under the logits it was sampled from,
-        // step-major beside the selections, of a method that samples them.
-        let confidence = self
-            .model
-            .samples
-            .then(|| {
-                Ok::<_, GraphError>(
-                    graph
-                        .local_for(
-                            entries.confidence,
-                            "confidence",
-                            &[("M", Dim::from(selected)), ("N", Dim::from(outputs)), ("V", vocabulary.clone())],
-                        )?
-                        .tensor()
-                        .clone(),
-                )
-            })
-            .transpose()?;
-        Ok(BlockReadout { residual, output_norm, head_rows, logits, result, confidence, leading })
+        Ok(BlockReadout { residual, output_norm, head_rows, logits, result, leading })
+    }
+
+    /// Each proposal's probability under the logits it was sampled from,
+    /// step-major beside the selections.
+    fn confidence_local(&self, graph: &mut G) -> Result<WorkflowTensor, GraphError> {
+        Ok(graph
+            .local_for(
+                self.entries.confidence,
+                "confidence",
+                &[
+                    ("M", Dim::from(self.selected)),
+                    ("N", Dim::from(self.outputs)),
+                    ("V", self.numbers.vocabulary.clone()),
+                ],
+            )?
+            .tensor()
+            .clone())
     }
 
     /// The selections of the draft's method from `projected`, its tokens'
@@ -2263,22 +2336,20 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         let (entries, numbers, planned) = (self.entries, self.numbers, &self.numbers.weights);
         let (slots, proposals) = (self.slots, self.class.proposals);
         let (hidden, vocabulary) = (&numbers.hidden, &numbers.vocabulary);
-        Ok(match (&numbers.method, &entries.markov) {
-            (MethodNumbers::DFlash, None) => MethodPorts {
-                selections: vec![self.dflash(graph, projected, constants)?],
-                anchors: None,
-                anchor_rows: None,
-                landed: None,
-            },
-            (MethodNumbers::DSpark { rank }, Some(chain)) => {
-                let (selections, anchors) = self.dspark(graph, (chain, rank), (direct, projected), weights, constants)?;
-                MethodPorts { selections, anchors: Some(anchors), anchor_rows: None, landed: None }
+        Ok(match &self.method {
+            BlockMethod::DFlash => {
+                let (selection, confidence) = self.dflash(graph, projected, constants)?;
+                MethodPorts::DFlash { selection, confidence }
             }
-            (MethodNumbers::DFlash2 { top_k, rank }, None) => {
-                let stages = entries.selector.as_ref().ok_or("a DFlash2 draft graph has no selector entries")?;
+            BlockMethod::DSpark { rank, entries: chain } => {
+                let (selections, anchors, confidence) =
+                    self.dspark(graph, (*chain, *rank), (direct, projected), weights, constants)?;
+                MethodPorts::DSpark { selections, anchors, confidence }
+            }
+            BlockMethod::DFlash2 { top_k, rank, entries: stages } => {
                 let anchors = selector_path(
                     graph,
-                    stages,
+                    *stages,
                     planned,
                     weights,
                     constants,
@@ -2295,26 +2366,25 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                         vocabulary,
                         readout_vocabulary: vocabulary,
                         hidden,
-                        rank,
-                        top_k,
+                        rank: *rank,
+                        top_k: *top_k,
                         epsilon: self.epsilon,
                     },
                 )?;
-                MethodPorts { selections: Vec::new(), anchors: Some(anchors), anchor_rows: None, landed: None }
+                MethodPorts::DFlash2 { anchors }
             }
-            (MethodNumbers::LiLiCorr { topology, widths }, None) => {
-                let stages = entries.corrector.as_ref().ok_or("a LiLiCorr draft graph has no corrector entries")?;
+            BlockMethod::LiLiCorr { topology, widths, entries: stages } => {
                 let (anchor_rows, landed) = correct_candidates(
                     graph,
-                    stages,
+                    *stages,
                     entries.embedding,
                     entries.landing,
                     planned,
                     weights,
                     constants,
                     CorrectorPath {
-                        topology: self.reals.arguments(topology.clone()),
-                        widths,
+                        topology: self.reals.arguments((*topology).clone()),
+                        widths: *widths,
                         table,
                         conditioning: self.conditioning,
                         entry_rows: self.entry_rows,
@@ -2334,9 +2404,8 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                         epsilon: self.epsilon,
                     },
                 )?;
-                MethodPorts { selections: Vec::new(), anchors: None, anchor_rows: Some(anchor_rows), landed }
+                MethodPorts::LiLiCorr { anchor_rows, landed }
             }
-            _ => return Err("draft method and entries disagree".into()),
         })
     }
 
@@ -2355,10 +2424,11 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         graph: &mut G,
         projected: &mut BlockReadout,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<SelectionPorts, GraphError> {
+    ) -> Result<(SelectionPorts, WorkflowTensor), GraphError> {
+        let confidence = self.confidence_local(graph)?;
         let (outputs, vocabulary) = (self.outputs, &self.numbers.vocabulary);
         let mut all = projected.result.tensor().slice_leading(0, outputs);
-        let mut all_confidence = projected.sampled()?.slice_leading(0, outputs);
+        let mut all_confidence = confidence.slice_leading(0, outputs);
         let identity = GraphConstant::identity(graph, outputs)?;
         let inputs = readout::selection_inputs(graph, self.entries.sample, &Dim::from(outputs), vocabulary)?;
         let selection = readout::select(
@@ -2375,13 +2445,13 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
             &mut all_confidence,
         )?;
         constants.push(identity);
-        Ok(selection)
+        Ok((selection, confidence))
     }
 
     /// DSpark's selections: each step's from its logits biased by the
     /// Markov memory (`chain`, of `rank` columns) of the token each slot
-    /// follows, its anchor and then its previous selection. Returns them and
-    /// the anchors' input port.
+    /// follows, its anchor and then its previous selection. Returns them,
+    /// the anchors' input port, and the proposals' confidences.
     fn dspark(
         &self,
         graph: &mut G,
@@ -2389,7 +2459,8 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         (direct, projected): (&RowDirectory, &mut BlockReadout),
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<(Vec<SelectionPorts>, NativePort), GraphError> {
+    ) -> Result<(Vec<SelectionPorts>, NativePort, WorkflowTensor), GraphError> {
+        let confidence = self.confidence_local(graph)?;
         let planned = &self.numbers.weights;
         let (slots, proposals, outputs) = (self.slots, self.class.proposals, self.outputs);
         let vocabulary = &self.numbers.vocabulary;
@@ -2461,7 +2532,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                 .value;
             let mut step_result = projected.result.tensor().slice_leading(step * slots, (step + 1) * slots);
             let inputs = readout::selection_inputs(graph, self.entries.sample, &Dim::from(slots), vocabulary)?;
-            let mut step_confidence = projected.sampled()?.slice_leading(step * slots, (step + 1) * slots);
+            let mut step_confidence = confidence.slice_leading(step * slots, (step + 1) * slots);
             // Its proposals' confidence is their probability under the
             // biased logits they are drawn from. DSpark's own confidence
             // head (sigmoid(score) < 0 at the service's fixed threshold)
@@ -2483,7 +2554,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
             constants.push(rows_of_step);
         }
         constants.push(identity);
-        Ok((selections, anchors))
+        Ok((selections, anchors, confidence))
     }
 }
 
@@ -3615,7 +3686,7 @@ impl PreparedDraftGraphs {
             let parts = split
                 .build(
                     target_device.native_graph_with_layout(&layouts[&class]),
-                    DraftGraphEntries::prepared(draft, landing),
+                    DraftGraphEntries::prepared(draft, landing).map_err(class_error)?,
                     &numbers,
                     class,
                 )
@@ -4087,17 +4158,19 @@ impl NativeDraftProgram {
                 }
             };
             let slot_rows = draft.block_rows(steps as u64);
-            let rows = match &ports.anchor_rows {
+            let rows = match &ports.method {
                 // A corrector projects every mask row of every slot,
                 // slot-major.
-                Some(_) => (0..slots as u64)
+                MethodPorts::LiLiCorr { .. } => (0..slots as u64)
                     .flat_map(|slot| {
                         (0..draft.max_proposals())
                             .map(move |mask| slot * slot_rows + draft.proposal_row(mask))
                     })
                     .map(|row| i32::try_from(row).map_err(|_| invalid("draft row exceeds i32")))
                     .collect::<Result<Vec<i32>, SubmitError>>()?,
-                None => (0..steps)
+                MethodPorts::DFlash { .. }
+                | MethodPorts::DSpark { .. }
+                | MethodPorts::DFlash2 { .. } => (0..steps)
                     .flat_map(|step| (0..slots).map(move |slot| (step, slot)))
                     .map(|(step, slot)| {
                         let index = packed(step, slot);
@@ -4116,25 +4189,9 @@ impl NativeDraftProgram {
             active
                 .write_input(&ports.head_rows, &i32_bytes(rows))
                 .map_err(device)?;
-            let words = ports.readout_vocabulary.fixed().div_ceil(32) as usize;
-            match ports.selections.as_slice() {
-                [selection] => {
-                    let order = (0..steps)
-                        .flat_map(|step| (0..slots).map(move |slot| (step, slot)))
-                        .map(|(step, slot)| packed(step, slot))
-                        .collect::<Vec<_>>();
-                    write_selection_rows(block, &mut active, selection, &order, words)?;
-                }
-                per_step => {
-                    for (step, selection) in per_step.iter().enumerate() {
-                        let order = (0..slots)
-                            .map(|slot| packed(step, slot))
-                            .collect::<Vec<_>>();
-                        write_selection_rows(block, &mut active, selection, &order, words)?;
-                    }
-                }
-            }
-            if let Some(anchors) = &ports.anchors {
+            let write_anchors = |active: &mut seismic::NativeGraphFamilyActive<'_>,
+                                 anchors: &NativePort|
+             -> Result<(), SubmitError> {
                 let anchors_of = (0..slots).flat_map(|slot| {
                     let row = slot * draft.block_rows(steps as u64) as usize;
                     [
@@ -4149,23 +4206,45 @@ impl NativeDraftProgram {
                 });
                 active
                     .write_input(anchors, &i32_bytes(anchors_of))
-                    .map_err(device)?;
-            }
-            // Each slot's last entry row, whose conditioning selected its
-            // anchor; padding slots read row 0.
-            if let Some(anchor_rows) = &ports.anchor_rows {
-                let mut last = vec![0_i32; slots];
-                for (row, &slot) in entry.row_slots[..entry.actual_rows].iter().enumerate() {
-                    let slot = usize::try_from(slot)
-                        .map_err(|_| invalid("draft entry row has no slot"))?;
-                    *last
-                        .get_mut(slot)
-                        .ok_or_else(|| invalid("draft entry row's slot exceeds the class"))? =
-                        i32::try_from(row).map_err(|_| invalid("draft entry row exceeds i32"))?;
+                    .map_err(device)
+            };
+            let words = ports.readout_vocabulary.fixed().div_ceil(32) as usize;
+            match &ports.method {
+                MethodPorts::DFlash { selection, .. } => {
+                    let order = (0..steps)
+                        .flat_map(|step| (0..slots).map(move |slot| (step, slot)))
+                        .map(|(step, slot)| packed(step, slot))
+                        .collect::<Vec<_>>();
+                    write_selection_rows(block, &mut active, selection, &order, words)?;
                 }
-                active
-                    .write_input(anchor_rows, &i32_bytes(last))
-                    .map_err(device)?;
+                MethodPorts::DSpark { selections, anchors, .. } => {
+                    for (step, selection) in selections.iter().enumerate() {
+                        let order = (0..slots)
+                            .map(|slot| packed(step, slot))
+                            .collect::<Vec<_>>();
+                        write_selection_rows(block, &mut active, selection, &order, words)?;
+                    }
+                    write_anchors(&mut active, anchors)?;
+                }
+                MethodPorts::DFlash2 { anchors } => {
+                    write_anchors(&mut active, anchors)?;
+                }
+                MethodPorts::LiLiCorr { anchor_rows, .. } => {
+                    // Each slot's last entry row, whose conditioning selected its
+                    // anchor; padding slots read row 0.
+                    let mut last = vec![0_i32; slots];
+                    for (row, &slot) in entry.row_slots[..entry.actual_rows].iter().enumerate() {
+                        let slot = usize::try_from(slot)
+                            .map_err(|_| invalid("draft entry row has no slot"))?;
+                        *last
+                            .get_mut(slot)
+                            .ok_or_else(|| invalid("draft entry row's slot exceeds the class"))? =
+                            i32::try_from(row).map_err(|_| invalid("draft entry row exceeds i32"))?;
+                    }
+                    active
+                        .write_input(anchor_rows, &i32_bytes(last))
+                        .map_err(device)?;
+                }
             }
         }
         // A corrector's candidates are table rows the device selects, a
@@ -4173,7 +4252,7 @@ impl NativeDraftProgram {
         let landed = graph
             .block
             .as_ref()
-            .and_then(|block| block.landed.as_ref())
+            .and_then(|block| block.method.landed())
             .map(|ports| ports.queue(&self.graphs.embedding, &self.unallocating, &mut bindings))
             .transpose()
             .map_err(invalid)?;
@@ -4195,8 +4274,8 @@ impl NativeDraftProgram {
                         .tensor(&graph.output)
                         .ok_or_else(|| invalid("draft graph omitted its selections"))?,
                     confidence: block
-                        .confidence
-                        .as_ref()
+                        .method
+                        .confidence()
                         .map(|confidence| {
                             owner
                                 .tensor(confidence)
@@ -4224,13 +4303,13 @@ fn write_controls(
     active
         .write_input(&ports.coordinates, &controls.coordinates)
         .map_err(device)?;
-    if let Some(visible) = &ports.visible {
+    if let Some(read) = &ports.read {
         active
-            .write_input(visible, &controls.visible)
+            .write_input(&read.visible, &controls.visible)
             .map_err(device)?;
-    }
-    if let Some(fresh) = &ports.fresh {
-        active.write_input(fresh, &controls.fresh).map_err(device)?;
+        active
+            .write_input(&read.fresh, &controls.fresh)
+            .map_err(device)?;
     }
     active
         .write_input(&ports.destinations, &controls.destinations)

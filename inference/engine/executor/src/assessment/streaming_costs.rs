@@ -1548,7 +1548,7 @@ impl CpuForm {
             ("function", u64::from(self.function as u32)),
             ("flight", self.flight),
             ("widest", self.widest),
-            ("threads", seismic::threads::quota().get() as u64),
+            ("threads", topology.host().processors.quota().get() as u64),
         ]);
         configuration.insert(format!("tier_{:?}", seismic::cpu::Tier::detected()), 1);
         // A clamped site's limit as its word; an unclamped site's key is
@@ -1774,6 +1774,14 @@ pub struct MemoryCosts {
 }
 
 impl MemoryCosts {
+    /// The host memory's default reader count on `topology`: the process's
+    /// discovered CPU quota (`topology.host().processors.quota()`), rather
+    /// than live `available_parallelism()` which a serving CPU-site placement
+    /// (`seismic::place_process`) narrows on Linux.
+    pub fn readers(topology: &DeviceTopology) -> u64 {
+        topology.host().processors.quota().get() as u64
+    }
+
     /// The span a sweep reads on `topology`'s host: [`CACHE_MULTIPLE`] times
     /// the largest cache that can serve host memory.
     pub(super) fn span(topology: &DeviceTopology) -> u64 {
@@ -2220,6 +2228,90 @@ mod tests {
         let convert = form.measure_demand(GRANULE).expect("convert demand computes");
         assert!(convert.device >= 2 * GRANULE, "convert demand covers staging and resident tensors");
         assert_eq!(convert.shared, GRANULE, "convert shared metadata rounds to 1 granularity block");
+    }
+
+    /// Host memory reader counts, CPU site record keys, standing requests, and
+    /// host stream readers must all derive from `topology.host().processors`
+    /// rather than live `seismic::threads::quota()`, so narrowing process
+    /// affinity (`seismic::place_process`) after discovery cannot invalidate
+    /// or make unfulfillable stored standing measurements.
+    #[test]
+    fn host_measurement_keys_follow_topology_quota_not_live_affinity() {
+        let live = seismic::threads::quota().get();
+        let quota = live + 7;
+        let mut reports = seismic::fixtures::rtx3090();
+        reports.processors = seismic::Processors::flat(
+            (0..quota).collect(),
+            std::num::NonZeroUsize::new(quota).unwrap(),
+        );
+        let topology = seismic::fixtures::topology(&reports);
+        let cuda = topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() == seismic::BackendName::Cuda)
+            .expect("rtx3090 fixture has a CUDA executor");
+        let expected = quota as u64;
+
+        assert_eq!(MemoryCosts::readers(&topology), expected);
+
+        let standing = super::super::requests::standing(&topology, cuda, &std::env::temp_dir()).unwrap();
+        assert!(
+            standing.contains(&super::super::PointRequest::HostMemory { readers: expected }),
+            "standing requests must key HostMemory by topology quota {expected}: {standing:?}"
+        );
+
+        let store = seismic::measure::HeldStore::default();
+        let span = MemoryCosts::span(&topology);
+        RecordStore::store(
+            &store,
+            &MemoryCosts::key(&topology, expected, span, 0),
+            &Record::Measured(Timing { median: 1e-4, interval: None, samples: 8 }),
+        )
+        .unwrap();
+        RecordStore::store(
+            &store,
+            &MemoryCosts::key(&topology, expected, span, span),
+            &Record::Measured(Timing { median: 5e-3, interval: None, samples: 8 }),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                MemoryCosts::priced(&topology, cuda, MemoryCosts::readers(&topology), &store),
+                super::super::Priced::Measured(_)
+            ),
+            "MemoryCosts::priced must find records stored under topology quota"
+        );
+        assert!(
+            !super::super::PointRequest::HostMemory { readers: expected }.outstanding(&topology, cuda, &store, None),
+            "HostMemory standing request must be satisfied by records stored under topology quota"
+        );
+
+        let form = CpuForm::reference(seismic::BackendName::Cuda).unwrap().unwrap();
+        let cpu_key = form.key(&topology, "workers");
+        assert_eq!(
+            cpu_key.configuration.get("threads").copied(),
+            Some(expected),
+            "CpuForm::key must key threads by topology quota {expected}, not live {live}"
+        );
+        for (term, median) in [("workers", 4.0), ("one", 1e-4), ("handshake", 2e-5), ("row", 1e-5)] {
+            RecordStore::store(
+                &store,
+                &form.key(&topology, term),
+                &Record::Measured(Timing { median, interval: None, samples: 8 }),
+            )
+            .unwrap();
+        }
+        assert!(
+            matches!(CpuCosts::priced(&topology, cuda, &form, &store), super::super::Priced::Measured(_)),
+            "CpuCosts::priced must find records stored under topology quota"
+        );
+
+        #[cfg(feature = "machine-line")]
+        assert_eq!(
+            super::super::line::host_readers(&topology).unwrap(),
+            [expected, 2 * expected],
+            "machine-line host_readers must derive from topology processors"
+        );
     }
 
     }

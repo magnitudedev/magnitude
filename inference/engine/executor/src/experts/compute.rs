@@ -12,9 +12,7 @@
 //!   inside a job's piece.
 //! - **Jobs** ([`Job`]): work the host submits, cut into pieces any worker
 //!   runs, then ended once by the worker that ran its last piece. A file
-//!   miss's landing into the tier is one (`landing::Converting`). A
-//!   submitter a step waits on works its job's pieces beside the workers
-//!   ([`HostCompute::run`]), so no wake stands before its first piece.
+//!   miss's landing into the tier is one (`landing::Converting`).
 //!
 //! The measurement job sizes the workers ([`Machine::sized`]): among the pools
 //! of whole memory nodes (a thread on each performance core of a node with
@@ -461,35 +459,19 @@ impl Compute {
     /// Run `job`'s pieces on the workers, then its end. A job submitted once
     /// the executor stopped never runs.
     pub(in crate::experts) fn submit(&self, job: Arc<dyn Job>) {
-        self.enqueue(job);
-    }
-
-    /// As [`Self::submit`], the calling thread working `job`'s pieces beside
-    /// the workers until each is taken: a step waits on it, and no worker's
-    /// wake stands before its first piece.
-    pub(in crate::experts) fn run(&self, job: Arc<dyn Job>) {
-        if let Some(running) = self.enqueue(job) {
-            while own_piece(&self.inner, &running) && running.next.load(Ordering::Acquire) < running.pieces {}
-        }
-    }
-
-    /// `job` queued for the workers, none where it has no piece or the
-    /// executor stopped.
-    fn enqueue(&self, job: Arc<dyn Job>) -> Option<Arc<Running>> {
         let pieces = job.pieces();
         let running = Arc::new(Running { job, pieces, next: AtomicUsize::new(0), done: AtomicUsize::new(0) });
         if pieces == 0 {
             running.job.end();
-            return None;
+            return;
         }
         let _rest = self.inner.rest.lock().expect("compute rest");
         if self.inner.stop.load(Ordering::Acquire) {
-            return None;
+            return;
         }
-        self.inner.jobs.lock().expect("compute jobs").push_back(running.clone());
+        self.inner.jobs.lock().expect("compute jobs").push_back(running);
         self.inner.queued.fetch_add(1, Ordering::AcqRel);
         self.inner.wake.notify_all();
-        Some(running)
     }
 
     /// Each group's tier records `views` address from now (a shrink's,
@@ -639,21 +621,6 @@ fn piece(inner: &Inner) -> bool {
         (urgent, index)
     };
     work_piece(&running, index);
-    true
-}
-
-/// Run one piece of `running`, its end after its last. True when one was
-/// left.
-fn own_piece(inner: &Inner, running: &Running) -> bool {
-    let index = {
-        // Pieces are taken only under the lock ([`piece`]).
-        let _jobs = inner.jobs.lock().expect("compute jobs");
-        match running.next.load(Ordering::Acquire) < running.pieces {
-            true => running.next.fetch_add(1, Ordering::AcqRel),
-            false => return false,
-        }
-    };
-    work_piece(running, index);
     true
 }
 

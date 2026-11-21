@@ -389,8 +389,9 @@ pub(crate) fn mix_site_hidden() -> u64 {
         seismic::generated::native_implementation_at::<magnitude_kernels::stream_mix_down::Entry>(backend, &elements)
             .expect("the kernels bundle resolves `stream_mix_down`")
             .unwrap_or_else(|| panic!("{backend:?} implements `stream_mix_down`"))
+            .at_device(&seismic::device::BackendFloor(backend))
     });
-    let admits = |implementation: &seismic::NativeImplementation, hidden: u64, injected: bool| {
+    let admits = |implementation: &seismic::OnDevice, hidden: u64, injected: bool| {
         let statics = implementation.statics.iter().fold(NativeSpecialization::new(), |statics, name| {
             let value = match name.as_str() {
                 "H" => hidden,

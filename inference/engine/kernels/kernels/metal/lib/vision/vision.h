@@ -127,23 +127,58 @@ template <uint THREADS, typename Y, typename WN, typename BN, bool WEIGHT, bool 
 inline void norm(device const float *row, element::Out<Y> out, ulong stride, device const uchar *weight,
     device const uchar *bias, uint width, bool centered, float epsilon, int activation,
     threadgroup float *partials, uint thread_index, uint sg, uint lane) {
+    constexpr uint CACHE = 8;
+    float cached[CACHE];
     float mean = 0.0f;
+    float squares = 0.0f;
     if (centered) {
         float sum = 0.0f;
-        for (uint i = thread_index; i < width; i += THREADS)
+        _Pragma("clang loop unroll(full)")
+        for (uint slot = 0; slot < CACHE; ++slot) {
+            const uint i = thread_index + slot * THREADS;
+            if (i < width) {
+                const float x = row[i];
+                cached[slot] = x;
+                sum += x;
+            }
+        }
+        for (uint i = thread_index + CACHE * THREADS; i < width; i += THREADS)
             sum += row[i];
         mean = row_norm::mean(reduce::group_sum<THREADS / 32>(sum, partials, sg, lane), width);
+        _Pragma("clang loop unroll(full)")
+        for (uint slot = 0; slot < CACHE; ++slot) {
+            const uint i = thread_index + slot * THREADS;
+            if (i < width)
+                squares = row_norm::square(cached[slot] - mean, squares);
+        }
+    } else {
+        _Pragma("clang loop unroll(full)")
+        for (uint slot = 0; slot < CACHE; ++slot) {
+            const uint i = thread_index + slot * THREADS;
+            if (i < width) {
+                const float x = row[i];
+                cached[slot] = x;
+                squares = row_norm::square(x, squares);
+            }
+        }
     }
-    float squares = 0.0f;
-    for (uint i = thread_index; i < width; i += THREADS)
+    for (uint i = thread_index + CACHE * THREADS; i < width; i += THREADS)
         squares = row_norm::square(row[i] - mean, squares);
     const float inverse = row_norm::inverse(reduce::group_sum<THREADS / 32>(squares, partials, sg, lane), width, epsilon);
-    for (uint i = thread_index; i < width; i += THREADS) {
+    auto publish = [&](uint i, float x) {
         const float w = WEIGHT ? element::at<WN>(weight, i) : 0.0f;
         const float b = BIAS ? element::at<BN>(bias, i) : 0.0f;
-        const float normalized = row_norm::apply<WEIGHT, BIAS>(row[i] - mean, inverse, w, b);
+        const float normalized = row_norm::apply<WEIGHT, BIAS>(x - mean, inverse, w, b);
         out.put(ulong(i) * stride, activation != 0 ? activate(activation, normalized) : normalized);
+    };
+    _Pragma("clang loop unroll(full)")
+    for (uint slot = 0; slot < CACHE; ++slot) {
+        const uint i = thread_index + slot * THREADS;
+        if (i < width)
+            publish(i, cached[slot]);
     }
+    for (uint i = thread_index + CACHE * THREADS; i < width; i += THREADS)
+        publish(i, row[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -174,18 +209,20 @@ inline void prepare_head(device const typename A::storage *source, device typena
         const float x = A::load(source[i]);
         return normed ? (norm ? x * inverse * norm[i] : x * inverse) : x;
     };
-    for (uint i = lane; i < W; i += 32) {
-        const float x = value(i);
-        float published = x;
-        if (rotated) {
-            const uint pair = i % (2 * P);
-            const float frequency = metal::precise::exp(-log_base * float(pair % P) / float(P));
-            const float angle = float(coordinates[pair / P]) * frequency;
-            const float c = metal::precise::cos(angle), s = metal::precise::sin(angle);
-            const float partner = value(i < 2 * P ? i + 2 * P : i - 2 * P);
-            published = i < 2 * P ? x * c - partner * s : x * c + partner * s;
+    if (rotated) {
+        for (uint i = lane; i < 2 * P; i += 32) {
+            const float x = value(i);
+            const float y = value(i + 2 * P);
+            const float frequency = metal::precise::exp(-log_base * float(i % P) / float(P));
+            const float angle = float(coordinates[i / P]) * frequency;
+            float c;
+            const float s = metal::precise::sincos(angle, c);
+            target[i] = A::store(x * c - y * s);
+            target[i + 2 * P] = A::store(y * c + x * s);
         }
-        target[i] = A::store(published);
+    } else {
+        for (uint i = lane; i < W; i += 32)
+            target[i] = A::store(value(i));
     }
     for (uint i = W + lane; i < WP; i += 32)
         target[i] = A::store(0.0f);

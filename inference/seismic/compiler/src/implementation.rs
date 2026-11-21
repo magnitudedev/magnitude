@@ -479,7 +479,9 @@ pub(crate) fn validate_universal_implementation<B: seismic_native_target::Target
 /// The site an implementation is constructed for.
 #[derive(Clone, Copy)]
 pub(crate) enum CallSite<'a> {
-    Root,
+    Root {
+        schema: &'a CallSchema,
+    },
     Spliced {
         /// The call node in the parent function.
         call: NodeId,
@@ -496,7 +498,7 @@ pub(crate) enum CallSite<'a> {
 impl fmt::Debug for CallSite<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Root => formatter.write_str("Root"),
+            Self::Root { .. } => formatter.write_str("Root"),
             Self::Spliced {
                 call, arguments, ..
             } => formatter
@@ -787,8 +789,9 @@ pub(crate) fn begin_source_construction<'a, B: seismic_native_target::TargetFami
         constants,
         precision,
         candidate.applicability,
-        CallSite::Root,
-        Some(root_schema),
+        CallSite::Root {
+            schema: root_schema,
+        },
     );
     crate::portable::construction::SourceConstruction::begin(builder, mode)
 }
@@ -829,7 +832,6 @@ impl<'a, B: seismic_native_target::TargetFamily> ImplementationBuilder<'a, B> {
         precision: &'a PrecisionPolicy,
         semantic_coverage: TargetPredicate,
         site: CallSite<'_>,
-        root_schema: Option<&CallSchema>,
     ) -> Self {
         Self {
             inner: internals::Builder::new(
@@ -842,7 +844,6 @@ impl<'a, B: seismic_native_target::TargetFamily> ImplementationBuilder<'a, B> {
                 precision,
                 semantic_coverage,
                 site,
-                root_schema,
             ),
         }
     }
@@ -982,7 +983,7 @@ impl<'a, B: seismic_native_target::TargetFamily> ImplementationBuilder<'a, B> {
         self.inner.portable_kernel_with_bindings()
     }
     pub(crate) fn portable_is_root(&self) -> bool {
-        self.inner.state.root
+        self.inner.state.scope.is_root()
     }
 
     /// The checked function reference has the builder's construction
@@ -1194,39 +1195,6 @@ mod internals {
         actual
     }
 
-    /// Private move slot for the open construction. Builder closure consumes
-    /// the IR owner before the remaining compiler metadata has been finalized;
-    /// deref keeps the open-phase implementation uncluttered without exposing
-    /// an optional lifecycle in the public IR API.
-    pub(super) struct OpenConstruction<B: seismic_native_target::TargetFamily>(
-        Option<Construction<B>>,
-    );
-    impl<B: seismic_native_target::TargetFamily> OpenConstruction<B> {
-        fn new(construction: Construction<B>) -> Self {
-            Self(Some(construction))
-        }
-        fn take(&mut self) -> Construction<B> {
-            self.0
-                .take()
-                .expect("builder construction is consumed exactly once at close")
-        }
-    }
-    impl<B: seismic_native_target::TargetFamily> std::ops::Deref for OpenConstruction<B> {
-        type Target = Construction<B>;
-        fn deref(&self) -> &Self::Target {
-            self.0
-                .as_ref()
-                .expect("builder construction is available before close")
-        }
-    }
-    impl<B: seismic_native_target::TargetFamily> std::ops::DerefMut for OpenConstruction<B> {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            self.0
-                .as_mut()
-                .expect("builder construction is available before close")
-        }
-    }
-
     struct CaptureBindings<'a, B: seismic_native_target::TargetFamily> {
         construction: &'a mut Construction<B>,
         arena: &'a mut ExprArena,
@@ -1314,17 +1282,29 @@ mod internals {
         result_slots: HashMap<SemanticValueId, ScalarPublication>,
     }
 
+    pub(super) enum BuilderScope {
+        Root {
+            pending_result_paths: HashMap<SemanticValueId, Vec<(Vec<u32>, Vec<NatExpr>)>>,
+        },
+        Callee,
+    }
+
+    impl BuilderScope {
+        pub(super) fn is_root(&self) -> bool {
+            matches!(self, Self::Root { .. })
+        }
+    }
+
     /// All mutable physical construction state. No borrowed arena, source body
     /// or target context survives when construction is suspended.
     pub(crate) struct BuilderState<B: seismic_native_target::TargetFamily> {
         function: seismic_lang::ids::FunctionId,
-        pub(super) construction: OpenConstruction<B>,
+        pub(super) construction: Construction<B>,
         contract: FunctionContract,
         semantic_coverage: TargetPredicate,
         pub(super) bindings: crate::portable::BindingArena,
-        pub(super) root: bool,
+        pub(super) scope: BuilderScope,
         physical: PhysicalEnvironment,
-        pending_result_paths: HashMap<SemanticValueId, Vec<(Vec<u32>, Vec<NatExpr>)>>,
         pub(super) schedule_region: u32,
         pub(super) choices: Vec<ChoiceDeclaration>,
         pub(super) constraints: Vec<BoolExpr>,
@@ -1397,116 +1377,108 @@ mod internals {
             precision: &'a PrecisionPolicy,
             semantic_coverage: TargetPredicate,
             site: CallSite<'_>,
-            root_schema: Option<&CallSchema>,
         ) -> Self {
             let mut contract = FunctionContract::derive(function);
-            if let Some(schema) = root_schema {
-                assert_eq!(
-                    contract.parameters.len(),
-                    schema.parameters().len(),
-                    "checked root parameter arity"
-                );
-                assert_eq!(
-                    contract.results.len(),
-                    schema.results().len(),
-                    "checked root result arity"
-                );
-                for (result, leaf) in contract.results.iter_mut().zip(schema.results()) {
-                    use seismic_lang::entry::ResultKind;
-                    match (&result.ty, &leaf.kind) {
-                        (
-                            SemanticType::Tensor(tensor),
-                            ResultKind::Tensor {
-                                representation,
-                                axes,
-                            },
-                        ) => {
-                            assert_eq!(tensor.representation, *representation);
-                            assert_eq!(tensor.axes.len(), axes.len());
+            let mut value_views = HashMap::new();
+            let mut scalar_symbols = HashMap::new();
+            let mut bindings = crate::portable::BindingArena::default();
+            let (construction, scope) = match site {
+                CallSite::Root { schema } => {
+                    assert_eq!(
+                        contract.parameters.len(),
+                        schema.parameters().len(),
+                        "checked root parameter arity"
+                    );
+                    assert_eq!(
+                        contract.results.len(),
+                        schema.results().len(),
+                        "checked root result arity"
+                    );
+                    for (result, leaf) in contract.results.iter_mut().zip(schema.results()) {
+                        use seismic_lang::entry::ResultKind;
+                        match (&result.ty, &leaf.kind) {
+                            (
+                                SemanticType::Tensor(tensor),
+                                ResultKind::Tensor {
+                                    representation,
+                                    axes,
+                                },
+                            ) => {
+                                assert_eq!(tensor.representation, *representation);
+                                assert_eq!(tensor.axes.len(), axes.len());
+                            }
+                            (SemanticType::Scalar(expected), ResultKind::Scalar(actual)) => {
+                                assert_eq!(expected, actual)
+                            }
+                            (SemanticType::Index { .. }, ResultKind::Index { .. })
+                            | (SemanticType::Range { .. }, ResultKind::Range { .. }) => {}
+                            _ => panic!("checked body result differs from the entry ABI type"),
                         }
-                        (SemanticType::Scalar(expected), ResultKind::Scalar(actual)) => {
-                            assert_eq!(expected, actual)
+                        match (&mut result.ty, &leaf.kind) {
+                            (SemanticType::Tensor(tensor), ResultKind::Tensor { axes, .. }) => {
+                                tensor.axes.clone_from(axes)
+                            }
+                            (
+                                SemanticType::Index { bound: actual },
+                                ResultKind::Index { bound },
+                            )
+                            | (
+                                SemanticType::Range { bound: actual },
+                                ResultKind::Range { bound },
+                            ) => *actual = *bound,
+                            _ => {}
                         }
-                        (SemanticType::Index { .. }, ResultKind::Index { .. })
-                        | (SemanticType::Range { .. }, ResultKind::Range { .. }) => {}
-                        _ => panic!("checked body result differs from the entry ABI type"),
+                        result.paths = vec![leaf.path.clone()];
                     }
-                    match (&mut result.ty, &leaf.kind) {
-                        (SemanticType::Tensor(tensor), ResultKind::Tensor { axes, .. }) => {
-                            tensor.axes.clone_from(axes)
-                        }
-                        (SemanticType::Index { bound: actual }, ResultKind::Index { bound })
-                        | (SemanticType::Range { bound: actual }, ResultKind::Range { bound }) => {
-                            *actual = *bound
-                        }
-                        _ => {}
-                    }
-                    result.paths = vec![leaf.path.clone()];
-                }
-            }
-            let disjoint = root_schema
-                .map(|schema| {
-                    schema
+                    let disjoint = schema
                         .aliases()
                         .iter()
                         .filter_map(|rule| match rule {
                             AliasRule::Disjoint(a, b) => Some((*a, *b)),
                             AliasRule::MayOverlap(_, _) => None,
                         })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut construction = Construction::new(
-                arena,
-                disjoint,
-                matches!(site, CallSite::Spliced { .. }),
-                target.addressable_resources().len(),
-            );
-            let mut value_views = HashMap::new();
-            let mut scalar_symbols = HashMap::new();
-            let mut pending_result_paths: HashMap<SemanticValueId, Vec<(Vec<u32>, Vec<NatExpr>)>> =
-                HashMap::new();
-            for parameter in &contract.parameters {
-                if matches!(site, CallSite::Spliced { .. }) {
-                    continue;
-                }
-                match &parameter.ty {
-                    SemanticType::Tensor(tensor) => {
-                        let abi = root_schema
-                            .map(|schema| entry_parameter(schema, function, parameter).id);
-                        let kind = GlobalBufferKind::Argument {
-                            value: parameter.value,
-                            abi,
-                        };
-                        let bytes = seismic_ir::storage::tensor_bytes(
-                            arena,
-                            tensor.representation,
-                            &tensor.axes,
-                        );
-                        let allocation = construction.storage_mut().allocate(
-                            kind,
-                            bytes,
-                            seismic_ir::storage::representation_alignment(tensor.representation),
-                        );
-                        let zero = arena.nat(0);
-                        let view = construction.storage_mut().dense_view(
-                            arena,
-                            allocation,
-                            tensor.representation,
-                            zero,
-                            tensor.axes.clone(),
-                        );
-                        let source = construction.view(view, tensor.representation);
-                        let actual = construction.bind_argument_tensor(arena, source);
-                        value_views.insert(parameter.value, actual);
-                    }
-                    SemanticType::Scalar(_) | SemanticType::Index { .. } => {
-                        let symbol = match site {
-                            CallSite::Root => {
-                                let schema =
-                                    root_schema.expect("root builder requires its CallSchema");
+                        .collect();
+                    let mut construction = Construction::new(
+                        arena,
+                        disjoint,
+                        false,
+                        target.addressable_resources().len(),
+                    );
+                    for parameter in &contract.parameters {
+                        match &parameter.ty {
+                            SemanticType::Tensor(tensor) => {
+                                let abi = Some(entry_parameter(schema, function, parameter).id);
+                                let kind = GlobalBufferKind::Argument {
+                                    value: parameter.value,
+                                    abi,
+                                };
+                                let bytes = seismic_ir::storage::tensor_bytes(
+                                    arena,
+                                    tensor.representation,
+                                    &tensor.axes,
+                                );
+                                let allocation = construction.storage_mut().allocate(
+                                    kind,
+                                    bytes,
+                                    seismic_ir::storage::representation_alignment(
+                                        tensor.representation,
+                                    ),
+                                );
+                                let zero = arena.nat(0);
+                                let view = construction.storage_mut().dense_view(
+                                    arena,
+                                    allocation,
+                                    tensor.representation,
+                                    zero,
+                                    tensor.axes.clone(),
+                                );
+                                let source = construction.view(view, tensor.representation);
+                                let actual = construction.bind_argument_tensor(arena, source);
+                                value_views.insert(parameter.value, actual);
+                            }
+                            SemanticType::Scalar(_) | SemanticType::Index { .. } => {
                                 let p = entry_parameter(schema, function, parameter);
-                                match &p.kind {
+                                let symbol = match &p.kind {
                                     ParameterKind::Scalar { symbol, dtype } => {
                                         ScalarBinding::Value {
                                             symbol: *symbol,
@@ -1519,21 +1491,13 @@ mod internals {
                                     _ => panic!(
                                         "scalar semantic parameter has a non-scalar ABI kind"
                                     ),
-                                }
+                                };
+                                scalar_symbols
+                                    .insert(parameter.value, PhysicalBinding::Scalar(symbol));
                             }
-                            CallSite::Spliced { .. } => {
-                                unreachable!("complete call bindings are imported below")
-                            }
-                        };
-                        scalar_symbols.insert(parameter.value, PhysicalBinding::Scalar(symbol));
-                    }
-                    SemanticType::Range { .. } => {
-                        let binding = match site {
-                            CallSite::Root => {
-                                let schema =
-                                    root_schema.expect("root builder requires its CallSchema");
-                                let parameter = entry_parameter(schema, function, parameter);
-                                match &parameter.kind {
+                            SemanticType::Range { .. } => {
+                                let parameter_entry = entry_parameter(schema, function, parameter);
+                                let binding = match &parameter_entry.kind {
                                     ParameterKind::Range { start, end, .. } => {
                                         PhysicalBinding::Range {
                                             start: ScalarBinding::Index(arena.nat_symbol(*start)),
@@ -1543,82 +1507,96 @@ mod internals {
                                     _ => {
                                         panic!("range semantic parameter has a non-range ABI kind")
                                     }
-                                }
+                                };
+                                scalar_symbols.insert(parameter.value, binding);
                             }
-                            CallSite::Spliced { .. } => {
-                                unreachable!("complete call bindings are imported below")
+                            SemanticType::Integer => {
+                                panic!(
+                                    "root parameter ABI does not expose unbounded signed Integer"
+                                )
                             }
-                        };
-                        scalar_symbols.insert(parameter.value, binding);
+                            SemanticType::Tuple(_)
+                            | SemanticType::Opaque { .. }
+                            | SemanticType::Void => {}
+                        }
                     }
-                    SemanticType::Integer => {
-                        panic!("root parameter ABI does not expose unbounded signed Integer")
+                    let mut pending_result_paths: HashMap<
+                        SemanticValueId,
+                        Vec<(Vec<u32>, Vec<NatExpr>)>,
+                    > = HashMap::new();
+                    for result in &contract.results {
+                        if let SemanticType::Tensor(tensor) = &result.ty {
+                            pending_result_paths
+                                .entry(result.value)
+                                .or_default()
+                                .extend(
+                                    result
+                                        .paths
+                                        .iter()
+                                        .cloned()
+                                        .map(|path| (path, tensor.axes.clone())),
+                                );
+                        }
                     }
-                    SemanticType::Tuple(_) | SemanticType::Opaque { .. } | SemanticType::Void => {}
+                    (
+                        construction,
+                        BuilderScope::Root {
+                            pending_result_paths,
+                        },
+                    )
                 }
-            }
-            let mut bindings = crate::portable::BindingArena::default();
-            if let CallSite::Spliced {
-                arguments,
-                bindings: caller,
-                contents,
-                binders,
-                storage,
-                selections,
-                ..
-            } = site
-            {
-                let mut capture = CaptureBindings {
-                    construction: &mut construction,
-                    arena,
-                    storage,
-                    parameter: contract.parameters.first().map(|parameter| parameter.value),
-                    views: HashMap::new(),
-                    slots: HashMap::new(),
-                    quantities: HashMap::new(),
-                };
-                bindings.import_parameters(
-                    caller,
+                CallSite::Spliced {
                     arguments,
-                    selections,
+                    bindings: caller,
                     contents,
                     binders,
-                    &mut capture,
-                );
-                for (parameter, binding) in
-                    contract.parameters.iter().zip(bindings.parameter_handles())
-                {
-                    if let Some(adapter) = bindings.physical_binding(*binding, |view| {
-                        construction.storage().view_layout(view).clone()
-                    }) {
-                        match adapter {
-                            PhysicalBinding::View { view, .. } => {
-                                value_views.insert(parameter.value, view);
-                            }
-                            other => {
-                                scalar_symbols.insert(parameter.value, other);
+                    storage,
+                    selections,
+                    ..
+                } => {
+                    let mut construction = Construction::new(
+                        arena,
+                        Default::default(),
+                        true,
+                        target.addressable_resources().len(),
+                    );
+                    let mut capture = CaptureBindings {
+                        construction: &mut construction,
+                        arena,
+                        storage,
+                        parameter: contract.parameters.first().map(|parameter| parameter.value),
+                        views: HashMap::new(),
+                        slots: HashMap::new(),
+                        quantities: HashMap::new(),
+                    };
+                    bindings.import_parameters(
+                        caller,
+                        arguments,
+                        selections,
+                        contents,
+                        binders,
+                        &mut capture,
+                    );
+                    for (parameter, binding) in
+                        contract.parameters.iter().zip(bindings.parameter_handles())
+                    {
+                        if let Some(adapter) = bindings.physical_binding(*binding, |view| {
+                            construction.storage().view_layout(view).clone()
+                        }) {
+                            match adapter {
+                                PhysicalBinding::View { view, .. } => {
+                                    value_views.insert(parameter.value, view);
+                                }
+                                other => {
+                                    scalar_symbols.insert(parameter.value, other);
+                                }
                             }
                         }
                     }
+                    (construction, BuilderScope::Callee)
                 }
-            }
+            };
             let result_slots = HashMap::new();
-            if matches!(site, CallSite::Root) {
-                for result in &contract.results {
-                    if let SemanticType::Tensor(tensor) = &result.ty {
-                        pending_result_paths
-                            .entry(result.value)
-                            .or_default()
-                            .extend(
-                                result
-                                    .paths
-                                    .iter()
-                                    .cloned()
-                                    .map(|path| (path, tensor.axes.clone())),
-                            );
-                    }
-                }
-            }
             Self {
                 arena,
                 program,
@@ -1629,17 +1607,16 @@ mod internals {
                 precision,
                 state: BuilderState {
                     function: function.id(),
-                    construction: OpenConstruction::new(construction),
+                    construction,
                     contract,
                     semantic_coverage,
                     bindings,
-                    root: matches!(site, CallSite::Root),
+                    scope,
                     physical: PhysicalEnvironment {
                         value_views,
                         scalar_symbols,
                         result_slots,
                     },
-                    pending_result_paths,
                     schedule_region: 0,
                     choices: Vec::new(),
                     constraints: Vec::new(),
@@ -1833,9 +1810,13 @@ mod internals {
             value: SemanticValueId,
             view: AnyBufferView,
         ) {
-            let paths = self
-                .state
-                .pending_result_paths
+            let BuilderScope::Root {
+                pending_result_paths,
+            } = &self.state.scope
+            else {
+                panic!("only a root builder publishes result tensors");
+            };
+            let paths = pending_result_paths
                 .get(&value)
                 .expect("root tensor publication has no declared result path")
                 .clone();
@@ -2057,78 +2038,107 @@ mod internals {
                 .finish_value_repeat(repeat.product, backedge)
         }
         pub(super) fn close(
-            mut self,
+            self,
             closed: ClosedSchedule,
             mode: crate::portable::SemanticMode,
         ) -> ConstructedCandidate<B> {
-            let coverage = self.state.semantic_coverage;
-            let allocation_ids = (0..self.state.construction.storage().allocation_count())
-                .map(|ordinal| self.state.construction.allocation(ordinal))
+            let Self {
+                state:
+                    BuilderState {
+                        construction,
+                        contract,
+                        semantic_coverage: coverage,
+                        bindings,
+                        scope,
+                        physical,
+                        mut choices,
+                        mut constraints,
+                        numerical_children,
+                        callees,
+                        ..
+                    },
+                arena,
+                program,
+                function,
+                target,
+                constants,
+                ..
+            } = self;
+            let allocation_ids = (0..construction.storage().allocation_count())
+                .map(|ordinal| construction.allocation(ordinal))
                 .collect::<Vec<_>>();
-            let construction = self.state.construction.take();
             let analyzed = construction
                 .close(closed)
                 .normalize_launches(
-                    self.arena,
-                    self.target.limits().max_grid[0],
-                    self.target.limits().max_index_bits,
+                    arena,
+                    target.limits().max_grid[0],
+                    target.limits().max_index_bits,
                 )
                 .expect("one implementation and its imported children share an immutable target")
                 .analyze_allocations();
-            self.validate_schedule(analyzed.schedule(), analyzed.storage());
+            Self::validate_schedule(
+                arena,
+                &mut constraints,
+                analyzed.schedule(),
+                analyzed.storage(),
+            );
             let reuse_policy = crate::refinement::AllocationReusePolicy::Explore;
             let (planned, reuse_decisions, reuse_constraints) =
-                crate::refinement::refine_allocation_choices(self.arena, analyzed, reuse_policy)
+                crate::refinement::refine_allocation_choices(arena, analyzed, reuse_policy)
                     .into_parts();
             for (decision, meaning) in reuse_decisions {
-                let active_when = self.arena.bool(true);
-                self.state.choices.push(ChoiceDeclaration {
+                let active_when = arena.bool(true);
+                choices.push(ChoiceDeclaration {
                     kind: crate::refinement::ChoiceKind::AllocationSlot,
                     decision,
                     meaning,
                     active_when,
                 });
             }
-            self.state.constraints.extend(reuse_constraints);
-            crate::refinement::validate_choice_declarations(self.arena, &self.state.choices);
+            constraints.extend(reuse_constraints);
+            crate::refinement::validate_choice_declarations(arena, &choices);
             let executable = planned.finish().close_execution(
-                self.arena,
-                self.target.local_realization(),
-                self.target.kernel_abi(),
+                arena,
+                target.local_realization(),
+                target.kernel_abi(),
             );
             let kernels = executable
                 .kernels()
                 .kernels()
                 .map(|(_, kernel)| kernel)
                 .collect::<Vec<_>>();
-            self.derive_constraints(
+            Self::derive_constraints(
+                arena,
+                target,
+                constants,
+                &mut constraints,
                 executable.storage(),
                 &allocation_ids,
                 executable.schedule(),
                 &kernels,
                 executable.launch_resources(),
             );
-            let raw_constraints = self.arena.all(&self.state.constraints);
-            let side_conditions = self.arena.side_conditions(AnyExpr::Bool(raw_constraints));
-            let hard_constraints = self.arena.and(side_conditions, raw_constraints);
-            let required = self
-                .program
+            let raw_constraints = arena.all(&constraints);
+            let side_conditions = arena.side_conditions(AnyExpr::Bool(raw_constraints));
+            let hard_constraints = arena.and(side_conditions, raw_constraints);
+            let required = program
                 .families()
-                .any(|(_, family)| family.reference().function() == self.function.id());
+                .any(|(_, family)| family.reference().function() == function.id());
             let numerical_applicability =
                 if required && mode == crate::portable::SemanticMode::Portable {
-                    self.state.numerical_children.clone()
+                    numerical_children
                 } else {
                     NumericalApplicability::selected_replacement(
-                        self.arena,
-                        self.program,
-                        self.function,
-                        &self.state.bindings,
+                        arena,
+                        program,
+                        function,
+                        &bindings,
                         &executable,
-                        &self.state.numerical_children,
+                        &numerical_children,
                     )
                 };
-            let roots = self.register_roots(
+            let roots = Self::register_roots(
+                arena,
                 executable.storage(),
                 &allocation_ids,
                 &kernels,
@@ -2137,7 +2147,7 @@ mod internals {
                 hard_constraints,
                 coverage,
             );
-            let expression_digest = self.arena.canonical_digest(&roots).bytes();
+            let expression_digest = arena.canonical_digest(&roots).bytes();
             let mut digest =
                 seismic_ir::identity::StructureDigest::new("seismic-implementation-v7");
             let (reference_math_version, reference_math_digest) =
@@ -2147,7 +2157,12 @@ mod internals {
             digest.bytes(&expression_digest);
             digest_structure(
                 &mut digest,
-                &self,
+                arena,
+                function,
+                &contract,
+                &choices,
+                &physical.result_slots,
+                &callees,
                 executable.storage(),
                 &allocation_ids,
                 &kernels,
@@ -2157,129 +2172,124 @@ mod internals {
                 structure: digest.finish(),
             };
             let mut result_publications = Vec::new();
-            for result in &self.state.contract.results {
-                if !self.state.root {
-                    continue;
-                }
-                for path in &result.paths {
-                    let binding = match &result.ty {
-                        SemanticType::Tensor(tensor) => {
-                            let publications = executable
-                                .storage()
-                                .result_views()
-                                .iter()
-                                .filter(|publication| &publication.path == path)
-                                .collect::<Vec<_>>();
-                            assert!(
-                                !publications.is_empty(),
-                                "closed result tensor path has no publication operation"
-                            );
-                            assert!(
-                                publications.iter().all(|publication| {
-                                    let view = executable.storage().view(publication.view);
-                                    view.representation == tensor.representation
-                                        && view.extents.len() == tensor.axes.len()
-                                }),
-                                "source result publication changed its declared tensor type"
-                            );
-                            PublishedResult::Buffer {
-                                representation: tensor.representation,
-                                rank: tensor.axes.len(),
+            if scope.is_root() {
+                for result in &contract.results {
+                    for path in &result.paths {
+                        let binding = match &result.ty {
+                            SemanticType::Tensor(tensor) => {
+                                let publications = executable
+                                    .storage()
+                                    .result_views()
+                                    .iter()
+                                    .filter(|publication| &publication.path == path)
+                                    .collect::<Vec<_>>();
+                                assert!(
+                                    !publications.is_empty(),
+                                    "closed result tensor path has no publication operation"
+                                );
+                                assert!(
+                                    publications.iter().all(|publication| {
+                                        let view = executable.storage().view(publication.view);
+                                        view.representation == tensor.representation
+                                            && view.extents.len() == tensor.axes.len()
+                                    }),
+                                    "source result publication changed its declared tensor type"
+                                );
+                                PublishedResult::Buffer {
+                                    representation: tensor.representation,
+                                    rank: tensor.axes.len(),
+                                }
                             }
-                        }
-                        SemanticType::Scalar(_) => {
-                            let ScalarPublication::Scalar(slot) = self
-                                .state
-                                .physical
-                                .result_slots
-                                .get(&result.value)
-                                .copied()
-                                .expect("closed scalar result has no publication")
-                            else {
-                                panic!("closed scalar result has a range publication")
-                            };
-                            PublishedResult::Scalar { slot }
-                        }
-                        SemanticType::Index { .. } => {
-                            let ScalarPublication::Quantity(slot) = self
-                                .state
-                                .physical
-                                .result_slots
-                                .get(&result.value)
-                                .copied()
-                                .expect("closed index result has no publication")
-                            else {
-                                panic!("closed index result has a non-natural publication")
-                            };
-                            PublishedResult::Quantity { slot }
-                        }
-                        SemanticType::Integer => {
-                            panic!("root result ABI does not expose unbounded signed Integer")
-                        }
-                        SemanticType::Range { .. } => {
-                            let ScalarPublication::Range { start, end } = self
-                                .state
-                                .physical
-                                .result_slots
-                                .get(&result.value)
-                                .copied()
-                                .expect("closed range result has no publication")
-                            else {
-                                panic!("closed range result has a scalar publication")
-                            };
-                            PublishedResult::Range { start, end }
-                        }
-                        SemanticType::Void => continue,
-                        SemanticType::Tuple(_) => {
-                            panic!("tuple result survived semantic leaf normalization")
-                        }
-                        SemanticType::Opaque { .. } => {
-                            panic!("opaque result crossed the implementation boundary")
-                        }
-                    };
-                    result_publications.push(ResultPublication {
-                        path: path.clone(),
-                        binding,
-                    });
+                            SemanticType::Scalar(_) => {
+                                let ScalarPublication::Scalar(slot) = physical
+                                    .result_slots
+                                    .get(&result.value)
+                                    .copied()
+                                    .expect("closed scalar result has no publication")
+                                else {
+                                    panic!("closed scalar result has a range publication")
+                                };
+                                PublishedResult::Scalar { slot }
+                            }
+                            SemanticType::Index { .. } => {
+                                let ScalarPublication::Quantity(slot) = physical
+                                    .result_slots
+                                    .get(&result.value)
+                                    .copied()
+                                    .expect("closed index result has no publication")
+                                else {
+                                    panic!("closed index result has a non-natural publication")
+                                };
+                                PublishedResult::Quantity { slot }
+                            }
+                            SemanticType::Integer => {
+                                panic!("root result ABI does not expose unbounded signed Integer")
+                            }
+                            SemanticType::Range { .. } => {
+                                let ScalarPublication::Range { start, end } = physical
+                                    .result_slots
+                                    .get(&result.value)
+                                    .copied()
+                                    .expect("closed range result has no publication")
+                                else {
+                                    panic!("closed range result has a scalar publication")
+                                };
+                                PublishedResult::Range { start, end }
+                            }
+                            SemanticType::Void => continue,
+                            SemanticType::Tuple(_) => {
+                                panic!("tuple result survived semantic leaf normalization")
+                            }
+                            SemanticType::Opaque { .. } => {
+                                panic!("opaque result crossed the implementation boundary")
+                            }
+                        };
+                        result_publications.push(ResultPublication {
+                            path: path.clone(),
+                            binding,
+                        });
+                    }
                 }
             }
             ConstructedCandidate::from_parts(ConstructedCandidateParts {
                 identity,
                 semantic_coverage: coverage,
-                native_index_bits: self.target.limits().max_index_bits,
+                native_index_bits: target.limits().max_index_bits,
                 executable,
-                choices: self.state.choices,
+                choices,
                 hard_constraints,
                 numerical_applicability,
                 provenance: ImplementationProvenance {
-                    root: self.function.stable(),
-                    callees: self.state.callees,
+                    root: function.stable(),
+                    callees,
                 },
                 result_publications,
-                bindings: self.state.bindings.freeze(),
+                bindings: bindings.freeze(),
             })
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn derive_constraints(
-            &mut self,
+            arena: &mut ExprArena,
+            target: &DeviceDescription<B>,
+            constants: &TargetConstants,
+            constraints: &mut Vec<BoolExpr>,
             storage: &seismic_ir::storage::GlobalAllocationTopology,
             allocation_ids: &[GlobalAllocationId],
             schedule: &ParametricSchedule<B>,
             kernels: &[&seismic_ir::kernel::Kernel<B>],
             resources: &[seismic_ir::execution::LaunchResources],
         ) {
-            let max_allocation = self.arena.nat_symbol(
-                self.arena
-                    .target_constant_symbol(self.constants.max_allocation_bytes),
-            );
+            let max_allocation =
+                arena.nat_symbol(arena.target_constant_symbol(constants.max_allocation_bytes));
             // Natural expressions are unbounded, so even a 64-bit native
             // index limit is a real target constraint. Form the exact bound
             // for the target's declared width rather than truncating to u64.
-            let index_bits = self.target.limits().max_index_bits;
+            let index_bits = target.limits().max_index_bits;
             let max_index = if index_bits <= 64 {
-                self.arena.nat(u64::MAX >> (64 - index_bits))
+                arena.nat(u64::MAX >> (64 - index_bits))
             } else {
-                self.arena.nat_exact(
+                arena.nat_exact(
                     (seismic_lang::expr::BigUint::from(1u8) << index_bits)
                         - seismic_lang::expr::BigUint::from(1u8),
                 )
@@ -2299,24 +2309,17 @@ mod internals {
                 if allocation.acquisition == seismic_ir::storage::AllocationAcquisition::Invocation
                     && !imported
                 {
-                    self.state.constraints.push(self.arena.nat_cmp(
-                        CmpOp::Le,
-                        bytes,
-                        max_allocation,
-                    ));
-                    self.state
-                        .constraints
-                        .push(self.arena.nat_cmp(CmpOp::Le, bytes, max_index));
+                    constraints.push(arena.nat_cmp(CmpOp::Le, bytes, max_allocation));
+                    constraints.push(arena.nat_cmp(CmpOp::Le, bytes, max_index));
                 }
                 let required_alignment = storage.allocation(id).alignment;
-                self.state.constraints.push(
-                    self.arena
-                        .bool(required_alignment <= self.target.limits().max_allocation_alignment),
+                constraints.push(
+                    arena.bool(required_alignment <= target.limits().max_allocation_alignment),
                 );
             }
             let mut view_requirements = Vec::new();
             for (view_ordinal, layout) in storage.views().iter().enumerate() {
-                let constraint_start = self.state.constraints.len();
+                let constraint_start = constraints.len();
                 // The whole-tensor constructor gives this view its allocation's
                 // exact geometry and byte demand. Rechecking its own span as
                 // `bytes <= bytes` introduces reached tensor slots into an
@@ -2325,7 +2328,7 @@ mod internals {
                     layout.mapping,
                     seismic_ir::storage::ViewMapping::WholeAllocation
                 ) {
-                    view_requirements.push(self.arena.bool(true));
+                    view_requirements.push(arena.bool(true));
                     continue;
                 }
                 if let seismic_ir::storage::ViewMapping::Transpose { source, .. } = &layout.mapping
@@ -2335,7 +2338,7 @@ mod internals {
                 }
                 if matches!(layout.base, seismic_ir::storage::ViewBase::TensorValue(id) if id.index() as usize == view_ordinal)
                 {
-                    view_requirements.push(self.arena.bool(true));
+                    view_requirements.push(arena.bool(true));
                     continue;
                 }
                 // Whole canonical views must use the same tensor-byte
@@ -2347,83 +2350,56 @@ mod internals {
                 // views retain the full addressed-range proof below.
                 let addressed = if layout.contiguous
                     && matches!(
-                        self.arena.view(AnyExpr::Nat(layout.offset)),
+                        arena.view(AnyExpr::Nat(layout.offset)),
                         NodeView::NatConst(0)
                     ) {
-                    seismic_ir::storage::tensor_bytes(
-                        self.arena,
-                        layout.representation,
-                        &layout.extents,
-                    )
+                    seismic_ir::storage::tensor_bytes(arena, layout.representation, &layout.extents)
                 } else {
-                    addressed_bytes(self.arena, layout)
+                    addressed_bytes(arena, layout)
                 };
                 let allocation_bytes = match layout.base {
                     seismic_ir::storage::ViewBase::Allocation(id) => storage.allocation(id).bytes,
                     seismic_ir::storage::ViewBase::TensorValue(id) => {
                         let source = &storage.views()[id.index() as usize];
-                        addressed_bytes(self.arena, source)
+                        addressed_bytes(arena, source)
                     }
                 };
-                self.state.constraints.push(self.arena.nat_cmp(
-                    CmpOp::Le,
-                    addressed,
-                    allocation_bytes,
-                ));
+                constraints.push(arena.nat_cmp(CmpOp::Le, addressed, allocation_bytes));
                 let view_alignment =
                     seismic_ir::storage::representation_alignment(layout.representation);
-                let alignment = self.arena.nat(view_alignment);
-                let remainder = self.arena.nat_rem(layout.offset, alignment);
-                let zero = self.arena.nat(0);
-                self.state
-                    .constraints
-                    .push(self.arena.nat_cmp(CmpOp::Eq, remainder, zero));
-                let terms = self.state.constraints.split_off(constraint_start);
-                view_requirements.push(self.arena.all(&terms));
+                let alignment = arena.nat(view_alignment);
+                let remainder = arena.nat_rem(layout.offset, alignment);
+                let zero = arena.nat(0);
+                constraints.push(arena.nat_cmp(CmpOp::Eq, remainder, zero));
+                let terms = constraints.split_off(constraint_start);
+                view_requirements.push(arena.all(&terms));
             }
-            let max_bindings = self.arena.nat_symbol(
-                self.arena
-                    .target_constant_symbol(self.constants.max_bindings),
-            );
-            let max_argument_bytes = self.arena.nat_symbol(
-                self.arena
-                    .target_constant_symbol(self.constants.max_argument_bytes),
-            );
+            let max_bindings =
+                arena.nat_symbol(arena.target_constant_symbol(constants.max_bindings));
+            let max_argument_bytes =
+                arena.nat_symbol(arena.target_constant_symbol(constants.max_argument_bytes));
             let mut launch_constraints = Vec::new();
             for (launch, resources) in schedule.launches().iter().zip(resources) {
                 let local_layout = resources.layout();
                 let scratch = resources.scratch();
                 let abi_allocations = resources.abi();
-                let constraint_start = self.state.constraints.len();
-                let threads = self.arena.nat_product(&launch.workgroup);
-                let max_threads = self.arena.nat(self.target.limits().max_workgroup_threads);
-                self.state
-                    .constraints
-                    .push(self.arena.nat_cmp(CmpOp::Le, threads, max_threads));
-                let grid_envelope = schedule.launch_grid_envelope(self.arena, launch);
+                let constraint_start = constraints.len();
+                let threads = arena.nat_product(&launch.workgroup);
+                let max_threads = arena.nat(target.limits().max_workgroup_threads);
+                constraints.push(arena.nat_cmp(CmpOp::Le, threads, max_threads));
+                let grid_envelope = schedule.launch_grid_envelope(arena, launch);
                 for axis in 0..3 {
-                    let max_workgroup_axis = self
-                        .arena
-                        .nat(self.target.limits().max_workgroup_size[axis]);
-                    self.state.constraints.push(self.arena.nat_cmp(
+                    let max_workgroup_axis = arena.nat(target.limits().max_workgroup_size[axis]);
+                    constraints.push(arena.nat_cmp(
                         CmpOp::Le,
                         launch.workgroup[axis],
                         max_workgroup_axis,
                     ));
-                    let max_grid = self.arena.nat(self.target.limits().max_grid[axis]);
-                    self.state.constraints.push(self.arena.nat_cmp(
-                        CmpOp::Le,
-                        grid_envelope[axis],
-                        max_grid,
-                    ));
-                    let physical_participants = self
-                        .arena
-                        .nat_mul(grid_envelope[axis], launch.workgroup[axis]);
-                    self.state.constraints.push(self.arena.nat_cmp(
-                        CmpOp::Le,
-                        physical_participants,
-                        max_index,
-                    ));
+                    let max_grid = arena.nat(target.limits().max_grid[axis]);
+                    constraints.push(arena.nat_cmp(CmpOp::Le, grid_envelope[axis], max_grid));
+                    let physical_participants =
+                        arena.nat_mul(grid_envelope[axis], launch.workgroup[axis]);
+                    constraints.push(arena.nat_cmp(CmpOp::Le, physical_participants, max_index));
                 }
 
                 let kernel = kernels
@@ -2435,11 +2411,7 @@ mod internals {
                         .chain(local.strides.iter().copied())
                         .chain(std::iter::once(local.bytes))
                     {
-                        self.state.constraints.push(self.arena.nat_cmp(
-                            CmpOp::Le,
-                            value,
-                            max_index,
-                        ));
+                        constraints.push(arena.nat_cmp(CmpOp::Le, value, max_index));
                     }
                 }
                 for total in [
@@ -2447,79 +2419,47 @@ mod internals {
                     local_layout.participant_bytes,
                     local_layout.register_bytes,
                 ] {
-                    self.state
-                        .constraints
-                        .push(self.arena.nat_cmp(CmpOp::Le, total, max_index));
+                    constraints.push(arena.nat_cmp(CmpOp::Le, total, max_index));
                 }
                 for requirement in [&scratch.workgroup, &scratch.participant, &scratch.register]
                     .into_iter()
                     .flatten()
                 {
-                    self.state.constraints.push(self.arena.nat_cmp(
-                        CmpOp::Le,
-                        requirement.bytes,
-                        max_allocation,
-                    ));
-                    self.state.constraints.push(self.arena.nat_cmp(
-                        CmpOp::Le,
-                        requirement.bytes,
-                        max_index,
-                    ));
-                    self.state.constraints.push(self.arena.bool(
+                    constraints.push(arena.nat_cmp(CmpOp::Le, requirement.bytes, max_allocation));
+                    constraints.push(arena.nat_cmp(CmpOp::Le, requirement.bytes, max_index));
+                    constraints.push(arena.bool(
                         requirement.alignment.is_power_of_two()
-                            && requirement.alignment
-                                <= self.target.limits().max_allocation_alignment,
+                            && requirement.alignment <= target.limits().max_allocation_alignment,
                     ));
                 }
                 let data = kernel;
                 for lease in data.addressable_resources() {
-                    let capacity = self.arena.nat_symbol(self.arena.target_constant_symbol(
-                        self.constants.addressable_resource_capacity(lease.class_id),
+                    let capacity = arena.nat_symbol(arena.target_constant_symbol(
+                        constants.addressable_resource_capacity(lease.class_id),
                     ));
-                    let end = self.arena.nat_add(lease.offset_units, lease.units);
-                    self.state
-                        .constraints
-                        .push(self.arena.nat_cmp(CmpOp::Le, end, capacity));
-                    self.state
-                        .constraints
-                        .push(self.arena.nat_cmp(CmpOp::Le, end, max_index));
+                    let end = arena.nat_add(lease.offset_units, lease.units);
+                    constraints.push(arena.nat_cmp(CmpOp::Le, end, capacity));
+                    constraints.push(arena.nat_cmp(CmpOp::Le, end, max_index));
                 }
-                let binding_count = self.arena.nat(data.interface().bindings.len() as u64);
-                self.state.constraints.push(self.arena.nat_cmp(
-                    CmpOp::Le,
-                    binding_count,
-                    max_bindings,
-                ));
+                let binding_count = arena.nat(data.interface().bindings.len() as u64);
+                constraints.push(arena.nat_cmp(CmpOp::Le, binding_count, max_bindings));
                 // Core ABI metadata size, not bytes reachable through bound
                 // tensors. Buffer/result slots are encoded as machine-width
                 // addresses, Nat arguments as u64, and scalar arguments at
                 // their declared width.
-                let footprint = self.target.kernel_abi_layout(kernel).footprint;
+                let footprint = target.kernel_abi_layout(kernel).footprint;
                 assert!(
                     footprint.alignment.is_power_of_two(),
                     "backend kernel ABI footprint alignment is a nonzero power of two"
                 );
-                let argument_bytes = self.arena.nat(footprint.bytes);
-                self.state.constraints.push(self.arena.nat_cmp(
-                    CmpOp::Le,
-                    argument_bytes,
-                    max_argument_bytes,
-                ));
+                let argument_bytes = arena.nat(footprint.bytes);
+                constraints.push(arena.nat_cmp(CmpOp::Le, argument_bytes, max_argument_bytes));
                 for allocation in abi_allocations {
-                    self.state.constraints.push(self.arena.nat_cmp(
-                        CmpOp::Le,
-                        allocation.bytes,
-                        max_allocation,
-                    ));
-                    self.state.constraints.push(self.arena.nat_cmp(
-                        CmpOp::Le,
-                        allocation.bytes,
-                        max_index,
-                    ));
-                    self.state.constraints.push(self.arena.bool(
+                    constraints.push(arena.nat_cmp(CmpOp::Le, allocation.bytes, max_allocation));
+                    constraints.push(arena.nat_cmp(CmpOp::Le, allocation.bytes, max_index));
+                    constraints.push(arena.bool(
                         allocation.alignment.is_power_of_two()
-                            && allocation.alignment
-                                <= self.target.limits().max_allocation_alignment,
+                            && allocation.alignment <= target.limits().max_allocation_alignment,
                     ));
                 }
 
@@ -2531,29 +2471,28 @@ mod internals {
                         );
                     }
                 }
-                let dynamic_local_limit = self.arena.nat(self.target.limits().max_workgroup_bytes);
-                self.state.constraints.push(self.arena.nat_cmp(
+                let dynamic_local_limit = arena.nat(target.limits().max_workgroup_bytes);
+                constraints.push(arena.nat_cmp(
                     CmpOp::Le,
                     local_layout.workgroup_bytes,
                     dynamic_local_limit,
                 ));
-                if let Some(participant_limit) = self.constants.participant_local_bytes {
-                    let participant_limit = self
-                        .arena
-                        .nat_symbol(self.arena.target_constant_symbol(participant_limit));
-                    self.state.constraints.push(self.arena.nat_cmp(
+                if let Some(participant_limit) = constants.participant_local_bytes {
+                    let participant_limit =
+                        arena.nat_symbol(arena.target_constant_symbol(participant_limit));
+                    constraints.push(arena.nat_cmp(
                         CmpOp::Le,
                         local_layout.participant_bytes,
                         participant_limit,
                     ));
                 }
-                let terms = self.state.constraints.split_off(constraint_start);
-                let predicate = self.arena.all(&terms);
-                let defined = self.arena.side_conditions(predicate.into());
-                launch_constraints.push(self.arena.and(defined, predicate));
+                let terms = constraints.split_off(constraint_start);
+                let predicate = arena.all(&terms);
+                let defined = arena.side_conditions(predicate.into());
+                launch_constraints.push(arena.and(defined, predicate));
             }
             let scoped = schedule.scoped_requirements(
-                self.arena,
+                arena,
                 storage.views(),
                 &mut |arena, point| {
                     use seismic_ir::schedule::RequirementPoint;
@@ -2614,16 +2553,17 @@ mod internals {
                 },
                 &mut |arena, step| acquisition_established(arena, storage, step),
             );
-            self.state.constraints.push(scoped);
+            constraints.push(scoped);
         }
 
         fn validate_schedule(
-            &mut self,
+            arena: &mut ExprArena,
+            constraints: &mut Vec<BoolExpr>,
             schedule: &ParametricSchedule<B>,
             storage: &seismic_ir::storage::TopologyBuilder,
         ) {
             let scoped = schedule.scoped_requirements(
-                self.arena,
+                arena,
                 storage.views(),
                 &mut |arena, point| {
                     use seismic_ir::schedule::RequirementPoint;
@@ -2694,11 +2634,12 @@ mod internals {
                     arena.bool(true)
                 },
             );
-            self.state.constraints.push(scoped);
+            constraints.push(scoped);
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn register_roots(
-            &mut self,
+            arena: &mut ExprArena,
             storage: &seismic_ir::storage::GlobalAllocationTopology,
             allocation_ids: &[GlobalAllocationId],
             kernels: &[&seismic_ir::kernel::Kernel<B>],
@@ -2710,7 +2651,7 @@ mod internals {
             let mut roots = Vec::new();
             assert_eq!(allocation_ids.len(), storage.allocations().len());
             for (allocation, &id) in allocation_ids.iter().enumerate() {
-                roots.push(self.arena.root(
+                roots.push(arena.root(
                     RootName::AllocationBytes {
                         allocation: allocation as u32,
                     },
@@ -2718,12 +2659,12 @@ mod internals {
                 ));
             }
             for (view, layout) in storage.views().iter().enumerate() {
-                roots.push(self.arena.root(
+                roots.push(arena.root(
                     RootName::ViewOffset { view: view as u32 },
                     AnyExpr::Nat(layout.offset),
                 ));
                 for (axis, extent) in layout.extents.iter().enumerate() {
-                    roots.push(self.arena.root(
+                    roots.push(arena.root(
                         RootName::ViewExtent {
                             view: view as u32,
                             axis: axis as u32,
@@ -2732,7 +2673,7 @@ mod internals {
                     ));
                 }
                 for (axis, stride) in layout.strides.iter().enumerate() {
-                    roots.push(self.arena.root(
+                    roots.push(arena.root(
                         RootName::ViewStride {
                             view: view as u32,
                             axis: axis as u32,
@@ -2743,7 +2684,7 @@ mod internals {
             }
             for (launch_id, launch) in schedule.launches().iter().enumerate() {
                 for axis in 0..3 {
-                    roots.push(self.arena.root(
+                    roots.push(arena.root(
                         RootName::LaunchGrid {
                             launch: launch_id as u32,
                             axis: axis as u8,
@@ -2752,7 +2693,7 @@ mod internals {
                     ));
                 }
                 for axis in 0..3 {
-                    roots.push(self.arena.root(
+                    roots.push(arena.root(
                         RootName::Workgroup {
                             launch: launch_id as u32,
                             axis: axis as u8,
@@ -2760,7 +2701,7 @@ mod internals {
                         AnyExpr::Nat(launch.workgroup[axis]),
                     ));
                 }
-                roots.push(self.arena.root(
+                roots.push(arena.root(
                     RootName::LaunchEmpty {
                         launch: launch_id as u32,
                     },
@@ -2768,7 +2709,7 @@ mod internals {
                 ));
                 let layout = resources[launch_id].layout();
                 for (local, value) in layout.locals.iter().enumerate() {
-                    roots.push(self.arena.root(
+                    roots.push(arena.root(
                         RootName::LocalOffset {
                             launch: launch_id as u32,
                             local: local as u32,
@@ -2776,7 +2717,7 @@ mod internals {
                         AnyExpr::Nat(value.offset),
                     ));
                     for (axis, stride) in value.strides.iter().enumerate() {
-                        roots.push(self.arena.root(
+                        roots.push(arena.root(
                             RootName::LocalStride {
                                 launch: launch_id as u32,
                                 local: local as u32,
@@ -2794,7 +2735,7 @@ mod internals {
                 .into_iter()
                 .enumerate()
                 {
-                    roots.push(self.arena.root(
+                    roots.push(arena.root(
                         RootName::LocalClassBytes {
                             launch: launch_id as u32,
                             class: class as u8,
@@ -2809,7 +2750,7 @@ mod internals {
                         .enumerate()
                 {
                     if let Some(requirement) = requirement {
-                        roots.push(self.arena.root(
+                        roots.push(arena.root(
                             RootName::LaunchScratchBytes {
                                 launch: launch_id as u32,
                                 class: class as u8,
@@ -2819,7 +2760,7 @@ mod internals {
                     }
                 }
                 for (allocation, requirement) in resources[launch_id].abi().iter().enumerate() {
-                    roots.push(self.arena.root(
+                    roots.push(arena.root(
                         RootName::LaunchAbiBytes {
                             launch: launch_id as u32,
                             allocation: allocation as u32,
@@ -2831,7 +2772,7 @@ mod internals {
             for (kernel_index, kernel) in kernels.iter().enumerate() {
                 let data = kernel;
                 for (argument, value) in data.interface().nat_args.iter().enumerate() {
-                    roots.push(self.arena.root(
+                    roots.push(arena.root(
                         RootName::KernelNatArgument {
                             kernel: kernel_index as u32,
                             argument: argument as u32,
@@ -2840,34 +2781,32 @@ mod internals {
                     ));
                 }
                 for (argument, (symbol, _)) in data.interface().scalar_args.iter().enumerate() {
-                    let expression = match self.arena.symbol_sort(*symbol) {
-                        SymbolSort::Nat => AnyExpr::Nat(self.arena.nat_symbol(*symbol)),
-                        SymbolSort::Int => AnyExpr::Int(self.arena.int_symbol(*symbol)),
-                        SymbolSort::Scalar(DType::F32) => AnyExpr::from(
-                            self.arena.scalar_symbol::<seismic_lang::expr::F32>(*symbol),
-                        ),
-                        SymbolSort::Scalar(DType::F16) => AnyExpr::from(
-                            self.arena.scalar_symbol::<seismic_lang::expr::F16>(*symbol),
-                        ),
-                        SymbolSort::Scalar(DType::BF16) => AnyExpr::from(
-                            self.arena
-                                .scalar_symbol::<seismic_lang::expr::BF16>(*symbol),
-                        ),
-                        SymbolSort::Scalar(DType::I32) => AnyExpr::from(
-                            self.arena.scalar_symbol::<seismic_lang::expr::I32>(*symbol),
-                        ),
-                        SymbolSort::Scalar(DType::U32) => AnyExpr::from(
-                            self.arena.scalar_symbol::<seismic_lang::expr::U32>(*symbol),
-                        ),
-                        SymbolSort::Scalar(DType::U64) => AnyExpr::from(
-                            self.arena.scalar_symbol::<seismic_lang::expr::U64>(*symbol),
-                        ),
+                    let expression = match arena.symbol_sort(*symbol) {
+                        SymbolSort::Nat => AnyExpr::Nat(arena.nat_symbol(*symbol)),
+                        SymbolSort::Int => AnyExpr::Int(arena.int_symbol(*symbol)),
+                        SymbolSort::Scalar(DType::F32) => {
+                            AnyExpr::from(arena.scalar_symbol::<seismic_lang::expr::F32>(*symbol))
+                        }
+                        SymbolSort::Scalar(DType::F16) => {
+                            AnyExpr::from(arena.scalar_symbol::<seismic_lang::expr::F16>(*symbol))
+                        }
+                        SymbolSort::Scalar(DType::BF16) => {
+                            AnyExpr::from(arena.scalar_symbol::<seismic_lang::expr::BF16>(*symbol))
+                        }
+                        SymbolSort::Scalar(DType::I32) => {
+                            AnyExpr::from(arena.scalar_symbol::<seismic_lang::expr::I32>(*symbol))
+                        }
+                        SymbolSort::Scalar(DType::U32) => {
+                            AnyExpr::from(arena.scalar_symbol::<seismic_lang::expr::U32>(*symbol))
+                        }
+                        SymbolSort::Scalar(DType::U64) => {
+                            AnyExpr::from(arena.scalar_symbol::<seismic_lang::expr::U64>(*symbol))
+                        }
                         SymbolSort::Scalar(DType::Bool) => AnyExpr::from(
-                            self.arena
-                                .scalar_symbol::<seismic_lang::expr::BoolScalar>(*symbol),
+                            arena.scalar_symbol::<seismic_lang::expr::BoolScalar>(*symbol),
                         ),
                     };
-                    roots.push(self.arena.root(
+                    roots.push(arena.root(
                         RootName::KernelScalarArgument {
                             kernel: kernel_index as u32,
                             argument: argument as u32,
@@ -2877,7 +2816,7 @@ mod internals {
                 }
                 for (local, allocation) in data.locals().iter().enumerate() {
                     for (axis, extent) in allocation.extents.iter().enumerate() {
-                        roots.push(self.arena.root(
+                        roots.push(arena.root(
                             RootName::LocalExtent {
                                 kernel: kernel_index as u32,
                                 local: local as u32,
@@ -2888,14 +2827,14 @@ mod internals {
                     }
                 }
                 for (lease, resource) in data.addressable_resources().iter().enumerate() {
-                    roots.push(self.arena.root(
+                    roots.push(arena.root(
                         RootName::AddressableResourceOffset {
                             kernel: kernel_index as u32,
                             lease: lease as u32,
                         },
                         AnyExpr::Nat(resource.offset_units),
                     ));
-                    roots.push(self.arena.root(
+                    roots.push(arena.root(
                         RootName::AddressableResourceUnits {
                             kernel: kernel_index as u32,
                             lease: lease as u32,
@@ -2905,7 +2844,7 @@ mod internals {
                 }
                 for (resource, values) in data.intrinsic_resources().iter().enumerate() {
                     if let Some(value) = values.workgroup_bytes {
-                        roots.push(self.arena.root(
+                        roots.push(arena.root(
                             RootName::IntrinsicWorkgroupBytes {
                                 kernel: kernel_index as u32,
                                 resource: resource as u32,
@@ -2914,7 +2853,7 @@ mod internals {
                         ));
                     }
                     if let Some(value) = values.participant_bytes {
-                        roots.push(self.arena.root(
+                        roots.push(arena.root(
                             RootName::IntrinsicParticipantBytes {
                                 kernel: kernel_index as u32,
                                 resource: resource as u32,
@@ -2923,7 +2862,7 @@ mod internals {
                         ));
                     }
                     if let Some(value) = values.register_bytes {
-                        roots.push(self.arena.root(
+                        roots.push(arena.root(
                             RootName::IntrinsicRegisterBytes {
                                 kernel: kernel_index as u32,
                                 resource: resource as u32,
@@ -3143,7 +3082,7 @@ mod internals {
             let (mut control, mut repeat, mut scalar_read, mut host_eval, mut publication) =
                 (0, 0, 0, 0, 0);
             schedule_roots(
-                self.arena,
+                arena,
                 schedule.steps(),
                 &mut roots,
                 &mut control,
@@ -3152,14 +3091,8 @@ mod internals {
                 &mut host_eval,
                 &mut publication,
             );
-            roots.push(
-                self.arena
-                    .root(RootName::HardConstraints, AnyExpr::Bool(hard_constraints)),
-            );
-            roots.push(
-                self.arena
-                    .root(RootName::Guard, AnyExpr::Bool(coverage.node())),
-            );
+            roots.push(arena.root(RootName::HardConstraints, AnyExpr::Bool(hard_constraints)));
+            roots.push(arena.root(RootName::Guard, AnyExpr::Bool(coverage.node())));
             roots
         }
     }
@@ -3172,19 +3105,25 @@ mod internals {
     /// is irrelevant to this axis's address contribution.
     pub(super) use seismic_ir::storage::addressed_bytes;
 
+    #[allow(clippy::too_many_arguments)]
     fn digest_structure<B: seismic_native_target::TargetFamily>(
         digest: &mut seismic_ir::identity::StructureDigest,
-        builder: &Builder<'_, B>,
+        arena: &ExprArena,
+        function: &SemanticFunction,
+        contract: &FunctionContract,
+        choices: &[ChoiceDeclaration],
+        result_slots: &HashMap<SemanticValueId, ScalarPublication>,
+        callees: &[StableFunctionId],
         storage: &seismic_ir::storage::GlobalAllocationTopology,
         allocation_ids: &[GlobalAllocationId],
         kernels: &[&seismic_ir::kernel::Kernel<B>],
         schedule: &ParametricSchedule<B>,
     ) {
-        digest.bytes(builder.function.stable().digest());
-        digest.hashed(&builder.state.choices.len());
-        for choice in &builder.state.choices {
+        digest.bytes(function.stable().digest());
+        digest.hashed(&choices.len());
+        for choice in choices {
             digest.bytes(choice.meaning.as_bytes());
-            digest.hashed(builder.arena.decision_domain(choice.decision).values());
+            digest.hashed(arena.decision_domain(choice.decision).values());
         }
 
         assert_eq!(allocation_ids.len(), storage.allocations().len());
@@ -3194,9 +3133,7 @@ mod internals {
                 GlobalBufferKind::Argument { value, abi } => {
                     digest.bytes(b"argument");
                     digest.hashed(
-                        &builder
-                            .state
-                            .contract
+                        &contract
                             .parameters
                             .iter()
                             .position(|parameter| parameter.value == *value),
@@ -3204,9 +3141,7 @@ mod internals {
                     digest.hashed(
                         &abi.as_ref()
                             .and_then(|id| {
-                                builder
-                                    .state
-                                    .contract
+                                contract
                                     .parameters
                                     .iter()
                                     .position(|parameter| parameter.value == *value)
@@ -3218,9 +3153,7 @@ mod internals {
                 GlobalBufferKind::Result { value } => {
                     digest.bytes(b"result");
                     digest.hashed(
-                        &builder
-                            .state
-                            .contract
+                        &contract
                             .results
                             .iter()
                             .position(|result| result.value == *value),
@@ -3229,17 +3162,13 @@ mod internals {
                 GlobalBufferKind::Imported { value, source } => {
                     digest.bytes(b"imported");
                     digest.hashed(
-                        &builder
-                            .state
-                            .contract
+                        &contract
                             .parameters
                             .iter()
                             .position(|parameter| parameter.value == *value),
                     );
                     digest.hashed(
-                        &builder
-                            .state
-                            .contract
+                        &contract
                             .results
                             .iter()
                             .position(|result| result.value == *value),
@@ -3261,9 +3190,7 @@ mod internals {
                 digest.hashed(&at.ordinal());
             }
             digest.hashed(&storage.allocation(id).slot.and_then(|decision| {
-                builder
-                    .state
-                    .choices
+                choices
                     .iter()
                     .position(|choice| choice.decision == decision)
             }));
@@ -3308,15 +3235,13 @@ mod internals {
             digest.hashed(&launch.kernel.index());
             digest.hashed(&launch.descriptor);
         }
-        digest_schedule(digest, builder, schedule.steps());
+        digest_schedule(digest, schedule.steps());
 
-        for result in &builder.state.contract.results {
-            if let Some(publication) = builder.state.physical.result_slots.get(&result.value) {
+        for result in &contract.results {
+            if let Some(publication) = result_slots.get(&result.value) {
                 digest.bytes(b"published-scalar");
                 digest.hashed(
-                    &builder
-                        .state
-                        .contract
+                    &contract
                         .results
                         .iter()
                         .position(|candidate| candidate.value == result.value),
@@ -3343,7 +3268,7 @@ mod internals {
                 }
             }
         }
-        for callee in &builder.state.callees {
+        for callee in callees {
             digest.bytes(callee.digest());
         }
     }
@@ -3834,11 +3759,7 @@ mod internals {
         digest.hashed(data.resource_facts());
     }
 
-    fn digest_schedule<B: seismic_native_target::TargetFamily>(
-        digest: &mut seismic_ir::identity::StructureDigest,
-        builder: &Builder<'_, B>,
-        steps: &[ScheduleStep],
-    ) {
+    fn digest_schedule(digest: &mut seismic_ir::identity::StructureDigest, steps: &[ScheduleStep]) {
         fn product<T>(
             digest: &mut seismic_ir::identity::StructureDigest,
             value: &seismic_ir::region::Product<T>,
@@ -3912,7 +3833,7 @@ mod internals {
             match step {
                 ScheduleStep::Imported { body, .. } => {
                     digest.bytes(b"imported");
-                    digest_schedule(digest, builder, body);
+                    digest_schedule(digest, body);
                 }
                 ScheduleStep::BeginAllocationInstance { source, result }
                 | ScheduleStep::BindArgumentTensor { source, result } => {
@@ -4013,8 +3934,8 @@ mod internals {
                         operand(digest, result.else_value());
                         destination(digest, result.result());
                     });
-                    digest_schedule(digest, builder, then_steps);
-                    digest_schedule(digest, builder, else_steps);
+                    digest_schedule(digest, then_steps);
+                    digest_schedule(digest, else_steps);
                 }
                 ScheduleStep::Repeat { body, carries, .. } => {
                     digest.bytes(b"repeat");
@@ -4024,7 +3945,7 @@ mod internals {
                         operand(digest, carry.backedge());
                         destination(digest, carry.result());
                     });
-                    digest_schedule(digest, builder, body);
+                    digest_schedule(digest, body);
                 }
             }
         }

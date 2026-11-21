@@ -100,6 +100,10 @@ fn vulkan_report(description: &crate::Description) -> VulkanReport {
             heaps: heaps(&device.memory),
         },
         kinds: kinds(device),
+        properties: description
+            .properties(&Default::default())
+            .ok()
+            .map(seismic_lang::device::DeviceProperties::Vulkan),
     }
 }
 

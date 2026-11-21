@@ -83,3 +83,42 @@ fn a_borrowed_slots_expert_converts_in_a_later_round() {
     }
     step.complete().unwrap();
 }
+
+/// With `windows > 1` (`window_slots = 4`, `window_count = 2`), `lendable_slot`
+/// lends unused scratch slots `0..window_slots` across windows using `expert % lw`
+/// indexing, while never lending a slot that an earlier window in the same tier
+/// converts into.
+#[test]
+fn windowed_prefill_lends_unused_scratch_slots_with_modulo_indexing() {
+    let conveying = Conveying::of(ROUND_RECORDS).lending_scratch();
+    let harness = lending_windowed(
+        "lend-windowed",
+        EXPERTS,
+        12,
+        1,
+        STAGING,
+        conveying,
+        TIER,
+        Placer::Bank,
+        false,
+        0,
+        false,
+        4,
+    );
+    let step = harness.prompt_step();
+    // Window 0 converts expert 0 (slot 0); window 1 converts experts 4, 5 (slots 0, 1).
+    // Slots 1, 2, 3 are never written in window 0, so both window 0 and window 1
+    // can borrow unused scratch slots without colliding with slot 0.
+    harness.publish(&step, 0, &[0, 4, 5]);
+    let w0 = harness.rounds_window_listed(&step, 0, 0);
+    let w1 = harness.rounds_window_listed(&step, 0, 1);
+    assert_eq!(Harness::experts(&w0), [0], "window 0 converts expert 0 into slot 0");
+    assert_eq!(Harness::experts(&w1), [0, 1], "window 1 converts experts 4, 5 into slots 0, 1");
+    let lent_w0 = Harness::from_slots(&w0);
+    let lent_w1 = Harness::from_slots(&w1);
+    assert!(!lent_w0.is_empty() || !lent_w1.is_empty(), "expected scratch-slot lending with windows > 1: w0={w0:?} w1={w1:?}");
+    for &(_, slot) in &lent_w1 {
+        assert_ne!(slot, 0, "window 1 must not borrow slot 0 written by window 0: w1={w1:?}");
+    }
+    step.complete().unwrap();
+}

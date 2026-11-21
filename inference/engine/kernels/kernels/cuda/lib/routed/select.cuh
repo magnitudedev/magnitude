@@ -5,14 +5,15 @@
 //
 // Lane `lane` holds experts lane + 32 i (i < P = ceil(E / 32)); when E is
 // not a multiple of 32, lanes at or past E % 32 hold P - 1
-// (`selection::candidates`, ranked.cuh) and their last register is an
-// excluded entry (ranked -inf, expert -1, as a popped one). Top-K is one
-// pass over a lane-local order: every lane sorts its P candidates once (an
-// odd-even transposition network over registers, by `selection::precedes`
-// over ranked values), then each of the K rounds is a single warp argmax
-// over the 32 lane heads (ties to the higher expert index) and one shift of
-// the winning lane's candidates. The winners are the portable body's K
-// argmax rounds in the same order.
+// (`selection::candidates`, ranked.cuh) and their last register is
+// `select::excluded()` (NaN), which `selection::precedes` never picks. Top-K
+// keeps each lane's best remaining candidate `(head_r, head_s, head_e)`
+// seeded by one linear scan of its P slots, then runs K warp argmax rounds
+// over the 32 lane heads (ties to the higher expert index); on each round
+// before the last, only the winning lane marks its winning slot
+// `select::excluded()` and re-scans its P slots for the next head. Because
+// each slot stays at `lane + 32 * i`, no `expert[P]` array is stored. The
+// winners are the portable body's K argmax rounds in the same order.
 //
 // This file is independent of any entry ABI.
 
@@ -64,38 +65,34 @@ template <unsigned P> __device__ __forceinline__ void scores(int function, float
     }
 }
 
-// Sorts this lane's (ranked, score, expert) triples by
-// `selection::precedes`.
-template <unsigned P>
-__device__ __forceinline__ void sort(float (&ranked)[P], float (&score)[P], int (&expert)[P]) {
-#pragma unroll
-    for (unsigned pass = 0; pass < P; ++pass) {
-#pragma unroll
-        for (unsigned i = pass & 1u; i + 1u < P; i += 2u) {
-            if (selection::precedes(ranked[i + 1u], expert[i + 1u], ranked[i], expert[i])) {
-                const float r = ranked[i], s = score[i];
-                const int e = expert[i];
-                ranked[i] = ranked[i + 1u];
-                score[i] = score[i + 1u];
-                expert[i] = expert[i + 1u];
-                ranked[i + 1u] = r;
-                score[i + 1u] = s;
-                expert[i + 1u] = e;
-            }
-        }
-    }
+// Sentinel for an excluded or already-chosen slot: a quiet NaN, which no
+// `selection::ranked` value is, so `selection::precedes` never picks it
+// (NVRTC compiles without fast math).
+__device__ __forceinline__ float excluded() {
+    return __int_as_float(0x7fc00000);
 }
 
-// Pops the lane's head (the winning lane only).
-template <unsigned P> __device__ __forceinline__ void pop(float (&ranked)[P], float (&score)[P], int (&expert)[P]) {
+// Finds this lane's best remaining candidate by `selection::precedes`,
+// optionally marking expert `erase` (`>= 0`) as `excluded()` (NaN) in the
+// same pass. Excluded and taken slots hold `excluded()`, which precedes
+// nothing, so an exhausted lane yields (-inf, 0.0f, -1).
+template <unsigned P>
+__device__ __forceinline__ void lane_max(float (&ranked)[P], const float (&score)[P], unsigned lane, int erase,
+                                         float &head_r, float &head_s, int &head_e) {
+    head_r = -__int_as_float(0x7f800000);
+    head_s = 0.0f;
+    head_e = -1;
 #pragma unroll
-    for (unsigned i = 0; i + 1u < P; ++i) {
-        ranked[i] = ranked[i + 1u];
-        score[i] = score[i + 1u];
-        expert[i] = expert[i + 1u];
+    for (unsigned i = 0; i < P; ++i) {
+        const int e = static_cast<int>(lane + 32 * i);
+        if (erase >= 0 && e == erase)
+            ranked[i] = excluded();
+        else if (selection::precedes(ranked[i], e, head_r, head_e)) {
+            head_r = ranked[i];
+            head_s = score[i];
+            head_e = e;
+        }
     }
-    ranked[P - 1] = -__int_as_float(0x7f800000);
-    expert[P - 1] = -1;
 }
 
 // A row's K choices, rank r at slot K - 1 - r (as `rank_experts` stores
@@ -110,8 +107,8 @@ template <unsigned K> struct Selected {
 // functions.seismic), shared by `routed_select` and its hints: the scores of
 // this lane's candidates from their logits (`logit(expert)`) by `function`,
 // ranked on score + `bias(expert)` (each held expert's ranked value given to
-// `keys`), sorted, then K argmax rounds over the lane heads. Every lane of
-// the warp calls it.
+// `keys`), then K argmax rounds over the 32 lane heads with lazy winning-lane
+// refill. Every lane of the warp calls it.
 template <unsigned E, unsigned K, class Logit, class Bias, class Keys = selection::NoKeys>
 __device__ __forceinline__ Selected<K> rank_row(int function, Logit logit, Bias bias, unsigned lane,
                                                 Keys keys = Keys{}) {
@@ -119,30 +116,32 @@ __device__ __forceinline__ Selected<K> rank_row(int function, Logit logit, Bias 
     // P when 32 divides E (a constant: no excluded entries).
     const unsigned held = selection::candidates<E>(lane);
     float score[P], ranked[P];
-    int expert[P];
 #pragma unroll
-    for (unsigned i = 0; i < P; ++i) {
-        expert[i] = i < held ? static_cast<int>(lane + 32 * i) : -1;
+    for (unsigned i = 0; i < P; ++i)
         score[i] = i < held ? logit(lane + 32 * i) : 0.0f;
-    }
     scores<P>(function, score, held);
 #pragma unroll
     for (unsigned i = 0; i < P; ++i)
-        ranked[i] = i < held ? selection::ranked(seismic_add_rn(score[i], bias(expert[i]))) : -__int_as_float(0x7f800000);
+        ranked[i] = i < held ? selection::ranked(seismic_add_rn(score[i], bias(static_cast<int>(lane + 32 * i))))
+                             : excluded();
 #pragma unroll
     for (unsigned i = 0; i < P; ++i)
         if (i < held)
-            keys(static_cast<unsigned>(expert[i]), ranked[i]);
-    sort<P>(ranked, score, expert);
+            keys(lane + 32 * i, ranked[i]);
+
+    float head_r, head_s;
+    int head_e;
+    lane_max<P>(ranked, score, lane, -1, head_r, head_s, head_e);
 
     Selected<K> selected;
+#pragma unroll
     for (unsigned rank = 0; rank < K; ++rank) {
         float best;
-        const int winner = reduce::argmax<reduce::HigherIndex>(ranked[0], expert[0], best);
+        const int winner = reduce::argmax<reduce::HigherIndex>(head_r, head_e, best);
         // The winner's unbiased score, from its lane.
-        const float winner_score = __shfl_sync(0xffffffffu, score[0], static_cast<unsigned>(winner) % 32u);
-        if (expert[0] == winner)
-            pop<P>(ranked, score, expert);
+        const float winner_score = __shfl_sync(0xffffffffu, head_s, static_cast<unsigned>(winner) % 32u);
+        if (rank + 1u < K && head_e == winner)
+            lane_max<P>(ranked, score, lane, winner, head_r, head_s, head_e);
         selected.chosen[K - 1 - rank] = winner_score;
         selected.winners[K - 1 - rank] = winner;
     }

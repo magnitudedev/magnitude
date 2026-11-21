@@ -843,6 +843,7 @@ mod tests {
             module
                 .native_implementation(module.entries()[0].id, backend)
                 .unwrap()
+                .at_device(&crate::device::BackendFloor(backend))
                 .walk_admissible(&crate::checked::NativeSpecialization::new(), |point| {
                     tiles.push((point.param("SUB_M").unwrap(), point.param("SUB_N").unwrap()));
                     true

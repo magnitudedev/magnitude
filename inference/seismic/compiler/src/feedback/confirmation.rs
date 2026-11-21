@@ -10,6 +10,15 @@ pub(super) enum Arm {
     Challenger,
 }
 
+impl Arm {
+    fn other(self) -> Self {
+        match self {
+            Self::Incumbent => Self::Challenger,
+            Self::Challenger => Self::Incumbent,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Verdict {
     Pending,
@@ -19,16 +28,46 @@ pub(super) enum Verdict {
     Inconclusive,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalVerdict {
+    Improved,
+    Inferior,
+    EnvironmentChanged,
+    Inconclusive,
+}
+
+impl From<FinalVerdict> for Verdict {
+    fn from(verdict: FinalVerdict) -> Self {
+        match verdict {
+            FinalVerdict::Improved => Self::Improved,
+            FinalVerdict::Inferior => Self::Inferior,
+            FinalVerdict::EnvironmentChanged => Self::EnvironmentChanged,
+            FinalVerdict::Inconclusive => Self::Inconclusive,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairState {
+    BetweenPairs,
+    FirstPending(Arm),
+    SecondReady(Arm),
+    SecondPending(Arm),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComparisonPhase {
+    Active { stage: u32, pair: PairState },
+    Decided { stage: u32, verdict: FinalVerdict },
+}
+
 pub(super) struct Comparison {
     event: u64,
     seed: u64,
-    stage: u32,
     environment: [u8; 32],
     incumbent: Vec<f64>,
     challenger: Vec<f64>,
-    pending: Option<Arm>,
-    pair_first: Option<Arm>,
-    verdict: Verdict,
+    phase: ComparisonPhase,
 }
 
 impl Comparison {
@@ -38,12 +77,12 @@ impl Comparison {
             event,
             seed,
             environment,
-            stage: 0,
             incumbent: Vec::new(),
             challenger: Vec::new(),
-            pending: None,
-            pair_first: None,
-            verdict: Verdict::Pending,
+            phase: ComparisonPhase::Active {
+                stage: 0,
+                pair: PairState::BetweenPairs,
+            },
         }
     }
 
@@ -51,50 +90,77 @@ impl Comparison {
         self.seed
     }
     pub fn stage(&self) -> u32 {
-        self.stage
+        match self.phase {
+            ComparisonPhase::Active { stage, .. } | ComparisonPhase::Decided { stage, .. } => stage,
+        }
     }
     pub fn verdict(&self) -> Verdict {
-        self.verdict
+        match self.phase {
+            ComparisonPhase::Active { .. } => Verdict::Pending,
+            ComparisonPhase::Decided { verdict, .. } => verdict.into(),
+        }
+    }
+    fn stage_samples_complete(&self, stage: u32) -> bool {
+        let target = 8usize.checked_shl(stage).unwrap_or(usize::MAX);
+        self.incumbent.len() == target && self.challenger.len() == target
     }
     pub fn stage_complete(&self) -> bool {
-        let target = 8usize.checked_shl(self.stage).unwrap_or(usize::MAX);
-        self.incumbent.len() == target && self.challenger.len() == target
+        self.stage_samples_complete(self.stage())
     }
 
     /// One pair has randomized order, preventing either arm from owning the
     /// systematically colder or later position. An interrupted request repeats
     /// the same arm until its completed observation is recorded.
     pub fn next(&mut self, random: &mut Random) -> Option<Arm> {
-        if self.verdict != Verdict::Pending || self.stage_complete() {
+        let ComparisonPhase::Active { stage, pair } = self.phase else {
+            return None;
+        };
+        if self.stage_samples_complete(stage) {
             return None;
         }
-        if let Some(arm) = self.pending {
-            return Some(arm);
-        }
-        let arm = match self.pair_first.take() {
-            Some(Arm::Incumbent) => Arm::Challenger,
-            Some(Arm::Challenger) => Arm::Incumbent,
-            None => {
+        let (arm, next_pair) = match pair {
+            PairState::BetweenPairs => {
                 let arm = if random.next() & 1 == 0 {
                     Arm::Incumbent
                 } else {
                     Arm::Challenger
                 };
-                self.pair_first = Some(arm);
-                arm
+                (arm, PairState::FirstPending(arm))
             }
+            PairState::FirstPending(arm) => (arm, PairState::FirstPending(arm)),
+            PairState::SecondReady(arm) => (arm, PairState::SecondPending(arm)),
+            PairState::SecondPending(arm) => (arm, PairState::SecondPending(arm)),
         };
-        self.pending = Some(arm);
+        self.phase = ComparisonPhase::Active {
+            stage,
+            pair: next_pair,
+        };
         Some(arm)
     }
 
     pub fn record(&mut self, sample: Duration, environment: [u8; 32]) {
-        let arm = self
-            .pending
-            .take()
-            .expect("observation requires a pending trial");
+        let (stage, arm, next_pair) = match self.phase {
+            ComparisonPhase::Active {
+                stage,
+                pair: PairState::FirstPending(arm),
+            } => (stage, arm, PairState::SecondReady(arm.other())),
+            ComparisonPhase::Active {
+                stage,
+                pair: PairState::SecondPending(arm),
+            } => (stage, arm, PairState::BetweenPairs),
+            ComparisonPhase::Active {
+                pair: PairState::BetweenPairs | PairState::SecondReady(_),
+                ..
+            }
+            | ComparisonPhase::Decided { .. } => {
+                panic!("observation requires a pending trial");
+            }
+        };
         if environment != self.environment {
-            self.verdict = Verdict::EnvironmentChanged;
+            self.phase = ComparisonPhase::Decided {
+                stage,
+                verdict: FinalVerdict::EnvironmentChanged,
+            };
             return;
         }
         match arm {
@@ -102,31 +168,56 @@ impl Comparison {
             Arm::Challenger => &mut self.challenger,
         }
         .push(sample.as_secs_f64());
-        if self.stage_complete() {
-            let allowance = alpha(0.05, self.event, self.stage);
+        if next_pair == PairState::BetweenPairs && self.stage_samples_complete(stage) {
+            let allowance = alpha(0.05, self.event, stage);
             let incumbent = median_interval(&self.incumbent, allowance);
             let challenger = median_interval(&self.challenger, allowance);
             if challenger.upper < incumbent.lower {
-                self.verdict = Verdict::Improved;
+                self.phase = ComparisonPhase::Decided {
+                    stage,
+                    verdict: FinalVerdict::Improved,
+                };
+                return;
             } else if challenger.lower > incumbent.upper {
-                self.verdict = Verdict::Inferior;
+                self.phase = ComparisonPhase::Decided {
+                    stage,
+                    verdict: FinalVerdict::Inferior,
+                };
+                return;
             }
         }
+        self.phase = ComparisonPhase::Active {
+            stage,
+            pair: next_pair,
+        };
     }
 
     /// A scheduler must explicitly buy another stage. Merely asking for the
     /// verdict cannot inspect a new interval or spend fresh error probability.
     pub fn advance(&mut self) -> bool {
-        if self.verdict != Verdict::Pending || !self.stage_complete() {
+        let ComparisonPhase::Active {
+            stage,
+            pair: PairState::BetweenPairs,
+        } = self.phase
+        else {
+            return false;
+        };
+        if !self.stage_samples_complete(stage) {
             return false;
         }
         // Bounded per-comparison storage; equal arms must not consume the
         // entire campaign. This stops without claiming either arm is better.
         if self.incumbent.len() >= 4096 {
-            self.verdict = Verdict::Inconclusive;
+            self.phase = ComparisonPhase::Decided {
+                stage,
+                verdict: FinalVerdict::Inconclusive,
+            };
             return false;
         }
-        self.stage += 1;
+        self.phase = ComparisonPhase::Active {
+            stage: stage + 1,
+            pair: PairState::BetweenPairs,
+        };
         true
     }
 }

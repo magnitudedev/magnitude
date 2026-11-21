@@ -56,26 +56,14 @@
 
 #include "../core/activation.h"
 #include "../core/functions.h"
+#include "join.h"
 #include <seismic/forms.h>
 #include <seismic/activation.h>
 
 namespace projection {
 
-// Register-array loops are fully unrolled: an array indexed by a rolled loop
-// lives in stack memory.
-#define PROJECTION_UNROLL _Pragma("clang loop unroll(full)")
-
 // ---------------------------------------------------------------------------
 // Shared pieces.
-
-// Row maps: which input row feeds projected row m.
-struct AllRows {
-    uint at(uint m) const { return m; }
-};
-struct SelectedRows {
-    device const int *table;
-    uint at(uint m) const { return uint(table[m]); }
-};
 
 // The rows of one weight tensor (decoder W, `k` logical values per row),
 // optionally gathered through a row table (the selected vocabulary rows):
@@ -185,268 +173,6 @@ struct CoherentStore {
         store(m, n + 1u, second);
     }
 };
-
-template <typename A, typename Rows>
-struct Residual {
-    element::Out<element::F32> y;
-    ulong stride0, stride1;
-    device const float *residual;
-    ulong residual0, residual1;
-    Rows rows;
-    void store(uint m, uint n, float value) const {
-        y.put(ulong(m) * stride0 + ulong(n) * stride1,
-            residual[ulong(rows.at(m)) * residual0 + ulong(n) * residual1] + A::round(value));
-    }
-    void store2(uint m, uint n, float first, float second) const {
-        store(m, n, first);
-        store(m, n + 1u, second);
-    }
-    // Row m resolved once (its result row and its residual row), for a
-    // caller that stores several columns of it.
-    struct Row {
-        element::Out<element::F32> y;
-        device const float *residual;
-        ulong stride1, residual1;
-        void store(uint n, float value) const {
-            y.put(ulong(n) * stride1, residual[ulong(n) * residual1] + A::round(value));
-        }
-        // Columns n .. n + 3: one vector load and store on unit strides.
-        void store4(uint n, float4 values) const {
-            float4 rounded;
-            PROJECTION_UNROLL
-            for (uint i = 0; i < 4; ++i)
-                rounded[i] = A::round(values[i]);
-            if (stride1 == 1 && residual1 == 1) {
-                const float4 from = float4(*reinterpret_cast<device const packed_float4 *>(residual + n));
-                y.put4(n, from + rounded);
-                return;
-            }
-            PROJECTION_UNROLL
-            for (uint i = 0; i < 4; ++i)
-                y.put(ulong(n + i) * stride1, residual[ulong(n + i) * residual1] + rounded[i]);
-        }
-        // Columns n .. n + 7 from their sums as (even, odd): two vector
-        // loads and stores on unit strides.
-        void store8(uint n, float4 even, float4 odd) const {
-            float4 low = float4(even.x, odd.x, even.y, odd.y), high = float4(even.z, odd.z, even.w, odd.w);
-            PROJECTION_UNROLL
-            for (uint i = 0; i < 4; ++i) {
-                low[i] = A::round(low[i]);
-                high[i] = A::round(high[i]);
-            }
-            if (stride1 == 1 && residual1 == 1) {
-                device const packed_float4 *from = reinterpret_cast<device const packed_float4 *>(residual + n);
-                y.put4(n, float4(from[0]) + low);
-                y.put4(n + 4u, float4(from[1]) + high);
-                return;
-            }
-            PROJECTION_UNROLL
-            for (uint i = 0; i < 4; ++i) {
-                y.put(ulong(n + i) * stride1, residual[ulong(n + i) * residual1] + low[i]);
-                y.put(ulong(n + 4u + i) * stride1, residual[ulong(n + 4u + i) * residual1] + high[i]);
-            }
-        }
-    };
-    Row row(uint m) const {
-        return Row{y.offset(ulong(m) * stride0), residual + ulong(rows.at(m)) * residual0, stride1, residual1};
-    }
-};
-
-// `scatter`: each of the STREAMS hyper-connection streams of the residual
-// plus the output times the stream's inject value,
-//   y[m, s * width + n] = residual[row(m), s * width + n] + round_A(acc) * inject[m, s]   (F32),
-// or (COMBED) the streams mixed by the comb that follows the inject values,
-//   y[m, d * width + n] = sum_s comb[m, s, d] residual[row(m), s * width + n] + round_A(acc) * inject[m, d],
-// with `Residual`'s interface (column strides are the streams' too).
-template <typename A, typename Rows, uint STREAMS, bool COMBED>
-struct Scatter {
-    element::Out<element::F32> y;
-    ulong stride0, stride1;
-    device const float *residual;
-    ulong residual0, residual1;
-    Rows rows;
-    device const float *inject;
-    ulong inject0;
-    uint width;
-    struct Row {
-        element::Out<element::F32> y;
-        device const float *residual;
-        ulong stride1, residual1;
-        device const float *inject;
-        uint width;
-        void store(uint n, float value) const {
-            const float rounded = A::round(value);
-            if (!COMBED) {
-                PROJECTION_UNROLL
-                for (uint s = 0; s < STREAMS; ++s) {
-                    const ulong column = ulong(s * width + n);
-                    y.put(column * stride1, residual[column * residual1] + rounded * inject[s]);
-                }
-                return;
-            }
-            float streams[STREAMS];
-            PROJECTION_UNROLL
-            for (uint s = 0; s < STREAMS; ++s) {
-                streams[s] = residual[ulong(s * width + n) * residual1];
-            }
-            device const float *comb = inject + STREAMS;
-            PROJECTION_UNROLL
-            for (uint d = 0; d < STREAMS; ++d) {
-                float mixed = 0.0f;
-                PROJECTION_UNROLL
-                for (uint s = 0; s < STREAMS; ++s) {
-                    mixed = mixed + comb[s * STREAMS + d] * streams[s];
-                }
-                y.put(ulong(d * width + n) * stride1, mixed + rounded * inject[d]);
-            }
-        }
-        void store4_with(uint n, float4 rounded, thread const float (&inj)[STREAMS],
-            thread const float (&comb)[COMBED ? STREAMS * STREAMS : 1]) const {
-            if constexpr (!COMBED) {
-                if (stride1 == 1 && residual1 == 1) {
-                    PROJECTION_UNROLL
-                    for (uint s = 0; s < STREAMS; ++s) {
-                        const ulong column = ulong(s) * width + n;
-                        const float4 base = float4(*reinterpret_cast<device const packed_float4 *>(residual + column));
-                        y.put4(column, base + rounded * inj[s]);
-                    }
-                    return;
-                }
-                PROJECTION_UNROLL
-                for (uint s = 0; s < STREAMS; ++s) {
-                    const ulong base_col = ulong(s) * width + n;
-                    PROJECTION_UNROLL
-                    for (uint i = 0; i < 4; ++i) {
-                        const ulong column = base_col + i;
-                        y.put(column * stride1, residual[column * residual1] + rounded[i] * inj[s]);
-                    }
-                }
-            } else {
-                if (stride1 == 1 && residual1 == 1) {
-                    float4 streams[STREAMS];
-                    PROJECTION_UNROLL
-                    for (uint s = 0; s < STREAMS; ++s) {
-                        streams[s] = float4(*reinterpret_cast<device const packed_float4 *>(
-                            residual + ulong(s) * width + n));
-                    }
-                    PROJECTION_UNROLL
-                    for (uint d = 0; d < STREAMS; ++d) {
-                        float4 mixed = float4(0.0f);
-                        PROJECTION_UNROLL
-                        for (uint s = 0; s < STREAMS; ++s) {
-                            mixed = mixed + comb[s * STREAMS + d] * streams[s];
-                        }
-                        y.put4(ulong(d) * width + n, mixed + rounded * inj[d]);
-                    }
-                    return;
-                }
-                PROJECTION_UNROLL
-                for (uint i = 0; i < 4; ++i) {
-                    float streams[STREAMS];
-                    PROJECTION_UNROLL
-                    for (uint s = 0; s < STREAMS; ++s) {
-                        streams[s] = residual[(ulong(s) * width + n + i) * residual1];
-                    }
-                    PROJECTION_UNROLL
-                    for (uint d = 0; d < STREAMS; ++d) {
-                        float mixed = 0.0f;
-                        PROJECTION_UNROLL
-                        for (uint s = 0; s < STREAMS; ++s) {
-                            mixed = mixed + comb[s * STREAMS + d] * streams[s];
-                        }
-                        y.put((ulong(d) * width + n + i) * stride1, mixed + rounded[i] * inj[d]);
-                    }
-                }
-            }
-        }
-        void store4(uint n, float4 values) const {
-            float4 rounded;
-            PROJECTION_UNROLL
-            for (uint i = 0; i < 4; ++i)
-                rounded[i] = A::round(values[i]);
-            float inj[STREAMS];
-            PROJECTION_UNROLL
-            for (uint s = 0; s < STREAMS; ++s)
-                inj[s] = inject[s];
-            float comb[COMBED ? STREAMS * STREAMS : 1];
-            if constexpr (COMBED) {
-                device const float *comb_ptr = inject + STREAMS;
-                PROJECTION_UNROLL
-                for (uint i = 0; i < STREAMS * STREAMS; ++i)
-                    comb[i] = comb_ptr[i];
-            }
-            store4_with(n, rounded, inj, comb);
-        }
-        void store8(uint n, float4 even, float4 odd) const {
-            float4 low = float4(even.x, odd.x, even.y, odd.y), high = float4(even.z, odd.z, even.w, odd.w);
-            PROJECTION_UNROLL
-            for (uint i = 0; i < 4; ++i) {
-                low[i] = A::round(low[i]);
-                high[i] = A::round(high[i]);
-            }
-            float inj[STREAMS];
-            PROJECTION_UNROLL
-            for (uint s = 0; s < STREAMS; ++s)
-                inj[s] = inject[s];
-            float comb[COMBED ? STREAMS * STREAMS : 1];
-            if constexpr (COMBED) {
-                device const float *comb_ptr = inject + STREAMS;
-                PROJECTION_UNROLL
-                for (uint i = 0; i < STREAMS * STREAMS; ++i)
-                    comb[i] = comb_ptr[i];
-            }
-            store4_with(n, low, inj, comb);
-            store4_with(n + 4u, high, inj, comb);
-        }
-    };
-    Row row(uint m) const {
-        return Row{y.offset(ulong(m) * stride0), residual + ulong(rows.at(m)) * residual0, stride1, residual1,
-            inject + ulong(m) * inject0, width};
-    }
-    void store(uint m, uint n, float value) const { row(m).store(n, value); }
-    void store2(uint m, uint n, float first, float second) const {
-        store(m, n, first);
-        store(m, n + 1u, second);
-    }
-};
-
-// An output entry's epilogue: `Residual`, or `Scatter` over STREAMS streams
-// when the entry takes inject values (COMBED: and a comb after them). `make`
-// forms either from every field (`Residual` reads the leading ones).
-template <typename A, typename Rows, uint STREAMS, bool INJECTED, bool COMBED>
-struct OutputOf {
-    typedef Scatter<A, Rows, STREAMS, COMBED> type;
-    static type make(element::Out<element::F32> y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
-        ulong residual1, Rows rows, device const float *inject, ulong inject0, uint width) {
-        return type{y, stride0, stride1, residual, residual0, residual1, rows, inject, inject0, width};
-    }
-};
-template <typename A, typename Rows>
-struct OutputOf<A, Rows, 1, false, false> {
-    typedef Residual<A, Rows> type;
-    static type make(element::Out<element::F32> y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
-        ulong residual1, Rows rows, device const float *, ulong, uint) {
-        return type{y, stride0, stride1, residual, residual0, residual1, rows};
-    }
-};
-
-// A routed sublayer's column n joining its row's residual (`routed_output`,
-// `routed_combine`): residual + selected + shared, in that order, or (INJECTED)
-// for each of the STREAMS streams residual[s] + (selected + shared) * inject[s].
-// `out`, `residual` and `inject` point at the row; strides are column strides.
-template <uint STREAMS, bool INJECTED>
-inline void routed_join(element::Out<element::F32> out, ulong out1, device const float *residual, ulong residual1,
-    device const float *inject, ulong width, ulong n, float selected, float shared) {
-    if (!INJECTED) {
-        out.put(n * out1, residual[n * residual1] + selected + shared);
-        return;
-    }
-    PROJECTION_UNROLL
-    for (uint s = 0; s < STREAMS; ++s) {
-        const ulong column = ulong(s) * width + n;
-        out.put(column * out1, residual[column * residual1] + (selected + shared) * inject[s]);
-    }
-}
 
 // A mix site's low-rank rows (`stream_mix_down`), over S streams:
 //   y = round_A(silu(acc / S))
@@ -2073,11 +1799,13 @@ inline void gemm_tall_paired(thread const In &in, thread const Out &out, thread 
 // activations in chunks
 // of `gemv_batch_chunk<NB>` columns, and each lane loads its next packet while
 // the current one multiplies. A batched GEMV launch declares
-//   shared_bytes (16640)
+//   shared_bytes (15488)
 // (8 * NB staged rows of `gemv_batch_chunk<NB> + 4` floats; a chunk is a
-// whole number of packets: 512 columns for NB = 1, 256 for NB = 2).
+// whole number of packets: 480 columns for NB = 1, 224 for NB = 2, leaving
+// headroom below 16 KiB for static threadgroup state so two threadgroups fit
+// per core).
 
-constant constexpr uint gemv_batch_shared_bytes = 16640;
+constant constexpr uint gemv_batch_shared_bytes = 15488;
 template <uint NB>
 constexpr uint gemv_batch_chunk() {
     return (gemv_batch_shared_bytes / (32u * NB) - 4u) / 32u * 32u;
@@ -2230,7 +1958,7 @@ struct gemv_batch_emit<true> {
 template <typename W, typename U, bool PAIRED, uint R, uint NB, bool COLUMNS = false, typename In, typename Out>
 inline void gemv_batch_body(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
-    uint simdgroups, uint sg, uint lane) {
+    uint simdgroups, uint sg, uint lane, uint first_packet = 0) {
     constexpr uint chunk = gemv_batch_chunk<NB>();
     constexpr uint pitch = chunk + 4u;
     constexpr bool QUARTERS = gemv_batch_quarters<W>::value;
@@ -2271,9 +1999,9 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
         // chunk or call finishes reading the staging first.
         if (active) {
             for (uint r = 0; r < R; ++r) {
-                a[r] = gemv_batch_load(w, a_at[r], c0 / 32u, a_run[r]);
+                a[r] = gemv_batch_load(w, a_at[r], first_packet + c0 / 32u, a_run[r]);
                 if (PAIRED)
-                    b[r] = gemv_batch_load(u, b_at[r], c0 / 32u, b_run[r]);
+                    b[r] = gemv_batch_load(u, b_at[r], first_packet + c0 / 32u, b_run[r]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2300,9 +2028,9 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
         for (uint local = 0; local < packets; ++local) {
             if (local + 1u < packets) {
                 for (uint r = 0; r < R; ++r) {
-                    a_next[r] = gemv_batch_load(w, a_at[r], c0 / 32u + local + 1u, a_run[r]);
+                    a_next[r] = gemv_batch_load(w, a_at[r], first_packet + c0 / 32u + local + 1u, a_run[r]);
                     if (PAIRED)
-                        b_next[r] = gemv_batch_load(u, b_at[r], c0 / 32u + local + 1u, b_run[r]);
+                        b_next[r] = gemv_batch_load(u, b_at[r], first_packet + c0 / 32u + local + 1u, b_run[r]);
                 }
             }
             simdgroup_float8x8 x[4][NB];
@@ -2328,11 +2056,13 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
 template <typename W, uint R, typename In, typename Out>
 inline void gemv_batch_runtime(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared, uint simdgroups,
-    uint sg, uint lane) {
+    uint sg, uint lane, uint first_packet = 0) {
     if (m_rows <= 8)
-        gemv_batch_body<W, W, false, R, 1>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg, lane);
+        gemv_batch_body<W, W, false, R, 1>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg, lane,
+            first_packet);
     else
-        gemv_batch_body<W, W, false, R, 2>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg, lane);
+        gemv_batch_body<W, W, false, R, 2>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg, lane,
+            first_packet);
 }
 
 // `gemv_batch_runtime` with a column epilogue (`gemv_emit<true>`).
@@ -2740,6 +2470,45 @@ inline void gemv_matrix_runs_body(thread const In &in, thread const Out &out,
         for (uint f = 0; f < NB; ++f)
             y[f] = metal::fma(float2(d), reinterpret_cast<thread float2 &>(acc[f].thread_elements()), y[f]);
     }
+    const uint tail = (k / 32u) & 7u;
+    if (tail != 0u && part == PARTS - 1u) {
+        const uint block = blocks;
+        const typename runs::fields scales = runs::block_fields(row, block);
+        const float d = runs::block_factor(row, block);
+        _Pragma("clang loop unroll(disable)")
+        for (uint b = 0; b < tail; ++b) {
+            const uint g = block * 8u + b;
+            const float scale = runs::run_scale(scales, b, run_of);
+            const typename lanes::words words = lanes::template load<true>(w.matrix, codes, g);
+            const lane_operands<lanes> pairs = lane_operands<lanes>::of(words);
+            uint2 stored[NB][2];
+            PROJECTION_UNROLL
+            for (uint f = 0; f < NB; ++f) {
+                PROJECTION_UNROLL
+                for (uint j = 0; j < 2; ++j)
+                    stored[f][j] = matrix_stored<UNIT>(in, stored_rows[f][j], 32u * g,
+                        8u * (at.y / 2u) + 4u * (at.y & 1u));
+            }
+            PROJECTION_UNROLL
+            for (uint s = 0; s < 4; ++s) {
+                metal::conditional_t<halves, simdgroup_half8x8, simdgroup_float8x8> left;
+                reinterpret_cast<thread operand &>(left.thread_elements()) = operand(pairs.pair(s)) * operand(scale);
+                PROJECTION_UNROLL
+                for (uint f = 0; f < NB; ++f) {
+                    simdgroup_float8x8 right;
+                    reinterpret_cast<thread float2 &>(right.thread_elements()) = float2(
+                        matrix_value<A>(stored[f][0], s), matrix_value<A>(stored[f][1], s));
+                    if (b == 0 && s == 0)
+                        simdgroup_multiply(acc[f], left, right);
+                    else
+                        simdgroup_multiply_accumulate(acc[f], left, right, acc[f]);
+                }
+            }
+        }
+        PROJECTION_UNROLL
+        for (uint f = 0; f < NB; ++f)
+            y[f] = metal::fma(float2(d), reinterpret_cast<thread float2 &>(acc[f].thread_elements()), y[f]);
+    }
     if (!matrix_exchange<NB, PARTS>(y, parts, part, sg, lane) || n >= rows)
         return;
     PROJECTION_UNROLL
@@ -3067,6 +2836,97 @@ inline void gemv_matrix_products(thread const In &in, thread const Out &out, thr
             }
         }
     }
+    const uint tail = (k / 32u) & 7u;
+    if (tail != 0u && part == PARTS - 1u) {
+        const uint block = blocks;
+        const typename coded::fields fields = coded::block_fields(row, block);
+        const float2 factors = coded::block_factors(row, block);
+        typename coded_up::fields up_fields;
+        float2 up_factors;
+        if constexpr (PAIRED) {
+            up_fields = coded_up::block_fields(up_row, block);
+            up_factors = coded_up::block_factors(up_row, block);
+        }
+        _Pragma("clang loop unroll(disable)")
+        for (uint b = 0; b < tail; ++b) {
+            const uint g = block * 8u + b;
+            const uint scale = coded::scale_code(fields, b);
+            const typename coded::words words = coded::load(w.matrix, codes, g);
+            uint up_scale;
+            typename coded_up::words up_words;
+            if constexpr (PAIRED) {
+                up_scale = coded_up::scale_code(up_fields, b);
+                up_words = coded_up::load(u.matrix, up_codes, g);
+            }
+            uint2 stored[NB][2];
+            PROJECTION_UNROLL
+            for (uint f = 0; f < NB; ++f) {
+                PROJECTION_UNROLL
+                for (uint j = 0; j < 2; ++j) {
+                    stored[f][j] = matrix_stored<UNIT>(in, stored_rows[f][j], 32u * g,
+                        8u * (at.y / 2u) + 4u * (at.y & 1u));
+                }
+            }
+            PROJECTION_UNROLL
+            for (uint s = 0; s < 4; ++s) {
+                simdgroup_half8x8 left;
+                reinterpret_cast<thread half2 &>(left.thread_elements()) =
+                    as_type<half2>(coded::pair(words, s) * scale);
+                simdgroup_half8x8 up_left;
+                if constexpr (PAIRED)
+                    reinterpret_cast<thread half2 &>(up_left.thread_elements()) =
+                        as_type<half2>(coded_up::pair(up_words, s) * up_scale);
+                PROJECTION_UNROLL
+                for (uint f = 0; f < NB; ++f) {
+                    simdgroup_float8x8 right;
+                    reinterpret_cast<thread float2 &>(right.thread_elements()) = float2(
+                        matrix_value<A>(stored[f][0], s), matrix_value<A>(stored[f][1], s));
+                    if (b == 0 && s == 0)
+                        simdgroup_multiply(acc[f], left, right);
+                    else
+                        simdgroup_multiply_accumulate(acc[f], left, right, acc[f]);
+                    if constexpr (PAIRED) {
+                        if (b == 0 && s == 0)
+                            simdgroup_multiply(acc_up[f], up_left, right);
+                        else
+                            simdgroup_multiply_accumulate(acc_up[f], up_left, right, acc_up[f]);
+                    }
+                }
+            }
+        }
+        simdgroup_half8x8 left;
+        const uint mc0 = at.x < tail ? coded::min_code(fields, at.x) : 0u;
+        const uint mc1 = at.x + 1u < tail ? coded::min_code(fields, at.x + 1u) : 0u;
+        reinterpret_cast<thread half2 &>(left.thread_elements()) = as_type<half2>(mc0 | (mc1 << 16));
+        simdgroup_half8x8 up_left;
+        if constexpr (PAIRED) {
+            const uint umc0 = at.x < tail ? coded_up::min_code(up_fields, at.x) : 0u;
+            const uint umc1 = at.x + 1u < tail ? coded_up::min_code(up_fields, at.x + 1u) : 0u;
+            reinterpret_cast<thread half2 &>(up_left.thread_elements()) = as_type<half2>(umc0 | (umc1 << 16));
+        }
+        PROJECTION_UNROLL
+        for (uint f = 0; f < NB; ++f) {
+            float2 sums = float2(0.0f);
+            if (at.y < tail) {
+                if constexpr (STAGED)
+                    sums = *reinterpret_cast<threadgroup const float2 *>(
+                        block_sums + (block * 8u + at.y) * 8u * NB + 8u * f + at.x);
+                else
+                    sums = matrix_block_sums<UNIT>(in, m[f][0], m[f][1], block * 8u + at.y);
+            }
+            simdgroup_float8x8 right;
+            reinterpret_cast<thread float2 &>(right.thread_elements()) = sums;
+            simdgroup_multiply(mins[f], left, right);
+            y[f] = metal::fma(float2(factors.x * 0x1p24f), reinterpret_cast<thread float2 &>(acc[f].thread_elements()),
+                metal::fma(float2(factors.y * 0x1p24f), reinterpret_cast<thread float2 &>(mins[f].thread_elements()),
+                    y[f]));
+            if constexpr (PAIRED) {
+                simdgroup_multiply(mins_up[f], up_left, right);
+                y_up[f] = metal::fma(float2(up_factors.x * 0x1p24f), reinterpret_cast<thread float2 &>(acc_up[f].thread_elements()),
+                    metal::fma(float2(up_factors.y * 0x1p24f), reinterpret_cast<thread float2 &>(mins_up[f].thread_elements()), y_up[f]));
+            }
+        }
+    }
     if constexpr (PAIRED) {
         const bool owner = matrix_exchange<NB, PARTS>(y, parts, part, sg, lane);
         matrix_exchange<NB, PARTS>(y_up, parts, part, sg, lane);
@@ -3299,10 +3159,9 @@ inline void gemv_matrix_paired_body(thread const In &in, thread const Out &out,
         gemv_matrix_symmetric<true, NB, PARTS, false>(in, out, gate, up, m_rows, rows, k, group, shared, simdgroups,
             sg, lane);
         return;
-    }
-    // The two products share each loaded and decoded activation fragment.
-    // Each accumulator keeps the single-product instruction order.
-    if constexpr (matrix_form<G>::stages_block_sums && matrix_form<U>::stages_block_sums) {
+    } else if constexpr (matrix_form<G>::stages_block_sums && matrix_form<U>::stages_block_sums) {
+        // The two products share each loaded and decoded activation fragment.
+        // Each accumulator keeps the single-product instruction order.
         const bool staged = gemv_matrix_shared_bytes(k, NB, simdgroups) <= gemv_matrix_staged_bytes;
         if (matrix_unit(in)) {
             if (staged)
@@ -3319,13 +3178,14 @@ inline void gemv_matrix_paired_body(thread const In &in, thread const Out &out,
                 m_rows, rows, k, group, shared, simdgroups, sg, lane);
         }
         return;
+    } else {
+        float2 gate_sums[NB];
+        const matrix_pair_gate first{gate_sums};
+        const matrix_pair_up<Out> second{out, gate_sums};
+        matrix_form<G>::template run<NB, PARTS>(in, first, gate, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+        matrix_form<U>::template run<NB, PARTS, matrix_form<G>::stages_block_sums>(in, second, up,
+            m_rows, rows, k, group, shared, simdgroups, sg, lane);
     }
-    float2 gate_sums[NB];
-    const matrix_pair_gate first{gate_sums};
-    const matrix_pair_up<Out> second{out, gate_sums};
-    matrix_form<G>::template run<NB, PARTS>(in, first, gate, m_rows, rows, k, group, shared, simdgroups, sg, lane);
-    matrix_form<U>::template run<NB, PARTS, matrix_form<G>::stages_block_sums>(in, second, up,
-        m_rows, rows, k, group, shared, simdgroups, sg, lane);
 }
 
 template <typename G, typename U, uint PARTS, typename In, typename Out>
@@ -3492,11 +3352,14 @@ inline void int8_quantize(thread const In &in, thread const int8_scratch &s, uin
 // A 32-row weight tile's factored coefficients, in 16-byte words: the rows'
 // factors of 256-column block `block`, and their scale bytes of the four
 // blocks from `g` (a multiple of four), for row class r.
+inline uint int8_blocks(uint groups) { return (groups + 7u) / 8u; }
 inline ulong int8_factor_at(uint tile, uint block, uint r, uint groups) {
-    return ulong(tile) * groups * 3u + block * 8u + r;
+    const uint blocks = int8_blocks(groups);
+    return ulong(tile) * blocks * 24u + block * 8u + r;
 }
 inline ulong int8_scale_bytes_at(uint tile, uint g, uint r, uint groups) {
-    return ulong(tile) * groups * 3u + groups + g * 2u + r;
+    const uint blocks = int8_blocks(groups);
+    return ulong(tile) * blocks * 24u + blocks * 8u + g * 2u + r;
 }
 
 // The coefficient pass: one thread per (32-row weight tile, row class r,
@@ -3504,18 +3367,19 @@ inline ulong int8_scale_bytes_at(uint tile, uint g, uint r, uint groups) {
 template <typename W>
 inline void int8_coefficients(thread const Weights<W> &w, thread const int8_scratch &s, uint rows, uint columns,
     uint item) {
-    const uint groups = columns / 32u, blocks = columns / 256u;
+    const uint groups = columns / 32u, blocks = int8_blocks(groups);
     const uint set = item / blocks, block = item % blocks;
     const uint tile = set / 8u, r = set & 7u;
     if (tile * 32u >= rows)
         return;
+    const uint count = metal::min(8u, groups - block * 8u);
     float4 factor;
     float scale[4][8], bias[4][8];
     PROJECTION_UNROLL
     for (uint q = 0; q < 4; ++q) {
         const uint n = tile * 32u + r + 8u * q;
         float row_factor;
-        packets::int8<W>::coefficients(w.locate(n), block, row_factor, scale[q], bias[q]);
+        packets::int8<W>::coefficients(w.locate(n), block, count, row_factor, scale[q], bias[q]);
         factor[q] = row_factor;
     }
     if constexpr (packets::int8<W>::factored) {
@@ -3535,8 +3399,10 @@ inline void int8_coefficients(thread const Weights<W> &w, thread const int8_scra
         device float4 *scales = reinterpret_cast<device float4 *>(s.coefficients)
             + (ulong(tile) * groups + block * 8u) * 8u + r;
         PROJECTION_UNROLL
-        for (uint i = 0; i < 8; ++i)
-            scales[i * 8u] = factor * float4(scale[0][i], scale[1][i], scale[2][i], scale[3][i]);
+        for (uint i = 0; i < 8; ++i) {
+            if (i < count)
+                scales[i * 8u] = factor * float4(scale[0][i], scale[1][i], scale[2][i], scale[3][i]);
+        }
     }
     if constexpr (packets::int8<W>::biased) {
         // A 16-row tile's rows r, r + 8 by four blocks are a lane's eight
@@ -3555,7 +3421,7 @@ inline void int8_coefficients(thread const Weights<W> &w, thread const int8_scra
             }
             // The blocks that pad the min-term product's last 32 are zero.
             if (block == blocks - 1u) {
-                for (uint g = groups; g < int8_min_chunks(groups) * 32u; g += 4u)
+                for (uint g = blocks * 8u; g < int8_min_chunks(groups) * 32u; g += 4u)
                     *reinterpret_cast<device uint4 *>(s.biases + int8_bias_at(n, g, groups)) = uint4(0u);
             }
         }
