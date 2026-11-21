@@ -20,21 +20,53 @@ kernel void post_norm_residual(
     threadgroup float partials[8];
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> result(result_cells);
     const ulong width = SEISMIC_DIM_D;
+    const ulong width4 = width & ~3ul;
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
     device const float *p = projected + ulong(row) * SEISMIC_PROJECTED_STRIDE_0;
     float squares = 0.0f;
-    for (ulong i = thread_index; i < width; i += 256u) {
-        const float v = p[i * SEISMIC_PROJECTED_STRIDE_1];
-        squares = metal::fma(v, v, squares);
+    if (SEISMIC_PROJECTED_STRIDE_1 == 1ul) {
+        for (ulong i = ulong(thread_index) * 4ul; i < width4; i += 1024ul) {
+            const float4 v = float4(*reinterpret_cast<device const packed_float4 *>(p + i));
+            squares = metal::fma(v.x, v.x, squares);
+            squares = metal::fma(v.y, v.y, squares);
+            squares = metal::fma(v.z, v.z, squares);
+            squares = metal::fma(v.w, v.w, squares);
+        }
+        for (ulong i = width4 + thread_index; i < width; i += 256u) {
+            const float v = p[i];
+            squares = metal::fma(v, v, squares);
+        }
+    } else {
+        for (ulong i = thread_index; i < width; i += 256u) {
+            const float v = p[i * SEISMIC_PROJECTED_STRIDE_1];
+            squares = metal::fma(v, v, squares);
+        }
     }
     const float total = reduce::group_sum<8>(squares, partials, sg, lane);
     const float inverse = metal::rsqrt(total / float(width) + epsilon);
     device const float *r = residual + ulong(out_rows[ulong(row) * SEISMIC_OUT_ROWS_STRIDE_0]) * SEISMIC_RESIDUAL_STRIDE_0;
-    for (ulong i = thread_index; i < width; i += 256u) {
-        const float normalized = p[i * SEISMIC_PROJECTED_STRIDE_1] * inverse
-            * element::at<Norm>(norm, i * SEISMIC_NORM_STRIDE_0);
-        result.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + i * SEISMIC_RESULT_0_STRIDE_1,
-            (r[i * SEISMIC_RESIDUAL_STRIDE_1] + normalized) * scale);
+    const ulong result_row = ulong(row) * SEISMIC_RESULT_0_STRIDE_0;
+    if (SEISMIC_PROJECTED_STRIDE_1 == 1ul && SEISMIC_RESIDUAL_STRIDE_1 == 1ul
+        && SEISMIC_NORM_STRIDE_0 == 1ul && SEISMIC_RESULT_0_STRIDE_1 == 1ul) {
+        device const Norm::storage *norm_base = reinterpret_cast<device const Norm::storage *>(norm);
+        for (ulong i = ulong(thread_index) * 4ul; i < width4; i += 1024ul) {
+            const float4 pv = float4(*reinterpret_cast<device const packed_float4 *>(p + i));
+            const float4 rv = float4(*reinterpret_cast<device const packed_float4 *>(r + i));
+            const float4 nv = Norm::load4(norm_base + i);
+            const float4 normalized = (pv * inverse) * nv;
+            result.put4(result_row + i, (rv + normalized) * scale);
+        }
+        for (ulong i = width4 + thread_index; i < width; i += 256u) {
+            const float normalized = p[i] * inverse * element::at<Norm>(norm, i);
+            result.put(result_row + i, (r[i] + normalized) * scale);
+        }
+    } else {
+        for (ulong i = thread_index; i < width; i += 256u) {
+            const float normalized = p[i * SEISMIC_PROJECTED_STRIDE_1] * inverse
+                * element::at<Norm>(norm, i * SEISMIC_NORM_STRIDE_0);
+            result.put(result_row + i * SEISMIC_RESULT_0_STRIDE_1,
+                (r[i * SEISMIC_RESIDUAL_STRIDE_1] + normalized) * scale);
+        }
     }
 }
