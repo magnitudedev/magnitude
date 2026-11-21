@@ -2460,7 +2460,6 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             "checked parallel loops cannot carry reassigned state"
         );
         construction::SegmentConstruction {
-            capacity_pending: None,
             cursor: kernel.suspend(),
             environment,
             branch,
