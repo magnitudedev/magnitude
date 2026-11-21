@@ -27,7 +27,9 @@
 //! [`DIVISION_LIMIT_SECONDS`] and was formed from measured launches only.
 //!
 //! Standalone calls, and every launch of a launch-detail trace (timed one by
-//! one), are recorded launch by launch into one queue submission.
+//! one), are recorded launch by launch and divided into queue submissions under
+//! the same [`SUBMISSION_SECONDS`] budget so multi-repetition tuning and long
+//! traces stay clear of driver watchdogs too.
 //!
 //! A span mark inside a graph (`spans`) ends a segment of it and no part:
 //! a run not sampled executes the segments as one, and a sampled run stamps
@@ -173,6 +175,7 @@ pub(super) fn encode(
                 repetitions,
                 &segments,
                 &encoded,
+                &replays.costs,
                 &mut submissions,
                 || DirectBatch::timed(device, launches),
                 QueueSubmission::Timed,
@@ -182,15 +185,21 @@ pub(super) fn encode(
                 repetitions,
                 &segments,
                 &encoded,
+                &replays.costs,
                 &mut submissions,
                 || DirectBatch::new(device),
                 QueueSubmission::Measured,
             ),
         };
-        if let Err(error) = issued {
-            return Err(submissions.failed(error));
-        }
-        return Ok(Committed::Vulkan(submissions.into_submission(None)));
+        let kinds = match issued {
+            Ok(kinds) => kinds,
+            Err(error) => return Err(submissions.failed(error)),
+        };
+        let feedback = Feedback {
+            costs: Arc::clone(&replays.costs),
+            kinds,
+        };
+        return Ok(Committed::Vulkan(submissions.into_submission(Some(feedback))));
     };
     let segments = graph_segments(list, Some(&runs));
     let keys = ReplayKeys { runs, encoded: Some(&encoded) };
@@ -502,6 +511,11 @@ impl<K: Copy + Eq + Hash> LaunchCosts<K> {
         *self.unmeasured.lock().expect("launch cost lock is never poisoned") += estimate;
     }
 
+    /// The estimated time of one launch of kind `kind`, if measured.
+    fn estimate_one(&self, kind: K) -> Option<f64> {
+        self.lock().get(&kind).copied()
+    }
+
     /// The estimated time of launches counted by kind; `None` when a kind
     /// has not been measured.
     fn estimate(&self, kinds: &[(K, u32)]) -> Option<f64> {
@@ -546,6 +560,10 @@ fn sum<K: Eq + Hash>(seconds: &HashMap<K, f64>, kinds: &[(K, u32)]) -> Option<f6
             .get(kind)
             .map(|value| total + value * f64::from(*count))
     })
+}
+
+fn fits_submission(queued: Option<f64>, estimate: Option<f64>) -> bool {
+    matches!((queued, estimate), (Some(queued), Some(estimate)) if queued + estimate <= SUBMISSION_SECONDS)
 }
 
 /// Parts queued into batches: consecutive parts share a queue submission
@@ -655,10 +673,10 @@ impl<'a> Queued<'a> {
         estimate: Option<f64>,
         rebind: Option<Vec<Vec<u8>>>,
     ) -> Result<(), CallError> {
-        let joins = matches!(
-            (&self.open, estimate),
-            (Some((_, Some(queued), _)), Some(estimate)) if queued + estimate <= SUBMISSION_SECONDS
-        );
+        let joins = self
+            .open
+            .as_ref()
+            .is_some_and(|(_, queued, _)| fits_submission(*queued, estimate));
         if !joins {
             self.commit()?;
             self.open(Some(estimate))?;
@@ -770,21 +788,47 @@ pub(crate) struct VulkanSubmission {
 }
 
 /// Encode an ungraphed list (timed or plain measured) into one or more queue
-/// submissions split at timeline boundaries.
+/// submissions split at timeline boundaries and whenever adding the next launch
+/// would exceed [`SUBMISSION_SECONDS`] (or either the batch or launch is
+/// unmeasured, matching [`Queued`]). Returns each committed submission's launch
+/// kinds so completion teaches [`LaunchCosts`].
 fn encode_ungraphed<T: Timing>(
     list: &impl DispatchList,
     repetitions: usize,
     segments: &[(Range<usize>, usize)],
     encoded: &[Vec<bool>],
+    costs: &LaunchCosts<LaunchKind>,
     submissions: &mut Issuing,
     mut new_batch: impl FnMut() -> Result<DirectBatch<T>, ExecutionError>,
     wrap: impl Fn(DirectSubmission<T>) -> QueueSubmission,
-) -> Result<(), CallError> {
+) -> Result<Vec<Vec<(LaunchKind, u32)>>, CallError> {
     let mut batch = new_batch().map_err(CallError::Execution)?;
+    let mut queued: Option<f64> = Some(0.0);
+    let mut kinds: Vec<(LaunchKind, u32)> = Vec::new();
+    let mut batch_kinds: Vec<Vec<(LaunchKind, u32)>> = Vec::new();
     for _ in 0..repetitions {
         for (calls, boundary) in segments {
             each_launch(list, calls.clone(), encoded, |launch| match launch {
-                Some(launch) => batch.launch(launch),
+                Some(launch) => {
+                    let kind = launch.kind();
+                    let estimate = costs.estimate_one(kind);
+                    if !kinds.is_empty() && !fits_submission(queued, estimate) {
+                        let next = new_batch()?;
+                        submissions.push(wrap(std::mem::replace(&mut batch, next).commit()?));
+                        batch_kinds.push(std::mem::take(&mut kinds));
+                        queued = Some(0.0);
+                    }
+                    queued = if kinds.is_empty() {
+                        estimate
+                    } else {
+                        queued.zip(estimate).map(|(queued, estimate)| queued + estimate)
+                    };
+                    match kinds.iter_mut().find(|(seen, _)| *seen == kind) {
+                        Some((_, count)) => *count += 1,
+                        None => kinds.push((kind, 1)),
+                    }
+                    batch.launch(launch)
+                }
                 None => {
                     batch.skip();
                     Ok(())
@@ -808,6 +852,8 @@ fn encode_ungraphed<T: Timing>(
                     .commit()
                     .map_err(CallError::Execution)?,
             ));
+            batch_kinds.push(std::mem::take(&mut kinds));
+            queued = Some(0.0);
             for operation in operations {
                 if operation.action == TimelineAction::Wait {
                     batch.wait_timeline(&vulkan_timeline(operation).gate, operation.value);
@@ -816,7 +862,8 @@ fn encode_ungraphed<T: Timing>(
         }
     }
     submissions.push(wrap(batch.commit().map_err(CallError::Execution)?));
-    Ok(())
+    batch_kinds.push(kinds);
+    Ok(batch_kinds)
 }
 
 /// One queue submission of a [`VulkanSubmission`]: measured (its device
@@ -1003,10 +1050,13 @@ impl VulkanSubmission {
             return;
         };
         for (submission, kinds) in self.submissions.iter().zip(&feedback.kinds) {
-            if let QueueSubmission::Measured(submission) = submission {
-                if let Ok(seconds) = submission.device_seconds() {
-                    feedback.costs.observe(kinds, seconds);
-                }
+            let seconds = match submission {
+                QueueSubmission::Measured(submission) => submission.device_seconds().ok(),
+                QueueSubmission::Timed(submission) => submission.device_seconds().ok(),
+                QueueSubmission::Unmeasured(_) => None,
+            };
+            if let Some(seconds) = seconds {
+                feedback.costs.observe(kinds, seconds);
             }
         }
     }
@@ -1282,5 +1332,18 @@ mod tests {
     #[test]
     fn counted_kinds_keep_first_use_order() {
         assert_eq!(counted(&[3, 1, 3, 3, 2, 1]), vec![(3, 3), (1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn fits_submission_splits_unmeasured_and_over_budget_launches() {
+        let costs = LaunchCosts::<u32>::default();
+        assert_eq!(costs.estimate_one(1), None);
+        assert!(!fits_submission(Some(0.01), None));
+        assert!(!fits_submission(None, Some(0.01)));
+        assert!(!fits_submission(None, None));
+        costs.observe(&[(1, 1)], 0.04);
+        assert_eq!(costs.estimate_one(1), Some(0.04));
+        assert!(fits_submission(Some(0.04), costs.estimate_one(1)));
+        assert!(!fits_submission(Some(0.08), costs.estimate_one(1)));
     }
 }

@@ -150,16 +150,15 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
     const uint lane = SEISMIC_LANE;
     const uint64_t rows = SEISMIC_DIM_M;
     const uint64_t padded = prefill_padded(rows);
-    uint64_t row, head_at;
-    seismic_split_group(gl_WorkGroupID.x, SEISMIC_SUBGROUPS, SEISMIC_SUBGROUP, KV * (G + 1u), row, head_at);
-    const uint head = uint(head_at);
+    const uint64_t row = uint64_t(gl_WorkGroupID.y);
+    const uint head = gl_WorkGroupID.x * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
     // A hardware subgroup's logical subgroups may hold items of either kind
-    // (or none, past the padded rows): each kind's preparation runs where any
+    // (or none, past KV * (G + 1)): each kind's preparation runs where any
     // of them holds one, the others preparing a row that exists (row 0, head
     // 0) and storing nothing. So a query item does not return after its
     // preparation: the fresh one's test below turns it away.
     bool tiled;
-    if (!seismic_steer(tiled, row < padded))
+    if (!seismic_steer(tiled, row < padded && head < KV * (G + 1u)))
         return;
     const uint64_t queries = scratch_planes.queries;
     bool is_query;

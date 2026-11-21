@@ -7,22 +7,21 @@
 #include "lib/projection/join.glsl"
 
 void stream_join() {
-    const uint64_t index = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationIndex;
     const uint64_t h = SEISMIC_DIM_H;
-    if (index >= SEISMIC_DIM_M * h)
-        return;
-    uint64_t row, column;
-    seismic_split_group(gl_WorkGroupID.x, gl_WorkGroupSize.x, gl_LocalInvocationIndex, h, row, column);
-    const float y = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_Y)
-        + (row * SEISMIC_Y_STRIDE_0 + column * SEISMIC_Y_STRIDE_1) * 4ul);
-    const Out result = out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0);
-    const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL) + row * SEISMIC_RESIDUAL_STRIDE_0 * 4ul;
-    if (SEISMIC_DIM_IN == 0) {
-        out_put(result, column * SEISMIC_RESULT_0_STRIDE_1,
-            element_f32_at(residual + column * SEISMIC_RESIDUAL_STRIDE_1 * 4ul) + y);
-        return;
+    const uint64_t count = SEISMIC_DIM_M * h;
+    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, h)); at.index < count; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x, column = at.axes.w;
+        const float y = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_Y)
+            + (row * SEISMIC_Y_STRIDE_0 + column * SEISMIC_Y_STRIDE_1) * 4ul);
+        const Out result = out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0);
+        const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL) + row * SEISMIC_RESIDUAL_STRIDE_0 * 4ul;
+        if (SEISMIC_DIM_IN == 0) {
+            out_put(result, column * SEISMIC_RESULT_0_STRIDE_1,
+                element_f32_at(residual + column * SEISMIC_RESIDUAL_STRIDE_1 * 4ul) + y);
+        } else {
+            join_scatter(result, SEISMIC_RESULT_0_STRIDE_1, residual, SEISMIC_RESIDUAL_STRIDE_1,
+                SEISMIC_PTR(SEISMIC_BUFFER_INJECT) + row * SEISMIC_INJECT_STRIDE_0 * 4ul, uint(SEISMIC_DIM_SN), uint(h),
+                SEISMIC_DIM_IN > SEISMIC_DIM_SN, column, y);
+        }
     }
-    join_scatter(result, SEISMIC_RESULT_0_STRIDE_1, residual, SEISMIC_RESIDUAL_STRIDE_1,
-        SEISMIC_PTR(SEISMIC_BUFFER_INJECT) + row * SEISMIC_INJECT_STRIDE_0 * 4ul, uint(SEISMIC_DIM_SN), uint(h),
-        SEISMIC_DIM_IN > SEISMIC_DIM_SN, column, y);
 }

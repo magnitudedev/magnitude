@@ -343,7 +343,7 @@ fn prefill_specializations_on(
             // query heads), the one tile admissible at every tested
             // geometry, whatever QT asks for.
             let params = if device.backend() == BackendName::Vulkan {
-                vulkan_prefill_matrix(64, split_groups)
+                vulkan_prefill_matrix(64, if split_groups == 1 { 128 } else { split_groups })
             } else {
                 vec![("QT", query_tile), ("SPLIT_GROUPS", split_groups)]
             };

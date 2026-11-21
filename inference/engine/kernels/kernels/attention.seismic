@@ -826,7 +826,7 @@ native attention_decode for vulkan from "vulkan/attention_decode.comp":
     scratch query_factors bytes ((ceil_div(M, max(1, SIMDS * 16 / G)) * max(1, SIMDS * 16 / G) * KV * G + SIMDS * 16) * 4) when MATRIX == 1 and G * (2 * P + S) * 2 > 32768
     scratch values bytes (M * KV * (2 * P + S) * 2) when MATRIX == 1 and G * (2 * P + S) * 2 > 32768
     launch attention_decode_prepare when MATRIX == 1 and G * (2 * P + S) * 2 > 32768:
-        threadgroups (ceil_div(ceil_div(M, max(1, SIMDS * 16 / G)) * max(1, SIMDS * 16 / G) * KV * (G + 1), 8), 1, 1)
+        threadgroups (ceil_div(KV * (G + 1), 8), ceil_div(M, max(1, SIMDS * 16 / G)) * max(1, SIMDS * 16 / G), 1)
         threads_per_threadgroup (256, 1, 1)
     launch attention_decode_partial:
         threadgroups (KV * GROUPS, PARTS, (1 - MATRIX) * M + MATRIX * ceil_div(M, max(1, SIMDS * 16 / G)))
@@ -1108,7 +1108,7 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
 native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
     static (KV, G, P, S, I, U, F, NQ, N, NV, B, SK, RA, RT, RO, VK, KR, AB, KS)
     params (arithmetic form MATRIX in [0, 1] default least where MATRIX == 1 or VECTOR == 1,
-        arithmetic ROWS in [64, 128] default 64, arithmetic SPLIT_GROUPS in [256, 128, 512, 1] default 256,
+        arithmetic ROWS in [64, 128] default 64, arithmetic SPLIT_GROUPS in [256, 128, 512] default 256,
         arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128] default 16,
         arithmetic SIMDS in [4, 8] default 4,
         arithmetic SLICES in [1, 2, 4, 8, 16, 32, 64] default least where VECTOR == 0 or (G % SLICES == 0 and ((G / SLICES) * ((2 * P + S) / 32) <= 32 or SLICES == G)))
@@ -1130,7 +1130,7 @@ native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
         threadgroups (ceil_div(KV * G, (1 + (2 * P + S) / 32 % 2)), M, 1)
         threads_per_threadgroup ((2 * P + S) * (1 + (2 * P + S) / 32 % 2), 1, 1)
     launch attention_prefill_prepare when MATRIX == 1:
-        threadgroups (ceil_div(ceil_div(M, ROWS / G) * (ROWS / G) * KV * (G + 1), 8), 1, 1)
+        threadgroups (ceil_div(KV * (G + 1), 8), ceil_div(M, ROWS / G) * (ROWS / G), 1)
         threads_per_threadgroup (256, 1, 1)
     launch attention_prefill_list when B > 0 and MATRIX == 1:
         threadgroups (ceil_div(M, ROWS / G), 1, 1)
@@ -1853,7 +1853,7 @@ native attention_prefill_k8v4 for cuda from "cuda/attention_prefill_k8v4.cu":
 # as history tiles decode as they are staged.
 native attention_prefill_k8v4 for vulkan from "vulkan/attention_prefill_k8v4.comp":
     static (KV, G, P, S, I, U, F, NQ, N, NV, B, KC, KP, VC, VP, SK, RA, RT, RO, VK)
-    params (arithmetic ROWS in [64, 128] default 64, arithmetic SPLIT_GROUPS in [256, 128, 512, 1] default 256)
+    params (arithmetic ROWS in [64, 128] default 64, arithmetic SPLIT_GROUPS in [256, 128, 512] default 256)
     where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G <= ROWS and ROWS / G <= 32 and 64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048 <= device.shared_bytes_per_group
     scratch queries bytes ((ceil_div(M, ROWS / G) * (ROWS / G) * KV * G + ROWS) * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
@@ -1864,7 +1864,7 @@ native attention_prefill_k8v4 for vulkan from "vulkan/attention_prefill_k8v4.com
     scratch query_factors bytes ((ceil_div(M, ROWS / G) * (ROWS / G) * KV * G + ROWS) * 4)
     scratch worklist bytes (ceil_div(M, (ROWS / G)) * ((ROWS / G) * (ceil_div(32 * B * BR, 32) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_k8v4_prepare:
-        threadgroups (ceil_div(ceil_div(M, ROWS / G) * (ROWS / G) * KV * (G + 1), 8), 1, 1)
+        threadgroups (ceil_div(KV * (G + 1), 8), ceil_div(M, ROWS / G) * (ROWS / G), 1)
         threads_per_threadgroup (256, 1, 1)
     launch attention_prefill_k8v4_list when B > 0:
         threadgroups (ceil_div(M, ROWS / G), 1, 1)

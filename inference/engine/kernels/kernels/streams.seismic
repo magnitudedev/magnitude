@@ -461,7 +461,7 @@ native stream_join for cuda from "cuda/stream_join.cu":
 native stream_join for vulkan from "vulkan/stream_join.comp":
     static (H, SN, IN)
     launch stream_join:
-        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threadgroups (min(ceil_div(M * H, 256), 65535), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: one work item per row, through the projection epilogues' scatter

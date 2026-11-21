@@ -885,7 +885,7 @@ fn prefill_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'stati
         BackendName::Cpu => [16, 8, 32, 4].into_iter().map(|rows| vec![("ROWS", rows)]).collect(),
         // ROWS = 64 is admissible at every tested geometry (ROWS / G <= 32,
         // and the W = 256 tile fits the shared bound).
-        BackendName::Vulkan => [1, 256, 512]
+        BackendName::Vulkan => [128, 256, 512]
             .into_iter()
             .map(|split| vec![("ROWS", 64), ("SPLIT_GROUPS", split)])
             .collect(),

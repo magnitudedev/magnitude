@@ -510,15 +510,16 @@ void projection_gemm_part(const int wk, projection_prologue in_, uint64_t partia
     }
 }
 
-// The split-K finalize: output `index` = m * rows + n sums its parts in order
-// and applies the epilogue.
-void projection_gemm_finalize(projection_epilogue out_, uint64_t partials, uint m_rows, uint rows, uint split, uint index) {
-    if (index >= m_rows * rows)
+// The split-K finalize: output (m, n) sums its parts in order and applies the
+// epilogue.
+void projection_gemm_finalize(projection_epilogue out_, uint64_t partials, uint m_rows, uint rows, uint split, uint m, uint n) {
+    if (m >= m_rows || n >= rows)
         return;
+    const uint64_t index = uint64_t(m) * rows + n;
     float total = 0.0;
     for (uint part = 0u; part < split; ++part)
         total += element_f32_at(partials + (uint64_t(part) * m_rows * rows + index) * 4ul);
-    projection_put(out_, index / rows, index % rows, total);
+    projection_put(out_, m, n, total);
 }
 
 // One GEMM tile of a paired projection: TN / 2 features of gate and up, the

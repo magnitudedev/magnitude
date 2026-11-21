@@ -232,7 +232,7 @@ fn specializations(device: &Device, geometry: Geometry, words: usize) -> Vec<(St
                 // A WorkList prefill over a history with values of its own
                 // runs in Vulkan's matrix form alone (its vector form is
                 // declared for stored keys).
-                BackendName::Vulkan => vulkan_prefill_matrix(64, split)
+                BackendName::Vulkan => vulkan_prefill_matrix(64, if split == 1 { 128 } else { split })
                     .into_iter()
                     .fold(base, |s, (name, value)| s.with_param(name, value)),
                 _ => base.with_param("QT", query_tile).with_param("SPLIT_GROUPS", split),

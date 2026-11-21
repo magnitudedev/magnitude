@@ -11,13 +11,14 @@
 
 void vision_norm() {
     const uint g = uint(SEISMIC_DIM_G), h = uint(SEISMIC_DIM_H);
-    const uint row = gl_WorkGroupID.x;
-    const uint from = SEISMIC_DIM_NO == 1 ? uint(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ORDER) + uint64_t(row) * 4ul))
-                                          : row;
-    const uint cell = row / g, member = row % g;
+    const uint cell = gl_WorkGroupID.y, member = gl_WorkGroupID.x;
+    const uint64_t row = uint64_t(cell) * g + member;
+    const uint64_t from = SEISMIC_DIM_NO == 1
+        ? uint64_t(uint(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ORDER) + row * 4ul)))
+        : row;
     const bool interleave = int(SEISMIC_PARAM_INTERLEAVE) != 0;
     const uint64_t first = uint64_t(cell) * SEISMIC_RESULT_0_STRIDE_0 + (interleave ? member : uint64_t(member) * h);
-    vision_row_norm(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE) + uint64_t(from) * h * 4ul,
+    vision_row_norm(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE) + from * h * 4ul,
         out_offset(SEISMIC_RESULT_0_OUT, first), interleave ? uint64_t(g) : 1ul,
         SEISMIC_DIM_NW == 1, SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), WEIGHT_KIND, SEISMIC_DIM_NB == 1,
         SEISMIC_PTR(SEISMIC_BUFFER_BIAS), BIAS_KIND, h, int(SEISMIC_PARAM_CENTERED) != 0,

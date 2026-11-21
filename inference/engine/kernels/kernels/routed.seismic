@@ -596,7 +596,7 @@ projection routed for vulkan:
         threads_per_threadgroup (GEMM_THREADS, 1, 1)
         shared_bytes (GEMM_HELD)
     launch quantize for grouped when STACKED == 1 and any(W, FIRST == 0 and operands(W) == 1):
-        threadgroups (B * T, 1, 1)
+        threadgroups (T, B, 1)
         grid (quantize_grid)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (128)

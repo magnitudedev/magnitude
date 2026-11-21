@@ -94,7 +94,7 @@ void projection_single_gemm() {
 void projection_single_finalize() {
     const uint g = PROJECTION_GROUP(gl_WorkGroupID.z);
     projection_gemm_finalize(projected_output(g), projection_single_partials(g), PROJECTION_M, PROJECTION_N,
-        PROJECTION_SPLIT, gl_GlobalInvocationID.x);
+        PROJECTION_SPLIT, gl_GlobalInvocationID.y, gl_GlobalInvocationID.x);
 }
 
 #endif

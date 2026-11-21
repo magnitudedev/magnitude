@@ -752,7 +752,7 @@ projection dense for vulkan:
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes (GEMM_HELD)
     launch finalize for single when ORDERED_ANY == 0 and M > VERIFY_ROWS and SPLIT > 1:
-        threadgroups (ceil_div(M * N, 256), 1, G)
+        threadgroups (ceil_div(N, 256), M, G)
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: the CPU projection library (`cpu/lib/projection/projection.rs`).

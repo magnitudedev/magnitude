@@ -347,7 +347,7 @@ fn configurations(backend: BackendName, kind: Kind) -> Vec<Vec<(&'static str, u6
         // parameters at their declared defaults.
         (BackendName::Vulkan, false) => vec![
             vec![("MATRIX", 1), ("ROWS", 64), ("SPLIT_GROUPS", 256)],
-            vec![("MATRIX", 1), ("ROWS", 64), ("SPLIT_GROUPS", 1)],
+            vec![("MATRIX", 1), ("ROWS", 64), ("SPLIT_GROUPS", 128)],
             vec![("MATRIX", 1), ("ROWS", 128), ("SPLIT_GROUPS", 512)],
         ],
         (other, _) => panic!("no attention configurations for {other:?}"),

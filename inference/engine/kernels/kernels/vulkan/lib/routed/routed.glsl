@@ -165,7 +165,7 @@ void routed_expert_grids(uint rows, uint used, uint tile_rows, uint subtiles, ui
     uint64_t stage, uint64_t expand, uint64_t quantize, uint64_t down) {
     routed_write_grid(stage, rows, 1u);
     routed_write_grid(expand, expand_columns, used * subtiles);
-    routed_write_grid(quantize, used * tile_rows, 1u);
+    routed_write_grid(quantize, tile_rows, used);
     routed_write_grid(down, down_columns, used * subtiles);
 }
 

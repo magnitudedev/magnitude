@@ -69,13 +69,13 @@ void routed_experts_up_stage() {
 }
 
 void routed_experts_up_quantize() {
-    uint64_t block, tile_row;
-    seismic_split(gl_WorkGroupID.x, SEISMIC_DIM_T, block, tile_row);
+    const uint64_t block = uint64_t(gl_WorkGroupID.y);
+    const uint64_t tile_row = uint64_t(gl_WorkGroupID.x);
     const int expert = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + block * SEISMIC_BLOCKS_STRIDE_0 * 4ul);
     if (EXPERTS_SLOT(expert) == -1)
         return;
     projection_form_in_place(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)
-        + uint64_t(gl_WorkGroupID.x) * SEISMIC_DIM_F * uint64_t(ELEMENT_BYTES(ROUTED_ACT)), uint(SEISMIC_DIM_F));
+        + (block * SEISMIC_DIM_T + tile_row) * SEISMIC_DIM_F * uint64_t(ELEMENT_BYTES(ROUTED_ACT)), uint(SEISMIC_DIM_F));
 }
 
 void routed_experts_up_expand() {

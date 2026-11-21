@@ -215,7 +215,7 @@ native vision_norm for cuda from "cuda/vision_norm.cu":
 native vision_norm for vulkan from "vulkan/vision_norm.comp":
     static (G, H, NW, NB, NO)
     launch vision_norm:
-        threadgroups (C * G, 1, 1)
+        threadgroups (G, C, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (32)
 
