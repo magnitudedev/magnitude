@@ -19,7 +19,9 @@
 //! W1 owns the internals behind `internals::Module`.
 
 use crate::device::DeviceValues;
+pub use crate::entry::TensorAccess;
 use crate::entry::{ElementBindings, LogicalEntry, ResultClass};
+pub use crate::expr::CmpOp;
 use crate::ids::{EntryContent, EntryId, ModuleHash, RepresentationId, StableEntryId};
 use crate::registry::{self, BackendName, RepresentationAccess, RepresentationKind};
 use crate::span::Span;
@@ -1877,22 +1879,12 @@ impl NativeParameter {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NativeComparison {
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    Eq,
-    Ne,
-}
-
 /// A boolean formula over native natural-number expressions: a native
 /// `where` or `when` condition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeCondition {
     Compare {
-        comparison: NativeComparison,
+        comparison: CmpOp,
         left: NativeNatExpr,
         right: NativeNatExpr,
     },
@@ -2638,12 +2630,12 @@ impl NativeCondition {
                 let left = left.evaluate(dimension, parameter)?;
                 let right = right.evaluate(dimension, parameter)?;
                 Ok(match comparison {
-                    NativeComparison::Lt => left < right,
-                    NativeComparison::Le => left <= right,
-                    NativeComparison::Gt => left > right,
-                    NativeComparison::Ge => left >= right,
-                    NativeComparison::Eq => left == right,
-                    NativeComparison::Ne => left != right,
+                    CmpOp::Lt => left < right,
+                    CmpOp::Le => left <= right,
+                    CmpOp::Gt => left > right,
+                    CmpOp::Ge => left >= right,
+                    CmpOp::Eq => left == right,
+                    CmpOp::Ne => left != right,
                 })
             }
             Self::And(left, right) => {
@@ -2723,14 +2715,14 @@ impl NativeCondition {
                     return NativeBounded::Fallible;
                 };
                 let decided = match comparison {
-                    NativeComparison::Lt => (b < c).then_some(true).or((a >= d).then_some(false)),
-                    NativeComparison::Le => (b <= c).then_some(true).or((a > d).then_some(false)),
-                    NativeComparison::Gt => (a > d).then_some(true).or((b <= c).then_some(false)),
-                    NativeComparison::Ge => (a >= d).then_some(true).or((b < c).then_some(false)),
-                    NativeComparison::Eq => (a == b && b == c && c == d)
+                    CmpOp::Lt => (b < c).then_some(true).or((a >= d).then_some(false)),
+                    CmpOp::Le => (b <= c).then_some(true).or((a > d).then_some(false)),
+                    CmpOp::Gt => (a > d).then_some(true).or((b <= c).then_some(false)),
+                    CmpOp::Ge => (a >= d).then_some(true).or((b < c).then_some(false)),
+                    CmpOp::Eq => (a == b && b == c && c == d)
                         .then_some(true)
                         .or((b < c || d < a).then_some(false)),
-                    NativeComparison::Ne => (b < c || d < a)
+                    CmpOp::Ne => (b < c || d < a)
                         .then_some(true)
                         .or((a == b && b == c && c == d).then_some(false)),
                 };
@@ -4544,17 +4536,6 @@ pub enum ParameterSummaryKind {
     Range,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TensorAccess {
-    Owned,
-    Shared,
-    Mutable,
-    /// A host port (`&host tensor`, `&host mut tensor`): the host reads it,
-    /// or rewrites it (`write`), once it sees the launch; the kernel never
-    /// accesses it.
-    Host { write: bool },
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ElementSummary {
     /// A fixed dtype or packed representation, by registry name.
@@ -4773,12 +4754,12 @@ mod native_tests {
             sync: false,
             when: Some(NativeCondition::And(
                 Box::new(NativeCondition::Compare {
-                    comparison: NativeComparison::Gt,
+                    comparison: CmpOp::Gt,
                     left: rows(),
                     right: NativeNatExpr::Constant(16),
                 }),
                 Box::new(NativeCondition::Compare {
-                    comparison: NativeComparison::Le,
+                    comparison: CmpOp::Le,
                     left: rows(),
                     right: NativeNatExpr::Constant(64),
                 }),
@@ -5389,7 +5370,7 @@ mod native_tests {
             )
         };
         let at_most = |left: NativeNatExpr, right: NativeNatExpr| NativeCondition::Compare {
-            comparison: NativeComparison::Le,
+            comparison: CmpOp::Le,
             left,
             right,
         };
@@ -5872,12 +5853,12 @@ mod native_tests {
         assert_eq!(read, ["N"]);
         // `and` and `or` evaluate their right side only when needed.
         let unbound = NativeCondition::Compare {
-            comparison: NativeComparison::Eq,
+            comparison: CmpOp::Eq,
             left: NativeNatExpr::Dimension("Z".into()),
             right: NativeNatExpr::Constant(0),
         };
         let never = NativeCondition::Compare {
-            comparison: NativeComparison::Lt,
+            comparison: CmpOp::Lt,
             left: NativeNatExpr::Constant(1),
             right: NativeNatExpr::Constant(0),
         };

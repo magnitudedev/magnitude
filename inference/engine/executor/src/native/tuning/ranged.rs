@@ -602,7 +602,7 @@ mod tests {
         NativeNatExpr::Parameter(name.into())
     }
 
-    fn compare(comparison: seismic::NativeComparison, left: NativeNatExpr, right: NativeNatExpr) -> NativeCondition {
+    fn compare(comparison: seismic::CmpOp, left: NativeNatExpr, right: NativeNatExpr) -> NativeCondition {
         NativeCondition::Compare { comparison, left, right }
     }
 
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn rows_are_cut_where_what_they_can_run_changes() {
-        use seismic::NativeComparison::{Eq, Ge, Gt, Le, Lt};
+        use seismic::CmpOp::{Eq, Ge, Gt, Le, Lt};
         let statics = NativeSpecialization::new().with_static("S", 4);
         // A dense projection's launches: the GEMV (`M < 2`), the pair
         // (`M == 2 and M < BATCH_FROM`), the row GEMV (`M >= 3 and
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn the_statics_admit_the_values_no_restriction_rules_out_alone() {
-        use seismic::NativeComparison::{Eq, Le};
+        use seismic::CmpOp::{Eq, Le};
         // `(KS == 0 or TOKENS == 1) and TOKENS <= SIMDS`.
         let sinks = NativeCondition::Or(
             Box::new(compare(Eq, NativeNatExpr::Dimension("KS".into()), constant(0))),

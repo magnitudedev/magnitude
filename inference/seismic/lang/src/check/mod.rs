@@ -2521,7 +2521,7 @@ fn native_condition(
     parameters: &[String],
     reads: NativeReads<'_>,
 ) -> Result<crate::checked::NativeCondition, (Span, String)> {
-    use crate::checked::{NativeComparison, NativeCondition};
+    use crate::checked::{CmpOp, NativeCondition};
     use crate::syntax::ast::{BinaryOp, ExprKind};
     let not_a_condition = || {
         (
@@ -2538,7 +2538,7 @@ fn native_condition(
                 == Some(crate::device::PropertyKind::Support)
         {
             return Ok(NativeCondition::Compare {
-                comparison: NativeComparison::Ne,
+                comparison: CmpOp::Ne,
                 left: crate::checked::NativeNatExpr::Device(name.name.clone()),
                 right: crate::checked::NativeNatExpr::Constant(0),
             });
@@ -2547,7 +2547,7 @@ fn native_condition(
     // `true` and `false` stand as the comparisons of zero that hold and fail.
     if let ExprKind::Bool(holds) = expression.kind {
         return Ok(NativeCondition::Compare {
-            comparison: if holds { NativeComparison::Eq } else { NativeComparison::Ne },
+            comparison: if holds { CmpOp::Eq } else { CmpOp::Ne },
             left: crate::checked::NativeNatExpr::Constant(0),
             right: crate::checked::NativeNatExpr::Constant(0),
         });
@@ -2564,12 +2564,12 @@ fn native_condition(
                 _ => NativeCondition::Or(left, right),
             });
         }
-        BinaryOp::Lt => NativeComparison::Lt,
-        BinaryOp::Le => NativeComparison::Le,
-        BinaryOp::Gt => NativeComparison::Gt,
-        BinaryOp::Ge => NativeComparison::Ge,
-        BinaryOp::Eq => NativeComparison::Eq,
-        BinaryOp::Ne => NativeComparison::Ne,
+        BinaryOp::Lt => CmpOp::Lt,
+        BinaryOp::Le => CmpOp::Le,
+        BinaryOp::Gt => CmpOp::Gt,
+        BinaryOp::Ge => CmpOp::Ge,
+        BinaryOp::Eq => CmpOp::Eq,
+        BinaryOp::Ne => CmpOp::Ne,
         _ => return Err(not_a_condition()),
     };
     let operand = |expr: &crate::syntax::ast::Expr| {

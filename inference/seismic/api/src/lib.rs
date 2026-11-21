@@ -20,7 +20,7 @@ pub use seismic_compiler::feedback::{
     PreparationOptions,
 };
 pub use seismic_lang::checked::{
-    Encoded as LaunchEncoding, NativeComparison, NativeCondition, NativeImplementation,
+    CmpOp, Encoded as LaunchEncoding, NativeCondition, NativeImplementation,
     NativeLaunch, NativeNatExpr, NativeParameter, NativeScratch, NativeSpecialization,
     NativeSpecializationError, DeviceBound, OnDevice, RecordPort,
 };

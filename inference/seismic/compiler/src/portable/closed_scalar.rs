@@ -843,14 +843,6 @@ impl<'a> Analysis<'a> {
             NodeView::Cmp { op, lhs, rhs } => {
                 let a = self.expression(lhs, slots)?;
                 let b = self.expression(rhs, slots)?;
-                let op = match op {
-                    seismic_lang::expr::CmpOp::Eq => reference::CmpOp::Eq,
-                    seismic_lang::expr::CmpOp::Ne => reference::CmpOp::Ne,
-                    seismic_lang::expr::CmpOp::Lt => reference::CmpOp::Lt,
-                    seismic_lang::expr::CmpOp::Le => reference::CmpOp::Le,
-                    seismic_lang::expr::CmpOp::Gt => reference::CmpOp::Gt,
-                    seismic_lang::expr::CmpOp::Ge => reference::CmpOp::Ge,
-                };
                 self.terms.compare(op, a, b)
             }
             // A natural is the same mathematical value as an integer; the
@@ -1051,15 +1043,7 @@ impl<'a> Analysis<'a> {
                                 | ValueType::Bool
                         ) =>
                     {
-                        let operation = match op {
-                            ops::CmpOp::Eq => reference::CmpOp::Eq,
-                            ops::CmpOp::Ne => reference::CmpOp::Ne,
-                            ops::CmpOp::Lt => reference::CmpOp::Lt,
-                            ops::CmpOp::Le => reference::CmpOp::Le,
-                            ops::CmpOp::Gt => reference::CmpOp::Gt,
-                            ops::CmpOp::Ge => reference::CmpOp::Ge,
-                        };
-                        Some((*out, self.terms.compare(operation, get(a)?, get(b)?)))
+                        Some((*out, self.terms.compare(*op, get(a)?, get(b)?)))
                     }
                     Op::ScalarBits { out, a } => Some((
                         *out,

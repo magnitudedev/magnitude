@@ -6,6 +6,7 @@ use super::{BindingSlot, BlockId};
 use crate::identity::OwnerToken;
 use crate::physical_target::PhysicalDialect;
 use crate::storage::LaunchLocalKind;
+pub use seismic_lang::expr::CmpOp;
 use seismic_lang::expr::{NatExpr, SymbolId};
 use seismic_lang::ids::{CapabilityId, IntrinsicId, RepresentationId};
 use seismic_lang::intrinsics::{AtomicOp, MathOp};
@@ -35,16 +36,6 @@ pub enum BitOp {
     Xor,
     Shl,
     Shr,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CmpOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -5,6 +5,7 @@
 //! caller.
 
 use super::resolve::SignatureDimension;
+use crate::entry::InferenceOp;
 use crate::expr::{AnyExpr, ExprArena, IntExpr, NodeView, SymbolId};
 use crate::types::ValueType;
 use sha2::{Digest, Sha256};
@@ -29,20 +30,12 @@ pub(crate) enum Known {
     Expression(IntExpr),
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum InverseOp {
-    Add(Known),
-    Subtract(Known),
-    ReverseSubtract(Known),
-    DivideExact(Known),
-}
-
 /// Solve `dimension` from `observation` by the inverse operations, in order.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DimensionStep {
     pub dimension: u32,
     pub observation: ObservedAxis,
-    pub operations: Vec<InverseOp>,
+    pub operations: Vec<InferenceOp<Known>>,
 }
 
 /// The family's dimension plan over its contract's arena.
@@ -178,12 +171,7 @@ pub(crate) fn plan_dimensions_with_seeds(
             observation: observations[observation].0.clone(),
             operations: operations
                 .into_iter()
-                .map(|operation| match operation {
-                    InferenceOp::Add(k) => InverseOp::Add(known(k)),
-                    InferenceOp::Subtract(k) => InverseOp::Subtract(known(k)),
-                    InferenceOp::ReverseSubtract(k) => InverseOp::ReverseSubtract(known(k)),
-                    InferenceOp::DivideExact(k) => InverseOp::DivideExact(known(k)),
-                })
+                .map(|operation| operation.map(&known))
                 .collect(),
         })
         .collect();
@@ -216,11 +204,7 @@ pub(crate) fn apply_at_call(
         }
         let mut value = actual(&step.observation);
         for operation in &step.operations {
-            let (InverseOp::Add(known)
-            | InverseOp::Subtract(known)
-            | InverseOp::ReverseSubtract(known)
-            | InverseOp::DivideExact(known)) = operation;
-            let known = match known {
+            let known = match operation.operand() {
                 Known::Observation(axis) => actual(axis),
                 Known::Dimension(dimension) => {
                     solved[*dimension as usize].expect("plan uses a dimension before its step")
@@ -241,10 +225,10 @@ pub(crate) fn apply_at_call(
                 }
             };
             value = match operation {
-                InverseOp::Add(_) => caller.int_add(value, known),
-                InverseOp::Subtract(_) => caller.int_sub(value, known),
-                InverseOp::ReverseSubtract(_) => caller.int_sub(known, value),
-                InverseOp::DivideExact(_) => super::prove::divide_exact(caller, value, known)
+                InferenceOp::Add(_) => caller.int_add(value, known),
+                InferenceOp::Subtract(_) => caller.int_sub(value, known),
+                InferenceOp::ReverseSubtract(_) => caller.int_sub(known, value),
+                InferenceOp::DivideExact(_) => super::prove::divide_exact(caller, value, known)
                     .ok_or(DimensionCallError::InexactDivision {
                         dimension: step.dimension,
                     })?,
@@ -262,7 +246,7 @@ pub(super) fn dimension_inference_order(
     arena: &ExprArena,
     dimensions: &[(&str, SymbolId, bool)],
     observations: &[AnyExpr],
-) -> Result<Vec<(SymbolId, usize, Vec<InferenceOp>)>, Vec<String>> {
+) -> Result<Vec<(SymbolId, usize, Vec<InferenceOp<InferenceKnown>>)>, Vec<String>> {
     dimension_inference_order_seeded(arena, dimensions, observations, &BTreeSet::new())
 }
 
@@ -271,7 +255,7 @@ fn dimension_inference_order_seeded(
     dimensions: &[(&str, SymbolId, bool)],
     observations: &[AnyExpr],
     seeds: &BTreeSet<SymbolId>,
-) -> Result<Vec<(SymbolId, usize, Vec<InferenceOp>)>, Vec<String>> {
+) -> Result<Vec<(SymbolId, usize, Vec<InferenceOp<InferenceKnown>>)>, Vec<String>> {
     // `Err` names every dimension no remaining observation determines.
     let observation_keys = observations
         .iter()
@@ -326,14 +310,6 @@ fn dimension_inference_order_seeded(
 pub(super) enum InferenceKnown {
     Observation(usize),
     Expression(AnyExpr),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) enum InferenceOp {
-    Add(InferenceKnown),
-    Subtract(InferenceKnown),
-    DivideExact(InferenceKnown),
-    ReverseSubtract(InferenceKnown),
 }
 
 /// DR1's private equality domain for tensor-axis observations.  This is
@@ -581,7 +557,7 @@ fn inverse_operations(
     observations: &[AnyExpr],
     observation_keys: &[CanonicalObservationKey],
     root_observation: usize,
-) -> Option<Vec<InferenceOp>> {
+) -> Option<Vec<InferenceOp<InferenceKnown>>> {
     fn contains(arena: &ExprArena, expression: AnyExpr, dimension: SymbolId) -> bool {
         arena.free_symbols(expression).contains(&dimension)
     }
@@ -667,7 +643,7 @@ fn inverse_operations(
         observations: &[AnyExpr],
         observation_keys: &[CanonicalObservationKey],
         root_observation: usize,
-    ) -> Option<Vec<InferenceOp>> {
+    ) -> Option<Vec<InferenceOp<InferenceKnown>>> {
         match arena.view(expression) {
             NodeView::Symbol(symbol) if symbol == dimension => Some(Vec::new()),
             NodeView::Unary { operand, .. } => walk(
