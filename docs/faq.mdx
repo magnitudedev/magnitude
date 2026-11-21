@@ -21,7 +21,7 @@ macOS, Linux, and Windows.
 
 ## Which models does it support?
 
-Models built on the families Magnitude supports, including any quant or fine-tune of them on Hugging Face. In the app, **Models → Explore models → What runs in Magnitude** lists the families; in a terminal, run `magnitude models families`. We write optimized kernels for the most popular open-weight families, which is how we beat generalist engines.
+See the full list at [magnitude.dev/models](https://magnitude.dev/models). We write optimized kernels for the most popular open-weight families, which is how we beat generalist engines.
 
 ## Which agents work with it?
 
@@ -33,12 +33,12 @@ Yes. Prompts, files, and models stay on your machine. No internet needed once a 
 
 ## Can I use Magnitude from another computer, a container, or WSL?
 
-Yes. Enable **Network access** for direct connections and use the server address and API key. SSH tunnels and mirrored WSL networking can use the local endpoint without enabling it. After signing in with the API key, a browser on another device can use the full app. See [Network access](/api/network-access) and [Windows and WSL](/api/windows-wsl).
+Yes. Enable **Network access** for direct connections and use the server address and API key. SSH tunnels and mirrored WSL networking can use the local endpoint without enabling it. Only inference is available from other devices. See [Network access](/api/network-access) and [Windows and WSL](/api/windows-wsl).
 
 ## Can I keep models on another drive?
 
-Yes. Choose another folder under **Settings → Storage → Model storage**, then quit Magnitude and move your existing models with the command it shows.
+Yes. Change **Model storage** in Settings, then move the existing models with the command it shows. See [Settings](/settings#model-storage).
 
 ## Why is the first response slow and later ones fast?
 
-Models load on demand and unload after an hour without requests, or when the system runs short of memory, so the first request after that includes loading the model. Later turns reuse cached context, and models use speculative decoding. Click **Load** on **Models** to load a model ahead of time.
+Models load on demand and unload when idle, so the first request after a pause includes loading. Later turns reuse cached context, and supported models use speculative decoding. Click **Load model** in **My Models** to load ahead of time.

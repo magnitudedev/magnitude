@@ -3,7 +3,7 @@ title: "Docker"
 description: "Run Magnitude as a container with the official image."
 ---
 
-The official image, `magnitudedev/magnitude`, runs Magnitude as a server: the OpenAI and Anthropic compatible API at `:10100/inference/v1` and `:10100/inference/anthropic`, the browser app at `:10100`, and the `magnitude` CLI through `docker exec`. It is the same as the [CLI-only install](/installation/cli-only), packaged for people who run everything in containers.
+The official image, `magnitudedev/magnitude`, runs Magnitude as a server: the OpenAI and Anthropic compatible API at `:10100/inference/v1` and `:10100/inference/anthropic`, the browser app at `:10100`, and the `magnitude` CLI through `docker exec`. It is the same product as a [remote server](/remote-server), packaged for people who run everything in containers.
 
 The image runs on x64 and ARM64; Docker picks the right one. One image serves CPU, NVIDIA CUDA, and Vulkan GPUs.
 
@@ -158,7 +158,7 @@ Requests that send the key are accepted under any host name, so other containers
 
 ## Memory limits
 
-With a memory limit, such as `-m 8g` or a Kubernetes `resources.limits.memory`, Magnitude counts the limit as the container's memory and fits models to it. It keeps 2 GB or a tenth of the limit in reserve, whichever is larger, so even the smallest recommended models need a limit of about 5 GB. `docker exec magnitude magnitude hardware` shows the memory Magnitude sees.
+With a memory limit, such as `-m 8g` or a Kubernetes `resources.limits.memory`, Magnitude counts the limit as the container's memory and fits models to it. It keeps 2 GB or a tenth of the limit in reserve, whichever is larger, so even the smallest catalog models need a limit of about 5 GB. `docker exec magnitude magnitude hardware` shows the memory Magnitude sees.
 
 ## Data and permissions
 

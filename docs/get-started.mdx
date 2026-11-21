@@ -5,20 +5,31 @@ description: "Download a model and use it with your agent."
 
 ## 1. Install Magnitude
 
-[Download Magnitude](https://magnitude.dev/download#downloads) for macOS, Windows, or Linux and open the installer.
+Magnitude comes with a desktop app and a CLI. Install from your terminal:
 
-Need help installing? See the guide for [**macOS**](https://docs.magnitude.dev/installation/macos), [**Windows**](https://docs.magnitude.dev/installation/windows), or [**Linux**](https://docs.magnitude.dev/installation/linux). Setting up a server? See [**CLI only**](https://docs.magnitude.dev/installation/cli-only). Running in a container? See [**Docker**](https://docs.magnitude.dev/installation/docker).
+<Tabs>
+<Tab title="macOS / Linux">
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh
+```
+</Tab>
+<Tab title="Windows PowerShell">
+```powershell
+irm https://magnitude.dev/install.ps1 | iex
+```
+</Tab>
+</Tabs>
 
-## 2. Choose a model
+Or [download the installer](https://magnitude.dev/download#downloads).
 
-The first time you open Magnitude, it reads your hardware, finds models already on your computer, and measures how models run on it. It then recommends up to three models that run well here.
+Need help installing? See the guide for [**macOS**](https://docs.magnitude.dev/installation/macos), [**Windows**](https://docs.magnitude.dev/installation/windows), or [**Linux**](https://docs.magnitude.dev/installation/linux).
 
-Choose one and click **Download**. When the download finishes, Magnitude loads the model and opens **Chat**, so you can try it right away.
+## 2. Download a model
 
-To find other models later, open **Models** and click **Explore models** to search Hugging Face. See [Models](/models).
+Open Magnitude and go to **Discover**. Choose a recommended model and click **Download**.
 
 ## 3. Connect your agent
 
-Open **Connections**, find your agent, and click **Connect**. Choose a model on its card, then copy the command shown and run it in your terminal from your project folder.
+Open **Connections**, find your agent, and click **Connect**. Copy the command shown and paste it into your terminal to start your agent.
 
-In a browser, such as with the [CLI only](/installation/cli-only), **Connections** gives you a setup prompt to paste into your agent instead.
+Using a dedicated machine for inference? See [**Remote server**](https://docs.magnitude.dev/remote-server).

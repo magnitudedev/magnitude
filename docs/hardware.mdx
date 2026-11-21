@@ -1,9 +1,9 @@
 ---
 title: "Hardware"
-description: "What your machine can run and what affects speed."
+description: "Understand what your machine can run and what affects performance."
 ---
 
-Magnitude measures your machine and recommends models that run well on it. Start with those rather than choosing a model by parameter count. To see what Magnitude found, open **Settings → General → Your machine**, or run `magnitude hardware`.
+Magnitude assesses your machine and recommends models that fit. Start with those recommendations rather than choosing a model by parameter count alone.
 
 ## Supported configurations
 
@@ -14,38 +14,45 @@ Magnitude measures your machine and recommends models that run well on it. Start
 | Windows x64 | CPU, supported NVIDIA CUDA GPUs, or supported Vulkan GPUs |
 | Linux x64 or ARM64 | CPU, supported NVIDIA CUDA GPUs, or supported Vulkan GPUs |
 
-See [macOS](/installation/macos), [Windows](/installation/windows), and [Linux](/installation/linux) for OS requirements and installers. In [Docker](/installation/docker), containers reach NVIDIA GPUs through the NVIDIA Container Toolkit and AMD and Intel GPUs through Vulkan. On any Mac, Docker runs containers in a Linux virtual machine that can't reach the Apple GPU, so the container runs models on the CPU; use the [macOS app](/installation/macos) for GPU speed.
+See [macOS](/installation/macos), [Windows](/installation/windows), and [Linux](/installation/linux) for OS requirements and installers. In [Docker](/installation/docker), containers reach NVIDIA GPUs through the NVIDIA Container Toolkit and AMD and Intel GPUs through Vulkan. On any Mac, Docker runs containers in a Linux virtual machine that can't reach the Apple GPU, so the container runs models on the CPU cores; use the [macOS app](/installation/macos) for GPU speed.
 
 ## Apple Silicon
 
-Apple Silicon shares memory between the CPU and GPU, so the GPU can use far more memory than a typical laptop's graphics card. macOS and your other apps use the same memory, so a Mac with 32 GB does not have all 32 GB for a model. If a model fails to load, close memory-heavy apps or choose a smaller quant.
+Apple Silicon shares memory between the CPU and GPU. That gives the GPU access to a larger memory pool than a typical laptop's dedicated graphics memory, but macOS and other apps use the same pool.
 
-Metal comes with macOS; you don't need a separate GPU toolkit.
+For example, a Mac with 32 GB of unified memory does not have all 32 GB available for a model. Use Discover's fit assessment and close memory-heavy apps if loading fails.
+
+Metal support is supplied by macOS; you do not need a separate GPU toolkit.
 
 ## NVIDIA GPUs
 
-On Linux and Windows, Magnitude uses CUDA on NVIDIA GPUs from the Ampere generation (RTX 30 series, A100) and newer. A dedicated GPU's memory is separate from your RAM: a machine with 64 GB of RAM and an 8 GB GPU has 8 GB of GPU memory, not 72 GB. Install your GPU's NVIDIA driver; you don't need the CUDA toolkit. To check that the driver sees the GPU:
+On Linux and Windows, Magnitude can use its CUDA backend with a compatible NVIDIA GPU and driver. The current CUDA builds target Ampere-class and newer GPUs; older CUDA-capable cards are not automatically supported.
+
+Install your GPU's supported NVIDIA driver. You can check that the driver sees it with:
 
 ```sh
 nvidia-smi
 ```
 
+Magnitude acquires compatible runtime components; you do not need the CUDA development toolkit. If acceleration is unavailable, check the hardware and compatibility information in the app before downloading a large model.
+
 ## AMD, Intel, and other Vulkan GPUs
 
-On Linux and Windows, Magnitude uses Vulkan 1.1 or later for other GPUs. Use your system's graphics driver and Vulkan runtime. Magnitude does not use ROCm.
+Linux and Windows GPU support uses Vulkan for compatible devices. Magnitude does **not** currently ship a ROCm backend.
 
-## CPU only
+Use your operating system's supported graphics driver and Vulkan runtime. The backend requires Vulkan 1.1 or later, but the version alone does not guarantee that a particular GPU supports every model. Check the model's compatibility in Catalog.
 
-Magnitude runs models without a supported GPU, including on Intel Macs. It can't measure speed on every CPU, so recommendations may say a model fits with its speed unknown. Smaller models and quants respond faster.
+## CPU-only machines
 
-## How a model fits
+Magnitude can run models without a supported GPU, including on Intel Macs and Windows machines without a compatible GPU. Smaller models and lower-bit quantizations are usually more practical when response speed matters.
 
-Each quant shows where it runs on your machine:
+CPU inference uses system RAM. Having enough memory to fit a large model does not mean it will generate quickly; use the speed estimates when choosing.
 
-- **In GPU or unified memory:** the fastest.
-- **Experts streamed from RAM or SSD:** a mixture-of-experts model larger than your GPU memory can still run, with the experts it isn't using kept in RAM or read from your SSD. It's slower than a model that fits entirely.
-- **Doesn't fit:** too large for this machine.
+## Memory and speed trade-offs
 
-When a model's full context doesn't fit in memory, Magnitude serves it with a shorter one: the largest power of two that fits, which the app shows in orange, such as **64K context**. It never goes below 32K, because a coding agent's prompt and tools fill much of a smaller context.
+- **More memory** lets you consider larger models, higher-fidelity quantizations, or larger contexts.
+- **GPU memory** matters on dedicated-GPU systems. A machine with 64 GB of system RAM and an 8 GB GPU does not have 72 GB of interchangeable GPU memory.
+- **Longer context** increases memory demand and can slow responses.
+- **Other applications** reduce available memory and can affect speed after assessment.
 
-On a machine with several GPUs, a model runs on one GPU.
+For a faster starting point, move Discover's slider toward **Faster**. For a model that needs less memory, compare the Memory values and quantized variants. See [Models](/models).

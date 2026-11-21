@@ -7,10 +7,7 @@
     "light": "/wordmark-black.svg",
     "dark": "/wordmark-white.svg"
   },
-  "favicon": {
-    "light": "/favicon-black.svg",
-    "dark": "/favicon-white.svg"
-  },
+  "favicon": "/logo.svg",
   "fonts": {
     "heading": {
       "family": "Martian Mono",
@@ -71,10 +68,11 @@
           "installation/macos",
           "installation/windows",
           "installation/linux",
-          "installation/cli-only",
           "installation/docker",
+          "remote-server",
           "hardware",
-          "models"
+          "models",
+          "settings"
         ]
       },
       {
@@ -113,14 +111,6 @@
     ]
   },
   "redirects": [
-    {
-      "source": "/settings",
-      "destination": "/introduction"
-    },
-    {
-      "source": "/remote-server",
-      "destination": "/installation/cli-only"
-    },
     {
       "source": "/api/other-apps",
       "destination": "/integrations/other-agents"

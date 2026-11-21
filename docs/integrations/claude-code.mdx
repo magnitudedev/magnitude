@@ -11,11 +11,9 @@ description: "Connect Claude Code to your downloaded Magnitude models."
 4. Select a downloaded model on the connected card, then click the command to copy it.
 5. Paste it into your terminal from your project folder. On Windows, use PowerShell.
 
-From a terminal, `magnitude connections connect claude-code` does the same. In a browser, such as with the [CLI only](/installation/cli-only), **Connections** shows **Copy setup prompt** instead of **Connect**: paste it into your agent.
-
 Magnitude configures Claude Code’s gateway. Local model IDs use the `anthropic-local/` prefix. Keep Magnitude running while connected, including for hosted models: hosted requests still go to their provider through the gateway. Disconnect and restart Claude Code before using it independently again.
 
-If Claude Code isn’t signed in, **Connect** also adds a placeholder credential, and Magnitude serves its requests for Claude models, including the ones built-in subagents ask for, with your loaded model. Requests for an `anthropic-local/` model use that model. With no model loaded, requests for Claude models fail until you load one. If you sign in to Claude Code later, connect again so your own login is used for Claude models.
+If Claude Code isn’t signed in, **Connect** also adds a placeholder credential, and Magnitude serves every request from it with your loaded model, including the Claude models that built-in subagents ask for. If you sign in to Claude Code later, connect again so your own login is used for Claude models.
 
 ## Run Claude Code
 
@@ -33,7 +31,7 @@ Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e4b-it-qat:gguf:q4`
 
 ### On another computer
 
-1. In Magnitude, turn on **Settings → Network → Network access**, then restart Magnitude.
+1. In Magnitude, turn on **Settings → Network access**.
 2. On the other computer, open `http://ADDRESS:10100` in a browser, using the address from **Reachable at**, and sign in with the **API key**.
 3. In **Connections**, click **Copy setup prompt** on Claude Code and send it to your agent.
 

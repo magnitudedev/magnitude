@@ -35,9 +35,6 @@ Magnitude reads `~/.magnitude/config.json`, or `%USERPROFILE%\.magnitude\config.
 | `contextLimits.softCapRatio` | Fraction of a model's context window used before compaction. Default `0.9`. | Next model load |
 | `contextLimits.softCapMaxTokens` | Absolute cap on context tokens, or `null`. | Next model load |
 | `providers` | OpenAI-compatible endpoints to expose alongside local models. Run `magnitude docs custom-endpoints` for the schema. | Immediately |
-| `models` | Model folders, models added from Hugging Face, hidden models and chosen drafters. Managed by **Models**, **Settings → Storage** and `magnitude models`; edit it with those rather than by hand. | Immediately |
-| `chatModelDefaults` | Each model's **Chat** defaults, from **Settings → Chat**. | Next message |
-| `onboarding` | `Completed` once first-run setup is done. Absent shows setup again. | Next app start |
 
 Invalid values are ignored and logged. A relative `modelsDirectory` or a `network.bind` that is not an IP address falls back to the default, and **Settings** shows the reason.
 
@@ -48,7 +45,5 @@ Invalid values are ignored and logged. A relative `modelsDirectory` or a `networ
 | `models/` | Downloaded models, unless `modelsDirectory` points elsewhere. |
 | `cache/` | Cached and derived data. Safe to delete while Magnitude is not running. |
 | `harness-connections.json` | Connection records for **Connections**. |
-| `huggingface.json` | Your Hugging Face sign-in. Remove it with `magnitude hf logout`. |
-| `logs/` | Service and inference logs. |
 
 Do not delete the whole directory to fix one problem. Removing the app and removing model data are separate actions.
