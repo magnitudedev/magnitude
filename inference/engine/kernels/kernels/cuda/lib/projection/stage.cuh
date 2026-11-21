@@ -13,9 +13,20 @@ template <class E, class Rows> struct Plain {
     Rows rows;
     static constexpr bool STAGED = !Same<E, Act>::value || !Same<Rows, AllRows>::value;
     static constexpr int FACTORS = 0;
+    static constexpr bool VEC4 = true;
     __device__ __forceinline__ void prepare_row(float *, u32, float *) const {}
     __device__ __forceinline__ float value(const float *, u32 m, u64 k) const {
         return Act::round(element::at<E>(x, rows(m) * stride + k));
+    }
+    __device__ __forceinline__ bool can_vec4(u32 m) const {
+        const u8 *row = x + rows(m) * stride * E::bytes;
+        return (reinterpret_cast<u64>(row) & (4 * E::bytes - 1)) == 0ull;
+    }
+    __device__ __forceinline__ void value4(const float *, u32 m, u64 k, float (&out)[4]) const {
+        element::span<E, 4, false>(x, rows(m) * stride + k, out);
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            out[j] = Act::round(out[j]);
     }
     // A view's base and stride are only element-aligned: the wide loads are
     // taken where they hold, single 16-bit loads elsewhere.
@@ -51,11 +62,47 @@ template <class E, class Rows> struct Strided {
     Rows rows;
     static constexpr bool STAGED = true;
     static constexpr int FACTORS = 0;
+    static constexpr bool VEC4 = true;
     __device__ __forceinline__ void prepare_row(float *, u32, float *) const {}
     __device__ __forceinline__ float value(const float *, u32 m, u64 k) const {
         return Act::round(element::at<E>(x, rows(m) * row_stride + k * column_stride));
     }
+    __device__ __forceinline__ bool can_vec4(u32 m) const {
+        if (column_stride != 1ull)
+            return false;
+        const u8 *row = x + rows(m) * row_stride * E::bytes;
+        return (reinterpret_cast<u64>(row) & (4 * E::bytes - 1)) == 0ull;
+    }
+    __device__ __forceinline__ void value4(const float *, u32 m, u64 k, float (&out)[4]) const {
+        element::span<E, 4, false>(x, rows(m) * row_stride + k, out);
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            out[j] = Act::round(out[j]);
+    }
 };
+
+// Coalesced float4 square sum over `row[0 .. width)` with exact FMA
+// accumulation, falling back to scalar when `row` is not 16-byte aligned.
+__device__ __forceinline__ float row_squares(const float *row, u64 width, u32 first, u32 step) {
+    float total = 0.0f;
+    if ((reinterpret_cast<u64>(row) & 15ull) == 0ull) {
+        const u64 vec_width = width & ~3ull;
+        const u64 step4 = (u64)step * 4ull;
+        for (u64 k = (u64)first * 4ull; k < vec_width; k += step4) {
+            const float4 v = *reinterpret_cast<const float4 *>(row + k);
+            total = seismic_fma_rn(v.x, v.x, total);
+            total = seismic_fma_rn(v.y, v.y, total);
+            total = seismic_fma_rn(v.z, v.z, total);
+            total = seismic_fma_rn(v.w, v.w, total);
+        }
+        for (u64 k = vec_width + first; k < width; k += step)
+            total = seismic_fma_rn(row[k], row[k], total);
+    } else {
+        for (u64 k = first; k < width; k += step)
+            total = seismic_fma_rn(row[k], row[k], total);
+    }
+    return total;
+}
 
 // RMS normalization of an F32 residual: x = round_A(t * rsqrt(sum t^2 / K + eps) * w).
 template <class NORM, class Rows> struct Rms {
@@ -67,12 +114,9 @@ template <class NORM, class Rows> struct Rms {
     Rows rows;
     static constexpr bool STAGED = true;
     static constexpr int FACTORS = 1;
+    static constexpr bool VEC4 = true;
     __device__ __forceinline__ float squares(u32 m, u32 first, u32 step) const {
-        const float *row = x + rows(m) * stride;
-        float total = 0.0f;
-        for (u64 k = first; k < width; k += step)
-            total = seismic_fma_rn(row[k], row[k], total);
-        return total;
+        return row_squares(x + rows(m) * stride, width, first, step);
     }
     __device__ __forceinline__ float inverse(float total) const { return rsqrtf(total / (float)width + eps); }
     __device__ __forceinline__ void prepare_row(float *shared, u32 m, float *scratch) const {
@@ -85,6 +129,21 @@ template <class NORM, class Rows> struct Rms {
     }
     __device__ __forceinline__ float value(const float *factors, u32 m, u64 k) const {
         return Act::round(formed(factors[0], m, k));
+    }
+    __device__ __forceinline__ bool can_vec4(u32 m) const {
+        const float *row = x + rows(m) * stride;
+        return (reinterpret_cast<u64>(row) & 15ull) == 0ull &&
+               (reinterpret_cast<u64>(norm) & (4 * NORM::bytes - 1)) == 0ull;
+    }
+    __device__ __forceinline__ void value4(const float *factors, u32 m, u64 k, float (&out)[4]) const {
+        const float4 v = *reinterpret_cast<const float4 *>(x + rows(m) * stride + k);
+        float w[4];
+        element::span<NORM, 4, true>(norm, k, w);
+        const float inv = factors[0];
+        out[0] = Act::round(v.x * inv * w[0]);
+        out[1] = Act::round(v.y * inv * w[1]);
+        out[2] = Act::round(v.z * inv * w[2]);
+        out[3] = Act::round(v.w * inv * w[3]);
     }
 };
 
@@ -102,6 +161,7 @@ template <class NORM, class Rows, u64 PARTS> struct Summed {
     Rows rows;
     static constexpr bool STAGED = true;
     static constexpr int FACTORS = 0;
+    static constexpr bool VEC4 = true;
     __device__ __forceinline__ void prepare_row(float *, u32, float *) const {}
     __device__ __forceinline__ float value(const float *, u32 m, u64 k) const {
         const float *row = x + rows(m) * stride;
@@ -110,6 +170,26 @@ template <class NORM, class Rows, u64 PARTS> struct Summed {
         for (u64 part = 0; part < PARTS; ++part)
             sum = seismic_add_rn(sum, row[part * width + k]);
         return Act::round(sum);
+    }
+    __device__ __forceinline__ bool can_vec4(u32 m) const {
+        const float *row = x + rows(m) * stride;
+        return (reinterpret_cast<u64>(row) & 15ull) == 0ull && (PARTS <= 1 || (width & 3ull) == 0ull);
+    }
+    __device__ __forceinline__ void value4(const float *, u32 m, u64 k, float (&out)[4]) const {
+        const float *row = x + rows(m) * stride;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+#pragma unroll
+        for (u64 part = 0; part < PARTS; ++part) {
+            const float4 v = *reinterpret_cast<const float4 *>(row + part * width + k);
+            s0 = seismic_add_rn(s0, v.x);
+            s1 = seismic_add_rn(s1, v.y);
+            s2 = seismic_add_rn(s2, v.z);
+            s3 = seismic_add_rn(s3, v.w);
+        }
+        out[0] = Act::round(s0);
+        out[1] = Act::round(s1);
+        out[2] = Act::round(s2);
+        out[3] = Act::round(s3);
     }
 };
 
@@ -126,12 +206,9 @@ template <class NORM, class Rows, u32 STREAMS> struct GroupRms {
     Rows rows;
     static constexpr bool STAGED = true;
     static constexpr int FACTORS = STREAMS;
+    static constexpr bool VEC4 = true;
     __device__ __forceinline__ float squares(u32 m, u32 stream, u32 first, u32 step) const {
-        const float *row = x + rows(m) * stride + stream * width;
-        float total = 0.0f;
-        for (u64 k = first; k < width; k += step)
-            total = seismic_fma_rn(row[k], row[k], total);
-        return total;
+        return row_squares(x + rows(m) * stride + stream * width, width, first, step);
     }
     __device__ __forceinline__ void prepare_row(float *shared, u32 m, float *scratch) const {
 #pragma unroll 1
@@ -147,6 +224,21 @@ template <class NORM, class Rows, u32 STREAMS> struct GroupRms {
     __device__ __forceinline__ float value(const float *factors, u32 m, u64 k) const {
         return Act::round(formed(factors, m, k));
     }
+    __device__ __forceinline__ bool can_vec4(u32 m) const {
+        const float *row = x + rows(m) * stride;
+        return (width & 3ull) == 0ull && (reinterpret_cast<u64>(row) & 15ull) == 0ull &&
+               (reinterpret_cast<u64>(norm) & (4 * NORM::bytes - 1)) == 0ull;
+    }
+    __device__ __forceinline__ void value4(const float *factors, u32 m, u64 k, float (&out)[4]) const {
+        const float4 v = *reinterpret_cast<const float4 *>(x + rows(m) * stride + k);
+        float w[4];
+        element::span<NORM, 4, true>(norm, k, w);
+        const float inv = factors[k / width];
+        out[0] = Act::round(v.x * inv * w[0]);
+        out[1] = Act::round(v.y * inv * w[1]);
+        out[2] = Act::round(v.z * inv * w[2]);
+        out[3] = Act::round(v.w * inv * w[3]);
+    }
 };
 
 // An entry's input prologue (`form_input`): RMS normalization with a norm
@@ -160,6 +252,31 @@ template <class NORM, class Rows, u64 PARTS> struct InputOf<NORM, Rows, 0, PARTS
 template <class NORM, class Rows, u64 NORM_EXTENT, u64 PARTS>
 using Input = typename InputOf<NORM, Rows, NORM_EXTENT, PARTS>::type;
 
+template <class Pro, class = void> struct has_vec4 {
+    static constexpr bool value = false;
+};
+template <class Pro> struct has_vec4<Pro, decltype(void(Pro::VEC4))> {
+    static constexpr bool value = Pro::VEC4;
+};
+
+template <class Pro> __device__ __forceinline__ bool pro_can_vec4(const Pro &pro, u32 m) {
+    if constexpr (has_vec4<Pro>::value)
+        return pro.can_vec4(m);
+    else
+        return false;
+}
+
+template <class Pro>
+__device__ __forceinline__ void pro_value4(const Pro &pro, const float *factors, u32 m, u64 k, float (&out)[4]) {
+    if constexpr (has_vec4<Pro>::value) {
+        pro.value4(factors, m, k, out);
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            out[j] = pro.value(factors, m, k + j);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NVFP4 operand rows (<seismic/activation.cuh>, `packets::nvfp4`): the row's
 // global scale over its peak, and each 16-value block's scale and codes.
@@ -170,8 +287,23 @@ namespace nvfp4_stage {
 template <class Pro>
 __device__ __forceinline__ float row_global(const Pro &pro, const float *factors, u32 m, u64 K, float *scratch) {
     float amax = 0.0f;
-    for (u64 k = threadIdx.x; k < K; k += blockDim.x)
-        amax = packets::peak_with(amax, pro.value(factors, m, k));
+    if (pro_can_vec4(pro, m)) {
+        const u64 k4 = K & ~3ull;
+        const u64 step4 = (u64)blockDim.x * 4ull;
+        for (u64 k = (u64)threadIdx.x * 4ull; k < k4; k += step4) {
+            float v[4];
+            pro_value4(pro, factors, m, k, v);
+            amax = packets::peak_with(amax, v[0]);
+            amax = packets::peak_with(amax, v[1]);
+            amax = packets::peak_with(amax, v[2]);
+            amax = packets::peak_with(amax, v[3]);
+        }
+        for (u64 k = k4 + threadIdx.x; k < K; k += blockDim.x)
+            amax = packets::peak_with(amax, pro.value(factors, m, k));
+    } else {
+        for (u64 k = threadIdx.x; k < K; k += blockDim.x)
+            amax = packets::peak_with(amax, pro.value(factors, m, k));
+    }
     return packets::nvfp4::global_scale(reduce::group_peak(amax, scratch));
 }
 
@@ -182,10 +314,27 @@ template <class Pro>
 __device__ __forceinline__ void block_operands(const Pro &pro, const float *factors, u32 m, u64 block, float g,
                                                float &s, float (&q)[16]) {
     float maximum = 0.0f;
+    const u64 base = block * 16;
+    if (pro_can_vec4(pro, m)) {
 #pragma unroll
-    for (int j = 0; j < 16; ++j) {
-        q[j] = pro.value(factors, m, block * 16 + j);
-        maximum = fmaxf(maximum, fabsf(q[j]));
+        for (int j = 0; j < 16; j += 4) {
+            float v[4];
+            pro_value4(pro, factors, m, base + j, v);
+            q[j + 0] = v[0];
+            q[j + 1] = v[1];
+            q[j + 2] = v[2];
+            q[j + 3] = v[3];
+            maximum = fmaxf(maximum, fabsf(v[0]));
+            maximum = fmaxf(maximum, fabsf(v[1]));
+            maximum = fmaxf(maximum, fabsf(v[2]));
+            maximum = fmaxf(maximum, fabsf(v[3]));
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            q[j] = pro.value(factors, m, base + j);
+            maximum = fmaxf(maximum, fabsf(q[j]));
+        }
     }
     s = packets::nvfp4::block_scale(maximum, g);
     const float d = __fmul_rn(g, s);
@@ -280,6 +429,8 @@ __device__ __forceinline__ void form_row(const Pro &pro, u32 m, u64 K, u8 *out,
     __syncthreads();
     if (published != nullptr && threadIdx.x < (unsigned)Pro::FACTORS)
         published->put(threadIdx.x * step, factors[threadIdx.x]);
+    const element::Out<Storage> dst = element::out_over_scratch<Storage>(out);
+    const u64 row_base = (u64)m * K;
     if constexpr (nvfp4_rows<Pro>::value) {
         const float g = nvfp4_stage::row_global(pro, factors, m, K, scratch);
         for (u64 block = threadIdx.x; block < K / 16; block += blockDim.x) {
@@ -288,11 +439,22 @@ __device__ __forceinline__ void form_row(const Pro &pro, u32 m, u64 K, u8 *out,
             const float d = __fmul_rn(g, s);
 #pragma unroll
             for (int j = 0; j < 16; ++j)
-                element::put<Storage>(out, m * K + block * 16 + j, __fmul_rn(q[j], d));
+                q[j] = __fmul_rn(q[j], d);
+            dst.template put_span<16>(row_base + block * 16, q);
         }
+    } else if (pro_can_vec4(pro, m)) {
+        const u64 k4 = K & ~3ull;
+        const u64 step4 = (u64)blockDim.x * 4ull;
+        for (u64 k = (u64)threadIdx.x * 4ull; k < k4; k += step4) {
+            float vals[4];
+            pro_value4(pro, factors, m, k, vals);
+            dst.template put_span<4>(row_base + k, vals);
+        }
+        for (u64 k = k4 + threadIdx.x; k < K; k += blockDim.x)
+            dst.put(row_base + k, pro.value(factors, m, k));
     } else {
         for (u64 k = threadIdx.x; k < K; k += blockDim.x)
-            element::put<Storage>(out, m * K + k, pro.value(factors, m, k));
+            dst.put(row_base + k, pro.value(factors, m, k));
     }
 }
 
@@ -383,13 +545,31 @@ __device__ __forceinline__ void stage_row_s8(const Pro &pro, u32 m, u64 K, u8 *q
     __shared__ float scratch[32];
     pro.prepare_row(factors, m, scratch);
     __syncthreads();
+    const bool vec4 = pro_can_vec4(pro, m);
     for (u64 group = threadIdx.x; group < K / 32; group += blockDim.x) {
         float values[32];
         float maximum = 0.0f;
+        const u64 base = group * 32;
+        if (vec4) {
 #pragma unroll
-        for (int j = 0; j < 32; ++j) {
-            values[j] = pro.value(factors, m, group * 32 + j);
-            maximum = packets::peak_with(maximum, values[j]);
+            for (int j = 0; j < 32; j += 4) {
+                float v[4];
+                pro_value4(pro, factors, m, base + j, v);
+                values[j + 0] = v[0];
+                values[j + 1] = v[1];
+                values[j + 2] = v[2];
+                values[j + 3] = v[3];
+                maximum = packets::peak_with(maximum, v[0]);
+                maximum = packets::peak_with(maximum, v[1]);
+                maximum = packets::peak_with(maximum, v[2]);
+                maximum = packets::peak_with(maximum, v[3]);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 32; ++j) {
+                values[j] = pro.value(factors, m, base + j);
+                maximum = packets::peak_with(maximum, values[j]);
+            }
         }
         const float d = packets::int8_scale_of(maximum);
         int total = 0;
@@ -435,6 +615,7 @@ template <class NORM, class Rows> struct OrderedRms {
     u64 norm_stride = 1;
     static constexpr bool STAGED = true;
     static constexpr int FACTORS = 1;
+    static constexpr bool VEC4 = true;
     __device__ __forceinline__ void ordered_inverses(u32 m_rows, float *inverses, u32 first_row = 0u,
                                                      float *scratch = nullptr) const {
         const u32 tid = threadIdx.x, threads = blockDim.x;
@@ -526,12 +707,51 @@ template <class NORM, class Rows> struct OrderedRms {
     __device__ __forceinline__ float ordered_at(u32 m, u64 c, float inv) const {
         return Act::round(x[rows(m) * stride + c * col_stride] * inv * element::at<NORM>(norm, c * norm_stride));
     }
+    __device__ __forceinline__ bool can_vec4(u32 m) const {
+        const float *row = x + rows(m) * stride;
+        return col_stride == 1ull && norm_stride == 1ull &&
+               (reinterpret_cast<u64>(row) & 15ull) == 0ull &&
+               (reinterpret_cast<u64>(norm) & (4 * NORM::bytes - 1)) == 0ull;
+    }
+    __device__ __forceinline__ void ordered_at4(u32 m, u64 c, float inv, float (&out)[4]) const {
+        const float4 v = *reinterpret_cast<const float4 *>(x + rows(m) * stride + c);
+        float w[4];
+        element::span<NORM, 4, true>(norm, c, w);
+        out[0] = Act::round(v.x * inv * w[0]);
+        out[1] = Act::round(v.y * inv * w[1]);
+        out[2] = Act::round(v.z * inv * w[2]);
+        out[3] = Act::round(v.w * inv * w[3]);
+    }
+    __device__ __forceinline__ bool can_vec8(u32 m) const {
+        const float *row = x + rows(m) * stride;
+        return col_stride == 1ull && norm_stride == 1ull &&
+               (reinterpret_cast<u64>(row) & 15ull) == 0ull &&
+               (reinterpret_cast<u64>(norm) & 15ull) == 0ull;
+    }
+    __device__ __forceinline__ void ordered_at8(u32 m, u64 c, float inv, float (&out)[8]) const {
+        const float *row = x + rows(m) * stride + c;
+        const float4 x0 = *reinterpret_cast<const float4 *>(row);
+        const float4 x1 = *reinterpret_cast<const float4 *>(row + 4ull);
+        float w[8];
+        element::span<NORM, 8, true>(norm, c, w);
+        out[0] = Act::round(x0.x * inv * w[0]);
+        out[1] = Act::round(x0.y * inv * w[1]);
+        out[2] = Act::round(x0.z * inv * w[2]);
+        out[3] = Act::round(x0.w * inv * w[3]);
+        out[4] = Act::round(x1.x * inv * w[4]);
+        out[5] = Act::round(x1.y * inv * w[5]);
+        out[6] = Act::round(x1.z * inv * w[6]);
+        out[7] = Act::round(x1.w * inv * w[7]);
+    }
     __device__ __forceinline__ void prepare_row(float *shared, u32 m, float *) const {
         __shared__ float ordered_sram[512];
         ordered_inverses(1u, shared, m, ordered_sram);
     }
     __device__ __forceinline__ float value(const float *factors, u32 m, u64 k) const {
         return ordered_at(m, k, factors[0]);
+    }
+    __device__ __forceinline__ void value4(const float *factors, u32 m, u64 k, float (&out)[4]) const {
+        ordered_at4(m, k, factors[0], out);
     }
 };
 
@@ -546,6 +766,7 @@ template <class NORM, class Rows, u64 PARTS> struct OrderedSummed {
     u64 norm_stride = 1;
     static constexpr bool STAGED = true;
     static constexpr int FACTORS = 0;
+    static constexpr bool VEC4 = true;
     __device__ __forceinline__ void ordered_inverses(u32 m_rows, float *inverses, u32 = 0u, float * = nullptr) const {
         for (u32 r = threadIdx.x; r < m_rows; r += blockDim.x)
             inverses[r] = 1.0f;
@@ -559,9 +780,47 @@ template <class NORM, class Rows, u64 PARTS> struct OrderedSummed {
             sum = seismic_add_rn(sum, row[(part * width + c) * col_stride]);
         return Act::round(sum);
     }
+    __device__ __forceinline__ bool can_vec4(u32 m) const {
+        const float *row = x + rows(m) * stride;
+        return col_stride == 1ull && (reinterpret_cast<u64>(row) & 15ull) == 0ull &&
+               (PARTS <= 1 || (width & 3ull) == 0ull);
+    }
+    __device__ __forceinline__ void ordered_at4(u32 m, u64 c, float, float (&out)[4]) const {
+        const float *row = x + rows(m) * stride;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+#pragma unroll
+        for (u64 part = 0; part < PARTS; ++part) {
+            const float4 v = *reinterpret_cast<const float4 *>(row + part * width + c);
+            s0 = seismic_add_rn(s0, v.x);
+            s1 = seismic_add_rn(s1, v.y);
+            s2 = seismic_add_rn(s2, v.z);
+            s3 = seismic_add_rn(s3, v.w);
+        }
+        out[0] = Act::round(s0);
+        out[1] = Act::round(s1);
+        out[2] = Act::round(s2);
+        out[3] = Act::round(s3);
+    }
+    __device__ __forceinline__ bool can_vec8(u32 m) const { return can_vec4(m); }
+    __device__ __forceinline__ void ordered_at8(u32 m, u64 c, float inv, float (&out)[8]) const {
+        float lo[4], hi[4];
+        ordered_at4(m, c, inv, lo);
+        ordered_at4(m, c + 4ull, inv, hi);
+        out[0] = lo[0];
+        out[1] = lo[1];
+        out[2] = lo[2];
+        out[3] = lo[3];
+        out[4] = hi[0];
+        out[5] = hi[1];
+        out[6] = hi[2];
+        out[7] = hi[3];
+    }
     __device__ __forceinline__ void prepare_row(float *, u32, float *) const {}
     __device__ __forceinline__ float value(const float *, u32 m, u64 k) const {
         return ordered_at(m, k, 1.0f);
+    }
+    __device__ __forceinline__ void value4(const float *, u32 m, u64 k, float (&out)[4]) const {
+        ordered_at4(m, k, 1.0f, out);
     }
 };
 
@@ -580,7 +839,20 @@ __device__ __forceinline__ float ordered_stage_row(const Pro &pro, u32 m, u64 K,
     __shared__ float stage_scratch[512];
     pro.ordered_inverses(1u, inv_shared, m, stage_scratch);
     const float inv = inv_shared[0];
-    for (u64 c = threadIdx.x; c < K; c += blockDim.x)
-        out.put(m * stride0 + c * stride1, pro.ordered_at(m, c, inv));
+    const u64 row_base = (u64)m * stride0;
+    if (stride1 == 1ull && pro.can_vec8(m) && (reinterpret_cast<u64>(out.stored(row_base)) & 15ull) == 0ull) {
+        const u64 k8 = K & ~7ull;
+        const u64 step8 = (u64)blockDim.x * 8ull;
+        for (u64 c = (u64)threadIdx.x * 8ull; c < k8; c += step8) {
+            float vals[8];
+            pro.ordered_at8(m, c, inv, vals);
+            out.template put_span<8>(row_base + c, vals);
+        }
+        for (u64 c = k8 + threadIdx.x; c < K; c += blockDim.x)
+            out.put(row_base + c, pro.ordered_at(m, c, inv));
+    } else {
+        for (u64 c = threadIdx.x; c < K; c += blockDim.x)
+            out.put(row_base + c * stride1, pro.ordered_at(m, c, inv));
+    }
     return inv;
 }
