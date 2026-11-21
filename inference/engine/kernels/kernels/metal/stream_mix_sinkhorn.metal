@@ -245,30 +245,93 @@ inline void reduce_slice(device const float *hidden, device const float *previou
             }
         }
     } else {
-        // Column `at` of every row this lane holds.
-        auto take = [&](uint at, thread const float (&f)[MIXES]) {
-            const uint stream = at / h, column = at % h;
-            for (uint r = 0; r < PER; ++r) {
-                const float v = x[r][ulong(stream) * SEISMIC_HIDDEN_STRIDE_1 + ulong(column) * SEISMIC_HIDDEN_STRIDE_2];
-                sums[r][0] = metal::fma(v, v, sums[r][0]);
-                for (uint j = 0; j < MIXES; ++j)
-                    sums[r][1u + j] = metal::fma(f[j], v, sums[r][1u + j]);
-            }
-        };
+        const bool unit_function = SEISMIC_FUNCTION_STRIDE_1 == 1ul;
+        const bool unit_hidden = SEISMIC_HIDDEN_STRIDE_2 == 1ul;
         for (uint chunk = first; chunk < last; chunk += CHUNK) {
             const uint count = metal::min(CHUNK, last - chunk);
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint e = thread_index; e < MIXES * count; e += THREADS) {
-                const uint j = e / count, c = e % count;
-                staged[j * CHUNK + c] =
-                    function[ulong(j) * SEISMIC_FUNCTION_STRIDE_0 + ulong(chunk + c) * SEISMIC_FUNCTION_STRIDE_1];
+            if (unit_function) {
+                const uint vec_count = count >> 2;
+                const uint vec_end = vec_count * 4u;
+                for (uint j = sg; j < MIXES; j += SIMDGROUPS) {
+                    device const float *src = function + ulong(j) * SEISMIC_FUNCTION_STRIDE_0 + ulong(chunk);
+                    threadgroup float *dst = staged + j * CHUNK;
+                    for (uint k = lane; k < vec_count; k += 32u) {
+                        *reinterpret_cast<threadgroup float4 *>(dst + 4u * k) =
+                            float4(*reinterpret_cast<device const packed_float4 *>(src + 4u * k));
+                    }
+                    for (uint c = vec_end + lane; c < count; c += 32u)
+                        dst[c] = src[c];
+                }
+            } else {
+                for (uint j = sg; j < MIXES; j += SIMDGROUPS) {
+                    device const float *src = function + ulong(j) * SEISMIC_FUNCTION_STRIDE_0;
+                    threadgroup float *dst = staged + j * CHUNK;
+                    for (uint c = lane; c < count; c += 32u)
+                        dst[c] = src[ulong(chunk + c) * SEISMIC_FUNCTION_STRIDE_1];
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint c = lane; c < count; c += PASS) {
-                float f[MIXES];
-                for (uint j = 0; j < MIXES; ++j)
-                    f[j] = staged[j * CHUNK + c];
-                take(chunk + c, f);
+            const uint chunk_end = chunk + count;
+            for (uint s = 0; s < STREAMS; ++s) {
+                const uint s_begin = s * h;
+                const uint s_end = s_begin + h;
+                const uint lo = metal::max(chunk, s_begin);
+                const uint hi = metal::min(chunk_end, s_end);
+                if (lo >= hi)
+                    continue;
+                const uint len = hi - lo;
+                const uint c_lo = lo - chunk;
+                const uint col_lo = lo - s_begin;
+                device const float *xs[PER];
+                for (uint r = 0; r < PER; ++r)
+                    xs[r] = x[r] + ulong(s) * SEISMIC_HIDDEN_STRIDE_1;
+                auto take_scalar = [&](uint d) {
+                    const uint col = col_lo + d;
+                    const uint c = c_lo + d;
+                    float v[PER];
+                    for (uint r = 0; r < PER; ++r) {
+                        v[r] = xs[r][ulong(col) * SEISMIC_HIDDEN_STRIDE_2];
+                        sums[r][0] = metal::fma(v[r], v[r], sums[r][0]);
+                    }
+                    for (uint j = 0; j < MIXES; ++j) {
+                        const float fj = staged[j * CHUNK + c];
+                        for (uint r = 0; r < PER; ++r)
+                            sums[r][1u + j] = metal::fma(fj, v[r], sums[r][1u + j]);
+                    }
+                };
+                if (unit_hidden) {
+                    const uint head = (4u - (c_lo & 3u)) & 3u;
+                    const uint vec_lo = metal::min(head, len);
+                    const uint vec_hi = vec_lo + ((len - vec_lo) & ~3u);
+                    for (uint d = lane; d < vec_lo; d += PASS)
+                        take_scalar(d);
+                    for (uint d = vec_lo + lane * 4u; d < vec_hi; d += PASS * 4u) {
+                        float4 v[PER];
+                        for (uint r = 0; r < PER; ++r) {
+                            v[r] = float4(*reinterpret_cast<device const packed_float4 *>(xs[r] + col_lo + d));
+                            sums[r][0] = metal::fma(v[r].x, v[r].x, sums[r][0]);
+                            sums[r][0] = metal::fma(v[r].y, v[r].y, sums[r][0]);
+                            sums[r][0] = metal::fma(v[r].z, v[r].z, sums[r][0]);
+                            sums[r][0] = metal::fma(v[r].w, v[r].w, sums[r][0]);
+                        }
+                        for (uint j = 0; j < MIXES; ++j) {
+                            const float4 fj =
+                                *reinterpret_cast<threadgroup const float4 *>(staged + j * CHUNK + c_lo + d);
+                            for (uint r = 0; r < PER; ++r) {
+                                sums[r][1u + j] = metal::fma(fj.x, v[r].x, sums[r][1u + j]);
+                                sums[r][1u + j] = metal::fma(fj.y, v[r].y, sums[r][1u + j]);
+                                sums[r][1u + j] = metal::fma(fj.z, v[r].z, sums[r][1u + j]);
+                                sums[r][1u + j] = metal::fma(fj.w, v[r].w, sums[r][1u + j]);
+                            }
+                        }
+                    }
+                    for (uint d = vec_hi + lane; d < len; d += PASS)
+                        take_scalar(d);
+                } else {
+                    for (uint d = lane; d < len; d += PASS)
+                        take_scalar(d);
+                }
             }
         }
     }
@@ -322,9 +385,9 @@ inline void reduce_slice(device const float *hidden, device const float *previou
         uint2 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],      \
         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {                \
         threadgroup float simdgroups[SUMS][THREADS / 32u];                                                     \
-        threadgroup float staged[STAGED];                                                                      \
+        threadgroup float4 staged_words[((STAGED) + 3u) / 4u];                                                 \
         reduce_slice<TILE>(hidden, previous, function, partials, element::Out<element::F32>(input), seismic_words, \
-            group, thread_index, sg, lane, staged, simdgroups);                                                \
+            group, thread_index, sg, lane, reinterpret_cast<threadgroup float *>(staged_words), simdgroups);  \
     }
 
 STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_split, 1u, 1u)

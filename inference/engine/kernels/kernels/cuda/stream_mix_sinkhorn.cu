@@ -261,33 +261,100 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
             }
         }
     } else {
-        // Column `at` of every row this lane holds.
-        auto take = [&](unsigned at, const float (&f)[MIXES]) {
-            const unsigned stream = at / h, column = at % h;
-#pragma unroll
-            for (unsigned r = 0; r < PER; ++r) {
-                const float v = x[r][(u64)stream * SEISMIC_HIDDEN_STRIDE_1 + (u64)column * SEISMIC_HIDDEN_STRIDE_2];
-                sums[r][0] = __fmaf_rn(v, v, sums[r][0]);
-#pragma unroll
-                for (unsigned j = 0; j < MIXES; ++j)
-                    sums[r][1u + j] = __fmaf_rn(f[j], v, sums[r][1u + j]);
-            }
-        };
+        const bool unit_function = SEISMIC_FUNCTION_STRIDE_1 == 1 && (SEISMIC_FUNCTION_STRIDE_0 & 3u) == 0u;
+        const bool unit_hidden = SEISMIC_HIDDEN_STRIDE_2 == 1 && (SEISMIC_HIDDEN_STRIDE_0 & 3u) == 0u;
         for (unsigned chunk = first; chunk < last; chunk += CHUNK) {
             const unsigned count = min(CHUNK, last - chunk);
             __syncthreads();
-            for (unsigned e = threadIdx.x; e < MIXES * count; e += THREADS) {
-                const unsigned j = e / count, c = e % count;
-                staged[j * CHUNK + c] =
-                    function[(u64)j * SEISMIC_FUNCTION_STRIDE_0 + (u64)(chunk + c) * SEISMIC_FUNCTION_STRIDE_1];
+            if (unit_function && (reinterpret_cast<u64>(function + (u64)chunk) & 15u) == 0u) {
+                const unsigned vec_count = count >> 2;
+                const unsigned vec_end = vec_count * 4u;
+                for (unsigned j = warp; j < MIXES; j += WARPS) {
+                    const float *src = function + (u64)j * SEISMIC_FUNCTION_STRIDE_0 + (u64)chunk;
+                    float *dst = staged + j * CHUNK;
+                    for (unsigned k = lane; k < vec_count; k += 32u)
+                        reinterpret_cast<float4 *>(dst)[k] = reinterpret_cast<const float4 *>(src)[k];
+                    for (unsigned c = vec_end + lane; c < count; c += 32u)
+                        dst[c] = src[c];
+                }
+            } else {
+                for (unsigned j = warp; j < MIXES; j += WARPS) {
+                    const float *src = function + (u64)j * SEISMIC_FUNCTION_STRIDE_0;
+                    float *dst = staged + j * CHUNK;
+                    for (unsigned c = lane; c < count; c += 32u)
+                        dst[c] = src[(u64)(chunk + c) * SEISMIC_FUNCTION_STRIDE_1];
+                }
             }
             __syncthreads();
-            for (unsigned c = lane; c < count; c += PASS) {
-                float f[MIXES];
+            const unsigned chunk_end = chunk + count;
+            for (unsigned s = 0; s < STREAMS; ++s) {
+                const unsigned s_begin = s * h;
+                const unsigned s_end = s_begin + h;
+                const unsigned lo = max(chunk, s_begin);
+                const unsigned hi = min(chunk_end, s_end);
+                if (lo >= hi)
+                    continue;
+                const unsigned len = hi - lo;
+                const unsigned c_lo = lo - chunk;
+                const unsigned col_lo = lo - s_begin;
+                const float *xs[PER];
 #pragma unroll
-                for (unsigned j = 0; j < MIXES; ++j)
-                    f[j] = staged[j * CHUNK + c];
-                take(chunk + c, f);
+                for (unsigned r = 0; r < PER; ++r)
+                    xs[r] = x[r] + (u64)s * SEISMIC_HIDDEN_STRIDE_1;
+                auto take_scalar = [&](unsigned d) {
+                    const unsigned col = col_lo + d;
+                    const unsigned c = c_lo + d;
+                    float v[PER];
+#pragma unroll
+                    for (unsigned r = 0; r < PER; ++r) {
+                        v[r] = xs[r][(u64)col * SEISMIC_HIDDEN_STRIDE_2];
+                        sums[r][0] = __fmaf_rn(v[r], v[r], sums[r][0]);
+                    }
+#pragma unroll
+                    for (unsigned j = 0; j < MIXES; ++j) {
+                        const float fj = staged[j * CHUNK + c];
+#pragma unroll
+                        for (unsigned r = 0; r < PER; ++r)
+                            sums[r][1u + j] = __fmaf_rn(fj, v[r], sums[r][1u + j]);
+                    }
+                };
+                const u64 x_addr = reinterpret_cast<u64>(xs[0] + col_lo);
+                const u64 s_addr = reinterpret_cast<u64>(staged + c_lo);
+                if (unit_hidden && ((x_addr & 15u) == (s_addr & 15u))) {
+                    const unsigned mis = (unsigned)((x_addr >> 2) & 3u);
+                    const unsigned head = (4u - mis) & 3u;
+                    const unsigned vec_lo = min(head, len);
+                    const unsigned vec_hi = vec_lo + ((len - vec_lo) & ~3u);
+                    for (unsigned d = lane; d < vec_lo; d += PASS)
+                        take_scalar(d);
+                    for (unsigned d = vec_lo + lane * 4u; d < vec_hi; d += PASS * 4u) {
+                        float4 v[PER];
+#pragma unroll
+                        for (unsigned r = 0; r < PER; ++r) {
+                            v[r] = *reinterpret_cast<const float4 *>(xs[r] + col_lo + d);
+                            sums[r][0] = __fmaf_rn(v[r].x, v[r].x, sums[r][0]);
+                            sums[r][0] = __fmaf_rn(v[r].y, v[r].y, sums[r][0]);
+                            sums[r][0] = __fmaf_rn(v[r].z, v[r].z, sums[r][0]);
+                            sums[r][0] = __fmaf_rn(v[r].w, v[r].w, sums[r][0]);
+                        }
+#pragma unroll
+                        for (unsigned j = 0; j < MIXES; ++j) {
+                            const float4 fj = *reinterpret_cast<const float4 *>(staged + j * CHUNK + c_lo + d);
+#pragma unroll
+                            for (unsigned r = 0; r < PER; ++r) {
+                                sums[r][1u + j] = __fmaf_rn(fj.x, v[r].x, sums[r][1u + j]);
+                                sums[r][1u + j] = __fmaf_rn(fj.y, v[r].y, sums[r][1u + j]);
+                                sums[r][1u + j] = __fmaf_rn(fj.z, v[r].z, sums[r][1u + j]);
+                                sums[r][1u + j] = __fmaf_rn(fj.w, v[r].w, sums[r][1u + j]);
+                            }
+                        }
+                    }
+                    for (unsigned d = vec_hi + lane; d < len; d += PASS)
+                        take_scalar(d);
+                } else {
+                    for (unsigned d = lane; d < len; d += PASS)
+                        take_scalar(d);
+                }
             }
         }
     }
@@ -338,13 +405,13 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
 #define STREAM_MIX_SLICE_KERNEL(NAME, TILE, STAGED)                                                                 \
     extern "C" __global__ void NAME(SEISMIC_KERNEL_PARAMS) {                                                        \
         __shared__ float warps[SUMS][THREADS / 32u];                                                                \
-        __shared__ float staged[STAGED];                                                                            \
+        __shared__ float4 staged_words[((STAGED) + 3u) / 4u];                                                       \
         reduce_slice<TILE>(reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)),                    \
                            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_PREVIOUS)),                  \
                            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_FUNCTION)),                  \
                            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),                \
                            SEISMIC_RESULT_0_OUT, seismic_words_value,                                              \
-                           staged, warps);                                                                          \
+                           reinterpret_cast<float *>(staged_words), warps);                                         \
     }
 
 STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_split, 1u, 1u)
