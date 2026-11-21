@@ -446,7 +446,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         work.priming = Some(PrimingFlight {
             request,
             submission,
-            continuation: None,
+            continuation: PrimingContinuation::Ordinary,
         });
         Ok(work)
     }
@@ -1261,13 +1261,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             panic!("invariant violated: a drafter entry has other than one slot");
         };
         match (advance, priming.continuation) {
-            (TentativeAdvance::Accepted(advance), None) => Ok(Some((priming.request, advance))),
+            (TentativeAdvance::Accepted(advance), PrimingContinuation::Ordinary) => {
+                Ok(Some((priming.request, advance)))
+            }
             // `claim_slots` found the state the successor follows.
-            (TentativeAdvance::Successor(successor), Some(Some(state))) => match successor.attach(state) {
-                Ok(advance) => Ok(Some((priming.request, advance))),
-                Err((_, error)) => panic!("invariant violated: a claimed drafter entry no longer follows its state: {error}"),
-            },
-            (TentativeAdvance::Successor(_), Some(None)) => Ok(None),
+            (TentativeAdvance::Successor(successor), PrimingContinuation::Accepted(state)) => {
+                match successor.attach(state) {
+                    Ok(advance) => Ok(Some((priming.request, advance))),
+                    Err((_, error)) => panic!(
+                        "invariant violated: a claimed drafter entry no longer follows its state: {error}"
+                    ),
+                }
+            }
+            (TentativeAdvance::Successor(_), PrimingContinuation::Unclaimed) => Ok(None),
             _ => panic!("invariant violated: a drafter entry's advance differs from its continuation"),
         }
     }

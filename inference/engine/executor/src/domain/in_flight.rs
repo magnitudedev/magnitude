@@ -175,10 +175,20 @@ impl<F: ProgramFamily> HeadFlight<F> {
 pub(super) struct PrimingFlight<H> {
     pub(super) request: RequestId,
     pub(super) submission: H,
-    /// For a claimed queued step: the accepted head state its successor
-    /// advance attaches to at finish, or `None` when nobody claimed it (its
-    /// rows are discarded). `None` for an ordinary flight.
-    pub(super) continuation: Option<Option<SequenceState>>,
+    /// How the drafter entry's head advance resolves at finish.
+    pub(super) continuation: PrimingContinuation,
+}
+
+/// How a [`PrimingFlight`]'s head advance resolves at finish.
+pub(super) enum PrimingContinuation {
+    /// An ordinary flight: its advance already owns the accepted head state.
+    Ordinary,
+    /// A claimed queued step whose head state nobody claimed: its successor
+    /// rows are discarded.
+    Unclaimed,
+    /// A claimed queued step whose successor advance attaches to this
+    /// accepted head state.
+    Accepted(SequenceState),
 }
 
 /// A front head launch's parts secured before it launches, behind a target

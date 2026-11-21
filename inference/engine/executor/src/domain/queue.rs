@@ -1424,7 +1424,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // Take-out: the drafter entry's accepted head state, returned as it
         // finishes (`finish_priming_work` attaches it).
         if let Some(priming) = &mut flight.priming {
-            priming.continuation = Some(self.take_head_state(priming.request));
+            priming.continuation = match self.take_head_state(priming.request) {
+                Some(state) => PrimingContinuation::Accepted(state),
+                None => PrimingContinuation::Unclaimed,
+            };
         }
         let front = front.map(|head| match heads {
             Some(states) => DueFront::Claimed(*head, states),

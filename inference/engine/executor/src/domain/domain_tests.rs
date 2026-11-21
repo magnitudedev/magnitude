@@ -1904,7 +1904,7 @@ fn deferred_priming_keeps_pending_completion_and_reports_device_failure() {
         work: PrimingFlight {
             request: RequestId(88),
             submission: PendingFailureSubmission::new(control.clone()).into(),
-            continuation: None,
+            continuation: PrimingContinuation::Ordinary,
         },
         target_end: 1,
         bindings,
@@ -2019,7 +2019,7 @@ fn attach_pending_priming(
     flight.work.priming = Some(PrimingFlight {
         request,
         submission: head,
-        continuation: None,
+        continuation: PrimingContinuation::Ordinary,
     });
     control
 }

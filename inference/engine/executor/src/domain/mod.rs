@@ -60,8 +60,8 @@ pub use in_flight::{
     HeadFlight, PrimingCompletionFlight, TargetContinuation, TargetFlight, VisionFlight,
 };
 use in_flight::{
-    DueFront, FrontFlight, FrontHead, FrontJoins, HeldFront, PrimingFlight, SecuredFrontSlot, Source,
-    TargetWork, decode_selected,
+    DueFront, FrontFlight, FrontHead, FrontJoins, HeldFront, PrimingContinuation, PrimingFlight,
+    SecuredFrontSlot, Source, TargetWork, decode_selected,
 };
 pub use ownership::OpenRequirements;
 pub use state::{LoadCharge, StateBytes, StoreAllocation, StoreStateBytes};
