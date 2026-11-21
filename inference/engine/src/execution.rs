@@ -797,7 +797,7 @@ fn seal_graphs(prepared: Box<PreparedPrograms>, manifest: &ExecutionManifest) ->
 /// imported, or the refusal of a plan holding its experts whole that could
 /// stream them ([`Built::Unheld`]).
 enum TargetImport {
-    Imported(ImportedTarget),
+    Imported(Box<ImportedTarget>),
     Unheld(LoadError),
 }
 
@@ -1095,7 +1095,7 @@ fn import_target(
         );
     }
     report_load_memory("target imported", &device);
-    Ok(TargetImport::Imported(ImportedTarget {
+    Ok(TargetImport::Imported(Box::new(ImportedTarget {
         startup,
         execution_plan,
         resident,
@@ -1117,7 +1117,7 @@ fn import_target(
         site_requests,
         head_enabled,
         primes_drafter,
-    }))
+    })))
 }
 
 /// A plan holding its experts whole that the target import's claim
@@ -1145,7 +1145,7 @@ fn streams_instead(
 /// The imported load's domain: its optional components' loaders and its
 /// state allocated, the domain made of them, warmed up and priced.
 fn assemble_domain(
-    imported: ImportedTarget,
+    imported: Box<ImportedTarget>,
     manifest: &ExecutionManifest,
     package: Arc<Package>,
     progress: &Rc<dyn Fn(LoadProgress)>,
@@ -1172,7 +1172,7 @@ fn assemble_domain(
         site_requests,
         head_enabled,
         primes_drafter,
-    } = imported;
+    } = *imported;
     let mut phase_started = Instant::now();
     progress(LoadProgress::Finalizing);
     let definition = Rc::new(manifest.definition.clone());
