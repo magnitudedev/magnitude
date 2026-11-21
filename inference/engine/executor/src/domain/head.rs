@@ -884,16 +884,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                                 .collect()
                         }),
                     },
-                    advance: advance.map(Advance::Step),
-                    primed: None,
-                    front: None,
+                    payload: PendingPayload::Head { advance },
                     rows: advance_rows(passes, rows, proposals),
                     committed_rows: rows,
                     kind: WorkKind::Decode,
                     physical_duration: Duration::ZERO,
                     timed: Timed::Untimed,
-                    image: None,
-                    awaited: None,
                 },
             )
             .collect();

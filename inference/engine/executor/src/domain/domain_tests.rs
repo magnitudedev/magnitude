@@ -1505,16 +1505,14 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
                 proposals: Vec::new(),
                 confidence: None,
             },
-            advance: Some(Advance::Step(head_advance)),
-            primed: None,
-            front: None,
+            payload: PendingPayload::Head {
+                advance: Some(head_advance),
+            },
             rows: 1,
             committed_rows: 0,
             kind: WorkKind::Decode,
             physical_duration: Duration::ZERO,
             timed: Timed::Settled,
-            image: None,
-            awaited: None,
         })
         .unwrap();
     assert_eq!(domain.target_state(request).unwrap().position(), 0);
@@ -1535,16 +1533,12 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             outcome: Outcome::Encode {
                 features: vision_features,
             },
-            advance: None,
-            primed: None,
-            front: None,
+            payload: PendingPayload::Encode { image },
             rows: 0,
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: Duration::ZERO,
             timed: Timed::Settled,
-            image: Some(image),
-            awaited: None,
         })
         .unwrap();
     assert_eq!(domain.target_state(request).unwrap().position(), 0);
@@ -1759,16 +1753,12 @@ fn reconcile_encode<F: ProgramFamily>(
                 outcome: Outcome::Encode {
                     features: features.clone(),
                 },
-                advance: None,
-                primed: None,
-                front: None,
+                payload: PendingPayload::Encode { image },
                 rows: 0,
                 committed_rows: 0,
                 kind: WorkKind::Prefill,
                 physical_duration: Duration::ZERO,
                 timed: Timed::Settled,
-                image: Some(image),
-                awaited: None,
             },
             PhysicalDecision::rows(0),
         )

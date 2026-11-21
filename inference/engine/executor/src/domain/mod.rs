@@ -319,12 +319,7 @@ fn holds(store: &StateStore, demands: &[RowDemand]) -> Result<(), CapacityError>
 pub struct PendingOperationOutcome {
     request: RequestId,
     outcome: Outcome,
-    advance: Option<Advance>,
-    /// A prompt chunk's drafter entry, committed whole with the chunk.
-    primed: Option<OwnedStateAdvance>,
-    /// The head advance of the front head launch behind a chained forward,
-    /// committing its entry row with the forward's accepted row.
-    front: Option<FrontAdvance>,
+    payload: PendingPayload,
     rows: usize,
     committed_rows: usize,
     kind: WorkKind,
@@ -334,12 +329,54 @@ pub struct PendingOperationOutcome {
     /// began or ended, within it; and whether the bank's cover read beside
     /// it.
     timed: Timed,
-    image: Option<ImageRef>,
-    /// Of a pass that ran rows ahead in an expert bank's step, that step:
-    /// the interest ledger awaits the pass's verdict by it, told as it is
-    /// reconciled (`ElasticBank::decided`), or its discard, as it is
-    /// aborted (`ElasticBank::discarded`).
-    awaited: Option<crate::experts::Step>,
+}
+
+/// The physical transaction state an outcome owns until it is reconciled or
+/// aborted, algebraic by operation lane so cross-lane combinations have no
+/// representation.
+enum PendingPayload {
+    Target {
+        advance: Advance,
+        head: TargetHeadAdvances,
+        /// Of a pass that ran rows ahead in an expert bank's step, that step:
+        /// the interest ledger awaits the pass's verdict by it, told as it is
+        /// reconciled (`ElasticBank::decided`), or its discard, as it is
+        /// aborted (`ElasticBank::discarded`).
+        awaited: Option<crate::experts::Step>,
+    },
+    Head {
+        /// `None` only for a head that keeps no history and reads target state.
+        advance: Option<OwnedStateAdvance>,
+    },
+    Encode {
+        image: ImageRef,
+    },
+}
+
+/// The head advances a target outcome owns until it is reconciled or aborted.
+enum TargetHeadAdvances {
+    None,
+    /// A prompt chunk's drafter entry, committed whole with the chunk.
+    Primed(OwnedStateAdvance),
+    /// A decode pass's front head advance (`crate::two_row`) over the
+    /// request's accepted head state, committing its one committed entry row
+    /// with the forward's accepted row and its scratch rows never.
+    Front(OwnedStateAdvance),
+    /// A prompt's closing chunk: its drafter entry, followed by its front
+    /// head advance (`OwnedSuccessorAdvance`), which attaches to the head
+    /// state once the drafter entry commits.
+    PrimedAndFront {
+        primed: OwnedStateAdvance,
+        front: OwnedSuccessorAdvance,
+    },
+}
+
+impl TargetHeadAdvances {
+    /// Whether this target outcome currently owns the request's accepted head
+    /// state (either via a primed drafter entry or a decode front head advance).
+    fn owns_head_state(&self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 /// What a launch's duration is its own across: the graphs recorded on the
@@ -402,19 +439,6 @@ enum Advance {
         joined: OwnedChainAdvance,
         chunk: magnitude_state::OwnedChainedAdvance,
     },
-}
-
-/// A chained forward's head advance in its front head launch
-/// (`crate::two_row`), as its outcome holds it: it commits its one committed
-/// entry row with the forward's accepted row, and its scratch rows (the
-/// front rows' entries) never.
-enum FrontAdvance {
-    /// A decode pass's: over the request's accepted head state.
-    Step(OwnedStateAdvance),
-    /// The prompt's closing chunk's: following its drafter entry
-    /// (`PendingOperationOutcome::primed`), which it joins once that
-    /// commits.
-    Entry(OwnedSuccessorAdvance),
 }
 
 impl PendingOperationOutcome {
@@ -3088,8 +3112,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         for operation in operations {
             let request = operation.request();
             // Take-out: the request's accepted head state, returned by its
-            // outcome's reconcile or abort (`FrontAdvance`), or here on
-            // refusal (`HeldFront::release`).
+            // outcome's reconcile or abort (`TargetHeadAdvances::Front`), or
+            // here on refusal (`HeldFront::release`).
             let state = self
                 .take_head_state(request)
                 .expect("reservation preflight established head ownership");
