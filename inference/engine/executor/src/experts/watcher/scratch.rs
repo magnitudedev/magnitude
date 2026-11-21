@@ -76,8 +76,215 @@ pub(super) struct Request {
     cold: Vec<usize>,
 }
 
+/// Group-wide routing summary for one expert at a tier's layer.
+#[derive(Clone, Copy)]
+struct GroupRoute {
+    count: u32,
+    /// The last step of the group that routed this expert here.
+    last: Step,
+}
+
+/// A cold expert's progression through scratch claiming and round scheduling.
+#[derive(Clone, Copy)]
+enum ColdStage {
+    /// Assigned to its reader, scratch slot not yet claimed.
+    Assigned,
+    /// Scratch slot claimed (`claim_scratch`); either awaiting `fix_rounds`
+    /// or copied from the host tier into its scratch slot.
+    Claimed,
+    /// Scratch slot claimed and scheduled in `round` of its reader's request.
+    Scheduled(u32),
+}
+
+/// A cold expert's conveyor read status.
+enum ColdRead {
+    /// Waiting for a conveyor record (or for a host-tier landing).
+    Deferred,
+    /// Carried by the conveyor (reading/held/listed) or copied from the host tier.
+    Active,
+    /// Its file read failed; its reader fails at its round with `reason`.
+    Failed(String),
+}
+
+/// Per-expert cold-read state within the open pass set.
+struct ColdSlot {
+    /// The step whose request reads this expert.
+    reader: Step,
+    stage: ColdStage,
+    read: ColdRead,
+}
+
+impl ColdSlot {
+    fn has_scratch(&self) -> bool {
+        matches!(self.stage, ColdStage::Claimed | ColdStage::Scheduled(_))
+    }
+
+    fn round(&self) -> Option<u32> {
+        match self.stage {
+            ColdStage::Scheduled(round) => Some(round),
+            ColdStage::Assigned | ColdStage::Claimed => None,
+        }
+    }
+
+    fn is_deferred(&self) -> bool {
+        matches!(self.read, ColdRead::Deferred)
+    }
+
+    fn failure(&self) -> Option<&str> {
+        match &self.read {
+            ColdRead::Failed(reason) => Some(reason.as_str()),
+            ColdRead::Deferred | ColdRead::Active => None,
+        }
+    }
+}
+
+/// Per-expert state within the open pass set.
+#[derive(Default)]
+enum SetSlot {
+    /// Not routed by any ingested request in the open pass set.
+    #[default]
+    Unrouted,
+    /// Routed in the open pass set as a hit (read from bank/store).
+    Hit,
+    /// Routed in the open pass set as a cold expert, read into its scratch slot.
+    Cold(ColdSlot),
+}
+
+/// Per-expert state at a tier's layer: group-wide routing counts plus
+/// open-pass-set routing, scratch, reader, round, and read status.
+#[derive(Default)]
+struct ExpertSlot {
+    group: Option<GroupRoute>,
+    set: SetSlot,
+}
+
+impl ExpertSlot {
+    fn routed(&self) -> bool {
+        self.group.is_some()
+    }
+
+    fn record_route(&mut self, count: u32, sequence: Step) {
+        match &mut self.group {
+            Some(route) => {
+                route.count += count;
+                route.last = sequence;
+            }
+            None => self.group = Some(GroupRoute { count, last: sequence }),
+        }
+    }
+
+    fn cold(&self) -> Option<&ColdSlot> {
+        match &self.set {
+            SetSlot::Cold(cold) => Some(cold),
+            SetSlot::Unrouted | SetSlot::Hit => None,
+        }
+    }
+
+    fn is_cold(&self) -> bool {
+        self.cold().is_some()
+    }
+
+    fn reader(&self) -> Option<Step> {
+        self.cold().map(|cold| cold.reader)
+    }
+
+    fn has_scratch(&self) -> bool {
+        self.cold().is_some_and(ColdSlot::has_scratch)
+    }
+
+    fn round(&self) -> Option<u32> {
+        self.cold().and_then(ColdSlot::round)
+    }
+
+    fn is_deferred(&self) -> bool {
+        self.cold().is_some_and(ColdSlot::is_deferred)
+    }
+
+    fn failure(&self) -> Option<&str> {
+        self.cold().and_then(ColdSlot::failure)
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failure().is_some()
+    }
+}
+
+/// Per-chain-place request state in a tier.
+enum PlaceSlot {
+    Empty,
+    /// Published for a pass set not yet opened; ingested on `open_set`.
+    Queued { sequence: Step, flags: Vec<u32> },
+    /// Ingested into the open pass set, awaiting its window(s) to arrive.
+    Ingested(Request),
+}
+
+impl PlaceSlot {
+    fn sequence(&self) -> Option<Step> {
+        match self {
+            Self::Empty => None,
+            Self::Queued { sequence, .. } => Some(*sequence),
+            Self::Ingested(request) => Some(request.sequence),
+        }
+    }
+
+    fn as_request(&self) -> Option<&Request> {
+        match self {
+            Self::Ingested(request) => Some(request),
+            Self::Empty | Self::Queued { .. } => None,
+        }
+    }
+
+    fn as_request_mut(&mut self) -> Option<&mut Request> {
+        match self {
+            Self::Ingested(request) => Some(request),
+            Self::Empty | Self::Queued { .. } => None,
+        }
+    }
+
+    fn take_request(&mut self) -> Option<Request> {
+        if !matches!(self, Self::Ingested(_)) {
+            return None;
+        }
+        match std::mem::replace(self, Self::Empty) {
+            Self::Ingested(request) => Some(request),
+            Self::Empty | Self::Queued { .. } => unreachable!(),
+        }
+    }
+
+    fn take_queued(&mut self) -> Option<(Step, Vec<u32>)> {
+        if !matches!(self, Self::Queued { .. }) {
+            return None;
+        }
+        match std::mem::replace(self, Self::Empty) {
+            Self::Queued { sequence, flags } => Some((sequence, flags)),
+            Self::Empty | Self::Ingested(_) => unreachable!(),
+        }
+    }
+}
+
+/// Where a tier's service cursor sits in `(set, window, place)` device order.
+#[derive(Clone, Copy)]
+enum PassCursor {
+    /// `sets[set]` is not yet opened (the previous set's last request may
+    /// still be draining); publishes stay queued until `open_set`.
+    PendingOpen { set: usize, window: u64, place: usize },
+    /// `sets[set]` is open; next unserved slot is `(window, place)`.
+    Open { set: usize, window: u64, place: usize },
+    /// Every pass set's slots have been dispatched.
+    Done,
+}
+
+impl PassCursor {
+    fn set_index(self) -> Option<usize> {
+        match self {
+            Self::PendingOpen { set, .. } | Self::Open { set, .. } => Some(set),
+            Self::Done => None,
+        }
+    }
+}
+
 /// A layer's scratch tier contents: every expert of layer `layer` that
-/// group `group`'s steps routed to (`routed[e]`, their choices of expert
+/// group `group`'s steps routed to (`experts[e].group`, their choices of expert
 /// `e`), whose cold ones their requests fill. The device's tier holds one
 /// layer's window at a time, filled by the layer's backs; the host holds the
 /// layer served and the next, whose requests are taken meanwhile, each until
@@ -88,34 +295,13 @@ struct Tier {
     layer_window: usize,
     windows: u64,
     sets: Vec<std::ops::Range<usize>>,
-    set_index: usize,
-    set_opened: bool,
-    cursor_window: u64,
-    cursor_place: usize,
-    routed: Vec<u32>,
-    set_routed: Vec<u32>,
-    /// Per expert, the last step of the group that routed it here.
-    last: Vec<Step>,
+    cursor: PassCursor,
+    /// Per expert, its group-wide routing and open-pass-set state.
+    experts: Vec<ExpertSlot>,
     /// The requests taken, one per chain place in step order, until served.
     taken: usize,
-    requests: Vec<Option<Request>>,
-    queued: Vec<Option<(Step, Vec<u32>)>>,
+    places: Vec<PlaceSlot>,
     seeds: Option<Vec<(usize, BankRecord)>>,
-    /// Per expert, whether it holds its scratch slot (`e % layer_window` in
-    /// window `e / layer_window`, once the group holds the scratch), which
-    /// its rounds convert it into and the pass reads it from.
-    scratch: Vec<bool>,
-    /// The cold experts not yet read (none carries them): no record was
-    /// free for them in the device's order (`Scratch::convey`).
-    deferred: Vec<usize>,
-    /// Per expert, the step whose request reads it (cold), if any.
-    reader: Vec<Option<Step>>,
-    /// Per expert, the round of its reader's request that lists it, once
-    /// that request is served.
-    round: Vec<Option<u32>>,
-    /// The cold experts whose read failed, with why: the step
-    /// that reads each fails at its round, at once.
-    failed: Vec<(usize, String)>,
 }
 
 /// The record step `step`'s pass reads `layer`'s `expert` in, as the device
@@ -157,18 +343,64 @@ impl Tier {
     /// its way), which its rounds then list: an expert is read at most once
     /// while carried.
     fn assign(&mut self, expert: usize, reader: Step, carried: bool) {
-        self.reader[expert] = Some(reader);
-        self.round[expert] = None;
-        if !carried && !self.deferred.contains(&expert) {
-            self.deferred.push(expert);
+        self.experts[expert].set = SetSlot::Cold(ColdSlot {
+            reader,
+            stage: ColdStage::Assigned,
+            read: if carried { ColdRead::Active } else { ColdRead::Deferred },
+        });
+    }
+
+    fn claim_scratch(&mut self, expert: usize) {
+        let SetSlot::Cold(cold) = &mut self.experts[expert].set else {
+            panic!("expert {expert} of layer {} claimed scratch without a cold reader", self.layer);
+        };
+        if matches!(cold.stage, ColdStage::Assigned) {
+            cold.stage = ColdStage::Claimed;
         }
     }
 
-    /// No step reads expert `expert` from now: it waits for no record, and
-    /// whatever the conveyor carries of it is any earlier need's to take.
-    fn unassign(&mut self, expert: usize) {
-        self.reader[expert] = None;
-        self.deferred.retain(|&deferred| deferred != expert);
+    fn schedule_round(&mut self, expert: usize, round: u32) {
+        let SetSlot::Cold(cold) = &mut self.experts[expert].set else {
+            panic!("expert {expert} of layer {} scheduled in round {round} without a cold reader", self.layer);
+        };
+        assert!(cold.has_scratch(), "expert {expert} of layer {} scheduled in round {round} without scratch", self.layer);
+        cold.stage = ColdStage::Scheduled(round);
+    }
+
+    fn mark_active(&mut self, expert: usize) {
+        let SetSlot::Cold(cold) = &mut self.experts[expert].set else {
+            panic!("expert {expert} of layer {} marked active without a cold reader", self.layer);
+        };
+        cold.read = ColdRead::Active;
+    }
+
+    fn mark_tiered(&mut self, expert: usize) {
+        let SetSlot::Cold(cold) = &mut self.experts[expert].set else {
+            panic!("expert {expert} of layer {} marked tiered without a cold reader", self.layer);
+        };
+        assert!(cold.has_scratch(), "expert {expert} of layer {} marked tiered without scratch", self.layer);
+        cold.read = ColdRead::Active;
+    }
+
+    fn fail_read(&mut self, expert: usize, reason: String, shared: &Shared) {
+        if let SetSlot::Cold(cold) = &mut self.experts[expert].set {
+            shared.steps.fail(cold.reader, reason.clone());
+            cold.read = ColdRead::Failed(reason);
+        }
+    }
+
+    fn deferred_experts(&self) -> impl Iterator<Item = usize> + '_ {
+        self.experts
+            .iter()
+            .enumerate()
+            .filter_map(|(expert, slot)| slot.is_deferred().then_some(expert))
+    }
+
+    fn failed_experts(&self) -> impl Iterator<Item = usize> + '_ {
+        self.experts
+            .iter()
+            .enumerate()
+            .filter_map(|(expert, slot)| slot.is_failed().then_some(expert))
     }
 
     /// Where expert `expert` lies in the device's order of the tier's
@@ -176,35 +408,45 @@ impl Tier {
     /// that reads it, then by the round that lists it (a request's experts all
     /// unlisted until it is served); one no step reads lies after every other.
     fn order(&self, expert: usize) -> (bool, usize, Option<Step>, Option<u32>) {
+        let slot = &self.experts[expert];
         (
-            self.reader[expert].is_none(),
+            !slot.is_cold(),
             expert / self.layer_window,
-            self.reader[expert],
-            self.round[expert],
+            slot.reader(),
+            slot.round(),
         )
     }
 
     /// Advance the tier's service cursor to the next `(place, window)` of its
     /// current pass set, or the first of its next pass set.
     fn advance_cursor(&mut self) {
-        let Some(set) = self.sets.get(self.set_index).cloned() else {
-            return;
+        let (set, window, place, opened) = match self.cursor {
+            PassCursor::Open { set, window, place } => (set, window, place, true),
+            PassCursor::PendingOpen { set, window, place } => (set, window, place, false),
+            PassCursor::Done => return,
         };
-        if self.cursor_place + 1 < set.end {
-            self.cursor_place += 1;
-        } else if self.cursor_window + 1 < self.windows {
-            self.cursor_window += 1;
-            self.cursor_place = set.start;
-        } else {
-            self.set_index += 1;
-            self.cursor_window = 0;
-            if let Some(next) = self.sets.get(self.set_index) {
-                self.cursor_place = next.start;
-                if self.windows > 1 {
-                    self.set_opened = false;
-                }
+        let range = &self.sets[set];
+        self.cursor = if place + 1 < range.end {
+            if opened {
+                PassCursor::Open { set, window, place: place + 1 }
+            } else {
+                PassCursor::PendingOpen { set, window, place: place + 1 }
             }
-        }
+        } else if window + 1 < self.windows {
+            if opened {
+                PassCursor::Open { set, window: window + 1, place: range.start }
+            } else {
+                PassCursor::PendingOpen { set, window: window + 1, place: range.start }
+            }
+        } else if let Some(next) = self.sets.get(set + 1) {
+            if self.windows > 1 {
+                PassCursor::PendingOpen { set: set + 1, window: 0, place: next.start }
+            } else {
+                PassCursor::Open { set: set + 1, window: 0, place: next.start }
+            }
+        } else {
+            PassCursor::Done
+        };
     }
 }
 
@@ -449,7 +691,7 @@ impl Scratch {
             .iter()
             .map(|tier| {
                 let mut ways = [0usize; 4];
-                for expert in (0..tier.routed.len()).filter(|&expert| tier.routed[expert] > 0) {
+                for (expert, _) in tier.experts.iter().enumerate().filter(|(_, slot)| slot.routed()) {
                     ways[match self.conveyor.state(tier.layer, expert) {
                         None => 0,
                         Some(State::Reading { .. }) => 1,
@@ -462,8 +704,8 @@ impl Scratch {
                     tier.group,
                     tier.layer,
                     tier.taken,
-                    tier.deferred,
-                    tier.failed.iter().map(|(expert, _)| expert).collect::<Vec<_>>(),
+                    tier.deferred_experts().collect::<Vec<_>>(),
+                    tier.failed_experts().collect::<Vec<_>>(),
                 )
             })
             .collect::<Vec<_>>();
@@ -484,7 +726,7 @@ impl Scratch {
     /// (its tier kept, `Self::advance`): past it, none of the group's passes
     /// reads the layer again.
     pub(super) fn routed(&self, group: Step, layer: usize, expert: usize) -> bool {
-        self.tiers.iter().any(|tier| (tier.group, tier.layer) == (group, layer) && tier.routed[expert] > 0)
+        self.tiers.iter().any(|tier| (tier.group, tier.layer) == (group, layer) && tier.experts[expert].routed())
     }
 
     /// Whether the conveyor still clears the group the device is past: no
@@ -500,36 +742,33 @@ impl Scratch {
     pub(super) fn unserved(&mut self, shared: &Shared, layer: usize) -> Option<(usize, u64, Step)> {
         let tier = self.tiers.iter_mut().find(|tier| tier.layer == layer)?;
         loop {
-            let set = tier.sets.get(tier.set_index)?;
-            let place = tier.cursor_place;
-            let window = tier.cursor_window;
+            let (set_index, window, place) = match tier.cursor {
+                PassCursor::Open { set, window, place } | PassCursor::PendingOpen { set, window, place } => (set, window, place),
+                PassCursor::Done => return None,
+            };
+            let set = &tier.sets[set_index];
             assert!(set.contains(&place), "cursor place {place} outside set {set:?}");
             if place >= tier.taken {
                 return None;
             }
-            let sequence = tier.requests[place]
-                .as_ref()
-                .map(|request| request.sequence)
-                .or_else(|| tier.queued[place].as_ref().map(|&(sequence, _)| sequence));
-            let Some(sequence) = sequence else {
+            let Some(sequence) = tier.places[place].sequence() else {
                 tier.advance_cursor();
                 continue;
             };
             if !shared.steps.ended(sequence) {
                 return Some((place, window, sequence));
             }
-            tier.requests[place] = None;
-            tier.queued[place] = None;
+            tier.places[place] = PlaceSlot::Empty;
             tier.advance_cursor();
         }
     }
 
-    /// Ensure tier `index`'s current pass set (`tier.set_index`) is open and
+    /// Ensure tier `index`'s current pass set (`tier.cursor`) is open and
     /// its already-published requests ingested.
     fn open_set(&mut self, index: usize, core: &mut Core, shared: &Shared) {
-        if self.tiers[index].set_opened {
+        let PassCursor::PendingOpen { set: set_index, window, place } = self.tiers[index].cursor else {
             return;
-        }
+        };
         let converted = core.take_converted();
         for listed in converted {
             listed.release(&mut self.conveyor);
@@ -537,19 +776,16 @@ impl Scratch {
         self.settle_landings(core);
         let layer = self.tiers[index].layer;
         core.layers[layer].clear_windows();
-        let set = self.tiers[index].sets[self.tiers[index].set_index].clone();
+        let set = self.tiers[index].sets[set_index].clone();
         {
             let tier = &mut self.tiers[index];
-            tier.set_routed.fill(0);
-            tier.scratch.fill(false);
-            tier.deferred.clear();
-            tier.reader.fill(None);
-            tier.round.fill(None);
-            tier.failed.clear();
-            tier.set_opened = true;
+            for slot in &mut tier.experts {
+                slot.set = SetSlot::Unrouted;
+            }
+            tier.cursor = PassCursor::Open { set: set_index, window, place };
         }
         for place in set {
-            if let Some((sequence, flags)) = self.tiers[index].queued[place].take() {
+            if let Some((sequence, flags)) = self.tiers[index].places[place].take_queued() {
                 self.ingest_place(index, place, sequence, &flags, core);
             }
         }
@@ -561,26 +797,24 @@ impl Scratch {
         let layer = self.tiers[index].layer;
         let experts = core.layers[layer].experts;
         let routed = (0..experts).filter(|&expert| flags[expert] > 0).collect::<Vec<_>>();
-        let first = routed
-            .iter()
-            .copied()
-            .filter(|&expert| self.tiers[index].set_routed[expert] == 0)
-            .collect::<Vec<_>>();
-        for (count, &flag) in self.tiers[index].set_routed.iter_mut().zip(flags) {
-            *count += flag;
-        }
         let (mut hits, mut cold) = (Vec::new(), Vec::new());
-        for expert in first {
+        let tier = &mut self.tiers[index];
+        for &expert in &routed {
+            if !matches!(tier.experts[expert].set, SetSlot::Unrouted) {
+                continue;
+            }
             match hit(core, layer, expert, sequence) {
-                Some(record) => hits.push((expert, record)),
-                None => cold.push(expert),
+                Some(record) => {
+                    tier.experts[expert].set = SetSlot::Hit;
+                    hits.push((expert, record));
+                }
+                None => {
+                    tier.assign(expert, sequence, self.conveyor.state(layer, expert).is_some());
+                    cold.push(expert);
+                }
             }
         }
-        let tier = &mut self.tiers[index];
-        for &expert in &cold {
-            tier.assign(expert, sequence, self.conveyor.state(layer, expert).is_some());
-        }
-        tier.requests[place] = Some(Request {
+        tier.places[place] = PlaceSlot::Ingested(Request {
             sequence,
             routed,
             hits,
@@ -705,7 +939,10 @@ impl Scratch {
                 let sets: Vec<std::ops::Range<usize>> = crate::programs::native_target_graph::Passes::with_launches(core.extents.pass_launches)
                     .sets(steps as usize, merged)
                     .collect();
-                let cursor_place = sets.first().map_or(0, |set| set.start);
+                let cursor = match sets.first() {
+                    Some(first) => PassCursor::Open { set: 0, window: 0, place: first.start },
+                    None => PassCursor::Done,
+                };
                 core.layers[layer].clear_windows();
                 self.tiers.push(Tier {
                     group,
@@ -713,22 +950,11 @@ impl Scratch {
                     layer_window: core.layers[layer].layer_window,
                     windows: core.extents.windows,
                     sets,
-                    set_index: 0,
-                    set_opened: true,
-                    cursor_window: 0,
-                    cursor_place,
-                    routed: vec![0; experts],
-                    set_routed: vec![0; experts],
-                    last: vec![0; experts],
+                    cursor,
+                    experts: (0..experts).map(|_| ExpertSlot::default()).collect(),
                     taken: 0,
-                    requests: (0..self.flags.len()).map(|_| None).collect(),
-                    queued: (0..self.flags.len()).map(|_| None).collect(),
+                    places: (0..self.flags.len()).map(|_| PlaceSlot::Empty).collect(),
                     seeds: None,
-                    scratch: vec![false; experts],
-                    deferred: Vec::new(),
-                    reader: vec![None; experts],
-                    round: vec![None; experts],
-                    failed: Vec::new(),
                 });
                 self.tiers.len() - 1
             }
@@ -738,10 +964,9 @@ impl Scratch {
             .collect::<Vec<_>>();
         {
             let tier = &mut self.tiers[index];
-            for ((count, last), &flag) in tier.routed.iter_mut().zip(&mut tier.last).zip(&flags) {
-                *count += flag;
+            for (slot, &flag) in tier.experts.iter_mut().zip(&flags) {
                 if flag > 0 {
-                    *last = sequence;
+                    slot.record_route(flag, sequence);
                 }
             }
             // The group routes these experts at this step, which the ranking
@@ -756,12 +981,13 @@ impl Scratch {
             }
             tier.taken += 1;
         }
-        let queue_for_later_set = core.extents.windows > 1 && {
-            let tier = &self.tiers[index];
-            !tier.set_opened || tier.sets.get(tier.set_index).is_none_or(|set| place >= set.end)
-        };
+        let queue_for_later_set = core.extents.windows > 1
+            && match self.tiers[index].cursor {
+                PassCursor::Open { set, .. } => place >= self.tiers[index].sets[set].end,
+                PassCursor::PendingOpen { .. } | PassCursor::Done => true,
+            };
         if queue_for_later_set {
-            self.tiers[index].queued[place] = Some((sequence, flags));
+            self.tiers[index].places[place] = PlaceSlot::Queued { sequence, flags };
         } else {
             self.ingest_place(index, place, sequence, &flags, core);
             self.convey(core, shared);
@@ -784,7 +1010,7 @@ impl Scratch {
     /// read again. So the expert the device waits on always progresses. A
     /// read that fails, or an engine that takes no job, fails the step that
     /// reads the expert,
-    /// with why, and stays its tier's (`Tier::failed`) until a later step
+    /// with why, and stays its tier's (`ColdRead::Failed`) until a later step
     /// takes it over. Deferred experts the host tier keeps whole take no
     /// record: the fill copies them from the tier in place. Whether a read
     /// or landing it settled had ended, or a round's records freed as the
@@ -808,7 +1034,13 @@ impl Scratch {
         let landed = self.settle_landings(core);
         let ended = freed || settled.ended + landed > 0;
         self.land_conveyed(core, shared, settled.landed);
-        let mut failed = settled.failed;
+        // Each failed expert stays its tier's, failing the step that reads
+        // it: at once, if its round is being served, else at its round 0.
+        for (layer, expert, reason) in settled.failed {
+            if let Some(tier) = self.tiers.iter_mut().find(|tier| tier.layer == layer) {
+                tier.fail_read(expert, reason, shared);
+            }
+        }
         self.lease(core);
         let knee = core.table.source().knee();
         for index in 0..self.tiers.len() {
@@ -818,7 +1050,7 @@ impl Scratch {
             let lack_read = self.tiers[..index]
                 .iter()
                 .filter(|tier| self.conveyor.shares_form(tier.layer, layer))
-                .map(|tier| tier.deferred.iter().filter(|&&expert| !self.waits(core, tier, expert)).count())
+                .map(|tier| tier.deferred_experts().filter(|&expert| !self.waits(core, tier, expert)).count())
                 .sum::<usize>();
             // The conveyor records free of the layer's form whose lent
             // records the group's lease holds.
@@ -830,19 +1062,14 @@ impl Scratch {
             };
             let free_conveyor =
                 |conveyor: &Conveyor, core: &Core| conveyor.free_conveyor(layer, |record| admits(conveyor, core, record));
-            let mut deferred = std::mem::take(&mut self.tiers[index].deferred);
+            // Those the host tier keeps whole, or lands, take no record.
+            let mut deferred = self.tiers[index]
+                .deferred_experts()
+                .filter(|&expert| !self.waits(core, &self.tiers[index], expert))
+                .collect::<Vec<_>>();
             let tier = &self.tiers[index];
             deferred.sort_by_key(|&expert| tier.order(expert));
-            // Those the host tier keeps whole, or lands, take no record.
-            let (waiting, deferred): (Vec<_>, Vec<_>) =
-                deferred.into_iter().partition(|&expert| self.waits(core, &self.tiers[index], expert));
-            let mut kept = waiting;
-            let mut blocked = false;
             for expert in deferred {
-                if blocked {
-                    kept.push(expert);
-                    continue;
-                }
                 // A scratch slot no step uses before the expert's round
                 // converts it carries it first, at no conveyor record, while
                 // the drive lacks work, its reads in flight short of its
@@ -864,9 +1091,7 @@ impl Scratch {
                             }
                         }
                         let Some(&record) = records.get(lack_read) else {
-                            blocked = true;
-                            kept.push(expert);
-                            continue;
+                            break;
                         };
                         record
                     }
@@ -882,22 +1107,11 @@ impl Scratch {
                         ticket.on_end(move |_, _| events.notify());
                         self.conveyor.take(layer, expert, record);
                         self.conveyor.reading(layer, expert, ticket, record);
+                        self.tiers[index].mark_active(expert);
                         self.mark(shared, layer, Mark::Submitted);
                     }
-                    Err(reason) => failed.push((layer, expert, reason)),
+                    Err(reason) => self.tiers[index].fail_read(expert, reason, shared),
                 }
-            }
-            // Behind what this tier's later experts yielded meanwhile.
-            self.tiers[index].deferred.extend(kept);
-        }
-        // Each failed expert stays its tier's, failing the step that reads
-        // it: at once, if its round is being served, else at its round 0.
-        for (layer, expert, reason) in failed {
-            if let Some(tier) = self.tiers.iter_mut().find(|tier| tier.layer == layer) {
-                if let Some(reader) = tier.reader[expert] {
-                    shared.steps.fail(reader, reason.clone());
-                }
-                tier.failed.push((expert, reason));
             }
         }
         ended
@@ -929,7 +1143,7 @@ impl Scratch {
             return None;
         }
         let tier = &self.tiers[index];
-        let reader = tier.reader[expert]?;
+        let reader = tier.experts[expert].reader()?;
         let serving = self.conveyor.serving?;
         if core.layers[tier.layer].slots.is_none() || !self.leased(core) {
             return None;
@@ -940,25 +1154,30 @@ impl Scratch {
         if before().any(|other| other.taken < steps || core.layers[other.layer].scratch_form != *form) {
             return None;
         }
-        let read_before = |slot: usize| {
-            before().any(|other| other.scratch.get(slot).is_some_and(|&held| held) || other.reader.get(slot).is_some_and(Option::is_some))
-        };
+        let read_before = |slot: usize| before().any(|other| other.experts.get(slot).is_some_and(ExpertSlot::is_cold));
         // Whether its rounds may still be composed to put its slot's
         // expert after it: they are not yet fixed, they are more than one,
         // and no expert of them borrows its own slot (so none is both a
         // borrower and a slot's expert, and composing binds only one way).
-        let composable = tier.round[expert].is_none()
-            && tier.reader.iter().filter(|&&other| other == Some(reader)).count() > core.extents.round_records
-            && !self.conveyor.borrower(expert).is_some_and(|(layer, other)| layer == tier.layer && tier.reader[other] == Some(reader));
+        let composable = tier.experts[expert].round().is_none()
+            && tier.experts.iter().filter(|other| other.reader() == Some(reader)).count() > core.extents.round_records
+            && !self
+                .conveyor
+                .borrower(expert)
+                .is_some_and(|(layer, other)| layer == tier.layer && tier.experts[other].reader() == Some(reader));
         // Whether this layer converts into `slot` only after the expert's
         // round: outright, or once its rounds are composed (the slot taken
         // only where none is free outright).
-        let after = |slot: usize| match (tier.reader[slot], tier.round[slot]) {
+        let after = |slot: usize| match &tier.experts[slot].set {
             _ if slot == expert => None,
-            (None, _) => (!tier.scratch[slot]).then_some(false),
-            (Some(step), _) if step != reader => (step > reader).then_some(false),
-            (Some(_), Some(round)) => tier.round[expert].is_some_and(|own| own < round).then_some(false),
-            (Some(_), None) => (composable && self.conveyor.state(tier.layer, slot).is_none()).then_some(true),
+            SetSlot::Unrouted | SetSlot::Hit => Some(false),
+            SetSlot::Cold(cold) if cold.reader != reader => (cold.reader > reader).then_some(false),
+            SetSlot::Cold(cold) => match cold.stage {
+                ColdStage::Scheduled(round) => tier.experts[expert].round().is_some_and(|own| own < round).then_some(false),
+                ColdStage::Assigned | ColdStage::Claimed => {
+                    (composable && self.conveyor.state(tier.layer, slot).is_none()).then_some(true)
+                }
+            },
         };
         (0..core.layers[tier.layer].experts.min(self.conveyor.slots()))
             .filter(|&slot| self.conveyor.borrower(slot).is_none() && !read_before(slot))
@@ -1020,10 +1239,9 @@ impl Scratch {
     /// promotes to demand (`Prefetch::hasten`).
     pub(super) fn awaited<'a>(&'a self, core: &'a Core) -> impl Iterator<Item = Staged> + 'a {
         self.tiers.iter().flat_map(move |tier| {
-            tier.deferred
-                .iter()
-                .filter(move |&&expert| copies_from_tier(core) && core.directory.lands(tier.layer, expert))
-                .map(move |&expert| (tier.layer, expert))
+            tier.deferred_experts()
+                .filter(move |&expert| copies_from_tier(core) && core.directory.lands(tier.layer, expert))
+                .map(move |expert| (tier.layer, expert))
         })
     }
 
@@ -1047,7 +1265,7 @@ impl Scratch {
             return;
         }
         let reader = |tiers: &[Tier], layer: usize, expert: usize| {
-            tiers.iter().find(|tier| tier.layer == layer).and_then(|tier| tier.reader[expert])
+            tiers.iter().find(|tier| tier.layer == layer).and_then(|tier| tier.experts[expert].reader())
         };
         let grants = landed
             .into_iter()
@@ -1094,7 +1312,7 @@ impl Scratch {
             .enumerate()
             .skip(index)
             .filter(|(_, tier)| self.conveyor.shares_form(tier.layer, layer))
-            .flat_map(|(at, tier)| (0..tier.reader.len()).map(move |other| ((at, tier.order(other)), at, other)))
+            .flat_map(|(at, tier)| (0..tier.experts.len()).map(move |other| ((at, tier.order(other)), at, other)))
             .filter(|&(order, at, other)| {
                 order > after && self.conveyor.state(self.tiers[at].layer, other).is_some_and(&holds)
             })
@@ -1108,8 +1326,8 @@ impl Scratch {
     fn yield_record(&mut self, index: usize, expert: usize) {
         let tier = &mut self.tiers[index];
         self.conveyor.yield_record(tier.layer, expert);
-        if tier.reader[expert].is_some() {
-            tier.deferred.push(expert);
+        if let SetSlot::Cold(cold) = &mut tier.experts[expert].set {
+            cold.read = ColdRead::Deferred;
         }
     }
 
@@ -1147,7 +1365,7 @@ impl Scratch {
             }
         }
         for &expert in experts {
-            self.tiers[index].scratch[expert] = true;
+            self.tiers[index].claim_scratch(expert);
         }
         true
     }
@@ -1168,12 +1386,13 @@ impl Scratch {
         let index = self.tiers.iter().position(|tier| (tier.group, tier.layer) == (at.point.group, at.point.layer))?;
         self.open_set(index, core, shared);
         let tier = &mut self.tiers[index];
-        let set = tier.sets.get(tier.set_index)?.clone();
-        let next_set_start = tier.sets.get(tier.set_index + 1).map(|next| next.start);
+        let set_index = tier.cursor.set_index()?;
+        let set = tier.sets[set_index].clone();
+        let next_set_start = tier.sets.get(set_index + 1).map(|next| next.start);
         let request = if window + 1 < tier.windows {
-            tier.requests[place].clone()?
+            tier.places[place].as_request().cloned()?
         } else {
-            tier.requests[place].take()?
+            tier.places[place].take_request()?
         };
         tier.advance_cursor();
         Some(Serve {
@@ -1196,7 +1415,7 @@ impl Scratch {
         if let Some(index) = self.tiers.iter().position(|tier| (tier.group, tier.layer) == (group, layer)) {
             self.open_set(index, core, shared);
             let lw = self.tiers[index].layer_window;
-            if let Some(request) = self.tiers[index].requests[place].take() {
+            if let Some(request) = self.tiers[index].places[place].take_request() {
                 self.tiers[index].advance_cursor();
                 let forfeited = (window == 0)
                     .then(|| request.hits.iter().map(|&(expert, _)| expert).collect::<Vec<_>>())
@@ -1330,7 +1549,7 @@ impl Scratch {
         // given while it awaited them, which the pass reads once its rounds
         // are past.
         let scratch = |tier: &Tier, expert: usize| {
-            assert!(tier.scratch[expert], "a fixed request's cold experts hold scratch slots");
+            assert!(tier.experts[expert].has_scratch(), "a fixed request's cold experts hold scratch slots");
             expert % lw
         };
         // Every expert the request routes in this window is read in place: a
@@ -1341,7 +1560,7 @@ impl Scratch {
         for &expert in &routed {
             if expert / lw == window as usize {
                 assert!(
-                    tier.scratch[expert] || hit(core, layer, expert, sequence).is_some(),
+                    tier.experts[expert].has_scratch() || hit(core, layer, expert, sequence).is_some(),
                     "step {sequence} routes expert {expert} at layer {layer} window {window} with neither a held record nor a scratch slot"
                 );
             }
@@ -1392,13 +1611,14 @@ impl Scratch {
         if sequence == last {
             if window == 0 {
                 let tier = &self.tiers[index];
-                let failed = |expert: usize| tier.failed.iter().any(|&(of, _)| of == expert);
-                let tier_routed = (0..tier.routed.len())
-                    .filter(|&expert| tier.routed[expert] > 0)
-                    .map(|expert| (expert, tier.routed[expert], tier.last[expert]))
+                let tier_routed = tier
+                    .experts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(expert, slot)| slot.group.map(|route| (expert, route.count, route.last)))
                     .collect::<Vec<_>>();
                 let read = tier_routed.iter().map(|&(expert, ..)| expert).collect::<Vec<_>>();
-                let filled = |expert: usize| (tier.scratch[expert] || tier.reader[expert].is_some()) && !failed(expert);
+                let filled = |expert: usize| tier.experts[expert].is_cold() && !tier.experts[expert].is_failed();
                 let (seeds, evicted) = core.directory.seed(at.point, scratch_group, layer, &tier_routed, &read, filled);
                 for (owner, expert) in evicted {
                     self.demote(owner, expert);
@@ -1407,13 +1627,14 @@ impl Scratch {
             }
             let first = core.directory.seeded_from(core.layers[layer].group);
             let tier = &self.tiers[index];
-            let failed = |expert: usize| tier.failed.iter().any(|&(of, _)| of == expert);
             let pairs = tier
                 .seeds
                 .as_deref()
                 .unwrap_or(&[])
                 .iter()
-                .filter(|&&(expert, _)| expert / lw == window as usize && tier.scratch[expert] && !failed(expert))
+                .filter(|&&(expert, _)| {
+                    expert / lw == window as usize && tier.experts[expert].has_scratch() && !tier.experts[expert].is_failed()
+                })
                 .map(|&(expert, record)| {
                     let named = record.index().checked_sub(first).expect("a seed takes no lent record the group holds");
                     ((expert % lw) as i32, i32::try_from(named).expect("bank records fit i32"))
@@ -1428,11 +1649,13 @@ impl Scratch {
         // experts have theirs (`convey`).
         for (round, chunk) in (0..).zip(cold.chunks(round_records)) {
             for &expert in chunk {
-                self.tiers[index].round[expert] = Some(round);
+                self.tiers[index].schedule_round(expert, round);
             }
         }
         // The tier list, which the tier copy reads after round 0's answer.
-        self.tiers[index].deferred.retain(|expert| !tiered.contains(expert));
+        for &expert in &tiered {
+            self.tiers[index].mark_tiered(expert);
+        }
         let tier = ListBounds { from: core.layers[layer].lists.tier, to: lw as u64, lent: 0 };
         core.layers[layer].tiered.publish_list(sequence, &listed, tier);
         // The window's staged count in its first round lane, which
@@ -1500,11 +1723,11 @@ impl Scratch {
             prefetch.settle(&mut core.directory);
             self.convey(core, shared);
             let tier = self.tiers.iter().find(|tier| (tier.group, tier.layer) == (group, layer)).expect("a served request's tier");
-            if let Some((_, reason)) = tier.failed.iter().find(|(expert, _)| chunk.contains(expert)) {
-                rounds.failure = Some(reason.clone());
+            if let Some(reason) = chunk.iter().find_map(|&expert| tier.experts[expert].failure()) {
+                rounds.failure = Some(reason.to_owned());
                 break;
             }
-            assert!(chunk.iter().all(|&expert| tier.scratch[expert]), "a listed expert holds its scratch slot");
+            assert!(chunk.iter().all(|&expert| tier.experts[expert].has_scratch()), "a listed expert holds its scratch slot");
             // A slot carrying a borrower's stored bytes is reclaimed before
             // the round's first entry, which may convert into it; once one
             // is appended, its borrowers are listed, at an earlier round.
@@ -1608,7 +1831,7 @@ impl Scratch {
         shared.telemetry.serve(layer, sequence, served);
         let last = self.conveyor.serving.expect("a scratch request's group is served").group.last();
         let tier = &mut self.tiers[index];
-        took.union = tier.routed.iter().filter(|&&count| count > 0).count() as u64;
+        took.union = tier.experts.iter().filter(|slot| slot.routed()).count() as u64;
         took.hits = hits.len() as u64;
         took.seeded = seeded;
         shared.telemetry.group(point, last, took);
@@ -1616,8 +1839,8 @@ impl Scratch {
             // The device's time after a failed step is no layer's compute.
             Some(reason) => {
                 let remaining = self.tiers[index]
-                    .requests[place]
-                    .take()
+                    .places[place]
+                    .take_request()
                     .map(|request| request.cold.into_iter().filter(|&expert| expert / lw > window as usize).collect::<Vec<_>>())
                     .unwrap_or_default();
                 let forfeited = hits
@@ -1663,7 +1886,7 @@ impl Scratch {
             return;
         };
         let mut reader = None;
-        for request in tier.requests.iter_mut().flatten() {
+        for request in tier.places.iter_mut().filter_map(PlaceSlot::as_request_mut) {
             if let Some(at) = request.hits.iter().position(|&(hit, _)| hit == expert) {
                 request.hits.swap_remove(at);
                 request.cold.push(expert);
@@ -1686,39 +1909,38 @@ impl Scratch {
     pub(super) fn forfeit(&mut self, index: usize, place: usize, experts: impl IntoIterator<Item = usize>, core: &Core) {
         let tier = &mut self.tiers[index];
         let layer = tier.layer;
+        let set_index = tier.cursor.set_index();
         let end = if tier.windows > 1 {
-            tier.sets.get(tier.set_index).map_or(tier.requests.len(), |set| set.end.min(tier.requests.len()))
+            set_index.map_or(tier.places.len(), |s| tier.sets[s].end.min(tier.places.len()))
         } else {
-            tier.requests.len()
+            tier.places.len()
         };
         for expert in experts {
-            tier.scratch[expert] = false;
-            // A later step that takes the expert over reads it again.
-            tier.failed.retain(|&(of, _)| of != expert);
             let later = (place + 1 < end)
-                .then(|| tier.requests[place + 1..end].iter_mut().flatten().find(|later| later.routed.contains(&expert)))
+                .then(|| {
+                    tier.places[place + 1..end]
+                        .iter_mut()
+                        .filter_map(PlaceSlot::as_request_mut)
+                        .find(|later| later.routed.contains(&expert))
+                })
                 .flatten();
             let held = |later: &Request| hit(core, layer, expert, later.sequence);
-            let reader = match later.map(|later| (held(later), later)) {
+            match later.map(|later| (held(later), later)) {
                 Some((Some(record), later)) => {
                     later.hits.push((expert, record));
-                    None
+                    tier.experts[expert].set = SetSlot::Hit;
                 }
                 Some((None, later)) => {
+                    let reader = later.sequence;
                     later.cold.push(expert);
-                    Some(later.sequence)
+                    tier.assign(expert, reader, self.conveyor.state(layer, expert).is_some());
                 }
                 None => {
-                    tier.set_routed[expert] = 0;
-                    if tier.windows == 1 || tier.set_index == 0 {
-                        tier.routed[expert] = 0;
+                    tier.experts[expert].set = SetSlot::Unrouted;
+                    if tier.windows == 1 || set_index == Some(0) {
+                        tier.experts[expert].group = None;
                     }
-                    None
                 }
-            };
-            match reader {
-                Some(reader) => tier.assign(expert, reader, self.conveyor.state(layer, expert).is_some()),
-                None => tier.unassign(expert),
             }
         }
     }
