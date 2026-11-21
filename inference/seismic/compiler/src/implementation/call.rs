@@ -315,7 +315,6 @@ impl<'a, B: seismic_native_target::TargetFamily> internals::Builder<'a, B> {
             self.precision,
             body.candidate.applicability,
             site,
-            None,
         );
         let (child, _) = crate::portable::construction::SourceConstruction::begin(
             builder,
