@@ -198,8 +198,8 @@ projection dense for metal:
     where (SPLIT == 1 or PLANES == 0) for single
     where (INT8 == 0 or (GATHERED == 0 and TALL == 1 and K % 512 == 0 and N % (64 / WEIGHTS) == 0 and each(W, form(W, INT8) == 1) and agree(W, form(W, INT8_INTERLEAVED)))) for paired | single
     where (INT8 == 1 or INT8_TILE == 128) for single
-    where (PACK == 0 or (GATHERED == 0 and TALL == 1 and INT8 == 0 and K % 256 == 0 and K < 1048576 and N % (64 / WEIGHTS) == 0 and each(W, form(W, PACK) == 1) and agree(W, form(W, PACK_FOLDS)) and agree(W, form(W, PACK_RESIDUE)) and agree(W, form(W, PACK_SUMS)))) for paired | single
-    where (PACK == 0 or (TALL == 1 and K % 256 == 0 and K < 1048576 and SERVED == 1 and any(W, N > 0 and N % 32 == 0 and form(W, PACK) == 1))) for segmented
+    where (PACK == 0 or (GATHERED == 0 and TALL == 1 and INT8 == 0 and K % 128 == 0 and K < 1048576 and N % (64 / WEIGHTS) == 0 and each(W, form(W, PACK) == 1) and agree(W, form(W, PACK_FOLDS)) and agree(W, form(W, PACK_RESIDUE)) and agree(W, form(W, PACK_SUMS)))) for paired | single
+    where (PACK == 0 or (TALL == 1 and K % 128 == 0 and K < 1048576 and SERVED == 1 and any(W, N > 0 and N % 32 == 0 and form(W, PACK) == 1))) for segmented
     where (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0))
     where (PACK == 0 or (TILE_M == 64 and TILE_N == 64))
     where (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))

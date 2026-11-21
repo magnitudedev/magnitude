@@ -772,6 +772,7 @@ struct packing_factors<Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GR
         const float scale = (512.0f + 128.0f * (metal::abs(terms::shift()) + offset)) * metal::abs(factors.scale(0));
         return float(L::largest) * (MIN ? metal::fma(128.0f, metal::abs(factors.bias(0)), scale) : scale);
     }
+    static float reach(thread const Located &row, uint block, uint) { return reach(row, block); }
 };
 
 // Direct coefficients: a block's factors from its eight packets' own,
@@ -795,22 +796,33 @@ struct packing_factors<Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTRE, OFFSET
     };
     static run start(thread const Located &row, uint block) { return run{block_supers(row, block), 0u}; }
     static typename terms::entry take(thread run &state) { return terms::of(K::at(state.supers, state.p++)); }
+    static float packet_reach(weight_bytes supers, uint i) {
+        const typename K::coefficients k = K::at(supers, i);
+        float largest = 0.0f;
+        _Pragma("clang loop unroll(full)")
+        for (uint g = 0; g < K::groups; ++g) {
+            const float scale = metal::abs(k.scale(g));
+            largest = metal::max(largest, terms::biased
+                ? metal::fma(128.0f, metal::abs(terms::min_term(k, g)), 512.0f * scale)
+                : scale);
+        }
+        return largest;
+    }
     static float reach(thread const Located &row, uint block) {
         weight_bytes supers = block_supers(row, block);
         // Without a min term the bound is 512 times the largest scale,
         // exactly: a power of two scales every term alike.
         float largest = 0.0f;
         _Pragma("clang loop unroll(full)")
-        for (uint i = 0; i < 8; ++i) {
-            const typename K::coefficients k = K::at(supers, i);
-            _Pragma("clang loop unroll(full)")
-            for (uint g = 0; g < K::groups; ++g) {
-                const float scale = metal::abs(k.scale(g));
-                largest = metal::max(largest, terms::biased
-                    ? metal::fma(128.0f, metal::abs(terms::min_term(k, g)), 512.0f * scale)
-                    : scale);
-            }
-        }
+        for (uint i = 0; i < 8; ++i)
+            largest = metal::max(largest, packet_reach(supers, i));
+        return terms::biased ? largest : 512.0f * largest;
+    }
+    static float reach(thread const Located &row, uint block, uint count) {
+        weight_bytes supers = block_supers(row, block);
+        float largest = 0.0f;
+        for (uint i = 0; i < count; ++i)
+            largest = metal::max(largest, packet_reach(supers, i));
         return terms::biased ? largest : 512.0f * largest;
     }
 };

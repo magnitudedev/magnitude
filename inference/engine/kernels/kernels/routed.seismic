@@ -166,8 +166,8 @@ projection routed for metal:
     where (INT8 == 0 or (TALL == 1 and (STACKED == 1 or SERVED == 2) and WIDTH % 512 == 0 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, INT8) == 1) and sum(W, FIRST * form(W, INT8_INTERLEAVED)) % SERVED == 0)) for grouped
     where (DOWN_INT8 == 0 or (DOWN_TALL == 1 and each(W, FIRST == 1 or (WIDTH % 512 == 0 and N % 64 == 0 and form(W, INT8) == 1)))) for grouped
     where (DOWN_INT8 == 1 or STACKED == 1 or INT8_TILE == 128) for grouped
-    where (PACK == 0 or (TALL == 1 and INT8 == 0 and WIDTH % 256 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0)) for grouped
-    where (DOWN_PACK == 0 or (DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 256 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1)))) for grouped
+    where (PACK == 0 or (TALL == 1 and INT8 == 0 and WIDTH % 128 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0)) for grouped
+    where (DOWN_PACK == 0 or (DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1)))) for grouped
     where (PACK == 1 or ((STACKED == 1 or PACK_TOKENS == 4) and WEIGHTS_AHEAD == 0)) for grouped
     where (DOWN_PACK == 1 or ((STACKED == 1 or DOWN_PACK_TOKENS == 4) and DOWN_WEIGHTS_AHEAD == 0)) for grouped
     where (PACK == 0 or ((STACKED == 1 or TALL_M == 128) and TALL_K == 64 and STAGERS == 2)) for grouped
