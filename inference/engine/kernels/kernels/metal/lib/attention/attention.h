@@ -3491,21 +3491,77 @@ inline void prefill_fold(history_window window, prefill_held held, uint round, d
     }
 }
 
+constant constexpr uint PREFILL_MERGE_MAX_PARTS = 256;
+
 // L3: threadgroup (QT-row tile, query head), one thread per column. A tile
 // that took several key partitions merges each of its rows' partitions in
 // partition order and applies the gate; other tiles were stored by L2.
 template <uint QT>
 inline void prefill_merge(device const Scalar *query, device const Scalar *gate, element::Out<activation::Act> result,
     device const float *partials, device const float *statistics, device const uint *counts,
+    threadgroup float *weights, threadgroup float &shared_inv_divisor,
     ulong M, uint tile, ulong head, uint column, bool softplus, device const float *sinks = nullptr) {
     constexpr uint W = ATTENTION_W;
     constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
     const uint count = counts[tile];
     if (count <= 1)
         return;
-    for (ulong row = ulong(tile) * QT; row < metal::min(ulong(tile + 1) * QT, M); ++row) {
+    const ulong start = ulong(tile) * QT;
+    const ulong stop = metal::min(ulong(tile + 1) * QT, M);
+    const ulong stride = M * H;
+    if (count <= PREFILL_MERGE_MAX_PARTS) {
+        const ulong pitch = stride * W;
+        for (ulong row = start; row < stop; ++row) {
+            if (row > start)
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            const ulong state = row * H + head;
+            if (column < 32) {
+                constexpr uint MAX_PER_LANE = PREFILL_MERGE_MAX_PARTS / 32;
+                float2 stat[MAX_PER_LANE];
+                float maximum = -INFINITY;
+                ATTENTION_UNROLL
+                for (uint i = 0; i < MAX_PER_LANE; ++i) {
+                    const uint p = column + i * 32;
+                    if (p < count) {
+                        const ulong slot = state + ulong(p) * stride;
+                        const float2 s = float2(statistics[slot * 2], statistics[slot * 2 + 1]);
+                        stat[i] = s;
+                        if (s.y > 0.0f)
+                            maximum = metal::max(maximum, s.x);
+                    }
+                }
+                maximum = simd_max(maximum);
+                float denominator = 0.0f;
+                ATTENTION_UNROLL
+                for (uint i = 0; i < MAX_PER_LANE; ++i) {
+                    const uint p = column + i * 32;
+                    if (p < count) {
+                        const float d = stat[i].y;
+                        const float w = d > 0.0f ? metal::fast::exp2(stat[i].x - maximum) : 0.0f;
+                        weights[p] = w;
+                        denominator = metal::fma(d, w, denominator);
+                    }
+                }
+                denominator = simd_sum(denominator);
+                if (column == 0)
+                    shared_inv_divisor = 1.0f / divisor(sinks, head, maximum, denominator);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float accumulated = 0.0f;
+            device const float *values = partials + state * W + column;
+            for (uint p = 0; p < count; ++p) {
+                const float weight = weights[p];
+                if (weight > 0.0f)
+                    accumulated = metal::fma(values[ulong(p) * pitch], weight, accumulated);
+            }
+            const float attended = accumulated * shared_inv_divisor;
+            result.put(state * W + column, gate_output(query, gate, row, head, column, attended, softplus));
+        }
+        return;
+    }
+    for (ulong row = start; row < stop; ++row) {
         const ulong state = row * H + head;
-        const float attended = merge(partials, statistics, state, M * H, count, column, sinks, head);
+        const float attended = merge(partials, statistics, state, stride, count, column, sinks, head);
         result.put(state * W + column, gate_output(query, gate, row, head, column, attended, softplus));
     }
 }
