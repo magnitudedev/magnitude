@@ -28,11 +28,11 @@ fn place_logits_rows[M, V, S](scores: &tensor[M, S] f32,
 
 native cluster_token_rows for metal from "metal/cluster_token_rows.metal":
     launch cluster_token_rows:
-        threadgroups (ceil_div(M * K * B, 256), 1, 1)
+        threadgroups (ceil_div(B, 256), K, M)
         threads_per_threadgroup (256, 1, 1)
 native cluster_token_rows for cuda from "cuda/cluster_token_rows.cu":
     launch cluster_token_rows:
-        threadgroups (ceil_div(M * K * B, 256), 1, 1)
+        threadgroups (ceil_div(B, 256), min(K, 65535), min(M, 65535))
         threads_per_threadgroup (256, 1, 1)
 native cluster_token_rows for vulkan from "vulkan/cluster_token_rows.comp":
     launch cluster_token_rows:
@@ -45,17 +45,17 @@ native cluster_token_rows for cpu from "cpu/cluster_token_rows.rs":
 
 native place_logits_rows for metal from "metal/place_logits_rows.metal":
     launch place_logits_fill:
-        threadgroups (ceil_div(M * V, 256), 1, 1)
+        threadgroups (ceil_div(V, 1024), M, 1)
         threads_per_threadgroup (256, 1, 1)
     launch place_logits_rows:
-        threadgroups (ceil_div(M * S, 256), 1, 1)
+        threadgroups (ceil_div(S, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
 native place_logits_rows for cuda from "cuda/place_logits_rows.cu":
     launch place_logits_fill:
-        threadgroups (ceil_div(M * V, 256), 1, 1)
+        threadgroups (ceil_div(V, 1024), min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)
     launch place_logits_rows:
-        threadgroups (ceil_div(M * S, 256), 1, 1)
+        threadgroups (ceil_div(S, 256), min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)
 native place_logits_rows for vulkan from "vulkan/place_logits_rows.comp":
     launch place_logits_fill:
