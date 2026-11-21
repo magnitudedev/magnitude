@@ -6382,10 +6382,12 @@ struct Sweep {
     /// keeps it.
     best: (Vec<u64>, f64),
     /// What the leaders' neighbourhoods do not reach, walked from what the
-    /// domain admits as it is asked for ([`RestWalk`]) from the seed, and
-    /// whether all of it was asked for: the group's admissible assignments
-    /// are then all measured, passed over as inert, or awaiting measurement.
-    rest: RestWalk,
+    /// domain admits as it is asked for ([`RestWalk`]) from the seed over
+    /// coordinates that are not inert, initialized when the walk begins, and
+    /// whether all of it was asked for: the group's active admissible
+    /// assignments are then all measured, passed over as inert, or awaiting
+    /// measurement.
+    rest: Option<RestWalk>,
     exhausted: bool,
     /// What awaits measurement was asked for from the rest, not by a
     /// leader's round.
@@ -6440,10 +6442,15 @@ struct RestWalk {
 }
 
 impl RestWalk {
+    #[cfg(test)]
     fn new(values: &[Vec<u64>], start: &[u64]) -> Self {
         let movable = (0..start.len())
             .filter(|&coordinate| values[coordinate].iter().any(|value| *value != start[coordinate]))
             .collect::<Vec<_>>();
+        Self::over(movable)
+    }
+
+    fn over(movable: Vec<usize>) -> Self {
         Self {
             sets: plan::Subsets::nearest_first(movable.len()),
             movable,
@@ -6532,7 +6539,7 @@ impl Sweep {
             expanded: BTreeSet::new(),
             round: None,
             best: (seed.clone(), cost),
-            rest: RestWalk::new(&group.values, &seed),
+            rest: None,
             exhausted: false,
             resting: false,
             seed,
@@ -6723,6 +6730,102 @@ impl GroupSearch {
                     *weight <= 0.
                         || domain.forecast(point, &measured.key, candidate) == measured.key
                 })
+    }
+
+    /// Whether moving `address` to `value` from `reference` (measured at
+    /// `reference_baseline`) can change the forecasted work at any weighted
+    /// point. Only admissible configurations are passed to `domain.forecast`.
+    fn coordinate_active(
+        &self,
+        domain: &dyn plan::Domain,
+        address: &plan::ParameterAddress,
+        value: u64,
+        reference: &NativeSpecialization,
+        reference_baseline: &[PointMeasurement],
+    ) -> Result<bool, TuneError> {
+        let single = std::slice::from_ref(address);
+        if let Some(placed) = domain.place(reference, single, &[value]).map_err(planning)? {
+            return Ok(!self.inert(domain, &placed, reference, reference_baseline));
+        }
+        let Some(witness) = domain.nearest(reference, single, &[value]).map_err(planning)? else {
+            return Ok(false);
+        };
+        let current = address.value(reference);
+        if let Some(without) = domain.place(&witness, single, &[current]).map_err(planning)? {
+            return Ok(
+                self.partition.boundary_of(&witness) != self.partition.boundary_of(&without)
+                    || reference_baseline.iter().zip(&self.weights).enumerate().any(
+                        |(point, (measured, weight))| {
+                            *weight > 0.
+                                && domain.forecast(point, &measured.key, &witness)
+                                    != domain.forecast(point, &measured.key, &without)
+                        },
+                    ),
+            );
+        }
+        Ok(!self.inert(domain, &witness, reference, reference_baseline))
+    }
+
+    /// The coordinates of `group` that have another declared value from
+    /// `seed` and are not inert at `base` or at any measured form leader of
+    /// `sweep`. Coordinates inert at every measured form cannot change the
+    /// service cost and are excluded from [`RestWalk`] so it never enumerates
+    /// their Cartesian product.
+    fn active_coordinates(
+        &self,
+        domain: &dyn plan::Domain,
+        group: &plan::Group,
+        base: &NativeSpecialization,
+        baseline: &[PointMeasurement],
+        seed: &[u64],
+        leaders: &BTreeMap<Vec<u64>, (Vec<u64>, f64, usize)>,
+    ) -> Result<Vec<usize>, TuneError> {
+        let mut references = vec![(base.clone(), baseline)];
+        for (leader, _, _) in leaders.values() {
+            if leader == seed {
+                continue;
+            }
+            if let Some(placed) = domain
+                .place(base, &group.parameters, leader)
+                .map_err(planning)?
+            {
+                if let Some(Some(measured)) = self.swept.get(&Configuration::of(&placed)) {
+                    references.push((placed, measured.as_slice()));
+                }
+            }
+        }
+        let mut active = Vec::new();
+        for coordinate in 0..seed.len() {
+            let address = &group.parameters[coordinate];
+            if !group.values[coordinate]
+                .iter()
+                .any(|&value| value != seed[coordinate])
+            {
+                continue;
+            }
+            let mut moves = false;
+            'refs: for (reference, reference_baseline) in &references {
+                let current = address.value(reference);
+                for &value in &group.values[coordinate] {
+                    if value != current
+                        && self.coordinate_active(
+                            domain,
+                            address,
+                            value,
+                            reference,
+                            reference_baseline,
+                        )?
+                    {
+                        moves = true;
+                        break 'refs;
+                    }
+                }
+            }
+            if moves {
+                active.push(coordinate);
+            }
+        }
+        Ok(active)
     }
 
     /// The consumer's hints the domain admits, as whole configurations:
@@ -6995,12 +7098,12 @@ impl GroupSearch {
             return;
         };
         let assignment = group.assignment(&specialization);
-        if !sweep.asked.insert(assignment.clone()) {
+        if sweep.asked.contains(&assignment)
+            || self.inert(domain, &specialization, base, baseline)
+        {
             return;
         }
-        if self.inert(domain, &specialization, base, baseline) {
-            return;
-        }
+        sweep.asked.insert(assignment.clone());
         let sequence = sweep.asked.len() - 1;
         let configuration = Configuration::of(&specialization);
         self.generated.insert(configuration.clone());
@@ -7118,10 +7221,23 @@ impl GroupSearch {
                             .iter()
                             .zip(&sweep.seed)
                             .fold(base.clone(), |held, (address, value)| address.set(held, *value));
+                        if sweep.rest.is_none() {
+                            let movable = self.active_coordinates(
+                                domain,
+                                group,
+                                base,
+                                baseline,
+                                &sweep.seed,
+                                &sweep.leaders,
+                            )?;
+                            sweep.rest = Some(RestWalk::over(movable));
+                        }
                         let asked = sweep.asked.len();
                         while sweep.pending.len() < wanted {
                             let Some(assignment) = sweep
                                 .rest
+                                .as_mut()
+                                .expect("rest walk initialized above")
                                 .next(domain, group, &at_start, &sweep.seed, wanted)
                                 .map_err(planning)?
                             else {
@@ -11221,6 +11337,105 @@ mod tests {
         assert!(
             ended > budget,
             "one mean over both classes overruns: {ended}"
+        );
+    }
+
+    #[test]
+    fn group_search_does_not_explode_on_inert_axes() {
+        // Two active launches in one group (coupled via shared LANES): launch 0
+        // serves N == 1 (weighted 1.0), launch 1 serves N == 32 (weighted 0.0)
+        // and owns 12 local parameters of 4 values each (4^12 = 16,777,216 inert
+        // combinations). GroupSearch must exhaust the active subspace in
+        // milliseconds without enumerating the inert Cartesian product or
+        // storing inert assignments in sweep.asked.
+        let inert_params = (0..12)
+            .map(|i| format!("INERT_{i} in [1, 2, 4, 8] default 1"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let inert_product = (0..12)
+            .map(|i| format!("INERT_{i}"))
+            .collect::<Vec<_>>()
+            .join(" * ");
+        let body = format!(
+            "    params (LANES in [16, 32] default 32)\n\
+             \x20   launch active when N <= 8:\n\
+             \x20       params (ROWS in [1, 2] default 1)\n\
+             \x20       threadgroups (ceil_div(N, ROWS * 32 / LANES), 1, 1)\n\
+             \x20       threads_per_threadgroup (32, 1, 1)\n\
+             \x20   launch untimed when N > 8:\n\
+             \x20       params ({inert_params})\n\
+             \x20       reads (LANES)\n\
+             \x20       threadgroups (ceil_div(N, {inert_product}), 1, 1)\n\
+             \x20       threads_per_threadgroup (32, 1, 1)\n"
+        );
+        let implementation = declared(&body);
+        let statics = NativeSpecialization::new();
+        let seed = implementation
+            .default_specialization_without_device(&statics)
+            .unwrap()
+            .unwrap();
+        let points = shapes(&[1, 32]);
+        let partition = plan::partition(&implementation, &statics, &points).unwrap();
+        assert_eq!(partition.groups.len(), 1);
+        assert_eq!(partition.groups[0].declared(), 4u128 * (1u128 << 24));
+        let keying = Keying::Launches(partition.boundary.clone());
+        let domain = Declared {
+            implementation: &implementation,
+            keying: &keying,
+        };
+        let measure = |spec: &NativeSpecialization| {
+            vec![
+                PointMeasurement {
+                    point: "m1".into(),
+                    key: keying.key(&implementation, vec![0], spec),
+                    ..measured(1.0, 0.0)
+                },
+                PointMeasurement {
+                    point: "m32".into(),
+                    key: keying.key(&implementation, vec![1], spec),
+                    ..measured(1.0, 0.0)
+                },
+            ]
+        };
+        let reference = measure(&seed);
+        let mut search = GroupSearch::new(
+            partition,
+            seed.clone(),
+            reference,
+            vec![1.0, 0.0],
+            Vec::new(),
+        );
+        let mut measured_count = 0usize;
+        while let Some(piece) = search.plan(&domain).unwrap() {
+            let specs = match piece {
+                Piece::Whole(specs) => specs,
+                Piece::Sweep { ready, .. } => ready,
+            };
+            for spec in specs {
+                search.record(&spec, Some(measure(&spec)));
+                measured_count += 1;
+            }
+            assert!(
+                measured_count <= 4,
+                "only the 3 non-seed active combinations should be measured, got {measured_count}"
+            );
+        }
+        assert!(search.exhausted());
+        assert_eq!(measured_count, 3);
+        let max_asked = search
+            .sweeps
+            .values()
+            .map(|sweep| sweep.asked.len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_asked <= 4,
+            "inert assignments must not grow sweep.asked (got {max_asked})"
+        );
+        assert!(
+            search.requests < 500,
+            "RestWalk must not enumerate inert Cartesian product (got {} requests)",
+            search.requests
         );
     }
 }

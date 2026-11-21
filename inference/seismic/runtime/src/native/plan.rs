@@ -1120,19 +1120,20 @@ pub fn partition(
         });
     }
     let mut components = BTreeMap::<usize, Vec<usize>>::new();
-    for launch in tuned {
+    for launch in measured {
         components
             .entry(root(&mut parents, launch))
             .or_default()
             .push(launch);
     }
-    // A bounded workload need not reach every declared launch. An entirely
-    // unserved independent component keeps its declared default; there is no
-    // measurement from which to choose a different configuration. Components
-    // coupled to a served launch still participate in that launch's search.
+    // A bounded workload need not reach every declared launch. Unserved
+    // launches keep their declared defaults: there is no measurement from
+    // which to choose a different configuration for their parameters, and
+    // including them in a served launch's group would inflate the group with
+    // inert axes. Served launches coupled by shared parameters or `where`
+    // restrictions stay in one group.
     let mut groups = components
         .into_values()
-        .filter(|launches| launches.iter().any(|launch| measured.contains(launch)))
         .map(|launches| {
             let parameters = owners
                 .iter()
@@ -1752,5 +1753,32 @@ mod tests {
             TuningPartition::nearest(&implementation, &default, &plan.boundary, &[3]),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn unserved_coupled_launches_do_not_pollute_served_group() {
+        let implementation = checked(
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (LANES in [16, 32] default 32, DEAD_ENTRY in [0, 1] default 0)\n    where LANES >= 16 or DEAD_ENTRY == 0\n    launch active_gemv when N <= 8:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS * 32 / LANES), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch dead_batch when N > 16:\n        params (TILE in [16, 32, 64, 128] default 16, TOKENS in [1, 2, 4, 8] default 1)\n        reads (LANES, DEAD_ENTRY)\n        threadgroups (ceil_div(N, TILE * TOKENS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+                .into(),
+        );
+        let served = [PointShape {
+            label: "m8".into(),
+            dimensions: BTreeMap::from([("N".into(), 8)]),
+        }];
+        let plan = partition(&implementation, &NativeSpecialization::new(), &served).unwrap();
+        assert_eq!(plan.groups.len(), 1);
+        let group = &plan.groups[0];
+        assert_eq!(group.launches, [0]);
+        assert_eq!(
+            group.parameters,
+            [
+                ParameterAddress::Entry("LANES".into()),
+                ParameterAddress::Launch {
+                    ordinal: 0,
+                    name: "ROWS".into(),
+                },
+            ]
+        );
+        assert_eq!(group.declared(), 4);
     }
 }
