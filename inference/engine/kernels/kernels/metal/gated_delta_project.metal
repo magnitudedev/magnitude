@@ -108,7 +108,7 @@ kernel void gated_delta_project_stage_tall(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMV
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void gated_delta_project_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(ONE, TILED);
 }
@@ -137,13 +137,13 @@ kernel void gated_delta_project_tall(PROJECTION_ARGUMENTS, PROJECTION_TILE_ARGUM
 }
 #endif
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMV_ROWS
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void gated_delta_project_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(SEVERAL, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMV_PAIR
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void gated_delta_project_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(PAIR, TILED);
 }

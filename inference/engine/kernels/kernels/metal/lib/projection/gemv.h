@@ -31,6 +31,7 @@ namespace projection {
 // A chunk holds at least one packet per lane of every row (LANES * MAXM
 // packet rows), which F32 staging at LANES 32 over 8 rows does not.
 constant constexpr uint gemv_stage_packet_rows = 448;
+constant constexpr uint mixed_gemv_stage_packet_rows = 256;
 constant constexpr uint gemv_packet_row_bytes = 4 * 16;
 
 // The staged word of chunk-local packet p, step s (columns 32p + 8s ..) and
@@ -305,7 +306,7 @@ struct gemv_emit<true> {
 // argument, not a field of the weight view, so no other reader of a view
 // (the GEMMs among them) carries it.
 template <typename W, typename U, bool PAIRED, uint R, uint MAXM, uint LANES, bool COLUMNS = false,
-    bool F32 = false, typename In, typename Out>
+    bool F32 = false, uint STAGE_ROWS = gemv_stage_packet_rows, typename In, typename Out>
 inline void gemv_body(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile,
     threadgroup uchar *shared, uint simdgroups, uint sg, uint lane, uint first_packet = 0) {
@@ -319,11 +320,14 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
     // rows' accumulators the located row costs more than the arithmetic
     // (`Weights::locate`).
     gemv_rows<W, U, PAIRED, R, (R == 1u)> at;
-    gemv_packets<W, U, PAIRED, R> current, next;
+    constexpr bool prefetch_packets = !(PAIRED && MAXM >= 8u);
+    gemv_packets<W, U, PAIRED, R> current;
     if (active) {
         at.locate(w, u, first_row, rows);
-        if (sub < packets)
-            current.load(w, u, at, first_packet + sub);
+        if constexpr (prefetch_packets) {
+            if (sub < packets)
+                current.load(w, u, at, first_packet + sub);
+        }
     }
     // The epilogue values of the output this lane emits, with its first
     // packet (`early`): lane sub emits output r * MAXM + m == sub.
@@ -331,9 +335,9 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
     if (gemv_emit<COLUMNS>::template ahead<PAIRED, R, MAXM, LANES>() && active && sub < R * MAXM
         && sub % MAXM < m_rows && first_row + sub / MAXM < rows)
         loaded = early<Out>::load(out, sub % MAXM, first_row + sub / MAXM);
-    static_assert(LANES * MAXM <= gemv_stage_packet_rows / (F32 ? 2u : 1u),
+    static_assert(LANES * MAXM <= STAGE_ROWS / (F32 ? 2u : 1u),
         "a chunk holds a packet per lane of every staged row");
-    uint chunk = min(packets, (gemv_stage_packet_rows / (F32 ? 2u : 1u) / MAXM) / LANES * LANES);
+    uint chunk = min(packets, (STAGE_ROWS / (F32 ? 2u : 1u) / MAXM) / LANES * LANES);
     threadgroup uint4 *words = reinterpret_cast<threadgroup uint4 *>(shared);
     float acc[R][MAXM], acc2[R][MAXM];
     for (uint r = 0; r < R; ++r)
@@ -349,10 +353,16 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (active) {
             for (uint local = sub; local < count; local += LANES) {
-                if (first + local + LANES < packets)
-                    next.load(w, u, at, first_packet + first + local + LANES);
-                gemv_accumulate<W, U, PAIRED, R, MAXM, A, F32>(acc, acc2, current, local, count, words);
-                current = next;
+                if constexpr (prefetch_packets) {
+                    gemv_packets<W, U, PAIRED, R> next;
+                    if (first + local + LANES < packets)
+                        next.load(w, u, at, first_packet + first + local + LANES);
+                    gemv_accumulate<W, U, PAIRED, R, MAXM, A, F32>(acc, acc2, current, local, count, words);
+                    current = next;
+                } else {
+                    current.load(w, u, at, first_packet + first + local);
+                    gemv_accumulate<W, U, PAIRED, R, MAXM, A, F32>(acc, acc2, current, local, count, words);
+                }
             }
         }
     }
@@ -528,13 +538,13 @@ inline void gemv_classes(thread const In &in, thread const Out &out, thread cons
 // `simd_sum`.
 constant constexpr uint gemv_recipe_rows_max = 8;
 
-template <typename W, uint R, uint LANES, typename In, typename Out>
+template <typename W, uint R, uint LANES, uint STAGE_ROWS = gemv_stage_packet_rows, typename In, typename Out>
 inline void gemv_recipe_rows(thread const In &x, thread const Out &out, thread const Weights<W> &w, uint rows,
     uint n, uint k, uint tile, threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
     typedef typename In::activation activation;
-    static_assert(gemv_stage_packet_rows / gemv_recipe_rows_max >= 32u, "the staging holds a lane stride of every row");
+    static_assert(STAGE_ROWS / gemv_recipe_rows_max >= 32u, "the staging holds a lane stride of every row");
     const uint groups = k / 32u;
-    const uint capacity = gemv_stage_packet_rows;
+    const uint capacity = STAGE_ROWS;
     const uint chunk = rows * groups <= capacity ? groups : capacity / rows / 32u * 32u;
     threadgroup uint4 *stage = reinterpret_cast<threadgroup uint4 *>(shared);
     const uint tid = sg * 32u + lane, threads = simdgroups * 32u;
@@ -937,25 +947,27 @@ inline void unordered_from_ordered_maxm_run(thread const RawIn &raw, thread cons
     threadgroup uchar *shared, uint sg, uint lane) {
     if constexpr (!NVFP4 && !gemv_recipe<W0>::value) {
         if constexpr (MAXM == 1u) {
-            if (m == 1u && k > 0u && (k & 31u) == 0u && (k >> 5u) <= gemv_stage_packet_rows) {
+            if (m == 1u && k > 0u && (k & 31u) == 0u && (k >> 5u) <= mixed_gemv_stage_packet_rows) {
                 gemv_prestaged_one<W0, W1, PAIRED, ROWS, LANES, SIMDGROUPS>(
                     raw, out, w0, w1, n, k, tile, shared, sg, lane);
                 return;
             }
         }
         constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : 4608u));
-        const uint avail_bytes = metal::max(min_shared_bytes, metal::min(((k + 31u) >> 5u) * MAXM, 448u) * 64u);
+        const uint avail_bytes = metal::max(min_shared_bytes,
+            metal::min(((k + 31u) >> 5u) * MAXM, mixed_gemv_stage_packet_rows) * 64u);
         threadgroup float *smem = reinterpret_cast<threadgroup float *>(shared);
         raw.ordered_inverses_sram(m, smem, smem, avail_bytes >> 2u, sg, lane, SIMDGROUPS);
         RegOrderedNorm<RawIn, MAXM> input{raw, {}};
         PROJECTION_UNROLL
         for (uint r = 0; r < MAXM; ++r)
             input.inv[r] = (r < m) ? smem[r] : 0.0f;
-        gemv_body<W0, W1, PAIRED, ROWS, MAXM, LANES>(
+        gemv_body<W0, W1, PAIRED, ROWS, MAXM, LANES, false, false, mixed_gemv_stage_packet_rows>(
             input, out, w0, w1, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
     } else {
         constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : 4608u));
-        const uint avail_bytes = metal::max(min_shared_bytes, metal::min(((k + 31u) >> 5u) * MAXM, 448u) * 64u);
+        const uint avail_bytes = metal::max(min_shared_bytes,
+            metal::min(((k + 31u) >> 5u) * MAXM, mixed_gemv_stage_packet_rows) * 64u);
         threadgroup float *smem = reinterpret_cast<threadgroup float *>(shared);
         raw.ordered_inverses_sram(m, smem, smem, avail_bytes >> 2u, sg, lane, SIMDGROUPS);
         RegOrderedNorm<RawIn, MAXM> input{raw, {}};
@@ -971,12 +983,14 @@ inline void unordered_from_ordered_maxm_run(thread const RawIn &raw, thread cons
                 rg.g[r] = (r < m) ? smem[r] : 0.0f;
             const Nvfp4Rows<RegOrderedNorm<RawIn, MAXM>, RegGlobals<MAXM>> x{input, rg};
             if constexpr (gemv_recipe<W0>::value)
-                gemv_recipe_rows<W0, ROWS, LANES>(x, out, w0, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
+                gemv_recipe_rows<W0, ROWS, LANES, mixed_gemv_stage_packet_rows>(x, out, w0, m, n, k, tile, shared,
+                    SIMDGROUPS, sg, lane);
             else
-                gemv_body<W0, W1, PAIRED, ROWS, MAXM, LANES>(
+                gemv_body<W0, W1, PAIRED, ROWS, MAXM, LANES, false, false, mixed_gemv_stage_packet_rows>(
                     x, out, w0, w1, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
         } else {
-            gemv_recipe_rows<W0, ROWS, LANES>(input, out, w0, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
+            gemv_recipe_rows<W0, ROWS, LANES, mixed_gemv_stage_packet_rows>(input, out, w0, m, n, k, tile, shared,
+                SIMDGROUPS, sg, lane);
         }
     }
 }

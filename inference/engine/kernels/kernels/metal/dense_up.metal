@@ -72,6 +72,7 @@ typedef projection::operands<NVFP4> Operands;
 
 // The normalized rows into `normalized`, one row a threadgroup.
 #ifdef SEISMIC_FORMING_DENSE_UP_NORMALIZE
+template <uint MATRIX>
 kernel void dense_up_normalize(PROJECTION_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -83,19 +84,19 @@ kernel void dense_up_normalize(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_DENSE_UP_GEMV
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void dense_up_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(ONE, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_DENSE_UP_GEMV_PAIR
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void dense_up_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_DENSE_UP_GEMV_ROWS
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void dense_up_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
 }

@@ -240,10 +240,12 @@ native stream_mix_down for metal from "metal/stream_mix_down.metal":
     where H % 32 == 0 and C <= 1
     project dense segmented (down_weight, inject_weight) parts S rows rms
     restate gemv SIMDGROUPS in [16, 8, 4, 2, 32] default 4
-    restate gemv_rows SIMDGROUPS in [16, 8, 4, 2, 32] default 4
+    restate gemv_rows SIMDGROUPS in [8, 16, 4, 2, 32] default 8
     restate gemv_rows ROWS in [1, 2, 4] default 1
     restate gemv_pair SIMDGROUPS in [16, 8, 4, 2, 32] default 4
     restate gemv_pair ROWS in [1, 2, 4] default 1
+    restate batch BATCH_SIMDGROUPS in [4, 8, 16, 32] default 4
+    restate batch BATCH_ROWS in [1, 2, 4] default 1
     scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * S * H * 2) when M > 16
     launch stream_mix_down_stage before gemm when M > 16 and (M <= 64 or TALL == 0 or PACK == 1):
         staging

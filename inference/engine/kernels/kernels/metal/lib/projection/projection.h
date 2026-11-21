@@ -1799,11 +1799,13 @@ inline void gemm_tall_paired(thread const In &in, thread const Out &out, thread 
 // activations in chunks
 // of `gemv_batch_chunk<NB>` columns, and each lane loads its next packet while
 // the current one multiplies. A batched GEMV launch declares
-//   shared_bytes (16640)
+//   shared_bytes (15488)
 // (8 * NB staged rows of `gemv_batch_chunk<NB> + 4` floats; a chunk is a
-// whole number of packets: 512 columns for NB = 1, 256 for NB = 2).
+// whole number of packets: 480 columns for NB = 1, 224 for NB = 2, leaving
+// headroom below 16 KiB for static threadgroup state so two threadgroups fit
+// per core).
 
-constant constexpr uint gemv_batch_shared_bytes = 16640;
+constant constexpr uint gemv_batch_shared_bytes = 15488;
 template <uint NB>
 constexpr uint gemv_batch_chunk() {
     return (gemv_batch_shared_bytes / (32u * NB) - 4u) / 32u * 32u;
@@ -1956,7 +1958,7 @@ struct gemv_batch_emit<true> {
 template <typename W, typename U, bool PAIRED, uint R, uint NB, bool COLUMNS = false, typename In, typename Out>
 inline void gemv_batch_body(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
-    uint simdgroups, uint sg, uint lane) {
+    uint simdgroups, uint sg, uint lane, uint first_packet = 0) {
     constexpr uint chunk = gemv_batch_chunk<NB>();
     constexpr uint pitch = chunk + 4u;
     constexpr bool QUARTERS = gemv_batch_quarters<W>::value;
@@ -1997,9 +1999,9 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
         // chunk or call finishes reading the staging first.
         if (active) {
             for (uint r = 0; r < R; ++r) {
-                a[r] = gemv_batch_load(w, a_at[r], c0 / 32u, a_run[r]);
+                a[r] = gemv_batch_load(w, a_at[r], first_packet + c0 / 32u, a_run[r]);
                 if (PAIRED)
-                    b[r] = gemv_batch_load(u, b_at[r], c0 / 32u, b_run[r]);
+                    b[r] = gemv_batch_load(u, b_at[r], first_packet + c0 / 32u, b_run[r]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2026,9 +2028,9 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
         for (uint local = 0; local < packets; ++local) {
             if (local + 1u < packets) {
                 for (uint r = 0; r < R; ++r) {
-                    a_next[r] = gemv_batch_load(w, a_at[r], c0 / 32u + local + 1u, a_run[r]);
+                    a_next[r] = gemv_batch_load(w, a_at[r], first_packet + c0 / 32u + local + 1u, a_run[r]);
                     if (PAIRED)
-                        b_next[r] = gemv_batch_load(u, b_at[r], c0 / 32u + local + 1u, b_run[r]);
+                        b_next[r] = gemv_batch_load(u, b_at[r], first_packet + c0 / 32u + local + 1u, b_run[r]);
                 }
             }
             simdgroup_float8x8 x[4][NB];
@@ -2054,11 +2056,13 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
 template <typename W, uint R, typename In, typename Out>
 inline void gemv_batch_runtime(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared, uint simdgroups,
-    uint sg, uint lane) {
+    uint sg, uint lane, uint first_packet = 0) {
     if (m_rows <= 8)
-        gemv_batch_body<W, W, false, R, 1>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg, lane);
+        gemv_batch_body<W, W, false, R, 1>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg, lane,
+            first_packet);
     else
-        gemv_batch_body<W, W, false, R, 2>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg, lane);
+        gemv_batch_body<W, W, false, R, 2>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg, lane,
+            first_packet);
 }
 
 // `gemv_batch_runtime` with a column epilogue (`gemv_emit<true>`).
@@ -3155,10 +3159,9 @@ inline void gemv_matrix_paired_body(thread const In &in, thread const Out &out,
         gemv_matrix_symmetric<true, NB, PARTS, false>(in, out, gate, up, m_rows, rows, k, group, shared, simdgroups,
             sg, lane);
         return;
-    }
-    // The two products share each loaded and decoded activation fragment.
-    // Each accumulator keeps the single-product instruction order.
-    if constexpr (matrix_form<G>::stages_block_sums && matrix_form<U>::stages_block_sums) {
+    } else if constexpr (matrix_form<G>::stages_block_sums && matrix_form<U>::stages_block_sums) {
+        // The two products share each loaded and decoded activation fragment.
+        // Each accumulator keeps the single-product instruction order.
         const bool staged = gemv_matrix_shared_bytes(k, NB, simdgroups) <= gemv_matrix_staged_bytes;
         if (matrix_unit(in)) {
             if (staged)
@@ -3175,13 +3178,14 @@ inline void gemv_matrix_paired_body(thread const In &in, thread const Out &out,
                 m_rows, rows, k, group, shared, simdgroups, sg, lane);
         }
         return;
+    } else {
+        float2 gate_sums[NB];
+        const matrix_pair_gate first{gate_sums};
+        const matrix_pair_up<Out> second{out, gate_sums};
+        matrix_form<G>::template run<NB, PARTS>(in, first, gate, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+        matrix_form<U>::template run<NB, PARTS, matrix_form<G>::stages_block_sums>(in, second, up,
+            m_rows, rows, k, group, shared, simdgroups, sg, lane);
     }
-    float2 gate_sums[NB];
-    const matrix_pair_gate first{gate_sums};
-    const matrix_pair_up<Out> second{out, gate_sums};
-    matrix_form<G>::template run<NB, PARTS>(in, first, gate, m_rows, rows, k, group, shared, simdgroups, sg, lane);
-    matrix_form<U>::template run<NB, PARTS, matrix_form<G>::stages_block_sums>(in, second, up,
-        m_rows, rows, k, group, shared, simdgroups, sg, lane);
 }
 
 template <typename G, typename U, uint PARTS, typename In, typename Out>

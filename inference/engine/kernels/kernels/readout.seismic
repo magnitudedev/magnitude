@@ -85,8 +85,8 @@ native readout_head_rows for metal from "metal/readout_head_rows.metal":
     static (V, D, PT, NM, WS)
     where WS <= 1
     project dense single (weight)
-    scratch normalized bytes (O * D * 2) when O > VERIFY_ROWS
-    launch readout_head_rows_stage before batch when O > VERIFY_ROWS:
+    scratch normalized bytes (O * D * 2) when O > VERIFY_ROWS or MATRIX > 0
+    launch readout_head_rows_stage before batch when O > VERIFY_ROWS or MATRIX > 0:
         staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
