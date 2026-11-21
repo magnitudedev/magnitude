@@ -236,7 +236,7 @@ native feature_copy for metal from "metal/feature_copy.metal":
 
 native feature_copy for cuda from "cuda/feature_copy.cu":
     launch feature_copy:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threadgroups (ceil_div(M * ceil_div(D, max(1, 16 / max(1, dense_bytes(A)))), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native feature_copy for vulkan from "vulkan/feature_copy.comp":

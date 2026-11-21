@@ -16,7 +16,7 @@ native copy_rows for metal from "metal/copy_rows.metal":
 
 native copy_rows for cuda from "cuda/copy_rows.cu":
     launch copy_rows:
-        threadgroups (ceil_div(N * KV * W, 256), 1, 1)
+        threadgroups (ceil_div(N * KV * ceil_div(W, max(1, 16 / max(1, dense_bytes(A)))), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # Vulkan: a grid-stride loop over every copied element; the x grid is capped
