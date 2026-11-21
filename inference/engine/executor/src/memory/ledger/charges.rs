@@ -277,9 +277,11 @@ impl State {
         self.allocated -= released;
         self.allocate(id, allocated);
         // A pool's entry holds spare granules that follow `allocated`; an
-        // import's upload window (`CommittedKind::Upload`) is a reusable peak
-        // reservation across batches, released whole when its holder drops.
-        if !matches!(entry.holding, Holding::Pool(_) | Holding::Committed(CommittedKind::Upload)) {
+        // import's upload window (`CommittedKind::Upload`) and an in-process
+        // measurement's room (`CommittedKind::Measurement`) are reusable peak
+        // reservations across batches/points, released whole when their holder
+        // drops.
+        if !matches!(entry.holding, Holding::Pool(_) | Holding::Committed(CommittedKind::Upload | CommittedKind::Measurement)) {
             self.resize(id, entry.bytes - held);
         }
     }

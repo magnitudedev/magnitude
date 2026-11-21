@@ -118,7 +118,8 @@ kernel void routed_expand_gathered(ROUTED_EXPAND_PORTS) {
     if (group.y < SEISMIC_DIM_M * SEISMIC_DIM_K) {
         if (ulong(tile) * simdgroups * R * (32u / L) >= SEISMIC_DIM_F) return;
         const routed::Gathered chosen = routed::gather(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
-            uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), group.y, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1);
+            uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), group.y, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
+            lane);
         if (chosen.count == 0) return;
         const projection::Plain<A, routed::Listed> in{normalized, SEISMIC_NORMALIZED_STRIDE_0,
             SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H), routed::Listed{chosen.rows}};

@@ -341,16 +341,18 @@ activation):
 Nothing in an absorbed read is staged in F16. A BF16 value is exact in F16 when
 2^−17 <= |x| <= 65280 or x = 0 (BF16's 8-bit significand fits F16's subnormal grid down to
 2^−17), so a smaller latent value would lose bits that A holds, and no bound on the stored norm
-weight keeps every value above it. Every decode and prefill form that rounds an operand to F16
-(Metal's decode matrix forms, `attention.h`'s `dense_history::KeyOperand`, and its shared-tile
-prefill with picks (KS > 0); Vulkan's decode and prefill matrix forms) is refused for an absorbed read by the declarations themselves: the dense
-entries' form table carries an axis `AB`, 1 for `QueryKeys::Absorbed`, and their `where` clauses
-exclude `MATRIX` (and, on Metal's prefill, KS > 0) for it (`attention.seismic`). The catalog decides which entry attends: Metal's
-vector decode holds no group of 64 queries of 512 and CUDA's holds no stored key (VK = 1), so
-their decode rows attend with their prefill entries (`graph::dense_decodes`), a selected read's
-rows (the indexer's WorkList bitmap) included: every prefill entry reads the bitmap, which only
-chooses the keys, so no operand is staged differently. Vulkan's vector decode form holds it, in
-A with F32 products.
+weight keeps every value above it. Metal's decode matrix forms (`decode_matrix`, `decode_shared`)
+and its shared-tile prefill with picks (KS > 0) stage queries, keys, values and probabilities in
+`dense_history::KeyOperand` (the activation element A), so they never round to F16 and are
+admitted for absorbed reads. Every decode and prefill form that rounds an operand to F16
+(Vulkan's decode and prefill matrix forms) is refused for an absorbed read by the declarations
+themselves: the dense entries' form table carries an axis `AB`, 1 for `QueryKeys::Absorbed`, and
+Vulkan's `where` clauses exclude `MATRIX` for it (`attention.seismic`). The catalog decides which
+entry attends: Metal's shared-tile decode holds GLM's 64 queries of 512 in A, Vulkan's vector
+decode holds it in A with F32 products, and CUDA's decode holds no stored key (VK = 1), so CUDA's
+decode rows attend with its prefill entry (`graph::dense_decodes`); a selected read's rows (the
+indexer's WorkList bitmap) attend with the prefill entry on every backend, since the bitmap only
+chooses the keys and no operand is staged differently.
 
 Vulkan's prefill entry has two forms. Where a stored key is read as the value (VK = 1) its
 canonical default is the vector form (MATRIX = 0, `vulkan/lib/attention/vector.glsl`), which

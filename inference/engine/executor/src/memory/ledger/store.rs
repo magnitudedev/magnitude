@@ -616,23 +616,35 @@ impl DeviceLedgers {
         [&self.device, &self.host].into_iter().find(|ledger| ledger.store.identity == *store)
     }
 
-    /// Charges of a measurement job run on `device` in this process (a
-    /// tool's, a test's): in each store the device reaches, a
-    /// [`CommittedKind::Measurement`] holding opened at none, which grows
-    /// as the job allocates through it, each allocation its own change
-    /// judged by the store's reading as any holding's is, and is released
-    /// as the last of the charges drops.
+    /// Pre-claimed [`CommittedKind::Measurement`] room for an in-process
+    /// measurement on `device` (a tiered load's transfer-queue line, or a
+    /// harness ceiling walk beside a loaded domain): claims `demand` via
+    /// [`Self::claim`] (synchronously reclaiming backed cache such as bank
+    /// slots outside both ledger and backend locks before admitting), and
+    /// pairs those claims with the [`seismic::Charges`] that allocate through
+    /// them. Any store `demand` places 0 bytes in opens at none. Dropping the
+    /// returned [`MeasurementCharges`] releases the peak reservation whole.
     ///
     /// # Panics
     /// Where `device` reaches a store these do not keep: only another
     /// device's would.
-    pub fn measurement(&self, device: &seismic::Device) -> seismic::Charges {
-        device.charges(|store| {
-            let ledger = self
-                .keeping(store)
-                .unwrap_or_else(|| panic!("invariant violated: a measurement job's device reaches {store:?}, a store its ledgers do not keep"));
-            Arc::new(ledger.growing(CommittedKind::Measurement))
-        })
+    pub fn claim_measurement(
+        &self,
+        device: &seismic::Device,
+        demand: crate::memory::ClaimDemand,
+    ) -> Result<MeasurementCharges, Short> {
+        let held = self.changes().back(|claiming| self.claim(&claiming, device, CommittedKind::Measurement, demand))?;
+        let charges = device.charges(|store| {
+            if let Some(claim) = held.claims.iter().find(|claim| claim.ledger().store.identity == *store) {
+                claim.entry()
+            } else {
+                let ledger = self
+                    .keeping(store)
+                    .unwrap_or_else(|| panic!("invariant violated: a measurement job's device reaches {store:?}, a store its ledgers do not keep"));
+                Arc::new(ledger.growing(CommittedKind::Measurement))
+            }
+        });
+        Ok(MeasurementCharges { charges, _held: held })
     }
 
     /// The ledger of the store `tier` lies in.
@@ -820,6 +832,23 @@ pub struct LoadEstimate {
     /// device: its host tier, staging and shared storage); none on unified
     /// memory, where the two are one store and `device` is it.
     pub host: Option<Estimate>,
+}
+
+/// Pre-claimed [`CommittedKind::Measurement`] room paired with the
+/// [`seismic::Charges`] that allocate through its claims
+/// ([`DeviceLedgers::claim_measurement`]). Field order drops `charges` before
+/// `_held` releases the peak reservation back to the ledger.
+#[must_use]
+pub struct MeasurementCharges {
+    charges: seismic::Charges,
+    _held: Held,
+}
+
+impl MeasurementCharges {
+    /// Charges allocating through the pre-claimed measurement room.
+    pub fn charges(&self) -> &seismic::Charges {
+        &self.charges
+    }
 }
 
 /// The committed claims of one allocation across the stores a device

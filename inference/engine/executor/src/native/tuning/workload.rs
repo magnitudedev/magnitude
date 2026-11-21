@@ -162,6 +162,7 @@ mod tests {
 
     const LIMITS: TuningLimits = TuningLimits {
         max_rows: 512,
+        max_pass_rows: 512,
         max_projected_rows: 8,
         context_tokens: 64256,
         image_cells: 0,

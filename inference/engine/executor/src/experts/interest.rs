@@ -891,15 +891,16 @@ impl Stands {
         Self { time, rows: Arc::new(Mutex::new(rows)) }
     }
 
-    /// The bank-wide epoch and the clock now, read under the time's lock
-    /// alone (never beside the stands').
-    fn now(&self) -> (u64, Tokens) {
+    /// Locks the stand rates, then reads the bank-wide epoch and clock under
+    /// that lock so every count and read observes monotonically non-decreasing
+    /// `(epoch, now)`. `horizon::Time` is a leaf lock, so `Stands::rows ->
+    /// horizon::Time` cannot deadlock.
+    fn lock_with_now(&self) -> (MutexGuard<'_, [[Judgement; 2]; ROWS]>, u64, Tokens) {
+        let rows = self.rows.lock().expect("the stand rates");
         let times = self.time.lock();
-        (times.bank_epoch(), times.clock.through_latest())
-    }
-
-    fn lock(&self) -> MutexGuard<'_, [[Judgement; 2]; ROWS]> {
-        self.rows.lock().expect("the stand rates")
+        let (epoch, now) = (times.bank_epoch(), times.clock.through_latest());
+        drop(times);
+        (rows, epoch, now)
     }
 
     /// Row `row`'s cell. Panics where `row` is not a guessed row,
@@ -912,8 +913,7 @@ impl Stands {
     /// Row `row` of `form`, every row before it having stood, `stood` or
     /// fell, judged now.
     pub(super) fn count(&self, row: usize, form: Form, stood: bool) {
-        let (epoch, now) = self.now();
-        let mut rows = self.lock();
+        let (mut rows, epoch, now) = self.lock_with_now();
         let cell = Self::cell(&mut rows, row, form);
         if let Judgement::Unjudged = cell {
             *cell = Judgement::Judged(Aged::new(epoch));
@@ -926,8 +926,8 @@ impl Stands {
     /// judged: row `row` ≥ 1 standing, every row before it having stood;
     /// none unjudged (whose bound, 1, the caller applies).
     pub fn judged(&self, row: usize, form: Form) -> Option<(f64, Tokens)> {
-        let (epoch, now) = self.now();
-        Self::read(&mut self.lock(), row, form, epoch, now)
+        let (mut rows, epoch, now) = self.lock_with_now();
+        Self::read(&mut rows, row, form, epoch, now)
     }
 
     /// r_row of `form`: [`Self::judged`]'s rate.
@@ -939,8 +939,7 @@ impl Stands {
     /// their bound 1.0 (design §3.3), read under a single lock of the clock
     /// and stand table.
     pub fn front_rates(&self) -> [f64; ROWS] {
-        let (epoch, now) = self.now();
-        let mut rows = self.lock();
+        let (mut rows, epoch, now) = self.lock_with_now();
         std::array::from_fn(|index| Self::read(&mut rows, index + 1, Form::Front, epoch, now).map_or(1.0, |(rate, _)| rate))
     }
 
@@ -948,8 +947,7 @@ impl Stands {
     /// guessed rows all stand, Π_{row ≤ depth} r_row, an unjudged row's at
     /// its bound 1.
     pub fn through_rows(&self, depth: usize, form: Form) -> f64 {
-        let (epoch, now) = self.now();
-        let mut rows = self.lock();
+        let (mut rows, epoch, now) = self.lock_with_now();
         (1..=depth).map(|row| Self::read(&mut rows, row, form, epoch, now).map_or(1., |(rate, _)| rate)).product()
     }
 
@@ -2365,6 +2363,55 @@ mod tests {
         assert!((rate - 0.5).abs() < 1e-12, "keeps its last measured rate across empty epochs");
         assert_eq!(age, Tokens::new(10.0), "age tracks tokens since last judgement");
         assert!((stands.through_rows(2, Form::Front) - (2.0 / 3.0) * 0.5).abs() < 1e-12);
+    }
+
+    /// Concurrent `Stands` reads and counts while `Time` advances `bank_epoch`
+    /// and the token clock never regress a window's epoch or `Aged`'s clock:
+    /// every operation reads `(epoch, now)` while holding `Stands::rows`.
+    #[test]
+    fn stands_concurrent_reads_and_counts_never_regress_epoch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let time = Time::new(&[vec![2]], 16);
+        let stands = Stands::new(time.clone());
+        time.lock().register(1, Advance::Known(Tokens::new(1.0)));
+        for row in 1..=ROWS {
+            stands.count(row, Form::Front, true);
+            stands.count(row, Form::Verify, true);
+        }
+
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for reader in 0..3usize {
+                let stands = stands.clone();
+                let done = &done;
+                scope.spawn(move || {
+                    let mut i = 0u64;
+                    while !done.load(Ordering::Relaxed) {
+                        let _ = stands.front_rates();
+                        let _ = stands.judged((reader % ROWS) + 1, Form::Front);
+                        let _ = stands.through_rows(ROWS, Form::Verify);
+                        if i.is_multiple_of(8) {
+                            stands.count((reader % ROWS) + 1, Form::Front, i.is_multiple_of(16));
+                        }
+                        i += 1;
+                    }
+                });
+            }
+            for step in 2..=2001u64 {
+                {
+                    let mut times = time.lock();
+                    times.register(step, Advance::Known(Tokens::new(1.0)));
+                    times.resized(0, Tier::Compute, 2);
+                    times.moved(0, Tier::Compute);
+                }
+                stands.count(1, Form::Front, step.is_multiple_of(2));
+                stands.count(1, Form::Verify, step.is_multiple_of(3));
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+        assert!(time.lock().bank_epoch() >= 2000);
+        assert!(stands.judged(1, Form::Front).is_some());
+        assert!(stands.judged(1, Form::Verify).is_some());
     }
 
     /// A combination key is `(nearest look, best rank at nearest, distinct look count)`:

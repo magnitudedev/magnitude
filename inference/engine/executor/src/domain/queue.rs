@@ -122,11 +122,20 @@ enum TokenSource {
     Host,
 }
 
+/// Token source for a queued successor before its per-slot advances are built.
+enum SuccessorTokens {
+    Host,
+    Selected {
+        selected: crate::GraphOutputTensor,
+        guesses: Option<crate::GraphOutputTensor>,
+    },
+}
+
 /// How a queued step's advances follow the step before it.
 enum Follow {
-    /// As pipelined successors, their tokens read from `TargetTokens`: a
+    /// As pipelined successors, their tokens read from `SuccessorTokens`: a
     /// decode continuation's, the predecessor's selection rows.
-    Successor(TargetTokens),
+    Successor(SuccessorTokens),
     /// As the next chunk of a chain, of its own tokens.
     Chained,
 }
@@ -930,13 +939,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .as_ref()
                     .expect("invariant violated: a chained continuation's predecessor ran no front head launch");
                 let chain = front.submission.output().front().expect("invariant violated: a front head launch makes no chain");
+                let HeadState::Owned { advances, .. } = front.submission.launch().state() else {
+                    panic!("invariant violated: a front head launch owns no advances");
+                };
                 (
-                    TargetTokens::Selected { selected: chain.next_selected.clone(), guesses: Some(chain.next_guesses.clone()) },
-                    Some(front.submission.launch().advances()),
+                    SuccessorTokens::Selected { selected: chain.next_selected.clone(), guesses: Some(chain.next_guesses.clone()) },
+                    Some(advances.as_slice()),
                 )
             }
-            TokenSource::Selected(selected) => (TargetTokens::Selected { selected, guesses: None }, None),
-            TokenSource::Host => (TargetTokens::Host, None),
+            TokenSource::Selected(selected) => (SuccessorTokens::Selected { selected, guesses: None }, None),
+            TokenSource::Host => (SuccessorTokens::Host, None),
         };
         // A planned prompt chunk's drafter entry follows the in-flight entry
         // of the chunk before it.
@@ -944,7 +956,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .priming
             .as_ref()
             .filter(|priming| matches!(predicted.as_slice(), [operation] if operation.request() == priming.request))
-            .and_then(|priming| priming.submission.launch().advances().first());
+            .and_then(|priming| match priming.submission.launch().state() {
+                HeadState::Owned { advances, .. } => advances.first(),
+                HeadState::TargetReads { .. } => {
+                    panic!("invariant violated: a drafter entry owns no advances")
+                }
+            });
         let entry_before = |count| entry_before.map_or(Ok(None), |advance| fitting(advance.successor(count)));
         let entry = self.queued_priming(&predicted, entry_before)?;
         let Some(entry) = entry else {
@@ -1276,14 +1293,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub(super) fn claim_slots(&self, operations: &[Operation]) -> Option<Vec<usize>> {
         let step = self.queue.front()?;
         let selected = step.selected.as_ref()?;
-        let advances = step.flight.submission.launch().advances();
+        let launch = step.flight.submission.launch();
         let mut slots = Vec::with_capacity(operations.len());
         for operation in operations {
             let slot = step
                 .predicted
                 .iter()
                 .position(|predicted| predicted.request() == operation.request())?;
-            let expected = match step.flight.submission.launch().tokens() {
+            let expected = match launch.tokens() {
                 // Each of the slot's rows read its predecessor's exact
                 // selection, or the guess of the chain made behind its
                 // predecessor at its depth, or idle the exact selection
@@ -1296,9 +1313,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 // fails when the step finishes, and the others continue
                 // (`finish_target_work`).
                 TargetTokens::Selected { .. } => claimed(&step.predicted[slot], step.reads[slot], selected)?,
-                TargetTokens::Host => step.predicted[slot].clone(),
+                TargetTokens::Host(..) => step.predicted[slot].clone(),
             };
-            let advance = advances.get(slot)?;
+            let advance = &launch.slot(slot)?.advance;
             // A chained chunk follows its chain; any other slot the
             // request's accepted state.
             let follows = match advance {
@@ -1376,9 +1393,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // Take-outs: the target state returns as the flight finishes
         // (`finish_target_work` attaches it); the head state as its front
         // head launch finishes (`finish_front`).
-        let advances = flight.submission.launch().advances();
+        let launch = flight.submission.launch();
         for (operation, &slot) in operations.iter().zip(&slots) {
-            sources[slot] = match &advances[slot] {
+            sources[slot] = match &launch
+                .slot(slot)
+                .expect("invariant violated: claimed slot is absent")
+                .advance
+            {
                 TentativeAdvance::Chained(_) => {
                     let Queue::Chain(chain) = &mut self.queue else {
                         panic!("invariant violated: a claimed chained chunk without its chain");
@@ -1426,9 +1447,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// `None` when the advances or their leases do not fit without growing
     /// anything, or a slot needs input slices: the step is then submitted as
     /// usual.
-    fn build_successor(
+    fn build_successor<'a>(
         &mut self,
-        predecessor: &[TentativeAdvance],
+        predecessor: impl Iterator<Item = &'a TentativeAdvance>,
         predicted: &[Operation],
         follow: Follow,
         ahead: &[Operation],
@@ -1439,7 +1460,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Follow::Successor(tokens) => (
                 TentativeAdvance::successors(
                     predecessor
-                        .iter()
                         .zip(predicted)
                         .map(|(advance, operation)| (advance, operation.committed_rows(), operation.front_rows())),
                 )
@@ -1453,7 +1473,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ),
             Follow::Chained => (
                 TentativeAdvance::chained(
-                    predecessor.iter().zip(predicted).map(|(advance, operation)| (advance, operation.row_count())),
+                    predecessor.zip(predicted).map(|(advance, operation)| (advance, operation.row_count())),
                 )
                 .map(|chunks| {
                     chunks
@@ -1461,7 +1481,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .map(TentativeAdvance::Chained)
                         .collect::<Vec<_>>()
                 }),
-                TargetTokens::Host,
+                SuccessorTokens::Host,
             ),
         };
         let advances = match advances {
@@ -1492,12 +1512,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let class_limits = self.target_class_limits();
         let vocabulary = self.definition.decoder.vocabulary as usize;
         let batch = match tokens {
-            TargetTokens::Selected { .. } => ValidatedTargetBatch::from_slots(&slots, vocabulary, class_limits),
-            TargetTokens::Host => ValidatedTargetBatch::covering(&slots, vocabulary, class_limits, segments),
+            SuccessorTokens::Selected { .. } => ValidatedTargetBatch::from_slots(&slots, vocabulary, class_limits),
+            SuccessorTokens::Host => ValidatedTargetBatch::covering(&slots, vocabulary, class_limits, segments),
         }
         .map_err(|error| DomainError::Input(error.to_string()))?;
         let tokens = match tokens {
-            TargetTokens::Selected { selected, guesses } => {
+            SuccessorTokens::Selected { selected, guesses } => {
                 let rows = batch.class().rows() as u64;
                 if selected
                     .tensor()
@@ -1511,9 +1531,49 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let leading = |tensor: crate::GraphOutputTensor| {
                     tensor.slice_leading(0, rows).map_err(|error| DomainError::Input(error.to_string()))
                 };
-                TargetTokens::Selected { selected: leading(selected)?, guesses: guesses.map(leading).transpose()? }
+                let target_slots = predicted
+                    .iter()
+                    .zip(advances)
+                    .zip(preceding)
+                    .map(|((operation, advance), preceding)| {
+                        assert!(
+                            matches!(
+                                operation,
+                                Operation::Forward { front, .. }
+                                    if front.iter().all(|row| matches!(row.kind, crate::operation::FrontKind::Device))
+                            ),
+                            "a selected-token launch slot must run a forward with Device front rows"
+                        );
+                        TargetSlot {
+                            request: operation.request(),
+                            advance,
+                            preceding,
+                        }
+                    })
+                    .collect();
+                TargetTokens::Selected {
+                    selected: leading(selected)?,
+                    guesses: guesses.map(leading).transpose()?,
+                    slots: target_slots,
+                }
             }
-            TargetTokens::Host => TargetTokens::Host,
+            SuccessorTokens::Host => TargetTokens::Host(
+                predicted
+                    .iter()
+                    .zip(advances)
+                    .zip(preceding)
+                    .map(|((operation, advance), preceding)| TargetHostSlot {
+                        slot: TargetSlot {
+                            request: operation.request(),
+                            advance,
+                            preceding,
+                        },
+                        conditioning: None,
+                        conditioning_slices: Vec::new(),
+                        guesses: SlotGuess::of(operation),
+                    })
+                    .collect(),
+            ),
         };
         let graph = self.resources.target_graph();
         let readout = self.resources.target_readout_graph(super::projected_rows(predicted));
@@ -1542,7 +1602,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         } else {
             None
         };
-        let count = predicted.len();
         let work = crate::operation::LaunchWork::of(predicted.iter().filter_map(|operation| match operation {
             Operation::Forward { kind, .. } => Some(*kind),
             _ => None,
@@ -1550,19 +1609,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let inputs = TargetLaunchInputs::new(
             batch,
             work,
-            predicted.iter().map(Operation::request).collect(),
             tokens,
-            advances,
-            vec![None; count],
-            vec![Vec::new(); count],
-            predicted,
             graph_workspace,
             graph_output,
             readout_workspace,
             readout_output,
         )
-        .with_boundary(boundary)
-        .with_preceding(preceding);
+        .with_boundary(boundary);
         match ValidatedTargetLaunch::new(
             inputs,
             &self.target_store,

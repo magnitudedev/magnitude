@@ -765,6 +765,24 @@ pub fn take_all_cache<F: ProgramFamily>(domain: &ExecutorDomain<F>) -> crate::me
     ledger.change(|keeping| ledger.claim_units(&keeping.claims(), crate::memory::ledger::CommittedKind::Scratch, std::num::NonZeroU64::MIN, u64::MAX)).0
 }
 
+/// Claim all free room on `domain`'s device ledger without triggering any
+/// cache reclaimer, leaving bank cache above its floor untouched.
+pub fn take_non_bank_room<F: ProgramFamily>(domain: &ExecutorDomain<F>) -> crate::memory::ledger::Claim {
+    let ledger = domain.resources.ledgers().device();
+    let estimate = ledger.estimate();
+    let free = estimate.free().min(estimate.allocatable());
+    ledger
+        .change(|keeping| {
+            ledger.claim_units(
+                &keeping.claims(),
+                crate::memory::ledger::CommittedKind::Scratch,
+                std::num::NonZeroU64::MIN,
+                free,
+            )
+        })
+        .0
+}
+
 /// The growth rule's inputs: the decode the fake bank counted, the
 /// fixtures' read line, and the resident step it is priced on: 15 ms at every depth, its all-hit
 /// steps' time.
@@ -996,7 +1014,7 @@ impl<L, W, O> ProgramSubmission for PendingSubmission<L, W, O> {
 
 type HeadTestWork = PendingSubmission<
     crate::HeadLaunchCore,
-    (NativeGraphWorkspaceLease, Option<NativeGraphOutputLease>),
+    (NativeGraphWorkspaceLease, NativeGraphOutputLease),
     crate::programs::HeadOutput,
 >;
 
@@ -1106,14 +1124,14 @@ pub struct TestFamily {
 /// watcher, it is asked to shrink only in a gap: a shrink begins only while
 /// none of its `steps` runs.
 pub struct FakeBank {
-    slots: seismic::SlabTensor,
+    slots: Arc<seismic::SlabTensor>,
     resize: std::sync::Mutex<FakeResize>,
     pub(crate) decode: Option<magnitude_cost_model::LiveDecode>,
     steps: std::sync::atomic::AtomicUsize,
     /// A host tier's slots and the most it holds (none without a tier),
     /// each a byte of upload storage, and its growth's outcome until an
     /// advance reports it.
-    host: std::sync::atomic::AtomicU64,
+    host: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) host_ceiling: u64,
     host_grown: std::sync::Mutex<Option<BankResized>>,
     /// Its slots' and its host tier's last finished resizes
@@ -1134,7 +1152,7 @@ pub struct FakeBank {
     covers: std::sync::atomic::AtomicU64,
     /// What its slots above the floor hold on the domain's ledger, as the
     /// served bank's cache does.
-    cache: crate::experts::cache::BankCache,
+    cache: Arc<crate::experts::cache::BankCache>,
     /// The pool entries of the stores its host tier's slots lie in, which
     /// it charges their bytes as the backend charges a pool's blocks
     /// ([`Self::hold_cache`]).
@@ -1169,14 +1187,86 @@ enum FakeResize {
     Stopped(u64),
 }
 
+struct FakeBankReclaimer {
+    slots: Arc<seismic::SlabTensor>,
+    host: Arc<std::sync::atomic::AtomicU64>,
+    cache: std::sync::Weak<crate::experts::cache::BankCache>,
+    tier: crate::planning::BankTier,
+}
+
+impl crate::memory::ledger::CacheReclaimer for FakeBankReclaimer {
+    fn reclaim(&self, need: u64) -> Result<u64, crate::memory::ledger::ReclaimError> {
+        use crate::memory::ledger::ReclaimError;
+        if need == 0 {
+            return Ok(0);
+        }
+        let Some(cache) = self.cache.upgrade() else {
+            return Err(ReclaimError::AtFloor);
+        };
+        match self.tier {
+            crate::planning::BankTier::Bank => {
+                let row = self.slots.pool().granule();
+                let backed = self.slots.backed();
+                let at = backed.len() as u64;
+                if at <= 1 {
+                    return Err(ReclaimError::AtFloor);
+                }
+                let drop_slots = need.div_ceil(row).min(at - 1);
+                let to = at - drop_slots;
+                for &slot in backed.iter().rev().take(drop_slots as usize) {
+                    self.slots.free_slab(slot).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+                }
+                let returned = cache.changes().clone().back(|_| {
+                    let returned = self
+                        .slots
+                        .pool()
+                        .return_freed(drop_slots * row)
+                        .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+                    cache.fit(crate::BankHolding::Experts, to.saturating_sub(1) * row);
+                    Ok(returned)
+                })?;
+                match returned {
+                    0 => Err(ReclaimError::AtFloor),
+                    n => Ok(n),
+                }
+            }
+            crate::planning::BankTier::Host => {
+                let at = self.host.load(std::sync::atomic::Ordering::Acquire);
+                if at == 0 {
+                    return Err(ReclaimError::AtFloor);
+                }
+                let dropped = need.min(at);
+                let to = at - dropped;
+                self.host.store(to, std::sync::atomic::Ordering::Release);
+                cache.changes().clone().back(|_| cache.fit(crate::BankHolding::Host, to));
+                Ok(dropped)
+            }
+        }
+    }
+}
+
 impl FakeBank {
     pub fn new(slots: seismic::SlabTensor, changes: std::sync::Arc<crate::memory::ledger::Changes>) -> Self {
+        let slots = Arc::new(slots);
+        let host = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cache = Arc::new(crate::experts::cache::BankCache::new(changes));
+        for tier in [crate::planning::BankTier::Bank, crate::planning::BankTier::Host] {
+            cache.set_reclaimer(
+                tier,
+                Arc::new(FakeBankReclaimer {
+                    slots: Arc::clone(&slots),
+                    host: Arc::clone(&host),
+                    cache: Arc::downgrade(&cache),
+                    tier,
+                }),
+            );
+        }
         Self {
             slots,
             resize: std::sync::Mutex::new(FakeResize::Idle),
             decode: None,
             steps: std::sync::atomic::AtomicUsize::new(0),
-            host: std::sync::atomic::AtomicU64::new(0),
+            host,
             host_ceiling: 0,
             host_grown: std::sync::Mutex::new(None),
             last_resize: std::sync::Mutex::new(None),
@@ -1185,7 +1275,7 @@ impl FakeBank {
             refuse_tier_copy: false,
             tier_copy: std::sync::Mutex::new(None),
             covers: std::sync::atomic::AtomicU64::new(1),
-            cache: crate::experts::cache::BankCache::new(changes),
+            cache,
             pools: std::sync::OnceLock::new(),
             decided: std::sync::Mutex::new(Vec::new()),
             discarded: std::sync::Mutex::new(Vec::new()),
@@ -1217,7 +1307,11 @@ impl FakeBank {
             .expect("the fixture's ledger holds its bank");
         let above = committed.saturating_sub(1) * self.row();
         let cache = ledger
-            .cache(crate::memory::ledger::CacheKind::Bank, above, crate::memory::ledger::Reclaim::Deferred)
+            .cache(
+                crate::memory::ledger::CacheKind::Bank,
+                above,
+                self.cache.reclaim_for(crate::BankHolding::Experts),
+            )
             .expect("the fixture's ledger holds its bank");
         self.cache.hold(crate::BankHolding::Experts, cache);
     }

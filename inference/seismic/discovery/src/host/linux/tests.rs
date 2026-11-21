@@ -163,13 +163,21 @@ fn clean_cache_cold_and_swap_are_zero_where_meminfo_has_none() {
         (170 * 1024, 50 * 1024, 30 * 1024)
     );
     let with_shmem = sample_of(&format!(
-        "{MEMINFO}Active(file): 100 kB\nInactive(file): 100 kB\nDirty: 20 kB\nWriteback: 10 kB\nShmem: 80 kB\n"
+        "{MEMINFO}Active(file): 100 kB\nInactive(file): 100 kB\nDirty: 20 kB\nWriteback: 10 kB\nShmem: 80 kB\nMapped: 80 kB\n"
     ));
-    assert_eq!(with_shmem.supply.clean_cache, 90 * 1024, "Shmem is tmpfs/shm, not droppable clean cache");
+    assert_eq!(
+        with_shmem.supply.clean_cache,
+        170 * 1024,
+        "Shmem is on anon/unevictable LRU, never in Active(file)+Inactive(file); mapped Shmem must not reduce clean file cache"
+    );
     let with_mapped = sample_of(&format!(
-        "{MEMINFO}Active(file): 100 kB\nInactive(file): 100 kB\nDirty: 20 kB\nWriteback: 10 kB\nShmem: 50 kB\nMapped: 40 kB\n"
+        "{MEMINFO}Active(file): 100 kB\nInactive(file): 100 kB\nDirty: 20 kB\nWriteback: 10 kB\nShmem: 50 kB\nMapped: 90 kB\n"
     ));
-    assert_eq!(with_mapped.supply.clean_cache, 80 * 1024, "Mapped executables/libs are not droppable clean cache");
+    assert_eq!(
+        with_mapped.supply.clean_cache,
+        130 * 1024,
+        "only mapped regular-file pages (Mapped - Shmem = 40 kB) are excluded from clean cache"
+    );
 }
 
 /// With no PSI anywhere there is no pressure level; with the machine's
@@ -553,4 +561,78 @@ fn cpu_model_reads_cpuinfo_or_falls_back() {
 fn last_level_cache_is_unreported_without_sysfs() {
     let machine = Machine::new("no-cacheinfo");
     assert_eq!(last_level_cache(&*machine), CacheSize::UNREPORTED);
+}
+
+/// A binding cgroup charges `memory.current` synchronously: `lag.growth` is
+/// `Duration::ZERO` when its clean file cache is 0 OR when `free_beyond_target > 0`
+/// (headroom below `memory.max - floor`), and `FLUSH_TIME` (2 s) only when
+/// `free_beyond_target <= 0` and clean cache from `memory.stat` can be evicted.
+#[test]
+fn cgroup_growth_lag_is_zero_without_clean_cache() {
+    let machine = Machine::in_cgroup("cgroup-lag", "0::/worker\n", V2_MOUNT);
+    machine.file("/proc/meminfo", MEMINFO);
+    machine.file("/sys/fs/cgroup/worker/memory.max", &format!("{}\n", 4 * GB));
+    machine.file("/sys/fs/cgroup/worker/memory.current", &format!("{}\n", GB));
+    machine.file(
+        "/sys/fs/cgroup/worker/memory.stat",
+        "active_file 0\ninactive_file 0\nfile_dirty 0\nfile_writeback 0\n",
+    );
+    let no_cache = sample(&*machine);
+    assert_eq!(no_cache.total, 4 * GB, "cgroup binds over host");
+    assert_eq!(no_cache.supply.clean_cache, 0);
+    assert_eq!(no_cache.lag.growth, Duration::ZERO);
+
+    // Clean cache present, but `memory.current` (1 GiB) is well below
+    // `memory.max - floor` (4 GiB - 341 MiB), so `free_beyond_target > 0`
+    // and growth charges `memory.current` synchronously without evicting cache.
+    machine.file(
+        "/sys/fs/cgroup/worker/memory.stat",
+        "active_file 4096\ninactive_file 0\nfile_dirty 0\nfile_writeback 0\n",
+    );
+    let with_headroom = sample(&*machine);
+    assert_eq!(with_headroom.total, 4 * GB, "cgroup binds over host");
+    assert_eq!(with_headroom.supply.clean_cache, 4096);
+    assert!(with_headroom.supply.free_beyond_target > 0);
+    assert_eq!(with_headroom.lag.growth, Duration::ZERO);
+
+    // Once `memory.current` reaches `memory.max - floor` (`free_beyond_target <= 0`)
+    // and clean cache is present, growth can evict cache whose drop in
+    // `memory.stat` lags within `FLUSH_TIME` (2 s).
+    machine.file("/sys/fs/cgroup/worker/memory.current", &format!("{}\n", 4 * GB));
+    let at_limit = sample(&*machine);
+    assert_eq!(at_limit.total, 4 * GB, "cgroup binds over host");
+    assert_eq!(at_limit.supply.clean_cache, 4096);
+    assert!(at_limit.supply.free_beyond_target <= 0);
+    assert_eq!(at_limit.lag.growth, Duration::from_secs(2));
+}
+
+/// Regression: CUDA `cuMemHostAlloc` allocates multi-GiB `shmem` that Linux
+/// accounts on the anon/unevictable LRU (never `active_file + inactive_file`)
+/// while still counting mapped `shmem` in `file_mapped`. `v2_limit` must
+/// subtract only regular-file mappings (`file_mapped - shmem`), never `shmem`
+/// itself or `shmem` twice.
+#[test]
+fn v2_clean_cache_excludes_only_regular_file_mappings_not_shmem() {
+    let machine = Machine::in_cgroup("v2-cuda-shmem", "0::/worker\n", V2_MOUNT);
+    let limit = 45 * GB;
+    let current = 40 * GB;
+    let shmem = 9 * GB;
+    let regular_mapped = 512 * 1024 * 1024;
+    let file_mapped = shmem + regular_mapped;
+    let active_file = 6 * GB;
+    let inactive_file = 12 * GB;
+    machine.file("/sys/fs/cgroup/worker/memory.max", &format!("{limit}\n"));
+    machine.file("/sys/fs/cgroup/worker/memory.current", &format!("{current}\n"));
+    machine.file(
+        "/sys/fs/cgroup/worker/memory.stat",
+        &format!(
+            "active_file {active_file}\ninactive_file {inactive_file}\nfile_dirty 0\nfile_writeback 0\nshmem {shmem}\nfile_mapped {file_mapped}\n"
+        ),
+    );
+    let container = &limits(&*machine)[0];
+    assert_eq!(
+        container.reclaimable_bytes,
+        active_file + inactive_file - regular_mapped,
+        "9 GiB cuMemHostAlloc shmem must not be subtracted from 18 GiB droppable file cache"
+    );
 }

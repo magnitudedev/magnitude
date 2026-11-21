@@ -16,7 +16,7 @@
 use super::cases::scale_extent;
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, experts_text, row_points,
-    served_row_points,
+    served_row_points, served_row_points_up_to,
 };
 use crate::operators::routed::fused_graph::{TILE_ROWS, grouped_blocks};
 use crate::planning::{BankBinding, HINT_LEADS, HintWeight, RoutedBinding};
@@ -61,20 +61,33 @@ pub(crate) const DECODE_SERVED: Range<u64> = 1..VERIFY_ROWS + 1;
 /// The rows the grouped form serves: every row past the decode form.
 pub(crate) const GROUPED_SERVED: Range<u64> = VERIFY_ROWS + 1..u64::MAX;
 
+/// The smallest row count of a merged-pass grouped expert invocation:
+/// above `1024` rows, merged prompt passes amortize per-expert setup across
+/// multiple blocks per expert and compete in a different form regime from
+/// small-grouped launches (`9..1025`).
+pub(crate) const MERGED_PASS_FROM: u64 = 1025;
+
 /// The decode points: row counts the decode form serves.
 pub(crate) fn decode_points(limits: TuningLimits) -> Vec<PointShape> {
     served_row_points(limits, |rows| DECODE_SERVED.contains(&rows))
 }
 
-/// The grouped points: row counts past the decode form.
+/// The grouped points: row counts past the decode form, up to `limits.max_rows`.
 pub(crate) fn grouped_points(limits: TuningLimits) -> Vec<PointShape> {
     served_row_points(limits, |rows| GROUPED_SERVED.contains(&rows))
+}
+
+/// The grouped points for entries that execute merged prompt passes
+/// (`routed_experts`, `routed_experts_up`): row counts past the decode form,
+/// up to `limits.max_pass_rows`.
+pub(crate) fn grouped_pass_points(limits: TuningLimits) -> Vec<PointShape> {
+    served_row_points_up_to(limits.max_pass_rows, |rows| GROUPED_SERVED.contains(&rows))
 }
 
 /// Distinct experts per row with the uneven expert loads of real routing: the
 /// expert of popularity rank r is (p r) mod E, p the first of 101, 103 and 107
 /// that E is no multiple of (a permutation: p is prime; a bank's slot count
-/// may be a multiple of 101), with popularity 1 / sqrt(r + 1),
+/// may be a multiple of 101), with canonical Zipf popularity 1 / (r + 1),
 /// and each row draws its choices by popularity without replacement from a
 /// fixed-seed generator. A grouped point then holds blocks of every live-row
 /// count, from one row to full tiles, and experts with no rows.
@@ -85,7 +98,7 @@ pub(crate) fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
         .find(|prime| experts % prime != 0)
         .expect("an expert count is a multiple of none of 101, 103 and 107");
     let popularity = (0..experts)
-        .map(|rank| 1.0 / ((rank + 1) as f64).sqrt())
+        .map(|rank| 1.0 / (rank + 1) as f64)
         .collect::<Vec<_>>();
     let total = popularity.iter().sum::<f64>();
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
@@ -1699,7 +1712,11 @@ impl EntryTuning for RoutedExpertsTuning {
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        grouped_points(limits)
+        grouped_pass_points(limits)
+    }
+
+    fn row_regime_cuts(&self) -> &'static [u64] {
+        &[MERGED_PASS_FROM]
     }
 
     fn rotation(

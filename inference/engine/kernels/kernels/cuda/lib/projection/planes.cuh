@@ -60,13 +60,30 @@ __device__ __forceinline__ void stage(const Pro &pro, u32 K, element::Out<Act> r
     formation.finish(state, m, partials);
 }
 
+// Unpack lane's 32 staged activations for row m from quarter-major shared memory.
+__device__ __forceinline__ X load_staged(const uint4 *staged, u32 m, u32 lane) {
+    X x;
+#pragma unroll
+    for (u32 q = 0; q < 4; ++q) {
+        const uint4 w = staged[(m * 4 + q) * 32 + lane];
+        x.pair[4 * q + 0] = Act::unpack2(w.x);
+        x.pair[4 * q + 1] = Act::unpack2(w.y);
+        x.pair[4 * q + 2] = Act::unpack2(w.z);
+        x.pair[4 * q + 3] = Act::unpack2(w.w);
+    }
+    return x;
+}
+
 // The vocabulary GEMV of rows `first`.. (`rows` of them, at most MAXM):
 // ROWS vocabulary rows per warp, lane l reading group l of each
 // PROJECTION_PLANES_CHUNK-column chunk, whose activations are staged in
 // `staged` (PROJECTION_PLANES_ROWS x PROJECTION_PLANES_CHUNK A values,
 // quarter-major so a warp's 16-byte reads are conflict-free). Every row's
 // words are loaded first, so their loads are in flight together; each
-// group's codes are decoded once for every row.
+// group's codes are decoded once for every row. For MAXM <= 2, each row's
+// unpacked activations are held in registers and reused across all ROWS
+// vocabulary rows; larger MAXM reloads from shared memory per vocabulary
+// row to avoid register spills.
 template <u32 MAXM, u32 ROWS, class View, class Epi>
 __device__ __forceinline__ void scan(const u8 *source, u32 first, u32 rows, u32 vocabulary, u32 d, const View &view,
                                      const Epi &epi, uint4 *staged) {
@@ -96,23 +113,35 @@ __device__ __forceinline__ void scan(const u8 *source, u32 first, u32 rows, u32 
 #pragma unroll
         for (u32 r = 0; r < ROWS; ++r)
             group[r] = view.load(min(vocabulary_first + r, vocabulary - 1), g);
-#pragma unroll
-        for (u32 r = 0; r < ROWS; ++r) {
-            const auto codes = view.decode(group[r]);
+        if constexpr (MAXM <= 2) {
+            X xs[MAXM];
 #pragma unroll
             for (u32 m = 0; m < MAXM; ++m) {
                 if (m >= rows)
                     break;
-                X x;
+                xs[m] = load_staged(staged, m, lane);
+            }
 #pragma unroll
-                for (u32 q = 0; q < 4; ++q) {
-                    const uint4 w = staged[(m * 4 + q) * 32 + lane];
-                    x.pair[4 * q + 0] = Act::unpack2(w.x);
-                    x.pair[4 * q + 1] = Act::unpack2(w.y);
-                    x.pair[4 * q + 2] = Act::unpack2(w.z);
-                    x.pair[4 * q + 3] = Act::unpack2(w.w);
+            for (u32 r = 0; r < ROWS; ++r) {
+                const auto codes = view.decode(group[r]);
+#pragma unroll
+                for (u32 m = 0; m < MAXM; ++m) {
+                    if (m >= rows)
+                        break;
+                    acc[r][m] = view.add(acc[r][m], group[r], codes, xs[m], m, lane);
                 }
-                acc[r][m] = view.add(acc[r][m], group[r], codes, x, m, lane);
+            }
+        } else {
+#pragma unroll
+            for (u32 r = 0; r < ROWS; ++r) {
+                const auto codes = view.decode(group[r]);
+#pragma unroll
+                for (u32 m = 0; m < MAXM; ++m) {
+                    if (m >= rows)
+                        break;
+                    const X x = load_staged(staged, m, lane);
+                    acc[r][m] = view.add(acc[r][m], group[r], codes, x, m, lane);
+                }
             }
         }
     }

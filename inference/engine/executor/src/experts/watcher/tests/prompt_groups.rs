@@ -653,26 +653,41 @@ fn a_group_is_the_fewest_steps_covering_each_layers_stage() {
     let lines = vec![magnitude_cost_model::ExpertLines::reference(1_000_000); 2];
     let ms = Duration::from_millis;
     let mut facts = GroupFacts {
-        compute: vec![Some(ms(10)), None],
-        held: vec![56, 0],
-        alone: vec![0; 2],
-        read: vec![None; 2],
-        pulled: vec![None; 2],
-        unions: vec![None; 2],
-        bytes: vec![1_000_000; 2],
-        resident: None,
-        experts: vec![256; 2],
+        layers: vec![
+            LayerFacts {
+                compute: Some(ms(10)),
+                held: 56,
+                alone: 0,
+                read: None,
+                pulled: None,
+                union: None,
+                bytes: 1_000_000,
+                resident: None,
+                experts: 256,
+            },
+            LayerFacts {
+                compute: None,
+                held: 0,
+                alone: 0,
+                read: None,
+                pulled: None,
+                union: None,
+                bytes: 1_000_000,
+                resident: None,
+                experts: 256,
+            },
+        ],
         windows: 1,
     };
     assert_eq!(facts.group_size(Some(&lines), Some(line), Notice::Written, 16), 16, "layer 1 is unmeasured");
-    facts.compute[1] = Some(ms(40));
+    facts.layers[1].compute = Some(ms(40));
     assert_eq!(facts.group_size(None, Some(line), Notice::Written, 16), 16, "the lines are unpriced");
     // Layer 0: 1 ms + 200 MB at 1 GB/s, then 200 moves of 1 MB records,
     // 44.56 µs each, 209.912 ms over 10 ms: 21 steps; layer 1: 268.407 ms over
     // 40 ms: 7.
     assert_eq!(facts.group_size(Some(&lines), Some(line), Notice::Written, 32), 21);
     assert_eq!(facts.group_size(Some(&lines), Some(line), Notice::Written, 16), 16);
-    facts.held[0] = 256;
+    facts.layers[0].held = 256;
     assert_eq!(facts.group_size(Some(&lines), Some(line), Notice::Written, 16), 7);
 }
 
@@ -683,15 +698,30 @@ fn a_group_is_the_fewest_steps_covering_each_layers_stage() {
 #[test]
 fn a_layers_read_is_what_the_last_group_to_end_there_read() {
     let mut facts = GroupFacts {
-        compute: vec![Some(Duration::from_millis(10)); 2],
-        held: vec![56, 0],
-        alone: vec![0; 2],
-        read: vec![None; 2],
-        pulled: vec![None; 2],
-        unions: vec![None; 2],
-        bytes: vec![1_000_000; 2],
-        resident: None,
-        experts: vec![256; 2],
+        layers: vec![
+            LayerFacts {
+                compute: Some(Duration::from_millis(10)),
+                held: 56,
+                alone: 0,
+                read: None,
+                pulled: None,
+                union: None,
+                bytes: 1_000_000,
+                resident: None,
+                experts: 256,
+            },
+            LayerFacts {
+                compute: Some(Duration::from_millis(10)),
+                held: 0,
+                alone: 0,
+                read: None,
+                pulled: None,
+                union: None,
+                bytes: 1_000_000,
+                resident: None,
+                experts: 256,
+            },
+        ],
         windows: 1,
     };
     let moved = |facts: &GroupFacts| {
@@ -699,13 +729,16 @@ fn a_layers_read_is_what_the_last_group_to_end_there_read() {
         terms.iter().map(|layer| (layer.filed, layer.tiered)).collect::<Vec<_>>()
     };
     assert_eq!(moved(&facts), [(200, 0), (256, 0)]);
-    facts.read[0] = Some(3);
+    facts.layers[0].read = Some(3);
     assert_eq!(moved(&facts), [(3, 0), (256, 0)]);
-    facts.alone = vec![10, 6];
+    facts.layers[0].alone = 10;
+    facts.layers[1].alone = 6;
     assert_eq!(moved(&facts), [(3, 0), (256, 0)], "without pulls the tier's experts are read");
-    facts.resident = Some(vec![2_000_000; 2]);
+    for layer in &mut facts.layers {
+        layer.resident = Some(2_000_000);
+    }
     assert_eq!(moved(&facts), [(3, 10), (250, 6)]);
-    facts.pulled[1] = Some(4);
+    facts.layers[1].pulled = Some(4);
     assert_eq!(moved(&facts)[1], (250, 4));
 }
 
@@ -716,25 +749,30 @@ fn a_layers_read_is_what_the_last_group_to_end_there_read() {
 #[test]
 fn an_unpriced_group_splits_only_before_cold_experts() {
     let mut facts = GroupFacts {
-        compute: vec![None; 4],
-        held: vec![256; 4],
-        alone: vec![0; 4],
-        read: vec![None; 4],
-        pulled: vec![None; 4],
-        unions: vec![None; 4],
-        bytes: vec![1_000_000; 4],
-        resident: Some(vec![2_000_000; 4]),
-        experts: vec![256; 4],
+        layers: vec![
+            LayerFacts {
+                compute: None,
+                held: 256,
+                alone: 0,
+                read: None,
+                pulled: None,
+                union: None,
+                bytes: 1_000_000,
+                resident: Some(2_000_000),
+                experts: 256,
+            };
+            4
+        ],
         windows: 1,
     };
     assert_eq!(facts.merge_sets(None, None, None, Notice::Written, 6), [6, 6, 6, 6], "a group with nothing cold");
-    facts.pulled[2] = Some(52);
+    facts.layers[2].pulled = Some(52);
     assert_eq!(facts.merge_sets(None, None, None, Notice::Written, 6), [6, 5, 6, 6], "the pulls before layer 2");
     facts.windows = 2;
     assert_eq!(facts.merge_sets(None, None, None, Notice::Written, 6), [6, 6, 6, 6], "a windowed scratch tier merges every layer whole");
     facts.windows = 1;
-    facts.pulled[2] = Some(0);
-    facts.held[3] = 200;
+    facts.layers[2].pulled = Some(0);
+    facts.layers[3].held = 200;
     assert_eq!(facts.merge_sets(None, None, None, Notice::Written, 6), [6, 6, 5, 6], "the reads before layer 3");
     assert_eq!(facts.merge_sets(None, None, None, Notice::Written, 1), [1; 4]);
 }

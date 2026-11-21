@@ -1457,3 +1457,64 @@ fn metal_stream_mix_down_stages_activations_without_changing_a_bit() {
         }
     }
 }
+
+/// Metal `stream_mix_up` at a 64-aligned, non-128-aligned rank (Qwen3.8's
+/// `LR = 320`): admits `TALL = 1` with `TALL_K = 64` at its declared defaults,
+/// refuses `TALL = 1` with `TALL_K = 128`, and matches the host reference past
+/// 64 rows.
+#[test]
+fn metal_stream_mix_up_admits_tall_k64_at_rank_320() {
+    let Some(device) = devices().into_iter().find(|device| device.backend() == seismic::BackendName::Metal) else {
+        return;
+    };
+    let case = Case::new((2560, 4, 320), 1, 70);
+    let (s, h, r, rows, width) = (case.s, case.h, case.r, case.rows, case.width());
+    let statics = case.statics();
+    let entry = stream_mix_up::native_entry_with(stream_mix_up::Elements {
+        UW: seismic::Element::bf16(),
+        NW: seismic::Element::f32(),
+        A: seismic::Element::bf16(),
+    });
+    let specialization = declared::declared(&device, &entry, |name| {
+        statics[..3]
+            .iter()
+            .find(|(given, _)| *given == name)
+            .unwrap_or_else(|| panic!("static {name} is given"))
+            .1
+    }, &[])
+    .unwrap();
+    let tall = crate::common::metal_launch::<stream_mix_up::Entry>("tall");
+    assert_eq!(specialization.param("TALL"), Some(1), "stream_mix_up at LR=320 admits TALL=1");
+    assert_eq!(
+        specialization.launch_param(tall, "TALL_K"),
+        Some(64),
+        "stream_mix_up at LR=320 selects TALL_K=64"
+    );
+    let invalid = specialization.clone().with_launch_param(tall, "TALL_K", 128);
+    assert!(
+        declared::declared_at(&device, &entry, &invalid).is_err(),
+        "stream_mix_up at LR=320 refuses TALL=1, TALL_K=128"
+    );
+    let expected = case.host();
+    let low = expected[0].iter().map(|v| *v as f32).collect::<Vec<_>>();
+    let inverse = expected[2].iter().map(|v| *v as f32).collect::<Vec<_>>();
+    let charges = seismic::Charges::tally(&device);
+    let gated = entry
+        .prepare(&device, &specialization)
+        .unwrap()
+        .call(&charges, stream_mix_up::Args {
+            low: &tensor(&device, DType::BF16, &[rows, r], &low),
+            up_weight: &tensor(&device, DType::BF16, &[width, r], &case.up),
+            hidden: &tensor(&device, DType::F32, &[rows, s, h], &case.hidden),
+            inverse: &tensor(&device, DType::F32, &[rows, s], &inverse),
+            norm: &tensor(&device, DType::F32, &[s, h], &case.norm),
+        })
+        .unwrap();
+    assert_close(
+        "Metal stream_mix_up TALL=1 TALL_K=64",
+        &read(&gated.value, DType::F32),
+        &expected[3],
+        1e-6,
+        1e-4,
+    );
+}

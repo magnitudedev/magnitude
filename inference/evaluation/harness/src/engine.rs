@@ -309,6 +309,58 @@ fn between_steps<F: ProgramFamily>(
     }
 }
 
+/// Run a memory-claiming operation on `domain` through the scheduler's one
+/// relief path ([`relieve`]), taking cache alone (the run's sequences are
+/// never preempted), and advancing pending background releases at a step
+/// boundary until the claim succeeds or fails without relief.
+fn with_relief<F: ProgramFamily, T>(
+    domain: &mut magnitude_executor::ExecutorDomain<F>,
+    memory: &mut BetweenFlights,
+    bindings: &mut StateBindings,
+    now: impl Fn() -> Result<u64, String>,
+    mut attempt: impl FnMut(&mut magnitude_executor::ExecutorDomain<F>, &mut StateBindings) -> Result<T, DomainError>,
+) -> Result<T, String> {
+    loop {
+        let first = attempt(domain, bindings);
+        let at = now()?;
+        let mut host = Unrequested { domain, memory, now: at };
+        let relieved = relieve(&mut host, bindings, first, false, |host, bindings| {
+            Ok(attempt(host.domain(), bindings))
+        })
+        .map_err(|error| error.to_string())?;
+        match relieved.current {
+            Ok(value) => return Ok(value),
+            Err(DomainError::Capacity(_)) if relieved.pending => {
+                between_steps(domain, memory, bindings, at)?;
+                std::thread::yield_now();
+            }
+            Err(error) => return Err(text(error)),
+        }
+    }
+}
+
+/// Open `request`'s state (fresh, or resumed from `from`) through
+/// [`with_relief`], as the service's owner does (`Service::make_resident`):
+/// when valued cache such as the expert bank holds room above its floor,
+/// cache relief shrinks it to cover the opening reservation instead of
+/// failing with `DomainError::Capacity`.
+fn open_request_state<F: ProgramFamily>(
+    domain: &mut magnitude_executor::ExecutorDomain<F>,
+    memory: &mut BetweenFlights,
+    bindings: &mut StateBindings,
+    request: RequestId,
+    from: Option<&ResumeState>,
+    rows: u64,
+    now: impl Fn() -> Result<u64, String>,
+) -> Result<(), String> {
+    with_relief(domain, memory, bindings, now, |domain, bindings| {
+        let unchained = domain
+            .unchained(bindings)
+            .expect("no chain is under way between the harness's steps");
+        domain.open_state(unchained, request, from, rows).map(|_| ())
+    })
+}
+
 /// One open request and its accepted position.
 pub struct Sequence {
     pub request: RequestId,
@@ -496,6 +548,7 @@ impl Engine {
         self.next_request += 1;
         self.domain
             .install_input(request, PreparedModelInput::continuation_only())?;
+        let opened = self.opened;
         let bindings = self
             .bindings
             .as_mut()
@@ -503,10 +556,21 @@ impl Engine {
         // The harness runs no chain between its steps. A sequence opens
         // holding the rows it resumes and a launch's rows ahead, as the
         // service's requests do; its steps reserve ahead as they go
-        // ([`Self::provision`]).
-        let unchained = self.domain.unchained(bindings).expect("no chain is under way between the harness's steps");
+        // ([`Self::provision`]). Short of memory, opening relieves cache
+        // through the scheduler's one relief path ([`open_request_state`]).
         let rows = from.map_or(0, ResumeState::position) as u64;
-        self.domain.open_state(unchained, request, from, rows).map_err(text)?;
+        if let Err(error) = open_request_state(
+            &mut self.domain,
+            &mut self.memory,
+            bindings,
+            request,
+            from,
+            rows,
+            || u64::try_from(opened.elapsed().as_nanos()).map_err(|_| "the run outlasts the clock".into()),
+        ) {
+            let _ = self.domain.close(request);
+            return Err(error);
+        }
         Ok(request)
     }
 
@@ -689,22 +753,14 @@ impl Engine {
     /// taking cache alone (the run's sequences are never preempted), and
     /// waits at the next boundary for a shrink that relief owes it.
     pub(crate) fn provision(&mut self, bindings: &mut StateBindings, operations: &[Operation]) -> Result<(), String> {
-        loop {
-            let first = self.domain.provision(bindings, operations, None);
-            let now = u64::try_from(self.opened.elapsed().as_nanos()).map_err(|_| "the run outlasts the clock")?;
-            let mut host = Unrequested { domain: &mut self.domain, memory: &mut self.memory, now };
-            let relieved = relieve(&mut host, bindings, first, false, |host, bindings| {
-                Ok(host.domain().provision(bindings, operations, None))
-            })
-            .map_err(|error| error.to_string())?;
-            match relieved.current {
-                Ok(()) => return Ok(()),
-                Err(magnitude_executor::DomainError::Capacity(_)) if relieved.pending => {
-                    between_steps(&mut self.domain, &mut self.memory, bindings, now)?;
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        }
+        let opened = self.opened;
+        with_relief(
+            &mut self.domain,
+            &mut self.memory,
+            bindings,
+            || u64::try_from(opened.elapsed().as_nanos()).map_err(|_| "the run outlasts the clock".into()),
+            |domain, bindings| domain.provision(bindings, operations, None),
+        )
     }
 
     /// One submission of `step`'s forwards: none where the flight was
@@ -998,6 +1054,71 @@ mod tests {
             assert_eq!(slots.last(), Some(&4), "grown to every expert: {slots:?}");
             let grown = slots.windows(2).filter(|pair| pair[1] != pair[0]).count();
             assert_eq!(grown, 1, "one step: {slots:?}");
+        }
+    }
+
+    /// Opening a sequence when device free room is exhausted but the expert
+    /// bank holds slots above its floor must relieve bank cache through the
+    /// scheduler's relief path instead of failing with `DomainError::Capacity`
+    /// (as happened between `logits` batches after bank growth).
+    #[test]
+    fn opening_a_sequence_relieves_bank_cache_when_device_room_is_tight() {
+        use magnitude_executor::fixtures::take_non_bank_room;
+        for backend in bank_backends() {
+            let (mut domain, mut bindings) = banked(backend, 4, 4);
+            // Open a first sequence so the pre-reserved request slot is held
+            // and the second sequence must draw from free room or cache.
+            let first = RequestId(1);
+            domain.install_input(first, PreparedModelInput::continuation_only()).unwrap();
+            let mut memory = BetweenFlights::new();
+            open_request_state(&mut domain, &mut memory, &mut bindings, first, None, 0, || Ok(0)).unwrap();
+
+            // Claim all non-bank room so only the 3 reclaimable bank slots
+            // above the 1-slot floor remain.
+            let _held = take_non_bank_room(&domain);
+            assert_eq!(domain.expert_bank_slots(), Some(4), "{backend:?}: bank still at 4 slots before open");
+
+            // A direct `open_state` fails with `Capacity` because `Ledger::reserve`
+            // does not reclaim valued `CacheKind::Bank` cache.
+            let second = RequestId(2);
+            domain.install_input(second, PreparedModelInput::continuation_only()).unwrap();
+            let unchained = domain.unchained(&mut bindings).unwrap();
+            assert!(
+                matches!(domain.open_state(unchained, second, None, 0), Err(DomainError::Capacity(_))),
+                "{backend:?}: direct open_state fails with Capacity when only bank cache can cover it"
+            );
+
+            // Opening through `open_request_state` relieves the bank and succeeds.
+            open_request_state(&mut domain, &mut memory, &mut bindings, second, None, 0, || Ok(0)).unwrap();
+            assert!(
+                domain.expert_bank_slots().unwrap() < 4,
+                "{backend:?}: bank shrank to relieve the opening reservation"
+            );
+            domain.close(second).unwrap();
+            domain.close(first).unwrap();
+        }
+    }
+
+    /// When no reclaimable cache can cover an opening reservation (the bank is
+    /// already at its floor and all free room is held), `open_request_state`
+    /// terminates immediately and propagates the capacity error.
+    #[test]
+    fn opening_a_sequence_propagates_capacity_when_no_relief_covers_it() {
+        for backend in bank_backends() {
+            let (mut domain, mut bindings) = banked(backend, 1, 1);
+            let first = RequestId(1);
+            domain.install_input(first, PreparedModelInput::continuation_only()).unwrap();
+            let mut memory = BetweenFlights::new();
+            open_request_state(&mut domain, &mut memory, &mut bindings, first, None, 0, || Ok(0)).unwrap();
+
+            let _taken = magnitude_executor::fixtures::take_all_cache(&domain);
+            let second = RequestId(2);
+            domain.install_input(second, PreparedModelInput::continuation_only()).unwrap();
+            let error = open_request_state(&mut domain, &mut memory, &mut bindings, second, None, 0, || Ok(0))
+                .expect_err("a capacity shortfall with no reclaimable cache fails cleanly");
+            assert!(error.contains("requires"), "{backend:?}: unexpected error: {error}");
+            domain.close(second).unwrap();
+            domain.close(first).unwrap();
         }
     }
 }

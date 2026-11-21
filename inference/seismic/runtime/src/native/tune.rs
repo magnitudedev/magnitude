@@ -2821,15 +2821,18 @@ fn medians(measured: &[PointMeasurement]) -> Vec<f64> {
 #[derive(Clone, Debug, PartialEq)]
 enum ContenderStanding {
     /// Measured and admitted at the timed points; not yet through
-    /// [`Stage::Promote`].
-    Measured,
+    /// [`Stage::Promote`]. `against` is the choice it was compared with in
+    /// matched rounds, and `evidence` is what those rounds have shown. A
+    /// lead is one over that choice: rounds beside a choice since replaced
+    /// say nothing of the one served now.
+    Measured {
+        against: Configuration,
+        evidence: Tally,
+    },
     /// Its comparison with a choice that was served resolved as a trail
     /// ([`Verdict::Trails`]): it is slower than that choice, and than any
     /// choice that replaced it.
     Trailing,
-    /// It could not be formed or sampled again for its conversion, or it
-    /// failed a coverage witness.
-    Rejected(Exclusion),
     /// Served now or earlier: the defaults, and every challenger promoted.
     Served,
 }
@@ -2837,11 +2840,6 @@ enum ContenderStanding {
 /// A configuration measured and admitted at the timed points.
 struct Contender {
     specialization: NativeSpecialization,
-    /// Its formed kernel, held only while it serves or leads
-    /// ([`Ledger::release`]): a measured configuration that does neither
-    /// owns nothing on the device. What stays of it is its identity and
-    /// its measurements; a later conversion forms it again.
-    kernel: Option<Arc<NativePrepared>>,
     /// The identity of its formed artifact.
     artifact: String,
     /// What its launches' programs use ([`NativePrepared::launch_programs`]).
@@ -2855,12 +2853,25 @@ struct Contender {
     confirmed: Vec<PointMeasurement>,
     /// Its cost relative to the defaults' measurement.
     cost: Cost,
-    /// The choice it was compared with in matched rounds, and what those
-    /// rounds have shown. A lead is one over that choice: rounds beside a
-    /// choice since replaced say nothing of the one served now.
-    against: Configuration,
-    evidence: Tally,
     standing: ContenderStanding,
+}
+
+/// One configuration reached by the search, with how it was first formed
+/// (for challengers) and its outcome.
+struct Entry {
+    formation: Option<FormationRecord>,
+    outcome: EntryOutcome,
+}
+
+enum EntryOutcome {
+    Contender(Contender),
+    /// A configuration that could not be formed, run, admitted, re-formed
+    /// for conversion, or qualified at every coverage witness.
+    Excluded {
+        artifact: Option<String>,
+        launches: Vec<Option<seismic_native_target::LaunchProgram>>,
+        exclusion: Exclusion,
+    },
 }
 
 /// Every configuration a unit's search reached, and the choice it serves.
@@ -2870,18 +2881,12 @@ struct Contender {
 struct Ledger {
     /// In the order reached.
     order: Vec<Configuration>,
-    contenders: BTreeMap<Configuration, Contender>,
-    /// Configurations that could not be formed, run or admitted, each with
-    /// its artifact when one was formed.
-    excluded: BTreeMap<Configuration, (Option<String>, Exclusion)>,
+    entries: BTreeMap<Configuration, Entry>,
     incumbent: Configuration,
     /// Every choice served, in turn: the defaults, then each promotion.
     served: Vec<Configuration>,
     /// Leaders that failed a coverage witness.
     failed: usize,
-    /// Conversions begun, and those that ended in a promotion.
-    conversions: usize,
-    promotions: usize,
     /// How often a resolved comparison of a challenger with the served
     /// choice may be wrong.
     settings: SearchSettings,
@@ -2895,10 +2900,11 @@ struct Ledger {
     /// work of a conversion.
     resolved: BTreeSet<(Gain, Configuration)>,
     nominal: BTreeSet<(Gain, Configuration)>,
-    /// The challengers that hold a formed kernel.
-    holding: BTreeSet<Configuration>,
-    /// How each challenger was formed before it was first measured.
-    formations: BTreeMap<Configuration, FormationRecord>,
+    /// The formed kernels currently held on the device: the served choice's,
+    /// and any challenger's that has not yet been released
+    /// ([`Ledger::release`]). A configuration not present here owns nothing
+    /// on the device; a later conversion forms it again.
+    kernels: BTreeMap<Configuration, Arc<NativePrepared>>,
 }
 
 /// What a challenger gains on the served choice over the points that tell
@@ -2929,54 +2935,100 @@ impl Ledger {
         settings: SearchSettings,
     ) -> Self {
         let incumbent = Configuration::of(default);
+        let artifact = kernel.artifact().0.clone();
+        let launches = kernel.launch_programs();
         Self {
             settings,
             resolved: BTreeSet::new(),
             nominal: BTreeSet::new(),
-            holding: BTreeSet::new(),
-            formations: BTreeMap::new(),
+            kernels: BTreeMap::from([(incumbent.clone(), kernel)]),
             order: vec![incumbent.clone()],
-            contenders: BTreeMap::from([(
+            entries: BTreeMap::from([(
                 incumbent.clone(),
-                Contender {
-                    specialization: default.clone(),
-                    artifact: kernel.artifact().0.clone(),
-                    launches: kernel.launch_programs(),
-                    kernel: Some(kernel),
-                    points: canonical,
-                    confirmed: Vec::new(),
-                    cost,
-                    against: incumbent.clone(),
-                    evidence: Tally::default(),
-                    standing: ContenderStanding::Served,
+                Entry {
+                    formation: None,
+                    outcome: EntryOutcome::Contender(Contender {
+                        specialization: default.clone(),
+                        artifact,
+                        launches,
+                        points: canonical,
+                        confirmed: Vec::new(),
+                        cost,
+                        standing: ContenderStanding::Served,
+                    }),
                 },
             )]),
-            excluded: BTreeMap::new(),
             served: vec![incumbent.clone()],
             incumbent,
             failed: 0,
-            conversions: 0,
-            promotions: 0,
+        }
+    }
+
+    fn contender(&self, configuration: &Configuration) -> &Contender {
+        match &self.entries[configuration].outcome {
+            EntryOutcome::Contender(contender) => contender,
+            EntryOutcome::Excluded { .. } => {
+                panic!("expected a contender, found an excluded configuration")
+            }
+        }
+    }
+
+    fn contender_mut(&mut self, configuration: &Configuration) -> &mut Contender {
+        match &mut self
+            .entries
+            .get_mut(configuration)
+            .expect("configuration is in the ledger")
+            .outcome
+        {
+            EntryOutcome::Contender(contender) => contender,
+            EntryOutcome::Excluded { .. } => {
+                panic!("expected a contender, found an excluded configuration")
+            }
         }
     }
 
     fn incumbent(&self) -> &Contender {
-        &self.contenders[&self.incumbent]
+        self.contender(&self.incumbent)
+    }
+
+    fn kernel(&self, configuration: &Configuration) -> Option<&Arc<NativePrepared>> {
+        self.kernels.get(configuration)
+    }
+
+    fn incumbent_kernel(&self) -> &Arc<NativePrepared> {
+        self.kernels
+            .get(&self.incumbent)
+            .expect("the served choice holds its kernel")
+    }
+
+    fn measured_contenders(&self) -> impl Iterator<Item = (&Configuration, &Contender)> {
+        self.entries
+            .iter()
+            .filter_map(|(configuration, entry)| match &entry.outcome {
+                EntryOutcome::Contender(contender)
+                    if matches!(contender.standing, ContenderStanding::Measured { .. }) =>
+                {
+                    Some((configuration, contender))
+                }
+                _ => None,
+            })
     }
 
     /// What `contender`'s matched rounds beside the choice served now have
     /// shown: nothing, when its rounds were beside another.
     fn evidence(&self, contender: &Contender) -> Tally {
-        if contender.against == self.incumbent {
-            contender.evidence
-        } else {
-            Tally::default()
+        match &contender.standing {
+            ContenderStanding::Measured { against, evidence } if *against == self.incumbent => {
+                *evidence
+            }
+            _ => Tally::default(),
         }
     }
 
     fn measured(
         &mut self,
         specialization: NativeSpecialization,
+        formation: Option<FormationRecord>,
         kernel: Arc<NativePrepared>,
         points: Vec<PointMeasurement>,
         cost: Cost,
@@ -2985,6 +3037,7 @@ impl Ledger {
         let artifact = kernel.artifact().0.clone();
         self.record(
             specialization,
+            formation,
             artifact,
             Some(kernel),
             points,
@@ -2996,9 +3049,11 @@ impl Ledger {
     /// Record a configuration measured and admitted at the timed points
     /// beside the served choice, where its rounds showed `evidence`, formed
     /// as `artifact`, and rank it against that choice.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         specialization: NativeSpecialization,
+        formation: Option<FormationRecord>,
         artifact: String,
         kernel: Option<Arc<NativePrepared>>,
         points: Vec<PointMeasurement>,
@@ -3007,22 +3062,29 @@ impl Ledger {
     ) {
         let configuration = Configuration::of(&specialization);
         self.order.push(configuration.clone());
-        if kernel.is_some() {
-            self.holding.insert(configuration.clone());
+        let launches = kernel
+            .as_deref()
+            .map(NativePrepared::launch_programs)
+            .unwrap_or_default();
+        if let Some(kernel) = kernel {
+            self.kernels.insert(configuration.clone(), kernel);
         }
-        self.contenders.insert(
+        self.entries.insert(
             configuration.clone(),
-            Contender {
-                specialization,
-                artifact,
-                launches: kernel.as_deref().map(NativePrepared::launch_programs).unwrap_or_default(),
-                kernel,
-                points,
-                confirmed: Vec::new(),
-                cost,
-                against: self.incumbent.clone(),
-                evidence,
-                standing: ContenderStanding::Measured,
+            Entry {
+                formation,
+                outcome: EntryOutcome::Contender(Contender {
+                    specialization,
+                    artifact,
+                    launches,
+                    points,
+                    confirmed: Vec::new(),
+                    cost,
+                    standing: ContenderStanding::Measured {
+                        against: self.incumbent.clone(),
+                        evidence,
+                    },
+                }),
             },
         );
         self.rank(&configuration);
@@ -3035,15 +3097,12 @@ impl Ledger {
     /// ranked again.
     fn rank(&mut self, configuration: &Configuration) {
         let incumbent = self.incumbent();
-        let contender = &self.contenders[configuration];
+        let contender = self.contender(configuration);
         let verdict = self.evidence(contender).verdict(self.settings.error_rate);
         let gain = Gain(contender.cost.gain_over(&incumbent.cost));
         match verdict {
             Some(Verdict::Trails) => {
-                self.contenders
-                    .get_mut(configuration)
-                    .expect("a ranked configuration is a contender")
-                    .standing = ContenderStanding::Trailing;
+                self.contender_mut(configuration).standing = ContenderStanding::Trailing;
             }
             Some(Verdict::Leads) => {
                 self.resolved.insert((gain, configuration.clone()));
@@ -3061,9 +3120,7 @@ impl Ledger {
         self.resolved.clear();
         self.nominal.clear();
         let measured = self
-            .contenders
-            .iter()
-            .filter(|(_, contender)| contender.standing == ContenderStanding::Measured)
+            .measured_contenders()
             .map(|(configuration, _)| configuration.clone())
             .collect::<Vec<_>>();
         for configuration in measured {
@@ -3081,11 +3138,41 @@ impl Ledger {
 
     /// `leader` holds `kernel`, formed again for its conversion.
     fn hold(&mut self, leader: &Configuration, kernel: Arc<NativePrepared>) {
-        self.contenders
-            .get_mut(leader)
-            .expect("the leader is a contender")
-            .kernel = Some(kernel);
-        self.holding.insert(leader.clone());
+        assert!(
+            matches!(
+                self.entries.get(leader).map(|entry| &entry.outcome),
+                Some(EntryOutcome::Contender(_))
+            ),
+            "the leader is a contender"
+        );
+        self.kernels.insert(leader.clone(), kernel);
+    }
+
+    /// Reject a contender that could not be re-formed, sampled for
+    /// conversion, or qualified at every coverage witness.
+    fn reject(&mut self, configuration: &Configuration, exclusion: Exclusion) {
+        self.kernels.remove(configuration);
+        let entry = self
+            .entries
+            .get_mut(configuration)
+            .expect("a rejected configuration is in the ledger");
+        let EntryOutcome::Contender(contender) = &mut entry.outcome else {
+            panic!("a rejected configuration is a contender");
+        };
+        let artifact = Some(std::mem::take(&mut contender.artifact));
+        let launches = std::mem::take(&mut contender.launches);
+        entry.outcome = EntryOutcome::Excluded {
+            artifact,
+            launches,
+            exclusion,
+        };
+    }
+
+    /// Promote `leader` to be the served choice.
+    fn promote(&mut self, leader: Configuration) {
+        self.contender_mut(&leader).standing = ContenderStanding::Served;
+        self.served.push(leader.clone());
+        self.incumbent = leader;
     }
 
     /// Release the kernel of every configuration that neither serves nor
@@ -3093,28 +3180,23 @@ impl Ledger {
     /// resolved or nominal, are the only kernels a unit holds between
     /// pieces of work.
     fn release(&mut self) {
-        let leaders = [
-            Some(self.incumbent.clone()),
-            self.leader().cloned(),
-            self.nominal().map(|(leader, _)| leader.clone()),
-        ];
         let Self {
-            holding,
-            contenders,
+            incumbent,
+            resolved,
+            nominal,
+            kernels,
             ..
         } = self;
-        holding.retain(|configuration| {
-            let held = leaders
+        let leaders = [
+            Some(&*incumbent),
+            resolved.first().map(|(_, leader)| leader),
+            nominal.first().map(|(_, leader)| leader),
+        ];
+        kernels.retain(|configuration, _| {
+            leaders
                 .iter()
                 .flatten()
-                .any(|leader| leader == configuration);
-            if !held {
-                contenders
-                    .get_mut(configuration)
-                    .expect("a holder is a contender")
-                    .kernel = None;
-            }
-            held
+                .any(|leader| *leader == configuration)
         });
     }
 
@@ -3123,13 +3205,21 @@ impl Ledger {
     fn exclude(
         &mut self,
         configuration: Configuration,
+        formation: Option<FormationRecord>,
         kernel: Option<&NativePrepared>,
         exclusion: Exclusion,
     ) {
         self.order.push(configuration.clone());
-        self.excluded.insert(
+        self.entries.insert(
             configuration,
-            (kernel.map(|kernel| kernel.artifact().0.clone()), exclusion),
+            Entry {
+                formation,
+                outcome: EntryOutcome::Excluded {
+                    artifact: kernel.map(|kernel| kernel.artifact().0.clone()),
+                    launches: Vec::new(),
+                    exclusion,
+                },
+            },
         );
     }
 
@@ -3158,34 +3248,28 @@ impl Ledger {
         self.order
             .iter()
             .map(|configuration| {
-                let launches = self
-                    .contenders
-                    .get(configuration)
-                    .map(|contender| contender.launches.clone())
-                    .unwrap_or_default();
-                let (artifact, outcome) = match (
-                    self.contenders.get(configuration),
-                    self.excluded.get(configuration),
-                ) {
-                    (Some(contender), _) => (
+                let entry = &self.entries[configuration];
+                let (launches, artifact, outcome) = match &entry.outcome {
+                    EntryOutcome::Contender(contender) => (
+                        contender.launches.clone(),
                         Some(contender.artifact.clone()),
-                        match &contender.standing {
-                            ContenderStanding::Rejected(exclusion) => {
-                                Outcome::Excluded(exclusion.clone())
-                            }
-                            _ => Outcome::Measured {
-                                points: contender.points.clone(),
-                                confirmed: contender.confirmed.clone(),
-                            },
+                        Outcome::Measured {
+                            points: contender.points.clone(),
+                            confirmed: contender.confirmed.clone(),
                         },
                     ),
-                    (None, Some((artifact, exclusion))) => {
-                        (artifact.clone(), Outcome::Excluded(exclusion.clone()))
-                    }
-                    (None, None) => unreachable!("every configuration reached has an outcome"),
+                    EntryOutcome::Excluded {
+                        artifact,
+                        launches,
+                        exclusion,
+                    } => (
+                        launches.clone(),
+                        artifact.clone(),
+                        Outcome::Excluded(exclusion.clone()),
+                    ),
                 };
                 ConfigurationRecord {
-                    formation: self.formations.get(configuration).copied(),
+                    formation: entry.formation,
                     launches,
                     configuration: configuration.clone(),
                     observations: artifact
@@ -4221,14 +4305,14 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 let mut conversion = rebuilt;
                 conversion.add(most_bytes(&self.conversion_bytes), 1);
                 if let Some(leader) = searching.ledger.leader() {
-                    let leader = &searching.ledger.contenders[leader];
+                    let contender = searching.ledger.contender(leader);
                     return Some(Work {
                         stage: Stage::Promote,
                         quote: self
                             .promotion_quote(searching, incumbent, leader)
                             .and(rebuilding),
                         forming: Quote::default(),
-                        opportunity: leader.cost.gain_over(&incumbent.cost),
+                        opportunity: contender.cost.gain_over(&incumbent.cost),
                         footprint: conversion,
                     });
                 }
@@ -4238,7 +4322,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 let confirm = ledger.nominal().map(|(leader, lead)| Work {
                     stage: Stage::Confirm,
                     quote: self
-                        .promotion_quote(searching, incumbent, &ledger.contenders[leader])
+                        .promotion_quote(searching, incumbent, leader)
                         .and(rebuilding),
                     forming: Quote::default(),
                     opportunity: lead,
@@ -4453,11 +4537,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         &self,
         searching: &Searching<'a>,
         incumbent: &Contender,
-        leader: &Contender,
+        leader: &Configuration,
     ) -> Quote {
         let rate = self.planned().settings.error_rate;
         let mut quote = Quote::default();
-        let evidence = searching.ledger.evidence(leader);
+        let contender = searching.ledger.contender(leader);
+        let evidence = searching.ledger.evidence(contender);
         if evidence.verdict(rate).is_none() {
             let points = searching
                 .points
@@ -4466,15 +4551,15 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 .map(|(index, point)| {
                     (
                         point.prices(),
-                        incumbent.points[index].key != leader.points[index].key,
+                        incumbent.points[index].key != contender.points[index].key,
                     )
                 })
                 .collect::<Vec<_>>();
             let witnessed = searching
                 .points
                 .iter()
-                .zip(&leader.points)
-                .all(|(point, measured)| point.witnessed(&leader.artifact, &measured.key));
+                .zip(&contender.points)
+                .all(|(point, measured)| point.witnessed(&contender.artifact, &measured.key));
             quote = searching.admission.conversion(
                 &points,
                 witnessed,
@@ -4488,7 +4573,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // unit of twelve untimed points was held to twelve times the
         // longest operation of any kind in the load for a conversion that
         // takes 0.08 s, and served its default with a measured lead.
-        if !searching.covered.contains(&leader.artifact) {
+        if !searching.covered.contains(&contender.artifact) {
             let observed = searching
                 .untimed
                 .iter()
@@ -4507,10 +4592,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         }
         // A leader that gave up its kernel is formed again: from the
         // programs the unit holds, or by one compile.
-        if leader.kernel.is_none() {
+        if searching.ledger.kernel(leader).is_none() {
             quote = quote.and(self.formation().quote(&self.programs.formables(
                 &self.implementation,
-                std::slice::from_ref(&leader.specialization),
+                std::slice::from_ref(&contender.specialization),
                 &[],
             )));
         }
@@ -5035,12 +5120,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         }
         .expect("a conversion converts the leader its work named")
         .clone();
-        ledger.conversions += 1;
         // A leader that gave up its kernel is formed again; one that can
         // no longer be formed is recorded so and gives way to the next.
-        if ledger.contenders[&leader].kernel.is_none() {
+        if ledger.kernel(&leader).is_none() {
             let formation = formation!(self);
-            let specialization = ledger.contenders[&leader].specialization.clone();
+            let specialization = ledger.contender(&leader).specialization.clone();
             let compiled = formation.price.lock().expect("formation price lock").total();
             let began = Instant::now();
             let formed = self
@@ -5059,31 +5143,24 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             match formed {
                 Ok(kernel) => ledger.hold(&leader, kernel),
                 Err(exclusion) => {
-                    ledger
-                        .contenders
-                        .get_mut(&leader)
-                        .expect("the leader is a contender")
-                        .standing = ContenderStanding::Rejected(exclusion);
+                    ledger.reject(&leader, exclusion);
                     return Ok(false);
                 }
             }
         }
         let keying = &run.keying;
-        let kernel = ledger.contenders[&leader]
-            .kernel
-            .clone()
+        let kernel = ledger
+            .kernel(&leader)
+            .cloned()
             .expect("the leader holds its kernel");
-        let leading = ledger.contenders[&leader].specialization.clone();
+        let leading = ledger.contender(&leader).specialization.clone();
         let rate = plan.settings.error_rate;
-        let before = ledger.evidence(&ledger.contenders[&leader]);
+        let before = ledger.evidence(ledger.contender(&leader));
         if before.verdict(rate).is_none() {
             let began = Instant::now();
             let served = ledger.incumbent();
             let (served_kernel, served_points) = (
-                served
-                    .kernel
-                    .clone()
-                    .expect("the served choice holds its kernel"),
+                ledger.incumbent_kernel().clone(),
                 served.points.clone(),
             );
             // Nothing is reused: every point that tells the two apart is
@@ -5125,22 +5202,21 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .expect("one challenger was compared");
             self.time.measuring_seconds += began.elapsed().as_secs_f64();
             let served = ledger.incumbent.clone();
-            let contender = ledger
-                .contenders
-                .get_mut(&leader)
-                .expect("the leader is a contender");
             match compared {
                 Err(exclusion) => {
-                    contender.standing = ContenderStanding::Rejected(exclusion);
+                    ledger.reject(&leader, exclusion);
                     return Ok(false);
                 }
                 Ok(None) => return Err(WorkError::Expired),
                 Ok(Some((measured, evidence))) => {
+                    let contender = ledger.contender_mut(&leader);
                     contender.cost = Weighing::of(points).cost(&measured, canonical);
                     contender.points = measured.clone();
                     contender.confirmed = measured;
-                    contender.against = served;
-                    contender.evidence = evidence;
+                    contender.standing = ContenderStanding::Measured {
+                        against: served,
+                        evidence,
+                    };
                     // A trail is recorded when the challengers are ranked
                     // again, as this piece ends; an unresolved lead stays
                     // as it is.
@@ -5176,11 +5252,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 WorkError::Failed(exclusion) => exclusion,
             };
             ledger.failed += 1;
-            ledger
-                .contenders
-                .get_mut(&leader)
-                .expect("the leader is a contender")
-                .standing = ContenderStanding::Rejected(exclusion);
+            ledger.reject(&leader, exclusion);
             return Ok(false);
         }
         // Serving prepares the chosen kernel as formed here. The unit's
@@ -5188,19 +5260,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // choice's it supersedes, which serving will never take.
         deadline.check(Duration::ZERO)?;
         kernel
-            .hand_off_replacing(ledger.incumbent().kernel.as_deref())
+            .hand_off_replacing(ledger.kernel(&ledger.incumbent).map(AsRef::as_ref))
             .map_err(|error| TuneError::Handoff(error.to_string()))?;
-        ledger
-            .contenders
-            .get_mut(&leader)
-            .expect("the leader is a contender")
-            .standing = ContenderStanding::Served;
-        ledger.served.push(leader.clone());
-        // The choice it supersedes holds its kernel as any challenger does:
-        // until the piece ends.
-        let superseded = std::mem::replace(&mut ledger.incumbent, leader);
-        ledger.holding.insert(superseded);
-        ledger.promotions += 1;
+        // The choice it supersedes still holds its kernel in `ledger.kernels`
+        // until the piece ends (`Ledger::release`).
+        ledger.promote(leader);
         Ok(true)
     }
 
@@ -5303,12 +5367,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         searching.run.search.weights = searching.points.iter().map(|point| point.weight).collect();
         let cost = Weighing::of(&searching.points).cost(&searching.canonical, &searching.canonical);
         let incumbent = searching.ledger.incumbent.clone();
-        searching
-            .ledger
-            .contenders
-            .get_mut(&incumbent)
-            .expect("incumbent exists")
-            .cost = cost;
+        searching.ledger.contender_mut(&incumbent).cost = cost;
         self.offered.set(None);
         true
     }
@@ -6593,22 +6652,28 @@ impl Run {
             &mut formation.price.lock().expect("formation price lock"),
             &specializations,
         );
-        for (specialization, formation) in specializations.iter().zip(formations) {
-            ledger
-                .formations
-                .insert(Configuration::of(specialization), formation);
-        }
         let mut candidates = Vec::with_capacity(specializations.len());
-        for (specialization, kernel) in specializations.into_iter().zip(formed) {
+        let mut candidate_formations = Vec::with_capacity(specializations.len());
+        for ((specialization, formation), kernel) in
+            specializations.into_iter().zip(formations).zip(formed)
+        {
             match kernel {
-                Ok(kernel) => candidates.push(Candidate {
-                    specialization,
-                    kernel,
-                    evidence: Tally::default(),
-                }),
+                Ok(kernel) => {
+                    candidates.push(Candidate {
+                        specialization,
+                        kernel,
+                        evidence: Tally::default(),
+                    });
+                    candidate_formations.push(formation);
+                }
                 Err(exclusion) => {
                     self.search.record(&specialization, None);
-                    ledger.exclude(Configuration::of(&specialization), None, exclusion);
+                    ledger.exclude(
+                        Configuration::of(&specialization),
+                        Some(formation),
+                        None,
+                        exclusion,
+                    );
                 }
             }
         }
@@ -6622,10 +6687,7 @@ impl Run {
         // configurations at every point, from the defaults'.
         let served = ledger.incumbent();
         let (served_kernel, served_points) = (
-            served
-                .kernel
-                .clone()
-                .expect("the served choice holds its kernel"),
+            ledger.incumbent_kernel().clone(),
             served.points.clone(),
         );
         let (affected, baseline) = match &group {
@@ -6661,7 +6723,11 @@ impl Run {
         );
         *measuring_seconds += began.elapsed().as_secs_f64();
         let mut interrupted = false;
-        for (candidate, outcome) in candidates.into_iter().zip(measured) {
+        for ((candidate, formation), outcome) in candidates
+            .into_iter()
+            .zip(candidate_formations)
+            .zip(measured)
+        {
             match outcome {
                 Ok(None) => interrupted = true,
                 Ok(Some((measured, evidence))) => {
@@ -6670,6 +6736,7 @@ impl Run {
                     let cost = weighing.cost(&measured, &self.search.reference);
                     ledger.measured(
                         candidate.specialization,
+                        Some(formation),
                         candidate.kernel,
                         measured,
                         cost,
@@ -6680,6 +6747,7 @@ impl Run {
                     self.search.record(&candidate.specialization, None);
                     ledger.exclude(
                         Configuration::of(&candidate.specialization),
+                        Some(formation),
                         Some(&candidate.kernel),
                         exclusion,
                     );
@@ -8417,7 +8485,7 @@ mod tests {
         // Read twice as fast, and its rounds resolved a trail.
         let trailing = recorded.compared(4, at(4, 0.5), tally(0, 7));
         assert_eq!(
-            recorded.ledger.contenders[&trailing].standing,
+            recorded.ledger.contender(&trailing).standing,
             ContenderStanding::Trailing
         );
         assert_eq!(
@@ -8432,9 +8500,7 @@ mod tests {
         let stale = recorded.compared(5, at(5, 0.5), tally(7, 0));
         assert_eq!(recorded.ledger.leader(), Some(&stale));
         let ledger = &mut recorded.ledger;
-        ledger.contenders.get_mut(&seven).unwrap().standing = ContenderStanding::Served;
-        ledger.served.push(seven.clone());
-        ledger.incumbent = seven;
+        ledger.promote(seven);
         ledger.rerank();
         assert_eq!(ledger.leader(), None);
         // Their measured costs still rank them: the cheapest is the
@@ -8443,12 +8509,12 @@ mod tests {
             ledger.nominal().map(|(nominal, _)| nominal.clone()),
             Some(stale)
         );
+        assert!(matches!(
+            ledger.contender(&six).standing,
+            ContenderStanding::Measured { .. }
+        ));
         assert_eq!(
-            ledger.contenders[&six].standing,
-            ContenderStanding::Measured
-        );
-        assert_eq!(
-            ledger.contenders[&trailing].standing,
+            ledger.contender(&trailing).standing,
             ContenderStanding::Trailing
         );
     }
@@ -8565,9 +8631,7 @@ mod tests {
         // The conversion's promotion: it serves, and nothing measured
         // beside the defaults leads it.
         let ledger = &mut recorded.ledger;
-        ledger.contenders.get_mut(&resolved).unwrap().standing = ContenderStanding::Served;
-        ledger.served.push(resolved.clone());
-        ledger.incumbent = resolved;
+        ledger.promote(resolved);
         ledger.rerank();
         assert_eq!(ledger.leader(), None);
         assert!(ledger.nominal().is_none());
@@ -9674,6 +9738,7 @@ mod tests {
             let configuration = Configuration::of(&specialization);
             self.ledger.record(
                 specialization,
+                None,
                 format!("cpu;project;;challenger {challenger};{challenger:064x};toolchain"),
                 None,
                 measured,
@@ -9785,7 +9850,7 @@ mod tests {
         let middling = challenge(2, 0.9, 0.9);
         let faster = challenge(3, 0.7, 1.2);
         let ledger = &recorded.ledger;
-        let total = |configuration: &Configuration| ledger.contenders[configuration].cost.total();
+        let total = |configuration: &Configuration| ledger.contender(configuration).cost.total();
         // By total the faster challenger is the dearest of all three, and
         // the middling one the cheapest.
         assert!(total(&faster) > total(&slower));
@@ -9813,11 +9878,7 @@ mod tests {
         // What ranking every measured challenger names.
         let afresh = |ledger: &Ledger| {
             let incumbent = ledger.incumbent();
-            let measured = ledger
-                .contenders
-                .iter()
-                .filter(|(_, contender)| contender.standing == ContenderStanding::Measured)
-                .collect::<Vec<_>>();
+            let measured = ledger.measured_contenders().collect::<Vec<_>>();
             let verdict = |contender: &Contender| {
                 ledger
                     .evidence(contender)
@@ -9888,22 +9949,21 @@ mod tests {
             conversions += 1;
             let promoted = conversions % 2 == 1;
             let served = ledger.incumbent.clone();
-            let contender = ledger.contenders.get_mut(&leader).unwrap();
-            contender.against = served;
-            contender.evidence = if promoted { tally(8, 0) } else { tally(0, 8) };
             if promoted {
                 promotions += 1;
-                contender.standing = ContenderStanding::Served;
-                ledger.served.push(leader.clone());
-                let superseded = std::mem::replace(&mut ledger.incumbent, leader.clone());
-                ledger.holding.insert(superseded);
+                ledger.promote(leader.clone());
+            } else {
+                ledger.contender_mut(&leader).standing = ContenderStanding::Measured {
+                    against: served,
+                    evidence: tally(0, 8),
+                };
             }
             ledger.rerank();
             ledger.release();
             agrees(ledger);
             if !promoted {
                 assert_eq!(
-                    ledger.contenders[&leader].standing,
+                    ledger.contender(&leader).standing,
                     ContenderStanding::Trailing
                 );
             }

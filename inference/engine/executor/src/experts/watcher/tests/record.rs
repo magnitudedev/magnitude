@@ -89,7 +89,7 @@ fn a_groups_acknowledgement_goes_with_its_group() {
     // Group B of steps 3 and 4 counted, then A's last step completes.
     let next = Point::whole(3, 0, 3);
     telemetry.group(next, 4, GroupLayer::default());
-    telemetry.complete_step(&harness.watcher.shared().steps, 2, CompletedStep { work: LaunchWork::Prompt, begun: Instant::now(), route: CompletedRoute::Grouped }, &|_| (0, 0, Duration::ZERO), None).expect("no reads, no line");
+    telemetry.complete_step(&harness.watcher.shared().steps, 2, CompletedStep { work: LaunchWork::Prompt, begun: Instant::now(), resized: false, route: CompletedRoute::Grouped }, &|_| (0, 0, Duration::ZERO), None).expect("no reads, no line");
     telemetry.served_whole(Some((next, Instant::now(), true)));
     telemetry.arrived(3, Instant::now());
     let group = harness.watcher.shared().costs().group.expect("group B is counted");
@@ -115,7 +115,7 @@ fn telemetry_ahead_prunes_past_completed_steps_and_ignores_late_reads() {
         .complete_step(
             &harness.watcher.shared().steps,
             4,
-            CompletedStep { work: LaunchWork::Prompt, begun: Instant::now(), route: CompletedRoute::Grouped },
+            CompletedStep { work: LaunchWork::Prompt, begun: Instant::now(), resized: false, route: CompletedRoute::Grouped },
             &|_| (0, 0, Duration::ZERO),
             None,
         )
@@ -128,10 +128,47 @@ fn telemetry_ahead_prunes_past_completed_steps_and_ignores_late_reads() {
         .complete_step(
             &harness.watcher.shared().steps,
             5,
-            CompletedStep { work: LaunchWork::Prompt, begun: Instant::now(), route: CompletedRoute::Grouped },
+            CompletedStep { work: LaunchWork::Prompt, begun: Instant::now(), resized: false, route: CompletedRoute::Grouped },
             &|_| (0, 0, Duration::ZERO),
             None,
         )
         .expect("complete step 5");
     assert_eq!(telemetry.ahead_len(), 0, "all completed steps pruned");
+}
+
+/// Queued `ExecutedStep`s read `(epoch, now)` under `Telemetry::shadows` when
+/// drained rather than capturing a detached `(epoch, now)` at step completion:
+/// advancing `bank_epoch` via resizes between step completion and
+/// `Telemetry::shadow()` never regresses `Shadows::deltas`'s window epoch.
+#[test]
+fn shadow_executed_never_regresses_epoch_across_resizes() {
+    use crate::experts::horizon::Tier;
+    let harness = harness("shadow-epoch", EXPERTS, 2);
+    let shared = harness.watcher.shared();
+    // Enable shadow tracking (as regime pricing does).
+    let _ = shared.telemetry.measured();
+
+    // Run enough decode steps for `Shadows` to advance past its behind-buffer
+    // and populate `U_shadow(0)`, while interspersing bank resizes that bump
+    // `bank_epoch` rapidly (the exact sequence that previously left
+    // `ExecutedStep` carrying a stale epoch behind `Shadows::deltas`).
+    for position in 0..16u64 {
+        let first = (2 * position as usize) % EXPERTS;
+        let step = harness.begun().decoding([row(position, None)].into_iter(), 0);
+        harness.request_at(&step, 0, &[first, first + 1]);
+        step.complete().unwrap();
+        // Bump `bank_epoch` multiple times right after step completion,
+        // before/alongside `expert-residency`'s `telemetry.shadow()` turn.
+        {
+            let mut times = shared.time().lock();
+            times.resized(0, Tier::Compute, 2);
+            times.resized(0, Tier::Compute, 2);
+        }
+        shared.telemetry.feed();
+        shared.telemetry.shadow();
+    }
+    eventually("the decode reads were never ranked", || shared.telemetry.fed_all());
+    assert!(shared.time().lock().bank_epoch() >= 13, "bank_epoch advanced across resizes");
+    assert!(shared.life.ended().is_none(), "expert-residency must not panic on epoch ordering");
+    assert!(shared.telemetry.measured().is_some(), "regime pricing reads measured shadow gaps");
 }

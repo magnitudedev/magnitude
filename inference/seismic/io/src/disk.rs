@@ -33,8 +33,17 @@ pub(crate) use probe::{full_rate, grid, Request, VolumeLines, WIDEST_WINDOW};
 
 use platform::{evict, open_cached, uncached};
 
+/// The alignment of a direct read's offset, length and buffer: the Apple
+/// Silicon VM page size (16 KiB) on macOS `aarch64`, where `F_NOCACHE`
+/// reads misaligned to 16 KiB fall back to partial-page UBC/UPL paths in
+/// XNU, and the largest logical block size of the storage served (4 KiB)
+/// elsewhere.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const ALIGNMENT: u64 = 16384;
+
 /// The alignment of a direct read's offset, length and buffer: the largest
 /// logical block size of the storage served.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub const ALIGNMENT: u64 = 4096;
 
 /// A regular file opened for reads, by the name it was opened by, made

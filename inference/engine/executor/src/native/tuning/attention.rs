@@ -2141,6 +2141,7 @@ mod tests {
                 };
                 let limits = TuningLimits {
                     max_rows: 8,
+                    max_pass_rows: 8,
                     max_projected_rows: 8,
                     context_tokens: 4096,
                     image_cells: 0,
@@ -2269,6 +2270,7 @@ mod tests {
             let parts = |context_tokens| {
                 let limits = TuningLimits {
                     max_rows: 8,
+                    max_pass_rows: 8,
                     max_projected_rows: 8,
                     context_tokens,
                     image_cells: 0,
@@ -2373,6 +2375,7 @@ mod tests {
                 };
                 let limits = TuningLimits {
                     max_rows,
+                    max_pass_rows: max_rows,
                     max_projected_rows: max_rows,
                     context_tokens: 65536,
                     image_cells: 0,
@@ -2482,6 +2485,7 @@ mod tests {
 
     const DECODE_LIMITS: TuningLimits = TuningLimits {
         max_rows: 8,
+        max_pass_rows: 8,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,
@@ -2568,6 +2572,7 @@ mod tests {
             terms.clone(),
             None,
             DECODE_LIMITS.max_rows,
+            DECODE_LIMITS.max_pass_rows,
         );
         let mut points = unit.points(DECODE_LIMITS);
         let mut representatives = points.iter().map(|point| point.rows).collect::<Vec<_>>();
@@ -2671,6 +2676,7 @@ mod tests {
         let tuning = AttentionDecodeTuning(mix.clone());
         let limits = TuningLimits {
             max_rows: 512,
+            max_pass_rows: 512,
             max_projected_rows: 512,
             context_tokens: picked.context,
             image_cells: 0,
@@ -2773,6 +2779,7 @@ mod tests {
         let tuning = AttentionPrefillK8V4Tuning(mix);
         let limits = TuningLimits {
             max_rows: 512,
+            max_pass_rows: 512,
             max_projected_rows: 512,
             context_tokens: 65536,
             image_cells: 0,

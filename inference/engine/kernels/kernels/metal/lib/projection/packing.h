@@ -860,22 +860,31 @@ inline void packing_coefficients(thread const Weights<W> &w, thread const packin
         if (n >= rows)
             return;
         typedef typename packing_codes<W>::factors coded;
-        const uint groups = columns / 32u, blocks = columns / 256u;
+        const uint groups = columns / 32u, full_blocks = groups / 8u, tail = groups & 7u;
         const uint tile = n / 32u, within = n % 32u;
         const typename Weights<W>::located row = w.locate(n);
         float largest = 0.0f;
-        for (uint block = lane; block < blocks; block += 32u)
+        for (uint block = lane; block < full_blocks; block += 32u)
             largest = metal::max(largest, coded::reach(row, block));
+        if (tail != 0u && lane == 0u)
+            largest = metal::max(largest, coded::reach(row, full_blocks, tail));
         const float scale = packing_scale(simd_max(largest));
         if (lane == 0)
             s.weight_scales[n] = scale;
         const float inverse = 1.0f / scale;
-        for (uint block = lane; block < blocks; block += 32u) {
+        for (uint block = lane; block < full_blocks; block += 32u) {
             typename coded::run run = coded::start(row, block);
             PROJECTION_UNROLL
             for (uint i = 0; i < 8; ++i)
                 reinterpret_cast<device metal::vec<half, coded::width> *>(s.weights)[((ulong(tile) * groups
                     + block * 8u + i) * 8u + (within & 7u)) * 4u + (within >> 3)] =
+                    metal::vec<half, coded::width>(coded::take(run) * inverse);
+        }
+        if (tail != 0u && lane == 0u) {
+            typename coded::run run = coded::start(row, full_blocks);
+            for (uint i = 0; i < tail; ++i)
+                reinterpret_cast<device metal::vec<half, coded::width> *>(s.weights)[((ulong(tile) * groups
+                    + full_blocks * 8u + i) * 8u + (within & 7u)) * 4u + (within >> 3)] =
                     metal::vec<half, coded::width>(coded::take(run) * inverse);
         }
     }
@@ -892,12 +901,14 @@ inline void packing_tile_coefficients(thread const Weights<W> &w, thread const p
     uint columns, uint tile, threadgroup float *peaks, uint thread_index, uint sg, uint lane) {
     if constexpr (packing_codes<W>::available) {
         typedef typename packing_codes<W>::factors coded;
-        const uint groups = columns / 32u, items = 32u * (columns / 256u);
+        const uint groups = columns / 32u, full_blocks = groups / 8u, tail = groups & 7u, items = 32u * full_blocks;
         float largest = 0.0f;
         for (uint item = thread_index; item < items; item += 256u) {
             const uint n = tile * 32u + (item & 31u);
             largest = metal::max(largest, coded::reach(w.locate(n), item >> 5));
         }
+        if (tail != 0u && thread_index < 32u)
+            largest = metal::max(largest, coded::reach(w.locate(tile * 32u + thread_index), full_blocks, tail));
         largest = simd_max(largest);
         if (lane == 0)
             peaks[sg] = largest;
@@ -916,6 +927,14 @@ inline void packing_tile_coefficients(thread const Weights<W> &w, thread const p
             for (uint i = 0; i < 8; ++i)
                 reinterpret_cast<device metal::vec<half, coded::width> *>(s.weights)[((ulong(tile) * groups
                     + block * 8u + i) * 8u + (within & 7u)) * 4u + (within >> 3)] =
+                    metal::vec<half, coded::width>(coded::take(run) * inverse);
+        }
+        if (tail != 0u && thread_index < 32u) {
+            const uint within = thread_index, n = tile * 32u + within;
+            typename coded::run run = coded::start(w.locate(n), full_blocks);
+            for (uint i = 0; i < tail; ++i)
+                reinterpret_cast<device metal::vec<half, coded::width> *>(s.weights)[((ulong(tile) * groups
+                    + full_blocks * 8u + i) * 8u + (within & 7u)) * 4u + (within >> 3)] =
                     metal::vec<half, coded::width>(coded::take(run) * inverse);
         }
     }

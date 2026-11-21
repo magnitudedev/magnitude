@@ -572,7 +572,7 @@ fn gated_delta_chunk[M, B, S, NK, NV, W, C, T](
 # systems on tensor cores, then the scan.)
 native gated_delta_chunk for metal from "metal/gated_delta_chunk.metal":
     static (NK, NV, W, C)
-    params (ROWS in [128, 64, 32] default 128)
+    params (ROWS in [32, 64, 128] default 32)
     where W % 32 == 0 and W <= 256 and W % ROWS == 0
     scratch inputs bytes (M * ((2 * NK + NV) * W + 2 * NV) * 4)
     scratch mixed bytes (M * NV * W * 4)
@@ -606,7 +606,7 @@ native gated_delta_chunk for cuda from "cuda/gated_delta_chunk.cu":
         threadgroups (ceil_div(M, CUDA_CHUNK_PIECE) + B, NK, 1)
         threads_per_threadgroup (256, 1, 1)
     launch gated_delta_chunk_scan:
-        params (ROWS in [128, 64, 32] default 128)
+        params (ROWS in [32, 64, 128] default 32)
         threadgroups (W / ROWS, NV, B)
         threads_per_threadgroup (2 * ROWS, 1, 1)
         shared_bytes (3 * (96 * W + 32 * ROWS + 1680) + ROWS / 16 * 16 * 17 * 4)
@@ -835,7 +835,7 @@ fn kimi_delta_chunk[M, B, S, NK, NV, W, C, T](
 # below 2^-126 |S| absolutely: below every output's rounding at any decay.
 native kimi_delta_chunk for metal from "metal/kimi_delta_chunk.metal":
     static (NK, NV, W, C)
-    params (ROWS in [128, 64, 32] default 128)
+    params (ROWS in [32, 64, 128] default 32)
     where W % 32 == 0 and W <= 128 and W % ROWS == 0
     scratch inputs bytes (M * ((2 * NK + NV) * W + NV + NV * W) * 4)
     scratch mixed bytes (M * NV * W * 4)
@@ -862,7 +862,7 @@ native kimi_delta_chunk for cuda from "cuda/kimi_delta_chunk.cu":
         threadgroups (ceil_div(M, CUDA_CHUNK_PIECE) + B, NK, 1)
         threads_per_threadgroup (256, 1, 1)
     launch kimi_delta_chunk_scan:
-        params (ROWS in [128, 64, 32] default 128)
+        params (ROWS in [32, 64, 128] default 32)
         threadgroups (W / ROWS, NV, B)
         threads_per_threadgroup (2 * ROWS, 1, 1)
         shared_bytes (3 * (164 * W + 32 * ROWS + 1536) + ROWS / 16 * 16 * 17 * 4)

@@ -486,6 +486,9 @@ impl<T: EntryTuning> EntryTuning for Ranged<T> {
     fn row_dimension(&self) -> &'static str {
         self.case.row_dimension()
     }
+    fn row_regime_cuts(&self) -> &'static [u64] {
+        self.case.row_regime_cuts()
+    }
     fn invocation_rows(&self, launch: &Launch, representatives: &[u64]) -> Option<u64> {
         if !self.rows.contains(&self.case.launch_rows(launch)) {
             return None;
@@ -892,5 +895,72 @@ mod tests {
     fn a_range_identifies_its_unit() {
         assert_eq!(identify("A=bf16".into(), &(2..9)), "A=bf16,M=2..9");
         assert_eq!(identify("A=bf16".into(), &(9..u64::MAX)), "A=bf16,M=9..");
+    }
+
+    #[test]
+    fn merged_pass_regime_cut_splits_grouped_experts_only_when_pass_points_exist_above_it() {
+        use super::routed::{GROUPED_SERVED, MERGED_PASS_FROM, grouped_pass_points};
+        let limits = |max_pass_rows| TuningLimits {
+            max_rows: 512,
+            max_pass_rows,
+            max_projected_rows: 8,
+            context_tokens: 65536,
+            image_cells: 0,
+        };
+        let rows = |max_pass_rows| {
+            grouped_pass_points(limits(max_pass_rows))
+                .into_iter()
+                .map(|point| point.rows)
+                .collect::<Vec<_>>()
+        };
+
+        // Without merged passes > 1024, no point lies past MERGED_PASS_FROM,
+        // so row_ranges keeps a single range 9.. identical to non-merged loads.
+        let flat_512 = rows(512);
+        assert_eq!(flat_512, vec![16, 32, 64, 128, 256, 512]);
+        assert_eq!(
+            row_ranges(GROUPED_SERVED, &[MERGED_PASS_FROM], &flat_512),
+            vec![GROUPED_SERVED]
+        );
+        let flat_1024 = rows(1024);
+        assert_eq!(flat_1024, vec![16, 32, 64, 128, 256, 512, 1024]);
+        assert_eq!(
+            row_ranges(GROUPED_SERVED, &[MERGED_PASS_FROM], &flat_1024),
+            vec![GROUPED_SERVED]
+        );
+
+        // When max_pass_rows > 1024, points lie on both sides of
+        // MERGED_PASS_FROM, splitting small-grouped (9..1025) from
+        // merged-pass (1025..).
+        let split_2048 = rows(2048);
+        assert_eq!(split_2048, vec![16, 32, 64, 128, 256, 512, 1024, 2048]);
+        assert_eq!(
+            row_ranges(GROUPED_SERVED, &[MERGED_PASS_FROM], &split_2048),
+            vec![VERIFY_ROWS + 1..MERGED_PASS_FROM, MERGED_PASS_FROM..u64::MAX]
+        );
+        let split_4096 = rows(4096);
+        assert_eq!(split_4096, vec![16, 32, 64, 128, 256, 512, 1024, 2048, 4096]);
+        let ranges = row_ranges(GROUPED_SERVED, &[MERGED_PASS_FROM], &split_4096);
+        assert_eq!(
+            ranges,
+            vec![VERIFY_ROWS + 1..MERGED_PASS_FROM, MERGED_PASS_FROM..u64::MAX]
+        );
+        // Every range holds its own measured points and non-merged row_points
+        // remain capped at max_rows = 512.
+        assert_eq!(
+            row_points(limits(4096))
+                .into_iter()
+                .map(|point| point.rows)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+        );
+        assert_eq!(
+            split_4096
+                .iter()
+                .copied()
+                .filter(|r| ranges[1].contains(r))
+                .collect::<Vec<_>>(),
+            vec![2048, 4096]
+        );
     }
 }

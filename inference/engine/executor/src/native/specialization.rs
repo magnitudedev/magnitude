@@ -152,6 +152,23 @@ impl<'a> Tuning<'a> {
             *repeat = repeat_case;
         }
     }
+    pub fn swap_invocations(
+        &mut self,
+        current: crate::programs::invocation_demand::InvocationCounts,
+        repeat_case: bool,
+    ) -> Option<(crate::programs::invocation_demand::InvocationCounts, bool)> {
+        match self {
+            Self::Demand {
+                current: active,
+                repeat_case: repeat,
+                ..
+            } => Some((
+                std::mem::replace(active, current),
+                std::mem::replace(repeat, repeat_case),
+            )),
+            _ => None,
+        }
+    }
     pub fn into_invocations(self) -> InvocationDemand {
         match self {
             Self::Demand { invocations, .. } => invocations,
@@ -520,7 +537,8 @@ impl<'a> Specializer<'a> {
             .into_iter()
             .map(|point| point.rows)
             .collect::<Vec<_>>();
-        let cuts = row_cuts(implementation, &statics, case.row_dimension(), &served, &points);
+        let mut cuts = row_cuts(implementation, &statics, case.row_dimension(), &served, &points);
+        cuts.extend_from_slice(case.row_regime_cuts());
         Ok(row_ranges(served, &cuts, &points))
     }
 

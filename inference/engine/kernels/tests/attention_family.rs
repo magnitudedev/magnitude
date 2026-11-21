@@ -188,6 +188,8 @@ struct Case {
     selected_slab_rows: usize,
     /// The trained rounding of the prepared key (`KR = 1`), or none.
     key_rounding: Option<Rounding>,
+    /// Whether this invocation is an absorbed latent read (`AB = 1`).
+    absorbed: bool,
     /// The prefill's WorkList read (`B` words a row, `BR = block_rows` keys a
     /// block): row r's bitmap is `selection[r * B..][..B]`; no words (`B = 0`)
     /// reads every key.
@@ -299,6 +301,7 @@ impl Case {
             selected: Vec::new(),
             selected_slab_rows: 1,
             key_rounding: None,
+            absorbed: false,
             selection: Vec::new(),
             selection_words: 0,
             block_rows: 1,
@@ -408,13 +411,17 @@ impl Case {
         self.selected.len() / (self.form.kv * self.form.w())
     }
 
-    /// The extents of the entries' empty `form` table: the layer form's,
-    /// then KR.
+    /// This case marked as an absorbed latent read (`AB = 1`).
+    fn with_absorbed(mut self) -> Self {
+        self.absorbed = true;
+        self
+    }
+
     /// The dense entries' `form`: the form's axes, the key rounding (`KR`),
-    /// and no absorbed latent read (`AB`).
+    /// and the absorbed latent read (`AB`).
     fn extents(&self) -> [usize; 7] {
         let [zero, ra, rt, ro, vk] = self.form.extents();
-        [zero, ra, rt, ro, vk, usize::from(self.key_rounding.is_some()), 0]
+        [zero, ra, rt, ro, vk, usize::from(self.key_rounding.is_some()), usize::from(self.absorbed)]
     }
 
     /// The key-rounding scalars (block 0 rounds nothing).
@@ -1091,14 +1098,21 @@ fn cuda_matrix_configurations(
         .iter()
         .filter(|(_, warps, stages, columns)| {
             // The declaration's shared bound: the query tile, STAGES K-piece +
-            // V-window stages (16-key tiles above W = 256), the exchange.
+            // V-window stages (16-key tiles above W = 256; whole K tiles when
+            // split scores are active at COLUMNS >= 2, W > 256), the exchange,
+            // position plan, and split-scores exchange.
             let w = form.w() as u64;
             let keys = if w > 256 { 16 } else { 32 };
+            let split = w > 256 && *columns >= 2;
+            let k_piece = if split { w } else { w.min(256) };
+            let split_bytes = if split { columns * warps * 1024 } else { 0 };
             form.g as u64 <= warps * 16
                 && (w <= 256 || w % 256 == 0)
                 && w.min(256 * columns) % (16 * columns) == 0
-                && (warps * 16 * w + stages * keys * (w.min(256) + w.min(256 * columns))) * 2
+                && (warps * 16 * w + stages * keys * (k_piece + w.min(256 * columns))) * 2
                     + warps * columns * w * 4
+                    + 320
+                    + split_bytes
                     <= 98304
         })
         .map(|&(parts, warps, stages, columns)| {
@@ -1506,9 +1520,10 @@ impl Attend {
         } else {
             specialization.clone().with_static("B", case.selection_words as u64)
         }
-        // The case's key rounding and index-list source.
+        // The case's key rounding, index-list source and absorbed latent read.
         .with_static("KR", u64::from(case.key_rounding.is_some()))
-        .with_static("KS", case.picks as u64);
+        .with_static("KS", case.picks as u64)
+        .with_static("AB", u64::from(case.absorbed));
         macro_rules! create {
             ($module:ident, $variant:ident) => {
                 {
@@ -4918,10 +4933,12 @@ fn glm_host_model_matches_reference() {
 /// over the native's own inputs to each), and the latent attention, over the
 /// native's absorbed queries, by the entry the executor attends it with
 /// (`graph::dense_decodes`) to the attended-row bar ([`check`]): decode rows
-/// by the CPU's decode entry and by the prefill entry on every backend,
-/// whose Metal and CUDA forms stage nothing in F16 (their operands are the
-/// BF16 activation element), and on Vulkan in both its forms, the vector
-/// default and the F16 matrix candidate; prompt rows by the prefill entry.
+/// by the CPU's and Metal's decode entries (Metal's shared-tile matrix form,
+/// `AB = 1, MATRIX = 2`, stages in the BF16 activation element) and by the
+/// prefill entry on every backend, whose Metal and CUDA forms stage nothing
+/// in F16 (their operands are the BF16 activation element), and on Vulkan in
+/// both its forms, the vector default and the F16 matrix candidate; prompt
+/// rows by the prefill entry.
 /// The same rows under GLM's selected read (a WorkList bitmap of unit picks
 /// and the tail) are held to the host model's reading of the bitmap by the
 /// prefill entry alone, which is the one that reads it. The attended-row bar holds an attended row, not its product through `v_b`,
@@ -4949,10 +4966,11 @@ fn glm_natives_match_reference() {
                 failures.push(label);
             }
             let absorbed = case.clone().with_queries(queries);
+            let absorbed = if backend == BackendName::Metal { absorbed.with_absorbed() } else { absorbed };
             let expected = absorbed.expected();
             // The decode entry reads no WorkList bitmap.
             let entries = match (decode, backend) {
-                (true, BackendName::Cpu) if absorbed.selection_words == 0 => vec![true, false],
+                (true, BackendName::Cpu | BackendName::Metal) if absorbed.selection_words == 0 => vec![true, false],
                 _ => vec![false],
             };
             for decode in entries {
@@ -5035,37 +5053,41 @@ fn prefill_admitted_absorbed(device: &Device, form: Form, absorbed: bool, picks:
 
 #[test]
 fn an_absorbed_read_has_no_f16_staged_decode_form() {
-    // The declarations decide: a stored-key read's matrix decode forms stage
-    // in F16 and are admitted, an absorbed latent read's are not; its vector
-    // form (F32 products) is, where it holds the group: Vulkan's holds GLM's
-    // 64 queries of 512, Metal's does not.
+    // The declarations decide: Metal's matrix decode forms stage in the
+    // activation element (no F16 rounding) and are admitted for absorbed
+    // reads (V4.1 and GLM's 64 queries of 512 via MATRIX = 2); Vulkan's
+    // matrix decode forms stage in F16 and are refused for absorbed reads,
+    // leaving its vector form (F32 products) to hold GLM's 64 queries of 512.
     for device in devices() {
-        let backend = device.backend();
-        if !matches!(backend, BackendName::Metal | BackendName::Vulkan) {
-            continue;
+        match device.backend() {
+            BackendName::Metal => {
+                assert!(decode_admitted_absorbed(&device, V41, false, true) > 0, "Metal: stored key, matrix");
+                assert!(decode_admitted_absorbed(&device, V41, true, true) > 0, "Metal: absorbed, matrix");
+                assert!(decode_admitted_absorbed(&device, GLM, true, true) > 0, "Metal: GLM, matrix");
+                assert_eq!(decode_admitted_absorbed(&device, GLM, true, false), 0, "Metal: GLM, vector");
+            }
+            BackendName::Vulkan => {
+                assert!(decode_admitted_absorbed(&device, V41, false, true) > 0, "Vulkan: stored key, matrix");
+                assert_eq!(decode_admitted_absorbed(&device, V41, true, true), 0, "Vulkan: absorbed, matrix");
+                assert_eq!(decode_admitted_absorbed(&device, GLM, true, true), 0, "Vulkan: GLM, matrix");
+                assert!(decode_admitted_absorbed(&device, GLM, true, false) > 0, "Vulkan: GLM, vector");
+            }
+            _ => {}
         }
-        assert!(decode_admitted_absorbed(&device, V41, false, true) > 0, "{backend:?}: stored key, matrix");
-        assert_eq!(decode_admitted_absorbed(&device, V41, true, true), 0, "{backend:?}: absorbed, matrix");
-        assert_eq!(decode_admitted_absorbed(&device, GLM, true, true), 0, "{backend:?}: GLM, matrix");
-        assert_eq!(
-            decode_admitted_absorbed(&device, GLM, true, false) > 0,
-            backend == BackendName::Vulkan,
-            "{backend:?}: GLM, vector"
-        );
     }
 }
 
 #[test]
 fn an_absorbed_read_has_no_f16_staged_prefill_form() {
-    // Metal's shared-tile prefill (picks, KS > 0) takes its values as F16
-    // operands, and Vulkan's matrix forms (MATRIX past 0) stage them so; the
-    // other forms read an absorbed latent in place, with or without a
-    // WorkList bitmap (the form GLM's selected read takes).
+    // Metal's shared-tile prefill (picks, KS > 0) stages in the activation
+    // element (no F16 rounding) and is admitted for absorbed reads; Vulkan's
+    // matrix forms (MATRIX past 0) stage in F16 and are refused, leaving its
+    // vector form.
     for device in devices() {
         match device.backend() {
             BackendName::Metal => {
                 assert!(prefill_admitted_absorbed(&device, V41, false, 512, 0, false) > 0, "stored key, picks");
-                assert_eq!(prefill_admitted_absorbed(&device, V41, true, 512, 0, false), 0, "absorbed, picks");
+                assert!(prefill_admitted_absorbed(&device, V41, true, 512, 0, false) > 0, "absorbed, picks");
                 for words in [0, 64] {
                     assert!(
                         prefill_admitted_absorbed(&device, GLM, true, 0, words, false) > 0,
@@ -5079,6 +5101,62 @@ fn an_absorbed_read_has_no_f16_staged_prefill_form() {
                 assert!(prefill_admitted_absorbed(&device, GLM, true, 0, 0, false) > 0, "absorbed, vector");
             }
             _ => {}
+        }
+    }
+}
+
+/// CUDA `attention_decode` over 512-wide heads:
+/// - `G = 64, W = 512` with `MATRIX = 1, QREG = 1, COLUMNS = 2, WARPS = 4, STAGES = 2`
+///   exercises split scores (`ATTENTION_SPLIT_SCORES`) and register queries
+///   within 90,432 <= 98,304 shared bytes.
+/// - `G = 16, W = 512` with `MATRIX = 0, WARPS = 4, SLICES = 4` (`DPL = 16, H = 4`)
+///   exercises the `TOKENS = 2` wide-head vector path.
+#[test]
+fn cuda_wide_mla_decode_split_scores_and_tokens() {
+    const WIDE_G64: Form = Form {
+        g: 64,
+        ..WIDE_G16
+    };
+    let cases = [
+        (
+            "cuda wide g64 matrix qreg split scores",
+            Case::new(WIDE_G64, 320, decode_rows(260), 128, 1.0, 1.0, 61),
+            [
+                ("PARTS", 12),
+                ("WARPS", 4),
+                ("SLICES", 1),
+                ("MATRIX", 1),
+                ("STAGES", 2),
+                ("COLUMNS", 2),
+                ("QREG", 1),
+            ],
+        ),
+        (
+            "cuda wide g16 vector tokens2",
+            Case::new(WIDE_G16, 320, decode_rows(260), 128, 1.0, 1.0, 62),
+            [
+                ("PARTS", 12),
+                ("WARPS", 4),
+                ("SLICES", 4),
+                ("MATRIX", 0),
+                ("STAGES", 2),
+                ("COLUMNS", 1),
+                ("QREG", 0),
+            ],
+        ),
+    ];
+    for device in devices()
+        .into_iter()
+        .filter(|device| device.backend() == BackendName::Cuda)
+    {
+        for (label, case, config) in &cases {
+            let expected = case.expected();
+            let specialization = config
+                .iter()
+                .fold(statics(&device, case.form, 0), |s, (n, v)| s.with_param(*n, *v));
+            let result = run(&device, true, &specialization, case)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            check(label, &result, &expected, case);
         }
     }
 }

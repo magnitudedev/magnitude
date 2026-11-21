@@ -11,7 +11,7 @@ use super::protocol::{
 };
 use super::transport::{HostTransport, MessageReceiver, MessageSender};
 use crate::census::AllocationCensus;
-use crate::error::{LoadError, RequestError};
+use crate::error::{LoadError, RequestError, UnloadCause};
 use crate::execution::LoadAttempt;
 use crate::invocation::ReleaseGuard;
 use magnitude_executor::UnpreparedUnits;
@@ -60,18 +60,94 @@ impl RequestEvent {
 }
 
 #[derive(Default)]
+enum RequestLifecycle {
+    /// Until the request began, or was refused.
+    #[default]
+    PendingAdmission,
+    Open(VecDeque<RequestEvent>),
+    Terminal(VecDeque<RequestEvent>),
+    Refused(RequestError),
+}
+
+#[derive(Default)]
 struct RequestSlot {
-    /// `None` while admission is pending: until the request began, or was
-    /// refused.
-    admission: Option<Result<(), RequestError>>,
-    events: VecDeque<RequestEvent>,
-    terminal_received: bool,
+    lifecycle: RequestLifecycle,
     /// `Some` once the pending status query was answered.
     status: Option<Option<RequestProgress>>,
     waker: Option<Waker>,
 }
 
 impl RequestSlot {
+    fn admit(&mut self, id: HostRequestId) -> Result<(), String> {
+        match &self.lifecycle {
+            RequestLifecycle::PendingAdmission => {
+                self.lifecycle = RequestLifecycle::Open(VecDeque::new());
+                self.wake();
+                Ok(())
+            }
+            RequestLifecycle::Open(_)
+            | RequestLifecycle::Terminal(_)
+            | RequestLifecycle::Refused(_) => Err(format!(
+                "request {id} received admission after it was already decided"
+            )),
+        }
+    }
+
+    fn refuse(&mut self, id: HostRequestId, error: RequestError) -> Result<(), String> {
+        match &self.lifecycle {
+            RequestLifecycle::PendingAdmission => {
+                self.lifecycle = RequestLifecycle::Refused(error);
+                self.wake();
+                Ok(())
+            }
+            RequestLifecycle::Open(_)
+            | RequestLifecycle::Terminal(_)
+            | RequestLifecycle::Refused(_) => Err(format!(
+                "request {id} received admission refusal after it was already decided"
+            )),
+        }
+    }
+
+    fn push_event(&mut self, id: HostRequestId, event: RequestEvent) -> Result<(), String> {
+        match &mut self.lifecycle {
+            RequestLifecycle::Open(events) => {
+                let terminal = event.is_terminal();
+                events.push_back(event);
+                if terminal {
+                    let events = std::mem::take(events);
+                    self.lifecycle = RequestLifecycle::Terminal(events);
+                }
+                self.wake();
+                Ok(())
+            }
+            RequestLifecycle::Terminal(_) => {
+                Err(format!("request {id} received an event after its terminal"))
+            }
+            RequestLifecycle::PendingAdmission => {
+                Err(format!("request {id} received an event before admission"))
+            }
+            RequestLifecycle::Refused(_) => Err(format!(
+                "request {id} received an event after admission was refused"
+            )),
+        }
+    }
+
+    fn close(&mut self, error: RequestError) {
+        match &mut self.lifecycle {
+            RequestLifecycle::PendingAdmission => {
+                self.lifecycle = RequestLifecycle::Refused(error);
+            }
+            RequestLifecycle::Open(events) => {
+                events.push_back(RequestEvent::Failed(error));
+                let events = std::mem::take(events);
+                self.lifecycle = RequestLifecycle::Terminal(events);
+            }
+            RequestLifecycle::Terminal(_) | RequestLifecycle::Refused(_) => {}
+        }
+        self.status.get_or_insert(None);
+        self.wake();
+    }
+
     fn wake(&mut self) {
         if let Some(waker) = self.waker.take() {
             waker.wake();
@@ -177,6 +253,72 @@ impl<T> Drop for ReplyGuard<'_, T> {
 type Shared<T> = Arc<Mutex<SharedReply<T>>>;
 
 #[derive(Default)]
+enum ConnectionPhase {
+    #[default]
+    Open,
+    /// The host asked the worker to shut down ([`EngineClient::shutdown`]): a connection that
+    /// ends after that ends for the stop, however the worker's end came (its own unload, or
+    /// its kill once it overran its exit).
+    ShuttingDown,
+    /// Why the connection ended; every later operation fails with it. `unloaded` is true when
+    /// the worker itself answered that its model is unloaded: its process is ending by its own
+    /// choice, unlike a connection that merely closed.
+    Closed {
+        error: RequestError,
+        unloaded: bool,
+    },
+}
+
+impl ConnectionPhase {
+    fn is_open(&self) -> bool {
+        match self {
+            Self::Open | Self::ShuttingDown => true,
+            Self::Closed { .. } => false,
+        }
+    }
+
+    fn check_open(&self) -> Result<(), RequestError> {
+        match self {
+            Self::Open | Self::ShuttingDown => Ok(()),
+            Self::Closed { error, .. } => Err(error.clone()),
+        }
+    }
+
+    fn closed_error(&self) -> Option<&RequestError> {
+        match self {
+            Self::Open | Self::ShuttingDown => None,
+            Self::Closed { error, .. } => Some(error),
+        }
+    }
+
+    fn is_unloaded(&self) -> bool {
+        match self {
+            Self::Open | Self::ShuttingDown => false,
+            Self::Closed { unloaded, .. } => *unloaded,
+        }
+    }
+
+    fn begin_shutdown(&mut self) {
+        match self {
+            Self::Open => *self = Self::ShuttingDown,
+            Self::ShuttingDown | Self::Closed { .. } => {}
+        }
+    }
+
+    /// Why a connection whose worker ended for `reason` ended: the host's stop, where the host
+    /// asked for one, so a stopped model's requests end alike whenever its worker ends.
+    fn lost(&self, reason: String) -> RequestError {
+        match self {
+            Self::Open => RequestError::WorkerLost { reason },
+            Self::ShuttingDown => RequestError::ModelUnloaded {
+                cause: UnloadCause::Shutdown,
+            },
+            Self::Closed { error, .. } => error.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
 struct State {
     next_id: u64,
     requests: HashMap<HostRequestId, RequestSlot>,
@@ -187,8 +329,7 @@ struct State {
     /// claim takes.
     room: Option<(RoomClaimId, Shared<RoomAnswer>)>,
     next_claim: u64,
-    /// Why the connection ended; every later operation fails with it.
-    closed: Option<RequestError>,
+    phase: ConnectionPhase,
     /// The census the worker pushed last, and how many it pushed
     /// ([`EngineClient::census`]).
     census: Option<AllocationCensus>,
@@ -196,20 +337,11 @@ struct State {
     /// Waiters on the connection's end or the census's next change
     /// ([`EngineClient::closed`], [`EngineClient::census`]).
     watchers: WakerSet,
-    /// The host asked the worker to shut down ([`EngineClient::shutdown`]): a connection that
-    /// ends after that ends for the stop, however the worker's end came (its own unload, or
-    /// its kill once it overran its exit).
-    shutting_down: bool,
-    /// The worker itself answered that its model is unloaded: its process is ending by its own
-    /// choice, unlike a connection that merely closed.
-    unloaded: bool,
 }
 
 impl State {
     fn open_request(&mut self, lease: ReleaseGuard) -> Result<HostRequestId, RequestError> {
-        if let Some(error) = &self.closed {
-            return Err(error.clone());
-        }
+        self.phase.check_open()?;
         let id = HostRequestId(self.next_id);
         self.next_id += 1;
         self.requests.insert(id, RequestSlot::default());
@@ -222,25 +354,23 @@ impl State {
     /// Why a connection whose worker ended for `reason` ended: the host's stop, where the host
     /// asked for one, so a stopped model's requests end alike whenever its worker ends.
     fn lost(&self, reason: String) -> RequestError {
-        match self.shutting_down {
-            true => RequestError::ModelUnloaded { cause: crate::error::UnloadCause::Shutdown },
-            false => RequestError::WorkerLost { reason },
-        }
+        self.phase.lost(reason)
     }
 
     fn close(&mut self, error: RequestError) {
-        if self.closed.is_some() {
+        self.finish_closing(error, false);
+    }
+
+    fn unload(&mut self, cause: UnloadCause) {
+        self.finish_closing(RequestError::ModelUnloaded { cause }, true);
+    }
+
+    fn finish_closing(&mut self, error: RequestError, unloaded: bool) {
+        if !self.phase.is_open() {
             return;
         }
         for slot in self.requests.values_mut() {
-            if slot.admission.is_none() {
-                slot.admission = Some(Err(error.clone()));
-            } else if !slot.terminal_received {
-                slot.events.push_back(RequestEvent::Failed(error.clone()));
-                slot.terminal_received = true;
-            }
-            slot.status.get_or_insert(None);
-            slot.wake();
+            slot.close(error.clone());
         }
         if let Some(reply) = self.observation.take() {
             reply.lock().unwrap().fulfill(Err(error.clone()));
@@ -249,7 +379,7 @@ impl State {
             reply.lock().unwrap().fulfill(Err(error.clone()));
         }
         self.leases.clear();
-        self.closed = Some(error);
+        self.phase = ConnectionPhase::Closed { error, unloaded };
         self.watchers.wake_all();
     }
 
@@ -297,14 +427,12 @@ impl State {
             }
             WorkerMessage::Admitted { request_id } => {
                 if let Some(slot) = self.requests.get_mut(&request_id) {
-                    slot.admission = Some(Ok(()));
-                    slot.wake();
+                    slot.admit(request_id)?;
                 }
             }
             WorkerMessage::AdmissionRefused { request_id, error } => {
                 if let Some(slot) = self.requests.get_mut(&request_id) {
-                    slot.admission = Some(Err(error));
-                    slot.wake();
+                    slot.refuse(request_id, error)?;
                 }
             }
             WorkerMessage::Output { request_id, tokens } => {
@@ -358,8 +486,7 @@ impl State {
                 }
             }
             WorkerMessage::Unloaded { cause } => {
-                self.unloaded = true;
-                self.close(RequestError::ModelUnloaded { cause });
+                self.unload(cause);
             }
             WorkerMessage::Hello { .. }
             | WorkerMessage::LoadProgress { .. }
@@ -383,13 +510,7 @@ impl State {
         let Some(slot) = self.requests.get_mut(&id) else {
             return Ok(());
         };
-        if slot.terminal_received {
-            return Err(format!("request {id} received an event after its terminal"));
-        }
-        slot.terminal_received = event.is_terminal();
-        slot.events.push_back(event);
-        slot.wake();
-        Ok(())
+        slot.push_event(id, event)
     }
 }
 
@@ -500,7 +621,7 @@ pub fn connect_worker(
             Ok(Some(message)) => {
                 let mut state = reading.lock().unwrap();
                 match state.deliver(message) {
-                    Ok(()) if state.closed.is_none() => continue,
+                    Ok(()) if state.phase.is_open() => continue,
                     Ok(()) => return,
                     Err(reason) => reason,
                 }
@@ -613,17 +734,15 @@ impl EngineClient {
         &self.connection.ready
     }
 
-    /// Whether the worker itself answered that its model is unloaded ([`State::unloaded`]).
+    /// Whether the worker itself answered that its model is unloaded: its process
+    /// is ending by its own choice, unlike a connection that merely closed.
     pub fn unloaded(&self) -> bool {
-        self.connection.state.lock().unwrap().unloaded
+        self.connection.state.lock().unwrap().phase.is_unloaded()
     }
 
     /// `Ok` while the worker serves; otherwise why it stopped.
     pub fn check(&self) -> Result<(), RequestError> {
-        match &self.connection.state.lock().unwrap().closed {
-            Some(error) => Err(error.clone()),
-            None => Ok(()),
-        }
+        self.connection.state.lock().unwrap().phase.check_open()
     }
 
     /// Why the worker stopped, once it has: the connection's end, awaited
@@ -635,7 +754,7 @@ impl EngineClient {
         };
         poll_fn(|context| {
             let mut state = self.connection.state.lock().unwrap();
-            if let Some(error) = state.closed.clone() {
+            if let Some(error) = state.phase.closed_error().cloned() {
                 state.watchers.remove(&mut guard.slot);
                 Poll::Ready(error)
             } else {
@@ -661,7 +780,7 @@ impl EngineClient {
                 let census = state.census.clone().expect("a pushed census is kept");
                 return Poll::Ready(Ok((state.censuses, census)));
             }
-            if let Some(error) = state.closed.clone() {
+            if let Some(error) = state.phase.closed_error().cloned() {
                 state.watchers.remove(&mut guard.slot);
                 Poll::Ready(Err(error))
             } else {
@@ -717,12 +836,13 @@ impl EngineClient {
         let admission = poll_fn(|cx| {
             let mut state = self.connection.state.lock().unwrap();
             let slot = state.requests.get_mut(&id).expect("live request slot");
-            match slot.admission.clone() {
-                Some(result) => Poll::Ready(result),
-                None => {
+            match &slot.lifecycle {
+                RequestLifecycle::PendingAdmission => {
                     slot.waker = Some(cx.waker().clone());
                     Poll::Pending
                 }
+                RequestLifecycle::Open(_) | RequestLifecycle::Terminal(_) => Poll::Ready(Ok(())),
+                RequestLifecycle::Refused(error) => Poll::Ready(Err(error.clone())),
             }
         })
         .await;
@@ -755,9 +875,7 @@ impl EngineClient {
     pub async fn claim_measurement_room(&self, bytes: u64) -> Result<RoomAnswer, RequestError> {
         let (reply, _) = self.connection.send_with_state(
             |state| {
-                if let Some(error) = &state.closed {
-                    return Err(error.clone());
-                }
+                state.phase.check_open()?;
                 let (reply, send_claim) = state.begin_room_claim();
                 let message =
                     send_claim.map(|claim| HostMessage::ClaimMeasurementRoom { claim, bytes });
@@ -777,9 +895,7 @@ impl EngineClient {
     pub fn attach_measurement_process(&self, process: magnitude_executor::ProcessId) -> Result<(), RequestError> {
         self.connection.send_with_state(
             |state| {
-                if let Some(error) = &state.closed {
-                    return Err(error.clone());
-                }
+                state.phase.check_open()?;
                 Ok(((), Some(HostMessage::AttachMeasurementProcess { process })))
             },
             |_, _, _| {},
@@ -809,7 +925,7 @@ impl EngineClient {
     pub fn shutdown(&self) -> Result<(), RequestError> {
         self.connection.send_with_state(
             |state| {
-                state.shutting_down = true;
+                state.phase.begin_shutdown();
                 Ok(((), Some(HostMessage::Shutdown)))
             },
             |_, _, _| {},
@@ -824,9 +940,7 @@ impl EngineClient {
     ) -> Result<Shared<T>, RequestError> {
         self.connection.send_with_state(
             |state| {
-                if let Some(error) = &state.closed {
-                    return Err(error.clone());
-                }
+                state.phase.check_open()?;
                 let slot = field(state);
                 if let Some(reply) = slot {
                     Ok((reply.clone(), None))
@@ -895,11 +1009,21 @@ impl EngineRequest {
         let event = poll_fn(|cx| {
             let mut state = self.connection.state.lock().unwrap();
             let slot = state.requests.get_mut(&id).expect("live request slot");
-            match slot.events.pop_front() {
-                Some(event) => Poll::Ready(event),
-                None => {
-                    slot.waker = Some(cx.waker().clone());
-                    Poll::Pending
+            match &mut slot.lifecycle {
+                RequestLifecycle::Open(events) => match events.pop_front() {
+                    Some(event) => Poll::Ready(event),
+                    None => {
+                        slot.waker = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                },
+                RequestLifecycle::Terminal(events) => Poll::Ready(
+                    events
+                        .pop_front()
+                        .expect("terminal request has queued terminal event"),
+                ),
+                RequestLifecycle::PendingAdmission | RequestLifecycle::Refused(_) => {
+                    unreachable!("EngineRequest only exists for admitted requests")
                 }
             }
         })
@@ -911,7 +1035,7 @@ impl EngineRequest {
             // A lost worker already terminated the stream above.
             let _ = self.connection.send_with_state(
                 |state| {
-                    let message = state.closed.is_none().then_some(HostMessage::Credit {
+                    let message = state.phase.is_open().then_some(HostMessage::Credit {
                         request_id: id,
                         batches: 1,
                     });
@@ -949,7 +1073,7 @@ impl EngineRequest {
         let id = self.id;
         let sent = self.connection.send_with_state(
             |state| {
-                if state.closed.is_some() {
+                if !state.phase.is_open() {
                     return Ok((false, None));
                 }
                 state
@@ -987,7 +1111,7 @@ impl Drop for EngineRequest {
         let _ = self.connection.send_with_state(
             |state| {
                 state.requests.remove(&self.id);
-                let message = state.closed.is_none().then_some(HostMessage::Cancel {
+                let message = state.phase.is_open().then_some(HostMessage::Cancel {
                     request_id: self.id,
                 });
                 Ok(((), message))
@@ -1068,10 +1192,112 @@ mod tests {
     fn a_stopped_workers_end_is_the_stop_however_it_ends() {
         let mut state = State::default();
         assert!(matches!(state.lost("the worker ended".into()), RequestError::WorkerLost { .. }));
-        state.shutting_down = true;
+        state.phase.begin_shutdown();
         assert_eq!(
             state.lost("the worker ended".into()),
-            RequestError::ModelUnloaded { cause: crate::error::UnloadCause::Shutdown }
+            RequestError::ModelUnloaded { cause: UnloadCause::Shutdown }
+        );
+    }
+
+    #[test]
+    fn request_lifecycle_rejects_out_of_order_transitions_and_closes_cleanly() {
+        let mut state = State::default();
+        let pending = state.open_request(ReleaseGuard::none()).unwrap();
+        let open = state.open_request(ReleaseGuard::none()).unwrap();
+        let refused = state.open_request(ReleaseGuard::none()).unwrap();
+        let terminal = state.open_request(ReleaseGuard::none()).unwrap();
+
+        // Event before admission is a protocol error.
+        assert!(state
+            .deliver(WorkerMessage::Output {
+                request_id: pending,
+                tokens: Vec::new(),
+            })
+            .is_err());
+
+        // Admitting opens the request; duplicate admission or refusal is rejected.
+        state.deliver(WorkerMessage::Admitted { request_id: open }).unwrap();
+        assert!(state.deliver(WorkerMessage::Admitted { request_id: open }).is_err());
+        assert!(state
+            .deliver(WorkerMessage::AdmissionRefused {
+                request_id: open,
+                error: RequestError::Overloaded,
+            })
+            .is_err());
+
+        // Refusing fixes the error; subsequent events are rejected.
+        state
+            .deliver(WorkerMessage::AdmissionRefused {
+                request_id: refused,
+                error: RequestError::Overloaded,
+            })
+            .unwrap();
+        assert!(state
+            .deliver(WorkerMessage::Output {
+                request_id: refused,
+                tokens: Vec::new(),
+            })
+            .is_err());
+
+        // Terminal event closes the stream; subsequent events are rejected.
+        state.deliver(WorkerMessage::Admitted { request_id: terminal }).unwrap();
+        state
+            .deliver(WorkerMessage::Failed {
+                request_id: terminal,
+                error: RequestError::internal("boom"),
+            })
+            .unwrap();
+        assert!(state
+            .deliver(WorkerMessage::Output {
+                request_id: terminal,
+                tokens: Vec::new(),
+            })
+            .is_err());
+
+        // Closing the connection transitions PendingAdmission -> Refused and Open -> Terminal,
+        // while preserving already-Refused and already-Terminal slots.
+        let lost = RequestError::WorkerLost {
+            reason: "gone".into(),
+        };
+        state.close(lost.clone());
+        assert!(!state.phase.is_open());
+        assert!(!state.phase.is_unloaded());
+        assert!(matches!(
+            &state.requests[&pending].lifecycle,
+            RequestLifecycle::Refused(err) if *err == lost
+        ));
+        assert!(matches!(
+            &state.requests[&open].lifecycle,
+            RequestLifecycle::Terminal(events)
+                if events.len() == 1 && matches!(&events[0], RequestEvent::Failed(err) if *err == lost)
+        ));
+        assert!(matches!(
+            &state.requests[&refused].lifecycle,
+            RequestLifecycle::Refused(RequestError::Overloaded)
+        ));
+        assert!(matches!(
+            &state.requests[&terminal].lifecycle,
+            RequestLifecycle::Terminal(events) if events.len() == 1
+        ));
+    }
+
+    #[test]
+    fn unloaded_closes_connection_and_marks_unloaded() {
+        let mut state = State::default();
+        assert!(state.phase.is_open());
+        assert!(!state.phase.is_unloaded());
+        state
+            .deliver(WorkerMessage::Unloaded {
+                cause: UnloadCause::Shutdown,
+            })
+            .unwrap();
+        assert!(!state.phase.is_open());
+        assert!(state.phase.is_unloaded());
+        assert_eq!(
+            state.phase.check_open(),
+            Err(RequestError::ModelUnloaded {
+                cause: UnloadCause::Shutdown
+            })
         );
     }
 }

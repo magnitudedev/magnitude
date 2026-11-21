@@ -71,7 +71,7 @@ typedef projection::operands<NVFP4> Operands;
         return;                                                                                                        \
     const routed::Gathered chosen = routed::gather(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,           \
         sources, ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, uint(SEISMIC_DIM_M),          \
-        uint(SEISMIC_DIM_K), group.y, ROUTED_GATE_UP_PRODUCT_STRIDE_0, ROUTED_GATE_UP_PRODUCT_STRIDE_1,                \
+        uint(SEISMIC_DIM_K), group.y, ROUTED_GATE_UP_PRODUCT_STRIDE_0, ROUTED_GATE_UP_PRODUCT_STRIDE_1, lane,          \
         [&](uint c, slab::Source source) { return ROUTED_GATE_UP_ACTIVE(c, source); });                                \
     if (chosen.count == 0)                                                                                             \
         return;                                                                                                        \

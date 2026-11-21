@@ -2114,7 +2114,7 @@ impl NativeVisionProgram {
         &self,
         core: &VisionLaunchCore,
         workspace: &mut NativeGraphWorkspaceLease,
-        output: &mut Option<NativeGraphOutputLease>,
+        output: &mut NativeGraphOutputLease,
     ) -> Result<GraphOutputTensor, SubmitError> {
         let input = core.batch().input();
         let class = core.batch().class_patch_rows();
@@ -2218,9 +2218,6 @@ impl NativeVisionProgram {
             .chain(pixels.iter().copied())
             .chain(std::iter::repeat_n(0, padding * pixel_row))
             .collect::<Vec<_>>();
-        let output = output
-            .as_mut()
-            .ok_or_else(|| invalid("vision graph output lease is absent"))?;
         Ok(prepared
             .run(
                 rows,

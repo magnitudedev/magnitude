@@ -43,16 +43,46 @@ struct CombineEpi {
     const float *inject;
     projection::u64 inject_stride;
     __device__ __forceinline__ void operator()(unsigned m, projection::u64 n, float value, float) const {
+        const projection::u32 tile32 = (projection::u32)tile;
+        const int *inv_row = inverse + m * inverse_stride;
+        const float *score_row = scores + m * scores_stride;
         float selected = 0.0f;
         for (projection::u64 k = 0; k < SEISMIC_DIM_K; ++k) {
-            const projection::u64 position = (projection::u64)inverse[m * inverse_stride + k];
+            const projection::u32 position = (projection::u32)inv_row[k];
+            const projection::u32 bucket = position / tile32;
+            const projection::u32 lane = position - bucket * tile32;
             const float projected = element::at<Act>(
-                expert_output, (position / tile) * block_stride + (position % tile) * lane_stride + n);
-            selected = __fmaf_rn(scores[m * scores_stride + k], projected, selected);
+                expert_output, (projection::u64)bucket * block_stride + (projection::u64)lane * lane_stride + n);
+            selected = __fmaf_rn(score_row[k], projected, selected);
         }
         projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(
             out.offset(m * out_stride), residual + m * residual_stride, inject + m * inject_stride, SEISMIC_DIM_H, n,
             selected, Act::round(value) * coefficient[m]);
+    }
+    __device__ __forceinline__ void pair(projection::u32 m, projection::u64 n, float a0, float a1, float, float) const {
+        const projection::u32 tile32 = (projection::u32)tile;
+        const int *inv_row = inverse + m * inverse_stride;
+        const float *score_row = scores + m * scores_stride;
+        float selected0 = 0.0f;
+        float selected1 = 0.0f;
+        for (projection::u64 k = 0; k < SEISMIC_DIM_K; ++k) {
+            const projection::u32 position = (projection::u32)inv_row[k];
+            const projection::u32 bucket = position / tile32;
+            const projection::u32 lane = position - bucket * tile32;
+            const projection::u64 base = (projection::u64)bucket * block_stride + (projection::u64)lane * lane_stride + n;
+            const projection::u8 *address = expert_output + base * Act::bytes;
+            const float2 projected = ((reinterpret_cast<projection::u64>(address) & 3u) == 0u)
+                                         ? Act::unpack2(*reinterpret_cast<const projection::u32 *>(address))
+                                         : make_float2(element::at<Act>(expert_output, base),
+                                                       element::at<Act>(expert_output, base + 1));
+            const float score = score_row[k];
+            selected0 = __fmaf_rn(score, projected.x, selected0);
+            selected1 = __fmaf_rn(score, projected.y, selected1);
+        }
+        const float coeff = coefficient[m];
+        projection::routed_join_pair<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(
+            out.offset(m * out_stride), residual + m * residual_stride, inject + m * inject_stride, SEISMIC_DIM_H, n,
+            selected0, selected1, Act::round(a0) * coeff, Act::round(a1) * coeff);
     }
 };
 

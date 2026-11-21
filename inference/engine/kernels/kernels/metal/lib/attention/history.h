@@ -37,11 +37,17 @@ struct lane_codes {
     // This lane's codes of one vector's code row, shifted so its code i sits
     // at bits B * i of the (i * B / 32)-th word.
     static inline void load(device const uint *row, uint lane, thread uint (&w)[words]) {
-        if (bits == 64) {
+        if constexpr (bits == 128) {
+            const uint4 quad = *reinterpret_cast<device const uint4 *>(row + lane * 4);
+            w[0] = quad.x;
+            w[1] = quad.y;
+            w[2] = quad.z;
+            w[3] = quad.w;
+        } else if constexpr (bits == 64) {
             const uint2 pair = *reinterpret_cast<device const uint2 *>(row + lane * 2);
             w[0] = pair.x;
-            w[words - 1] = pair.y;
-        } else if (bits >= 32) {
+            w[1] = pair.y;
+        } else if constexpr (bits >= 32) {
             ATTENTION_UNROLL
             for (uint j = 0; j < words; ++j)
                 w[j] = row[lane * words + j];

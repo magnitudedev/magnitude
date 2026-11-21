@@ -425,9 +425,10 @@ fn reads_coalesce_then_split_into_pieces() {
         length,
         sink: sink(),
     };
+    let second = ALIGNMENT + 100;
     let ranges = [
         range(0, 90),
-        range(8000, 90),
+        range(second, 90),
         range(2_000_000, 90),
         range(1_000_000, 3 * LEAST_READ as usize),
     ];
@@ -457,7 +458,7 @@ fn reads_coalesce_then_split_into_pieces() {
             .map(|part| (part.range, part.from, part.length))
             .collect::<Vec<_>>()
     };
-    assert_eq!(parts(&pieces[0]), [(0, 0, 90), (1, 8000, 90)]);
+    assert_eq!(parts(&pieces[0]), [(0, 0, 90), (1, second as usize, 90)]);
     let skip = (1_000_000 - start) as usize;
     assert_eq!(parts(&pieces[1]), [(3, skip, LEAST_READ as usize - skip)]);
     assert_eq!(parts(&pieces[2]), [(3, 0, LEAST_READ as usize)]);
@@ -753,9 +754,10 @@ fn a_cancelled_read_ahead_ends_with_what_it_had_in_flight_and_the_due_one_lands(
 }
 
 /// An unprobed volume falls back to `Shape::PENDING` with modern NVMe/SSD
-/// defaults: at least 1 MiB reads (avoiding 128 KiB fragmentation), a knee of
-/// at most 4 MiB so speculative read-ahead cannot pile up behind parked demand
-/// reads, each read size at most half the knee, and due depth at least knee.
+/// defaults: 1 MiB reads (avoiding 128 KiB fragmentation), a 4 MiB knee so
+/// speculative read-ahead cannot pile up behind parked demand reads, and a
+/// `WIDEST_WINDOW` (32 MiB) due depth (`queue_depth() == 37`) so demand bursts
+/// are not capped to a handful of pieces in flight.
 #[test]
 fn unprobed_volume_uses_sane_pending_shape() {
     const MIB: u64 = 1024 * 1024;
@@ -763,12 +765,11 @@ fn unprobed_volume_uses_sane_pending_shape() {
     let urgent = Urgent { parts: vec![460 * 1024; 3], records: 8 };
     for shape in [Shape::PENDING, lines.shape(None), lines.shape(Some(&urgent))] {
         assert_eq!(shape, Shape::PENDING);
-        assert!(shape.due_read >= MIB, "due_read {} < 1 MiB", shape.due_read);
-        assert!(shape.ahead_read >= MIB, "ahead_read {} < 1 MiB", shape.ahead_read);
-        assert!(shape.knee <= 4 * MIB, "knee {} > 4 MiB", shape.knee);
-        assert!(shape.due_read <= shape.knee / 2, "due_read {} > knee / 2 ({})", shape.due_read, shape.knee / 2);
-        assert!(shape.ahead_read <= shape.knee / 2, "ahead_read {} > knee / 2 ({})", shape.ahead_read, shape.knee / 2);
-        assert!(shape.due >= shape.knee, "due {} < knee {}", shape.due, shape.knee);
+        assert_eq!(shape.due, WIDEST_WINDOW);
+        assert_eq!(shape.knee, 4 * MIB);
+        assert_eq!(shape.due_read, MIB);
+        assert_eq!(shape.ahead_read, MIB);
+        assert_eq!(shape.queue_depth(), 37);
     }
 }
 
@@ -915,6 +916,36 @@ fn a_requests_probe_reads_its_range_line() {
     assert_eq!(shape.knee % urgent.span(), 0, "a knee of whole ranges");
     assert_eq!(shape.ahead_read, LEAST_READ, "the least read holding the widest range");
     std::fs::remove_file(path).unwrap();
+}
+
+/// Probing succeeds when each individual part fits in the file even if their
+/// sum exceeds `file.size`, and returns `Error::Invalid` (never panicking)
+/// when a single part exceeds `file.size` or the file is empty.
+#[cfg(unix)]
+#[test]
+fn probe_handles_small_files_without_panicking() {
+    let _volume = temporary_volume();
+    let urgent = Urgent { parts: vec![64 * 1024; 3], records: 2 };
+
+    // Record sum (192 KiB) > file (128 KiB), but every part (64 KiB) fits.
+    let fits_parts = temporary("probe-fits-parts", &vec![3u8; 128 * 1024]);
+    let curve = probe_volume(&OpenFile::open(&fits_parts).unwrap(), Some(&urgent)).unwrap();
+    assert!(!curve.points.is_empty());
+    assert!(!curve.lone.is_empty());
+    assert!(!curve.ranges.is_empty());
+    std::fs::remove_file(fits_parts).unwrap();
+
+    // Widest part (64 KiB) > file (32 KiB): returns Invalid instead of panicking.
+    let too_small = temporary("probe-too-small", &vec![5u8; 32 * 1024]);
+    assert!(matches!(probe_volume(&OpenFile::open(&too_small).unwrap(), Some(&urgent)), Err(Error::Invalid(_))));
+    std::fs::remove_file(too_small).unwrap();
+
+    // Empty file: returns Invalid instead of panicking.
+    let empty = temporary("probe-empty", &[]);
+    let empty_source = OpenFile::open(&empty).unwrap();
+    assert!(matches!(probe_volume(&empty_source, None), Err(Error::Invalid(_))));
+    assert!(matches!(probe_volume(&empty_source, Some(&urgent)), Err(Error::Invalid(_))));
+    std::fs::remove_file(empty).unwrap();
 }
 
 /// A request's range line at each depth, GB/s, with a spread of 2%.
@@ -1287,4 +1318,22 @@ fn stream_rejects_offset_overflow_with_invalid_input() {
         })
         .unwrap();
     std::fs::remove_file(path).unwrap();
+}
+
+/// `ALIGNMENT` matches the platform's direct-read alignment (16 KiB VM page
+/// size on Apple Silicon macOS, 4 KiB elsewhere) and `Buffer::new` returns
+/// allocations aligned to `ALIGNMENT`.
+#[test]
+fn alignment_and_buffer_match_platform_direct_read_alignment() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    assert_eq!(ALIGNMENT, 16384);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    assert_eq!(ALIGNMENT, 4096);
+
+    for length in [0, 1, 4096, ALIGNMENT as usize, ALIGNMENT as usize + 7] {
+        let buffer = Buffer::new(length);
+        let (base, region_len) = buffer.region();
+        assert_eq!(region_len, length);
+        assert_eq!(base.as_ptr() as usize % ALIGNMENT as usize, 0);
+    }
 }

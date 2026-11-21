@@ -237,19 +237,13 @@ impl crate::experts::source::RecordStore for StoreRegion {
     }
 }
 
-/// What a store commits: the slots its records serve, its growth running,
-/// a shrink's evicted records waiting for the passes that may read them,
-/// and a shrink done until an advance reports it.
+/// What a store commits: the slots its records serve, its resize lifecycle
+/// ([`Resize`]), and any running shrink beginning owed to the domain.
 pub(super) struct Commitment {
     /// Written by whoever resizes: a shrink on the submitting thread, a
     /// growth's slots on the resize thread as each joins.
     pub(super) slots: Arc<AtomicU64>,
     pub(super) resize: Resize,
-    pub(super) releasing: Option<Releasing>,
-    pub(super) shrunk: Option<BankResized>,
-    /// A growth stopped synchronously by [`ExpertBank::reclaim`], queued for
-    /// the next `advance` to report so the caller consumes its resize cleanly.
-    pub(super) stopped_growth: Option<BankResized>,
     /// A shrink begun beside a running chain the domain has not yet taken
     /// ([`ExpertBank::take_running_begun`]).
     pub(super) running: Option<RunningBegun>,
@@ -264,27 +258,14 @@ pub(super) struct Commitment {
 
 impl Commitment {
     pub(super) fn new(slots: Arc<AtomicU64>) -> Self {
-        Self {
-            slots,
-            resize: Resize::Idle,
-            releasing: None,
-            shrunk: None,
-            stopped_growth: None,
-            running: None,
-            reclaim_lock: Arc::new(Mutex::new(())),
-            reclaiming: false,
-        }
+        Self { slots, resize: Resize::Idle, running: None, reclaim_lock: Arc::new(Mutex::new(())), reclaiming: false }
     }
 
     /// Whether a resize of the store runs until an advance finishes it: a
-    /// synchronous reclaim, a growth, a shrink's release, a shrink not yet
-    /// reported, or a growth stopped by reclaim not yet reported.
+    /// synchronous reclaim, a growth, a shrink's release, or an outcome not
+    /// yet reported.
     fn resizing(&self) -> bool {
-        self.reclaiming
-            || matches!(self.resize, Resize::Growing(_))
-            || self.releasing.is_some()
-            || self.shrunk.is_some()
-            || self.stopped_growth.is_some()
+        self.reclaiming || !matches!(self.resize, Resize::Idle | Resize::Broken(_))
     }
 }
 
@@ -298,21 +279,55 @@ pub(super) struct HostTier {
     pub(super) commitment: Commitment,
     pub(super) ceiling: u64,
     pub(super) thread: StorageThread,
-    /// The growth running is its backing to the plan's host slots as the
-    /// bank opens ([`ExpertBank::back_host`]), which no domain resize began.
-    pub(super) backing: bool,
     /// Its host slots' last finished resize
     /// ([`crate::domain::ElasticBank::record_resize`]).
     pub(super) last_resize: Option<crate::domain::BankResize>,
 }
 
-/// A store's resize: none, a growth on its resize thread, or broken (a
-/// resize step panicked or broke an invariant: none runs again, and each
-/// asked fails with why).
+/// A store's resize lifecycle: idle, a growth on its resize thread (with
+/// `backing` true for a host tier's open backing to its planned slots,
+/// which no domain resize began), a shrink's evicted records waiting for
+/// the passes that may read them, a finished outcome not yet reported to
+/// the domain, or broken (a resize step panicked or broke an invariant:
+/// none runs again, and each asked fails with why).
 pub(super) enum Resize {
     Idle,
-    Growing(Growing),
+    Growing { growing: Growing, backing: bool },
+    Releasing(Releasing),
+    Reported(BankResized),
     Broken(String),
+}
+
+impl Resize {
+    fn take_growing(&mut self) -> Option<(Growing, bool)> {
+        match std::mem::replace(self, Self::Idle) {
+            Self::Growing { growing, backing } => Some((growing, backing)),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    fn take_releasing(&mut self) -> Option<Releasing> {
+        match std::mem::replace(self, Self::Idle) {
+            Self::Releasing(releasing) => Some(releasing),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    fn take_reported(&mut self) -> Option<BankResized> {
+        match std::mem::replace(self, Self::Idle) {
+            Self::Reported(resized) => Some(resized),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
 }
 
 /// A shrink's evicted records, each group's, whose storage returns once
@@ -670,8 +685,7 @@ impl ExpertBank {
             return Ok(false);
         }
         let growing = self.growing(&tier.stores, (&tier.commitment.slots, to), BankTier::Host, Joining::Landed, &tier.thread, wake);
-        tier.commitment.resize = Resize::Growing(growing);
-        tier.backing = backing;
+        tier.commitment.resize = Resize::Growing { growing, backing };
         Ok(true)
     }
 
@@ -717,7 +731,7 @@ impl ExpertBank {
     /// growth.
     pub(super) fn stop_growth(&self, tier: BankTier) {
         let stop = |resize: &Resize| {
-            if let Resize::Growing(growing) = resize {
+            if let Resize::Growing { growing, .. } = resize {
                 growing.stop.store(true, Ordering::Release);
             }
         };
@@ -758,31 +772,29 @@ impl ExpertBank {
             return Ok(None);
         };
         let tier = &mut *tier;
-        if let Some(stopped) = tier.commitment.stopped_growth.take() {
-            self.drain_owed(&tier.stores, "host tier")?;
-            return Ok(Some((stopped, true)));
-        }
-        if let Some(mut shrunk) = tier.commitment.shrunk.take() {
-            if let BankResized::Shrunk { returned, .. } = &mut shrunk {
-                *returned += self.drain_owed(&tier.stores, "host tier")?;
+        if let Some(mut resized) = tier.commitment.resize.take_reported() {
+            let drained = self.drain_owed(&tier.stores, "host tier")?;
+            if let BankResized::Shrunk { returned, .. } = &mut resized {
+                *returned += drained;
             }
-            return Ok(Some((shrunk, true)));
+            return Ok(Some((resized, true)));
         }
         self.drain_owed(&tier.stores, "host tier")?;
-        let Resize::Growing(growing) = &tier.commitment.resize else {
+        let Resize::Growing { growing, backing } = &tier.commitment.resize else {
             return Ok(None);
         };
+        let backing = *backing;
         let Some(ended) = growing.ended(BankHolding::Host, || tier.stores.charged()) else {
             return Ok(None);
         };
         match ended {
             Ok((resized, spent)) => {
                 let slots = tier.commitment.slots.load(Ordering::Acquire);
-                let kind = if tier.backing { "backing" } else { "growth" };
+                let kind = if backing { "backing" } else { "growth" };
                 let (planned, ceiling) = (self.plan.host_slots, tier.ceiling);
                 tracing::info!("the host tier's {kind} ended at {slots} of {planned} planned host slots ({ceiling} every expert), {spent}: {resized:?}");
                 tier.commitment.resize = Resize::Idle;
-                Ok(Some((resized, !std::mem::take(&mut tier.backing))))
+                Ok(Some((resized, !backing)))
             }
             Err(reason) => {
                 tier.commitment.resize = Resize::Broken(reason.clone());
@@ -794,13 +806,14 @@ impl ExpertBank {
     /// Whether a host tier's growth runs, or its shrink is not yet
     /// reported, until its advance finishes it.
     pub(super) fn host_growing(&self) -> bool {
-        self.host().is_some_and(|tier| !tier.backing && tier.commitment.resizing())
+        self.host()
+            .is_some_and(|tier| tier.commitment.resizing() && !matches!(tier.commitment.resize, Resize::Growing { backing: true, .. }))
     }
 
     /// Whether the host tier's backing to its planned slots runs
     /// ([`Self::back_host`]), until its advance finishes it.
     pub(super) fn host_backing(&self) -> bool {
-        self.host().is_some_and(|tier| tier.backing && matches!(tier.commitment.resize, Resize::Growing(_)))
+        self.host().is_some_and(|tier| matches!(tier.commitment.resize, Resize::Growing { backing: true, .. }))
     }
 
     /// [`ElasticBank::shrink`] of `tier`'s records now, beside running steps
@@ -834,7 +847,7 @@ impl ExpertBank {
             let to = slots as u64;
             commitment.slots.store(to, Ordering::Release);
             let begun = Begun { decided, queued, planned: decided.elapsed().saturating_sub(queued), trip };
-            commitment.shrunk = Some(self.release(stores, tier, (from, to), charged, &records, begun)?);
+            commitment.resize = Resize::Reported(self.release(stores, tier, (from, to), charged, &records, begun)?);
             Ok(BankStep::Begun(tier))
         };
         match tier {
@@ -909,7 +922,7 @@ impl ExpertBank {
             Placer::Bank => Joining::Landed,
         };
         let growing = self.growing(&self.stores, (&commitment.slots, to), BankTier::Bank, joining, &self.resize_thread, wake);
-        commitment.resize = Resize::Growing(growing);
+        commitment.resize = Resize::Growing { growing, backing: false };
         Ok(BankStep::Begun(BankTier::Bank))
     }
 
@@ -919,27 +932,24 @@ impl ExpertBank {
     /// thread ended it.
     pub(super) fn advance(&self) -> Result<Option<BankResized>, DomainError> {
         let mut commitment = self.commitment();
-        if let Some(stopped) = commitment.stopped_growth.take() {
-            self.drain_owed(&self.stores, "expert bank")?;
-            return Ok(Some(stopped));
-        }
-        if let Some(releasing) = commitment.releasing.take() {
+        if let Some(releasing) = commitment.resize.take_releasing() {
             match self.released(releasing) {
-                Ok(shrunk) => commitment.shrunk = Some(shrunk),
+                Ok(shrunk) => commitment.resize = Resize::Reported(shrunk),
                 Err(error) => {
                     commitment.resize = Resize::Broken(error.to_string());
                     return Err(error);
                 }
             }
         }
-        if let Some(mut shrunk) = commitment.shrunk.take() {
-            if let BankResized::Shrunk { returned, .. } = &mut shrunk {
-                *returned += self.drain_owed(&self.stores, "expert bank")?;
+        if let Some(mut resized) = commitment.resize.take_reported() {
+            let drained = self.drain_owed(&self.stores, "expert bank")?;
+            if let BankResized::Shrunk { returned, .. } = &mut resized {
+                *returned += drained;
             }
-            return Ok(Some(shrunk));
+            return Ok(Some(resized));
         }
         self.drain_owed(&self.stores, "expert bank")?;
-        let Resize::Growing(growing) = &commitment.resize else {
+        let Resize::Growing { growing, .. } = &commitment.resize else {
             return Ok(None);
         };
         match growing.ended(BankHolding::Experts, || self.charged()) {
@@ -996,23 +1006,25 @@ impl ExpertBank {
         };
         let short = short.then(pressure).flatten().filter(|pressure| pressure.bytes > 0);
         let mut commitment = self.commitment();
-        if commitment.releasing.is_none() {
-            let short = short.filter(|_| !commitment.resizing())?;
+        if !matches!(commitment.resize, Resize::Releasing(_)) {
+            let short = short.filter(|_| matches!(commitment.resize, Resize::Idle) && !commitment.resizing())?;
             if let Err(reason) = self.evict_beside(&mut commitment, chain, short, started) {
                 commitment.resize = Resize::Broken(reason);
                 return None;
             }
         }
-        let releasing = commitment.releasing.as_ref()?;
+        let Resize::Releasing(releasing) = &commitment.resize else {
+            return None;
+        };
         // Due once every pass of the decided block is submitted, or at once
         // beside a later chain, whose steps resolve none of them.
         let awaits = (releasing.last == chain.last()).then_some(releasing.after).flatten().filter(|&block| submitted.is_none_or(|through| through < block));
         if awaits.is_some() {
             return awaits;
         }
-        let releasing = commitment.releasing.take().expect("a release is due");
+        let releasing = commitment.resize.take_releasing().expect("a release is due");
         match self.released(releasing) {
-            Ok(shrunk) => commitment.shrunk = Some(shrunk),
+            Ok(shrunk) => commitment.resize = Resize::Reported(shrunk),
             Err(error) => commitment.resize = Resize::Broken(error.to_string()),
         }
         None
@@ -1047,7 +1059,7 @@ impl ExpertBank {
         assert!(commitment.running.replace(RunningBegun { decided, held: started.elapsed() }).is_none(), "a running shrink's beginning is taken before the next begins");
         let after = layer.map(|layer| self.plan.layers()[layer].sublayer().block as usize);
         let begun = Begun { decided, queued: Duration::ZERO, planned: trip.picked + trip.served, trip };
-        commitment.releasing = Some(Releasing { from, to, charged, evicted: records, last: chain.last(), after, begun });
+        commitment.resize = Resize::Releasing(Releasing { from, to, charged, evicted: records, last: chain.last(), after, begun });
         Ok(())
     }
 
@@ -1115,45 +1127,21 @@ impl ExpertBank {
         // 1. Mark `reclaiming = true` and stop any running growth on `tier`,
         //    then await its current slot outside the commitment lock so no
         //    deadlock is possible.
-        let stopped = match tier {
-            BankTier::Bank => {
-                let mut commitment = self.commitment();
-                if let Resize::Broken(reason) = &commitment.resize {
-                    return Err(ReclaimError::Invariant(reason.clone()));
-                }
-                assert!(!commitment.reclaiming, "invariant violated: concurrent bank reclaim despite reclaim_lock");
-                commitment.reclaiming = true;
-                match std::mem::replace(&mut commitment.resize, Resize::Idle) {
-                    Resize::Growing(growing) => {
-                        growing.stop.store(true, Ordering::Release);
-                        Some((growing, false))
-                    }
-                    other => {
-                        commitment.resize = other;
-                        None
-                    }
-                }
+        let begin_reclaim = |commitment: &mut Commitment, label: &str| -> Result<Option<(Growing, bool)>, ReclaimError> {
+            if let Resize::Broken(reason) = &commitment.resize {
+                return Err(ReclaimError::Invariant(reason.clone()));
             }
+            assert!(!commitment.reclaiming, "invariant violated: concurrent {label} reclaim despite reclaim_lock");
+            commitment.reclaiming = true;
+            Ok(commitment.resize.take_growing().inspect(|(growing, _)| growing.stop.store(true, Ordering::Release)))
+        };
+        let stopped = match tier {
+            BankTier::Bank => begin_reclaim(&mut self.commitment(), "bank")?,
             BankTier::Host => {
                 let Some(mut host) = self.host() else {
                     return Err(ReclaimError::AtFloor);
                 };
-                if let Resize::Broken(reason) = &host.commitment.resize {
-                    return Err(ReclaimError::Invariant(reason.clone()));
-                }
-                assert!(!host.commitment.reclaiming, "invariant violated: concurrent host reclaim despite reclaim_lock");
-                host.commitment.reclaiming = true;
-                match std::mem::replace(&mut host.commitment.resize, Resize::Idle) {
-                    Resize::Growing(growing) => {
-                        growing.stop.store(true, Ordering::Release);
-                        let was_backing = std::mem::take(&mut host.backing);
-                        Some((growing, was_backing))
-                    }
-                    other => {
-                        host.commitment.resize = other;
-                        None
-                    }
-                }
+                begin_reclaim(&mut host.commitment, "host")?
             }
         };
         let _reclaiming = ReclaimGuard { bank: self, tier };
@@ -1170,18 +1158,10 @@ impl ExpertBank {
                     self.cache.fit(holding, self.above_floor(tier, slots));
                     if !was_backing {
                         match tier {
-                            BankTier::Bank => {
-                                assert!(
-                                    self.commitment().stopped_growth.replace(resized).is_none(),
-                                    "invariant violated: a stopped growth was not consumed before another began"
-                                );
-                            }
+                            BankTier::Bank => self.commitment().resize = Resize::Reported(resized),
                             BankTier::Host => {
                                 if let Some(mut host) = self.host() {
-                                    assert!(
-                                        host.commitment.stopped_growth.replace(resized).is_none(),
-                                        "invariant violated: a stopped host growth was not consumed before another began"
-                                    );
+                                    host.commitment.resize = Resize::Reported(resized);
                                 }
                             }
                         }
@@ -1201,19 +1181,14 @@ impl ExpertBank {
             }
         }
 
-        // 2. Flush any pending `releasing` from an earlier running shrink on
-        //    Bank, storing its `BankResized` in `commitment.shrunk` so the
-        //    next `advance()` pairs with `bank_began[Bank]`.
+        // 2. Flush any pending `Resize::Releasing` from an earlier running
+        //    shrink on Bank, storing its `BankResized` in `Resize::Reported`
+        //    so the next `advance()` pairs with `bank_began[Bank]`.
         if tier == BankTier::Bank {
-            let releasing = self.commitment().releasing.take();
+            let releasing = self.commitment().resize.take_releasing();
             if let Some(releasing) = releasing {
                 match self.released(releasing) {
-                    Ok(shrunk) => {
-                        assert!(
-                            self.commitment().shrunk.replace(shrunk).is_none(),
-                            "invariant violated: a running shrink's release was not consumed before another finished"
-                        );
-                    }
+                    Ok(shrunk) => self.commitment().resize = Resize::Reported(shrunk),
                     Err(error) => {
                         let reason = error.to_string();
                         self.commitment().resize = Resize::Broken(reason.clone());

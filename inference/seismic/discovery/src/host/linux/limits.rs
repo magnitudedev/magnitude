@@ -182,9 +182,10 @@ pub(super) fn cgroup_floor(limit_bytes: u64) -> u64 {
 /// which its siblings share: the visible level whose own
 /// `memory.limit_in_bytes` is that limit, else (the level is above the
 /// mount) the mount's root, the outermost visible; its clean file cache
-/// from that level's hierarchical (`total_`) counts, excluding `total_shmem`
-/// and `total_mapped_file`. None where the limit is the page counter's
-/// maximum ([`v1_unlimited_bytes`]) or a file is missing.
+/// from that level's hierarchical (`total_`) counts, excluding mapped
+/// regular-file pages (`total_mapped_file − total_shmem`). None where the
+/// limit is the page counter's maximum ([`v1_unlimited_bytes`]) or a file
+/// is missing.
 fn v1_limit(sys: &impl Sys, mount: &CgroupMount) -> Option<Limit> {
     let own = mount.cgroup.join("memory.stat");
     let limit_bytes = stat_field(&own, &sys.text(&own)?, "hierarchical_memory_limit")?;
@@ -208,12 +209,12 @@ fn v1_limit(sys: &impl Sys, mount: &CgroupMount) -> Option<Limit> {
         "total_dirty",
         "total_writeback",
     ];
-    let non_droppable = stat_field(&path, &stat, "total_shmem")
+    let mapped_file = stat_field(&path, &stat, "total_mapped_file")
         .unwrap_or(0)
-        .saturating_add(stat_field(&path, &stat, "total_mapped_file").unwrap_or(0));
+        .saturating_sub(stat_field(&path, &stat, "total_shmem").unwrap_or(0));
     let reclaimable_bytes = clean_cache(
         cache.map(|key| stat_field(&path, &stat, key)),
-        non_droppable,
+        mapped_file,
     )
     .min(raw_used);
     Some(Limit {
@@ -229,9 +230,10 @@ fn v1_limit(sys: &impl Sys, mount: &CgroupMount) -> Option<Limit> {
 /// A cgroup v2 level's limit: the lower of `memory.max` and `memory.high`
 /// (past which the kernel reclaims the cgroup and throttles it), enforced
 /// against its `memory.current` plus [`cgroup_floor`]; its clean file cache
-/// from its `memory.stat`, excluding `shmem` and `file_mapped` (executables
-/// and shared libraries). None where both are `max` or missing (the root, or
-/// no memory controller), or where `memory.current` is missing.
+/// from its `memory.stat`, excluding mapped regular-file pages
+/// (`file_mapped − shmem`, executables and shared libraries). None where both
+/// are `max` or missing (the root, or no memory controller), or where
+/// `memory.current` is missing.
 fn v2_limit(sys: &impl Sys, directory: &Path, cgroup: String) -> Option<Limit> {
     let limit_bytes = ["memory.max", "memory.high"]
         .into_iter()
@@ -246,18 +248,18 @@ fn v2_limit(sys: &impl Sys, directory: &Path, cgroup: String) -> Option<Limit> {
     let path = directory.join("memory.stat");
     let cache = ["active_file", "inactive_file", "file_dirty", "file_writeback"];
     let stat = sys.text(&path);
-    let non_droppable = stat
+    let mapped_file = stat
         .as_deref()
-        .and_then(|stat| stat_field(&path, stat, "shmem"))
+        .and_then(|stat| stat_field(&path, stat, "file_mapped"))
         .unwrap_or(0)
-        .saturating_add(
+        .saturating_sub(
             stat.as_deref()
-                .and_then(|stat| stat_field(&path, stat, "file_mapped"))
+                .and_then(|stat| stat_field(&path, stat, "shmem"))
                 .unwrap_or(0),
         );
     let reclaimable_bytes = clean_cache(
         cache.map(|key| stat.as_deref().and_then(|stat| stat_field(&path, stat, key))),
-        non_droppable,
+        mapped_file,
     )
     .min(raw_used);
     Some(Limit {
@@ -352,7 +354,9 @@ fn allowed_nodes(sys: &impl Sys, status: &str) -> Option<Limit> {
         cache += clean_cache(
             ["Active(file):", "Inactive(file):", "Dirty:", "Writeback:"]
                 .map(|name| kib_field(&meminfo, name)),
-            kib_field(&meminfo, "Shmem:").unwrap_or(0),
+            kib_field(&meminfo, "Mapped:")
+                .unwrap_or(0)
+                .saturating_sub(kib_field(&meminfo, "Shmem:").unwrap_or(0)),
         );
     }
     let floor = super::memory::nodes_floor(sys, &nodes, total);

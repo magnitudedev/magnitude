@@ -36,7 +36,8 @@ using Epi = projection::Activated<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 template <int TPW, int KSPLIT>
 __launch_bounds__(routed::DECODE_THREADS) __global__ void routed_up_choice(SEISMIC_KERNEL_PARAMS) {
     using Shape = routed::DecodeShape<TPW, KSPLIT>;
-    __shared__ projection::GemvShared<Shape, projection::SharedRow> shared;
+    using Readers = routed::DecodeReaders<packets::W0>;
+    __shared__ projection::GemvShared<Shape, projection::SharedRow, 0, routed::DecodePoints<packets::W0>> shared;
     const projection::u8 *normalized = SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED);
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;
@@ -55,6 +56,7 @@ __launch_bounds__(routed::DECODE_THREADS) __global__ void routed_up_choice(SEISM
         });
         return;
     }
+    projection::stage_points(Readers{});
     const projection::u64 group = Shape::tile_group();
     const auto epi = projection::scaling<(SEISMIC_DIM_US != 0)>::wrap(
         Epi{product, 0, (int)SEISMIC_PARAM_ACTIVATION},
@@ -84,7 +86,8 @@ __global__ void routed_up_stage(SEISMIC_KERNEL_PARAMS) {
 template <int TPW, int KSPLIT>
 __global__ void routed_up_gathered(SEISMIC_KERNEL_PARAMS) {
     using Shape = routed::DecodeShape<TPW, KSPLIT>;
-    __shared__ projection::GemvShared<Shape, Raw> shared;
+    using Readers = routed::DecodeReaders<packets::W0>;
+    __shared__ projection::GemvShared<Shape, Raw, 0, routed::DecodePoints<packets::W0>> shared;
     __shared__ routed::Gathered table;
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const unsigned choice = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;
@@ -106,6 +109,7 @@ __global__ void routed_up_gathered(SEISMIC_KERNEL_PARAMS) {
             });
         return;
     }
+    projection::stage_points(Readers{});
     const projection::u64 group = Shape::tile_group();
     const auto epi = projection::scaling<(SEISMIC_DIM_US != 0)>::wrap(
         routed::ChoiceRows<Epi>{Epi{SEISMIC_RESULT_0_OUT, 0, (int)SEISMIC_PARAM_ACTIVATION},

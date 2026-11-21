@@ -970,6 +970,10 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     PositionPlan *plan = reinterpret_cast<PositionPlan *>(table);
     float *exchange = reinterpret_cast<float *>(
         Rows::POSITIONS ? table + PLAN_INTS : table + (last + 1) * 4);  // [WARPS * COLUMNS][W]
+    // Decode rows with producer warps concurrently use `exchange` in
+    // `stage_fresh_at`, so the split-scores exchange sits after it.
+    [[maybe_unused]] float *split_exchange =
+        (Rows::POSITIONS && PRODUCED) ? exchange + WARPS * COLUMNS * W : exchange;
 
     // Span table: union and common interval of the tile's valid tokens. Decode
     // rows (POSITIONS) place their tiles on each row's own grid instead.
@@ -1732,7 +1736,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
         if constexpr (SPLIT_SCORES) {
             // Publish this warp's span scores, meet the row block's other
             // column warps, and add every span's scores in column order.
-            float *group = exchange + ((parity * WARPS + row_block) * COLUMNS) * 32 * SPLIT_LANE_FLOATS;
+            float *group = split_exchange + ((parity * WARPS + row_block) * COLUMNS) * 32 * SPLIT_LANE_FLOATS;
             float *own = group + (column * 32 + lane) * SPLIT_LANE_FLOATS;
 #pragma unroll
             for (int n = 0; n < KEYS / 8; ++n)

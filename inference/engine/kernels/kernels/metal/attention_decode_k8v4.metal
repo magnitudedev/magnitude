@@ -329,11 +329,9 @@ kernel void attention_decode_k8v4_partial(
 #endif
 }
 
-// L2: threadgroup (query head, row, 32-column group), one thread per column:
-// the fixed-order merge of the row's partitions (with the head's sink when
-// SK = 1) and the output gate. With the output rotary (RO = 1), one
-// threadgroup holds the head's whole row, which it turns back in F32 before
-// publishing it.
+// L2: threadgroup (query head, row), one thread per column (W threads): the
+// fixed-order merge of the row's partitions (with the head's sink when
+// SK = 1), the output rotary in F32 when RO = 1, and the output gate.
 kernel void attention_decode_k8v4_merge(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
@@ -355,11 +353,13 @@ kernel void attention_decode_k8v4_merge(
         return;
     constexpr bool ROTATED = SEISMIC_DIM_RO != 0;
     const element::Out<activation::Act> result(result_cells);
-    threadgroup float weights[2 * SEISMIC_TUNE_PARTS];
+    threadgroup float weights[SEISMIC_TUNE_PARTS];
+    threadgroup uint shared_active;
+    threadgroup float shared_inv_divisor;
     threadgroup float row_values[ROTATED ? ATTENTION_W : 1];
     attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_MATRIX ? SEISMIC_TUNE_KEYS : 0, 0,
         ROTATED>(query, gate,
-        visible, fresh, result, partials, statistics, weights, SEISMIC_DIM_R, group.x, group.y,
-        ROTATED ? thread_index : group.z * 32 + lane, lane, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks,
-        thread_index < 32, row_values, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes);
+        visible, fresh, result, partials, statistics, weights, shared_active, shared_inv_divisor, SEISMIC_DIM_R,
+        group.x, group.y, thread_index, lane, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks,
+        row_values, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes);
 }

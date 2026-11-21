@@ -1,8 +1,9 @@
 // unit_reads on CUDA (contract and portable body in indexer.seismic), as
-// Metal's (`metal/unit_reads.metal`): a block of 256 threads per row, a
-// thread per bitmap word finding its word's picks by a binary search of the
-// ascending valid picks; thread 0 writes the units, the picks then the tail
-// unit, then -1.
+// Metal's (`metal/unit_reads.metal`): a block of 256 threads per row. Thread 0
+// finds the count of valid picks by binary search and broadcasts it through
+// shared memory; all 256 threads write `units` (the picks, then the tail unit,
+// then -1) in parallel, and each thread sets its bitmap words by binary search
+// over the ascending valid picks.
 //
 // Dynamic extents and strides read `seismic_words`.
 
@@ -10,6 +11,7 @@ typedef unsigned int u32;
 typedef unsigned long long u64;
 
 extern "C" __global__ void unit_reads(SEISMIC_KERNEL_PARAMS) {
+    __shared__ u32 shared_count;
     const u64 row = blockIdx.x;
     const u32 k = static_cast<u32>(SEISMIC_DIM_K);
     const u32 b = static_cast<u32>(SEISMIC_DIM_B);
@@ -18,18 +20,21 @@ extern "C" __global__ void unit_reads(SEISMIC_KERNEL_PARAMS) {
     const int tail = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_COMPLETE))[row * SEISMIC_COMPLETE_STRIDE_0];
     u32 *bitmap = reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)) + row * SEISMIC_RESULT_0_STRIDE_0;
     int *units = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER)) + row * SEISMIC_RESULT_1_STRIDE_0;
-    // The valid picks: the first `count`.
-    u32 lo = 0, hi = k;
-    while (lo < hi) {
-        const u32 mid = (lo + hi) / 2;
-        if (picks[mid * pick_stride] >= 0) lo = mid + 1;
-        else hi = mid;
+    // The valid picks: the first `count`, found once by thread 0 and broadcast.
+    if (threadIdx.x == 0) {
+        u32 lo = 0, hi = k;
+        while (lo < hi) {
+            const u32 mid = (lo + hi) / 2;
+            if (picks[mid * pick_stride] >= 0) lo = mid + 1;
+            else hi = mid;
+        }
+        shared_count = lo;
     }
-    const u32 count = lo;
-    if (threadIdx.x == 0)
-        for (u32 slot = 0; slot <= k; ++slot)
-            units[slot * SEISMIC_RESULT_1_STRIDE_1] =
-                slot < count ? picks[slot * pick_stride] : (slot == count ? tail : -1);
+    __syncthreads();
+    const u32 count = shared_count;
+    for (u32 slot = threadIdx.x; slot <= k; slot += blockDim.x)
+        units[slot * SEISMIC_RESULT_1_STRIDE_1] =
+            slot < count ? picks[slot * pick_stride] : (slot == count ? tail : -1);
     for (u32 word = threadIdx.x; word < b; word += blockDim.x) {
         const int first = static_cast<int>(word * 32);
         // The first pick at or past the word's first unit.

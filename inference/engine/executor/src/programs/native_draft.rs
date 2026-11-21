@@ -118,7 +118,7 @@ pub(crate) struct DraftGraphClass {
     /// Whether windowed history layers inject the entry rows. Always for a
     /// drafting class; an injection-only class may skip them when every
     /// entry row falls before the first draft's windows
-    /// (`HeadLaunchCore::windowed`).
+    /// (`HeadState::Owned`).
     pub windowed: bool,
     /// Whether an injection-only entry reads its conditioning from a target
     /// feature output on the device (a prompt chunk's entry drafted behind
@@ -3944,20 +3944,27 @@ impl NativeDraftProgram {
             ),
             None => (0, false),
         };
+        let crate::HeadState::Owned {
+            advances,
+            conditioning,
+            windowed,
+        } = core.state()
+        else {
+            return Err(invalid("draft batch has no state advance"));
+        };
         let class = DraftGraphClass {
             entry_rows: entry_rows as u64,
             slots: slots as u64,
             proposals: steps as u64,
             shaped,
-            windowed: block.is_some() || core.windowed(),
+            windowed: block.is_some() || *windowed,
             device: matches!(
-                core.conditioning(),
+                conditioning,
                 crate::HeadConditioning::Features { .. }
             ),
         };
         let (graph, bound) = self.graphs.class(class)?;
-        let planes = core
-            .advances()
+        let planes = advances
             .first()
             .ok_or_else(|| invalid("draft batch has no state advance"))?
             .bindings()
@@ -3992,7 +3999,7 @@ impl NativeDraftProgram {
             }
         }
         let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
-        match (&graph.conditioning, core.conditioning()) {
+        match (&graph.conditioning, conditioning) {
             // Host rows in entry-row order, widened to F32 and padded.
             (DraftConditioning::Rows(port), crate::HeadConditioning::Rows(rows)) => {
                 let mut conditioning = Vec::new();
@@ -4240,10 +4247,7 @@ impl HeadProgram for NativeDraftProgram {
     ) -> Result<Self::Submission, (SubmitError, ValidatedHeadLaunch)> {
         let queued = {
             let (core, workspace, output) = launch.execution_parts_mut();
-            match output.as_mut() {
-                Some(output) => self.queue(core, workspace, output),
-                None => Err(invalid("draft graph output lease is absent")),
-            }
+            self.queue(core, workspace, output)
         };
         let (completion, output) = match queued {
             Ok(queued) => queued,

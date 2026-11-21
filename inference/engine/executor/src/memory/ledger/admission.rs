@@ -273,6 +273,7 @@ struct Candidate {
     kind: CacheKind,
     id: EntryId,
     bytes: u64,
+    releasing: u64,
     reclaim: CandidateReclaim,
 }
 
@@ -312,13 +313,13 @@ impl State {
             .held
             .iter()
             .filter_map(|(id, entry)| {
-                let (kind, bytes) = match entry.holding {
-                    Holding::Cache(ck) if of(ck) && entry.bytes > 0 => (ck, entry.bytes),
+                let (kind, bytes, releasing) = match entry.holding {
+                    Holding::Cache(ck) if of(ck) && entry.bytes > 0 => (ck, entry.bytes, 0),
                     Holding::Pool(class) if Some(class) != own_pool && of(CacheKind::Spare) && (entry.bytes > 0 || entry.releasing > 0) => {
-                        (CacheKind::Spare, entry.bytes)
+                        (CacheKind::Spare, entry.bytes, entry.releasing)
                     }
                     Holding::Pool(class) if Some(class) == own_pool && entry.releasing > 0 && need_own_pool_flush => {
-                        (CacheKind::Spare, 0)
+                        (CacheKind::Spare, 0, entry.releasing)
                     }
                     _ => return None,
                 };
@@ -336,7 +337,7 @@ impl State {
                     }
                     Some(Reclaim::Deferred) | None => return None,
                 };
-                Some(Candidate { value: entry.value, kind, id: *id, bytes, reclaim })
+                Some(Candidate { value: entry.value, kind, id: *id, bytes, releasing, reclaim })
             })
             .collect();
         candidates.sort_by_key(|c| (c.value, c.kind, c.id));
@@ -392,35 +393,56 @@ impl State {
             _ => own_pool.map_or(0, |class| self.spare_of(class)),
         };
         let external = policy.bytes.saturating_sub(own_spare);
-        let alloc_needed = match (holding, external) {
-            (_, 0) => 0,
-            (Holding::Committed(CommittedKind::Backing(class)), ext) => match self.pools[class.index()].as_ref() {
-                Some(pool) => ext.div_ceil(pool.block.get()).saturating_mul(pool.block.get()),
-                None => ext,
+        if external == 0 {
+            return ReclaimStep::Done(Ok(self.insert(holding, policy.bytes)));
+        }
+        let alloc_needed = match holding {
+            Holding::Committed(CommittedKind::Backing(class)) => match self.pools[class.index()].as_ref() {
+                Some(pool) => external.div_ceil(pool.block.get()).saturating_mul(pool.block.get()),
+                None => external,
             },
-            (_, ext) => ext,
+            _ => external,
         };
-        let free = if external == 0 { 0 } else { estimate.free() };
+        let budget = estimate.budget();
+        let held_now = estimate.held_now();
+        let free = estimate.free();
         let beside = {
             let raw = self.free_for(read, holding, external).saturating_add(reclaimed).min(free);
             if policy.within_boundary {
-                let within = estimate.cap().map_or(u64::MAX, |cap| cap.saturating_sub(estimate.held_now()));
+                let within = estimate.cap().map_or(u64::MAX, |cap| cap.saturating_sub(held_now));
                 raw.min(within)
             } else {
                 raw
             }
         };
-        let candidates = self.reclaim_candidates(own_pool, &policy.of, alloc_needed > estimate.allocatable(), exhausted);
+        // Compute deficits without saturating away any over-budget overhang
+        // (`held_now > budget` or `allocated + credited > budget`) so an
+        // over-budget admission requests the full deficit in one reclaim call
+        // (or fails fast with `Short`) instead of looping one slot at a time.
+        let need_alloc = estimate.allocated().saturating_add(estimate.credited()).saturating_add(alloc_needed).saturating_sub(budget);
+        let need_budget_ext = held_now.saturating_add(external).saturating_sub(budget);
+        let need_budget_alloc = held_now.saturating_add(alloc_needed).saturating_sub(budget);
+        let need_cap = if policy.within_boundary {
+            estimate.cap().map_or(0, |cap| held_now.saturating_add(external).saturating_sub(cap))
+        } else {
+            0
+        };
+        let candidates = self.reclaim_candidates(own_pool, &policy.of, need_alloc > 0, exhausted);
         let reclaimable_room: u64 = candidates.iter().map(|c| c.bytes).sum();
-        let max_room = if policy.allow_guarantee { free } else { beside }.saturating_add(reclaimable_room);
-        if external > max_room {
+        let reclaimable_shed: u64 = candidates.iter().map(|c| c.releasing).sum::<u64>().min(estimate.shed());
+        let max_reclaimable_held = reclaimable_room.saturating_add(reclaimable_shed);
+        let min_need_held = if policy.allow_guarantee {
+            need_budget_ext
+        } else {
+            external.saturating_sub(beside).max(need_budget_ext)
+        }
+        .max(need_cap);
+        if min_need_held > max_reclaimable_held {
             self.waiting = true;
-            return ReclaimStep::Done(Err(Over { bytes: external - max_room }.of(store, policy.bytes)));
+            return ReclaimStep::Done(Err(Over { bytes: min_need_held - max_reclaimable_held }.of(store, policy.bytes)));
         }
 
-        let need_block_slack = alloc_needed.saturating_sub(free);
-        let need_room = external.saturating_sub(beside).max(need_block_slack);
-        let need_alloc = alloc_needed.saturating_sub(estimate.allocatable());
+        let need_room = external.saturating_sub(beside).max(need_budget_alloc).max(need_cap);
         let need_reclaim = need_room.max(need_alloc);
 
         if need_reclaim == 0 {
@@ -443,7 +465,7 @@ impl State {
             self.waiting = true;
             return ReclaimStep::Done(Err(Over { bytes: need_alloc }.of(store, policy.bytes)));
         }
-        let owed = self.give_unbacked(external.saturating_sub(beside), &policy.of, holding);
+        let owed = self.give_unbacked(need_room, &policy.of, holding);
         let short = if policy.allow_guarantee { owed.saturating_sub(free - beside) } else { owed };
         if short > 0 {
             self.waiting = true;
@@ -514,7 +536,13 @@ impl Ledger {
             let holding = Holding::Committed(kind);
             let free = state.free_for(read, holding, most).saturating_add(reclaimed).min(state.free(read, most));
             let candidates = state.reclaim_candidates(None, &yielding, false, exhausted);
-            let cover = candidates.iter().fold(free, |acc, c| acc.saturating_add(c.bytes));
+            let reclaimable_room: u64 = candidates.iter().map(|c| c.bytes).sum();
+            let reclaimable_shed: u64 = candidates.iter().map(|c| c.releasing).sum::<u64>().min(estimate.shed());
+            let held_overhang = estimate.held_now().saturating_sub(estimate.budget());
+            let cover = free
+                .saturating_add(reclaimable_room)
+                .saturating_add(reclaimable_shed)
+                .saturating_sub(held_overhang);
             let unbacked_room: u64 = candidates
                 .iter()
                 .filter(|c| matches!(c.reclaim, CandidateReclaim::Unbacked))
@@ -522,8 +550,13 @@ impl Ledger {
                 .sum();
             let units = most.min(cover / unit.get());
             let bytes = units * unit.get();
-            let need_alloc = bytes.saturating_sub(estimate.allocatable());
-            let need_reclaim = bytes.saturating_sub(free).max(need_alloc);
+            if bytes == 0 {
+                return ReclaimStep::Done((state.insert(holding, 0), 0));
+            }
+            let budget = estimate.budget();
+            let need_held = estimate.held_now().saturating_add(bytes).saturating_sub(budget);
+            let need_alloc = estimate.allocated().saturating_add(estimate.credited()).saturating_add(bytes).saturating_sub(budget);
+            let need_reclaim = bytes.saturating_sub(free).max(need_held).max(need_alloc);
             if need_reclaim == 0 {
                 return ReclaimStep::Done((state.insert(holding, bytes), units));
             }

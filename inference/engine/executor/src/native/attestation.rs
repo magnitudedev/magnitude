@@ -729,7 +729,7 @@ impl AttestedPrograms {
         tuning: TuningContext<'_>,
         room: Option<&'_ dyn super::tuning::TuningRoom>,
     ) -> Result<Vec<TunedEntry>, CatalogError> {
-        let limits = TuningLimits::of(plan.policy().limits(), tuning.definition);
+        let limits = TuningLimits::of(plan.policy().limits(), plan.load(), tuning.definition);
         Self::preparation_inputs(
             plan.policy().path(),
             plan.device(),
@@ -791,7 +791,8 @@ impl AttestedPrograms {
                     topology.vision().is_some(),
                 ),
                 tuning.definition.draft.as_ref(),
-                selection_limits.max_launch_rows as u64,
+                limits.max_rows,
+                limits.max_pass_rows,
             ),
         })
     }
@@ -816,7 +817,7 @@ impl AttestedPrograms {
             plan.device(),
             plan.programs(),
             plan.load(),
-            TuningLimits::of(plan.policy().limits(), tuning.definition),
+            TuningLimits::of(plan.policy().limits(), plan.load(), tuning.definition),
             plan.policy().limits(),
             plan.policy().method(),
             charges,

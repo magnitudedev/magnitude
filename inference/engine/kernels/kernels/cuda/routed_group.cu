@@ -17,7 +17,7 @@ namespace {
 constexpr unsigned experts = SEISMIC_DIM_E;
 constexpr unsigned parts = 1024 / experts;
 constexpr unsigned threads = experts * parts;
-constexpr unsigned warps = (threads + 31) / 32;
+constexpr unsigned expert_warps = (experts + 31) / 32;
 constexpr unsigned K = SEISMIC_DIM_K;
 constexpr unsigned chunk_choices = SEISMIC_CONST_GROUP_CHOICES;
 
@@ -103,8 +103,10 @@ extern "C" __global__ void routed_group_place(SEISMIC_KERNEL_PARAMS) {
         halves[flat] = flat < choices ? static_cast<unsigned short>(GROUP_ROUTE(base + first + flat))
                                       : static_cast<unsigned short>(0xffffu);
     // Expert e's choices in every chunk and in the chunks before this one.
+    // For a single live chunk (chunks <= 1), `partials` is not needed and may
+    // not be populated; `total` is summed directly from `slices` below.
     unsigned total = 0, before = 0;
-    if (part == 0)
+    if (part == 0 && chunks > 1u)
         for (unsigned other = 0; other < chunks; ++other) {
             const unsigned value = partials[static_cast<unsigned long long>(other) * experts + expert];
             total += value;
@@ -115,33 +117,47 @@ extern "C" __global__ void routed_group_place(SEISMIC_KERNEL_PARAMS) {
     for (unsigned vector = begin; vector < end; ++vector)
         count += matches(staged[vector], expert);
     slices[expert * parts + part] = count;
+    if (chunks <= 1u) {
+        __syncthreads();
+        if (part == 0) {
+            for (unsigned slice = 0; slice < parts; ++slice)
+                total += slices[expert * parts + slice];
+        }
+    }
 
-    // Exclusive scan of the experts' tile counts (thread e < E holds expert e).
+    // Exclusive scan of the experts' tile counts (thread e < E holds expert e;
+    // only warps < expert_warps carry part == 0 threads).
     const unsigned tiles = (total + tile - 1) / tile;
     unsigned inclusive = tiles;
-#pragma unroll
-    for (unsigned offset = 1; offset < 32; offset *= 2) {
-        const unsigned value = __shfl_up_sync(0xffffffffu, inclusive, offset);
-        if (lane >= offset)
-            inclusive += value;
-    }
-    if (lane == 31)
-        sums[warp] = inclusive;
-    __syncthreads();
-    if (warp == 0) {
-        unsigned value = lane < warps ? sums[lane] : 0;
+    if (warp < expert_warps) {
 #pragma unroll
         for (unsigned offset = 1; offset < 32; offset *= 2) {
-            const unsigned other = __shfl_up_sync(0xffffffffu, value, offset);
+            const unsigned value = __shfl_up_sync(0xffffffffu, inclusive, offset);
             if (lane >= offset)
-                value += other;
+                inclusive += value;
         }
-        if (lane < warps)
-            sums[lane] = value;
+        if constexpr (expert_warps > 1) {
+            if (lane == 31 && warp < expert_warps - 1)
+                sums[warp] = inclusive;
+        }
     }
-    __syncthreads();
-    const unsigned start = inclusive + (warp > 0 ? sums[warp - 1] : 0) - tiles;
+    if constexpr (expert_warps > 1) {
+        __syncthreads();
+        if (warp == 0) {
+            unsigned value = lane < expert_warps - 1 ? sums[lane] : 0;
+#pragma unroll
+            for (unsigned offset = 1; offset < 32; offset *= 2) {
+                const unsigned other = __shfl_up_sync(0xffffffffu, value, offset);
+                if (lane >= offset)
+                    value += other;
+            }
+            if (lane < expert_warps - 1)
+                sums[lane] = value;
+        }
+        __syncthreads();
+    }
     if (part == 0) {
+        const unsigned start = inclusive + (expert_warps > 1 && warp > 0 ? sums[warp - 1] : 0) - tiles;
         bases[expert] = start * tile + before;
         if (chunk == 0) {
             counts[expert * SEISMIC_COUNTS_STRIDE_0] = static_cast<int>(total);
@@ -156,12 +172,16 @@ extern "C" __global__ void routed_group_place(SEISMIC_KERNEL_PARAMS) {
     }
     __syncthreads();
 
+    if (count == 0)
+        return;
     unsigned position = bases[expert];
     for (unsigned slice = 0; slice < part; ++slice)
         position += slices[expert * parts + slice];
+    unsigned remaining = count;
     for (unsigned vector = begin; vector < end; ++vector) {
         const uint4 packed = staged[vector];
-        if (matches(packed, expert) == 0)
+        const unsigned found = matches(packed, expert);
+        if (found == 0)
             continue;
         const unsigned words[4] = {packed.x, packed.y, packed.z, packed.w};
 #pragma unroll
@@ -176,5 +196,8 @@ extern "C" __global__ void routed_group_place(SEISMIC_KERNEL_PARAMS) {
                     static_cast<unsigned long long>(flat % K) * SEISMIC_INVERSE_STRIDE_1] = static_cast<int>(position);
             ++position;
         }
+        remaining -= found;
+        if (remaining == 0)
+            break;
     }
 }

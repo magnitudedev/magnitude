@@ -105,7 +105,8 @@ typedef projection::operands<NVFP4> Operands;
 #include "lib/projection/operator.h"
 
 // Past 16 rows: one threadgroup per row and stream normalizes it into
-// `normalized` and publishes its inverse.
+// `normalized` (in row order, or in the tall GEMM's order past 64 rows)
+// and publishes its inverse.
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_STAGE
 kernel void stream_mix_down_stage(PROJECTION_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
@@ -113,6 +114,19 @@ kernel void stream_mix_down_stage(PROJECTION_ARGUMENTS,
     PROJECTION_NORMALIZE_SHARED(norms);
     PROJECTION_OPERANDS;
     const float value = projection::device_normalize<256>(raw, item, normalized, k, norms, thread_index);
+    if (thread_index == 0)
+        inverse.put(ulong(item / uint(SEISMIC_DIM_S)) * SEISMIC_RESULT_2_STRIDE_0
+            + ulong(item % uint(SEISMIC_DIM_S)) * SEISMIC_RESULT_2_STRIDE_1, value);
+}
+#endif
+#ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_STAGE_TALL
+kernel void stream_mix_down_stage_tall(PROJECTION_ARGUMENTS,
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(norms);
+    PROJECTION_OPERANDS;
+    const float value = projection::device_normalize<256, projection::TallOrder<activation_element>>(
+        raw, item, normalized, k, norms, thread_index);
     if (thread_index == 0)
         inverse.put(ulong(item / uint(SEISMIC_DIM_S)) * SEISMIC_RESULT_2_STRIDE_0
             + ulong(item % uint(SEISMIC_DIM_S)) * SEISMIC_RESULT_2_STRIDE_1, value);

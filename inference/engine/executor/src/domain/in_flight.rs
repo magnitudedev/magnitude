@@ -408,8 +408,13 @@ impl<F: ProgramFamily> TargetFlight<F> {
     /// chunk's target result before waiting for drafter history.
     pub(super) fn detach_priming(&mut self) -> Option<(PrimingFlight<F::HeadSubmission>, usize)> {
         let work = self.work.priming.take()?;
-        let advances = self.work.submission.launch().advances();
-        let target = &advances[0];
+        let target = &self
+            .work
+            .submission
+            .launch()
+            .slot(0)
+            .expect("invariant violated: target launch has no slot")
+            .advance;
         Some((work, target.position() + target.rows()))
     }
 }

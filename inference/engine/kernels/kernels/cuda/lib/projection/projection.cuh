@@ -1111,19 +1111,37 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
 #pragma unroll
             for (int e = 0; e < 4; ++e)
                 d[nb][e] = 0.0f;
-#pragma unroll
-        for (int step = 0; step < W::GROUP_STEPS; ++step) {
-            const int h = W::gemv_half(step, t);
-            u32 a[4];
-            W::template entry_pairs<Op, Src>(raw, 0, group, t, h, a[0], a[2]);
-            W::template entry_pairs<Op, Src>(raw, 1, group, t, h, a[1], a[3]);
-            const u64 k = kblock * 64 + 8 * entry + 4 * h;
+        if constexpr (W::GROUP_STEPS == 2) {
+            u32 rg[4], rg8[4];
+            W::template entry_all_pairs<Op, Src>(raw, 0, group, t, rg);
+            W::template entry_all_pairs<Op, Src>(raw, 1, group, t, rg8);
+            const u64 k = kblock * 64 + 8 * entry;
+            const u32 a0[4] = {rg[0], rg8[0], rg[1], rg8[1]};
+            const u32 a1[4] = {rg[2], rg8[2], rg[3], rg8[3]};
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
                 const u32 m = 8 * nb + g;
-                const bool feeds = is_shared_row<Pro> || m < M;
-                const u32 b[2] = {feeds ? pro.pair(factors, m, k) : 0u, feeds ? pro.pair(factors, m, k + 2) : 0u};
-                Op::mma(d[nb], a, b);
+                const uint4 x = is_shared_row<Pro> || m < M ? pro.octet(factors, m, k) : make_uint4(0u, 0u, 0u, 0u);
+                const u32 b0[2] = {x.x, x.y};
+                const u32 b1[2] = {x.z, x.w};
+                Op::mma(d[nb], a0, b0);
+                Op::mma(d[nb], a1, b1);
+            }
+        } else {
+#pragma unroll
+            for (int step = 0; step < W::GROUP_STEPS; ++step) {
+                const int h = W::gemv_half(step, t);
+                u32 a[4];
+                W::template entry_pairs<Op, Src>(raw, 0, group, t, h, a[0], a[2]);
+                W::template entry_pairs<Op, Src>(raw, 1, group, t, h, a[1], a[3]);
+                const u64 k = kblock * 64 + 8 * entry + 4 * h;
+#pragma unroll
+                for (int nb = 0; nb < NB; ++nb) {
+                    const u32 m = 8 * nb + g;
+                    const bool feeds = is_shared_row<Pro> || m < M;
+                    const u32 b[2] = {feeds ? pro.pair(factors, m, k) : 0u, feeds ? pro.pair(factors, m, k + 2) : 0u};
+                    Op::mma(d[nb], a, b);
+                }
             }
         }
 #pragma unroll
@@ -1182,12 +1200,15 @@ __device__ __forceinline__ void gemv_entries_group(const Ready &ready, u32 M, u6
                     stage.bb[i] = wb.block(tile0 + i, sb, lane);
             }
     };
-    Stage stage;
+    Stage current;
     if (begin < end)
-        load(stage, begin);
+        load(current, begin);
     const auto pro = ready();
     static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
     for (u64 sb = begin; sb < end; ++sb) {
+        Stage next;
+        if (sb + 1 < end)
+            load(next, sb + 1);
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
             const u64 kblock = 4 * sb + q;
@@ -1196,17 +1217,16 @@ __device__ __forceinline__ void gemv_entries_group(const Ready &ready, u32 M, u6
                 if (kblock >= kblocks || tile0 + i >= tiles)
                     continue;
                 Coefficients<WA::GROUPS> ca;
-                wa.coefficients(stage.ba[i], q, ca);
-                gemv_entries_kblock<NB, Src>(acc[0][i], wa, stage.ra[i][q], ca, pro, M, kblock);
+                wa.coefficients(current.ba[i], q, ca);
+                gemv_entries_kblock<NB, Src>(acc[0][i], wa, current.ra[i][q], ca, pro, M, kblock);
                 if constexpr (PAIR) {
                     Coefficients<WB::GROUPS> cb;
-                    wb.coefficients(stage.bb[i], q, cb);
-                    gemv_entries_kblock<NB, Src>(acc[1][i], wb, stage.rb[i][q], cb, pro, M, kblock);
+                    wb.coefficients(current.bb[i], q, cb);
+                    gemv_entries_kblock<NB, Src>(acc[1][i], wb, current.rb[i][q], cb, pro, M, kblock);
                 }
             }
         }
-        if (sb + 1 < end)
-            load(stage, sb + 1);
+        current = next;
     }
     gemv_finish<TPW, KSPLIT, NB>(acc, M, tile0, tiles, rows, epi, reduce, barrier, part);
 }
@@ -1545,8 +1565,10 @@ template <class Shape, class WA, class WB, u64 GRID, int RESIDENCY> struct GemvR
         const u64 per = (GRID + SEISMIC_MULTIPROCESSORS - 1) / SEISMIC_MULTIPROCESSORS;
         return per < 1 ? 1 : per > MOST ? MOST : per;
     }
-    static constexpr int value = !RECORDS ? (GRID == 0 ? 1 : wave() < (u64)RESIDENCY ? (int)wave() : RESIDENCY)
-                                          : GRID == 0 ? 0 : (int)wave();
+    static constexpr int value =
+        RECORDS || (GRID == 0 && Shape::WARPS == 4)
+            ? (GRID == 0 ? 0 : (int)wave())
+            : (GRID == 0 ? 1 : wave() < (u64)RESIDENCY ? (int)wave() : RESIDENCY);
 };
 
 // The launch bounds' minimum blocks per SM of a GEMV kernel of that launch.

@@ -225,7 +225,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         ) {
             Ok(launch) => launch,
             Err((inputs, error)) => {
-                let (_, advances, _, _, _) = inputs.into_parts();
+                let HeadState::Owned { advances, .. } = inputs.into_state() else {
+                    unreachable!("owned head launch")
+                };
                 self.restore_head_advances(&metadata, advances);
                 return Err(SubmitFailure::Failed(DomainError::Invariant(error)));
             }
@@ -264,7 +266,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Ok(submission) => submission,
             Err((error, launch)) => {
                 let (core, _, _) = launch.into_submission_parts();
-                let (_, advances, _) = core.into_parts();
+                let HeadState::Owned { advances, .. } = core.into_state() else {
+                    unreachable!("owned head launch")
+                };
                 self.restore_head_advances(&metadata, advances);
                 return Err(SubmitFailure::Failed(error.into()));
             }
@@ -303,15 +307,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(SubmitFailure::Refused(error.into(), bindings));
             }
         };
-        let conditioning = HeadConditioning::Rows(
-            operations
-                .iter()
-                .filter_map(|operation| match operation {
-                    Operation::Head { conditioning, .. } => Some(conditioning.clone()),
-                    _ => None,
-                })
-                .collect(),
-        );
+        let conditioning = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::Head { conditioning, .. } => Some(conditioning.clone()),
+                _ => None,
+            })
+            .collect();
         let inputs = HeadLaunchInputs::reading_target(
             batch,
             crate::TargetReads { states, history },
@@ -327,9 +329,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         ) {
             Ok(launch) => launch,
             Err((inputs, error)) => {
-                if let Some(reads) = inputs.into_target_reads() {
-                    self.restore_target_reads(operations, reads.states);
-                }
+                let HeadState::TargetReads { reads, .. } = inputs.into_state() else {
+                    unreachable!("target-reading head launch")
+                };
+                self.restore_target_reads(operations, reads.states);
                 return Err(SubmitFailure::Failed(DomainError::Invariant(error)));
             }
         };
@@ -339,9 +342,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Ok(submission) => submission,
             Err((error, launch)) => {
                 let (core, _, _) = launch.into_submission_parts();
-                if let Some(reads) = core.into_target_reads() {
-                    self.restore_target_reads(operations, reads.states);
-                }
+                let HeadState::TargetReads { reads, .. } = core.into_state() else {
+                    unreachable!("target-reading head launch")
+                };
+                self.restore_target_reads(operations, reads.states);
                 return Err(SubmitFailure::Failed(error.into()));
             }
         };
@@ -845,16 +849,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // A head that keeps no history read its requests' accepted target
         // states: the device is done with them, so they return unchanged and
         // its outcomes own no advance.
-        let advances = if core.target_reads().is_some() {
-            let reads = core.into_target_reads().expect("invariant violated: a head flight lost its target reads");
-            assert_eq!(reads.states.len(), requests.len(), "invariant violated: a head flight's target reads differ from its requests");
-            for ((request, _, _), state) in requests.iter().zip(reads.states) {
-                self.put_target_state(*request, state);
+        let advances = match core.into_state() {
+            HeadState::TargetReads { reads, .. } => {
+                assert_eq!(reads.states.len(), requests.len(), "invariant violated: a head flight's target reads differ from its requests");
+                for ((request, _, _), state) in requests.iter().zip(reads.states) {
+                    self.put_target_state(*request, state);
+                }
+                requests.iter().map(|_| None).collect::<Vec<_>>()
             }
-            requests.iter().map(|_| None).collect::<Vec<_>>()
-        } else {
-            let (_, advances, _) = core.into_parts();
-            advances
+            HeadState::Owned { advances, .. } => advances
                 .into_iter()
                 .map(|advance| match advance {
                     TentativeAdvance::Accepted(advance) => Some(advance),
@@ -862,7 +865,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         panic!("invariant violated: a head transaction follows an in-flight advance")
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         };
         let mut pending: Vec<PendingOperationOutcome> = requests
             .into_iter()

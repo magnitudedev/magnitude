@@ -1,6 +1,6 @@
 use super::file::SourceFile;
 use super::platform::{evict, uncached, volume_key};
-use super::probe::{Curve, Urgent, VolumeLines};
+use super::probe::{Curve, Urgent, VolumeLines, WIDEST_WINDOW};
 use super::OpenFile;
 use crate::{Error, Volume};
 use std::collections::HashMap;
@@ -49,10 +49,11 @@ impl Shape {
     /// How a volume is read before any probe of it: 1 MiB reads (avoiding
     /// 128 KiB fragmentation on NVMe/SSD drives while keeping each piece at
     /// most half the knee), a 4 MiB knee so speculative read-ahead never
-    /// queues tens of MiB behind a parked demand read, and an 8 MiB due
-    /// depth so parked and streamed demand reads saturate modern NVMe drives.
+    /// queues tens of MiB behind a parked demand read, and a [`WIDEST_WINDOW`]
+    /// (32 MiB) due depth so multi-piece demand bursts saturate modern NVMe
+    /// drives without capping the worker pool.
     pub(crate) const PENDING: Self = Self {
-        due: 8 * 1024 * 1024,
+        due: WIDEST_WINDOW,
         knee: 4 * 1024 * 1024,
         ahead_read: 1024 * 1024,
         due_read: 1024 * 1024,

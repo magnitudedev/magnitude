@@ -1194,6 +1194,24 @@ pub mod tensor {
         /// Per slot, the backed slots before it, and last all of them: how
         /// many of a run of slots are backed is one difference.
         backed: Vec<usize>,
+        /// Distinct `Allocation::access_identity()` values of any lent slab
+        /// lenders in this view's store (empty when no slabs are lent).
+        #[cfg(any(test, target_os = "macos"))]
+        pub(crate) lender_groups: Box<[usize]>,
+        /// Globally unique logical allocation identity for this view's
+        /// `(Slots, region)` (`Slots::region_identity`), used to summarize
+        /// pool-backed slabs in O(1) reaches instead of O(slabs).
+        #[cfg(any(test, target_os = "macos"))]
+        pub(crate) logical_allocation: u64,
+        /// Starting slot index of this view within its `Slots` store.
+        #[cfg(any(test, target_os = "macos"))]
+        pub(crate) first_slot: usize,
+        /// Contiguous physical lender range for this view's leading lent
+        /// slots, if any: `(lender_allocation_id, lender_byte_base, lent_bytes)`
+        /// where view byte `b < lent_bytes` lies at `lender_byte_base + b` in
+        /// `lender_allocation_id`.
+        #[cfg(any(test, target_os = "macos"))]
+        pub(crate) lent_region: Option<(u64, u64, u64)>,
     }
 
     /// The slots of `slab_bytes` each that hold bytes `[offset, offset +
@@ -1206,14 +1224,35 @@ pub mod tensor {
     }
 
     impl SlabReach {
-        fn new(table_bytes: u64, slab_bytes: u64, regions: Vec<Option<(u64, u64, u64)>>) -> Self {
+        fn new(
+            table_bytes: u64,
+            slab_bytes: u64,
+            regions: Vec<Option<(u64, u64, u64)>>,
+            #[cfg(any(test, target_os = "macos"))] lender_groups: Box<[usize]>,
+            #[cfg(any(test, target_os = "macos"))] logical_allocation: u64,
+            #[cfg(any(test, target_os = "macos"))] first_slot: usize,
+            #[cfg(any(test, target_os = "macos"))] lent_region: Option<(u64, u64, u64)>,
+        ) -> Self {
             let backed = std::iter::once(0)
                 .chain(regions.iter().scan(0, |backed, region| {
                     *backed += usize::from(region.is_some());
                     Some(*backed)
                 }))
                 .collect();
-            Self { table_bytes, slab_bytes, regions, backed }
+            Self {
+                table_bytes,
+                slab_bytes,
+                regions,
+                backed,
+                #[cfg(any(test, target_os = "macos"))]
+                lender_groups,
+                #[cfg(any(test, target_os = "macos"))]
+                logical_allocation,
+                #[cfg(any(test, target_os = "macos"))]
+                first_slot,
+                #[cfg(any(test, target_os = "macos"))]
+                lent_region,
+            }
         }
 
         /// The slots that hold the view's bytes `[offset, offset + bytes)`.
@@ -1223,8 +1262,27 @@ pub mod tensor {
         }
 
         /// Whether any of `slots` is backed.
-        fn any_backed(&self, slots: std::ops::Range<usize>) -> bool {
+        pub(crate) fn any_backed(&self, slots: std::ops::Range<usize>) -> bool {
             self.backed[slots.end] > self.backed[slots.start]
+        }
+
+        #[cfg(test)]
+        pub(crate) fn for_test(
+            slab_bytes: u64,
+            regions: Vec<Option<(u64, u64, u64)>>,
+            logical_allocation: u64,
+            first_slot: usize,
+            lent_region: Option<(u64, u64, u64)>,
+        ) -> Self {
+            Self::new(
+                seismic_lang::registry::record_table_entry(regions.len() as u64),
+                slab_bytes,
+                regions,
+                Box::new([]),
+                logical_allocation,
+                first_slot,
+                lent_region,
+            )
         }
 
         /// The bytes device work reaches in slot `slot` for the view's bytes
@@ -1444,10 +1502,41 @@ pub mod tensor {
             match &*cached {
                 Some((read, reach)) if *read == generation => reach.clone(),
                 _ => {
+                    #[cfg(any(test, target_os = "macos"))]
+                    let lender_groups = {
+                        let mut groups: Vec<usize> = self
+                            .slots
+                            .lenders()
+                            .map(|lender| lender.access_identity())
+                            .collect();
+                        groups.sort_unstable();
+                        groups.dedup();
+                        groups.into_boxed_slice()
+                    };
+                    #[cfg(any(test, target_os = "macos"))]
+                    let lent_region = self.slots.lent_region(self.region).and_then(|(lender, start)| {
+                        let lent_slots = self.slots.lent().saturating_sub(self.first).min(self.count);
+                        let lent_bytes = lent_slots as u64 * self.slab_bytes;
+                        (lent_bytes > 0).then(|| {
+                            (
+                                lender.identity(),
+                                start + self.first as u64 * self.slab_bytes,
+                                lent_bytes,
+                            )
+                        })
+                    });
                     let reach = Arc::new(SlabReach::new(
                         seismic_lang::registry::record_table_entry(self.count as u64),
                         self.slab_bytes,
                         self.slots.reach(self.region, self.first, self.count, self.slab_bytes),
+                        #[cfg(any(test, target_os = "macos"))]
+                        lender_groups,
+                        #[cfg(any(test, target_os = "macos"))]
+                        self.slots.region_identity(self.region),
+                        #[cfg(any(test, target_os = "macos"))]
+                        self.first,
+                        #[cfg(any(test, target_os = "macos"))]
+                        lent_region,
                     ));
                     *cached = Some((generation, reach.clone()));
                     reach

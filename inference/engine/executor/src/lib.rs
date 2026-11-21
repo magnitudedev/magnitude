@@ -107,11 +107,11 @@ pub use kernel_cache::{
 };
 pub use lanes::ConditioningSlice;
 pub use lanes::{
-    FrontFeatures, FrontReads, HeadConditioning, HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore, ImportLaunchInputs,
-    ResidentWeightSlot, SlotGuess, StateLaunchCore, StateLaunchInputs, StateWork, TargetHistoryRead,
-    TargetLaunchCore, TargetLaunchInputs, TargetLaunchWorkspace, TargetReads, TargetTokens,
-    ValidatedHeadLaunch, ValidatedImportLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
-    ValidatedVisionLaunch, VisionLaunchCore, VisionLaunchInputs,
+    FrontFeatures, FrontReads, HeadConditioning, HeadLaunchCore, HeadLaunchInputs, HeadState, ImportLaunchCore,
+    ImportLaunchInputs, ResidentWeightSlot, SlotGuess, StateLaunchCore, StateLaunchInputs, StateWork,
+    TargetHistoryRead, TargetHostSlot, TargetLaunchCore, TargetLaunchInputs, TargetLaunchWorkspace, TargetReads,
+    TargetSlot, TargetSlotsIter, TargetTokens, ValidatedHeadLaunch, ValidatedImportLaunch, ValidatedStateLaunch,
+    ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchCore, VisionLaunchInputs,
 };
 pub use magnitude_batching::{self as batching, Demand, LaunchClass};
 /// Development-only tuning pin for bit-exact measurement runs
@@ -153,7 +153,7 @@ pub use planning::{
     CONVERSATION_CHECKPOINTS, CPU_IMAGE_CELLS, CapabilityPlan, ComponentPlan, ComponentSelection,
     ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,
     DenseBinding, DenseBranchBinding, DenseScales, DeviceProcessBytes, DraftBlockBinding,
-    DraftProgramPlan, DraftWidths,
+    DraftProgramPlan, DrafterProgramPlan, DraftWidths,
     BankForm, ChargedDraft, EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding, FloorForms, HeldForm, HeldBound, HeldCharge, Placed, Unplaced, WeightBound,
     FeedForwardProgramSlot, FlightDepth, GraphSlots, HeadBinding, HeadProgramPlan, HostProcessBytes,
     CandidatePool, CandidatesBinding, HostTablePlan, ImportProgramSlot, IndexerBinding,

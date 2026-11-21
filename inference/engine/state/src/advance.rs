@@ -130,12 +130,15 @@ impl OwnedCodecAdvance {
         match Self::prepare(&source, &destination) {
             Ok((source_codec, destination_codec, from)) => {
                 let counts = from.iter().map(Vec::len).collect::<Vec<_>>();
-                let claims = match destination.store.reserve_rows(&vec![Tail::NEW; counts.len()], &counts)
+                let claims = match destination
+                    .snapshot
+                    .store
+                    .reserve_rows(&vec![Tail::NEW; counts.len()], &counts)
                 {
                     Ok(claims) => claims,
                     Err(error) => return Err((source, destination, error)),
                 };
-                let destination_bank = match destination.store.successor_bank() {
+                let destination_bank = match destination.snapshot.store.successor_bank() {
                     Ok(bank) => bank,
                     Err(error) => return Err((source, destination, error)),
                 };
@@ -153,18 +156,18 @@ impl OwnedCodecAdvance {
                         ));
                     }
                 };
-                let source_history = match source.store.history_planes() {
+                let source_history = match source.snapshot.store.history_planes() {
                     Ok(planes) => planes,
                     Err(error) => return Err((source, destination, error)),
                 };
-                let destination_history = match destination.store.history_planes() {
+                let destination_history = match destination.snapshot.store.history_planes() {
                     Ok(planes) => planes,
                     Err(error) => return Err((source, destination, error)),
                 };
                 let conversions = conversion_steps(&source, &destination, &from, &to);
                 Ok(Self {
-                    source_recurrent: source.store.recurrent_arenas(),
-                    destination_recurrent: destination.store.recurrent_arenas(),
+                    source_recurrent: source.snapshot.store.recurrent_arenas(),
+                    destination_recurrent: destination.snapshot.store.recurrent_arenas(),
                     source,
                     destination,
                     claims,
@@ -187,23 +190,31 @@ impl OwnedCodecAdvance {
         source: &SequenceState,
         destination: &SequenceState,
     ) -> Result<(KvCodec, KvCodec, Vec<Vec<usize>>), Error> {
-        if Rc::ptr_eq(&source.store, &destination.store)
-            || !source.store.device.same_device(&destination.store.device)
-            || destination.position != 0
-            || destination.claims.iter().any(|claims| !claims.is_empty())
-            || destination.history_start != 0
-            || source.store.component_specs != destination.store.component_specs
-            || source.store.shared != destination.store.shared
-            || source.position > destination.store.context_capacity
-            || source.expected_end > destination.store.context_capacity
+        if Rc::ptr_eq(&source.snapshot.store, &destination.snapshot.store)
+            || !source
+                .snapshot
+                .store
+                .device
+                .same_device(&destination.snapshot.store.device)
+            || destination.snapshot.position != 0
+            || destination
+                .snapshot
+                .domains
+                .iter()
+                .any(|domain| !domain.claims.is_empty())
+            || destination.snapshot.history_start != 0
+            || source.snapshot.store.component_specs != destination.snapshot.store.component_specs
+            || source.snapshot.store.shared != destination.snapshot.store.shared
+            || source.snapshot.position > destination.snapshot.store.context_capacity
+            || source.expected_end > destination.snapshot.store.context_capacity
         {
             return Err(Error::Request(
                 "codec conversion requires a fresh compatible destination on the same device"
                     .into(),
             ));
         }
-        let source_domains = &source.store.domains;
-        let destination_domains = &destination.store.domains;
+        let source_domains = &source.snapshot.store.domains;
+        let destination_domains = &destination.snapshot.store.domains;
         if source_domains.is_empty()
             || source_domains.len() != destination_domains.len()
             || source_domains
@@ -296,7 +307,7 @@ impl OwnedCodecAdvance {
             source_history: &self.source_history,
             destination_history: &self.destination_history,
             source_recurrent: &self.source_recurrent,
-            source_bank: self.source.bank.index(),
+            source_bank: self.source.bank_index(),
             destination_recurrent: &self.destination_recurrent,
             destination_bank: self.destination_bank.index(),
             conversions: &self.conversions,
@@ -313,15 +324,21 @@ impl OwnedCodecAdvance {
             mut destination_bank,
             ..
         } = self;
-        destination.position = source.position;
+        destination.snapshot.position = source.snapshot.position;
         destination.expected_end = source.expected_end;
-        destination.history_start = source.history_start;
-        destination.starts = source.starts.clone();
-        for (history, claims) in destination.claims.iter_mut().zip(claims) {
-            history.append(claims);
+        destination.snapshot.history_start = source.snapshot.history_start;
+        for ((dst, src), claims) in destination
+            .snapshot
+            .domains
+            .iter_mut()
+            .zip(&source.snapshot.domains)
+            .zip(claims)
+        {
+            dst.start = src.start;
+            dst.claims.append(claims);
         }
-        std::mem::swap(&mut destination.bank, &mut destination_bank);
-        destination.tape = source.tape;
+        std::mem::swap(&mut destination.snapshot.bank, &mut destination_bank);
+        destination.snapshot.tape = source.snapshot.tape;
         destination
     }
 }
@@ -364,10 +381,11 @@ fn conversion_steps(
     let mut source_base = 0;
     let mut destination_base = 0;
     let pairs = source
+        .snapshot
         .store
         .domains
         .iter()
-        .zip(&destination.store.domains)
+        .zip(&destination.snapshot.store.domains)
         .enumerate()
         .flat_map(|(domain, (before, after))| {
             before
@@ -441,13 +459,14 @@ impl OwnedTailRelocation {
         let ranges = state.history_ranges(domain);
         let &(last, count) = ranges.last().expect("a blocked history has rows");
         let end = last + count;
-        let page_rows = state.store.history_page_rows(domain);
+        let page_rows = state.snapshot.store.history_page_rows(domain);
         // A page is filled in place from its first row, so the history's
         // rows of its last page are one run.
         let first = last.max((end - 1) / page_rows * page_rows);
         let moved = end - first;
-        let Some(destination) = state.store.reserve_page(domain, moved) else {
-            let error = match (page_rows as u64).checked_mul(state.store.history_row_bytes(domain))
+        let Some(destination) = state.snapshot.store.reserve_page(domain, moved) else {
+            let error = match (page_rows as u64)
+                .checked_mul(state.snapshot.store.history_row_bytes(domain))
             {
                 Some(required) => Error::Capacity {
                     required,
@@ -463,6 +482,7 @@ impl OwnedTailRelocation {
             .flat_map(|(start, count)| start..start + count)
             .collect::<Vec<_>>();
         let copy = match state
+            .snapshot
             .store
             .history_row_copy(domain, (first..end).collect(), to)
         {
@@ -494,7 +514,7 @@ impl OwnedTailRelocation {
             destination,
             ..
         } = self;
-        let claims = &mut state.claims[domain.0];
+        let claims = &mut state.snapshot.domains[domain.0].claims;
         let kept = claims.rows() - destination.rows();
         drop(claims.split_off(kept));
         claims.append(destination);
@@ -545,23 +565,33 @@ impl OwnedStateAdvance {
         if committed == 0 {
             return Err((state, Error::from("an advance commits rows")));
         }
-        if count > state.store.context_capacity.saturating_sub(state.position) {
+        if count
+            > state
+                .snapshot
+                .store
+                .context_capacity
+                .saturating_sub(state.snapshot.position)
+        {
             return Err((state, Error::from("advance exceeds context capacity")));
         }
-        let claims = match state.store.reserve(&state.tails(), state.position, count) {
+        let claims = match state
+            .snapshot
+            .store
+            .reserve(&state.tails(), state.snapshot.position, count)
+        {
             Ok(claims) => claims,
             Err(error) => return Err((state, error)),
         };
-        let following = match state.store.successor_bank() {
+        let following = match state.snapshot.store.successor_bank() {
             Ok(following) => following,
             Err(error) => return Err((state, error)),
         };
-        let history = match state.store.history_planes() {
+        let history = match state.snapshot.store.history_planes() {
             Ok(history) => history,
             Err(error) => return Err((state, error)),
         };
         let destinations = destinations(&claims);
-        let recurrent = state.store.recurrent_arenas();
+        let recurrent = state.snapshot.store.recurrent_arenas();
         Ok(Self {
             state,
             count,
@@ -576,7 +606,7 @@ impl OwnedStateAdvance {
     }
 
     pub fn position(&self) -> usize {
-        self.state.position
+        self.state.position()
     }
 
     pub fn rows(&self) -> usize {
@@ -611,8 +641,8 @@ impl OwnedStateAdvance {
     pub fn bindings(&self) -> OwnedAdvanceBindings<'_> {
         OwnedAdvanceBindings {
             recurrent: &self.recurrent,
-            previous_bank: self.state.bank.index(),
-            previous_tape: self.state.tape,
+            previous_bank: self.state.bank_index(),
+            previous_tape: self.state.tape_rows(),
             following_bank: self.following.index(),
             stop: self.committed,
             history: &self.history,
@@ -659,7 +689,7 @@ impl OwnedStateAdvance {
         if accepted == 0 {
             return Ok(OwnedAdvanceResolution::Aborted(state));
         }
-        let tape = if state.store.has_recurrent_components() {
+        let tape = if state.snapshot.store.has_recurrent_components() {
             let Some(tape) = accepted.checked_sub(committed) else {
                 return Err((
                     state,
@@ -670,7 +700,12 @@ impl OwnedStateAdvance {
         } else {
             0
         };
-        keep_accepted(&state.store, &mut claims, state.position, accepted);
+        keep_accepted(
+            &state.snapshot.store,
+            &mut claims,
+            state.snapshot.position,
+            accepted,
+        );
         install_commit(&mut state, claims, &mut following, tape, accepted);
         Ok(OwnedAdvanceResolution::Committed(state))
     }
@@ -720,18 +755,24 @@ impl OwnedStateAdvance {
         if self.acceptable != self.committed {
             return Err(Error::from("a successor follows an advance whose commit is decided by its reconciliation"));
         }
+        let starts = self.state.history_starts();
         Ok(Predecessor::of(
-            &self.state.store,
-            self.state.position,
+            &self.state.snapshot.store,
+            self.state.snapshot.position,
             self.committed,
             &self.claims,
-            self.state.history_start,
-            &self.state.starts,
+            self.state.snapshot.history_start,
+            &starts,
             self.state.domain_ranges(),
             self.following.index(),
             &self.history,
             &self.recurrent,
-            self.state.claims.iter().map(|claims| claims.id).collect(),
+            self.state
+                .snapshot
+                .domains
+                .iter()
+                .map(|domain| domain.claims.id)
+                .collect(),
         ))
     }
 }
@@ -1093,10 +1134,10 @@ impl OwnedSuccessorAdvance {
     /// state the predecessor published (position, version and history).
     pub fn attach(self, state: SequenceState) -> Result<OwnedStateAdvance, (SequenceState, Error)> {
         if !state.belongs_to(&self.store)
-            || state.position != self.position
-            || state.bank.index() != self.previous_bank
-            || state.tape != 0
-            || state.starts != self.starts
+            || state.position() != self.position
+            || state.bank_index() != self.previous_bank
+            || state.tape_rows() != 0
+            || state.history_starts() != self.starts
             || state.domain_ranges() != self.ranges
         {
             return Err((
@@ -1216,9 +1257,11 @@ impl OwnedChainAdvance {
 
     /// The position after the last joined chunk.
     pub fn end(&self) -> usize {
-        self.chunks.last().map_or(self.first.state.position + self.first.count, |chunk| {
-            chunk.advance.position + chunk.advance.count
-        })
+        self.chunks
+            .last()
+            .map_or(self.first.state.position() + self.first.count, |chunk| {
+                chunk.advance.position + chunk.advance.count
+            })
     }
 
     /// Join the chunk chained behind the last one joined; any other is
@@ -1231,7 +1274,7 @@ impl OwnedChainAdvance {
             .chunks
             .last()
             .map_or(&self.first.following, |last| &last.advance.following);
-        if !Rc::ptr_eq(&chunk.advance.store, &self.first.state.store)
+        if !Rc::ptr_eq(&chunk.advance.store, &self.first.state.snapshot.store)
             || chunk.advance.position != self.end()
             || chunk.advance.previous_bank != bank.index()
         {
@@ -1251,8 +1294,8 @@ impl OwnedChainAdvance {
             mut following,
             ..
         } = first;
-        let store = state.store.clone();
-        keep_accepted(&store, &mut claims, state.position, count);
+        let store = state.snapshot.store.clone();
+        keep_accepted(&store, &mut claims, state.snapshot.position, count);
         let mut rows = count;
         for chunk in chunks {
             // Its step ran: what it admitted stays admitted.

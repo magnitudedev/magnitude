@@ -25,7 +25,7 @@ use crate::operators::streams::ResidualCarry;
 use crate::experts::{AheadOf, DecodeRow, StepRoute};
 use crate::operators::routed::split::{RunStage, SplitPorts, SplitValues};
 use crate::{
-    ConditioningRef, ConditioningSlice, DeviceError, GraphOutputTensor, InvariantError,
+    DeviceError, GraphOutputTensor, InvariantError,
     NativeGraphOutputLease, NativeGraphWorkspaceLease, SubmitError, TargetGraphOutputLease,
     TargetGraphWorkspaceLease, TargetLaunchCore, TargetLaunchWorkspace, TargetTokens,
     ValidatedTargetLaunch, completion::CompletionWaiter, native::AttestedState,
@@ -656,7 +656,7 @@ struct RunLaunch<'l> {
     batch: TargetBatchUpload<'l>,
     state: RowState<'l>,
     graph_workspace: &'l mut TargetGraphWorkspaceLease,
-    readout: (&'l mut NativeGraphWorkspaceLease, &'l mut Option<NativeGraphOutputLease>),
+    readout: (&'l mut NativeGraphWorkspaceLease, &'l mut NativeGraphOutputLease),
 }
 
 /// The class of a block a run takes at its rows: its history segment class,
@@ -713,14 +713,8 @@ struct TargetRun<'l> {
 }
 
 impl RowState<'_> {
-    fn slots(&self) -> usize {
-        self.0.advances().len()
-    }
     fn tokens(&self) -> &TargetTokens {
         self.0.tokens()
-    }
-    fn preceding(&self) -> &[Vec<u64>] {
-        self.0.preceding()
     }
     fn host_guesses(&self) -> Vec<[i32; 2]> {
         self.0.host_guesses()
@@ -730,9 +724,8 @@ impl RowState<'_> {
     /// the rows each slot reads and publishes.
     fn recurrent_arenas(&self) -> Result<&[Tensor], SubmitError> {
         self.0
-            .advances()
-            .first()
-            .map(|advance| advance.bindings().recurrent)
+            .slot(0)
+            .map(|slot| slot.advance.bindings().recurrent)
             .ok_or_else(|| invalid("recurrent batch has no state advance"))
     }
     /// `layer`'s history read (`HistoryReads::read`, the index of its
@@ -746,9 +739,8 @@ impl RowState<'_> {
         let read = store.history_reads().read(layer).ok_or_else(missing)?;
         let planes = self
             .0
-            .advances()
-            .first()
-            .map(|advance| advance.bindings().history)
+            .slot(0)
+            .map(|slot| slot.advance.bindings().history)
             .ok_or_else(|| invalid("attention batch has no state advance"))?;
         Ok((
             read,
@@ -771,9 +763,8 @@ impl RowState<'_> {
         };
         let planes = self
             .0
-            .advances()
-            .first()
-            .map(|advance| advance.bindings().history)
+            .slot(0)
+            .map(|slot| slot.advance.bindings().history)
             .ok_or_else(|| invalid("attention batch has no state advance"))?;
         let layer = LayerRef::IndexKeys { block, part: 0 };
         let of = |domain: magnitude_state::HistoryDomainId| {
@@ -799,9 +790,8 @@ impl RowState<'_> {
             .ok_or_else(|| invalid("an index-list source has no pooled history"))?;
         let planes = self
             .0
-            .advances()
-            .first()
-            .map(|advance| advance.bindings().history)
+            .slot(0)
+            .map(|slot| slot.advance.bindings().history)
             .ok_or_else(|| invalid("attention batch has no state advance"))?;
         let of = |domain: magnitude_state::HistoryDomainId, layer: LayerRef| {
             planes
@@ -826,16 +816,6 @@ impl RowState<'_> {
             _ => return Err(invalid("a pooled source's index-key planes are not one")),
         };
         Ok(PooledPlanes { window, block_read: blocks.0, rows, index_keys })
-    }
-    fn conditioning(&self, slot: usize) -> Option<&ConditioningRef> {
-        self.0.conditioning().get(slot).and_then(Option::as_ref)
-    }
-    fn conditioning_slices(&self, slot: usize) -> &[ConditioningSlice] {
-        self.0
-            .conditioning_slices()
-            .get(slot)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
     }
 }
 
@@ -911,10 +891,8 @@ impl NativeTargetProgram {
         submitter: &mut StepSubmitter,
     ) -> Result<Option<TargetReadoutGraphResult>, SubmitError> {
         let (workspace, output) = &mut run.launch.readout;
-        let output = output
-            .as_mut()
-            .ok_or_else(|| invalid("readout output was not reserved before submit"))?;
         let workspace = &mut **workspace;
+        let output = &mut **output;
         let (batch, region, window, hidden, residual) = (
             &run.launch.batch,
             &run.region,
@@ -1052,7 +1030,7 @@ impl NativeTargetProgram {
         if let Some(ports) = &graph.token_rows {
             let rows = u64::try_from(batch.class.rows()).map_err(|_| invalid("row class exceeds u64"))?;
             let tokens = match run.launch.state.tokens() {
-                TargetTokens::Host => self.kept_token_rows(region, rows)?,
+                TargetTokens::Host(..) => self.kept_token_rows(region, rows)?,
                 TargetTokens::Selected { selected, .. } => selected.tensor().clone(),
             };
             bindings.set(&self.unallocating(), &ports.tokens, &window.slice(&tokens)?).map_err(device)?;
@@ -1204,7 +1182,7 @@ impl NativeTargetProgram {
             return Ok(None);
         };
         let (graph, bound, per_layer) = entry.map_err(invalid)?;
-        let TargetTokens::Host = run.launch.state.tokens() else {
+        let TargetTokens::Host(..) = run.launch.state.tokens() else {
             return Err(invalid(
                 "a per-layer entry gathers table rows by host tokens",
             ));
@@ -1309,14 +1287,10 @@ impl NativeTargetProgram {
             .into_iter()
             .find_map(|(block, hash)| (block == index).then(|| hash.clone()))
             .ok_or_else(|| invalid("a stored table's block has no row rule"))?;
-        let preceding = state.preceding();
-        if preceding.len() != state.slots() {
-            return Err(invalid("the step's preceding tokens differ from its slots"));
-        }
         match state.tokens() {
-            TargetTokens::Host => {
+            TargetTokens::Host(host_slots) => {
                 let mut rows = Vec::new();
-                for (slot, preceding) in preceding.iter().enumerate() {
+                for (slot, host) in host_slots.iter().enumerate() {
                     let [start, end] = batch.segments[slot];
                     let tokens = usize::try_from(start)
                         .ok()
@@ -1327,15 +1301,15 @@ impl NativeTargetProgram {
                         .map(|token| u64::try_from(*token))
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|_| invalid("a host token is negative"))?;
-                    rows.push(hash.rows(preceding, &tokens));
+                    rows.push(hash.rows(&host.slot.preceding, &tokens));
                 }
                 Ok(StepRows::Known(rows))
             }
-            TargetTokens::Selected { .. } => {
+            TargetTokens::Selected { slots, .. } => {
                 let notice = notice
                     .cloned()
                     .ok_or_else(|| invalid("selected tokens without their notice"))?;
-                let preceding = preceding.to_vec();
+                let preceding: Vec<Vec<u64>> = slots.iter().map(|slot| slot.preceding.clone()).collect();
                 let segments = batch.segments[..preceding.len()].to_vec();
                 Ok(StepRows::Selected(Box::new(move || {
                     // A slot's rows are its segment's selection rows (a
@@ -1395,10 +1369,13 @@ impl NativeTargetProgram {
         state: &RowState<'_>,
         batch: &TargetBatchUpload<'_>,
     ) -> Result<Vec<(Tensor, usize, usize)>, SubmitError> {
+        let TargetTokens::Host(host_slots) = state.tokens() else {
+            return Ok(Vec::new());
+        };
         let mut sources = Vec::new();
-        for slot in 0..state.slots() {
-            let conditioning = state.conditioning(slot);
-            let slices = state.conditioning_slices(slot);
+        for (slot, host) in host_slots.iter().enumerate() {
+            let conditioning = host.conditioning.as_ref();
+            let slices = &host.conditioning_slices;
             if conditioning.is_none() && slices.is_empty() {
                 continue;
             }
@@ -1494,7 +1471,13 @@ impl NativeTargetProgram {
                             let rows = upload.actual_rows;
                             let (slots, front) = (&upload.row_slots[..rows], &upload.front[..rows]);
                             let positions = upload.coordinates[..rows].iter().map(|row| row[0] as u64);
-                            step.decoding(decode_rows(positions, slots, front, upload.stop, launch.requests()).into_iter(), upload.class.rows() - rows)
+                            step.decoding(
+                                decode_rows(positions, slots, front, upload.stop, |slot| {
+                                    launch.slot(slot).expect("a row's slot is in range").request
+                                })
+                                .into_iter(),
+                                upload.class.rows() - rows,
+                            )
                         }
                         // Its slots of more rows than they commit run
                         // rows ahead (a verification wider than the decode
@@ -1502,8 +1485,13 @@ impl NativeTargetProgram {
                         StepRoute::Grouped => {
                             let rows = &upload.row_slots[..upload.actual_rows];
                             let ahead = |slot: usize| rows.iter().filter(|&&of| of as usize == slot).count() > upload.stop[slot] as usize;
-                            let requests = launch.requests();
-                            step.guessing((0..requests.len()).filter(|&slot| ahead(slot)).map(|slot| requests[slot]))
+                            step.guessing(
+                                launch
+                                    .slots()
+                                    .enumerate()
+                                    .filter(|&(slot, _)| ahead(slot))
+                                    .map(|(_, slot)| slot.request),
+                            )
                         }
                     };
                     (launch, Some((bank.clone(), step)))
@@ -1693,7 +1681,7 @@ impl NativeTargetProgram {
             u64::try_from(batch.class.rows()).map_err(|_| invalid("row class exceeds u64"))?;
         let tokens = state.tokens();
         let source = match tokens {
-            TargetTokens::Host => EntryTokens::Uploaded,
+            TargetTokens::Host(..) => EntryTokens::Uploaded,
             TargetTokens::Selected { .. } => EntryTokens::Selected,
         };
         let (entry, entry_bound) = self.graphs.entry(rows, source).map_err(invalid)?;
@@ -1707,7 +1695,7 @@ impl NativeTargetProgram {
                 .map_err(device)?;
             let mut bindings = entry_bound.bindings();
             match tokens {
-                TargetTokens::Host => {
+                TargetTokens::Host(..) => {
                     let rows = self
                         .graphs
                         .embedding
@@ -2326,7 +2314,7 @@ impl NativeTargetProgram {
                 match &inputs.guesses {
                     Some(port) => {
                         let guesses = match state.tokens() {
-                            TargetTokens::Host => &self.kept_guess_rows(&run.region, rows)?,
+                            TargetTokens::Host(..) => &self.kept_guess_rows(&run.region, rows)?,
                             TargetTokens::Selected { guesses: Some(guesses), .. } => guesses.tensor(),
                             TargetTokens::Selected { guesses: None, .. } if bank.front == 0 => {
                                 &self.kept_guess_rows(&run.region, rows)?
@@ -2351,7 +2339,7 @@ impl NativeTargetProgram {
             // the entry kept them, or the previous step's selection.
             if let Some(ports) = &graph.ngram {
                 match state.tokens() {
-                    TargetTokens::Host => bindings
+                    TargetTokens::Host(..) => bindings
                         .set(&self.unallocating(), &ports.tokens, &self.kept_token_rows(&run.region, rows)?)
                         .map_err(device)?,
                     TargetTokens::Selected { selected, .. } => bindings
@@ -2952,7 +2940,13 @@ impl TargetProgram for NativeTargetProgram {
 /// rows, or else its front rows (`front`, per row), which trail them. A row
 /// past the committed ones is an ahead row: its index among the slot's ahead
 /// rows, and the slot's acceptable rows.
-fn decode_rows(positions: impl Iterator<Item = u64>, slots: &[i32], front: &[bool], stop: &[i32], requests: &[crate::operation::RequestId]) -> Vec<DecodeRow> {
+fn decode_rows(
+    positions: impl Iterator<Item = u64>,
+    slots: &[i32],
+    front: &[bool],
+    stop: &[i32],
+    request: impl Fn(usize) -> crate::operation::RequestId,
+) -> Vec<DecodeRow> {
     positions
         .enumerate()
         .map(|(row, position)| {
@@ -2964,7 +2958,7 @@ fn decode_rows(positions: impl Iterator<Item = u64>, slots: &[i32], front: &[boo
                 let acceptable = of_slot().filter(|&other| !front[other]).count().saturating_sub(exact);
                 AheadOf::new(exact, acceptable, index)
             });
-            DecodeRow { position, request: requests[slot], ahead }
+            DecodeRow { position, request: request(slot), ahead }
         })
         .collect()
 }
@@ -2976,7 +2970,7 @@ mod decode_rows_tests {
 
     fn rows(slots: &[i32], front: &[bool], stop: &[i32]) -> Vec<Option<AheadOf>> {
         let requests = [RequestId(10), RequestId(11)];
-        let decoded = decode_rows((0..slots.len() as u64).map(|row| 100 + row), slots, front, stop, &requests);
+        let decoded = decode_rows((0..slots.len() as u64).map(|row| 100 + row), slots, front, stop, |slot| requests[slot]);
         assert!(decoded.iter().enumerate().all(|(row, decoded)| decoded.position == 100 + row as u64 && decoded.request == requests[slots[row] as usize]));
         decoded.into_iter().map(|DecodeRow { ahead, .. }| ahead).collect()
     }

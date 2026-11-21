@@ -47,9 +47,15 @@ kernel void embedding_rows(
         float squares = 0.0f;
         for (uint p = thread_index; p * 32u < width; p += embedding_threads) {
             typename packets::W0::packet packet = rows.packet(token, p);
-            for (uint i = 0; i < 32u && 32u * p + i < width; ++i) {
-                const float value = packets::value_at<packets::W0>(packet, i) * scale;
-                squares = metal::fma(value, value, squares);
+            for (uint step = 0; step < 4; ++step) {
+                float4 even, odd;
+                packets::W0::exact_values(packet, step, even, odd);
+                for (uint i = 0; i < 8; ++i) {
+                    if (32u * p + 8u * step + i < width) {
+                        const float value = ((i & 1u) ? odd[i >> 1] : even[i >> 1]) * scale;
+                        squares = metal::fma(value, value, squares);
+                    }
+                }
             }
         }
         const float total = reduce::group_sum<embedding_threads / 32>(squares, partials, sg, lane);

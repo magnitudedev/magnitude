@@ -278,7 +278,6 @@ impl ExpertBank {
                     commitment: Commitment::new(Arc::new(AtomicU64::new(0))),
                     ceiling,
                     thread: StorageThread::start("expert-bank-host-tier")?,
-                    backing: false,
                     last_resize: None,
                 }))
             })

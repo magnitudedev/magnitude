@@ -10,6 +10,7 @@
 // Thread (n, m)'s body: R(base + (sum_k w_k * projected_k + cpu)), the sum
 // in slot order. The includer defines the kernel `routed_down_combine` over it.
 #define ROUTED_DOWN_COMBINE_BODY                                                                           \
+    seismic_dependency_start();                                                                            \
     const projection::u64 n = (projection::u64)blockIdx.x * blockDim.x + threadIdx.x;                     \
     const projection::u64 m = blockIdx.y;                                                                  \
     ROUTED_SITE_AWAIT(m)                                                                                   \

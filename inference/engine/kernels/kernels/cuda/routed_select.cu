@@ -8,8 +8,9 @@
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY
 
+using NormElem = ELEMENT_OF(SEISMIC_NORM);
 using RouterRaw = projection::OrderedRms<ELEMENT_OF(SEISMIC_ROUTER_NORM), projection::AllRows>;
-using NormRaw = projection::OrderedRms<ELEMENT_OF(SEISMIC_NORM), projection::AllRows>;
+using NormRaw = projection::OrderedRms<NormElem, projection::AllRows>;
 using LogitStore = projection::Store<element::F32>;
 
 extern "C" __global__ void routed_select_ordered_stage(SEISMIC_KERNEL_PARAMS) {
@@ -24,11 +25,8 @@ extern "C" __global__ void routed_select_ordered_stage(SEISMIC_KERNEL_PARAMS) {
     const element::Out<activation::Act> staged_out = element::out_over_scratch<activation::Act>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED));
     const float inv =
         projection::ordered_stage_row(router_raw, blockIdx.x, SEISMIC_DIM_H, staged_out, SEISMIC_DIM_H, 1);
-    const auto pub_out = SEISMIC_RESULT_0_OUT;
-    for (unsigned long long c = threadIdx.x; c < SEISMIC_DIM_H; c += blockDim.x)
-        pub_out.put(static_cast<unsigned long long>(blockIdx.x) * SEISMIC_RESULT_0_STRIDE_0 +
-                        c * SEISMIC_RESULT_0_STRIDE_1,
-                    norm_raw.ordered_at(blockIdx.x, c, inv));
+    routed::publish_ordered_norm_row<activation::Act, NormElem>(
+        norm_raw, blockIdx.x, inv, SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1);
 }
 
 extern "C" __global__ void routed_select_ordered_gemv(SEISMIC_KERNEL_PARAMS) {
@@ -50,13 +48,8 @@ extern "C" __global__ void routed_select_ordered_gemv(SEISMIC_KERNEL_PARAMS) {
         KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_ROUTER)), LogitStore{logits_out, SEISMIC_DIM_E, 0});
     if (blockIdx.x == 0) {
         const float *smem_inv = reinterpret_cast<const float *>(shared_raw);
-        const auto pub_out = SEISMIC_RESULT_0_OUT;
-        for (unsigned long long idx = threadIdx.x; idx < m * k; idx += blockDim.x) {
-            const unsigned r = static_cast<unsigned>(idx / k);
-            const unsigned long long c = idx % k;
-            pub_out.put(static_cast<unsigned long long>(r) * SEISMIC_RESULT_0_STRIDE_0 + c * SEISMIC_RESULT_0_STRIDE_1,
-                        norm_raw.ordered_at(r, c, smem_inv[r]));
-        }
+        routed::publish_ordered_norm_rows<activation::Act, NormElem>(
+            norm_raw, m, smem_inv, SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1);
     }
     const unsigned ordered_tiles = static_cast<unsigned>((SEISMIC_DIM_E + 31ull) / 32ull);
     __shared__ unsigned last;

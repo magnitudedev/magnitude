@@ -315,13 +315,16 @@ kernel void routed_combine(COMBINE_ARGUMENTS,
         return;
     const bool vector = SEISMIC_EXPERT_OUTPUT_STRIDE_2 == 1 && (SEISMIC_EXPERT_OUTPUT_STRIDE_1 & 7u) == 0
         && (SEISMIC_EXPERT_OUTPUT_STRIDE_0 & 7u) == 0;
+    const uint t_dim = uint(SEISMIC_DIM_T);
     float4 selected_even = float4(0.0f), selected_odd = float4(0.0f);
-    for (ulong k = 0; k < SEISMIC_DIM_K; ++k) {
-        const ulong position = ulong(inverse[m * SEISMIC_INVERSE_STRIDE_0 + k * SEISMIC_INVERSE_STRIDE_1]);
+    for (uint k = 0; k < SEISMIC_DIM_K; ++k) {
+        const uint position = uint(inverse[m * SEISMIC_INVERSE_STRIDE_0 + k * SEISMIC_INVERSE_STRIDE_1]);
         const float score = scores[m * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1];
+        const uint bucket = position / t_dim;
+        const uint slot = position - bucket * t_dim;
         device const S *row = reinterpret_cast<device const S *>(expert_output)
-            + (position / SEISMIC_DIM_T) * SEISMIC_EXPERT_OUTPUT_STRIDE_0
-            + (position % SEISMIC_DIM_T) * SEISMIC_EXPERT_OUTPUT_STRIDE_1;
+            + ulong(bucket) * SEISMIC_EXPERT_OUTPUT_STRIDE_0
+            + ulong(slot) * SEISMIC_EXPERT_OUTPUT_STRIDE_1;
         float4 even, odd;
         projection::load8_storage<A>(row, SEISMIC_EXPERT_OUTPUT_STRIDE_2, n, columns, vector, even, odd);
         selected_even = metal::fma(float4(score), even, selected_even);
@@ -331,13 +334,38 @@ kernel void routed_combine(COMBINE_ARGUMENTS,
     projection::load8_storage<A>(reinterpret_cast<device const S *>(shared_output) + ulong(m) * columns, 1, n,
         columns, (columns & 7u) == 0, shared_even, shared_odd);
     const float c = coefficient[m * SEISMIC_COEFFICIENT_STRIDE_0];
-    const float selected[8] = {selected_even.x, selected_odd.x, selected_even.y, selected_odd.y,
-        selected_even.z, selected_odd.z, selected_even.w, selected_odd.w};
-    const float projected[8] = {shared_even.x, shared_odd.x, shared_even.y, shared_odd.y, shared_even.z,
-        shared_odd.z, shared_even.w, shared_odd.w};
-    for (uint i = 0; i < 8u && n + i < columns; ++i)
-        projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(value.offset(m * SEISMIC_RESULT_0_STRIDE_0),
-            SEISMIC_RESULT_0_STRIDE_1, residual + m * SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1,
-            inject + m * SEISMIC_INJECT_STRIDE_0, columns, n + i, selected[i], projected[i] * c);
+    const float4 selected_low = float4(selected_even.x, selected_odd.x, selected_even.y, selected_odd.y);
+    const float4 selected_high = float4(selected_even.z, selected_odd.z, selected_even.w, selected_odd.w);
+    const float4 shared_low = float4(shared_even.x, shared_odd.x, shared_even.y, shared_odd.y) * c;
+    const float4 shared_high = float4(shared_even.z, shared_odd.z, shared_even.w, shared_odd.w) * c;
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> out_row = value.offset(m * SEISMIC_RESULT_0_STRIDE_0);
+    device const float *residual_row = residual + m * SEISMIC_RESIDUAL_STRIDE_0;
+    device const float *inject_row = inject + m * SEISMIC_INJECT_STRIDE_0;
+    if (SEISMIC_RESIDUAL_STRIDE_1 == 1 && SEISMIC_RESULT_0_STRIDE_1 == 1 && n + 8u <= columns) {
+        if constexpr (SEISMIC_DIM_IN == 0) {
+            device const packed_float4 *from = reinterpret_cast<device const packed_float4 *>(residual_row + n);
+            out_row.put4(n, (float4(from[0]) + selected_low) + shared_low);
+            out_row.put4(n + 4u, (float4(from[1]) + selected_high) + shared_high);
+        } else {
+            const float4 sum_low = selected_low + shared_low;
+            const float4 sum_high = selected_high + shared_high;
+            PROJECTION_UNROLL
+            for (uint s = 0; s < SEISMIC_DIM_SN; ++s) {
+                const float inj = inject_row[s];
+                const ulong base = ulong(s) * columns + n;
+                device const packed_float4 *from = reinterpret_cast<device const packed_float4 *>(residual_row + base);
+                out_row.put4(base, float4(from[0]) + sum_low * inj);
+                out_row.put4(base + 4u, float4(from[1]) + sum_high * inj);
+            }
+        }
+    } else {
+        const float selected[8] = {selected_low.x, selected_low.y, selected_low.z, selected_low.w,
+            selected_high.x, selected_high.y, selected_high.z, selected_high.w};
+        const float projected[8] = {shared_low.x, shared_low.y, shared_low.z, shared_low.w,
+            shared_high.x, shared_high.y, shared_high.z, shared_high.w};
+        for (uint i = 0; i < 8u && n + i < columns; ++i)
+            projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(out_row, SEISMIC_RESULT_0_STRIDE_1,
+                residual_row, SEISMIC_RESIDUAL_STRIDE_1, inject_row, columns, n + i, selected[i], projected[i]);
+    }
 }
 #endif

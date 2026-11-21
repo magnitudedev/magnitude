@@ -219,62 +219,58 @@ struct Decay<Rule, 1> {
                                     float (&system)[GROUP][PIECE][PIECE + 1]) {
         const recurrent::Inputs &base = Rule::base(in);
         const int n = piece.count;
-        __shared__ float key_gram[PIECE][PIECE + 1];
-        __shared__ float query_gram[PIECE][PIECE + 1];
         __shared__ float cumulative[GROUP][PIECE];
-        // Gates of the value heads; padding rows have zero decay and beta.
-        if (threadIdx.x < GROUP * PIECE) {
+        // Gates of the value heads and their inclusive cumulative log decays
+        // (16-lane warp prefix sum per member); padding rows have zero decay
+        // and beta.
+        if (threadIdx.x / 32 < (GROUP + 1) / 2) {
             const int member = threadIdx.x / PIECE;
             const int t = threadIdx.x % PIECE;
             float log_decay = 0.0f, b = 0.0f;
-            if (t < n) {
+            if (member < GROUP && t < n) {
                 const recurrent::Gates gates = Rule::row_gates(in, piece.first + t, member_head(base, key_head, member));
                 log_decay = gates.log_decay;
                 b = gates.beta;
             }
-            cumulative[member][t] = log_decay;
-            beta[member][t] = b;
+#pragma unroll
+            for (int offset = 1; offset < PIECE; offset <<= 1) {
+                const float up = __shfl_up_sync(0xffffffffu, log_decay, offset, PIECE);
+                if (t >= offset) log_decay += up;
+            }
+            if (member < GROUP) {
+                cumulative[member][t] = log_decay;
+                beta[member][t] = b;
+            }
         }
         __syncthreads();
 
-        // K K^T and Q K^T in F32, one (t, s) pair per thread (two partial sums
-        // each); the inclusive cumulative log decays.
+        // K K^T and Q K^T in F32 for the causal triangle (s <= t), one (t, s)
+        // pair per thread (two partial sums each), then per value head: A in
+        // shared memory, D and the decays to the record.
         {
             const int t = threadIdx.x / PIECE;
             const int s = threadIdx.x % PIECE;
             float kk[2] = {0.0f, 0.0f}, qk_dot[2] = {0.0f, 0.0f};
+            if (s <= t && t < n) {
 #pragma unroll 8
-            for (int c = 0; c < W; c += 2) {
+                for (int c = 0; c < W; c += 2) {
 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    kk[h] = __fmaf_rn(keys[t][c + h], keys[s][c + h], kk[h]);
-                    qk_dot[h] = __fmaf_rn(queries[t][c + h], keys[s][c + h], qk_dot[h]);
+                    for (int h = 0; h < 2; ++h) {
+                        kk[h] = __fmaf_rn(keys[t][c + h], keys[s][c + h], kk[h]);
+                        qk_dot[h] = __fmaf_rn(queries[t][c + h], keys[s][c + h], qk_dot[h]);
+                    }
                 }
             }
-            key_gram[t][s] = kk[0] + kk[1];
-            query_gram[t][s] = qk_dot[0] + qk_dot[1];
-        }
-        if (threadIdx.x < GROUP) {
-            float sum = 0.0f;
-            for (int t = 0; t < PIECE; ++t) {
-                sum += cumulative[threadIdx.x][t];
-                cumulative[threadIdx.x][t] = sum;
-            }
-        }
-        __syncthreads();
-
-        // Per value head: A in shared memory, D and the decays to the record.
-        {
-            const int t = threadIdx.x / PIECE;
-            const int s = threadIdx.x % PIECE;
+            const float key_dot = kk[0] + kk[1];
+            const float query_dot = qk_dot[0] + qk_dot[1];
 #pragma unroll
             for (int member = 0; member < GROUP; ++member) {
                 const float *G = cumulative[member];
-                const float decay = s <= t ? expf(G[t] - G[s]) : 0.0f;
-                system[member][t][s] = s < t ? beta[member][t] * decay * key_gram[t][s] : 0.0f;
+                const float decay = s <= t && t < n ? (s < t ? expf(G[t] - G[s]) : 1.0f) : 0.0f;
+                system[member][t][s] = s < t ? beta[member][t] * decay * key_dot : 0.0f;
                 u8 *out = record(pieces, blockIdx.x, member_head(base, key_head, member));
                 reinterpret_cast<u16 *>(out + RECORD_D)[t * PIECE + s] =
-                    seismic_f32_to_f16(t < n ? decay * query_gram[t][s] : 0.0f);
+                    seismic_f32_to_f16(s <= t && t < n ? decay * query_dot : 0.0f);
                 if (threadIdx.x < PIECE) {
                     const float last = G[PIECE - 1];
                     float *gates = reinterpret_cast<float *>(out + RECORD_GATES);
@@ -533,23 +529,26 @@ __device__ __forceinline__ void prepare(const typename Rule::Inputs &in, u8 *pie
     }
     Form::products(in, pieces, piece, key_head, queries, keys, beta, system);
 
-    // Tb = (I + A)^-1 diag(beta) by forward substitution: warp `member`, lane
-    // j < 16 owning column j.
-    for (int member = warp; member < GROUP; member += PREPARE_WARPS) {
-        if (lane >= PIECE) continue;
+    // Tb = (I + A)^-1 diag(beta) by forward substitution: two members per warp
+    // (lanes 0..15 and 16..31), lane16 = j owning column j. Keep the loops
+    // statically bounded and unrolled so `x` stays in registers (no local
+    // memory spill) and `system[member][i][k]` broadcasts across each half-warp.
+    const int member = threadIdx.x / PIECE;
+    const int lane16 = threadIdx.x % PIECE;
+    if (member < GROUP) {
         u16 *tb = reinterpret_cast<u16 *>(
             Form::record(pieces, blockIdx.x, member_head(base, key_head, member)) + RECORD_TB);
         float x[PIECE];
 #pragma unroll
         for (int i = 0; i < PIECE; ++i) {
-            float value = i == lane ? 1.0f : 0.0f;
+            float value = i == lane16 ? 1.0f : 0.0f;
 #pragma unroll
             for (int k = 0; k < i; ++k) value = __fmaf_rn(-system[member][i][k], x[k], value);
             x[i] = value;
         }
-        const float b = beta[member][lane];
+        const float b = beta[member][lane16];
 #pragma unroll
-        for (int i = 0; i < PIECE; ++i) tb[i * PIECE + lane] = seismic_f32_to_f16(x[i] * b);
+        for (int i = 0; i < PIECE; ++i) tb[i * PIECE + lane16] = seismic_f32_to_f16(x[i] * b);
     }
 }
 

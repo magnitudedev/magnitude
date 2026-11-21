@@ -122,7 +122,8 @@ inline void project_channels_one(thread const In &in, thread const projection::W
             }
             // The previous chunk's reads of the stage end before this one's
             // writes; its writes before any lane reads them.
-            simdgroup_barrier(mem_flags::mem_threadgroup);
+            if (base > 0u)
+                simdgroup_barrier(mem_flags::mem_threadgroup);
             for (uint word = lane; word < 4u * count; word += 32u)
                 staged[word] = in.words8(0, 32u * base + 8u * word);
             simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -251,6 +252,56 @@ inline void project_channels_step(thread const In &in, thread const typename W::
     }
 }
 
+// Threadgroup-staged activation rows for `project_channels_step`: row `m`
+// begins at `m * STRIDE_WORDS` `uint4` words (8 activation values per word).
+template <uint STRIDE_WORDS>
+struct StagedRows {
+    threadgroup const uint4 *staged;
+    inline uint4 words8(uint m, uint col) const {
+        return staged[m * STRIDE_WORDS + (col >> 3)];
+    }
+};
+
+// Project one contiguous packet slice `[pkt_base, pkt_base + count)` into
+// `acc`, reading activations from `in` at column `32u * (in_pkt_base + p)`.
+// Software-pipelines `current`/`next` weight packets for `ROWS <= 2` (wider
+// rows hold too many live weight packets for Apple GPU occupancy and compile
+// budget).
+template <typename W, uint ROWS, uint LANES, uint MAXM, typename In>
+inline void project_channels_slice(thread const In &in, thread const projection::Weights<W> &w,
+    thread const uint (&n)[ROWS], uint pkt_base, uint in_pkt_base, uint count, uint m_rows, uint sub,
+    thread float (&acc)[ROWS][MAXM]) {
+    if constexpr (ROWS <= 2u) {
+        typename W::packet current[ROWS], next[ROWS];
+        if (sub < count) {
+            PROJECTION_UNROLL
+            for (uint r = 0; r < ROWS; ++r)
+                current[r] = w.packet(n[r], pkt_base + sub);
+        }
+        for (uint p = sub; p < count; p += LANES) {
+            if (p + LANES < count) {
+                PROJECTION_UNROLL
+                for (uint r = 0; r < ROWS; ++r)
+                    next[r] = w.packet(n[r], pkt_base + p + LANES);
+            }
+            project_channels_step<W, ROWS, MAXM>(in, current, 32u * (in_pkt_base + p), m_rows, acc);
+            if (p + LANES < count) {
+                PROJECTION_UNROLL
+                for (uint r = 0; r < ROWS; ++r)
+                    current[r] = next[r];
+            }
+        }
+    } else {
+        for (uint p = sub; p < count; p += LANES) {
+            typename W::packet pkt[ROWS];
+            PROJECTION_UNROLL
+            for (uint r = 0; r < ROWS; ++r)
+                pkt[r] = w.packet(n[r], pkt_base + p);
+            project_channels_step<W, ROWS, MAXM>(in, pkt, 32u * (in_pkt_base + p), m_rows, acc);
+        }
+    }
+}
+
 // Batched decode down projection of `m_rows` (<= MAXM) rows against one weight
 // matrix `w` in a single weight pass, publishing row m's channels directly to
 // `published_rows[m]` in `published`. Preserves `project_channels`' exact
@@ -289,36 +340,35 @@ inline void project_channels_published(thread const In &raw, thread const projec
             acc[r][m] = 0.0f;
     }
     constexpr uint CHUNK = (STAGE == 0u || COLUMN_PACKETS < STAGE) ? COLUMN_PACKETS : STAGE;
-    for (uint base = 0; base < P; base += CHUNK) {
-        const uint count = min(CHUNK, P - base);
-        if constexpr (ROWS <= 2u) {
-            typename W::packet current[ROWS], next[ROWS];
-            if (sub < count) {
-                PROJECTION_UNROLL
-                for (uint r = 0; r < ROWS; ++r)
-                    current[r] = w.packet(n[r], base + sub);
-            }
-            for (uint p = sub; p < count; p += LANES) {
-                if (p + LANES < count) {
-                    PROJECTION_UNROLL
-                    for (uint r = 0; r < ROWS; ++r)
-                        next[r] = w.packet(n[r], base + p + LANES);
+    // Sub-chunk size staged for all MAXM rows inside `region` (16 * STAGE floats
+    // = 4 * STAGE uint4s): a multiple of LANES so every lane visits the exact
+    // same packet indices in the exact same order as `project_channels_one`,
+    // and MAXM * SUB_CHUNK <= STAGE so `staged` never exceeds `region`.
+    constexpr uint SUB_CHUNK = (STAGE / MAXM / LANES) * LANES;
+    if constexpr (SUB_CHUNK > 0u) {
+        threadgroup uint4 *staged = reinterpret_cast<threadgroup uint4 *>(region);
+        constexpr uint ROW_WORDS = 4u * SUB_CHUNK;
+        const StagedRows<ROW_WORDS> staged_in{staged};
+        for (uint base = 0; base < P; base += CHUNK) {
+            const uint count = min(CHUNK, P - base);
+            for (uint sub_base = 0; sub_base < count; sub_base += SUB_CHUNK) {
+                const uint sub_count = min(SUB_CHUNK, count - sub_base);
+                if (base > 0u || sub_base > 0u)
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                const uint words_per_row = 4u * sub_count;
+                for (uint m = 0; m < m_rows; ++m) {
+                    for (uint word = lane; word < words_per_row; word += 32u)
+                        staged[m * ROW_WORDS + word] = in.words8(m, 32u * (base + sub_base) + 8u * word);
                 }
-                project_channels_step<W, ROWS, MAXM>(in, current, 32u * (base + p), m_rows, acc);
-                if (p + LANES < count) {
-                    PROJECTION_UNROLL
-                    for (uint r = 0; r < ROWS; ++r)
-                        current[r] = next[r];
-                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                project_channels_slice<W, ROWS, LANES, MAXM>(
+                    staged_in, w, n, base + sub_base, 0u, sub_count, m_rows, sub, acc);
             }
-        } else {
-            for (uint p = sub; p < count; p += LANES) {
-                typename W::packet pkt[ROWS];
-                PROJECTION_UNROLL
-                for (uint r = 0; r < ROWS; ++r)
-                    pkt[r] = w.packet(n[r], base + p);
-                project_channels_step<W, ROWS, MAXM>(in, pkt, 32u * (base + p), m_rows, acc);
-            }
+        }
+    } else {
+        for (uint base = 0; base < P; base += CHUNK) {
+            const uint count = min(CHUNK, P - base);
+            project_channels_slice<W, ROWS, LANES, MAXM>(in, w, n, base, base, count, m_rows, sub, acc);
         }
     }
     PROJECTION_UNROLL
@@ -346,7 +396,7 @@ inline void project_gathered_expert(device const uchar *product, ulong p0, ulong
     uint first, uint sg, uint lane, threadgroup float *region, Published published) {
     constexpr uint TILE = (32u / LANES) * ROWS;
     const Gathered chosen =
-        gather(routes, r0, r1, sources, source_rows, src1, src2, m_rows, K, m * K + sg, SLOTS, 1);
+        gather(routes, r0, r1, sources, source_rows, src1, src2, m_rows, K, m * K + sg, SLOTS, 1, lane);
     if (chosen.count == 0)
         return;
     const slab::Source source = decode_source(sources, source_rows, src1, src2, m, sg, chosen.expert);

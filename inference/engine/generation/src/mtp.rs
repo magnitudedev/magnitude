@@ -861,13 +861,15 @@ impl MethodState for DrafterState {
             RoundStage::Declined | RoundStage::Entering { .. } | RoundStage::Drafting(_) => {
                 return Propose::Tokens(Vec::new());
             }
-            RoundStage::ResumeDraft(generated) => {
-                if self.history.has_open() || selects.is_empty() {
+            RoundStage::ResumeDraft(generated)
+                if *generated > 0 && *generated <= selects.len() =>
+            {
+                if self.history.has_open() {
                     return Propose::Tokens(Vec::new());
                 }
                 *generated
             }
-            stage @ RoundStage::Idle => {
+            stage @ (RoundStage::Idle | RoundStage::ResumeDraft(_)) => {
                 if self.history.has_open() || selects.is_empty() {
                     return Propose::Tokens(Vec::new());
                 }
@@ -911,9 +913,6 @@ impl MethodState for DrafterState {
                 generated
             }
         };
-        if generated == 0 || generated > selects.len() {
-            return Propose::Tokens(Vec::new());
-        }
         // Rounds that drafted nothing left their pairs pending: the drafter
         // enters them now, then this round drafts from its anchor.
         if self.round_state().catching_up().0.is_some() {
@@ -941,7 +940,7 @@ impl MethodState for DrafterState {
             selects[..generated].to_vec(),
             self.drafter.form(),
         ) else {
-            self.round = RoundStage::ResumeDraft(generated);
+            self.round = RoundStage::Declined;
             return Propose::Tokens(Vec::new());
         };
         let operation = transaction.operation().clone();

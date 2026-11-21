@@ -1802,7 +1802,7 @@ fn grouped_forms(device: &seismic::Device) -> Vec<GroupedForm> {
             .into_iter()
             .flat_map(|(tall, int8, pack)| {
                 [
-                    form(&[(tall, 1)], false),
+                    form(&[(tall, 0)], false),
                     form(&[(tall, 1), (int8, 1)], true),
                     form(&[(tall, 1), (pack, 1)], true),
                 ]

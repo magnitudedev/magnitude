@@ -93,13 +93,17 @@ pub enum Reread {
     Stands { cost: Duration, changed: bool, ceiling: Option<Duration> },
 }
 
-/// The worker's timed reading ([`Reread`]): the interval its search stands
-/// at, and when the owner reads next, none once one fired and no reading
-/// has answered it yet.
+/// The worker's timed reading ([`Reread`]): settled, or active with the
+/// interval its search stands at and when the owner reads next (none once one
+/// fired and no reading has answered it yet).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Rereading {
-    interval: Option<Duration>,
-    due: Option<Instant>,
+enum Rereading {
+    #[default]
+    Settled,
+    Active {
+        interval: Duration,
+        due: Option<Instant>,
+    },
 }
 
 impl Rereading {
@@ -109,16 +113,16 @@ impl Rereading {
     /// progress.
     fn after(self, reread: Reread, now: Instant) -> Self {
         match reread {
-            Reread::Settled => Self::default(),
+            Reread::Settled => Self::Settled,
             Reread::Unread => self,
             Reread::Stands { cost, changed, ceiling } => {
                 let cost = cost.max(Duration::from_nanos(1));
-                let interval = match (changed, self.interval) {
-                    (false, Some(interval)) => interval.saturating_mul(2),
+                let interval = match (changed, self) {
+                    (false, Self::Active { interval, .. }) => interval.saturating_mul(2),
                     _ => cost,
                 };
                 let interval = ceiling.map_or(interval, |ceiling| interval.min(ceiling.max(Duration::from_nanos(1))));
-                Self { interval: Some(interval), due: now.checked_add(interval) }
+                Self::Active { interval, due: now.checked_add(interval) }
             }
         }
     }
@@ -141,10 +145,10 @@ pub enum DispatchError<C> {
     Full,
 }
 
-struct ReplyState<C> {
-    abandoned: bool,
-    result: Option<Result<WorkerReply, CallError<C>>>,
-    waker: Option<Waker>,
+enum ReplyState<C> {
+    Waiting(Option<Waker>),
+    Ready(Result<WorkerReply, CallError<C>>),
+    Abandoned,
 }
 struct Reply<C> {
     state: Mutex<ReplyState<C>>,
@@ -158,12 +162,17 @@ enum Item<C> {
     Control(Envelope<C>),
     Event(Event),
 }
+enum InboxPhase<C> {
+    Open {
+        /// Commands and events in arrival order.
+        items: VecDeque<Item<C>>,
+        /// The session's waker, woken when execution stops.
+        stop_watcher: Option<Waker>,
+    },
+    Stopped(C),
+}
 struct Inbox<C> {
-    /// Commands and events in arrival order.
-    items: VecDeque<Item<C>>,
-    stopped: Option<C>,
-    /// The session's waker, woken when execution stops.
-    stop_watcher: Option<Waker>,
+    phase: InboxPhase<C>,
     /// Dispatched calls not yet consumed or abandoned.
     outstanding: usize,
 }
@@ -178,10 +187,10 @@ struct Mailbox<C> {
 impl<C: Clone> Mailbox<C> {
     fn push(&self, event: Event) {
         let mut state = self.state.lock().unwrap();
-        if state.stopped.is_some() {
+        let InboxPhase::Open { items, .. } = &mut state.phase else {
             return;
-        }
-        state.items.push_back(Item::Event(event));
+        };
+        items.push_back(Item::Event(event));
         self.changed.notify_one();
     }
     fn release(&self) {
@@ -191,29 +200,35 @@ impl<C: Clone> Mailbox<C> {
     /// abandoned an admission that the owner accepted.
     fn deliver(&self, reply: &Reply<C>, result: Result<WorkerReply, CallError<C>>) -> Option<RequestId> {
         let mut state = reply.state.lock().unwrap();
-        if !state.abandoned {
-            state.result = Some(result);
-            let waker = state.waker.take();
-            drop(state);
-            reply.changed.notify_one();
-            if let Some(waker) = waker {
-                waker.wake();
+        match std::mem::replace(&mut *state, ReplyState::Abandoned) {
+            ReplyState::Waiting(waker) => {
+                *state = ReplyState::Ready(result);
+                drop(state);
+                reply.changed.notify_one();
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+                None
             }
-            return None;
-        }
-        drop(state);
-        self.release();
-        match result {
-            Ok(WorkerReply::Admitted { request, .. }) => Some(request),
-            _ => None,
+            ReplyState::Abandoned => {
+                drop(state);
+                self.release();
+                match result {
+                    Ok(WorkerReply::Admitted { request, .. }) => Some(request),
+                    _ => None,
+                }
+            }
+            ReplyState::Ready(_) => unreachable!("invariant violated: a worker reply was delivered twice"),
         }
     }
     /// Stop accepting work and fail every pending command with `cause`.
     fn stop(&self, cause: C) {
         let (pending, watcher) = {
             let mut state = self.state.lock().unwrap();
-            state.stopped = Some(cause.clone());
-            (std::mem::take(&mut state.items), state.stop_watcher.take())
+            match std::mem::replace(&mut state.phase, InboxPhase::Stopped(cause.clone())) {
+                InboxPhase::Open { items, stop_watcher } => (items, stop_watcher),
+                InboxPhase::Stopped(_) => unreachable!("invariant violated: mailbox stopped twice"),
+            }
         };
         self.stopped.notify_all();
         if let Some(watcher) = watcher {
@@ -285,10 +300,15 @@ impl<C: Clone> Call<C> {
         let result = {
             let mut state = self.reply.state.lock().unwrap();
             loop {
-                if let Some(result) = state.result.take() {
-                    break result;
+                if matches!(&*state, ReplyState::Waiting(_)) {
+                    state = self.reply.changed.wait(state).unwrap();
+                    continue;
                 }
-                state = self.reply.changed.wait(state).unwrap();
+                match std::mem::replace(&mut *state, ReplyState::Abandoned) {
+                    ReplyState::Ready(result) => break result,
+                    ReplyState::Waiting(_) => unreachable!(),
+                    ReplyState::Abandoned => unreachable!("invariant violated: unconsumed call reply was abandoned"),
+                }
             }
         };
         self.consumed = true;
@@ -303,12 +323,16 @@ impl<C: Clone> Future for Call<C> {
         assert!(!this.consumed, "worker reply polled after consumption");
         let result = {
             let mut state = this.reply.state.lock().unwrap();
-            match state.result.take() {
-                Some(result) => Some(result),
-                None => {
-                    state.waker = Some(cx.waker().clone());
+            match &mut *state {
+                ReplyState::Waiting(waker) => {
+                    *waker = Some(cx.waker().clone());
                     None
                 }
+                ReplyState::Ready(_) => match std::mem::replace(&mut *state, ReplyState::Abandoned) {
+                    ReplyState::Ready(result) => Some(result),
+                    _ => unreachable!(),
+                },
+                ReplyState::Abandoned => unreachable!("invariant violated: unconsumed call reply was abandoned"),
             }
         };
         match result {
@@ -328,9 +352,11 @@ impl<C: Clone> Drop for Call<C> {
         }
         let completed = {
             let mut state = self.reply.state.lock().unwrap();
-            state.abandoned = true;
-            state.waker.take();
-            state.result.take()
+            match std::mem::replace(&mut *state, ReplyState::Abandoned) {
+                ReplyState::Ready(result) => Some(result),
+                ReplyState::Waiting(_) => None,
+                ReplyState::Abandoned => unreachable!("invariant violated: unconsumed call reply was already abandoned"),
+            }
         };
         if let Some(result) = completed {
             if let Ok(WorkerReply::Admitted { request, .. }) = result {
@@ -402,9 +428,10 @@ impl<C: Clone + Send + 'static> Worker<C> {
         }
         let mailbox = Arc::new(Mailbox {
             state: Mutex::new(Inbox {
-                items: VecDeque::new(),
-                stopped: None,
-                stop_watcher: None,
+                phase: InboxPhase::Open {
+                    items: VecDeque::new(),
+                    stop_watcher: None,
+                },
                 outstanding: 0,
             }),
             changed: Condvar::new(),
@@ -454,8 +481,15 @@ impl<C: Clone + Send + 'static> Worker<C> {
     pub fn stop(&self) -> C {
         self.mailbox.push(Event::Close);
         let state = self.mailbox.state.lock().unwrap();
-        let state = self.mailbox.stopped.wait_while(state, |state| state.stopped.is_none()).unwrap();
-        state.stopped.clone().expect("execution stopped")
+        let state = self
+            .mailbox
+            .stopped
+            .wait_while(state, |state| matches!(state.phase, InboxPhase::Open { .. }))
+            .unwrap();
+        match &state.phase {
+            InboxPhase::Stopped(cause) => cause.clone(),
+            InboxPhase::Open { .. } => unreachable!("execution stopped"),
+        }
     }
     /// Terminate every request, let the flight finish, and join the thread.
     pub fn close(&mut self) {
@@ -488,38 +522,43 @@ impl<C> Clone for Client<C> {
 impl<C: Clone + Send + 'static> Client<C> {
     /// Why execution stopped, once it has.
     pub fn stopped(&self) -> Option<C> {
-        self.mailbox.state.lock().unwrap().stopped.clone()
+        match &self.mailbox.state.lock().unwrap().phase {
+            InboxPhase::Open { .. } => None,
+            InboxPhase::Stopped(cause) => Some(cause.clone()),
+        }
     }
     /// Why execution stopped; otherwise `waker` replaces the watcher woken
     /// once it does.
     pub fn poll_stopped(&self, waker: &Waker) -> Option<C> {
         let mut state = self.mailbox.state.lock().unwrap();
-        if state.stopped.is_none() {
-            state.stop_watcher = Some(waker.clone());
+        match &mut state.phase {
+            InboxPhase::Open { stop_watcher, .. } => {
+                *stop_watcher = Some(waker.clone());
+                None
+            }
+            InboxPhase::Stopped(cause) => Some(cause.clone()),
         }
-        state.stopped.clone()
     }
     pub fn dispatch(&self, command: WorkerCommand) -> Result<Call<C>, DispatchError<C>> {
         let reply = Arc::new(Reply {
-            state: Mutex::new(ReplyState {
-                abandoned: false,
-                result: None,
-                waker: None,
-            }),
+            state: Mutex::new(ReplyState::Waiting(None)),
             changed: Condvar::new(),
         });
-        let mut state = self.mailbox.state.lock().unwrap();
-        if let Some(cause) = &state.stopped {
-            return Err(DispatchError::Stopped(cause.clone()));
+        let mut guard = self.mailbox.state.lock().unwrap();
+        let inbox = &mut *guard;
+        match &mut inbox.phase {
+            InboxPhase::Stopped(cause) => return Err(DispatchError::Stopped(cause.clone())),
+            InboxPhase::Open { items, .. } => {
+                if inbox.outstanding >= self.mailbox.capacity {
+                    return Err(DispatchError::Full);
+                }
+                inbox.outstanding += 1;
+                items.push_back(Item::Control(Envelope {
+                    command,
+                    reply: reply.clone(),
+                }));
+            }
         }
-        if state.outstanding >= self.mailbox.capacity {
-            return Err(DispatchError::Full);
-        }
-        state.outstanding += 1;
-        state.items.push_back(Item::Control(Envelope {
-            command,
-            reply: reply.clone(),
-        }));
         self.mailbox.changed.notify_one();
         Ok(Call {
             reply,
@@ -544,7 +583,13 @@ fn run<C: Clone>(owner: &mut dyn Driven<Stopped = C>, mailbox: &Mailbox<C>) -> C
     let start = Instant::now();
     let now = || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     loop {
-        let items = std::mem::take(&mut mailbox.state.lock().unwrap().items);
+        let items = {
+            let mut state = mailbox.state.lock().unwrap();
+            match &mut state.phase {
+                InboxPhase::Open { items, .. } => std::mem::take(items),
+                InboxPhase::Stopped(_) => unreachable!("invariant violated: mailbox stopped while worker is running"),
+            }
+        };
         for item in items {
             match item {
                 Item::Event(event) => owner.event(event, now()),
@@ -563,8 +608,13 @@ fn run<C: Clone>(owner: &mut dyn Driven<Stopped = C>, mailbox: &Mailbox<C>) -> C
             Err(cause) => return cause,
         }
         let mut state = mailbox.state.lock().unwrap();
-        while state.items.is_empty() {
-            let Some(due) = rereading.due else {
+        loop {
+            match &mut state.phase {
+                InboxPhase::Open { items, .. } if !items.is_empty() => break,
+                InboxPhase::Open { .. } => {}
+                InboxPhase::Stopped(_) => unreachable!("invariant violated: mailbox stopped while worker is running"),
+            }
+            let Rereading::Active { interval, due: Some(due) } = rereading else {
                 state = mailbox.changed.wait(state).unwrap();
                 continue;
             };
@@ -572,8 +622,11 @@ fn run<C: Clone>(owner: &mut dyn Driven<Stopped = C>, mailbox: &Mailbox<C>) -> C
                 Some(left) => state = mailbox.changed.wait_timeout(state, left).unwrap().0,
                 None => {
                     // Fired once: the reading it brings sets the next.
-                    rereading.due = None;
-                    state.items.push_back(Item::Event(Event::Reread));
+                    rereading = Rereading::Active { interval, due: None };
+                    if let InboxPhase::Open { items, .. } = &mut state.phase {
+                        items.push_back(Item::Event(Event::Reread));
+                    }
+                    break;
                 }
             }
         }
@@ -771,18 +824,18 @@ mod tests {
         let ms = Duration::from_millis;
         let stands = |cost, changed| Reread::Stands { cost: ms(cost), changed, ceiling: None };
         let first = Rereading::default().after(stands(3, false), now);
-        assert_eq!(first, Rereading { interval: Some(ms(3)), due: Some(now + ms(3)) });
+        assert_eq!(first, Rereading::Active { interval: ms(3), due: Some(now + ms(3)) });
         let doubled = first.after(stands(5, false), now).after(stands(5, false), now);
-        assert_eq!(doubled.interval, Some(ms(12)));
+        assert_eq!(doubled, Rereading::Active { interval: ms(12), due: Some(now + ms(12)) });
         assert_eq!(doubled.after(Reread::Unread, now + ms(1)), doubled);
         let reset = doubled.after(stands(4, true), now);
-        assert_eq!(reset, Rereading { interval: Some(ms(4)), due: Some(now + ms(4)) });
-        assert_eq!(reset.after(Reread::Settled, now), Rereading::default());
+        assert_eq!(reset, Rereading::Active { interval: ms(4), due: Some(now + ms(4)) });
+        assert_eq!(reset.after(Reread::Settled, now), Rereading::Settled);
         // Others were seen to move across 10 ms: the doubling stops there.
         let bounded = |interval: Rereading| interval.after(Reread::Stands { cost: ms(4), changed: false, ceiling: Some(ms(10)) }, now);
         let capped = bounded(bounded(reset));
-        assert_eq!(capped, Rereading { interval: Some(ms(10)), due: Some(now + ms(10)) });
-        assert_eq!(bounded(capped).interval, Some(ms(10)));
+        assert_eq!(capped, Rereading::Active { interval: ms(10), due: Some(now + ms(10)) });
+        assert_eq!(bounded(capped), Rereading::Active { interval: ms(10), due: Some(now + ms(10)) });
     }
 
     #[test]
@@ -793,17 +846,17 @@ mod tests {
             Reread::Stands { cost: Duration::ZERO, changed: false, ceiling: None },
             now,
         );
-        assert_eq!(first, Rereading { interval: Some(ns(1)), due: Some(now + ns(1)) });
+        assert_eq!(first, Rereading::Active { interval: ns(1), due: Some(now + ns(1)) });
         let doubled = first.after(
             Reread::Stands { cost: Duration::ZERO, changed: false, ceiling: None },
             now,
         );
-        assert_eq!(doubled, Rereading { interval: Some(ns(2)), due: Some(now + ns(2)) });
+        assert_eq!(doubled, Rereading::Active { interval: ns(2), due: Some(now + ns(2)) });
         let reset = doubled.after(
             Reread::Stands { cost: Duration::ZERO, changed: true, ceiling: Some(Duration::ZERO) },
             now,
         );
-        assert_eq!(reset, Rereading { interval: Some(ns(1)), due: Some(now + ns(1)) });
+        assert_eq!(reset, Rereading::Active { interval: ns(1), due: Some(now + ns(1)) });
     }
 
     /// The incident's worker half: commands never wait on the owner's state.

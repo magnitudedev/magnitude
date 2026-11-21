@@ -82,10 +82,10 @@
 # activations read from device memory. On simdgroup matrices they are read in
 # fragment order: a paired entry's pre-pass writes that order, and a single
 # projection first reorders its rows into `fragments` (a second copy of them,
-# in whole 64-row tiles). The form needs K a multiple of 128 and has no
-# split-K; its staged producer reads every weight, dense ones included
-# (`forms` admits it for all), and where it is admitted it is the default,
-# with the same results as the tiles above.
+# in whole 64-row tiles). The form needs K a multiple of 64 (128 when TALL_K
+# is 128) and has no split-K; its staged producer reads every weight, dense
+# ones included (`forms` admits it for all), and where it is admitted it is
+# the default, with the same results as the tiles above.
 # PACK selects the token-packing GEMM past 64 rows (`gemm_packed`, over the
 # weights `forms::metal_packing` admits, integer lane codes not scaled by a
 # power of two of their own whose coefficients fold per run of a 32-column
@@ -145,9 +145,9 @@
 # tiles, each threadgroup a part's row tile over that part's own rows
 # (`PROJECTION_SEGMENTED_PARTS_GEMV`), into F32 `partials`; the last of a
 # row tile's P threadgroups to arrive (`arrivals`, a counter a row tile)
-# adds them in part order. The batched launch and the tuned GEMM read whole
-# rows; no other form reads parts (TALL, PACK, MATRIX, SMALL and TILED are 0
-# for a parted entry).
+# adds them in part order. The batched launch and every form past 16 rows
+# read whole rows (TALL and PACK among them); MATRIX, SMALL and TILED are 0
+# for a parted entry.
 # Groups: the GEMVs, the batched launch, the reductions, the relayout and
 # the tall GEMM run group g at grid z, the GEMMs at z = g * split + part, each
 # over its own G-th of the split partials and of the tall form's fragments;
@@ -193,13 +193,14 @@ projection dense for metal:
     where (TILED == 0 or (PLANES == 0 and PARTED == 0))
     where (STAGE == 0 or PLANES == 0)
     where (STAGE == 0 or (TILED == 0 and LANES < 32))
-    where (TALL == 0 or (GATHERED == 0 and PLANES == 0 and PARTED == 0 and SPLITS == 1 and K % 128 == 0))
+    where (TALL == 0 or (GATHERED == 0 and PLANES == 0 and SPLITS == 1 and K % 64 == 0))
+    where (TALL == 0 or K % 128 == 0 or TALL_K == 64)
     where (SMALL == 0 or (PLANES == 0 and PARTED == 0))
     where (SPLIT == 1 or PLANES == 0) for single
     where (INT8 == 0 or (GATHERED == 0 and TALL == 1 and K % 512 == 0 and N % (64 / WEIGHTS) == 0 and each(W, form(W, INT8) == 1) and agree(W, form(W, INT8_INTERLEAVED)))) for paired | single
     where (INT8 == 1 or INT8_TILE == 128) for single
-    where (PACK == 0 or (GATHERED == 0 and TALL == 1 and INT8 == 0 and K % 256 == 0 and K < 1048576 and N % (64 / WEIGHTS) == 0 and each(W, form(W, PACK) == 1) and agree(W, form(W, PACK_FOLDS)) and agree(W, form(W, PACK_RESIDUE)) and agree(W, form(W, PACK_SUMS)))) for paired | single
-    where (PACK == 0 or (PARTED == 0 and TALL == 1 and K % 256 == 0 and K < 1048576 and SERVED == 1 and any(W, N > 0 and N % 32 == 0 and form(W, PACK) == 1))) for segmented
+    where (PACK == 0 or (GATHERED == 0 and TALL == 1 and INT8 == 0 and K % 128 == 0 and K < 1048576 and N % (64 / WEIGHTS) == 0 and each(W, form(W, PACK) == 1) and agree(W, form(W, PACK_FOLDS)) and agree(W, form(W, PACK_RESIDUE)) and agree(W, form(W, PACK_SUMS)))) for paired | single
+    where (PACK == 0 or (TALL == 1 and K % 128 == 0 and K < 1048576 and SERVED == 1 and any(W, N > 0 and N % 32 == 0 and form(W, PACK) == 1))) for segmented
     where (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0))
     where (PACK == 0 or (TILE_M == 64 and TILE_N == 64))
     where (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))

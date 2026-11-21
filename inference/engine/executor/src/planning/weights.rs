@@ -1949,16 +1949,22 @@ enum WeightSlot {
     Vision(usize),
 }
 
+/// Planned weights and head-specific facts for a selected drafter component.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModelLoadPlan {
-    /// Width of raw F32 residual conditioning requested by the selected head.
-    pub(super) residual_conditioning: Option<u64>,
-    pub(super) target: Vec<WeightPlan>,
-    pub(super) head: Option<Vec<WeightPlan>>,
+pub(super) struct HeadWeightsPlan {
+    pub(super) weights: Vec<WeightPlan>,
     /// Whether the selected drafter is a draft head that keeps its own
     /// history (`HeadHistory::Own`): an embedded head a front pass's chain
-    /// runs on (`Self::fronts`).
-    pub(super) own_history_head: bool,
+    /// runs on (`ModelLoadPlan::fronts`).
+    pub(super) own_history: bool,
+    /// Width of raw F32 residual conditioning requested by the selected head.
+    pub(super) residual_conditioning: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelLoadPlan {
+    pub(super) target: Vec<WeightPlan>,
+    pub(super) head: Option<HeadWeightsPlan>,
     pub(super) vision: Option<Vec<WeightPlan>>,
     /// The target's host-resident gathered tables.
     pub(super) host_tables: Vec<HostTablePlan>,
@@ -2002,7 +2008,7 @@ fn head_component_scope(scope: WeightScope) -> Result<bool, String> {
 
 impl ModelLoadPlan {
     pub(crate) fn residual_conditioning(&self) -> Option<u64> {
-        self.residual_conditioning
+        self.head.as_ref().and_then(|head| head.residual_conditioning)
     }
 
     pub fn host_tables(&self) -> &[HostTablePlan] {
@@ -2101,12 +2107,12 @@ impl ModelLoadPlan {
         // Each stored tensor once, however many roles or representations
         // the load gives it (a tied embedding is a table and a head).
         let capacity = self.target.len()
-            + self.head.as_ref().map_or(0, Vec::len)
+            + self.head().map_or(0, <[WeightPlan]>::len)
             + self.vision.as_ref().map_or(0, Vec::len)
             + self.host_tables.len();
         let mut counted = fx_set_with_capacity::<(ArtifactComponent, &str)>(capacity);
         let mut stored = 0u64;
-        let weights = [self.target.as_slice(), self.head.as_deref().unwrap_or_default(), self.vision.as_deref().unwrap_or_default()];
+        let weights = [self.target.as_slice(), self.head().unwrap_or_default(), self.vision.as_deref().unwrap_or_default()];
         for weight in weights.into_iter().flatten() {
             if counted.insert((weight.component, weight.descriptor.name.as_str())) {
                 let bytes = match weight.holding {
@@ -2242,7 +2248,7 @@ impl ModelLoadPlan {
 
     /// Peak upload allocation while importing a lazy optional component.
     pub fn head_upload_peak_bytes(&self) -> u64 {
-        super::ImportPlan::new(self.head.iter().flatten()).peak_bytes()
+        super::ImportPlan::new(self.head().into_iter().flatten()).peak_bytes()
     }
 
     pub fn vision_upload_peak_bytes(&self) -> u64 {
@@ -2278,7 +2284,7 @@ fn visit_weight_storages(
     mut visit: impl FnMut(usize, &WeightPlan) -> Result<(), String>,
 ) -> Result<(), String> {
     let capacity = load.target.len()
-        + load.head.as_ref().map_or(0, Vec::len)
+        + load.head().map_or(0, <[WeightPlan]>::len)
         + load.vision.as_ref().map_or(0, Vec::len);
     // Map each distinct `ArtifactComponent` (at most 3 in a load) to a small
     // integer so `seen` does not hash or store 32-byte identities per weight.
@@ -2305,7 +2311,7 @@ fn visit_weight_storages(
         fx_map_with_capacity(capacity);
     for (index, weights) in [
         load.target.as_slice(),
-        load.head.as_deref().unwrap_or_default(),
+        load.head().unwrap_or_default(),
         load.vision.as_deref().unwrap_or_default(),
     ]
     .into_iter()
@@ -2365,7 +2371,7 @@ impl ModelLoadPlan {
     }
 
     pub fn head(&self) -> Option<&[WeightPlan]> {
-        self.head.as_deref()
+        self.head.as_ref().map(|head| head.weights.as_slice())
     }
 
     pub fn vision(&self) -> Option<&[WeightPlan]> {
@@ -2374,13 +2380,13 @@ impl ModelLoadPlan {
 
     pub(super) fn rebuild_role_index(&mut self) {
         let capacity = self.target.len()
-            + self.head.as_ref().map_or(0, Vec::len)
+            + self.head().map_or(0, <[WeightPlan]>::len)
             + self.vision.as_ref().map_or(0, Vec::len);
         let mut index = fx_map_with_capacity(capacity);
         for (i, weight) in self.target.iter().enumerate() {
             index.entry(weight.role).or_insert(WeightSlot::Target(i));
         }
-        if let Some(head) = &self.head {
+        if let Some(head) = self.head() {
             for (i, weight) in head.iter().enumerate() {
                 index.entry(weight.role).or_insert(WeightSlot::Head(i));
             }
@@ -2408,7 +2414,7 @@ impl ModelLoadPlan {
     pub fn weight_by_role(&self, role: WeightRole) -> Option<&WeightPlan> {
         match *self.role_index.get(&role)? {
             WeightSlot::Target(index) => self.target.get(index),
-            WeightSlot::Head(index) => self.head.as_deref()?.get(index),
+            WeightSlot::Head(index) => self.head()?.get(index),
             WeightSlot::Vision(index) => self.vision.as_deref()?.get(index),
         }
     }
@@ -2432,10 +2438,8 @@ impl ModelLoadPlan {
     #[cfg(test)]
     pub(crate) fn from_vision(vision: Vec<WeightPlan>) -> Self {
         let mut load = Self {
-            residual_conditioning: None,
             target: Vec::new(),
             head: None,
-            own_history_head: false,
             vision: Some(vision),
             host_tables: Vec::new(),
             readout_candidates: Vec::new(),
@@ -2458,7 +2462,7 @@ impl ModelLoadPlan {
     /// output row.
     pub(crate) fn draft_fusion(&self) -> Option<&WeightPlan> {
         let role = WeightRole { scope: WeightScope::Draft, kind: WeightKind::DraftFusion };
-        self.residual_conditioning.is_none().then(|| self.target_weight(role)).flatten()
+        self.residual_conditioning().is_none().then(|| self.target_weight(role)).flatten()
     }
 
     /// Resolve the ordered checked-entry topology from the same weight facts
@@ -2495,8 +2499,7 @@ impl ModelLoadPlan {
         }
         let target = combine_planned(&self.target, &self.unplaced_output, false);
         let head = self
-            .head
-            .as_deref()
+            .head()
             .map(|head| combine_planned(head, &self.unplaced_output, true));
         let vision = self.vision.as_deref();
         let _guard = ProgramPlanLookupGuard::enter(self, &target, head.as_deref(), vision);
@@ -2732,7 +2735,13 @@ impl ModelLoadPlan {
                     component,
                     operators::head_weights(head).map_err(|error| error.to_string())?,
                 )?;
-                Some(plans)
+                Some(HeadWeightsPlan {
+                    weights: plans,
+                    own_history: head.history == HeadHistory::Own,
+                    residual_conditioning: head
+                        .residual_conditioning()
+                        .then(|| head.conditioning_width(&definition.decoder)),
+                })
             }
             (true, None, Some(separate), Some((identity, tensors))) => {
                 let component = ArtifactComponent {
@@ -2755,7 +2764,11 @@ impl ModelLoadPlan {
                     component,
                     operators::draft::draft_weights(separate).map_err(|error| error.to_string())?,
                 )?;
-                Some(plans)
+                Some(HeadWeightsPlan {
+                    weights: plans,
+                    own_history: false,
+                    residual_conditioning: None,
+                })
             }
             _ => return Err("the selected drafter has no component".into()),
         };
@@ -2775,7 +2788,7 @@ impl ModelLoadPlan {
             })
             .transpose()?;
         let capacity = target.len()
-            + head.as_ref().map_or(0, Vec::len)
+            + head.as_ref().map_or(0, |head| head.weights.len())
             + vision.as_ref().map_or(0, Vec::len);
         let mut role_index = fx_map_with_capacity(capacity);
         let dup_err = |plan: &WeightPlan| {
@@ -2800,7 +2813,7 @@ impl ModelLoadPlan {
             }
         }
         if let Some(head) = &head {
-            for (i, plan) in head.iter().enumerate() {
+            for (i, plan) in head.weights.iter().enumerate() {
                 match role_index.entry(plan.role) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         entry.insert(WeightSlot::Head(i));
@@ -2808,7 +2821,7 @@ impl ModelLoadPlan {
                     std::collections::hash_map::Entry::Occupied(_) => {
                         if target
                             .iter()
-                            .chain(&head[..i])
+                            .chain(&head.weights[..i])
                             .any(|prev| prev.component == plan.component && prev.role == plan.role)
                         {
                             return Err(dup_err(plan));
@@ -2826,7 +2839,7 @@ impl ModelLoadPlan {
                     std::collections::hash_map::Entry::Occupied(_) => {
                         if target
                             .iter()
-                            .chain(head.as_deref().unwrap_or_default())
+                            .chain(head.as_ref().map_or(&[][..], |head| head.weights.as_slice()))
                             .chain(&vision[..i])
                             .any(|prev| prev.component == plan.component && prev.role == plan.role)
                         {
@@ -2838,15 +2851,8 @@ impl ModelLoadPlan {
         }
 
         let load = Self {
-            residual_conditioning: definition
-                .head
-                .as_ref()
-                .filter(|head| selection.head && head.residual_conditioning())
-                .map(|head| head.conditioning_width(&definition.decoder)),
             target,
             head,
-            own_history_head: selection.head
-                && definition.head.as_ref().is_some_and(|head| head.history == HeadHistory::Own),
             vision,
             host_tables,
             readout_candidates: Vec::new(),
@@ -2971,7 +2977,7 @@ impl ModelLoadPlan {
     /// allocator places.
     pub fn device_allocations(&self) -> Result<Vec<u64>, String> {
         let capacity = self.target.len()
-            + self.head.as_ref().map_or(0, Vec::len)
+            + self.head().map_or(0, <[WeightPlan]>::len)
             + self.vision.as_ref().map_or(0, Vec::len);
         let mut allocations = Vec::with_capacity(capacity * 2);
         visit_weight_storages(self, |_, weight| {
@@ -3122,6 +3128,7 @@ impl ModelLoadPlan {
                 self.head
                     .as_mut()
                     .ok_or("qualified head representation has no head component")?
+                    .weights
                     .push(candidate);
             } else {
                 self.target.push(candidate);
@@ -3133,9 +3140,11 @@ impl ModelLoadPlan {
                 kind: WeightKind::Output,
             };
             let placed = if head_component_scope(scope)? {
-                self.head
+                &mut self
+                    .head
                     .as_mut()
                     .ok_or("qualified head representation has no head component")?
+                    .weights
             } else {
                 &mut self.target
             };
@@ -3184,7 +3193,7 @@ impl ModelLoadPlan {
     pub fn weights(&self) -> impl Iterator<Item = &WeightPlan> {
         self.target
             .iter()
-            .chain(self.head.iter().flatten())
+            .chain(self.head().into_iter().flatten())
             .chain(self.vision.iter().flatten())
     }
 
@@ -3212,7 +3221,7 @@ impl ModelLoadPlan {
     /// step's front rows run on the host's guesses, whose kinds its step
     /// words read (`routed_step`).
     pub(crate) fn fronts(&self) -> bool {
-        self.bank.is_some() && self.own_history_head
+        self.bank.is_some() && self.head.as_ref().is_some_and(|head| head.own_history)
     }
 
     /// The plan with each streamed table's stagings counting the front head
@@ -3220,7 +3229,11 @@ impl ModelLoadPlan {
     /// removing the expert bank decides.
     pub(super) fn with_front_stagings(mut self) -> Self {
         let fronts = self.fronts();
-        let weights = self.target.iter_mut().chain(self.head.iter_mut().flatten()).chain(self.vision.iter_mut().flatten());
+        let weights = self
+            .target
+            .iter_mut()
+            .chain(self.head.iter_mut().flat_map(|head| head.weights.iter_mut()))
+            .chain(self.vision.iter_mut().flatten());
         for weight in weights {
             if let Holding::Streamed(StreamedRows { fill: TableFill::Imported(flights), .. }) = &mut weight.holding {
                 flights.fronts = fronts;
@@ -4207,7 +4220,7 @@ pub(super) fn planned_scalable(
         if ctx.head_len > 0 && ptr == ctx.head_ptr && len == ctx.head_len {
             match load.role_index.get(&role) {
                 Some(&WeightSlot::Head(i)) => {
-                    if let Some(head) = load.head.as_deref() {
+                    if let Some(head) = load.head() {
                         return Some(Ok(to_scalable(&head[i])));
                     }
                 }

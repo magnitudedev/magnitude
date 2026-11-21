@@ -34,11 +34,12 @@ inline void put_own(threadgroup float *own, ulong index, float value) { own[inde
 
 // Pre (`own`), post and the Sinkhorn comb (`joined`) of a row from its
 // reduced mixes (each already scaled by the row's inverse norm, held by
-// every thread), formed by the whole threadgroup: thread e < S * S owns comb
-// element (e / S, e % S) through `comb` (S * S floats of threadgroup memory),
-// each of its sums over its row or column read there in index order, so
-// every element takes the same operations in the same order as one thread
-// forming them all would. Every thread of the threadgroup calls it.
+// threads < S * S), formed by simdgroup 0 in registers via `simd_shuffle`
+// when S * S <= 32 (zero threadgroup barriers and zero threadgroup memory
+// bounces), or by the whole threadgroup through `comb` (S * S floats of
+// threadgroup memory) when S * S > 32. Each row or column sum runs in index
+// order, so every element takes the same operations in the same order as one
+// thread forming them all would. Every thread of the threadgroup calls it.
 // Independent of any entry ABI: the caller passes its views' strides, and
 // `own` is the pre result or threadgroup memory (`put_own`).
 template <typename Own>
@@ -47,6 +48,54 @@ inline void publish_coefficients(thread const float (&mixes)[MIXES], threadgroup
     ulong own_stride, element::Out<element::F32> joined, ulong joined_stride, float epsilon, uint iterations) {
     const uint source = thread_index / STREAMS, target = thread_index % STREAMS;
     const bool owns = thread_index < STREAMS * STREAMS;
+    if constexpr (STREAMS * STREAMS <= 32u) {
+        if (thread_index >= 32u)
+            return;
+        const uint row_base = owns ? source * STREAMS : 0u;
+        const uint col_base = owns ? target : 0u;
+        // The element's logit, then its row's softmax.
+        float value = 0.0f;
+        if (owns) {
+            const uint at = 2u * STREAMS + thread_index;
+            value = mixes[at] * scale[2u * scale_stride] + base[ulong(at) * base_stride];
+        }
+        float maximum = -INFINITY;
+        for (uint t = 0; t < STREAMS; ++t)
+            maximum = metal::max(maximum, simd_shuffle(value, ushort(row_base + t)));
+        value = metal::exp(value - maximum);
+        float total = 0.0f;
+        for (uint t = 0; t < STREAMS; ++t)
+            total += simd_shuffle(value, ushort(row_base + t));
+        value = value / total + epsilon;
+        // The Sinkhorn normalizations: rows (after the first sweep), then
+        // columns.
+        for (uint sweep = 0; sweep < iterations; ++sweep) {
+            if (sweep > 0u) {
+                float sum = 0.0f;
+                for (uint t = 0; t < STREAMS; ++t)
+                    sum += simd_shuffle(value, ushort(row_base + t));
+                value /= sum + epsilon;
+            }
+            float sum = 0.0f;
+            for (uint s = 0; s < STREAMS; ++s)
+                sum += simd_shuffle(value, ushort(s * STREAMS + col_base));
+            value /= sum + epsilon;
+        }
+        // Order simdgroup 0's reads of `reduced` (which `own` may alias when
+        // !CARRIED) before writing `own`.
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (owns)
+            joined.put(ulong(STREAMS + thread_index) * joined_stride, value);
+        if (thread_index < STREAMS) {
+            const uint stream = thread_index;
+            put_own(own, ulong(stream) * own_stride,
+                functions::sigmoid(mixes[stream] * scale[0] + base[ulong(stream) * base_stride]) + epsilon);
+            joined.put(ulong(stream) * joined_stride, 2.0f
+                * functions::sigmoid(mixes[STREAMS + stream] * scale[scale_stride]
+                    + base[ulong(STREAMS + stream) * base_stride]));
+        }
+        return;
+    }
     // The element's logit, then its row's softmax.
     float value = 0.0f;
     if (owns) {
@@ -152,24 +201,60 @@ inline void reduce_slice(device const float *hidden, device const float *previou
     for (uint r = 0; r < PER; ++r)
         for (uint j = 0; j < SUMS; ++j)
             sums[r][j] = 0.0f;
-    // Column `at` of every row this lane holds.
-    auto take = [&](uint at, thread const float (&f)[MIXES]) {
-        const uint stream = at / h, column = at % h;
-        for (uint r = 0; r < PER; ++r) {
-            const float v = x[r][ulong(stream) * SEISMIC_HIDDEN_STRIDE_1 + ulong(column) * SEISMIC_HIDDEN_STRIDE_2];
-            sums[r][0] = metal::fma(v, v, sums[r][0]);
-            for (uint j = 0; j < MIXES; ++j)
-                sums[r][1u + j] = metal::fma(f[j], v, sums[r][1u + j]);
-        }
-    };
     if constexpr (TILE == 1u) {
-        for (uint at = first + stripe * 32u + lane; at < last; at += PASS) {
-            float f[MIXES];
-            for (uint j = 0; j < MIXES; ++j)
-                f[j] = function[ulong(j) * SEISMIC_FUNCTION_STRIDE_0 + ulong(at) * SEISMIC_FUNCTION_STRIDE_1];
-            take(at, f);
+        const bool unit_strides = SEISMIC_HIDDEN_STRIDE_2 == 1ul && SEISMIC_FUNCTION_STRIDE_1 == 1ul
+            && (SEISMIC_FUNCTION_STRIDE_0 & 3ul) == 0ul;
+        const uint tid = stripe * 32u + lane;
+        for (uint s = 0; s < STREAMS; ++s) {
+            const uint s_begin = s * h;
+            const uint s_first = metal::max(first, s_begin);
+            const uint s_last = metal::min(last, s_begin + h);
+            if (s_first >= s_last)
+                continue;
+            device const float *xs = x[0] + ulong(s) * SEISMIC_HIDDEN_STRIDE_1;
+            const uint col0 = s_first - s_begin;
+            uint tail_start = s_first;
+            if (unit_strides && (ulong(xs + col0) & 15ul) == 0ul && (ulong(function + s_first) & 15ul) == 0ul) {
+                const uint vec_count = (s_last - s_first) / 4u;
+                for (uint k = tid; k < vec_count; k += PASS) {
+                    const uint off = 4u * k;
+                    const float4 v = *reinterpret_cast<device const float4 *>(xs + col0 + off);
+                    sums[0][0] = metal::fma(v.x, v.x, sums[0][0]);
+                    sums[0][0] = metal::fma(v.y, v.y, sums[0][0]);
+                    sums[0][0] = metal::fma(v.z, v.z, sums[0][0]);
+                    sums[0][0] = metal::fma(v.w, v.w, sums[0][0]);
+                    const ulong func_off = ulong(s_first + off);
+                    for (uint j = 0; j < MIXES; ++j) {
+                        const float4 f = *reinterpret_cast<device const float4 *>(
+                            function + ulong(j) * SEISMIC_FUNCTION_STRIDE_0 + func_off);
+                        sums[0][1u + j] = metal::fma(f.x, v.x, sums[0][1u + j]);
+                        sums[0][1u + j] = metal::fma(f.y, v.y, sums[0][1u + j]);
+                        sums[0][1u + j] = metal::fma(f.z, v.z, sums[0][1u + j]);
+                        sums[0][1u + j] = metal::fma(f.w, v.w, sums[0][1u + j]);
+                    }
+                }
+                tail_start = s_first + vec_count * 4u;
+            }
+            for (uint at = tail_start + tid; at < s_last; at += PASS) {
+                const float v = xs[ulong(at - s_begin) * SEISMIC_HIDDEN_STRIDE_2];
+                sums[0][0] = metal::fma(v, v, sums[0][0]);
+                for (uint j = 0; j < MIXES; ++j) {
+                    const float f = function[ulong(j) * SEISMIC_FUNCTION_STRIDE_0 + ulong(at) * SEISMIC_FUNCTION_STRIDE_1];
+                    sums[0][1u + j] = metal::fma(f, v, sums[0][1u + j]);
+                }
+            }
         }
     } else {
+        // Column `at` of every row this lane holds.
+        auto take = [&](uint at, thread const float (&f)[MIXES]) {
+            const uint stream = at / h, column = at % h;
+            for (uint r = 0; r < PER; ++r) {
+                const float v = x[r][ulong(stream) * SEISMIC_HIDDEN_STRIDE_1 + ulong(column) * SEISMIC_HIDDEN_STRIDE_2];
+                sums[r][0] = metal::fma(v, v, sums[r][0]);
+                for (uint j = 0; j < MIXES; ++j)
+                    sums[r][1u + j] = metal::fma(f[j], v, sums[r][1u + j]);
+            }
+        };
         for (uint chunk = first; chunk < last; chunk += CHUNK) {
             const uint count = metal::min(CHUNK, last - chunk);
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -259,7 +344,7 @@ kernel void stream_mix_sinkhorn_finish(
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
     threadgroup float reduced[SUMS];
-    threadgroup float comb[STREAMS * STREAMS];
+    threadgroup float comb[STREAMS * STREAMS <= 32u ? 1u : STREAMS * STREAMS];
     const uint h = uint(SEISMIC_DIM_H), width = STREAMS * h, split = uint(SEISMIC_CONST_SINKHORN_SPLIT);
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     const float norm_epsilon = as_type<float>(uint(SEISMIC_PARAM_NORM_EPSILON));
@@ -271,10 +356,12 @@ kernel void stream_mix_sinkhorn_finish(
         reduced[thread_index] = total;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inverse = metal::rsqrt(reduced[0] / float(width) + norm_epsilon);
     float mixes[MIXES];
-    for (uint j = 0; j < MIXES; ++j)
-        mixes[j] = reduced[1u + j] * inverse;
+    if (thread_index < STREAMS * STREAMS) {
+        const float inverse = metal::rsqrt(reduced[0] / float(width) + norm_epsilon);
+        for (uint j = 0; j < MIXES; ++j)
+            mixes[j] = reduced[1u + j] * inverse;
+    }
     const element::Out<element::F32> joined
         = element::Out<element::F32>(join).offset(ulong(row) * SEISMIC_RESULT_2_STRIDE_0);
     if (CARRIED) {
@@ -282,7 +369,8 @@ kernel void stream_mix_sinkhorn_finish(
             element::Out<element::F32>(pre).offset(ulong(row) * SEISMIC_RESULT_1_STRIDE_0), SEISMIC_RESULT_1_STRIDE_1,
             joined, SEISMIC_RESULT_2_STRIDE_1, epsilon, iterations);
     } else {
-        // Every thread holds its mixes, so `reduced` takes the pre.
+        // Only threads < S * S read `reduced` above, so `reduced` takes the pre
+        // once their reads complete (ordered inside `publish_coefficients`).
         publish_coefficients(mixes, comb, thread_index, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
             reduced, 1ul, joined, SEISMIC_RESULT_2_STRIDE_1, epsilon, iterations);
         threadgroup_barrier(mem_flags::mem_threadgroup);

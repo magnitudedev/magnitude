@@ -202,8 +202,40 @@ impl Base {
     }
 }
 
-/// A group of steps begun: its steps, those ended, when it began, and
-/// whether the watcher has retired it (the device is past it).
+/// How a group of steps runs, by its form:
+/// - `Decode`: every step routes by the decode form (no group reads record,
+///   never scratch-served, no per-layer merge sets).
+/// - `Grouped`: at least one step routes by the grouped form, so the group
+///   holds a group reads record (`BankPart::GroupReads`) until every step of
+///   it has ended, each streamed layer's merge set (`Telemetry::merge_sets`),
+///   and whether its steps are scratch-served (not resident).
+enum GroupKind {
+    Decode,
+    Grouped {
+        /// The group reads record a group of grouped steps holds
+        /// (`BankPart::GroupReads`), until every step of it has ended.
+        reads: Option<GroupRecord>,
+        /// Each streamed layer's merge set, the steps the group ends with
+        /// whose backs run in one pass (`Telemetry::merge_sets`).
+        merges: Vec<usize>,
+        /// Whether its steps are scratch-served (not resident).
+        scratch: bool,
+    },
+}
+
+impl GroupKind {
+    /// Whether the group's steps are scratch-served: only a grouped group
+    /// that is not resident can be.
+    fn is_scratch(&self) -> bool {
+        match self {
+            Self::Decode => false,
+            Self::Grouped { scratch, .. } => *scratch,
+        }
+    }
+}
+
+/// A group of steps begun: its steps, those ended, when it began, whether the
+/// watcher has retired it (the device is past it), its work, and its form.
 struct Begun {
     steps: u64,
     /// The pieces it runs as, by their first layer: one, its own, until a
@@ -212,17 +244,12 @@ struct Begun {
     ended: u64,
     begun: Instant,
     retired: bool,
-    /// Whether its steps are scratch-served: a prompt group's requests.
-    scratch: bool,
-    /// Each streamed layer's merge set, the steps the group ends with
-    /// whose backs run in one pass (`Telemetry::merge_sets`).
-    merges: Vec<usize>,
-    /// The group reads record a group of grouped steps holds
-    /// (`BankPart::GroupReads`), until every step of it has ended.
-    reads: Option<GroupRecord>,
-    /// Whether a launch of it is a prompt's (`LaunchWork::Prompt`): its
-    /// reads are a prompt's, and it runs as one.
-    prompt: bool,
+    /// Whether a launch of it is a prompt's (`LaunchWork::Prompt`), apart
+    /// from its form: its reads are a prompt's, and it runs as one.
+    work: LaunchWork,
+    /// Its form's state: decode (no group reads record, never scratch-served)
+    /// or grouped (group reads record, per-layer merge sets, scratch-served).
+    kind: GroupKind,
 }
 
 /// A group's hold of one of the group reads records, one for each group in
@@ -322,6 +349,16 @@ impl Begun {
     fn after(&self, group: Step) -> Point {
         let piece = self.pieces.last().expect("a group runs a piece").piece;
         Point { piece, layer: usize::MAX, sequence: Step::MAX, group }
+    }
+
+    /// Whether the group's steps are scratch-served.
+    fn is_scratch(&self) -> bool {
+        self.kind.is_scratch()
+    }
+
+    /// Whether any launch of the group is a prompt's.
+    fn is_prompt(&self) -> bool {
+        self.work == LaunchWork::Prompt
     }
 }
 
@@ -431,7 +468,7 @@ impl State {
     /// claimed record by record later, as the group's first request is
     /// taken: this span is what covers the begin before it.
     fn lending(&self) -> bool {
-        self.groups.values().any(|group| group.scratch && !group.retired)
+        self.groups.values().any(|group| group.is_scratch() && !group.retired)
     }
 
     /// Forget the groups both retired and ended.
@@ -468,7 +505,7 @@ impl Unresolved<'_> {
         let unbegun = state.last + 1;
         let mut from = state.first_unresolved(self.point, layer);
         for (&first, group) in &state.groups {
-            if group.scratch && group.ended < group.steps && first + group.steps > from {
+            if group.is_scratch() && group.ended < group.steps && first + group.steps > from {
                 from = from.max(first + group.steps);
             }
         }
@@ -755,16 +792,16 @@ impl Steps {
     pub(in crate::experts) fn scratch_group(&self, sequence: Step) -> Option<ScratchGroup> {
         let mut state = self.lock();
         let (first, group) = state.group(sequence);
-        group.scratch.then_some(ScratchGroup { first, steps: group.steps })
+        group.is_scratch().then_some(ScratchGroup { first, steps: group.steps })
     }
 
     /// Group `group`'s merge set size at streamed layer `layer`.
     pub(super) fn merges_of(&self, group: Step, layer: usize) -> usize {
         let state = self.lock();
-        state
-            .groups
-            .get(&group)
-            .map_or(1, |begun| begun.merges.get(layer).copied().unwrap_or(begun.steps as usize))
+        state.groups.get(&group).map_or(1, |begun| match &begun.kind {
+            GroupKind::Decode => begun.steps as usize,
+            GroupKind::Grouped { merges, .. } => merges.get(layer).copied().unwrap_or(begun.steps as usize),
+        })
     }
 
     /// Step `sequence`'s group and when it began.
@@ -799,10 +836,10 @@ impl Steps {
         let (first, group) = state.group(sequence);
         group.ended += 1;
         let steps = group.steps;
-        let prompt = group.prompt;
-        let held = match group.ended == steps {
-            true => group.reads.take().map(|record| (record, group.merges.clone())),
-            false => None,
+        let prompt = group.is_prompt();
+        let held = match (&mut group.kind, group.ended == steps) {
+            (GroupKind::Grouped { reads, merges, .. }, true) => reads.take().map(|record| (record, merges.clone())),
+            (GroupKind::Decode, _) | (GroupKind::Grouped { .. }, false) => None,
         };
         state.running -= 1;
         state.forget();
@@ -982,7 +1019,7 @@ impl Steps {
     /// Whether a running group is a prompt group's, however it is served
     /// (scratch or resident): its steps run many at once.
     pub(super) fn prompt_running(&self) -> bool {
-        self.lock().groups.values().any(|group| group.prompt && group.ended < group.steps)
+        self.lock().groups.values().any(|group| group.is_prompt() && group.ended < group.steps)
     }
 
     /// Steps through `last` begun, each a group of one run whole, where a
@@ -1009,10 +1046,8 @@ impl Steps {
             ended: 0,
             begun: Instant::now(),
             retired: false,
-            scratch: false,
-            merges: Vec::new(),
-            reads: None,
-            prompt: false,
+            work: LaunchWork::Generation,
+            kind: GroupKind::Decode,
         };
         state.groups.insert(first, begun);
         state.last = first + count - 1;
@@ -1152,7 +1187,7 @@ impl Steps {
     /// Whether a running group is scratch-served: its requests may come
     /// whatever its layers hold.
     pub(super) fn scratch_running(&self) -> bool {
-        self.lock().groups.values().any(|group| group.scratch && group.ended < group.steps)
+        self.lock().groups.values().any(|group| group.is_scratch() && group.ended < group.steps)
     }
 
     /// The steps' state, for the exchange's watchdog: the frontier, the
@@ -1170,7 +1205,7 @@ impl Steps {
                     group.ended,
                     group.begun.elapsed(),
                     group.retired,
-                    group.scratch
+                    group.is_scratch()
                 )
             })
             .collect::<Vec<_>>();
@@ -1250,7 +1285,10 @@ impl Shared {
         // policy words staged are written first, so its runs read them.
         self.write_staged();
         let grouped = launches.iter().any(|launch| route(launch) == StepRoute::Grouped);
-        let prompt = launches.iter().any(|launch| work(launch) == LaunchWork::Prompt);
+        let group_work = match launches.iter().any(|launch| work(launch) == LaunchWork::Prompt) {
+            true => LaunchWork::Prompt,
+            false => LaunchWork::Generation,
+        };
         let begun = (|| -> Result<_, String> {
             let count = launches.len() as u64;
             let mut state = self.steps.lock();
@@ -1270,7 +1308,8 @@ impl Shared {
                 }
             }
             let scratch = scratch()?;
-            let reads = match grouped {
+            assert!(grouped || !scratch, "a decode group is never scratch-served");
+            let record = match grouped {
                 false => None,
                 true => {
                     let record = state
@@ -1281,13 +1320,16 @@ impl Shared {
                     Some(record)
                 }
             };
-            let index = reads.as_ref().map(|&GroupRecord(index)| index);
             let merges = self
                 .telemetry
                 .merge_sets(self.priced().as_deref(), self.passes().as_deref(), self.notice(), launches.len())
                 .into_iter()
                 .map(|size| if scratch { size } else { launches.len() })
                 .collect::<Vec<_>>();
+            let (index, kind) = match record {
+                None => (None, GroupKind::Decode),
+                Some(record) => (Some(record.0), GroupKind::Grouped { reads: Some(record), merges: merges.clone(), scratch }),
+            };
             // Known to the watcher before any of its steps' requests can be.
             let pieces = state.open(first, count, before);
             state.groups.insert(
@@ -1298,10 +1340,8 @@ impl Shared {
                     ended: 0,
                     begun: Instant::now(),
                     retired: false,
-                    scratch,
-                    merges: merges.clone(),
-                    reads,
-                    prompt,
+                    work: group_work,
+                    kind,
                 },
             );
             for sequence in first..first + count {
@@ -1320,7 +1360,7 @@ impl Shared {
         // `Telemetry::group_read` feeds its reads as `Fed::Decode` at its last
         // step (`first + count - 1`): register that step on the clock now,
         // before any later step can begin and register a higher sequence.
-        if grouped && !prompt && launches.iter().all(|launch| route(launch) == StepRoute::Grouped) {
+        if grouped && group_work == LaunchWork::Generation && launches.iter().all(|launch| route(launch) == StepRoute::Grouped) {
             self.register_step(
                 first + launches.len() as u64 - 1,
                 crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0)),
@@ -1353,6 +1393,7 @@ impl Shared {
                 shared: self.clone(),
                 launch: None,
                 recorded: None,
+                resize_generation: self.telemetry.resize_generation(),
                 ending: Ending::Unrun,
             };
             admission.remaining -= 1;
@@ -1386,6 +1427,9 @@ pub(crate) struct ExpertStep {
     /// (`Telemetry::samples`), decided as it begins; none of a step not
     /// sampled.
     sampled: Option<Arc<[ExpertLines]>>,
+    /// `Telemetry::resize_generation` snapshotted when this step began, so a
+    /// pass whose wall time spanned a bank resize does not poison `Passes`.
+    resize_generation: u64,
     /// How it ends, as the interest ledger is told ([`Ending`]).
     ending: Ending,
 }
@@ -1415,6 +1459,7 @@ pub(crate) struct Recording;
 pub(super) struct CompletedStep {
     pub(super) work: LaunchWork,
     pub(super) begun: Instant,
+    pub(super) resized: bool,
     pub(super) route: CompletedRoute,
 }
 
@@ -1611,7 +1656,8 @@ impl ExpertStep {
                 sampled: self.sampled.take(),
             }),
         };
-        let completion = CompletedStep { work: self.work, begun, route };
+        let resized = self.resize_generation != shared.telemetry.resize_generation();
+        let completion = CompletedStep { work: self.work, begun, resized, route };
         let sequence = self.sequence;
         // Told as the step ends, once its group's reads are feedable.
         self.ending = Ending::Completed(
@@ -2136,7 +2182,12 @@ mod order_tests {
         let steps = steps();
         let decode = steps.begin_group(1, None);
         let prompt = steps.begin_group(2, None);
-        steps.lock().groups.get_mut(&prompt).expect("the prompt group").scratch = true;
+        {
+            let mut state = steps.lock();
+            let group = state.groups.get_mut(&prompt).expect("the prompt group");
+            group.work = LaunchWork::Prompt;
+            group.kind = GroupKind::Grouped { reads: None, merges: Vec::new(), scratch: true };
+        }
         let parked = steps.at(decode, 1, LAYERS).point;
         let park = steps.park(parked, LAYERS);
         assert_eq!(park.unresolved, [prompt, prompt, decode, decode].map(ParkFrom), "the parked step's own from layer 2, the prompt group's below");

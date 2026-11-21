@@ -152,6 +152,27 @@ impl PointRequest {
         }
     }
 
+    /// Peak memory demand across `requests` run sequentially in-process via
+    /// `measure_in_process` on `device`: the elementwise maximum of each
+    /// request's demand, rounded to `device`'s native allocation granularity.
+    pub fn measure_demand(device: &seismic::Device, requests: &[Self]) -> Result<crate::memory::ClaimDemand, ExecutorCostsError> {
+        let granularity = device.native_allocations().granularity.max(1);
+        let mut peak = crate::memory::ClaimDemand::default();
+        for request in requests {
+            let demand = match request {
+                Self::TierCopy => TierCopyCosts::measure_demand(granularity),
+                Self::Convert(form) => form.measure_demand(granularity)?,
+                _ => crate::memory::ClaimDemand::default(),
+            };
+            peak.device = peak.device.max(demand.device);
+            peak.upload = peak.upload.max(demand.upload);
+            peak.shared = peak.shared.max(demand.shared);
+            peak.host = peak.host.max(demand.host);
+            peak.staged = peak.staged.max(demand.staged);
+        }
+        Ok(peak)
+    }
+
     /// Measure it in the job (`walks`): why its measuring ended before its
     /// end where no visited point's outcome says, and why a figure could
     /// not be read outside its points' timings.

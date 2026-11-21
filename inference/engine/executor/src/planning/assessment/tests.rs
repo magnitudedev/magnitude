@@ -876,7 +876,7 @@ fn target_reading_head_plans_its_program_weights_and_charge() {
     .unwrap();
     // Every head weight, its own vocabulary table and both projections
     // included, is the draft component's.
-    let head_weights = load.head.as_ref().unwrap();
+    let head_weights = load.head().unwrap();
     assert_eq!(
         head_weights.len(),
         crate::operators::head_weights(definition.head.as_ref().unwrap())
@@ -2204,7 +2204,7 @@ fn worker_host_bytes_price_the_plans_vocabulary_and_kernels() {
             &programs,
             &definition,
             &load,
-            crate::TuningLimits::of(limits, &definition),
+            crate::TuningLimits::of(limits, &load, &definition),
         )
         .unwrap()
         .len() as u64;

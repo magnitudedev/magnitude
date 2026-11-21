@@ -161,13 +161,15 @@ projection routed for metal:
     where K + SHARED <= 32 for summed
     where ROWS * ceil_div(SUMMED_PACKETS - (1 - min(1, LANES / 16) + (min(1, LANES / 16) - LANES / 32) * SUMMED_STAGES_16) * (SUMMED_PACKETS - SUMMED_STAGE), LANES) <= 8 for summed
     where (SHARED == 1 or 2 * ceil_div(SUMMED_PACKETS - SUMMED_STAGES_16 * (SUMMED_PACKETS - SUMMED_STAGE), 16) <= 8) for summed
-    where (TALL == 0 or (WIDTH % 128 == 0 and (STACKED == 0 or T % 32 == 0))) for grouped
-    where (DOWN_TALL == 0 or (each(W, FIRST == 1 or WIDTH % 128 == 0) and (STACKED == 0 or T % 32 == 0))) for grouped
+    where (TALL == 0 or (WIDTH % 64 == 0 and (STACKED == 0 or T % 32 == 0))) for grouped
+    where (TALL == 0 or WIDTH % 128 == 0 or TALL_K == 64) for grouped
+    where (DOWN_TALL == 0 or (each(W, FIRST == 1 or WIDTH % 64 == 0) and (STACKED == 0 or T % 32 == 0))) for grouped
+    where (DOWN_TALL == 0 or each(W, FIRST == 1 or WIDTH % 128 == 0) or DOWN_TALL_K == 64) for grouped
     where (INT8 == 0 or (TALL == 1 and (STACKED == 1 or SERVED == 2) and WIDTH % 512 == 0 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, INT8) == 1) and sum(W, FIRST * form(W, INT8_INTERLEAVED)) % SERVED == 0)) for grouped
     where (DOWN_INT8 == 0 or (DOWN_TALL == 1 and each(W, FIRST == 1 or (WIDTH % 512 == 0 and N % 64 == 0 and form(W, INT8) == 1)))) for grouped
     where (DOWN_INT8 == 1 or STACKED == 1 or INT8_TILE == 128) for grouped
-    where (PACK == 0 or (TALL == 1 and INT8 == 0 and WIDTH % 256 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0)) for grouped
-    where (DOWN_PACK == 0 or (DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 256 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1)))) for grouped
+    where (PACK == 0 or (TALL == 1 and INT8 == 0 and WIDTH % 128 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0)) for grouped
+    where (DOWN_PACK == 0 or (DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1)))) for grouped
     where (PACK == 1 or ((STACKED == 1 or PACK_TOKENS == 4) and WEIGHTS_AHEAD == 0)) for grouped
     where (DOWN_PACK == 1 or ((STACKED == 1 or DOWN_PACK_TOKENS == 4) and DOWN_WEIGHTS_AHEAD == 0)) for grouped
     where (PACK == 0 or ((STACKED == 1 or TALL_M == 128) and TALL_K == 64 and STAGERS == 2)) for grouped
@@ -1007,16 +1009,19 @@ fn routed_group[M, E, K, B, T](first: &tensor[1] i32, rows: &tensor[1] i32, rout
 # words (E <= 1024: 4 KiB). Prefill chunks of 512 rows (K <= 16) are one.
 const GROUP_CHOICES = 8192
 
-# Metal and CUDA: `routed_group_count` counts each chunk of GROUP_CHOICES
-# choices by expert (`partials[chunk, e]`); `routed_group_place` places each
-# chunk's choices after the earlier chunks' of their expert, and its first
-# threadgroup writes the per-expert tables and `used`. No launch is bounded
-# by the row count, and chunks past the grouped rows exit.
+# Metal and CUDA: when M * K <= GROUP_CHOICES, `routed_group_place` runs alone
+# (single launch, no `partials` scratch) and sums each expert's total directly
+# from its per-part slice counts in group memory. Above GROUP_CHOICES,
+# `routed_group_count` counts each chunk of GROUP_CHOICES choices by expert
+# (`partials[chunk, e]`), and `routed_group_place` places each chunk's choices
+# after the earlier chunks' of their expert; its first threadgroup writes the
+# per-expert tables and `used`. No launch is bounded by the row count, and
+# chunks past the grouped rows exit.
 native routed_group for metal from "metal/routed_group.metal":
     static (E, K)
     where E <= 1024
-    scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4)
-    launch routed_group_count:
+    scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4) when M * K > GROUP_CHOICES
+    launch routed_group_count when M * K > GROUP_CHOICES:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
         threads_per_threadgroup (1024, 1, 1)
         shared_bytes (E * 4)
@@ -1028,8 +1033,8 @@ native routed_group for metal from "metal/routed_group.metal":
 native routed_group for cuda from "cuda/routed_group.cu":
     static (E, K)
     where E <= 1024
-    scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4)
-    launch routed_group_count:
+    scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4) when M * K > GROUP_CHOICES
+    launch routed_group_count when M * K > GROUP_CHOICES:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
         threads_per_threadgroup (1024, 1, 1)
         shared_bytes (E * 4)

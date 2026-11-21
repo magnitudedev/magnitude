@@ -260,23 +260,27 @@ struct RchDecays {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         constexpr uint SHARE_COLUMNS = DECAYS / RCH_SHARES;
-        for (uint task = thread_index; task < RCH_SHARES * 2 * RCH_PIECE * RCH_PIECE; task += RCH_THREADS) {
-            const uint share = task % RCH_SHARES;
-            const uint pair = (task / RCH_SHARES) % (RCH_PIECE * RCH_PIECE);
-            const uint kind = task / (RCH_SHARES * RCH_PIECE * RCH_PIECE);
-            const uint i = pair / RCH_PIECE;
-            const uint j = pair % RCH_PIECE;
-            threadgroup const float *left = (kind == 0 ? keys : queries) + i * RCH_INPUT_STRIDE;
+        // Pack the strictly lower triangle of A (j < i) and the lower triangle
+        // of D (j <= i) into one RCH_PIECE x RCH_PIECE square per share:
+        // b <= a computes D[a, b] (kind 1), b > a computes A[b, a] (kind 0).
+        for (uint task = thread_index; task < RCH_SHARES * RCH_PIECE * RCH_PIECE; task += RCH_THREADS) {
+            const uint pair = task % (RCH_PIECE * RCH_PIECE);
+            const uint share = task / (RCH_PIECE * RCH_PIECE);
+            const uint a = pair / RCH_PIECE;
+            const uint b = pair % RCH_PIECE;
+            const bool is_query = b <= a;
+            const uint kind = is_query ? 1 : 0;
+            const uint i = is_query ? a : b;
+            const uint j = is_query ? b : a;
+            threadgroup const float *left = (is_query ? queries : keys) + i * RCH_INPUT_STRIDE;
             threadgroup const float *right = keys + j * RCH_INPUT_STRIDE;
             threadgroup const float *upper = gates + i * STRIDE;
             threadgroup const float *lower = gates + j * STRIDE;
             float sum = 0.0f;
-            if (j <= i) {
-                for (uint c = share * SHARE_COLUMNS; c < (share + 1) * SHARE_COLUMNS; ++c) {
-                    sum = metal::fma(left[c] * right[c], metal::exp(upper[c] - lower[c]), sum);
-                }
+            for (uint c = share * SHARE_COLUMNS; c < (share + 1) * SHARE_COLUMNS; ++c) {
+                sum = metal::fma(left[c] * right[c], metal::exp(upper[c] - lower[c]), sum);
             }
-            shares[share][kind][pair] = sum;
+            shares[share][kind][i * RCH_PIECE + j] = sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // Q o exp G in place, and K o exp G.
@@ -368,7 +372,11 @@ struct RchDecays<1> {
     }
 
     float pair(ushort row, ushort j) const {
-        return metal::exp(j <= row ? row_cumulative - simd_shuffle(cumulative, j) : 0.0f);
+        const float col_cumulative = simd_shuffle(cumulative, j);
+        if (j < row) {
+            return metal::exp(row_cumulative - col_cumulative);
+        }
+        return j == row ? 1.0f : 0.0f;
     }
     float gamma() const { return row_gamma; }
     float tail() const { return row_tail; }
@@ -514,17 +522,26 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
         simdgroup_float8x8 complement;
         RECURRENT_UNROLL for (ushort e = 0; e < 2; ++e) {
             const ushort j = ushort(column + e);
-            float key_dot = 0.0f;
-            float query_dot = 0.0f;
-            RECURRENT_UNROLL for (uint s = 0; s < RCH_SHARES; ++s) {
-                key_dot += shares[s][0][row * RCH_PIECE + j];
-                query_dot += shares[s][1][row * RCH_PIECE + j];
-            }
             const float decay = decays.pair(row, j);
-            const float a = j < row ? decays.row_beta * decay * key_dot : 0.0f;
+            float a = 0.0f;
+            float d = 0.0f;
+            if (j <= row) {
+                float query_dot = 0.0f;
+                RECURRENT_UNROLL for (uint s = 0; s < RCH_SHARES; ++s) {
+                    query_dot += shares[s][1][row * RCH_PIECE + j];
+                }
+                d = decay * query_dot;
+                if (j < row) {
+                    float key_dot = 0.0f;
+                    RECURRENT_UNROLL for (uint s = 0; s < RCH_SHARES; ++s) {
+                        key_dot += shares[s][0][row * RCH_PIECE + j];
+                    }
+                    a = decays.row_beta * decay * key_dot;
+                }
+            }
             system.thread_elements()[e] = a;
             complement.thread_elements()[e] = (j == row ? 1.0f : 0.0f) - a;
-            attention.thread_elements()[e] = j <= row ? decay * query_dot : 0.0f;
+            attention.thread_elements()[e] = d;
         }
         simdgroup_float8x8 square;
         simdgroup_float8x8 fourth;
@@ -582,13 +599,14 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
                     published.put_tile(8 * h * state_stride + 8 * c, state[h][c], state_stride, true);
                 }
             }
+        } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     // The rows after the stop row advance row-sequentially from the published
     // state (their innovations feed the tape).
     if (geometry.stop < geometry.hi - geometry.lo) {
-        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
         RCH_SEQUENTIAL(geometry.lo + geometry.stop);
     }
 #undef RCH_SEQUENTIAL

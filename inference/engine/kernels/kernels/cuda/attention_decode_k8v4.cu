@@ -41,6 +41,7 @@
 #define ATTENTION_COLUMNS SEISMIC_TUNE_COLUMNS
 #define ATTENTION_Q_REGISTERS SEISMIC_TUNE_QREG
 #define ATTENTION_PRODUCER_WARPS (SEISMIC_TUNE_WARPS * SEISMIC_TUNE_COLUMNS)
+#define ATTENTION_SPLIT_SCORES 1
 #include "lib/attention/prefill.cuh"
 
 extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS + attention::prefill::PRODUCERS)

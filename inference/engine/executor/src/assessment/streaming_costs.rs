@@ -448,6 +448,46 @@ impl ConvertCosts {
 }
 
 impl ConvertForm {
+    /// Peak memory demand of [`Self::measure`] across one landing launch at
+    /// [`CONVERTED_RECORDS`], rounded to `granularity` (the backend's native
+    /// allocation granularity, `>= 1`), so a caller beside a live bank can
+    /// pre-claim its room via [`crate::memory::ledger::DeviceLedgers::claim_measurement`].
+    pub fn measure_demand(&self, granularity: u64) -> Result<crate::memory::ClaimDemand, ExecutorCostsError> {
+        let error = failed("convert measure demand");
+        let granularity = granularity.max(1);
+        let round = |bytes: u64| bytes.next_multiple_of(granularity);
+        let records = CONVERTED_RECORDS;
+        let RecordTensors { gate, up, down } = self.record;
+        let tensors = [(gate.unwrap_or(up), if gate.is_some() { records } else { 0 }), (up, records), (down, records)];
+        let mut device = 0u64;
+        for (tensor, held) in tensors {
+            if held == 0 {
+                continue;
+            }
+            let (stored_el, stored_ext) = tensor.stored_tensor(held);
+            let stored_bytes = stored_el.canonical_byte_len(&stored_ext).map_err(|cause| error(&cause))?;
+            let (resident_el, resident_ext) = tensor.resident_tensor(held);
+            let resident_bytes = resident_el.canonical_byte_len(&resident_ext).map_err(|cause| error(&cause))?;
+            device = device
+                .checked_add(round(stored_bytes))
+                .and_then(|total| total.checked_add(round(resident_bytes)))
+                .ok_or_else(|| error(&"convert demand overflows u64"))?;
+        }
+        let table = magnitude_kernels::SlotTable::file(1, 1);
+        let file_words: u64 = table.extents().iter().product();
+        let shared_words = constants::STEP_WORDS
+            + file_words
+            + constants::SOURCE_ROWS
+            + constants::POLICY_WORDS
+            + magnitude_kernels::constants::LANDING_ENTRY(records)
+            + 3;
+        Ok(crate::memory::ClaimDemand {
+            device,
+            shared: round(4 * shared_words),
+            ..crate::memory::ClaimDemand::default()
+        })
+    }
+
     /// Measure the form's points in the measurement job (`walks`): landing
     /// launches of one record and of [`CONVERTED_RECORDS`], consuming the
     /// kernel formed on the job's worker pool.
@@ -742,6 +782,24 @@ impl TierCopyCosts {
     pub fn link_byte_seconds(&self) -> f64 {
         let (records, bytes) = TIER_COPY_PROBE;
         self.whole_seconds / (records * bytes) as f64
+    }
+
+    /// Peak memory demand of [`Self::measure`], rounded to `granularity` (the
+    /// backend's native allocation granularity, `>= 1`): during `Beside::Copy`,
+    /// the transfer queue's `copied` (shared) and `into` (device) live beside
+    /// `tier_copy_point(Source::Device)`'s `source` + `destination` (device)
+    /// and its small index/step/grid buffers.
+    pub fn measure_demand(granularity: u64) -> crate::memory::ClaimDemand {
+        let granularity = granularity.max(1);
+        let round = |bytes: u64| bytes.next_multiple_of(granularity);
+        let (records, bytes) = TIER_COPY_PROBE;
+        let probe = records * bytes;
+        let small = 4 * (magnitude_kernels::constants::LIST_ENTRY(records) + constants::STEP_WORDS + 3);
+        crate::memory::ClaimDemand {
+            device: 3 * round(probe) + round(small),
+            shared: round(probe),
+            ..crate::memory::ClaimDemand::default()
+        }
     }
 
     /// Measure the copy in the measurement job (`walks`), on a device with
@@ -2145,6 +2203,23 @@ mod tests {
         }
         assert!(stop.load(std::sync::atomic::Ordering::Relaxed));
         assert!(finished.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn tier_copy_and_convert_measure_demand_cover_peak_probe_allocations() {
+        const GRANULE: u64 = 2 * 1024 * 1024;
+        let (records, bytes) = TIER_COPY_PROBE;
+        let probe = records * bytes;
+        let tier = TierCopyCosts::measure_demand(GRANULE);
+        assert_eq!(tier.device, 3 * probe + GRANULE, "3 probe buffers plus 1 granularity block for small tensors");
+        assert_eq!(tier.shared, probe, "1 host-shared probe buffer");
+
+        let form = ConvertForm::reference(seismic::BackendName::Cuda)
+            .expect("cuda reference convert form")
+            .expect("cuda has a reference convert form");
+        let convert = form.measure_demand(GRANULE).expect("convert demand computes");
+        assert!(convert.device >= 2 * GRANULE, "convert demand covers staging and resident tensors");
+        assert_eq!(convert.shared, GRANULE, "convert shared metadata rounds to 1 granularity block");
     }
 
     }

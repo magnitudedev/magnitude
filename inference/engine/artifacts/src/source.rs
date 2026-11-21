@@ -44,6 +44,10 @@ impl FileSource {
         self.opened.path()
     }
 
+    pub fn volume(&self) -> seismic_io::Volume {
+        self.reader.volume()
+    }
+
     fn file(&self) -> &File {
         self.opened.file()
     }

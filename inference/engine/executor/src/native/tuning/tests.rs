@@ -12,6 +12,7 @@ use std::rc::Rc;
 
 const LIMITS: TuningLimits = TuningLimits {
     max_rows: 512,
+    max_pass_rows: 512,
     max_projected_rows: 8,
     context_tokens: 16384,
     image_cells: 0,
@@ -46,6 +47,7 @@ fn fixture_add<T: EntryTuning>(
         demand.objective.terms.clone(),
         None,
         limits.max_rows,
+        limits.max_pass_rows,
     );
     let mut representatives = case
         .points(limits)
@@ -631,7 +633,7 @@ fn numerical_histories_include_witnesses_and_the_window_limit() {
     assert_eq!(labels(Some(16384)), whole);
     assert_eq!(labels(Some(65536)), whole);
     let windowed = with_contexts(LIMITS, Some(1024), row_points(LIMITS));
-    assert_eq!(windowed.len(), TUNING_ROWS.len() * 3);
+    assert_eq!(windowed.len(), row_points(LIMITS).len() * 3);
     assert!((windowed.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
     // The window's lengths of one row point are its class, each row class
     // keeping the share it has at any history.
@@ -672,7 +674,7 @@ fn attention_points_cross_rows_with_served_contexts() {
     let points = attention_points(LIMITS);
     assert_eq!(
         points.len(),
-        TUNING_ROWS.len() * 4,
+        row_points(LIMITS).len() * 4,
         "all numerical histories through the served context"
     );
     assert!(points.iter().all(|point| point.context.unwrap() <= 16384));
@@ -684,6 +686,7 @@ fn attention_points_cross_rows_with_served_contexts() {
     assert!((points.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
     let short = attention_points(TuningLimits {
         max_rows: 1,
+        max_pass_rows: 1,
         max_projected_rows: 1,
         context_tokens: 128,
         image_cells: 0,
@@ -789,6 +792,7 @@ fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
     };
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,
@@ -1413,6 +1417,7 @@ fn a_prepare_abandoned_mid_search_is_searched_again_by_the_next_prepare() {
     };
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,
@@ -1674,6 +1679,7 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
     };
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,
@@ -1869,6 +1875,7 @@ fn a_record_made_without_demand_is_read_without_demand_and_searched_with_it() {
     };
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,
@@ -2006,6 +2013,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     };
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,
@@ -2211,6 +2219,7 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
         });
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,
@@ -2442,6 +2451,7 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
         });
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,
@@ -2595,6 +2605,7 @@ fn unqualified_terminal_choices_are_reused_with_their_disposition_and_without_se
         });
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,
@@ -3075,6 +3086,7 @@ fn units_measure_baselines_before_search() {
     large.launches = 3;
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,
@@ -3235,6 +3247,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
     let recorder = Recorder::default();
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 4096,
         image_cells: 0,
@@ -3426,6 +3439,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
         });
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,
@@ -3723,6 +3737,33 @@ fn routes_over_a_multiple_of_101_slots_draw_distinct_experts_per_row() {
         assert_eq!(distinct.len(), row.len(), "a row's experts are distinct: {row:?}");
         assert!(row.iter().all(|expert| (0..202).contains(expert)), "a row routes over the slots: {row:?}");
     }
+}
+
+/// Synthetic routes use canonical Zipf locality (`1 / (r + 1)`), so a
+/// multi-row decode batch (`M=8, E=512, K=10`, Qwen3.8-Flash-Next verify
+/// shape) shares hot experts across rows rather than touching nearly every
+/// slot once (`M * K = 80`).
+#[test]
+fn routes_share_hot_experts_across_multi_row_decode() {
+    let (rows, selected) = (8, 10);
+    let shape = super::routed::RoutedShape {
+        hidden: 128,
+        experts: 512,
+        selected,
+        features: 128,
+        shared: 0,
+    };
+    let table = super::routed::routes(rows, shape);
+    assert_eq!(table.len() as u64, rows * selected);
+    for row in table.chunks(selected as usize) {
+        let distinct = row.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(distinct.len(), row.len(), "a row's experts are distinct: {row:?}");
+    }
+    let unique = table.iter().collect::<std::collections::BTreeSet<_>>().len();
+    assert!(
+        (selected as usize + 1..=60).contains(&unique),
+        "expected realistic multi-row expert sharing well below M*K=80, got {unique}"
+    );
 }
 
 /// A search of a streamed load forms and runs every streamed tuning case
@@ -4241,6 +4282,7 @@ fn mandatory_census_longer_than_budget_still_searches() {
         });
     let limits = TuningLimits {
         max_rows: 64,
+        max_pass_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
         image_cells: 0,

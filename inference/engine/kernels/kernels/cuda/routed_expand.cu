@@ -60,6 +60,7 @@ __global__ void routed_expand_stage(SEISMIC_KERNEL_PARAMS) {
 // buffers are kernel parameters).
 #define SHARED_EXPERT(Shape, shared, group)                                                                 \
     do {                                                                                                    \
+        projection::stage_points(routed::DecodeReaders<packets::W2, packets::W3>{});                        \
         const Pro pro{ROWS_OF(SHARED_NVFP4), STRIDE_OF(SHARED_NVFP4), projection::AllRows{}};               \
         const Epi epi{SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0};                                     \
         const auto gate = KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE));                            \
@@ -77,7 +78,10 @@ __global__ void routed_expand_stage(SEISMIC_KERNEL_PARAMS) {
 template <int TPW, int KSPLIT>
 __global__ void routed_expand_choice(SEISMIC_KERNEL_PARAMS) {
     using Shape = routed::DecodeShape<TPW, KSPLIT>;
-    __shared__ projection::GemvShared<Shape, projection::SharedRow> shared;
+    using RoutedReaders = routed::DecodeReaders<packets::W0, packets::W1>;
+    using SharedReaders = routed::DecodeReaders<packets::W2, packets::W3>;
+    using Points = typename projection::PointsOf<typename routed::DecodeUnion<RoutedReaders, SharedReaders>::type>::type;
+    __shared__ projection::GemvShared<Shape, projection::SharedRow, 0, Points> shared;
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const projection::u64 group = Shape::tile_group();
     const projection::u64 choices = SEISMIC_DIM_M * SEISMIC_DIM_K;
@@ -86,6 +90,7 @@ __global__ void routed_expand_choice(SEISMIC_KERNEL_PARAMS) {
     // first; the shared expert's issue their first weight loads before.
     if (blockIdx.y < choices) {
         seismic_dependency_start();
+        projection::stage_points(RoutedReaders{});
         const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;
         const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
         const projection::SharedRow pro = projection::shared_row(
@@ -107,7 +112,10 @@ __global__ void routed_expand_choice(SEISMIC_KERNEL_PARAMS) {
 template <int TPW, int KSPLIT>
 __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
     using Shape = routed::DecodeShape<TPW, KSPLIT>;
-    __shared__ projection::GemvShared<Shape, Pro> shared;
+    using RoutedReaders = routed::DecodeReaders<packets::W0, packets::W1>;
+    using SharedReaders = routed::DecodeReaders<packets::W2, packets::W3>;
+    using Points = typename projection::PointsOf<typename routed::DecodeUnion<RoutedReaders, SharedReaders>::type>::type;
+    __shared__ projection::GemvShared<Shape, Pro, 0, Points> shared;
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const projection::u64 group = Shape::tile_group();
     const projection::u64 choices = SEISMIC_DIM_M * SEISMIC_DIM_K;
@@ -126,6 +134,7 @@ __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
                             (unsigned)SEISMIC_DIM_M, slots, blockIdx.y,
                             STRIDE_OF(ROUTED_NVFP4), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1))
             return;
+        projection::stage_points(RoutedReaders{});
         const projection::u64 expert = (projection::u64)table.expert;
         projection::gemv_segment<Shape>(
             shared, routed::GatheredRows{ROWS_OF(ROUTED_NVFP4), table.rows}, table.count, SEISMIC_DIM_H / 64, group,

@@ -1442,3 +1442,106 @@ fn cold_reaging_after_harm_shrink_never_sawtooths_bank_while_exogenous_exit_grow
         machine.bank_bytes()
     );
 }
+
+/// Under a positive `lag.growth` (e.g. a Linux cgroup's 2 s memcg flush), the
+/// OS may charge an own growth into `supply` immediately rather than waiting
+/// the full lag. `State::read` must attribute an early flush to `in_use`
+/// rather than `others` so `budget()`, `free()`, `allocatable()`, `hold_room()`,
+/// and `import_room()` never double-subtract our own growth, while remaining
+/// exact (zero double-spending) when the OS has not flushed yet.
+#[test]
+fn early_flush_under_growth_lag_holds_without_double_spending() {
+    let mut os = Os::new();
+    os.cold = 0;
+    os.cache = 0;
+    os.hot = 42 * GB + 512 * MB;
+    os.lag = seismic::Lag { release: Duration::ZERO, growth: Duration::from_secs(2) };
+    let mut machine = Machine::load(os, 20 * GB, 0);
+
+    // Settle the initial load past `lag.growth` and close its growth step.
+    machine.tick(2100);
+    machine.read();
+    for _ in 0..10 {
+        if machine.ledger.estimate().target() == 512 * MB {
+            break;
+        }
+        machine.tick(SNAPSHOT_MS);
+        machine.read();
+    }
+    let before = machine.ledger.estimate();
+    assert!(!before.pending());
+    assert_eq!(before.budget(), 20 * GB + 512 * MB);
+    assert_eq!(before.hold_room(), 512 * MB);
+    assert_eq!(before.import_room(), 512 * MB);
+    assert_eq!(before.target(), 512 * MB);
+
+    // Grow the bank by 384 MiB inside the 512 MiB supply.
+    let growth = 384 * MB;
+    let at = machine.at();
+    let granule = machine
+        .ledger
+        .cache(CacheKind::Bank, growth, super::Reclaim::Unbacked)
+        .expect("384 MiB fits in 512 MiB supply");
+    machine
+        .ledger
+        .change(|_| machine.pool.take(&machine.pool.change(), growth, machine.wiring))
+        .expect("pool admits 384 MiB");
+    machine.os.grow(at, growth, machine.wiring);
+
+    // 1. OS has NOT flushed yet (15 ms < 2 s): `budget()`, `allocatable()`,
+    // `import_room()`, and `target()` stay exact and never double-spend.
+    machine.tick(15);
+    machine.read();
+    let unflushed = machine.ledger.estimate();
+    assert!(unflushed.pending(), "growth is still within 2 s lag");
+    assert_eq!(unflushed.supply(), 512 * MB as i64);
+    assert_eq!(unflushed.others(), 42 * GB + 512 * MB + GB);
+    assert_eq!(unflushed.budget(), 20 * GB + 512 * MB);
+    assert_eq!(unflushed.free(), 128 * MB);
+    assert_eq!(unflushed.allocatable(), 128 * MB);
+    assert_eq!(unflushed.import_room(), 512 * MB, "import_room must not double-spend");
+    assert!(unflushed.target() <= 512 * MB, "target must not double-spend");
+    assert_eq!(unflushed.hold_room(), 512 * MB);
+
+    // 2. OS flushes our 384 MiB growth EARLY (30 ms < 2 s): `supply` drops
+    // immediately to 128 MiB. `State::read` credits the early flush to `in_use`
+    // so `others`, `budget`, `free`, `allocatable`, `hold_room`, and
+    // `import_room` all stay continuous (no double-subtraction, no
+    // `AllocationCapacity` hit, no self-shrink).
+    machine.os.growing.clear();
+    machine.tick(15);
+    machine.read();
+    let flushed_early = machine.ledger.estimate();
+    assert!(flushed_early.pending(), "growth is still within 2 s lag");
+    assert_eq!(flushed_early.supply(), 128 * MB as i64);
+    assert_eq!(flushed_early.others(), before.others(), "early flush must not inflate others");
+    assert_eq!(flushed_early.budget(), 20 * GB + 512 * MB, "early flush must not double-subtract budget");
+    assert_eq!(flushed_early.free(), 128 * MB, "remaining free room stays visible");
+    assert_eq!(flushed_early.allocatable(), 128 * MB, "allocatable must not collapse to 0");
+    assert_eq!(flushed_early.hold_room(), 512 * MB, "early flush must not depress hold_room");
+    assert_eq!(flushed_early.import_room(), 512 * MB, "import_room stays continuous");
+    let shape = crate::experts::derived::BankShape::new(growth, 0, u64::MAX / growth, u64::MAX / growth);
+    let slots = crate::experts::derived::held_target_in(
+        flushed_early.hold_room(),
+        flushed_early.target(),
+        1,
+        0,
+        &shape,
+        &|slots| slots * growth,
+    );
+    assert_eq!(slots, 1, "early flush must not self-shrink the just-grown slot");
+
+    // 3. Past `lag.growth`, all figures remain completely continuous.
+    machine.tick(2100);
+    machine.read();
+    let settled = machine.ledger.estimate();
+    assert!(!settled.pending());
+    assert_eq!(settled.others(), before.others());
+    assert_eq!(settled.budget(), 20 * GB + 512 * MB);
+    assert_eq!(settled.free(), 128 * MB);
+    assert_eq!(settled.allocatable(), 128 * MB);
+    assert_eq!(settled.hold_room(), 512 * MB);
+    assert_eq!(settled.import_room(), 512 * MB);
+
+    drop(granule);
+}
