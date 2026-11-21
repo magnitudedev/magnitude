@@ -131,22 +131,17 @@ impl DomainError {
     /// as it opens or grows: a deficit of the memory its state draws on
     /// ([`ResourceKind::RequestState`]).
     pub(crate) fn request_short(short: crate::memory::ledger::Short) -> Self {
-        let crate::memory::ledger::Short { required, over, .. } = short;
-        Self::Capacity(CapacityError { resource: ResourceKind::RequestState, required, available: required - over })
+        Self::Capacity(CapacityError::from_short(ResourceKind::RequestState, &short))
     }
 
     /// A claim on `ledgers` refused as `short`: a deficit of that store's
     /// memory.
     pub(crate) fn short(short: crate::memory::ledger::Short, ledgers: &crate::memory::ledger::DeviceLedgers) -> Self {
-        let crate::memory::ledger::Short { store, required, over } = short;
-        Self::Capacity(CapacityError {
-            resource: match store == ledgers.device().store() {
-                true => ResourceKind::DeviceMemory,
-                false => ResourceKind::HostStaging,
-            },
-            required,
-            available: required - over,
-        })
+        let resource = match short.store == ledgers.device().store() {
+            true => ResourceKind::DeviceMemory,
+            false => ResourceKind::HostStaging,
+        };
+        Self::Capacity(CapacityError::from_short(resource, &short))
     }
 }
 
@@ -203,29 +198,29 @@ impl From<magnitude_state::Error> for DomainError {
             _ => None,
         };
         if let Some((required, available)) = refusal {
-            return Self::Capacity(crate::CapacityError { resource: crate::ResourceKind::DeviceMemory, required, available });
+            return Self::Capacity(crate::CapacityError::new(crate::ResourceKind::DeviceMemory, required, available));
         }
         match error {
             magnitude_state::Error::Tensor(seismic::TensorError::Execution(
                 seismic::ExecutionError::AllocationFailed(_),
-            )) => Self::Capacity(crate::CapacityError {
-                resource: crate::ResourceKind::DeviceMemory,
-                required: 1,
-                available: 0,
-            }),
+            )) => Self::Capacity(crate::CapacityError::new(
+                crate::ResourceKind::DeviceMemory,
+                1,
+                0,
+            )),
             magnitude_state::Error::Capacity {
                 required,
                 available_bytes,
-            } => Self::Capacity(crate::CapacityError {
-                resource: crate::ResourceKind::StateRows,
+            } => Self::Capacity(crate::CapacityError::new(
+                crate::ResourceKind::StateRows,
                 required,
-                available: available_bytes,
-            }),
-            magnitude_state::Error::BanksExhausted { .. } => Self::Capacity(crate::CapacityError {
-                resource: crate::ResourceKind::RecurrentBanks,
-                required: 1,
-                available: 0,
-            }),
+                available_bytes,
+            )),
+            magnitude_state::Error::BanksExhausted { .. } => Self::Capacity(crate::CapacityError::new(
+                crate::ResourceKind::RecurrentBanks,
+                1,
+                0,
+            )),
             other => Self::State(other),
         }
     }
@@ -304,11 +299,11 @@ fn holds(store: &StateStore, demands: &[RowDemand]) -> Result<(), CapacityError>
             .sum::<usize>();
         let available = store.free_rows(domain);
         if available < required {
-            return Err(CapacityError {
-                resource: ResourceKind::StateRows,
-                required: required as u64,
-                available: available as u64,
-            });
+            return Err(CapacityError::new(
+                ResourceKind::StateRows,
+                required as u64,
+                available as u64,
+            ));
         }
     }
     Ok(())
@@ -573,11 +568,7 @@ pub(super) fn front_selects(operation: &Operation) -> Vec<SelectSpec> {
 fn image_patch_rows(pool: PoolClass) -> Result<u64, CapacityError> {
     match pool {
         PoolClass::Vision { patch_rows } => Ok(patch_rows as u64),
-        _ => Err(CapacityError {
-            resource: ResourceKind::Output,
-            required: 1,
-            available: 0,
-        }),
+        _ => Err(CapacityError::new(ResourceKind::Output, 1, 0)),
     }
 }
 
@@ -2621,18 +2612,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let available = |workspace: Option<usize>, output: Option<usize>| {
             if workspace.unwrap_or(0) == 0 {
-                return Err(CapacityError {
-                    resource: ResourceKind::Workspace,
-                    required: 1,
-                    available: 0,
-                });
+                return Err(CapacityError::new(ResourceKind::Workspace, 1, 0));
             }
             if output.is_some_and(|count| count == 0) {
-                return Err(CapacityError {
-                    resource: ResourceKind::Output,
-                    required: 1,
-                    available: 0,
-                });
+                return Err(CapacityError::new(ResourceKind::Output, 1, 0));
             }
             Ok(())
         };
@@ -2640,23 +2623,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ReservationLane::Target => {
                 let graph = self.resources.target_graph();
                 if graph.available_workspace() == 0 || graph.available_output() < 2 {
-                    return Err(CapacityError {
-                        resource: if graph.available_workspace() == 0 {
+                    return Err(CapacityError::new(
+                        if graph.available_workspace() == 0 {
                             ResourceKind::Workspace
                         } else {
                             ResourceKind::Output
                         },
-                        required: if graph.available_workspace() == 0 {
-                            1
-                        } else {
-                            2
-                        },
-                        available: if graph.available_workspace() == 0 {
+                        if graph.available_workspace() == 0 { 1 } else { 2 },
+                        if graph.available_workspace() == 0 {
                             0
                         } else {
                             graph.available_output() as u64
                         },
-                    });
+                    ));
                 }
                 let readout = self.resources.target_readout_graph(requirements.projected);
                 available(
@@ -2665,22 +2644,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 )?;
             }
             ReservationLane::Head => {
-                let graph = self.resources.head_graph().ok_or(CapacityError {
-                    resource: ResourceKind::Workspace,
-                    required: 1,
-                    available: 0,
-                })?;
+                let graph = self
+                    .resources
+                    .head_graph()
+                    .ok_or_else(|| CapacityError::new(ResourceKind::Workspace, 1, 0))?;
                 available(
                     Some(graph.available_workspace()),
                     Some(graph.available_output()),
                 )?;
             }
             ReservationLane::Vision => {
-                let graph = self.resources.vision_graph().ok_or(CapacityError {
-                    resource: ResourceKind::Workspace,
-                    required: 1,
-                    available: 0,
-                })?;
+                let graph = self
+                    .resources
+                    .vision_graph()
+                    .ok_or_else(|| CapacityError::new(ResourceKind::Workspace, 1, 0))?;
                 let class = image_patch_rows(requirements.pool)?;
                 available(
                     Some(graph.available_workspace(class)),
@@ -2690,35 +2667,36 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         if requirements.head_launches != 0 {
             let launches = requirements.head_launches;
-            let graph = self.resources.head_graph().ok_or(CapacityError {
-                resource: ResourceKind::Workspace,
-                required: launches as u64,
-                available: 0,
-            })?;
+            let graph = self
+                .resources
+                .head_graph()
+                .ok_or_else(|| CapacityError::new(ResourceKind::Workspace, launches as u64, 0))?;
             for (resource, available) in [
                 (ResourceKind::Workspace, graph.available_workspace()),
                 (ResourceKind::Output, graph.available_output()),
             ] {
                 if available < launches {
-                    return Err(CapacityError { resource, required: launches as u64, available: available as u64 });
+                    return Err(CapacityError::new(resource, launches as u64, available as u64));
                 }
             }
-            let store = self.head_store.as_ref().ok_or(CapacityError {
-                resource: ResourceKind::StateRows,
-                required: requirements
-                    .head_demand
-                    .iter()
-                    .map(|demand| demand.rows as u64)
-                    .sum(),
-                available: 0,
+            let store = self.head_store.as_ref().ok_or_else(|| {
+                CapacityError::new(
+                    ResourceKind::StateRows,
+                    requirements
+                        .head_demand
+                        .iter()
+                        .map(|demand| demand.rows as u64)
+                        .sum(),
+                    0,
+                )
             })?;
             holds(store, &requirements.head_demand)?;
             if store.available_banks() < requirements.head_banks {
-                return Err(CapacityError {
-                    resource: ResourceKind::RecurrentBanks,
-                    required: requirements.head_banks as u64,
-                    available: store.available_banks() as u64,
-                });
+                return Err(CapacityError::new(
+                    ResourceKind::RecurrentBanks,
+                    requirements.head_banks as u64,
+                    store.available_banks() as u64,
+                ));
             }
         }
         let store = if requirements.lane == ReservationLane::Head {
@@ -2733,11 +2711,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             holds(store, &requirements.state_demand)?;
             let banks = store.available_banks();
             if banks < requirements.successor_banks {
-                return Err(CapacityError {
-                    resource: ResourceKind::RecurrentBanks,
-                    required: requirements.successor_banks as u64,
-                    available: banks as u64,
-                });
+                return Err(CapacityError::new(
+                    ResourceKind::RecurrentBanks,
+                    requirements.successor_banks as u64,
+                    banks as u64,
+                ));
             }
         }
         Ok(())
@@ -2852,14 +2830,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         match error {
             ResidencyError::Import(WeightImportError::Refused { contract, required, available }) => {
                 let store = ledgers.of_contract(device, *contract).store();
-                DomainError::Capacity(CapacityError {
-                    resource: match store == ledgers.device().store() {
+                DomainError::Capacity(CapacityError::new(
+                    match store == ledgers.device().store() {
                         true => ResourceKind::DeviceMemory,
                         false => ResourceKind::HostStaging,
                     },
-                    required: *required,
-                    available: *available,
-                })
+                    *required,
+                    *available,
+                ))
             }
             ResidencyError::Import(WeightImportError::Allocation(
                 AllocationError::Tensor(error)
@@ -2870,11 +2848,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         || matches!(execution, seismic::ExecutionError::AllocationFailed(_)) =>
                 {
                     let (required, available) = execution.capacity_refusal().unwrap_or((1, 0));
-                    DomainError::Capacity(CapacityError {
-                        resource: ResourceKind::DeviceMemory,
+                    DomainError::Capacity(CapacityError::new(
+                        ResourceKind::DeviceMemory,
                         required,
                         available,
-                    })
+                    ))
                 }
                 other => DomainError::Device(DeviceError::Execution(format!("component import: {other}"))),
             },

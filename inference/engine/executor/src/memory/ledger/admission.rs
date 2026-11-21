@@ -65,6 +65,14 @@ pub struct Short {
     pub over: u64,
 }
 
+impl Short {
+    /// Bytes of `required` available in `store`: zero when the store is
+    /// already at or past its budget or boundary cap (`over >= required`).
+    pub fn available(&self) -> u64 {
+        self.required.saturating_sub(self.over)
+    }
+}
+
 /// A need refused: committed memory it may not preempt, with the need,
 /// exceeds the budget by `bytes`. Cache never refuses a claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

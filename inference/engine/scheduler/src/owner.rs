@@ -1043,7 +1043,7 @@ fn classify_domain_error(error: DomainError) -> RequestError {
 /// ([`RequestError::ContextExceedsMemory`]).
 fn refused_alone(error: DomainError) -> RequestError {
     match error {
-        DomainError::Capacity(magnitude_executor::CapacityError { resource: ResourceKind::RequestState, required, available }) => {
+        DomainError::Capacity(magnitude_executor::CapacityError { resource: ResourceKind::RequestState, required, available, .. }) => {
             RequestError::ContextExceedsMemory { required, available }
         }
         error => classify_domain_error(error),
@@ -2471,7 +2471,7 @@ trait MemoryStep: MemoryHost + Sized {
                     Yielded::Released { .. } => None,
                     Yielded::Pending => Some(true),
                     Yielded::Nothing => {
-                        let lacks = capacity.required.saturating_sub(capacity.available);
+                        let lacks = capacity.lacks();
                         let evictable = self.evictable();
                         let allow = match preempting {
                             true => Relief::CacheAndRequests(&evictable),
@@ -4718,7 +4718,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
             .expect("a need some request covers");
         let named = service.domain.plan_relief(resource, lacks, Relief::CacheAndRequests(&evictable)).expect("the plan").preempt().to_vec();
         assert_eq!(named, [ids[2]], "the latest admitted, just enough");
-        let short = Err(DomainError::Capacity(magnitude_executor::CapacityError { resource, required: lacks, available: 0 }));
+        let short = Err(DomainError::Capacity(magnitude_executor::CapacityError::new(resource, lacks, 0)));
         let relieved = service.relieve(bindings, short, true, |_, _| Ok(Ok(()))).unwrap();
         assert!(relieved.current.is_ok(), "the claim fits once relieved");
         let evicted = |service: &Service<fixtures::TestFamily>, id: RequestId| {
@@ -4729,6 +4729,101 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         for id in &ids[..2] {
             assert!(!evicted(service, *id) && service.requests[id].record.preemption_debt == 0, "{id:?} stands");
         }
+    }
+
+    /// When a store is already over budget (`Short::over > Short::required`),
+    /// `CapacityError::from_short` reports `available == 0` without `u64`
+    /// underflow and `MemoryStep::relieve` plans relief for the full `over`
+    /// deficit — neither skipping relief (`lacks == 0`) nor partially evicting
+    /// for only `required` bytes when `over` cannot be covered.
+    #[test]
+    fn relief_uses_full_over_budget_shortfall_without_underflow_or_partial_eviction() {
+        let (domain, bindings) = fixtures::fixture(None);
+        let mut owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
+        let ids = admit(&mut owner, 3);
+        let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("an idle owner") };
+        let service = &mut owner.service;
+        for id in &ids {
+            assert_eq!(residency(service, bindings, *id), Some(true), "{id:?} opens");
+        }
+        let resource = magnitude_executor::ResourceKind::RequestState;
+        let evictable = MemoryHost::evictable(service);
+        // Find the exact cache-only ceiling so `one_req_need = cache_only + 1`
+        // requires evicting `ids[2]`, regardless of any spare pool cache on the
+        // host GPU.
+        let mut lo = 0u64;
+        let mut hi = 1u64;
+        while service.domain.plan_relief(resource, hi, Relief::CacheOnly).is_some() {
+            lo = hi;
+            hi = hi.checked_mul(2).expect("cache ceiling fits u64");
+        }
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if service.domain.plan_relief(resource, mid, Relief::CacheOnly).is_some() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let one_req_need = lo + 1;
+        let plan = service
+            .domain
+            .plan_relief(resource, one_req_need, Relief::CacheAndRequests(&evictable))
+            .expect("evicting a request covers one byte past cache-only");
+        assert_eq!(plan.preempt(), [ids[2]], "one_req_need evicts ids[2]");
+        let store = plan.store();
+        let tiny_required = one_req_need.min(40_960).saturating_sub(1).max(1);
+        assert!(one_req_need > tiny_required, "test requires over > required");
+
+        // Case A: `over` exceeds `required` and is coverable by evicting `ids[2]`.
+        let coverable = magnitude_executor::memory::ledger::Short {
+            store: store.clone(),
+            required: tiny_required,
+            over: one_req_need,
+        };
+        let cap_a = magnitude_executor::CapacityError::from_short(resource, &coverable);
+        assert_eq!(cap_a.available, 0);
+        assert_eq!(cap_a.lacks(), one_req_need);
+        let relieved = service
+            .relieve(bindings, Err(DomainError::Capacity(cap_a)), true, |_, _| Ok(Ok(())))
+            .unwrap();
+        assert!(relieved.current.is_ok(), "relief runs and succeeds when over is coverable");
+        assert!(
+            matches!(service.requests[&ids[2]].state, State::Between(_, Stage::NonResident(None)))
+                && service.requests[&ids[2]].record.preemption_debt == 1,
+            "ids[2] was evicted to cover the full over-budget shortfall"
+        );
+
+        // Case B: `over` exceeds everything evictable, even though `tiny_required`
+        // alone would be covered by evicting `ids[1]`. Relief must NOT partially
+        // evict `ids[1]` for nothing.
+        let huge_over = 4_511_149_824u64;
+        let uncoverable = magnitude_executor::memory::ledger::Short {
+            store,
+            required: tiny_required,
+            over: huge_over,
+        };
+        let cap_b = magnitude_executor::CapacityError::from_short(resource, &uncoverable);
+        assert_eq!(cap_b.available, 0);
+        assert_eq!(cap_b.lacks(), huge_over);
+        let result = service
+            .relieve::<()>(bindings, Err(DomainError::Capacity(cap_b)), true, |_, _| {
+                panic!("uncoverable over-budget shortfall must not retry")
+            })
+            .unwrap();
+        assert!(!result.pending);
+        match result.current {
+            Err(DomainError::Capacity(err)) => {
+                assert_eq!(err.required, tiny_required);
+                assert_eq!(err.available, 0);
+                assert_eq!(err.lacks(), huge_over);
+            }
+            other => panic!("expected CapacityError, got {other:?}"),
+        }
+        assert_eq!(
+            service.requests[&ids[1]].record.preemption_debt, 0,
+            "ids[1] must not be partially evicted when full over-budget shortfall cannot be covered"
+        );
     }
 
     /// A drafting load whose drafter was released with nothing resident

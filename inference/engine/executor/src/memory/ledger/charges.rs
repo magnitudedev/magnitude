@@ -196,7 +196,7 @@ impl State {
                 if free < lacks {
                     return Err(seismic::memory::Refused {
                         required: bytes,
-                        available: (bytes - lacks) + free,
+                        available: bytes.saturating_sub(lacks).saturating_add(free),
                     });
                 }
             }
@@ -212,7 +212,7 @@ impl State {
                 if free < lacks {
                     return Err(seismic::memory::Refused {
                         required: bytes,
-                        available: (bytes - lacks) + free,
+                        available: bytes.saturating_sub(lacks).saturating_add(free),
                     });
                 }
                 self.resize(id, entry.bytes + lacks);

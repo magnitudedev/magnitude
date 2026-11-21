@@ -2144,16 +2144,16 @@ impl Startup {
 /// or cache) is the store's [`Short`], refused as a startup allocation is
 /// ([`refused`]); anything else is internal.
 fn domain_refused(error: magnitude_executor::DomainError, ledgers: &DeviceLedgers) -> LoadError {
-    use magnitude_executor::{CapacityError, DomainError, ResourceKind};
+    use magnitude_executor::{DomainError, ResourceKind};
     let store = |resource| match resource {
         ResourceKind::DeviceMemory => Some(ledgers.device().store()),
         ResourceKind::HostStaging => Some(ledgers.host().store()),
         _ => None,
     };
     match error {
-        DomainError::Capacity(CapacityError { resource, required, available }) => match store(resource) {
-            Some(store) => refused("the executor domain", Short { store, required, over: required.saturating_sub(available) }),
-            None => internal(format!("the executor domain: {resource:?} requires {required} units; {available} available")),
+        DomainError::Capacity(error) => match store(error.resource) {
+            Some(store) => refused("the executor domain", Short { store, required: error.required, over: error.lacks() }),
+            None => internal(format!("the executor domain: {:?} requires {} units; {} available", error.resource, error.required, error.available)),
         },
         error => internal(error.to_string()),
     }
@@ -2192,8 +2192,9 @@ fn import_refused(error: magnitude_executor::ResidencyError, device: &seismic::D
 }
 
 /// A startup allocation `short` refused, for `purpose`.
-fn refused(purpose: &str, Short { store, required, over }: Short) -> LoadError {
-    LoadError::InsufficientMemory { purpose: purpose.to_owned(), store, memory: InsufficientMemory { required, available: required - over } }
+fn refused(purpose: &str, short: Short) -> LoadError {
+    let available = short.available();
+    LoadError::InsufficientMemory { purpose: purpose.to_owned(), store: short.store, memory: InsufficientMemory { required: short.required, available } }
 }
 
 /// Run one throwaway single-row forward before readiness, so a broken device

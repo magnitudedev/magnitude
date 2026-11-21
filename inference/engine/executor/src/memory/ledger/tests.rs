@@ -2635,3 +2635,46 @@ fn measurement_claim_reclaims_bank_and_reuses_peak_reservation_across_points() {
     drop(measurement);
     assert_eq!(ledger.estimate().committed(), 4 * GB, "measurement peak reservation released whole");
 }
+
+/// When a store is already past its budget (e.g. after unrefusable driver
+/// allocations via `entry_took` or a supply drop), a small 40960-byte request
+/// produces `Short { required: 40960, over: overhang + 40960 }` with
+/// `over > required`. `Short::available()` must saturate to `0` (never
+/// wrapping `u64`), and `CapacityError::from_short` must preserve the full
+/// `over` shortfall in `lacks()`.
+#[test]
+fn over_budget_short_saturates_available_and_preserves_full_shortfall() {
+    const OVERHANG: u64 = 4_511_108_864;
+    const REQ: u64 = 40_960;
+
+    let (_scope, ledger, _pools) = host();
+    let mut clock = Clock::new();
+    // 8 GB budget; driver `took` (which is never refused, e.g. CUDA graph
+    // capture) pushes committed memory OVERHANG bytes past the 8 GB budget
+    // before the 40960-byte claim arrives.
+    read(&ledger, &mut clock, 16 * GB, 8 * GB, None);
+    let _weights = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, 8 * GB))
+        .expect("initial weights fit");
+    let entry = _weights.entry();
+    ledger.change(|_| entry.took(&entry.change(), 8 * GB + OVERHANG, Pageable));
+    assert_eq!(ledger.estimate().budget(), 8 * GB);
+    assert_eq!(ledger.estimate().held_now(), 8 * GB + OVERHANG);
+
+    let short = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, REQ))
+        .err()
+        .expect("over-budget claim must be refused");
+    assert_eq!(short.required, REQ);
+    assert_eq!(short.over, OVERHANG + REQ);
+    assert_eq!(short.available(), 0, "over > required must saturate available to 0, never wrap u64");
+
+    let capacity = crate::CapacityError::from_short(crate::ResourceKind::RequestState, &short);
+    assert_eq!(capacity.required, REQ);
+    assert_eq!(capacity.available, 0);
+    assert_eq!(capacity.lacks(), OVERHANG + REQ, "CapacityError::lacks must preserve full over-budget shortfall");
+
+    let clamped = crate::CapacityError::new(crate::ResourceKind::DeviceMemory, REQ, REQ + 128);
+    assert_eq!(clamped.available, 0, "available >= required is clamped to 0 by construction");
+    assert_eq!(clamped.lacks(), REQ);
+}

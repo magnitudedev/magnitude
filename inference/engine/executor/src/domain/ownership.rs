@@ -28,20 +28,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn can_open(&self, requirements: OpenRequirements) -> Result<(), CapacityError> {
         let target = self.target_store.available_banks();
         if target < requirements.target_banks {
-            return Err(CapacityError {
-                resource: ResourceKind::RecurrentBanks,
-                required: requirements.target_banks as u64,
-                available: target as u64,
-            });
+            return Err(CapacityError::new(
+                ResourceKind::RecurrentBanks,
+                requirements.target_banks as u64,
+                target as u64,
+            ));
         }
         if let Some(store) = &self.head_store {
             let head = store.available_banks();
             if head < requirements.head_banks {
-                return Err(CapacityError {
-                    resource: ResourceKind::RecurrentBanks,
-                    required: requirements.head_banks as u64,
-                    available: head as u64,
-                });
+                return Err(CapacityError::new(
+                    ResourceKind::RecurrentBanks,
+                    requirements.head_banks as u64,
+                    head as u64,
+                ));
             }
         }
         Ok(())

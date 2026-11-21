@@ -1591,13 +1591,11 @@ fn growth_failure(error: seismic::TensorError, bytes: u64, growth: &str) -> Doma
             if execution.capacity_refusal().is_some()
                 || matches!(execution, seismic::ExecutionError::AllocationFailed(_)) =>
         {
-            DomainError::Capacity(CapacityError {
-                resource: ResourceKind::DeviceMemory,
-                required: bytes,
-                available: execution
-                    .capacity_refusal()
-                    .map_or(0, |(_, available)| if available < bytes { available } else { 0 }),
-            })
+            DomainError::Capacity(CapacityError::new(
+                ResourceKind::DeviceMemory,
+                bytes,
+                execution.capacity_refusal().map_or(0, |(_, available)| available),
+            ))
         }
         other => DomainError::Device(crate::DeviceError::Execution(format!("{growth}: {other}"))),
     }

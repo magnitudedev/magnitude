@@ -2344,11 +2344,11 @@ fn refusal(no: NoBank, capacity: u64) -> PlanError {
     match no {
         NoBank::Unstreamed(reason) => PlanError::Unstreamed(reason),
         NoBank::Bound { bound, needed } => PlanError::WeightBound { bound, needed },
-        NoBank::Short { deficit_bytes } => PlanError::Resource(crate::CapacityError {
-            resource: crate::ResourceKind::DeviceMemory,
-            required: capacity + deficit_bytes.get(),
-            available: capacity,
-        }),
+        NoBank::Short { deficit_bytes } => PlanError::Resource(crate::CapacityError::new(
+            crate::ResourceKind::DeviceMemory,
+            capacity + deficit_bytes.get(),
+            capacity,
+        )),
     }
 }
 
