@@ -636,11 +636,11 @@ fn a_plain_decode_measured_cold_is_measured_again_once_drafting_runs_on_its_pric
     {
         let mut cold = LaunchCosts::default();
         cold.verify.insert(1, Durations::settled(&[(1, 0.090), (2, 0.095), (3, 0.092)]));
-        load.costs
-            .lock()
-            .unwrap()
+        let mut state = load.lock();
+        state
+            .costs
             .insert(((CONTEXT / 2).next_power_of_two(), 1), cold);
-        *load.rounds.lock().unwrap() = 3;
+        state.rounds = 3;
     }
     let run = adaptive(&stream, FLASH, &load);
     // The cold price lasts until its durations are `STALE_ROUNDS` old; the
@@ -724,18 +724,19 @@ fn a_launch_not_measured_here_costs_no_more_than_a_larger_one_proven_here() {
     use super::{Durations, LaunchCosts, RoundCosts};
     let load = DraftLoad::default();
     {
-        let mut costs = load.costs.lock().unwrap();
+        let mut state = load.lock();
         // A held-up first duration of width 3 at a short context.
         let mut short = LaunchCosts::default();
         short.draft.insert(3, Durations::settled(&[(1, 0.0795)]));
-        costs.insert((512, 1), short);
+        state.costs.insert((512, 1), short);
         // Width 7 proven at the request's context.
         let mut long = LaunchCosts::default();
         long.draft
             .insert(7, Durations::settled(&[(2, 0.0099), (3, 0.0099), (4, 0.0099)]));
-        costs.insert((4096, 1), long);
+        state.costs.insert((4096, 1), long);
     }
-    let costs = RoundCosts::of(&load, 4096, 1, None);
+    let state = load.lock();
+    let costs = RoundCosts::of(&state, 4096, 1, None);
     assert_eq!(costs.draft(3), 0.0099);
 }
 
@@ -1057,16 +1058,7 @@ fn a_width_held_up_on_its_first_launch_is_taken_again() {
     let class = (4 * CONTEXT).next_power_of_two();
     for held in 0..12 {
         let load = Arc::new(DraftLoad {
-            costs: std::sync::Mutex::new(warm.costs.lock().unwrap().clone()),
-            rounds: std::sync::Mutex::new(*warm.rounds.lock().unwrap()),
-            depths: std::sync::Mutex::new(warm.depths.lock().unwrap().clone()),
-            calibration: std::sync::Mutex::new(warm.calibration.lock().unwrap().clone()),
-            look_run: std::sync::Mutex::new(*warm.look_run.lock().unwrap()),
-            look_seconds: std::sync::Mutex::new(*warm.look_seconds.lock().unwrap()),
-            plain_seconds: std::sync::Mutex::new(*warm.plain_seconds.lock().unwrap()),
-            beside_cover: std::sync::Mutex::new(*warm.beside_cover.lock().unwrap()),
-            bank_epoch: std::sync::Mutex::new(*warm.bank_epoch.lock().unwrap()),
-            verify_prior: std::sync::Mutex::new(warm.verify_prior.lock().unwrap().clone()),
+            state: std::sync::Mutex::new(warm.lock().clone()),
         });
         let round = std::cell::Cell::new(0usize);
         let run = adaptive_on(&stream, SHORT, &load, class - 50, |position| {
@@ -1362,8 +1354,8 @@ fn a_switch_is_measured_apart_from_its_rounds_launches() {
         .filter(|pair| (pair[0].0.generated > 0) != (pair[1].0.generated > 0))
         .count();
     assert!(switches >= 4, "the run switches: {}", run.rounds());
-    let costs = load.costs.lock().unwrap();
-    let measured = &costs[&((CONTEXT + 1).next_power_of_two(), 1)];
+    let state = load.lock();
+    let measured = &state.costs[&((CONTEXT + 1).next_power_of_two(), 1)];
     let ms = |durations: &super::Durations| durations.cost() * 1000.0;
     let enter = ms(&measured.enter);
     let catch_up = (V710_HEADS.catch_up)(64);
@@ -1518,8 +1510,8 @@ fn a_fused_drafter_declining_decodes_at_the_plain_pace() {
     assert!(adaptive <= best * 1.05, "adaptive {adaptive:.0} ms, fixed {width} {best:.0} ms");
     let load = Arc::new(DraftLoad::default());
     pipelined(&Stream::of(&[(150, HEADS_CODE), (150, DFLASH_PROSE), (150, HEADS_CODE)]), M4_DFLASH, HEADS, &load, Reported::Whole);
-    let costs = load.costs.lock().unwrap();
-    let enter = costs[&((CONTEXT + 1).next_power_of_two(), 1)].enter.cost() * 1000.0;
+    let state = load.lock();
+    let enter = state.costs[&((CONTEXT + 1).next_power_of_two(), 1)].enter.cost() * 1000.0;
     assert!((enter - 0.19).abs() < 0.01, "entering costs the taps alone: {enter} ms");
 }
 
@@ -1527,17 +1519,17 @@ fn a_fused_drafter_declining_decodes_at_the_plain_pace() {
 fn concurrent_controllers_share_look_seconds_without_lost_updates_or_stale_overwrites() {
     let stream = Stream::of(&[(3_000, UNPREDICTABLE)]);
     let load = warmed(&stream, LONG);
-    *load.look_seconds.lock().unwrap() = 0.0;
+    load.lock().look_seconds = 0.0;
 
     let mut first = DraftController::new(WIDEST, load.clone());
     let mut second = DraftController::new(WIDEST, load.clone());
 
     assert_eq!(first.generate(WIDEST, CONTEXT, true), 0);
-    let after_first = *load.look_seconds.lock().unwrap();
+    let after_first = load.lock().look_seconds;
     assert!(after_first > 0.0, "first controller accrues look time");
 
     assert_eq!(second.generate(WIDEST, CONTEXT, true), 0);
-    let after_second = *load.look_seconds.lock().unwrap();
+    let after_second = load.lock().look_seconds;
     assert!(
         (after_second - 2.0 * after_first).abs() < 1e-12,
         "second controller accrues on top of first ({after_second} vs 2 * {after_first})"
@@ -1546,7 +1538,7 @@ fn concurrent_controllers_share_look_seconds_without_lost_updates_or_stale_overw
     // A round with no wider look candidate (`limit == 0`) must not touch `look_seconds`.
     assert_eq!(first.generate(0, CONTEXT, true), 0);
     assert_eq!(
-        *load.look_seconds.lock().unwrap(),
+        load.lock().look_seconds,
         after_second,
         "a round without a look candidate leaves look_seconds untouched"
     );
@@ -1559,7 +1551,7 @@ fn concurrent_controllers_share_look_seconds_without_lost_updates_or_stale_overw
         let generated = controller.generate(WIDEST, CONTEXT, true);
         if generated > 0 {
             assert!(controller.choice().look);
-            assert_eq!(*load.look_seconds.lock().unwrap(), 0.0);
+            assert_eq!(load.lock().look_seconds, 0.0);
             triggered_by_first = Some(is_first);
             break;
         }
@@ -1569,9 +1561,9 @@ fn concurrent_controllers_share_look_seconds_without_lost_updates_or_stale_overw
     // The peer controller must not overwrite the reset with any stale value.
     let peer = if triggered_by_first { &mut second } else { &mut first };
     assert_eq!(peer.generate(0, CONTEXT, true), 0);
-    assert_eq!(*load.look_seconds.lock().unwrap(), 0.0);
+    assert_eq!(load.lock().look_seconds, 0.0);
     assert_eq!(peer.generate(WIDEST, CONTEXT, true), 0);
-    let after_reset = *load.look_seconds.lock().unwrap();
+    let after_reset = load.lock().look_seconds;
     assert!(
         (after_reset - after_first).abs() < 1e-12,
         "peer accrues from 0.0 after reset ({after_reset} vs {after_first})"
@@ -1596,7 +1588,7 @@ fn draft_load_costs_stays_bounded_across_many_context_and_sequence_buckets() {
             controller.committed(&[TokenId(0)]);
         }
     }
-    let buckets = load.costs.lock().unwrap().len();
+    let buckets = load.lock().costs.len();
     assert_eq!(
         buckets,
         super::MAX_COST_BUCKETS,
@@ -1604,7 +1596,7 @@ fn draft_load_costs_stays_bounded_across_many_context_and_sequence_buckets() {
         super::MAX_COST_BUCKETS
     );
     // Most recently measured bucket is still retained.
-    assert!(load.costs.lock().unwrap().contains_key(&(1 << 9, 20)));
+    assert!(load.lock().costs.contains_key(&(1 << 9, 20)));
 }
 
 #[test]
@@ -1628,7 +1620,8 @@ fn streamed_verify_prior_avoids_blind_widest_first_probing_and_larger_clamp() {
     // Linear extrapolation beyond the prior's table uses the last two points' slope.
     let ctx = CONTEXT.max(1).next_power_of_two();
     {
-        let costs = RoundCosts::of(&steep, ctx, 1, None);
+        let state = steep.lock();
+        let costs = RoundCosts::of(&state, ctx, 1, None);
         assert!((costs.verify(1) - 0.050).abs() < 1e-12);
         assert!((costs.verify(4) - 0.280).abs() < 1e-12);
         // k = 7 => 0.280 + (7 - 3) * (0.280 - 0.200) = 0.600
@@ -1638,12 +1631,13 @@ fn streamed_verify_prior_avoids_blind_widest_first_probing_and_larger_clamp() {
     // Proving a larger width (rows = 8 at 70ms) must not drag an unmeasured smaller
     // width (rows = 4) below its streamed prior (280ms).
     {
-        let mut map = steep.costs.lock().unwrap();
-        let bucket = map.entry((ctx, 1)).or_default();
+        let mut state = steep.lock();
+        let bucket = state.costs.entry((ctx, 1)).or_default();
         bucket.verify.insert(8, super::Durations::settled(&[(1, 0.070), (2, 0.070), (3, 0.070)]));
     }
     {
-        let costs = RoundCosts::of(&steep, ctx, 1, None);
+        let state = steep.lock();
+        let costs = RoundCosts::of(&state, ctx, 1, None);
         assert!((costs.verify(8) - 0.070).abs() < 1e-12, "proven width uses its measurement");
         assert!((costs.verify(4) - 0.280).abs() < 1e-12, "unmeasured width keeps prior without larger clamp");
     }
@@ -1671,27 +1665,27 @@ fn observe_streamed_invalidates_target_costs_on_bank_epoch_change_preserving_dra
     let ctx_a = 1024usize;
     let ctx_b = 2048usize;
     {
-        let mut map = load.costs.lock().unwrap();
-        let a = map.entry((ctx_a, 1)).or_default();
+        let mut state = load.lock();
+        let a = state.costs.entry((ctx_a, 1)).or_default();
         a.draft.insert(4, super::Durations::settled(&[(1, 0.005)]));
         a.verify.insert(2, super::Durations::settled(&[(1, 0.090)]));
         a.enter = super::Durations::settled(&[(1, 0.002)]);
         a.leave = super::Durations::settled(&[(1, 0.003)]);
 
         // Bucket with only verify durations (should be pruned when cleared).
-        let b = map.entry((ctx_b, 1)).or_default();
+        let b = state.costs.entry((ctx_b, 1)).or_default();
         b.verify.insert(1, super::Durations::settled(&[(1, 0.045)]));
     }
 
     // Same epoch leaves every measured duration untouched.
     load.observe_streamed(Some(prior_e1));
     {
-        let map = load.costs.lock().unwrap();
-        assert!(map[&(ctx_a, 1)].verify.contains_key(&2));
-        assert!(map[&(ctx_a, 1)].draft.contains_key(&4));
-        assert!(map[&(ctx_a, 1)].enter.measured());
-        assert!(map[&(ctx_a, 1)].leave.measured());
-        assert!(map.contains_key(&(ctx_b, 1)));
+        let state = load.lock();
+        assert!(state.costs[&(ctx_a, 1)].verify.contains_key(&2));
+        assert!(state.costs[&(ctx_a, 1)].draft.contains_key(&4));
+        assert!(state.costs[&(ctx_a, 1)].enter.measured());
+        assert!(state.costs[&(ctx_a, 1)].leave.measured());
+        assert!(state.costs.contains_key(&(ctx_b, 1)));
     }
 
     // New bank_epoch clears verify/enter/leave, prunes empty buckets, and preserves draft.
@@ -1700,15 +1694,16 @@ fn observe_streamed_invalidates_target_costs_on_bank_epoch_change_preserving_dra
         verify_seconds: vec![0.040, 0.075],
     }));
     {
-        let map = load.costs.lock().unwrap();
-        let a = &map[&(ctx_a, 1)];
+        let state = load.lock();
+        let a = &state.costs[&(ctx_a, 1)];
         assert!(a.draft.contains_key(&4), "draft durations must survive bank_epoch change");
         assert!((a.draft[&4].cost() - 0.005).abs() < 1e-12);
         assert!(a.verify.is_empty(), "verify durations must be cleared on bank_epoch change");
         assert!(!a.enter.measured(), "enter durations must be cleared on bank_epoch change");
         assert!(!a.leave.measured(), "leave durations must be cleared on bank_epoch change");
-        assert!(!map.contains_key(&(ctx_b, 1)), "buckets emptied by invalidation must be pruned");
+        assert!(!state.costs.contains_key(&(ctx_b, 1)), "buckets emptied by invalidation must be pruned");
     }
-    let costs = RoundCosts::of(&load, ctx_a, 1, None);
+    let state = load.lock();
+    let costs = RoundCosts::of(&state, ctx_a, 1, None);
     assert!((costs.verify(2) - 0.075).abs() < 1e-12, "new epoch prior takes effect immediately");
 }
