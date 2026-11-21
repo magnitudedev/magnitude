@@ -23,7 +23,7 @@ export function NoModelsYet({ memory }: { memory: ServingMemory }) {
   const placeholder = recommendationsSettled(view) ? null : <OfferedModelsSkeleton firstOpened footer />
   return <>
     <p className="text-sm text-slate-500 dark:text-slate-400">No models yet. Download one below, or explore more on Hugging Face.</p>
-    <RecommendedForYourMachine recommendations={recommendations} placeholder={placeholder} measuring={view.measuring}
+    <RecommendedForYourMachine recommendations={recommendations} placeholder={placeholder} benchmark={view.benchmark}
       usOnly={usOnly} setUsOnly={setUsOnly} owned={NOTHING_OWNED} selection={selection} footer={download} className="mt-6" />
   </>
 }

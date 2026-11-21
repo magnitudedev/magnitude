@@ -480,6 +480,7 @@ describe("LocalModelsStateSchema", () => {
       preparation: {
         discovery: { complete: true, modelsFound: 1 },
         assessment: { complete: true, settledModels: 1, totalModels: 1 },
+        measurement: { _tag: "Measured" },
       },
       models: [foundModel],
       unsupported: [{
@@ -499,6 +500,7 @@ describe("LocalModelsStateSchema", () => {
       preparation: {
         discovery: { complete: true, modelsFound: 1 },
         assessment: { complete: true, settledModels: 1, totalModels: 1 },
+        measurement: { _tag: "Measured" },
       },
       unsupported: [],
     }
@@ -569,17 +571,26 @@ describe("LocalModelPreparationSchema", () => {
     expect(Schema.decodeUnknownSync(LocalModelPreparationSchema)({
       discovery: { complete: false, modelsFound: 5 },
       assessment: { complete: false, settledModels: 12, totalModels: 18 },
+      measurement: { _tag: "Measuring", progress: { completed: 24, total: 113, phase: "TokenGeneration" } },
     })).toEqual({
       discovery: { complete: false, modelsFound: 5 },
       assessment: { complete: false, settledModels: 12, totalModels: 18 },
+      measurement: { _tag: "Measuring", progress: Option.some({ completed: 24, total: 113, phase: "TokenGeneration" }) },
     })
     expect(() => Schema.decodeUnknownSync(LocalModelPreparationSchema)({
       discovery: { complete: false, modelsFound: 5 },
       assessment: { complete: false, settledModels: 19, totalModels: 18 },
+      measurement: { _tag: "Measured" },
     })).toThrow()
     expect(() => Schema.decodeUnknownSync(LocalModelPreparationSchema)({
       discovery: { complete: true, modelsFound: 18 },
       assessment: { complete: true, settledModels: 17, totalModels: 18 },
+      measurement: { _tag: "Measured" },
+    })).toThrow()
+    expect(() => Schema.decodeUnknownSync(LocalModelPreparationSchema)({
+      discovery: { complete: false, modelsFound: 0 },
+      assessment: { complete: false, settledModels: 0, totalModels: 10 },
+      measurement: { _tag: "Measuring", progress: { completed: 120, total: 113, phase: "TokenGeneration" } },
     })).toThrow()
   })
 })
@@ -706,7 +717,7 @@ describe("comparisonTokensPerSecond", () => {
   it("reads the estimate nearest 50K, or nearest the served context when it is shorter", () => {
     expect(comparisonTokensPerSecond({ _tag: "Estimated", samples }, 131_072)).toEqual(Option.some(24))
     expect(comparisonTokensPerSecond({ _tag: "Estimated", samples }, 32_768)).toEqual(Option.some(30))
-    expect(comparisonTokensPerSecond({ _tag: "Pending", measurement: { _tag: "Measuring" } }, 131_072))
+    expect(comparisonTokensPerSecond({ _tag: "Pending", measurement: { _tag: "Measuring", progress: Option.none() } }, 131_072))
       .toEqual(Option.none())
   })
 })

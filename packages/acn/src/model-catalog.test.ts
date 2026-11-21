@@ -43,6 +43,7 @@ const local = (overrides: Partial<LocalModelsState> = {}): LocalModelsState => (
   preparation: {
     discovery: { complete: true, modelsFound: 0 },
     assessment: { complete: true, settledModels: 0, totalModels: 0 },
+    measurement: { _tag: "Measured" },
   },
   models: [],
   unsupported: [],
@@ -59,6 +60,7 @@ describe("ACN model catalog projection", () => {
       localModelPreparation: {
         discovery: { complete: true, modelsFound: 0 },
         assessment: { complete: true, settledModels: 0, totalModels: 0 },
+        measurement: { _tag: "Measured" },
       },
     })
   })
@@ -114,6 +116,7 @@ describe("ACN model catalog projection", () => {
       preparation: {
         discovery: { complete: false, modelsFound: 0 },
         assessment: { complete: false, settledModels: 0, totalModels: 0 },
+        measurement: { _tag: "Measuring", progress: Option.none() },
       },
     }))
 

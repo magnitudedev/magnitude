@@ -52,10 +52,10 @@ describe("Recommended for your machine", () => {
 })
 
 describe("when Recommended for your machine shows its list", () => {
-  const view = (measuring: RecommendationsView["measuring"], ready = true): RecommendationsView => ({ ready, measuring, offered: [], roomShortfall: null, families: [] })
+  const view = (benchmark: RecommendationsView["benchmark"], ready = true): RecommendationsView => ({ ready, benchmark, offered: [], roomShortfall: null, families: [] })
 
-  it("shows no list while any quant is still being measured, nor before the recommendations are read", () => {
-    expect(recommendationsSettled(view({ settled: 12, total: 36 }))).toBe(false)
+  it("shows no list while benchmarking or ranking, nor before the recommendations are read", () => {
+    expect(recommendationsSettled(view({ title: "Benchmarking your hardware", subtitle: "Testing baseline compute", percent: 12, fraction: 0.12, failed: false }))).toBe(false)
     expect(recommendationsSettled(view(null, false))).toBe(false)
     expect(recommendationsSettled(view(null))).toBe(true)
   })

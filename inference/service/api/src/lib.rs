@@ -2838,7 +2838,9 @@ mod tests {
             ),
             catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
             custom: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
-            measurement: magnitude_service_contracts::models::MeasurementState::Measuring,
+            measurement: magnitude_service_contracts::models::MeasurementState::Measuring {
+                progress: None,
+            },
         }));
         let response = test_app(AppState::new().with_model_assessments(assessments))
             .oneshot(

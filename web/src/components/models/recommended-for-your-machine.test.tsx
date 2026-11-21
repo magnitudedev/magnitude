@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { CatalogFormModelIdSchema, type LocalModel, type RecommendedModel } from "@magnitudedev/sdk"
 import { makeSetupModel } from "@magnitudedev/client-common/fixtures/model"
+import { hardwareBenchmarkView, type HardwareBenchmarkView } from "./benchmark"
 import { offeredFromRecommendation } from "./data"
+import { PreparationProgress, preparationLabels } from "./onboarding"
 import { RecommendedForYourMachine, selectedModel, useRecommendedSelection } from "./recommended-for-your-machine"
-import type { Recommendation, RecommendationsView } from "./recommendations"
+import type { Recommendation } from "./recommendations"
 
 const GB = 1e9
 const ladder = [4, 6].map(bits => ({ ...makeSetupModel(false), modelId: CatalogFormModelIdSchema.make(`flash:gguf:q${bits}`), storageBytes: bits * 20 * GB }) as LocalModel)
@@ -17,9 +19,9 @@ const recommendations: readonly Recommendation[] = [
   { model: offeredFromRecommendation(recommendation, new Map(ladder.map(model => [model.modelId, model])), "Device", null)!, note: "Smartest that runs well here" },
 ]
 
-function Shown({ measuring, placeholder = null }: { measuring: RecommendationsView["measuring"]; placeholder?: React.ReactNode }) {
+function Shown({ benchmark, placeholder = null }: { benchmark: HardwareBenchmarkView | null; placeholder?: React.ReactNode }) {
   const selection = useRecommendedSelection(recommendations)
-  return <RecommendedForYourMachine recommendations={recommendations} placeholder={placeholder} measuring={measuring}
+  return <RecommendedForYourMachine recommendations={recommendations} placeholder={placeholder} benchmark={benchmark}
     usOnly={false} setUsOnly={() => {}} owned={new Set()} selection={selection} />
 }
 
@@ -29,27 +31,65 @@ const nestsControls = (html: string) => /role="button"/.test(html) || /<button\b
 const STATUS = /<div role="status".*?<\/div>/
 
 describe("Recommended for your machine", () => {
-  it("shows measuring progress below the heading row without crowding it, leaving everything else as it is", () => {
-    const measuring = renderToStaticMarkup(<Shown measuring={{ settled: 12, total: 36 }} />)
-    const settled = renderToStaticMarkup(<Shown measuring={null} />)
-    expect(measuring).toContain("Measuring speeds on this computer · 12 of 36")
-    expect(measuring).toContain("width:33.33")
-    expect(measuring.indexOf("Only models from US developers")).toBeLessThan(measuring.indexOf("Measuring speeds"))
+  const activeBenchmark = hardwareBenchmarkView(
+    { _tag: "Measuring", progress: Option.some({ completed: 38, total: 113, phase: "TokenGeneration" }) },
+    false,
+  )!
+
+  it("shows benchmark progress below the heading row without crowding it, leaving everything else as it is", () => {
+    const measuring = renderToStaticMarkup(<Shown benchmark={activeBenchmark} />)
+    const settled = renderToStaticMarkup(<Shown benchmark={null} />)
+    expect(measuring).toContain("Benchmarking your hardware · Testing token generation speed · 34%")
+    expect(measuring.indexOf("Only models from US developers")).toBeLessThan(measuring.indexOf("Benchmarking your hardware"))
     expect(measuring.replace(STATUS, "")).toBe(settled)
   })
 
-  it("integrates measuring progress into the loading placeholder when recommendations are still settling", () => {
-    const html = renderToStaticMarkup(<Shown measuring={{ settled: 8, total: 32 }} placeholder={<div>skeleton</div>} />)
-    expect(html).toContain("Measuring speeds on this computer")
-    expect(html).toContain("8 of 32")
-    expect(html).toContain("width:25%")
+  it("integrates standardized benchmark progress into the loading placeholder when recommendations are still settling", () => {
+    const benchmark = hardwareBenchmarkView(
+      { _tag: "Measuring", progress: Option.some({ completed: 16, total: 100, phase: "MemoryAndStorage" }) },
+      false,
+    )!
+    const html = renderToStaticMarkup(<Shown benchmark={benchmark} placeholder={<div>skeleton</div>} />)
+    expect(html).toContain("Benchmarking your hardware")
+    expect(html).toContain("Testing memory and SSD speed")
+    expect(html).toContain("16%")
+    expect(html).toContain("width:16%")
     expect(html).toContain("opacity-45")
   })
 
+  it("maps every benchmark phase and edge state consistently", () => {
+    expect(hardwareBenchmarkView({ _tag: "Measuring", progress: Option.none() }, false)?.subtitle).toBe("Testing baseline compute")
+    expect(hardwareBenchmarkView({ _tag: "Measuring", progress: Option.some({ completed: 10, total: 100, phase: "Baseline" }) }, false)?.subtitle).toBe("Testing baseline compute")
+    expect(hardwareBenchmarkView({ _tag: "Measuring", progress: Option.some({ completed: 15, total: 100, phase: "MemoryAndStorage" }) }, false)?.subtitle).toBe("Testing memory and SSD speed")
+    expect(hardwareBenchmarkView({ _tag: "Measuring", progress: Option.some({ completed: 50, total: 100, phase: "TokenGeneration" }) }, false)?.subtitle).toBe("Testing token generation speed")
+    expect(hardwareBenchmarkView({ _tag: "Measuring", progress: Option.some({ completed: 80, total: 100, phase: "PromptProcessing" }) }, false)?.subtitle).toBe("Testing prompt processing speed")
+    expect(hardwareBenchmarkView({ _tag: "Measuring", progress: Option.some({ completed: 95, total: 100, phase: "LongContextAttention" }) }, false)?.subtitle).toBe("Testing long-context attention")
+    expect(hardwareBenchmarkView({ _tag: "Measured" }, false)).toMatchObject({ subtitle: "Ranking models for your machine", percent: 100, fraction: 1 })
+    expect(hardwareBenchmarkView({ _tag: "Unmeasured" }, false)).toMatchObject({ subtitle: "Waiting for your GPU to be free", percent: null, fraction: null })
+    expect(hardwareBenchmarkView({ _tag: "Failed", retryAt: Date.now() + 60_000 }, false)?.failed).toBe(true)
+    expect(hardwareBenchmarkView({ _tag: "Measured" }, true)).toBeNull()
+  })
+
   it("opens a card from its own button, with the repository link beside it rather than inside it", () => {
-    const html = renderToStaticMarkup(<Shown measuring={null} />)
+    const html = renderToStaticMarkup(<Shown benchmark={null} />)
     expect(html).toContain('aria-expanded="true"')
     expect(nestsControls(html)).toBe(false)
+  })
+
+  it("renders the same standardized benchmark copy in onboarding step 4", () => {
+    const benchmark = hardwareBenchmarkView(
+      { _tag: "Measuring", progress: Option.some({ completed: 16, total: 100, phase: "MemoryAndStorage" }) },
+      false,
+    )!
+    const html = renderToStaticMarkup(<PreparationProgress steps={[
+      { label: preparationLabels[0], detail: null, fraction: null, state: "done" },
+      { label: preparationLabels[1], detail: null, fraction: null, state: "done" },
+      { label: preparationLabels[2], detail: "0 models found", fraction: null, state: "done" },
+      { label: preparationLabels[3], subtitle: benchmark.subtitle, detail: `${benchmark.percent}%`, fraction: benchmark.fraction, state: "active" },
+    ]} />)
+    expect(html).toContain("Benchmarking your hardware")
+    expect(html).toContain("Testing memory and SSD speed")
+    expect(html).toContain("16%")
   })
 })
 

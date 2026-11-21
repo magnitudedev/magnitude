@@ -6267,9 +6267,23 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "host"
+                ]
+              }
+            }
           }
         ],
-        "description": "What a discovery diagnostic is about: one backend's enumeration, or the\nOS's adapter interface (DXGI)."
+        "description": "What a discovery diagnostic is about: one backend's enumeration, the OS's\nadapter interface (DXGI), or the host's memory limits."
       },
       "HardwareExecutor": {
         "type": "object",
@@ -7809,6 +7823,42 @@
         },
         "additionalProperties": false
       },
+      "MeasurementPhase": {
+        "type": "string",
+        "description": "The state of the measurement job, which measures this machine's selected executor in a\nworker process of its own, so that speed estimates can be made. It runs while no model is\nloading or being optimized, and while no request holds a loaded model, beside which it runs\nonce that model has made room for it. It moves from `Unmeasured` to `Measuring`, then to\n`Measured`, or to `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when\na load or a request preempts the job.\nPhase of the one-time hardware benchmark job, advancing monotonically.",
+        "enum": [
+          "Baseline",
+          "MemoryAndStorage",
+          "TokenGeneration",
+          "PromptProcessing",
+          "LongContextAttention"
+        ]
+      },
+      "MeasurementProgress": {
+        "type": "object",
+        "description": "Standing progress reported while the hardware benchmark job runs.",
+        "required": [
+          "completed",
+          "total",
+          "phase"
+        ],
+        "properties": {
+          "completed": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "phase": {
+            "$ref": "#/components/schemas/MeasurementPhase"
+          }
+        },
+        "additionalProperties": false
+      },
       "MeasurementState": {
         "oneOf": [
           {
@@ -7833,6 +7883,9 @@
               "_tag"
             ],
             "properties": {
+              "progress": {
+                "$ref": "#/components/schemas/MeasurementProgress"
+              },
               "_tag": {
                 "type": "string",
                 "enum": [
@@ -7877,8 +7930,7 @@
               }
             }
           }
-        ],
-        "description": "The state of the measurement job, which measures this machine's selected executor in a\nworker process of its own, so that speed estimates can be made. It runs while no model is\nloading or being optimized, and while no request holds a loaded model, beside which it runs\nonce that model has made room for it. It moves from `Unmeasured` to `Measuring`, then to\n`Measured`, or to `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when\na load or a request preempts the job."
+        ]
       },
       "MemoryAssessment": {
         "type": "object",

@@ -333,7 +333,7 @@ it("refuses to download a catalog model that does not fit or that the catalog dr
       ],
       unsupported: [],
       hidden: [],
-      preparation: { discovery: { complete: true, modelsFound: 0 }, assessment: { complete: true, settledModels: 5, totalModels: 5 } },
+      preparation: { discovery: { complete: true, modelsFound: 0 }, assessment: { complete: true, settledModels: 5, totalModels: 5 }, measurement: { _tag: "Measured" } },
     }) } as never),
     Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
     Effect.provideService(IcnClient, {

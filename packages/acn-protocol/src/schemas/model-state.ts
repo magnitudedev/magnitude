@@ -535,12 +535,34 @@ export const GenerationPerformanceSamplesSchema = Schema.Array(
 { message: () => "performance samples must be nonempty and ordered by unique context" }))
 export type GenerationPerformanceSamples = typeof GenerationPerformanceSamplesSchema.Type
 
+/** Phase of the one-time hardware benchmark job, advancing monotonically. */
+export const MachineMeasurementPhaseSchema = Schema.Literal(
+  "Baseline",
+  "MemoryAndStorage",
+  "TokenGeneration",
+  "PromptProcessing",
+  "LongContextAttention",
+)
+export type MachineMeasurementPhase = typeof MachineMeasurementPhaseSchema.Type
+
+/** Standing progress reported while the hardware benchmark job runs. */
+export const MachineMeasurementProgressSchema = Schema.Struct({
+  completed: NonNegativeSafeInteger,
+  total: PositiveSafeInteger,
+  phase: MachineMeasurementPhaseSchema,
+}).pipe(Schema.filter(({ completed, total }) => completed <= total, {
+  message: () => "completed measurement points cannot exceed total measurement points",
+}))
+export type MachineMeasurementProgress = typeof MachineMeasurementProgressSchema.Type
+
 /** Progress of the measurements this machine's speed estimates are computed from. */
 export const MachineMeasurementSchema = Schema.Union(
   /** No measurement job has run yet: it waits for the accelerators to be free of models. */
   Schema.TaggedStruct("Unmeasured", {}),
   /** A job is measuring this machine. */
-  Schema.TaggedStruct("Measuring", {}),
+  Schema.TaggedStruct("Measuring", {
+    progress: Schema.optionalWith(MachineMeasurementProgressSchema, { as: "Option", exact: true }),
+  }),
   /** Every measurement an estimate reads is stored, or recorded unobtainable. */
   Schema.TaggedStruct("Measured", {}),
   /** The last job did not store every measurement; the next starts at `retryAt` (Unix epoch ms). */
@@ -1471,6 +1493,7 @@ export const LocalModelPreparationSchema = Schema.Struct({
   }).pipe(Schema.filter(({ settledModels, totalModels }) => settledModels <= totalModels, {
     message: () => "settled model assessments cannot exceed total model assessments",
   })),
+  measurement: MachineMeasurementSchema,
 }).pipe(Schema.filter(({ assessment }) => !assessment.complete
   || assessment.settledModels === assessment.totalModels, {
   message: () => "complete model assessment progress must have every target settled",
