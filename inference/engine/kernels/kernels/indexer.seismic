@@ -171,18 +171,20 @@ native indexer_keys for cpu from "cpu/indexer_keys.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes ((2 * P + 2 * (2 * P + S)) * 4)
 
-# Metal: a threadgroup per (256 scores, row). Its simdgroups prepare the
-# row's H query heads into threadgroup memory (padded by 4 floats per head),
-# stage the row's head weights once, then each simdgroup cooperatively scores
-# its 32 rows one key at a time: coalesced float4 key load into a per-simdgroup
-# buffer, each lane owning ceil(H / 32) heads with ascending FMA dot products.
+# Metal: a threadgroup per (256 scores, row). When all H prepared query heads
+# (padded by 4 floats per head) plus 8 per-simdgroup key buffers fit in 32 KiB,
+# its simdgroups prepare all H heads once and each simdgroup cooperatively
+# scores its 32 rows one key at a time (each lane owning ceil(H / 32) heads).
+# Otherwise (e.g. W = 512, H = 32), it tiles over power-of-two head chunks
+# that fit alongside the 8 key buffers, splitting each head's dot product
+# across 32 / HEAD_TILE lanes.
 native indexer_score for metal from "metal/indexer_score.metal":
     static (H, P, S, NQ, HW, RA, RT)
-    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and (H * (2 * P + S + 4) + 8 * (2 * P + S) + HW) * 4 <= 32768 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
+    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and 9 * (2 * P + S) * 4 <= 32768 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
     launch indexer_score:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((H * (2 * P + S + 4) + 8 * (2 * P + S) + HW) * 4)
+        shared_bytes (min((H * (2 * P + S + 4) + 8 * (2 * P + S)) * 4, 32768))
 
 # CUDA: as Metal, each head's warp rotating through the head's own shared
 # row before it holds the prepared head, then each warp cooperatively scoring
