@@ -374,6 +374,51 @@ inline float ordered_combine8(float v) {
     return v;
 }
 
+// Accumulate `sp[u], sp[u + 8], ... < count` in exact 8-lane reference order.
+inline float ordered_accumulate_sram8(threadgroup const float *sp, uint count, uint u, float sum) {
+    uint c = u;
+    for (; c + 56u < count; c += 64u) {
+        const float v0 = sp[c], v1 = sp[c + 8u], v2 = sp[c + 16u], v3 = sp[c + 24u];
+        const float v4 = sp[c + 32u], v5 = sp[c + 40u], v6 = sp[c + 48u], v7 = sp[c + 56u];
+        sum = metal::fma(v0, v0, sum);
+        sum = metal::fma(v1, v1, sum);
+        sum = metal::fma(v2, v2, sum);
+        sum = metal::fma(v3, v3, sum);
+        sum = metal::fma(v4, v4, sum);
+        sum = metal::fma(v5, v5, sum);
+        sum = metal::fma(v6, v6, sum);
+        sum = metal::fma(v7, v7, sum);
+    }
+    for (; c < count; c += 8u) {
+        const float val = sp[c];
+        sum = metal::fma(val, val, sum);
+    }
+    return sum;
+}
+
+// Power-of-two 2D thread partition across `(m_rows, width)` without runtime integer division.
+inline void ordered_stage_partition(uint m_rows, uint width, uint tid, uint threads,
+    thread uint &r0, thread uint &row_stride, thread uint &c0, thread uint &c_stride) {
+    if (m_rows == 1u) {
+        r0 = 0u;
+        row_stride = 1u;
+        c0 = tid;
+        c_stride = threads;
+        return;
+    }
+    const uint max_group = metal::min(threads, metal::max(16u, width));
+    uint shift = 4u;
+    if (max_group >= 32u) shift = 5u;
+    if (max_group >= 64u) shift = 6u;
+    if (max_group >= 128u) shift = 7u;
+    if (max_group >= 256u) shift = 8u;
+    if (max_group >= 512u) shift = 9u;
+    c_stride = 1u << shift;
+    row_stride = threads >> shift;
+    r0 = tid >> shift;
+    c0 = tid & (c_stride - 1u);
+}
+
 // 8x8 butterfly transpose within each 8-lane quarter (`q = lane >> 3`, `u = lane & 7`):
 // lane `u` enters holding 8 contiguous values at `base + 8*u + 0..7` and exits
 // holding `v[s] = val[base + 8*s + u]` (`s = 0..7`), matching the 8-lane reference order.
@@ -520,48 +565,42 @@ struct OrderedRms {
             const uint chunk = metal::min(row_cap, columns - k0);
             if ((chunk & 3u) == 0u) {
                 const uint chunk4 = chunk >> 2u;
-                for (uint idx = tid; idx < m_rows * chunk4; idx += threads) {
-                    const uint r = idx / chunk4, c4 = (idx - r * chunk4) * 4u;
-                    device const float *rp = x + ulong(rows.at(r)) * stride0 + k0 + c4;
-                    const float4 v = ((ulong(rp) & 15ul) == 0ul)
-                        ? *reinterpret_cast<device const float4 *>(rp)
-                        : float4(rp[0], rp[1], rp[2], rp[3]);
-                    *reinterpret_cast<threadgroup float4 *>(sram + r * row_cap + c4) = v;
+                uint r0, row_stride, c0, c_stride;
+                ordered_stage_partition(m_rows, chunk4, tid, threads, r0, row_stride, c0, c_stride);
+                for (uint r = r0; r < m_rows; r += row_stride) {
+                    device const float *row_base = x + ulong(rows.at(r)) * stride0 + k0;
+                    threadgroup float4 *dst4 = reinterpret_cast<threadgroup float4 *>(sram + r * row_cap);
+                    const bool aligned = (ulong(row_base) & 15ul) == 0ul;
+                    for (uint c = c0; c < chunk4; c += c_stride) {
+                        device const float *rp = row_base + c * 4u;
+                        dst4[c] = aligned ? *reinterpret_cast<device const float4 *>(rp)
+                                          : float4(rp[0], rp[1], rp[2], rp[3]);
+                    }
                 }
             } else {
-                for (uint idx = tid; idx < m_rows * chunk; idx += threads) {
-                    const uint r = idx / chunk, c = idx - r * chunk;
-                    sram[r * row_cap + c] = x[ulong(rows.at(r)) * stride0 + k0 + c];
+                uint r0, row_stride, c0, c_stride;
+                ordered_stage_partition(m_rows, chunk, tid, threads, r0, row_stride, c0, c_stride);
+                for (uint r = r0; r < m_rows; r += row_stride) {
+                    device const float *row_base = x + ulong(rows.at(r)) * stride0 + k0;
+                    threadgroup float *dst = sram + r * row_cap;
+                    for (uint c = c0; c < chunk; c += c_stride)
+                        dst[c] = row_base[c];
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (q_idx < m_rows) {
-                threadgroup const float *sp = sram + q_idx * row_cap;
-                uint c = u;
-                for (; c + 56u < chunk; c += 64u) {
-                    const float v0 = sp[c], v1 = sp[c + 8u], v2 = sp[c + 16u], v3 = sp[c + 24u];
-                    const float v4 = sp[c + 32u], v5 = sp[c + 40u], v6 = sp[c + 48u], v7 = sp[c + 56u];
-                    sum = metal::fma(v0, v0, sum);
-                    sum = metal::fma(v1, v1, sum);
-                    sum = metal::fma(v2, v2, sum);
-                    sum = metal::fma(v3, v3, sum);
-                    sum = metal::fma(v4, v4, sum);
-                    sum = metal::fma(v5, v5, sum);
-                    sum = metal::fma(v6, v6, sum);
-                    sum = metal::fma(v7, v7, sum);
-                }
-                for (; c < chunk; c += 8u) {
-                    const float val = sp[c];
-                    sum = metal::fma(val, val, sum);
-                }
-            }
+            if (q_idx < m_rows)
+                sum = ordered_accumulate_sram8(sram + q_idx * row_cap, chunk, u, sum);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv = 0.0f;
         if (q_idx < m_rows) {
             const float total_sq = ordered_combine8(sum);
             if (u == 0u)
-                inverses[q_idx] = 1.0f / metal::precise::sqrt(total_sq / float(columns) + eps);
+                inv = 1.0f / metal::precise::sqrt(total_sq / float(columns) + eps);
         }
+        if ((inverses < sram + m_rows * row_cap) && (sram < inverses + m_rows))
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (q_idx < m_rows && u == 0u)
+            inverses[q_idx] = inv;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float ordered_at(uint m, uint c, float inv) const {
@@ -618,73 +657,53 @@ struct OrderedInputOf<A, N, Rows, 0, PARTS> {
     typedef OrderedSummed<A, N, Rows, PARTS> type;
 };
 
-// Fused single-read prologue for `gemv_prestaged_one`: preloads `x` into
-// registers while simdgroup 0 reduces the reference-order RMS inverse, then
-// writes normalized `uint4` words in `gemv_word` layout at `shared + 0..k*2`.
 template <typename A, typename N, typename Rows>
+inline void ordered_norm8_regs(thread const OrderedRms<A, N, Rows> &in, uint c, float inv,
+    float4 r0, float4 r1, thread float4 &even, thread float4 &odd) {
+    float4 ne, no;
+    norm8<N>::load(in.norm, in.norm_stride, c, ne, no);
+    const float4 e = float4(r0.x, r0.z, r1.x, r1.z) * inv * ne;
+    const float4 o = float4(r0.y, r0.w, r1.y, r1.w) * inv * no;
+    PROJECTION_UNROLL
+    for (uint i = 0; i < 4; ++i) {
+        even[i] = A::round(e[i]);
+        odd[i] = A::round(o[i]);
+    }
+}
+
+// Reference-order RMS inverse over preloaded register chunks (`CHUNKS * 2048` max width):
+// streams `r0[ch], r1[ch]` through `shared` (`sram_floats` floats, >= 256) so simdgroup 0
+// lanes 0..7 accumulate `x[u], x[u + 8], ...` in bit-exact reference order.
+template <uint CHUNKS, typename A, typename N, typename Rows>
 inline float ordered_preload_inverse(thread const OrderedRms<A, N, Rows> &in, uint k,
-    float4 r0, float4 r1, threadgroup uchar *shared, uint sg, uint lane) {
+    thread const float4 (&r0)[CHUNKS], thread const float4 (&r1)[CHUNKS],
+    threadgroup uchar *shared, uint sram_floats, uint sg, uint lane) {
     const uint tid = sg * 32u + lane;
-    const uint cap_threads = metal::max(32u, ((k + 31u) >> 5u) * 2u);
+    const uint cap_threads = sram_floats >> 3u;
     const uint cap_floats = cap_threads * 8u;
     threadgroup float4 *sram4 = reinterpret_cast<threadgroup float4 *>(shared);
     threadgroup const float *sp = reinterpret_cast<threadgroup const float *>(shared);
-    if (tid < cap_threads) {
-        sram4[2u * tid] = r0;
-        sram4[2u * tid + 1u] = r1;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     float sum = 0.0f;
-    if (sg == 0u && lane < 8u) {
-        const uint lim0 = metal::min(k, cap_floats);
-        uint c0 = lane;
-        for (; c0 + 56u < lim0; c0 += 64u) {
-            const float v0 = sp[c0], v1 = sp[c0 + 8u], v2 = sp[c0 + 16u], v3 = sp[c0 + 24u];
-            const float v4 = sp[c0 + 32u], v5 = sp[c0 + 40u], v6 = sp[c0 + 48u], v7 = sp[c0 + 56u];
-            sum = metal::fma(v0, v0, sum);
-            sum = metal::fma(v1, v1, sum);
-            sum = metal::fma(v2, v2, sum);
-            sum = metal::fma(v3, v3, sum);
-            sum = metal::fma(v4, v4, sum);
-            sum = metal::fma(v5, v5, sum);
-            sum = metal::fma(v6, v6, sum);
-            sum = metal::fma(v7, v7, sum);
-        }
-        for (; c0 < lim0; c0 += 8u) {
-            const float val = sp[c0];
-            sum = metal::fma(val, val, sum);
-        }
-    }
-    if (k > cap_floats) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid >= cap_threads && tid < 2u * cap_threads) {
-            const uint slot = tid - cap_threads;
-            sram4[2u * slot] = r0;
-            sram4[2u * slot + 1u] = r1;
+    for (uint base_slot = 0u; base_slot * 8u < k; base_slot += cap_threads) {
+        if (base_slot > 0u)
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 256u) {
+            PROJECTION_UNROLL
+            for (uint ch = 0u; ch < CHUNKS; ++ch) {
+                const uint slot = ch * 256u + tid;
+                if (slot >= base_slot && slot < base_slot + cap_threads) {
+                    const uint local_slot = slot - base_slot;
+                    sram4[2u * local_slot] = r0[ch];
+                    sram4[2u * local_slot + 1u] = r1[ch];
+                }
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0u && lane < 8u) {
-            const uint lim1 = k - cap_floats;
-            uint c0 = lane;
-            for (; c0 + 56u < lim1; c0 += 64u) {
-                const float v0 = sp[c0], v1 = sp[c0 + 8u], v2 = sp[c0 + 16u], v3 = sp[c0 + 24u];
-                const float v4 = sp[c0 + 32u], v5 = sp[c0 + 40u], v6 = sp[c0 + 48u], v7 = sp[c0 + 56u];
-                sum = metal::fma(v0, v0, sum);
-                sum = metal::fma(v1, v1, sum);
-                sum = metal::fma(v2, v2, sum);
-                sum = metal::fma(v3, v3, sum);
-                sum = metal::fma(v4, v4, sum);
-                sum = metal::fma(v5, v5, sum);
-                sum = metal::fma(v6, v6, sum);
-                sum = metal::fma(v7, v7, sum);
-            }
-            for (; c0 < lim1; c0 += 8u) {
-                const float val = sp[c0];
-                sum = metal::fma(val, val, sum);
-            }
+            const uint lim = metal::min(k - base_slot * 8u, cap_floats);
+            sum = ordered_accumulate_sram8(sp, lim, lane, sum);
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0u) {
         const float total_sq = ordered_combine8(sum);
         if (lane == 0u)
@@ -697,33 +716,41 @@ inline float ordered_preload_inverse(thread const OrderedRms<A, N, Rows> &in, ui
     return inv;
 }
 
+// Fused single-read prologue for `gemv_prestaged_one` (`m == 1, k <= 8192`):
+// preloads `x` into registers while simdgroup 0 reduces the reference-order RMS
+// inverse, then writes normalized `uint4` words in `gemv_word` layout at `shared + 0..k*2`.
 template <uint SIMDGROUPS, typename A, typename N, typename Rows>
 inline bool ordered_stage_single_gemv_words(thread const OrderedRms<A, N, Rows> &in, uint k,
     threadgroup uchar *shared, uint sg, uint lane) {
     if constexpr (SIMDGROUPS < 8u)
         return false;
-    if (k != in.columns || k == 0u || k > 2048u || (k & 31u) != 0u || in.stride1 != 1ul)
+    if (k != in.columns || k == 0u || k > 8192u || (k & 31u) != 0u || in.stride1 != 1ul)
         return false;
     const uint tid = sg * 32u + lane;
-    const uint c = tid * 8u;
-    float4 r0 = float4(0.0f), r1 = float4(0.0f);
-    if (tid < 256u)
-        in.preload_row_regs(0u, c, r0, r1);
-    const float inv = ordered_preload_inverse(in, k, r0, r1, shared, sg, lane);
-    if (tid < 256u && c < k) {
-        float4 ne, no;
-        norm8<N>::load(in.norm, in.norm_stride, c, ne, no);
-        const float4 e = float4(r0.x, r0.z, r1.x, r1.z) * inv * ne;
-        const float4 o = float4(r0.y, r0.w, r1.y, r1.w) * inv * no;
-        float4 even, odd;
-        PROJECTION_UNROLL
-        for (uint i = 0; i < 4; ++i) {
-            even[i] = A::round(e[i]);
-            odd[i] = A::round(o[i]);
-        }
+    float4 r0[4], r1[4];
+    PROJECTION_UNROLL
+    for (uint ch = 0u; ch < 4u; ++ch) {
+        r0[ch] = float4(0.0f);
+        r1[ch] = float4(0.0f);
+        const uint c = (ch * 256u + tid) * 8u;
+        if (tid < 256u && c < k)
+            in.preload_row_regs(0u, c, r0[ch], r1[ch]);
+    }
+    const uint sram_floats = metal::max(256u, ((k + 31u) >> 5u) * 16u);
+    const float inv = ordered_preload_inverse<4u>(in, k, r0, r1, shared, sram_floats, sg, lane);
+    if (tid < 256u) {
         const uint count = k >> 5u;
         threadgroup uint4 *words = reinterpret_cast<threadgroup uint4 *>(shared);
-        words[(tid & 3u) * count + (tid >> 2u)] = A::pack8(even, odd);
+        PROJECTION_UNROLL
+        for (uint ch = 0u; ch < 4u; ++ch) {
+            const uint slot = ch * 256u + tid;
+            const uint c = slot * 8u;
+            if (c < k) {
+                float4 even, odd;
+                ordered_norm8_regs(in, c, inv, r0[ch], r1[ch], even, odd);
+                words[(slot & 3u) * count + (slot >> 2u)] = A::pack8(even, odd);
+            }
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     return true;
@@ -734,7 +761,8 @@ inline bool ordered_stage_single_gemv_words(thread const In &, uint, threadgroup
     return false;
 }
 
-// Fused single-read prologue for `ordered_gemv` (`m == 1, k <= 2048`):
+// Fused single-read prologue for `ordered_gemv` (`m == 1, k <= 4096`, capped by
+// `ORDERED_GEMV_SHARED = 8192` bytes = 4096 packed bf16/f16 elements):
 // stages `x` into `shared` in lane-strided `uint4` packets (`[block * 8 + u]`).
 template <bool PUBLISH, uint SIMDGROUPS, typename A, typename N, typename Rows, typename PubOut>
 inline bool ordered_stage_single_gemv_raw(thread const OrderedRms<A, N, Rows> &in, uint k,
@@ -742,59 +770,65 @@ inline bool ordered_stage_single_gemv_raw(thread const OrderedRms<A, N, Rows> &i
     thread float &inv_out, uint sg, uint lane) {
     if constexpr (SIMDGROUPS < 8u)
         return false;
-    if (k != in.columns || k == 0u || k > 2048u || (k > 512u && (k & 63u) != 0u) || in.stride1 != 1ul)
+    if (k != in.columns || k == 0u || k > 4096u || (k > 512u && (k & 63u) != 0u) || in.stride1 != 1ul)
         return false;
     const uint tid = sg * 32u + lane;
-    const uint c = tid * 8u;
-    float4 r0 = float4(0.0f), r1 = float4(0.0f);
-    if (tid < 256u)
-        in.preload_row_regs(0u, c, r0, r1);
-    const float inv = ordered_preload_inverse(in, k, r0, r1, shared, sg, lane);
+    float4 r0[2], r1[2];
+    PROJECTION_UNROLL
+    for (uint ch = 0u; ch < 2u; ++ch) {
+        r0[ch] = float4(0.0f);
+        r1[ch] = float4(0.0f);
+        const uint c = (ch * 256u + tid) * 8u;
+        if (tid < 256u && c < k)
+            in.preload_row_regs(0u, c, r0[ch], r1[ch]);
+    }
+    const uint sram_floats = metal::max(256u, ((k + 31u) >> 5u) * 16u);
+    const float inv = ordered_preload_inverse<2u>(in, k, r0, r1, shared, sram_floats, sg, lane);
     inv_out = inv;
     const uint active_tids = ((k + 63u) & ~63u) >> 3u;
-    if (tid < active_tids) {
-        float4 even = float4(0.0f), odd = float4(0.0f);
-        if (c + 8u <= k) {
-            float4 ne, no;
-            norm8<N>::load(in.norm, in.norm_stride, c, ne, no);
-            const float4 e = float4(r0.x, r0.z, r1.x, r1.z) * inv * ne;
-            const float4 o = float4(r0.y, r0.w, r1.y, r1.w) * inv * no;
-            PROJECTION_UNROLL
-            for (uint i = 0; i < 4; ++i) {
-                even[i] = A::round(e[i]);
-                odd[i] = A::round(o[i]);
-            }
-        } else if (c < k) {
-            const float raw_v[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
-            float out_v[8];
-            PROJECTION_UNROLL
-            for (uint j = 0; j < 8; ++j) {
-                out_v[j] = (c + j < k)
-                    ? A::round(raw_v[j] * inv * element::at<N>(in.norm, ulong(c + j) * in.norm_stride))
-                    : 0.0f;
-            }
-            even = float4(out_v[0], out_v[2], out_v[4], out_v[6]);
-            odd = float4(out_v[1], out_v[3], out_v[5], out_v[7]);
-        }
-        if constexpr (PUBLISH) {
-            if (publish_rows && c < k) {
-                if (pub_stride1 == 1ul && (pub_stride0 & 7ul) == 0ul && c + 8u <= k) {
-                    pub_out.put8(ulong(c), even, odd);
-                } else {
+    if (tid < 256u) {
+        PROJECTION_UNROLL
+        for (uint ch = 0u; ch < 2u; ++ch) {
+            const uint slot = ch * 256u + tid;
+            if (slot < active_tids) {
+                const uint c = slot * 8u;
+                float4 even = float4(0.0f), odd = float4(0.0f);
+                if (c + 8u <= k) {
+                    ordered_norm8_regs(in, c, inv, r0[ch], r1[ch], even, odd);
+                } else if (c < k) {
+                    const float raw_v[8] = {
+                        r0[ch].x, r0[ch].y, r0[ch].z, r0[ch].w, r1[ch].x, r1[ch].y, r1[ch].z, r1[ch].w};
+                    float out_v[8];
+                    PROJECTION_UNROLL
                     for (uint j = 0; j < 8; ++j) {
-                        if (c + j < k) {
-                            const float val = (j & 1u) != 0u ? odd[j >> 1u] : even[j >> 1u];
-                            pub_out.put(ulong(c + j) * pub_stride1, val);
+                        out_v[j] = (c + j < k)
+                            ? A::round(raw_v[j] * inv * element::at<N>(in.norm, ulong(c + j) * in.norm_stride))
+                            : 0.0f;
+                    }
+                    even = float4(out_v[0], out_v[2], out_v[4], out_v[6]);
+                    odd = float4(out_v[1], out_v[3], out_v[5], out_v[7]);
+                }
+                if constexpr (PUBLISH) {
+                    if (publish_rows && c < k) {
+                        if (pub_stride1 == 1ul && (pub_stride0 & 7ul) == 0ul && c + 8u <= k) {
+                            pub_out.put8(ulong(c), even, odd);
+                        } else {
+                            for (uint j = 0; j < 8; ++j) {
+                                if (c + j < k) {
+                                    const float val = (j & 1u) != 0u ? odd[j >> 1u] : even[j >> 1u];
+                                    pub_out.put(ulong(c + j) * pub_stride1, val);
+                                }
+                            }
                         }
                     }
                 }
+                float xv[8] = {even.x, odd.x, even.y, odd.y, even.z, odd.z, even.w, odd.w};
+                ordered_transpose8(xv, lane & 7u);
+                reinterpret_cast<threadgroup uint4 *>(shared)[slot] = A::pack8(
+                    float4(xv[0], xv[2], xv[4], xv[6]),
+                    float4(xv[1], xv[3], xv[5], xv[7]));
             }
         }
-        float xv[8] = {even.x, odd.x, even.y, odd.y, even.z, odd.z, even.w, odd.w};
-        ordered_transpose8(xv, lane & 7u);
-        reinterpret_cast<threadgroup uint4 *>(shared)[tid] = A::pack8(
-            float4(xv[0], xv[2], xv[4], xv[6]),
-            float4(xv[1], xv[3], xv[5], xv[7]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     return true;
@@ -808,40 +842,50 @@ inline bool ordered_stage_single_gemv_raw(thread const In &, uint, threadgroup u
 
 template <typename A, typename N, typename Rows, typename Out>
 inline float ordered_stage_row(thread const OrderedRms<A, N, Rows> &in, Out out, ulong out_stride, ulong col_stride,
-    uint row, uint m_rows, uint k, threadgroup float *scratch, uint sg, uint lane) {
+    uint row, uint m_rows, uint k, threadgroup float *scratch, uint sg, uint lane, uint scratch_floats = 8u) {
     if (row >= m_rows)
         return 0.0f;
     const uint tid = sg * 32u + lane;
-    if (k == in.columns && k > 0u && k <= 2048u && in.stride1 == 1ul) {
-        const uint c = tid * 8u;
-        float4 r0 = float4(0.0f), r1 = float4(0.0f);
-        in.preload_row_regs(row, c, r0, r1);
-        if (sg == 0u) {
-            const float inv0 = in.row_inverse_lane(row, lane < 8u, lane);
-            if (lane == 0u)
-                scratch[0] = inv0;
+    if (k == in.columns && k > 0u && k <= 8192u && in.stride1 == 1ul) {
+        float4 r0[4], r1[4];
+        PROJECTION_UNROLL
+        for (uint ch = 0u; ch < 4u; ++ch) {
+            r0[ch] = float4(0.0f);
+            r1[ch] = float4(0.0f);
+            const uint c = (ch * 256u + tid) * 8u;
+            if (c < k)
+                in.preload_row_regs(row, c, r0[ch], r1[ch]);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float inv = scratch[0];
-        if (c < k) {
-            if (col_stride == 1ul && (out_stride & 7ul) == 0ul && c + 8u <= k) {
-                float4 ne, no;
-                norm8<N>::load(in.norm, in.norm_stride, c, ne, no);
-                const float4 e = float4(r0.x, r0.z, r1.x, r1.z) * inv * ne;
-                const float4 o = float4(r0.y, r0.w, r1.y, r1.w) * inv * no;
-                float4 even, odd;
-                PROJECTION_UNROLL
-                for (uint i = 0; i < 4; ++i) {
-                    even[i] = A::round(e[i]);
-                    odd[i] = A::round(o[i]);
-                }
-                out.put8(ulong(row) * out_stride + ulong(c), even, odd);
-            } else {
-                const float raw_v[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
-                for (uint j = 0; j < 8u && c + j < k; ++j) {
-                    const float val = A::round(
-                        raw_v[j] * inv * element::at<N>(in.norm, ulong(c + j) * in.norm_stride));
-                    out.put(ulong(row) * out_stride + ulong(c + j) * col_stride, val);
+        float inv;
+        if (scratch_floats >= 256u) {
+            inv = ordered_preload_inverse<4u>(in, k, r0, r1, reinterpret_cast<threadgroup uchar *>(scratch),
+                scratch_floats, sg, lane);
+        } else {
+            if (sg == 0u) {
+                const float inv0 = in.row_inverse_lane(row, lane < 8u, lane);
+                if (lane == 0u)
+                    scratch[0] = inv0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            inv = scratch[0];
+        }
+        const bool fast_put = (col_stride == 1ul && (out_stride & 7ul) == 0ul);
+        PROJECTION_UNROLL
+        for (uint ch = 0u; ch < 4u; ++ch) {
+            const uint c = (ch * 256u + tid) * 8u;
+            if (c < k) {
+                if (fast_put && c + 8u <= k) {
+                    float4 even, odd;
+                    ordered_norm8_regs(in, c, inv, r0[ch], r1[ch], even, odd);
+                    out.put8(ulong(row) * out_stride + ulong(c), even, odd);
+                } else {
+                    const float raw_v[8] = {
+                        r0[ch].x, r0[ch].y, r0[ch].z, r0[ch].w, r1[ch].x, r1[ch].y, r1[ch].z, r1[ch].w};
+                    for (uint j = 0; j < 8u && c + j < k; ++j) {
+                        const float val = A::round(
+                            raw_v[j] * inv * element::at<N>(in.norm, ulong(c + j) * in.norm_stride));
+                        out.put(ulong(row) * out_stride + ulong(c + j) * col_stride, val);
+                    }
                 }
             }
         }
@@ -867,7 +911,7 @@ inline float ordered_stage_row(thread const OrderedRms<A, N, Rows> &in, Out out,
 
 template <typename A, typename N, typename Rows, uint PARTS, typename Out>
 inline float ordered_stage_row(thread const OrderedSummed<A, N, Rows, PARTS> &in, Out out, ulong out_stride,
-    ulong col_stride, uint row, uint m_rows, uint k, threadgroup float *, uint sg, uint lane) {
+    ulong col_stride, uint row, uint m_rows, uint k, threadgroup float *, uint sg, uint lane, uint = 8u) {
     if (row >= m_rows)
         return 0.0f;
     const uint tid = sg * 32u + lane;
