@@ -63,7 +63,17 @@ pub fn summary(step: &Step, previous_device_end: Option<f64>) -> Result<Value, S
         .sum();
     Ok(json!({
         "submissions": step.submissions.len(),
-        "launches": step.submissions.iter().map(|submission| submission.launches.len()).sum::<usize>(),
+        "launches": step
+            .submissions
+            .iter()
+            .map(|submission| {
+                submission
+                    .launches
+                    .iter()
+                    .filter(|launch| launch.geometry.is_some())
+                    .count()
+            })
+            .sum::<usize>(),
         "host_before_first_encode_ms": (first.encode_start - step.start) * MS,
         "host_encode_ms": encode * MS,
         "host_submit_span_ms": (last.committed - first.encode_start) * MS,

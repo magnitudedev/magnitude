@@ -172,22 +172,12 @@ pub struct SealedNodeShape {
     /// Whether a call parks (`CallSchema::parks`), so a park node precedes
     /// it.
     parks: bool,
-    /// What a graph recording the node holds of it: every launch it
-    /// declares, active or not, with its arguments in its backend's layout.
-    census: GraphCensus,
 }
 
 impl SealedNodeShape {
     pub fn of(schema: &CallSchema, implementation: &NativeImplementation) -> Self {
         let arguments = super::abi::buffer_slots(schema, implementation) - 2;
         let words = super::abi::native_word_count(schema, implementation);
-        let launch_arguments = argument_bytes(implementation.backend, arguments as u64, 8 * words as u64);
-        let census = implementation
-            .launches
-            .iter()
-            .map(|_| GraphCensus::launch(launch_arguments))
-            .try_fold(GraphCensus::default(), GraphCensus::plus)
-            .expect("a node's launch census fits u64");
         let conditions = implementation.launches.iter().map(|l| l.conditions.len()).sum();
         Self {
             buffers: sealed_buffers(schema, implementation),
@@ -195,9 +185,14 @@ impl SealedNodeShape {
             words,
             launches: implementation.launches.len(),
             conditions,
-            census,
             parks: schema.parks(),
         }
+    }
+
+    fn launch_census(&self, backend: BackendName, active_launches: u64) -> GraphCensus {
+        GraphCensus::launch(argument_bytes(backend, self.arguments as u64, 8 * self.words as u64))
+            .times(active_launches)
+            .expect("a node's launch census fits u64")
     }
 }
 
@@ -1036,13 +1031,17 @@ impl NativeGraphDraft {
             let (kernel, _, shape) = &mut shaped[producer];
             shape.words[super::abi::emitted_word(kernel.schema(), kernel.implementation(), emitted)] = word;
         }
-        let recorded = recorded_census(
-            shaped
-                .iter()
-                .map(|(kernel, _, _)| SealedNodeShape::of(kernel.schema(), kernel.implementation()).census),
-            &self.timelines,
-            super::backend_name(&self.device.kind),
-        );
+        let backend = super::backend_name(&self.device.kind);
+        let launches = shaped
+            .iter()
+            .map(|(kernel, _, shape)| {
+                let active = shape.launches.geometry.iter().filter(|g| g.is_some()).count() as u64;
+                SealedNodeShape::of(kernel.schema(), kernel.implementation())
+                    .launch_census(backend, active)
+            })
+            .try_fold(GraphCensus::default(), GraphCensus::plus)
+            .expect("a graph's launch census fits u64");
+        let recorded = recorded_census(backend, shaped.len(), launches, &self.timelines, &self.marks);
         let storage = if let Some(layout) = &self.layout {
             layout
                 .storage_for(&self.ports, &planned, &links, &results, &self.exports, &self.stores)
@@ -1098,7 +1097,6 @@ impl NativeGraphDraft {
         } else {
             Arc::new(candidate)
         };
-        let backend = super::backend_name(&self.device.kind);
         self.device.native.register_plan_key(backend, shape.keyed(backend));
         Ok(NativeGraphPlan {
             identity,
@@ -1153,9 +1151,9 @@ pub struct NativeGraphMetadataDraft {
     carries: Vec<Carry>,
     timelines: Vec<(usize, TimelineNode)>,
     marks: Vec<usize>,
-    /// Per node on CUDA, the active-launch bound at its enqueued dimensions
-    /// (`cuda_recorded_census`), empty on other backends.
-    cuda_launches: Vec<u64>,
+    /// Per node, the active-launch bitmask at its enqueued dimensions
+    /// ([`recorded_census`]).
+    active_launches: Vec<u64>,
 }
 
 /// A Seismic placement for a dominating graph class. Exact graphs with the
@@ -1478,14 +1476,14 @@ pub fn recorded_census_of(
     nodes: &[(usize, usize, usize)],
     timelines: &[TimelineNode],
 ) -> GraphCensus {
-    let mut shapes = nodes.iter().map(|&(arguments, words, launches)| {
-        let launch_arguments = argument_bytes(backend, arguments as u64, 8 * words as u64);
-        (0..launches)
-            .map(|_| GraphCensus::launch(launch_arguments))
-            .try_fold(GraphCensus::default(), GraphCensus::plus)
-            .expect("a node's launch census fits u64")
-    });
-    let launches = shapes
+    let launches = nodes
+        .iter()
+        .map(|&(arguments, words, launches)| {
+            let launch_arguments = argument_bytes(backend, arguments as u64, 8 * words as u64);
+            GraphCensus::launch(launch_arguments)
+                .times(launches as u64)
+                .expect("a node's launch census fits u64")
+        })
         .try_fold(GraphCensus::default(), GraphCensus::plus)
         .expect("a graph's launch census fits u64");
     let (graphs, held) = match backend {
@@ -1632,26 +1630,43 @@ pub fn topology_heap_of(
     )
 }
 
-fn cuda_recorded_census_sum(
+/// What recording one run of a graph takes on `backend`, given the summed
+/// active-launch census `launches` across its `nodes` nodes:
+/// - On CUDA: one graph when `nodes > 0`, with a node for each active
+///   launch, each span mark inside `(1..nodes)`, and the nodes of each
+///   timeline node inside `(1..nodes)` (`cuda::timeline_nodes`), matching
+///   [`NativeGraphPlan::run_graphs`] exactly.
+/// - On Vulkan, Metal and CPU: one graph plus one per timeline boundary,
+///   holding only the active launches and their argument bytes.
+fn recorded_census(
+    backend: BackendName,
     nodes: usize,
-    launches: u64,
+    launches: GraphCensus,
     timelines: &[(usize, TimelineNode)],
     marks: &[usize],
 ) -> GraphCensus {
-    let timelines = timelines
-        .iter()
-        .filter(|(position, _)| (1..nodes).contains(position))
-        .map(|&(_, node)| super::cuda::timeline_nodes(node))
-        .sum::<u64>();
-    let held_marks = marks
-        .iter()
-        .filter(|mark| (1..nodes).contains(mark))
-        .count() as u64;
-    GraphCensus {
-        graphs: u64::from(nodes > 0),
-        launches: launches + held_marks + timelines,
-        arguments: 0,
-        largest: 0,
+    match backend {
+        BackendName::Cuda => {
+            let held_timelines = timelines
+                .iter()
+                .filter(|(position, _)| (1..nodes).contains(position))
+                .map(|&(_, node)| super::cuda::timeline_nodes(node))
+                .sum::<u64>();
+            let held_marks = marks
+                .iter()
+                .filter(|mark| (1..nodes).contains(mark))
+                .count() as u64;
+            GraphCensus {
+                graphs: u64::from(nodes > 0),
+                launches: launches.launches + held_marks + held_timelines,
+                arguments: 0,
+                largest: 0,
+            }
+        }
+        BackendName::Vulkan | BackendName::Metal | BackendName::Cpu => GraphCensus {
+            graphs: 1 + timelines.len() as u64,
+            ..launches
+        },
     }
 }
 
@@ -1665,20 +1680,11 @@ pub fn cuda_recorded_census(
     timelines: &[(usize, TimelineNode)],
     marks: &[usize],
 ) -> GraphCensus {
-    let launches = node_launches.iter().copied().sum::<u64>();
-    cuda_recorded_census_sum(nodes, launches, timelines, marks)
-}
-
-fn recorded_census(shapes: impl IntoIterator<Item = GraphCensus>, timelines: &[(usize, TimelineNode)], backend: BackendName) -> GraphCensus {
-    let launches = shapes
-        .into_iter()
-        .try_fold(GraphCensus::default(), GraphCensus::plus)
-        .expect("a graph's launch census fits u64");
-    let (graphs, held) = match backend {
-        BackendName::Cuda => (0, timelines.iter().map(|&(_, node)| super::cuda::timeline_nodes(node)).sum()),
-        BackendName::Vulkan | BackendName::Metal | BackendName::Cpu => (timelines.len() as u64, 0),
+    let launches = GraphCensus {
+        launches: node_launches.iter().copied().sum::<u64>(),
+        ..GraphCensus::default()
     };
-    GraphCensus { graphs: 1 + graphs, launches: launches.launches + held, ..launches }
+    recorded_census(BackendName::Cuda, nodes, launches, timelines, marks)
 }
 
 impl NativeGraphMetadataDraft {
@@ -1697,7 +1703,7 @@ impl NativeGraphMetadataDraft {
             carries: Vec::new(),
             timelines: Vec::new(),
             marks: Vec::new(),
-            cuda_launches: Vec::new(),
+            active_launches: Vec::new(),
         }
     }
 
@@ -1821,7 +1827,7 @@ impl NativeGraphMetadataDraft {
         scratch: Vec<ScratchNeed>,
         activation: Option<RepresentationId>,
         shape: SealedNodeShape,
-        cuda_launches: Option<u64>,
+        active_launches: Option<u64>,
     ) -> Result<PendingWorkflowResults, CallError> {
         let node = u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
         validate_node_references(self.identity, self.ports.len(), node, &args)
@@ -1845,10 +1851,8 @@ impl NativeGraphMetadataDraft {
             })
             .collect::<Result<Vec<_>, CallError>>()?;
         let count = u32::try_from(results.len()).expect("native result ordinal exhausted");
-        if self.backend == BackendName::Cuda {
-            let default_mask = if shape.launches >= 64 { u64::MAX } else { (1u64 << shape.launches) - 1 };
-            self.cuda_launches.push(cuda_launches.unwrap_or(default_mask));
-        }
+        let default_mask = if shape.launches >= 64 { u64::MAX } else { (1u64 << shape.launches) - 1 };
+        self.active_launches.push(active_launches.unwrap_or(default_mask));
         self.nodes.push(PlannedNode { args: Arc::new(args), scratch, activation, condition: None, share: None });
         self.entries.push(entry);
         self.shapes.push(shape);
@@ -1873,11 +1877,11 @@ impl NativeGraphMetadataDraft {
         scratch: Vec<ScratchNeed>,
         activation: Option<RepresentationId>,
         shape: SealedNodeShape,
-        cuda_launches: Option<u64>,
+        active_launches: Option<u64>,
         condition: NodeCondition,
     ) -> Result<PendingWorkflowResults, CallError> {
         let port = condition_port(self.identity, &self.ports, self.nodes.len(), condition).map_err(CallError::Workflow)?;
-        let pending = self.enqueue(entry, args, parameter_shapes, result_shapes, scratch, activation, shape, cuda_launches)?;
+        let pending = self.enqueue(entry, args, parameter_shapes, result_shapes, scratch, activation, shape, active_launches)?;
         self.nodes.last_mut().expect("the node just enqueued").condition = Some((port, condition.index, condition.encoded));
         Ok(pending)
     }
@@ -1945,19 +1949,23 @@ impl NativeGraphMetadataDraft {
         })
     }
 
-    /// What recording one run of this graph takes ([`recorded_census`], or
-    /// [`cuda_recorded_census`] on CUDA).
+    /// What recording one run of this graph takes when each node makes the
+    /// launches in `masks` ([`recorded_census`]).
+    fn recorded_for(&self, masks: &[u64]) -> GraphCensus {
+        debug_assert_eq!(masks.len(), self.shapes.len());
+        let launches = self
+            .shapes
+            .iter()
+            .zip(masks)
+            .map(|(shape, &mask)| shape.launch_census(self.backend, u64::from(mask.count_ones())))
+            .try_fold(GraphCensus::default(), GraphCensus::plus)
+            .expect("a graph's launch census fits u64");
+        recorded_census(self.backend, self.nodes.len(), launches, &self.timelines, &self.marks)
+    }
+
+    /// What recording one run of this graph takes ([`recorded_census`]).
     fn recorded(&self) -> GraphCensus {
-        match self.backend {
-            BackendName::Cuda => {
-                debug_assert_eq!(self.cuda_launches.len(), self.nodes.len());
-                let counts: Vec<u64> = self.cuda_launches.iter().map(|&m| u64::from(m.count_ones())).collect();
-                cuda_recorded_census(self.nodes.len(), &counts, &self.timelines, &self.marks)
-            }
-            BackendName::Vulkan | BackendName::Metal | BackendName::Cpu => {
-                recorded_census(self.shapes.iter().map(|shape| shape.census), &self.timelines, self.backend)
-            }
-        }
+        self.recorded_for(&self.active_launches)
     }
 
     /// Verify an exact checked metadata graph against the storage certificate
@@ -2143,8 +2151,7 @@ impl ValidatedMetadataDraft {
             .iter()
             .map(|node| node.scratch.clone())
             .collect();
-        let mut cuda_launches: Option<Vec<u64>> = (validated.draft.backend == BackendName::Cuda)
-            .then(|| validated.draft.cuda_launches.clone());
+        let mut active_launches = validated.draft.active_launches.clone();
 
         for draft in iter {
             let links = draft.validate_topology()?;
@@ -2184,16 +2191,14 @@ impl ValidatedMetadataDraft {
                     cap.bytes = cap.bytes.max(need.bytes);
                 }
             }
-            if let Some(launches) = &mut cuda_launches {
-                if launches.len() != draft.cuda_launches.len() {
-                    return Err(topology());
-                }
-                for (cap, &active) in launches.iter_mut().zip(&draft.cuda_launches) {
-                    *cap |= active;
-                }
+            if active_launches.len() != draft.active_launches.len() {
+                return Err(topology());
+            }
+            for (cap, &active) in active_launches.iter_mut().zip(&draft.active_launches) {
+                *cap |= active;
             }
         }
-        validated.capacity_layout(&ports, &results, scratch, cuda_launches.as_deref())
+        validated.capacity_layout(&ports, &results, scratch, Some(&active_launches))
     }
 
     /// Place this validated topology once with every buffer at its supplied
@@ -2206,19 +2211,11 @@ impl ValidatedMetadataDraft {
         ports: &[u64],
         results: &[Vec<u64>],
         scratch: Vec<Vec<ScratchNeed>>,
-        cuda_launches: Option<&[u64]>,
+        active_launches: Option<&[u64]>,
     ) -> Result<NativeGraphLayout, WorkflowError> {
         let (ports, nodes, results) = self.at_capacities(ports, results, scratch)?;
-        let recorded = match cuda_launches {
-            Some(masks) => {
-                let counts: Vec<u64> = masks.iter().map(|&m| u64::from(m.count_ones())).collect();
-                cuda_recorded_census(
-                    self.draft.nodes.len(),
-                    &counts,
-                    &self.draft.timelines,
-                    &self.draft.marks,
-                )
-            }
+        let recorded = match active_launches {
+            Some(masks) => self.draft.recorded_for(masks),
             None => self.census,
         };
         Ok(make_layout(
@@ -2243,20 +2240,12 @@ impl ValidatedMetadataDraft {
         ports: &[u64],
         results: &[Vec<u64>],
         scratch: Vec<Vec<ScratchNeed>>,
-        cuda_launches: Option<&[u64]>,
+        active_launches: Option<&[u64]>,
     ) -> Result<NativeGraphStorageBytes, WorkflowError> {
         let (ports, nodes, results) = self.at_capacities(ports, results, scratch)?;
         let storage = plan_storage(&ports, &nodes, &self.links, &results, &self.draft.exports, &self.draft.stores);
-        let recorded = match cuda_launches {
-            Some(masks) => {
-                let counts: Vec<u64> = masks.iter().map(|&m| u64::from(m.count_ones())).collect();
-                cuda_recorded_census(
-                    self.draft.nodes.len(),
-                    &counts,
-                    &self.draft.timelines,
-                    &self.draft.marks,
-                )
-            }
+        let recorded = match active_launches {
+            Some(masks) => self.draft.recorded_for(masks),
             None => self.census,
         };
         Ok(NativeGraphStorageBytes {
@@ -5095,16 +5084,20 @@ impl NativeGraphPlan {
     /// mark it holds and the nodes of each timeline node inside it
     /// (`cuda::timeline_nodes`), exactly what `cuda::record_run` makes,
     /// none of a launched plan, whose runs launch call by call
-    /// ([`NativeGraphDraft::seal_launched`]); elsewhere what recording its
-    /// run takes at most ([`Self::recorded`]).
+    /// ([`NativeGraphDraft::seal_launched`]); elsewhere its recorded
+    /// active-launch census ([`Self::recorded`]).
     fn run_graphs(&self, form: &[u64]) -> GraphCensus {
         if !self.graphed() {
             return GraphCensus::default();
         }
         match super::backend_name(&self.device.kind) {
             BackendName::Cuda => {
-                let launches = form.iter().map(|word| u64::from(word.count_ones())).sum::<u64>();
-                cuda_recorded_census_sum(
+                let launches = GraphCensus {
+                    launches: form.iter().map(|word| u64::from(word.count_ones())).sum::<u64>(),
+                    ..GraphCensus::default()
+                };
+                recorded_census(
+                    BackendName::Cuda,
                     self.topology.nodes.len(),
                     launches,
                     &self.topology.timelines,
@@ -7265,6 +7258,84 @@ mod layout_certificate_tests {
                 bytes: 128,
                 capacity: 64,
             }))
+        );
+    }
+
+    #[test]
+    fn non_cuda_recorded_census_counts_only_active_launches() {
+        let f32s = seismic_lang::registry::representation("f32").unwrap();
+        let shape = SealedNodeShape {
+            buffers: 2,
+            arguments: 2,
+            words: 4,
+            launches: 4,
+            conditions: 0,
+            parks: false,
+        };
+        let build = |backend: BackendName, active_mask: Option<u64>| {
+            let mut draft = NativeGraphMetadataDraft::new(backend);
+            let input = draft.port(f32s, &[4], false, false).unwrap();
+            let mut args = EncodedWorkflowArgs::new();
+            args.push_result_tensor(input.reference);
+            let mut pending = draft
+                .enqueue(
+                    "routed",
+                    args,
+                    vec![Some((f32s, vec![4]))],
+                    vec![Some((f32s, vec![4]))],
+                    Vec::new(),
+                    None,
+                    shape.clone(),
+                    active_mask,
+                )
+                .unwrap();
+            draft.export(pending.take()).unwrap();
+            draft
+        };
+
+        // Metal: 1 active launch out of 4 declared -> launches == 1, not 4.
+        let metal_single = build(BackendName::Metal, Some(0b0010)).seal().unwrap();
+        assert_eq!(
+            metal_single.recorded,
+            GraphCensus { graphs: 1, launches: 1, arguments: 0, largest: 0 }
+        );
+
+        // Metal certify_group: union of 0b0001 and 0b0100 -> 2 active launches, not 4.
+        let metal_group = ValidatedMetadataDraft::certify_group([
+            build(BackendName::Metal, Some(0b0001)),
+            build(BackendName::Metal, Some(0b0100)),
+        ])
+        .unwrap();
+        assert_eq!(
+            metal_group.storage_bytes().recorded,
+            GraphCensus { graphs: 1, launches: 2, arguments: 0, largest: 0 }
+        );
+
+        // Vulkan: 2 active launches out of 4 declared -> 2 launches and 2x argument_bytes.
+        let arg_bytes = argument_bytes(BackendName::Vulkan, 2, 8 * 4);
+        let vulkan = build(BackendName::Vulkan, Some(0b1010)).seal().unwrap();
+        assert_eq!(
+            vulkan.recorded,
+            GraphCensus {
+                graphs: 1,
+                launches: 2,
+                arguments: 2 * arg_bytes,
+                largest: arg_bytes,
+            }
+        );
+
+        // Zero active launches (all branches inactive): 0 launches, 0 arguments, 0 largest.
+        let none_active = build(BackendName::Vulkan, Some(0)).seal().unwrap();
+        assert_eq!(
+            none_active.recorded,
+            GraphCensus { graphs: 1, launches: 0, arguments: 0, largest: 0 }
+        );
+
+        // CPU: None mask falls back to all declared launches (4).
+        let cpu_all = build(BackendName::Cpu, None).seal().unwrap();
+        assert_eq!(
+            cpu_all.recorded,
+            GraphCensus { graphs: 1, launches: 4, arguments: 0, largest: 0 }
         );
     }
 }
