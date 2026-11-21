@@ -210,6 +210,21 @@ struct Residual {
         void store(uint n, float value) const {
             y.put(ulong(n) * stride1, residual[ulong(n) * residual1] + A::round(value));
         }
+        // Columns n .. n + 3: one vector load and store on unit strides.
+        void store4(uint n, float4 values) const {
+            float4 rounded;
+            PROJECTION_UNROLL
+            for (uint i = 0; i < 4; ++i)
+                rounded[i] = A::round(values[i]);
+            if (stride1 == 1 && residual1 == 1) {
+                const float4 from = float4(*reinterpret_cast<device const packed_float4 *>(residual + n));
+                y.put4(n, from + rounded);
+                return;
+            }
+            PROJECTION_UNROLL
+            for (uint i = 0; i < 4; ++i)
+                y.put(ulong(n + i) * stride1, residual[ulong(n + i) * residual1] + rounded[i]);
+        }
         // Columns n .. n + 7 from their sums as (even, odd): two vector
         // loads and stores on unit strides.
         void store8(uint n, float4 even, float4 odd) const {
@@ -285,12 +300,103 @@ struct Scatter {
                 y.put(ulong(d * width + n) * stride1, mixed + rounded * inject[d]);
             }
         }
+        void store4_with(uint n, float4 rounded, thread const float (&inj)[STREAMS],
+            thread const float (&comb)[COMBED ? STREAMS * STREAMS : 1]) const {
+            if constexpr (!COMBED) {
+                if (stride1 == 1 && residual1 == 1) {
+                    PROJECTION_UNROLL
+                    for (uint s = 0; s < STREAMS; ++s) {
+                        const ulong column = ulong(s) * width + n;
+                        const float4 base = float4(*reinterpret_cast<device const packed_float4 *>(residual + column));
+                        y.put4(column, base + rounded * inj[s]);
+                    }
+                    return;
+                }
+                PROJECTION_UNROLL
+                for (uint s = 0; s < STREAMS; ++s) {
+                    const ulong base_col = ulong(s) * width + n;
+                    PROJECTION_UNROLL
+                    for (uint i = 0; i < 4; ++i) {
+                        const ulong column = base_col + i;
+                        y.put(column * stride1, residual[column * residual1] + rounded[i] * inj[s]);
+                    }
+                }
+            } else {
+                if (stride1 == 1 && residual1 == 1) {
+                    float4 streams[STREAMS];
+                    PROJECTION_UNROLL
+                    for (uint s = 0; s < STREAMS; ++s) {
+                        streams[s] = float4(*reinterpret_cast<device const packed_float4 *>(
+                            residual + ulong(s) * width + n));
+                    }
+                    PROJECTION_UNROLL
+                    for (uint d = 0; d < STREAMS; ++d) {
+                        float4 mixed = float4(0.0f);
+                        PROJECTION_UNROLL
+                        for (uint s = 0; s < STREAMS; ++s) {
+                            mixed = mixed + comb[s * STREAMS + d] * streams[s];
+                        }
+                        y.put4(ulong(d) * width + n, mixed + rounded * inj[d]);
+                    }
+                    return;
+                }
+                PROJECTION_UNROLL
+                for (uint i = 0; i < 4; ++i) {
+                    float streams[STREAMS];
+                    PROJECTION_UNROLL
+                    for (uint s = 0; s < STREAMS; ++s) {
+                        streams[s] = residual[(ulong(s) * width + n + i) * residual1];
+                    }
+                    PROJECTION_UNROLL
+                    for (uint d = 0; d < STREAMS; ++d) {
+                        float mixed = 0.0f;
+                        PROJECTION_UNROLL
+                        for (uint s = 0; s < STREAMS; ++s) {
+                            mixed = mixed + comb[s * STREAMS + d] * streams[s];
+                        }
+                        y.put((ulong(d) * width + n + i) * stride1, mixed + rounded[i] * inj[d]);
+                    }
+                }
+            }
+        }
+        void store4(uint n, float4 values) const {
+            float4 rounded;
+            PROJECTION_UNROLL
+            for (uint i = 0; i < 4; ++i)
+                rounded[i] = A::round(values[i]);
+            float inj[STREAMS];
+            PROJECTION_UNROLL
+            for (uint s = 0; s < STREAMS; ++s)
+                inj[s] = inject[s];
+            float comb[COMBED ? STREAMS * STREAMS : 1];
+            if constexpr (COMBED) {
+                device const float *comb_ptr = inject + STREAMS;
+                PROJECTION_UNROLL
+                for (uint i = 0; i < STREAMS * STREAMS; ++i)
+                    comb[i] = comb_ptr[i];
+            }
+            store4_with(n, rounded, inj, comb);
+        }
         void store8(uint n, float4 even, float4 odd) const {
+            float4 low = float4(even.x, odd.x, even.y, odd.y), high = float4(even.z, odd.z, even.w, odd.w);
             PROJECTION_UNROLL
             for (uint i = 0; i < 4; ++i) {
-                store(n + 2u * i, even[i]);
-                store(n + 2u * i + 1u, odd[i]);
+                low[i] = A::round(low[i]);
+                high[i] = A::round(high[i]);
             }
+            float inj[STREAMS];
+            PROJECTION_UNROLL
+            for (uint s = 0; s < STREAMS; ++s)
+                inj[s] = inject[s];
+            float comb[COMBED ? STREAMS * STREAMS : 1];
+            if constexpr (COMBED) {
+                device const float *comb_ptr = inject + STREAMS;
+                PROJECTION_UNROLL
+                for (uint i = 0; i < STREAMS * STREAMS; ++i)
+                    comb[i] = comb_ptr[i];
+            }
+            store4_with(n, low, inj, comb);
+            store4_with(n + 4u, high, inj, comb);
         }
     };
     Row row(uint m) const {

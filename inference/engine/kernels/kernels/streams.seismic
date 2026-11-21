@@ -440,17 +440,18 @@ native stream_collapse for cpu from "cpu/stream_collapse.rs":
 
 # Metal, CUDA and Vulkan: the projection library's output join
 # (`projection::OutputOf`, the `Scatter` of every output entry's join;
-# Vulkan's `join_scatter`) over the F32 rows, one thread per column of a row.
+# Vulkan's `join_scatter`) over the F32 rows: four columns per thread on
+# Metal and CUDA, one thread per column on Vulkan.
 native stream_join for metal from "metal/stream_join.metal":
     static (H, SN, IN)
     launch stream_join:
-        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threadgroups (ceil_div(M * ceil_div(H, 4), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native stream_join for cuda from "cuda/stream_join.cu":
     static (H, SN, IN)
     launch stream_join:
-        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threadgroups (ceil_div(M * ceil_div(H, 4), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native stream_join for vulkan from "vulkan/stream_join.comp":
