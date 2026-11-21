@@ -1698,9 +1698,18 @@ impl Directory {
     /// held one's expert leaving the bank. The pool shrinks by the host
     /// records claimed now ([`Self::resize_pool`]). Whether the group holds
     /// the records its scratch lies in ([`Self::leased`]).
-    pub fn lease(&mut self, lender: usize, scratch_group: ScratchGroup) -> bool {
+    pub fn lease(&mut self, lender: usize, scratch_group: ScratchGroup, may_evict: bool, copy: Option<&mut dyn FnMut(u32, u32)>) -> bool {
         let before = self.host[lender].claimed();
-        self.host[lender].lease(scratch_group);
+        if !self.host[lender].leased() {
+            let tier = self.host_tier();
+            if copy.is_some() && self.host[lender].capacity() > 0 {
+                let reuse = Reuse::of(&self.ranking);
+                let rank = store_rank(reuse.ranker(lender, tier, Reader::Move), &self.prompt_reads);
+                self.host[lender].lease(scratch_group, rank, may_evict, copy);
+            } else {
+                self.host[lender].lease(scratch_group, |_, _| 0u64, false, None);
+            }
+        }
         if self.host[lender].claimed() != before {
             self.resize_pool(lender);
         }

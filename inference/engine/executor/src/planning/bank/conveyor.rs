@@ -62,8 +62,9 @@ impl ConveyorCarrier {
 
 /// Where each staging pool's conveyor lies: `records` records of its stored
 /// form at `offsets[pool]` bytes into the lender's lent records of its
-/// routed tensor's carrier (`RecordForm::carrier`), the pools one tensor
-/// carries laid end to end, the conveyors in each reaching `bytes` of it
+/// routed tensor's carrier (`RecordForm::carrier`), all pools one tensor
+/// carries sharing the same bytes from offset 0 (like [`ScratchLayout`]),
+/// the conveyors in each reaching `bytes` of it
 /// (`BankStructure::conveyor_layout`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConveyorLayout {
@@ -359,21 +360,14 @@ impl BankStructure<'_> {
     }
 
     /// Records of each stored form's conveyor (`V` of `routed_round`,
-    /// [`ExpertBankPlan::conveyor`]): beside a host tier, a whole layer's
-    /// experts, record `e` holding expert `e` of a layer, so every cold
-    /// expert of a layer is read at once (the tier's records are plentiful
-    /// host RAM); on the one store, whose records are the bank's slots, two
-    /// rounds' records, all that is converted or landing at once, so a
-    /// round's reads land while the device converts the round before and a
-    /// record frees once its round is past (Metal's 4k prefill rose from 424
-    /// to 448 tok/s at 6.89 GB with it, its records the bank's); at most the
-    /// widest layer's experts, all a layer ever reads.
+    /// [`ExpertBankPlan::conveyor`]): two rounds' records, all that is
+    /// converted or landing at once, bounded by `window_slots`, uniformly
+    /// across both unified memory and discrete hosts (so a round's reads land
+    /// while the device converts the round before and a record frees once its
+    /// round is past, without stealing hundreds of cached experts from the
+    /// host tier).
     pub(super) fn conveyor_records(self) -> u64 {
-        let widest = self.widest();
-        match self.host {
-            HostTier::Linked => widest,
-            HostTier::Unified(_) => (2 * self.round_records()).min(widest),
-        }
+        (2 * self.round_records()).min(self.window_slots)
     }
 
     /// The bank's lending ([`Lending`]), or why its conveyor or its scratch
@@ -457,9 +451,10 @@ impl BankStructure<'_> {
 
     /// Where each staging pool's conveyor of `records` records lies in the
     /// lender's lent records of its tensor's carrier (`RecordForm::carrier`),
-    /// and the bytes the conveyors each carrier holds reach: those pools end
-    /// to end, each `records` records of its stored form, from the first
-    /// place past the last that its layout's alignment admits.
+    /// and the bytes the conveyors each carrier holds reach: all pools carried
+    /// by the same tensor share one region from offset 0 (aligned for each
+    /// pool), reaching the largest pool's `records` records, mirroring
+    /// [`Self::scratch`].
     pub(super) fn conveyor_layout(self, pools: &[StagingPool], records: u64) -> Result<ConveyorLayout, String> {
         let mut offsets = vec![0u64; pools.len()];
         let form = self.form();
@@ -469,13 +464,14 @@ impl BankStructure<'_> {
                 let (_, alignment) =
                     seismic::Tensor::canonical_layout(pool.source, &[records, pool.matrix[0], pool.matrix[1]])
                         .map_err(|error| format!("{} conveyor: {error}", pool.source.name()))?;
-                let offset = bytes.next_multiple_of(alignment.max(1));
+                let offset = 0u64.next_multiple_of(alignment.max(1));
                 offsets[index] = offset;
-                bytes = pool
+                let end = pool
                     .record_bytes()?
                     .checked_mul(records)
                     .and_then(|conveyor| conveyor.checked_add(offset))
                     .ok_or_else(|| format!("{} conveyor bytes overflow", pool.source.name()))?;
+                bytes = bytes.max(end);
             }
             Ok::<_, String>(bytes)
         })?;

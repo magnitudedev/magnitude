@@ -634,18 +634,6 @@ fn a_hit_the_layer_befores_seeding_evicts_is_read() {
     }
 }
 
-/// Layers sharing any pool share a conveyor form: a Q4_K_M model's
-/// layers share gate and up pools while their down pools alternate.
-#[test]
-fn layers_sharing_a_pool_share_conveyor_records() {
-    assert_eq!(conveyor_forms(4, &[vec![0, 1, 2], vec![0, 1, 3], vec![0, 1, 2]]), [0, 0, 0]);
-    assert_eq!(conveyor_forms(6, &[vec![0, 1, 2], vec![3, 4, 5], vec![0, 1, 2]]), [0, 1, 0]);
-    // Joined through a third layer.
-    assert_eq!(conveyor_forms(5, &[vec![0, 1, 2], vec![3, 1, 4], vec![3, 3, 4]]), [0, 0, 0]);
-    // Up-only records: two routed tensors each.
-    assert_eq!(conveyor_forms(3, &[vec![0, 1], vec![2, 1]]), [0, 0]);
-}
-
 /// The size rule: the fewest steps whose compute covers every layer's
 /// stage, within the capacity; to capacity until every layer's compute is
 /// measured and its lines priced.

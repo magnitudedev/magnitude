@@ -419,41 +419,6 @@ fn compose_rounds(cold: &[usize], borrowers: &[Option<usize>], round_records: us
     composed
 }
 
-/// Each layer's conveyor form, of layers whose routed tensors read the
-/// pools `layers` names (of `pools`): the class of layers sharing a pool
-/// with it, directly or through others. Record `e` of a pool holds one
-/// layer's expert `e` at a time, so layers that share any pool share its
-/// records: a Q4_K_M layer's gate and up pools are those of layers whose
-/// down pools differ.
-pub(super) fn conveyor_forms(pools: usize, layers: &[Vec<usize>]) -> Vec<usize> {
-    let mut root = (0..pools).collect::<Vec<_>>();
-    fn find(root: &mut [usize], pool: usize) -> usize {
-        let mut at = pool;
-        while root[at] != at {
-            root[at] = root[root[at]];
-            at = root[at];
-        }
-        at
-    }
-    for layer in layers {
-        for &pool in &layer[1..] {
-            let (a, b) = (find(&mut root, layer[0]), find(&mut root, pool));
-            root[a] = b;
-        }
-    }
-    let mut forms: Vec<usize> = Vec::new();
-    layers
-        .iter()
-        .map(|layer| {
-            let class = find(&mut root, layer[0]);
-            forms.iter().position(|&form| form == class).unwrap_or_else(|| {
-                forms.push(class);
-                forms.len() - 1
-            })
-        })
-        .collect()
-}
-
 /// Fail step `sequence`'s scratch requests: the failure is recorded, then
 /// published in every lane of its slot not yet answered at every streamed
 /// layer, the request's and each round's (the last round's among them,
@@ -976,11 +941,10 @@ impl Scratch {
         let knee = core.table.source().knee();
         for index in 0..self.tiers.len() {
             let layer = self.tiers[index].layer;
-            // What the earlier tiers of the layer's form still lack: their
-            // experts not yet read, a conveyor record each.
+            // What the earlier tiers still lack: their experts not yet read, a
+            // conveyor record each (all staging pools share one conveyor).
             let lack_read = self.tiers[..index]
                 .iter()
-                .filter(|tier| self.conveyor.shares_form(tier.layer, layer))
                 .map(|tier| tier.deferred_experts().filter(|&(_, expert)| !self.waits(core, tier, expert)).count())
                 .sum::<usize>();
             let free_conveyor = |conveyor: &Conveyor, core: &Core| {
@@ -1018,14 +982,15 @@ impl Scratch {
                     Some(slot) => self.conveyor.slot_record(slot),
                     None => {
                         let mut records = free_conveyor(&self.conveyor, core);
-                        if records.is_empty() && lack_read == 0 {
+                        while records.is_empty() && lack_read == 0 {
                             let holds = |state: &State| {
-                                matches!(*state, State::Held { record } if self.conveyor.slot_of(record).is_none() && Self::admits_conveyor(&self.conveyor, core, layer, record))
+                                matches!(*state, State::Held { record } if self.conveyor.slot_of(record).is_none())
                             };
-                            if let Some((at, other)) = self.latest_after(index, set_idx, expert, holds) {
-                                self.yield_record(at, other);
-                                records = free_conveyor(&self.conveyor, core);
-                            }
+                            let Some((at, other)) = self.latest_after(index, set_idx, expert, holds) else {
+                                break;
+                            };
+                            self.yield_record(at, other);
+                            records = free_conveyor(&self.conveyor, core);
                         }
                         if records.is_empty() {
                             if let Some(record) = self.conveyor.landing_only_record(layer, |record| Self::admits_conveyor(&self.conveyor, core, layer, record)) {
@@ -1295,17 +1260,15 @@ impl Scratch {
         landed.len()
     }
 
-    /// Of the experts of tier `index`'s form, from that tier on, that the
-    /// device needs after its `(set_idx, expert)` and that hold a record
-    /// `holds` accepts, the one it needs last: its tier's index and expert.
+    /// Of the experts from tier `index` on that the device needs after its
+    /// `(set_idx, expert)` and that hold a record `holds` accepts, the one it
+    /// needs last: its tier's index and expert.
     fn latest_after(&self, index: usize, set_idx: usize, expert: usize, holds: impl Fn(&State) -> bool) -> Option<(usize, usize)> {
-        let layer = self.tiers[index].layer;
         let after = (index, self.tiers[index].order(set_idx, expert));
         self.tiers
             .iter()
             .enumerate()
             .skip(index)
-            .filter(|(_, tier)| self.conveyor.shares_form(tier.layer, layer))
             .flat_map(|(at, tier)| {
                 (0..tier.group_routes.len()).map(move |other| {
                     let order = match tier.active_set(other) {
@@ -1348,7 +1311,23 @@ impl Scratch {
     /// lands in it.
     fn lease(&mut self, core: &mut Core) {
         let serving = self.conveyor.serving.expect("the conveyor leases for the group it serves");
-        core.directory.lease(self.conveyor.lending().group, serving.group);
+        let lender = self.conveyor.lending().group;
+        // Evicting a colder kept record past the lent zone is safe only before
+        // any tier of this group has taken a hit or a cut-in step has begun.
+        let may_evict = self.tiers.is_empty();
+        let tier = core.groups[lender].tier.as_deref();
+        let mut copy_fn = |src: u32, dst: u32| {
+            if let Some(tensors) = tier {
+                for tensor in tensors {
+                    // SAFETY: `src` is an unheld kept record (read-only), `dst`
+                    // is ready (or freshly unmapped past every earlier piece,
+                    // unheld), and `src != dst`.
+                    unsafe { tensor.records.copy_record(u64::from(src), u64::from(dst)) };
+                }
+            }
+        };
+        let copy = tier.is_some().then_some(&mut copy_fn as &mut dyn FnMut(u32, u32));
+        core.directory.lease(lender, serving.group, may_evict, copy);
     }
 
     /// Whether the group served holds every record the scratch lies in (on

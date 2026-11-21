@@ -1258,10 +1258,24 @@ impl HostRecords {
             return Vec::new();
         }
         let need = (self.reserve + self.pool).saturating_sub(self.reserved());
-        self.taking_order(&rank, true, Some(need), |record| (!lending || record >= self.lent) && self.unheld(record))
-            .into_iter()
-            .map(|record| (record, self.records[record as usize].whole().expect("a record in taking order keeps an expert").staged))
-            .collect()
+        let mut order = (0..self.extent())
+            .filter(|&record| (!lending || record >= self.lent) && self.unheld(record))
+            .filter_map(|record| {
+                let (kept, key, staged) = match self.records[record as usize] {
+                    Host::Answering(Whole { staged, kept, read, .. }, _) => taking(kept, staged, read, &rank),
+                    _ => self.place(record, &rank)?,
+                };
+                // Prefer evicting from `0..self.lent` when ranks tie so the
+                // lent zone naturally stays cold between prefills.
+                Some(((kept, key, record >= self.lent, staged), record, staged))
+            })
+            .collect::<Vec<_>>();
+        if need < order.len() {
+            order.select_nth_unstable(need);
+            order.truncate(need);
+        }
+        order.sort_unstable();
+        order.into_iter().map(|(_, record, staged)| (record, staged)).collect()
     }
 
     /// Whether the reserve's records ([`Self::reserved`]), with `unmapped`
@@ -1643,40 +1657,120 @@ impl HostRecords {
         self.set(record, content.with(Whole { kept: Kept::Banked, ..whole }));
     }
 
-    /// Claim lent record `record` for scratch group `scratch_group`: claimed
-    /// already, or ready, it is claimed; kept and not held (no copy reads
-    /// it), its expert is unmapped from the group's first step on (the group
-    /// runs after every step that read it, before any read lands in it) and
-    /// it is claimed; otherwise (graced, landing, held, or an outstanding
-    /// answer) it waits. Whether the group holds it. A record past the lent
-    /// ones is an invariant violation.
-    fn claim_record(&mut self, record: u32, scratch_group: ScratchGroup) -> bool {
-        assert!(record < self.lent, "record {record} lies past the {} lent", self.lent);
-        match self.records[record as usize] {
-            Host::Claimed => true,
-            Host::Ready => {
-                self.set(record, Host::Claimed);
-                true
-            }
-            Host::Kept(Whole { holds: 0, .. }) => {
-                let staged = self.unkeep(record);
-                self.unmap_from(staged, record, Some(scratch_group.into()));
-                self.set(record, Host::Claimed);
-                true
-            }
-            Host::Kept(_) | Host::Answering(..) | Host::Graced { .. } | Host::Landing { .. } | Host::Seeding { .. } | Host::WritingBack { .. } => false,
-            Host::Absent => unreachable!("lent record {record} is a hole: the floor holds every lent record"),
+    /// Relocate unheld kept record `src` (`< self.lent`) into ready record
+    /// `dst` (`>= self.lent`) after its bytes were copied there, claiming
+    /// `src` for `scratch_group` without releasing the expert from `inbound`
+    /// or `lacking`.
+    fn relocate(&mut self, src: u32, dst: u32, scratch_group: ScratchGroup) {
+        assert!(src < self.lent, "relocate source {src} lies past the {} lent", self.lent);
+        assert!(dst >= self.lent, "relocate destination {dst} lies inside the {} lent", self.lent);
+        assert_eq!(self.records[dst as usize], Host::Ready, "relocate destination {dst} is not ready");
+        let Host::Kept(whole) = self.records[src as usize] else {
+            panic!("relocate source {src} is not an unheld kept record: {:?}", self.records[src as usize]);
+        };
+        assert_eq!(whole.holds, 0, "relocate source {src} is held by a copy");
+        let from = MapStep::from(scratch_group);
+        if let Some(map) = &self.maps[whole.staged.0] {
+            map.map_from(whole.staged.1, dst, from);
         }
+        assert!(self.ready.remove(&dst), "relocate destination {dst} is listed ready");
+        self.records[src as usize] = Host::Claimed;
+        self.claimed += 1;
+        self.records[dst as usize] = Host::Kept(Whole { from, ..whole });
+        let previous = self.kept.insert(whole.staged, dst);
+        assert_eq!(previous, Some(src), "{:?} was kept in {src}", whole.staged);
+        if whole.kept == Kept::Banked {
+            assert!(self.banked.remove(&src), "banked record {src} is listed banked");
+            assert!(self.banked.insert(dst), "relocate destination {dst} is listed banked once");
+        }
+        self.unprepare();
     }
 
     /// Grant scratch group `scratch_group` its lease, record by record:
-    /// claim each lent record it does not yet hold ([`Self::claim_record`]),
-    /// each a claim of its own, nothing once it holds them all. Whether it
-    /// holds the whole lease ([`Self::leased`]).
-    pub fn lease(&mut self, scratch_group: ScratchGroup) -> bool {
-        if !self.leased() {
-            for record in 0..self.lent {
-                self.claim_record(record, scratch_group);
+    /// claim each lent record it does not yet hold, relocating hot kept
+    /// experts out of `0..self.lent` into `self.lent..` (first into ready
+    /// records, then—when `may_evict`—evicting strictly colder unheld kept
+    /// records at `rank`) whenever `copy` provides host-accessible backing,
+    /// before claiming each lent record. Whether it holds the whole lease
+    /// ([`Self::leased`]).
+    pub fn lease<K: Ord + Copy>(
+        &mut self,
+        scratch_group: ScratchGroup,
+        rank: impl Rank<K>,
+        may_evict: bool,
+        mut copy: Option<&mut dyn FnMut(u32, u32)>,
+    ) -> bool {
+        if self.leased() {
+            return true;
+        }
+        let mut kept_in_lent = Vec::new();
+        for record in 0..self.lent {
+            match self.records[record as usize] {
+                Host::Claimed => {}
+                Host::Ready => self.set(record, Host::Claimed),
+                Host::Kept(Whole { staged, kept, read, holds: 0, .. }) => {
+                    kept_in_lent.push(((kept, rank(staged, read)), record));
+                }
+                Host::Kept(_)
+                | Host::Answering(..)
+                | Host::Graced { .. }
+                | Host::Landing { .. }
+                | Host::Seeding { .. }
+                | Host::WritingBack { .. } => {}
+                Host::Absent => unreachable!("lent record {record} is a hole: the floor holds every lent record"),
+            }
+        }
+        if let Some(copy_fn) = copy.as_deref_mut().filter(|_| !kept_in_lent.is_empty()) {
+            // Process hottest first so ready slots and coldest victims go to
+            // the most valuable experts, with at most one copy per expert.
+            kept_in_lent.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let mut idx = 0;
+            while idx < kept_in_lent.len() {
+                let Some(&dst) = self.ready.range(self.lent..).next() else {
+                    break;
+                };
+                let src = kept_in_lent[idx].1;
+                copy_fn(src, dst);
+                self.relocate(src, dst, scratch_group);
+                idx += 1;
+            }
+            let remaining = kept_in_lent.len() - idx;
+            if remaining > 0 && may_evict {
+                let mut victims = (self.lent..self.extent())
+                    .filter_map(|dst| match self.records[dst as usize] {
+                        Host::Kept(Whole { staged, kept, read, holds: 0, .. }) => {
+                            Some(((kept, rank(staged, read)), staged, dst))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if remaining < victims.len() {
+                    victims.select_nth_unstable_by(remaining, |a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                    victims.truncate(remaining);
+                }
+                victims.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                for (victim_rank, victim_staged, dst) in victims {
+                    let (hot_rank, src) = kept_in_lent[idx];
+                    if victim_rank >= hot_rank {
+                        break;
+                    }
+                    self.unmap_from(victim_staged, dst, Some(scratch_group.into()));
+                    self.set(dst, Host::Ready);
+                    copy_fn(src, dst);
+                    self.relocate(src, dst, scratch_group);
+                    idx += 1;
+                }
+            }
+            for &(_, record) in &kept_in_lent[idx..] {
+                let staged = self.unkeep(record);
+                self.unmap_from(staged, record, Some(scratch_group.into()));
+                self.set(record, Host::Claimed);
+            }
+        } else {
+            for (_, record) in kept_in_lent {
+                let staged = self.unkeep(record);
+                self.unmap_from(staged, record, Some(scratch_group.into()));
+                self.set(record, Host::Claimed);
             }
         }
         self.leased()
@@ -2493,7 +2587,7 @@ mod tests {
         }
         assert_eq!(tier.lacked(), 0, "every expert is kept");
         assert!(tier.complete() && !tier.settled(), "one is kept in the lent record");
-        assert!(tier.claim_record(0, ScratchGroup::at(10, 1)), "a scratch group's claim takes it");
+        assert!(tier.lease(ScratchGroup::at(10, 1), |_, _| 0u64, false, None), "a scratch group's claim takes it");
         assert_eq!(tier.lacked(), 1, "and its expert is absent");
     }
 
@@ -2502,7 +2596,7 @@ mod tests {
         /// it.
         fn claim_record_of_lent_free(&mut self) -> bool {
             self.lent = 1;
-            let claimed = self.claim_record(0, ScratchGroup::at(5, 1));
+            let claimed = self.lease(ScratchGroup::at(5, 1), |_, _| 0u64, false, None);
             self.lent = 0;
             claimed
         }
@@ -2704,5 +2798,89 @@ mod tests {
         assert_eq!(views[2].from(3), 7, "from step 7, not from step 11, the first not yet begun");
         tier.grant_of((0, 3), 0).expect("a ready record").map();
         assert_eq!(views[0].from(3), 8, "step 7 resolved layer 0");
+    }
+
+    /// `lease()` relocates a hot expert out of `0..self.lent` into a `Ready`
+    /// slot in `self.lent..` instead of evicting it, copying its bytes and
+    /// updating its map entry from the scratch group's first step.
+    #[test]
+    fn lease_relocates_hot_expert_into_ready_slot_past_lent() {
+        let steps = Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
+        steps.begin_through(5);
+        let group_start = steps.begin_group(2, None);
+        let scratch_group = ScratchGroup::at(group_start, 2);
+        // 4 records total, bottom 2 lent (`0..2`), 2 past lent (`2..4`).
+        let (mut tier, maps) = mapped_on(steps.clone(), 4, 1, &[(0, EXPERTS)], Resolution::BeforeStamp);
+        tier.lent = 2;
+        let Maps::Stamped(views) = maps else { unreachable!() };
+        // Place expert 7 in lent record 0 (hot, last read at step 5).
+        tier.keep(0, (0, 7));
+        let mut copied = Vec::new();
+        let mut copy_fn = |src: u32, dst: u32| copied.push((src, dst));
+        assert!(tier.lease(scratch_group, |_, _| Some(5u64), true, Some(&mut copy_fn)));
+        assert_eq!(copied, vec![(0, 2)], "hot expert in lent record 0 copied to ready record 2");
+        assert!(tier.is_claimed(0) && tier.is_claimed(1), "both lent records claimed");
+        assert_eq!(tier.kept_record((0, 7)), Some(2), "expert 7 kept in record 2");
+        assert_eq!(views[0].resolve(7, group_start), Some(2), "map resolves expert 7 to record 2 for the prompt group");
+    }
+
+    /// When no `Ready` slot exists past `self.lent`, `lease()` with
+    /// `may_evict = true` relocates a hot expert out of `0..self.lent` by
+    /// evicting a strictly colder `Host::Kept` slot in `self.lent..`, and
+    /// leaves strictly hotter slots in `self.lent..` untouched.
+    #[test]
+    fn lease_relocates_hot_expert_by_evicting_colder_slot_past_lent() {
+        let steps = Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
+        steps.begin_through(20);
+        let group_start = steps.begin_group(2, None);
+        let scratch_group = ScratchGroup::at(group_start, 2);
+        // 4 records total, bottom 2 lent (`0..2`), 2 past lent (`2..4`).
+        let (mut tier, maps) = mapped_on(steps.clone(), 4, 1, &[(0, EXPERTS)], Resolution::BeforeStamp);
+        tier.lent = 2;
+        let Maps::Stamped(views) = maps else { unreachable!() };
+        // Lent zone: record 0 = cold (rank 1), record 1 = very hot (rank 100).
+        // Past lent: record 2 = colder (rank 10), record 3 = hotter (rank 50).
+        tier.keep(0, (0, 10));
+        tier.keep(1, (0, 11));
+        tier.keep(2, (0, 12));
+        tier.keep(3, (0, 13));
+        let rank = |staged: Staged, _: Option<Step>| match staged.1 {
+            10 => 1u64,
+            11 => 100u64,
+            12 => 10u64,
+            13 => 50u64,
+            _ => 0u64,
+        };
+        let mut copied = Vec::new();
+        let mut copy_fn = |src: u32, dst: u32| copied.push((src, dst));
+        assert!(tier.lease(scratch_group, rank, true, Some(&mut copy_fn)));
+        // Only record 1 (expert 11, rank 100) relocates, evicting record 2 (expert 12, rank 10).
+        // Record 0 (expert 10, rank 1) is colder than record 3 (rank 50), so it is evicted without copy.
+        assert_eq!(copied, vec![(1, 2)]);
+        assert_eq!(tier.kept_record((0, 11)), Some(2), "hot expert 11 relocated to record 2");
+        assert_eq!(tier.kept_record((0, 13)), Some(3), "warm expert 13 preserved in record 3");
+        assert_eq!(tier.kept_record((0, 12)), None, "colder expert 12 evicted");
+        assert_eq!(tier.kept_record((0, 10)), None, "coldest expert 10 evicted");
+        assert_eq!(views[0].resolve(11, group_start), Some(2));
+        assert_eq!(views[0].resolve(12, group_start), None);
+        assert_eq!(views[0].resolve(10, group_start), None);
+        assert!(tier.is_claimed(0) && tier.is_claimed(1));
+    }
+
+    /// `refill_victims` breaks ties by preferring records in `0..self.lent` so
+    /// the lent zone stays cold between prefills.
+    #[test]
+    fn refill_victims_prefers_lent_zone_on_tied_ranks() {
+        let inbound = Arc::new(InboundTable::new(&[EXPERTS]));
+        let mut tier = HostRecords::new(4, 1, vec![(0, EXPERTS, None)], Resolution::AfterStore, (2, 1), inbound);
+        // Fill all 4 records with tied rank; expert indices intentionally higher
+        // in `0..lent` to prove `record < self.lent` beats `staged` tie-break.
+        tier.keep(0, (0, 30));
+        tier.keep(1, (0, 31));
+        tier.keep(2, (0, 1));
+        tier.keep(3, (0, 2));
+        let victims = tier.refill_victims(|_, _| 10u64, false);
+        assert_eq!(victims.len(), 1);
+        assert!(victims[0].0 < 2, "tied victim chosen from 0..lent, got record {}", victims[0].0);
     }
 }

@@ -177,7 +177,7 @@ fn a_prompt_group_is_lent_its_bank_records_and_returns_them_free() {
     directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
     assert_eq!(directory.held(0, 0), Some(0));
     // Records 0 and 1 are lent: 0 holds layer 0's 0, which leaves.
-    assert!(directory.lease(0, crate::experts::watcher::ScratchGroup::at(2, 1)), "every lent record is free or held, so leased at once");
+    assert!(directory.lease(0, crate::experts::watcher::ScratchGroup::at(2, 1), false, None), "every lent record is free or held, so leased at once");
     assert_eq!(directory.held(0, 0), None);
     assert!((0..2).all(|record| directory.bank.records(0)[record] == Record::Lent { from: 2 }));
     directory.read_pending(1, 3, 2);
@@ -1228,7 +1228,7 @@ fn a_lease_shrinks_the_pool_only_while_a_prompt_group_holds_it() {
     let mut directory = lending_store();
     let pool = |directory: &Directory| directory.reuse_now().records(0);
     assert_eq!(pool(&directory), records - reserve, "no lend held: the records less the reserve");
-    assert!(directory.lease(0, prompt_of(at(1000, 0))), "every lent record is ready, so leased at once");
+    assert!(directory.lease(0, prompt_of(at(1000, 0)), false, None), "every lent record is ready, so leased at once");
     let host = directory.host(0);
     assert_eq!((host.claimed(), host.capacity()), (lent, records - reserve - lent), "the lease held");
     assert_eq!(pool(&directory), records - lent - reserve, "present - claimed - reserve");
@@ -1247,7 +1247,7 @@ fn a_lease_shrinks_the_pool_only_while_a_prompt_group_holds_it() {
 fn seeds_fill_no_layer_past_the_capacity_a_lend_leaves() {
     let (records, (lent, reserve), layers, experts) = LENDING;
     let mut directory = lending_store();
-    assert!(directory.lease(0, prompt_of(at(1000, 0))), "every lent record is ready, so leased at once");
+    assert!(directory.lease(0, prompt_of(at(1000, 0)), false, None), "every lent record is ready, so leased at once");
     let available = records as usize - lent as usize - reserve;
     let routed = (0..experts as usize).map(|expert| (expert, 1, 1000)).collect::<Vec<(usize, u32, Step)>>();
     let mut seeded = 0usize;

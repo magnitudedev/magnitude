@@ -658,6 +658,12 @@ impl From<&Unbegun> for MapStep {
     }
 }
 
+impl From<ScratchGroup> for MapStep {
+    fn from(group: ScratchGroup) -> Self {
+        Self(group.first)
+    }
+}
+
 impl From<MapFrom> for MapStep {
     fn from(MapFrom(step): MapFrom) -> Self {
         Self(step)
