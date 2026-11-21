@@ -4,7 +4,7 @@
 use crate::error::UnloadCause;
 use crate::execution::{LoadPricing, load_measures};
 use crate::census::AllocationCensus;
-use magnitude_executor::ProgramFamily;
+use magnitude_executor::{ExpertCover, ProgramFamily};
 use magnitude_generation::Method;
 use magnitude_scheduler::{
     owner::{AdmissionError, Owner, Ran},
@@ -15,19 +15,26 @@ use magnitude_scheduler::{
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
+#[derive(Default)]
+enum WatchState {
+    #[default]
+    Empty,
+    Waiting(Waker),
+    Ready(AllocationCensus),
+}
+
 /// The census the owner counted last and the session has not sent yet:
 /// published by the owner as its count changes after a run, taken by the
 /// session, which sends it to the host. Pushed on change, never sampled.
 #[derive(Default)]
 pub(crate) struct CensusWatch {
-    state: Mutex<(Option<AllocationCensus>, Option<Waker>)>,
+    state: Mutex<WatchState>,
 }
 
 impl CensusWatch {
     fn publish(&self, counted: AllocationCensus) {
-        let mut state = self.state.lock().unwrap();
-        state.0 = Some(counted);
-        if let Some(waker) = state.1.take() {
+        let prev = std::mem::replace(&mut *self.state.lock().unwrap(), WatchState::Ready(counted));
+        if let WatchState::Waiting(waker) = prev {
             waker.wake();
         }
     }
@@ -36,11 +43,13 @@ impl CensusWatch {
     /// once one is.
     pub(crate) fn take(&self, waker: &Waker) -> Option<AllocationCensus> {
         let mut state = self.state.lock().unwrap();
-        let counted = state.0.take();
-        if counted.is_none() {
-            state.1 = Some(waker.clone());
+        match std::mem::replace(&mut *state, WatchState::Empty) {
+            WatchState::Ready(counted) => Some(counted),
+            WatchState::Empty | WatchState::Waiting(_) => {
+                *state = WatchState::Waiting(waker.clone());
+                None
+            }
         }
-        counted
     }
 }
 
@@ -50,37 +59,41 @@ enum Execution<F: ProgramFamily> {
     /// Every request has been terminated with the cause; the in-flight group
     /// finishes, then `Stopped`.
     Draining(Owner<F>, UnloadCause),
-    Stopped(UnloadCause),
+    Stopped {
+        cause: UnloadCause,
+        /// The owner whose execution stopped, what it owed settled: it drops
+        /// after the stop is announced, so a worker process's end, which needs
+        /// none of its teardown, can answer first and cut that teardown short.
+        ended: Option<Owner<F>>,
+    },
+}
+
+/// The census last counted and the `Owner::census_key` it was counted at:
+/// nothing it counts changes while the key stands, and readings never move it.
+struct CountedCensus {
+    key: (u64, Option<ExpertCover>),
+    census: AllocationCensus,
 }
 
 pub(crate) struct ExecutionOwner<F: ProgramFamily> {
     execution: Execution<F>,
-    /// The owner whose execution stopped, what it owed settled: it drops
-    /// after the stop is announced, so a worker process's end, which needs
-    /// none of its teardown, can answer first and cut that teardown short.
-    ended: Option<Owner<F>>,
     method: Arc<dyn Method>,
     /// What prices the load, which prices it again, measuring nothing,
     /// once the service stores new measurement records.
     pricing: LoadPricing,
     /// Where the census goes as it changes, and what it was last.
     census: Arc<CensusWatch>,
-    counted: Option<AllocationCensus>,
-    /// What the census was last counted at (`Owner::census_key`): nothing
-    /// it counts changes while it stands, and readings never move it.
-    counted_at: Option<(u64, Option<magnitude_executor::ExpertCover>)>,
+    last_census: Option<CountedCensus>,
 }
 
 impl<F: ProgramFamily> ExecutionOwner<F> {
     pub fn new(owner: Owner<F>, method: Arc<dyn Method>, pricing: LoadPricing, census: Arc<CensusWatch>) -> Self {
         Self {
             execution: Execution::Serving(owner),
-            ended: None,
             method,
             pricing,
             census,
-            counted: None,
-            counted_at: None,
+            last_census: None,
         }
     }
 
@@ -89,15 +102,14 @@ impl<F: ProgramFamily> ExecutionOwner<F> {
     /// moved since then (`Owner::census_key`).
     fn count(&mut self, owner: &Owner<F>) -> Result<(), String> {
         let key = owner.census_key();
-        if self.counted_at == Some(key) {
+        if self.last_census.as_ref().is_some_and(|last| last.key == key) {
             return Ok(());
         }
-        self.counted_at = Some(key);
-        let counted = AllocationCensus { stores: owner.store_allocations(), serving: owner.serving_census()? };
-        if self.counted.as_ref() != Some(&counted) {
-            self.counted = Some(counted.clone());
-            self.census.publish(counted);
+        let census = AllocationCensus { stores: owner.store_allocations(), serving: owner.serving_census()? };
+        if self.last_census.as_ref().map(|last| &last.census) != Some(&census) {
+            self.census.publish(census.clone());
         }
+        self.last_census = Some(CountedCensus { key, census });
         Ok(())
     }
 
@@ -106,9 +118,12 @@ impl<F: ProgramFamily> ExecutionOwner<F> {
     fn take(&mut self) -> Execution<F> {
         std::mem::replace(
             &mut self.execution,
-            Execution::Stopped(UnloadCause::Internal {
-                reason: "execution transition interrupted".into(),
-            }),
+            Execution::Stopped {
+                cause: UnloadCause::Internal {
+                    reason: "execution transition interrupted".into(),
+                },
+                ended: None,
+            },
         )
     }
 }
@@ -145,7 +160,7 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                         },
                     )
                 }
-                Execution::Draining(_, cause) | Execution::Stopped(cause) => {
+                Execution::Draining(_, cause) | Execution::Stopped { cause, .. } => {
                     Ok(WorkerReply::AdmissionRefused(unloaded(cause)))
                 }
             },
@@ -161,16 +176,16 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                 Execution::Serving(owner) | Execution::Draining(owner, _) => {
                     owner.snapshot(request)
                 }
-                Execution::Stopped(_) => None,
+                Execution::Stopped { .. } => None,
             })),
             WorkerCommand::Observe => match &self.execution {
                 Execution::Serving(owner) | Execution::Draining(owner, _) => owner.observe(),
-                Execution::Stopped(cause) => Err(format!("execution stopped: {cause}")),
+                Execution::Stopped { cause, .. } => Err(format!("execution stopped: {cause}")),
             },
             WorkerCommand::ClaimMeasurementRoom { bytes } => Ok(WorkerReply::MeasurementRoom(match &mut self.execution {
                 Execution::Serving(owner) => owner.claim_measurement_room(bytes),
                 // An ending model holds no claim; its end answers the host.
-                Execution::Draining(..) | Execution::Stopped(_) => RoomGrant::released(),
+                Execution::Draining(..) | Execution::Stopped { .. } => RoomGrant::released(),
             })),
             WorkerCommand::AttachMeasurementProcess { process } => {
                 if let Execution::Serving(owner) | Execution::Draining(owner, _) = &mut self.execution {
@@ -183,7 +198,7 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                     // The costs the load planned on, found pending again, end it.
                     Execution::Serving(owner) => owner.measure_load(load_measures(&self.pricing)?),
                     // An ending model has nothing left to price.
-                    Execution::Draining(..) | Execution::Stopped(_) => {}
+                    Execution::Draining(..) | Execution::Stopped { .. } => {}
                 }
                 Ok(WorkerReply::Acknowledged)
             }
@@ -198,7 +213,7 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                 Execution::Serving(owner) | Execution::Draining(owner, _) => {
                     owner.publication_wake(request, wake)
                 }
-                Execution::Stopped(_) => {}
+                Execution::Stopped { .. } => {}
             },
             Event::ReleaseMeasurementRoom => {
                 if let Execution::Serving(owner) | Execution::Draining(owner, _) = &mut self.execution {
@@ -207,7 +222,7 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
             }
             Event::Cancel(request) => match &mut self.execution {
                 Execution::Serving(owner) | Execution::Draining(owner, _) => owner.cancel(request),
-                Execution::Stopped(_) => {}
+                Execution::Stopped { .. } => {}
             },
             // The owner reads memory when it next runs: the reader marks the
             // pressure event it was woken for.
@@ -216,7 +231,7 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
             // it next runs.
             Event::Reread => match &mut self.execution {
                 Execution::Serving(owner) | Execution::Draining(owner, _) => owner.reread(),
-                Execution::Stopped(_) => {}
+                Execution::Stopped { .. } => {}
             },
             Event::Close => {
                 self.execution = match self.take() {
@@ -225,7 +240,7 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                         Execution::Draining(owner, UnloadCause::Shutdown)
                     }
                     draining @ Execution::Draining(..) => draining,
-                    stopped @ Execution::Stopped(_) => stopped,
+                    stopped @ Execution::Stopped { .. } => stopped,
                 }
             }
         }
@@ -243,14 +258,23 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                             self.execution = Execution::Serving(owner);
                             return Ok(reread);
                         }
-                        Err(reason) => self.execution = Execution::Stopped(UnloadCause::Internal { reason }),
+                        Err(reason) => {
+                            self.execution = Execution::Stopped {
+                                cause: UnloadCause::Internal { reason },
+                                ended: None,
+                            }
+                        }
                     },
-                    Err(error) => self.execution = Execution::Stopped(UnloadCause::from(&error)),
+                    Err(error) => {
+                        self.execution = Execution::Stopped {
+                            cause: UnloadCause::from(&error),
+                            ended: None,
+                        }
+                    }
                 },
                 Execution::Draining(owner, cause) => match owner.run(now) {
                     Ok((owner, Ran { in_flight: false, .. })) => {
-                        self.ended = Some(owner);
-                        self.execution = Execution::Stopped(cause)
+                        self.execution = Execution::Stopped { cause, ended: Some(owner) }
                     }
                     // A draining owner answers no shortage: its flight's end
                     // is all it waits for.
@@ -258,13 +282,18 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                         self.execution = Execution::Draining(owner, cause);
                         return Ok(Reread::Settled);
                     }
-                    Err(error) => self.execution = Execution::Stopped(UnloadCause::from(&error)),
+                    Err(error) => {
+                        self.execution = Execution::Stopped {
+                            cause: UnloadCause::from(&error),
+                            ended: None,
+                        }
+                    }
                 },
-                Execution::Stopped(cause) => {
+                Execution::Stopped { cause, ended } => {
                     // Before the stop is announced, every durable effect of
                     // the load is made (`magnitude_executor::settle`).
                     magnitude_executor::settle::settle();
-                    self.execution = Execution::Stopped(cause.clone());
+                    self.execution = Execution::Stopped { cause: cause.clone(), ended };
                     return Err(cause);
                 }
             }
