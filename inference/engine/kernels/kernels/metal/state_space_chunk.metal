@@ -57,6 +57,14 @@ inline device const float *staged(device const float *inputs, long row) {
     return inputs + ulong(row) * INPUT_WIDTH;
 }
 
+// Inverts p = i * (i + 1) / 2 + j (0 <= j <= i) for the lower triangle.
+inline uint lower_triangle_row(uint pair) {
+    int i = int((metal::sqrt(float(8u * pair) + 1.25f) - 1.0f) * 0.5f);
+    if ((i + 1) * (i + 2) / 2 <= int(pair)) ++i;
+    if (i * (i + 1) / 2 > int(pair)) --i;
+    return uint(i);
+}
+
 // One row per threadgroup x, 256 of its B and C channels and step sizes per
 // threadgroup y. Rows no slot covers are no slot's input.
 kernel void state_space_chunk_inputs(STATE_SPACE_CHUNK_ARGUMENTS,
@@ -106,11 +114,9 @@ kernel void state_space_chunk_products(STATE_SPACE_CHUNK_ARGUMENTS,
     STATE_SPACE_UNROLL for (uint k = 0; k < SSC_OWNED; ++k) {
         // Pair p = i (i + 1) / 2 + j of the lower triangle.
         const uint pair = thread_index + 256 * k;
-        uint i = 0;
-        while ((i + 1) * (i + 2) / 2 <= pair)
-            ++i;
-        rows[k] = pair < SSC_PAIRS ? i : STATE_SPACE_PIECE;
-        columns[k] = pair - i * (i + 1) / 2;
+        const uint i = pair < SSC_PAIRS ? lower_triangle_row(pair) : STATE_SPACE_PIECE;
+        rows[k] = i;
+        columns[k] = pair < SSC_PAIRS ? pair - i * (i + 1) / 2 : 0;
         sums[k] = 0.0f;
     }
     for (uint base = 0; base < N; base += 32) {
@@ -122,8 +128,13 @@ kernel void state_space_chunk_products(STATE_SPACE_CHUNK_ARGUMENTS,
         threadgroup_barrier(mem_flags::mem_threadgroup);
         STATE_SPACE_UNROLL for (uint k = 0; k < SSC_OWNED; ++k) {
             if (rows[k] < count) {
-                for (uint n = 0; n < 32; ++n)
-                    sums[k] = metal::fma(c_rows[rows[k]][n], b_rows[columns[k]][n], sums[k]);
+                threadgroup const float *cr = c_rows[rows[k]];
+                threadgroup const float *br = b_rows[columns[k]];
+                float sum = sums[k];
+                STATE_SPACE_UNROLL for (uint n = 0; n < 32; ++n) {
+                    sum = metal::fma(cr[n], br[n], sum);
+                }
+                sums[k] = sum;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -138,14 +149,34 @@ kernel void state_space_chunk_products(STATE_SPACE_CHUNK_ARGUMENTS,
 // Threadgroup memory of the sequential advance: B and C rows, x rows, step
 // sizes and decays of a span.
 #define SSC_SEQUENTIAL_FLOATS (SSC_SPAN * (2 * SEISMIC_DIM_N + SEISMIC_TUNE_ROWS) + 2 * SSC_SPAN)
-// Of a piece: x rows, the weights (gamma_i / gamma_j) (C_i . B_j), the
-// cumulative log decays, gamma, the tail factors gamma_last / gamma_j, the
-// step sizes. Weight rows are padded so the lanes reading different rows at
-// one column hit different banks.
+// Of a piece: x rows, precomputed u = delta * x rows, the weights
+// (gamma_i / gamma_j) (C_i . B_j), the cumulative log decays, gamma, and the
+// tail factors gamma_last / gamma_j. Weight rows are padded so the lanes
+// reading different rows at one column hit different banks.
 #define SSC_WEIGHT_STRIDE (STATE_SPACE_PIECE + 1)
-#define SSC_PIECE_FLOATS (STATE_SPACE_PIECE * SEISMIC_TUNE_ROWS + STATE_SPACE_PIECE * SSC_WEIGHT_STRIDE \
-    + 4 * STATE_SPACE_PIECE)
-static_assert(SSC_PIECE_FLOATS <= SSC_SEQUENTIAL_FLOATS, "a piece's staging fits the sequential staging");
+#define SSC_PIECE_FLOATS (2 * STATE_SPACE_PIECE * SEISMIC_TUNE_ROWS + STATE_SPACE_PIECE * SSC_WEIGHT_STRIDE \
+    + 3 * STATE_SPACE_PIECE)
+#define SSC_SHARED_FLOATS (SSC_SEQUENTIAL_FLOATS > SSC_PIECE_FLOATS ? SSC_SEQUENTIAL_FLOATS : SSC_PIECE_FLOATS)
+static_assert(SSC_SHARED_FLOATS <= 8192, "staging fits in 32 KiB threadgroup memory");
+
+// Loads a lane's COLUMNS contiguous F32 elements using packed_float4 loads
+// when COLUMNS % 4 == 0 (4-byte aligned, safe for any device float pointer),
+// with exact scalar fallback.
+inline void load_columns(device const float *src, thread float (&dst)[COLUMNS]) {
+    if constexpr (COLUMNS % 4 == 0) {
+        STATE_SPACE_UNROLL for (uint j = 0; j < COLUMNS / 4; ++j) {
+            const float4 v = float4(*reinterpret_cast<device const packed_float4 *>(src + 4 * j));
+            dst[4 * j + 0] = v.x;
+            dst[4 * j + 1] = v.y;
+            dst[4 * j + 2] = v.z;
+            dst[4 * j + 3] = v.w;
+        }
+    } else {
+        STATE_SPACE_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+            dst[j] = src[j];
+        }
+    }
+}
 
 // Sums each of `values`' 32 elements over the simdgroup and leaves lane l
 // with element l's total. On Apple GPUs 32 hardware `simd_sum`s are about
@@ -172,18 +203,17 @@ inline void advance_piece(state_space::Operands in, device const float *inputs, 
     const long first = slot.lo + long(local) * STATE_SPACE_PIECE;
     const uint count = uint(metal::min(long(STATE_SPACE_PIECE), slot.stop - long(local) * STATE_SPACE_PIECE));
     threadgroup float *x_piece = shared;
-    threadgroup float *weights = x_piece + STATE_SPACE_PIECE * SEISMIC_TUNE_ROWS;
+    threadgroup float *u_piece = x_piece + STATE_SPACE_PIECE * SEISMIC_TUNE_ROWS;
+    threadgroup float *weights = u_piece + STATE_SPACE_PIECE * SEISMIC_TUNE_ROWS;
     threadgroup float *log_gamma = weights + STATE_SPACE_PIECE * SSC_WEIGHT_STRIDE;
     threadgroup float *gamma = log_gamma + STATE_SPACE_PIECE;
     threadgroup float *tail = gamma + STATE_SPACE_PIECE;
-    threadgroup float *delta = tail + STATE_SPACE_PIECE;
     for (uint item = thread_index; item < count * SEISMIC_TUNE_ROWS; item += threads) {
         const uint i = item / SEISMIC_TUNE_ROWS;
-        x_piece[item] = state_space::convolve(in, slot, first + long(i) - slot.lo,
+        const float value = state_space::convolve(in, slot, first + long(i) - slot.lo,
             head * P + block_row0 + item % SEISMIC_TUNE_ROWS);
-    }
-    for (uint i = thread_index; i < count; i += threads) {
-        delta[i] = staged(inputs, first + long(i))[state_space::INPUT_DELTA + head];
+        x_piece[item] = value;
+        u_piece[item] = staged(inputs, first + long(i))[state_space::INPUT_DELTA + head] * value;
     }
     if (thread_index == 0) {
         float sum = 0.0f;
@@ -195,11 +225,12 @@ inline void advance_piece(state_space::Operands in, device const float *inputs, 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const float *piece_products = products
         + (piece * state_space::G + g) * STATE_SPACE_PIECE * STATE_SPACE_PIECE;
-    for (uint item = thread_index; item < count * count; item += threads) {
-        const uint i = item / count;
-        const uint j = item % count;
-        weights[i * SSC_WEIGHT_STRIDE + j] = j <= i
-            ? metal::exp(log_gamma[i] - log_gamma[j]) * piece_products[i * STATE_SPACE_PIECE + j] : 0.0f;
+    const uint pairs = count * (count + 1) / 2;
+    for (uint pair = thread_index; pair < pairs; pair += threads) {
+        const uint i = lower_triangle_row(pair);
+        const uint j = pair - i * (i + 1) / 2;
+        weights[i * SSC_WEIGHT_STRIDE + j] =
+            metal::exp(log_gamma[i] - log_gamma[j]) * piece_products[i * STATE_SPACE_PIECE + j];
     }
     for (uint i = thread_index; i < count; i += threads) {
         gamma[i] = metal::exp(log_gamma[i]);
@@ -217,9 +248,7 @@ inline void advance_piece(state_space::Operands in, device const float *inputs, 
             const uint i = metal::min(i0 + k, count - 1);
             device const float *c = staged(inputs, first + long(i)) + state_space::INPUT_C + g * N + lane * COLUMNS;
             float cs[COLUMNS];
-            STATE_SPACE_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                cs[j] = c[j];
-            }
+            load_columns(c, cs);
             STATE_SPACE_UNROLL for (uint s = 0; s < SSC_LANE_ROWS; ++s) {
                 float sum = 0.0f;
                 STATE_SPACE_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
@@ -234,7 +263,7 @@ inline void advance_piece(state_space::Operands in, device const float *inputs, 
             float sum = 0.0f;
             for (uint j = 0; j <= i; ++j) {
                 sum = metal::fma(weights[i * SSC_WEIGHT_STRIDE + j],
-                    delta[j] * x_piece[j * SEISMIC_TUNE_ROWS + local_row + r], sum);
+                    u_piece[j * SEISMIC_TUNE_ROWS + local_row + r], sum);
             }
             const float value = x_piece[i * SEISMIC_TUNE_ROWS + local_row + r];
             const float output = metal::fma(skip, value, metal::fma(gamma[i], inter, sum));
@@ -252,11 +281,9 @@ inline void advance_piece(state_space::Operands in, device const float *inputs, 
     for (uint j = 0; j < count; ++j) {
         device const float *b = staged(inputs, first + long(j)) + state_space::INPUT_B + g * N + lane * COLUMNS;
         float bs[COLUMNS];
-        STATE_SPACE_UNROLL for (uint c = 0; c < COLUMNS; ++c) {
-            bs[c] = b[c];
-        }
+        load_columns(b, bs);
         STATE_SPACE_UNROLL for (uint s = 0; s < SSC_LANE_ROWS; ++s) {
-            const float coefficient = tail[j] * (delta[j] * x_piece[j * SEISMIC_TUNE_ROWS + local_row + s]);
+            const float coefficient = tail[j] * u_piece[j * SEISMIC_TUNE_ROWS + local_row + s];
             STATE_SPACE_UNROLL for (uint c = 0; c < COLUMNS; ++c) {
                 rows.values[s][c] = metal::fma(coefficient, bs[c], rows.values[s][c]);
             }
@@ -271,7 +298,7 @@ kernel void state_space_chunk_scan(STATE_SPACE_CHUNK_ARGUMENTS,
     uint3 threadgroup_shape [[threads_per_threadgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float shared[SSC_SEQUENTIAL_FLOATS];
+    threadgroup float shared[SSC_SHARED_FLOATS];
     STATE_SPACE_CHUNK_OPERANDS;
     const uint head = group.x;
     const ulong block_row0 = ulong(group.y) * SEISMIC_TUNE_ROWS;

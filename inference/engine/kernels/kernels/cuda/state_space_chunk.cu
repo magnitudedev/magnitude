@@ -25,6 +25,14 @@ __device__ __forceinline__ const float *staged(const float *inputs, int row) {
     return inputs + static_cast<u64>(row) * INPUT_WIDTH;
 }
 
+// Inverts p = i * (i + 1) / 2 + j (0 <= j <= i) for the lower triangle.
+__device__ __forceinline__ int lower_triangle_row(int pair) {
+    int i = static_cast<int>((sqrtf(static_cast<float>(8 * pair) + 1.25f) - 1.0f) * 0.5f);
+    if ((i + 1) * (i + 2) / 2 <= pair) ++i;
+    if (i * (i + 1) / 2 > pair) --i;
+    return i;
+}
+
 } // namespace state_space
 
 #ifdef SEISMIC_FORMING_STATE_SPACE_CHUNK_INPUTS
@@ -81,10 +89,9 @@ __global__ void state_space_chunk_products(SEISMIC_KERNEL_PARAMS) {
     for (int k = 0; k < OWNED; ++k) {
         // Pair p = i (i + 1) / 2 + j of the lower triangle.
         const int pair = threadIdx.x + 256 * k;
-        int i = 0;
-        while ((i + 1) * (i + 2) / 2 <= pair) ++i;
-        rows[k] = pair < PAIRS ? i : PIECE;
-        columns[k] = pair - i * (i + 1) / 2;
+        const int i = pair < PAIRS ? lower_triangle_row(pair) : PIECE;
+        rows[k] = i;
+        columns[k] = pair < PAIRS ? pair - i * (i + 1) / 2 : 0;
         sums[k] = 0.0f;
     }
     for (int base = 0; base < N; base += SPAN) {
@@ -97,9 +104,14 @@ __global__ void state_space_chunk_products(SEISMIC_KERNEL_PARAMS) {
         __syncthreads();
 #pragma unroll
         for (int k = 0; k < OWNED; ++k) {
-            if (rows[k] < count)
-                for (int n = 0; n < SPAN; ++n)
-                    sums[k] = seismic_fma_rn(c_rows[rows[k]][n], b_rows[columns[k]][n], sums[k]);
+            if (rows[k] < count) {
+                const float *cr = c_rows[rows[k]];
+                const float *br = b_rows[columns[k]];
+                float sum = sums[k];
+#pragma unroll
+                for (int n = 0; n < SPAN; ++n) sum = seismic_fma_rn(cr[n], br[n], sum);
+                sums[k] = sum;
+            }
         }
         __syncthreads();
     }
@@ -114,18 +126,40 @@ __global__ void state_space_chunk_products(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_STATE_SPACE_CHUNK_SCAN
 namespace state_space {
 
-// Shared memory of a piece: x rows of the block's state rows, the weights
-// (gamma_i / gamma_j) (C_i . B_j), the cumulative log decays, gamma, the tail
-// factors gamma_last / gamma_j, the step sizes. Weight rows are padded so the
-// lanes reading different rows at one column hit different banks.
+// Shared memory of a piece: x rows of the block's state rows, precomputed
+// u = delta * x rows, the weights (gamma_i / gamma_j) (C_i . B_j), the
+// cumulative log decays, gamma, and the tail factors gamma_last / gamma_j.
+// Weight rows are padded so the lanes reading different rows at one column
+// hit different banks.
 template <int BLOCK_ROWS> struct PieceShared {
     float x[PIECE][BLOCK_ROWS];
+    float u[PIECE][BLOCK_ROWS];
     float weights[PIECE][PIECE + 1];
     float log_gamma[PIECE];
     float gamma[PIECE];
     float tail[PIECE];
-    float delta[PIECE];
 };
+
+// Loads a lane's COLUMNS contiguous F32 elements using 16-byte aligned float4
+// loads when COLUMNS % 4 == 0 and aligned, with exact scalar fallback.
+__device__ __forceinline__ void load_columns(const float *src, float (&dst)[COLUMNS]) {
+    if constexpr (COLUMNS % 4 == 0) {
+        if ((reinterpret_cast<u64>(src) & 15ull) == 0ull) {
+            const float4 *vec = reinterpret_cast<const float4 *>(src);
+#pragma unroll
+            for (int j = 0; j < COLUMNS / 4; ++j) {
+                const float4 v = vec[j];
+                dst[4 * j + 0] = v.x;
+                dst[4 * j + 1] = v.y;
+                dst[4 * j + 2] = v.z;
+                dst[4 * j + 3] = v.w;
+            }
+            return;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < COLUMNS; ++j) dst[j] = src[j];
+}
 
 // Sums each of `values`' 32 elements over the warp and leaves lane l with
 // element l's total (recursive halving: at mask m a lane keeps the half its
@@ -161,10 +195,11 @@ __device__ __forceinline__ void advance_piece(const Operands &in, const float *i
     const int count = min(PIECE, slot.stop - local * PIECE);
     for (int item = threadIdx.x; item < count * BLOCK_ROWS; item += blockDim.x) {
         const int i = item / BLOCK_ROWS;
-        shared.x[i][item % BLOCK_ROWS] =
-            convolve(in, slot, first + i - slot.lo, head * P + block_row0 + item % BLOCK_ROWS);
+        const int col = item % BLOCK_ROWS;
+        const float value = convolve(in, slot, first + i - slot.lo, head * P + block_row0 + col);
+        shared.x[i][col] = value;
+        shared.u[i][col] = seismic_mul_rn(staged(inputs, first + i)[INPUT_DELTA + head], value);
     }
-    for (int i = threadIdx.x; i < count; i += blockDim.x) shared.delta[i] = staged(inputs, first + i)[INPUT_DELTA + head];
     if (threadIdx.x == 0) {
         float sum = 0.0f;
         for (int i = 0; i < count; ++i) {
@@ -174,12 +209,12 @@ __device__ __forceinline__ void advance_piece(const Operands &in, const float *i
     }
     __syncthreads();
     const float *piece_products = products + (static_cast<u64>(piece) * G + g) * PIECE * PIECE;
-    for (int item = threadIdx.x; item < count * count; item += blockDim.x) {
-        const int i = item / count;
-        const int j = item % count;
-        shared.weights[i][j] = j <= i ? seismic_mul_rn(expf(shared.log_gamma[i] - shared.log_gamma[j]),
-                                                       piece_products[i * PIECE + j])
-                                      : 0.0f;
+    const int pairs = count * (count + 1) / 2;
+    for (int pair = threadIdx.x; pair < pairs; pair += blockDim.x) {
+        const int i = lower_triangle_row(pair);
+        const int j = pair - i * (i + 1) / 2;
+        shared.weights[i][j] =
+            seismic_mul_rn(expf(shared.log_gamma[i] - shared.log_gamma[j]), piece_products[i * PIECE + j]);
     }
     for (int i = threadIdx.x; i < count; i += blockDim.x) {
         shared.gamma[i] = expf(shared.log_gamma[i]);
@@ -198,8 +233,7 @@ __device__ __forceinline__ void advance_piece(const Operands &in, const float *i
             const int i = min(i0 + k, count - 1);
             const float *c = staged(inputs, first + i) + INPUT_C + g * N + lane * COLUMNS;
             float cs[COLUMNS];
-#pragma unroll
-            for (int j = 0; j < COLUMNS; ++j) cs[j] = c[j];
+            load_columns(c, cs);
 #pragma unroll
             for (int s = 0; s < LANE_ROWS; ++s) {
                 float sum = 0.0f;
@@ -212,9 +246,7 @@ __device__ __forceinline__ void advance_piece(const Operands &in, const float *i
         const int i = i0 + lane / LANE_ROWS;
         if (i < count) {
             float sum = 0.0f;
-            for (int j = 0; j <= i; ++j)
-                sum = seismic_fma_rn(shared.weights[i][j], seismic_mul_rn(shared.delta[j], shared.x[j][local_row + r]),
-                                     sum);
+            for (int j = 0; j <= i; ++j) sum = seismic_fma_rn(shared.weights[i][j], shared.u[j][local_row + r], sum);
             const float value = shared.x[i][local_row + r];
             const float output = seismic_fma_rn(skip, value, seismic_fma_rn(shared.gamma[i], inter, sum));
             in.mixed.put(static_cast<u64>(first + i) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1 +
@@ -231,12 +263,10 @@ __device__ __forceinline__ void advance_piece(const Operands &in, const float *i
     for (int j = 0; j < count; ++j) {
         const float *b = staged(inputs, first + j) + INPUT_B + g * N + lane * COLUMNS;
         float bs[COLUMNS];
-#pragma unroll
-        for (int c = 0; c < COLUMNS; ++c) bs[c] = b[c];
+        load_columns(b, bs);
 #pragma unroll
         for (int s = 0; s < LANE_ROWS; ++s) {
-            const float coefficient =
-                seismic_mul_rn(shared.tail[j], seismic_mul_rn(shared.delta[j], shared.x[j][local_row + s]));
+            const float coefficient = seismic_mul_rn(shared.tail[j], shared.u[j][local_row + s]);
 #pragma unroll
             for (int c = 0; c < COLUMNS; ++c) rows.values[s][c] = seismic_fma_rn(coefficient, bs[c], rows.values[s][c]);
         }
