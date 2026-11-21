@@ -576,13 +576,21 @@ pub struct ResponseProjection {
     metadata: Map<String, Value>,
 }
 
-struct ToolProjection {
-    output_index: usize,
-    item_id: String,
-    call_id: String,
-    name: String,
-    arguments: String,
-    finished: bool,
+enum ProjectedItem {
+    Reasoning {
+        text: String,
+    },
+    Message {
+        text: String,
+    },
+    ToolCall {
+        call_index: usize,
+        item_id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+        finished: bool,
+    },
 }
 
 pub(crate) struct StreamProjector {
@@ -591,14 +599,9 @@ pub(crate) struct StreamProjector {
     created_at: u64,
     model: String,
     sender: mpsc::Sender<Value>,
-    next_output_index: usize,
-    message_output_index: Option<usize>,
-    reasoning_output_index: Option<usize>,
-    text: String,
-    reasoning: String,
-    tool_calls: BTreeMap<usize, ToolProjection>,
+    items: Vec<ProjectedItem>,
     projection: ResponseProjection,
-    concluded: Option<oneshot::Sender<Vec<Value>>>,
+    concluded: oneshot::Sender<Vec<Value>>,
 }
 
 /// The stream consumer is gone; the generation is dropped (cancelled).
@@ -620,14 +623,9 @@ impl StreamProjector {
             created_at,
             model,
             sender,
-            next_output_index: 0,
-            message_output_index: None,
-            reasoning_output_index: None,
-            text: String::new(),
-            reasoning: String::new(),
-            tool_calls: BTreeMap::new(),
+            items: Vec::new(),
             projection,
-            concluded: Some(concluded),
+            concluded,
         }
     }
 
@@ -679,14 +677,35 @@ impl StreamProjector {
         match event {
             OutputEvent::Started => {}
             OutputEvent::ToolCallFinished { index } => {
-                self.tool_call(index)?.finished = true;
+                let finished = self
+                    .items
+                    .iter_mut()
+                    .find_map(|item| match item {
+                        ProjectedItem::ToolCall {
+                            call_index,
+                            finished,
+                            ..
+                        } if *call_index == index => Some(finished),
+                        _ => None,
+                    })
+                    .ok_or_else(tool_event_before_start)?;
+                *finished = true;
             }
             OutputEvent::ReasoningDelta(text) => {
-                let index = match self.reasoning_output_index {
+                let index = match self.items.iter_mut().enumerate().find_map(|(index, item)| {
+                    match item {
+                        ProjectedItem::Reasoning { text: reasoning } => {
+                            reasoning.push_str(&text);
+                            Some(index)
+                        }
+                        _ => None,
+                    }
+                }) {
                     Some(index) => index,
                     None => {
-                        let index = self.allocate_output();
-                        self.reasoning_output_index = Some(index);
+                        let index = self.items.len();
+                        self.items
+                            .push(ProjectedItem::Reasoning { text: text.clone() });
                         let item = reasoning_item(self.reasoning_id(), "in_progress", None);
                         self.send(
                             "response.output_item.added",
@@ -696,7 +715,6 @@ impl StreamProjector {
                         index
                     }
                 };
-                self.reasoning.push_str(&text);
                 self.send(
                     "response.reasoning_summary_text.delta",
                     serde_json::json!({
@@ -707,11 +725,20 @@ impl StreamProjector {
                 .await?;
             }
             OutputEvent::TextDelta(text) => {
-                let index = match self.message_output_index {
+                let index = match self.items.iter_mut().enumerate().find_map(|(index, item)| {
+                    match item {
+                        ProjectedItem::Message { text: message } => {
+                            message.push_str(&text);
+                            Some(index)
+                        }
+                        _ => None,
+                    }
+                }) {
                     Some(index) => index,
                     None => {
-                        let index = self.allocate_output();
-                        self.message_output_index = Some(index);
+                        let index = self.items.len();
+                        self.items
+                            .push(ProjectedItem::Message { text: text.clone() });
                         let item = message_item(self.message_id.clone(), "in_progress", None);
                         self.send(
                             "response.output_item.added",
@@ -729,7 +756,6 @@ impl StreamProjector {
                         index
                     }
                 };
-                self.text.push_str(&text);
                 self.send(
                     "response.output_text.delta",
                     serde_json::json!({
@@ -740,19 +766,16 @@ impl StreamProjector {
                 .await?;
             }
             OutputEvent::ToolCallStarted { index, id, name } => {
-                let output_index = self.allocate_output();
+                let output_index = self.items.len();
                 let item_id = format!("fc_{id}");
-                self.tool_calls.insert(
-                    index,
-                    ToolProjection {
-                        output_index,
-                        item_id: item_id.clone(),
-                        call_id: id.clone(),
-                        name: name.clone(),
-                        arguments: String::new(),
-                        finished: false,
-                    },
-                );
+                self.items.push(ProjectedItem::ToolCall {
+                    call_index: index,
+                    item_id: item_id.clone(),
+                    call_id: id.clone(),
+                    name: name.clone(),
+                    arguments: String::new(),
+                    finished: false,
+                });
                 let item = function_call_item(item_id, "in_progress", id, name, String::new());
                 self.send(
                     "response.output_item.added",
@@ -761,11 +784,23 @@ impl StreamProjector {
                 .await?;
             }
             OutputEvent::ToolInputDelta { index, fragment } => {
-                let (output_index, item_id) = {
-                    let entry = self.tool_call(index)?;
-                    entry.arguments.push_str(&fragment);
-                    (entry.output_index, entry.item_id.clone())
-                };
+                let (output_index, item_id) = self
+                    .items
+                    .iter_mut()
+                    .enumerate()
+                    .find_map(|(output_index, item)| match item {
+                        ProjectedItem::ToolCall {
+                            call_index,
+                            item_id,
+                            arguments,
+                            ..
+                        } if *call_index == index => {
+                            arguments.push_str(&fragment);
+                            Some((output_index, item_id.clone()))
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(tool_event_before_start)?;
                 self.send(
                     "response.function_call_arguments.delta",
                     serde_json::json!({
@@ -778,97 +813,88 @@ impl StreamProjector {
         Ok(())
     }
 
-    fn tool_call(&mut self, index: usize) -> Result<&mut ToolProjection, ProjectionError> {
-        self.tool_calls.get_mut(&index).ok_or_else(|| {
-            ProjectionError::Failed(ServingError::Internal(
-                "tool event arrived before tool start".into(),
-            ))
-        })
-    }
-
     /// Close every output item in `output_index` order, so the order a client
     /// observes items concluding is the order of the response's `output`. A
     /// call the output limit cut off concludes `incomplete` and, as in a
     /// complete response, is not part of `output`.
-    async fn finish(&mut self, completion: &Completion) -> Result<(), Disconnected> {
-        let mut closing: Vec<(usize, Vec<(&'static str, Value)>, Value)> = Vec::new();
-        if let Some(index) = self.reasoning_output_index {
-            let item_id = self.reasoning_id();
-            let item = serde_json::to_value(reasoning_item(
-                item_id.clone(),
-                "completed",
-                Some(self.reasoning.clone()),
-            ))
-            .expect("output item is serializable");
-            let events = vec![(
-                "response.reasoning_summary_text.done",
-                serde_json::json!({
-                    "item_id": item_id, "output_index": index, "summary_index": 0, "text": self.reasoning,
-                }),
-            )];
-            closing.push((index, events, item));
-        }
-        if let Some(index) = self.message_output_index {
-            let item = serde_json::to_value(message_item(
-                self.message_id.clone(),
-                "completed",
-                Some(self.text.clone()),
-            ))
-            .expect("output item is serializable");
-            let events = vec![
-                (
-                    "response.output_text.done",
-                    serde_json::json!({
-                        "item_id": self.message_id, "output_index": index, "content_index": 0, "text": self.text,
-                    }),
-                ),
-                (
-                    "response.content_part.done",
-                    serde_json::json!({
-                        "item_id": self.message_id, "output_index": index, "content_index": 0,
-                        "part": item["content"][0],
-                    }),
-                ),
-            ];
-            closing.push((index, events, item));
-        }
-        let mut cut_off = Vec::new();
-        for call in self.tool_calls.values() {
-            let status = if call.finished { "completed" } else { "incomplete" };
-            let item = serde_json::to_value(function_call_item(
-                call.item_id.clone(),
-                status,
-                call.call_id.clone(),
-                call.name.clone(),
-                call.arguments.clone(),
-            ))
-            .expect("output item is serializable");
-            let events = if call.finished {
-                vec![(
-                    "response.function_call_arguments.done",
-                    serde_json::json!({
-                        "item_id": call.item_id, "output_index": call.output_index,
-                        "arguments": call.arguments,
-                    }),
-                )]
-            } else {
-                cut_off.push(call.output_index);
-                Vec::new()
+    async fn finish(mut self, completion: &Completion) -> Result<(), Disconnected> {
+        let projected = std::mem::take(&mut self.items);
+        let mut items = Vec::with_capacity(projected.len());
+        for (index, projected) in projected.into_iter().enumerate() {
+            let (item, include) = match projected {
+                ProjectedItem::Reasoning { text } => {
+                    let item_id = self.reasoning_id();
+                    self.send(
+                        "response.reasoning_summary_text.done",
+                        serde_json::json!({
+                            "item_id": item_id, "output_index": index, "summary_index": 0, "text": text,
+                        }),
+                    )
+                    .await?;
+                    let item = serde_json::to_value(reasoning_item(
+                        item_id,
+                        "completed",
+                        Some(text),
+                    ))
+                    .expect("output item is serializable");
+                    (item, true)
+                }
+                ProjectedItem::Message { text } => {
+                    self.send(
+                        "response.output_text.done",
+                        serde_json::json!({
+                            "item_id": self.message_id, "output_index": index, "content_index": 0, "text": text,
+                        }),
+                    )
+                    .await?;
+                    let item = serde_json::to_value(message_item(
+                        self.message_id.clone(),
+                        "completed",
+                        Some(text),
+                    ))
+                    .expect("output item is serializable");
+                    self.send(
+                        "response.content_part.done",
+                        serde_json::json!({
+                            "item_id": self.message_id, "output_index": index, "content_index": 0,
+                            "part": item["content"][0],
+                        }),
+                    )
+                    .await?;
+                    (item, true)
+                }
+                ProjectedItem::ToolCall {
+                    item_id,
+                    call_id,
+                    name,
+                    arguments,
+                    finished,
+                    ..
+                } => {
+                    if finished {
+                        self.send(
+                            "response.function_call_arguments.done",
+                            serde_json::json!({
+                                "item_id": item_id, "output_index": index,
+                                "arguments": arguments,
+                            }),
+                        )
+                        .await?;
+                    }
+                    let status = if finished { "completed" } else { "incomplete" };
+                    let item = serde_json::to_value(function_call_item(
+                        item_id, status, call_id, name, arguments,
+                    ))
+                    .expect("output item is serializable");
+                    (item, finished)
+                }
             };
-            closing.push((call.output_index, events, item));
-        }
-        closing.sort_by_key(|(index, _, _)| *index);
-        let mut items = Vec::with_capacity(closing.len());
-        for (index, events, item) in closing {
-            for (event_type, value) in events {
-                self.send(event_type, value).await?;
-            }
             self.send(
                 "response.output_item.done",
                 serde_json::json!({ "output_index": index, "item": item }),
             )
             .await?;
-            if !cut_off.contains(&index) {
+            if include {
                 items.push(item);
             }
         }
@@ -891,9 +917,7 @@ impl StreamProjector {
             serde_json::json!({ "response": completed }),
         )
         .await?;
-        if let Some(concluded) = self.concluded.take() {
-            let _ = concluded.send(items);
-        }
+        let _ = self.concluded.send(items);
         Ok(())
     }
 
@@ -905,15 +929,15 @@ impl StreamProjector {
             .await;
     }
 
-    fn allocate_output(&mut self) -> usize {
-        let index = self.next_output_index;
-        self.next_output_index += 1;
-        index
-    }
-
     fn reasoning_id(&self) -> String {
         format!("rs_{}", response_suffix(&self.id))
     }
+}
+
+fn tool_event_before_start() -> ProjectionError {
+    ProjectionError::Failed(ServingError::Internal(
+        "tool event arrived before tool start".into(),
+    ))
 }
 
 enum ProjectionError {
