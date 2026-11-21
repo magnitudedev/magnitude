@@ -355,7 +355,7 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
         .iter()
         .map(|&(start, _)| start / slab_rows)
         .collect::<BTreeSet<_>>();
-    let backed = store.domains[WINDOW.0].arena.borrow().backed.clone();
+    let backed = store.domains[WINDOW.0].arena.borrow().backed_slabs();
     assert!(backed.len() <= 2);
     assert!(occupied_slabs.is_subset(&backed));
     assert_eq!(device.tally.held(), before - released);
@@ -364,7 +364,7 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
         state = step(&mut bindings, state, 3);
         check(&state);
     }
-    assert!(store.domains[WINDOW.0].arena.borrow().backed.len() <= 2);
+    assert!(store.domains[WINDOW.0].arena.borrow().slabs.len() <= 2);
     assert_eq!(store.occupied_rows(WINDOW), WINDOW_ROWS);
 }
 
@@ -397,7 +397,7 @@ fn freed_window_slab_index_is_reused_by_growth() {
     assert!(released > 0);
     assert_eq!(device.pool.return_freed(released).unwrap(), released);
     assert_eq!(device.tally.held(), charged - released);
-    assert_eq!(arena.borrow().backed, BTreeSet::from([1]));
+    assert_eq!(arena.borrow().backed_slabs(), BTreeSet::from([1]));
     // Growth backs the lowest unbacked index, the freed slab 0, again.
     store
         .provision(
@@ -408,7 +408,7 @@ fn freed_window_slab_index_is_reused_by_growth() {
             0,
         )
         .unwrap();
-    assert_eq!(arena.borrow().backed, BTreeSet::from([0, 1]));
+    assert_eq!(arena.borrow().backed_slabs(), BTreeSet::from([0, 1]));
     let state = commit(state, 1);
     assert_eq!(store.occupied_rows(WINDOW), 8);
     assert_eq!(state.history_start(WINDOW), slab_rows + 1);
@@ -518,7 +518,7 @@ fn shrink_covers_every_domain() {
         domain: WINDOW,
         rows: 3 * window_slab,
     }];
-    let slab_bytes = store.backing.borrow().history[WINDOW.0].slabs.slab_bytes();
+    let slab_bytes = store.backing.borrow().history.slabs()[WINDOW.0].slabs.slab_bytes();
     assert_eq!(
         store.growth_claim(&demand, &[], 0).unwrap().minimum_bytes,
         2 * slab_bytes
@@ -534,8 +534,8 @@ fn shrink_covers_every_domain() {
     assert_eq!(released, 2 * device.pool.granule());
     assert_eq!(device.pool.return_freed(released).unwrap(), released);
     assert_eq!(device.tally.held(), charged - released);
-    assert_eq!(store.domains[TOKEN.0].arena.borrow().backed.len(), 1);
-    assert_eq!(store.domains[WINDOW.0].arena.borrow().backed.len(), 1);
+    assert_eq!(store.domains[TOKEN.0].arena.borrow().slabs.len(), 1);
+    assert_eq!(store.domains[WINDOW.0].arena.borrow().slabs.len(), 1);
     assert_eq!((store.occupied_rows(TOKEN), store.occupied_rows(WINDOW)), (40, 16), "the state's rows stay");
     drop(state);
 }
