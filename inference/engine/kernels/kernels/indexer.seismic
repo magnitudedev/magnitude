@@ -447,19 +447,19 @@ native candidate_blocks for cpu from "cpu/candidate_blocks.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Metal: a threadgroup per (256 blocks, row), a thread per block.
+# Metal: a threadgroup per (8 blocks, row), a simdgroup (32 lanes) per block.
 native candidate_blocks for metal from "metal/candidate_blocks.metal":
     launch candidate_blocks:
-        threadgroups (ceil_div(NB, 256), M, 1)
+        threadgroups (ceil_div(NB, 8), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CUDA: as Metal.
+# CUDA: as Metal (a warp per block).
 native candidate_blocks for cuda from "cuda/candidate_blocks.cu":
     launch candidate_blocks:
-        threadgroups (ceil_div(NB, 256), M, 1)
+        threadgroups (ceil_div(NB, 8), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Vulkan: as CUDA.
+# Vulkan: a workgroup per (256 blocks, row), an invocation per block.
 native candidate_blocks for vulkan from "vulkan/candidate_blocks.comp":
     launch candidate_blocks:
         threadgroups (ceil_div(NB, 256), M, 1)
