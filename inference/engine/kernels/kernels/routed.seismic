@@ -73,8 +73,8 @@
 # (GATHERED, `routed::gather`): a choice's threadgroups run where it is its
 # expert's first and stage the rows of every choice of the expert, so a step
 # reads each chosen expert once (rows that share experts: the 8-row verify
-# touched 4.49x one row's experts), up to VERIFY_ROWS rows (a call of more
-# runs the per-choice launch); a row's bits are its one-row bits in
+# touched 4.49x one row's experts), for 2..=VERIFY_ROWS rows (at one row or
+# more than VERIFY_ROWS it runs the per-choice launch); a row's bits are its one-row bits in
 # either. The shared expert's row stages every activation row. summed: the K choices (and the shared
 # expert) side by side, one simdgroup each, over (32 / LANES) * ROWS output
 # channels a threadgroup, meeting in threadgroup memory; or gathered
@@ -85,7 +85,7 @@
 # choices; each slot's projection is published in A (`published`,
 # [M, K + SHARED, H]), and the last of a channel tile's threadgroups to
 # arrive (`arrivals`) joins the tile's channels of every row in slot order,
-# up to VERIFY_ROWS rows (a call of more runs the side-by-side launch).
+# for 2..=VERIFY_ROWS rows (at one row or more than VERIFY_ROWS it runs the side-by-side launch).
 # Either way a slot's projection and the join are bit for bit the same. grouped: a first
 # one-thread launch writes the others' grids from `rows` and `used`; the
 # paired (or single) expansion GEMM, then the down GEMM, over each block's
@@ -151,9 +151,9 @@ projection routed for metal:
     let USED_EXPERTS = STACKED * min(E, B) + 1 - STACKED for grouped
     let ORDINAL_BYTES = STACKED * ceil_div(B, 4) * 16 for grouped
     params (SIMDGROUPS in [2, 4, 8, 16] default 2 for choice, ROWS in [1, 2, 4] default 1 for choice,
-        arithmetic LANES in [32, 16] default 32 for choice, form GATHERED in [0, 1] default 0 for choice,
+        arithmetic LANES in [32, 16] default 32 for choice, form GATHERED in [0, 1] default 1 for choice,
         ROWS in [2, 1, 4, 8] default 2 for summed, arithmetic LANES in [16, 32, 8, 4] default 16 for summed,
-        form GATHERED in [0, 1] default 0 for summed,
+        form GATHERED in [0, 1] default 1 for summed,
         TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
         form TALL in [0, 1] default (1 - STACKED) for grouped, arithmetic form INT8 in [0, 1] default 0 for grouped,
         arithmetic form PACK in [0, 1] default 0 for grouped, form DOWN_TALL in [0, 1] default (1 - STACKED) for grouped,
@@ -183,62 +183,62 @@ projection routed for metal:
     scratch tile_grid bytes (12) when STACKED == 1 for grouped
     scratch operand bytes (max(EXPANSION_OPERAND, DOWN_OPERAND)) when (STACKED == 1 or M > 64) and (TALL == 1 or DOWN_TALL == 1) for grouped
     scratch tables bytes (ORDINAL_BYTES + USED_EXPERTS * max(EXPANSION_TABLES, DOWN_TABLES)) when (STACKED == 1 or M > 64) and INT8 + PACK + DOWN_INT8 + DOWN_PACK > 0 for grouped
-    launch choice for choice when (GATHERED == 0 or M > VERIFY_ROWS or PER_ROW == 1) and (RECORDS == 0 or SHARED == 1 or XS > 0):
+    launch choice for choice when (GATHERED == 0 or M == 1 or M > VERIFY_ROWS or PER_ROW == 1) and (RECORDS == 0 or SHARED == 1 or XS > 0):
         reads (ROWS, LANES)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (CHOICE_SHARED)
-    launch resident for choice when (GATHERED == 0 or M > VERIFY_ROWS) and RECORDS == 1 and SHARED == 0 and XS == 0:
+    launch resident for choice when (GATHERED == 0 or M == 1 or M > VERIFY_ROWS) and RECORDS == 1 and SHARED == 0 and XS == 0:
         reads (ROWS, LANES)
         records (W)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (CHOICE_SHARED)
-    launch gathered for choice when GATHERED == 1 and M <= VERIFY_ROWS and PER_ROW == 0 and (RECORDS == 0 or SHARED == 1 or XS > 0):
+    launch gathered for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0 and (RECORDS == 0 or SHARED == 1 or XS > 0):
         reads (ROWS, LANES)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (GATHERED_SHARED)
-    launch gathered_resident for choice when GATHERED == 1 and M <= VERIFY_ROWS and RECORDS == 1 and SHARED == 0 and XS == 0:
+    launch gathered_resident for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and RECORDS == 1 and SHARED == 0 and XS == 0:
         reads (ROWS, LANES)
         records (W)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (GATHERED_SHARED)
-    launch summed for summed when (GATHERED == 0 or M > VERIFY_ROWS) and XS > 0 and WHOLE == 0:
+    launch summed for summed when (GATHERED == 0 or M == 1 or M > VERIFY_ROWS) and XS > 0 and WHOLE == 0:
         reads (ROWS, LANES)
         threadgroups (SUMMED_GROUPS, M, 1)
         threads_per_threadgroup (32 * (K + SHARED), 1, 1)
-    launch summed for summed when (GATHERED == 0 or M > VERIFY_ROWS) and XS > 0 and WHOLE == 1:
+    launch summed for summed when (GATHERED == 0 or M == 1 or M > VERIFY_ROWS) and XS > 0 and WHOLE == 1:
         reads (ROWS, LANES)
         threadgroups (SUMMED_GROUPS, M, 1)
         unless (policy[POLICY_WHOLE])
         threads_per_threadgroup (32 * (K + SHARED), 1, 1)
-    launch whole for summed when (GATHERED == 0 or M > VERIFY_ROWS) and XS > 0 and WHOLE == 1:
+    launch whole for summed when (GATHERED == 0 or M == 1 or M > VERIFY_ROWS) and XS > 0 and WHOLE == 1:
         reads (ROWS, LANES)
         threadgroups (SUMMED_GROUPS, M, 1)
         if (policy[POLICY_WHOLE])
         threads_per_threadgroup (32 * (K + SHARED), 1, 1)
-    launch resident for summed when (GATHERED == 0 or M > VERIFY_ROWS) and XS == 0:
+    launch resident for summed when (GATHERED == 0 or M == 1 or M > VERIFY_ROWS) and XS == 0:
         reads (ROWS, LANES)
         records (W)
         threadgroups (SUMMED_GROUPS, M, 1)
         threads_per_threadgroup (32 * (K + SHARED), 1, 1)
-    launch gathered for summed when GATHERED == 1 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 0:
+    launch gathered for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 0:
         reads (ROWS, LANES)
         threadgroups (SUMMED_GROUPS, M, 1)
         threads_per_threadgroup (32 * (K + SHARED), 1, 1)
-    launch gathered for summed when GATHERED == 1 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 1:
+    launch gathered for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 1:
         reads (ROWS, LANES)
         threadgroups (SUMMED_GROUPS, M, 1)
         unless (policy[POLICY_WHOLE])
         threads_per_threadgroup (32 * (K + SHARED), 1, 1)
-    launch gathered_whole for summed when GATHERED == 1 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 1:
+    launch gathered_whole for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 1:
         reads (ROWS, LANES)
         threadgroups (SUMMED_GROUPS, M, 1)
         if (policy[POLICY_WHOLE])
         threads_per_threadgroup (32 * (K + SHARED), 1, 1)
-    launch gathered_resident for summed when GATHERED == 1 and M <= VERIFY_ROWS and XS == 0:
+    launch gathered_resident for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS == 0:
         reads (ROWS, LANES)
         records (W)
         threadgroups (SUMMED_GROUPS, M, 1)
@@ -910,8 +910,8 @@ native routed_output for metal from "metal/routed_output.metal":
     static (H, SN, IN, K, F, S)
     records (expert_down, tier_down)
     project routed summed (expert_down) shared (shared_down)
-    scratch published bytes (M * (K + 1) * H * 2) when GATHERED == 1 and M <= VERIFY_ROWS
-    scratch arrivals bytes (ceil_div(H, ROWS * 32 / LANES) * 4) sync when GATHERED == 1 and M <= VERIFY_ROWS
+    scratch published bytes (M * (K + 1) * H * 2) when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS
+    scratch arrivals bytes (ceil_div(H, ROWS * 32 / LANES) * 4) sync when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS
 
 # CUDA: the swap-AB GEMV (TPW, KSPLIT as in the expansion), the choices and
 # the shared expert in separate blocks publishing A-rounded channels per
@@ -1821,8 +1821,8 @@ native routed_down for metal from "metal/routed_down.metal":
     static (H, K, F)
     records (expert_down, tier_down)
     project routed summed (expert_down)
-    scratch published bytes (M * K * H * 2) when GATHERED == 1 and M <= VERIFY_ROWS
-    scratch arrivals bytes (ceil_div(H, ROWS * 32 / LANES) * 4) sync when GATHERED == 1 and M <= VERIFY_ROWS
+    scratch published bytes (M * K * H * 2) when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS
+    scratch arrivals bytes (ceil_div(H, ROWS * 32 / LANES) * 4) sync when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS
 
 # CUDA: the choices' projections in parallel blocks, A-rounded into
 # `projected`, then the slot-order combine, which adds the sum to the base.

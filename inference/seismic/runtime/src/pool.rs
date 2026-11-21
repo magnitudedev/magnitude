@@ -795,12 +795,14 @@ impl Pool {
             }
         } else {
             debug_assert!(failure.is_none());
+            // A concurrent `region_view` during `Slots::adopt`'s unlocked
+            // submission phase (or a detached view on a freed slot) may still
+            // hold a source granule's `SlabHold`, keeping that granule
+            // `Granule::Held` until the view drops.
             let mut state = pool.state();
             match state.granules.try_vacated(vacating) {
                 Ok(bytes) => Ok(VacateStep::Vacated(bytes)),
                 Err(vacating) => {
-                    // A granule whose store or slot already left is still
-                    // pinned by a detached view: unvacate and skip cleanly.
                     state.granules.unvacate(vacating);
                     skip.insert(block);
                     Ok(VacateStep::Skipped)
@@ -939,13 +941,13 @@ pub(crate) struct Slots {
     generation: AtomicU64,
     /// Serializes mutations (`add_slabs`, `free_slab`, `adopt`) so `slabs`
     /// stays a leaf lock for `region_view` / `backed` / `backed_count` / `reach`
-    /// and is never held across `granules.grow()`, `moves::submit()`, or
-    /// `slots.point_many()` during `add_slabs` / `free_slab`.
+    /// and is never held across `pool.state()`, `granules.grow()`,
+    /// `repointed()`, `moves::submit()`, or `point_many()`.
     mutate: Mutex<()>,
     slabs: Mutex<Vec<Option<Slab>>>,
     /// The device work that last wrote the table ([`Self::adopt`]), while
     /// it may still run: a later repoint is ordered after it, never a host
-    /// write it could land over. Changed under the slab lock.
+    /// write it could land over. Changed under the mutate lock.
     repointed: Mutex<Option<Arc<dyn DeviceCompletion>>>,
 }
 
@@ -1162,52 +1164,51 @@ impl Slots {
     fn adopt(&self, moved: &[Move<Holder>]) -> Result<Vec<Adopted>, TensorError> {
         let pool = self.pool.as_ref().expect("a store whose granules move is a pool's");
         let _mutate = self.mutate();
-        // Look up block allocations before locking `self.slabs()` so we never
-        // nest `slabs -> pool.state` (preserving `mutate -> pool.state`).
-        let all_blocks = {
-            let state = pool.state();
+        // Phase 1: classify candidate moves under a brief `slabs` leaf lock,
+        // then drop `slabs` before touching `pool.state()`, `repointed()`, or
+        // `moves::submit()` so concurrent `region_view` calls (for example
+        // `expert-requests` answering a parked GPU kernel) never block behind
+        // device submission.
+        let adopted = {
+            let slabs = self.slabs();
             moved
+                .iter()
+                .map(|moved| match slabs.get(moved.holder.slot) {
+                    Some(Some(slab)) if slab.granule() == Some(moved.from) => {
+                        match Arc::strong_count(&slab.hold) > 1 {
+                            true => Adopted::Viewed,
+                            false => Adopted::Moved,
+                        }
+                    }
+                    Some(_) | None => Adopted::Left,
+                })
+                .collect::<Vec<_>>()
+        };
+        let moving = moved.iter().zip(&adopted).filter(|(_, adopted)| matches!(adopted, Adopted::Moved)).map(|(moved, _)| moved).collect::<Vec<_>>();
+        if moving.is_empty() {
+            return Ok(adopted);
+        }
+        let blocks = {
+            let state = pool.state();
+            moving
                 .iter()
                 .map(|moved| (state.granules.block(moved.from.block).allocation.clone(), state.granules.block(moved.to.block).allocation.clone()))
                 .collect::<Vec<_>>()
         };
-        // On Metal, `moves::submit` drains device work on the domain via
-        // `domain.acquire(true)`. Acquire that permit before locking
-        // `self.slabs()` so a parked GPU kernel waiting on `region_view`
-        // cannot deadlock against `adopt`.
+        // Phase 2 (no `slabs` lock held): prepare and submit copy + repoint
+        // steps. During this phase `from` and `to` have identical bytes; any
+        // concurrent `region_view` reads `from` and keeps it alive via
+        // `Arc<SlabHold>` until the view drops.
         let move_permit = moves::prepare(&self.device, &self.table)?;
-        let mut slabs = self.slabs();
-        let adopted = moved
-            .iter()
-            .map(|moved| match slabs.get(moved.holder.slot) {
-                Some(Some(slab)) if slab.granule() == Some(moved.from) => {
-                    match Arc::strong_count(&slab.hold) > 1 {
-                        true => Adopted::Viewed,
-                        false => Adopted::Moved,
-                    }
-                }
-                Some(_) | None => Adopted::Left,
-            })
-            .collect::<Vec<_>>();
-        let moving = moved
-            .iter()
-            .zip(&all_blocks)
-            .zip(&adopted)
-            .filter(|(_, adopted)| matches!(adopted, Adopted::Moved))
-            .map(|((moved, blocks), _)| (moved, blocks))
-            .collect::<Vec<_>>();
-        if moving.is_empty() {
-            return Ok(adopted);
-        }
         let at = |granule: GranuleId| u64::from(granule.index) * pool.granule;
-        let copies = moving.iter().map(|(moved, (from, to))| MoveStep::Copy {
+        let copies = moving.iter().zip(&blocks).map(|(moved, (from, to))| MoveStep::Copy {
             source: from,
             source_offset: at(moved.from),
             destination: to,
             destination_offset: at(moved.to),
             bytes: self.slab_bytes,
         });
-        let words = moving.iter().flat_map(|(moved, _)| {
+        let words = moving.iter().flat_map(|moved| {
             self.offsets.iter().enumerate().map(move |(region, offset)| MoveStep::Word {
                 destination: &self.table,
                 offset: self.entry(region, moved.holder.slot),
@@ -1221,24 +1222,34 @@ impl Slots {
         let written = moves::submit_prepared(&self.device, &self.table, &steps, move_permit)?;
         *repointed = written;
         drop(repointed);
-        let previous = moving
-            .iter()
-            .map(|(moved, (_, to))| {
-                let adopted = Slab {
-                    regions: self.offsets.iter().map(|offset| (to.clone(), at(moved.to) + offset)).collect(),
-                    hold: Arc::new(SlabHold {
-                        store: self.id,
-                        slot: moved.holder.slot,
-                        granule: Some(GranuleHold { pool: pool.clone(), granule: moved.to }),
-                    }),
-                };
-                std::mem::replace(slabs[moved.holder.slot].as_mut().expect("a moving slot is backed"), adopted)
-            })
-            .collect::<Vec<_>>();
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        drop(slabs);
-        // No view holds them: each old granule leaves now, released behind
-        // the pool's newest uses, the moves among them.
+        // Phase 3 (brief `slabs` leaf lock): install the new slabs, bump
+        // `generation` after updating `slabs` so `reach()` never caches a
+        // new generation with old slab locations, and drop `slabs`.
+        let previous = {
+            let mut slabs = self.slabs();
+            let previous = moving
+                .iter()
+                .zip(&blocks)
+                .map(|(moved, (_, to))| {
+                    let adopted = Slab {
+                        regions: self.offsets.iter().map(|offset| (to.clone(), at(moved.to) + offset)).collect(),
+                        hold: Arc::new(SlabHold {
+                            store: self.id,
+                            slot: moved.holder.slot,
+                            granule: Some(GranuleHold { pool: pool.clone(), granule: moved.to }),
+                        }),
+                    };
+                    std::mem::replace(slabs[moved.holder.slot].as_mut().expect("a moving slot is backed"), adopted)
+                })
+                .collect::<Vec<_>>();
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            previous
+        };
+        // Phase 4 (outside `slabs`): drop old `SlabHold`s. Each unviewed old
+        // granule releases behind the pool's newest uses (the moves among
+        // them); any old granule cloned by a concurrent `region_view` during
+        // Phase 2 stays held until that view drops, and `vacate_emptiest`
+        // skips the block cleanly via `GranulePool::try_vacated`.
         drop(previous);
         Ok(adopted)
     }
@@ -2248,5 +2259,91 @@ mod tests {
         assert_eq!(pool.return_freed(4 * granule).unwrap(), block);
         let g3 = slabs.slots.generation();
         assert!(g3 > g2, "adopt bumps generation");
+    }
+
+    /// `Slots::adopt` keeps `Slots::slabs` a leaf lock and never holds it
+    /// across `moves::submit`: a concurrent `region_view` succeeds while
+    /// `moves::submit` is blocked, keeps the old granule alive with intact
+    /// bytes, and `vacate_emptiest` skips the block cleanly via
+    /// `GranulePool::try_vacated` instead of panicking.
+    #[test]
+    fn adopt_releases_slabs_lock_across_moves_submit_and_skips_mid_adopt_view() {
+        let catalog = crate::devices::Devices::discover(&[]).unwrap();
+        let id = catalog.resolve(seismic_topology::ExecutorSelector::HostCpu).unwrap();
+        let device = catalog.open(id).unwrap();
+        let topology = catalog.topology();
+        let store = topology.first_store(topology.executor(id).unwrap(), Contract::DeviceOnly).unwrap();
+        let tally = crate::memory::Tally::unbounded(topology.store_identity(store).unwrap());
+        let (granule, block) = (1 << 16, 1 << 18); // 4 granules per block
+        let charges = PoolCharges::one(&Charges::in_store(&device, Contract::DeviceOnly, Arc::new(tally.clone())));
+        let pool = Pool::open(&charges, Contract::DeviceOnly, granule, block).unwrap();
+        let absent = tally.held();
+        let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+        let geometry = SlabGeometry {
+            rows_per_slab: 4,
+            logical_rows: 32,
+            capacity: 8,
+            slab_bytes: BLOCK_ALIGNMENT,
+            slab_alignment: BLOCK_ALIGNMENT,
+            regions: vec![(i32s, vec![2], 0)],
+        };
+        let slabs = SlabStore::in_pool(&crate::memory::Charges::tally(&device), &pool, geometry, &[]).unwrap();
+        for _ in 0..8 {
+            slabs.add_slab(SlabFill::Zeroed).unwrap();
+        }
+        assert_eq!(tally.held(), absent + 2 * block);
+        let image = (0..8i32).flat_map(|value| (value + 11).to_le_bytes()).collect::<Vec<_>>();
+        let old_address = {
+            let view = slabs.slab_region(7, 0).unwrap().unwrap();
+            view.write_from_host(&image).unwrap();
+            view.device_address()
+        };
+        // Free 1 slot in block 0 and 3 slots in block 1 so vacating block 1
+        // moves slot 7 into block 0.
+        for slot in [1, 4, 5, 6] {
+            assert!(slabs.free_slab(slot).unwrap());
+        }
+
+        // Hold a host write permit on the pool's hazard domain so `moves::submit`
+        // blocks inside `domain.acquire_for_device(true)` while holding
+        // `slabs.slots.repointed`.
+        let host_permit = pool.0.absent.allocation.acquire(true).unwrap();
+        let pool_bg = pool.clone();
+        let handle = std::thread::spawn(move || pool_bg.return_freed(4 * granule));
+
+        // Wait until `Slots::adopt` enters Phase 2 (`repointed` locked, blocked
+        // inside `moves::submit`).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while slabs.slots.repointed.try_lock().is_ok() {
+            assert!(std::time::Instant::now() < deadline, "adopt did not reach moves::submit in time");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // `region_view` must succeed immediately while `moves::submit` is
+        // blocked (would deadlock if `Slots::adopt` held `Slots::slabs`).
+        let mid_view = slabs.slab_region(7, 0).unwrap().unwrap();
+        assert_eq!(mid_view.device_address(), old_address, "mid-adopt view still sees the old granule");
+
+        // Unblock `moves::submit` and let `return_freed` finish.
+        drop(host_permit);
+        assert_eq!(
+            handle.join().unwrap().unwrap(),
+            0,
+            "block pinned by a mid-adopt view is skipped cleanly via try_vacated"
+        );
+        assert_eq!(tally.held(), absent + 2 * block, "pinned block stays held while mid_view lives");
+        assert_eq!(mid_view.read_to_host().unwrap(), image, "mid-adopt view reads intact bytes from old granule");
+
+        let new_view = slabs.slab_region(7, 0).unwrap().unwrap();
+        assert_eq!(new_view.read_to_host().unwrap(), image, "moved slot reads intact bytes from new granule");
+        assert_ne!(new_view.device_address(), old_address, "slot 7 moved to a new granule");
+        drop(new_view);
+
+        // Dropping the mid-adopt view releases the old granule; the now-empty
+        // block returns on the next `return_freed(0)`.
+        drop(mid_view);
+        assert_eq!(pool.return_freed(0).unwrap(), block, "emptied block returns once the mid-adopt view drops");
+        pool.join_waiters();
+        assert_eq!(tally.held(), absent + block);
     }
 }

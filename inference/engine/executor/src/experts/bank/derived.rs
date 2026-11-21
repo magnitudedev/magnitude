@@ -35,27 +35,15 @@ pub struct BankShape {
 
 impl BankShape {
     /// The shape of a bank of `floor` to `ceiling` slots (the plan's, its
-    /// structure's most), growing by `block_bytes`, whose misses stop
-    /// falling at `curve` slots: it holds at most the lesser of the two.
+    /// structure's most), growing by `block_bytes`, bounded by `bound` slots
+    /// (its ceiling, or fewer where a tier holds nothing beside a whole device
+    /// bank): it holds at most the lesser of the two.
     ///
     /// # Panics
     /// Where the floor lies past the ceiling: a plan that is no bank.
-    pub fn new(block_bytes: u64, floor: u64, ceiling: u64, curve: u64) -> Self {
+    pub fn new(block_bytes: u64, floor: u64, ceiling: u64, bound: u64) -> Self {
         assert!(floor <= ceiling, "invariant violated: a bank floor of {floor} slots past its ceiling of {ceiling}");
-        Self { block_bytes, floor_slots: floor, saturation_slots: ceiling.min(curve).max(floor) }
-    }
-
-    /// The shape of a holding of `floor` to `ceiling` slots holding `at`,
-    /// growing by `block_bytes`, priced by a miss curve that found its
-    /// deepest reuse `curve` slots deep (none before it found one, which
-    /// bounds nothing): [`Self::new`], the curve's saturation never below
-    /// `at`. The curve counts every step since the load, so its deepest
-    /// reuse only deepens; a slot past it is one no step has shown useful
-    /// yet, not one shown useless, so it bounds a growth and never shrinks
-    /// what the holding holds (Gemma 4 26B on an M4 Pro: 78 slots deep
-    /// after a dozen steps, 123 seconds later).
-    pub fn curved(block_bytes: u64, floor: u64, ceiling: u64, curve: Option<u64>, at: u64) -> Self {
-        Self::new(block_bytes, floor, ceiling, curve.map_or(ceiling, |curve| curve.max(at)))
+        Self { block_bytes, floor_slots: floor, saturation_slots: ceiling.min(bound).max(floor) }
     }
 
     /// The granule pool's block: the least resize either way, so a target
@@ -274,15 +262,6 @@ pub fn derive<'t>(ledgers: &DeviceLedgers, targets: &'t [HoldingTarget<'t>]) -> 
             members.into_iter().zip(slots).collect::<Vec<_>>()
         })
         .collect()
-}
-
-/// The one resize toward `derived` targets ([`derive`]): a shrink before
-/// any growth; none where each holding holds its target.
-pub fn next_move(derived: &[(&HoldingTarget<'_>, u64)]) -> Option<(BankHolding, BankMove)> {
-    let moves: Vec<(BankHolding, BankMove)> =
-        derived.iter().filter_map(|(target, slots)| bank_move(*slots, target.at).map(|resize| (target.holding, resize))).collect();
-    let shrink = moves.iter().copied().find(|(_, resize)| matches!(resize, BankMove::Shrink { .. }));
-    shrink.or_else(|| moves.first().copied())
 }
 
 /// A bank holding's derived target in its store, beside what it holds now,

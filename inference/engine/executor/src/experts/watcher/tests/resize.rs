@@ -56,10 +56,7 @@ fn a_resize_between_flights_keeps_the_most_recent_experts() {
     // A regrowth backs the holes, which the next seeds take; it joins
     // beside a running step, at the watcher's next pass.
     let running = harness.step();
-    shared.join(super::Join::Bank {
-        records: vec![vec![0, 1]],
-        views: vec![harness.host.bank_record_views(&[0, 1])],
-    });
+    shared.join(super::Join::Bank { records: vec![vec![0, 1]] });
     shared.joins.wait_taken();
     drop(running);
     assert_eq!(shared.costs().records, [4]);
@@ -598,14 +595,10 @@ fn promotions_and_requests_never_enter_blocking_allocation() {
         .unwrap()
         .expect("shrink evicts two records");
     let rejoined: Vec<usize> = evicted.records[0].iter().map(|&r| r as usize).collect();
-    shared.join(super::Join::Bank {
-        views: vec![harness.host.bank_record_views(&rejoined)],
-        records: vec![rejoined],
-    });
+    shared.join(super::Join::Bank { records: vec![rejoined] });
     shared.joins.wait_taken();
-    // Promote new experts into the rejoined records using views delivered by
-    // `Join::Bank` (never touching `Stores` or `Pool`), and serve a decode
-    // request.
+    // Promote new experts into the rejoined records (resolved on demand from
+    // `Group::bank`) and serve a decode request.
     harness.promoted(0, &[4, 5]);
     harness.request(&[4, 5]).complete().unwrap();
     assert_eq!(shared.life.ended(), None, "serving never tripped the no-blocking-allocation guard");

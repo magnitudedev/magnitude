@@ -893,7 +893,7 @@ impl HistoryStorePlan {
             kind: self.kind,
             capacity: self.rows,
             row_bytes: self.row_bytes,
-            bytes: self.row_bytes * self.rows as u64,
+            bytes: self.row_bytes.saturating_mul(self.rows as u64),
             slab_rows: self.slab_rows as usize,
             page_rows: self.page_rows as usize,
             span_limit: self.span_limit,
@@ -2417,6 +2417,21 @@ mod slab_plan_tests {
         )
         .unwrap();
         assert_eq!(from_layout_startup, startup);
+    }
+
+    #[test]
+    fn history_store_plan_trace_saturates_bytes_on_overflow() {
+        let plan = HistoryStorePlan {
+            kind: HistoryDomainKind::Token,
+            components: Vec::new(),
+            rows: usize::MAX,
+            row_bytes: u64::MAX,
+            slab_rows: 16,
+            page_rows: 16,
+            span_limit: 1,
+        };
+        let trace = plan.trace();
+        assert_eq!(trace.bytes, u64::MAX);
     }
 }
 

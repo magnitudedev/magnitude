@@ -212,25 +212,10 @@ impl HostWords {
         self.tier.iter().map(|tensor| Records::new(rows(tensor, u64::from(records)), RECORD).unwrap()).collect()
     }
 
-    /// Each routed tensor's first `records` bank records, delivered into
-    /// `Group::bank` at open.
-    pub(super) fn bank_views(&self, records: u64) -> Vec<Vec<Option<Tensor>>> {
-        self.bank.0.iter().map(|tensor| rows(tensor, records)).collect()
-    }
-
-    /// Per-record routed tensor views for newly joined bank `records`,
-    /// matching `Join::Bank::views`.
-    pub(super) fn bank_record_views(&self, records: &[usize]) -> Vec<Vec<Tensor>> {
-        records
-            .iter()
-            .map(|&record| {
-                self.bank
-                    .0
-                    .iter()
-                    .map(|tensor| tensor.slice_leading(record as u64, record as u64 + 1).unwrap())
-                    .collect()
-            })
-            .collect()
+    /// Each routed tensor's first `records` bank records as the host
+    /// addresses them on demand.
+    pub(super) fn bank_views(&self, records: u64) -> Vec<Records> {
+        self.bank.0.iter().map(|tensor| Records::new(rows(tensor, records), RECORD).unwrap()).collect()
     }
 }
 

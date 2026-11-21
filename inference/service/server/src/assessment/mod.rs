@@ -580,7 +580,7 @@ pub struct ManagedModelAssessments {
     catalog: Arc<dyn CatalogModels>,
     local: Arc<dyn LocalModels>,
     current: std::sync::RwLock<AssessmentPoolCurrent>,
-    changes: tokio::sync::broadcast::Sender<ModelAssessmentsInvalidation>,
+    changes: tokio::sync::watch::Sender<u64>,
     active: Mutex<ActiveAssessments>,
     concurrency: Arc<tokio::sync::Semaphore>,
     host: HostDevice,
@@ -713,7 +713,7 @@ impl ManagedModelAssessments {
         measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
         host: HostDevice,
     ) -> Arc<Self> {
-        let (changes, _) = tokio::sync::broadcast::channel(64);
+        let (changes, _) = tokio::sync::watch::channel(0);
         let concurrency = assessment_concurrency();
         let environment_id = assessor.environment().id.clone();
         let state = measurement.borrow().state.clone();
@@ -756,7 +756,7 @@ impl ManagedModelAssessments {
         let revision = current.snapshot.revision;
         self.host.observe(&current);
         drop(current);
-        let _ = self.changes.send(ModelAssessmentsInvalidation { revision });
+        self.changes.send_replace(revision);
         true
     }
 
@@ -970,6 +970,12 @@ impl ManagedModelAssessments {
     /// host's device where it is measured; `None` when the pool is closing.
     async fn attempt(&self, item: AssessmentWork) -> Option<AssessmentOutcome> {
         let _permit = Arc::clone(&self.concurrency).acquire_owned().await.ok()?;
+        self.run_attempt(item).await
+    }
+
+    /// Execute one assessment attempt (after admission / concurrency control), sharing the host's
+    /// device where it is measured.
+    async fn run_attempt(&self, item: AssessmentWork) -> Option<AssessmentOutcome> {
         let _share = self.host.share().await;
         let key = item.key.clone();
         Some(
@@ -1038,18 +1044,17 @@ impl ManagedModelAssessments {
             (rekeyed, assessed)
         };
         self.cancel_unreferenced();
-        self.schedule(
-            rekeyed
-                .iter()
-                .filter(|(old, _)| !assessed.contains(*old))
-                .map(|(_, work)| work.clone())
-                .collect(),
-        );
+        let unassessed = rekeyed
+            .iter()
+            .filter(|(old, _)| !assessed.contains(*old))
+            .map(|(_, work)| work.clone())
+            .collect();
         let refinished = rekeyed
             .into_iter()
             .filter(|(old, _)| assessed.contains(old))
             .collect::<std::collections::BTreeMap<_, _>>();
         self.refinish(environment, refinished, measurement);
+        self.schedule(unassessed);
     }
 
     /// Finish each assessed model's work in `environment` again (`refinished`, by the key its
@@ -1064,12 +1069,17 @@ impl ManagedModelAssessments {
     ) {
         let service = Arc::clone(self);
         let handle = magnitude_service_utils::owner::spawn("an assessment refinish", async move {
-            let outcomes = futures_util::future::join_all(
-                refinished
-                    .values()
-                    .map(|work| service.attempt(work.clone())),
-            )
-            .await;
+            // Refinish runs over already-prepared bundles (pure CPU arithmetic), so it uses its
+            // own bounded concurrency rather than queueing behind unassessed preparations on
+            // `self.concurrency`.
+            let outcomes = futures_util::stream::iter(refinished.values().cloned())
+                .map(|work| {
+                    let service = Arc::clone(&service);
+                    async move { service.run_attempt(work).await }
+                })
+                .buffer_unordered(assessment_concurrency())
+                .collect::<Vec<_>>()
+                .await;
             let Some(outcomes) = outcomes.into_iter().collect::<Option<Vec<_>>>() else {
                 return;
             };
@@ -1098,9 +1108,7 @@ impl ManagedModelAssessments {
             service.host.observe(&current);
             drop(current);
             log_dropped_catalog_models(applied.dropped_catalog_models);
-            let _ = service
-                .changes
-                .send(ModelAssessmentsInvalidation { revision });
+            service.changes.send_replace(revision);
         });
         self.active
             .lock()
@@ -1122,7 +1130,7 @@ impl ManagedModelAssessments {
         self.host.observe(&current);
         drop(current);
         log_dropped_catalog_models(applied.dropped_catalog_models);
-        let _ = self.changes.send(ModelAssessmentsInvalidation { revision });
+        self.changes.send_replace(revision);
     }
 
     fn cancel_unreferenced(&self) {
@@ -1197,20 +1205,16 @@ impl ModelAssessments for ManagedModelAssessments {
     }
 
     fn watch(&self) -> BoxStream<'static, ModelAssessmentsInvalidation> {
+        let receiver = self.changes.subscribe();
         let initial = self
             .current
             .read()
             .map(|state| state.snapshot.revision)
             .unwrap_or_default();
-        let receiver = self.changes.subscribe();
         let changes = futures_util::stream::unfold(receiver, |mut receiver| async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(event) => return Some((event, receiver)),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                }
-            }
+            receiver.changed().await.ok()?;
+            let revision = *receiver.borrow_and_update();
+            Some((ModelAssessmentsInvalidation { revision }, receiver))
         });
         Box::pin(
             futures_util::stream::once(async move {

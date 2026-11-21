@@ -589,17 +589,22 @@ fn watch(
         TierStart { records, lent, reserve, placement }
     };
     // A group's commits span its ceiling, as its entries bind them, so a
-    // resize keeps them. Initial bank record views are delivered into
-    // `Group::bank` for `Placer::Tier` so promotions never touch `Stores`.
+    // resize keeps them. For `Placer::Tier`, `Group::bank` resolves bank slab
+    // views on demand (`Stores::records`) so idle bank slabs hold no view and
+    // the pool can vacate their blocks on shrink or reclaim.
+    let mut bank_records = match plan.placer() {
+        Placer::Tier => bank.records()?.into_iter(),
+        Placer::Bank => Vec::new().into_iter(),
+    };
     let groups = layout
         .groups
         .iter()
         .enumerate()
         .map(|(index, group)| {
-            let mut watched = Group {
+            Ok(Group {
                 commits: Words::new(group.commits.clone(), plan.records(index), 0)?,
                 tier: Some(tiers[index].clone()),
-                bank: Vec::new(),
+                bank: bank_records.next().unwrap_or_default(),
                 // The bank records the directory places into: none where
                 // landings land into the bank itself (their records are the
                 // landings').
@@ -608,12 +613,7 @@ fn watch(
                         .map_err(|_| "committed records exceed the host")?,
                     Placer::Bank => 0,
                 },
-            };
-            if plan.placer() == Placer::Tier {
-                let backed = bank.backed(index);
-                watched.join_bank(&backed, bank.record_views(index, &backed));
-            }
-            Ok(watched)
+            })
         })
         .collect::<Result<Vec<_>, String>>()?;
     let compute = super::HostCompute::serving(site_layers, &threads)?;

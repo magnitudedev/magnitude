@@ -20,8 +20,67 @@ use crate::storage_thread::{Done, StorageThread};
 use crate::CompletionWake;
 use seismic::{Pool, SlabTensor, Tensor, TensorError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
+
+/// Waiter-priority gate paired with the bank's `rises: Mutex<()>` so
+/// domain-thread observations ([`ExpertBank::hold_rises`]) are never starved
+/// behind consecutive background growth slots ([`grow_by_slots`]) under an
+/// unfair OS mutex.
+///
+/// Lock ordering: `priority_waiters` is never held while acquiring `rises`,
+/// and `WaiterGuard` always decrements `priority_waiters` and wakes waiters on
+/// drop (including unwind), so deadlock is impossible.
+pub(super) struct RiseGate {
+    priority_waiters: Mutex<usize>,
+    cleared: Condvar,
+}
+
+impl RiseGate {
+    pub(super) fn new() -> Self {
+        Self { priority_waiters: Mutex::new(0), cleared: Condvar::new() }
+    }
+
+    /// Acquire `rises` with priority over background callers: while this
+    /// caller waits for `rises`, background callers yield instead of
+    /// re-acquiring `rises` for another slot.
+    pub(super) fn hold_priority<'a>(&self, rises: &'a Mutex<()>) -> MutexGuard<'a, ()> {
+        struct WaiterGuard<'g>(&'g RiseGate);
+        impl Drop for WaiterGuard<'_> {
+            fn drop(&mut self) {
+                let mut waiters = self.0.priority_waiters.lock().expect("rise gate priority waiters");
+                *waiters -= 1;
+                if *waiters == 0 {
+                    self.0.cleared.notify_all();
+                }
+            }
+        }
+        {
+            let mut waiters = self.priority_waiters.lock().expect("rise gate priority waiters");
+            *waiters += 1;
+        }
+        let _waiter = WaiterGuard(self);
+        rises.lock().expect("the bank's charge rises")
+    }
+
+    /// Acquire `rises` as a background caller, yielding whenever any priority
+    /// caller is waiting so the priority caller acquires `rises` on the very
+    /// next release.
+    pub(super) fn hold_background<'a>(&self, rises: &'a Mutex<()>) -> MutexGuard<'a, ()> {
+        {
+            let mut waiters = self.priority_waiters.lock().expect("rise gate priority waiters");
+            while *waiters > 0 {
+                waiters = self.cleared.wait(waiters).expect("rise gate priority waiters");
+            }
+        }
+        rises.lock().expect("the bank's charge rises")
+    }
+
+    #[cfg(test)]
+    fn priority_waiters(&self) -> usize {
+        *self.priority_waiters.lock().expect("rise gate priority waiters")
+    }
+}
 
 /// One store's records: each group's slab store in the store's pool, a
 /// record a slab, its leading `lent` records over the lender's lent
@@ -34,6 +93,7 @@ pub(super) struct Stores {
     groups: Vec<SlabTensor>,
     lent: Vec<u64>,
     record_bytes: Vec<Vec<u64>>,
+    rise_gate: Arc<RiseGate>,
 }
 
 impl Stores {
@@ -46,7 +106,12 @@ impl Stores {
             lent.push(leading);
             record_bytes.push(bytes);
         }
-        Self { pool, block, groups: stores, lent, record_bytes }
+        Self { pool, block, groups: stores, lent, record_bytes, rise_gate: Arc::new(RiseGate::new()) }
+    }
+
+    /// Waiter-priority gate paired with the bank's `rises` mutex.
+    pub(super) fn rise_gate(&self) -> &Arc<RiseGate> {
+        &self.rise_gate
     }
 
     fn group(&self, group: usize) -> &SlabTensor {
@@ -126,37 +191,12 @@ impl Stores {
         self.pool.return_freed(freed)
     }
 
-    /// The backed record indices currently held in group `group`.
-    pub(super) fn backed(&self, group: usize) -> Vec<usize> {
-        seismic::memory::assert_blocking_allocation_allowed("Stores::backed");
-        self.group(group).backed()
-    }
-
     /// Record `record` of group `group`'s region `region`, while it is
     /// held. Safe inside a no-blocking-allocation scope: `Stores::groups`
     /// holds no outer mutex and `SlabTensor::slab_region` acquires only the
     /// `Slots::slabs` leaf lock (never held across allocation or submission).
     pub(super) fn view(&self, group: usize, region: usize, record: usize) -> Option<Tensor> {
         self.group(group).slab_region(record, region).expect("a record and region lie in their group's store")
-    }
-
-    /// All routed tensor views for each slot in `records` of group `group`,
-    /// delivered into residency's `Group::bank` at open and on `Join::Bank`.
-    pub(super) fn record_views(&self, group: usize, records: &[usize]) -> Vec<Vec<Tensor>> {
-        seismic::memory::assert_blocking_allocation_allowed("Stores::record_views");
-        let regions = self.group(group).region_count();
-        records
-            .iter()
-            .map(|&record| {
-                (0..regions)
-                    .map(|region| {
-                        self.view(group, region, record).unwrap_or_else(|| {
-                            panic!("invariant violated: record {record} of group {group} holds no storage")
-                        })
-                    })
-                    .collect()
-            })
-            .collect()
     }
 
     /// Each group's routed tensors' records the host addresses, resolved on
@@ -378,6 +418,21 @@ pub(super) fn grow_by_slots<S>(
     stop: &AtomicBool,
     begin: impl Fn() -> Option<S>,
 ) -> Grown {
+    grow_by_slots_gated(stores, (from, to), records, joining, changes, post, (slots, rises, None), stop, begin)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grow_by_slots_gated<S>(
+    stores: &Arc<Stores>,
+    (from, to): (u64, u64),
+    records: &RecordsAt,
+    joining: Joining,
+    changes: &Arc<Changes>,
+    post: impl Fn(Join),
+    (slots, rises, rise_gate): (&AtomicU64, &Mutex<()>, Option<&RiseGate>),
+    stop: &AtomicBool,
+    begin: impl Fn() -> Option<S>,
+) -> Grown {
     let groups = stores.groups.len();
     let mut reached = from;
     let mut joined: Option<(Instant, Instant)> = None;
@@ -398,10 +453,16 @@ pub(super) fn grow_by_slots<S>(
         spent.slots += 1;
         let claiming = Instant::now();
         // Acquire `rises` before `changes.back` (matching `domain::observe`
-        // order). `SlabTensor::add_slab` grows the pool outside slab/pool locks
-        // via single-flight `GrowGate` when no granule is free.
+        // order), yielding through `rise_gate` whenever a priority caller
+        // (`ExpertBank::hold_rises`) is waiting so background growth never
+        // starves domain observations. `SlabTensor::add_slab` grows the pool
+        // outside slab/pool locks via single-flight `GrowGate` when no granule
+        // is free.
         let claimed = {
-            let _rises = rises.lock().expect("the bank's charge rises");
+            let _rises = match rise_gate {
+                Some(gate) => gate.hold_background(rises),
+                None => rises.lock().expect("the bank's charge rises"),
+            };
             changes.back(|_| {
                 let mut claimed: Vec<Vec<usize>> = Vec::with_capacity(groups);
                 for group in 0..groups {
@@ -427,14 +488,7 @@ pub(super) fn grow_by_slots<S>(
         let joining_at = Instant::now();
         spent.claim += joining_at - claiming;
         let join = match &views {
-            None => {
-                let bank_views = claimed
-                    .iter()
-                    .enumerate()
-                    .map(|(group, records)| stores.record_views(group, records))
-                    .collect();
-                Join::Bank { records: claimed, views: bank_views }
-            }
+            None => Join::Bank { records: claimed },
             Some(views) => {
                 let records = claimed
                     .iter()
@@ -637,11 +691,22 @@ impl ExpertBank {
     ) -> Growing {
         let (decided, from, charged) = (Instant::now(), slots.load(Ordering::Acquire), stores.charged());
         let (shared, slots, stop) = (self.watcher.shared().clone(), slots.clone(), Arc::new(AtomicBool::new(false)));
-        let (stopping, rises, stores, records) = (stop.clone(), self.rises.clone(), stores.clone(), self.tier_counts(tier));
+        let (stopping, rises, rise_gate, stores, records) =
+            (stop.clone(), self.rises.clone(), self.stores.rise_gate().clone(), stores.clone(), self.tier_counts(tier));
         let changes = self.cache.changes().clone();
         let done = thread.run(wake, move || {
             let slot = || shared.backing_slot(&stopping);
-            grow_by_slots(&stores, (from, to), &records, joining, &changes, |join| shared.join(join), (&slots, &rises), &stopping, slot)
+            grow_by_slots_gated(
+                &stores,
+                (from, to),
+                &records,
+                joining,
+                &changes,
+                |join| shared.join(join),
+                (&slots, &rises, Some(&rise_gate)),
+                &stopping,
+                slot,
+            )
         });
         Growing { from, charged, decided, stop, done }
     }
@@ -1181,12 +1246,27 @@ impl ExpertBank {
 
             // Flush already-free or fenced pool granules first before evicting
             // more live bank slots.
-            let flushed = self
+            let mut flushed = self
                 .cache
                 .changes()
                 .clone()
                 .back(|_| stores.pool.return_freed_sync(deficit))
                 .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            // If at least one full block's worth of granules is already free
+            // in the pool yet nothing returned, an in-flight promotion or
+            // landing may momentarily hold a temporary view on the candidate
+            // block. Drain in-flight traffic so those views drop, then retry
+            // returning before evicting additional live slots.
+            if flushed == 0 && stores.pool.free_granules() as u64 * stores.pool.granule() >= block_bytes {
+                let _hold = self.watcher.shared().hold_traffic();
+                self.watcher.shared().wait_traffic_quiet().map_err(ReclaimError::Invariant)?;
+                flushed = self
+                    .cache
+                    .changes()
+                    .clone()
+                    .back(|_| stores.pool.return_freed_sync(deficit))
+                    .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            }
             total_returned = total_returned.saturating_add(flushed);
             if total_returned >= need {
                 break;
@@ -1299,5 +1379,75 @@ impl CacheReclaimer for BankReclaimer {
             return Err(ReclaimError::AtFloor);
         };
         bank.reclaim(self.tier, need)
+    }
+}
+
+#[cfg(test)]
+mod rise_gate_tests {
+    use super::RiseGate;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Under a tight background `hold_background` loop (modelling consecutive
+    /// `grow_by_slots` iterations), a `hold_priority` caller (`hold_rises`)
+    /// acquires `rises` on the very next release and is never starved.
+    #[test]
+    fn priority_caller_acquires_on_very_next_release() {
+        const ROUNDS: usize = 16;
+        let gate = Arc::new(RiseGate::new());
+        let rises = Arc::new(Mutex::new(()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let entered_round = Arc::new(AtomicUsize::new(0));
+        let completed_slots = Arc::new(AtomicUsize::new(0));
+        let hold_until_waiter = Arc::new(AtomicBool::new(true));
+
+        let bg = {
+            let (gate, rises, stop, entered_round, completed_slots, hold_until_waiter) = (
+                gate.clone(),
+                rises.clone(),
+                stop.clone(),
+                entered_round.clone(),
+                completed_slots.clone(),
+                hold_until_waiter.clone(),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let _guard = gate.hold_background(&rises);
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let slot = completed_slots.fetch_add(1, Ordering::AcqRel) + 1;
+                    if hold_until_waiter.swap(false, Ordering::AcqRel) {
+                        entered_round.store(slot, Ordering::Release);
+                        // Hold `rises` until the priority caller has registered
+                        // itself as a waiter, then drop and immediately loop to
+                        // try to re-acquire `rises` without yielding.
+                        while gate.priority_waiters() == 0 && !stop.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+            })
+        };
+
+        for expected_slot in 1..=ROUNDS {
+            while entered_round.load(Ordering::Acquire) < expected_slot {
+                std::thread::yield_now();
+            }
+            let _priority = gate.hold_priority(&rises);
+            let seen = completed_slots.load(Ordering::Acquire);
+            assert_eq!(
+                seen, expected_slot,
+                "priority caller was starved: expected acquisition right after slot {expected_slot}, saw {seen}"
+            );
+            if expected_slot < ROUNDS {
+                hold_until_waiter.store(true, Ordering::Release);
+            } else {
+                stop.store(true, Ordering::Release);
+            }
+        }
+
+        bg.join().expect("background thread finished cleanly");
+        assert_eq!(gate.priority_waiters(), 0);
     }
 }

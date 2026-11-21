@@ -94,18 +94,17 @@ fn the_bank_holds_at_most_its_ceiling_or_saturation() {
     assert_eq!(BankShape::host(SLOT, 256, 256, false).saturation_slots(), 256, "a device short of experts");
 }
 
-/// A miss curve bounds a growth, never what the bank holds: its deepest
-/// reuse only deepens as the decode counts steps, so a bank of 126 slots
-/// whose curve has found reuse 78 deep keeps its slots where the room holds
-/// them, grows no further, and still shrinks to a room short of them.
+/// A bank grows all the way to its structural ceiling whenever room allows
+/// and shrinks cleanly when room tightens — never capped by a shallow
+/// intermediate slot count.
 #[test]
-fn a_shallow_curve_bounds_growth_and_shrinks_nothing() {
+fn the_bank_grows_to_its_ceiling_and_shrinks_to_room() {
     let room = |slots: u64| (slots - 8) * SLOT;
-    let shape = |at| BankShape::curved(SLOT, 8, 226, Some(78), at);
-    assert_eq!(held_target(room(200), 126, 0, &shape(126), &charge), 126, "held past the curve");
-    assert_eq!(held_target(room(200), 60, 0, &shape(60), &charge), 78, "grown to the curve");
-    assert_eq!(held_target(room(100), 126, 0, &shape(126), &charge), 100, "shrunk to the room");
-    assert_eq!(BankShape::curved(SLOT, 8, 226, None, 126).saturation_slots(), 226, "no curve: the ceiling");
+    let full = BankShape::new(SLOT, 8, 226, 226);
+    assert_eq!(held_target(room(200), 126, 0, &full, &charge), 200, "grows into newly available room");
+    assert_eq!(held_target(room(300), 126, 0, &full, &charge), 226, "grows up to ceiling");
+    assert_eq!(held_target(room(100), 200, 0, &full, &charge), 100, "shrinks to tighter room");
+    assert_eq!(held_target(room(226), 100, 0, &full, &charge), 226, "regrows to ceiling after shrink");
 }
 
 /// One store's holdings, each at its floor, share its room in their order:

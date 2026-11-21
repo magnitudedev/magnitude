@@ -1,5 +1,5 @@
 use super::{ExpertBank, HeldTable};
-use magnitude_cost_model::{DecodePrice, LiveDecode};
+use magnitude_cost_model::LiveDecode;
 use crate::planning::BankTier;
 use crate::domain::{BankHolding, BankResize, BankResized, BankStep, DomainError, ElasticBank, ExpertResidency, ResizeTimes, TableResidency};
 use crate::experts::derived::{BankShape, HoldingTarget};
@@ -51,7 +51,7 @@ impl ServedBank {
             floors.push(recorded.carve(&ledger.store(), CommittedKind::Landing, ledger.bytes(&need)));
         }
         let landed = floors.iter().map(Claim::bytes).sum::<u64>();
-        for target in served.targets(None)? {
+        for target in served.targets()? {
             let floor = (target.charge)(target.shape.floor_slots());
             // A linked tier's floor holds its landing rows, carved above.
             let floor = match target.holding {
@@ -343,13 +343,10 @@ impl ElasticBank for ServedBank {
 
     /// Each holding as its target reads it, the experts first, then the
     /// host tier, then each table: within a store they share its room in
-    /// that order. The experts' slots hold at most their ceiling and where
-    /// the decode's misses stop falling on `price` (the ceiling before the
-    /// load is priced), a table's records where its curve's do, and the
-    /// host tier's host slots its ceiling (held still while its backing to
-    /// its planned slots runs). A curve bounds a growth, never what a
-    /// holding holds ([`BankShape::curved`]).
-    fn targets(&self, price: Option<&DecodePrice>) -> Result<Vec<HoldingTarget<'_>>, DomainError> {
+    /// that order. Each holding grows up to its structural ceiling as room
+    /// allows (the host tier held still while its backing to its planned slots
+    /// runs, and none beside a whole device bank).
+    fn targets(&self) -> Result<Vec<HoldingTarget<'_>>, DomainError> {
         let plan = &self.bank.plan;
         let counts = &self.bank.counts;
         let block = plan.block().held;
@@ -359,7 +356,7 @@ impl ElasticBank for ServedBank {
             tier: self.storage(BankHolding::Experts)?,
             at,
             owed: self.bank.cache.owed(BankHolding::Experts, self.above_floor(BankHolding::Experts, at)?),
-            shape: BankShape::curved(block, counts.floor(), plan.ceiling, price.and_then(DecodePrice::saturation), at),
+            shape: BankShape::new(block, counts.floor(), plan.ceiling, plan.ceiling),
             charge: Box::new(move |slots| counts.resident_charge(slots)),
         }];
         if let Some((host, ceiling)) = self.bank.host_tier() {
@@ -381,12 +378,13 @@ impl ElasticBank for ServedBank {
             let holding = BankHolding::Table { table: index };
             let (block, granule) = (plan.block(), plan.granule());
             let records = held.table.records();
+            let ceiling = held.plan.records.get();
             targets.push(HoldingTarget {
                 holding,
                 tier: self.storage(holding)?,
                 at: records,
                 owed: self.bank.cache.owed(holding, self.above_floor(holding, records)?),
-                shape: BankShape::curved(block.held, held.plan.floor, held.plan.records.get(), Some(held.table.curve().saturation()), records),
+                shape: BankShape::new(block.held, held.plan.floor, ceiling, ceiling),
                 charge: Box::new(move |records| {
                     crate::planning::BankTable::charge(block, granule, records).expect("invariant violated: a table's charge fits u64 at every size it holds")
                 }),

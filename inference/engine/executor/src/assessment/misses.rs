@@ -34,7 +34,10 @@ impl LayerStep {
     /// misses on demand and every read a hint saved, hit or not, which is
     /// what a bank without read-ahead would have missed.
     pub fn anticipated(&self) -> Anticipated {
-        Anticipated { file: self.misses - self.hinted + self.used, hinted: self.used }
+        Anticipated {
+            file: self.misses.saturating_sub(self.hinted).saturating_add(self.used),
+            hinted: self.used,
+        }
     }
 
     /// What the layer's misses added to its step along `lines`, its file
@@ -42,6 +45,9 @@ impl LayerStep {
     /// ([`magnitude_cost_model::StepTime`]): its routed experts each of the step's mean rows
     /// an expert.
     pub fn exposed(&self, lines: &ExpertLines, read: &ReadLine) -> f64 {
+        if self.routed == 0 {
+            return 0.;
+        }
         let all = [*lines];
         magnitude_cost_model::step_inputs(0., *read, ReadAhead::NONE, &all)
             .one(
@@ -258,5 +264,23 @@ mod tests {
         let seconds = |curve: &TableCurve| curve.step_seconds(0, &READ).unwrap();
         assert_eq!(seconds(&gridded), READ.latency_seconds() + READ.transfer_seconds(2. * page as f64));
         assert!(seconds(&whole) < seconds(&gridded));
+    }
+
+    #[test]
+    fn anticipated_saturates_when_hinted_exceeds_misses_or_addition_overflows() {
+        let step = LayerStep { misses: 1, hinted: 5, used: 3, ..LayerStep::default() };
+        assert_eq!(step.anticipated(), Anticipated { file: 3, hinted: 3 });
+
+        let huge = LayerStep { misses: u64::MAX, hinted: 0, used: 2, ..LayerStep::default() };
+        assert_eq!(huge.anticipated(), Anticipated { file: u64::MAX, hinted: 2 });
+    }
+
+    #[test]
+    fn exposed_returns_zero_when_nothing_was_routed() {
+        let lines = lines();
+        let empty = LayerStep::default();
+        assert_eq!(empty.exposed(&lines, &READ), 0.);
+        let unrouted_with_misses = LayerStep { routed: 0, choices: 0, hosted: 1, misses: 1, ..LayerStep::default() };
+        assert_eq!(unrouted_with_misses.exposed(&lines, &READ), 0.);
     }
 }

@@ -597,6 +597,8 @@ pub enum TierCopyError {
     /// The stall probe's work ran faster beside a copy than alone, beyond
     /// both timings' intervals: a bad measurement, never a stall of zero.
     FasterBeside { alone: f64, beside: f64 },
+    /// A recorded timing's median is not finite and positive.
+    InvalidTiming { point: TierCopyPoint, median: f64 },
     /// The transfer queue's batches make no line: the whole probe's batch
     /// took less than one record's, or a term is not finite.
     Transfer(InvalidLine),
@@ -613,6 +615,9 @@ impl fmt::Display for TierCopyError {
                 formatter,
                 "the stall probe ran faster beside a copy ({beside:e} s) than alone ({alone:e} s), beyond both intervals: a bad measurement"
             ),
+            Self::InvalidTiming { point, median } => {
+                write!(formatter, "{point} has a non-positive or non-finite median ({median:e} s)")
+            }
             Self::Transfer(invalid) => write!(formatter, "the transfer queue's batches: {invalid}"),
         }
     }
@@ -680,19 +685,33 @@ impl TierCopyCosts {
     /// grid until the job has measured them.
     pub fn stored(topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> Result<Self, TierCopyError> {
         let (backend, tensor_ops, identity) = (executor.backend(), executor.forms_tensor_operations(), executor_identity(topology, executor)?);
+        Self::stored_with(&identity, backend, tensor_ops, store)
+    }
+
+    fn stored_with(
+        identity: &seismic::Identity,
+        backend: seismic::BackendName,
+        tensor_ops: bool,
+        store: &dyn RecordStore<PointKey>,
+    ) -> Result<Self, TierCopyError> {
         let grid = magnitude_kernels::LIST_BLOCKS;
         let timing = |key: PointKey, point: TierCopyPoint| match store.load(&key)? {
-            Some(Record::Measured(timing)) => Ok(timing),
+            Some(Record::Measured(timing)) => {
+                if !timing.median.is_finite() || timing.median <= 0. {
+                    return Err(TierCopyError::InvalidTiming { point, median: timing.median });
+                }
+                Ok(timing)
+            }
             Some(Record::Unobtainable { reason }) => Err(TierCopyError::Unobtainable { point, reason }),
             None => Err(TierCopyError::Unrecorded { point }),
         };
         let median = |key: PointKey, point: TierCopyPoint| timing(key, point).map(|timing| timing.median);
-        let [one, whole] = [1, grid].map(|blocks| median(Self::key(&identity, backend, tensor_ops, blocks)?, TierCopyPoint::Copy { blocks }));
+        let [one, whole] = [1, grid].map(|blocks| median(Self::key(identity, backend, tensor_ops, blocks)?, TierCopyPoint::Copy { blocks }));
         let [one, whole] = [one?, whole?];
         // A block's rate against the link's, `R_link / r_block`, is the one
         // block's time over the whole grid's.
         let blocks = (one / whole).ceil().clamp(1., f64::from(grid)) as u32;
-        let [alone, beside] = [Beside::Alone, Beside::Copy].map(|beside| timing(Self::stall_key(&identity, backend, tensor_ops, beside)?, beside.named()));
+        let [alone, beside] = [Beside::Alone, Beside::Copy].map(|beside| timing(Self::stall_key(identity, backend, tensor_ops, beside)?, beside.named()));
         let (alone, beside) = (alone?, beside?);
         // The work beside a copy takes at least its time alone. Faster beside
         // it within the timings' intervals, a copy stalls nothing the probe
@@ -711,7 +730,7 @@ impl TierCopyCosts {
         // leaves its latency.
         let (records, bytes) = TIER_COPY_PROBE;
         let line = |direction: Direction| {
-            let [lone, full] = [1, records].map(|batch| median(Self::transfer_key(&identity, batch, direction), TierCopyPoint::Transfer { records: batch, direction }));
+            let [lone, full] = [1, records].map(|batch| median(Self::transfer_key(identity, batch, direction), TierCopyPoint::Transfer { records: batch, direction }));
             let (lone, full) = (lone?, full?);
             let byte_seconds = (full - lone) / ((records - 1) * bytes) as f64;
             ReadLine::new((lone - bytes as f64 * byte_seconds).max(0.), byte_seconds).map_err(TierCopyError::Transfer)
@@ -826,7 +845,7 @@ impl TierCopyCosts {
     pub fn depth(&self, bytes: u64) -> usize {
         let record = self.transfer.transfer_seconds(bytes as f64);
         assert!(record > 0., "a record of {bytes} bytes crosses the transfer queue in no time");
-        (1 + (self.transfer.latency_seconds() / record).ceil() as usize).max(2)
+        ((self.transfer.latency_seconds() / record).ceil() as usize).saturating_add(1).max(2)
     }
 }
 
@@ -865,6 +884,12 @@ impl<'s> Copying<'s> {
             Some(thread) => thread.join().expect("the copier's panic ends the process"),
             None => Ok(()),
         }
+    }
+}
+
+impl Drop for Copying<'_> {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
@@ -2119,6 +2144,78 @@ mod tests {
         let cpu_key = form.key(&topology, "one");
         assert!(matches!(cpu_key.subject, seismic::PointSubject::Host(_)));
         assert!(cpu_key.configuration.contains_key("threads"));
+    }
+
+    #[test]
+    fn tier_copy_depth_saturates_instead_of_overflowing() {
+        let line = ReadLine::new(1e300, 1e-10).unwrap();
+        let costs = TierCopyCosts { blocks: 1, whole_seconds: 1e-3, stall_share: 0., transfer: line, back: line };
+        assert_eq!(costs.depth(1), usize::MAX);
+    }
+
+    #[test]
+    fn tier_copy_stored_rejects_non_positive_or_non_finite_medians() {
+        let topology = seismic::Devices::discover(&[]).unwrap().topology();
+        let executor = topology.executors().first().expect("host discovers at least one executor");
+        let identity = executor_identity(&topology, executor).unwrap();
+        // Metal's kernel identity renders purely in Rust with no external toolchain (e.g. NVRTC).
+        let backend = seismic::BackendName::Metal;
+        let tensor_ops = false;
+        let grid = magnitude_kernels::LIST_BLOCKS;
+        let (records, _) = TIER_COPY_PROBE;
+        let seed = |store: &seismic::measure::HeldStore, key: PointKey, median: f64| {
+            store.store(&key, &Record::Measured(Timing { median, interval: None, samples: 1 })).unwrap();
+        };
+        let valid_store = || {
+            let store = seismic::measure::HeldStore::default();
+            seed(&store, TierCopyCosts::key(&identity, backend, tensor_ops, 1).unwrap(), 4e-3);
+            seed(&store, TierCopyCosts::key(&identity, backend, tensor_ops, grid).unwrap(), 1e-3);
+            seed(&store, TierCopyCosts::stall_key(&identity, backend, tensor_ops, Beside::Alone).unwrap(), 1e-3);
+            seed(&store, TierCopyCosts::stall_key(&identity, backend, tensor_ops, Beside::Copy).unwrap(), 1.2e-3);
+            for direction in [Direction::In, Direction::Out] {
+                seed(&store, TierCopyCosts::transfer_key(&identity, 1, direction), 1e-4);
+                seed(&store, TierCopyCosts::transfer_key(&identity, records, direction), 3.2e-3);
+            }
+            store
+        };
+        assert!(TierCopyCosts::stored_with(&identity, backend, tensor_ops, &valid_store()).is_ok());
+
+        for bad in [0.0, -1e-3, f64::NAN, f64::INFINITY] {
+            let points = [
+                (TierCopyCosts::key(&identity, backend, tensor_ops, 1).unwrap(), TierCopyPoint::Copy { blocks: 1 }),
+                (TierCopyCosts::key(&identity, backend, tensor_ops, grid).unwrap(), TierCopyPoint::Copy { blocks: grid }),
+                (TierCopyCosts::stall_key(&identity, backend, tensor_ops, Beside::Alone).unwrap(), TierCopyPoint::StallAlone),
+                (TierCopyCosts::stall_key(&identity, backend, tensor_ops, Beside::Copy).unwrap(), TierCopyPoint::StallBesideCopy),
+            ];
+            for (key, expected_point) in points {
+                let store = valid_store();
+                seed(&store, key, bad);
+                match TierCopyCosts::stored_with(&identity, backend, tensor_ops, &store) {
+                    Err(TierCopyError::InvalidTiming { point, .. }) => assert_eq!(point, expected_point),
+                    other => panic!("expected InvalidTiming for {expected_point:?} with median {bad}, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn copying_drop_stops_and_joins_background_thread() {
+        let store = seismic::measure::HeldStore::default();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stopping, done) = (stop.clone(), finished.clone());
+        let thread = std::thread::spawn(move || {
+            while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        {
+            let _copying = Copying { stop: stop.clone(), thread: std::sync::Mutex::new(Some(thread)), store: &store };
+        }
+        assert!(stop.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(finished.load(std::sync::atomic::Ordering::Acquire));
     }
 
     }

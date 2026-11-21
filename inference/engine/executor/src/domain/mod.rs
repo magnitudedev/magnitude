@@ -32,7 +32,7 @@ mod features;
 mod head;
 mod reader;
 mod serving_heap;
-pub use serving_heap::{Followed, FrontRegime, TwoRowPricing, Yielded};
+pub use serving_heap::{Followed, FrontRegime, StreamedVerifyPrior, TwoRowPricing, Yielded};
 mod in_flight;
 mod input;
 mod ownership;
@@ -978,16 +978,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// `read` of each of `bank`'s holdings beside its derived target, at
-    /// the decode's price and the ledgers' room now
-    /// (`experts::derived::derive`): the one derivation the bank follows
-    /// (`Self::next_bank_move`) and the domain reports
+    /// the ledgers' room now (`experts::derived::derive`): the one derivation
+    /// the bank follows (`Self::next_bank_move`) and the domain reports
     /// ([`Self::derived_targets`]).
     fn derive_bank<R>(
         &self,
         bank: &dyn ElasticBank,
         read: impl FnOnce(&[(&crate::experts::derived::HoldingTarget<'_>, u64)]) -> R,
     ) -> Result<R, DomainError> {
-        let holdings = bank.targets(self.decode_price()?.as_ref())?;
+        let holdings = bank.targets()?;
         Ok(read(&crate::experts::derived::derive(self.resources.ledgers(), &holdings)))
     }
 
@@ -997,7 +996,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         &self,
         bank: &dyn ElasticBank,
     ) -> Result<Vec<crate::experts::derived::DerivedTarget>, DomainError> {
-        derived_targets_for(self.resources.ledgers(), bank, self.decode_price()?.as_ref())
+        derived_targets_for(self.resources.ledgers(), bank)
     }
 
     /// The device's graph budget (`seismic::Device::graph_budget`) and what
@@ -1302,9 +1301,8 @@ struct StoreAnswer<'d> {
 fn derived_targets_for(
     ledgers: &crate::memory::ledger::DeviceLedgers,
     bank: &dyn ElasticBank,
-    decode_price: Option<&magnitude_cost_model::DecodePrice>,
 ) -> Result<Vec<crate::experts::derived::DerivedTarget>, DomainError> {
-    let holdings = bank.targets(decode_price)?;
+    let holdings = bank.targets()?;
     Ok(crate::experts::derived::derive(ledgers, &holdings)
         .iter()
         .map(|(target, slots)| crate::experts::derived::DerivedTarget {
@@ -1467,7 +1465,6 @@ impl<'d> MemoryProbe<'d> {
     fn running_pressure(
         &self,
         bank: &dyn ElasticBank,
-        decode_price: Option<&magnitude_cost_model::DecodePrice>,
     ) -> Option<RunningPressure> {
         let reader = self.memory.borrow();
         if self.resizing || !reader.pressured() {
@@ -1485,7 +1482,7 @@ impl<'d> MemoryProbe<'d> {
         // Beside a running chain the owner evicts nothing: the answer's
         // relief preempts no request.
         drop(self.answer(&std::collections::BTreeSet::new(), || {
-            derived_targets_for(self.ledgers, bank, decode_price).unwrap_or_default()
+            derived_targets_for(self.ledgers, bank).unwrap_or_default()
         }));
         match before - bank_cache() {
             0 => None,
@@ -2098,11 +2095,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         spare: crate::TargetGraphOutputLease,
     ) -> Result<Chain<F::TargetSubmission>, crate::programs::ChainRefusal> {
         // The family is lent to the chain, so the probe borrows the rest.
-        let decode_price = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG)
-            .then(|| self.decode_price().ok().flatten())
-            .flatten();
         let probe = MemoryProbe::of(&self.memory, self.resources.ledgers(), &self.answered, &self.resize_held);
-        let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank, decode_price.as_ref()));
+        let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank));
         self.note_running_cut();
         submitted
     }

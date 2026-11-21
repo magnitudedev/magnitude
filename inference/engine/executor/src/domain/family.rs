@@ -142,11 +142,9 @@ pub trait ElasticBank {
 
     /// Each holding as its derived target reads it
     /// (`experts::derived::HoldingTarget`), in the order its store's room
-    /// is shared: between its floor and the lesser of its ceiling and where
-    /// its misses stop falling on `price` (its ceiling before the load is
-    /// priced). The domain derives their targets from its ledgers
-    /// (`experts::derived::derive`).
-    fn targets(&self, price: Option<&magnitude_cost_model::DecodePrice>) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, super::DomainError>;
+    /// is shared: between its floor and its ceiling. The domain derives their
+    /// targets from its ledgers (`experts::derived::derive`).
+    fn targets(&self) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, super::DomainError>;
 
     /// The experts' slots a shrink releasing `bytes` reaches: the shallowest
     /// size that does, down to the floor; none at the floor. A test's way

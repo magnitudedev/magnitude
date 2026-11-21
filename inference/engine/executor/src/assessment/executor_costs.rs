@@ -293,12 +293,43 @@ impl MeasuredCost {
 
     /// `units` over each of `timing`'s times: a rate, its interval from the
     /// times' (the slowest time bounds it below).
+    ///
+    /// Panics if `units` or `timing.median` is not finite and positive.
     pub(super) fn rate(units: f64, timing: &Timing) -> Self {
+        assert!(
+            units.is_finite() && units > 0.0,
+            "rate units must be finite and positive, got {units}"
+        );
+        assert!(
+            timing.median.is_finite() && timing.median > 0.0,
+            "rate timing median must be finite and positive, got {}",
+            timing.median
+        );
         Self {
             value: units / timing.median,
             interval: timing
                 .interval
+                .filter(|&(fastest, slowest)| {
+                    fastest.is_finite()
+                        && fastest > 0.0
+                        && slowest.is_finite()
+                        && slowest > 0.0
+                        && slowest >= fastest
+                })
                 .map(|(fastest, slowest)| (units / slowest, units / fastest)),
+            samples: timing.samples,
+        }
+    }
+
+    /// `timing`'s seconds beyond `device`, clamped at `0.0`: cross-run jitter
+    /// or pipelined overlap can make a host timing fall below the median
+    /// device time, which must never yield a negative step cost.
+    fn beyond(timing: Timing, device: f64) -> Self {
+        Self {
+            value: (timing.median - device).max(0.0),
+            interval: timing
+                .interval
+                .map(|(low, high)| ((low - device).max(0.0), (high - device).max(0.0))),
             samples: timing.samples,
         }
     }
@@ -572,10 +603,25 @@ impl ExecutorCosts {
         let formats = self.chain.calls.iter().flat_map(Work::formats).collect::<Vec<_>>();
         let layouts = self.chain.calls.iter().filter_map(Work::layout).collect::<Vec<_>>();
         let priced = self.chain.layers as f64 * pricing::calls_seconds(&self.chain.calls, &self.rates(&formats, &layouts), depth)?;
+        if !priced.is_finite() || priced <= 0.0 {
+            return Err(AssessmentError::Demand(format!(
+                "the composition chain's priced time is not finite and positive ({priced})"
+            )));
+        }
         let timing = self.chain.timing;
+        if !timing.median.is_finite() || timing.median <= 0.0 {
+            return Err(AssessmentError::Demand(format!(
+                "the composition chain's measured time is not finite and positive ({})",
+                timing.median
+            )));
+        }
+        let interval = timing
+            .interval
+            .filter(|&(low, high)| low.is_finite() && high.is_finite() && low >= 0.0 && high >= low)
+            .map(|(low, high)| (low / priced, high / priced));
         Ok(MeasuredCost {
             value: timing.median / priced,
-            interval: timing.interval.map(|(low, high)| (low / priced, high / priced)),
+            interval,
             samples: timing.samples,
         })
     }
@@ -1422,12 +1468,11 @@ impl ProgramSet {
                 (0..set.converts.len()).map(Job::Convert).collect()
             };
             let formed = measuring.run(|| {
-                seismic::Workers::of_the_host().each(&jobs, |job| match *job {
-                    _ if !forming.formation.begin() => {}
-                    job => {
-                        forming.form(&set, &device, job);
-                        forming.formation.end();
-                    }
+                seismic::Workers::of_the_host().each(&jobs, |job| {
+                    let Some(_compiling) = forming.formation.begin() else {
+                        return;
+                    };
+                    forming.form(&set, &device, *job);
                 })
             });
             if let Err(panic) = formed {
@@ -1610,10 +1655,10 @@ impl Compiles {
         self.state.lock().expect("formation lock poisoned")
     }
 
-    /// A program begins to form once nothing holds the formation; false
+    /// A program begins to form once nothing holds the formation; `None`
     /// once the job's walks are done ([`Self::close`]): no point could read
-    /// it.
-    fn begin(&self) -> bool {
+    /// it. The returned guard releases the compile on drop (including unwind).
+    fn begin(self: &Arc<Self>) -> Option<Compiling> {
         let mut state = self.state();
         loop {
             if let Some(panic) = state.abandoned.clone() {
@@ -1621,11 +1666,11 @@ impl Compiles {
                 panic.resume();
             }
             if state.closed {
-                return false;
+                return None;
             }
             if state.held == 0 {
                 state.compiling += 1;
-                return true;
+                return Some(Compiling(Arc::clone(self)));
             }
             state = self.changed.wait(state).expect("formation lock poisoned");
         }
@@ -1638,17 +1683,12 @@ impl Compiles {
         self.changed.notify_all();
     }
 
-    /// A program [`Self::begin`] began has formed.
-    fn end(&self) {
-        self.state().compiling -= 1;
-        self.changed.notify_all();
-    }
-
     /// Hold the formation once no compile runs: no compile begins while it
     /// is held, and those running end, so the wait is theirs alone.
     fn hold(self: &Arc<Self>) -> Quiet {
         let mut state = self.state();
         state.held += 1;
+        let quiet = Quiet(Arc::clone(self));
         while state.compiling > 0 {
             if let Some(panic) = state.abandoned.clone() {
                 drop(state);
@@ -1656,12 +1696,23 @@ impl Compiles {
             }
             state = self.changed.wait(state).expect("formation lock poisoned");
         }
-        Quiet(self.clone())
+        quiet
     }
 
     fn abandon(&self, panic: &seismic::threads::Panic) {
         self.state().abandoned = Some(panic.clone());
         self.changed.notify_all();
+    }
+}
+
+/// A compile running on the formation thread ([`Compiles::begin`]),
+/// released as it drops so a panicking worker cannot leak `compiling`.
+struct Compiling(Arc<Compiles>);
+
+impl Drop for Compiling {
+    fn drop(&mut self) {
+        self.0.state().compiling -= 1;
+        self.0.changed.notify_all();
     }
 }
 
@@ -1883,7 +1934,11 @@ fn told<E: fmt::Display, G: fmt::Display>(outcome: Outcome<E, G>) -> Outcome<Str
 fn timed<M>(outcome: &Outcome<CallError, ExecutorCostsError>) -> Result<Timing, Stop<M>> {
     match outcome {
         Outcome::Loaded(record) => self::outcome(record),
-        Outcome::Measured(timing) => Ok(*timing),
+        Outcome::Measured(timing) if timing.median.is_finite() && timing.median > 0.0 => Ok(*timing),
+        Outcome::Measured(timing) => Err(Stop::Point(ExecutorCostsError(format!(
+            "measured timing median must be finite and positive, got {}",
+            timing.median
+        )))),
         Outcome::Skipped(reason) => Err(unobtainable(reason)),
         Outcome::Unformed(error) | Outcome::Unmade(error) => Err(Stop::Point(error.clone())),
         Outcome::Failed(error) => Err(Stop::Point(failed("timing a point")(error))),
@@ -1920,7 +1975,11 @@ impl Records<'_> {
 /// What a record gives the walk: its timing, or the point unobtainable.
 fn outcome<M>(record: &Record) -> Result<Timing, Stop<M>> {
     match record {
-        Record::Measured(timing) => Ok(*timing),
+        Record::Measured(timing) if timing.median.is_finite() && timing.median > 0.0 => Ok(*timing),
+        Record::Measured(timing) => Err(Stop::Point(ExecutorCostsError(format!(
+            "stored timing median must be finite and positive, got {}",
+            timing.median
+        )))),
         Record::Unobtainable { reason } => Err(unobtainable(reason)),
     }
 }
@@ -4218,13 +4277,9 @@ impl Read {
         };
         // A run's device time is its calls' (the launch cost is its share
         // of one); its host time beyond it is the step cost, whose interval
-        // is the host time's beyond the median device time.
+        // is the host time's beyond the median device time, clamped at zero
+        // against cross-run jitter or pipelined overlap.
         let device = launch.median;
-        let beyond = |timing: Timing| MeasuredCost {
-            value: timing.median - device,
-            interval: timing.interval.map(|(low, high)| (low - device, high - device)),
-            samples: timing.samples,
-        };
         let mut formats = self.formats.into_iter();
         Ok(Ok(ExecutorCosts {
             first: RouteCosts {
@@ -4256,8 +4311,8 @@ impl Read {
                     .map(|(low, high)| (low / GRAPH_CALLS as f64, high / GRAPH_CALLS as f64)),
                 samples: launch.samples,
             },
-            step_pipelined_seconds: beyond(queued),
-            step_round_trip_seconds: beyond(waited),
+            step_pipelined_seconds: MeasuredCost::beyond(queued, device),
+            step_round_trip_seconds: MeasuredCost::beyond(waited, device),
             unobtainable: self.unobtainable,
         }))
     }
@@ -5447,33 +5502,42 @@ mod tests {
             host: false,
         };
         let pause = std::time::Duration::from_millis(20);
-        assert!(programs.formation.begin(), "nothing holds the formation");
+        let compiling = programs
+            .formation
+            .begin()
+            .expect("nothing holds the formation");
         let held = std::thread::scope(|scope| {
             let hold = scope.spawn(|| programs.quiet(true).is_some());
             std::thread::sleep(pause);
             assert!(!hold.is_finished(), "a hold waits for the program forming");
-            programs.formation.end();
+            drop(compiling);
             hold.join().unwrap()
         });
         assert!(held, "the program formed, the hold is taken");
         let quiet = programs.quiet(true).expect("a point that touches the host holds the formation");
-        std::thread::scope(|scope| {
+        let compiling = std::thread::scope(|scope| {
             let begun = scope.spawn(|| programs.formation.begin());
             std::thread::sleep(pause);
             assert!(!begun.is_finished(), "no program begins while held");
             drop(quiet);
-            assert!(begun.join().unwrap(), "the hold released, the program begins");
+            begun
+                .join()
+                .unwrap()
+                .expect("the hold released, the program begins")
         });
         std::thread::scope(|scope| {
             let point = scope.spawn(|| programs.kernel(&programs.walk().copy).is_err());
             std::thread::sleep(pause);
             assert!(!point.is_finished(), "a point waits for its kernel forming");
             programs.walk().copy.set(Err(ExecutorCostsError("no kernel".into())));
-            programs.formation.end();
+            drop(compiling);
             assert!(point.join().unwrap(), "a kernel that failed to form never makes its point");
         });
         programs.formation.close();
-        assert!(!programs.formation.begin(), "no program begins once the walks are done");
+        assert!(
+            programs.formation.begin().is_none(),
+            "no program begins once the walks are done"
+        );
     }
 
     /// A job's scratch is what it lays out in device storage: on a machine
@@ -5967,5 +6031,145 @@ mod tests {
         // F32 pilot at 100 GB/s = 50 GFLOP/s; with ratio = 1 it stays 50 GFLOP/s.
         cpu.first.formats = vec![(f32_el, FormatRates { pilot: rate(100e9), streamed: None })];
         assert!((cpu.matrix_flops(f32_el) - 50e9).abs() < 1e3, "got {}", cpu.matrix_flops(f32_el));
+    }
+
+    /// Dropping a `Compiling` guard on worker unwind releases `compiling` and
+    /// wakes waiting holds, and resuming an abandoned panic inside `hold`
+    /// releases `held` via its `Quiet` guard.
+    #[test]
+    fn compiling_and_quiet_guards_release_on_unwind() {
+        let compiles = Arc::new(Compiles::default());
+        let pause = std::time::Duration::from_millis(20);
+
+        // A worker panicking while holding `Compiling` must not leak `compiling`
+        // or deadlock a concurrent `hold()`.
+        let panicked = std::thread::scope(|scope| {
+            let compiles_worker = Arc::clone(&compiles);
+            let compiling = compiles_worker.begin().expect("compile begins");
+            let hold = scope.spawn(|| {
+                let _quiet = compiles.hold();
+            });
+            std::thread::sleep(pause);
+            assert!(!hold.is_finished(), "hold waits while compile is active");
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _guard = compiling;
+                panic!("worker boom");
+            }))
+            .is_err();
+            hold.join().unwrap();
+            unwound
+        });
+        assert!(panicked);
+        assert_eq!(compiles.state().compiling, 0);
+        assert_eq!(compiles.state().held, 0);
+
+        // `Quiet` is constructed before `hold()` waits on `compiling > 0`, so
+        // resuming an abandoned panic releases `held` on unwind.
+        let active = compiles.begin().expect("compile begins");
+        let panic = seismic::threads::Submitter::here()
+            .run::<()>(|| panic!("formation panic"))
+            .unwrap_err();
+        let held_unwound = std::thread::scope(|scope| {
+            let holder = scope.spawn(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _quiet = compiles.hold();
+                }))
+                .is_err()
+            });
+            std::thread::sleep(pause);
+            assert!(!holder.is_finished(), "hold waits while a compile runs");
+            compiles.abandon(&panic);
+            holder.join().unwrap()
+        });
+        assert!(held_unwound, "hold resumed the abandoned panic");
+        assert_eq!(compiles.state().held, 0, "Quiet guard released held on unwind");
+        drop(active);
+        assert_eq!(compiles.state().compiling, 0);
+    }
+
+    /// Host step timings below the median device time (from cross-run jitter
+    /// or pipelined overlap) clamp to `0.0` for both median and interval bounds.
+    #[test]
+    fn step_beyond_clamps_negative_values_and_intervals_at_zero() {
+        let device = 100e-6;
+        let below = MeasuredCost::beyond(
+            Timing { median: 90e-6, interval: Some((85e-6, 95e-6)), samples: 16 },
+            device,
+        );
+        assert_eq!(below.value, 0.0);
+        assert_eq!(below.interval, Some((0.0, 0.0)));
+        assert_eq!(below.samples, 16);
+
+        let straddling = MeasuredCost::beyond(
+            Timing { median: 110e-6, interval: Some((95e-6, 125e-6)), samples: 8 },
+            device,
+        );
+        assert!((straddling.value - 10e-6).abs() < 1e-18);
+        let (low, high) = straddling.interval.unwrap();
+        assert_eq!(low, 0.0);
+        assert!((high - 25e-6).abs() < 1e-18);
+
+        let above = MeasuredCost::beyond(
+            Timing { median: 140e-6, interval: Some((120e-6, 160e-6)), samples: 12 },
+            device,
+        );
+        assert!((above.value - 40e-6).abs() < 1e-18);
+        let (low, high) = above.interval.unwrap();
+        assert!((low - 20e-6).abs() < 1e-18);
+        assert!((high - 60e-6).abs() < 1e-18);
+    }
+
+    /// Stored or direct timings with non-positive or non-finite medians never
+    /// propagate `NaN` or `inf` into rates, loaded records, or composition ratios.
+    #[test]
+    fn rate_outcome_and_composition_guard_against_non_positive_or_non_finite_timings() {
+        let timing = |median, interval| Timing { median, interval, samples: 16 };
+
+        // Valid `MeasuredCost::rate` computes finite positive value and interval.
+        let valid = MeasuredCost::rate(1000.0, &timing(2.0, Some((1.0, 4.0))));
+        assert_eq!(valid.value, 500.0);
+        assert_eq!(valid.interval, Some((250.0, 1000.0)));
+
+        // Degenerate interval bounds drop to `None` instead of yielding `inf`/`NaN`.
+        assert_eq!(MeasuredCost::rate(1000.0, &timing(2.0, Some((0.0, 4.0)))).interval, None);
+        assert_eq!(MeasuredCost::rate(1000.0, &timing(2.0, Some((f64::NAN, 4.0)))).interval, None);
+        assert_eq!(MeasuredCost::rate(1000.0, &timing(2.0, Some((5.0, 4.0)))).interval, None);
+
+        // Non-positive or non-finite medians or units panic in `MeasuredCost::rate`.
+        for bad_median in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let panicked = std::panic::catch_unwind(|| {
+                MeasuredCost::rate(1000.0, &timing(bad_median, None))
+            })
+            .is_err();
+            assert!(panicked, "expected rate to reject median={bad_median}");
+            assert!(
+                matches!(
+                    outcome::<()>(&Record::Measured(timing(bad_median, None))),
+                    Err(Stop::Point(_))
+                ),
+                "expected outcome to reject stored median={bad_median}"
+            );
+        }
+        for bad_units in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let panicked = std::panic::catch_unwind(|| {
+                MeasuredCost::rate(bad_units, &timing(1.0, None))
+            })
+            .is_err();
+            assert!(panicked, "expected rate to reject units={bad_units}");
+        }
+
+        // `ExecutorCosts::composition` returns `Err(AssessmentError::Demand(_))`
+        // for non-positive/non-finite measured time or priced time.
+        for bad_median in [0.0, -1e-3, f64::NAN, f64::INFINITY] {
+            let mut costs = crate::assessment::fixtures::costs();
+            costs.chain.timing.median = bad_median;
+            assert!(
+                matches!(costs.composition(), Err(AssessmentError::Demand(_))),
+                "expected composition to reject chain median={bad_median}"
+            );
+        }
+        let mut zero_priced = crate::assessment::fixtures::costs();
+        zero_priced.chain.layers = 0;
+        assert!(matches!(zero_priced.composition(), Err(AssessmentError::Demand(_))));
     }
 }

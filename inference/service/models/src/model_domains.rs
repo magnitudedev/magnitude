@@ -27,7 +27,7 @@ pub struct ModelDomainResolver {
 /// hold (which catalog models serve without their drafter), counted by `generation`.
 pub(crate) struct CatalogChanges {
     pub(crate) generation: AtomicU64,
-    pub(crate) changes: tokio::sync::broadcast::Sender<ModelDomainInvalidation>,
+    pub(crate) changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl ModelDomainResolver {
@@ -39,7 +39,7 @@ impl ModelDomainResolver {
             local: LocalModelsContext::new(),
             catalog_changes: CatalogChanges {
                 generation: AtomicU64::new(0),
-                changes: tokio::sync::broadcast::channel(32).0,
+                changes: tokio::sync::watch::channel(0).0,
             },
             upstream: UpstreamUpdates::new(),
         })
@@ -95,16 +95,12 @@ pub fn managed_model_services(
 
 pub(crate) fn domain_changes(
     initial_revision: u64,
-    receiver: tokio::sync::broadcast::Receiver<ModelDomainInvalidation>,
+    receiver: tokio::sync::watch::Receiver<u64>,
 ) -> BoxStream<'static, ModelDomainInvalidation> {
     let changes = futures_util::stream::unfold(receiver, |mut receiver| async move {
-        loop {
-            match receiver.recv().await {
-                Ok(event) => return Some((event, receiver)),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-            }
-        }
+        receiver.changed().await.ok()?;
+        let revision = *receiver.borrow_and_update();
+        Some((ModelDomainInvalidation { revision }, receiver))
     });
     Box::pin(
         futures_util::stream::once(async move {
@@ -114,4 +110,26 @@ pub(crate) fn domain_changes(
         })
         .chain(changes),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn domain_changes_coalesces_bursts_without_dropping_latest_revision() {
+        let (tx, _rx) = tokio::sync::watch::channel(0u64);
+        let mut stream = domain_changes(1, tx.subscribe());
+        assert_eq!(stream.next().await.expect("initial").revision, 1);
+
+        for rev in 2..=128 {
+            tx.send_replace(rev);
+        }
+
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("coalesced wakeup arrived")
+            .expect("stream open");
+        assert_eq!(next.revision, 128);
+    }
 }

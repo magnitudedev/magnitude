@@ -1792,6 +1792,65 @@ fn the_m4_pros_recorded_sample_prices_the_wired_grant() {
     );
 }
 
+/// `PlanningRoom::capacity()` returns the store's structural capacity
+/// (`total.min(grant_limit)`), never momentary free room (`net()`), so a load
+/// starting under memory pressure plans a bank ceiling that can grow into
+/// freed RAM later.
+#[test]
+fn planning_room_capacity_is_structural_not_momentary_free() {
+    use crate::domain::PlanningRoom;
+    use crate::SettleRoom;
+
+    // 64 GiB Mac with 48 GiB working set, but only 20 GiB currently free because
+    // another app holds ~44 GiB.
+    const TOTAL_64G: u64 = 64 * GB;
+    const WORKING_SET_48G: u64 = 48 * GB;
+    const FREE_20G: u64 = 20 * GB;
+    let scope = Ledgers::new();
+    let mut sample_data = seismic::host_samples::m4_pro();
+    sample_data.total = TOTAL_64G;
+    sample_data.supply = seismic::Supply {
+        free_beyond_target: i64::try_from(FREE_20G).unwrap(),
+        clean_cache: 0,
+        cold_reclaimable: 0,
+    };
+    sample_data.wired = Some(seismic::WiredFigures {
+        limit: seismic::WiredLimit::OsDefault,
+        wire_count: 8 * GB,
+    });
+    let sample = Sample::scripted(scope.changes(), sample_data);
+    let (ledgers, reading) = DeviceLedgers::unified_in(&scope, shape())
+        .read_granted(&sample, DeviceGrant::Wired { working_set: WORKING_SET_48G });
+    let room = PlanningRoom::new(&reading, &ledgers);
+    assert_eq!(room.net(), FREE_20G, "momentary free room at load is 20 GiB");
+    assert_eq!(
+        room.capacity().unwrap(),
+        WORKING_SET_48G,
+        "structural capacity is 48 GiB working set, not momentary 20 GiB free"
+    );
+
+    // Unified Linux CUDA (128 GiB host, 120 GiB CUDA limit) with 30 GiB free at load.
+    let mut linux_sample = seismic::host_samples::m4_pro();
+    linux_sample.total = 128 * GB;
+    linux_sample.wired = None;
+    linux_sample.supply = seismic::Supply {
+        free_beyond_target: i64::try_from(30 * GB).unwrap(),
+        clean_cache: 0,
+        cold_reclaimable: 0,
+    };
+    let l_scope = Ledgers::new();
+    let l_sample = Sample::scripted(l_scope.changes(), linux_sample);
+    let (l_ledgers, l_reading) = DeviceLedgers::unified_in(&l_scope, shape())
+        .read_granted(&l_sample, DeviceGrant::HostLimit { limit: 120 * GB });
+    let l_room = PlanningRoom::new(&l_reading, &l_ledgers);
+    assert_eq!(l_room.net(), 30 * GB, "momentary free room at load is 30 GiB");
+    assert_eq!(l_room.capacity().unwrap(), 120 * GB, "structural capacity is 120 GiB CUDA limit");
+
+    // Discrete GPU (24 GiB VRAM) with 10 GiB free at load.
+    let discrete = Reading::device(24 * GB, 10 * GB, seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO });
+    assert_eq!(discrete.capacity(), 24 * GB, "structural VRAM capacity is 24 GiB");
+}
+
 /// A Linux unified-memory host (NVIDIA GB10: CUDA and Vulkan sharing host
 /// RAM with `wired == None`) prices CPU, CUDA total-memory, and Vulkan
 /// heap-budget grants on the one host-RAM store without requiring macOS
@@ -2221,7 +2280,176 @@ fn non_pooled_entry_take_refuses_when_only_pool_spare_remains() {
     // A non-pooled Device entry asking for 2 GB cannot take the records pool's
     // spare bytes: it must return Err(Refused), never panic.
     let own = seismic::memory::Store::own(&ledger);
-    let result = ledger.change(|_| own.take(&own.change(), 2 * GB, Pageable));
-    assert!(result.is_err(), "non-pooled entry_take must refuse when only pool spare covers the shortfall");
+    let refused = ledger
+        .change(|_| own.take(&own.change(), 2 * GB, Pageable))
+        .expect_err("non-pooled entry_take must refuse when only pool spare covers the shortfall");
+    assert_eq!(refused, seismic::memory::Refused { required: 2 * GB, available: 1 * GB });
+    // A pool entry refusing when free room < lacks must also report available < required,
+    // never adding unrelated cache bytes onto `available`.
+    let pool_refused = ledger
+        .change(|_| pools.state.take(&pools.state.change(), 2 * GB, Pageable))
+        .expect_err("pool entry_take must refuse when free room < lacks");
+    assert_eq!(pool_refused, seismic::memory::Refused { required: 2 * GB, available: 1 * GB });
     ledger.change(|_| pools.records.freed(&pools.records.change(), 3 * GB, Pageable));
+}
+
+#[test]
+fn relief_skips_at_floor_pool_and_reclaims_bank_synchronously() {
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 4 * GB, 4 * GB, None);
+
+    // State pool has 1 GB of unfreeable spare bytes (reclaimer returns AtFloor).
+    ledger.change(|_| pools.state.take(&pools.state.change(), 1 * GB, Pageable)).expect("state pool fits");
+    struct FloorPool;
+    impl CacheReclaimer for FloorPool {
+        fn reclaim(&self, _need: u64) -> Result<u64, ReclaimError> {
+            Err(ReclaimError::AtFloor)
+        }
+    }
+    ledger.register_pool_reclaimer(PoolClass::State, Arc::new(FloorPool));
+
+    // Bank holds 3 GB of reclaimable cache (worth > 0 so it ranks after Pool spare).
+    struct BankReclaim {
+        ledger: Ledger,
+        pool: Arc<dyn seismic::memory::Entry>,
+        piece: std::sync::Mutex<Option<Cached>>,
+    }
+    impl CacheReclaimer for BankReclaim {
+        fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+            let mut guard = self.piece.lock().unwrap();
+            let Some(cached) = guard.take() else {
+                return Err(ReclaimError::AtFloor);
+            };
+            let bytes = cached.bytes();
+            let cut = bytes.min(need);
+            self.ledger.change(|_| {
+                drop(cached);
+                self.pool.freed(&self.pool.change(), bytes, Pageable);
+            });
+            Ok(cut)
+        }
+    }
+    let bank_claim = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 3 * GB))
+        .expect("bank backing fits");
+    ledger.change(|_| pools.records.take(&pools.records.change(), 3 * GB, Pageable)).expect("records pool allocates");
+    let reclaimer = Arc::new(BankReclaim {
+        ledger: ledger.clone(),
+        pool: pools.records.clone(),
+        piece: std::sync::Mutex::new(None),
+    });
+    let weak = Arc::downgrade(&reclaimer) as std::sync::Weak<dyn CacheReclaimer>;
+    let bank_cache = ledger.change(|_| bank_claim.into_backed_cache(CacheKind::Bank, Reclaim::Backed(weak)));
+    bank_cache.value(Value::per_byte(1.0, NonZeroU64::new(GB).unwrap()));
+    *reclaimer.piece.lock().unwrap() = Some(bank_cache);
+
+    // First relief pass picks Pool(State) spare (worth 0) -> AtFloor -> recorded in `exhausted`.
+    let mut exhausted = std::collections::BTreeSet::new();
+    let plan1 = ledger
+        .plan_relief_excluding(1 * GB, Relief::CacheOnly, Frees::Room, &exhausted)
+        .expect("first plan covers 1 GB from state pool spare");
+    let owed1 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan1));
+    assert_eq!(owed1.reclaimed, 0);
+    assert_eq!(owed1.yielded, 0);
+    assert!(!owed1.exhausted.is_empty());
+    exhausted.extend(owed1.exhausted);
+
+    // Second relief pass excludes exhausted Pool(State) and synchronously reclaims Bank.
+    let plan2 = ledger
+        .plan_relief_excluding(1 * GB, Relief::CacheOnly, Frees::Room, &exhausted)
+        .expect("second plan covers 1 GB from bank cache");
+    let owed2 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan2));
+    assert_eq!(owed2.reclaimed, 1 * GB);
+    assert!(owed2.exhausted.is_empty());
+
+    ledger.change(|_| pools.state.freed(&pools.state.change(), 1 * GB, Pageable));
+}
+
+/// `Ledger::grant(GrantRole::Measurement, ...)` synchronously reclaims backed
+/// `CacheKind::Bank` cache before admitting the grant, leaves `Reclaim::Deferred`
+/// cache untouched, and refuses shortfalls (including a `PAST` room probe)
+/// without spuriously draining the bank.
+#[test]
+fn measurement_grant_reclaims_bank_cache_and_refuses_shortfall_without_draining() {
+    use std::sync::{Mutex, Weak};
+
+    struct FakeBankReclaimer {
+        cached: Mutex<Option<Cached>>,
+        pool: Arc<dyn seismic::memory::Entry>,
+        calls: AtomicU64,
+    }
+    impl CacheReclaimer for FakeBankReclaimer {
+        fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut guard = self.cached.lock().unwrap();
+            let Some(cached) = guard.as_mut() else {
+                return Err(ReclaimError::AtFloor);
+            };
+            let has = cached.bytes();
+            let free = has.min(need);
+            if free == 0 {
+                return Err(ReclaimError::AtFloor);
+            }
+            if free == has {
+                drop(guard.take());
+            } else {
+                drop(cached.split(free, CacheKind::Bank));
+            }
+            self.pool.freed(&self.pool.change(), free, Pageable);
+            Ok(free)
+        }
+    }
+
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    // 12 GB available: 2 GB committed weights, 2 GB deferred Prefix cache,
+    // 8 GB backed Bank cache (0 free, 0 allocatable).
+    read(&ledger, &mut clock, 64 * GB, 12 * GB, Some(64 * GB));
+    let _weights = commit(&ledger, 2 * GB);
+    let _deferred_prefix = ledger.cached_with(CacheKind::Prefix, 2 * GB, Reclaim::Deferred).expect("prefix fits");
+
+    let reclaimer = Arc::new(FakeBankReclaimer {
+        cached: Mutex::new(None),
+        pool: pools.records.clone(),
+        calls: AtomicU64::new(0),
+    });
+    let bank_cache = ledger
+        .cached_with(CacheKind::Bank, 8 * GB, Reclaim::Backed(Arc::downgrade(&reclaimer) as Weak<dyn CacheReclaimer>))
+        .expect("bank cache fits");
+    *reclaimer.cached.lock().unwrap() = Some(bank_cache);
+    assert_eq!(ledger.estimate().allocatable(), 0, "all 12 GB allocated");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 8 * GB);
+
+    // 1. `PAST` room probe exceeds reclaimable room (8 GB) -> Err(Short) without
+    //    invoking the reclaimer or draining the bank; `PAST - over == 8 GB`.
+    const PAST: u64 = u64::MAX / 4;
+    let probe = ledger
+        .change(|keeping| ledger.grant(&keeping.claims(), GrantRole::Measurement, PAST))
+        .err()
+        .expect("PAST probe must be refused");
+    assert_eq!(PAST - probe.over, 8 * GB, "room equals reclaimable bank cache (deferred prefix excluded)");
+    assert_eq!(reclaimer.calls.load(Ordering::Relaxed), 0, "PAST probe must not drain the bank");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 8 * GB);
+
+    // 2. Requesting 9 GB (exceeds 8 GB reclaimable bank; deferred prefix is not
+    //    reclaimable without freeing backing) -> Err(Short { over: 1 GB }), 0 calls.
+    let short = ledger
+        .change(|keeping| ledger.grant(&keeping.claims(), GrantRole::Measurement, 9 * GB))
+        .err()
+        .expect("exceeds reclaimable room");
+    assert_eq!(short.over, 1 * GB);
+    assert_eq!(reclaimer.calls.load(Ordering::Relaxed), 0, "shortfall must not drain the bank");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Prefix), 2 * GB, "deferred prefix untouched");
+
+    // 3. Requesting 5 GB synchronously reclaims 5 GB of Bank cache before admitting.
+    let grant = ledger
+        .change(|keeping| ledger.grant(&keeping.claims(), GrantRole::Measurement, 5 * GB))
+        .expect("measurement grant reclaims bank cache");
+    assert!(reclaimer.calls.load(Ordering::Relaxed) >= 1, "reclaimer was invoked");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 3 * GB, "bank shrunk by 5 GB");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Prefix), 2 * GB, "deferred prefix untouched");
+    assert_eq!(ledger.estimate().committed(), 7 * GB, "2 GB weights + 5 GB measurement grant");
+    assert!(ledger.estimate().allocatable() >= 5 * GB, "5 GB physically freed for measurement process");
+    drop(grant);
 }

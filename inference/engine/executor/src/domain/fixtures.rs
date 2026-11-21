@@ -1440,20 +1440,19 @@ impl ElasticBank for FakeBank {
         Ok(())
     }
 
-    /// Its slots, a granule each, from one to where its decode's
-    /// misses stop falling on `price` (every row before the load is
-    /// priced), and its host tier's, a byte of upload storage each, to its
-    /// ceiling: derived from the domain's ledgers as the served bank's are.
-    fn targets(&self, price: Option<&magnitude_cost_model::DecodePrice>) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, DomainError> {
+    /// Its slots, a granule each, from one to every row, and its host tier's,
+    /// a byte of upload storage each, to its ceiling: derived from the
+    /// domain's ledgers as the served bank's are.
+    fn targets(&self) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, DomainError> {
         use crate::experts::derived::{BankShape, HoldingTarget};
         let (rows, unit) = (self.experts(), self.row());
-        let (curve, at) = (price.and_then(magnitude_cost_model::DecodePrice::saturation), self.slots());
+        let at = self.slots();
         let mut targets = vec![HoldingTarget {
             holding: crate::BankHolding::Experts,
             tier: crate::planning::BankTier::Bank,
             at,
             owed: self.cache.owed(crate::BankHolding::Experts, at.saturating_sub(1) * unit),
-            shape: BankShape::curved(unit, 1, rows, curve, at),
+            shape: BankShape::new(unit, 1, rows, rows),
             charge: Box::new(move |slots| slots * unit),
         }];
         if self.host_ceiling > 0 {

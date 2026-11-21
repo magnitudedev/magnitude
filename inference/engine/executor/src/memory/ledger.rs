@@ -98,6 +98,7 @@ pub use claims::{ArenaClaim, Cached, Claim};
 pub use estimate::Estimate;
 pub use grant::{Footprints, Grant, SystemFootprints};
 pub use relief::{Owed, Relief, ReliefPlan};
+pub use state::EntryId;
 pub use reservation::Reservation;
 pub use view::{ChargeClasses, Ledger, Standing};
 pub use vocabulary::{CacheKind, CommittedKind, Entry, GrantRole, Holding, LoadShape, Need, PoolClass, RequestRows, StoreShape, Value};

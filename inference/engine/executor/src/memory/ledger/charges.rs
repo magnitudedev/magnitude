@@ -182,10 +182,6 @@ impl State {
             Holding::Pool(class) => self.spare_at(class, entry.allocated.checked_add(bytes).expect("a store's bytes fit u64")) - entry.bytes,
             _ => bytes.saturating_sub(entry.bytes - entry.allocated),
         };
-        let refused = |state: &Self| seismic::memory::Refused {
-            required: bytes,
-            available: state.free_for(at, entry.holding, lacks) + state.cache,
-        };
         // The one bound on an allocation: the bytes the budget leaves beside
         // what the process has allocated. A claim holding cache it took in
         // process allocates it only once its holder freed it.
@@ -196,17 +192,28 @@ impl State {
         match entry.holding {
             _ if lacks == 0 => {}
             Holding::Pool(_) => {
-                if self.free_for(at, entry.holding, lacks) < lacks {
-                    return Err(refused(self));
+                let free = self.free_for(at, entry.holding, lacks);
+                if free < lacks {
+                    return Err(seismic::memory::Refused {
+                        required: bytes,
+                        available: (bytes - lacks) + free,
+                    });
                 }
             }
             Holding::Committed(kind) => {
-                let taken = self.take(at, kind, lacks).map_err(|_| refused(self))?;
+                let taken = self.take(at, kind, lacks).map_err(|over| seismic::memory::Refused {
+                    required: bytes,
+                    available: bytes.saturating_sub(over.bytes),
+                })?;
                 self.merge(taken, id);
             }
             Holding::Cache(_) => {
-                if self.free_for(at, entry.holding, lacks) < lacks {
-                    return Err(refused(self));
+                let free = self.free_for(at, entry.holding, lacks);
+                if free < lacks {
+                    return Err(seismic::memory::Refused {
+                        required: bytes,
+                        available: (bytes - lacks) + free,
+                    });
                 }
                 self.resize(id, entry.bytes + lacks);
             }

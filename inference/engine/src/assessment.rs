@@ -36,9 +36,9 @@ use magnitude_chat::{
 };
 use magnitude_executor::{
     assessment::{
-        assess::assess_execution_fit_at_context, estimate_execution, lookahead, performance_depths,
-        pool, streamed_layers, stage_timer, AssessmentError, DecodeDemand, SizingScope,
-        StructuralCharge, AssessmentRequest,
+        assess_execution_fit_with_priced_bank, estimate_execution, lookahead, performance_depths,
+        pool, streamed_layers, stage_timer, AssessmentError, DecodeDemand, PricedBankContext,
+        SizingScope, StructuralCharge, AssessmentRequest,
         ExecutionAssessment, ExecutionFit, ExecutionShortfall,
         ExecutorCosts, ExpertShares, PerformanceEstimate, PreparedExecutionAssessment,
         PointRequests, Priced, StoredCosts, StreamedFigures,
@@ -615,23 +615,24 @@ pub fn finish_model_assessment(
     let definition = execution.definition();
     let structure = &setup.structure;
     let pricing = structure.selected.graph_cost;
-    let bank_prices = match &setup.measurements {
+    let priced_bank = match &setup.measurements {
         Measurements::Measured {
             costs,
             streamed: Priced::Measured(figures),
             ..
-        } => Some((&**costs, figures)),
+        } => PricedBankContext::new(execution, costs, figures)
+            .map_err(ModelAssessmentError::Assessment)?,
         _ => None,
     };
     let served = served_tier(tiers.len(), |index| {
         let tier = tiers[index];
-        let fit = assess_execution_fit_at_context(
+        let fit = assess_execution_fit_with_priced_bank(
             u64::from(tier),
             execution,
             pricing,
             &structure.topology,
             &structure.status,
-            bank_prices,
+            priced_bank.as_ref(),
         )
         .map_err(ModelAssessmentError::Assessment)?;
         Ok::<_, ModelAssessmentError>(match fit {
@@ -666,6 +667,7 @@ pub fn finish_model_assessment(
                     &request,
                     shares.held(shares.slots()),
                     shares.held(shares.floor()),
+                    priced_bank.as_ref(),
                 )?;
                 ModelResidency::Streamed {
                     performance,
@@ -756,27 +758,33 @@ fn streamed_estimates<const N: usize>(
     bank: &ExpertBankPlan,
     request: &AssessmentRequest,
     holdings: [magnitude_cost_model::HeldSlots; N],
+    priced_bank: Option<&PricedBankContext>,
 ) -> Result<[Performance; N], AssessmentError> {
-    let (layers, (target, priced)) = pool::join(
-        || streamed_layers(bank, costs, figures),
-        || {
-            let target = preparation.target_census();
-            let priced = costs.figures(&target.censuses());
-            (target, priced)
-        },
-    );
-    let layers = match layers {
-        Priced::Measured(layers) => layers,
-        Priced::Pending(_) => return Ok(std::array::from_fn(|_| Performance::Pending)),
-        Priced::Unavailable(reason) => {
-            let msg = format!("the streamed layers: {reason}");
-            return Ok(std::array::from_fn(|_| Performance::Unavailable {
-                reason: msg.clone(),
-            }));
+    let target = preparation.target_census();
+    let owned;
+    let (layers, priced) = match priced_bank {
+        Some(ctx) => (&ctx.layers, &ctx.figures),
+        None => {
+            let (layers, priced) = pool::join(
+                || streamed_layers(bank, costs, figures),
+                || costs.figures(&target.censuses()),
+            );
+            let layers = match layers {
+                Priced::Measured(layers) => layers,
+                Priced::Pending(_) => return Ok(std::array::from_fn(|_| Performance::Pending)),
+                Priced::Unavailable(reason) => {
+                    let msg = format!("the streamed layers: {reason}");
+                    return Ok(std::array::from_fn(|_| Performance::Unavailable {
+                        reason: msg.clone(),
+                    }));
+                }
+            };
+            owned = (layers, priced);
+            (&owned.0, &owned.1)
         }
     };
     let pricing = seismic::measure::pricing::Pricing {
-        figures: &priced,
+        figures: priced,
         lookahead: lookahead(preparation.draft()),
     };
     let depths = performance_depths(request.context_limit, &request.performance_depths);
@@ -830,6 +838,7 @@ fn streamed_performance_pair(
     request: &AssessmentRequest,
     held_a: magnitude_cost_model::HeldSlots,
     held_b: magnitude_cost_model::HeldSlots,
+    priced_bank: Option<&PricedBankContext>,
 ) -> Result<(Performance, Performance), AssessmentError> {
     match measurements {
         Measurements::Pending(_) => Ok((Performance::Pending, Performance::Pending)),
@@ -851,6 +860,7 @@ fn streamed_performance_pair(
                     bank,
                     request,
                     [held_a, held_b],
+                    priced_bank,
                 )?;
                 Ok((a, b))
             }
@@ -875,7 +885,7 @@ pub fn streamed_estimate(
     request: &AssessmentRequest,
     held: magnitude_cost_model::HeldSlots,
 ) -> Result<Performance, ModelAssessmentError> {
-    let [performance] = streamed_estimates(costs, figures, preparation, bank, request, [held])
+    let [performance] = streamed_estimates(costs, figures, preparation, bank, request, [held], None)
         .map_err(ModelAssessmentError::Assessment)?;
     Ok(performance)
 }

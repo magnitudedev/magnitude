@@ -1,6 +1,6 @@
 use super::file::SourceFile;
 use super::platform::{evict, uncached, volume_key};
-use super::probe::{Curve, Urgent, VolumeLines, LEAST_READ, WIDEST_WINDOW};
+use super::probe::{Curve, Urgent, VolumeLines};
 use super::OpenFile;
 use crate::{Error, Volume};
 use std::collections::HashMap;
@@ -46,11 +46,18 @@ impl std::fmt::Display for Shape {
 }
 
 impl Shape {
-    /// How a volume is read before any probe of it: at the least read size
-    /// and every depth the widest window, every piece at the most any device
-    /// measured needs (the declared bounds of the search), which takes no
-    /// measurement.
-    pub(crate) const PENDING: Self = Self { due: WIDEST_WINDOW, knee: WIDEST_WINDOW, ahead_read: LEAST_READ, due_read: LEAST_READ, cores: 0. };
+    /// How a volume is read before any probe of it: 1 MiB reads (avoiding
+    /// 128 KiB fragmentation on NVMe/SSD drives while keeping each piece at
+    /// most half the knee), a 4 MiB knee so speculative read-ahead never
+    /// queues tens of MiB behind a parked demand read, and an 8 MiB due
+    /// depth so parked and streamed demand reads saturate modern NVMe drives.
+    pub(crate) const PENDING: Self = Self {
+        due: 8 * 1024 * 1024,
+        knee: 4 * 1024 * 1024,
+        ahead_read: 1024 * 1024,
+        due_read: 1024 * 1024,
+        cores: 0.,
+    };
 
     /// The size a piece is cut at, due or not.
     pub(crate) fn read(&self, due: bool) -> u64 {

@@ -351,21 +351,269 @@ fn an_open_unloads_a_component_an_earlier_claim_took() {
 }
 
 /// A pass the host builds runs up to the regime's depth: no request
-/// fronts before a pass is timed.
+/// fronts before a pass is timed, whether the bank is partial or whole.
 #[test]
 fn a_built_pass_fronts_nothing_before_a_pass_is_timed() {
     use crate::RequestId;
     let requests = [RequestId(1), RequestId(2), RequestId(3)];
-    let pricing = super::TwoRowPricing {
-        measured: None,
-        prices: crate::domain::fixtures::load_costs(None).prices,
+    for whole in [false, true] {
+        let pricing = super::TwoRowPricing {
+            measured: None,
+            prices: crate::domain::fixtures::load_costs(None).prices,
+            depth: 1,
+            rows: crate::CHAINED_ROWS,
+            verifies: 3,
+            whole,
+            overhead: None,
+        };
+        assert_eq!(
+            pricing.built(&requests, &requests).unwrap(),
+            crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() },
+            "whole={whole}"
+        );
+    }
+}
+
+/// Whole-bank and zero-miss partial-bank loads price verify passes against
+/// plain decode on resident compute, verify stand rates, and verify turn
+/// overhead, and transition seamlessly to and from streamed front passes as
+/// the bank shrinks or grows.
+#[test]
+fn whole_bank_and_zero_miss_loads_price_verify_passes_and_transition_cleanly() {
+    use crate::RequestId;
+    use magnitude_cost_model::{Form, Needed, PathTerm, Terms, Waste};
+    let requests = [RequestId(1)];
+    let prices = crate::domain::fixtures::load_costs(None).prices;
+    let compute = |seconds: f64| Terms { compute: seconds, drive: 0., link: 0., cpu: 0., memory: 0. };
+    let mut plain_terms = [None; crate::experts::DEPTHS];
+    plain_terms[0] = Some(compute(0.032));
+    let zero_miss = crate::experts::Measured {
+        depth: 0,
+        verifying: false,
+        terms: plain_terms,
+        verify_terms: [None; crate::experts::DEPTHS],
+        paths: None,
+        stall: None,
+        needed: [[None; crate::experts::DEPTHS]; 2],
+        stand: None,
+        accepts: [None; crate::experts::DEPTHS - 1],
+        fresh: [None; crate::experts::DEPTHS - 1],
+        held: None,
+    };
+    let pricing = |measured: crate::experts::Measured, whole: bool, verifies: usize, overhead: Option<f64>| super::TwoRowPricing {
+        measured: Some(measured),
+        prices: prices.clone(),
         depth: 1,
         rows: crate::CHAINED_ROWS,
-        verifies: 0,
-        overhead: None,
+        verifies,
+        whole,
+        overhead,
     };
+
+    // 1. Whole bank after the first plain pass: no misses, no shadows yet ->
+    //    regime chooses Verify (never Front), built pass clamps to depth 1
+    //    (running + 1) because the previous pass was a front/plain pass.
+    let whole_initial = pricing(zero_miss.clone(), true, 4, None);
+    let regime = whole_initial.regime(1, 1).unwrap().expect("whole bank prices after first pass");
+    assert_eq!(regime.depth, 0, "whole bank never runs front rows");
+    assert!(matches!(regime.pass, Form::Verify(d) if d >= 1), "whole bank chooses Verify: {:?}", regime.pass);
     assert_eq!(
-        pricing.built(&requests, &requests).unwrap(),
+        whole_initial.built(&requests, &requests).unwrap(),
+        crate::FrontPass::Built { form: crate::BuiltForm::Verify, depths: std::collections::BTreeMap::from([(RequestId(1), 1)]) }
+    );
+
+    // 2. Whole bank after a verify pass with high acceptance and measured turn
+    //    overhead: unclamped verify depth > 1.
+    let mut high_accept = zero_miss.clone();
+    high_accept.depth = 1;
+    high_accept.verifying = true;
+    high_accept.verify_terms[1] = Some(compute(0.034));
+    high_accept.accepts = [Some(0.9); crate::experts::DEPTHS - 1];
+    let whole_verifying = pricing(high_accept.clone(), true, 4, Some(0.005));
+    let built = whole_verifying.built(&requests, &requests).unwrap();
+    match built {
+        crate::FrontPass::Built { form: crate::BuiltForm::Verify, depths } => {
+            let depth = depths.get(&RequestId(1)).copied().unwrap_or(0);
+            assert!(depth > 1 && depth <= 4, "expected verify depth in 2..=4, got {depth}");
+        }
+        other => panic!("expected BuiltForm::Verify, got {other:?}"),
+    }
+
+    // 3. Whole bank with low acceptance and turn overhead falls back to plain
+    //    decode (Front(0), empty depths).
+    let mut low_accept = high_accept.clone();
+    low_accept.accepts = [Some(0.05); crate::experts::DEPTHS - 1];
+    let whole_low = pricing(low_accept, true, 4, Some(0.020));
+    let regime = whole_low.regime(1, 1).unwrap().expect("whole bank prices at low acceptance");
+    assert_eq!(regime.pass, Form::Front(0));
+    assert_eq!(
+        whole_low.built(&requests, &requests).unwrap(),
         crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() }
+    );
+
+    // 4. Whole bank with verifies == 0 produces plain decode.
+    let whole_no_verify = pricing(zero_miss.clone(), true, 0, None);
+    assert_eq!(
+        whole_no_verify.built(&requests, &requests).unwrap(),
+        crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() }
+    );
+
+    // 5. Partial bank with zero misses over the window also prices Verify
+    //    instead of returning None.
+    let partial_zero_miss = pricing(high_accept.clone(), false, 4, Some(0.005));
+    let regime = partial_zero_miss.regime(1, 1).unwrap().expect("zero-miss partial bank prices");
+    assert_eq!(regime.depth, 0);
+    assert!(matches!(regime.pass, Form::Verify(_)), "{:?}", regime.pass);
+
+    // 6. Streamed <-> whole transition: drive-bound partial bank chooses
+    //    Front(k), and once whole == true it immediately ignores stale
+    //    streaming misses and chooses Verify.
+    let drive = PathTerm {
+        seconds: 1e-3,
+        wasted: Waste { front: vec![Some(0.); crate::experts::DEPTHS], verify: vec![Some(0.); crate::experts::DEPTHS] },
+    };
+    let needed_row: [Option<Needed>; crate::experts::DEPTHS] =
+        std::array::from_fn(|k| Some(Needed::Executed(245. - 4. * k as f64)));
+    let mut streamed = high_accept;
+    streamed.paths = Some(vec![drive]);
+    streamed.needed = [needed_row, needed_row];
+    streamed.stand = Some(0.95);
+    let partial_drive = pricing(streamed.clone(), false, 4, Some(0.005));
+    let regime = partial_drive.regime(1, 1).unwrap().expect("drive-bound partial bank prices");
+    assert!(matches!(regime.pass, Form::Front(d) if d >= 1), "drive-bound partial bank fronts: {:?}", regime.pass);
+    let grown_whole = pricing(streamed, true, 4, Some(0.005));
+    let regime = grown_whole.regime(1, 1).unwrap().expect("grown whole bank prices");
+    assert_eq!(regime.depth, 0, "whole bank drops stale streaming misses");
+    assert!(regime.regime.paths.is_empty(), "whole bank clears path terms");
+    assert!(matches!(regime.pass, Form::Verify(d) if d >= 1), "whole bank verifies: {:?}", regime.pass);
+}
+
+/// A whole banked domain still returns `TwoRowPricing` so verify passes are
+/// priced instead of trapping the load in 0-draft plain decode.
+#[test]
+fn a_whole_banked_domain_prices_two_row_passes() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 4);
+        crate::domain::fixtures::measure_load(&mut domain, &mut bindings);
+        let pricing = domain
+            .two_row_pricing()
+            .unwrap()
+            .expect("a whole banked domain prices two-row passes");
+        assert!(pricing.whole, "{backend:?}: 4/4 bank is whole");
+    }
+}
+
+/// Distinct device (VRAM) and host (RAM) ledgers for multi-store bank move tests.
+fn discrete_ledgers(at: Instant) -> (Ledger, Ledger) {
+    use crate::memory::ledger::{Ledgers, LoadShape};
+    let scope = Ledgers::new();
+    let shape = std::sync::Arc::new(LoadShape { stores: Vec::new() });
+    let device = scope.ledger(seismic::StoreIdentity::DeviceMemory(seismic::PhysicalIdentity::Uuid([1; 16])), shape.clone());
+    let host = scope.ledger(seismic::StoreIdentity::HostRam, shape);
+    device.read(device.sampled(at), Reading::device(TOTAL, TOTAL - OTHERS, NO_LAG));
+    host.read(host.sampled(at), Reading::device(TOTAL, TOTAL - OTHERS, NO_LAG));
+    (device, host)
+}
+
+/// A sub-noise partial grow on `BankHolding::Experts` (`gained < min_partial`)
+/// must not shadow an eligible grow on `BankHolding::Host`, and shrink-before-grow
+/// priority across holdings is preserved.
+#[test]
+fn sub_noise_experts_grow_does_not_starve_host_grow() {
+    use crate::domain::BankHolding;
+    use crate::experts::derived::{BankMove, BankShape, HoldingTarget};
+    use crate::planning::BankTier;
+
+    let slot_bytes: u64 = 16 << 20;
+    let block_bytes: u64 = 2 << 20;
+    let (device, host) = discrete_ledgers(Instant::now());
+    let ledger_of = |tier| match tier {
+        BankTier::Bank => &device,
+        BankTier::Host => &host,
+    };
+
+    // sat_charge = 512 * 16 MiB = 8 GiB -> sat_charge / 64 = 128 MiB = min_partial.
+    // Growing Experts 100 -> 101 gains 16 MiB (< 128 MiB) while still below saturation (512).
+    let experts = HoldingTarget {
+        holding: BankHolding::Experts,
+        tier: BankTier::Bank,
+        at: 100,
+        owed: 0,
+        shape: BankShape::new(block_bytes, 8, 512, 512),
+        charge: Box::new(move |slots| slots * slot_bytes),
+    };
+    let host_target = HoldingTarget {
+        holding: BankHolding::Host,
+        tier: BankTier::Host,
+        at: 146,
+        owed: 0,
+        shape: BankShape::new(block_bytes, 0, 512, 512),
+        charge: Box::new(move |slots| slots * slot_bytes),
+    };
+
+    // Sanity check: Experts alone is filtered out by min_partial.
+    assert_eq!(super::select_bank_move(&[(&experts, 101)], ledger_of, None), None);
+    // With Host eligible to grow, Host is selected instead of returning None.
+    assert_eq!(
+        super::select_bank_move(&[(&experts, 101), (&host_target, 512)], ledger_of, None),
+        Some((BankHolding::Host, BankMove::Grow { to: 512 })),
+    );
+    // Shrink on a later holding still beats an eligible grow on an earlier holding.
+    assert_eq!(
+        super::select_bank_move(&[(&experts, 512), (&host_target, 100)], ledger_of, None),
+        Some((BankHolding::Host, BankMove::Shrink { to: 100 })),
+    );
+}
+
+/// An `ExogenousShrink` cooldown on `DeviceMemory` suppresses `BankHolding::Experts`
+/// regrow without starving `BankHolding::Host` on `HostRam`.
+#[test]
+fn exogenous_shrink_cooldown_on_device_does_not_starve_host_grow() {
+    use crate::domain::BankHolding;
+    use crate::experts::derived::{BankMove, BankShape, HoldingTarget};
+    use crate::planning::BankTier;
+
+    let slot_bytes: u64 = 16 << 20;
+    let block_bytes: u64 = 2 << 20;
+    let t0 = Instant::now();
+    let (device, host) = discrete_ledgers(t0);
+    let est = device.estimate();
+    let shrink = super::ExogenousShrink {
+        store: device.store(),
+        at: est.at().at(),
+        committed: est.committed(),
+        hold_room: est.hold_room(),
+        block: block_bytes,
+    };
+    // Advance within the 3 s cooldown with unchanged headroom/committed bytes.
+    read(&device, t0 + Duration::from_millis(100));
+
+    let ledger_of = |tier| match tier {
+        BankTier::Bank => &device,
+        BankTier::Host => &host,
+    };
+    let experts = HoldingTarget {
+        holding: BankHolding::Experts,
+        tier: BankTier::Bank,
+        at: 100,
+        owed: 0,
+        shape: BankShape::new(block_bytes, 8, 512, 512),
+        charge: Box::new(move |slots| slots * slot_bytes),
+    };
+    let host_target = HoldingTarget {
+        holding: BankHolding::Host,
+        tier: BankTier::Host,
+        at: 146,
+        owed: 0,
+        shape: BankShape::new(block_bytes, 0, 512, 512),
+        charge: Box::new(move |slots| slots * slot_bytes),
+    };
+
+    // Sanity check: saturation grow on Experts is suppressed by DeviceMemory cooldown.
+    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, Some(&shrink)), None);
+    // Host on HostRam is unaffected by DeviceMemory's cooldown and is selected to grow.
+    assert_eq!(
+        super::select_bank_move(&[(&experts, 512), (&host_target, 512)], ledger_of, Some(&shrink)),
+        Some((BankHolding::Host, BankMove::Grow { to: 512 })),
     );
 }

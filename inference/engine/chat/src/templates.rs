@@ -854,4 +854,45 @@ mod tests {
         let prompt = bundle.render_prompt(&request, &selection).unwrap();
         assert_eq!(prompt, prepared.description().prompt);
     }
+
+    #[test]
+    fn concurrent_inspect_cached_on_shared_template_never_deadlocks() {
+        use std::sync::Barrier;
+
+        for iteration in 0..8 {
+            let source = format!(
+                "{{% for m in messages %}}<|im_start|>{{{{ m.role }}}}\n{{{{ m.content }}}}<|im_end|>\n{{% endfor %}}<!-- {iteration} -->"
+            );
+            let barrier = Arc::new(Barrier::new(6));
+            let mut handles = Vec::new();
+            for _ in 0..6 {
+                let source = source.clone();
+                let barrier = Arc::clone(&barrier);
+                handles.push(
+                    seismic_threads::spawn("test-inspect-cached", move || {
+                        let bundle = TemplateBundle::new(
+                            vec![TemplateVariant {
+                                name: "default".into(),
+                                source,
+                                provenance: "test".into(),
+                            }],
+                            "default".into(),
+                            SpecialTokens::default(),
+                        )
+                        .unwrap();
+                        barrier.wait();
+                        let (inspected, _) = seismic_threads::pool::join(
+                            || bundle.inspect_cached(),
+                            || 1usize,
+                        );
+                        inspected.expect("concurrent cached template inspection succeeded")
+                    })
+                    .expect("spawn test thread"),
+                );
+            }
+            for handle in handles {
+                let _ = handle.join().expect("inspection thread did not deadlock");
+            }
+        }
+    }
 }

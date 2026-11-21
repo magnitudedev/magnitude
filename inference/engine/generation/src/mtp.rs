@@ -40,7 +40,7 @@ use crate::{
 use crate::{front::FrontState, DraftHistory, DraftRoundState};
 use magnitude_executor::{
     Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, HeadPhase, LaunchDuration,
-    Guess, GuessKind, Operation, Outcome, RequestId, SelectSpec, Selected, TokenId,
+    Guess, GuessKind, Operation, Outcome, RequestId, SelectSpec, Selected, StreamedVerifyPrior, TokenId,
 };
 use std::sync::Arc;
 
@@ -166,6 +166,11 @@ impl Method for Mtp {
     }
     fn decodes_two_rows(&self) -> bool {
         self.fronting
+    }
+    fn observe_streamed_prior(&self, prior: Option<StreamedVerifyPrior>) {
+        if let Some(adaptive) = &self.adaptive {
+            adaptive.observe_streamed(prior);
+        }
     }
 }
 

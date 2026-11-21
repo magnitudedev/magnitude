@@ -26,14 +26,16 @@ const PARTIAL_GROW_MIN_CAP: u64 = 256 * (1 << 20);
 /// launch prices as they stand, the counted decode's context, the rows a
 /// launch of chained decode passes holds
 /// (`crate::ResourceLimits::chained_rows`), the acceptable rows a pass of
-/// the load's method may verify (its draft rows), and the host's turn after
-/// a verify pass (`overhead`, none before one is timed).
+/// the load's method may verify (its draft rows), whether the bank holds
+/// every streamed layer's experts (`whole`), and the host's turn after a
+/// verify pass (`overhead`, none before one is timed).
 pub struct TwoRowPricing {
     measured: Option<crate::experts::Measured>,
     prices: magnitude_cost_model::LaunchPrices,
     depth: u32,
     rows: usize,
     verifies: usize,
+    whole: bool,
     pub(super) overhead: Option<f64>,
 }
 
@@ -48,6 +50,21 @@ pub struct FrontRegime {
     pub running: usize,
     pub depth: usize,
     pub pass: magnitude_cost_model::Form,
+}
+
+/// Prior target-launch durations for streamed decode verification at a
+/// bank epoch ([`ExecutorDomain::streamed_verify_prior`]): the cost model's
+/// regime prices plain decode (`index 0`) and `1 + k`-row verify passes
+/// (`index k >= 1`) so an adaptive draft controller does not probe wide
+/// verify widths blindly when streaming makes them expensive, and
+/// invalidates stale target verify measurements when `bank_epoch` changes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamedVerifyPrior {
+    pub bank_epoch: u64,
+    /// Prior target-launch seconds for `1 + k` rows per sequence:
+    /// index 0 = plain decode `regime.time(0)`,
+    /// index `k >= 1` = `regime.verify_pass_time(k)`.
+    pub verify_seconds: Vec<f64>,
 }
 
 impl TwoRowPricing {
@@ -83,14 +100,19 @@ impl TwoRowPricing {
     /// The regime a launch of `requests` requests, `fronted` of them able
     /// to run guessed rows, is decided by
     /// (`magnitude_cost_model::Regime::pass`, the one owner of it); none
-    /// where no request can, or before the measured passes counted a miss
-    /// and the ranking's shadows read a decode step.
+    /// where no request can, before a decode pass is timed, or on a partial
+    /// bank with measured misses before the ranking's shadows read a decode
+    /// step.
     ///
-    /// The regime is the measured passes': their resident compute at each
-    /// depth the launch may run, measured where the window holds passes of
-    /// it, else the measured depth's nearest below it (or above) scaled by
-    /// the launch prices' compute at the two (the prior a measurement
-    /// refines); the ranking's misses at each depth of foresight
+    /// At a whole bank (or a partial bank whose measured window missed
+    /// nothing), every path term and stall is zero, so no front row pays
+    /// and the regime prices verify passes against plain decode on resident
+    /// compute, verify stand rates, and the host's turn after a verify pass.
+    /// Otherwise the regime is the measured passes': their resident compute
+    /// at each depth the launch may run, measured where the window holds
+    /// passes of it, else the measured depth's nearest below it (or above)
+    /// scaled by the launch prices' compute at the two (the prior a
+    /// measurement refines); the ranking's misses at each depth of foresight
     /// (`Reuse::shadows`); the first front row's stand rate; the stall a
     /// miss held a plain pass; and every term besides the GPU's
     /// (`magnitude_cost_model::Terms::each_path`), each its seconds a miss
@@ -101,14 +123,22 @@ impl TwoRowPricing {
         let Some(measured) = self.measured.as_ref().filter(|_| fronted > 0) else {
             return Ok(None);
         };
-        let (Some(paths), Some(front), Some(verify)) = (
-            measured.paths.clone(),
-            measured.needed[0].into_iter().collect::<Option<Vec<_>>>(),
-            measured.needed[1].into_iter().collect::<Option<Vec<_>>>(),
-        ) else {
-            return Ok(None);
+        let (paths, needed, stall) = match (!self.whole).then(|| measured.paths.clone()).flatten() {
+            Some(paths) => {
+                let (Some(front), Some(verify)) = (
+                    measured.needed[0].into_iter().collect::<Option<Vec<_>>>(),
+                    measured.needed[1].into_iter().collect::<Option<Vec<_>>>(),
+                ) else {
+                    return Ok(None);
+                };
+                (paths, magnitude_cost_model::NeededByForm { front, verify }, measured.stall)
+            }
+            None => (
+                Vec::new(),
+                magnitude_cost_model::NeededByForm::both(vec![magnitude_cost_model::Needed::Executed(0.); crate::experts::DEPTHS]),
+                None,
+            ),
         };
-        let needed = magnitude_cost_model::NeededByForm { front, verify };
         let deepest = (1..crate::experts::DEPTHS)
             .rev()
             .find(|&depth| crate::two_row::fronted_requests(self.rows, requests, depth).min(fronted) > 0)
@@ -122,10 +152,10 @@ impl TwoRowPricing {
             let fronting = crate::two_row::fronted_requests(self.rows, requests, depth).min(fronted);
             self.prices
                 .front(rows(requests)?, rows(fronting)?, rows(depth)?, self.depth, &routes)
-                .map(|form| form.streamed)
+                .map(|form| if self.whole { form.resident } else { form.streamed })
                 .map_err(|error| DomainError::invariant(format!("the decode launch: {error}")))
         };
-        let measured_at = |depth: usize| measured.terms[depth].map(|terms| terms.compute);
+        let measured_at = |depth: usize| measured.terms_for(self.whole && depth > 0, depth).map(|terms| terms.compute);
         let resident = (0..=deepest)
             .map(|depth| match measured_at(depth) {
                 Some(resident) => Ok(resident),
@@ -138,7 +168,7 @@ impl TwoRowPricing {
             })
             .collect::<Result<Vec<_>, DomainError>>()?;
         let accepts = measured.accepts[..self.verifies.min(measured.accepts.len())].to_vec();
-        let regime = magnitude_cost_model::Regime { resident, needed, stand: measured.stand, accepts, stall: measured.stall, overhead: self.overhead, paths };
+        let regime = magnitude_cost_model::Regime { resident, needed, stand: measured.stand, accepts, stall, overhead: self.overhead, paths };
         let (depth, pass) = (regime.depth(), regime.pass());
         Ok(Some(FrontRegime { regime, running: measured.depth.min(deepest), depth, pass }))
     }
@@ -249,41 +279,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// The one resize toward `bank`'s derived targets
-    /// (`experts::derived::next_move`), at the decode's price now: filters out
-    /// sub-noise partial grows on small-slot banks and post-shrink ping-pong
-    /// rebounds while letting shrinks, saturation grows, own-claim frees, and
-    /// large exogenous releases through immediately.
+    /// The one resize toward `bank`'s derived targets, at the decode's price
+    /// now: a shrink before any growth, filtering out sub-noise partial grows
+    /// on small-slot banks and post-shrink ping-pong rebounds per holding so a
+    /// suppressed growth never starves another holding (such as the host tier
+    /// or a table) while letting shrinks, saturation grows, own-claim frees,
+    /// and large exogenous releases through immediately.
     fn next_bank_move(&self, bank: &dyn super::ElasticBank) -> Result<Option<(BankHolding, BankMove)>, DomainError> {
         self.derive_bank(bank, |derived| {
-            let Some((holding, mv)) = crate::experts::derived::next_move(derived) else {
-                return None;
-            };
-            let BankMove::Grow { to } = mv else {
-                return Some((holding, mv));
-            };
-            let (target, _) = derived.iter().find(|(t, _)| t.holding == holding)?;
-            let sat = target.shape.saturation_slots();
-            let sat_charge = (target.charge)(sat);
-            let floor_charge = (target.charge)(target.shape.floor_slots());
-            let sat_cache = sat_charge.saturating_sub(floor_charge);
-            let gained = (target.charge)(to).saturating_sub((target.charge)(target.at));
-            let min_partial = target.shape.block_bytes().max((sat_charge / 64).min(PARTIAL_GROW_MIN_CAP));
-            if to < sat && gained < min_partial {
-                return None;
-            }
-            let ledger = self.resources.ledgers().of(target.tier);
-            if let Some(shrink) = self.exogenous_shrink.as_ref().filter(|s| s.store == ledger.store()) {
-                let est = ledger.estimate();
-                let own_committed_freed = est.committed() < shrink.committed;
-                let elapsed = est.at().at().saturating_duration_since(shrink.at);
-                let rebound_margin = shrink.block.saturating_mul(4).max(REBOUND_MARGIN_MIN).min(sat_cache.max(shrink.block));
-                let large_release = est.hold_room() >= shrink.hold_room.saturating_add(rebound_margin);
-                if !own_committed_freed && elapsed < EXOGENOUS_REGROW_COOLDOWN && !large_release {
-                    return None;
-                }
-            }
-            Some((holding, mv))
+            select_bank_move(derived, |tier| self.resources.ledgers().of(tier), self.exogenous_shrink.as_ref())
         })
     }
 
@@ -339,7 +343,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 self.resize_held.begin(tier, started);
                 self.shrink_step = true;
                 let block = bank
-                    .targets(self.decode_price()?.as_ref())?
+                    .targets()?
                     .into_iter()
                     .find(|t| t.holding == holding)
                     .map_or(0, |t| t.shape.block_bytes());
@@ -641,23 +645,53 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         prior.rates(step_seconds, resident).map(Some)
     }
 
-    /// What a decode launch now pairs on ([`TwoRowPricing`]): none without a
-    /// priced bank, or at a whole one, where no launch pairs, so a load that
-    /// cannot pair plans no request's two-row pass. Taken afresh for every
-    /// launch from the bank's live size, its watcher's measured passes, the
-    /// host's turns after verify passes and the pass queued behind the last
-    /// flight.
+    /// What a decode launch now prices its guessed rows on
+    /// ([`TwoRowPricing`]): none without a priced bank. Taken afresh for
+    /// every launch from the bank's live size (including whether it is
+    /// whole, where no front row pays and verify passes are priced against
+    /// plain decode on resident compute), its watcher's measured passes,
+    /// and the host's turns after verify passes.
     pub fn two_row_pricing(&self) -> Result<Option<TwoRowPricing>, DomainError> {
         let (Some(price), Some(held), Some(prices), Some(bank)) = (self.decode_price()?, self.held_slots()?, self.launch_prices(), self.family.expert_bank()) else {
             return Ok(None);
         };
-        Ok((!price.whole(held)).then(|| TwoRowPricing {
+        Ok(Some(TwoRowPricing {
             measured: bank.measured(),
             prices: prices.clone(),
             depth: price.depth(),
             rows: self.chained_rows(),
             verifies: self.execution.policy().method().draft_rows(),
+            whole: price.whole(held),
             overhead: self.verify_turns.mean(bank.bank_epoch()),
+        }))
+    }
+
+    /// Prior target-launch durations for a streamed decode launch of
+    /// `sequences` requests, tagged with the expert bank's live epoch.
+    /// Returns `Ok(None)` for unbanked or whole-bank loads (or before the
+    /// regime has measured a miss), leaving fully-resident loads untouched.
+    pub fn streamed_verify_prior(&self, sequences: usize) -> Result<Option<StreamedVerifyPrior>, DomainError> {
+        if sequences == 0 {
+            return Ok(None);
+        }
+        let Some(bank) = self.family.expert_bank() else {
+            return Ok(None);
+        };
+        let Some(pricing) = self.two_row_pricing()? else {
+            return Ok(None);
+        };
+        let Some(FrontRegime { regime, .. }) = pricing.regime(sequences, sequences)? else {
+            return Ok(None);
+        };
+        let verifies = regime.accepts.len().min(regime.resident.len().saturating_sub(1));
+        let mut verify_seconds = Vec::with_capacity(1 + verifies);
+        verify_seconds.push(regime.time(0));
+        for k in 1..=verifies {
+            verify_seconds.push(regime.verify_pass_time(k));
+        }
+        Ok(Some(StreamedVerifyPrior {
+            bank_epoch: bank.bank_epoch(),
+            verify_seconds,
         }))
     }
 
@@ -715,6 +749,59 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let to = bank.released_to(bytes)?.unwrap_or_else(|| bank.slots());
         self.shrink_expert_bank_to(bindings, BankHolding::Experts, to, wake)
     }
+}
+
+/// Choose the next eligible resize toward `derived` targets: the first shrink
+/// unconditionally, else the first growth passing [`allow_bank_grow`] for its
+/// holding and store.
+fn select_bank_move<'a>(
+    derived: &[(&crate::experts::derived::HoldingTarget<'_>, u64)],
+    ledger_of: impl Fn(crate::planning::BankTier) -> &'a crate::memory::ledger::Ledger,
+    exogenous_shrink: Option<&ExogenousShrink>,
+) -> Option<(BankHolding, BankMove)> {
+    let mut first_grow = None;
+    for &(target, slots) in derived {
+        match crate::experts::derived::bank_move(slots, target.at) {
+            None => continue,
+            Some(mv @ BankMove::Shrink { .. }) => return Some((target.holding, mv)),
+            Some(mv @ BankMove::Grow { to }) => {
+                if first_grow.is_none() && allow_bank_grow(target, to, ledger_of(target.tier), exogenous_shrink) {
+                    first_grow = Some((target.holding, mv));
+                }
+            }
+        }
+    }
+    first_grow
+}
+
+/// Whether a derived growth of `target` to `to` passes the sub-noise partial
+/// grow guard and the post-shrink exogenous cooldown on `ledger`.
+fn allow_bank_grow(
+    target: &crate::experts::derived::HoldingTarget<'_>,
+    to: u64,
+    ledger: &crate::memory::ledger::Ledger,
+    exogenous_shrink: Option<&ExogenousShrink>,
+) -> bool {
+    let sat = target.shape.saturation_slots();
+    let sat_charge = (target.charge)(sat);
+    let floor_charge = (target.charge)(target.shape.floor_slots());
+    let sat_cache = sat_charge.saturating_sub(floor_charge);
+    let gained = (target.charge)(to).saturating_sub((target.charge)(target.at));
+    let min_partial = target.shape.block_bytes().max((sat_charge / 64).min(PARTIAL_GROW_MIN_CAP));
+    if to < sat && gained < min_partial {
+        return false;
+    }
+    if let Some(shrink) = exogenous_shrink.filter(|s| s.store == ledger.store()) {
+        let est = ledger.estimate();
+        let own_committed_freed = est.committed() < shrink.committed;
+        let elapsed = est.at().at().saturating_duration_since(shrink.at);
+        let rebound_margin = shrink.block.saturating_mul(4).max(REBOUND_MARGIN_MIN).min(sat_cache.max(shrink.block));
+        let large_release = est.hold_room() >= shrink.hold_room.saturating_add(rebound_margin);
+        if !own_committed_freed && elapsed < EXOGENOUS_REGROW_COOLDOWN && !large_release {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]

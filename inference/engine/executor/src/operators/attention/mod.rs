@@ -568,6 +568,11 @@ pub(crate) fn check_rotary_divisors(
         ));
     }
     for (index, ((pair, base), divisor)) in pairs.iter().zip(bases).zip(stored).enumerate() {
+        if !divisor.is_finite() || *divisor <= 0.0 {
+            return Err(format!(
+                "rotary pair {index}: stored divisor {divisor} must be finite and positive"
+            ));
+        }
         let frequency = base / f64::from(*divisor);
         let matches = if pair.frequency == 0.0 {
             frequency <= 1e-20
@@ -2821,5 +2826,16 @@ pub(crate) mod tests {
         assert!(check_rotary_divisors(&pairs, &bases, &[1.0, 4.0, 1e30]).is_err());
         assert!(check_rotary_divisors(&pairs, &bases, &[1.0, 2.0, 1.0]).is_err());
         assert!(check_rotary_divisors(&pairs, &bases, &[1.0, 2.0]).is_err());
+        // Non-positive or non-finite divisors must not bypass unrotated or rotated checks.
+        for bad in [-1.0_f32, -0.0, 0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                check_rotary_divisors(&pairs, &bases, &[1.0, 2.0, bad]).is_err(),
+                "unrotated pair accepted invalid divisor {bad}"
+            );
+            assert!(
+                check_rotary_divisors(&pairs, &bases, &[bad, 2.0, 1e30]).is_err(),
+                "rotated pair accepted invalid divisor {bad}"
+            );
+        }
     }
 }

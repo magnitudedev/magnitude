@@ -13,7 +13,7 @@ use crate::{
     DraftBudget, DraftLoad, Method, MethodCheckpoint, MethodChoice, MethodRequirements,
     MethodState,
 };
-use magnitude_executor::Demand;
+use magnitude_executor::{Demand, StreamedVerifyPrior};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -93,5 +93,10 @@ impl Method for DFlash {
             self.adaptive.clone(),
             checkpoint,
         )?))
+    }
+    fn observe_streamed_prior(&self, prior: Option<StreamedVerifyPrior>) {
+        if let Some(adaptive) = &self.adaptive {
+            adaptive.observe_streamed(prior);
+        }
     }
 }

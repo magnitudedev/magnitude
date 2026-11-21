@@ -401,7 +401,7 @@ pub enum HostTier {
 /// kernels (Metal, CUDA), where host and device see each other's stores as
 /// they land; or at submission boundaries (Vulkan), where the device's
 /// stores are the host's only once its submission ends, past the park that
-/// waits on every entry of a landing (`ExpertBankPlan::demand_records`).
+/// waits on every entry of a landing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Parking {
     InKernels,

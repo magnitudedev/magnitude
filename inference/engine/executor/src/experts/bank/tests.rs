@@ -51,8 +51,7 @@ fn a_growth_joins_each_slot_as_every_group_holds_it() {
         Joining::Bank,
         &changes,
         |join| {
-            let Join::Bank { records, views } = join else { panic!("a bank's join") };
-            assert_eq!(views.len(), records.len(), "views delivered for every group");
+            let Join::Bank { records } = join else { panic!("a bank's join") };
             let at = records[0][0] as u64 + 1;
             assert_eq!(records, vec![vec![at as usize - 1]; 2], "each group claims the slot's record in its lowest hole");
             assert!((0..2).all(|group| stores.present(group) >= at), "slot {at} joined before every group holds it");
@@ -393,4 +392,81 @@ fn stores_charged_uses_whole_blocks_and_owed_drains_settled_blocks() {
 
     drop(held_1);
     changes.change(|_| drop((claim, records, stores)));
+}
+
+/// Reproduces RC1: a fragmented multi-block pool (20 blocks x 10 granules/block =
+/// 200 live slots) where evicting 1 block's worth of slots scattered across 10
+/// distinct blocks leaves zero empty blocks. Because `Group::bank` now holds
+/// on-demand `Stores::records()` instead of permanent `Tensor` views,
+/// `return_freed_sync(block_bytes)` vacates a block in one pass and returns
+/// `>= block_bytes` while preserving 190/200 (95%) of live slots and keeping
+/// moved slabs intact.
+#[test]
+fn fragmented_multiblock_reclaim_vacates_one_block_without_collateral_wipeout() {
+    const BLOCKS: u64 = 20;
+    const PER_BLOCK: u64 = 10;
+    const TOTAL_SLOTS: u64 = BLOCKS * PER_BLOCK;
+
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
+    let regions = [seismic::SlabRegion { element: seismic::Element::i32(), row_shape: vec![16] }];
+    let layout = seismic::SlabLayout::for_regions(1, TOTAL_SLOTS, &regions).unwrap();
+    let granule = layout.slab_bytes.next_multiple_of(layout.slab_alignment);
+    let block_bytes = PER_BLOCK * granule;
+    let block = seismic::BlockSize { bytes: block_bytes, held: block_bytes, absent: granule };
+
+    let scope = crate::memory::ledger::Ledgers::strict();
+    let _owner = scope.changes().own();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() }));
+    ledger.read(ledger.sampled(Instant::now()), crate::memory::supply::Reading::device(1 << 40, 1 << 40, crate::domain::fixtures::NO_LAG));
+    let changes = scope.changes().clone();
+    let entries = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(block_bytes).unwrap());
+    let charges = seismic::Charges::tally(&device);
+    let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, block_bytes).unwrap();
+    let store = seismic::SlabTensor::in_pool(&charges, &pool, 1, TOTAL_SLOTS, &regions).unwrap();
+    let stores = Arc::new(Stores::new(pool.clone(), block, vec![(store, 0, vec![64])]));
+    let claim = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, TOTAL_SLOTS * granule))
+        .expect("200 slabs fit");
+
+    // Claim 200 slabs across 20 full blocks and resolve on-demand `Records`
+    // (the same handle `Group::bank` holds for `Placer::Tier`).
+    changes.change(|_| assert_eq!(stores.claim_to(0, TOTAL_SLOTS).unwrap().len(), TOTAL_SLOTS as usize));
+    let bank_records = stores.records().unwrap();
+    assert_eq!(stores.present(0), TOTAL_SLOTS);
+    assert_eq!(stores.charged(), BLOCKS * block_bytes);
+
+    // Stamp a distinct value into every live slab using on-demand `tensor()`
+    // (temporary views drop immediately, leaving idle slabs unviewed).
+    for slot in 0..TOTAL_SLOTS {
+        let marker = [slot as i32; 16];
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(marker.as_ptr().cast::<u8>(), std::mem::size_of_val(&marker)) };
+        bank_records[0][0].tensor(slot).write_from_host(bytes).unwrap();
+    }
+
+    // Evict exactly 1 block's worth (10 slots) scattered across 10 different
+    // blocks (1 slot per block: slots 0, 10, 20, ..., 90) so zero blocks are
+    // empty on their own.
+    let scattered: Vec<u32> = (0..PER_BLOCK).map(|b| (b * PER_BLOCK) as u32).collect();
+    stores.free(0, &scattered).unwrap();
+
+    // Synchronous reclaim returns >= 1 block via pool vacation while keeping
+    // 190/200 (95%) of live slots intact (never wiping out 89% of the bank).
+    let returned = changes.change(|_| pool.return_freed_sync(block_bytes).unwrap());
+    assert!(returned >= block_bytes, "expected at least one block ({block_bytes} B) returned, got {returned}");
+    assert_eq!(stores.present(0), TOTAL_SLOTS - PER_BLOCK, "must preserve 95% of live slots");
+    assert_eq!(stores.charged(), (BLOCKS - 1) * block_bytes);
+
+    // Verify surviving slabs (including any relocated out of the vacated block)
+    // still read back their exact markers through on-demand `Records::tensor`.
+    let evicted_set: std::collections::BTreeSet<u64> = scattered.iter().map(|&s| u64::from(s)).collect();
+    for slot in 0..TOTAL_SLOTS {
+        if evicted_set.contains(&slot) {
+            continue;
+        }
+        let buf = bank_records[0][0].tensor(slot).read_to_host().unwrap();
+        let word = i32::from_ne_bytes(buf[..4].try_into().unwrap());
+        assert_eq!(word, slot as i32, "surviving slab {slot} corrupted after vacation");
+    }
+
+    changes.change(|_| drop((claim, bank_records, stores)));
 }

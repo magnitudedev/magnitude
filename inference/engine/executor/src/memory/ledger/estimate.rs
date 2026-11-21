@@ -14,6 +14,9 @@ use super::vocabulary::CacheKind;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Read {
     pub(super) at: Sampled,
+    /// The store's structural capacity (`Reading::capacity`): the most bytes
+    /// the store could grant the process beside nothing else.
+    capacity: u64,
     /// The store's supply, others' cold pages in it only once harm is
     /// judged ([`Boundary::judges`]).
     supply: i64,
@@ -223,6 +226,12 @@ impl Estimate {
     /// process's wired bytes ([`Self::unwired_shortfall`]).
     pub fn unwired_readings(&self) -> u64 {
         self.unwired_readings
+    }
+
+    /// The store's structural capacity at the reading (`Reading::capacity`):
+    /// the most bytes it could grant the process beside nothing else.
+    pub fn capacity(&self) -> u64 {
+        self.read.capacity
     }
 
     /// What the process may hold in the store: `min(grant, in_use +
@@ -528,7 +537,7 @@ impl State {
         }
         let paged = reading.paging().is_some();
         let (cap, grows) = (self.boundary.cap(), !paged || self.boundary.admits_growth());
-        self.read = Some(Read { at, supply, visible: visible.allocated, nonresident, unobserved, credited, others, rise, grant, ceiling: reading.ceiling(), unwired, lag, shown, cap, grows });
+        self.read = Some(Read { at, capacity: reading.capacity(), supply, visible: visible.allocated, nonresident, unobserved, credited, others, rise, grant, ceiling: reading.ceiling(), unwired, lag, shown, cap, grows });
         let estimate = self.estimate().expect("a store just read is estimated");
         let cause = shortage::cause(&estimate, self.boundary.harmed(), self.boundary.pressed());
         // Only a floor shortfall unloads: its persistence alone is kept,
