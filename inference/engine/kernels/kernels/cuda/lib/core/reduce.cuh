@@ -63,6 +63,66 @@ __device__ __forceinline__ float group_max(float value, float *partials) {
     return maximum;
 }
 
+// Single-pass online softmax state: running maximum and sum of exp(x - max).
+// Empty state is {-inf, 0}; -inf inputs never produce NaN, while NaN inputs
+// propagate through `sum`.
+struct OnlineSoftmax {
+    float max;
+    float sum;
+
+    static __device__ __forceinline__ OnlineSoftmax empty() {
+        return OnlineSoftmax{-__int_as_float(0x7f800000), 0.0f};
+    }
+
+    __device__ __forceinline__ void add(float x) {
+        if (x > max) {
+            sum = (sum != 0.0f ? sum * expf(max - x) : 0.0f) + 1.0f;
+            max = x;
+        } else if (x != -__int_as_float(0x7f800000)) {
+            sum += expf(x - max);
+        }
+    }
+
+    static __device__ __forceinline__ OnlineSoftmax merge(OnlineSoftmax a, OnlineSoftmax b) {
+        if (a.sum == 0.0f)
+            return b;
+        if (b.sum == 0.0f)
+            return a;
+        const float m = fmaxf(a.max, b.max);
+        return OnlineSoftmax{m, a.sum * expf(a.max - m) + b.sum * expf(b.max - m)};
+    }
+};
+
+// Online softmax reduction over a warp. All 32 lanes must be convergent; every
+// lane receives the combined state.
+__device__ __forceinline__ OnlineSoftmax warp_online_softmax(OnlineSoftmax value) {
+    const float m = seismic_warp_max_f32(value.max);
+    const float scaled = value.sum != 0.0f ? value.sum * expf(value.max - m) : 0.0f;
+    return OnlineSoftmax{m, seismic_warp_sum_f32(scaled)};
+}
+
+// Online softmax reduction over a block, in a single barrier pair. `partials`
+// holds one OnlineSoftmax per warp (at most 32); the leading barrier lets
+// consecutive calls share it. Every thread of the block must call it.
+__device__ __forceinline__ OnlineSoftmax group_online_softmax(OnlineSoftmax value, OnlineSoftmax *partials) {
+    value = warp_online_softmax(value);
+    const unsigned warps = blockDim.x / 32;
+    __syncthreads();
+    if (threadIdx.x % 32 == 0)
+        partials[threadIdx.x / 32] = value;
+    __syncthreads();
+    float maximum = partials[0].max;
+    for (unsigned w = 1; w < warps; ++w)
+        maximum = fmaxf(maximum, partials[w].max);
+    float total = 0.0f;
+    for (unsigned w = 0; w < warps; ++w) {
+        const OnlineSoftmax p = partials[w];
+        if (p.sum != 0.0f)
+            total += p.sum * expf(p.max - maximum);
+    }
+    return OnlineSoftmax{maximum, total};
+}
+
 // Maximum of one value per thread, each non-negative or NaN, NaN if any is
 // (a group's peak, `packets::peak_with`), as `group_max`: such values'
 // bits order as the values do with every NaN above +Inf, so integer maxima

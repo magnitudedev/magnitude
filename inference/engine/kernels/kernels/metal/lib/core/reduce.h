@@ -65,6 +65,66 @@ struct Candidate {
     int index;
 };
 
+// Single-pass online softmax state: running maximum and sum of exp(x - max).
+// Empty state is {-inf, 0}; -inf inputs never produce NaN, while NaN inputs
+// propagate through `sum`.
+struct OnlineSoftmax {
+    float max;
+    float sum;
+
+    static inline OnlineSoftmax empty() { return OnlineSoftmax{-INFINITY, 0.0f}; }
+
+    inline void add(float x) {
+        if (x > max) {
+            sum = (sum != 0.0f ? sum * metal::exp(max - x) : 0.0f) + 1.0f;
+            max = x;
+        } else if (x != -INFINITY) {
+            sum += metal::exp(x - max);
+        }
+    }
+
+    static inline OnlineSoftmax merge(OnlineSoftmax a, OnlineSoftmax b) {
+        if (a.sum == 0.0f)
+            return b;
+        if (b.sum == 0.0f)
+            return a;
+        const float m = metal::max(a.max, b.max);
+        return OnlineSoftmax{m, a.sum * metal::exp(a.max - m) + b.sum * metal::exp(b.max - m)};
+    }
+};
+
+// Online softmax reduction over a simdgroup. Every lane receives the combined
+// state.
+inline OnlineSoftmax warp_online_softmax(OnlineSoftmax value) {
+    const float m = simd_max(value.max);
+    const float scaled = value.sum != 0.0f ? value.sum * metal::exp(value.max - m) : 0.0f;
+    return OnlineSoftmax{m, simd_sum(scaled)};
+}
+
+// Online softmax reduction over a threadgroup of SIMDGROUPS simdgroups, in a
+// single barrier pair. `partials` holds SIMDGROUPS OnlineSoftmax values; the
+// leading barrier lets consecutive calls share it. Every thread of the
+// threadgroup must call it.
+template <uint SIMDGROUPS>
+inline OnlineSoftmax group_online_softmax(OnlineSoftmax value, threadgroup OnlineSoftmax *partials, uint sg,
+                                          uint lane) {
+    value = warp_online_softmax(value);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0)
+        partials[sg] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float maximum = partials[0].max;
+    for (uint j = 1; j < SIMDGROUPS; ++j)
+        maximum = metal::max(maximum, partials[j].max);
+    float total = 0.0f;
+    for (uint j = 0; j < SIMDGROUPS; ++j) {
+        const OnlineSoftmax p = partials[j];
+        if (p.sum != 0.0f)
+            total += p.sum * metal::exp(p.max - maximum);
+    }
+    return OnlineSoftmax{maximum, total};
+}
+
 // Tie rules of an argmax: among candidates of equal score, the higher or the
 // lower index wins.
 struct HigherIndex {

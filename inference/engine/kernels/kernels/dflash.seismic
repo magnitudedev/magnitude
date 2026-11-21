@@ -172,14 +172,15 @@ fn token_confidence[M, N, V](logits: &tensor[N, V] f32, rows: &tensor[M] i32,
 # Every backend: two launches. The partition reduces each of 64 contiguous
 # vocabulary slices of a selection's row to its maximum and its sum of
 # exp(logit - maximum), so a draft's few selections still spread over the
-# device; the merge, one thread per selection, combines them.
+# device; the merge combines them (one warp/simdgroup per selection on Metal
+# and CUDA, one thread per selection on Vulkan and CPU).
 native token_confidence for metal from "metal/token_confidence.metal":
     scratch partials bytes (M * 64 * 8)
     launch token_confidence_partition:
         threadgroups (64, M, 1)
         threads_per_threadgroup (256, 1, 1)
     launch token_confidence_merge:
-        threadgroups (ceil_div(M, 32), 1, 1)
+        threadgroups (M, 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
 native token_confidence for cuda from "cuda/token_confidence.cu":
@@ -188,7 +189,7 @@ native token_confidence for cuda from "cuda/token_confidence.cu":
         threadgroups (64, M, 1)
         threads_per_threadgroup (256, 1, 1)
     launch token_confidence_merge:
-        threadgroups (ceil_div(M, 32), 1, 1)
+        threadgroups (M, 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
 native token_confidence for vulkan from "vulkan/token_confidence.comp":
