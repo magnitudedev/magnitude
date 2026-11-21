@@ -24,28 +24,21 @@ Magnitude is an open source inference engine that tunes its kernels on your hard
 
 ## Get started
 
-Magnitude comes with a desktop app and a CLI. Install from your terminal:
-
-macOS / Linux:
-
-```sh
-curl -fsSL https://magnitude.dev/install.sh | sh
-```
-
-Windows PowerShell:
-
-```powershell
-irm https://magnitude.dev/install.ps1 | iex
-```
-
-Or download the installer:
+Download the installer:
 
 - **macOS:** [Apple silicon](https://magnitude.dev/api/installer?os=darwin&arch=arm64&package=dmg) · [Intel](https://magnitude.dev/api/installer?os=darwin&arch=x64&package=dmg)
 - **Windows:** [x64](https://magnitude.dev/api/installer?os=windows&arch=x64&package=windows-exe)
 - **Linux x64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=x64&package=rpm) · [.pkg.tar.zst](https://magnitude.dev/api/installer?os=linux&arch=x64&package=pacman)
 - **Linux ARM64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=rpm)
 
-To run Magnitude as a service other computers can use, see [Remote server](https://docs.magnitude.dev/remote-server). To run it in a container, see [Docker](https://docs.magnitude.dev/installation/docker).
+Setting up a server? Install the CLI only:
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh     # macOS / Linux
+irm https://magnitude.dev/install.ps1 | iex          # Windows PowerShell
+```
+
+For more info, see [CLI only](https://docs.magnitude.dev/installation/cli-only). For Docker container installs, see [Docker](https://docs.magnitude.dev/installation/docker).
 
 ## Why Magnitude?
 
@@ -86,7 +79,7 @@ macOS, Linux, and Windows.
 
 ### Which models does it support?
 
-See the full list at [magnitude.dev/models](https://magnitude.dev/models). We write optimized kernels for the most popular open-weight families, which is how we beat generalist engines.
+Any GGUF model from Hugging Face in a supported family, including fine-tunes and other people’s quants. We write optimized kernels for each of the most popular open-weight families, which is how we beat generalist engines. See the families and the models we recommend at [magnitude.dev/models](https://magnitude.dev/models).
 
 ### Which agents work with it?
 

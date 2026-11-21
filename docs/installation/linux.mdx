@@ -9,18 +9,6 @@ Magnitude requires **glibc 2.34 or later**. Ubuntu 22.04, Debian 12 and RHEL 9 (
 
 Your package manager installs required desktop libraries. GPU inference also needs a supported driver; see [Hardware](/hardware). Alpine/musl packages are not available.
 
-## Install from the terminal
-
-```sh
-curl -fsSL https://magnitude.dev/install.sh | sh
-```
-
-Includes the desktop app and CLI. The script detects your architecture, selects the package for `apt`, `dnf`, or `pacman`, verifies the download, and installs it with its dependencies. It requires `curl`, Python 3, `openssl`, and `timeout`, and asks for administrator authorization when needed.
-
-The installer asks whether to run Magnitude as a server. Choose **Yes** for a persistent service that starts at boot on a dedicated inference machine; otherwise choose **No**. With no terminal, or no answer within 60 seconds, it installs without setting up a server. See [Remote server](/remote-server).
-
-For desktop use, open **Magnitude** from your applications menu and follow [Quick start](/get-started). For a headless session without a persistent service, run `magnitude serve`.
-
 ## Download the installer
 
 Visit [Download Magnitude](https://magnitude.dev/download?os=linux#downloads) and choose:
@@ -56,8 +44,28 @@ sudo pacman -U ./magnitude-desktop.pkg.tar.zst
 
 Open **Magnitude** from your applications menu and follow [Quick start](/get-started).
 
+## Install from the terminal
+
+To install the desktop app from a terminal:
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh -s -- --desktop
+```
+
+The script detects your architecture, selects the package for `apt`, `dnf`, or `pacman`, verifies the download, and installs it with its dependencies. It requires `curl` and `openssl`, and asks for administrator authorization when needed. Open **Magnitude** from your applications menu and follow [Quick start](/get-started).
+
+## Install the CLI only
+
+For a server, or any machine that serves without the desktop app:
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh
+```
+
+This installs only the CLI, into `~/.magnitude/cli`, with the `magnitude` command in `~/.magnitude/bin`. It needs no `sudo`, no package manager and no graphical session, and updates itself while `magnitude serve` runs. Open a new shell, then run `magnitude serve`. To keep it running in the background, see [CLI only](/installation/cli-only#keep-it-running-in-the-background).
+
 ## Updates and removal
 
-App updates use your system package manager. Click **Restart** to install a downloaded update; at your desktop it installs without a password, while over SSH it asks for administrator authentication. Use **Settings → Application updates** for the available actions. A [server](/remote-server) installs its updates by itself.
+App updates use your system package manager. Click **Restart to update** to install a downloaded update; at your desktop it installs without a password, while over SSH it asks for administrator authentication. Use **Settings → About** for the available actions. A CLI-only install updates itself while `magnitude serve` runs; see [CLI only](/installation/cli-only#updates).
 
-Remove Magnitude through your distribution's software manager. Downloaded models and settings live in `~/.magnitude` and are separate from the installed application package. On a server, run `magnitude server remove` before removing the package; reinstalling the package without it keeps the server set up.
+Remove Magnitude through your distribution's software manager. Downloaded models and settings live in `~/.magnitude` and are separate from the installed application package. To remove a CLI-only install, see [CLI only](/installation/cli-only#uninstall).
