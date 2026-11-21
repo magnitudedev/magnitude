@@ -419,16 +419,20 @@ native draft_top_k for cpu from "cpu/draft_top_k.rs":
         threads_per_threadgroup (1, 1, 1)
 
 # Metal, CUDA, Vulkan: one threadgroup of 256 threads per row reduces each
-# candidate's rank-R score. CPU: one work item per row.
+# candidate's rank-R score. Metal and CUDA cache `predecessor * hidden` once
+# per row in dynamic shared memory (up to 4096 floats, streaming above that)
+# and evaluate candidates one warp/simdgroup each. CPU: one work item per row.
 native draft_path_step for metal from "metal/draft_path_step.metal":
     launch draft_path_step:
         threadgroups (S, 1, 1)
         threads_per_threadgroup (256, 1, 1)
+        shared_bytes (max(1, min(R, 4096)) * 4)
 
 native draft_path_step for cuda from "cuda/draft_path_step.cu":
     launch draft_path_step:
         threadgroups (S, 1, 1)
         threads_per_threadgroup (256, 1, 1)
+        shared_bytes (max(1, min(R, 4096)) * 4)
 
 native draft_path_step for vulkan from "vulkan/draft_path_step.comp":
     launch draft_path_step:
