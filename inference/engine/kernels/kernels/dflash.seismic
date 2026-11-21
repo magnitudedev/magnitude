@@ -313,17 +313,17 @@ fn draft_path_step[S, K, R](candidates: &tensor[S * K, 2] i32, unary: &tensor[S,
         selection[row, 0] = chosen
         selection[row, 1] = 0
 
-# Metal, CUDA: one thread per output element. Vulkan: a grid-stride loop over
-# every element, the x grid capped at the 65535-group floor. CPU: one work
-# item per row.
+# Metal, CUDA: 4 columns per thread on a (column, row) grid (CUDA caps y at
+# 65535 and strides rows). Vulkan: a grid-stride loop over every element, the
+# x grid capped at the 65535-group floor. CPU: one work item per row.
 native draft_convolve_input for metal from "metal/draft_convolve_input.metal":
     launch draft_convolve_input:
-        threadgroups (ceil_div(M * G * C, 256), 1, 1)
+        threadgroups (ceil_div(G * C, 1024), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_convolve_input for cuda from "cuda/draft_convolve_input.cu":
     launch draft_convolve_input:
-        threadgroups (ceil_div(M * G * C, 256), 1, 1)
+        threadgroups (ceil_div(G * C, 1024), min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_convolve_input for vulkan from "vulkan/draft_convolve_input.comp":
@@ -339,12 +339,12 @@ native draft_convolve_input for cpu from "cpu/draft_convolve_input.rs":
 
 native draft_convolve_residual for metal from "metal/draft_convolve_residual.metal":
     launch draft_convolve_residual:
-        threadgroups (ceil_div(M * G * C, 256), 1, 1)
+        threadgroups (ceil_div(G * C, 1024), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_convolve_residual for cuda from "cuda/draft_convolve_residual.cu":
     launch draft_convolve_residual:
-        threadgroups (ceil_div(M * G * C, 256), 1, 1)
+        threadgroups (ceil_div(G * C, 1024), min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_convolve_residual for vulkan from "vulkan/draft_convolve_residual.comp":
