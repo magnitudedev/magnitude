@@ -94,7 +94,7 @@ fn main() -> anyhow::Result<()> {
     magnitude_executor::main("magnitude-main", move || {
         magnitude_engine::telemetry::log_to_stderr().map_err(anyhow::Error::msg)?;
         let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-        seismic_threads::runtime()?.block_on(assess_catalog(arguments, process_started))
+        seismic_threads_tokio::runtime()?.block_on(assess_catalog(arguments, process_started))
     })
 }
 

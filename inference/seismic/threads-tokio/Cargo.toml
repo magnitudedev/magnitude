@@ -1,0 +1,16 @@
+[package]
+name = "seismic-threads-tokio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Tokio runtime construction under seismic-threads' share, stack and panic policy.
+# Kept separate from `seismic-threads` so crates below `magnitude-kernels` do not
+# depend on `tokio` (and downstream binaries' `tokio` features never alter
+# `magnitude-kernels`'s Cargo unit hash).
+[dependencies]
+seismic-threads.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

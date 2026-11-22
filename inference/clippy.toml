@@ -9,9 +9,9 @@ disallowed-methods = [
   # `std::thread::scope` starts no thread; what starts one in it is this.
   { path = "std::thread::Scope::spawn", reason = "start scoped threads through seismic_threads::spawn_scoped or run" },
   # Also what `#[tokio::main]` expands to. Crates without Tokio cannot resolve these.
-  { path = "tokio::runtime::Builder::new_multi_thread", reason = "build runtimes through seismic_threads::runtime", allow-invalid = true },
-  { path = "tokio::runtime::Builder::new_current_thread", reason = "build runtimes through seismic_threads::runtime", allow-invalid = true },
-  { path = "tokio::runtime::Runtime::new", reason = "build runtimes through seismic_threads::runtime", allow-invalid = true },
+  { path = "tokio::runtime::Builder::new_multi_thread", reason = "build runtimes through seismic_threads_tokio::runtime", allow-invalid = true },
+  { path = "tokio::runtime::Builder::new_current_thread", reason = "build runtimes through seismic_threads_tokio::runtime", allow-invalid = true },
+  { path = "tokio::runtime::Runtime::new", reason = "build runtimes through seismic_threads_tokio::runtime", allow-invalid = true },
 ]
 
 # The most stack one function's frame may take: seismic_threads::FRAME_BYTES,

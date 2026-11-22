@@ -4451,7 +4451,6 @@ impl<C: FloatCodes, K: Coefficients, const STORAGE: usize> Format for FloatRows<
 /// The caller is compiled with `L`'s features (an `#[inline(always)]` body
 /// below its tier boundary).
 #[cfg(target_arch = "x86_64")]
-#[cfg(feature = "machine-line")]
 #[inline(always)]
 pub unsafe fn quantized_dot<L: Isa>(
     acc: std::arch::x86_64::__m256i,
@@ -4467,7 +4466,6 @@ pub unsafe fn quantized_dot<L: Isa>(
 /// # Safety
 /// The caller is compiled with `L`'s features, and `L` has AVX-512 VNNI.
 #[cfg(target_arch = "x86_64")]
-#[cfg(feature = "machine-line")]
 #[inline(always)]
 pub unsafe fn quantized_dot_wide<L: Isa>(
     acc: std::arch::x86_64::__m512i,
@@ -4484,7 +4482,6 @@ pub unsafe fn quantized_dot_wide<L: Isa>(
 /// # Safety
 /// The caller is compiled with the NeonDot tier's features.
 #[cfg(target_arch = "aarch64")]
-#[cfg(feature = "machine-line")]
 #[inline(always)]
 pub unsafe fn quantized_dot_neon(
     acc: std::arch::aarch64::int32x4_t,

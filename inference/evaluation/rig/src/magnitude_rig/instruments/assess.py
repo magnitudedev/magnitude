@@ -21,7 +21,7 @@ from dataclasses import replace
 from ..engine import Headers, Step
 from . import Answer, Instrument, JobResult, Plan
 from .held import CHECKPOINT
-from .binaries import ASSESS, ASSESS_BUILD
+from .binaries import ASSESS, SERVED_BUILD
 
 def measurement(backend: str) -> Step:
     """The product's measurement job, for its own time (the engine's `MEASUREMENT_SECONDS`), which
@@ -47,12 +47,12 @@ def priced(plan: Plan, streams: bool, backend: str) -> Plan:
     """`plan` under that rule: its jobs preceded, and the assessment's binary built for the measurement job."""
     if not streams:
         return plan
-    builds = plan.builds if ASSESS_BUILD in plan.builds else (*plan.builds, ASSESS_BUILD)
+    builds = plan.builds if SERVED_BUILD in plan.builds else (*plan.builds, SERVED_BUILD)
     return replace(plan, builds=builds, jobs=preceded(plan.jobs, True, backend))
 
 
 CATALOG = "{target}/release/examples/catalog_assessment"
-BUILDS = (ASSESS_BUILD,)
+BUILDS = (SERVED_BUILD,)
 CATALOG_BUILDS = BUILDS + (
     Step("catalog assessment", ("cargo", "build", "--release", "-p", "magnitude-service-server",
                                 "--example", "catalog_assessment")),

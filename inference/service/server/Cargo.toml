@@ -33,7 +33,8 @@ opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 seismic.workspace = true
-seismic-threads = { workspace = true, features = ["tokio"] }
+seismic-threads.workspace = true
+seismic-threads-tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

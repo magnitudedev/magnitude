@@ -6,7 +6,6 @@
 // accumulators seeded apart, the operands each subgroup's first `x` in f16;
 // it writes `x` back (line.seismic). A subgroup runs whole or not at all.
 #include <seismic/element.glsl>
-#include "../../kernels/vulkan/lib/core/matrix.glsl"
 
 void line_matrix() {
 #if SEISMIC_HAS_MATRIX_HARDWARE
@@ -19,11 +18,13 @@ void line_matrix() {
         return;
     seismic_f32 xs = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_X));
     const float16_t value = float16_t(xs[uint(first * SEISMIC_X_STRIDE_0)].v);
-    const MATRIX_FRAGMENT_A a = MATRIX_FRAGMENT_A(value);
-    const MATRIX_FRAGMENT_B b = MATRIX_FRAGMENT_B(value);
-    MATRIX_FRAGMENT_C d[UNROLL];
+    const coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>(value);
+    const coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>(value);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> d[UNROLL];
     [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
-        d[k] = MATRIX_FRAGMENT_C(float(k));
+        d[k] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float(k));
     for (uint step = 0u; step < PRODUCTS / UNROLL; ++step) {
         [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
             d[k] = coopMatMulAdd(a, b, d[k]);

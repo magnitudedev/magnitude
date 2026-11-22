@@ -18,7 +18,7 @@ import json
 from .. import store
 from ..engine import Refused, Step
 from . import Answer, Instrument, JobResult, Plan
-from .binaries import ASSESS, ASSESS_BUILD
+from .binaries import ASSESS, SERVED_BUILD
 
 VULKAN_FACTS = "{target}/release/vulkan-facts"
 SHOWN = 30
@@ -29,7 +29,7 @@ def configure(parser: argparse.ArgumentParser) -> None:
 
 
 def plan(arguments, source, host) -> Plan:
-    builds = [ASSESS_BUILD]
+    builds = [SERVED_BUILD]
     jobs = [
         ("host", Step("host", ("{python}", "-m", "magnitude_rig.host", "facts"))),
         ("topology", Step("topology", (ASSESS, "--device", arguments.backend, "--kernels", "{engine_cache}/kernels", "--topology"))),

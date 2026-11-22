@@ -441,7 +441,7 @@ fn run() -> Result<(), String> {
                 .with_state(serving.clone()),
         )
         .merge(magnitude_serving::router(serving));
-    let runtime = seismic_threads::runtime().map_err(|error| error.to_string())?;
+    let runtime = seismic_threads_tokio::runtime().map_err(|error| error.to_string())?;
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind((options.host.as_str(), options.port))
             .await

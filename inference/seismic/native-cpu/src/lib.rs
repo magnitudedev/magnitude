@@ -43,9 +43,9 @@ pub use element::{Bf16, Dense, Element, F16, F32, I32, Slot, Store, Stored, U32,
 pub use isa::{Isa, Tier};
 pub use repack::{External, Packed};
 pub use tensor::{Scalars, Scratch, Tensor};
-#[cfg(all(target_arch = "x86_64", feature = "machine-line"))]
+#[cfg(target_arch = "x86_64")]
 pub use weights::{quantized_dot, quantized_dot_wide};
-#[cfg(all(target_arch = "aarch64", feature = "machine-line"))]
+#[cfg(target_arch = "aarch64")]
 pub use weights::quantized_dot_neon;
 
 use components::WeightKernels;

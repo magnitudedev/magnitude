@@ -1,0 +1,19 @@
+[package]
+name = "magnitude-line-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Development-only machine line probe kernels (`line/`), depended on only when
+# `magnitude-executor`'s `machine-line` feature is enabled (never by a served
+# engine). Kept separate from `magnitude-kernels` so enabling `machine-line` for
+# `magnitude-harness` does not change `magnitude-kernels`'s Cargo unit hash or
+# trigger a second compile of the 270k-line kernel catalog.
+[dependencies]
+seismic.workspace = true
+
+[build-dependencies]
+seismic-build.workspace = true
+
+[lints]
+workspace = true

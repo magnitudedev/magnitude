@@ -901,14 +901,8 @@ fn contract_node_shape_presence_matches_native_implementation_all_entries() {
         .iter()
         .map(|entry| entry.name.as_str())
         .collect();
-    #[cfg(not(feature = "machine-line"))]
     assert_eq!(
         checked, catalog,
         "contract_node_shape parity test must cover every entry in magnitude_kernels"
-    );
-    #[cfg(feature = "machine-line")]
-    assert!(
-        checked.is_subset(&catalog),
-        "all checked entries must exist in magnitude_kernels"
     );
 }

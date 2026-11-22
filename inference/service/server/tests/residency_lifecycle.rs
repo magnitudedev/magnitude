@@ -74,7 +74,7 @@ fn start() -> anyhow::Result<()> {
         println!("residency_lifecycle: not run (it needs a device host's models: --bundle and the rest)");
         return Ok(());
     }
-    seismic_threads::runtime()?.block_on(lifecycle(arguments))
+    seismic_threads_tokio::runtime()?.block_on(lifecycle(arguments))
 }
 
 struct Harness {

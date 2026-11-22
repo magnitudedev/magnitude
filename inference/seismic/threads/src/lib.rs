@@ -393,23 +393,13 @@ fn install() {
     });
 }
 
-/// A multi-threaded Tokio runtime whose worker count is [`share`] and whose
-/// workers and blocking threads have [`STACK_BYTES`] of stack: every runtime
-/// of the process is built here, so work that blocks on one runs on the
-/// owner's stack too and respects the process's thread share. Its threads work
-/// for the thread that builds it, which blocks on it: a panic on them ends
-/// as one there would, so within [`main`] a task's panic ends the process
-/// at the panic.
-#[cfg(feature = "tokio")]
-pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+/// Captures the calling thread's panic policy and installs the process's panic
+/// hook, returning a worker initializer that installs that policy on each thread
+/// a runtime starts (used by `seismic-threads-tokio::runtime`).
+pub fn worker_init() -> impl Fn() + Send + Sync + 'static {
     install();
     let panics = Panics::here();
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(share().get())
-        .enable_all()
-        .thread_stack_size(STACK_BYTES)
-        .on_thread_start(move || PANICS.with(|thread| thread.set(panics)))
-        .build()
+    move || PANICS.with(|thread| thread.set(panics))
 }
 
 #[cfg(test)]
@@ -557,34 +547,12 @@ mod tests {
                     let _unwound = Unwound;
                     panic!("an invariant violated")
                 }),
-                #[cfg(feature = "tokio")]
-                Some("task") => main("program", || {
-                    let _unwound = Unwound;
-                    let _ = runtime().unwrap().block_on(async {
-                        tokio::spawn(async {
-                            let _unwound = Unwound;
-                            panic!("an invariant violated")
-                        })
-                        .await
-                    });
-                }),
-                #[cfg(feature = "tokio")]
-                Some("detached") => {
-                    let _ = runtime().unwrap().block_on(async {
-                        tokio::spawn(detached("an owner", async {
-                            let _unwound = Unwound;
-                            panic!("an invariant violated")
-                        }))
-                        .await
-                    });
-                }
                 _ => return,
             }
             eprintln!("the process outlived the panic");
             return;
         }
-        let cases: &[&str] = if cfg!(feature = "tokio") { &["program", "task", "detached"] } else { &["program"] };
-        for case in cases {
+        for case in ["program"] {
             let ended = child_as(NAME, case);
             let stderr = String::from_utf8_lossy(&ended.stderr);
             assert!(!ended.status.success(), "{case}: {stderr}");
@@ -592,9 +560,6 @@ mod tests {
             assert_eq!(std::os::unix::process::ExitStatusExt::signal(&ended.status), Some(6), "{case} aborted: {stderr}");
             assert!(stderr.contains("an invariant violated"), "{case}: the panic is reported: {stderr}");
             assert!(stderr.contains("the process ends rather than run on the state it left"), "{case}: {stderr}");
-            if *case == "detached" {
-                assert!(stderr.contains("(task an owner) panicked at"), "the report names the task: {stderr}");
-            }
             assert!(!stderr.contains("unwound past the panic"), "{case}: nothing unwinds: {stderr}");
             assert!(!stderr.contains("outlived"), "{case}: {stderr}");
         }
@@ -612,16 +577,5 @@ mod tests {
                 .any(|line| line.trim() == format!("stack-size-threshold = {FRAME_BYTES}")),
             "clippy.toml's stack-size-threshold is FRAME_BYTES ({FRAME_BYTES})"
         );
-    }
-
-    #[cfg(feature = "tokio")]
-    #[test]
-    fn a_runtimes_threads_are_the_owners() {
-        let wanted = STACK_BYTES / 2;
-        let runtime = runtime().unwrap();
-        runtime.block_on(async move {
-            tokio::spawn(async move { deep(wanted) }).await.unwrap();
-            tokio::task::spawn_blocking(move || deep(wanted)).await.unwrap();
-        });
     }
 }

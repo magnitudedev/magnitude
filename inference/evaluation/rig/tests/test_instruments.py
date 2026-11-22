@@ -960,10 +960,11 @@ def test_bench_takes_its_measurement_options_and_builds_our_binaries_apart():
     (template,) = plan.files
     assert argv[argv.index("--template") + 1] == f"{{inputs}}/{template.name}"
     assert len(json.loads(template.read_text())["sessions"]) == 9
-    # The served engine and the harness never share a cargo invocation (feature unification).
+    # The served binaries share one cargo invocation (so they unify once), separate from the
+    # harness so none of the harness's development features unify into them.
     cargo = [step.argv for step in plan.builds if step.argv[0] == "cargo"]
-    assert cargo == [("cargo", "build", "--release", "-p", "magnitude-engine-cli"),
-                     ("cargo", "build", "--release", "-p", "magnitude-engine", "--bin", "magnitude-assess"),
+    assert cargo == [("cargo", "build", "--release", "-p", "magnitude-engine-cli", "-p", "magnitude-engine",
+                      "--bin", "magnitude-engine", "--bin", "magnitude-assess"),
                      ("cargo", "build", "--release", "-p", "magnitude-harness")]
     # A cache the run names is priced and served as given.
     named = parse("bench", "--backend", "cuda", "--model", MODEL, "--purpose", "p",
@@ -1048,7 +1049,7 @@ def test_every_streamed_job_follows_its_machines_measurement_job_and_its_acquisi
     """One rule (`assess.preceded`) for every instrument: a load that streams runs after the measurement job,
     which reads the run's acquisition object, so after the job that writes one from a held set; the assessment's
     binary is built for it; a load that does not stream has no measurement job."""
-    from magnitude_rig.instruments.binaries import ASSESS_BUILD
+    from magnitude_rig.instruments.binaries import SERVED_BUILD
 
     def plan(*argv):
         return REGISTRY[argv[0]].plan(parse(*argv, "--backend", "cuda", "--template", "repeat:1k", "--purpose", "p",
@@ -1062,7 +1063,7 @@ def test_every_streamed_job_follows_its_machines_measurement_job_and_its_acquisi
     )
     for streams in streamed:
         names = [name for name, _ in streams.jobs]
-        assert ASSESS_BUILD in streams.builds and names.count("measure") == 1
+        assert SERVED_BUILD in streams.builds and names.count("measure") == 1
         assert names.index("measure") == int(names[0] == "checkpoint")  # first, or after the acquisition
     resident = (plan("step", "--model", MODEL), plan("draft", "--model", MODEL), plan("kl", "--model", MODEL))
     assert all("measure" not in [name for name, _ in each.jobs] for each in resident)
@@ -1260,7 +1261,7 @@ def test_memory_follows_the_devices_memory_as_its_hosts_recorded_topology_states
                                              "--purpose", "p", "--estimate", "1m"), None, host)
 
     rtx, mac, gb10 = plan("rtx", "cuda"), plan("mac", "metal"), plan("gb10", "cuda")
-    assert [step.name for step in rtx.builds] == ["engine", "assess"] and rtx.device == "timed"
+    assert [step.name for step in rtx.builds] == ["served"] and rtx.device == "timed"
     for unified in (mac, gb10):  # a unified CUDA device measures as Metal does
         assert unified.builds[0].argv[-1] == "magnitude-harness" and unified.device == "device"
         argv = dict(unified.jobs)["memory"].argv

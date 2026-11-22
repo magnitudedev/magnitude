@@ -2306,6 +2306,7 @@ dependencies = [
  "magnitude-state",
  "seismic",
  "seismic-threads",
+ "seismic-threads-tokio",
  "serde_json",
  "tokio",
 ]
@@ -2329,6 +2330,7 @@ dependencies = [
  "magnitude-family-qwen4exp",
  "magnitude-family-registry",
  "magnitude-kernels",
+ "magnitude-line-kernels",
  "magnitude-source-identity",
  "magnitude-state",
  "seismic",
@@ -2579,6 +2581,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnitude-line-kernels"
+version = "0.1.0"
+dependencies = [
+ "seismic",
+ "seismic-build",
+]
+
+[[package]]
 name = "magnitude-scheduler"
 version = "0.1.0"
 dependencies = [
@@ -2627,6 +2637,7 @@ dependencies = [
  "magnitude-service-models",
  "seismic-io",
  "seismic-threads",
+ "seismic-threads-tokio",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
@@ -2706,6 +2717,7 @@ dependencies = [
  "reqwest",
  "seismic",
  "seismic-threads",
+ "seismic-threads-tokio",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4472,7 +4484,12 @@ dependencies = [
 [[package]]
 name = "seismic-threads"
 version = "0.1.0"
+
+[[package]]
+name = "seismic-threads-tokio"
+version = "0.1.0"
 dependencies = [
+ "seismic-threads",
  "tokio",
 ]
 

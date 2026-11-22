@@ -25,7 +25,7 @@ from .. import sync, templates
 from ..engine import Step
 from ..sources import checkout
 from . import Answer, Instrument, JobResult, Plan, environment, harness, held
-from .binaries import ASSESS, ASSESS_BUILD, ENGINE, ENGINE_BUILD
+from .binaries import ASSESS, ENGINE, SERVED_BUILD
 
 BENCH = "{venv}/bin/magnitude-bench"
 KERNELS = f"{{runs}}/{sync.RUN_KERNELS}"  # the run's own kernel cache
@@ -56,15 +56,14 @@ def plan(arguments, source, host) -> Plan:
     builds = [environment("bench", "--package", "magnitude-bench")]
     jobs, ours = [], []
     if "magnitude" in engines:
+        builds.append(SERVED_BUILD)
         if arguments.magnitude_binary is None:
-            builds.append(ENGINE_BUILD)
             ours += ["--magnitude-binary", ENGINE]
         if arguments.magnitude_cache_dir is None:  # a named cache is passed with the bench's options
             cache = KERNELS
             ours += ["--magnitude-cache-dir", cache]
         else:
             cache = str(arguments.magnitude_cache_dir)
-        builds.append(ASSESS_BUILD)
         jobs.append(("measure", Step("measure", (
             ASSESS, "--device", arguments.magnitude_device, "--kernels", cache, "--topology"))))
     if any(engine in bench.HOST_RENDERED for engine in engines) and arguments.harness is None:

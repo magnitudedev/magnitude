@@ -38,7 +38,7 @@ use super::executor_costs::{
     executor_identity, failed, largest_cache, named, rotation_sets, ExecutorCostsError, Formation, MeasuredCost, Walks,
 };
 use super::streaming_costs::{MemoryCosts, Sweeps};
-use magnitude_kernels::{line_f32, line_int8, line_matrix, line_matrix_f32, line_stream};
+use magnitude_line_kernels::{line_f32, line_int8, line_matrix, line_matrix_f32, line_stream};
 use seismic::measure::{Reason, Record, RecordStore, StoreError, Timing, Unformed};
 use seismic::{BackendName, Device, DeviceTopology, Element, Entry, Executor, NativeKernel, Point, PointKey, Tensor};
 use std::cell::OnceCell;

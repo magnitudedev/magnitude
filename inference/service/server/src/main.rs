@@ -138,7 +138,7 @@ fn serve() -> anyhow::Result<()> {
                 // auxiliary pools it opens) are background work beside a serving worker.
                 seismic::threads::set_share(MachineBudget::host().share(Duty::Background).get());
             }
-            seismic_threads::runtime()
+            seismic_threads_tokio::runtime()
                 .context("failed to start the service runtime")?
                 .block_on(run(command))
         }

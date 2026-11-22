@@ -11,6 +11,7 @@ magnitude-batching = { path = "../batching" }
 magnitude-cost-model = { path = "../cost-model" }
 magnitude-family-contracts = { path = "../families/contracts" }
 magnitude-kernels = { path = "../kernels" }
+magnitude-line-kernels = { path = "../line-kernels", optional = true }
 magnitude-state = { path = "../state" }
 seismic.workspace = true
 seismic-io.workspace = true
@@ -35,7 +36,7 @@ expert-routing = []
 # itself reaches, measured on request by a tool's measurement job. Enabled
 # only through `magnitude-engine`'s `machine-line` feature by
 # `magnitude-harness` and `magnitude-assess`; never by a served engine.
-machine-line = ["magnitude-kernels/machine-line"]
+machine-line = ["dep:magnitude-line-kernels"]
 # Test-only: the controlled execution domain (`fixtures`), its family and its
 # fake expert bank, for the tests of the owners above the domain, and the
 # expert watchers' stall (`starve`). Enabled only as a

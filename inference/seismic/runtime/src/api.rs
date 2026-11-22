@@ -791,7 +791,6 @@ pub mod device {
         pub fn properties(&self) -> &seismic_lang::device::DeviceProperties {
             &self.properties
         }
-        #[cfg(feature = "machine-line")]
         /// Whether a Vulkan device has cooperative matrices to form
         /// (`FormationTarget::matrix_hardware`, whether or not the
         /// projection GEMMs choose the path), which a matrix program is

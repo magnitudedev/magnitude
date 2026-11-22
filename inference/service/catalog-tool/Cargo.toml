@@ -14,7 +14,8 @@ magnitude-service-contracts.workspace = true
 magnitude-service-models.workspace = true
 magnitude-executor = { path = "../../engine/executor" }
 seismic-io.workspace = true
-seismic-threads = { workspace = true, features = ["tokio"] }
+seismic-threads.workspace = true
+seismic-threads-tokio.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true

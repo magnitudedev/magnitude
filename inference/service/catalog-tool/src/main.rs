@@ -591,7 +591,7 @@ async fn publish(output: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     seismic_threads::main("magnitude-catalog", || {
         let command = Cli::parse().command;
-        seismic_threads::runtime()
+        seismic_threads_tokio::runtime()
             .context("failed to start the catalog tool runtime")?
             .block_on(run(command))
     })
