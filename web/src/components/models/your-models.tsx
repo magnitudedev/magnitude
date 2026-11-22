@@ -218,7 +218,7 @@ export function YourModels({ models, action, onExploreQuants, onRemove, onDrafte
               <LabMark lab={model.lab} className="size-7" />
               <span className="min-w-0"><span className="block truncate text-[13px] font-medium">{model.name}</span><QuantLine model={model} />{model.downloadFailure && <span role="alert" className="mt-0.5 block text-xs text-red-600 dark:text-red-400">{model.downloadFailure}</span>}</span>
               <span className="text-right text-[13px] tabular-nums text-slate-700 dark:text-slate-300">{formatStorageSize(model.quant.sizeBytes)}</span>
-              <span className="text-right max-lg:hidden">{model.quant.fits && <Speed quant={model.quant} />}</span>
+              <span className="text-right max-lg:hidden">{model.quant.fits && !model.quant.measuring && <Speed quant={model.quant} />}</span>
             </button>
             <span className="flex justify-end">{action(model)}</span>
             <ModelMenu model={model} onExploreQuants={() => onExploreQuants(model)} onRemove={() => onRemove(model)} />

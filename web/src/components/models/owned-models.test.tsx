@@ -1,9 +1,11 @@
 import { renderToStaticMarkup } from "react-dom/server"
+import { Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { makeSetupModel } from "@magnitudedev/client-common/fixtures/model"
+import type { LocalModel } from "@magnitudedev/sdk"
+import { makeSetupModel, streamedReadyResidency } from "@magnitudedev/client-common/fixtures/model"
 import { modelLabs } from "../model-logo"
 import { ownedModel } from "./data"
-import { OwnedModels } from "./models-screen"
+import { OwnedModelAction, OwnedModels } from "./models-screen"
 import { matchingModels, YourModels } from "./your-models"
 
 /** Whether any button or link sits inside a button or an element acting as one. */
@@ -42,5 +44,52 @@ describe("the user's models", () => {
     expect(matchingModels([model], { lab: otherLab, usOnly: false }, "")).toEqual([])
     expect(matchingModels([model], { lab: null, usOnly: false }, "no such model")).toEqual([])
     expect(matchingModels([model], { lab: null, usOnly: false }, "")).toEqual([model])
+  })
+
+  it("hides Load behind a single Measuring status while standing measurements are still pending", () => {
+    const base = makeSetupModel(true)
+    const pending: LocalModel = {
+      ...base,
+      servingState: base.servingState._tag === "Assessed" && base.servingState.assessment._tag === "Fits"
+        ? {
+            ...base.servingState,
+            assessment: {
+              ...base.servingState.assessment,
+              residency: {
+                _tag: "Resident" as const,
+                performance: { _tag: "Pending" as const, measurement: { _tag: "Measuring" as const, progress: Option.none() } },
+              },
+            },
+          }
+        : base.servingState,
+    }
+    const pendingView = ownedModel(pending, "Device")
+    expect(pendingView.quant.fits).toBe(true)
+    expect(pendingView.quant.measuring).toBe(true)
+    const rowHtml = renderToStaticMarkup(<YourModels
+      models={[pendingView]}
+      action={view => <OwnedModelAction model={pending} view={view} onLoad={() => {}} onStop={() => {}} onCancel={() => {}} onRetry={() => {}} />}
+      onExploreQuants={() => {}} onRemove={() => {}} onDrafter={() => {}}
+    />)
+    expect(rowHtml).not.toContain(">Load<")
+    expect(rowHtml.match(/Measuring…/g)).toHaveLength(1)
+  })
+
+  it("shows Load once standing measurements settle, and keeps Stop when already running", () => {
+    const settled = makeSetupModel(true)
+    const settledView = ownedModel(settled, "Device")
+    const settledHtml = renderToStaticMarkup(<OwnedModelAction model={settled} view={settledView} onLoad={() => {}} onStop={() => {}} onCancel={() => {}} onRetry={() => {}} />)
+    expect(settledHtml).toContain("Load")
+    expect(settledHtml).not.toContain("Measuring…")
+
+    const running: LocalModel = {
+      ...settled,
+      acquisitionState: settled.acquisitionState._tag === "Installed"
+        ? { ...settled.acquisitionState, residencyState: streamedReadyResidency(["metal:0"]) }
+        : settled.acquisitionState,
+    }
+    const runningHtml = renderToStaticMarkup(<OwnedModelAction model={running} view={ownedModel(running, "Device")} onLoad={() => {}} onStop={() => {}} onCancel={() => {}} onRetry={() => {}} />)
+    expect(runningHtml).toContain("Running")
+    expect(runningHtml).toContain("Stop")
   })
 })
