@@ -1136,10 +1136,9 @@ struct ExecutedStep {
 }
 
 /// Short-locked bridge between `magnitude-main` and `Shadows` on
-/// `expert-residenc`: never held during `Shadows::step()`, so `complete_step`,
-/// `verify_executed`, and `measured` never block behind shadow stepping.
+/// `expert-residenc`: never held during `Shadows::step()`, so `complete_step`
+/// and `measured` never block behind shadow stepping.
 struct ShadowState {
-    pending_verify: Option<(Step, usize, f64)>,
     pending_executed: Vec<ExecutedStep>,
     gaps: [[Option<Gap>; DEPTHS]; 2],
 }
@@ -1147,7 +1146,6 @@ struct ShadowState {
 impl Default for ShadowState {
     fn default() -> Self {
         Self {
-            pending_verify: None,
             pending_executed: Vec::new(),
             gaps: [[None; DEPTHS]; 2],
         }
@@ -2033,18 +2031,24 @@ impl Telemetry {
                         });
                     }
                     if depth < DEPTHS && pass_rows > 0 && self.shadows_needed.load(Ordering::Acquire) {
-                        if launch.verifies() {
-                            self.shadow_state.lock().expect("watcher telemetry shadow state").pending_verify = Some((sequence, depth, missed_total));
+                        let verifies = launch.verifies();
+                        // Front/plain passes emit 1.0 token per step (`missed_total`);
+                        // verify passes run `1 + depth` rows, so per-row misses
+                        // `missed_total / (1 + depth)` calibrate the shared verify
+                        // baseline without baking in noisy single-step rejection
+                        // spikes (`Regime::verify_pass_and_emitted` accounts for
+                        // discarded rows analytically via `shadow_verify_misses` and
+                        // live `Stands`).
+                        let real = if verifies {
+                            missed_total / (1 + depth) as f64
                         } else {
-                            // Plain and front passes emit 1.0 token per step on
-                            // the clock (`Advance::Known(1.0)`), matching
-                            // `Shadows::step`'s denominator.
-                            self.shadow_state.lock().expect("watcher telemetry shadow state").pending_executed.push(ExecutedStep {
-                                verifies: false,
-                                depth,
-                                real: missed_total,
-                            });
-                        }
+                            missed_total
+                        };
+                        self.shadow_state.lock().expect("watcher telemetry shadow state").pending_executed.push(ExecutedStep {
+                            verifies,
+                            depth,
+                            real,
+                        });
                     }
                     if launch.front() != 0 {
                         costs.front.passes += 1;
@@ -2531,32 +2535,47 @@ impl Telemetry {
         if !self.shadows_needed.swap(true, Ordering::AcqRel) {
             crate::experts::reuse::Reuse::of(&self.ranking).enable_shadows();
         }
+        let current_regime = self.horizon.lock().regime_epoch();
         let gaps = self.shadow_state.lock().expect("watcher telemetry shadow state").gaps;
-        let needed = [0usize, 1].map(|form| {
-            std::array::from_fn(|depth| {
-                gaps[form][depth].map(|gap| match gap.delta {
-                    crate::experts::reuse::Delta::Unmeasured => {
-                        magnitude_cost_model::Needed::Shadow(gap.needed())
-                    }
-                    // A verify depth's `Δ = U_real − U_shadow` bakes in the
-                    // acceptance rate (`emitted`) from when that depth last
-                    // ran. Once silent past the same staleness threshold as
-                    // its stand row, fall back to `Needed::Shadow(U_shadow)`
-                    // so a stale warmup / low-acceptance delta cannot lock out
-                    // wider verification.
-                    crate::experts::reuse::Delta::Measured { age, .. }
-                        if form == 1
-                            && depth > 0
-                            && age.get() >= self.stands.stale_after(depth, crate::experts::interest::Form::Verify) =>
-                    {
-                        magnitude_cost_model::Needed::Shadow(gap.shadow)
-                    }
-                    crate::experts::reuse::Delta::Measured { .. } => {
-                        magnitude_cost_model::Needed::Executed(gap.needed())
-                    }
-                })
+        // If live execution in the current physical regime beats the shadow
+        // (`Δ = U_real − U_shadow < 0`), carry that negative baseline offset
+        // onto unmeasured depths' shadow bounds so they are compared
+        // apples-to-apples against executing depths rather than penalized by
+        // `|Δ|` and locked out of exploration.
+        let min_negative_delta = (0..2usize)
+            .flat_map(|form| (0..DEPTHS).map(move |depth| (form, depth)))
+            .filter_map(|(form, depth)| {
+                let gap = gaps[form][depth]?;
+                match gap.delta {
+                    crate::experts::reuse::Delta::Measured { regime, delta, .. } if regime == current_regime => Some(delta),
+                    _ => None,
+                }
+            })
+            .fold(0.0_f64, f64::min);
+        let front = std::array::from_fn(|depth| {
+            gaps[0][depth].map(|gap| match gap.delta {
+                crate::experts::reuse::Delta::Measured { regime, .. } if regime == current_regime => {
+                    magnitude_cost_model::Needed::Executed(gap.needed())
+                }
+                _ => magnitude_cost_model::Needed::Shadow((gap.shadow + min_negative_delta).max(0.0)),
             })
         });
+        // Every verify depth is priced via `Needed::Shadow(u_row)` calibrated
+        // by the single shared live verify baseline `Δ_verify` in the current
+        // regime (falling back to `min_negative_delta` before the first verify
+        // pass in this regime). `Regime::verify_pass_and_emitted` then applies
+        // `shadow_verify_misses(u_row, k)` + live `Stands` analytically, so no
+        // verify depth can freeze out others via single-step route variance.
+        let verify = std::array::from_fn(|depth| {
+            gaps[1][depth].map(|gap| {
+                let offset = match gap.delta {
+                    crate::experts::reuse::Delta::Measured { regime, delta, .. } if regime == current_regime => delta,
+                    _ => min_negative_delta,
+                };
+                magnitude_cost_model::Needed::Shadow((gap.shadow + offset).max(0.0))
+            })
+        });
+        let needed = [front, verify];
         let measured = self.lock().costs.passes.measured(self.routing.experts.len(), needed, &self.stands);
         if measured.is_some() && gaps[0].iter().any(Option::is_some) {
             tracing::debug!(
@@ -2570,29 +2589,6 @@ impl Telemetry {
             );
         }
         measured
-    }
-
-    /// A verify step's verdicts are all in (`emitted`: mean tokens emitted per
-    /// request, `1 + accepted / requests`): queue its `Δ_{verify, depth}` with
-    /// the same per-token denominator as `Shadows::step`, without blocking on
-    /// `self.shadows`.
-    pub(super) fn verify_executed(&self, step: Step, emitted: f64) {
-        if !self.shadows_needed.load(Ordering::Acquire) {
-            return;
-        }
-        let pending = self
-            .shadow_state
-            .lock()
-            .expect("watcher telemetry shadow state")
-            .pending_verify
-            .take_if(|(pending_step, ..)| *pending_step == step);
-        if let Some((_, depth, missed_total)) = pending {
-            self.shadow_state.lock().expect("watcher telemetry shadow state").pending_executed.push(ExecutedStep {
-                verifies: true,
-                depth,
-                real: missed_total / emitted,
-            });
-        }
     }
 
     /// Formatted §8 A1 `history` vs `far` per-decile summary across streamed
@@ -2638,15 +2634,15 @@ impl Telemetry {
             }
             let shadows = guard.as_mut().expect("shadows initialized");
             shadows.read_log(fed);
-            let (epoch, now) = {
+            let (regime, epoch, now) = {
                 let times = self.horizon.lock();
-                (times.bank_epoch(), times.clock.through_latest())
+                (times.regime_epoch(), times.bank_epoch(), times.clock.through_latest())
             };
             for ev in executed {
-                shadows.executed(ev.verifies, ev.depth, ev.real, epoch, now);
+                shadows.executed(ev.verifies, ev.depth, ev.real, regime, epoch, now);
             }
             let reentries = shadows.take_reentries();
-            let gaps = shadows.gaps(epoch, now);
+            let gaps = shadows.gaps(regime, epoch, now);
             self.shadow_state.lock().expect("watcher telemetry shadow state").gaps = gaps;
             reentries
         };

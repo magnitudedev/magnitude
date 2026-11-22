@@ -231,6 +231,9 @@ impl LinkMover {
             let was = self.staged_total;
             self.staged_total = self.staged_total.saturating_add(staged_count as u64);
             if was == 0 {
+                shared.time.lock().update_residency(|state| {
+                    state.link_staging = true;
+                });
                 tracing::info!(
                     staged_count,
                     staged_bytes,

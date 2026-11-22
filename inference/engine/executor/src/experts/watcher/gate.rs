@@ -36,7 +36,7 @@
 //! word is valid for any step: the gate moves what a pass costs, never what
 //! it computes.
 
-use crate::experts::horizon::{Hold, Time, Tokens};
+use crate::experts::horizon::{Hold, RegimeEpoch, Time, Tokens};
 use crate::experts::interest::{Caught, Cohort, CohortRates, HINT_LEADS};
 use magnitude_cost_model::{LaunchPrices, ReadAdmission};
 
@@ -67,13 +67,13 @@ pub(super) struct HintGate {
     published: Vec<bool>,
     time: Time,
     rates: CohortRates,
-    hold: Hold,
+    hold: (RegimeEpoch, Hold),
 }
 
 impl HintGate {
     /// None seen, of streamed layers whose hint ring rows hint `targets`,
     /// each running its hints where it hints a layer, rolling on `time`'s
-    /// bank-wide epochs and clock.
+    /// physical regime, bank-wide epochs, and clock.
     pub(super) fn new(targets: Vec<Vec<usize>>, time: Time) -> Self {
         let layers = targets.len();
         let mut hinters = vec![[None; HINT_LEADS]; layers];
@@ -88,9 +88,9 @@ impl HintGate {
             }
         }
         let running = targets.iter().map(|targets| !targets.is_empty()).collect::<Vec<_>>();
-        let (epoch, now) = {
+        let (regime, epoch, now) = {
             let times = time.lock();
-            (times.bank_epoch(), times.clock.through_latest())
+            (times.regime_epoch(), times.bank_epoch(), times.clock.through_latest())
         };
         Self {
             targets,
@@ -98,8 +98,8 @@ impl HintGate {
             decided: running.clone(),
             published: running,
             time,
-            rates: CohortRates::new(layers, epoch),
-            hold: Hold::started(now),
+            rates: CohortRates::new(layers, regime, epoch),
+            hold: (regime, Hold::started(now)),
         }
     }
 
@@ -108,13 +108,13 @@ impl HintGate {
     /// size counts always, and each lead's exclusive-catch share counts only
     /// while the layer hinting that target at that lead ran its hints.
     pub(super) fn resolved(&mut self, cohorts: &[Cohort]) {
-        let (epoch, now) = {
+        let (regime, epoch, now) = {
             let times = self.time.lock();
-            (times.bank_epoch(), times.clock.through_latest())
+            (times.regime_epoch(), times.bank_epoch(), times.clock.through_latest())
         };
         for cohort in cohorts {
             let running = self.hinters[cohort.layer].map(|src| src.is_some_and(|src| self.published[src]));
-            self.rates.count(cohort, &running, epoch, now);
+            self.rates.count(cohort, &running, regime, epoch, now);
         }
     }
 
@@ -154,14 +154,18 @@ impl HintGate {
         let (Some(prices), Some((rows, pass))) = (prices, pass) else {
             return self.decided.clone();
         };
-        let (epoch, now, tokens_per_step) = {
+        let (regime, epoch, now, tokens_per_step) = {
             let times = self.time.lock();
             (
+                times.regime_epoch(),
                 times.bank_epoch(),
                 times.clock.through_latest(),
                 times.tokens_per_step(0).expect("ā exists once a decode pass is timed"),
             )
         };
+        if self.hold.0 != regime {
+            self.hold = (regime, Hold::started(now));
+        }
         let mut gained = 0.0;
         let hints = (0..self.targets.len())
             .map(|layer| {
@@ -174,7 +178,7 @@ impl HintGate {
                     .unwrap_or_else(|error| panic!("invariant violated: the load's prices refuse streamed layer {layer}'s hint launch at {rows} rows: {error}"))
                     .unwrap_or_else(|| panic!("invariant violated: streamed layer {layer} hints {:?} and its load's census makes no hint launch of it", self.targets[layer]));
                 let z = confidence_z(pass, price);
-                let Some((saving, saving_on, saving_off)) = self.saving_bounds(layer, resolved, miss, epoch, now, z, &mut admitted) else {
+                let Some((saving, saving_on, saving_off)) = self.saving_bounds(layer, running, resolved, miss, regime, epoch, now, z, &mut admitted) else {
                     return running;
                 };
                 let run = if running {
@@ -188,14 +192,14 @@ impl HintGate {
                 run
             })
             .collect::<Vec<_>>();
-        if self.hold.pays(now, gained / tokens_per_step, pass) {
+        if self.hold.1.pays(now, gained / tokens_per_step, pass) {
             // Assumption A10: log each restarting lead's frozen exclusive-catch
-            // rate and its age in tokens at restart.
+            // rate and its age in tokens at restart (only within the same regime).
             for (layer, (&was, &now_on)) in self.decided.iter().zip(&hints).enumerate() {
                 if !was && now_on {
                     for (index, &target) in self.targets[layer].iter().enumerate() {
                         let lead = (index + 1) as u8;
-                        if let Caught::Measured { rate, age } = self.rates.exclusive(lead, epoch, now) {
+                        if let Caught::Measured { rate, age } = self.rates.exclusive(lead, regime, epoch, now) {
                             tracing::info!(
                                 layer,
                                 target,
@@ -209,7 +213,7 @@ impl HintGate {
                 }
             }
             self.decided.clone_from(&hints);
-            self.hold.changed(now);
+            self.hold.1.changed(now);
         }
         self.decided.clone()
     }
@@ -237,8 +241,10 @@ impl HintGate {
     fn saving_bounds(
         &mut self,
         layer: usize,
+        running: bool,
         resolved: &[bool],
         miss: ReadAdmission,
+        regime: RegimeEpoch,
         epoch: u64,
         now: Tokens,
         z: f64,
@@ -253,12 +259,18 @@ impl HintGate {
             if !admitted(target, lead, miss) {
                 continue;
             }
-            let cohort_share = self.rates.cohort_share(target, epoch)?;
+            let cohort_share = self.rates.cohort_share(target, regime, epoch)?;
             let cohort = cohort_share.rate();
             let (cohort_lo, cohort_hi) = cohort_share.poisson(z);
-            let (excl_share, _) = self.rates.exclusive_share(lead, epoch, now)?;
-            let excl = excl_share.rate();
-            let excl_hi = excl_share.wilson(z).1;
+            let (excl, excl_hi) = match self.rates.exclusive_share(lead, regime, epoch, now) {
+                Some((excl_share, _)) => (excl_share.rate(), excl_share.wilson(z).1),
+                // Unmeasured in this regime while stopped: use the optimistic
+                // bound (1.0) so a stopped layer re-probes when the new
+                // regime's cohort warrants it; while running, hold ON until
+                // its first cohort in this regime is measured.
+                None if !running => (1.0, 1.0),
+                None => return None,
+            };
             let delta = |m: f64, e: f64| miss.layer_stall(m) - miss.layer_stall((m - e * m).max(0.0));
             point += delta(cohort, excl);
             lower += delta(cohort_lo, excl);
@@ -269,16 +281,17 @@ impl HintGate {
 
     #[cfg(test)]
     fn saving(&mut self, layer: usize, resolved: &[bool], miss: ReadAdmission, epoch: u64, now: Tokens) -> f64 {
+        let regime = self.time.lock().regime_epoch();
         let mut total = 0.0;
         for (index, &target) in self.targets[layer].iter().enumerate() {
             if resolved[target] {
                 continue;
             }
-            let Some(cohort) = self.rates.cohort(target, epoch) else {
+            let Some(cohort) = self.rates.cohort(target, regime, epoch) else {
                 continue;
             };
             let lead = (index + 1) as u8;
-            let exclusive = self.rates.exclusive(lead, epoch, now).rate();
+            let exclusive = self.rates.exclusive(lead, regime, epoch, now).rate();
             let remaining = (cohort - exclusive * cohort).max(0.0);
             total += miss.layer_stall(cohort) - miss.layer_stall(remaining);
         }
@@ -367,13 +380,13 @@ mod tests {
         let c1 = Cohort { step: 1, layer: 2, misses: 1, saved: vec![catchers(&[1, 2]), catchers(&[1])] };
         gate.resolved(&[c1]);
 
-        let (epoch, now) = {
+        let (regime, epoch, now) = {
             let times = time.lock();
-            (times.bank_epoch(), times.clock.through_latest())
+            (times.regime_epoch(), times.bank_epoch(), times.clock.through_latest())
         };
-        assert_eq!(gate.rates.cohort(2, epoch), Some(3.0));
-        assert_eq!(gate.rates.exclusive(1, epoch, now), Caught::Measured { rate: 1.0 / 3.0, age: Tokens::ZERO });
-        assert_eq!(gate.rates.exclusive(2, epoch, now), Caught::Measured { rate: 0.0, age: Tokens::ZERO });
+        assert_eq!(gate.rates.cohort(2, regime, epoch), Some(3.0));
+        assert_eq!(gate.rates.exclusive(1, regime, epoch, now), Caught::Measured { rate: 1.0 / 3.0, age: Tokens::ZERO });
+        assert_eq!(gate.rates.exclusive(2, regime, epoch, now), Caught::Measured { rate: 0.0, age: Tokens::ZERO });
 
         // Layer 1 hints layer 2 at lead 1: saving = stall(3) - stall(3 - (1/3)*3) = stall(3) - stall(2) = 1 ms.
         let save_l1 = gate.saving(1, &[false, false, false], cost, epoch, now);
@@ -424,18 +437,18 @@ mod tests {
             times.moved(0, Tier::COMPUTE);
         }
         gate.resolved(&[Cohort { step: off_step, layer: 2, misses: 3, saved: Vec::new() }]);
-        let (epoch, now) = {
+        let (regime, epoch, now) = {
             let times = time.lock();
-            (times.bank_epoch(), times.clock.through_latest())
+            (times.regime_epoch(), times.bank_epoch(), times.clock.through_latest())
         };
-        match gate.rates.exclusive(1, epoch, now) {
+        match gate.rates.exclusive(1, regime, epoch, now) {
             Caught::Measured { rate, age } => {
                 assert!((rate - 1.0 / 3.0).abs() < 1e-12, "frozen exclusive_1 holds its last rate");
                 assert!(age.get() >= 100.0, "age grows while off: {age:?}");
             }
-            Caught::Unmeasured => panic!("exclusive_1 must never return to unmeasured"),
+            Caught::Unmeasured => panic!("exclusive_1 must hold within the same regime"),
         }
-        assert!(gate.rates.cohort(2, epoch).unwrap() > 0.0, "cohort stays live while lead is off");
+        assert!(gate.rates.cohort(2, regime, epoch).unwrap() > 0.0, "cohort stays live while lead is off");
     }
 
     /// A layer's hints run while what their names save outweighs their
@@ -513,7 +526,7 @@ mod tests {
         let decided = gate.decide(&[false, true], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
         assert!(!decided[0], "first positive gain moves the gate while unbounded");
         gate.publish(&decided);
-        assert_eq!(gate.hold.expected(Tokens::new(1.0)), Held::Tokens(Tokens::new(1.0)));
+        assert_eq!(gate.hold.1.expected(Tokens::new(1.0)), Held::Tokens(Tokens::new(1.0)));
 
         // Step 2: target becomes unresolved with 2 misses -> lower cohort bound > 0.1 ms,
         // point saving = 1.0 ms (gain 0.9 ms/token), hold = 2 tokens -> 1.8 ms < 10 ms break -> does NOT move yet.
@@ -625,14 +638,52 @@ mod tests {
         time.lock().register(1, Advance::Known(Tokens::new(1.0)));
         gate.resolved(&[Cohort { step: 1, layer: 1, misses: 5, saved: Vec::new() }]);
 
-        let (epoch, now) = {
+        let (regime, epoch, now) = {
             let times = time.lock();
-            (times.bank_epoch(), times.clock.through_latest())
+            (times.regime_epoch(), times.bank_epoch(), times.clock.through_latest())
         };
-        let bounds = gate.saving_bounds(0, &[false, false], cost, epoch, now, 3.78, &mut |_, _, _| false);
+        let bounds = gate.saving_bounds(0, true, &[false, false], cost, regime, epoch, now, 3.78, &mut |_, _, _| false);
         assert_eq!(bounds, Some((0.0, 0.0, 0.0)), "unadmitted hint must save identically 0");
 
         let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| false);
         assert_eq!(decided, [false, false], "POLICY_HINTS flips to 0 immediately when no rank is admitted");
+    }
+
+    /// Reproduces `de033d` (`344 -> 349 -> 409` bank resize): a frozen A10
+    /// `exclusive` rate captured in an earlier residency regime becomes
+    /// `Caught::Unmeasured` by construction when the bank resizes, so stale
+    /// churn-era `frozen_exclusive` can never steer `HintGate` after growth.
+    #[test]
+    fn regime_transition_clears_frozen_exclusive_a10_by_construction() {
+        let time = Time::new(&[vec![344]], 32);
+        let mut gate = HintGate::new(vec![vec![1], Vec::new()], time.clone());
+
+        // Regime 0 (344 slots): record a high exclusive catch rate (0.60).
+        time.lock().register(1, Advance::Known(Tokens::new(1.0)));
+        gate.resolved(&[Cohort {
+            step: 1,
+            layer: 1,
+            misses: 2,
+            saved: vec![catchers(&[1]), catchers(&[1]), catchers(&[1])],
+        }]);
+        let (r0, e0, n0) = {
+            let t = time.lock();
+            (t.regime_epoch(), t.bank_epoch(), t.clock.through_latest())
+        };
+        assert_eq!(gate.rates.exclusive(1, r0, e0, n0), Caught::Measured { rate: 0.6, age: Tokens::ZERO });
+
+        // Bank grows 344 -> 409 slots: RegimeEpoch advances automatically.
+        time.lock().resized(0, Tier::COMPUTE, 409);
+        let (r1, e1, n1) = {
+            let t = time.lock();
+            (t.regime_epoch(), t.bank_epoch(), t.clock.through_latest())
+        };
+        assert!(r1 > r0, "bank resize must advance RegimeEpoch");
+        assert_eq!(
+            gate.rates.exclusive(1, r1, e1, n1),
+            Caught::Unmeasured,
+            "stale A10 frozen_exclusive from 344-slot regime must be inapplicable at 409 slots"
+        );
+        assert_eq!(gate.rates.cohort(1, r1, e1), None, "stale cohort from 344-slot regime must be inapplicable");
     }
 }

@@ -628,18 +628,18 @@ const FLASH_SLOW_PLAIN: Costs = Costs {
 /// past that a plain look measures it.
 #[test]
 fn a_plain_decode_measured_cold_is_measured_again_once_drafting_runs_on_its_price() {
-    use super::{Durations, LaunchCosts};
+    use super::{Durations, TargetCosts};
     let stream = Stream::of(&[(3_000, CONTINUED)]);
     let (width, plain) = fastest_fixed(&stream, FLASH);
     assert_eq!(width, 0, "plain decoding is the fastest");
     let load = Arc::new(DraftLoad::default());
     {
-        let mut cold = LaunchCosts::default();
+        let mut cold = TargetCosts::default();
         cold.verify.insert(1, Durations::settled(&[(1, 0.090), (2, 0.095), (3, 0.092)]));
         let mut state = load.lock();
         state
-            .costs
-            .insert(((CONTEXT / 2).next_power_of_two(), 1), cold);
+            .target_costs
+            .insert((None, (CONTEXT / 2).next_power_of_two(), 1), cold);
         state.rounds = 3;
     }
     let run = adaptive(&stream, FLASH, &load);
@@ -721,19 +721,22 @@ fn a_launch_that_proves_slow_is_not_taken_again() {
 
 #[test]
 fn a_launch_not_measured_here_costs_no_more_than_a_larger_one_proven_here() {
-    use super::{Durations, LaunchCosts, RoundCosts};
+    use super::{Durations, RoundCosts};
     let load = DraftLoad::default();
     {
         let mut state = load.lock();
         // A held-up first duration of width 3 at a short context.
-        let mut short = LaunchCosts::default();
-        short.draft.insert(3, Durations::settled(&[(1, 0.0795)]));
-        state.costs.insert((512, 1), short);
+        state
+            .draft_costs
+            .entry((512, 1))
+            .or_default()
+            .insert(3, Durations::settled(&[(1, 0.0795)]));
         // Width 7 proven at the request's context.
-        let mut long = LaunchCosts::default();
-        long.draft
+        state
+            .draft_costs
+            .entry((4096, 1))
+            .or_default()
             .insert(7, Durations::settled(&[(2, 0.0099), (3, 0.0099), (4, 0.0099)]));
-        state.costs.insert((4096, 1), long);
     }
     let state = load.lock();
     let costs = RoundCosts::of(&state, 4096, 1, None);
@@ -1355,23 +1358,24 @@ fn a_switch_is_measured_apart_from_its_rounds_launches() {
         .count();
     assert!(switches >= 4, "the run switches: {}", run.rounds());
     let state = load.lock();
-    let measured = &state.costs[&((CONTEXT + 1).next_power_of_two(), 1)];
+    let ctx = (CONTEXT + 1).next_power_of_two();
+    let measured_target = &state.target_costs[&(None, ctx, 1)];
+    let measured_draft = &state.draft_costs[&(ctx, 1)];
     let ms = |durations: &super::Durations| durations.cost() * 1000.0;
-    let enter = ms(&measured.enter);
+    let enter = ms(&measured_target.enter);
     let catch_up = (V710_HEADS.catch_up)(64);
     assert!(
         enter >= V710_HEADS.discard * 0.99 && enter <= (V710_HEADS.discard + catch_up) * 1.01,
         "entering costs the discarded decode and the catch-up: {enter} ms"
     );
-    assert!((ms(&measured.leave) - V710_HEADS.resume).abs() < 0.01);
-    assert!((ms(&measured.verify[&1]) - (V710_HEADS.costs.verify)(1)).abs() < 0.01);
+    assert!((ms(&measured_target.leave) - V710_HEADS.resume).abs() < 0.01);
+    assert!((ms(&measured_target.verify[&1]) - (V710_HEADS.costs.verify)(1)).abs() < 0.01);
     // A catch-up's length varies with the pairs held, so a drafter launch
     // that pays for one is off by at most that variation. A launch first
     // measured in a switching round, before the switch had a price, keeps
     // that duration until it is measured again, so only launches measured
     // their full share of times are checked.
-    for (generated, durations) in measured
-        .draft
+    for (generated, durations) in measured_draft
         .iter()
         .filter(|(_, durations)| durations.proven())
     {
@@ -1511,7 +1515,7 @@ fn a_fused_drafter_declining_decodes_at_the_plain_pace() {
     let load = Arc::new(DraftLoad::default());
     pipelined(&Stream::of(&[(150, HEADS_CODE), (150, DFLASH_PROSE), (150, HEADS_CODE)]), M4_DFLASH, HEADS, &load, Reported::Whole);
     let state = load.lock();
-    let enter = state.costs[&((CONTEXT + 1).next_power_of_two(), 1)].enter.cost() * 1000.0;
+    let enter = state.target_costs[&(None, (CONTEXT + 1).next_power_of_two(), 1)].enter.cost() * 1000.0;
     assert!((enter - 0.19).abs() < 0.01, "entering costs the taps alone: {enter} ms");
 }
 
@@ -1588,15 +1592,15 @@ fn draft_load_costs_stays_bounded_across_many_context_and_sequence_buckets() {
             controller.committed(&[TokenId(0)]);
         }
     }
-    let buckets = load.lock().costs.len();
+    let buckets = load.lock().target_costs.len();
     assert_eq!(
         buckets,
         super::MAX_COST_BUCKETS,
-        "DraftLoad::costs should populate and cap at MAX_COST_BUCKETS ({})",
+        "DraftLoad::target_costs should populate and cap at MAX_COST_BUCKETS ({})",
         super::MAX_COST_BUCKETS
     );
     // Most recently measured bucket is still retained.
-    assert!(load.lock().costs.contains_key(&(1 << 9, 20)));
+    assert!(load.lock().target_costs.contains_key(&(None, 1 << 9, 20)));
 }
 
 #[test]
@@ -1611,7 +1615,7 @@ fn streamed_verify_prior_avoids_blind_widest_first_probing_and_larger_clamp() {
     // chooses plain decode (0) rather than blindly probing WIDEST.
     let steep = Arc::new(DraftLoad::default());
     steep.observe_streamed(Some(StreamedVerifyPrior {
-        bank_epoch: 1,
+        regime_epoch: 1,
         verify_seconds: vec![0.050, 0.120, 0.200, 0.280],
     }));
     let mut steep_ctrl = DraftController::new(WIDEST, steep.clone());
@@ -1628,25 +1632,34 @@ fn streamed_verify_prior_avoids_blind_widest_first_probing_and_larger_clamp() {
         assert!((costs.verify(8) - 0.600).abs() < 1e-12);
     }
 
-    // Proving a larger width (rows = 8 at 70ms) must not drag an unmeasured smaller
-    // width (rows = 4) below its streamed prior (280ms).
+    // Once a width (rows = 8 at 70ms) is measured live, unmeasured widths
+    // (rows = 4) anchor the prior's ratio to that live measurement
+    // (`0.070 * 0.280 / 0.600`) instead of mixing raw cold prior scale (280ms)
+    // against live durations (70ms).
     {
         let mut state = steep.lock();
-        let bucket = state.costs.entry((ctx, 1)).or_default();
+        let bucket = state.target_costs.entry((Some(1), ctx, 1)).or_default();
         bucket.verify.insert(8, super::Durations::settled(&[(1, 0.070), (2, 0.070), (3, 0.070)]));
+        state.rounds = 3;
     }
     {
         let state = steep.lock();
         let costs = RoundCosts::of(&state, ctx, 1, None);
         assert!((costs.verify(8) - 0.070).abs() < 1e-12, "proven width uses its measurement");
-        assert!((costs.verify(4) - 0.280).abs() < 1e-12, "unmeasured width keeps prior without larger clamp");
+        let expected_4 = 0.070 * (0.280 / 0.600);
+        assert!(
+            (costs.verify(4) - expected_4).abs() < 1e-12,
+            "unmeasured width anchors prior ratio to live measurement: {} vs {}",
+            costs.verify(4),
+            expected_4,
+        );
     }
 
     // Under a moderate prior where k=1 (80ms -> 25 tok/s) beats plain (50ms -> 20 tok/s)
     // and deeper widths (k=2 200ms -> 15 tok/s), cold-start selects width 1, not WIDEST.
     let moderate = Arc::new(DraftLoad::default());
     moderate.observe_streamed(Some(StreamedVerifyPrior {
-        bank_epoch: 1,
+        regime_epoch: 1,
         verify_seconds: vec![0.050, 0.080, 0.200, 0.320],
     }));
     let mut mod_ctrl = DraftController::new(WIDEST, moderate);
@@ -1654,10 +1667,10 @@ fn streamed_verify_prior_avoids_blind_widest_first_probing_and_larger_clamp() {
 }
 
 #[test]
-fn observe_streamed_invalidates_target_costs_on_bank_epoch_change_preserving_draft() {
+fn observe_streamed_invalidates_target_costs_on_regime_epoch_change_preserving_draft() {
     let load = Arc::new(DraftLoad::default());
     let prior_e1 = StreamedVerifyPrior {
-        bank_epoch: 1,
+        regime_epoch: 1,
         verify_seconds: vec![0.050, 0.100],
     };
     load.observe_streamed(Some(prior_e1.clone()));
@@ -1666,46 +1679,46 @@ fn observe_streamed_invalidates_target_costs_on_bank_epoch_change_preserving_dra
     let ctx_b = 2048usize;
     {
         let mut state = load.lock();
-        let a = state.costs.entry((ctx_a, 1)).or_default();
-        a.draft.insert(4, super::Durations::settled(&[(1, 0.005)]));
+        state
+            .draft_costs
+            .entry((ctx_a, 1))
+            .or_default()
+            .insert(4, super::Durations::settled(&[(1, 0.005)]));
+        let a = state.target_costs.entry((Some(1), ctx_a, 1)).or_default();
         a.verify.insert(2, super::Durations::settled(&[(1, 0.090)]));
         a.enter = super::Durations::settled(&[(1, 0.002)]);
         a.leave = super::Durations::settled(&[(1, 0.003)]);
 
-        // Bucket with only verify durations (should be pruned when cleared).
-        let b = state.costs.entry((ctx_b, 1)).or_default();
+        let b = state.target_costs.entry((Some(1), ctx_b, 1)).or_default();
         b.verify.insert(1, super::Durations::settled(&[(1, 0.045)]));
     }
 
-    // Same epoch leaves every measured duration untouched.
+    // Same regime leaves every measured duration untouched.
     load.observe_streamed(Some(prior_e1));
     {
         let state = load.lock();
-        assert!(state.costs[&(ctx_a, 1)].verify.contains_key(&2));
-        assert!(state.costs[&(ctx_a, 1)].draft.contains_key(&4));
-        assert!(state.costs[&(ctx_a, 1)].enter.measured());
-        assert!(state.costs[&(ctx_a, 1)].leave.measured());
-        assert!(state.costs.contains_key(&(ctx_b, 1)));
+        assert!(state.target_costs[&(Some(1), ctx_a, 1)].verify.contains_key(&2));
+        assert!(state.draft_costs[&(ctx_a, 1)].contains_key(&4));
+        assert!(state.target_costs[&(Some(1), ctx_a, 1)].enter.measured());
+        assert!(state.target_costs[&(Some(1), ctx_a, 1)].leave.measured());
+        assert!(state.target_costs.contains_key(&(Some(1), ctx_b, 1)));
     }
 
-    // New bank_epoch clears verify/enter/leave, prunes empty buckets, and preserves draft.
+    // New regime_epoch makes old-regime target costs inapplicable by construction
+    // and prunes them while preserving draft_costs.
     load.observe_streamed(Some(StreamedVerifyPrior {
-        bank_epoch: 2,
+        regime_epoch: 2,
         verify_seconds: vec![0.040, 0.075],
     }));
     {
         let state = load.lock();
-        let a = &state.costs[&(ctx_a, 1)];
-        assert!(a.draft.contains_key(&4), "draft durations must survive bank_epoch change");
-        assert!((a.draft[&4].cost() - 0.005).abs() < 1e-12);
-        assert!(a.verify.is_empty(), "verify durations must be cleared on bank_epoch change");
-        assert!(!a.enter.measured(), "enter durations must be cleared on bank_epoch change");
-        assert!(!a.leave.measured(), "leave durations must be cleared on bank_epoch change");
-        assert!(!state.costs.contains_key(&(ctx_b, 1)), "buckets emptied by invalidation must be pruned");
+        assert!(state.draft_costs[&(ctx_a, 1)].contains_key(&4), "draft durations must survive regime_epoch change");
+        assert!((state.draft_costs[&(ctx_a, 1)][&4].cost() - 0.005).abs() < 1e-12);
+        assert!(state.target_costs.is_empty(), "prior-regime target costs must not survive regime_epoch change");
     }
     let state = load.lock();
     let costs = RoundCosts::of(&state, ctx_a, 1, None);
-    assert!((costs.verify(2) - 0.075).abs() < 1e-12, "new epoch prior takes effect immediately");
+    assert!((costs.verify(2) - 0.075).abs() < 1e-12, "new regime prior takes effect immediately");
 }
 
 /// `LaunchPrices` supplies analytical priors for both unmeasured `D(g)` and
@@ -1839,4 +1852,82 @@ fn launch_prices_supplies_draft_and_verify_priors_replaced_on_first_observation(
     let live_right = ctrl.right();
     assert!((live_right[0] - 1.0).abs() < 1e-12);
     assert!((live_right[1] - 0.0).abs() < 1e-12);
+}
+
+/// Reproduces `d273df` (`v710-sc` Vulkan DFlash): live `verify(4)` measured
+/// ~79 ms while a cold `StreamedVerifyPrior` predicted `verify(4) = 150 ms`
+/// and `verify(8) = 240 ms` (1.60× ratio). Anchoring the prior's ratio to
+/// live `verify(4)` prices `verify(8)` at `79 * 1.60 = 126 ms`, so at 96.3%
+/// acceptance (`tokens(7)/tokens(3) = 1.75× > 1.60×`), `DraftController`
+/// immediately widens to `verified = 7` instead of staying trapped at `3`.
+#[test]
+fn anchored_streamed_verify_prior_widens_when_measured_narrow_beats_cold_prior() {
+    let load = Arc::new(DraftLoad::default());
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.070, 0.100, 0.125, 0.150, 0.175, 0.200, 0.220, 0.240],
+    }));
+    let ctx = CONTEXT.max(1).next_power_of_two();
+    {
+        let mut state = load.lock();
+        state
+            .draft_costs
+            .entry((ctx, 1))
+            .or_default()
+            .insert(7, super::Durations::settled(&[(1, 0.014), (2, 0.014), (3, 0.014)]));
+        state
+            .target_costs
+            .entry((Some(1), ctx, 1))
+            .or_default()
+            .verify
+            .insert(4, super::Durations::settled(&[(1, 0.079), (2, 0.079), (3, 0.079)]));
+        state.rounds = 3;
+    }
+
+    let mut ctrl = DraftController::new(7, load.clone());
+    // Feed high acceptance (~96% per step) matching `d273df`.
+    for _ in 0..8 {
+        let g = ctrl.generate(7, CONTEXT, true);
+        let block: Vec<TokenId> = (1..=g as u32).map(TokenId).collect();
+        ctrl.drafted(g, &block, None);
+        let v = ctrl.verify(7);
+        assert_eq!(v, 7, "anchored verify(8) must beat verify(4) at high acceptance (got {v})");
+        let mut committed = block;
+        committed.push(TokenId(99));
+        ctrl.committed(&committed);
+    }
+}
+
+/// Within a single physical regime, a non-plain verify width (`rows > 1`)
+/// whose measurement is older than `STALE_ROUNDS` expires on read so a
+/// transient stall cannot permanently trap `DraftController` at narrow width.
+#[test]
+fn stale_slow_wide_verify_expires_on_read_past_stale_rounds() {
+    let load = Arc::new(DraftLoad::default());
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.040, 0.050, 0.060, 0.070, 0.080, 0.090, 0.100, 0.110],
+    }));
+    let ctx = CONTEXT.max(1).next_power_of_two();
+    {
+        let mut state = load.lock();
+        let target = state.target_costs.entry((Some(1), ctx, 1)).or_default();
+        // Round 1: verify(8) hit a transient 500 ms stall.
+        target
+            .verify
+            .insert(8, super::Durations::settled(&[(1, 0.500), (2, 0.500), (3, 0.500)]));
+        // Recent rounds: verify(4) runs at 50 ms.
+        target
+            .verify
+            .insert(4, super::Durations::settled(&[(102, 0.050), (103, 0.050), (104, 0.050)]));
+        state.rounds = 104; // 104 - 3 = 101 >= STALE_ROUNDS (100)
+    }
+    let state = load.lock();
+    let costs = RoundCosts::of(&state, ctx, 1, None);
+    let expected = 0.050 * (0.110 / 0.070);
+    assert!(
+        (costs.verify(8) - expected).abs() < 1e-12,
+        "stale 500 ms verify(8) must expire on read to anchored prior {expected}, got {}",
+        costs.verify(8)
+    );
 }

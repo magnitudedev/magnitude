@@ -119,7 +119,7 @@ use std::ops::AddAssign;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use super::horizon::{self, Aged, Time, Tokens, Window};
+use super::horizon::{self, RegimeAged, RegimeEpoch, RegimeWindow, Time, Tokens, Window};
 use super::watcher::{At, DecodeRow, Step};
 use crate::operation::{GuessKind, RequestId, TokenId};
 
@@ -885,15 +885,16 @@ pub(in crate::experts) const STAND_STALE_BASE: f64 = 32.0;
 const STAND_STALE_MAX: f64 = 256.0;
 
 /// A stand rate's state (§3.3): unjudged (its bound 1), or judged over a
-/// window on the bank-wide epochs, which holds its last measurement, with
-/// its age, while its row is not run. Unjudged → judged is the only
-/// transition, so raw history ([`Stands::judged`]) never returns to its bound,
-/// while [`Stands::live_rate`] expires silent rows past `stale_after` tokens
+/// regime-scoped aged window on the bank-wide epochs, which holds its last
+/// measurement, with its age, while its row is not run within the same
+/// physical [`RegimeEpoch`]. Any physical tier/residency regime transition
+/// makes prior-regime judgements inapplicable by construction, while within a
+/// regime [`Stands::live_rate`] expires silent rows past `stale_after` tokens
 /// so a transient hard passage cannot permanently trap decode at a narrow width.
 pub(in crate::experts) enum Judgement {
     Unjudged,
     Judged {
-        window: Aged<Tally>,
+        window: RegimeAged<Tally>,
         stale_after: f64,
     },
 }
@@ -935,16 +936,16 @@ impl Stands {
         Self { time, rows: Arc::new(Mutex::new(rows)) }
     }
 
-    /// Locks the stand rates, then reads the bank-wide epoch and clock under
-    /// that lock so every count and read observes monotonically non-decreasing
-    /// `(epoch, now)`. `horizon::Time` is a leaf lock, so `Stands::rows ->
-    /// horizon::Time` cannot deadlock.
-    fn lock_with_now(&self) -> (MutexGuard<'_, [[Judgement; 2]; ROWS]>, u64, Tokens) {
+    /// Locks the stand rates, then reads the physical regime epoch, bank-wide
+    /// epoch, and clock under that lock so every count and read observes
+    /// monotonically non-decreasing `(regime, epoch, now)`. `horizon::Time` is
+    /// a leaf lock, so `Stands::rows -> horizon::Time` cannot deadlock.
+    fn lock_with_now(&self) -> (MutexGuard<'_, [[Judgement; 2]; ROWS]>, RegimeEpoch, u64, Tokens) {
         let rows = self.rows.lock().expect("the stand rates");
         let times = self.time.lock();
-        let (epoch, now) = (times.bank_epoch(), times.clock.through_latest());
+        let (regime, epoch, now) = (times.regime_epoch(), times.bank_epoch(), times.clock.through_latest());
         drop(times);
-        (rows, epoch, now)
+        (rows, regime, epoch, now)
     }
 
     /// Row `row`'s cell. Panics where `row` is not a guessed row,
@@ -957,44 +958,52 @@ impl Stands {
     /// Row `row` of `form`, every row before it having stood, `stood` or
     /// fell, judged now.
     pub(super) fn count(&self, row: usize, form: Form, stood: bool) {
-        let (mut rows, epoch, now) = self.lock_with_now();
+        let (mut rows, regime, epoch, now) = self.lock_with_now();
         let cell = Self::cell(&mut rows, row, form);
         match cell {
             Judgement::Unjudged => {
                 *cell = Judgement::Judged {
-                    window: Aged::new(epoch),
+                    window: RegimeAged::new(regime, epoch),
                     stale_after: STAND_STALE_BASE,
                 };
             }
             Judgement::Judged { window, stale_after } => {
-                if let Some((_, age)) = window.read(epoch, now) {
-                    if age.get() >= *stale_after {
-                        // Re-entering after staleness expiry: drop the frozen
-                        // pre-silence epoch tally so the fresh probe stands on
-                        // its own verdict, and back off exponentially if it
+                match window.read(regime, epoch, now) {
+                    None => {
+                        // Regime transitioned: reset backoff to base; `window.count`
+                        // below starts fresh at `regime`.
+                        *stale_after = STAND_STALE_BASE;
+                    }
+                    Some((_, age)) if age.get() >= *stale_after => {
+                        // Re-entering after staleness expiry within the same regime:
+                        // drop the frozen pre-silence epoch tally so the fresh probe
+                        // stands on its own verdict, and back off exponentially if it
                         // still falls (or reset to base if it stands).
-                        *window = Aged::new(epoch);
+                        window.reset(regime, epoch);
                         *stale_after = if stood {
                             STAND_STALE_BASE
                         } else {
                             (*stale_after * 2.0).min(STAND_STALE_MAX)
                         };
-                    } else if stood {
+                    }
+                    Some(_) if stood => {
                         *stale_after = STAND_STALE_BASE;
                     }
+                    Some(_) => {}
                 }
             }
         }
         let Judgement::Judged { window, .. } = cell else { unreachable!("judged above") };
-        *window.count(epoch, now) += Tally::of(stood);
+        *window.count(regime, epoch, now) += Tally::of(stood);
     }
 
     /// r_row of `form` (§3.4) and its age, the tokens since its row was last
-    /// judged: row `row` ≥ 1 standing, every row before it having stood;
-    /// none unjudged (whose bound, 1, the caller applies).
+    /// judged in the current physical regime: row `row` ≥ 1 standing, every
+    /// row before it having stood; none unjudged in this regime (whose bound,
+    /// 1, the caller applies).
     pub fn judged(&self, row: usize, form: Form) -> Option<(f64, Tokens)> {
-        let (mut rows, epoch, now) = self.lock_with_now();
-        Self::read(&mut rows, row, form, epoch, now)
+        let (mut rows, regime, epoch, now) = self.lock_with_now();
+        Self::read(&mut rows, row, form, regime, epoch, now)
     }
 
     /// r_row of `form`: [`Self::judged`]'s rate.
@@ -1003,12 +1012,13 @@ impl Stands {
     }
 
     /// The token-age staleness threshold currently governing `(row, form)`
-    /// (`STAND_STALE_BASE`..=`STAND_STALE_MAX`).
+    /// (`STAND_STALE_BASE`..=`STAND_STALE_MAX`) in the current physical regime.
     pub fn stale_after(&self, row: usize, form: Form) -> f64 {
-        let mut rows = self.rows.lock().expect("the stand rates");
+        let (mut rows, regime, _, _) = self.lock_with_now();
         match Self::cell(&mut rows, row, form) {
             Judgement::Unjudged => STAND_STALE_BASE,
-            Judgement::Judged { stale_after, .. } => *stale_after,
+            Judgement::Judged { window, stale_after } if window.regime() == regime => *stale_after,
+            Judgement::Judged { .. } => STAND_STALE_BASE,
         }
     }
 
@@ -1018,16 +1028,17 @@ impl Stands {
     /// for at least `stale_after` tokens so `Regime::verify_emitted` carries
     /// forward the shallower live stand rate instead of staying permanently
     /// trapped by a frozen warmup or hard-passage sample. An unjudged
-    /// `preferred` row stays `None` (its optimistic bound 1).
+    /// `preferred` row (or one from a prior physical regime) stays `None` (its
+    /// optimistic bound 1).
     pub fn live_rate(&self, row: usize, preferred: Form) -> Option<f64> {
-        let (mut rows, epoch, now) = self.lock_with_now();
-        let (rate, age, stale_after) = Self::read_with_stale(&mut rows, row, preferred, epoch, now)?;
+        let (mut rows, regime, epoch, now) = self.lock_with_now();
+        let (rate, age, stale_after) = Self::read_with_stale(&mut rows, row, preferred, regime, epoch, now)?;
         let other = match preferred {
             Form::Front => Form::Verify,
             Form::Verify => Form::Front,
         };
         if let Some((other_rate, other_age, other_stale_after)) =
-            Self::read_with_stale(&mut rows, row, other, epoch, now)
+            Self::read_with_stale(&mut rows, row, other, regime, epoch, now)
         {
             if other_age.get() < other_stale_after && other_age < age {
                 return Some(other_rate);
@@ -1043,30 +1054,44 @@ impl Stands {
     /// their bound 1.0 (design §3.3), read under a single lock of the clock
     /// and stand table.
     pub fn front_rates(&self) -> [f64; ROWS] {
-        let (mut rows, epoch, now) = self.lock_with_now();
-        std::array::from_fn(|index| Self::read(&mut rows, index + 1, Form::Front, epoch, now).map_or(1.0, |(rate, _)| rate))
+        let (mut rows, regime, epoch, now) = self.lock_with_now();
+        std::array::from_fn(|index| Self::read(&mut rows, index + 1, Form::Front, regime, epoch, now).map_or(1.0, |(rate, _)| rate))
     }
 
     /// σ_depth of `form` (§3.3): the probability a pass's first `depth`
     /// guessed rows all stand, Π_{row ≤ depth} r_row, an unjudged row's at
     /// its bound 1.
     pub fn through_rows(&self, depth: usize, form: Form) -> f64 {
-        let (mut rows, epoch, now) = self.lock_with_now();
-        (1..=depth).map(|row| Self::read(&mut rows, row, form, epoch, now).map_or(1., |(rate, _)| rate)).product()
+        let (mut rows, regime, epoch, now) = self.lock_with_now();
+        (1..=depth).map(|row| Self::read(&mut rows, row, form, regime, epoch, now).map_or(1., |(rate, _)| rate)).product()
     }
 
-    fn read_with_stale(rows: &mut [[Judgement; 2]; ROWS], row: usize, form: Form, epoch: u64, now: Tokens) -> Option<(f64, Tokens, f64)> {
+    fn read_with_stale(
+        rows: &mut [[Judgement; 2]; ROWS],
+        row: usize,
+        form: Form,
+        regime: RegimeEpoch,
+        epoch: u64,
+        now: Tokens,
+    ) -> Option<(f64, Tokens, f64)> {
         match Self::cell(rows, row, form) {
             Judgement::Unjudged => None,
             Judgement::Judged { window, stale_after } => {
-                let (tallies, age) = window.read(epoch, now).expect("a judged row holds a verdict");
+                let (tallies, age) = window.read(regime, epoch, now)?;
                 Some((Tally::over(tallies), age, *stale_after))
             }
         }
     }
 
-    fn read(rows: &mut [[Judgement; 2]; ROWS], row: usize, form: Form, epoch: u64, now: Tokens) -> Option<(f64, Tokens)> {
-        Self::read_with_stale(rows, row, form, epoch, now).map(|(rate, age, _)| (rate, age))
+    fn read(
+        rows: &mut [[Judgement; 2]; ROWS],
+        row: usize,
+        form: Form,
+        regime: RegimeEpoch,
+        epoch: u64,
+        now: Tokens,
+    ) -> Option<(f64, Tokens)> {
+        Self::read_with_stale(rows, row, form, regime, epoch, now).map(|(rate, age, _)| (rate, age))
     }
 }
 
@@ -1197,71 +1222,76 @@ impl Caught {
     }
 }
 
-/// The counterfactual demand cohort rates (§3.5, Revision 1 row 2):
-/// - `exclusive_ℓ` (`Aged<Share>` on bank-wide epochs, counted only while
-///   lead ℓ runs on a non-empty cohort; unmeasured reads 1, and freezes
-///   with its age while ℓ is off, A10);
-/// - `cohort_l` (`Window<Share>` on bank-wide epochs, counted on every
-///   resolved step whether hints run or not).
+/// The counterfactual demand cohort rates (§3.5, Revision 1 row 2), keyed to
+/// the physical [`RegimeEpoch`] they were measured in so a bank resize,
+/// `tier_complete`, or residency/policy change makes prior-regime frozen
+/// exclusive rates (A10) and cohorts inapplicable by construction:
+/// - `exclusive_ℓ` (`RegimeAged<Share>` on `(regime, bank_epoch)`, counted only
+///   while lead ℓ runs on a non-empty cohort; unmeasured reads 1, and freezes
+///   with its age while ℓ is off within the same regime, A10);
+/// - `cohort_l` (`RegimeWindow<Share>` on `(regime, bank_epoch)`, counted on
+///   every resolved step whether hints run or not).
 #[derive(Clone, Debug)]
 pub(in crate::experts) struct CohortRates {
-    exclusive: [Aged<Share>; HINT_LEADS],
-    cohorts: Vec<Window<Share>>,
+    exclusive: [RegimeAged<Share>; HINT_LEADS],
+    cohorts: Vec<RegimeWindow<Share>>,
 }
 
 impl CohortRates {
-    pub fn new(layers: usize, epoch: u64) -> Self {
+    pub fn new(layers: usize, regime: RegimeEpoch, epoch: u64) -> Self {
         Self {
-            exclusive: std::array::from_fn(|_| Aged::new(epoch)),
-            cohorts: vec![Window::new(epoch); layers],
+            exclusive: std::array::from_fn(|_| RegimeAged::new(regime, epoch)),
+            cohorts: vec![RegimeWindow::new(regime, epoch); layers],
         }
     }
 
-    /// Count one layer's resolved `cohort` at bank-wide `epoch` and clock
+    /// Count one layer's resolved `cohort` at `(regime, epoch)` and clock
     /// `now`. `running[lead - 1]` is whether the layer hinting
     /// `cohort.layer` at `lead` ran its hints on this step.
-    pub fn count(&mut self, cohort: &Cohort, running: &[bool], epoch: u64, now: Tokens) {
+    pub fn count(&mut self, cohort: &Cohort, running: &[bool], regime: RegimeEpoch, epoch: u64, now: Tokens) {
         assert!(running.len() <= HINT_LEADS, "running has {} entries, past HINT_LEADS ({HINT_LEADS})", running.len());
         let size = u64::from(cohort.size());
-        self.cohorts[cohort.layer].count(epoch).add(size, 1);
+        self.cohorts[cohort.layer].count(regime, epoch).add(size, 1);
         if size > 0 {
             for (index, &ran) in running.iter().enumerate() {
                 if ran {
                     let lead = (index + 1) as u8;
                     let exclusive = u64::from(cohort.exclusive(lead));
-                    self.exclusive[index].count(epoch, now).add(exclusive, size);
+                    self.exclusive[index].count(regime, epoch, now).add(exclusive, size);
                 }
             }
         }
     }
 
     /// Lead `lead`'s (1..=HINT_LEADS) exclusive-catch tallies and age at
-    /// bank-wide `epoch` and clock `now`; none before any cohort counted.
-    pub fn exclusive_share(&mut self, lead: u8, epoch: u64, now: Tokens) -> Option<(Share, Tokens)> {
+    /// `(regime, epoch)` and clock `now`; none before any cohort counted in
+    /// `regime`.
+    pub fn exclusive_share(&mut self, lead: u8, regime: RegimeEpoch, epoch: u64, now: Tokens) -> Option<(Share, Tokens)> {
         let index = usize::from(lead);
         assert!((1..=HINT_LEADS).contains(&index), "a hint at lead {lead} outside 1..={HINT_LEADS}");
-        self.exclusive[index - 1].read(epoch, now).map(|(tallies, age)| (Share::sum(tallies), age))
+        self.exclusive[index - 1].read(regime, epoch, now).map(|(tallies, age)| (Share::sum(tallies), age))
     }
 
     /// Lead `lead`'s (1..=HINT_LEADS) exclusive-catch rate and its age at
-    /// bank-wide `epoch` and clock `now`.
-    pub fn exclusive(&mut self, lead: u8, epoch: u64, now: Tokens) -> Caught {
-        match self.exclusive_share(lead, epoch, now) {
+    /// `(regime, epoch)` and clock `now`.
+    pub fn exclusive(&mut self, lead: u8, regime: RegimeEpoch, epoch: u64, now: Tokens) -> Caught {
+        match self.exclusive_share(lead, regime, epoch, now) {
             None => Caught::Unmeasured,
             Some((share, age)) => Caught::Measured { rate: share.rate(), age },
         }
     }
 
-    /// Layer `layer`'s cohort tallies `(reads, steps)` at bank-wide `epoch`;
-    /// none before any step resolves there.
-    pub fn cohort_share(&mut self, layer: usize, epoch: u64) -> Option<Share> {
-        self.cohorts[layer].read(epoch).map(Share::sum)
+    /// Layer `layer`'s cohort tallies `(reads, steps)` at `(regime, epoch)`;
+    /// none before any step resolves there in `regime`.
+    pub fn cohort_share(&mut self, layer: usize, regime: RegimeEpoch, epoch: u64) -> Option<Share> {
+        self.cohorts[layer].read(regime, epoch).map(Share::sum)
     }
 
-    /// Layer `layer`'s mean cohort size a step at bank-wide `epoch`; none
-    /// before any step resolves there.
-    pub fn cohort(&mut self, layer: usize, epoch: u64) -> Option<f64> {
-        self.cohort_share(layer, epoch).map(Share::rate)
+    /// Layer `layer`'s mean cohort size a step at `(regime, epoch)`; none
+    /// before any step resolves there in `regime`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn cohort(&mut self, layer: usize, regime: RegimeEpoch, epoch: u64) -> Option<f64> {
+        self.cohort_share(layer, regime, epoch).map(Share::rate)
     }
 }
 
@@ -2763,18 +2793,25 @@ mod tests {
         assert_eq!(cohort.exclusive(1), 1, "only expert 2 is exclusively caught by lead 1");
         assert_eq!(cohort.exclusive(2), 0, "expert 1 was also caught by lead 1");
 
-        let mut rates = CohortRates::new(1, 0);
-        assert_eq!(rates.exclusive(1, 0, Tokens::new(1.0)), Caught::Unmeasured);
-        rates.count(cohort, &[true, true], 0, Tokens::new(1.0));
-        assert_eq!(rates.cohort(0, 0), Some(3.0));
-        assert_eq!(rates.exclusive(1, 0, Tokens::new(1.0)), Caught::Measured { rate: 1.0 / 3.0, age: Tokens::ZERO });
-        assert_eq!(rates.exclusive(2, 0, Tokens::new(1.0)), Caught::Measured { rate: 0.0, age: Tokens::ZERO });
+        let r0 = RegimeEpoch::ZERO;
+        let r1 = r0.next();
+        let mut rates = CohortRates::new(1, r0, 0);
+        assert_eq!(rates.exclusive(1, r0, 0, Tokens::new(1.0)), Caught::Unmeasured);
+        rates.count(cohort, &[true, true], r0, 0, Tokens::new(1.0));
+        assert_eq!(rates.cohort(0, r0, 0), Some(3.0));
+        assert_eq!(rates.exclusive(1, r0, 0, Tokens::new(1.0)), Caught::Measured { rate: 1.0 / 3.0, age: Tokens::ZERO });
+        assert_eq!(rates.exclusive(2, r0, 0, Tokens::new(1.0)), Caught::Measured { rate: 0.0, age: Tokens::ZERO });
 
-        // Lead 1 turns off: cohort keeps counting, lead 1 freezes with growing age.
+        // Lead 1 turns off within the same regime: cohort keeps counting, lead 1 freezes with growing age.
         let miss_only = Cohort { step: 7, layer: 0, misses: 5, saved: Vec::new() };
-        rates.count(&miss_only, &[false, true], 1, Tokens::new(6.0));
-        assert_eq!(rates.cohort(0, 1), Some(4.0), "(3 + 5) / 2");
-        assert_eq!(rates.exclusive(1, 1, Tokens::new(6.0)), Caught::Measured { rate: 1.0 / 3.0, age: Tokens::new(5.0) });
+        rates.count(&miss_only, &[false, true], r0, 1, Tokens::new(6.0));
+        assert_eq!(rates.cohort(0, r0, 1), Some(4.0), "(3 + 5) / 2");
+        assert_eq!(rates.exclusive(1, r0, 1, Tokens::new(6.0)), Caught::Measured { rate: 1.0 / 3.0, age: Tokens::new(5.0) });
+
+        // Advancing RegimeEpoch (e.g. bank resize or tier_complete) makes prior-regime
+        // frozen exclusive rates (A10) and cohorts inapplicable by construction.
+        assert_eq!(rates.exclusive(1, r1, 1, Tokens::new(6.0)), Caught::Unmeasured);
+        assert_eq!(rates.cohort(0, r1, 1), None);
     }
 
     /// What a read is admitted at is the measured rate of the combination

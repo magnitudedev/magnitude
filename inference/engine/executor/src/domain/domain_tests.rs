@@ -210,11 +210,14 @@ fn a_verify_pass_times_the_host_turn_its_overhead_prices() {
     };
     let bindings = step(&mut domain, bindings, 0, false);
     let bindings = step(&mut domain, bindings, 1, false);
-    assert_eq!(domain.verify_turns.mean(domain.family.expert_bank().unwrap().bank_epoch()), None, "no verify pass ran");
+    let bank = domain.family.expert_bank().unwrap();
+    assert_eq!(domain.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()), None, "no verify pass ran");
     let bindings = step(&mut domain, bindings, 2, true);
-    assert_eq!(domain.verify_turns.mean(domain.family.expert_bank().unwrap().bank_epoch()), None, "the turn is open until the next launch");
+    let bank = domain.family.expert_bank().unwrap();
+    assert_eq!(domain.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()), None, "the turn is open until the next launch");
     step(&mut domain, bindings, 3, false);
-    assert!(domain.verify_turns.mean(domain.family.expert_bank().unwrap().bank_epoch()).is_some(), "the next launch timed the verify pass's turn");
+    let bank = domain.family.expert_bank().unwrap();
+    assert!(domain.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()).is_some(), "the next launch timed the verify pass's turn");
     if let Some(pricing) = domain.two_row_pricing().unwrap() {
         assert!(pricing.overhead.is_some());
     }

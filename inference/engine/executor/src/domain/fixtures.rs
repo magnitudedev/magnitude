@@ -1586,6 +1586,11 @@ impl ElasticBank for FakeBank {
         0
     }
 
+    /// No residency change: stays at regime epoch 0.
+    fn regime_epoch(&self) -> u64 {
+        0
+    }
+
     /// Its one streamed layer of 4 experts, each step routing 4, on the
     /// reference lines of 1 MB records, whatever lines the load priced.
     fn streamed_layers(&self, _lines: std::sync::Arc<[magnitude_cost_model::ExpertLines]>) -> magnitude_cost_model::StreamedLayers {

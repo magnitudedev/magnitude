@@ -286,8 +286,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         };
         let flight_requests = requests.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
-        let bank_epoch = self.family.expert_bank().map(|bank| bank.bank_epoch());
-        self.verify_turns.launched(&flight_requests, started, bank_epoch);
+        let epochs = self.family.expert_bank().map(|bank| (bank.regime_epoch(), bank.bank_epoch()));
+        self.verify_turns.launched(&flight_requests, started, epochs);
         let work = TargetWork {
             runnable: self.service_start(&flight_requests, started),
             verifies: operations.iter().any(|operation| self.verify_pass(operation)),
@@ -1243,8 +1243,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.target_timing = Some(timing);
         self.begin_host_turn(pending.iter().map(|item| item.request));
         if verified {
-            let bank_epoch = self.family.expert_bank().map(|bank| bank.bank_epoch());
-            self.verify_turns.begin(finish_started, bank_epoch, pending.iter().map(|item| item.request).collect());
+            let epochs = self.family.expert_bank().map(|bank| (bank.regime_epoch(), bank.bank_epoch()));
+            self.verify_turns.begin(finish_started, epochs, pending.iter().map(|item| item.request).collect());
         }
         Ok(pending)
     }

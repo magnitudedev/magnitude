@@ -19,6 +19,7 @@ pub(super) struct HostTurn {
 struct OpenVerifyTurn {
     since: Instant,
     owner: Duration,
+    begun_regime: crate::experts::RegimeEpoch,
     begun_epoch: u64,
     requests: Vec<RequestId>,
 }
@@ -28,23 +29,23 @@ struct OpenVerifyTurn {
 /// its completion to the next target launch of one of its requests (the
 /// host reconciling it, drafting the next guesses in a head transaction and
 /// preparing that launch) the device idles on the host. The mean of the
-/// turns over the bank-wide turnover's epoch window
-/// (`experts::Window<Turns>` rolling on `bank_epoch`) is the regime's `O`
-/// (`magnitude_cost_model::Regime::overhead`). A turn the owner idled in,
-/// or another launch ended first, is no verify pass's; a turn of a load
-/// with no expert bank prices no regime and is not timed. The owner's own
-/// work in the turn (`owner_worked`) is excluded, and a turn spanned by a
-/// bank-epoch transition (such as a bank resize) is dropped without rolling
-/// the window so clean pre-resize turns survive.
+/// turns over the regime-scoped bank-wide turnover window
+/// (`experts::RegimeWindow<Turns>` keyed on `(regime_epoch, bank_epoch)`) is
+/// the regime's `O` (`magnitude_cost_model::Regime::overhead`). A turn the
+/// owner idled in, or another launch ended first, is no verify pass's; a turn
+/// of a load with no expert bank prices no regime and is not timed. The
+/// owner's own work in the turn (`owner_worked`) is excluded, a turn spanned
+/// by a regime or bank-epoch transition is dropped, and turns measured in a
+/// prior physical regime are inapplicable by construction.
 #[derive(Debug)]
 pub(super) struct VerifyTurns {
     open: Option<OpenVerifyTurn>,
-    latest: crate::experts::Window<Turns>,
+    latest: crate::experts::RegimeWindow<Turns>,
 }
 
 impl Default for VerifyTurns {
     fn default() -> Self {
-        Self { open: None, latest: crate::experts::Window::new(0) }
+        Self { open: None, latest: crate::experts::RegimeWindow::new(crate::experts::RegimeEpoch::ZERO, 0) }
     }
 }
 
@@ -63,12 +64,13 @@ impl crate::experts::Tally for Turns {
 }
 
 impl VerifyTurns {
-    /// A verify pass of `requests` completed at `since` at bank-wide `epoch`
+    /// A verify pass of `requests` completed at `since` at `(regime, epoch)`
     /// (none without a bank).
-    pub(super) fn begin(&mut self, since: Instant, epoch: Option<u64>, requests: Vec<RequestId>) {
-        self.open = epoch.map(|begun_epoch| OpenVerifyTurn {
+    pub(super) fn begin(&mut self, since: Instant, epochs: Option<(u64, u64)>, requests: Vec<RequestId>) {
+        self.open = epochs.map(|(begun_regime, begun_epoch)| OpenVerifyTurn {
             since,
             owner: Duration::ZERO,
+            begun_regime: crate::experts::RegimeEpoch::new(begun_regime),
             begun_epoch,
             requests,
         });
@@ -83,17 +85,18 @@ impl VerifyTurns {
     }
 
     /// A target launch of `requests` submitted at `started` ends the open
-    /// turn: timed where it carries one of the turn's requests and the
-    /// bank-wide `epoch` did not change during the turn, counted into
-    /// `epoch` (none without a bank).
-    pub(super) fn launched(&mut self, requests: &[RequestId], started: Instant, epoch: Option<u64>) {
+    /// turn: timed where it carries one of the turn's requests and neither
+    /// `regime` nor `bank_epoch` changed during the turn, counted into
+    /// `(regime, epoch)` (none without a bank).
+    pub(super) fn launched(&mut self, requests: &[RequestId], started: Instant, epochs: Option<(u64, u64)>) {
         let Some(turn) = self.open.take() else {
             return;
         };
-        let Some(epoch) = epoch else {
+        let Some((regime, epoch)) = epochs else {
             return;
         };
-        if epoch != turn.begun_epoch {
+        let regime = crate::experts::RegimeEpoch::new(regime);
+        if regime != turn.begun_regime || epoch != turn.begun_epoch {
             return;
         }
         if requests.iter().any(|request| turn.requests.contains(request)) {
@@ -101,7 +104,7 @@ impl VerifyTurns {
                 .saturating_duration_since(turn.since)
                 .saturating_sub(turn.owner)
                 .as_secs_f64();
-            let tally = self.latest.count(epoch);
+            let tally = self.latest.count(regime, epoch);
             tally.seconds += seconds;
             tally.turns += 1;
         }
@@ -113,10 +116,10 @@ impl VerifyTurns {
         self.open = None;
     }
 
-    /// `O`: a turn's mean over the bank-wide epoch window at `epoch`; none
-    /// before one is timed there.
-    pub(super) fn mean(&self, epoch: u64) -> Option<f64> {
-        let (first, second) = self.latest.snapshot(epoch)?;
+    /// `O`: a turn's mean over the regime-scoped bank-wide epoch window at
+    /// `(regime, epoch)`; none before one is timed in `regime`.
+    pub(super) fn mean(&self, regime: u64, epoch: u64) -> Option<f64> {
+        let (first, second) = self.latest.snapshot(crate::experts::RegimeEpoch::new(regime), epoch)?;
         let seconds = first.seconds + second.map_or(0.0, |t| t.seconds);
         let turns = first.turns + second.map_or(0, |t| t.turns);
         (turns > 0).then(|| (seconds / turns as f64).max(0.))
@@ -475,28 +478,31 @@ mod tests {
         let req = RequestId(1);
         let t0 = Instant::now();
 
-        // Clean turn at epoch 0: 10 ms wall time with 7 ms of owner work -> 3 ms.
-        turns.begin(t0, Some(0), vec![req]);
+        // Clean turn at (regime 0, epoch 0): 10 ms wall time with 7 ms of owner work -> 3 ms.
+        turns.begin(t0, Some((0, 0)), vec![req]);
         turns.owner_worked(Duration::from_millis(7));
-        turns.launched(&[req], t0 + Duration::from_millis(10), Some(0));
-        let clean = turns.mean(0).expect("clean turn recorded");
+        turns.launched(&[req], t0 + Duration::from_millis(10), Some((0, 0)));
+        let clean = turns.mean(0, 0).expect("clean turn recorded");
         assert!((clean - 0.003).abs() < 1e-9, "expected 3 ms after subtracting owner work, got {clean}");
 
-        // Resize-spanning turn (epoch 0 -> epoch 1) with a 25 ms pause must be
+        // Epoch-spanning turn within same regime (epoch 0 -> epoch 1) with a 25 ms pause must be
         // skipped AND must not roll the window or evict the clean 3 ms turn.
-        turns.begin(t0 + Duration::from_millis(20), Some(0), vec![req]);
-        turns.launched(&[req], t0 + Duration::from_millis(45), Some(1));
-        let after_resize = turns.mean(1).expect("clean pre-resize turn survives at new epoch");
+        turns.begin(t0 + Duration::from_millis(20), Some((0, 0)), vec![req]);
+        turns.launched(&[req], t0 + Duration::from_millis(45), Some((0, 1)));
+        let after_turnover = turns.mean(0, 1).expect("clean turn survives turnover within same regime");
         assert!(
-            (after_resize - 0.003).abs() < 1e-9,
-            "resize-spanning turn must not contaminate or evict clean mean: {after_resize}"
+            (after_turnover - 0.003).abs() < 1e-9,
+            "epoch-spanning turn must not contaminate or evict clean mean: {after_turnover}"
         );
 
+        // Regime transition (regime 0 -> regime 1) makes old-regime turns inapplicable by construction.
+        assert_eq!(turns.mean(1, 1), None, "prior-regime verify turns must not outlive their regime");
+
         // Owner work exceeding wall time saturates at 0 without panicking.
-        turns.begin(t0 + Duration::from_millis(50), Some(1), vec![req]);
+        turns.begin(t0 + Duration::from_millis(50), Some((0, 1)), vec![req]);
         turns.owner_worked(Duration::from_millis(10));
-        turns.launched(&[req], t0 + Duration::from_millis(52), Some(1));
-        let with_zero = turns.mean(1).expect("clean turn at epoch 1 recorded");
+        turns.launched(&[req], t0 + Duration::from_millis(52), Some((0, 1)));
+        let with_zero = turns.mean(0, 1).expect("clean turn at epoch 1 recorded");
         assert!((with_zero - 0.0015).abs() < 1e-9, "mean of 3 ms (epoch 0) and 0 ms (epoch 1): {with_zero}");
     }
 }

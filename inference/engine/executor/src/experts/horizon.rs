@@ -15,6 +15,62 @@ use super::watcher::Step;
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub(crate) struct Tokens(f64);
 
+/// Monotonic identifier of the physical tier/residency regime under which
+/// decode pass prices and miss deltas are measured.
+///
+/// Advances whenever any physical residency/tier input changes: tier capacity
+/// resize (compute or host tier), host-tier completion (`tier_complete`),
+/// per-layer `(POLICY_WHOLE, POLICY_RESOLVED)` residency policy, async DMA
+/// link staging activation (`LinkMover` `MAP_STAGE`), or cover-read activity.
+/// Learned prices keyed by `RegimeEpoch` become inapplicable by construction
+/// the instant the physical regime changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct RegimeEpoch(u64);
+
+impl RegimeEpoch {
+    pub(crate) const ZERO: Self = Self(0);
+
+    pub(crate) const fn new(epoch: u64) -> Self {
+        Self(epoch)
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+/// The physical residency/tier state that governs decode pass cost and miss
+/// service paths. Any change to these fields advances [`Times::regime_epoch`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResidencyState {
+    /// Whether the host tier (or single store) keeps every expert (no file misses).
+    pub(crate) tier_complete: bool,
+    /// FNV-1a fingerprint of per-layer `(whole, resolved)` policy flags.
+    pub(crate) policy_hash: u64,
+    /// Whether async DMA link staging (`LinkMover` `MAP_STAGE`) is active.
+    pub(crate) link_staging: bool,
+    /// Whether background cover reads are competing on the drive.
+    pub(crate) covering: bool,
+}
+
+/// Stable 64-bit FNV-1a fingerprint of per-layer `(whole, resolved)` residency
+/// policy flags.
+pub(crate) fn policy_fingerprint(flags: impl IntoIterator<Item = (bool, bool)>) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for (whole, resolved) in flags {
+        let byte = (u8::from(whole) << 1) | u8::from(resolved);
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 impl Tokens {
     pub(crate) const ZERO: Self = Self(0.0);
 
@@ -437,6 +493,108 @@ impl<T: Tally> Aged<T> {
     }
 }
 
+/// A [`Window`] keyed to the [`RegimeEpoch`] it was measured in.
+///
+/// Any read at a newer `RegimeEpoch` returns `None` by construction, and any
+/// count at a newer `RegimeEpoch` starts a fresh window at that regime.
+/// Stale measurements from a previous tier/residency regime can never leak
+/// through `Window::previous`.
+#[derive(Clone, Debug)]
+pub(crate) struct RegimeWindow<T: Tally> {
+    regime: RegimeEpoch,
+    window: Window<T>,
+}
+
+impl<T: Tally> RegimeWindow<T> {
+    pub(crate) fn new(regime: RegimeEpoch, epoch: u64) -> Self {
+        Self { regime, window: Window::new(epoch) }
+    }
+
+    /// Count into the tally for `(regime, epoch)`. Resets the window if
+    /// `regime` has advanced. Panics where `regime` regresses.
+    pub(crate) fn count(&mut self, regime: RegimeEpoch, epoch: u64) -> &mut T {
+        assert!(regime >= self.regime, "a regime window at {:?} counted at {regime:?}", self.regime);
+        if regime > self.regime {
+            self.regime = regime;
+            self.window = Window::new(epoch);
+        }
+        self.window.count(epoch)
+    }
+
+    /// Read `(previous, current)` at `(regime, epoch)`. Returns `None` if
+    /// `regime` has advanced past the regime this window was measured in.
+    /// Panics where `regime` regresses.
+    pub(crate) fn read(&mut self, regime: RegimeEpoch, epoch: u64) -> Option<(&T, &T)> {
+        assert!(regime >= self.regime, "a regime window at {:?} read at {regime:?}", self.regime);
+        if regime > self.regime {
+            return None;
+        }
+        self.window.read(epoch)
+    }
+
+    /// Non-mutating snapshot at `(regime, epoch)`. Returns `None` if `regime`
+    /// has advanced past the regime this window was measured in. Panics where
+    /// `regime` regresses.
+    pub(crate) fn snapshot(&self, regime: RegimeEpoch, epoch: u64) -> Option<(&T, Option<&T>)> {
+        assert!(regime >= self.regime, "a regime window at {:?} snapshotted at {regime:?}", self.regime);
+        if regime > self.regime {
+            return None;
+        }
+        self.window.snapshot(epoch)
+    }
+}
+
+/// An [`Aged`] window keyed to the [`RegimeEpoch`] it was measured in.
+///
+/// Any read at a newer `RegimeEpoch` returns `None` by construction, and any
+/// count at a newer `RegimeEpoch` starts a fresh aged window at that regime.
+#[derive(Clone, Debug)]
+pub(crate) struct RegimeAged<T: Tally> {
+    regime: RegimeEpoch,
+    aged: Aged<T>,
+}
+
+impl<T: Tally> RegimeAged<T> {
+    pub(crate) fn new(regime: RegimeEpoch, epoch: u64) -> Self {
+        Self { regime, aged: Aged::new(epoch) }
+    }
+
+    /// The regime this aged window's current contents belong to.
+    pub(crate) fn regime(&self) -> RegimeEpoch {
+        self.regime
+    }
+
+    /// Reset to empty at `(regime, epoch)` (for within-regime staleness
+    /// re-entry expiry).
+    pub(crate) fn reset(&mut self, regime: RegimeEpoch, epoch: u64) {
+        assert!(regime >= self.regime, "a regime aged window at {:?} reset at {regime:?}", self.regime);
+        self.regime = regime;
+        self.aged = Aged::new(epoch);
+    }
+
+    /// Count at `(regime, epoch, now)`. Resets the window if `regime` has
+    /// advanced. Panics where `regime` regresses.
+    pub(crate) fn count(&mut self, regime: RegimeEpoch, epoch: u64, now: Tokens) -> &mut T {
+        assert!(regime >= self.regime, "a regime aged window at {:?} counted at {regime:?}", self.regime);
+        if regime > self.regime {
+            self.regime = regime;
+            self.aged = Aged::new(epoch);
+        }
+        self.aged.count(epoch, now)
+    }
+
+    /// Read `((previous, current), age)` at `(regime, epoch, now)`. Returns
+    /// `None` if `regime` has advanced past the regime this window was
+    /// measured in. Panics where `regime` regresses.
+    pub(crate) fn read(&mut self, regime: RegimeEpoch, epoch: u64, now: Tokens) -> Option<((&T, &T), Tokens)> {
+        assert!(regime >= self.regime, "a regime aged window at {:?} read at {regime:?}", self.regime);
+        if regime > self.regime {
+            return None;
+        }
+        self.aged.read(epoch, now)
+    }
+}
+
 /// How long a choice is expected to stay (§3.6): time on test over finished
 /// holds, the open one in the time.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -513,6 +671,11 @@ pub(crate) struct Times {
     /// (σ, Δ_j, the regime's and gate's terms) roll on its epochs. Its K
     /// is the sum of the groups' tier-0 records.
     bank: (Turnover, u64),
+    /// Physical tier/residency regime epoch: advances on any tier resize
+    /// (compute or host) or [`ResidencyState`] change.
+    regime: RegimeEpoch,
+    /// Latest physical residency/tier state.
+    residency: ResidencyState,
 }
 
 impl Time {
@@ -529,7 +692,13 @@ impl Time {
             })
             .collect();
         let bank = (Turnover::new(&clock), records.iter().map(|tiers| tiers[0]).sum());
-        Self(Arc::new(Mutex::new(Times { clock, tiers, bank })))
+        Self(Arc::new(Mutex::new(Times {
+            clock,
+            tiers,
+            bank,
+            regime: RegimeEpoch::ZERO,
+            residency: ResidencyState::default(),
+        })))
     }
 
     /// The state, held for one read or write.
@@ -560,7 +729,7 @@ impl Times {
     /// a record; never a seed, a shrink's eviction or a lend), at the clock's
     /// T. A tier-0 move is also a bank-wide move.
     pub(crate) fn moved(&mut self, group: usize, tier: TierId) {
-        let Self { clock, tiers, bank } = self;
+        let Self { clock, tiers, bank, .. } = self;
         let (turnover, records) = Self::tier(tiers, group, tier);
         turnover.moved(clock, *records);
         if tier == TierId::COMPUTE {
@@ -570,9 +739,10 @@ impl Times {
 
     /// `group`'s `tier` resized to `records`: its turnover closes its epoch
     /// and restarts `Unturned`; a tier-0 resize does so for the bank-wide
-    /// turnover too, at the bank's new sum.
+    /// turnover too, at the bank's new sum. Any actual capacity change on any
+    /// tier advances [`Self::regime_epoch`].
     pub(crate) fn resized(&mut self, group: usize, tier: TierId, records: u64) {
-        let Self { clock, tiers, bank } = self;
+        let Self { clock, tiers, bank, regime, .. } = self;
         let (turnover, held) = Self::tier(tiers, group, tier);
         let before = std::mem::replace(held, records);
         turnover.resized(clock);
@@ -580,6 +750,28 @@ impl Times {
             bank.1 = bank.1 - before + records;
             bank.0.resized(clock);
         }
+        if before != records {
+            *regime = regime.next();
+        }
+    }
+
+    /// Update the physical residency/tier state. If any field changed,
+    /// advances [`Self::regime_epoch`] and returns `true`.
+    pub(crate) fn update_residency(&mut self, update: impl FnOnce(&mut ResidencyState)) -> bool {
+        let mut next = self.residency;
+        update(&mut next);
+        if next != self.residency {
+            self.residency = next;
+            self.regime = self.regime.next();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The current physical tier/residency regime epoch.
+    pub(crate) fn regime_epoch(&self) -> RegimeEpoch {
+        self.regime
     }
 
     /// τ of `group`'s `tier` for `reader` ([`Turnover::horizon`]).

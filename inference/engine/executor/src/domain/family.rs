@@ -168,6 +168,10 @@ pub trait ElasticBank {
     /// roll on.
     fn bank_epoch(&self) -> u64;
 
+    /// The physical tier/residency regime epoch (`experts::horizon::Times::regime_epoch`):
+    /// learned prices keyed to an older regime are inapplicable by construction.
+    fn regime_epoch(&self) -> u64;
+
     /// The bank's streamed layers, each priced by its `lines`, which its
     /// decode is priced on.
     fn streamed_layers(&self, lines: std::sync::Arc<[magnitude_cost_model::ExpertLines]>) -> magnitude_cost_model::StreamedLayers;

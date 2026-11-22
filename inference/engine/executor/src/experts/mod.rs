@@ -70,7 +70,7 @@ mod yielding;
 
 pub use bank::{GroupLend, ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, RecordedRoutes, RoutedStep, StepCost, STEP_TRACE};
 pub(crate) use directory::Ranks;
-pub(crate) use horizon::{Tally, Window};
+pub(crate) use horizon::{RegimeEpoch, RegimeWindow, Tally};
 pub(crate) use compute::{Compute, ComputeThreads, HostCompute, Machine};
 pub(crate) use site::{SiteLayer, SiteRecords, SiteScales, SiteShape, SiteTensors, gated, measure as measure_site, measure_cpu_site};
 pub use site::{SITE_TERM_NAMES, SiteServed};

@@ -41,7 +41,7 @@
 //! rather than any single group's.
 
 use super::telemetry::FRONT_DEPTHS;
-use crate::experts::horizon::{self, Time, Window};
+use crate::experts::horizon::{self, RegimeEpoch, RegimeWindow, Time};
 use crate::experts::interest::{Form, Stands};
 use magnitude_cost_model::{PathAdmission, ReadLine, Terms};
 use std::ops::AddAssign;
@@ -215,12 +215,14 @@ impl AddAssign for Sums {
 }
 
 /// The decode passes timed over the bank-wide turnover's window, their
-/// sums overall and by `(form, depth)`, and the latest pass.
+/// sums overall and by `(form, depth)`, and the latest pass — all keyed to
+/// the physical [`RegimeEpoch`] they were measured in so stale prices from a
+/// prior tier/residency regime are inapplicable by construction.
 pub(super) struct Passes {
     time: Time,
-    latest: Option<Pass>,
-    all: Window<Sums>,
-    sums: [Box<[Window<Sums>]>; 2],
+    latest: Option<(RegimeEpoch, Pass)>,
+    all: RegimeWindow<Sums>,
+    sums: [Box<[RegimeWindow<Sums>]>; 2],
 }
 
 impl std::fmt::Debug for Passes {
@@ -291,48 +293,53 @@ impl Measured {
 }
 
 impl Passes {
-    /// None timed, rolling on `time`'s bank-wide turnover epochs.
+    /// None timed, rolling on `time`'s physical regime and bank-wide turnover epochs.
     pub fn new(time: Time) -> Self {
-        let epoch = time.lock().bank_epoch();
+        let (regime, epoch) = {
+            let times = time.lock();
+            (times.regime_epoch(), times.bank_epoch())
+        };
         Self {
             time,
             latest: None,
-            all: Window::new(epoch),
-            sums: std::array::from_fn(|_| (0..DEPTHS).map(|_| Window::new(epoch)).collect()),
+            all: RegimeWindow::new(regime, epoch),
+            sums: std::array::from_fn(|_| (0..DEPTHS).map(|_| RegimeWindow::new(regime, epoch)).collect()),
         }
     }
 
-    fn epoch(&self) -> u64 {
-        self.time.lock().bank_epoch()
+    fn regime_and_epoch(&self) -> (RegimeEpoch, u64) {
+        let times = self.time.lock();
+        (times.regime_epoch(), times.bank_epoch())
     }
 
     /// A decode pass was timed: counted into the bank-wide window overall
-    /// and for its `(form, depth)`.
+    /// and for its `(form, depth)` under the current physical regime.
     pub fn timed(&mut self, pass: Pass) {
         assert!(pass.depth < DEPTHS, "a pass of depth {} past the decode form's rows", pass.depth);
-        let epoch = self.epoch();
+        let (regime, epoch) = self.regime_and_epoch();
         let one = Sums::of(&pass);
-        *self.all.count(epoch) += one;
-        *self.sums[usize::from(pass.verifies)][pass.depth].count(epoch) += one;
-        self.latest = Some(pass);
+        *self.all.count(regime, epoch) += one;
+        *self.sums[usize::from(pass.verifies)][pass.depth].count(regime, epoch) += one;
+        self.latest = Some((regime, pass));
     }
 
-    /// One `(form, depth)`'s sums over its window (keeping its last measured
-    /// epoch while unrun).
-    fn depth(&mut self, verify: bool, depth: usize, epoch: u64) -> Sums {
-        self.sums[usize::from(verify)][depth].read(epoch).map(Sums::over).unwrap_or_default()
+    /// One `(form, depth)`'s sums over its window within `regime` (keeping its
+    /// last measured epoch while unrun in the same regime, and returning empty
+    /// if `regime` has advanced).
+    fn depth(&mut self, verify: bool, depth: usize, regime: RegimeEpoch, epoch: u64) -> Sums {
+        self.sums[usize::from(verify)][depth].read(regime, epoch).map(Sums::over).unwrap_or_default()
     }
 
-    /// Every pass of the bank-wide window, together.
+    /// Every pass of the bank-wide window in the current regime, together.
     fn all(&mut self) -> Sums {
-        let epoch = self.epoch();
-        self.all.read(epoch).map(Sums::over).unwrap_or_default()
+        let (regime, epoch) = self.regime_and_epoch();
+        self.all.read(regime, epoch).map(Sums::over).unwrap_or_default()
     }
 
     /// The mean terms a pass over the window ([`Terms`]) and the drive's
     /// seconds a read its exact rows needed: what a write-back into the
     /// host tier is priced on (`directory::WriteBack`). None before a pass
-    /// that read is timed.
+    /// that read is timed in the current regime.
     pub fn terms(&mut self) -> Option<(Terms, f64)> {
         let all = self.all();
         let terms = all.terms()?;
@@ -342,9 +349,9 @@ impl Passes {
     /// What a Drive-path read ahead is admitted by over the window
     /// ([`PathAdmission`]), given the drive's measured read line (`drive_line`).
     pub fn read_admission(&mut self, drive_line: Option<ReadLine>) -> PathAdmission {
-        let epoch = self.epoch();
-        let all = self.all.read(epoch).map(Sums::over).unwrap_or_default();
-        let plain = self.depth(false, 0, epoch).pass;
+        let (regime, epoch) = self.regime_and_epoch();
+        let all = self.all.read(regime, epoch).map(Sums::over).unwrap_or_default();
+        let plain = self.depth(false, 0, regime, epoch).pass;
         let terms = all.terms().unwrap_or_default();
         let demand_stall = (all.pass.misses > 0.).then(|| all.pass.parked / all.pass.misses);
         let plain_stall = (plain.missed > 0.).then(|| plain.parked / plain.missed);
@@ -355,9 +362,9 @@ impl Passes {
     /// window ([`PathAdmission`]), given the copy engine's measured transfer
     /// line (`link_line`).
     pub fn link_admission(&mut self, link_line: Option<ReadLine>) -> PathAdmission {
-        let epoch = self.epoch();
-        let all = self.all.read(epoch).map(Sums::over).unwrap_or_default();
-        let plain = self.depth(false, 0, epoch).pass;
+        let (regime, epoch) = self.regime_and_epoch();
+        let all = self.all.read(regime, epoch).map(Sums::over).unwrap_or_default();
+        let plain = self.depth(false, 0, regime, epoch).pass;
         let terms = all.terms().unwrap_or_default();
         let demand_stall = (all.pass.missed > 0.).then(|| all.pass.served / all.pass.missed);
         let plain_stall = (plain.missed > 0.).then(|| plain.served / plain.missed);
@@ -366,10 +373,11 @@ impl Passes {
 
     /// The latest pass's rows, and a pass's mean time over the window: what
     /// a break of the pipeline of queued steps costs at most. None before a
-    /// pass is timed.
+    /// pass is timed in the current regime.
     pub fn latest(&mut self) -> Option<(u32, f64)> {
-        let latest = self.latest?;
-        let all = self.all();
+        let (regime, epoch) = self.regime_and_epoch();
+        let latest = self.latest.filter(|(r, _)| *r == regime).map(|(_, pass)| pass)?;
+        let all = self.all.read(regime, epoch).map(Sums::over).unwrap_or_default();
         (all.passes > 0.).then(|| (latest.rows, all.pass.seconds / all.passes))
     }
 
@@ -403,9 +411,9 @@ impl Passes {
     /// holds them: the first front row's and a verify pass's rows'; none before
     /// a pass is timed.
     pub fn measured(&mut self, layers: usize, needed: [[Option<magnitude_cost_model::Needed>; DEPTHS]; 2], stands: &Stands) -> Option<Measured> {
-        let latest = self.latest?;
-        let epoch = self.epoch();
-        let all = self.all.read(epoch).map(Sums::over).unwrap_or_default();
+        let (regime, epoch) = self.regime_and_epoch();
+        let latest = self.latest.filter(|(r, _)| *r == regime).map(|(_, pass)| pass)?;
+        let all = self.all.read(regime, epoch).map(Sums::over)?;
         let routed = all.pass.routed;
         // Each depth's unused reads ahead per pass of each form that ran that
         // depth: exact-row lookahead hints (`depth == 0`, `Basis::Hint`,
@@ -446,11 +454,11 @@ impl Passes {
             };
             terms.each_path().into_iter().map(path).collect()
         });
-        let plain = self.depth(false, 0, epoch).pass;
+        let plain = self.depth(false, 0, regime, epoch).pass;
         let front_terms: [Option<Terms>; DEPTHS] =
-            std::array::from_fn(|depth| self.depth(false, depth, epoch).terms());
+            std::array::from_fn(|depth| self.depth(false, depth, regime, epoch).terms());
         let verify_terms: [Option<Terms>; DEPTHS] =
-            std::array::from_fn(|depth| self.depth(true, depth, epoch).terms());
+            std::array::from_fn(|depth| self.depth(true, depth, regime, epoch).terms());
         let terms = std::array::from_fn(|depth| front_terms[depth].or(verify_terms[depth]));
         Some(Measured {
             layers,
@@ -936,5 +944,92 @@ mod tests {
         let link_adm = passes.link_admission(None);
         assert_eq!(link_adm.path, magnitude_cost_model::PathKind::Link);
         assert!((link_adm.terms.link - 0.050).abs() < 1e-12, "Terms::link still reflects total link load");
+    }
+
+    /// Reproduces `ae7bcf` (`rtx5090`, Qwen3.8 MTP): passes and stand rates
+    /// measured before `tier_complete` becomes true (with heavy NVMe `drive`
+    /// and `parked` stall) become inapplicable by construction the instant
+    /// `tier_complete` flips to true, so the very next pass in the new regime
+    /// sees zero NVMe drive/stall and immediately widens to optimal verify depth.
+    #[test]
+    fn tier_complete_regime_transition_drops_nvme_drive_and_widens_verify_immediately() {
+        let (mut passes, time) = passes();
+        let stands = Stands::new(time.clone());
+
+        // Regime 0 (`tier_complete == false`): warmup passes suffer heavy NVMe
+        // drive time and parked stall, and warmup stand rates at rows 2..=7 fall.
+        time.lock().register(1, Advance::Known(Tokens::new(1.0)));
+        passes.timed(Pass {
+            rows: 1,
+            depth: 0,
+            verifies: false,
+            seconds: 0.250,
+            parked: 0.200,
+            misses: 100.0,
+            missed: 100.0,
+            reads: 100.0,
+            drive: 0.200,
+            ..Pass::default()
+        });
+        stands.count(1, Form::Verify, true);
+        for row in 2..=7 {
+            stands.count(row, Form::Verify, false);
+        }
+
+        let needed_all = [[Some(magnitude_cost_model::Needed::Shadow(80.0)); DEPTHS]; 2];
+        let before = passes.measured(48, needed_all, &stands).expect("measured in regime 0");
+        assert!(before.stall.is_some(), "NVMe plain stall present in regime 0");
+        assert!(before.paths.as_ref().unwrap()[0].seconds > 0.0, "NVMe drive term present in regime 0");
+        assert_eq!(before.accepts[1], Some(0.0), "warmup rejection present in regime 0");
+
+        // Host tier finishes warming (`tier_complete: false -> true`):
+        // RegimeEpoch advances; ALL regime-0 passes and stand rates become
+        // inapplicable by construction with zero imperative resets.
+        assert!(time.lock().update_residency(|s| s.tier_complete = true));
+        assert!(passes.measured(48, needed_all, &stands).is_none(), "old-regime passes must not leak after tier_complete");
+        assert!(passes.latest().is_none(), "old-regime latest pass must not leak");
+        for row in 1..=7 {
+            assert_eq!(stands.live_rate(row, Form::Verify), None, "old-regime stand row {row} must return None");
+        }
+
+        // One pass completes in the new `tier_complete` regime (zero NVMe drive,
+        // fast PCIe link service): `measured()` sees zero drive/stall and fresh
+        // optimistic stands, so `Regime::pass()` immediately widens to Verify(7).
+        time.lock().register(2, Advance::Known(Tokens::new(1.0)));
+        passes.timed(Pass {
+            rows: 1,
+            depth: 0,
+            verifies: false,
+            seconds: 0.035,
+            parked: 0.0,
+            misses: 0.0,
+            missed: 80.0,
+            reads: 0.0,
+            drive: 0.0,
+            link: 0.004,
+            served: 0.004,
+            ..Pass::default()
+        });
+        let after = passes.measured(48, needed_all, &stands).expect("measured in regime 1");
+        assert_eq!(after.stall, Some(0.0), "no NVMe parked stall in tier_complete regime");
+        assert_eq!(after.paths.as_ref().unwrap()[0].seconds, 0.0, "drive term is 0 after tier_complete");
+        assert!(after.accepts.iter().all(Option::is_none), "fresh stands in new regime");
+
+        let resident: Vec<f64> = (0..DEPTHS).map(|k| 0.031 + 0.002 * k as f64).collect();
+        let regime = magnitude_cost_model::Regime {
+            resident,
+            needed: magnitude_cost_model::NeededByForm::both(vec![magnitude_cost_model::Needed::Shadow(80.0); DEPTHS]),
+            stand: after.stand,
+            accepts: after.accepts.to_vec(),
+            stall: after.stall,
+            overhead: Some(0.003),
+            paths: after.paths.unwrap(),
+            routes: magnitude_cost_model::VerifyRoutes { layers: 48, fresh: vec![3.5; DEPTHS - 1] },
+        };
+        assert_eq!(
+            regime.pass(),
+            magnitude_cost_model::Form::Verify(DEPTHS - 1),
+            "after tier_complete, high-acceptance decode must immediately widen to optimal verify depth"
+        );
     }
 }

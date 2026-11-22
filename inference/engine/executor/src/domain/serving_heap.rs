@@ -53,14 +53,15 @@ pub struct FrontRegime {
 }
 
 /// Prior target-launch durations for streamed decode verification at a
-/// bank epoch ([`ExecutorDomain::streamed_verify_prior`]): the cost model's
-/// regime prices plain decode (`index 0`) and `1 + k`-row verify passes
-/// (`index k >= 1`) so an adaptive draft controller does not probe wide
-/// verify widths blindly when streaming makes them expensive, and
-/// invalidates stale target verify measurements when `bank_epoch` changes.
+/// physical tier/residency regime ([`ExecutorDomain::streamed_verify_prior`]):
+/// the cost model's regime prices plain decode (`index 0`) and `1 + k`-row
+/// verify passes (`index k >= 1`) so an adaptive draft controller does not
+/// probe wide verify widths blindly when streaming makes them expensive, and
+/// keys target verify measurements to `regime_epoch` so prior-regime
+/// measurements become inapplicable by construction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StreamedVerifyPrior {
-    pub bank_epoch: u64,
+    pub regime_epoch: u64,
     /// Prior target-launch seconds for `1 + k` rows per sequence:
     /// index 0 = plain decode `regime.time(0)`,
     /// index `k >= 1` = `regime.verify_pass_time(k)`.
@@ -852,14 +853,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             rows: self.chained_rows(),
             verifies: self.execution.policy().method().draft_rows(),
             whole: price.whole(held),
-            overhead: self.verify_turns.mean(bank.bank_epoch()),
+            overhead: self.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()),
         }))
     }
 
     /// Prior target-launch durations for a streamed decode launch of
-    /// `sequences` requests, tagged with the expert bank's live epoch.
-    /// Returns `Ok(None)` for unbanked or whole-bank loads (or before the
-    /// regime has measured a miss), leaving fully-resident loads untouched.
+    /// `sequences` requests, tagged with the expert bank's live physical
+    /// `regime_epoch`. Returns `Ok(None)` for unbanked or whole-bank loads
+    /// (or before the regime has measured a miss), leaving fully-resident
+    /// loads untouched.
     pub fn streamed_verify_prior(&self, sequences: usize) -> Result<Option<StreamedVerifyPrior>, DomainError> {
         if sequences == 0 {
             return Ok(None);
@@ -875,7 +877,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let verifies = regime.accepts.len().min(regime.resident.len().saturating_sub(1));
         Ok(Some(StreamedVerifyPrior {
-            bank_epoch: bank.bank_epoch(),
+            regime_epoch: bank.regime_epoch(),
             verify_seconds: regime.verify_prior(verifies),
         }))
     }

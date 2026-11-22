@@ -189,6 +189,11 @@ impl Durations {
         self.len > 0
     }
 
+    /// Whether the latest measurement is still within [`STALE_ROUNDS`] of `round`.
+    fn is_fresh(&self, round: u64) -> bool {
+        self.len > 0 && round.saturating_sub(self.latest()) < STALE_ROUNDS
+    }
+
     /// Whether the cost rests on its full share of durations.
     fn proven(&self) -> bool {
         usize::from(self.len) == COST_SAMPLES
@@ -338,43 +343,50 @@ impl LaunchCosts {
         costs.entry(size).or_default().record(round, seconds, covering);
     }
 
-    /// Drop every duration measured beside the expert bank's cover read,
-    /// which has ended: what a launch missed then shared the drive with the
-    /// cover and read what it had not yet landed, not what the bank settled
-    /// to. A launch left with none is unmeasured again, so the rounds
-    /// measure it anew.
+    /// The most the measurements prove a launch of `size` costs at least: a
+    /// larger launch costs no less than a smaller one. A larger launch
+    /// proves nothing about a smaller one (a 16-row launch costs more than
+    /// twice an 8-row one where the rows cross a class).
+    fn at_least(costs: &BTreeMap<usize, Durations>, size: usize) -> f64 {
+        costs
+            .range(..=size)
+            .map(|(_, durations)| durations.cost())
+            .fold(0.0, f64::max)
+    }
+}
+
+/// Measured target launch costs at one `(regime_epoch, context_class, sequences)`:
+/// keyed to the target expert bank's physical `regime_epoch` so target durations
+/// measured under a prior tier/residency regime are inapplicable by construction.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TargetCosts {
+    /// By target rows.
+    verify: BTreeMap<usize, Durations>,
+    enter: Durations,
+    leave: Durations,
+}
+
+impl TargetCosts {
     fn settle(&mut self) {
-        for costs in [&mut self.draft, &mut self.verify] {
-            costs.retain(|_, durations| {
-                durations.settle();
-                durations.measured()
-            });
-        }
+        self.verify.retain(|_, durations| {
+            durations.settle();
+            durations.measured()
+        });
         self.enter.settle();
         self.leave.settle();
     }
 
-    /// A plain launch (one target row) took `seconds`. The machine's speed
-    /// moves every launch alike (another process taking the CPU, or giving
-    /// it back), so each other measurement moves with the plain one's cost:
-    /// a launch no longer taken keeps its cost relative to a plain decode
-    /// rather than the seconds it took on a machine that was busier or
-    /// freer, until it is measured again.
-    fn record_plain(&mut self, round: u64, seconds: f64, covering: bool) {
+    fn record_plain(&mut self, round: u64, seconds: f64, covering: bool) -> Option<f64> {
         let before = self.verify.get(&1).map(Durations::cost);
-        Self::record(&mut self.verify, round, 1, seconds, covering);
-        let Some(before) = before.filter(|before| *before > 0.0) else {
-            return;
-        };
+        LaunchCosts::record(&mut self.verify, round, 1, seconds, covering);
+        let before = before.filter(|before| *before > 0.0)?;
         let factor = self.verify[&1].cost() / before;
         for (_, durations) in self.verify.iter_mut().filter(|(rows, _)| **rows != 1) {
             durations.scale(factor);
         }
-        for durations in self.draft.values_mut() {
-            durations.scale(factor);
-        }
         self.enter.scale(factor);
         self.leave.scale(factor);
+        Some(factor)
     }
 
     fn switch(&self, switch: Switch) -> &Durations {
@@ -391,28 +403,13 @@ impl LaunchCosts {
         }
     }
 
-    /// The most the measurements prove a launch of `size` costs at least: a
-    /// larger launch costs no less than a smaller one. A larger launch
-    /// proves nothing about a smaller one (a 16-row launch costs more than
-    /// twice an 8-row one where the rows cross a class).
-    fn at_least(costs: &BTreeMap<usize, Durations>, size: usize) -> f64 {
-        costs
-            .range(..=size)
-            .map(|(_, durations)| durations.cost())
-            .fold(0.0, f64::max)
-    }
-
     fn is_empty(&self) -> bool {
-        self.draft.is_empty()
-            && self.verify.is_empty()
-            && !self.enter.measured()
-            && !self.leave.measured()
+        self.verify.is_empty() && !self.enter.measured() && !self.leave.measured()
     }
 
     fn latest(&self) -> u64 {
-        self.draft
+        self.verify
             .values()
-            .chain(self.verify.values())
             .chain([&self.enter, &self.leave])
             .map(Durations::latest)
             .max()
@@ -420,9 +417,31 @@ impl LaunchCosts {
     }
 }
 
-/// Evict the least-recently-updated `(context_class, sequences)` buckets
+/// Evict the least-recently-updated `(context_class, sequences)` draft buckets
 /// whenever `costs` exceeds [`MAX_COST_BUCKETS`], never evicting `keep`.
-fn prune_costs(costs: &mut BTreeMap<(usize, usize), LaunchCosts>, keep: (usize, usize)) {
+fn prune_draft_costs(
+    costs: &mut BTreeMap<(usize, usize), BTreeMap<usize, Durations>>,
+    keep: (usize, usize),
+) {
+    while costs.len() > MAX_COST_BUCKETS {
+        let Some(victim) = costs
+            .iter()
+            .filter(|&(&key, _)| key != keep)
+            .min_by_key(|(_, bucket)| bucket.values().map(Durations::latest).max().unwrap_or(0))
+            .map(|(&key, _)| key)
+        else {
+            break;
+        };
+        costs.remove(&victim);
+    }
+}
+
+/// Evict the least-recently-updated target buckets whenever `costs` exceeds
+/// [`MAX_COST_BUCKETS`], never evicting `keep`.
+fn prune_target_costs(
+    costs: &mut BTreeMap<(Option<u64>, usize, usize), TargetCosts>,
+    keep: (Option<u64>, usize, usize),
+) {
     while costs.len() > MAX_COST_BUCKETS {
         let Some(victim) = costs
             .iter()
@@ -436,25 +455,16 @@ fn prune_costs(costs: &mut BTreeMap<(usize, usize), LaunchCosts>, keep: (usize, 
     }
 }
 
-/// The launch costs of one context class and number of requests sharing a
-/// launch. Borrows `DraftLoadState::costs` and `verify_prior` under the load's
-/// lock with zero cloning.
-///
-/// A launch not measured there costs at least what its other measurements
-/// prove, and at least what the same launch measured over no longer a
-/// history and among no more requests: neither makes it cheaper.
-///
-/// A launch not proven there (measured fewer times than its cost needs, or
-/// not at all) costs no more than a larger launch proven there, nor than the
-/// same launch proven among as many requests over a shorter history times
-/// the ratio of the context classes (only its attention reads a longer
-/// history, and reads it at most that many times as long). One held-up
-/// duration would otherwise price it out of being taken, and so of ever
-/// being measured again.
+/// The launch costs of one physical regime, context class, and number of
+/// requests sharing a launch. Borrows `DraftLoadState`'s draft and target cost
+/// tables under the load's lock with zero cloning.
 struct RoundCosts<'a> {
-    costs: &'a BTreeMap<(usize, usize), LaunchCosts>,
+    draft_costs: &'a BTreeMap<(usize, usize), BTreeMap<usize, Durations>>,
+    target_costs: &'a BTreeMap<(Option<u64>, usize, usize), TargetCosts>,
     verify_prior: Option<&'a StreamedVerifyPrior>,
     launch_prices: Option<&'a LaunchPrices>,
+    regime_epoch: Option<u64>,
+    round: u64,
     context_class: usize,
     /// Requests sharing each launch.
     sequences: usize,
@@ -463,18 +473,25 @@ struct RoundCosts<'a> {
 }
 
 impl<'a> RoundCosts<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn from_parts(
-        costs: &'a BTreeMap<(usize, usize), LaunchCosts>,
+        draft_costs: &'a BTreeMap<(usize, usize), BTreeMap<usize, Durations>>,
+        target_costs: &'a BTreeMap<(Option<u64>, usize, usize), TargetCosts>,
         verify_prior: Option<&'a StreamedVerifyPrior>,
         launch_prices: Option<&'a LaunchPrices>,
+        round: u64,
         context_class: usize,
         sequences: usize,
         after_drafting: Option<bool>,
     ) -> Self {
+        let regime_epoch = verify_prior.map(|p| p.regime_epoch);
         Self {
-            costs,
+            draft_costs,
+            target_costs,
             verify_prior,
             launch_prices,
+            regime_epoch,
+            round,
             context_class,
             sequences,
             after_drafting,
@@ -489,23 +506,29 @@ impl<'a> RoundCosts<'a> {
         after_drafting: Option<bool>,
     ) -> Self {
         Self::from_parts(
-            &state.costs,
+            &state.draft_costs,
+            &state.target_costs,
             state.verify_prior.as_ref(),
             state.launch_prices.as_ref(),
+            state.rounds,
             context_class,
             sequences,
             after_drafting,
         )
     }
 
-    fn own(&self) -> Option<&LaunchCosts> {
-        self.costs.get(&(self.context_class, self.sequences))
+    fn own_draft(&self) -> Option<&BTreeMap<usize, Durations>> {
+        self.draft_costs.get(&(self.context_class, self.sequences))
     }
 
-    /// Measurements at no longer a context and of no more requests.
-    fn lesser(&self) -> impl Iterator<Item = &LaunchCosts> + '_ {
+    fn own_target(&self) -> Option<&TargetCosts> {
+        self.target_costs.get(&(self.regime_epoch, self.context_class, self.sequences))
+    }
+
+    /// Draft measurements at no longer a context and of no more requests.
+    fn lesser_draft(&self) -> impl Iterator<Item = &BTreeMap<usize, Durations>> + '_ {
         let (context_class, sequences) = (self.context_class, self.sequences);
-        self.costs
+        self.draft_costs
             .range(..=(context_class, sequences))
             .filter(move |&(&(context, shared), _)| {
                 context <= context_class
@@ -515,14 +538,39 @@ impl<'a> RoundCosts<'a> {
             .map(|(_, costs)| costs)
     }
 
-    /// Measurements of as many requests at a shorter context, with how many
-    /// times longer this context class is.
-    fn shorter(&self) -> impl Iterator<Item = (f64, &LaunchCosts)> + '_ {
+    /// Target measurements in the current regime at no longer a context and of
+    /// no more requests.
+    fn lesser_target(&self) -> impl Iterator<Item = &TargetCosts> + '_ {
+        let (regime, context_class, sequences) = (self.regime_epoch, self.context_class, self.sequences);
+        self.target_costs
+            .range((regime, 0, 0)..=(regime, context_class, sequences))
+            .filter(move |&(&(r, context, shared), _)| {
+                r == regime
+                    && context <= context_class
+                    && shared <= sequences
+                    && (context, shared) != (context_class, sequences)
+            })
+            .map(|(_, costs)| costs)
+    }
+
+    /// Draft measurements of as many requests at a shorter context, with how
+    /// many times longer this context class is.
+    fn shorter_draft(&self) -> impl Iterator<Item = (f64, &BTreeMap<usize, Durations>)> + '_ {
         let (context_class, sequences) = (self.context_class, self.sequences);
-        self.costs
+        self.draft_costs
             .range(..(context_class, 0))
             .filter(move |&(&(context, shared), _)| context < context_class && shared == sequences)
             .map(move |(&(context, _), costs)| (context_class as f64 / context as f64, costs))
+    }
+
+    /// Target measurements in the current regime of as many requests at a
+    /// shorter context, with how many times longer this context class is.
+    fn shorter_target(&self) -> impl Iterator<Item = (f64, &TargetCosts)> + '_ {
+        let (regime, context_class, sequences) = (self.regime_epoch, self.context_class, self.sequences);
+        self.target_costs
+            .range((regime, 0, 0)..(regime, context_class, 0))
+            .filter(move |&(&(r, context, shared), _)| r == regime && context < context_class && shared == sequences)
+            .map(move |(&(_, context, _), costs)| (context_class as f64 / context as f64, costs))
     }
 
     /// These costs with a round that would switch paying `weight` of the
@@ -534,15 +582,15 @@ impl<'a> RoundCosts<'a> {
         }
     }
 
-    fn seconds(&self, costs: fn(&LaunchCosts) -> &BTreeMap<usize, Durations>, size: usize) -> f64 {
-        let own = self.own().map(costs);
+    fn draft_seconds_from_table(&self, size: usize) -> f64 {
+        let own = self.own_draft();
         let unproven = match own.and_then(|own| own.get(&size)) {
             Some(durations) if durations.proven() => return durations.cost(),
             Some(durations) => durations.cost(),
             None => own
                 .into_iter()
                 .map(|own| LaunchCosts::at_least(own, size))
-                .chain(self.lesser().map(|measured| LaunchCosts::at_least(costs(measured), size)))
+                .chain(self.lesser_draft().map(|measured| LaunchCosts::at_least(measured, size)))
                 .fold(0.0, f64::max),
         };
         let larger = own
@@ -550,10 +598,38 @@ impl<'a> RoundCosts<'a> {
             .flat_map(|own| own.range(size + 1..))
             .filter(|(_, larger)| larger.proven())
             .map(|(_, larger)| larger.cost());
-        let shorter = self.shorter().filter_map(|(ratio, measured)| {
-            costs(measured)
+        let shorter = self.shorter_draft().filter_map(|(ratio, measured)| {
+            measured
                 .get(&size)
                 .filter(|durations| durations.proven())
+                .map(|durations| ratio * durations.cost())
+        });
+        larger.chain(shorter).fold(unproven, f64::min)
+    }
+
+    fn verify_seconds_from_table(&self, size: usize) -> f64 {
+        let own = self.own_target().map(|t| &t.verify);
+        let is_non_plain = size > self.sequences.max(1);
+        let fresh_or_plain = |durations: &Durations| !is_non_plain || durations.is_fresh(self.round);
+        let unproven = match own.and_then(|own| own.get(&size)).filter(|d| fresh_or_plain(d)) {
+            Some(durations) if durations.proven() => return durations.cost(),
+            Some(durations) => durations.cost(),
+            None => own
+                .into_iter()
+                .map(|own| LaunchCosts::at_least(own, size))
+                .chain(self.lesser_target().map(|measured| LaunchCosts::at_least(&measured.verify, size)))
+                .fold(0.0, f64::max),
+        };
+        let larger = own
+            .into_iter()
+            .flat_map(|own| own.range(size + 1..))
+            .filter(|(_, larger)| larger.proven() && larger.is_fresh(self.round))
+            .map(|(_, larger)| larger.cost());
+        let shorter = self.shorter_target().filter_map(|(ratio, measured)| {
+            measured
+                .verify
+                .get(&size)
+                .filter(|durations| durations.proven() && fresh_or_plain(durations))
                 .map(|durations| ratio * durations.cost())
         });
         larger.chain(shorter).fold(unproven, f64::min)
@@ -563,7 +639,7 @@ impl<'a> RoundCosts<'a> {
         if generated == 0 {
             return 0.0;
         }
-        if self.own().is_none_or(|own| !own.draft.contains_key(&generated)) {
+        if self.own_draft().is_none_or(|own| !own.contains_key(&generated)) {
             if let Some(prior) = self.launch_prices.and_then(|prices| {
                 prices
                     .draft_seconds(
@@ -577,7 +653,7 @@ impl<'a> RoundCosts<'a> {
                 return prior;
             }
         }
-        self.seconds(|costs| &costs.draft, generated)
+        self.draft_seconds_from_table(generated)
     }
 
     fn prior_verify_seconds(prior: &StreamedVerifyPrior, sequences: usize, rows: usize) -> Option<f64> {
@@ -599,19 +675,41 @@ impl<'a> RoundCosts<'a> {
     }
 
     fn verify(&self, rows: usize) -> f64 {
-        if self.own().is_none_or(|own| !own.verify.contains_key(&rows)) {
-            if let Some(prior) = self
-                .verify_prior
-                .and_then(|prior| Self::prior_verify_seconds(prior, self.sequences, rows))
-            {
-                return prior;
+        let is_non_plain = rows > self.sequences.max(1);
+        let has_live = self.own_target().is_some_and(|own| {
+            own.verify
+                .get(&rows)
+                .is_some_and(|d| !is_non_plain || d.is_fresh(self.round))
+        });
+        if !has_live {
+            if let Some(prior) = self.verify_prior {
+                if let Some(prior_rows) = Self::prior_verify_seconds(prior, self.sequences, rows) {
+                    // Anchor the streamed verify prior to the nearest fresh
+                    // measured verify width in the current regime via ratio
+                    // scaling (`measured(ref) * prior(rows) / prior(ref)`),
+                    // preventing scale mismatches between live measured widths
+                    // and unmeasured wider widths from locking out exploration.
+                    if let Some((&ref_rows, ref_dur)) = self.own_target().and_then(|own| {
+                        own.verify
+                            .iter()
+                            .filter(|(_, d)| d.is_fresh(self.round))
+                            .min_by_key(|(&r, _)| r.abs_diff(rows))
+                    }) {
+                        if let Some(prior_ref) =
+                            Self::prior_verify_seconds(prior, self.sequences, ref_rows).filter(|&p| p > 0.0)
+                        {
+                            return ref_dur.cost() * (prior_rows / prior_ref);
+                        }
+                    }
+                    return prior_rows;
+                }
             }
             // Only use GPU-only `LaunchPrices` resident priors on cold start (before any
             // verify launch is measured) and only for non-banked resident targets; banked
             // MoE targets include streaming miss service that `.resident` omits, and
             // mixing a cold analytical prior for small `rows` against live measured
             // durations for large `rows` collapses draft width.
-            if self.own().is_none_or(|own| own.verify.is_empty()) {
+            if self.own_target().is_none_or(|own| own.verify.is_empty()) {
                 if let Some(prior) = self.launch_prices.filter(|p| !p.is_banked()).and_then(|prices| {
                     let seq = self.sequences.max(1) as u32;
                     let depth = self.context_class as u32;
@@ -625,17 +723,18 @@ impl<'a> RoundCosts<'a> {
                 }
             }
         }
-        self.seconds(|costs| &costs.verify, rows)
+        self.verify_seconds_from_table(rows)
     }
 
     /// What changing between drafting and not costs a round beyond its
-    /// launches: measured here, or else the most it measured at no longer a
-    /// context (it enters pairs and restarts a pipeline, not attention).
+    /// launches: measured here in the current regime, or else the most it
+    /// measured at no longer a context (it enters pairs and restarts a
+    /// pipeline, not attention).
     fn switch(&self, switch: Switch) -> Option<f64> {
-        if let Some(own) = self.own().map(|own| own.switch(switch)).filter(|durations| durations.measured()) {
+        if let Some(own) = self.own_target().map(|own| own.switch(switch)).filter(|durations| durations.measured()) {
             return Some(own.cost());
         }
-        self.lesser()
+        self.lesser_target()
             .map(|costs| costs.switch(switch))
             .filter(|durations| durations.measured())
             .map(Durations::cost)
@@ -654,12 +753,7 @@ impl<'a> RoundCosts<'a> {
 
     /// Seconds of a round generating `generated` and verifying `verified`,
     /// in launches whose other requests take the same rows, with its share
-    /// of what changing between drafting and not costs. A switch serves the
-    /// rounds after it too: the choice it follows lasts at least as many
-    /// rounds as the estimates take to move, so a round that would switch
-    /// pays the weight a block has in them of it, and nothing until it is
-    /// measured. Launches nothing has measured cost the same, so a load's
-    /// first round is its widest.
+    /// of what changing between drafting and not costs.
     fn round(&self, generated: usize, verified: usize) -> f64 {
         let switch = self
             .switching(generated > 0)
@@ -684,12 +778,12 @@ impl<'a> RoundCosts<'a> {
         (1.0 - self.switch_weight) * cost(there) + cost(back)
     }
 
-    /// The price of a round's launches when both are measured here.
+    /// The price of a round's launches when both are measured here in the
+    /// current regime.
     fn steady(&self, generated: usize, rows: usize) -> Option<f64> {
-        let own = self.own()?;
-        let drafted = generated == 0 || own.draft.contains_key(&generated);
-        (drafted && own.verify.contains_key(&rows))
-            .then(|| self.draft(generated) + self.verify(rows))
+        let drafted = generated == 0 || self.own_draft().is_some_and(|own| own.contains_key(&generated));
+        let verified = self.own_target().is_some_and(|own| own.verify.contains_key(&rows));
+        (drafted && verified).then(|| self.draft(generated) + self.verify(rows))
     }
 }
 
@@ -763,12 +857,18 @@ pub fn share_rows(outlooks: &[DraftOutlook], rows: usize) -> Option<Vec<usize>> 
 }
 
 /// Shared mutable state of a [`DraftLoad`], guarded by a single mutex so
-/// coupled fields (costs, bank epoch via `verify_prior`, cover state,
+/// coupled fields (draft costs, regime-keyed target costs, cover state,
 /// rounds, depth means + calibration, and look budgets) update atomically
 /// with no nested locks.
 #[derive(Clone, Debug)]
 struct DraftLoadState {
-    costs: BTreeMap<(usize, usize), LaunchCosts>,
+    /// Drafter launch costs by `(context_class, sequences)`: independent of
+    /// target expert-bank residency regimes.
+    draft_costs: BTreeMap<(usize, usize), BTreeMap<usize, Durations>>,
+    /// Target verify/switch costs by `(regime_epoch, context_class, sequences)`:
+    /// keyed to the target bank's physical `regime_epoch` so prior-regime
+    /// measurements are inapplicable by construction.
+    target_costs: BTreeMap<(Option<u64>, usize, usize), TargetCosts>,
     rounds: u64,
     depths: Vec<(DepthMeans, Calibration)>,
     /// The run of accepted rounds that earned its latest request a look.
@@ -776,11 +876,11 @@ struct DraftLoadState {
     look_seconds: f64,
     /// The decode time set aside for the next plain look.
     plain_seconds: f64,
-    /// Whether `costs` holds a duration measured beside the expert bank's
-    /// cover read ([`Self::settle`]).
+    /// Whether `draft_costs` / `target_costs` hold a duration measured beside
+    /// the expert bank's cover read ([`Self::settle`]).
     beside_cover: bool,
     /// Latest streamed verify prior from the cost model's regime. Its
-    /// `bank_epoch` is the single authority for epoch-change invalidation.
+    /// `regime_epoch` keys `target_costs` directly.
     verify_prior: Option<StreamedVerifyPrior>,
     /// Analytical launch-price snapshot for unmeasured `D(g)` and `V(v+1)`
     /// launches (replaced on first live observation via `Durations`) and
@@ -791,7 +891,8 @@ struct DraftLoadState {
 impl Default for DraftLoadState {
     fn default() -> Self {
         Self {
-            costs: BTreeMap::new(),
+            draft_costs: BTreeMap::new(),
+            target_costs: BTreeMap::new(),
             rounds: 0,
             depths: Vec::new(),
             look_run: 1,
@@ -809,11 +910,22 @@ impl DraftLoadState {
     /// launch measured with none beside it shows ended ([`LaunchCosts::settle`]).
     fn settle(&mut self) {
         if std::mem::take(&mut self.beside_cover) {
-            self.costs.retain(|_, costs| {
+            self.draft_costs.retain(|_, drafts| {
+                drafts.retain(|_, durations| {
+                    durations.settle();
+                    durations.measured()
+                });
+                !drafts.is_empty()
+            });
+            self.target_costs.retain(|_, costs| {
                 costs.settle();
                 !costs.is_empty()
             });
         }
+    }
+
+    fn regime_epoch(&self) -> Option<u64> {
+        self.verify_prior.as_ref().map(|p| p.regime_epoch)
     }
 }
 
@@ -834,20 +946,15 @@ impl DraftLoad {
     }
 
     /// Observe the streamed target verify prior for the current round.
-    /// When `bank_epoch` changes, invalidates target verify/enter/leave
-    /// durations across every bucket (preserving `draft` durations, which
-    /// do not stream from the target expert bank) and prunes empty buckets.
+    /// Target verify/enter/leave durations are keyed directly by
+    /// `regime_epoch`, so any regime change makes prior-regime target costs
+    /// inapplicable by construction; older-regime entries are also pruned to
+    /// bound memory while preserving `draft_costs`.
     pub fn observe_streamed(&self, prior: Option<StreamedVerifyPrior>) {
         let mut state = self.lock();
-        let prev_epoch = state.verify_prior.as_ref().map(|p| p.bank_epoch);
-        let next_epoch = prior.as_ref().map(|p| p.bank_epoch);
-        if prev_epoch != next_epoch {
-            state.costs.retain(|_, bucket| {
-                bucket.verify.clear();
-                bucket.enter = Durations::default();
-                bucket.leave = Durations::default();
-                !bucket.is_empty()
-            });
+        let next_regime = prior.as_ref().map(|p| p.regime_epoch);
+        if state.regime_epoch() != next_regime {
+            state.target_costs.retain(|&(regime, ..), _| regime == next_regime);
         }
         state.verify_prior = prior;
     }
@@ -1111,14 +1218,26 @@ impl DraftController {
             .collect()
     }
 
-    /// The measured launch seconds at this round's context class.
+    /// The measured launch seconds at this round's context class and current
+    /// physical regime.
     pub fn measured(&self) -> LaunchCosts {
-        self.load
-            .lock()
-            .costs
+        let state = self.load.lock();
+        let draft = state
+            .draft_costs
             .get(&(self.context_class, self.sequences))
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let target = state
+            .target_costs
+            .get(&(state.regime_epoch(), self.context_class, self.sequences))
+            .cloned()
+            .unwrap_or_default();
+        LaunchCosts {
+            draft,
+            verify: target.verify,
+            enter: target.enter,
+            leave: target.leave,
+        }
     }
 
     /// The costs this round chooses by. A plain decode taken to measure it
@@ -1214,9 +1333,11 @@ impl DraftController {
         let mut load = self.load.lock();
         let state = &mut *load;
         let costs = RoundCosts::from_parts(
-            &state.costs,
+            &state.draft_costs,
+            &state.target_costs,
             state.verify_prior.as_ref(),
             state.launch_prices.as_ref(),
+            state.rounds,
             self.context_class,
             self.sequences,
             self.chosen,
@@ -1237,7 +1358,7 @@ impl DraftController {
         // again in place of drafting: a duration another process held up,
         // or a machine since freed, would otherwise price it for good.
         let round = state.rounds;
-        let plain = costs.own().and_then(|own| own.verify.get(&costs.sequences));
+        let plain = costs.own_target().and_then(|own| own.verify.get(&costs.sequences));
         let plain_unsettled = fastest > 0
             && plain.is_some_and(|plain| {
                 !plain.proven() || round.saturating_sub(plain.latest()) >= STALE_ROUNDS
@@ -1342,7 +1463,7 @@ impl DraftController {
         // so that a width kept past it goes on measuring itself.
         let plain_look = fastest > 0 && plain.is_none() && {
             let floor = costs
-                .lesser()
+                .lesser_target()
                 .flat_map(|measured| measured.verify.range(..=costs.sequences))
                 .filter(|(_, durations)| round.saturating_sub(durations.latest()) < STALE_ROUNDS)
                 .map(|(_, durations)| durations.cost())
@@ -1596,12 +1717,12 @@ impl DraftController {
         // has no other measurement: it carries only the restarted pipeline,
         // and the plain decode is taken again until the median of its
         // durations leaves that one out.
-        let paid = |paying: Switch, launches: &LaunchCosts, size: usize| {
+        let paid = |paying: Switch, target: Option<&TargetCosts>, size: usize| {
             if switch != Some(paying) {
                 return Some(0.0);
             }
             switch_cost.or_else(|| {
-                (paying == Switch::Leave && !launches.verify.contains_key(&size)).then_some(0.0)
+                (paying == Switch::Leave && target.is_none_or(|t| !t.verify.contains_key(&size))).then_some(0.0)
             })
         };
         let took = self.timing.entered.take_with(seconds);
@@ -1609,17 +1730,19 @@ impl DraftController {
             load.rounds += 1;
         }
         let round = load.rounds;
-        let key = (self.context_class, self.sequences);
-        let launches = load.costs.entry(key).or_default();
+        let draft_key = (self.context_class, self.sequences);
+        let regime = load.regime_epoch();
+        let target_key = (regime, self.context_class, self.sequences);
         if launch == TimedLaunch::Draft {
             self.timing.drafter = match took {
                 Some(seconds) => DrafterTiming::Replayed(seconds),
                 None => DrafterTiming::Recorded,
             };
-            if let (Some(took), Some(paid)) = (took, paid(Switch::Enter, launches, size)) {
-                LaunchCosts::record(&mut launches.draft, round, size, (took - paid).max(0.0), covering);
+            if let (Some(took), Some(paid)) = (took, paid(Switch::Enter, load.target_costs.get(&target_key), size)) {
+                let drafts = load.draft_costs.entry(draft_key).or_default();
+                LaunchCosts::record(drafts, round, size, (took - paid).max(0.0), covering);
             }
-            prune_costs(&mut load.costs, key);
+            prune_draft_costs(&mut load.draft_costs, draft_key);
             return;
         }
         let drafter = std::mem::take(&mut self.timing.drafter);
@@ -1628,30 +1751,41 @@ impl DraftController {
         let Some(took) = took else {
             return;
         };
+        let target = load.target_costs.entry(target_key).or_default();
         if let (Some(switch), Some(steady), Some(drafter_took)) =
             (switch, steady, drafter.seconds())
         {
-            launches
+            target
                 .switch_mut(switch)
                 .record(round, (took + drafter_took - steady).max(0.0), covering);
         }
         if self.preparing() {
-            prune_costs(&mut load.costs, key);
+            prune_target_costs(&mut load.target_costs, target_key);
             return;
         }
-        let Some(paid) = paid(Switch::Leave, launches, size) else {
-            prune_costs(&mut load.costs, key);
+        let Some(paid) = paid(Switch::Leave, Some(target), size) else {
+            prune_target_costs(&mut load.target_costs, target_key);
             return;
         };
         let seconds = (took - paid).max(0.0);
-        match (size, self.choice.generated) {
-            (1, 0) => launches.record_plain(round, seconds, covering),
+        let scaled_factor = match (size, self.choice.generated) {
+            (1, 0) => target.record_plain(round, seconds, covering),
             // A drafting round that verified nothing decoded one row behind
             // its drafter's launch, not in a decode pipeline.
-            (1, _) => {}
-            (rows, _) => LaunchCosts::record(&mut launches.verify, round, rows, seconds, covering),
+            (1, _) => None,
+            (rows, _) => {
+                LaunchCosts::record(&mut target.verify, round, rows, seconds, covering);
+                None
+            }
+        };
+        if let Some(factor) = scaled_factor {
+            if let Some(drafts) = load.draft_costs.get_mut(&draft_key) {
+                for durations in drafts.values_mut() {
+                    durations.scale(factor);
+                }
+            }
         }
-        prune_costs(&mut load.costs, key);
+        prune_target_costs(&mut load.target_costs, target_key);
     }
 }
 

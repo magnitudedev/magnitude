@@ -437,29 +437,22 @@ impl Shared {
     /// verdict for another step arrives while a verify step is pending, or
     /// where no request remains.
     fn decide_verify(&self, step: Step, accepted: u32) {
-        let emitted = {
-            let mut pending = self.pending_verify.lock().expect("pending verify step");
-            let Some((pending_step, total, remaining, rows)) = *pending else {
-                return;
-            };
-            assert_eq!(
-                pending_step, step,
-                "verdict for step {step} arrived while verify step {pending_step} is pending"
-            );
-            assert!(remaining > 0, "verify step {step} decided with no requests remaining");
-            self.time.lock().decided(step, accepted);
-            let rows = rows + u64::from(accepted);
-            let left = remaining - 1;
-            if left > 0 {
-                *pending = Some((pending_step, total, left, rows));
-                None
-            } else {
-                *pending = None;
-                Some(1.0 + rows as f64 / f64::from(total))
-            }
+        let mut pending = self.pending_verify.lock().expect("pending verify step");
+        let Some((pending_step, total, remaining, rows)) = *pending else {
+            return;
         };
-        if let Some(emitted) = emitted {
-            self.telemetry.verify_executed(step, emitted);
+        assert_eq!(
+            pending_step, step,
+            "verdict for step {step} arrived while verify step {pending_step} is pending"
+        );
+        assert!(remaining > 0, "verify step {step} decided with no requests remaining");
+        self.time.lock().decided(step, accepted);
+        let rows = rows + u64::from(accepted);
+        let left = remaining - 1;
+        if left > 0 {
+            *pending = Some((pending_step, total, left, rows));
+        } else {
+            *pending = None;
         }
     }
 
@@ -513,8 +506,11 @@ impl Shared {
     }
 
     /// Publish whether the cover still reads, `reading`; a change is an
-    /// event, which wakes [`Self::wait_covered`].
+    /// event, which wakes [`Self::wait_covered`] and advances `regime_epoch`.
     pub(super) fn publish_cover(&self, reading: bool) {
+        self.time.lock().update_residency(|state| {
+            state.covering = reading;
+        });
         let read = u64::from(!reading);
         let changed = self
             .covers
@@ -623,6 +619,10 @@ impl Shared {
             let mut policy = self.policy.lock().expect("staged policy");
             if let Some((words, write)) = policy.staged.take() {
                 write(&words);
+                let policy_hash = words.residency_fingerprint();
+                self.time.lock().update_residency(|state| {
+                    state.policy_hash = policy_hash;
+                });
                 policy.written = Some(words);
             }
         });
@@ -652,6 +652,13 @@ impl Shared {
     /// what a live rate measured outside the watcher rolls on.
     pub fn bank_epoch(&self) -> u64 {
         self.time.lock().bank_epoch()
+    }
+
+    /// The physical tier/residency regime epoch (`horizon::Times::regime_epoch`):
+    /// advances on any tier resize, `tier_complete`, residency policy, link
+    /// staging, or cover-read transition.
+    pub fn regime_epoch(&self) -> u64 {
+        self.time.lock().regime_epoch().get()
     }
 
     /// The experts each streamed layer's slot map names held, ascending.

@@ -423,7 +423,7 @@ const NOT_HELD: usize = usize::MAX;
 /// Backed by an indexed binary min-heap per group (ordered by strict total
 /// order `Placed = (Rank, layer, expert)`) so rank updates sift in place in
 /// contiguous memory instead of removing and re-inserting into a `BTreeSet`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Pools {
     pub(super) records: Vec<usize>,
     held: Vec<Vec<Placed>>,
@@ -1149,10 +1149,12 @@ impl Reuse {
         self.shadowed.get_or_insert_with(Vec::new);
     }
 
-    /// Construct [`Shadows`] matching the pools' current shapes.
+    /// Construct [`Shadows`] matching the pools' current shapes and resident
+    /// contents so `U_shadow` starts warm beside the live bank instead of
+    /// suffering a cold-start empty-pool miss cliff.
     pub(crate) fn build_shadows(&self) -> Shadows {
         let experts = self.layers.iter().map(Calibration::experts).collect::<Vec<_>>();
-        Shadows::new(&experts, &self.groups, &self.pools.records)
+        Shadows::new_with_pools(&experts, &self.groups, &self.pools)
     }
 
     /// The shadows of its pools at every depth of foresight, as they stand

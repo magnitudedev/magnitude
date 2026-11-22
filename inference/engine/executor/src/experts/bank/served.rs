@@ -522,6 +522,10 @@ impl ElasticBank for ServedBank {
         self.bank.watcher.shared().bank_epoch()
     }
 
+    fn regime_epoch(&self) -> u64 {
+        self.bank.watcher.shared().regime_epoch()
+    }
+
     fn streamed_layers(&self, lines: Arc<[magnitude_cost_model::ExpertLines]>) -> magnitude_cost_model::StreamedLayers {
         let plan = &self.bank.plan;
         magnitude_cost_model::StreamedLayers::new(plan.layers().iter().map(|layer| layer.experts).collect(), plan.selected(), lines)

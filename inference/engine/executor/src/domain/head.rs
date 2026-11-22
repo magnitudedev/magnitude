@@ -328,7 +328,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         if steps > 0 {
             if let Some(bank) = self.family.expert_bank() {
-                if let Some(estimated_seconds) = self.verify_turns.mean(bank.bank_epoch()).filter(|&s| s > 0.0) {
+                if let Some(estimated_seconds) = self.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()).filter(|&s| s > 0.0) {
                     bank.draft_window(estimated_seconds);
                 }
             }

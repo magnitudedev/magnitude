@@ -48,6 +48,16 @@ pub(in crate::experts) struct PolicyWords {
     served: bool,
 }
 
+impl PolicyWords {
+    /// Fingerprint of per-layer `(POLICY_WHOLE, POLICY_RESOLVED)` flags for
+    /// `horizon::ResidencyState`.
+    pub(super) fn residency_fingerprint(&self) -> u64 {
+        crate::experts::horizon::policy_fingerprint(
+            self.layers.iter().map(|layer| (layer.whole, layer.resolved)),
+        )
+    }
+}
+
 /// A streamed layer's policy words: whole, resolved, its home, and whether
 /// its hint launches run.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -598,6 +608,9 @@ impl Residency {
             );
         }
         self.complete = complete;
+        self.shared.time.lock().update_residency(|state| {
+            state.tier_complete = complete;
+        });
     }
 
     /// The store misses land into: a host tier's where the device places,
