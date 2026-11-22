@@ -1,6 +1,6 @@
 //! Filesystem watches over the model locations, so models appear and disappear without a restart.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::Duration;
 
@@ -217,12 +217,25 @@ fn affected(
 pub(crate) struct RootWatcher {
     targets: Vec<WatchTarget>,
     unwatched: BTreeSet<PathBuf>,
+    watch_errors: BTreeMap<PathBuf, String>,
     _watcher: notify::RecommendedWatcher,
+}
+
+/// Whether a watch failure on `path` with `error` should emit a warning given the previous
+/// watcher's recorded errors: warns once when a path enters an error state (or its error changes),
+/// stays silent while the error is unchanged, and re-arms once the path becomes watchable again.
+fn should_warn_watch_error(
+    prior_errors: &BTreeMap<PathBuf, String>,
+    path: &Path,
+    error: &str,
+) -> bool {
+    prior_errors.get(path).map(String::as_str) != Some(error)
 }
 
 impl RootWatcher {
     pub(crate) fn start(
         targets: Vec<WatchTarget>,
+        prior_errors: &BTreeMap<PathBuf, String>,
         on_change: impl Fn(BTreeSet<PathBuf>) + Send + 'static,
     ) -> Option<Self> {
         let runtime = tokio::runtime::Handle::try_current().ok()?;
@@ -247,6 +260,7 @@ impl RootWatcher {
             .inspect_err(|error| tracing::warn!(%error, "model location watcher could not start"))
             .ok()?;
         let mut unwatched = BTreeSet::new();
+        let mut watch_errors = BTreeMap::new();
         for (target, watch_path) in targets.iter().zip(&watch_paths) {
             let mode = if target.recursive {
                 RecursiveMode::Recursive
@@ -254,11 +268,15 @@ impl RootWatcher {
                 RecursiveMode::NonRecursive
             };
             if let Err(error) = watcher.watch(watch_path, mode) {
-                tracing::warn!(
-                    path = %watch_path.display(),
-                    %error,
-                    "model location is not watched; it is rescanned periodically instead"
-                );
+                let message = error.to_string();
+                if should_warn_watch_error(prior_errors, watch_path, &message) {
+                    tracing::warn!(
+                        path = %watch_path.display(),
+                        %error,
+                        "model location is not watched; it is rescanned periodically instead"
+                    );
+                }
+                watch_errors.insert(watch_path.clone(), message);
                 unwatched.insert(target.interest.clone());
             }
         }
@@ -266,6 +284,7 @@ impl RootWatcher {
         Some(Self {
             targets,
             unwatched,
+            watch_errors,
             _watcher: watcher,
         })
     }
@@ -277,6 +296,11 @@ impl RootWatcher {
     /// The configured paths whose watch could not start, which are rescanned periodically.
     pub(crate) fn unwatched(&self) -> &BTreeSet<PathBuf> {
         &self.unwatched
+    }
+
+    /// Watch errors recorded when this watcher started, keyed by watched path.
+    pub(crate) fn watch_errors(&self) -> &BTreeMap<PathBuf, String> {
+        &self.watch_errors
     }
 }
 
@@ -399,5 +423,18 @@ mod tests {
             .map(|target| WatchScope::from_target(target, false))
             .collect::<Vec<_>>();
         assert!(affected(&created_different_case, &sensitive_scopes, false).is_empty());
+    }
+
+    #[test]
+    fn unchanged_watch_errors_warn_once_and_rearm_after_recovery() {
+        let path = PathBuf::from("/usr/share/ollama");
+        let denied = "Permission denied (os error 13)";
+        let empty = BTreeMap::new();
+        assert!(should_warn_watch_error(&empty, &path, denied));
+
+        let prior = BTreeMap::from([(path.clone(), denied.to_owned())]);
+        assert!(!should_warn_watch_error(&prior, &path, denied));
+        assert!(should_warn_watch_error(&prior, &path, "Not a directory"));
+        assert!(should_warn_watch_error(&empty, &path, denied));
     }
 }

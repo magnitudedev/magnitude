@@ -1976,8 +1976,17 @@ impl ManagedLocalModels {
             .iter()
             .map(|target| target.interest.clone())
             .collect::<BTreeSet<_>>();
+        let prior_errors = watcher
+            .as_ref()
+            .map(|existing| existing.watch_errors().clone())
+            .unwrap_or_default();
+        let was_unstarted = watcher.is_none()
+            && self
+                .unwatched
+                .lock()
+                .is_ok_and(|unwatched| !unwatched.is_empty());
         let this = self.this.clone();
-        *watcher = RootWatcher::start(targets, move |affected| {
+        *watcher = RootWatcher::start(targets, &prior_errors, move |affected| {
             if let Some(models) = this.upgrade() {
                 magnitude_service_utils::owner::spawn("a custom model rescan", async move { models.rescan_after_change(affected).await });
             }
@@ -1985,9 +1994,11 @@ impl ManagedLocalModels {
         let unwatched = match watcher.as_ref() {
             Some(watcher) => watcher.unwatched().clone(),
             None => {
-                tracing::warn!(
-                    "model location watcher could not start; every location is rescanned periodically"
-                );
+                if !was_unstarted {
+                    tracing::warn!(
+                        "model location watcher could not start; every location is rescanned periodically"
+                    );
+                }
                 interests
             }
         };
@@ -9186,10 +9197,16 @@ mod tests {
                 recursive: true,
                 interest: missing.clone(),
             }],
+            &BTreeMap::new(),
             |_| {},
         )
         .expect("the watcher starts");
-        assert_eq!(watcher.unwatched(), &BTreeSet::from([missing]));
+        assert_eq!(watcher.unwatched(), &BTreeSet::from([missing.clone()]));
+        assert!(
+            watcher
+                .watch_errors()
+                .contains_key(&crate::identity::stable_path(&missing))
+        );
     }
 
     /// QA (Debian, round 3b): a model kept "Drafter None" with its drafter back in its folder,
