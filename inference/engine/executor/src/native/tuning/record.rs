@@ -119,10 +119,15 @@ impl ChosenEvidence {
     }
 
     /// A qualified choice was measured, was served by its search, holds a
-    /// measurement against the default at every one of `shapes`, and every
-    /// one of its measurements is admitted by the requirement the record is
-    /// served under.
-    pub(crate) fn qualified_at(&self, shapes: &[PointShape]) -> Result<(), String> {
+    /// measurement against the validation reference at every one of `shapes`
+    /// (unless it is the validation reference itself, which is exact against
+    /// itself and carries no self-observations), and every one of its
+    /// measurements is admitted by the requirement the record is served under.
+    pub(crate) fn qualified_at(
+        &self,
+        shapes: &[PointShape],
+        is_reference: bool,
+    ) -> Result<(), String> {
         let measured = self
             .measured
             .as_ref()
@@ -133,12 +138,14 @@ impl ChosenEvidence {
         if let Some(violation) = &measured.violation {
             return Err(violation.clone());
         }
-        for shape in shapes {
-            if !measured.observed.contains(&shape.label) {
-                return Err(format!(
-                    "selected artifact has no measurement against the native default at {}",
-                    shape.label
-                ));
+        if !is_reference {
+            for shape in shapes {
+                if !measured.observed.contains(&shape.label) {
+                    return Err(format!(
+                        "selected artifact has no measurement against the validation reference at {}",
+                        shape.label
+                    ));
+                }
             }
         }
         Ok(())

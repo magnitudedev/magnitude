@@ -253,13 +253,18 @@ fn demanded_cache_requires_selected_native_default_evidence_for_every_case() {
         coverage: None,
         default_launches: Vec::new(),
     };
-    assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_err());
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes, false).is_err());
+    // When the promoted candidate is the validation reference itself, it is
+    // exact against itself and owes no self-observations across served shapes
+    // (including zero-demand witnesses), while still requiring measurement,
+    // promotion, and no failing observations.
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes, true).is_ok());
     result
         .observations
         .push(observation(&shapes[0].label, 4, 2.));
     result.configurations[0].observations.push(0);
     assert!(
-        ChosenEvidence::of(&result).qualified_at(&shapes).is_err(),
+        ChosenEvidence::of(&result).qualified_at(&shapes, false).is_err(),
         "untimed cases remain required"
     );
     // Another candidate's measurement at the untimed case is not the
@@ -267,24 +272,25 @@ fn demanded_cache_requires_selected_native_default_evidence_for_every_case() {
     result
         .observations
         .push(observation(&shapes[1].label, 8, 2.));
-    assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_err());
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes, false).is_err());
     result.configurations[0].observations.push(1);
-    assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_ok());
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes, false).is_ok());
     // Evidence at every case is not admission: one measurement beyond α
     // disqualifies the choice.
     result.observations[1] = observation(&shapes[1].label, 4, 8.5);
     assert!(
         ChosenEvidence::of(&result)
-            .qualified_at(&shapes)
+            .qualified_at(&shapes, false)
             .unwrap_err()
             .contains("error ratio 8.5 exceeds alpha 8")
     );
     result.observations[1] = observation(&shapes[1].label, 4, 2.);
     // A choice its search never promoted has no confirmation or coverage.
     let promoted = result.served.pop().unwrap();
-    assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_err());
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes, false).is_err());
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes, true).is_err());
     result.served.push(promoted);
-    assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_ok());
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes, false).is_ok());
 
     // A recorded canonical fallback is usable without that evidence, unless
     // the canonical artifact itself was rejected.
@@ -3379,6 +3385,42 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
             .contains("not the declared validation reference")
     );
     record.disposition = seismic::TuningDisposition::QualifiedCandidate;
+    // When `defaults != reference` and the search promotes `reference` itself
+    // as a `QualifiedCandidate`, `Validator` records no self-observations for
+    // `reference`, yet reloading must accept it across all served shapes
+    // (including zero-demand witnesses) once measured and promoted, while still
+    // rejecting any non-reference `QualifiedCandidate` missing observations.
+    let mut mixed_points = points.clone();
+    if let Some(last) = mixed_points.last_mut() {
+        last.weight = 0.;
+    }
+    record.configurations = vec![seismic::ConfigurationRecord {
+        configuration: record.overall.clone(),
+        artifact: Some("reference".into()),
+        formation: None,
+        launches: Vec::new(),
+        observations: Vec::new(),
+        outcome: seismic::Outcome::Measured {
+            points: Vec::new(),
+            confirmed: Vec::new(),
+        },
+    }];
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record).unwrap();
+    let promoted_ref_hit = tuner
+        .stored(&case, &statics, &mixed_points, &invalid, &defaults)
+        .unwrap()
+        .unwrap()
+        .2
+        .expect("promoted validation reference must reload without self-observations");
+    assert_eq!(promoted_ref_hit.0.overall, record.overall);
+    assert!(
+        tuner
+            .stored(&case, &statics, &mixed_points, &defaults, &invalid)
+            .err()
+            .expect("non-reference QualifiedCandidate without observations must fail")
+            .contains("lacks matching numerical evidence")
+    );
+    record.configurations.clear();
     // A record whose search stopped for want of room is the machine's
     // moment, not the unit's: a search searches the unit again.
     cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO).without_room(), &record).unwrap();

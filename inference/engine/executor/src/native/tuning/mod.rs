@@ -5219,9 +5219,12 @@ impl<'a> Tuner<'a> {
                 }
                 seismic::TuningDisposition::QualifiedCandidate => {
                     if demanded {
-                        choice.chosen.qualified_at(shapes).map_err(|detail| {
-                            format!("terminal tuning choice for {entry} lacks matching numerical evidence: {detail}; search cannot reopen")
-                        })?;
+                        choice
+                            .chosen
+                            .qualified_at(shapes, chosen == *reference)
+                            .map_err(|detail| {
+                                format!("terminal tuning choice for {entry} lacks matching numerical evidence: {detail}; search cannot reopen")
+                            })?;
                     }
                 }
             }
