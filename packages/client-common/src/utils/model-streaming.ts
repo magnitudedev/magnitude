@@ -12,7 +12,7 @@ import {
   type ModelStreamingStatus,
   type StreamingResize,
 } from "@magnitudedev/sdk"
-import { formatMemorySize } from "./format-bytes"
+import { formatMemoryCapacity, formatMemorySize, formatStorageSize } from "./format-bytes"
 import { memoryDomainLabels } from "./hardware-memory"
 import { performanceRangeSpeedLabel } from "./local-model-radar"
 
@@ -198,27 +198,38 @@ export interface StreamingResidencySummary {
  */
 export const streamingResidencySummary = (status: ModelStreamingStatus): StreamingResidencySummary => {
   const share = (slots: number) => percent(slots / status.experts)
-  const bankBytes = status.tiers.reduce((sum, tier) => sum + tier.bytes, 0)
   const range = `(${share(status.floorSlots)}–${share(status.ceilingSlots)})`
   return Option.match(status.host, {
-    onNone: () => ({
-      primary: share(status.slots),
-      range,
-      secondary: null,
-      breakdown: [
-        `${formatMemorySize(bankBytes)} in memory`,
-        ...(status.diskBytes > 0 ? [`${formatMemorySize(status.diskBytes)} on disk`] : []),
-      ].join(" · "),
-    }),
-    onSome: (host) => ({
-      primary: `${share(status.slots)} GPU`,
-      range,
-      secondary: `${share(host.slots)} RAM`,
-      breakdown: [
-        `${formatMemorySize(bankBytes)} GPU`,
-        `${formatMemorySize(host.bytes)} RAM`,
-        ...(status.diskBytes > 0 ? [`${formatMemorySize(status.diskBytes)} on disk`] : []),
-      ].join(" · "),
-    }),
+    onNone: () => {
+      const memoryBytes = status.tiers.reduce((sum, tier) => sum + tier.bytes, 0)
+      return {
+        primary: share(status.slots),
+        range,
+        secondary: null,
+        breakdown: [
+          `${formatMemoryCapacity(memoryBytes)} in memory`,
+          ...(status.diskBytes > 0 ? [`${formatStorageSize(status.diskBytes)} on disk`] : []),
+        ].join(" · "),
+      }
+    },
+    onSome: (host) => {
+      const gpuBytes = status.tiers
+        .filter((tier) => tier.memoryDomainId !== host.memoryDomainId)
+        .reduce((sum, tier) => sum + tier.bytes, 0)
+      const hostTierBytes = status.tiers
+        .filter((tier) => tier.memoryDomainId === host.memoryDomainId)
+        .reduce((sum, tier) => sum + tier.bytes, 0)
+      const ramBytes = Math.max(hostTierBytes, host.bytes)
+      return {
+        primary: `${share(status.slots)} GPU`,
+        range,
+        secondary: `${share(host.slots)} RAM`,
+        breakdown: [
+          `${formatMemoryCapacity(gpuBytes)} GPU`,
+          `${formatMemoryCapacity(ramBytes)} RAM`,
+          ...(status.diskBytes > 0 ? [`${formatStorageSize(status.diskBytes)} on disk`] : []),
+        ].join(" · "),
+      }
+    },
   })
 }

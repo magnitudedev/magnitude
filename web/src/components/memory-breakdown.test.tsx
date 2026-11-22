@@ -90,7 +90,7 @@ it("renders a single compact streaming residency row for streamed models and not
   expect(unifiedHtml).toContain("Experts in memory")
   expect(unifiedHtml).toContain("<strong>40%</strong>")
   expect(unifiedHtml).toContain("(1%–60%)")
-  expect(unifiedHtml).toContain("300 MB in memory · 300 MB on disk")
+  expect(unifiedHtml).toContain("286 MB in memory · 300 MB on disk")
   for (const text of ["<details", "Prompt group places", "N-gram table", "Last resize"]) {
     expect(unifiedHtml).not.toContain(text)
   }
@@ -100,10 +100,27 @@ it("renders a single compact streaming residency row for streamed models and not
   expect(discreteHtml).toContain("<strong>40% GPU</strong>")
   expect(discreteHtml).toContain("(1%–60%)")
   expect(discreteHtml).toContain("· 30% RAM")
-  expect(discreteHtml).toContain("300 MB GPU · 210 MB RAM · 300 MB on disk")
+  expect(discreteHtml).toContain("286 MB GPU · 200 MB RAM · 300 MB on disk")
   for (const text of ["<details", "Prompt group places", "N-gram table", "Last resize"]) {
     expect(discreteHtml).not.toContain(text)
   }
+
+  const twoTierBase = streamingStatus(["cuda-0", "system"])
+  const twoTierHost = Option.getOrThrow(twoTierBase.host)
+  const twoTierStatus = {
+    ...twoTierBase,
+    tiers: [
+      { memoryDomainId: twoTierBase.tiers[0]!.memoryDomainId, bytes: 20 * GiB },
+      { memoryDomainId: twoTierHost.memoryDomainId, bytes: 22 * GiB },
+    ],
+    host: Option.some({ ...twoTierHost, bytes: 22 * GiB }),
+    diskBytes: 16_300_000_000,
+  }
+  const twoTierHtml = renderToStaticMarkup(
+    <MemoryFigures allocation={Option.some({ ...splitAllocation, streaming: Option.some(twoTierStatus) })} hardware={discreteHardware} />,
+  )
+  expect(twoTierHtml).toContain("20 GB GPU · 22 GB RAM · 16.3 GB on disk")
+  expect(twoTierHtml).not.toContain("42 GB GPU")
 })
 
 it("falls back gracefully when free memory or hardware is unobserved", () => {

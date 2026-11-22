@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest"
 import { LocalModelFitResidencySchema, type LocalModel, type StreamingResize } from "@magnitudedev/sdk"
 import { servingHardware } from "../application/fixtures/hardware"
 import { makeSetupModel, streamedFitResidency, streamedReadyResidency } from "../application/fixtures/model"
-import { formatMemorySize } from "./format-bytes"
+import { formatMemoryCapacity, formatMemorySize, formatStorageSize } from "./format-bytes"
 import {
   fitResidencyFacts,
   localModelExpertFacts,
@@ -159,10 +159,10 @@ describe("streaming residency summary", () => {
       primary: "44%",
       range: "(2%–100%)",
       secondary: null,
-      breakdown: `${formatMemorySize(Math.round(15.5 * 1024 ** 3))} in memory · ${formatMemorySize(19 * 1024 ** 3)} on disk`,
+      breakdown: `${formatMemoryCapacity(Math.round(15.5 * 1024 ** 3))} in memory · ${formatStorageSize(19 * 1024 ** 3)} on disk`,
     })
     expect(streamingResidencySummary({ ...status, diskBytes: 0 }).breakdown)
-      .toBe(`${formatMemorySize(Math.round(15.5 * 1024 ** 3))} in memory`)
+      .toBe(`${formatMemoryCapacity(Math.round(15.5 * 1024 ** 3))} in memory`)
   })
 
   it("formats discrete 3-tier residency with GPU range, RAM share, and optional disk bytes", () => {
@@ -182,9 +182,36 @@ describe("streaming residency summary", () => {
       primary: "38% GPU",
       range: "(2%–62%)",
       secondary: "62% RAM",
-      breakdown: `${formatMemorySize(Math.round(12.4 * 1024 ** 3))} GPU · ${formatMemorySize(Math.round(20.1 * 1024 ** 3))} RAM`,
+      breakdown: `${formatMemoryCapacity(Math.round(12.4 * 1024 ** 3))} GPU · ${formatMemoryCapacity(Math.round(20.1 * 1024 ** 3))} RAM`,
     })
     expect(streamingResidencySummary({ ...status, diskBytes: 5 * 1024 ** 3 }).breakdown)
-      .toBe(`${formatMemorySize(Math.round(12.4 * 1024 ** 3))} GPU · ${formatMemorySize(Math.round(20.1 * 1024 ** 3))} RAM · ${formatMemorySize(5 * 1024 ** 3)} on disk`)
+      .toBe(`${formatMemoryCapacity(Math.round(12.4 * 1024 ** 3))} GPU · ${formatMemoryCapacity(Math.round(20.1 * 1024 ** 3))} RAM · ${formatStorageSize(5 * 1024 ** 3)} on disk`)
+  })
+
+  it("excludes the host memory domain tier from GPU bytes instead of double-counting RAM into GPU", () => {
+    const base = Option.getOrThrow(allocation(["cuda-0", "system"]).streaming)
+    const host = Option.getOrThrow(base.host)
+    const gpuBytes = 20 * 1024 ** 3
+    const ramBytes = 22 * 1024 ** 3
+    const diskBytes = 16_300_000_000
+    const status = {
+      ...base,
+      experts: 100,
+      slots: 88,
+      floorSlots: 0,
+      ceilingSlots: 96,
+      tiers: [
+        { memoryDomainId: base.tiers[0]!.memoryDomainId, bytes: gpuBytes },
+        { memoryDomainId: host.memoryDomainId, bytes: ramBytes },
+      ],
+      host: Option.some({ ...host, slots: 100, ceilingSlots: 100, bytes: ramBytes }),
+      diskBytes,
+    }
+    expect(streamingResidencySummary(status)).toEqual({
+      primary: "88% GPU",
+      range: "(0%–96%)",
+      secondary: "100% RAM",
+      breakdown: "20 GB GPU · 22 GB RAM · 16.3 GB on disk",
+    })
   })
 })
