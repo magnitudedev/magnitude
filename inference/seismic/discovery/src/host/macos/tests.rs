@@ -225,20 +225,48 @@ fn the_file_floor_is_what_the_os_keeps_as_it_compresses() {
         file_floor(Some(&kept), &statistics(60_000, 4_200, 88_000), target),
         88_000
     );
+    // Bulk file-cache writes (e.g. downloading a GGUF) growing `external`
+    // while dipping `free` below `free_target`, or stray background
+    // compressions <= `free_target` while `free < free_target`, must not
+    // latch gigabytes of reclaimable clean file cache into `file_floor`.
+    let pre_download = snapshot(statistics(100, 80_000, 90_000), 0);
+    let during_download = statistics(12_000, 2_000, 640_679);
+    assert_eq!(
+        file_floor(Some(&pre_download), &during_download, target),
+        0,
+        "growing file cache during download must not latch file_floor"
+    );
+    let post_download = snapshot(during_download, 0);
+    let stray_bg_compression = statistics(12_000 + target, 2_000, 640_679);
+    assert_eq!(
+        file_floor(Some(&post_download), &stray_bg_compression, target),
+        0,
+        "background compressions within free_target must not latch file_floor"
+    );
+    // Speculative pages are always excluded from `file_floor`.
+    let mut with_spec = statistics(60_000, 4_200, 120_000);
+    with_spec.speculative_count = 40_000;
+    assert_eq!(
+        file_floor(Some(&kept), &with_spec, target),
+        80_000,
+        "speculative file pages are excluded from file_floor"
+    );
 }
 
-/// Live `vm.page_pageable_external_count` and `vm.vm_page_xpmapped_min`
-/// yield skew-free clean cache above the kernel's executable floor.
+/// Live `vm.page_pageable_external_count` exposes clean file cache without
+/// subtracting XNU's proportional `vm.vm_page_xpmapped_min` watermark (which
+/// scales to ~28-37% of `external` after large GGUF downloads on 16 GB Macs
+/// even though non-executable file cache is 100% reclaimable).
 #[test]
-fn live_external_respects_xpmapped_min() {
+fn live_external_does_not_hide_clean_cache_behind_xpmapped_min() {
     let mac = Mac::new().counts(&[
-        ("vm.page_free_count", 100_000),
+        ("vm.page_free_count", 13_832),
         ("vm.vm_page_free_target", 4_000),
-        ("vm.page_pageable_external_count", 250_000),
-        ("vm.vm_page_xpmapped_min", 100_000),
+        ("vm.page_pageable_external_count", 640_679),
+        ("vm.vm_page_xpmapped_min", 177_971),
     ]);
     let s = sample(&mac);
-    assert_eq!(s.supply.clean_cache, 150_000 * (16 << 10));
+    assert_eq!(s.supply.clean_cache, 640_679 * (16 << 10));
 }
 
 /// `iogpu.wired_limit_mb` of zero is the OS's default, which the ledger

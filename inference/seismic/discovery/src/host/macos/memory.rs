@@ -159,16 +159,20 @@ pub(super) struct Snapshot {
     pub(super) file_floor: u64,
 }
 
-/// The file pages the OS keeps while it compresses others' memory, as the
-/// snapshot `statistics` after `before` shows them: where the OS compressed
-/// more pages between the two than were free above its free-page target
-/// `free_target` (`free_count` excludes `speculative_count` as
-/// `vm.page_free_count` does), it chose compressing over every file page still
-/// standing, so those are its floor (a mapped library or binary in use);
-/// otherwise the floor `before` showed, clamped to current external file pages.
-/// Freeing our own memory raises `free` without making those mapped binaries
-/// evictable, so `file_floor` never resets on calm `free` alone (which would
-/// fabricate phantom `clean_cache` supply after every shrink).
+/// The non-speculative file pages the OS keeps while it compresses others'
+/// memory, as the snapshot `statistics` after `before` shows them: where the OS
+/// compressed more pages between the two than both the free margin above
+/// `free_target` and a full `free_target` refill (`free_count` excludes
+/// `speculative_count` as `vm.page_free_count` does), and non-speculative file
+/// pages did not grow across the span, it chose compressing over the remaining
+/// non-speculative file pages, so those are its floor (mapped libraries or
+/// binaries in use); otherwise the floor `before` showed, clamped to current
+/// non-speculative external file pages. Requiring `non_spec <= prev_non_spec`
+/// and a compression batch past `free_target` prevents bulk file writes (such
+/// as model downloads filling macOS's unified buffer cache and briefly dipping
+/// `free` below `free_target`) or stray background compressions from latching
+/// gigabytes of reclaimable clean file cache as an executable floor, while
+/// still holding genuine mapped-binary floors across calm `free` recovery.
 pub(super) fn file_floor(
     before: Option<&Snapshot>,
     statistics: &libc::vm_statistics64,
@@ -177,15 +181,20 @@ pub(super) fn file_floor(
     let Some(before) = before else { return 0 };
     let compressed =
         u64::from(statistics.compressions).saturating_sub(u64::from(before.statistics.compressions));
-    let external = u64::from(statistics.external_page_count);
+    let non_spec = u64::from(statistics.external_page_count)
+        .saturating_sub(u64::from(statistics.speculative_count));
+    let prev_non_spec = u64::from(before.statistics.external_page_count)
+        .saturating_sub(u64::from(before.statistics.speculative_count));
     let free = u64::from(statistics.free_count).saturating_sub(u64::from(statistics.speculative_count))
         + u64::from(statistics.purgeable_count);
-    let floor = if compressed > free.saturating_sub(free_target) {
-        external
+    let floor = if compressed > free.saturating_sub(free_target).max(free_target)
+        && non_spec <= prev_non_spec
+    {
+        non_spec
     } else {
         before.file_floor
     };
-    floor.min(external)
+    floor.min(non_spec)
 }
 
 /// The snapshot the latest sample was served, and when that sample began.
@@ -448,7 +457,6 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
     let background_target = sysctl_count(sys, "vm.vm_page_background_target").unwrap_or(0);
     let reclaim_band = pages(background_target.saturating_sub(free_target));
     let external_live = sysctl_count(sys, "vm.page_pageable_external_count");
-    let xpmapped_min = sysctl_count(sys, "vm.vm_page_xpmapped_min").unwrap_or(0);
     let wired_limit = wired_limit(sys);
     let swap = swap_free(sys);
     let pressure = pressure_level(sys);
@@ -479,12 +487,15 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
             .saturating_sub(purgeable),
     );
     // Live file-backed pages (`vm.page_pageable_external_count` when present,
-    // preventing 1s clock skew against `vm.page_free_count`), minus the larger
-    // of XNU's executable-mapped floor (`vm.vm_page_xpmapped_min`) and any
-    // dynamic compression floor (`file_floor`).
+    // preventing 1s clock skew against `vm.page_free_count`), minus any
+    // empirically observed compression floor (`file_floor`). Do not subtract
+    // `vm.vm_page_xpmapped_min`: in XNU (`vm_pageout.c`) that sysctl is a
+    // dynamic watermark proportional to `vm_page_external_count` (~28-37% of
+    // all file cache, e.g. 2.92 GB after a GGUF download on a 16 GB Mac) that
+    // only protects executable-mapped (`vmp_xpmapped`) pages, never clean
+    // data-file cache pages.
     let external = external_live.unwrap_or(external_snap);
-    let protected_file = file_floor.max(xpmapped_min);
-    let clean_cache = pages(external.saturating_sub(protected_file));
+    let clean_cache = pages(external.saturating_sub(file_floor));
     let stored = pages(u64::from(statistics.compressor_page_count));
     let logical = pages(statistics.total_uncompressed_pages_in_compressor);
     // `free_beyond_target` and `clean_cache` come from live `vm.*` sysctls while

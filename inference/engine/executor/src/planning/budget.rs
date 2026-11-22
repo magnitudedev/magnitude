@@ -335,6 +335,31 @@ impl MemoryBudget {
         Ok(self.device.available.saturating_sub(needed))
     }
 
+    /// Whether live available headroom is strictly below structural capacity
+    /// on any store (`MemoryBudget::stable` always has `available == capacity`).
+    pub fn live_below_capacity(&self) -> bool {
+        self.device.available < self.device.capacity
+            || self.host.is_some_and(|h| h.available < h.capacity)
+    }
+
+    /// Whether `charge`'s full served-context workload fits every store's
+    /// structural `capacity`, independently of momentary live headroom.
+    pub fn fits_capacity(
+        &self,
+        draft: &ExecutionPlanDraft,
+        charge: &AssessmentMemoryCharge,
+    ) -> Result<bool, PlanError> {
+        let demands = charge
+            .store_demands(draft.device().topology(), draft.device().executor())
+            .map_err(PlanError::ResourcePlanning)?;
+        Ok(match demands {
+            StoreDemands::Unified { total } => total <= self.device.capacity,
+            StoreDemands::Split { device, host } => {
+                device <= self.device.capacity && self.host.is_none_or(|h| host <= h.capacity)
+            }
+        })
+    }
+
     /// Fit of `draft` charged `charge` as a whole plan against this budget.
     pub fn fit_whole(
         &self,
@@ -344,18 +369,36 @@ impl MemoryBudget {
         let demands = charge
             .store_demands(draft.device().topology(), draft.device().executor())
             .map_err(PlanError::ResourcePlanning)?;
+        Ok(self.fit_demands(demands))
+    }
+
+    /// Fit of `draft`'s actual startup peak (`AssessmentMemoryCharge::startup_store_demands`,
+    /// excluding elastic KV history allocated on demand after load) against
+    /// this budget's live available headroom.
+    pub fn fit_startup(
+        &self,
+        draft: &ExecutionPlanDraft,
+        charge: &AssessmentMemoryCharge,
+    ) -> Result<WholeFit, PlanError> {
+        let demands = charge
+            .startup_store_demands(draft.device().topology(), draft.device().executor())
+            .map_err(PlanError::ResourcePlanning)?;
+        Ok(self.fit_demands(demands))
+    }
+
+    fn fit_demands(&self, demands: StoreDemands) -> WholeFit {
         let device_avail = self.device.available;
         match demands {
             StoreDemands::Unified { total } => {
                 let short = NonZeroU64::new(total.saturating_sub(device_avail));
-                Ok(WholeFit {
+                WholeFit {
                     available: device_avail,
                     needed: total,
                     short,
                     limiting: short.map(|_| DomainRole::Allocation),
                     limiting_required: total,
                     limiting_available: device_avail,
-                })
+                }
             }
             StoreDemands::Split { device, host } => {
                 let device_short = device.saturating_sub(device_avail);
@@ -365,24 +408,24 @@ impl MemoryBudget {
                 };
                 if device_short >= host_short {
                     let short = NonZeroU64::new(device_short);
-                    Ok(WholeFit {
+                    WholeFit {
                         available: device_avail,
                         needed: device,
                         short,
                         limiting: short.map(|_| DomainRole::Allocation),
                         limiting_required: device,
                         limiting_available: device_avail,
-                    })
+                    }
                 } else {
                     let short = NonZeroU64::new(host_short);
-                    Ok(WholeFit {
+                    WholeFit {
                         available: device_avail,
                         needed: device,
                         short,
                         limiting: short.map(|_| DomainRole::Staging),
                         limiting_required: host,
                         limiting_available: host_avail,
-                    })
+                    }
                 }
             }
         }

@@ -1884,14 +1884,14 @@ impl AssessmentMemoryCharge {
         }
     }
 
-    /// Startup device-store bytes required to load this plan (weights in the
-    /// device store + prepared resources + startup state + startup additional
-    /// bytes, plus host-side bytes on unified memory). Used by `LoadPreview`.
-    pub fn startup_required_bytes(
+    /// Per-store startup peak demand (weights + prepared resources + startup
+    /// state + startup transient, plus host-side bytes, excluding elastic KV
+    /// history allocated on demand as prompts grow).
+    pub fn startup_store_demands(
         &self,
         topology: &DeviceTopology,
         executor: &Executor,
-    ) -> Result<u64, String> {
+    ) -> Result<StoreDemands, String> {
         let weight_bytes = self
             .weight_demand
             .checked_bytes()
@@ -1906,18 +1906,36 @@ impl AssessmentMemoryCharge {
         let raw_startup = prepared
             .checked_add(loading)
             .ok_or_else(|| "startup byte count overflow".to_owned())?;
+        let host_bytes = self.host_bytes()?;
         let unified_host = DomainRole::of(topology, executor, topology.host_ram().id())
             == DomainRole::Allocation;
         if unified_host {
-            raw_startup
-                .checked_add(self.host_bytes()?)
-                .ok_or_else(|| "unified startup byte count overflow".to_owned())
+            let total = raw_startup
+                .checked_add(host_bytes)
+                .ok_or_else(|| "unified startup byte count overflow".to_owned())?;
+            Ok(StoreDemands::Unified { total })
         } else {
             let host_weights = self.split_host_weight_bytes(topology, executor)?;
-            raw_startup
+            let device = raw_startup
                 .checked_sub(host_weights)
-                .ok_or_else(|| "host weight storage exceeds startup charge".to_owned())
+                .ok_or_else(|| "host weight storage exceeds startup charge".to_owned())?;
+            let host = host_bytes
+                .checked_add(host_weights)
+                .and_then(|bytes| bytes.checked_add(self.staging_bytes))
+                .ok_or_else(|| "host startup charge overflows".to_owned())?;
+            Ok(StoreDemands::Split { device, host })
         }
+    }
+
+    /// Startup device-store bytes required to load this plan (weights in the
+    /// device store + prepared resources + startup state + startup additional
+    /// bytes, plus host-side bytes on unified memory). Used by `LoadPreview`.
+    pub fn startup_required_bytes(
+        &self,
+        topology: &DeviceTopology,
+        executor: &Executor,
+    ) -> Result<u64, String> {
+        Ok(self.startup_store_demands(topology, executor)?.allocation_bytes())
     }
 
     /// What `domains`, this charge's fit, require in all: the weights (their
