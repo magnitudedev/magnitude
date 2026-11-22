@@ -1507,6 +1507,8 @@ impl ElasticBank for FakeBank {
         }
     }
 
+    fn draft_window(&self, _estimated_seconds: f64) {}
+
     /// Its slots shrink to `to`, at least one; its host tier releases
     /// nothing.
     fn shrink(

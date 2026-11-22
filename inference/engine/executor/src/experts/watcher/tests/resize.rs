@@ -181,8 +181,8 @@ fn a_groups_places_are_served_from_the_words_handed_over_between_flights() {
     let state = residency::lock(&harness.watcher.state);
     let reuse = state.core.directory.reuse_now();
     assert!(
-        reuse.rank(1, 6, crate::experts::horizon::Tier::Compute, crate::experts::horizon::Reader::Move, None)
-            > reuse.rank(1, 0, crate::experts::horizon::Tier::Compute, crate::experts::horizon::Reader::Move, None),
+        reuse.rank(1, 6, crate::experts::horizon::Tier::COMPUTE, crate::experts::horizon::Reader::Move, None)
+            > reuse.rank(1, 0, crate::experts::horizon::Tier::COMPUTE, crate::experts::horizon::Reader::Move, None),
         "expert 6 ranked above unrouted experts from the handed-over group_reads words"
     );
 }

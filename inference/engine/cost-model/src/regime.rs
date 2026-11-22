@@ -82,7 +82,7 @@
 //! Where no path term or stall exceeds what the rows add to the GPU's, and
 //! no stand pays a verify pass's turn, the depth is 0 and the pass is plain.
 
-use crate::{ReadLine, Terms};
+use crate::{PathKind, ReadLine, Terms};
 
 /// One term besides the GPU's pass ([`crate::Terms::each_path`]): `seconds`,
 /// what a miss of the memory the GPU computes from holds it (`t_i` times
@@ -392,52 +392,108 @@ fn sum(wasted: &[Option<f64>]) -> f64 {
     wasted.iter().map(|wasted| wasted.unwrap_or(0.)).sum()
 }
 
-/// The single owner of read-ahead admission and demand-miss stall pricing,
-/// evaluated purely on measured quantities (`terms`, `drive_line`,
-/// `demand_stall`, `plain_stall`).
+/// The single owner of speculative transfer admission and demand-miss stall
+/// pricing across any streaming path (`PathKind::Drive` for NVMe -> RAM and
+/// `PathKind::Link` for RAM / peer -> VRAM), evaluated purely on measured
+/// quantities (`terms`, `line`, `demand_stall`, `plain_stall`).
 ///
-/// Issuing a speculative read of `bytes` consumes pipelined drive bandwidth
+/// Issuing a speculative transfer of `bytes` consumes pipelined path bandwidth
 /// `t_bw = b / P_peak` (`ReadLine::transfer_seconds`). Given `idle` seconds
-/// of remaining per-layer idle compute, `overlap = min(t_bw, idle)` is hidden
-/// behind compute, leaving net critical-path cost `w_net = (t_bw - overlap)`
-/// when the drive binds (`D > 0 && D >= max(C, L_link, CPU, Mem)`) and `0`
-/// otherwise. If the expert is used (probability `p`), it avoids a demand
-/// stall `s_demand`. Expected step time decreases iff
-/// `w_net - p * s_demand <= 0`, i.e. `p >= (w_net / s_demand).min(1.0)`.
+/// of remaining idle compute / draft-window slack, `overlap = min(t_bw, idle)`
+/// is hidden behind compute, leaving net critical-path cost `w_net = (t_bw - overlap)`
+/// when `path` (or any shared [`crate::ContentionDomain`] such as Host DDR5)
+/// binds (`Terms::binds_path`) and `0` otherwise. If the expert is used
+/// (probability `p`), it avoids a demand stall `s_demand`. Expected step time
+/// decreases iff `w_net - p * s_demand <= 0`, i.e. `p >= (w_net / s_demand).min(1.0)`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ReadAdmission {
+pub struct PathAdmission {
+    pub path: PathKind,
     pub terms: Terms,
-    pub drive_line: Option<ReadLine>,
+    pub line: Option<ReadLine>,
     pub demand_stall: Option<f64>,
     pub plain_stall: Option<f64>,
 }
 
-impl ReadAdmission {
-    /// Pipelined marginal bandwidth time `t_bw = b / P_peak` for `bytes`
-    /// (`0.0` before the drive line is measured).
-    pub fn transfer_seconds(&self, bytes: u64) -> f64 {
-        self.drive_line.map_or(0.0, |line| line.transfer_seconds(bytes as f64))
+/// Backward-compatible alias for [`PathAdmission`].
+pub type ReadAdmission = PathAdmission;
+
+impl PathAdmission {
+    /// Construct a Drive-path (`NVMe -> RAM`) admission pricer.
+    pub fn drive(terms: Terms, line: Option<ReadLine>, demand_stall: Option<f64>, plain_stall: Option<f64>) -> Self {
+        Self { path: PathKind::Drive, terms, line, demand_stall, plain_stall }
     }
 
-    /// Whether the drive is the binding resource
-    /// (`D > 0 && D >= max(C, L_link, CPU, Mem)`).
+    /// Construct a Link-path (`RAM / peer -> VRAM`) admission pricer.
+    pub fn link(terms: Terms, line: Option<ReadLine>, demand_stall: Option<f64>, plain_stall: Option<f64>) -> Self {
+        Self { path: PathKind::Link, terms, line, demand_stall, plain_stall }
+    }
+
+    /// Pipelined marginal bandwidth time `t_bw = b / P_peak` for `bytes`
+    /// (`0.0` before the path line is measured).
+    pub fn transfer_seconds(&self, bytes: u64) -> f64 {
+        self.line.map_or(0.0, |line| line.transfer_seconds(bytes as f64))
+    }
+
+    /// Whether this path (via its own transport domain or a shared physical
+    /// contention domain such as Host DDR5) is the binding resource.
     pub fn binds(&self) -> bool {
-        let t = self.terms;
-        t.drive > 0.0 && t.drive >= t.compute.max(t.link).max(t.cpu).max(t.memory)
+        self.terms.binds_path(self.path)
+    }
+
+    /// Per-step idle path slack `(C - path_term).max(0.0)` when resident
+    /// compute exceeds the path's own and shared contention terms (`0.0` when
+    /// the path binds).
+    pub fn slack_seconds(&self) -> f64 {
+        (self.terms.compute - self.terms.path_term(self.path)).max(0.0)
+    }
+
+    /// Per-layer idle path slack `((C - path_term).max(0.0)) / L` (`0.0` when
+    /// `layers == 0` or the path binds).
+    pub fn layer_idle(&self, layers: usize) -> f64 {
+        if layers == 0 {
+            0.0
+        } else {
+            self.slack_seconds() / layers as f64
+        }
+    }
+
+    /// Maximum speculative prefetch bytes per step that fit inside the idle
+    /// path slack without pushing `(U + W) * t_bw` past `C`:
+    /// `B_budget = (C - path_term).max(0.0) * P_peak`
+    /// (`0` when the path binds or before `line` is measured).
+    pub fn prefetch_byte_budget(&self) -> u64 {
+        let slack = self.slack_seconds();
+        if slack <= 0.0 {
+            return 0;
+        }
+        let Some(line) = self.line else {
+            return 0;
+        };
+        let secs_per_byte = line.seconds_per_byte();
+        if secs_per_byte <= 0.0 {
+            return 0;
+        }
+        let bytes = (slack / secs_per_byte).floor();
+        if bytes.is_finite() && bytes > 0.0 {
+            bytes.min(u64::MAX as f64) as u64
+        } else {
+            0
+        }
     }
 
     /// Expected critical-path stall saved by avoiding one demand miss of
     /// `bytes`: live `demand_stall`, falling back to `plain_stall` (so 100%
     /// prefetch hit rate never collapses to `break_even == 1.0`), then to the
-    /// unpipelined drive read time `λ + b / P_peak`.
+    /// unpipelined path transfer time `λ + b / P_peak`.
     pub fn effective_stall(&self, bytes: u64) -> Option<f64> {
         self.demand_stall
             .or(self.plain_stall)
-            .or_else(|| self.drive_line.map(|line| line.seconds(bytes)))
+            .or_else(|| self.line.map(|line| line.seconds(bytes)))
     }
 
-    /// The probability of use at which a read ahead of `bytes` breaks even
-    /// given `idle` seconds of remaining per-layer idle compute.
+    /// The probability of use at which a speculative transfer of `bytes`
+    /// breaks even given `idle` seconds of remaining idle compute / draft
+    /// window slack.
     ///
     /// # Panics
     /// Where `idle` is non-finite or negative.
@@ -458,13 +514,13 @@ impl ReadAdmission {
         }
     }
 
-    /// Whether a read ahead of `bytes` used with probability `p` is admitted
-    /// given `idle` seconds of remaining per-layer idle compute.
+    /// Whether a speculative transfer of `bytes` used with probability `p` is
+    /// admitted given `idle` seconds of remaining idle compute / draft window.
     pub fn admits(&self, p: f64, bytes: u64, idle: f64) -> bool {
         p >= self.break_even(bytes, idle)
     }
 
-    /// Critical-path stall of `reads` demand reads fetched together at a
+    /// Critical-path stall of `reads` demand misses fetched together at a
     /// layer (`reads * demand_stall.or(plain_stall).unwrap_or(0.0)`).
     ///
     /// # Panics
@@ -472,6 +528,55 @@ impl ReadAdmission {
     pub fn layer_stall(&self, reads: f64) -> f64 {
         assert!(reads.is_finite() && reads >= 0.0, "layer_stall reads must be finite and non-negative, got {reads}");
         reads * self.demand_stall.or(self.plain_stall).unwrap_or(0.0)
+    }
+}
+
+/// Remaining per-path idle compute + draft-window slack during one scheduling
+/// pass: `(c_layer + draft_window_remaining - queued_on_path).max(0.0)`.
+///
+/// Feeds every streaming path (both NVMe `PathKind::Drive` and PCIe DMA
+/// `PathKind::Link`) from the same `Told::DraftWindow` and per-layer compute
+/// slack, decremented as moves are admitted in priority order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinkIdleBudget {
+    remaining: f64,
+}
+
+impl LinkIdleBudget {
+    /// Construct a path's idle budget from per-layer compute slack `c_layer`,
+    /// remaining `draft_window_remaining` seconds (`Told::DraftWindow`), and
+    /// `queued_on_path` seconds already committed on this path.
+    ///
+    /// # Panics
+    /// Where any input is non-finite or negative.
+    pub fn new(c_layer: f64, draft_window_remaining: f64, queued_on_path: f64) -> Self {
+        assert!(c_layer.is_finite() && c_layer >= 0.0, "c_layer must be finite and non-negative, got {c_layer}");
+        assert!(
+            draft_window_remaining.is_finite() && draft_window_remaining >= 0.0,
+            "draft_window_remaining must be finite and non-negative, got {draft_window_remaining}"
+        );
+        assert!(
+            queued_on_path.is_finite() && queued_on_path >= 0.0,
+            "queued_on_path must be finite and non-negative, got {queued_on_path}"
+        );
+        Self { remaining: (c_layer + draft_window_remaining - queued_on_path).max(0.0) }
+    }
+
+    /// Remaining idle seconds available on this path.
+    pub fn remaining(&self) -> f64 {
+        self.remaining
+    }
+
+    /// Consume `transfer_seconds` of idle slack after admitting a move.
+    ///
+    /// # Panics
+    /// Where `transfer_seconds` is non-finite or negative.
+    pub fn consume(&mut self, transfer_seconds: f64) {
+        assert!(
+            transfer_seconds.is_finite() && transfer_seconds >= 0.0,
+            "transfer_seconds must be finite and non-negative, got {transfer_seconds}"
+        );
+        self.remaining = (self.remaining - transfer_seconds).max(0.0);
     }
 }
 
@@ -847,7 +952,7 @@ mod tests {
         assert!((zero_layers.shadow_verify_misses(100.0, 4) - 500.0).abs() < 1e-12);
     }
 
-    /// `ReadAdmission::break_even` prices pipelined bandwidth `t_bw = b / P_peak`
+    /// `PathAdmission::break_even` prices pipelined bandwidth `t_bw = b / P_peak`
     /// against `s_demand` across bandwidth-saturated (M4 Pro), latency-bound
     /// (GB10), discrete (RTX 3090), GPU-bound, and 100%-prefetch-hit regimes.
     #[test]
@@ -857,12 +962,7 @@ mod tests {
 
         // 1. M4 Pro (bandwidth-saturated): t_bw = 0.67 ms, s_demand = 0.81 ms -> p* = 0.67 / 0.81 ≈ 0.827.
         let m4_line = ReadLine::new(0.14e-3, 0.67e-3 / bytes as f64).unwrap();
-        let m4 = ReadAdmission {
-            terms: drive_bound,
-            drive_line: Some(m4_line),
-            demand_stall: Some(0.81e-3),
-            plain_stall: Some(0.81e-3),
-        };
+        let m4 = PathAdmission::drive(drive_bound, Some(m4_line), Some(0.81e-3), Some(0.81e-3));
         assert!(m4.binds());
         assert!((m4.transfer_seconds(bytes) - 0.67e-3).abs() < 1e-12);
         let p_m4 = m4.break_even(bytes, 0.0);
@@ -876,29 +976,24 @@ mod tests {
 
         // 2. GB10 (latency-bound): t_bw = 0.08 ms, lambda = 0.32 ms, s_demand = 0.40 ms -> p* = 0.20.
         let gb10_line = ReadLine::new(0.32e-3, 0.08e-3 / bytes as f64).unwrap();
-        let gb10 = ReadAdmission {
-            terms: drive_bound,
-            drive_line: Some(gb10_line),
-            demand_stall: Some(0.40e-3),
-            plain_stall: None,
-        };
+        let gb10 = PathAdmission::drive(drive_bound, Some(gb10_line), Some(0.40e-3), None);
         let p_gb10 = gb10.break_even(bytes, 0.0);
         assert!((p_gb10 - 0.20).abs() < 1e-9, "GB10 p* = {p_gb10}");
         assert!(gb10.admits(0.20, bytes, 0.0) && !gb10.admits(0.19, bytes, 0.0));
 
         // 3. RTX 3090: t_bw = 0.40 ms, s_demand = 0.60 ms -> p* = 2/3 ≈ 0.667.
         let rtx_line = ReadLine::new(0.20e-3, 0.40e-3 / bytes as f64).unwrap();
-        let rtx = ReadAdmission {
-            terms: Terms { compute: 0.020, drive: 0.090, link: 0.040, cpu: 0.025, memory: 0.015 },
-            drive_line: Some(rtx_line),
-            demand_stall: Some(0.60e-3),
-            plain_stall: None,
-        };
+        let rtx = PathAdmission::drive(
+            Terms { compute: 0.020, drive: 0.090, link: 0.040, cpu: 0.025, memory: 0.015 },
+            Some(rtx_line),
+            Some(0.60e-3),
+            None,
+        );
         let p_rtx = rtx.break_even(bytes, 0.0);
         assert!((p_rtx - 2.0 / 3.0).abs() < 1e-9, "RTX 3090 p* = {p_rtx}");
 
         // 4. GPU-bound: drive does not bind -> p* = 0.0.
-        let gpu_bound = ReadAdmission {
+        let gpu_bound = PathAdmission {
             terms: Terms { compute: 0.032, drive: 0.002, ..Terms::default() },
             ..m4
         };
@@ -906,18 +1001,97 @@ mod tests {
         assert_eq!(gpu_bound.break_even(bytes, 0.0), 0.0);
 
         // 5. 100% prefetch hit: demand_stall = None falls back to plain_stall, never collapsing to 1.0.
-        let full_hit = ReadAdmission { demand_stall: None, ..m4 };
+        let full_hit = PathAdmission { demand_stall: None, ..m4 };
         assert!((full_hit.break_even(bytes, 0.0) - 0.67 / 0.81).abs() < 1e-9);
         assert!((full_hit.layer_stall(3.0) - 3.0 * 0.81e-3).abs() < 1e-12);
 
-        // 6. Both stalls None: falls back to drive_line.seconds(bytes) = lambda + t_bw.
-        let line_only = ReadAdmission { demand_stall: None, plain_stall: None, ..m4 };
+        // 6. Both stalls None: falls back to line.seconds(bytes) = lambda + t_bw.
+        let line_only = PathAdmission { demand_stall: None, plain_stall: None, ..m4 };
         assert!((line_only.break_even(bytes, 0.0) - 0.67 / 0.81).abs() < 1e-9);
         assert_eq!(line_only.layer_stall(3.0), 0.0);
 
         // 7. Default (unmeasured): admits everything, layer_stall = 0.
-        let default = ReadAdmission::default();
+        let default = PathAdmission::default();
         assert_eq!(default.break_even(bytes, 0.0), 0.0);
         assert_eq!(default.layer_stall(4.0), 0.0);
+    }
+
+    #[test]
+    fn read_admission_slack_and_prefetch_byte_budget() {
+        // 4.6 GB/s SSD, 3.09 MB expert -> t_bw ≈ 0.6717 ms.
+        let bytes = 3_090_000_u64;
+        let peak_bps = 4.6e9_f64;
+        let line = ReadLine::new(0.14e-3, 1.0 / peak_bps).unwrap();
+
+        // Compute-bound verify step: C_verify = 75 ms, U * t_bw = 35 ms -> slack = 40 ms.
+        // Per-layer idle over 48 layers = 40 ms / 48 ≈ 0.833 ms.
+        // B_budget = 0.040 * 4.6e9 = 184_000_000 bytes (~59 experts).
+        let slack_regime = PathAdmission::drive(
+            Terms { compute: 0.075, drive: 0.035, ..Terms::default() },
+            Some(line),
+            Some(0.81e-3),
+            Some(0.81e-3),
+        );
+        assert!(!slack_regime.binds());
+        assert!((slack_regime.slack_seconds() - 0.040).abs() < 1e-12);
+        assert!((slack_regime.layer_idle(48) - 0.040 / 48.0).abs() < 1e-12);
+        assert_eq!(slack_regime.layer_idle(0), 0.0);
+        let budget = slack_regime.prefetch_byte_budget();
+        assert!((budget as f64 - 184_000_000.0).abs() <= 1.0, "expected ~184 MB budget, got {budget}");
+        assert_eq!(slack_regime.break_even(bytes, slack_regime.layer_idle(48)), 0.0);
+
+        // Drive-bound step: C = 32 ms, U * t_bw = 100 ms -> slack = 0, budget = 0.
+        let drive_bound = PathAdmission {
+            terms: Terms { compute: 0.032, drive: 0.100, ..Terms::default() },
+            ..slack_regime
+        };
+        assert!(drive_bound.binds());
+        assert_eq!(drive_bound.slack_seconds(), 0.0);
+        assert_eq!(drive_bound.layer_idle(48), 0.0);
+        assert_eq!(drive_bound.prefetch_byte_budget(), 0);
+        // During a 19 ms MTP DraftWindow, idle = 0.019 >= t_bw -> break_even = 0.0 even when drive binds.
+        assert_eq!(drive_bound.break_even(bytes, 0.019), 0.0);
+        assert!(drive_bound.admits(0.0, bytes, 0.019));
+    }
+
+    /// `PathAdmission` generalizes Drive + Link + shared Host DDR5 contention:
+    /// when Host DDR5 (`terms.memory`) is the binding domain, BOTH `Drive` and
+    /// `Link` bind and price speculative traffic against DDR5 contention; when
+    /// `Link` binds alone, `Link` binds while `Drive` does not.
+    #[test]
+    fn path_admission_handles_drive_link_and_shared_ddr5_contention() {
+        let bytes = 2_000_000_u64;
+        let pcie_line = ReadLine::new(5e-6, 40e-6 / bytes as f64).unwrap(); // 50 GB/s PCIe 5
+        let nvme_line = ReadLine::new(100e-6, 300e-6 / bytes as f64).unwrap();
+
+        // 1. 100%-RAM discrete GPU: Link binds (45 ms), Drive idle (0 ms), DDR5 (12 ms).
+        let link_bound = Terms { compute: 0.020, drive: 0.0, link: 0.045, cpu: 0.030, memory: 0.012 };
+        let link_adm = PathAdmission::link(link_bound, Some(pcie_line), Some(80e-6), None);
+        let drive_adm = PathAdmission::drive(link_bound, Some(nvme_line), Some(400e-6), None);
+        assert!(link_adm.binds(), "Link binds on 100%-RAM discrete GPU");
+        assert!(!drive_adm.binds(), "Drive does not bind when Link is the bottleneck");
+        assert!((link_adm.break_even(bytes, 0.0) - 0.5).abs() < 1e-9, "40 us / 80 us = 0.5");
+        assert_eq!(drive_adm.break_even(bytes, 0.0), 0.0);
+
+        // 2. Shared Host DDR5 binds (55 ms > Link 35 ms > Compute 20 ms > Drive 15 ms):
+        // BOTH Link and Drive share HostMemory, so BOTH bind!
+        let ddr5_bound = Terms { compute: 0.020, drive: 0.015, link: 0.035, cpu: 0.040, memory: 0.055 };
+        let link_ddr5 = PathAdmission::link(ddr5_bound, Some(pcie_line), Some(80e-6), None);
+        let drive_ddr5 = PathAdmission::drive(ddr5_bound, Some(nvme_line), Some(400e-6), None);
+        assert!(link_ddr5.binds(), "Link binds when shared Host DDR5 binds");
+        assert!(drive_ddr5.binds(), "Drive binds when shared Host DDR5 binds");
+        assert!((link_ddr5.break_even(bytes, 0.0) - 0.5).abs() < 1e-9);
+        assert!((drive_ddr5.break_even(bytes, 0.0) - 0.75).abs() < 1e-9);
+
+        // 3. LinkIdleBudget combines c_layer + draft_window_remaining - queued_on_path
+        // and feeds both Drive and Link paths.
+        let mut budget = LinkIdleBudget::new(0.5e-3, 15.0e-3, 1.5e-3);
+        assert!((budget.remaining() - 14.0e-3).abs() < 1e-12);
+        // DraftWindow covers Link transfer -> break_even drops to 0.0 even when Link binds.
+        assert_eq!(link_adm.break_even(bytes, budget.remaining()), 0.0);
+        budget.consume(4.0e-3);
+        assert!((budget.remaining() - 10.0e-3).abs() < 1e-12);
+        budget.consume(20.0e-3);
+        assert_eq!(budget.remaining(), 0.0);
     }
 }

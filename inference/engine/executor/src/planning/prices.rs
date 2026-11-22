@@ -49,6 +49,16 @@ pub(crate) fn prior(context: u64, limits: ResourceLimits) -> Result<Prior, PlanE
     Ok(Prior::of(context, limits.max_launch_rows as u64, region_rows)?)
 }
 
+/// The widest decode/verify pass row budget a load with `limits` can launch:
+/// `VERIFY_ROWS` bounded by `limits.max_launch_rows` (at least one). Shared by
+/// [`PlanPrices::of_bank`] and assessment's `BankPathPricer` so staging
+/// `ahead` records match the verify row budget bit-for-bit.
+pub(crate) fn decode_rows(limits: ResourceLimits) -> u64 {
+    magnitude_kernels::constants::VERIFY_ROWS
+        .min(limits.max_launch_rows as u64)
+        .max(1)
+}
+
 impl PlanPrices {
     pub fn new(costs: ExecutorCosts, figures: StreamedFigures, steps: Box<PlanSteps>) -> Self {
         Self { costs, figures, steps }
@@ -91,6 +101,7 @@ impl PlanPrices {
             // a pass the prior's half-context prompt fills would split
             // longer prompts into more passes, each reading its misses again.
             definition.decoder.context_limit,
+            decode_rows(limits),
         )))
     }
 }

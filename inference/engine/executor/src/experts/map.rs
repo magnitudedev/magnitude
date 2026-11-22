@@ -30,7 +30,24 @@
 use super::Words;
 use super::directory::Point;
 use super::watcher::{MapStep, Step, Steps, Unbegun, UnmapStep};
-use magnitude_kernels::constants::{MAP_FROM, MAP_RECORD, MAP_UNTIL, MAP_WORDS};
+use magnitude_kernels::constants::{MAP_FROM, MAP_RECORD, MAP_STAGE, MAP_UNTIL, MAP_WORDS};
+
+/// Encode an opportunistic DMA staging publication for `(step, record)` into
+/// the 32-bit `MAP_STAGE` word: high 16 bits = `step & 0xFFFF`, low 16 bits =
+/// `record + 1` (so `0` is always unstaged).
+pub(in crate::experts) fn stage_word(step: Step, record: usize) -> i32 {
+    assert!(record < u16::MAX as usize, "staged bank record {record} exceeds 16-bit MAP_STAGE slot");
+    ((((step as u32) & 0xFFFF) << 16) | ((record as u32) + 1)) as i32
+}
+
+/// Decode a `MAP_STAGE` word for `step`: `Some(record)` when the slot is
+/// non-zero and its 16-bit step tag matches `step & 0xFFFF`, else `None`.
+#[cfg(test)]
+pub(in crate::experts) fn decode_stage_word(word: i32, step: Step) -> Option<usize> {
+    let raw = word as u32;
+    let slot = raw & 0xFFFF;
+    (slot != 0 && (raw >> 16) == ((step as u32) & 0xFFFF)).then(|| (slot - 1) as usize)
+}
 
 /// UNTIL while mapped: every step.
 const ALWAYS: Step = Step::MAX;
@@ -47,6 +64,11 @@ impl MapView {
     /// Its experts.
     pub fn experts(&self) -> usize {
         self.words.len() / MAP_WORDS as usize
+    }
+
+    /// The underlying host-shared map tensor (for copy-engine `MAP_STAGE` signals).
+    pub fn tensor(&self) -> &seismic::Tensor {
+        self.words.tensor()
     }
 
     fn word(expert: usize, word: u64) -> usize {
@@ -106,6 +128,7 @@ impl StampedMap {
         let map = Self { view: MapView { words } };
         for expert in 0..map.view.experts() {
             map.store(expert, MAP_RECORD, -1);
+            map.store(expert, MAP_STAGE, 0);
             map.store_step(expert, MAP_FROM, 0);
             map.store_step(expert, MAP_UNTIL, 0);
         }

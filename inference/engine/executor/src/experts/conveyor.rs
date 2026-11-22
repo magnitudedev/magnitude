@@ -82,6 +82,9 @@ pub(super) struct Serving {
 pub(super) struct Lending {
     pub group: usize,
     pub pools: Vec<LentPool>,
+    /// On `Placer::Bank` (unified memory), each scratch form's layout inside
+    /// `0..lent` (empty on `Placer::Tier` or tests without scratch geometry).
+    pub scratch: Vec<LentPool>,
 }
 
 /// A pool's conveyor in the lent records: each lent record of its routed
@@ -96,10 +99,34 @@ pub(super) struct LentPool {
 impl Lending {
     /// The lent records conveyor record `record` of pool `pool` lies across.
     pub fn records(&self, pool: usize, record: u32) -> std::ops::RangeInclusive<usize> {
-        let LentPool { record: bytes, offset, conveyor } = &self.pools[pool];
-        let start = offset + conveyor * u64::from(record);
+        Self::span(&self.pools[pool], u64::from(record))
+    }
+
+    fn span(pool: &LentPool, index: u64) -> std::ops::RangeInclusive<usize> {
+        let LentPool { record: bytes, offset, conveyor } = pool;
+        let start = offset + conveyor * index;
         let lent = |byte: u64| usize::try_from(byte / bytes).expect("a lent record");
         lent(start)..=lent(start + conveyor - 1)
+    }
+
+    /// Whether unified-memory scratch geometry inside `0..lent` is known,
+    /// enabling demand-derived partial leasing.
+    pub fn has_scratch(&self) -> bool {
+        !self.scratch.is_empty()
+    }
+
+    /// All lent record indices in `0..lent` covered by conveyor records
+    /// `0..count` across all staging pools.
+    pub fn conveyor_records(&self, count: usize) -> impl Iterator<Item = usize> + '_ {
+        (0..count).flat_map(move |record| {
+            self.pools.iter().flat_map(move |pool| Self::span(pool, record as u64))
+        })
+    }
+
+    /// All lent record indices in `0..lent` covered by scratch slot `slot`
+    /// across all scratch forms.
+    pub fn scratch_records(&self, slot: usize) -> impl Iterator<Item = usize> + '_ {
+        self.scratch.iter().flat_map(move |pool| Self::span(pool, slot as u64))
     }
 }
 
@@ -215,6 +242,11 @@ impl Conveyor {
     /// The group lending the records that carry it.
     pub fn lending(&self) -> &Lending {
         &self.carrier.lending
+    }
+
+    /// Number of conveyor records carried by the lender's lent zone.
+    pub fn records(&self) -> usize {
+        self.carrier.records
     }
 
 
@@ -536,7 +568,7 @@ mod tests {
         let carrier = Carrier {
             records,
             slots: 0,
-            lending: Lending { group: 0, pools: Vec::new() },
+            lending: Lending { group: 0, pools: Vec::new(), scratch: Vec::new() },
             pools: Vec::new(),
         };
         Conveyor::new(layer_pools, &experts, carrier)
@@ -611,6 +643,7 @@ mod tests {
                     LentPool { record: 1000, offset: 0, conveyor: 500 },
                     LentPool { record: 1000, offset: 0, conveyor: 800 },
                 ],
+                scratch: Vec::new(),
             },
             pools: Vec::new(),
         };

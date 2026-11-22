@@ -161,8 +161,8 @@ fn shadow_executed_never_regresses_epoch_across_resizes() {
         // before/alongside `expert-residency`'s `telemetry.shadow()` turn.
         {
             let mut times = shared.time().lock();
-            times.resized(0, Tier::Compute, 2);
-            times.resized(0, Tier::Compute, 2);
+            times.resized(0, Tier::COMPUTE, 2);
+            times.resized(0, Tier::COMPUTE, 2);
         }
         shared.telemetry.feed();
         shared.telemetry.shadow();

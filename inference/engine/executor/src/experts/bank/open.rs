@@ -513,8 +513,35 @@ fn watch(
     // each pool's conveyor where it lies in them, which reads land in in
     // place.
     let conveyor = plan.conveyor();
+    let scratch_plan = plan.scratch();
     let lending = |lender: &Lender| {
         let lent = &plan.groups()[lender.group].record;
+        let scratch_pools = if plan.placer() == Placer::Bank {
+            let mut seen = Vec::new();
+            let mut pools = Vec::new();
+            for (index, forms) in scratch_forms.iter().enumerate() {
+                let layer_window = plan.layer_window(index);
+                for (kind, _) in plan.groups()[lender.group].record.iter() {
+                    let Some(&form) = forms.get(kind) else { continue };
+                    let key = (kind, form);
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    seen.push(key);
+                    let view = scratch[index].get(kind).ok_or("a scratch view of a tensor the record lacks")?;
+                    let slot_bytes = view.byte_len() / layer_window;
+                    let record = lent
+                        .get(kind)
+                        .ok_or("scratch of a tensor the lender's records lack")?
+                        .record_bytes()?;
+                    let offset = scratch_plan.layout.offsets[form];
+                    pools.push(LentPool { record, offset, conveyor: slot_bytes });
+                }
+            }
+            pools
+        } else {
+            Vec::new()
+        };
         Ok::<_, String>(Lending {
             group: lender.group,
             pools: staging_pools
@@ -531,6 +558,7 @@ fn watch(
                     })
                 })
                 .collect::<Result<_, String>>()?,
+            scratch: scratch_pools,
         })
     };
     // What promotions copy with, beside a host tier: the device's transfer
@@ -581,7 +609,25 @@ fn watch(
             Placer::Tier => {
                 let lender = plan.scratch().lender;
                 let lent = usize::try_from(lender.records).map_err(|_| "lent records exceed the host")?;
-                Placement::Tier { bank_maps, tier_maps: landing_maps, lent: (lender.group, lent) }
+                // Reserve a dedicated even/odd double-buffered DMA staging ring
+                // (`2 * K` records per group, ~24-60 MB total, 0.1% of 32 GB
+                // VRAM) on every partial discrete-GPU group, completely
+                // independent of `lent == 0` and prompt scratch leases.
+                let want = (plan.selected() as usize).saturating_mul(2);
+                let stage_slots = (0..tiers.len())
+                    .map(|group| {
+                        if plan.whole() {
+                            return 0;
+                        }
+                        let present = bank.present(group) as usize;
+                        let start = if group == lender.group { lent } else { 0 };
+                        let avail = present.saturating_sub(start);
+                        // Preserve at least 1 permanent bank record if possible.
+                        let max_stage = avail.saturating_sub(1) & !1;
+                        want.min(max_stage)
+                    })
+                    .collect();
+                Placement::Tier { bank_maps, tier_maps: landing_maps, lent: (lender.group, lent), stage_slots }
             }
             Placer::Bank => Placement::Bank { landing_maps },
         };

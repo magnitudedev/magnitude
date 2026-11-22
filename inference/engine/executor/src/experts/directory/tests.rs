@@ -380,6 +380,7 @@ fn tiered(records: &[u32], layers: usize, experts: u64, lent: usize) -> HostTier
             bank_maps: (0..layers).map(|_| StampedMap::new(cpu_words(&[experts, map_words], 0))).collect(),
             tier_maps: (0..layers).map(|_| LandingMap::Tier(cpu_words(&[experts], -1))).collect(),
             lent: (0, lent),
+            stage_slots: vec![0; records.len()],
         },
     }
 }
@@ -485,7 +486,7 @@ fn a_promotion_waits_until_its_reads_earn_its_copy() {
         let time = directory.time();
         let mut times = time.lock();
         for _ in 0..3 {
-            times.moved(0, crate::experts::horizon::Tier::Compute);
+            times.moved(0, crate::experts::horizon::Tier::COMPUTE);
         }
     }
     // Unpriced by default (`None`): no promotion runs before `price_copies`.
@@ -533,7 +534,7 @@ fn a_want_earns_its_copy_and_its_victim_is_released() {
         }
         log(&directory, step, 1, &[0]);
         if step % 20 == 0 {
-            directory.time().lock().moved(0, crate::experts::horizon::Tier::Compute);
+            directory.time().lock().moved(0, crate::experts::horizon::Tier::COMPUTE);
         }
     }
     let asked = directory.promote();
@@ -856,13 +857,13 @@ fn written_back_victim(priced: bool) -> Directory {
         }
         log(&directory, step, 1, &[0]);
         if step % 20 == 0 {
-            directory.time().lock().moved(0, crate::experts::horizon::Tier::Compute);
+            directory.time().lock().moved(0, crate::experts::horizon::Tier::COMPUTE);
         }
     }
     assert!(
         directory
             .reuse_now()
-            .expected(0, 1, crate::experts::horizon::Tier::Host, crate::experts::horizon::Reader::Move, None)
+            .expected(0, 1, crate::experts::horizon::Tier::HOST, crate::experts::horizon::Reader::Move, None)
             .uses()
             > 0.,
         "a use of the victim is expected"
@@ -1303,16 +1304,16 @@ fn a_read_ahead_displaces_only_a_lower_rank() {
     {
         let reuse = directory.reuse_now();
         let q = 2.0 / 3.0;
-        let base = reuse.expected(0, 1, Tier::Host, Reader::Move, None).uses();
-        let with_q = reuse.expected_with(0, 1, Tier::Host, 4, q).uses();
-        let with_one = reuse.expected_with(0, 1, Tier::Host, 4, 1.0).uses();
-        let with_zero = reuse.expected_with(0, 1, Tier::Host, 4, 0.0).uses();
+        let base = reuse.expected(0, 1, Tier::HOST, Reader::Move, None).uses();
+        let with_q = reuse.expected_with(0, 1, Tier::HOST, 4, q).uses();
+        let with_one = reuse.expected_with(0, 1, Tier::HOST, 4, 1.0).uses();
+        let with_zero = reuse.expected_with(0, 1, Tier::HOST, 4, 0.0).uses();
         assert!((with_q - base).abs() < 1e-9, "p = q must keep lead term {q}: base={base}, with_q={with_q}");
         assert!((with_one - base - (1.0 - q)).abs() < 1e-9, "p = 1.0 adds {} over q={q}: base={base}, with_one={with_one}", 1.0 - q);
         assert!((base - with_zero - q).abs() < 1e-9, "p = 0.0 subtracts {q} from q={q}: base={base}, with_zero={with_zero}");
     }
 
-    // Part 2: victim test at Tier::Host, Reader::Move with keep = reserve = 1.
+    // Part 2: victim test at Tier::HOST, Reader::Move with keep = reserve = 1.
     let mut hot_tier = Directory::new(&[1], &[0], &[8], HostTier::replay(vec![2]).reserving(1));
     for step in 1..=10 {
         log(&hot_tier, step, 0, &[0]);
@@ -1415,8 +1416,8 @@ fn the_host_tier_ranks_at_its_own_turnover() {
         log(&directory, step, 0, &[0]);
         let time = directory.time();
         let mut times = time.lock();
-        times.moved(0, Tier::Compute);
-        times.moved(0, Tier::Compute);
+        times.moved(0, Tier::COMPUTE);
+        times.moved(0, Tier::COMPUTE);
     }
     // Step 21: exact row (depth 0) chooses expert 0; front row (depth 1)
     // chooses expert 1 (σ₁ = 1 unjudged -> p₁(1) = 1, p₁(0) = 0).
@@ -1424,8 +1425,8 @@ fn the_host_tier_ranks_at_its_own_turnover() {
         let time = directory.time();
         let mut times = time.lock();
         times.register(21, Advance::Known(Tokens::new(1.0)));
-        times.moved(0, Tier::Compute);
-        times.moved(0, Tier::Compute);
+        times.moved(0, Tier::COMPUTE);
+        times.moved(0, Tier::COMPUTE);
     }
     let mut keys = vec![0.0f32; 256];
     keys[0] = 1.0;
@@ -1439,10 +1440,10 @@ fn the_host_tier_ranks_at_its_own_turnover() {
 
     {
         let reuse = directory.reuse_now();
-        let compute_0 = reuse.rank(0, 0, Tier::Compute, Reader::Move, None);
-        let compute_1 = reuse.rank(0, 1, Tier::Compute, Reader::Move, None);
-        let host_0 = reuse.rank(0, 0, Tier::Host, Reader::Move, None);
-        let host_1 = reuse.rank(0, 1, Tier::Host, Reader::Move, None);
+        let compute_0 = reuse.rank(0, 0, Tier::COMPUTE, Reader::Move, None);
+        let compute_1 = reuse.rank(0, 1, Tier::COMPUTE, Reader::Move, None);
+        let host_0 = reuse.rank(0, 0, Tier::HOST, Reader::Move, None);
+        let host_1 = reuse.rank(0, 1, Tier::HOST, Reader::Move, None);
         assert!(compute_1 > compute_0, "at short τ₀, lead-1 expert 1 outranks expert 0");
         assert!(host_0 > host_1, "at long τ₁, frequent expert 0 outranks expert 1");
     }
@@ -1469,8 +1470,8 @@ fn the_rankings_size_is_constant_in_run_length() {
             log(&directory, step, 1, &b);
             let time = directory.time();
             let mut times = time.lock();
-            times.moved(0, Tier::Compute);
-            times.moved(0, Tier::Host);
+            times.moved(0, Tier::COMPUTE);
+            times.moved(0, Tier::HOST);
         }
     };
     run(1..=10);
@@ -1520,4 +1521,61 @@ fn warm_prompt_repeat_with_tied_expected_seeds_zero_kept_records() {
         let (seeds, evicted) = directory.seed(at(1001, layer), prompt_of(at(1001, layer)), layer, &routed(1001), &[], |_| true);
         assert!(seeds.is_empty() && evicted.is_empty(), "layer {layer} thrashed on tied Expected: seeds={seeds:?} evicted={evicted:?}");
     }
+}
+
+/// On a discrete `Placer::Tier` bank with `lent = 2` (`0..2`) and a dedicated
+/// even/odd staging ring `stage_slots = 4` (`2..6`), `Directory::seeded_from`
+/// remains `lent` (matching `ExpertBankPlan::seeded_from` and the GPU
+/// `routed_seed_commit` base offset), and `Directory::seed` never hands out
+/// any record in `0..lent` or `2..6` (by construction via `Record::StageIdle`),
+/// so every seeded record satisfies `record.index() >= seeded_from` and
+/// `record.index() - seeded_from` equals its true offset past `lent`.
+#[test]
+fn seed_skips_lent_and_stage_ring_and_keeps_seeded_from_at_lent() {
+    let lent = 2usize;
+    let stage_slots = 4usize;
+    let total_records = 10usize; // 0..2 lent, 2..6 staging ring, 6..10 permanent bank
+    let experts = 8u64;
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let host = HostTier {
+        records: vec![8],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier {
+            bank_maps: vec![StampedMap::new(cpu_words(&[experts, map_words], 0))],
+            tier_maps: vec![LandingMap::Tier(cpu_words(&[experts], -1))],
+            lent: (0, lent),
+            stage_slots: vec![stage_slots],
+        },
+    };
+    let mut directory = Directory::new(&[total_records], &[0], &[experts as usize], host);
+    let steps = steps();
+    steps.begin_through(10);
+
+    // `seeded_from` MUST stay equal to `lent` (matching GPU `routed_seed_commit`).
+    assert_eq!(directory.seeded_from(0), lent);
+    assert_eq!(directory.capacity(0), total_records - lent - stage_slots);
+    assert_eq!(directory.stage_ring_half(0), stage_slots / 2);
+
+    // Lease `0..lent` for prompt group starting at step 1, then seed 4 experts.
+    let group = ScratchGroup::at(1, 1);
+    assert!(directory.lease(0, group, false, None), "lent records 0..2 lease cleanly");
+
+    let routed = [(0usize, 10u32, 1u64), (1, 10, 1), (2, 10, 1), (3, 10, 1)];
+    let (seeds, evicted) = directory.seed(at(1, 0), group, 0, &routed, &[], |_| true);
+    assert_eq!(seeds.len(), 4, "all 4 permanent records 6..10 are seeded");
+    assert!(evicted.is_empty());
+    let mut indices: Vec<usize> = seeds.iter().map(|&(_, rec)| rec.index()).collect();
+    indices.sort_unstable();
+    assert_eq!(indices, vec![6, 7, 8, 9], "seed must never touch 0..lent or staging ring 2..6");
+    for &idx in &indices {
+        assert!(!directory.is_stage_slot(0, idx));
+        assert!(idx >= directory.seeded_from(0));
+        // GPU `routed_seed_commit` offset relative to `ExpertBankPlan::seeded_from` (`lent`).
+        assert_eq!(idx - directory.seeded_from(0), idx - lent);
+    }
+
+    // Staging ring `2..6` remains completely untouched and ready for even/odd DMA staging.
+    assert_eq!(directory.free_stage_slot(0, 2), Some(2));
+    assert_eq!(directory.free_stage_slot(0, 3), Some(4));
 }

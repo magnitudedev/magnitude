@@ -164,14 +164,26 @@ impl Clock {
     }
 }
 
-/// A tier of a group's records (§3.2): tier 0, what the GPU computes from
-/// (the bank beside a host tier, the one store on unified memory), and
-/// tier 1, the host tier beside a bank. Unified memory has tier 0 alone.
+/// A tier of a group's records (§3.2): tier `0` (`COMPUTE`), what the GPU
+/// computes from (the bank beside a host tier, the one store on unified
+/// memory), tier `1` (`HOST`), the host tier beside a bank, and any deeper
+/// tier `TierId(n)` in an N-tier hierarchy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum Tier {
-    Compute,
-    Host,
+pub(crate) struct TierId(pub(crate) u8);
+
+impl TierId {
+    /// Tier 0: the memory the GPU computes from.
+    pub(crate) const COMPUTE: Self = Self(0);
+    /// Tier 1: host RAM beside a discrete GPU.
+    pub(crate) const HOST: Self = Self(1);
+
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
 }
+
+/// Alias for [`TierId`] within the experts subsystem.
+pub(crate) type Tier = TierId;
 
 /// Which consumer of τ is asking (§3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -512,7 +524,7 @@ impl Time {
         let tiers: Vec<Vec<(Turnover, u64)>> = records
             .iter()
             .map(|tiers| {
-                assert!(matches!(tiers.len(), 1 | 2), "a group has tier 0 and at most a host tier: {tiers:?}");
+                assert!(!tiers.is_empty() && tiers.len() <= usize::from(u8::MAX), "a group has 1..=255 tiers: {tiers:?}");
                 tiers.iter().map(|&records| (Turnover::new(&clock), records)).collect()
             })
             .collect();
@@ -547,11 +559,11 @@ impl Times {
     /// A move into `group`'s `tier` (§3.2: a landing that fills or replaces
     /// a record; never a seed, a shrink's eviction or a lend), at the clock's
     /// T. A tier-0 move is also a bank-wide move.
-    pub(crate) fn moved(&mut self, group: usize, tier: Tier) {
+    pub(crate) fn moved(&mut self, group: usize, tier: TierId) {
         let Self { clock, tiers, bank } = self;
         let (turnover, records) = Self::tier(tiers, group, tier);
         turnover.moved(clock, *records);
-        if tier == Tier::Compute {
+        if tier == TierId::COMPUTE {
             bank.0.moved(clock, bank.1);
         }
     }
@@ -559,19 +571,19 @@ impl Times {
     /// `group`'s `tier` resized to `records`: its turnover closes its epoch
     /// and restarts `Unturned`; a tier-0 resize does so for the bank-wide
     /// turnover too, at the bank's new sum.
-    pub(crate) fn resized(&mut self, group: usize, tier: Tier, records: u64) {
+    pub(crate) fn resized(&mut self, group: usize, tier: TierId, records: u64) {
         let Self { clock, tiers, bank } = self;
         let (turnover, held) = Self::tier(tiers, group, tier);
         let before = std::mem::replace(held, records);
         turnover.resized(clock);
-        if tier == Tier::Compute {
+        if tier == TierId::COMPUTE {
             bank.1 = bank.1 - before + records;
             bank.0.resized(clock);
         }
     }
 
     /// τ of `group`'s `tier` for `reader` ([`Turnover::horizon`]).
-    pub(crate) fn horizon(&self, group: usize, tier: Tier, reader: Reader) -> Option<Horizon> {
+    pub(crate) fn horizon(&self, group: usize, tier: TierId, reader: Reader) -> Option<Horizon> {
         let (turnover, records) = &self.tiers[group][Self::index(&self.tiers[group], group, tier)];
         turnover.horizon(reader, *records, &self.clock)
     }
@@ -592,18 +604,15 @@ impl Times {
         self.bank.0.epoch()
     }
 
-    fn tier(tiers: &mut [Vec<(Turnover, u64)>], group: usize, tier: Tier) -> &mut (Turnover, u64) {
+    fn tier(tiers: &mut [Vec<(Turnover, u64)>], group: usize, tier: TierId) -> &mut (Turnover, u64) {
         let index = Self::index(&tiers[group], group, tier);
         &mut tiers[group][index]
     }
 
     /// `tier`'s index in `group`'s tiers. Panics where the group has no
-    /// such tier: unified memory has no host tier.
-    fn index(tiers: &[(Turnover, u64)], group: usize, tier: Tier) -> usize {
-        let index = match tier {
-            Tier::Compute => 0,
-            Tier::Host => 1,
-        };
+    /// such tier.
+    fn index(tiers: &[(Turnover, u64)], group: usize, tier: TierId) -> usize {
+        let index = tier.index();
         assert!(index < tiers.len(), "group {group} has no {tier:?} tier");
         index
     }
@@ -690,31 +699,31 @@ mod tests {
         const K: u64 = 3;
         let time = Time::new(&[vec![K]], 8);
         let mut times = time.lock();
-        assert_eq!(times.horizon(0, Tier::Compute, Reader::Move), None, "before any decode step, no τ");
+        assert_eq!(times.horizon(0, Tier::COMPUTE, Reader::Move), None, "before any decode step, no τ");
         assert_eq!(times.tokens_per_step(0), None);
         times.register(1, front());
         assert_eq!(times.tokens_per_step(0), Some(1.0), "ā is exactly 1 at the first step");
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Move), Horizon::Tokens(tokens(3.0)), "K·1/(0 + 1)");
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Observe), Horizon::Unbounded, "an observer before a move");
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Move), Horizon::Tokens(tokens(3.0)), "K·1/(0 + 1)");
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Observe), Horizon::Unbounded, "an observer before a move");
         times.register(2, Advance::Pending { requests: 1 });
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Move), Horizon::Tokens(tokens(6.0)), "T counts step 2 at 1");
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Move), Horizon::Tokens(tokens(6.0)), "T counts step 2 at 1");
         times.decided(2, 2);
-        times.moved(0, Tier::Compute);
+        times.moved(0, Tier::COMPUTE);
         // T = 4 over S = 2, M = 1.
         assert_eq!(times.tokens_per_step(0), Some(2.0));
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Move), Horizon::Tokens(tokens(6.0)), "3·4/(1 + 1)");
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Observe), Horizon::Tokens(tokens(12.0)), "3·4/1");
-        times.moved(0, Tier::Compute);
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Move), Horizon::Tokens(tokens(6.0)), "3·4/(1 + 1)");
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Observe), Horizon::Tokens(tokens(12.0)), "3·4/1");
+        times.moved(0, Tier::COMPUTE);
         assert_eq!(times.group_epoch(0), 0, "unturned below K moves");
-        times.moved(0, Tier::Compute);
+        times.moved(0, Tier::COMPUTE);
         assert_eq!(times.group_epoch(0), 1, "the K-th move turns it");
         assert!(matches!(times.tiers[0][0].0, Turnover::Turned { .. }));
         // The window is the closed epoch: T = 4, M = 3.
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Move), Horizon::Tokens(tokens(3.0)), "3·4/(3 + 1)");
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Move), Horizon::Tokens(tokens(3.0)), "3·4/(3 + 1)");
         times.register(3, front());
-        times.moved(0, Tier::Compute);
+        times.moved(0, Tier::COMPUTE);
         // Previous (4 tokens, 2 steps, 3 moves) plus running (1, 1, 1).
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Observe), Horizon::Tokens(tokens(3.0 * 5.0 / 4.0)));
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Observe), Horizon::Tokens(tokens(3.0 * 5.0 / 4.0)));
         assert_eq!(times.tokens_per_step(0), Some(5.0 / 3.0));
     }
 
@@ -757,28 +766,28 @@ mod tests {
         let mut rate = Window::<Count>::new(times.group_epoch(0));
         times.register(1, front());
         times.register(2, front());
-        times.moved(0, Tier::Compute);
-        times.moved(0, Tier::Compute);
+        times.moved(0, Tier::COMPUTE);
+        times.moved(0, Tier::COMPUTE);
         times.register(3, front());
-        times.moved(0, Tier::Compute);
+        times.moved(0, Tier::COMPUTE);
         assert_eq!(times.group_epoch(0), 1);
         rate.count(times.group_epoch(0)).0 += 1;
         // A grow: the epoch closes, and the counts restart at step 3.
-        times.resized(0, Tier::Compute, 6);
+        times.resized(0, Tier::COMPUTE, 6);
         assert_eq!(times.group_epoch(0), 2);
         assert!(matches!(times.tiers[0][0].0, Turnover::Unturned { .. }), "restarted unturned");
         assert_eq!(rate.read(times.group_epoch(0)), Some((&Count(1), &Count(0))), "the window rolls once, keeping its tally");
         assert_eq!(times.tokens_per_step(0), Some(1.0), "S and T restart at the latest begun step");
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Move), Horizon::Tokens(tokens(6.0)), "K_new·1/(0 + 1)");
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Observe), Horizon::Unbounded, "no old move is read at the new K");
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Move), Horizon::Tokens(tokens(6.0)), "K_new·1/(0 + 1)");
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Observe), Horizon::Unbounded, "no old move is read at the new K");
         times.register(4, front());
-        times.moved(0, Tier::Compute);
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Move), Horizon::Tokens(tokens(6.0)), "6·2/(1 + 1)");
+        times.moved(0, Tier::COMPUTE);
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Move), Horizon::Tokens(tokens(6.0)), "6·2/(1 + 1)");
         // A shrink of the host tier closes its own epoch, and not tier 0's.
         let host = times.tiers[0][1].0.epoch();
-        times.resized(0, Tier::Host, 1);
+        times.resized(0, Tier::HOST, 1);
         assert_eq!((times.tiers[0][1].0.epoch(), times.group_epoch(0)), (host + 1, 2));
-        assert_eq!(tau(&times, 0, Tier::Host, Reader::Move), Horizon::Tokens(tokens(1.0)));
+        assert_eq!(tau(&times, 0, Tier::HOST, Reader::Move), Horizon::Tokens(tokens(1.0)));
     }
 
     #[test]
@@ -788,17 +797,17 @@ mod tests {
         let mut times = time.lock();
         for step in 1..=5 {
             times.register(step, front());
-            times.moved(0, Tier::Compute);
+            times.moved(0, Tier::COMPUTE);
         }
-        times.moved(1, Tier::Host);
+        times.moved(1, Tier::HOST);
         assert_eq!(times.bank_epoch(), 1, "group 1 never moving in tier 0 does not hold the bank back");
         assert_eq!(times.group_epoch(0), 2);
         assert_eq!(times.group_epoch(1), 0, "no move, no aging");
-        assert_eq!(tau(&times, 1, Tier::Compute, Reader::Observe), Horizon::Unbounded);
-        assert_eq!(tau(&times, 1, Tier::Compute, Reader::Move), Horizon::Tokens(tokens(15.0)), "3·5/(0 + 1): every step since the load");
+        assert_eq!(tau(&times, 1, Tier::COMPUTE, Reader::Observe), Horizon::Unbounded);
+        assert_eq!(tau(&times, 1, Tier::COMPUTE, Reader::Move), Horizon::Tokens(tokens(15.0)), "3·5/(0 + 1): every step since the load");
         assert_eq!(times.tokens_per_step(1), Some(1.0));
         // A tier-0 resize resizes the bank: 2 + 1 records, restarted at step 5.
-        times.resized(1, Tier::Compute, 1);
+        times.resized(1, Tier::COMPUTE, 1);
         assert_eq!(times.bank_epoch(), 2);
         assert_eq!(times.bank.1, 3);
         assert_eq!(times.bank.0.horizon(Reader::Move, times.bank.1, &times.clock), Some(Horizon::Tokens(tokens(3.0))));
@@ -826,32 +835,32 @@ mod tests {
         let mut times = time.lock();
         // Moves before any decode step never close an epoch or produce a window.
         for _ in 0..5 {
-            times.moved(0, Tier::Compute);
+            times.moved(0, Tier::COMPUTE);
         }
         assert_eq!(times.group_epoch(0), 0);
         assert_eq!(times.tokens_per_step(0), None);
-        assert_eq!(times.horizon(0, Tier::Compute, Reader::Move), None);
+        assert_eq!(times.horizon(0, Tier::COMPUTE, Reader::Move), None);
 
         // Step 1 with > 2K moves after a resize: turns once, keeps ā = 1.0,
         // and attributes all moves of the step to its closed span.
         times.register(1, front());
-        times.resized(0, Tier::Compute, K);
+        times.resized(0, Tier::COMPUTE, K);
         let after_resize = times.group_epoch(0);
         for _ in 0..7 {
-            times.moved(0, Tier::Compute);
+            times.moved(0, Tier::COMPUTE);
         }
         assert_eq!(times.group_epoch(0), after_resize + 1, "at most one epoch closes per step");
         assert_eq!(times.tokens_per_step(0), Some(1.0));
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Observe), Horizon::Tokens(tokens(2.0 / 7.0)));
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Move), Horizon::Tokens(tokens(2.0 / 8.0)));
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Observe), Horizon::Tokens(tokens(2.0 / 7.0)));
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Move), Horizon::Tokens(tokens(2.0 / 8.0)));
 
         // Step 2 with another 7 moves: turns once more with the exact 7 moves/token rate.
         times.register(2, front());
         for _ in 0..7 {
-            times.moved(0, Tier::Compute);
+            times.moved(0, Tier::COMPUTE);
         }
         assert_eq!(times.group_epoch(0), after_resize + 2);
         assert_eq!(times.tokens_per_step(0), Some(1.0));
-        assert_eq!(tau(&times, 0, Tier::Compute, Reader::Observe), Horizon::Tokens(tokens(2.0 / 7.0)));
+        assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Observe), Horizon::Tokens(tokens(2.0 / 7.0)));
     }
 }

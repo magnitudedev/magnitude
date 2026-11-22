@@ -143,7 +143,14 @@ impl HintGate {
     /// Where the load's prices refuse a hint launch, or price none for a
     /// layer that hints: its census makes every hinting layer's hint
     /// launch (`LayerCall::Hint`).
-    pub(super) fn decide(&mut self, resolved: &[bool], prices: Option<&LaunchPrices>, miss: ReadAdmission, pass: Option<(u32, f64)>) -> Vec<bool> {
+    pub(super) fn decide(
+        &mut self,
+        resolved: &[bool],
+        prices: Option<&LaunchPrices>,
+        miss: ReadAdmission,
+        pass: Option<(u32, f64)>,
+        mut admitted: impl FnMut(usize, u8, ReadAdmission) -> bool,
+    ) -> Vec<bool> {
         let (Some(prices), Some((rows, pass))) = (prices, pass) else {
             return self.decided.clone();
         };
@@ -167,7 +174,7 @@ impl HintGate {
                     .unwrap_or_else(|error| panic!("invariant violated: the load's prices refuse streamed layer {layer}'s hint launch at {rows} rows: {error}"))
                     .unwrap_or_else(|| panic!("invariant violated: streamed layer {layer} hints {:?} and its load's census makes no hint launch of it", self.targets[layer]));
                 let z = confidence_z(pass, price);
-                let Some((saving, saving_on, saving_off)) = self.saving_bounds(layer, resolved, miss, epoch, now, z) else {
+                let Some((saving, saving_on, saving_off)) = self.saving_bounds(layer, resolved, miss, epoch, now, z, &mut admitted) else {
                     return running;
                 };
                 let run = if running {
@@ -223,16 +230,32 @@ impl HintGate {
     /// - `lower_for_on` uses `(exclusive_point, cohort_lo)` at `z`: a stopped
     ///   layer flips ON only when its measured exclusive rate and lower cohort
     ///   bound repay its launch price (never turning on with `exclusive == 0`).
-    fn saving_bounds(&mut self, layer: usize, resolved: &[bool], miss: ReadAdmission, epoch: u64, now: Tokens, z: f64) -> Option<(f64, f64, f64)> {
+    /// If no calibrated rank for `(target, lead)` is admitted by
+    /// `ReadAdmission` (`!admitted(target, lead, miss)`), that lead can never
+    /// issue a read and saves `(0.0, 0.0, 0.0)` by construction.
+    #[allow(clippy::too_many_arguments)]
+    fn saving_bounds(
+        &mut self,
+        layer: usize,
+        resolved: &[bool],
+        miss: ReadAdmission,
+        epoch: u64,
+        now: Tokens,
+        z: f64,
+        admitted: &mut impl FnMut(usize, u8, ReadAdmission) -> bool,
+    ) -> Option<(f64, f64, f64)> {
         let (mut point, mut lower, mut upper) = (0.0, 0.0, 0.0);
         for (index, &target) in self.targets[layer].iter().enumerate() {
             if resolved[target] {
                 continue;
             }
+            let lead = (index + 1) as u8;
+            if !admitted(target, lead, miss) {
+                continue;
+            }
             let cohort_share = self.rates.cohort_share(target, epoch)?;
             let cohort = cohort_share.rate();
             let (cohort_lo, cohort_hi) = cohort_share.poisson(z);
-            let lead = (index + 1) as u8;
             let (excl_share, _) = self.rates.exclusive_share(lead, epoch, now)?;
             let excl = excl_share.rate();
             let excl_hi = excl_share.wilson(z).1;
@@ -363,12 +386,12 @@ mod tests {
         // below launch price (0.1 ms) while layer 1 is resolved: layer 0 turns OFF while layer 1 stays ON.
         let prices = table_for(&[0, 1]);
         let mut step = 2u64;
-        let mut decided = gate.decide(&[false, true, false], Some(&prices), cost, Some((1, 0.01)));
+        let mut decided = gate.decide(&[false, true, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
         gate.publish(&decided);
         for _ in 0..140 {
             time.lock().register(step, Advance::Known(Tokens::new(1.0)));
             gate.resolved(&[Cohort { step, layer: 2, misses: 1, saved: vec![catchers(&[1, 2]), catchers(&[1])] }]);
-            decided = gate.decide(&[false, true, false], Some(&prices), cost, Some((1, 0.01)));
+            decided = gate.decide(&[false, true, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
             gate.publish(&decided);
             step += 1;
             if decided == [false, true, false] {
@@ -383,10 +406,10 @@ mod tests {
             {
                 let mut times = time.lock();
                 times.register(step, Advance::Known(Tokens::new(1.0)));
-                times.moved(0, Tier::Compute);
+                times.moved(0, Tier::COMPUTE);
             }
             gate.resolved(&[Cohort { step, layer: 2, misses: 0, saved: Vec::new() }]);
-            let d = gate.decide(&[false, true, false], Some(&prices), cost, Some((1, 0.01)));
+            let d = gate.decide(&[false, true, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
             gate.publish(&d);
             step += 1;
         }
@@ -398,7 +421,7 @@ mod tests {
         {
             let mut times = time.lock();
             times.register(off_step, Advance::Known(Tokens::new(1.0)));
-            times.moved(0, Tier::Compute);
+            times.moved(0, Tier::COMPUTE);
         }
         gate.resolved(&[Cohort { step: off_step, layer: 2, misses: 3, saved: Vec::new() }]);
         let (epoch, now) = {
@@ -431,10 +454,10 @@ mod tests {
             {
                 let mut times = time.lock();
                 times.register(step, Advance::Known(Tokens::new(1.0)));
-                times.moved(0, Tier::Compute);
+                times.moved(0, Tier::COMPUTE);
             }
             gate.resolved(&[Cohort { step, layer: 1, misses: 1, saved: vec![catchers(&[1])] }]);
-            let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)));
+            let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
             gate.publish(&decided);
             assert!(decided[0], "stays on at step {step}");
         }
@@ -446,10 +469,10 @@ mod tests {
             {
                 let mut times = time.lock();
                 times.register(step, Advance::Known(Tokens::new(1.0)));
-                times.moved(0, Tier::Compute);
+                times.moved(0, Tier::COMPUTE);
             }
             gate.resolved(&[Cohort { step, layer: 1, misses: 0, saved: Vec::new() }]);
-            let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)));
+            let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
             gate.publish(&decided);
             step += 1;
             !decided[0]
@@ -462,10 +485,10 @@ mod tests {
             {
                 let mut times = time.lock();
                 times.register(step, Advance::Known(Tokens::new(1.0)));
-                times.moved(0, Tier::Compute);
+                times.moved(0, Tier::COMPUTE);
             }
             gate.resolved(&[Cohort { step, layer: 1, misses: 2, saved: Vec::new() }]);
-            let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)));
+            let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
             gate.publish(&decided);
             step += 1;
             decided[0]
@@ -487,7 +510,7 @@ mod tests {
         // first move happens immediately (Unbounded).
         time.lock().register(1, Advance::Known(Tokens::new(1.0)));
         gate.resolved(&[Cohort { step: 1, layer: 1, misses: 1, saved: vec![catchers(&[1])] }]);
-        let decided = gate.decide(&[false, true], Some(&prices), cost, Some((1, 0.01)));
+        let decided = gate.decide(&[false, true], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
         assert!(!decided[0], "first positive gain moves the gate while unbounded");
         gate.publish(&decided);
         assert_eq!(gate.hold.expected(Tokens::new(1.0)), Held::Tokens(Tokens::new(1.0)));
@@ -496,7 +519,7 @@ mod tests {
         // point saving = 1.0 ms (gain 0.9 ms/token), hold = 2 tokens -> 1.8 ms < 10 ms break -> does NOT move yet.
         time.lock().register(2, Advance::Known(Tokens::new(1.0)));
         gate.resolved(&[Cohort { step: 2, layer: 1, misses: 2, saved: Vec::new() }]);
-        let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)));
+        let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
         assert!(!decided[0], "gain below break over expected hold does not move the gate");
     }
 
@@ -513,7 +536,7 @@ mod tests {
         // Single bad sample: 1 miss, 0 catches (n = 1, x = 0) -> stays ON.
         time.lock().register(1, Advance::Known(Tokens::new(1.0)));
         gate.resolved(&[Cohort { step: 1, layer: 1, misses: 1, saved: Vec::new() }]);
-        let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)));
+        let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
         assert!(decided[0], "one bad sample must not disable hints");
         gate.publish(&decided);
 
@@ -523,7 +546,7 @@ mod tests {
         for step in 2..=140u64 {
             time.lock().register(step, Advance::Known(Tokens::new(1.0)));
             gate.resolved(&[Cohort { step, layer: 1, misses: 10, saved: Vec::new() }]);
-            let d = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)));
+            let d = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
             gate.publish(&d);
             if !d[0] {
                 turned_off = true;
@@ -544,8 +567,8 @@ mod tests {
 
         time.lock().register(1, Advance::Known(Tokens::new(1.0)));
         gate.resolved(&[Cohort { step: 1, layer: 1, misses: 1, saved: vec![catchers(&[1])] }]);
-        assert!(gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)))[0]);
-        assert!(!gate.decide(&[false, true], Some(&prices), cost, Some((1, 0.01)))[0], "a resolved target's hints stop");
+        assert!(gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true)[0]);
+        assert!(!gate.decide(&[false, true], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true)[0], "a resolved target's hints stop");
     }
 
     /// Before a pass is timed or the load's prices are had nothing moves:
@@ -556,8 +579,8 @@ mod tests {
         let mut gate = HintGate::new(vec![vec![1], Vec::new()], time.clone());
         time.lock().register(1, Advance::Known(Tokens::new(1.0)));
         gate.resolved(&[Cohort { step: 1, layer: 1, misses: 0, saved: Vec::new() }]);
-        assert_eq!(gate.decide(&[false, true], None, ReadAdmission::default(), Some((1, 0.01))), [true, false]);
-        assert_eq!(gate.decide(&[false, true], Some(&table()), ReadAdmission::default(), None), [true, false]);
+        assert_eq!(gate.decide(&[false, true], None, ReadAdmission::default(), Some((1, 0.01)), |_, _, _| true), [true, false]);
+        assert_eq!(gate.decide(&[false, true], Some(&table()), ReadAdmission::default(), None, |_, _, _| true), [true, false]);
     }
 
     /// A bank shrink to small capacity followed by `>= 2 * records` moves
@@ -571,18 +594,45 @@ mod tests {
 
         time.lock().register(1, Advance::Known(Tokens::new(1.0)));
         gate.resolved(&[Cohort { step: 1, layer: 1, misses: 1, saved: vec![catchers(&[1])] }]);
-        let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)));
+        let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
         gate.publish(&decided);
 
         {
             let mut times = time.lock();
-            times.resized(0, Tier::Compute, 2);
+            times.resized(0, Tier::COMPUTE, 2);
             times.register(2, Advance::Known(Tokens::new(1.0)));
             for _ in 0..6 {
-                times.moved(0, Tier::Compute);
+                times.moved(0, Tier::COMPUTE);
             }
         }
-        let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)));
+        let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| true);
         assert!(decided[0], "decide succeeds with ā intact after >= 2K moves in one step");
+    }
+
+    /// B-1: If no calibrated rank for `(target, lead)` is admitted by
+    /// `ReadAdmission`, its `(point, lower, upper)` saving is identically
+    /// `(0.0, 0.0, 0.0)` and `POLICY_HINTS` flips to `false` immediately
+    /// without waiting for Wilson upper-bound inertia.
+    #[test]
+    fn unadmitted_hint_yields_zero_saving_and_disables_policy_hints_immediately() {
+        let time = Time::new(&[vec![256]], 32);
+        let mut gate = HintGate::new(vec![vec![1], Vec::new()], time.clone());
+        let prices = table();
+        let cost = miss_cost(&time, 1e-3);
+
+        // Even with a single sample where Wilson upper bound would otherwise keep
+        // hints open, an unadmitted lead can never issue a read and saves 0.0.
+        time.lock().register(1, Advance::Known(Tokens::new(1.0)));
+        gate.resolved(&[Cohort { step: 1, layer: 1, misses: 5, saved: Vec::new() }]);
+
+        let (epoch, now) = {
+            let times = time.lock();
+            (times.bank_epoch(), times.clock.through_latest())
+        };
+        let bounds = gate.saving_bounds(0, &[false, false], cost, epoch, now, 3.78, &mut |_, _, _| false);
+        assert_eq!(bounds, Some((0.0, 0.0, 0.0)), "unadmitted hint must save identically 0");
+
+        let decided = gate.decide(&[false, false], Some(&prices), cost, Some((1, 0.01)), |_, _, _| false);
+        assert_eq!(decided, [false, false], "POLICY_HINTS flips to 0 immediately when no rank is admitted");
     }
 }

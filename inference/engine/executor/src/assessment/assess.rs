@@ -1309,6 +1309,7 @@ struct BankPathPricer<'a> {
     compute: magnitude_cost_model::FormSeconds,
     num_layers: u64,
     least_move_bytes: u64,
+    decode_rows: u64,
 }
 
 impl<'a> BankPathPricer<'a> {
@@ -1333,6 +1334,7 @@ impl<'a> BankPathPricer<'a> {
             compute,
             num_layers: context.num_layers,
             least_move_bytes: context.least_move_bytes,
+            decode_rows: crate::planning::decode_rows(limits),
         })
     }
 
@@ -1349,6 +1351,7 @@ impl<'a> BankPathPricer<'a> {
                 held,
                 crate::planning::HINT_LEADS,
                 self.num_layers,
+                self.decode_rows,
             )
             .unwrap_or(magnitude_cost_model::PathRecords::NONE);
         Ok(crate::planning::BankPaths::Priced {

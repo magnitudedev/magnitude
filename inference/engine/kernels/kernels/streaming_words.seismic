@@ -78,9 +78,18 @@ const STEP_GUESS_SHIFT(R) = STEP_GUESS_BITS * R
 # The device reads UNTIL with acquire, then FROM, then RECORD
 # (`streaming_held`), so an UNTIL it reads new carries the FROM and RECORD
 # before it.
+# - Opportunistic staging (MAP_STAGE, word 5): a 32-bit generation-stamped
+#   slot written directly by the copy engine via TransferItem::Signal once an
+#   opportunistic H2D copy into the lender's double-buffered staging ring has
+#   landed. Encoded as ((q & 0xFFFF) << 16) | (slot + 1), where 0 means
+#   unstaged. Read with acquire after `streaming_held` misses: if its tag
+#   matches (q & 0xFFFF) and its slot is nonzero, the step computes from VRAM
+#   record `slot - 1` with zero spin; otherwise it falls through immediately
+#   to `tier[e]`.
 const MAP_FROM = 0
 const MAP_UNTIL = 2
 const MAP_RECORD = 4
+const MAP_STAGE = 5
 const MAP_WORDS = 6
 
 # The tier map `tier[e]`: the host tier record holding expert e whole, or -1

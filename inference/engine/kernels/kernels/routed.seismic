@@ -2264,6 +2264,11 @@ fn resolve[M, K, E, FW, FLIGHT, P, GM, TM, RING](routes: &tensor[M, K] i32, weig
                 let mut source = -1
                 if first == i32(row * K + choice):
                     source = held(map, home + expert, q)
+                    if source < 0:
+                        let staged = u32(map[home + expert, MAP_STAGE])
+                        let slot = staged & u32(65535)
+                        if slot != u32(0) and (staged >> u32(16)) == u32(q & u64(65535)):
+                            source = i32(slot - u32(1))
                     if source < 0 and TM > 0:
                         let tiered = tier[expert]
                         if tiered >= 0:

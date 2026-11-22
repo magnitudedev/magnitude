@@ -395,14 +395,14 @@ impl Residency {
     /// meanwhile nothing new is promoted or read ahead (`Residency::tend`).
     /// A shrink waits on nothing. The ask, while it waits; none once
     /// answered, or once serving ended (whose end wakes the owner).
-    pub(super) fn resize(&mut self, asked: Asked, copier: Option<&super::promotions::Copier>) -> Option<Asked> {
+    pub(super) fn resize(&mut self, asked: Asked, copier: Option<&super::link::Copier>) -> Option<Asked> {
         // Every slot a growth joined before the ask is the directory's.
         self.join();
         self.retire();
         if let Some(copier) = copier {
-            super::promotions::carry(&mut self.core, &self.shared, copier, self.prefetch.reached());
+            self.link.settle(&mut self.core, &mut self.ledger, &self.shared, copier, self.prefetch.reached());
         }
-        self.prefetch.settle(&mut self.core.directory);
+        let _ = self.prefetch.settle(&mut self.core.directory, &mut self.ledger);
         if self.shared.life.ended().is_some() {
             return None;
         }
@@ -449,7 +449,7 @@ impl Residency {
         self.refill_tier();
         self.publish_policy();
         self.shared.write_staged();
-        self.publish_lines();
+        self.publish_lines(None);
         self.shared.telemetry.note_resized();
         Published(())
     }

@@ -103,6 +103,9 @@ pub enum CacheKind {
     /// Idle graph slots beyond the floor's, a closed prompt group's class
     /// until its pools release them.
     GraphSlots,
+    /// Auxiliary stored tables (e.g. N-gram / speculative tables) above their
+    /// floor: cheaper to drop and rebuild than resident routed experts.
+    Table,
     /// Expert bank slots above the floor.
     Bank,
     /// Retained prefixes.
@@ -210,7 +213,7 @@ impl Holding {
             Self::Committed(CommittedKind::Backing(class)) => Some(class),
             Self::Committed(_) => None,
             Self::Cache(CacheKind::Spare | CacheKind::Prefix) => Some(PoolClass::State),
-            Self::Cache(CacheKind::Bank) => Some(PoolClass::Records),
+            Self::Cache(CacheKind::Bank | CacheKind::Table) => Some(PoolClass::Records),
             Self::Cache(_) => None,
             Self::Pool(class) => Some(class),
         }
@@ -430,7 +433,7 @@ pub(super) fn size(shape: &LoadShape, need: &Need) -> u64 {
 
 impl CacheKind {
     /// In declaration order, which [`Self::index`] counts.
-    pub(super) const ALL: [Self; 6] = [Self::Spare, Self::GraphSlots, Self::Bank, Self::Prefix, Self::Drafter, Self::Vision];
+    pub(super) const ALL: [Self; 7] = [Self::Spare, Self::GraphSlots, Self::Table, Self::Bank, Self::Prefix, Self::Drafter, Self::Vision];
 
     /// Whether its holder measures what it is worth ([`Value`]): spare
     /// granules and idle graph slots are worth nothing.

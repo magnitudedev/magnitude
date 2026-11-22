@@ -667,8 +667,15 @@ impl ReadPrice {
 
     /// Whether a read ahead of `bytes` of an expert used with probability
     /// `p` is admitted with no idle compute overlap (`idle = 0`).
+    #[cfg(test)]
     pub(super) fn admits(&self, p: f64, bytes: u64) -> bool {
         self.admits_with_idle(p, bytes, 0.)
+    }
+
+    /// Whether a read ahead of `bytes` of an expert used with probability `p`
+    /// is admitted given the per-layer idle slack `((C - U * t_bw).max(0.0)) / L`.
+    pub(super) fn admits_for_layers(&self, p: f64, bytes: u64, layers: usize) -> bool {
+        self.admits_with_idle(p, bytes, self.layer_idle(layers))
     }
 
     /// Whether a read ahead of `bytes` of an expert used with probability
@@ -688,6 +695,21 @@ impl ReadPrice {
     /// Mean resident compute seconds per decode pass (`Terms::compute`).
     pub(super) fn compute(&self) -> f64 {
         self.admission.terms.compute
+    }
+
+    /// Whether the drive is the binding resource (`ReadAdmission::binds`).
+    pub(super) fn binds(&self) -> bool {
+        self.admission.binds()
+    }
+
+    /// Per-layer idle drive slack `((C - U * t_bw).max(0.0)) / L`.
+    pub(super) fn layer_idle(&self, layers: usize) -> f64 {
+        self.admission.layer_idle(layers)
+    }
+
+    /// Per-step speculative prefetch byte budget `(C - U * t_bw).max(0.0) * P_peak`.
+    pub(super) fn prefetch_byte_budget(&self) -> u64 {
+        self.admission.prefetch_byte_budget()
     }
 
     /// Pipelined marginal bandwidth time `t_bw = b / P_peak` of an expert of
@@ -865,6 +887,10 @@ struct Costs {
     /// timed: the seconds they held the link and the records they read
     /// ([`Telemetry::moved`]), which the next pass counts.
     moved: (f64, f64),
+    /// Opportunistic link staging transfers completed since the last decode
+    /// pass was timed: tracked separately from permanent `moved` so
+    /// `POLICY_LINK_BUSY_NS` and promotion earning are never polluted.
+    staged_link: (f64, f64),
     /// The decode passes as measured ([`Passes`]).
     passes: Passes,
     /// The experts each streamed layer's exact row chose at its sequence's
@@ -1355,6 +1381,7 @@ impl Telemetry {
                     spent_seen: AheadUse::default(),
                     used_ahead: (0, 0),
                     moved: (0., 0.),
+                    staged_link: (0., 0.),
                     passes: Passes::new(horizon.clone()),
                     recent: std::collections::VecDeque::new(),
                     hints_gate: HintGate::new(layers.iter().map(|layer| layer.hints.clone()).collect(), horizon.clone()),
@@ -1962,6 +1989,7 @@ impl Telemetry {
                         missed + line.transfer_seconds(used_bytes as f64)
                     });
                     let moved = std::mem::take(&mut costs.moved);
+                    let staged_link = std::mem::take(&mut costs.staged_link);
                     let tiered = &decoded.2;
                     let served = priced.map(|lines| self.with_observed(costs, lines)).map(|lines| PassService::of(&lines, &decoded.1, tiered, absent, &sites, moved));
                     let PassService { link, cpu, memory, served } = served.unwrap_or_default();
@@ -1992,9 +2020,11 @@ impl Telemetry {
                             reads: (absent.iter().sum::<u64>() + used) as f64,
                             unused: cost.ahead.unused(),
                             drive,
-                            link,
+                            link: link + staged_link.0,
                             moved: moved.0,
                             moved_records: moved.1,
+                            staged_link: staged_link.0,
+                            staged_records: staged_link.1,
                             cpu,
                             memory,
                             served,
@@ -2024,6 +2054,7 @@ impl Telemetry {
                 cost.storage = self.delivered(costs);
                 costs.used_ahead = (0, 0);
                 costs.moved = (0., 0.);
+                costs.staged_link = (0., 0.);
                 costs.recent.clear();
             }
         }
@@ -2424,12 +2455,35 @@ impl Telemetry {
     /// Whether each streamed layer's hint launch runs now
     /// (`gate::HintGate::decide`), priced by `prices` (none before the
     /// load's prices are had), a miss's cost and a break's as the measured
-    /// passes say ([`Passes`]). `resolved` says which layers will be
-    /// resolved as the gate is written.
-    pub(super) fn hint_gates(&self, resolved: &[bool], prices: Option<&magnitude_cost_model::LaunchPrices>) -> Vec<bool> {
+    /// passes say ([`Passes`]). `whole` says which layers are whole in Tier 0
+    /// (need no hints); when `link_line` is `Some` (e.g. 100%-RAM discrete GPU
+    /// where `tier_complete()` holds), hints are priced on `PathKind::Link`
+    /// admission rather than `PathKind::Drive`.
+    pub(super) fn hint_gates(
+        &self,
+        whole: &[bool],
+        link_line: Option<magnitude_cost_model::ReadLine>,
+        prices: Option<&magnitude_cost_model::LaunchPrices>,
+        admitted: impl FnMut(usize, u8, magnitude_cost_model::PathAdmission) -> bool,
+    ) -> Vec<bool> {
+        let drive_line = self.line();
         let costs = &mut self.lock().costs;
-        let (miss, latest) = (costs.passes.read_admission(None), costs.passes.latest());
-        costs.hints_gate.decide(resolved, prices, miss, latest)
+        let miss = match link_line {
+            Some(line) => costs.passes.link_admission(Some(line)),
+            None => costs.passes.read_admission(drive_line),
+        };
+        let latest = costs.passes.latest();
+        costs.hints_gate.decide(whole, prices, miss, latest, admitted)
+    }
+
+    /// The drive's measured read line, if available.
+    pub(super) fn drive_line(&self) -> Option<magnitude_cost_model::ReadLine> {
+        self.line()
+    }
+
+    /// Link-path admission pricer (`PathKind::Link`) over the measured passes.
+    pub(super) fn link_admission(&self, link_line: Option<magnitude_cost_model::ReadLine>) -> magnitude_cost_model::PathAdmission {
+        self.lock().costs.passes.link_admission(link_line)
     }
 
     /// Residency's write of `hints` took effect: in effect from now.
@@ -2443,6 +2497,16 @@ impl Telemetry {
         let moved = &mut self.lock().costs.moved;
         moved.0 += link;
         moved.1 += records as f64;
+    }
+
+    /// Opportunistic link staging transfers completed: `records` records whose
+    /// DMA copies held the link `link` seconds, tracked separately from
+    /// permanent `moved` so `POLICY_LINK_BUSY_NS` and promotion earning are
+    /// never polluted.
+    pub(super) fn staged_link(&self, link: f64, records: usize) {
+        let staged = &mut self.lock().costs.staged_link;
+        staged.0 += link;
+        staged.1 += records as f64;
     }
 
     /// The shares of the decode's time a promotion's copy runs beside, as

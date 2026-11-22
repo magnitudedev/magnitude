@@ -135,7 +135,7 @@ pub fn replay(
         if recency == Recency::Reuse {
             let mut times = directory.time().lock();
             for _ in &absent {
-                times.moved(group, crate::experts::horizon::Tier::Compute);
+                times.moved(group, crate::experts::horizon::Tier::COMPUTE);
             }
         }
     }

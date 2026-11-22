@@ -58,6 +58,7 @@
 //! reference body against [`ExpertLines::serve`].
 
 use crate::lines::{FileLine, ReadLine, RecordLine};
+use crate::terms::DomainBudget;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -293,6 +294,21 @@ impl CpuLines {
             Ok(RowLine { one: ns(expert)?, row })
         };
         Ok(Self { expert: line(&samples[1..])?, handshake: ns(handshake)? })
+    }
+
+    /// Scale the weight-read-dominated 1-row CPU expert cost (`expert.one`) by
+    /// `1 / (1 - budget.load())` to reflect live shared-domain bandwidth
+    /// contention (active DMA + active NVMe landing bytes vs Host DDR5),
+    /// leaving `expert.row` (additional rows amortized over already-fetched
+    /// weights) and `handshake` untouched.
+    pub fn with_domain_budget(self, budget: DomainBudget) -> Self {
+        let share = budget.load();
+        if share <= 0.0 {
+            return self;
+        }
+        let factor = 1.0 / (1.0 - share);
+        let one = Nanoseconds::saturating(self.expert.one.get() * factor * 1e-9);
+        Self { expert: RowLine { one, ..self.expert }, handshake: self.handshake }
     }
 }
 

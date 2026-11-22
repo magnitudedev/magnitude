@@ -134,6 +134,12 @@ impl NativeGraphPool {
         Ok(())
     }
 
+    /// Whether the pool already holds at least `slots` allocated activations
+    /// and output slots (so re-holding requires zero new allocations).
+    pub(crate) fn has_allocated(&self, slots: GraphSlots) -> bool {
+        self.allocated.activations >= slots.activations && self.allocated.output >= slots.output
+    }
+
     /// Hold `slots`' class, which [`Self::grow`] allocated: its slots are
     /// kept until Reclaim releases the class.
     pub(crate) fn hold(&mut self, slots: GraphSlots) {

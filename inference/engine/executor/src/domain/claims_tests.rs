@@ -80,30 +80,42 @@ use crate::memory::ledger::{CacheKind, Holding};
 /// A group opening where room allows claims its class as it opens (design
 /// §2: an optional committed claim, never reserved ahead): a place for
 /// each of its chunks, whatever their rows, at most the three its pass
-/// holds, committed on the ledger; and its close frees its places, its
-/// claim turning into the idle slots' cache, which the next group's class
-/// takes up again.
+/// holds, committed on the ledger; its close keeps both its graph slots and
+/// warm group buffers in `IdleClass` (`CacheKind::GraphSlots`) so the next
+/// group reuses them in place with zero alloc/free thrash until real memory
+/// pressure reclaims them.
 #[test]
 fn a_group_claims_its_places_as_it_opens_and_frees_them_as_it_closes() {
     for backend in bank_backends() {
         let (mut domain, _bindings) = banked_chain(backend, 4, 3);
+        let mut high_water_idle = 0u64;
         for (planned, places) in [(0, 1), (1, 2), (2, 3), (5, 3)] {
             let (held, claims) = opened(&mut domain, planned);
             assert_eq!(held, places, "{backend:?}: {planned} chunks behind the first");
             assert_eq!(!claims.is_empty(), places > 1, "{backend:?}: {planned} chunks behind: {claims:?}");
             assert!(claims.iter().all(|bytes| *bytes > 0), "{backend:?}: {claims:?}");
+            let total_claims: u64 = claims.iter().sum();
             domain.close_group().unwrap();
-            assert_eq!(domain.group_places().get(), 1, "{backend:?}: the close frees the group's places");
-            assert!(committed_of(&domain, crate::memory::ledger::CommittedKind::GroupClass).is_empty(), "{backend:?}: and its claim");
-            // What the pools keep idles as cache until they release it; the
-            // group's buffers went back at the close.
-            let buffers = crate::domain::ProgramFamily::group_demand(&domain.family, places).unwrap().checked_bytes().unwrap();
-            let expected = match places > 1 {
-                true => claims.iter().sum::<u64>() - buffers,
-                false => 0,
-            };
-            assert_eq!(idle_cache(&domain), expected, "{backend:?}: the class's idle slots as cache");
+            assert_eq!(domain.group_places().get(), 1, "{backend:?}: the close frees the group's active places");
+            assert!(committed_of(&domain, crate::memory::ledger::CommittedKind::GroupClass).is_empty(), "{backend:?}: and its committed claim");
+            if places > 1 {
+                high_water_idle = high_water_idle.max(total_claims);
+                assert_eq!(idle_cache(&domain), high_water_idle, "{backend:?}: the whole warm class idles as GraphSlots cache");
+            } else {
+                assert_eq!(idle_cache(&domain), high_water_idle, "{backend:?}");
+            }
         }
+        // Reopening with <= held places reuses the warm class with zero new
+        // device allocations (no alloc/free thrash across prefill/decode turns).
+        let allocated_before = domain.resources.ledgers().device().estimate().allocated();
+        let (held, _) = opened(&mut domain, 2);
+        assert_eq!(held, 3, "{backend:?}: warm class reused at full width");
+        assert_eq!(
+            domain.resources.ledgers().device().estimate().allocated(),
+            allocated_before,
+            "{backend:?}: reopening warm class allocates 0 new bytes"
+        );
+        domain.close_group().unwrap();
     }
 }
 
@@ -577,7 +589,7 @@ fn partial_group_class_refusal_idles_allocated_claims_as_graph_slots() {
         claims.iter_mut().for_each(crate::memory::ledger::Claim::fit_allocated);
         let allocated: Vec<_> = claims.into_iter().filter(|claim| claim.bytes() > 0).collect();
         assert_eq!(allocated.len(), 1, "zero-byte unallocated claim drops without idling");
-        idle_class.idle(allocated);
+        idle_class.idle(None, allocated);
     });
     let est = ledger.estimate();
     assert_eq!(est.cache_of(CacheKind::GraphSlots), 32 * MIB, "partially allocated slots idle as GraphSlots cache");
@@ -590,4 +602,71 @@ fn partial_group_class_refusal_idles_allocated_claims_as_graph_slots() {
     });
     drop(released);
     assert_eq!(ledger.estimate().cache_of(CacheKind::GraphSlots), 0);
+}
+
+/// When the elastic bank holds slots above its floor and free VRAM alone cannot
+/// cover a merged prompt group's `class_demand`, `open_group` /
+/// `claim_group_class` synchronously reclaims elastic bank slabs back to the
+/// OS/driver to preserve merged `group_places` instead of collapsing to `1`,
+/// and subsequent bank growth (`PoolClass::Records`) never cannibalizes warm
+/// `CacheKind::GraphSlots`.
+#[test]
+fn open_group_reclaims_elastic_bank_and_bank_growth_preserves_warm_graph_slots() {
+    use crate::domain::ProgramFamily;
+    use crate::memory::ledger::{CacheKind, CommittedKind, PoolClass};
+
+    for backend in bank_backends() {
+        let (mut domain, _bindings) = banked_chain(backend, 4, 3);
+        let ledger = domain.resources.ledgers().device().clone();
+        let device = domain.domain.device().clone();
+        let demand = super::class_demand(&domain.execution, &mut domain.resources, &domain.family, &device, 3).unwrap();
+        let (on_device, _) = domain.resources.ledgers().placed(&device, demand);
+        assert!(on_device > 0, "{backend:?}: 3-place class requires device bytes");
+
+        let slots_before = domain.family.expert_bank().expect("banked fixture").slots();
+        let bank_cache_before = ledger.estimate().cache_of(CacheKind::Bank);
+        assert!(slots_before > 1 && bank_cache_before > 0, "{backend:?}: bank starts above floor");
+
+        // Pin all free room so `open_group` MUST synchronously reclaim from the
+        // elastic bank's `CacheKind::Bank` slabs to preserve `places == 3`.
+        let free_now = ledger.estimate().free();
+        let _pin = if free_now > 0 {
+            Some(
+                ledger
+                    .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Scratch, free_now))
+                    .expect("pin free room"),
+            )
+        } else {
+            None
+        };
+        assert!(
+            ledger.estimate().free() < on_device,
+            "{backend:?}: free room ({}) must be below class_demand ({on_device})",
+            ledger.estimate().free()
+        );
+
+        let (places, claims) = opened(&mut domain, 2);
+        assert_eq!(places, 3, "{backend:?}: open_group reclaimed elastic bank slots instead of collapsing to 1");
+        assert!(!claims.is_empty(), "{backend:?}");
+        let slots_after = domain.family.expert_bank().expect("banked fixture").slots();
+        assert!(
+            slots_after < slots_before,
+            "{backend:?}: elastic bank slots must shrink synchronously ({slots_before} -> {slots_after})"
+        );
+
+        // Closing the group keeps the warm class in `CacheKind::GraphSlots`;
+        // a subsequent elastic bank growth (`PoolClass::Records`) must NEVER
+        // cannibalize `CacheKind::GraphSlots`.
+        domain.close_group().unwrap();
+        let warm_idle = idle_cache(&domain);
+        assert!(warm_idle > 0, "{backend:?}: warm class idles as GraphSlots");
+        let _ = ledger.change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, warm_idle));
+        assert!(
+            !domain.idle_class.taken(),
+            "{backend:?}: bank growth must never cannibalize warm GraphSlots"
+        );
+        assert_eq!(idle_cache(&domain), warm_idle, "{backend:?}: warm GraphSlots remain intact");
+
+        drop(_pin);
+    }
 }

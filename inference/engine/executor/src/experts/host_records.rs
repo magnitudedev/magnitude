@@ -1698,13 +1698,32 @@ impl HostRecords {
         scratch_group: ScratchGroup,
         rank: impl Rank<K>,
         may_evict: bool,
+        copy: Option<&mut dyn FnMut(u32, u32)>,
+    ) -> bool {
+        self.lease_records(scratch_group, None, rank, may_evict, copy)
+    }
+
+    /// Grant scratch group `scratch_group` its lease of `target_records` (or
+    /// all `0..self.lent` when `None`), relocating hot kept experts out of the
+    /// target records into `self.lent..` before claiming them and leaving all
+    /// unrequested records in `0..self.lent` resident and untouched.
+    pub fn lease_records<K: Ord + Copy>(
+        &mut self,
+        scratch_group: ScratchGroup,
+        target_records: Option<&[u32]>,
+        rank: impl Rank<K>,
+        may_evict: bool,
         mut copy: Option<&mut dyn FnMut(u32, u32)>,
     ) -> bool {
-        if self.leased() {
+        if self.leased_records(target_records) {
             return true;
         }
         let mut kept_in_lent = Vec::new();
-        for record in 0..self.lent {
+        let records: Vec<u32> = match target_records {
+            Some(subset) => subset.iter().copied().filter(|&r| r < self.lent).collect(),
+            None => (0..self.lent).collect(),
+        };
+        for record in records {
             match self.records[record as usize] {
                 Host::Claimed => {}
                 Host::Ready => self.set(record, Host::Claimed),
@@ -1773,13 +1792,31 @@ impl HostRecords {
                 self.set(record, Host::Claimed);
             }
         }
-        self.leased()
+        self.leased_records(target_records)
     }
 
     /// Whether the prompt group holds every lent record claimed: its whole
     /// lease. True where nothing is lent.
     pub fn leased(&self) -> bool {
         self.claimed == self.lent as usize
+    }
+
+    /// Whether every record in `target_records` (or all `0..self.lent` when
+    /// `None`) is currently `Host::Claimed`.
+    pub fn leased_records(&self, target_records: Option<&[u32]>) -> bool {
+        match target_records {
+            Some(subset) => subset.iter().all(|&r| r >= self.lent || self.is_claimed(r)),
+            None => self.leased(),
+        }
+    }
+
+    /// The kept expert currently held in `record`, if any (used to compute the
+    /// fixed-point closure of a demand-derived partial prompt lease).
+    pub fn kept_at(&self, record: u32) -> Option<Staged> {
+        match self.records.get(record as usize) {
+            Some(Host::Kept(Whole { staged, .. })) => Some(*staged),
+            _ => None,
+        }
     }
 
     /// Whether the prompt group's lease holds `record` claimed.
@@ -2882,5 +2919,47 @@ mod tests {
         let victims = tier.refill_victims(|_, _| 10u64, false);
         assert_eq!(victims.len(), 1);
         assert!(victims[0].0 < 2, "tied victim chosen from 0..lent, got record {}", victims[0].0);
+    }
+
+    /// A demand-derived partial lease (`lease_records(Some(&subset))`) claims
+    /// ONLY the requested records in `0..self.lent`, leaving all other records
+    /// in `0..self.lent` `Host::Kept` and mapped, and `return_lease()` returns
+    /// only the claimed subset to `Host::Ready` without disturbing resident
+    /// experts in the unrequested lent records.
+    #[test]
+    fn partial_lease_claims_only_needed_records_and_keeps_rest_resident() {
+        let steps = Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
+        steps.begin_through(20);
+        let group_start = steps.begin_group(2, None);
+        let scratch_group = ScratchGroup::at(group_start, 2);
+        // 16 records total, all 16 holding resident mapped experts, bottom 12 lent (`0..12`).
+        let (mut tier, maps) = mapped_on(steps.clone(), 16, 1, &[(0, EXPERTS)], Resolution::BeforeStamp);
+        let Maps::Stamped(views) = maps else { unreachable!() };
+        for r in 0..16u32 {
+            assert_eq!(tier.land((0, r as usize)), r);
+        }
+        tier.lent = 12;
+        // Only 2 lent records (`0` and `5`) are needed for the prompt group.
+        let subset = [0u32, 5u32];
+        assert!(tier.lease_records(scratch_group, Some(&subset), |_, _| 0u64, false, None));
+        assert!(tier.leased_records(Some(&subset)), "requested subset is fully leased");
+        assert!(!tier.leased(), "full 0..lent lease was not taken");
+        assert_eq!(tier.claimed(), 2, "only the 2 requested records are claimed");
+        assert!(tier.is_claimed(0) && tier.is_claimed(5));
+        assert_eq!(tier.kept_record((0, 0)), None);
+        assert_eq!(tier.kept_record((0, 5)), None);
+        // All other 10 records in `0..12` remain resident and mapped for the prompt group!
+        for r in (0..12u32).filter(|r| !subset.contains(r)) {
+            assert!(!tier.is_claimed(r), "unrequested lent record {r} must not be claimed");
+            assert_eq!(tier.kept_record((0, r as usize)), Some(r), "expert {r} remains resident in record {r}");
+            assert_eq!(views[0].resolve(r as usize, group_start), Some(r as usize), "expert {r} stays mapped for the prompt group");
+        }
+        // Returning the lease frees only the 2 claimed records and leaves the 10 resident experts intact.
+        tier.return_lease();
+        assert_eq!(tier.claimed(), 0);
+        assert_eq!(tier.ready(), 2);
+        for r in (0..12u32).filter(|r| !subset.contains(r)) {
+            assert_eq!(tier.kept_record((0, r as usize)), Some(r), "expert {r} still resident after return_lease");
+        }
     }
 }

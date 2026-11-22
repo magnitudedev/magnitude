@@ -1044,7 +1044,7 @@ fn a_resident_prompt_groups_reads_reach_the_stack() {
         let state = residency::lock(&harness.watcher.state);
         let reuse = state.core.directory.reuse_now();
         assert!(reuse.has_read(0) && reuse.has_read(1), "both layers logged the prompt union");
-        let rank = |layer: usize, expert: usize| reuse.rank(layer, expert, Tier::Compute, Reader::Move, None);
+        let rank = |layer: usize, expert: usize| reuse.rank(layer, expert, Tier::COMPUTE, Reader::Move, None);
         assert!(rank(0, 1) > rank(0, 4) && rank(0, 4) > rank(0, 6), "layer 0 ranked both places' counts above unrouted experts");
         assert!(rank(1, 6) > rank(1, 1), "layer 1 ranked only what it grouped");
     }

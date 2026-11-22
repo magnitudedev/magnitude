@@ -2681,3 +2681,33 @@ fn over_budget_short_saturates_available_and_preserves_full_shortfall() {
     assert_eq!(clamped.available, 0, "available >= required is clamped to 0 by construction");
     assert_eq!(clamped.lacks(), REQ);
 }
+
+/// Ordered reclaim priority: `CacheKind::Table` (e.g. N-gram lookup tables)
+/// reclaims synchronously BEFORE `CacheKind::Bank` (resident experts) in both
+/// unit claims (`open_group` / `claim_units`) and general claims, leaving the
+/// expert bank untouched whenever `Table` covers the deficit.
+#[test]
+fn table_cache_reclaims_synchronously_before_bank_in_claim_and_units() {
+    let (_scope, ledger, _pool) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 40 * GB);
+    let bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("bank fits");
+    let table = ledger.cached(CacheKind::Table, 4 * GB).expect("table fits");
+    read(&ledger, &mut clock, 64 * GB, 0, None);
+
+    // 1. Unit claim (`open_group` / `claim_units`) needing 2 GB reclaims Table
+    //    first, leaving Bank completely untouched (preserving `whole`).
+    let unit = NonZeroU64::new(GB).unwrap();
+    let (group_class, units) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::GroupClass, unit, 2));
+    assert_eq!(units, 2);
+    assert_eq!(table.bytes(), 2 * GB, "Table yields first to unit claim");
+    assert_eq!(bank.bytes(), 20 * GB, "Bank is untouched when Table covers the deficit");
+
+    // 2. A further general claim needing 3 GB drains the remaining 2 GB of
+    //    Table first, then takes only the 1 GB remainder from Bank.
+    let _extra = held(&ledger, 3 * GB).expect("Table + Bank cover 3 GB");
+    assert_eq!(table.bytes(), 0, "Table drains completely before Bank");
+    assert_eq!(bank.bytes(), 19 * GB, "Bank yields only the 1 GB remainder past Table");
+    drop(group_class);
+}

@@ -655,8 +655,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(Yielded::Pending);
         }
         if self.idle_class.taken() {
-            // The slots' cache goes with their release, freed as it ends;
-            // with no slot idling any more, their cache is let go at once.
+            // Release warm group buffers first (between flights) before
+            // releasing the idle graph slots on the release thread; with no
+            // slot idling any more, their cache is let go at once.
+            if self.idle_class.held_places().is_some() {
+                let Some(quiet) = self.quiet() else {
+                    return Ok(Yielded::Pending);
+                };
+                let changes = self.resources.ledgers().changes().clone();
+                changes.change(|_| self.family.release_group(quiet).map_err(DomainError::invariant))?;
+            }
             return Ok(match self.resources.release_idle_slots(self.idle_class.release(), wake) {
                 true => Yielded::Pending,
                 false => Yielded::Released { released: 0, returned: 0 },

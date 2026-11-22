@@ -97,11 +97,11 @@
 mod core;
 mod decode;
 mod gate;
+mod link;
 mod liveness;
 mod parks;
 mod passes;
 mod prefetch;
-mod promotions;
 mod requests;
 mod residency;
 mod resize;
@@ -117,7 +117,7 @@ pub(in crate::experts) use self::core::{
 };
 pub(crate) use parks::{ParkKind, ParkSite, Parks};
 pub(crate) use passes::{DEPTHS, Measured};
-pub(in crate::experts) use promotions::Copier;
+pub(in crate::experts) use link::Copier;
 pub(crate) use resize::{Candidates, Evicted, Evicting, Join};
 pub(crate) use steps::{AheadOf, DecodeRow, ExpertStep, ScratchGroup, Recording, Step, StepFailure, StepRoute, low_word};
 pub use routes::{RecordedRoutes, RoutedStep};
@@ -138,8 +138,8 @@ use super::directory::{Directory, HostTier};
 use super::source::ExpertSource;
 use magnitude_cost_model::ExpertLines;
 use liveness::Life;
+use link::LinkMover;
 use prefetch::Prefetch;
-use promotions::Promotions;
 use requests::Requests;
 use residency::Residency;
 use resize::{Joins, ResizeHandoff};
@@ -467,6 +467,12 @@ impl Shared {
     /// names its rows published drop, and their unbegun reads cancel.
     pub fn closed(&self, request: crate::operation::RequestId) {
         self.tell(crate::experts::interest::Told::Closed(request));
+    }
+
+    /// An MTP head draft launched after a verify step completed: the drive is
+    /// idle for `estimated_seconds` until the next verify step begins.
+    pub fn draft_window(&self, estimated_seconds: f64) {
+        self.tell(crate::experts::interest::Told::DraftWindow { estimated_seconds });
     }
 
     /// When the host reads a step's request: at a park where parks are
@@ -916,17 +922,21 @@ impl Watcher {
         let ranking = core.directory.ranking();
         let groups = core.directory.layer_groups();
         let ranks = core.extents.selected;
+        let (_, stands) = crate::experts::reuse::Reuse::of(&ranking).rates();
+        let ledger = crate::experts::interest::Ledger::new(groups, ranks, time, stands);
         let mut residency = Residency {
             homes,
             shared: shared.clone(),
             core,
-            prefetch: Prefetch::new(staging, groups, ranks, time, inbox, &ranking),
+            ledger,
+            inbox,
+            prefetch: Prefetch::new(staging, count),
             scratch: Scratch::new(
                 count,
                 flags,
                 Conveyor::new(layer_pools, &experts, carrier),
             ),
-            promotions: Promotions::new(),
+            link: LinkMover::new(),
             asked: None,
             opened: Instant::now(),
             complete: false,
@@ -939,7 +949,7 @@ impl Watcher {
         // No step runs yet: the open's words are written now, as every
         // later gap writes what it staged.
         shared.write_staged();
-        residency.publish_lines();
+        residency.publish_lines(None);
         let residency = Arc::new(crate::experts::yielding::Yielding::new(residency));
         // From here a thread that cannot start drops the watcher, which
         // stops and joins those that did.

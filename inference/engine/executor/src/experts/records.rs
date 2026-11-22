@@ -83,6 +83,22 @@ pub(super) enum Record {
     /// Lent to the prompt group whose first step is `from`: its scratch
     /// slots, which no step reads through the map.
     Lent { from: Step },
+    /// Idle slot reserved for the dedicated even/odd DMA staging ring
+    /// (`stage_rings`). Never `Record::Free` or `Record::Held`, so `free()`,
+    /// `evictable()`, `seed()`, `promote()`, `fill()`, and `shrink()` cannot
+    /// name it by construction.
+    StageIdle,
+    /// Taken by an opportunistic DMA staging copy of `staged` for `target_step`
+    /// in parity half `parity` (`0` = even steps, `1` = odd steps). `tier` and
+    /// `batch` are `Some` while the DMA batch is in flight and `None` once
+    /// landed (held read-only for `target_step` until `Steps::frontier() > target_step`).
+    Staging {
+        staged: Staged,
+        target_step: Step,
+        tier: Option<HostRecord>,
+        batch: Option<u64>,
+        parity: u8,
+    },
     /// A hole: the bank holds no storage for it, so nothing is placed in it
     /// until a growth backs it again.
     Absent,
@@ -176,11 +192,12 @@ pub(super) struct BankRecords {
     /// The experts a promotion or a seed takes a record for: no second
     /// placement takes one, so an expert is in one record at most.
     placing: HashSet<Staged>,
-    /// The records promotions, releases and fills take, (group, record),
-    /// in the order they were taken.
+    /// The records promotions, releases, fills and opportunistic staging take,
+    /// (group, record), in the order they were taken.
     promoting: Vec<(usize, usize)>,
     releasing: Vec<(usize, usize)>,
     filling: Vec<(usize, usize)>,
+    staging: Vec<(usize, usize)>,
     /// Whether a record was freed, or one a promotion could use was taken,
     /// since the promotions last asked ([`Self::take_changed`]).
     changed: bool,
@@ -189,6 +206,12 @@ pub(super) struct BankRecords {
     /// without a device (an offline replay) or where the host places, whose
     /// landings write the one store's.
     tier: Option<(Vec<StampedMap>, (usize, usize))>,
+    /// Per group, the dedicated even/odd double-buffered DMA staging ring
+    /// (`lent..lent + stage_slots`), completely disjoint from prompt scratch
+    /// (`0..lent`) and protected from promotions, seeds, and shrinks so
+    /// `LinkMover` stages Host-RAM misses even when `lent == 0` or on
+    /// non-lender groups. Empty (`0..0`) on unified memory or whole banks.
+    stage_rings: Vec<std::ops::Range<usize>>,
     /// Bumped as any expert comes to be held or leaves: what each layer
     /// holds changed since a reader last saw it ([`Self::holdings`]).
     holdings: u64,
@@ -197,21 +220,53 @@ pub(super) struct BankRecords {
 impl BankRecords {
     /// Groups of `records` records each, every one free, of `layers`,
     /// each (its group, its experts), none held; beside a host tier mapped
-    /// through its maps, its lender lending its lent records (`tier`).
-    pub fn new(records: &[usize], layers: &[(usize, usize)], tier: Option<(Vec<StampedMap>, (usize, usize))>) -> Self {
-        if let Some((maps, (group, count))) = &tier {
-            assert_eq!(maps.len(), layers.len(), "each layer has its map");
-            assert!(*count <= records[*group], "a group lends {count} of its {} records", records[*group]);
+    /// through its maps, its lender lending its lent records and each group
+    /// reserving its dedicated even/odd staging ring (`tier`).
+    pub fn new(
+        records: &[usize],
+        layers: &[(usize, usize)],
+        tier: Option<(Vec<StampedMap>, (usize, usize), Vec<usize>)>,
+    ) -> Self {
+        let (tier, stage_rings) = match tier {
+            Some((maps, (lender, lent), stage_slots)) => {
+                assert_eq!(maps.len(), layers.len(), "each layer has its map");
+                assert_eq!(stage_slots.len(), records.len(), "each group has its staging ring count");
+                assert!(lent <= records[lender], "a group lends {lent} of its {} records", records[lender]);
+                let rings = records
+                    .iter()
+                    .enumerate()
+                    .map(|(group, &count)| {
+                        let start = if group == lender { lent } else { 0 };
+                        let slots = stage_slots[group];
+                        assert!(slots % 2 == 0, "group {group} staging ring count {slots} must be even");
+                        assert!(
+                            start + slots <= count,
+                            "group {group} lent ({start}) + staging ({slots}) exceeds its {count} records"
+                        );
+                        start..start + slots
+                    })
+                    .collect();
+                (Some((maps, (lender, lent))), rings)
+            }
+            None => (None, vec![0..0; records.len()]),
+        };
+        let mut groups: Vec<Records> = records.iter().map(|&count| Records::new(count)).collect();
+        for (group, range) in stage_rings.iter().enumerate() {
+            for record in range.clone() {
+                groups[group].set(record, Record::StageIdle);
+            }
         }
         Self {
-            groups: records.iter().map(|&count| Records::new(count)).collect(),
+            groups,
             layers: layers.iter().map(|&(group, experts)| (group, vec![None; experts])).collect(),
             placing: HashSet::new(),
             promoting: Vec::new(),
             releasing: Vec::new(),
             filling: Vec::new(),
+            staging: Vec::new(),
             changed: false,
             tier,
+            stage_rings,
             holdings: 0,
         }
     }
@@ -222,8 +277,18 @@ impl BankRecords {
     }
 
     /// The lender's bank group and its lent records, beside a host tier.
-    fn lent(&self) -> Option<(usize, usize)> {
+    pub(super) fn lent(&self) -> Option<(usize, usize)> {
         self.tier.as_ref().map(|&(_, lent)| lent)
+    }
+
+    /// Whether record `record` of group `group` is currently `Record::Free`.
+    pub(super) fn is_free(&self, group: usize, record: usize) -> bool {
+        matches!(self.groups[group].contents.get(record), Some(Record::Free))
+    }
+
+    /// Whether group `group` currently has any record leased to a prompt group.
+    pub(super) fn has_lent(&self, group: usize) -> bool {
+        self.groups[group].lent > 0
     }
 
     pub fn layers(&self) -> usize {
@@ -272,8 +337,10 @@ impl BankRecords {
     }
 
     /// The first record of group `group` a seed may take: past the lent
-    /// ones where it is the lender (`ExpertBankPlan::seeded_from`), which
-    /// a seed never takes ([`Self::fill`]).
+    /// ones where it is the lender (`ExpertBankPlan::seeded_from`), matching
+    /// the GPU `routed_seed_commit` base offset (`lent`). Staging-ring slots
+    /// are excluded from `free()`, `evictable()`, `seed()`, `promote()`, and
+    /// `shrink()` by construction via `Record::StageIdle` / `Record::Staging`.
     pub fn seeded_from(&self, group: usize) -> usize {
         self.lent().filter(|&(lender, _)| lender == group).map_or(0, |(_, records)| records)
     }
@@ -281,6 +348,18 @@ impl BankRecords {
     /// Whether record `record` of group `group` is a lent one.
     pub fn lends(&self, group: usize, record: usize) -> bool {
         self.lent().is_some_and(|(lender, records)| lender == group && record < records)
+    }
+
+    /// Whether record `record` of group `group` lies in its dedicated DMA
+    /// staging ring (`lent..lent + stage_slots`).
+    pub fn is_stage_slot(&self, group: usize, record: usize) -> bool {
+        self.stage_rings.get(group).is_some_and(|range| range.contains(&record))
+    }
+
+    /// The number of slots in each parity half (`even` or `odd`) of group
+    /// `group`'s dedicated DMA staging ring (`0` when disabled).
+    pub fn stage_ring_half(&self, group: usize) -> usize {
+        self.stage_rings.get(group).map_or(0, |range| range.len() / 2)
     }
 
     /// The record step `step`'s pass reads `layer`'s `expert` in, as the
@@ -342,9 +421,9 @@ impl BankRecords {
     }
 
     /// Whether a promotion or a release may take record `record` of group
-    /// `group`: any but a lent one, the scratch's.
+    /// `group`: any but a lent scratch record or a dedicated staging-ring slot.
     pub fn usable(&self, group: usize, record: usize) -> bool {
-        !self.lends(group, record)
+        !self.lends(group, record) && !self.is_stage_slot(group, record)
     }
 
     /// Group `group`'s records a promotion may take now or once released:
@@ -356,11 +435,10 @@ impl BankRecords {
     }
 
     /// Decode's capacity in group `group`: the records the bank holds
-    /// storage for, less the lent ones, which hold only the scratch (a
-    /// bank imported whole keeps homes there until a lease takes them, and
-    /// nothing is promoted into one).
+    /// storage for, less the lent ones (the scratch's) and the dedicated
+    /// DMA staging ring.
     pub fn capacity(&self, group: usize) -> usize {
-        self.groups[group].present - self.seeded_from(group)
+        self.groups[group].present - self.seeded_from(group) - self.stage_rings[group].len()
     }
 
     /// `staged` held in `record` of its group from now.
@@ -540,16 +618,137 @@ impl BankRecords {
         back
     }
 
-    /// Whether any promotion is in flight or any release draining.
+    /// Whether any promotion is in flight, any release draining, or any
+    /// opportunistic staging slot active (in-flight DMA or held for an
+    /// unretired step).
     pub fn moving(&self) -> bool {
-        !self.promoting.is_empty() || !self.releasing.is_empty()
+        !self.promoting.is_empty() || !self.releasing.is_empty() || !self.staging.is_empty()
     }
 
-    /// The promotions in flight and the releases draining, for the
-    /// exchange's watchdog.
+    /// The promotions in flight, releases draining, and active staging slots,
+    /// for the exchange's watchdog.
     pub fn describe(&self) -> String {
         let records = |taken: &[(usize, usize)]| taken.iter().map(|&(group, record)| self.groups[group].contents[record]).collect::<Vec<_>>();
-        format!("promotions {:?}, releases {:?}", records(&self.promoting), records(&self.releasing))
+        format!("promotions {:?}, releases {:?}, staging {:?}", records(&self.promoting), records(&self.releasing), records(&self.staging))
+    }
+
+    /// Find a free slot in `group`'s dedicated parity half for `target_step`
+    /// (`range.start..range.start + half` for even steps,
+    /// `range.start + half..range.end` for odd steps, where `half = range.len() / 2`),
+    /// completely independent of `lent == 0` and prompt scratch leases.
+    /// Enforces zero aliasing by construction: returns `None` if any slot in
+    /// that parity half still holds `Record::Staging` for a different step
+    /// `!= target_step` (until `drain_staging(frontier)` frees it once
+    /// `Steps::frontier() > prev_target`).
+    pub fn free_stage_slot(&self, group: usize, target_step: Step) -> Option<usize> {
+        let range = self.stage_rings.get(group)?;
+        let half = range.len() / 2;
+        if half == 0 {
+            return None;
+        }
+        let parity = (target_step & 1) as usize;
+        let base = range.start + parity * half;
+        let slice = &self.groups[group].contents[base..base + half];
+        if slice.iter().any(|content| matches!(content, Record::Staging { target_step: prev, .. } if *prev != target_step)) {
+            return None;
+        }
+        slice.iter().position(|&content| content == Record::StageIdle).map(|offset| base + offset)
+    }
+
+    /// Transition `StageIdle -> Staging` for an opportunistic DMA staging copy
+    /// of `staged` into `slot` of `group` for `target_step` in parity half
+    /// `parity`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage(
+        &mut self,
+        group: usize,
+        slot: usize,
+        staged: Staged,
+        target_step: Step,
+        tier: HostRecord,
+        batch: u64,
+        parity: u8,
+    ) {
+        assert!(self.is_stage_slot(group, slot), "staging slot {slot} of group {group} must be in its dedicated staging ring");
+        assert_eq!(self.groups[group].contents[slot], Record::StageIdle, "staging takes an idle staging-ring slot");
+        self.set(
+            group,
+            slot,
+            Record::Staging { staged, target_step, tier: Some(tier), batch: Some(batch), parity },
+        );
+        self.staging.push((group, slot));
+    }
+
+    /// Mark an in-flight `Record::Staging` DMA copy as landed: clears `tier`
+    /// and `batch` so the host-tier hold is released while the VRAM slot
+    /// remains `Record::Staging` (read-only for `target_step`) until
+    /// `drain_staging(frontier)` observes `frontier > target_step`.
+    pub fn staged_landed(&mut self, group: usize, slot: usize) -> (Staged, HostRecord) {
+        let Record::Staging { staged, target_step, tier: Some(tier), batch: Some(_), parity } = self.groups[group].contents[slot] else {
+            panic!("record {slot} of group {group} has no in-flight staging copy to land");
+        };
+        self.set(group, slot, Record::Staging { staged, target_step, tier: None, batch: None, parity });
+        (staged, tier)
+    }
+
+    /// Cancel or fail an in-flight `Record::Staging` copy, returning the slot
+    /// immediately to `Record::StageIdle`.
+    pub fn unstage(&mut self, group: usize, slot: usize) -> (Staged, Option<HostRecord>) {
+        let Record::Staging { staged, tier, .. } = self.groups[group].contents[slot] else {
+            panic!("record {slot} of group {group} is not staging");
+        };
+        self.staging.retain(|&taken| taken != (group, slot));
+        self.set(group, slot, Record::StageIdle);
+        (staged, tier)
+    }
+
+    /// Drain landed `Record::Staging` slots whose `target_step` has passed
+    /// `frontier` (`frontier > target_step`), returning them to `Record::StageIdle`.
+    /// Never frees a slot whose DMA batch is still in flight (`batch.is_some()`).
+    pub fn drain_staging(&mut self, frontier: Step) -> bool {
+        let (drained, kept) = std::mem::take(&mut self.staging).into_iter().partition::<Vec<_>, _>(|&(group, record)| {
+            let Record::Staging { target_step, batch, .. } = self.groups[group].contents[record] else {
+                panic!("record {record} of group {group} is listed staging");
+            };
+            batch.is_none() && frontier > target_step
+        });
+        self.staging = kept;
+        for &(group, record) in &drained {
+            self.set(group, record, Record::StageIdle);
+        }
+        !drained.is_empty()
+    }
+
+    /// In-flight staging DMA batches: each `(group, slot, batch)`.
+    pub fn staging_copying(&self) -> Vec<(usize, usize, u64)> {
+        self.staging
+            .iter()
+            .filter_map(|&(group, record)| match self.groups[group].contents[record] {
+                Record::Staging { batch: Some(batch), .. } => Some((group, record, batch)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether any opportunistic staging DMA batch is currently in flight.
+    pub fn staging_in_flight(&self) -> bool {
+        self.staging
+            .iter()
+            .any(|&(group, record)| matches!(self.groups[group].contents[record], Record::Staging { batch: Some(_), .. }))
+    }
+
+    /// Active staging entry for `staged` in `group`, if any:
+    /// `(slot, target_step, batch)`.
+    pub fn staged_entry(&self, group: usize, staged: Staged) -> Option<(usize, Step, Option<u64>)> {
+        self.staging.iter().find_map(|&(g, record)| {
+            if g != group {
+                return None;
+            }
+            match self.groups[g].contents[record] {
+                Record::Staging { staged: s, target_step, batch, .. } if s == staged => Some((record, target_step, batch)),
+                _ => None,
+            }
+        })
     }
 
     /// Queued promotion `record` of group `group` copies from tier record
@@ -592,7 +791,7 @@ impl BankRecords {
                 let tier = tier.unwrap_or_else(|| panic!("record {record} of group {group} completed a promotion it never copied"));
                 self.hold(staged, record);
                 // The caller (`Directory::promoted`) feeds the tier-0 move
-                // (`Times::moved(group, Tier::Compute)`) outside the steps' lock.
+                // (`Times::moved(group, Tier::COMPUTE)`) outside the steps' lock.
                 (staged, record, tier)
             })
             .collect::<Vec<_>>();
@@ -739,8 +938,9 @@ impl BankRecords {
                     }
                     left.extend(self.vacate(group, record, scratch_group.into(), Some(exit)));
                 }
-                // Granted already, or its write-back still reads it.
-                Record::Lent { .. } | Record::Releasing { .. } => continue,
+                // Granted already, its write-back still reads it, or an
+                // opportunistic staging slot is draining past the frontier.
+                Record::Lent { .. } | Record::Releasing { .. } | Record::Staging { .. } => continue,
                 other => panic!("lent record {record} leased from {other:?}"),
             }
             self.set(group, record, Record::Lent { from: scratch_group.first() });
@@ -791,6 +991,7 @@ impl BankRecords {
         let mut evicted = Vec::new();
         for (&record, exit) in records.iter().zip(exits) {
             assert!(!self.lends(group, record), "a shrink evicts lent record {record} of group {group}");
+            assert!(!self.is_stage_slot(group, record), "a shrink evicts staging ring record {record} of group {group}");
             match self.groups[group].contents[record] {
                 Record::Free => assert!(exit.is_none(), "a free record has no exit"),
                 Record::Releasing { back: None, .. } => {
@@ -831,7 +1032,16 @@ mod tests {
         let tensor = seismic::Tensor::shared(&seismic::Charges::tally(&cpu), seismic::Element::i32(), &[EXPERTS as u64, MAP_WORDS]).unwrap();
         let map = StampedMap::new(Words::new(tensor, words, 0).unwrap());
         let view = map.view().clone();
-        (BankRecords::new(&[4], &[(0, EXPERTS)], Some((vec![map], (0, 2)))), view)
+        (BankRecords::new(&[4], &[(0, EXPERTS)], Some((vec![map], (0, 2), vec![0]))), view)
+    }
+
+    fn bank_with_staging(records: usize, lent: usize, stage_slots: usize) -> (BankRecords, MapView) {
+        let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
+        let words = EXPERTS as u64 * MAP_WORDS;
+        let tensor = seismic::Tensor::shared(&seismic::Charges::tally(&cpu), seismic::Element::i32(), &[EXPERTS as u64, MAP_WORDS]).unwrap();
+        let map = StampedMap::new(Words::new(tensor, words, 0).unwrap());
+        let view = map.view().clone();
+        (BankRecords::new(&[records], &[(0, EXPERTS)], Some((vec![map], (0, lent), vec![stage_slots]))), view)
     }
 
     fn promotion(record: u32, expert: usize) -> Promotion {
@@ -1036,5 +1246,62 @@ mod tests {
     fn growing_a_held_record_panics() {
         let (mut bank, _) = bank();
         bank.grow(0, [3]);
+    }
+
+    /// `Record::Staging` lives in a dedicated even/odd double-buffered ring in
+    /// `BankRecords` completely independent of `lent == 0`, is covered by
+    /// `moving()`, protected from shrinks and promotions, and frees slots only
+    /// once `drain_staging(frontier)` observes `frontier > target_step` and the
+    /// DMA batch has landed.
+    #[test]
+    fn record_staging_is_covered_by_moving_and_drains_past_frontier() {
+        // Dedicated staging ring with `lent == 0`: slots 0 (even) and 1 (odd),
+        // permanent bank records 2..4.
+        let (mut bank, _) = bank_with_staging(4, 0, 2);
+        assert!(!bank.moving());
+        assert_eq!(bank.stage_ring_half(0), 1);
+        assert_eq!(bank.capacity(0), 2, "staging ring slots are excluded from permanent decode capacity");
+        assert_eq!(bank.evictable(0).map(|(r, _)| r).collect::<Vec<_>>(), [2, 3], "staging ring is never evictable");
+
+        // Step 2 (even): takes slot 0 even though lent == 0.
+        assert_eq!(bank.free_stage_slot(0, 2), Some(0));
+        bank.stage(0, 0, (0, 5), 2, HostRecord(10), 42, 0);
+        assert!(bank.moving(), "in-flight staging must mark BankRecords::moving()");
+        assert!(bank.staging_in_flight());
+        assert_eq!(bank.staging_copying(), vec![(0, 0, 42)]);
+        assert_eq!(bank.staged_entry(0, (0, 5)), Some((0, 2, Some(42))));
+        // Even half is full; odd half (step 3) takes slot 1 concurrently.
+        assert_eq!(bank.free_stage_slot(0, 2), None);
+        assert_eq!(bank.free_stage_slot(0, 3), Some(1));
+        bank.stage(0, 1, (0, 6), 3, HostRecord(11), 43, 1);
+
+        // Frontier advances past step 2 while DMA is still in flight -> must NOT drain!
+        assert!(!bank.drain_staging(3));
+        assert!(bank.moving());
+
+        // DMA lands for step 2 -> tier hold released, but slot stays Staging until frontier > 2.
+        assert_eq!(bank.staged_landed(0, 0), ((0, 5), HostRecord(10)));
+        assert_eq!(bank.staged_entry(0, (0, 5)), Some((0, 2, None)));
+        assert!(!bank.drain_staging(2), "frontier == target_step must not drain");
+        assert_eq!(bank.free_stage_slot(0, 4), None, "even half blocked while step 2 is unretired");
+
+        // Frontier > 2 drains slot 0 cleanly while step 3 (in-flight) stays active.
+        assert!(bank.drain_staging(3));
+        assert_eq!(bank.free_stage_slot(0, 4), Some(0));
+        assert!(bank.moving(), "step 3 still staging");
+
+        // Cancel/unstage step 3 frees slot 1 immediately -> moving() becomes false.
+        assert_eq!(bank.unstage(0, 1), ((0, 6), Some(HostRecord(11))));
+        assert!(!bank.moving());
+        assert!(!bank.staging_in_flight());
+
+        // Disjoint from prompt scratch `0..lent`: when `lent == 2` and
+        // `stage_slots == 2`, staging uses `2..4` and prompt `lease()` takes
+        // `0..2` cleanly without colliding with active staging slots.
+        let (mut disjoint, _) = bank_with_staging(6, 2, 2);
+        assert_eq!(disjoint.free_stage_slot(0, 2), Some(2));
+        disjoint.stage(0, 2, (0, 5), 2, HostRecord(10), 99, 0);
+        assert!(disjoint.lease(ScratchGroup::at(4, 1), Vec::new()).is_empty());
+        assert!(disjoint.leased(), "prompt lease on 0..2 succeeds without colliding with staging ring 2..4");
     }
 }

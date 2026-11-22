@@ -26,6 +26,9 @@ pub(crate) struct BankCache {
     /// Synchronous reclaimers for each tier's bank cache entries, owned here
     /// (each holding only a weak reference to `ExpertBank`, so no cycle).
     reclaimers: Mutex<[Option<Arc<dyn CacheReclaimer>>; 2]>,
+    /// Synchronous reclaimers for each held auxiliary table (`BankHolding::Table`),
+    /// indexed by table index (weak refs only, so no cycle).
+    table_reclaimers: Mutex<Vec<Option<Arc<dyn CacheReclaimer>>>>,
     /// Whether the host tier's open backing was registered via [`Self::open_host`].
     /// Tracked independently of `held`, because a 0-byte backing (when the first
     /// host slots fit within the floor's landing reserve) is pruned immediately
@@ -51,11 +54,37 @@ impl Drop for BankCache {
     }
 }
 
-/// A running growth: its holding and its claim (`Ledger::backing`), which
+/// How a running growth's backing is held in the ledger until [`BankCache::settle`].
+enum GrowingBacking {
+    /// Held as `CacheKind::Bank` with its installed `Reclaim::Backed` reclaimer
+    /// from the moment growth begins so admissions (`GroupClass`, `State`,
+    /// `Measurement`) can synchronously reclaim running bank growths.
+    Cached(Cached),
+    /// Stored tables resize synchronously on the domain thread (`Reclaim::Deferred`).
+    Claim(Claim),
+}
+
+impl GrowingBacking {
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Cached(cached) => cached.bytes(),
+            Self::Claim(claim) => claim.bytes(),
+        }
+    }
+
+    fn take_claimed(&self) -> u64 {
+        match self {
+            Self::Cached(cached) => cached.take_claimed(),
+            Self::Claim(_) => 0,
+        }
+    }
+}
+
+/// A running growth: its holding and its backing (`Ledger::backing`), which
 /// holds its slots' granules as the pool backs them.
 struct Growing {
     holding: BankHolding,
-    claim: Claim,
+    backing: GrowingBacking,
 }
 
 impl BankCache {
@@ -67,6 +96,15 @@ impl BankCache {
         }
     }
 
+    /// The [`CacheKind`] representing `holding` in the single ordered reclaim
+    /// priority (`Spare < GraphSlots < Table < Bank < Prefix < Drafter < Vision`).
+    pub(crate) fn cache_kind(holding: BankHolding) -> CacheKind {
+        match holding {
+            BankHolding::Experts | BankHolding::Host => CacheKind::Bank,
+            BankHolding::Table { .. } => CacheKind::Table,
+        }
+    }
+
     /// A bank's cache on the ledgers of `changes`' scope, holding nothing.
     pub(crate) fn new(changes: Arc<Changes>) -> Self {
         Self {
@@ -75,6 +113,7 @@ impl BankCache {
             growing: Mutex::default(),
             owed: Mutex::default(),
             reclaimers: Mutex::new([None, None]),
+            table_reclaimers: Mutex::default(),
             host_opened: AtomicBool::new(false),
             changes,
         }
@@ -87,19 +126,38 @@ impl BankCache {
         self.reclaimers.lock().expect("bank reclaimers")[tier.index()] = Some(reclaimer);
     }
 
+    /// Install `reclaimer` for stored table `table` (`BankHolding::Table`) so
+    /// synchronous admission reclaim can shrink lower-priority `CacheKind::Table`
+    /// entries before evicting resident routed experts (`CacheKind::Bank`).
+    pub(crate) fn set_table_reclaimer(&self, table: usize, reclaimer: Arc<dyn CacheReclaimer>) {
+        let mut reclaimers = self.table_reclaimers.lock().expect("table reclaimers");
+        if reclaimers.len() <= table {
+            reclaimers.resize_with(table + 1, || None);
+        }
+        reclaimers[table] = Some(reclaimer);
+    }
+
     /// The [`Reclaim`] policy for a cache entry of `holding`: `Reclaim::Backed`
-    /// with the tier's installed reclaimer for `Experts`/`Host`, `Reclaim::Deferred`
-    /// for stored tables.
+    /// with the tier's installed reclaimer for `Experts`/`Host`, and the
+    /// table's installed reclaimer for `Table` (falling back to `Deferred` in
+    /// unit tests without tables).
     pub(crate) fn reclaim_for(&self, holding: BankHolding) -> Reclaim {
-        match Self::tier_of(holding) {
-            Some(tier) => {
+        match holding {
+            BankHolding::Experts | BankHolding::Host => {
+                let tier = Self::tier_of(holding).expect("Experts/Host have a BankTier");
                 let guard = self.reclaimers.lock().expect("bank reclaimers");
                 let reclaimer = guard[tier.index()]
                     .as_ref()
                     .unwrap_or_else(|| panic!("invariant violated: {tier:?} bank cache created before its reclaimer was installed"));
                 Reclaim::Backed(Arc::downgrade(reclaimer))
             }
-            None => Reclaim::Deferred,
+            BankHolding::Table { table } => {
+                let guard = self.table_reclaimers.lock().expect("table reclaimers");
+                match guard.get(table).and_then(Option::as_ref) {
+                    Some(reclaimer) => Reclaim::Backed(Arc::downgrade(reclaimer)),
+                    None => Reclaim::Deferred,
+                }
+            }
         }
     }
 
@@ -196,7 +254,9 @@ impl BankCache {
                 }
                 pruned.push(cache);
             } else {
-                cache.value(value);
+                if Self::tier_of(holding).is_some() {
+                    cache.value(value);
+                }
                 held.push((holding, cache));
             }
             pruned
@@ -204,26 +264,48 @@ impl BankCache {
         self.drop_pruned(pruned);
     }
 
-    /// Value its slots at `value` per byte (`memory::ledger::Cached::value`):
-    /// the order the ledger takes cache in.
+    /// Value its expert/host slots at `value` per byte (`memory::ledger::Cached::value`):
+    /// the order the ledger takes cache in. Auxiliary tables (`CacheKind::Table`)
+    /// stay at `Value::NONE` so they always reclaim before resident routed experts.
     pub(crate) fn value(&self, value: Value) {
         *self.value.lock().expect("bank cache value") = value;
         let pruned = {
             let mut held = self.held.lock().expect("bank cache");
             let pruned = self.prune_empty(&mut held);
-            held.iter().for_each(|(_, cached)| cached.value(value));
+            held.iter()
+                .filter(|(holding, _)| Self::tier_of(*holding).is_some())
+                .for_each(|(_, cached)| cached.value(value));
             pruned
         };
+        for running in self.growing.lock().expect("bank growth").iter() {
+            if let GrowingBacking::Cached(cached) = &running.backing {
+                cached.value(value);
+            }
+        }
         self.drop_pruned(pruned);
     }
 
     /// `claim` (`Ledger::backing`) taken for a growth of `holding`: it
     /// holds the granules the pool backs for its slots, until an advance
-    /// reports what it grew ([`Self::settle`]).
+    /// reports what it grew ([`Self::settle`]). For backed bank/host tiers,
+    /// `claim` is immediately turned into `CacheKind::Bank` with its installed
+    /// `Reclaim::Backed` reclaimer so admissions (`GroupClass`, `State`,
+    /// `Measurement`) can synchronously reclaim a running growth without
+    /// waiting for `advance()`.
     pub(crate) fn grow(&self, holding: BankHolding, claim: Claim) {
+        let backing = match Self::tier_of(holding) {
+            Some(_) => {
+                let reclaim = self.reclaim_for(holding);
+                let cached = self.changes.back(|_| claim.into_backed_cache(CacheKind::Bank, reclaim));
+                let value = *self.value.lock().expect("bank cache value");
+                cached.value(value);
+                GrowingBacking::Cached(cached)
+            }
+            None => GrowingBacking::Claim(claim),
+        };
         let mut growing = self.growing.lock().expect("bank growth");
         assert!(growing.iter().all(|running| running.holding != holding), "invariant violated: a growth of {holding:?} began beside another of it");
-        growing.push(Growing { holding, claim });
+        growing.push(Growing { holding, backing });
     }
 
     /// `holding`'s growth, where one runs, taken: its claim.
@@ -236,7 +318,7 @@ impl BankCache {
     /// nothing of it backed.
     pub(crate) fn abandon(&self, holding: BankHolding) {
         let growing = self.take(holding);
-        self.changes.change(|_| drop(growing));
+        self.changes.back(|_| drop(growing));
     }
 
     /// Whether a growth of `holding` runs.
@@ -268,9 +350,12 @@ impl BankCache {
     /// bound.
     fn settle_owed(&self, held: &[(BankHolding, Cached)], holding: BankHolding, above: u64) -> u64 {
         let pieces = held.iter().filter(|(of, _)| *of == holding);
-        let claimed = pieces.clone().map(|(_, cached)| cached.take_claimed()).sum::<u64>();
+        let growing_guard = self.growing.lock().expect("bank growth");
+        let claimed = pieces.clone().map(|(_, cached)| cached.take_claimed()).sum::<u64>()
+            + growing_guard.iter().filter(|running| running.holding == holding).map(|running| running.backing.take_claimed()).sum::<u64>();
         let cached = pieces.map(|(_, cached)| cached.bytes()).sum::<u64>()
-            + self.growing.lock().expect("bank growth").iter().filter(|running| running.holding == holding).map(|running| running.claim.bytes()).sum::<u64>();
+            + growing_guard.iter().filter(|running| running.holding == holding).map(|running| running.backing.bytes()).sum::<u64>();
+        drop(growing_guard);
         let mut owed = self.owed.lock().expect("bank owed");
         let at = match owed.iter().position(|(of, _)| *of == holding) {
             Some(at) => at,
@@ -306,7 +391,7 @@ impl BankCache {
             let less = (holds - above).min(has);
             match less == has {
                 true => cut.push(held.remove(at).1),
-                false => cut.push(held[at].1.split(less, CacheKind::Bank)),
+                false => cut.push(held[at].1.split(less, Self::cache_kind(holding))),
             }
             holds -= less;
         }
@@ -327,8 +412,13 @@ impl BankCache {
             BankResized::Shrunk { .. } => {}
             BankResized::Grown { holding, .. } => {
                 if let Some(growing) = self.take(holding) {
-                    let reclaim = self.reclaim_for(holding);
-                    let cache = self.changes.back(|_| growing.claim.into_backed_cache(CacheKind::Bank, reclaim));
+                    let cache = match growing.backing {
+                        GrowingBacking::Cached(cached) => cached,
+                        GrowingBacking::Claim(claim) => {
+                            let reclaim = self.reclaim_for(holding);
+                            self.changes.back(|_| claim.into_backed_cache(Self::cache_kind(holding), reclaim))
+                        }
+                    };
                     self.hold(holding, cache);
                 }
             }

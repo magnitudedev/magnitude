@@ -339,12 +339,13 @@ impl Requests {
     }
 
     /// Whether the device's words are polled while a step runs: where kernels
-    /// wait in place, while a step runs that may ask anything (with every
-    /// layer resolved a decode step asks nothing, no miss and no hint, but a
-    /// prompt group's requests may come).
+    /// wait in place, while a step runs that may ask anything (or publish
+    /// foresight hints/front rings while any group is not whole in Tier 0,
+    /// including 100%-RAM discrete GPUs where `POLICY_RESOLVED == 1` but
+    /// `POLICY_WHOLE == 0`, or while a prompt group runs).
     fn polls(&self, residency: &Residency) -> bool {
         let steps = &self.shared.steps;
-        !self.shared.parks.kept && steps.in_flight() > 0 && (!residency.resolved() || steps.scratch_running())
+        !self.shared.parks.kept && steps.in_flight() > 0 && (!residency.all_whole() || steps.scratch_running())
     }
 
     /// One pass: the misses waiting resumed, the conveyor carried, then
@@ -479,8 +480,8 @@ impl Requests {
                     serve
                 }
             };
-            let Residency { scratch, core, prefetch, .. } = residency;
-            let (serve, carried) = scratch.carry(serve, core, prefetch, &self.shared);
+            let Residency { scratch, core, prefetch, ledger, .. } = residency;
+            let (serve, carried) = scratch.carry(serve, core, prefetch, ledger, &self.shared);
             moved |= carried;
             if let Some(serve) = serve {
                 service.pending[layer] = Some(Pending::Served(serve));

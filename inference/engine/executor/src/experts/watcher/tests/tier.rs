@@ -270,7 +270,7 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
         (0..state.core.layers.len()).map(|layer| (0..EXPERTS).filter(|&expert| directory.in_tier(layer, expert)).count()).collect::<Vec<_>>()
     };
     let claimed = std::cell::RefCell::new(Vec::new());
-    let short = |state: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::promotions::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
+    let short = |state: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::link::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
         for expert in 0..EXPERTS {
             if let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(0, expert, 0, crate::experts::host_records::Taking::Out, crate::experts::host_records::Refuses) {
                 grants.borrow_mut().push(grant);
@@ -288,7 +288,7 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
     // run, it takes the lock as the latter gives way, reads the holdings
     // and begins a step, before the hastening.
     let request = std::cell::RefCell::new(None);
-    let wait = |held: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::promotions::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
+    let wait = |held: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::link::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
         assert_ne!(kept(held), *claimed.borrow(), "the refill took no victim the tier kept");
         let (requested, shared) = (state.clone(), shared.clone());
         let records = harness.layers.iter().map(|layer| layer.4.clone()).collect::<Vec<_>>();
@@ -317,7 +317,7 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
         true
     };
     let quiet = std::cell::Cell::new(true);
-    let after = |held: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::promotions::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
+    let after = |held: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::link::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
         quiet.set(held.shared.traffic_quiet.load(std::sync::atomic::Ordering::Acquire));
         true
     };

@@ -752,7 +752,7 @@ impl Reuse {
         let (horizon, a_bar) = match self.step_horizon[group] {
             Some((at, horizon, a_bar)) if at >= step => (horizon, a_bar),
             _ => {
-                let (horizon, a_bar) = match times.horizon(group, Tier::Compute, Reader::Move) {
+                let (horizon, a_bar) = match times.horizon(group, Tier::COMPUTE, Reader::Move) {
                     Some(horizon) => (horizon, times.tokens_per_step(group).expect("ā exists wherever τ does")),
                     None => (horizon::Horizon::Unbounded, 1.0),
                 };
@@ -966,10 +966,46 @@ impl Reuse {
         self.layers[layer].latest_step().is_some()
     }
 
+    /// Group `group`'s ranked `(rank, layer, expert)` entries in ascending rank
+    /// order (highest-ranked at the end).
+    pub fn top_order(&self, group: usize) -> &[(Rank, usize, usize)] {
+        &self.order[group]
+    }
+
     /// Whether the bank is asked to hold `layer`'s `expert`: its group's
     /// most ranked, as many as its records.
     pub fn in_top(&self, layer: usize, expert: usize) -> bool {
         self.top[layer][expert]
+    }
+
+    /// Up to `limit` highest-expected-use experts across all groups matching
+    /// `accept(layer, expert)` (with positive expected uses), ordered
+    /// descending by expected uses (`Rank`).
+    pub fn top_candidates(&self, limit: usize, mut accept: impl FnMut(usize, usize) -> bool) -> Vec<(Rank, usize, usize)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut best = Vec::new();
+        for group_order in &self.order {
+            let mut taken = 0;
+            for &(rank, layer, expert) in group_order.iter().rev() {
+                if rank.expected <= Expected::ZERO {
+                    break;
+                }
+                if accept(layer, expert) {
+                    best.push((rank, layer, expert));
+                    taken += 1;
+                    if taken >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        if self.order.len() > 1 {
+            best.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            best.truncate(limit);
+        }
+        best
     }
 
     /// The reads logged so far: a want withheld at one count may earn its
@@ -1069,7 +1105,7 @@ impl Reuse {
         // `store_rank` uses for kept records, never mixing `Form::Prompt`
         // candidates against `Form::Decode` victims.
         if calibration.has_decode() {
-            let ranker = self.ranker(group, Tier::Compute, Reader::Move);
+            let ranker = self.ranker(group, Tier::COMPUTE, Reader::Move);
             return routed
                 .iter()
                 .map(|&(expert, _, last)| {
@@ -1079,7 +1115,7 @@ impl Reuse {
                 })
                 .collect();
         }
-        let (horizon, a_bar, epoch) = self.horizon_of(group, Tier::Compute, Reader::Move);
+        let (horizon, a_bar, epoch) = self.horizon_of(group, Tier::COMPUTE, Reader::Move);
         let probs_all = calibration.prompt_probs(routed, epoch, &self.history, layer);
         routed
             .iter()
@@ -1241,10 +1277,10 @@ pub(super) mod tests {
             let r = RoutedRead { sequence: step, layer: 0, experts: chosen, choices: 2 };
             reuse.read(&r, Some(Arc::new(Rows::of(2, &[0], &row))), Evidence::Decode);
         }
-        assert_eq!(time.lock().horizon(0, Tier::Compute, Reader::Observe), Some(H::Unbounded));
+        assert_eq!(time.lock().horizon(0, Tier::COMPUTE, Reader::Observe), Some(H::Unbounded));
         let rates = front_rates(&reuse.stands);
         let mut unbounded: Vec<(Rank, usize)> = (0..8)
-            .map(|e| (reuse.rank(0, e, Tier::Compute, Reader::Observe, None), e))
+            .map(|e| (reuse.rank(0, e, Tier::COMPUTE, Reader::Observe, None), e))
             .collect();
         unbounded.sort();
 
@@ -1267,7 +1303,7 @@ pub(super) mod tests {
             let probs = lead_probs(&reuse.layers[0], &reuse.history, 0, e, &rates, epoch);
             let p_inf = reuse.layers[0].history_prob(e, &reuse.history, 0);
             let expected_limit = Expected::new(p_inf, probs.iter().map(|&p| p - p_inf).sum());
-            assert_eq!(reuse.expected(0, e, Tier::Compute, Reader::Observe, None), expected_limit);
+            assert_eq!(reuse.expected(0, e, Tier::COMPUTE, Reader::Observe, None), expected_limit);
         }
     }
 
@@ -1295,14 +1331,14 @@ pub(super) mod tests {
         let time = time_for(&[4]);
         let reuse = Reuse::new(&[8], &[0], &[4], time.clone());
         // Before any decode step (Unbounded limit order):
-        let unread_cold = reuse.rank(0, 1, Tier::Compute, Reader::Move, None);
-        let unlogged_cold = reuse.rank(0, 0, Tier::Compute, Reader::Move, Some(Unlogged::at(1)));
+        let unread_cold = reuse.rank(0, 1, Tier::COMPUTE, Reader::Move, None);
+        let unlogged_cold = reuse.rank(0, 0, Tier::COMPUTE, Reader::Move, Some(Unlogged::at(1)));
         assert!(unlogged_cold > unread_cold, "unlogged before any decode step must outrank unread");
 
         // After first decode step is registered (finite Move τ), still before layer 0 logs:
         register_front(&time, 1);
-        let unread = reuse.rank(0, 1, Tier::Compute, Reader::Move, None);
-        let unlogged = reuse.rank(0, 0, Tier::Compute, Reader::Move, Some(Unlogged::at(1)));
+        let unread = reuse.rank(0, 1, Tier::COMPUTE, Reader::Move, None);
+        let unlogged = reuse.rank(0, 0, Tier::COMPUTE, Reader::Move, Some(Unlogged::at(1)));
         assert!(unlogged.expected().uses() > unread.expected().uses());
         assert!(unlogged > unread);
         assert_eq!(unlogged.last(), Some(1));
@@ -1322,9 +1358,9 @@ pub(super) mod tests {
         let check_all = |reuse: &Reuse| {
             for e in 0..8 {
                 for reader in [Reader::Move, Reader::Observe] {
-                    let exp = reuse.expected(0, e, Tier::Compute, reader, None);
+                    let exp = reuse.expected(0, e, Tier::COMPUTE, reader, None);
                     assert!(exp.uses().is_finite() && exp.sooner().is_finite());
-                    let exp_u = reuse.expected(0, e, Tier::Compute, reader, Some(Unlogged::at(10)));
+                    let exp_u = reuse.expected(0, e, Tier::COMPUTE, reader, Some(Unlogged::at(10)));
                     assert!(exp_u.uses().is_finite() && exp_u.sooner().is_finite());
                 }
             }
@@ -1341,7 +1377,7 @@ pub(super) mod tests {
         log(&mut reuse, &time, read(2, &[0, 2]));
         check_all(&reuse);
         // Resize to 1 record.
-        time.lock().resized(0, Tier::Compute, 1);
+        time.lock().resized(0, Tier::COMPUTE, 1);
         reuse.resize(0, 1);
         check_all(&reuse);
     }
@@ -1363,7 +1399,7 @@ pub(super) mod tests {
             let r = RoutedRead { sequence: step, layer: 0, experts: chosen, choices: 2 };
             reuse.read(&r, None, Evidence::Decode);
             if step % 5 == 0 {
-                time.lock().moved(0, Tier::Compute);
+                time.lock().moved(0, Tier::COMPUTE);
             }
             if step == 10 {
                 bytes_at_10 = reuse.bytes();
@@ -1442,7 +1478,7 @@ pub(super) mod tests {
         register_front(&time, 2);
         assert_eq!(time.lock().tokens_per_step(0), Some(1.0));
         for e in 0..8 {
-            let exp = reuse.expected(0, e, Tier::Compute, Reader::Move, None);
+            let exp = reuse.expected(0, e, Tier::COMPUTE, Reader::Move, None);
             assert!(exp.uses().is_finite() && exp.sooner().is_finite());
         }
     }
@@ -1455,10 +1491,10 @@ pub(super) mod tests {
         let time = time_for(&[2]);
         let mut reuse = Reuse::new(&[3], &[0], &[2], time.clone());
         assert_eq!(log(&mut reuse, &time, read(4, &[0])), [3], "a first read lies past every expert");
-        assert!((1..3).all(|expert| reuse.rank(0, 0, Tier::Compute, Reader::Move, None) > reuse.rank(0, expert, Tier::Compute, Reader::Move, None)));
-        assert_eq!(reuse.rank(0, 0, Tier::Compute, Reader::Move, Some(Unlogged::at(3))), reuse.rank(0, 0, Tier::Compute, Reader::Move, None));
-        assert!(reuse.rank(0, 2, Tier::Compute, Reader::Move, Some(Unlogged::at(7))) > reuse.rank(0, 2, Tier::Compute, Reader::Move, None));
-        assert_eq!(reuse.rank(0, 2, Tier::Compute, Reader::Move, Some(Unlogged::at(7))).last(), Some(7));
+        assert!((1..3).all(|expert| reuse.rank(0, 0, Tier::COMPUTE, Reader::Move, None) > reuse.rank(0, expert, Tier::COMPUTE, Reader::Move, None)));
+        assert_eq!(reuse.rank(0, 0, Tier::COMPUTE, Reader::Move, Some(Unlogged::at(3))), reuse.rank(0, 0, Tier::COMPUTE, Reader::Move, None));
+        assert!(reuse.rank(0, 2, Tier::COMPUTE, Reader::Move, Some(Unlogged::at(7))) > reuse.rank(0, 2, Tier::COMPUTE, Reader::Move, None));
+        assert_eq!(reuse.rank(0, 2, Tier::COMPUTE, Reader::Move, Some(Unlogged::at(7))).last(), Some(7));
         assert_eq!(reuse.last(0, 0), Some(4));
 
         let time_keyed = time_for(&[2]);
@@ -1466,7 +1502,7 @@ pub(super) mod tests {
         register_front(&time_keyed, 1);
         let rows = Rows::of(1, &[0], &[0.26, 0.25, 0.25, 0.24]);
         keyed.read(&read(1, &[0]), Some(Arc::new(rows)), Evidence::Decode);
-        assert!((1..4).all(|expert| keyed.rank(0, 0, Tier::Compute, Reader::Move, None) > keyed.rank(0, expert, Tier::Compute, Reader::Move, None)));
+        assert!((1..4).all(|expert| keyed.rank(0, 0, Tier::COMPUTE, Reader::Move, None) > keyed.rank(0, expert, Tier::COMPUTE, Reader::Move, None)));
     }
 
     /// A group's pool holds what its layers' reads are expected to use most
@@ -1482,7 +1518,7 @@ pub(super) mod tests {
             let cold = RoutedRead { sequence: step, layer: 1, experts: vec![step as usize], choices: 1 };
             reuse.read(&hot, None, Evidence::Decode);
             reuse.read(&cold, None, Evidence::Decode);
-            time.lock().moved(0, Tier::Compute);
+            time.lock().moved(0, Tier::COMPUTE);
         }
         let held = |layer: usize| (0..64).filter(|&expert| reuse.pools.pos[layer][expert] != NOT_HELD).count();
         assert_eq!((held(0), held(1)), (4, 2), "the recurring layer holds its four");
@@ -1504,7 +1540,7 @@ pub(super) mod tests {
         for step in 1..=20 {
             register_front(&time, step);
             reuse.read(&read(step, &[0]), Some(rows(1)), Evidence::Decode);
-            time.lock().moved(0, Tier::Compute);
+            time.lock().moved(0, Tier::COMPUTE);
         }
         assert!(reuse.in_top(0, 0) && reuse.in_top(0, 1), "the chosen and the foreseen");
         reuse.take_changes();
@@ -1526,11 +1562,32 @@ pub(super) mod tests {
         }
         assert_eq!((0..8).filter(|&expert| reuse.in_top(0, expert)).count(), 4);
         reuse.take_changes();
-        time.lock().resized(0, Tier::Compute, 2);
+        time.lock().resized(0, Tier::COMPUTE, 2);
         reuse.resize(0, 2);
         let top = (0..8).filter(|&expert| reuse.in_top(0, expert)).collect::<BTreeSet<_>>();
         assert_eq!(top.len(), 2);
         assert_eq!(reuse.take_changes().len(), 2, "two left");
         assert_eq!((0..8).filter(|&expert| reuse.pools.pos[0][expert] != NOT_HELD).count(), 2);
+    }
+
+    /// B-2 / B-3: `Reuse::top_candidates` returns the highest-expected-use
+    /// experts matching `accept`, in descending rank order, skipping zero-use
+    /// experts.
+    #[test]
+    fn top_candidates_orders_accepted_lacked_experts_by_expected_uses() {
+        let time = time_for(&[4]);
+        let mut reuse = Reuse::new(&[8], &[0], &[4], time.clone());
+        for step in 1..=4 {
+            log(&mut reuse, &time, read(step, &[1, 3]));
+        }
+        log(&mut reuse, &time, read(5, &[3, 5]));
+        // Expert 3 is already resident (rejected by `accept`): top 2 lacked must
+        // be the carried-over experts 5 and 1 (strictly ahead of never-seen
+        // experts' prior), in descending rank order, never returning 3.
+        let top = reuse.top_candidates(2, |_layer, expert| expert != 3);
+        let experts: Vec<usize> = top.iter().map(|&(_, _, expert)| expert).collect();
+        assert_eq!(experts, vec![5, 1], "must return top lacked experts in descending rank order: {top:?}");
+        assert!(top[0].0 >= top[1].0, "must be sorted descending by Rank: {top:?}");
+        assert!(top.iter().all(|&(rank, _, _)| rank.expected() > Expected::ZERO));
     }
 }

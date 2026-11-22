@@ -679,6 +679,10 @@ pub(in crate::experts) enum Told {
     Discarded { step: Step, request: RequestId },
     /// Request `request` closed: none of its passes will come.
     Closed(RequestId),
+    /// An MTP head draft launched after a verify step completed: the drive is
+    /// idle for `estimated_seconds` until the next verify step begins
+    /// (`Told::Began`).
+    DraftWindow { estimated_seconds: f64 },
 }
 
 /// Outcomes counted, and how many of them hit (a name's expert chosen, a
@@ -1396,6 +1400,9 @@ pub(in crate::experts) struct Ledger {
     /// rows' ([`Self::take_judged`]).
     judged: Vec<Judged>,
     accepted: Vec<Accepted>,
+    /// Active MTP head draft window (`(started, estimated_seconds)`): set on
+    /// [`Told::DraftWindow`] and cleared on [`Told::Began`].
+    draft_window: Option<(Instant, f64)>,
 }
 
 impl std::fmt::Debug for Ledger {
@@ -1435,6 +1442,7 @@ impl Ledger {
             awaiting: HashMap::new(),
             judged: Vec::new(),
             accepted: Vec::new(),
+            draft_window: None,
         }
     }
 
@@ -1450,6 +1458,38 @@ impl Ledger {
         let group = self.groups[layer];
         let epoch = self.time.lock().group_epoch(group);
         self.calibration.combined(group, combination, epoch)
+    }
+
+    /// Whether any calibrated rank `r ∈ 0..K` of an exact row's lookahead hint
+    /// at `lead` targeting `target_layer` reaches `break_even`. Unmeasured
+    /// ranks read their bound `1.0` and are admitted until calibrated.
+    pub fn hint_admitted(&mut self, target_layer: usize, lead: u8, break_even: f64) -> bool {
+        let group = self.groups[target_layer];
+        let epoch = self.epoch(target_layer);
+        let look = Look::of(Source::Lead { distance: lead, row: None });
+        (0..self.calibration.ranks).any(|rank| {
+            let combination = Combination { nearest: look, rank: rank as u8, looks: 1 };
+            self.calibration.combined(group, combination, epoch) >= break_even
+        })
+    }
+
+    /// Remaining idle drive seconds in the active MTP head draft window at
+    /// `now` (`0.0` outside a draft window or once its estimate has elapsed).
+    pub fn draft_window_remaining(&self, now: Instant) -> f64 {
+        let Some((started, estimated)) = self.draft_window else {
+            return 0.0;
+        };
+        (estimated - now.saturating_duration_since(started).as_secs_f64()).max(0.0)
+    }
+
+    /// Whether an MTP head draft window is currently active.
+    pub fn in_draft_window(&self) -> bool {
+        self.draft_window.is_some()
+    }
+
+    /// The latest decode step currently begun and not yet ended.
+    pub fn latest_active_step(&self) -> Option<Step> {
+        self.launches.keys().next_back().copied()
     }
 
     /// The host has seen step `step`'s route at `layer`.
@@ -1489,6 +1529,13 @@ impl Ledger {
             Told::Decided { step, request, verdict } => self.verdict(step, request, &verdict),
             Told::Discarded { step, request } => self.discard(step, request),
             Told::Closed(request) => self.close(request),
+            Told::DraftWindow { estimated_seconds } => {
+                assert!(
+                    estimated_seconds.is_finite() && estimated_seconds >= 0.0,
+                    "draft window duration must be finite and non-negative, got {estimated_seconds}"
+                );
+                self.draft_window = (estimated_seconds > 0.0).then(|| (Instant::now(), estimated_seconds));
+            }
         }
         Learned::default()
     }
@@ -1550,6 +1597,7 @@ impl Ledger {
     /// rows (a pass's front rows are its ahead rows, in depth order,
     /// [`crate::Rows`]), from its exact row's position.
     fn begin(&mut self, step: Step, rows: Box<[DecodeRow]>, padding: usize) {
+        self.draft_window = None;
         let mut passes: Vec<(RequestId, u64)> = Vec::new();
         let mut ahead: BTreeMap<RequestId, Awaiting> = BTreeMap::new();
         for (index, row) in rows.iter().enumerate() {
@@ -1599,6 +1647,7 @@ impl Ledger {
     /// ahead in it: each such pass awaits its verdict. Its rows name
     /// nothing ahead, so it binds no name and is bound by none.
     fn begin_grouped(&mut self, step: Step, requests: &[RequestId]) {
+        self.draft_window = None;
         for &request in requests {
             // A grouped pass's decision judges its proposals alone: the
             // truths it learns judge no front row (a request decoding in
@@ -2113,6 +2162,19 @@ impl Ledger {
         }
     }
 
+    /// Record a completed Path 0 (`LinkMover`) opportunistic DMA staging copy
+    /// for `(step, layer, expert)` so `HintGate` credits link-staged hint hits
+    /// without polluting Path 1 (`Drive`) `Spent` telemetry.
+    pub fn link_landed(&mut self, step: Step, layer: usize, expert: usize, issued: Instant, landed: Instant) {
+        self.landed_hints.entry((step, layer, expert)).or_insert((issued, landed));
+    }
+
+    /// Whether a Path 0 (`LinkMover`) opportunistic DMA staging copy landed for
+    /// `(step, layer, expert)`.
+    pub fn has_link_landed(&self, step: Step, layer: usize, expert: usize) -> bool {
+        self.landed_hints.contains_key(&(step, layer, expert))
+    }
+
     /// The read ahead of `expert` of `layer` was cancelled before any piece
     /// began.
     pub fn cancelled(&mut self, layer: usize, expert: usize) {
@@ -2170,6 +2232,9 @@ impl Ledger {
     /// interest is admitted to read is not issued, and an unbegun read of it
     /// cancels.
     pub fn act(&mut self, layer: usize, expert: usize, read: Read, admit: &impl Admit) -> Act {
+        if matches!(read, Read::Landing | Read::Held) {
+            return Act::Keep;
+        }
         let (group, epoch) = (self.groups[layer], self.epoch(layer));
         let Self { layers, calibration, reached, .. } = self;
         let class = layers[layer].get_mut(&expert).and_then(|entry| {
@@ -2198,17 +2263,31 @@ impl Ledger {
             .collect()
     }
 
-    /// What to do with each of `experts`' reads ([`Self::act`]), each
+    /// Whether `(layer, expert)` currently has any live interest in the ledger
+    /// (used for Path 1 -> Path 0 pipeline chain-through when an NVMe landing
+    /// finishes into Tier 1).
+    pub fn is_wanted(&self, layer: usize, expert: usize) -> bool {
+        self.layers
+            .get(layer)
+            .and_then(|entries| entries.get(&expert))
+            .is_some_and(|entry| entry.live().next().is_some())
+    }
+
+    /// What to do with each of `experts`' moves on `path` (`PathKind::Drive`
+    /// for NVMe -> RAM or `PathKind::Link` for RAM / peer -> VRAM), each
     /// standing as `read` says and admitted by its layer's `admit`, in the
     /// one order they are done in: cancellations first, then hastenings to
-    /// due, each freeing room or ordering a step's own wait; then the reads
-    /// short of due, repriced before issued (a queued read keeps its place
-    /// against a new one), each kind by the step that wants it, the soonest
-    /// first, then its probability of use, then its first publication. A
-    /// read ahead is ordered on its link by the same step and probability
-    /// (`seismic_io::Want`), so what is issued first, where staging is
-    /// short, is what the drive reads first.
-    pub fn schedule<A: Admit>(&mut self, experts: impl IntoIterator<Item = (usize, usize)>, mut read: impl FnMut(usize, usize) -> Read, admit: impl Fn(usize) -> A) -> Vec<Scheduled> {
+    /// due, then reprices before issues. On `PathKind::Drive`, expected reads
+    /// order by `(step, -p, first)`; on `PathKind::Link`, expected staging
+    /// moves order by `(step, layer, -p, first)` so early layers race ahead of
+    /// layer-by-layer compute.
+    pub fn schedule_for_path<A: Admit>(
+        &mut self,
+        path: magnitude_cost_model::PathKind,
+        experts: impl IntoIterator<Item = (usize, usize)>,
+        mut read: impl FnMut(usize, usize) -> Read,
+        admit: impl Fn(usize) -> A,
+    ) -> Vec<Scheduled> {
         let mut candidates: Vec<(usize, usize, Read, u8, Step, f64, u64)> = experts
             .into_iter()
             .map(|(layer, expert)| {
@@ -2224,8 +2303,8 @@ impl Ledger {
                     },
                     None => (Step::MAX, 0., u64::MAX),
                 };
-                // Evaluate unbegun queued reads ahead before new candidates so
-                // already-queued reads keep their idle-compute slot without
+                // Evaluate unbegun queued moves ahead before new candidates so
+                // already-queued moves keep their idle-compute slot without
                 // oscillating, each group ordered by `(step, -p, first)`.
                 let tier = match state {
                     Read::Reading { begun: false } => 0u8,
@@ -2261,21 +2340,28 @@ impl Ledger {
             .collect::<Vec<_>>();
         scheduled.sort_by(|left, right| {
             let rank = |scheduled: &Scheduled| match scheduled.act {
-                Act::Cancel => (0u8, 0, 0.),
-                Act::Reprice(Class::Due) => (1, 0, 0.),
-                Act::Reprice(Class::Expected { step, p }) => (2, step, -p),
-                Act::Issue(Class::Expected { step, p }) => (3, step, -p),
-                Act::Issue(Class::Due) | Act::Keep => (4, 0, 0.),
+                Act::Cancel => (0u8, 0, 0, 0.),
+                Act::Reprice(Class::Due) => (1, 0, 0, 0.),
+                Act::Reprice(Class::Expected { step, p }) => (2, step, if path == magnitude_cost_model::PathKind::Link { scheduled.layer } else { 0 }, -p),
+                Act::Issue(Class::Expected { step, p }) => (3, step, if path == magnitude_cost_model::PathKind::Link { scheduled.layer } else { 0 }, -p),
+                Act::Issue(Class::Due) | Act::Keep => (4, 0, 0, 0.),
             };
             let (left_rank, right_rank) = (rank(left), rank(right));
             left_rank
                 .0
                 .cmp(&right_rank.0)
                 .then(left_rank.1.cmp(&right_rank.1))
-                .then(left_rank.2.total_cmp(&right_rank.2))
+                .then(left_rank.2.cmp(&right_rank.2))
+                .then(left_rank.3.total_cmp(&right_rank.3))
                 .then(left.first.cmp(&right.first))
         });
         scheduled
+    }
+
+    /// Drive-path scheduling (`PathKind::Drive`), delegating to
+    /// [`Self::schedule_for_path`].
+    pub fn schedule<A: Admit>(&mut self, experts: impl IntoIterator<Item = (usize, usize)>, read: impl FnMut(usize, usize) -> Read, admit: impl Fn(usize) -> A) -> Vec<Scheduled> {
+        self.schedule_for_path(magnitude_cost_model::PathKind::Drive, experts, read, admit)
     }
 
     #[cfg(test)]
@@ -2407,8 +2493,8 @@ mod tests {
         for step in 2..=11 {
             let mut times = time.lock();
             times.register(step, Advance::Known(Tokens::new(1.0)));
-            times.moved(0, Tier::Compute);
-            times.moved(0, Tier::Compute);
+            times.moved(0, Tier::COMPUTE);
+            times.moved(0, Tier::COMPUTE);
         }
         assert!(time.lock().bank_epoch() >= 10);
         let (rate, age) = stands.judged(2, Form::Front).expect("never returns to unjudged");
@@ -2453,8 +2539,8 @@ mod tests {
                 {
                     let mut times = time.lock();
                     times.register(step, Advance::Known(Tokens::new(1.0)));
-                    times.resized(0, Tier::Compute, 2);
-                    times.moved(0, Tier::Compute);
+                    times.resized(0, Tier::COMPUTE, 2);
+                    times.moved(0, Tier::COMPUTE);
                 }
                 stands.count(1, Form::Front, step.is_multiple_of(2));
                 stands.count(1, Form::Verify, step.is_multiple_of(3));
@@ -3298,5 +3384,36 @@ mod tests {
         assert_eq!(learned.cohorts.len(), 1);
         assert_eq!(learned.cohorts[0].saved.len(), 1, "preserved landing duration credits lead 1");
         assert_eq!(learned.cohorts[0].exclusive(1), 1);
+    }
+
+    /// B-1: `Ledger::hint_admitted` checks whether any rank `0..K` for
+    /// `(target_layer, lead)` has calibrated probability `>= break_even`.
+    #[test]
+    fn hint_admitted_reflects_calibrated_ranks_against_break_even() {
+        let time = Time::new(&[vec![64]], 8);
+        let stands = Stands::new(time.clone());
+        let mut ledger = Ledger::new(vec![0], 2, time, stands);
+        // Unmeasured ranks read their bound 1.0 -> admitted even at break_even = 0.85.
+        assert!(ledger.hint_admitted(0, 1, 0.85));
+
+        // Calibrate both ranks 0 and 1 at lead 1 to p = 0.25 (1 hit in 4).
+        let t0 = now();
+        for step in 1..=4u64 {
+            for rank in 0..2u8 {
+                let mut n = name(LEAD, step);
+                n.rank = rank;
+                ledger.publish(0, rank as usize, n, t0);
+                ledger.act(0, rank as usize, Read::Absent, &PRICE);
+            }
+            let chose = if step == 1 {
+                vec![vec![Chosen { expert: 0, saves: true, tier: false }, Chosen { expert: 1, saves: true, tier: false }]]
+            } else {
+                vec![Vec::new()]
+            };
+            ledger.tell(Told::Completed { step, chose, guesses: None });
+        }
+        assert!(!ledger.hint_admitted(0, 1, 0.80), "calibrated p = 0.25 < 0.80 must not be admitted");
+        assert!(ledger.hint_admitted(0, 1, 0.25), "calibrated p = 0.25 >= 0.25 is admitted");
+        assert!(ledger.hint_admitted(0, 1, 0.0), "p* = 0.0 admits all calibrated ranks");
     }
 }

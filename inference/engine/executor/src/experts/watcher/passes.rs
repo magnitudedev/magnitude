@@ -43,7 +43,7 @@
 use super::telemetry::FRONT_DEPTHS;
 use crate::experts::horizon::{self, Time, Window};
 use crate::experts::interest::{Form, Stands};
-use magnitude_cost_model::{ReadAdmission, ReadLine, Terms};
+use magnitude_cost_model::{PathAdmission, ReadLine, Terms};
 use std::ops::AddAssign;
 
 /// One decode pass as timed: its launch's rows, its depth (the guessed rows
@@ -79,6 +79,11 @@ pub(super) struct Pass {
     pub link: f64,
     pub moved: f64,
     pub moved_records: f64,
+    /// Opportunistic link staging busy seconds and record count, tracked
+    /// separately from permanent `moved` (promotions/write-backs) so
+    /// `POLICY_LINK_BUSY_NS` and promotion earning are never polluted.
+    pub staged_link: f64,
+    pub staged_records: f64,
     pub cpu: f64,
     pub memory: f64,
     pub served: f64,
@@ -142,6 +147,8 @@ impl Pass {
         self.link += pass.link;
         self.moved += pass.moved;
         self.moved_records += pass.moved_records;
+        self.staged_link += pass.staged_link;
+        self.staged_records += pass.staged_records;
         self.cpu += pass.cpu;
         self.memory += pass.memory;
         self.served += pass.served;
@@ -332,16 +339,29 @@ impl Passes {
         (all.pass.reads > 0.).then(|| (terms, all.pass.drive / all.pass.reads))
     }
 
-    /// What a read ahead is admitted by over the window ([`ReadAdmission`]),
-    /// given the drive's measured read line (`drive_line`).
-    pub fn read_admission(&mut self, drive_line: Option<ReadLine>) -> ReadAdmission {
+    /// What a Drive-path read ahead is admitted by over the window
+    /// ([`PathAdmission`]), given the drive's measured read line (`drive_line`).
+    pub fn read_admission(&mut self, drive_line: Option<ReadLine>) -> PathAdmission {
         let epoch = self.epoch();
         let all = self.all.read(epoch).map(Sums::over).unwrap_or_default();
         let plain = self.depth(false, 0, epoch).pass;
         let terms = all.terms().unwrap_or_default();
         let demand_stall = (all.pass.misses > 0.).then(|| all.pass.parked / all.pass.misses);
         let plain_stall = (plain.missed > 0.).then(|| plain.parked / plain.missed);
-        ReadAdmission { terms, drive_line, demand_stall, plain_stall }
+        PathAdmission::drive(terms, drive_line, demand_stall, plain_stall)
+    }
+
+    /// What a Link-path opportunistic staging move is admitted by over the
+    /// window ([`PathAdmission`]), given the copy engine's measured transfer
+    /// line (`link_line`).
+    pub fn link_admission(&mut self, link_line: Option<ReadLine>) -> PathAdmission {
+        let epoch = self.epoch();
+        let all = self.all.read(epoch).map(Sums::over).unwrap_or_default();
+        let plain = self.depth(false, 0, epoch).pass;
+        let terms = all.terms().unwrap_or_default();
+        let demand_stall = (all.pass.missed > 0.).then(|| all.pass.served / all.pass.missed);
+        let plain_stall = (plain.missed > 0.).then(|| plain.served / plain.missed);
+        PathAdmission::link(terms, link_line, demand_stall, plain_stall)
     }
 
     /// The latest pass's rows, and a pass's mean time over the window: what
@@ -353,9 +373,10 @@ impl Passes {
         (all.passes > 0.).then(|| (latest.rows, all.pass.seconds / all.passes))
     }
 
-    /// The moves beside a decode step over the window: the seconds they
-    /// held the link and the records they read; none before a pass is
-    /// timed.
+    /// The permanent promotion/write-back moves beside a decode step over the
+    /// window: the seconds they held the link and the records they read; none
+    /// before a pass is timed. Excludes opportunistic `staged_link` so
+    /// `POLICY_LINK_BUSY_NS` is never polluted.
     pub fn moves(&mut self) -> Option<(f64, f64)> {
         let all = self.all();
         (all.passes > 0.).then(|| (all.pass.moved / all.passes, all.pass.moved_records / all.passes))
@@ -366,9 +387,12 @@ impl Passes {
     /// memory, and the link's reads in place; none of either before a pass
     /// is timed.
     pub fn beside(&mut self) -> crate::assessment::Beside {
-        let Pass { seconds, link, moved, cpu, .. } = self.all().pass;
+        let Pass { seconds, link, moved, staged_link, cpu, .. } = self.all().pass;
         match seconds > 0. {
-            true => crate::assessment::Beside { cpu: (cpu / seconds).clamp(0., 1.), link: ((link - moved) / seconds).clamp(0., 1.) },
+            true => crate::assessment::Beside {
+                cpu: (cpu / seconds).clamp(0., 1.),
+                link: ((link - moved - staged_link) / seconds).clamp(0., 1.),
+            },
             false => crate::assessment::Beside::default(),
         }
     }
@@ -461,7 +485,7 @@ mod tests {
         let mut times = time.lock();
         times.register(step, Advance::Known(Tokens::new(1.0)));
         for _ in 0..records {
-            times.moved(0, Tier::Compute);
+            times.moved(0, Tier::COMPUTE);
         }
     }
 
@@ -541,7 +565,7 @@ mod tests {
         let cost = p.read_admission(None);
         assert!((cost.layer_stall(3.0) - 3.0 * 1e-3).abs() < 1e-12);
         assert_eq!(cost.layer_stall(0.0), 0.0);
-        assert_eq!(ReadAdmission::default().layer_stall(4.0), 0.0);
+        assert_eq!(PathAdmission::default().layer_stall(4.0), 0.0);
     }
 
     /// The regime's figures are the window's: each kind's terms apart; each
@@ -801,5 +825,36 @@ mod tests {
         stands.count(1, Form::Verify, true);
         let reentered = passes.measured(48, [[None; DEPTHS]; 2], &stands).expect("passes timed");
         assert!((reentered.accepts[0].unwrap() - 6.0 / 8.0).abs() < 1e-12);
+    }
+
+    /// Opportunistic link staging (`staged_link`, `staged_records`) is tracked
+    /// separately from permanent promotions (`moved`, `moved_records`) so
+    /// `Passes::moves()` (`POLICY_LINK_BUSY_NS`) and `Passes::beside()`
+    /// (in-place link read share for promotion earning) are never polluted.
+    #[test]
+    fn staged_link_is_separated_from_moved_promotions_and_beside() {
+        let (mut passes, _) = passes();
+        // Total link = 0.050: 0.010 in-place reads + 0.015 permanent promotions + 0.025 opportunistic staging.
+        passes.timed(Pass {
+            rows: 1,
+            seconds: 0.100,
+            served: 0.030,
+            missed: 10.0,
+            link: 0.050,
+            moved: 0.015,
+            moved_records: 3.0,
+            staged_link: 0.025,
+            staged_records: 5.0,
+            cpu: 0.020,
+            memory: 0.010,
+            ..Pass::default()
+        });
+        assert_eq!(passes.moves(), Some((0.015, 3.0)), "moves() reports permanent promotions only");
+        let beside = passes.beside();
+        assert!((beside.link - 0.010 / 0.100).abs() < 1e-12, "beside.link excludes both moved and staged_link: {beside:?}");
+        assert!((beside.cpu - 0.020 / 0.100).abs() < 1e-12);
+        let link_adm = passes.link_admission(None);
+        assert_eq!(link_adm.path, magnitude_cost_model::PathKind::Link);
+        assert!((link_adm.terms.link - 0.050).abs() < 1e-12, "Terms::link still reflects total link load");
     }
 }

@@ -368,7 +368,7 @@ impl Estimate {
     /// Runtime growth target for a pinned host bank: [`Self::pinned_import_room`]
     /// when growth is admissible, else capped at current bank holdings.
     pub fn pinned_target(&self) -> u64 {
-        let bank = self.cache_of(CacheKind::Bank) + self.bank_spare;
+        let bank = self.cache_of(CacheKind::Bank) + self.cache_of(CacheKind::Table) + self.bank_spare;
         let room = self.pinned_import_room();
         match self.read.grows {
             true => room,
@@ -389,14 +389,14 @@ impl Estimate {
     }
 
     fn room_in(&self, budget: u64, reserve: u64) -> u64 {
-        let bank = self.cache_of(CacheKind::Bank) + self.bank_spare;
+        let bank = self.cache_of(CacheKind::Bank) + self.cache_of(CacheKind::Table) + self.bank_spare;
         let beside = self.committed.saturating_add(self.cache - bank).saturating_add(self.shed);
         let room = budget.saturating_sub(beside.saturating_add(reserve));
         self.read.cap.map_or(room, |cap| room.min(cap.saturating_sub(beside)))
     }
 
     pub fn target(&self) -> u64 {
-        let bank = self.cache_of(CacheKind::Bank) + self.bank_spare;
+        let bank = self.cache_of(CacheKind::Bank) + self.cache_of(CacheKind::Table) + self.bank_spare;
         let room = self.import_room();
         match self.read.grows {
             true => room,

@@ -454,6 +454,9 @@ pub(super) struct Scratch {
     /// The host tier records the group's tier copies read, (layer, record),
     /// held until the device is past the group.
     held: Vec<(usize, HostRecord)>,
+    /// Demand-derived subset of `0..lent` leased for the active prompt group on
+    /// `Placer::Bank` (`None` = full `0..lent` lease).
+    lease_records: Option<Vec<u32>>,
     pub(super) conveyor: Conveyor,
 }
 
@@ -553,6 +556,7 @@ impl Scratch {
             flags,
             tiers: Vec::new(),
             held: Vec::new(),
+            lease_records: None,
             conveyor,
         }
     }
@@ -778,6 +782,7 @@ impl Scratch {
         }
         core.directory.end_prompt_group(self.conveyor.lending().group);
         self.conveyor.serving = None;
+        self.lease_records = None;
         true
     }
 
@@ -808,6 +813,7 @@ impl Scratch {
         let scratch_group = shared.steps.scratch_group(group).unwrap_or_else(|| panic!("the conveyor serves group {group}, which is not scratch-served"));
         assert_eq!(scratch_group.first(), group, "the conveyor serves group {group} from its first step");
         self.conveyor.serving = Some(Serving { group: scratch_group, past: false });
+        self.lease_records = None;
     }
 
     /// Take the request `at` its point from chain place `place`, as its
@@ -1059,6 +1065,7 @@ impl Scratch {
         if core.layers[tier.layer].slots.is_none() || !self.leased(core) {
             return None;
         }
+        let lending = self.conveyor.lending();
         let steps = (serving.group.last() - serving.group.first() + 1) as usize;
         let form = &core.layers[tier.layer].scratch_form;
         let before = || self.tiers.iter().filter(|other| (other.group, other.layer) < (tier.group, tier.layer));
@@ -1129,7 +1136,15 @@ impl Scratch {
             }
         };
         (0..lw.min(self.conveyor.slots()))
-            .filter(|&slot| self.conveyor.borrower(slot).is_none() && !read_before(slot))
+            .filter(|&slot| {
+                self.conveyor.borrower(slot).is_none()
+                    && !read_before(slot)
+                    && self.lease_records.as_ref().is_none_or(|recs| {
+                        lending.scratch_records(slot).all(|lent| {
+                            u32::try_from(lent).is_ok_and(|record| recs.binary_search(&record).is_ok())
+                        })
+                    })
+            })
             .filter_map(|slot| Some((after(slot)?, slot)))
             .min()
             .map(|(_, slot)| slot)
@@ -1303,6 +1318,85 @@ impl Scratch {
         }
     }
 
+    /// Derive the minimal fixed-point subset of `0..lent` needed by the active
+    /// prompt group on `Placer::Bank` (unified memory): only the conveyor
+    /// records and scratch slots actually required by currently absent experts
+    /// (closed under any expert evicted from a leased record), leaving all
+    /// other `0..lent` records resident. Returns `None` when a full `0..lent`
+    /// lease is required (discrete `Placer::Tier`, unknown scratch geometry, or
+    /// fixed point covering all `0..lent`).
+    fn compute_lease_records(&self, core: &Core) -> Option<Vec<u32>> {
+        if core.extents.placer != crate::planning::Placer::Bank {
+            return None;
+        }
+        let lending = self.conveyor.lending();
+        if !lending.has_scratch() {
+            return None;
+        }
+        let lender = lending.group;
+        let lent = core.directory.host_lent(lender) as usize;
+        if lent == 0 {
+            return None;
+        }
+        let mut needed = std::collections::BTreeSet::<u32>::new();
+        let mut layer_missing = vec![0usize; core.layers.len()];
+        let mut max_missing = 0usize;
+        for (layer_idx, layer) in core.layers.iter().enumerate() {
+            let lw = layer.layer_window;
+            for expert in 0..layer.experts {
+                if !matches!(core.directory.located(layer_idx, expert), crate::experts::host_records::Located::Kept(_)) {
+                    layer_missing[layer_idx] += 1;
+                    for r in lending.scratch_records(expert % lw) {
+                        if r < lent {
+                            needed.insert(r as u32);
+                        }
+                    }
+                }
+            }
+            max_missing = max_missing.max(layer_missing[layer_idx]);
+        }
+        let mut conveyor_count = max_missing.min(self.conveyor.records());
+        for r in lending.conveyor_records(conveyor_count) {
+            if r < lent {
+                needed.insert(r as u32);
+            }
+        }
+        // Fixed-point closure: claiming `r` may evict the expert kept at `r`,
+        // which then also needs its scratch slot and a conveyor record.
+        let mut inspected = std::collections::BTreeSet::<u32>::new();
+        loop {
+            if needed.len() >= lent {
+                return None;
+            }
+            let pending: Vec<u32> = needed.difference(&inspected).copied().collect();
+            if pending.is_empty() {
+                break;
+            }
+            for r in pending {
+                inspected.insert(r);
+                if let Some((layer_idx, expert)) = core.directory.host_kept_at(lender, r) {
+                    let lw = core.layers[layer_idx].layer_window;
+                    for sr in lending.scratch_records(expert % lw) {
+                        if sr < lent {
+                            needed.insert(sr as u32);
+                        }
+                    }
+                    layer_missing[layer_idx] += 1;
+                    let next_conveyor = layer_missing[layer_idx].min(self.conveyor.records());
+                    if next_conveyor > conveyor_count {
+                        conveyor_count = next_conveyor;
+                        for cr in lending.conveyor_records(conveyor_count) {
+                            if cr < lent {
+                                needed.insert(cr as u32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(needed.into_iter().collect())
+    }
+
     /// Grant the group served its lease of what frees now
     /// (`Directory::lease`): the conveyor takes a record only once every
     /// lent record it lies across is the group's, and the scratch takes a
@@ -1320,6 +1414,9 @@ impl Scratch {
         // Evicting a colder kept record past the lent zone is safe only before
         // any tier of this group has taken a hit or a cut-in step has begun.
         let may_evict = self.tiers.is_empty();
+        if self.lease_records.is_none() && may_evict {
+            self.lease_records = self.compute_lease_records(core);
+        }
         let tier = core.groups[lender].tier.as_deref();
         let mut copy_fn = |src: u32, dst: u32| {
             if let Some(tensors) = tier {
@@ -1332,14 +1429,15 @@ impl Scratch {
             }
         };
         let copy = tier.is_some().then_some(&mut copy_fn as &mut dyn FnMut(u32, u32));
-        core.directory.lease(lender, serving.group, may_evict, copy);
+        core.directory.lease_records(lender, serving.group, self.lease_records.as_deref(), may_evict, copy);
     }
 
     /// Whether the group served holds every record the scratch lies in (on
     /// the one store the lent host records, beside a host tier the bank's,
     /// `Directory::leased`): its slots take no convert before.
     fn leased(&self, core: &Core) -> bool {
-        self.conveyor.serving.is_some() && core.directory.leased(self.conveyor.lending().group)
+        self.conveyor.serving.is_some()
+            && core.directory.leased_records(self.conveyor.lending().group, self.lease_records.as_deref())
     }
 
     /// Give each of `experts` of tier `index`'s pass set `set_idx` its
@@ -1347,6 +1445,35 @@ impl Scratch {
     /// once the group holds every record it lies in: whether every one has
     /// its slot.
     fn claim_scratch(&mut self, index: usize, set_idx: usize, experts: &[usize], core: &mut Core) -> bool {
+        let mut extended = false;
+        if let Some(ref mut target) = self.lease_records {
+            let lending = self.conveyor.lending();
+            let lent = core.directory.host_lent(lending.group) as usize;
+            let lw = self.tiers[index].layer_window;
+            for &expert in experts {
+                for r in lending.scratch_records(expert % lw) {
+                    if r < lent && target.binary_search(&(r as u32)).is_err() {
+                        target.push(r as u32);
+                        extended = true;
+                    }
+                }
+            }
+            if !experts.is_empty() && self.conveyor.records() > 0 {
+                for r in lending.conveyor_records(1) {
+                    if r < lent && target.binary_search(&(r as u32)).is_err() {
+                        target.push(r as u32);
+                        extended = true;
+                    }
+                }
+            }
+            if extended {
+                target.sort_unstable();
+                target.dedup();
+            }
+        }
+        if extended {
+            self.lease(core);
+        }
         if !self.leased(core) {
             self.lease(core);
             if !self.leased(core) {
@@ -1428,7 +1555,14 @@ impl Scratch {
     /// records (reads' ends, the queue's completions), its records free
     /// once the device arrives at the round after. The request, none once
     /// served whole or failed, and whether it moved.
-    pub(super) fn carry(&mut self, serve: Serve, core: &mut Core, prefetch: &mut Prefetch, shared: &Shared) -> (Option<Serve>, bool) {
+    pub(super) fn carry(
+        &mut self,
+        serve: Serve,
+        core: &mut Core,
+        prefetch: &mut Prefetch,
+        ledger: &mut crate::experts::interest::Ledger,
+        shared: &Shared,
+    ) -> (Option<Serve>, bool) {
         let Serve { at, place, set_index, window, set, next_set_start, arrived, mut stage } = serve;
         let Point { group, layer, .. } = at.point;
         let mut moved = false;
@@ -1444,7 +1578,7 @@ impl Scratch {
                     RequestStage::Awaiting(self.opened(at, window, arrived, request, core, shared))
                 }
                 RequestStage::Awaiting(opened) => {
-                    match self.await_landings(layer, &opened.cold, core, prefetch) && self.claim_scratch(index, set_index, &opened.cold, core) {
+                    match self.await_landings(layer, &opened.cold, core, prefetch, ledger) && self.claim_scratch(index, set_index, &opened.cold, core) {
                         true => RequestStage::Rounds(self.fix_rounds(at, set_index, window, opened, core, shared)),
                         false => {
                             return (
@@ -1456,7 +1590,7 @@ impl Scratch {
                 }
                 RequestStage::Rounds(mut rounds) => {
                     let before = rounds.round;
-                    if self.round(at, place, set_index, window, &set, next_set_start, &mut rounds, core, prefetch, shared) {
+                    if self.round(at, place, set_index, window, &set, next_set_start, &mut rounds, core, prefetch, ledger, shared) {
                         self.finish(at, place, set_index, window, arrived, index, rounds, core, shared);
                         return (None, true);
                     }
@@ -1499,7 +1633,14 @@ impl Scratch {
     /// again, and the rounds, fixed next, wait for it first. Each still
     /// landing is hastened; its landing's end is an event. On the one store
     /// no landing serves a request ([`copies_from_tier`]): nothing waits for one.
-    fn await_landings(&mut self, layer: usize, cold: &[usize], core: &mut Core, prefetch: &mut Prefetch) -> bool {
+    fn await_landings(
+        &mut self,
+        layer: usize,
+        cold: &[usize],
+        core: &mut Core,
+        prefetch: &mut Prefetch,
+        ledger: &mut crate::experts::interest::Ledger,
+    ) -> bool {
         let landing = |scratch: &Self, core: &Core| {
             cold.iter()
                 .filter(|&&expert| {
@@ -1515,7 +1656,7 @@ impl Scratch {
         for &staged in &awaited {
             prefetch.hasten(staged);
         }
-        prefetch.settle(&mut core.directory);
+        let _ = prefetch.settle(&mut core.directory, ledger);
         self.settle_landings(core);
         landing(self, core).is_empty()
     }
@@ -1701,6 +1842,7 @@ impl Scratch {
         rounds: &mut Rounds,
         core: &mut Core,
         prefetch: &mut Prefetch,
+        ledger: &mut crate::experts::interest::Ledger,
         shared: &Shared,
     ) -> bool {
         let Point { group, layer, sequence, .. } = at.point;
@@ -1717,7 +1859,7 @@ impl Scratch {
             let chunk = rounds.cold.chunks(round_records).nth(round as usize).unwrap_or_default().to_vec();
             // Reads into staging that ended free their records, as the
             // rounds the device has converted free theirs (`convey`).
-            prefetch.settle(&mut core.directory);
+            let _ = prefetch.settle(&mut core.directory, ledger);
             self.convey(core, shared);
             let tier = self.tiers.iter().find(|tier| (tier.group, tier.layer) == (group, layer)).expect("a served request's tier");
             if let Some(reason) = chunk.iter().find_map(|&expert| tier.sets[set_index].experts[expert].failure()) {

@@ -26,6 +26,94 @@
 //! the regime's depth weighs the GPU's term against every other one
 //! ([`Terms::each_path`], `crate::Regime`).
 
+/// A physical bandwidth or execution contention domain shared across tiers and
+/// paths on a machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ContentionDomain {
+    Compute,
+    Drive,
+    Link,
+    HostMemory,
+    Cpu,
+}
+
+/// Which physical streaming path an admission or scheduling decision governs:
+/// - `Drive`: storage -> host RAM (or unified memory bank);
+/// - `Link`: host RAM / peer -> device VRAM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PathKind {
+    #[default]
+    Drive,
+    Link,
+}
+
+impl PathKind {
+    /// The transport contention domain owned by this path.
+    pub const fn transport_domain(self) -> ContentionDomain {
+        match self {
+            Self::Drive => ContentionDomain::Drive,
+            Self::Link => ContentionDomain::Link,
+        }
+    }
+
+    /// Physical contention domains shared with other paths or in-place compute
+    /// (e.g. Host DDR5 on discrete hosts, whose term is `0.0` on unified memory).
+    pub const fn shared_domains(self) -> &'static [ContentionDomain] {
+        match self {
+            Self::Drive | Self::Link => &[ContentionDomain::HostMemory],
+        }
+    }
+}
+
+/// Continuous live bandwidth budget of a shared physical memory domain
+/// (e.g. Host DDR5), tracking active DMA transfers and active NVMe landings
+/// against the domain's measured memory bandwidth (`HostLines::memory`).
+///
+/// Replaces any binary `dma_active: bool` check with the live bandwidth share:
+/// `load = ((dma_bytes_per_sec + landing_bytes_per_sec) / memory_bytes_per_sec).clamp(0.0, 0.95)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DomainBudget {
+    /// Live DMA bandwidth currently consuming the shared domain (bytes/sec).
+    pub dma_bytes_per_sec: f64,
+    /// Live NVMe landing bandwidth currently consuming the shared domain (bytes/sec).
+    pub landing_bytes_per_sec: f64,
+    /// Total measured bandwidth of the shared domain (bytes/sec).
+    pub memory_bytes_per_sec: f64,
+}
+
+impl DomainBudget {
+    /// Construct a shared-domain budget from live active bandwidths (bytes/sec).
+    ///
+    /// # Panics
+    /// Where any rate is non-finite or negative.
+    pub fn new(dma_bytes_per_sec: f64, landing_bytes_per_sec: f64, memory_bytes_per_sec: f64) -> Self {
+        assert!(
+            dma_bytes_per_sec.is_finite() && dma_bytes_per_sec >= 0.0,
+            "dma_bytes_per_sec must be finite and non-negative, got {dma_bytes_per_sec}"
+        );
+        assert!(
+            landing_bytes_per_sec.is_finite() && landing_bytes_per_sec >= 0.0,
+            "landing_bytes_per_sec must be finite and non-negative, got {landing_bytes_per_sec}"
+        );
+        assert!(
+            memory_bytes_per_sec.is_finite() && memory_bytes_per_sec >= 0.0,
+            "memory_bytes_per_sec must be finite and non-negative, got {memory_bytes_per_sec}"
+        );
+        Self { dma_bytes_per_sec, landing_bytes_per_sec, memory_bytes_per_sec }
+    }
+
+    /// Fraction of the shared domain's bandwidth currently occupied by active
+    /// DMA and NVMe landings, clamped to `[0.0, 0.95]` so the remaining share
+    /// `1.0 - load()` stays strictly positive (`0.0` when memory bandwidth is
+    /// unmeasured).
+    pub fn load(&self) -> f64 {
+        if self.memory_bytes_per_sec <= 0.0 || !self.memory_bytes_per_sec.is_finite() {
+            return 0.0;
+        }
+        ((self.dma_bytes_per_sec.max(0.0) + self.landing_bytes_per_sec.max(0.0)) / self.memory_bytes_per_sec).clamp(0.0, 0.95)
+    }
+}
+
 /// One token's terms: each resource's busy seconds a token
 /// (module documentation). On unified memory `link`, `cpu` and `memory` are
 /// none.
@@ -38,7 +126,36 @@ pub struct Terms {
     pub memory: f64,
 }
 
+/// Alias naming [`Terms`] as a token's per-domain resource busy seconds.
+pub type ResourceTerms = Terms;
+
 impl Terms {
+    /// Busy seconds of physical contention domain `domain`.
+    pub fn domain(&self, domain: ContentionDomain) -> f64 {
+        match domain {
+            ContentionDomain::Compute => self.compute,
+            ContentionDomain::Drive => self.drive,
+            ContentionDomain::Link => self.link,
+            ContentionDomain::HostMemory => self.memory,
+            ContentionDomain::Cpu => self.cpu,
+        }
+    }
+
+    /// The slowest term among `path`'s own transport domain and any shared
+    /// physical contention domains (e.g. Host DDR5).
+    pub fn path_term(&self, path: PathKind) -> f64 {
+        let own = self.domain(path.transport_domain());
+        path.shared_domains().iter().fold(own, |acc, &d| acc.max(self.domain(d)))
+    }
+
+    /// Whether `path` (via its own transport domain or a shared contention
+    /// domain such as Host DDR5) is a binding resource:
+    /// `path_term > 0 && path_term >= time()`.
+    pub fn binds_path(&self, path: PathKind) -> bool {
+        let peak = self.time();
+        peak > 0.0 && self.path_term(path) >= peak
+    }
+
     /// Every term besides the GPU's pass, each path and in-place tier, the
     /// drive's first: what the GPU's pass overlaps with foresight.
     pub fn each_path(&self) -> [f64; 4] {
@@ -106,5 +223,41 @@ mod tests {
         sum.add(&short, 1.);
         sum.add(&fits, -1.);
         assert_eq!(sum.over(1.), short);
+    }
+
+    #[test]
+    fn domain_budget_computes_continuous_dma_and_landing_share_clamped() {
+        // Idle: 0% load.
+        let idle = DomainBudget::new(0.0, 0.0, 60e9);
+        assert_eq!(idle.load(), 0.0);
+
+        // 48 GB/s PCIe 5 DMA + 0 NVMe on 60 GB/s DDR5 -> 80% load -> 5x CPU 1-row scaling.
+        let dma_only = DomainBudget::new(48e9, 0.0, 60e9);
+        assert!((dma_only.load() - 0.80).abs() < 1e-12);
+
+        // 48 GB/s DMA + 6 GB/s NVMe landing on 60 GB/s DDR5 -> 90% load -> 10x CPU 1-row scaling.
+        let dma_and_nvme = DomainBudget::new(48e9, 6e9, 60e9);
+        assert!((dma_and_nvme.load() - 0.90).abs() < 1e-12);
+
+        // Saturated (> 95%): clamped to 0.95 -> 20x max scaling, never infinite/NaN.
+        let saturated = DomainBudget::new(55e9, 10e9, 60e9);
+        assert_eq!(saturated.load(), 0.95);
+
+        // Unmeasured memory bandwidth: 0% load.
+        assert_eq!(DomainBudget::new(48e9, 6e9, 0.0).load(), 0.0);
+
+        // Verify CpuLines::with_domain_budget scales only `expert.one`, leaving `expert.row` and `handshake` untouched.
+        let cpu = crate::CpuLines {
+            expert: crate::RowLine {
+                one: crate::Nanoseconds::try_from(40_000).unwrap(),
+                row: crate::RowCost::Measured(crate::Nanoseconds::try_from(1_000).unwrap()),
+            },
+            handshake: crate::Nanoseconds::try_from(4_000).unwrap(),
+        };
+        assert_eq!(cpu.with_domain_budget(idle), cpu);
+        let scaled = cpu.with_domain_budget(dma_and_nvme);
+        assert_eq!(scaled.expert.one.get(), 400_000.0);
+        assert_eq!(scaled.expert.row, cpu.expert.row);
+        assert_eq!(scaled.handshake, cpu.handshake);
     }
 }

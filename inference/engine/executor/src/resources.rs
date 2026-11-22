@@ -366,6 +366,19 @@ impl AllocatedResources {
         }
     }
 
+    /// Re-hold `slots` in place without allocating if every pool already holds
+    /// at least `slots` allocated (e.g. reclaiming a warm `IdleClass` across a
+    /// prefill/decode transition). Returns `false` if any pool needs growth.
+    pub(crate) fn rehold_class(&mut self, slots: crate::StartupSlots) -> bool {
+        if !self.class_pools(slots).all(|(pool, slots)| pool.has_allocated(slots)) {
+            return false;
+        }
+        for (pool, slots) in self.class_pools(slots) {
+            pool.hold(slots);
+        }
+        true
+    }
+
     /// Hold the floor's class of one place again: the slots beyond it idle
     /// until released ([`Self::release_idle_slots`]).
     pub(crate) fn release_class(&mut self) {

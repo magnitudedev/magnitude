@@ -385,7 +385,7 @@ fn bank_prices_step_accounts_for_host_tier_and_prompt_uses_group_stage() {
     let routed = PassLayers::of(&pass, experts, 4);
     let compute = FormSeconds { resident: 0.010, streamed: 0.012 };
     let rates = WorkloadRates::prior(0.012, 100., 512., 0.1);
-    let prices = BankPrices::new(layers, pass, routed, 1, read, compute, rates, 256, 512);
+    let prices = BankPrices::new(layers, pass, routed, 1, read, compute, rates, 256, 512, 8);
 
     // Host tier holds all 32 experts while VRAM holds 8: decode step is strictly
     // faster with host tier credited than with `HeldSlots::bank(8)` (file misses).
@@ -405,4 +405,40 @@ fn bank_prices_step_accounts_for_host_tier_and_prompt_uses_group_stage() {
     let tiered_prompt = prices.prompt_seconds(2, with_host);
     let expected_stage = 2. * lines.group_stage(&read, 24, 0);
     close(tiered_prompt - whole_prompt, expected_stage);
+}
+
+/// `StreamedLayers::path_records` scales `ahead` staging records with
+/// `decode_rows` so multi-row verify bursts do not starve cross-layer hints,
+/// while preserving `reserve` from the single-row release wait when it already
+/// dominates `ahead`.
+#[test]
+fn path_records_scales_ahead_for_multi_row_verify_without_inflating_reserve() {
+    let read = ReadLine::new(3e-4, 1. / 4.6e9).unwrap();
+    let record_bytes = 1_800_000u64;
+    let lines = ExpertLines::reference(record_bytes);
+    let num_layers = 48usize;
+    let layers = StreamedLayers::new(
+        vec![512u64; num_layers],
+        10,
+        std::sync::Arc::from(vec![lines; num_layers]),
+    );
+    let compute = FormSeconds { resident: 0.032, streamed: 0.035 };
+    let held = HeldSlots::bank(355);
+
+    let single = layers.path_records(read, compute, record_bytes, held, 2, num_layers as u64, 1).unwrap();
+    let verify = layers.path_records(read, compute, record_bytes, held, 2, num_layers as u64, 8).unwrap();
+
+    assert!(
+        verify.ahead > single.ahead,
+        "multi-row verify must size more ahead staging records than M=1: verify={verify:?} single={single:?}"
+    );
+    assert!(
+        verify.reserve >= verify.ahead,
+        "reserve must always cover ahead: verify={verify:?}"
+    );
+    assert_eq!(
+        verify.reserve,
+        single.reserve.max(verify.ahead),
+        "reserve should not inflate beyond max(single-row release, verify.ahead): verify={verify:?} single={single:?}"
+    );
 }

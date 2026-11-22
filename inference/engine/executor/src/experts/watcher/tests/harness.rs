@@ -548,6 +548,7 @@ pub(super) fn lending_windowed_passes(
             .iter()
             .map(|pool| LentPool { record: bytes, offset: 0, conveyor: pool.bytes() })
             .collect(),
+        scratch: Vec::new(),
     };
     // Each tensor's experts as the device's pass reads them, by window slot:
     // the scratch slots the harness's tier copy plays into.
@@ -568,6 +569,7 @@ pub(super) fn lending_windowed_passes(
             bank_maps: std::mem::take(&mut maps),
             tier_maps: host.maps.iter().map(|words| LandingMap::Tier(words.clone())).collect(),
             lent: (0, bank_lent),
+            stage_slots: vec![0],
         },
         Placer::Bank => crate::experts::directory::Placement::Bank {
             landing_maps: std::mem::take(&mut maps)

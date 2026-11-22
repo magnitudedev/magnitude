@@ -207,16 +207,18 @@ pub struct BankPrices {
     rates: WorkloadRates,
     region_rows: u64,
     prompt_rows: u64,
+    decode_rows: u64,
 }
 
 impl BankPrices {
     /// The prices of a bank of `layers`, its passes `pass` over `routed`, in
     /// `windows` windows, its file reads along `read`, its step `compute`
-    /// in each form, under `rates`, its passes' regions `region_rows` rows
-    /// and its prompts `prompt_rows`.
+    /// in each form, under `rates`, its passes' regions `region_rows` rows,
+    /// its prompts `prompt_rows`, and decode/verify passes of up to
+    /// `decode_rows` rows.
     ///
     /// # Panics
-    /// Where `region_rows` is zero.
+    /// Where `region_rows` or `decode_rows` is zero.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         layers: StreamedLayers,
@@ -228,9 +230,11 @@ impl BankPrices {
         rates: WorkloadRates,
         region_rows: u64,
         prompt_rows: u64,
+        decode_rows: u64,
     ) -> Self {
         assert!(region_rows > 0, "invariant violated: a bank's prompt region has at least one row");
-        Self { layers, pass, routed, windows, read, compute, rates, region_rows, prompt_rows }
+        assert!(decode_rows > 0, "invariant violated: a bank's decode row budget is at least one row");
+        Self { layers, pass, routed, windows, read, compute, rates, region_rows, prompt_rows, decode_rows }
     }
 
     /// A decode step's seconds holding `held` of each layer's experts.
@@ -275,7 +279,7 @@ impl BankPrices {
     /// load.
     pub fn paths(&self, bytes: u64, held: HeldSlots, hint_leads: u64) -> Option<PathRecords> {
         let layers: u64 = self.routed.iter().map(|kind| kind.layers).sum();
-        self.layers.path_records(self.read, self.compute, bytes, held, hint_leads, layers)
+        self.layers.path_records(self.read, self.compute, bytes, held, hint_leads, layers, self.decode_rows)
     }
 }
 

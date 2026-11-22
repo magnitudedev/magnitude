@@ -326,6 +326,16 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
             continue;
         const int expert = STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c));
         int source = streaming_held(STREAMING_AT(map, u64(home + expert) * map0), map1, q);
+        if (source < 0) {
+            // Acquire: the copy engine publishes MAP_STAGE via TransferItem::Signal
+            // once every H2D copy for the expert's staged bank record has landed.
+            // If it has not landed for step q, fall through with zero spin.
+            const u32 staged = u32(streaming_load_acquire(
+                STREAMING_AT(map, u64(home + expert) * map0 + SEISMIC_CONST_MAP_STAGE * map1)));
+            const u32 slot = staged & 0xFFFFu;
+            if (slot != 0u && (staged >> 16) == u32(q & 0xFFFFu))
+                source = int(slot - 1u);
+        }
         if (source < 0 && tiered != 0) {
             // Acquire: the host maps a tier record with release once its
             // bytes are whole, which the step's entries then read.

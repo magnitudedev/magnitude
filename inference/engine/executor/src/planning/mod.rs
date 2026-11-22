@@ -14,7 +14,7 @@ pub(crate) use imports::ImportPlan;
 mod programs;
 mod prices;
 pub use prices::{PlanForms, PlanPrices, PlanSteps};
-pub(crate) use prices::prior;
+pub(crate) use prices::{decode_rows, prior};
 mod prompt_room;
 pub(crate) use prompt_room::pass_ladder;
 mod resources;

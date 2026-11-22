@@ -3,10 +3,74 @@ use magnitude_cost_model::LiveDecode;
 use crate::planning::BankTier;
 use crate::domain::{BankHolding, BankResize, BankResized, BankStep, DomainError, ElasticBank, ExpertResidency, ResizeTimes, TableResidency};
 use crate::experts::derived::{BankShape, HoldingTarget};
-use crate::memory::ledger::{CacheKind, Claim, CommittedKind, DeviceLedgers, Recorded};
+use crate::memory::ledger::{CacheReclaimer, Claim, CommittedKind, DeviceLedgers, ReclaimError, Recorded};
 use crate::CompletionWake;
 use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+
+/// Synchronous [`CacheReclaimer`] for one auxiliary stored table
+/// (`BankHolding::Table`), holding only weak references so it never extends
+/// the bank's or table's lifetime. Reclaimed before `CacheKind::Bank` via the
+/// single ordered `CacheKind` priority (`Spare < GraphSlots < Table < Bank`).
+struct TableReclaimer {
+    bank: Weak<ExpertBank>,
+    table: Weak<crate::stored_table::StoredTable>,
+    index: usize,
+    floor: u64,
+}
+
+impl CacheReclaimer for TableReclaimer {
+    fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+        if need == 0 {
+            return Ok(0);
+        }
+        let (Some(bank), Some(table)) = (self.bank.upgrade(), self.table.upgrade()) else {
+            return Err(ReclaimError::AtFloor);
+        };
+        // Wait for a gap between flights before mutating a stored table's slabs.
+        if !bank.watcher.shared().in_gap() {
+            return Err(ReclaimError::AtFloor);
+        }
+        let from = table.records();
+        if from <= self.floor {
+            return Err(ReclaimError::AtFloor);
+        }
+        let (block, granule) = (bank.plan.block(), bank.plan.granule());
+        let charge = |records: u64| crate::planning::BankTable::charge(block, granule, records).map_err(ReclaimError::Invariant);
+        let Some(to) = crate::planning::releasing(from, self.floor, need, charge)? else {
+            return Err(ReclaimError::AtFloor);
+        };
+        let holding = BankHolding::Table { table: self.index };
+        let tier = bank
+            .plan
+            .holding_storage(holding)
+            .ok_or_else(|| ReclaimError::Invariant(format!("{holding:?} of a bank without it")))?;
+        let before = table.charged_bytes();
+        let floor_charge = charge(self.floor)?;
+        let returned = bank
+            .cache
+            .changes()
+            .clone()
+            .back(|_| {
+                match table.resize(to).map_err(|error| ReclaimError::Invariant(error.to_string()))? {
+                    Ok(()) => {}
+                    Err(refusal) => return Err(ReclaimError::Invariant(format!("stored table refused shrink: {refusal}"))),
+                }
+                let after = table.charged_bytes();
+                let released = before.saturating_sub(after);
+                let above = charge(table.records())?.saturating_sub(floor_charge);
+                bank.cache.fit(holding, above);
+                let returned = bank
+                    .return_freed_sync(tier, released.max(need))
+                    .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+                Ok(returned)
+            })?;
+        match returned {
+            0 => Err(ReclaimError::AtFloor),
+            n => Ok(n),
+        }
+    }
+}
 
 /// A load's expert bank as the domain resizes it (`ElasticBank`): the bank
 /// and the stored tables it holds (`ExpertBankPlan::tables`), the one owner
@@ -39,6 +103,17 @@ impl ServedBank {
         recorded: &mut Recorded,
     ) -> Result<Self, DomainError> {
         bank.cache.served_on(ledgers, bank.plan.host_slots);
+        for (index, held) in tables.iter().enumerate() {
+            bank.cache.set_table_reclaimer(
+                index,
+                Arc::new(TableReclaimer {
+                    bank: Arc::downgrade(&bank),
+                    table: Arc::downgrade(&held.table),
+                    index,
+                    floor: held.plan.floor,
+                }),
+            );
+        }
         let served = Self {
             bank,
             tables,
@@ -69,7 +144,8 @@ impl ServedBank {
                 BankHolding::Host if served.bank.plan.host_slots > 0 => {}
                 holding => {
                     let reclaim = served.bank.cache.reclaim_for(holding);
-                    served.bank.cache.hold(holding, recorded.carve(&store, CommittedKind::Backing(crate::memory::ledger::PoolClass::Records), above).into_backed_cache(CacheKind::Bank, reclaim));
+                    let kind = super::cache::BankCache::cache_kind(holding);
+                    served.bank.cache.hold(holding, recorded.carve(&store, CommittedKind::Backing(crate::memory::ledger::PoolClass::Records), above).into_backed_cache(kind, reclaim));
                 }
             }
         }
@@ -277,6 +353,10 @@ impl ElasticBank for ServedBank {
 
     fn closed(&self, request: crate::operation::RequestId) {
         self.bank.watcher.shared().closed(request);
+    }
+
+    fn draft_window(&self, estimated_seconds: f64) {
+        self.bank.watcher.shared().draft_window(estimated_seconds);
     }
 
     fn stop_growths(&self) {

@@ -328,9 +328,16 @@ impl StreamedLayers {
 
     /// The free path records needed for moves of `bytes` stored bytes along
     /// `read`, the bank holding `held` with `hint_leads` lookahead layers
-    /// across `num_layers` routed layers and decode compute time `compute`.
+    /// across `num_layers` routed layers, decode compute time `compute` (at
+    /// one row), and decode/verify passes of up to `decode_rows` rows.
     /// Single owner shared by [`crate::BankPrices::paths`] and assessment's
     /// path pricer.
+    ///
+    /// `ahead` staging records are sized for the demand queue across
+    /// `hint_leads` layers at `decode_rows` rows so multi-row verify bursts
+    /// do not starve read-ahead staging, while `reserve` covers both `ahead`
+    /// and the single-row decode step's victim release wait without wasting
+    /// bank slots.
     pub fn path_records(
         &self,
         read: ReadLine,
@@ -339,16 +346,25 @@ impl StreamedLayers {
         held: HeldSlots,
         hint_leads: u64,
         num_layers: u64,
+        decode_rows: u64,
     ) -> Option<crate::PathRecords> {
-        let period = self.prepare(None, held, 1.0);
-        let step = period.step_seconds(read, compute).total_seconds;
-        let reads = period.step_seconds(read, FormSeconds { resident: 0., streamed: 0. }).total_seconds;
+        assert!(decode_rows > 0, "invariant violated: path_records decode_rows must be positive");
+        let single = self.prepare(None, held, 1.0);
+        let step = single.step_seconds(read, compute).total_seconds;
+        let single_reads = single.step_seconds(read, FormSeconds { resident: 0., streamed: 0. }).total_seconds;
+        let burst_reads = if decode_rows == 1 {
+            single_reads
+        } else {
+            self.prepare(None, held, decode_rows as f64)
+                .step_seconds(read, FormSeconds { resident: 0., streamed: 0. })
+                .total_seconds
+        };
         let queue = if num_layers == 0 {
             0.0
         } else {
-            hint_leads as f64 * (reads / num_layers as f64)
+            hint_leads as f64 * (burst_reads / num_layers as f64)
         };
-        crate::PathRecords::of(read, bytes, queue, crate::PathRecords::release(step, reads))
+        crate::PathRecords::of(read, bytes, queue, crate::PathRecords::release(step, single_reads))
     }
 }
 

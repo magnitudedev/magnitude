@@ -59,15 +59,16 @@ use crate::experts::Words;
 use crate::experts::directory::{Directory, HostRecord, Point};
 use crate::experts::host_records::{Claim, Grant, Located, Taking};
 use crate::experts::compute::Urgency;
-use crate::experts::interest::{Act, Admit, Class, Ledger, Name, Origin, Read as ReadState, Scheduled, Source, Told, When};
+use crate::experts::interest::{Act, Admit, Class, Ledger, Name, Origin, Read as ReadState, Scheduled, Source, When};
 use super::Step;
 use crate::experts::landing::{Answer, Converting, DeviceLanding, Ended};
 use crate::experts::source::{Outcome, Read, Ticket};
 use crate::experts::staging::{Staged, StagingPool};
+use magnitude_cost_model::LinkIdleBudget;
 use seismic_io::Want;
 use magnitude_kernels::constants;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -284,6 +285,9 @@ struct Inbound {
     need: Need,
     ended: Ended,
     urgency: Arc<Urgency>,
+    /// True once this inbound's drive read has finished (even if its
+    /// `DeviceLanding` or host `Converting` has not yet settled).
+    read_done: Arc<AtomicBool>,
 }
 
 /// Why an expert is inbound, with the read that brings it.
@@ -305,13 +309,18 @@ enum Ahead {
     /// The covering tier's ([`Prefetch::cover`]), undated, which no
     /// interest names.
     Cover,
+    /// Carryover prefetch from the reuse ranking (`Directory::reuse_now`),
+    /// issued during an MTP `DraftWindow` (`draft == true`, cancelled if
+    /// unbegun on `Told::Began`) or within idle SSD slack between parks
+    /// (`draft == false`, capped by `ReadAdmission::prefetch_byte_budget`).
+    Carryover { draft: bool },
 }
 
 impl Ahead {
     /// How its landing takes its tier record.
     fn taking(self) -> Taking {
         match self {
-            Self::Interest { .. } => Taking::Ahead,
+            Self::Interest { .. } | Self::Carryover { .. } => Taking::Ahead,
             Self::Cover => Taking::Out,
         }
     }
@@ -327,12 +336,12 @@ impl Inbound {
     }
 
     /// The step that read it: a request's, or the route's that published
-    /// its interest; none for the cover's.
+    /// its interest; none for the cover's or carryover's.
     fn read(&self) -> Option<Step> {
         match &self.need {
             Need::Due { read, .. } => Some(*read),
             Need::Ahead { ahead: Ahead::Interest { issued, .. }, .. } => Some(issued.point.sequence),
-            Need::Ahead { ahead: Ahead::Cover, .. } => None,
+            Need::Ahead { ahead: Ahead::Cover | Ahead::Carryover { .. }, .. } => None,
         }
     }
 }
@@ -407,7 +416,10 @@ fn ring_entries(ring: &Words, base: usize, seen: i32, choices: u64) -> Option<Ri
     (ring.load(base + constants::RING_SEQUENCE as usize) == low).then_some((low, guesses, entries))
 }
 
-/// The staging records and the reads into them.
+/// The staging records and the reads into them (Path 1: NVMe -> RAM / bank).
+/// The shared `NameLedger` (`experts::interest::Ledger`) is owned by
+/// `Residency` and passed in so both Path 1 (`Prefetch`) and Path 0
+/// (`LinkMover`) schedule from one ledger.
 pub(super) struct Prefetch {
     /// Staging record indices, valid in every pool, under their own lock:
     /// the request service's look takes a request's beside residency.
@@ -418,15 +430,19 @@ pub(super) struct Prefetch {
     /// How far the device is known to be (`Residency::advance`), which ends
     /// the landings it converted behind it.
     past: Point,
-    /// The interest ledger (`experts::interest`): the one owner of what is
-    /// wanted, by when and how surely, of which this derives every read.
-    /// Other threads reach it through `inbox` ([`Self::learn`]).
-    ledger: Ledger,
-    inbox: Receiver<Told>,
     /// Per layer, the low word of the last step each of its rings was read
     /// for: its hint rings' rows by lead, then its front ring
     /// ([`FRONT_RING`]).
     seen: Vec<[i32; RINGS]>,
+    /// Speculative prefetch bytes issued during the current active decode/verify
+    /// step (reset on `Told::Began` and `Told::DraftWindow`), capped by
+    /// `PathAdmission::prefetch_byte_budget` in slack-bearing regimes.
+    step_prefetch_bytes: u64,
+    /// Set whenever a drive read completes (including `DeviceLanding` demand
+    /// reads on unified memory that stay in `inbound` until the next layer
+    /// parks), so `Residency::rings` / `Residency::hasten` immediately drives
+    /// lookahead reads into the newly freed drive window.
+    reads_finished: Arc<AtomicBool>,
 }
 
 /// A layer's rings: its hint rings' rows by lead, then its front ring.
@@ -453,40 +469,37 @@ impl<'a> Priced<'a> {
     }
 }
 
-/// Remaining shared-drive idle compute window (`c_layer - queued_drive`)
-/// during one `Prefetch::derive` pass (`designs/streamed-decode.md` §5):
-/// the drive is a single shared resource across all layers, so one layer's
-/// compute `c_layer = compute / layers` is compared against all reads
-/// currently occupying the drive (every `Need::Due` plus every already-begun
-/// or out-of-pass `Need::Ahead` across all layers), lazily initialized on
-/// first query and decremented as reads ahead are admitted in priority order
-/// inside `Ledger::schedule`.
-struct IdleBudget {
+/// Lazy Drive-path wrapper around [`magnitude_cost_model::LinkIdleBudget`] so
+/// due-only derivations never lock telemetry.
+struct DriveIdleBudget {
     layers: usize,
     queued_bytes: Vec<u64>,
-    remaining: std::cell::Cell<Option<f64>>,
+    draft_idle: f64,
+    budget: std::cell::Cell<Option<LinkIdleBudget>>,
 }
 
-impl IdleBudget {
-    fn new(layers: usize, queued_bytes: Vec<u64>) -> Self {
-        Self { layers, queued_bytes, remaining: std::cell::Cell::new(None) }
+impl DriveIdleBudget {
+    fn new(layers: usize, queued_bytes: Vec<u64>, draft_idle: f64) -> Self {
+        Self { layers, queued_bytes, draft_idle, budget: std::cell::Cell::new(None) }
     }
 
     fn get(&self, price: &super::telemetry::ReadPrice) -> f64 {
-        if let Some(rem) = self.remaining.get() {
-            return rem;
+        if let Some(budget) = self.budget.get() {
+            return budget.remaining();
         }
         let c_layer = if self.layers == 0 { 0.0 } else { price.compute() / self.layers as f64 };
         let queued: f64 = self.queued_bytes.iter().map(|&bytes| price.transfer_seconds(bytes)).sum();
-        let rem = (c_layer - queued).max(0.0);
-        self.remaining.set(Some(rem));
+        let budget = LinkIdleBudget::new(c_layer, self.draft_idle, queued);
+        let rem = budget.remaining();
+        self.budget.set(Some(budget));
         rem
     }
 
     fn consume(&self, price: &super::telemetry::ReadPrice, transfer_seconds: f64) {
-        let rem = self.get(price);
-        if rem > 0.0 {
-            self.remaining.set(Some((rem - transfer_seconds).max(0.0)));
+        let _ = self.get(price);
+        if let Some(mut budget) = self.budget.get() {
+            budget.consume(transfer_seconds);
+            self.budget.set(Some(budget));
         }
     }
 }
@@ -497,7 +510,7 @@ impl IdleBudget {
 struct Admitting<'a> {
     priced: &'a Priced<'a>,
     bytes: u64,
-    idle: &'a IdleBudget,
+    idle: &'a DriveIdleBudget,
 }
 
 impl Admit for Admitting<'_> {
@@ -512,27 +525,40 @@ impl Admit for Admitting<'_> {
 }
 
 impl Prefetch {
-    /// `records` staging records, every one free, for layers in `groups`
-    /// whose rings name `ranks` experts a row, its ledger rolling on
-    /// `time`'s epochs and counting verdicts into `ranking`'s `Stands`.
-    pub(super) fn new(
-        records: u32,
-        groups: Vec<usize>,
-        ranks: usize,
-        time: crate::experts::horizon::Time,
-        inbox: Receiver<Told>,
-        ranking: &crate::experts::reuse::Ranking,
-    ) -> Self {
-        let layers = groups.len();
-        let (_, stands) = crate::experts::reuse::Reuse::of(ranking).rates();
+    /// `records` staging records, every one free, for `layers` streamed layers.
+    pub(super) fn new(records: u32, layers: usize) -> Self {
         Self {
             staging: Arc::new(StagingPool::new(records)),
             inbound: HashMap::new(),
             past: Point::START,
-            ledger: Ledger::new(groups, ranks, time, stands),
-            inbox,
             seen: vec![[0; RINGS]; layers],
+            step_prefetch_bytes: 0,
+            reads_finished: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Consume whether any drive read finished since last checked.
+    pub(super) fn take_reads_finished(&self) -> bool {
+        self.reads_finished.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether any NVMe read or landing into host RAM is currently active
+    /// (used by `DomainBudget` for shared DDR5 bandwidth accounting).
+    pub(super) fn landing_active(&self) -> bool {
+        !self.inbound.is_empty()
+    }
+
+    /// Called by `Residency::learn` when `Told::Began` arrives: reset per-step
+    /// speculative byte accounting and cancel unbegun draft-window carryover
+    /// reads so layer-0 demand never queues behind them.
+    pub(super) fn on_began(&mut self) {
+        self.step_prefetch_bytes = 0;
+        self.cancel_draft_carryover();
+    }
+
+    /// Called by `Residency::learn` when `Told::DraftWindow` arrives.
+    pub(super) fn on_draft_window(&mut self) {
+        self.step_prefetch_bytes = 0;
     }
 
     /// The low word of the last step `layer`'s front ring was read for.
@@ -552,16 +578,20 @@ impl Prefetch {
     pub(super) fn demand(&mut self, core: &Core, named: Named, naming: Naming, at: Point, landings: &Arc<Landings>, shared: &Arc<Shared>) {
         let Named { expert, posting: Posting { ticket, join }, staged, grant, rows, answer } = named;
         let (ended, urgency, tier) = (Ended::new(shared.events()), Urgency::waited(), grant.record());
+        let read_done = Arc::new(AtomicBool::new(false));
         let device = core.layers[naming.layer]
             .landing
             .as_ref()
             .map(|list| Arc::new(DeviceLanding::new(list.clone(), at, ended.clone(), shared.landings.clone())));
-        let (serving, end) = (shared.clone(), ended.clone());
+        let (serving, end, done, finished) = (shared.clone(), ended.clone(), read_done.clone(), self.reads_finished.clone());
         match &device {
             Some(device) => {
                 let device = device.clone();
                 join.claimed(move |outcome, failed| {
+                    done.store(true, Ordering::Release);
+                    finished.store(true, Ordering::Release);
                     if !read_named(&serving, naming, (&rows, &answer), &outcome, failed, &end) {
+                        serving.events().notify();
                         return;
                     }
                     // Appended while the step owns its slot: a read ending
@@ -573,13 +603,21 @@ impl Prefetch {
                         Some(false) => answer.publish(None),
                         None => end.set(false),
                     }
+                    // Wake residency/requests now that the drive slot is free:
+                    // `DeviceLanding::end` waits until the next layer parks, so
+                    // without this notification lookahead reads cannot enter the
+                    // idle compute window between layers on unified memory.
+                    serving.events().notify();
                 });
             }
             None => {
                 let landing = core.landing(grant, staged);
                 let (landings, urgent) = (landings.clone(), urgency.clone());
                 join.claimed(move |outcome, failed| {
+                    done.store(true, Ordering::Release);
+                    finished.store(true, Ordering::Release);
                     if !read_named(&serving, naming, (&rows, &answer), &outcome, failed, &end) {
+                        serving.events().notify();
                         return;
                     }
                     landings.read();
@@ -595,11 +633,12 @@ impl Prefetch {
                         })
                     };
                     serving.compute.submit(Arc::new(converting));
+                    serving.events().notify();
                 });
             }
         }
         let need = Need::Due { ticket, read: naming.sequence, device };
-        self.arrive((naming.layer, expert), Inbound { record: Some(staged), tier, need, ended, urgency });
+        self.arrive((naming.layer, expert), Inbound { record: Some(staged), tier, need, ended, urgency, read_done });
     }
 
     /// The landing of `staged` in flight a request finds, by what read it:
@@ -612,7 +651,7 @@ impl Prefetch {
         }
         Some(match inbound.need {
             Need::Ahead { ahead: Ahead::Interest { issued, .. }, .. } => Reading::Predicted(issued),
-            Need::Due { .. } | Need::Ahead { ahead: Ahead::Cover, .. } => Reading::Unpredicted,
+            Need::Due { .. } | Need::Ahead { ahead: Ahead::Cover | Ahead::Carryover { .. }, .. } => Reading::Unpredicted,
         })
     }
 
@@ -639,6 +678,7 @@ impl Prefetch {
             Need::Ahead { ahead: Ahead::Interest { source: Source::Ahead(_), .. }, .. } => 3,
             Need::Ahead { ahead: Ahead::Interest { .. }, .. } => 1,
             Need::Ahead { ahead: Ahead::Cover, .. } => 2,
+            Need::Ahead { ahead: Ahead::Carryover { .. }, .. } => 4,
         });
         if !inbound.urgency.is_waited() {
             inbound.ticket().reprice(inbound.urgency.get().min(Want::now()));
@@ -651,43 +691,29 @@ impl Prefetch {
     /// flight for it is hastened to demand (`Self::hasten`), as is the
     /// cover's. The request reads an absent one itself (`Decode`). Certain
     /// and due, no read here is priced or scheduled through `derive`.
-    pub(super) fn want(&mut self, core: &Core, shared: &Arc<Shared>, at: At, experts: &[usize]) {
+    pub(super) fn want(&mut self, core: &Core, ledger: &mut Ledger, shared: &Arc<Shared>, at: At, experts: &[usize]) {
         let (sequence, layer) = (at.point.sequence, at.point.layer);
-        self.ledger.reach(sequence, layer);
+        ledger.reach(sequence, layer);
         let now = Instant::now();
         for &expert in experts {
             let staged = (layer, expert);
             let reading = matches!(self.read_state(core, staged), ReadState::Reading { .. });
-            self.ledger.requested(layer, expert, reading);
+            ledger.requested(layer, expert, reading);
             let name = Name { source: Source::Exact, when: When::Step(sequence), rank: 0, from: at, candidate: false, lineage: None };
-            self.ledger.publish(layer, expert, name, now);
+            ledger.publish(layer, expert, name, now);
             if reading {
                 self.hasten(staged);
             }
         }
-        self.spend(shared);
+        Self::spend(ledger, shared);
     }
 
-    /// Pass the predicted interests whose step's route is done at their
-    /// layer, so no read can serve them any more (`Ledger::pass`), and
-    /// derive their reads again: one nothing else wants that no worker has
-    /// begun and no step waits on is cancelled. A route is done once the
-    /// request the service just served (`served`, its step and layer) is at
-    /// or past it, its step has ended, or a ring showed its route done with
-    /// no request there (`Ledger::routed`: a request is published before
-    /// those rings, so one absent then was never made). A read begun is not
-    /// cancelled (its bytes would be wasted and the expert read again): it
-    /// lands and falls to the ranking. A cancelled read reads nothing more,
-    /// so it takes no source time from demand; its read ends failed, which
-    /// frees its staging and tier records ([`Self::settle`]), and a later
-    /// request for its expert reads it anew. A store seen out of that order
-    /// only costs that read.
-    pub(super) fn pass(&mut self, core: &mut Core, shared: &Arc<Shared>, served: Option<(Step, usize)>) {
+    pub(super) fn pass(&mut self, core: &mut Core, ledger: &mut Ledger, shared: &Arc<Shared>, served: Option<(Step, usize)>) {
         let steps = &shared.steps;
         let mut changed = Vec::new();
         for layer in 0..core.layers.len() {
-            let (routed, file) = (self.ledger.routed(layer), &core.layers[layer].file);
-            let passed = self.ledger.pass(layer, Instant::now(), |interest| {
+            let (routed, file) = (ledger.routed(layer), &core.layers[layer].file);
+            let passed = ledger.pass(layer, Instant::now(), |interest| {
                 let step = interest.step();
                 served.is_some_and(|(sequence, at)| (step, layer) <= (sequence, at))
                     || steps.ended(step)
@@ -696,7 +722,7 @@ impl Prefetch {
             changed.extend(passed.into_iter().map(|expert| (layer, expert)));
         }
         if !changed.is_empty() {
-            self.derive(core, shared, Some(changed.as_slice()));
+            self.derive(core, ledger, shared, Some(changed.as_slice()));
         }
     }
 
@@ -713,7 +739,7 @@ impl Prefetch {
     /// the expert again once nothing holds.
     pub(super) fn cancel_cover(&mut self) {
         for inbound in self.inbound.values_mut() {
-            let Need::Ahead { ticket, ahead: Ahead::Cover } = &mut inbound.need else {
+            let Need::Ahead { ticket, ahead: Ahead::Cover | Ahead::Carryover { .. } } = &mut inbound.need else {
                 continue;
             };
             if !inbound.urgency.is_waited() && !ticket.cancelled() {
@@ -722,20 +748,35 @@ impl Prefetch {
         }
     }
 
+    /// Cancel any unbegun draft-window carryover reads the instant the next
+    /// decode/verify step begins (`Told::Began`), so layer-0 demand reads
+    /// never queue behind speculative draft-window prefetches.
+    fn cancel_draft_carryover(&mut self) {
+        for inbound in self.inbound.values_mut() {
+            let Need::Ahead { ticket, ahead: Ahead::Carryover { draft: true } } = &mut inbound.need else {
+                continue;
+            };
+            if !inbound.urgency.is_waited() && !ticket.begun() && !ticket.cancelled() {
+                ticket.cancel();
+            }
+        }
+    }
+
     /// Staging and what is in flight into it, for the exchange's watchdog.
     pub(super) fn describe(&self) -> String {
-        let [mut hints, mut fronts, mut covers, mut due, mut running] = [0; 5];
+        let [mut hints, mut fronts, mut covers, mut carryover, mut due, mut running] = [0; 6];
         for inbound in self.inbound.values() {
             match inbound.need {
                 Need::Due { .. } => due += 1,
                 Need::Ahead { ahead: Ahead::Interest { source: Source::Ahead(_), .. }, .. } => fronts += 1,
                 Need::Ahead { ahead: Ahead::Interest { .. }, .. } => hints += 1,
                 Need::Ahead { ahead: Ahead::Cover, .. } => covers += 1,
+                Need::Ahead { ahead: Ahead::Carryover { .. }, .. } => carryover += 1,
             }
             running += usize::from(inbound.ticket().running());
         }
         format!(
-            "staging {} free of {}; inbound: hints {hints}, front {fronts}, covers {covers}, due {due}; reads running for {running}",
+            "staging {} free of {}; inbound: hints {hints}, front {fronts}, covers {covers}, carryover {carryover}, due {due}; reads running for {running}",
             self.staging.free(),
             self.staging.records(),
         )
@@ -762,16 +803,10 @@ impl Prefetch {
         self.past
     }
 
-    /// Settle the landings that ended (their ends mapped or failed their
-    /// experts): each tier record keeps its expert in `directory`, or is
-    /// ready again, and each staging record frees; and each device landing's
-    /// staging record whose entry the device stored DONE for, its landing
-    /// ending only once the device is past its launch
-    /// (`DeviceLanding::end`). Where the device parks in its kernels the
-    /// request service's pass reads those words while a step runs, so a
-    /// request's later misses read into the records its earlier ones free.
-    /// True when any ended or freed.
-    pub(super) fn settle(&mut self, directory: &mut Directory) -> bool {
+    /// Settle the landings that ended: returns `(settled, newly_landed)` where
+    /// `newly_landed` lists every `(layer, expert)` that just landed into
+    /// Tier 1 (used for Path 1 -> Path 0 pipeline chain-through to `LinkMover`).
+    pub(super) fn settle(&mut self, directory: &mut Directory, ledger: &mut Ledger) -> (bool, Vec<Staged>) {
         let mut freed = false;
         for inbound in self.inbound.values_mut() {
             if let Need::Due { device: Some(device), .. } = &inbound.need {
@@ -791,21 +826,25 @@ impl Prefetch {
             None => true,
         });
         let settled = freed || !ended.is_empty();
+        let mut newly_landed = Vec::new();
         for (record, staged, tier, read, landed) in ended {
-            self.ended(directory, record, staged, tier, read, landed);
+            if landed {
+                newly_landed.push(staged);
+            }
+            self.ended(directory, ledger, record, staged, tier, read, landed);
         }
-        settled
+        (settled, newly_landed)
     }
 
     /// A landing of `staged` from staging record `record` (none, freed
     /// already) into tier record `tier`, read at step `read` (none for the
     /// cover's), ended: landed or not.
-    fn ended(&mut self, directory: &mut Directory, record: Option<u32>, staged: Staged, tier: u32, read: Option<Step>, landed: bool) {
+    fn ended(&mut self, directory: &mut Directory, ledger: &mut Ledger, record: Option<u32>, staged: Staged, tier: u32, read: Option<Step>, landed: bool) {
         let (layer, expert) = staged;
         match landed {
             true => {
                 directory.landed(layer, HostRecord(tier), expert, read);
-                self.ledger.landed(layer, expert, Instant::now());
+                ledger.landed(layer, expert, Instant::now());
             }
             false => directory.unlanded(layer, HostRecord(tier)),
         }
@@ -814,77 +853,39 @@ impl Prefetch {
         }
     }
 
-    /// The calibrated probability of `combination` at `layer` (test helper).
-    #[cfg(test)]
-    pub(super) fn rate(&mut self, layer: usize, combination: crate::experts::interest::Combination) -> f64 {
-        self.ledger.rate(layer, combination)
+    /// Read changed rings (before `Residency::learn` drains `Told`).
+    pub(super) fn read_rings_raw(&mut self, core: &Core) -> Vec<RingRead> {
+        self.read_rings(core)
     }
 
-    /// Learn what other threads told the ledger (`Told`), in the order told:
-    /// a completion's resolutions count into the hints' recall and
-    /// precision, and a verdict's judged front rows into the front gate's
-    /// wrong rate. True when any was told.
-    pub(super) fn learn(&mut self, shared: &Shared) -> bool {
-        let mut told = false;
-        while let Ok(event) = self.inbox.try_recv() {
-            told = true;
-            let completed = matches!(&event, Told::Completed { .. });
-            let learned = self.ledger.tell(event);
-            if completed {
-                shared.telemetry.resolved(&learned.resolved, &learned.cohorts);
-            }
-        }
-        let (judged, accepted) = self.ledger.take_judged();
-        if !judged.is_empty() || !accepted.is_empty() {
-            shared.telemetry.judged(&judged, &accepted);
-        }
-        self.spend(shared);
-        told
-    }
-
-    /// Read each layer's rings that changed, its hint rings and its front
-    /// ring, then learn what was told ([`Self::learn`]) and publish the names
-    /// of the rings of a step whose request at the named layer is not yet
-    /// noticed (`served`, each layer's last request noticed; a later one's
-    /// names are decided, its route there having chosen) to the ledger
-    /// ([`Self::admit`]); then derive every read from it ([`Self::drive`]).
-    /// The rings are read before the ledger learns, so every launch a ring
-    /// names has been told it (a launch is told before it is queued). Each
-    /// entry names the batch row whose choice named it (`Ledger::row`), and
-    /// so the step its name is for: an exact row's, the ring's own step; an
-    /// ahead row's, the step its token is exact in, its lineage the ahead
-    /// row's. A hint ring row of lead `d` names the layer `d` ahead
-    /// (`Source::Lead`); a front ring names its own layer (`Source::Ahead`).
-    /// Reads ahead only ever read the file: where the host tier keeps every
-    /// expert (`Directory::tier_complete`) nothing is a candidate, and no
-    /// ring is read. True when it read any ring, learned anything or read
-    /// any expert.
-    /// Read changed rings, drain what other threads told the ledger, and
-    /// resolve each live ring's step and device progress point so residency
-    /// can retire graced records behind that point before admitting names.
-    pub(super) fn begin_rings(&mut self, core: &Core, shared: &Shared) -> RingsRead {
-        let read = self.read_rings(core);
-        let told = self.learn(shared);
+    /// Resolve each live ring's step and device progress point after
+    /// `Residency::learn` has drained `Told`.
+    pub(super) fn resolve_rings(&mut self, core: &Core, ledger: &mut Ledger, shared: &Shared, read: Vec<RingRead>, told: bool) -> RingsRead {
         let any = !read.is_empty();
-        let (named, latest) = self.name(core, shared, read);
+        let (named, latest) = self.name(core, ledger, shared, read);
         RingsRead { named, latest, any, told }
     }
 
-    /// Admit `named` from `begin_rings`, and derive reads whenever rings
-    /// arrived, events were told, or capacity freed.
+    /// Admit `named` from `resolve_rings` into `ledger`, and derive Drive reads
+    /// whenever rings arrived, events were told, or capacity freed.
     pub(super) fn finish_rings(
         &mut self,
         core: &mut Core,
+        ledger: &mut Ledger,
         shared: &Arc<Shared>,
         RingsRead { named, any, told, .. }: RingsRead,
         freed: bool,
         served: &[Step],
     ) -> bool {
         for (target, names) in named {
-            self.admit(core, shared, target, names, served);
+            self.admit(core, ledger, shared, target, names, served);
         }
         if any || told || freed {
-            self.drive(core, shared);
+            if !core.directory.tier_complete() {
+                self.drive(core, ledger, shared);
+            } else {
+                self.pass(core, ledger, shared, None);
+            }
             true
         } else {
             false
@@ -914,7 +915,7 @@ impl Prefetch {
     /// The names the rings `read` make, by the layer each names, of the steps
     /// not ended: a ring of a step that ended is skipped, and the layers its
     /// route showed done are the ledger's to know ([`Ledger::route_seen`]).
-    fn name(&mut self, core: &Core, shared: &Shared, read: Vec<RingRead>) -> (Vec<(usize, Vec<RingName>)>, Option<Point>) {
+    fn name(&mut self, core: &Core, ledger: &mut Ledger, shared: &Shared, read: Vec<RingRead>) -> (Vec<(usize, Vec<RingName>)>, Option<Point>) {
         let (experts, selected) = (|layer: usize| core.layers[layer].experts, core.extents.selected);
         // Each entry's expert, rank and row checked: a ring of another shape
         // is the device's broken invariant.
@@ -936,13 +937,13 @@ impl Prefetch {
             match ring {
                 FRONT_RING => {
                     // Published once the route's request was.
-                    self.ledger.route_seen(sequence, layer);
+                    ledger.route_seen(sequence, layer);
                     // A front row that ran on no guess names nothing.
                     let names = entries
                         .into_iter()
                         .filter_map(|entry| {
                             let (expert, rank, row) = checked(layer, entry);
-                            let Origin::Ahead { row: ahead, when, lineage } = self.ledger.row(sequence, row, guesses)? else {
+                            let Origin::Ahead { row: ahead, when, lineage } = ledger.row(sequence, row, guesses)? else {
                                 panic!("step {sequence}'s front ring at layer {layer} names row {row}, which is no ahead row");
                             };
                             assert!(!ahead.acceptable(), "step {sequence}'s front ring at layer {layer} names row {row}, an acceptable row");
@@ -955,14 +956,14 @@ impl Prefetch {
                     // this layer give way ([`Ledger::supersede`]).
                     let requests = names.iter().filter_map(|name| name.name.lineage.map(|lineage| lineage.request)).collect::<BTreeSet<_>>();
                     for request in requests {
-                        self.ledger.supersede(layer, request, sequence);
+                        ledger.supersede(layer, request, sequence);
                     }
                     named.push((layer, names));
                 }
                 lead => {
                     // The route before published its request before this ring.
                     if let Some(before) = layer.checked_sub(1) {
-                        self.ledger.route_seen(sequence, before);
+                        ledger.route_seen(sequence, before);
                     }
                     let target = core.layers[layer].hints[lead];
                     let distance = u8::try_from(lead + 1).expect("a ring's leads fit a byte");
@@ -970,7 +971,7 @@ impl Prefetch {
                         .into_iter()
                         .filter_map(|entry| {
                             let (expert, rank, row) = checked(target, entry);
-                            let (ahead, when, lineage) = match self.ledger.row(sequence, row, guesses)? {
+                            let (ahead, when, lineage) = match ledger.row(sequence, row, guesses)? {
                                 Origin::Exact => (None, When::Step(sequence), None),
                                 Origin::Ahead { row, when, lineage } => (Some(row), when, Some(lineage)),
                             };
@@ -1004,7 +1005,7 @@ impl Prefetch {
     /// candidate an exact row's hint newly published counts with its step,
     /// with whether its probability reached the read-ahead break-even
     /// (`Telemetry::hints_named`).
-    fn admit(&mut self, core: &Core, shared: &Arc<Shared>, target: usize, names: Vec<RingName>, served: &[Step]) {
+    fn admit(&mut self, core: &Core, ledger: &mut Ledger, shared: &Arc<Shared>, target: usize, names: Vec<RingName>, served: &[Step]) {
         let recording = seismic_io::timeline::recording();
         let (price, bytes) = (Priced::new(&shared.telemetry), core.layers[target].expert_bytes());
         let mut hinted = Vec::new();
@@ -1035,10 +1036,10 @@ impl Prefetch {
             if !candidate {
                 note(Fate::Held, expert, &name);
             }
-            self.ledger.reach(name.from.point.sequence, name.from.point.layer);
-            let published = self.ledger.publish(target, expert, Name { candidate, ..name }, now);
+            ledger.reach(name.from.point.sequence, name.from.point.layer);
+            let published = ledger.publish(target, expert, Name { candidate, ..name }, now);
             if let (Source::Lead { distance, row: None }, When::Step(step), Some(p), true) = (name.source, name.when, published, candidate) {
-                hinted.push((step, name.from.point.layer, distance, price.get().admits(p, bytes)));
+                hinted.push((step, name.from.point.layer, distance, price.get().admits_for_layers(p, bytes, core.layers.len())));
             }
         }
         if !hinted.is_empty() {
@@ -1064,11 +1065,15 @@ impl Prefetch {
     }
 
     /// Mark routes and ended steps past, then derive every read from the
-    /// ledger, the soonest wanted first ([`Self::derive`]). True when any
-    /// was read.
-    pub(super) fn drive(&mut self, core: &mut Core, shared: &Arc<Shared>) -> bool {
-        self.pass(core, shared, None);
-        self.derive(core, shared, None)
+    /// ledger, the soonest wanted first ([`Self::derive`]), and fill any idle
+    /// drive window (MTP `DraftWindow` or in-step slack between `routed_land`
+    /// parks) with victim-admitted carryover prefetches
+    /// ([`Self::prefetch_carryover`]). True when any was read.
+    pub(super) fn drive(&mut self, core: &mut Core, ledger: &mut Ledger, shared: &Arc<Shared>) -> bool {
+        self.pass(core, ledger, shared, None);
+        let mut read = self.derive(core, ledger, shared, None);
+        read |= self.prefetch_carryover(core, ledger, shared);
+        read
     }
 
     /// Where `staged`'s read stands, as the ledger is told it: read ahead
@@ -1086,15 +1091,21 @@ impl Prefetch {
     }
 
     /// Expert bytes of every inbound read currently occupying the shared drive:
-    /// every demand read (`Need::Due`), plus every already-begun ahead read or
-    /// unbegun, uncancelled ahead read outside `seen` (partial `derive` from
-    /// `pass`), across all layers.
+    /// every active demand read (`Need::Due` whose drive read has not yet
+    /// finished), plus every already-begun active ahead read or unbegun,
+    /// uncancelled ahead read outside `seen` (partial `derive` from `pass`),
+    /// across all layers.
     fn drive_queued_bytes(&self, expert_bytes: impl Fn(usize) -> u64, seen: &HashSet<Staged>) -> Vec<u64> {
         self.inbound
             .iter()
-            .filter(|(staged, inbound)| match &inbound.need {
-                Need::Due { .. } => true,
-                Need::Ahead { ticket, .. } => ticket.begun() || (!ticket.cancelled() && !seen.contains(staged)),
+            .filter(|(staged, inbound)| {
+                if inbound.read_done.load(Ordering::Acquire) {
+                    return false;
+                }
+                match &inbound.need {
+                    Need::Due { .. } => true,
+                    Need::Ahead { ticket, .. } => ticket.begun() || (!ticket.cancelled() && !seen.contains(staged)),
+                }
             })
             .map(|(staged, _)| expert_bytes(staged.0))
             .collect()
@@ -1114,25 +1125,31 @@ impl Prefetch {
     /// due read is never priced, so deriving the reads requests find due
     /// reads nothing under telemetry's lock ([`Priced`]). True when any was
     /// read.
-    fn derive(&mut self, core: &mut Core, shared: &Arc<Shared>, only: Option<&[Staged]>) -> bool {
+    fn derive(&mut self, core: &mut Core, ledger: &mut Ledger, shared: &Arc<Shared>, only: Option<&[Staged]>) -> bool {
         let reserve = self.reserve(core, false);
         let price = Priced::new(&shared.telemetry);
-        let owed = if only.is_none() { self.ledger.take_owed() } else { Vec::new() };
+        let owed = if only.is_none() { ledger.take_owed() } else { Vec::new() };
         let mut experts = match only {
             Some(only) => only.to_vec(),
-            None => self.ledger.wanted(),
+            None => ledger.wanted(),
         };
         experts.extend(owed);
         let mut seen = HashSet::new();
         experts.retain(|&staged| seen.insert(staged));
+        let draft_idle = ledger.draft_window_remaining(Instant::now());
         let scheduled = {
             let core: &Core = core;
             let queued_bytes = self.drive_queued_bytes(|layer| core.layers[layer].expert_bytes(), &seen);
-            let idle = IdleBudget::new(core.layers.len(), queued_bytes);
+            let idle = DriveIdleBudget::new(core.layers.len(), queued_bytes, draft_idle);
             // Each read's standing, taken before the ledger decides on it.
             let states = experts.iter().map(|&staged| (staged, self.read_state(core, staged))).collect::<HashMap<_, _>>();
             let read = |layer, expert| states[&(layer, expert)];
-            self.ledger.schedule(experts, read, |layer| Admitting { priced: &price, bytes: core.layers[layer].expert_bytes(), idle: &idle })
+            ledger.schedule_for_path(
+                magnitude_cost_model::PathKind::Drive,
+                experts,
+                read,
+                |layer| Admitting { priced: &price, bytes: core.layers[layer].expert_bytes(), idle: &idle },
+            )
         };
         let wanted = |class: Class| match class {
             Class::Due => Want::now(),
@@ -1141,20 +1158,22 @@ impl Prefetch {
             // use ("Order and depth").
             Class::Expected { step, p } => Want::expected(step, p),
         };
+        let in_draft = ledger.in_draft_window();
         let (mut read, mut staging_full) = (false, false);
         for Scheduled { layer, expert, act, leading, .. } in scheduled {
             let staged = (layer, expert);
             match act {
                 Act::Keep | Act::Issue(Class::Due) => {}
                 Act::Reprice(Class::Due) => self.hasten(staged),
-                // A read ahead takes its want's price; the cover's, undated,
-                // is only hastened by a want of its expert.
+                // A read ahead takes its want's price; the cover's and
+                // carryover's, undated, are only hastened by a want of their
+                // expert.
                 Act::Reprice(class) => {
                     if let Some(Inbound { need: Need::Ahead { ticket, ahead }, urgency, .. }) = self.inbound.get(&staged) {
                         if !urgency.is_waited() && !ticket.cancelled() {
                             let want = match ahead {
                                 Ahead::Interest { .. } => wanted(class),
-                                Ahead::Cover => urgency.get().min(wanted(class)),
+                                Ahead::Cover | Ahead::Carryover { .. } => urgency.get().min(wanted(class)),
                             };
                             ticket.reprice(want);
                             urgency.set(want);
@@ -1165,13 +1184,22 @@ impl Prefetch {
                     if let Some(Inbound { need: Need::Ahead { ticket, ahead: Ahead::Interest { .. } }, urgency, .. }) = self.inbound.get_mut(&staged) {
                         if !urgency.is_waited() && !ticket.begun() && !ticket.cancelled() {
                             ticket.cancel();
-                            self.ledger.cancelled(layer, expert);
+                            ledger.cancelled(layer, expert);
                         }
                     }
                 }
                 Act::Issue(class) => {
                     if staging_full {
                         continue;
+                    }
+                    if !in_draft {
+                        let p = price.get();
+                        if !p.binds() {
+                            let budget = p.prefetch_byte_budget();
+                            if budget > 0 && self.step_prefetch_bytes.saturating_add(core.layers[layer].expert_bytes()) > budget {
+                                continue;
+                            }
+                        }
                     }
                     let expected = match class {
                         Class::Expected { step, p } => Some((step, p)),
@@ -1181,7 +1209,10 @@ impl Prefetch {
                     let ahead = Ahead::Interest { source: interest.source, issued: interest.from };
                     match self.read_ahead(core, shared, staged, wanted(class), ahead, expected, reserve) {
                         Ok(bytes) => {
-                            self.ledger.issued(layer, expert, &interest, bytes, Instant::now());
+                            if !in_draft {
+                                self.step_prefetch_bytes = self.step_prefetch_bytes.saturating_add(bytes);
+                            }
+                            ledger.issued(layer, expert, &interest, bytes, Instant::now());
                             shared.telemetry.read_ahead(interest.source, interest.step(), staged, interest.from.point.layer, bytes);
                             read = true;
                             if seismic_io::timeline::recording() {
@@ -1194,14 +1225,128 @@ impl Prefetch {
                 }
             }
         }
-        self.spend(shared);
+        Self::spend(ledger, shared);
+        read
+    }
+
+    fn prefetch_carryover(&mut self, core: &mut Core, ledger: &mut Ledger, shared: &Arc<Shared>) -> bool {
+        let reserve = self.reserve(core, false);
+        let room = self.staging.free().saturating_sub(reserve.0);
+        if room == 0 || core.layers.is_empty() {
+            return false;
+        }
+        let price = Priced::new(&shared.telemetry);
+        let draft_idle = ledger.draft_window_remaining(Instant::now());
+        if draft_idle > 0.0 {
+            let p = price.get();
+            let queued_secs: f64 = self
+                .inbound
+                .iter()
+                .filter(|(_, inbound)| !inbound.read_done.load(Ordering::Acquire))
+                .map(|(&(layer, _), _)| p.transfer_seconds(core.layers[layer].expert_bytes()))
+                .sum();
+            let mut remaining_idle = (draft_idle - queued_secs).max(0.0);
+            if remaining_idle <= 0.0 {
+                return false;
+            }
+            let candidates = {
+                let reuse = core.directory.reuse_now();
+                reuse.top_candidates(room, |layer, expert| Self::candidate(core, (layer, expert)))
+            };
+            let mut read = false;
+            for (rank, layer, expert) in candidates {
+                if self.staging.free() <= reserve.0 {
+                    break;
+                }
+                let bytes = core.layers[layer].expert_bytes();
+                let t_bw = p.transfer_seconds(bytes);
+                if !p.admits_with_idle(0.0, bytes, remaining_idle) {
+                    break;
+                }
+                let want = Want::undated(rank.expected().uses());
+                match self.read_ahead(core, shared, (layer, expert), want, Ahead::Carryover { draft: true }, None, reserve) {
+                    Ok(_) => {
+                        read = true;
+                        remaining_idle = (remaining_idle - t_bw).max(0.0);
+                        if t_bw > 0.0 && remaining_idle <= 0.0 {
+                            break;
+                        }
+                    }
+                    Err(Short::Staging) => break,
+                    Err(Short::Tier | Short::Refused) => {}
+                }
+            }
+            return read;
+        }
+
+        // In-step l+1..=l+4 slack carryover: only when unparked (no active
+        // demand drive read) and within B_budget.
+        if self.inbound.values().any(|inbound| matches!(inbound.need, Need::Due { .. }) && !inbound.read_done.load(Ordering::Acquire)) {
+            return false;
+        }
+        let (reached_step, reached_layer) = ledger.reached();
+        let (step, current_layer) = if (self.past.sequence, self.past.layer) > (reached_step, reached_layer) {
+            (self.past.sequence, self.past.layer)
+        } else {
+            (reached_step, reached_layer)
+        };
+        let (step, current_layer) = match ledger.latest_active_step() {
+            Some(active) if active > step => (active, 0),
+            _ => (step, current_layer),
+        };
+        if step == 0 || shared.steps.ended(step) {
+            return false;
+        }
+        let p = price.get();
+        let budget = p.prefetch_byte_budget();
+        let mut remaining_budget = budget.saturating_sub(self.step_prefetch_bytes);
+        if remaining_budget == 0 {
+            return false;
+        }
+        let layers = core.layers.len();
+        let lo = current_layer.saturating_add(1);
+        if lo >= layers {
+            return false;
+        }
+        let hi = current_layer.saturating_add(4).min(layers - 1);
+        let candidates = {
+            let reuse = core.directory.reuse_now();
+            reuse.top_candidates(room, |layer, expert| layer >= lo && layer <= hi && Self::candidate(core, (layer, expert)))
+        };
+        let layer_idle = p.layer_idle(layers);
+        let mut read = false;
+        for (rank, layer, expert) in candidates {
+            if self.staging.free() <= reserve.0 {
+                break;
+            }
+            let bytes = core.layers[layer].expert_bytes();
+            if bytes > remaining_budget {
+                continue;
+            }
+            if !p.admits_with_idle(0.0, bytes, layer_idle) {
+                break;
+            }
+            let want = Want::undated(rank.expected().uses());
+            match self.read_ahead(core, shared, (layer, expert), want, Ahead::Carryover { draft: false }, None, reserve) {
+                Ok(bytes) => {
+                    self.step_prefetch_bytes = self.step_prefetch_bytes.saturating_add(bytes);
+                    remaining_budget = remaining_budget.saturating_sub(bytes);
+                    read = true;
+                    if remaining_budget == 0 {
+                        break;
+                    }
+                }
+                Err(Short::Staging) => break,
+                Err(Short::Tier | Short::Refused) => {}
+            }
+        }
         read
     }
 
     /// Hand telemetry the reads ahead's fates the ledger learned
     /// (`Ledger::take_spent`).
-    fn spend(&mut self, shared: &Shared) {
-        let spent = self.ledger.take_spent();
+    pub(super) fn spend(ledger: &mut Ledger, shared: &Shared) {
+        let spent = ledger.take_spent();
         if !spent.is_empty() {
             shared.telemetry.spent(&spent);
         }
@@ -1281,9 +1426,10 @@ impl Prefetch {
         // past the reads ahead's staging, whose landings it counts already;
         // none for the cover.
         let keep = ahead_staging.map_or(0, |ahead| core.directory.host(core.layers[target].group).reserve().saturating_sub(ahead));
-        let claim = match expected {
-            Some((step, p)) => core.directory.claim_ahead(target, expert, keep, ahead.taking(), step, p),
-            None => core.directory.claim_landing(target, expert, keep, ahead.taking(), (|_, _| (), |_, _| false)),
+        let claim = match (ahead, expected) {
+            (Ahead::Interest { .. }, Some((step, p))) => core.directory.claim_ahead(target, expert, keep, ahead.taking(), step, p),
+            (Ahead::Carryover { .. }, _) => core.directory.claim_carryover(target, expert, keep, ahead.taking()),
+            _ => core.directory.claim_landing(target, expert, keep, ahead.taking(), (|_, _| (), |_, _| false)),
         };
         let Claim::Taken(grant) = claim else {
             self.staging.release(record);
@@ -1300,12 +1446,15 @@ impl Prefetch {
                 }
                 let ended = Ended::new(shared.events());
                 let urgency = Urgency::ahead(want);
-                let (end, serving, urgent) = (ended.clone(), shared.clone(), urgency.clone());
+                let read_done = Arc::new(AtomicBool::new(false));
+                let (end, serving, urgent, done, finished) = (ended.clone(), shared.clone(), urgency.clone(), read_done.clone(), self.reads_finished.clone());
                 // A read ahead's end: read, its landing is submitted, whose
                 // end maps its tier record; failed, it fails nothing (a step
                 // waiting for it reads its expert anew).
                 join.claimed(move |outcome, failed| {
                     unpanicked(&outcome);
+                    done.store(true, Ordering::Release);
+                    finished.store(true, Ordering::Release);
                     let read = failed.is_empty() && matches!(outcome, Outcome::Read);
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead_read"), 0, (target as i64, expert as i64, read as i64));
                     if read {
@@ -1317,11 +1466,12 @@ impl Prefetch {
                             })
                         };
                         serving.compute.submit(Arc::new(converting));
+                        serving.events().notify();
                         return;
                     }
                     end.set(false);
                 });
-                self.arrive(staged, Inbound { record: Some(record), tier, need: Need::Ahead { ticket, ahead }, ended, urgency });
+                self.arrive(staged, Inbound { record: Some(record), tier, need: Need::Ahead { ticket, ahead }, ended, urgency, read_done });
                 Ok(bytes)
             }
             // The engine took no request: the read stages and lands nothing and
@@ -1339,7 +1489,7 @@ impl Prefetch {
 /// A ring read whole ([`Prefetch::read_rings`]): the layer whose ring it is,
 /// which of its rings (a hint ring's lead, or [`FRONT_RING`]), and the step's
 /// low word, front rows' guess kinds and entries it holds.
-struct RingRead {
+pub(super) struct RingRead {
     layer: usize,
     ring: usize,
     low: i32,
@@ -1365,30 +1515,24 @@ enum Short {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ahead, IdleBudget, Inbound, Need, Prefetch};
+    use super::{Ahead, DriveIdleBudget, Inbound, Need, Prefetch};
     use crate::experts::compute::Urgency;
     use crate::experts::events::Events;
     use crate::experts::horizon::Time;
+    use crate::experts::interest::{Ledger, Stands};
     use crate::experts::landing::Ended;
-    use crate::experts::reuse::Reuse;
     use crate::experts::source::Ticket;
     use crate::experts::watcher::passes::{Pass, Passes};
     use crate::experts::watcher::telemetry::ReadPrice;
     use magnitude_cost_model::ReadLine;
     use seismic_io::Want;
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    /// A request's read posted before residency serves it, or left waiting
-    /// for tier records, or given up while it runs, holds its staging record
-    /// and is in no landing residency tracks: it is outstanding until its
-    /// record frees, so no resize or traffic hold finds the load quiet while
-    /// it may still write into staging.
     #[test]
     fn a_read_holding_staging_outside_the_landings_is_outstanding() {
-        let time = Time::new(&[vec![2]], 32);
-        let ranking = Reuse::ranking(&[4], &[0], &[2], time.clone());
-        let prefetch = Prefetch::new(2, vec![0], 4, time, std::sync::mpsc::channel().1, &ranking);
+        let prefetch = Prefetch::new(2, 1);
         assert!(!prefetch.outstanding(), "nothing read");
         let posted = prefetch.staging.take_up_to(1);
         assert!(prefetch.outstanding(), "a posted read's staging record is taken");
@@ -1396,44 +1540,29 @@ mod tests {
         assert!(!prefetch.outstanding(), "its record freed as it ended");
     }
 
-    /// The drive is a single shared resource across layers: when a `Need::Due`
-    /// demand read is in flight on layer `l - 1` occupying `>= c_layer`, layer
-    /// `l` sees `idle == 0.0` and requires the full drive-bound break-even
-    /// `break_even(read, 0.0)` instead of admitting low-probability hints;
-    /// and when the drive is idle, admitting one hint consumes the shared
-    /// budget across all layers.
     #[test]
     fn shared_drive_idle_budget_counts_demand_and_cross_layer_reads() {
         let layers = 35;
-        let bytes = 1_000_000_u64; // 1 MB -> t_bw = 1.0 ms on 1 GB/s line (plus 0.3 ms latency, ignored by pipelined IdleBudget)
+        let bytes = 1_000_000_u64;
         let line = ReadLine::new(0.3e-3, 1e-9).expect("a line");
         let mut passes = Passes::new(Time::new(&[vec![1]], 8));
-        // compute = 0.1 - 0.065 = 0.035 s -> c_layer = 0.035 / 35 = 0.001 s (1.0 ms).
-        // Drive-bound (0.068 > 0.035), stall = 0.065 / 68 ≈ 0.956 ms <= t_bw = 1.0 ms ->
-        // break_even(1.0 ms, 0.0) = (1.0 / 0.956).min(1.0) = 1.0 (only a certain read pays with no idle window).
         passes.timed(Pass { rows: 1, depth: 0, seconds: 0.1, parked: 0.065, misses: 68., drive: 0.068, ..Pass::default() });
         let price = ReadPrice::priced(passes.read_admission(Some(line)));
-        assert!((price.transfer_seconds(bytes) - 1e-3).abs() < 1e-12, "IdleBudget uses pipelined t_bw, not lambda + t_bw");
+        assert!((price.transfer_seconds(bytes) - 1e-3).abs() < 1e-12, "DriveIdleBudget uses pipelined t_bw, not lambda + t_bw");
         assert!(!price.admits_with_idle(0.30, bytes, 0.0) && !price.admits_with_idle(0.52, bytes, 0.0) && price.admits_with_idle(1.0, bytes, 0.0));
 
-        let time = Time::new(&[vec![2, 2]], 32);
-        let ranking = Reuse::ranking(&[4, 4], &[0, 0], &[2], time.clone());
-        let mut prefetch = Prefetch::new(4, vec![0, 0], 4, time, std::sync::mpsc::channel().1, &ranking);
+        let mut prefetch = Prefetch::new(4, 2);
         let events = Arc::new(Events::default());
         let seen = HashSet::from([(1, 0)]);
 
-        // Empty drive: `idle == c_layer == 1.0 ms`, so one 30% hint is admitted
-        // and consumes the shared budget (`t_bw = 1.0 ms`), leaving 0.0 for the next candidate.
-        let idle = IdleBudget::new(layers, prefetch.drive_queued_bytes(|_| bytes, &seen));
+        let idle = DriveIdleBudget::new(layers, prefetch.drive_queued_bytes(|_| bytes, &seen), 0.0);
         assert!((idle.get(&price) - 1e-3).abs() < 1e-12);
         assert!(price.admits_with_idle(0.30, bytes, idle.get(&price)));
         idle.consume(&price, price.transfer_seconds(bytes));
         assert_eq!(idle.get(&price), 0.0);
         assert!(!price.admits_with_idle(0.30, bytes, idle.get(&price)));
 
-        // Demand read (`Need::Due`) in flight on layer 0 (l - 1) occupying
-        // 1.0 ms >= c_layer: layer 1 (l) sees `idle == 0.0` and must meet the
-        // full drive-bound break-even (~0.511).
+        let due_done = Arc::new(AtomicBool::new(false));
         prefetch.inbound.insert(
             (0, 0),
             Inbound {
@@ -1442,19 +1571,26 @@ mod tests {
                 need: Need::Due { ticket: Ticket::empty(), read: 0, device: None },
                 ended: Ended::new(&events),
                 urgency: Urgency::waited(),
+                read_done: due_done.clone(),
             },
         );
         let queued = prefetch.drive_queued_bytes(|_| bytes, &seen);
         assert_eq!(queued, vec![bytes]);
-        let idle = IdleBudget::new(layers, queued);
+        let idle = DriveIdleBudget::new(layers, queued, 0.0);
         assert_eq!(idle.get(&price), 0.0, "demand read on layer l-1 saturates shared drive");
         assert!(!price.admits_with_idle(0.30, bytes, idle.get(&price)), "low-p hint rejected when drive is busy");
         assert!(!price.admits_with_idle(0.52, bytes, idle.get(&price)), "50% hint rejected on saturated drive with no park overhead");
         assert!(price.admits_with_idle(1.0, bytes, idle.get(&price)), "certain read still admitted");
 
-        // An unbegun ahead read in `seen` (being re-evaluated in this pass) is
-        // not double-counted, while an out-of-pass ahead read on another layer
-        // IS counted on the shared drive.
+        // Once the demand read completes on the drive (even while its
+        // DeviceLanding stays in `inbound` awaiting the next layer's park),
+        // the shared drive is free and `DriveIdleBudget` opens `c_layer`.
+        due_done.store(true, Ordering::Release);
+        assert!(prefetch.drive_queued_bytes(|_| bytes, &seen).is_empty(), "finished demand read no longer occupies the drive");
+        let idle = DriveIdleBudget::new(layers, prefetch.drive_queued_bytes(|_| bytes, &seen), 0.0);
+        assert!((idle.get(&price) - 1e-3).abs() < 1e-12, "full c_layer idle budget opens once demand read finishes");
+        assert!(price.admits_with_idle(0.30, bytes, idle.get(&price)));
+
         prefetch.inbound.clear();
         prefetch.inbound.insert(
             (1, 0),
@@ -1464,6 +1600,7 @@ mod tests {
                 need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Cover },
                 ended: Ended::new(&events),
                 urgency: Urgency::ahead(Want::undated(0.)),
+                read_done: Arc::new(AtomicBool::new(false)),
             },
         );
         assert!(prefetch.drive_queued_bytes(|_| bytes, &seen).is_empty(), "in-pass unbegun ahead read is not pre-counted");
@@ -1475,10 +1612,78 @@ mod tests {
                 need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Cover },
                 ended: Ended::new(&events),
                 urgency: Urgency::ahead(Want::undated(0.)),
+                read_done: Arc::new(AtomicBool::new(false)),
             },
         );
         let queued = prefetch.drive_queued_bytes(|_| bytes, &seen);
         assert_eq!(queued, vec![bytes], "out-of-pass ahead read on layer 0 counts against shared drive");
-        assert_eq!(IdleBudget::new(layers, queued).get(&price), 0.0);
+        assert_eq!(DriveIdleBudget::new(layers, queued, 0.0).get(&price), 0.0);
+    }
+
+    #[test]
+    fn draft_window_opens_idle_budget_and_cancels_unbegun_reads_on_began() {
+        use crate::experts::interest::{Launched, Told};
+        use std::time::Instant;
+
+        let bytes = 3_090_000_u64;
+        let line = ReadLine::new(0.14e-3, 1.0 / 4.6e9).expect("a line");
+        let mut passes = Passes::new(Time::new(&[vec![1]], 8));
+        passes.timed(Pass { rows: 1, depth: 0, seconds: 0.135, parked: 0.100, misses: 120., drive: 0.100, ..Pass::default() });
+        let price = ReadPrice::priced(passes.read_admission(Some(line)));
+        assert!(price.binds());
+        assert!(!price.admits_with_idle(0.0, bytes, 0.0));
+
+        let time = Time::new(&[vec![4, 4]], 32);
+        let stands = Stands::new(time.clone());
+        let mut ledger = Ledger::new(vec![0, 0], 4, time, stands);
+        let mut prefetch = Prefetch::new(8, 2);
+        let events = Arc::new(Events::default());
+
+        ledger.tell(Told::DraftWindow { estimated_seconds: 0.019 });
+        assert!(ledger.in_draft_window());
+        let rem = ledger.draft_window_remaining(Instant::now());
+        assert!(rem > 0.010 && rem <= 0.019, "remaining draft window {rem}");
+
+        let idle = DriveIdleBudget::new(48, Vec::new(), rem);
+        assert!(price.admits_with_idle(0.0, bytes, idle.get(&price)));
+
+        prefetch.step_prefetch_bytes = 10_000_000;
+        ledger.tell(Told::Began { step: 2, launch: Launched::Decode { rows: Box::new([]), padding: 0 } });
+        prefetch.on_began();
+        assert!(!ledger.in_draft_window());
+        assert_eq!(ledger.draft_window_remaining(Instant::now()), 0.0);
+        assert_eq!(prefetch.step_prefetch_bytes, 0);
+        let post_idle = DriveIdleBudget::new(48, vec![bytes], 0.0);
+        assert!(!price.admits_with_idle(0.0, bytes, post_idle.get(&price)));
+        let _ = events;
+    }
+
+    /// B-3: Slack-aware `ReadPrice` exposes per-layer idle slack and
+    /// `B_budget = (C - U * t_bw) * P_peak`, admitting reads within slack and
+    /// capping speculative bytes when compute exceeds pipelined drive bandwidth.
+    #[test]
+    fn slack_aware_read_price_computes_layer_idle_and_byte_budget() {
+        let bytes = 3_090_000_u64;
+        let line = ReadLine::new(0.14e-3, 1.0 / 4.6e9).expect("a line");
+        let mut passes = Passes::new(Time::new(&[vec![1]], 8));
+        // C = 0.075 s, U * t_bw = 0.035 s -> slack = 0.040 s, B_budget = 184 MB.
+        // Note: parked = 0.060 s (exposed stall), seconds = 0.135 s -> C = 0.135 - 0.060 = 0.075 s,
+        // while terms.drive = 0.035 s (pipelined U * t_bw, NOT parked).
+        passes.timed(Pass {
+            rows: 4,
+            depth: 3,
+            verifies: true,
+            seconds: 0.135,
+            parked: 0.060,
+            misses: 52.,
+            drive: 0.035,
+            ..Pass::default()
+        });
+        let price = ReadPrice::priced(passes.read_admission(Some(line)));
+        assert!(!price.binds(), "pipelined drive (35 ms) < C (75 ms), even though exposed parked was 60 ms");
+        assert!((price.layer_idle(48) - 0.040 / 48.0).abs() < 1e-12);
+        let budget = price.prefetch_byte_budget();
+        assert!((budget as f64 - 184_000_000.0).abs() <= 1.0, "expected ~184 MB budget, got {budget}");
+        assert!(price.admits_for_layers(0.10, bytes, 48));
     }
 }

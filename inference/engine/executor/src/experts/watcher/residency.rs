@@ -25,15 +25,17 @@
 
 use super::core::Core;
 use super::decode;
+use super::link::{Copier, LinkMover};
 use super::prefetch::Prefetch;
-use super::promotions::{Copier, Promotions};
 use super::resize::{Asked, Owed};
 use super::scratch::Scratch;
 use super::{Shared, Step};
-use magnitude_cost_model::{ExpertLines, SiteLines};
+use magnitude_cost_model::{DomainBudget, ExpertLines, SiteLines};
 use crate::experts::directory::{MissCurve, Point};
+use crate::experts::interest::{Ledger, Told};
 use crate::experts::yielding::Yielding;
 use magnitude_kernels::constants;
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, MutexGuard};
 use std::time::Instant;
 
@@ -64,10 +66,15 @@ pub(super) struct Residency {
     pub(super) homes: Vec<i32>,
     pub(super) shared: Arc<Shared>,
     pub(super) core: Core,
+    /// Shared `NameLedger` owned by residency: fed by ring reads & `Told`
+    /// events, and consumed by both Path 1 (`Prefetch`) and Path 0 (`LinkMover`).
+    pub(super) ledger: Ledger,
+    pub(super) inbox: Receiver<Told>,
     pub(super) prefetch: Prefetch,
     pub(super) scratch: Scratch,
-    /// What sizes the promotions' reserves.
-    pub(super) promotions: Promotions,
+    /// Unified Path 0 (`RAM -> VRAM`) link mover: write-backs, `NameLedger`-driven
+    /// opportunistic DMA staging, and `Reuse`-ranked permanent promotions.
+    pub(super) link: LinkMover,
     /// A resize asked, waiting until nothing moves a record.
     pub(super) asked: Option<Asked>,
     /// When residency opened, and whether the host tier keeps every expert
@@ -283,16 +290,67 @@ impl Residency {
     /// resize asked served, which ends the turn. A fault of the executor's
     /// work, or the device lost under the parks, ends serving, as
     /// residency's own panic does, and the turn.
+    /// Drain all pending `Told` events into the shared `NameLedger`, updating
+    /// telemetry and notifying `Prefetch` on step begin / draft window changes.
+    pub(super) fn learn_told(&mut self) -> bool {
+        let mut told = false;
+        let link_only = self.core.directory.tier_complete() && !self.core.directory.all_groups_whole();
+        while let Ok(mut event) = self.inbox.try_recv() {
+            told = true;
+            let completed = matches!(&event, Told::Completed { .. });
+            let began = matches!(&event, Told::Began { .. });
+            let draft = matches!(&event, Told::DraftWindow { .. });
+            // On 100%-RAM discrete GPUs (`tier_complete()` with partial VRAM),
+            // `Use::Tier` is a Path 0 (`Link`) miss rather than a Drive hit:
+            // reclassify un-staged Host-RAM misses as `tier: false` so
+            // `HintGate` measures the true live Link miss cohort instead of 0.
+            if link_only {
+                if let Told::Completed { step, ref mut chose, .. } = event {
+                    for (layer, choices) in chose.iter_mut().enumerate() {
+                        for chosen in choices.iter_mut() {
+                            if chosen.saves && chosen.tier && !self.ledger.has_link_landed(step, layer, chosen.expert) {
+                                chosen.tier = false;
+                            }
+                        }
+                    }
+                }
+            }
+            let learned = self.ledger.tell(event);
+            if began {
+                self.prefetch.on_began();
+            } else if draft {
+                self.prefetch.on_draft_window();
+            }
+            if completed {
+                self.shared.telemetry.resolved(&learned.resolved, &learned.cohorts);
+            }
+        }
+        let (judged, accepted) = self.ledger.take_judged();
+        if !judged.is_empty() || !accepted.is_empty() {
+            self.shared.telemetry.judged(&judged, &accepted);
+        }
+        Prefetch::spend(&mut self.ledger, &self.shared);
+        told
+    }
+
     fn learn(&mut self, turn: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
         if let Some(reason) = self.shared.fault() {
             self.shared.end_serving(reason);
             return false;
         }
+        // Drain `Told` events (`DraftWindow`, `Began`, `Completed`) before
+        // `promote` (`LinkMover::advance`) so Path 0 immediately sees fresh
+        // draft windows and completed steps on the same turn.
+        let told = self.learn_told();
         let joined = self.join();
         let retired = self.retire();
-        let landed = self.prefetch.settle(&mut self.core.directory);
+        let (landed, newly_landed) = self.prefetch.settle(&mut self.core.directory, &mut self.ledger);
         let refilled = self.refill_tier();
-        turn.changed = joined || retired || landed || refilled;
+        // Pipeline chain-through: if Path 1 just landed an expert into Tier 1
+        // that is live in `NameLedger` for an upcoming step, mark changed so
+        // `promote` (`LinkMover::advance`) immediately stages it into Tier 0.
+        let chain_through = newly_landed.into_iter().any(|(layer, expert)| self.ledger.is_wanted(layer, expert));
+        turn.changed = told || joined || retired || landed || refilled || chain_through;
         if let Some(asked) = self.asked.take().or_else(|| self.shared.resizing.asked().map(Asked::taken)) {
             self.asked = self.resize(asked, copier);
             return false;
@@ -300,15 +358,14 @@ impl Residency {
         true
     }
 
-    /// The promotions asked and carried. Held for a measurement beside the idle
-    /// load, the copies running end and none is asked; a step running ends
-    /// the hold at once, so no request waits on a measurement (the service
-    /// preempts the measurement as a request arrives, and serving outranks
-    /// it here until it has).
+    /// Unified Path 0 (`LinkMover`): write-backs, `NameLedger`-driven
+    /// opportunistic DMA staging, and `Reuse`-ranked permanent promotions.
     fn promote(&mut self, turn: &mut Turn, copier: Option<&Copier>, decoded: Option<&MissCurve>) -> bool {
         let held = self.traffic_held();
-        let promoted = copier.is_some_and(|copier| self.promotions.advance(&mut self.core, &self.shared, copier, decoded, held, &self.prefetch));
-        turn.changed |= promoted;
+        let progressed = copier.is_some_and(|copier| {
+            self.link.advance(&mut self.core, &mut self.ledger, &self.shared, copier, decoded, held, self.prefetch.reached())
+        });
+        turn.changed |= progressed;
         true
     }
 
@@ -318,22 +375,19 @@ impl Residency {
         true
     }
 
-    /// The tier's cover read (`Prefetch::cover`), and the reads ahead a
-    /// prompt group's step waits for while they land into the host tier
-    /// (`Scratch::awaited`) hastened to demand (`Prefetch::hasten`), unless
-    /// traffic is held; then whether the cover still reads published
-    /// (`Shared::publish_cover`), and its turning quiet is an event, which a
-    /// hold waits on. Whether it is held is read here, not
-    /// carried from the promotions: a request served between them means a
-    /// step runs, which ends the hold at once.
+    /// Drive Path 1 (`Prefetch`), cover reads, and prompt-group hastening.
     fn hasten(&mut self, turn: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
         let held = self.traffic_held();
         if held {
             self.prefetch.cancel_cover();
         } else {
-            let told = self.prefetch.learn(&self.shared);
-            if told || turn.changed {
-                self.prefetch.drive(&mut self.core, &self.shared);
+            let told = self.learn_told();
+            let reads_finished = self.prefetch.take_reads_finished();
+            turn.changed |= told || reads_finished;
+            if turn.changed {
+                if !self.core.directory.tier_complete() {
+                    self.prefetch.drive(&mut self.core, &mut self.ledger, &self.shared);
+                }
             }
             let scratch = &self.scratch;
             self.prefetch.cover(&mut self.core, &self.shared, |staged| scratch.carries(staged));
@@ -352,10 +406,10 @@ impl Residency {
 
     /// The words a run's encoding reads, only while no step runs; the
     /// lines at every turn; and the turn's change announced.
-    fn publish_turn(&mut self, turn: &mut Turn, _: Option<&Copier>, _: Option<&MissCurve>) -> bool {
+    fn publish_turn(&mut self, turn: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
         self.publish_policy();
         self.shared.write_staged();
-        self.publish_lines();
+        self.publish_lines(copier);
         if turn.changed {
             self.shared.events().notify();
         }
@@ -376,29 +430,23 @@ impl Residency {
             return false;
         }
         self.core.retired = frontier;
+        self.core.directory.drain_staging(frontier);
         if let Some(past) = self.shared.steps.retire_groups(frontier) {
             self.advance(past);
         }
         true
     }
 
-    /// The device is at `progress`: learn the landings that ended (a
-    /// landing ends before it answers, so the device past an answer proves
-    /// its landing ended), retire the seeds and tier graces before it, free
-    /// the records taken before it, and the conveyor's (staging what a
-    /// group past held whole); then publish the tier map's changes. What a
-    /// request at `progress` sees follows from this alone, so every request
-    /// is taken or served only after it: none acts on what its own position
-    /// proves past, however late residency learned of it.
-    /// Read live hint and front rings, advancing device progress to the
-    /// latest ring seen so graced tier records of earlier layers retire
-    /// even on passes that never park on a demand miss, before admitting
-    /// and driving reads ahead.
+    /// Read live hint and front rings while any group is not whole in Tier 0
+    /// (`!core.directory.all_groups_whole()`), unblocking foresight on
+    /// 100%-RAM discrete GPUs as well as 2-tier and 3-tier workloads.
     pub(super) fn rings(&mut self, shared: &Arc<Shared>, served: &[Step], mut freed: bool) -> bool {
-        if self.core.directory.tier_complete() {
-            return self.prefetch.learn(shared);
+        if self.core.directory.all_groups_whole() {
+            return self.learn_told();
         }
-        let read = self.prefetch.begin_rings(&self.core, shared);
+        let raw = self.prefetch.read_rings_raw(&self.core);
+        let told = self.learn_told();
+        let read = self.prefetch.resolve_rings(&self.core, &mut self.ledger, shared, raw, told);
         if let Some(latest) = read.latest {
             if latest > self.prefetch.reached() {
                 self.advance_retired(latest);
@@ -406,12 +454,14 @@ impl Residency {
             }
         }
         if read.any {
-            self.prefetch.pass(&mut self.core, shared, None);
+            self.prefetch.pass(&mut self.core, &mut self.ledger, shared, None);
         }
-        let settled = self.prefetch.settle(&mut self.core.directory);
+        let (settled, newly_landed) = self.prefetch.settle(&mut self.core.directory, &mut self.ledger);
+        let chain_through = newly_landed.into_iter().any(|(layer, expert)| self.ledger.is_wanted(layer, expert));
         let refilled = self.refill_tier();
-        freed |= settled || refilled;
-        self.prefetch.finish_rings(&mut self.core, shared, read, freed, served)
+        let reads_finished = self.prefetch.take_reads_finished();
+        freed |= settled || refilled || chain_through || reads_finished;
+        self.prefetch.finish_rings(&mut self.core, &mut self.ledger, shared, read, freed, served)
     }
 
     pub(super) fn advance(&mut self, progress: Point) {
@@ -425,7 +475,7 @@ impl Residency {
     /// after settling.
     fn advance_retired(&mut self, progress: Point) {
         self.prefetch.past(progress);
-        self.prefetch.settle(&mut self.core.directory);
+        let _ = self.prefetch.settle(&mut self.core.directory, &mut self.ledger);
         for listed in self.core.take_past(progress) {
             listed.release(&mut self.scratch.conveyor);
         }
@@ -438,7 +488,7 @@ impl Residency {
     /// free the conveyor records whose converts have completed, without moving
     /// device progress backwards across steps in the set.
     pub(super) fn advance_window(&mut self) {
-        self.prefetch.settle(&mut self.core.directory);
+        let _ = self.prefetch.settle(&mut self.core.directory, &mut self.ledger);
         for listed in self.core.take_converted() {
             listed.release(&mut self.scratch.conveyor);
         }
@@ -607,7 +657,23 @@ impl Residency {
         let served = self.core.layers.iter().any(|layer| layer.site.is_some() && !(full[layer.group] && (every || lender != layer.group)));
         let whole = self.core.layers.iter().map(|layer| full[layer.group] && (every || lender != layer.group)).collect::<Vec<_>>();
         let resolved = self.core.layers.iter().zip(&whole).map(|(layer, &whole)| whole || self.core.directory.group_tier_settled(layer.group)).collect::<Vec<_>>();
-        let hints = self.shared.telemetry.hint_gates(&resolved, self.shared.launch_prices().as_ref());
+        // Keep `POLICY_RESOLVED` strictly as the `routed_land` / file-exchange
+        // omission bit, while gating `HintGate` on `&whole` (`!all_groups_whole`)
+        // so 100%-RAM discrete GPUs keep foresight hints active for Link staging.
+        let link_line = self
+            .core
+            .directory
+            .tier_complete()
+            .then(|| self.shared.copy.lock().expect("a copy's price").as_ref().map(|c| c.transfer))
+            .flatten();
+        let core = &self.core;
+        let ledger = &mut self.ledger;
+        let layer_count = core.layers.len();
+        let hints = self.shared.telemetry.hint_gates(&whole, link_line, self.shared.launch_prices().as_ref(), |target, lead, miss| {
+            let bytes = core.layers[target].expert_bytes();
+            let idle = miss.layer_idle(layer_count);
+            ledger.hint_admitted(target, lead, miss.break_even(bytes, idle))
+        });
         let layers = (0..self.core.layers.len())
             .map(|index| LayerPolicy {
                 whole: whole[index],
@@ -655,7 +721,7 @@ impl Residency {
     /// that has not routed the layer yet may, as a mapping may take effect
     /// from such a step: word by word, some of a layer's words old and
     /// some new. A decode that never idles is repriced so.
-    pub(super) fn publish_lines(&mut self) {
+    pub(super) fn publish_lines(&mut self, copier: Option<&Copier>) {
         let priced = self.shared.priced().map(|lines| self.shared.telemetry.refined(&lines));
         let copy = self.shared.copy.lock().expect("a copy's price").clone();
         if let (Some(lines), Some(copy)) = (&priced, &copy) {
@@ -670,15 +736,44 @@ impl Residency {
                 self.core.directory.price_write_backs(layer, price);
             }
         }
+        // Continuous shared-domain bandwidth share (`DomainBudget`) across
+        // live PCIe DMA + live NVMe landing bytes vs Host DDR5 (`HostLines::memory`),
+        // replacing the binary `dma_active: bool` hack.
+        let dma_active = copier.is_some_and(|copier| !copier.copies.idle()) || self.core.directory.staging_in_flight();
+        let landing_active = self.core.extents.placer == crate::planning::Placer::Tier && self.prefetch.landing_active();
+        let b_dma = if dma_active {
+            copy.as_ref().map_or(0.0, |c| {
+                let spb = c.transfer.seconds_per_byte();
+                if spb > 0.0 { 1.0 / spb } else { 0.0 }
+            })
+        } else {
+            0.0
+        };
+        let b_landing = if landing_active {
+            self.shared.telemetry.drive_line().map_or(0.0, |d| {
+                let spb = d.seconds_per_byte();
+                if spb > 0.0 { 1.0 / spb } else { 0.0 }
+            })
+        } else {
+            0.0
+        };
         let words = self
             .core
             .layers
             .iter()
             .enumerate()
             .map(|(index, layer)| {
-                // A priced line holds a site's CPU lines once its verdict
-                // admits it (`ExpertMeasures::lines`).
-                let cpu = priced.as_ref().and_then(|lines| lines[index].host.cpu);
+                let cpu = priced.as_ref().and_then(|lines| {
+                    let layer_lines = &lines[index];
+                    layer_lines.host.cpu.map(|cpu| {
+                        let b_mem = layer_lines
+                            .host
+                            .memory
+                            .filter(|m| m.get() > 0.0)
+                            .map_or(0.0, |m| layer_lines.host.record_bytes as f64 / (m.get() * 1e-9));
+                        cpu.with_domain_budget(DomainBudget::new(b_dma, b_landing, b_mem))
+                    })
+                });
                 let site = match (&layer.site, &cpu) {
                     (None, _) => SiteLines::Unsited,
                     (Some(_), None) => SiteLines::Pending,
@@ -722,12 +817,11 @@ impl Residency {
         )
     }
 
-    /// Whether every layer is resolved as last published: every expert is
-    /// held in the bank or settled in the host tier, so nothing a decode
-    /// step runs then asks anything (no miss, no hint). Reads the single
-    /// published `POLICY_RESOLVED` word directly.
-    pub(super) fn resolved(&self) -> bool {
-        self.core.layers.iter().all(|layer| layer.policy.load(constants::POLICY_RESOLVED as usize) != 0)
+    /// Whether every group is whole in Tier 0 (`Directory::all_groups_whole`):
+    /// false on 100%-RAM discrete GPUs so `Requests::polls` keeps reading
+    /// foresight rings for Link staging, true once VRAM holds every expert.
+    pub(super) fn all_whole(&self) -> bool {
+        self.core.directory.all_groups_whole()
     }
 
     /// Each group's host tier records `views` address from now (a shrink's,
@@ -740,6 +834,11 @@ impl Residency {
 
     /// What decode serving reads and writes of it (`decode::Serving`).
     pub(super) fn serving(&mut self) -> decode::Serving<'_> {
-        decode::Serving { core: &mut self.core, prefetch: &mut self.prefetch, shared: &self.shared }
+        decode::Serving {
+            core: &mut self.core,
+            prefetch: &mut self.prefetch,
+            ledger: &mut self.ledger,
+            shared: &self.shared,
+        }
     }
 }

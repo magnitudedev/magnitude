@@ -431,7 +431,7 @@ impl Shadows {
         self.history.resize(group, records);
         for shadow in &mut self.depths {
             shadow.pools.fit(group, records);
-            shadow.time.lock().resized(group, Tier::Compute, records as u64);
+            shadow.time.lock().resized(group, Tier::COMPUTE, records as u64);
         }
         // Additive deltas `Δ = U_real − U_shadow` measured at the previous slot
         // count are invalid after a resize; clearing them returns unexecuted
@@ -535,7 +535,7 @@ impl Shadows {
                         (Horizon::Unbounded, 1.0)
                     } else {
                         let horizon = times
-                            .horizon(group, Tier::Compute, Reader::Move)
+                            .horizon(group, Tier::COMPUTE, Reader::Move)
                             .expect("decode step registered");
                         let a_bar = times
                             .tokens_per_step(group)
@@ -595,7 +595,7 @@ impl Shadows {
                     if shadow.pools.records[group] > 0 && lacked > 0 {
                         let mut times = shadow.time.lock();
                         for _ in 0..lacked {
-                            times.moved(group, Tier::Compute);
+                            times.moved(group, Tier::COMPUTE);
                         }
                     }
                     step_misses[depth] += lacked;
@@ -634,7 +634,7 @@ impl Shadows {
                 }
                 let (horizon, a_bar) = {
                     let times = shadow.time.lock();
-                    match times.horizon(group, Tier::Compute, Reader::Move) {
+                    match times.horizon(group, Tier::COMPUTE, Reader::Move) {
                         Some(h) => (h, times.tokens_per_step(group).expect("ā exists wherever τ does")),
                         None => (Horizon::Unbounded, 1.0),
                     }

@@ -162,6 +162,11 @@ impl Words {
         self.len
     }
 
+    /// The underlying host-shared tensor (e.g. for `TransferItem::Signal`).
+    pub(crate) fn tensor(&self) -> &seismic::Tensor {
+        &self.tensor
+    }
+
     /// Word `index`, loaded with acquire ordering. Every index the host
     /// names lies within the words, which `new` stored once each: neither
     /// the storage nor the offset can be refused.

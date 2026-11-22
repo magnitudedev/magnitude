@@ -1123,6 +1123,16 @@ impl ExpertBank {
         pool.return_freed(freed).map_err(|error| DomainError::invariant(format!("the {tier:?} pool could not return a shrink's blocks: {error}")))
     }
 
+    /// Synchronously return at least `freed` bytes of `tier`'s pool to the OS
+    /// (`seismic::Pool::return_freed_sync`), for synchronous admission reclaim.
+    pub(super) fn return_freed_sync(&self, tier: BankTier, freed: u64) -> Result<u64, DomainError> {
+        let pool = match tier {
+            BankTier::Bank => self.stores.pool.clone(),
+            BankTier::Host => self.host().ok_or_else(|| DomainError::invariant("a host tier's pool without one"))?.stores.pool.clone(),
+        };
+        pool.return_freed_sync(freed).map_err(|error| DomainError::invariant(format!("the {tier:?} pool could not return a shrink's blocks: {error}")))
+    }
+
     /// [`ElasticBank::running_begun`](crate::domain::ElasticBank::running_begun).
     pub(super) fn take_running_begun(&self) -> Option<RunningBegun> {
         self.commitment().running.take()

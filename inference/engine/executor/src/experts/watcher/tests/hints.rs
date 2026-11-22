@@ -260,7 +260,7 @@ fn a_completed_steps_routes_calibrate_its_hints() {
     harness.staging_free();
     harness.tier_ready();
     let key = Combination { nearest: Look::of(Source::Lead { distance: 1, row: None }), rank: 0, looks: 1 };
-    let precision = || residency::lock(&harness.watcher.state).prefetch.rate(1, key);
+    let precision = || residency::lock(&harness.watcher.state).ledger.rate(1, key);
     assert_eq!(precision(), 1., "its bound before any outcome");
     let step = harness.step();
     harness.hint(&step, 0, &[5, 6, 7]);

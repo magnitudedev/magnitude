@@ -326,6 +326,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(SubmitFailure::Failed(error.into()));
             }
         };
+        if steps > 0 {
+            if let Some(bank) = self.family.expert_bank() {
+                if let Some(estimated_seconds) = self.verify_turns.mean(bank.bank_epoch()).filter(|&s| s > 0.0) {
+                    bank.draft_window(estimated_seconds);
+                }
+            }
+        }
         let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
         Ok(HeadFlight {
             started: self.service_start(&requests, started),

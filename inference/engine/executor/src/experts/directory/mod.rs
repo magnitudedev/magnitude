@@ -465,7 +465,7 @@ impl Exits<'_> {
                 return None;
             }
             let stay = self.stay?;
-            let ranker = reuse.ranker(group, Tier::Host, Reader::Move);
+            let ranker = reuse.ranker(group, Tier::HOST, Reader::Move);
             let read = beside(&directory.prompt_reads, staged, reuse.last(layer, expert));
             if !price.pays(ranker.expected(layer, expert, read).uses(), stay) {
                 return None;
@@ -596,9 +596,11 @@ pub(in crate::experts) struct HostTier {
 pub(in crate::experts) enum Placement {
     /// The device places from a host tier: the bank's records are each
     /// layer's stamped map's one writer (`bank_maps`), each layer's host
-    /// records its plain tier map's (`tier_maps`), and the lender's bank
-    /// records `lent`, `(group, records)`, are lent to prompt groups.
-    Tier { bank_maps: Vec<StampedMap>, tier_maps: Vec<LandingMap>, lent: (usize, usize) },
+    /// records its plain tier map's (`tier_maps`), the lender's bank
+    /// records `lent`, `(group, records)`, are lent to prompt groups, and
+    /// `stage_slots` reserves a dedicated even/odd double-buffered DMA staging
+    /// ring per group (`lent..lent + stage_slots`), independent of `lent`.
+    Tier { bank_maps: Vec<StampedMap>, tier_maps: Vec<LandingMap>, lent: (usize, usize), stage_slots: Vec<usize> },
     /// The host places in the bank's own records, the one store: each
     /// layer's host records write its stamped landing map.
     Bank { landing_maps: Vec<LandingMap> },
@@ -650,7 +652,7 @@ impl Directory {
         // The maps the host records write, one per layer, where the
         // placement writes any.
         let (bank_maps, maps) = match placement {
-            Placement::Tier { bank_maps, tier_maps, lent } => (Some((bank_maps, lent)), Some(tier_maps)),
+            Placement::Tier { bank_maps, tier_maps, lent, stage_slots } => (Some((bank_maps, lent, stage_slots)), Some(tier_maps)),
             Placement::Bank { landing_maps } => (None, Some(landing_maps)),
             Placement::Replay => (None, None),
         };
@@ -714,8 +716,8 @@ impl Directory {
     /// host tier (tier 1).
     fn tiers_of(placer: crate::planning::Placer) -> &'static [Tier] {
         match placer {
-            crate::planning::Placer::Bank => &[Tier::Compute],
-            crate::planning::Placer::Tier => &[Tier::Compute, Tier::Host],
+            crate::planning::Placer::Bank => &[Tier::COMPUTE],
+            crate::planning::Placer::Tier => &[Tier::COMPUTE, Tier::HOST],
         }
     }
 
@@ -723,8 +725,8 @@ impl Directory {
     /// or the host tier beside the bank.
     fn host_tier(&self) -> Tier {
         match self.placer {
-            crate::planning::Placer::Bank => Tier::Compute,
-            crate::planning::Placer::Tier => Tier::Host,
+            crate::planning::Placer::Bank => Tier::COMPUTE,
+            crate::planning::Placer::Tier => Tier::HOST,
         }
     }
 
@@ -733,9 +735,10 @@ impl Directory {
     /// or the promotions' reserve moves no record).
     fn records_of((bank, host, placer): (&BankRecords, &[HostRecords], crate::planning::Placer), group: usize, tier: Tier) -> u64 {
         match (placer, tier) {
-            (crate::planning::Placer::Tier, Tier::Compute) => bank.counts()[group] as u64,
-            (crate::planning::Placer::Bank, Tier::Compute) | (crate::planning::Placer::Tier, Tier::Host) => u64::from(host[group].records()),
-            (crate::planning::Placer::Bank, Tier::Host) => unreachable!("the one store has no host tier"),
+            (crate::planning::Placer::Tier, Tier::COMPUTE) => bank.counts()[group] as u64,
+            (crate::planning::Placer::Bank, Tier::COMPUTE) | (crate::planning::Placer::Tier, Tier::HOST) => u64::from(host[group].records()),
+            (crate::planning::Placer::Bank, Tier::HOST) => unreachable!("the one store has no host tier"),
+            (_, other) => unreachable!("directory has no storage for tier {other:?}"),
         }
     }
 
@@ -896,6 +899,18 @@ impl Directory {
         self.host[group].claim((layer, expert), keep, taking, outranking(ranker, &self.prompt_reads, candidate))
     }
 
+    /// Claim a carryover prefetch landing of `layer`'s `expert` in its group's
+    /// host tier, leaving `keep` reserve records, strictly enforcing victim
+    /// admission (`expected_uses(candidate) > expected_uses(victim)` via
+    /// [`outranking`]).
+    pub fn claim_carryover(&mut self, layer: usize, expert: usize, keep: usize, taking: Taking) -> Claim {
+        let (group, tier) = (self.bank.group(layer), self.host_tier());
+        let reuse = Reuse::of(&self.ranking);
+        let ranker = reuse.ranker(group, tier, Reader::Move);
+        let candidate = store_rank(ranker, &self.prompt_reads)((layer, expert), None);
+        self.host[group].claim((layer, expert), keep, taking, outranking(ranker, &self.prompt_reads, candidate))
+    }
+
     /// Claim a background host-tier landing for a cold expert read into the
     /// conveyor (`Scratch::land_conveyed`): admitted whenever the tier covers
     /// every expert (`HostRecords::covers`); otherwise takes a free ready
@@ -946,6 +961,27 @@ impl Directory {
         self.placer == crate::planning::Placer::Tier && self.host.iter().any(|tier| tier.covers() && tier.lacked() > 0)
     }
 
+    /// The lender's bank group and its lent records `[0, count)`, beside a host
+    /// tier (`None` on unified memory / offline replay).
+    pub fn lender(&self) -> Option<(usize, usize)> {
+        self.bank.lent()
+    }
+
+    /// Whether bank record `record` of group `group` is currently `Record::Free`.
+    pub fn bank_record_free(&self, group: usize, record: usize) -> bool {
+        self.bank.is_free(group, record)
+    }
+
+    /// Inspect bank record `record` of group `group`.
+    pub(in crate::experts) fn bank_record(&self, group: usize, record: usize) -> Option<crate::experts::records::Record> {
+        self.bank.records(group).get(record).copied()
+    }
+
+    /// Whether group `group` currently has any bank record leased to a prompt group.
+    pub fn group_has_lent(&self, group: usize) -> bool {
+        self.bank.has_lent(group)
+    }
+
     /// Whether every group's host tier keeps every expert of its layers,
     /// none without a tier: no decode miss reads the file.
     pub fn tier_complete(&self) -> bool {
@@ -957,6 +993,13 @@ impl Directory {
     /// bank has no tier.
     pub fn group_tier_settled(&self, group: usize) -> bool {
         self.host[group].settled()
+    }
+
+    /// Whether every group's layers are whole in Tier 0 (no expert of any
+    /// group can miss Tier 0). On unified memory this equals `tier_complete()`;
+    /// on discrete GPUs it is true only when every expert is held in VRAM.
+    pub fn all_groups_whole(&self) -> bool {
+        (0..self.host.len()).all(|group| self.group_whole(group))
     }
 
     /// Whether no expert of group `group`'s layers can miss, every one
@@ -1339,7 +1382,7 @@ impl Directory {
             .map(|staged @ (layer, expert)| (staged, self.bank.held(layer, expert).expect("an unwanted expert is held")))
             .filter(|&(_, record)| self.bank.usable(group, record))
             .collect::<Vec<_>>();
-        let ranker = reuse.ranker(group, Tier::Compute, Reader::Move);
+        let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
         let mut released = held.iter().map(|&((layer, expert), record)| (self.ranked(ranker, layer, expert, None), record)).collect::<Vec<_>>();
         let mut floor = held.iter().map(|&(staged, _)| self.uses(ranker, staged)).collect::<Vec<_>>();
         if held.len() > most {
@@ -1372,7 +1415,7 @@ impl Directory {
         // A layer whose hit saves nothing earns no promotion at any read:
         // its wants wait for no read, so none is withheld; its lines'
         // repricing asks them again (`Self::price_copies`).
-        let ranker = reuse.ranker(group, Tier::Compute, Reader::Move);
+        let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
         let mut ranked = wanted
             .into_iter()
             .filter_map(|staged| self.copy_hits[staged.0].map(|hits| (self.uses(ranker, staged) - hits, staged)))
@@ -1399,7 +1442,7 @@ impl Directory {
         let stay = (self.placer == crate::planning::Placer::Tier && self.host[group].records() > 0)
             .then(|| {
                 let times = self.time.lock();
-                let tau = match times.horizon(group, Tier::Host, Reader::Move)? {
+                let tau = match times.horizon(group, Tier::HOST, Reader::Move)? {
                     Horizon::Tokens(tau) => tau.get(),
                     Horizon::Unbounded => unreachable!("a move's τ is finite once a decode step has begun"),
                 };
@@ -1422,7 +1465,7 @@ impl Directory {
         };
         let back = {
             let reuse = Reuse::of(&self.ranking);
-            let ranker = reuse.ranker(group, Tier::Host, Reader::Move);
+            let ranker = reuse.ranker(group, Tier::HOST, Reader::Move);
             let candidate = ranker.rank(staged.0, staged.1, beside(&self.prompt_reads, staged, read));
             let keep = self.host[group].reserve();
             match self.host[group].claim_back(staged, keep, outranking(ranker, &self.prompt_reads, candidate)) {
@@ -1518,10 +1561,80 @@ impl Directory {
         self.bank.copying()
     }
 
-    /// Whether any promotion is in flight or any release draining, and
-    /// what each is doing.
+    /// Whether any promotion is in flight, any release draining, or any
+    /// opportunistic staging slot active, and what each is doing.
     pub fn moving(&self) -> bool {
         self.bank.moving()
+    }
+
+    /// Find a free parity-half staging slot in `group`'s dedicated staging ring
+    /// for `target_step` ([`BankRecords::free_stage_slot`]).
+    pub fn free_stage_slot(&self, group: usize, target_step: Step) -> Option<usize> {
+        self.bank.free_stage_slot(group, target_step)
+    }
+
+    /// Number of slots in each parity half (`even` or `odd`) of `group`'s
+    /// dedicated DMA staging ring (`0` when disabled).
+    pub fn stage_ring_half(&self, group: usize) -> usize {
+        self.bank.stage_ring_half(group)
+    }
+
+    /// Whether `record` of `group` lies in its dedicated DMA staging ring.
+    pub fn is_stage_slot(&self, group: usize, record: usize) -> bool {
+        self.bank.is_stage_slot(group, record)
+    }
+
+    /// Record an opportunistic DMA staging copy into `slot` of `group`
+    /// ([`BankRecords::stage`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage(&mut self, group: usize, slot: usize, staged: Staged, target_step: Step, tier: HostRecord, batch: u64, parity: u8) {
+        self.bank.stage(group, slot, staged, target_step, tier, batch, parity);
+    }
+
+    /// Mark an in-flight opportunistic staging copy as landed, releasing its
+    /// host-tier hold while keeping the VRAM slot reserved until `frontier > target_step`.
+    pub fn staged_landed(&mut self, group: usize, slot: usize) -> Staged {
+        let (staged @ (layer, _), tier) = self.bank.staged_landed(group, slot);
+        self.unhold_tier(layer, tier);
+        staged
+    }
+
+    /// Cancel or fail an in-flight opportunistic staging copy, releasing its
+    /// host-tier hold and returning the VRAM slot to `Record::Free`.
+    pub fn unstage(&mut self, group: usize, slot: usize) -> Staged {
+        let (staged @ (layer, _), tier) = self.bank.unstage(group, slot);
+        if let Some(tier) = tier {
+            self.unhold_tier(layer, tier);
+        }
+        staged
+    }
+
+    /// Drain landed staging slots whose `target_step < frontier`
+    /// ([`BankRecords::drain_staging`]).
+    pub fn drain_staging(&mut self, frontier: Step) -> bool {
+        self.bank.drain_staging(frontier)
+    }
+
+    /// In-flight opportunistic staging DMA batches: `(group, slot, batch)`.
+    pub fn staging_copying(&self) -> Vec<(usize, usize, u64)> {
+        self.bank.staging_copying()
+    }
+
+    /// Whether any opportunistic staging DMA batch is currently in flight.
+    pub fn staging_in_flight(&self) -> bool {
+        self.bank.staging_in_flight()
+    }
+
+    /// Active staging entry for `staged` in `group`, if any:
+    /// `(slot, target_step, batch)`.
+    pub fn staged_entry(&self, group: usize, staged: Staged) -> Option<(usize, Step, Option<u64>)> {
+        self.bank.staged_entry(group, staged)
+    }
+
+    /// Whether `staged` is currently being placed into the permanent bank by a
+    /// promotion or prompt seed (`BankRecords::placing`).
+    pub fn placing(&self, staged: Staged) -> bool {
+        self.bank.placing(staged)
     }
 
     pub fn describe_promotions(&self) -> String {
@@ -1549,7 +1662,7 @@ impl Directory {
             .into_iter()
             .map(|((layer, expert), record, tier)| {
                 let group = self.bank.group(layer);
-                self.time.lock().moved(group, Tier::Compute);
+                self.time.lock().moved(group, Tier::COMPUTE);
                 self.tier(layer).banked((layer, expert));
                 self.tier(layer).unhold(tier.0);
                 self.resettle(layer, expert);
@@ -1701,15 +1814,28 @@ impl Directory {
     /// records claimed now ([`Self::resize_pool`]). Whether the group holds
     /// the records its scratch lies in ([`Self::leased`]).
     pub fn lease(&mut self, lender: usize, scratch_group: ScratchGroup, may_evict: bool, copy: Option<&mut dyn FnMut(u32, u32)>) -> bool {
+        self.lease_records(lender, scratch_group, None, may_evict, copy)
+    }
+
+    /// Grant scratch group `scratch_group` its lease of `target_records` (or
+    /// all `0..lent` when `None`) of group `lender`.
+    pub fn lease_records(
+        &mut self,
+        lender: usize,
+        scratch_group: ScratchGroup,
+        target_records: Option<&[u32]>,
+        may_evict: bool,
+        copy: Option<&mut dyn FnMut(u32, u32)>,
+    ) -> bool {
         let before = self.host[lender].claimed();
-        if !self.host[lender].leased() {
+        if !self.host[lender].leased_records(target_records) {
             let tier = self.host_tier();
             if copy.is_some() && self.host[lender].capacity() > 0 {
                 let reuse = Reuse::of(&self.ranking);
                 let rank = store_rank(reuse.ranker(lender, tier, Reader::Move), &self.prompt_reads);
-                self.host[lender].lease(scratch_group, rank, may_evict, copy);
+                self.host[lender].lease_records(scratch_group, target_records, rank, may_evict, copy);
             } else {
-                self.host[lender].lease(scratch_group, |_, _| 0u64, false, None);
+                self.host[lender].lease_records(scratch_group, target_records, |_, _| 0u64, false, None);
             }
         }
         if self.host[lender].claimed() != before {
@@ -1720,7 +1846,7 @@ impl Directory {
         for (layer, expert) in self.bank.lease(scratch_group, exits) {
             self.left_bank(layer, expert, None);
         }
-        self.leased(lender)
+        self.leased_records(lender, target_records)
     }
 
     /// Whether the prompt group holds the lent records of group `lender`
@@ -1728,10 +1854,26 @@ impl Directory {
     /// ([`HostRecords::leased`]), beside a host tier the bank's
     /// ([`BankRecords::leased`]).
     pub fn leased(&self, lender: usize) -> bool {
+        self.leased_records(lender, None)
+    }
+
+    /// Whether the prompt group holds `target_records` (or all `0..lent` when
+    /// `None`) claimed for `lender`.
+    pub fn leased_records(&self, lender: usize, target_records: Option<&[u32]>) -> bool {
         match self.placer {
-            crate::planning::Placer::Bank => self.host[lender].leased(),
+            crate::planning::Placer::Bank => self.host[lender].leased_records(target_records),
             crate::planning::Placer::Tier => self.bank.leased(),
         }
+    }
+
+    /// The kept expert currently held in host record `record` of `group`, if any.
+    pub fn host_kept_at(&self, group: usize, record: u32) -> Option<Staged> {
+        self.host[group].kept_at(record)
+    }
+
+    /// Number of lent host records `[0, lent)` in group `group`.
+    pub fn host_lent(&self, group: usize) -> u32 {
+        self.host[group].lent()
     }
 
     /// Whether the prompt group's lease holds conveyor record `record` of
@@ -1820,7 +1962,7 @@ impl Directory {
                 .map(|record| (None, bank_record(record)))
                 .collect::<Vec<_>>();
             if order.len() < absent.len() {
-                let rank = seed_rank(&reuse, reuse.ranker(group, Tier::Compute, Reader::Move), &self.prompt_reads);
+                let rank = seed_rank(&reuse, reuse.ranker(group, Tier::COMPUTE, Reader::Move), &self.prompt_reads);
                 let mut held = self
                     .bank
                     .records(group)
@@ -1875,7 +2017,7 @@ impl Directory {
         let taken = {
             let reuse = self.reuse_now();
             let ranks = reuse.rank_union(layer, routed);
-            let rank = seed_rank(&reuse, reuse.ranker(group, Tier::Compute, Reader::Move), &self.prompt_reads);
+            let rank = seed_rank(&reuse, reuse.ranker(group, Tier::COMPUTE, Reader::Move), &self.prompt_reads);
             let host = &self.host[group];
             let absent = routed
                 .iter()
@@ -2170,7 +2312,7 @@ impl Directory {
         if short == 0 {
             return typed(least);
         }
-        let ranker = reuse.ranker(group, Tier::Compute, Reader::Move);
+        let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
         let mut held = self
             .bank
             .records(group)
@@ -2227,7 +2369,7 @@ impl Directory {
             // may hold it) has answered.
             let mut held = {
                 let reuse = self.reuse_now();
-                let ranker = reuse.ranker(group, Tier::Compute, Reader::Observe);
+                let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Observe);
                 held.into_iter().map(|(layer, expert, read, record)| (self.ranked(ranker, layer, expert, read), record)).collect::<Vec<_>>()
             };
             held.sort_unstable();
@@ -2286,7 +2428,7 @@ impl Directory {
             }
             self.resize_pool(group);
             if self.bank.counts()[group] != before {
-                self.resized(group, Tier::Compute);
+                self.resized(group, Tier::COMPUTE);
             }
         }
         true
@@ -2310,7 +2452,7 @@ impl Directory {
         self.bank.grow(group, records);
         self.resize_pool(group);
         if self.bank.counts()[group] != before {
-            self.resized(group, Tier::Compute);
+            self.resized(group, Tier::COMPUTE);
         }
     }
 }

@@ -51,12 +51,12 @@ pub use expert_lines::{
 };
 pub use launch::{FrontRoutes, LaunchPrices, TargetCensus};
 pub use lines::{FileLine, ReadLine, RecordLine};
-pub use regime::{Form, Needed, NeededByForm, PathTerm, ReadAdmission, Regime, VerifyRoutes, Waste};
+pub use regime::{Form, LinkIdleBudget, Needed, NeededByForm, PathAdmission, PathTerm, ReadAdmission, Regime, VerifyRoutes, Waste};
 pub use speculative::{
     expected_tokens, prior_expected_tokens, sigma_prior, DraftCensus, DraftMethod, DraftWidthCensus, SpeculativePrice, SpeculativeRate,
 };
 pub use step::{LayerLoad, LayerRun, Lead, ReadAhead, StepInputs, StepTime};
-pub use terms::Terms;
+pub use terms::{ContentionDomain, DomainBudget, PathKind, ResourceTerms, Terms};
 pub use streamed::{step_inputs, DecodePrice, FormSeconds, HeldSlots, LayerReads, LiveDecode, StreamedLayers, StreamedStep};
 
 #[cfg(test)]

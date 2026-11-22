@@ -40,10 +40,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// What serving a decode request reads and writes: the core, the staging,
-/// and what the watcher shares with the steps.
+/// the shared interest ledger, and what the watcher shares with the steps.
 pub(super) struct Serving<'a> {
     pub(super) core: &'a mut Core,
     pub(super) prefetch: &'a mut Prefetch,
+    pub(super) ledger: &'a mut crate::experts::interest::Ledger,
     pub(super) shared: &'a Arc<Shared>,
 }
 
@@ -472,8 +473,8 @@ impl Decode {
     /// next turn to learn it. True when any landing was learned, or any
     /// miss claimed, answered, landed or dropped.
     pub(super) fn resume(&mut self, serving: Serving<'_>) -> bool {
-        let Serving { core, prefetch, shared } = serving;
-        let mut progressed = !(self.waiting.is_empty() && self.unclaimed.is_empty()) && prefetch.settle(&mut core.directory);
+        let Serving { core, prefetch, ledger, shared } = serving;
+        let mut progressed = !(self.waiting.is_empty() && self.unclaimed.is_empty()) && prefetch.settle(&mut core.directory, ledger).0;
         let ended = |core: &Core, at: At| request_ended(core, shared, at.point.layer, at.point.sequence);
         for mut unclaimed in std::mem::take(&mut self.unclaimed) {
             let (at, layer) = (unclaimed.at, unclaimed.at.point.layer);
@@ -529,7 +530,7 @@ impl Decode {
                 // it again.
                 Located::Landing => {
                     let at = waits.at;
-                    prefetch.want(core, shared, at, &[expert]);
+                    prefetch.want(core, ledger, shared, at, &[expert]);
                     index += 1;
                     continue;
                 }
@@ -601,7 +602,7 @@ impl Decode {
     /// flight (hastened to demand), or waiting for records; and the
     /// request's accounting.
     pub(super) fn serve(&mut self, posted: Posted, at: At, serving: Serving<'_>) {
-        let Serving { core, prefetch, shared } = serving;
+        let Serving { core, prefetch, ledger, shared } = serving;
         // A request whose step ended before residency served it is given
         // up: its posted read's staging frees as it ends.
         if request_ended(core, shared, posted.layer, posted.sequence) {
@@ -692,7 +693,7 @@ impl Decode {
         }
         // Every absent expert is wanted now, certainly: the ledger hastens
         // each read ahead it finds to demand.
-        prefetch.want(core, shared, at, &absent);
+        prefetch.want(core, ledger, shared, at, &absent);
         // The posted reads' records, each claimed now (of a read the engine
         // took): a short tier leaves its landing waiting for one, its read
         // in flight (`Self::resume`).
@@ -717,7 +718,7 @@ impl Decode {
         // Retire passed read-ahead interests (any needed expert in `absent` was
         // already hastened above) before publishing answers so unneeded hints
         // are cancelled before the device moves on.
-        prefetch.pass(core, shared, Some((sequence, layer)));
+        prefetch.pass(core, ledger, shared, Some((sequence, layer)));
         if let Some((PostedRead { landings, submitted }, grants)) = read {
             // The tier map's unmappings, a ready record's reclaim among
             // them, were stored as each claim took its record, before any
@@ -776,7 +777,7 @@ impl Decode {
         // landings held until residency's advance learned their end) is
         // read now, its records free since.
         if waits {
-            self.resume(Serving { core, prefetch, shared });
+            self.resume(Serving { core, prefetch, ledger, shared });
         }
         // Off the parked request's critical path (landings, answers and
         // reads are now in flight): prepare victims for subsequent requests.

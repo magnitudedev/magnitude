@@ -167,7 +167,7 @@ impl Ledger {
                 at: None,
                 kind,
                 bytes,
-                of: |ck: CacheKind| !ck.valued(),
+                of: |ck: CacheKind| ck == CacheKind::Spare,
                 within_boundary: false,
                 allow_guarantee: false,
             })?,

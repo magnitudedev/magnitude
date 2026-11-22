@@ -110,7 +110,7 @@ fn a_front_rows_names_calibrate_its_row_once_their_step_completes() {
     harness.staging_free();
     harness.tier_ready();
     let key = Combination { nearest: Look::of(Source::Ahead(Row { index: 0, front: Some(crate::GuessKind::Chained) })), rank: 0, looks: 1 };
-    let precision = || residency::lock(&harness.watcher.state).prefetch.rate(0, key);
+    let precision = || residency::lock(&harness.watcher.state).ledger.rate(0, key);
     let step = harness.two_row_step();
     let before = residency::lock(&harness.watcher.state).prefetch.front_read(0);
     harness.front_at(&step, 0, &[5]);
@@ -250,9 +250,9 @@ fn a_non_parking_pass_retires_graced_tier_records_from_its_rings() {
         assert_eq!(victims.len(), 4, "four layer-0 incumbents kept before the pass: {victims:?}");
         let reuse = directory.reuse_now();
         for &victim in &victims {
-            let victim_rank = reuse.rank(0, victim, Tier::Host, Reader::Move, None);
+            let victim_rank = reuse.rank(0, victim, Tier::HOST, Reader::Move, None);
             for skip in 4..8 {
-                let skip_rank = reuse.rank_of(0, skip, reuse.expected_with(0, skip, Tier::Host, step.sequence() + 1, 1.0));
+                let skip_rank = reuse.rank_of(0, skip, reuse.expected_with(0, skip, Tier::HOST, step.sequence() + 1, 1.0));
                 assert!(victim_rank < skip_rank, "incumbent (0, {victim}) must rank below skip (0, {skip})");
             }
         }

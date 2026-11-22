@@ -532,12 +532,36 @@ impl Ledger {
         self.reclaim_until(|state, exhausted, reclaimed| state.try_admit(&self.store.identity, &policy, exhausted, reclaimed))
     }
 
+    /// Synchronously reclaim up to `need` bytes of backed `Spare` / `Bank`
+    /// cache outside the ledger mutex (e.g. when a physical device allocation
+    /// hits a capacity refusal despite the ledger's last reading). Returns the
+    /// total bytes physically returned by reclaimers.
+    pub fn reclaim_backed(&self, need: u64) -> u64 {
+        if need == 0 {
+            return 0;
+        }
+        let yielding = |ck: CacheKind| matches!(ck, CacheKind::Spare | CacheKind::Table | CacheKind::Bank);
+        self.reclaim_until(|state, exhausted, reclaimed| {
+            if reclaimed >= need {
+                return ReclaimStep::Done(reclaimed);
+            }
+            let candidates = state.reclaim_candidates(None, &yielding, false, exhausted);
+            if let Some((id, reclaimer)) = candidates.into_iter().find_map(|c| match c.reclaim {
+                CandidateReclaim::Backed(reclaimer) => Some((c.id, reclaimer)),
+                CandidateReclaim::Unbacked => None,
+            }) {
+                return ReclaimStep::Reclaim { id, reclaimer, need: need - reclaimed };
+            }
+            ReclaimStep::Done(reclaimed)
+        })
+    }
+
     /// Hold up to `most` whole `unit`s of committed memory of `kind`,
     /// synchronously reclaiming eligible [`Reclaim::Backed`] cache OUTSIDE the
     /// ledger mutex via [`Self::reclaim_until`] before inserting the claim.
     pub(super) fn admit_units(&self, kind: CommittedKind, unit: NonZeroU64, most: u64) -> (EntryId, u64) {
         assert!(!matches!(kind, CommittedKind::Request(_)), "a request's state is reserved by its own path, never in units");
-        let yielding = |ck: CacheKind| matches!(ck, CacheKind::Spare | CacheKind::GraphSlots | CacheKind::Bank);
+        let yielding = |ck: CacheKind| matches!(ck, CacheKind::Spare | CacheKind::GraphSlots | CacheKind::Table | CacheKind::Bank);
         self.reclaim_until(|state, exhausted, reclaimed| {
             let read = state.reading(&self.store.identity, None);
             let estimate = state.estimate_at(read);

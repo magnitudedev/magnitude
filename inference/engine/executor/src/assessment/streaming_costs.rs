@@ -40,7 +40,7 @@
 use super::executor_costs::{executor_identity, failed, named, ExecutorCostsError, Formation, Walks};
 use crate::operators::routed::streamed::land_launch;
 use crate::planning::{BankBinding, ExpertBankPlan, RecordTensor, RecordTensors};
-use magnitude_kernels::{constants, routed_copy, routed_land};
+use magnitude_kernels::{constants, dense_output, routed_copy, routed_land};
 use seismic::measure::{
     Gauge, InvalidLine, Pending, Reason, Record, RecordStore, StoreError, Sums, Terms, Timing, Unformed, Work,
 };
@@ -643,6 +643,13 @@ const SCHEMA: (&str, u64) = ("schema", 2);
 /// the link's time to copy them (2.8 ms at 12 GB/s).
 pub const TIER_COPY_PROBE: (u64, u64) = (32, 1 << 20);
 
+/// The read-only GEMV probe (`[H, F]` bf16 weights = 128 MiB, exceeding even
+/// large GPU L2 caches such as RTX 5090's 96 MiB) used to measure
+/// `TierCopyCosts::stall_share` beside an async H2D transfer. Unlike a
+/// VRAM-write-saturating copy kernel (`routed_copy`), decode GEMV reads
+/// weights from VRAM and writes only a single activation row (32 KiB).
+pub const STALL_GEMV_PROBE: (u64, u64) = (8192, 8192);
+
 /// A point of [`TierCopyCosts`]: the probe's copy on `blocks`, the stall
 /// probe's work, alone or beside a copy on the transfer queue, or one
 /// transfer-queue batch of `records` of the probe's records.
@@ -731,14 +738,26 @@ impl TierCopyCosts {
         })
     }
 
-    /// The stall probe's key: the probe's records copied within device
-    /// memory on a list's whole grid, each run its own submission, `beside`.
+    fn stall_formation() -> Formation<dense_output::Entry> {
+        let (h, f) = STALL_GEMV_PROBE;
+        Formation::new(
+            dense_output::native_entry_with(dense_output::Elements {
+                A: Element::bf16(),
+                DW: Element::bf16(),
+            }),
+            &[("H", h), ("F", f), ("DS", 0), ("DB", 0)],
+        )
+    }
+
+    /// The stall probe's key: a read-only decode GEMV (`dense_output`) over
+    /// [`STALL_GEMV_PROBE`] bf16 weights in device memory, each run its own
+    /// submission, `beside` an H2D transfer-queue copy.
     fn stall_key(identity: &seismic::Identity, backend: seismic::BackendName, tensor_ops: bool, beside: Beside) -> Result<PointKey, ExecutorCostsError> {
-        let (records, bytes) = TIER_COPY_PROBE;
+        let (h, f) = STALL_GEMV_PROBE;
         Ok(PointKey {
             subject: seismic::PointSubject::executor(identity),
-            kernels: vec![Self::formation().identity(backend, tensor_ops)?],
-            configuration: named(&[("copy_stall", 1), ("records", records), ("bytes", bytes), SCHEMA]),
+            kernels: vec![Self::stall_formation().identity(backend, tensor_ops)?],
+            configuration: named(&[("copy_stall", 2), ("rows", h), ("cols", f), SCHEMA]),
             point: named(&[("beside_copy", beside.point())]),
         })
     }
@@ -827,16 +846,18 @@ impl TierCopyCosts {
     /// Peak memory demand of [`Self::measure`], rounded to `granularity` (the
     /// backend's native allocation granularity, `>= 1`): during `Beside::Copy`,
     /// the transfer queue's `copied` (shared) and `into` (device) live beside
-    /// `tier_copy_point(Source::Device)`'s `source` + `destination` (device)
-    /// and its small index/step/grid buffers.
+    /// `stall_gemv_point`'s `[H, F]` bf16 weight matrix and small activation
+    /// buffers in device memory.
     pub fn measure_demand(granularity: u64) -> crate::memory::ClaimDemand {
         let granularity = granularity.max(1);
         let round = |bytes: u64| bytes.next_multiple_of(granularity);
         let (records, bytes) = TIER_COPY_PROBE;
         let probe = records * bytes;
-        let small = 4 * (magnitude_kernels::constants::LIST_ENTRY(records) + constants::STEP_WORDS + 3);
+        let (h, f) = STALL_GEMV_PROBE;
+        let gemv_weights = h * f * 2;
+        let small = h * 4 + f * 2 + 4 + h * 4;
         crate::memory::ClaimDemand {
-            device: 3 * round(probe) + round(small),
+            device: round(probe) + round(gemv_weights) + round(small),
             shared: round(probe),
             ..crate::memory::ClaimDemand::default()
         }
@@ -865,7 +886,7 @@ impl TierCopyCosts {
                     .get_or_init(|| Self::formation().form(device, None))
                     .as_ref()
                     .map_err(|error| Unformed::Never(error.clone()))?;
-                tier_copy_point(charges, kernel, blocks, Source::Host).map_err(Unformed::Now)
+                tier_copy_point(charges, kernel, blocks).map_err(Unformed::Now)
             });
         }
         let error = failed("the stall probe's copy");
@@ -900,21 +921,22 @@ impl TierCopyCosts {
                 }
             }
         }
-        // The device's work queued alone, then beside a copy the transfer
-        // queue runs throughout its timing.
+        // The device's read-only GEMV work queued alone, then beside a copy the
+        // transfer queue runs throughout its timing.
+        let stall_formed = OnceCell::<Result<NativeKernel<dense_output::Entry>, ExecutorCostsError>>::new();
         let stall_store: &dyn RecordStore<PointKey> = if remeasuring_stall { &remeasure } else { store };
         let mut all_stall_measured = true;
         let mut last_stall_key = None;
         for beside in [Beside::Alone, Beside::Copy] {
             let key = Self::stall_key(&walks.identity(), device.backend(), device.info().forms_tensor_operations(), beside)?;
             last_stall_key = Some(key.clone());
-            let formed = &formed;
+            let stall_formed = &stall_formed;
             let point = move || {
-                let kernel = formed
-                    .get_or_init(|| Self::formation().form(device, None))
+                let kernel = stall_formed
+                    .get_or_init(|| Self::stall_formation().form(device, None))
                     .as_ref()
                     .map_err(|error| Unformed::Never(error.clone()))?;
-                tier_copy_point(charges, kernel, magnitude_kernels::LIST_BLOCKS, Source::Device).map_err(Unformed::Now)
+                stall_gemv_point(charges, kernel).map_err(Unformed::Now)
             };
             // Timed with no compile beside it; beside a copy, its record kept
             // only where the copy ran throughout ([`Copying`]).
@@ -1071,19 +1093,10 @@ impl Work for TransferBatches<'_> {
     }
 }
 
-/// Where a copy point's records lie: in host memory the device reads in
-/// place over the link (a tier copy), or in device memory (the stall
-/// probe's work, which loads no link).
-#[derive(Clone, Copy)]
-enum Source {
-    Host,
-    Device,
-}
-
 /// A copy of [`TIER_COPY_PROBE`]'s records from host-shared memory, read in
 /// place over the link as a tier's records are, into device memory on
 /// `blocks` blocks, its list staged in device memory as the copy reads it.
-fn tier_copy_point(charges: &seismic::Charges, kernel: &NativeKernel<routed_copy::Entry>, blocks: u32, source: Source) -> Result<Point, ExecutorCostsError> {
+fn tier_copy_point(charges: &seismic::Charges, kernel: &NativeKernel<routed_copy::Entry>, blocks: u32) -> Result<Point, ExecutorCostsError> {
     let error = failed("tier copy point");
     let (records, bytes) = TIER_COPY_PROBE;
     let byte = Element::bool();
@@ -1101,12 +1114,8 @@ fn tier_copy_point(charges: &seismic::Charges, kernel: &NativeKernel<routed_copy
     }
     let i32_bytes = |values: &[i32]| values.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
     let tensors = [
-        match source {
-            // Host memory the device reads in place over the link, as a tier's.
-            Source::Host => Tensor::shared(charges, byte, &shape),
-            Source::Device => Tensor::zeros(charges, byte, &shape),
-        }
-        .map_err(|cause| error(&cause))?,
+        // Host memory the device reads in place over the link, as a tier's.
+        Tensor::shared(charges, byte, &shape).map_err(|cause| error(&cause))?,
         Tensor::from_host(charges, Element::i32(), &[words], &i32_bytes(&list)).map_err(|cause| error(&cause))?,
         Tensor::from_host(charges, Element::i32(), &[constants::STEP_WORDS], &i32_bytes(&step)).map_err(|cause| error(&cause))?,
         Tensor::zeros(charges, byte, &shape).map_err(|cause| error(&cause))?,
@@ -1137,13 +1146,51 @@ fn tier_copy_point(charges: &seismic::Charges, kernel: &NativeKernel<routed_copy
     for (port, tensor) in ports.iter().zip(&tensors) {
         bindings.set(charges, port, tensor).map_err(|cause| error(&cause))?;
     }
-    // The stall probe's runs are submitted back to back, each its own
-    // submission, as a step's are: a copy beside them delays each.
-    let timing = match source {
-        Source::Host => GraphTiming::Device,
-        Source::Device => GraphTiming::Queued,
+    plan.point(charges, bindings, GraphTiming::Device).map(Point::Graph).map_err(|cause| error(&cause))
+}
+
+/// A read-only decode GEMV (`dense_output`) over [`STALL_GEMV_PROBE`] bf16
+/// weights in device memory, submitted as its own queued run so concurrent
+/// H2D copies measure real decode-GEMV interference rather than VRAM-write
+/// contention.
+fn stall_gemv_point(charges: &seismic::Charges, kernel: &NativeKernel<dense_output::Entry>) -> Result<Point, ExecutorCostsError> {
+    let error = failed("stall gemv point");
+    let (h, f) = STALL_GEMV_PROBE;
+    let tensors = [
+        Tensor::zeros(charges, Element::f32(), &[1, h]).map_err(|cause| error(&cause))?,
+        Tensor::zeros(charges, Element::bf16(), &[1, f]).map_err(|cause| error(&cause))?,
+        Tensor::zeros(charges, Element::bf16(), &[h, f]).map_err(|cause| error(&cause))?,
+        Tensor::from_host(charges, Element::i32(), &[1], &0i32.to_le_bytes()).map_err(|cause| error(&cause))?,
+        Tensor::zeros(charges, Element::f32(), &[0]).map_err(|cause| error(&cause))?,
+        Tensor::zeros(charges, Element::f32(), &[0]).map_err(|cause| error(&cause))?,
+    ];
+    let mut graph = charges.device().native_graph();
+    let mut ports = Vec::with_capacity(tensors.len());
+    for tensor in &tensors {
+        ports.push(graph.port(tensor.element(), &tensor.extents()).map_err(|cause| error(&cause))?);
+    }
+    let [residual_port, product_port, weight_port, rows_port, scale_port, bound_port] = &mut ports[..] else {
+        unreachable!("six ports");
     };
-    plan.point(charges, bindings, timing).map(Point::Graph).map_err(|cause| error(&cause))
+    graph
+        .enqueue(
+            kernel,
+            dense_output::WorkflowArgs {
+                residual: residual_port.tensor().into(),
+                product: product_port.tensor().into(),
+                down_weight: weight_port.tensor().into(),
+                out_rows: rows_port.tensor().into(),
+                down_scale: scale_port.tensor().into(),
+                down_bound: bound_port.tensor().into(),
+            },
+        )
+        .map_err(|cause| error(&cause))?;
+    let plan = graph.seal().map_err(|cause| error(&cause))?;
+    let mut bindings = plan.bindings();
+    for (port, tensor) in ports.iter().zip(&tensors) {
+        bindings.set(charges, port, tensor).map_err(|cause| error(&cause))?;
+    }
+    plan.point(charges, bindings, GraphTiming::Queued).map(Point::Graph).map_err(|cause| error(&cause))
 }
 
 /// The value `store` records measured at `key`, none while unrecorded. The
@@ -2304,8 +2351,10 @@ mod tests {
         const GRANULE: u64 = 2 * 1024 * 1024;
         let (records, bytes) = TIER_COPY_PROBE;
         let probe = records * bytes;
+        let (h, f) = STALL_GEMV_PROBE;
+        let gemv_weights = h * f * 2;
         let tier = TierCopyCosts::measure_demand(GRANULE);
-        assert_eq!(tier.device, 3 * probe + GRANULE, "3 probe buffers plus 1 granularity block for small tensors");
+        assert_eq!(tier.device, probe + gemv_weights + GRANULE, "transfer dest + GEMV weights + 1 granularity block for small tensors");
         assert_eq!(tier.shared, probe, "1 host-shared probe buffer");
 
         let form = ConvertForm::reference(seismic::BackendName::Cuda)
@@ -2314,6 +2363,27 @@ mod tests {
         let convert = form.measure_demand(GRANULE).expect("convert demand computes");
         assert!(convert.device >= 2 * GRANULE, "convert demand covers staging and resident tensors");
         assert_eq!(convert.shared, GRANULE, "convert shared metadata rounds to 1 granularity block");
+    }
+
+    #[test]
+    fn stall_key_uses_readonly_gemv_probe_distinct_from_tier_copy() {
+        let reports = seismic::fixtures::rtx3090();
+        let topology = seismic::fixtures::topology(&reports);
+        let cuda = topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() == seismic::BackendName::Cuda)
+            .expect("rtx3090 fixture has a CUDA executor");
+        let identity = executor_identity(&topology, cuda).unwrap();
+        let copy_key = TierCopyCosts::key(&identity, cuda.backend(), cuda.forms_tensor_operations(), 1).unwrap();
+        let alone_key = TierCopyCosts::stall_key(&identity, cuda.backend(), cuda.forms_tensor_operations(), Beside::Alone).unwrap();
+        let beside_key = TierCopyCosts::stall_key(&identity, cuda.backend(), cuda.forms_tensor_operations(), Beside::Copy).unwrap();
+        assert_ne!(alone_key.kernels, copy_key.kernels, "stall probe must use read-only GEMV, not VRAM-write routed_copy");
+        assert_eq!(alone_key.kernels, beside_key.kernels);
+        assert_eq!(alone_key.configuration.get("copy_stall"), Some(&2));
+        assert_eq!(alone_key.configuration.get("rows"), Some(&STALL_GEMV_PROBE.0));
+        assert_eq!(alone_key.configuration.get("cols"), Some(&STALL_GEMV_PROBE.1));
+        assert_ne!(alone_key.point, beside_key.point);
     }
 
     /// Host memory reader counts, CPU site record keys, standing requests, and
