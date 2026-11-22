@@ -78,6 +78,12 @@ impl<S: StoredRecords> MeasurementStatus<S> {
             measurements: stored,
         }
     }
+
+    /// When the machine's measurements are permanently unavailable (for example,
+    /// the measurement job could not open the device), returns the refusal reason.
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        self.measurements.unavailable_reason()
+    }
 }
 
 /// How far what is stored has come, all the job reads of it.
@@ -97,6 +103,8 @@ pub trait StoredRecords: Clone + Send + Sync + 'static {
     /// What is stored, its costs unavailable for `reason`: settled, so every model counts as
     /// measured, its speed unavailable.
     fn unavailable(&self, reason: String) -> Self;
+    /// When costs are permanently unavailable, the refusal reason.
+    fn unavailable_reason(&self) -> Option<&str>;
 }
 
 impl StoredRecords for AssessmentSetup {
@@ -112,6 +120,13 @@ impl StoredRecords for AssessmentSetup {
         Self {
             structure: Arc::clone(&self.structure),
             measurements: Measurements::Unavailable { reason },
+        }
+    }
+
+    fn unavailable_reason(&self) -> Option<&str> {
+        match &self.measurements {
+            Measurements::Unavailable { reason } => Some(reason.as_str()),
+            Measurements::Pending(_) | Measurements::Measured { .. } => None,
         }
     }
 }
@@ -856,6 +871,13 @@ mod tests {
 
         fn unavailable(&self, _: String) -> Self {
             Self::Unavailable
+        }
+
+        fn unavailable_reason(&self) -> Option<&str> {
+            match self {
+                Self::Stored(_) => None,
+                Self::Unavailable => Some("unavailable"),
+            }
         }
     }
 

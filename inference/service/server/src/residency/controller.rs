@@ -53,6 +53,7 @@ use super::{
     ResidencyLease, ResidencyNotification, ResidencyWorker, ResolvedResidencyTarget,
 };
 use crate::assessment::assessor::ModelAssessor;
+use crate::assessment::measurement::{MeasurementStatus, StoredRecords};
 use crate::configurations::{HeldConfiguration, ResolvedConfiguration, ResolvedConfigurations};
 use crate::device_lock::{DeviceHold, DeviceLock, DeviceShare, IdleResident, ResidentRoom};
 use crate::hardware::execution_backend;
@@ -97,6 +98,9 @@ pub struct ResidencyEnvironment {
     pub launcher: WorkerLauncher,
     /// Shared by every load and optimization for its lifetime, against the measurement job.
     pub device: DeviceLock,
+    /// Current status of the machine's background measurement job: loads and previews fail fast
+    /// with `device_unavailable` when measurements are permanently unavailable.
+    pub measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
     /// Distinguishes this service run's instance identifiers.
     pub instance_id_namespace: String,
 }
@@ -222,7 +226,9 @@ impl ModelInstances {
                 .await?;
             let preview = preview(&self.environment.catalog, &resolved.configuration)
                 .await
-                .map_err(|error| InventoryError::from(preview_failure(error)))?;
+                .map_err(|error| {
+                    InventoryError::from(preview_failure(error, &self.environment.measurement))
+                })?;
             load_plan(&preview).map_err(InventoryError::from)
         })
     }
@@ -544,17 +550,51 @@ pub(super) async fn preview(
     magnitude_service_utils::blocking::run(move || resolved.manifest.preview(&catalog)).await
 }
 
+/// When the background measurement job has marked the machine's measurements permanently
+/// unavailable (for example, the device could not be opened), return the corresponding
+/// `device_unavailable` failure instead of reporting `prices_pending`.
+fn unavailable_measurement<S: StoredRecords>(
+    measurement: &tokio::sync::watch::Receiver<MeasurementStatus<S>>,
+) -> Option<ModelOperationFailure> {
+    measurement
+        .borrow()
+        .unavailable_reason()
+        .map(|reason| ModelOperationFailure::new("device_unavailable", reason.to_owned(), false))
+}
+
 /// Ask the measurement job for pending figures via `defer` and wait for the next device release,
 /// holding nothing of the device. Subscribes to `device.releases()` before `defer` so a release
-/// that finishes during `defer` is never missed.
-pub(super) async fn settle_prices(
+/// that finishes during `defer` is never missed. Fails fast with `device_unavailable` if
+/// `measurement` is already or becomes permanently unavailable.
+pub(super) async fn settle_prices<S: StoredRecords>(
     device: &DeviceLock,
+    measurement: &tokio::sync::watch::Receiver<MeasurementStatus<S>>,
     defer: impl std::future::Future<Output = Result<(), ModelOperationFailure>>,
 ) -> Result<(), ModelOperationFailure> {
+    if let Some(failure) = unavailable_measurement(measurement) {
+        return Err(failure);
+    }
     let mut releases = device.releases();
+    let mut status = measurement.clone();
     defer.await?;
     device.requested();
-    releases.released().await;
+    let unavailable = async {
+        loop {
+            if let Some(failure) = unavailable_measurement(&status) {
+                return failure;
+            }
+            if status.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::select! {
+        () = releases.released() => {}
+        failure = unavailable => return Err(failure),
+    }
+    if let Some(failure) = unavailable_measurement(measurement) {
+        return Err(failure);
+    }
     Ok(())
 }
 
@@ -595,13 +635,21 @@ fn context_window_tokens(tokens: u64) -> Result<u32, ModelOperationFailure> {
     })
 }
 
-fn preview_failure(error: PreviewError) -> ModelOperationFailure {
+fn preview_failure<S: StoredRecords>(
+    error: PreviewError,
+    measurement: &tokio::sync::watch::Receiver<MeasurementStatus<S>>,
+) -> ModelOperationFailure {
     let (code, retryable) = match &error {
         PreviewError::Unsupported(_) => ("unsupported_model", false),
         PreviewError::Device(_) => ("device_unavailable", true),
         PreviewError::MemoryObservationUnavailable { .. } => ("memory_observation_unavailable", true),
         PreviewError::WeightBound(bound) => return ModelOperationFailure::WeightBound(*bound),
-        PreviewError::PricesPending { .. } => ("prices_pending", true),
+        PreviewError::PricesPending { .. } => {
+            if let Some(failure) = unavailable_measurement(measurement) {
+                return failure;
+            }
+            ("prices_pending", true)
+        }
         PreviewError::Internal { .. } => ("load_preview_failed", false),
     };
     ModelOperationFailure::new(code, error.to_string(), retryable)
@@ -609,7 +657,11 @@ fn preview_failure(error: PreviewError) -> ModelOperationFailure {
 
 /// A worker's load failure. A memory refusal is a shortage: blocked by the bytes the engine's
 /// claim found available above the domain's reserve.
-fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailure {
+fn load_failure<S: StoredRecords>(
+    error: LoadError,
+    worker: &EngineWorker,
+    measurement: &tokio::sync::watch::Receiver<MeasurementStatus<S>>,
+) -> ModelOperationFailure {
     let retryable = error.retryable();
     let code = match &error {
         LoadError::InsufficientMemory { memory, .. } => {
@@ -626,7 +678,12 @@ fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailur
         LoadError::DeviceLost { .. } => "device_lost",
         LoadError::WorkerLost { .. } => "worker_exited",
         LoadError::Configuration { .. } => "invalid_model_configuration",
-        LoadError::PricesPending { .. } => "prices_pending",
+        LoadError::PricesPending { .. } => {
+            if let Some(failure) = unavailable_measurement(measurement) {
+                return failure;
+            }
+            "prices_pending"
+        }
         LoadError::Internal { .. } => "model_load_failed",
     };
     let message = match &error {
@@ -798,7 +855,13 @@ impl EngineResidency {
 
             let ((worker, connection), preview, _device) = run_priced(
                 || preview(&environment.catalog, &resolved.configuration),
-                || settle_prices(&environment.device, self.defer_unpriced(instance_id, &resolved.configuration)),
+                || {
+                    settle_prices(
+                        &environment.device,
+                        &environment.measurement,
+                        self.defer_unpriced(instance_id, &resolved.configuration),
+                    )
+                },
                 |_| async {
                     let held = self.demand.lock().expect("device demand").clone();
                     match held {
@@ -919,9 +982,11 @@ impl EngineResidency {
             )
             .await
             .map_err(|error| match error {
-                PricedError::Preview(error) => preview_failure(error),
+                PricedError::Preview(error) => preview_failure(error, &environment.measurement),
                 PricedError::Host(failure) => failure,
-                PricedError::Load(error, Some(worker)) => load_failure(error, &worker),
+                PricedError::Load(error, Some(worker)) => {
+                    load_failure(error, &worker, &environment.measurement)
+                }
                 PricedError::Load(error, None) => {
                     ModelOperationFailure::new("worker_exited", error.to_string(), true)
                 }
@@ -1152,12 +1217,48 @@ mod tests {
 
     const MODEL: &str = "qwen3.5-4b:gguf:q4";
 
+    #[derive(Clone)]
+    enum TestRecords {
+        Pending,
+        Unavailable(String),
+    }
+
+    impl StoredRecords for TestRecords {
+        fn stage(&self) -> crate::assessment::measurement::Stage {
+            match self {
+                Self::Pending => crate::assessment::measurement::Stage::Unmeasured,
+                Self::Unavailable(_) => crate::assessment::measurement::Stage::Settled,
+            }
+        }
+
+        fn unavailable(&self, reason: String) -> Self {
+            Self::Unavailable(reason)
+        }
+
+        fn unavailable_reason(&self) -> Option<&str> {
+            match self {
+                Self::Pending => None,
+                Self::Unavailable(reason) => Some(reason.as_str()),
+            }
+        }
+    }
+
+    fn test_measurement(
+        records: TestRecords,
+    ) -> (
+        tokio::sync::watch::Sender<MeasurementStatus<TestRecords>>,
+        tokio::sync::watch::Receiver<MeasurementStatus<TestRecords>>,
+    ) {
+        tokio::sync::watch::channel(MeasurementStatus::stored(records))
+    }
+
     /// A weight cap below the load's least weights is the service's own failure, with its own
     /// code and both numbers, never retried: not a memory shortage, which clears with memory.
     #[test]
     fn a_weight_cap_below_the_least_weights_is_never_retried() {
+        let (_tx, measurement) = test_measurement(TestRecords::Pending);
         let cap = magnitude_engine::error::WeightBoundBelowWeights { bound: magnitude_executor::WeightBound::Cap(2_100_000_000), needed: 2_130_136_892 };
-        let failure = preview_failure(PreviewError::WeightBound(cap));
+        let failure = preview_failure(PreviewError::WeightBound(cap), &measurement);
         assert!(matches!(&failure, ModelOperationFailure::WeightBound(found) if *found == cap));
         assert_eq!(failure.code(), magnitude_serving::error::WEIGHT_BOUND_BELOW_WEIGHTS);
         assert!(!failure.retryable());
@@ -1180,6 +1281,7 @@ mod tests {
     async fn an_unpriced_load_waits_without_the_device_until_its_figures_are_stored() {
         use std::sync::atomic::AtomicBool;
         let device = DeviceLock::default();
+        let (_tx, measurement) = test_measurement(TestRecords::Pending);
         let stored = Arc::new(AtomicBool::new(false));
         let (requests, previews) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let (shown, mut stages) = tokio::sync::mpsc::unbounded_channel();
@@ -1203,7 +1305,7 @@ mod tests {
                         }
                     },
                     || {
-                        settle_prices(&device, async {
+                        settle_prices(&device, &measurement, async {
                             shown.send(ModelLoadStage::Queued).expect("stages");
                             requests.fetch_add(1, Ordering::Relaxed);
                             Ok(())
@@ -1239,6 +1341,7 @@ mod tests {
     #[tokio::test]
     async fn an_unpriced_load_fails_when_a_measurement_release_stores_nothing() {
         let device = DeviceLock::default();
+        let (_tx, measurement) = test_measurement(TestRecords::Pending);
         let previews = Arc::new(AtomicU64::new(0));
         let mut changes = device.changes();
         let load = tokio::spawn({
@@ -1254,7 +1357,7 @@ mod tests {
                             })
                         }
                     },
-                    || settle_prices(&device, async { Ok(()) }),
+                    || settle_prices(&device, &measurement, async { Ok(()) }),
                     |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
                     |()| {},
                     (),
@@ -1274,6 +1377,81 @@ mod tests {
             Err(PricedError::Preview(PreviewError::PricesPending { .. }))
         ));
         assert_eq!(previews.load(Ordering::Relaxed), 2, "re-previews once after settle, then stops");
+    }
+
+    /// When the measurement job has already marked measurements permanently unavailable,
+    /// `settle_prices` fails fast with `device_unavailable` carrying the reason without waiting
+    /// for a device release, and `preview_failure` translates `PricesPending` the same way.
+    #[tokio::test]
+    async fn unavailable_measurements_fail_fast_with_device_unavailable() {
+        let device = DeviceLock::default();
+        let reason = "the measurement job could not open the device in 2 jobs in a row: no timestamps";
+        let (_tx, measurement) = test_measurement(TestRecords::Unavailable(reason.into()));
+        let previews = Arc::new(AtomicU64::new(0));
+        let outcome = run_priced(
+            || {
+                previews.fetch_add(1, Ordering::Relaxed);
+                async {
+                    Err::<&str, _>(PreviewError::PricesPending {
+                        reason: "nothing is measured".into(),
+                        pending: sample_pending_prices(),
+                    })
+                }
+            },
+            || settle_prices(&device, &measurement, async { Ok(()) }),
+            |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+            |()| {},
+            (),
+            |&plan, &(), ()| {
+                std::future::ready(Ok::<_, PricedFailure<ModelOperationFailure, ()>>(plan))
+            },
+        )
+        .await;
+        match outcome {
+            Err(PricedError::Host(failure)) => {
+                assert_eq!(failure.code(), "device_unavailable");
+                assert_eq!(failure.message(), reason);
+                assert!(!failure.retryable());
+            }
+            other => panic!("expected Host(device_unavailable), got {other:?}"),
+        }
+        assert_eq!(previews.load(Ordering::Relaxed), 1, "does not loop or wait on a device release");
+
+        let direct = preview_failure(
+            PreviewError::PricesPending {
+                reason: "nothing is measured".into(),
+                pending: sample_pending_prices(),
+            },
+            &measurement,
+        );
+        assert_eq!(direct.code(), "device_unavailable");
+        assert_eq!(direct.message(), reason);
+        assert!(!direct.retryable());
+    }
+
+    /// When measurements transition to `Unavailable` while `settle_prices` is waiting for a
+    /// device release, it wakes immediately and surfaces `device_unavailable` with the reason.
+    #[tokio::test]
+    async fn settle_prices_wakes_when_measurements_become_unavailable() {
+        let device = DeviceLock::default();
+        let (tx, measurement) = test_measurement(TestRecords::Pending);
+        let mut changes = device.changes();
+        let waiter = tokio::spawn({
+            let device = device.clone();
+            async move { settle_prices(&device, &measurement, async { Ok(()) }).await }
+        });
+        changes.changed().await;
+        let reason = "cannot open GPU";
+        tx.send_replace(MeasurementStatus::stored(TestRecords::Unavailable(
+            reason.into(),
+        )));
+        let failure = waiter
+            .await
+            .expect("waiter")
+            .expect_err("must fail with device_unavailable");
+        assert_eq!(failure.code(), "device_unavailable");
+        assert_eq!(failure.message(), reason);
+        assert!(!failure.retryable());
     }
 
     fn snapshot(model: &str, assessment: serde_json::Value) -> ModelAssessmentsSnapshot {

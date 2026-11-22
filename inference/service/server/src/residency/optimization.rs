@@ -322,7 +322,13 @@ async fn prepare(
     // standing figures through `run_priced` while holding nothing of the device.
     let outcome = run_priced(
         || preview(&environment.catalog, &resolved.configuration),
-        || settle_prices(&environment.device, request_prices(&environment.catalog, &resolved.configuration)),
+        || {
+            settle_prices(
+                &environment.device,
+                &environment.measurement,
+                request_prices(&environment.catalog, &resolved.configuration),
+            )
+        },
         |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
         |()| {},
         job,

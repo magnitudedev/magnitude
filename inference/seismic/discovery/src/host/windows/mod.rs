@@ -318,21 +318,34 @@ impl Sys for LiveSys {
                 }
             }
         }
-        // Opened once: an account refused the counters stays refused.
+        // Opened once: a session where PDH counters are unavailable stays without them.
         static QUERY: std::sync::OnceLock<Option<std::sync::Mutex<Query>>> =
             std::sync::OnceLock::new();
         let query = QUERY.get_or_init(|| {
             let mut raw_query = std::ptr::null_mut();
-            pdh("PdhOpenQueryW", unsafe {
-                PdhOpenQueryW(std::ptr::null(), 0, &mut raw_query)
-            })?;
+            let status = unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut raw_query) };
+            if pdh(status).is_none() {
+                tracing::warn!(
+                    call = "PdhOpenQueryW",
+                    status = format_args!("{status:#x}"),
+                    "Windows PDH counters unavailable; falling back to GlobalMemoryStatusEx"
+                );
+                return None;
+            }
             let mut guard = QueryGuard(raw_query);
             let mut counters = [std::ptr::null_mut(); 4];
             for (counter, path) in counters.iter_mut().zip(COUNTER_PATHS) {
                 let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-                pdh(path, unsafe {
-                    PdhAddEnglishCounterW(guard.0, wide.as_ptr(), 0, counter)
-                })?;
+                let status =
+                    unsafe { PdhAddEnglishCounterW(guard.0, wide.as_ptr(), 0, counter) };
+                if pdh(status).is_none() {
+                    tracing::warn!(
+                        counter = path,
+                        status = format_args!("{status:#x}"),
+                        "Windows PDH counters unavailable; falling back to GlobalMemoryStatusEx"
+                    );
+                    return None;
+                }
             }
             let query = std::mem::replace(&mut guard.0, std::ptr::null_mut());
             Some(std::sync::Mutex::new(Query { query, counters }))
@@ -342,17 +355,13 @@ impl Sys for LiveSys {
             .as_ref()?
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pdh("PdhCollectQueryData", unsafe {
-            PdhCollectQueryData(query.query)
-        })?;
+        pdh(unsafe { PdhCollectQueryData(query.query) })?;
         let mut values = [0u64; 4];
         for ((value, counter), path) in values.iter_mut().zip(query.counters).zip(COUNTER_PATHS) {
             let mut raw: PDH_RAW_COUNTER = unsafe { std::mem::zeroed() };
-            pdh(path, unsafe {
-                PdhGetRawCounterValue(counter, std::ptr::null_mut(), &mut raw)
-            })?;
+            pdh(unsafe { PdhGetRawCounterValue(counter, std::ptr::null_mut(), &mut raw) })?;
             if raw.CStatus != PDH_CSTATUS_VALID_DATA && raw.CStatus != PDH_CSTATUS_NEW_DATA {
-                pdh(path, raw.CStatus)?;
+                pdh(raw.CStatus)?;
             }
             *value = u64::try_from(raw.FirstValue)
                 .unwrap_or_else(|_| panic!("invariant violated: {path} reads {}", raw.FirstValue));
@@ -464,23 +473,12 @@ impl Sys for LiveSys {
     }
 }
 
-/// A PDH call's `status` as a read ([`read`]): an account refused the
-/// counters (`PDH_ACCESS_DENIED`) or a counter or object the system does
-/// not provide (its provider disabled or its registration damaged) is none;
-/// any other failure an invariant violation.
-fn pdh(what: &str, status: u32) -> Option<()> {
-    use windows_sys::Win32::System::Performance::{
-        PDH_ACCESS_DENIED, PDH_CSTATUS_NO_COUNTER, PDH_CSTATUS_NO_OBJECT, PDH_NO_DATA,
-    };
-    let outcome = match status {
-        0 => Ok(()),
-        PDH_ACCESS_DENIED => Err(std::io::ErrorKind::PermissionDenied.into()),
-        PDH_CSTATUS_NO_OBJECT | PDH_CSTATUS_NO_COUNTER | PDH_NO_DATA => {
-            Err(std::io::ErrorKind::NotFound.into())
-        }
-        status => Err(std::io::Error::other(format!("PDH status {status:#x}"))),
-    };
-    read(what, outcome)
+/// A PDH call's `status`: `Some(())` on `ERROR_SUCCESS` (`0`), `None` for any
+/// non-zero status (for example `PDH_ACCESS_DENIED`, missing or damaged
+/// counter providers, or `PDH_CANNOT_READ_NAME_STRINGS` `0xc0000bc8` in
+/// restricted SSH/service sessions).
+fn pdh(status: u32) -> Option<()> {
+    (status == 0).then_some(())
 }
 
 /// The OS's diagnostics for the hardware report: none on Windows.

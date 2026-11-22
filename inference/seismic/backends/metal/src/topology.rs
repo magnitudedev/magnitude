@@ -73,12 +73,22 @@ pub fn describe(
             let properties = answers
                 .properties(&handle)
                 .map(seismic_lang::device::DeviceProperties::Metal);
+            let admission = answers
+                .language()
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+                .and_then(|()| {
+                    handle
+                        .supports_stage_boundary_timestamps()
+                        .then_some(())
+                        .ok_or_else(|| crate::device::no_stage_boundary_timestamps(&handle))
+                });
             let report = MetalReport {
                 registry_id: handle.registry_id(),
                 name: handle.name(),
                 unified: handle.has_unified_memory(),
                 tensor_operations: answers.forms_tensor_operations(&handle),
-                admission: answers.language().map(|_| ()).map_err(|error| error.to_string()),
+                admission,
                 working_set: handle.recommended_working_set_bytes(),
                 max_allocation: handle.max_allocation_bytes(),
                 kinds: kinds(handle.has_unified_memory()),

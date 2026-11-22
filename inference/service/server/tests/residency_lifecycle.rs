@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
+use magnitude_engine::assessment::{AssessmentSetup, Measurements};
+use magnitude_executor::assessment::{CostWalk, PendingPrices, PointRequest};
 use magnitude_executor::platform::ReleaseRate;
 use magnitude_service_api::{AppState, app};
 use magnitude_service_contracts::HardwareProvider;
@@ -35,7 +37,8 @@ use magnitude_service_models::{
     InventoryConfig, ManagedModelDownloads, ManagedModelServices, ManagedModelStore,
     ModelDomainResolver, load_release_catalog, managed_model_services,
 };
-use magnitude_service_server::assessment::environment::ServingDevice;
+use magnitude_service_server::assessment::environment::{ServingDevice, assessment_structure};
+use magnitude_service_server::assessment::measurement::MeasurementStatus;
 use magnitude_service_server::configurations::ResolvedConfigurations;
 use magnitude_service_server::device_lock::DeviceLock;
 use magnitude_service_server::hardware::HardwareInventory;
@@ -87,6 +90,7 @@ struct Served {
     configurations: Arc<ResolvedConfigurations>,
     catalog: Arc<seismic::Devices>,
     serving: ServingDevice,
+    measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
 }
 
 impl Served {
@@ -102,6 +106,7 @@ impl Served {
             idle_timeout,
             launcher: WorkerLauncher::current().expect("harness executable"),
             device: DeviceLock::default(),
+            measurement: self.measurement.clone(),
             instance_id_namespace: namespace.to_owned(),
         });
         let router = app(
@@ -169,6 +174,19 @@ async fn served(arguments: &[String]) -> anyhow::Result<(Served, ServedVolumes)>
         serving,
         Default::default(),
     ));
+    let structure = assessment_structure(
+        &catalog,
+        serving,
+        Some(&inventory.derived_cache().kernel_directory()),
+    )?;
+    let (_measurement_tx, measurement) = tokio::sync::watch::channel(MeasurementStatus::stored(
+        AssessmentSetup {
+            structure: Arc::new(structure),
+            measurements: Measurements::Pending(PendingPrices::standing(PointRequest::Costs(
+                CostWalk::Required,
+            ))),
+        },
+    ));
     let served = Served {
         inventory,
         resolver,
@@ -176,6 +194,7 @@ async fn served(arguments: &[String]) -> anyhow::Result<(Served, ServedVolumes)>
         configurations,
         catalog,
         serving,
+        measurement,
     };
     Ok((served, volumes))
 }

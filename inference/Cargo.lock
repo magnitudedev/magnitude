@@ -4287,6 +4287,7 @@ dependencies = [
  "seismic-topology",
  "seismic-vulkan",
  "serde_json",
+ "tracing",
  "windows",
  "windows-sys 0.61.2",
 ]

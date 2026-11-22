@@ -89,6 +89,12 @@ impl DeviceHandle {
         })
     }
 
+    /// Whether this device can sample GPU timestamps at stage boundaries,
+    /// which every timed and observed batch requires ([`MetalDevice::open`]).
+    pub fn supports_stage_boundary_timestamps(&self) -> bool {
+        crate::pooled(|| timestamp_counters(self).is_some())
+    }
+
     /// `MTLDevice.recommendedMaxWorkingSetSize`: Metal's advisory ceiling for
     /// this device's working set. Advice, not physical capacity.
     pub fn recommended_working_set_bytes(&self) -> u64 {
@@ -905,6 +911,16 @@ fn timestamp_counters(handle: &DeviceHandle) -> Option<Retained<ProtocolObject<d
     raw.counterSets()?.iter().find(|set| &*set.name() == wanted)
 }
 
+/// Refusal reason shared by discovery (`crate::topology::describe`) and open
+/// (`MetalDevice::open`) when a Metal device lacks stage-boundary GPU timestamps.
+pub(crate) fn no_stage_boundary_timestamps(handle: &DeviceHandle) -> String {
+    format!(
+        "Metal device `{}` cannot sample GPU timestamps at stage boundaries, which every timed \
+         and observed batch requires",
+        handle.name()
+    )
+}
+
 /// The device service: device plus one command queue.
 #[derive(Clone)]
 pub struct MetalDevice {
@@ -948,13 +964,8 @@ impl MetalDevice {
         // Metal defaults to a small compiler pool; allow the system to scale
         // compilation concurrency to the machine before forming any kernels.
         handle.raw().setShouldMaximizeConcurrentCompilation(true);
-        let timestamps = timestamp_counters(&handle).ok_or_else(|| {
-            TargetError::DeviceUnavailable(format!(
-                "Metal device `{}` cannot sample GPU timestamps at stage boundaries, which every timed \
-                 and observed batch requires",
-                handle.name()
-            ))
-        })?;
+        let timestamps = timestamp_counters(&handle)
+            .ok_or_else(|| TargetError::DeviceUnavailable(no_stage_boundary_timestamps(&handle)))?;
         let raw_queue = handle.raw().newCommandQueue().ok_or_else(|| {
             TargetError::DeviceUnavailable("could not create a Metal command queue".into())
         })?;

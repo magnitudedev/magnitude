@@ -161,22 +161,133 @@ const CPU_IDENTITY_FIELDS: [&str; 16] = [
 ];
 
 /// Human-readable CPU brand string from `/proc/cpuinfo`'s `model name`,
-/// falling back to `"CPU (<arch>)"`.
+/// ARM MIDR (`CPU implementer` + `CPU part`), `/proc/cpuinfo`'s `Hardware`,
+/// or `/proc/device-tree/model`, falling back to `"CPU (<arch>)"`.
 pub(super) fn cpu_model(sys: &impl Sys) -> String {
+    let cpuinfo = sys.text(Path::new("/proc/cpuinfo"));
+    let model_name = || cpuinfo_field(cpuinfo.as_deref()?, "model name");
+    let midr = || arm_midr_model(cpuinfo.as_deref()?);
+    let hardware = || cpuinfo_field(cpuinfo.as_deref()?, "Hardware");
+    let device_tree = || {
+        sys.text(Path::new("/proc/device-tree/model"))
+            .map(|text| {
+                text.trim_matches(|ch: char| ch.is_whitespace() || ch == '\0')
+                    .to_owned()
+            })
+            .filter(|name| !name.is_empty())
+    };
     resolve(
-        &[((), &|| {
-            sys.text(Path::new("/proc/cpuinfo"))?
-                .lines()
-                .find_map(|line| {
-                    let (key, value) = line.split_once(':')?;
-                    (key.trim() == "model name").then(|| value.trim().to_owned())
-                })
-                .filter(|name| !name.is_empty())
-        })],
+        &[
+            ((), &model_name),
+            ((), &midr),
+            ((), &hardware),
+            ((), &device_tree),
+        ],
         (),
         || format!("CPU ({})", std::env::consts::ARCH),
     )
     .0
+}
+
+fn cpuinfo_field(cpuinfo: &str, wanted: &str) -> Option<String> {
+    cpuinfo
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == wanted).then(|| value.trim().to_owned())
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_hex_u16(value: &str) -> Option<u16> {
+    let digits = value
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| value.trim().strip_prefix("0X"))?;
+    u16::from_str_radix(digits, 16).ok()
+}
+
+/// Decodes ARM `CPU implementer` + `CPU part` pairs from `/proc/cpuinfo`,
+/// deduplicating heterogeneous core pairs in order of first appearance.
+fn arm_midr_model(cpuinfo: &str) -> Option<String> {
+    let mut names: Vec<&'static str> = Vec::new();
+    let mut implementer: Option<u8> = None;
+    let mut part: Option<u16> = None;
+    let flush = |implementer: &mut Option<u8>, part: &mut Option<u16>, names: &mut Vec<&'static str>| {
+        if let (Some(imp), Some(p)) = (implementer.take(), part.take()) {
+            if let Some(name) = arm_midr_name(imp, p) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    };
+    for line in cpuinfo.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            flush(&mut implementer, &mut part, &mut names);
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "processor" => flush(&mut implementer, &mut part, &mut names),
+            "CPU implementer" => {
+                implementer = parse_hex_u16(value).and_then(|v| u8::try_from(v).ok());
+            }
+            "CPU part" => {
+                part = parse_hex_u16(value);
+            }
+            _ => {}
+        }
+    }
+    flush(&mut implementer, &mut part, &mut names);
+    (!names.is_empty()).then(|| names.join(" / "))
+}
+
+fn arm_midr_name(implementer: u8, part: u16) -> Option<&'static str> {
+    match (implementer, part) {
+        // ARM Ltd.
+        (0x41, 0xd03) => Some("ARM Cortex-A53"),
+        (0x41, 0xd05) => Some("ARM Cortex-A55"),
+        (0x41, 0xd07) => Some("ARM Cortex-A57"),
+        (0x41, 0xd08) => Some("ARM Cortex-A72"),
+        (0x41, 0xd0b) => Some("ARM Cortex-A76"),
+        (0x41, 0xd0c) => Some("ARM Neoverse-N1"),
+        (0x41, 0xd40) => Some("ARM Neoverse-V1"),
+        (0x41, 0xd41) => Some("ARM Cortex-A78"),
+        (0x41, 0xd44) => Some("ARM Cortex-X1"),
+        (0x41, 0xd46) => Some("ARM Cortex-A510"),
+        (0x41, 0xd47) => Some("ARM Cortex-A710"),
+        (0x41, 0xd48) => Some("ARM Cortex-X2"),
+        (0x41, 0xd49) => Some("ARM Neoverse-N2"),
+        (0x41, 0xd4d) => Some("ARM Cortex-A715"),
+        (0x41, 0xd4e) => Some("ARM Cortex-X3"),
+        (0x41, 0xd4f) => Some("ARM Neoverse-V2"),
+        (0x41, 0xd80) => Some("ARM Cortex-A520"),
+        (0x41, 0xd81) => Some("ARM Cortex-A720"),
+        (0x41, 0xd82) => Some("ARM Cortex-X4"),
+        (0x41, 0xd84) => Some("ARM Neoverse-V3"),
+        (0x41, 0xd8e) => Some("ARM Neoverse-N3"),
+        // Fujitsu
+        (0x46, 0x001) => Some("Fujitsu A64FX"),
+        // NVIDIA (Grace uses ARM Neoverse-V2 0x41:0xd4f above)
+        (0x4e, 0x004) => Some("NVIDIA Carmel"),
+        // Qualcomm
+        (0x51, 0x001) => Some("Qualcomm Oryon"),
+        // Apple
+        (0x61, 0x022 | 0x023) => Some("Apple M1"),
+        (0x61, 0x024 | 0x025) => Some("Apple M1 Pro"),
+        (0x61, 0x028 | 0x029) => Some("Apple M1 Max"),
+        (0x61, 0x032 | 0x033) => Some("Apple M2"),
+        (0x61, 0x034 | 0x035) => Some("Apple M2 Pro"),
+        (0x61, 0x038 | 0x039) => Some("Apple M2 Max"),
+        // Ampere
+        (0xc0, 0xac3) => Some("Ampere-1"),
+        (0xc0, 0xac4) => Some("Ampere-1a"),
+        _ => None,
+    }
 }
 
 /// `/proc/cpuinfo`'s identifying fields; where it is unreadable or names

@@ -547,13 +547,89 @@ fn a_shared_cgroup_is_not_the_processs_own() {
     assert_eq!(own_cgroup(&*v1), None);
 }
 
-/// `cpu_model` reads `/proc/cpuinfo`'s `model name`, falling back to `CPU (<arch>)`.
+/// `cpu_model` reads `/proc/cpuinfo`'s `model name`, falling back through ARM MIDR,
+/// `/proc/cpuinfo`'s `Hardware`, `/proc/device-tree/model`, and finally `CPU (<arch>)`.
 #[test]
 fn cpu_model_reads_cpuinfo_or_falls_back() {
     let machine = Machine::new("cpu-model");
     assert_eq!(cpu_model(&*machine), format!("CPU ({})", std::env::consts::ARCH));
     machine.file("/proc/cpuinfo", "processor\t: 0\nmodel name\t: AMD EPYC 7763 64-Core Processor\n");
     assert_eq!(cpu_model(&*machine), "AMD EPYC 7763 64-Core Processor");
+}
+
+#[test]
+fn cpu_model_decodes_arm_midr_graviton_and_big_little() {
+    let graviton4 = Machine::new("cpu-model-graviton4");
+    graviton4.file(
+        "/proc/cpuinfo",
+        "\
+processor\t: 0
+BogoMIPS\t: 2100.00
+Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics
+CPU implementer\t: 0x41
+CPU architecture: 8
+CPU variant\t: 0x0
+CPU part\t: 0xd4f
+CPU revision\t: 1
+
+processor\t: 1
+CPU implementer\t: 0x41
+CPU architecture: 8
+CPU variant\t: 0x0
+CPU part\t: 0xd4f
+CPU revision\t: 1
+",
+    );
+    assert_eq!(cpu_model(&*graviton4), "ARM Neoverse-V2");
+
+    let graviton2 = Machine::new("cpu-model-graviton2");
+    graviton2.file(
+        "/proc/cpuinfo",
+        "processor\t: 0\nCPU implementer\t: 0x41\nCPU part\t: 0xd0c\n",
+    );
+    assert_eq!(cpu_model(&*graviton2), "ARM Neoverse-N1");
+
+    let big_little = Machine::new("cpu-model-big-little");
+    big_little.file(
+        "/proc/cpuinfo",
+        "\
+processor\t: 0
+CPU implementer\t: 0x41
+CPU part\t: 0xd05
+
+processor\t: 1
+CPU implementer\t: 0x41
+CPU part\t: 0xd05
+
+processor\t: 2
+CPU implementer\t: 0x41
+CPU part\t: 0xd0b
+
+processor\t: 3
+CPU implementer\t: 0x41
+CPU part\t: 0xd0b
+",
+    );
+    assert_eq!(cpu_model(&*big_little), "ARM Cortex-A55 / ARM Cortex-A76");
+}
+
+#[test]
+fn cpu_model_falls_back_to_hardware_and_device_tree_model() {
+    let dt = Machine::new("cpu-model-device-tree");
+    dt.file(
+        "/proc/cpuinfo",
+        "processor\t: 0\nCPU implementer\t: 0x99\nCPU part\t: 0x999\n",
+    );
+    dt.file("/proc/device-tree/model", "Raspberry Pi 5 Model B Rev 1.0\0");
+    assert_eq!(cpu_model(&*dt), "Raspberry Pi 5 Model B Rev 1.0");
+
+    let hw = Machine::new("cpu-model-hardware");
+    hw.file(
+        "/proc/cpuinfo",
+        "processor\t: 0\nCPU implementer\t: 0x99\nCPU part\t: 0x999\nHardware\t: BCM2712\n",
+    );
+    hw.file("/proc/device-tree/model", "Raspberry Pi 5 Model B Rev 1.0\0");
+    assert_eq!(cpu_model(&*hw), "BCM2712");
 }
 
 /// `last_level_cache` returns `CacheSize::UNREPORTED` when cacheinfo is absent.

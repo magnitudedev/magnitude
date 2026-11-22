@@ -274,6 +274,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 idle_timeout: MODEL_IDLE_TIMEOUT,
                 launcher: worker_launcher,
                 device,
+                measurement: measurement.clone(),
                 instance_id_namespace: instance_id.clone(),
             });
             let model_services = managed_model_services(
