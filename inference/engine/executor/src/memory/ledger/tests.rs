@@ -1153,7 +1153,7 @@ fn a_devices_own_memory_is_charged_as_it_opens_before_its_store_is_read() {
     let probe = Backed::take(&opening.own(), OPENING, Pageable, |_| Ok::<_, Refused>(())).expect("a second own entry's too");
     assert_eq!(opening.allocated(), 2 * OPENING, "the device's own memory is charged and counted");
     let sample = Sample::scripted(scope.changes(), seismic::host_samples::m4_pro());
-    let (ledgers, reading) = DeviceLedgers::unified_in(&scope, shape()).read_granted(&sample, DeviceGrant::Wired { working_set: seismic::fixtures::M4_PRO_WORKING_SET });
+    let (ledgers, reading) = DeviceLedgers::unified_in(&scope, shape()).read_granted(&sample, DeviceGrant::Wired { working_set: seismic::fixtures::M4_PRO_WORKING_SET, left: None });
     assert_eq!(reading.device.allocated(), 2 * OPENING, "the first reading counts what opening charged");
     assert!(ledgers.device().change(|keeping| ledgers.device().claim_at(&keeping.claims(), Some(&reading.device), CommittedKind::Load, GB)).is_ok(), "a load claims after the first reading, judged by it");
     drop((order, probe));
@@ -1174,7 +1174,7 @@ fn unified_metal_without_wired_figures_is_bounded_by_its_working_set() {
     };
     let room = read(DeviceGrant::Host).budget();
     let working_set = room / 2;
-    let unified = read(DeviceGrant::Wired { working_set });
+    let unified = read(DeviceGrant::Wired { working_set, left: None });
     assert_eq!(unified.wired_limit(), None, "no wired ceiling is read");
     assert_eq!(unified.budget(), working_set, "the working set bounds the room");
 }
@@ -1778,7 +1778,7 @@ fn the_m4_pros_recorded_sample_prices_the_wired_grant() {
     let recorded = seismic::host_samples::m4_pro();
     assert_eq!(recorded.total, STORE);
     let sample = Sample::scripted(scope.changes(), recorded);
-    let (ledgers, reading) = DeviceLedgers::unified_in(&scope, shape()).read_granted(&sample, DeviceGrant::Wired { working_set: seismic::fixtures::M4_PRO_WORKING_SET });
+    let (ledgers, reading) = DeviceLedgers::unified_in(&scope, shape()).read_granted(&sample, DeviceGrant::Wired { working_set: seismic::fixtures::M4_PRO_WORKING_SET, left: None });
     let ledger = ledgers.device();
     let held = &reading.device;
     assert_eq!((held.supply(), held.others()), (47_779_758_080, 3_759_849_472), "free above the target and clean cache; others' the rest");
@@ -1825,7 +1825,7 @@ fn planning_room_capacity_is_structural_not_momentary_free() {
     });
     let sample = Sample::scripted(scope.changes(), sample_data);
     let (ledgers, reading) = DeviceLedgers::unified_in(&scope, shape())
-        .read_granted(&sample, DeviceGrant::Wired { working_set: WORKING_SET_48G });
+        .read_granted(&sample, DeviceGrant::Wired { working_set: WORKING_SET_48G, left: None });
     let budget = MemoryBudget::live_ledger(&m4_pro, metal, &reading, &ledgers, 0);
     assert_eq!(budget.available(), FREE_20G, "momentary free room at load is 20 GiB");
     assert_eq!(
@@ -2833,4 +2833,126 @@ fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_l
         "live IOGPU wire_count must not misattribute own wired growth as others_wired when counted.at lags"
     );
     assert_eq!(est2.unwired_shortfall(), 0);
+}
+
+/// On Apple Silicon Metal (`HostGrant::Wired`), elastic bank targets
+/// (`import_room`, `hold_room`, `target`) preserve at least
+/// `max(block_unit, 256 MiB)` below `recommendedMaxWorkingSetSize` so
+/// dynamic bank growth never pins `MTLDevice.currentAllocatedSize` to the
+/// hard command-buffer OOM cliff, while `budget()` remains exact for
+/// committed claims and host-RAM-tight readings waste zero bytes.
+#[test]
+fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
+    const TOTAL_16G: u64 = 16 * GB;
+    const WORKING_SET: u64 = 11_453_251_584; // 16 GB M1 recommendedMaxWorkingSetSize
+    const MIN_HEADROOM: u64 = 256 << 20;
+    const BLOCK_384M: u64 = 384 << 20;
+    const COMMITTED: u64 = 6 * GB;
+
+    let scope = Ledgers::new();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape());
+    let mut clock = Clock::new();
+    let sample_with = |at: Instant, own_wired: u64, free: u64| seismic::HostSample {
+        at,
+        counted: seismic::Counted { at, lag: Duration::ZERO },
+        wired: Some(seismic::WiredFigures {
+            limit: seismic::WiredLimit::OsDefault,
+            wire_count: own_wired,
+            at,
+        }),
+        ..host_sample(TOTAL_16G, free)
+    };
+
+    let t0 = clock.next();
+    ledger.read(ledger.sampled(t0), Reading::unified(&sample_with(t0, 0, 14 * GB), WORKING_SET));
+    let base = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, COMMITTED))
+        .expect("committed fits");
+    ledger
+        .change(|_| base.entry().take(&base.entry().change(), COMMITTED, seismic::memory::Wiring::Wired))
+        .expect("committed wired");
+
+    // Two calm readings past `lag` establish `judged == true` so `target()` admits growth.
+    let t1 = clock.next();
+    ledger.read(ledger.sampled(t1), Reading::unified(&sample_with(t1, COMMITTED, 8 * GB), WORKING_SET));
+    let t2 = clock.next();
+    let est = ledger.read(ledger.sampled(t2), Reading::unified(&sample_with(t2, COMMITTED, 8 * GB), WORKING_SET));
+    assert_eq!(est.budget(), WORKING_SET, "committed budget stays exact at working set");
+    assert_eq!(est.import_room(), WORKING_SET - MIN_HEADROOM - COMMITTED);
+    assert_eq!(est.hold_room(), WORKING_SET - MIN_HEADROOM - COMMITTED);
+    assert_eq!(est.target(), WORKING_SET - MIN_HEADROOM - COMMITTED);
+
+    // Opening a pool with a 384 MiB block preserves the full block unit below `grant`.
+    let _records = ledger.pool_block(PoolClass::Records, NonZeroU64::new(BLOCK_384M).unwrap()).blocks;
+    let t3 = clock.next();
+    let est_pool = ledger.read(ledger.sampled(t3), Reading::unified(&sample_with(t3, COMMITTED, 8 * GB), WORKING_SET));
+    assert_eq!(est_pool.import_room(), WORKING_SET - BLOCK_384M - COMMITTED);
+    assert_eq!(est_pool.target(), WORKING_SET - BLOCK_384M - COMMITTED);
+
+    // When host RAM supply is tighter than `grant - headroom`, zero bytes are wasted.
+    let t4 = clock.next();
+    let est_tight = ledger.read(ledger.sampled(t4), Reading::unified(&sample_with(t4, COMMITTED, 3 * GB), WORKING_SET));
+    assert_eq!(est_tight.budget(), 9 * GB);
+    assert_eq!(est_tight.hold_room(), 9 * GB - COMMITTED);
+}
+
+/// Live `MTLDevice.currentAllocatedSize` headroom (`left = working_set -
+/// currentAllocatedSize`) is reconciled into `HostGrant::Wired` so uncharged
+/// Metal allocations (pipelines, driver heaps, command rings) reduce `grant`,
+/// `budget()`, and elastic bank targets byte-for-byte.
+#[test]
+fn metal_working_set_left_reconciles_uncharged_metal_allocations() {
+    const TOTAL_16G: u64 = 16 * GB;
+    const WORKING_SET: u64 = 11_453_251_584;
+    const COMMITTED: u64 = 8 * GB;
+    const UNCHARGED_METAL: u64 = 400 << 20;
+    const MIN_HEADROOM: u64 = 256 << 20;
+
+    let scope = Ledgers::new();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape());
+    let mut clock = Clock::new();
+    let sample_with = |at: Instant, own_wired: u64, free: u64| seismic::HostSample {
+        at,
+        counted: seismic::Counted { at, lag: Duration::ZERO },
+        wired: Some(seismic::WiredFigures {
+            limit: seismic::WiredLimit::OsDefault,
+            wire_count: own_wired,
+            at,
+        }),
+        ..host_sample(TOTAL_16G, free)
+    };
+
+    let t0 = clock.next();
+    ledger.read(
+        ledger.sampled(t0),
+        Reading::unified_with_left(&sample_with(t0, 0, 14 * GB), WORKING_SET, Some(WORKING_SET)),
+    );
+    let base = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, COMMITTED))
+        .expect("committed fits");
+    ledger
+        .change(|_| base.entry().take(&base.entry().change(), COMMITTED, seismic::memory::Wiring::Wired))
+        .expect("committed wired");
+
+    let metal_left = WORKING_SET - COMMITTED - UNCHARGED_METAL;
+    let t1 = clock.next();
+    ledger.read(
+        ledger.sampled(t1),
+        Reading::unified_with_left(&sample_with(t1, COMMITTED, 6 * GB), WORKING_SET, Some(metal_left)),
+    );
+    let t2 = clock.next();
+    let est = ledger.read(
+        ledger.sampled(t2),
+        Reading::unified_with_left(&sample_with(t2, COMMITTED, 6 * GB), WORKING_SET, Some(metal_left)),
+    );
+    assert_eq!(
+        est.budget(),
+        WORKING_SET - UNCHARGED_METAL,
+        "uncharged Metal allocations in currentAllocatedSize must reduce wired grant byte-for-byte"
+    );
+    assert_eq!(
+        est.target(),
+        WORKING_SET - UNCHARGED_METAL - MIN_HEADROOM - COMMITTED,
+        "elastic bank target must stay >= 256 MiB below remaining Metal working set"
+    );
 }

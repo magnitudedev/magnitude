@@ -9,6 +9,16 @@ use super::changes::Sampled;
 use super::state::{FoldedReading, State};
 use super::vocabulary::CacheKind;
 
+/// Minimum working-set execution headroom reserved below a wired GPU ceiling
+/// (`HostGrant::Wired`, e.g. Metal's `recommendedMaxWorkingSetSize`) when
+/// sizing elastic bank holdings (`import_room`, `hold_room`, `target`).
+/// Metal fails `MTLCommandBuffer` commits with `OutOfMemory` (`device_lost`)
+/// when `currentAllocatedSize` plus transient command-buffer, encoder, and
+/// incoming KV/scratch allocations crosses `recommendedMaxWorkingSetSize`.
+/// Elastic banks preserve `max(block_unit, WIRED_BANK_HEADROOM_MIN)` below
+/// `grant`, while `budget()` stays exact for committed claims.
+const WIRED_BANK_HEADROOM_MIN: u64 = 256 * (1 << 20);
+
 /// A reading as the ledger estimated it (§4.1-4.3): every figure of one
 /// sample's instant, the process's own as the sample shows it.
 #[derive(Clone, Copy, Debug)]
@@ -314,13 +324,30 @@ impl Estimate {
         self.pending
     }
 
+    /// Effective budget ceiling for elastic bank holdings (`import_room`,
+    /// `hold_room`, `target`): on a wired GPU ceiling (`HostGrant::Wired`),
+    /// preserves `max(block_unit, WIRED_BANK_HEADROOM_MIN)` below `grant` so
+    /// elastic bank growth never pins `MTLDevice.currentAllocatedSize` against
+    /// `recommendedMaxWorkingSetSize` and starves Metal command buffers or
+    /// incoming KV/scratch allocations.
+    fn bank_budget(&self) -> u64 {
+        let budget = self.budget();
+        match (self.read.ceiling, self.read.grant) {
+            (Some(_), Some(grant)) => {
+                let headroom = self.read.unit.max(WIRED_BANK_HEADROOM_MIN);
+                budget.min(grant.saturating_sub(headroom))
+            }
+            _ => budget,
+        }
+    }
+
     /// The room the store leaves the bank and its records pool's spare
-    /// granules before growth's harm/step gate (`Self::target`): `budget` less
-    /// committed memory, other caches, unreleased shed cache, and the guarantee,
-    /// bounded by `cap`. Load import sizes what the store's room holds at open
-    /// (`experts::derived::import_target`).
+    /// granules before growth's harm/step gate (`Self::target`): `bank_budget`
+    /// less committed memory, other caches, unreleased shed cache, and the
+    /// guarantee, bounded by `cap`. Load import sizes what the store's room
+    /// holds at open (`experts::derived::import_target`).
     pub fn import_room(&self) -> u64 {
-        self.room_in(self.budget(), self.guarantee())
+        self.room_in(self.bank_budget(), self.guarantee())
     }
 
     /// The room the store leaves the bank and its records pool's spare
@@ -328,7 +355,7 @@ impl Estimate {
     /// transient `guarantee` derivative a second time (`budget` already
     /// reflects others' growth).
     pub fn hold_room(&self) -> u64 {
-        self.room_in(self.budget(), 0)
+        self.room_in(self.bank_budget(), 0)
     }
 
     /// OS/container reserve preserved in immediate supply for unreclaimable
@@ -626,7 +653,7 @@ impl State {
         let mut wired_others = prev.and_then(|before| before.wired_others);
         let mut unwired = 0;
         let grant = match reading.grant() {
-            Some(HostGrant::Wired(ceiling)) => {
+            Some(HostGrant::Wired { ceiling, left }) => {
                 // Others' wired bytes: what the OS wires beyond the process's
                 // own wired bytes at the instant `ceiling.wired` was sampled
                 // (`wired_at`). The process's pageable memory is never in the
@@ -652,7 +679,12 @@ impl State {
                         (wired_others.unwrap_or(ceiling.wired), 0)
                     }
                 };
-                Some(ceiling.limit.saturating_sub(others_wired).saturating_sub(wired_rise))
+                let wired_grant = ceiling.limit.saturating_sub(others_wired).saturating_sub(wired_rise);
+                let grant = match left {
+                    Some(left) => wired_grant.min(visible_allocated.saturating_add(left).min(ceiling.limit)),
+                    None => wired_grant,
+                };
+                Some(grant)
             }
             Some(HostGrant::Limit(limit)) => Some(limit),
             Some(HostGrant::Budget { capacity, left }) => Some(visible_allocated.saturating_add(left).min(capacity)),

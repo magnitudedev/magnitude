@@ -468,7 +468,14 @@ impl DeviceLedgers {
         let grant = match path.grant() {
             None => DeviceGrant::Host,
             Some(grant) => match grant.kind {
-                seismic::GrantKind::Wired => DeviceGrant::Wired { working_set: grant.bytes.value },
+                seismic::GrantKind::Wired => {
+                    let left = sample
+                        .status()
+                        .grant_left(path)
+                        .and_then(Result::ok)
+                        .map(|reported| reported.value);
+                    DeviceGrant::Wired { working_set: grant.bytes.value, left }
+                }
                 seismic::GrantKind::HostLimit => DeviceGrant::HostLimit { limit: grant.bytes.value },
                 seismic::GrantKind::HostBudget => {
                     let left = sample
@@ -510,8 +517,11 @@ impl DeviceLedgers {
             (true, DeviceGrant::Host) => {
                 DeviceReading { device: self.host.read_after(at, Reading::host(sample.host()), after_idle), host: None }
             }
-            (true, DeviceGrant::Wired { working_set }) => {
-                DeviceReading { device: self.host.read_after(at, Reading::unified(sample.host(), working_set), after_idle), host: None }
+            (true, DeviceGrant::Wired { working_set, left }) => {
+                DeviceReading {
+                    device: self.host.read_after(at, Reading::unified_with_left(sample.host(), working_set, left), after_idle),
+                    host: None,
+                }
             }
             (true, DeviceGrant::HostLimit { limit }) => {
                 DeviceReading { device: self.host.read_after(at, Reading::host_limit(sample.host(), limit), after_idle), host: None }
@@ -762,9 +772,10 @@ pub enum DeviceGrant {
     /// Host RAM with no separate device ceiling (CPU).
     Host,
     /// macOS unified Metal: host RAM bounded by the kernel wired ceiling,
-    /// where the host has one, and `recommendedMaxWorkingSetSize`
-    /// ([`Reading::unified`]).
-    Wired { working_set: u64 },
+    /// where the host has one, and `recommendedMaxWorkingSetSize`, optionally
+    /// paired with live unallocated working-set headroom (`left`) from
+    /// `MTLDevice.currentAllocatedSize` ([`Reading::unified_with_left`]).
+    Wired { working_set: u64, left: Option<u64> },
     /// Unified host RAM bounded by a static device ceiling (unified CUDA's
     /// total or usable memory on Linux or Windows).
     HostLimit { limit: u64 },

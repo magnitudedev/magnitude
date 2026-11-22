@@ -127,8 +127,12 @@ pub struct Reading {
 /// or OS limit bounds it beside host RAM's supply (§4.3).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum HostGrant {
-    /// macOS Metal's kernel wired ceiling and current wire count.
-    Wired(Ceiling),
+    /// macOS Metal's kernel wired ceiling and current wire count, optionally
+    /// paired with the live working-set headroom reported by the device
+    /// (`recommendedMaxWorkingSetSize - currentAllocatedSize`) so uncharged
+    /// Metal resources (pipelines, command buffers, driver heaps) never hide
+    /// from the wired ceiling.
+    Wired { ceiling: Ceiling, left: Option<u64> },
     /// A static byte ceiling on device-accessible host RAM (unified CUDA's
     /// total or usable memory).
     Limit(u64),
@@ -201,15 +205,28 @@ impl Reading {
     /// block's buffer is made purgeable-Empty before it is released, which
     /// discards its pages in that call, so the free shows at once.
     pub fn unified(sample: &seismic::HostSample, working_set: u64) -> Self {
+        Self::unified_with_left(sample, working_set, None)
+    }
+
+    /// [`Self::unified`] with the live device working-set headroom `left`
+    /// (`recommendedMaxWorkingSetSize - currentAllocatedSize`), when sampled
+    /// from an opened Metal device.
+    pub fn unified_with_left(sample: &seismic::HostSample, working_set: u64, left: Option<u64>) -> Self {
         let grant = match sample.wired {
             Some(wired) => {
                 let limit = match wired.limit {
                     seismic::WiredLimit::OsDefault => working_set,
                     seismic::WiredLimit::Set(bytes) => bytes.min(working_set),
                 };
-                HostGrant::Wired(Ceiling { limit, wired: wired.wire_count, at: wired.at })
+                HostGrant::Wired {
+                    ceiling: Ceiling { limit, wired: wired.wire_count, at: wired.at },
+                    left: left.map(|left| left.min(working_set)),
+                }
             }
-            None => HostGrant::Limit(working_set),
+            None => match left {
+                Some(left) => HostGrant::Budget { capacity: working_set, left: left.min(working_set) },
+                None => HostGrant::Limit(working_set),
+            },
         };
         Self { grant: Some(grant), ..Self::host(sample) }
     }
@@ -252,7 +269,7 @@ impl Reading {
     /// (`PlanningRoom::capacity`) independently of momentary free supply.
     pub fn capacity(&self) -> u64 {
         match self.grant {
-            Some(HostGrant::Wired(ceiling)) => self.total.min(ceiling.limit),
+            Some(HostGrant::Wired { ceiling, .. }) => self.total.min(ceiling.limit),
             Some(HostGrant::Limit(limit)) => self.total.min(limit),
             Some(HostGrant::Budget { capacity, .. }) => self.total.min(capacity),
             None => self.total,
@@ -273,7 +290,7 @@ impl Reading {
 
     pub(crate) fn ceiling(&self) -> Option<Ceiling> {
         match self.grant {
-            Some(HostGrant::Wired(ceiling)) => Some(ceiling),
+            Some(HostGrant::Wired { ceiling, .. }) => Some(ceiling),
             _ => None,
         }
     }

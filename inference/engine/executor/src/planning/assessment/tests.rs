@@ -2784,7 +2784,7 @@ fn stable_live_status_and_live_ledger_agree_on_store_demands() {
     });
     let sample = Sample::scripted(scope.changes(), host_sample);
     let (ledgers, reading) = DeviceLedgers::unified_in(&scope, Arc::new(LoadShape { stores: Vec::new() }))
-        .read_granted(&sample, DeviceGrant::Wired { working_set: stable.capacity() });
+        .read_granted(&sample, DeviceGrant::Wired { working_set: stable.capacity(), left: None });
     let live_ledger = MemoryBudget::live_ledger(&m4_pro, metal, &reading, &ledgers, 0);
     assert_eq!(live_ledger.capacity(), stable.capacity());
     assert_eq!(live_ledger.available(), LIVE_16G);
