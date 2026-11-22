@@ -1,5 +1,5 @@
 import * as FileSystem from "@effect/platform/FileSystem"
-import { Config, Effect, Option, Schedule, Schema } from "effect"
+import { Config, Duration, Effect, Option, Schedule, Schema } from "effect"
 import { sign, walk } from "@electron/osx-sign"
 import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -15,8 +15,58 @@ import { verifyAppleDeploymentTarget } from "../build/common"
 
 const resources = resolve(dirname(fileURLToPath(import.meta.url)), "../../resources/macos")
 
+// APFS, Spotlight (mds_stores), XProtect and DiskArbitration can briefly hold a staging folder or
+// disk image busy during hdiutil operations on macOS runners. Retry only those transient busy
+// failures with exponential backoff, removing any partial output DMG between attempts.
+const transientHdiutilBusy = /resource busy|temporarily unavailable/i
+const hdiutilRetries = 5
+const hdiutilRetryBase = Duration.seconds(2)
+
+export const isTransientHdiutilBusy = (error: AppleDistributionFailed) =>
+  transientHdiutilBusy.test(error.message)
+
+export const retryHdiutilBusy = <A, R>(
+  run: Effect.Effect<A, AppleDistributionFailed, R>,
+  options?: {
+    readonly cleanupOutput?: string
+    readonly retries?: number
+    readonly baseDelay?: Duration.DurationInput
+  },
+): Effect.Effect<A, AppleDistributionFailed, R | FileSystem.FileSystem> => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const retries = options?.retries ?? hdiutilRetries
+  const baseDelay = options?.baseDelay ?? hdiutilRetryBase
+  const cleanupPaths = options?.cleanupOutput
+    ? (options.cleanupOutput.endsWith(".dmg") ? [options.cleanupOutput] : [options.cleanupOutput, `${options.cleanupOutput}.dmg`])
+    : []
+  let attempt = 0
+  return yield* run.pipe(
+    Effect.tapError(error => {
+      if (!isTransientHdiutilBusy(error)) return Effect.void
+      attempt += 1
+      return Effect.gen(function* () {
+        for (const path of cleanupPaths) {
+          yield* fs.remove(path, { force: true }).pipe(
+            Effect.tapError(removeError => Effect.logWarning(`Could not remove partial disk image ${path}: ${String(removeError)}`)),
+            Effect.ignore,
+          )
+        }
+        if (attempt <= retries) {
+          yield* Effect.logWarning(`hdiutil reported a transient busy error; retrying (${attempt}/${retries}): ${error.message}`)
+        }
+      })
+    }),
+    Effect.retry({
+      schedule: Schedule.exponential(baseDelay).pipe(Schedule.intersect(Schedule.recurs(retries))),
+      while: isTransientHdiutilBusy,
+    }),
+  )
+})
+
 export const attachDesktopDmg = (image: string, mount: string, mode: "-readonly" | "-readwrite") => Effect.gen(function* () {
-  const plist = yield* appleCommand("/usr/bin/hdiutil", "attach", "-plist", mode, "-nobrowse", "-mountpoint", mount, image)
+  const plist = yield* retryHdiutilBusy(
+    appleCommand("/usr/bin/hdiutil", "attach", "-plist", mode, "-nobrowse", "-mountpoint", mount, image),
+  )
   const json = yield* Command.make("/usr/bin/plutil", "-convert", "json", "-o", "-", "-").pipe(
     Command.feed(plist), Command.string,
   )
@@ -34,7 +84,7 @@ export const detachDesktopDmg = (device: string) => appleCommand("/usr/bin/hdiut
   Effect.retry({
     schedule: Schedule.spaced("2 seconds"),
     times: 30,
-    while: error => error.message.includes("hdiutil exited 16:") && error.message.includes("Resource busy"),
+    while: error => error.message.includes("hdiutil exited 16:") && isTransientHdiutilBusy(error),
   }),
 )
 
@@ -52,7 +102,10 @@ export const packageDesktopDmg = (app: string, output: string) => Effect.scoped(
   const writable = join(stage, "installer.dmg")
   const mount = join(stage, "mounted")
   yield* fs.makeDirectory(mount)
-  yield* appleCommand("/usr/bin/hdiutil", "create", "-volname", "Install Magnitude", "-srcfolder", contents, "-format", "UDRW", writable)
+  yield* retryHdiutilBusy(
+    appleCommand("/usr/bin/hdiutil", "create", "-volname", "Install Magnitude", "-srcfolder", contents, "-format", "UDRW", writable),
+    { cleanupOutput: writable },
+  )
   yield* Effect.scoped(Effect.gen(function* () {
     yield* Effect.acquireRelease(
       attachDesktopDmg(writable, mount, "-readwrite"),
@@ -65,8 +118,11 @@ export const packageDesktopDmg = (app: string, output: string) => Effect.scoped(
       return yield* new AppleDistributionFailed({ message: "Finder did not save the installer layout" })
     }
   }))
-  yield* appleCommand("/usr/bin/hdiutil", "convert", writable, "-format", "UDZO", "-o", output)
-  yield* appleCommand("/usr/bin/hdiutil", "verify", output)
+  yield* retryHdiutilBusy(
+    appleCommand("/usr/bin/hdiutil", "convert", writable, "-format", "UDZO", "-o", output),
+    { cleanupOutput: output },
+  )
+  yield* retryHdiutilBusy(appleCommand("/usr/bin/hdiutil", "verify", output))
 }))
 
 export const validateDesktopDistribution = (options: { readonly image: string; readonly updateArchive: string; readonly version: string; readonly revision: number; readonly rpcVersion: number; readonly inferenceInstallation: string }) => Effect.scoped(Effect.gen(function* () {
