@@ -97,6 +97,9 @@ pub struct Estimate {
     /// the bank's slots grow into, each pool holding its own class
     /// (`PoolClass`).
     bank_spare: u64,
+    /// Whether `CacheKind::GraphSlots` yields to `CacheKind::Bank` growth
+    /// under the ledger's per-byte value comparison (`Value`).
+    graph_slots_yield_to_bank: bool,
     /// A change of the process's no reading shows yet.
     pending: bool,
     /// The store's readings so far with some of the process's bytes
@@ -388,10 +391,21 @@ impl Estimate {
         }
     }
 
+    /// Whether `CacheKind::GraphSlots` yields to `CacheKind::Bank` growth
+    /// under the ledger's per-byte value comparison (`Value`).
+    pub fn graph_slots_yield_to_bank(&self) -> bool {
+        self.graph_slots_yield_to_bank
+    }
+
     fn room_in(&self, budget: u64, reserve: u64) -> u64 {
+        let graph_slots = if self.graph_slots_yield_to_bank {
+            self.cache_of(CacheKind::GraphSlots)
+        } else {
+            0
+        };
         let bank = self.cache_of(CacheKind::Bank)
             + self.cache_of(CacheKind::Table)
-            + self.cache_of(CacheKind::GraphSlots)
+            + graph_slots
             + self.bank_spare;
         let beside = self.committed.saturating_add(self.cache - bank).saturating_add(self.shed);
         let room = budget.saturating_sub(beside.saturating_add(reserve));
@@ -428,6 +442,7 @@ impl State {
             shed: self.releasing - self.taken,
             cache_of: self.cache_of,
             bank_spare: self.spare_of(super::vocabulary::PoolClass::Records),
+            graph_slots_yield_to_bank: self.graph_slots_yield_to_bank(),
             pending: self.journal.pending(),
             unobserved_readings: self.unobserved_readings,
             accounting_violations: self.accounting_violations,

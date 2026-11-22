@@ -257,6 +257,8 @@ pub(super) enum OptionalSlot<T: Clone> {
 pub(super) struct Served {
     /// Decode steps: the bank's slots above its floor serve each.
     decode_steps: u64,
+    /// Multi-place prompt groups opened: warm `GraphSlots` save their rebuild.
+    pub(super) prompt_groups: u64,
     /// Requests since the drafter was imported: each would load it again.
     drafter: u64,
     /// Requests with images since the projector was imported.
@@ -457,24 +459,32 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     fn grow_expert_bank(&mut self, holding: BankHolding, to: u64, wake: crate::CompletionWake) -> Result<BankStep, DomainError> {
         let started = Instant::now();
         let bank = self.family.expert_bank().expect("invariant violated: a growth of a load without a bank");
-        // If the ledger derived this growth using lower-priority
-        // `CacheKind::GraphSlots` (`IdleClass`, which is `Reclaim::Deferred`),
-        // release `IdleClass` first between flights so its physical bytes free
-        // and `wake` retries the growth cleanly.
-        if self.idle_class.held_places().is_some() && !self.resources.releasing_slots() {
+        // If the ledger derived this device-tier growth by pricing
+        // `CacheKind::GraphSlots` below `CacheKind::Bank`, release `IdleClass`
+        // AND begin `bank.grow` in the same step (the ledger's
+        // `PoolClass::Records` backing reclaims `CacheKind::GraphSlots`
+        // synchronously while the release thread frees the buffers), never
+        // paying the rebuild cost without growing.
+        if self.idle_class.bytes() > 0
+            && !self.resources.releasing_slots()
+            && bank.holding_storage(holding)? == crate::planning::BankTier::Bank
+        {
             let est = self.resources.ledgers().device().estimate();
-            let target_bytes = bank
-                .targets()?
-                .into_iter()
-                .find(|t| t.holding == holding)
-                .map_or(0, |t| (t.charge)(to).saturating_sub((t.charge)(t.at)));
-            if target_bytes > est.free() {
-                if let Some(quiet) = self.quiet() {
-                    let changes = self.resources.ledgers().changes().clone();
-                    changes.change(|_| self.family.release_group(quiet).map_err(DomainError::invariant))?;
-                    let _ = self.resources.release_idle_slots(self.idle_class.release(), wake);
+            if est.graph_slots_yield_to_bank() {
+                let target_bytes = bank
+                    .targets()?
+                    .into_iter()
+                    .find(|t| t.holding == holding)
+                    .map_or(0, |t| (t.charge)(to).saturating_sub((t.charge)(t.at)));
+                if target_bytes > est.free().saturating_add(est.cache_of(CacheKind::Spare)) {
+                    if let Some(quiet) = self.quiet() {
+                        if self.idle_class.held_places().is_some() {
+                            let changes = self.resources.ledgers().changes().clone();
+                            changes.change(|_| self.family.release_group(quiet).map_err(DomainError::invariant))?;
+                        }
+                        let _ = self.resources.release_idle_slots(self.idle_class.release(), crate::CompletionWake::new(|| {}));
+                    }
                 }
-                return Ok(BankStep::Deferred);
             }
         }
         let step = bank.grow(self.resources.ledgers(), holding, to, wake)?;
@@ -530,13 +540,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .map_or(0, |t| t.shape.block_bytes());
                 let ledger = self.resources.ledgers().of(tier);
                 let est = ledger.estimate();
-                self.exogenous_shrink = Some(ExogenousShrink {
-                    store: ledger.store(),
-                    at: est.at().at(),
-                    committed: est.committed(),
-                    hold_room: est.hold_room(),
-                    block,
-                });
+                if matches!(holding, BankHolding::Experts | BankHolding::Host) {
+                    self.exogenous_shrink = Some(ExogenousShrink {
+                        store: ledger.store(),
+                        at: est.at().at(),
+                        committed: est.committed(),
+                        hold_room: est.hold_room(),
+                        block,
+                    });
+                }
             }
             _ => self.resize_held.hold(started, super::HeldSource::Decision),
         }
@@ -608,6 +620,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 bank.value(Value::recompute(saved.max(0.0), self.served.decode_steps, bytes));
             }
         }
+        self.value_idle_class();
         if let (Some((tokens, hits)), Some(bytes)) = (prefix, std::num::NonZeroU64::new(self.retained_entry_bytes())) {
             let rates = match held_step_seconds {
                 Some(seconds) => self.serving_prior_at(Some(seconds))?,
@@ -630,6 +643,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         Ok(())
+    }
+
+    /// Value idle `CacheKind::GraphSlots` on the ledger from its measured
+    /// rebuild time over prompt groups served, in the same seconds-per-byte
+    /// units as `CacheKind::Bank`.
+    pub(super) fn value_idle_class(&self) {
+        if let Some(bytes) = std::num::NonZeroU64::new(self.idle_class.bytes()) {
+            let rebuild = self.idle_class.rebuild_seconds();
+            if rebuild > 0.0 {
+                self.idle_class.value(Value::recompute(rebuild, self.served.prompt_groups.max(1), bytes));
+            }
+        }
     }
 
     /// Free what the ledger took of the load's cache other than the bank's

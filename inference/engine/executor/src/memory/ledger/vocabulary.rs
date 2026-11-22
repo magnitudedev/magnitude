@@ -436,9 +436,9 @@ impl CacheKind {
     pub(super) const ALL: [Self; 7] = [Self::Spare, Self::GraphSlots, Self::Table, Self::Bank, Self::Prefix, Self::Drafter, Self::Vision];
 
     /// Whether its holder measures what it is worth ([`Value`]): spare
-    /// granules and idle graph slots are worth nothing.
+    /// granules are worth nothing.
     pub(super) fn valued(self) -> bool {
-        !matches!(self, Self::Spare | Self::GraphSlots)
+        self != Self::Spare
     }
 
     pub(super) const fn index(self) -> usize {

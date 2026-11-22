@@ -2736,3 +2736,40 @@ fn bank_room_and_backing_include_graph_slots() {
     assert_eq!(graph_slots.bytes(), 2 * GB, "GraphSlots yielded 2 GB to Records backing");
     drop(backing);
 }
+
+/// When `CacheKind::GraphSlots` has higher recompute value per byte than
+/// `CacheKind::Bank` (e.g. expensive CUDA prefill graph rebuild vs fast PCIe
+/// misses), the ledger keeps `GraphSlots` warm out of `import_room`/`target`
+/// and `PoolClass::Records` backing; when `Bank` value exceeds `GraphSlots`
+/// (e.g. slow NVMe misses vs cheap Metal buffer rebuild), `GraphSlots` yields.
+#[test]
+fn graph_slots_yield_to_bank_only_when_bank_value_exceeds_rebuild_value() {
+    let (_scope, ledger, _pool) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 40 * GB);
+    let bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("bank fits");
+    let graph_slots = ledger.cached(CacheKind::GraphSlots, 4 * GB).expect("graph slots fit");
+    read(&ledger, &mut clock, 64 * GB, 0, None);
+
+    // 5090 regime: GraphSlots rebuild value (0.41 s/GB) > Bank value (0.04 s/GB).
+    bank.value(Value::per_byte(0.80, NonZeroU64::new(20 * GB).unwrap()));
+    graph_slots.value(Value::per_byte(1.64, NonZeroU64::new(4 * GB).unwrap()));
+    let est = ledger.estimate();
+    assert_eq!(est.import_room(), 20 * GB, "high-value GraphSlots stay warm out of bank room");
+    assert!(
+        ledger.change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 2 * GB)).is_err(),
+        "Records backing does not evict higher-value GraphSlots"
+    );
+
+    // M4 Pro regime: Bank miss-savings value (0.41 s/GB) > GraphSlots rebuild value (0.02 s/GB).
+    bank.value(Value::per_byte(8.20, NonZeroU64::new(20 * GB).unwrap()));
+    graph_slots.value(Value::per_byte(0.08, NonZeroU64::new(4 * GB).unwrap()));
+    let est = ledger.estimate();
+    assert_eq!(est.import_room(), 24 * GB, "lower-value GraphSlots count toward bank room");
+    let backing = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 2 * GB))
+        .expect("Records backing reclaims lower-value GraphSlots");
+    assert_eq!(graph_slots.bytes(), 2 * GB, "GraphSlots yielded 2 GB to Records backing");
+    drop(backing);
+}

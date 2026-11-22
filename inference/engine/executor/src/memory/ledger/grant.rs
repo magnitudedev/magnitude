@@ -104,10 +104,10 @@ impl Grant {
 
     /// Hold what its process has grown by since it was named, where that
     /// is more than the grant holds, in `claiming`: growth that already
-    /// happened, so never refused, the cache worth nothing (spare granules,
-    /// idle graph slots) yielding what it took of the guarantee's room (a
-    /// search's heap, which no claim of its own admits). A grant never takes the bank or
-    /// the retained prefixes: they yield only to a relief plan.
+    /// happened, so never refused, the cache worth nothing (spare granules)
+    /// yielding what it took of the guarantee's room (a search's heap, which
+    /// no claim of its own admits). A grant never takes valued cache: it
+    /// yields only to a relief plan.
     pub fn hold_growth(&self, claiming: &Claiming) {
         let ledger = self.claim.ledger();
         claiming.of_scope(&ledger.store.changes);

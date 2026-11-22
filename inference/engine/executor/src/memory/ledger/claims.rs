@@ -163,14 +163,17 @@ impl Ledger {
                 within_boundary: false,
                 allow_guarantee: true,
             })?,
-            PoolClass::Records => self.admit_or_reclaim(AdmitPolicy {
-                at: None,
-                kind,
-                bytes,
-                of: |ck: CacheKind| matches!(ck, CacheKind::Spare | CacheKind::GraphSlots),
-                within_boundary: false,
-                allow_guarantee: false,
-            })?,
+            PoolClass::Records => {
+                let reclaim_graph = self.state().graph_slots_yield_to_bank();
+                self.admit_or_reclaim(AdmitPolicy {
+                    at: None,
+                    kind,
+                    bytes,
+                    of: |ck: CacheKind| ck == CacheKind::Spare || (reclaim_graph && ck == CacheKind::GraphSlots),
+                    within_boundary: false,
+                    allow_guarantee: false,
+                })?
+            }
         };
         Ok(Claim::held(self.clone(), id, kind))
     }
@@ -389,7 +392,7 @@ impl Cached {
     /// by it ([`Value`]).
     ///
     /// # Panics
-    /// For spare granules and idle graph slots, which are worth nothing.
+    /// For spare granules, which are worth nothing.
     pub fn value(&self, value: Value) {
         assert!(self.kind.valued(), "invariant violated: {:?} cache is valued", self.kind);
         let mut state = self.ledger().state();

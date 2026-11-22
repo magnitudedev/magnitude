@@ -978,6 +978,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             // already cover `places`.
             if let Some(held_places) = idle_places.filter(|held| held.get() >= places) {
                 if self.resources.rehold_class(limits.class_slots(places, fronts)) {
+                    self.served.prompt_groups += 1;
                     self.group_class = Some(GroupClass {
                         places: grown,
                         buffer_places: held_places,
@@ -1013,6 +1014,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             // The class's allocations and their record are one change: the
             // pools' slots and the group's buffers are made, each charged to
             // the claim of its store.
+            let alloc_started = std::time::Instant::now();
             let mut class = ledgers.holding(crate::memory::ledger::CommittedKind::GroupClass, claims);
             let held = class.allocate(&device, |charges| {
                 self.resources
@@ -1022,6 +1024,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             });
             match held {
                 Ok(()) => {
+                    self.idle_class.record_rebuild(alloc_started.elapsed().as_secs_f64(), idle_places.is_some());
+                    self.served.prompt_groups += 1;
                     // Claimed at the class's priced demand: each claim now
                     // holds what its allocations charged, so its graphs'
                     // price, which CUDA charges to the device's own entry,
@@ -1095,6 +1099,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.resources.release_class();
             self.idle_class.idle(Some(buffer_places), claims);
             self.idle_class.idle(None, idle);
+            self.value_idle_class();
             Ok::<(), DomainError>(())
         })
     }
@@ -1383,9 +1388,36 @@ pub(super) struct IdleClass {
     /// Warm group buffers' places held by `family` (`hold_group`) while idle.
     places: Option<std::num::NonZeroUsize>,
     cached: Vec<crate::memory::ledger::Cached>,
+    /// Measured wall-clock seconds to allocate and warm this group class from
+    /// cold (`claim_group_class`), used to value `CacheKind::GraphSlots` on the
+    /// ledger in the same seconds-per-byte units as `CacheKind::Bank`.
+    rebuild_seconds: f64,
 }
 
 impl IdleClass {
+    pub(super) fn record_rebuild(&mut self, seconds: f64, incremental: bool) {
+        if seconds.is_finite() && seconds >= 0.0 {
+            if incremental {
+                self.rebuild_seconds += seconds;
+            } else {
+                self.rebuild_seconds = seconds;
+            }
+        }
+    }
+
+    pub(super) fn rebuild_seconds(&self) -> f64 {
+        self.rebuild_seconds
+    }
+
+    pub(super) fn bytes(&self) -> u64 {
+        self.cached.iter().map(crate::memory::ledger::Cached::bytes).sum()
+    }
+
+    pub(super) fn value(&self, value: crate::memory::ledger::Value) {
+        for cached in &self.cached {
+            cached.value(value);
+        }
+    }
     /// Idle `claims`, a class's committed in place, as cache, recording
     /// `places` if the family holds warm group buffers for them.
     pub(super) fn idle(
@@ -1418,6 +1450,7 @@ impl IdleClass {
     /// (`AllocatedResources::release_idle_slots`).
     pub(super) fn release(&mut self) -> Vec<crate::memory::ledger::Cached> {
         self.places = None;
+        self.rebuild_seconds = 0.0;
         std::mem::take(&mut self.cached)
     }
 

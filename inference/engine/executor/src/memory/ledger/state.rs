@@ -348,6 +348,33 @@ impl State {
         self.taken -= bytes.min(self.taken);
     }
 
+    /// Whether idle `CacheKind::GraphSlots` should yield to `CacheKind::Bank`
+    /// growth: true when the bank's value per byte meets or exceeds idle graph
+    /// slots' rebuild value per byte (or when graph slots are unvalued).
+    pub(super) fn graph_slots_yield_to_bank(&self) -> bool {
+        let mut bank: Option<Value> = None;
+        let mut graph: Option<Value> = None;
+        for entry in self.held.values() {
+            if entry.bytes == 0 {
+                continue;
+            }
+            match entry.holding {
+                Holding::Cache(CacheKind::Bank) => {
+                    bank = Some(bank.map_or(entry.value, |cur| cur.max(entry.value)));
+                }
+                Holding::Cache(CacheKind::GraphSlots) => {
+                    graph = Some(graph.map_or(entry.value, |cur| cur.max(entry.value)));
+                }
+                _ => {}
+            }
+        }
+        match (bank, graph) {
+            (Some(bank), Some(graph)) => graph <= bank,
+            (None, Some(graph)) => graph == Value::NONE,
+            _ => true,
+        }
+    }
+
     /// What `sequence`'s state is worth per byte: its reservation's
     /// ([`Reservation::value`]), none where its holder never valued it.
     pub(super) fn value_of(&self, sequence: RequestId) -> Value {
