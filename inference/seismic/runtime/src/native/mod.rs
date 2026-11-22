@@ -2630,21 +2630,29 @@ impl NativePrepared {
                             launch.kernel,
                         )));
                     }
-                    // `RESIDENT`: half of the threadgroups the cores hold at
-                    // once, each core as many as the pipeline's threads and
-                    // the threadgroup memory allow. The memory term takes
-                    // the per-threadgroup limit as a core's capacity, which
-                    // holds at least because a core fits one maximal
-                    // threadgroup; the half covers the rest. On an M4 Pro a
-                    // grid of the full count was seen co-resident and one
-                    // more was not; the half leaves the margin no query
-                    // states, and the barrier's bounded wait reports a grid
-                    // that still was not.
+                    // `RESIDENT`: co-resident threadgroups across the device's
+                    // GPU cores. Metal exposes no per-core occupancy or
+                    // threadgroup-slot query, only the per-threadgroup
+                    // ceilings (`maxTotalThreadsPerThreadgroup` and
+                    // `maxThreadgroupMemoryLength`) that every core fits at
+                    // least once. Capping the pre-halving per-core factor at 2
+                    // dispatches at most one threadgroup per core (or
+                    // `cores / 2` when a single group exceeds half of either
+                    // ceiling), avoiding oversubscribing per-core threadgroup
+                    // and barrier slots on smaller threadgroups (e.g. 64
+                    // threads on Apple7/M1), while the barrier's bounded wait
+                    // still catches any grid that is not co-resident.
                     if launch.resident.is_some() {
-                        let per_core = (pipeline.max_threads_per_threadgroup() / participants.max(1))
-                            .min(available / group_bytes.max(1));
                         let cores = opened.device_description().device_info().properties().units.get();
-                        groups = [groups[0].min((cores * per_core / 2).max(1)), 1, 1];
+                        let resident = metal_resident_groups(
+                            groups[0],
+                            cores,
+                            pipeline.max_threads_per_threadgroup(),
+                            participants,
+                            available,
+                            group_bytes,
+                        );
+                        groups = [resident, 1, 1];
                     }
                     let max_grid = opened.device_description().limits().max_grid;
                     if let Some(axis) = (0..3).find(|axis| groups[*axis] > max_grid[*axis]) {
@@ -3335,6 +3343,21 @@ impl NativeBoundCall {
         self.binding_leases = Vec::new();
         self.results = Vec::new();
     }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn metal_resident_groups(
+    work: u64,
+    cores: u64,
+    max_threads: u64,
+    participants: u64,
+    available_bytes: u64,
+    group_bytes: u64,
+) -> u64 {
+    let per_core = (max_threads / participants.max(1))
+        .min(available_bytes / group_bytes.max(1))
+        .min(2);
+    work.min((cores.saturating_mul(per_core) / 2).max(1))
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -4270,8 +4293,16 @@ mod tests {
             unreachable!("a Metal device's route");
         };
         let cores = opened.device_description().device_info().properties().units.get();
-        let per_core = launches.pipeline(0).max_threads_per_threadgroup() / 256;
-        let resident = (cores * per_core / 2).max(1);
+        let pipeline = launches.pipeline(0);
+        let available = opened.device_description().limits().max_workgroup_bytes;
+        let resident = metal_resident_groups(
+            u64::MAX,
+            cores,
+            pipeline.max_threads_per_threadgroup(),
+            256,
+            available,
+            pipeline.static_threadgroup_bytes(),
+        );
         for (work, expected) in [(1, 1), (resident, resident), (resident + 1, resident), (1 << 20, resident)] {
             let geometry = prepared
                 .launches_at(&|name| (name == "N").then_some(work))
@@ -4724,5 +4755,31 @@ mod admission_tests {
                 "`parts`: its `cuda` declaration reads `device.subgroup_width`, which only a device binds".into()
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod resident_grid_tests {
+    use super::metal_resident_groups;
+
+    #[test]
+    fn metal_resident_groups_caps_at_one_threadgroup_per_core() {
+        // M1 8-core AGX G13G with `resident_reverse` (64 threads, 16 B shared):
+        // previously 8 * (1024 / 64) / 2 = 64 groups (8/core), which exceeded
+        // per-core co-residency and failed the grid barrier 3/3 times at N=64.
+        assert_eq!(metal_resident_groups(64, 8, 1024, 64, 32_768, 16), 8);
+        assert_eq!(metal_resident_groups(1 << 20, 8, 1024, 64, 32_768, 16), 8);
+        // Work smaller than `cores` stays bounded by `work`.
+        assert_eq!(metal_resident_groups(1, 8, 1024, 64, 32_768, 16), 1);
+        assert_eq!(metal_resident_groups(4, 8, 1024, 64, 32_768, 16), 4);
+        // Tiny threadgroups never explode per-core group counts.
+        assert_eq!(metal_resident_groups(1 << 20, 8, 1024, 1, 32_768, 16), 8);
+        assert_eq!(metal_resident_groups(1 << 20, 20, 1024, 64, 32_768, 16), 20);
+        // Heavy threadgroups exceeding half of a core's thread or threadgroup-memory
+        // limit keep the 50% core margin (`cores / 2`).
+        assert_eq!(metal_resident_groups(1 << 20, 8, 1024, 1024, 32_768, 16), 4);
+        assert_eq!(metal_resident_groups(1 << 20, 8, 1024, 64, 32_768, 24_576), 4);
+        // Unstated core count (1 core) always yields at least 1 group.
+        assert_eq!(metal_resident_groups(1 << 20, 1, 1024, 1024, 32_768, 32_768), 1);
     }
 }
