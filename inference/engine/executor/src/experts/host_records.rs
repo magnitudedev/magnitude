@@ -1103,7 +1103,7 @@ impl HostRecords {
             // Whole in its record already: nothing to land.
             Located::Kept(record) | Located::Graced(record) => Claim::Kept(record),
             Located::Landing => Claim::Landing,
-            Located::Lacked if admitted(self.displaced(|staged, read| admit.rank(staged, read), keep), |kept, key| admit.admits(kept, key)) => {
+            Located::Lacked if admitted(self.displaced_for(|staged, read| admit.rank(staged, read), keep, taking), |kept, key| admit.admits(kept, key)) => {
                 match self.inbound.claim(staged) {
                     true => Claim::Taken(self.take_lacked(staged, None, taking)),
                     // A posted read claimed it since it was located.
@@ -1167,7 +1167,12 @@ impl HostRecords {
     /// ready, as a prompt group's claim waits for a landing into it). A
     /// shrink never evicts a landing's record ([`Self::evictable`]).
     fn take_lacked(&mut self, staged: Staged, park: Option<&Park>, taking: Taking) -> Grant {
-        let record = self.ready.range(self.lent..).next().or_else(|| self.ready.first()).copied().expect("a record taken is ready");
+        let record = match taking {
+            Taking::Ahead => self.ready.range(self.lent..).next(),
+            Taking::Out => self.ready.range(self.lent..).next().or_else(|| self.ready.first()),
+        }
+        .copied()
+        .expect("a record taken is ready");
         let parked = park.map(|park| park.unresolved(staged.0));
         self.set(record, Host::Landing { staged, answer: park.map(|park| park.point), from: parked.map_or(MapStep::EVERY, MapStep::from), taking });
         let from = match parked {
@@ -1177,14 +1182,41 @@ impl HostRecords {
         self.grant(staged, record, from)
     }
 
-    /// Whether [`Self::claim`] of `keep` takes a record now: a ready one
-    /// beyond the pool set aside, of the reserve's records
-    /// ([`Self::reserved`]) beyond `keep` and the pool. A read ahead's
-    /// landing keeps its record among the reserve's until it ends, so one
-    /// that ends unlanded returns its record to a reserve that never
-    /// replaced it: no record lies beyond the reserve for it to take.
+    /// Whether [`Self::claim`] of `keep` with `taking` takes a record now
+    /// without displacing a kept one: a ready record available to `taking`
+    /// beyond the pool set aside, of `taking`'s reserve records beyond `keep`
+    /// and the pool. `Taking::Ahead` excludes lent records (`0..self.lent`)
+    /// from both counts so lent scratch capacity never lets speculative
+    /// read-ahead consume lent records or bypass victim admission.
+    #[cfg(test)]
     fn takes(&self, keep: usize) -> bool {
-        self.ready_beyond(self.pool) && self.beyond(self.reserved(), keep + self.pool)
+        self.takes_for(keep, Taking::Out)
+    }
+
+    fn takes_for(&self, keep: usize, taking: Taking) -> bool {
+        self.beyond(self.ready_count(taking), self.pool) && self.beyond(self.reserved_for(taking), keep + self.pool)
+    }
+
+    /// Ready records available to `taking`: `Taking::Ahead` only considers
+    /// non-lent records (`self.lent..`).
+    fn ready_count(&self, taking: Taking) -> usize {
+        match taking {
+            Taking::Ahead => self.ready.range(self.lent..).count(),
+            Taking::Out => self.ready.len(),
+        }
+    }
+
+    /// Reserve records visible to `taking`: `Taking::Ahead` excludes lent
+    /// records (`0..self.lent`). Every `self.ahead` landing is already in
+    /// `self.lent..` by construction (`Self::take_lacked`).
+    fn reserved_for(&self, taking: Taking) -> usize {
+        match taking {
+            Taking::Ahead => {
+                let graced = self.graced.iter().filter(|&&record| record >= self.lent).count();
+                self.ready.range(self.lent..).count() + graced + self.ahead
+            }
+            Taking::Out => self.reserved(),
+        }
     }
 
     /// Whether a record is ready beyond `keep` ([`Self::beyond`]).
@@ -1405,10 +1437,14 @@ impl HostRecords {
     /// record the refill would unmap first, none where it may take nothing
     /// (no record ready beyond the pool, or none kept to unmap).
     pub fn displaced<K: Ord + Copy>(&self, rank: impl Rank<K>, keep: usize) -> Option<Option<(Kept, K)>> {
-        if self.takes(keep) {
+        self.displaced_for(rank, keep, Taking::Out)
+    }
+
+    fn displaced_for<K: Ord + Copy>(&self, rank: impl Rank<K>, keep: usize, taking: Taking) -> Option<Option<(Kept, K)>> {
+        if self.takes_for(keep, taking) {
             return None;
         }
-        if !self.ready_beyond(self.pool) {
+        if !self.beyond(self.ready_count(taking), self.pool) {
             return Some(None);
         }
         let first = self
@@ -1417,7 +1453,7 @@ impl HostRecords {
             .next();
         Some(first.map(|record| {
             let whole = self.records[record as usize].whole().expect("a record in taking order keeps an expert");
-            let (kept, key, _) = taking(whole.kept, whole.staged, whole.read, &rank);
+            let (kept, key, _) = self::taking(whole.kept, whole.staged, whole.read, &rank);
             (kept, key)
         }))
     }
@@ -1705,12 +1741,12 @@ impl HostRecords {
         assert_eq!(whole.holds, 0, "relocate source {src} is held by a copy");
         let from = MapStep::from(scratch_group);
         if let Some(map) = &self.maps[whole.staged.0] {
-            map.map_from(whole.staged.1, dst, from);
+            map.map_covering(whole.staged.1, dst, from);
         }
         assert!(self.ready.remove(&dst), "relocate destination {dst} is listed ready");
         self.records[src as usize] = Host::Claimed;
         self.claimed += 1;
-        self.records[dst as usize] = Host::Kept(Whole { from, ..whole });
+        self.records[dst as usize] = Host::Kept(Whole { from: whole.from.min(from), ..whole });
         let previous = self.kept.insert(whole.staged, dst);
         assert_eq!(previous, Some(src), "{:?} was kept in {src}", whole.staged);
         if whole.kept == Kept::Banked {
@@ -2899,6 +2935,78 @@ mod tests {
         assert!(tier.is_claimed(0) && tier.is_claimed(1), "both lent records claimed");
         assert_eq!(tier.kept_record((0, 7)), Some(2), "expert 7 kept in record 2");
         assert_eq!(views[0].resolve(7, group_start), Some(2), "map resolves expert 7 to record 2 for the prompt group");
+    }
+
+    /// Relocating a kept expert out of `0..self.lent` preserves its existing
+    /// `MAP_FROM` coverage for steps begun before `scratch_group.first()`,
+    /// including when `dst` is later evicted from `scratch_group.first()`.
+    #[test]
+    fn lease_relocate_preserves_earlier_map_from_coverage() {
+        let steps = Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
+        steps.begin_through(4);
+        // 4 records total, bottom 2 lent (`0..2`), 2 past lent (`2..4`).
+        let (mut tier, maps) = mapped_on(steps.clone(), 4, 1, &[(0, EXPERTS)], Resolution::BeforeStamp);
+        tier.lent = 2;
+        let Maps::Stamped(views) = maps else { unreachable!() };
+        // Keep expert 7 in lent record 0 before step 5 (`earlier`) begins.
+        tier.keep(0, (0, 7));
+        let earlier = steps.begin_group(1, None);
+        assert_eq!(views[0].resolve(7, earlier), Some(0));
+        let group_start = steps.begin_group(2, None);
+        let scratch_group = ScratchGroup::at(group_start, 2);
+        let mut copied = Vec::new();
+        let mut copy_fn = |src: u32, dst: u32| copied.push((src, dst));
+        assert!(tier.lease(scratch_group, |_, _| Some(5u64), true, Some(&mut copy_fn)));
+        assert_eq!(copied, vec![(0, 2)]);
+        assert!(views[0].from(7) <= earlier, "relocate must not shrink MAP_FROM past earlier steps");
+        assert_eq!(views[0].resolve(7, earlier), Some(2), "step before the group still resolves the relocated expert");
+        assert_eq!(views[0].resolve(7, group_start), Some(2), "the group resolves the relocated expert");
+        // Evicting `dst` from `group_start` must still leave `earlier` able to read it.
+        tier.evict(&[2], |_| Some(UnmapStep::from(scratch_group)));
+        assert_eq!(views[0].resolve(7, earlier), Some(2), "step before the group still resolves after eviction");
+        assert_eq!(views[0].resolve(7, group_start), None, "the group no longer resolves after eviction");
+    }
+
+    /// Speculative read-ahead (`Taking::Ahead`) never consumes lent records
+    /// (`0..self.lent`), even when lent records are ready and `admit` would
+    /// admit any victim.
+    #[test]
+    fn ahead_claim_never_consumes_lent_records() {
+        struct Accepts;
+        impl Admit for Accepts {
+            type Key = ();
+            fn rank(&self, _: Staged, _: Option<Step>) {}
+            fn admits(&self, _: Kept, (): ()) -> bool {
+                true
+            }
+        }
+        let inbound = Arc::new(InboundTable::new(&[EXPERTS]));
+        // 4 records total: 2 lent (`0..2`), 2 non-lent (`2..4`), reserve = 2.
+        let mut tier = HostRecords::new(4, 1, vec![(0, EXPERTS, None)], Resolution::AfterStore, (2, 2), inbound);
+        tier.keep(2, (0, 0));
+        // One non-lent record (`3`) is still ready: Taking::Ahead takes it.
+        let Claim::Taken(grant) = tier.claim((0, 1), 0, Taking::Ahead, Accepts) else {
+            panic!("Taking::Ahead takes the remaining non-lent ready record");
+        };
+        assert_eq!(grant.record(), 3, "Taking::Ahead must take a non-lent record");
+        // Now `2..4` are occupied and only lent records `0..2` are ready:
+        // Taking::Ahead must return Short rather than consuming `0..2`.
+        assert!(
+            matches!(tier.claim((0, 2), 0, Taking::Ahead, Accepts), Claim::Short),
+            "Taking::Ahead must never consume lent records 0..self.lent"
+        );
+        // Also verify lent records do not inflate `reserved` to bypass victim
+        // admission when non-lent ready records <= `keep`.
+        let inbound2 = Arc::new(InboundTable::new(&[EXPERTS]));
+        let mut tier2 = HostRecords::new(6, 1, vec![(0, EXPERTS, None)], Resolution::AfterStore, (3, 2), inbound2);
+        tier2.keep(3, (0, 0));
+        tier2.keep(4, (0, 1));
+        // Only 1 non-lent record (`5`) is ready (`<= keep = 1`), while 3 lent
+        // records (`0..3`) are ready: `Refuses` must NOT be bypassed.
+        assert!(
+            matches!(tier2.claim((0, 2), 1, Taking::Ahead, Refuses), Claim::Short),
+            "lent records must not count toward Taking::Ahead free headroom"
+        );
     }
 
     /// When no `Ready` slot exists past `self.lent`, `lease()` with

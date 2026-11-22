@@ -254,6 +254,18 @@ impl LandingMap {
         }
     }
 
+    /// Map `expert` to `record`, its bytes whole, from `from` on or from its
+    /// entry's existing `FROM` where its entry already covers an earlier step
+    /// ([`StampedMap::map_covering`]): relocating an expert out of a lent
+    /// record must not shrink the step range already covered before the
+    /// scratch group.
+    pub fn map_covering(&self, expert: usize, record: u32, from: MapStep) {
+        match self {
+            Self::Tier(tier) => tier.store(expert, record as i32),
+            Self::Bank { map, steps } => steps.unbegun(|at| map.map_covering(expert, record as usize, from.min(at.into()))),
+        }
+    }
+
     /// Unmap `expert` from its record `record` from step `from` on where
     /// given (a park's, the first step whose resolution of the map's layer
     /// the device has not reached, `Park::unresolved`, so the record is
