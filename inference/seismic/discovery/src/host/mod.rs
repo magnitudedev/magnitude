@@ -327,11 +327,16 @@ pub struct WiredFigures {
     pub limit: WiredLimit,
     /// Bytes wired against the GPU's wired ceiling, ours included: on Apple
     /// Silicon, IOGPU's `AGXAccelerator` `PerformanceStatistics`
-    /// `"In use system memory"` (excluding XNU kernel wired pages that do not
-    /// count against `iogpu.wired_limit_mb` / `recommendedMaxWorkingSetSize`),
-    /// falling back to machine-wide `vm_statistics64.wire_count` where
+    /// `"In use system memory"` (live at [`HostSample::at`], excluding XNU
+    /// kernel wired pages that do not count against `iogpu.wired_limit_mb` /
+    /// `recommendedMaxWorkingSetSize`), falling back to machine-wide
+    /// `vm_statistics64.wire_count` (at [`HostSample::counted`]) where
     /// `AGXAccelerator` is unavailable.
     pub wire_count: u64,
+    /// When `wire_count` was sampled: [`HostSample::at`] when read live from
+    /// IOGPU `AGXAccelerator`, or [`HostSample::counted`]'s `at` when falling
+    /// back to `vm_statistics64.wire_count`.
+    pub at: Instant,
 }
 
 /// The ceiling on host RAM Apple silicon's GPU may wire, as the IOGPU

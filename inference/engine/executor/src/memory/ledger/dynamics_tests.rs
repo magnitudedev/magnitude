@@ -242,6 +242,7 @@ impl Os {
             wired: self.wired.map(|(limit, _)| seismic::WiredFigures {
                 limit: seismic::WiredLimit::Set(limit),
                 wire_count: wire_count.expect("a wired store's snapshot counts its wire count"),
+                at: snapshot.at,
             }),
             harm: self.counts_own.then_some(seismic::Harm { machine: snapshot.machine, own: snapshot.own }),
             pressure: self.reports_pressure.then_some(self.pressure),
@@ -1090,7 +1091,12 @@ fn an_idle_load_under_harm_never_unloads() {
 /// stands; a request past the slot is refused under B.
 #[test]
 fn an_idle_load_under_pressure_never_unloads() {
-    let mut machine = idle(Os::new());
+    let mut os = Os::new();
+    // Put the host under real immediate scarcity (free <= scarcity_cushion) so
+    // OS pressure events fire rather than being suppressed by abundant free RAM.
+    os.hot = 35 * GB;
+    os.cache = 0;
+    let mut machine = idle(os);
     machine.os.pressure = seismic::PressureLevel::Warn;
     let cause = stands_idle(&mut machine, |machine| {
         machine.ledger.pressure_event();
@@ -1309,6 +1315,10 @@ fn windows_level_triggered_pressure_yields_smoothly_until_relief() {
 #[test]
 fn non_pooled_cache_without_open_pool_reads_and_relieves_under_pressure() {
     let mut os = Os::new();
+    // Start near immediate scarcity so after loading ~2.1 GiB, free <= scarcity_cushion
+    // and OS pressure events fire without a synthetic exogenous jump.
+    os.hot = 52 * GB;
+    os.cache = 0;
     let now = Arc::new(Lock::new(Instant::now()));
     let clock = now.clone();
     let scope = Ledgers::scripted(move || *clock.lock().expect("the clock"));
@@ -1335,8 +1345,8 @@ fn non_pooled_cache_without_open_pool_reads_and_relieves_under_pressure() {
     assert_eq!(ledger.estimate().cache(), graph_bytes + drafter_bytes);
     assert!(ledger.estimate().cap().is_none());
 
-    // Pressure lowers B by the largest non-pooled cache entry (64 MB) and
-    // plans cache-only relief for it.
+    // Pressure under real immediate scarcity (`free <= scarcity_cushion`) lowers
+    // B by the largest non-pooled cache entry (64 MB) and plans cache-only relief.
     os.pressure = seismic::PressureLevel::Warn;
     ledger.pressure_event();
     *now.lock().expect("the clock") += Duration::from_millis(100);

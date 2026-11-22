@@ -513,15 +513,22 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
             stored: compressed_stored(task.compressed, stored, logical),
             exact: true,
         }),
-        wired: wired_limit.map(|limit| WiredFigures {
-            limit,
-            // Prefer IOGPU's `"In use system memory"` over machine-wide
-            // `vm_statistics64.wire_count` so XNU kernel wired pages are not
-            // double-charged against the IOGPU wired ceiling; fall back to
-            // `vm_statistics64.wire_count` where `AGXAccelerator` is absent.
-            wire_count: sys
-                .iogpu_in_use_memory()
-                .unwrap_or_else(|| pages(u64::from(statistics.wire_count))),
+        wired: wired_limit.map(|limit| {
+            // Prefer IOGPU's live `"In use system memory"` (sampled at `at`)
+            // over 1 s-cached `vm_statistics64.wire_count` (sampled at
+            // `counted.at`) so XNU kernel wired pages are not double-charged
+            // against the IOGPU wired ceiling and the ledger reconciles
+            // `wire_count` against the process's wired bytes at the matching
+            // timestamp.
+            let (wire_count, wired_at) = match sys.iogpu_in_use_memory() {
+                Some(bytes) => (bytes, at),
+                None => (pages(u64::from(statistics.wire_count)), counted.at),
+            };
+            WiredFigures {
+                limit,
+                wire_count,
+                at: wired_at,
+            }
         }),
         harm: Some(Harm {
             machine: statistics.decompressions.saturating_add(statistics.swapins),

@@ -128,11 +128,12 @@ pub(crate) enum HostGrant {
 }
 
 /// The system's wired ceiling and what is wired now, the process's
-/// included.
+/// included, at the instant `wire_count` was sampled.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Ceiling {
     pub(crate) limit: u64,
     pub(crate) wired: u64,
+    pub(crate) at: Instant,
 }
 
 /// Host RAM's counters at a sample, as of when they show the machine
@@ -195,7 +196,7 @@ impl Reading {
                     seismic::WiredLimit::OsDefault => working_set,
                     seismic::WiredLimit::Set(bytes) => bytes.min(working_set),
                 };
-                HostGrant::Wired(Ceiling { limit, wired: wired.wire_count })
+                HostGrant::Wired(Ceiling { limit, wired: wired.wire_count, at: wired.at })
             }
             None => HostGrant::Limit(working_set),
         };
@@ -464,13 +465,14 @@ impl Boundary {
         let seismic::Counted { at, lag } = paging.counted;
         self.harmed = None;
         let scarce_free = free <= scarcity_cushion(total, unit);
-        // When over half of total RAM is immediately free + clean cache
-        // (e.g. Linux PSI firing on hugepage/DMA compaction with 77 GB free),
-        // the host is not under memory scarcity.
-        let abundant_free = total > 0 && free > total / 2;
         let prev_level = self.level;
         self.level = paging.pressure.filter(|level| *level != seismic::PressureLevel::Normal);
-        let mut pressure_trigger = self.level.filter(|_| events > 0 && !abundant_free);
+        // Immediate free + clean cache above `scarcity_cushion` means the host
+        // can satisfy allocations without swapping/compressing anonymous pages
+        // (e.g. Linux PSI firing on clean page-cache reclaim or compaction with
+        // tens of GiB of clean cache free): never fire pressure or latch `cap`
+        // while immediate supply is non-scarce.
+        let mut pressure_trigger = self.level.filter(|_| events > 0 && scarce_free);
         match self.level {
             None => self.pressure_at = None,
             Some(level) => {
@@ -527,12 +529,7 @@ impl Boundary {
             cap.free = cap.free.min(free);
             cap.anchor = cap.anchor.min(held.saturating_add(free));
         }
-        let pressure_calm = self.level.is_none()
-            || (self.pressed.is_none()
-                && (abundant_free
-                    || (self.level == Some(seismic::PressureLevel::Warn)
-                        && paging.harm.is_some()
-                        && !scarce_free)));
+        let pressure_calm = self.level.is_none() || (self.pressed.is_none() && !scarce_free);
         let Some(harm) = paging.harm else {
             // No share of the process's is counted: nothing judges harm,
             // growth or a step; B, where pressure set it, lifts on others' release.
@@ -561,7 +558,7 @@ impl Boundary {
         let harmed = harm.machine.saturating_sub(last.machine).saturating_sub(harm.own.saturating_sub(last.own));
         let harmed_bytes = harmed.saturating_mul(paging.page_bytes);
         let rate_bps = harmed_bytes as f64 / span;
-        let scarce = (self.level == Some(seismic::PressureLevel::Critical) && !abundant_free) || scarce_free;
+        let scarce = scarce_free;
         let no_exogenous_relief = free <= last.free.saturating_add(EXOGENOUS_RELIEF_TOLERANCE)
             && room <= last.room.saturating_add(EXOGENOUS_RELIEF_TOLERANCE);
         let excess_span = ((rate_bps - THRASH_RATE_BPS).max(0.0) * span).round() as u64;
@@ -799,9 +796,12 @@ mod tests {
     #[test]
     fn unified_metals_grant_is_its_working_set_under_any_wired_limit() {
         let working_set = 48 * GB;
-        let wired = |limit| seismic::HostSample {
-            wired: Some(seismic::WiredFigures { limit, wire_count: 4 * GB }),
-            ..seismic::host_samples::m4_pro()
+        let wired = |limit| {
+            let base = seismic::host_samples::m4_pro();
+            seismic::HostSample {
+                wired: Some(seismic::WiredFigures { limit, wire_count: 4 * GB, at: base.at }),
+                ..base
+            }
         };
         let limit = |sample: seismic::HostSample| Reading::unified(&sample, working_set).ceiling().map(|ceiling| ceiling.limit);
         assert_eq!(limit(wired(seismic::WiredLimit::OsDefault)), Some(working_set));
@@ -965,10 +965,12 @@ mod tests {
         assert_eq!(boundary.pressed(), Some(seismic::PressureLevel::Critical));
         assert_eq!(boundary.cap(), Some(30 * GB - 2 * unit));
 
-        // Abundant free supply suppresses standing dwell even under Critical.
+        // Abundant free supply (+4 GB exogenous release above 2 GB cushion)
+        // suppresses standing dwell and lifts the standing cap even while Critical
+        // has not yet cleared.
         boundary.observe(unjudged(start + Duration::from_millis(2500), 30 * GB, 4 * GB, seismic::PressureLevel::Critical));
         assert_eq!(boundary.pressed(), None);
-        assert_eq!(boundary.cap(), Some(30 * GB - 2 * unit));
+        assert_eq!(boundary.cap(), None);
 
         // Judged OS (macOS / Linux): standing Warn with events == 0 NEVER drains,
         // even for 60s, while Critical under scarcity still yields at 250ms.
@@ -1199,5 +1201,53 @@ mod tests {
         );
         boundary.observe(obs_with_cold(start + Duration::from_secs(102), pages, wall, free_after_probe_shrink + 10 * GB, 0));
         assert_eq!(boundary.cap(), None, "exogenous release with no cold overhang clears cap to None");
+    }
+
+    /// Reproduces the `sparky` 122 GiB unified CUDA Linux PSI regression:
+    /// with a 46 GiB model resident and 39 GiB of clean page cache (`< total/2`
+    /// = 61 GiB, yet far above `scarcity_cushion` = 2 GiB), a Linux PSI
+    /// `Critical` edge event from clean-cache reclaim/compaction must NOT fire
+    /// `Pressure(Critical)` or latch `cap`; and if a `cap` was latched under
+    /// genuine scarcity, exogenous free recovery above `scarcity_cushion` must
+    /// lift `cap` immediately even while PSI's 10 s `avg10` still reads `Critical`.
+    #[test]
+    fn non_scarce_clean_cache_below_half_total_suppresses_critical_psi_and_lifts_cap_on_recovery() {
+        let mut boundary = Boundary::default();
+        let start = Instant::now();
+        let total = 122 * GB;
+        let held = 46 * GB;
+        let free = 39 * GB;
+        let unit = 65 * MB;
+        let page = 4096;
+        assert!(free < total / 2, "below half of total RAM");
+        assert!(free > scarcity_cushion(total, unit), "far above scarcity cushion");
+
+        boundary.observe(obs(start, total, 0, held, free, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(1), total, 0, held, free, unit, 0, seismic::PressureLevel::Normal));
+        assert!(boundary.judges());
+
+        // Transient Critical PSI edge event + high-rate file refaults with 39 GiB clean cache:
+        // must neither fire Pressure(Critical) nor Harm nor latch cap.
+        let rate_pages = (128 * MB) / page;
+        boundary.observe(obs(start + Duration::from_secs(2), total, rate_pages, held, free, unit, 1, seismic::PressureLevel::Critical));
+        assert_eq!(boundary.pressed(), None, "Critical PSI with 39 GiB free+clean must not fire");
+        assert_eq!(boundary.harmed(), None);
+        assert_eq!(boundary.cap(), None, "cap must not latch when immediate supply is non-scarce");
+
+        boundary.observe(obs(start + Duration::from_secs(3), total, 2 * rate_pages, held, free, unit, 1, seismic::PressureLevel::Critical));
+        assert_eq!(boundary.pressed(), None);
+        assert_eq!(boundary.harmed(), None);
+        assert_eq!(boundary.cap(), None);
+
+        // Under genuine scarcity (`free = 0 <= 2 GiB`), Critical PSI fires and latches cap.
+        boundary.observe(obs(start + Duration::from_secs(4), total, 2 * rate_pages, held, 0, unit, 1, seismic::PressureLevel::Critical));
+        assert_eq!(boundary.pressed(), Some(seismic::PressureLevel::Critical));
+        assert_eq!(boundary.cap(), Some(held - unit));
+
+        // Competing app exits, freeing 10 GiB (`free = 10 GiB > 2 GiB`) while Linux PSI's
+        // 10 s avg10 still reports standing Critical with 0 new events: cap lifts cleanly.
+        boundary.observe(obs(start + Duration::from_secs(5), total, 2 * rate_pages, held - unit, 10 * GB, unit, 0, seismic::PressureLevel::Critical));
+        assert_eq!(boundary.pressed(), None);
+        assert_eq!(boundary.cap(), None, "exogenous recovery above scarcity cushion lifts cap even while PSI avg10 decays from Critical");
     }
 }

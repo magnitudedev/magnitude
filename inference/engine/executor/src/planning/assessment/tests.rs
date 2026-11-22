@@ -2780,6 +2780,7 @@ fn stable_live_status_and_live_ledger_agree_on_store_demands() {
     host_sample.wired = Some(seismic::WiredFigures {
         limit: seismic::WiredLimit::OsDefault,
         wire_count: 4 * GIB,
+        at: host_sample.at,
     });
     let sample = Sample::scripted(scope.changes(), host_sample);
     let (ledgers, reading) = DeviceLedgers::unified_in(&scope, Arc::new(LoadShape { stores: Vec::new() }))

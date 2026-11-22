@@ -116,8 +116,9 @@ fn read(ledger: &Ledger, clock: &mut Clock, total: u64, available: u64, grant: O
     let reading = match grant {
         None => device(total, available),
         Some(grant) => {
-            let wired = seismic::WiredFigures { limit: seismic::WiredLimit::Set(grant), wire_count: ledger.state().wired };
-            Reading::unified(&seismic::HostSample { wired: Some(wired), ..host_sample(total, available) }, u64::MAX)
+            let sample = host_sample(total, available);
+            let wired = seismic::WiredFigures { limit: seismic::WiredLimit::Set(grant), wire_count: ledger.state().wired, at: sample.at };
+            Reading::unified(&seismic::HostSample { wired: Some(wired), ..sample }, u64::MAX)
         }
     };
     ledger.read(ledger.sampled(at), reading);
@@ -147,10 +148,11 @@ fn file_cache_is_supply_whatever_it_holds() {
     let estimate = |cache: u64| {
         let (_scope, ledger, _pool) = host();
         let (total, others) = (48 * GB, 8 * GB);
+        let base = host_sample(total, 0);
         let sample = seismic::HostSample {
             supply: seismic::Supply { free_beyond_target: i64::try_from(total - others - cache).expect("bytes fit i64"), clean_cache: cache, cold_reclaimable: 0 },
-            wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(36 * GB), wire_count: GB }),
-            ..host_sample(total, 0)
+            wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(36 * GB), wire_count: GB, at: base.at }),
+            ..base
         };
         ledger.read(ledger.sampled(Clock::new().next()), Reading::unified(&sample, u64::MAX));
         ledger.estimate()
@@ -1818,6 +1820,7 @@ fn planning_room_capacity_is_structural_not_momentary_free() {
     sample_data.wired = Some(seismic::WiredFigures {
         limit: seismic::WiredLimit::OsDefault,
         wire_count: 8 * GB,
+        at: sample_data.at,
     });
     let sample = Sample::scripted(scope.changes(), sample_data);
     let (ledgers, reading) = DeviceLedgers::unified_in(&scope, shape())
@@ -1998,7 +2001,7 @@ fn a_settled_idle_sleep_opens_a_fresh_baseline_at_the_next_reading() {
         let sample = seismic::HostSample {
             at,
             counted: seismic::Counted { at, lag: LAG },
-            wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(22 * GB), wire_count: ledger.state().wired }),
+            wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(22 * GB), wire_count: ledger.state().wired, at }),
             ..host_sample(48 * GB, 40 * GB)
         };
         ledger.read(ledger.sampled(at), Reading::unified(&sample, u64::MAX));
@@ -2011,7 +2014,7 @@ fn a_settled_idle_sleep_opens_a_fresh_baseline_at_the_next_reading() {
         at: wake,
         counted: seismic::Counted { at: wake, lag: LAG },
         harm: Some(seismic::Harm { machine: 1024, own: 0 }),
-        wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(22 * GB), wire_count: 4 * GB }),
+        wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(22 * GB), wire_count: 4 * GB, at: wake }),
         ..host_sample(48 * GB, 20 * GB)
     };
     let woken = ledger.read_after(ledger.sampled(wake), Reading::unified(&woken_sample, u64::MAX), true);
@@ -2028,7 +2031,7 @@ fn a_settled_idle_sleep_opens_a_fresh_baseline_at_the_next_reading() {
         at: active,
         counted: seismic::Counted { at: active, lag: LAG },
         harm: Some(seismic::Harm { machine: 1024, own: 0 }),
-        wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(22 * GB), wire_count: 5 * GB }),
+        wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(22 * GB), wire_count: 5 * GB, at: active }),
         ..host_sample(48 * GB, 18 * GB)
     };
     let chained = ledger.read(ledger.sampled(active), Reading::unified(&active_sample, u64::MAX));
@@ -2044,7 +2047,7 @@ fn a_settled_idle_sleep_opens_a_fresh_baseline_at_the_next_reading() {
         at: pressured_wake,
         counted: seismic::Counted { at: pressured_wake, lag: LAG },
         harm: Some(seismic::Harm { machine: 1024, own: 0 }),
-        wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(22 * GB), wire_count: 6 * GB }),
+        wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(22 * GB), wire_count: 6 * GB, at: pressured_wake }),
         ..host_sample(48 * GB, 15 * GB)
     };
     let pressured = ledger.read_after(ledger.sampled(pressured_wake), Reading::unified(&pressured_sample, u64::MAX), true);
@@ -2772,4 +2775,60 @@ fn graph_slots_yield_to_bank_only_when_bank_value_exceeds_rebuild_value() {
         .expect("Records backing reclaims lower-value GraphSlots");
     assert_eq!(graph_slots.bytes(), 2 * GB, "GraphSlots yielded 2 GB to Records backing");
     drop(backing);
+}
+
+/// Reproduces the `m4-pro-01` unified Metal slot ping-pong regression:
+/// on Apple Silicon, `WiredFigures::wire_count` is read live from IOGPU
+/// (`wired.at == sample.at`) while `host_statistics64` (`sample.counted.at`)
+/// can lag up to 1 s behind. Growing wired memory and reading 25 ms later
+/// (while `counted.at` still predates the growth) must reconcile `wire_count`
+/// against the process's wired bytes at `wired.at` (`visible.wired`), not
+/// `counted.wired`, so our own growth is never misattributed to `others_wired`
+/// and `budget()` stays steady instead of dropping and evicting the grown slots.
+#[test]
+fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_lags() {
+    const LAG_1S: Duration = Duration::from_secs(1);
+    const WORKING_SET: u64 = 36 * GB;
+    const OTHERS_WIRED: u64 = 142 << 20;
+    const GROWTH: u64 = 750 << 20;
+
+    let (_scope, ledger, _pool) = host();
+    let base = Instant::now();
+    let t0 = base + Duration::from_secs(2);
+    let counted_t0 = t0 - Duration::from_millis(500);
+
+    let sample_at = |at: Instant, counted_at: Instant, own_wired: u64, free: u64| seismic::HostSample {
+        at,
+        counted: seismic::Counted { at: counted_at, lag: LAG_1S },
+        wired: Some(seismic::WiredFigures {
+            limit: seismic::WiredLimit::OsDefault,
+            wire_count: own_wired + OTHERS_WIRED,
+            at,
+        }),
+        ..host_sample(48 * GB, free)
+    };
+
+    // Baseline reading with 34 GiB wired and 7 GiB free.
+    ledger.read(ledger.sampled(t0), Reading::unified(&sample_at(t0, counted_t0, 0, 41 * GB), WORKING_SET));
+    let base_claim = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, 34 * GB)).expect("base fits");
+    ledger.change(|_| base_claim.entry().take(&base_claim.entry().change(), 34 * GB, seismic::memory::Wiring::Wired)).expect("base wired");
+    let t1 = t0 + Duration::from_secs(2);
+    let counted_t1 = t1 - Duration::from_millis(200);
+    let est1 = ledger.read(ledger.sampled(t1), Reading::unified(&sample_at(t1, counted_t1, 34 * GB, 7 * GB), WORKING_SET));
+    assert_eq!(est1.budget(), WORKING_SET - OTHERS_WIRED);
+    assert_eq!(est1.unwired_shortfall(), 0);
+
+    // Grow wired bank by +750 MiB, then read 25 ms later while `counted.at` is
+    // still `counted_t1` (before the growth), matching Apple Silicon's 1 s
+    // `host_statistics64` cache window alongside live `iogpu_in_use_memory()`.
+    let grow_claim = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, GROWTH)).expect("growth fits");
+    ledger.change(|_| grow_claim.entry().take(&grow_claim.entry().change(), GROWTH, seismic::memory::Wiring::Wired)).expect("growth wired");
+    let t2 = t1 + Duration::from_millis(25);
+    let est2 = ledger.read(ledger.sampled(t2), Reading::unified(&sample_at(t2, counted_t1, 34 * GB + GROWTH, 7 * GB - GROWTH), WORKING_SET));
+    assert_eq!(
+        est2.budget(),
+        WORKING_SET - OTHERS_WIRED,
+        "live IOGPU wire_count must not misattribute own wired growth as others_wired when counted.at lags"
+    );
+    assert_eq!(est2.unwired_shortfall(), 0);
 }

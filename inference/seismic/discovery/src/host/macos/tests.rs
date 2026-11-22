@@ -443,20 +443,27 @@ fn wired_count_prefers_iogpu_in_use_memory_and_falls_back_to_vm_wire_count() {
         iogpu_in_use: Some(256 << 20),
         ..base
     };
-    let wired = sample(&with_iogpu)
+    let sample_iogpu = sample(&with_iogpu);
+    let wired = sample_iogpu
         .wired
         .expect("iogpu.wired_limit_mb reports wired figures");
     assert_eq!(wired.limit, WiredLimit::OsDefault);
     assert_eq!(wired.wire_count, 256 << 20);
+    assert_eq!(wired.at, sample_iogpu.at, "live IOGPU wire_count carries sample.at");
 
     let fallback = Mac {
         iogpu_in_use: None,
         ..with_iogpu
     };
-    let wired_fallback = sample(&fallback)
+    let sample_fallback = sample(&fallback);
+    let wired_fallback = sample_fallback
         .wired
         .expect("fallback still reports wired figures");
     assert_eq!(wired_fallback.wire_count, 120_000 * (16 << 10));
+    assert_eq!(
+        wired_fallback.at, sample_fallback.counted.at,
+        "fallback vm_statistics64 wire_count carries counted.at"
+    );
 }
 
 /// On Apple Silicon, IORegistry `AGXAccelerator` → `PerformanceStatistics` →

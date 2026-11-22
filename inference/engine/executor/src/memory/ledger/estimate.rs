@@ -480,15 +480,17 @@ impl State {
         let settled = after_idle && events == 0;
         let lag = reading.lag();
         // The live figures show the machine at the sample's instant; the
-        // counters (cold, harm, wire count) at their own, which may be
-        // earlier (`seismic::Counted`): what they show of the process is
-        // judged there, and a change leaves the journal only once every
-        // figure shows it.
+        // counters (cold, harm) at `counted_at`; and the wired ceiling's wire
+        // count at `wired_at` (live at `at` for Apple Silicon IOGPU, or
+        // `counted_at` when falling back to `vm_statistics64.wire_count`).
+        // A change leaves the journal only once every figure shows it.
         let counted_at = reading.paging().map_or(at.at(), |paging| paging.counted.at);
+        let wired_at = reading.ceiling().map_or(at.at(), |ceiling| ceiling.at);
         let own = self.own();
         let visible = self.journal.visible(own, at, at.at(), lag);
         let counted = self.journal.visible(own, at, counted_at, lag);
-        self.journal.settle(at, counted_at.min(at.at()), lag);
+        let wired_own = self.journal.visible(own, at, wired_at, lag).wired;
+        self.journal.settle(at, counted_at.min(wired_at).min(at.at()), lag);
         // Every change of the process's shows in this reading.
         let shown = !self.journal.pending();
         let figures = reading.supply();
@@ -626,9 +628,10 @@ impl State {
         let grant = match reading.grant() {
             Some(HostGrant::Wired(ceiling)) => {
                 // Others' wired bytes: what the OS wires beyond the process's
-                // own wired bytes as the counters show them. The process's
-                // pageable memory is never in the count.
-                let (others_wired, wired_rise) = match ceiling.wired.checked_sub(counted.wired) {
+                // own wired bytes at the instant `ceiling.wired` was sampled
+                // (`wired_at`). The process's pageable memory is never in the
+                // count.
+                let (others_wired, wired_rise) = match ceiling.wired.checked_sub(wired_own) {
                     Some(others_wired) => {
                         let judged = !settled && prev_read.is_some_and(|before| before.shown) && shown;
                         let wired_rise = wired_others.filter(|_| judged).map_or(0, |before| others_wired.saturating_sub(before));
@@ -644,7 +647,7 @@ impl State {
                     // at the last count that showed them (the whole count, the
                     // most they can be, before one), and rise by nothing.
                     None => {
-                        unwired = counted.wired - ceiling.wired;
+                        unwired = wired_own - ceiling.wired;
                         self.unwired_readings += 1;
                         (wired_others.unwrap_or(ceiling.wired), 0)
                     }

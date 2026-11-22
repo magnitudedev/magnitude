@@ -21,7 +21,7 @@ pub fn m4_pro() -> HostSample {
         counted: Counted { at, lag: Duration::from_secs(1) },
         cold: ColdPages { machine: 0, own: None },
         own_reclaimed: Some(OwnReclaimed::NONE),
-        wired: Some(WiredFigures { limit: WiredLimit::OsDefault, wire_count: 1_795_801_088 }),
+        wired: Some(WiredFigures { limit: WiredLimit::OsDefault, wire_count: 1_795_801_088, at }),
         harm: Some(Harm { machine: 15_802_606, own: 0 }),
         pressure: Some(PressureLevel::Normal),
         lag: Lag { release: Duration::ZERO, growth: Duration::ZERO },
