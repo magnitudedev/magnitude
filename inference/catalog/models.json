@@ -24,7 +24,7 @@
     { "name": "Nemotron 3 and 3.5", "lab": "nvidia", "architectures": ["nemotron_h_moe"], "status": "supported" },
     { "name": "Muse Glimmer", "lab": "meta", "architectures": ["muse-glimmer"], "status": "supported" },
     { "name": "DeepSeek V4.1", "lab": "deepseek", "architectures": ["deepseek41"], "status": "comingSoon" },
-    { "name": "GLM-5.3 Flash", "lab": "zai", "architectures": ["glm5-next"], "status": "comingSoon" }
+    { "name": "GLM-5.3 Flash", "lab": "zai", "architectures": ["glm5-next"], "status": "supported" }
   ],
   "models": [
     {
