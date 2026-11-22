@@ -852,7 +852,7 @@ fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
     assert!(!tuner.stale());
 }
 
-fn fixture_load() -> (magnitude_family_contracts::ModelDefinition, ModelLoadPlan) {
+pub(super) fn fixture_load() -> (magnitude_family_contracts::ModelDefinition, ModelLoadPlan) {
     let definition = fixture_definition();
     let manifest = fixture_manifest(&definition);
     let load = ModelLoadPlan::derive(

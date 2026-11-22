@@ -130,9 +130,10 @@ pub(crate) struct TuningWeights<'a> {
     source: &'a dyn TuningWeightSource,
     import: &'a ImportKernels,
     resident: HashMap<Stack, Tensor>,
-    /// The packing bounds the imports made (`WeightPlan::bound`), kept for
-    /// the tuning's duration: a bound is a few values, and outlives its
-    /// weight's release.
+    /// The packing bounds the imports made (`WeightPlan::bound`), released
+    /// once neither `resident` nor any built input binds them: a small
+    /// tensor carved from a shared device block would otherwise pin that
+    /// whole block across releases.
     bounds: HashMap<Stack, Tensor>,
 }
 
@@ -210,6 +211,9 @@ impl<'a> TuningWeights<'a> {
     /// leaves when the last of them gives its inputs up.
     pub fn release_unheld(&mut self) {
         self.resident.retain(|_, tensor| held_elsewhere(tensor));
+        self.bounds.retain(|stack, tensor| {
+            self.resident.contains_key(stack) || held_elsewhere(tensor)
+        });
     }
 
     pub fn load(&self) -> &'a ModelLoadPlan {
@@ -291,5 +295,91 @@ impl<'a> TuningWeights<'a> {
         }
         self.resident.insert(stack, destination.clone());
         Ok(destination)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AllocationError, WeightImportError};
+
+    #[test]
+    fn weight_import_capacity_refusal_preserves_build_refused() {
+        let capacity = seismic::ExecutionError::AllocationCapacity {
+            required: 891_289_600u64.into(),
+            available: 96_496_640,
+        };
+        let expected = BuildError::Refused {
+            required: 891_289_600,
+            available: 96_496_640,
+        };
+        assert_eq!(
+            BuildError::from(WeightImportError::Allocation(AllocationError::Tensor(
+                seismic::TensorError::Execution(capacity),
+            ))),
+            expected
+        );
+        assert_eq!(
+            BuildError::from(WeightImportError::Refused {
+                contract: seismic::Contract::DeviceOnly,
+                required: 891_289_600,
+                available: 96_496_640,
+            }),
+            expected
+        );
+        assert!(matches!(
+            BuildError::from(WeightImportError::Invalid("corrupt".into())),
+            BuildError::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn release_unheld_drops_packing_bounds_when_weight_and_inputs_release() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let selected = crate::test_support::selected_with_room(&catalog, 256 * 1024 * 1024);
+        let device = crate::test_support::open(
+            &catalog,
+            catalog.resolve(selected.info.selector()).unwrap(),
+        )
+        .expect("selected backend opens");
+        let charges = seismic::Charges::tally(&device);
+        let (_definition, load) = super::super::tests::fixture_load();
+        let import = ImportKernels {
+            import_dense: HashMap::new(),
+            repack_weight: HashMap::new(),
+            packing_bound: HashMap::new(),
+        };
+        let mut weights = TuningWeights::new(&charges, &load, &ZeroTuningWeights, &import);
+        let stack = Stack {
+            role: WeightRole {
+                scope: WeightScope::Target,
+                kind: WeightKind::OutputNorm,
+            },
+            leading: None,
+        };
+        let before = device.allocated();
+        let weight = Tensor::zeros(&charges, Element::f32(), &[16]).unwrap();
+        let bound = Tensor::zeros(&charges, Element::f32(), &[4]).unwrap();
+        weights.resident.insert(stack, weight.clone());
+        weights.bounds.insert(stack, bound.clone());
+
+        // Both weight and bound are held by external handles: neither drops.
+        weights.release_unheld();
+        assert!(weights.resident.contains_key(&stack));
+        assert!(weights.bounds.contains_key(&stack));
+
+        // Dropping the external bound handle while the weight stays resident keeps the bound.
+        drop(bound);
+        weights.release_unheld();
+        assert!(weights.resident.contains_key(&stack));
+        assert!(weights.bounds.contains_key(&stack));
+
+        // Once the external weight handle drops too, both resident and bound release
+        // so neither pins its backing device block.
+        drop(weight);
+        weights.release_unheld();
+        assert!(!weights.resident.contains_key(&stack));
+        assert!(!weights.bounds.contains_key(&stack));
+        assert_eq!(device.allocated(), before);
     }
 }

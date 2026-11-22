@@ -84,6 +84,25 @@ impl std::error::Error for WeightImportError {
     }
 }
 
+impl From<WeightImportError> for seismic::BuildError {
+    /// An allocation the device refused for capacity is a refusal; anything
+    /// else a failure.
+    fn from(error: WeightImportError) -> Self {
+        match error {
+            WeightImportError::Refused {
+                required,
+                available,
+                ..
+            } => Self::Refused {
+                required,
+                available,
+            },
+            WeightImportError::Allocation(error) => error.into(),
+            other => Self::Failed(other.to_string()),
+        }
+    }
+}
+
 impl From<seismic_io::Error> for WeightImportError {
     fn from(error: seismic_io::Error) -> Self {
         Self::Read(error)
@@ -1197,7 +1216,8 @@ impl ResidencyStore {
             bank.import_whole(&mut |weight, records, record_at| {
                 let entry = self.programs.import_entry(weight).map_err(|error| error.to_string())?;
                 let stored = Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
-                let source = crate::resources::filled_import(weight, &stored, charges)?;
+                let source = crate::resources::filled_import(weight, &stored, charges)
+                    .map_err(|error| error.to_string())?;
                 if entry.writes_records() {
                     crate::programs::native_import::import_into(&entry, charges, &source, records, None)
                         .map_err(|error| error.to_string())

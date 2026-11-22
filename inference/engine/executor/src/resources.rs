@@ -52,11 +52,16 @@ pub(crate) unsafe fn import_upload(weight: &WeightPlan, charges: &seismic::Charg
 /// ([`crate::programs::native_import::fill_staged_source`]): the source a
 /// weight imported outside a load's batches (an expert bank's stacks, a
 /// tuning unit's weights) is imported from.
-pub(crate) fn filled_import(weight: &WeightPlan, stored: &Stored, charges: &seismic::Charges) -> Result<Tensor, String> {
+pub(crate) fn filled_import(
+    weight: &WeightPlan,
+    stored: &Stored,
+    charges: &seismic::Charges,
+) -> Result<Tensor, crate::WeightImportError> {
     // SAFETY: filled here, before any entry binds it.
-    let mut upload = unsafe { import_upload(weight, charges) }.map_err(|error| error.to_string())?;
+    let mut upload =
+        unsafe { import_upload(weight, charges) }.map_err(crate::WeightImportError::Allocation)?;
     crate::programs::native_import::fill_staged_source(stored, weight, &mut upload)
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::WeightImportError::Submit)?;
     Ok(upload)
 }
 

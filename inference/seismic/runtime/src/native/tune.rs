@@ -910,7 +910,10 @@ fn build_point<'a>(
                 .timed(charges)
                 .inspect_err(|_| source.release(index))
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            source.release(index);
+            Err(error)
+        }
     };
     match built {
         Ok(point) => Ok(Some(point)),
@@ -8708,6 +8711,73 @@ mod tests {
             BuildError::from(ExecutionError::AllocationFailed("driver".into())),
             BuildError::Failed(_)
         ));
+    }
+
+    /// A point build refused partway through must still release the source's
+    /// partially-built inputs so caches (imported weights, shared planes)
+    /// drop what no unit owns.
+    #[test]
+    fn build_point_releases_source_when_build_is_refused() {
+        use crate::api::tensor::TensorInner;
+        struct RefusingSource<'a> {
+            charges: &'a Charges,
+            held: Option<TensorInner>,
+            released: Vec<usize>,
+        }
+        impl PointSource<'static> for RefusingSource<'_> {
+            fn release(&mut self, point: usize) {
+                self.held = None;
+                self.released.push(point);
+            }
+            fn points(&self) -> Vec<PointSpec> {
+                vec![PointSpec {
+                    label: "m1".into(),
+                    weight: 1.0,
+                    class: None,
+                    cost: 1.0,
+                    census: true,
+                }]
+            }
+            fn build(&mut self, _point: usize) -> Result<PointInputs<'static>, BuildError> {
+                // Simulate a point build that allocates device memory before a
+                // later allocation is refused for capacity.
+                self.held = Some(TensorInner::zeros(
+                    self.charges,
+                    seismic_lang::registry::dense(seismic_lang::types::DType::F32),
+                    &[16],
+                )?);
+                Err(BuildError::Refused {
+                    required: 1024,
+                    available: 128,
+                })
+            }
+        }
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let device = devices
+            .open_backend(BackendName::Cuda)
+            .or_else(|_| devices.open_backend(BackendName::Cpu))
+            .unwrap();
+        let charges = crate::memory::Charges::tally(&device);
+        let before = device.allocated();
+        let spec = PointSpec {
+            label: "m1".into(),
+            weight: 1.0,
+            class: None,
+            cost: 1.0,
+            census: true,
+        };
+        let mut source = RefusingSource {
+            charges: &charges,
+            held: None,
+            released: Vec::new(),
+        };
+        let mut resident = Observed::default();
+        let built = build_point(&charges, &mut source, &spec, 0, &mut resident).unwrap();
+        assert!(built.is_none());
+        assert_eq!(source.released, vec![0]);
+        assert!(source.held.is_none());
+        assert_eq!(device.allocated(), before);
+        assert!(resident.longest() >= 1024.0);
     }
 
     #[test]
