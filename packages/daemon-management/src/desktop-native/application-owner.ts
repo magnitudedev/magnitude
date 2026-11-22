@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs"
 import { chmod, lstat, mkdir } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { Effect, Option, Schema } from "effect"
@@ -13,6 +14,17 @@ export const observeApplicationOwner = (directory: string) => Effect.gen(functio
   if (Option.isNone(endpoint)) return Option.none<"Desktop" | "Headless">()
   return Option.some((yield* requestApplication(endpoint.value, "Observe")).owner._tag)
 }).pipe(Effect.timeout("1 second"), Effect.catchAll(() => Effect.succeed(Option.none<"Desktop" | "Headless">())))
+
+/**
+ * Whether another process currently holds `application.lock` in `directory` (including an exiting desktop app that
+ * has already closed its control socket and service port). Creates nothing when the lock file does not exist.
+ */
+export const applicationOwnershipHeld = (directory: string) => Effect.scoped(Effect.gen(function* () {
+  const lock = join(directory, "application.lock")
+  if (!(yield* Effect.sync(() => existsSync(lock)))) return false
+  const native = yield* NativeHost
+  return Option.isNone(yield* native.acquireOwnership(lock))
+})).pipe(Effect.orElseSucceed(() => false))
 
 const applicationAlreadyRunning = (directory: string) => Effect.gen(function* () {
   const owner = yield* observeApplicationOwner(directory)

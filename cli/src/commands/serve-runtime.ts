@@ -6,7 +6,7 @@ import { BunContext } from "@effect/platform-bun"
 import { Deferred, Effect, Option, Ref, Runtime, Schema } from "effect"
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
-import { applicationNativeHostPath, applicationStateDirectory, holdContainerData, makeUnixProcessContinuation, nativeHostLayer, resolveApplicationProfile,
+import { applicationNativeHostPath, applicationOwnershipHeld, applicationStateDirectory, holdContainerData, makeUnixProcessContinuation, nativeHostLayer, observeApplicationOwner, resolveApplicationProfile,
   isLegacyServerMarked, NativeHost, resolveInstalledApplicationRuntime, runHeadlessApplication, servicePortBound, servicePortLingering, servingBlocker, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { containerImage } from "@magnitudedev/daemon-management/application-update"
 import { isDevelopmentBuild } from "../runtime/environment"
@@ -16,6 +16,7 @@ import { recordModelsBeforeUpdate, recordResidentModels, resumeResidentModels } 
 import { isContainer, renderNodeHint, requireWritableDataDirectory, unopenableRenderNodes } from "../server/container"
 import { resolveServeOwner } from "../server/serve-owner"
 import { readServerReach, renderServeReady } from "../server/server-reach"
+import { runServeLoop } from "../server/serve-turn"
 import { serveStopSignals } from "./serve-signals"
 
 class ServeRefused extends Schema.TaggedError<ServeRefused>()("ServeRefused", { message: Schema.String }) {}
@@ -82,90 +83,51 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
     return yield* Effect.sync(() => process.exit(process.platform === "win32" ? 75 : 1))
   })
   const blocker = servingBlocker(stateDirectory, profile.port).pipe(Effect.provide(native))
-  /** Waits while the desktop app or another Magnitude serves, or an update installs; resolves once this server may start. */
-  const waited = yield* Ref.make(false)
-  const retried = yield* Ref.make(false)
-  const awaitTurn = Effect.gen(function* () {
-    let announced = false
-    let recorded = 0
-    for (let current = yield* blocker; Option.isSome(current); current = yield* blocker) {
-      if (!announced) yield* notify(current.value === "UpdateInstallation"
-        ? "A Magnitude update is being installed; this server will resume when it finishes."
-        : "Another Magnitude app is serving on this machine; this server will resume when it stops.")
-      announced = true
-      yield* Ref.set(waited, true)
-      if (yield* Deferred.isDone(stopped)) return false
-      // What this account's desktop app has loaded is loaded again once this server resumes; one that does not answer keeps the last record.
-      if (current.value === "Desktop" && Date.now() - recorded >= 10_000) {
-        recorded = Date.now()
-        yield* recordResidentModels(profile.endpoint, stateDirectory, "Desktop").pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.ignore)
-      }
-      yield* Effect.raceFirst(Effect.sleep("2 seconds"), Deferred.await(stopped))
-    }
-    return !(yield* Deferred.isDone(stopped))
+  const observeOwner = observeApplicationOwner(stateDirectory).pipe(Effect.provide(native))
+  const ownershipHeld = applicationOwnershipHeld(stateDirectory).pipe(Effect.provide(native))
+  const lastRecordedDesktop = yield* Ref.make(0)
+  yield* runServeLoop({
+    stopped,
+    blocker,
+    observeOwner,
+    ownershipHeld,
+    portBound: servicePortBound(profile.port),
+    portLingering: servicePortLingering(profile.port),
+    notify,
+    // What this account's desktop app has loaded is loaded again once this server resumes; one that does not answer keeps the last record.
+    onDesktopBlocker: Ref.get(lastRecordedDesktop).pipe(Effect.flatMap(recorded => {
+      const now = Date.now()
+      if (now - recorded < 10_000) return Effect.void
+      return Ref.set(lastRecordedDesktop, now).pipe(Effect.zipRight(
+        recordResidentModels(profile.endpoint, stateDirectory, "Desktop").pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.ignore),
+      ))
+    })),
+    replacedByDesktop,
+    onReplacedByDesktop: notify("The desktop app replaced this CLI-only installation. Restarting with its command.").pipe(Effect.zipRight(restartAsDesktop)),
+    onBeforeAttempt: Ref.set(ready, false),
+    runAttempt: runHeadlessApplication({
+      runtime, profile, stateDirectory, home: homedir(), environment: process.env,
+      prepareStartup: prepareServeStartup(runtime, profile, stateDirectory).pipe(
+        Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon))),
+      initializeUpdates, ...(container ? { container: { image: containerImage(CLI_VERSION) } } : {}),
+      ...updateHooks,
+      stopping: reason => Effect.sync(() => { process.stderr.write(reason === "DesktopTakeover"
+        ? "The desktop app was opened and is taking over. This server will resume when it quits.\n"
+        : reason === "Restart" ? "Restarting the Magnitude server.\n"
+        : reason === "InstallUpdate" ? "Stopping the service to install the downloaded update; clients reconnect when it is back.\n"
+        : "Stopping the Magnitude server.\n") }).pipe(
+        // The version that starts after the update loads the same models again.
+        Effect.zipRight(reason === "InstallUpdate" ? recordModelsBeforeUpdate(profile.endpoint, stateDirectory).pipe(Effect.provideService(FileSystem.FileSystem, fs)) : Effect.void)),
+      stop: Deferred.await(stopped),
+      observe: state => Ref.getAndSet(ready, state._tag === "Ready").pipe(Effect.flatMap(wasReady =>
+        state._tag === "Ready" && !wasReady
+          ? readServerReach({ endpoint: profile.endpoint, dataDirectory: profile.dataDirectory, service: owner === "service" }).pipe(
+            Effect.flatMap(reach => Effect.sync(() => { process.stderr.write(renderServeReady(reach)) })),
+            Effect.zipRight(resumeResidentModels(profile.endpoint, stateDirectory, notify).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.forkIn(scope))))
+          : Effect.void)),
+    }).pipe(Effect.provide(native)),
+    onInstallUpdate: Option.isSome(idle) ? idle.value.install : Effect.void,
   })
-  /**
-   * After yielding, the desktop still has to take the ownership lock (or, from another account, the port) this server
-   * just released; until it has, nothing appears to serve. Wait for it to (or a minute, if it never does) so this
-   * server does not take them straight back.
-   */
-  const awaitDesktop = Effect.gen(function* () {
-    const deadline = Date.now() + 60_000
-    while (Date.now() < deadline && !(yield* Deferred.isDone(stopped))) {
-      if (Option.isSome(yield* blocker)) return
-      yield* Effect.raceFirst(Effect.sleep("250 millis"), Deferred.await(stopped))
-    }
-  })
-  // A restart request re-admits the owner in place, so settings read at service start take effect.
-  for (;;) {
-    yield* Ref.set(ready, false)
-    if (!(yield* awaitTurn)) return
-    if (yield* replacedByDesktop) {
-      yield* notify("The desktop app replaced this CLI-only installation. Restarting with its command.")
-      return yield* restartAsDesktop
-    }
-    const attempt = yield* Effect.either(runHeadlessApplication({ runtime, profile, stateDirectory, home: homedir(), environment: process.env,
-    prepareStartup: prepareServeStartup(runtime, profile, stateDirectory).pipe(
-      Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon))),
-    initializeUpdates, ...(container ? { container: { image: containerImage(CLI_VERSION) } } : {}),
-    ...updateHooks,
-    stopping: reason => Effect.sync(() => { process.stderr.write(reason === "DesktopTakeover"
-      ? "The desktop app was opened and is taking over. This server will resume when it quits.\n"
-      : reason === "Restart" ? "Restarting the Magnitude server.\n"
-      : reason === "InstallUpdate" ? "Stopping the service to install the downloaded update; clients reconnect when it is back.\n"
-      : "Stopping the Magnitude server.\n") }).pipe(
-      // The version that starts after the update loads the same models again.
-      Effect.zipRight(reason === "InstallUpdate" ? recordModelsBeforeUpdate(profile.endpoint, stateDirectory).pipe(Effect.provideService(FileSystem.FileSystem, fs)) : Effect.void)),
-    stop: Deferred.await(stopped), observe: state => Ref.getAndSet(ready, state._tag === "Ready").pipe(Effect.flatMap(wasReady =>
-      state._tag === "Ready" && !wasReady
-        ? readServerReach({ endpoint: profile.endpoint, dataDirectory: profile.dataDirectory, service: owner === "service" }).pipe(
-          Effect.flatMap(reach => Effect.sync(() => { process.stderr.write(renderServeReady(reach)) })),
-          Effect.zipRight(resumeResidentModels(profile.endpoint, stateDirectory, notify).pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.forkIn(scope))))
-        : Effect.void)),
-  }).pipe(Effect.provide(native)))
-    // Another Magnitude may have started between the wait and admission; wait for it rather than fail.
-    if (attempt._tag === "Left") {
-      if (Option.isSome(yield* blocker)) continue
-      // A Magnitude that just stopped still holds the port for a while: it stops answering before it closes its
-      // listener, and its closed connections linger after (up to 30 s on macOS, where they keep another account
-      // from binding). Wait for the port while it is being released, then try again once.
-      const releasing = Effect.zipWith(Ref.get(waited), servicePortBound(profile.port), (waited, bound) => waited && bound).pipe(
-        Effect.flatMap(releasing => releasing ? Effect.succeed(true) : servicePortLingering(profile.port)))
-      if (!(yield* Ref.get(retried)) && (yield* releasing)) {
-        for (let second = 0; second < 90 && (yield* servicePortBound(profile.port)); second++) yield* Effect.sleep("1 second")
-        yield* Ref.set(waited, false)
-        yield* Ref.set(retried, true)
-        continue
-      }
-      return yield* Effect.fail(attempt.left)
-    }
-    const stop = attempt.right
-    yield* Ref.set(retried, false)
-    // Installation replaces this process on success; otherwise the current version serves again.
-    if (stop === "InstallUpdate" && Option.isSome(idle)) yield* idle.value.install
-    else if (stop === "DesktopTakeover") yield* awaitDesktop
-    else if (stop !== "Restart") return
-  }
 })).pipe(Effect.provide([BunContext.layer, BunSqliteDriverLayer]), Effect.catchAll(error => Effect.sync(() => {
   process.stderr.write(`${error.message}\n`)
   process.exitCode = 1

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs"
 import { mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -5,7 +6,7 @@ import { fileURLToPath } from "node:url"
 import { Deferred, Effect, Exit, Fiber, Option, Ref, Schema, Scope, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { ApplicationSnapshot, type ApplicationIntent } from "@magnitudedev/sdk/desktop-host"
-import { acquireApplicationMaintenance, acquireApplicationOwner, acquireDesktopInstallation } from "./application-owner"
+import { acquireApplicationMaintenance, acquireApplicationOwner, acquireDesktopInstallation, applicationOwnershipHeld } from "./application-owner"
 import { occupiedMessage } from "./service-port"
 import { requestApplication, serveApplicationControl } from "./application-control"
 import { acquireUpdateInstallationLease } from "./update-installation-lease"
@@ -176,6 +177,19 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
       expect((yield* Fiber.join(contender).pipe(Effect.timeout("2 seconds")))._tag).toBe("Owner")
       const third = yield* acquireApplicationOwner(root, { _tag: "Headless" }).pipe(Effect.either)
       expect(third._tag === "Left" && third.left._tag).toBe("ApplicationOwnershipFailed")
+    })).pipe(Effect.provide(nativeHostLayer(addon))))
+  })
+
+  it("reports whether application.lock is held without creating it when absent", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const root = yield* directory
+      expect(yield* applicationOwnershipHeld(root)).toBe(false)
+      expect(existsSync(join(root, "application.lock"))).toBe(false)
+      yield* Effect.scoped(Effect.gen(function* () {
+        yield* acquireApplicationOwner(root, { _tag: "Headless" })
+        expect(yield* applicationOwnershipHeld(root)).toBe(true)
+      }))
+      expect(yield* applicationOwnershipHeld(root)).toBe(false)
     })).pipe(Effect.provide(nativeHostLayer(addon))))
   })
 })
