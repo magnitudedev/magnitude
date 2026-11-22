@@ -19,6 +19,7 @@ kernel void corrector_rows(
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+    constexpr ulong CACHE_MAX_N = 4096ul;
     threadgroup float partials[ROWS_THREADS / 32u];
     const element::Out<output_element> result(result_cells);
     const ulong width = SEISMIC_DIM_N;
@@ -28,6 +29,59 @@ kernel void corrector_rows(
     device const float *res_line = residual + ulong(row) * SEISMIC_RESIDUAL_STRIDE_1;
     const ulong result_row = ulong(row) * SEISMIC_RESULT_0_STRIDE_0;
     const bool bias_vec = SEISMIC_VALUES_STRIDE_1 == 1ul && SEISMIC_BIAS_STRIDE_0 == 1ul;
+    const bool out_vec =
+        bias_vec && SEISMIC_RESULT_0_STRIDE_1 == 1ul && (SEISMIC_DIM_R == 0 || SEISMIC_RESIDUAL_STRIDE_2 == 1ul);
+
+    // Form 2 single-read register-cached path when the entire row fits in <= 4
+    // float4s per thread (N <= 4096) on the unit-strided layout.
+    if constexpr (SEISMIC_DIM_N <= CACHE_MAX_N) {
+        if (form == 2 && out_vec) {
+            constexpr ulong STEP4 = ulong(ROWS_THREADS) * 4ul;
+            constexpr ulong WIDTH4 = ulong(SEISMIC_DIM_N) & ~3ul;
+            constexpr uint CACHE_VECS = WIDTH4 > 0ul ? uint((WIDTH4 + STEP4 - 1ul) / STEP4) : 1u;
+            float4 cached[CACHE_VECS];
+            float tail_val = 0.0f;
+            float partial = 0.0f;
+            _Pragma("clang loop unroll(full)")
+            for (uint slot = 0; slot < CACHE_VECS; ++slot) {
+                const ulong column = ulong(thread_index) * 4ul + ulong(slot) * STEP4;
+                if (column < width4) {
+                    const float4 biased = float4(*reinterpret_cast<device const packed_float4 *>(line + column)) +
+                                          float4(*reinterpret_cast<device const packed_float4 *>(bias + column));
+                    cached[slot] = biased;
+                    partial = metal::fma(biased.x, biased.x, partial);
+                    partial = metal::fma(biased.y, biased.y, partial);
+                    partial = metal::fma(biased.z, biased.z, partial);
+                    partial = metal::fma(biased.w, biased.w, partial);
+                }
+            }
+            const ulong tail_col = width4 + thread_index;
+            if (tail_col < width) {
+                tail_val = line[tail_col] + bias[tail_col];
+                partial = metal::fma(tail_val, tail_val, partial);
+            }
+            const float length = metal::sqrt(reduce::group_sum<ROWS_THREADS / 32u>(partial, partials, sg, lane));
+            const float scale = 1.0f / metal::max(length, as_type<float>(uint(SEISMIC_PARAM_EPSILON)));
+            _Pragma("clang loop unroll(full)")
+            for (uint slot = 0; slot < CACHE_VECS; ++slot) {
+                const ulong column = ulong(thread_index) * 4ul + ulong(slot) * STEP4;
+                if (column < width4) {
+                    float4 out = cached[slot] * scale;
+                    if (SEISMIC_DIM_R == 1)
+                        out += float4(*reinterpret_cast<device const packed_float4 *>(res_line + column));
+                    result.put4(result_row + column, out);
+                }
+            }
+            if (tail_col < width) {
+                float out = tail_val * scale;
+                if (SEISMIC_DIM_R == 1)
+                    out += res_line[tail_col];
+                result.put(result_row + tail_col, out);
+            }
+            return;
+        }
+    }
+
     float scale = 1.0f;
     if (form == 2) {
         float partial = 0.0f;
@@ -53,8 +107,6 @@ kernel void corrector_rows(
         const float length = metal::sqrt(reduce::group_sum<ROWS_THREADS / 32u>(partial, partials, sg, lane));
         scale = 1.0f / metal::max(length, as_type<float>(uint(SEISMIC_PARAM_EPSILON)));
     }
-    const bool out_vec =
-        bias_vec && SEISMIC_RESULT_0_STRIDE_1 == 1ul && (SEISMIC_DIM_R == 0 || SEISMIC_RESIDUAL_STRIDE_2 == 1ul);
     if (out_vec) {
         for (ulong column = ulong(thread_index) * 4ul; column < width4; column += ROWS_THREADS * 4ul) {
             const float4 biased = float4(*reinterpret_cast<device const packed_float4 *>(line + column)) +

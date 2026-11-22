@@ -77,6 +77,19 @@ inline float activate(int code, float value) {
                      : silu(value);
 }
 
+// Vectorized loads for dense operands (any element alignment via packed vectors).
+template <typename E>
+inline float2 load2(device const uchar *base, ulong index) {
+    const auto raw = *reinterpret_cast<device const typename E::packed2 *>(
+        reinterpret_cast<device const typename E::storage *>(base) + index);
+    return float2(E::load(raw[0]), E::load(raw[1]));
+}
+
+template <typename E>
+inline float4 load4(device const uchar *base, ulong index) {
+    return E::load4(reinterpret_cast<device const typename E::storage *>(base) + index);
+}
+
 // ---------------------------------------------------------------------------
 // The `vision_linear` epilogue. `store(m, n, acc)` receives the F32 product
 // of output (m, n); the projection is acc, plus bias[n] when BIAS, clamped to
@@ -98,22 +111,36 @@ struct output_linear {
     int activation;
     void store(uint m, uint n, float value) const {
         float projected = value;
-        if (BIAS)
+        if constexpr (BIAS)
             projected = value + element::at<B>(bias, n);
-        if (CLAMP)
+        if constexpr (CLAMP)
             projected = metal::min(metal::max(projected, minimum), maximum);
         float published = projected;
         if (activation != 0)
             published = activate(activation, projected);
-        else if (GATE)
+        else if constexpr (GATE)
             published = projected * element::at<A>(gate, ulong(m) * gate_stride + n);
-        else if (RESIDUAL)
+        else if constexpr (RESIDUAL)
             published = residual[ulong(m) * residual_stride + n] + projected;
         y.put(ulong(m) * stride + n, published);
     }
     void store2(uint m, uint n, float first, float second) const {
-        store(m, n, first);
-        store(m, n + 1u, second);
+        float2 projected(first, second);
+        if constexpr (BIAS)
+            projected = projected + load2<B>(bias, n);
+        if constexpr (CLAMP)
+            projected = metal::min(metal::max(projected, minimum), maximum);
+        float2 published = projected;
+        if (activation != 0) {
+            published = float2(activate(activation, projected.x), activate(activation, projected.y));
+        } else if constexpr (GATE) {
+            published = projected * load2<A>(gate, ulong(m) * gate_stride + n);
+        } else if constexpr (RESIDUAL) {
+            const float2 res = float2(*reinterpret_cast<device const packed_float2 *>(
+                residual + ulong(m) * residual_stride + n));
+            published = res + projected;
+        }
+        y.put2(ulong(m) * stride + n, published.x, published.y);
     }
 };
 
@@ -127,58 +154,89 @@ template <uint THREADS, typename Y, typename WN, typename BN, bool WEIGHT, bool 
 inline void norm(device const float *row, element::Out<Y> out, ulong stride, device const uchar *weight,
     device const uchar *bias, uint width, bool centered, float epsilon, int activation,
     threadgroup float *partials, uint thread_index, uint sg, uint lane) {
-    constexpr uint CACHE = 8;
-    float cached[CACHE];
+    constexpr uint CACHE_VECS = 2;
+    const uint vec_count = width / 4;
+    const uint tail_start = vec_count * 4;
+    float4 cached[CACHE_VECS];
     float mean = 0.0f;
-    float squares = 0.0f;
+    float4 sq4 = float4(0.0f);
     if (centered) {
-        float sum = 0.0f;
+        float4 sum4 = float4(0.0f);
         _Pragma("clang loop unroll(full)")
-        for (uint slot = 0; slot < CACHE; ++slot) {
-            const uint i = thread_index + slot * THREADS;
-            if (i < width) {
-                const float x = row[i];
+        for (uint slot = 0; slot < CACHE_VECS; ++slot) {
+            const uint v = thread_index + slot * THREADS;
+            if (v < vec_count) {
+                const float4 x = float4(*reinterpret_cast<device const packed_float4 *>(row + v * 4));
                 cached[slot] = x;
-                sum += x;
+                sum4 += x;
             }
         }
-        for (uint i = thread_index + CACHE * THREADS; i < width; i += THREADS)
-            sum += row[i];
+        for (uint v = thread_index + CACHE_VECS * THREADS; v < vec_count; v += THREADS)
+            sum4 += float4(*reinterpret_cast<device const packed_float4 *>(row + v * 4));
+        float sum = row_norm::sum4(sum4);
+        if (tail_start + thread_index < width)
+            sum += row[tail_start + thread_index];
         mean = row_norm::mean(reduce::group_sum<THREADS / 32>(sum, partials, sg, lane), width);
         _Pragma("clang loop unroll(full)")
-        for (uint slot = 0; slot < CACHE; ++slot) {
-            const uint i = thread_index + slot * THREADS;
-            if (i < width)
-                squares = row_norm::square(cached[slot] - mean, squares);
+        for (uint slot = 0; slot < CACHE_VECS; ++slot) {
+            const uint v = thread_index + slot * THREADS;
+            if (v < vec_count)
+                sq4 = row_norm::square4(cached[slot] - mean, sq4);
         }
     } else {
         _Pragma("clang loop unroll(full)")
-        for (uint slot = 0; slot < CACHE; ++slot) {
-            const uint i = thread_index + slot * THREADS;
-            if (i < width) {
-                const float x = row[i];
+        for (uint slot = 0; slot < CACHE_VECS; ++slot) {
+            const uint v = thread_index + slot * THREADS;
+            if (v < vec_count) {
+                const float4 x = float4(*reinterpret_cast<device const packed_float4 *>(row + v * 4));
                 cached[slot] = x;
-                squares = row_norm::square(x, squares);
+                sq4 = row_norm::square4(x, sq4);
             }
         }
     }
-    for (uint i = thread_index + CACHE * THREADS; i < width; i += THREADS)
-        squares = row_norm::square(row[i] - mean, squares);
+    for (uint v = thread_index + CACHE_VECS * THREADS; v < vec_count; v += THREADS) {
+        const float4 x = float4(*reinterpret_cast<device const packed_float4 *>(row + v * 4));
+        sq4 = row_norm::square4(x - mean, sq4);
+    }
+    float squares = row_norm::sum4(sq4);
+    if (tail_start + thread_index < width)
+        squares = row_norm::square(row[tail_start + thread_index] - mean, squares);
     const float inverse = row_norm::inverse(reduce::group_sum<THREADS / 32>(squares, partials, sg, lane), width, epsilon);
-    auto publish = [&](uint i, float x) {
-        const float w = WEIGHT ? element::at<WN>(weight, i) : 0.0f;
-        const float b = BIAS ? element::at<BN>(bias, i) : 0.0f;
-        const float normalized = row_norm::apply<WEIGHT, BIAS>(x - mean, inverse, w, b);
-        out.put(ulong(i) * stride, activation != 0 ? activate(activation, normalized) : normalized);
+    auto publish4 = [&](uint base, float4 x) {
+        float4 w = float4(0.0f);
+        if constexpr (WEIGHT)
+            w = load4<WN>(weight, base);
+        float4 b = float4(0.0f);
+        if constexpr (BIAS)
+            b = load4<BN>(bias, base);
+        float4 out4 = row_norm::apply4<WEIGHT, BIAS>(x - mean, inverse, w, b);
+        if (activation != 0)
+            out4 = float4(activate(activation, out4.x), activate(activation, out4.y),
+                activate(activation, out4.z), activate(activation, out4.w));
+        if (stride == 1) {
+            out.put4(base, out4);
+        } else {
+            out.put(ulong(base + 0) * stride, out4.x);
+            out.put(ulong(base + 1) * stride, out4.y);
+            out.put(ulong(base + 2) * stride, out4.z);
+            out.put(ulong(base + 3) * stride, out4.w);
+        }
     };
     _Pragma("clang loop unroll(full)")
-    for (uint slot = 0; slot < CACHE; ++slot) {
-        const uint i = thread_index + slot * THREADS;
-        if (i < width)
-            publish(i, cached[slot]);
+    for (uint slot = 0; slot < CACHE_VECS; ++slot) {
+        const uint v = thread_index + slot * THREADS;
+        if (v < vec_count)
+            publish4(v * 4, cached[slot]);
     }
-    for (uint i = thread_index + CACHE * THREADS; i < width; i += THREADS)
-        publish(i, row[i]);
+    for (uint v = thread_index + CACHE_VECS * THREADS; v < vec_count; v += THREADS)
+        publish4(v * 4, float4(*reinterpret_cast<device const packed_float4 *>(row + v * 4)));
+    if (tail_start + thread_index < width) {
+        const uint i = tail_start + thread_index;
+        const float w = WEIGHT ? element::at<WN>(weight, i) : 0.0f;
+        const float b = BIAS ? element::at<BN>(bias, i) : 0.0f;
+        const float normalized = row_norm::apply<WEIGHT, BIAS>(row[i] - mean, inverse, w, b);
+        out.put(ulong(i) * stride, activation != 0 ? activate(activation, normalized) : normalized);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +322,29 @@ inline void attend_stage(threadgroup S *staged, device const S *qkv, ulong row_s
     }
 }
 
+// Parallel simdgroup reduction of the union [low, high) of ATTEND_ROWS row spans.
+inline void reduce_span_bounds(device const int *spans, uint tile_first, uint rows,
+    threadgroup uint *bounds, uint simd, uint lane) {
+    if (simd == 0) {
+        uint low = rows, high = 0;
+        for (uint offset = lane; offset < ATTEND_ROWS; offset += 32) {
+            const uint r = tile_first + offset;
+            if (r < rows) {
+                const int2 s = int2(*reinterpret_cast<device const packed_int2 *>(spans + r * 2));
+                low = metal::min(low, uint(s.x));
+                high = metal::max(high, uint(s.y));
+            }
+        }
+        low = simd_min(low);
+        high = simd_max(high);
+        if (lane == 0) {
+            bounds[0] = low;
+            bounds[1] = high;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 template <typename A, uint W, uint WP>
 inline void attend(device const typename A::native *qkv, element::Out<A> out, uint rows, uint heads, uint group,
     float scale, device const int *spans, threadgroup typename A::native *keys,
@@ -294,16 +375,7 @@ inline void attend(device const typename A::native *qkv, element::Out<A> out, ui
         const uint span_row = metal::min(first_row + fm, rows - 1);
         row_first = uint(spans[span_row * 2]);
         row_end = uint(spans[span_row * 2 + 1]);
-        if (thread_index == 0) {
-            uint low = rows, high = 0;
-            for (uint r = tile * ATTEND_ROWS; r < metal::min(tile * ATTEND_ROWS + ATTEND_ROWS, rows); ++r) {
-                low = metal::min(low, uint(spans[r * 2]));
-                high = metal::max(high, uint(spans[r * 2 + 1]));
-            }
-            bounds[0] = low;
-            bounds[1] = high;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        reduce_span_bounds(spans, tile * ATTEND_ROWS, rows, bounds, simd, lane);
         walk_first = bounds[0];
         walk_end = bounds[1];
     }
@@ -464,16 +536,7 @@ inline void attend_tensor(device const typename A::native *qkv, element::Out<A> 
         const uint span_row = metal::min(first_row + row, rows - 1);
         row_first = uint(spans[span_row * 2]);
         row_end = uint(spans[span_row * 2 + 1]);
-        if (thread_index == 0) {
-            uint low = rows, high = 0;
-            for (uint r = tile * ATTEND_ROWS; r < metal::min(tile * ATTEND_ROWS + ATTEND_ROWS, rows); ++r) {
-                low = metal::min(low, uint(spans[r * 2]));
-                high = metal::max(high, uint(spans[r * 2 + 1]));
-            }
-            bounds[0] = low;
-            bounds[1] = high;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        reduce_span_bounds(spans, tile * ATTEND_ROWS, rows, bounds, simd, lane);
         walk_first = bounds[0];
         walk_end = bounds[1];
     }

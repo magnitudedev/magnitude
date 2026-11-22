@@ -96,6 +96,20 @@ struct norm8<element::F16> {
         norm8_packed<element::F16>(norm, stride, k, even, odd);
     }
 };
+template <>
+struct norm8<element::F32> {
+    static void load(device const uchar *norm, ulong stride, uint k, thread float4 &even, thread float4 &odd) {
+        if (stride == 1) {
+            device const float *p = reinterpret_cast<device const float *>(norm) + ulong(k);
+            const float4 lo = float4(*reinterpret_cast<device const packed_float4 *>(p));
+            const float4 hi = float4(*reinterpret_cast<device const packed_float4 *>(p + 4u));
+            even = float4(lo.x, lo.z, hi.x, hi.z);
+            odd = float4(lo.y, lo.w, hi.y, hi.w);
+        } else {
+            norm8_scalar<element::F32>(norm, stride, k, even, odd);
+        }
+    }
+};
 
 template <typename A, typename Rows>
 struct Plain {
@@ -170,6 +184,23 @@ struct Summed {
     }
     float value(uint m, uint column, float) const { return A::round(sum(m, column)); }
     void load8(uint m, uint k, float, thread float4 &even, thread float4 &odd) const {
+        if (stride1 == 1 && k + 8u <= columns) {
+            device const float *row = x + ulong(rows.at(m)) * stride0;
+            float4 lo = float4(0.0f);
+            float4 hi = float4(0.0f);
+            for (uint part = 0; part < PARTS; ++part) {
+                device const float *p = row + ulong(part) * ulong(columns) + ulong(k);
+                lo += float4(*reinterpret_cast<device const packed_float4 *>(p));
+                hi += float4(*reinterpret_cast<device const packed_float4 *>(p + 4u));
+            }
+            const float4 e = float4(lo.x, lo.z, hi.x, hi.z);
+            const float4 o = float4(lo.y, lo.w, hi.y, hi.w);
+            for (uint i = 0; i < 4; ++i) {
+                even[i] = A::round(e[i]);
+                odd[i] = A::round(o[i]);
+            }
+            return;
+        }
         float v[8];
         for (uint i = 0; i < 8; ++i)
             v[i] = k + i < columns ? A::round(sum(m, k + i)) : 0.0f;

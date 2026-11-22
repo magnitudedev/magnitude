@@ -57,6 +57,7 @@ typedef projection::operands<NVFP4> Operands;
 // The GEMV's rows: the norm applied as they stage, from their sums of
 // squares over the threadgroup.
 #define PROJECTION_GROUPS 1
+#define PROJECTION_GATHERED 1
 #define PROJECTION_GEMV_INPUT(x)                                                        \
     PROJECTION_SQUARES_SHARED(squares, decltype(raw)::parts);                           \
     projection::threadgroup_squares_runtime(raw, m, squares, simdgroups, sg, lane);     \
@@ -82,25 +83,25 @@ kernel void readout_selected_rows_stage(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_READOUT_SELECTED_ROWS_GEMV
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_selected_rows_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(ONE, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_SELECTED_ROWS_GEMV_PAIR
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_selected_rows_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_SELECTED_ROWS_GEMV_ROWS
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_selected_rows_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_SELECTED_ROWS_BATCH
-template <uint MATRIX, uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint MATRIX_FROM, uint BATCH_ROWS, uint BATCH_PARTS>
 kernel void readout_selected_rows_batch(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_BATCH;
 }

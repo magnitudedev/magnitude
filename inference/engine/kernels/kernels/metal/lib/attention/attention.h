@@ -380,7 +380,32 @@ inline void publish_slices(thread const float (&maximum)[H], thread const float 
     constexpr uint W = ATTENTION_W;
     constexpr uint E = ATTENTION_E;
     constexpr uint GROUPS = SIMDS / SLICES;
-    const uint slice = simd % SLICES;
+    if constexpr (GROUPS == 1) {
+        ATTENTION_UNROLL
+        for (uint h = 0; h < H; ++h) {
+            const ulong slot = first + (simd * H + h) * PARTS;
+            device float *dst = partials + slot * W + lane * E;
+            if constexpr (E % 4 == 0) {
+                constexpr uint COUNT = E % 4 == 0 ? E : 0;
+                ATTENTION_UNROLL
+                for (uint i = 0; i < COUNT; i += 4)
+                    *reinterpret_cast<device float4 *>(dst + i) =
+                        float4(output[h][i], output[h][i + 1], output[h][i + 2], output[h][i + 3]);
+            } else if constexpr (E % 2 == 0) {
+                constexpr uint COUNT = E % 2 == 0 ? E : 0;
+                ATTENTION_UNROLL
+                for (uint i = 0; i < COUNT; i += 2)
+                    *reinterpret_cast<device float2 *>(dst + i) = float2(output[h][i], output[h][i + 1]);
+            } else {
+                ATTENTION_UNROLL
+                for (uint i = 0; i < E; ++i)
+                    dst[i] = output[h][i];
+            }
+            if (lane == 0)
+                *reinterpret_cast<device float2 *>(statistics + slot * 2) = float2(maximum[h], denominator[h]);
+        }
+        return;
+    }
     if (lane == 0) {
         ATTENTION_UNROLL
         for (uint h = 0; h < H; ++h) {
@@ -389,49 +414,63 @@ inline void publish_slices(thread const float (&maximum)[H], thread const float 
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    constexpr uint STAT_STRIDE = SLICES * H * 2;
+    constexpr uint W4 = W / 4;
     ATTENTION_UNROLL
     for (uint h = 0; h < H; ++h) {
-        float partition_maximum = -INFINITY;
-        for (uint group = 0; group < GROUPS; ++group) {
-            const uint s = group * SLICES + slice;
-            if (states[(s * H + h) * 2 + 1] > 0.0f)
-                partition_maximum = metal::max(partition_maximum, states[(s * H + h) * 2]);
-        }
-        const float weight = denominator[h] > 0.0f
-            ? metal::fast::exp2(maximum[h] - partition_maximum) : 0.0f;
         ATTENTION_UNROLL
         for (uint i = 0; i < E; ++i)
-            columns[simd * W + lane * E + i] = output[h][i] * weight;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint item = thread_index; item < SLICES * W; item += SIMDS * 32) {
-            const uint item_slice = item / W;
-            const uint column = item % W;
-            float sum = 0.0f;
-            for (uint group = 0; group < GROUPS; ++group)
-                sum += columns[(group * SLICES + item_slice) * W + column];
-            partials[(first + (item_slice * H + h) * PARTS) * W + column] = sum;
-        }
+            columns[simd * W + lane * E + i] = output[h][i];
         if (thread_index < SLICES) {
             const uint item_slice = thread_index;
+            threadgroup float *slice_states = states + (item_slice * H + h) * 2;
+            float group_max[GROUPS];
+            float group_denom[GROUPS];
             float slice_maximum = -INFINITY;
+            ATTENTION_UNROLL
             for (uint group = 0; group < GROUPS; ++group) {
-                const uint s = group * SLICES + item_slice;
-                if (states[(s * H + h) * 2 + 1] > 0.0f)
-                    slice_maximum = metal::max(slice_maximum, states[(s * H + h) * 2]);
+                const float m = slice_states[group * STAT_STRIDE];
+                const float d = slice_states[group * STAT_STRIDE + 1];
+                group_max[group] = m;
+                group_denom[group] = d;
+                if (d > 0.0f)
+                    slice_maximum = metal::max(slice_maximum, m);
             }
             float total_denominator = 0.0f;
+            ATTENTION_UNROLL
             for (uint group = 0; group < GROUPS; ++group) {
-                const uint s = group * SLICES + item_slice;
-                const float d = states[(s * H + h) * 2 + 1];
-                if (d > 0.0f)
-                    total_denominator = metal::fma(d,
-                        metal::fast::exp2(states[(s * H + h) * 2] - slice_maximum), total_denominator);
+                const float d = group_denom[group];
+                float weight = 0.0f;
+                if (d > 0.0f) {
+                    weight = metal::fast::exp2(group_max[group] - slice_maximum);
+                    total_denominator = metal::fma(d, weight, total_denominator);
+                }
+                slice_states[group * STAT_STRIDE] = weight;
             }
             const ulong slot = first + (item_slice * H + h) * PARTS;
-            statistics[slot * 2] = slice_maximum;
-            statistics[slot * 2 + 1] = total_denominator;
+            *reinterpret_cast<device float2 *>(statistics + slot * 2) = float2(slice_maximum, total_denominator);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint item = thread_index; item < SLICES * W4; item += SIMDS * 32) {
+            const uint item_slice = SLICES == 1 ? 0u : item / W4;
+            const uint col4 = SLICES == 1 ? item : item % W4;
+            const uint col = col4 * 4;
+            threadgroup const float *slice_weights = states + (item_slice * H + h) * 2;
+            threadgroup const float *col_base = columns + item_slice * W + col;
+            float4 sum = float4(0.0f);
+            ATTENTION_UNROLL
+            for (uint group = 0; group < GROUPS; ++group) {
+                const float weight = slice_weights[group * STAT_STRIDE];
+                if (weight > 0.0f) {
+                    threadgroup const float *src = col_base + group * SLICES * W;
+                    sum = metal::fma(float4(src[0], src[1], src[2], src[3]), float4(weight), sum);
+                }
+            }
+            const ulong slot = first + (item_slice * H + h) * PARTS;
+            *reinterpret_cast<device float4 *>(partials + slot * W + col) = sum;
+        }
+        if (h + 1u < H)
+            threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -618,9 +657,6 @@ inline float turned_back(float attended, float other, uint column, ulong row, de
 // memory) and the gate. A row that sees no key attends to zero. The partitions
 // split the row's key sequence: its visible keys, then its PICKS index-list
 // picks (`decode_matrix`, `decode_shared`).
-//
-// Each batch issues up to BATCH loads of `partials` before accumulating them
-// so memory latency is hidden across partitions.
 template <uint SPAN, uint PARTS, uint GRID_KEYS, uint PICKS = 0, bool ROTATED = false>
 inline void decode_output(device const Scalar *query, device const Scalar *gate, device const int *visible,
     device const int *fresh, element::Out<activation::Act> result, device const float *partials,
@@ -669,22 +705,11 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint active = shared_active;
-    constexpr uint BATCH = PARTS < 64 ? PARTS : 64;
     float accumulated = 0.0f;
-    for (uint p0 = 0; p0 < active; p0 += BATCH) {
-        float values[BATCH];
-        ATTENTION_UNROLL
-        for (uint i = 0; i < BATCH; ++i)
-            values[i] = p0 + i < active ? partials[(first + p0 + i) * W + column] : 0.0f;
-        ATTENTION_UNROLL
-        for (uint i = 0; i < BATCH; ++i) {
-            const uint p = p0 + i;
-            if (p < active) {
-                const float weight = weights[p];
-                if (weight > 0.0f)
-                    accumulated = metal::fma(values[i], weight, accumulated);
-            }
-        }
+    for (uint p = 0; p < active; ++p) {
+        const float w = weights[p];
+        if (w > 0.0f)
+            accumulated = metal::fma(partials[(first + p) * W + column], w, accumulated);
     }
     float attended = accumulated * shared_inv_divisor;
     if (ROTATED) {
@@ -3904,7 +3929,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         (PACKED_QUERY_BYTES > PACKED_TILE_BYTES ? PACKED_QUERY_BYTES : PACKED_TILE_BYTES) + 8 * 8;
     constexpr bool BANDED = History::AFFINE && HEAD_BAND == 8;
     constexpr bool PACKED = BANDED || (History::AFFINE && TOKENS == 4 && G <= 8 && (W == 128 || W == 256)
-        && SIMDS == TOKENS && PACKED_SHARED_BYTES <= 32768);
+        && SIMDS == TOKENS && PACKED_SHARED_BYTES <= uint(SEISMIC_DEVICE_SHARED_BYTES_PER_GROUP));
     static_assert(HEAD_BAND == 0 || (HEAD_BAND == 8 && TOKENS == 2 && SIMDS == 4),
         "head bands own two tokens and two column slices per token");
     static_assert(GROUP == G || !PACKED, "packed tokens hold their kv head's whole group");
@@ -3928,7 +3953,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         "head-band columns are whole 32-column codec groups");
     constexpr uint BAND_WORK_BYTES = KEYS * W * 4 + EXCHANGE_BYTES;
     static_assert(!BANDED || ((PACKED_QUERY_BYTES > BAND_WORK_BYTES
-        ? PACKED_QUERY_BYTES : BAND_WORK_BYTES) + 64 <= 32768),
+        ? PACKED_QUERY_BYTES : BAND_WORK_BYTES) + 64 <= uint(SEISMIC_DEVICE_SHARED_BYTES_PER_GROUP)),
         "head-band query staging and nonaliasing exchange fit shared memory");
     static_assert(sizeof(KeyOperand) == 2, "tile regions hold 2-byte operands");
     static_assert(KEYS % 8 == 0, "a key tile is whole 8-key fragments");

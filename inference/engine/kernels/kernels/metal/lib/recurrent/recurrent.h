@@ -74,6 +74,7 @@ struct Convolved {
     struct Row {
         device const float *values;
         float at(ulong channel, constant ulong *) const { return values[channel]; }
+        float4 at4(ulong channel, constant ulong *) const { return element::F32::load4(values + channel); }
     };
     Row row(long row, constant ulong *) const {
         Row result;
@@ -186,25 +187,67 @@ inline void load_state_rows(device const float *initial, ulong stride, thread fl
     }
 }
 
+// Loads N contiguous F32 elements from device `from` into `out`, using 128-bit
+// packed vector loads when N is a multiple of 4.
+template <uint N>
+inline void load_contiguous(device const float *from, thread float (&out)[N]) {
+    if constexpr (N % 4 == 0) {
+        RECURRENT_UNROLL for (uint j = 0; j < N; j += 4) {
+            const float4 v = element::F32::load4(from + j);
+            out[j + 0] = v.x;
+            out[j + 1] = v.y;
+            out[j + 2] = v.z;
+            out[j + 3] = v.w;
+        }
+        return;
+    }
+    RECURRENT_UNROLL for (uint j = 0; j < N; ++j) {
+        out[j] = from[j];
+    }
+}
+
+// Loads N contiguous F32 elements from threadgroup `from` into `out`, using
+// 128-bit packed vector loads when N is a multiple of 4.
+template <uint N>
+inline void load_contiguous(threadgroup const float *from, thread float (&out)[N]) {
+    if constexpr (N % 4 == 0) {
+        RECURRENT_UNROLL for (uint j = 0; j < N; j += 4) {
+            const float4 v = float4(*reinterpret_cast<threadgroup const packed_float4 *>(from + j));
+            out[j + 0] = v.x;
+            out[j + 1] = v.y;
+            out[j + 2] = v.z;
+            out[j + 3] = v.w;
+        }
+        return;
+    }
+    RECURRENT_UNROLL for (uint j = 0; j < N; ++j) {
+        out[j] = from[j];
+    }
+}
+
+// Stores N contiguous F32 elements from `values` to `to` at `index`, using
+// 128-bit packed vector stores when N is a multiple of 4.
+template <uint N>
+inline void store_contiguous(element::Out<element::F32> to, ulong index, thread const float (&values)[N]) {
+    if constexpr (N % 4 == 0) {
+        RECURRENT_UNROLL for (uint j = 0; j < N; j += 4) {
+            to.put4(index + j, float4(values[j + 0], values[j + 1], values[j + 2], values[j + 3]));
+        }
+        return;
+    }
+    RECURRENT_UNROLL for (uint j = 0; j < N; ++j) {
+        to.put(index + j, values[j]);
+    }
+}
+
 // Stores a simdgroup's LANE_ROWS x COLUMNS state rows to `published` (rows
 // `stride` floats apart, columns contiguous), using 4-float vector stores
 // when COLUMNS is a multiple of 4.
 template <uint LANE_ROWS, uint COLUMNS>
 inline void store_state_rows(element::Out<element::F32> published, ulong stride,
     thread const float (&state)[LANE_ROWS][COLUMNS]) {
-    if constexpr (COLUMNS % 4 == 0) {
-        RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
-            const ulong row = r * stride;
-            RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; j += 4) {
-                published.put4(row + j, float4(state[r][j + 0], state[r][j + 1], state[r][j + 2], state[r][j + 3]));
-            }
-        }
-        return;
-    }
     RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
-        RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-            published.put(r * stride + j, state[r][j]);
-        }
+        store_contiguous(published, r * stride, state[r]);
     }
 }
 
@@ -272,12 +315,8 @@ inline void advance_rows(Inputs inputs, RowGates gates,
         float k[COLUMNS];
         // One decay per value head is loaded once.
         float factor[LANE_DECAYS];
-        RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-            k[j] = row[RECURRENT_TAPE_K + key * width + first_column + j];
-        }
-        RECURRENT_UNROLL for (uint j = 0; j < LANE_DECAYS; ++j) {
-            factor[j] = row[tape_decays + j];
-        }
+        load_contiguous(row + RECURRENT_TAPE_K + key * width + first_column, k);
+        load_contiguous(row + tape_decays, factor);
         RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
             const float innovation = row[RECURRENT_TAPE_U + head * width + row0 + r];
             RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
@@ -301,16 +340,37 @@ inline void advance_rows(Inputs inputs, RowGates gates,
             const ulong channel0 = (is_key ? key_heads + key : key) * width + first_column;
             float values[COLUMNS];
             float squares = 0.0f;
-            RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                values[j] = channels.at(channel0 + j, seismic_words);
-                squares = metal::fma(values[j], values[j], squares);
+            if constexpr (COLUMNS % 4 == 0) {
+                RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; j += 4) {
+                    const float4 v = channels.at4(channel0 + j, seismic_words);
+                    values[j + 0] = v.x;
+                    values[j + 1] = v.y;
+                    values[j + 2] = v.z;
+                    values[j + 3] = v.w;
+                    squares = metal::fma(v.x, v.x, squares);
+                    squares = metal::fma(v.y, v.y, squares);
+                    squares = metal::fma(v.z, v.z, squares);
+                    squares = metal::fma(v.w, v.w, squares);
+                }
+            } else {
+                RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+                    values[j] = channels.at(channel0 + j, seismic_words);
+                    squares = metal::fma(values[j], values[j], squares);
+                }
             }
             const float inverse = metal::rsqrt(simd_sum(squares) + epsilon)
                 * (is_key ? 1.0f : query_scale);
             threadgroup float *destination = (is_key ? key_block : query_block) + i * QK_STRIDE
                 + first_column;
-            RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                destination[j] = values[j] * inverse;
+            if constexpr (COLUMNS % 4 == 0) {
+                RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; j += 4) {
+                    const float4 scaled = float4(values[j + 0], values[j + 1], values[j + 2], values[j + 3]) * inverse;
+                    *reinterpret_cast<threadgroup packed_float4 *>(destination + j) = packed_float4(scaled);
+                }
+            } else {
+                RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+                    destination[j] = values[j] * inverse;
+                }
             }
         }
         // The value channels go to the last threads, off the q/k simdgroups.
@@ -336,13 +396,9 @@ inline void advance_rows(Inputs inputs, RowGates gates,
             float query[COLUMNS];
             float key_values[COLUMNS];
             float remembered[LANE_ROWS];
-            RECURRENT_UNROLL for (uint j = 0; j < LANE_DECAYS; ++j) {
-                factor[j] = decay_block[i * DECAYS + first_decay + j];
-            }
-            RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                query[j] = query_block[i * QK_STRIDE + first_column + j];
-                key_values[j] = key_block[i * QK_STRIDE + first_column + j];
-            }
+            load_contiguous(decay_block + i * DECAYS + first_decay, factor);
+            load_contiguous(query_block + i * QK_STRIDE + first_column, query);
+            load_contiguous(key_block + i * QK_STRIDE + first_column, key_values);
             RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
                 remembered[r] = 0.0f;
                 RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
@@ -355,14 +411,10 @@ inline void advance_rows(Inputs inputs, RowGates gates,
             const element::Out<element::F32> entry = row >= publish && row - publish < recorded
                 ? tape_row(tape, slot.target, row - publish, seismic_words) : element::Out<element::F32>(nullptr);
             if (entry.present() && records_keys) {
-                RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                    entry.put(RECURRENT_TAPE_K + key * width + first_column + j, key_values[j]);
-                }
+                store_contiguous(entry, RECURRENT_TAPE_K + key * width + first_column, key_values);
             }
             if (entry.present() && records && (DECAYS != 1 || lane == 0)) {
-                RECURRENT_UNROLL for (uint j = 0; j < LANE_DECAYS; ++j) {
-                    entry.put(tape_decays + j, factor[j]);
-                }
+                store_contiguous(entry, tape_decays, factor);
             }
             float output[LANE_ROWS];
             RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {

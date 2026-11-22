@@ -67,6 +67,7 @@ typedef projection::OutputOf<activation_element, projection::AllRows, SEISMIC_DI
 
 // The gated rows as NVFP4 operands into `staged`, one row a threadgroup.
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_STAGE
+template <uint MATRIX_FROM>
 kernel void attention_output_stage(PROJECTION_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -88,25 +89,25 @@ kernel void attention_output_stage(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_output_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(ONE, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_PAIR
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_output_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_ROWS
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_output_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_BATCH
-template <uint MATRIX, uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint MATRIX_FROM, uint BATCH_ROWS, uint BATCH_PARTS>
 kernel void attention_output_batch(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_BATCH;
 }

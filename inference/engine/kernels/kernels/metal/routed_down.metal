@@ -17,6 +17,53 @@
 #include "lib/routed/down_sum.h"
 #include "lib/core/arrive.h"
 
+namespace {
+
+// Four adjacent channels c .. c + 3 of a resident combine's projections in
+// threadgroup memory, A-rounded.
+struct TileProjections4 {
+    threadgroup const float *projected;
+    uint stride;
+    uint c;
+    float4 at4(uint k) const thread {
+        threadgroup const float *at = projected + k * stride + c;
+        return float4(
+            routed::Act::round(at[0]),
+            routed::Act::round(at[1]),
+            routed::Act::round(at[2]),
+            routed::Act::round(at[3]));
+    }
+};
+
+// Four adjacent channels n .. n + 3 of row m's arrived projections in A,
+// read through coherent device loads (`routed::PublishedSlots`).
+template <uint SLOTS, uint H>
+struct ArrivedProjections4 {
+    routed::PublishedSlots published;
+    ulong m;
+    uint n;
+    float4 at4(uint k) const thread {
+        const ulong offset = (m * SLOTS + k) * H + n;
+        if ((reinterpret_cast<ulong>(published + offset) & 7ul) == 0ul) {
+            const metal::vec<typename routed::Act::storage, 4> raw =
+                *reinterpret_cast<coherent(device) device const metal::vec<typename routed::Act::storage, 4> *>(
+                    published + offset);
+            return float4(
+                routed::Act::load(raw.x),
+                routed::Act::load(raw.y),
+                routed::Act::load(raw.z),
+                routed::Act::load(raw.w));
+        }
+        return float4(
+            routed::Act::load(published[offset + 0ul]),
+            routed::Act::load(published[offset + 1ul]),
+            routed::Act::load(published[offset + 2ul]),
+            routed::Act::load(published[offset + 3ul]));
+    }
+};
+
+} // namespace
+
 // The ports, the expert stack's: its records' address table.
 #define ROUTED_DOWN_PORTS                                                                                  \
     device const float *base [[buffer(SEISMIC_BUFFER_BASE)]],                                                     \
@@ -35,6 +82,7 @@
 #define ROUTED_DOWN_BODY                                                                                          \
     constexpr uint TILE = routed::down_tile<ROWS, LANES>();                                                       \
     constexpr uint REGION = routed::down_region<ROWS, LANES>();                                                   \
+    constexpr uint H = uint(SEISMIC_DIM_H);                                                                       \
     threadgroup float projected[uint(SEISMIC_DIM_K)][REGION];                                                     \
     const ulong m = group.y;                                                                                      \
     const uint first = group.x * TILE;                                                                            \
@@ -42,11 +90,21 @@
     routed::down_project<ROWS, LANES>(product, routes, sources, expert_down, tier_down, m, first, sg, lane,       \
         projected[sg], seismic_words);                                                                            \
     threadgroup_barrier(mem_flags::mem_threadgroup);                                                              \
-    const uint n = first + tid;                                                                                   \
-    if (tid >= TILE || n >= uint(SEISMIC_DIM_H))                                                                  \
+    const uint c = tid * 4u;                                                                                      \
+    if (c >= TILE)                                                                                                \
         return;                                                                                                   \
-    routed::down_publish(base, weights, value, m, n, routed::TileProjections{&projected[0][0], REGION, tid},      \
-        routed::Answer{false, 0.0f}, seismic_words);
+    const uint n = first + c;                                                                                     \
+    if (n >= H)                                                                                                   \
+        return;                                                                                                   \
+    if (c + 4u <= TILE && n + 4u <= H) {                                                                          \
+        routed::down_publish4(base, weights, value, m, n, TileProjections4{&projected[0][0], REGION, c},          \
+            routed::Answer4{false, float4(0.0f)}, seismic_words);                                                 \
+    } else {                                                                                                      \
+        for (uint i = 0u; i < 4u && c + i < TILE && n + i < H; ++i)                                               \
+            routed::down_publish(base, weights, value, m, n + i,                                                  \
+                routed::TileProjections{&projected[0][0], REGION, c + i}, routed::Answer{false, 0.0f},            \
+                seismic_words);                                                                                   \
+    }
 
 // The gathered ports: the side-by-side form's, the published projections and
 // the channel tiles' arrival counters.
@@ -63,6 +121,7 @@
     constexpr uint REGION = routed::down_region<ROWS, LANES>();                                                   \
     constexpr uint SLOTS = uint(SEISMIC_DIM_K);                                                                   \
     constexpr uint H = uint(SEISMIC_DIM_H);                                                                       \
+    constexpr uint QUADS = (TILE + 3u) / 4u;                                                                      \
     threadgroup float projected[SLOTS][REGION];                                                                   \
     threadgroup uint last;                                                                                        \
     const uint first = group.x * TILE;                                                                            \
@@ -71,12 +130,21 @@
         uint(SEISMIC_DIM_M), group.y, first, sg, lane, projected[sg], published, seismic_words);                  \
     if (!arrive::last(arrivals + group.x, uint(SEISMIC_DIM_M), &last, tid))                                       \
         return;                                                                                                   \
-    for (uint item = tid; item < uint(SEISMIC_DIM_M) * TILE; item += 32 * SLOTS) {                                \
-        const ulong m = item / TILE;                                                                              \
-        const uint n = first + item % TILE;                                                                       \
-        if (n < H)                                                                                                \
-            routed::down_publish(base, weights, value, m, n, routed::ArrivedProjections<SLOTS, H>{published, m, n}, \
-                routed::Answer{false, 0.0f}, seismic_words);                                                      \
+    for (uint item = tid; item < uint(SEISMIC_DIM_M) * QUADS; item += 32u * SLOTS) {                              \
+        const ulong m = item / QUADS;                                                                             \
+        const uint c = (item % QUADS) * 4u;                                                                       \
+        const uint n = first + c;                                                                                 \
+        if (n >= H)                                                                                               \
+            continue;                                                                                             \
+        if (c + 4u <= TILE && n + 4u <= H) {                                                                      \
+            routed::down_publish4(base, weights, value, m, n, ArrivedProjections4<SLOTS, H>{published, m, n},     \
+                routed::Answer4{false, float4(0.0f)}, seismic_words);                                             \
+        } else {                                                                                                  \
+            for (uint i = 0u; i < 4u && c + i < TILE && n + i < H; ++i)                                           \
+                routed::down_publish(base, weights, value, m, n + i,                                              \
+                    routed::ArrivedProjections<SLOTS, H>{published, m, n + i}, routed::Answer{false, 0.0f},       \
+                    seismic_words);                                                                               \
+        }                                                                                                         \
     }
 
 #ifdef SEISMIC_FORMING_ROUTED_DOWN_SUMMED

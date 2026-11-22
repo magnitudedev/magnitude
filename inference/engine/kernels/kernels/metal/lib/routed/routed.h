@@ -268,6 +268,12 @@ struct ArrivedProjections {
     float at(uint k) const thread {
         return Act::load(published[(m * SLOTS + k) * H + n]);
     }
+    float4 at4(uint k) const thread {
+        const vec<typename Act::storage, 4> raw = vec<typename Act::storage, 4>(
+            *reinterpret_cast<coherent(device) device const typename Act::packed4 *>(
+                published + (m * SLOTS + k) * H + n));
+        return float4(Act::load(raw.x), Act::load(raw.y), Act::load(raw.z), Act::load(raw.w));
+    }
 };
 
 // A plain activation prologue over rows of a [rows, columns] A tensor.
@@ -545,6 +551,10 @@ struct TileProjections {
     uint tid;
     float at(uint k) const thread {
         return Act::round(projected[k * stride + tid]);
+    }
+    float4 at4(uint k) const thread {
+        const float4 raw = float4(*reinterpret_cast<threadgroup const packed_float4 *>(projected + k * stride + tid));
+        return float4(Act::round(raw.x), Act::round(raw.y), Act::round(raw.z), Act::round(raw.w));
     }
 };
 

@@ -22,6 +22,14 @@ struct Answer {
 };
 #endif
 
+#ifndef ROUTED_ANSWER4
+#define ROUTED_ANSWER4
+struct Answer4 {
+    bool answered;
+    float4 value;
+};
+#endif
+
 
 // Channel n's publication, over the K + 1 A-rounded projections
 // `projections.at(k)` and the CPU's `answer`.
@@ -40,6 +48,29 @@ inline void output_publish(device const float *residual, device const float *inj
         SEISMIC_RESULT_0_STRIDE_1, residual + m * SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1,
         inject + m * SEISMIC_INJECT_STRIDE_0, SEISMIC_DIM_H, n, selected,
         projections.at(K) * coefficient[m * SEISMIC_COEFFICIENT_STRIDE_0]);
+}
+
+// Channels n .. n + 3's publication, over the K + 1 A-rounded projections
+// `projections.at4(k)` and the CPU's `answer`: hoists `scores[m, k]` and
+// `coefficient[m]` once across all four channels and publishes via
+// `projection::routed_join_quad`.
+template <typename Projections>
+inline void output_publish4(device const float *residual, device const float *inject, device const float *scores,
+    device const float *coefficient, element::Out<element::F32> value, ulong m, uint n,
+    thread const Projections &projections, thread const Answer4 &answer, constant ulong *seismic_words) {
+    constexpr uint K = uint(SEISMIC_DIM_K);
+    device const float *row_scores = scores + m * SEISMIC_SCORES_STRIDE_0;
+    float4 selected = float4(0.0f);
+    for (uint k = 0; k < K; ++k) {
+        const float score = row_scores[k * SEISMIC_SCORES_STRIDE_1];
+        selected = metal::fma(float4(score), projections.at4(k), selected);
+    }
+    if (answer.answered)
+        selected += answer.value;
+    const float coeff = coefficient[m * SEISMIC_COEFFICIENT_STRIDE_0];
+    projection::routed_join_quad<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(value.offset(m * SEISMIC_RESULT_0_STRIDE_0),
+        SEISMIC_RESULT_0_STRIDE_1, residual + m * SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1,
+        inject + m * SEISMIC_INJECT_STRIDE_0, SEISMIC_DIM_H, n, selected, projections.at4(K) * coeff);
 }
 
 } // namespace routed

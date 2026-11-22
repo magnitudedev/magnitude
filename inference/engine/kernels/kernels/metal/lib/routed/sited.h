@@ -7,6 +7,14 @@
 
 namespace routed {
 
+#ifndef ROUTED_ANSWER4
+#define ROUTED_ANSWER4
+struct Answer4 {
+    bool answered;
+    float4 value;
+};
+#endif
+
 // Channel n of row m's published projections, in A (a fused output's slot K
 // the shared expert's).
 struct PublishedProjections {
@@ -17,6 +25,18 @@ struct PublishedProjections {
     float at(uint k) const thread {
         return Act::load(reinterpret_cast<device const typename Act::storage *>(published)[
             m * SEISMIC_PUBLISHED_STRIDE_0 + ulong(k) * SEISMIC_PUBLISHED_STRIDE_1 + ulong(n) * SEISMIC_PUBLISHED_STRIDE_2]);
+    }
+    float4 at4(uint k) const thread {
+        device const typename Act::storage *base =
+            reinterpret_cast<device const typename Act::storage *>(published)
+            + m * SEISMIC_PUBLISHED_STRIDE_0 + ulong(k) * SEISMIC_PUBLISHED_STRIDE_1;
+        if (SEISMIC_PUBLISHED_STRIDE_2 == 1)
+            return Act::load4(base + n);
+        return float4(
+            Act::load(base[ulong(n + 0u) * SEISMIC_PUBLISHED_STRIDE_2]),
+            Act::load(base[ulong(n + 1u) * SEISMIC_PUBLISHED_STRIDE_2]),
+            Act::load(base[ulong(n + 2u) * SEISMIC_PUBLISHED_STRIDE_2]),
+            Act::load(base[ulong(n + 3u) * SEISMIC_PUBLISHED_STRIDE_2]));
     }
 };
 
@@ -43,6 +63,24 @@ inline Answer answer_at(SYSTEM const float *output, bool answered, ulong m, uint
         return Answer{false, 0.0f};
     streaming_system_fence();
     return Answer{true, output[m * SEISMIC_SITE_OUTPUT_STRIDE_1 + ulong(n) * SEISMIC_SITE_OUTPUT_STRIDE_2]};
+}
+
+// Channels n .. n + 3 of row m of the slot's answer `output` (`site_output`)
+// where the CPU answered the step, else none. Acquires once for the quad.
+inline Answer4 answer_at4(SYSTEM const float *output, bool answered, ulong m, uint n, constant ulong *seismic_words) {
+    if (!answered)
+        return Answer4{false, float4(0.0f)};
+    streaming_system_fence();
+    SYSTEM const float *row = output + m * SEISMIC_SITE_OUTPUT_STRIDE_1;
+    if (SEISMIC_SITE_OUTPUT_STRIDE_2 == 1) {
+        SYSTEM const float *base = row + n;
+        return Answer4{true, float4(base[0], base[1], base[2], base[3])};
+    }
+    return Answer4{true, float4(
+        row[ulong(n + 0u) * SEISMIC_SITE_OUTPUT_STRIDE_2],
+        row[ulong(n + 1u) * SEISMIC_SITE_OUTPUT_STRIDE_2],
+        row[ulong(n + 2u) * SEISMIC_SITE_OUTPUT_STRIDE_2],
+        row[ulong(n + 3u) * SEISMIC_SITE_OUTPUT_STRIDE_2])};
 }
 
 } // namespace routed

@@ -1018,9 +1018,6 @@ inline void unordered_from_ordered_maxm_run(thread const RawIn &raw, thread cons
     do { constexpr uint MAXM = 2; __VA_ARGS__; } while (0)
 static_assert(SEISMIC_CONST_VERIFY_ROWS <= 8, "the GEMV bodies serve at most 8 rows");
 #define PROJECTION_FOR_SEVERAL_ROWS(rows, ...)                                  \
-    do {                                                                        \
-        if ((rows) <= 4) { constexpr uint MAXM = 4; __VA_ARGS__; }              \
-        else { constexpr uint MAXM = 8; __VA_ARGS__; }                          \
-    } while (0)
+    do { constexpr uint MAXM = (MATRIX_FROM <= 5 ? 4 : 8); __VA_ARGS__; } while (0)
 
 } // namespace projection

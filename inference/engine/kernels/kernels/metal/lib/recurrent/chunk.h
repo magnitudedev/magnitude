@@ -147,8 +147,7 @@ inline RchScratch<DECAYS> rch_scratch(device float *inputs, constant ulong *seis
 }
 
 // The inputs launch: the row's channel head (`rch_prepare_row`) and, for a
-// value head, lane l's key channels l, l + 32, ... of its log decays and
-// channel 0's beta.
+// value head, its log decays (channel quads for DECAYS > 1) and beta.
 template <typename Rule>
 inline void rch_inputs(Rule rule, device const recurrent::Storage *projection, device const float *convolution,
     device const int *segments, device const int *stop, device const int *previous_bank,
@@ -166,17 +165,30 @@ inline void rch_inputs(Rule rule, device const recurrent::Storage *projection, d
     const RchScratch<DECAYS> scratch = rch_scratch<DECAYS>(inputs, seismic_words);
     rch_prepare_row(projection, convolution, window, slot, row, head, scratch.rows, scratch.values, scratch.height,
         lane, seismic_words);
-    const bool is_value = head >= 2 * RCH_KEY_HEADS;
-    const uint value_head = head - 2 * RCH_KEY_HEADS;
-    RECURRENT_UNROLL for (uint k = 0; k < (DECAYS + 31) / 32; ++k) {
-        const uint channel = lane + 32 * k;
-        if (is_value && channel < DECAYS) {
-            device float *gates = scratch.head_gates(value_head);
-            float beta;
-            gates[row * DECAYS + channel] = rule.gates(value_head, seismic_words).at(row, channel, beta,
-                seismic_words);
-            if (channel == 0) {
-                gates[DECAYS * scratch.height + row] = beta;
+    if (head >= 2 * RCH_KEY_HEADS) {
+        const uint value_head = head - 2 * RCH_KEY_HEADS;
+        device float *gates = scratch.head_gates(value_head);
+        const auto head_gates = rule.gates(value_head, seismic_words);
+        if constexpr (DECAYS == 1) {
+            if (lane == 0) {
+                float beta;
+                gates[row] = head_gates.at(row, 0, beta, seismic_words);
+                gates[scratch.height + row] = beta;
+            }
+        } else {
+            static_assert(DECAYS % 4 == 0, "channel decays must be a multiple of 4");
+            constexpr uint GATE_QUADS = (DECAYS / 4 + 31) / 32;
+            RECURRENT_UNROLL for (uint j = 0; j < GATE_QUADS; ++j) {
+                const uint channel = 4 * (lane + 32 * j);
+                if (channel < DECAYS) {
+                    float beta;
+                    const float4 log_decays = head_gates.at4(row, channel, beta, seismic_words);
+                    *reinterpret_cast<device packed_float4 *>(gates + row * DECAYS + channel) =
+                        packed_float4(log_decays);
+                    if (channel == 0) {
+                        gates[DECAYS * scratch.height + row] = beta;
+                    }
+                }
             }
         }
     }
@@ -230,7 +242,8 @@ struct RchDecays {
     enum : uint { STRIDE = RCH_INPUT_STRIDE };
     // K o exp G, then K o exp(G_last - G) (K').
     threadgroup float *decayed;
-    threadgroup const float *log_decays;
+    // exp(G_last) staged into the dead `queries` buffer after `rch_project`.
+    threadgroup const float *last_factors;
     float row_beta;
 
     void stage(threadgroup float *gates, device const float *head_gates, ulong height, long first, long length,
@@ -239,17 +252,20 @@ struct RchDecays {
             gates[RCH_PIECE * STRIDE + thread_index] = long(thread_index) < length
                 ? head_gates[DECAYS * height + ulong(first) + thread_index] : 0.0f;
         }
-        for (uint item = thread_index; item < RCH_PIECE * DECAYS; item += RCH_THREADS) {
-            const uint i = item / DECAYS;
-            gates[i * STRIDE + item % DECAYS] = long(i) < length
-                ? head_gates[(ulong(first) + i) * DECAYS + item % DECAYS] : 0.0f;
+        static_assert(DECAYS % 4 == 0, "channel decays must be a multiple of 4");
+        for (uint item = thread_index; item < RCH_PIECE * DECAYS / 4; item += RCH_THREADS) {
+            const uint i = item / (DECAYS / 4);
+            const uint channel = 4 * (item % (DECAYS / 4));
+            *reinterpret_cast<threadgroup float4 *>(gates + i * STRIDE + channel) = long(i) < length
+                ? float4(*reinterpret_cast<device const packed_float4 *>(
+                    head_gates + (ulong(first) + i) * DECAYS + channel))
+                : float4(0.0f);
         }
     }
 
     void products(threadgroup float *queries, threadgroup const float *keys, threadgroup float *gates,
         RchShares shares, thread simdgroup_float8x8 (&state)[2][RCH_TILES], thread simdgroup_float8x8 (&removed)[2],
         thread simdgroup_float8x8 (&output)[2], uint thread_index, uint, ushort lane, ushort row) {
-        log_decays = gates;
         // Each channel's cumulative log decays over the piece.
         for (uint channel = thread_index; channel < DECAYS; channel += RCH_THREADS) {
             float running = 0.0f;
@@ -260,6 +276,7 @@ struct RchDecays {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         constexpr uint SHARE_COLUMNS = DECAYS / RCH_SHARES;
+        static_assert(SHARE_COLUMNS % 4 == 0, "share columns must be a multiple of 4");
         // Pack the strictly lower triangle of A (j < i) and the lower triangle
         // of D (j <= i) into one RCH_PIECE x RCH_PIECE square per share:
         // b <= a computes D[a, b] (kind 1), b > a computes A[b, a] (kind 0).
@@ -277,28 +294,52 @@ struct RchDecays {
             threadgroup const float *upper = gates + i * STRIDE;
             threadgroup const float *lower = gates + j * STRIDE;
             float sum = 0.0f;
-            for (uint c = share * SHARE_COLUMNS; c < (share + 1) * SHARE_COLUMNS; ++c) {
-                sum = metal::fma(left[c] * right[c], metal::exp(upper[c] - lower[c]), sum);
+            for (uint c = share * SHARE_COLUMNS; c < (share + 1) * SHARE_COLUMNS; c += 4) {
+                const float4 l = *reinterpret_cast<threadgroup const float4 *>(left + c);
+                const float4 r = *reinterpret_cast<threadgroup const float4 *>(right + c);
+                const float4 u = *reinterpret_cast<threadgroup const float4 *>(upper + c);
+                const float4 lo = *reinterpret_cast<threadgroup const float4 *>(lower + c);
+                const float4 prod = l * r;
+                const float4 decay = metal::exp(u - lo);
+                sum = metal::fma(prod.x, decay.x, sum);
+                sum = metal::fma(prod.y, decay.y, sum);
+                sum = metal::fma(prod.z, decay.z, sum);
+                sum = metal::fma(prod.w, decay.w, sum);
             }
             shares[share][kind][i * RCH_PIECE + j] = sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // Q o exp G in place, and K o exp G.
-        for (uint item = thread_index; item < RCH_PIECE * DECAYS; item += RCH_THREADS) {
-            const uint at = (item / DECAYS) * RCH_INPUT_STRIDE + item % DECAYS;
-            const float gamma = metal::exp(gates[(item / DECAYS) * STRIDE + item % DECAYS]);
-            queries[at] *= gamma;
-            decayed[at] = keys[at] * gamma;
+        for (uint item = thread_index; item < RCH_PIECE * DECAYS / 4; item += RCH_THREADS) {
+            const uint i = item / (DECAYS / 4);
+            const uint channel = 4 * (item % (DECAYS / 4));
+            const uint at = i * RCH_INPUT_STRIDE + channel;
+            const float4 gamma = metal::exp(*reinterpret_cast<threadgroup const float4 *>(
+                gates + i * STRIDE + channel));
+            *reinterpret_cast<threadgroup float4 *>(queries + at) *= gamma;
+            *reinterpret_cast<threadgroup float4 *>(decayed + at) =
+                *reinterpret_cast<threadgroup const float4 *>(keys + at) * gamma;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         rch_project(queries, decayed, state, removed, output);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // K o exp(G_last - G) for the state update.
-        for (uint item = thread_index; item < RCH_PIECE * DECAYS; item += RCH_THREADS) {
-            const uint channel = item % DECAYS;
-            const uint at = (item / DECAYS) * RCH_INPUT_STRIDE + channel;
-            decayed[at] = keys[at]
-                * metal::exp(gates[(RCH_PIECE - 1) * STRIDE + channel] - gates[(item / DECAYS) * STRIDE + channel]);
+        // K o exp(G_last - G) for the state update, and exp(G_last) into the
+        // dead `queries` buffer for `factor()`.
+        last_factors = queries;
+        for (uint item = thread_index; item < RCH_PIECE * DECAYS / 4; item += RCH_THREADS) {
+            const uint i = item / (DECAYS / 4);
+            const uint channel = 4 * (item % (DECAYS / 4));
+            const uint at = i * RCH_INPUT_STRIDE + channel;
+            const float4 last_log = *reinterpret_cast<threadgroup const float4 *>(
+                gates + (RCH_PIECE - 1) * STRIDE + channel);
+            const float4 k = *reinterpret_cast<threadgroup const float4 *>(keys + at);
+            if (i == RCH_PIECE - 1) {
+                *reinterpret_cast<threadgroup float4 *>(decayed + at) = k;
+                *reinterpret_cast<threadgroup float4 *>(queries + channel) = metal::exp(last_log);
+            } else {
+                const float4 g = *reinterpret_cast<threadgroup const float4 *>(gates + i * STRIDE + channel);
+                *reinterpret_cast<threadgroup float4 *>(decayed + at) = k * metal::exp(last_log - g);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // Lane i < 8 holds row i's beta; padding rows have zero beta.
@@ -311,7 +352,7 @@ struct RchDecays {
     threadgroup const float *update_keys(threadgroup const float *) const { return decayed; }
     void start_update() {}
     float factor(uint c, ushort row) const {
-        return metal::exp(log_decays[(RCH_PIECE - 1) * STRIDE + 8 * c + row]);
+        return last_factors[8 * c + row];
     }
 };
 
@@ -454,22 +495,26 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
         // The source version's tape rows, with the step's update: element e of
         // tile (h, c) is S[row0 + 8h + column + e][8c + row], scaled by key
         // column 8c + row's factor (the head's one factor for one decay).
-        constexpr uint FACTORS = DECAYS == 1 ? 1 : RCH_TILES;
         for (long entry = 0; entry < geometry.taped; ++entry) {
             device const float *tape_row = recurrent::tape_view(tape, source, entry, seismic_words);
-            float factors[FACTORS];
-            RECURRENT_UNROLL for (uint c = 0; c < FACTORS; ++c) {
-                factors[c] = tape_row[recurrent::tape_decay<DECAYS>(head, 8 * c + row, seismic_words)];
-            }
+            const float head_factor = DECAYS == 1
+                ? tape_row[recurrent::tape_decay<DECAYS>(head, 0, seismic_words)] : 0.0f;
+            float2 innovation[2];
             RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
-                RECURRENT_UNROLL for (uint c = 0; c < RCH_TILES; ++c) {
-                    const float key_value = tape_row[RECURRENT_TAPE_K + key_head * width + 8 * c + row];
-                    RECURRENT_UNROLL for (uint e = 0; e < 2; ++e) {
-                        const float innovation = tape_row[RECURRENT_TAPE_U + head * width + row0 + 8 * h + column + e];
-                        state[h][c].thread_elements()[e] *= factors[c % FACTORS];
-                        state[h][c].thread_elements()[e] = metal::fma(innovation, key_value,
-                            state[h][c].thread_elements()[e]);
-                    }
+                innovation[h] = float2(*reinterpret_cast<device const packed_float2 *>(
+                    tape_row + RECURRENT_TAPE_U + head * width + row0 + 8 * h + column));
+            }
+            RECURRENT_UNROLL for (uint c = 0; c < RCH_TILES; ++c) {
+                const float factor = DECAYS == 1 ? head_factor
+                    : tape_row[recurrent::tape_decay<DECAYS>(head, 8 * c + row, seismic_words)];
+                const float key_value = tape_row[RECURRENT_TAPE_K + key_head * width + 8 * c + row];
+                RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
+                    state[h][c].thread_elements()[0] *= factor;
+                    state[h][c].thread_elements()[0] = metal::fma(innovation[h].x, key_value,
+                        state[h][c].thread_elements()[0]);
+                    state[h][c].thread_elements()[1] *= factor;
+                    state[h][c].thread_elements()[1] = metal::fma(innovation[h].y, key_value,
+                        state[h][c].thread_elements()[1]);
                 }
             }
         }
@@ -573,9 +618,9 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
             if (long(row) < length) {
                 device recurrent::Storage *destination = mixed
                     + recurrent::raw_index(ulong(first + long(row)), head, row0 + 8 * h + column, seismic_words);
-                RECURRENT_UNROLL for (ushort e = 0; e < 2; ++e) {
-                    destination[e] = activation::Act::store(output[h].thread_elements()[e]);
-                }
+                *reinterpret_cast<device activation::Act::packed2 *>(destination) =
+                    activation::Act::packed2(activation::Act::store2(
+                        float2(output[h].thread_elements()[0], output[h].thread_elements()[1])));
             }
             update[h].thread_elements()[0] *= decays.tail();
             update[h].thread_elements()[1] *= decays.tail();

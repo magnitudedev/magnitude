@@ -67,6 +67,7 @@ typedef projection::operands<NVFP4> Operands;
     projection::Weights<packets::W0> w{{weight, KERNEL_W0_LAYOUT(k), k}}
 
 #define PROJECTION_GROUPS 1
+#define PROJECTION_GATHERED 1
 #define PROJECTION_GEMV_INPUT(x) const auto x = raw
 #define PROJECTION_INT8_SCRATCH \
     const projection::int8_scratch scratch{quantized, row_scales, block_sums, coefficients, biases}
@@ -78,6 +79,7 @@ typedef projection::operands<NVFP4> Operands;
 
 // The feature rows as NVFP4 operands into `staged`, one row a threadgroup.
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_STAGE
+template <uint MATRIX_FROM>
 kernel void readout_project_rows_stage(PROJECTION_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -140,25 +142,25 @@ kernel void readout_project_rows_gather_choice(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_project_rows_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(ONE, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PAIR
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_project_rows_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_ROWS
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_project_rows_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_BATCH
-template <uint MATRIX, uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint MATRIX_FROM, uint BATCH_ROWS, uint BATCH_PARTS>
 kernel void readout_project_rows_batch(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_BATCH;
 }

@@ -157,7 +157,8 @@ kernel void state_space_chunk_products(STATE_SPACE_CHUNK_ARGUMENTS,
 #define SSC_PIECE_FLOATS (2 * STATE_SPACE_PIECE * SEISMIC_TUNE_ROWS + STATE_SPACE_PIECE * SSC_WEIGHT_STRIDE \
     + 3 * STATE_SPACE_PIECE)
 #define SSC_SHARED_FLOATS (SSC_SEQUENTIAL_FLOATS > SSC_PIECE_FLOATS ? SSC_SEQUENTIAL_FLOATS : SSC_PIECE_FLOATS)
-static_assert(SSC_SHARED_FLOATS <= 8192, "staging fits in 32 KiB threadgroup memory");
+static_assert(SSC_SHARED_FLOATS * 4u <= uint(SEISMIC_DEVICE_SHARED_BYTES_PER_GROUP),
+    "staging fits in threadgroup memory");
 
 // Loads a lane's COLUMNS contiguous F32 elements using packed_float4 loads
 // when COLUMNS % 4 == 0 (4-byte aligned, safe for any device float pointer),

@@ -31,17 +31,26 @@
                 x, out, w0, w1, rows, n, k, tile, shared, simdgroups, sg, lane));                               \
     }
 
-// The batched launch (VERIFY_ROWS + 1..16 rows of `x`, `m` of them): with
-// MATRIX = 1 the matrix GEMV, which the projection admits only where it
-// serves every weight, else the batched rows, each launch's grid exactly
-// its form's threadgroups.
-#define PROJECTION_BATCH(W0, W1, PAIRED, BATCH_ROWS, BATCH_PARTS, MATRIX, x, out, w0, w1, m, n, k)               \
-    if constexpr (MATRIX == 1) {                                                                                \
-        if constexpr (PAIRED)                                                                                   \
-            projection::gemv_matrix_paired<W0, W1, BATCH_PARTS>(x, out, w0, w1, m, n, k, tile, shared,          \
+// The batched launch (MATRIX_FROM..16 rows of `x`, `m` of them): when
+// QMATRIX_STATIC holds and k % 32 == 0, the matrix GEMV (`gemv_matrix`), else
+// the batched rows (`gemv_batch_runtime`), each launch's grid matching its
+// form's threadgroups.
+#define PROJECTION_BATCH(W0, W1, PAIRED, BATCH_ROWS, BATCH_PARTS, QMATRIX_STATIC, x, out, w0, w1, m, n, k)      \
+    if constexpr (QMATRIX_STATIC) {                                                                             \
+        if ((k) % 32u == 0u) {                                                                                  \
+            if constexpr (PAIRED)                                                                               \
+                projection::gemv_matrix_paired<W0, W1, BATCH_PARTS>(x, out, w0, w1, m, n, k, tile, shared,      \
+                    simdgroups, sg, lane);                                                                      \
+            else                                                                                                \
+                projection::gemv_matrix<W0, BATCH_PARTS>(x, out, w0, m, n, k, tile, shared, simdgroups, sg,     \
+                    lane);                                                                                      \
+        } else if constexpr (PAIRED) {                                                                          \
+            projection::gemv_batch_paired_runtime<W0, W1, BATCH_ROWS>(x, out, w0, w1, m, n, k, tile, shared,    \
                 simdgroups, sg, lane);                                                                          \
-        else                                                                                                    \
-            projection::gemv_matrix<W0, BATCH_PARTS>(x, out, w0, m, n, k, tile, shared, simdgroups, sg, lane);  \
+        } else {                                                                                                \
+            projection::gemv_batch_runtime<W0, BATCH_ROWS>(x, out, w0, m, n, k, tile, shared, simdgroups, sg,   \
+                lane);                                                                                          \
+        }                                                                                                       \
     } else if constexpr (PAIRED) {                                                                              \
         projection::gemv_batch_paired_runtime<W0, W1, BATCH_ROWS>(x, out, w0, w1, m, n, k, tile, shared,        \
             simdgroups, sg, lane);                                                                              \
@@ -86,6 +95,9 @@
 #ifndef PROJECTION_GROUPS
 #define PROJECTION_GROUPS 1
 #endif
+#ifndef PROJECTION_GATHERED
+#define PROJECTION_GATHERED 0
+#endif
 #define PROJECTION_GROUP(z) (PROJECTION_GROUPS == 1 ? 0u : uint(z))
 
 // The arguments of the row launches (the GEMVs, the batch).
@@ -127,7 +139,10 @@
 #define PROJECTION_SINGLE_BATCH                                                                                 \
     const uint tile = position.x;                                                                               \
     PROJECTION_OPERANDS(PROJECTION_GROUP(position.z));                                                          \
-    PROJECTION_BATCH(packets::W0, packets::W0, false, BATCH_ROWS, BATCH_PARTS, MATRIX, in, out, w, w, m, n, k)
+    constexpr bool QMATRIX_STATIC = (PROJECTION_GROUPS == 1) && (PROJECTION_GATHERED == 0)                      \
+        && projection::matrix_form<packets::W0>::available;                                                     \
+    PROJECTION_BATCH(packets::W0, packets::W0, false, BATCH_ROWS, BATCH_PARTS, QMATRIX_STATIC, in, out, w, w,   \
+        m, n, k)
 
 // The batched launch over the rows each threadgroup forms as the GEMV does
 // (`PROJECTION_GEMV_INPUT`), for an entry that stages none to 16 rows.
@@ -135,7 +150,7 @@
     const uint tile = position.x;                                                                               \
     PROJECTION_OPERANDS(PROJECTION_GROUP(position.z));                                                          \
     PROJECTION_GEMV_INPUT(formed);                                                                              \
-    PROJECTION_BATCH(packets::W0, packets::W0, false, BATCH_ROWS, BATCH_PARTS, MATRIX, formed, out, w, w, m, n, \
+    PROJECTION_BATCH(packets::W0, packets::W0, false, BATCH_ROWS, BATCH_PARTS, false, formed, out, w, w, m, n,  \
         k)
 
 // A group's share of a split's partials: SPLIT parts of m x n each.
@@ -296,7 +311,10 @@
 #define PROJECTION_PAIRED_BATCH                                                                                 \
     const uint tile = position.x;                                                                               \
     PROJECTION_OPERANDS;                                                                                        \
-    PROJECTION_BATCH(packets::W0, packets::W1, true, BATCH_ROWS, BATCH_PARTS, MATRIX, in, out, w0, w1, m, n, k)
+    constexpr bool QMATRIX_STATIC = (PROJECTION_GROUPS == 1) && (PROJECTION_GATHERED == 0)                      \
+        && projection::matrix_form<packets::W0>::available && projection::matrix_form<packets::W1>::available;  \
+    PROJECTION_BATCH(packets::W0, packets::W1, true, BATCH_ROWS, BATCH_PARTS, QMATRIX_STATIC, in, out, w0, w1,  \
+        m, n, k)
 
 // The staged paired tiles, TM x TN.
 #define PROJECTION_PAIRED_TILES(TM, TN)                                                                         \
@@ -551,12 +569,12 @@ inline void zero_segment(thread const Out &out, uint m, uint n, uint row0, uint 
 // else the batched rows, whose threadgroups past the
 // segment's rows (the matrix GEMV's grid) return. A pair takes `w` and `v`
 // together.
-template <typename W, typename V, bool PAIRED, uint BATCH_ROWS, uint PARTS, uint MATRIX, bool COLUMNS, typename In,
+template <typename W, typename V, bool PAIRED, uint BATCH_ROWS, uint PARTS, bool QMATRIX, bool COLUMNS, typename In,
     typename Out>
 inline void segment_batch(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const Weights<V> &v, uint m, uint n, uint k, uint tile, threadgroup uchar *shared, uint simdgroups,
     uint sg, uint lane) {
-    if constexpr (MATRIX == 1 && matrix_form<W>::available && (!PAIRED || matrix_form<V>::available)) {
+    if constexpr (QMATRIX && matrix_form<W>::available && (!PAIRED || matrix_form<V>::available)) {
         if (k % 32u == 0) {
             if constexpr (PAIRED)
                 gemv_matrix_paired<W, V, PARTS>(in, out, w, v, m, n, k, tile, shared, simdgroups, sg, lane);
@@ -680,32 +698,39 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
     PROJECTION_SEGMENT_CHAIN                                                                                    \
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_GEMV, COUNT, TILED, per)
 
-#define PROJECTION_SEGMENT_BATCH(s, x)                                                                          \
+#define PROJECTION_SEGMENT_HAS_MATRIX(s, ...)                                                                   \
+    || (uint(PROJECTION_N##s) > 0u && projection::matrix_form<PROJECTION_PACKET(s)>::available                  \
+        && (!PROJECTION_PAIRED(s) || projection::matrix_form<PROJECTION_PARTNER_PACKET(s)>::available))
+
+#define PROJECTION_SEGMENT_BATCH(s, x, QMATRIX)                                                                 \
     else if (segment == s##u) {                                                                                 \
         PROJECTION_BATCH_PROLOGUE(s);                                                                           \
-        projection::segment_batch<PROJECTION_PACKET(s), PROJECTION_PARTNER_PACKET(s), PROJECTION_PAIRED(s),            \
-            BATCH_ROWS, BATCH_PARTS, MATRIX, PROJECTION_COLUMNS(s)>(x, out##s, w##s, PROJECTION_PARTNER(s), m,  \
+        projection::segment_batch<PROJECTION_PACKET(s), PROJECTION_PARTNER_PACKET(s), PROJECTION_PAIRED(s),     \
+            BATCH_ROWS, BATCH_PARTS, QMATRIX, PROJECTION_COLUMNS(s)>(x, out##s, w##s, PROJECTION_PARTNER(s), m, \
             uint(PROJECTION_N##s), k, local, shared, simdgroups, sg, lane);                                     \
     }
 
-// The batched launch: with MATRIX = 1 the matrix GEMV over the staged rows
-// for the segments it serves (the others' batched rows over them too), each
-// segment taking the matrix GEMV's threadgroups; else the batched rows over
-// the GEMV's rows, each segment taking theirs.
+// The batched launch over the staged rows: when any active segment supports
+// `matrix_form` and k % 32 == 0, uses the matrix GEMV grid (`QMATRIX`), else
+// the batched-rows grid.
 #define PROJECTION_SEGMENTED_BATCH                                                                              \
     PROJECTION_OPERANDS;                                                                                        \
-    const uint per = MATRIX == 1 ? 8u * simdgroups / BATCH_PARTS : 8u * simdgroups * BATCH_ROWS;                \
+    constexpr bool QMATRIX_STATIC = false PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_HAS_MATRIX, );             \
+    const bool qmatrix = QMATRIX_STATIC && (k % 32u == 0u);                                                     \
+    const uint per = qmatrix ? 8u * simdgroups / BATCH_PARTS : 8u * simdgroups * BATCH_ROWS;                    \
     PROJECTION_SEGMENT_FIND(position.x, per);                                                                   \
     PROJECTION_SEGMENTED_ZEROS(0u, m, per, simdgroups * 32u);                                                   \
-    if constexpr (MATRIX == 1) {                                                                                \
-        PROJECTION_SEGMENT_CHAIN                                                                                \
-        PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_BATCH, in)                                                   \
+    if constexpr (QMATRIX_STATIC) {                                                                             \
+        if (qmatrix) {                                                                                          \
+            PROJECTION_SEGMENT_CHAIN                                                                            \
+            PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_BATCH, in, true)                                         \
+        } else {                                                                                                \
+            PROJECTION_SEGMENT_CHAIN                                                                            \
+            PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_BATCH, in, false)                                        \
+        }                                                                                                       \
     } else {                                                                                                    \
-        PROJECTION_GEMV_INPUT(input);                                                                           \
-        PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                                             \
-        const auto x = Operands::rows(input, m, k, globals, simdgroups, sg, lane);                              \
         PROJECTION_SEGMENT_CHAIN                                                                                \
-        PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_BATCH, x)                                                    \
+        PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_BATCH, in, false)                                            \
     }
 
 // SKIP(s): whether the tiles leave segment s to another launch.
@@ -877,9 +902,9 @@ struct PartPartial {
 #define PROJECTION_ADD_ROWS(s, ...) + uint(PROJECTION_N##s)
 #define PROJECTION_ADD_TILES(s, PER) + (uint(PROJECTION_N##s) + (PER) - 1u) / (PER)
 
-#define PROJECTION_SEGMENT_PART_GEMV(s, ...)                                                                    \
+#define PROJECTION_SEGMENT_PART_GEMV(s, COUNT)                                                                  \
     else if (segment == s##u)                                                                                   \
-        PROJECTION_FOR_ROWS(m,                                                                                  \
+        PROJECTION_FOR_##COUNT##_ROWS(m,                                                                        \
             projection::gemv_runtime<PROJECTION_PACKET(s), ROWS, MAXM, LANES, (STAGE == 1)>(x,                  \
             projection::PartPartial{sums.y, sums.row, sums.column + PROJECTION_FIRST_##s}, w##s, m,             \
             uint(PROJECTION_N##s), width, local, shared, simdgroups, sg, lane, part * (width / 32u)));
@@ -897,8 +922,8 @@ struct PartPartial {
         }                                                                                                       \
     }
 
-// The GEMV of every row count below the batched launch's.
-#define PROJECTION_SEGMENTED_PARTS_GEMV                                                                         \
+// The GEMV of a parted row class (`ONE`, `PAIR`, `SEVERAL`).
+#define PROJECTION_SEGMENTED_PARTS_GEMV(COUNT)                                                                  \
     PROJECTION_OPERANDS;                                                                                        \
     const uint parts = uint(PROJECTION_PARTS), width = k / parts;                                               \
     const uint per = simdgroups * ROWS * (32u / LANES);                                                         \
@@ -909,7 +934,7 @@ struct PartPartial {
     const projection::PartPartial sums{partials, ulong(parts) * outputs, ulong(part) * outputs};                \
     PROJECTION_SEGMENT_FIND(row_tile, per);                                                                     \
     PROJECTION_SEGMENT_CHAIN                                                                                    \
-    PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_GEMV, )                                                     \
+    PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_GEMV, COUNT)                                                \
     threadgroup uint last;                                                                                      \
     const uint thread_index = sg * 32u + lane, threads = simdgroups * 32u;                                      \
     if (!arrive::last(arrivals + row_tile, parts, &last, thread_index))                                         \

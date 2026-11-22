@@ -107,7 +107,7 @@ typedef projection::operands<NVFP4> Operands;
 // The normalized rows into `normalized`, one row a threadgroup: in row
 // order, and in the tall GEMM's.
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_STAGE
-template <uint MATRIX>
+template <uint MATRIX_FROM>
 kernel void attention_project_stage(PROJECTION_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -128,13 +128,13 @@ kernel void attention_project_stage_tall(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_project_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(ONE, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_BATCH
-template <uint MATRIX, uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint MATRIX_FROM, uint BATCH_ROWS, uint BATCH_PARTS>
 kernel void attention_project_batch(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_BATCH;
 }
@@ -157,13 +157,13 @@ kernel void attention_project_tall(PROJECTION_ARGUMENTS, PROJECTION_TILE_ARGUMEN
 }
 #endif
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV_ROWS
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_project_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(SEVERAL, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV_PAIR
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_project_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(PAIR, TILED);
 }

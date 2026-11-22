@@ -75,6 +75,10 @@ struct Convolving {
             const Taps held = taps;
             return convolve(convolution, held, channel, seismic_words);
         }
+        float4 at4(ulong channel, constant ulong *seismic_words) const {
+            const Taps held = taps;
+            return convolve4(convolution, held, channel, seismic_words);
+        }
     };
     Row row(long row, constant ulong *seismic_words) const {
         return Row{taps(projection, window, slot, row - slot.lo, seismic_words), convolution};

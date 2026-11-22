@@ -31,11 +31,23 @@ kernel void routed_output_sited(
     const ulong q = streaming_step(step, SEISMIC_STEP_STRIDE_0);
     const ulong slot = q % ulong(SEISMIC_DIM_FLIGHT);
     const bool answered = routed::site_answered(sources, site + slot * SEISMIC_SITE_STRIDE_0, q, &ready, tid, seismic_words);
-    const uint n = group.x * threads.x + tid;
-    if (n >= uint(SEISMIC_DIM_H))
+    const uint first = group.x * threads.x;
+    const uint c = tid * 4u;
+    const uint n = first + c;
+    if (c >= threads.x || n >= uint(SEISMIC_DIM_H))
         return;
-    const routed::Answer answer = routed::answer_at(site_output + slot * SEISMIC_SITE_OUTPUT_STRIDE_0, answered, m, n,
-        seismic_words);
-    routed::output_publish(residual, inject, scores, coefficient, value, m, n,
-        routed::PublishedProjections{published, seismic_words, m, n}, answer, seismic_words);
+    SYSTEM const float *slot_output = site_output + slot * SEISMIC_SITE_OUTPUT_STRIDE_0;
+    if (c + 4u <= threads.x && n + 4u <= uint(SEISMIC_DIM_H)) {
+        const routed::Answer4 answer = routed::answer_at4(slot_output, answered, m, n, seismic_words);
+        routed::output_publish4(residual, inject, scores, coefficient, value, m, n,
+            routed::PublishedProjections{published, seismic_words, m, n}, answer, seismic_words);
+    } else {
+        const uint end = metal::min(threads.x, uint(SEISMIC_DIM_H) - first);
+        for (uint i = c; i < end; ++i) {
+            const uint ch = first + i;
+            const routed::Answer answer = routed::answer_at(slot_output, answered, m, ch, seismic_words);
+            routed::output_publish(residual, inject, scores, coefficient, value, m, ch,
+                routed::PublishedProjections{published, seismic_words, m, ch}, answer, seismic_words);
+        }
+    }
 }

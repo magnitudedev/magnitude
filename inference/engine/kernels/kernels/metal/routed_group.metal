@@ -20,7 +20,7 @@
 // tiles' padding and `used`.
 
 constant constexpr uint group_experts = SEISMIC_DIM_E;
-constant constexpr uint group_parts = 1024u / group_experts;
+constant constexpr uint group_parts = uint(SEISMIC_DEVICE_MAX_GROUP_THREADS) / group_experts;
 constant constexpr uint group_threads = group_experts * group_parts;
 constant constexpr uint group_expert_simdgroups = (group_experts + 31u) / 32u;
 constant constexpr uint group_choices = SEISMIC_CONST_GROUP_CHOICES;

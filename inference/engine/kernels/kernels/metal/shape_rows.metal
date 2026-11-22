@@ -102,6 +102,52 @@ inline ulong shape_top_p_target(float top_p, ulong total) {
     const element::Out<element::F32> values =                                           \
         element::Out<element::F32>(logits_cells).offset(ulong(row) * SEISMIC_LOGITS_STRIDE_0)
 
+inline float shape_prepare_lane(
+    float value, uint count, float repetition, float presence, float frequency,
+    bool masked, bool bit_allowed, bool scale_temp, float temperature,
+    thread uint &maximum) {
+    if (count > 0u) {
+        value = value < 0.0f ? value * repetition : value / repetition;
+        value = value - presence - frequency * float(count);
+    }
+    if (masked && !bit_allowed && value < INFINITY)
+        value = -INFINITY;
+    if (scale_temp)
+        value = value / temperature;
+    if (finite_f32(value))
+        maximum = metal::max(maximum, order::finite_key(value));
+    else if (value != -INFINITY)
+        maximum = shape_unshaped;
+    return value;
+}
+
+inline void shape_prepare_scalar(
+    element::Out<element::F32> values, ulong slot, uint token, uint begin,
+    bool penalized, bool use_counts, uint hn,
+    threadgroup atomic_uint *counts,
+    device const int *row_history, ulong history_stride,
+    float repetition, float presence, float frequency,
+    bool masked, device const uint *words, ulong mask_stride,
+    bool scale_temp, float temperature, bool write_back,
+    thread uint &maximum) {
+    uint count = 0u;
+    if (penalized) {
+        if (use_counts) {
+            count = atomic_load_explicit(&counts[token - begin], memory_order_relaxed);
+        } else {
+            for (uint h = 0u; h < hn; ++h)
+                count += uint(row_history[ulong(h) * history_stride] == int(token));
+        }
+    }
+    const bool bit_allowed =
+        !masked || ((words[ulong(token >> 5u) * mask_stride] >> (token & 31u)) & 1u) != 0u;
+    const float value = shape_prepare_lane(
+        values.at(slot), count, repetition, presence, frequency,
+        masked, bit_allowed, scale_temp, temperature, maximum);
+    if (write_back)
+        values.put(slot, value);
+}
+
 kernel void shape_rows_prepare(SHAPE_ARGUMENTS,
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -144,33 +190,75 @@ kernel void shape_rows_prepare(SHAPE_ARGUMENTS,
     const bool scale_temp = temperature != 0.0f && temperature != 1.0f;
     const bool write_back = penalized || masked || scale_temp;
     uint maximum = 0u;
-    for (uint token = begin + thread_index; token < end; token += shape_threads) {
-        const ulong slot = ulong(token) * SEISMIC_LOGITS_STRIDE_1;
-        float value = values.at(slot);
-        if (penalized) {
-            uint count = 0u;
-            if (use_counts) {
-                count = atomic_load_explicit(&counts[token - begin], memory_order_relaxed);
-            } else {
-                for (uint h = 0u; h < hn; ++h)
-                    count += uint(row_history[ulong(h) * SEISMIC_HISTORY_STRIDE_1] == int(token));
-            }
-            if (count > 0u) {
-                value = value < 0.0f ? value * repetition : value / repetition;
-                value = value - presence - frequency * float(count);
-            }
+    if (SEISMIC_LOGITS_STRIDE_1 == 1ul) {
+        // Align the 4-wide body to 4-token boundaries so every 4-lane group
+        // shares one 32-bit mask word (token >> 5).
+        const uint vec_begin = metal::min((begin + 3u) & ~3u, end);
+        const uint vec_end = metal::max(vec_begin, end & ~3u);
+        if (thread_index < vec_begin - begin) {
+            const uint token = begin + thread_index;
+            shape_prepare_scalar(
+                values, ulong(token), token, begin,
+                penalized, use_counts, hn, counts,
+                row_history, SEISMIC_HISTORY_STRIDE_1,
+                repetition, presence, frequency,
+                masked, words, SEISMIC_MASK_STRIDE_1,
+                scale_temp, temperature, write_back, maximum);
         }
-        if (masked && ((words[ulong(token / 32u) * SEISMIC_MASK_STRIDE_1] >> (token % 32u)) & 1u) == 0u
-            && value < INFINITY)
-            value = -INFINITY;
-        if (scale_temp)
-            value = value / temperature;
-        if (write_back)
-            values.put(slot, value);
-        if (finite_f32(value))
-            maximum = metal::max(maximum, order::finite_key(value));
-        else if (value != -INFINITY)
-            maximum = shape_unshaped;
+        for (uint token = vec_begin + thread_index * 4u; token < vec_end; token += shape_threads * 4u) {
+            const float4 in = values.at4(ulong(token));
+            uint c0 = 0u, c1 = 0u, c2 = 0u, c3 = 0u;
+            if (penalized) {
+                if (use_counts) {
+                    const uint base = token - begin;
+                    c0 = atomic_load_explicit(&counts[base], memory_order_relaxed);
+                    c1 = atomic_load_explicit(&counts[base + 1u], memory_order_relaxed);
+                    c2 = atomic_load_explicit(&counts[base + 2u], memory_order_relaxed);
+                    c3 = atomic_load_explicit(&counts[base + 3u], memory_order_relaxed);
+                } else {
+                    for (uint h = 0u; h < hn; ++h) {
+                        const int tok = row_history[ulong(h) * SEISMIC_HISTORY_STRIDE_1];
+                        c0 += uint(tok == int(token));
+                        c1 += uint(tok == int(token + 1u));
+                        c2 += uint(tok == int(token + 2u));
+                        c3 += uint(tok == int(token + 3u));
+                    }
+                }
+            }
+            const uint mask_bits =
+                masked ? (words[ulong(token >> 5u) * SEISMIC_MASK_STRIDE_1] >> (token & 31u)) : 0xFu;
+            float4 out;
+            out.x = shape_prepare_lane(in.x, c0, repetition, presence, frequency,
+                                       masked, (mask_bits & 1u) != 0u, scale_temp, temperature, maximum);
+            out.y = shape_prepare_lane(in.y, c1, repetition, presence, frequency,
+                                       masked, (mask_bits & 2u) != 0u, scale_temp, temperature, maximum);
+            out.z = shape_prepare_lane(in.z, c2, repetition, presence, frequency,
+                                       masked, (mask_bits & 4u) != 0u, scale_temp, temperature, maximum);
+            out.w = shape_prepare_lane(in.w, c3, repetition, presence, frequency,
+                                       masked, (mask_bits & 8u) != 0u, scale_temp, temperature, maximum);
+            if (write_back)
+                values.put4(ulong(token), out);
+        }
+        if (thread_index < end - vec_end) {
+            const uint token = vec_end + thread_index;
+            shape_prepare_scalar(
+                values, ulong(token), token, begin,
+                penalized, use_counts, hn, counts,
+                row_history, SEISMIC_HISTORY_STRIDE_1,
+                repetition, presence, frequency,
+                masked, words, SEISMIC_MASK_STRIDE_1,
+                scale_temp, temperature, write_back, maximum);
+        }
+    } else {
+        for (uint token = begin + thread_index; token < end; token += shape_threads) {
+            shape_prepare_scalar(
+                values, ulong(token) * SEISMIC_LOGITS_STRIDE_1, token, begin,
+                penalized, use_counts, hn, counts,
+                row_history, SEISMIC_HISTORY_STRIDE_1,
+                repetition, presence, frequency,
+                masked, words, SEISMIC_MASK_STRIDE_1,
+                scale_temp, temperature, write_back, maximum);
+        }
     }
     maximum = simd_max(maximum);
     if (lane == 0u)
@@ -194,15 +282,13 @@ struct Survivor {
     uint top_k_key;
     float min_p;
 
-    inline bool at(ulong token, thread float &value, thread uint &key) const {
-        value = line.at(token * stride);
+    inline bool test(float value, thread uint &key) const {
         if (!finite_f32(value))
             return false;
         key = order::finite_key(value);
         return key >= top_k_key && !(min_p > 0.0f && metal::exp(value - maximum) < min_p);
     }
-    inline bool at_mass(ulong token, thread uint &key, thread ulong &mass_out) const {
-        const float value = line.at(token * stride);
+    inline bool test_mass(float value, thread uint &key, thread ulong &mass_out) const {
         if (!finite_f32(value))
             return false;
         key = order::finite_key(value);
@@ -213,6 +299,13 @@ struct Survivor {
             return false;
         mass_out = e >= 1.0f ? (1ul << 32) : ulong(e * 4294967296.0f);
         return true;
+    }
+    inline bool at(ulong token, thread float &value, thread uint &key) const {
+        value = line.at(token * stride);
+        return test(value, key);
+    }
+    inline bool at_mass(ulong token, thread uint &key, thread ulong &mass_out) const {
+        return test_mass(line.at(token * stride), key, mass_out);
     }
     inline ulong mass(float value) const {
         const float e = metal::exp(value - maximum);
@@ -430,26 +523,94 @@ inline bool select_key_from(thread const Survivor &survivor, ulong vocabulary, u
         hist_clear(hist_lo, hist_hi, bins, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (!MASS) {
-            for (ulong base = 0ul; base < vocabulary; base += shape_select_threads) {
-                const ulong token = base + tid;
-                bool hit = false;
-                uint bin = 0u;
-                if (token < vocabulary) {
-                    float value;
-                    uint key;
-                    if (survivor.at(token, value, key) && (key & mask) == prefix) {
-                        hit = true;
-                        bin = (key >> shifts[level]) & (bins - 1u);
+            if (survivor.stride == 1ul) {
+                const ulong vec_end = vocabulary & ~3ul;
+                for (ulong base = 0ul; base < vec_end; base += ulong(shape_select_threads) * 4ul) {
+                    const ulong token = base + ulong(tid) * 4ul;
+                    bool h0 = false, h1 = false, h2 = false, h3 = false;
+                    uint b0 = 0u, b1 = 0u, b2 = 0u, b3 = 0u;
+                    if (token < vec_end) {
+                        const float4 v = survivor.line.at4(token);
+                        uint key;
+                        if (survivor.test(v.x, key) && (key & mask) == prefix) {
+                            h0 = true;
+                            b0 = (key >> shifts[level]) & (bins - 1u);
+                        }
+                        if (survivor.test(v.y, key) && (key & mask) == prefix) {
+                            h1 = true;
+                            b1 = (key >> shifts[level]) & (bins - 1u);
+                        }
+                        if (survivor.test(v.z, key) && (key & mask) == prefix) {
+                            h2 = true;
+                            b2 = (key >> shifts[level]) & (bins - 1u);
+                        }
+                        if (survivor.test(v.w, key) && (key & mask) == prefix) {
+                            h3 = true;
+                            b3 = (key >> shifts[level]) & (bins - 1u);
+                        }
                     }
+                    hist_add_count_simd(hist_lo, b0, h0, lane);
+                    hist_add_count_simd(hist_lo, b1, h1, lane);
+                    hist_add_count_simd(hist_lo, b2, h2, lane);
+                    hist_add_count_simd(hist_lo, b3, h3, lane);
                 }
-                hist_add_count_simd(hist_lo, bin, hit, lane);
+                if (vec_end < vocabulary) {
+                    bool hit = false;
+                    uint bin = 0u;
+                    if (ulong(tid) < vocabulary - vec_end) {
+                        uint key;
+                        if (survivor.test(survivor.line.at(vec_end + ulong(tid)), key) && (key & mask) == prefix) {
+                            hit = true;
+                            bin = (key >> shifts[level]) & (bins - 1u);
+                        }
+                    }
+                    hist_add_count_simd(hist_lo, bin, hit, lane);
+                }
+            } else {
+                for (ulong base = 0ul; base < vocabulary; base += shape_select_threads) {
+                    const ulong token = base + tid;
+                    bool hit = false;
+                    uint bin = 0u;
+                    if (token < vocabulary) {
+                        float value;
+                        uint key;
+                        if (survivor.at(token, value, key) && (key & mask) == prefix) {
+                            hit = true;
+                            bin = (key >> shifts[level]) & (bins - 1u);
+                        }
+                    }
+                    hist_add_count_simd(hist_lo, bin, hit, lane);
+                }
             }
         } else {
-            for (ulong token = tid; token < vocabulary; token += shape_select_threads) {
-                uint key;
-                ulong w;
-                if (survivor.at_mass(token, key, w) && (key & mask) == prefix)
-                    hist_add_u64(hist_lo, hist_hi, (key >> shifts[level]) & (bins - 1u), w);
+            if (survivor.stride == 1ul) {
+                const ulong vec_end = vocabulary & ~3ul;
+                for (ulong token = ulong(tid) * 4ul; token < vec_end; token += ulong(shape_select_threads) * 4ul) {
+                    const float4 v = survivor.line.at4(token);
+                    uint key;
+                    ulong w;
+                    if (survivor.test_mass(v.x, key, w) && (key & mask) == prefix)
+                        hist_add_u64(hist_lo, hist_hi, (key >> shifts[level]) & (bins - 1u), w);
+                    if (survivor.test_mass(v.y, key, w) && (key & mask) == prefix)
+                        hist_add_u64(hist_lo, hist_hi, (key >> shifts[level]) & (bins - 1u), w);
+                    if (survivor.test_mass(v.z, key, w) && (key & mask) == prefix)
+                        hist_add_u64(hist_lo, hist_hi, (key >> shifts[level]) & (bins - 1u), w);
+                    if (survivor.test_mass(v.w, key, w) && (key & mask) == prefix)
+                        hist_add_u64(hist_lo, hist_hi, (key >> shifts[level]) & (bins - 1u), w);
+                }
+                if (ulong(tid) < vocabulary - vec_end) {
+                    uint key;
+                    ulong w;
+                    if (survivor.test_mass(survivor.line.at(vec_end + ulong(tid)), key, w) && (key & mask) == prefix)
+                        hist_add_u64(hist_lo, hist_hi, (key >> shifts[level]) & (bins - 1u), w);
+                }
+            } else {
+                for (ulong token = tid; token < vocabulary; token += shape_select_threads) {
+                    uint key;
+                    ulong w;
+                    if (survivor.at_mass(token, key, w) && (key & mask) == prefix)
+                        hist_add_u64(hist_lo, hist_hi, (key >> shifts[level]) & (bins - 1u), w);
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -464,18 +625,48 @@ inline bool select_key_from(thread const Survivor &survivor, ulong vocabulary, u
     return true;
 }
 
+inline void compact_topk_lane(float value, ulong token, uint digit0,
+                              threadgroup atomic_uint *cand_count,
+                              threadgroup uint *buf_a, threadgroup uint *buf_b) {
+    if (finite_f32(value)) {
+        const uint key = order::finite_key(value);
+        if ((key >> 21) >= digit0) {
+            const uint idx = atomic_fetch_add_explicit(cand_count, 1u, memory_order_relaxed);
+            buf_a[idx] = key;
+            buf_b[idx] = uint(token);
+        }
+    }
+}
+
+inline void accumulate_top_p_lane(float value, ulong token, thread const Survivor &survivor,
+                                  thread ulong &total, threadgroup atomic_uint *cand_count,
+                                  threadgroup uint *buf_a, threadgroup uint *buf_b) {
+    uint key;
+    ulong w;
+    if (survivor.test_mass(value, key, w)) {
+        total += w;
+        if (atomic_load_explicit(cand_count, memory_order_relaxed) <= shape_compact_cap) {
+            const uint idx = atomic_fetch_add_explicit(cand_count, 1u, memory_order_relaxed);
+            if (idx < shape_compact_cap) {
+                buf_a[idx] = key;
+                buf_b[idx] = uint(token);
+            }
+        }
+    }
+}
+
 kernel void shape_rows_select(SHAPE_ARGUMENTS,
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    // Threadgroup memory: 8192 + 8192 + 256 + 256 + 4096 + 20 = 21012 bytes <= 32768 bytes.
-    // buf_a / buf_b alias (hist_lo, hist_hi) during radix passes and (keys, tokens) during compact sort.
+    // Threadgroup memory: 8192 + 8192 + 256 + 256 + 20 = 16916 bytes <= 32768 bytes.
+    // buf_a / buf_b alias (hist_lo, hist_hi) during radix passes, (keys, tokens) during compact sort,
+    // and buf_a[0..31] holds simdgroup tie-count totals during the 2-level tie-rank scan.
     threadgroup uint buf_a[shape_bins];
     threadgroup uint buf_b[shape_bins];
     threadgroup ulong lane_totals[32];
     threadgroup ulong reduce[32];
-    threadgroup uint chunk_counts[shape_select_threads];
     threadgroup atomic_uint cand_count;
     threadgroup uint shared_digit;
     threadgroup ulong shared_base;
@@ -517,18 +708,50 @@ kernel void shape_rows_select(SHAPE_ARGUMENTS,
     if (top_k > 0 && ulong(top_k) < vocabulary && maximum != 0u) {
         hist_clear(buf_a, buf_b, shape_bins, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (ulong base = 0ul; base < vocabulary; base += shape_select_threads) {
-            const ulong token = base + tid;
-            bool hit = false;
-            uint bin = 0u;
-            if (token < vocabulary) {
-                const float value = survivor.line.at(token * survivor.stride);
-                if (finite_f32(value)) {
-                    hit = true;
-                    bin = order::finite_key(value) >> 21;
+        if (survivor.stride == 1ul) {
+            const ulong vec_end = vocabulary & ~3ul;
+            for (ulong base = 0ul; base < vec_end; base += ulong(shape_select_threads) * 4ul) {
+                const ulong token = base + ulong(tid) * 4ul;
+                bool h0 = false, h1 = false, h2 = false, h3 = false;
+                uint b0 = 0u, b1 = 0u, b2 = 0u, b3 = 0u;
+                if (token < vec_end) {
+                    const float4 v = survivor.line.at4(token);
+                    if (finite_f32(v.x)) { h0 = true; b0 = order::finite_key(v.x) >> 21; }
+                    if (finite_f32(v.y)) { h1 = true; b1 = order::finite_key(v.y) >> 21; }
+                    if (finite_f32(v.z)) { h2 = true; b2 = order::finite_key(v.z) >> 21; }
+                    if (finite_f32(v.w)) { h3 = true; b3 = order::finite_key(v.w) >> 21; }
                 }
+                hist_add_count_simd(buf_a, b0, h0, lane);
+                hist_add_count_simd(buf_a, b1, h1, lane);
+                hist_add_count_simd(buf_a, b2, h2, lane);
+                hist_add_count_simd(buf_a, b3, h3, lane);
             }
-            hist_add_count_simd(buf_a, bin, hit, lane);
+            if (vec_end < vocabulary) {
+                bool hit = false;
+                uint bin = 0u;
+                if (ulong(tid) < vocabulary - vec_end) {
+                    const float value = survivor.line.at(vec_end + ulong(tid));
+                    if (finite_f32(value)) {
+                        hit = true;
+                        bin = order::finite_key(value) >> 21;
+                    }
+                }
+                hist_add_count_simd(buf_a, bin, hit, lane);
+            }
+        } else {
+            for (ulong base = 0ul; base < vocabulary; base += shape_select_threads) {
+                const ulong token = base + tid;
+                bool hit = false;
+                uint bin = 0u;
+                if (token < vocabulary) {
+                    const float value = survivor.line.at(token * survivor.stride);
+                    if (finite_f32(value)) {
+                        hit = true;
+                        bin = order::finite_key(value) >> 21;
+                    }
+                }
+                hist_add_count_simd(buf_a, bin, hit, lane);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint digit0 = descend(buf_a, buf_b, shape_bins, ulong(top_k), above, lane_totals,
@@ -540,15 +763,23 @@ kernel void shape_rows_select(SHAPE_ARGUMENTS,
                 if (tid == 0u)
                     atomic_store_explicit(&cand_count, 0u, memory_order_relaxed);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (ulong token = tid; token < vocabulary; token += shape_select_threads) {
-                    const float value = survivor.line.at(token * survivor.stride);
-                    if (finite_f32(value)) {
-                        const uint key = order::finite_key(value);
-                        if ((key >> 21) >= digit0) {
-                            const uint idx = atomic_fetch_add_explicit(&cand_count, 1u, memory_order_relaxed);
-                            buf_a[idx] = key;
-                            buf_b[idx] = uint(token);
-                        }
+                if (survivor.stride == 1ul) {
+                    const ulong vec_end = vocabulary & ~3ul;
+                    for (ulong token = ulong(tid) * 4ul; token < vec_end; token += ulong(shape_select_threads) * 4ul) {
+                        const float4 v = survivor.line.at4(token);
+                        compact_topk_lane(v.x, token, digit0, &cand_count, buf_a, buf_b);
+                        compact_topk_lane(v.y, token + 1ul, digit0, &cand_count, buf_a, buf_b);
+                        compact_topk_lane(v.z, token + 2ul, digit0, &cand_count, buf_a, buf_b);
+                        compact_topk_lane(v.w, token + 3ul, digit0, &cand_count, buf_a, buf_b);
+                    }
+                    if (ulong(tid) < vocabulary - vec_end) {
+                        const ulong token = vec_end + ulong(tid);
+                        compact_topk_lane(survivor.line.at(token), token, digit0, &cand_count, buf_a, buf_b);
+                    }
+                } else {
+                    for (ulong token = tid; token < vocabulary; token += shape_select_threads) {
+                        compact_topk_lane(survivor.line.at(token * survivor.stride), token, digit0,
+                                          &cand_count, buf_a, buf_b);
                     }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -578,18 +809,23 @@ kernel void shape_rows_select(SHAPE_ARGUMENTS,
                 atomic_store_explicit(&cand_count, 0u, memory_order_relaxed);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             ulong total = 0ul;
-            for (ulong token = tid; token < vocabulary; token += shape_select_threads) {
-                uint key;
-                ulong w;
-                if (survivor.at_mass(token, key, w)) {
-                    total += w;
-                    if (atomic_load_explicit(&cand_count, memory_order_relaxed) <= shape_compact_cap) {
-                        const uint idx = atomic_fetch_add_explicit(&cand_count, 1u, memory_order_relaxed);
-                        if (idx < shape_compact_cap) {
-                            buf_a[idx] = key;
-                            buf_b[idx] = uint(token);
-                        }
-                    }
+            if (survivor.stride == 1ul) {
+                const ulong vec_end = vocabulary & ~3ul;
+                for (ulong token = ulong(tid) * 4ul; token < vec_end; token += ulong(shape_select_threads) * 4ul) {
+                    const float4 v = survivor.line.at4(token);
+                    accumulate_top_p_lane(v.x, token, survivor, total, &cand_count, buf_a, buf_b);
+                    accumulate_top_p_lane(v.y, token + 1ul, survivor, total, &cand_count, buf_a, buf_b);
+                    accumulate_top_p_lane(v.z, token + 2ul, survivor, total, &cand_count, buf_a, buf_b);
+                    accumulate_top_p_lane(v.w, token + 3ul, survivor, total, &cand_count, buf_a, buf_b);
+                }
+                if (ulong(tid) < vocabulary - vec_end) {
+                    const ulong token = vec_end + ulong(tid);
+                    accumulate_top_p_lane(survivor.line.at(token), token, survivor, total, &cand_count, buf_a, buf_b);
+                }
+            } else {
+                for (ulong token = tid; token < vocabulary; token += shape_select_threads) {
+                    accumulate_top_p_lane(survivor.line.at(token * survivor.stride), token, survivor, total,
+                                          &cand_count, buf_a, buf_b);
                 }
             }
             for (ushort offset = 16; offset > 0; offset >>= 1)
@@ -620,27 +856,85 @@ kernel void shape_rows_select(SHAPE_ARGUMENTS,
                 // above < target <= above + ties * each, so each > 0 and rank < ties.
                 const ulong rank = (target - above + each - 1ul) / each - 1ul;
                 const ulong chunk = (vocabulary + shape_select_threads - 1ul) / shape_select_threads;
-                const ulong first = ulong(tid) * chunk;
+                const ulong first = metal::min(ulong(tid) * chunk, vocabulary);
+                const ulong last = metal::min(first + chunk, vocabulary);
                 uint tie_count = 0u;
-                for (ulong token = first; token < first + chunk && token < vocabulary; ++token) {
-                    float value;
-                    uint candidate;
-                    tie_count += survivor.at(token, value, candidate) && candidate == key ? 1u : 0u;
-                }
-                chunk_counts[tid] = tie_count;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                ulong before = 0ul;
-                for (uint t = 0u; t < tid; ++t)
-                    before += chunk_counts[t];
-                if (rank >= before && rank < before + tie_count) {
-                    ulong seen = before;
-                    for (ulong token = first; token < first + chunk && token < vocabulary; ++token) {
+                if (survivor.stride == 1ul) {
+                    const ulong vec_end = first + ((last - first) & ~3ul);
+                    for (ulong token = first; token < vec_end; token += 4ul) {
+                        const float4 v = survivor.line.at4(token);
+                        uint candidate;
+                        tie_count += uint(survivor.test(v.x, candidate) && candidate == key);
+                        tie_count += uint(survivor.test(v.y, candidate) && candidate == key);
+                        tie_count += uint(survivor.test(v.z, candidate) && candidate == key);
+                        tie_count += uint(survivor.test(v.w, candidate) && candidate == key);
+                    }
+                    for (ulong token = vec_end; token < last; ++token) {
+                        uint candidate;
+                        tie_count += uint(survivor.test(survivor.line.at(token), candidate) && candidate == key);
+                    }
+                } else {
+                    for (ulong token = first; token < last; ++token) {
                         float value;
                         uint candidate;
-                        if (survivor.at(token, value, candidate) && candidate == key) {
-                            if (seen == rank)
-                                selection->top_p_token = uint(token);
-                            ++seen;
+                        tie_count += uint(survivor.at(token, value, candidate) && candidate == key);
+                    }
+                }
+                // 2-level simdgroup exclusive scan over the 1024 per-thread tie counts.
+                const uint lane_excl = simd_prefix_exclusive_sum(tie_count);
+                if (lane == 31u)
+                    buf_a[sg] = lane_excl + tie_count;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg == 0u) {
+                    const uint sg_total = buf_a[lane];
+                    buf_a[lane] = simd_prefix_exclusive_sum(sg_total);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const ulong before = ulong(buf_a[sg] + lane_excl);
+                if (rank >= before && rank < before + tie_count) {
+                    ulong seen = before;
+                    if (survivor.stride == 1ul) {
+                        const ulong vec_end = first + ((last - first) & ~3ul);
+                        for (ulong token = first; token < vec_end; token += 4ul) {
+                            const float4 v = survivor.line.at4(token);
+                            const float lanes[4] = {v.x, v.y, v.z, v.w};
+                            for (ulong i = 0ul; i < 4ul; ++i) {
+                                uint candidate;
+                                if (survivor.test(lanes[i], candidate) && candidate == key) {
+                                    if (seen == rank) {
+                                        selection->top_p_token = uint(token + i);
+                                        seen = rank + 1ul;
+                                        break;
+                                    }
+                                    ++seen;
+                                }
+                            }
+                            if (seen > rank)
+                                break;
+                        }
+                        if (seen <= rank) {
+                            for (ulong token = vec_end; token < last; ++token) {
+                                uint candidate;
+                                if (survivor.test(survivor.line.at(token), candidate) && candidate == key) {
+                                    if (seen == rank) {
+                                        selection->top_p_token = uint(token);
+                                        break;
+                                    }
+                                    ++seen;
+                                }
+                            }
+                        }
+                    } else {
+                        for (ulong token = first; token < last; ++token) {
+                            float value;
+                            uint candidate;
+                            if (survivor.at(token, value, candidate) && candidate == key) {
+                                if (seen == rank) {
+                                    selection->top_p_token = uint(token);
+                                    break;
+                                }
+                                ++seen;
+                            }
                         }
                     }
                 }
@@ -656,6 +950,16 @@ kernel void shape_rows_select(SHAPE_ARGUMENTS,
         selection->top_p_key = top_p_key;
         selection->top_p_mode = mode;
     }
+}
+
+inline bool shape_token_removed(float value, uint token, Selection selection, float min_p, float maximum) {
+    if (!finite_f32(value))
+        return false;
+    const uint key = order::finite_key(value);
+    return key < selection.top_k_key || (min_p > 0.0f && metal::exp(value - maximum) < min_p) ||
+        selection.top_p_mode == 2u ||
+        (selection.top_p_mode == 1u &&
+         (key < selection.top_p_key || (key == selection.top_p_key && token > selection.top_p_token)));
 }
 
 kernel void shape_rows_apply(SHAPE_ARGUMENTS,
@@ -675,18 +979,38 @@ kernel void shape_rows_apply(SHAPE_ARGUMENTS,
     if (selection.top_k_key == 0u && !(min_p > 0.0f) && selection.top_p_mode == 0u)
         return;
     const float maximum = order::value(selection.maximum);
-    for (uint token = begin + thread_index; token < end; token += shape_threads) {
-        const ulong slot = ulong(token) * SEISMIC_LOGITS_STRIDE_1;
-        const float value = values.at(slot);
-        if (!finite_f32(value))
-            continue;
-        const uint key = order::finite_key(value);
-        const bool removed =
-            key < selection.top_k_key || (min_p > 0.0f && metal::exp(value - maximum) < min_p) ||
-            selection.top_p_mode == 2u ||
-            (selection.top_p_mode == 1u &&
-             (key < selection.top_p_key || (key == selection.top_p_key && token > selection.top_p_token)));
-        if (removed)
-            values.put(slot, -INFINITY);
+    if (SEISMIC_LOGITS_STRIDE_1 == 1ul) {
+        const uint vec_begin = metal::min((begin + 3u) & ~3u, end);
+        const uint vec_end = metal::max(vec_begin, end & ~3u);
+        if (thread_index < vec_begin - begin) {
+            const uint token = begin + thread_index;
+            if (shape_token_removed(values.at(ulong(token)), token, selection, min_p, maximum))
+                values.put(ulong(token), -INFINITY);
+        }
+        for (uint token = vec_begin + thread_index * 4u; token < vec_end; token += shape_threads * 4u) {
+            float4 v = values.at4(ulong(token));
+            const bool r0 = shape_token_removed(v.x, token, selection, min_p, maximum);
+            const bool r1 = shape_token_removed(v.y, token + 1u, selection, min_p, maximum);
+            const bool r2 = shape_token_removed(v.z, token + 2u, selection, min_p, maximum);
+            const bool r3 = shape_token_removed(v.w, token + 3u, selection, min_p, maximum);
+            if (r0 || r1 || r2 || r3) {
+                if (r0) v.x = -INFINITY;
+                if (r1) v.y = -INFINITY;
+                if (r2) v.z = -INFINITY;
+                if (r3) v.w = -INFINITY;
+                values.put4(ulong(token), v);
+            }
+        }
+        if (thread_index < end - vec_end) {
+            const uint token = vec_end + thread_index;
+            if (shape_token_removed(values.at(ulong(token)), token, selection, min_p, maximum))
+                values.put(ulong(token), -INFINITY);
+        }
+    } else {
+        for (uint token = begin + thread_index; token < end; token += shape_threads) {
+            const ulong slot = ulong(token) * SEISMIC_LOGITS_STRIDE_1;
+            if (shape_token_removed(values.at(slot), token, selection, min_p, maximum))
+                values.put(slot, -INFINITY);
+        }
     }
 }

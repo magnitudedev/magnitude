@@ -82,7 +82,7 @@ typedef projection::operands<NVFP4> Operands;
 #define PROJECTION_GEMV_EPILOGUE(s, first, count)
 
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_NORMALIZE
-template <uint MATRIX>
+template <uint MATRIX_FROM>
 kernel void short_conv_project_normalize(PROJECTION_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -103,13 +103,13 @@ kernel void short_conv_project_normalize_tall(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMV
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void short_conv_project_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(ONE, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_BATCH
-template <uint MATRIX, uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint MATRIX_FROM, uint BATCH_ROWS, uint BATCH_PARTS>
 kernel void short_conv_project_batch(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_BATCH;
 }
@@ -132,13 +132,13 @@ kernel void short_conv_project_tall(PROJECTION_ARGUMENTS, PROJECTION_TILE_ARGUME
 }
 #endif
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMV_ROWS
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void short_conv_project_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(SEVERAL, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMV_PAIR
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void short_conv_project_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(PAIR, TILED);
 }

@@ -2,7 +2,8 @@
 // state-space output rows, y * SiLU(z) RMS-normalized over each group of U
 // heads and scaled by the state norm. A threadgroup of 256 threads owns (row,
 // group): `vec4` lane chains on canonical strides, `reduce::group_sum`, and
-// `row_norm` RMS normalization (the gate recomputed with the same arithmetic).
+// `row_norm` RMS normalization (gated vec4 values register-cached across the
+// two passes for widths up to 4096).
 
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
@@ -63,17 +64,31 @@ kernel void state_space_gate(
     device const Act::storage *proj_group = projection + proj_row + first;
     const bool vec_in =
         SEISMIC_PROJECTION_STRIDE_1 == 1 && SEISMIC_MIXED_STRIDE_1 == SEISMIC_DIM_P && SEISMIC_MIXED_STRIDE_2 == 1;
+    constexpr uint MAX_CACHE = 4u;
+    constexpr uint vec_stride = 4u * 256u;
+    float4 cached[MAX_CACHE];
+    float cached_tail = 0.0f;
+    const uint tail_col = vec_width + thread_index;
     float squares = 0.0f;
     if (vec_in) {
         float4 sq4 = float4(0.0f);
-        for (uint column = 4u * thread_index; column < vec_width; column += 4u * 256u) {
+        _Pragma("clang loop unroll(full)")
+        for (uint k = 0u; k < MAX_CACHE; ++k) {
+            const uint column = 4u * thread_index + k * vec_stride;
+            if (column < vec_width) {
+                const float4 value = silu_mul4(Act::load4(mixed_group + column), Act::load4(proj_group + column));
+                cached[k] = value;
+                sq4 = row_norm::square4(value, sq4);
+            }
+        }
+        for (uint column = 4u * thread_index + MAX_CACHE * vec_stride; column < vec_width; column += vec_stride) {
             const float4 value = silu_mul4(Act::load4(mixed_group + column), Act::load4(proj_group + column));
             sq4 = row_norm::square4(value, sq4);
         }
         squares = row_norm::sum4(sq4);
-        for (uint column = vec_width + thread_index; column < width; column += 256u) {
-            const float value = silu_mul(Act::load(mixed_group[column]), Act::load(proj_group[column]));
-            squares = row_norm::square(value, squares);
+        if (tail_col < width) {
+            cached_tail = silu_mul(Act::load(mixed_group[tail_col]), Act::load(proj_group[tail_col]));
+            squares = row_norm::square(cached_tail, squares);
         }
     } else {
         for (uint column = thread_index; column < width; column += 256u) {
@@ -90,14 +105,21 @@ kernel void state_space_gate(
         && SEISMIC_RESULT_0_STRIDE_1 == SEISMIC_DIM_P && SEISMIC_RESULT_0_STRIDE_2 == 1;
     if (vec_out) {
         const element::Out<Act> out_group = out.offset(out_row + first);
-        for (uint column = 4u * thread_index; column < vec_width; column += 4u * 256u) {
+        _Pragma("clang loop unroll(full)")
+        for (uint k = 0u; k < MAX_CACHE; ++k) {
+            const uint column = 4u * thread_index + k * vec_stride;
+            if (column < vec_width) {
+                const float4 weight = float4(*reinterpret_cast<device const packed_float4 *>(norm_group + column));
+                out_group.put4(column, row_norm::apply4<true, false>(cached[k], inverse, weight, float4(0.0f)));
+            }
+        }
+        for (uint column = 4u * thread_index + MAX_CACHE * vec_stride; column < vec_width; column += vec_stride) {
             const float4 weight = float4(*reinterpret_cast<device const packed_float4 *>(norm_group + column));
             const float4 value = silu_mul4(Act::load4(mixed_group + column), Act::load4(proj_group + column));
             out_group.put4(column, row_norm::apply4<true, false>(value, inverse, weight, float4(0.0f)));
         }
-        for (uint column = vec_width + thread_index; column < width; column += 256u) {
-            const float value = silu_mul(Act::load(mixed_group[column]), Act::load(proj_group[column]));
-            out_group.put(column, row_norm::apply<true, false>(value, inverse, norm_group[column], 0.0f));
+        if (tail_col < width) {
+            out_group.put(tail_col, row_norm::apply<true, false>(cached_tail, inverse, norm_group[tail_col], 0.0f));
         }
     } else {
         for (uint column = thread_index; column < width; column += 256u) {

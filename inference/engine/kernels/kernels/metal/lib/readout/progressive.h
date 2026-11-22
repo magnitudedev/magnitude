@@ -51,7 +51,7 @@ inline uint4 progressive_high(device const uint *row, uint group) {
 // four rows of 2,048 A values. Its launch declares the rows' own bytes,
 // min(O × D × 2, 16 KiB), so a level of fewer rows keeps more threadgroups
 // resident.
-#define PROGRESSIVE_STAGE_WORDS 1024u
+#define PROGRESSIVE_STAGE_WORDS ((uint(SEISMIC_DEVICE_SHARED_BYTES_PER_GROUP) / 2u) / 16u)
 
 // The two views of a progressive head as projection-library packets, so the
 // library's GEMV, batched GEMV and GEMM project its planes. A packet is one

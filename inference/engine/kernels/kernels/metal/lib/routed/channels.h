@@ -26,7 +26,7 @@ namespace routed {
 // declaration bounds the weight packets a lane then holds (routed.seismic).
 template <uint SIMDGROUPS, uint LANES, uint COLUMN_PACKETS, bool AT_16>
 constexpr uint stage_packets() {
-    constexpr uint SHARE = 16384u / (SIMDGROUPS * 64u);
+    constexpr uint SHARE = (uint(SEISMIC_DEVICE_SHARED_BYTES_PER_GROUP) / 2u) / (SIMDGROUPS * 64u);
     constexpr bool STAGED = LANES < 16u || (AT_16 && LANES == 16u && (COLUMN_PACKETS + 15u) / 16u > 2u);
     return !STAGED ? 0u : COLUMN_PACKETS < SHARE ? COLUMN_PACKETS : SHARE;
 }

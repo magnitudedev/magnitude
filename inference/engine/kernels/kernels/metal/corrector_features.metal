@@ -1,8 +1,8 @@
 // corrector_features: one threadgroup of 256 threads per proposing row
-// reduces its softmax normalizer over the V logits, then forms each of its K
-// candidates' five features and their layer norm (every thread, redundantly)
-// and the H outputs silu(up · normed + up_bias), one column per thread,
-// rounded once to A.
+// reduces its softmax normalizer over the V logits, then in rank tiles of at
+// most 64 forms each candidate's five normed features once into threadgroup
+// memory and projects the H outputs silu(up · normed + up_bias), loading each
+// column's up_weight and up_bias once per tile, rounded once to A.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 #include "lib/core/reduce.h"
@@ -25,6 +25,9 @@ kernel void corrector_features(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup reduce::OnlineSoftmax partials[FEATURES_THREADS / 32u];
+    constexpr uint K_TILE =
+        SEISMIC_DIM_K < 64ul ? (SEISMIC_DIM_K > 0ul ? uint(SEISMIC_DIM_K) : 1u) : 64u;
+    threadgroup float normed_shared[K_TILE * 5u];
     const element::Out<activation_element> result(result_cells);
     const ulong vocabulary = SEISMIC_DIM_V, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
     device const float *line = logits + ulong(row) * SEISMIC_LOGITS_STRIDE_0;
@@ -49,31 +52,49 @@ kernel void corrector_features(
     const float normalizer = softmax.max + metal::log(softmax.sum);
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     device const float *candidates = unary + ulong(row) * SEISMIC_UNARY_STRIDE_0;
-    const float first = candidates[0];
-    for (ulong rank = 0; rank < count; ++rank) {
-        const float logit = candidates[rank * SEISMIC_UNARY_STRIDE_1];
-        const float lp = logit - normalizer;
-        const float features[5] = {lp, metal::exp(lp), logit - first,
-            count > 1 ? float(rank) / float(count - 1) : 0.0f, rank == 0 ? 1.0f : 0.0f};
-        float mean = 0.0f;
-        for (uint f = 0; f < 5u; ++f)
-            mean += features[f];
-        mean /= 5.0f;
-        float variance = 0.0f;
-        for (uint f = 0; f < 5u; ++f)
-            variance += (features[f] - mean) * (features[f] - mean);
-        const float inverse = 1.0f / metal::sqrt(variance / 5.0f + epsilon);
-        float normed[5];
-        for (uint f = 0; f < 5u; ++f)
-            normed[f] = (features[f] - mean) * inverse * norm_weight[f * SEISMIC_NORM_WEIGHT_STRIDE_0] +
-                norm_bias[f * SEISMIC_NORM_BIAS_STRIDE_0];
-        const ulong out = (ulong(row) * count + rank) * SEISMIC_RESULT_0_STRIDE_0;
+    for (ulong base = 0; base < count; base += ulong(K_TILE)) {
+        const ulong remaining = count - base;
+        const ulong tile_count = remaining < ulong(K_TILE) ? remaining : ulong(K_TILE);
+        if (base > 0ul)
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (ulong local_rank = thread_index; local_rank < tile_count; local_rank += FEATURES_THREADS) {
+            const ulong rank = base + local_rank;
+            const float first = candidates[0];
+            const float logit = candidates[rank * SEISMIC_UNARY_STRIDE_1];
+            const float lp = logit - normalizer;
+            const float features[5] = {lp, metal::exp(lp), logit - first,
+                count > 1ul ? float(rank) / float(count - 1ul) : 0.0f, rank == 0ul ? 1.0f : 0.0f};
+            float mean = 0.0f;
+            for (uint f = 0; f < 5u; ++f)
+                mean += features[f];
+            mean /= 5.0f;
+            float variance = 0.0f;
+            for (uint f = 0; f < 5u; ++f)
+                variance += (features[f] - mean) * (features[f] - mean);
+            const float inverse = 1.0f / metal::sqrt(variance / 5.0f + epsilon);
+            threadgroup float *dst = normed_shared + local_rank * 5ul;
+            for (uint f = 0; f < 5u; ++f)
+                dst[f] = (features[f] - mean) * inverse * norm_weight[f * SEISMIC_NORM_WEIGHT_STRIDE_0] +
+                    norm_bias[f * SEISMIC_NORM_BIAS_STRIDE_0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const ulong out_base = (ulong(row) * count + base) * SEISMIC_RESULT_0_STRIDE_0;
         for (ulong column = thread_index; column < width; column += FEATURES_THREADS) {
             device const float *weights = up_weight + column * SEISMIC_UP_WEIGHT_STRIDE_0;
-            float value = up_bias[column * SEISMIC_UP_BIAS_STRIDE_0];
+            const float bias = up_bias[column * SEISMIC_UP_BIAS_STRIDE_0];
+            float w[5];
             for (uint f = 0; f < 5u; ++f)
-                value = metal::fma(weights[f * SEISMIC_UP_WEIGHT_STRIDE_1], normed[f], value);
-            result.put(out + column * SEISMIC_RESULT_0_STRIDE_1, value / (1.0f + metal::exp(-value)));
+                w[f] = weights[f * SEISMIC_UP_WEIGHT_STRIDE_1];
+            const ulong out_col = column * SEISMIC_RESULT_0_STRIDE_1;
+            for (ulong local_rank = 0; local_rank < tile_count; ++local_rank) {
+                threadgroup const float *normed = normed_shared + local_rank * 5ul;
+                float value = bias;
+                for (uint f = 0; f < 5u; ++f)
+                    value = metal::fma(w[f], normed[f], value);
+                result.put(out_base + local_rank * SEISMIC_RESULT_0_STRIDE_0 + out_col,
+                    value / (1.0f + metal::exp(-value)));
+            }
         }
     }
 }

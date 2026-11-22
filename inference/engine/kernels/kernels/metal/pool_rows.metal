@@ -42,73 +42,89 @@ typedef rotary::layout<POOL_W, SEISMIC_DIM_P, (SEISMIC_DIM_RT != 0 ? SEISMIC_DIM
 // The row element Y: A for a history source's rows, F32 for indexer keys.
 typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) Row;
 
-// A row's own u, the lane holding contiguous columns [lane * E, (lane + 1) * E)
-// (`CONTIGUOUS`) or strided columns lane + 32 * k, LayerNorm-ed per token with
-// `weight` and `bias` when TN = 1 (`token_norm`): `row_norm`'s arithmetic over
-// the simdgroup's partials (vec4 on contiguous lanes when E % 4 == 0).
-template <bool CONTIGUOUS>
+// Loads lane's contiguous columns [col_base, col_base + POOL_E) from `base`
+// using 128-bit packed_float4 loads with scalar tail.
+inline void load_f32_lane(thread float (&out)[POOL_E], device const float *base, uint col_base) {
+    constexpr uint VEC = POOL_E & ~3u;
+    POOL_UNROLL
+    for (uint k = 0; k < VEC; k += 4) {
+        const float4 v = float4(*reinterpret_cast<device const packed_float4 *>(base + col_base + k));
+        out[k] = v.x;
+        out[k + 1] = v.y;
+        out[k + 2] = v.z;
+        out[k + 3] = v.w;
+    }
+    POOL_UNROLL
+    for (uint k = VEC; k < POOL_E; ++k)
+        out[k] = base[col_base + k];
+}
+
+// Stores lane's contiguous columns [col_base, col_base + POOL_E) to `target`
+// using 4-wide vector stores when stride == 1, with scalar tail.
+template <typename Elem>
+inline void store_lane(element::Out<Elem> target, uint col_base, ulong stride, thread const float (&values)[POOL_E]) {
+    if (stride == 1ul) {
+        constexpr uint VEC = POOL_E & ~3u;
+        POOL_UNROLL
+        for (uint k = 0; k < VEC; k += 4)
+            target.put4(col_base + k, float4(values[k], values[k + 1], values[k + 2], values[k + 3]));
+        POOL_UNROLL
+        for (uint k = VEC; k < POOL_E; ++k)
+            target.put(col_base + k, values[k]);
+        return;
+    }
+    POOL_UNROLL
+    for (uint k = 0; k < POOL_E; ++k)
+        target.put(ulong(col_base + k) * stride, values[k]);
+}
+
+// A row's own u, the lane holding contiguous columns [lane * E, (lane + 1) * E),
+// LayerNorm-ed per token with `weight` and `bias` when TN = 1 (`token_norm`):
+// `row_norm`'s arithmetic over the simdgroup's partials.
 inline void own_row(thread float (&x)[POOL_E], device const float *u, device const float *weight,
                     device const float *bias, float epsilon, uint lane) {
     const uint base = lane * POOL_E;
-    if constexpr (CONTIGUOUS && (POOL_E % 4 == 0)) {
-        POOL_UNROLL
-        for (uint k = 0; k < POOL_E; k += 4) {
-            const float4 v = float4(*reinterpret_cast<device const packed_float4 *>(u + base + k));
-            x[k] = v.x;
-            x[k + 1] = v.y;
-            x[k + 2] = v.z;
-            x[k + 3] = v.w;
-        }
-    } else {
-        POOL_UNROLL
-        for (uint k = 0; k < POOL_E; ++k)
-            x[k] = u[CONTIGUOUS ? base + k : lane + 32u * k];
-    }
+    load_f32_lane(x, u, base);
     if constexpr (POOL_TOKEN_NORM) {
+        constexpr uint VEC = POOL_E & ~3u;
         float sum = 0.0f;
         POOL_UNROLL
         for (uint k = 0; k < POOL_E; ++k)
             sum += x[k];
         const float mean = row_norm::mean(simd_sum(sum), POOL_W);
-        float squares = 0.0f;
-        if constexpr (CONTIGUOUS && (POOL_E % 4 == 0)) {
-            float4 sq4 = float4(0.0f);
-            POOL_UNROLL
-            for (uint k = 0; k < POOL_E; k += 4) {
-                x[k] -= mean;
-                x[k + 1] -= mean;
-                x[k + 2] -= mean;
-                x[k + 3] -= mean;
-                sq4 = row_norm::square4(float4(x[k], x[k + 1], x[k + 2], x[k + 3]), sq4);
-            }
-            squares = row_norm::sum4(sq4);
-        } else {
-            POOL_UNROLL
-            for (uint k = 0; k < POOL_E; ++k) {
-                x[k] -= mean;
-                squares = row_norm::square(x[k], squares);
-            }
+        float4 sq4 = float4(0.0f);
+        POOL_UNROLL
+        for (uint k = 0; k < VEC; k += 4) {
+            x[k] -= mean;
+            x[k + 1] -= mean;
+            x[k + 2] -= mean;
+            x[k + 3] -= mean;
+            sq4 = row_norm::square4(float4(x[k], x[k + 1], x[k + 2], x[k + 3]), sq4);
+        }
+        float squares = row_norm::sum4(sq4);
+        POOL_UNROLL
+        for (uint k = VEC; k < POOL_E; ++k) {
+            x[k] -= mean;
+            squares = row_norm::square(x[k], squares);
         }
         const float inverse = row_norm::inverse(simd_sum(squares), POOL_W, epsilon);
-        if constexpr (CONTIGUOUS && (POOL_E % 4 == 0)) {
-            POOL_UNROLL
-            for (uint k = 0; k < POOL_E; k += 4) {
-                const float4 w4 = float4(*reinterpret_cast<device const packed_float4 *>(weight + base + k));
-                const float4 b4 = float4(*reinterpret_cast<device const packed_float4 *>(bias + base + k));
-                const float4 y4 =
-                    row_norm::apply4<true, true>(float4(x[k], x[k + 1], x[k + 2], x[k + 3]), inverse, w4, b4);
-                x[k] = y4.x;
-                x[k + 1] = y4.y;
-                x[k + 2] = y4.z;
-                x[k + 3] = y4.w;
-            }
-        } else {
-            POOL_UNROLL
-            for (uint k = 0; k < POOL_E; ++k) {
-                const uint column = CONTIGUOUS ? base + k : lane + 32u * k;
-                x[k] = row_norm::apply<true, true>(x[k], inverse, weight[column], bias[column]);
-            }
+        float w[POOL_E], b[POOL_E];
+        load_f32_lane(w, weight, base);
+        load_f32_lane(b, bias, base);
+        POOL_UNROLL
+        for (uint k = 0; k < VEC; k += 4) {
+            const float4 y4 = row_norm::apply4<true, true>(
+                float4(x[k], x[k + 1], x[k + 2], x[k + 3]), inverse,
+                float4(w[k], w[k + 1], w[k + 2], w[k + 3]),
+                float4(b[k], b[k + 1], b[k + 2], b[k + 3]));
+            x[k] = y4.x;
+            x[k + 1] = y4.y;
+            x[k + 2] = y4.z;
+            x[k + 3] = y4.w;
         }
+        POOL_UNROLL
+        for (uint k = VEC; k < POOL_E; ++k)
+            x[k] = row_norm::apply<true, true>(x[k], inverse, w[k], b[k]);
     }
 }
 
@@ -133,15 +149,14 @@ kernel void pool_rows_append(
     const ulong slab_rows = ulong(SEISMIC_PARAM_WINDOW_SLAB_ROWS);
     constexpr uint width = (POOL_GATED ? 2 : 1) * POOL_W;
     const element::Out<element::F32> target = slab::out_row(window_rows, ulong(destination), slab_rows, width);
+    const uint lane_base = lane * POOL_E;
     float x[POOL_E];
-    pooled::own_row<false>(x, u + row * POOL_W, norm, bias, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane);
-    POOL_UNROLL
-    for (uint k = 0; k < POOL_E; ++k)
-        target.put(lane + 32u * k, x[k]);
+    pooled::own_row(x, u + row * POOL_W, norm, bias, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane);
+    pooled::store_lane(target, lane_base, 1ul, x);
     if (POOL_GATED) {
-        device const float *g_row = g + row * POOL_W;
-        for (uint column = lane; column < POOL_W; column += 32u)
-            target.put(POOL_W + column, g_row[column]);
+        float g_vals[POOL_E];
+        pooled::load_f32_lane(g_vals, g + row * POOL_W, lane_base);
+        pooled::store_lane(target, POOL_W + lane_base, 1ul, g_vals);
     }
     if (lane < 4u)
         slab::row<int>(window_coordinates, ulong(destination), slab_rows, 4)[lane] = coordinates[row * 4 + lane];
@@ -177,21 +192,11 @@ kernel void pool_rows_complete(
     const element::Out<element::F32> published =
         element::Out<element::F32>(latent).offset(row * SEISMIC_RESULT_0_STRIDE_0);
     if (destination < 0) {
-        if constexpr (E % 4 == 0) {
-            if (SEISMIC_RESULT_0_STRIDE_1 == 1) {
-                POOL_UNROLL
-                for (uint i = 0; i < E; i += 4)
-                    published.put4(lane_base + i, float4(0.0f));
-            } else {
-                POOL_UNROLL
-                for (uint i = 0; i < E; ++i)
-                    published.put(ulong(lane_base + i) * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
-            }
-        } else {
-            POOL_UNROLL
-            for (uint i = 0; i < E; ++i)
-                published.put(ulong(lane_base + i) * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
-        }
+        float zeros[E];
+        POOL_UNROLL
+        for (uint i = 0; i < E; ++i)
+            zeros[i] = 0.0f;
+        pooled::store_lane(published, lane_base, SEISMIC_RESULT_0_STRIDE_1, zeros);
         if (lane == 0u)
             latent_rows[row * SEISMIC_RESULT_1_STRIDE_0] = -1;
         if (lane < 4u)
@@ -229,7 +234,7 @@ kernel void pool_rows_complete(
     // The row's own u (normed per token when TN = 1), beside its window
     // members'.
     float own[E];
-    pooled::own_row<true>(own, u + row * W, norm, bias, epsilon, lane);
+    pooled::own_row(own, u + row * W, norm, bias, epsilon, lane);
     // A member's gate scores follow its u in the window; the row's own are
     // g. Each takes its place's term (PR = RATE; none at PR = 0).
     device const float *own_gates = g + row * W;
@@ -243,35 +248,61 @@ kernel void pool_rows_complete(
             x[i] = 0.0f;
         }
         float scores[POOL_RATE][E];
+        POOL_UNROLL
         for (uint member = 0; member < POOL_RATE; ++member) {
             device const float *gates = member + 1 < POOL_RATE ? members[member] + W : own_gates;
-            POOL_UNROLL
-            for (uint i = 0; i < E; ++i) {
-                const float place = member < POOL_PLACES ? position[member * W + lane_base + i] : 0.0f;
-                scores[member][i] = gates[lane_base + i] + place;
-                top[i] = metal::max(top[i], scores[member][i]);
+            pooled::load_f32_lane(scores[member], gates, lane_base);
+            if (member < POOL_PLACES) {
+                float place[E];
+                pooled::load_f32_lane(place, position + member * W, lane_base);
+                POOL_UNROLL
+                for (uint i = 0; i < E; ++i)
+                    scores[member][i] += place[i];
             }
-        }
-        for (uint member = 0; member < POOL_RATE; ++member) {
             POOL_UNROLL
             for (uint i = 0; i < E; ++i)
-                total[i] += metal::precise::exp(scores[member][i] - top[i]);
+                top[i] = metal::max(top[i], scores[member][i]);
         }
+        POOL_UNROLL
         for (uint member = 0; member < POOL_RATE; ++member) {
             POOL_UNROLL
             for (uint i = 0; i < E; ++i) {
-                const float value = member + 1 < POOL_RATE ? members[member][lane_base + i] : own[i];
-                x[i] += metal::precise::exp(scores[member][i] - top[i]) / total[i] * value;
+                const float w = metal::precise::exp(scores[member][i] - top[i]);
+                scores[member][i] = w;
+                total[i] += w;
             }
+        }
+        POOL_UNROLL
+        for (uint member = 0; member < POOL_RATE; ++member) {
+            float val[E];
+            if (member + 1 < POOL_RATE) {
+                pooled::load_f32_lane(val, members[member], lane_base);
+            } else {
+                POOL_UNROLL
+                for (uint i = 0; i < E; ++i)
+                    val[i] = own[i];
+            }
+            POOL_UNROLL
+            for (uint i = 0; i < E; ++i)
+                x[i] += scores[member][i] / total[i] * val[i];
         }
     } else {
         POOL_UNROLL
         for (uint i = 0; i < E; ++i)
             x[i] = 0.0f;
+        POOL_UNROLL
         for (uint member = 0; member < POOL_RATE; ++member) {
-            POOL_UNROLL
-            for (uint i = 0; i < E; ++i)
-                x[i] += member + 1 < POOL_RATE ? members[member][lane_base + i] : own[i];
+            if (member + 1 < POOL_RATE) {
+                float val[E];
+                pooled::load_f32_lane(val, members[member], lane_base);
+                POOL_UNROLL
+                for (uint i = 0; i < E; ++i)
+                    x[i] += val[i];
+            } else {
+                POOL_UNROLL
+                for (uint i = 0; i < E; ++i)
+                    x[i] += own[i];
+            }
         }
         POOL_UNROLL
         for (uint i = 0; i < E; ++i)
@@ -288,21 +319,7 @@ kernel void pool_rows_complete(
         head::rms_norm(x, norm, epsilon, lane);
         rounding::hold_lanes<activation::Act>(x, trained);
     }
-    if constexpr (E % 4 == 0) {
-        if (SEISMIC_RESULT_0_STRIDE_1 == 1) {
-            POOL_UNROLL
-            for (uint i = 0; i < E; i += 4)
-                published.put4(lane_base + i, float4(x[i], x[i + 1], x[i + 2], x[i + 3]));
-        } else {
-            POOL_UNROLL
-            for (uint i = 0; i < E; ++i)
-                published.put(ulong(lane_base + i) * SEISMIC_RESULT_0_STRIDE_1, x[i]);
-        }
-    } else {
-        POOL_UNROLL
-        for (uint i = 0; i < E; ++i)
-            published.put(ulong(lane_base + i) * SEISMIC_RESULT_0_STRIDE_1, x[i]);
-    }
+    pooled::store_lane(published, lane_base, SEISMIC_RESULT_0_STRIDE_1, x);
     if (lane == 0u)
         latent_rows[row * SEISMIC_RESULT_1_STRIDE_0] = destination;
     // Rotated at the group's first token, rounded, stored.
@@ -318,13 +335,5 @@ kernel void pool_rows_complete(
     // hold every value).
     const element::Out<pooled::Row> target =
         slab::out_row(block_rows, ulong(destination), ulong(SEISMIC_PARAM_BLOCK_SLAB_ROWS), W);
-    if constexpr (E % 4 == 0) {
-        POOL_UNROLL
-        for (uint i = 0; i < E; i += 4)
-            target.put4(lane_base + i, float4(x[i], x[i + 1], x[i + 2], x[i + 3]));
-    } else {
-        POOL_UNROLL
-        for (uint i = 0; i < E; ++i)
-            target.put(lane_base + i, x[i]);
-    }
+    pooled::store_lane(target, lane_base, 1ul, x);
 }

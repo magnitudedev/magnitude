@@ -73,34 +73,46 @@ kernel void per_layer_gate_stage(PROJECTION_ARGUMENTS,
         projection::operands<true>::form<256>(source, item, rounded, uint(SEISMIC_DIM_D), maxima, thread_index);
         return;
     }
-    device typename activation_element::storage *row =
-        reinterpret_cast<device typename activation_element::storage *>(rounded) + ulong(item) * SEISMIC_DIM_D;
-    for (uint i = thread_index; i < uint(SEISMIC_DIM_D); i += 256u)
-        row[i] = activation_element::store(hidden[ulong(item) * SEISMIC_HIDDEN_STRIDE_0 + ulong(i) * SEISMIC_HIDDEN_STRIDE_1]);
+    const uint width = uint(SEISMIC_DIM_D);
+    const auto dst = element::out_over_scratch<activation_element>(rounded);
+    const ulong dst_row = ulong(item) * SEISMIC_DIM_D;
+    device const float *src = hidden + ulong(item) * SEISMIC_HIDDEN_STRIDE_0;
+    if (SEISMIC_HIDDEN_STRIDE_1 == 1) {
+        const uint vec_end = width & ~3u;
+        for (uint i = thread_index * 4u; i < vec_end; i += 256u * 4u) {
+            const float4 v = float4(*reinterpret_cast<device const packed_float4 *>(src + i));
+            dst.put4(dst_row + i, v);
+        }
+        for (uint i = vec_end + thread_index; i < width; i += 256u)
+            dst.put(dst_row + i, src[i]);
+        return;
+    }
+    for (uint i = thread_index; i < width; i += 256u)
+        dst.put(dst_row + i, src[ulong(i) * SEISMIC_HIDDEN_STRIDE_1]);
 }
 #endif
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void per_layer_gate_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(ONE, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PAIR
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void per_layer_gate_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV_ROWS
-template <uint MATRIX, uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint MATRIX_FROM, uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void per_layer_gate_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_BATCH
-template <uint MATRIX, uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint MATRIX_FROM, uint BATCH_ROWS, uint BATCH_PARTS>
 kernel void per_layer_gate_batch(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_BATCH;
 }

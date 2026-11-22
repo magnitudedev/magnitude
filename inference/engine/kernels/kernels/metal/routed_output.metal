@@ -46,11 +46,21 @@
     routed::output_project<ROWS, LANES>(expert_product, shared_product, routes, sources, expert_down, tier_down, \
         shared_down, m, first, sg, lane, projected[sg], seismic_words);                                          \
     threadgroup_barrier(mem_flags::mem_threadgroup);                                                             \
-    const uint n = first + tid;                                                                                  \
-    if (tid >= TILE || n >= uint(SEISMIC_DIM_H))                                                                 \
+    const uint c = tid * 4u;                                                                                     \
+    const uint n = first + c;                                                                                    \
+    if (c >= TILE || n >= uint(SEISMIC_DIM_H))                                                                   \
         return;                                                                                                  \
-    routed::output_publish(residual, inject, scores, coefficient, value, m, n,                                   \
-        routed::TileProjections{&projected[0][0], REGION, tid}, routed::Answer{false, 0.0f}, seismic_words);
+    if (c + 4u <= TILE && n + 4u <= uint(SEISMIC_DIM_H)) {                                                       \
+        routed::output_publish4(residual, inject, scores, coefficient, value, m, n,                              \
+            routed::TileProjections{&projected[0][0], REGION, c}, routed::Answer4{false, float4(0.0f)},          \
+            seismic_words);                                                                                      \
+    } else {                                                                                                     \
+        const uint end = metal::min(TILE, uint(SEISMIC_DIM_H) - first);                                          \
+        for (uint i = c; i < end; ++i)                                                                           \
+            routed::output_publish(residual, inject, scores, coefficient, value, m, first + i,                   \
+                routed::TileProjections{&projected[0][0], REGION, i}, routed::Answer{false, 0.0f},               \
+                seismic_words);                                                                                  \
+    }
 
 // The gathered ports: the side-by-side form's, the published projections and
 // the channel tiles' arrival counters.
@@ -61,7 +71,8 @@
 
 // The gathered body (`routed::output_project_gathered`): threadgroup (x, m)'s
 // simdgroups publish their batched projections of tile x; the last of the
-// tile's M threadgroups to arrive joins the tile's channels of every row.
+// tile's M threadgroups to arrive joins the tile's channels of every row,
+// four contiguous channels per thread with a scalar tail.
 #define ROUTED_OUTPUT_GATHERED_BODY                                                                              \
     constexpr uint TILE = routed::output_tile<ROWS, LANES>();                                                    \
     constexpr uint REGION = routed::output_region<ROWS, LANES>();                                                \
@@ -76,13 +87,39 @@
         seismic_words);                                                                                          \
     if (!arrive::last(arrivals + group.x, uint(SEISMIC_DIM_M), &last, tid))                                      \
         return;                                                                                                  \
-    for (uint item = tid; item < uint(SEISMIC_DIM_M) * TILE; item += 32 * SLOTS) {                               \
-        const ulong m = item / TILE;                                                                             \
-        const uint n = first + item % TILE;                                                                      \
-        if (n < H)                                                                                               \
-            routed::output_publish(residual, inject, scores, coefficient, value, m, n,                           \
-                routed::ArrivedProjections<SLOTS, H>{published, m, n}, routed::Answer{false, 0.0f},              \
+    const uint rows = uint(SEISMIC_DIM_M);                                                                       \
+    if ((TILE & 3u) == 0u && TILE != 0u && first + TILE <= H) {                                                  \
+        constexpr uint QUADS = (TILE >= 4u && (TILE & 3u) == 0u) ? (TILE >> 2u) : 1u;                            \
+        for (uint item = tid; item < rows * QUADS; item += 32u * SLOTS) {                                        \
+            const ulong m = item / QUADS;                                                                        \
+            const uint n = first + (item % QUADS) * 4u;                                                          \
+            routed::output_publish4(residual, inject, scores, coefficient, value, m, n,                          \
+                routed::ArrivedProjections<SLOTS, H>{published, m, n}, routed::Answer4{false, float4(0.0f)},     \
                 seismic_words);                                                                                  \
+        }                                                                                                        \
+    } else if (first < H) {                                                                                      \
+        const uint span = metal::min(TILE, H - first);                                                           \
+        const uint quads = span >> 2u;                                                                           \
+        if (quads != 0u) {                                                                                       \
+            for (uint item = tid; item < rows * quads; item += 32u * SLOTS) {                                    \
+                const ulong m = item / quads;                                                                    \
+                const uint n = first + (item - uint(m) * quads) * 4u;                                            \
+                routed::output_publish4(residual, inject, scores, coefficient, value, m, n,                      \
+                    routed::ArrivedProjections<SLOTS, H>{published, m, n},                                       \
+                    routed::Answer4{false, float4(0.0f)}, seismic_words);                                        \
+            }                                                                                                    \
+        }                                                                                                        \
+        const uint tail = span & 3u;                                                                             \
+        if (tail != 0u) {                                                                                        \
+            const uint tail_base = first + (quads << 2u);                                                        \
+            for (uint item = tid; item < rows * tail; item += 32u * SLOTS) {                                     \
+                const ulong m = item / tail;                                                                     \
+                const uint n = tail_base + (item - uint(m) * tail);                                              \
+                routed::output_publish(residual, inject, scores, coefficient, value, m, n,                       \
+                    routed::ArrivedProjections<SLOTS, H>{published, m, n}, routed::Answer{false, 0.0f},          \
+                    seismic_words);                                                                              \
+            }                                                                                                    \
+        }                                                                                                        \
     }
 
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_SUMMED

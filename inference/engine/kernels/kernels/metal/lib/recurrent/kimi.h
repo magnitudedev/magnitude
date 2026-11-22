@@ -22,11 +22,27 @@ struct Decay {
     device const float *time_bias;
     float lower;
 
-    float log_at(ulong row, ulong head, ulong channel, constant ulong *seismic_words) const {
+    float log_at(ulong row, ulong head, ulong channel, float head_rate, constant ulong *seismic_words) const {
         const ulong index = head * SEISMIC_DIM_W + channel;
         const float shifted = activation::Act::load(input[row * SEISMIC_DECAY_STRIDE_0 + index])
             + time_bias[index * SEISMIC_TIME_BIAS_STRIDE_0];
-        return lower / (1.0f + metal::exp(rate[head * SEISMIC_RATE_STRIDE_0] * shifted));
+        return lower / (1.0f + metal::exp(head_rate * shifted));
+    }
+
+    float log_at(ulong row, ulong head, ulong channel, constant ulong *seismic_words) const {
+        return log_at(row, head, channel, rate[head * SEISMIC_RATE_STRIDE_0], seismic_words);
+    }
+
+    float4 log_at4(ulong row, ulong head, ulong channel, float head_rate, constant ulong *seismic_words) const {
+        const ulong index = head * SEISMIC_DIM_W + channel;
+        const float4 decay_in = activation::Act::load4(input + row * SEISMIC_DECAY_STRIDE_0 + index);
+        const ulong bias_stride = SEISMIC_TIME_BIAS_STRIDE_0;
+        const float4 bias = bias_stride == 1
+            ? float4(*reinterpret_cast<device const packed_float4 *>(time_bias + index))
+            : float4(time_bias[index * bias_stride], time_bias[(index + 1) * bias_stride],
+                time_bias[(index + 2) * bias_stride], time_bias[(index + 3) * bias_stride]);
+        const float4 shifted = decay_in + bias;
+        return lower / (1.0f + metal::exp(head_rate * shifted));
     }
 };
 
@@ -48,12 +64,20 @@ struct ChannelGates {
     device const Storage *beta_input;
     Decay decay;
     ulong head;
+    float head_rate;
 
     float at(ulong row, ulong channel, thread float &beta, constant ulong *seismic_words) const {
         if (channel == 0) {
             beta = beta_at(beta_input, row, head, seismic_words);
         }
-        return decay.log_at(row, head, channel, seismic_words);
+        return decay.log_at(row, head, channel, head_rate, seismic_words);
+    }
+
+    float4 at4(ulong row, ulong channel, thread float &beta, constant ulong *seismic_words) const {
+        if (channel == 0) {
+            beta = beta_at(beta_input, row, head, seismic_words);
+        }
+        return decay.log_at4(row, head, channel, head_rate, seismic_words);
     }
 };
 
@@ -63,7 +87,9 @@ struct ChannelRule {
     device const Storage *beta;
     Decay decay;
 
-    ChannelGates gates(ulong head, constant ulong *) const { return ChannelGates{beta, decay, head}; }
+    ChannelGates gates(ulong head, constant ulong *seismic_words) const {
+        return ChannelGates{beta, decay, head, decay.rate[head * SEISMIC_RATE_STRIDE_0]};
+    }
 };
 
 inline ChannelRule channel_rule(device const Storage *beta, device const Storage *decay, device const float *rate,

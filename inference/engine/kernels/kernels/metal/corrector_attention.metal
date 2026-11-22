@@ -1,10 +1,10 @@
 // corrector_attention: one threadgroup of 256 threads (8 simdgroups) per
-// (node, head). Each simdgroup scores a strided set of the block's keys (its
-// 32 lanes split the head's columns of the biased query and key for coalesced
-// loads, then `simd_sum`, plus the head's additive bias) into shared memory;
-// the threadgroup reduces their maximum and softmax denominator, then each
-// thread accumulates whole columns of the weighted biased values, published
-// to A.
+// (node, head). Each active simdgroup caches its slice of the biased query
+// and key bias in per-lane registers (using 128-bit `packed_float4` loads
+// when unit-strided), then scores a strided set of the block's keys into
+// shared memory while tracking its local maximum; the threadgroup reduces
+// their maximum and softmax denominator, then each thread accumulates whole
+// columns of the weighted biased values, published to A.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.h"
 #include "lib/core/reduce.h"
@@ -40,18 +40,109 @@ kernel void corrector_attention(
     device const float *bias_row = bias + head * SEISMIC_BIAS_STRIDE_0 + query_node * SEISMIC_BIAS_STRIDE_1;
     const float scale = 1.0f / metal::sqrt(float(width));
     float local = -INFINITY;
-    for (ulong key = sg; key < nodes; key += CORRECTOR_SIMDGROUPS) {
-        device const float *k =
-            block_rows + key * SEISMIC_QKV_STRIDE_1 + SEISMIC_QKV_STRIDE_2 + head * SEISMIC_QKV_STRIDE_3;
-        float dot = 0.0f;
-        for (ulong c = lane; c < width; c += 32u)
-            dot = metal::fma(query[c * SEISMIC_QKV_STRIDE_4] + query_bias[c * SEISMIC_INPUT_BIAS_STRIDE_2],
-                k[c * SEISMIC_QKV_STRIDE_4] + key_bias[c * SEISMIC_INPUT_BIAS_STRIDE_2], dot);
-        dot = simd_sum(dot);
-        if (lane == 0u) {
-            const float score = dot * scale + bias_row[key * SEISMIC_BIAS_STRIDE_2];
-            scores[key] = score;
-            local = metal::max(local, score);
+    if (ulong(sg) < nodes) {
+        const ulong q_stride = SEISMIC_QKV_STRIDE_4;
+        const ulong b_stride = SEISMIC_INPUT_BIAS_STRIDE_2;
+        if (q_stride == 1ul && b_stride == 1ul) {
+            constexpr uint VEC4_REG_CAP = 4u;
+            constexpr ulong VEC4_COUNT = ulong(SEISMIC_DIM_W) / 4ul;
+            constexpr ulong VEC4_FULL_CHUNKS = (VEC4_COUNT + 31ul) / 32ul;
+            constexpr uint VEC4_CHUNKS =
+                VEC4_FULL_CHUNKS < ulong(VEC4_REG_CAP) ? uint(VEC4_FULL_CHUNKS) : VEC4_REG_CAP;
+            constexpr uint VEC4_ARRAY_LEN = VEC4_CHUNKS > 0u ? VEC4_CHUNKS : 1u;
+            constexpr ulong TAIL_START = VEC4_COUNT * 4ul;
+            constexpr ulong TAIL = ulong(SEISMIC_DIM_W) - TAIL_START;
+
+            float4 q_reg[VEC4_ARRAY_LEN];
+            float4 kb_reg[VEC4_ARRAY_LEN];
+            _Pragma("clang loop unroll(full)")
+            for (uint t = 0u; t < VEC4_CHUNKS; ++t) {
+                const ulong v = ulong(t) * 32ul + ulong(lane);
+                if (v < VEC4_COUNT) {
+                    const ulong c = v * 4ul;
+                    q_reg[t] = float4(*reinterpret_cast<device const packed_float4 *>(query + c)) +
+                               float4(*reinterpret_cast<device const packed_float4 *>(query_bias + c));
+                    kb_reg[t] = float4(*reinterpret_cast<device const packed_float4 *>(key_bias + c));
+                }
+            }
+            float q_tail = 0.0f;
+            float kb_tail = 0.0f;
+            if (TAIL > 0ul && ulong(lane) < TAIL) {
+                const ulong c = TAIL_START + ulong(lane);
+                q_tail = query[c] + query_bias[c];
+                kb_tail = key_bias[c];
+            }
+
+            for (ulong key = sg; key < nodes; key += CORRECTOR_SIMDGROUPS) {
+                device const float *k =
+                    block_rows + key * SEISMIC_QKV_STRIDE_1 + SEISMIC_QKV_STRIDE_2 + head * SEISMIC_QKV_STRIDE_3;
+                float4 dot4 = float4(0.0f);
+                _Pragma("clang loop unroll(full)")
+                for (uint t = 0u; t < VEC4_CHUNKS; ++t) {
+                    const ulong v = ulong(t) * 32ul + ulong(lane);
+                    if (v < VEC4_COUNT) {
+                        const float4 kv =
+                            float4(*reinterpret_cast<device const packed_float4 *>(k + v * 4ul)) + kb_reg[t];
+                        dot4 = metal::fma(q_reg[t], kv, dot4);
+                    }
+                }
+                for (ulong v = ulong(VEC4_CHUNKS) * 32ul + ulong(lane); v < VEC4_COUNT; v += 32ul) {
+                    const ulong c = v * 4ul;
+                    const float4 qv = float4(*reinterpret_cast<device const packed_float4 *>(query + c)) +
+                                      float4(*reinterpret_cast<device const packed_float4 *>(query_bias + c));
+                    const float4 kv = float4(*reinterpret_cast<device const packed_float4 *>(k + c)) +
+                                      float4(*reinterpret_cast<device const packed_float4 *>(key_bias + c));
+                    dot4 = metal::fma(qv, kv, dot4);
+                }
+                float dot = (dot4.x + dot4.y) + (dot4.z + dot4.w);
+                if (TAIL > 0ul && ulong(lane) < TAIL)
+                    dot = metal::fma(q_tail, k[TAIL_START + ulong(lane)] + kb_tail, dot);
+                dot = simd_sum(dot);
+                if (lane == 0u) {
+                    const float score = dot * scale + bias_row[key * SEISMIC_BIAS_STRIDE_2];
+                    scores[key] = score;
+                    local = metal::max(local, score);
+                }
+            }
+        } else {
+            constexpr uint SCALAR_REG_CAP = 16u;
+            constexpr ulong SCALAR_FULL_CHUNKS = (ulong(SEISMIC_DIM_W) + 31ul) / 32ul;
+            constexpr uint SCALAR_CHUNKS =
+                SCALAR_FULL_CHUNKS < ulong(SCALAR_REG_CAP) ? uint(SCALAR_FULL_CHUNKS) : SCALAR_REG_CAP;
+            constexpr uint SCALAR_ARRAY_LEN = SCALAR_CHUNKS > 0u ? SCALAR_CHUNKS : 1u;
+
+            float q_reg[SCALAR_ARRAY_LEN];
+            float kb_reg[SCALAR_ARRAY_LEN];
+            _Pragma("clang loop unroll(full)")
+            for (uint t = 0u; t < SCALAR_CHUNKS; ++t) {
+                const ulong c = ulong(t) * 32ul + ulong(lane);
+                if (c < width) {
+                    q_reg[t] = query[c * q_stride] + query_bias[c * b_stride];
+                    kb_reg[t] = key_bias[c * b_stride];
+                }
+            }
+
+            for (ulong key = sg; key < nodes; key += CORRECTOR_SIMDGROUPS) {
+                device const float *k =
+                    block_rows + key * SEISMIC_QKV_STRIDE_1 + SEISMIC_QKV_STRIDE_2 + head * SEISMIC_QKV_STRIDE_3;
+                float dot = 0.0f;
+                _Pragma("clang loop unroll(full)")
+                for (uint t = 0u; t < SCALAR_CHUNKS; ++t) {
+                    const ulong c = ulong(t) * 32ul + ulong(lane);
+                    if (c < width)
+                        dot = metal::fma(q_reg[t], k[c * q_stride] + kb_reg[t], dot);
+                }
+                for (ulong c = ulong(SCALAR_CHUNKS) * 32ul + ulong(lane); c < width; c += 32ul) {
+                    dot = metal::fma(
+                        query[c * q_stride] + query_bias[c * b_stride], k[c * q_stride] + key_bias[c * b_stride], dot);
+                }
+                dot = simd_sum(dot);
+                if (lane == 0u) {
+                    const float score = dot * scale + bias_row[key * SEISMIC_BIAS_STRIDE_2];
+                    scores[key] = score;
+                    local = metal::max(local, score);
+                }
+            }
         }
     }
     // `group_max`'s barriers also publish every `scores[key]` to the threadgroup.
