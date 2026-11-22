@@ -239,10 +239,19 @@ static void check_cli_path(HMODULE library, HKEY isolated) {
   require_success(configure(directory, L"Installation", TRUE), "repeat removal is harmless");
 
   set_value(isolated, L"Environment", L"Path", installed);
-  require_success(configure(directory, L"Installation", FALSE), "accept pre-existing PATH");
-  check_value(isolated, L"Installation", L"OwnedCliPath", NULL);
-  require_success(configure(directory, L"Installation", TRUE), "preserve unowned PATH");
+  require_success(configure(directory, L"Installation", FALSE), "claim pre-existing CLI PATH without duplicating");
   check_value(isolated, L"Environment", L"Path", installed);
+  check_value(isolated, L"Installation", L"OwnedCliPath", directory);
+  require_success(configure(directory, L"Installation", TRUE), "remove claimed CLI PATH on uninstall");
+  check_value(isolated, L"Environment", L"Path", original);
+  check_value(isolated, L"Installation", L"OwnedCliPath", NULL);
+
+  /* Uninstall removes stale duplicate entries even if an earlier install never wrote OwnedCliPath. */
+  LPCWSTR duplicated = L"C:\\Users\\Fixture User\\Magnitude\\resources;C:\\Tools;C:\\Users\\Fixture User\\Magnitude\\resources\\;C:\\Other";
+  set_value(isolated, L"Environment", L"Path", duplicated);
+  require_success(configure(directory, L"Installation", TRUE), "remove stale unrecorded and duplicate CLI PATH entries");
+  check_value(isolated, L"Environment", L"Path", original);
+  check_value(isolated, L"Installation", L"OwnedCliPath", NULL);
 
   set_value(isolated, L"Environment", L"Path", original);
   require_success(configure(directory, L"Installation", FALSE), "install before external edit");
@@ -251,7 +260,7 @@ static void check_cli_path(HMODULE library, HKEY isolated) {
   check_value(isolated, L"Environment", L"Path", L"C:\\User replacement");
   check_value(isolated, L"Installation", L"OwnedCliPath", NULL);
   require_success(configure(directory, L"MissingInstallation", TRUE), "missing registration needs no cleanup");
-  puts("PASS actual installer DLL: CLI PATH registration, idempotence, and owned-only removal");
+  puts("PASS actual installer DLL: CLI PATH registration, idempotence, pre-existing takeover, and uninstall cleanup");
 }
 
 static void check_cli_launcher(HMODULE library) {

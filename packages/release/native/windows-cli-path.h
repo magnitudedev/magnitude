@@ -17,7 +17,28 @@ static BOOL cli_path_entry_matches(LPCWSTR start, size_t length, LPCWSTR directo
   while (length && (start[length - 1] == L' ' || start[length - 1] == L'\t')) length--;
   if (length >= 2 && start[0] == L'"' && start[length - 1] == L'"') { start++; length -= 2; }
   while (length && (start[length - 1] == L'\\' || start[length - 1] == L'/')) length--;
-  return length == wcslen(directory) && _wcsnicmp(start, directory, length) == 0;
+  size_t directory_length = wcslen(directory);
+  while (directory_length && (directory[directory_length - 1] == L'\\' || directory[directory_length - 1] == L'/')) directory_length--;
+  return length == directory_length && _wcsnicmp(start, directory, length) == 0;
+}
+
+static BOOL cli_path_entry_matches_expanded(
+  LPCWSTR start,
+  size_t length,
+  LPCWSTR directory,
+  WCHAR *scratch,
+  WCHAR *expanded
+) {
+  if (cli_path_entry_matches(start, length, directory)) return TRUE;
+  while (length && (*start == L' ' || *start == L'\t')) { start++; length--; }
+  while (length && (start[length - 1] == L' ' || start[length - 1] == L'\t')) length--;
+  if (length >= 2 && start[0] == L'"' && start[length - 1] == L'"') { start++; length -= 2; }
+  if (!length || length >= CLI_PATH_CAPACITY || !wmemchr(start, L'%', length)) return FALSE;
+  wmemcpy(scratch, start, length);
+  scratch[length] = 0;
+  DWORD needed = ExpandEnvironmentStringsW(scratch, expanded, CLI_PATH_CAPACITY);
+  if (!needed || needed > CLI_PATH_CAPACITY) return FALSE;
+  return cli_path_entry_matches(expanded, wcslen(expanded), directory);
 }
 
 __declspec(dllexport) DWORD WINAPI ConfigureCliPath(LPCWSTR directory, LPCWSTR registration, BOOL remove) {
@@ -31,36 +52,57 @@ __declspec(dllexport) DWORD WINAPI ConfigureCliPath(LPCWSTR directory, LPCWSTR r
   WCHAR *path = calloc(CLI_PATH_CAPACITY, sizeof(WCHAR));
   WCHAR *next = calloc(CLI_PATH_CAPACITY, sizeof(WCHAR));
   WCHAR *owned = calloc(CLI_PATH_CAPACITY, sizeof(WCHAR));
+  WCHAR *scratch = calloc(CLI_PATH_CAPACITY, sizeof(WCHAR));
+  WCHAR *expanded = calloc(CLI_PATH_CAPACITY, sizeof(WCHAR));
   DWORD type = 0;
-  if (!error && (!path || !next || !owned)) error = ERROR_NOT_ENOUGH_MEMORY;
+  BOOL has_owned = FALSE;
+  if (!error && (!path || !next || !owned || !scratch || !expanded)) error = ERROR_NOT_ENOUGH_MEMORY;
   if (!error) error = read_user_path(environment, path, &type);
   if (remove && error == ERROR_FILE_NOT_FOUND) { error = ERROR_SUCCESS; goto done; }
   if (!error && remove) {
     error = read_registration_string(installation, L"OwnedCliPath", owned, CLI_PATH_CAPACITY);
-    if (error == ERROR_FILE_NOT_FOUND) { error = ERROR_SUCCESS; goto done; }
-    if (error) goto done;
-    if (_wcsicmp(owned, directory)) { error = ERROR_INVALID_DATA; goto done; }
+    if (error == ERROR_SUCCESS) {
+      has_owned = TRUE;
+      if (_wcsicmp(owned, directory)) { error = ERROR_INVALID_DATA; goto done; }
+    } else if (error == ERROR_FILE_NOT_FOUND) {
+      /* A pre-existing entry (for instance from a CLI-only install replaced by Desktop)
+       * still points at this application's removed CLI launcher directory, so retire it. */
+      error = ERROR_SUCCESS;
+    } else {
+      goto done;
+    }
   }
   if (error) goto done;
-  const WCHAR *entry = path, *match = NULL, *end = NULL;
+  BOOL matched = FALSE;
+  size_t next_length = 0;
+  BOOL wrote_entry = FALSE;
+  const WCHAR *entry = path;
   for (;;) {
     const WCHAR *separator = wcschr(entry, L';');
     size_t length = separator ? (size_t)(separator - entry) : wcslen(entry);
-    if (cli_path_entry_matches(entry, length, directory)) { match = entry; end = entry + length; break; }
+    if (cli_path_entry_matches_expanded(entry, length, directory, scratch, expanded)) {
+      matched = TRUE;
+    } else if (remove) {
+      if (wrote_entry) next[next_length++] = L';';
+      if (length) { wmemcpy(next + next_length, entry, length); next_length += length; }
+      wrote_entry = TRUE;
+    }
     if (!separator) break;
     entry = separator + 1;
   }
-  if (!remove && match) goto done; /* Do not claim a pre-existing user entry. */
+  next[next_length] = 0;
+  if (!remove && matched) {
+    /* Claim ownership of an existing entry (such as one left by a CLI-only install)
+     * without duplicating it in User PATH, so uninstall cleanly removes it later. */
+    error = RegSetValueExW(installation, L"OwnedCliPath", 0, REG_SZ,
+      (const BYTE *)directory, (DWORD)((wcslen(directory) + 1) * sizeof(WCHAR)));
+    goto done;
+  }
   if (remove) {
-    if (!match) {
-      error = RegDeleteValueW(installation, L"OwnedCliPath");
+    if (!matched) {
+      if (has_owned) error = RegDeleteValueW(installation, L"OwnedCliPath");
       goto done;
     }
-    size_t prefix = (size_t)(match - path);
-    if (*end == L';') end++;
-    else if (prefix) prefix--;
-    wmemcpy(next, path, prefix);
-    wcscpy(next + prefix, end);
   } else {
     if (wcslen(directory) + wcslen(path) + 2 > CLI_PATH_CAPACITY) { error = ERROR_BUFFER_OVERFLOW; goto done; }
     wcscpy(next, directory);
@@ -68,9 +110,12 @@ __declspec(dllexport) DWORD WINAPI ConfigureCliPath(LPCWSTR directory, LPCWSTR r
   }
   error = RegSetValueExW(environment, L"Path", 0, type, (const BYTE *)next, (DWORD)((wcslen(next) + 1) * sizeof(WCHAR)));
   if (error) goto done;
-  if (remove) error = RegDeleteValueW(installation, L"OwnedCliPath");
-  else error = RegSetValueExW(installation, L"OwnedCliPath", 0, REG_SZ,
-    (const BYTE *)directory, (DWORD)((wcslen(directory) + 1) * sizeof(WCHAR)));
+  if (remove) {
+    if (has_owned) error = RegDeleteValueW(installation, L"OwnedCliPath");
+  } else {
+    error = RegSetValueExW(installation, L"OwnedCliPath", 0, REG_SZ,
+      (const BYTE *)directory, (DWORD)((wcslen(directory) + 1) * sizeof(WCHAR)));
+  }
   if (error) {
     /* A failed ownership write must not leave an unowned PATH change. */
     RegSetValueExW(environment, L"Path", 0, type, (const BYTE *)path, (DWORD)((wcslen(path) + 1) * sizeof(WCHAR)));
@@ -80,7 +125,7 @@ __declspec(dllexport) DWORD WINAPI ConfigureCliPath(LPCWSTR directory, LPCWSTR r
       SMTO_ABORTIFHUNG, 2000, &ignored);
   }
 done:
-  free(path); free(next); free(owned);
+  free(path); free(next); free(owned); free(scratch); free(expanded);
   if (installation) RegCloseKey(installation);
   RegCloseKey(environment);
   return error;
