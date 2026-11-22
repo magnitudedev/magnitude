@@ -984,7 +984,8 @@ pub(crate) struct AttentionMix {
     /// ([`history_window`]): its points see no longer history.
     pub window: Option<u64>,
     /// A selected read's indexer: the prefill then reads through its
-    /// WorkList bitmap (`B` words, static), tuned with every block read.
+    /// WorkList bitmap (`B` words, static), tuned at the indexer's `top`
+    /// block density plus each row's tail.
     pub selection: Option<SelectionBinding>,
     /// The index-list source the layers' picks read ([`picked_rows`]):
     /// present exactly when the shape picks rows (`KS > 0`).
@@ -1002,6 +1003,46 @@ impl AttentionMix {
     /// visible row.
     fn block_keys(&self) -> u64 {
         self.selection.map_or(1, |selection| selection.shape.block)
+    }
+
+    /// The prefill's WorkList selection bitmap (`[rows, B]`), matching
+    /// `unit_reads`: a row reads every unit when its complete units are at
+    /// most `top`; otherwise `top` complete units spaced by `complete / top`
+    /// (so consecutive rows in a query tile share their selected blocks) plus
+    /// every unit from its tail (`complete`) on.
+    fn selection_bitmap(&self, row_keys: &[u64]) -> Vec<u32> {
+        let Some(selection) = self.selection else {
+            return Vec::new();
+        };
+        let words = selection.shape.words as usize;
+        if words == 0 {
+            return Vec::new();
+        }
+        let block = selection.shape.block;
+        let top = selection.indexer.top;
+        let total_units = selection.shape.units();
+        let mut bitmap = vec![0u32; row_keys.len() * words];
+        for (&keys, row_words) in row_keys.iter().zip(bitmap.chunks_exact_mut(words)) {
+            let complete = (keys / block).min(total_units);
+            if complete <= top {
+                row_words.fill(u32::MAX);
+                continue;
+            }
+            if top > 0 {
+                let step = complete / top;
+                for pick in 0..top {
+                    let unit = (pick * step) as usize;
+                    row_words[unit / 32] |= 1u32 << (unit % 32);
+                }
+            }
+            if complete < total_units {
+                let first_word = (complete / 32) as usize;
+                let first_bit = (complete % 32) as u32;
+                row_words[first_word] |= u32::MAX << first_bit;
+                row_words[first_word + 1..].fill(u32::MAX);
+            }
+        }
+        bitmap
     }
 }
 
@@ -1221,9 +1262,9 @@ pub(crate) struct AttentionMixCase<H> {
     /// The history row tiles the case's rows see (the affine prefill's
     /// `history_tiles`).
     history_tiles: Tensor,
-    /// The prefill's WorkList bitmap (`[rows, B]`, every block read; none in
-    /// the Visible form) and its blocks' keys (`[0, BR]`, BR 1 in the
-    /// Visible form).
+    /// The prefill's WorkList bitmap (`[rows, B]`, `top` complete blocks plus
+    /// each row's tail; none in the Visible form) and its blocks' keys
+    /// (`[0, BR]`, BR 1 in the Visible form).
     selection: Tensor,
     block_slots: Tensor,
     /// The dense entries' index-list source: each row's picks (`[rows,
@@ -1680,6 +1721,23 @@ impl AttentionMix {
             &tables.row_slots[..rows as usize],
         );
         let plane_rows = self.picked_plane_rows(point);
+        let selection_bits = if self.selection.is_some() {
+            let row_keys = history_tables
+                .visible
+                .iter()
+                .zip(&history_tables.fresh)
+                .map(|(spans, &[fresh_lo, fresh_hi])| {
+                    spans
+                        .iter()
+                        .map(|&[lo, hi]| (hi - lo).max(0) as u64)
+                        .sum::<u64>()
+                        + (fresh_hi - fresh_lo).max(0) as u64
+                })
+                .collect::<Vec<_>>();
+            self.selection_bitmap(&row_keys)
+        } else {
+            Vec::new()
+        };
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
@@ -1766,10 +1824,7 @@ impl AttentionMix {
                             inputs.i32s(&[1, tiles.len() as u64], &tiles)?
                         }
                     },
-                    selection: inputs.u32s(
-                        &[rows, self.words()],
-                        &vec![u32::MAX; (rows * self.words()) as usize],
-                    )?,
+                    selection: inputs.u32s(&[rows, self.words()], &selection_bits)?,
                     block_slots: inputs.i32s(&[0, self.block_keys()], &[])?,
                     selected_rows: inputs.i32s(&[rows, shape.widths.picks], &selected_rows)?,
                     selected: inputs.slab_view(inputs.activation(
@@ -2814,5 +2869,104 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn worklist_selection_bitmap_matches_unit_reads_density() {
+        let mut mix = AttentionMix {
+            codec: magnitude_state::KvCodec::AffineK8V4.spec(seismic::DType::BF16, 128, 128),
+            listing: PrefillListing::Every,
+            activation: Element::bf16(),
+            shape: AttentionShape {
+                form: crate::planning::AttentionForm {
+                    gate: crate::planning::GateSpec::None,
+                    key_value: crate::planning::KeyValueSpec::Fresh {
+                        key: (),
+                        value: crate::planning::ValueSpec::Projected(()),
+                    },
+                    query_norm: true,
+                    key_norm: true,
+                    value_norm: false,
+                    sinks: false,
+                    rotary_adjacent: false,
+                    rotary_trailing: false,
+                    output_rotary: false,
+                    absorbed: None,
+                },
+                key_rounding: crate::RoundingArgs::NONE,
+                widths: crate::planning::AttentionWidths {
+                    hidden: 2048,
+                    kv_heads: 2,
+                    group: 16,
+                    rotary_pairs: 32,
+                    width: 128,
+                    picks: 0,
+                },
+            },
+            scopes: Vec::new(),
+            epsilon: 1.0e-5,
+            window: None,
+            selection: None,
+            picked: None,
+        };
+        assert!(mix.selection_bitmap(&[1024]).is_empty());
+
+        let words = 2049u64;
+        let block = 4u64;
+        let top = 512u64;
+        mix.selection = Some(SelectionBinding {
+            shape: crate::SelectionShape { block, words },
+            keys: crate::SelectionKeysBinding {
+                projection: Element::bf16(),
+                gate: None,
+                place: false,
+                norm: Element::f32(),
+                token_norm: false,
+            },
+            indexer: crate::IndexerBinding {
+                input: magnitude_family_contracts::IndexerInput::Hidden,
+                heads: 4,
+                width: 64,
+                top,
+                query_norm: 0,
+                query: Element::bf16(),
+                head_weights: None,
+                candidates: crate::planning::CandidatesBinding::All,
+                query_rounding: crate::RoundingArgs::NONE,
+                key_rounding: crate::RoundingArgs::NONE,
+            },
+        });
+
+        let row_keys = [
+            top * block,       // dense: complete == top
+            262_144,           // sparse: complete == 65_536, tail in word 2048
+            262_148,           // consecutive row with same complete / top
+            100_000,           // mid-context: complete == 25_000, partial tail word
+        ];
+        let bitmap = mix.selection_bitmap(&row_keys);
+        assert_eq!(bitmap.len(), row_keys.len() * words as usize);
+
+        let is_set = |row: usize, unit: u64| -> bool {
+            (bitmap[row * words as usize + (unit / 32) as usize] >> (unit % 32)) & 1 != 0
+        };
+        let total_units = words * 32;
+
+        // Dense row: every bit set.
+        assert!(bitmap[..words as usize].iter().all(|&word| word == u32::MAX));
+
+        // Sparse rows: exactly `top` bits in 0..complete, and every tail bit >= complete set.
+        for (row, &keys) in row_keys.iter().enumerate().skip(1) {
+            let complete = keys / block;
+            let picked = (0..complete).filter(|&u| is_set(row, u)).count() as u64;
+            assert_eq!(picked, top, "row {row} picked count");
+            assert!(
+                (complete..total_units).all(|u| is_set(row, u)),
+                "row {row} tail bits"
+            );
+        }
+
+        // Consecutive rows with the same complete / top select identical complete units.
+        let shared = (0..row_keys[1] / block).all(|u| is_set(1, u) == is_set(2, u));
+        assert!(shared, "consecutive rows in a tile should share selected blocks");
     }
 }

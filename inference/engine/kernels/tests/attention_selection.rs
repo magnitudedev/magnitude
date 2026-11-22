@@ -24,9 +24,9 @@ fn bitmap(rows: usize, words: usize, seed: u64) -> Vec<u32> {
         .collect()
 }
 
-fn reads(bits: &[u32], words: usize) -> impl Fn(usize, usize) -> bool + '_ {
+fn reads(bits: &[u32], words: usize, block_rows: usize) -> impl Fn(usize, usize) -> bool + '_ {
     move |row, ordinal| {
-        let block = ordinal / BLOCK_ROWS;
+        let block = ordinal / block_rows;
         block / 32 < words && bits[row * words + block / 32] >> (block % 32) & 1 != 0
     }
 }
@@ -120,6 +120,7 @@ fn native(
     case: &Case,
     bits: &[u32],
     words: usize,
+    block_rows: usize,
     stored: bool,
 ) -> Vec<f32> {
     let Geometry { kv, g, p, .. } = case.geometry;
@@ -178,7 +179,7 @@ fn native(
             fresh: &i32_tensor(device, &[m, 2], &case.fresh),
             destinations: &i32_tensor(device, &[m], &case.destinations),
             selection: &selection,
-            block_slots: &block_slots(device, BLOCK_ROWS),
+            block_slots: &block_slots(device, block_rows),
             selected_rows: &selected_rows,
             selected: &selected,
             history_key: &mut history_key,
@@ -283,29 +284,29 @@ fn portable_worklist_prefill_reads_only_selected_blocks() {
     let (_, case) = case();
     let words = 3;
     let bits = bitmap(case.rows, words, 5);
-    let expected = case.expected_reading(&reads(&bits, words)).0;
+    let expected = case.expected_reading(&reads(&bits, words, BLOCK_ROWS)).0;
     check("portable", &portable(&case, &bits, words), &expected);
 }
 
 #[test]
 fn native_worklist_prefill_reads_only_selected_blocks() {
     let (geometry, case) = case();
-    for (words, seed) in [(3usize, 5u64), (1, 7)] {
-        // One word covers 32 blocks: keys past them are not read.
+    for (block_rows, words, seed) in [(BLOCK_ROWS, 3usize, 5u64), (BLOCK_ROWS, 1, 7), (1, 11, 9), (1, 5, 11)] {
+        // Smaller `words` covers fewer blocks: keys past them are not read.
         let bits = bitmap(case.rows, words, seed);
-        let expected = case.expected_reading(&reads(&bits, words)).0;
+        let expected = case.expected_reading(&reads(&bits, words, block_rows)).0;
         for device in devices() {
             for (config, specialization) in specializations(&device, geometry, words) {
-                let actual = native(&device, &specialization, &case, &bits, words, false);
-                check(&format!("{config} words={words}"), &actual, &expected);
+                let actual = native(&device, &specialization, &case, &bits, words, block_rows, false);
+                check(&format!("{config} br={block_rows} words={words}"), &actual, &expected);
             }
         }
         let stored = stored_key(&case);
-        let expected = stored.expected_reading(&reads(&bits, words)).0;
+        let expected = stored.expected_reading(&reads(&bits, words, block_rows)).0;
         for device in devices() {
             for (config, specialization) in stored_key_specializations(&device, geometry, words) {
-                let actual = native(&device, &specialization, &stored, &bits, words, true);
-                check(&format!("{config} words={words}"), &actual, &expected);
+                let actual = native(&device, &specialization, &stored, &bits, words, block_rows, true);
+                check(&format!("{config} br={block_rows} words={words}"), &actual, &expected);
             }
         }
     }

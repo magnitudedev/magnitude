@@ -490,6 +490,11 @@ void prefill_lane_scores(uint scratch, float scale, int first, bool inside, int 
 }
 
 #if !defined(PREFILL_DECODE)
+// Coherent reference for same-launch exchange of `PREFILL_BASES_BUFFER`
+// inside `prefill_list`: `element_i32_put`/`element_i32_at` are non-coherent
+// and cannot be ordered within one dispatch by `memoryBarrierBuffer(); barrier()`.
+layout(buffer_reference, scalar, buffer_reference_align = 4) coherent buffer prefill_coherent_i32 { int v; };
+
 // Whether row `row` reads key `key` of span `index` (bounds from `lo`) under
 // the WorkList: the bit of the key's block; a block past the bitmap is not
 // read.
@@ -504,6 +509,30 @@ bool prefill_reads(uint64_t row, int base, int key, int lo) {
     const uint word = element_u32_at(PREFILL_SELECTION_BUFFER
         + (row * uint64_t(PREFILL_SELECTION_WORDS) + uint64_t(block / 32u)) * 4ul);
     return ((word >> (block % 32u)) & 1u) != 0u;
+}
+
+// Whether row `row` reads any key in [first_key, last_key) of span `index`
+// (bounds from `lo`, at most PREFILL_KEYS = 32 keys, so at most 2 consecutive
+// bitmap words at PREFILL_BLOCK_ROWS >= 1).
+bool prefill_reads_any(uint64_t row, int base, int first_key, int last_key, int lo) {
+    if (!PREFILL_SELECTED)
+        return first_key < last_key;
+    if (first_key >= last_key)
+        return false;
+    const uint b_lo = uint(base + first_key - lo) / uint(PREFILL_BLOCK_ROWS);
+    const uint b_hi = uint(base + (last_key - 1) - lo) / uint(PREFILL_BLOCK_ROWS);
+    const uint w_lo = b_lo / 32u;
+    const uint w_hi = b_hi / 32u;
+    const uint mask0 = ~0u << (b_lo % 32u);
+    const uint mask1 = ~0u >> (31u - (b_hi % 32u));
+    const uint64_t row_words = PREFILL_SELECTION_BUFFER + row * uint64_t(PREFILL_SELECTION_WORDS) * 4ul;
+    if (w_lo == w_hi)
+        return w_lo < uint(PREFILL_SELECTION_WORDS)
+            && (element_u32_at(row_words + uint64_t(w_lo) * 4ul) & (mask0 & mask1)) != 0u;
+    return (w_lo < uint(PREFILL_SELECTION_WORDS)
+               && (element_u32_at(row_words + uint64_t(w_lo) * 4ul) & mask0) != 0u)
+        || (w_hi < uint(PREFILL_SELECTION_WORDS)
+               && (element_u32_at(row_words + uint64_t(w_hi) * 4ul) & mask1) != 0u);
 }
 
 // The least key ordinal at or past `ordinal`, and before `end`, that row `row`
@@ -555,15 +584,15 @@ uint prefill_next_read(uint64_t row, uint ordinal, uint end) {
 // The list launch (PREFILL_SELECTED): workgroup per QT-row query tile, 256
 // invocations. It writes each tile row's span ordinals, then lists, in L2's
 // tile order (each span's union interval in PREFILL_KEYS-key tiles, spans
-// then fresh), the key tiles some row of the tile reads. Shared u32: a flag
-// per invocation, then the running count.
+// then fresh), the key tiles some row of the tile reads. Shared u32: one
+// partial sum per logical subgroup (`reduce_group_exclusive_add`).
 void prefill_list() {
     const uint64_t visible = SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE);
     const uint64_t fresh = SEISMIC_PTR(SEISMIC_BUFFER_FRESH);
     const uint64_t rows = SEISMIC_DIM_M;
     const uint64_t spans = SEISMIC_DIM_R;
     const uint tile = gl_WorkGroupID.x;
-    const uint thread = gl_LocalInvocationIndex;
+    const uint thread = SEISMIC_THREAD;
     const uint threads = gl_WorkGroupSize.x;
     const uint64_t tile_first = uint64_t(tile) * PREFILL_QT;
     if (thread < PREFILL_QT && tile_first + thread < rows) {
@@ -572,14 +601,14 @@ void prefill_list() {
         for (uint64_t index = 0ul; index <= spans; ++index) {
             int lo, hi;
             attention_span(visible, fresh, row, spans, index, lo, hi);
-            element_i32_put(PREFILL_BASES_BUFFER + (row * (spans + 1ul) + index) * 4ul, base);
+            prefill_coherent_i32(PREFILL_BASES_BUFFER + (row * (spans + 1ul) + index) * 4ul).v = base;
             base += max(hi - lo, 0);
         }
     }
-    if (thread == 0u)
-        seismic_shared_u32[threads] = 0u;
+    memoryBarrierBuffer();
     barrier();
     const uint total = prefill_total_tiles(visible, fresh, tile_first, rows, spans);
+    uint listed = 0u;
     for (uint first_candidate = 0u; first_candidate < total; first_candidate += threads) {
         const uint candidate = first_candidate + thread;
         bool read = false;
@@ -602,44 +631,26 @@ void prefill_list() {
                 const uint64_t row = tile_first + i;
                 if (row >= rows)
                     break;
-                // The row's ordinal at the span's start (the bases this
-                // launch writes are read by the attend launch only).
-                int base = 0;
+                const int base = prefill_coherent_i32(
+                    PREFILL_BASES_BUFFER + (row * (spans + 1ul) + uint64_t(entry_span)) * 4ul).v;
                 int lo = 0, hi = 0;
-                for (uint64_t index = 0ul; index < uint64_t(entry_span); ++index) {
-                    attention_span(visible, fresh, row, spans, index, lo, hi);
-                    base += max(hi - lo, 0);
-                }
                 attention_span(visible, fresh, row, spans, uint64_t(entry_span), lo, hi);
                 const int first_key = max(entry_first, lo);
                 const int last_key = min(end, hi);
-                if (first_key >= last_key)
-                    continue;
-                for (int key = first_key; key < last_key && !read; ++key)
-                    read = prefill_reads(row, base, key, lo);
+                read = prefill_reads_any(row, base, first_key, last_key, lo);
             }
         }
-        seismic_shared_u32[thread] = read ? 1u : 0u;
-        barrier();
-        uint offset = seismic_shared_u32[threads];
-        for (uint other = 0u; other < thread; ++other)
-            offset += seismic_shared_u32[other];
+        uint added;
+        const uint offset = listed + reduce_group_exclusive_add(read ? 1u : 0u, 0u, added);
         if (read && offset < PREFILL_LIST_CAPACITY) {
             const uint64_t slot = PREFILL_LISTS_BUFFER + ((uint64_t(tile) * PREFILL_LIST_CAPACITY + offset) * 2ul) * 4ul;
             element_i32_put(slot, entry_span);
             element_i32_put(slot + 4ul, entry_first);
         }
-        barrier();
-        if (thread == 0u) {
-            uint added = 0u;
-            for (uint other = 0u; other < threads; ++other)
-                added += seismic_shared_u32[other];
-            seismic_shared_u32[threads] += added;
-        }
-        barrier();
+        listed += added;
     }
     if (thread == 0u)
-        element_u32_put(PREFILL_LISTED_BUFFER + uint64_t(tile) * 4ul, min(seismic_shared_u32[threads], PREFILL_LIST_CAPACITY));
+        element_u32_put(PREFILL_LISTED_BUFFER + uint64_t(tile) * 4ul, min(listed, PREFILL_LIST_CAPACITY));
 }
 #endif
 
@@ -918,17 +929,22 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
         flash_softmax softmax = flash_softmax_start();
 #ifndef PREFILL_DECODE
         // A WorkList walks its listed key tiles, every key masked per row.
+        uint64_t cached_index = ~0ul;
+        ivec4 interval = ivec4(0);
+        int row_lo = 0, row_hi = 0, row_base = 0;
         for (uint listed = tiles_lo; PREFILL_SELECTED && listed < tiles_hi; ++listed) {
             const uint64_t slot = PREFILL_LISTS_BUFFER + ((uint64_t(tile) * PREFILL_LIST_CAPACITY + listed) * 2ul) * 4ul;
             const uint64_t index = uint64_t(element_i32_at(slot));
             const int first = element_i32_at(slot + 4ul);
-            const ivec4 interval = prefill_interval(visible, fresh, tile_first, rows, spans, index);
-            const bool historical = index < spans;
-            int row_lo = 0, row_hi = 0, row_base = 0;
-            if (valid) {
-                attention_span(visible, fresh, token, spans, index, row_lo, row_hi);
-                row_base = element_i32_at(PREFILL_BASES_BUFFER + (token * (spans + 1ul) + index) * 4ul);
+            if (index != cached_index) {
+                cached_index = index;
+                interval = prefill_interval(visible, fresh, tile_first, rows, spans, index);
+                if (valid) {
+                    attention_span(visible, fresh, token, spans, index, row_lo, row_hi);
+                    row_base = element_i32_at(PREFILL_BASES_BUFFER + (token * (spans + 1ul) + index) * 4ul);
+                }
             }
+            const bool historical = index < spans;
             flash_scores_state scores;
             flash_scores_clear(scores);
             for (uint column = 0u; column < W; column += chunk) {
@@ -941,11 +957,30 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
             flash_scores_publish(scores, scratch);
             float s[16];
             prefill_lane_scores(scratch, row_scale, first, false, row_lo, row_hi, s);
-            const uint lane_half = SEISMIC_LANE / 16u;
-            [[unroll]] for (uint j = 0u; j < 16u; ++j) {
-                const int t = first + int(16u * lane_half + j);
-                if (valid && t >= row_lo && t < row_hi && !prefill_reads(token, row_base, t, row_lo))
-                    s[j] = -ATTENTION_INF;
+            const int t0 = first + int(16u * (SEISMIC_LANE / 16u));
+            const int k_lo = max(t0, row_lo);
+            const int k_hi = min(t0 + 16, row_hi);
+            if (valid && k_lo < k_hi) {
+                const uint b_lo = uint(row_base + k_lo - row_lo) / uint(PREFILL_BLOCK_ROWS);
+                const uint b_hi = uint(row_base + (k_hi - 1) - row_lo) / uint(PREFILL_BLOCK_ROWS);
+                const uint w_lo = b_lo / 32u;
+                const uint w_hi = b_hi / 32u;
+                const uint64_t row_words = PREFILL_SELECTION_BUFFER + token * uint64_t(PREFILL_SELECTION_WORDS) * 4ul;
+                const uint word0 = w_lo < uint(PREFILL_SELECTION_WORDS)
+                    ? element_u32_at(row_words + uint64_t(w_lo) * 4ul)
+                    : 0u;
+                const uint word1 = (w_hi != w_lo && w_hi < uint(PREFILL_SELECTION_WORDS))
+                    ? element_u32_at(row_words + uint64_t(w_hi) * 4ul)
+                    : 0u;
+                [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+                    const int t = t0 + int(j);
+                    if (t >= k_lo && t < k_hi) {
+                        const uint block = uint(row_base + t - row_lo) / uint(PREFILL_BLOCK_ROWS);
+                        const uint word = (block / 32u == w_lo) ? word0 : word1;
+                        if (((word >> (block % 32u)) & 1u) == 0u)
+                            s[j] = -ATTENTION_INF;
+                    }
+                }
             }
             const float alpha = flash_online(softmax, s);
             const uint p_half = flash_publish_probabilities(scratch, s);

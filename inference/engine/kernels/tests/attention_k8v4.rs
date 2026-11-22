@@ -4651,3 +4651,150 @@ fn cpu_decode_matches_host_model_at_every_partition_fill() {
         );
     }
 }
+
+/// Regression check for the Vulkan `attention_prefill_k8v4` WorkList shape
+/// (`M = 5120, B = 2049, BR = 4`, `parts = 1`) at realistic `top = 512`
+/// density: completes cleanly without tripping the GPU watchdog.
+#[test]
+fn vulkan_worklist_prefill_k8v4_large_context_completes() {
+    let Some(device) = seismic_native_tests::devices(&[BackendName::Vulkan]).into_iter().next() else {
+        return;
+    };
+    let geometry = Geometry { kv: 2, g: 4, p: 32, s: 64 };
+    let (m, context, words, block_rows, top) = (5120usize, 262_144usize, 2049usize, 4usize, 512usize);
+    let total_rows = context + m;
+    let w = geometry.w();
+    let kc = w * KEY_BITS as usize / 32;
+    let vc = w * VALUE_BITS as usize / 32;
+    let kp = coefficient_elements(w);
+    let vp = coefficient_elements(w);
+
+    let spec = specialization_on(&device, geometry, &[("ROWS", 64), ("SPLIT_GROUPS", 256)])
+        .with_static("B", words as u64)
+        .with_static("L", 0);
+    let kernel = declared::prepared(
+        &device,
+        &attention_prefill_k8v4::native_entry_with(attention_prefill_k8v4::Elements { A: Element::bf16() }),
+        &spec,
+    )
+    .unwrap();
+
+    let charges = seismic::Charges::tally(&device);
+    let bf16_zero = |shape: &[usize]| -> Tensor {
+        let count: usize = shape.iter().product();
+        Tensor::from_host(
+            &charges,
+            Element::bf16(),
+            &shape.iter().map(|&d| d as u64).collect::<Vec<_>>(),
+            &vec![0u8; count * 2],
+        )
+        .unwrap()
+    };
+    let f32_ones = |shape: &[usize]| -> Tensor {
+        let count: usize = shape.iter().product();
+        let bytes = 1.0f32.to_le_bytes();
+        let mut data = Vec::with_capacity(count * 4);
+        for _ in 0..count {
+            data.extend_from_slice(&bytes);
+        }
+        Tensor::from_host(
+            &charges,
+            Element::f32(),
+            &shape.iter().map(|&d| d as u64).collect::<Vec<_>>(),
+            &data,
+        )
+        .unwrap()
+    };
+
+    let visible: Vec<i32> = (0..m).flat_map(|_| [0i32, context as i32]).collect();
+    let fresh: Vec<i32> = (0..m).flat_map(|r| [0i32, (r + 1) as i32]).collect();
+    let destinations: Vec<i32> = (0..m).map(|r| (context + r) as i32).collect();
+    let coordinates: Vec<i32> = (0..m).flat_map(|r| [(context + r) as i32, 0, 0, 0]).collect();
+    let components: Vec<i32> = (0..geometry.p).map(|_| 0i32).collect();
+    let frequencies: Vec<f32> = (0..geometry.p).map(|_| 0.0f32).collect();
+
+    let total_units = words * 32;
+    let mut selection_bits = vec![0u32; m * words];
+    for (r, row_words) in selection_bits.chunks_exact_mut(words).enumerate() {
+        let complete = ((context + r + 1) / block_rows).min(total_units);
+        let step = complete / top;
+        for pick in 0..top {
+            let unit = pick * step;
+            row_words[unit / 32] |= 1u32 << (unit % 32);
+        }
+        if complete < total_units {
+            let first_word = complete / 32;
+            let first_bit = (complete % 32) as u32;
+            row_words[first_word] |= u32::MAX << first_bit;
+            row_words[first_word + 1..].fill(u32::MAX);
+        }
+    }
+    let selection = Tensor::from_host(
+        &charges,
+        Element::u32(),
+        &[m as u64, words as u64],
+        &selection_bits.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    let slab = |element: Element, cols: usize| {
+        let slabs = crate::common::slab_tensor(
+            &device,
+            total_rows as u64,
+            total_rows as u64,
+            &vec![SlabRegion { element, row_shape: vec![geometry.kv as u64, cols as u64] }],
+        );
+        slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
+        let logical = slabs.logical_region(0).unwrap();
+        (slabs, logical)
+    };
+    let (_kc_slabs, mut key_codes) = slab(Element::u32(), kc);
+    let (_kp_slabs, mut key_coefficients) = slab(Element::f16(), kp);
+    let (_vc_slabs, mut value_codes) = slab(Element::u32(), vc);
+    let (_vp_slabs, mut value_coefficients) = slab(Element::f16(), vp);
+
+    let start = std::time::Instant::now();
+    let gated = kernel
+        .call(
+            &charges,
+            attention_prefill_k8v4::Args {
+                query: &bf16_zero(&[m, geometry.kv * geometry.g, 2 * w]),
+                gate: &bf16_zero(&[m, geometry.kv * geometry.g, 0]),
+                key: &bf16_zero(&[1, m, geometry.kv * w]),
+                value: &bf16_zero(&[1, m, geometry.kv * w]),
+                query_norm: &f32_ones(&[1, w]),
+                key_norm: &f32_ones(&[1, w]),
+                value_norm: &f32_tensor(&device, &[0, w], &[]),
+                sinks: &f32_tensor(&device, &[0, geometry.kv * geometry.g], &[]),
+                rotary_components: &i32_tensor(&device, &[geometry.p], &components),
+                rotary_frequencies: &f32_tensor(&device, &[geometry.p], &frequencies),
+                rotary_amplitudes: &f32_ones(&[geometry.p]),
+                coordinates: &i32_tensor(&device, &[m, 4], &coordinates),
+                visible: &i32_tensor(&device, &[m, 1, 2], &visible),
+                fresh: &i32_tensor(&device, &[m, 2], &fresh),
+                destinations: &i32_tensor(&device, &[m], &destinations),
+                selection: &selection,
+                block_slots: &block_slots(&device, block_rows),
+                history_tiles: &i32_tensor(&device, &[0, 1], &[]),
+                history_key_codes: &mut key_codes,
+                history_key_coefficients: &mut key_coefficients,
+                history_value_codes: &mut value_codes,
+                history_value_coefficients: &mut value_coefficients,
+                form: &Tensor::from_host(&charges, Element::i32(), &[0, 0, 0, 0, 0], &[]).unwrap(),
+                epsilon: 1.0e-5,
+                scale: 1.0 / (w as f32).sqrt(),
+                gate_function: 0,
+                slab_rows: total_rows as u32,
+            },
+        )
+        .unwrap()
+        .value;
+    let elapsed = start.elapsed();
+    let values = bf16_values(&gated);
+    assert_eq!(values.len(), m * geometry.kv * geometry.g * w);
+    assert!(
+        values.iter().all(|v| v.is_finite()),
+        "large WorkList prefill produced non-finite values in {elapsed:?}"
+    );
+    eprintln!("vulkan_worklist_prefill_k8v4_large_context_completes: M={m} B={words} BR={block_rows} top={top} finished in {elapsed:?}");
+}
