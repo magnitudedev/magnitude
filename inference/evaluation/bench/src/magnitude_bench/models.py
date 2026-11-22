@@ -70,6 +70,12 @@ class Acquisition(Record):
     target_sha256: str
     drafter: Drafter | None
     projector: Projector | None
+    target_files: tuple[Path, ...] | None = None
+
+    @property
+    def target_shards(self) -> tuple[Path, ...]:
+        """All target GGUF shard paths in shard order (always non-empty)."""
+        return self.target_files if self.target_files else (self.target,)
 
     @property
     def embedded_drafter(self) -> bool:

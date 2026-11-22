@@ -36,6 +36,8 @@ pub struct AcquiredDrafter {
 pub struct AcquiredCatalogModel {
     /// The primary weights GGUF (its first shard when sharded).
     pub target: AcquiredFile,
+    /// All target weights GGUF files in shard order (always non-empty; first is `target`).
+    pub target_files: Vec<AcquiredFile>,
     pub drafter: Option<AcquiredDrafter>,
     pub projector: Option<AcquiredFile>,
 }
@@ -58,7 +60,14 @@ impl ManagedModelStore {
             Some(draft) => Some(self.acquire_package(draft, &progress).await?),
             None => None,
         };
-        let target_file = acquired(&target_snapshot, primary_weights(target)?);
+        let target_files: Vec<AcquiredFile> = target
+            .ordered_weights()
+            .into_iter()
+            .map(|file| acquired(&target_snapshot, file))
+            .collect();
+        let target_file = target_files.first().cloned().ok_or_else(|| {
+            InventoryError::Integrity(format!("package {} has no weights", target.id.0))
+        })?;
         let projector = target
             .files
             .iter()
@@ -77,6 +86,7 @@ impl ManagedModelStore {
         };
         Ok(AcquiredCatalogModel {
             target: target_file,
+            target_files,
             drafter,
             projector,
         })

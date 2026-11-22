@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 struct Options {
-    target: PathBuf,
+    target_shards: Vec<PathBuf>,
     projector: ProjectorSelection,
     draft: Option<PathBuf>,
     host: String,
@@ -101,7 +101,7 @@ where
 
 fn parse() -> Result<Options, String> {
     let defaults = ModelPolicy::default();
-    let mut target = None;
+    let mut target_shards = Vec::new();
     let mut projector = ProjectorSelection::Discover;
     let mut draft = None;
     let mut host = "127.0.0.1".to_owned();
@@ -125,7 +125,7 @@ fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--model" => target = Some(PathBuf::from(value(&flag, &mut args)?)),
+            "--model" => target_shards.push(PathBuf::from(value(&flag, &mut args)?)),
             "--projector" => {
                 projector = ProjectorSelection::Explicit(PathBuf::from(value(&flag, &mut args)?))
             }
@@ -185,10 +185,12 @@ fn parse() -> Result<Options, String> {
             other => return Err(format!("unknown flag: {other} (try --help)")),
         }
     }
-    let target = target.ok_or("--model is required")?;
+    if target_shards.is_empty() {
+        return Err("--model is required".into());
+    }
     let served_model = match served_model {
         Some(name) => name,
-        None => target
+        None => target_shards[0]
             .file_stem()
             .map(|name| name.to_string_lossy().into_owned())
             .ok_or("--served-model is required when the model path has no file name")?,
@@ -197,7 +199,7 @@ fn parse() -> Result<Options, String> {
         return Err("context, output capacity, and prefill tokens must be positive".into());
     }
     Ok(Options {
-        target,
+        target_shards,
         projector,
         draft,
         host,
@@ -356,7 +358,11 @@ fn run() -> Result<(), String> {
     };
     let release = ReleaseRate::of_machine(options.kernel_cache.as_deref().zip(topology.as_deref()));
     let mut resolved = EngineConfiguration {
-        package: PackageOptions::single(options.target, options.projector, options.draft),
+        package: PackageOptions {
+            target_shards: options.target_shards,
+            projector: options.projector,
+            draft: options.draft,
+        },
         model: ModelPolicy {
             draft_policy: options.draft_policy,
             method: options.method,

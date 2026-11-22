@@ -1530,4 +1530,28 @@ def test_a_header_export_names_a_models_components_by_its_whole_reference(tmp_pa
     assert ask("m:gguf:q4") == 0
     artifacts = json.loads(output.read_text())
     assert Path(artifacts["target"]).name == "q4.gguf" and Path(artifacts["drafter"]["path"]).name == "draft.gguf"
+    assert [Path(p).name for p in artifacts["target_files"]] == ["q4.gguf"]
     assert ask("m:gguf:q6") == 1
+
+
+def test_a_header_export_preserves_multi_shard_and_engram_target_files(tmp_path):
+    from magnitude_rig.host.__main__ import _header_artifacts
+    file = {"repository": "owner/repo", "revision": "r"}
+    (tmp_path / "index.json").write_text(json.dumps({"components": [
+        {
+            "model": "deepseek-v4.1-flash:gguf:iq2-xxs",
+            "role": "target",
+            "shards": ["DS-00001-of-00002.gguf", "DS-Engram-IQ4_NL.gguf"],
+            **file,
+        },
+    ]}))
+    output = tmp_path / "artifacts.json"
+    assert _header_artifacts(argparse.Namespace(
+        export=tmp_path, model="deepseek-v4.1-flash:gguf:iq2-xxs", output=output,
+    )) == 0
+    artifacts = json.loads(output.read_text())
+    assert Path(artifacts["target"]).name == "DS-00001-of-00002.gguf"
+    assert [Path(p).name for p in artifacts["target_files"]] == [
+        "DS-00001-of-00002.gguf",
+        "DS-Engram-IQ4_NL.gguf",
+    ]

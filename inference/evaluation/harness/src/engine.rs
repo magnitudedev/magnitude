@@ -104,7 +104,11 @@ pub fn configuration(
     };
     let release = ReleaseRate::of_machine(options.cache_dir.as_deref().zip(topology.as_deref()));
     let mut resolved = EngineConfiguration {
-        package: PackageOptions::single(artifacts.target.clone(), ProjectorSelection::Disabled, draft),
+        package: PackageOptions {
+            target_shards: artifacts.target_shards(),
+            projector: ProjectorSelection::Disabled,
+            draft,
+        },
         model: ModelPolicy {
             draft_policy: None,
             method: load.method,

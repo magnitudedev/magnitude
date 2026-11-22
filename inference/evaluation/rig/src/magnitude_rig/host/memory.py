@@ -766,11 +766,11 @@ def main():
     if options.fit:
         fit_loads([load for path in options.fit for load in json.loads(Path(path).read_text())])
         return
-    models = list(options.models)
+    models = [(None, paths, [paths.split(",")[0]]) for paths in options.models]
     if options.artifacts:
         acquired = json.loads(Path(options.artifacts).read_text())
-        models.append(",".join([acquired["target"], (acquired.get("projector") or {}).get("path", ""),
-                                (acquired.get("drafter") or {}).get("path", "")]).rstrip(","))
+        target_files = acquired.get("target_files") or [acquired["target"]]
+        models.append((options.artifacts, acquired["target"], target_files))
     scratch = Path(options.scratch)
     scratch.mkdir(parents=True, exist_ok=True)
     (device_costs if options.memory == "dedicated" and not options.pressure_store else host_costs)(options, models, scratch)
@@ -782,8 +782,8 @@ def host_costs(options, models, scratch):
     what it would have tested is untested. So does every check that failed: expert pages in the
     file cache, and the forced-pressure gate (`report_pressure`)."""
     results, failed, failures = [], [], []
-    for index, paths in enumerate(models):
-        target = paths.split(",")[0]
+    for index, (_artifacts, _paths, target_files) in enumerate(models):
+        target = target_files[0]
         name = Path(target).stem
         cap = ("--weight-cap", str(options.weight_cap)) if options.weight_cap else ()
         context = ("--context", str(options.context)) if options.context else ()
@@ -804,7 +804,7 @@ def host_costs(options, models, scratch):
                     if options.pressure_store else ())
         kernels = ("--cache-dir", options.kernels) if options.kernels else ()
         load = subprocess.run([exe(options.bin, "magnitude-harness"), "memory", "--device", options.backend,
-                               *cap, *context, *decode, *pressure, *kernels, target],
+                               *cap, *context, *decode, *pressure, *kernels, *target_files],
                               capture_output=True, text=True, check=False)  # a failure is reported below
         log.write_text(load.stderr)
         found = moments((None, line) for line in load.stderr.splitlines())
@@ -843,7 +843,7 @@ def host_costs(options, models, scratch):
             same = ("--template", decode[1], "--decode-tokens", str(len(charge["decoded_tokens"])),
                     "--decode-prompt-tokens", str(charge["decode_prompt_tokens"]))
             resident = subprocess.run([exe(options.bin, "magnitude-harness"), "memory", "--device", options.backend,
-                                       *same, *kernels, target],
+                                       *same, *kernels, *target_files],
                                       capture_output=True, text=True, check=False)  # a failure is reported below
             (scratch / f"{index}-{name}-resident.log").write_text(resident.stderr)
             if resident.returncode != 0:
@@ -955,10 +955,11 @@ def device_costs(options, models, scratch):
     """Each model's load on a dedicated GPU: what the device lost, split by term."""
     cache = str(scratch / "kernel-cache")
     results = []
-    for index, paths in enumerate(models):
-        name = Path(paths.split(",")[0]).stem
+    for index, (artifacts_path, paths, target_files) in enumerate(models):
+        name = Path(target_files[0]).stem
+        model_args = ("--artifacts", artifacts_path) if artifacts_path else (paths,)
         assess = subprocess.run([exe(options.bin, "magnitude-assess"), "--device", options.backend,
-                                 "--kernels", cache, "--breakdown", paths],
+                                 "--kernels", cache, "--breakdown", *model_args],
                                 capture_output=True, text=True, check=False)  # a failure is reported below
         breakdown = [json.loads(l.split(": memory ", 1)[1]) for l in assess.stderr.splitlines() if ": memory {" in l]
         verdict = json.loads(assess.stdout.splitlines()[0]) if assess.stdout.strip() else {}

@@ -23,19 +23,13 @@ from . import Answer, Instrument, JobResult, Plan
 from .held import CHECKPOINT
 from .binaries import ASSESS, ASSESS_BUILD
 
-RUNNER = (
-    "import json, os, sys; a = json.load(open(sys.argv[1])); "
-    "paths = a['target'] + (',,' + a['drafter']['path'] if a.get('drafter') else ''); "
-    "os.execv(sys.argv[2], [sys.argv[2], '--device', sys.argv[3], '--kernels', sys.argv[4], *sys.argv[5:], paths])"
-)
-
-
 def measurement(backend: str) -> Step:
     """The product's measurement job, for its own time (the engine's `MEASUREMENT_SECONDS`), which
     a capped load prices its lines from: a fresh checkout's cost points take 7.5 s on Metal, 9.1 s
     on GB10 and 8.7 s on a 3090 (2026-10-28), later runs load what is stored, and whatever is still
     not measured is shown with the answer."""
-    return Step("measure", ("{python}", "-c", RUNNER, "{artifacts}", ASSESS, backend, "{engine_cache}/kernels"))
+    return Step("measure", (ASSESS, "--device", backend, "--kernels", "{engine_cache}/kernels",
+                            "--artifacts", "{artifacts}"))
 
 
 def preceded(jobs: tuple[tuple[str, Step], ...], streams: bool, backend: str) -> tuple[tuple[str, Step], ...]:
@@ -91,7 +85,8 @@ def plan(arguments, source, host) -> Plan:
     extra = (*(("--depths", arguments.depths) if arguments.depths else ()),
              *(("--breakdown",) if arguments.breakdown else ()))
     job = Step("assess", (
-        "{python}", "-c", RUNNER, "{artifacts}", ASSESS, arguments.backend, "{engine_cache}/kernels", *extra,
+        ASSESS, "--device", arguments.backend, "--kernels", "{engine_cache}/kernels",
+        *extra, "--artifacts", "{artifacts}",
     ))  # fmt: skip
     return Plan(
         builds=BUILDS,

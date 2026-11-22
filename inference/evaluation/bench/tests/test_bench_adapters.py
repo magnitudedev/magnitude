@@ -352,3 +352,15 @@ def test_explicit_mtp_keeps_its_separate_catalog_head(artifact_path, tmp_path, a
     # An override away from a DFlash catalog entry uses the embedded MTP head.
     argv = make("magnitude", artifact_path, tmp_path, acquisition, options).argv(1234, 8192, 1, tmp_path)
     assert "--draft" not in argv
+
+
+def test_magnitude_passes_all_target_files_including_engram_shards(artifact_path, tmp_path, acquisition):
+    engram = tmp_path / "DeepSeek-Engram-IQ4_NL.gguf"
+    engram.write_bytes(b"engram")
+    sharded = acquisition.model_copy(
+        update={"target": artifact_path, "target_files": (artifact_path, engram)}
+    )
+    assert sharded.target_shards == (artifact_path, engram)
+    argv = make("magnitude", artifact_path, tmp_path, sharded).argv(1234, 8192, 1, tmp_path)
+    models = [argv[i + 1] for i, token in enumerate(argv) if token == "--model"]
+    assert models == [str(artifact_path), str(engram)]

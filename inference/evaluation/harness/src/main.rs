@@ -191,8 +191,9 @@ enum Command {
         /// Explicitly approved complete numerical computations (JSON).
         #[arg(long, value_name = "FILE")]
         numerical_profile: Option<PathBuf>,
-        /// The target model file.
-        target: PathBuf,
+        /// The target model file(s), in shard order.
+        #[arg(required = true)]
+        target: Vec<PathBuf>,
     },
     /// Another process's memory: what `memory --pressure-store` starts
     /// beside a load to take what its store gives past its guarantee.
@@ -307,11 +308,11 @@ struct RunArgs {
 
 /// The model's host artifacts, opened for rendering as the target serves.
 fn host(artifacts: &ArtifactsFile) -> Result<HostArtifacts, String> {
-    HostArtifacts::open(&PackageOptions::single(
-        artifacts.artifacts.target.clone(),
-        ProjectorSelection::Disabled,
-        None,
-    ))
+    HostArtifacts::open(&PackageOptions {
+        target_shards: artifacts.artifacts.target_shards(),
+        projector: ProjectorSelection::Disabled,
+        draft: None,
+    })
     .map_err(|error| error.to_string())
 }
 

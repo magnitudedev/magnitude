@@ -73,8 +73,8 @@ def acquire(directory: str, output: str) -> dict:
     `target_sha256` that file's SHA-256, as a catalog acquisition's is, so the target's own provenance record
     (`identity.recorded_sha256`) tells whether it is a slice; the set's identity is in its model name."""
     model, digest, paths = model_of(directory)
-    artifacts = {"model": model, "target": paths[0], "target_sha256": remembered_sha256(paths[0]), "drafter": None,
-                 "projector": None}
+    artifacts = {"model": model, "target": paths[0], "target_files": paths,
+                 "target_sha256": remembered_sha256(paths[0]), "drafter": None, "projector": None}
     with open(output, "w") as file:
         json.dump(artifacts, file)
     print("checkpoint %s: %d shards, sha256 %s" % (directory, len(paths), digest), flush=True)

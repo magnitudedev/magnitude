@@ -157,19 +157,21 @@ def _header_artifacts(arguments) -> int:
     def component(role):
         for entry in index["components"]:
             if entry["model"] == arguments.model and entry["role"] == role:
-                return str(export / entry["repository"] / entry["revision"] / entry["path"])
+                shards = entry.get("shards") or [entry["path"]]
+                return [str(export / entry["repository"] / entry["revision"] / shard) for shard in shards]
         return None
 
-    target = component("target")
-    if target is None:
+    target_files = component("target")
+    if not target_files:
         sys.stderr.write("the header export has no target %s\n" % arguments.model)
         return 1
     draft = component("draft")
     artifacts = {
         "model": arguments.model,
-        "target": target,
+        "target": target_files[0],
+        "target_files": target_files,
         "target_sha256": "headers-only",
-        "drafter": {"path": draft} if draft else None,
+        "drafter": {"path": draft[0]} if draft else None,
         "projector": None,
     }
     trace.atomic(Path(arguments.output), artifacts)

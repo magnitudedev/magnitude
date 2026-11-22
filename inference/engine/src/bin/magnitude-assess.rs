@@ -197,6 +197,51 @@ fn parse() -> Result<Options, String> {
                         .map_err(|error| format!("--context: {error}"))?,
                 )
             }
+            "--artifacts" => {
+                let path = PathBuf::from(value(&argument, &mut args)?);
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|error| format!("--artifacts {}: {error}", path.display()))?;
+                let raw: Value = serde_json::from_str(&text)
+                    .map_err(|error| format!("--artifacts {}: {error}", path.display()))?;
+                let target_shards = raw
+                    .get("target_files")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| {
+                                item.as_str()
+                                    .map(PathBuf::from)
+                                    .ok_or_else(|| format!("--artifacts {}: target_files entry must be a string", path.display()))
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?
+                    .filter(|files| !files.is_empty())
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        raw.get("target")
+                            .and_then(Value::as_str)
+                            .map(|target| vec![PathBuf::from(target)])
+                            .ok_or_else(|| format!("--artifacts {}: missing target", path.display()))
+                    })?;
+                let projector = raw
+                    .get("projector")
+                    .and_then(|value| value.get("path"))
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from);
+                let draft = raw
+                    .get("drafter")
+                    .and_then(|value| value.get("path"))
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from);
+                models.push(ModelPackagePaths {
+                    target_shards,
+                    projector,
+                    draft,
+                    method: ModelMethod::Auto,
+                });
+            }
             JOB_ONLY => job = Some((job_executor(&argument, &mut args)?, Job::Machine)),
             #[cfg(feature = "machine-line")]
             LINE_JOB_ONLY => job = Some((job_executor(&argument, &mut args)?, Job::Line)),

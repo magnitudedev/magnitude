@@ -62,7 +62,7 @@ pub fn backend(name: &str) -> Result<BackendName, String> {
 /// What one load is.
 pub struct Load {
     pub backend: BackendName,
-    pub target: PathBuf,
+    pub target: Vec<PathBuf>,
     /// The kernel cache the load prepares from, as a served load's.
     pub kernel_cache: Option<PathBuf>,
     /// The computations the load approves beyond the defaults.
@@ -261,7 +261,7 @@ pub fn load(load: Load) -> Result<(), String> {
     println!(
         "{}",
         json!({
-            "model": target.display().to_string(),
+            "model": target.first().map(|path| path.display().to_string()).unwrap_or_default(),
             "backend": backend.as_str(),
             "weight_cap": weight_cap,
             "context": context,
@@ -368,7 +368,7 @@ struct Planned {
 /// weights under `weight_cap` when given, its kernels from `kernel_cache`.
 fn plan(
     backend: BackendName,
-    target: &std::path::Path,
+    target: &[PathBuf],
     kernel_cache: Option<PathBuf>,
     numerical_profile: Option<magnitude_executor::NumericalProfile>,
     context_tokens: Option<usize>,
@@ -394,7 +394,7 @@ fn plan(
 /// its drafter or projector, at `context_tokens` or its declared context, on
 /// `device`, its kernels from `kernel_cache`.
 fn configured(
-    target: &std::path::Path,
+    target: &[PathBuf],
     policy: ModelPolicy,
     context_tokens: Option<usize>,
     device: DeviceRequest,
@@ -402,7 +402,11 @@ fn configured(
     release: ReleaseRate,
 ) -> Result<ResolvedEngineConfiguration, String> {
     EngineConfiguration {
-        package: PackageOptions::single(target.to_path_buf(), ProjectorSelection::Disabled, None),
+        package: PackageOptions {
+            target_shards: target.to_vec(),
+            projector: ProjectorSelection::Disabled,
+            draft: None,
+        },
         model: policy,
         context_tokens,
         service: standard_service_limits(),

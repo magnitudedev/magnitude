@@ -514,27 +514,37 @@ mod schema {
             })
         }
 
+        /// The package's weights files in shard order (shard 1 first, ascending by shard index,
+        /// then path for unindexed files).
+        #[must_use]
+        pub fn ordered_weights(&self) -> Vec<&ModelFile> {
+            let mut weights: Vec<&ModelFile> = self
+                .files
+                .iter()
+                .filter(|file| file.role == ModelFileRole::Weights)
+                .collect();
+            weights.sort_by(|left, right| {
+                let left_shard = self.shard_index(&left.id);
+                let right_shard = self.shard_index(&right.id);
+                (
+                    left_shard != Some(1),
+                    left_shard.unwrap_or(u32::MAX),
+                    left.path.as_path(),
+                )
+                    .cmp(&(
+                        right_shard != Some(1),
+                        right_shard.unwrap_or(u32::MAX),
+                        right.path.as_path(),
+                    ))
+            });
+            weights
+        }
+
         /// The package's primary weights file: the `Weights` file with `Shard { index: 1, .. }`,
         /// or the sole `Weights` file if unsharded, falling back to minimum shard index then path.
         #[must_use]
         pub fn primary_weights(&self) -> Option<&ModelFile> {
-            self.files
-                .iter()
-                .filter(|file| file.role == ModelFileRole::Weights)
-                .min_by(|left, right| {
-                    let left_shard = self.shard_index(&left.id);
-                    let right_shard = self.shard_index(&right.id);
-                    (
-                        left_shard != Some(1),
-                        left_shard.unwrap_or(u32::MAX),
-                        left.path.as_path(),
-                    )
-                        .cmp(&(
-                            right_shard != Some(1),
-                            right_shard.unwrap_or(u32::MAX),
-                            right.path.as_path(),
-                        ))
-                })
+            self.ordered_weights().into_iter().next()
         }
     }
 

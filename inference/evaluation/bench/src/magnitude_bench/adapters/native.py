@@ -109,10 +109,14 @@ class Native(Adapter):
 
     def argv(self, port, context, parallel, directory):
         magnitude = self.magnitude
+        shards = (
+            self.acquisition.target_shards
+            if self.artifact.path == self.acquisition.target
+            else (self.artifact.path,)
+        )
         arguments = [
             str(magnitude.binary),
-            "--model",
-            str(self.artifact.path),
+            *(arg for path in shards for arg in ("--model", str(path))),
             *(
                 ["--projector", str(self.acquisition.projector.path)]
                 if self.options.vision and self.acquisition.projector is not None

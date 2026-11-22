@@ -508,9 +508,19 @@ fn report_download(event: &ModelDownloadEvent, last_report: &Mutex<Option<Instan
 /// The evaluation contract's catalog-acquisition object.
 fn acquisition_json(model: &ModelId, acquired: &AcquiredCatalogModel) -> Value {
     let file = |file: &AcquiredFile| json!({ "path": file.path, "sha256": file.sha256 });
+    let target_files: Vec<&Path> = if acquired.target_files.is_empty() {
+        vec![acquired.target.path.as_path()]
+    } else {
+        acquired
+            .target_files
+            .iter()
+            .map(|file| file.path.as_path())
+            .collect()
+    };
     json!({
         "model": model.as_str(),
         "target": acquired.target.path,
+        "target_files": target_files,
         "target_sha256": acquired.target.sha256,
         "drafter": acquired.drafter.as_ref().map(|drafter| json!({
             "method": speculative_method_name(&drafter.method),
@@ -707,6 +717,7 @@ mod tests {
         let model: ModelId = "qwen3.5-4b:gguf:q4".parse().unwrap();
         let acquired = AcquiredCatalogModel {
             target: file("/store/target.gguf", "aa"),
+            target_files: vec![file("/store/target.gguf", "aa")],
             drafter: Some(magnitude_service_models::AcquiredDrafter {
                 method: SpeculativeMethod::DFlash,
                 file: file("/store/draft.gguf", "bb"),
@@ -718,6 +729,7 @@ mod tests {
             json!({
                 "model": "qwen3.5-4b:gguf:q4",
                 "target": "/store/target.gguf",
+                "target_files": ["/store/target.gguf"],
                 "target_sha256": "aa",
                 "drafter": { "method": "dflash", "path": "/store/draft.gguf", "sha256": "bb" },
                 "projector": { "path": "/store/mmproj.gguf", "sha256": "cc" },
@@ -726,10 +738,35 @@ mod tests {
     }
 
     #[test]
+    fn acquisition_json_preserves_all_sharded_and_engram_target_files() {
+        let model: ModelId = "deepseek-v4.1-flash:gguf:iq2-xxs".parse().unwrap();
+        let shard1 = file("/store/DeepSeek-V4.1-Flash-00001-of-00006.gguf", "aa");
+        let shard2 = file("/store/DeepSeek-V4.1-Flash-00002-of-00006.gguf", "bb");
+        let engram = file("/store/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf", "cc");
+        let acquired = AcquiredCatalogModel {
+            target: shard1.clone(),
+            target_files: vec![shard1, shard2, engram],
+            drafter: None,
+            projector: None,
+        };
+        let value = acquisition_json(&model, &acquired);
+        assert_eq!(value["target"], "/store/DeepSeek-V4.1-Flash-00001-of-00006.gguf");
+        assert_eq!(
+            value["target_files"],
+            json!([
+                "/store/DeepSeek-V4.1-Flash-00001-of-00006.gguf",
+                "/store/DeepSeek-V4.1-Flash-00002-of-00006.gguf",
+                "/store/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",
+            ])
+        );
+    }
+
+    #[test]
     fn absent_drafter_and_projector_are_null() {
         let model: ModelId = "bonsai-8b-q1:gguf:q1".parse().unwrap();
         let acquired = AcquiredCatalogModel {
             target: file("/store/target.gguf", "aa"),
+            target_files: vec![file("/store/target.gguf", "aa")],
             drafter: None,
             projector: None,
         };

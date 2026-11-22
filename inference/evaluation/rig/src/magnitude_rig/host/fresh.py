@@ -67,13 +67,17 @@ def run(artifacts: Path, output: Path, clones: Path, argv: list[str]) -> int:
     signal.signal(signal.SIGTERM, _terminate)
     try:
         target = Path(acquisition["target"])
+        explicit = acquisition.get("target_files")
+        files = [Path(path) for path in explicit] if explicit else target_files(target)
         if cloned:
             clones.mkdir(parents=True)
-            for path in target_files(target):
+            for path in files:
                 subprocess.run(["cp", "-c", str(path), str(clones / path.name)], check=True)
             acquisition["target"] = str(clones / target.name)
+            if explicit:
+                acquisition["target_files"] = [str(clones / path.name) for path in files]
         else:  # Linux
-            for path in target_files(target):
+            for path in files:
                 drop_cached(path)
         trace.atomic(output, acquisition)
         child = subprocess.Popen(argv)
