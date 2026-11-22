@@ -75,6 +75,7 @@ fn recorded_setup(
         page_bytes: 4096,
         total: topology.host_ram().capacity().value,
         supply: seismic::Supply { free_beyond_target: 0, clean_cache: 0, cold_reclaimable: 0 },
+        reclaim_band: 0,
         counted: seismic::Counted { at, lag: at_once },
         cold: seismic::ColdPages::default(),
         own_reclaimed: Some(seismic::OwnReclaimed::NONE),

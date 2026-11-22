@@ -2,7 +2,7 @@
 //! sources in order, or its documented value where none answers.
 
 use super::super::{
-    beyond, binding, resolve, ColdPages, Counted, Harm, HostSample, Lag, OwnReclaimed,
+    beyond, binding, resolve, ColdPages, Counted, Harm, HostSample, Lag, Limit, OwnReclaimed,
     PressureLevel, ProcessLimitKind, Scope, Supply,
 };
 use super::limits::{self, Cgroups};
@@ -61,7 +61,8 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
             .unwrap_or(0)
             .saturating_sub(field("Shmem:").unwrap_or(0)),
     );
-    let free_beyond_target = beyond(free, reclaim_floor(sys, total, page));
+    let (floor, host_reclaim_band) = reclaim_watermarks(sys, total, page);
+    let free_beyond_target = beyond(free, floor);
     let immediate = u64::try_from(free_beyond_target.max(0))
         .unwrap_or(0)
         .saturating_add(clean_cache);
@@ -99,6 +100,14 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
         },
     };
     let binding = binding(host, &limits);
+    let reclaim_band = match binding.supplier.map(|index| &limits[index]) {
+        Some(Limit {
+            kind: ProcessLimitKind::AllowedNodes { nodes },
+            limit_bytes,
+            ..
+        }) => nodes_watermarks(sys, nodes, *limit_bytes).1,
+        _ => host_reclaim_band,
+    };
     // The counters show every event their folds had passed as the reading
     // began.
     let counted_at = Instant::now();
@@ -111,6 +120,7 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
         page_bytes: page,
         total: binding.scope.total,
         supply: binding.scope.supply,
+        reclaim_band,
         counted,
         cold: ColdPages {
             machine: cold_machine,
@@ -184,18 +194,17 @@ fn stat_interval(sys: &impl Sys) -> Duration {
     .0
 }
 
-/// The floor the kernel keeps free, in bytes: kswapd wakes to reclaim once
-/// free pages fall below the zones' low watermarks, so free pages above
-/// them are taken without anyone's reclaim. The sum of every zone's `low`
-/// in `/proc/zoneinfo`, in pages of `page` bytes; where it is missing or
-/// states no watermark, the kernel's own formula from the host's `total`
-/// bytes ([`watermark_formula`]).
-fn reclaim_floor(sys: &impl Sys, total: u64, page: u64) -> u64 {
+/// The kernel's reclaim watermarks `(low, high − low)`, in bytes: kswapd wakes
+/// once free pages fall below `low` (subtracted from `free_beyond_target`) and
+/// reclaims back up to `high`, so `high − low` is the active reclaim band above
+/// `low`. Read from `/proc/zoneinfo` in pages of `page` bytes; where missing or
+/// zero, the kernel's own formula from `total` ([`watermark_formula`]).
+fn reclaim_watermarks(sys: &impl Sys, total: u64, page: u64) -> (u64, u64) {
     resolve(
         &[((), &|| {
             let zoneinfo = sys.text(Path::new("/proc/zoneinfo"))?;
-            let low = zones_low(&zoneinfo, |_| true);
-            (low > 0).then(|| low * page)
+            let (low, band) = zones_watermarks(&zoneinfo, |_| true);
+            (low > 0).then(|| (low * page, band * page))
         })],
         (),
         || watermark_formula(sys, total),
@@ -209,35 +218,45 @@ fn reclaim_floor(sys: &impl Sys, total: u64, page: u64) -> u64 {
 /// missing, the nodes' share of the host's ([`watermark_formula`]), each
 /// node's zones set in proportion to its managed pages.
 pub(super) fn nodes_floor(sys: &impl Sys, nodes: &[usize], nodes_total: u64) -> u64 {
+    nodes_watermarks(sys, nodes, nodes_total).0
+}
+
+/// The `(low, high − low)` watermarks on the memory nodes `nodes`, of
+/// `nodes_total` bytes.
+fn nodes_watermarks(sys: &impl Sys, nodes: &[usize], nodes_total: u64) -> (u64, u64) {
     let page = sys.page();
     resolve(
         &[((), &|| {
             let zoneinfo = sys.text(Path::new("/proc/zoneinfo"))?;
-            let low = zones_low(&zoneinfo, |node| nodes.contains(&node));
-            (low > 0).then(|| low * page)
+            let (low, band) = zones_watermarks(&zoneinfo, |node| nodes.contains(&node));
+            (low > 0).then(|| (low * page, band * page))
         })],
         (),
         || {
             let total = host_total(sys).value;
-            let share = u128::from(watermark_formula(sys, total)) * u128::from(nodes_total)
-                / u128::from(total.max(1));
-            u64::try_from(share).unwrap_or_else(|_| {
-                panic!("invariant violated: node reclaim floor share {share} exceeds u64")
-            })
+            let (low, band) = watermark_formula(sys, total);
+            let scale = |bytes: u64| {
+                let share = u128::from(bytes) * u128::from(nodes_total) / u128::from(total.max(1));
+                u64::try_from(share).unwrap_or_else(|_| {
+                    panic!("invariant violated: node reclaim watermark share {share} exceeds u64")
+                })
+            };
+            (scale(low), scale(band))
         },
     )
     .0
 }
 
-/// The zones' low watermarks summed, in bytes, as `mm/page_alloc.c` sets
-/// them for a host of `total` bytes.
+/// The zones' `(low, high − low)` watermarks summed, in bytes, as
+/// `mm/page_alloc.c` sets them for a host of `total` bytes.
 ///
 /// `__setup_per_zone_wmarks` splits `min_free_kbytes` (`pages_min`) over
 /// the zones in proportion to their managed pages (`min_z = pages_min ×
-/// managed_z / lowmem`), then sets each zone's `low = min_z + max(min_z /
-/// 4, managed_z × watermark_scale_factor / 10000)`. As `min_z` is
-/// proportional to `managed_z`, the same term wins in every zone, so over
-/// the zones `Σ low = min_free + max(min_free / 4, total × scale / 10000)`
+/// managed_z / lowmem`), then sets each zone's `distance = max(min_z / 4,
+/// managed_z × watermark_scale_factor / 10000)`, `low = min_z + distance`,
+/// and `high = min_z + 2 × distance` (so `high − low = distance`). As `min_z`
+/// is proportional to `managed_z`, the same term wins in every zone, so over
+/// the zones `Σ low = min_free + distance` and `Σ(high − low) = distance`,
 /// with `total` the managed pages, which `MemTotal` counts.
 ///
 /// The tunables, each from its file else the kernel's default:
@@ -249,7 +268,7 @@ pub(super) fn nodes_floor(sys: &impl Sys, nodes: &[usize], nodes_total: u64) -> 
 ///
 /// # Panics
 /// Where a tunable does not parse.
-fn watermark_formula(sys: &impl Sys, total: u64) -> u64 {
+fn watermark_formula(sys: &impl Sys, total: u64) -> (u64, u64) {
     let tunable = |path: &str| {
         sys.text(Path::new(path)).map(|value| {
             value
@@ -273,38 +292,67 @@ fn watermark_formula(sys: &impl Sys, total: u64) -> u64 {
     let scaled = u64::try_from(u128::from(total) * u128::from(scale) / 10_000).unwrap_or_else(|_| {
         panic!("invariant violated: watermark_scale_factor {scale} overflows u64")
     });
-    min_free.saturating_add((min_free / 4).max(scaled))
+    let distance = (min_free / 4).max(scaled);
+    (min_free.saturating_add(distance), distance)
 }
 
-/// The `low` of every zone of a `/proc/zoneinfo` text on a node `keep`
-/// keeps, in pages.
+/// The `(low, high − low)` watermarks summed over every zone of a
+/// `/proc/zoneinfo` text on a node `keep` keeps, in pages.
 ///
 /// # Panics
-/// Where a node header or a `low` does not parse.
-fn zones_low(zoneinfo: &str, keep: impl Fn(usize) -> bool) -> u64 {
+/// Where a node header or a `low`/`high` line does not parse.
+fn zones_watermarks(zoneinfo: &str, keep: impl Fn(usize) -> bool) -> (u64, u64) {
     let mut kept = false;
-    zoneinfo
-        .lines()
-        .filter_map(|line| {
-            if let Some(header) = line.strip_prefix("Node ") {
-                let node = header
-                    .split(',')
-                    .next()
-                    .and_then(|node| node.trim().parse::<usize>().ok());
-                kept = keep(
-                    node.unwrap_or_else(|| panic!("invariant violated: /proc/zoneinfo reads {line:?}")),
-                );
-                return None;
+    let mut total_low = 0u64;
+    let mut total_band = 0u64;
+    let mut zone_low: Option<u64> = None;
+    let mut zone_high: Option<u64> = None;
+    let flush = |low: &mut Option<u64>, high: &mut Option<u64>, total_low: &mut u64, total_band: &mut u64| {
+        if let Some(l) = low.take() {
+            *total_low = total_low.saturating_add(l);
+            if let Some(h) = high.take() {
+                *total_band = total_band.saturating_add(h.saturating_sub(l));
             }
-            let mut fields = line.split_whitespace();
-            (kept && fields.next() == Some("low")).then(|| {
-                fields
+        } else {
+            *high = None;
+        }
+    };
+    for line in zoneinfo.lines() {
+        if let Some(header) = line.strip_prefix("Node ") {
+            flush(&mut zone_low, &mut zone_high, &mut total_low, &mut total_band);
+            let node = header
+                .split(',')
+                .next()
+                .and_then(|node| node.trim().parse::<usize>().ok());
+            kept = keep(
+                node.unwrap_or_else(|| panic!("invariant violated: /proc/zoneinfo reads {line:?}")),
+            );
+            continue;
+        }
+        if !kept {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        match fields.next() {
+            Some("low") => {
+                let value = fields
                     .next()
                     .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or_else(|| panic!("invariant violated: /proc/zoneinfo reads {line:?}"))
-            })
-        })
-        .sum()
+                    .unwrap_or_else(|| panic!("invariant violated: /proc/zoneinfo reads {line:?}"));
+                zone_low = Some(value);
+            }
+            Some("high") => {
+                let value = fields
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("invariant violated: /proc/zoneinfo reads {line:?}"));
+                zone_high = Some(value);
+            }
+            _ => {}
+        }
+    }
+    flush(&mut zone_low, &mut zone_high, &mut total_low, &mut total_band);
+    (total_low, total_band)
 }
 
 /// The pressure level: the higher of the machine's PSI

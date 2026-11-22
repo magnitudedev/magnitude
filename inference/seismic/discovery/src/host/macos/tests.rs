@@ -484,3 +484,24 @@ fn iogpu_in_use_memory_excludes_kernel_wired_pages() {
         assert!(bytes < vm_wired);
     }
 }
+
+/// `reclaim_band` is `vm.vm_page_background_target` above the `free_target`
+/// already subtracted from `free_beyond_target` (never double-counting
+/// `free_target`), and `0` when unreported.
+#[test]
+fn reclaim_band_is_background_target_above_free_target() {
+    let page = 16 << 10;
+    let total = 48 * GB;
+    let base = Mac::new()
+        .count("hw.memsize", total)
+        .count("vm.page_free_count", 100_000)
+        .count("vm.vm_page_free_target", 4_000);
+    // Unreported `vm.vm_page_background_target` yields 0 (no double-counting).
+    assert_eq!(sample(&base).reclaim_band, 0);
+
+    // 48 GiB reserve_pages = 48 GiB / 256 / 16 KiB = 12_288 pages (192 MiB);
+    // background_target = 50_000 pages -> reclaim_band = (50_000 - 12_288) * 16 KiB.
+    let with_bg = base.count("vm.vm_page_background_target", 50_000);
+    let s = sample(&with_bg);
+    assert_eq!(s.reclaim_band, (50_000 - 12_288) * page);
+}

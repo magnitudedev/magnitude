@@ -445,6 +445,8 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
     } else {
         0
     };
+    let background_target = sysctl_count(sys, "vm.vm_page_background_target").unwrap_or(0);
+    let reclaim_band = pages(background_target.saturating_sub(free_target));
     let external_live = sysctl_count(sys, "vm.page_pageable_external_count");
     let xpmapped_min = sysctl_count(sys, "vm.vm_page_xpmapped_min").unwrap_or(0);
     let wired_limit = wired_limit(sys);
@@ -503,6 +505,7 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
             clean_cache,
             cold_reclaimable,
         },
+        reclaim_band,
         counted,
         cold: ColdPages {
             machine: cold,

@@ -1504,8 +1504,9 @@ mod rise_gate_tests {
         const MIB: u64 = 1 << 20;
         const GIB: u64 = 1 << 30;
         const TOTAL: u64 = 64 * GIB;
+        const RECLAIM_BAND: u64 = 64 * MIB; // Linux 64 GiB zone (high - low)
         const SLOT: u64 = 384 * MIB;
-        const RESERVE: u64 = 2 * GIB; // scarcity_cushion(64 GiB, 384 MiB)
+        const RESERVE: u64 = RECLAIM_BAND + SLOT; // scarcity_threshold(64 MiB, 384 MiB, 0)
 
         let t0 = Instant::now();
         let sample_with = |at: Instant, free_beyond_target: i64, clean_cache: u64, cold_reclaimable: u64, monitored: bool| {
@@ -1514,6 +1515,7 @@ mod rise_gate_tests {
                 page_bytes: 4096,
                 total: TOTAL,
                 supply: seismic::Supply { free_beyond_target, clean_cache, cold_reclaimable },
+                reclaim_band: RECLAIM_BAND,
                 counted: seismic::Counted { at, lag: Duration::ZERO },
                 cold: seismic::ColdPages { machine: cold_reclaimable, own: None },
                 own_reclaimed: None,
@@ -1526,7 +1528,7 @@ mod rise_gate_tests {
 
         let scope = Ledgers::new();
         let ledger = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(LoadShape { stores: Vec::new() }));
-        let _pool = ledger.pool_block(PoolClass::Records, NonZeroU64::new(SLOT).unwrap()).blocks;
+        let _pool = ledger.pool_block(PoolClass::Records, NonZeroU64::new(SLOT).unwrap());
 
         // Initial 64 GiB Linux container reading: 10 GiB free, 4 GiB clean cache,
         // 16 GiB swap-backed cold_reclaimable (must never be counted for pinned).
@@ -1535,23 +1537,22 @@ mod rise_gate_tests {
         let est = ledger.estimate();
         assert_eq!(est.pinned_reserve(), RESERVE);
         assert_eq!(est.guarantee(), 0);
-        // Immediate supply = 10 + 4 = 14 GiB; minus 2 GiB reserve = 12 GiB.
-        assert_eq!(est.pinned_room(), 12 * GIB);
-        assert_eq!(est.pinned_import_room(), 12 * GIB);
-        assert_eq!(est.live_pinned_headroom(&s0), 12 * GIB, "live_pinned_headroom agrees with pinned_import_room");
+        // Immediate supply = 10 + 4 = 14 GiB; minus RESERVE (448 MiB).
+        assert_eq!(est.pinned_room(), 14 * GIB - RESERVE);
+        assert_eq!(est.pinned_import_room(), 14 * GIB - RESERVE);
+        assert_eq!(est.live_pinned_headroom(&s0), 14 * GIB - RESERVE, "live_pinned_headroom agrees with pinned_import_room");
 
-        // Simulate cuMemHostAlloc growing slot-by-slot until only 2 GiB clean
-        // page cache remains (free_beyond_target = 0, clean_cache = 2 GiB,
-        // cold_reclaimable = 16 GiB). Growth MUST stop with the 2 GiB clean
-        // page cache completely intact (never driven to 0 bytes).
-        let at_floor = sample_with(t0 + Duration::from_secs(1), 0, 2 * GIB, 16 * GIB, true);
+        // Simulate cuMemHostAlloc growing slot-by-slot until only RESERVE clean
+        // page cache remains (free_beyond_target = 0, clean_cache = RESERVE,
+        // cold_reclaimable = 16 GiB). Growth MUST stop with the reserve intact.
+        let at_floor = sample_with(t0 + Duration::from_secs(1), 0, RESERVE, 16 * GIB, true);
         assert_eq!(
             est.live_pinned_headroom(&at_floor),
             0,
-            "growth must stop at the 2 GiB clean-cache reserve even with 16 GiB swap"
+            "growth must stop at the derived clean-cache reserve even with 16 GiB swap"
         );
 
-        // One slot above the 2 GiB reserve fits; one byte below does not.
+        // One slot above the reserve fits; one byte below does not.
         let one_slot_above = sample_with(t0 + Duration::from_secs(1), 0, RESERVE + SLOT, 0, true);
         assert_eq!(est.live_pinned_headroom(&one_slot_above), SLOT);
         let one_byte_short = sample_with(t0 + Duration::from_secs(1), 0, RESERVE + SLOT - 1, 16 * GIB, true);
@@ -1568,15 +1569,15 @@ mod rise_gate_tests {
         assert_eq!(est.live_pinned_headroom(&dipped), 0);
 
         // Others' rise sets `guarantee` > 0 on the HostRam ledger: live_pinned_headroom
-        // must preserve BOTH the 2 GiB OS reserve AND `guarantee`.
+        // must preserve BOTH the derived OS reserve AND `guarantee`.
         let t1 = t0 + Duration::from_secs(2);
         let s1 = sample_with(t1, (9 * GIB) as i64, 4 * GIB, 16 * GIB, true); // others rose by 1 GiB
         ledger.read(ledger.sampled(t1), Reading::host(&s1));
         let est1 = ledger.estimate();
         assert_eq!(est1.guarantee(), GIB);
-        // Immediate supply = 9 + 4 = 13 GiB; minus 2 GiB reserve minus 1 GiB guarantee = 10 GiB.
-        assert_eq!(est1.pinned_import_room(), 10 * GIB);
-        assert_eq!(est1.live_pinned_headroom(&s1), 10 * GIB);
+        // Immediate supply = 9 + 4 = 13 GiB; minus RESERVE minus 1 GiB guarantee.
+        assert_eq!(est1.pinned_import_room(), 12 * GIB - RESERVE);
+        assert_eq!(est1.live_pinned_headroom(&s1), 12 * GIB - RESERVE);
         let with_guarantee_tight = sample_with(t1, 0, RESERVE + GIB + SLOT - 1, 0, true);
         assert!(
             est1.live_pinned_headroom(&with_guarantee_tight) < SLOT,

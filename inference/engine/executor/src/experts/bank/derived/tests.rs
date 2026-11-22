@@ -265,9 +265,10 @@ fn pinned_host_budget_clamping_and_per_slot_guard_agree_on_64g_linux_container()
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
     const TOTAL: u64 = 64 * GIB;
+    const RECLAIM_BAND: u64 = 64 * MIB; // Linux 64 GiB zone (high - low)
     const HOST_SLOT: u64 = 384 * MIB;
     const HOST_FLOOR: u64 = 3 * GIB;
-    const RESERVE: u64 = 2 * GIB;
+    const RESERVE: u64 = RECLAIM_BAND + HOST_SLOT;
 
     let t0 = Instant::now();
     let sample = seismic::HostSample {
@@ -279,6 +280,7 @@ fn pinned_host_budget_clamping_and_per_slot_guard_agree_on_64g_linux_container()
             clean_cache: 4 * GIB,
             cold_reclaimable: 12 * GIB,
         },
+        reclaim_band: RECLAIM_BAND,
         counted: seismic::Counted { at: t0, lag: Duration::ZERO },
         cold: seismic::ColdPages { machine: 12 * GIB, own: None },
         own_reclaimed: None,
@@ -290,7 +292,7 @@ fn pinned_host_budget_clamping_and_per_slot_guard_agree_on_64g_linux_container()
 
     let scope = Ledgers::new();
     let ledger = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(LoadShape { stores: Vec::new() }));
-    let _pool = ledger.pool_block(PoolClass::Records, NonZeroU64::new(HOST_SLOT).unwrap()).blocks;
+    let _pool = ledger.pool_block(PoolClass::Records, NonZeroU64::new(HOST_SLOT).unwrap());
     ledger.read(ledger.sampled(t0), Reading::host(&sample));
 
     // Claim and allocate the 3 GiB committed host floor.
@@ -320,9 +322,9 @@ fn pinned_host_budget_clamping_and_per_slot_guard_agree_on_64g_linux_container()
     let est = ledger.estimate();
 
     // Expected pinned room above committed floor:
-    // immediate_supply (33 + 4 = 37 GiB) - reserve (2 GiB) = 35 GiB.
-    // Note: 12 GiB cold_reclaimable is excluded, and 2 GiB reserve is preserved.
-    let expected_room = 35 * GIB;
+    // immediate_supply (33 + 4 = 37 GiB) - reserve (448 MiB).
+    // Note: 12 GiB cold_reclaimable is excluded, and derived reserve is preserved.
+    let expected_room = 37 * GIB - RESERVE;
     assert_eq!(est.pinned_reserve(), RESERVE);
     assert_eq!(est.pinned_room(), expected_room);
     assert_eq!(est.pinned_import_room(), expected_room);

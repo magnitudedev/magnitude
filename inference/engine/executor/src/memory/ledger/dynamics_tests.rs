@@ -226,6 +226,7 @@ impl Os {
                 clean_cache: self.cache + growing,
                 cold_reclaimable: self.cold / 2,
             },
+            reclaim_band: 64 * MB,
             counted: seismic::Counted { at: snapshot.at, lag: Duration::ZERO },
             cold: seismic::ColdPages {
                 machine: snapshot.cold,
@@ -1092,7 +1093,7 @@ fn an_idle_load_under_harm_never_unloads() {
 #[test]
 fn an_idle_load_under_pressure_never_unloads() {
     let mut os = Os::new();
-    // Put the host under real immediate scarcity (free <= scarcity_cushion) so
+    // Put the host under real immediate scarcity (free <= scarcity_threshold) so
     // OS pressure events fire rather than being suppressed by abundant free RAM.
     os.hot = 35 * GB;
     os.cache = 0;
@@ -1315,9 +1316,9 @@ fn windows_level_triggered_pressure_yields_smoothly_until_relief() {
 #[test]
 fn non_pooled_cache_without_open_pool_reads_and_relieves_under_pressure() {
     let mut os = Os::new();
-    // Start near immediate scarcity so after loading ~2.1 GiB, free <= scarcity_cushion
+    // Start near immediate scarcity so after loading ~2.1 GiB, free <= scarcity_threshold
     // and OS pressure events fire without a synthetic exogenous jump.
-    os.hot = 52 * GB;
+    os.hot = 53 * GB;
     os.cache = 0;
     let now = Arc::new(Lock::new(Instant::now()));
     let clock = now.clone();
@@ -1345,7 +1346,7 @@ fn non_pooled_cache_without_open_pool_reads_and_relieves_under_pressure() {
     assert_eq!(ledger.estimate().cache(), graph_bytes + drafter_bytes);
     assert!(ledger.estimate().cap().is_none());
 
-    // Pressure under real immediate scarcity (`free <= scarcity_cushion`) lowers
+    // Pressure under real immediate scarcity (`free <= scarcity_threshold`) lowers
     // B by the largest non-pooled cache entry (64 MB) and plans cache-only relief.
     os.pressure = seismic::PressureLevel::Warn;
     ledger.pressure_event();

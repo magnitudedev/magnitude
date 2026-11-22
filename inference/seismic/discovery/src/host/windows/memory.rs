@@ -111,6 +111,8 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
         page_bytes: sys.page(),
         total: scope.total,
         supply: scope.supply,
+        // `windows_floor` is already subtracted from `free_beyond_target`.
+        reclaim_band: 0,
         counted: Counted {
             at: counted_at,
             lag: counted_at.duration_since(at),

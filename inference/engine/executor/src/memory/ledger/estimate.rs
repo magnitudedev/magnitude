@@ -381,8 +381,8 @@ impl Estimate {
 
     /// Live pinned-host headroom for a fresh `sample` taken during background
     /// host-tier growth, preserving this store's OS/container reserve
-    /// (`scarcity_cushion(sample.total, unit)`), `guarantee` (others' rise),
-    /// and any standing boundary `cap`.
+    /// (`scarcity_threshold(sample.reclaim_band, unit, 0)`), `guarantee`
+    /// (others' rise), and any standing boundary `cap`.
     pub fn live_pinned_headroom(&self, sample: &seismic::HostSample) -> u64 {
         let live = Reading::host(sample).pinned_headroom(self.guarantee(), self.read.unit);
         match self.read.cap {
@@ -582,22 +582,6 @@ impl State {
         if settled {
             self.boundary.settle_idle();
         }
-        if let Some(paging) = reading.paging() {
-            let room = in_use.saturating_add(figures.total());
-            let free = u64::try_from(figures.free_beyond_target.max(0)).unwrap_or(0).saturating_add(reading.clean_cache_supply());
-            let held = self.committed.saturating_add(self.cache).saturating_add(self.releasing - self.taken);
-            self.boundary.observe(Observed {
-                paging,
-                total: reading.total(),
-                allocated: counted.allocated,
-                held,
-                room,
-                free,
-                unit: self.unit(),
-                events,
-                committed: self.committed,
-            });
-        }
         // Others' rise counts only where it is attributed to them, between
         // readings that show every change of the process's: their harm, or a
         // fall of the supply that the process's own bytes in use do not
@@ -609,19 +593,35 @@ impl State {
         // second stale, left 285 of 1,184 readings unshown on an M4 Pro,
         // and each one regrew a slot just shed into that rise). A reading
         // after an idle sleep judges none: the rise is none.
-        let rise = match prev_read.filter(|_| !settled) {
+        let observed_rise = match prev_read.filter(|_| !settled) {
             None => 0,
             Some(before) if !(before.shown && shown) => before.rise,
             Some(before) => {
                 let risen = others.saturating_sub(before.others);
-                match self.boundary.harmed() {
-                    Some(_) => risen,
-                    None => {
-                        let fall = i128::from(before.supply) - i128::from(supply) - (i128::from(in_use) - i128::from(before.in_use()));
-                        risen.min(u64::try_from(fall.max(0)).expect("a supply's fall fits u64"))
-                    }
-                }
+                let fall = i128::from(before.supply) - i128::from(supply) - (i128::from(in_use) - i128::from(before.in_use()));
+                risen.min(u64::try_from(fall.max(0)).expect("a supply's fall fits u64"))
             }
+        };
+        if let Some(paging) = reading.paging() {
+            let room = in_use.saturating_add(figures.total());
+            let free = u64::try_from(figures.free_beyond_target.max(0)).unwrap_or(0).saturating_add(reading.clean_cache_supply());
+            let held = self.committed.saturating_add(self.cache).saturating_add(self.releasing - self.taken);
+            self.boundary.observe(Observed {
+                paging,
+                reclaim_band: reading.reclaim_band(),
+                others_step: observed_rise,
+                allocated: counted.allocated,
+                held,
+                room,
+                free,
+                unit: self.unit(),
+                events,
+                committed: self.committed,
+            });
+        }
+        let rise = match (prev_read.filter(|_| !settled), self.boundary.harmed()) {
+            (Some(before), Some(_)) if before.shown && shown => others.saturating_sub(before.others),
+            _ => observed_rise,
         };
         let mut wired_others = prev.and_then(|before| before.wired_others);
         let mut unwired = 0;
@@ -663,7 +663,7 @@ impl State {
             self.others_interval = Some(self.others_interval.map_or(interval, |shortest| shortest.min(interval)));
         }
         let paged = reading.paging().is_some();
-        let unit = self.unit();
+        let unit = self.block_unit();
         let immediate_supply = reading.immediate_supply();
         let pinned_reserve = reading.pinned_reserve(unit);
         let (cap, grows) = (self.boundary.cap(), !paged || self.boundary.admits_growth());

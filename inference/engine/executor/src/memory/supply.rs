@@ -48,7 +48,7 @@
 //!       bounded probe increment, never jumping straight to `None`.
 //!   - Each OS pressure event (`seismic::PressureEvents`) while pressure is
 //!     above `Normal` lowers B by one block (`unit`) per event; if pressure
-//!     persists silently under immediate scarcity (`free <= scarcity_cushion`)
+//!     persists silently under immediate scarcity (`free <= scarcity_threshold`)
 //!     without new edge events, `Critical` steps B down every `250 ms` on every
 //!     OS, while standing `Warn` steps down every `1 s` only when the OS reports
 //!     no harm counters (level-triggered OSes such as Windows
@@ -81,18 +81,25 @@ const CALM_PROBE_BASE: Duration = Duration::from_secs(30);
 const CALM_PROBE_MAX_SHIFT: u32 = 4;
 const CALM_PROBE_MIN_BYTES: u64 = 256 * (1 << 20);
 
-/// Immediate free + clean cache threshold at or below which the host is
-/// considered scarce (relying on compression/swap), so sustained high-rate
-/// paging can signal real contention even before OS pressure escalates.
-/// Also serves as the OS/container reserve that unreclaimable pinned host
-/// allocations must leave untouched in immediate supply.
-pub(crate) fn scarcity_cushion(total: u64, unit: u64) -> u64 {
-    const MIB: u64 = 1 << 20;
-    const GIB: u64 = 1 << 30;
-    if total == 0 {
-        return 0;
-    }
-    (total / 32).clamp(256 * MIB, 2 * GIB).max(unit).min(total / 4)
+/// Derived immediate-supply scarcity threshold in bytes:
+///
+/// `reclaim_band + unit + others_step`
+///
+/// - `reclaim_band`: the OS's own active reclaim band above the floor already
+///   subtracted from `Supply::free_beyond_target` (Linux `/proc/zoneinfo`
+///   `Σ(high - low)`, macOS `vm.vm_page_background_target - free_target`,
+///   Windows `0` since `windows_floor` is already subtracted). Never
+///   double-counts the floor already removed from `free_beyond_target`.
+/// - `unit`: the smallest block we can give back to the OS (one pool granule /
+///   expert slot).
+/// - `others_step`: the competing-process allocation step measured by the
+///   ledger (`guarantee`: others' attributed rise between judged readings).
+///
+/// When immediate non-swapping supply (`free_beyond_target + clean_cache`) is
+/// at or below this threshold, either one more block of ours or one more step
+/// of competing processes pushes the OS into its active reclaim band.
+pub(crate) fn scarcity_threshold(reclaim_band: u64, unit: u64, others_step: u64) -> u64 {
+    reclaim_band.saturating_add(unit).saturating_add(others_step)
 }
 
 /// One store's figures at one sample: the ledger's one OS input
@@ -102,6 +109,9 @@ pub(crate) fn scarcity_cushion(total: u64, unit: u64) -> u64 {
 pub struct Reading {
     total: u64,
     supply: seismic::Supply,
+    /// The OS's active reclaim band above the floor already subtracted from
+    /// `supply.free_beyond_target` (`0` on non-host device stores).
+    reclaim_band: u64,
     /// A unified device's grant over host RAM (§4.3).
     grant: Option<HostGrant>,
     /// Host RAM's paging signals, where the store is host RAM.
@@ -164,6 +174,7 @@ impl Reading {
         Self {
             total: sample.total,
             supply: sample.supply,
+            reclaim_band: sample.reclaim_band,
             grant: None,
             paging: Some(Paging {
                 harm: sample.harm,
@@ -229,7 +240,7 @@ impl Reading {
     pub fn device(capacity: u64, free: u64, lag: seismic::Lag) -> Self {
         assert!(free <= capacity, "invariant violated: a device's grant leaves {free} of its {capacity} bytes");
         let supply = seismic::Supply { free_beyond_target: i64::try_from(free).expect("a store's bytes fit i64"), clean_cache: 0, cold_reclaimable: 0 };
-        Self { total: capacity, supply, grant: None, paging: None, own_reclaimed: None, lag }
+        Self { total: capacity, supply, reclaim_band: 0, grant: None, paging: None, own_reclaimed: None, lag }
     }
 
     pub fn total(&self) -> u64 {
@@ -250,6 +261,10 @@ impl Reading {
 
     pub(crate) fn supply(&self) -> seismic::Supply {
         self.supply
+    }
+
+    pub(crate) fn reclaim_band(&self) -> u64 {
+        self.reclaim_band
     }
 
     pub(crate) fn grant(&self) -> Option<HostGrant> {
@@ -296,12 +311,16 @@ impl Reading {
     }
 
     /// OS/container reserve that unreclaimable pinned host allocations must
-    /// leave untouched in immediate supply (`free_beyond_target + clean_cache`):
-    /// [`scarcity_cushion`] scaled to `total` and `unit` on host stores, and
-    /// `0` on non-host device stores.
+    /// leave untouched in immediate supply (`free_beyond_target + clean_cache`)
+    /// beside `guarantee`: [`scarcity_threshold`] with `others_step = 0`
+    /// (`reclaim_band + unit`) on host stores, and `0` on non-host device
+    /// stores. [`Self::pinned_headroom`] and `Estimate::pinned_room` subtract
+    /// `guarantee` (`others_step`) separately so total preserved immediate
+    /// supply equals `scarcity_threshold(reclaim_band, unit, guarantee)`
+    /// without double-counting `guarantee`.
     pub(crate) fn pinned_reserve(&self, unit: u64) -> u64 {
         match self.paging {
-            Some(_) => scarcity_cushion(self.total, unit),
+            Some(_) => scarcity_threshold(self.reclaim_band, unit, 0),
             None => 0,
         }
     }
@@ -383,8 +402,11 @@ pub(crate) struct Boundary {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Observed {
     pub(crate) paging: Paging,
-    /// The store's total bytes, used to scale the scarcity cushion.
-    pub(crate) total: u64,
+    /// The OS's active reclaim band above the floor already subtracted from
+    /// `free_beyond_target`.
+    pub(crate) reclaim_band: u64,
+    /// Competing-process allocation step measured by the ledger (`guarantee`).
+    pub(crate) others_step: u64,
     /// What the process had physically allocated as the counters show it (at
     /// `paging.counted.at`): what physical growth steps are judged against.
     pub(crate) allocated: u64,
@@ -460,14 +482,29 @@ struct Cap {
 impl Boundary {
     /// Fold in one reading.
     pub(crate) fn observe(&mut self, now: Observed) {
-        let Observed { paging, total, allocated, held, room, free, unit, events, committed } = now;
+        let Observed { paging, reclaim_band, others_step, allocated, held, room, free, unit, events, committed } = now;
         self.committed = committed;
         let seismic::Counted { at, lag } = paging.counted;
         self.harmed = None;
-        let scarce_free = free <= scarcity_cushion(total, unit);
+        let threshold = scarcity_threshold(reclaim_band, unit, others_step);
+        // Track the trough of immediate `free` and `held + free` while `cap`
+        // stands: our own shrinks preserve `held + free` (`-Δheld + Δfree == 0`)
+        // and other apps' pages cycling `active <-> inactive` never enter `free`,
+        // so measuring scarcity against `cap.free + (held + free - cap.anchor)`
+        // keeps scarcity invariant under our own shrinks while lifting as soon
+        // as genuine exogenous free supply exceeds `threshold`.
+        let effective_free = match self.cap.as_mut() {
+            Some(cap) => {
+                cap.free = cap.free.min(free);
+                cap.anchor = cap.anchor.min(held.saturating_add(free));
+                cap.free.saturating_add(held.saturating_add(free).saturating_sub(cap.anchor))
+            }
+            None => free,
+        };
+        let scarce_free = effective_free <= threshold;
         let prev_level = self.level;
         self.level = paging.pressure.filter(|level| *level != seismic::PressureLevel::Normal);
-        // Immediate free + clean cache above `scarcity_cushion` means the host
+        // Immediate free + clean cache above `scarcity_threshold` means the host
         // can satisfy allocations without swapping/compressing anonymous pages
         // (e.g. Linux PSI firing on clean page-cache reclaim or compaction with
         // tens of GiB of clean cache free): never fire pressure or latch `cap`
@@ -521,21 +558,13 @@ impl Boundary {
             };
             self.cap = Some(cap);
         }
-        // Track the trough of immediate `free` and `held + free` while `cap`
-        // stands: our own shrinks preserve `held + free` (`-Δheld + Δfree == 0`)
-        // and other apps' pages cycling `active <-> inactive` never enter `free`,
-        // so only others' genuine growth lowers `anchor`, and their exit lifts it.
-        if let Some(cap) = self.cap.as_mut() {
-            cap.free = cap.free.min(free);
-            cap.anchor = cap.anchor.min(held.saturating_add(free));
-        }
         let pressure_calm = self.level.is_none() || (self.pressed.is_none() && !scarce_free);
         let Some(harm) = paging.harm else {
             // No share of the process's is counted: nothing judges harm,
             // growth or a step; B, where pressure set it, lifts on others' release.
             self.unjudged = true;
             if pressure_calm {
-                self.raise_on_exogenous_release(held, free, room, unit, total, at);
+                self.raise_on_exogenous_release(held, free, room, unit, threshold, at);
             } else if let Some(cap) = self.cap.as_mut() {
                 cap.calm_since = None;
             }
@@ -650,8 +679,8 @@ impl Boundary {
         }
         let calm = !thrashing && self.thrash.is_none() && self.step.is_none() && pressure_calm;
         if calm {
-            if !self.raise_on_exogenous_release(held, free, room, unit, total, at) {
-                self.probe_after_calm(held, room, unit, total, at);
+            if !self.raise_on_exogenous_release(held, free, room, unit, threshold, at) {
+                self.probe_after_calm(held, room, unit, threshold, at);
             }
         } else if let Some(cap) = self.cap.as_mut() {
             cap.calm_since = None;
@@ -664,9 +693,9 @@ impl Boundary {
     /// `cold` overhang remains above the raised ceiling (`raised >= room` or
     /// `room <= held + free + unit`), so an exogenous release never triggers an
     /// unbounded leap into a known `Harm` wall. Returns whether `cap` moved.
-    fn raise_on_exogenous_release(&mut self, held: u64, free: u64, room: u64, unit: u64, total: u64, at: Instant) -> bool {
+    fn raise_on_exogenous_release(&mut self, held: u64, free: u64, room: u64, unit: u64, threshold: u64, at: Instant) -> bool {
         let Some(cap) = self.cap else { return false };
-        let max_lift_gain = scarcity_cushion(total, unit).max(unit);
+        let max_lift_gain = threshold.max(unit);
         let min_gain = cap.step.min(max_lift_gain).max(unit);
         let held_plus_free = held.saturating_add(free);
         let gain = held_plus_free.saturating_sub(cap.anchor);
@@ -694,7 +723,7 @@ impl Boundary {
     /// After sustained uninterrupted calm under a standing cap on a judged OS,
     /// raise `cap.bytes` by one bounded probe increment (never clearing to
     /// `None`) with exponential backoff across consecutive wall-hit strikes.
-    fn probe_after_calm(&mut self, held: u64, room: u64, unit: u64, total: u64, at: Instant) {
+    fn probe_after_calm(&mut self, held: u64, room: u64, unit: u64, threshold: u64, at: Instant) {
         let Some(cap) = self.cap.as_mut() else { return };
         if unit == 0 {
             return;
@@ -704,7 +733,7 @@ impl Boundary {
         if at.saturating_duration_since(since) < dwell {
             return;
         }
-        let probe = unit.max(CALM_PROBE_MIN_BYTES).min(scarcity_cushion(total, unit).max(unit));
+        let probe = unit.max(CALM_PROBE_MIN_BYTES).min(threshold.max(unit));
         let next = cap.bytes.saturating_add(probe);
         if held.saturating_add(probe) > cap.bytes && room >= next {
             cap.bytes = next;
@@ -817,7 +846,11 @@ mod tests {
     /// The counters' lag, λ_h.
     const LAG: Duration = Duration::from_millis(100);
 
-    fn obs(at: Instant, total: u64, machine: u64, held: u64, free: u64, unit: u64, events: u64, pressure: seismic::PressureLevel) -> Observed {
+    /// Typical macOS 64 GiB XNU background reclaim band above `free_target`
+    /// (`50_000 * 16 KiB - 256 MiB = 525.25 MiB`).
+    const MACOS_64G_BAND: u64 = 50_000 * 16_384 - 256 * MB;
+
+    fn obs(at: Instant, reclaim_band: u64, machine: u64, held: u64, free: u64, unit: u64, events: u64, pressure: seismic::PressureLevel) -> Observed {
         let paging = Paging {
             harm: Some(seismic::Harm { machine, own: 0 }),
             page_bytes: 16 * 1024,
@@ -826,7 +859,7 @@ mod tests {
             pressure: Some(pressure),
             counted: seismic::Counted { at, lag: LAG },
         };
-        Observed { paging, total, allocated: held, held, room: held + free, free, unit, events, committed: 20 * GB }
+        Observed { paging, reclaim_band, others_step: 0, allocated: held, held, room: held + free, free, unit, events, committed: 20 * GB }
     }
 
     /// Normal OS compression/wakeup activity (e.g. a few MB/s of lazy
@@ -837,34 +870,34 @@ mod tests {
     fn normal_background_decompressions_and_abundant_bursts_never_harm() {
         let mut boundary = Boundary::default();
         let start = Instant::now();
-        let total = 64 * GB;
+        let band = MACOS_64G_BAND;
         let unit = 256 * MB;
         let page = 16 * 1024;
-        boundary.observe(obs(start, total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
-        boundary.observe(obs(start + Duration::from_secs(1), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start, band, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(1), band, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
         assert!(boundary.judges());
 
         // Continuous 20 MB/s background decompressions even with free = 0 remain well below THRASH_RATE_BPS (64 MiB/s).
         let mut pages = 0u64;
         for tick in 2..=6 {
             pages += (20 * MB) / page;
-            boundary.observe(obs(start + Duration::from_secs(tick), total, pages, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+            boundary.observe(obs(start + Duration::from_secs(tick), band, pages, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
             assert_eq!(boundary.cap(), None, "normal compression touch tick {tick} must not set B");
             assert_eq!(boundary.harmed(), None);
         }
 
-        // Single huge tab-switch / app wakeup while free headroom is abundant (4 GB > 2 GB cushion).
+        // Single huge tab-switch / app wakeup while free headroom is abundant (4 GB > threshold).
         pages += (512 * MB) / page;
-        boundary.observe(obs(start + Duration::from_secs(7), total, pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(7), band, pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Normal));
         pages += (512 * MB) / page;
-        boundary.observe(obs(start + Duration::from_secs(8), total, pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(8), band, pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Normal));
         assert_eq!(boundary.cap(), None, "paging under abundant free supply never sets B");
 
         // Multi-GB decompression burst when an app frees memory (free rises +4 GB).
         pages += (4 * GB) / page;
-        boundary.observe(obs(start + Duration::from_secs(9), total, pages, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(9), band, pages, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
         pages += (4 * GB) / page;
-        boundary.observe(obs(start + Duration::from_secs(10), total, pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(10), band, pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Normal));
         assert_eq!(boundary.cap(), None, "exogenous memory release must not be read as contention");
     }
 
@@ -874,17 +907,17 @@ mod tests {
     fn transient_one_shot_spike_does_not_fire_thrashing() {
         let mut boundary = Boundary::default();
         let start = Instant::now();
-        let total = 64 * GB;
+        let band = MACOS_64G_BAND;
         let unit = 256 * MB;
         let page = 16 * 1024;
-        boundary.observe(obs(start, total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
-        boundary.observe(obs(start + Duration::from_secs(1), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start, band, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(1), band, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
 
         // Single 150 MB/s spike for 1s, then back to calm 4 MB/s.
         let spike = (150 * MB) / page;
-        boundary.observe(obs(start + Duration::from_secs(2), total, spike, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(2), band, spike, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
         assert_eq!(boundary.cap(), None);
-        boundary.observe(obs(start + Duration::from_secs(3), total, spike + (4 * MB) / page, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(3), band, spike + (4 * MB) / page, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
         assert_eq!(boundary.cap(), None, "one-shot wakeup never sets B");
     }
 
@@ -896,17 +929,17 @@ mod tests {
     fn sustained_thrashing_under_scarcity_caps_without_snapping_or_self_lifting() {
         let mut boundary = Boundary::default();
         let start = Instant::now();
-        let total = 64 * GB;
+        let band = MACOS_64G_BAND;
         let unit = 256 * MB;
         let page = 16 * 1024;
-        boundary.observe(obs(start, total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
-        boundary.observe(obs(start + Duration::from_secs(1), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start, band, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(1), band, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
 
         // Two consecutive 1s spans at 128 MB/s under scarcity (excess = 2 * 64 MB = 128 MB).
         let rate_pages = (128 * MB) / page;
-        boundary.observe(obs(start + Duration::from_secs(2), total, rate_pages, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(2), band, rate_pages, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
         assert_eq!(boundary.cap(), None, "first span arms without firing yet");
-        boundary.observe(obs(start + Duration::from_secs(3), total, 2 * rate_pages, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(3), band, 2 * rate_pages, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
         let first_cap = boundary.cap().expect("second sustained thrash span sets B");
         assert_eq!(first_cap, 30 * GB - 128 * MB);
 
@@ -915,18 +948,18 @@ mod tests {
         // must NOT self-lift B.
         let held_after_shrink = first_cap - 600 * MB;
         let free_from_shrink = 728 * MB;
-        boundary.observe(obs(start + Duration::from_secs(4), total, 2 * rate_pages, held_after_shrink, free_from_shrink, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(4), band, 2 * rate_pages, held_after_shrink, free_from_shrink, unit, 0, seismic::PressureLevel::Normal));
         assert_eq!(boundary.cap(), Some(first_cap), "own shrink must never self-lift B");
 
         // Renewed sustained thrashing at 128 MB/s tightens cap in place by excess alone, never snapping to `held`.
-        boundary.observe(obs(start + Duration::from_secs(5), total, 3 * rate_pages, held_after_shrink, free_from_shrink, unit, 0, seismic::PressureLevel::Normal));
-        boundary.observe(obs(start + Duration::from_secs(6), total, 4 * rate_pages, held_after_shrink, free_from_shrink, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(5), band, 3 * rate_pages, held_after_shrink, free_from_shrink, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(6), band, 4 * rate_pages, held_after_shrink, free_from_shrink, unit, 0, seismic::PressureLevel::Normal));
         let second_cap = boundary.cap().expect("standing B tightens cleanly");
         assert!(second_cap > held_after_shrink + 400 * MB);
         assert_eq!(second_cap, first_cap - 128 * MB);
 
         // Calm exogenous app release lifts B once `held + free >= anchor + step` and `free >= cap.free + step`.
-        boundary.observe(obs(start + Duration::from_secs(7), total, 4 * rate_pages, held_after_shrink, free_from_shrink + GB, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(7), band, 4 * rate_pages, held_after_shrink, free_from_shrink + GB, unit, 0, seismic::PressureLevel::Normal));
         assert_eq!(boundary.cap(), None, "exogenous free lifts B cleanly");
     }
 
@@ -935,20 +968,20 @@ mod tests {
     /// - `Warn` past 1 s only on level-triggered / unjudged OSes (`harm: None`,
     ///   e.g. Windows `LowMemoryResourceNotification`), never on judged OSes
     ///   (macOS/Linux) where standing `Warn` is normal desktop compressor state;
-    /// - `Critical` past 250 ms on every OS while `free <= scarcity_cushion`;
-    /// - neither fires when immediate `free` exceeds `scarcity_cushion`.
+    /// - `Critical` past 250 ms on every OS while `free <= scarcity_threshold`;
+    /// - neither fires when immediate `free` exceeds `scarcity_threshold`.
     #[test]
     fn standing_pressure_yields_past_dwell_even_without_edge_events() {
         let start = Instant::now();
-        let total = 64 * GB;
+        let band = MACOS_64G_BAND;
         let unit = 256 * MB;
         let unjudged = |at, held, free, pressure| {
-            let mut o = obs(at, total, 0, held, free, unit, 0, pressure);
+            let mut o = obs(at, 0, 0, held, free, unit, 0, pressure);
             o.paging.harm = None;
             o
         };
 
-        // Level-triggered / unjudged OS (Windows): Warn past 1s under scarcity yields.
+        // Level-triggered / unjudged OS (Windows, reclaim_band = 0): Warn past 1s under scarcity yields.
         let mut boundary = Boundary::default();
         boundary.observe(unjudged(start, 30 * GB, 0, seismic::PressureLevel::Normal));
         boundary.observe(unjudged(start + Duration::from_millis(100), 30 * GB, 0, seismic::PressureLevel::Warn));
@@ -965,7 +998,7 @@ mod tests {
         assert_eq!(boundary.pressed(), Some(seismic::PressureLevel::Critical));
         assert_eq!(boundary.cap(), Some(30 * GB - 2 * unit));
 
-        // Abundant free supply (+4 GB exogenous release above 2 GB cushion)
+        // Abundant free supply (+4 GB exogenous release above threshold)
         // suppresses standing dwell and lifts the standing cap even while Critical
         // has not yet cleared.
         boundary.observe(unjudged(start + Duration::from_millis(2500), 30 * GB, 4 * GB, seismic::PressureLevel::Critical));
@@ -975,16 +1008,16 @@ mod tests {
         // Judged OS (macOS / Linux): standing Warn with events == 0 NEVER drains,
         // even for 60s, while Critical under scarcity still yields at 250ms.
         let mut macos = Boundary::default();
-        macos.observe(obs(start, total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
+        macos.observe(obs(start, band, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Normal));
         for sec in 1..=60 {
-            macos.observe(obs(start + Duration::from_secs(sec), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Warn));
+            macos.observe(obs(start + Duration::from_secs(sec), band, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Warn));
             assert_eq!(macos.pressed(), None, "standing Warn on macOS/Linux must never drain (sec {sec})");
             assert_eq!(macos.cap(), None);
         }
         // Escalation to Critical under scarcity starts dwell cleanly and yields after 250ms.
-        macos.observe(obs(start + Duration::from_secs(61), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Critical));
+        macos.observe(obs(start + Duration::from_secs(61), band, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Critical));
         assert_eq!(macos.pressed(), None);
-        macos.observe(obs(start + Duration::from_millis(61_250), total, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Critical));
+        macos.observe(obs(start + Duration::from_millis(61_250), band, 0, 30 * GB, 0, unit, 0, seismic::PressureLevel::Critical));
         assert_eq!(macos.pressed(), Some(seismic::PressureLevel::Critical));
         assert_eq!(macos.cap(), Some(30 * GB - unit));
     }
@@ -997,44 +1030,44 @@ mod tests {
     fn standing_warn_never_false_harms_and_lifts_cap_from_trough_on_recovery() {
         let mut boundary = Boundary::default();
         let start = Instant::now();
-        let total = 64 * GB;
+        let band = MACOS_64G_BAND;
         let unit = 256 * MB;
         let page = 16 * 1024;
-        boundary.observe(obs(start, total, 0, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
-        boundary.observe(obs(start + Duration::from_secs(1), total, 0, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
+        boundary.observe(obs(start, band, 0, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
+        boundary.observe(obs(start + Duration::from_secs(1), band, 0, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
         assert!(boundary.judges());
 
-        // High-rate lazy decompressions (128 MiB/s) under standing Warn with 4 GB free (> 2 GB cushion):
+        // High-rate lazy decompressions (128 MiB/s) under standing Warn with 4 GB free (> threshold):
         // must NOT fire Harm because immediate free supply is abundant.
         let rate_pages = (128 * MB) / page;
-        boundary.observe(obs(start + Duration::from_secs(2), total, rate_pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
-        boundary.observe(obs(start + Duration::from_secs(3), total, 2 * rate_pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
+        boundary.observe(obs(start + Duration::from_secs(2), band, rate_pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
+        boundary.observe(obs(start + Duration::from_secs(3), band, 2 * rate_pages, 30 * GB, 4 * GB, unit, 0, seismic::PressureLevel::Warn));
         assert_eq!(boundary.harmed(), None, "standing Warn with abundant free must not fire Harm");
         assert_eq!(boundary.cap(), None);
 
         // Competing app grows +10 GB: triggers pressure events, pushes room down from 30 GB to 20 GB.
-        boundary.observe(obs(start + Duration::from_secs(4), total, 2 * rate_pages, 30 * GB, 0, unit, 1, seismic::PressureLevel::Warn));
+        boundary.observe(obs(start + Duration::from_secs(4), band, 2 * rate_pages, 30 * GB, 0, unit, 1, seismic::PressureLevel::Warn));
         assert_eq!(boundary.cap(), Some(30 * GB - unit));
         for tick in 5..=14 {
             let held = 30 * GB - (tick - 4) * GB;
-            boundary.observe(obs(start + Duration::from_secs(tick), total, 2 * rate_pages, held, 0, unit, 1, seismic::PressureLevel::Warn));
+            boundary.observe(obs(start + Duration::from_secs(tick), band, 2 * rate_pages, held, 0, unit, 1, seismic::PressureLevel::Warn));
         }
         assert!(boundary.cap().is_some());
 
         // Competing app exits, freeing 10 GB: room recovers from trough (20 GB) to 30 GB,
-        // free jumps to 10 GB (> cushion), even while macOS stays at standing Warn.
-        boundary.observe(obs(start + Duration::from_secs(15), total, 2 * rate_pages, 20 * GB, 10 * GB, unit, 0, seismic::PressureLevel::Warn));
+        // free jumps to 10 GB (> threshold), even while macOS stays at standing Warn.
+        boundary.observe(obs(start + Duration::from_secs(15), band, 2 * rate_pages, 20 * GB, 10 * GB, unit, 0, seismic::PressureLevel::Warn));
         assert_eq!(boundary.cap(), None, "exogenous recovery from trough must lift cap even under standing Warn");
 
-        // Abundant free supply (> total/2) suppresses even edge pressure events
-        // (e.g. Linux PSI compaction stalls when >50% of host RAM is free).
-        boundary.observe(obs(start + Duration::from_secs(16), total, 2 * rate_pages, 20 * GB, 36 * GB, unit, 1, seismic::PressureLevel::Critical));
-        assert_eq!(boundary.pressed(), None, "pressure event with >50% of total RAM free must not fire");
+        // Abundant free supply suppresses even edge pressure events
+        // (e.g. Linux PSI compaction stalls when tens of GiB are free).
+        boundary.observe(obs(start + Duration::from_secs(16), band, 2 * rate_pages, 20 * GB, 36 * GB, unit, 1, seismic::PressureLevel::Critical));
+        assert_eq!(boundary.pressed(), None, "pressure event with abundant free RAM must not fire");
         assert_eq!(boundary.cap(), None);
     }
 
     /// Linux GGUF page-cache scenario (`total = 64 GiB`, `free_beyond_target = 16 GiB`,
-    /// `clean_cache = 24 GiB`, immediate reclaimable supply = `40 GiB > total / 2`):
+    /// `clean_cache = 24 GiB`, immediate reclaimable supply = `40 GiB`):
     /// `Critical` PSI blips and file-cache refaults must NOT fire `Pressure(Critical)`
     /// or `Harm` or ratchet down `Cap`. Also verifies `Cap::bytes` never ratchets
     /// below `committed` on repeated pressure events at floor.
@@ -1042,6 +1075,7 @@ mod tests {
     fn linux_gguf_clean_page_cache_suppresses_critical_psi_and_cap_stays_above_committed() {
         let start = Instant::now();
         let total = 64 * GB;
+        let band = 64 * MB; // Linux 64 GiB zone (high - low)
         let unit = 256 * MB;
         let page = 16 * 1024;
         let sample = seismic::HostSample {
@@ -1051,6 +1085,7 @@ mod tests {
                 clean_cache: 24 * GB,
                 cold_reclaimable: 0,
             },
+            reclaim_band: band,
             wired: None,
             pressure: Some(seismic::PressureLevel::Critical),
             ..seismic::host_samples::m4_pro()
@@ -1061,34 +1096,33 @@ mod tests {
             .unwrap_or(0)
             .saturating_add(reading.clean_cache_supply());
         assert_eq!(immediate_supply, 40 * GB);
-        assert!(immediate_supply > total / 2);
 
         let mut boundary = Boundary::default();
-        boundary.observe(obs(start, total, 0, 22 * GB, immediate_supply, unit, 0, seismic::PressureLevel::Normal));
-        boundary.observe(obs(start + Duration::from_secs(1), total, 0, 22 * GB, immediate_supply, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start, band, 0, 22 * GB, immediate_supply, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(1), band, 0, 22 * GB, immediate_supply, unit, 0, seismic::PressureLevel::Normal));
         assert!(boundary.judges());
 
         // Critical PSI edge event + high-rate refaults (128 MiB/s over 2s) while
-        // free + clean_cache = 40 GiB (> 32 GiB): neither Pressure nor Harm fires.
+        // free + clean_cache = 40 GiB: neither Pressure nor Harm fires.
         let rate_pages = (128 * MB) / page;
-        boundary.observe(obs(start + Duration::from_secs(2), total, rate_pages, 22 * GB, immediate_supply, unit, 1, seismic::PressureLevel::Critical));
+        boundary.observe(obs(start + Duration::from_secs(2), band, rate_pages, 22 * GB, immediate_supply, unit, 1, seismic::PressureLevel::Critical));
         assert_eq!(boundary.pressed(), None, "Critical PSI with 40/64 GiB free+clean must not fire");
         assert_eq!(boundary.harmed(), None);
         assert_eq!(boundary.cap(), None);
 
-        boundary.observe(obs(start + Duration::from_secs(3), total, 2 * rate_pages, 22 * GB, immediate_supply, unit, 1, seismic::PressureLevel::Critical));
+        boundary.observe(obs(start + Duration::from_secs(3), band, 2 * rate_pages, 22 * GB, immediate_supply, unit, 1, seismic::PressureLevel::Critical));
         assert_eq!(boundary.pressed(), None, "repeated Critical PSI with 40/64 GiB free+clean must not fire");
-        assert_eq!(boundary.harmed(), None, "Critical PSI with >50% free+clean must not mark host scarce for Harm");
+        assert_eq!(boundary.harmed(), None, "Critical PSI with abundant free+clean must not mark host scarce for Harm");
         assert_eq!(boundary.cap(), None);
 
         // Under genuine scarcity at floor (held == committed == 20 GiB), repeated
         // pressure events never ratchet `cap.bytes` below committed.
         let mut floored = Boundary::default();
         for tick in 0..10 {
-            floored.observe(obs(start + Duration::from_secs(tick), total, 0, 20 * GB, 0, unit, 1, seismic::PressureLevel::Critical));
+            floored.observe(obs(start + Duration::from_secs(tick), band, 0, 20 * GB, 0, unit, 1, seismic::PressureLevel::Critical));
             assert_eq!(floored.cap(), Some(20 * GB));
         }
-        let mut lower_committed = obs(start + Duration::from_secs(10), total, 0, 20 * GB, 0, unit, 0, seismic::PressureLevel::Normal);
+        let mut lower_committed = obs(start + Duration::from_secs(10), band, 0, 20 * GB, 0, unit, 0, seismic::PressureLevel::Normal);
         lower_committed.committed = 16 * GB;
         floored.observe(lower_committed);
         assert_eq!(floored.cap(), Some(20 * GB), "cap.bytes must never have ratcheted below the committed floor");
@@ -1107,7 +1141,6 @@ mod tests {
     fn harm_wall_never_sawtooths_on_cold_reaging_or_own_shrink_and_backs_off_probes() {
         let mut boundary = Boundary::default();
         let start = Instant::now();
-        let total = 64 * GB;
         let unit = 68 * MB;
         let committed = 7 * GB;
         let page = 16 * 1024;
@@ -1120,7 +1153,8 @@ mod tests {
                 pressure: Some(seismic::PressureLevel::Normal),
                 counted: seismic::Counted { at, lag: LAG },
             },
-            total,
+            reclaim_band: MACOS_64G_BAND,
+            others_step: 0,
             allocated: held,
             held,
             room: held + free + cold,
@@ -1205,49 +1239,91 @@ mod tests {
 
     /// Reproduces the `sparky` 122 GiB unified CUDA Linux PSI regression:
     /// with a 46 GiB model resident and 39 GiB of clean page cache (`< total/2`
-    /// = 61 GiB, yet far above `scarcity_cushion` = 2 GiB), a Linux PSI
-    /// `Critical` edge event from clean-cache reclaim/compaction must NOT fire
-    /// `Pressure(Critical)` or latch `cap`; and if a `cap` was latched under
-    /// genuine scarcity, exogenous free recovery above `scarcity_cushion` must
-    /// lift `cap` immediately even while PSI's 10 s `avg10` still reads `Critical`.
+    /// = 61 GiB, yet far above `scarcity_threshold` = `reclaim_band + unit`), a
+    /// Linux PSI `Critical` edge event from clean-cache reclaim/compaction must
+    /// NOT fire `Pressure(Critical)` or latch `cap`; and if a `cap` was latched
+    /// under genuine scarcity, exogenous free recovery above
+    /// `scarcity_threshold` must lift `cap` immediately even while PSI's 10 s
+    /// `avg10` still reads `Critical`.
     #[test]
     fn non_scarce_clean_cache_below_half_total_suppresses_critical_psi_and_lifts_cap_on_recovery() {
         let mut boundary = Boundary::default();
         let start = Instant::now();
         let total = 122 * GB;
+        let band = 125 * MB; // Linux 122 GiB zone (high - low)
         let held = 46 * GB;
         let free = 39 * GB;
         let unit = 65 * MB;
         let page = 4096;
         assert!(free < total / 2, "below half of total RAM");
-        assert!(free > scarcity_cushion(total, unit), "far above scarcity cushion");
+        assert!(free > scarcity_threshold(band, unit, 0), "far above derived scarcity threshold");
 
-        boundary.observe(obs(start, total, 0, held, free, unit, 0, seismic::PressureLevel::Normal));
-        boundary.observe(obs(start + Duration::from_secs(1), total, 0, held, free, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start, band, 0, held, free, unit, 0, seismic::PressureLevel::Normal));
+        boundary.observe(obs(start + Duration::from_secs(1), band, 0, held, free, unit, 0, seismic::PressureLevel::Normal));
         assert!(boundary.judges());
 
         // Transient Critical PSI edge event + high-rate file refaults with 39 GiB clean cache:
         // must neither fire Pressure(Critical) nor Harm nor latch cap.
         let rate_pages = (128 * MB) / page;
-        boundary.observe(obs(start + Duration::from_secs(2), total, rate_pages, held, free, unit, 1, seismic::PressureLevel::Critical));
+        boundary.observe(obs(start + Duration::from_secs(2), band, rate_pages, held, free, unit, 1, seismic::PressureLevel::Critical));
         assert_eq!(boundary.pressed(), None, "Critical PSI with 39 GiB free+clean must not fire");
         assert_eq!(boundary.harmed(), None);
         assert_eq!(boundary.cap(), None, "cap must not latch when immediate supply is non-scarce");
 
-        boundary.observe(obs(start + Duration::from_secs(3), total, 2 * rate_pages, held, free, unit, 1, seismic::PressureLevel::Critical));
+        boundary.observe(obs(start + Duration::from_secs(3), band, 2 * rate_pages, held, free, unit, 1, seismic::PressureLevel::Critical));
         assert_eq!(boundary.pressed(), None);
         assert_eq!(boundary.harmed(), None);
         assert_eq!(boundary.cap(), None);
 
-        // Under genuine scarcity (`free = 0 <= 2 GiB`), Critical PSI fires and latches cap.
-        boundary.observe(obs(start + Duration::from_secs(4), total, 2 * rate_pages, held, 0, unit, 1, seismic::PressureLevel::Critical));
+        // Under genuine scarcity (`free = 0 <= threshold`), Critical PSI fires and latches cap.
+        boundary.observe(obs(start + Duration::from_secs(4), band, 2 * rate_pages, held, 0, unit, 1, seismic::PressureLevel::Critical));
         assert_eq!(boundary.pressed(), Some(seismic::PressureLevel::Critical));
         assert_eq!(boundary.cap(), Some(held - unit));
 
-        // Competing app exits, freeing 10 GiB (`free = 10 GiB > 2 GiB`) while Linux PSI's
+        // Competing app exits, freeing 10 GiB (`free = 10 GiB > threshold`) while Linux PSI's
         // 10 s avg10 still reports standing Critical with 0 new events: cap lifts cleanly.
-        boundary.observe(obs(start + Duration::from_secs(5), total, 2 * rate_pages, held - unit, 10 * GB, unit, 0, seismic::PressureLevel::Critical));
+        boundary.observe(obs(start + Duration::from_secs(5), band, 2 * rate_pages, held - unit, 10 * GB, unit, 0, seismic::PressureLevel::Critical));
         assert_eq!(boundary.pressed(), None);
-        assert_eq!(boundary.cap(), None, "exogenous recovery above scarcity cushion lifts cap even while PSI avg10 decays from Critical");
+        assert_eq!(boundary.cap(), None, "exogenous recovery above scarcity threshold lifts cap even while PSI avg10 decays from Critical");
+    }
+
+    /// Derived scarcity threshold equals `reclaim_band + unit + others_step`:
+    /// competing-process allocation bursts (`others_step`) expand the scarcity
+    /// horizon without magic percentages, and `pinned_headroom` preserves the
+    /// exact same total without double-counting `guarantee`.
+    #[test]
+    fn derived_scarcity_threshold_covers_reclaim_band_unit_and_others_step() {
+        let band = 125 * MB;
+        let unit = 384 * MB;
+        let others_step = 512 * MB;
+        assert_eq!(scarcity_threshold(band, unit, others_step), band + unit + others_step);
+
+        // With free = 800 MiB: above `band + unit` (509 MiB) when idle, so a
+        // Critical edge event does not fire; once competing processes rise by
+        // 512 MiB (`others_step`), threshold = 1021 MiB >= 800 MiB and the
+        // exact same free level is scarce.
+        let start = Instant::now();
+        let mut boundary = Boundary::default();
+        boundary.observe(obs(start, band, 0, 30 * GB, 800 * MB, unit, 1, seismic::PressureLevel::Critical));
+        assert_eq!(boundary.pressed(), None, "idle free above reclaim_band + unit is not scarce");
+
+        let mut competing = obs(start + Duration::from_secs(1), band, 0, 30 * GB, 800 * MB, unit, 1, seismic::PressureLevel::Critical);
+        competing.others_step = others_step;
+        boundary.observe(competing);
+        assert_eq!(boundary.pressed(), Some(seismic::PressureLevel::Critical), "competing allocation step makes free <= threshold scarce");
+
+        // `pinned_reserve(unit) + guarantee == scarcity_threshold(band, unit, guarantee)`.
+        let sample = seismic::HostSample {
+            supply: seismic::Supply { free_beyond_target: (2 * GB) as i64, clean_cache: 0, cold_reclaimable: 0 },
+            reclaim_band: band,
+            ..seismic::host_samples::m4_pro()
+        };
+        let reading = Reading::host(&sample);
+        assert_eq!(reading.pinned_reserve(unit), band + unit);
+        assert_eq!(
+            reading.pinned_headroom(others_step, unit),
+            2 * GB - scarcity_threshold(band, unit, others_step),
+            "pinned_headroom preserves reclaim_band + unit + guarantee without double-counting"
+        );
     }
 }

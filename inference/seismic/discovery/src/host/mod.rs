@@ -144,6 +144,16 @@ pub struct HostSample {
     /// Bytes of the binding scope.
     pub total: u64,
     pub supply: Supply,
+    /// The OS's own active reclaim band above the floor already subtracted
+    /// from [`Supply::free_beyond_target`], in bytes:
+    /// - Linux: the zones' `high − low` watermark span (`/proc/zoneinfo`, or
+    ///   the kernel's `watermark_scale_factor` / `min_free_kbytes` distance),
+    ///   scoped to allowed NUMA nodes where `Mems_allowed` binds.
+    /// - macOS: `vm.vm_page_background_target` above `free_target` (`0` where
+    ///   unreported).
+    /// - Windows: `0` (`windows_floor` is already subtracted from
+    ///   `free_beyond_target`).
+    pub reclaim_band: u64,
     /// When the counters below show the machine.
     pub counted: Counted,
     /// Cold anonymous pages machine-wide and, where the OS isolates it

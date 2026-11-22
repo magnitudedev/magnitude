@@ -2825,8 +2825,8 @@ fn stable_live_status_and_live_ledger_agree_on_store_demands() {
     let cuda = executor(&rtx3090, BackendName::Cuda);
     let mut rtx_status = unopened(&rtx3090);
     // On a split GPU, `MemoryBudget` sizes host RAM through the single pinned
-    // headroom owner (`Reading::pinned_headroom`), reserving `scarcity_cushion`
-    // (2 GiB on 64 GiB) and never counting swap-backed `cold_reclaimable`.
+    // headroom owner (`Reading::pinned_headroom`), reserving `pinned_reserve`
+    // (`reclaim_band + unit`) and never counting swap-backed `cold_reclaimable`.
     let rtx_reserve = crate::memory::supply::Reading::host(&rtx_status.sample.host).pinned_reserve(0);
     rtx_status.sample.host.supply = seismic::Supply {
         free_beyond_target: i64::try_from(2 * GIB + rtx_reserve).unwrap(),

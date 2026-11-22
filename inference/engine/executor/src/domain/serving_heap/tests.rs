@@ -269,6 +269,7 @@ fn exogenous_shrink_damps_ping_pong_until_cooldown_or_large_release() {
             page_bytes: 16 * 1024,
             total: TOTAL,
             supply: seismic::Supply { free_beyond_target, clean_cache: 0, cold_reclaimable: 0 },
+            reclaim_band: 0,
             counted: seismic::Counted { at, lag: Duration::ZERO },
             cold: seismic::ColdPages::default(),
             own_reclaimed: Some(seismic::OwnReclaimed::NONE),

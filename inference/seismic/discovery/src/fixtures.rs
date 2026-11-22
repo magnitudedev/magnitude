@@ -18,6 +18,9 @@ pub fn m4_pro() -> HostSample {
         page_bytes: 16_384,
         total: 51_539_607_552,
         supply: Supply { free_beyond_target: 18_506_711_040, clean_cache: 29_273_047_040, cold_reclaimable: 0 },
+        // XNU `vm.vm_page_background_target` (50_000 pages) above `free_target`
+        // (12_288 pages = 192 MiB on 48 GiB), at 16 KiB/page = 589.25 MiB.
+        reclaim_band: (50_000 - 12_288) * 16_384,
         counted: Counted { at, lag: Duration::from_secs(1) },
         cold: ColdPages { machine: 0, own: None },
         own_reclaimed: Some(OwnReclaimed::NONE),

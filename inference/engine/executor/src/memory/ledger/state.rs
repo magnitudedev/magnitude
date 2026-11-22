@@ -258,7 +258,11 @@ impl State {
     /// # Panics
     /// Where pooled cache is held in a store whose pool of that class is not
     /// open.
-    pub(super) fn unit(&self) -> u64 {
+    /// The store's block granularity: the largest open pool's block size, or
+    /// the largest non-pooled cache entry where no pool is open (`0` when
+    /// neither exists). Used as the allocation/reclaim granularity in
+    /// `Reading::pinned_reserve` even before the first block is filled.
+    pub(super) fn block_unit(&self) -> u64 {
         for entry in self.held.values() {
             if entry.bytes > 0 {
                 if let Some(class) = entry.holding.pool_class().filter(|_| entry.holding.pooled()) {
@@ -271,8 +275,7 @@ impl State {
                 }
             }
         }
-        let unit = self
-            .pools
+        self.pools
             .iter()
             .filter_map(|slot| slot.pool.as_ref())
             .map(|pool| pool.block.get())
@@ -284,8 +287,13 @@ impl State {
                     .map(|entry| entry.bytes)
                     .max()
             })
-            .unwrap_or(0);
-        unit.min(self.cache)
+            .unwrap_or(0)
+    }
+
+    /// What one pressure event lowers B by: one block of the store's pool (or
+    /// largest non-pooled cache entry), bounded by the cache currently held.
+    pub(super) fn unit(&self) -> u64 {
+        self.block_unit().min(self.cache)
     }
 
     /// What pooled holdings of `class` hold: the granules the class's

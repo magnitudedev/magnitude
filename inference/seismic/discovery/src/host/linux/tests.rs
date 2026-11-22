@@ -87,7 +87,9 @@ fn the_floor_is_the_zones_low_watermarks() {
         "/proc/zoneinfo",
         "Node 0, zone   Normal\n  pages free     3\n        min      10\n        low      12\n        high     14\n        protection: (0, 0)\nNode 0, zone DMA32\n        low      5\n",
     );
-    assert_eq!(sample(&*machine).supply.free_beyond_target, (8 * GB - 17 * 4096) as i64);
+    let s = sample(&*machine);
+    assert_eq!(s.supply.free_beyond_target, (8 * GB - 17 * 4096) as i64);
+    assert_eq!(s.reclaim_band, 2 * 4096);
 }
 
 /// Where `/proc/zoneinfo` is refused, the floor is the kernel's formula
@@ -100,9 +102,12 @@ fn the_floor_is_the_kernels_formula_where_zoneinfo_is_refused() {
     machine.file("/proc/sys/vm/min_free_kbytes", "67584\n");
     machine.file("/proc/sys/vm/watermark_scale_factor", "10\n");
     let min_free = 67584 * 1024;
-    let floor = min_free + (min_free / 4).max(16 * GB * 10 / 10_000);
+    let distance = (min_free / 4).max(16 * GB * 10 / 10_000);
+    let floor = min_free + distance;
     assert_eq!(floor, 86_507_520);
-    assert_eq!(sample(&*machine).supply.free_beyond_target, (8 * GB - floor) as i64);
+    let s = sample(&*machine);
+    assert_eq!(s.supply.free_beyond_target, (8 * GB - floor) as i64);
+    assert_eq!(s.reclaim_band, distance);
 }
 
 /// Where the tunables are refused too, the formula takes the kernel's
