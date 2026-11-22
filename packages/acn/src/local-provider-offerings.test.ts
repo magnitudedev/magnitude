@@ -137,7 +137,7 @@ const unavailable = (model: AvailableCatalogLocalModel, support: CatalogSupport)
     catalogData: {
       ...model.catalogData,
       support,
-      intelligence: support._tag === "Disabled" ? Option.some(intelligence) : intelligence,
+      intelligence: support._tag === "Supported" ? intelligence : Option.some(intelligence),
     },
   })
 }
