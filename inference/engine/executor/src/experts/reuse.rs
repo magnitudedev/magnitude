@@ -138,6 +138,21 @@ impl Rows {
         self.depths.contains(&depth)
     }
 
+    /// Number of rows in this layer's routing keys.
+    pub(in crate::experts) fn row_count(&self) -> usize {
+        self.depths.len()
+    }
+
+    /// Chosen expert indices of row `row` (`0..self.row_count()`), ascending.
+    pub(in crate::experts) fn row_experts(&self, row: usize) -> Vec<usize> {
+        let start = row * self.experts;
+        self.chosen[start..start + self.experts]
+            .iter()
+            .enumerate()
+            .filter_map(|(expert, &picked)| picked.then_some(expert))
+            .collect()
+    }
+
     /// The rows of depth `depth` merged: each expert's combined prior
     /// `1 − Π_r (1 − π_{r,e})` and whether any row of that depth chose it;
     /// none where no row has that depth.

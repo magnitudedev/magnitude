@@ -1931,3 +1931,46 @@ fn stale_slow_wide_verify_expires_on_read_past_stale_rounds() {
         costs.verify(8)
     );
 }
+
+/// Reproduces `53f185` (`v710-sc` DFlash): after a `RegimeEpoch` advance (e.g.
+/// `LinkMover` activation) clears `plain`, `plain_look` uses the current
+/// regime's derived plain prior (`37 ms` = 27 tok/s) as its floor instead of
+/// assuming `gain = 1.0`, so drafting at ~55 tok/s burns ZERO width-0 plain
+/// bursts mid-request.
+#[test]
+fn regime_epoch_change_with_derived_plain_prior_does_not_burn_plain_look_bursts() {
+    let load = Arc::new(DraftLoad::default());
+    // Regime 1 -> Regime 2 transition clears target_costs (including plain).
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.037, 0.055, 0.070, 0.080, 0.090, 0.100, 0.108, 0.116],
+    }));
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 2,
+        verify_seconds: vec![0.037, 0.055, 0.070, 0.080, 0.090, 0.100, 0.108, 0.116],
+    }));
+
+    let mut ctrl = DraftController::new(7, load.clone());
+    let mut plain_rounds = 0usize;
+    for _ in 0..40 {
+        let g = ctrl.generate(7, CONTEXT, true);
+        if g == 0 {
+            plain_rounds += 1;
+            ctrl.timed(TimedLaunch::Target, Some(LaunchDuration::settled(Duration::from_millis(37))), 1, 1);
+            ctrl.committed(&[TokenId(1)]);
+            continue;
+        }
+        ctrl.timed(TimedLaunch::Draft, Some(LaunchDuration::settled(Duration::from_millis(15))), 1, g);
+        let block: Vec<TokenId> = (1..=g as u32).map(TokenId).collect();
+        ctrl.drafted(g, &block, None);
+        let v = ctrl.verify(7);
+        ctrl.timed(TimedLaunch::Target, Some(LaunchDuration::settled(Duration::from_millis(116))), 1, v + 1);
+        let mut committed = block[..v].to_vec();
+        committed.push(TokenId(99));
+        ctrl.committed(&committed);
+    }
+    assert_eq!(
+        plain_rounds, 0,
+        "derived plain prior (37 ms = 27 tok/s) is far slower than drafting (~61 tok/s), so plain_look must burn 0 width-0 bursts"
+    );
+}

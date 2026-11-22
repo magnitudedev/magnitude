@@ -674,6 +674,48 @@ impl<'a> RoundCosts<'a> {
         Some(last + (k - last_idx) as f64 * slope)
     }
 
+    /// Derived prior duration for plain decode (`rows == self.sequences`) from
+    /// the current regime's `StreamedVerifyPrior` (anchored to the nearest
+    /// fresh measured verify width if any) or non-banked `LaunchPrices`, without
+    /// falling back to stale `lesser_target()` measurements.
+    fn derived_plain_prior(&self) -> Option<f64> {
+        let rows = self.sequences.max(1);
+        if let Some(prior) = self.verify_prior {
+            if let Some(prior_rows) = Self::prior_verify_seconds(prior, self.sequences, rows) {
+                if let Some((&ref_rows, ref_dur)) = self.own_target().and_then(|own| {
+                    own.verify
+                        .iter()
+                        .filter(|(_, d)| d.is_fresh(self.round))
+                        .min_by_key(|(&r, _)| r.abs_diff(rows))
+                }) {
+                    if let Some(prior_ref) =
+                        Self::prior_verify_seconds(prior, self.sequences, ref_rows).filter(|&p| p > 0.0)
+                    {
+                        let anchored = ref_dur.cost() * (prior_rows / prior_ref);
+                        if anchored > 0.0 {
+                            return Some(anchored);
+                        }
+                    }
+                }
+                if prior_rows > 0.0 {
+                    return Some(prior_rows);
+                }
+            }
+        }
+        if self.own_target().is_none_or(|own| own.verify.is_empty()) {
+            if let Some(prior) = self.launch_prices.filter(|p| !p.is_banked()).and_then(|prices| {
+                prices
+                    .plain_seconds(rows as u32, self.context_class as u32)
+                    .ok()
+                    .map(|f| f.resident)
+                    .filter(|&s| s > 0.0)
+            }) {
+                return Some(prior);
+            }
+        }
+        None
+    }
+
     fn verify(&self, rows: usize) -> f64 {
         let is_non_plain = rows > self.sequences.max(1);
         let has_live = self.own_target().is_some_and(|own| {
@@ -1462,12 +1504,16 @@ impl DraftController {
         // whole of the switches it makes), on a round of the fastest pair,
         // so that a width kept past it goes on measuring itself.
         let plain_look = fastest > 0 && plain.is_none() && {
-            let floor = costs
+            let measured_floor = costs
                 .lesser_target()
                 .flat_map(|measured| measured.verify.range(..=costs.sequences))
                 .filter(|(_, durations)| round.saturating_sub(durations.latest()) < STALE_ROUNDS)
                 .map(|(_, durations)| durations.cost())
                 .reduce(f64::max);
+            let floor = match (measured_floor, costs.derived_plain_prior()) {
+                (Some(m), Some(p)) => Some(m.max(p)),
+                (m, p) => m.or(p),
+            };
             let gain = floor.map_or(1.0, |floor| (1.0 / floor / rate - 1.0).min(1.0));
             gain > 0.0 && {
                 state.plain_seconds += LOOK_SHARE * gain * costs.round(fastest, verified);

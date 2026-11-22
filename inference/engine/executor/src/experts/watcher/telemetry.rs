@@ -804,27 +804,80 @@ impl PassService {
     }
 }
 
-/// What one sequence's exact row's routes show (`routed`, each streamed
-/// layer's experts, ascending; `absent`, each layer's file misses among
-/// them), lagged against its tokens before (`recent`, most recent first),
-/// which it then joins: at each lag `j`, the experts it chose that none of
-/// the `j` tokens before chose, at every layer they were seen; its picks,
-/// and those the bank held.
-fn lagged(recent: &mut std::collections::VecDeque<Vec<Vec<usize>>>, routed: &[RoutedRead], absent: &[u64]) -> Routed {
+/// What one sequence's tokens' routes show (`routed`, each streamed layer's
+/// experts, ascending; `absent`, each layer's file misses among them; `keys`,
+/// per-layer per-row choices when available on multi-row verify/front passes),
+/// lagged against its tokens before (`recent`, most recent first), which they
+/// then join: at each lag `j`, the experts a token chose that none of the `j`
+/// tokens before chose, at every layer they were seen; its picks, and those
+/// the bank held.
+///
+/// On multi-row single-sequence passes (e.g. `Verify(5)` with 6 rows), feeding
+/// each row `0..=k` individually from `keys` measures true per-token lag
+/// sharing (`fresh[0..LAGS]`) on the very first pass instead of pushing the
+/// multi-row union as a single token (which flattened `fresh[j]` and caused
+/// `shadow_verify_misses` to overestimate wider verify passes linearly).
+fn lagged(
+    recent: &mut std::collections::VecDeque<Vec<Vec<usize>>>,
+    routed: &[RoutedRead],
+    absent: &[u64],
+    keys: Option<&StepKeys>,
+) -> Routed {
     let mut lags = Routed::default();
     for (layer, read) in routed.iter().enumerate() {
         lags.picks += read.choices as f64;
         lags.held += read.choices.saturating_sub(absent[layer]) as f64;
-        let mut seen = Vec::<usize>::new();
-        for (lag, before) in recent.iter().enumerate() {
-            seen.extend(&before[layer]);
-            lags.fresh[lag] += read.experts.iter().filter(|expert| !seen.contains(*expert)).count() as f64;
-            lags.layers[lag] += 1.;
-        }
     }
-    recent.push_front(routed.iter().map(|read| read.experts.clone()).collect());
-    recent.truncate(LAGS);
+    let mut push_token = |token_experts: Vec<Vec<usize>>| {
+        for (layer, experts) in token_experts.iter().enumerate() {
+            let mut seen = Vec::<usize>::new();
+            for (lag, before) in recent.iter().enumerate() {
+                seen.extend(&before[layer]);
+                lags.fresh[lag] += experts.iter().filter(|expert| !seen.contains(*expert)).count() as f64;
+                lags.layers[lag] += 1.;
+            }
+        }
+        recent.push_front(token_experts);
+        recent.truncate(LAGS);
+    };
+    if let Some(keys) = keys.filter(|k| k.layers.len() == routed.len() && k.depths.len() > 1) {
+        let per_layer: Vec<_> = (0..routed.len()).map(|layer| keys.rows(layer)).collect();
+        let rows = per_layer[0].row_count();
+        for row in 0..rows {
+            let token_experts = per_layer.iter().map(|layer_rows| layer_rows.row_experts(row)).collect();
+            push_token(token_experts);
+        }
+    } else {
+        let token_experts = routed.iter().map(|read| read.experts.clone()).collect();
+        push_token(token_experts);
+    }
     lags
+}
+
+/// Deduplication multiplier `M(depth) / u_1` matching
+/// `Regime::shadow_verify_misses`: converts a verify pass's total distinct
+/// misses across `1 + depth` rows back to the equivalent single-token miss
+/// rate `u_1` so `shadow_verify_misses(u_1, depth) == missed_total` exactly.
+fn verify_miss_scale(routed: &Routed, depth: usize) -> f64 {
+    if depth == 0 {
+        return 1.0;
+    }
+    let Some(f1) = (routed.layers[0] > 0.0).then(|| routed.fresh[0] / routed.layers[0]).filter(|&f| f > 0.0) else {
+        return (1 + depth) as f64;
+    };
+    let mut last = f1;
+    let mut extra = 0.0;
+    for j in 1..=depth {
+        let fj = if j - 1 < LAGS && routed.layers[j - 1] > 0.0 {
+            let v = routed.fresh[j - 1] / routed.layers[j - 1];
+            last = v;
+            v
+        } else {
+            last
+        };
+        extra += fj / f1;
+    }
+    1.0 + extra
 }
 
 /// A step still running: its accumulated cost, wall-clock wait intervals, and
@@ -1964,10 +2017,10 @@ impl Telemetry {
                 if let Some(launch) = decoded.as_ref().and_then(|decoded| decoded.0.0.launch) {
                     let decoded = decoded.as_ref().expect("a launch's step is decoded");
                     let absent = &decoded.4;
-                    // One sequence's exact row is its next token: its routes
-                    // lag against its tokens before.
+                    // One sequence's exact row (and its verify/front rows when
+                    // per-row keys are present) lags against its tokens before.
                     let routed = match launch.rows - launch.front().count_ones() as usize {
-                        1 => lagged(&mut costs.recent, &decoded.1, absent),
+                        1 => lagged(&mut costs.recent, &decoded.1, absent, decoded.0.1.as_deref()),
                         _ => {
                             costs.recent.clear();
                             Routed::default()
@@ -2040,7 +2093,7 @@ impl Telemetry {
                         // discarded rows analytically via `shadow_verify_misses` and
                         // live `Stands`).
                         let real = if verifies {
-                            missed_total / (1 + depth) as f64
+                            missed_total / verify_miss_scale(&routed, depth)
                         } else {
                             missed_total
                         };

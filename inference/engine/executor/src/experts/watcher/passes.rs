@@ -1032,4 +1032,80 @@ mod tests {
             "after tier_complete, high-acceptance decode must immediately widen to optimal verify depth"
         );
     }
+
+    /// Reproduces `20cf97` (`rtx5090`, Qwen3.8 MTP at 88.1% acceptance after
+    /// `tier_complete`): when `Verify(5)` runs in the new regime and per-token
+    /// decaying `fresh` routes are measured (rather than flat 6-row union lags),
+    /// `shadow_verify_misses` scales sub-linearly (+14% from depth 5 to 7) while
+    /// `emitted` grows +18%, so `Regime::pass()` widens from `Verify(5)` to
+    /// `Verify(7)` instead of locking at `Verify(5)`.
+    #[test]
+    fn verify_5_after_tier_complete_widens_to_verify_7_with_sublinear_fresh_routes() {
+        let (mut passes, time) = passes();
+        let stands = Stands::new(time.clone());
+
+        // Regime 1 (`tier_complete == true`): 4 bursts of Verify(5) at ~88%
+        // conditional acceptance, with true per-token decaying `fresh` routes.
+        assert!(time.lock().update_residency(|s| s.tier_complete = true));
+        time.lock().register(1, Advance::Known(Tokens::new(5.0)));
+        let mut routed = Routed::default();
+        let per_token_fresh = [3.10, 1.73, 1.33, 1.10, 0.95, 0.85, 0.78];
+        for (lag, &f) in per_token_fresh.iter().enumerate() {
+            routed.fresh[lag] = f * 48.0;
+            routed.layers[lag] = 48.0;
+        }
+        routed.picks = 480.0;
+        routed.held = 320.0;
+        passes.timed(Pass {
+            rows: 6,
+            depth: 5,
+            verifies: true,
+            seconds: 0.077,
+            parked: 0.0,
+            misses: 0.0,
+            missed: 240.0,
+            reads: 0.0,
+            drive: 0.0,
+            link: 0.048,
+            cpu: 0.062,
+            memory: 0.040,
+            served: 0.012,
+            routed,
+            ..Pass::default()
+        });
+        // Judge rows 1..=5 at ~92% conditional acceptance (~88% overall across 5 rows);
+        // rows 6..=7 are unjudged (`None`) and carry forward row 5's stand rate.
+        for row in 1..=5 {
+            for i in 0..12 {
+                stands.count(row, Form::Verify, i != 0); // 11/12 = 91.7%
+            }
+        }
+
+        let u_single = 240.0 / (1.0 + per_token_fresh[..5].iter().map(|&f| f / per_token_fresh[0]).sum::<f64>());
+        let needed_all = [[Some(magnitude_cost_model::Needed::Shadow(u_single)); DEPTHS]; 2];
+        let measured = passes.measured(48, needed_all, &stands).expect("measured in tier_complete regime");
+
+        // Resident compute for M=8 row class (depths 5, 6, 7 share the 8-row launch class).
+        let resident = vec![0.032, 0.040, 0.048, 0.056, 0.062, 0.065, 0.067, 0.069];
+        let regime = magnitude_cost_model::Regime {
+            resident,
+            needed: magnitude_cost_model::NeededByForm::both(vec![magnitude_cost_model::Needed::Shadow(u_single); DEPTHS]),
+            stand: measured.stand,
+            accepts: measured.accepts.to_vec(),
+            stall: measured.stall,
+            overhead: Some(0.003),
+            paths: measured.paths.unwrap(),
+            routes: magnitude_cost_model::VerifyRoutes {
+                layers: 48,
+                fresh: measured.fresh.iter().map_while(|f| *f).collect(),
+            },
+        };
+        assert_eq!(
+            regime.pass(),
+            magnitude_cost_model::Form::Verify(7),
+            "with true per-token fresh routes, Verify(7) ({:.4}s/tok) must beat Verify(5) ({:.4}s/tok)",
+            regime.verify_time(7),
+            regime.verify_time(5),
+        );
+    }
 }
