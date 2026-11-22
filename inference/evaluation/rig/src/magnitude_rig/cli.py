@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import ab, dashboard, engine, gate, ledger, selectors, sources, state, store
-from .connection import HostError, HostRun, connect, host_status, read, setup
+from .connection import HostError, HostRun, HostUnavailable, connect, host_status, read, setup
 from .hosts import Hosts
 from .instruments import KINDS, REGISTRY, Instrument
 from .instruments import cargo as instruments_cargo
@@ -211,22 +211,44 @@ def _stop(arguments) -> int:
     """Stop the run through the process following it, which delivers the stop and fetches the
     run; with none, stop its runner directly (the next command fetches it). A follower that has
     neither begun delivering its stop nor ended `STOP_SECONDS` after it is hung: it is ended,
-    and its runner is stopped as a run whose caller is gone is."""
+    and its runner is stopped as a run whose caller is gone is. When the host cannot be reached,
+    the run is resolved locally to terminal `host_lost` and removed from active runs."""
     run = state.run_state(arguments.run)
+    killed_caller = False
     if run is not None:
-        os.kill(run["pid"], signal.SIGTERM)
-        print(f"stopping {run['run']} on {run['host']}")
-        if _takes_stop(run, STOP_SECONDS):
-            return 0
-        os.kill(run["pid"], signal.SIGKILL)
-        if not _takes_stop(run, STOP_SECONDS):
-            raise SystemExit(f"{run['run']}: its caller {run['pid']} did not end when killed")
-        print(f"{run['run']}: its caller did not take the stop in {STOP_SECONDS:.0f} s; ended it")
+        already_stopping = "stopping" in run
+        try:
+            os.kill(run["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            state.RunState.remove(run["run"])
+        else:
+            print(f"stopping {run['run']} on {run['host']}")
+            if _takes_stop(run, STOP_SECONDS, allow_stopping=not already_stopping):
+                lost = state.host_lost_record(run.get("results"))
+                if lost is not None:
+                    print(f"{run['run']}: {lost['detail']}; marked terminal locally ({state.HOST_LOST})")
+                return 0
+            try:
+                os.kill(run["pid"], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if not _takes_stop(run, STOP_SECONDS, allow_stopping=False):
+                raise SystemExit(f"{run['run']}: its caller {run['pid']} did not end when killed")
+            state.RunState.remove(run["run"])
+            killed_caller = True
+            print(f"{run['run']}: its caller did not take the stop in {STOP_SECONDS:.0f} s; ended it")
     launched = next((value for value in state.Launched.gone() if value["run"].endswith(arguments.run)), None)
     if launched is None:
+        if killed_caller:
+            return 0
         raise SystemExit(f"no run {arguments.run} in flight on this machine")
-    remote = connect(Hosts.load().host(launched["host"]))
-    stopped = HostRun(remote, launched["run"], launched["agent"]).stop()
+    try:
+        remote = connect(Hosts.load().host(launched["host"]))
+        stopped = HostRun(remote, launched["run"], launched["agent"]).stop()
+    except HostUnavailable as error:
+        failed = engine.mark_host_lost(launched["run"], launched["host"], Path(launched["results"]), str(error))
+        print(f"{launched['run']}: {failed['detail']}; marked terminal locally ({engine.HOST_LOST})")
+        return 0
     print(f"stopping {launched['run']} on {launched['host']}: {stopped}")
     return 0
 
@@ -235,12 +257,13 @@ def _stop(arguments) -> int:
 STOP_SECONDS = 30.0
 
 
-def _takes_stop(run: dict, seconds: float) -> bool:
-    """Whether run `run`'s caller, within `seconds`, has ended or begun delivering its stop."""
+def _takes_stop(run: dict, seconds: float, *, allow_stopping: bool = True) -> bool:
+    """Whether run `run`'s caller, within `seconds`, has ended or (when `allow_stopping`)
+    begun delivering its stop."""
     deadline = time.monotonic() + seconds
     while True:
         current = state.run_state(run["run"])
-        if current is None or current["pid"] != run["pid"] or "stopping" in current:
+        if current is None or current["pid"] != run["pid"] or (allow_stopping and "stopping" in current):
             return True
         if time.monotonic() >= deadline:
             return False

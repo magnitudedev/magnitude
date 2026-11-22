@@ -938,6 +938,9 @@ class Run:
         self.destination: Candidate | None = None
         self.carried = 0.0  # seconds it queued on the hosts it left
         self.stacks: list[str] = []  # each process asked for its stacks: where they go, and why
+        self._stop: threading.Event | None = None
+        self._host_lost = threading.Event()
+        self.host_lost_reason: str | None = None
 
     def enter(self, phase: str) -> None:
         now = time.monotonic()
@@ -1095,12 +1098,26 @@ def _retrying(run: Run, what: str, action: Callable[[], object],
 
 
 def _stop_when(run: Run, stop: threading.Event, followed: threading.Event) -> None:
-    """Deliver the caller's stop to the runner, once asked, however long the host is away;
-    nothing once the run has been followed to its end."""
+    """Deliver the caller's stop to the runner, once asked; if the host cannot be reached,
+    resolve the run locally as `host_lost` rather than stranding it forever. Nothing once the
+    run has been followed to its end."""
     stop.wait()
-    if not followed.is_set():
-        run.state.update(stopping=time.time())  # `mrig stop` waits for this
-        _retrying(run, "stop", run.host.stop)
+    if followed.is_set():
+        return
+    try:
+        run.host.stop()
+    except HostUnavailable as error:
+        run.host_lost_reason = str(error)
+        run.note(f"stop failed ({error}); host unreachable, marking run {HOST_LOST}")
+        run._host_lost.set()
+        abort = getattr(run.host, "abort_follow", None)
+        if abort is not None:
+            abort()
+        return
+    except CommandFailed as error:
+        run.note(f"stop command failed ({error})")
+        return
+    run.state.update(stopping=time.time())  # `mrig stop` waits for this
 
 
 # Seconds between a queued run's placements again (`replaced`).
@@ -1148,9 +1165,13 @@ def stopped_to_move(ended: dict) -> bool:
 
 
 def _follow(run: Run) -> dict:
-    """Follow the runner to its end, through lost connections; its `ended` event."""
+    """Follow the runner to its end, through lost connections; its `ended` event. When a stop was
+    requested and the host cannot be reached, returns a terminal `host_lost` end instead of
+    retrying forever."""
     backoff = BACKOFF_FIRST
     while True:
+        if run._host_lost.is_set():
+            return _host_lost(run.phase, run.remote.alias, run.host_lost_reason or "host unreachable")
         try:
             for event in run.host.follow(run.sequence):
                 backoff = BACKOFF_FIRST
@@ -1160,8 +1181,13 @@ def _follow(run: Run) -> dict:
                 if event["event"] == "ended":
                     return event
         except HostUnavailable as error:
+            if run._host_lost.is_set() or (run._stop is not None and run._stop.is_set()):
+                reason = run.host_lost_reason or str(error)
+                run.host_lost_reason = reason
+                return _host_lost(run.phase, run.remote.alias, reason)
             run.note(f"connection lost ({error}); following again in {backoff:.0f} s")
-            time.sleep(backoff)
+            if run._host_lost.wait(backoff):
+                return _host_lost(run.phase, run.remote.alias, run.host_lost_reason or str(error))
             backoff = min(2 * backoff, BACKOFF_LONGEST)
 
 
@@ -1226,6 +1252,7 @@ def _execute(request: Request, run_id: str, results: Path, hosts: Hosts,
     run = Run(request, candidate, run_id, results, announce)
     current.append(run)
     stop = threading.Event()
+    run._stop = stop
     # Stopping the caller stops the run: the runner ends its command and releases its holds.
     previous = signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
     try:
@@ -1255,9 +1282,17 @@ def _execute(request: Request, run_id: str, results: Path, hosts: Hosts,
             ended = _follow(run)
             followed.set()  # the runner has ended, its holds released: no stop goes to its pid after it
             replacing.join()  # it sends no stop and sets no destination from here on
+            if is_host_lost(ended):
+                state.Launched.remove(run_id)
+                break
             if not stopped_to_move(ended):
                 run.enter("fetch")
-                _retrying(run, "fetch", lambda: sync.fetch_answer(run.remote, run.remote.path("runs", run_id), results))
+                try:
+                    _retrying(run, "fetch", lambda: sync.fetch_answer(run.remote, run.remote.path("runs", run_id), results),
+                              stop)
+                except Stopped as error:
+                    ended = _host_lost("fetch", run.remote.alias, str(error))
+                    state.Launched.remove(run_id)
                 break
             # Stopped while it queued, to go where it starts sooner: what it left is removed.
             candidate, left = run.destination, run.host
@@ -1275,6 +1310,8 @@ def _execute(request: Request, run_id: str, results: Path, hosts: Hosts,
     last = {"phase": run.phase, "seconds": round(time.monotonic() - run.phase_started, 3)}  # fetch, or stage
     outcome.phases = [*run.phases[:caller], *ended["phases"], last]
     record((run.request, candidate.work), run_id, run.remote.alias, outcome, failed)
+    if is_host_lost(ended):
+        state.RunState.remove(run_id)
     if failed is not None:
         raise RunFailed(failed["phase"], failed["detail"], outcome)
     return outcome
@@ -1373,6 +1410,51 @@ def _owed(launched: dict, step: Callable[[dict], bool | None]) -> bool:
         return False
 
 
+HOST_LOST = state.HOST_LOST
+
+
+def _host_lost(phase: str, host: str, reason: str) -> dict:
+    """The terminal end recorded for a run whose host could not be reached."""
+    return {
+        "codes": {},
+        "phases": [],
+        "failed": {
+            "phase": phase,
+            "state": HOST_LOST,
+            "detail": f"host {host} unreachable ({reason})",
+        },
+    }
+
+
+def is_host_lost(record_or_ended: dict | None) -> bool:
+    """Whether a run record (`rig.json`) or ended event is a terminal `host_lost` failure."""
+    if not isinstance(record_or_ended, dict):
+        return False
+    failed = record_or_ended.get("failed")
+    return isinstance(failed, dict) and failed.get("state") == HOST_LOST
+
+
+def mark_host_lost(run_id: str, host: str, results: Path, reason: str, *, phase: str = "stop") -> dict:
+    """Resolve a run locally to terminal `host_lost` when its host cannot be reached: write its
+    terminal `rig.json` (if not already written), record its failure transcript and exit code 1
+    (if not already coded), and remove its live (`RunState`) and launched (`Launched`) records so
+    it never appears as active or owed again."""
+    failed = _host_lost(phase, host, reason)["failed"]
+    results.mkdir(parents=True, exist_ok=True)
+    if not (results / "rig.json").exists():
+        outcome = Outcome(run_id, host, results, {})
+        record(None, run_id, host, outcome, failed)
+    if not (results / CODE).exists():
+        with open(results / TRANSCRIPT, "a") as transcript:
+            transcript.write(f"FAILED in {phase}: {failed['detail']}\n")
+        staged = (results / CODE).with_name(f".{CODE}.{os.getpid()}")
+        staged.write_text("1")
+        staged.replace(results / CODE)
+    state.RunState.remove(run_id)
+    state.Launched.remove(run_id)
+    return failed
+
+
 def _vanished(phase: str, host: str) -> dict:
     """The end recorded for a run whose runner is gone without recording its own."""
     return {"codes": {}, "phases": [], "failed": {
@@ -1405,7 +1487,11 @@ def _answer(hosts: Hosts, launched: dict, answer: Callable[[dict], None]) -> boo
 
 def _fetch_rest(hosts: Hosts, launched: dict) -> None:
     """Fetch the rest of one answered run's directory, have the host prune it and remove its
-    launched record."""
+    launched record. A run already resolved locally as `host_lost` has no reachable host to fetch
+    from and drops its launched record immediately."""
+    if state.host_lost_record(launched["results"]) is not None:
+        state.Launched.remove(launched["run"])
+        return
     remote = connect(hosts.host(launched["host"]))
     if run_state(remote, launched["run"]) != "absent":
         sync.fetch(remote, remote.path("runs", launched["run"]), Path(launched["results"]))

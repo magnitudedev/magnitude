@@ -6,6 +6,7 @@ import io
 import json
 import shlex
 import subprocess
+import threading
 import zipfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -260,6 +261,18 @@ class HostRun:
 
     def __init__(self, remote: Remote, run: str, agent: list[str]):
         self.remote, self.run, self.agent = remote, run, agent
+        self._follow_lock = threading.Lock()
+        self._follow_process: subprocess.Popen | None = None
+        self._follow_aborted = False
+
+    def abort_follow(self) -> None:
+        """Terminate an in-flight `follow` ssh subprocess immediately (e.g. when the host is
+        determined unreachable while stopping)."""
+        with self._follow_lock:
+            self._follow_aborted = True
+            process = self._follow_process
+        if process is not None and process.poll() is None:
+            process.kill()
 
     @classmethod
     @contextlib.contextmanager
@@ -310,10 +323,14 @@ class HostRun:
         """The run's events after sequence `after`, as the runner writes them, through `ended`
         (or `vanished`); a lost connection raises `HostUnavailable`, the agent's own failure
         `CommandFailed`."""
-        process = subprocess.Popen(
-            self.remote.command(self._argv("follow", "--after", str(after))),
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
+        with self._follow_lock:
+            if self._follow_aborted:
+                raise HostUnavailable(f"{self.remote.alias}: following run {self.run} aborted (host unreachable)")
+            process = subprocess.Popen(
+                self.remote.command(self._argv("follow", "--after", str(after))),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self._follow_process = process
         try:
             for line in process.stdout:
                 try:
@@ -326,10 +343,15 @@ class HostRun:
                 if event["event"] in ("ended", "vanished"):
                     return
             process.wait()
-            failure = HostUnavailable if unreachable(self.remote, process.returncode) else CommandFailed
+            with self._follow_lock:
+                aborted = self._follow_aborted
+            failure = HostUnavailable if (aborted or unreachable(self.remote, process.returncode)) else CommandFailed
             raise failure(f"{self.remote.alias}: following run {self.run} ended: "
                           f"{process.stderr.read().strip()}")
         finally:
+            with self._follow_lock:
+                if self._follow_process is process:
+                    self._follow_process = None
             if process.poll() is None:
                 process.kill()
             process.wait()

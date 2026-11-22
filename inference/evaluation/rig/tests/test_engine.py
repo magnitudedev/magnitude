@@ -1429,6 +1429,129 @@ def test_a_stopped_caller_hung_past_its_stop_is_ended_and_its_runner_stopped(rig
     assert stopped == ["20261105T000000Z-step-bbbbbb"]
 
 
+def test_stopping_a_run_on_an_unreachable_host_marks_it_host_lost_and_clears_active_runs(rig, monkeypatch):
+    """When a running job's host becomes unreachable and the caller is stopped (SIGTERM / mrig stop),
+    the caller does not retry forever: it aborts following, marks the run terminal `host_lost`,
+    writes rig.json, and removes both RunState and Launched so `mrig runs` drops it."""
+    hosts, source, tmp_path = rig
+    monkeypatch.setattr(engine, "BACKOFF_FIRST", 30.0)
+    run_id = engine.new_run_id("test")
+    down = link_down(tmp_path)
+    job = engine.Step("job", (PY, "-c", "import time; print('started', flush=True); time.sleep(60)"))
+
+    def trigger_dead_host_stop():
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            live = state.run_state(run_id)
+            if live is not None and live["phase"] == "job-job":
+                break
+            time.sleep(0.1)
+        else:
+            return
+        down.touch()
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    stopper = threading.Thread(target=trigger_dead_host_stop, daemon=True)
+    stopper.start()
+    started = time.monotonic()
+    with pytest.raises(engine.RunFailed) as failed:
+        engine.execute(request(source, jobs=[("job", job)], host="alpha"), run_id, hosts=hosts,
+                       announce=lambda line: None)
+    stopper.join(5)
+    assert time.monotonic() - started < 20, "stop on an unreachable host must not wait out backoff"
+    assert "unreachable" in failed.value.detail
+    rig_record = json.loads((store.results() / run_id / "rig.json").read_text())
+    assert engine.is_host_lost(rig_record)
+    assert rig_record["failed"]["state"] == engine.HOST_LOST
+    assert "unreachable" in rig_record["failed"]["detail"]
+    assert state.live_runs() == []
+    assert state.Launched.gone() == []
+
+
+def test_stop_on_unreachable_or_removed_host_marks_terminal_host_lost(rig, monkeypatch, capsys):
+    """`mrig stop` against an unreachable or config-removed host resolves the run locally to
+    terminal `host_lost`, removes it from `mrig runs` and `Launched`, and reports clearly.
+    A caller already stuck in `stopping` is killed and resolved rather than treated as done."""
+    hosts, _, tmp_path = rig
+    monkeypatch.setattr(cli.Hosts, "load", classmethod(lambda cls: hosts))
+    monkeypatch.setattr(cli, "STOP_SECONDS", 1.0)
+
+    # Case 1: Caller gone, host removed from config / unreachable (SSH 255).
+    run_a = "20261121T205825Z-test-af9e32"
+    results_a = store.results() / run_a
+    state.Launched(run_a, "rtx5090-bench", ["agent"], results_a, ("test",)).write()
+    link_down(tmp_path).touch()
+    assert cli._stop(argparse.Namespace(run=run_a)) == 0
+    out_a = capsys.readouterr().out
+    assert "unreachable" in out_a and engine.HOST_LOST in out_a
+    record_a = json.loads((results_a / "rig.json").read_text())
+    assert engine.is_host_lost(record_a)
+    assert (results_a / engine.CODE).read_text() == "1"
+    assert state.live_runs() == [] and state.Launched.gone() == []
+
+    # Case 2: Caller hung with a pre-existing `stopping` flag on an unreachable host.
+    follower = _follower(ignores_stop=True)
+    run_b = "20261121T205828Z-test-cdefb2"
+    results_b = store.results() / run_b
+    record_state = state.RunState(run_b, {"host": "rtx3090-bench", "results": str(results_b), "stopping": time.time()})
+    record_state.value["pid"] = follower.pid
+    record_state.write()
+    state.Launched(run_b, "rtx3090-bench", ["agent"], results_b, ("test",)).write()
+    assert cli._stop(argparse.Namespace(run=run_b)) == 0
+    assert not state.alive(follower.pid)
+    out_b = capsys.readouterr().out
+    assert "unreachable" in out_b and engine.HOST_LOST in out_b
+    assert engine.is_host_lost(json.loads((results_b / "rig.json").read_text()))
+    assert state.live_runs() == [] and state.Launched.gone() == []
+
+
+def test_host_lost_run_never_reappears_in_live_runs(rig):
+    """Once a run's rig.json records terminal `host_lost`, `state.live_runs()` never lists it
+    again even if a stale RunState file for a live PID remains."""
+    run_id = "20261121T205829Z-test-dead01"
+    results_dir = store.results() / run_id
+    state.RunState(run_id, {"host": "rtx5090-bench", "results": str(results_dir), "started": time.time(),
+                            "phase": "job-test", "estimate": 360.0})
+    assert [r["run"] for r in state.live_runs()] == [run_id]
+    engine.mark_host_lost(run_id, "rtx5090-bench", results_dir, "Connection refused")
+    # Even if a stale RunState is written back with a live PID, live_runs() drops it.
+    state.RunState(run_id, {"host": "rtx5090-bench", "results": str(results_dir), "started": time.time(),
+                            "phase": "job-test", "estimate": 360.0})
+    assert state.live_runs() == []
+    assert not (state.RUNS / f"{run_id}.json").exists()
+
+
+def test_stopping_a_run_on_a_reachable_host_stops_remotely(rig):
+    """Stopping a run on a reachable host still delivers the stop remotely and fetches its end
+    without marking it `host_lost`."""
+    hosts, source, _ = rig
+    run_id = engine.new_run_id("test")
+    job = engine.Step("job", (PY, "-c", "import time; print('running', flush=True); time.sleep(60)"))
+
+    def trigger_stop():
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            live = state.run_state(run_id)
+            if live is not None and live["phase"] == "job-job":
+                break
+            time.sleep(0.1)
+        else:
+            return
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    stopper = threading.Thread(target=trigger_stop, daemon=True)
+    stopper.start()
+    with pytest.raises(engine.RunFailed) as failed:
+        engine.execute(request(source, jobs=[("job", job)], host="alpha"), run_id, hosts=hosts,
+                       announce=lambda line: None)
+    stopper.join(5)
+    engine.complete(run_id, hosts)
+    rig_record = json.loads((store.results() / run_id / "rig.json").read_text())
+    assert not engine.is_host_lost(rig_record)
+    assert "stopped" in failed.value.detail.lower()
+    assert state.live_runs() == [] and state.Launched.gone() == []
+
+
 def test_served_asks_a_tool_conversation_whole(tmp_path):
     """A tools session's calls keep their ids and its tools are offered, so the service accepts it,
     at the history the harness sized it to, its answer held to its canonical answer's tokens."""

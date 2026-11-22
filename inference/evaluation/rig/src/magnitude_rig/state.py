@@ -86,6 +86,23 @@ def account(run: dict, now: float) -> tuple[float, float]:
     return accounted(run["started"], {"waited": run.get("waited", 0.0), "since": run.get("waiting_since")}, now)
 
 
+HOST_LOST = "host_lost"
+
+
+def host_lost_record(results: str | Path | None) -> dict | None:
+    """The `failed` entry of `results/rig.json` when it records a terminal `host_lost` state."""
+    if not results:
+        return None
+    record = Path(results) / "rig.json"
+    if not record.is_file():
+        return None
+    try:
+        failed = json.loads(record.read_text()).get("failed")
+    except (OSError, ValueError):
+        return None
+    return failed if isinstance(failed, dict) and failed.get("state") == HOST_LOST else None
+
+
 def live_runs() -> list[dict]:
     runs = []
     for path in sorted(RUNS.glob("*.json")) if RUNS.is_dir() else ():
@@ -93,7 +110,7 @@ def live_runs() -> list[dict]:
             value = json.loads(path.read_text())  # written whole (`_atomic`)
         except FileNotFoundError:
             continue  # its run ended since the listing
-        if alive(value["pid"]):
+        if alive(value["pid"]) and host_lost_record(value.get("results")) is None:
             runs.append(value)
         else:
             path.unlink(missing_ok=True)
