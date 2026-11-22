@@ -2531,11 +2531,28 @@ impl Telemetry {
             crate::experts::reuse::Reuse::of(&self.ranking).enable_shadows();
         }
         let gaps = self.shadow_state.lock().expect("watcher telemetry shadow state").gaps;
-        let needed = gaps.map(|form| {
-            form.map(|gap| {
-                gap.map(|gap| match gap.delta {
-                    crate::experts::reuse::Delta::Unmeasured => magnitude_cost_model::Needed::Shadow(gap.needed()),
-                    crate::experts::reuse::Delta::Measured { .. } => magnitude_cost_model::Needed::Executed(gap.needed()),
+        let needed = [0usize, 1].map(|form| {
+            std::array::from_fn(|depth| {
+                gaps[form][depth].map(|gap| match gap.delta {
+                    crate::experts::reuse::Delta::Unmeasured => {
+                        magnitude_cost_model::Needed::Shadow(gap.needed())
+                    }
+                    // A verify depth's `Δ = U_real − U_shadow` bakes in the
+                    // acceptance rate (`emitted`) from when that depth last
+                    // ran. Once silent past the same staleness threshold as
+                    // its stand row, fall back to `Needed::Shadow(U_shadow)`
+                    // so a stale warmup / low-acceptance delta cannot lock out
+                    // wider verification.
+                    crate::experts::reuse::Delta::Measured { age, .. }
+                        if form == 1
+                            && depth > 0
+                            && age.get() >= self.stands.stale_after(depth, crate::experts::interest::Form::Verify) =>
+                    {
+                        magnitude_cost_model::Needed::Shadow(gap.shadow)
+                    }
+                    crate::experts::reuse::Delta::Measured { .. } => {
+                        magnitude_cost_model::Needed::Executed(gap.needed())
+                    }
                 })
             })
         });

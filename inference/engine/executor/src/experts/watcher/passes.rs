@@ -827,6 +827,86 @@ mod tests {
         assert!((reentered.accepts[0].unwrap() - 6.0 / 8.0).abs() < 1e-12);
     }
 
+    /// Reproduces the 3-tier NVMe-streamed width-1 trap (`20261122T025920Z-bench-3db631`):
+    /// warmup rejections on rows `2..=5` narrow `Regime::pass()` to `Verify(1)`,
+    /// after which 100% acceptance at row 1 leaves deeper rows silent. Once the
+    /// silent rows age past `STAND_STALE_BASE` tokens, `Passes::measured` expires
+    /// them to `None` so `Regime::verify_emitted` carries forward row 1's live
+    /// `1.0` and `Regime::pass()` widens beyond width 1 instead of staying trapped.
+    #[test]
+    fn three_tier_streamed_verify_escapes_width_one_trap_after_stale_rows_expire() {
+        use crate::experts::interest::STAND_STALE_BASE;
+        use magnitude_cost_model::{Form as PassForm, Needed, NeededByForm, Regime, VerifyRoutes};
+
+        let (mut passes, time) = passes();
+        let stands = unjudged(time.clone());
+        passes.timed(Pass {
+            rows: 2,
+            depth: 1,
+            verifies: true,
+            seconds: 0.420,
+            drive: 0.400,
+            missed: 200.,
+            reads: 200.,
+            ..Pass::default()
+        });
+
+        // Warmup at step 1: row 1 stands, deeper rows 2..=5 saw rejections (~0.5).
+        time.lock().register(1, Advance::Known(Tokens::new(1.0)));
+        stands.count(1, Form::Verify, true);
+        for row in 2..=5 {
+            stands.count(row, Form::Verify, true);
+            stands.count(row, Form::Verify, false);
+        }
+
+        let mut needed_verify = [None; DEPTHS];
+        needed_verify[0] = Some(Needed::Shadow(100.0));
+        needed_verify[1] = Some(Needed::Executed(100.0));
+        for k in 2..DEPTHS {
+            needed_verify[k] = Some(Needed::Shadow(98.0));
+        }
+        let needed_front = [Some(Needed::Shadow(100.0)); DEPTHS];
+
+        let build_regime = |passes: &mut Passes, stands: &Stands| {
+            let measured = passes.measured(42, [needed_front, needed_verify], stands).expect("passes timed");
+            Regime {
+                resident: (0..DEPTHS).map(|k| 0.020 + 0.002 * k as f64).collect(),
+                needed: NeededByForm {
+                    front: needed_front.into_iter().map(Option::unwrap).collect(),
+                    verify: needed_verify.into_iter().map(Option::unwrap).collect(),
+                },
+                stand: Some(0.85),
+                accepts: measured.accepts[..5].to_vec(),
+                stall: Some(2e-3),
+                overhead: Some(0.010),
+                paths: measured.paths.expect("NVMe drive path"),
+                routes: VerifyRoutes { layers: 42, fresh: vec![5.0, 4.2, 3.7, 3.3, 3.0] },
+            }
+        };
+
+        // Immediately after warmup rejections, Verify(1) wins over Verify(2..=5).
+        assert_eq!(
+            build_regime(&mut passes, &stands).pass(),
+            PassForm::Verify(1),
+            "warmup rejections narrow to width 1",
+        );
+
+        // Simulate 16 rounds of Verify(1) (32 tokens) with 100% acceptance at row 1.
+        let rounds = (STAND_STALE_BASE / 2.0) as u64;
+        for r in 0..rounds {
+            time.lock().register(2 + r, Advance::Known(Tokens::new(2.0)));
+            stands.count(1, Form::Verify, true);
+        }
+
+        // Silent deeper rows have expired: `Regime::pass()` escapes width 1
+        // and widens to amortize NVMe misses across the burst.
+        let recovered = build_regime(&mut passes, &stands).pass();
+        assert!(
+            matches!(recovered, PassForm::Verify(d) if d >= 2),
+            "must escape width-1 trap once silent rows expire, got {recovered:?}",
+        );
+    }
+
     /// Opportunistic link staging (`staged_link`, `staged_records`) is tracked
     /// separately from permanent promotions (`moved`, `moved_records`) so
     /// `Passes::moves()` (`POLICY_LINK_BUSY_NS`) and `Passes::beside()`

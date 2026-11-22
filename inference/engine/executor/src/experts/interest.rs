@@ -874,13 +874,28 @@ impl Calibration {
     }
 }
 
+/// Base token age after which a silent stand-rate row expires from
+/// [`Stands::live_rate`] so the regime can re-probe deeper widths (matching
+/// `DraftController`'s ~32-round decay timescale).
+pub(in crate::experts) const STAND_STALE_BASE: f64 = 32.0;
+
+/// Maximum exponential-backoff token age for a silent stand-rate row whose
+/// re-entry probes keep falling (`32 → 64 → 128 → 256`, bounding worst-case
+/// probe overhead below 0.5%).
+const STAND_STALE_MAX: f64 = 256.0;
+
 /// A stand rate's state (§3.3): unjudged (its bound 1), or judged over a
 /// window on the bank-wide epochs, which holds its last measurement, with
 /// its age, while its row is not run. Unjudged → judged is the only
-/// transition, so a depth never returns to its bound.
+/// transition, so raw history ([`Stands::judged`]) never returns to its bound,
+/// while [`Stands::live_rate`] expires silent rows past `stale_after` tokens
+/// so a transient hard passage cannot permanently trap decode at a narrow width.
 pub(in crate::experts) enum Judgement {
     Unjudged,
-    Judged(Aged<Tally>),
+    Judged {
+        window: Aged<Tally>,
+        stale_after: f64,
+    },
 }
 
 /// The guessed rows a pass runs: 1..DEPTHS − 1, past its exact row.
@@ -944,10 +959,33 @@ impl Stands {
     pub(super) fn count(&self, row: usize, form: Form, stood: bool) {
         let (mut rows, epoch, now) = self.lock_with_now();
         let cell = Self::cell(&mut rows, row, form);
-        if let Judgement::Unjudged = cell {
-            *cell = Judgement::Judged(Aged::new(epoch));
+        match cell {
+            Judgement::Unjudged => {
+                *cell = Judgement::Judged {
+                    window: Aged::new(epoch),
+                    stale_after: STAND_STALE_BASE,
+                };
+            }
+            Judgement::Judged { window, stale_after } => {
+                if let Some((_, age)) = window.read(epoch, now) {
+                    if age.get() >= *stale_after {
+                        // Re-entering after staleness expiry: drop the frozen
+                        // pre-silence epoch tally so the fresh probe stands on
+                        // its own verdict, and back off exponentially if it
+                        // still falls (or reset to base if it stands).
+                        *window = Aged::new(epoch);
+                        *stale_after = if stood {
+                            STAND_STALE_BASE
+                        } else {
+                            (*stale_after * 2.0).min(STAND_STALE_MAX)
+                        };
+                    } else if stood {
+                        *stale_after = STAND_STALE_BASE;
+                    }
+                }
+            }
         }
-        let Judgement::Judged(window) = cell else { unreachable!("judged above") };
+        let Judgement::Judged { window, .. } = cell else { unreachable!("judged above") };
         *window.count(epoch, now) += Tally::of(stood);
     }
 
@@ -964,23 +1002,41 @@ impl Stands {
         self.judged(row, form).map(|(rate, _)| rate)
     }
 
+    /// The token-age staleness threshold currently governing `(row, form)`
+    /// (`STAND_STALE_BASE`..=`STAND_STALE_MAX`).
+    pub fn stale_after(&self, row: usize, form: Form) -> f64 {
+        let mut rows = self.rows.lock().expect("the stand rates");
+        match Self::cell(&mut rows, row, form) {
+            Judgement::Unjudged => STAND_STALE_BASE,
+            Judgement::Judged { stale_after, .. } => *stale_after,
+        }
+    }
+
     /// r_row for `preferred`, falling back to the other form's live rate when
-    /// `preferred` is stale relative to it (strictly older on the token clock).
-    /// Both forms judge the same MTP drafter, so a form that stopped running
-    /// does not stay locked out by an old sample while the other form is
-    /// actively measuring a newer stand rate. An unjudged `preferred` row
-    /// stays `None` (its optimistic bound 1).
+    /// `preferred` is stale relative to it (strictly older on the token clock
+    /// and the other form is still fresh), and expiring to `None` once silent
+    /// for at least `stale_after` tokens so `Regime::verify_emitted` carries
+    /// forward the shallower live stand rate instead of staying permanently
+    /// trapped by a frozen warmup or hard-passage sample. An unjudged
+    /// `preferred` row stays `None` (its optimistic bound 1).
     pub fn live_rate(&self, row: usize, preferred: Form) -> Option<f64> {
         let (mut rows, epoch, now) = self.lock_with_now();
-        let (rate, age) = Self::read(&mut rows, row, preferred, epoch, now)?;
+        let (rate, age, stale_after) = Self::read_with_stale(&mut rows, row, preferred, epoch, now)?;
         let other = match preferred {
             Form::Front => Form::Verify,
             Form::Verify => Form::Front,
         };
-        match Self::read(&mut rows, row, other, epoch, now) {
-            Some((other_rate, other_age)) if other_age < age => Some(other_rate),
-            _ => Some(rate),
+        if let Some((other_rate, other_age, other_stale_after)) =
+            Self::read_with_stale(&mut rows, row, other, epoch, now)
+        {
+            if other_age.get() < other_stale_after && other_age < age {
+                return Some(other_rate);
+            }
         }
+        if age.get() >= stale_after {
+            return None;
+        }
+        Some(rate)
     }
 
     /// Conditional front-row stand rates `r_1..r_{DEPTHS-1}`, unjudged rows at
@@ -999,14 +1055,18 @@ impl Stands {
         (1..=depth).map(|row| Self::read(&mut rows, row, form, epoch, now).map_or(1., |(rate, _)| rate)).product()
     }
 
-    fn read(rows: &mut [[Judgement; 2]; ROWS], row: usize, form: Form, epoch: u64, now: Tokens) -> Option<(f64, Tokens)> {
+    fn read_with_stale(rows: &mut [[Judgement; 2]; ROWS], row: usize, form: Form, epoch: u64, now: Tokens) -> Option<(f64, Tokens, f64)> {
         match Self::cell(rows, row, form) {
             Judgement::Unjudged => None,
-            Judgement::Judged(window) => {
+            Judgement::Judged { window, stale_after } => {
                 let (tallies, age) = window.read(epoch, now).expect("a judged row holds a verdict");
-                Some((Tally::over(tallies), age))
+                Some((Tally::over(tallies), age, *stale_after))
             }
         }
+    }
+
+    fn read(rows: &mut [[Judgement; 2]; ROWS], row: usize, form: Form, epoch: u64, now: Tokens) -> Option<(f64, Tokens)> {
+        Self::read_with_stale(rows, row, form, epoch, now).map(|(rate, age, _)| (rate, age))
     }
 }
 
@@ -2501,6 +2561,75 @@ mod tests {
         assert!((rate - 0.5).abs() < 1e-12, "keeps its last measured rate across empty epochs");
         assert_eq!(age, Tokens::new(10.0), "age tracks tokens since last judgement");
         assert!((stands.through_rows(2, Form::Front) - (2.0 / 3.0) * 0.5).abs() < 1e-12);
+    }
+
+    /// Silent deeper `Form::Verify` rows expire from `live_rate` after
+    /// `STAND_STALE_BASE` tokens so a transient warmup or hard-passage dip
+    /// cannot trap decode at width 1 forever; re-entering drops the frozen
+    /// pre-silence tally, restores `1.0` immediately when the probe stands,
+    /// and backs off exponentially (`32 → 64 → 128 → 256`) when probes fall.
+    #[test]
+    fn silent_verify_row_expires_with_backoff_and_recovers_cleanly() {
+        let time = Time::new(&[vec![4]], 16);
+        let stands = Stands::new(time.clone());
+
+        // Warmup at step 1: row 1 stands, row 2 falls 0/5 times.
+        time.lock().register(1, Advance::Known(Tokens::new(1.0)));
+        stands.count(1, Form::Verify, true);
+        for _ in 0..5 {
+            stands.count(2, Form::Verify, false);
+        }
+        assert_eq!(stands.live_rate(2, Form::Verify), Some(0.0));
+        assert_eq!(stands.stale_after(2, Form::Verify), STAND_STALE_BASE);
+
+        // Advance 31 tokens (still below STAND_STALE_BASE = 32) while only
+        // row 1 is judged (width-1 rounds): row 2 stays at its measured 0.0.
+        let mut step = 2u64;
+        for _ in 0..31 {
+            let mut times = time.lock();
+            times.register(step, Advance::Known(Tokens::new(1.0)));
+            times.moved(0, Tier::COMPUTE);
+            drop(times);
+            stands.count(1, Form::Verify, true);
+            step += 1;
+        }
+        assert_eq!(stands.live_rate(1, Form::Verify), Some(1.0));
+        assert_eq!(stands.live_rate(2, Form::Verify), Some(0.0), "fresh before 32 tokens");
+
+        // One more token (age == 32): row 2 expires from `live_rate` so the
+        // regime carries forward row 1's 1.0 and probes width 2, while raw
+        // `judged` preserves its history.
+        time.lock().register(step, Advance::Known(Tokens::new(1.0)));
+        step += 1;
+        assert_eq!(stands.live_rate(2, Form::Verify), None, "expired at 32 tokens");
+        assert_eq!(stands.rate(2, Form::Verify), Some(0.0), "raw history preserved");
+
+        // Re-entry probe fails: stale 0/5 is dropped, fresh 0/1 recorded,
+        // and backoff doubles to 64 tokens.
+        stands.count(2, Form::Verify, false);
+        assert_eq!(stands.live_rate(2, Form::Verify), Some(0.0));
+        assert_eq!(stands.stale_after(2, Form::Verify), STAND_STALE_BASE * 2.0);
+
+        // Advance 32 tokens: still not expired because backoff is now 64.
+        for _ in 0..32 {
+            time.lock().register(step, Advance::Known(Tokens::new(1.0)));
+            step += 1;
+        }
+        assert_eq!(stands.live_rate(2, Form::Verify), Some(0.0), "backed off to 64 tokens");
+
+        // Advance another 32 tokens (total 64): expires again.
+        for _ in 0..32 {
+            time.lock().register(step, Advance::Known(Tokens::new(1.0)));
+            step += 1;
+        }
+        assert_eq!(stands.live_rate(2, Form::Verify), None, "expired at 64 tokens");
+
+        // Re-entry probe stands: pre-silence failure tally is dropped so the
+        // single standing probe immediately reads 1.0 (not 1/2 or 1/6), and
+        // `stale_after` resets to `STAND_STALE_BASE`.
+        stands.count(2, Form::Verify, true);
+        assert_eq!(stands.live_rate(2, Form::Verify), Some(1.0));
+        assert_eq!(stands.stale_after(2, Form::Verify), STAND_STALE_BASE);
     }
 
     /// Concurrent `Stands` reads and counts while `Time` advances `bank_epoch`

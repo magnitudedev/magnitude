@@ -358,6 +358,18 @@ impl Shadows {
         if let Some(pending) = &mut self.pending_reentry[form][depth] {
             pending.fresh.add(diff);
         }
+        // When a verify depth re-enters after being silent past the staleness
+        // threshold, drop its frozen pre-silence epoch tally (after A9
+        // `pending_reentry` has captured it above) so a stale warmup or
+        // low-acceptance delta does not poison the fresh measurement.
+        if verifies
+            && depth > 0
+            && self.deltas[form][depth]
+                .read(epoch, now)
+                .is_some_and(|(_, age)| age.get() >= crate::experts::interest::STAND_STALE_BASE)
+        {
+            self.deltas[form][depth] = horizon::Aged::new(epoch);
+        }
         self.deltas[form][depth].count(epoch, now).add(diff);
     }
 
@@ -809,5 +821,43 @@ mod tests {
         let gaps = shadows.gaps(1, Tokens::new(30.0));
         assert_eq!(gaps[1][1].expect("verify depth 1").delta, Delta::Unmeasured);
         assert_eq!(gaps[0][0].expect("front depth 0").delta, Delta::Unmeasured);
+    }
+
+    /// When a silent `Form::Verify` depth re-enters after at least
+    /// `STAND_STALE_BASE` tokens, its frozen pre-silence warmup delta is
+    /// captured in A9 `Reentry` and then dropped so the fresh verify pass is
+    /// not poisoned by old low-acceptance / cold-bank misses.
+    #[test]
+    fn stale_verify_reentry_drops_old_delta_while_recording_a9() {
+        let mut shadows = Shadows::new(&[8], &[0], &[2]);
+        feed_cycle(&mut shadows, 1..=20, 4, 8);
+        let u2 = shadows.misses()[2].expect("depth 2 shadow");
+        let u1 = shadows.misses()[1].expect("depth 1 shadow");
+
+        // Warmup: verify depth 2 records a huge inflated delta (+10.0) in epoch 0.
+        for _ in 0..5 {
+            shadows.executed(true, 2, u2 + 10.0, 0, Tokens::new(10.0));
+        }
+        // Switch to verify depth 1 for 40 tokens across epochs 1..=4.
+        for epoch in 1..=4 {
+            shadows.executed(true, 1, u1, epoch, Tokens::new(10.0 + epoch as f64 * 10.0));
+        }
+
+        // Re-enter verify depth 2 at token 50 (age 40 >= STAND_STALE_BASE) with
+        // a clean fresh delta (0.0): the stale +10.0 must not blend into the
+        // live delta, while A9 still records frozen=+10.0 vs observed=0.0.
+        shadows.executed(true, 2, u2, 4, Tokens::new(50.0));
+        match shadows.gaps(4, Tokens::new(50.0))[1][2].expect("verify depth 2").delta {
+            Delta::Measured { delta, age } => {
+                assert!(delta.abs() < 1e-9, "fresh verify delta must not blend stale +10.0: {delta}");
+                assert_eq!(age, Tokens::ZERO);
+            }
+            Delta::Unmeasured => panic!("verify depth 2 was just executed"),
+        }
+        shadows.executed(true, 2, u2, 5, Tokens::new(51.0));
+        let reentries = shadows.take_reentries();
+        assert_eq!(reentries.len(), 1);
+        assert!((reentries[0].frozen - 10.0).abs() < 1e-9);
+        assert!(reentries[0].observed.abs() < 1e-9);
     }
 }
