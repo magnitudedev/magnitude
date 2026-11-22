@@ -1391,12 +1391,7 @@ async fn persist_inventory_index(cache: &ModelCache, change: IndexChange) {
 }
 
 fn model_primary_path(root: &Path, model: &InventoryModel) -> Option<PathBuf> {
-    let component = model.location.components().iter().find(|component| {
-        matches!(
-            component.role,
-            ComponentRole::Weights | ComponentRole::Shard
-        )
-    })?;
+    let component = primary_weight_component(model.location.components())?;
     let path = match (&model.location, &model.source) {
         (
             ModelLocation::MagnitudeCache { .. },
@@ -2331,16 +2326,7 @@ fn model_metadata_evidence(
 }
 
 fn model_metadata_evidence_for_model(model: &InventoryModel) -> Result<String, InventoryError> {
-    let primary_name = model
-        .location
-        .components()
-        .iter()
-        .find(|component| {
-            matches!(
-                component.role,
-                ComponentRole::Weights | ComponentRole::Shard
-            )
-        })
+    let primary_name = primary_weight_component(model.location.components())
         .and_then(|component| Path::new(&component.path).file_name())
         .and_then(|value| value.to_str())
         .unwrap_or("local model");
@@ -2753,16 +2739,20 @@ fn unique_projector_for(model: &Path, projectors: &[PathBuf]) -> Option<PathBuf>
     (matches.len() == 1).then(|| matches[0].clone())
 }
 
-pub(crate) fn primary_path(root: &Path, components: &[ModelComponent]) -> Option<PathBuf> {
+fn primary_weight_component(components: &[ModelComponent]) -> Option<&ModelComponent> {
     components
         .iter()
-        .find(|component| {
+        .filter(|component| {
             matches!(
                 component.role,
                 ComponentRole::Weights | ComponentRole::Shard
             )
         })
-        .map(|component| root.join(&component.path))
+        .min_by_key(|component| component.shard_index.unwrap_or(0))
+}
+
+pub(crate) fn primary_path(root: &Path, components: &[ModelComponent]) -> Option<PathBuf> {
+    primary_weight_component(components).map(|component| root.join(&component.path))
 }
 
 pub(crate) fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, InventoryError> {

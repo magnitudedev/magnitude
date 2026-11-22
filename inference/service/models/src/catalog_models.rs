@@ -1176,7 +1176,8 @@ fn catalog_resolution<'a>(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let projector_package = catalog_projector_package(catalog_target(definition));
+    let target_definition = catalog_target(definition);
+    let projector_package = catalog_projector_package(target_definition);
     let superseded_package_ids = affiliations
         .iter()
         .filter(|affiliation| {
@@ -1186,7 +1187,12 @@ fn catalog_resolution<'a>(
                 && projector_package
                     .as_ref()
                     .is_none_or(|projector| projector.id != affiliation.package_id)
-                && present.contains_key(&affiliation.package_id)
+                && present.get(&affiliation.package_id).is_some_and(|entry| {
+                    !crate::package_service::exact_target_weights(
+                        target_definition,
+                        &entry.package,
+                    )
+                })
         })
         .map(|affiliation| affiliation.package_id.clone())
         .collect::<BTreeSet<_>>()

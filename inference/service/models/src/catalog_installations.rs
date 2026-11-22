@@ -393,6 +393,13 @@ impl ManagedCatalogInstallations {
                 });
             }
         }
+        // Reconcile before planning so the removal plan sees every managed package
+        // that `remove_managed_packages`'s own reconciliation will observe (such as
+        // a target's standalone projector package and weights-only discovered group).
+        self.resolver
+            .inventory
+            .ensure_installed_model_inventory()
+            .await?;
         let plan = self.resolver.catalog_removal_plan(id)?;
         if !plan.installed {
             return Err(InventoryError::ModelOperation {

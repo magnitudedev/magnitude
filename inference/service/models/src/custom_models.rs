@@ -2068,6 +2068,7 @@ impl LocalModels for ManagedLocalModels {
     ) -> BoxFuture<'_, Result<LocalModelRemoval, InventoryError>> {
         let model_id = model_id.clone();
         Box::pin(async move {
+            self.inventory().ensure_installed_model_inventory().await?;
             let projection = self.resolver.local_projection()?;
             let projected = projection
                 .models
@@ -5757,6 +5758,258 @@ mod tests {
         );
         fixture.inventory().ensure_installed_model_inventory().await.unwrap();
         assert!(fixture.inventory().list_installed().await.unwrap().packages.is_empty());
+    }
+
+    /// QA RTX 5090 (F-030): installing a multi-repo catalog model whose target weights live in a
+    /// subdirectory with a root supplemental shard (e.g. ngram/engram) and root projector while
+    /// its drafter lives in a separate repository publishes only `[target, draft]` into memory.
+    /// Removing it immediately (without a prior rescan) must reconcile before planning and
+    /// attribute the managed weights-only discovery group by exact target weights, so one remove
+    /// call frees every byte across both repositories instead of deleting only the drafter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_multi_repo_catalog_model_immediately_after_install_removes_everything() {
+        use magnitude_service_contracts::models::{
+            CatalogInstallationAdmission, CatalogInstallationOperationState,
+            CatalogInstallationRemoval, CatalogInstallations as _, CatalogModelState,
+            InstalledModelPackages as _, ModelFile, ModelFileId, ModelFileRelationship,
+            ModelPackageProperties, ModelPackageSource,
+        };
+
+        let (definition, target_id, draft_id, total_bytes, endpoint) = {
+            let target_repo = "ISTA-DASLab/Model-GSQ-GGUF";
+            let draft_repo = "unsloth/Model-GGUF";
+            let target_commit = "a".repeat(40);
+            let draft_commit = "b".repeat(40);
+
+            let shard1_path = "Q2_0/Model-Q2_0-00001-of-00002.gguf";
+            let shard2_path = "Model-Ngram-Q5_0.gguf";
+            let projector_path = "mmproj-BF16.gguf";
+            let drafter_path = "MTP/mtp-Model-Q8_0.gguf";
+
+            let shard1 = gguf_bytes(
+                &[
+                    ("general.architecture", Meta::Str("llama")),
+                    ("general.name", Meta::Str("Qwen3.8 Flash Next")),
+                    ("split.no", Meta::U32(0)),
+                    ("split.count", Meta::U32(2)),
+                    ("split.tensors.count", Meta::U32(3)),
+                ],
+                &["token_embd.weight", "blk.0.attn_q.weight"],
+            );
+            // A distinct `general.name` causes `intrinsic_target_identity` to return `(None, None)`,
+            // exercising exact-target-weights attribution for the managed weights-only discovery group.
+            let shard2 = gguf_bytes(
+                &[
+                    ("general.architecture", Meta::Str("llama")),
+                    ("general.name", Meta::Str("Qwen3.8 Flash Next Ngram")),
+                    ("split.no", Meta::U32(1)),
+                    ("split.count", Meta::U32(2)),
+                    ("split.tensors.count", Meta::U32(3)),
+                ],
+                &["blk.0.ngram_k"],
+            );
+            let projector = gguf_bytes(
+                &[
+                    ("general.architecture", Meta::Str("clip")),
+                    ("general.name", Meta::Str("projector")),
+                ],
+                &["v.patch_embd.weight"],
+            );
+            let drafter = drafter_bytes("Qwen3.8-Flash-Next-MTP");
+
+            let total_bytes =
+                (shard1.len() + shard2.len() + projector.len() + drafter.len()) as u64;
+
+            let make_file = |path: &str, role: ModelFileRole, bytes: &[u8]| {
+                let digest = sha256(bytes);
+                ModelFile {
+                    id: ModelFileId(format!("file_{digest}")),
+                    path: PathBuf::from(path),
+                    role,
+                    size_bytes: bytes.len() as u64,
+                    tensor_storage_bytes: Some(bytes.len() as u64),
+                    sha256: digest,
+                }
+            };
+            let shard1_file = make_file(shard1_path, ModelFileRole::Weights, &shard1);
+            let shard2_file = make_file(shard2_path, ModelFileRole::Weights, &shard2);
+            let projector_file = make_file(projector_path, ModelFileRole::Projector, &projector);
+            let shard1_id = shard1_file.id.clone();
+            let shard2_id = shard2_file.id.clone();
+            let projector_id = projector_file.id.clone();
+            let mut target_files = vec![shard1_file, shard2_file, projector_file];
+            target_files.sort_by(|left, right| left.path.cmp(&right.path));
+            let mut target_relationships = vec![
+                ModelFileRelationship::Shard {
+                    file_id: shard1_id.clone(),
+                    index: 1,
+                    count: 2,
+                },
+                ModelFileRelationship::Shard {
+                    file_id: shard2_id,
+                    index: 2,
+                    count: 2,
+                },
+                ModelFileRelationship::ProjectorFor {
+                    projector_file_id: projector_id,
+                    weights_file_id: shard1_id,
+                },
+            ];
+            target_relationships.sort_by_key(|relationship| format!("{relationship:?}"));
+            let target = ModelPackage {
+                id: crate::package_service::canonical_package_id(
+                    &target_files,
+                    &target_relationships,
+                ),
+                source: ModelPackageSource::HuggingFace {
+                    repository: target_repo.to_owned(),
+                    revision: target_commit.clone(),
+                },
+                files: target_files,
+                relationships: target_relationships,
+                properties: ModelPackageProperties {
+                    format: "gguf".to_owned(),
+                    quantization: "F32".to_owned(),
+                    quantization_name: "F32".to_owned(),
+                    architecture: "llama".to_owned(),
+                    maximum_context_length: Some(4_096),
+                    intrinsic_model_id: None,
+                    intrinsic_quality_id: None,
+                },
+            };
+
+            let draft_files = vec![make_file(drafter_path, ModelFileRole::Weights, &drafter)];
+            let draft = ModelPackage {
+                id: crate::package_service::canonical_package_id(&draft_files, &[]),
+                source: ModelPackageSource::HuggingFace {
+                    repository: draft_repo.to_owned(),
+                    revision: draft_commit.clone(),
+                },
+                files: draft_files,
+                relationships: Vec::new(),
+                properties: ModelPackageProperties {
+                    format: "gguf".to_owned(),
+                    quantization: "F32".to_owned(),
+                    quantization_name: "F32".to_owned(),
+                    architecture: "dflash".to_owned(),
+                    maximum_context_length: Some(4_096),
+                    intrinsic_model_id: None,
+                    intrinsic_quality_id: None,
+                },
+            };
+
+            let target_id = target.id.clone();
+            let draft_id = draft.id.clone();
+            let mut definition = catalog_definition(target.clone());
+            definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+                target,
+                draft_source: SpeculativeDraftSource::Separate { draft },
+                method: SpeculativeMethod::Mtp,
+            };
+
+            let (endpoint, _) = serve_files(vec![
+                (
+                    target_repo,
+                    target_commit,
+                    vec![
+                        (shard1_path, shard1),
+                        (shard2_path, shard2),
+                        (projector_path, projector),
+                    ],
+                ),
+                (draft_repo, draft_commit, vec![(drafter_path, drafter)]),
+            ]);
+            (definition, target_id, draft_id, total_bytes, endpoint)
+        };
+        let model_id = catalog_id(&definition);
+        let fixture = Fixture::new()
+            .await
+            .restart_with_hub(endpoint, vec![definition])
+            .await;
+
+        let downloads = Arc::new(
+            crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+                .await
+                .unwrap(),
+        );
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            downloads,
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(NoOptimizer),
+        );
+
+        let CatalogInstallationAdmission::Admitted { operation_id } =
+            installations.install(&model_id).await.unwrap()
+        else {
+            panic!("the multi-repo catalog installation is admitted");
+        };
+        for _ in 0..200 {
+            let done = installations
+                .list_catalog_installations()
+                .await
+                .unwrap()
+                .operations
+                .iter()
+                .any(|operation| {
+                    operation.operation_id == operation_id
+                        && operation.state == CatalogInstallationOperationState::Completed
+                });
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            matches!(
+                fixture.resolver.catalog_snapshot().unwrap().models[0].local_state,
+                CatalogModelState::Installed { .. }
+            ),
+            "the multi-repo catalog model is installed after download"
+        );
+        // Before any rescan, only the two downloaded packages are in memory.
+        let pre_scan_ids = fixture
+            .inventory()
+            .list_installed()
+            .await
+            .unwrap()
+            .packages
+            .into_iter()
+            .map(|entry| entry.package.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(pre_scan_ids, BTreeSet::from([target_id, draft_id]));
+
+        // Remove immediately without rescanning: one removal must delete every file in both repos.
+        let removed = installations.remove(&model_id).await.unwrap();
+        assert_eq!(
+            removed,
+            CatalogInstallationRemoval::Removed {
+                reclaimed_bytes: total_bytes,
+                kept_components: Vec::new(),
+            }
+        );
+        assert!(
+            stored_files(&fixture.store).is_empty(),
+            "no target, ngram, projector, or drafter files remain on disk"
+        );
+        assert_eq!(
+            fixture.resolver.catalog_snapshot().unwrap().models[0].local_state,
+            CatalogModelState::NotInstalled
+        );
+        fixture
+            .inventory()
+            .ensure_installed_model_inventory()
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .inventory()
+                .list_installed()
+                .await
+                .unwrap()
+                .packages
+                .is_empty()
+        );
     }
 
     /// QA linux-vulkan: removing one variant of a catalog model deleted the projector file the

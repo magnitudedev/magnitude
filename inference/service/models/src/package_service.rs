@@ -819,29 +819,34 @@ impl ManagedModelStore {
             );
         }
 
-        // Intrinsic upgrade attribution is reserved for Magnitude-managed
-        // installations. External material is a catalog target only when its
-        // weights are exactly a current target's.
-        if !matches!(model.location, ModelLocation::MagnitudeCache { .. }) {
-            let exact = self
-                .config
-                .catalog_models
-                .iter()
-                .filter(|catalog_model| {
-                    exact_target_weights(catalog_target(catalog_model), package)
-                })
-                .collect::<Vec<_>>();
-            return match exact.as_slice() {
-                [] => InstalledCatalogAttribution::NotCatalogTarget,
-                [catalog_model] => attributed(catalog_model),
-                _ => failure(
+        // Exact current target weights without the catalog target's projector (such as a found
+        // copy or a managed snapshot's weights-only discovery group) belong to that catalog model
+        // without recording a superseded-revision affiliation.
+        let exact_weights = self
+            .config
+            .catalog_models
+            .iter()
+            .filter(|catalog_model| exact_target_weights(catalog_target(catalog_model), package))
+            .collect::<Vec<_>>();
+        match exact_weights.as_slice() {
+            [catalog_model] => return attributed(catalog_model),
+            [_, ..] => {
+                return failure(
                     "catalog_target_package_ambiguous",
                     format!(
                         "package {} holds the target weights of multiple catalog variants",
                         package.id.0
                     ),
-                ),
-            };
+                );
+            }
+            [] => {}
+        }
+
+        // Intrinsic upgrade attribution is reserved for Magnitude-managed
+        // installations. External material is a catalog target only when its
+        // weights are exactly a current target's.
+        if !matches!(model.location, ModelLocation::MagnitudeCache { .. }) {
+            return InstalledCatalogAttribution::NotCatalogTarget;
         }
 
         let retired_catalog_target = !affiliated_keys.is_empty();
