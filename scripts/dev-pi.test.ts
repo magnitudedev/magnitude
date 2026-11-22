@@ -73,7 +73,7 @@ describe("Pi development resource isolation", () => {
 const readyCatalog = (models = [makeInstalledCatalogModel()]): ModelCatalogState => ({
   _tag: "Ready", providers: [], failures: [],
   models: models.map(product => ({ _tag: "Local", product, offering: Option.none() })),
-  localModelPreparation: { discovery: { complete: true, modelsFound: models.length }, assessment: { complete: true, settledModels: models.length, totalModels: models.length } },
+  localModelPreparation: { discovery: { complete: true, modelsFound: models.length }, assessment: { complete: true, settledModels: models.length, totalModels: models.length }, measurement: { _tag: "Measured" } },
   unsupportedLocalModels: [], hiddenLocalModels: [],
 })
 

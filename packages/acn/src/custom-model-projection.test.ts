@@ -346,6 +346,7 @@ describe("local models state", () => {
   const assessments = (modelIds: readonly string[]) => ({
     revision: 1,
     environmentId: "environment",
+    measurement: { _tag: "Measured" },
     catalog: { _tag: "Available", sourceRevision: 1, entries: [] },
     custom: {
       _tag: "Available",
@@ -402,6 +403,7 @@ describe("local models state", () => {
     expect(state.preparation).toEqual({
       discovery: { complete: true, modelsFound: 1 },
       assessment: { complete: true, settledModels: 1, totalModels: 1 },
+      measurement: { _tag: "Measured" },
     })
   })
   it("follows a found exact target through its projector and then its drafter without ever reporting an update", () => {

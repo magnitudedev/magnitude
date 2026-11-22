@@ -350,6 +350,7 @@ type CatalogSnapshotState = Exclude<ModelCatalogState, { readonly _tag: "Initial
 export const makePreparation = (settledModels = 1, totalModels = 1): LocalModelPreparation => ({
   discovery: { complete: true, modelsFound: totalModels },
   assessment: { complete: settledModels === totalModels, settledModels, totalModels },
+  measurement: { _tag: "Measured" },
 })
 
 export const catalogState = (

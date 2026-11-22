@@ -267,7 +267,7 @@ describe("recommendations, families, and assessment progress", () => {
     expect(renderPreparation(makePreparation(3, 4), [measured])).toBe("Assessment: In progress - 3 of 4 models assessed")
     expect(renderPreparation(makePreparation(4, 4), [measured])).toBe("Assessment: Complete - 4 of 4 models assessed")
     const measuring = makeCatalogModel({ servingState: { ...measured.servingState, assessment: {
-      ...fitsAssessment(), residency: { _tag: "Resident", performance: { _tag: "Pending", measurement: { _tag: "Measuring" } } } } } as typeof measured.servingState })
+      ...fitsAssessment(), residency: { _tag: "Resident", performance: { _tag: "Pending", measurement: { _tag: "Measuring", progress: Option.none() } } } } } as typeof measured.servingState })
     expect(renderPreparation(makePreparation(4, 4), [measured, measuring]))
       .toBe("Assessment: In progress - 4 of 4 models assessed, measuring the speed of 1 quant")
   })
