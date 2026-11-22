@@ -31,6 +31,7 @@ export const useLocalModels = () => {const value=usePhase();if (value === 'memor
 export const useLocalInferenceHardware = () => {const value=usePhase();return value === 'loading' || value === 'hardware-loading' ? Result.initial() : value === 'error' ? Result.fail('offline') : Result.success(hardware,{waiting:value==="refreshing"})}
 export const useLocalModelMutations = () => ({ install(){setPhase("download-unknown")},load(){setPhase("load-pending")},stop(){},cancel(){setPhase("ready")},remove(){},dismissFailure(){setPhase("ready")} })
 export const useLocalModelCommandStatus = () => ({pending:false,pendingOperations:[],failures:[]})
+export const useLocalModelCommandStatuses = () => new Map()
 export const useLocalModelStopStatus = () => ({pending:false,failure:Option.none()})
 // Hardware budget is intentionally independent of platform-specific fixture domain schemas.
 export const targetPhysicalMemoryBytes = () => 68719476736

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
-import { Option } from "effect"
-import { CatalogFormModelIdSchema, type LocalModel, type RecommendedModel } from "@magnitudedev/sdk"
+import { Option, Schema } from "effect"
+import { CatalogFormModelIdSchema, CatalogSupportSchema, LocalModelMutationFailed, type LocalModel, type RecommendedModel } from "@magnitudedev/sdk"
 import { makeSetupModel } from "@magnitudedev/client-common/fixtures/model"
 import { offeredFromRecommendation, ownedModel, transferLabel } from "./data"
 
@@ -56,5 +56,47 @@ describe("a transfer's label", () => {
 
   it("gives the real percentage once downloading, the bytes already here included", () => {
     expect(transferLabel(progress("downloading", 1_353_300_000, 3_470_000_000))).toEqual({ text: "Downloading 39%", fraction: 0.39 })
+  })
+})
+
+describe("an owned catalog model's support and load failures", () => {
+  it("falls back to the replacement model ID when the replacement is not in the catalog list", () => {
+    const installed = makeSetupModel(true)
+    const deprecated: LocalModel = {
+      ...installed,
+      catalogData: {
+        ...installed.catalogData,
+        intelligence: Option.none(),
+        support: Schema.decodeUnknownSync(CatalogSupportSchema)({
+          _tag: "Deprecated",
+          since: "2026-11-18",
+          replacement: "qwen3.8-27b:gguf:iq2",
+          reason: "Superseded by Qwen3.8 27B at 2-bit.",
+        }) as Extract<typeof CatalogSupportSchema.Type, { readonly _tag: "Deprecated" }>,
+      },
+    }
+    expect(ownedModel(deprecated, "Device").support).toEqual({
+      kind: "Deprecated",
+      label: "Deprecated",
+      summary: "No longer supported: Superseded by Qwen3.8 27B at 2-bit. Switch to qwen3.8-27b:gguf:iq2.",
+    })
+  })
+
+  it("hides a stale load command failure once residency becomes active", () => {
+    const installed = makeSetupModel(true)
+    const loading: LocalModel = {
+      ...installed,
+      acquisitionState: { ...installed.acquisitionState, residencyState: { _tag: "Requested" } },
+    } as LocalModel
+    const staleFailure = {
+      pending: false,
+      pendingOperations: [],
+      failures: [{
+        operation: "load" as const,
+        rejection: Option.some(new LocalModelMutationFailed({ code: "memory_shortage", message: "tight", retryable: true })),
+      }],
+    }
+    expect(ownedModel(installed, "Device", [installed], staleFailure).failure?.summary).toContain("Not enough memory right now.")
+    expect(ownedModel(loading, "Device", [loading], staleFailure).failure).toBeNull()
   })
 })

@@ -1,7 +1,8 @@
 import { Option } from "effect"
-import { localModelResidency, type CustomLocalModel, type DrafterTarget, type LocalModel, type LocalModelAssessment, type LocalModelDeveloper, type LocalModelFamily, type ModelTransferProgress, type RecommendedModel, type SpeculativeMethod, type UnsupportedLocalModel } from "@magnitudedev/sdk"
-import { describeModelLoadFailure, fitPlacementPhrase, modelDownloadFailureMessage, modelFailureLabel, formatStorageSize, ladderBitWidths, localModelQuantName, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
+import { localModelResidency, type CustomLocalModel, type DrafterTarget, type LocalModel, type LocalModelAssessment, type LocalModelDeveloper, type LocalModelFamily, type ModelResidency, type ModelTransferProgress, type RecommendedModel, type SpeculativeMethod, type UnsupportedLocalModel } from "@magnitudedev/sdk"
+import { catalogModelReplacement, catalogSupportLabel, describeCatalogDeprecation, describeModelLoadFailure, fitPlacementPhrase, modelDownloadFailureMessage, modelFailureLabel, formatStorageSize, ladderBitWidths, localModelQuantName, localModelSizeBytes, quantBitWidth, type LocalModelCommandStatus, type ServingMemory } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
+import { modelCommandNotice } from "../model-error"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
 import type { RunnableFamily } from "./explore-view"
@@ -135,14 +136,55 @@ const drafterOf = (model: LocalModel): OwnedModel["drafter"] => {
   return Option.match(model.catalogData.drafter, { onNone: () => null, onSome: drafter => ({ method: methodName[drafter.method._tag], sizeBytes: drafter.sizeBytes, attached: true }) })
 }
 
-/** A model on this computer as the Your models list shows it. */
-/** How the model last failed, named for what its code says happened, in a sentence from it, with the engine's own report kept for Details. */
-const failureOf = (model: LocalModel): OwnedModel["failure"] => Option.match(localModelResidency(model), {
-  onNone: () => null,
-  onSome: residency => residency._tag === "Failed" ? { label: modelFailureLabel(residency.failure), summary: describeModelLoadFailure(residency.failure), detail: residency.failure.message } : null,
-})
+const isActiveResidency = (residency: ModelResidency | undefined) =>
+  residency?._tag === "Requested" || residency?._tag === "Loading" || residency?._tag === "Ready" || residency?._tag === "Stopping"
 
-export const ownedModel = (model: LocalModel, memory: ServingMemory): OwnedModel => {
+/** Catalog support warning for an unavailable (deprecated or disabled) catalog model. */
+const supportOf = (model: LocalModel, catalog: readonly LocalModel[]): OwnedModel["support"] => {
+  if (model._tag !== "Catalog") return null
+  const { support } = model.catalogData
+  switch (support._tag) {
+    case "Supported": return null
+    case "Deprecated": return {
+      kind: "Deprecated",
+      label: Option.getOrElse(catalogSupportLabel(support), () => "Deprecated"),
+      summary: describeCatalogDeprecation(support, catalogModelReplacement(catalog, support)),
+    }
+    case "Disabled": return {
+      kind: "Disabled",
+      label: Option.getOrElse(catalogSupportLabel(support), () => "Disabled"),
+      summary: support.reason,
+    }
+  }
+}
+
+/** How the model last failed, from a rejected Load click or residency failure, with any diagnostic report kept for Details. */
+const failureOf = (model: LocalModel, commandStatus?: LocalModelCommandStatus): OwnedModel["failure"] => {
+  const residency = Option.getOrUndefined(localModelResidency(model))
+  if (isActiveResidency(residency)) return null
+  const loadFailure = commandStatus?.failures.find(failure => failure.operation === "load")
+  if (loadFailure) {
+    const notice = modelCommandNotice(loadFailure)
+    const severity = notice.severity ?? "error"
+    return {
+      label: severity === "info" ? notice.title : "Couldn’t load",
+      summary: notice.description ? `${notice.title}. ${notice.description}` : notice.title,
+      detail: Option.match(loadFailure.rejection, { onNone: () => null, onSome: rejection => rejection.message || null }),
+      severity,
+    }
+  }
+  return residency?._tag === "Failed"
+    ? { label: modelFailureLabel(residency.failure), summary: describeModelLoadFailure(residency.failure), detail: residency.failure.message || null, severity: "error" }
+    : null
+}
+
+/** A model on this computer as the Your models list shows it. */
+export const ownedModel = (
+  model: LocalModel,
+  memory: ServingMemory,
+  catalog: readonly LocalModel[] = [],
+  commandStatus?: LocalModelCommandStatus,
+): OwnedModel => {
   const developer = Option.getOrNull(developerOf(model))
   const assessment = assessmentOf(model)
   const quant = quantOf(model, memory)
@@ -160,7 +202,8 @@ export const ownedModel = (model: LocalModel, memory: ServingMemory): OwnedModel
     drafter: drafterOf(model),
     drafterChoosable: model._tag === "Custom",
     searchText: `${model.presentation.displayName} ${quant.repository ?? ""} ${quant.name}`,
-    failure: failureOf(model),
+    support: supportOf(model, catalog),
+    failure: failureOf(model, commandStatus),
     downloadFailure: model.acquisitionState._tag === "InstallFailed" || model.acquisitionState._tag === "UpdateFailed" ? modelDownloadFailureMessage(model.acquisitionState.failure) : null,
   }
 }

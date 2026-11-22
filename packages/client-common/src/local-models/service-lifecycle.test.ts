@@ -8,12 +8,13 @@ import { describe, expect, it } from "vitest"
 import {
   AgentClientProvider,
   useLocalModelActions,
+  useLocalModelCommandStatuses,
   useLocalModelMutations,
   useLocalModelStopStatus,
   useLocalModelsSelector,
   type AgentClient,
 } from "../index"
-import { CatalogFormModelIdSchema, type Change, type LocalModelsState } from "@magnitudedev/sdk"
+import { CatalogFormModelIdSchema, LocalModelMutationFailed, type Change, type LocalModelsState } from "@magnitudedev/sdk"
 import { Queue, Stream } from "effect"
 import { clientServicesLayer, type ClientServices } from "../state/client-services"
 import type { AcnClientRequirements } from "../state/agent-client"
@@ -222,6 +223,48 @@ describe("shared local-model command hooks", () => {
         await Effect.runPromise(Effect.sleep("20 millis"))
       })
       for (const id of [0, 1]) expect(statuses.get(id)).toEqual({ pending: false, failure: Option.some("The model may still be running. Try stopping it again.") })
+    } finally {
+      if (renderer) await act(async () => renderer.unmount())
+      registry.dispose()
+    }
+  })
+
+  it("reports a rejected LoadLocalModel command via useLocalModelCommandStatuses", async () => {
+    const rejection = new LocalModelMutationFailed({
+      code: "memory_shortage",
+      message: "requires 18 GB and 17 GB available",
+      retryable: true,
+    })
+    const { client } = makeFakeAgentClient(() => {}, {
+      command: (tag) => tag === "LoadLocalModel"
+        ? Effect.fail(rejection)
+        : Effect.dieMessage(`Unexpected command: ${tag}`),
+    })
+    const registry = Registry.make({ defaultIdleTTL: 5_000 })
+    let actions!: ReturnType<typeof useLocalModelMutations>
+    let observed: ReturnType<typeof useLocalModelCommandStatuses> = new Map()
+    const Probe = () => {
+      actions = useLocalModelMutations()
+      observed = useLocalModelCommandStatuses()
+      return null
+    }
+    let renderer!: ReactTestRenderer
+    try {
+      await act(async () => {
+        renderer = create(createElement(RegistryContext.Provider, { value: registry },
+          createElement(AgentClientProvider, { tag: client, children: createElement(Probe) })))
+        await Effect.runPromise(Effect.sleep("20 millis"))
+      })
+      const modelId = CatalogFormModelIdSchema.make("qwen3.8:gguf:q4")
+      await act(async () => {
+        actions.load(modelId)
+        await Effect.runPromise(Effect.sleep("20 millis"))
+      })
+      expect(observed.get(modelId)).toEqual({
+        pending: false,
+        pendingOperations: [],
+        failures: [{ operation: "load", rejection: Option.some(rejection) }],
+      })
     } finally {
       if (renderer) await act(async () => renderer.unmount())
       registry.dispose()

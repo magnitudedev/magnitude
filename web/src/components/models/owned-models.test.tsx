@@ -1,19 +1,59 @@
 import { renderToStaticMarkup } from "react-dom/server"
-import { Option } from "effect"
+import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
-import type { LocalModel } from "@magnitudedev/sdk"
+import { CatalogFormModelIdSchema, CatalogSupportSchema, LocalModelMutationFailed, QuantNameSchema, type LocalModel } from "@magnitudedev/sdk"
+import type { LocalModelCommandStatus } from "@magnitudedev/client-common"
 import { makeSetupModel, streamedReadyResidency } from "@magnitudedev/client-common/fixtures/model"
 import { modelLabs } from "../model-logo"
 import { ownedModel } from "./data"
-import { OwnedModelAction, OwnedModels } from "./models-screen"
+import { modelRowAction, OwnedModels } from "./models-screen"
 import { matchingModels, YourModels } from "./your-models"
 
 /** Whether any button or link sits inside a button or an element acting as one. */
 const nestsControls = (html: string) => /role="button"/.test(html) || /<button\b(?:(?!<\/button>).)*<(?:button|a)\b/s.test(html)
 
-const model = ownedModel(makeSetupModel(true), "Device")
+const baseModel = makeSetupModel(true)
+const model = ownedModel(baseModel, "Device")
 const EMPTY = <p>No models are downloaded yet.</p>
 const list = <YourModels models={[model]} action={() => null} onExploreQuants={() => {}} onRemove={() => {}} onDrafter={() => {}} />
+const noopActions = { loadPending: false, onLoad: () => {}, onStop: () => {}, onCancel: () => {}, onRetryInstall: () => {} }
+
+const replacementModel: LocalModel = {
+  ...makeSetupModel(false),
+  modelId: CatalogFormModelIdSchema.make("qwen3.8-27b:gguf:iq2"),
+  presentation: { ...baseModel.presentation, displayName: "Qwen3.8 27B" },
+  catalogData: {
+    ...baseModel.catalogData,
+    quant: { ...baseModel.catalogData.quant, name: QuantNameSchema.make("IQ2_M") },
+  },
+}
+
+const deprecatedModel: LocalModel = {
+  ...baseModel,
+  modelId: CatalogFormModelIdSchema.make("qwen3.5-9b:gguf:q4"),
+  presentation: { ...baseModel.presentation, displayName: "Qwen3.5 9B" },
+  catalogData: {
+    ...baseModel.catalogData,
+    intelligence: Option.none(),
+    support: Schema.decodeUnknownSync(CatalogSupportSchema)({
+      _tag: "Deprecated",
+      since: "2026-11-18",
+      replacement: replacementModel.modelId,
+      reason: "Superseded by Qwen3.8 27B at 2-bit, which is far smarter at a similar size.",
+    }) as Extract<typeof CatalogSupportSchema.Type, { readonly _tag: "Deprecated" }>,
+  },
+}
+
+const disabledModel: LocalModel = {
+  ...baseModel,
+  modelId: CatalogFormModelIdSchema.make("disabled-model:gguf:q4"),
+  presentation: { ...baseModel.presentation, displayName: "Disabled Model" },
+  catalogData: {
+    ...baseModel.catalogData,
+    intelligence: Option.none(),
+    support: { _tag: "Disabled", reason: "Full serving path is unfinished." },
+  },
+}
 
 describe("the user's models", () => {
   it("shows the empty state, then Hidden, while every model is hidden, with no search or filters and no 'No models match.'", () => {
@@ -68,7 +108,7 @@ describe("the user's models", () => {
     expect(pendingView.quant.measuring).toBe(true)
     const rowHtml = renderToStaticMarkup(<YourModels
       models={[pendingView]}
-      action={view => <OwnedModelAction model={pending} view={view} onLoad={() => {}} onStop={() => {}} onCancel={() => {}} onRetry={() => {}} />}
+      action={view => modelRowAction(view, pending, noopActions)}
       onExploreQuants={() => {}} onRemove={() => {}} onDrafter={() => {}}
     />)
     expect(rowHtml).not.toContain(">Load<")
@@ -78,7 +118,7 @@ describe("the user's models", () => {
   it("shows Load once standing measurements settle, and keeps Stop when already running", () => {
     const settled = makeSetupModel(true)
     const settledView = ownedModel(settled, "Device")
-    const settledHtml = renderToStaticMarkup(<OwnedModelAction model={settled} view={settledView} onLoad={() => {}} onStop={() => {}} onCancel={() => {}} onRetry={() => {}} />)
+    const settledHtml = renderToStaticMarkup(<>{modelRowAction(settledView, settled, noopActions)}</>)
     expect(settledHtml).toContain("Load")
     expect(settledHtml).not.toContain("Measuring…")
 
@@ -88,8 +128,109 @@ describe("the user's models", () => {
         ? { ...settled.acquisitionState, residencyState: streamedReadyResidency(["metal:0"]) }
         : settled.acquisitionState,
     }
-    const runningHtml = renderToStaticMarkup(<OwnedModelAction model={running} view={ownedModel(running, "Device")} onLoad={() => {}} onStop={() => {}} onCancel={() => {}} onRetry={() => {}} />)
+    const runningHtml = renderToStaticMarkup(<>{modelRowAction(ownedModel(running, "Device"), running, noopActions)}</>)
     expect(runningHtml).toContain("Running")
     expect(runningHtml).toContain("Stop")
+  })
+
+  it("surfaces a deprecated owned catalog model with its badge and replacement, and omits the broken Load button", () => {
+    const deprecated = ownedModel(deprecatedModel, "Device", [deprecatedModel, replacementModel])
+    const html = renderToStaticMarkup(
+      <YourModels
+        models={[deprecated]}
+        action={view => modelRowAction(view, deprecatedModel, noopActions)}
+        onExploreQuants={() => {}}
+        onRemove={() => {}}
+        onDrafter={() => {}}
+      />,
+    )
+    expect(html).toContain("Deprecated")
+    expect(html).toContain("No longer supported")
+    expect(html).toContain("Superseded by Qwen3.8 27B at 2-bit, which is far smarter at a similar size.")
+    expect(html).toContain("Switch to Qwen3.8 27B (IQ2_M).")
+    expect(html).not.toMatch(/>Load<\/button>/)
+    expect(nestsControls(html)).toBe(false)
+  })
+
+  it("surfaces a disabled owned catalog model with its reason and omits Load", () => {
+    const disabled = ownedModel(disabledModel, "Device", [disabledModel])
+    const html = renderToStaticMarkup(
+      <YourModels
+        models={[disabled]}
+        action={view => modelRowAction(view, disabledModel, noopActions)}
+        onExploreQuants={() => {}}
+        onRemove={() => {}}
+        onDrafter={() => {}}
+      />,
+    )
+    expect(html).toContain("Disabled")
+    expect(html).toContain("Full serving path is unfinished.")
+    expect(html).not.toMatch(/>Load<\/button>/)
+  })
+
+  it("surfaces a rejected Load click on the row when residency stays unloaded", () => {
+    const failedLoad: LocalModelCommandStatus = {
+      pending: false,
+      pendingOperations: [],
+      failures: [{
+        operation: "load",
+        rejection: Option.some(new LocalModelMutationFailed({
+          code: "memory_shortage",
+          message: "PRIVATE requires 18710917797 bytes and 17334222848 bytes are available",
+          retryable: true,
+        })),
+      }],
+    }
+    const failed = ownedModel(baseModel, "Device", [baseModel], failedLoad)
+    expect(failed.failure?.detail).toContain("PRIVATE")
+    const html = renderToStaticMarkup(
+      <YourModels
+        models={[failed]}
+        action={view => modelRowAction(view, baseModel, noopActions)}
+        onExploreQuants={() => {}}
+        onRemove={() => {}}
+        onDrafter={() => {}}
+      />,
+    )
+    expect(html).toContain('role="alert"')
+    expect(html).toContain("Not enough memory right now.")
+    expect(html).toContain("Quit apps you aren’t using, or choose a smaller model.")
+    expect(html).toContain("Couldn’t load")
+    expect(html).toContain(">Load</button>")
+    expect(html).not.toContain("PRIVATE")
+    expect(nestsControls(html)).toBe(false)
+  })
+
+  it("surfaces a non-retryable or transport Load rejection and shows Loading while a load command is pending", () => {
+    const transportFailed: LocalModelCommandStatus = {
+      pending: false,
+      pendingOperations: [],
+      failures: [{ operation: "load", rejection: Option.none() }],
+    }
+    const failed = ownedModel(baseModel, "Device", [baseModel], transportFailed)
+    const failedHtml = renderToStaticMarkup(
+      <YourModels
+        models={[failed]}
+        action={view => modelRowAction(view, baseModel, noopActions)}
+        onExploreQuants={() => {}}
+        onRemove={() => {}}
+        onDrafter={() => {}}
+      />,
+    )
+    expect(failedHtml).toContain('role="alert"')
+    expect(failedHtml).toContain("This model couldn’t load.")
+    expect(failedHtml).toContain(">Load</button>")
+
+    const pendingHtml = renderToStaticMarkup(
+      <YourModels
+        models={[model]}
+        action={view => modelRowAction(view, baseModel, { ...noopActions, loadPending: true })}
+        onExploreQuants={() => {}}
+        onRemove={() => {}}
+        onDrafter={() => {}}
+      />,
+    )
+    expect(pendingHtml).toContain("Loading…")
+    expect(pendingHtml).not.toContain(">Load</button>")
   })
 })

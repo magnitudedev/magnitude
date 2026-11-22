@@ -55,14 +55,33 @@ export const modelRemovalNotice = (failure: ModelFailure): NoticeContent => {
 }
 
 export const modelCommandNotice = (failure: LocalModelCommandFailure): NoticeContent => {
-  if (failure.operation === "load" && Option.isSome(failure.rejection) && failure.rejection.value.code === "model_instance_stopped") return {
-    severity: "info", title: "Loading was stopped", description: "Load the model again when you’re ready.",
-  }
-  if (failure.operation === "load" && Option.isSome(failure.rejection) && failure.rejection.value.code === "model_does_not_fit") return {
-    title: "This model doesn’t fit this computer", description: "It needs more memory than this computer can provide. Choose a smaller model.",
+  if (failure.operation === "load" && Option.isSome(failure.rejection)) {
+    switch (failure.rejection.value.code) {
+      case "model_instance_stopped": return {
+        severity: "info", title: "Loading was stopped", description: "Load the model again when you’re ready.",
+      }
+      case "model_does_not_fit": return {
+        title: "This model doesn’t fit this computer", description: "It needs more memory than this computer can provide. Choose a smaller model.",
+      }
+      case "catalog_model_deprecated": return {
+        title: "This model is deprecated", description: "It can no longer be loaded. Switch to its replacement or choose another model.",
+      }
+      case "catalog_model_disabled": return {
+        title: "This model is disabled", description: "It can’t be loaded in this version of Magnitude. Choose another model.",
+      }
+      case "prices_pending": return {
+        title: "Still measuring this computer", description: "Wait for measurement to finish, then try loading it again.",
+      }
+      case "model_busy": return {
+        title: "This model is busy", description: "Wait a moment for the current change to finish, then try again.",
+      }
+    }
   }
   if (Option.isSome(failure.rejection) && failure.rejection.value.code === "memory_shortage") return {
     title: MEMORY_SHORTAGE_TITLE, description: "Quit apps you aren’t using, or choose a smaller model.",
+  }
+  if (failure.operation === "load" && Option.isSome(failure.rejection) && !failure.rejection.value.retryable) return {
+    title: "This model couldn’t load", description: "It can’t run on this computer with this version of Magnitude. Choose another model.",
   }
   switch (failure.operation) {
     case "load": return { title: "This model couldn’t load", description: "Try loading it again, or choose another model." }

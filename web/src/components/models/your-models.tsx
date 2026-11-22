@@ -6,7 +6,7 @@ import { Input } from "../ui/input"
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog"
 import { HuggingFaceLogo, LabLogo, modelLabs, type ModelLab } from "../model-logo"
 import { cn } from "@/lib/utils"
-import { ContextText, LabMark, PlacementBar, RepositoryLink, Speed } from "./parts"
+import { Badge, ContextText, LabMark, PlacementBar, RepositoryLink, Speed } from "./parts"
 import type { QuantView } from "./view"
 import { FailureDetails } from "../failure-details"
 
@@ -25,7 +25,8 @@ export interface OwnedModel {
   readonly drafter: { readonly method: string; readonly sizeBytes: number | null; readonly attached: boolean } | null
   readonly drafterChoosable: boolean
   readonly searchText: string
-  readonly failure: { readonly label: string; readonly summary: string; readonly detail: string } | null
+  readonly support: { readonly kind: "Deprecated" | "Disabled"; readonly label: string; readonly summary: string } | null
+  readonly failure: { readonly label: string; readonly summary: string; readonly detail: string | null; readonly severity: "error" | "warning" | "info" } | null
   readonly downloadFailure: string | null
 }
 
@@ -118,7 +119,7 @@ function ModelMenu({ model, onExploreQuants, onRemove }: { model: OwnedModel; on
     <Dialog open={confirming} onOpenChange={setConfirming}>
       <DialogContent showCloseButton={false}>
         <DialogTitle className="font-heading text-base font-semibold">Delete {model.name} {model.quant.bits}-bit?</DialogTitle>
-        <p className="text-[13px] text-slate-600 dark:text-slate-400">This removes its {formatStorageSize(model.quant.sizeBytes)} of files from this computer. You can download it again later.</p>
+        <p className="text-[13px] text-slate-600 dark:text-slate-400">This removes its {formatStorageSize(model.quant.sizeBytes)} of files from this computer.{model.support === null && " You can download it again later."}</p>
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={() => setConfirming(false)}>Cancel</Button>
           <Button variant="destructive" onClick={() => { setConfirming(false); onRemove() }}><TrashIcon />Delete</Button>
@@ -136,6 +137,7 @@ function QuantLine({ model }: { model: OwnedModel }) {
 /** What opening a model shows: how it runs here, then where it came from and what goes with it. */
 function Details({ model, onDrafter }: { model: OwnedModel; onDrafter: () => void }) {
   const rows: readonly (readonly [string, ReactNode])[] = [
+    ...(model.support ? [["Support", <span className="text-orange-700 dark:text-orange-300">{model.support.summary}</span>] as const] : []),
     ["Source", model.quant.repository ? <span className="inline-flex min-w-0 items-center gap-1 text-slate-700 dark:text-slate-300"><HuggingFaceLogo className="size-3.5" /><RepositoryLink repository={model.quant.repository} /></span> : <span className="text-slate-500">Not matched to a Hugging Face repo</span>],
     ...(model.location ? [["Location", <span className="truncate font-mono text-[11px] text-slate-600 dark:text-slate-400">{model.location}</span>] as const] : []),
     ["Drafter", <span className="flex items-center gap-2">
@@ -144,7 +146,7 @@ function Details({ model, onDrafter }: { model: OwnedModel; onDrafter: () => voi
         : model.drafterChoosable && <Button size="xs" variant="outline" onClick={event => { event.stopPropagation(); onDrafter() }}><PlusIcon />Add {model.drafter.method} drafter{model.drafter.sizeBytes !== null && ` · ${formatStorageSize(model.drafter.sizeBytes)}`}</Button>}
       {model.drafterChoosable && (model.drafter === null || model.drafter.attached) && <Button size="xs" variant="ghost" onClick={event => { event.stopPropagation(); onDrafter() }}>{model.drafter === null ? "Choose…" : "Change…"}</Button>}
     </span>],
-    ...(model.failure ? [["Last failure", <span className="block min-w-0 flex-1"><span className="text-red-600 dark:text-red-400">{model.failure.label}. {model.failure.summary}</span><FailureDetails text={model.failure.detail} /></span>] as const] : []),
+    ...(model.failure ? [["Last failure", <span className="block min-w-0 flex-1"><span className={model.failure.severity === "info" ? "text-slate-600 dark:text-slate-400" : "text-red-600 dark:text-red-400"}>{model.failure.summary}</span>{model.failure.detail && <FailureDetails text={model.failure.detail} />}</span>] as const] : []),
     ...(model.developer ? [["Developer", <span className="text-slate-700 dark:text-slate-300">{model.developer}{model.license && <span className="text-slate-500"> · {model.license}</span>}</span>] as const] : []),
   ]
   return <div className="space-y-4">
@@ -216,9 +218,15 @@ export function YourModels({ models, action, onExploreQuants, onRemove, onDrafte
             <button type="button" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : model.modelId)}
               className="col-span-4 grid cursor-pointer grid-cols-subgrid items-center rounded-md text-left focus-visible:outline-2 focus-visible:outline-blue-500 max-lg:col-span-3">
               <LabMark lab={model.lab} className="size-7" />
-              <span className="min-w-0"><span className="block truncate text-[13px] font-medium">{model.name}</span><QuantLine model={model} />{model.downloadFailure && <span role="alert" className="mt-0.5 block text-xs text-red-600 dark:text-red-400">{model.downloadFailure}</span>}</span>
+              <span className="min-w-0">
+                <span className="flex items-center gap-2"><span className="truncate text-[13px] font-medium">{model.name}</span>{model.support && <Badge tone="amber">{model.support.label}</Badge>}</span>
+                <QuantLine model={model} />
+                {model.support && <span className="mt-0.5 block text-xs text-orange-700 dark:text-orange-300">{model.support.summary}</span>}
+                {model.downloadFailure && <span role="alert" className="mt-0.5 block text-xs text-red-600 dark:text-red-400">{model.downloadFailure}</span>}
+                {model.failure && <span role={model.failure.severity === "info" ? "status" : "alert"} className={cn("mt-0.5 block text-xs", model.failure.severity === "info" ? "text-slate-500" : "text-red-600 dark:text-red-400")}>{model.failure.summary}</span>}
+              </span>
               <span className="text-right text-[13px] tabular-nums text-slate-700 dark:text-slate-300">{formatStorageSize(model.quant.sizeBytes)}</span>
-              <span className="text-right max-lg:hidden">{model.quant.fits && !model.quant.measuring && <Speed quant={model.quant} />}</span>
+              <span className="text-right max-lg:hidden">{model.support === null && model.quant.fits && !model.quant.measuring && <Speed quant={model.quant} />}</span>
             </button>
             <span className="flex justify-end">{action(model)}</span>
             <ModelMenu model={model} onExploreQuants={() => onExploreQuants(model)} onRemove={() => onRemove(model)} />

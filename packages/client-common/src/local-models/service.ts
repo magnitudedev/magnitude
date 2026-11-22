@@ -119,6 +119,15 @@ const makeLocalModels = Effect.gen(function* () {
     const model = Result.isSuccess(observed) ? Option.fromNullable(observed.value.models.find(value => value.modelId === modelId)) : Option.none<LocalModel>()
     return localModelCommandStatus(modelId, commandObservations.map(observation => get(observation)), model)
   }))
+  const commandStatuses = Atom.make(get => {
+    const observed = get(state)
+    const histories = commandObservations.map(observation => get(observation))
+    const ids = new Set<ModelId>(histories.flatMap(history => history.map(entry => entry.modelId)))
+    const byId = Result.isSuccess(observed) ? new Map(observed.value.models.map(model => [model.modelId, model])) : new Map<ModelId, LocalModel>()
+    return new Map<ModelId, LocalModelCommandStatus>(
+      [...ids].map(modelId => [modelId, localModelCommandStatus(modelId, histories, Option.fromNullable(byId.get(modelId)))]),
+    )
+  })
   const provideRegistry = Effect.provideService(Registry.AtomRegistry, registry)
 
   return {
@@ -128,6 +137,7 @@ const makeLocalModels = Effect.gen(function* () {
     unsupported,
     hidden,
     commandStatus,
+    commandStatuses,
     stopStatus,
     load: (modelId: ModelId) => Mutation.execute(load, { modelId }).pipe(provideRegistry),
     stop: Mutation.execute(stop, {}).pipe(provideRegistry),
@@ -195,10 +205,20 @@ export function useLocalModelStopStatus(): LocalModelStopStatus {
   return Result.isSuccess(result) ? result.value : { pending: false, failure: Option.none() }
 }
 
+const EMPTY_COMMAND_STATUSES: ReadonlyMap<ModelId, LocalModelCommandStatus> = new Map()
+
 export function useLocalModelCommandStatus(modelId: ModelId): LocalModelCommandStatus {
   const client = useAgentClient()
   const service = useMemo(() => client.runtime.atom(LocalModels), [client])
   const status = useMemo(() => Atom.make(get => Result.map(get(service), models => get(models.commandStatus(modelId)))), [service, modelId])
   const result = useAtomValue(status)
   return Result.isSuccess(result) ? result.value : { pending: false, pendingOperations: [], failures: [] }
+}
+
+export function useLocalModelCommandStatuses(): ReadonlyMap<ModelId, LocalModelCommandStatus> {
+  const client = useAgentClient()
+  const service = useMemo(() => client.runtime.atom(LocalModels), [client])
+  const statuses = useMemo(() => Atom.make(get => Result.map(get(service), models => get(models.commandStatuses))), [service])
+  const result = useAtomValue(statuses)
+  return Result.isSuccess(result) ? result.value : EMPTY_COMMAND_STATUSES
 }
