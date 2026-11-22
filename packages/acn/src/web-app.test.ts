@@ -71,5 +71,6 @@ describe("serving the browser app", () => {
     const response = yield* HttpClient.get(`${origin}/`)
     expect(response.status).toBe(503)
     expect(yield* response.text).toContain("browser app has not been built")
+    expect((yield* HttpClient.get(`${origin}/inference/api/v1/models`)).status).toBe(404)
   })))
 })

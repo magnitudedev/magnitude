@@ -65,9 +65,9 @@ export const webAppFilePath = (pathname: string): Option.Option<string> => {
 
 export const serveWebApp = (source: WebAppSource, fs: FileSystem.FileSystem): Effect.Effect<HttpServerResponse.HttpServerResponse, never, HttpServerRequest.HttpServerRequest> => Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest
-  if (source._tag === "Missing") return HttpServerResponse.text(NOT_BUILT, { status: 503 })
   const pathname = new URL(request.url, "http://localhost").pathname
   if (SERVICE_PATHS.some(prefix => pathname === prefix || pathname.startsWith(`${prefix}/`))) return HttpServerResponse.text("Not found", { status: 404 })
+  if (source._tag === "Missing") return HttpServerResponse.text(NOT_BUILT, { status: 503 })
   const relative = webAppFilePath(pathname)
   if (Option.isNone(relative)) return HttpServerResponse.text("Not found", { status: 404 })
   const locate = (path: string): Option.Option<string> => source._tag === "Embedded"
