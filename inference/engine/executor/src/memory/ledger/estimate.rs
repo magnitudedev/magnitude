@@ -389,7 +389,10 @@ impl Estimate {
     }
 
     fn room_in(&self, budget: u64, reserve: u64) -> u64 {
-        let bank = self.cache_of(CacheKind::Bank) + self.cache_of(CacheKind::Table) + self.bank_spare;
+        let bank = self.cache_of(CacheKind::Bank)
+            + self.cache_of(CacheKind::Table)
+            + self.cache_of(CacheKind::GraphSlots)
+            + self.bank_spare;
         let beside = self.committed.saturating_add(self.cache - bank).saturating_add(self.shed);
         let room = budget.saturating_sub(beside.saturating_add(reserve));
         self.read.cap.map_or(room, |cap| room.min(cap.saturating_sub(beside)))

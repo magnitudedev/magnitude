@@ -434,29 +434,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(Followed::Holds);
         };
         match self.next_bank_move(bank)? {
-            None => {
-                // Lower-priority `CacheKind::GraphSlots` (`IdleClass`) stays
-                // warm across prefill/decode transitions when the expert bank
-                // is already saturated (`at >= saturation_slots`, e.g. `whole`
-                // unified-memory banks — zero alloc/free thrash), but yields
-                // to a partial device bank (`at < saturation_slots`) so idle
-                // prefill buffers never starve decode residency.
-                if self.idle_class.held_places().is_some()
-                    && !self.resources.releasing_slots()
-                    && self.resources.ledgers().device().estimate().cache_of(CacheKind::GraphSlots) > 0
-                    && bank
-                        .targets()?
-                        .iter()
-                        .any(|t| t.holding == BankHolding::Experts && t.at < t.shape.saturation_slots())
-                {
-                    if let Some(quiet) = self.quiet() {
-                        let changes = self.resources.ledgers().changes().clone();
-                        changes.change(|_| self.family.release_group(quiet).map_err(DomainError::invariant))?;
-                        let _ = self.resources.release_idle_slots(self.idle_class.release(), wake);
-                    }
-                }
-                Ok(Followed::Holds)
-            }
+            None => Ok(Followed::Holds),
             Some((holding, BankMove::Shrink { to })) => self.shrink_expert_bank_to(bindings, holding, to, wake).map(Followed::Shrank),
             Some((holding, BankMove::Grow { to })) => self.grow_expert_bank(holding, to, wake).map(Followed::Grew),
         }
@@ -479,6 +457,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     fn grow_expert_bank(&mut self, holding: BankHolding, to: u64, wake: crate::CompletionWake) -> Result<BankStep, DomainError> {
         let started = Instant::now();
         let bank = self.family.expert_bank().expect("invariant violated: a growth of a load without a bank");
+        // If the ledger derived this growth using lower-priority
+        // `CacheKind::GraphSlots` (`IdleClass`, which is `Reclaim::Deferred`),
+        // release `IdleClass` first between flights so its physical bytes free
+        // and `wake` retries the growth cleanly.
+        if self.idle_class.held_places().is_some() && !self.resources.releasing_slots() {
+            let est = self.resources.ledgers().device().estimate();
+            let target_bytes = bank
+                .targets()?
+                .into_iter()
+                .find(|t| t.holding == holding)
+                .map_or(0, |t| (t.charge)(to).saturating_sub((t.charge)(t.at)));
+            if target_bytes > est.free() {
+                if let Some(quiet) = self.quiet() {
+                    let changes = self.resources.ledgers().changes().clone();
+                    changes.change(|_| self.family.release_group(quiet).map_err(DomainError::invariant))?;
+                    let _ = self.resources.release_idle_slots(self.idle_class.release(), wake);
+                }
+                return Ok(BankStep::Deferred);
+            }
+        }
         let step = bank.grow(self.resources.ledgers(), holding, to, wake)?;
         if let BankStep::Begun(tier) = step {
             self.resize_held.begin(tier, started);

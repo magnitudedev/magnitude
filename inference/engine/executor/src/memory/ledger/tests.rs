@@ -2711,3 +2711,28 @@ fn table_cache_reclaims_synchronously_before_bank_in_claim_and_units() {
     assert_eq!(bank.bytes(), 19 * GB, "Bank yields only the 1 GB remainder past Table");
     drop(group_class);
 }
+
+/// Lower-priority `CacheKind::GraphSlots` counts toward `Estimate::import_room`
+/// / `target` and is reclaimable by `Ledger::backing(PoolClass::Records)`, so
+/// the ledger's single priority order lets a growing bank reclaim idle prefill
+/// graph slots without any whole/partial conditional outside the ledger.
+#[test]
+fn bank_room_and_backing_include_graph_slots() {
+    let (_scope, ledger, _pool) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 40 * GB);
+    let _bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("bank fits");
+    let graph_slots = ledger.cached(CacheKind::GraphSlots, 4 * GB).expect("graph slots fit");
+    read(&ledger, &mut clock, 64 * GB, 0, None);
+
+    let est = ledger.estimate();
+    assert_eq!(est.import_room(), 24 * GB, "bank room includes lower-priority GraphSlots");
+    assert_eq!(est.target(), 24 * GB, "bank growth target includes GraphSlots");
+
+    let backing = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 2 * GB))
+        .expect("Records backing reclaims GraphSlots");
+    assert_eq!(graph_slots.bytes(), 2 * GB, "GraphSlots yielded 2 GB to Records backing");
+    drop(backing);
+}
