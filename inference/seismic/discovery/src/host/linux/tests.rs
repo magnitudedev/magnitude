@@ -712,3 +712,60 @@ fn v2_clean_cache_excludes_only_regular_file_mappings_not_shmem() {
         "9 GiB cuMemHostAlloc shmem must not be subtracted from 18 GiB droppable file cache"
     );
 }
+
+/// Reproduces `a56890` on a 64 GiB Vast.ai Linux container (`memory.max = 60 GiB`,
+/// `memory.swap.max = 0`, physical `MemTotal = 64 GiB`, host `SwapFree = 8 GiB`):
+/// 1. `v2_limit` reads `memory.swap.max = 0` and reserves `min(limit / 12, 4 GiB)`
+///    instead of capping at 2 GiB (leaving room for uncharged serving/driver RSS
+///    and `file_mapped` fault-ins that cannot swap).
+/// 2. `binding()` bounds immediate non-swapping supply (`free_beyond_target +
+///    clean_cache`) by the physical host even when host `SwapFree` inflates the
+///    host's total `balance()` above the cgroup's.
+#[test]
+fn swapless_v2_cgroup_reserves_swapless_floor_and_never_masks_host_immediate_exhaustion() {
+    let machine = Machine::in_cgroup("v2-swapless-64g", "0::/worker\n", V2_MOUNT);
+    let host_total_kib = 64 * 1024 * 1024;
+    // Physical host has only 1 GiB free + 0.5 GiB clean cache, plus 8 GiB swap-backed cold anon.
+    machine.file(
+        "/proc/meminfo",
+        &format!(
+            "MemTotal: {host_total_kib} kB\n\
+             MemFree: 1048576 kB\n\
+             Active(file): 262144 kB\n\
+             Inactive(file): 262144 kB\n\
+             Dirty: 0 kB\n\
+             Writeback: 0 kB\n\
+             Inactive(anon): 8388608 kB\n\
+             SwapFree: 8388608 kB\n"
+        ),
+    );
+    machine.file("/proc/zoneinfo", "Node 0, zone Normal\n        low 1\n");
+    let limit = 60 * GB;
+    let current = 52 * GB;
+    machine.file("/sys/fs/cgroup/worker/memory.max", &format!("{limit}\n"));
+    machine.file("/sys/fs/cgroup/worker/memory.current", &format!("{current}\n"));
+    machine.file("/sys/fs/cgroup/worker/memory.swap.max", "0\n");
+    machine.file(
+        "/sys/fs/cgroup/worker/memory.stat",
+        "active_file 0\ninactive_file 0\nfile_dirty 0\nfile_writeback 0\n",
+    );
+
+    // 1. Verify swapless cgroup_floor is 4 GiB (`min(60 GiB / 12, 4 GiB)`), not 2 GiB.
+    let container = &limits(&*machine)[0];
+    assert_eq!(container.used_bytes, current + 4 * GB);
+
+    // 2. Verify sample() does NOT let cgroup's 4 GiB immediate supply hide
+    //    the physical host's 1.5 GiB immediate supply behind 8 GiB host swap.
+    let s = sample(&*machine);
+    assert_eq!(s.total, limit);
+    assert_eq!(
+        s.supply.free_beyond_target + s.supply.clean_cache as i64,
+        (GB + GB / 2 - 4096) as i64,
+        "immediate non-swapping supply must stay bounded by the physical host (1.5 GiB - 1 page low watermark)"
+    );
+    assert_eq!(
+        s.supply.balance(),
+        (4 * GB) as i64,
+        "total pageable balance stays bounded by the cgroup (4 GiB)"
+    );
+}

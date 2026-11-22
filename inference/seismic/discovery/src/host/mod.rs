@@ -454,20 +454,57 @@ pub(crate) struct Binding {
 }
 
 /// The binding scope of `host` and each limit of `limits`:
-/// the least total of them all and the least supply any of them leaves.
-/// Each bounds what this process may take, so both are bound by every one
-/// at once: whichever leaves the least supply, the total never moves with
-/// it, and the supply moves only as the scopes' own figures move.
+/// the least total of them all, the least total supply (`balance`) any of
+/// them leaves, and the least immediate non-swapping supply
+/// (`free_beyond_target + clean_cache`) any of them leaves.
+///
+/// Bounding immediate supply independently of `cold_reclaimable` ensures a
+/// physical host with swap (`SwapFree > 0`) never masks its own immediate-RAM
+/// exhaustion behind a container cgroup whose `cold_reclaimable == 0` has a
+/// smaller total `balance` but a larger `free_beyond_target + clean_cache`.
 #[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn binding(host: Scope, limits: &[Limit]) -> Binding {
+    let immediate = |supply: Supply| {
+        i128::from(supply.free_beyond_target) + i128::from(supply.clean_cache)
+    };
     limits.iter().map(|limit| limit.scope(host.total)).enumerate().fold(
         Binding { scope: host, supplier: None },
         |least, (index, bound)| {
-            let (supply, supplier) = match bound.supply.balance() < least.scope.supply.balance() {
-                true => (bound.supply, Some(index)),
-                false => (least.scope.supply, least.supplier),
+            let least_bal = i128::from(least.scope.supply.balance());
+            let bound_bal = i128::from(bound.supply.balance());
+            let least_imm = immediate(least.scope.supply);
+            let bound_imm = immediate(bound.supply);
+            let min_bal = least_bal.min(bound_bal);
+            let (supply, supplier) = if bound_imm < least_imm {
+                let cold = u64::try_from((min_bal - bound_imm).max(0))
+                    .expect("a store's cold supply fits u64");
+                (
+                    Supply {
+                        free_beyond_target: bound.supply.free_beyond_target,
+                        clean_cache: bound.supply.clean_cache,
+                        cold_reclaimable: cold,
+                    },
+                    Some(index),
+                )
+            } else {
+                let cold = u64::try_from((min_bal - least_imm).max(0))
+                    .expect("a store's cold supply fits u64");
+                (
+                    Supply {
+                        free_beyond_target: least.scope.supply.free_beyond_target,
+                        clean_cache: least.scope.supply.clean_cache,
+                        cold_reclaimable: cold,
+                    },
+                    least.supplier,
+                )
             };
-            Binding { scope: Scope { total: least.scope.total.min(bound.total), supply }, supplier }
+            Binding {
+                scope: Scope {
+                    total: least.scope.total.min(bound.total),
+                    supply,
+                },
+                supplier,
+            }
         },
     )
 }
@@ -602,6 +639,29 @@ mod tests {
         let supply = Supply { free_beyond_target: -3 * GB as i64, clean_cache: GB, cold_reclaimable: 0 };
         assert_eq!(overrun, Binding { scope: Scope { total: 32 * GB, supply }, supplier: Some(0) });
         assert_eq!(supply.balance(), -2 * GB as i64);
+    }
+
+    /// A cgroup with `cold_reclaimable = 0` must never inflate immediate
+    /// non-swapping supply (`free_beyond_target + clean_cache`) above the
+    /// physical host's when host swap (`cold_reclaimable > 0`) makes the
+    /// host's total `balance()` larger than the cgroup's.
+    #[test]
+    fn host_swap_never_masks_physical_immediate_ram_exhaustion_behind_cgroup() {
+        // Physical host: 64 GiB total, only 1 GiB immediate (0.5 free + 0.5 cache),
+        // plus 8 GiB swap-backed cold_reclaimable -> balance = 9 GiB.
+        let machine = host(64 * GB, GB / 2, GB / 2, 8 * GB);
+        // Cgroup: 60 GiB limit, 57 GiB used, 0.5 GiB cache -> 3.5 GiB immediate, 0 cold -> balance = 3.5 GiB.
+        let limit = [cgroup(60 * GB, 57 * GB, GB / 2)];
+        let bound = binding(machine, &limit);
+        assert_eq!(bound.scope.total, 60 * GB);
+        // Total balance is still bounded by the cgroup (3.5 GiB).
+        assert_eq!(bound.scope.supply.balance(), (3 * GB + GB / 2) as i64);
+        // Immediate non-swapping supply MUST stay bounded by the physical host (1 GiB),
+        // with the remaining 2.5 GiB explicitly accounted as swap-backed cold_reclaimable.
+        assert_eq!(bound.scope.supply.free_beyond_target, (GB / 2) as i64);
+        assert_eq!(bound.scope.supply.clean_cache, GB / 2);
+        assert_eq!(bound.scope.supply.cold_reclaimable, 2 * GB + GB / 2);
+        assert_eq!(bound.supplier, None, "host binds immediate supply");
     }
 
     /// A 32-bit count read across its wrap keeps rising.

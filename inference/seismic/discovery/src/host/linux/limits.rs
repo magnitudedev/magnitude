@@ -163,16 +163,22 @@ impl Cgroups {
 /// OOM-safety reserve below a Linux cgroup memory limit (`memory.max` /
 /// `memory.high` / `hierarchical_memory_limit`): unlike host RAM (which has
 /// zone `low` watermarks and kswapd), a cgroup limit has no kernel watermark
-/// and OOM-kills immediately on overrun (especially when `memory.swap.max = 0`
-/// or pinned CUDA host blocks cannot swap). Reserves `min(limit / 12, 2 GiB)`
-/// on real containers (`>= 64 MiB`), and `0` on tiny synthetic limits.
-pub(super) fn cgroup_floor(limit_bytes: u64) -> u64 {
+/// and OOM-kills immediately on overrun.
+///
+/// Reserves `min(limit / 12, 2 GiB)` when the cgroup can spill anonymous
+/// bursts to swap, and `min(limit / 12, 4 GiB)` when swap is explicitly
+/// disabled (`memory.swap.max == 0` in cgroup v2 or `memsw == limit` in
+/// cgroup v1), where uncharged serving/driver RSS and mapped executable
+/// fault-ins cannot page out and otherwise thrash `file_mapped` until
+/// OOM-kill. Reserves `0` on tiny synthetic limits (`< 64 MiB`).
+pub(super) fn cgroup_floor(limit_bytes: u64, swap_disabled: bool) -> u64 {
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
     if limit_bytes < 64 * MIB {
         return 0;
     }
-    (limit_bytes / 12).min(2 * GIB)
+    let cap = if swap_disabled { 4 * GIB } else { 2 * GIB };
+    (limit_bytes / 12).min(cap)
 }
 
 /// The v1 limit of this process's cgroup: its `memory.stat`'s
@@ -217,12 +223,14 @@ fn v1_limit(sys: &impl Sys, mount: &CgroupMount) -> Option<Limit> {
         mapped_file,
     )
     .min(raw_used);
+    let swap_disabled =
+        read_bytes(sys, &setter.join("memory.memsw.limit_in_bytes")) == Some(limit_bytes);
     Some(Limit {
         kind: ProcessLimitKind::CgroupV1 {
             cgroup: mount.name(setter),
         },
         limit_bytes,
-        used_bytes: raw_used.saturating_add(cgroup_floor(limit_bytes)),
+        used_bytes: raw_used.saturating_add(cgroup_floor(limit_bytes, swap_disabled)),
         reclaimable_bytes,
     })
 }
@@ -262,10 +270,13 @@ fn v2_limit(sys: &impl Sys, directory: &Path, cgroup: String) -> Option<Limit> {
         mapped_file,
     )
     .min(raw_used);
+    let swap_disabled = sys
+        .text(&directory.join("memory.swap.max"))
+        .is_some_and(|value| value.trim() == "0");
     Some(Limit {
         kind: ProcessLimitKind::CgroupV2 { cgroup },
         limit_bytes,
-        used_bytes: raw_used.saturating_add(cgroup_floor(limit_bytes)),
+        used_bytes: raw_used.saturating_add(cgroup_floor(limit_bytes, swap_disabled)),
         reclaimable_bytes,
     })
 }
