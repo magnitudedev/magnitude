@@ -3319,9 +3319,7 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
         crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap()).unwrap(),
     );
     let capacity = ResourceCapacity {
-        domain_bytes: crate::StableRoom::of_selected(&selected)
-            .capacity()
-            .unwrap()
+        domain_bytes: crate::MemoryBudget::of_selected_stable(&selected).unwrap().capacity()
             .min(1024 * 1024 * 1024),
         tensor_operations: crate::TensorOperations::of(selected.info.forms_tensor_operations()),
         allocations: seismic::NativeAllocations::EXACT,
@@ -3367,7 +3365,7 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
     )
     .unwrap();
     let base_draft = base_draft
-        .finalize_readout(&definition, programs.readout_choices(), &crate::StableRoom::of_selected(&selected))
+        .finalize_readout(&definition, programs.readout_choices(), &crate::MemoryBudget::of_selected_stable(&selected).unwrap())
         .unwrap();
     let target_graphs = programs
         .prepare_target_graphs(

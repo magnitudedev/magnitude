@@ -383,7 +383,7 @@ pub fn fixture_over(
     );
     let definition = Rc::new(definition);
     let capacity_bytes = ResourceCapacity {
-        domain_bytes: crate::StableRoom::of_selected(&selected).capacity().unwrap().min(512 * 1024 * 1024),
+        domain_bytes: crate::MemoryBudget::of_selected_stable(&selected).unwrap().capacity().min(512 * 1024 * 1024),
         tensor_operations: crate::TensorOperations::of(selected.info.forms_tensor_operations()),
         allocations: seismic::NativeAllocations::EXACT,
     };

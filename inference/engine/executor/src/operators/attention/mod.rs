@@ -2360,7 +2360,7 @@ pub(crate) mod tests {
                 KvCodec::Dense,
                 limits,
                 ResourceCapacity {
-                    domain_bytes: crate::StableRoom::of_selected(&chosen).capacity().unwrap().min(1 << 30),
+                    domain_bytes: crate::MemoryBudget::of_selected_stable(&chosen).unwrap().capacity().min(1 << 30),
                     tensor_operations: crate::TensorOperations::of(
                         chosen.info.forms_tensor_operations(),
                     ),
@@ -2439,7 +2439,7 @@ pub(crate) mod tests {
                 KvCodec::Dense,
                 limits,
                 ResourceCapacity {
-                    domain_bytes: crate::StableRoom::of_selected(&chosen).capacity().unwrap().min(1 << 30),
+                    domain_bytes: crate::MemoryBudget::of_selected_stable(&chosen).unwrap().capacity().min(1 << 30),
                     tensor_operations: crate::TensorOperations::of(
                         chosen.info.forms_tensor_operations(),
                     ),

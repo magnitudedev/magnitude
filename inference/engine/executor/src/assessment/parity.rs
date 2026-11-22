@@ -21,7 +21,7 @@ use super::catalog::served_targets;
 use crate::platform::{DomainRole, GraphPricing, ReleaseRate};
 use crate::{
     AssessmentFit, AssessmentFitVerdict, AssessmentMemoryCharge, AttestedPrograms, ComponentSelection, ExecutionPath,
-    ExecutionPlanDraft, ExecutionPlanner, Placed, PlannedMethod, ResourceLimits, StableRoom,
+    ExecutionPlanDraft, ExecutionPlanner, MemoryBudget, Placed, PlannedMethod, ResourceLimits,
 };
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_state::KvCodec;
@@ -271,7 +271,10 @@ fn row(
         return failed("pricing", "this host knows no Vulkan graph bound".to_owned());
     };
     let device = crate::platform::selected(topology, status, &release, executor.clone(), pricing);
-    let room = StableRoom { topology, executor, status };
+    let budget = match MemoryBudget::stable(topology, executor, status) {
+        Ok(budget) => budget,
+        Err(error) => return failed("budget", error.to_string()),
+    };
     // Both planners are compared at one load: this workload at one
     // conversation (`main` charged one, whatever the harness decoded).
     let limits = ResourceLimits { conversations: NonZeroUsize::MIN, ..workload.limits };
@@ -300,7 +303,7 @@ fn row(
         Ok(charge) => charge,
         Err(error) => return failed("charging whole", format!("{error:?}")),
     };
-    let (_, whole_need, whole_fits) = match room.fit(&whole_charge) {
+    let (_, whole_need, whole_fits) = match budget.fit(topology, executor, &whole_charge) {
         Ok(fit) => need(&fit),
         Err(error) => return failed("whole's fit", error.to_string()),
     };
@@ -312,9 +315,9 @@ fn row(
         Err(error) => return failed("assessment", error),
     };
     let assessment_ms = assessing.elapsed().as_secs_f64() * 1e3;
-    let verdict = match draft.placed::<AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &room) {
+    let verdict = match draft.placed::<AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &budget) {
         Ok(Placed::Whole(placed)) => {
-            let fits = match room.fit(placed.charge()) {
+            let fits = match budget.fit(topology, executor, placed.charge()) {
                 Ok(fit) => need(&fit).2,
                 Err(error) => return failed("placed fit", error.to_string()),
             };
@@ -376,7 +379,7 @@ fn placed_chain(target: &(String, ModelDefinition, magnitude_artifacts::PackageM
     let device = crate::platform::selected(topology, &status, &release, executor.clone(), pricing(machine, backend).unwrap());
     let mut definition = target.1.clone();
     definition.decoder.context_limit = context;
-    match plan(&definition, &target.2, &device, service(backend, &definition)).unwrap().placed::<AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &StableRoom::of_selected(&device)).unwrap() {
+    match plan(&definition, &target.2, &device, service(backend, &definition)).unwrap().placed::<AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &MemoryBudget::of_selected_stable(&device).unwrap()).unwrap() {
         Placed::Whole(placed) => Some(placed.draft().policy().limits().chain_capacity.get()),
         Placed::Short(_) => None,
     }
@@ -579,7 +582,8 @@ fn qwen3_6_with_its_draft_is_placed_on_an_m4_pro_and_an_rtx3090() {
         )
         .unwrap_or_else(|error| panic!("{machine}: {error}"));
         let planned = draft.device().clone();
-        if let Err(error) = draft.placed::<crate::AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &StableRoom::of(&planned)) {
+        let budget = MemoryBudget::of_stable(&planned).unwrap();
+        if let Err(error) = draft.placed::<crate::AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &budget) {
             panic!("{machine}: {error}");
         }
     }
@@ -615,15 +619,11 @@ fn glm_5_3_flash_at_32k_fits_on_an_rtx3090_by_windowing_its_scratch_and_not_on_a
     let pricing_3090 = pricing("rtx3090", BackendName::Cuda).unwrap();
     let device_3090 = crate::platform::selected(&topology_3090, &status_3090, &release, executor_3090.clone(), pricing_3090);
     let draft_3090 = plan(&definition, manifest, &device_3090, limits).unwrap();
-    let room_3090 = StableRoom {
-        topology: &topology_3090,
-        executor: executor_3090,
-        status: &status_3090,
-    };
+    let budget_3090 = MemoryBudget::stable(&topology_3090, executor_3090, &status_3090).unwrap();
 
     let prices = crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices());
-    let placed_3090 = match draft_3090.clone().placed::<AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &room_3090).unwrap() {
-        Placed::Short(short) => short.streamed(&definition, &prices, &room_3090).unwrap(),
+    let placed_3090 = match draft_3090.clone().placed::<AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &budget_3090).unwrap() {
+        Placed::Short(short) => short.streamed(&definition, &prices, &budget_3090).unwrap(),
         Placed::Whole(_) => panic!("GLM-5.3-Flash FP8 cannot fit whole on a 24 GB RTX 3090"),
     };
     let bank_3090 = placed_3090.draft().load().expert_bank().expect("streamed through expert bank");
@@ -634,7 +634,7 @@ fn glm_5_3_flash_at_32k_fits_on_an_rtx3090_by_windowing_its_scratch_and_not_on_a
         bank_3090.widest(),
         bank_3090.windows(),
     );
-    let (cap_3090, placed_need_3090, placed_fits_3090) = need(&room_3090.fit(placed_3090.charge()).unwrap());
+    let (cap_3090, placed_need_3090, placed_fits_3090) = need(&budget_3090.fit(&topology_3090, executor_3090, placed_3090.charge()).unwrap());
     assert!(
         placed_fits_3090 && placed_need_3090 <= cap_3090,
         "RTX 3090 placed plan must fit: need {placed_need_3090} <= cap {cap_3090}"

@@ -643,6 +643,12 @@ fn preview_failure<S: StoredRecords>(
         PreviewError::Unsupported(_) => ("unsupported_model", false),
         PreviewError::Device(_) => ("device_unavailable", true),
         PreviewError::MemoryObservationUnavailable { .. } => ("memory_observation_unavailable", true),
+        PreviewError::InsufficientMemory(memory) => {
+            return ModelOperationFailure::MemoryShortage(MemoryShortage::Blocked {
+                required_bytes: memory.required,
+                available_bytes: memory.available,
+            });
+        }
         PreviewError::WeightBound(bound) => return ModelOperationFailure::WeightBound(*bound),
         PreviewError::PricesPending { .. } => {
             if let Some(failure) = unavailable_measurement(measurement) {
@@ -894,9 +900,11 @@ impl EngineResidency {
                 sequence,
                 |preview, device, sequence| {
                     let plan = load_plan(preview);
+                    let initial_form = preview.form;
                     let driver = self.clone();
                     let load_instance = instance_id.clone();
-                    let manifest = manifest.clone();
+                    let base_manifest = manifest.clone();
+                    let catalog = Arc::clone(&environment.catalog);
                     let worker_device = Arc::clone(device);
                     let bundle_key = bundle_key.clone();
                     async move {
@@ -906,6 +914,7 @@ impl EngineResidency {
                         magnitude_service_utils::blocking::run(move || {
                             let progression = RefCell::new(LoadProgression::default());
                             let notifier = driver.client.notifier();
+                            let plan_cell = RefCell::new(plan);
                             let report = |progress: LoadProgress| {
                                 if let Some((stage, fraction, details)) =
                                     progression.borrow_mut().advance(progress)
@@ -915,7 +924,7 @@ impl EngineResidency {
                                         stage,
                                         fraction,
                                         details,
-                                        planned_allocation: Some(plan.clone()),
+                                        planned_allocation: Some(plan_cell.borrow().clone()),
                                     });
                                 }
                             };
@@ -941,19 +950,55 @@ impl EngineResidency {
                                 }
                             };
                             let preparation = RefCell::new(preparation);
-                            let loaded = load_prepared(
-                                &manifest,
-                                |unprepared| {
-                                    spawn()?
-                                        .connect(manifest.clone(), unprepared, &report)
-                                        .map_err(|(_, error)| error)
-                                },
-                                || spawn().map(SpawnedWorker::into_process),
-                                |progress: LoadProgress| {
-                                    preparation.borrow_mut().report(progress.clone());
-                                    report(progress);
-                                },
-                            );
+                            let run_load = |manifest: &magnitude_engine::options::ExecutionManifest| {
+                                load_prepared(
+                                    manifest,
+                                    |unprepared| {
+                                        spawn()?
+                                            .connect(manifest.clone(), unprepared, &report)
+                                            .map_err(|(_, error)| error)
+                                    },
+                                    || spawn().map(SpawnedWorker::into_process),
+                                    |progress: LoadProgress| {
+                                        preparation.borrow_mut().report(progress.clone());
+                                        report(progress);
+                                    },
+                                )
+                            };
+                            let manifest = base_manifest.clone().with_plan_form(initial_form);
+                            let mut loaded = run_load(&manifest);
+                            // If a Whole load hits InsufficientMemory (e.g. an external process
+                            // took RAM mid-load), re-preview once against fresh live status for
+                            // a streamable model and run `load_prepared` in `PlanForm::Streamed`
+                            // so the streamed form is tuned, never served with ServeDefaults.
+                            if initial_form == magnitude_executor::PlanForm::Whole
+                                && matches!(loaded, Err(LoadError::InsufficientMemory { .. }))
+                                && spawn_failure.borrow().is_none()
+                            {
+                                let streamed_preview = match base_manifest.preview(&catalog) {
+                                    Ok(fresh)
+                                        if fresh.form == magnitude_executor::PlanForm::Streamed =>
+                                    {
+                                        Ok(fresh)
+                                    }
+                                    Ok(_) => base_manifest
+                                        .clone()
+                                        .with_plan_form(magnitude_executor::PlanForm::Streamed)
+                                        .preview(&catalog),
+                                    Err(err) => Err(err),
+                                };
+                                if let Ok(streamed_preview) = streamed_preview {
+                                    tracing::info!(
+                                        "whole-form load hit insufficient memory; retrying with tuned streamed form"
+                                    );
+                                    if let Ok(streamed_plan) = load_plan(&streamed_preview) {
+                                        *plan_cell.borrow_mut() = streamed_plan;
+                                    }
+                                    let streamed_manifest = base_manifest
+                                        .with_plan_form(magnitude_executor::PlanForm::Streamed);
+                                    loaded = run_load(&streamed_manifest);
+                                }
+                            }
                             match loaded {
                                 Ok((loaded, prepared)) => {
                                     match prepared {

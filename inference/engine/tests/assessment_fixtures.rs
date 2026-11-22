@@ -19,7 +19,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
 use magnitude_executor::{
-    AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, ExpertBankPlan, HeldBound, PlanError, PlanPrices, PlanRoom, StableRoom,
+    AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, ExpertBankPlan, HeldBound, MemoryBudget, PlanError, PlanPrices,
     WeightBound,
     assessment::{AssessmentError, ColdSource, ExecutionFit, ExpertShares, Priced, Residency, execution_memory_charge, synthetic},
     platform::{DeviceRequest, DomainRole, ReleaseRate},
@@ -832,13 +832,13 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     // `within_host`'s host RAM limit (`unbounded`'s `host_left` returns `i64::MAX`,
     // which previously passed only because `landing_records` was 80 >= 40 * 2).
     let replan = |draft: &magnitude_executor::ExecutionPlanDraft| {
-        let room = StableRoom::of(draft.device());
+        let budget = MemoryBudget::of_stable(draft.device()).unwrap();
         draft
             .with_held_experts(
                 &definition,
-                HeldBound::of(None, room.capacity().unwrap()),
+                HeldBound::of(None, budget.capacity()),
                 &synthetic_prices(),
-                room,
+                &budget,
                 |_, _| Ok::<_, AssessmentError>(Ok(())),
             )
             .unwrap()
@@ -986,13 +986,10 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
     let fit = execution_memory_charge(definition, draft).unwrap().assess_fit(&structure.topology, device, &structure.status).unwrap();
     let allocation = fit.domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
     let bound = allocation.capacity_bytes;
-    let room = |mandatory: u64| {
-        let left = bound.saturating_sub(mandatory);
-        PlanRoom { free: left, ceiling: left }
-    };
+    let budget = MemoryBudget::fixed(bound, None);
     let prices = magnitude_engine::planning::plan_prices(&setup.measurements, draft);
     let (planned, ()) = draft
-        .with_held_experts(definition, HeldBound::room(bound), &prices, room, |_, _| {
+        .with_held_experts(definition, HeldBound::room(bound), &prices, &budget, |_, _| {
             Ok::<_, AssessmentError>(Ok(()))
         })
         .unwrap()
@@ -1183,20 +1180,14 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     let allocation = domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
     let bound = allocation.capacity_bytes;
     let structure = &setup.structure;
-    let stable = StableRoom {
-        topology: &structure.topology,
-        executor: structure.topology.resolve(draft.device().selector()).unwrap(),
-        status: &structure.status,
-    };
+    let executor = structure.topology.resolve(draft.device().selector()).unwrap();
+    let stable = MemoryBudget::stable(&structure.topology, executor, &structure.status).unwrap();
     let prices = magnitude_engine::planning::plan_prices(&setup.measurements, draft);
-    let settled = |share: u64| {
-        let room = |mandatory: u64| {
-            let left = bound.saturating_sub(mandatory) / share;
-            PlanRoom { free: left, ceiling: left }
-        };
+    let settled = |budget_bytes: u64| {
+        let budget = MemoryBudget::fixed(budget_bytes, None);
         let (planned, ()) = draft
-            .with_held_experts(definition, HeldBound::room(bound), &prices, room, |_, charge| {
-                Ok::<_, AssessmentError>(match stable.fit(charge).unwrap().verdict {
+            .with_held_experts(definition, HeldBound::room(bound), &prices, &budget, |_, charge| {
+                Ok::<_, AssessmentError>(match stable.fit(&structure.topology, executor, charge).unwrap().verdict {
                     AssessmentFitVerdict::Fits => Ok(()),
                     AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
                 })
@@ -1205,8 +1196,15 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
             .unwrap();
         planned.draft().load().expert_bank().unwrap().slots
     };
-    assert!(settled(1) <= shares.slots());
-    assert!(settled(2) <= settled(1));
+    let full = settled(bound);
+    assert!(full <= shares.slots());
+    let floor_bytes = execution_memory_charge(definition, &draft.clone().streaming::<AssessmentMemoryCharge>(definition, None, &stable).unwrap().streamed(definition, &prices, &MemoryBudget::fixed(bound, None)).unwrap().into_draft())
+        .unwrap()
+        .store_demands(&structure.topology, executor)
+        .unwrap()
+        .allocation_bytes();
+    let half_extra = bound.saturating_sub(floor_bytes) / 2;
+    assert!(settled(floor_bytes + half_extra) <= full);
 
     // A machine whose figures are pending leaves a plan that must stream
     // pending: no plan is sized unpriced.

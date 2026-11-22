@@ -87,7 +87,7 @@ pub use device_resources::{
     ResourceError, WeakFeatureRef,
 };
 pub use domain::{
-    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, FrontRegime, MemoryStanding, StreamedVerifyPrior, TwoRowPricing, Yielded, TableResidency, DeviceReader, LoadRoom, MachineReading, PlanningRoom, DomainError, DomainRequirements, DomainReservation, ExecutorDomain, Unchained,
+    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, FrontRegime, MemoryStanding, StreamedVerifyPrior, TwoRowPricing, Yielded, TableResidency, DeviceReader, LoadRoom, MachineReading, DomainError, DomainRequirements, DomainReservation, ExecutorDomain, Unchained,
     ExpertMeasures, LoadCosts, LoadMeasures, ExpertCover, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent,
     ExpertTargets, HeadFlight, LaunchDuration, LoadCharge, MemoryRead, MemoryReading, MemoryResponse, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
@@ -159,7 +159,7 @@ pub use planning::{
     CandidatePool, CandidatesBinding, HostTablePlan, ImportProgramSlot, IndexerBinding,
     LowRankQueryBinding, PickedBinding,
     PooledBinding, MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding,
-    MixerProgramSlot, ModelLoadPlan, NGramBinding, NGramGateForm, NGramTaps, NoBank, PlanRoom, SettleRoom, StableRoom, WholeFit, NativeGraphCharge, ParallelBinding,
+    MixerProgramSlot, ModelLoadPlan, NGramBinding, NGramGateForm, NGramTaps, NoBank, MemoryBudget, PlanForm, StoreBudget, WholeFit, NativeGraphCharge, ParallelBinding,
     PassLaunches, PlanForms, PlanPrices, PlanSteps, PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
     ReadoutBinding, ReadoutClassChoice, ReadoutHead, RecurrentBinding, RecurrentForm, ResolvedPolicy,
     ResourceBytes, ResourceCapacity, ResourceLimits, StepAllowances, EVALUATION_PREFILL_ROWS, ResourcePlan, ResourcePlanner, RoutedBinding,

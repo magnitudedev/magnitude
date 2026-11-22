@@ -1798,14 +1798,15 @@ fn the_m4_pros_recorded_sample_prices_the_wired_grant() {
 /// freed RAM later.
 #[test]
 fn planning_room_capacity_is_structural_not_momentary_free() {
-    use crate::domain::PlanningRoom;
-    use crate::SettleRoom;
+    use crate::MemoryBudget;
 
     // 64 GiB Mac with 48 GiB working set, but only 20 GiB currently free because
     // another app holds ~44 GiB.
     const TOTAL_64G: u64 = 64 * GB;
     const WORKING_SET_48G: u64 = 48 * GB;
     const FREE_20G: u64 = 20 * GB;
+    let m4_pro = seismic::fixtures::recorded::m4_pro();
+    let metal = m4_pro.executors().iter().find(|e| e.backend() == seismic::BackendName::Metal).unwrap();
     let scope = Ledgers::new();
     let mut sample_data = seismic::host_samples::m4_pro();
     sample_data.total = TOTAL_64G;
@@ -1821,15 +1822,17 @@ fn planning_room_capacity_is_structural_not_momentary_free() {
     let sample = Sample::scripted(scope.changes(), sample_data);
     let (ledgers, reading) = DeviceLedgers::unified_in(&scope, shape())
         .read_granted(&sample, DeviceGrant::Wired { working_set: WORKING_SET_48G });
-    let room = PlanningRoom::new(&reading, &ledgers);
-    assert_eq!(room.net(), FREE_20G, "momentary free room at load is 20 GiB");
+    let budget = MemoryBudget::live_ledger(&m4_pro, metal, &reading, &ledgers, 0);
+    assert_eq!(budget.available(), FREE_20G, "momentary free room at load is 20 GiB");
     assert_eq!(
-        room.capacity().unwrap(),
+        budget.capacity(),
         WORKING_SET_48G,
         "structural capacity is 48 GiB working set, not momentary 20 GiB free"
     );
 
     // Unified Linux CUDA (128 GiB host, 120 GiB CUDA limit) with 30 GiB free at load.
+    let gb10 = seismic::fixtures::recorded::gb10();
+    let cuda = gb10.executors().iter().find(|e| e.backend() == seismic::BackendName::Cuda).unwrap();
     let mut linux_sample = seismic::host_samples::m4_pro();
     linux_sample.total = 128 * GB;
     linux_sample.wired = None;
@@ -1842,9 +1845,9 @@ fn planning_room_capacity_is_structural_not_momentary_free() {
     let l_sample = Sample::scripted(l_scope.changes(), linux_sample);
     let (l_ledgers, l_reading) = DeviceLedgers::unified_in(&l_scope, shape())
         .read_granted(&l_sample, DeviceGrant::HostLimit { limit: 120 * GB });
-    let l_room = PlanningRoom::new(&l_reading, &l_ledgers);
-    assert_eq!(l_room.net(), 30 * GB, "momentary free room at load is 30 GiB");
-    assert_eq!(l_room.capacity().unwrap(), 120 * GB, "structural capacity is 120 GiB CUDA limit");
+    let l_budget = MemoryBudget::live_ledger(&gb10, cuda, &l_reading, &l_ledgers, 0);
+    assert_eq!(l_budget.available(), 30 * GB, "momentary free room at load is 30 GiB");
+    assert_eq!(l_budget.capacity(), 120 * GB, "structural capacity is 120 GiB CUDA limit");
 
     // Discrete GPU (24 GiB VRAM) with 10 GiB free at load.
     let discrete = Reading::device(24 * GB, 10 * GB, seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO });

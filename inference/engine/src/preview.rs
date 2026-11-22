@@ -6,7 +6,8 @@
 
 use crate::error::{classify_plan, classify_platform, PlanOutcome, PreviewError};
 use crate::options::ExecutionManifest;
-use crate::planning::{plan_execution, ExecutionPlanningError};
+use crate::planning::{plan_banked, plan_resident, ExecutionPlanningError};
+use magnitude_executor::{MemoryBudget, PlanForm};
 use seismic::{BackendName, Devices, ExecutorSelector};
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,9 @@ pub struct LoadPreview {
     /// the startup transient. History growth is elastic and claimed as it
     /// grows, so it is not included.
     pub required_bytes: u64,
+    /// The plan form decided once against the live memory budget (`Whole` vs
+    /// `Streamed`), stamped onto `ExecutionManifest` before Prepare and Load.
+    pub form: PlanForm,
 }
 
 fn internal(reason: impl Into<String>) -> PreviewError {
@@ -48,12 +52,23 @@ impl ExecutionManifest {
         let selected = crate::planning::select_load_device(catalog, manifest)
             .map_err(|error| PreviewError::from(classify_platform(error)))?;
         let backend = selected.info.backend();
-        // The bounds planning charged the draft with: its graphs are
-        // certified once, there.
-        let planned = plan_execution::<magnitude_executor::AssessmentMemoryCharge>(manifest, &selected).map_err(|error| match error {
-            ExecutionPlanningError::Plan(error) => classify_plan(error, backend).into(),
-            error => PreviewError::from(PlanOutcome::Internal(error.to_string())),
-        })?;
+        let classify = |error: ExecutionPlanningError| -> PreviewError {
+            match error {
+                ExecutionPlanningError::Plan(error) => classify_plan(error, backend).into(),
+                error => PreviewError::from(PlanOutcome::Internal(error.to_string())),
+            }
+        };
+        let budget = MemoryBudget::of_selected_live(&selected)
+            .map_err(|error| PreviewError::from(classify_plan(error, backend)))?;
+        let resident = plan_resident(manifest, &selected).map_err(classify)?;
+        let (planned, form) = plan_banked::<magnitude_executor::AssessmentMemoryCharge>(
+            manifest,
+            &selected,
+            resident,
+            manifest.plan_form,
+            &budget,
+        )
+        .map_err(classify)?;
         let required_bytes = planned
             .charge()
             .startup_required_bytes(&selected.reading.topology, &selected.info)
@@ -63,6 +78,7 @@ impl ExecutionManifest {
             device: selected.info.selector(),
             backend,
             required_bytes,
+            form,
         })
     }
 }
@@ -194,11 +210,12 @@ mod tests {
         let selected = crate::planning::select_load_device(&catalog, &manifest).unwrap();
         crate::execution::store_fixed_costs(&catalog.topology(), &selected.info, cache.path());
         let preview = manifest.preview(&catalog).unwrap();
-        let planned = plan_execution::<magnitude_executor::AssessmentMemoryCharge>(&manifest, &selected).unwrap();
+        let planned = crate::planning::plan_execution::<magnitude_executor::AssessmentMemoryCharge>(&manifest, &selected).unwrap();
         let expected = planned
             .charge()
             .startup_required_bytes(&selected.reading.topology, &selected.info)
             .unwrap();
         assert_eq!(preview.required_bytes, expected);
+        assert_eq!(preview.form, PlanForm::Whole);
     }
 }

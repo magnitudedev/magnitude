@@ -1685,6 +1685,7 @@ fn inventory(
 ) -> Result<Result<Vec<seismic::KernelRequest>, UnsupportedModel>, ModelAssessmentError> {
     let refused = |outcome: PlanOutcome| match outcome {
         PlanOutcome::Unsupported(unsupported) => Ok(Err(unsupported)),
+        PlanOutcome::InsufficientMemory(memory) => Err(ModelAssessmentError::Planning(memory.to_string())),
         PlanOutcome::WeightBound(error) => Err(ModelAssessmentError::WeightBound(error)),
         PlanOutcome::PricesPending(_) => unreachable!("assessment plans without banking"),
         PlanOutcome::Internal(reason) => Err(ModelAssessmentError::Planning(reason)),
@@ -1720,6 +1721,7 @@ impl Refusal {
     fn of(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(unsupported) => Self::Unsupported(unsupported),
+            PlanOutcome::InsufficientMemory(memory) => Self::Failed(ModelAssessmentError::Planning(memory.to_string())),
             PlanOutcome::WeightBound(error) => Self::Failed(ModelAssessmentError::WeightBound(error)),
             PlanOutcome::PricesPending(_) => unreachable!("assessment plans without banking"),
             PlanOutcome::Internal(reason) => Self::Failed(ModelAssessmentError::Planning(reason)),

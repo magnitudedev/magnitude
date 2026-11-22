@@ -633,7 +633,7 @@ fn compile(
 ) -> Compiled {
     let LoadRequest { definition, backend, limits, codec, .. } = *request;
     let capacity = ResourceCapacity {
-        domain_bytes: crate::StableRoom::of_selected(selected).capacity().unwrap().min(1024 * 1024 * 1024),
+        domain_bytes: crate::MemoryBudget::of_selected_stable(selected).unwrap().capacity().min(1024 * 1024 * 1024),
         tensor_operations: crate::TensorOperations::of(selected.info.forms_tensor_operations()),
         allocations: seismic::NativeAllocations::EXACT,
     };
@@ -664,7 +664,7 @@ fn compile(
     // As a load finalizes it (`execution`): its readout, and the CPU sites
     // its qualification admitted, which its graphs encode.
     let draft = draft
-        .finalize_readout(definition, programs.readout_choices(), &crate::StableRoom::of_selected(selected))
+        .finalize_readout(definition, programs.readout_choices(), &crate::MemoryBudget::of_selected_stable(selected).unwrap())
         .and_then(|draft| draft.finalize_sites(|bank| programs.sited_layers(bank)))
         .unwrap();
     let (resources_plan, pass_rows) = prepare_graphs(request, device, &draft, &mut programs, state);

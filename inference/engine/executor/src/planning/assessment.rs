@@ -16,7 +16,7 @@ use super::{
 };
 use crate::assessment::{DomainFit, MemoryBreakdown, stage_timer};
 use crate::memory::ClaimDemand;
-use crate::platform::{DomainRole, Fit, FitMode, StorageDemand};
+use crate::platform::DomainRole;
 use crate::{AttestedPrograms, GraphError};
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_state::{BankCapacity, KvCodec, ModelStateLayout};
@@ -1917,88 +1917,18 @@ impl AssessmentMemoryCharge {
         })
     }
 
-    /// Whether the charge fits `executor` at stable capacity: its device
-    /// storage, upload storage, reserved host backing and its host RAM ([`Self::host_bytes`] and the
-    /// staging fit charges there) placed by
-    /// [`Fit::demand`], which alone interprets placements, stores, grants
-    /// and grants. Returns each store the demand reached, with what it
-    /// required and what of its room remains (negative: its deficit), and
-    /// the verdict: fits, or the store of the largest deficit. A store's
-    /// room is what fit can place there along the executor's placements
-    /// beside the same host demand, so a grant below the store (Metal's
-    /// working set, CUDA's usable memory) bounds it; its capacity is that room.
+    /// Whether the charge fits `executor` at stable capacity via the single
+    /// [`super::MemoryBudget::stable`] and [`Self::store_demands`] owner.
     pub fn assess_fit(
         &self,
         topology: &DeviceTopology,
         executor: &Executor,
         status: &Status,
     ) -> Result<AssessmentFit, String> {
-        let fit = Fit::new(topology, status);
-        // The staging window is part of `allocation_bytes`
-        // (`startup_additional_bytes`); fit decides whether host RAM also
-        // holds it as a demand of its own.
-        let host = self
-            .host_bytes()?
-            .checked_add(fit.host_staging(executor, self.staging_bytes))
-            .ok_or("host charge overflow")?;
-        let other = self.allocation_bytes.checked_sub(self.weight_demand.checked_bytes()
-            .ok_or("weight demand overflows")?).ok_or("weight storage exceeds the allocation charge")?;
-        let demand = self.weight_demand.checked_plus(ClaimDemand { device: other, ..ClaimDemand::default() })
-            .ok_or("assessment storage demand overflows")?;
-        let place = |bytes: [u64; crate::memory::CLAIMED.len()]| {
-            let demands: [_; crate::memory::CLAIMED.len()] = std::array::from_fn(|index| StorageDemand {
-                executor: executor.id(), kind: crate::memory::CLAIMED[index], bytes: bytes[index],
-            });
-            fit.demand(&demands, &[(topology.host_ram().id(), host)], FitMode::Stable)
-                .map_err(|error| error.to_string())
-        };
-        let mut bytes = [0; { crate::memory::CLAIMED.len() }];
-        for (index, kind) in crate::memory::CLAIMED.into_iter().enumerate() {
-            bytes[index] = demand.storage_bytes(kind).ok_or("assessment storage demand overflows")?;
-        }
-        let result = place(bytes)?;
-        // Each store's room: what all physical placements can place there.
-        let rooms = place(crate::memory::CLAIMED.map(|kind| if executor.paths(kind).is_empty() { 0 } else { u64::MAX }))?.placed;
-        let mut domains = Vec::new();
-        for (store, placed) in result.placed {
-            let room = rooms
-                .iter()
-                .find(|(of, _)| *of == store)
-                .map(|(_, bytes)| *bytes)
-                .expect("a store the demand reached is one its placements reach");
-            let missing = result
-                .refused
-                .iter()
-                .filter(|refusal| refusal.store == store)
-                .map(|refusal| refusal.missing_bytes)
-                .sum::<u64>();
-            let required_bytes = placed.checked_add(missing).ok_or("store demand overflow")?;
-            let remaining_bytes = if missing == 0 {
-                i64::try_from(room.saturating_sub(placed))
-                    .map_err(|_| "fit remainder exceeds i64")?
-            } else {
-                -i64::try_from(missing).map_err(|_| "fit deficit exceeds i64")?
-            };
-            domains.push(DomainFit {
-                role: DomainRole::of(topology, executor, store),
-                domain: store,
-                capacity_bytes: room,
-                required_bytes,
-                remaining_bytes,
-            });
-        }
-        // A domain's deficit: none where it has room.
-        let verdict = domains
-            .iter()
-            .filter_map(|domain| Some((domain.domain, NonZeroU64::new(domain.remaining_bytes.min(0).unsigned_abs())?)))
-            .max_by_key(|&(_, deficit_bytes)| deficit_bytes)
-            .map_or(AssessmentFitVerdict::Fits, |(limiting, deficit_bytes)| {
-                AssessmentFitVerdict::DoesNotFit {
-                    limiting,
-                    deficit_bytes,
-                }
-            });
-        Ok(AssessmentFit { verdict, domains })
+        super::MemoryBudget::stable(topology, executor, status)
+            .map_err(|error| error.to_string())?
+            .fit(topology, executor, self)
+            .map_err(|error| error.to_string())
     }
 }
 

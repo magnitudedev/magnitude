@@ -5,6 +5,7 @@
 
 mod assessment;
 mod bank;
+mod budget;
 mod capabilities;
 mod components;
 mod execution_plan;
@@ -44,8 +45,9 @@ pub use capabilities::{
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
 #[cfg(test)]
 pub(crate) use execution_plan::bank_substrate;
+pub use budget::{MemoryBudget, PlanForm, StoreBudget, WholeFit};
 pub use execution_plan::{
-    BackendPlan, BankForm, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FloorForms, HeldForm, HeldBound, HeldCharge, NoBank, Placed, Unplaced, WeightBound, WholeFit, PlanRoom, PlannedDevice, SettleRoom, StableRoom,
+    BackendPlan, BankForm, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FloorForms, HeldForm, HeldBound, HeldCharge, NoBank, Placed, Unplaced, WeightBound, PlannedDevice,
     ResolvedPolicy, prompt_places_at,
 };
 pub use programs::{
@@ -573,7 +575,7 @@ pub(crate) mod tests {
             conversations: std::num::NonZeroUsize::MIN,
         };
         let capacity_bytes = ResourceCapacity {
-            domain_bytes: StableRoom::of_selected(&selected).capacity().unwrap().min(512 * 1024 * 1024),
+            domain_bytes: MemoryBudget::of_selected_stable(&selected).unwrap().capacity().min(512 * 1024 * 1024),
             tensor_operations: TensorOperations::of(selected.info.forms_tensor_operations()),
             allocations: selected.info.limits().allocations(),
         };
@@ -908,7 +910,7 @@ pub(crate) mod tests {
                 KvCodec::Dense,
                 limits,
                 ResourceCapacity {
-                    domain_bytes: StableRoom::of_selected(&selected).capacity().unwrap().min(512 * 1024 * 1024),
+                    domain_bytes: MemoryBudget::of_selected_stable(&selected).unwrap().capacity().min(512 * 1024 * 1024),
                     tensor_operations: TensorOperations::of(
                         selected.info.forms_tensor_operations(),
                     ),

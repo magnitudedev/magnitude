@@ -272,6 +272,8 @@ pub enum PreviewError {
     Device(DeviceSelectionError),
     /// A required memory observation failed (Blind). Retryable.
     MemoryObservationUnavailable { reason: String },
+    /// The live memory budget cannot hold even the minimum required plan.
+    InsufficientMemory(InsufficientMemory),
     /// The weight bound is below the load's least weights. Never retryable.
     WeightBound(WeightBoundBelowWeights),
     /// The plan prices its holdings on this machine's standing figures, which the measurement
@@ -288,6 +290,7 @@ impl fmt::Display for PreviewError {
         match self {
             Self::Unsupported(error) => error.fmt(formatter),
             Self::Device(error) => error.fmt(formatter),
+            Self::InsufficientMemory(memory) => write!(formatter, "insufficient memory: {memory}"),
             Self::WeightBound(error) => error.fmt(formatter),
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
@@ -306,6 +309,11 @@ impl From<PreviewError> for LoadError {
             PreviewError::MemoryObservationUnavailable { reason } => {
                 Self::MemoryObservationUnavailable { reason }
             }
+            PreviewError::InsufficientMemory(memory) => Self::InsufficientMemory {
+                purpose: "execution planning".into(),
+                store: StoreIdentity::HostRam,
+                memory,
+            },
             PreviewError::WeightBound(bound) => Self::WeightBound(bound),
             PreviewError::PricesPending { reason, pending } => {
                 Self::PricesPending { reason, pending }
@@ -599,6 +607,18 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
             violation.entry,
             violation.statics,
         )),
+        PlanError::Resource(capacity)
+            if matches!(
+                capacity.resource,
+                magnitude_executor::ResourceKind::DeviceMemory
+                    | magnitude_executor::ResourceKind::HostStaging
+            ) =>
+        {
+            PlanOutcome::InsufficientMemory(InsufficientMemory {
+                required: capacity.required,
+                available: capacity.available,
+            })
+        }
         error @ (PlanError::Arithmetic(_)
         | PlanError::ResourcePlanning(_)
         | PlanError::Resource(_)
@@ -650,6 +670,8 @@ fn kernel_domain(backend: &str, entry: &str, statics: Vec<(String, u64)>) -> Uns
 
 pub(crate) enum PlanOutcome {
     Unsupported(UnsupportedModel),
+    /// The live memory budget cannot hold the planned form.
+    InsufficientMemory(InsufficientMemory),
     /// The caller's weight bound is below the load's least weights: no
     /// property of the model or the backend.
     WeightBound(WeightBoundBelowWeights),
@@ -717,6 +739,7 @@ impl From<PlanOutcome> for PreviewError {
     fn from(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
+            PlanOutcome::InsufficientMemory(memory) => Self::InsufficientMemory(memory),
             PlanOutcome::WeightBound(error) => Self::WeightBound(error),
             PlanOutcome::PricesPending(pending) => Self::PricesPending {
                 reason: pending.to_string(),
@@ -731,6 +754,11 @@ impl From<PlanOutcome> for LoadError {
     fn from(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
+            PlanOutcome::InsufficientMemory(memory) => Self::InsufficientMemory {
+                purpose: "execution planning".into(),
+                store: StoreIdentity::HostRam,
+                memory,
+            },
             PlanOutcome::WeightBound(error) => Self::WeightBound(error),
             PlanOutcome::PricesPending(pending) => Self::PricesPending {
                 reason: pending.to_string(),
@@ -759,6 +787,26 @@ mod tests {
         assert_eq!(load, LoadError::WeightBound(typed));
         assert!(!load.retryable());
         assert!(load.to_string().contains("2100000000") && load.to_string().contains("2130136892"));
+    }
+
+    /// A `PlanError::Resource` on device or host memory surfaces as typed
+    /// `InsufficientMemory` in both preview and load, never `Internal`.
+    #[test]
+    fn memory_capacity_plan_error_classifies_as_insufficient_memory() {
+        let cap = PlanError::Resource(magnitude_executor::CapacityError::new(
+            magnitude_executor::ResourceKind::DeviceMemory,
+            10_000,
+            4_000,
+        ));
+        let expected = InsufficientMemory { required: 10_000, available: 4_000 };
+        assert_eq!(
+            PreviewError::from(classify_plan(cap.clone(), seismic::BackendName::Metal)),
+            PreviewError::InsufficientMemory(expected)
+        );
+        assert!(matches!(
+            LoadError::from(classify_plan(cap, seismic::BackendName::Metal)),
+            LoadError::InsufficientMemory { memory, .. } if memory == expected
+        ));
     }
 
     /// A failed execution owner keeps its classified failure: a device loss

@@ -453,6 +453,11 @@ pub struct ExecutionManifest {
     /// Where the Prepare and the load each append their tuning trace (JSON
     /// Lines); `None` records none.
     pub tuning_trace: Option<PathBuf>,
+    /// The plan form decided once at load preview (`Whole` vs `Streamed`),
+    /// stamped onto the manifest before Prepare/Load so both tune and execute
+    /// the exact same form. `None` when not yet decided.
+    #[serde(default)]
+    pub plan_form: Option<magnitude_executor::PlanForm>,
 }
 
 /// Device-free readiness evidence returned only after worker construction has
@@ -598,7 +603,14 @@ impl ExecutionManifest {
             release,
             tuning: TuningSettings::STANDARD,
             tuning_trace: None,
+            plan_form: None,
         })
+    }
+
+    /// Return a copy of this manifest stamped with the decided [`PlanForm`].
+    pub fn with_plan_form(mut self, form: magnitude_executor::PlanForm) -> Self {
+        self.plan_form = Some(form);
+        self
     }
 }
 

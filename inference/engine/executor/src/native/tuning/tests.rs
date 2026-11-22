@@ -3921,7 +3921,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
             )
             .unwrap();
             let device = prepared.device().clone();
-            let room = crate::StableRoom::of(&device);
+            let room = crate::MemoryBudget::of_stable(&device).unwrap();
             prepared
                 .streaming::<crate::AssessmentMemoryCharge>(&definition, bound, &room)
                 .unwrap()

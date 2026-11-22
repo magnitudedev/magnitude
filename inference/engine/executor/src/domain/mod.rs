@@ -55,7 +55,7 @@ pub use family::{
     NativeFamily,
     ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, OptionalComponent, TrafficHold, Trip,
 };
-pub use reader::{DeviceReader, LoadRoom, MachineReading, PlanningRoom, StatusReading};
+pub use reader::{DeviceReader, LoadRoom, MachineReading, StatusReading};
 pub use in_flight::{
     HeadFlight, PrimingCompletionFlight, TargetContinuation, TargetFlight, VisionFlight,
 };

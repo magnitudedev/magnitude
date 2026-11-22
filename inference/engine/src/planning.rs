@@ -15,7 +15,7 @@ use magnitude_executor::{
     platform::{self, PlatformError, SelectedDevice},
     BackendPlan, ComponentSelection,
     DraftWidths,
-    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, HeldCharge, PlanError, PlanPrices, Placed, PlannedMethod, ResourceLimits, SettleRoom, StableRoom,
+    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, HeldCharge, MemoryBudget, PlanError, PlanForm, PlanPrices, Placed, PlannedMethod, ResourceLimits,
     assessment::{launch_prices, ExecutorCosts, Priced},
 };
 use magnitude_scheduler::ServiceLimits;
@@ -61,35 +61,17 @@ pub(crate) fn select_load_device(
     platform::select_recorded(catalog, manifest.path, manifest.device, &manifest.release, manifest.kernel_cache.as_deref())
 }
 
-/// Plan the manifest's model on the selected device: component selection,
-/// planned method, KV codec and resource limits resolved from the manifest,
-/// then `ExecutionPlanner::prepare`, then its expert bank under the model
-/// policy's weight cap, if any, beside its arena, a streamed bank at the
-/// pass the machine's prices settle ([`plan_banked`]).
-/// Opens no device and reads no payload: its room is the stable fit's
-/// ([`StableRoom`]), an assessment's and a preview's, where a load's is the
-/// reading it holds ([`magnitude_executor::PlanningRoom`]). The draft comes
-/// with the memory charge its planning confirmed, each way of holding its
-/// experts charged as a `C` (`HeldCharge`).
+/// Plan the manifest's model on the selected device using the static stable
+/// capacity budget ([`MemoryBudget::of_selected_stable`]).
 pub fn plan_execution<C: HeldCharge>(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
 ) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
+    let budget = MemoryBudget::of_selected_stable(selected).map_err(ExecutionPlanningError::Plan)?;
     plan_resident(manifest, selected).and_then(|resident| {
-        plan_banked(manifest, selected, resident, Holding::Placed, &StableRoom::of_selected(selected))
+        plan_banked(manifest, selected, resident, manifest.plan_form, &budget)
+            .map(|(draft, _)| draft)
     })
-}
-
-/// How a plan holds its experts ([`plan_banked`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Holding {
-    /// As placement decides from the stable room: whole where it holds
-    /// them, else streamed.
-    Placed,
-    /// Streamed, whatever whole form the stable room holds: a load whose
-    /// target import claim refused its whole plan, its bank then fitted by
-    /// that claim.
-    Streamed,
 }
 
 /// [`plan_execution`]'s plan before its expert bank: every expert resident.
@@ -115,27 +97,19 @@ pub fn plan_resident(
     })
 }
 
-/// [`plan_execution`]'s plan from its `resident` plan, in two stages: its
-/// experts placed whole under the model policy's weight cap, if any, from
-/// memory alone, in `room` (`ExecutionPlanDraft::placed`); else streamed
-/// through the expert bank `room` holds beside its arena, at the pass the machine's
-/// prices settle ([`plan_prices`], `Unplaced::streamed`).
-///
-/// Every load, whole or streamed, is priced on its executor's costs as it
-/// serves (`execution::load_measures`), so none plans before the
-/// measurement job stored the costs' required figures: while they are
-/// pending the load waits for them (`PlanError::Pending`), holding nothing
-/// of the device, once per machine. Without a kernel cache nothing is
-/// measured for it and its prices are unavailable: a whole plan holds
-/// without them, and a streamed one fails (`PlanError::Unavailable`, an
-/// internal error).
+/// Plan `resident` against `budget`, honoring `form` when decided:
+/// - `None`: decide the form against `budget` (whole if it fits, else streamed)
+///   and return `(draft, form)`.
+/// - `Some(PlanForm::Whole)`: require a whole plan fitting `budget`; fail
+///   immediately with `CapacityError` if not.
+/// - `Some(PlanForm::Streamed)`: plan a streamed bank sized to `budget`.
 pub fn plan_banked<C: HeldCharge>(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
     resident: ExecutionPlanDraft,
-    holding: Holding,
-    room: &impl SettleRoom,
-) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
+    form: Option<PlanForm>,
+    budget: &MemoryBudget,
+) -> Result<(ChargedDraft<C>, PlanForm), ExecutionPlanningError> {
     let measurements = match manifest.kernel_cache.as_deref() {
         None => Measurements::Unavailable {
             reason: "the load keeps no kernel cache, which holds the machine's figures".into(),
@@ -151,23 +125,47 @@ pub fn plan_banked<C: HeldCharge>(
         return Err(ExecutionPlanningError::Plan(PlanError::Pending(pending)));
     }
     let prices = plan_prices(&measurements, &resident);
-    let short = match holding {
-        Holding::Placed => match resident.placed(&manifest.definition, manifest.model.weight_bound, &prices, room).map_err(ExecutionPlanningError::Plan)? {
-            // A recording load reads its routing from its bank's routing
-            // records, which a load of no bank keeps none of.
-            Placed::Whole(whole) if manifest.model.record_routes && whole.draft().load().expert_bank().is_none() => {
-                return Err(ExecutionPlanningError::Plan(PlanError::Topology(
-                    "a load recording its routes holds its experts in a bank: it reads them from the bank's routing records",
-                )));
+    let check_recording = |whole: &ChargedDraft<C>| -> Result<(), ExecutionPlanningError> {
+        // A recording load reads its routing from its bank's routing
+        // records, which a load of no bank keeps none of.
+        if manifest.model.record_routes && whole.draft().load().expert_bank().is_none() {
+            return Err(ExecutionPlanningError::Plan(PlanError::Topology(
+                "a load recording its routes holds its experts in a bank: it reads them from the bank's routing records",
+            )));
+        }
+        Ok(())
+    };
+    let short = match form {
+        None => match resident
+            .placed(&manifest.definition, manifest.model.weight_bound, &prices, budget)
+            .map_err(ExecutionPlanningError::Plan)?
+        {
+            Placed::Whole(whole) => {
+                check_recording(&whole)?;
+                return Ok((whole, PlanForm::Whole));
             }
-            Placed::Whole(whole) => return Ok(whole),
             Placed::Short(short) => short,
         },
-        Holding::Streamed => resident
-            .streaming(&manifest.definition, manifest.model.weight_bound, room)
+        Some(PlanForm::Whole) => match resident
+            .placed(&manifest.definition, manifest.model.weight_bound, &prices, budget)
+            .map_err(ExecutionPlanningError::Plan)?
+        {
+            Placed::Whole(whole) => {
+                check_recording(&whole)?;
+                return Ok((whole, PlanForm::Whole));
+            }
+            Placed::Short(short) => {
+                return Err(ExecutionPlanningError::Plan(short.whole_short_error()));
+            }
+        },
+        Some(PlanForm::Streamed) => resident
+            .streaming(&manifest.definition, manifest.model.weight_bound, budget)
             .map_err(ExecutionPlanningError::Plan)?,
     };
-    short.streamed(&manifest.definition, &prices, room).map_err(ExecutionPlanningError::Plan)
+    let streamed = short
+        .streamed(&manifest.definition, &prices, budget)
+        .map_err(ExecutionPlanningError::Plan)?;
+    Ok((streamed, PlanForm::Streamed))
 }
 
 /// The prices a plan of `definition` as `plan` (its plan before any bank)
@@ -407,6 +405,65 @@ mod tests {
                 required: 1024,
                 admitted: 512,
             })
+        );
+    }
+
+    /// `plan_banked` honors an already-decided `PlanForm`: `Some(PlanForm::Whole)`
+    /// refuses with `PlanError::Resource` when the live budget cannot hold the
+    /// whole model instead of silently toggling to streamed, and
+    /// `Some(PlanForm::Streamed)` stays streamed even when whole would fit.
+    #[test]
+    fn plan_banked_honors_decided_plan_form_without_toggling() {
+        use magnitude_executor::{
+            AssessmentMemoryCharge, ExecutionPath, MemoryBudget, PlanForm,
+            platform::{DeviceRequest, ReleaseRate},
+        };
+        let cache = tempfile::tempdir().unwrap();
+        let definition = magnitude_executor::fixtures::tiny_definition();
+        let model = crate::options::ModelPolicy::default().resolve(&definition).unwrap();
+        let manifest = ExecutionManifest::new(
+            magnitude_executor::fixtures::tiny_manifest(&definition),
+            definition,
+            model,
+            crate::options::standard_service_limits(),
+            ExecutionPath::Native,
+            DeviceRequest::Backend(seismic::BackendName::Cpu),
+            Some(cache.path().to_owned()),
+            Some(cache.path().to_owned()),
+            ReleaseRate::of_machine(None),
+        )
+        .unwrap();
+        let catalog = Devices::discover(&[]).unwrap();
+        let selected = select_load_device(&catalog, &manifest).unwrap();
+        crate::execution::store_fixed_costs(&catalog.topology(), &selected.info, cache.path());
+        let resident = plan_resident(&manifest, &selected).unwrap();
+
+        // With generous budget, Whole succeeds and returns PlanForm::Whole.
+        let generous = MemoryBudget::fixed(16 << 30, None);
+        let (_, form) = plan_banked::<AssessmentMemoryCharge>(
+            &manifest,
+            &selected,
+            resident.clone(),
+            Some(PlanForm::Whole),
+            &generous,
+        )
+        .unwrap();
+        assert_eq!(form, PlanForm::Whole);
+
+        // With a tiny live budget, Whole fails immediately with PlanError::Resource.
+        let tight = MemoryBudget::fixed(1024, None);
+        let err = plan_banked::<AssessmentMemoryCharge>(
+            &manifest,
+            &selected,
+            resident,
+            Some(PlanForm::Whole),
+            &tight,
+        )
+        .err()
+        .expect("PlanForm::Whole must fail when tight budget cannot hold it");
+        assert!(
+            matches!(err, ExecutionPlanningError::Plan(PlanError::Resource(ref c)) if c.available == 1024 && c.required > 1024),
+            "expected PlanError::Resource with available=1024, got {err:?}"
         );
     }
 }

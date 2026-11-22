@@ -1,4 +1,5 @@
 use super::*;
+use crate::platform::Fit;
 use magnitude_kernels::dense_output;
 use seismic::fixtures::recorded;
 use seismic::{BackendName, Element, Layout, NativeGraphMetadata};
@@ -2276,20 +2277,16 @@ fn staging_is_charged_to_host_ram_once() {
     assert_eq!(domain(&staging, host_ram).required_bytes, tables + staged);
 }
 
-/// Metal's working set bounds only its device storage: host-resident
-/// tables are mapped pages, not Metal buffers, so host RAM holds them
-/// beside it, and the store's room for the load is the tables with the
-/// working set's room.
+/// On unified memory (Metal), `StoreDemands::Unified` charges `allocation_bytes + host_bytes()`
+/// together against the single device allocation store budget (`MemoryBudget::stable`).
 #[test]
-fn host_demand_sits_beside_the_metal_working_set() {
+fn host_demand_shares_the_unified_metal_budget() {
     let m4_pro = recorded::m4_pro();
     let status = unopened(&m4_pro);
     let metal = executor(&m4_pro, BackendName::Metal);
     let host_ram = m4_pro.host_ram().id();
     let fit = Fit::new(&m4_pro, &status);
     let room = fit.placement(metal, seismic::Contract::DeviceOnly).unwrap().stable_bytes;
-    let host = fit.store(host_ram).unwrap();
-    assert!(room + GIB < host.capacity_bytes);
     let assess = |device| {
         AssessmentMemoryCharge {
             host_table_bytes: GIB,
@@ -2298,20 +2295,20 @@ fn host_demand_sits_beside_the_metal_working_set() {
         .assess_fit(&m4_pro, metal, &status)
         .unwrap()
     };
-    let full = assess(room);
+    let full = assess(room - GIB);
     assert_eq!(full.verdict, AssessmentFitVerdict::Fits);
     assert_eq!(
         domain(&full, host_ram),
         DomainFit {
             role: DomainRole::Allocation,
             domain: host_ram,
-            capacity_bytes: room + GIB,
-            required_bytes: room + GIB,
+            capacity_bytes: room,
+            required_bytes: room,
             remaining_bytes: 0,
         }
     );
     assert_eq!(
-        assess(room + 1).verdict,
+        assess(room - GIB + 1).verdict,
         AssessmentFitVerdict::DoesNotFit {
             limiting: host_ram,
             deficit_bytes: NonZeroU64::MIN,
@@ -2685,10 +2682,10 @@ fn unified_store_demands_and_stable_room_agree_with_assess_fit() {
     let fit = charge.assess_fit(&m4_pro, metal, &status).unwrap();
     let alloc_domain = domain(&fit, host_ram);
     assert_eq!(alloc_domain.required_bytes, expected_total);
-    // `StableRoom::room` must match `assess_fit`'s remaining allocation bytes.
-    let room = crate::StableRoom { topology: &m4_pro, executor: metal, status: &status };
+    // `MemoryBudget::stable` must match `assess_fit`'s remaining allocation bytes.
+    let budget = crate::MemoryBudget::stable(&m4_pro, metal, &status).unwrap();
     let fit_remaining = u64::try_from(alloc_domain.remaining_bytes.max(0)).unwrap();
-    let stable_fit = room.fit(&charge).unwrap();
+    let stable_fit = budget.fit(&m4_pro, metal, &charge).unwrap();
     let stable_alloc = stable_fit
         .domains
         .iter()
@@ -2750,4 +2747,101 @@ fn discrete_store_demands_match_assess_fit_for_shared_and_upload_weights() {
             "{backend:?}: total across device + host stores conserved"
         );
     }
+}
+
+/// `MemoryBudget::stable`, `MemoryBudget::live_status`, and `MemoryBudget::live_ledger`
+/// all evaluate the exact same `StoreDemands` on unified and split topologies,
+/// differing only in their `available` bytes (`capacity` vs live status vs live ledger).
+#[test]
+fn stable_live_status_and_live_ledger_agree_on_store_demands() {
+    use crate::memory::ledger::{DeviceGrant, DeviceLedgers, Ledgers, LoadShape, Sample};
+    use crate::MemoryBudget;
+    use std::sync::Arc;
+
+    let m4_pro = recorded::m4_pro();
+    let metal = executor(&m4_pro, BackendName::Metal);
+    let mut status = unopened(&m4_pro);
+    const LIVE_16G: u64 = 16 * GIB;
+    status.sample.host.supply = seismic::Supply {
+        free_beyond_target: i64::try_from(LIVE_16G).unwrap(),
+        clean_cache: 0,
+        cold_reclaimable: 0,
+    };
+
+    let stable = MemoryBudget::stable(&m4_pro, metal, &status).unwrap();
+    let live_status = MemoryBudget::live_status(&m4_pro, metal, &status).unwrap();
+    assert_eq!(stable.available(), stable.capacity());
+    assert_eq!(live_status.capacity(), stable.capacity());
+    assert_eq!(live_status.available(), LIVE_16G);
+    assert!(stable.host.is_none() && live_status.host.is_none());
+
+    let scope = Ledgers::new();
+    let mut host_sample = status.sample.host.clone();
+    host_sample.wired = Some(seismic::WiredFigures {
+        limit: seismic::WiredLimit::OsDefault,
+        wire_count: 4 * GIB,
+    });
+    let sample = Sample::scripted(scope.changes(), host_sample);
+    let (ledgers, reading) = DeviceLedgers::unified_in(&scope, Arc::new(LoadShape { stores: Vec::new() }))
+        .read_granted(&sample, DeviceGrant::Wired { working_set: stable.capacity() });
+    let live_ledger = MemoryBudget::live_ledger(&m4_pro, metal, &reading, &ledgers, 0);
+    assert_eq!(live_ledger.capacity(), stable.capacity());
+    assert_eq!(live_ledger.available(), LIVE_16G);
+
+    let charge = AssessmentMemoryCharge {
+        host_table_bytes: GIB,
+        ..fixture_charge(19 * GIB, 256 << 20)
+    };
+    let crate::StoreDemands::Unified { total } = charge.store_demands(&m4_pro, metal).unwrap() else {
+        panic!("M4 Pro Metal is unified");
+    };
+    assert_eq!(total, 20 * GIB);
+
+    let stable_fit = stable.fit(&m4_pro, metal, &charge).unwrap();
+    let live_status_fit = live_status.fit(&m4_pro, metal, &charge).unwrap();
+    let live_ledger_fit = live_ledger.fit(&m4_pro, metal, &charge).unwrap();
+    assert_eq!(stable_fit.verdict, AssessmentFitVerdict::Fits);
+    assert_eq!(
+        live_status_fit.verdict,
+        AssessmentFitVerdict::DoesNotFit {
+            limiting: m4_pro.host_ram().id(),
+            deficit_bytes: NonZeroU64::new(4 * GIB).unwrap(),
+        }
+    );
+    assert_eq!(live_ledger_fit.verdict, live_status_fit.verdict);
+    assert_eq!(live_ledger_fit.domains[0].required_bytes, total);
+    assert_eq!(live_status_fit.domains[0].required_bytes, total);
+    assert_eq!(stable_fit.domains[0].required_bytes, total);
+
+    let held_budget = MemoryBudget::live_ledger(&m4_pro, metal, &reading, &ledgers, 4 * GIB);
+    assert_eq!(held_budget.available(), 20 * GIB);
+    assert_eq!(
+        held_budget.fit(&m4_pro, metal, &charge).unwrap().verdict,
+        AssessmentFitVerdict::Fits
+    );
+
+    let rtx3090 = recorded::rtx3090();
+    let cuda = executor(&rtx3090, BackendName::Cuda);
+    let mut rtx_status = unopened(&rtx3090);
+    rtx_status.sample.host.supply = seismic::Supply {
+        free_beyond_target: i64::try_from(2 * GIB).unwrap(),
+        clean_cache: 0,
+        cold_reclaimable: 0,
+    };
+    let rtx_stable = MemoryBudget::stable(&rtx3090, cuda, &rtx_status).unwrap();
+    let rtx_live = MemoryBudget::live_status(&rtx3090, cuda, &rtx_status).unwrap();
+    assert!(rtx_stable.host.is_some() && rtx_live.host.is_some());
+    assert_eq!(rtx_live.host.unwrap().available, 2 * GIB);
+    let split_charge = fixture_charge(4 * GIB, 3 * GIB);
+    assert_eq!(
+        rtx_stable.fit(&rtx3090, cuda, &split_charge).unwrap().verdict,
+        AssessmentFitVerdict::Fits
+    );
+    assert_eq!(
+        rtx_live.fit(&rtx3090, cuda, &split_charge).unwrap().verdict,
+        AssessmentFitVerdict::DoesNotFit {
+            limiting: rtx3090.host_ram().id(),
+            deficit_bytes: NonZeroU64::new(GIB).unwrap(),
+        }
+    );
 }

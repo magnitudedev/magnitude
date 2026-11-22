@@ -402,7 +402,7 @@ fn header_only_assessment_charges_what_a_load_commits() {
         policy.codec(),
         policy.limits(),
         ResourceCapacity {
-            domain_bytes: magnitude_executor::StableRoom::of(plan.device()).capacity().unwrap(),
+            domain_bytes: magnitude_executor::MemoryBudget::of_stable(plan.device()).unwrap().capacity(),
             tensor_operations: magnitude_executor::TensorOperations::of(
                 plan.device().tensor_operations(),
             ),

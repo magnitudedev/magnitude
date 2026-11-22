@@ -334,7 +334,7 @@ async fn prepare(
         job,
         |previewed, &(), mut job| {
             let device = load_plan(previewed).map(|plan| plan.device);
-            let manifest = manifest.clone();
+            let manifest = manifest.clone().with_plan_form(previewed.form);
             let progress = Arc::clone(&progress);
             async move {
                 let device = device.map_err(PricedFailure::Host)?;

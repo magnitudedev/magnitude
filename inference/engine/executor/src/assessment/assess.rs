@@ -1161,9 +1161,9 @@ impl StructuralCharge {
 
 fn resource_capacity(draft: &ExecutionPlanDraft) -> Result<ResourceCapacity, AssessmentError> {
     Ok(ResourceCapacity {
-        domain_bytes: crate::StableRoom::of(draft.device())
-            .capacity()
-            .map_err(|error| AssessmentError::Plan(error.to_string()))?,
+        domain_bytes: crate::MemoryBudget::of_stable(draft.device())
+            .map_err(|error| AssessmentError::Plan(error.to_string()))?
+            .capacity(),
         tensor_operations: crate::TensorOperations::of(draft.device().tensor_operations()),
         allocations: draft.device().allocations(),
     })
@@ -1338,9 +1338,9 @@ fn size_bank_with_host_tier(
     places: u64,
     paths: crate::planning::BankPaths,
     charge: &AssessmentMemoryCharge,
-    room: &crate::planning::StableRoom<'_>,
+    budget: &crate::planning::MemoryBudget,
 ) -> Result<Result<crate::planning::ExpertBankPlan, crate::UnstreamedExperts>, AssessmentError> {
-    use crate::planning::{HostTier, PassLaunches, SettleRoom};
+    use crate::planning::{HostTier, PassLaunches};
 
     let mut bank = draft
         .load()
@@ -1366,7 +1366,7 @@ fn size_bank_with_host_tier(
     };
     let left = |host_slots: u64| -> Result<i64, AssessmentError> {
         let growth = bank.host_cache(host_slots).map_err(AssessmentError::Memory)?;
-        Ok(room.host_left(draft, charge, growth)?)
+        Ok(budget.host_left(draft, charge, growth)?)
     };
     if left(0)? < 0 {
         let reserve = bank.landing_records();
@@ -1409,7 +1409,9 @@ fn settle_bank_rung(
     tier_places: u64,
     path_pricer: Option<&BankPathPricer<'_>>,
     pricing: crate::platform::GraphPricing,
-    room: &crate::planning::StableRoom<'_>,
+    topology: &DeviceTopology,
+    executor: &seismic::Executor,
+    budget: &crate::planning::MemoryBudget,
 ) -> Result<
     Result<(crate::planning::ExpertBankPlan, AssessmentMemoryCharge, crate::AssessmentFit), crate::AssessmentFit>,
     AssessmentError,
@@ -1439,7 +1441,7 @@ fn settle_bank_rung(
             paths,
             pricing,
         )?;
-        let floor_fit = room.fit(&floor_charge)?;
+        let floor_fit = budget.fit(topology, executor, &floor_charge)?;
         if !holds(&floor_fit) {
             return Ok(Err(floor_fit));
         }
@@ -1455,7 +1457,7 @@ fn settle_bank_rung(
                 paths,
                 pricing,
             )?;
-            let fit = room.fit(&charge)?;
+            let fit = budget.fit(topology, executor, &charge)?;
             if holds(&fit) {
                 lo = mid;
                 best = (charge, fit);
@@ -1469,7 +1471,7 @@ fn settle_bank_rung(
             None => paths,
         };
         if next == paths {
-            match size_bank_with_host_tier(draft, slots, tier_places, paths, &charge, room)? {
+            match size_bank_with_host_tier(draft, slots, tier_places, paths, &charge, budget)? {
                 Ok(sized) => return Ok(Ok((sized, charge, fit))),
                 Err(reason) => {
                     return Err(AssessmentError::Plan(format!(
@@ -1557,7 +1559,7 @@ pub fn assess_execution_fit_with_priced_bank(
 ) -> Result<ExecutionAssessment, AssessmentError> {
     let forms = &prepared.forms;
     let device = planned_executor(prepared.draft(), topology)?;
-    let room = crate::planning::StableRoom { topology, executor: device, status };
+    let budget = crate::planning::MemoryBudget::stable(topology, device, status)?;
     let fit_context_tokens = u32::try_from(context_limit)
         .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
     let fits_with_bank = |structure: &StructuralCharge,
@@ -1622,7 +1624,7 @@ pub fn assess_execution_fit_with_priced_bank(
             whole_paths,
             pricing,
         )?;
-        let fit = room.fit(&charge)?;
+        let fit = budget.fit(topology, device, &charge)?;
         if holds(&fit) {
             let sized = size_bank_with_host_tier(
                 &bank.form.draft,
@@ -1630,7 +1632,7 @@ pub fn assess_execution_fit_with_priced_bank(
                 tier_places,
                 whole_paths,
                 &charge,
-                &room,
+                &budget,
             )?
             .expect("a whole bank needs no host tier");
             return fits_with_bank(&bank.form.structure, bank.form.draft.load(), Some(sized), &charge, fit);
@@ -1641,7 +1643,7 @@ pub fn assess_execution_fit_with_priced_bank(
             let charge = resident
                 .structure
                 .charge_with_state_and_pricing(state_bytes, &resident.draft, pricing)?;
-            let fit = room.fit(&charge)?;
+            let fit = budget.fit(topology, device, &charge)?;
             if holds(&fit) {
                 return fits_with_bank(&resident.structure, resident.draft.load(), None, &charge, fit);
             }
@@ -1667,7 +1669,9 @@ pub fn assess_execution_fit_with_priced_bank(
                 tier_places,
                 path_pricer.as_ref(),
                 pricing,
-                &room,
+                topology,
+                device,
+                &budget,
             )? {
                 Ok((sized, charge, fit)) => {
                     return fits_with_bank(
@@ -1724,7 +1728,9 @@ pub fn assess_execution_fit_with_priced_bank(
                         tier_places,
                         path_pricer.as_ref(),
                         pricing,
-                        &room,
+                        topology,
+                        device,
+                        &budget,
                     )? {
                         Ok((sized, charge, fit)) => {
                             Ok(Some(Ok((structure, rung.draft.load(), sized, charge, fit))))
