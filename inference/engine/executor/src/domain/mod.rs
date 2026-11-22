@@ -778,6 +778,18 @@ struct ExogenousShrink {
     block: u64,
 }
 
+/// Snapshot of a store's ledger figures when a bank growth on that tier was
+/// refused by the allocator (`BankResized::GrowthRefused` or partial
+/// `BankResized::Grown { refused: Some(_), .. }`). Suppresses retrying growth
+/// on that tier until memory is actually released or `free`/`budget` genuinely
+/// increases by at least one block unit, or a shrink completes on that tier.
+#[derive(Clone, Copy, Debug)]
+struct GrowthRefusal {
+    allocated: u64,
+    free: u64,
+    budget: u64,
+}
+
 /// Native executor with no erased stage or executor type parameters. The
 /// accepted map is vacant while that request's advance is in flight.
 pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
@@ -879,6 +891,11 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// room jitter cannot immediately ping-pong back into a small grow while
     /// still letting own-claim frees and large app exits regrow immediately.
     exogenous_shrink: Option<ExogenousShrink>,
+    /// Per-tier latch set when a bank growth is refused by the allocator
+    /// (`BankResized::GrowthRefused` or `Grown { refused: Some(_), .. }`),
+    /// preventing repeated failing allocation calls until memory is released or
+    /// `free`/`budget` genuinely increases by at least one block unit.
+    growth_refused: [Option<GrowthRefusal>; crate::planning::BankTier::COUNT],
     /// A cut of the expert bank begun beside a running chain, until the
     /// owner takes it ([`Self::take_running_release`]): the storage it
     /// resizes.
@@ -1154,7 +1171,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if !self.family.has_planned_host_tier() {
             return Ok(());
         }
-        self.memory.borrow_mut().settled_read(self.resources.ledgers());
+        // Establish a clean post-load/post-warm-up baseline (`after_idle = true`)
+        // so one-time uncharged driver/JIT/warm-up host RSS is absorbed into
+        // `others` and `pinned_budget()` without poisoning `guarantee` (`read.rise`)
+        // and double-subtracting it from `pinned_import_room()` / `live_pinned_headroom()`.
+        self.memory.borrow_mut().settled_read_after(self.resources.ledgers(), true);
         self.family.begin_host_backing(self.resources.ledgers())
     }
 
@@ -3157,7 +3178,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // thread stands beside it, they are judged by the last reading with
         // every claim since counted; the owner's first step owes a reading
         // and takes it.
-        if memory.read_at_event(resources.ledgers()).is_none() {
+        if memory.read_at_event_after(resources.ledgers(), true).is_none() {
             tracing::debug!(target: MEMORY_TRACE, "the domain's opening memory read deferred: a change of ours stood beside the sample");
         }
         // The arena: the load's graph scratch and the target graphs' bound
@@ -3201,6 +3222,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             resize_held: ResizeHeld::default(),
             shrink_step: false,
             exogenous_shrink: None,
+            growth_refused: [None; crate::planning::BankTier::COUNT],
             running_release: None,
             _owner: owner,
             teardown: Default::default(),

@@ -236,7 +236,15 @@ impl DeviceReader {
     /// way to end (`memory::ledger::Sample::settled`). The
     /// load plans, searches and claims at it (design §5).
     pub fn settled_read(&self, ledgers: &DeviceLedgers) -> DeviceReading {
-        ledgers.read(&self.device, &self.settled_sample(ledgers.changes()))
+        self.settled_read_after(ledgers, false)
+    }
+
+    /// [`Self::settled_read`] with `after_idle` marking a baseline boundary
+    /// (such as post-load/post-warm-up) so one-time initialization overhead is
+    /// absorbed into `others` and `budget` without poisoning `guarantee`
+    /// (`read.rise`) when no OS memory pressure events occurred.
+    pub fn settled_read_after(&self, ledgers: &DeviceLedgers, after_idle: bool) -> DeviceReading {
+        ledgers.read_after(&self.device, &self.settled_sample(ledgers.changes()), after_idle)
     }
 
     /// [`Self::settled_read`] of ledgers never read, opened with the

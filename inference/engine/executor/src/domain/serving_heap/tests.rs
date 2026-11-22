@@ -561,15 +561,15 @@ fn sub_noise_experts_grow_does_not_starve_host_grow() {
     };
 
     // Sanity check: Experts alone is filtered out by min_partial.
-    assert_eq!(super::select_bank_move(&[(&experts, 101)], ledger_of, None), None);
+    assert_eq!(super::select_bank_move(&[(&experts, 101)], ledger_of, None, &[None; BankTier::COUNT]), None);
     // With Host eligible to grow, Host is selected instead of returning None.
     assert_eq!(
-        super::select_bank_move(&[(&experts, 101), (&host_target, 512)], ledger_of, None),
+        super::select_bank_move(&[(&experts, 101), (&host_target, 512)], ledger_of, None, &[None; BankTier::COUNT]),
         Some((BankHolding::Host, BankMove::Grow { to: 512 })),
     );
     // Shrink on a later holding still beats an eligible grow on an earlier holding.
     assert_eq!(
-        super::select_bank_move(&[(&experts, 512), (&host_target, 100)], ledger_of, None),
+        super::select_bank_move(&[(&experts, 512), (&host_target, 100)], ledger_of, None, &[None; BankTier::COUNT]),
         Some((BankHolding::Host, BankMove::Shrink { to: 100 })),
     );
 }
@@ -619,10 +619,173 @@ fn exogenous_shrink_cooldown_on_device_does_not_starve_host_grow() {
     };
 
     // Sanity check: saturation grow on Experts is suppressed by DeviceMemory cooldown.
-    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, Some(&shrink)), None);
+    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, Some(&shrink), &[None; BankTier::COUNT]), None);
     // Host on HostRam is unaffected by DeviceMemory's cooldown and is selected to grow.
     assert_eq!(
-        super::select_bank_move(&[(&experts, 512), (&host_target, 512)], ledger_of, Some(&shrink)),
+        super::select_bank_move(&[(&experts, 512), (&host_target, 512)], ledger_of, Some(&shrink), &[None; BankTier::COUNT]),
         Some((BankHolding::Host, BankMove::Grow { to: 512 })),
     );
+}
+
+/// A `GrowthRefusal` latch on `BankTier::Bank` suppresses repeated allocator
+/// growth retries until memory on that store is released or `free`/`budget`
+/// genuinely increases by at least one block unit, while never starving
+/// `BankTier::Host` growth.
+#[test]
+fn growth_refusal_latches_store_until_release_or_room_grows_without_starving_other_tier() {
+    use crate::domain::{BankHolding, GrowthRefusal};
+    use crate::experts::derived::{BankMove, BankShape, HoldingTarget};
+    use crate::memory::ledger::CommittedKind;
+    use crate::planning::BankTier;
+
+    let slot_bytes: u64 = 16 << 20;
+    let block_bytes: u64 = 8 << 20;
+    let t0 = Instant::now();
+    let (device, host) = discrete_ledgers(t0);
+    // Hold one committed claim and allocate its bytes so we can test releasing allocated bytes later.
+    let held = device
+        .change(|keeping| device.claim_at(&keeping.claims(), None, CommittedKind::Arena, block_bytes))
+        .expect("committed claim fits");
+    device
+        .change(|_| held.entry().take(&held.entry().change(), block_bytes, seismic::memory::Wiring::Pageable))
+        .expect("take committed bytes");
+    // Refresh device reading with `free = TOTAL - OTHERS - block_bytes`.
+    let t1 = t0 + Duration::from_millis(50);
+    device.read(device.sampled(t1), Reading::device(TOTAL, TOTAL - OTHERS - block_bytes, NO_LAG));
+    let est = device.estimate();
+    let mut refused = [None; BankTier::COUNT];
+    refused[BankTier::Bank.index()] = Some(GrowthRefusal {
+        allocated: est.allocated(),
+        free: est.free(),
+        budget: est.budget(),
+    });
+
+    let ledger_of = |tier| match tier {
+        BankTier::Bank => &device,
+        BankTier::Host => &host,
+    };
+    let experts = HoldingTarget {
+        holding: BankHolding::Experts,
+        tier: BankTier::Bank,
+        at: 57,
+        owed: 0,
+        shape: BankShape::new(block_bytes, 8, 512, 512),
+        charge: Box::new(move |slots| slots * slot_bytes),
+    };
+    let host_target = HoldingTarget {
+        holding: BankHolding::Host,
+        tier: BankTier::Host,
+        at: 98,
+        owed: 0,
+        shape: BankShape::new(block_bytes, 0, 512, 512),
+        charge: Box::new(move |slots| slots * slot_bytes),
+    };
+
+    // Unchanged store: Experts growth is latched (no retry spam).
+    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, None, &refused), None);
+    // Sub-unit jitter (< block_bytes) still stays latched.
+    let t2 = t1 + Duration::from_millis(50);
+    device.read(device.sampled(t2), Reading::device(TOTAL, TOTAL - OTHERS - block_bytes + (block_bytes - 1), NO_LAG));
+    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, None, &refused), None);
+    // Host on BankTier::Host is NOT starved while BankTier::Bank is latched.
+    assert_eq!(
+        super::select_bank_move(&[(&experts, 512), (&host_target, 512)], ledger_of, None, &refused),
+        Some((BankHolding::Host, BankMove::Grow { to: 512 })),
+    );
+
+    // Budget/free rising by >= one block unit opens the latch.
+    let t3 = t2 + Duration::from_millis(50);
+    device.read(device.sampled(t3), Reading::device(TOTAL, TOTAL - OTHERS, NO_LAG));
+    assert_eq!(
+        super::select_bank_move(&[(&experts, 512)], ledger_of, None, &refused),
+        Some((BankHolding::Experts, BankMove::Grow { to: 512 })),
+    );
+
+    // Reset reading back to refusal baseline, then release >= block_bytes of own allocation.
+    let t4 = t3 + Duration::from_millis(50);
+    device.read(device.sampled(t4), Reading::device(TOTAL, TOTAL - OTHERS - block_bytes, NO_LAG));
+    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, None, &refused), None);
+    device.change(|_| {
+        held.entry().freed(&held.entry().change(), block_bytes, seismic::memory::Wiring::Pageable);
+        drop(held);
+    });
+    assert_eq!(
+        super::select_bank_move(&[(&experts, 512)], ledger_of, None, &refused),
+        Some((BankHolding::Experts, BankMove::Grow { to: 512 })),
+    );
+}
+
+/// Post-load/warm-up settled baseline (`read_after(..., true)`, as called by
+/// `ExecutorDomain::begin_host_backing`) absorbs one-time uncharged load/warm-up
+/// host overhead into `others` and `pinned_budget()` without poisoning
+/// `guarantee()` (`read.rise`), so `pinned_import_room()` and
+/// `live_pinned_headroom()` do not double-subtract warm-up overhead.
+/// Subsequent serving-time rises (`after_idle = false`) still set `guarantee()`.
+#[test]
+fn post_warmup_settled_read_absorbs_load_overhead_without_poisoning_pinned_headroom() {
+    use crate::memory::ledger::{Ledgers, LoadShape, PoolClass};
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    const TOTAL_64G: u64 = 62 * GIB;
+    const RECLAIM_BAND: u64 = 64 * MIB;
+    const BLOCK: u64 = 130 * MIB;
+    const RESERVE: u64 = RECLAIM_BAND + BLOCK;
+    const WARMUP_UNCHANGED_RSS: u64 = 5_583_413_248; // 5.20 GiB observed in 7aa835
+
+    let sample_at = |at: Instant, free_beyond_target: i64, clean_cache: u64| seismic::HostSample {
+        at,
+        page_bytes: 4096,
+        total: TOTAL_64G,
+        supply: seismic::Supply { free_beyond_target, clean_cache, cold_reclaimable: 0 },
+        reclaim_band: RECLAIM_BAND,
+        counted: seismic::Counted { at, lag: Duration::ZERO },
+        cold: seismic::ColdPages::default(),
+        own_reclaimed: None,
+        wired: None,
+        harm: Some(seismic::Harm { machine: 0, own: 0 }),
+        pressure: Some(seismic::PressureLevel::Normal),
+        lag: NO_LAG,
+    };
+
+    let scope = Ledgers::new();
+    let host = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(LoadShape { stores: Vec::new() }));
+    let _pool = host.pool_block(PoolClass::Records, NonZeroU64::new(BLOCK).unwrap());
+
+    // Opening read before model load / warm-up.
+    let t0 = Instant::now();
+    let s0 = sample_at(t0, (48 * GIB) as i64, 9 * GIB);
+    host.read(host.sampled(t0), Reading::host(&s0));
+
+    // Model load + warm-up adds 5.20 GiB of uncharged host/driver RSS.
+    // Settled post-warm-up baseline read (`after_idle = true`) absorbs it into
+    // `others` and `pinned_budget()` with `guarantee() == 0`.
+    let t1 = t0 + Duration::from_secs(5);
+    let s1 = sample_at(t1, (48 * GIB) as i64 - WARMUP_UNCHANGED_RSS as i64, 9 * GIB);
+    let post_warmup = host.read_after(host.sampled(t1), Reading::host(&s1), true);
+    assert_eq!(post_warmup.guarantee(), 0, "one-time warm-up RSS must not poison guarantee");
+    assert_eq!(post_warmup.others(), 5 * GIB + WARMUP_UNCHANGED_RSS);
+    let expected_post_warmup_imm = (48 * GIB - WARMUP_UNCHANGED_RSS) + 9 * GIB;
+    assert_eq!(post_warmup.pinned_import_room(), expected_post_warmup_imm - RESERVE);
+
+    // Late in host-tier backing: free_beyond_target = -3.02 GiB (cgroup_floor
+    // already subtracted), clean_cache = +8.55 GiB -> immediate_supply = +5.53 GiB.
+    let t2 = t1 + Duration::from_secs(5);
+    let late = sample_at(t2, -3_245_690_880, 9_185_488_896);
+    let expected_late_imm = (9_185_488_896_i64 - 3_245_690_880_i64) as u64;
+    assert_eq!(
+        post_warmup.live_pinned_headroom(&late),
+        expected_late_imm - RESERVE,
+        "live_pinned_headroom must expose immediate_supply - pinned_reserve without double-subtracting warm-up RSS"
+    );
+
+    // During live serving (`after_idle = false`), a genuine 1 GiB competing-process
+    // rise still sets `guarantee() == 1 GiB` and is preserved by `live_pinned_headroom`.
+    let t3 = t2 + Duration::from_secs(2);
+    let s3 = sample_at(t3, (47 * GIB) as i64 - WARMUP_UNCHANGED_RSS as i64, 9 * GIB);
+    let serving = host.read(host.sampled(t3), Reading::host(&s3));
+    assert_eq!(serving.guarantee(), GIB);
+    assert_eq!(serving.live_pinned_headroom(&late), expected_late_imm - RESERVE - GIB);
 }

@@ -451,7 +451,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// and large exogenous releases through immediately.
     fn next_bank_move(&self, bank: &dyn super::ElasticBank) -> Result<Option<(BankHolding, BankMove)>, DomainError> {
         self.derive_bank(bank, |derived| {
-            select_bank_move(derived, |tier| self.resources.ledgers().of(tier), self.exogenous_shrink.as_ref())
+            select_bank_move(derived, |tier| self.resources.ledgers().of(tier), self.exogenous_shrink.as_ref(), &self.growth_refused)
         })
     }
 
@@ -495,6 +495,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             if self.exogenous_shrink.as_ref().is_some_and(|s| s.store == grew_store) {
                 self.exogenous_shrink = None;
             }
+            self.growth_refused[tier.index()] = None;
         }
         Ok(step)
     }
@@ -945,6 +946,7 @@ fn select_bank_move<'a>(
     derived: &[(&crate::experts::derived::HoldingTarget<'_>, u64)],
     ledger_of: impl Fn(crate::planning::BankTier) -> &'a crate::memory::ledger::Ledger,
     exogenous_shrink: Option<&ExogenousShrink>,
+    growth_refused: &[Option<super::GrowthRefusal>; crate::planning::BankTier::COUNT],
 ) -> Option<(BankHolding, BankMove)> {
     let mut first_grow = None;
     for &(target, slots) in derived {
@@ -952,7 +954,15 @@ fn select_bank_move<'a>(
             None => continue,
             Some(mv @ BankMove::Shrink { .. }) => return Some((target.holding, mv)),
             Some(mv @ BankMove::Grow { to }) => {
-                if first_grow.is_none() && allow_bank_grow(target, to, ledger_of(target.tier), exogenous_shrink) {
+                if first_grow.is_none()
+                    && allow_bank_grow(
+                        target,
+                        to,
+                        ledger_of(target.tier),
+                        exogenous_shrink,
+                        growth_refused[target.tier.index()].as_ref(),
+                    )
+                {
                     first_grow = Some((target.holding, mv));
                 }
             }
@@ -962,12 +972,14 @@ fn select_bank_move<'a>(
 }
 
 /// Whether a derived growth of `target` to `to` passes the sub-noise partial
-/// grow guard and the post-shrink exogenous cooldown on `ledger`.
+/// grow guard, the per-tier allocator-refusal latch, and the post-shrink
+/// exogenous cooldown on `ledger`.
 fn allow_bank_grow(
     target: &crate::experts::derived::HoldingTarget<'_>,
     to: u64,
     ledger: &crate::memory::ledger::Ledger,
     exogenous_shrink: Option<&ExogenousShrink>,
+    growth_refused: Option<&super::GrowthRefusal>,
 ) -> bool {
     let sat = target.shape.saturation_slots();
     let sat_charge = (target.charge)(sat);
@@ -977,6 +989,16 @@ fn allow_bank_grow(
     let min_partial = target.shape.block_bytes().max((sat_charge / 64).min(PARTIAL_GROW_MIN_CAP));
     if to < sat && gained < min_partial {
         return false;
+    }
+    if let Some(refusal) = growth_refused {
+        let est = ledger.estimate();
+        let unit = target.shape.block_bytes().max(1);
+        let released = refusal.allocated.saturating_sub(est.allocated()) >= unit;
+        let free_grew = est.free().saturating_sub(refusal.free) >= unit;
+        let budget_grew = est.budget().saturating_sub(refusal.budget) >= unit;
+        if !released && !free_grew && !budget_grew {
+            return false;
+        }
     }
     if let Some(shrink) = exogenous_shrink.filter(|s| s.store == ledger.store()) {
         let est = ledger.estimate();

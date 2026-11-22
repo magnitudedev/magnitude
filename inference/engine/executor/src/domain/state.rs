@@ -1262,6 +1262,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let bank = self.family.expert_bank().expect("a resize finished of the load's expert bank");
         let holding = finished.holding();
         let tier = bank.holding_storage(holding)?;
+        match &finished {
+            super::BankResized::GrowthRefused { .. }
+            | super::BankResized::Grown { refused: Some(_), .. } => {
+                let est = self.resources.ledgers().of(tier).estimate();
+                self.growth_refused[tier.index()] = Some(super::GrowthRefusal {
+                    allocated: est.allocated(),
+                    free: est.free(),
+                    budget: est.budget(),
+                });
+            }
+            super::BankResized::Shrunk { .. }
+            | super::BankResized::Grown { refused: None, .. } => {
+                self.growth_refused[tier.index()] = None;
+            }
+            super::BankResized::Stopped { .. } => {}
+        }
         let held = self.resize_held.finish(started, tier, holding);
         Ok(Some((finished, held)))
     }
