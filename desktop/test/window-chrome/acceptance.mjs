@@ -8,14 +8,21 @@ const { _electron } = await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE).
 const output = process.env.CHROME_EVIDENCE
 await mkdir(output, { recursive: true })
 const profile = await mkdtemp(join(tmpdir(), 'magnitude-chrome-'))
+await writeFile(join(profile, 'config.json'), JSON.stringify({ onboarding: 'Completed' }))
 const app = await _electron.launch({ executablePath: process.env.MAGNITUDE_TEST_APP, env: { ...process.env, MAGNITUDE_DEV_DATA_DIR: profile, MAGNITUDE_DEV_PORT: '11279', MAGNITUDE_SHELL_ENV_INHERITED: '1' }, timeout: 60000 })
 const evidence = { platform: process.platform, checks: [] }
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 try {
   const page = await app.firstWindow()
-  await page.getByRole('button', { name: 'Usage', exact: true }).waitFor({ timeout: 60000 })
+  await page.getByRole('button', { name: 'Connections', exact: true }).waitFor({ timeout: 60000 })
+  await page.getByRole('button', { name: /^Models\b/ }).waitFor()
+  await page.getByRole('button', { name: 'Chat', exact: true }).waitFor()
+  await page.getByRole('button', { name: 'Connections', exact: true }).click()
+  await page.getByRole('heading', { name: 'Connections', exact: true }).waitFor()
+  await page.getByRole('button', { name: 'Settings', exact: true }).click()
+  await page.getByRole('heading', { name: 'Settings', exact: true }).waitFor()
   await page.getByRole('button', { name: 'Usage', exact: true }).click()
-  await page.getByRole('heading', { name: 'Usage', exact: true }).waitFor()
+  await page.getByRole('button', { name: 'Close', exact: true }).click()
   evidence.checks.push('navigation remains clickable')
   const integrated = process.platform !== 'linux'
   assert.equal(await page.locator('[data-window-drag-region]').count() > 0, integrated)
