@@ -21,6 +21,7 @@ const missing = (error: unknown) => error instanceof Error && "code" in error &&
 const failed = (message: string) => new LegacyStartupFailed({ message })
 
 const GENERATED_DESCRIPTION = "Magnitude local inference service"
+const SYSTEMCTL_CANDIDATES = ["systemctl", "/usr/bin/systemctl", "/bin/systemctl"] as const
 
 /**
  * Whether a unit claims to be the historical generated one. The person's own service under the same name (such as
@@ -79,7 +80,17 @@ export const makeLinuxLegacyStartup = (options: {
     const bytes = await readFile(path)
     return Option.some({ text: bytes.toString("utf8"), digest: createHash("sha256").update(bytes).digest("hex") })
   }, catch: error => failed(`Cannot read legacy user service: ${String(error)}`) })
-  const run = (args: readonly string[]) => commands.run("systemctl", ["--user", "--no-pager", ...args])
+  const run = (args: readonly string[]) => Effect.gen(function* () {
+    const fullArgs = ["--user", "--no-pager", ...args]
+    let lastError: LegacyStartupFailed | undefined
+    for (const candidate of SYSTEMCTL_CANDIDATES) {
+      const result = yield* Effect.either(commands.run(candidate, fullArgs))
+      if (result._tag === "Right") return result.right
+      lastError = result.left
+      if (!result.left.executableNotFound) return yield* Effect.fail(result.left)
+    }
+    return yield* Effect.fail(lastError!)
+  })
   const requireSuccess = (args: readonly string[]) => run(args).pipe(Effect.flatMap(result => result.code === 0
     ? Effect.void : Effect.fail(failed(result.stderr.trim() || `Legacy user-service command exited ${result.code}`))))
   const state = run(["show", "--all", `--property=${Object.keys(UnitState.fields).join(",")}`, unit]).pipe(Effect.flatMap(result => {
@@ -117,7 +128,12 @@ export const makeLinuxLegacyStartup = (options: {
       if (Option.isSome(source)) return yield* failed("The legacy user service exists but its systemd user manager is unavailable")
       return Option.none<LegacyLinuxStartup>()
     }
-    const current = yield* state
+    const currentResult = yield* Effect.either(state)
+    if (currentResult._tag === "Left") {
+      if (Option.isNone(source) && currentResult.left.executableNotFound) return Option.none<LegacyLinuxStartup>()
+      return yield* Effect.fail(currentResult.left)
+    }
+    const current = currentResult.right
     if (Option.isNone(source)) {
       if (!absent(current)) return yield* failed("Legacy user service is loaded without its verified source file")
       return Option.none<LegacyLinuxStartup>()

@@ -167,4 +167,64 @@ describe.skipIf(process.platform === "win32")("legacy Linux user service", () =>
     await expect(run(f.adapter.inspect)).rejects.toThrow("regular file")
     expect(mutations(f.calls)).toEqual([])
   })
+  it("falls back to /usr/bin/systemctl when systemctl is absent from $PATH", async () => {
+    await writeFile(path, source)
+    socket = createServer()
+    await new Promise<void>((resolve, reject) => { socket!.once("error", reject); socket!.listen(join(runtime, "systemd/private"), resolve) })
+    const attempted: string[] = []
+    const commands = LegacyStartupCommands.of({ run: (executable, args) => {
+      attempted.push(executable)
+      if (executable === "systemctl") {
+        return Effect.fail(new LegacyStartupFailed({ message: 'Could not execute systemctl: Executable not found in $PATH: "systemctl"', executableNotFound: true }))
+      }
+      expect(executable).toBe("/usr/bin/systemctl")
+      expect(args.slice(0, 3)).toEqual(["--user", "--no-pager", "show"])
+      return Effect.succeed({
+        code: 0,
+        stdout: [
+          "LoadState=loaded", "ActiveState=active", `FragmentPath=${path}`,
+          "UnitFileState=enabled", "MainPID=12345", "DropInPaths=", "Transient=no", "NeedDaemonReload=no",
+        ].join("\n"),
+        stderr: "",
+      })
+    } })
+    const adapter = await run(makeLinuxLegacyStartup({ home, runtimeDirectory: runtime }).pipe(Effect.provideService(LegacyStartupCommands, commands)))
+    const inspected = Option.getOrThrow(await run(adapter.inspect))
+    expect(inspected.enabled).toBe(true)
+    expect(Option.getOrThrow(inspected.runningPid)).toBe(12345)
+    expect(attempted).toEqual(["systemctl", "/usr/bin/systemctl"])
+  })
+  it("treats missing systemctl as no legacy registration when no legacy unit file exists", async () => {
+    socket = createServer()
+    await new Promise<void>((resolve, reject) => { socket!.once("error", reject); socket!.listen(join(runtime, "systemd/private"), resolve) })
+    const attempted: string[] = []
+    const commands = LegacyStartupCommands.of({ run: (executable) => {
+      attempted.push(executable)
+      return Effect.fail(new LegacyStartupFailed({ message: `Could not execute ${executable}: ENOENT`, executableNotFound: true }))
+    } })
+    const adapter = await run(makeLinuxLegacyStartup({ home, runtimeDirectory: runtime }).pipe(Effect.provideService(LegacyStartupCommands, commands)))
+    expect(Option.isNone(await run(adapter.inspect))).toBe(true)
+    expect(attempted).toEqual(["systemctl", "/usr/bin/systemctl", "/bin/systemctl"])
+  })
+  it("still fails when the legacy unit file exists and systemctl is missing everywhere", async () => {
+    await writeFile(path, source)
+    socket = createServer()
+    await new Promise<void>((resolve, reject) => { socket!.once("error", reject); socket!.listen(join(runtime, "systemd/private"), resolve) })
+    const commands = LegacyStartupCommands.of({ run: (executable) =>
+      Effect.fail(new LegacyStartupFailed({ message: `Could not execute ${executable}: ENOENT`, executableNotFound: true })) })
+    const adapter = await run(makeLinuxLegacyStartup({ home, runtimeDirectory: runtime }).pipe(Effect.provideService(LegacyStartupCommands, commands)))
+    await expect(run(adapter.inspect)).rejects.toThrow("Could not execute /bin/systemctl")
+  })
+  it("does not fall back or ignore non-ENOENT systemctl execution failures", async () => {
+    socket = createServer()
+    await new Promise<void>((resolve, reject) => { socket!.once("error", reject); socket!.listen(join(runtime, "systemd/private"), resolve) })
+    const attempted: string[] = []
+    const commands = LegacyStartupCommands.of({ run: (executable) => {
+      attempted.push(executable)
+      return Effect.fail(new LegacyStartupFailed({ message: `Could not execute ${executable}: EACCES` }))
+    } })
+    const adapter = await run(makeLinuxLegacyStartup({ home, runtimeDirectory: runtime }).pipe(Effect.provideService(LegacyStartupCommands, commands)))
+    await expect(run(adapter.inspect)).rejects.toThrow("EACCES")
+    expect(attempted).toEqual(["systemctl"])
+  })
 })
