@@ -45,7 +45,7 @@ use crate::api::{CallError, TensorError};
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::prepared::{validate_invocation, InvocationContract};
 use seismic_lang::checked::{
-    CheckedModule, NativeDefault, NativeImplementation, NativeNatExpr, NativeParameter, NativeSpecialization,
+    CheckedModule, NativeImplementation, NativeParameter, NativeSpecialization,
 };
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, Writer};
 use seismic_lang::expr::SymbolValue;
@@ -8194,9 +8194,8 @@ fn fix(
                 parameter.values
             )));
         }
-        parameter.values = vec![*value];
-        // Its one value is its default.
-        parameter.default = NativeDefault::Value(NativeNatExpr::Constant(*value));
+        // Its one value is its default and its reference.
+        parameter.fix(*value);
     }
     Ok(())
 }
@@ -8644,8 +8643,7 @@ impl SurveyDomain {
                     }
                     .expect("an unserved parameter is declared");
                     let value = address.value(default);
-                    parameter.values = vec![value];
-                    parameter.default = NativeDefault::Value(NativeNatExpr::Constant(value));
+                    parameter.fix(value);
                 }
                 Ok(())
             })

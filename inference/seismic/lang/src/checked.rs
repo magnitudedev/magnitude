@@ -1788,6 +1788,17 @@ pub struct NativeParameter {
     pub role: NativeParameterRole,
 }
 
+impl NativeParameter {
+    /// Narrow this parameter's domain to the single value `value`, updating
+    /// both its default and its optional validation reference so neither can
+    /// stay outside its listed values.
+    pub fn fix(&mut self, value: u64) {
+        self.values = vec![value];
+        self.default = NativeDefault::Value(NativeNatExpr::Constant(value));
+        self.reference = None;
+    }
+}
+
 /// How a parameter's default is chosen, over the static dimensions (the
 /// device's properties are substituted first, [`NativeImplementation::at_device`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -6098,6 +6109,34 @@ mod native_tests {
         .expect_err("non-arithmetic reference must be rejected")
         .to_string();
         assert!(err.contains("only permitted on `arithmetic` parameters"), "{err}");
+    }
+
+    #[test]
+    fn fixing_an_arithmetic_parameter_keeps_reference_specialization_valid() {
+        let ok = check_source(source(
+            "native scale for vulkan from \"vulkan/scale.comp\":\n    static (N)\n    params (arithmetic LANES in [8, 16, 32] default least where LANES == 32 or N / (32 * LANES) <= 4 reference 32, ROWS in [2, 1, 4] default 2)\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (64, 1, 1)\n",
+        ))
+        .expect("arithmetic parameter with reference checks");
+        let entry = ok.entry_named("scale").unwrap();
+        let native = ok.native_implementation(entry, BackendName::Vulkan).unwrap();
+        let statics = NativeSpecialization::new().with_static("N", 512).with_param("LANES", 8);
+        let fixed = DeviceBound(native.clone())
+            .with_defaults_at(&statics)
+            .unwrap()
+            .adjusted::<std::convert::Infallible>(|implementation| {
+                implementation
+                    .params
+                    .iter_mut()
+                    .find(|parameter| parameter.name == "LANES")
+                    .unwrap()
+                    .fix(8);
+                Ok(())
+            })
+            .unwrap();
+        let default = fixed.default_specialization(&statics).unwrap();
+        let reference = fixed.reference_specialization(&statics).unwrap();
+        assert_eq!(default.param("LANES"), Some(8));
+        assert_eq!(reference.param("LANES"), Some(8));
     }
 
     /// The declared defaults are only the first candidate: at statics where

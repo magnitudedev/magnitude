@@ -40,7 +40,7 @@ pub fn declared_at<E: seismic::Entry>(
     entry: &seismic::BoundEntry<E>,
     given: &seismic::NativeSpecialization,
 ) -> Result<seismic::NativeSpecialization, seismic::NativeSpecializationError> {
-    use seismic_lang::checked::{NativeDefault, NativeNatExpr, NativeParameter, NativeSpecializationError};
+    use seismic_lang::checked::{NativeParameter, NativeSpecializationError};
     let implementation = offered(device, entry);
     let statics = implementation.statics.iter().fold(seismic::NativeSpecialization::new(), |statics, name| {
         let value = given
@@ -72,8 +72,7 @@ pub fn declared_at<E: seismic::Entry>(
         if !parameter.values.contains(&value) {
             return Err(NativeSpecializationError::OutsideDomain { parameter: parameter.name.clone(), value });
         }
-        parameter.values = vec![value];
-        parameter.default = NativeDefault::Value(NativeNatExpr::Constant(value));
+        parameter.fix(value);
         Ok(())
     };
     implementation
