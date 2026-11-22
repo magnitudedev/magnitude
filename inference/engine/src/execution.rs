@@ -1173,6 +1173,9 @@ fn assemble_domain(
     domain
         .measure_load(load_measures(&pricing).map_err(internal)?, &mut bindings)
         .map_err(|error| internal(error.to_string()))?;
+    domain
+        .begin_host_backing()
+        .map_err(|error| internal(error.to_string()))?;
     phase.enter("serving");
     Ok(Box::new(NativeDomain {
         domain,

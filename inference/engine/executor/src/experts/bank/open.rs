@@ -326,8 +326,8 @@ impl ExpertBank {
         }
         // Register the open host-tier backing claim now so `ServedBank::new`
         // finds it; actual background slot allocation (`ExpertBank::back_host_to`)
-        // starts only after domain allocation and its fresh post-domain `HostRam`
-        // reading (`ServedBank::begin_host_backing`), clamped to live host room.
+        // starts only after warm-up and load pricing (`ExecutorDomain::begin_host_backing`),
+        // clamped to live host room.
         bank.cache.open_host(plan.host_slots, host_backing);
         Ok(bank)
     }

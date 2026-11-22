@@ -18,8 +18,6 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-#[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 thread_local! {
@@ -193,22 +191,60 @@ pub fn large_page_backing() -> LargePageBacking {
     host::measure_large_page_backing(&ranges)
 }
 
-/// Latched `true` on Linux once a `MADV_HUGEPAGE` block under a blocking
-/// `/sys/kernel/mm/transparent_hugepage/defrag` policy hits synchronous kernel
-/// compaction during `fault_in`, so subsequent blocks skip `MADV_HUGEPAGE` and
-/// fault at full RAM speed.
-#[cfg(target_os = "linux")]
-static COMPACTION_STALLED: AtomicBool = AtomicBool::new(false);
+/// Linux `/sys/kernel/mm/transparent_hugepage/defrag` policy.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThpDefrag {
+    Never,
+    Defer,
+    Madvise,
+    DeferMadvise,
+    Always,
+    Unknown,
+}
 
-/// Below this `fault_in` throughput (500 MB/s), `MADV_HUGEPAGE` under a
-/// blocking `thp/defrag` policy has hit synchronous kernel compaction.
-#[cfg(target_os = "linux")]
-const MIN_THP_FAULT_BYTES_PER_SEC: u128 = 500_000_000;
+/// Advice applied to a whole-large-page [`HostBlock`] on Linux so faulting
+/// never enters synchronous kernel THP compaction (`compact_zone` / direct
+/// reclaim under `mm->mmap_lock`).
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HugePageAdvice {
+    /// `MADV_HUGEPAGE`: opportunistic 2 MiB pages with no synchronous
+    /// compaction (`defrag` is `never` or `defer`).
+    Prefer,
+    /// No advice: avoids opting into synchronous compaction under
+    /// `defrag = madvise | defer+madvise | unknown`.
+    Default,
+    /// `MADV_NOHUGEPAGE`: opts out of global synchronous compaction under
+    /// `defrag = always`.
+    Avoid,
+}
 
-#[cfg(target_os = "linux")]
-fn fault_stalled(bytes: usize, elapsed: std::time::Duration) -> bool {
-    (bytes as u128).saturating_mul(1_000_000_000)
-        < MIN_THP_FAULT_BYTES_PER_SEC.saturating_mul(elapsed.as_nanos())
+#[cfg(any(target_os = "linux", test))]
+impl ThpDefrag {
+    /// Parse the active `[token]` from `/sys/kernel/mm/transparent_hugepage/defrag`.
+    fn parse(content: &str) -> Self {
+        let active = content
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix('[').and_then(|s| s.strip_suffix(']')));
+        match active {
+            Some("never") => Self::Never,
+            Some("defer") => Self::Defer,
+            Some("madvise") => Self::Madvise,
+            Some("defer+madvise") => Self::DeferMadvise,
+            Some("always") => Self::Always,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// The `madvise` policy for a large-page block under this defrag mode.
+    fn advice(self) -> HugePageAdvice {
+        match self {
+            Self::Never | Self::Defer => HugePageAdvice::Prefer,
+            Self::Madvise | Self::DeferMadvise | Self::Unknown => HugePageAdvice::Default,
+            Self::Always => HugePageAdvice::Avoid,
+        }
+    }
 }
 
 /// Whether a host read's `error` is its source missing (`ENOENT`,
@@ -252,30 +288,14 @@ impl HostBlock {
         // Unmapped by its drop from here, whatever fails.
         let mut block = Self { base, bytes, large_page: None };
         #[cfg(target_os = "linux")]
-        let advised_blocking = if large_page.is_some() {
-            let blocking = host::thp_defrag().blocks_on_madvise();
-            if !blocking || !COMPACTION_STALLED.load(Ordering::Relaxed) {
-                // Faulted in large pages opportunistically when free; under a
-                // blocking `thp/defrag` policy, once synchronous kernel
-                // compaction stalls a block's `fault_in`, subsequent blocks
-                // skip `MADV_HUGEPAGE` to fault at full RAM speed.
-                unsafe { host::prefer_large(base.as_ptr(), bytes)? };
-                blocking
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        #[cfg(target_os = "linux")]
-        let fault_start = advised_blocking.then(std::time::Instant::now);
-        fault_in(base, bytes, page);
-        #[cfg(target_os = "linux")]
-        if let Some(start) = fault_start {
-            if fault_stalled(bytes, start.elapsed()) {
-                COMPACTION_STALLED.store(true, Ordering::Relaxed);
+        if large_page.is_some() {
+            match host::thp_defrag().advice() {
+                HugePageAdvice::Prefer => unsafe { host::prefer_large(base.as_ptr(), bytes)? },
+                HugePageAdvice::Default => {}
+                HugePageAdvice::Avoid => unsafe { host::avoid_large(base.as_ptr(), bytes) },
             }
         }
+        fault_in(base, bytes, page);
         if let Some(large_page) = large_page {
             let mut live = live_large_blocks().lock().unwrap_or_else(PoisonError::into_inner);
             let prev = live.insert(base.as_ptr() as usize, (bytes, large_page));
@@ -463,50 +483,13 @@ mod host {
     #[cfg(target_os = "linux")]
     const THP_DEFRAG: &str = "/sys/kernel/mm/transparent_hugepage/defrag";
 
-    /// Active token parsed from `/sys/kernel/mm/transparent_hugepage/defrag`.
-    #[cfg(target_os = "linux")]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) enum ThpDefrag {
-        Never,
-        Defer,
-        Madvise,
-        DeferMadvise,
-        Always,
-        Unknown,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl ThpDefrag {
-        /// Whether `madvise(MADV_HUGEPAGE)` may trigger synchronous direct
-        /// reclaim / compaction on page fault under this policy.
-        pub(super) fn blocks_on_madvise(self) -> bool {
-            !matches!(self, Self::Never | Self::Defer)
-        }
-    }
-
-    /// Parse the active `[token]` from `/sys/kernel/mm/transparent_hugepage/defrag`.
-    #[cfg(target_os = "linux")]
-    pub(super) fn parse_thp_defrag(content: &str) -> ThpDefrag {
-        let active = content
-            .split_whitespace()
-            .find_map(|tok| tok.strip_prefix('[').and_then(|s| s.strip_suffix(']')));
-        match active {
-            Some("never") => ThpDefrag::Never,
-            Some("defer") => ThpDefrag::Defer,
-            Some("madvise") => ThpDefrag::Madvise,
-            Some("defer+madvise") => ThpDefrag::DeferMadvise,
-            Some("always") => ThpDefrag::Always,
-            _ => ThpDefrag::Unknown,
-        }
-    }
-
     /// Read `/sys/kernel/mm/transparent_hugepage/defrag` once per process.
     #[cfg(target_os = "linux")]
-    pub(super) fn thp_defrag() -> ThpDefrag {
-        static DEFRAG: std::sync::OnceLock<ThpDefrag> = std::sync::OnceLock::new();
+    pub(super) fn thp_defrag() -> super::ThpDefrag {
+        static DEFRAG: std::sync::OnceLock<super::ThpDefrag> = std::sync::OnceLock::new();
         *DEFRAG.get_or_init(|| match std::fs::read_to_string(THP_DEFRAG) {
-            Ok(content) => parse_thp_defrag(&content),
-            Err(_) => ThpDefrag::Unknown,
+            Ok(content) => super::ThpDefrag::parse(&content),
+            Err(_) => super::ThpDefrag::Unknown,
         })
     }
 
@@ -586,6 +569,14 @@ mod host {
             0 => Ok(()),
             _ => Err(AllocationFailure::LargePagesRefused),
         }
+    }
+
+    /// Opt out of transparent huge pages for `[start, start + bytes)` so a
+    /// global `defrag = always` kernel policy never triggers synchronous
+    /// compaction during `fault_in`. Best-effort: kernels without THP ignore it.
+    #[cfg(target_os = "linux")]
+    pub(super) unsafe fn avoid_large(start: *mut u8, bytes: usize) {
+        let _ = unsafe { libc::madvise(start.cast(), bytes, libc::MADV_NOHUGEPAGE) };
     }
 
     /// Measure large-page and small-page backing for `ranges` — sorted,
@@ -932,35 +923,30 @@ AnonHugePages:      8192 kB
         drop(b);
         assert_eq!(large_page_backing(), before, "dropping all blocks returns backing to baseline");
     }
+}
+
+#[cfg(test)]
+mod thp_policy_tests {
+    use super::{HugePageAdvice, ThpDefrag};
 
     #[test]
-    fn thp_defrag_parser_recognizes_active_token_and_blocking_policy() {
-        use host::{ThpDefrag, parse_thp_defrag};
-        assert_eq!(parse_thp_defrag("[madvise]"), ThpDefrag::Madvise);
-        assert!(parse_thp_defrag("[madvise]").blocks_on_madvise());
+    fn thp_defrag_parser_maps_every_policy_to_non_blocking_advice() {
+        assert_eq!(ThpDefrag::parse("[never]"), ThpDefrag::Never);
+        assert_eq!(ThpDefrag::Never.advice(), HugePageAdvice::Prefer);
 
-        assert_eq!(parse_thp_defrag("always defer defer+madvise [madvise] never\n"), ThpDefrag::Madvise);
-        assert!(parse_thp_defrag("always defer defer+madvise [madvise] never\n").blocks_on_madvise());
+        assert_eq!(ThpDefrag::parse("[defer]"), ThpDefrag::Defer);
+        assert_eq!(ThpDefrag::Defer.advice(), HugePageAdvice::Prefer);
 
-        assert_eq!(parse_thp_defrag("[never]"), ThpDefrag::Never);
-        assert!(!parse_thp_defrag("[never]").blocks_on_madvise());
+        assert_eq!(ThpDefrag::parse("always defer defer+madvise [madvise] never\n"), ThpDefrag::Madvise);
+        assert_eq!(ThpDefrag::Madvise.advice(), HugePageAdvice::Default);
 
-        assert_eq!(parse_thp_defrag("[defer]"), ThpDefrag::Defer);
-        assert!(!parse_thp_defrag("[defer]").blocks_on_madvise());
+        assert_eq!(ThpDefrag::parse("always defer [defer+madvise] madvise never"), ThpDefrag::DeferMadvise);
+        assert_eq!(ThpDefrag::DeferMadvise.advice(), HugePageAdvice::Default);
 
-        assert_eq!(parse_thp_defrag("always defer [defer+madvise] madvise never"), ThpDefrag::DeferMadvise);
-        assert!(parse_thp_defrag("always defer [defer+madvise] madvise never").blocks_on_madvise());
+        assert_eq!(ThpDefrag::parse("[always] defer defer+madvise madvise never"), ThpDefrag::Always);
+        assert_eq!(ThpDefrag::Always.advice(), HugePageAdvice::Avoid);
 
-        assert_eq!(parse_thp_defrag("[always] defer defer+madvise madvise never"), ThpDefrag::Always);
-        assert!(parse_thp_defrag("[always] defer defer+madvise madvise never").blocks_on_madvise());
-
-        assert_eq!(parse_thp_defrag(""), ThpDefrag::Unknown);
-        assert!(parse_thp_defrag("").blocks_on_madvise());
-
-        // Fault throughput stall threshold: 500 MB/s.
-        let block = 64usize << 20; // 67_108_864 bytes -> 500 MB/s threshold is ~134.2 ms
-        assert!(!fault_stalled(block, std::time::Duration::from_millis(16))); // ~4 GB/s
-        assert!(!fault_stalled(block, std::time::Duration::ZERO));
-        assert!(fault_stalled(block, std::time::Duration::from_millis(200))); // ~335 MB/s
+        assert_eq!(ThpDefrag::parse(""), ThpDefrag::Unknown);
+        assert_eq!(ThpDefrag::Unknown.advice(), HugePageAdvice::Default);
     }
 }

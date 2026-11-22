@@ -159,11 +159,10 @@ impl ServedBank {
         self.bank.plan.host_slots > 0 && self.bank.host_tier().is_some()
     }
 
-    /// Start background backing of the linked host tier after domain
-    /// allocation, clamped to what the fresh post-domain `HostRam` reading
-    /// actually admits. Any slots trimmed below `plan.host_slots` are shed
-    /// from `BankCache` immediately so no phantom `CacheKind::Bank` bytes
-    /// remain in the ledger.
+    /// Start background backing of the linked host tier after warm-up and load
+    /// pricing, clamped to what the fresh `HostRam` reading actually admits.
+    /// Any slots trimmed below `plan.host_slots` are shed from `BankCache`
+    /// immediately so no phantom `CacheKind::Bank` bytes remain in the ledger.
     pub(crate) fn begin_host_backing(&self, ledgers: &DeviceLedgers) -> Result<(), DomainError> {
         if !self.has_planned_host_tier() {
             return Ok(());

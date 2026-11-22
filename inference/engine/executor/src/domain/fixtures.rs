@@ -527,6 +527,8 @@ pub fn fixture_over(
             pressed,
             clock,
             reading,
+            has_host_tier: std::cell::Cell::new(false),
+            host_backing_started: std::cell::Cell::new(0),
         },
         recorded,
         request_slot,
@@ -1113,6 +1115,10 @@ pub struct TestFamily {
     clock: TestClock,
     /// The reader its domain samples memory through.
     reading: Rc<dyn StatusReading>,
+    /// Whether `has_planned_host_tier` reports a host tier awaiting backing.
+    pub(crate) has_host_tier: std::cell::Cell<bool>,
+    /// How many times `begin_host_backing` was invoked on this family.
+    pub(crate) host_backing_started: std::cell::Cell<usize>,
 }
 
 /// A fake elastic expert bank (`ElasticBank`): a slab store of a slot a
@@ -1846,6 +1852,15 @@ impl ProgramFamily for TestFamily {
 
     fn expert_bank(&self) -> Option<&dyn ElasticBank> {
         self.bank.as_ref().map(|bank| bank as &dyn ElasticBank)
+    }
+
+    fn has_planned_host_tier(&self) -> bool {
+        self.has_host_tier.get()
+    }
+
+    fn begin_host_backing(&self, _ledgers: &crate::memory::ledger::DeviceLedgers) -> Result<(), super::DomainError> {
+        self.host_backing_started.set(self.host_backing_started.get() + 1);
+        Ok(())
     }
 
     fn hold_group(

@@ -95,6 +95,27 @@ impl Phase {
     }
 }
 
+/// Capture the owners' report and write the thread stacks in the order each
+/// trigger requires:
+/// - On a fatal signal (`is_fault == true`), capture `report()` *before*
+///   unwinding all threads' stacks (which can take seconds across hundreds of
+///   threads while other threads keep running), so `report on demand` reflects
+///   the exact state at the moment of the fault.
+/// - On an on-demand `SIGUSR1` (`is_fault == false`, used for hangs where a
+///   stuck thread may hold the allocator lock), write the allocation-free
+///   stacks first and capture `report()` after.
+#[cfg(any(unix, test))]
+fn capture_and_write_stacks(is_fault: bool, write_stacks: impl FnOnce(), capture_report: impl FnOnce() -> String) -> String {
+    if is_fault {
+        let owners = capture_report();
+        write_stacks();
+        owners
+    } else {
+        write_stacks();
+        capture_report()
+    }
+}
+
 /// Every owner's report, in registration order.
 pub(crate) fn report() -> String {
     let owners = owners().lock().expect("the diagnostics' owners").iter().map(|owner| (owner.name, owner.report.clone())).collect::<Vec<_>>();
@@ -137,8 +158,12 @@ pub fn install() {
                     FAULTED => (2, Some(stacks::Fault::load())),
                     other => unreachable!("the diagnostics pipe carries {ASKED} or {FAULTED}, not {other}"),
                 };
-                stacks::write(out, fault.as_ref(), &mut scratch);
-                write_all(out, format!("{}\n", report()).as_bytes());
+                let owners = capture_and_write_stacks(
+                    fault.is_some(),
+                    || stacks::write(out, fault.as_ref(), &mut scratch),
+                    report,
+                );
+                write_all(out, format!("{owners}\n").as_bytes());
                 // A fault report closes with why the process ends, where a
                 // panic ended it: a reader of its last lines (the service's
                 // tail of a worker's stderr) learns the panic.
@@ -338,5 +363,36 @@ mod tests {
         drop((registered, phase));
         let text = report();
         assert!(!text.contains("owner-under-test") && !text.contains("phase-under-test"), "{text}");
+    }
+
+    /// On a fatal signal, the owners' report is captured *before* the
+    /// multi-second thread stack unwind so it reflects state at the fault
+    /// rather than state after other threads kept running; on SIGUSR1,
+    /// allocation-free stacks are written first.
+    #[test]
+    fn fatal_signal_captures_report_before_stack_unwind() {
+        let order = std::cell::RefCell::new(Vec::new());
+        let fault_report = capture_and_write_stacks(
+            true,
+            || order.borrow_mut().push("stacks"),
+            || {
+                order.borrow_mut().push("report");
+                "at-fault".into()
+            },
+        );
+        assert_eq!(fault_report, "at-fault");
+        assert_eq!(*order.borrow(), vec!["report", "stacks"]);
+
+        order.borrow_mut().clear();
+        let asked_report = capture_and_write_stacks(
+            false,
+            || order.borrow_mut().push("stacks"),
+            || {
+                order.borrow_mut().push("report");
+                "on-demand".into()
+            },
+        );
+        assert_eq!(asked_report, "on-demand");
+        assert_eq!(*order.borrow(), vec!["stacks", "report"]);
     }
 }

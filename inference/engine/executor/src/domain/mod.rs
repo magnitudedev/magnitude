@@ -1146,6 +1146,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
+    /// Start background backing of any planned host tier, clamped to live
+    /// post-warm-up `HostRam` room. Called after warm-up and load pricing so
+    /// tens of gigabytes of pinned host-tier allocation neither stall warm-up
+    /// nor contaminate pricing measurements.
+    pub fn begin_host_backing(&self) -> Result<(), DomainError> {
+        if !self.family.has_planned_host_tier() {
+            return Ok(());
+        }
+        self.memory.borrow_mut().settled_read(self.resources.ledgers());
+        self.family.begin_host_backing(self.resources.ledgers())
+    }
+
     /// The load's costs; none before [`Self::measure_load`], or where
     /// nothing keeps them.
     fn load_costs(&self) -> Option<&LoadCosts> {
@@ -3145,14 +3157,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // thread stands beside it, they are judged by the last reading with
         // every claim since counted; the owner's first step owes a reading
         // and takes it.
-        if family.has_planned_host_tier() {
-            // Take a settled post-domain reading before starting host-tier
-            // backing so post-domain uncharged host RSS (bound graphs, driver
-            // state, heap) is reflected in `HostRam` and the host-tier target
-            // is clamped to live host room.
-            memory.settled_read(resources.ledgers());
-            family.begin_host_backing(resources.ledgers())?;
-        } else if memory.read_at_event(resources.ledgers()).is_none() {
+        if memory.read_at_event(resources.ledgers()).is_none() {
             tracing::debug!(target: MEMORY_TRACE, "the domain's opening memory read deferred: a change of ours stood beside the sample");
         }
         // The arena: the load's graph scratch and the target graphs' bound
@@ -3265,5 +3270,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Host timing of the most recently finished target step.
     pub fn target_timing(&self) -> Option<TargetHostTiming> {
         self.target_timing
+    }
+}
+
+#[cfg(test)]
+mod host_backing_deferral_tests {
+    use super::fixtures;
+
+    #[test]
+    fn host_tier_backing_starts_only_when_requested_after_domain_open() {
+        let (domain, _bindings) = fixtures::fixture(None);
+        domain.family.has_host_tier.set(true);
+        // Domain construction never launches background host-tier backing.
+        assert_eq!(domain.family.host_backing_started.get(), 0);
+        // Explicit post-warm-up/pricing invocation starts it.
+        domain.begin_host_backing().expect("host tier backing starts cleanly");
+        assert_eq!(domain.family.host_backing_started.get(), 1);
     }
 }
