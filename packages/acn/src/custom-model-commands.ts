@@ -768,10 +768,10 @@ export const CustomModelCommandsLive: Layer.Layer<
         : Effect.void,
   { discard: true })
 
-  /** Removes a model added from Hugging Face as if it had never been added: its downloads, Magnitude's copy, and its record. */
+  /** Removes a Magnitude-managed custom model (added or retired from the catalog): its downloads, Magnitude's copy, and its record. */
   const removeAdded = (
     modelId: CustomFormModelId,
-    addedId: HuggingFaceFormModelId,
+    addedId: Option.Option<HuggingFaceFormModelId>,
     related: readonly RelatedDownload[],
   ) => Effect.gen(function* () {
     yield* endDownloads(related)
@@ -782,7 +782,10 @@ export const CustomModelCommandsLive: Layer.Layer<
     )
     yield* customModels.modify((current) => Effect.succeed([undefined, {
       ...withDrafterChoice(current, modelId, { _tag: "Auto" }),
-      added: withoutKey(current.added, addedId),
+      added: Option.match(addedId, {
+        onNone: () => current.added,
+        onSome: (id) => withoutKey(current.added, id),
+      }),
     }] as const))
     yield* settle
     yield* pruneDrafters
@@ -966,8 +969,11 @@ export const CustomModelCommandsLive: Layer.Layer<
           return yield* catalogHideRefusal(modelId)
         }
       } else {
-        if (Option.isSome(addedModel(config, modelId))) return yield* managedHideRefusal(modelId)
-        if (Option.isNone(yield* rowFor(modelId))) return yield* notFound(modelId)
+        const row = yield* rowFor(modelId)
+        if (Option.isSome(addedModel(config, modelId)) || Option.exists(row, ({ origin }) => origin._tag === "Added")) {
+          return yield* managedHideRefusal(modelId)
+        }
+        if (Option.isNone(row)) return yield* notFound(modelId)
       }
       yield* customModels.modify((current) => Effect.succeed([undefined, isHidden(current, modelId)
         ? current
@@ -1016,8 +1022,10 @@ export const CustomModelCommandsLive: Layer.Layer<
     remove: (modelId) => Effect.gen(function* () {
       const { config, related } = yield* modelAcquisition(modelId)
       const added = addedModel(config, modelId)
-      if (Option.isNone(added)) {
-        if (Option.isNone(yield* rowFor(modelId))) return yield* notFound(modelId)
+      const row = yield* rowFor(modelId)
+      const managed = Option.isSome(added) || Option.exists(row, ({ origin }) => origin._tag === "Added")
+      if (!managed) {
+        if (Option.isNone(row)) return yield* notFound(modelId)
         yield* endDownloads(related)
         yield* customModels.modify((current) => Effect.succeed([undefined, isHidden(current, modelId)
           ? current
@@ -1025,7 +1033,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         yield* settle
         return {}
       }
-      return yield* removeAdded(modelId, added.value[0], related)
+      return yield* removeAdded(modelId, Option.map(added, ([id]) => id), related)
     }),
 
     sync: (modelId) => Effect.gen(function* () {
@@ -1067,7 +1075,7 @@ export const CustomModelCommandsLive: Layer.Layer<
       const added = addedModel(config, modelId)
       const installed = Option.exists(yield* rowFor(modelId), localModelIsInstalled)
       if (Option.isSome(added) && !installed && Option.exists(currentDownload(related, "Target"), downloadIsActive)) {
-        return yield* removeAdded(modelId, added.value[0], related)
+        return yield* removeAdded(modelId, Option.some(added.value[0]), related)
       }
       yield* Effect.forEach(related.filter(({ download }) => downloadIsActive(download)), ({ download }) =>
         downloads.cancel(download.id), { discard: true }).pipe(Effect.mapError(commandFailed("cancel")))

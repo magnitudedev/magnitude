@@ -135,11 +135,62 @@ impl ModelDomainResolver {
     }
 
     /// The model a request names: a custom ID a catalog model lists as an alias (the ID a copy of
-    /// its exact target had as a found model before it was attributed) is that catalog model;
-    /// every other ID is itself.
+    /// its exact target had as a found model before it was attributed) is that catalog model; a
+    /// retired catalog ID whose installed target package is still in Magnitude's store resolves to
+    /// that target's custom ID; every other ID is itself.
     pub fn canonical_model_id(&self, model_id: ModelId) -> Result<ModelId, InventoryError> {
-        if matches!(model_id.parsed(), ParsedModelId::Catalog { .. }) {
-            return Ok(model_id);
+        if let ParsedModelId::Catalog {
+            base_id,
+            variant_id,
+        } = model_id.parsed()
+        {
+            if self
+                .catalog
+                .models
+                .iter()
+                .any(|model| model.model_id == base_id && model.variant_id == variant_id)
+            {
+                return Ok(model_id);
+            }
+            let retired_packages = self
+                .inventory
+                .catalog_affiliations
+                .read()
+                .map_err(|_| {
+                    InventoryError::Internal("catalog affiliation lock poisoned".to_owned())
+                })?
+                .entries()
+                .filter(|affiliation| {
+                    affiliation.role == CatalogPackageRole::Target
+                        && affiliation.model_id == base_id
+                        && affiliation.variant_id == variant_id
+                })
+                .map(|affiliation| affiliation.package_id.clone())
+                .collect::<BTreeSet<_>>();
+            if retired_packages.is_empty() {
+                return Ok(model_id);
+            }
+            let records = self
+                .inventory
+                .installed_packages
+                .read()
+                .map_err(|_| {
+                    InventoryError::Internal("installed package lock poisoned".to_owned())
+                })?;
+            let custom_ids = records
+                .records
+                .values()
+                .filter(|record| {
+                    record.installed.origin == ModelPackageInstallationOrigin::Magnitude
+                        && retired_packages.contains(&record.installed.package.id)
+                })
+                .filter_map(InstalledPackageRecord::model_id)
+                .collect::<BTreeSet<_>>();
+            let mut custom_ids = custom_ids.into_iter();
+            return Ok(match (custom_ids.next(), custom_ids.next()) {
+                (Some(custom_id), None) => custom_id,
+                _ => model_id,
+            });
         }
         let records = self
             .inventory

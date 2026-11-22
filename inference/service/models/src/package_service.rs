@@ -844,21 +844,30 @@ impl ManagedModelStore {
             };
         }
 
+        let retired_catalog_target = !affiliated_keys.is_empty();
+        let retired_or_failure = |code: &str, message: String| {
+            if retired_catalog_target {
+                InstalledCatalogAttribution::NotCatalogTarget
+            } else {
+                failure(code, message)
+            }
+        };
+
         let ModelPackageSource::HuggingFace { .. } = &package.source else {
-            return failure(
+            return retired_or_failure(
                 "catalog_target_source_missing",
                 "managed catalog model has no Hugging Face target repository".to_owned(),
             );
         };
         let Some(quality) = package.properties.intrinsic_quality_id.as_deref() else {
-            return failure(
+            return retired_or_failure(
                 "catalog_target_identity_missing",
                 "managed catalog model has no intrinsic GGUF quality identity".to_owned(),
             );
         };
 
         let Some(intrinsic_model_id) = package.properties.intrinsic_model_id.as_deref() else {
-            return failure(
+            return retired_or_failure(
                 "catalog_target_identity_missing",
                 "managed catalog model has no intrinsic GGUF model identity".to_owned(),
             );
@@ -892,7 +901,7 @@ impl ManagedModelStore {
                 ),
             )
         } else {
-            failure(
+            retired_or_failure(
                 "catalog_target_unrecognized",
                 format!(
                     "intrinsic GGUF identity ({intrinsic_model_id}, {quality}) is not in the catalog"
@@ -960,6 +969,35 @@ impl ManagedModelStore {
                 return;
             };
             affiliations.forget_package(&package.id)
+        };
+        if changed {
+            self.persist_catalog_affiliations();
+        }
+    }
+
+    fn forget_uninstalled_catalog_packages(&self, package_ids: &[ModelPackageId]) {
+        let Ok(remaining) = self.installed_packages.read().map(|installed| {
+            installed
+                .records
+                .values()
+                .map(|record| record.installed.package.id.clone())
+                .collect::<BTreeSet<_>>()
+        }) else {
+            return;
+        };
+        let changed = {
+            let Ok(mut affiliations) = self.catalog_affiliations.write() else {
+                tracing::warn!(
+                    "catalog affiliation lock poisoned while forgetting removed packages"
+                );
+                return;
+            };
+            package_ids
+                .iter()
+                .filter(|package_id| !remaining.contains(*package_id))
+                .fold(false, |changed, package_id| {
+                    affiliations.forget_package(package_id) || changed
+                })
         };
         if changed {
             self.persist_catalog_affiliations();
@@ -1589,6 +1627,7 @@ impl ManagedModelStore {
             .inspect_err(|error| {
                 tracing::warn!(?package_ids, %error, "installed model package removal failed");
             })?;
+        self.forget_uninstalled_catalog_packages(package_ids);
         tracing::info!(?package_ids, freed_bytes, "removed installed model packages");
         Ok(freed_bytes)
     }

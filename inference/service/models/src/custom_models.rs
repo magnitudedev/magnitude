@@ -302,11 +302,12 @@ impl ModelDomainResolver {
             .read()
             .map_err(|_| InventoryError::Internal("enrichment lock poisoned".to_owned()))?
             .clone();
+        let catalog_drafters = self.catalog_drafter_revisions();
+        let retired_catalog_targets = self.retired_catalog_target_packages();
         let records =
             self.inventory.installed_packages.read().map_err(|_| {
                 InventoryError::Internal("installed package lock poisoned".to_owned())
             })?;
-        let catalog_drafters = self.catalog_drafter_revisions();
         let mut projection = project(
             &records,
             &configuration,
@@ -314,6 +315,7 @@ impl ModelDomainResolver {
             enrichment.as_ref(),
             &self.inventory,
             &catalog_drafters,
+            &retired_catalog_targets,
         );
         self.upstream.annotate(
             projection
@@ -347,6 +349,28 @@ impl ModelDomainResolver {
             }
         }
         revisions
+    }
+
+    /// Every Magnitude-installed target package affiliated with a catalog model that is no longer
+    /// in the current release catalog.
+    fn retired_catalog_target_packages(&self) -> BTreeSet<ModelPackageId> {
+        let current = self
+            .catalog
+            .models
+            .iter()
+            .map(|definition| (&definition.model_id, &definition.variant_id))
+            .collect::<BTreeSet<_>>();
+        let Ok(affiliations) = self.inventory.catalog_affiliations.read() else {
+            return BTreeSet::new();
+        };
+        affiliations
+            .entries()
+            .filter(|affiliation| {
+                affiliation.role == CatalogPackageRole::Target
+                    && !current.contains(&(&affiliation.model_id, &affiliation.variant_id))
+            })
+            .map(|affiliation| affiliation.package_id.clone())
+            .collect()
     }
 
     /// The separate drafter packages custom models use (the drafter each serves with, or downloads
@@ -897,6 +921,33 @@ impl<'a> CopyGroup<'a> {
             })
         })
     }
+
+    /// The Hugging Face repository and commit of a retired catalog model's Magnitude-stored copy,
+    /// when no active `AddedModel` declaration pins this `model_id`.
+    fn retired_catalog_target(
+        &self,
+        model_id: &ModelId,
+        configuration: &LocalModelsConfiguration,
+        retired_catalog_targets: &BTreeSet<ModelPackageId>,
+    ) -> Option<(HuggingFaceRepositoryId, String)> {
+        if configuration
+            .added
+            .iter()
+            .any(|added| added.model_id() == *model_id)
+        {
+            return None;
+        }
+        self.occurrences.iter().find_map(|occurrence| {
+            if occurrence.origin() != ModelPackageInstallationOrigin::Magnitude
+                || !retired_catalog_targets.contains(&occurrence.record.installed.package.id)
+            {
+                return None;
+            }
+            let hub = occurrence.hub.as_ref()?;
+            let repository = HuggingFaceRepositoryId::new(hub.file.repository.clone()).ok()?;
+            Some((repository, hub.commit.clone()))
+        })
+    }
 }
 
 fn custom_profile(installed: &InstalledModelPackage) -> ServingProfile {
@@ -934,6 +985,7 @@ fn project(
     enrichment: &dyn CustomModelEnrichment,
     inventory: &ManagedModelStore,
     catalog_drafters: &CatalogDrafterRevisions,
+    retired_catalog_targets: &BTreeSet<ModelPackageId>,
 ) -> LocalProjection {
     let managed_root = inventory.config.root.as_path();
     let architectures = &inventory.config.architectures;
@@ -1025,6 +1077,7 @@ fn project(
         architectures,
         catalog,
         catalog_drafters,
+        retired_catalog_targets,
         enrichment,
         cache: inventory.derived_cache(),
         occurrences: &occurrences,
@@ -1126,6 +1179,7 @@ struct ModelContext<'a> {
     architectures: &'a RecognizedArchitectures,
     catalog: &'a RecommendableModelCatalog,
     catalog_drafters: &'a CatalogDrafterRevisions,
+    retired_catalog_targets: &'a BTreeSet<ModelPackageId>,
     enrichment: &'a dyn CustomModelEnrichment,
     cache: &'a crate::ModelCache,
     occurrences: &'a [Occurrence<'a>],
@@ -1140,10 +1194,11 @@ impl ModelContext<'_> {
         group: &CopyGroup<'_>,
     ) -> Option<ProjectedModel> {
         let ModelContext {
-            configuration: _,
+            configuration,
             architectures,
             catalog,
             catalog_drafters,
+            retired_catalog_targets,
             enrichment,
             cache,
             occurrences,
@@ -1155,13 +1210,20 @@ impl ModelContext<'_> {
                 repository: added.repository.clone(),
                 commit: added.revision.clone(),
             },
-            // Material only in the managed store that no added model pins is no longer a model
-            // anyone added; it is not published.
-            None => CustomModelOrigin::Found {
-                source: group
-                    .occurrences
-                    .iter()
-                    .find_map(|occurrence| occurrence.found_source())?,
+            None => match group.retired_catalog_target(
+                &model_id,
+                configuration,
+                retired_catalog_targets,
+            ) {
+                Some((repository, commit)) => CustomModelOrigin::Added { repository, commit },
+                // Material only in the managed store that no added model pins and no retired
+                // catalog affiliation owns is no longer a model anyone added; it is not published.
+                None => CustomModelOrigin::Found {
+                    source: group
+                        .occurrences
+                        .iter()
+                        .find_map(|occurrence| occurrence.found_source())?,
+                },
             },
         };
         let installed = &representative.record.installed;
@@ -9402,5 +9464,217 @@ mod tests {
         }
         lister.join().unwrap();
         publisher.join().unwrap();
+    }
+
+    /// A model installed from an earlier release's catalog (recorded in `catalog-affiliations.json`)
+    /// whose catalog entry is removed in a later release must remain visible as a custom model,
+    /// servable under both its `hf:` ID and its retired catalog ID, and removable to reclaim disk
+    /// space.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_catalog_model_remains_listed_servable_and_removable() {
+        use magnitude_service_contracts::models::{
+            CatalogBaseId, CatalogModelState, CatalogVariantId, InstalledModelPackages as _,
+        };
+
+        let fixture = Fixture::new().await;
+        let repository = "openbmb/MiniCPM5-1B-GGUF";
+        let commit = "3".repeat(40);
+        let file = "MiniCPM5-1B-Q4_K_M.gguf";
+        let snapshot = publish_managed(
+            &fixture.store,
+            repository,
+            &commit,
+            &[(file, model_bytes("MiniCPM5-1B"))],
+        );
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let target = fixture.inventory().list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        let mut definition = catalog_definition(target);
+        definition.model_id = CatalogBaseId::new("minicpm5-1b").unwrap();
+        definition.variant_id = CatalogVariantId::new("gguf:q4").unwrap();
+        let retired_catalog_id = catalog_id(&definition);
+        let custom_id: ModelId = format!("hf:{repository}/{file}").parse().unwrap();
+
+        // Install/observe under the release catalog that includes the model, persisting its
+        // affiliation in `catalog-affiliations.json`.
+        let fixture = fixture.restart(vec![definition]).await;
+        let before = fixture.apply(LocalModelsConfiguration::default()).await;
+        assert!(before.models.is_empty(), "current catalog model is listed in catalog, not custom");
+        assert!(matches!(
+            fixture.resolver.catalog_snapshot().unwrap().models[0].local_state,
+            CatalogModelState::Installed { .. }
+        ));
+
+        // Upgrade to a release catalog that no longer lists `minicpm5-1b`.
+        let fixture = fixture.restart(Vec::new()).await;
+        let listed = fixture.apply(LocalModelsConfiguration::default()).await;
+        assert_eq!(ids(&listed.models), [custom_id.to_string()]);
+        let model = &listed.models[0];
+        assert_eq!(
+            model.origin,
+            CustomModelOrigin::Added {
+                repository: HuggingFaceRepositoryId::new(repository).unwrap(),
+                commit: commit.clone(),
+            }
+        );
+        assert!(matches!(
+            &model.state,
+            CustomModelState::Ready {
+                installation: ResolvedModelInstallation::Resolved {
+                    ownership: ModelInstallationOwnership::Magnitude,
+                    ..
+                },
+                catalog_attribution: CustomModelCatalogAttribution::NotInCatalog,
+                ..
+            }
+        ));
+        assert!(fixture.resolver.serving_configuration(&custom_id).is_ok());
+        assert_eq!(
+            fixture
+                .resolver
+                .canonical_model_id(retired_catalog_id.clone())
+                .unwrap(),
+            custom_id
+        );
+        assert!(
+            fixture
+                .resolver
+                .serving_configuration(
+                    &fixture
+                        .resolver
+                        .canonical_model_id(retired_catalog_id.clone())
+                        .unwrap()
+                )
+                .is_ok()
+        );
+
+        let removal = fixture.local.remove_local(&custom_id).await.unwrap();
+        assert!(removal.removed);
+        assert!(removal.freed_bytes > 0);
+        assert!(!snapshot.join(file).exists());
+        let after = fixture.local.refresh_local().await.unwrap();
+        assert!(after.models.is_empty());
+        assert_eq!(
+            fixture
+                .resolver
+                .canonical_model_id(retired_catalog_id.clone())
+                .unwrap(),
+            retired_catalog_id
+        );
+        assert_eq!(
+            crate::catalog_affiliations::CatalogAffiliations::load(&fixture.store)
+                .entries()
+                .count(),
+            0,
+            "removing the retired catalog package forgets its affiliation"
+        );
+    }
+
+    /// Even when a retired catalog model's architecture is no longer supported by the engine, it
+    /// stays visible under local models with `CustomModelOrigin::Added` so users can remove it
+    /// instead of silently accumulating un-deletable gigabytes on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_catalog_model_with_unsupported_architecture_stays_visible_and_removable() {
+        use magnitude_service_contracts::models::{
+            CatalogBaseId, CatalogVariantId, InstalledModelPackages as _,
+        };
+
+        let fixture = Fixture::new().await;
+        let repository = "owner/RetiredArch-GGUF";
+        let commit = "4".repeat(40);
+        let file = "RetiredArch-Q4_K_M.gguf";
+        let bytes = gguf_bytes(
+            &[
+                ("general.architecture", Meta::Str("retired_arch")),
+                ("general.name", Meta::Str("RetiredArch")),
+            ],
+            &["token_embd.weight", "blk.0.attn_q.weight"],
+        );
+        let snapshot = publish_managed(&fixture.store, repository, &commit, &[(file, bytes)]);
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let target = fixture.inventory().list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        let mut definition = catalog_definition(target);
+        definition.model_id = CatalogBaseId::new("retired-arch").unwrap();
+        definition.variant_id = CatalogVariantId::new("gguf:q4").unwrap();
+        let custom_id: ModelId = format!("hf:{repository}/{file}").parse().unwrap();
+
+        let fixture = fixture.restart(vec![definition]).await;
+        fixture.apply(LocalModelsConfiguration::default()).await;
+
+        let fixture = fixture.restart(Vec::new()).await;
+        let listed = fixture.apply(LocalModelsConfiguration::default()).await;
+        assert_eq!(ids(&listed.models), [custom_id.to_string()]);
+        assert_eq!(
+            listed.models[0].origin,
+            CustomModelOrigin::Added {
+                repository: HuggingFaceRepositoryId::new(repository).unwrap(),
+                commit,
+            }
+        );
+
+        let removal = fixture.local.remove_local(&custom_id).await.unwrap();
+        assert!(removal.removed && removal.freed_bytes > 0);
+        assert!(!snapshot.join(file).exists());
+        assert!(fixture.local.refresh_local().await.unwrap().models.is_empty());
+    }
+
+    /// A retired catalog model whose bytes also exist in the user's Hugging Face cache has Mixed
+    /// ownership: removing it deletes only Magnitude's copy and leaves the Hugging Face cache file
+    /// intact as a found model.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_catalog_model_also_in_hf_cache_has_mixed_ownership_and_keeps_external_copy_on_remove() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+
+        let fixture = Fixture::new().await;
+        let repository = "openbmb/MiniCPM5-1B-GGUF";
+        let commit = "5".repeat(40);
+        let file = "MiniCPM5-1B-Q4_K_M.gguf";
+        let bytes = model_bytes("MiniCPM5-1B");
+        let managed = publish_managed(&fixture.store, repository, &commit, &[(file, bytes.clone())]);
+        let cache = fixture.root.join("hf");
+        let external = publish_hf_cache(&cache, repository, &commit, &[(file, bytes)]);
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let target = fixture.inventory().list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        let definition = catalog_definition(target);
+        let custom_id: ModelId = format!("hf:{repository}/{file}").parse().unwrap();
+
+        let fixture = fixture.restart(vec![definition]).await;
+        fixture
+            .apply(roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]))
+            .await;
+
+        let fixture = fixture.restart(Vec::new()).await;
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]))
+            .await;
+        assert_eq!(ids(&listed.models), [custom_id.to_string()]);
+        assert!(matches!(
+            &listed.models[0].state,
+            CustomModelState::Ready {
+                installation: ResolvedModelInstallation::Resolved {
+                    ownership: ModelInstallationOwnership::Mixed,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let removal = fixture.local.remove_local(&custom_id).await.unwrap();
+        assert!(removal.removed && removal.freed_bytes > 0);
+        assert!(!managed.join(file).exists());
+        assert!(external.join(file).exists());
+        let after = fixture.local.refresh_local().await.unwrap();
+        assert_eq!(ids(&after.models), [custom_id.to_string()]);
+        assert_eq!(
+            after.models[0].origin,
+            CustomModelOrigin::Found {
+                source: FoundSource::HuggingFaceCache,
+            }
+        );
     }
 }

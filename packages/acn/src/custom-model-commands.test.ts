@@ -1066,6 +1066,32 @@ describe("removal by origin", () => {
     expect(config.hidden).toEqual([])
   })
 
+  it("removes files and refuses hide for a retired catalog model surfaced with Added origin outside config.added", async () => {
+    const retiredId = CustomFormModelIdSchema.make("hf:openbmb/MiniCPM5-1B-GGUF/MiniCPM5-1B-Q4_K_M.gguf")
+    const { run, recorded } = harness({
+      config: customModelsConfig({ added: {} }),
+      customModels: [nativeCustomModel({
+        modelId: retiredId,
+        origin: { _tag: "Added", repository: "openbmb/MiniCPM5-1B-GGUF", commit: "3d55fac8" },
+        files: [{ path: "/store/MiniCPM5-1B-Q4_K_M.gguf", sizeBytes: 688_065_920 }],
+        state: {
+          _tag: "Ready",
+          catalogAttribution: { _tag: "NotInCatalog" },
+          installation: { _tag: "Resolved", installedBytes: 688_065_920, ownership: "Magnitude", primaryPath: "/store/MiniCPM5-1B-Q4_K_M.gguf" },
+          model: readyModel,
+        },
+      })],
+    })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const hideRefusal = yield* commands.hide(retiredId).pipe(Effect.flip)
+      yield* commands.remove(retiredId)
+      return { hideRefusal, config: yield* models.get }
+    }))
+    expect(result.hideRefusal).toMatchObject({ code: "managed_model_not_hideable" })
+    expect(recorded.removedFiles).toEqual([retiredId])
+    expect(result.config.hidden).toEqual([])
+  })
+
   it("reports a removal ICN refuses for the moment, as one racing the model's load, as retryable", async () => {
     const { run } = harness({
       customModels: [nativeCustomModel({
