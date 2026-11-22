@@ -24,7 +24,7 @@ use super::Shared;
 use super::core::Core;
 use crate::assessment::TierCopyCosts;
 use crate::experts::copies::{BatchItem, Run, Signal, TransferPriority};
-use crate::experts::directory::{BankRecord, HostRecord, MissCurve, Point};
+use crate::experts::directory::{BankRecord, Directory, HostRecord, MissCurve, Point};
 use crate::experts::horizon::{Hold, Tokens};
 use crate::experts::interest::{Act, Admit, Class, Ledger, Read as ReadState, Scheduled};
 use crate::experts::map::stage_word;
@@ -45,14 +45,28 @@ pub(in crate::experts) struct Copier {
 }
 
 /// What a reserve is sized within ([`reserve`]): each layer's group and
-/// the most experts a decode step reads there (its experts, at most a
-/// step's choices), each group's capacity (`Directory::capacity`),
-/// and the steps in flight.
+/// the most distinct experts a generation step can read there (all of the
+/// layer's experts, since `decoded` counts both decode-form passes up to
+/// `VERIFY_ROWS` rows and wider grouped generation passes such as concurrent
+/// batches or multi-sequence verification), each group's capacity
+/// (`Directory::capacity`), and the steps in flight.
 struct Sizing {
     groups: Vec<usize>,
     reads: Vec<usize>,
     records: Vec<usize>,
     flight: usize,
+}
+
+impl Sizing {
+    /// Sizing bounds for `directory`'s streamed layers and groups.
+    fn of(directory: &Directory, flight: usize) -> Self {
+        Self {
+            groups: directory.layer_groups(),
+            reads: directory.layer_experts(),
+            records: directory.capacities(),
+            flight,
+        }
+    }
 }
 
 /// A candidate reserve of a group ([`reserve`]): its records, and what it
@@ -539,13 +553,7 @@ impl LinkMover {
 
     /// Size each group's promotion reserve by `decoded` ([`reserve`], [`decide`]).
     fn size(&mut self, core: &mut Core, decoded: &MissCurve) {
-        let choices = magnitude_kernels::constants::VERIFY_ROWS as usize * core.extents.selected;
-        let sizing = Sizing {
-            groups: core.directory.layer_groups(),
-            reads: core.directory.layer_experts().into_iter().map(|experts| experts.min(choices)).collect(),
-            records: core.directory.capacities(),
-            flight: core.extents.words.flight as usize,
-        };
+        let sizing = Sizing::of(&core.directory, core.extents.words.flight as usize);
         let drain = (self.drained.1 > 0).then(|| self.drained.0 as f64 / self.drained.1 as f64);
         let (now, spacing) = {
             let times = core.directory.time().lock();
@@ -717,7 +725,7 @@ fn record_bytes(core: &Core) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::{LinkAdmitting, MissCurve, Reserve, Sizing, decide, reserve};
-    use crate::experts::directory::LayerCurve;
+    use crate::experts::directory::{Directory, HostTier, LayerCurve, RoutedRead, Stack};
     use crate::experts::horizon::{Hold, Time, Tokens};
     use crate::experts::interest::{Act, Class, Ledger, Name, Read as ReadState, Source, Stands, When};
     use crate::experts::map::{decode_stage_word, stage_word};
@@ -794,6 +802,75 @@ mod tests {
     #[should_panic(expected = "beyond the 3 in flight")]
     fn a_drain_beyond_the_flight_panics() {
         reserve(&sizing(4), &curve(&[0, 0, 0, 0, 0, 0, 0, 0, 100]), Some(3.5));
+    }
+
+    /// A grouped generation pass wider than `VERIFY_ROWS` (e.g. concurrent
+    /// batched verification with `batch * verify_width > VERIFY_ROWS`, where a
+    /// 256-expert layer routes more than `VERIFY_ROWS * K = 64` distinct
+    /// experts in one step) feeds `Stack::decoded()` via `Telemetry::group_read`
+    /// and sizes the promotion reserve without panicking, up to all experts of
+    /// the layer.
+    #[test]
+    fn a_grouped_generation_step_wider_than_verify_rows_sizes_a_reserve() {
+        const EXPERTS: usize = 256;
+        const BANK_RECORDS: usize = 47;
+        const SELECTED: usize = 8;
+        let verify_cap = magnitude_kernels::constants::VERIFY_ROWS as usize * SELECTED;
+        assert!(verify_cap < EXPERTS, "test exercises layers wider than VERIFY_ROWS * K");
+
+        let directory = Directory::new(&[BANK_RECORDS], &[0], &[EXPERTS], HostTier::replay(vec![EXPERTS as u32]));
+        let sizing = Sizing::of(&directory, 3);
+        assert_eq!(sizing.reads, vec![EXPERTS], "reads bound is the layer's expert count, not VERIFY_ROWS * K");
+
+        // Two grouped generation steps reading 67 and 68 distinct experts
+        // (mean 67.5 > 64 = VERIFY_ROWS * K), matching a 16-row concurrent
+        // verify batch (`batch=4, verify_width=4`) on a 256-expert layer.
+        let mut stack = Stack::new(directory.ranking(), 1, EXPERTS);
+        stack.read(
+            &RoutedRead { sequence: 1, layer: 0, experts: (0..67).collect(), choices: 16 * SELECTED as u64 },
+            None,
+            None,
+        );
+        stack.read(
+            &RoutedRead { sequence: 2, layer: 0, experts: (0..68).collect(), choices: 16 * SELECTED as u64 },
+            None,
+            None,
+        );
+        let decoded = stack.decoded();
+        assert_eq!(decoded.steps, 2);
+        assert_eq!(decoded.layers[0].at(0).1, 135);
+        assert!((decoded.layers[0].at(0).1 as f64 / decoded.steps as f64) > verify_cap as f64);
+
+        let candidates = &reserve(&sizing, decoded, Some(1.0))[0];
+        assert_eq!(candidates.len(), BANK_RECORDS);
+        assert!(candidates.iter().all(|candidate| candidate.records < BANK_RECORDS && candidate.net.is_finite()));
+
+        // Every expert of the layer read in one grouped generation step is
+        // still within the layer's expert bound.
+        let mut saturated = Stack::alone(1, EXPERTS, BANK_RECORDS);
+        saturated.read(
+            &RoutedRead { sequence: 1, layer: 0, experts: (0..EXPERTS).collect(), choices: 64 * SELECTED as u64 },
+            None,
+            None,
+        );
+        let full = &reserve(&sizing, saturated.decoded(), Some(1.0))[0];
+        assert_eq!(full.len(), BANK_RECORDS);
+        assert!(full.iter().all(|candidate| candidate.records < BANK_RECORDS && candidate.net.is_finite()));
+    }
+
+    #[test]
+    #[should_panic(expected = "of a layer reading at most 256")]
+    fn a_rate_beyond_a_layers_experts_still_panics() {
+        const EXPERTS: usize = 256;
+        let directory = Directory::new(&[47], &[0], &[EXPERTS], HostTier::replay(vec![EXPERTS as u32]));
+        let sizing = Sizing::of(&directory, 3);
+        let mut misses = vec![0u64; EXPERTS + 1];
+        misses[EXPERTS] = EXPERTS as u64 + 1;
+        let impossible = MissCurve {
+            steps: 1,
+            layers: vec![LayerCurve { misses, requests: vec![0; EXPERTS + 1], choices: 0 }],
+        };
+        reserve(&sizing, &impossible, Some(1.0));
     }
 
     #[test]
