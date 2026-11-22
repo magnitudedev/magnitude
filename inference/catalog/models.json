@@ -23,7 +23,7 @@
     { "name": "LFM 2.5 and 3", "lab": "liquid", "architectures": ["lfm2", "lfm2moe", "lfm3"], "status": "supported" },
     { "name": "Nemotron 3 and 3.5", "lab": "nvidia", "architectures": ["nemotron_h_moe"], "status": "supported" },
     { "name": "Muse Glimmer", "lab": "meta", "architectures": ["muse-glimmer"], "status": "supported" },
-    { "name": "DeepSeek V4.1", "lab": "deepseek", "architectures": ["deepseek41"], "status": "comingSoon" },
+    { "name": "DeepSeek V4.1", "lab": "deepseek", "architectures": ["deepseek41"], "status": "supported" },
     { "name": "GLM-5.3 Flash", "lab": "zai", "architectures": ["glm5-next"], "status": "supported" }
   ],
   "models": [
