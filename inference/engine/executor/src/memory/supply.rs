@@ -84,7 +84,9 @@ const CALM_PROBE_MIN_BYTES: u64 = 256 * (1 << 20);
 /// Immediate free + clean cache threshold at or below which the host is
 /// considered scarce (relying on compression/swap), so sustained high-rate
 /// paging can signal real contention even before OS pressure escalates.
-fn scarcity_cushion(total: u64, unit: u64) -> u64 {
+/// Also serves as the OS/container reserve that unreclaimable pinned host
+/// allocations must leave untouched in immediate supply.
+pub(crate) fn scarcity_cushion(total: u64, unit: u64) -> u64 {
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
     if total == 0 {
@@ -281,6 +283,39 @@ impl Reading {
             Some(Paging { harm: None, pressure: None, .. }) => 0,
             _ => self.supply.clean_cache,
         }
+    }
+
+    /// Immediate non-swapping supply: free pages beyond the OS target plus
+    /// monitored clean file cache, never counting swap/compressor-backed
+    /// `cold_reclaimable` pages. Signed because `free_beyond_target` may be
+    /// negative when the OS has dipped below its target.
+    pub(crate) fn immediate_supply(&self) -> i64 {
+        let clean = i64::try_from(self.clean_cache_supply()).expect("a store's bytes fit i64");
+        self.supply.free_beyond_target.saturating_add(clean)
+    }
+
+    /// OS/container reserve that unreclaimable pinned host allocations must
+    /// leave untouched in immediate supply (`free_beyond_target + clean_cache`):
+    /// [`scarcity_cushion`] scaled to `total` and `unit` on host stores, and
+    /// `0` on non-host device stores.
+    pub(crate) fn pinned_reserve(&self, unit: u64) -> u64 {
+        match self.paging {
+            Some(_) => scarcity_cushion(self.total, unit),
+            None => 0,
+        }
+    }
+
+    /// Live pinned-host headroom in bytes beyond the OS/container reserve
+    /// ([`Self::pinned_reserve`]) and `guarantee` (others' rise):
+    /// `max(0, immediate_supply - pinned_reserve(unit) - guarantee)`.
+    ///
+    /// Single owner for sizing and gating unreclaimable pinned host
+    /// allocations (CUDA `cuMemHostAlloc`, linked host expert tiers across
+    /// all backends) directly from a host reading.
+    pub(crate) fn pinned_headroom(&self, guarantee: u64, unit: u64) -> u64 {
+        let reserve = i128::from(self.pinned_reserve(unit)).saturating_add(i128::from(guarantee));
+        let room = (i128::from(self.immediate_supply()) - reserve).max(0);
+        u64::try_from(room).expect("a store's bytes fit u64")
     }
 
     pub fn lag(&self) -> seismic::Lag {

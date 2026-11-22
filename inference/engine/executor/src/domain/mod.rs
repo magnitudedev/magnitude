@@ -3145,7 +3145,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // thread stands beside it, they are judged by the last reading with
         // every claim since counted; the owner's first step owes a reading
         // and takes it.
-        if memory.read_at_event(resources.ledgers()).is_none() {
+        if family.has_planned_host_tier() {
+            // Take a settled post-domain reading before starting host-tier
+            // backing so post-domain uncharged host RSS (bound graphs, driver
+            // state, heap) is reflected in `HostRam` and the host-tier target
+            // is clamped to live host room.
+            memory.settled_read(resources.ledgers());
+            family.begin_host_backing(resources.ledgers())?;
+        } else if memory.read_at_event(resources.ledgers()).is_none() {
             tracing::debug!(target: MEMORY_TRACE, "the domain's opening memory read deferred: a change of ours stood beside the sample");
         }
         // The arena: the load's graph scratch and the target graphs' bound

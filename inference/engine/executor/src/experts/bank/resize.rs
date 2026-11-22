@@ -14,7 +14,7 @@ use super::ExpertBank;
 use crate::domain::{BankHolding, BankResized, BankStep, DomainError, ResizeTimes, RunningBegun, RunningPressure, Trip};
 use crate::experts::source::Records;
 use crate::experts::watcher::{Candidates, Evicted, Evicting, Join, ScratchGroup};
-use crate::memory::ledger::{CacheReclaimer, Changes, ReclaimError};
+use crate::memory::ledger::{CacheReclaimer, Changes, Ledger, ReclaimError};
 use crate::planning::{BankTier, Placer};
 use crate::storage_thread::{Done, StorageThread};
 use crate::CompletionWake;
@@ -433,7 +433,7 @@ pub(super) fn grow_by_slots<S>(
     stop: &AtomicBool,
     begin: impl Fn() -> Option<S>,
 ) -> Grown {
-    grow_by_slots_gated(stores, (from, to), records, joining, changes, post, (slots, rises, None), stop, begin)
+    grow_by_slots_gated(stores, (from, to), records, joining, changes, post, (slots, rises, None), stop, begin, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -447,6 +447,7 @@ fn grow_by_slots_gated<S>(
     (slots, rises, rise_gate): (&AtomicU64, &Mutex<()>, Option<&RiseGate>),
     stop: &AtomicBool,
     begin: impl Fn() -> Option<S>,
+    can_allocate: Option<&dyn Fn(u64) -> bool>,
 ) -> Grown {
     let groups = stores.groups.len();
     let mut reached = from;
@@ -465,6 +466,11 @@ fn grow_by_slots_gated<S>(
         let Some(_slot) = begin().filter(|_| !stop.load(Ordering::Acquire)) else {
             break;
         };
+        if let Some(check) = can_allocate {
+            if !check(at) {
+                break;
+            }
+        }
         spent.slots += 1;
         let claiming = Instant::now();
         // Acquire `rises` before `changes.back` (matching `domain::observe`
@@ -655,27 +661,32 @@ impl ExpertBank {
     /// Begin growing the host tier to `to` host slots on its thread, each
     /// host slot joining the tier as soon as every group holds it; while a
     /// resize of it runs, none begins.
-    pub(super) fn grow_host(&self, to: u64, wake: CompletionWake) -> Result<BankStep, DomainError> {
-        Ok(match self.host_growth(to, wake, false)? {
+    pub(super) fn grow_host(&self, to: u64, host_ledger: Ledger, wake: CompletionWake) -> Result<BankStep, DomainError> {
+        Ok(match self.host_growth(to, host_ledger, wake, false)? {
             true => BankStep::Begun(BankTier::Host),
             false => BankStep::Running,
         })
     }
 
-    /// Back the host tier from the floor it opens at to the plan's host
-    /// slots, its load-time size (`ExpertBankPlan::host_slots`), on its
-    /// thread: each host slot joins the tier as soon as every group holds
-    /// it, so the load waits for none of it (backing tens of gigabytes of
-    /// pinned host storage before the bank opened held a 6.89 GB load of
-    /// the 3090 18-26 s, its import 25-33 s against 5-10 s at the floor,
-    /// 2026-11-01). It is the open's, no resize: its end reports none.
-    pub(super) fn back_host(&self) -> Result<(), DomainError> {
-        self.host_growth(self.plan.host_slots, CompletionWake::new(|| {}), true).map(|_| ())
+    /// Back the host tier from the floor it opens at up to `to` host slots
+    /// (at most `self.plan.host_slots`, clamped to live post-domain `HostRam`
+    /// pinned room by `ServedBank::begin_host_backing`), on its thread: each
+    /// host slot joins the tier as soon as every group holds it, so the load
+    /// waits for none of it (backing tens of gigabytes of pinned host storage
+    /// before the bank opened held a 6.89 GB load of the 3090 18-26 s, its
+    /// import 25-33 s against 5-10 s at the floor, 2026-11-01). It is the
+    /// open's, no resize: its end reports none.
+    pub(super) fn back_host_to(&self, to: u64, host_ledger: Ledger) -> Result<(), DomainError> {
+        let clamped = to.min(self.plan.host_slots);
+        if clamped == 0 {
+            return Ok(());
+        }
+        self.host_growth(clamped, host_ledger, CompletionWake::new(|| {}), true).map(|_| ())
     }
 
     /// Begin growing the host tier to `to` host slots, the open's backing
     /// where `backing`; false while a resize of it runs, which begins none.
-    fn host_growth(&self, to: u64, wake: CompletionWake, backing: bool) -> Result<bool, DomainError> {
+    fn host_growth(&self, to: u64, host_ledger: Ledger, wake: CompletionWake, backing: bool) -> Result<bool, DomainError> {
         let mut tier = self.host().ok_or_else(|| DomainError::invariant("a host tier growth without one"))?;
         let tier = &mut *tier;
         if let Resize::Broken(reason) = &tier.commitment.resize {
@@ -684,7 +695,7 @@ impl ExpertBank {
         if tier.commitment.resizing() {
             return Ok(false);
         }
-        let growing = self.growing(&tier.stores, (&tier.commitment.slots, to), BankTier::Host, Joining::Landed, &tier.thread, wake);
+        let growing = self.growing(&tier.stores, (&tier.commitment.slots, to), BankTier::Host, Joining::Landed, Some(host_ledger), &tier.thread, wake);
         tier.commitment.resize = Resize::Growing { growing, backing };
         Ok(true)
     }
@@ -694,12 +705,14 @@ impl ExpertBank {
     /// the watcher as `joining` says as soon as every group holds it, its
     /// granules held by the growth's claim (`BankCache::grow`); `wake`
     /// completed once it ends.
+    #[allow(clippy::too_many_arguments)]
     fn growing(
         &self,
         stores: &Arc<Stores>,
         (slots, to): (&Arc<AtomicU64>, u64),
         tier: BankTier,
         joining: Joining,
+        host_ledger: Option<Ledger>,
         thread: &StorageThread,
         wake: CompletionWake,
     ) -> Growing {
@@ -707,9 +720,44 @@ impl ExpertBank {
         let (shared, slots, stop) = (self.watcher.shared().clone(), slots.clone(), Arc::new(AtomicBool::new(false)));
         let (stopping, rises, rise_gate, stores, records) =
             (stop.clone(), self.rises.clone(), self.stores.rise_gate().clone(), stores.clone(), self.tier_counts(tier));
+        let counts = self.counts.clone();
         let changes = self.cache.changes().clone();
         let done = thread.run(wake, move || {
             let slot = || shared.backing_slot(&stopping);
+            // For `BankTier::Host`, check live pinned HostRam headroom through
+            // the single `Estimate::live_pinned_headroom` owner before each
+            // slot that requires a new OS block so pinned host allocations
+            // never outrun live `HostRam` headroom, OS/container reserve,
+            // `guarantee`, or standing `cap` while the owner thread is busy.
+            let host_guard = |at: u64| {
+                let delta = counts.host_charge(at).saturating_sub(stores.charged());
+                if delta == 0 {
+                    return true;
+                }
+                let sample = seismic::host_sample();
+                let estimate = host_ledger
+                    .as_ref()
+                    .expect("invariant violated: host tier growth without HostRam ledger")
+                    .estimate();
+                let headroom = estimate.live_pinned_headroom(&sample);
+                let fits = headroom >= delta;
+                if !fits {
+                    tracing::warn!(
+                        "host tier growth stopped before slot {at} of {to}: live pinned HostRam headroom \
+                         ({headroom} bytes; free_beyond_target={} bytes, clean_cache={} bytes, \
+                         pinned_reserve={} bytes, guarantee={} bytes) cannot back {delta} more bytes",
+                        sample.supply.free_beyond_target,
+                        sample.supply.clean_cache,
+                        estimate.pinned_reserve(),
+                        estimate.guarantee(),
+                    );
+                }
+                fits
+            };
+            let guard: Option<&dyn Fn(u64) -> bool> = match tier {
+                BankTier::Host => Some(&host_guard),
+                BankTier::Bank => None,
+            };
             grow_by_slots_gated(
                 &stores,
                 (from, to),
@@ -720,6 +768,7 @@ impl ExpertBank {
                 (&slots, &rises, Some(&rise_gate)),
                 &stopping,
                 slot,
+                guard,
             )
         });
         Growing { from, charged, decided, stop, done }
@@ -921,7 +970,7 @@ impl ExpertBank {
             Placer::Tier => Joining::Bank,
             Placer::Bank => Joining::Landed,
         };
-        let growing = self.growing(&self.stores, (&commitment.slots, to), BankTier::Bank, joining, &self.resize_thread, wake);
+        let growing = self.growing(&self.stores, (&commitment.slots, to), BankTier::Bank, joining, None, &self.resize_thread, wake);
         commitment.resize = Resize::Growing { growing, backing: false };
         Ok(BankStep::Begun(BankTier::Bank))
     }
@@ -1424,5 +1473,105 @@ mod rise_gate_tests {
 
         bg.join().expect("background thread finished cleanly");
         assert_eq!(gate.priority_waiters(), 0);
+    }
+
+    /// Reproduces `79bbf8` on a 64 GiB Linux container with `cuMemHostAlloc`
+    /// growth approaching the `clean_cache` / `guarantee` floor:
+    /// `Estimate::live_pinned_headroom` (the single owner replacing ad-hoc
+    /// `host_supply_covers`) never counts swap-backed `cold_reclaimable`,
+    /// excludes `clean_cache` on unmonitored shared cgroups, always preserves
+    /// the machine's OS/container clean-page-cache reserve (`pinned_reserve` =
+    /// 2 GiB on 64 GiB) plus `guarantee` (others' rise), and stops per-slot
+    /// growth cleanly before clean page cache can be driven to 0 bytes.
+    #[test]
+    fn live_pinned_headroom_stops_growth_before_draining_clean_cache_or_guarantee() {
+        use crate::memory::ledger::{Ledgers, LoadShape, PoolClass};
+        use crate::memory::supply::Reading;
+        use std::num::NonZeroU64;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        const TOTAL: u64 = 64 * GIB;
+        const SLOT: u64 = 384 * MIB;
+        const RESERVE: u64 = 2 * GIB; // scarcity_cushion(64 GiB, 384 MiB)
+
+        let t0 = Instant::now();
+        let sample_with = |at: Instant, free_beyond_target: i64, clean_cache: u64, cold_reclaimable: u64, monitored: bool| {
+            seismic::HostSample {
+                at,
+                page_bytes: 4096,
+                total: TOTAL,
+                supply: seismic::Supply { free_beyond_target, clean_cache, cold_reclaimable },
+                counted: seismic::Counted { at, lag: Duration::ZERO },
+                cold: seismic::ColdPages { machine: cold_reclaimable, own: None },
+                own_reclaimed: None,
+                wired: None,
+                harm: monitored.then_some(seismic::Harm { machine: 0, own: 0 }),
+                pressure: monitored.then_some(seismic::PressureLevel::Normal),
+                lag: seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO },
+            }
+        };
+
+        let scope = Ledgers::new();
+        let ledger = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(LoadShape { stores: Vec::new() }));
+        let _pool = ledger.pool_block(PoolClass::Records, NonZeroU64::new(SLOT).unwrap()).blocks;
+
+        // Initial 64 GiB Linux container reading: 10 GiB free, 4 GiB clean cache,
+        // 16 GiB swap-backed cold_reclaimable (must never be counted for pinned).
+        let s0 = sample_with(t0, (10 * GIB) as i64, 4 * GIB, 16 * GIB, true);
+        ledger.read(ledger.sampled(t0), Reading::host(&s0));
+        let est = ledger.estimate();
+        assert_eq!(est.pinned_reserve(), RESERVE);
+        assert_eq!(est.guarantee(), 0);
+        // Immediate supply = 10 + 4 = 14 GiB; minus 2 GiB reserve = 12 GiB.
+        assert_eq!(est.pinned_room(), 12 * GIB);
+        assert_eq!(est.pinned_import_room(), 12 * GIB);
+        assert_eq!(est.live_pinned_headroom(&s0), 12 * GIB, "live_pinned_headroom agrees with pinned_import_room");
+
+        // Simulate cuMemHostAlloc growing slot-by-slot until only 2 GiB clean
+        // page cache remains (free_beyond_target = 0, clean_cache = 2 GiB,
+        // cold_reclaimable = 16 GiB). Growth MUST stop with the 2 GiB clean
+        // page cache completely intact (never driven to 0 bytes).
+        let at_floor = sample_with(t0 + Duration::from_secs(1), 0, 2 * GIB, 16 * GIB, true);
+        assert_eq!(
+            est.live_pinned_headroom(&at_floor),
+            0,
+            "growth must stop at the 2 GiB clean-cache reserve even with 16 GiB swap"
+        );
+
+        // One slot above the 2 GiB reserve fits; one byte below does not.
+        let one_slot_above = sample_with(t0 + Duration::from_secs(1), 0, RESERVE + SLOT, 0, true);
+        assert_eq!(est.live_pinned_headroom(&one_slot_above), SLOT);
+        let one_byte_short = sample_with(t0 + Duration::from_secs(1), 0, RESERVE + SLOT - 1, 16 * GIB, true);
+        assert!(est.live_pinned_headroom(&one_byte_short) < SLOT);
+
+        // Unmonitored shared cgroup (harm: None, pressure: None) excludes clean_cache.
+        let unmonitored = sample_with(t0 + Duration::from_secs(1), (RESERVE + SLOT) as i64, 8 * GIB, 0, false);
+        assert_eq!(est.live_pinned_headroom(&unmonitored), SLOT);
+        let unmonitored_cache_only = sample_with(t0 + Duration::from_secs(1), 0, 8 * GIB, 0, false);
+        assert_eq!(est.live_pinned_headroom(&unmonitored_cache_only), 0);
+
+        // Negative free_beyond_target (cgroup/OS dipped below watermark) offsets clean_cache.
+        let dipped = sample_with(t0 + Duration::from_secs(1), -(512 * MIB as i64), RESERVE + 512 * MIB, 0, true);
+        assert_eq!(est.live_pinned_headroom(&dipped), 0);
+
+        // Others' rise sets `guarantee` > 0 on the HostRam ledger: live_pinned_headroom
+        // must preserve BOTH the 2 GiB OS reserve AND `guarantee`.
+        let t1 = t0 + Duration::from_secs(2);
+        let s1 = sample_with(t1, (9 * GIB) as i64, 4 * GIB, 16 * GIB, true); // others rose by 1 GiB
+        ledger.read(ledger.sampled(t1), Reading::host(&s1));
+        let est1 = ledger.estimate();
+        assert_eq!(est1.guarantee(), GIB);
+        // Immediate supply = 9 + 4 = 13 GiB; minus 2 GiB reserve minus 1 GiB guarantee = 10 GiB.
+        assert_eq!(est1.pinned_import_room(), 10 * GIB);
+        assert_eq!(est1.live_pinned_headroom(&s1), 10 * GIB);
+        let with_guarantee_tight = sample_with(t1, 0, RESERVE + GIB + SLOT - 1, 0, true);
+        assert!(
+            est1.live_pinned_headroom(&with_guarantee_tight) < SLOT,
+            "guarantee ({} B) + reserve ({RESERVE} B) must both be preserved",
+            est1.guarantee()
+        );
     }
 }

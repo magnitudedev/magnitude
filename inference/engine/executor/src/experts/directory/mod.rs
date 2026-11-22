@@ -23,9 +23,11 @@
 //! host lands a file miss into a ready tier record ([`Directory::claim_landing`]),
 //! the device's steps serve the tier's misses from it, and the host promotes
 //! the ones the ranking keeps into the bank in the background, on the copy
-//! engine (`watcher::promotions`). The tier is inclusive of the bank: a
-//! promotion copies an expert into the bank and the tier keeps its copy, so
-//! the bank evicting it costs nothing, and nothing is ever written back. A
+//! engine (`watcher::promotions`). The tier and the bank hold disjoint sets:
+//! a promotion copies an expert into the bank and the tier surrenders its copy
+//! (`HostRecords::surrender`), ready for another expert once no step may still
+//! read it; an expert leaving the bank exits by `Directory::exit`, written
+//! back into the tier where its expected uses pay for the copy. A
 //! prompt group's seeds are the one placement the device copies: they hold
 //! their records once the device committed them, which the host learns
 //! once the device is past them ([`Directory::retire`]).

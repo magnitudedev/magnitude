@@ -161,7 +161,7 @@ impl MemoryBudget {
                 store: Some(host_ram),
                 role: DomainRole::Staging,
                 capacity: h.capacity(),
-                available: h.room(),
+                available: h.pinned_room(),
             })
         };
         Self { device, host }
@@ -238,7 +238,7 @@ impl MemoryBudget {
                 .map_err(|error| PlanError::ResourcePlanning(error.to_string()))?;
             let host_available = match mode {
                 FitMode::Stable => host_fit.capacity_bytes,
-                FitMode::Live => host_fit.headroom_bytes,
+                FitMode::Live => crate::memory::supply::Reading::host(&status.sample.host).pinned_headroom(0, 0),
             };
             Some(StoreBudget {
                 store: Some(host_ram),

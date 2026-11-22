@@ -468,6 +468,19 @@ pub trait ProgramFamily: 'static {
         false
     }
 
+    /// Whether the family's expert bank has a linked host tier with planned
+    /// load-time slots awaiting post-domain backing ([`Self::begin_host_backing`]).
+    fn has_planned_host_tier(&self) -> bool {
+        false
+    }
+
+    /// Start background backing of the linked host tier after domain
+    /// allocation and its fresh post-domain `HostRam` reading, clamped to
+    /// what live `HostRam` admits.
+    fn begin_host_backing(&self, _ledgers: &crate::memory::ledger::DeviceLedgers) -> Result<(), super::DomainError> {
+        Ok(())
+    }
+
     /// What the load's graphs cost serving so far, of every family
     /// ([`Self::family_graph_replays`]).
     fn graph_replays(&self) -> seismic::GraphReplays {
@@ -794,6 +807,15 @@ impl ProgramFamily for NativeFamily {
     }
     fn records_decode_ahead(&self) -> bool {
         self.programs.records_decode_ahead()
+    }
+    fn has_planned_host_tier(&self) -> bool {
+        self.bank.as_ref().is_some_and(crate::experts::ServedBank::has_planned_host_tier)
+    }
+    fn begin_host_backing(&self, ledgers: &crate::memory::ledger::DeviceLedgers) -> Result<(), super::DomainError> {
+        match &self.bank {
+            Some(bank) => bank.begin_host_backing(ledgers),
+            None => Ok(()),
+        }
     }
     fn vision_is_bound(&self) -> bool {
         self.vision.is_some()

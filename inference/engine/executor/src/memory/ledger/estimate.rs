@@ -20,6 +20,14 @@ pub(super) struct Read {
     /// The store's supply, others' cold pages in it only once harm is
     /// judged ([`Boundary::judges`]).
     supply: i64,
+    /// Immediate non-swapping supply (`Reading::immediate_supply`): excludes
+    /// swap/compressor-backed `cold_reclaimable` pages.
+    immediate_supply: i64,
+    /// OS/container reserve that unreclaimable pinned host allocations must
+    /// leave untouched (`Reading::pinned_reserve(unit)`): 0 on device stores.
+    pinned_reserve: u64,
+    /// The store's pool block unit at the reading (`State::unit`).
+    unit: u64,
     /// What the process had allocated as the sample shows it (including any
     /// own growth within `lag.growth` that the OS already flushed into
     /// `supply`).
@@ -309,7 +317,7 @@ impl Estimate {
     /// bounded by `cap`. Load import sizes what the store's room holds at open
     /// (`experts::derived::import_target`).
     pub fn import_room(&self) -> u64 {
-        self.room_less(self.guarantee())
+        self.room_in(self.budget(), self.guarantee())
     }
 
     /// The room the store leaves the bank and its records pool's spare
@@ -317,13 +325,73 @@ impl Estimate {
     /// transient `guarantee` derivative a second time (`budget` already
     /// reflects others' growth).
     pub fn hold_room(&self) -> u64 {
-        self.room_less(0)
+        self.room_in(self.budget(), 0)
     }
 
-    fn room_less(&self, reserve: u64) -> u64 {
+    /// OS/container reserve preserved in immediate supply for unreclaimable
+    /// pinned host allocations (`Reading::pinned_reserve`): 0 on device stores.
+    pub fn pinned_reserve(&self) -> u64 {
+        self.read.pinned_reserve
+    }
+
+    /// What the process may hold in the store for unreclaimable pinned host
+    /// allocations: `min(grant, in_use + immediate_supply - pinned_reserve)`,
+    /// never counting swap-backed `cold_reclaimable` pages and always keeping
+    /// the OS/container clean-page-cache reserve intact.
+    pub fn pinned_budget(&self) -> u64 {
+        let supply = i128::from(self.read.immediate_supply) - i128::from(self.read.pinned_reserve);
+        let room = u64::try_from((i128::from(self.read.in_use()) + supply).max(0)).expect("a store's bytes fit u64");
+        self.read.grant.map_or(room, |grant| grant.min(room))
+    }
+
+    /// What a pinned host allocation may take beside committed memory and the
+    /// guarantee: `pinned_budget` less committed memory and `guarantee`.
+    pub fn pinned_room(&self) -> u64 {
+        self.pinned_budget().saturating_sub(self.committed.saturating_add(self.guarantee()))
+    }
+
+    /// The room the store leaves a pinned host bank and its records pool's
+    /// spare granules before growth's harm/step gate: `pinned_budget` less
+    /// committed memory, other caches, unreleased shed cache, and `guarantee`,
+    /// bounded by `cap`.
+    pub fn pinned_import_room(&self) -> u64 {
+        self.room_in(self.pinned_budget(), self.guarantee())
+    }
+
+    /// The room the store leaves a pinned host bank for holding already-resident
+    /// slots without subtracting the transient `guarantee` derivative a second
+    /// time.
+    pub fn pinned_hold_room(&self) -> u64 {
+        self.room_in(self.pinned_budget(), 0)
+    }
+
+    /// Runtime growth target for a pinned host bank: [`Self::pinned_import_room`]
+    /// when growth is admissible, else capped at current bank holdings.
+    pub fn pinned_target(&self) -> u64 {
+        let bank = self.cache_of(CacheKind::Bank) + self.bank_spare;
+        let room = self.pinned_import_room();
+        match self.read.grows {
+            true => room,
+            false => room.min(bank),
+        }
+    }
+
+    /// Live pinned-host headroom for a fresh `sample` taken during background
+    /// host-tier growth, preserving this store's OS/container reserve
+    /// (`scarcity_cushion(sample.total, unit)`), `guarantee` (others' rise),
+    /// and any standing boundary `cap`.
+    pub fn live_pinned_headroom(&self, sample: &seismic::HostSample) -> u64 {
+        let live = Reading::host(sample).pinned_headroom(self.guarantee(), self.read.unit);
+        match self.read.cap {
+            Some(cap) => live.min(cap.saturating_sub(self.allocated.saturating_add(self.read.credited))),
+            None => live,
+        }
+    }
+
+    fn room_in(&self, budget: u64, reserve: u64) -> u64 {
         let bank = self.cache_of(CacheKind::Bank) + self.bank_spare;
         let beside = self.committed.saturating_add(self.cache - bank).saturating_add(self.shed);
-        let room = self.budget().saturating_sub(beside.saturating_add(reserve));
+        let room = budget.saturating_sub(beside.saturating_add(reserve));
         self.read.cap.map_or(room, |cap| room.min(cap.saturating_sub(beside)))
     }
 
@@ -574,8 +642,31 @@ impl State {
             self.others_interval = Some(self.others_interval.map_or(interval, |shortest| shortest.min(interval)));
         }
         let paged = reading.paging().is_some();
+        let unit = self.unit();
+        let immediate_supply = reading.immediate_supply();
+        let pinned_reserve = reading.pinned_reserve(unit);
         let (cap, grows) = (self.boundary.cap(), !paged || self.boundary.admits_growth());
-        let read = Read { at, capacity: reading.capacity(), supply, visible: visible_allocated, nonresident, unobserved, credited, others, rise, grant, ceiling: reading.ceiling(), unwired, lag, shown, cap, grows };
+        let read = Read {
+            at,
+            capacity: reading.capacity(),
+            supply,
+            immediate_supply,
+            pinned_reserve,
+            unit,
+            visible: visible_allocated,
+            nonresident,
+            unobserved,
+            credited,
+            others,
+            rise,
+            grant,
+            ceiling: reading.ceiling(),
+            unwired,
+            lag,
+            shown,
+            cap,
+            grows,
+        };
         self.folded = Some(FoldedReading { read, wired_others, answered: prev.and_then(|before| before.answered) });
         let estimate = self.estimate_at(read);
         let cause = shortage::cause(&estimate, self.boundary.harmed(), self.boundary.pressed());

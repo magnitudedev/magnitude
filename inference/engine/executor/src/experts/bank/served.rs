@@ -77,6 +77,38 @@ impl ServedBank {
         Ok(Self { _floors: floors, ..served })
     }
 
+    /// Whether this bank has a linked host tier with planned load-time host
+    /// slots awaiting post-domain backing ([`Self::begin_host_backing`]).
+    pub(crate) fn has_planned_host_tier(&self) -> bool {
+        self.bank.plan.host_slots > 0 && self.bank.host_tier().is_some()
+    }
+
+    /// Start background backing of the linked host tier after domain
+    /// allocation, clamped to what the fresh post-domain `HostRam` reading
+    /// actually admits. Any slots trimmed below `plan.host_slots` are shed
+    /// from `BankCache` immediately so no phantom `CacheKind::Bank` bytes
+    /// remain in the ledger.
+    pub(crate) fn begin_host_backing(&self, ledgers: &DeviceLedgers) -> Result<(), DomainError> {
+        if !self.has_planned_host_tier() {
+            return Ok(());
+        }
+        let host_estimate = ledgers.host().estimate();
+        let planned = self.bank.plan.host_slots;
+        let clamped = crate::experts::derived::clamped_host_slots(&host_estimate, &self.bank.plan);
+        self.bank.cache.fit(BankHolding::Host, self.above_floor(BankHolding::Host, clamped)?);
+        if clamped < planned {
+            tracing::info!(
+                "host tier backing clamped from {planned} to {clamped} host slots after domain allocation \
+                 (live pinned host import room {} bytes)",
+                host_estimate.pinned_import_room(),
+            );
+        }
+        if clamped > 0 {
+            self.bank.back_host_to(clamped, ledgers.host().clone())?;
+        }
+        Ok(())
+    }
+
     /// The pool `holding` lies in (`ExpertBankPlan::holding_storage`).
     fn storage(&self, holding: BankHolding) -> Result<BankTier, DomainError> {
         self.bank.plan.holding_storage(holding).ok_or_else(|| DomainError::invariant(format!("{holding:?} of a bank without it")))
@@ -439,7 +471,7 @@ impl ElasticBank for ServedBank {
         let step = match holding {
             BankHolding::Experts => self.bank.grow(to, wake),
             BankHolding::Table { table: index } => self.resize_table(index, to, Instant::now(), Duration::ZERO, wake),
-            BankHolding::Host => self.bank.grow_host(to, wake),
+            BankHolding::Host => self.bank.grow_host(to, ledger.clone(), wake),
         };
         if !matches!(step, Ok(BankStep::Begun(_))) {
             self.bank.cache.abandon(holding);

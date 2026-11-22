@@ -312,10 +312,11 @@ impl ExpertBank {
         if bank.host.is_some() {
             bank.cache.set_reclaimer(BankTier::Host, super::resize::BankReclaimer::new(&bank, BankTier::Host));
         }
+        // Register the open host-tier backing claim now so `ServedBank::new`
+        // finds it; actual background slot allocation (`ExpertBank::back_host_to`)
+        // starts only after domain allocation and its fresh post-domain `HostRam`
+        // reading (`ServedBank::begin_host_backing`), clamped to live host room.
         bank.cache.open_host(plan.host_slots, host_backing);
-        if plan.host_slots > 0 {
-            bank.back_host().map_err(|error| format!("the host tier's backing: {error}"))?;
-        }
         Ok(bank)
     }
 }

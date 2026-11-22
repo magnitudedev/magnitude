@@ -173,3 +173,166 @@ fn asymmetric_hold_room_stops_guarantee_derivative_kick_oscillation() {
     assert_eq!(held_target_in(hold_room, grow_room, 132, 0, &shape(), &charge), 132, "hold_room absorbs single-block jitter");
     assert_eq!(held_target_in(base - SLOT, base - 2 * SLOT, 132, 0, &shape(), &charge), 131, "actual 1-slot drop sheds 1 slot, not 2");
 }
+
+/// Reproduces `f92704` on a 64 GiB Linux discrete-GPU host: at import time
+/// `HostRam` supply (~59.84 GB) fits 135 planned host slots (384 MB each),
+/// but subsequent domain allocation adds ~4 GB of uncharged process RSS plus
+/// host floor/tables, dropping live `HostRam` `import_room()` below the 135-slot
+/// charge. Re-clamping against the fresh post-domain reading shrinks the
+/// host-tier target cleanly into live `import_room()`, never over-committing
+/// past `HostRam` budget, and clamps all the way to 0 when post-domain supply
+/// is exhausted.
+#[test]
+fn host_tier_target_clamps_to_post_domain_host_ram_supply() {
+    use crate::memory::ledger::{CacheKind, CommittedKind, Ledgers, LoadShape};
+    use crate::memory::supply::Reading;
+    use std::time::{Duration, Instant};
+
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000_000_000;
+    const TOTAL: u64 = 67_300 * MB;
+    const HOST_SLOT: u64 = 384 * MB;
+    const HOST_FLOOR: u64 = 3 * GB;
+    const PLANNED_HOST_SLOTS: u64 = 135;
+
+    let now = seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO };
+    let scope = Ledgers::new();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, std::sync::Arc::new(LoadShape { stores: Vec::new() }));
+    let _pool = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(HOST_SLOT).unwrap()).blocks;
+    let start = Instant::now();
+    let host_charge = |slots: u64| HOST_FLOOR + slots * HOST_SLOT;
+    let host_shape = BankShape::new(HOST_SLOT, 0, PLANNED_HOST_SLOTS, PLANNED_HOST_SLOTS);
+
+    // 1. Pre-domain import reading: 59.84 GB supply (7.46 GB other/OS).
+    let at_import = ledger.sampled(start);
+    ledger.read(at_import, Reading::device(TOTAL, 59_840 * MB, now));
+    let imported_slots = import_target(&ledger.estimate(), HOST_FLOOR, &host_shape, &host_charge);
+    assert_eq!(imported_slots, PLANNED_HOST_SLOTS, "pre-domain reading fits all 135 planned host slots");
+
+    // Claim committed host floor and hold the planned host-tier backing as
+    // `CacheKind::Bank` (matching `ExpertBank::open` -> `open_host`).
+    let floor_claim = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, HOST_FLOOR))
+        .expect("host floor fits");
+    ledger
+        .change(|_| {
+            let entry = floor_claim.entry();
+            entry.take(&entry.change(), HOST_FLOOR, seismic::memory::Wiring::Pageable)
+        })
+        .expect("host floor allocates");
+    let planned_backing = PLANNED_HOST_SLOTS * HOST_SLOT;
+    let _backing_cache = ledger.cache(CacheKind::Bank, planned_backing, crate::memory::ledger::Reclaim::Unbacked).expect("backing cache fits at import");
+
+    // 2. Post-domain reading: domain allocation added ~8 GB of uncharged host
+    //    RSS (bound graphs, CUDA driver host state, heap) beyond the 3 GB
+    //    committed floor, leaving 48.35 GB live supply.
+    let at_domain = ledger.sampled(start + Duration::from_secs(5));
+    ledger.read(at_domain, Reading::device(TOTAL, 48_350 * MB, now));
+    let post_domain = ledger.estimate();
+    let clamped = target_slots(post_domain.import_room(), &host_shape, &host_charge);
+    assert!(
+        clamped < PLANNED_HOST_SLOTS,
+        "post-domain clamp must drop below planned {PLANNED_HOST_SLOTS} slots, got {clamped}"
+    );
+    assert!(
+        host_charge(clamped) - HOST_FLOOR <= post_domain.import_room(),
+        "clamped host slots ({clamped}) must fit live post-domain import_room ({})",
+        post_domain.import_room()
+    );
+    assert_eq!(clamped, (post_domain.import_room() / HOST_SLOT).min(PLANNED_HOST_SLOTS));
+
+    // 3. Exhausted post-domain supply clamps cleanly to 0 host slots (floor only).
+    let at_exhausted = ledger.sampled(start + Duration::from_secs(10));
+    ledger.read(at_exhausted, Reading::device(TOTAL, 100 * MB, now));
+    let clamped_zero = target_slots(ledger.estimate().pinned_import_room(), &host_shape, &host_charge);
+    assert_eq!(clamped_zero, 0, "exhausted post-domain host supply clamps to 0 host slots");
+}
+
+/// On a 64 GiB Linux host (`Reading::host`), `Estimate::pinned_room()`,
+/// `Estimate::pinned_import_room()` (used by `clamped_host_slots` and
+/// `import_host_slots`), `Estimate::pinned_target()` (used by `derived::derive`),
+/// and `Estimate::live_pinned_headroom()` (used by per-slot `grow_by_slots_gated`)
+/// all agree via the single owner and preserve the 2 GiB OS/container clean-cache
+/// reserve without counting swap-backed `cold_reclaimable`.
+#[test]
+fn pinned_host_budget_clamping_and_per_slot_guard_agree_on_64g_linux_container() {
+    use crate::memory::ledger::{CommittedKind, Ledgers, LoadShape, PoolClass};
+    use crate::memory::supply::Reading;
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    const TOTAL: u64 = 64 * GIB;
+    const HOST_SLOT: u64 = 384 * MIB;
+    const HOST_FLOOR: u64 = 3 * GIB;
+    const RESERVE: u64 = 2 * GIB;
+
+    let t0 = Instant::now();
+    let sample = seismic::HostSample {
+        at: t0,
+        page_bytes: 4096,
+        total: TOTAL,
+        supply: seismic::Supply {
+            free_beyond_target: (36 * GIB) as i64,
+            clean_cache: 4 * GIB,
+            cold_reclaimable: 12 * GIB,
+        },
+        counted: seismic::Counted { at: t0, lag: Duration::ZERO },
+        cold: seismic::ColdPages { machine: 12 * GIB, own: None },
+        own_reclaimed: None,
+        wired: None,
+        harm: Some(seismic::Harm { machine: 0, own: 0 }),
+        pressure: Some(seismic::PressureLevel::Normal),
+        lag: seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO },
+    };
+
+    let scope = Ledgers::new();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(LoadShape { stores: Vec::new() }));
+    let _pool = ledger.pool_block(PoolClass::Records, NonZeroU64::new(HOST_SLOT).unwrap()).blocks;
+    ledger.read(ledger.sampled(t0), Reading::host(&sample));
+
+    // Claim and allocate the 3 GiB committed host floor.
+    let floor_claim = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, HOST_FLOOR))
+        .expect("host floor fits");
+    ledger
+        .change(|_| {
+            let entry = floor_claim.entry();
+            entry.take(&entry.change(), HOST_FLOOR, seismic::memory::Wiring::Pageable)
+        })
+        .expect("host floor allocates");
+
+    // Post-floor sample: OS free dropped by HOST_FLOOR (36 -> 33 GiB).
+    let t1 = t0 + Duration::from_secs(1);
+    let post_floor = seismic::HostSample {
+        at: t1,
+        counted: seismic::Counted { at: t1, lag: Duration::ZERO },
+        supply: seismic::Supply {
+            free_beyond_target: (33 * GIB) as i64,
+            clean_cache: 4 * GIB,
+            cold_reclaimable: 12 * GIB,
+        },
+        ..sample
+    };
+    ledger.read(ledger.sampled(t1), Reading::host(&post_floor));
+    let est = ledger.estimate();
+
+    // Expected pinned room above committed floor:
+    // immediate_supply (33 + 4 = 37 GiB) - reserve (2 GiB) = 35 GiB.
+    // Note: 12 GiB cold_reclaimable is excluded, and 2 GiB reserve is preserved.
+    let expected_room = 35 * GIB;
+    assert_eq!(est.pinned_reserve(), RESERVE);
+    assert_eq!(est.pinned_room(), expected_room);
+    assert_eq!(est.pinned_import_room(), expected_room);
+    assert_eq!(est.live_pinned_headroom(&post_floor), expected_room);
+
+    // Clamped host slots and per-slot guard agree on the exact slot count.
+    let host_charge = |slots: u64| HOST_FLOOR + slots * HOST_SLOT;
+    let host_shape = BankShape::new(HOST_SLOT, 0, 133, 133);
+    let clamped = target_slots(est.pinned_import_room(), &host_shape, &host_charge);
+    assert_eq!(clamped, expected_room / HOST_SLOT);
+    assert!(clamped * HOST_SLOT <= est.live_pinned_headroom(&post_floor));
+    assert!((clamped + 1) * HOST_SLOT > est.live_pinned_headroom(&post_floor));
+}

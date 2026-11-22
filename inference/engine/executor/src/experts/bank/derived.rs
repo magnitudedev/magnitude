@@ -127,7 +127,7 @@ pub fn import_slots(
 }
 
 /// The host tier's slots a load imports its bank `plan` at, in `[0, plan.host_slots]`,
-/// bounded by post-sealing host room beside `floor` (the import's weights at
+/// bounded by post-sealing pinned host room beside `floor` (the import's weights at
 /// `host_slots = 0`, i.e. the landing reserve floor).
 pub fn import_host_slots(
     at_load: &crate::memory::ledger::LoadEstimate,
@@ -145,7 +145,26 @@ pub fn import_host_slots(
     let shape = BankShape::new(plan.block().held, 0, plan.host_slots, plan.host_slots);
     let charge = |slots| plan.host_charge(slots).expect("invariant violated: a bank plan charges every host size within its ceiling");
     let beside = ledgers.placed_in(device, floor, BankTier::Host);
-    import_target(at_load.of(BankTier::Host), beside, &shape, &charge)
+    target_slots(at_load.of(BankTier::Host).pinned_import_room().saturating_sub(beside), &shape, &charge)
+}
+
+/// The host tier's slots in `[0, plan.host_slots]` admitted by a fresh
+/// post-domain `HostRam` reading (`host_estimate`): `pinned_import_room()`
+/// excludes swap-backed `cold_reclaimable` pages, preserves the OS/container
+/// clean-page-cache reserve (`pinned_reserve`) and `guarantee`, and excludes
+/// committed host holdings and uncharged post-domain process RSS folded into
+/// `others`, so clamping here before `back_host_to` prevents over-committing
+/// pinned host storage when domain allocation drops live `HostRam` supply.
+pub fn clamped_host_slots(
+    host_estimate: &Estimate,
+    plan: &crate::planning::ExpertBankPlan,
+) -> u64 {
+    if plan.host_slots == 0 || plan.host_granule().is_none() {
+        return 0;
+    }
+    let shape = BankShape::new(plan.block().held, 0, plan.host_slots, plan.host_slots);
+    let charge = |slots| plan.host_charge(slots).expect("invariant violated: a bank plan charges every host size within its ceiling");
+    target_slots(host_estimate.pinned_import_room(), &shape, &charge)
 }
 
 /// The experts' target a load's import holds, `beside` the bytes the
@@ -258,7 +277,13 @@ pub fn derive<'t>(ledgers: &DeviceLedgers, targets: &'t [HoldingTarget<'t>]) -> 
             let estimate = ledgers.of(members[0].tier).estimate();
             let shapes: Vec<(BankShape, u64, u64, &dyn Fn(u64) -> u64)> =
                 members.iter().map(|target| (target.shape, target.at, target.owed, &*target.charge)).collect();
-            let slots = shared_targets_bounded(estimate.hold_room(), estimate.target(), &shapes);
+            let host_tier = members.iter().all(|target| target.tier == BankTier::Host);
+            let (hold_room, grow_room) = if host_tier {
+                (estimate.pinned_hold_room(), estimate.pinned_target())
+            } else {
+                (estimate.hold_room(), estimate.target())
+            };
+            let slots = shared_targets_bounded(hold_room, grow_room, &shapes);
             members.into_iter().zip(slots).collect::<Vec<_>>()
         })
         .collect()
