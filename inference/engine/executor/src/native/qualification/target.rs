@@ -2387,4 +2387,158 @@ mod tests {
         let reads = ExpertReads::routed(&charges, fused_binding).unwrap();
         qualify_routed(&charges, fused_binding, &fused_kernels, SublayerRows::SINGLE, &reads).unwrap();
     }
+
+    /// GLM-5.3-Flash UD-IQ2_XXS general routed qualification (`H=4096, E=288,
+    /// K=8, F=2048, shared=2048 gated limit=10.0, score=1, norm=2, bias=true`,
+    /// BF16 router/norm/activation, packed shared and expert weights).
+    #[test]
+    fn glm53_flash_general_routed_qualification() {
+        let devices = seismic::Devices::discover(&[]).unwrap();
+        if !crate::test_support::available(&devices, BackendName::Cuda) {
+            return;
+        }
+        let device = crate::test_support::open_backend(&devices, BackendName::Cuda).unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let (bf16, f32) = (Element::bf16(), Element::f32());
+        let q5k = Element::stored("q5k", seismic::Layout::Mma16).unwrap();
+        let q6k = Element::stored("q6k", seismic::Layout::Mma16).unwrap();
+        let iq2xxs = Element::stored("iq2xxs", seismic::Layout::Mma16).unwrap();
+        let iq3xxs = Element::stored("iq3xxs", seismic::Layout::Mma16).unwrap();
+        const HIDDEN: u64 = 4096;
+        const FEATURES: u64 = 2048;
+        const SHARED: u64 = 2048;
+        const EXPERTS: u64 = 288;
+        const SELECTED: u64 = 8;
+        let limit = Some(magnitude_family_contracts::GluLimit::new(10.0).unwrap());
+        let expansion = Expansion {
+            gated: true,
+            activation: 0,
+            limit,
+        };
+        let statics = [
+            ("H", HIDDEN),
+            ("PT", 1),
+            ("NM", HIDDEN),
+            ("E", EXPERTS),
+            ("K", SELECTED),
+            ("F", FEATURES),
+            ("S", SHARED),
+            ("T", TILE_ROWS),
+            ("ES", 0),
+            ("GS", 0),
+            ("US", 0),
+            ("DS", 0),
+            ("GB", 0),
+            ("UB", 0),
+            ("DB", 0),
+            ("LB", magnitude_family_contracts::GluLimit::word(limit)),
+            ("GL", magnitude_family_contracts::GluLimit::word(limit)),
+            ("SN", 1),
+            ("IN", 0),
+        ];
+        let binding = crate::GeneralRoutedBinding {
+            shape: GeneralRoutedShape {
+                hidden: HIDDEN,
+                experts: EXPERTS,
+                selected: SELECTED,
+                intermediate: FEATURES,
+                expert_hidden: HIDDEN,
+                latent: false,
+                experts_expansion: expansion,
+                shared: Some((SHARED, expansion)),
+                score: 1,
+                normalization: 2,
+                normalization_epsilon: 507_307_272,
+                scale: 1_075_838_976,
+                bias: true,
+                expert_scale: false,
+                router_norm: false,
+            },
+            norm: bf16,
+            router_norm: bf16,
+            router: bf16,
+            expert_gate: Some(iq2xxs),
+            expert_up: iq2xxs,
+            expert_down: iq3xxs,
+            latent: None,
+            shared: Some((Some(q5k), q5k, q6k)),
+            activation: bf16,
+            scales: Default::default(),
+        };
+        let kernels = GeneralRoutedKernels {
+            select: prepare(
+                &device,
+                routed_select::native_entry_with(routed_select::Elements {
+                    NW: bf16,
+                    RNW: bf16,
+                    RW: bf16,
+                    A: bf16,
+                }),
+                &statics,
+                &[],
+            ),
+            experts: ExpertKernels::Gated {
+                decode: every_row(prepare(
+                    &device,
+                    routed_gate_up::native_entry_with(routed_gate_up::Elements {
+                        EGW: iq2xxs,
+                        EUW: iq2xxs,
+                        A: bf16,
+                    }),
+                    &statics,
+                    &[("GATHERED", 1)],
+                )),
+                grouped: every_row(prepare(
+                    &device,
+                    routed_experts::native_entry_with(routed_experts::Elements {
+                        EGW: iq2xxs,
+                        EUW: iq2xxs,
+                        EDW: iq3xxs,
+                        A: bf16,
+                    }),
+                    &statics,
+                    &[],
+                )),
+            },
+            down: every_row(prepare(
+                &device,
+                routed_down::native_entry_with(routed_down::Elements {
+                    EDW: iq3xxs,
+                    A: bf16,
+                    R: f32,
+                }),
+                &statics,
+                &[],
+            )),
+            group: prepare(&device, routed_group::native_entry(), &statics, &[]),
+            scatter: prepare(
+                &device,
+                routed_scatter::native_entry_with(routed_scatter::Elements { A: bf16, R: f32 }),
+                &statics,
+                &[],
+            ),
+            shared: Some((
+                DenseExpansionKernel::Gated(every_row(prepare(
+                    &device,
+                    dense_expand::native_entry_with(dense_expand::Elements {
+                        NW: bf16,
+                        GW: q5k,
+                        UW: q5k,
+                        A: bf16,
+                    }),
+                    &statics,
+                    &[],
+                ))),
+                every_row(prepare(
+                    &device,
+                    dense_output::native_entry_with(dense_output::Elements { DW: q6k, A: bf16 }),
+                    &statics,
+                    &[],
+                )),
+            )),
+            latent: None,
+        };
+        let reads = ExpertReads::general(&charges, binding).unwrap();
+        qualify_general_routed(&charges, binding, &kernels, &reads).unwrap();
+    }
 }

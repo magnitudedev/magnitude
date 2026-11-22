@@ -857,6 +857,141 @@ fn native_select_matches_host_reference_at_catalog_shapes() {
     }
 }
 
+/// GLM-5.3-Flash routing (`H=4096, E=288, K=8, score=1, norm=2, bias=true`,
+/// BF16 norm/router_norm/router/activation) across decode (GEMV) and prefill
+/// (GEMM) row counts.
+#[test]
+fn native_select_glm53_flash_bf16() {
+    let routing = Routing {
+        name: "glm-5.3-flash",
+        hidden: 4096,
+        experts: 288,
+        selected: 8,
+        score: 1,
+        normalization: 2,
+        epsilon: f32::from_bits(507_307_272),
+        scale: f32::from_bits(1_075_838_976),
+        biased: true,
+        expert_scales: false,
+        router_norm: false,
+    };
+    let row_counts = [1, 8, 16, 64, 512];
+    for device in devices() {
+        let charges = seismic::Charges::tally(&device);
+        for rows in row_counts {
+            let mut case = SelectCase::new(&routing, rows);
+            case.norm = stored(DType::BF16, &case.norm);
+            case.router_norm = stored(DType::BF16, &case.router_norm);
+            case.router = stored(DType::BF16, &case.router);
+            let reference = host_select(&routing, &case);
+            let (h, e, k) = (routing.hidden, routing.experts, routing.selected);
+            for mapping in select_mappings(&device) {
+                let label = format!(
+                    "{:?} {} bf16 rows {rows} {mapping:?}",
+                    device.backend(),
+                    routing.name
+                );
+                let kernel = declared::prepared(
+                    &device,
+                    &routed_select::native_entry_with(routed_select::Elements {
+                        NW: seismic::Element::bf16(),
+                        RNW: seismic::Element::bf16(),
+                        RW: seismic::Element::bf16(),
+                        A: seismic::Element::bf16(),
+                    }),
+                    &specialization(
+                        &device,
+                        &[("H", h), ("E", e), ("K", k), ("ES", 0)],
+                        &mapping,
+                    ),
+                )
+                .unwrap();
+                let mut routes = i32_tensor(&device, &[rows, k], &vec![-7; rows * k]);
+                let mut weights = tensor(&device, DType::F32, &[rows, k], &vec![-7.0; rows * k]);
+                let outcome = kernel
+                    .call(&charges, routed_select::Args {
+                        residual: &tensor(&device, DType::F32, &[rows, h], &case.residual),
+                        norm: &tensor(&device, DType::BF16, &[h], &case.norm),
+                        router_norm: &tensor(&device, DType::BF16, &[h], &case.router_norm),
+                        router: &tensor(&device, DType::BF16, &[e, h], &case.router),
+                        bias: &tensor(&device, DType::F32, &[e], &case.bias),
+                        expert_scale: &tensor(&device, DType::F32, &[0], &[]),
+                        routes: &mut routes,
+                        weights: &mut weights,
+                        epsilon: 1e-6,
+                        score: routing.score,
+                        normalization: routing.normalization,
+                        normalization_epsilon: routing.epsilon,
+                        scale: routing.scale,
+                    })
+                    .unwrap();
+                let weights = read_f32(&weights)
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>();
+                let normalized = read_activation(&outcome.value, DType::BF16)
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>();
+                assert_selection(
+                    &label,
+                    &routing,
+                    &reference,
+                    &read_i32(&routes),
+                    &weights,
+                    &normalized,
+                );
+            }
+        }
+        // Qualification-shaped zero weights (norm=0, router_norm=0, router=0,
+        // bias=0, residual=1.0) at M=1 and M=16, repeated to catch races.
+        let (h, e, k) = (routing.hidden, routing.experts, routing.selected);
+        let kernel = declared::prepared(
+            &device,
+            &routed_select::native_entry_with(routed_select::Elements {
+                NW: seismic::Element::bf16(),
+                RNW: seismic::Element::bf16(),
+                RW: seismic::Element::bf16(),
+                A: seismic::Element::bf16(),
+            }),
+            &specialization(&device, &[("H", h), ("E", e), ("K", k), ("ES", 0)], &[]),
+        )
+        .unwrap();
+        let norm = tensor(&device, DType::BF16, &[h], &vec![0.0; h]);
+        let router_norm = tensor(&device, DType::BF16, &[h], &vec![0.0; h]);
+        let router = tensor(&device, DType::BF16, &[e, h], &vec![0.0; e * h]);
+        let bias = tensor(&device, DType::F32, &[e], &vec![0.0; e]);
+        let expert_scale = tensor(&device, DType::F32, &[0], &[]);
+        for rows in [1usize, 16] {
+            let residual = tensor(&device, DType::F32, &[rows, h], &vec![1.0; rows * h]);
+            let mut routes = i32_tensor(&device, &[rows, k], &vec![0; rows * k]);
+            let mut weights = tensor(&device, DType::F32, &[rows, k], &vec![0.0; rows * k]);
+            for _ in 0..10 {
+                let outcome = kernel
+                    .call(&charges, routed_select::Args {
+                        residual: &residual,
+                        norm: &norm,
+                        router_norm: &router_norm,
+                        router: &router,
+                        bias: &bias,
+                        expert_scale: &expert_scale,
+                        routes: &mut routes,
+                        weights: &mut weights,
+                        epsilon: 1e-5,
+                        score: routing.score,
+                        normalization: routing.normalization,
+                        normalization_epsilon: routing.epsilon,
+                        scale: routing.scale,
+                    })
+                    .unwrap();
+                let got_routes = read_i32(&routes);
+                assert_eq!(got_routes.len(), rows * k);
+                let _ = read_activation(&outcome.value, DType::BF16);
+            }
+        }
+    }
+}
+
 /// The tied router rows 5 and 21 rank the higher expert first in the
 /// portable body.
 #[test]
