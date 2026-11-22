@@ -1266,6 +1266,7 @@ impl ExpertBank {
         let mut total_returned = 0u64;
         let mut total_released = 0u64;
         let mut evicted_any = false;
+        let mut _traffic = None;
         let initial_from = match tier {
             BankTier::Bank => self.commitment().slots.load(Ordering::Acquire),
             BankTier::Host => self.host().map_or(0, |h| h.commitment.slots.load(Ordering::Acquire)),
@@ -1292,8 +1293,10 @@ impl ExpertBank {
             // block. Drain in-flight traffic so those views drop, then retry
             // returning before evicting additional live slots.
             if flushed == 0 && stores.pool.free_granules() as u64 * stores.pool.granule() >= block_bytes {
-                let _hold = self.watcher.shared().hold_traffic();
-                self.watcher.shared().wait_traffic_quiet().map_err(ReclaimError::Invariant)?;
+                if _traffic.is_none() {
+                    _traffic = Some(self.watcher.shared().hold_traffic());
+                    self.watcher.shared().wait_traffic_quiet().map_err(ReclaimError::Invariant)?;
+                }
                 flushed = self
                     .cache
                     .changes()
@@ -1336,20 +1339,17 @@ impl ExpertBank {
                 break;
             };
 
-            // Evict from the watcher; if in-flight bank traffic temporarily
-            // pins slabs, hold traffic and wait for it to drain, then retry.
+            // Hold background promotion/landing traffic across eviction and
+            // `release_evicted` so transient views neither block vacation nor
+            // force extra live-slot evictions during synchronous reclaim.
+            if _traffic.is_none() {
+                _traffic = Some(self.watcher.shared().hold_traffic());
+                self.watcher.shared().wait_traffic_quiet().map_err(ReclaimError::Invariant)?;
+            }
             let evicting = self.evicting(tier);
             let charged = stores.charged();
             let candidates = self.candidates(tier, (shallowest, deepest)).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
-            let evicted = match self.watcher.shared().shrink(evicting, candidates, None).map_err(ReclaimError::Invariant)? {
-                Some(evicted) => Some(evicted),
-                None => {
-                    let _hold = self.watcher.shared().hold_traffic();
-                    self.watcher.shared().wait_traffic_quiet().map_err(ReclaimError::Invariant)?;
-                    let candidates = self.candidates(tier, (shallowest, deepest)).map_err(|error| ReclaimError::Invariant(error.to_string()))?;
-                    self.watcher.shared().shrink(evicting, candidates, None).map_err(ReclaimError::Invariant)?
-                }
-            };
+            let evicted = self.watcher.shared().shrink(evicting, candidates, None).map_err(ReclaimError::Invariant)?;
 
             let Some(Evicted { slots, records, .. }) = evicted else {
                 break;

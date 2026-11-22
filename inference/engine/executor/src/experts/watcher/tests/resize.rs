@@ -572,8 +572,8 @@ fn entering_pool_or_slab_lock_while_holding_residency_panics() {
         assert_no_blocking_alloc_panic("Pool::grow", std::panic::AssertUnwindSafe(|| {
             let _ = pool.grow();
         }));
-        assert_no_blocking_alloc_panic("SlabTensor::backed", std::panic::AssertUnwindSafe(|| {
-            let _ = slabs.backed();
+        assert_no_blocking_alloc_panic("SlabTensor::add_slab", std::panic::AssertUnwindSafe(|| {
+            let _ = slabs.add_slab(seismic::SlabFill::Unwritten);
         }));
     }
 
