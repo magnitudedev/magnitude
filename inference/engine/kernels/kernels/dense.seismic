@@ -270,7 +270,9 @@ projection dense for metal:
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (8192)
     launch gemv when ORDERED_ANY == 0 and M < 2 and M < MATRIX_FROM:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default greatest where SIMDGROUPS <= 16 and (SIMDGROUPS == 2 or GATHERED == 1 or P * G * (1 - GATHERED) * tiles(W, ceil_div(N, SIMDGROUPS * 32 / LANES)) >= 2 * device.units), ROWS in [1, 2, 4] default 1)
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default greatest where SIMDGROUPS <= 16 and (SIMDGROUPS == 2 or GATHERED == 1 or P * G * (1 - GATHERED) * tiles(W, ceil_div(N, SIMDGROUPS * 32 / LANES)) >= 2 * device.units),
+            ROWS in [1, 2, 4] default greatest where ROWS == 1 or (ROWS == 2 and most(W, row_bytes(W, codes, 32)) <= 24 and (GATHERED == 1 or P * G * (1 - GATHERED) * tiles(W, ceil_div(N, SIMDGROUPS * 2 * 32 / LANES)) >= 8 * device.units)) for single,
+            ROWS in [1, 2, 4] default 1 for paired | segmented)
         threadgroups (P * tiles(W, ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(min(ceil_div(K / P, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448 / (1 + STAGE)) * 64 * (1 + STAGE), TILED * SIMDGROUPS * (128 * SERVED)))
@@ -495,7 +497,7 @@ projection dense for cuda:
         arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or (ORDERED_ANY == 0 and PARTED == 0 and each(W, N == 0 or form(W, INT8) == 1) and agree(W, form(W, S8_ENTRIES))) reference 0 for segmented,
         arithmetic OPERAND in [0, 1] default 0,
         arithmetic SPLIT in [2, 1] default 2 for single,
-        arithmetic GEMM_SPLIT in [1, 2, 4, 8] default least where (PARTED == 0 and GEMM_SPLIT == 1) or (PARTED == 1 and (GEMM_TILES * 4 * GEMM_SPLIT >= device.units or GEMM_SPLIT * 512 > K or GEMM_SPLIT == 8)) for segmented,
+        arithmetic GEMM_SPLIT in [1, 2, 4, 8] default least where (PARTED == 0 and GEMM_SPLIT == 1) or (PARTED == 1 and (GEMM_TILES * 2 * GEMM_SPLIT >= device.units or GEMM_SPLIT * 512 > K or GEMM_SPLIT == 8)) for segmented,
         TPW in [1, 2] default 1 for ordered,
         form STAGING in [0, 1] default 0 for single | segmented, form STAGING in [0] default 0 for paired,
         arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ALL == 1 and KSPLIT == 1) or (ORDERED_ALL == 0 and KSPLIT != 1 and (P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= device.units or KSPLIT == (8 - 4 * ORDERED_ANY))))

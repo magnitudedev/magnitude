@@ -524,8 +524,10 @@ projection routed for vulkan:
     let TABLE_SUM = sum(W, form(W, TABLE)) for grouped
     let TABLE_REGION = min(1, TABLE_SUM) * (8 * ceil_div(TABLE_SUM, 8) + 4) for grouped
     let GEMM_HELD = GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMM_REGION + TABLE_REGION, 16) / (device.shared_bytes_per_group + 1))) for grouped
-    params (SIMDGROUPS in [2, 4, 8] default 2 for choice | summed, ROWS in [1, 2, 4] default 1 for choice | summed,
-        form GATHERED in [0, 1] default 1 for choice, arithmetic LANES in [32, 16, 8] default 32 for summed,
+    params (SIMDGROUPS in [2, 4, 8] default greatest where SIMDGROUPS * 32 <= device.max_group_threads and (SIMDGROUPS == 2 or ceil_div(most(W, N), SIMDGROUPS) * (K + SHARED) >= 2 * device.units) for choice | summed,
+        ROWS in [1, 2, 4] default 1 for choice, ROWS in [2, 1, 4] default 2 for summed,
+        form GATHERED in [0, 1] default 1 for choice,
+        arithmetic LANES in [8, 16, 32] default least where LANES == 32 or most(W, WIDTH) / (32 * LANES) <= 4 reference 32 for summed,
         TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
         SUB_M in [32, 64] default 32 for grouped, SUB_N in [32, 64] default 32 for grouped)
     where SIMDGROUPS * 32 <= device.max_group_threads for choice | summed
@@ -1061,7 +1063,7 @@ native routed_group for cuda from "cuda/routed_group.cu":
 # chunk's choices in global memory, PARTS slices per expert.
 native routed_group for vulkan from "vulkan/routed_group.comp":
     static (E, K)
-    params (PARTS in [1, 2, 4] default 1)
+    params (PARTS in [1, 2, 4] default greatest where E * PARTS <= device.max_group_threads and E * PARTS * 4 + E * 8 <= device.shared_bytes_per_group)
     where E * PARTS <= device.max_group_threads
     scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4)
     launch routed_group_count:
@@ -1762,7 +1764,7 @@ native routed_gate_up for metal from "metal/routed_gate_up.metal":
     records (expert_gate, expert_up, tier_gate, tier_up)
     project routed choice (expert_gate, expert_up)
     restate SIMDGROUPS in [2, 4, 8, 16] default 8
-    restate ROWS in [1, 2, 4] default 2
+    restate ROWS in [1, 2, 4] default greatest where ROWS == 1 or (ROWS == 2 and row_bytes(EGW, codes, 32) <= 24 and row_bytes(EUW, codes, 32) <= 24)
     restate arithmetic LANES in [32, 16] default 16
 
 # Metal: `routed_gate_up_part` projects in `routed_gate_up`'s streamed forms
@@ -1773,7 +1775,7 @@ native routed_gate_up_part for metal from "metal/routed_gate_up_part.metal":
     records (expert_gate, expert_up, tier_gate, tier_up)
     project routed choice (expert_gate, expert_up)
     restate SIMDGROUPS in [2, 4, 8, 16] default 8
-    restate ROWS in [1, 2, 4] default 2
+    restate ROWS in [1, 2, 4] default greatest where ROWS == 1 or (ROWS == 2 and row_bytes(EGW, codes, 32) <= 24 and row_bytes(EUW, codes, 32) <= 24)
     restate arithmetic LANES in [32, 16] default 16
 
 native routed_gate_up for cuda from "cuda/routed_gate_up.cu":
