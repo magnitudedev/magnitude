@@ -275,21 +275,37 @@ struct Tier {
     seeds: Option<Vec<(usize, BankRecord)>>,
 }
 
+/// Whether `record` is leased to the active prompt group: claimed by the
+/// lender's host records, or named by the group's lease (`subset` for a
+/// demand-derived partial lease, or all `0..lent` for a full lease).
+fn record_is_leased(record: u32, lent: u32, claimed: bool, leased: Option<&[u32]>) -> bool {
+    claimed
+        || match leased {
+            Some(subset) => subset.binary_search(&record).is_ok(),
+            None => record < lent,
+        }
+}
+
 /// The record step `step`'s pass reads `layer`'s `expert` in, as the device
 /// resolves its map: a hit, none where it reads it from its scratch slot.
-/// Never a record lent to the step's group (its lease, `HostRecords::lent`):
-/// a group's lease takes its lent records before it takes a hit, unmapping
-/// what they held from its first step, and nothing maps into one while it
-/// holds it; beside a host tier the bank's records assert it
-/// (`BankRecords::resolve`), on the one store its lent host records.
-fn hit(core: &Core, layer: usize, expert: usize, step: Step) -> Option<usize> {
+/// Never a record leased to the step's group: a group's lease takes its
+/// leased records before it takes a hit, unmapping what they held from its
+/// first step, and nothing maps into one while it holds it; beside a host
+/// tier the bank's records assert it (`BankRecords::resolve`), on the one
+/// store unleased records in `0..lent` remain resident hits while leased
+/// records are asserted absent.
+fn hit(core: &Core, layer: usize, expert: usize, step: Step, leased: Option<&[u32]>) -> Option<usize> {
     match core.extents.placer {
         crate::planning::Placer::Tier => core.directory.resolve(layer, expert, step).map(BankRecord::index),
         crate::planning::Placer::Bank => {
             let record = core.layers[layer].map.resolve(expert, step)?;
+            let group = core.layers[layer].group;
+            let idx = u32::try_from(record).expect("record fits u32");
+            let lent = core.directory.host_lent(group);
+            let claimed = core.directory.lent_claimed(group, HostRecord(idx));
             assert!(
-                record >= core.directory.host(core.layers[layer].group).lent() as usize,
-                "step {step} resolves expert {expert} of layer {layer} in lent record {record}"
+                !record_is_leased(idx, lent, claimed, leased),
+                "step {step} resolves expert {expert} of layer {layer} in leased lent record {record}"
             );
             Some(record)
         }
@@ -693,12 +709,13 @@ impl Scratch {
         let experts = core.layers[layer].experts;
         let routed = (0..experts).filter(|&expert| flags[expert] > 0).collect::<Vec<_>>();
         let (mut hits, mut cold) = (Vec::new(), Vec::new());
+        let leased = self.lease_records.as_deref();
         let tier = &mut self.tiers[index];
         for &expert in &routed {
             if !matches!(tier.sets[set_idx].experts[expert], SetSlot::Unrouted) {
                 continue;
             }
-            match hit(core, layer, expert, sequence) {
+            match hit(core, layer, expert, sequence, leased) {
                 Some(record) => {
                     tier.sets[set_idx].experts[expert] = SetSlot::Hit;
                     hits.push((expert, record));
@@ -1690,11 +1707,12 @@ impl Scratch {
         // hit in the record the map holds for its pass, or a cold one in its
         // window's scratch slot. One with neither would read a slot no round
         // filled: an invariant violation, which ends serving.
+        let leased = self.lease_records.as_deref();
         let tier = &self.tiers[index];
         for &expert in &routed {
             if expert / lw == window as usize {
                 assert!(
-                    tier.sets[set_index].experts[expert].has_scratch() || hit(core, layer, expert, sequence).is_some(),
+                    tier.sets[set_index].experts[expert].has_scratch() || hit(core, layer, expert, sequence, leased).is_some(),
                     "step {sequence} routes expert {expert} at layer {layer} window {window} with neither a held record nor a scratch slot"
                 );
             }
@@ -2069,6 +2087,7 @@ impl Scratch {
     /// (`PassSet::assign`), and one no later step took is the pass set's no
     /// more (and the tier's no more if no other pass set routes it).
     pub(super) fn forfeit(&mut self, index: usize, set_index: usize, place: usize, experts: impl IntoIterator<Item = usize>, core: &Core) {
+        let leased = self.lease_records.as_deref();
         let tier = &mut self.tiers[index];
         let layer = tier.layer;
         let end = tier.sets[set_index].range.end.min(tier.places.len());
@@ -2081,7 +2100,7 @@ impl Scratch {
                         .find(|later| later.routed.contains(&expert))
                 })
                 .flatten();
-            let held = |later: &Request| hit(core, layer, expert, later.sequence);
+            let held = |later: &Request| hit(core, layer, expert, later.sequence, leased);
             match later.map(|later| (held(later), later)) {
                 Some((Some(record), later)) => {
                     later.hits.push((expert, record));
@@ -2107,7 +2126,7 @@ impl Scratch {
 
 #[cfg(test)]
 mod tests {
-    use super::compose_rounds;
+    use super::{compose_rounds, record_is_leased};
 
     /// A slot's expert converts in a round after its borrower's, which
     /// converts the borrower out of it, the rest in the order they are
@@ -2126,5 +2145,28 @@ mod tests {
         // Its borrower ready last, in the last full round, which nothing
         // else fills: 1 joins it.
         assert_eq!(compose_rounds(&[2, 4, 3, 1], &[None, None, None, Some(3)], 2), [2, 4, 3, 1]);
+    }
+
+    /// Under a demand-derived partial prompt lease (`Some(&[2, 5])` out of
+    /// `lent = 12`), unleased resident records in `0..12` (such as record 0)
+    /// are valid hits (`!record_is_leased`), while leased or claimed records
+    /// are rejected; under a full lease (`None`), every record in `0..12` is
+    /// rejected.
+    #[test]
+    fn partial_lease_allows_hit_in_unleased_lent_record_and_rejects_leased() {
+        let subset = [2u32, 5u32];
+        // Unleased resident record 0 in 0..12 is NOT leased under partial lease.
+        assert!(!record_is_leased(0, 12, false, Some(&subset)));
+        assert!(!record_is_leased(11, 12, false, Some(&subset)));
+        // Empty partial lease (0 absent experts) allows every record in 0..12 as a hit.
+        assert!(!record_is_leased(0, 12, false, Some(&[])));
+        // Leased subset records or claimed records are rejected.
+        assert!(record_is_leased(2, 12, false, Some(&subset)));
+        assert!(record_is_leased(5, 12, true, Some(&subset)));
+        assert!(record_is_leased(0, 12, true, Some(&subset)));
+        // Full lease (`None`) rejects every record in 0..12 and allows >= 12.
+        assert!(record_is_leased(0, 12, false, None));
+        assert!(record_is_leased(11, 12, false, None));
+        assert!(!record_is_leased(12, 12, false, None));
     }
 }

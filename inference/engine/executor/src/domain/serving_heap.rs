@@ -434,7 +434,29 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(Followed::Holds);
         };
         match self.next_bank_move(bank)? {
-            None => Ok(Followed::Holds),
+            None => {
+                // Lower-priority `CacheKind::GraphSlots` (`IdleClass`) stays
+                // warm across prefill/decode transitions when the expert bank
+                // is already saturated (`at >= saturation_slots`, e.g. `whole`
+                // unified-memory banks — zero alloc/free thrash), but yields
+                // to a partial device bank (`at < saturation_slots`) so idle
+                // prefill buffers never starve decode residency.
+                if self.idle_class.held_places().is_some()
+                    && !self.resources.releasing_slots()
+                    && self.resources.ledgers().device().estimate().cache_of(CacheKind::GraphSlots) > 0
+                    && bank
+                        .targets()?
+                        .iter()
+                        .any(|t| t.holding == BankHolding::Experts && t.at < t.shape.saturation_slots())
+                {
+                    if let Some(quiet) = self.quiet() {
+                        let changes = self.resources.ledgers().changes().clone();
+                        changes.change(|_| self.family.release_group(quiet).map_err(DomainError::invariant))?;
+                        let _ = self.resources.release_idle_slots(self.idle_class.release(), wake);
+                    }
+                }
+                Ok(Followed::Holds)
+            }
             Some((holding, BankMove::Shrink { to })) => self.shrink_expert_bank_to(bindings, holding, to, wake).map(Followed::Shrank),
             Some((holding, BankMove::Grow { to })) => self.grow_expert_bank(holding, to, wake).map(Followed::Grew),
         }
