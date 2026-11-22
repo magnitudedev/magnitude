@@ -25,6 +25,7 @@
 #define STREAMING_SYSTEM_READ SYSTEM const int *
 #define STREAMING_DEVICE_WORDS device int *
 #define STREAMING_DEVICE_READ device const int *
+#define STREAMING_ATOMIC_WORDS device atomic_int *
 #define STREAMING_THREAD thread
 #define STREAMING_AT(handle, index) ((handle) + (index))
 #define STREAMING_GROUP_PARAM threadgroup int *streaming_group
@@ -51,6 +52,10 @@ constant metal::thread_scope system_scope = static_cast<metal::thread_scope>(3);
 
 inline void streaming_system_fence() {
     metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, streaming::system_scope);
+}
+
+inline void streaming_device_fence() {
+    metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
 }
 
 // A host-shared word as the host last wrote it, and a store the host reads.
@@ -91,20 +96,24 @@ inline void streaming_device_store(device int *word, int value) {
     *word = value;
 }
 
-inline int streaming_device_add(device int *word, int value) {
-    return atomic_fetch_add_explicit((device atomic_int *)word, value, memory_order_relaxed);
+inline int streaming_atomic_load(device atomic_int *word) {
+    return atomic_load_explicit(word, memory_order_relaxed);
 }
 
-// MSL's compare-and-swap is weak only: it retries a spurious failure (the
-// word read as `expected`), so it fails only where the word differs.
-inline int streaming_device_cas(device int *word, int expected, int desired) {
-    int seen = expected;
-    while (!atomic_compare_exchange_weak_explicit((device atomic_int *)word, &seen, desired, memory_order_relaxed,
-                                                  memory_order_relaxed)) {
-        if (seen != expected)
-            return seen;
-    }
-    return expected;
+inline void streaming_atomic_store(device atomic_int *word, int value) {
+    atomic_store_explicit(word, value, memory_order_relaxed);
+}
+
+inline int streaming_atomic_add(device atomic_int *word, int value) {
+    return atomic_fetch_add_explicit(word, value, memory_order_relaxed);
+}
+
+inline int streaming_atomic_max(device atomic_int *word, int value) {
+    return atomic_fetch_max_explicit(word, value, memory_order_relaxed);
+}
+
+inline int streaming_atomic_exchange(device atomic_int *word, int value) {
+    return atomic_exchange_explicit(word, value, memory_order_relaxed);
 }
 
 // The threadgroup's barrier over its threadgroup memory, and over its device

@@ -32,7 +32,7 @@ kernel void routed_land(
     device const ulong *gate [[buffer(SEISMIC_BUFFER_GATE)]],
     device const ulong *up [[buffer(SEISMIC_BUFFER_UP)]],
     device const ulong *down [[buffer(SEISMIC_BUFFER_DOWN)]],
-    device int *counters [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTERS)]],
+    device atomic_int *counters [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTERS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *window [[threadgroup(0)]],
     uint group [[threadgroup_position_in_grid]],

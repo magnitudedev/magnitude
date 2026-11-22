@@ -38,6 +38,7 @@ __device__ __forceinline__ unsigned streaming_narrow_quotient(unsigned long long
 #define STREAMING_SYSTEM_READ const int *
 #define STREAMING_DEVICE_WORDS int *
 #define STREAMING_DEVICE_READ const int *
+#define STREAMING_ATOMIC_WORDS int *
 #define STREAMING_THREAD
 #define STREAMING_AT(handle, index) ((handle) + (index))
 #define STREAMING_GROUP_PARAM int *streaming_group
@@ -84,12 +85,30 @@ __device__ __forceinline__ void streaming_device_store(int *word, int value) {
     *word = value;
 }
 
-__device__ __forceinline__ int streaming_device_add(int *word, int value) {
+__device__ __forceinline__ int streaming_atomic_load(const int *word) {
+    int value;
+    asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];" : "=r"(value) : "l"(word) : "memory");
+    return value;
+}
+
+__device__ __forceinline__ void streaming_atomic_store(int *word, int value) {
+    asm volatile("st.relaxed.gpu.global.s32 [%0], %1;" : : "l"(word), "r"(value) : "memory");
+}
+
+__device__ __forceinline__ int streaming_atomic_add(int *word, int value) {
     return atomicAdd(word, value);
 }
 
-__device__ __forceinline__ int streaming_device_cas(int *word, int expected, int desired) {
-    return atomicCAS(word, expected, desired);
+__device__ __forceinline__ int streaming_atomic_max(int *word, int value) {
+    return atomicMax(word, value);
+}
+
+__device__ __forceinline__ int streaming_atomic_exchange(int *word, int value) {
+    return atomicExch(word, value);
+}
+
+__device__ __forceinline__ void streaming_device_fence() {
+    __threadfence();
 }
 
 __device__ __forceinline__ void streaming_system_fence() {

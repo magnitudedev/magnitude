@@ -129,7 +129,7 @@ STREAMING_FN u32 streaming_land_count(STREAMING_SYSTEM_WORDS landing, u64 stride
 // once. Each look's count, and whether it is final, it publishes to HEARD
 // at `counters` for the threadgroups that wait beside it.
 STREAMING_FN int streaming_land_poll(STREAMING_SYSTEM_WORDS landing, u64 landing_stride,
-    STREAMING_SYSTEM_WORDS slot, u64 slot_stride, u64 q, u32 entry, STREAMING_DEVICE_WORDS counters) {
+    STREAMING_SYSTEM_WORDS slot, u64 slot_stride, u64 q, u32 entry, STREAMING_ATOMIC_WORDS counters) {
     const u64 failed = q | (u64(u32(SEISMIC_CONST_SLOT_FAILED)) << 32);
     const bool requested =
         streaming_load_u64_acquire(STREAMING_AT(slot, SEISMIC_CONST_SLOT_REQUEST * slot_stride)) == q;
@@ -162,11 +162,8 @@ STREAMING_FN int streaming_land_poll(STREAMING_SYSTEM_WORDS landing, u64 landing
         if (heard != published) {
             published = heard;
             streaming_system_fence();
-            int held = streaming_device_add(STREAMING_AT(counters, STREAMING_LAND_HEARD), 0);
-            while (held < heard) {
-                const int seen = streaming_device_cas(STREAMING_AT(counters, STREAMING_LAND_HEARD), held, heard);
-                held = seen == held ? heard : seen;
-            }
+            streaming_atomic_max(STREAMING_AT(counters, STREAMING_LAND_HEARD), heard);
+            streaming_device_fence();
         }
         if (count > entry)
             return int(count);
@@ -174,6 +171,13 @@ STREAMING_FN int streaming_land_poll(STREAMING_SYSTEM_WORDS landing, u64 landing
             return -1;
     }
 }
+
+// How many waiter iterations pass between direct peeks at the landing head
+// and slot answer while another threadgroup holds LAND_LEAD: keeps one
+// poller on the host-shared bus in normal execution while guaranteeing
+// forward progress even when the GPU scheduler does not co-progress a
+// descheduled lead threadgroup alongside spinning waiters.
+#define STREAMING_LAND_WAITER_PEEK 4096u
 
 // Thread 0's wait for entry `entry` of step `q`'s landing list at
 // `landing` (stride `landing_stride`), on the launch's slot at `slot`
@@ -184,9 +188,11 @@ STREAMING_FN int streaming_land_poll(STREAMING_SYSTEM_WORDS landing, u64 landing
 // was heard (an invariant violation: the slot's SLOT_VIOLATED stored). A waiting threadgroup that
 // finds the poll free takes it (LEAD at `counters`), polls, and frees it.
 STREAMING_FN int streaming_land_await(STREAMING_SYSTEM_WORDS landing, u64 landing_stride,
-    STREAMING_SYSTEM_WORDS slot, u64 slot_stride, u64 q, u32 entry, STREAMING_DEVICE_WORDS counters) {
-    for (;;) {
-        const int heard = streaming_device_add(STREAMING_AT(counters, STREAMING_LAND_HEARD), 0);
+    STREAMING_SYSTEM_WORDS slot, u64 slot_stride, u64 q, u32 entry, STREAMING_ATOMIC_WORDS counters) {
+    const u64 failed = q | (u64(u32(SEISMIC_CONST_SLOT_FAILED)) << 32);
+    for (u32 wait = 0u;; ++wait) {
+        streaming_device_fence();
+        const int heard = streaming_atomic_load(STREAMING_AT(counters, STREAMING_LAND_HEARD));
         const u32 count = u32(heard) >> 1;
         if (count > entry) {
             // Order this relaxed read of HEARD before reading the host-written
@@ -204,11 +210,41 @@ STREAMING_FN int streaming_land_await(STREAMING_SYSTEM_WORDS landing, u64 landin
         }
         if ((heard & 1) != 0)
             return -1;
-        if (streaming_device_add(STREAMING_AT(counters, STREAMING_LAND_LEAD), 0) == 0
-            && streaming_device_cas(STREAMING_AT(counters, STREAMING_LAND_LEAD), 0, 1) == 0) {
+        if (streaming_atomic_load(STREAMING_AT(counters, STREAMING_LAND_LEAD)) == 0
+            && streaming_atomic_exchange(STREAMING_AT(counters, STREAMING_LAND_LEAD), 1) == 0) {
             const int polled = streaming_land_poll(landing, landing_stride, slot, slot_stride, q, entry, counters);
-            streaming_device_add(STREAMING_AT(counters, STREAMING_LAND_LEAD), -1);
+            streaming_device_fence();
+            streaming_atomic_store(STREAMING_AT(counters, STREAMING_LAND_LEAD), 0);
+            streaming_device_fence();
             return polled;
+        }
+        if ((wait & (STREAMING_LAND_WAITER_PEEK - 1u)) == (STREAMING_LAND_WAITER_PEEK - 1u)) {
+            u32 direct = streaming_land_count(landing, landing_stride, q);
+            bool ended = false;
+            if (direct <= entry) {
+                const u64 request =
+                    streaming_load_u64_acquire(STREAMING_AT(slot, SEISMIC_CONST_SLOT_REQUEST * slot_stride));
+                if (request != q) {
+                    ended = true;
+                } else {
+                    const u64 answer =
+                        streaming_load_u64_acquire(STREAMING_AT(slot, SEISMIC_CONST_SLOT_ANSWER * slot_stride));
+                    if (answer == q || answer == failed) {
+                        direct = streaming_land_count(landing, landing_stride, q);
+                        ended = true;
+                    }
+                }
+            }
+            const int direct_heard = int(2u * direct) + (ended ? 1 : 0);
+            if (direct_heard > heard) {
+                streaming_system_fence();
+                streaming_atomic_max(STREAMING_AT(counters, STREAMING_LAND_HEARD), direct_heard);
+                streaming_device_fence();
+            }
+            if (direct > entry)
+                return int(direct);
+            if (ended)
+                return -1;
         }
     }
 }
@@ -241,7 +277,7 @@ STREAMING_FN void streaming_land_entry(STREAMING_SYSTEM_WORDS landing, u64 landi
 // arrived. A launch that lands nothing (no record converts: where the host
 // tier places) does not call it: an entry of no items has no claims.
 STREAMING_FN void streaming_land(STREAMING_LAND_PARAM, STREAMING_SYSTEM_WORDS landing, u64 landing_stride,
-    STREAMING_SYSTEM_WORDS slot, u64 slot_stride, u64 q, STREAMING_DEVICE_WORDS counters, u32 capacity, u32 groups,
+    STREAMING_SYSTEM_WORDS slot, u64 slot_stride, u64 q, STREAMING_ATOMIC_WORDS counters, u32 capacity, u32 groups,
     STREAMING_GROUP_PARAM, u32 tid) {
     const u32 gate = streaming_land_items(STREAMING_LAND_ARG, STREAMING_LAND_GATE);
     const u32 up = streaming_land_items(STREAMING_LAND_ARG, STREAMING_LAND_UP);
@@ -251,7 +287,7 @@ STREAMING_FN void streaming_land(STREAMING_LAND_PARAM, STREAMING_SYSTEM_WORDS la
     u32 known = 0u;
     int read = -1;
     if (tid == 0u) {
-        STREAMING_GROUP(STREAMING_LAND_CLAIM) = streaming_device_add(STREAMING_AT(counters, STREAMING_LAND_CLAIMS), 1);
+        STREAMING_GROUP(STREAMING_LAND_CLAIM) = streaming_atomic_add(STREAMING_AT(counters, STREAMING_LAND_CLAIMS), 1);
         STREAMING_GROUP(STREAMING_LAND_LANDED) = 0;
     }
     streaming_barrier();
@@ -295,7 +331,7 @@ STREAMING_FN void streaming_land(STREAMING_LAND_PARAM, STREAMING_SYSTEM_WORDS la
         // The next claim, taken now and loaded at once where its entry is
         // known landed or the head shows it (one look, no wait).
         if (tid == 0u) {
-            const int next = streaming_device_add(STREAMING_AT(counters, STREAMING_LAND_CLAIMS), 1);
+            const int next = streaming_atomic_add(STREAMING_AT(counters, STREAMING_LAND_CLAIMS), 1);
             const u32 next_entry = u32(next) / per_entry;
             if (next_entry >= known)
                 known = max(known, streaming_land_count(landing, landing_stride, q));
@@ -320,7 +356,7 @@ STREAMING_FN void streaming_land(STREAMING_LAND_PARAM, STREAMING_SYSTEM_WORDS la
         streaming_publish_barrier();
         if (tid == 0u) {
             streaming_system_fence();
-            const int landed = streaming_device_add(STREAMING_AT(counters, STREAMING_LAND_ITEMS + int(entry)), 1);
+            const int landed = streaming_atomic_add(STREAMING_AT(counters, STREAMING_LAND_ITEMS + int(entry)), 1);
             if (landed + 1 == int(per_entry)) {
                 streaming_system_fence();
                 streaming_store(STREAMING_AT(landing, (SEISMIC_CONST_LANDING_ENTRY(u64(entry)) + SEISMIC_CONST_LANDING_DONE) * landing_stride),
@@ -331,14 +367,14 @@ STREAMING_FN void streaming_land(STREAMING_LAND_PARAM, STREAMING_SYSTEM_WORDS la
     // The arrival: the last restores every counter.
     if (tid == 0u) {
         streaming_system_fence();
-        if (streaming_device_add(STREAMING_AT(counters, STREAMING_LAND_ARRIVALS), 1) + 1 == int(groups)) {
+        if (streaming_atomic_add(STREAMING_AT(counters, STREAMING_LAND_ARRIVALS), 1) + 1 == int(groups)) {
             streaming_system_fence();
-            streaming_device_store(STREAMING_AT(counters, STREAMING_LAND_CLAIMS), 0);
-            streaming_device_store(STREAMING_AT(counters, STREAMING_LAND_ARRIVALS), 0);
-            streaming_device_store(STREAMING_AT(counters, STREAMING_LAND_LEAD), 0);
-            streaming_device_store(STREAMING_AT(counters, STREAMING_LAND_HEARD), 0);
+            streaming_atomic_store(STREAMING_AT(counters, STREAMING_LAND_CLAIMS), 0);
+            streaming_atomic_store(STREAMING_AT(counters, STREAMING_LAND_ARRIVALS), 0);
+            streaming_atomic_store(STREAMING_AT(counters, STREAMING_LAND_LEAD), 0);
+            streaming_atomic_store(STREAMING_AT(counters, STREAMING_LAND_HEARD), 0);
             for (u32 entry = 0u; entry < capacity; ++entry)
-                streaming_device_store(STREAMING_AT(counters, STREAMING_LAND_ITEMS + int(entry)), 0);
+                streaming_atomic_store(STREAMING_AT(counters, STREAMING_LAND_ITEMS + int(entry)), 0);
             streaming_system_fence();
         }
     }

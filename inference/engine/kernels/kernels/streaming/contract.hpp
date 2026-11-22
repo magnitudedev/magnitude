@@ -8,16 +8,17 @@
 // - `STREAMING_FN`, a protocol function's qualifier; `u32` and `u64`.
 // - Word handles: `STREAMING_SYSTEM_WORDS` and `STREAMING_SYSTEM_READ` for
 //   host-shared words (read-write, read-only), `STREAMING_DEVICE_WORDS` and
-//   `STREAMING_DEVICE_READ` for device words; `STREAMING_AT(handle, index)`, the handle of word `index`
-//   past `handle`; `streaming_load(handle)` and `streaming_store(handle, v)`
-//   of a host-shared word, `streaming_device_load` and
-//   `streaming_device_store` of a device word, and
-//   `streaming_device_add(word, v)`, a relaxed device-scope atomic add of
-//   `v` to a device word, returning the word before it (a landing launch's
-//   counters, streaming/land.hpp), and `streaming_device_cas(word,
-//   expected, desired)`, a relaxed device-scope compare-and-swap, storing
-//   `desired` only where the word holds `expected` and returning the word
-//   before it (a landing launch's poll).
+//   `STREAMING_DEVICE_READ` for device words, and `STREAMING_ATOMIC_WORDS`
+//   for device atomic counter words (a landing launch's counters,
+//   streaming/land.hpp); `STREAMING_AT(handle, index)`, the handle of word
+//   `index` past `handle`; `streaming_load(handle)` and
+//   `streaming_store(handle, v)` of a host-shared word,
+//   `streaming_device_load` and `streaming_device_store` of a device word,
+//   `streaming_device_fence()` for device-scope memory ordering, and
+//   relaxed device-scope atomics on `STREAMING_ATOMIC_WORDS`:
+//   `streaming_atomic_load(word)`, `streaming_atomic_store(word, v)`,
+//   `streaming_atomic_add(word, v)`, `streaming_atomic_max(word, v)`, and
+//   `streaming_atomic_exchange(word, v)`.
 // - Record tables: `STREAMING_RECORDS`, the handle a record copy's source
 //   and destination records are each addressed from (below): a record
 //   port's table of its records' addresses.

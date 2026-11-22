@@ -8169,6 +8169,108 @@ fn streaming_a_landing_stops_once_its_slot_is_answered_or_failed() {
     }
 }
 
+/// The landing launches' scratch counters are atomic device memory across every
+/// streaming backend, declared `device atomic_int *` in Metal entries and
+/// driven by wait-free atomic primitives (`streaming_atomic_max` /
+/// `streaming_atomic_exchange`) with device fences and bounded waiter direct
+/// peeks rather than weak-CAS or idempotent `add 0` spin loops.
+#[test]
+fn streaming_landing_counters_use_atomic_device_protocol() {
+    let kernels = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+    for entry in ["metal/routed_land.metal", "metal/routed_round.metal"] {
+        let source = std::fs::read_to_string(kernels.join(entry)).unwrap();
+        assert!(
+            source.contains("device atomic_int *counters [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTERS)]]"),
+            "{entry} must declare its sync counters as `device atomic_int *`"
+        );
+        assert!(
+            !source.contains("device int *counters"),
+            "{entry} must not declare atomic counters as plain `device int *`"
+        );
+    }
+    let metal_control = std::fs::read_to_string(kernels.join("metal/lib/streaming/control.h")).unwrap();
+    for required in [
+        "#define STREAMING_ATOMIC_WORDS device atomic_int *",
+        "streaming_device_fence",
+        "atomic_load_explicit",
+        "atomic_store_explicit",
+        "atomic_fetch_max_explicit",
+        "atomic_exchange_explicit",
+    ] {
+        assert!(metal_control.contains(required), "metal/lib/streaming/control.h missing {required}");
+    }
+    assert!(
+        !metal_control.contains("atomic_compare_exchange_weak_explicit"),
+        "metal/lib/streaming/control.h must not spin on weak CAS"
+    );
+    let land = std::fs::read_to_string(kernels.join("streaming/land.hpp")).unwrap();
+    for required in [
+        "STREAMING_ATOMIC_WORDS",
+        "streaming_atomic_load",
+        "streaming_atomic_store",
+        "streaming_atomic_max",
+        "streaming_atomic_exchange",
+        "STREAMING_LAND_WAITER_PEEK",
+    ] {
+        assert!(land.contains(required), "streaming/land.hpp missing {required}");
+    }
+    for forbidden in ["streaming_device_add", "streaming_device_cas"] {
+        assert!(!land.contains(forbidden), "streaming/land.hpp must not use {forbidden}");
+    }
+}
+
+/// Repeated answered `routed_land` and `routed_round` launches at full
+/// `LAND_GROUPS` (the `qualify_bank` and conversion-measurement pattern)
+/// complete every launch without deadlocking on `LAND_HEARD`/`LAND_LEAD` or
+/// leaking stale counter state between launches.
+#[test]
+fn streaming_repeated_answered_land_and_round_complete_without_deadlock() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let charges = seismic::Charges::tally(&device);
+    let (q, low, k) = (STREAMING_SEQUENCE as u64, STREAMING_SEQUENCE, 4u64);
+    let step = streaming_step(&device);
+    let form = ServedForm::qwen35b(&device);
+    let land_kernel = form.land_kernel(&device, k);
+    let round_kernel = form.round_kernel(&device);
+    let staging = landed_staging(&device, &form);
+    let requested = [-1 - LANDED_EXPERTS[0] as i32, LANDED_EXPERTS[1] as i32, LANDED_EXPERTS[2] as i32, LANDED_EXPERTS[3] as i32];
+    let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
+    let grid = land_grid(&device, true);
+    let conveyor = form.records(&device, false, 3, |tensor, record| Some(form.stored(record, tensor)));
+    for run in 0..16 {
+        let (table, words) = file_words(k, q, &requested, &[(1, 1), (2, -1), (3, -1)], Some(q));
+        let mut file = shared_i32(&device, &table.extents(), &words);
+        let mut landing = shared_i32(&device, &[constants::LANDING_ENTRY(3)], &landing_words(low, 1, &[(0, 1)], 3));
+        let mut sources = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
+        let mut bank = form.records(&device, true, 6, |_, _| None);
+        let [gate, up, down] = bank.each_mut();
+        land_kernel
+            .call_answered(&charges, routed_land::Args {
+                step: &step,
+                file: &mut file,
+                sources: &mut sources,
+                policy: &policy,
+                landing: &mut landing,
+                staging_gate: &staging[0],
+                staging_up: &staging[1],
+                staging_down: &staging[2],
+                gate,
+                up,
+                down,
+                grid: &grid,
+            })
+            .unwrap();
+        assert_eq!(read_i32(&landing)[landing_done(0)], low, "routed_land run {run}: DONE");
+
+        let mut round_landing = shared_i32(&device, &[constants::LANDING_ENTRY(2)], &landing_words(low, 1, &[(0, 0), (1, 1)], 2));
+        let mut scratch = form.records(&device, true, 2, |_, _| None);
+        served_round(&device, &round_kernel, &step, &mut round_landing, &conveyor, &mut scratch);
+        assert_eq!(read_i32(&round_landing)[landing_done(0)], low, "routed_round run {run}: DONE");
+    }
+}
+
 /// Two consecutive steps in flight (`q` and `q + 1`), queued as a load
 /// queues a step and its lookahead successor: each on a family slot of its
 /// own over one shared execution arena, every flight's decode graph

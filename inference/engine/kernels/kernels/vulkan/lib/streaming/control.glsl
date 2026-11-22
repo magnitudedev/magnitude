@@ -28,6 +28,7 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) coherent volatile b
 #define STREAMING_SYSTEM_READ uint64_t
 #define STREAMING_DEVICE_WORDS uint64_t
 #define STREAMING_DEVICE_READ uint64_t
+#define STREAMING_ATOMIC_WORDS uint64_t
 #define STREAMING_THREAD
 #define STREAMING_AT(handle, index) ((handle) + uint64_t(index) * 4ul)
 #define STREAMING_GROUP_PARAM uint streaming_group
@@ -83,12 +84,28 @@ void streaming_device_store(uint64_t word, int value) {
     streaming_word_t(word).v = value;
 }
 
-int streaming_device_add(uint64_t word, int value) {
+int streaming_atomic_load(uint64_t word) {
+    return atomicLoad(streaming_word_t(word).v, gl_ScopeDevice, gl_StorageSemanticsNone, gl_SemanticsRelaxed);
+}
+
+void streaming_atomic_store(uint64_t word, int value) {
+    atomicStore(streaming_word_t(word).v, value, gl_ScopeDevice, gl_StorageSemanticsNone, gl_SemanticsRelaxed);
+}
+
+int streaming_atomic_add(uint64_t word, int value) {
     return atomicAdd(streaming_word_t(word).v, value);
 }
 
-int streaming_device_cas(uint64_t word, int expected, int desired) {
-    return atomicCompSwap(streaming_word_t(word).v, expected, desired);
+int streaming_atomic_max(uint64_t word, int value) {
+    return atomicMax(streaming_word_t(word).v, value);
+}
+
+int streaming_atomic_exchange(uint64_t word, int value) {
+    return atomicExchange(streaming_word_t(word).v, value);
+}
+
+void streaming_device_fence() {
+    memoryBarrierBuffer();
 }
 
 // Orders this invocation's accesses of host-shared words.
