@@ -543,6 +543,7 @@ function QuitFailureDialog() {
 export function AppShell({ page, navigate, platform, footer, children }: { page: MainPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; footer?: ReactNode; children: ReactNode }) {
   const narrow = useNarrowViewport()
   const [open, setOpen] = useState(false)
+  useEffect(() => { if (!narrow) setOpen(false) }, [narrow])
   // Only the navigation chrome changes across `md`; the page stays mounted, so resizing keeps its state.
   return <div className={narrow ? "relative flex h-screen flex-col bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200" : "relative flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200"}>
     {narrow ? <NarrowBar open={open} onOpen={() => setOpen(true)} /> : <DockedSidebar page={page} navigate={navigate} platform={platform} />}
@@ -628,7 +629,7 @@ function NarrowBar({ open, onOpen }: { open: boolean; onOpen: () => void }) {
     <span className="flex items-center gap-2 font-heading text-base font-semibold"><MagnitudeMark className="h-7 w-7 shrink-0" />Magnitude</span>
   </header>
 }
-function NavigationDrawer({ page, navigate, onClose }: { page: MainPage; navigate?: (page: ApplicationPage) => void; onClose: () => void }) {
+export function NavigationDrawer({ page, navigate, onClose }: { page: MainPage; navigate?: (page: ApplicationPage) => void; onClose: () => void }) {
   return <div className="fixed inset-0 z-50 flex" onKeyDown={event => { if (event.key === "Escape") onClose() }}>
     <button type="button" aria-label="Close navigation" className="absolute inset-0 cursor-default bg-black/45 dark:bg-black/70" onClick={onClose} />
     <aside aria-label="Navigation" className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-3 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">

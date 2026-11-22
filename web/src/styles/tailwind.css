@@ -369,11 +369,6 @@
   }
 }
 
-@keyframes slide-in-left {
-  from { transform: translateX(-100%); }
-  to { transform: translateX(0); }
-}
-
 .chat-scroll { scrollbar-gutter: stable; }
 .chat-composer:focus-within { border-color: color-mix(in srgb, var(--magnitude-slate-300) 70%, var(--magnitude-slate-500)); }
 [data-theme=dark] .chat-composer:focus-within { border-color: color-mix(in srgb, var(--magnitude-slate-700) 70%, var(--magnitude-slate-500)); }
