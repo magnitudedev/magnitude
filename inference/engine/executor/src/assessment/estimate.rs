@@ -56,7 +56,7 @@
 use super::demand::format_of;
 use super::executor_costs::ExecutorCosts;
 use super::AssessmentError;
-use magnitude_cost_model::{Census, ExpertPass, RoutedKind};
+use magnitude_cost_model::{Census, DraftCensus, ExpertPass, RoutedKind, SpeculativePrice};
 use seismic::measure::pricing::{Bytes, Flops, Pricing};
 
 /// The decode speed at one depth.
@@ -112,14 +112,31 @@ pub fn expert_pass(bank: &crate::planning::ExpertBankPlan, costs: &ExecutorCosts
 }
 
 /// One estimate per depth: tokens per second per conversation, of
-/// `census`'s decode at `sequences` sequences.
+/// `census`'s plain decode at `sequences` sequences.
 pub fn estimate_decode(census: &Census, pricing: &Pricing<'_>, sequences: u64, depths: &[u32]) -> Result<Vec<PerformanceEstimate>, AssessmentError> {
+    estimate_decode_speculative(census, None, pricing, sequences, depths)
+}
+
+/// One estimate per depth: tokens per second per conversation, of
+/// `census`'s decode at `sequences` sequences, priced through
+/// [`SpeculativePrice::resident`] when `draft` is present.
+pub fn estimate_decode_speculative(
+    census: &Census,
+    draft: Option<&DraftCensus>,
+    pricing: &Pricing<'_>,
+    sequences: u64,
+    depths: &[u32],
+) -> Result<Vec<PerformanceEstimate>, AssessmentError> {
     depths
         .iter()
         .map(|&depth| {
+            let tokens_per_second = match draft {
+                Some(draft) => SpeculativePrice::resident(census, draft, pricing, sequences, depth)?.tokens_per_second,
+                None => 1.0 / magnitude_cost_model::step_seconds(census, pricing, sequences, depth)?.total(),
+            };
             Ok(PerformanceEstimate {
                 context_tokens: depth,
-                tokens_per_second: 1.0 / magnitude_cost_model::step_seconds(census, pricing, sequences, depth)?.total(),
+                tokens_per_second,
             })
         })
         .collect()
@@ -399,12 +416,16 @@ mod tests {
             }),
             ..Work::default()
         });
+        let decode = costs.decode_line.expect("the fixture populates decode_line");
         let at = |rows| only(step(&demand, &costs, true, rows, 1).unwrap());
         assert_eq!(at(1).bytes, 8.0 * 3e6 / 300e9);
         let union = 256.0 * (1.0 - (1.0 - 8.0 / 256.0f64).powf(4.0));
         assert_eq!(at(4).bytes, union * 3e6 / 300e9);
         assert!(union < 4.0 * 8.0 && union > 8.0);
-        assert_eq!(at(4).compute, 4.0 * 8.0 * 6e6 / 20e12);
+        assert_eq!(
+            at(4).compute,
+            (4.0_f64 * 8.0 * 6e6 / 20e12).max(6e6 * (union * decode.fixed + 4.0 * 8.0 * decode.row))
+        );
     }
 
     /// History is read per sequence up to its window, at its layout's rate

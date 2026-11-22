@@ -1409,6 +1409,24 @@ pub(crate) struct ReadoutSizingCensus {
     pub decode_calls: Vec<SizedCall>,
 }
 
+/// Decode-regime launch census for one generated proposal width `proposals` of
+/// a drafter family, retained directly from `SizingOutline` at zero extra
+/// outlining cost.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DraftWidthSizingCensus {
+    pub proposals: u8,
+    pub rows_per_sequence: u64,
+    pub calls: Vec<SizedCall>,
+    pub timelines: usize,
+}
+
+/// Accumulated decode-regime launch census for a certified drafter family
+/// (`Head`, `SharedHead`, or `Draft`), sorted ascending by `proposals`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DraftFamilySizingCensus {
+    pub widths: Vec<DraftWidthSizingCensus>,
+}
+
 static NEXT_SIZING_OUTLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// What a structural regime certifies to under direct contract sizing:

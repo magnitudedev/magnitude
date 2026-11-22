@@ -29,6 +29,7 @@
 //!
 //! Requests verified in one launch share its rows ([`share_rows`]).
 
+use magnitude_cost_model::LaunchPrices;
 use magnitude_executor::{draft_ladder, LaunchDuration, StreamedVerifyPrior, TokenId};
 use std::{
     collections::BTreeMap,
@@ -453,6 +454,7 @@ fn prune_costs(costs: &mut BTreeMap<(usize, usize), LaunchCosts>, keep: (usize, 
 struct RoundCosts<'a> {
     costs: &'a BTreeMap<(usize, usize), LaunchCosts>,
     verify_prior: Option<&'a StreamedVerifyPrior>,
+    launch_prices: Option<&'a LaunchPrices>,
     context_class: usize,
     /// Requests sharing each launch.
     sequences: usize,
@@ -464,6 +466,7 @@ impl<'a> RoundCosts<'a> {
     fn from_parts(
         costs: &'a BTreeMap<(usize, usize), LaunchCosts>,
         verify_prior: Option<&'a StreamedVerifyPrior>,
+        launch_prices: Option<&'a LaunchPrices>,
         context_class: usize,
         sequences: usize,
         after_drafting: Option<bool>,
@@ -471,6 +474,7 @@ impl<'a> RoundCosts<'a> {
         Self {
             costs,
             verify_prior,
+            launch_prices,
             context_class,
             sequences,
             after_drafting,
@@ -487,6 +491,7 @@ impl<'a> RoundCosts<'a> {
         Self::from_parts(
             &state.costs,
             state.verify_prior.as_ref(),
+            state.launch_prices.as_ref(),
             context_class,
             sequences,
             after_drafting,
@@ -556,10 +561,23 @@ impl<'a> RoundCosts<'a> {
 
     fn draft(&self, generated: usize) -> f64 {
         if generated == 0 {
-            0.0
-        } else {
-            self.seconds(|costs| &costs.draft, generated)
+            return 0.0;
         }
+        if self.own().is_none_or(|own| !own.draft.contains_key(&generated)) {
+            if let Some(prior) = self.launch_prices.and_then(|prices| {
+                prices
+                    .draft_seconds(
+                        self.sequences.max(1) as u32,
+                        generated.min(usize::from(u8::MAX)) as u8,
+                        self.context_class as u32,
+                    )
+                    .ok()
+                    .flatten()
+            }) {
+                return prior;
+            }
+        }
+        self.seconds(|costs| &costs.draft, generated)
     }
 
     fn prior_verify_seconds(prior: &StreamedVerifyPrior, sequences: usize, rows: usize) -> Option<f64> {
@@ -587,6 +605,24 @@ impl<'a> RoundCosts<'a> {
                 .and_then(|prior| Self::prior_verify_seconds(prior, self.sequences, rows))
             {
                 return prior;
+            }
+            // Only use GPU-only `LaunchPrices` resident priors on cold start (before any
+            // verify launch is measured) and only for non-banked resident targets; banked
+            // MoE targets include streaming miss service that `.resident` omits, and
+            // mixing a cold analytical prior for small `rows` against live measured
+            // durations for large `rows` collapses draft width.
+            if self.own().is_none_or(|own| own.verify.is_empty()) {
+                if let Some(prior) = self.launch_prices.filter(|p| !p.is_banked()).and_then(|prices| {
+                    let seq = self.sequences.max(1) as u32;
+                    let depth = self.context_class as u32;
+                    if rows == self.sequences.max(1) {
+                        prices.plain_seconds(seq, depth).ok().map(|f| f.resident)
+                    } else {
+                        prices.verify_seconds(seq, rows as u32, depth).ok().map(|f| f.resident)
+                    }
+                }) {
+                    return prior;
+                }
             }
         }
         self.seconds(|costs| &costs.verify, rows)
@@ -746,6 +782,10 @@ struct DraftLoadState {
     /// Latest streamed verify prior from the cost model's regime. Its
     /// `bank_epoch` is the single authority for epoch-change invalidation.
     verify_prior: Option<StreamedVerifyPrior>,
+    /// Analytical launch-price snapshot for unmeasured `D(g)` and `V(v+1)`
+    /// launches (replaced on first live observation via `Durations`) and
+    /// structural `sigma_prior` for unscored depths (replaced via `DepthMeans`).
+    launch_prices: Option<LaunchPrices>,
 }
 
 impl Default for DraftLoadState {
@@ -759,6 +799,7 @@ impl Default for DraftLoadState {
             plain_seconds: 0.0,
             beside_cover: false,
             verify_prior: None,
+            launch_prices: None,
         }
     }
 }
@@ -809,6 +850,13 @@ impl DraftLoad {
             });
         }
         state.verify_prior = prior;
+    }
+
+    /// Supply the load's analytical [`LaunchPrices`] snapshot so unmeasured
+    /// `D(g)` and `V(v+1)` launches and unscored proposal depths start from
+    /// the cost model's prior rather than zero-cost `UNSCORED` probing.
+    pub fn observe_launch_prices(&self, prices: Option<LaunchPrices>) {
+        self.lock().launch_prices = prices;
     }
 }
 
@@ -1048,7 +1096,10 @@ impl DraftController {
     /// How often a block is expected to be right through each depth, from
     /// depth 1 (see [`DepthMeans`]). A block right through a depth is right
     /// through every shallower one, so no depth is rated above a shallower
-    /// one.
+    /// one. Unscored depths keep optimistic [`UNSCORED`] (`1.0`), carrying
+    /// the deepest measured depth's live acceptance forward so high-acceptance
+    /// workloads explore deeper widths instead of getting trapped by a
+    /// pessimistic offline prior.
     pub fn right(&self) -> Vec<f64> {
         let mut bound = 1.0f64;
         self.depths
@@ -1165,6 +1216,7 @@ impl DraftController {
         let costs = RoundCosts::from_parts(
             &state.costs,
             state.verify_prior.as_ref(),
+            state.launch_prices.as_ref(),
             self.context_class,
             self.sequences,
             self.chosen,

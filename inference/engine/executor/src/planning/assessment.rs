@@ -746,6 +746,8 @@ pub struct AssessmentGraphResourceBounds {
     pub drafter_graph_host_bytes: u64,
     /// Decode readout calls recorded by `SizingDraft` for `DecodeDemand`.
     pub(crate) readout_census: crate::programs::graph::sizing::ReadoutSizingCensus,
+    /// Decode-regime drafter calls retained from `SizingOutline` for `DraftDemand`.
+    pub(crate) draft_census: Option<crate::programs::graph::sizing::DraftFamilySizingCensus>,
     /// Deduplicated kernels referenced by non-target, non-state families
     /// (readout, head/shared_head/draft, vision).
     pub(crate) other_kernels: std::collections::HashSet<seismic::KernelRequest>,
@@ -902,6 +904,7 @@ impl AssessmentGraphResourceBounds {
             sealed_state_graphs,
             self.drafter_graph_host_bytes,
             self.readout_census.clone(),
+            self.draft_census.clone(),
             self.other_kernels.clone(),
             state_kernels,
             bank_capacity,
@@ -1217,6 +1220,20 @@ impl AssessmentGraphResourceBounds {
         Ok(((drafted, drafted_census), (plain, plain_census)))
     }
 
+    /// Certify only the drafter family and return its retained
+    /// `DraftFamilySizingCensus` (or `None` when `plan` has no drafter).
+    pub(crate) fn drafter_census_direct(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        plan: &super::ProgramPlan,
+        state: &super::StateResourcePlan,
+        method: PlannedMethod,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+    ) -> Result<Option<crate::programs::graph::sizing::DraftFamilySizingCensus>, GraphError> {
+        Ok(Self::drafter_bounds(definition, load, plan, state, method, limits, backend)?.census)
+    }
+
     /// Certify the drafter graph family (`shared_head`, `draft`, or `head`)
     /// for `plan`, if any.
     fn drafter_bounds(
@@ -1236,7 +1253,7 @@ impl AssessmentGraphResourceBounds {
                     let geometry = crate::programs::native_shared_head::SharedHeadGeometry::new(
                         definition, state, shared,
                     )?;
-                    let (head_graph, kernels) =
+                    let (head_graph, kernels, census) =
                         crate::programs::native_shared_head::checked_shared_head_family_with_kernels(
                             backend,
                             load,
@@ -1251,6 +1268,7 @@ impl AssessmentGraphResourceBounds {
                         constant_bytes: head_graph.binding_constant_bytes,
                         host_bytes: head_graph.host_heap.bytes,
                         kernels,
+                        census: (!census.widths.is_empty()).then_some(census),
                     })
                 })
             }
@@ -1262,7 +1280,7 @@ impl AssessmentGraphResourceBounds {
                         .ok_or("a draft program without a draft")?;
                     let geometry =
                         crate::programs::native_draft::DraftGeometry::new(definition, head_state)?;
-                    let (draft_graph, kernels) = crate::programs::native_draft::checked_draft_family_with_kernels(
+                    let (draft_graph, kernels, census) = crate::programs::native_draft::checked_draft_family_with_kernels(
                         backend,
                         load,
                         draft_plan,
@@ -1279,6 +1297,7 @@ impl AssessmentGraphResourceBounds {
                         constant_bytes: draft_graph.binding_constant_bytes,
                         host_bytes: draft_graph.host_heap.bytes,
                         kernels,
+                        census: (!census.widths.is_empty()).then_some(census),
                     })
                 })
             }
@@ -1296,7 +1315,7 @@ impl AssessmentGraphResourceBounds {
                             .ok_or("head graph requires a draft head block")?,
                     )
                     .map_err(|error| error.to_string())?;
-                    let (head_graph, kernels) = crate::programs::native_head::checked_head_family_with_kernels(
+                    let (head_graph, kernels, census) = crate::programs::native_head::checked_head_family_with_kernels(
                         backend,
                         load,
                         &definition.decoder,
@@ -1314,6 +1333,7 @@ impl AssessmentGraphResourceBounds {
                         constant_bytes: head_graph.binding_constant_bytes,
                         host_bytes: head_graph.host_heap.bytes,
                         kernels,
+                        census: (!census.widths.is_empty()).then_some(census),
                     })
                 })
             }
@@ -1405,6 +1425,7 @@ impl AssessmentGraphResourceBounds {
             sealed_state_graphs,
             drafter.host_bytes,
             readout_census,
+            drafter.census,
             other_kernels,
             state_kernels,
             bank_capacity,
@@ -1425,6 +1446,7 @@ impl AssessmentGraphResourceBounds {
         sealed_state_graphs: seismic::HostHeap,
         drafter_graph_host_bytes: u64,
         readout_census: crate::programs::graph::sizing::ReadoutSizingCensus,
+        draft_census: Option<crate::programs::graph::sizing::DraftFamilySizingCensus>,
         other_kernels: std::collections::HashSet<seismic::KernelRequest>,
         state_kernels: std::collections::HashSet<seismic::KernelRequest>,
         state_bank_capacity: Option<BankCapacity>,
@@ -1459,6 +1481,7 @@ impl AssessmentGraphResourceBounds {
             sealed_state_graphs,
             drafter_graph_host_bytes,
             readout_census,
+            draft_census,
             other_kernels,
             state_kernels,
             state_bank_capacity,
@@ -1472,6 +1495,7 @@ struct DrafterBounds {
     constant_bytes: u64,
     host_bytes: u64,
     kernels: std::collections::HashSet<seismic::KernelRequest>,
+    census: Option<crate::programs::graph::sizing::DraftFamilySizingCensus>,
 }
 
 fn state_bank_capacity(state: &super::StateResourcePlan) -> Option<BankCapacity> {

@@ -37,6 +37,7 @@ pub mod launch;
 pub mod lines;
 mod miss_model;
 pub mod regime;
+pub mod speculative;
 pub mod step;
 pub mod streamed;
 pub mod terms;
@@ -51,6 +52,9 @@ pub use expert_lines::{
 pub use launch::{FrontRoutes, LaunchPrices, TargetCensus};
 pub use lines::{FileLine, ReadLine, RecordLine};
 pub use regime::{Form, Needed, NeededByForm, PathTerm, ReadAdmission, Regime, VerifyRoutes, Waste};
+pub use speculative::{
+    expected_tokens, prior_expected_tokens, sigma_prior, DraftCensus, DraftMethod, DraftWidthCensus, SpeculativePrice, SpeculativeRate,
+};
 pub use step::{LayerLoad, LayerRun, Lead, ReadAhead, StepInputs, StepTime};
 pub use terms::Terms;
 pub use streamed::{step_inputs, DecodePrice, FormSeconds, HeldSlots, LayerReads, LiveDecode, StreamedLayers, StreamedStep};

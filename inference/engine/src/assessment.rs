@@ -40,7 +40,7 @@ use magnitude_executor::{
         pool, streamed_layers, stage_timer, AssessmentError, DecodeDemand, PricedBankContext,
         SizingScope, StructuralCharge, AssessmentRequest,
         ExecutionAssessment, ExecutionFit, ExecutionShortfall,
-        ExecutorCosts, ExpertShares, PerformanceEstimate, PreparedExecutionAssessment,
+        ExecutorCosts, ExpertShares, PerformanceEstimate, PreparedDemands, PreparedExecutionAssessment,
         PointRequests, Priced, StoredCosts, StreamedFigures,
     },
     platform::{self, DeviceRequest, GraphPricing, ReleaseRate, PlatformError, SelectedDevice},
@@ -761,13 +761,14 @@ fn streamed_estimates<const N: usize>(
     priced_bank: Option<&PricedBankContext>,
 ) -> Result<[Performance; N], AssessmentError> {
     let target = preparation.target_census();
+    let draft = preparation.draft_census();
     let owned;
     let (layers, priced) = match priced_bank {
         Some(ctx) => (&ctx.layers, &ctx.figures),
         None => {
             let (layers, priced) = pool::join(
                 || streamed_layers(bank, costs, figures),
-                || costs.figures(&target.censuses()),
+                || costs.figures(&preparation.all_censuses()),
             );
             let layers = match layers {
                 Priced::Measured(layers) => layers,
@@ -791,32 +792,54 @@ fn streamed_estimates<const N: usize>(
     let seq_u64 = u64::from(request.sequences);
     let seq_f64 = f64::from(request.sequences);
     let read = figures.read;
-    let mut periods = Vec::with_capacity(N);
+    let mut unique_holdings = Vec::with_capacity(N);
     let mut holding_index = [0usize; N];
     for i in 0..N {
         holding_index[i] = if let Some(prev) = holdings[..i].iter().position(|&h| h == holdings[i]) {
             holding_index[prev]
         } else {
-            let idx = periods.len();
-            periods.push(layers.prepare(None, holdings[i], seq_f64));
+            let idx = unique_holdings.len();
+            unique_holdings.push(holdings[i]);
             idx
         };
     }
-    let rows = pool::par_for_results(&depths, |&depth| {
-        let compute = target.each(|census| {
-            magnitude_cost_model::step_seconds(census, &pricing, seq_u64, depth)
-        })?;
-        let mut tps = [0.0f64; N];
-        for (slot, period) in tps.iter_mut().zip(&periods) {
-            *slot = 1. / period.step_seconds(read, compute).total_seconds;
-        }
-        Ok::<_, seismic::measure::pricing::PriceError>(std::array::from_fn::<_, N, _>(|i| {
-            PerformanceEstimate {
-                context_tokens: depth,
-                tokens_per_second: tps[holding_index[i]],
+    let rows = if let Some(draft) = draft {
+        pool::par_for_results(&depths, |&depth| {
+            let mut tps = [0.0f64; N];
+            for (slot, &held) in tps.iter_mut().zip(&unique_holdings) {
+                *slot = magnitude_cost_model::SpeculativePrice::streamed(
+                    target, draft, &pricing, layers, read, held, seq_u64, depth,
+                )?
+                .tokens_per_second;
             }
-        }))
-    })?;
+            Ok::<_, seismic::measure::pricing::PriceError>(std::array::from_fn::<_, N, _>(|i| {
+                PerformanceEstimate {
+                    context_tokens: depth,
+                    tokens_per_second: tps[holding_index[i]],
+                }
+            }))
+        })?
+    } else {
+        let periods: Vec<_> = unique_holdings
+            .iter()
+            .map(|&held| layers.prepare(None, held, seq_f64))
+            .collect();
+        pool::par_for_results(&depths, |&depth| {
+            let compute = target.each(|census| {
+                magnitude_cost_model::step_seconds(census, &pricing, seq_u64, depth)
+            })?;
+            let mut tps = [0.0f64; N];
+            for (slot, period) in tps.iter_mut().zip(&periods) {
+                *slot = 1. / period.step_seconds(read, compute).total_seconds;
+            }
+            Ok::<_, seismic::measure::pricing::PriceError>(std::array::from_fn::<_, N, _>(|i| {
+                PerformanceEstimate {
+                    context_tokens: depth,
+                    tokens_per_second: tps[holding_index[i]],
+                }
+            }))
+        })?
+    };
     let mut estimates: [Vec<PerformanceEstimate>; N] =
         std::array::from_fn(|_| Vec::with_capacity(rows.len()));
     for row in rows {
@@ -1400,7 +1423,7 @@ fn plan_package(
                 }
             };
             structure.release_target_cache();
-            let (demand, whole) = match demands {
+            let demands = match demands {
                 Ok(demands) => demands,
                 Err(AssessmentError::Graph(error)) => return refused(Refusal::of(classify_graph(error))),
                 Err(error) => return Err(ModelAssessmentError::Assessment(error)),
@@ -1412,8 +1435,7 @@ fn plan_package(
             let execution = PreparedExecutionAssessment::from_demands(
                 manifest.definition,
                 forms.structures(),
-                demand,
-                whole,
+                demands,
             );
             Ok(Ok((PreparedDrafter::Bound { method, alone }, execution)))
         }
@@ -1463,7 +1485,7 @@ fn plan_package(
             if recording {
                 stage_timer::record_stage(|t| t.decode_demand_ns += dd_ns);
             }
-            let (demand, whole) = match demands_res {
+            let demands = match demands_res {
                 Ok(demands) => demands,
                 Err(AssessmentError::Graph(error)) => return refused(Refusal::of(classify_graph(error))),
                 Err(error) => return Err(ModelAssessmentError::Assessment(error)),
@@ -1471,8 +1493,7 @@ fn plan_package(
             let execution = PreparedExecutionAssessment::from_demands(
                 plain_definition,
                 forms,
-                demand,
-                whole,
+                demands,
             );
             Ok(Ok((verdict, execution)))
         }
@@ -1485,7 +1506,7 @@ struct DraftedPlan {
     method: SpeculativeMethod,
     manifest: ExecutionManifest,
     forms: FloorForms<Option<UndraftedBounds>>,
-    demands: Result<(DecodeDemand, Option<DecodeDemand>), AssessmentError>,
+    demands: Result<PreparedDemands, AssessmentError>,
     decode_demand_ns: u64,
     /// `None` when the pre-planned plain primary form already equals
     /// `target_alone` and is reused directly.

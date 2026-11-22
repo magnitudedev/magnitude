@@ -172,6 +172,11 @@ impl Method for Mtp {
             adaptive.observe_streamed(prior);
         }
     }
+    fn observe_launch_prices(&self, prices: Option<magnitude_cost_model::LaunchPrices>) {
+        if let Some(adaptive) = &self.adaptive {
+            adaptive.observe_launch_prices(prices);
+        }
+    }
 }
 
 /// Which target-conditioned drafter a state drives.

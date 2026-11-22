@@ -6,9 +6,9 @@
 //! ([`estimate_execution`]: its per-call decode demand over the executor's
 //! measured kernel costs).
 
-use super::demand::DecodeDemand;
-use super::estimate::{estimate_decode, performance_depths, PerformanceEstimate};
-use magnitude_cost_model::{LaunchPrices, TargetCensus};
+use super::demand::{DecodeDemand, DraftDemand};
+use super::estimate::{estimate_decode_speculative, performance_depths, PerformanceEstimate};
+use magnitude_cost_model::{Census, DraftCensus, LaunchPrices, TargetCensus};
 use seismic::measure::pricing::Pricing;
 use super::executor_costs::ExecutorCosts;
 use magnitude_cost_model::HeldSlots;
@@ -326,6 +326,13 @@ pub struct ExecutionShortfall {
     pub deficit_bytes: NonZeroU64,
 }
 
+/// Precomputed decode demands for [`PreparedExecutionAssessment::from_demands`].
+pub struct PreparedDemands {
+    pub demand: DecodeDemand,
+    pub whole: Option<DecodeDemand>,
+    pub draft: Option<DraftDemand>,
+}
+
 /// Basis-independent decode demand and the structure of the standard
 /// workload's memory charge in each way of holding the experts
 /// ([`crate::FloorForms`]), at the model's largest served context: every
@@ -338,8 +345,12 @@ pub struct PreparedExecutionAssessment {
     /// resident form its decode runs while its bank holds every expert. None
     /// of a plan that holds them whole, whose own demand is that form.
     whole: Option<DecodeDemand>,
+    /// Of a drafted plan, its drafter's demand across certified proposal
+    /// widths, retained from `SizingOutline` at zero extra outlining cost.
+    draft: Option<DraftDemand>,
     forms: crate::FloorForms,
     target_census: std::sync::OnceLock<TargetCensus>,
+    draft_census: std::sync::OnceLock<Option<DraftCensus>>,
 }
 
 impl PreparedExecutionAssessment {
@@ -378,6 +389,24 @@ impl PreparedExecutionAssessment {
         })
     }
 
+    /// Cached drafter census, computed once per prepared execution (`None`
+    /// when the plan does not draft).
+    pub fn draft_census(&self) -> Option<&DraftCensus> {
+        self.draft_census
+            .get_or_init(|| self.draft.as_ref().map(DraftDemand::census))
+            .as_ref()
+    }
+
+    /// Every census this preparation holds (target censuses plus any drafter
+    /// width censuses), for [`ExecutorCosts::figures`].
+    pub fn all_censuses(&self) -> Vec<&Census> {
+        let mut censuses = self.target_census().censuses();
+        if let Some(draft) = self.draft_census() {
+            censuses.extend(draft.censuses());
+        }
+        censuses
+    }
+
     /// The plan's censuses as they pair ([`TargetCensus::of`]): of a plan
     /// banking its experts, its census holding them whole beside its own;
     /// of one holding them whole, its own.
@@ -397,17 +426,19 @@ impl PreparedExecutionAssessment {
         let primary = self.primary();
         primary.structure.charge_with_pricing(definition, &primary.draft, pricing)
     }
-    /// Compute the plain and whole-bank decode demands from `definition` and
-    /// `primary` without consuming `FloorForms`, so callers can overlap this
-    /// with independent work such as `target_alone`.
+    /// Compute the plain, whole-bank, and drafter decode demands from
+    /// `definition` and `primary` without consuming `FloorForms`, so callers
+    /// can overlap this with independent work such as `target_alone`.
     pub fn compute_decode_demands<T>(
         definition: &ModelDefinition,
         primary: &crate::HeldForm<T>,
-    ) -> Result<(DecodeDemand, Option<DecodeDemand>), AssessmentError> {
-        let draft = &primary.draft;
-        let codec = draft.policy().codec();
-        let load = draft.load();
+    ) -> Result<PreparedDemands, AssessmentError> {
+        let draft_plan = &primary.draft;
+        let codec = draft_plan.policy().codec();
+        let method = draft_plan.policy().method();
+        let load = draft_plan.load();
         let graph = primary.structure.graph();
+        let draft = DraftDemand::from_census(definition, method, graph)?;
         if load.expert_bank().is_some() {
             let (whole, demand) = crate::assessment::pool::join(
                 || DecodeDemand::from_census(definition, load, codec, graph, true),
@@ -415,10 +446,10 @@ impl PreparedExecutionAssessment {
             );
             let whole = whole?;
             let demand = demand?;
-            Ok((demand, Some(whole)))
+            Ok(PreparedDemands { demand, whole: Some(whole), draft })
         } else {
             let demand = DecodeDemand::from_census(definition, load, codec, graph, false)?;
-            Ok((demand, None))
+            Ok(PreparedDemands { demand, whole: None, draft })
         }
     }
 
@@ -427,16 +458,17 @@ impl PreparedExecutionAssessment {
     pub fn from_demands(
         definition: ModelDefinition,
         mut forms: crate::FloorForms,
-        demand: DecodeDemand,
-        whole: Option<DecodeDemand>,
+        demands: PreparedDemands,
     ) -> Box<Self> {
         forms.release_target_cache();
         Box::new(Self {
             definition,
-            demand,
-            whole,
+            demand: demands.demand,
+            whole: demands.whole,
+            draft: demands.draft,
             forms,
             target_census: std::sync::OnceLock::new(),
+            draft_census: std::sync::OnceLock::new(),
         })
     }
 }
@@ -452,8 +484,8 @@ pub fn prepare_execution_assessment(
     definition: ModelDefinition,
     forms: crate::FloorForms,
 ) -> Result<Box<PreparedExecutionAssessment>, AssessmentError> {
-    let (demand, whole) = PreparedExecutionAssessment::compute_decode_demands(&definition, forms.primary())?;
-    Ok(PreparedExecutionAssessment::from_demands(definition, forms, demand, whole))
+    let demands = PreparedExecutionAssessment::compute_decode_demands(&definition, forms.primary())?;
+    Ok(PreparedExecutionAssessment::from_demands(definition, forms, demands))
 }
 
 /// The standard workload's checked memory charge of `definition` planned
@@ -1248,10 +1280,7 @@ impl PricedBankContext {
             .expect("a bank form holds an expert bank");
         let (layers, priced) = super::pool::join(
             || super::streamed_layers(bank_plan, costs, figures),
-            || {
-                let target = prepared.target_census();
-                costs.figures(&target.censuses())
-            },
+            || costs.figures(&prepared.all_censuses()),
         );
         let super::Priced::Measured(layers) = layers else {
             return Ok(None);
@@ -1795,12 +1824,35 @@ pub fn assess_execution_fit_with_priced_bank(
     }
 }
 
+/// The drafter's decode demand for `definition` planned as `draft`, or
+/// `Ok(None)` when `draft` does not draft.
+pub fn draft_demand(
+    definition: &ModelDefinition,
+    draft: &ExecutionPlanDraft,
+) -> Result<Option<DraftDemand>, AssessmentError> {
+    if !draft.policy().method().drafts() {
+        return Ok(None);
+    }
+    let _scope =
+        crate::programs::graph::sizing::SizingScope::enter_with_device(draft.device().properties());
+    let policy = draft.policy();
+    let capacity = resource_capacity(draft)?;
+    super::demand::draft_demand_direct(
+        definition,
+        draft.load(),
+        policy.codec(),
+        policy.method(),
+        policy.limits(),
+        capacity,
+        draft.device().backend(),
+    )
+}
+
 /// The prices of every launch of a load of `definition` planned as
 /// `planned`, `resident` its plan holding its experts whole
-/// ([`LaunchPrices`]): each plan's decode census ([`decode_demand`]), on
-/// `costs`' figures under `resident`'s lookahead, which the two share; at
-/// the point `planned` runs, its bank's slots where it banks its experts,
-/// up to `definition`'s context. No drafter is censused.
+/// ([`LaunchPrices`]): each plan's decode census ([`decode_demand`]) and,
+/// when drafted, its drafter census ([`draft_demand`]), on `costs`' figures
+/// under `resident`'s lookahead, which the two share.
 pub fn launch_prices(
     definition: &ModelDefinition,
     resident: &ExecutionPlanDraft,
@@ -1812,8 +1864,13 @@ pub fn launch_prices(
         None => None,
     };
     let target = TargetCensus::of(decode_demand(definition, resident)?.census(), streamed);
-    let figures = costs.figures(&target.censuses());
-    Ok(LaunchPrices::new(target, figures, lookahead(resident)))
+    let draft = draft_demand(definition, resident)?.map(|demand| demand.census());
+    let mut censuses = target.censuses();
+    if let Some(draft) = &draft {
+        censuses.extend(draft.censuses());
+    }
+    let figures = costs.figures(&censuses);
+    Ok(LaunchPrices::with_draft(target, draft, figures, lookahead(resident)))
 }
 
 /// Whether the draft's decode runs with lookahead: its resolved policy's.
@@ -1821,8 +1878,13 @@ pub fn lookahead(draft: &ExecutionPlanDraft) -> bool {
     draft.policy().limits().flights().pipelines()
 }
 
-/// One prepared model's decode speed at each requested depth, from the
-/// planned executor's measured kernel costs.
+/// One prepared model's resident decode speed at each requested depth, from
+/// the planned executor's measured kernel costs.
+///
+/// A banked MoE model that fits resident executes its whole-resident form
+/// (`TargetCensus::Banked { resident, .. }`), never its streamed form. When a
+/// drafter is attached, speculative rounds are priced through
+/// [`magnitude_cost_model::SpeculativePrice::resident`].
 pub fn estimate_execution(
     prepared: &PreparedExecutionAssessment,
     costs: &ExecutorCosts,
@@ -1830,11 +1892,17 @@ pub fn estimate_execution(
 ) -> Result<Vec<PerformanceEstimate>, AssessmentError> {
     let census = match prepared.target_census() {
         TargetCensus::Resident(census) => census,
-        TargetCensus::Banked { streamed, .. } => streamed,
+        TargetCensus::Banked { resident, .. } => resident,
     };
-    let figures = costs.figures(&[census]);
-    estimate_decode(
+    let draft = prepared.draft_census();
+    let mut censuses = vec![census];
+    if let Some(draft) = draft {
+        censuses.extend(draft.censuses());
+    }
+    let figures = costs.figures(&censuses);
+    estimate_decode_speculative(
         census,
+        draft,
         &Pricing { figures: &figures, lookahead: lookahead(prepared.draft()) },
         u64::from(request.sequences),
         &performance_depths(request.context_limit, &request.performance_depths),
@@ -2304,6 +2372,51 @@ pub(crate) mod tests {
         assert_eq!(
             assessed_unpriced.bank.unwrap().paths,
             crate::planning::BankPaths::Unpriced
+        );
+    }
+
+    /// A banked MoE model that fits resident must be priced using its
+    /// `TargetCensus::Banked { resident, .. }` census, never its `streamed`
+    /// census (which carries streaming-only calls and submission boundaries).
+    #[test]
+    fn resident_banked_moe_estimate_execution_uses_resident_census() {
+        let env = environment(4096);
+        let mut prepared = env.prepared();
+        let resident_demand = prepared.demand.clone();
+        let mut streamed_demand = resident_demand.clone();
+        streamed_demand.boundaries = resident_demand.boundaries + 100;
+        prepared.whole = Some(resident_demand.clone());
+        prepared.demand = streamed_demand.clone();
+        prepared.target_census = std::sync::OnceLock::new();
+
+        let costs = crate::assessment::fixtures::costs();
+        let req = request(4096, &[1024]);
+        let estimates = estimate_execution(&prepared, &costs, &req).unwrap();
+        let resident_census = resident_demand.census();
+        let streamed_census = streamed_demand.census();
+        let figures = costs.figures(&[&resident_census, &streamed_census]);
+        let pricing = Pricing {
+            figures: &figures,
+            lookahead: lookahead(prepared.draft()),
+        };
+        let expected_resident =
+            1.0 / magnitude_cost_model::step_seconds(&resident_census, &pricing, 1, 1024)
+                .unwrap()
+                .total();
+        let streamed_tps =
+            1.0 / magnitude_cost_model::step_seconds(&streamed_census, &pricing, 1, 1024)
+                .unwrap()
+                .total();
+        assert!(
+            expected_resident > streamed_tps,
+            "streamed boundaries must make streamed slower than resident"
+        );
+        assert!(
+            (estimates[0].tokens_per_second - expected_resident).abs() < 1e-9,
+            "estimate_execution returned {:.3} tok/s, expected resident {:.3} (streamed was {:.3})",
+            estimates[0].tokens_per_second,
+            expected_resident,
+            streamed_tps,
         );
     }
 }

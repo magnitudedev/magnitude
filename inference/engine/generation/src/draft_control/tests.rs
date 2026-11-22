@@ -1707,3 +1707,136 @@ fn observe_streamed_invalidates_target_costs_on_bank_epoch_change_preserving_dra
     let costs = RoundCosts::of(&state, ctx_a, 1, None);
     assert!((costs.verify(2) - 0.075).abs() < 1e-12, "new epoch prior takes effect immediately");
 }
+
+/// `LaunchPrices` supplies analytical priors for both unmeasured `D(g)` and
+/// `V(v+1)` launches and `sigma_prior` for unscored depths; first live
+/// observations via `Durations` and `DepthMeans` replace each prior cleanly.
+#[test]
+fn launch_prices_supplies_draft_and_verify_priors_replaced_on_first_observation() {
+    use magnitude_cost_model::{
+        Census, DraftCensus, DraftMethod, DraftWidthCensus, Kind, LaunchCounts,
+        LaunchPrices, TargetCensus,
+    };
+    use seismic_measure::pricing::{Bytes, Figures, Flops, Format, Rates, Storage, Work};
+
+    const BF16: Format = Format("bf16");
+    const Q4K: Format = Format("q4k");
+
+    let make_prices = |target_bytes: u64, draft_bytes: u64, method: DraftMethod| {
+        let rates = Rates {
+            activation: BF16,
+            weights: Storage::ALL
+                .iter()
+                .flat_map(|&storage| [(storage, BF16, 300e9), (storage, Q4K, 300e9)])
+                .collect(),
+            flops: vec![(BF16, 60e12), (Q4K, 60e12)],
+            history: Vec::new(),
+            launch: 5e-6,
+            decode: None,
+        };
+        let figures = Figures {
+            rates,
+            composition: Ok(1.0),
+            step_pipelined: 50e-6,
+            step_round_trip: 200e-6,
+        };
+        let census_of = |bytes: u64| {
+            let launches = LaunchCounts::new((1..=8).map(|_| Ok(1)).collect());
+            let work = Work {
+                weights: vec![Bytes { format: Q4K, bytes }],
+                row_flops: vec![Flops { format: Q4K, flops: bytes * 2 }],
+                ..Work::default()
+            };
+            Census::new(vec![(Kind { work, launches }, None)], 0, 8)
+        };
+        let target = TargetCensus::Resident(census_of(target_bytes));
+        let draft_c = census_of(draft_bytes);
+        let draft = DraftCensus {
+            method,
+            widths: vec![
+                DraftWidthCensus { proposals: 1, rows_per_sequence: 2, census: draft_c.clone() },
+                DraftWidthCensus { proposals: 3, rows_per_sequence: 4, census: draft_c.clone() },
+                DraftWidthCensus { proposals: 7, rows_per_sequence: 8, census: draft_c },
+            ],
+            max_proposals: 7,
+        };
+        LaunchPrices::with_draft(target, Some(draft), figures, true)
+    };
+
+    // 1. Expensive drafter vs small target: LaunchPrices prior avoids drafting immediately.
+    let expensive_load = Arc::new(DraftLoad::default());
+    expensive_load.observe_launch_prices(Some(make_prices(
+        100_000_000,
+        1_000_000_000,
+        DraftMethod::Block,
+    )));
+    let mut expensive_ctrl = DraftController::new(7, expensive_load);
+    assert_eq!(
+        expensive_ctrl.generate(7, 1024, true),
+        0,
+        "LaunchPrices prior should choose plain decode when drafting does not pay"
+    );
+
+    // 2. Fast drafter vs large target: LaunchPrices supplies D(g), V(v+1), and sigma_prior;
+    //    live measurements replace each prior on first observation.
+    let fast_prices = make_prices(9_000_000_000, 900_000_000, DraftMethod::Block);
+    let expected_d7 = fast_prices.draft_seconds(1, 7, 1024).unwrap().unwrap();
+    let expected_v8 = fast_prices.verify_seconds(1, 8, 1024).unwrap().resident;
+    let expected_plain = fast_prices.plain_seconds(1, 1024).unwrap().resident;
+
+    let fast_load = Arc::new(DraftLoad::default());
+    fast_load.observe_launch_prices(Some(fast_prices));
+    let mut ctrl = DraftController::new(7, fast_load.clone());
+
+    // Unscored depths stay optimistic (1.0) so high-acceptance workloads explore deeper widths
+    // rather than getting trapped at shallow widths by a pessimistic offline prior.
+    let prior_right = ctrl.right();
+    assert!((prior_right[0] - 1.0).abs() < 1e-12);
+    assert!((prior_right[1] - 1.0).abs() < 1e-12);
+
+    // Unmeasured launches return LaunchPrices priors directly.
+    {
+        let state = fast_load.lock();
+        let costs = RoundCosts::of(&state, 1024, 1, None);
+        assert!((costs.draft(7) - expected_d7).abs() < 1e-12);
+        assert!((costs.verify(8) - expected_v8).abs() < 1e-12);
+        assert!((costs.verify(1) - expected_plain).abs() < 1e-12);
+    }
+
+    // First round chooses drafting width 7.
+    let generated = ctrl.generate(7, 1024, true);
+    assert_eq!(generated, 7);
+
+    // Record live draft and verify observations: live Durations replace priors immediately.
+    ctrl.timed(TimedLaunch::Draft, Some(LaunchDuration::settled(std::time::Duration::from_millis(11))), 1, 7);
+    ctrl.drafted(
+        7,
+        &[
+            TokenId(10),
+            TokenId(20),
+            TokenId(30),
+            TokenId(40),
+            TokenId(50),
+            TokenId(60),
+            TokenId(70),
+        ],
+        None,
+    );
+    let verified = ctrl.verify(7);
+    assert_eq!(verified, 7);
+    ctrl.timed(TimedLaunch::Target, Some(LaunchDuration::settled(std::time::Duration::from_millis(42))), 1, 8);
+    ctrl.committed(&[TokenId(10), TokenId(99)]); // depth 1 right, depths 2..=7 wrong
+
+    // Live observations replaced both D(7), V(8), and DepthMeans[0..7].
+    {
+        let state = fast_load.lock();
+        let costs = RoundCosts::of(&state, 1024, 1, None);
+        assert!((costs.draft(7) - 0.011).abs() < 1e-12);
+        assert!((costs.verify(8) - 0.042).abs() < 1e-12);
+        // Unmeasured width 3 still uses LaunchPrices prior.
+        assert!(costs.draft(3) > 0.0);
+    }
+    let live_right = ctrl.right();
+    assert!((live_right[0] - 1.0).abs() < 1e-12);
+    assert!((live_right[1] - 0.0).abs() < 1e-12);
+}

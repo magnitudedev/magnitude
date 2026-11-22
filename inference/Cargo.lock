@@ -2500,7 +2500,9 @@ name = "magnitude-generation"
 version = "0.1.0"
 dependencies = [
  "magnitude-artifacts",
+ "magnitude-cost-model",
  "magnitude-executor",
+ "seismic-measure",
  "serde",
 ]
 

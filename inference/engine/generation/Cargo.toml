@@ -6,8 +6,12 @@ license.workspace = true
 
 [dependencies]
 magnitude-artifacts = { path = "../artifacts" }
+magnitude-cost-model = { path = "../cost-model" }
 magnitude-executor = { path = "../executor" }
 serde.workspace = true
+
+[dev-dependencies]
+seismic-measure = { path = "../../seismic/measure" }
 
 [lints]
 workspace = true

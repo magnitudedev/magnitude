@@ -375,6 +375,9 @@ pub trait Method: Send + Sync {
     /// round. Drafting methods with an adaptive controller forward this to
     /// their shared [`crate::DraftLoad`].
     fn observe_streamed_prior(&self, _prior: Option<StreamedVerifyPrior>) {}
+    /// Observe the load's analytical [`magnitude_cost_model::LaunchPrices`]
+    /// snapshot for unmeasured draft/verify launch priors.
+    fn observe_launch_prices(&self, _prices: Option<magnitude_cost_model::LaunchPrices>) {}
 }
 
 /// Per-request method state remains confined to its owner thread.

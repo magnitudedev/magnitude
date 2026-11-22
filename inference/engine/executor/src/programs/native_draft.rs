@@ -1415,7 +1415,7 @@ pub(crate) fn checked_draft_family_storage(
     classes: impl IntoIterator<Item = DraftGraphClass>,
 ) -> Result<CheckedGraphResources, GraphError> {
     checked_draft_family_with_kernels(backend, load, plan, geometry, classes)
-        .map(|(resources, _)| resources)
+        .map(|(resources, _, _)| resources)
 }
 
 pub(crate) fn checked_draft_family_with_kernels(
@@ -1424,7 +1424,14 @@ pub(crate) fn checked_draft_family_with_kernels(
     plan: &DraftProgramPlan,
     geometry: &DraftGeometry<'_>,
     classes: impl IntoIterator<Item = DraftGraphClass>,
-) -> Result<(CheckedGraphResources, std::collections::HashSet<seismic::KernelRequest>), GraphError> {
+) -> Result<
+    (
+        CheckedGraphResources,
+        std::collections::HashSet<seismic::KernelRequest>,
+        crate::programs::graph::sizing::DraftFamilySizingCensus,
+    ),
+    GraphError,
+> {
     let classes = classes.into_iter().collect::<Vec<_>>();
     let split = DraftSplit::of(backend, load, plan, geometry)?;
     DraftFamilyComposition::evaluate(&split, &classes)
@@ -1476,6 +1483,7 @@ struct DraftGroupOut {
     topology_heap: seismic::HostHeap,
     plan_count: usize,
     kernels: Vec<seismic::KernelRequest>,
+    draft_width: Option<(bool, crate::programs::graph::sizing::DraftWidthSizingCensus)>,
 }
 
 /// Single-owner composition of a draft graph family's resources and kernel set,
@@ -1486,7 +1494,14 @@ impl DraftFamilyComposition {
     pub(crate) fn evaluate(
         split: &DraftSplit<'_>,
         classes: &[DraftGraphClass],
-    ) -> Result<(CheckedGraphResources, std::collections::HashSet<seismic::KernelRequest>), GraphError> {
+    ) -> Result<
+        (
+            CheckedGraphResources,
+            std::collections::HashSet<seismic::KernelRequest>,
+            crate::programs::graph::sizing::DraftFamilySizingCensus,
+        ),
+        GraphError,
+    > {
         let groups = partition_draft_groups(split, classes)?;
         let numbers = split.numbers();
 
@@ -1494,6 +1509,27 @@ impl DraftFamilyComposition {
             crate::assessment::pool::par_for_results(&groups, |(topology, group)| {
                 let (layout, constants) =
                     certify_draft_group::<SizingOutline>(split, &numbers, *topology, group)?;
+                let draft_width = u8::try_from(topology.proposals).ok().and_then(|proposals| {
+                    let proposing = proposals > 0
+                        && !topology.shaped
+                        && !topology.device
+                        && topology.windowed
+                        && topology.rows == RowForm::of(1)
+                        && topology.block_form.is_some();
+                    proposing.then(|| {
+                        let decode_block =
+                            topology.block_form == Some(RowForm::of(topology.block_rows));
+                        (
+                            decode_block,
+                            crate::programs::graph::sizing::DraftWidthSizingCensus {
+                                proposals,
+                                rows_per_sequence: topology.block_rows,
+                                calls: layout.launches().to_vec(),
+                                timelines: layout.timeline_count(),
+                            },
+                        )
+                    })
+                });
                 Ok::<_, GraphError>(DraftGroupOut {
                     storage: layout.storage_bytes(),
                     constants,
@@ -1501,11 +1537,16 @@ impl DraftFamilyComposition {
                     topology_heap: layout.topology_heap(),
                     plan_count: group.len(),
                     kernels: layout.kernels().to_vec(),
+                    draft_width,
                 })
             })?;
 
         let mut family = CheckedGraphFamilyResources::new();
         let mut kernels = std::collections::HashSet::with_capacity(64);
+        let mut widths: std::collections::BTreeMap<
+            u8,
+            (bool, crate::programs::graph::sizing::DraftWidthSizingCensus),
+        > = std::collections::BTreeMap::new();
         for out in group_outputs {
             family.include(out.storage, out.constants);
             // A draft launch runs on its own lane, never in a decode step's.
@@ -1517,9 +1558,20 @@ impl DraftFamilyComposition {
                 family.include_plan(out.plan_heap)?;
             }
             kernels.extend(out.kernels);
+            if let Some((decode_block, width)) = out.draft_width {
+                let replace = widths
+                    .get(&width.proposals)
+                    .is_none_or(|(existing_decode, _)| decode_block && !*existing_decode);
+                if replace {
+                    widths.insert(width.proposals, (decode_block, width));
+                }
+            }
         }
 
-        Ok((family.finish()?, kernels))
+        let census = crate::programs::graph::sizing::DraftFamilySizingCensus {
+            widths: widths.into_values().map(|(_, width)| width).collect(),
+        };
+        Ok((family.finish()?, kernels, census))
     }
 }
 
@@ -4676,7 +4728,7 @@ mod composition_tests {
         assert!(classes.iter().any(|c| c.slots == 0 && c.device));
 
         let split = DraftSplit::of(BackendName::Cpu, &load, draft_plan, &geometry).unwrap();
-        let (composed_resources, composed_kernels) =
+        let (composed_resources, composed_kernels, _census) =
             DraftFamilyComposition::evaluate(&split, &classes).unwrap();
 
         let (unrolled_resources, unrolled_outlines) =

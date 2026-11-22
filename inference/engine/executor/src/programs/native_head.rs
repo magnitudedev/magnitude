@@ -1842,7 +1842,7 @@ pub(crate) fn checked_head_family_storage(
     classes: impl IntoIterator<Item = HeadGraphClass>,
 ) -> Result<CheckedGraphResources, GraphError> {
     checked_head_family_with_kernels(backend, load, geometry, head, binding, classes)
-        .map(|(resources, _)| resources)
+        .map(|(resources, _, _)| resources)
 }
 
 pub(crate) fn checked_head_family_with_kernels(
@@ -1852,7 +1852,14 @@ pub(crate) fn checked_head_family_with_kernels(
     head: CausalHeadBlock<'_>,
     binding: HeadBinding,
     classes: impl IntoIterator<Item = HeadGraphClass>,
-) -> Result<(CheckedGraphResources, std::collections::HashSet<seismic::KernelRequest>), GraphError> {
+) -> Result<
+    (
+        CheckedGraphResources,
+        std::collections::HashSet<seismic::KernelRequest>,
+        crate::programs::graph::sizing::DraftFamilySizingCensus,
+    ),
+    GraphError,
+> {
     let classes = classes.into_iter().collect::<Vec<_>>();
     HeadFamilyComposition::evaluate(backend, load, geometry, head, binding, &classes)
 }
@@ -1937,6 +1944,7 @@ struct HeadGroupOut {
     topology_heap: seismic::HostHeap,
     plan_count: usize,
     kernels: Vec<seismic::KernelRequest>,
+    draft_width: Option<crate::programs::graph::sizing::DraftWidthSizingCensus>,
 }
 
 /// Single-owner composition of a head graph family's resources and kernel set,
@@ -1951,7 +1959,14 @@ impl HeadFamilyComposition {
         head: CausalHeadBlock<'_>,
         binding: HeadBinding,
         classes: &[HeadGraphClass],
-    ) -> Result<(CheckedGraphResources, std::collections::HashSet<seismic::KernelRequest>), GraphError> {
+    ) -> Result<
+        (
+            CheckedGraphResources,
+            std::collections::HashSet<seismic::KernelRequest>,
+            crate::programs::graph::sizing::DraftFamilySizingCensus,
+        ),
+        GraphError,
+    > {
         let entries = CheckedHeadEntries::new(binding, backend, load)?;
         let split = HeadSplit::of(load, geometry, head, binding.feed_forward)?;
         let groups = partition_head_groups(classes, &split)?;
@@ -1963,6 +1978,24 @@ impl HeadFamilyComposition {
             crate::assessment::pool::par_for_results(&groups, |group| {
                 let (layout, constants) =
                     certify_head_group::<SizingOutline>(backend, &entries, &split, group)?;
+                let draft_width = group.first().and_then(|class| {
+                    let key = HeadGroupKey::of(*class, &split);
+                    let proposals = u8::try_from(key.steps).ok()?;
+                    let proposing = !key.front
+                        && proposals > 0
+                        && !key.shaped
+                        && !key.scored
+                        && !key.device
+                        && !key.prefix
+                        && !key.prefix_tail
+                        && key.entry_form == RowForm::of(1);
+                    proposing.then(|| crate::programs::graph::sizing::DraftWidthSizingCensus {
+                        proposals,
+                        rows_per_sequence: 1,
+                        calls: layout.launches().to_vec(),
+                        timelines: layout.timeline_count(),
+                    })
+                });
                 Ok::<_, GraphError>(HeadGroupOut {
                     storage: layout.storage_bytes(),
                     constants,
@@ -1970,11 +2003,13 @@ impl HeadFamilyComposition {
                     topology_heap: layout.topology_heap(),
                     plan_count: group.len(),
                     kernels: layout.kernels().to_vec(),
+                    draft_width,
                 })
             })?;
 
         let mut family = CheckedGraphFamilyResources::new();
         let mut kernels = std::collections::HashSet::new();
+        let mut widths = std::collections::BTreeMap::new();
         for out in group_outputs {
             family.include(out.storage, out.constants);
             // A head launch runs on its own lane, never in a decode step's.
@@ -1986,9 +2021,15 @@ impl HeadFamilyComposition {
                 family.include_plan(out.plan_heap)?;
             }
             kernels.extend(out.kernels);
+            if let Some(width) = out.draft_width {
+                widths.entry(width.proposals).or_insert(width);
+            }
         }
 
-        Ok((family.finish()?, kernels))
+        let census = crate::programs::graph::sizing::DraftFamilySizingCensus {
+            widths: widths.into_values().collect(),
+        };
+        Ok((family.finish()?, kernels, census))
     }
 }
 
@@ -2866,7 +2907,7 @@ mod composition_tests {
             .any(|c| c.steps() == 2 && !HeadPasses::of(c.launch).shaped));
         let binding = plan.head().unwrap().blocks()[0];
 
-        let (composed_resources, composed_kernels) = HeadFamilyComposition::evaluate(
+        let (composed_resources, composed_kernels, _census) = HeadFamilyComposition::evaluate(
             BackendName::Cpu,
             &load,
             &definition.decoder,

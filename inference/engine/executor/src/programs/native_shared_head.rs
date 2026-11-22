@@ -1104,7 +1104,7 @@ pub(crate) fn checked_shared_head_family_storage(
     classes: impl IntoIterator<Item = SharedHeadGraphClass>,
 ) -> Result<CheckedGraphResources, GraphError> {
     checked_shared_head_family_with_kernels(backend, load, geometry, classes)
-        .map(|(resources, _)| resources)
+        .map(|(resources, _, _)| resources)
 }
 
 pub(crate) fn checked_shared_head_family_with_kernels(
@@ -1112,14 +1112,37 @@ pub(crate) fn checked_shared_head_family_with_kernels(
     load: &ModelLoadPlan,
     geometry: &SharedHeadGeometry<'_>,
     classes: impl IntoIterator<Item = SharedHeadGraphClass>,
-) -> Result<(CheckedGraphResources, std::collections::HashSet<seismic::KernelRequest>), GraphError> {
+) -> Result<
+    (
+        CheckedGraphResources,
+        std::collections::HashSet<seismic::KernelRequest>,
+        crate::programs::graph::sizing::DraftFamilySizingCensus,
+    ),
+    GraphError,
+> {
     let (resources, layouts) =
         certify_shared_head_family::<SizingOutline>(backend, load, geometry, classes)?;
     let mut kernels = std::collections::HashSet::new();
-    for layout in layouts.values() {
+    let mut widths = std::collections::BTreeMap::new();
+    for (class, layout) in &layouts {
         kernels.extend(layout.kernels().iter().cloned());
+        if !class.shaped && class.steps > 0 {
+            if let Ok(proposals) = u8::try_from(class.steps) {
+                widths.entry(proposals).or_insert_with(|| {
+                    crate::programs::graph::sizing::DraftWidthSizingCensus {
+                        proposals,
+                        rows_per_sequence: 1,
+                        calls: layout.launches().to_vec(),
+                        timelines: layout.timeline_count(),
+                    }
+                });
+            }
+        }
     }
-    Ok((resources, kernels))
+    let census = crate::programs::graph::sizing::DraftFamilySizingCensus {
+        widths: widths.into_values().collect(),
+    };
+    Ok((resources, kernels, census))
 }
 
 pub struct PreparedSharedHeadGraphs {

@@ -2886,8 +2886,11 @@ impl<F: ProgramFamily> Service<F> {
                 .domain
                 .streamed_verify_prior(requests.len())
                 .map_err(|error| (None, classify_domain_error(error)))?;
+            let prices = self.domain.launch_prices().cloned();
             for id in &requests {
-                self.requests[id].state.generation().observe_streamed_prior(prior.clone());
+                let gen = self.requests[id].state.generation();
+                gen.observe_streamed_prior(prior.clone());
+                gen.observe_launch_prices(prices.clone());
             }
         }
         // Requests whose drafted blocks await verification share the launch

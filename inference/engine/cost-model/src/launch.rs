@@ -14,6 +14,7 @@
 
 use crate::census::{Census, RoutedKind};
 use crate::compute::{hint_seconds, launch_terms, read_terms, routed_seconds};
+use crate::speculative::{DraftCensus, DraftMethod, SpeculativePrice};
 use crate::streamed::FormSeconds;
 use seismic_measure::pricing::{expert_union, ExpertRead, Experts, Figures, LaunchSeconds, PriceError, Pricing};
 use std::collections::HashMap;
@@ -120,9 +121,12 @@ impl FrontRoutes {
 #[derive(Debug)]
 struct Source {
     target: TargetCensus,
+    draft: Option<DraftCensus>,
     figures: Figures,
     lookahead: bool,
     priced: Mutex<HashMap<(u32, u32, u32), FormSeconds>>,
+    priced_verify: Mutex<HashMap<(u32, u32, u32), FormSeconds>>,
+    priced_draft: Mutex<HashMap<(u32, u8, u32), f64>>,
 }
 
 /// The price of a loaded model's launches: one immutable snapshot of its
@@ -134,18 +138,107 @@ pub struct LaunchPrices {
 
 impl LaunchPrices {
     /// The prices of a load of `target`'s censuses at `figures`, its decode
-    /// under `lookahead`.
+    /// under `lookahead`, with no drafter census.
     ///
     /// # Panics
     /// Where `figures` lack a rate of a census's format or layout, or its
     /// censuses decode up to other rows.
     pub fn new(target: TargetCensus, figures: Figures, lookahead: bool) -> Self {
+        Self::with_draft(target, None, figures, lookahead)
+    }
+
+    /// The prices of a load of `target`'s and optional `draft`'s censuses at
+    /// `figures`, its plain decode under `lookahead`.
+    ///
+    /// # Panics
+    /// Where `figures` lack a rate of any target or draft census's format or
+    /// layout, or target censuses decode up to other rows.
+    pub fn with_draft(target: TargetCensus, draft: Option<DraftCensus>, figures: Figures, lookahead: bool) -> Self {
         let decode_rows = target.decoding().decode_rows();
         for census in target.censuses() {
             assert!(figures.rates.covers(&census.formats(), &census.layouts()), "invariant violated: the figures price every format and layout of the load's censuses");
             assert_eq!(census.decode_rows(), decode_rows, "invariant violated: a load's censuses decode up to the same rows");
         }
-        Self { source: Arc::new(Source { target, figures, lookahead, priced: Mutex::default() }) }
+        if let Some(draft) = &draft {
+            for census in draft.censuses() {
+                assert!(
+                    figures.rates.covers(&census.formats(), &census.layouts()),
+                    "invariant violated: the figures price every format and layout of the load's draft censuses"
+                );
+            }
+        }
+        Self {
+            source: Arc::new(Source {
+                target,
+                draft,
+                figures,
+                lookahead,
+                priced: Mutex::default(),
+                priced_verify: Mutex::default(),
+                priced_draft: Mutex::default(),
+            }),
+        }
+    }
+
+    /// The structural class of the load's drafter, if censused.
+    pub fn draft_method(&self) -> Option<DraftMethod> {
+        self.source.draft.as_ref().map(|draft| draft.method)
+    }
+
+    /// Prior wall-clock seconds of a drafter launch generating `generated`
+    /// proposals for `sequences` sequences at `depth` tokens, unpipelined
+    /// (`lookahead: false`). Returns `Ok(None)` when no draft census is held
+    /// or `generated == 0`.
+    pub fn draft_seconds(&self, sequences: u32, generated: u8, depth: u32) -> Result<Option<f64>, PriceError> {
+        let Source { draft, figures, priced_draft, .. } = &*self.source;
+        let Some(draft) = draft else {
+            return Ok(None);
+        };
+        let Some(width) = draft.width(generated) else {
+            return Ok(None);
+        };
+        let key = (sequences, width.proposals, depth);
+        {
+            let cache = priced_draft.lock().expect("a load's priced draft launches");
+            if let Some(&seconds) = cache.get(&key) {
+                return Ok(Some(seconds));
+            }
+        }
+        let seconds = SpeculativePrice::draft_launch(width, figures, u64::from(sequences.max(1)), depth)?;
+        priced_draft.lock().expect("a load's priced draft launches").insert(key, seconds);
+        Ok(Some(seconds))
+    }
+
+    /// Whether the target model uses a banked/streamed MoE plan (whose live step
+    /// time includes streaming miss service, so GPU-only `.resident` launch priors
+    /// must not be used in place of `StreamedVerifyPrior`).
+    pub fn is_banked(&self) -> bool {
+        matches!(self.source.target, TargetCensus::Banked { .. })
+    }
+
+    /// Prior wall-clock seconds of an unpipelined speculative verify launch
+    /// (`lookahead: false`) of `rows` rows for `sequences` sequences at
+    /// `depth` tokens, in each form (`resident` and `streamed`).
+    pub fn verify_seconds(&self, sequences: u32, rows: u32, depth: u32) -> Result<FormSeconds, PriceError> {
+        let Source { target, figures, priced_verify, .. } = &*self.source;
+        let key = (sequences, rows, depth);
+        {
+            let cache = priced_verify.lock().expect("a load's priced verify launches");
+            if let Some(&seconds) = cache.get(&key) {
+                return Ok(seconds);
+            }
+        }
+        let pricing = Pricing { figures, lookahead: false };
+        let seconds = target.each(|census| launch_terms(census, &pricing, sequences.into(), rows.into(), depth))?;
+        priced_verify.lock().expect("a load's priced verify launches").insert(key, seconds);
+        Ok(seconds)
+    }
+
+    /// Prior wall-clock seconds of a plain 1-row-per-sequence decode launch of
+    /// `sequences` sequences at `depth` tokens under the load's `lookahead`
+    /// policy, in each form.
+    pub fn plain_seconds(&self, sequences: u32, depth: u32) -> Result<FormSeconds, PriceError> {
+        self.target(sequences, sequences, depth)
     }
 
     /// The sequences a launch of `rows` rows runs: beyond the decode rows
@@ -232,7 +325,7 @@ impl LaunchPrices {
     /// is not kept. A two-row decode launch's sequences are its requests,
     /// fewer than its rows.
     pub fn target(&self, sequences: u32, rows: u32, depth: u32) -> Result<FormSeconds, PriceError> {
-        let Source { target, figures, lookahead, priced } = &*self.source;
+        let Source { target, figures, lookahead, priced, .. } = &*self.source;
         let mut priced = priced.lock().expect("a load's priced launches");
         if let Some(&seconds) = priced.get(&(sequences, rows, depth)) {
             return Ok(seconds);

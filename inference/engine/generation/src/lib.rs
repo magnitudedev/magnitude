@@ -1167,6 +1167,12 @@ impl Generation {
         self.method_factory.observe_streamed_prior(prior);
     }
 
+    /// Observe the load's analytical [`magnitude_cost_model::LaunchPrices`]
+    /// snapshot, forwarding to this generation's method.
+    pub fn observe_launch_prices(&self, prices: Option<magnitude_cost_model::LaunchPrices>) {
+        self.method_factory.observe_launch_prices(prices);
+    }
+
     pub fn commit_method_transition(&mut self, transition: PreparedMethodTransition) {
         assert!(
             self.resident_position == transition.expected_resident_position

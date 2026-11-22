@@ -46,15 +46,19 @@ mod vision_traces;
 pub mod synthetic;
 
 pub use assess::{
-    assess_execution_fit, assess_execution_fit_with_priced_bank, decode_demand, estimate_execution,
-    launch_prices, lookahead, execution_memory_charge, PricedBankContext, StructuralCharge,
-    TargetLayoutCache, prepare_execution_assessment, AssessmentRequest, ColdSource, DomainFit,
-    ExecutionAssessment, ExecutionFit, ExecutionShortfall, ExpertShares, FileOnly, MemoryBreakdown,
-    ModelPlacement, PreparedExecutionAssessment, Residency,
+    assess_execution_fit, assess_execution_fit_with_priced_bank, decode_demand, draft_demand,
+    estimate_execution, launch_prices, lookahead, execution_memory_charge, PricedBankContext,
+    StructuralCharge, TargetLayoutCache, prepare_execution_assessment, AssessmentRequest,
+    ColdSource, DomainFit, ExecutionAssessment, ExecutionFit, ExecutionShortfall, ExpertShares,
+    FileOnly, MemoryBreakdown, ModelPlacement, PreparedDemands, PreparedExecutionAssessment,
+    Residency,
 };
 pub use crate::programs::graph::sizing::SizingScope;
-pub use demand::{format_of, layout_of, Call, DecodeDemand};
-pub use estimate::{estimate_decode, expert_pass, performance_depths, PerformanceEstimate};
+pub use demand::{format_of, layout_of, Call, DecodeDemand, DraftDemand, DraftWidthDemand};
+pub use estimate::{
+    estimate_decode, estimate_decode_speculative, expert_pass, performance_depths,
+    PerformanceEstimate,
+};
 pub use executor_costs::{
     ChainCost, CostWalk, Derived, ExecutorCosts, ExecutorCostsError, FormatRates, Held, HistoryCosts,
     MatrixCosts, MeasuredCost, Measurement, Placement, Placements, Required, RouteCosts, StoredCosts,

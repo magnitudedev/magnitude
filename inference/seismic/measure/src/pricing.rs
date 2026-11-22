@@ -362,6 +362,19 @@ impl Rates {
         })
     }
 
+    /// The seconds of routed expert `slab_flops` in a decode form reading
+    /// `experts` distinct slabs and computing `picks` row-slab picks: each
+    /// active slab runs a GEMV of `picks / experts` rows on average, so its
+    /// decode-line time is `one * (experts * line.fixed + picks * line.row)`,
+    /// no faster than the matrix throughput `compute(slab_flops, picks)`.
+    pub fn decode_expert_compute(&self, slab_flops: &[Flops], experts: f64, picks: f64) -> f64 {
+        let matrix = self.compute(slab_flops, picks);
+        self.decode.map_or(matrix, |line| {
+            let one = slab_flops.iter().map(|flops| flops.flops as f64).sum::<f64>();
+            matrix.max(one * (experts * line.fixed + picks * line.row))
+        })
+    }
+
     /// `work`'s history figure where an attention entry reads its history;
     /// none where it reads none or no entry does, or why its layout has
     /// none.
@@ -481,30 +494,38 @@ impl ExpertRead {
 /// independently, each computing every pick.
 pub fn call_seconds(work: &Work, history: Option<&HistoryFigure>, rates: &Rates, rows: u64, sequences: u64, depth: u32, launches: u64) -> CallSeconds {
     let read = work.experts.as_ref().map(|experts| ExpertRead::independent(experts, rows));
-    let compute = rates.compute(&work.row_flops, rows as f64);
-    seconds(work, history, rates, rows, sequences, depth, launches, compute, read)
+    seconds(work, history, rates, rows, sequences, depth, launches, false, read)
 }
 
 /// The time of `work` as [`call_seconds`] prices it, in a decode form
-/// ([`Rates::decode_compute`]), a routed call's rows reading and computing
-/// `read` (none exactly where it routes nothing).
+/// ([`Rates::decode_compute`] and [`Rates::decode_expert_compute`]), a routed
+/// call's rows reading and computing `read` (none exactly where it routes
+/// nothing).
 #[allow(clippy::too_many_arguments)]
 pub fn decode_call_seconds(work: &Work, history: Option<&HistoryFigure>, rates: &Rates, rows: u64, sequences: u64, depth: u32, launches: u64, read: Option<ExpertRead>) -> CallSeconds {
-    let compute = rates.decode_compute(&work.row_flops, rows as f64);
-    seconds(work, history, rates, rows, sequences, depth, launches, compute, read)
+    seconds(work, history, rates, rows, sequences, depth, launches, true, read)
 }
 
-/// The time of `work` as [`call_seconds`] prices it, its rows' arithmetic
-/// `compute` seconds, its routed experts read and computed as `read` (none
-/// exactly where it routes nothing).
+/// The time of `work` as [`call_seconds`] prices it, in either decode
+/// (`decode == true`) or batch/matrix form, its routed experts read and
+/// computed as `read` (none exactly where it routes nothing).
 #[allow(clippy::too_many_arguments)]
-fn seconds(work: &Work, history: Option<&HistoryFigure>, rates: &Rates, rows: u64, sequences: u64, depth: u32, launches: u64, mut compute: f64, read: Option<ExpertRead>) -> CallSeconds {
+fn seconds(work: &Work, history: Option<&HistoryFigure>, rates: &Rates, rows: u64, sequences: u64, depth: u32, launches: u64, decode: bool, read: Option<ExpertRead>) -> CallSeconds {
     let (rows_f, sequences) = (rows as f64, sequences as f64);
+    let mut compute = if decode {
+        rates.decode_compute(&work.row_flops, rows_f)
+    } else {
+        rates.compute(&work.row_flops, rows_f)
+    };
     let mut bytes = rates.weights(&work.weights, 1.0);
     match (&work.experts, read) {
         (Some(experts), Some(read)) => {
             bytes += rates.weights(&experts.slab_bytes, read.experts);
-            compute += rates.compute(&experts.slab_flops, read.picks);
+            compute += if decode {
+                rates.decode_expert_compute(&experts.slab_flops, read.experts, read.picks)
+            } else {
+                rates.compute(&experts.slab_flops, read.picks)
+            };
         }
         (None, None) => {}
         _ => panic!("invariant violated: a call's experts are read exactly where it routes"),
@@ -535,9 +556,13 @@ fn seconds(work: &Work, history: Option<&HistoryFigure>, rates: &Rates, rows: u6
 }
 
 /// The calls of `works`' time at one row and `depth` tokens alone, each a
-/// launch: what a composition chain's calls are priced at alone.
+/// launch, in decode form: what a composition chain's calls are priced at
+/// alone, matching `step_seconds`.
 pub fn calls_seconds(works: &[Work], rates: &Rates, depth: u32) -> Result<f64, PriceError> {
-    works.iter().try_fold(0.0, |seconds, work| Ok(seconds + call_seconds(work, rates.history_of(work)?, rates, 1, 1, depth, 1).total()))
+    works.iter().try_fold(0.0, |seconds, work| {
+        let read = work.experts.as_ref().map(|experts| ExpertRead::independent(experts, 1));
+        Ok(seconds + decode_call_seconds(work, rates.history_of(work)?, rates, 1, 1, depth, 1, read).total())
+    })
 }
 
 /// A call's time in a launch and the calls of it the launch makes.

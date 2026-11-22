@@ -13,13 +13,17 @@ use super::AssessmentError;
 use crate::operators::parallel::DenseBesideRouted;
 use crate::operators::routed::streamed;
 use crate::operators::streams::{BlockStreams, SinkhornBinding};
-use crate::programs::graph::sizing::{ReadoutSizingCensus, SizedCall, TargetFamilySizingCensus};
+use crate::programs::graph::sizing::{
+    DraftFamilySizingCensus, ReadoutSizingCensus, SizedCall, TargetFamilySizingCensus,
+};
 use crate::{
     AssessmentGraphResourceBounds, CandidatesBinding, FeedForwardProgramSlot, MixerProgramSlot,
     ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner,
     TargetBlockProgramSlot,
 };
-use magnitude_cost_model::{Census, Kind, LaunchCounts, LayerCall, RoutedCall};
+use magnitude_cost_model::{
+    Census, DraftCensus, DraftMethod, DraftWidthCensus, Kind, LaunchCounts, LayerCall, RoutedCall,
+};
 use magnitude_family_contracts::{ModelDefinition, SublayerIndex, WeightScope};
 use magnitude_kernels as kernels;
 use magnitude_state::{HistoryDomainLayout, KvCodec, LayerRef, ModelStateLayout};
@@ -831,6 +835,137 @@ impl DecodeDemand {
 
         Ok(Self { calls, boundaries })
     }
+}
+
+/// One candidate draft width's decode demand.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DraftWidthDemand {
+    pub proposals: u8,
+    pub rows_per_sequence: u64,
+    pub demand: DecodeDemand,
+}
+
+/// Demand of a load's drafter across its certified proposal widths.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DraftDemand {
+    pub method: DraftMethod,
+    pub widths: Vec<DraftWidthDemand>,
+    pub max_proposals: u8,
+}
+
+impl DraftDemand {
+    /// Convert this drafter's demand into a cost-model [`DraftCensus`].
+    pub fn census(&self) -> DraftCensus {
+        DraftCensus {
+            method: self.method,
+            widths: self
+                .widths
+                .iter()
+                .map(|w| DraftWidthCensus {
+                    proposals: w.proposals,
+                    rows_per_sequence: w.rows_per_sequence,
+                    census: w.demand.census(),
+                })
+                .collect(),
+            max_proposals: self.max_proposals,
+        }
+    }
+
+    /// Derive drafter demand directly from the `DraftFamilySizingCensus`
+    /// already retained in `graph` during `StructuralCharge::of` (zero extra
+    /// outlining cost). Returns `Ok(None)` when `method` does not draft or no
+    /// proposing widths were recorded.
+    pub(crate) fn from_census(
+        definition: &ModelDefinition,
+        method: PlannedMethod,
+        graph: &AssessmentGraphResourceBounds,
+    ) -> Result<Option<Self>, AssessmentError> {
+        let Some(draft_census) = &graph.draft_census else {
+            return Ok(None);
+        };
+        Self::from_family_census(definition, method, draft_census)
+    }
+
+    pub(crate) fn from_family_census(
+        definition: &ModelDefinition,
+        method: PlannedMethod,
+        draft_census: &DraftFamilySizingCensus,
+    ) -> Result<Option<Self>, AssessmentError> {
+        let draft_method = match method {
+            PlannedMethod::Plain => return Ok(None),
+            PlannedMethod::Mtp { .. } => DraftMethod::Mtp,
+            PlannedMethod::DFlash { .. } => DraftMethod::Block,
+        };
+        if draft_census.widths.is_empty() {
+            return Ok(None);
+        }
+        let vocabulary = definition.decoder.vocabulary;
+        let mut widths = Vec::with_capacity(draft_census.widths.len());
+        for width in &draft_census.widths {
+            if width.calls.is_empty() {
+                continue;
+            }
+            let backend = width.calls[0].backend;
+            let mut calls = Vec::with_capacity(width.calls.len());
+            let mut unused_gate_up_part = false;
+            for sized in &width.calls {
+                calls.push(call_from_sized(
+                    sized,
+                    &[],
+                    vocabulary,
+                    None,
+                    &mut unused_gate_up_part,
+                )?);
+            }
+            let boundaries = if !backend.parks_in_kernels() {
+                width.timelines as u64
+            } else {
+                0
+            };
+            widths.push(DraftWidthDemand {
+                proposals: width.proposals,
+                rows_per_sequence: width.rows_per_sequence,
+                demand: DecodeDemand { calls, boundaries },
+            });
+        }
+        if widths.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            method: draft_method,
+            widths,
+            max_proposals: method.widest(),
+        }))
+    }
+}
+
+/// Outline only the drafter family via `SizingDraft` and build `DraftDemand`
+/// for load-time `LaunchPrices` (returns `Ok(None)` when `method` does not
+/// draft).
+pub(crate) fn draft_demand_direct(
+    definition: &ModelDefinition,
+    load: &ModelLoadPlan,
+    codec: KvCodec,
+    method: PlannedMethod,
+    limits: ResourceLimits,
+    capacity: ResourceCapacity,
+    backend: BackendName,
+) -> Result<Option<DraftDemand>, AssessmentError> {
+    if !method.drafts() {
+        return Ok(None);
+    }
+    let plan = AssessmentGraphResourceBounds::program_plan(definition, load, method, codec)
+        .map_err(AssessmentError::Graph)?;
+    let state = ResourcePlanner::state_plan(definition, load, method, codec, limits, capacity)
+        .map_err(AssessmentError::Plan)?;
+    let Some(draft_census) = AssessmentGraphResourceBounds::drafter_census_direct(
+        definition, load, &plan, &state, method, limits, backend,
+    )
+    .map_err(AssessmentError::Graph)?
+    else {
+        return Ok(None);
+    };
+    DraftDemand::from_family_census(definition, method, &draft_census)
 }
 
 /// Outline only the target and readout families via `SizingDraft` and build
