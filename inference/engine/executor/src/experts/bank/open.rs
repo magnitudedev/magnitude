@@ -610,10 +610,15 @@ fn watch(
                 let lender = plan.scratch().lender;
                 let lent = usize::try_from(lender.records).map_err(|_| "lent records exceed the host")?;
                 // Reserve a dedicated even/odd double-buffered DMA staging ring
-                // (`2 * K` records per group, ~24-60 MB total, 0.1% of 32 GB
-                // VRAM) on every partial discrete-GPU group, completely
-                // independent of `lent == 0` and prompt scratch leases.
-                let want = (plan.selected() as usize).saturating_mul(2);
+                // on every partial discrete-GPU group, sized for the active
+                // lookahead window (`HINT_LEADS + 1` simultaneous layers:
+                // executing layer `l` plus lookahead layers `l+1..=l+HINT_LEADS`)
+                // at verify burst width (`VERIFY_ROWS`) scaled by the group's
+                // actual VRAM miss fraction, bounded to a small share of
+                // available records so permanent residency is preserved.
+                let k = plan.selected() as usize;
+                let verify_rows = magnitude_kernels::constants::VERIFY_ROWS as usize;
+                let lookahead_layers = crate::planning::HINT_LEADS as usize + 1;
                 let stage_slots = (0..tiers.len())
                     .map(|group| {
                         if plan.whole() {
@@ -622,8 +627,18 @@ fn watch(
                         let present = bank.present(group) as usize;
                         let start = if group == lender.group { lent } else { 0 };
                         let avail = present.saturating_sub(start);
-                        // Preserve at least 1 permanent bank record if possible.
-                        let max_stage = avail.saturating_sub(1) & !1;
+                        let group_layers = plan.groups()[group].layers.len();
+                        let active_layers = lookahead_layers.min(group_layers);
+                        let total_experts = plan.group_experts(group) as usize;
+                        let miss_frac = (1.0 - (present as f64 / total_experts.max(1) as f64)).clamp(0.0, 1.0);
+                        // Expected unique misses per layer across VERIFY_ROWS
+                        // (accounting for ~50% cross-row expert overlap, at least K).
+                        let misses_per_layer = ((miss_frac * (k * verify_rows) as f64 * 0.5).ceil() as usize).max(k);
+                        let want = active_layers.saturating_mul(misses_per_layer).saturating_mul(2);
+                        // Cap at 1/16th of available records (with a 2*K floor when
+                        // capacity allows), always even and leaving >= 1 permanent record.
+                        let share_cap = (avail / 16).max(k.saturating_mul(2));
+                        let max_stage = share_cap.min(avail.saturating_sub(1)) & !1;
                         want.min(max_stage)
                     })
                     .collect();

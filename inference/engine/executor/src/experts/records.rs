@@ -619,10 +619,15 @@ impl BankRecords {
     }
 
     /// Whether any promotion is in flight, any release draining, or any
-    /// opportunistic staging slot active (in-flight DMA or held for an
-    /// unretired step).
+    /// opportunistic staging DMA batch is currently in flight.
+    ///
+    /// Landed staging slots (`batch.is_none()`, `tier.is_none()`) hold no copy
+    /// batch and no host-tier pin and live in `stage_rings` (excluded from
+    /// eviction by construction), so they must NOT mark the bank as moving —
+    /// otherwise a resize waiting on `moving()` would deadlock waiting for a
+    /// future `target_step` that cannot begin until the resize completes.
     pub fn moving(&self) -> bool {
-        !self.promoting.is_empty() || !self.releasing.is_empty() || !self.staging.is_empty()
+        !self.promoting.is_empty() || !self.releasing.is_empty() || self.staging_in_flight()
     }
 
     /// The promotions in flight, releases draining, and active staging slots,
@@ -632,14 +637,14 @@ impl BankRecords {
         format!("promotions {:?}, releases {:?}, staging {:?}", records(&self.promoting), records(&self.releasing), records(&self.staging))
     }
 
-    /// Find a free slot in `group`'s dedicated parity half for `target_step`
-    /// (`range.start..range.start + half` for even steps,
-    /// `range.start + half..range.end` for odd steps, where `half = range.len() / 2`),
-    /// completely independent of `lent == 0` and prompt scratch leases.
-    /// Enforces zero aliasing by construction: returns `None` if any slot in
-    /// that parity half still holds `Record::Staging` for a different step
-    /// `!= target_step` (until `drain_staging(frontier)` frees it once
-    /// `Steps::frontier() > prev_target`).
+    /// Find a free (`Record::StageIdle`) slot in `group`'s dedicated parity
+    /// half for `target_step` (`range.start..range.start + half` for even
+    /// steps, `range.start + half..range.end` for odd steps, where
+    /// `half = range.len() / 2`). Every `StageIdle` slot has already been
+    /// proven unreferenced by `drain_staging(progress, steps)` via
+    /// `Steps::step_served`, and `MAP_STAGE` is step-stamped, so slots
+    /// reclaimed after earlier layers of the same step (or prior steps) can be
+    /// reused immediately without aliasing.
     pub fn free_stage_slot(&self, group: usize, target_step: Step) -> Option<usize> {
         let range = self.stage_rings.get(group)?;
         let half = range.len() / 2;
@@ -649,10 +654,22 @@ impl BankRecords {
         let parity = (target_step & 1) as usize;
         let base = range.start + parity * half;
         let slice = &self.groups[group].contents[base..base + half];
-        if slice.iter().any(|content| matches!(content, Record::Staging { target_step: prev, .. } if *prev != target_step)) {
-            return None;
-        }
         slice.iter().position(|&content| content == Record::StageIdle).map(|offset| base + offset)
+    }
+
+    /// Number of active (in-flight or landed) staging slots currently held in
+    /// `group` for `target_step`.
+    pub fn staged_for_step(&self, group: usize, target_step: Step) -> usize {
+        self.staging
+            .iter()
+            .filter(|&&(g, record)| {
+                g == group
+                    && matches!(
+                        self.groups[g].contents[record],
+                        Record::Staging { target_step: step, .. } if step == target_step
+                    )
+            })
+            .count()
     }
 
     /// Transition `StageIdle -> Staging` for an opportunistic DMA staging copy
@@ -702,15 +719,19 @@ impl BankRecords {
         (staged, tier)
     }
 
-    /// Drain landed `Record::Staging` slots whose `target_step` has passed
-    /// `frontier` (`frontier > target_step`), returning them to `Record::StageIdle`.
-    /// Never frees a slot whose DMA batch is still in flight (`batch.is_some()`).
-    pub fn drain_staging(&mut self, frontier: Step) -> bool {
+    /// Drain landed `Record::Staging` slots whose `(target_step, layer)` has
+    /// been served (`steps.step_served(target_step, layer, progress)` — i.e.,
+    /// `target_step` has passed `layer`, ended, or fallen below `frontier`),
+    /// returning them to `Record::StageIdle` immediately so later layers of the
+    /// same step can reuse the staging ring.
+    /// Never frees a slot whose DMA batch is still in flight (`batch.is_some()`),
+    /// nor a slot staged for a future step that has not yet begun.
+    pub fn drain_staging(&mut self, progress: Point, steps: &super::watcher::Steps) -> bool {
         let (drained, kept) = std::mem::take(&mut self.staging).into_iter().partition::<Vec<_>, _>(|&(group, record)| {
-            let Record::Staging { target_step, batch, .. } = self.groups[group].contents[record] else {
+            let Record::Staging { staged: (layer, _), target_step, batch, .. } = self.groups[group].contents[record] else {
                 panic!("record {record} of group {group} is listed staging");
             };
-            batch.is_none() && frontier > target_step
+            batch.is_none() && steps.step_served(target_step, layer, progress)
         });
         self.staging = kept;
         for &(group, record) in &drained {
@@ -1249,21 +1270,25 @@ mod tests {
     }
 
     /// `Record::Staging` lives in a dedicated even/odd double-buffered ring in
-    /// `BankRecords` completely independent of `lent == 0`, is covered by
-    /// `moving()`, protected from shrinks and promotions, and frees slots only
-    /// once `drain_staging(frontier)` observes `frontier > target_step` and the
-    /// DMA batch has landed.
+    /// `BankRecords` completely independent of `lent == 0`, marks `moving()`
+    /// ONLY while its DMA batch is in flight (never once landed, preventing
+    /// resize deadlocks on future `target_step`s), is protected from shrinks
+    /// and promotions, and reclaims slots per layer as `Steps::step_served`
+    /// observes `progress` pass `(target_step, layer)` (never draining a future
+    /// step that has not begun yet).
     #[test]
-    fn record_staging_is_covered_by_moving_and_drains_past_frontier() {
+    fn record_staging_reclaims_per_layer_and_moving_tracks_in_flight_only() {
         // Dedicated staging ring with `lent == 0`: slots 0 (even) and 1 (odd),
         // permanent bank records 2..4.
         let (mut bank, _) = bank_with_staging(4, 0, 2);
+        let steps = super::super::watcher::Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new());
+        steps.begin_through(3);
         assert!(!bank.moving());
         assert_eq!(bank.stage_ring_half(0), 1);
         assert_eq!(bank.capacity(0), 2, "staging ring slots are excluded from permanent decode capacity");
         assert_eq!(bank.evictable(0).map(|(r, _)| r).collect::<Vec<_>>(), [2, 3], "staging ring is never evictable");
 
-        // Step 2 (even): takes slot 0 even though lent == 0.
+        // Step 2 (even), layer 0: takes slot 0 even though lent == 0.
         assert_eq!(bank.free_stage_slot(0, 2), Some(0));
         bank.stage(0, 0, (0, 5), 2, HostRecord(10), 42, 0);
         assert!(bank.moving(), "in-flight staging must mark BankRecords::moving()");
@@ -1275,25 +1300,33 @@ mod tests {
         assert_eq!(bank.free_stage_slot(0, 3), Some(1));
         bank.stage(0, 1, (0, 6), 3, HostRecord(11), 43, 1);
 
-        // Frontier advances past step 2 while DMA is still in flight -> must NOT drain!
-        assert!(!bank.drain_staging(3));
+        // Progress passes layer 0 of step 2 while DMA is still in flight -> must NOT drain!
+        assert!(!bank.drain_staging(Point::whole(2, 1, 2), &steps));
         assert!(bank.moving());
 
-        // DMA lands for step 2 -> tier hold released, but slot stays Staging until frontier > 2.
+        // DMA lands for step 2 -> tier hold released; slot stays Staging while
+        // progress is still at layer 0 of step 2, then drains immediately once
+        // progress enters layer 1 of the SAME step 2 (reusable for later layers!).
         assert_eq!(bank.staged_landed(0, 0), ((0, 5), HostRecord(10)));
         assert_eq!(bank.staged_entry(0, (0, 5)), Some((0, 2, None)));
-        assert!(!bank.drain_staging(2), "frontier == target_step must not drain");
-        assert_eq!(bank.free_stage_slot(0, 4), None, "even half blocked while step 2 is unretired");
+        assert!(!bank.drain_staging(Point::whole(2, 0, 2), &steps), "same layer must not drain");
+        assert!(bank.drain_staging(Point::whole(2, 1, 2), &steps), "layer 0 must drain once step 2 enters layer 1");
+        assert_eq!(bank.free_stage_slot(0, 2), Some(0), "slot 0 immediately reusable for later layer of step 2");
+        assert!(bank.moving(), "step 3 still has an in-flight DMA batch");
 
-        // Frontier > 2 drains slot 0 cleanly while step 3 (in-flight) stays active.
-        assert!(bank.drain_staging(3));
+        // Stage for future step 4 (not yet begun > steps.last == 3), land its DMA:
+        // must NOT drain before step 4 begins, AND must NOT mark `moving()` once
+        // landed (so a resize waiting on `moving()` cannot deadlock!).
         assert_eq!(bank.free_stage_slot(0, 4), Some(0));
-        assert!(bank.moving(), "step 3 still staging");
+        bank.stage(0, 0, (0, 7), 4, HostRecord(12), 44, 0);
+        assert_eq!(bank.staged_landed(0, 0), ((0, 7), HostRecord(12)));
+        assert!(!bank.drain_staging(Point::whole(3, 10, 3), &steps), "future step 4 must not drain before beginning");
 
-        // Cancel/unstage step 3 frees slot 1 immediately -> moving() becomes false.
+        // Cancel/unstage step 3 frees slot 1 immediately -> no in-flight DMA left,
+        // so `moving()` is false even while step 4's landed slot stays reserved.
         assert_eq!(bank.unstage(0, 1), ((0, 6), Some(HostRecord(11))));
-        assert!(!bank.moving());
         assert!(!bank.staging_in_flight());
+        assert!(!bank.moving(), "landed staging slot for future step must not block resize via moving()");
 
         // Disjoint from prompt scratch `0..lent`: when `lent == 2` and
         // `stage_slots == 2`, staging uses `2..4` and prompt `lease()` takes

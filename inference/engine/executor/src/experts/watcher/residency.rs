@@ -430,7 +430,7 @@ impl Residency {
             return false;
         }
         self.core.retired = frontier;
-        self.core.directory.drain_staging(frontier);
+        self.core.directory.drain_staging(self.prefetch.reached(), &self.core.steps);
         if let Some(past) = self.shared.steps.retire_groups(frontier) {
             self.advance(past);
         }
@@ -481,6 +481,7 @@ impl Residency {
         }
         // The tiers it is past place their seeds, which it is past too.
         self.scratch.advance(progress, &mut self.core);
+        self.core.directory.drain_staging(progress, &self.core.steps);
         self.core.retire(progress);
     }
 

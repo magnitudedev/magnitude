@@ -239,10 +239,26 @@ impl LinkMover {
             }
         }
 
-        // 4. Drain releases and landed staging slots past the frontier.
+        // 4. Drain releases and landed staging slots whose (target_step, layer)
+        //    has been served at `progress`.
         moved |= core.directory.drain(progress, &core.steps);
-        moved |= core.directory.drain_staging(core.steps.frontier());
+        moved |= core.directory.drain_staging(progress, &core.steps);
         moved
+    }
+
+    /// Cancel every unbegun opportunistic staging batch on `copier`, freeing
+    /// its staging slot and host-tier hold immediately (used when a resize
+    /// waits for in-flight copies to drain, matching `Prefetch::cancel_cover`).
+    pub(super) fn cancel_unbegun(&mut self, core: &mut Core, copier: &Copier) -> bool {
+        let mut cancelled = false;
+        for (group, slot, batch) in core.directory.staging_copying() {
+            if copier.copies.cancel(batch) {
+                self.stage_issued.remove(&(group, slot));
+                core.directory.unstage(group, slot);
+                cancelled = true;
+            }
+        }
+        cancelled
     }
 
     /// One turn of Path 0: size promotion reserves, settle in-flight copies,
@@ -288,7 +304,7 @@ impl LinkMover {
 
         // Priority 2: Opportunistic staging from NameLedger + DraftWindow carryover
         // (works on BOTH 100%-RAM and unsettled 3-tier workloads!).
-        moved |= self.stage_predicted(core, ledger, shared, copier, &copy, &bytes);
+        moved |= self.stage_predicted(core, ledger, shared, copier, &copy, &bytes, progress);
 
         // Priority 3: Permanent promotions filling remaining copy-engine depth.
         moved |= self.ask(core, shared, copier, &copy);
@@ -322,6 +338,7 @@ impl LinkMover {
     /// carryover. No `group_tier_settled` blackout: any `Located::Kept` Tier-1
     /// expert absent from Tier 0 is eligible on both 100%-RAM and unsettled
     /// 3-tier workloads.
+    #[allow(clippy::too_many_arguments)]
     fn stage_predicted(
         &mut self,
         core: &mut Core,
@@ -330,31 +347,41 @@ impl LinkMover {
         copier: &Copier,
         copy: &TierCopyCosts,
         bytes: &[u64],
+        progress: Point,
     ) -> bool {
         if core.steps.prompt_running() {
             return false;
         }
         let (frontier, next_step) = core.steps.unbegun_beside_frontier(|frontier, at| (frontier, at.next()));
-        let mut moved = core.directory.drain_staging(frontier);
+        let mut moved = core.directory.drain_staging(progress, &core.steps);
 
         let admission = shared.telemetry.link_admission(Some(copy.transfer));
         let layers = core.layers.len();
         let c_layer = if layers == 0 { 0.0 } else { admission.terms.compute / layers as f64 };
+        // Hints look up to `HINT_LEADS` layers ahead, so the compute overlap
+        // horizon spans `HINT_LEADS * c_layer`.
+        let c_window = (crate::planning::HINT_LEADS as f64) * c_layer;
         let draft_idle = ledger.draft_window_remaining(Instant::now());
         let wanted_all = ledger.wanted();
 
         for group in 0..core.groups.len() {
-            if core.directory.stage_ring_half(group) == 0 || core.directory.group_whole(group) {
+            let ring_half = core.directory.stage_ring_half(group);
+            if ring_half == 0 || core.directory.group_whole(group) {
                 continue;
             }
             let record_bytes = bytes[group];
             if record_bytes == 0 {
                 continue;
             }
-            let depth = copy.depth(record_bytes);
+            // Opportunistic `Stage` batches are priority-ordered by
+            // `(step, layer, -p)` and cancellable while waiting in `Copies`,
+            // so allow queuing up to the parity-half capacity (at least
+            // `copy.depth`) so all hints for `l+1..=l+HINT_LEADS` stream back-
+            // to-back at PCIe line rate without per-pair host wakeups.
+            let stage_depth = copy.depth(record_bytes).max(ring_half);
             let queued_batches = core.directory.copying().len() + core.directory.backing().len() + core.directory.staging_copying().len();
             let queued_on_link = queued_batches as f64 * copy.transfer.transfer_seconds(record_bytes as f64);
-            let idle = Cell::new(LinkIdleBudget::new(c_layer, draft_idle, queued_on_link));
+            let idle = Cell::new(LinkIdleBudget::new(c_window, draft_idle, queued_on_link));
 
             // Gather wanted experts in `group` plus any currently-copying staging
             // experts (so fallen/passed unbegun staging batches can be cancelled).
@@ -421,7 +448,7 @@ impl LinkMover {
                             }
                         }
                         Act::Issue(Class::Expected { step, p }) => {
-                            if copier.copies.flight() >= depth {
+                            if copier.copies.flight() >= stage_depth {
                                 continue;
                             }
                             let target_step = if step < frontier || core.steps.ended(step) { next_step } else { step };
@@ -429,7 +456,7 @@ impl LinkMover {
                                 continue;
                             };
                             let priority = TransferPriority::Stage { step: target_step, layer, p };
-                            match post_stage(core, copier, depth, priority, group, slot, target_step, staged) {
+                            match post_stage(core, copier, stage_depth, priority, group, slot, target_step, staged) {
                                 Ok(Some((tier, ticket))) => {
                                     self.stage_issued.insert((group, slot), (target_step, Instant::now()));
                                     core.directory.stage(group, slot, staged, target_step, tier, ticket, (target_step & 1) as u8);
@@ -447,10 +474,14 @@ impl LinkMover {
             }
 
             // DraftWindow carryover on Link: while an MTP draft window is active,
-            // fill remaining LinkIdleBudget and parity slots with top Tier-1-only
-            // Reuse carryover experts for `next_step`.
-            if draft_idle > 0.0 && copier.copies.flight() < depth && idle.get().remaining() > 0.0 {
-                let room = depth.saturating_sub(copier.copies.flight());
+            // fill up to half of `next_step`'s parity ring with top Tier-1-only
+            // Reuse carryover experts (sorted earliest-layer-first so layer 0..
+            // warm up while keeping >= half the ring free for live within-pass
+            // `routed_hint_route` hints once `next_step` begins).
+            let carryover_cap = (ring_half / 2).max(1);
+            let carryover_room = carryover_cap.saturating_sub(core.directory.staged_for_step(group, next_step));
+            if draft_idle > 0.0 && carryover_room > 0 && copier.copies.flight() < stage_depth && idle.get().remaining() > 0.0 {
+                let room = stage_depth.saturating_sub(copier.copies.flight()).min(carryover_room);
                 let carryover = {
                     let reuse = core.directory.reuse_now();
                     reuse.top_candidates(room, |layer, expert| {
@@ -467,7 +498,7 @@ impl LinkMover {
                     .collect();
                 carryover.sort_by_key(|&(_, layer, _)| layer);
                 for (uses, layer, expert) in carryover {
-                    if copier.copies.flight() >= depth {
+                    if copier.copies.flight() >= stage_depth {
                         break;
                     }
                     let mut budget = idle.get();
@@ -479,7 +510,7 @@ impl LinkMover {
                         break;
                     };
                     let priority = TransferPriority::Stage { step: next_step, layer, p: uses.clamp(0.0, 1.0) };
-                    match post_stage(core, copier, depth, priority, group, slot, next_step, (layer, expert)) {
+                    match post_stage(core, copier, stage_depth, priority, group, slot, next_step, (layer, expert)) {
                         Ok(Some((tier, ticket))) => {
                             self.stage_issued.insert((group, slot), (next_step, Instant::now()));
                             core.directory.stage(group, slot, (layer, expert), next_step, tier, ticket, (next_step & 1) as u8);

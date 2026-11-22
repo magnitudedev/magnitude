@@ -1609,10 +1609,15 @@ impl Directory {
         staged
     }
 
-    /// Drain landed staging slots whose `target_step < frontier`
+    /// Drain landed staging slots whose `(target_step, layer)` has been served
     /// ([`BankRecords::drain_staging`]).
-    pub fn drain_staging(&mut self, frontier: Step) -> bool {
-        self.bank.drain_staging(frontier)
+    pub fn drain_staging(&mut self, progress: Point, steps: &super::watcher::Steps) -> bool {
+        self.bank.drain_staging(progress, steps)
+    }
+
+    /// Number of active staging slots currently held in `group` for `target_step`.
+    pub fn staged_for_step(&self, group: usize, target_step: Step) -> usize {
+        self.bank.staged_for_step(group, target_step)
     }
 
     /// In-flight opportunistic staging DMA batches: `(group, slot, batch)`.

@@ -406,10 +406,13 @@ impl Residency {
         if self.shared.life.ended().is_some() {
             return None;
         }
-        // Whatever is asked, the cover's queued reads yield: a resize waits
-        // for the reads that run, and a cut of the tier is deferred by the
-        // landings in flight, never by a queue of reads ahead of use.
+        // Whatever is asked, the cover's queued reads and unbegun opportunistic
+        // staging batches yield: a resize waits for the reads and DMA copies
+        // that are actually running, never for queued speculative work.
         self.prefetch.cancel_cover();
+        if let Some(copier) = copier {
+            self.link.cancel_unbegun(&mut self.core, copier);
+        }
         if asked.ask.waits() {
             if self.core.directory.moving() || self.prefetch.outstanding() {
                 return Some(asked);

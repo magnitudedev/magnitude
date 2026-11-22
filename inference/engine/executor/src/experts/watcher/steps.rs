@@ -926,6 +926,24 @@ impl Steps {
         })
     }
 
+    /// Whether `step` has already passed `layer` (its pass there lies strictly
+    /// before `progress`) or ended; `false` while `step` has not yet begun
+    /// (e.g. a future step staged during a draft window).
+    pub(in crate::experts) fn step_served(&self, step: Step, layer: usize, progress: Point) -> bool {
+        let state = self.lock();
+        if step < state.frontier || state.ended.contains(&step) {
+            return true;
+        }
+        if step > state.last {
+            return false;
+        }
+        let first = state.groups.range(..=step).next_back().map_or(step, |(&first, _)| first);
+        state.groups.range(first..=step).all(|(&group, begun)| {
+            !(group..group + begun.steps).contains(&step)
+                || Point { piece: begun.pass(layer).piece, layer, sequence: step, group } < progress
+        })
+    }
+
     /// The first group the device is not past at `progress`: the earlier
     /// of `progress`'s own and the first whose last piece it is not past
     /// (one it runs inside, cut in before that one's later layers).
