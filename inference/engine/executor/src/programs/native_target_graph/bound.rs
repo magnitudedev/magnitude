@@ -50,10 +50,10 @@ pub(crate) struct BoundTargetGraphs {
 
 /// A run of a step of its load's expert bank: the bank, the step's
 /// sequence in it (`ExpertStep::sequence`), whether the step times its
-/// blocks (`ExpertStep::samples`), and whether its chain began resident
-/// (`ChainServing::resident`), so its whole decode blocks take their
-/// resident forms (`PreparedTargetGraphs::run_stage`). Only a load with a
-/// bank holds graphs of bank parts and parks
+/// blocks (`ExpertStep::samples`), and how its chain is served
+/// (`ChainServing`), so each whole decode block takes its resident form
+/// (`PreparedTargetGraphs::run_stage`) and each whole prompt block skips
+/// scratch fills. Only a load with a bank holds graphs of bank parts and parks
 /// (`PreparedTargetGraphs::bind_weights`).
 #[derive(Clone)]
 pub(crate) struct BankRun {
@@ -62,10 +62,28 @@ pub(crate) struct BankRun {
     /// The step's front rows (STEP_FRONT's bits), its step words carry.
     pub(crate) front: u32,
     pub(crate) sampled: bool,
-    pub(crate) resident: bool,
+    pub(crate) serving: crate::experts::ChainServing,
 }
 
 impl BankRun {
+    /// Whether block `index`'s streamed layer runs its resident decode form
+    /// (`RunStage::Resident`) in this chain.
+    pub(crate) fn block_decode_resident(&self, index: usize) -> bool {
+        let Ok(layer) = block_layer(self.bank.plan(), index) else {
+            return false;
+        };
+        self.serving.decode_resident(layer, self.bank.plan().sets_step(layer))
+    }
+
+    /// Whether block `index`'s streamed layer is whole (`POLICY_WHOLE == 1`)
+    /// in this chain, so a prompt group skips `routed_scratch_request` and
+    /// `run_fill` on it.
+    pub(crate) fn block_whole(&self, index: usize) -> bool {
+        let Ok(layer) = block_layer(self.bank.plan(), index) else {
+            return false;
+        };
+        self.serving.layer_whole(layer)
+    }
     /// Bind `graph`'s bank parts for this run as block `index` at chain
     /// place `place` (`placed_banks`), and its park and publication nodes
     /// to the bank's park timeline (`crate::experts::Parks`); the run takes

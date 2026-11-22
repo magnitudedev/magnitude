@@ -483,13 +483,6 @@ impl Residency {
     /// evicts once the copy ends.
     fn serve_evict(&mut self, evicting: Evicting, candidates: &Candidates, chain: Option<ScratchGroup>, trip: impl Fn() -> Trip) -> Result<Option<Evicted>, String> {
         let running = !self.shared.steps.idle();
-        let kept = (0..self.core.groups.len())
-            .map(|group| {
-                evicting == Evicting::Bank
-                    && running
-                    && self.core.layers.iter().enumerate().any(|(index, layer)| layer.group == group && self.shared.telemetry.is_whole(index))
-            })
-            .collect::<Vec<_>>();
         if chain.is_some_and(|chain| !self.shared.steps.latest(chain.last())) {
             return Ok(None);
         }
@@ -499,14 +492,18 @@ impl Residency {
         let last_read = |layer: usize, expert: usize| Reuse::of(&ranking).last(layer, expert);
         let groups = self.core.groups.len();
         let directory = &self.core.directory;
+        let skip_landed_protected = running && self.core.extents.placer == crate::planning::Placer::Bank;
         let held = |group: usize| match evicting {
             Evicting::Bank => directory.records()[group],
             Evicting::Landed => directory.host(group).records() as usize,
         };
         let evictable = |group: usize, target: usize| match evicting {
-            Evicting::Bank if kept[group] => Vec::new(),
-            Evicting::Bank => directory.evictions(group, target, last_read).into_iter().map(|record| u32::try_from(record).expect("bank records fit u32")).collect::<Vec<_>>(),
-            Evicting::Landed => directory.host_evictions(group, u32::try_from(target).expect("host records fit u32")),
+            Evicting::Bank => directory
+                .evictions_filtered(group, target, last_read, running)
+                .into_iter()
+                .map(|record| u32::try_from(record).expect("bank records fit u32"))
+                .collect::<Vec<_>>(),
+            Evicting::Landed => directory.host_evictions_filtered(group, u32::try_from(target).expect("host records fit u32"), skip_landed_protected),
         };
         let most = (0..groups).map(|group| evictable(group, 0).len()).collect::<Vec<_>>();
         let Some((slots, targets)) = deepest(candidates, |group, records| held(group).saturating_sub(records) <= most[group], groups) else {

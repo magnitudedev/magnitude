@@ -480,15 +480,17 @@ fn an_eviction_beside_a_running_group_drops_all_it_has_not_decided() {
 }
 
 /// A bank imported whole into the one store whose shrink evicts only the
-/// tier's reserve keeps every expert at its home, but the store no longer
-/// holds every record its commits span: no layer's whole word stays set, so
-/// no step after the shrink binds the records directly in a resident form.
-/// Two layers of eight experts at their homes in records 0 to 15, the
-/// conveyor lent the bottom four, and a reserve of eight above them; the
-/// shrink to twenty records evicts four of the reserve and keeps every
-/// expert.
+/// tier's reserve keeps every expert at its home (and every home slab
+/// backed): both layers keep `POLICY_WHOLE == 1` because `homes[layer]` is a
+/// per-record slab view over `[home .. home + E)`.
+///
+/// Conversely, when a shrink evicts experts from layer 1 (home 8..16) while
+/// layer 0 (home 0..8) overlaps the lender zone `[0..4)`, layer 1 loses
+/// `POLICY_WHOLE` and layer 0 loses `POLICY_WHOLE` only because its home
+/// overlaps `[0..lent)` while `!every`; a third layer (home 16..24, disjoint
+/// from `[0..4)`) keeps `POLICY_WHOLE == 1` and `POLICY_RESOLVED == 1`!
 #[test]
-fn a_cut_of_a_whole_banks_reserve_alone_ends_its_resident_form() {
+fn a_cut_of_a_whole_banks_reserve_keeps_resident_layers_whole() {
     const RESERVE: u32 = 8;
     let conveying = Conveying::of(4);
     let tier = 2 * EXPERTS as u32 + RESERVE;
@@ -505,8 +507,92 @@ fn a_cut_of_a_whole_banks_reserve_alone_ends_its_resident_form() {
         let directory = &state.core.directory;
         assert!(directory.group_whole(0) && directory.group_at_home(0), "the shrink kept every expert at its home");
     }
-    eventually("a layer stayed resident beside evicted records", || (0..2).all(|layer| whole(layer) == 0));
+    assert!((0..2).all(|layer| whole(layer) == 1), "cutting only the reserve keeps every home slab backed and whole");
     assert_eq!(shared.life.ended(), None, "the watcher serves on");
+}
+
+/// Evicting a single expert from one layer in a multi-layer pooled one-store
+/// bank clears `POLICY_WHOLE` and `POLICY_RESOLVED` ONLY for the partial layer
+/// (and any layer whose home range overlaps `[0 .. lent)`), while all other
+/// layers that still hold every expert at home keep `POLICY_WHOLE == 1` and
+/// `POLICY_RESOLVED == 1`!
+#[test]
+fn evicting_one_layer_in_a_pooled_bank_keeps_disjoint_whole_layers_resident() {
+    let conveying = Conveying::of(4);
+    // 4 layers of 8 experts each = 32 records, bottom 4 lent (`0..4`, inside layer 0's home `0..8`).
+    // Reserve is 2, K = 2 (`reserve + K = 4`), so 1 partial layer (7 records) leaves >= 4 evictable records.
+    let total = 4 * EXPERTS as u32;
+    let harness = lending_bank("per-layer-shrink", EXPERTS, total as u64, 4, STAGING, conveying, total, Placer::Bank, false, 0, true);
+    let whole = |layer: usize| harness.layers[layer].5.load(constants::POLICY_WHOLE as usize);
+    let resolved = |layer: usize| harness.layers[layer].5.load(constants::POLICY_RESOLVED as usize);
+    assert!((0..4).all(|layer| whole(layer) == 1 && resolved(layer) == 1), "all 4 layers start whole");
+
+    // Touch layers 0, 1, 2 so layer 3 is coldest and evicted first by the shrink.
+    let step = harness.step();
+    for layer in 0..3 {
+        harness.route_at(&step, layer, &(0..EXPERTS).collect::<Vec<_>>());
+    }
+    step.complete().unwrap();
+
+    // Shrink by 1 record below `total` (evicting 1 expert from the coldest layer, layer 3).
+    // Note: `lending_bank` adds `conveying` (4) to the initial `tier` capacity, so
+    // shrinking to `total - 1` evicts those 4 spare records plus 1 expert of layer 3.
+    let shared = harness.watcher.shared().clone();
+    let target = (total - 1) as usize;
+    let candidates = Candidates { shallowest: target, deepest: target, records: Box::new(|slots| vec![slots]) };
+    let evicted = shared.shrink(Evicting::Landed, candidates, None).expect("shrink served").expect("shrink answered");
+    assert_eq!(evicted.slots, target);
+    assert!(evicted.records[0].len() >= 1);
+
+    // Wait for policy publication:
+    // Because all layers started whole (`POLICY_WHOLE == 1`, so no routing
+    // record was fed), ranks are tied and the shrink evicts from layer 0.
+    // With `target = 31`, `lent = 4`, `usable = 27`, `min_evictable = reserve (4) + 2*K (4) = 8`,
+    // layers 1 and 2 (`16` records, leaving `27 - 16 = 11 >= 8` evictable records)
+    // keep `POLICY_WHOLE == 1` and `POLICY_RESOLVED == 1`, while layer 3 is
+    // kept unprotected so demand/refill never starve behind a prompt lease.
+    eventually("per-layer policy did not converge", || {
+        whole(0) == 0 && whole(1) == 1 && whole(2) == 1 && whole(3) == 0
+    });
+    assert_eq!((resolved(0), resolved(1), resolved(2), resolved(3)), (0, 1, 1, 0));
+    assert_eq!(shared.life.ended(), None, "the watcher serves on");
+}
+
+/// On a partial pooled one-store bank (`Placer::Bank`), a layer that happens to
+/// hold all `E` of its experts at non-home records (`POLICY_WHOLE == 0`) must
+/// keep `POLICY_RESOLVED == 0` because another layer's miss can still evict its
+/// records mid-flight — ensuring `routed_land` and `routed_hint_route` /
+/// `HintGate` remain active.
+#[test]
+fn partial_pooled_store_keeps_policy_resolved_clear_for_non_home_full_layer() {
+    // 2 layers of 8 experts each = 16 experts, but store only holds 14 records
+    // (partial bank, never whole).
+    let harness = lending("partial-resolved", EXPERTS, 14, 2, STAGING, DECODE, 14, Placer::Bank, false);
+    let whole = |layer: usize| harness.layers[layer].5.load(constants::POLICY_WHOLE as usize);
+    let resolved = |layer: usize| harness.layers[layer].5.load(constants::POLICY_RESOLVED as usize);
+
+    // Land all 8 experts of layer 1 (records will be assigned sequentially from 0..8,
+    // NOT layer 1's home 8..16), while layer 0 remains empty.
+    let step = harness.step();
+    harness.request_at(&step, 0, &[]);
+    harness.request_at(&step, 1, &[0, 1, 2, 3]);
+    step.complete().unwrap();
+    let step = harness.step();
+    harness.request_at(&step, 0, &[]);
+    harness.request_at(&step, 1, &[4, 5, 6, 7]);
+    step.complete().unwrap();
+    harness.tier_ready();
+
+    // Verify layer 1 holds all 8 experts in the one store, yet group 0 is incomplete.
+    eventually("layer 1 holds all experts", || {
+        (0..EXPERTS).all(|e| harness.layers[1].0.held(e).is_some())
+    });
+    assert_eq!((whole(0), whole(1)), (0, 0), "neither layer is whole at home");
+    assert_eq!(
+        (resolved(0), resolved(1)),
+        (0, 0),
+        "POLICY_RESOLVED must stay 0 on a partial pooled store so hints and routed_land stay active"
+    );
 }
 /// Admission is decided once at the claim (design §3.7, §6): a landing
 /// whose step has ended before its read arrives still lands into the

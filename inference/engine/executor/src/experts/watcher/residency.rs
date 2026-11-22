@@ -652,12 +652,83 @@ impl Residency {
     /// dropping any write staged before (`Shared::stage_policy`): a change
     /// undone before it is written breaks nothing.
     pub(super) fn publish_policy(&mut self) {
-        let full = (0..self.core.groups.len()).map(|group| self.core.group_resident(group)).collect::<Vec<_>>();
-        let every = full.iter().all(|&full| full);
+        let layer_count = self.core.layers.len();
+        let directory = &self.core.directory;
+        // Per-layer residency at home: every expert `0..E` of `layer` is
+        // currently kept at its home record `home + e` (so every slab in
+        // `[home .. home + E)` is backed and holds its expert weight).
+        let at_home = (0..layer_count).map(|layer| directory.layer_at_home(layer)).collect::<Vec<_>>();
+        let every = at_home.iter().all(|&home| home);
         let lender = self.scratch.conveyor.lending().group;
-        let served = self.core.layers.iter().any(|layer| layer.site.is_some() && !(full[layer.group] && (every || lender != layer.group)));
-        let whole = self.core.layers.iter().map(|layer| full[layer.group] && (every || lender != layer.group)).collect::<Vec<_>>();
-        let resolved = self.core.layers.iter().zip(&whole).map(|(layer, &whole)| whole || self.core.directory.group_tier_settled(layer.group)).collect::<Vec<_>>();
+        let lent = match self.core.extents.placer {
+            crate::planning::Placer::Bank => directory.host_lent(lender) as usize,
+            crate::planning::Placer::Tier => directory.lender().filter(|&(group, _)| group == lender).map_or(0, |(_, count)| count),
+        };
+        // When any layer is not resident (`!every`), a prompt group may lease
+        // `[0 .. lent)` of `lender` mid-flight. Only layers whose home range
+        // overlaps `[0 .. lent)` (i.e. `home(layer) < lent` in `lender`) are
+        // exposed to that lease; all other layers in `lender` are disjoint.
+        let mut whole = (0..layer_count)
+            .map(|layer| at_home[layer] && (every || self.core.layers[layer].group != lender || directory.home(layer) >= lent))
+            .collect::<Vec<_>>();
+        // Whole layers are protected from mid-flight eviction while
+        // `POLICY_WHOLE == 1`. When a group is partially whole, ensure the
+        // non-whole records outside `[0 .. lent)` still leave enough evictable
+        // headroom so mid-flight demand/refill/promotions/seeds never starve:
+        // - `Placer::Bank`: `reserve + 2 * K` (tier reserve + cut-in pool + one
+        //   decode step's choices) beyond `lent`.
+        // - `Placer::Tier`: at least `K` bank records beyond `lent`.
+        let need = self.core.extents.selected;
+        for group in 0..self.core.groups.len() {
+            let members: Vec<usize> = (0..layer_count)
+                .filter(|&layer| self.core.layers[layer].group == group)
+                .collect();
+            if members.iter().all(|&layer| whole[layer]) {
+                continue;
+            }
+            let (total_records, lent_in_group, min_evictable) = match self.core.extents.placer {
+                crate::planning::Placer::Bank => (
+                    directory.host(group).records() as usize,
+                    directory.host_lent(group) as usize,
+                    directory.host(group).reserve() + 2 * need,
+                ),
+                crate::planning::Placer::Tier => (
+                    directory.records()[group],
+                    directory.lender().filter(|&(g, _)| g == group).map_or(0, |(_, count)| count),
+                    need.max(1),
+                ),
+            };
+            let usable = total_records.saturating_sub(lent_in_group);
+            let mut whole_records: usize = members
+                .iter()
+                .filter(|&&layer| whole[layer])
+                .map(|&layer| self.core.layers[layer].experts)
+                .sum();
+            for &layer in members.iter().rev() {
+                if usable.saturating_sub(whole_records) >= min_evictable {
+                    break;
+                }
+                if whole[layer] {
+                    whole[layer] = false;
+                    whole_records -= self.core.layers[layer].experts;
+                }
+            }
+        }
+        let served = self.core.layers.iter().enumerate().any(|(index, layer)| layer.site.is_some() && !whole[index]);
+        // `POLICY_RESOLVED` may only be set when the layer is `whole` (protected
+        // in Tier 0 at home) or its group's entire host tier is settled outside
+        // `0..lent` (so no layer in the group can miss the tier and trigger
+        // mid-flight tier eviction). A single unprotected layer in a partial
+        // pooled tier can still lose experts mid-flight and must keep
+        // `POLICY_RESOLVED == 0` so `routed_land` and `routed_hint_route` remain
+        // active.
+        let resolved = self
+            .core
+            .layers
+            .iter()
+            .zip(&whole)
+            .map(|(layer, &whole)| whole || directory.group_tier_settled(layer.group))
+            .collect::<Vec<_>>();
         // Keep `POLICY_RESOLVED` strictly as the `routed_land` / file-exchange
         // omission bit, while gating `HintGate` on `&whole` (`!all_groups_whole`)
         // so 100%-RAM discrete GPUs keep foresight hints active for Link staging.

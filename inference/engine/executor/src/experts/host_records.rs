@@ -523,6 +523,12 @@ pub(super) struct HostRecords {
     /// The read path's mirror of where every expert is, whose words of the
     /// group's layers these records alone clear.
     inbound: Arc<InboundTable>,
+    /// Per-layer live `POLICY_WHOLE` flags (`Telemetry::whole_flags`), bound on
+    /// `Placer::Bank` (the one store): while a layer's flag is set, its kept
+    /// home records are never chosen as eviction/refill/demand/seed victims
+    /// mid-flight because active steps read them at `home + expert` without
+    /// consulting the map.
+    protected_layers: Arc<[AtomicBool]>,
 }
 
 impl HostRecords {
@@ -570,10 +576,33 @@ impl HostRecords {
             victims: VecDeque::new(),
             prepared: None,
             inbound,
+            protected_layers: Arc::from([]),
         };
         assert!(lent <= records, "a tier lends {lent} of its {records} records");
         host.grow(0..records);
         host
+    }
+
+    /// Bind the live per-layer `POLICY_WHOLE` flags (`Telemetry::whole_flags`)
+    /// so records belonging to a published whole layer are never evicted
+    /// mid-flight on the one store (`Placer::Bank`).
+    pub fn bind_protected_layers(&mut self, protected: Arc<[AtomicBool]>) {
+        self.protected_layers = protected;
+    }
+
+    /// Whether `record` holds a kept expert of a layer whose live
+    /// `POLICY_WHOLE` flag is currently set.
+    fn layer_protected(&self, record: u32) -> bool {
+        self.records[record as usize].whole().is_some_and(|whole| {
+            self.protected_layers
+                .get(whole.staged.0)
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        })
+    }
+
+    /// Whether every expert `0..experts` of `layer` is currently kept whole.
+    pub fn layer_complete(&self, layer: usize, experts: usize) -> bool {
+        (0..experts).all(|expert| self.kept.contains_key(&(layer, expert)))
     }
 
     /// Record `record` holds `content` from now: the one change of a
@@ -864,7 +893,7 @@ impl HostRecords {
         let ready = self.ready.range(self.lent..).count().min(self.reserved().saturating_sub(self.reserve + self.pool));
         let free = self.ready.range(self.lent..).take(ready).map(|&record| (None, record));
         let mut kept = (self.lent..self.extent())
-            .filter(|&record| self.unheld(record))
+            .filter(|&record| self.unheld(record) && !self.layer_protected(record))
             .filter_map(|record| Some((self.place(record, &rank)?, record)))
             .filter(|&((.., staged), _)| !pinned(staged))
             .collect::<Vec<_>>();
@@ -1259,7 +1288,7 @@ impl HostRecords {
         }
         let need = (self.reserve + self.pool).saturating_sub(self.reserved());
         let mut order = (0..self.extent())
-            .filter(|&record| (!lending || record >= self.lent) && self.unheld(record))
+            .filter(|&record| (!lending || record >= self.lent) && self.unheld(record) && !self.layer_protected(record))
             .filter_map(|record| {
                 let (kept, key, staged) = match self.records[record as usize] {
                     Host::Answering(Whole { staged, kept, read, .. }, _) => taking(kept, staged, read, &rank),
@@ -1382,7 +1411,10 @@ impl HostRecords {
         if !self.ready_beyond(self.pool) {
             return Some(None);
         }
-        let first = self.taking_order(&rank, true, Some(1), |record| self.unheld(record)).into_iter().next();
+        let first = self
+            .taking_order(&rank, true, Some(1), |record| self.unheld(record) && !self.layer_protected(record))
+            .into_iter()
+            .next();
         Some(first.map(|record| {
             let whole = self.records[record as usize].whole().expect("a record in taking order keeps an expert");
             let (kept, key, _) = taking(whole.kept, whole.staged, whole.read, &rank);
@@ -1398,7 +1430,7 @@ impl HostRecords {
     /// checked again as it is taken.
     pub fn prepare_demand<K: Ord + Copy>(&mut self, rank: impl Rank<K>, depth: usize, sequence: Step) {
         let mut order = (0..self.extent())
-            .filter(|&record| self.unheld(record))
+            .filter(|&record| self.unheld(record) && !self.layer_protected(record))
             .filter_map(|record| Some((self.place(record, &rank)?, record)))
             .collect::<Vec<_>>();
         let take = depth.min(order.len());
@@ -1462,7 +1494,9 @@ impl HostRecords {
     /// it ([`Park::frees`]). Never an outstanding answer.
     fn reclaims(&self, record: u32, read: impl Fn(u32) -> bool, park: &Park) -> bool {
         match self.records[record as usize] {
-            Host::Kept(Whole { staged, holds: 0, from, .. }) => !read(record) && park.frees(staged.0, from.step(), Step::MAX),
+            Host::Kept(Whole { staged, holds: 0, from, .. }) => {
+                !self.layer_protected(record) && !read(record) && park.frees(staged.0, from.step(), Step::MAX)
+            }
             _ => false,
         }
     }
@@ -1842,6 +1876,10 @@ impl HostRecords {
     /// kept and unheld first in taking order at `rank`, so it keeps the
     /// most valuable where their bytes are.
     pub fn evictable<K: Ord + Copy>(&self, rank: impl Rank<K>) -> Vec<u32> {
+        self.evictable_filtered(rank, false)
+    }
+
+    pub fn evictable_filtered<K: Ord + Copy>(&self, rank: impl Rank<K>, skip_protected: bool) -> Vec<u32> {
         let past_lent = |record: &u32| *record >= self.lent;
         let graced = self
             .graced
@@ -1849,7 +1887,9 @@ impl HostRecords {
             .copied()
             .filter(past_lent)
             .filter(|&record| matches!(self.records[record as usize], Host::Graced { answer: None, .. }));
-        let kept = self.taking_order(&rank, false, None, |record| record >= self.lent && self.unheld(record));
+        let kept = self.taking_order(&rank, false, None, |record| {
+            record >= self.lent && self.unheld(record) && !(skip_protected && self.layer_protected(record))
+        });
         self.ready.iter().copied().filter(past_lent).chain(graced).chain(kept).collect()
     }
 

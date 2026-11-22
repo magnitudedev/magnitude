@@ -260,6 +260,17 @@ impl ExpertBank {
             .collect::<Result<Vec<_>, String>>()?;
         let homes = plan.resident.then(|| homes(plan, &layout)).transpose()?;
         let slot_maps = slot_maps(plan, &layout)?;
+        let layer_residents = layout
+            .layers
+            .iter()
+            .map(|layer| {
+                let whole = magnitude_kernels::constants::POLICY_WHOLE;
+                layer
+                    .policy
+                    .slice_leading(whole, whole + 1)
+                    .map_err(|error| format!("a layer's resident policy view failed: {error}"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let floor = allocate_placed(charges, plan, std::num::NonZeroU64::MIN)
             .map_err(|error| crate::residency::WeightImportError::of_allocation(seismic::Contract::Words, error))?;
         // The slots the bank commits, which its watcher's telemetry reads.
@@ -296,6 +307,7 @@ impl ExpertBank {
             stores: bank_stores,
             host,
             slot_maps,
+            layer_residents,
             watcher,
             lines,
             scratch_tables,

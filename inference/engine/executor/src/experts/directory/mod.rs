@@ -45,6 +45,7 @@ use super::staging::Staged;
 use super::watcher::{ParkFrom, ScratchGroup, Step, Steps, Unbegun, UnmapStep};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 pub use stack::{CountedLaunch, LayerCurve, MissCurve, RoutedRead, Stack};
 pub(crate) use stack::Ranks;
 #[cfg(any(test, feature = "expert-routing"))]
@@ -284,6 +285,11 @@ pub(super) struct Directory {
     host: Vec<HostRecords>,
     /// Their read path's mirror of where every expert is.
     inbound: Arc<InboundTable>,
+    /// Live per-layer `POLICY_WHOLE` flags (`Telemetry::whole_flags`): while
+    /// a layer's flag is set, active steps read its experts at `home + expert`
+    /// without consulting the map, so no mid-flight promotion, seed, refill,
+    /// demand claim, or shrink may evict its records.
+    whole_layers: Arc<[AtomicBool]>,
     /// The running prompt group's reads the ranking has not logged yet:
     /// every expert its steps routed, each at its last step
     /// ([`Self::read_pending`]), which every taking ranks beside, a use at
@@ -695,6 +701,7 @@ impl Directory {
             placer,
             host,
             inbound,
+            whole_layers: Arc::from([]),
             prompt_reads: HashMap::new(),
             ranking: Reuse::ranking(experts, layers, &kept, time.clone()),
             wanted: vec![BTreeSet::new(); layers.len()],
@@ -988,6 +995,24 @@ impl Directory {
         self.host.iter().all(HostRecords::complete)
     }
 
+    /// Bind the live per-layer `POLICY_WHOLE` flags (`Telemetry::whole_flags`)
+    /// so mid-flight victim selection never evicts a published whole layer.
+    pub fn bind_whole_layers(&mut self, whole: Arc<[AtomicBool]>) {
+        if self.placer == crate::planning::Placer::Bank {
+            for host in &mut self.host {
+                host.bind_protected_layers(Arc::clone(&whole));
+            }
+        }
+        self.whole_layers = whole;
+    }
+
+    /// Whether `layer` currently has `POLICY_WHOLE` published on the device.
+    fn is_layer_whole_published(&self, layer: usize) -> bool {
+        self.whole_layers
+            .get(layer)
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
     /// Whether group `group`'s host tier keeps every expert of its layers
     /// where no flight takes it ([`HostRecords::settled`]); false where the
     /// bank has no tier.
@@ -1002,38 +1027,51 @@ impl Directory {
         (0..self.host.len()).all(|group| self.group_whole(group))
     }
 
+    /// Whether no expert of `layer` can miss Tier 0: every expert `0..E` is
+    /// held in the bank (`Placer::Tier`) or kept in the one store (`Placer::Bank`).
+    pub fn layer_whole(&self, layer: usize) -> bool {
+        let group = self.bank.group(layer);
+        let experts = self.bank.experts(layer);
+        match self.placer {
+            crate::planning::Placer::Tier => (0..experts).all(|expert| self.bank.held(layer, expert).is_some()),
+            crate::planning::Placer::Bank => self.host[group].layer_complete(layer, experts),
+        }
+    }
+
     /// Whether no expert of group `group`'s layers can miss, every one
     /// mapped where a pass reads it in place: beside a host tier, held in
     /// the bank; where the host places, kept in the one store, whose
-    /// records are the bank's, its lent records among them. A lender's
-    /// claimed lent record unmaps its expert, but only a prompt group that
-    /// is not resident claims, and the lender's layers count as whole only
-    /// while every group is, when every prompt group is resident
-    /// (`Residency::publish_policy`).
+    /// records are the bank's, its lent records among them.
     pub fn group_whole(&self, group: usize) -> bool {
         match self.placer {
-            crate::planning::Placer::Tier => {
-                (0..self.bank.layers())
-                    .filter(|&layer| self.bank.group(layer) == group)
-                    .all(|layer| (0..self.bank.experts(layer)).all(|expert| self.bank.held(layer, expert).is_some()))
-            }
+            crate::planning::Placer::Tier => (0..self.bank.layers())
+                .filter(|&layer| self.bank.group(layer) == group)
+                .all(|layer| self.layer_whole(layer)),
             crate::planning::Placer::Bank => self.host[group].complete(),
         }
+    }
+
+    /// Whether every expert `0..E` of `layer` is currently kept at its home
+    /// record (`home(layer) + expert`), so every slab in `[home .. home + E)`
+    /// is backed and holds its expert weight.
+    pub fn layer_at_home(&self, layer: usize) -> bool {
+        let group = self.bank.group(layer);
+        let home = self.home(layer);
+        (0..self.bank.experts(layer)).all(|expert| match self.placer {
+            crate::planning::Placer::Tier => self.bank.held(layer, expert) == Some(home + expert),
+            crate::planning::Placer::Bank => {
+                self.host[group].kept_record((layer, expert)).is_some_and(|record| record as usize == home + expert)
+            }
+        })
     }
 
     /// Whether every expert of group `group`'s layers is at its home record
     /// ([`Self::home`]), which a route then sources without the map: a bank
     /// imported whole is, one regrown to every expert need not be.
     pub fn group_at_home(&self, group: usize) -> bool {
-        (0..self.bank.layers()).filter(|&layer| self.bank.group(layer) == group).all(|layer| {
-            let home = self.home(layer);
-            (0..self.bank.experts(layer)).all(|expert| match self.placer {
-                crate::planning::Placer::Tier => self.bank.held(layer, expert) == Some(home + expert),
-                crate::planning::Placer::Bank => {
-                    self.host[group].kept_record((layer, expert)).is_some_and(|record| record as usize == home + expert)
-                }
-            })
-        })
+        (0..self.bank.layers())
+            .filter(|&layer| self.bank.group(layer) == group)
+            .all(|layer| self.layer_at_home(layer))
     }
 
     /// Claim a demand landing of `layer`'s `expert` while the device is
@@ -1378,6 +1416,7 @@ impl Directory {
     fn victims(&self, reuse: &Reuse, group: usize, members: &[usize], most: usize) -> Victims {
         let held = members
             .iter()
+            .filter(|&&layer| !self.is_layer_whole_published(layer))
             .flat_map(|&layer| self.unwanted[layer].iter().map(move |&expert| (layer, expert)))
             .map(|staged @ (layer, expert)| (staged, self.bank.held(layer, expert).expect("an unwanted expert is held")))
             .filter(|&(_, record)| self.bank.usable(group, record))
@@ -1718,10 +1757,14 @@ impl Directory {
     /// §3.2, §4: `Reader::Observe`). None where it holds no more than
     /// `target`, and fewer than it lacks where too few are evictable.
     pub fn host_evictions(&self, group: usize, target: u32) -> Vec<u32> {
+        self.host_evictions_filtered(group, target, false)
+    }
+
+    pub fn host_evictions_filtered(&self, group: usize, target: u32, skip_protected: bool) -> Vec<u32> {
         let excess = self.host[group].records().saturating_sub(target) as usize;
         let reuse = Reuse::of(&self.ranking);
         let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Observe), &self.prompt_reads);
-        let mut evicted = self.host[group].evictable(rank);
+        let mut evicted = self.host[group].evictable_filtered(rank, skip_protected);
         evicted.truncate(excess);
         evicted
     }
@@ -1957,7 +2000,12 @@ impl Directory {
             let contents = self.bank.records(group);
             let pooled = contents.iter().map(|content| matches!(*content, Record::Held((layer, expert)) if reuse.in_top(layer, expert))).collect::<Vec<_>>();
             let backs = self.kept_by_exit(&reuse, group);
-            let kept = |record: usize| pinned.contains(&record) || pooled[record] || backs[record];
+            let kept = |record: usize| {
+                pinned.contains(&record)
+                    || pooled[record]
+                    || backs[record]
+                    || matches!(contents[record], Record::Held((layer, _)) if self.is_layer_whole_published(layer))
+            };
             let free_limit = self.bank.free(group).filter(|&record| !kept(record)).count().div_ceil(remaining);
             let mut order = self
                 .bank
@@ -2357,13 +2405,27 @@ impl Directory {
     /// experts where their bytes are. None where it holds no more than
     /// `target`, and fewer than it lacks where too few are evictable.
     pub fn evictions(&self, group: usize, target: usize, last_read: impl Fn(usize, usize) -> Option<Step>) -> Vec<usize> {
+        self.evictions_filtered(group, target, last_read, false)
+    }
+
+    pub fn evictions_filtered(
+        &self,
+        group: usize,
+        target: usize,
+        last_read: impl Fn(usize, usize) -> Option<Step>,
+        skip_protected: bool,
+    ) -> Vec<usize> {
         let excess = self.bank.counts()[group].saturating_sub(target);
         let (mut idle, mut held) = (Vec::new(), Vec::new());
         for (record, content) in self.bank.evictable(group) {
             match content {
                 Record::Free => idle.push((0, record)),
                 Record::Releasing { .. } => idle.push((1, record)),
-                Record::Held((layer, expert)) => held.push((layer, expert, last_read(layer, expert), record)),
+                Record::Held((layer, expert)) => {
+                    if !(skip_protected && self.is_layer_whole_published(layer)) {
+                        held.push((layer, expert, last_read(layer, expert), record));
+                    }
+                }
                 _ => unreachable!("an evictable record is free, releasing or held"),
             }
         }

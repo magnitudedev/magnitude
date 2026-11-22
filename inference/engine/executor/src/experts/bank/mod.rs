@@ -51,21 +51,46 @@ fn write_blocks(grid: &seismic::Tensor, blocks: u32) -> Result<(), String> {
     grid.clone().write_from_host(&words).map_err(|error| format!("a list grid's blocks: {error}"))
 }
 
-/// How a chain [`ExpertBank::begin`] began is served, by whether it is
-/// resident (`ExpertBank::resident`) and has a grouped step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How a chain [`ExpertBank::begin`] began is served, by each streamed layer's
+/// `POLICY_WHOLE` word (`ExpertBank::resident`) and whether it has a grouped
+/// step.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChainServing {
-    /// Every streamed layer is whole: its decode runs take the resident
-    /// forms (`RunStage::Resident`), its prompt fronts request nothing.
-    pub resident: bool,
+    /// Per streamed layer, whether `POLICY_WHOLE` is set for this chain.
+    /// Whole layers skip `routed_scratch_request` and `run_fill` in prompt
+    /// groups, and run their resident decode form (`RunStage::Resident`) when
+    /// `has_homes` holds.
+    pub whole: Arc<[bool]>,
+    /// Whether the bank holds home record views (`ExpertBank::homes`), so
+    /// resident decode forms (`RunStage::Resident`) were sealed.
+    pub has_homes: bool,
     grouped: bool,
 }
 
 impl ChainServing {
-    /// Whether its grouped steps are scratch-served: a group's that is not
-    /// resident.
-    pub(crate) fn scratch(self) -> bool {
-        self.grouped && !self.resident
+    /// Whether every streamed layer is whole.
+    pub(crate) fn all_whole(&self) -> bool {
+        self.whole.iter().all(|&w| w)
+    }
+
+    /// Whether streamed layer `layer` is whole for this chain.
+    pub(crate) fn layer_whole(&self, layer: usize) -> bool {
+        self.whole.get(layer).copied().unwrap_or(false)
+    }
+
+    /// Whether streamed layer `layer` runs its resident decode form
+    /// (`RunStage::Resident`). When any later layer is non-whole, the layer
+    /// that sets `BankPart::Step` (`sets_step`) stays on `RunStage::Whole`
+    /// (with `POLICY_WHOLE = 1, POLICY_RESOLVED = 1`) so `routed_step` writes
+    /// `BankPart::Step` for the non-whole layers.
+    pub(crate) fn decode_resident(&self, layer: usize, sets_step: bool) -> bool {
+        self.has_homes && self.layer_whole(layer) && (!sets_step || self.all_whole())
+    }
+
+    /// Whether its grouped steps are scratch-served: a group with at least one
+    /// non-whole layer.
+    pub(crate) fn scratch(&self) -> bool {
+        self.grouped && !self.all_whole()
     }
 }
 
@@ -115,6 +140,10 @@ pub(crate) struct ExpertBank {
     /// Each layer's slot map: its view of its group's map
     /// (`BankPart::SlotMap`).
     slot_maps: Vec<Tensor>,
+    /// Per-layer 1-word view of `policy[POLICY_WHOLE]` (`BankPart::Resident`),
+    /// which `routed_scratch_request` (`unless (resident)`) reads so whole
+    /// layers skip scratch requests independently of partial siblings.
+    layer_residents: Vec<Tensor>,
     watcher: Watcher,
     /// Each streamed layer's scratch table as the host addresses it, which
     /// a step's fill is marked followed in ([`Self::fill_followed`]).
@@ -358,17 +387,19 @@ impl ExpertBank {
         let grouped = launches.iter().any(|launch| route(launch) == StepRoute::Grouped);
         #[cfg(test)]
         let decodes = launches.iter().filter(|launch| route(launch) == StepRoute::Decode).count() as u64;
-        let mut resident = false;
+        let has_homes = self.homes.is_some();
+        let mut whole: Arc<[bool]> = Arc::from([]);
         let (steps, merges) = self.watcher.shared().begin(launches, &route, work, || {
-            resident = self.resident()?;
-            Ok(ChainServing { resident, grouped }.scratch())
+            whole = self.resident()?;
+            Ok(ChainServing { whole: Arc::clone(&whole), has_homes, grouped }.scratch())
         })?;
+        let serving = ChainServing { whole, has_homes, grouped };
         #[cfg(test)]
-        if resident {
+        if serving.has_homes && serving.all_whole() {
             self.resident_decodes.fetch_add(decodes, Ordering::Relaxed);
         }
         let merges = self.plan.layers().iter().map(|layer| layer.scope).zip(merges).collect();
-        Ok((steps, merges, ChainServing { resident, grouped }))
+        Ok((steps, merges, serving))
     }
 
     /// The decode steps begun resident, which ran the resident forms.
@@ -394,23 +425,28 @@ impl ExpertBank {
     /// them in, and a shrink clears one before it evicts a record: what this
     /// reads holds until the group ends, so no record a resident group's
     /// runs read is evicted or released before they end.
-    fn resident(&self) -> Result<bool, String> {
+    /// Per streamed layer, whether `POLICY_WHOLE` is set as `begin` begins
+    /// this group: residency publishes policy words only while no step runs
+    /// (`Residency::publish_policy`), under the lock `begin` reads them in,
+    /// and a shrink clears one before evicting a record, so what this reads
+    /// holds until the group ends.
+    fn resident(&self) -> Result<Arc<[bool]>, String> {
         let word = |tensor: &Tensor| {
             tensor
                 .load_acquire(4 * magnitude_kernels::constants::POLICY_WHOLE)
                 .map_err(|error| format!("a policy's whole word: {error}"))
         };
-        let mut resident = true;
+        let mut whole = Vec::with_capacity(self.layout.layers.len());
         for words in &self.layout.layers {
-            resident &= word(&words.policy)? != 0;
+            whole.push(word(&words.policy)? != 0);
         }
-        resident = resident && self.homes.is_some();
+        let all_whole = whole.iter().all(|&w| w);
         self.layout
             .load
             .resident
-            .store_release(0, u32::from(resident))
+            .store_release(0, u32::from(all_whole))
             .map_err(|error| format!("the resident word: {error}"))?;
-        Ok(resident)
+        Ok(Arc::from(whole))
     }
 
     /// Step `sequence`'s runs serve the blocks from `block` on over a window
@@ -584,7 +620,7 @@ impl ExpertBank {
             BankPart::Window | BankPart::WindowTable | BankPart::RoundList { .. } => {
                 return Err(format!("bank part {part:?} is bound at a window"));
             }
-            BankPart::Resident => &load.resident,
+            BankPart::Resident => &self.layer_residents[index],
             BankPart::SlotMap => &self.slot_maps[index],
             BankPart::Map => &group.map,
             BankPart::TierMap => layer.tier.as_ref().ok_or_else(|| format!("bank part {part:?} of a bank without a host tier"))?,

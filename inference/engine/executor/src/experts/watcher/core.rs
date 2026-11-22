@@ -491,23 +491,6 @@ pub(super) struct Core {
 }
 
 impl Core {
-    /// Whether group `group`'s layers run their resident forms: whole and
-    /// at home (`Directory::group_whole`, `Directory::group_at_home`), and
-    /// its records every record its reservation holds
-    /// (`ExpertBankPlan::records`, the span its commits words cover), which
-    /// a resident form binds directly, so only while every granule is
-    /// backed. A shrink that cuts only records keeping no expert (the
-    /// tier's reserve above the homes, where the host places) leaves the
-    /// group whole and at home, but releases granules no step may bind.
-    pub(super) fn group_resident(&self, group: usize) -> bool {
-        let directory = &self.directory;
-        let records = match self.extents.placer {
-            crate::planning::Placer::Tier => directory.records()[group],
-            crate::planning::Placer::Bank => directory.host(group).records() as usize,
-        };
-        directory.group_whole(group) && directory.group_at_home(group) && records == self.groups[group].commits.len()
-    }
-
     /// The device is at `progress`: the records taken before it, now free.
     pub(super) fn take_past(&mut self, progress: Point) -> Vec<Listed> {
         let (done, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.taken)

@@ -1544,7 +1544,7 @@ impl NativeTargetProgram {
         // A scratch-served chain is a prompt group's, whose steps run long
         // (a 16k prompt's 31 chunks one chain of 43 s): memory is read and
         // the bank released between its submissions.
-        let release = match (&self.graphs.bank, serving) {
+        let release = match (&self.graphs.bank, &serving) {
             (Some(bank), Some(serving)) if serving.scratch() => {
                 let chain = steps
                     .iter()
@@ -1557,7 +1557,7 @@ impl NativeTargetProgram {
         };
         let (mut submitter, queued) = steps.scoped(
             StepSubmitter::new(&self.device, release),
-            |steps, submitter| self.queue_runs(steps, spare, &sets, serving, submitter),
+            |steps, submitter| self.queue_runs(steps, spare, &sets, serving.as_ref(), submitter),
         );
         match queued {
             Ok(runs) => {
@@ -1619,11 +1619,10 @@ impl NativeTargetProgram {
         steps: Branded<'b, &'b mut (ValidatedTargetLaunch, Option<(Arc<crate::experts::ExpertBank>, crate::experts::ExpertStep)>)>,
         spare: &mut TargetGraphOutputLease,
         sets: &[usize],
-        serving: Option<crate::experts::ChainServing>,
+        serving: Option<&crate::experts::ChainServing>,
         submitter: &mut StepSubmitter,
     ) -> Result<Branded<'b, QueuedRuns>, SubmitError> {
         let scratch = serving.is_some_and(crate::experts::ChainServing::scratch);
-        let resident = serving.is_some_and(|serving| serving.resident);
         let group = self.graphs.group(steps.len()).map_err(invalid)?;
         // Every step of the group holds its group's record.
         let reads = steps
@@ -1634,9 +1633,13 @@ impl NativeTargetProgram {
         let reads = reads.as_ref().map(|(bank, record)| (&**bank, *record));
         let (launches, outputs) = steps
             .map(|(launch, banked)| {
-                let bank = banked
-                    .as_ref()
-                    .map(|(bank, step)| BankRun { bank: bank.clone(), sequence: step.sequence(), front: step.front(), sampled: step.samples(), resident });
+                let bank = banked.as_ref().map(|(bank, step)| BankRun {
+                    bank: bank.clone(),
+                    sequence: step.sequence(),
+                    front: step.front(),
+                    sampled: step.samples(),
+                    serving: serving.expect("a banked chain has its serving state").clone(),
+                });
                 let (core, graph_workspace, graph_output, workspace, output) = launch.submission_parts_mut();
                 ((core, graph_workspace, (workspace, output), bank), graph_output)
             })
@@ -1997,9 +2000,9 @@ impl NativeTargetProgram {
             scored,
         };
         let stages = self.graphs.prepared.stages(index, rows);
-        // A run of a chain its bank began resident takes a whole decode
-        // block's resident form.
-        let resident = run.bank.as_ref().is_some_and(|bank| bank.resident);
+        // A run whose block's streamed layer is whole takes the whole decode
+        // block's resident form (`RunStage::Resident`).
+        let resident = run.bank.as_ref().is_some_and(|bank| bank.block_decode_resident(index));
         let stage = self.graphs.prepared.run_stage(index, rows, stages[0], resident);
         self.run_stage(run, index, &class, stage, rotation, submitter)?;
         run.back = (stages.len() > 1).then_some((index, class));
@@ -2039,7 +2042,9 @@ impl NativeTargetProgram {
         let count = runs.len();
         let block = runs.iter_mut().find_map(|run| run.back.as_ref().map(|&(at, _)| at));
         let merged = block.map_or(1, |at| sets[at]);
-        let filled = |at: usize| scratch && self.graphs.prepared.streams(at);
+        let bank_run = runs.iter().next().and_then(|run| run.bank.clone());
+        let block_whole = |at: usize| bank_run.as_ref().is_some_and(|bank| bank.block_whole(at));
+        let filled = |at: usize| scratch && self.graphs.prepared.streams(at) && !block_whole(at);
         let early = self.device.backend().fills_beside_compute();
         // The runs of block `index`'s first pass set, whose fills follow no
         // pass of their own layer.

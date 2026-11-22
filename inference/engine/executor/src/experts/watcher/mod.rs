@@ -821,7 +821,7 @@ impl Watcher {
             .collect::<Result<Vec<_>, _>>()?;
         let LoadWords { flags } = load;
         let count = layers.len();
-        let core = Core {
+        let mut core = Core {
             table: Arc::new(ReadTable::new(source, pools, &layers)),
             directory,
             layers,
@@ -858,6 +858,7 @@ impl Watcher {
             core.table.source().volumes(),
             spans,
         );
+        core.directory.bind_whole_layers(telemetry.whole_flags());
         // The load's parks, on one timeline of its device, which each answer
         // of a slot of the exchange settles.
         let parks = {

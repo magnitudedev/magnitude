@@ -767,25 +767,27 @@ fn an_unpriced_group_splits_only_before_cold_experts() {
     assert_eq!(facts.merge_sets(None, None, None, Notice::Written, 1), [1; 4]);
 }
 
-/// A group is whole only while every layer of it holds every expert: a
-/// layer holding every expert beside a partial one keeps its whole word
-/// clear; once both hold every expert, both words are set. The words are
-/// published between flights.
+/// Policy whole is per-layer: a layer holding every expert at its home sets
+/// its own `POLICY_WHOLE` and `POLICY_RESOLVED` immediately even while a
+/// sibling layer in the same group is still partial; once the sibling also
+/// holds every expert at its home, both layers have `POLICY_WHOLE == 1`.
 #[test]
-fn a_group_is_whole_only_while_every_layer_holds_every_expert() {
+fn a_layer_is_whole_independent_of_partial_siblings_in_its_group() {
     // The tier keeps every expert either layer lands, beyond its reserve.
-    let harness = lending("whole-group", EXPERTS, 2 * EXPERTS as u64, 2, STAGING, DECODE, STAGING + 2 * EXPERTS as u32, Placer::Tier, true);
+    let harness = lending("whole-layer", EXPERTS, 2 * EXPERTS as u64, 2, STAGING, DECODE, STAGING + 2 * EXPERTS as u32, Placer::Tier, true);
     let shared = harness.watcher.shared();
     let whole = |layer: usize| harness.layers[layer].5.load(constants::POLICY_WHOLE as usize);
+    let resolved = |layer: usize| harness.layers[layer].5.load(constants::POLICY_RESOLVED as usize);
     harness.promoted(0, &(0..EXPERTS).collect::<Vec<_>>());
     harness.promoted(1, &(0..6).collect::<Vec<_>>());
     assert_eq!(shared.holdings().0, [EXPERTS, 6]);
-    // A gap publishes the words after it retired the fills.
-    std::thread::sleep(Duration::from_millis(50));
-    assert_eq!((whole(0), whole(1)), (0, 0), "a full layer beside a partial one is not whole");
+    // Layer 0 holds all of its experts at home; layer 1 is still partial.
+    until(&harness.layers[0].5, constants::POLICY_WHOLE as usize, 1);
+    assert_eq!((whole(0), whole(1)), (1, 0), "a full layer at home is whole while its sibling is partial");
+    assert_eq!(resolved(0), 1, "a whole layer is also resolved");
     harness.promoted(1, &[6, 7]);
-    until(&harness.layers[0].5, 0, 1);
-    until(&harness.layers[1].5, 0, 1);
+    until(&harness.layers[1].5, constants::POLICY_WHOLE as usize, 1);
+    assert_eq!((whole(0), whole(1)), (1, 1));
 }
 
 /// Reads run ahead of the device's rounds: every cold expert of a layer,

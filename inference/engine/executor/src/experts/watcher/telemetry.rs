@@ -1197,7 +1197,7 @@ pub(super) struct Telemetry {
     /// route writes beside its keys, is a trace's alone)
     /// ([`Residency::publish_policy`](super::residency::Residency::publish_policy),
     /// while no step runs).
-    whole: Vec<AtomicBool>,
+    whole: Arc<[AtomicBool]>,
     /// The first step whose group has not ended: the reads of every group
     /// before it are ready to feed ([`Self::ended`], [`Self::feed`]). A
     /// step's end only raises it, so the thread ending steps never waits
@@ -1422,7 +1422,7 @@ impl Telemetry {
             shadows,
             shadows_needed,
             shadow_state,
-            whole: layers.iter().map(|_| AtomicBool::new(false)).collect(),
+            whole: Arc::from(layers.iter().map(|_| AtomicBool::new(false)).collect::<Vec<_>>()),
             feedable: AtomicU64::new(0),
             resize_generation: AtomicU64::new(0),
             #[cfg(test)]
@@ -1657,9 +1657,10 @@ impl Telemetry {
         self.whole[layer].store(whole, Ordering::Release);
     }
 
-    /// Whether `layer` is whole, as its policy word was last written.
-    pub(super) fn is_whole(&self, layer: usize) -> bool {
-        self.whole[layer].load(Ordering::Acquire)
+    /// Shared live per-layer `POLICY_WHOLE` flags, updated atomically whenever
+    /// staged policy words are written between flights.
+    pub(super) fn whole_flags(&self) -> Arc<[AtomicBool]> {
+        Arc::clone(&self.whole)
     }
 
     /// The stack, fed ([`Self::feed_stack`]).
