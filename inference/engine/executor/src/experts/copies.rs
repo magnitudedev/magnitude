@@ -137,6 +137,9 @@ struct State {
     running: VecDeque<(u64, u64, Vec<BatchItem>)>,
     /// The batches the queue refused as issued, and why.
     refused: BTreeMap<u64, String>,
+    /// Cancelled unbegun batches whose tensors are deferred for drop on the
+    /// issuer thread (outside `residency` and `NoBlockingAllocationGuard`).
+    cancelled: Vec<Vec<BatchItem>>,
     /// Why the queue faulted, once it has: no batch completes from then.
     fault: Option<String>,
 }
@@ -171,12 +174,15 @@ impl State {
 
     /// Cancel an unbegun waiting batch; returns `true` only if it was still in
     /// `waiting` and removed before `issue` popped it. Never cancels an
-    /// issuing or running DMA batch.
+    /// issuing or running DMA batch. Deferred items drop on the issuer thread
+    /// so cancellation under `residency` / `NoBlockingAllocationGuard` never
+    /// drops slab views or device fences in place.
     fn cancel(&mut self, ticket: u64) -> bool {
         let Some(pos) = self.waiting.iter().position(|entry| entry.ticket == ticket) else {
             return false;
         };
-        self.waiting.swap_remove(pos);
+        let removed = self.waiting.swap_remove(pos);
+        self.cancelled.push(removed.items);
         true
     }
 
@@ -365,12 +371,15 @@ impl Copies {
             if stopped() {
                 return;
             }
-            let Some(QueuedBatch { ticket, items: batch, .. }) = ({
+            let (cancelled, next) = {
                 let mut state = self.state();
+                let cancelled = std::mem::take(&mut state.cancelled);
                 let next = state.pop_next();
                 state.issuing = next.as_ref().map(|entry| (entry.ticket, std::time::Instant::now()));
-                next
-            }) else {
+                (cancelled, next)
+            };
+            drop(cancelled);
+            let Some(QueuedBatch { ticket, items: batch, .. }) = next else {
                 events.wait(seen);
                 continue;
             };
@@ -425,7 +434,8 @@ impl Copies {
             match self.inner.transfer.wait(value, BOUND) {
                 Ok(false) => continue,
                 Ok(true) => {
-                    self.state().running.pop_front();
+                    let completed = self.state().running.pop_front();
+                    drop(completed);
                 }
                 Err(error) => self.state().fault = Some(error.to_string()),
             }
@@ -474,10 +484,14 @@ mod tests {
         assert_eq!(state.pop_next().unwrap().ticket, t_stage_late);
         assert_eq!(state.pop_next().unwrap().ticket, t_stage_l0);
 
-        // Cancel `t_stage_l1_low` while still unbegun -> succeeds and removes it from flight.
+        // Cancel `t_stage_l1_low` while still unbegun -> succeeds, removes it
+        // from flight, and defers its batch items to `cancelled` for drop on
+        // the issuer thread rather than dropping under the caller's lock.
         assert!(state.cancel(t_stage_l1_low));
         assert!(!state.is_in_flight(t_stage_l1_low));
+        assert_eq!(state.cancelled.len(), 1, "cancelled batch items are deferred for drop on the issuer thread");
         assert!(!state.cancel(t_stage_l1_low), "second cancel returns false");
+        assert_eq!(state.cancelled.len(), 1);
 
         // Remaining order: `t_stage_l1_high`, then `t_promote`.
         assert_eq!(state.pop_next().unwrap().ticket, t_stage_l1_high);

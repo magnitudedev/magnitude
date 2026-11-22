@@ -194,6 +194,22 @@ impl TransferInner {
                 TransferItem::Signal { word, offset, .. } => self.check_signal(word, *offset)?,
             }
         }
+        // Any view of a slab moved by `Slots::adopt` must wait for its
+        // compute-queue `Copy(from -> to)` before the unordered transfer
+        // stream reads or overwrites it. Done here (outside `residency` and
+        // `NoBlockingAllocationGuard`, and before `self.issuing` / device
+        // permits) so `Slots::region_view` stays strictly non-blocking.
+        for item in items {
+            match item {
+                TransferItem::Run(run) => {
+                    run.source.wait_adopted().map_err(TransferError::Execution)?;
+                    run.destination.wait_adopted().map_err(TransferError::Execution)?;
+                }
+                TransferItem::Signal { word, .. } => {
+                    word.wait_adopted().map_err(TransferError::Execution)?;
+                }
+            }
+        }
         // Host access is excluded while the batch is queued, in access-group
         // order as native submissions take theirs.
         let access = crate::native::merge_access(items.iter().flat_map(|item| match item {

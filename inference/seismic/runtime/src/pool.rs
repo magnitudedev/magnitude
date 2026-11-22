@@ -54,8 +54,8 @@ use seismic_lang::ids::RepresentationId;
 use seismic_memory::pool::{BlockId, Blocks, Claimed, Fence, GranuleId, GranulePool, Move};
 use seismic_topology::Contract;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
 /// How a pool's blocks are sized, which its opener decides
 /// ([`Pool::open`]'s `block_bytes`).
@@ -771,12 +771,14 @@ impl Pool {
                         }
                     }
                 }
-                // Nothing of the store's moves ran: their destinations go
-                // back free, their slabs where they were.
-                Err(error) => {
+                // The store's moves failed: release any destination granule not
+                // already handed to a `GranuleHold` (which releases on drop).
+                Err((error, owned)) => {
                     let mut state = pool.state();
-                    for moved in &moved {
-                        state.granules.release(moved.to, None);
+                    for (moved, is_owned) in moved.iter().zip(owned) {
+                        if !is_owned {
+                            state.granules.release(moved.to, None);
+                        }
                     }
                     failure = Some(error);
                     stays = true;
@@ -831,6 +833,103 @@ struct GranuleHold {
     granule: GranuleId,
 }
 
+/// Lifecycle of an adopted slab's asynchronous copy and table repoint
+/// ([`Slots::adopt`]).
+enum AdoptState {
+    /// Phase 4 (`MoveStep::Word` table repoint) is still submitting.
+    Pending,
+    /// Table repoint submitted; `copy_done` is the `MoveStep::Copy` completion
+    /// that must end before unordered queues or the host access the new granule.
+    Submitted(Option<Arc<dyn DeviceCompletion>>),
+    /// The copy has ended (or completed synchronously on submission).
+    Settled,
+    /// Phase 4 failed or aborted and the slot was rolled back to its source granule.
+    Failed(String),
+}
+
+/// Deferred adoption completion attached to an adopted slab's [`SlabHold`].
+///
+/// [`Slots::region_view`] never queries, waits on, or destroys device
+/// completions — it only clones `Arc<SlabHold>` under the `Slots::slabs` leaf
+/// lock so callers holding `residency` or `NoBlockingAllocationGuard` (which
+/// answer parked GPU kernels) can never block on the CUDA/Vulkan driver.
+/// Consumers that access the slab outside the compute queue's hazard-domain
+/// ordering (async transfer queues and direct host reads/writes) call
+/// [`SlabHold::wait_adopted`] on their own non-blocking-free threads.
+struct AdoptFence {
+    settled: AtomicBool,
+    state: Mutex<AdoptState>,
+    changed: Condvar,
+}
+
+impl AdoptFence {
+    fn pending() -> Self {
+        Self {
+            settled: AtomicBool::new(false),
+            state: Mutex::new(AdoptState::Pending),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn submitted(&self, copy_done: Option<Arc<dyn DeviceCompletion>>) {
+        {
+            let mut state = self.state.lock().expect("adopt fence lock poisoned");
+            if copy_done.is_none() {
+                *state = AdoptState::Settled;
+                self.settled.store(true, Ordering::Release);
+            } else {
+                *state = AdoptState::Submitted(copy_done);
+            }
+        }
+        self.changed.notify_all();
+    }
+
+    fn failed(&self, reason: String) {
+        let stale = {
+            let mut state = self.state.lock().expect("adopt fence lock poisoned");
+            std::mem::replace(&mut *state, AdoptState::Failed(reason))
+        };
+        self.changed.notify_all();
+        drop(stale);
+    }
+
+    fn wait(&self) -> Result<(), ExecutionError> {
+        if self.settled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        seismic_memory::assert_blocking_allocation_allowed("AdoptFence::wait");
+        let done = {
+            let mut state = self.state.lock().expect("adopt fence lock poisoned");
+            loop {
+                match &*state {
+                    AdoptState::Pending => {
+                        state = self.changed.wait(state).expect("adopt fence lock poisoned");
+                    }
+                    AdoptState::Settled => return Ok(()),
+                    AdoptState::Failed(reason) => {
+                        return Err(ExecutionError::SubmissionFailed(reason.clone()));
+                    }
+                    AdoptState::Submitted(done) => break done.clone(),
+                }
+            }
+        };
+        if let Some(done) = done {
+            done.ended()?;
+        }
+        let stale = {
+            let mut state = self.state.lock().expect("adopt fence lock poisoned");
+            if matches!(&*state, AdoptState::Submitted(_)) {
+                self.settled.store(true, Ordering::Release);
+                Some(std::mem::replace(&mut *state, AdoptState::Settled))
+            } else {
+                None
+            }
+        };
+        drop(stale);
+        Ok(())
+    }
+}
+
 /// A slab's place, held by the slab and by every view of its regions
 /// (`TensorInner::in_slab`): its store's slot, and its granule where it is
 /// a pool's. A view's bytes are that slot's slab's, which no other store
@@ -841,6 +940,10 @@ pub(crate) struct SlabHold {
     store: u64,
     slot: usize,
     granule: Option<GranuleHold>,
+    /// Present on slabs moved by [`Slots::adopt`]: defers waiting for the
+    /// compute queue's `Copy(from -> to)` out of [`Slots::region_view`] and
+    /// onto unordered consumers (`TransferInner::copy`, host reads/writes).
+    adopt: Option<Arc<AdoptFence>>,
 }
 
 impl SlabHold {
@@ -852,6 +955,16 @@ impl SlabHold {
     /// The slot that holds the slab, as long as it is not freed.
     pub(crate) fn slot(&self) -> usize {
         self.slot
+    }
+
+    /// Wait for any pending slab-adoption copy (`Slots::adopt`) populating
+    /// this slab to finish before unordered queues or direct host access
+    /// touch its bytes. Lock-free no-op once settled or for non-adopted slabs.
+    pub(crate) fn wait_adopted(&self) -> Result<(), ExecutionError> {
+        match &self.adopt {
+            Some(fence) => fence.wait(),
+            None => Ok(()),
+        }
     }
 }
 
@@ -893,20 +1006,11 @@ struct Slab {
     /// [`Slots::adopt`] detects any view created (and possibly written and
     /// dropped) during its unlocked copy phase.
     views: u64,
-    /// True during the brief table-repoint phase of [`Slots::adopt`] for
-    /// confirmed slots only, preventing a new [`Slots::region_view`] from
-    /// observing `from` while `table[slot]` is being repointed to `to`.
-    adopting: bool,
-    /// Completion of the `MoveStep::Copy` that populated an adopted slab,
-    /// waited on outside `self.slabs()` by the first [`Slots::region_view`] so
-    /// an unordered transfer queue cannot write to `to` while the compute
-    /// queue's `Copy(from -> to)` is still in flight.
-    copy_done: Option<Arc<dyn DeviceCompletion>>,
 }
 
 impl Slab {
     fn new(regions: Vec<(Arc<Allocation>, u64)>, hold: Arc<SlabHold>) -> Self {
-        Self { regions, hold, views: 0, adopting: false, copy_done: None }
+        Self { regions, hold, views: 0 }
     }
 
     fn granule(&self) -> Option<GranuleId> {
@@ -967,9 +1071,6 @@ pub(crate) struct Slots {
     /// `repointed()`, `moves::submit()`, or `point_many()`.
     mutate: Mutex<()>,
     slabs: Mutex<Vec<Option<Slab>>>,
-    /// Notifies [`Self::region_view`] callers waiting for a confirmed slot's
-    /// brief table-repoint phase in [`Self::adopt`] to finish.
-    adopt_done: std::sync::Condvar,
     /// The device work that last wrote the table ([`Self::adopt`]), while
     /// it may still run: a later repoint is ordered after it, never a host
     /// write it could land over. Changed under the mutate lock.
@@ -1125,9 +1226,23 @@ impl Slots {
         self.repointed.lock().expect("slab table repoint lock poisoned")
     }
 
+    /// Whether `slot` is currently backed by a slab, without creating a view
+    /// or touching any driver state.
+    pub(crate) fn is_backed(&self, slot: usize) -> bool {
+        self.slabs().get(slot).is_some_and(Option::is_some)
+    }
+
     /// A view of region `region` of slot `slot`'s slab as `representation`
     /// over `extents` (its rows), holding the slab's granule; none for a
     /// free slot.
+    ///
+    /// Strictly non-blocking and free of driver calls: acquires only the
+    /// `Slots::slabs` leaf lock, so callers holding `residency` or a
+    /// `NoBlockingAllocationGuard` (which answer parked GPU kernels) can
+    /// never wait on the device or contend with driver context locks. Any
+    /// pending adoption copy from [`Self::adopt`] is carried on the returned
+    /// tensor's [`SlabHold`] and awaited by unordered consumers
+    /// (`TransferInner::copy`, direct host reads/writes) outside those scopes.
     pub(crate) fn region_view(
         &self,
         slot: usize,
@@ -1135,32 +1250,16 @@ impl Slots {
         representation: RepresentationId,
         extents: &[u64],
     ) -> Result<Option<TensorInner>, TensorError> {
-        let (allocation, offset, hold, copy_done) = {
+        let (allocation, offset, hold) = {
             let mut slabs = self.slabs();
-            loop {
-                let Some(Some(slab)) = slabs.get_mut(slot) else {
-                    return Ok(None);
-                };
-                if !slab.adopting {
-                    slab.views = slab.views.wrapping_add(1);
-                    let (allocation, offset) = slab.regions[region].clone();
-                    let hold = slab.hold.clone();
-                    let copy_done = match &slab.copy_done {
-                        Some(done) if matches!(done.completed(), Ok(true)) => {
-                            slab.copy_done = None;
-                            None
-                        }
-                        Some(done) => Some(done.clone()),
-                        None => None,
-                    };
-                    break (allocation, offset, hold, copy_done);
-                }
-                slabs = self.adopt_done.wait(slabs).expect("slab store lock poisoned");
-            }
+            let Some(Some(slab)) = slabs.get_mut(slot) else {
+                return Ok(None);
+            };
+            slab.views = slab.views.wrapping_add(1);
+            let (allocation, offset) = slab.regions[region].clone();
+            let hold = slab.hold.clone();
+            (allocation, offset, hold)
         };
-        if let Some(done) = copy_done {
-            done.ended()?;
-        }
         TensorInner::in_slab(&self.device, allocation, offset, representation, extents, Some(hold)).map(Some)
     }
 
@@ -1204,16 +1303,18 @@ impl Slots {
     /// Take each of `moved`, this store's moves out of a vacating block,
     /// where its slot's slab is still the granule it moves from and nothing
     /// but the slab holds it: copy the slab into its new granule and repoint
-    /// the slot's entries, as one submission of device work ordered after
-    /// the work submitted before it and before the work submitted after
-    /// (`native::moves`), so this never waits for device work (but on
-    /// Metal); each old granule is then released behind it, and work in
-    /// flight keeps reading and writing the old granules it names, whose
-    /// bytes the copy follows. A view of a slab would read and write the old
-    /// granule after the copy, so a viewed slab stays where it is. What each
-    /// slot did, in order; refused, nothing run and every slab where it was,
-    /// where the submission was.
-    fn adopt(&self, moved: &[Move<Holder>]) -> Result<Vec<Adopted>, TensorError> {
+    /// the slot's entries, as device work ordered after the work submitted
+    /// before and before the work submitted after (`native::moves`), so this
+    /// never waits for device work (but on Metal); each old granule is then
+    /// released behind it, and work in flight keeps reading and writing the
+    /// old granules it names, whose bytes the copy follows. A view of a slab
+    /// would read and write the old granule after the copy, so a viewed slab
+    /// stays where it is.
+    ///
+    /// On error, returns `(error, owned)` where `owned[i]` is true when
+    /// `moved[i].to` was already transferred to a [`GranuleHold`] (which
+    /// releases it on drop) and must not be released again by the caller.
+    fn adopt(&self, moved: &[Move<Holder>]) -> Result<Vec<Adopted>, (TensorError, Vec<bool>)> {
         let pool = self.pool.as_ref().expect("a store whose granules move is a pool's");
         let _mutate = self.mutate();
         // Phase 1: classify candidate moves under a brief `slabs` leaf lock
@@ -1260,7 +1361,10 @@ impl Slots {
         // immediately on `from` (no parked-kernel deadlock) and increments
         // `slab.views`, which Phase 3 detects so no write to `from` can ever
         // be orphaned behind a repointed table entry.
-        let move_permit = moves::prepare(&self.device, &self.table)?;
+        let move_permit = match moves::prepare(&self.device, &self.table) {
+            Ok(permit) => permit,
+            Err(error) => return Err((error.into(), vec![false; moved.len()])),
+        };
         let at = |granule: GranuleId| u64::from(granule.index) * pool.granule;
         let copies: Vec<MoveStep<'_>> = moving
             .iter()
@@ -1275,15 +1379,22 @@ impl Slots {
             .collect();
         let copy_written = {
             let _repointed = self.repointed();
-            moves::submit_prepared(&self.device, &self.table, &copies, move_permit)?
+            match moves::submit_prepared(&self.device, &self.table, &copies, move_permit) {
+                Ok(written) => written,
+                Err(error) => return Err((error.into(), vec![false; moved.len()])),
+            }
         };
         // Phase 3 (brief `slabs` leaf lock): confirm which slots were NOT
-        // viewed during Phase 2. Any slot viewed during Phase 2 stays at
-        // `from` (`Adopted::Viewed`, table untouched); confirmed slots are
-        // marked `adopting = true` across the brief Phase 4 table repoint so
-        // no `region_view` can slip in and write to `from` while `table[slot]`
-        // is being repointed to `to`.
-        let mut confirmed: Vec<(usize, Arc<Allocation>)> = Vec::with_capacity(moving.len());
+        // viewed during Phase 2 and immediately install their destination
+        // slabs carrying a pending `AdoptFence`. Any concurrent `region_view`
+        // during Phase 4 returns the destination view immediately without
+        // blocking or querying the driver, and any unordered consumer awaits
+        // `AdoptFence` outside `residency` / `NoBlockingAllocationGuard`
+        // before accessing `to`.
+        let mut owned = vec![false; moved.len()];
+        let mut confirmed: Vec<usize> = Vec::with_capacity(moving.len());
+        let mut previous: Vec<(usize, Slab)> = Vec::with_capacity(moving.len());
+        let mut fence: Option<Arc<AdoptFence>> = None;
         {
             let mut slabs = self.slabs();
             for (&i, (_, to)) in moving.iter().zip(blocks) {
@@ -1296,45 +1407,80 @@ impl Slots {
                             && Arc::strong_count(&slab.hold) == 1
                 );
                 if untouched {
-                    slabs[m.holder.slot].as_mut().expect("checked above").adopting = true;
-                    confirmed.push((i, to));
+                    let adopt_fence = fence.get_or_insert_with(|| Arc::new(AdoptFence::pending())).clone();
+                    let new_slab = Slab::new(
+                        self.offsets.iter().map(|offset| (to.clone(), at(m.to) + offset)).collect(),
+                        Arc::new(SlabHold {
+                            store: self.id,
+                            slot: m.holder.slot,
+                            granule: Some(GranuleHold { pool: pool.clone(), granule: m.to }),
+                            adopt: Some(adopt_fence),
+                        }),
+                    );
+                    let old_slab = std::mem::replace(
+                        slabs[m.holder.slot].as_mut().expect("checked above"),
+                        new_slab,
+                    );
+                    previous.push((m.holder.slot, old_slab));
+                    owned[i] = true;
+                    confirmed.push(i);
                 } else {
                     adopted[i] = Adopted::Viewed;
                 }
             }
-        }
-        if confirmed.is_empty() {
-            return Ok(adopted);
-        }
-        // Clear `adopting` and wake waiters if Phase 4 fails or unwinds.
-        struct AdoptingGuard<'a> {
-            slots: &'a Slots,
-            indices: Vec<usize>,
-            armed: bool,
-        }
-        impl Drop for AdoptingGuard<'_> {
-            fn drop(&mut self) {
-                if self.armed {
-                    let mut slabs = self.slots.slabs();
-                    for &slot in &self.indices {
-                        if let Some(Some(slab)) = slabs.get_mut(slot) {
-                            slab.adopting = false;
-                        }
-                    }
-                    self.slots.adopt_done.notify_all();
-                }
+            if !confirmed.is_empty() {
+                self.generation.fetch_add(1, Ordering::AcqRel);
             }
         }
-        let mut guard = AdoptingGuard {
-            slots: self,
-            indices: confirmed.iter().map(|&(i, _)| moved[i].holder.slot).collect(),
-            armed: true,
+        let Some(fence) = fence else {
+            return Ok(adopted);
         };
+        // Restore `previous`, bump `generation`, fail `fence`, and drop the
+        // rolled-back destination slabs outside `self.slabs()` if Phase 4
+        // fails or unwinds.
+        struct AdoptRollbackGuard<'a> {
+            slots: &'a Slots,
+            fence: Arc<AdoptFence>,
+            previous: Vec<(usize, Slab)>,
+        }
+        impl AdoptRollbackGuard<'_> {
+            fn disarm(mut self) -> Vec<(usize, Slab)> {
+                std::mem::take(&mut self.previous)
+            }
+
+            fn rollback(mut self, reason: String) {
+                self.restore(reason);
+            }
+
+            fn restore(&mut self, reason: String) {
+                let previous = std::mem::take(&mut self.previous);
+                if previous.is_empty() {
+                    return;
+                }
+                let rolled_back = {
+                    let mut slabs = self.slots.slabs();
+                    let rolled_back: Vec<Option<Slab>> = previous
+                        .into_iter()
+                        .map(|(slot, old)| slabs[slot].replace(old))
+                        .collect();
+                    self.slots.generation.fetch_add(1, Ordering::AcqRel);
+                    rolled_back
+                };
+                self.fence.failed(reason);
+                drop(rolled_back);
+            }
+        }
+        impl Drop for AdoptRollbackGuard<'_> {
+            fn drop(&mut self) {
+                self.restore("slab adoption aborted".into());
+            }
+        }
+        let guard = AdoptRollbackGuard { slots: self, fence: fence.clone(), previous };
         // Phase 4 (no `slabs` lock held): repoint `self.table` for confirmed
         // slots only, ordered after `copy_written` on the same queue.
         let words: Vec<MoveStep<'_>> = confirmed
             .iter()
-            .flat_map(|&(i, _)| {
+            .flat_map(|&i| {
                 let m = &moved[i];
                 self.offsets.iter().enumerate().map(move |(region, offset)| MoveStep::Word {
                     destination: &self.table,
@@ -1343,45 +1489,26 @@ impl Slots {
                 })
             })
             .collect();
-        let words_written = {
+        let submitted = {
             let mut repointed = self.repointed();
-            let written = moves::submit(&self.device, &self.table, &words)?;
-            *repointed = written.clone().or_else(|| copy_written.clone());
-            written
+            match moves::submit(&self.device, &self.table, &words) {
+                Ok(written) => {
+                    *repointed = written.or_else(|| copy_written.clone());
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
         };
-        let _ = words_written;
-        // Phase 5 (brief `slabs` leaf lock): install the new slabs with
-        // `copy_done = copy_written` (so the first `region_view` waits for
-        // `Copy(from -> to)` before an unordered transfer can write to `to`),
-        // bump `generation`, clear `adopting`, and wake waiters.
-        let previous = {
-            let mut slabs = self.slabs();
-            let previous = confirmed
-                .into_iter()
-                .map(|(i, to)| {
-                    let m = &moved[i];
-                    let adopted = Slab {
-                        regions: self.offsets.iter().map(|offset| (to.clone(), at(m.to) + offset)).collect(),
-                        hold: Arc::new(SlabHold {
-                            store: self.id,
-                            slot: m.holder.slot,
-                            granule: Some(GranuleHold { pool: pool.clone(), granule: m.to }),
-                        }),
-                        views: 0,
-                        adopting: false,
-                        copy_done: copy_written.clone(),
-                    };
-                    std::mem::replace(slabs[m.holder.slot].as_mut().expect("a confirmed slot is backed"), adopted)
-                })
-                .collect::<Vec<_>>();
-            self.generation.fetch_add(1, Ordering::AcqRel);
-            guard.armed = false;
-            self.adopt_done.notify_all();
-            previous
-        };
-        // Phase 6 (outside `slabs`): drop old `SlabHold`s. Each old granule
-        // releases behind the pool's newest uses (the copy and repoint among
-        // them).
+        if let Err(error) = submitted {
+            guard.rollback(error.to_string());
+            return Err((error.into(), owned));
+        }
+        // Phase 5 (outside `slabs` and `repointed`): disarm rollback, publish
+        // `copy_written` on the `AdoptFence` so unordered consumers await the
+        // copy, and drop old `SlabHold`s so each old granule releases behind
+        // the pool's newest uses (the copy and repoint among them).
+        let previous = guard.disarm();
+        fence.submitted(copy_written);
         drop(previous);
         Ok(adopted)
     }
@@ -1410,7 +1537,7 @@ impl Slots {
                         let slab = TensorInner::from_host_in(charges, representation, extents, bytes, Some(table.access_group().clone()))?;
                         Ok::<_, TensorError>(Slab::new(
                             vec![(slab.allocation().clone(), 0)],
-                            Arc::new(SlabHold { store: id, slot, granule: None }),
+                            Arc::new(SlabHold { store: id, slot, granule: None, adopt: None }),
                         ))
                     })
                     .transpose()
@@ -1437,7 +1564,6 @@ impl Slots {
             generation: AtomicU64::new(0),
             mutate: Mutex::new(()),
             slabs: Mutex::new(slabs),
-            adopt_done: std::sync::Condvar::new(),
             repointed: Mutex::new(None),
         }))
     }
@@ -1557,7 +1683,7 @@ impl SlabStore {
                             Ok::<_, TensorError>((tensor.allocation().clone(), tensor.byte_offset() + slot as u64 * bytes))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    *slab = Some(Slab::new(regions, Arc::new(SlabHold { store: id, slot, granule: None })));
+                    *slab = Some(Slab::new(regions, Arc::new(SlabHold { store: id, slot, granule: None, adopt: None })));
                 }
                 count
             }
@@ -1605,7 +1731,6 @@ impl SlabStore {
             generation: AtomicU64::new(0),
             mutate: Mutex::new(()),
             slabs: Mutex::new(Vec::new()),
-            adopt_done: std::sync::Condvar::new(),
             repointed: Mutex::new(None),
         });
         let words = seismic_lang::registry::record_table((0..slots.offsets.len()).flat_map(|region| {
@@ -1644,6 +1769,12 @@ impl SlabStore {
     /// The number of backed slots, without allocating.
     pub fn backed_count(&self) -> usize {
         self.slots.slabs().iter().filter(|slab| slab.is_some()).count()
+    }
+
+    /// Whether `slot` is backed by a slab, without creating a view or
+    /// bumping `Slab::views`.
+    pub fn is_backed(&self, slot: usize) -> bool {
+        self.slots.is_backed(slot)
     }
 
     /// Region `region`'s table: `[capacity, 2]` u32, one 64-bit address an
@@ -1764,6 +1895,7 @@ impl SlabStore {
                         store: slots.id,
                         slot,
                         granule: Some(GranuleHold { pool: pool.clone(), granule }),
+                        adopt: None,
                     });
                     let base = u64::from(granule.index) * pool.granule;
                     claimed.push(ClaimedSlab { slot, address, base, fresh, block, hold });
@@ -1865,7 +1997,6 @@ impl SlabStore {
 mod tests {
     use super::*;
     use crate::driver::DeviceQueue;
-    use std::sync::Condvar;
 
     /// Work in flight on a pool until the test ends it, recording each
     /// thread that waited on it.
@@ -2568,5 +2699,161 @@ mod tests {
         assert_eq!(pool.return_freed(0).unwrap(), block);
         pool.join_waiters();
         assert_eq!(tally.held(), absent + block);
+    }
+
+    /// `Slots::region_view` never queries, waits on, or drops a
+    /// `DeviceCompletion` while holding `Slots::slabs` or inside a
+    /// `NoBlockingAllocationGuard` (the Windows WDDM circular deadlock where
+    /// `expert-residency` blocked inside `cuEventQuery`/`cuEventSynchronize`
+    /// while holding `residency`, starving `expert-requests` from unparking
+    /// the compute kernel). Waiting is deferred to `TensorInner::wait_adopted`
+    /// outside that guard, and becomes a lock-free no-op once settled.
+    #[test]
+    fn region_view_never_blocks_or_queries_completion_inside_no_blocking_allocation_guard() {
+        struct CountingCompletion {
+            flight: Arc<Flight>,
+            completed_calls: Arc<AtomicU64>,
+            ended_calls: Arc<AtomicU64>,
+        }
+
+        impl DeviceCompletion for CountingCompletion {
+            fn completed(&self) -> Result<bool, ExecutionError> {
+                self.completed_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(*self.flight.done.lock().unwrap())
+            }
+
+            fn ended(&self) -> Result<(), ExecutionError> {
+                self.ended_calls.fetch_add(1, Ordering::AcqRel);
+                let mut done = self.flight.done.lock().unwrap();
+                while !*done {
+                    done = self.flight.ended.wait(done).unwrap();
+                }
+                Ok(())
+            }
+        }
+
+        let catalog = crate::devices::Devices::discover(&[]).unwrap();
+        let id = catalog.resolve(seismic_topology::ExecutorSelector::HostCpu).unwrap();
+        let device = catalog.open(id).unwrap();
+        let charges = Charges::tally(&device);
+        let (granule, block) = (1 << 16, 1 << 18);
+        let pool = Pool::open(&PoolCharges::one(&charges), Contract::DeviceOnly, granule, block).unwrap();
+        let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+        let geometry = SlabGeometry {
+            rows_per_slab: 4,
+            logical_rows: 16,
+            capacity: 4,
+            slab_bytes: BLOCK_ALIGNMENT,
+            slab_alignment: BLOCK_ALIGNMENT,
+            regions: vec![(i32s, vec![2], 0)],
+        };
+        let slabs = SlabStore::in_pool(&charges, &pool, geometry, &[]).unwrap();
+        slabs.add_slab(SlabFill::Zeroed).unwrap();
+
+        let flight = Arc::new(Flight::default());
+        let completed_calls = Arc::new(AtomicU64::new(0));
+        let ended_calls = Arc::new(AtomicU64::new(0));
+        let fence = Arc::new(AdoptFence::pending());
+        fence.submitted(Some(Arc::new(CountingCompletion {
+            flight: flight.clone(),
+            completed_calls: completed_calls.clone(),
+            ended_calls: ended_calls.clone(),
+        })));
+        {
+            let mut guard = slabs.slots.slabs();
+            let slab = guard[0].as_mut().unwrap();
+            Arc::get_mut(&mut slab.hold).expect("unique slab hold").adopt = Some(fence);
+        }
+
+        // Inside `NoBlockingAllocationGuard`, `slab_region` and `is_backed`
+        // must succeed immediately with zero driver/completion calls.
+        let view = {
+            let _no_alloc = seismic_memory::enter_no_blocking_allocation();
+            assert!(slabs.is_backed(0));
+            assert!(!slabs.is_backed(1));
+            let view = slabs.slab_region(0, 0).unwrap().unwrap();
+            assert_eq!(completed_calls.load(Ordering::Acquire), 0, "region_view must never poll completion");
+            assert_eq!(ended_calls.load(Ordering::Acquire), 0, "region_view must never wait on completion");
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = view.wait_adopted();
+                }))
+                .is_err(),
+                "waiting on an unsettled adopt fence inside NoBlockingAllocationGuard must panic"
+            );
+            view
+        };
+
+        // Outside the guard, `wait_adopted` waits for the copy completion once.
+        let completer = {
+            let flight = flight.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                flight.complete();
+            })
+        };
+        view.wait_adopted().unwrap();
+        completer.join().unwrap();
+        assert_eq!(ended_calls.load(Ordering::Acquire), 1);
+
+        // Once settled, `wait_adopted` takes the lock-free fast path even
+        // inside a `NoBlockingAllocationGuard` without touching the completion.
+        {
+            let _no_alloc = seismic_memory::enter_no_blocking_allocation();
+            view.wait_adopted().unwrap();
+        }
+        assert_eq!(ended_calls.load(Ordering::Acquire), 1);
+    }
+
+    /// While `Slots::adopt` Phase 4 is still submitting table repoints
+    /// (`AdoptFence` in `Pending`), `region_view` returns immediately under
+    /// `NoBlockingAllocationGuard`; `wait_adopted` blocks until submission
+    /// completes or propagates rollback failure if Phase 4 fails.
+    #[test]
+    fn region_view_succeeds_while_adopt_fence_is_pending_and_wait_propagates_failure() {
+        let catalog = crate::devices::Devices::discover(&[]).unwrap();
+        let id = catalog.resolve(seismic_topology::ExecutorSelector::HostCpu).unwrap();
+        let device = catalog.open(id).unwrap();
+        let charges = Charges::tally(&device);
+        let (granule, block) = (1 << 16, 1 << 18);
+        let pool = Pool::open(&PoolCharges::one(&charges), Contract::DeviceOnly, granule, block).unwrap();
+        let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+        let geometry = SlabGeometry {
+            rows_per_slab: 4,
+            logical_rows: 16,
+            capacity: 4,
+            slab_bytes: BLOCK_ALIGNMENT,
+            slab_alignment: BLOCK_ALIGNMENT,
+            regions: vec![(i32s, vec![2], 0)],
+        };
+        let slabs = SlabStore::in_pool(&charges, &pool, geometry, &[]).unwrap();
+        slabs.add_slabs(2, SlabFill::Zeroed).unwrap();
+
+        let fence_ok = Arc::new(AdoptFence::pending());
+        let fence_err = Arc::new(AdoptFence::pending());
+        {
+            let mut guard = slabs.slots.slabs();
+            Arc::get_mut(&mut guard[0].as_mut().unwrap().hold).expect("unique slab hold").adopt = Some(fence_ok.clone());
+            Arc::get_mut(&mut guard[1].as_mut().unwrap().hold).expect("unique slab hold").adopt = Some(fence_err.clone());
+        }
+
+        let (view0, view1) = {
+            let _no_alloc = seismic_memory::enter_no_blocking_allocation();
+            (slabs.slab_region(0, 0).unwrap().unwrap(), slabs.slab_region(1, 0).unwrap().unwrap())
+        };
+
+        let finisher = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            fence_ok.submitted(None);
+            fence_err.failed("simulated repoint failure".into());
+        });
+
+        view0.wait_adopted().unwrap();
+        let err = view1.wait_adopted().unwrap_err();
+        finisher.join().unwrap();
+        assert!(
+            matches!(err, ExecutionError::SubmissionFailed(ref msg) if msg.contains("simulated repoint failure")),
+            "expected SubmissionFailed with rollback reason, got {err:?}"
+        );
     }
 }

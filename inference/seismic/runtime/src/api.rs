@@ -1752,6 +1752,16 @@ pub mod tensor {
             }
         }
 
+        /// Wait for any pending slab-adoption copy (`Slots::adopt`) populating
+        /// this view's slab to finish. Lock-free no-op for non-slab views and
+        /// already settled slabs.
+        pub fn wait_adopted(&self) -> Result<(), ExecutionError> {
+            match self.slab_hold() {
+                Some(hold) => hold.wait_adopted(),
+                None => Ok(()),
+            }
+        }
+
         /// The bytes device work bound to this plain view's bytes `span`
         /// reaches: its own (`Self::alias_identity`, range).
         fn plain_bytes(&self, span: std::ops::Range<u64>) -> (u64, std::ops::Range<u64>) {
@@ -2477,6 +2487,7 @@ pub mod tensor {
                     Ok(bytes)
                 }
                 TensorBacking::Plain { .. } => {
+                    self.wait_adopted()?;
                     let access = self.allocation.acquire(false)?;
                     self.read_with(&access)
                 }
@@ -2576,6 +2587,7 @@ pub mod tensor {
                     actual,
                 });
             }
+            self.wait_adopted()?;
             let _guard = match idle {
                 true => self
                     .allocation
@@ -2627,6 +2639,7 @@ pub mod tensor {
                     "a chunked upload requires a canonical contiguous tensor".into(),
                 ));
             }
+            self.wait_adopted()?;
             let _guard = self.allocation.acquire(true)?;
             let mut write = |at: u64, bytes: &[u8]| -> std::io::Result<()> {
                 let end = at.checked_add(bytes.len() as u64).filter(|end| *end <= self.byte_len);

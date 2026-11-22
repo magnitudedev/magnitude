@@ -202,6 +202,11 @@ impl SlabTensor {
         self.store.backed_count()
     }
 
+    /// Whether slot `index` is backed by a slab, without creating a view.
+    pub fn is_backed(&self, index: usize) -> bool {
+        self.store.is_backed(index)
+    }
+
     /// Back the lowest free slot with a granule of the pool, growing the
     /// pool by a block, admitted by its entry, where none is free: the slot.
     /// Refused where every slot is backed, or with the entry's capacity

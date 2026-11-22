@@ -738,16 +738,15 @@ unsafe impl Send for Stream {}
 unsafe impl Sync for Stream {}
 
 impl Stream {
+    /// Create a non-blocking CUDA stream (`CU_STREAM_NON_BLOCKING`) so work on
+    /// compute, fill, and transfer streams never implicitly synchronizes with
+    /// the legacy default stream on CUDA/WDDM.
     pub fn new(context: &Arc<Context>) -> Result<Arc<Self>, DriverError> {
-        Self::with_flags(context, 0)
-    }
-
-    fn with_flags(context: &Arc<Context>, flags: c_uint) -> Result<Arc<Self>, DriverError> {
         let _current = context.enter()?;
         let mut raw = std::ptr::null_mut();
         unsafe {
             context.driver.check(
-                (context.driver.stream_create)(&mut raw, flags),
+                (context.driver.stream_create)(&mut raw, CU_STREAM_NON_BLOCKING),
                 "stream creation",
             )?;
         }
@@ -768,7 +767,7 @@ impl Stream {
         if let Some(wakes) = self.wakes.get() {
             return Ok(wakes);
         }
-        let made = Self::with_flags(&self.context, CU_STREAM_NON_BLOCKING)?;
+        let made = Self::new(&self.context)?;
         Ok(self.wakes.get_or_init(|| made))
     }
 

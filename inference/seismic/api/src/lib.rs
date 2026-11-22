@@ -1869,6 +1869,14 @@ impl Tensor {
         self.inner.host_address()
     }
 
+    /// Wait for any pending slab-adoption copy (`Pool::return_freed`)
+    /// populating this view's slab to finish before direct host access via
+    /// [`Self::shared_address`]. Lock-free no-op for non-slab tensors and
+    /// already settled slabs.
+    pub fn wait_adopted(&self) -> Result<(), TensorError> {
+        self.inner.wait_adopted().map_err(TensorError::Execution)
+    }
+
     /// Read `into.len()` bytes at `offset` bytes into this view without
     /// waiting for device work that uses its storage. A dense floating
     /// tensor is refused ([`TensorError::FloatingSharedRead`]): its values

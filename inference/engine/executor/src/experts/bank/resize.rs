@@ -232,6 +232,10 @@ impl crate::experts::source::RecordStore for StoreRegion {
         self.stores.view(self.group, self.region, record)
     }
 
+    fn holds(&self, record: u64) -> bool {
+        usize::try_from(record).ok().is_some_and(|record| self.stores.group(self.group).is_backed(record))
+    }
+
     fn count(&self) -> u64 {
         self.stores.group(self.group).backed().last().map_or(0, |record| record + 1) as u64
     }

@@ -16,6 +16,10 @@ use std::time::Instant;
 pub(crate) trait RecordStore: Send + Sync {
     /// A view of `record`, or `None` where the store holds no slab for it.
     fn view(&self, record: u64) -> Option<Tensor>;
+    /// Whether `record` is backed, without creating a view.
+    fn holds(&self, record: u64) -> bool {
+        self.view(record).is_some()
+    }
     /// One past the highest backed record index.
     fn count(&self) -> u64;
 }
@@ -162,29 +166,30 @@ impl Records {
     pub fn holds(&self, record: u64) -> bool {
         match &self.0.backing {
             Backing::Fixed(records) => usize::try_from(record).ok().and_then(|record| records.get(record)).and_then(Option::as_ref).is_some(),
-            Backing::Pooled(store) => store.view(record).is_some(),
+            Backing::Pooled(store) => store.holds(record),
         }
     }
 
     /// Hold record `record`'s view for the duration of an active host read
     /// or write, resolving on demand for pooled records.
     pub fn hold(&self, record: u64) -> HeldRecord {
-        match &self.0.backing {
-            Backing::Fixed(records) => {
-                let held = usize::try_from(record)
-                    .ok()
-                    .and_then(|record| records.get(record))
-                    .and_then(Option::as_ref)
-                    .unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count()));
-                HeldRecord(held.clone())
-            }
+        let held = match &self.0.backing {
+            Backing::Fixed(records) => usize::try_from(record)
+                .ok()
+                .and_then(|record| records.get(record))
+                .and_then(Option::as_ref)
+                .unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count()))
+                .clone(),
             Backing::Pooled(store) => {
                 let tensor = store.view(record).unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count()));
-                let held = Record::of(tensor, self.0.bytes)
-                    .unwrap_or_else(|error| panic!("invariant violated: pooled record {record} is not host-addressable: {error}"));
-                HeldRecord(held)
+                Record::of(tensor, self.0.bytes)
+                    .unwrap_or_else(|error| panic!("invariant violated: pooled record {record} is not host-addressable: {error}"))
             }
+        };
+        if let Err(error) = held.tensor.wait_adopted() {
+            panic!("record {record}'s slab copy failed before host access: {error}");
         }
+        HeldRecord(held)
     }
 
     /// The view record `record` lies in: what a device copy or landing
