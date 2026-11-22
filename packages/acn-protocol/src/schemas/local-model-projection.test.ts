@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Option, Schema } from "effect"
-import { localModelServingProfile } from "./local-model-projection"
-import { LocalModelSchema } from "./model-state"
+import { localModelIsOwnedByMagnitude, localModelServingProfile } from "./local-model-projection"
+import { LocalModelSchema, type LocalModel } from "./model-state"
 
 const addedModel = (servingState: unknown) => Schema.decodeUnknownSync(LocalModelSchema)({
   _tag: "Custom",
@@ -26,5 +26,25 @@ describe("localModelServingProfile", () => {
       profile: { contextLength: 100_000 },
       failure: { code: "model_assessment_failed", message: "Failed", retryable: true },
     }))).toEqual(Option.none())
+  })
+})
+
+describe("localModelIsOwnedByMagnitude", () => {
+  const withInstallation = (tag: "Installed" | "External", ownership: "Magnitude" | "External" | "Mixed"): LocalModel => ({
+    _tag: "Catalog",
+    modelId: "lfm3-1.7b:gguf:q8",
+    acquisitionState: {
+      _tag: tag,
+      installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/m.gguf", ownership },
+      residencyState: { _tag: "Unloaded" },
+    },
+  } as unknown as LocalModel)
+
+  it("distinguishes Magnitude-downloaded models from externally found or uninstalled models", () => {
+    expect(localModelIsOwnedByMagnitude(withInstallation("Installed", "Magnitude"))).toBe(true)
+    expect(localModelIsOwnedByMagnitude(withInstallation("Installed", "Mixed"))).toBe(true)
+    expect(localModelIsOwnedByMagnitude(withInstallation("Installed", "External"))).toBe(false)
+    expect(localModelIsOwnedByMagnitude(withInstallation("External", "External"))).toBe(false)
+    expect(localModelIsOwnedByMagnitude(addedModel({ _tag: "Assessing", profile: { contextLength: 100_000 } }))).toBe(false)
   })
 })

@@ -1,7 +1,7 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Context, Effect, Layer, Option, Stream } from "effect"
 import { Mutation } from "@magnitudedev/effect-query"
-import { localModelResidency, ModelLoadStageSchema, type LocalModelsState, type ModelId, type ModelResidency } from "@magnitudedev/sdk"
+import { localModelIsOwnedByMagnitude, localModelResidency, ModelLoadStageSchema, type LocalModelsState, type ModelId, type ModelResidency } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { LocalModels } from "../local-models/service"
 import { ClientEffectQuery } from "../state/client-effect-query"
@@ -77,11 +77,28 @@ const makeApplicationSession = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const provideRegistry = Effect.provideService(Registry.AtomRegistry, registry)
   const onboarding = effectQuery.Configuration.GetOnboarding({})
-  // Whether onboarding opens over the page: none until the service answers, and false when it can't be read.
+  const hasMagnitudeOwnedModel = (result: Result.Result<LocalModelsState, unknown>) =>
+    Result.isSuccess(result) && result.value.models.some(localModelIsOwnedByMagnitude)
+  // Whether onboarding opens over the page: none until the service answers, and false when it can't be read
+  // or when Magnitude already owns a downloaded model on this computer (such as an upgrade from 0.2.17).
   const onboardingPending = Atom.keepAlive(Atom.make((get): Option.Option<boolean> => {
     const state = get(onboarding).result
-    return Result.isInitial(state) ? Option.none() : Option.some(Result.isSuccess(state) && state.value.onboarding === "Pending")
+    if (Result.isInitial(state)) return Option.none()
+    if (!Result.isSuccess(state) || state.value.onboarding !== "Pending") return Option.some(false)
+    return Option.some(!hasMagnitudeOwnedModel(get(models.state)))
   }))
+  // If GetOnboarding answered Pending before initial model discovery reported an existing Magnitude download,
+  // persist completion once both onboarding state and the owned model have been observed.
+  const onboardingNeedsAutoComplete = Atom.keepAlive(Atom.make((get): boolean => {
+    const state = get(onboarding).result
+    return Result.isSuccess(state) && state.value.onboarding === "Pending" && hasMagnitudeOwnedModel(get(models.state))
+  }))
+  yield* Registry.toStream(registry, onboardingNeedsAutoComplete).pipe(
+    Stream.filter(Boolean),
+    Stream.take(1),
+    Stream.runForEach(() => Mutation.execute(effectQuery.Configuration.CompleteOnboarding, {}).pipe(provideRegistry, Effect.ignore)),
+    Effect.forkScoped,
+  )
   const navigate = router.navigate
   const landing = (result: Result.Result<LocalModelsState, unknown>) => Result.isSuccess(result) ? landingPage(result.value) : Option.none()
   // The app opens on the page the first full answer about this computer's models calls for, unless it has moved on.

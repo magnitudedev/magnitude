@@ -166,6 +166,10 @@ export const localModelSizeBytes = (model: LocalModel): number => {
 
 export const localModelIsInstalled = (model: LocalModel): boolean => Option.isSome(localModelInstallation(model))
 
+/** Whether Magnitude itself downloaded files for this model (not merely found in another app's folder). */
+export const localModelIsOwnedByMagnitude = (model: LocalModel): boolean =>
+  Option.exists(localModelInstallation(model), ({ ownership }) => ownership === "Magnitude" || ownership === "Mixed")
+
 export const installedLocalModels = (
   state: LocalModelsState,
 ): readonly LocalModel[] =>

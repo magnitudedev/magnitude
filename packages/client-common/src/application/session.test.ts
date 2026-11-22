@@ -5,7 +5,7 @@ import { ApplicationSession, ApplicationSessionLive, HostAction, modelTrayPresen
 import { ApplicationHost } from "./host"
 import { ApplicationRouterMemory } from "./router"
 import { LocalModels } from "../local-models/service"
-import { makeSetupModel } from "./fixtures/model"
+import { makeFoundModel, makeSetupModel } from "./fixtures/model"
 import { Client as EffectQueryClient } from "@magnitudedev/effect-query"
 import { AcnQueries } from "../operations"
 import { ClientEffectQuery } from "../state/client-effect-query"
@@ -103,6 +103,29 @@ describe("host actions", () => {
     expect(registry.get(session.onboardingPending)).toEqual(Option.some(true))
     expect(registry.get(session.page)).toBe("chat")
   }), { current: "Pending" }))
+
+  it("suppresses and auto-completes onboarding when a Magnitude-downloaded model already exists", () => {
+    const onboarding = { current: "Pending" as "Pending" | "Completed" }
+    const models = Atom.make<Result.Result<LocalModelsState>>(Result.initial())
+    return withSession([], (session, registry) => Effect.gen(function* () {
+      expect(registry.get(session.onboardingPending)).toEqual(Option.some(true))
+      registry.set(models, Result.success(ready))
+      expect(registry.get(session.onboardingPending)).toEqual(Option.some(false))
+      yield* Effect.sleep("20 millis")
+      expect(onboarding.current).toBe("Completed")
+    }), onboarding, models)
+  })
+
+  it("keeps onboarding pending on a fresh install with only externally discovered models", () => {
+    const onboarding = { current: "Pending" as "Pending" | "Completed" }
+    const foundOnly: LocalModelsState = { ...ready, models: [makeSetupModel(false), makeFoundModel()] }
+    const models = Atom.make<Result.Result<LocalModelsState>>(Result.success(foundOnly))
+    return withSession([], (session, registry) => Effect.gen(function* () {
+      yield* Effect.sleep("20 millis")
+      expect(registry.get(session.onboardingPending)).toEqual(Option.some(true))
+      expect(onboarding.current).toBe("Pending")
+    }), onboarding, models)
+  })
 
   it("opens Models once onboarding is completed while its download is still running", () => {
     const models = Atom.make<Result.Result<LocalModelsState>>(Result.success(downloading))
