@@ -54,15 +54,49 @@ impl Dialect {
             Self::Vulkan(_) => registry::BackendName::Vulkan,
         }
     }
+
+    /// The universal GPU device properties propagated into every compiled
+    /// kernel unit as `SEISMIC_DEVICE_*` compile-time constants.
+    pub(crate) fn device(self) -> seismic_lang::device::UniversalGpuProperties {
+        match self {
+            Self::Metal(features) => features.device,
+            Self::Cuda(features) => features.device,
+            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+            Self::Vulkan(features) => features.device,
+        }
+    }
 }
 
-/// The Metal device features a native source tests as `SEISMIC_HAS_<NAME>`,
-/// from the opened device's facts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The Metal device features a native source tests as `SEISMIC_HAS_<NAME>`
+/// and universal GPU facts (`SEISMIC_DEVICE_*`), from the opened device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MetalFeatures {
     /// Metal 4 tensor operations (`mpp::tensor_ops::matmul2d`) on the GPU's
     /// matrix hardware; the prefix includes their headers.
     pub(crate) tensor_ops: bool,
+    pub(crate) device: seismic_lang::device::UniversalGpuProperties,
+}
+
+impl MetalFeatures {
+    /// Features of an opened Metal device.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn of(properties: &seismic_lang::device::metal::Properties) -> Self {
+        Self {
+            tensor_ops: properties.tensor_ops.holds(),
+            device: seismic_lang::device::UniversalGpuProperties::of(properties),
+        }
+    }
+
+    /// Features for offline / unopened rendering with conservative floor
+    /// universal properties.
+    pub(crate) fn unopened(tensor_ops: bool) -> Self {
+        Self {
+            tensor_ops,
+            device: seismic_lang::device::UniversalGpuProperties::floor(
+                registry::BackendName::Metal,
+            ),
+        }
+    }
 }
 
 /// The standard library, the tensor-operation headers when enabled, and the
@@ -82,21 +116,30 @@ fn metal_header(features: MetalFeatures) -> String {
     header
 }
 
-/// The CUDA device facts a native source reads as `SEISMIC_<NAME>`, from the
-/// opened device's facts.
+/// The CUDA device facts a native source reads as `SEISMIC_DEVICE_*` (and
+/// legacy `SEISMIC_MULTIPROCESSORS`), from the opened device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CudaFeatures {
-    /// Streaming multiprocessors (`SEISMIC_MULTIPROCESSORS`): a kernel that
-    /// states its grid sizes its blocks' residency to the waves they fill.
-    pub(crate) multiprocessors: u64,
+    pub(crate) device: seismic_lang::device::UniversalGpuProperties,
 }
 
 impl CudaFeatures {
-    /// The facts a source renders at without an opened device (formation
-    /// coverage, a kernel's identity): a source reads the multiprocessor
-    /// count only as a constant, which no preprocessor group tests, so one
-    /// count renders every group the same way as any other.
-    pub(crate) const UNOPENED: Self = Self { multiprocessors: 48 };
+    /// Facts of an opened CUDA device.
+    pub(crate) fn of(properties: &seismic_lang::device::cuda::Properties) -> Self {
+        Self {
+            device: seismic_lang::device::UniversalGpuProperties::of(properties),
+        }
+    }
+
+    /// Facts for offline / unopened rendering with conservative floor
+    /// universal properties.
+    pub(crate) fn unopened() -> Self {
+        Self {
+            device: seismic_lang::device::UniversalGpuProperties::floor(
+                registry::BackendName::Cuda,
+            ),
+        }
+    }
 }
 
 /// The helpers and the device fact macros.
@@ -104,7 +147,7 @@ fn cuda_header(features: CudaFeatures) -> String {
     let mut header = String::from(CUDA_HELPERS);
     header.push_str(&format!(
         "#define SEISMIC_MULTIPROCESSORS {}\n",
-        features.multiprocessors
+        features.device.units
     ));
     header
 }
@@ -581,6 +624,11 @@ fn render_source_with(
                 + format!("#define REPACK_TILE_ROWS_INT {}\n", conversion::TILE_ROWS).as_str()
         }
     };
+    // Universal GPU device properties propagated from the same
+    // `DeviceProperties` that `.seismic` evaluates.
+    for (name, value) in dialect.device().macros() {
+        prefix.push_str(&format!("#define {name} {value}\n"));
+    }
     // Whether a call that parks waits inside its kernel, spinning on its
     // awaited words, or at a submission boundary before it: the backend's
     // fact (`BackendName::parks_in_kernels`), stated there alone.
@@ -2632,7 +2680,22 @@ mod tests {
         }
     }
 
-    const METAL: Dialect = Dialect::Metal(MetalFeatures { tensor_ops: false });
+    const METAL_DEVICE: seismic_lang::device::UniversalGpuProperties =
+        seismic_lang::device::UniversalGpuProperties {
+            units: 16,
+            subgroup_width: 32,
+            max_group_threads: 1024,
+            shared_bytes_per_group: 32 * 1024,
+            shared_bytes_per_unit: 32 * 1024,
+            max_grid_x: u32::MAX as u64,
+            max_grid_y: u32::MAX as u64,
+            max_grid_z: u32::MAX as u64,
+        };
+
+    const METAL: Dialect = Dialect::Metal(MetalFeatures {
+        tensor_ops: false,
+        device: METAL_DEVICE,
+    });
 
     /// A record parameter is host-written where the backend's plain loads
     /// would not read the host's writes (Metal), under each of its prefixes;
@@ -2670,7 +2733,13 @@ mod tests {
         assert!(plain.starts_with("#include <metal_stdlib>\nusing namespace metal;\n"));
         assert!(plain.contains("#define SEISMIC_HAS_TENSOR_OPS 0\n"));
         assert!(!plain.contains("metal_tensor"));
-        let tensor = render(Dialect::Metal(MetalFeatures { tensor_ops: true }), "f32");
+        let tensor = render(
+            Dialect::Metal(MetalFeatures {
+                tensor_ops: true,
+                device: METAL_DEVICE,
+            }),
+            "f32",
+        );
         for line in [
             "#include <metal_tensor>\n",
             "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n",
@@ -2690,6 +2759,16 @@ mod tests {
         f32_atomic_add: false,
         shared_int64_atomics: false,
         maximal_reconvergence: false,
+        device: seismic_lang::device::UniversalGpuProperties {
+            units: 16,
+            subgroup_width: 32,
+            max_group_threads: 1024,
+            shared_bytes_per_group: 32 * 1024,
+            shared_bytes_per_unit: 32 * 1024,
+            max_grid_x: 65_535,
+            max_grid_y: 65_535,
+            max_grid_z: 65_535,
+        },
     };
 
     #[test]
@@ -2882,7 +2961,53 @@ void probe() {{
         }
     }
 
-    const CUDA: Dialect = Dialect::Cuda(CudaFeatures::UNOPENED);
+    const CUDA: Dialect = Dialect::Cuda(CudaFeatures {
+        device: seismic_lang::device::UniversalGpuProperties {
+            units: 48,
+            subgroup_width: 32,
+            max_group_threads: 1024,
+            shared_bytes_per_group: 96 * 1024,
+            shared_bytes_per_unit: 96 * 1024,
+            max_grid_x: (1 << 31) - 1,
+            max_grid_y: 65_535,
+            max_grid_z: 65_535,
+        },
+    });
+
+    #[test]
+    fn universal_device_macros_propagate_to_all_gpu_dialects() {
+        let custom = seismic_lang::device::UniversalGpuProperties {
+            units: 82,
+            subgroup_width: 32,
+            max_group_threads: 1024,
+            shared_bytes_per_group: 101_376,
+            shared_bytes_per_unit: 102_400,
+            max_grid_x: 2_147_483_647,
+            max_grid_y: 65_535,
+            max_grid_z: 65_535,
+        };
+        for dialect in [
+            Dialect::Metal(MetalFeatures {
+                tensor_ops: false,
+                device: custom,
+            }),
+            Dialect::Cuda(CudaFeatures { device: custom }),
+            Dialect::Vulkan(vulkan::VulkanFeatures {
+                device: custom,
+                ..VULKAN_FEATURES
+            }),
+        ] {
+            let source = render(dialect, "f32");
+            for (name, value) in custom.macros() {
+                let line = format!("#define {name} {value}\n");
+                assert!(
+                    source.contains(&line),
+                    "{:?} missing {line:?}",
+                    dialect.backend()
+                );
+            }
+        }
+    }
 
     #[test]
     fn cuda_prefix_declares_kernel_parameters_and_helpers() {

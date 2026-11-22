@@ -1119,8 +1119,25 @@ impl Parser {
         }
     }
 
-    /// `[arithmetic] [form] NAME in [V, ..] default DEFAULT`, the default
     /// `EXPR`, `least where CONDITION` or `greatest where CONDITION`.
+    fn native_default(&mut self) -> PResult<NativeDefaultDecl> {
+        if self.at_word("least") || self.at_word("greatest") {
+            let least = self.at_word("least");
+            self.bump();
+            self.expect_kw(Kw::Where)?;
+            let condition = self.expr()?;
+            if least {
+                Ok(NativeDefaultDecl::Least(condition))
+            } else {
+                Ok(NativeDefaultDecl::Greatest(condition))
+            }
+        } else {
+            Ok(NativeDefaultDecl::Value(self.expr()?))
+        }
+    }
+
+    /// `[arithmetic] [form] NAME in [V, ..] default DEFAULT [reference DEFAULT]`,
+    /// each default/reference `EXPR`, `least where CONDITION` or `greatest where CONDITION`.
     fn native_param(&mut self) -> PResult<NativeParamDecl> {
         let begin = self.span();
         let mut arithmetic = false;
@@ -1158,18 +1175,12 @@ impl Parser {
             )));
         }
         self.bump();
-        let default = if self.at_word("least") || self.at_word("greatest") {
-            let least = self.at_word("least");
+        let default = self.native_default()?;
+        let reference = if self.at_word("reference") {
             self.bump();
-            self.expect_kw(Kw::Where)?;
-            let condition = self.expr()?;
-            if least {
-                NativeDefaultDecl::Least(condition)
-            } else {
-                NativeDefaultDecl::Greatest(condition)
-            }
+            Some(self.native_default()?)
         } else {
-            NativeDefaultDecl::Value(self.expr()?)
+            None
         };
         Ok(NativeParamDecl {
             name,
@@ -1177,6 +1188,7 @@ impl Parser {
             form,
             values,
             default,
+            reference,
             span: begin.to(self.prev_span()),
         })
     }
@@ -2273,6 +2285,21 @@ mod tests {
             NativeDefaultDecl::Value(Expr { kind: ExprKind::Attr { .. }, .. })
         ));
         assert!(native.launches[0].constraint.is_some());
+    }
+
+    #[test]
+    fn parameter_reference_round_trips() {
+        let file = round_trip(
+            "native project for cpu from \"project.rs\":\n    params (arithmetic form INT8 in [0, 1] default 1 reference 0, ROWS in [8, 4] default 8)\n    launch project:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert!(matches!(
+            native.params[0].reference,
+            Some(NativeDefaultDecl::Value(Expr { kind: ExprKind::Int(0), .. }))
+        ));
+        assert!(native.params[1].reference.is_none());
     }
 
     #[test]

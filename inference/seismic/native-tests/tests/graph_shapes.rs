@@ -231,7 +231,7 @@ fn interleaved_classes_slots_and_places_record_each_shape_once() {
         let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let layout = NativeGraphMetadata::certify_group(classes.into_iter().map(|m| {
-            let mut draft = NativeGraphMetadata::new(backend);
+            let mut draft = device.native_graph_metadata();
             let input = draft.port(Element::f32(), &[m, n]).unwrap();
             let landing = draft.port(Element::f32(), &[m, n]).unwrap();
             let scaled = draft
@@ -330,7 +330,7 @@ fn a_layouts_classes_making_different_launches_replay_one_graph() {
         let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let layout = NativeGraphMetadata::certify_group(classes.into_iter().map(|n| {
-            let mut draft = NativeGraphMetadata::new(backend);
+            let mut draft = device.native_graph_metadata();
             let input = draft.port(Element::f32(), &[n]).unwrap();
             let sum = draft
                 .enqueue::<gated_sum::Entry>(&[], &[("N", n)], gated_sum::WorkflowArgs { x: input.tensor().into() })

@@ -110,7 +110,7 @@ fn a_templates_classes_seal_their_store_into_its_layout() {
         let backend = device.backend();
         let charges = seismic::Charges::tally(&device);
         let layout = NativeGraphMetadata::certify_group([2u64, 4].into_iter().map(|m| {
-            let mut draft = NativeGraphMetadata::new(backend);
+            let mut draft = device.native_graph_metadata();
             let input = draft.port(Element::f32(), &[m, n]).unwrap();
             let landing = draft.port(Element::f32(), &[m, n]).unwrap();
             let scaled = draft

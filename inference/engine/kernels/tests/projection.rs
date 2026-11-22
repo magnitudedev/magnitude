@@ -1051,7 +1051,7 @@ fn segmented_projection_specialization_on<E: seismic::Entry>(
     let specialization = with_projection_forms::<E>(device, specialization, mapping);
     if device.backend() == BackendName::Metal {
         specialization
-            .with_param("MATRIX", 0)
+            .with_param("MATRIX_FROM", 9)
             .with_launch_param(common::metal_launch::<E>("batch"), "BATCH_PARTS", 2)
     } else {
         specialization
@@ -1197,11 +1197,11 @@ fn with_matrix<E: seismic::Entry>(
         return specialization;
     }
     let batch = common::metal_launch::<E>("batch");
-    let matrix = specialization.clone().with_param("MATRIX", 1).with_launch_param(batch, "BATCH_ROWS", 2);
+    let matrix = specialization.clone().with_param("MATRIX_FROM", 2).with_launch_param(batch, "BATCH_ROWS", 2);
     if declared::declared_at(device, &seismic::generated::bound_entry::<E>(elements, None), &matrix).is_ok() {
         matrix
     } else {
-        specialization.with_param("MATRIX", 0).with_launch_param(batch, "BATCH_PARTS", 2)
+        specialization.with_param("MATRIX_FROM", 9).with_launch_param(batch, "BATCH_PARTS", 2)
     }
 }
 
@@ -1223,7 +1223,7 @@ fn readout_selected_specialization_on(
         specialization,
         Mapping { tall: None, tiled: 0, int8_tile: 128, ..mapping },
     )
-    .with_param("MATRIX", 0)
+    .with_param("MATRIX_FROM", 9)
     .with_launch_param(common::metal_launch::<readout_selected_rows::Entry>("batch"), "BATCH_PARTS", 2)
 }
 
@@ -1286,16 +1286,16 @@ fn checked_classes(four_b: bool) -> (Vec<usize>, Vec<Mapping>) {
 /// The `dense` projection's launches (`dense.seismic`) for each
 /// variant, in its order.
 const PAIRED_LAUNCHES: [&str; 14] = [
-    "gemv", "batch", "gemm_small", "gemm", "tall", "quantize", "coefficients", "int8", "gemv_rows", "gemv_pair",
-    "pack", "pack_coefficients", "packed", "unpacked",
+    "gemv", "batch", "gemm_small", "gemm", "tall", "quantize", "coefficients", "int8", "gemv_rows",
+    "gemv_pair", "pack", "pack_coefficients", "packed", "unpacked",
 ];
 const SINGLE_LAUNCHES: [&str; 17] = [
     "gemv", "batch", "gemm_small", "reduce_small", "gemm", "reduce", "relayout", "tall", "quantize",
     "coefficients", "int8", "gemv_rows", "gemv_pair", "pack", "pack_coefficients", "packed", "unpacked",
 ];
 const SEGMENTED_LAUNCHES: [&str; 11] = [
-    "gemv", "batch", "gemm_small", "gemm", "tall", "gemv_rows", "gemv_pair", "pack", "pack_coefficients", "packed",
-    "unpacked",
+    "gemv", "batch", "gemm_small", "gemm", "tall", "gemv_rows", "gemv_pair", "pack", "pack_coefficients",
+    "packed", "unpacked",
 ];
 /// A segmented projection whose contract bounds its rows at 16 keeps the
 /// launches of up to 16 rows.
@@ -2165,7 +2165,7 @@ fn metal_attention_project_matrix_gemv_matches_the_batched_rows() {
                                 &device,
                                 &seismic::generated::bound_entry::<attention_project::Entry>(&elements, None),
                                 &specialization
-                                    .with_param("MATRIX", 1)
+                                    .with_param("MATRIX_FROM", 2)
                                     .with_launch_param(common::metal_launch::<attention_project::Entry>("batch"), "BATCH_ROWS", 2),
                             )
                             .is_ok(),
@@ -4226,7 +4226,7 @@ fn metal_matrix_gemv_partial_k_block_matches_the_host() {
                     &[("H", h), ("F", k)],
                     gemm_mapping(64, 64, 1),
                 )
-                .with_param("MATRIX", 1)
+                .with_param("MATRIX_FROM", 2)
                 .with_launch_param(common::metal_launch::<dense_output::Entry>("batch"), "BATCH_ROWS", 2),
             );
             assert!(
@@ -7536,7 +7536,7 @@ fn mxfp8_grouped_project_rows_at_deepseek_v41_prefill_wo_a_times() {
         ("BATCH_SIMDGROUPS", 8),
         ("BATCH_ROWS", 2),
         ("BATCH_PARTS", 2),
-        ("MATRIX", 0),
+        ("MATRIX_FROM", 9),
         ("TILE_M", 64),
         ("TILE_N", 64),
         ("TALL_M", 128),

@@ -3269,7 +3269,10 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         fixture_invocations(&case, &statics, limits),
     );
     let points = case.points(limits);
-    let (_, key, hit) = tuner.stored(&case, &statics, &points, &defaults).unwrap().unwrap();
+    let (_, key, hit) = tuner
+        .stored(&case, &statics, &points, &defaults, &defaults)
+        .unwrap()
+        .unwrap();
     assert!(hit.is_none());
     let configuration = |spec: &NativeSpecialization| Configuration {
         statics: spec.statics().clone(),
@@ -3307,7 +3310,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
     );
     assert!(
         tuner
-            .stored(&case, &statics, &points, &defaults)
+            .stored(&case, &statics, &points, &defaults, &defaults)
             .err()
             .expect("invalid terminal choice must fail")
             .contains("search cannot reopen"),
@@ -3317,7 +3320,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
     cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record).unwrap();
     assert!(
         tuner
-            .stored(&case, &statics, &points, &defaults)
+            .stored(&case, &statics, &points, &defaults, &defaults)
             .err()
             .expect("unqualified demanded choice fails")
             .contains("lacks matching numerical evidence")
@@ -3332,7 +3335,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         })
         .collect::<Vec<_>>();
     let hit = tuner
-        .stored(&case, &statics, &inactive_points, &defaults)
+        .stored(&case, &statics, &inactive_points, &defaults, &defaults)
         .unwrap()
         .unwrap()
         .2
@@ -3350,17 +3353,42 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
     cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record).unwrap();
     assert!(
         tuner
-            .stored(&case, &statics, &points, &invalid)
+            .stored(&case, &statics, &points, &invalid, &defaults)
             .err()
             .expect("mismatched CanonicalFallback must fail")
             .contains("not the declared canonical default")
+    );
+    // A ReferenceFallback strictly accepts the declared validation reference
+    // (even when distinct from `defaults`) and rejects any other choice.
+    record.disposition = seismic::TuningDisposition::ReferenceFallback {
+        artifact: "reference".into(),
+    };
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record).unwrap();
+    let ref_hit = tuner
+        .stored(&case, &statics, &points, &invalid, &defaults)
+        .unwrap()
+        .unwrap()
+        .2
+        .expect("matching ReferenceFallback must succeed");
+    assert_eq!(ref_hit.0.overall, record.overall);
+    assert!(
+        tuner
+            .stored(&case, &statics, &points, &defaults, &invalid)
+            .err()
+            .expect("mismatched ReferenceFallback must fail")
+            .contains("not the declared validation reference")
     );
     record.disposition = seismic::TuningDisposition::QualifiedCandidate;
     // A record whose search stopped for want of room is the machine's
     // moment, not the unit's: a search searches the unit again.
     cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO).without_room(), &record).unwrap();
     assert!(
-        tuner.stored(&case, &statics, &inactive_points, &defaults).unwrap().unwrap().2.is_none(),
+        tuner
+            .stored(&case, &statics, &inactive_points, &defaults, &defaults)
+            .unwrap()
+            .unwrap()
+            .2
+            .is_none(),
         "a record stopped for want of room is no cache hit"
     );
     std::fs::remove_dir_all(root).unwrap();

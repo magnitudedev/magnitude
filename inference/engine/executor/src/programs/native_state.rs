@@ -253,6 +253,9 @@ impl PreparedStateCopyGraphs {
         handles: &AttestedState,
         classes: impl IntoIterator<Item = StateCopyGraphClass>,
     ) -> Result<Self, SubmitError> {
+        let _sizing = super::graph::sizing::SizingScope::enter_with_device(Some(
+            *target_device.properties(),
+        ));
         let classes = classes.into_iter().collect::<Vec<_>>();
         let (storage, graphs, layouts) = certify_copy_family::<NativeGraphLayout>(target_device.backend(), &classes)
             .map_err(|error| invalid(error.to_string()))?;

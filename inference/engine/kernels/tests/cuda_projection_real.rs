@@ -664,6 +664,7 @@ fn real_26b_grouped_physical_f16_operands() {
                 .with_static("GS", 0)
                 .with_static("US", 0)
                 .with_static("LB", 0)
+                .with_param("INT8", 0)
                 .with_param("OPERAND", operand),
         )
         .unwrap()

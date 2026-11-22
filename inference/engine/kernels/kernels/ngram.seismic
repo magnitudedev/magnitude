@@ -248,14 +248,14 @@ native ngram_gate for metal from "metal/ngram_gate.metal":
 native ngram_gate for cuda from "cuda/ngram_gate.cu":
     static (H, S, PR)
     launch ngram_gate:
-        threadgroups (S, min(M, 65535), 1)
+        threadgroups (S, min(M, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
 
 # Vulkan: CUDA's items.
 native ngram_gate for vulkan from "vulkan/ngram_gate.comp":
     static (H, S, PR)
     launch ngram_gate:
-        threadgroups (S, min(M, 65535), 1)
+        threadgroups (S, min(M, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (128)
 
@@ -281,14 +281,15 @@ native ngram_inject for metal from "metal/ngram_inject.metal":
 native ngram_inject for cuda from "cuda/ngram_inject.cu":
     static (H, S, K)
     launch ngram_inject:
-        threadgroups (ceil_div(ceil_div(H, 4), 128), min(M + B, 65535), S)
+        threadgroups (ceil_div(ceil_div(H, 4), 128), min(M + B, device.max_grid_y), S)
         threads_per_threadgroup (128, 1, 1)
 
+# Vulkan: CUDA's items.
 native ngram_inject for vulkan from "vulkan/ngram_inject.comp":
     static (H, S, K)
     launch ngram_inject:
-        threadgroups (ceil_div(S * H, 256), min(M + B, 65535), 1)
-        threads_per_threadgroup (256, 1, 1)
+        threadgroups (ceil_div(ceil_div(H, 4), 128), min(M + B, device.max_grid_y), S)
+        threads_per_threadgroup (128, 1, 1)
 
 # CPU: work item r < M computes every channel of row r; work item M + b
 # publishes slot b's successor window. Shared: the decoded norm.
@@ -311,14 +312,15 @@ native ngram_add for metal from "metal/ngram_add.metal":
 native ngram_add for cuda from "cuda/ngram_add.cu":
     static (H, S)
     launch ngram_add:
-        threadgroups (ceil_div(ceil_div(H, 4), 128), min(M, 65535), 1)
+        threadgroups (ceil_div(ceil_div(H, 4), 128), min(M, device.max_grid_y), 1)
         threads_per_threadgroup (128, 1, 1)
 
+# Vulkan: CUDA's threads.
 native ngram_add for vulkan from "vulkan/ngram_add.comp":
     static (H, S)
     launch ngram_add:
-        threadgroups (ceil_div(S * H, 256), min(M, 65535), 1)
-        threads_per_threadgroup (256, 1, 1)
+        threadgroups (ceil_div(ceil_div(H, 4), 128), min(M, device.max_grid_y), 1)
+        threads_per_threadgroup (128, 1, 1)
 
 # CPU: one work item per row.
 native ngram_add for cpu from "cpu/ngram_add.rs":

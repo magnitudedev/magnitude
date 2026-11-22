@@ -2900,15 +2900,11 @@ __device__ __forceinline__ void stage_projection_row(const Pro &pro, u32 m, u32 
                                                      u8 *staged, void *groups) {
     static_assert(!S8 || Same<Operands, SemanticGemmOperands>::value,
                   "activation quantization and coefficient conversion are distinct policies");
-    if constexpr (S8) {
-        // Both bands read int8_rule rows, each in its order.
-        if (rows <= GEMV_ROWS)
-            stage_row_s8<GEMV_ENTRIES>(pro, m, K, staged, reinterpret_cast<float2 *>(groups));
-        else
-            stage_row_s8<GEMM_ENTRIES>(pro, m, K, staged, reinterpret_cast<float2 *>(groups));
-    } else if (rows <= GEMV_ROWS) {
+    if (rows <= GEMV_ROWS) {
         if constexpr (Pro::STAGED)
             form_row(pro, m, K, staged);
+    } else if constexpr (S8) {
+        stage_row_s8<GEMM_ENTRIES>(pro, m, K, staged, reinterpret_cast<float2 *>(groups));
     } else if constexpr (Pro::STAGED || Operands::MATERIALIZE) {
         materialize_operand_row<Operands>(pro, m, K, staged);
     }

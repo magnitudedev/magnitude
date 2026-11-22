@@ -106,7 +106,7 @@ native conditioning_overlay for metal from "metal/conditioning_overlay.metal":
 
 native conditioning_overlay for cuda from "cuda/conditioning_overlay.cu":
     launch conditioning_overlay:
-        threadgroups (ceil_div(D, 1024), min(M, 65535), 1)
+        threadgroups (ceil_div(D, 1024), min(M, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
 
 # Vulkan: the RMS inverse is a launch of its own (it returns at once when
@@ -133,7 +133,7 @@ native embedding_rows for cpu from "cpu/embedding_rows.rs":
 # 65535-group floor (Vulkan spec §5.3).
 native conditioning_overlay for vulkan from "vulkan/conditioning_overlay.comp":
     launch conditioning_overlay:
-        threadgroups (min(ceil_div(M * D, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * D, 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: one work item per row.
@@ -176,7 +176,7 @@ native stored_rows for cuda from "cuda/stored_rows.cu":
     static (W)
     records (slots)
     launch stored_rows:
-        threadgroups (min(M, 65535), ceil_div(W, 256), 1)
+        threadgroups (min(M, device.max_grid_x), ceil_div(W, 256), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native stored_rows for vulkan from "vulkan/stored_rows.comp":
@@ -184,7 +184,7 @@ native stored_rows for vulkan from "vulkan/stored_rows.comp":
     records (slots)
     where form(E, DECODED) == 1
     launch stored_rows:
-        threadgroups (min(M, 65535), ceil_div(W, 256), 1)
+        threadgroups (min(M, device.max_grid_x), ceil_div(W, 256), 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: one work item per row, its decoded values in its shared bytes.
@@ -242,7 +242,7 @@ native feature_copy for cuda from "cuda/feature_copy.cu":
 
 native feature_copy for vulkan from "vulkan/feature_copy.comp":
     launch feature_copy:
-        threadgroups (min(ceil_div(M * D, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * D, 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native feature_copy for cpu from "cpu/feature_copy.rs":

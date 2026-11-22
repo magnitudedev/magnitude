@@ -4733,20 +4733,23 @@ impl<'a> Tuner<'a> {
         let defaults = offered
             .default_specialization(statics)
             .map_err(|error| failure(format!("the device offers no default at these statics: {error}")))?;
+        let reference = offered
+            .reference_specialization(statics)
+            .map_err(|error| failure(format!("the device offers no reference at these statics: {error}")))?;
         let shapes = self.shapes(case, &key, statics)?;
         if shapes.is_empty() {
             return Err(failure("the engine's bounds admit no tuning point".into()));
         }
         match self.phase {
             Phase::Count { .. } => {
-                self.count_unit(case, &offered, statics, key, &shapes, &defaults)
+                self.count_unit(case, &offered, statics, key, &shapes, &defaults, &reference)
             }
             Phase::Census { .. } => self.census_unit(case, offered, statics, key, shapes),
             // The search is over: the unit's published choice is read, and
             // nothing is prepared.
             Phase::Searched => self.searched_unit(case, statics, key, shapes),
             Phase::Serve(_) => self
-                .served_unit(case, &offered, statics, key, shapes, &defaults)
+                .served_unit(case, &offered, statics, key, shapes, &defaults, &reference)
                 .map(Some),
         }
         .map(|chosen| chosen.unwrap_or(defaults))
@@ -4763,6 +4766,7 @@ impl<'a> Tuner<'a> {
         key: TuningKey,
         shapes: &[PointShape],
         defaults: &NativeSpecialization,
+        reference: &NativeSpecialization,
     ) -> Result<Option<NativeSpecialization>, CatalogFailure> {
         let failure = |outcome: String| CatalogFailure::Tuning {
             entry: key.0,
@@ -4800,7 +4804,9 @@ impl<'a> Tuner<'a> {
         // A valid cached final choice is never searched again. The first
         // preparation alone owns the fixed tuning allowance.
         let began = Instant::now();
-        let cached = self.stored(case, statics, shapes, defaults).map_err(failure)?;
+        let cached = self
+            .stored(case, statics, shapes, defaults, reference)
+            .map_err(failure)?;
         let slot = cached.as_ref().map(|(_, slot, _)| slot.clone());
         let settled = if let Some((_, _, Some((choice, receipt)))) = cached {
             // A later load is metadata only: the walk that prepares the
@@ -5034,6 +5040,7 @@ impl<'a> Tuner<'a> {
         key: TuningKey,
         shapes: Vec<PointShape>,
         defaults: &NativeSpecialization,
+        reference: &NativeSpecialization,
     ) -> Result<NativeSpecialization, CatalogFailure> {
         let entry = key.0;
         let bindings = key.1.clone();
@@ -5059,7 +5066,9 @@ impl<'a> Tuner<'a> {
             return Ok(chosen);
         }
         let began = Instant::now();
-        let stored = self.stored(case, statics, &shapes, defaults).map_err(failure)?;
+        let stored = self
+            .stored(case, statics, &shapes, defaults, reference)
+            .map_err(failure)?;
         let Some((_, _, Some((choice, receipt)))) = stored else {
             self.unprepared_unit(entry, bindings, key.2.statics.clone())?;
             self.chosen.insert(key, defaults.clone());
@@ -5112,6 +5121,7 @@ impl<'a> Tuner<'a> {
         statics: &NativeSpecialization,
         shapes: &[PointShape],
         defaults: &NativeSpecialization,
+        reference: &NativeSpecialization,
     ) -> Result<Option<StoredSlot<'a>>, String> {
         let entry = <T::Entry as seismic::Entry>::NAME;
         let Some(cache) = self.context.cache.filter(|_| survey_plan(entry).is_none()) else {
@@ -5193,6 +5203,15 @@ impl<'a> Tuner<'a> {
                     if chosen != *defaults {
                         return Err(
                             "terminal fallback: choice is not the declared canonical default; search cannot reopen"
+                                .into(),
+                        );
+                    }
+                    choice.chosen.usable_fallback()?;
+                }
+                seismic::TuningDisposition::ReferenceFallback { .. } => {
+                    if chosen != *reference {
+                        return Err(
+                            "terminal reference fallback: choice is not the declared validation reference; search cannot reopen"
                                 .into(),
                         );
                     }

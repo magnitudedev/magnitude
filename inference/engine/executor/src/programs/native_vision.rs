@@ -2328,6 +2328,9 @@ impl PreparedVisionGraphs {
         description: &VisionDescription,
         patch_rows: impl IntoIterator<Item = u64>,
     ) -> Result<Self, SubmitError> {
+        let _sizing = super::graph::sizing::SizingScope::enter_with_device(Some(
+            *target_device.properties(),
+        ));
         let graph_error = |error: GraphError| invalid(error.to_string());
         let patch_rows = patch_rows.into_iter().collect::<Vec<_>>();
         let program = planned_program(description, load).map_err(graph_error)?;

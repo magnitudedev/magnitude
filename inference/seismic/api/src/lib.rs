@@ -805,8 +805,24 @@ impl Device {
             inner: seismic_runtime::native::graph::NativeGraphDraft::new(&self.inner),
         }
     }
+    /// Begin a checked metadata graph bound to this device's hardware
+    /// properties, for certifying layouts sealed on this device.
+    pub fn native_graph_metadata(&self) -> NativeGraphMetadata {
+        NativeGraphMetadata::new_for_device(self.backend(), Some(*self.properties()))
+    }
     /// Begin an exact graph using a certified Seismic placement.
+    ///
+    /// Panics if `layout` was not certified for this device's properties:
+    /// kernel scratch bounds and active launch masks depend on hardware
+    /// properties (`device.shared_bytes_per_group`, `device.units`, etc.), so
+    /// sealing against a layout certified for the backend floor or a different
+    /// device is an invariant violation.
     pub fn native_graph_with_layout(&self, layout: &NativeGraphLayout) -> NativeGraph {
+        assert_eq!(
+            layout.device,
+            Some(*self.properties()),
+            "native graph layout was not certified for this device's properties"
+        );
         NativeGraph {
             inner: seismic_runtime::native::graph::NativeGraphDraft::with_layout(
                 &self.inner,
@@ -2867,10 +2883,17 @@ pub use seismic_runtime::native::graph::{GraphFamilyCensus, HostHeap, NativeGrap
 
 #[derive(Clone)]
 pub struct NativeGraphLayout {
+    device: Option<crate::device::DeviceProperties>,
     inner: Arc<seismic_runtime::native::graph::NativeGraphLayout>,
 }
 
 impl NativeGraphLayout {
+    /// The device properties this layout was certified against, or `None` when
+    /// certified offline against the backend floor.
+    pub fn device(&self) -> Option<crate::device::DeviceProperties> {
+        self.device
+    }
+
     /// Unique identifier of this layout, shared across clones of it.
     pub fn identity(&self) -> u64 {
         self.inner.identity()
@@ -3099,6 +3122,16 @@ impl<E: Entry> BoundEntry<E> {
         statics: &NativeSpecialization,
     ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
         generated::native_default_specialization::<E>(device, statics, &self.elements)
+    }
+
+    /// The numerical validation reference specialization at `statics` as
+    /// `device` offers this entry.
+    pub fn reference_specialization(
+        &self,
+        device: &Device,
+        statics: &NativeSpecialization,
+    ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
+        generated::native_reference_specialization::<E>(device, statics, &self.elements)
     }
 
     /// The entry's native implementation as `device` offers it at this
@@ -3516,6 +3549,13 @@ impl NativeGraphMetadata {
         self,
         layout: &NativeGraphLayout,
     ) -> Result<NativeGraphStorageBytes, NativeGraphMetadataError> {
+        if self.device != layout.device {
+            return Err(NativeGraphMetadataError::Workflow(
+                WorkflowError::NativeGraphLayoutMismatch(
+                    seismic_runtime::api::LayoutMismatch::Topology,
+                ),
+            ));
+        }
         self.inner
             .seal_with_layout(&layout.inner)
             .map_err(NativeGraphMetadataError::Workflow)
@@ -3523,17 +3563,33 @@ impl NativeGraphMetadata {
 
     /// Certify a single [`NativeGraphLayout`] as the element-wise maximum of
     /// buffer capacities and active launch counts across a non-empty sequence
-    /// of concrete exact-shape drafts sharing one topology.
+    /// of concrete exact-shape drafts sharing one topology and device
+    /// properties.
     pub fn certify_group(
         drafts: impl IntoIterator<Item = NativeGraphMetadata>,
     ) -> Result<NativeGraphLayout, NativeGraphMetadataError> {
-        seismic_runtime::native::graph::ValidatedMetadataDraft::certify_group(
-            drafts.into_iter().map(|draft| draft.inner),
-        )
-        .map(|inner| NativeGraphLayout {
-            inner: Arc::new(inner),
-        })
-        .map_err(NativeGraphMetadataError::Workflow)
+        let mut device: Option<Option<crate::device::DeviceProperties>> = None;
+        let mut inner_drafts = Vec::new();
+        for draft in drafts {
+            match device {
+                None => device = Some(draft.device),
+                Some(expected) if expected != draft.device => {
+                    return Err(NativeGraphMetadataError::Workflow(
+                        WorkflowError::NativeGraphLayoutMismatch(
+                            seismic_runtime::api::LayoutMismatch::Topology,
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+            inner_drafts.push(draft.inner);
+        }
+        seismic_runtime::native::graph::ValidatedMetadataDraft::certify_group(inner_drafts)
+            .map(|inner| NativeGraphLayout {
+                device: device.flatten(),
+                inner: Arc::new(inner),
+            })
+            .map_err(NativeGraphMetadataError::Workflow)
     }
 }
 
@@ -5770,6 +5826,24 @@ pub mod generated {
         let module = E::module()?;
         let entry = E::resolve(module)?;
         Ok(seismic_runtime::native::default_specialization(
+            device.inner(),
+            module.checked(),
+            entry.id(),
+            &element_bindings(elements),
+            statics,
+        ))
+    }
+
+    /// The numerical validation reference specialization at `statics` as
+    /// `device` offers its implementation.
+    pub fn native_reference_specialization<E: Entry>(
+        device: &Device,
+        statics: &NativeSpecialization,
+        elements: &[(&str, Element)],
+    ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        Ok(seismic_runtime::native::reference_specialization(
             device.inner(),
             module.checked(),
             entry.id(),

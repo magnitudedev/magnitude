@@ -164,14 +164,14 @@ native corrector_nodes for cuda from "cuda/corrector_nodes.cu":
     static (J, K, H, TB)
     where TB <= 1
     launch corrector_nodes:
-        threadgroups (ceil_div(H, 1024), min(J * K, 65535), min(S, 65535))
+        threadgroups (ceil_div(H, 1024), min(J * K, device.max_grid_y), min(S, device.max_grid_z))
         threads_per_threadgroup (256, 1, 1)
 
 native corrector_nodes for vulkan from "vulkan/corrector_nodes.comp":
     static (J, K, H, TB)
     where TB <= 1
     launch corrector_nodes:
-        threadgroups (min(ceil_div(S * J * K * H, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(H, 1024), device.max_grid_x), min(J * K, device.max_grid_y), min(S, device.max_grid_z))
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: one work item per node row.
@@ -269,13 +269,13 @@ native corrector_factors for metal from "metal/corrector_factors.metal":
 native corrector_factors for cuda from "cuda/corrector_factors.cu":
     static (N, H)
     launch corrector_factors:
-        threadgroups (ceil_div(H, 1024), min(N, 65535), min(S, 65535))
+        threadgroups (ceil_div(H, 1024), min(N, device.max_grid_y), min(S, device.max_grid_z))
         threads_per_threadgroup (256, 1, 1)
 
 native corrector_factors for vulkan from "vulkan/corrector_factors.comp":
     static (N, H)
     launch corrector_factors:
-        threadgroups (min(ceil_div(S * N * H, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(H, 1024), device.max_grid_x), min(N, device.max_grid_y), min(S, device.max_grid_z))
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: one work item per node.

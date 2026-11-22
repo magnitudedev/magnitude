@@ -88,8 +88,8 @@ impl Evidence {
 /// What every point of a unit shares: the default, what candidates are
 /// held to against it, and what was observed so far.
 struct Shared {
-    /// The declaration's native default: the canonical kernel itself.
-    default: Arc<NativePrepared>,
+    /// The declaration's numerical validation reference oracle.
+    default: RefCell<Arc<NativePrepared>>,
     /// What its observations' calls and placements allocate through.
     charges: crate::memory::Charges,
     requirement: NumericalRequirement,
@@ -180,8 +180,8 @@ impl<'a> PreparedPoint<'a> {
                     reset.borrow_mut()().map_err(|e| execution(&e))?;
                 }
                 deadline.check(Duration::ZERO)?;
-                let results = shared
-                    .default
+                let reference = shared.default.borrow().clone();
+                let results = reference
                     .call(&shared.charges, args.clone())
                     .map_err(|e| execution(&e))?;
                 let expected = observe(
@@ -201,6 +201,11 @@ impl<'a> PreparedPoint<'a> {
         result
     }
 
+    /// Whether `kernel` is the validation reference oracle itself.
+    pub(super) fn is_reference(&self, kernel: &NativePrepared) -> bool {
+        kernel.artifact() == self.shared.default.borrow().artifact()
+    }
+
     /// The census's run of the native default at this point: its first
     /// pass over the workload rotation is observed and retained as the
     /// reference there, so no candidate ever needs another default run at
@@ -212,7 +217,7 @@ impl<'a> PreparedPoint<'a> {
     ) -> Result<(), WorkError<Exclusion>> {
         let shared = &self.shared;
         let inputs = self.inputs();
-        if timing.prepared().artifact() != shared.default.artifact()
+        if timing.prepared().artifact() != shared.default.borrow().artifact()
             || inputs
                 .workload
                 .iter()
@@ -301,7 +306,7 @@ impl<'a> PreparedPoint<'a> {
         let shared = &self.shared;
         let inputs = self.inputs();
         let artifact = &kernel.artifact().0;
-        if *artifact == shared.default.artifact().0 {
+        if *artifact == shared.default.borrow().artifact().0 {
             return Ok(None);
         }
         let all = (0..inputs.rotation.len()).collect::<Vec<_>>();
@@ -406,7 +411,7 @@ impl<'a> PreparedPoint<'a> {
     /// reference itself, or that work was observed here before.
     pub(super) fn witnessed(&self, artifact: &str, key: &LaunchKey) -> bool {
         let shared = &self.shared;
-        artifact == shared.default.artifact().0
+        artifact == shared.default.borrow().artifact().0
             || shared
                 .evidence
                 .borrow()
@@ -448,7 +453,7 @@ impl Validator {
         Self {
             mutable: mutable.to_vec(),
             shared: Rc::new(Shared {
-                default: default.clone(),
+                default: RefCell::new(default.clone()),
                 charges: charges.clone(),
                 requirement: requirement.clone(),
                 logical: logical.clone(),
@@ -457,6 +462,11 @@ impl Validator {
                 evidence: RefCell::new(Evidence::default()),
             }),
         }
+    }
+
+    /// Replace the validation reference oracle once prepared lazily.
+    pub(super) fn set_reference(&self, reference: &Arc<NativePrepared>) {
+        *self.shared.default.borrow_mut() = reference.clone();
     }
 
     /// Time spent executing the default as the reference so far.

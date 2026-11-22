@@ -1179,6 +1179,9 @@ impl PreparedSharedHeadGraphs {
         geometry: &SharedHeadGeometry<'_>,
         classes: impl IntoIterator<Item = SharedHeadGraphClass>,
     ) -> Result<Self, SubmitError> {
+        let _sizing = super::graph::sizing::SizingScope::enter_with_device(Some(
+            *target_device.properties(),
+        ));
         let classes = classes.into_iter().collect::<Vec<_>>();
         // Certify each class's layout so sealing verifies against and adopts
         // the exact certified storage the planner charged.

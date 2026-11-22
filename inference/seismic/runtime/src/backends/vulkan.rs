@@ -58,7 +58,10 @@ impl VulkanOpened {
 
     /// The device features the generated prefix exposes.
     pub(crate) fn features(&self) -> VulkanFeatures {
-        VulkanFeatures::of(&self.service.formation())
+        VulkanFeatures::of(
+            &self.service.formation(),
+            seismic_lang::device::UniversalGpuProperties::of(self.service.properties()),
+        )
     }
 
     /// A buffer charged as `charge` says, landing on the first of its kinds

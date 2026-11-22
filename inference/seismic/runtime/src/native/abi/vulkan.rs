@@ -29,11 +29,16 @@ pub(crate) struct VulkanFeatures {
     /// `MaximallyReconvergesKHR` where it does, and the uniformity check
     /// accepts a subgroup operation after such a loop only then.
     pub(crate) maximal_reconvergence: bool,
+    /// Universal GPU device properties propagated as `SEISMIC_DEVICE_*`.
+    pub(crate) device: seismic_lang::device::UniversalGpuProperties,
 }
 
 impl VulkanFeatures {
-    /// The features a device with `facts` exposes.
-    pub(crate) fn of(facts: &seismic_vulkan::FormationTarget) -> Self {
+    /// The features an opened device with `facts` and `device` properties exposes.
+    pub(crate) fn of(
+        facts: &seismic_vulkan::FormationTarget,
+        device: seismic_lang::device::UniversalGpuProperties,
+    ) -> Self {
         Self {
             subgroup_lanes: facts.subgroup_lanes,
             float16: facts.float16,
@@ -44,7 +49,19 @@ impl VulkanFeatures {
             f32_atomic_add: facts.f32_atomic_add,
             shared_int64_atomics: facts.shared_int64_atomics,
             maximal_reconvergence: facts.maximal_reconvergence,
+            device,
         }
+    }
+
+    /// The features for offline / unopened rendering of `facts`, using
+    /// conservative Vulkan floor universal properties aligned with
+    /// `facts.subgroup_lanes`.
+    pub(crate) fn of_target(facts: &seismic_vulkan::FormationTarget) -> Self {
+        let mut device = seismic_lang::device::UniversalGpuProperties::floor(
+            seismic_lang::registry::BackendName::Vulkan,
+        );
+        device.subgroup_width = u64::from(facts.subgroup_lanes);
+        Self::of(facts, device)
     }
 }
 
@@ -308,6 +325,7 @@ void main() {
             f32_atomic_add: false,
             shared_int64_atomics: false,
             maximal_reconvergence: false,
+            device: seismic_lang::device::UniversalGpuProperties::of(device.properties()),
         };
         let source = format!("{}{KERNEL}", header(features));
         let former = ProgramFormer::new(VulkanToolchain::new(device.clone()), ProgramStore::user());
@@ -510,6 +528,7 @@ void main() {
             f32_atomic_add: false,
             shared_int64_atomics: false,
             maximal_reconvergence: false,
+            device: seismic_lang::device::UniversalGpuProperties::of(device.properties()),
         };
         let source = format!("{}{HALVES}", header(features));
         let former = ProgramFormer::new(VulkanToolchain::new(device.clone()), ProgramStore::user());

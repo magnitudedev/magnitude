@@ -256,7 +256,7 @@ fn graph_completion_retains_inputs_until_its_outcome_is_taken() {
 fn plans_of_one_layout_share_topology() {
     for device in seismic_native_tests::every_device() {
         let layout = NativeGraphMetadata::certify_group([1u64, 4].into_iter().map(|m| {
-            let mut metadata = NativeGraphMetadata::new(device.backend());
+            let mut metadata = device.native_graph_metadata();
             let input = metadata.port(Element::f32(), &[m, 8u64]).unwrap();
             let value = metadata
                 .enqueue::<scale_rows::Entry>(
@@ -309,5 +309,69 @@ fn plans_of_one_layout_share_topology() {
         let planned_total = layout.plan_heap().times(2).unwrap().plus(layout.topology_heap()).unwrap();
         let held_total = plan_a.host_heap().plus(plan_b.host_heap()).unwrap().plus(plan_a.topology_heap()).unwrap();
         assert_eq!(held_total, planned_total, "{:?}: combined planned == held with shared topology", device.backend());
+    }
+}
+
+/// Sealing a live device graph requires a layout certified for that device's
+/// hardware properties: a floor-certified layout (`NativeGraphMetadata::new`)
+/// is rejected by `Device::native_graph_with_layout`, and `certify_group`
+/// rejects mixing floor and device-bound drafts.
+#[test]
+fn native_graph_with_layout_requires_matching_device_certification() {
+    let build = |mut metadata: NativeGraphMetadata, m: u64| {
+        let input = metadata.port(Element::f32(), &[m, 8u64]).unwrap();
+        let value = metadata
+            .enqueue::<scale_rows::Entry>(
+                &[],
+                &[("M", m), ("N", 8u64)],
+                scale_rows::WorkflowArgs {
+                    x: input.tensor().into(),
+                    factor: seismic::Argument::from(2.0),
+                },
+            )
+            .unwrap()
+            .value;
+        metadata.export(&value).unwrap();
+        metadata
+    };
+    for device in seismic_native_tests::every_device() {
+        let floor_layout =
+            NativeGraphMetadata::certify_group([build(NativeGraphMetadata::new(device.backend()), 1)]).unwrap();
+        assert_eq!(floor_layout.device(), None);
+
+        let device_layout =
+            NativeGraphMetadata::certify_group([build(device.native_graph_metadata(), 1)]).unwrap();
+        assert_eq!(device_layout.device(), Some(*device.properties()));
+
+        // Mixing floor and device-bound drafts in one certification group is rejected.
+        assert!(
+            NativeGraphMetadata::certify_group([
+                build(NativeGraphMetadata::new(device.backend()), 1),
+                build(device.native_graph_metadata(), 4),
+            ])
+            .is_err(),
+            "{:?}: certify_group must reject mixed device properties",
+            device.backend()
+        );
+
+        // Sealing a device-bound metadata draft into a floor layout is rejected.
+        assert!(
+            build(device.native_graph_metadata(), 1)
+                .seal_with_layout(&floor_layout)
+                .is_err(),
+            "{:?}: seal_with_layout must reject mismatched device properties",
+            device.backend()
+        );
+
+        // Live sealing against a floor layout panics as an invariant violation.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = device.native_graph_with_layout(&floor_layout);
+        }))
+        .is_err();
+        assert!(
+            panicked,
+            "{:?}: native_graph_with_layout must panic on floor-certified layout",
+            device.backend()
+        );
     }
 }

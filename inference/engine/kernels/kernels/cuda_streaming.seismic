@@ -155,10 +155,10 @@ native routed_output_project for cuda from "cuda/routed_output_project.cu":
     records (expert_down, tier_down)
     project routed summed (expert_down) shared (shared_down)
 
-# CUDA: a thread a channel of a row (`lib/routed/output_sum.cuh`), its
+# CUDA: 4 contiguous channels a thread (`lib/routed/output_sum.cuh`), its
 # block's thread 0 spinning on the CPU's answer before it joins.
 native routed_output_sited for cuda from "cuda/routed_output_sited.cu":
     static (H, SN, IN, K)
     launch routed_output_combine:
-        threadgroups (ceil_div(H, 256), M, 1)
+        threadgroups (ceil_div(H, 1024), M, 1)
         threads_per_threadgroup (256, 1, 1)

@@ -223,6 +223,9 @@ impl NativePreparationCache {
             graph_demand,
         } = inputs;
         let device = &charges.device();
+        let _sizing = crate::programs::graph::sizing::SizingScope::enter_with_device(Some(
+            *device.properties(),
+        ));
         let began = std::time::Instant::now();
         let mut spec = Specializer::new(device);
         let import = imports(&mut spec, plan)?;
@@ -328,6 +331,9 @@ impl NativePreparationCache {
             graph_demand,
         } = inputs;
         let device = &charges.device();
+        let _sizing = crate::programs::graph::sizing::SizingScope::enter_with_device(Some(
+            *device.properties(),
+        ));
         // The search imports the weights its units measure through the
         // import kernels.
         let import = imports(&mut Specializer::new(device), plan)?;

@@ -2275,6 +2275,9 @@ impl PreparedHeadGraphs {
         head: CausalHeadBlock<'_>,
         classes: impl IntoIterator<Item = HeadGraphClass>,
     ) -> Result<Self, SubmitError> {
+        let _sizing = super::graph::sizing::SizingScope::enter_with_device(Some(
+            *target_device.properties(),
+        ));
         let classes = classes.into_iter().collect::<Vec<_>>();
         let binding = kernels
             .blocks

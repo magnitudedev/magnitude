@@ -1138,6 +1138,11 @@ mod internals {
         // The device library's names, surface like the names the ABI fixes:
         // kernels spell them.
         symbols.extend(library_symbols(dialect));
+        // Universal GPU device properties propagated into every GPU kernel
+        // source (`SEISMIC_DEVICE_*`).
+        for symbol in seismic_lang::device::UNIVERSAL_GPU_MACROS {
+            symbols.insert(symbol.to_owned());
+        }
         match dialect {
             SourceDialect::Cuda => {
                 symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());

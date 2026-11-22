@@ -134,7 +134,7 @@ projection routed for metal:
     let GATHERED_SHARED = min(ceil_div(WIDTH, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64 for choice
     let SUMMED_GROUPS = ceil_div(most(W, N), ROWS * 32 / LANES) for summed
     let SUMMED_PACKETS = ceil_div(most(W, WIDTH), 32) for summed
-    let SUMMED_STAGE = min(SUMMED_PACKETS, 256 / (K + SHARED)) for summed
+    let SUMMED_STAGE = min(SUMMED_PACKETS, (device.shared_bytes_per_group / 2) / ((K + SHARED) * 64)) for summed
     let SUMMED_STAGES_16 = (1 - SHARED) * min(1, ceil_div(SUMMED_PACKETS, 16) / 3) for summed
     let ROW_TILES = STACKED * B * ceil_div(T, TILE_M) + (1 - STACKED) * ceil_div(M, TILE_M) for grouped
     let BLOCKS = STACKED * B + 1 - STACKED for grouped
@@ -155,10 +155,13 @@ projection routed for metal:
         ROWS in [2, 1, 4, 8] default 2 for summed, arithmetic LANES in [8, 16, 32, 4] default 8 for summed,
         form GATHERED in [0, 1] default 0 for summed,
         TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
-        form TALL in [0, 1] default (1 - STACKED) for grouped, arithmetic form INT8 in [0, 1] default 0 for grouped,
-        arithmetic form PACK in [0, 1] default 0 for grouped, form DOWN_TALL in [0, 1] default (1 - STACKED) for grouped,
-        arithmetic form DOWN_INT8 in [0, 1] default 0 for grouped, arithmetic form DOWN_PACK in [0, 1] default 0 for grouped)
-    where K + SHARED <= 32 for summed
+        form TALL in [0, 1] default greatest where TALL == 0 or STACKED == 0 or (device.tensor_ops == 0 and T % 32 == 0 and WIDTH % 128 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0) for grouped,
+        arithmetic form INT8 in [0, 1] default 0 for grouped,
+        arithmetic form PACK in [0, 1] default greatest where PACK == 0 or (device.tensor_ops == 0 and TALL == 1 and INT8 == 0 and WIDTH % 128 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0) reference 0 for grouped,
+        form DOWN_TALL in [0, 1] default greatest where DOWN_TALL == 0 or STACKED == 0 or (device.tensor_ops == 0 and T % 32 == 0 and each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1))) for grouped,
+        arithmetic form DOWN_INT8 in [0, 1] default 0 for grouped,
+        arithmetic form DOWN_PACK in [0, 1] default greatest where DOWN_PACK == 0 or (device.tensor_ops == 0 and DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1))) reference 0 for grouped)
+    where K + SHARED <= device.max_group_threads / device.subgroup_width for summed
     where ROWS * ceil_div(SUMMED_PACKETS - (1 - min(1, LANES / 16) + (min(1, LANES / 16) - LANES / 32) * SUMMED_STAGES_16) * (SUMMED_PACKETS - SUMMED_STAGE), LANES) <= 8 for summed
     where (SHARED == 1 or 2 * ceil_div(SUMMED_PACKETS - SUMMED_STAGES_16 * (SUMMED_PACKETS - SUMMED_STAGE), 16) <= 8) for summed
     where (TALL == 0 or ((WIDTH % 64 == 0 or INT8 == 1) and (STACKED == 0 or T % 32 == 0))) for grouped
@@ -406,16 +409,20 @@ projection routed for metal:
 # its expert's weights.
 projection routed for cuda:
     let DECODE_GROUPS = ceil_div(ceil_div(ceil_div(most(W, N), 16), TPW), 4 / KSPLIT) for choice | summed
-    let TILE = 64 + 64 * STACKED for grouped
-    let STAGES = 3 - STACKED for grouped
-    let COEF_BYTES = 4096 - 2048 * STACKED for grouped
+    let TILE = BM for grouped
+    let STAGES = 3 - BM / 128 for grouped
+    let COEF_BYTES = 4096 - 2048 * (BM / 128) for grouped
     let ROW_TILES = STACKED * ceil_div(T, TILE) + (1 - STACKED) * ceil_div(M, TILE) for grouped
     let TILE_BLOCKS = STACKED * B + (1 - STACKED) for grouped
     let PRODUCT_ROWS = STACKED * B * T + (1 - STACKED) * M for grouped
-    params (TPW in [1, 2] default 1 for choice | summed, arithmetic KSPLIT in [1, 2, 4] default 1 for choice | summed,
-        form GATHERED in [0, 1] default 1 for choice, arithmetic INT8 in [0, 1] default 0 for grouped,
-        arithmetic OPERAND in [0, 1] default 0 for grouped)
+    params (TPW in [1, 2] default 1 for choice | summed, arithmetic KSPLIT in [1, 2, 4] default least where (KSPLIT == 1 and most(W, WIDTH) / (64 * 2) < 8) or (KSPLIT == 2 and (most(W, WIDTH) / (64 * 4) < 8 or ceil_div(ceil_div(most(W, N), 16), 4 / 2) * (K + SHARED) >= device.units)) or KSPLIT == 4 for choice | summed,
+        form GATHERED in [0, 1] default 1 for choice,
+        arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or (STACKED == 1 and each(W, form(W, INT8) == 1)) reference 0 for grouped,
+        arithmetic OPERAND in [0, 1] default 0 for grouped,
+        BM in [64, 128, 32] default 64 for grouped)
     where each(W, WIDTH % 64 == 0)
+    where (STACKED == 1 or BM == 64) for grouped
+    where STAGES * (TILE * 144 + SERVED * 10240) + SERVED * COEF_BYTES <= device.shared_bytes_per_group for grouped
     where (OPERAND == 0 or INT8 == 0) for grouped
     where (INT8 == 0 or each(W, form(W, INT8) == 1)) for grouped
     scratch operands bytes (M * WIDTH * 2) when (SHARED == 1 or (GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0)) and any(W, operands(W) == 1) for choice
@@ -460,6 +467,7 @@ projection routed for cuda:
         threadgroups (DECODE_GROUPS, M * (K + SHARED), 1)
         threads_per_threadgroup (128, 1, 1)
     launch grids for grouped when STACKED == 1:
+        reads (BM)
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch stage for grouped when (OPERAND == 1 or INT8 == 1 or any(W, FIRST == 1 and operands(W) == 1)):
@@ -469,7 +477,7 @@ projection routed for cuda:
         grid (stage_grid)
         threads_per_threadgroup (256, 1, 1)
     launch expand for grouped:
-        reads (INT8, OPERAND)
+        reads (INT8, OPERAND, BM)
         threadgroups (ceil_div(ceil_div(N, 16), 8), ROW_TILES, TILE_BLOCKS)
         grid (expand_grid)
         threads_per_threadgroup (256, 1, 1)
@@ -480,7 +488,7 @@ projection routed for cuda:
         grid (quantize_grid)
         threads_per_threadgroup (256, 1, 1)
     launch down for grouped:
-        reads (INT8, OPERAND)
+        reads (INT8, OPERAND, BM)
         threadgroups (ceil_div(ceil_div(WIDTH, 16), 8), ROW_TILES, TILE_BLOCKS)
         grid (down_grid)
         threads_per_threadgroup (256, 1, 1)
@@ -515,15 +523,17 @@ projection routed for vulkan:
     let GEMM_REGION = (TILE_M + TILE_N) * 80 for grouped
     let TABLE_SUM = sum(W, form(W, TABLE)) for grouped
     let TABLE_REGION = min(1, TABLE_SUM) * (8 * ceil_div(TABLE_SUM, 8) + 4) for grouped
-    let GEMM_HELD = GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMM_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1))) for grouped
+    let GEMM_HELD = GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMM_REGION + TABLE_REGION, 16) / (device.shared_bytes_per_group + 1))) for grouped
     params (SIMDGROUPS in [2, 4, 8] default 2 for choice | summed, ROWS in [1, 2, 4] default 1 for choice | summed,
-        form GATHERED in [0, 1] default 0 for choice, arithmetic LANES in [32, 16, 8] default 32 for summed,
+        form GATHERED in [0, 1] default 1 for choice, arithmetic LANES in [32, 16, 8] default 32 for summed,
         TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
         SUB_M in [32, 64] default 32 for grouped, SUB_N in [32, 64] default 32 for grouped)
+    where SIMDGROUPS * 32 <= device.max_group_threads for choice | summed
     where SUB_M <= TILE_M and SUB_N <= TILE_N for grouped
-    # Every workgroup holds whole 64-lane hardware subgroups: a GEMM tile of
-    # one sub-tile (32 x 64 of 32 x 64) would launch 32 invocations.
+    # Every workgroup holds whole 64-lane hardware subgroups (Vulkan contract)
+    # and fits the device group limit.
     where TILE_M * TILE_N >= 2 * SUB_M * SUB_N for grouped
+    where TILE_M * TILE_N * 32 / (SUB_M * SUB_N) <= device.max_group_threads for grouped
     where each(W, form(W, DECODED) == 1)
     scratch gathered bytes (M * K * (1 + 2 * VERIFY_ROWS) * 4) when GATHERED == 1 and PER_ROW == 0 for choice
     scratch staged bytes (M * WIDTH * 2) when STACKED == 1 and any(W, FIRST == 1 and operands(W) == 1) for grouped
@@ -638,7 +648,7 @@ fn routed_route[M, H, PT, NM, E, K, ES](residual: &tensor[M, PT * H] f32, norm: 
 # of a subgroup/warp per row.
 native routed_route for metal from "metal/routed_route.metal":
     static (H, PT, NM, E, K, ES)
-    where H % 32 == 0 and E <= 1024
+    where H % 32 == 0 and E <= device.max_group_threads
     project dense segmented (router, shared_router) rows rms publishes (result 0) ordered (router, shared_router)
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync when M <= VERIFY_ROWS
@@ -648,7 +658,7 @@ native routed_route for metal from "metal/routed_route.metal":
 
 native routed_route for cuda from "cuda/routed_route.cu":
     static (H, PT, NM, E, K, ES)
-    where H % 32 == 0 and E <= 1024
+    where H % 32 == 0 and E <= device.max_group_threads
     project dense segmented (router, shared_router) rows rms publishes (result 0) ordered (router, shared_router)
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync when M <= VERIFY_ROWS
@@ -658,7 +668,7 @@ native routed_route for cuda from "cuda/routed_route.cu":
 
 native routed_route for vulkan from "vulkan/routed_route.comp":
     static (H, PT, NM, E, K, ES)
-    where H % 32 == 0 and E <= 1024
+    where H % 32 == 0 and E <= device.max_group_threads
     project dense segmented (router, shared_router) rows rms publishes (result 0) ordered (router, shared_router)
     scratch logits bytes (M * (E + 1) * 4)
     launch routed_route_select:
@@ -707,21 +717,21 @@ fn routed_route_shared[M, H, PT, NM, E, K, S, ES](residual: &tensor[M, PT * H] f
 
 native routed_route_shared for metal from "metal/routed_route_shared.metal":
     static (H, PT, NM, E, K, S, ES)
-    where H % 32 == 0 and E <= 1024
+    where H % 32 == 0 and E <= device.max_group_threads
     project dense segmented (router, shared_router, (shared_gate, shared_up)) rows rms publishes (result 0) ordered (router, shared_router)
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
 
 native routed_route_shared for cuda from "cuda/routed_route_shared.cu":
     static (H, PT, NM, E, K, S, ES)
-    where H % 64 == 0 and E <= 1024
+    where H % 64 == 0 and E <= device.max_group_threads
     project dense segmented (router, shared_router, (shared_gate, shared_up)) rows rms publishes (result 0) ordered (router, shared_router)
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
 
 native routed_route_shared for vulkan from "vulkan/routed_route_shared.comp":
     static (H, PT, NM, E, K, S, ES)
-    where H % 32 == 0 and E <= 1024
+    where H % 32 == 0 and E <= device.max_group_threads
     project dense segmented (router, shared_router, (shared_gate, shared_up)) rows rms publishes (result 0) ordered (router, shared_router)
     scratch logits bytes (M * (E + 1) * 4)
     launch routed_route_select:
@@ -934,7 +944,7 @@ native routed_output for cuda from "cuda/routed_output.cu":
 
 # Vulkan: project the expert choices and shared expert in separate workgroups
 # into `projected`, then combine their A-rounded outputs in choice order,
-# an invocation a channel of a row (`lib/routed/output_sum.glsl`). A lane
+# four channels per invocation (`lib/routed/output_sum.glsl`). A lane
 # group of LANES lanes owns ROWS channels; LANES sets the summation order (so
 # it is arithmetic). A tier-served choice's workgroups read its tier record
 # in place, over the link.
@@ -944,7 +954,7 @@ native routed_output for vulkan from "vulkan/routed_output.comp":
     project routed summed (expert_down) shared (shared_down)
     scratch projected bytes (M * (K + 1) * H * 2)
     launch routed_output_combine:
-        threadgroups (ceil_div(H, 256), M, 1)
+        threadgroups (ceil_div(H, 1024), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: the products are the projection's operands, each formed once as F32
@@ -1027,12 +1037,12 @@ native routed_group for metal from "metal/routed_group.metal":
     scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4) when M * K > GROUP_CHOICES
     launch routed_group_count when M * K > GROUP_CHOICES:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
-        threads_per_threadgroup (1024, 1, 1)
+        threads_per_threadgroup (device.max_group_threads, 1, 1)
         shared_bytes (E * 4)
     launch routed_group_place:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
-        threads_per_threadgroup (E * (1024 / E), 1, 1)
-        shared_bytes (GROUP_CHOICES * 2 + E * (1024 / E) * 4 + E * 4 + 128 + 16)
+        threads_per_threadgroup (E * (device.max_group_threads / E), 1, 1)
+        shared_bytes (GROUP_CHOICES * 2 + E * (device.max_group_threads / E) * 4 + E * 4 + 128 + 16)
 
 native routed_group for cuda from "cuda/routed_group.cu":
     static (E, K)
@@ -1040,12 +1050,12 @@ native routed_group for cuda from "cuda/routed_group.cu":
     scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4) when M * K > GROUP_CHOICES
     launch routed_group_count when M * K > GROUP_CHOICES:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
-        threads_per_threadgroup (1024, 1, 1)
+        threads_per_threadgroup (device.max_group_threads, 1, 1)
         shared_bytes (E * 4)
     launch routed_group_place:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
-        threads_per_threadgroup (E * (1024 / E), 1, 1)
-        shared_bytes (GROUP_CHOICES * 2 + E * (1024 / E) * 4 + E * 4 + 128 + 16)
+        threads_per_threadgroup (E * (device.max_group_threads / E), 1, 1)
+        shared_bytes (GROUP_CHOICES * 2 + E * (device.max_group_threads / E) * 4 + E * 4 + 128 + 16)
 
 # Vulkan: the same two launches, without atomics; each workgroup walks its
 # chunk's choices in global memory, PARTS slices per expert.
@@ -1382,7 +1392,7 @@ fn select_route[M, H, E, K, ES](residual: &tensor[M, H] f32, norm: &tensor[H] NW
 # `routed_route`'s tiles (`metal/lib/routed/logits.h`).
 native routed_select for metal from "metal/routed_select.metal":
     static (H, E, K, ES)
-    where H % 32 == 0 and E <= 1024 and K <= E
+    where H % 32 == 0 and E <= device.max_group_threads and K <= E
     project dense single (router) rows rms ordered (router)
     scratch logits bytes (M * E * 4)
     scratch arrivals bytes (4) sync when M <= VERIFY_ROWS
@@ -1392,7 +1402,7 @@ native routed_select for metal from "metal/routed_select.metal":
 
 native routed_select for cuda from "cuda/routed_select.cu":
     static (H, E, K, ES)
-    where H % 32 == 0 and E <= 1024 and K <= E
+    where H % 32 == 0 and E <= device.max_group_threads and K <= E
     project dense single (router) rows rms ordered (router)
     scratch logits bytes (M * E * 4)
     scratch arrivals bytes (4) sync when M <= VERIFY_ROWS
@@ -1402,7 +1412,7 @@ native routed_select for cuda from "cuda/routed_select.cu":
 
 native routed_select for vulkan from "vulkan/routed_select.comp":
     static (H, E, K, ES)
-    where H % 32 == 0 and E <= 1024 and K <= E
+    where H % 32 == 0 and E <= device.max_group_threads and K <= E
     project dense single (router) rows rms ordered (router)
     scratch logits bytes (M * E * 4)
     launch routed_select_select:

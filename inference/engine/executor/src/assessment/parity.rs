@@ -985,3 +985,170 @@ fn device_dependent_contracts_build_assessment_graphs_without_device_dependent_e
         }
     }
 }
+
+/// Regression test for the `v710-sc` (AMD RDNA3 Vulkan, 64 KiB shared memory)
+/// load failure where certifying a graph without binding the device's
+/// `DeviceProperties` fell back to `BackendFloor(Vulkan)` (32 KiB shared
+/// memory). At `qwen3.6-35b-a3b` head geometry (`2*P+S = 256, KV = 2, G = 8,
+/// M = 16`), `attention_prefill_k8v4` admits `ROWS = 128` on 64 KiB shared
+/// memory (`queries` scratch = 196608 bytes) but rejects it at the 32 KiB
+/// floor (`queries` scratch = 163840 bytes). Certifying inside
+/// `SizingScope::enter_with_device(Some(props))` covers the full 196608-byte
+/// scratch across both `NativeGraphLayout` and `SizingOutline` and records
+/// `props` on the resulting `NativeGraphLayout`.
+#[test]
+fn device_certified_layout_covers_above_floor_shared_memory_scratch() {
+    use crate::programs::graph::draft::Certified;
+    use crate::programs::graph::sizing::{SizingOutline, SizingScope};
+    use seismic::device::{vulkan, DeviceProperties};
+    use seismic::{Element, NativeGraphLayout, NativeSpecialization};
+
+    struct Rdna3Vulkan;
+    impl vulkan::Queries for Rdna3Vulkan {
+        fn amd_compute_units(&self) -> Option<u64> { Some(54) }
+        fn nv_shader_sm_count(&self) -> Option<u64> { None }
+        fn fallback_units(&self) -> Option<u64> { Some(54) }
+        fn required_subgroup_32(&self) -> Option<u64> { Some(32) }
+        fn fixed_subgroup_size(&self) -> Option<u64> { Some(32) }
+        fn max_compute_work_group_invocations(&self) -> Option<u64> { Some(1024) }
+        fn max_compute_shared_memory_size(&self) -> Option<u64> { Some(65_536) }
+        fn max_compute_work_group_count_x(&self) -> Option<u64> { Some(65_535) }
+        fn max_compute_work_group_count_y(&self) -> Option<u64> { Some(65_535) }
+        fn max_compute_work_group_count_z(&self) -> Option<u64> { Some(65_535) }
+        fn shader_float16(&self) -> Option<bool> { Some(true) }
+        fn shader_rounding_mode_rte_float16(&self) -> Option<bool> { Some(true) }
+        fn shader_signed_zero_inf_nan_preserve_float16(&self) -> Option<bool> { Some(true) }
+        fn cooperative_matrix(&self) -> Option<bool> { Some(true) }
+        fn cooperative_matrix_f16_16x16x16(&self) -> Option<bool> { Some(true) }
+        fn integer_dot_product_4x8_mixed_signedness_accelerated(&self) -> Option<bool> { Some(true) }
+        fn shader_buffer_float32_atomic_add(&self) -> Option<bool> { Some(true) }
+        fn shader_shared_int64_atomics(&self) -> Option<bool> { Some(true) }
+        fn shader_denorm_preserve_float32(&self) -> Option<bool> { Some(true) }
+        fn shader_fma_float32(&self) -> Option<bool> { Some(true) }
+        fn shader_rounding_mode_rte_float32(&self) -> Option<bool> { Some(true) }
+        fn shader_subgroup_uniform_control_flow(&self) -> Option<bool> { Some(true) }
+        fn shader_maximal_reconvergence(&self) -> Option<bool> { Some(true) }
+    }
+
+    let rdna3 = DeviceProperties::Vulkan(
+        vulkan::describe(&Rdna3Vulkan, &vulkan::Probed::default()).unwrap(),
+    );
+
+    // `qwen3.6-35b-a3b` K8/V4 attention block geometry at row class 16.
+    let dims: [(&str, u64); 25] = [
+        ("M", 16),
+        ("T", 4096),
+        ("KV", 2),
+        ("G", 8),
+        ("P", 32),
+        ("S", 192),
+        ("I", 0),
+        ("U", 0),
+        ("F", 1),
+        ("NQ", 1),
+        ("N", 1),
+        ("NV", 0),
+        ("R", 1),
+        ("B", 0),
+        ("BR", 1),
+        ("KC", 64),
+        ("KP", 16),
+        ("VC", 32),
+        ("VP", 16),
+        ("SK", 0),
+        ("RA", 0),
+        ("RT", 0),
+        ("RO", 0),
+        ("VK", 0),
+        ("HT", 0),
+    ];
+    let dim_lookup = |name: &str| dims.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
+    let implementation = seismic::generated::native_implementation_at::<
+        magnitude_kernels::attention_prefill_k8v4::Entry,
+    >(BackendName::Vulkan, &[("A", Element::bf16())])
+    .unwrap()
+    .expect("attention_prefill_k8v4 exists on Vulkan");
+
+    // 1. Verify the exact scratch_bound difference: 163840 at 32 KiB floor vs
+    //    196608 on 64 KiB RDNA3 where `ROWS = 128` is admitted.
+    let floor_bound = implementation
+        .at_device(&seismic::device::BackendFloor(BackendName::Vulkan))
+        .scratch_bound(&dim_lookup)
+        .unwrap();
+    let rdna3_bound = implementation
+        .at_device(&rdna3)
+        .scratch_bound(&dim_lookup)
+        .unwrap();
+    assert_eq!(floor_bound[0], 163_840, "32 KiB floor admits only ROWS=64");
+    assert_eq!(rdna3_bound[0], 196_608, "64 KiB RDNA3 admits ROWS=128");
+
+    // Verify ROWS=128 is rejected at the floor and admitted on RDNA3.
+    let mut spec = NativeSpecialization::new()
+        .with_param("ROWS", 128)
+        .with_param("SPLIT_GROUPS", 256);
+    for &(name, value) in &dims {
+        if implementation.statics.iter().any(|s| s == name) {
+            spec = spec.with_static(name, value);
+        }
+    }
+    assert!(
+        implementation
+            .at_device(&seismic::device::BackendFloor(BackendName::Vulkan))
+            .admits(&spec)
+            .is_err(),
+        "ROWS=128 must be rejected at 32 KiB Vulkan floor"
+    );
+    assert!(
+        implementation.at_device(&rdna3).admits(&spec).is_ok(),
+        "ROWS=128 must be admitted on 64 KiB RDNA3"
+    );
+
+    // 2. Certifying via `Certified::certify_group` with `SizingScope::enter_with_device`
+    //    records `Some(rdna3)` on `NativeGraphLayout`, while omitting the scope
+    //    records `None` (floor), which `Device::native_graph_with_layout` rejects.
+    fn build_copy<G: crate::programs::graph::draft::ElementBoundDraft>(
+        mut graph: G,
+        rows: u64,
+    ) -> Result<(G, ()), crate::GraphError> {
+        use crate::programs::graph::draft::GraphDraft;
+        use magnitude_kernels::copy_rows;
+        let elements = [("A", Element::f32())];
+        let entry = G::bind::<copy_rows::Entry>(&elements[..]);
+        let n = seismic::Dim::from(rows);
+        let t = seismic::Dim::from(32u64);
+        let kv = seismic::Dim::from(2u64);
+        let w = seismic::Dim::from(16u64);
+        let dimensions = [("N", &n), ("T", &t), ("KV", &kv), ("W", &w)];
+        let data = graph.port(Element::f32(), &[&t, &kv, &w])?;
+        let from = graph.input_for(entry, "from", &dimensions)?;
+        let to = graph.input_for(entry, "to", &dimensions)?;
+        let mut data_tensor = data.tensor().clone();
+        graph.enqueue::<copy_rows::Entry>(
+            entry,
+            &dimensions,
+            copy_rows::WorkflowArgs {
+                rows: (&mut data_tensor).into(),
+                from: from.tensor().into(),
+                to: to.tensor().into(),
+                slab_rows: seismic::Argument::from(32u32),
+            },
+        )?;
+        Ok((graph, ()))
+    }
+    let (floor_layout, _) =
+        NativeGraphLayout::certify_group(BackendName::Vulkan, &[16u64], build_copy).unwrap();
+    assert_eq!(floor_layout.device(), None);
+
+    let (device_layout, _) = {
+        let _scope = SizingScope::enter_with_device(Some(rdna3));
+        NativeGraphLayout::certify_group(BackendName::Vulkan, &[16u64], build_copy).unwrap()
+    };
+    assert_eq!(device_layout.device(), Some(rdna3));
+
+    // Verify SizingOutline and NativeGraphLayout agree on storage under RDNA3.
+    let (outline, _) = {
+        let _scope = SizingScope::enter_with_device(Some(rdna3));
+        SizingOutline::certify_group(BackendName::Vulkan, &[16u64], build_copy).unwrap()
+    };
+    assert_eq!(outline.storage_bytes(), device_layout.storage_bytes());
+}

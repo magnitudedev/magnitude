@@ -995,6 +995,9 @@ impl seismic_lang::device::metal::Queries for Queries<'_> {
     fn max_threads_per_threadgroup(&self) -> Option<u64> {
         Some(self.max_threads_per_threadgroup)
     }
+    fn max_grid_dim(&self) -> Option<u64> {
+        Some(MSL_GRID_INDEX_MAX)
+    }
     fn apple10_family(&self) -> Option<bool> {
         Some(crate::pooled(|| self.device.supportsFamily(MTLGPUFamily::Apple10)))
     }

@@ -93,6 +93,15 @@ pub(crate) fn cold_copies(
     rotation: &[EncodedArgs],
     cold: u64,
 ) -> Result<Vec<EncodedArgs>, crate::api::TensorError> {
+    let l2_bytes = cold / COLD_CACHE_MULTIPLE;
+    // Individual tensors already >= 2 * L2 evict L2 on their own and do not
+    // need duplication; total cold-copy VRAM is bounded to min(4 * L2, available / 8).
+    let skip_threshold = 2 * l2_bytes;
+    let available = charges
+        .device()
+        .room(seismic_topology::Contract::DeviceOnly);
+    let budget = cold.min(available / 8);
+
     let mut distinct = HashMap::new();
     for args in rotation {
         for tensor in args.tensors().flatten() {
@@ -105,8 +114,23 @@ pub(crate) fn cold_copies(
     if occupied == 0 || occupied >= cold {
         return Ok(Vec::new());
     }
+    let copyable: u64 = distinct
+        .values()
+        .copied()
+        .filter(|&bytes| bytes > 0 && bytes < skip_threshold)
+        .sum();
+    if copyable == 0 || budget == 0 {
+        return Ok(Vec::new());
+    }
     let most = (COLD_PASS_SETS / rotation.len()).saturating_sub(1) as u64;
-    let count = (cold - occupied).div_ceil(occupied).min(most);
+    let max_by_budget = budget / copyable;
+    let count = (cold - occupied)
+        .div_ceil(copyable)
+        .min(most)
+        .min(max_by_budget);
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     // Each argument's bytes are read to the host once, for every copy.
     let mut images = HashMap::new();
     let mut copies = Vec::new();
@@ -114,7 +138,8 @@ pub(crate) fn cold_copies(
         let mut copied: HashMap<TensorKey, Arc<TensorInner>> = HashMap::new();
         for args in rotation {
             copies.push(args.map_tensors(|tensor| {
-                if tensor.occupied_bytes() == 0 {
+                let bytes = tensor.occupied_bytes();
+                if bytes == 0 || bytes >= skip_threshold {
                     return Ok(tensor.clone());
                 }
                 let key = tensor_key(tensor);

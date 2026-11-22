@@ -239,12 +239,8 @@ native stream_mix_down for metal from "metal/stream_mix_down.metal":
     static (H, S, LR, C)
     where H % 32 == 0 and C <= 1
     project dense segmented (down_weight, inject_weight) parts S rows rms
-    restate gemv SIMDGROUPS in [16, 8, 4, 2, 32] default 4
-    restate gemv_rows SIMDGROUPS in [8, 16, 4, 2, 32] default 8
     restate gemv_rows ROWS in [1, 2, 4] default 1
-    restate gemv_pair SIMDGROUPS in [16, 8, 4, 2, 32] default 4
     restate gemv_pair ROWS in [1, 2, 4] default 1
-    restate batch BATCH_SIMDGROUPS in [4, 8, 16, 32] default 4
     restate batch BATCH_ROWS in [1, 2, 4] default 1
     scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * S * H * 2) when M > 16
     launch stream_mix_down_stage before gemm when M > 16 and (M <= 64 or TALL == 0 or PACK == 1):
@@ -268,7 +264,6 @@ native stream_mix_down for cuda from "cuda/stream_mix_down.cu":
     static (H, S, LR, C)
     where H % 256 == 0 and C <= 1
     project dense segmented (down_weight, inject_weight) parts S rows rms
-    restate arithmetic KSPLIT in [8, 4, 2] default 8
 
 # Vulkan: the `dense` projection (segmented) in S parts, the streams: the
 # GEMV classes (to 8 rows) split K by stream (a workgroup normalizes its
@@ -334,23 +329,12 @@ native stream_mix_up for cpu from "cpu/stream_mix_up.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (H * 4)
 
-# The threadgroups a Sinkhorn mix site's decode row is split across
-# (`stream_mix_sinkhorn`, Metal, CUDA and Vulkan): enough that a row's
-# function matrix streams through many cores, few enough that each
-# threadgroup's slice stays long. On M4 Pro at one decode row of DeepSeek
-# V4.1's sites (timed, µs a site at 16 / 32 / 64 / 128 / 1 threadgroups):
-# 42.6 / 42.6 / 43.7 / 45.0 / 89.2, and with the comb formed across the
-# threadgroup 27.2 / 28.5 / 30.8 / 32.6 / 92.2; 16 is the fastest measured.
-# At 16, 8 decode rows (128 threadgroups) take 36.5 µs against one row's
-# 28.5.
-const SINKHORN_SPLIT = 16
-
 # The rows a Sinkhorn mix site's prefill tile holds (`stream_mix_sinkhorn`,
 # Metal, CUDA and Vulkan): each of a tile's function columns is read once
 # for all its rows, two rows a simdgroup (warp, subgroup) of eight.
 const SINKHORN_TILE = 16
 
-# Metal, CUDA and Vulkan: at every row count SINKHORN_SPLIT threadgroups a
+# Metal, CUDA and Vulkan: at every row count SPLIT threadgroups a
 # row tile each reduce a contiguous slice of its rows' columns into the
 # scratch and, under P = 1, mix their share of the input by the previous
 # site's pre; a second launch sums each row's partials in slice order and
@@ -392,14 +376,15 @@ native stream_mix_sinkhorn for cuda from "cuda/stream_mix_sinkhorn.cu":
 
 native stream_mix_sinkhorn for vulkan from "vulkan/stream_mix_sinkhorn.comp":
     static (H, S, P)
+    params (arithmetic SPLIT in [16, 32, 64, 128] default least where SPLIT >= device.units or SPLIT == 128)
     where S <= 8
-    scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
+    scratch partials bytes (M * SPLIT * (1 + (2 + S) * S) * 4)
     launch stream_mix_sinkhorn_split when M <= VERIFY_ROWS:
-        threadgroups (SINKHORN_SPLIT, M, 1)
+        threadgroups (SPLIT, M, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 + (2 + S) * S) * 8 * 4)
     launch stream_mix_sinkhorn_tiles when M > VERIFY_ROWS:
-        threadgroups (SINKHORN_SPLIT, ceil_div(M, SINKHORN_TILE), 1)
+        threadgroups (SPLIT, ceil_div(M, SINKHORN_TILE), 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (((1 + (2 + S) * S) * 8 + (2 + S) * S * (6144 / ((2 + S) * S) / 32 * 32)) * 4)
     launch stream_mix_sinkhorn_finish:
@@ -461,7 +446,7 @@ native stream_join for cuda from "cuda/stream_join.cu":
 native stream_join for vulkan from "vulkan/stream_join.comp":
     static (H, SN, IN)
     launch stream_join:
-        threadgroups (min(ceil_div(M * H, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * ceil_div(H, 4), 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: one work item per row, through the projection epilogues' scatter
@@ -471,8 +456,8 @@ native stream_join for cpu from "cpu/stream_join.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Four columns across all S streams per thread on Metal and CUDA; one thread
-# per value on Vulkan; one work item per row on CPU.
+# Four columns across all S streams per thread on Metal, CUDA and Vulkan; one
+# work item per row on CPU.
 native repeat_rows for metal from "metal/repeat_rows.metal":
     launch repeat_rows:
         threadgroups (ceil_div(M * ceil_div(H, 4), 256), 1, 1)
@@ -485,7 +470,7 @@ native repeat_rows for cuda from "cuda/repeat_rows.cu":
 
 native repeat_rows for vulkan from "vulkan/repeat_rows.comp":
     launch repeat_rows:
-        threadgroups (min(ceil_div(M * S * H, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * ceil_div(H, 4), 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native repeat_rows for cpu from "cpu/repeat_rows.rs":

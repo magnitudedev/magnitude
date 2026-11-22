@@ -227,20 +227,23 @@ native shape_rows for cuda from "cuda/shape_rows.cu":
         threads_per_threadgroup (WIDTH, 1, 1)
 
 # Native Vulkan: the CUDA form, the same contract (as Metal's); the select's
-# 64-bit histogram is (low, high) u32 planes with carrying atomic adds.
+# 64-bit histogram is (low, high) u32 planes with carrying atomic adds
+# (aliased with compacted (key, token) pairs on the <= 2048 compact fast path).
 # The partition maxima and the selection state are apart, so select only
-# reads the maxima it steers by. Shared: prepare holds the history row and
-# the partition maximum; select 5186 words (histogram planes, lane totals,
-# the top-p total, per-invocation tie counts).
+# reads the maxima it steers by. Shared: prepare holds the 4096-entry
+# partition count table (with global history fallback when slice_len > 4096,
+# no Hn cap) and per-subgroup maxima; select 5186 words (histogram/compact
+# planes, subgroup/lane totals, per-invocation tie counts, candidate count,
+# and selected top-p key).
 native shape_rows for vulkan from "vulkan/shape_rows.comp":
     static (V, Hn)
-    params (PARTS in [64, 128, 32] default 64, WIDTH in [256, 512] default 256)
+    params (PARTS in [64, 128, 32] default least where PARTS >= device.units or PARTS == 128, WIDTH in [256, 512] default 256)
     scratch maxima bytes (Sx * PARTS * 4)
     scratch state bytes (Sx * 8 * 4)
     launch shape_rows_prepare:
         threadgroups (PARTS, Sx, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
-        shared_bytes (Hn * 4 + 4)
+        shared_bytes ((4096 + WIDTH / 32) * 4)
     launch shape_rows_select:
         threadgroups (Sx, 1, 1)
         threads_per_threadgroup (1024, 1, 1)
@@ -305,7 +308,7 @@ native sample_rows for cuda from "cuda/sample_rows.cu":
 # Native Vulkan: the CUDA two stages, with the same merge order.
 native sample_rows for vulkan from "vulkan/sample_rows.comp":
     static (V)
-    params (PARTS in [32, 64, 128, 16] default 32, WIDTH in [256, 512] default 256)
+    params (PARTS in [32, 64, 128, 16] default least where PARTS >= device.units or PARTS == 128, WIDTH in [256, 512] default 256)
     scratch partials bytes (M * PARTS * 12)
     launch sample_rows_partition:
         threadgroups (PARTS, M, 1)

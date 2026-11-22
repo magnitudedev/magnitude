@@ -4053,6 +4053,18 @@ mod tests {
         fn max_shared_memory_per_block_optin(&self) -> Option<u64> {
             Some(49152)
         }
+        fn max_shared_memory_per_multiprocessor(&self) -> Option<u64> {
+            Some(49152)
+        }
+        fn max_grid_dim_x(&self) -> Option<u64> {
+            Some((1 << 31) - 1)
+        }
+        fn max_grid_dim_y(&self) -> Option<u64> {
+            Some(65_535)
+        }
+        fn max_grid_dim_z(&self) -> Option<u64> {
+            Some(65_535)
+        }
         fn l2_cache_size(&self) -> Option<u64> {
             Some(1024)
         }

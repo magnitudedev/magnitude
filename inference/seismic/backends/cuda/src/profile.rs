@@ -368,6 +368,10 @@ struct Attributes {
     max_threads_per_block: u64,
     max_threads_per_multiprocessor: u64,
     max_shared_memory_per_block_optin: u64,
+    max_shared_memory_per_multiprocessor: u64,
+    max_grid_dim_x: u64,
+    max_grid_dim_y: u64,
+    max_grid_dim_z: u64,
     l2_cache_size: u64,
     cooperative_launch: bool,
     max_registers_per_block: u64,
@@ -388,6 +392,18 @@ impl seismic_lang::device::cuda::Queries for Attributes {
     }
     fn max_shared_memory_per_block_optin(&self) -> Option<u64> {
         Some(self.max_shared_memory_per_block_optin)
+    }
+    fn max_shared_memory_per_multiprocessor(&self) -> Option<u64> {
+        Some(self.max_shared_memory_per_multiprocessor)
+    }
+    fn max_grid_dim_x(&self) -> Option<u64> {
+        Some(self.max_grid_dim_x)
+    }
+    fn max_grid_dim_y(&self) -> Option<u64> {
+        Some(self.max_grid_dim_y)
+    }
+    fn max_grid_dim_z(&self) -> Option<u64> {
+        Some(self.max_grid_dim_z)
     }
     fn l2_cache_size(&self) -> Option<u64> {
         Some(self.l2_cache_size)
@@ -422,6 +438,7 @@ mod attr {
     pub const MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
     pub const COMPUTE_CAPABILITY_MAJOR: i32 = 75;
     pub const COMPUTE_CAPABILITY_MINOR: i32 = 76;
+    pub const MAX_SHARED_MEMORY_PER_MULTIPROCESSOR: i32 = 81;
     pub const MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
     pub const COOPERATIVE_LAUNCH: i32 = 99;
     pub const INTEGRATED: i32 = 18;
@@ -629,6 +646,12 @@ fn read_properties(driver: &Driver, handle: c_int) -> Result<Properties, TargetE
             max_shared_memory_per_block_optin: u64::from(unsigned(
                 attr::MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
             )?),
+            max_shared_memory_per_multiprocessor: u64::from(unsigned(
+                attr::MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+            )?),
+            max_grid_dim_x: u64::from(unsigned(attr::MAX_GRID_DIM_X)?),
+            max_grid_dim_y: u64::from(unsigned(attr::MAX_GRID_DIM_Y)?),
+            max_grid_dim_z: u64::from(unsigned(attr::MAX_GRID_DIM_Z)?),
             l2_cache_size: u64::from(unsigned(attr::L2_CACHE_SIZE)?),
             cooperative_launch: unsigned(attr::COOPERATIVE_LAUNCH)? == 1,
             max_registers_per_block: u64::from(unsigned(attr::MAX_REGISTERS_PER_BLOCK)?),

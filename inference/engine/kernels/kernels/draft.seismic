@@ -147,8 +147,8 @@ native readout_project_rows for metal from "metal/readout_project_rows.metal":
     restate single_gemv
     restate GATHER_SIMDGROUPS in [16, 8, 4, 2] default 16
     restate arithmetic GATHER_LANES in [16, 32] default 16
-    scratch staged bytes (O * D * 2) when I == 0 and O > VERIFY_ROWS and operands(OW) == 1
-    launch readout_project_rows_stage before batch when I == 0 and O > VERIFY_ROWS and operands(OW) == 1:
+    scratch staged bytes (O * D * 2) when I == 0 and (O > VERIFY_ROWS or O >= MATRIX_FROM) and operands(OW) == 1
+    launch readout_project_rows_stage before batch when I == 0 and (O > VERIFY_ROWS or O >= MATRIX_FROM) and operands(OW) == 1:
         staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -171,7 +171,7 @@ native readout_project_rows for cuda from "cuda/readout_project_rows.cu":
 # floor.
 native readout_project_rows for vulkan from "vulkan/readout_project_rows.comp":
     static (V, D, S, I, WS)
-    where (I > 0 or ceil_div(S, SIMDGROUPS * ROWS * 32 / LANES) <= 65535) and (I == 0 or ceil_div(S, GATHER_SIMDGROUPS * GATHER_ROWS) <= 65535)
+    where (I > 0 or ceil_div(S, SIMDGROUPS * ROWS * 32 / LANES) <= device.max_grid_x) and (I == 0 or ceil_div(S, GATHER_SIMDGROUPS * GATHER_ROWS) <= device.max_grid_x)
     project dense single (weight) gathered token_rows
     restate GATHER_SIMDGROUPS in [8, 4, 2] default 8
 

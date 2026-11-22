@@ -26,7 +26,7 @@ native import_dense for metal from "metal/import_dense.metal":
 native import_dense for cuda from "cuda/import_dense.cu":
     records (result 0)
     launch import_dense:
-        threadgroups (ceil_div(ceil_div(K, 4), 256), min(N, 65535), min(B, 65535))
+        threadgroups (ceil_div(ceil_div(K, 4), 256), min(N, device.max_grid_y), min(B, device.max_grid_z))
         threads_per_threadgroup (256, 1, 1)
 
 
@@ -95,12 +95,12 @@ native repack_weight for cpu from "cpu/repack_weight.rs":
         threadgroups (ceil_div(N, 8), B, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Vulkan: a grid-stride loop over every element; the x grid is capped at the
-# 65535-group floor (Vulkan spec §5.3).
+# Vulkan: four elements per thread along K, with grid-stride loops over y and z
+# because Vulkan caps each grid dimension at the 65535-group floor (Vulkan spec §5.3).
 native import_dense for vulkan from "vulkan/import_dense.comp":
     records (result 0)
     launch import_dense:
-        threadgroups (min(ceil_div(B * N * K, 256), 65535), 1, 1)
+        threadgroups (ceil_div(ceil_div(K, 4), 256), min(N, device.max_grid_y), min(B, device.max_grid_z))
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: each work item decodes 16 source rows of the [B, N, K] view to F32

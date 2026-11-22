@@ -99,7 +99,7 @@ native vision_patch_stem for vulkan from "vulkan/vision_patch_stem.comp":
     scratch converted bytes (M * (1 + S) * ceil_div(C * P * P, 8) * 8 * 2)
     scratch partial bytes (M * H * 4)
     launch vision_patch_stem_convert:
-        threadgroups (min(ceil_div(M * (1 + S) * ceil_div(C * P * P, 8), 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * (1 + S) * ceil_div(C * P * P, 8), 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch vision_patch_stem_first when S == 1:
         threadgroups (ceil_div(H, 64), ceil_div(M, 64), 1)
@@ -315,12 +315,12 @@ native vision_clamp for metal from "metal/vision_clamp.metal":
 
 native vision_clamp for cuda from "cuda/vision_clamp.cu":
     launch vision_clamp:
-        threadgroups (ceil_div(N, 1024), min(M, 65535), 1)
+        threadgroups (ceil_div(N, 1024), min(M, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native vision_clamp for vulkan from "vulkan/vision_clamp.comp":
     launch vision_clamp:
-        threadgroups (min(ceil_div(M * N, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * N, 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native vision_clamp for cpu from "cpu/vision_clamp.rs":
@@ -494,13 +494,13 @@ native vision_gated_convolution for metal from "metal/vision_gated_convolution.m
 native vision_gated_convolution for cuda from "cuda/vision_gated_convolution.cu":
     static (H, T)
     launch vision_gated_convolution:
-        threadgroups (ceil_div(H, 1024), min(M, 65535), 1)
+        threadgroups (ceil_div(H, 1024), min(M, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native vision_gated_convolution for vulkan from "vulkan/vision_gated_convolution.comp":
     static (H, T)
     launch vision_gated_convolution:
-        threadgroups (min(ceil_div(M * H, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * H, 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: one work item per row, its neighbour rows widened once.
@@ -538,13 +538,13 @@ native vision_pool for metal from "metal/vision_pool.metal":
 native vision_pool for cuda from "cuda/vision_pool.cu":
     static (G, H, NS)
     launch vision_pool:
-        threadgroups (ceil_div(H, 1024), min(M, 65535), 1)
+        threadgroups (ceil_div(H, 1024), min(M, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native vision_pool for vulkan from "vulkan/vision_pool.comp":
     static (G, H, NS)
     launch vision_pool:
-        threadgroups (min(ceil_div(M * H, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * H, 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native vision_pool for cpu from "cpu/vision_pool.rs":
@@ -576,13 +576,13 @@ native vision_position for metal from "metal/vision_position.metal":
 native vision_position for cuda from "cuda/vision_position.cu":
     static (H)
     launch vision_position:
-        threadgroups (ceil_div(H, 1024), min(M, 65535), 1)
+        threadgroups (ceil_div(H, 1024), min(M, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native vision_position for vulkan from "vulkan/vision_position.comp":
     static (H)
     launch vision_position:
-        threadgroups (min(ceil_div(M * H, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * H, 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native vision_position for cpu from "cpu/vision_position.rs":

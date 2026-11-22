@@ -4067,6 +4067,7 @@ mod tests {
             form: false,
             values,
             default,
+            reference: None,
             role: NativeParameterRole::Declared,
         }
     }

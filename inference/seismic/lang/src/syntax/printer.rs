@@ -501,16 +501,8 @@ impl Printer {
         self.level -= 1;
     }
 
-    fn native_param(&mut self, param: &NativeParamDecl) {
-        if param.arithmetic {
-            self.out.push_str("arithmetic ");
-        }
-        if param.form {
-            self.out.push_str("form ");
-        }
-        let values = param.values.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
-        let _ = write!(self.out, "{} in [{values}] default ", param.name.name);
-        match &param.default {
+    fn native_default(&mut self, default: &NativeDefaultDecl) {
+        match default {
             NativeDefaultDecl::Value(value) => self.expr(value, 0),
             NativeDefaultDecl::Least(condition) => {
                 self.out.push_str("least where ");
@@ -520,6 +512,22 @@ impl Printer {
                 self.out.push_str("greatest where ");
                 self.expr(condition, 0);
             }
+        }
+    }
+
+    fn native_param(&mut self, param: &NativeParamDecl) {
+        if param.arithmetic {
+            self.out.push_str("arithmetic ");
+        }
+        if param.form {
+            self.out.push_str("form ");
+        }
+        let values = param.values.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+        let _ = write!(self.out, "{} in [{values}] default ", param.name.name);
+        self.native_default(&param.default);
+        if let Some(reference) = &param.reference {
+            self.out.push_str(" reference ");
+            self.native_default(reference);
         }
     }
 

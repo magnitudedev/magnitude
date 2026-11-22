@@ -184,30 +184,34 @@ native indexer_score for metal from "metal/indexer_score.metal":
     launch indexer_score:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (min((H * (2 * P + S + 4) + 8 * (2 * P + S)) * 4, 32768))
+        shared_bytes (min((H * (2 * P + S + 4) + 8 * (2 * P + S)) * 4, device.shared_bytes_per_group))
 
 # CUDA: as Metal, each head's warp rotating through the head's own shared
 # row before it holds the prepared head, then each warp cooperatively scoring
 # its 32 rows one key at a time with coalesced float4 key loads; shapes whose
-# full prepared heads + warp key buffers exceed 48 KiB tile H in power-of-two
-# chunks fitting 48 KiB.
+# full prepared heads + warp key buffers exceed `device.shared_bytes_per_group`
+# tile H in power-of-two chunks fitting `device.shared_bytes_per_group`.
 native indexer_score for cuda from "cuda/indexer_score.cu":
     static (H, P, S, NQ, HW, RA, RT)
     where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and (9 * (2 * P + S) + 4) * 4 <= device.shared_bytes_per_group and (2 * P + S) % 32 == 0
     launch indexer_score:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (min((H * (2 * P + S + 4) + 8 * (2 * P + S)) * 4, 49152))
+        shared_bytes (min((H * (2 * P + S + 4) + 8 * (2 * P + S)) * 4, device.shared_bytes_per_group))
 
-# Vulkan: CUDA's form, each head's subgroup rotating by shuffles before it
-# stores the prepared head in group memory.
+# Vulkan: CUDA/Metal's subgroup-cooperative form, each head's subgroup rotating
+# by shuffles before storing the prepared head (padded by 4 floats per head),
+# then each subgroup cooperatively scoring its 32 rows one key at a time with
+# coalesced 128-bit key loads into per-subgroup group memory; shapes whose full
+# prepared heads + subgroup key buffers exceed 32 KiB tile H in power-of-two
+# chunks fitting 32 KiB.
 native indexer_score for vulkan from "vulkan/indexer_score.comp":
     static (H, P, S, NQ, HW, RA, RT)
-    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and H * (2 * P + S) * 4 <= device.shared_bytes_per_group and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
+    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and (9 * (2 * P + S) + 4) * 4 <= 32768 and (9 * (2 * P + S) + 4) * 4 <= device.shared_bytes_per_group and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
     launch indexer_score:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (H * (2 * P + S) * 4)
+        shared_bytes (min((H * (2 * P + S + 4) + 8 * (2 * P + S)) * 4, 32768))
 
 # CPU: one work item per (256 scores, row), each preparing the row's query
 # heads.
@@ -248,16 +252,17 @@ native rows_topk for cuda from "cuda/rows_topk.cu":
         threads_per_threadgroup (1024, 1, 1)
         shared_bytes ((256 + 32 + 4) * 4)
 
-# Vulkan: Metal's form, a workgroup of 256 invocations per row; group memory
-# the bins, the scans' subgroup sums, the select state and one chunk of 256
-# of the row's span offsets, whatever R is (the offsets of the chunk holding
-# an invocation's first ordinal are scanned there, and the walk follows the
-# spans' lengths).
+# Vulkan: CUDA/Metal's form, a workgroup of 1024 invocations per row (8 items
+# per invocation, CHUNK = 8192); group memory holds the bins [256], the scans'
+# 32 subgroup sums, the select state [4] and one chunk of 1024 span offsets,
+# whatever R is (rows with R <= 1024 reuse the initial scan's offsets directly,
+# and rows with at most 8192 scored ordinals hold their 8 keys per invocation
+# in registers across all radix passes and emit).
 native rows_topk for vulkan from "vulkan/rows_topk.comp":
     launch rows_topk:
         threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((256 + 8 + 4 + 256) * 4)
+        threads_per_threadgroup (1024, 1, 1)
+        shared_bytes ((256 + 32 + 4 + 1024) * 4)
 
 # CPU: one work item per row, a partial sort of its scored ordinals.
 native rows_topk for cpu from "cpu/rows_topk.rs":

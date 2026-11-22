@@ -374,8 +374,8 @@ fn project_rows_specialization(
         .with_param("RESIDUE", 1)
         .with_param("INT8", 0)
         .with_launch_param(batch, "BATCH_PARTS", 2)
-        // Dense weights have no matrix GEMV.
-        .with_param("MATRIX", 0)
+        // Scalar GEMV across all decode rows.
+        .with_param("MATRIX_FROM", 9)
         .with_launch_param(tall, "TALL_M", 128)
         .with_launch_param(tall, "TALL_K", 64)
         .with_launch_param(tall, "STAGERS", 2)

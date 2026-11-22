@@ -220,22 +220,25 @@ struct GatheredRows {
 };
 
 // The grouped expert GEMMs (`routed_experts`, `routed_experts_up`): block
-// tiles of 128 rows x 128 columns, one warp row, 2 stages, rotating loader
-// sets (matching dense `LargeGemm<2>`). Consecutive full T-row blocks of the
-// same expert are coalesced into one super-block of up to TILE_M rows in
-// `expert_grids`, amortizing weight loads and dequantization across up to 4x
-// as many rows while empty m16 tiles in partial super-blocks are skipped by
-// `live_tiles` inside `gemm_segment` / `gemm_segment_s8`.
-using RoutedShape = projection::GemmShape<128, 1, 8, 2, false, 2>;
-constexpr u32 TILE_M = RoutedShape::BM;
+// tiles of BM rows (32, 64, or 128, derived from problem shape/occupancy via
+// `SEISMIC_TUNE_BM`) x 128 columns, one warp row: 3 stages (ROTATE=1) at
+// BM=32/64 for pipeline hiding on narrow/short-K experts, and 2 stages
+// (ROTATE=2, matching dense `LargeGemm<2>`) at BM=128 for wide experts.
+// Consecutive full T-row blocks of the same expert are coalesced into one
+// super-block of up to BM rows in `expert_grids`, while empty m16 tiles
+// in partial super-blocks are skipped by `live_tiles` inside `gemm_segment`
+// / `gemm_segment_s8`.
+template <u32 BM>
+using RoutedShapeOf =
+    projection::GemmShape<BM, 1, 8, (BM == 128 ? 2 : 3), false, (BM == 128 ? 2 : 1)>;
 
 // One block of a grouped expert GEMM over `source` (A rows, or s8 rows where
 // S8), on either path of `projection::gemm_rows`.
-template <bool S8, class Operands, class Rows, class WA, class WB, class Epi>
+template <u32 BM, bool S8, class Operands, class Rows, class WA, class WB, class Epi>
 __device__ __forceinline__ void routed_gemm(u8 *shared, const Rows &source, u32 M,
                                             u64 K, u64 nblock, u64 rows,
                                             const WA &wa, const WB &wb, const Epi &epi) {
-    projection::gemm_rows<RoutedShape, S8, Operands>(shared, source, M, K, nblock, rows, wa, wb, epi);
+    projection::gemm_rows<RoutedShapeOf<BM>, S8, Operands>(shared, source, M, K, nblock, rows, wa, wb, epi);
 }
 
 
@@ -275,6 +278,7 @@ __device__ __forceinline__ void write_grid(u8 *grid, u64 x, u64 y, u64 z) {
 // `tile_rows <= TILE_M`, consecutive full blocks of the same expert are
 // merged into one super-block of up to `TILE_M` rows (grid y = 1); otherwise
 // each block spans ceil(tile_rows / TILE_M) row tiles in grid y.
+template <u32 TILE_M>
 __device__ __forceinline__ void expert_grids(const u8 *rows, const u8 *used_ptr, const int *blocks,
                                              u64 blocks_stride, const int *order, u64 order_stride_0,
                                              u64 order_stride_1, u64 tile_rows, u64 expand_columns,

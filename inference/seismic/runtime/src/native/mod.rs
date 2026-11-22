@@ -1357,6 +1357,21 @@ pub fn default_specialization(
         .and_then(|implementation| implementation.default_specialization(statics).ok())
 }
 
+/// The numerical validation reference specialization at `statics` as `device`
+/// offers the implementation ([`offered`]). Identical to
+/// [`default_specialization`] unless an `arithmetic` parameter declares a
+/// distinct `reference`.
+pub fn reference_specialization(
+    device: &Arc<DeviceInner>,
+    module: &CheckedModule,
+    entry: EntryId,
+    bindings: &ElementBindings,
+    statics: &NativeSpecialization,
+) -> Option<NativeSpecialization> {
+    offered(device, module, entry, bindings)
+        .and_then(|implementation| implementation.reference_specialization(statics).ok())
+}
+
 /// The CPU route of `implementation` (as [`on_device`] offers it) for a
 /// validated `specialization`: the tier it runs at, one function per launch
 /// for that tier and the bound dense elements, the participants of each
@@ -1495,20 +1510,20 @@ fn template_instance(kernel: &str, values: &[u64]) -> ProgramEntry {
 }
 
 /// The dialect of an opened Metal device's native sources: MSL with its
-/// feature macros.
+/// feature and device macros.
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_dialect(opened: &crate::backends::MetalOpened) -> abi::Dialect {
-    abi::Dialect::Metal(abi::MetalFeatures {
-        tensor_ops: opened.device_description().device_info().properties().tensor_ops.holds(),
-    })
+    abi::Dialect::Metal(abi::MetalFeatures::of(
+        opened.device_description().device_info().properties(),
+    ))
 }
 
 /// The dialect of an opened CUDA device's native sources: CUDA C++ with its
-/// fact macros.
+/// device macros.
 pub(crate) fn cuda_dialect(opened: &crate::backends::CudaOpened) -> abi::Dialect {
-    abi::Dialect::Cuda(abi::CudaFeatures {
-        multiprocessors: opened.device_description().device_info().properties.units.get(),
-    })
+    abi::Dialect::Cuda(abi::CudaFeatures::of(
+        &opened.device_description().device_info().properties,
+    ))
 }
 
 /// One launch's program with `variants` as its entries. Every variant of a
@@ -2631,6 +2646,13 @@ impl NativePrepared {
                         let cores = opened.device_description().device_info().properties().units.get();
                         groups = [groups[0].min((cores * per_core / 2).max(1)), 1, 1];
                     }
+                    let max_grid = opened.device_description().limits().max_grid;
+                    if let Some(axis) = (0..3).find(|axis| groups[*axis] > max_grid[*axis]) {
+                        return Err(limit(format!(
+                            "launch `{}` requests {} threadgroups on axis {axis}; the device allows {}",
+                            launch.kernel, groups[axis], max_grid[axis]
+                        )));
+                    }
                 }
                 NativeRoute::Cuda { opened, launches } => {
                     let (module, function) = launches.launch(ordinal);
@@ -2665,6 +2687,13 @@ impl NativePrepared {
                         }
                         let bound = groups.iter().product::<u64>();
                         groups = [bound.min(resident), 1, 1];
+                    }
+                    let max_grid = opened.device_description().limits().max_grid;
+                    if let Some(axis) = (0..3).find(|axis| groups[*axis] > max_grid[*axis]) {
+                        return Err(limit(format!(
+                            "launch `{}` requests {} blocks on axis {axis}; the device allows {}",
+                            launch.kernel, groups[axis], max_grid[axis]
+                        )));
                     }
                 }
                 // The workgroup size and group memory are the pipeline's,

@@ -25,11 +25,11 @@ native tap_rows for cuda from "cuda/tap_rows.cu":
         threadgroups (ceil_div(D, 1024), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Vulkan: a grid-stride loop over every element; the x grid is capped at the
-# 65535-group floor (Vulkan spec §5.3).
+# Vulkan: four elements per thread on a (column, row) grid; the y grid is
+# capped at the 65535-group floor (Vulkan spec §5.3) and strides rows.
 native tap_rows for vulkan from "vulkan/tap_rows.comp":
     launch tap_rows:
-        threadgroups (min(ceil_div(M * D, 256), 65535), 1, 1)
+        threadgroups (ceil_div(D, 1024), min(M, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: one work item per row.
@@ -61,11 +61,11 @@ native feature_rows for cuda from "cuda/feature_rows.cu":
         threadgroups (ceil_div(D, 1024), O, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Vulkan: a grid-stride loop over every element; the x grid is capped at the
-# 65535-group floor (Vulkan spec §5.3).
+# Vulkan: four elements per thread on a (column, row) grid; the y grid is
+# capped at the 65535-group floor (Vulkan spec §5.3) and strides rows.
 native feature_rows for vulkan from "vulkan/feature_rows.comp":
     launch feature_rows:
-        threadgroups (min(ceil_div(O * D, 256), 65535), 1, 1)
+        threadgroups (ceil_div(D, 1024), min(O, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: one work item per output row.
@@ -101,7 +101,7 @@ native widen_rows for cuda from "cuda/widen_rows.cu":
 # 65535-group floor (Vulkan spec §5.3).
 native widen_rows for vulkan from "vulkan/widen_rows.comp":
     launch widen_rows:
-        threadgroups (min(ceil_div(M * D, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * D, 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: one work item per row.
@@ -323,12 +323,12 @@ native draft_convolve_input for metal from "metal/draft_convolve_input.metal":
 
 native draft_convolve_input for cuda from "cuda/draft_convolve_input.cu":
     launch draft_convolve_input:
-        threadgroups (ceil_div(G * C, 1024), min(M, 65535), 1)
+        threadgroups (ceil_div(G * C, 1024), min(M, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_convolve_input for vulkan from "vulkan/draft_convolve_input.comp":
     launch draft_convolve_input:
-        threadgroups (min(ceil_div(M * G * C, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * G * C, 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_convolve_input for cpu from "cpu/draft_convolve_input.rs":
@@ -344,12 +344,12 @@ native draft_convolve_residual for metal from "metal/draft_convolve_residual.met
 
 native draft_convolve_residual for cuda from "cuda/draft_convolve_residual.cu":
     launch draft_convolve_residual:
-        threadgroups (ceil_div(G * C, 1024), min(M, 65535), 1)
+        threadgroups (ceil_div(G * C, 1024), min(M, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_convolve_residual for vulkan from "vulkan/draft_convolve_residual.comp":
     launch draft_convolve_residual:
-        threadgroups (min(ceil_div(M * G * C, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * G * C, 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_convolve_residual for cpu from "cpu/draft_convolve_residual.rs":
@@ -364,12 +364,12 @@ native draft_gated_rows for metal from "metal/draft_gated_rows.metal":
 
 native draft_gated_rows for cuda from "cuda/draft_gated_rows.cu":
     launch draft_gated_rows:
-        threadgroups (ceil_div(F, 1024), min(M, 65535), 1)
+        threadgroups (ceil_div(F, 1024), min(M, device.max_grid_y), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_gated_rows for vulkan from "vulkan/draft_gated_rows.comp":
     launch draft_gated_rows:
-        threadgroups (min(ceil_div(M * F, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(M * F, 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_gated_rows for cpu from "cpu/draft_gated_rows.rs":

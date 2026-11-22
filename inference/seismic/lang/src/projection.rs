@@ -1853,12 +1853,16 @@ fn gather(entry: &str, expanded: &mut NativeDecl, parameters: &str) {
             ident.name = renamed.clone();
         }
     };
+    let rename_default = |default: &mut NativeDefaultDecl| match default {
+        NativeDefaultDecl::Value(expr) | NativeDefaultDecl::Least(expr) | NativeDefaultDecl::Greatest(expr) => {
+            rename(expr, &names)
+        }
+    };
     let rename_param = |param: &mut NativeParamDecl| {
         rename_ident(&mut param.name, &names);
-        match &mut param.default {
-            NativeDefaultDecl::Value(expr) | NativeDefaultDecl::Least(expr) | NativeDefaultDecl::Greatest(expr) => {
-                rename(expr, &names)
-            }
+        rename_default(&mut param.default);
+        if let Some(reference) = &mut param.reference {
+            rename_default(reference);
         }
     };
     expanded.params.iter_mut().for_each(rename_param);
@@ -2042,19 +2046,24 @@ fn admit(mut params: Vec<&mut NativeParamDecl>, conjuncts: Vec<Expr>) -> Result<
         if values.len() == param.values.len() {
             continue;
         }
-        match &param.default {
-            NativeDefaultDecl::Value(Expr { kind: ExprKind::Int(default), .. }) => {
-                if !values.contains(default) {
-                    param.default = NativeDefaultDecl::Value(Expr { kind: ExprKind::Int(first), span: param.span });
+        let narrow = |decl: &mut NativeDefaultDecl, kind: &str| -> Result<(), Diagnostic> {
+            match decl {
+                NativeDefaultDecl::Value(Expr { kind: ExprKind::Int(val), .. }) => {
+                    if !values.contains(val) {
+                        *decl = NativeDefaultDecl::Value(Expr { kind: ExprKind::Int(first), span: param.span });
+                    }
+                    Ok(())
                 }
-            }
-            NativeDefaultDecl::Least(_) | NativeDefaultDecl::Greatest(_) => {}
-            NativeDefaultDecl::Value(_) => {
-                return Err(error(
+                NativeDefaultDecl::Least(_) | NativeDefaultDecl::Greatest(_) => Ok(()),
+                NativeDefaultDecl::Value(_) => Err(error(
                     param.span,
-                    format!("the projection's admission narrows `{name}` for this entry, so its default is a literal value or `least`/`greatest`"),
-                ));
+                    format!("the projection's admission narrows `{name}` for this entry, so its {kind} is a literal value or `least`/`greatest`"),
+                )),
             }
+        };
+        narrow(&mut param.default, "default")?;
+        if let Some(reference) = &mut param.reference {
+            narrow(reference, "reference")?;
         }
         param.values = values;
     }
@@ -2669,17 +2678,22 @@ impl Instance<'_> {
         })
     }
 
+    fn default_decl(&self, decl: &NativeDefaultDecl) -> Result<NativeDefaultDecl, Diagnostic> {
+        Ok(match decl {
+            NativeDefaultDecl::Value(value) => NativeDefaultDecl::Value(self.expr(value)?),
+            NativeDefaultDecl::Least(condition) => NativeDefaultDecl::Least(self.expr(condition)?),
+            NativeDefaultDecl::Greatest(condition) => NativeDefaultDecl::Greatest(self.expr(condition)?),
+        })
+    }
+
     fn param(&self, param: &NativeParamDecl) -> Result<NativeParamDecl, Diagnostic> {
         Ok(NativeParamDecl {
             name: self.ident(&param.name),
             arithmetic: param.arithmetic,
             form: param.form,
             values: param.values.clone(),
-            default: match &param.default {
-                NativeDefaultDecl::Value(value) => NativeDefaultDecl::Value(self.expr(value)?),
-                NativeDefaultDecl::Least(condition) => NativeDefaultDecl::Least(self.expr(condition)?),
-                NativeDefaultDecl::Greatest(condition) => NativeDefaultDecl::Greatest(self.expr(condition)?),
-            },
+            default: self.default_decl(&param.default)?,
+            reference: param.reference.as_ref().map(|r| self.default_decl(r)).transpose()?,
             span: self.span(param.span),
         })
     }

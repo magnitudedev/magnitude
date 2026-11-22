@@ -23,7 +23,7 @@ native copy_rows for cuda from "cuda/copy_rows.cu":
 # at the 65535-group floor (Vulkan spec §5.3).
 native copy_rows for vulkan from "vulkan/copy_rows.comp":
     launch copy_rows:
-        threadgroups (min(ceil_div(N * KV * W, 256), 65535), 1, 1)
+        threadgroups (min(ceil_div(N * KV * W, 256), device.max_grid_x), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CPU: one work item per copied item moves its KV rows as storage words, so

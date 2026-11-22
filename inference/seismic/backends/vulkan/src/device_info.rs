@@ -285,6 +285,10 @@ const AMD_VENDOR: u32 = 0x1002;
 
 /// `VK_KHR_shader_fma` (newer than ash 0.38).
 pub(crate) const SHADER_FMA_EXTENSION: &CStr = c"VK_KHR_shader_fma";
+/// `VK_AMD_shader_core_properties` (compute unit count on AMD GPUs).
+const AMD_SHADER_CORE_PROPERTIES_EXTENSION: &CStr = c"VK_AMD_shader_core_properties";
+/// `VK_NV_shader_sm_builtins` (streaming multiprocessor count on NVIDIA GPUs).
+const NV_SHADER_SM_BUILTINS_EXTENSION: &CStr = c"VK_NV_shader_sm_builtins";
 
 /// `VkPhysicalDeviceShaderFmaFeaturesKHR` (newer than ash 0.38).
 #[repr(C)]
@@ -601,10 +605,13 @@ impl Description {
 /// (`seismic_lang::device::vulkan`): each the one field its query names.
 #[derive(Clone, Debug)]
 struct Queried {
+    amd_compute_units: Option<u64>,
+    nv_shader_sm_count: Option<u64>,
     subgroup_width: Option<SubgroupWidth>,
     min_subgroup_size: u32,
     max_compute_work_group_invocations: u32,
     max_compute_shared_memory_size: u32,
+    max_compute_work_group_count: [u32; 3],
     shader_float16: bool,
     shader_rounding_mode_rte_float16: bool,
     shader_signed_zero_inf_nan_preserve_float16: bool,
@@ -623,6 +630,15 @@ struct Queried {
 }
 
 impl seismic_lang::device::vulkan::Queries for Queried {
+    fn amd_compute_units(&self) -> Option<u64> {
+        self.amd_compute_units
+    }
+    fn nv_shader_sm_count(&self) -> Option<u64> {
+        self.nv_shader_sm_count
+    }
+    fn fallback_units(&self) -> Option<u64> {
+        Some(1)
+    }
     fn required_subgroup_32(&self) -> Option<u64> {
         (self.subgroup_width? == SubgroupWidth::Required32).then_some(u64::from(SUBGROUP_WIDTH))
     }
@@ -637,6 +653,15 @@ impl seismic_lang::device::vulkan::Queries for Queried {
     }
     fn max_compute_shared_memory_size(&self) -> Option<u64> {
         Some(self.max_compute_shared_memory_size.into())
+    }
+    fn max_compute_work_group_count_x(&self) -> Option<u64> {
+        Some(self.max_compute_work_group_count[0].into())
+    }
+    fn max_compute_work_group_count_y(&self) -> Option<u64> {
+        Some(self.max_compute_work_group_count[1].into())
+    }
+    fn max_compute_work_group_count_z(&self) -> Option<u64> {
+        Some(self.max_compute_work_group_count[2].into())
     }
     fn shader_float16(&self) -> Option<bool> {
         Some(self.shader_float16)
@@ -716,13 +741,23 @@ pub(crate) fn describe(
     let mut v12 = vk::PhysicalDeviceVulkan12Properties::default();
     let mut v13 = vk::PhysicalDeviceVulkan13Properties::default();
     let mut pci_bus_info = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+    let mut amd_cores = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
+    let mut nv_sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
     let has_pci_bus_info = has(ash::ext::pci_bus_info::NAME);
+    let has_amd_cores = has(AMD_SHADER_CORE_PROPERTIES_EXTENSION);
+    let has_nv_sm = has(NV_SHADER_SM_BUILTINS_EXTENSION);
     let mut properties = vk::PhysicalDeviceProperties2::default()
         .push_next(&mut v11)
         .push_next(&mut v12)
         .push_next(&mut v13);
     if has_pci_bus_info {
         properties = properties.push_next(&mut pci_bus_info);
+    }
+    if has_amd_cores {
+        properties = properties.push_next(&mut amd_cores);
+    }
+    if has_nv_sm {
+        properties = properties.push_next(&mut nv_sm);
     }
     unsafe { raw.get_physical_device_properties2(physical, &mut properties) };
     let base = properties.properties;
@@ -786,11 +821,24 @@ pub(crate) fn describe(
     );
     let on = |value: vk::Bool32| value == vk::TRUE;
     let mixed_dot = on(v13.integer_dot_product4x8_bit_packed_mixed_signedness_accelerated);
+    let amd_compute_units = has_amd_cores
+        .then(|| {
+            u64::from(amd_cores.shader_engine_count)
+                .saturating_mul(u64::from(amd_cores.shader_arrays_per_engine_count))
+                .saturating_mul(u64::from(amd_cores.compute_units_per_shader_array))
+        })
+        .filter(|&units| units > 0);
+    let nv_shader_sm_count = has_nv_sm
+        .then(|| u64::from(nv_sm.shader_sm_count))
+        .filter(|&units| units > 0);
     let queried = Queried {
+        amd_compute_units,
+        nv_shader_sm_count,
         subgroup_width,
         min_subgroup_size: v13.min_subgroup_size,
         max_compute_work_group_invocations: base.limits.max_compute_work_group_invocations,
         max_compute_shared_memory_size: base.limits.max_compute_shared_memory_size,
+        max_compute_work_group_count: base.limits.max_compute_work_group_count,
         shader_float16: on(f12.shader_float16),
         shader_rounding_mode_rte_float16: on(v12.shader_rounding_mode_rte_float16),
         shader_signed_zero_inf_nan_preserve_float16: on(v12.shader_signed_zero_inf_nan_preserve_float16),

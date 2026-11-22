@@ -1180,7 +1180,8 @@ impl<I: std::borrow::Borrow<NativeImplementation>> DeviceBound<I> {
         &self,
         dimension: &impl Fn(&str) -> Option<u64>,
     ) -> Result<Vec<u64>, NativeSpecializationError> {
-        self.implementation().resolve_defaults(dimension)
+        self.implementation()
+            .resolve_choices(dimension, |parameter| &parameter.default)
     }
 
     /// The bound implementation.
@@ -1211,6 +1212,28 @@ impl<I: std::borrow::Borrow<NativeImplementation>> DeviceBound<I> {
         &self,
         statics: &NativeSpecialization,
     ) -> Result<NativeSpecialization, NativeSpecializationError> {
+        self.preferred_specialization(statics, |parameter| &parameter.default)
+    }
+
+    /// The numerical-validation reference configuration at the given static
+    /// values: every parameter at its declared `reference` (falling back to
+    /// `default` when `reference` is `None`) when that configuration is
+    /// admissible; otherwise the first admissible configuration trying each
+    /// parameter's reference value first.
+    pub fn reference_specialization(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> Result<NativeSpecialization, NativeSpecializationError> {
+        self.preferred_specialization(statics, |parameter| {
+            parameter.reference.as_ref().unwrap_or(&parameter.default)
+        })
+    }
+
+    fn preferred_specialization(
+        &self,
+        statics: &NativeSpecialization,
+        pick: impl Fn(&NativeParameter) -> &NativeDefault,
+    ) -> Result<NativeSpecialization, NativeSpecializationError> {
         let implementation = self.implementation();
         if let Some(name) = implementation
             .statics
@@ -1219,7 +1242,7 @@ impl<I: std::borrow::Borrow<NativeImplementation>> DeviceBound<I> {
         {
             return Err(NativeSpecializationError::MissingStatic(name.clone()));
         }
-        let ordered = implementation.defaults_first(statics)?;
+        let ordered = implementation.ordered_first(statics, pick)?;
         let mut first = None;
         ordered.as_ref().walk_admissible(statics, |configuration| {
             first = Some(configuration.clone());
@@ -1352,15 +1375,22 @@ impl OnDevice {
         statics: &NativeSpecialization,
     ) -> Result<Self, NativeSpecializationError> {
         let dimension = |name: &str| statics.static_value(name);
-        let defaults = self.0.resolve_defaults(&dimension)?;
+        let defaults = self.0.resolve_choices(&dimension, |parameter| &parameter.default)?;
+        let references = self.0.resolve_choices(&dimension, |parameter| {
+            parameter.reference.as_ref().unwrap_or(&parameter.default)
+        })?;
         let implementation = &mut self.0;
-        for (parameter, value) in implementation
+        for ((parameter, default_value), reference_value) in implementation
             .params
             .iter_mut()
             .chain(implementation.launches.iter_mut().flat_map(|launch| &mut launch.params))
             .zip(defaults)
+            .zip(references)
         {
-            parameter.default = NativeDefault::Value(NativeNatExpr::Constant(value));
+            parameter.default = NativeDefault::Value(NativeNatExpr::Constant(default_value));
+            if parameter.reference.is_some() {
+                parameter.reference = Some(NativeDefault::Value(NativeNatExpr::Constant(reference_value)));
+            }
         }
         Ok(self)
     }
@@ -1446,7 +1476,15 @@ impl NativeImplementation {
             .then(|| DeviceBound(self).default_specialization(statics))
     }
 
-    /// Whether any parameter default or domain constraint reads `device.NAME`.
+    pub fn reference_specialization_without_device(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> Option<Result<NativeSpecialization, NativeSpecializationError>> {
+        (!self.specialization_reads_device())
+            .then(|| DeviceBound(self).reference_specialization(statics))
+    }
+
+    /// Whether any parameter default, reference, or domain constraint reads `device.NAME`.
     fn specialization_reads_device(&self) -> bool {
         let mut reads = Vec::new();
         for parameter in self
@@ -1454,10 +1492,12 @@ impl NativeImplementation {
             .iter()
             .chain(self.launches.iter().flat_map(|launch| &launch.params))
         {
-            match &parameter.default {
-                NativeDefault::Value(value) => value.device_reads(&mut reads),
-                NativeDefault::Least(bound) | NativeDefault::Greatest(bound) => {
-                    bound.device_reads(&mut reads);
+            for choice in std::iter::once(&parameter.default).chain(parameter.reference.iter()) {
+                match choice {
+                    NativeDefault::Value(value) => value.device_reads(&mut reads),
+                    NativeDefault::Least(bound) | NativeDefault::Greatest(bound) => {
+                        bound.device_reads(&mut reads);
+                    }
                 }
             }
         }
@@ -1545,9 +1585,11 @@ impl NativeImplementation {
             expression: &mut dyn FnMut(&NativeNatExpr),
             condition: &mut dyn FnMut(&NativeCondition),
         ) {
-            match &parameter.default {
-                NativeDefault::Value(value) => expression(value),
-                NativeDefault::Least(bound) | NativeDefault::Greatest(bound) => condition(bound),
+            for choice in std::iter::once(&parameter.default).chain(parameter.reference.iter()) {
+                match choice {
+                    NativeDefault::Value(value) => expression(value),
+                    NativeDefault::Least(bound) | NativeDefault::Greatest(bound) => condition(bound),
+                }
             }
         }
         for declared in &self.params {
@@ -1591,6 +1633,7 @@ impl NativeImplementation {
     ) -> Self {
         let parameter = |parameter: &NativeParameter| NativeParameter {
             default: parameter.default.mapped(expression, condition),
+            reference: parameter.reference.as_ref().map(|r| r.mapped(expression, condition)),
             ..parameter.clone()
         };
         Self {
@@ -1739,6 +1782,9 @@ pub struct NativeParameter {
     pub form: bool,
     pub values: Vec<u64>,
     pub default: NativeDefault,
+    /// Optional numerical-validation oracle value (only on `arithmetic`
+    /// parameters). When `None`, `default` is also the validation reference.
+    pub reference: Option<NativeDefault>,
     pub role: NativeParameterRole,
 }
 
@@ -2018,6 +2064,7 @@ impl NativeParameter {
                 form: false,
                 values: counts.clone(),
                 default: NativeDefault::Value(NativeNatExpr::Constant(0)),
+                reference: None,
                 role: NativeParameterRole::Workers {
                     launch: launch as u32,
                 },
@@ -2029,6 +2076,7 @@ impl NativeParameter {
                 form: false,
                 values: tiers,
                 default: NativeDefault::Value(NativeNatExpr::Constant(0)),
+                reference: None,
                 role: NativeParameterRole::Tier,
             }))
             .collect()
@@ -3798,13 +3846,14 @@ impl NativeImplementation {
         Ok(masks)
     }
 
-    /// Evaluate every parameter's default sequentially in declaration order
-    /// (entry parameters first, then each launch's parameters), so later
-    /// parameter defaults may read earlier already-defaulted parameters in
-    /// scope.
-    fn resolve_defaults(
+    /// Evaluate each parameter's chosen default or reference sequentially in
+    /// declaration order (entry parameters first, then each launch's
+    /// parameters), so later expressions may read earlier already-chosen
+    /// parameters in scope.
+    fn resolve_choices(
         &self,
         dimension: &impl Fn(&str) -> Option<u64>,
+        pick: impl Fn(&NativeParameter) -> &NativeDefault,
     ) -> Result<Vec<u64>, NativeSpecializationError> {
         let total = self.params.len()
             + self.launches.iter().map(|launch| launch.params.len()).sum::<usize>();
@@ -3815,7 +3864,7 @@ impl NativeImplementation {
                 entry_chosen.iter().find(|(name, _)| *name == read).map(|(_, value)| *value)
             };
             let value =
-                parameter.default.value(&parameter.name, &parameter.values, dimension, &prior)?;
+                pick(parameter).value(&parameter.name, &parameter.values, dimension, &prior)?;
             entry_chosen.push((&parameter.name, value));
             out.push(value);
         }
@@ -3829,7 +3878,7 @@ impl NativeImplementation {
                         .or_else(|| entry_chosen.iter().find(|(name, _)| *name == read))
                         .map(|(_, value)| *value)
                 };
-                let value = parameter.default.value(
+                let value = pick(parameter).value(
                     &parameter.name,
                     &parameter.values,
                     dimension,
@@ -3843,45 +3892,47 @@ impl NativeImplementation {
     }
 
     /// The declaration with each parameter's values reordered so its
-    /// default at `statics` comes first, the others keeping their declared
-    /// order: the declaration itself where every default is its first value.
-    fn defaults_first(
+    /// chosen value (`pick`) at `statics` comes first, the others keeping
+    /// their declared order: the declaration itself where every chosen value
+    /// is its first value.
+    fn ordered_first(
         &self,
         statics: &NativeSpecialization,
+        pick: impl Fn(&NativeParameter) -> &NativeDefault,
     ) -> Result<Cow<'_, Self>, NativeSpecializationError> {
         let dimension = |name: &str| statics.static_value(name);
-        let defaults = self.resolve_defaults(&dimension)?;
+        let chosen = self.resolve_choices(&dimension, pick)?;
         let parameters = self
             .params
             .iter()
             .chain(self.launches.iter().flat_map(|launch| &launch.params));
         let first = parameters
-            .zip(&defaults)
-            .all(|(parameter, &default)| parameter.values.first() == Some(&default));
+            .zip(&chosen)
+            .all(|(parameter, &value)| parameter.values.first() == Some(&value));
         if first {
             return Ok(Cow::Borrowed(self));
         }
-        let ordered = |parameter: &NativeParameter, default: u64| -> NativeParameter {
-            let values = std::iter::once(default)
-                .chain(parameter.values.iter().copied().filter(|value| *value != default))
+        let ordered = |parameter: &NativeParameter, value: u64| -> NativeParameter {
+            let values = std::iter::once(value)
+                .chain(parameter.values.iter().copied().filter(|other| *other != value))
                 .collect();
             NativeParameter {
                 values,
                 ..parameter.clone()
             }
         };
-        let mut cursor = defaults.into_iter();
+        let mut cursor = chosen.into_iter();
         let mut declaration = self.clone();
         declaration.params = self
             .params
             .iter()
-            .map(|parameter| ordered(parameter, cursor.next().expect("resolved default")))
+            .map(|parameter| ordered(parameter, cursor.next().expect("resolved choice")))
             .collect();
         for (launch, original) in declaration.launches.iter_mut().zip(&self.launches) {
             launch.params = original
                 .params
                 .iter()
-                .map(|parameter| ordered(parameter, cursor.next().expect("resolved default")))
+                .map(|parameter| ordered(parameter, cursor.next().expect("resolved choice")))
                 .collect();
         }
         Ok(Cow::Owned(declaration))
@@ -6022,6 +6073,31 @@ mod native_tests {
             let error = check_source(source(&declaration(params))).expect_err(params).to_string();
             assert!(error.contains(expected), "{params}: expected {expected:?}, got {error}");
         }
+    }
+
+    #[test]
+    fn reference_specialization_separates_oracle_from_default() {
+        let ok = check_source(source(
+            "native scale for cpu from \"cpu/scale.rs\":\n    params (arithmetic form INT8 in [0, 1] default 1 reference 0, ROWS in [8, 4] default 8)\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+        ))
+        .expect("arithmetic parameter with reference checks");
+        let entry = ok.entry_named("scale").unwrap();
+        let native = ok.native_implementation(entry, BackendName::Cpu).unwrap();
+        let statics = NativeSpecialization::new();
+        let default = native.default_specialization_without_device(&statics).unwrap().unwrap();
+        let reference = native.reference_specialization_without_device(&statics).unwrap().unwrap();
+        assert_eq!(default.param("INT8"), Some(1));
+        assert_eq!(default.param("ROWS"), Some(8));
+        assert_eq!(reference.param("INT8"), Some(0));
+        assert_eq!(reference.param("ROWS"), Some(8));
+
+        // Non-arithmetic parameter with `reference` is rejected.
+        let err = check_source(source(
+            "native scale for cpu from \"cpu/scale.rs\":\n    params (ROWS in [8, 4] default 8 reference 4)\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+        ))
+        .expect_err("non-arithmetic reference must be rejected")
+        .to_string();
+        assert!(err.contains("only permitted on `arithmetic` parameters"), "{err}");
     }
 
     /// The declared defaults are only the first candidate: at statics where

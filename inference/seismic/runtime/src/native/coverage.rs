@@ -78,9 +78,9 @@ pub enum Configuration {
 impl Configuration {
     fn dialect(self) -> Dialect {
         match self {
-            Self::Vulkan(facts) => Dialect::Vulkan(abi::vulkan::VulkanFeatures::of(&facts)),
-            Self::Cuda { .. } => Dialect::Cuda(abi::CudaFeatures::UNOPENED),
-            Self::Metal { tensor_ops } => Dialect::Metal(abi::MetalFeatures { tensor_ops }),
+            Self::Vulkan(facts) => Dialect::Vulkan(abi::vulkan::VulkanFeatures::of_target(&facts)),
+            Self::Cuda { .. } => Dialect::Cuda(abi::CudaFeatures::unopened()),
+            Self::Metal { tensor_ops } => Dialect::Metal(abi::MetalFeatures::unopened(tensor_ops)),
         }
     }
 }
@@ -2634,7 +2634,7 @@ mod tests {
             &text,
             asset,
             "k.comp",
-            Dialect::Vulkan(abi::vulkan::VulkanFeatures::of(&seismic_vulkan::FormationTarget::FLOOR)),
+            Dialect::Vulkan(abi::vulkan::VulkanFeatures::of_target(&seismic_vulkan::FormationTarget::FLOOR)),
             "",
         );
         assert_eq!(

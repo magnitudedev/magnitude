@@ -199,6 +199,87 @@ impl ProbeAnswer for u64 {
 /// devices hold against it, so every device it runs on holds it.
 pub const VULKAN_FLOOR_SHARED_BYTES: u64 = 32 * 1024;
 
+/// The minimal orthogonal universal GPU properties every GPU backend
+/// (`metal`, `cuda`, `vulkan`) exposes to both `.seismic` declarations
+/// (`device.<name>`) and compiled GPU kernel sources (`SEISMIC_DEVICE_<NAME>`).
+pub const UNIVERSAL_GPU_PROPERTIES: [&str; 8] = [
+    "units",
+    "subgroup_width",
+    "max_group_threads",
+    "shared_bytes_per_group",
+    "shared_bytes_per_unit",
+    "max_grid_x",
+    "max_grid_y",
+    "max_grid_z",
+];
+
+/// The `SEISMIC_DEVICE_*` compile-time constant macros injected into every
+/// compiled GPU kernel unit (MSL, CUDA, GLSL), in one-to-one correspondence
+/// with [`UNIVERSAL_GPU_PROPERTIES`].
+pub const UNIVERSAL_GPU_MACROS: [&str; 8] = [
+    "SEISMIC_DEVICE_UNITS",
+    "SEISMIC_DEVICE_SUBGROUP_WIDTH",
+    "SEISMIC_DEVICE_MAX_GROUP_THREADS",
+    "SEISMIC_DEVICE_SHARED_BYTES_PER_GROUP",
+    "SEISMIC_DEVICE_SHARED_BYTES_PER_UNIT",
+    "SEISMIC_DEVICE_MAX_GRID_X",
+    "SEISMIC_DEVICE_MAX_GRID_Y",
+    "SEISMIC_DEVICE_MAX_GRID_Z",
+];
+
+/// One GPU device's values for the universal orthogonal capability basis,
+/// extracted from the same [`DeviceValues`] that `.seismic` evaluates and
+/// propagated into GPU kernel sources as `SEISMIC_DEVICE_*` macros.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct UniversalGpuProperties {
+    pub units: u64,
+    pub subgroup_width: u64,
+    pub max_group_threads: u64,
+    pub shared_bytes_per_group: u64,
+    pub shared_bytes_per_unit: u64,
+    pub max_grid_x: u64,
+    pub max_grid_y: u64,
+    pub max_grid_z: u64,
+}
+
+impl UniversalGpuProperties {
+    /// Extract the universal GPU properties from any GPU backend's
+    /// [`DeviceValues`] (`cuda::Properties`, `metal::Properties`,
+    /// `vulkan::Properties`, or `BackendFloor` of a GPU backend).
+    pub fn of(values: &impl DeviceValues) -> Self {
+        Self {
+            units: values.value("units"),
+            subgroup_width: values.value("subgroup_width"),
+            max_group_threads: values.value("max_group_threads"),
+            shared_bytes_per_group: values.value("shared_bytes_per_group"),
+            shared_bytes_per_unit: values.value("shared_bytes_per_unit"),
+            max_grid_x: values.value("max_grid_x"),
+            max_grid_y: values.value("max_grid_y"),
+            max_grid_z: values.value("max_grid_z"),
+        }
+    }
+
+    /// Conservative floor values for offline / unopened rendering on a GPU
+    /// backend, sourced from [`BackendFloor`].
+    pub fn floor(backend: BackendName) -> Self {
+        Self::of(&BackendFloor(backend))
+    }
+
+    /// The `(macro_name, value)` pairs injected into GPU kernel sources.
+    pub fn macros(self) -> [(&'static str, u64); 8] {
+        [
+            (UNIVERSAL_GPU_MACROS[0], self.units),
+            (UNIVERSAL_GPU_MACROS[1], self.subgroup_width),
+            (UNIVERSAL_GPU_MACROS[2], self.max_group_threads),
+            (UNIVERSAL_GPU_MACROS[3], self.shared_bytes_per_group),
+            (UNIVERSAL_GPU_MACROS[4], self.shared_bytes_per_unit),
+            (UNIVERSAL_GPU_MACROS[5], self.max_grid_x),
+            (UNIVERSAL_GPU_MACROS[6], self.max_grid_y),
+            (UNIVERSAL_GPU_MACROS[7], self.max_grid_z),
+        ]
+    }
+}
+
 /// The type of property `name` when `backend` provides it.
 pub fn provided(backend: BackendName, name: &str) -> Option<PropertyKind> {
     let names: &[(&str, PropertyKind)] = match backend {
@@ -513,6 +594,10 @@ properties! {
         max_threads_per_block: Count,
         max_threads_per_multiprocessor: Count,
         max_shared_memory_per_block_optin: Count,
+        max_shared_memory_per_multiprocessor: Count,
+        max_grid_dim_x: Count,
+        max_grid_dim_y: Count,
+        max_grid_dim_z: Count,
         l2_cache_size: Count,
         cooperative_launch: Support,
         max_registers_per_thread: Count,
@@ -520,11 +605,17 @@ properties! {
     }
     probes {}
     properties {
+        // Universal GPU properties.
         units: Count = query(multiprocessor_count);
         subgroup_width: Count = query(warp_size);
         max_group_threads: Count = query(max_threads_per_block);
-        threads_per_unit: Count = query(max_threads_per_multiprocessor);
         shared_bytes_per_group: Count = query(max_shared_memory_per_block_optin);
+        shared_bytes_per_unit: Count = query(max_shared_memory_per_multiprocessor);
+        max_grid_x: Count = query(max_grid_dim_x);
+        max_grid_y: Count = query(max_grid_dim_y);
+        max_grid_z: Count = query(max_grid_dim_z);
+        // CUDA-specific properties.
+        threads_per_unit: Count = query(max_threads_per_multiprocessor);
         l2_bytes: Count = query(l2_cache_size);
         cooperative_launch: Support = query(cooperative_launch);
         // Registers one thread may use: the documented ceiling of every
@@ -538,10 +629,16 @@ properties! {
 properties! {
     vulkan;
     queries {
+        amd_compute_units: Count,
+        nv_shader_sm_count: Count,
+        fallback_units: Count,
         required_subgroup_32: Count,
         fixed_subgroup_size: Count,
         max_compute_work_group_invocations: Count,
         max_compute_shared_memory_size: Count,
+        max_compute_work_group_count_x: Count,
+        max_compute_work_group_count_y: Count,
+        max_compute_work_group_count_z: Count,
         shader_float16: Support,
         shader_rounding_mode_rte_float16: Support,
         shader_signed_zero_inf_nan_preserve_float16: Support,
@@ -564,9 +661,16 @@ properties! {
         register_file: Count,
     }
     properties {
+        // Universal GPU properties.
+        units: Count = query(amd_compute_units) | query(nv_shader_sm_count) | query(fallback_units);
         subgroup_width: Count = query(required_subgroup_32) | query(fixed_subgroup_size);
         max_group_threads: Count = query(max_compute_work_group_invocations);
         shared_bytes_per_group: Count = query(max_compute_shared_memory_size);
+        shared_bytes_per_unit: Count = query(max_compute_shared_memory_size);
+        max_grid_x: Count = query(max_compute_work_group_count_x);
+        max_grid_y: Count = query(max_compute_work_group_count_y);
+        max_grid_z: Count = query(max_compute_work_group_count_z);
+        // Vulkan-specific extensions and driver probes.
         float16: Support = query(shader_float16)
             & query(shader_rounding_mode_rte_float16)
             & query(shader_signed_zero_inf_nan_preserve_float16);
@@ -616,6 +720,8 @@ properties! {
         // The maximum threads in a threadgroup (`MTLDevice.maxThreadsPerThreadgroup`,
         // capped by a compute pipeline's `maxTotalThreadsPerThreadgroup`).
         max_threads_per_threadgroup: Count,
+        // Maximum dispatch grid dimension along each axis (`u32::MAX`).
+        max_grid_dim: Count,
         apple10_family: Support,
         // The compiler forms a `matmul2d` pipeline: asked of the API at
         // open, running nothing.
@@ -623,10 +729,16 @@ properties! {
     }
     probes {}
     properties {
-        shared_bytes_per_group: Count = query(max_threadgroup_memory_length);
+        // Universal GPU properties.
         units: Count = query(gpu_cores);
         subgroup_width: Count = query(thread_execution_width);
         max_group_threads: Count = query(max_threads_per_threadgroup);
+        shared_bytes_per_group: Count = query(max_threadgroup_memory_length);
+        shared_bytes_per_unit: Count = query(max_threadgroup_memory_length);
+        max_grid_x: Count = query(max_grid_dim);
+        max_grid_y: Count = query(max_grid_dim);
+        max_grid_z: Count = query(max_grid_dim);
+        // Metal-specific properties.
         tensor_ops: Support = query(apple10_family) & query(tensor_matmul_forms);
     }
 }
@@ -654,22 +766,30 @@ impl DeviceValues for BackendFloor {
     fn value(&self, name: &str) -> u64 {
         match (self.0, name) {
             (BackendName::Metal, "shared_bytes_per_group") => 32 * 1024,
+            (BackendName::Metal, "shared_bytes_per_unit") => 32 * 1024,
             (BackendName::Metal, "max_group_threads") => 1024,
             (BackendName::Metal, "subgroup_width") => 32,
             (BackendName::Metal, "units") => 16,
+            (BackendName::Metal, "max_grid_x" | "max_grid_y" | "max_grid_z") => u64::from(u32::MAX),
             (BackendName::Metal, "tensor_ops") => 0,
             (BackendName::Cuda, "shared_bytes_per_group") => 96 * 1024,
+            (BackendName::Cuda, "shared_bytes_per_unit") => 96 * 1024,
             (BackendName::Cuda, "max_group_threads") => 1024,
             (BackendName::Cuda, "subgroup_width") => 32,
             (BackendName::Cuda, "units") => 48,
+            (BackendName::Cuda, "max_grid_x") => (1 << 31) - 1,
+            (BackendName::Cuda, "max_grid_y" | "max_grid_z") => 65_535,
             (BackendName::Cuda, "threads_per_unit") => 1536,
             (BackendName::Cuda, "l2_bytes") => 6 * 1024 * 1024,
             (BackendName::Cuda, "cooperative_launch") => 1,
             (BackendName::Cuda, "registers_per_thread") => 255,
             (BackendName::Cuda, "registers_per_group") => 65536,
+            (BackendName::Vulkan, "units") => 16,
             (BackendName::Vulkan, "shared_bytes_per_group") => VULKAN_FLOOR_SHARED_BYTES,
+            (BackendName::Vulkan, "shared_bytes_per_unit") => VULKAN_FLOOR_SHARED_BYTES,
             (BackendName::Vulkan, "max_group_threads") => 1024,
             (BackendName::Vulkan, "subgroup_width") => 32,
+            (BackendName::Vulkan, "max_grid_x" | "max_grid_y" | "max_grid_z") => 65_535,
             (BackendName::Vulkan, _) => 0,
             (BackendName::Cpu, "units") => 1,
             (backend, other) => {
@@ -693,6 +813,15 @@ mod tests {
     }
 
     impl vulkan::Queries for Answers {
+        fn amd_compute_units(&self) -> Option<u64> {
+            None
+        }
+        fn nv_shader_sm_count(&self) -> Option<u64> {
+            Some(48)
+        }
+        fn fallback_units(&self) -> Option<u64> {
+            Some(1)
+        }
         fn required_subgroup_32(&self) -> Option<u64> {
             None
         }
@@ -704,6 +833,15 @@ mod tests {
         }
         fn max_compute_shared_memory_size(&self) -> Option<u64> {
             Some(49152)
+        }
+        fn max_compute_work_group_count_x(&self) -> Option<u64> {
+            Some(65_535)
+        }
+        fn max_compute_work_group_count_y(&self) -> Option<u64> {
+            Some(65_535)
+        }
+        fn max_compute_work_group_count_z(&self) -> Option<u64> {
+            Some(65_535)
         }
         fn shader_float16(&self) -> Option<bool> {
             Some(true)
@@ -793,5 +931,32 @@ mod tests {
         assert_eq!(measured.registers_per_group.get(), Some(65536));
         assert_eq!(measured.registers_per_thread.get(), None);
         assert!(measured.identity().contains("registers_per_thread=unmeasured;registers_per_group=65536"));
+    }
+
+    #[test]
+    fn every_gpu_backend_provides_the_universal_orthogonal_basis() {
+        for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            for name in UNIVERSAL_GPU_PROPERTIES {
+                assert_eq!(
+                    provided(backend, name),
+                    Some(PropertyKind::Count),
+                    "{backend:?} must provide universal property `{name}` as Count"
+                );
+            }
+            let floor = UniversalGpuProperties::floor(backend);
+            assert!(floor.units >= 1);
+            assert!(floor.subgroup_width >= 32);
+            assert!(floor.max_group_threads >= 1024);
+            assert!(floor.shared_bytes_per_group >= VULKAN_FLOOR_SHARED_BYTES);
+            assert!(floor.shared_bytes_per_unit >= floor.shared_bytes_per_group);
+            assert!(floor.max_grid_x >= 65_535);
+            assert!(floor.max_grid_y >= 65_535);
+            assert!(floor.max_grid_z >= 65_535);
+            let macros = floor.macros();
+            for ((macro_name, value), expected_name) in macros.iter().zip(UNIVERSAL_GPU_MACROS) {
+                assert_eq!(*macro_name, expected_name);
+                assert!(*value > 0);
+            }
+        }
     }
 }

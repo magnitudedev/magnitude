@@ -171,7 +171,8 @@ projection dense for metal:
     let ORDERED_ALL = sum(W, ORDERED) / WEIGHTS
     let ORDERED_GEMV_SHARED = 8192
     let MIXED_GEMV_SHARED = min(ceil_div(K, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 256) * 64
-    let QMATRIX = MATRIX % 2
+    let QMATRIX = (1 - GATHERED) * (1 - PLANES) * (1 - min(1, G - 1)) * (1 - min(1, K % 32)) * (sum(W, form(W, MATRIX)) / WEIGHTS) for paired | single
+    let QMATRIX = (1 - PARTED) * (1 - PLANES) * (1 - min(1, K % 32)) * min(1, sum(W, min(1, N) * form(W, MATRIX))) for segmented
     let TOKENS = 128 / SERVED
     let SPLITS = 1 for paired | segmented
     let SPLITS = SPLIT for single
@@ -181,13 +182,17 @@ projection dense for metal:
     params (arithmetic SPLIT in [1, 2, 4] default 1 for single,
         SIMDGROUPS in [8, 16, 4, 2] default 8 for ordered, ROWS in [1, 2, 4] default 1 for ordered,
         form TALL in [1, 0] default (1 - ORDERED_ANY),
-        arithmetic form INT8 in [0, 1] default 0 for paired | single, arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1,
-        arithmetic form MATRIX in [1, 2, 0] default (1 - ORDERED_ANY),
+        arithmetic form INT8 in [0, 1] default 0 for paired | single,
+        arithmetic form PACK in [0, 1] default greatest where PACK == 0 or (device.tensor_ops == 0 and ORDERED_ANY == 0 and GATHERED == 0 and PLANES == 0 and G == 1 and TALL == 1 and INT8 == 0 and K % 128 == 0 and K < 1048576 and N % (64 / WEIGHTS) == 0 and each(W, form(W, PACK) == 1) and agree(W, form(W, PACK_FOLDS)) and agree(W, form(W, PACK_RESIDUE)) and agree(W, form(W, PACK_SUMS))) reference 0 for paired | single,
+        arithmetic form PACK in [0, 1] default greatest where PACK == 0 or (device.tensor_ops == 0 and ORDERED_ANY == 0 and PLANES == 0 and G == 1 and TALL == 1 and K % 128 == 0 and K < 1048576 and SERVED == 1 and any(W, N > 0 and N % 32 == 0 and form(W, PACK) == 1)) reference 0 for segmented,
+        arithmetic form RESIDUE in [1, 2] default 1,
+        arithmetic form MATRIX_FROM in [5, 3, 9, 2, 17] default least where (ORDERED_ANY == 1 and MATRIX_FROM == 17) or (ORDERED_ANY == 0 and (MATRIX_FROM == 9 or (MATRIX_FROM == 5 and GATHERED == 0 and PLANES == 0 and G == 1 and K % 32 == 0) or (MATRIX_FROM == 3 and GATHERED == 0 and PLANES == 0 and G == 1 and K % 32 == 0 and QMATRIX == 0 and P * tiles(W, ceil_div(N, 8 * 8)) >= 2 * device.units))) reference (9 + 8 * ORDERED_ANY),
         arithmetic form SMALL in [1, 0] default (1 - ORDERED_ANY),
         arithmetic LANES in [16, 32, 8] default (16 + 16 * ORDERED_ALL), arithmetic form TILED in [0, 1, 2] default 0,
         form STAGE in [0, 1] default 0)
     where dense_bytes(A) == 2
-    where (ORDERED_ANY == 0 or (TALL == 0 and PACK == 0 and RESIDUE == 1 and MATRIX == 0 and SMALL == 0 and LANES != 8 and TILED == 0))
+    where (ORDERED_ANY == 0 or (TALL == 0 and PACK == 0 and RESIDUE == 1 and MATRIX_FROM == 17 and SMALL == 0 and LANES != 8 and TILED == 0))
+    where (ORDERED_ANY == 1 or MATRIX_FROM <= 9)
     where (ORDERED_ANY == 0 or SPLIT == 1) for single
     where (ORDERED_ANY == 0 or INT8 == 0) for paired | single
     where (ORDERED_ALL == 0 or ROWS == 1) for ordered
@@ -207,13 +212,11 @@ projection dense for metal:
     where (PACK == 0 or (TILE_M == 64 and TILE_N == 64))
     where (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))
     where (RESIDUE == 1 or (PACK == 1 and any(W, bound(W) > 0 and form(W, PACK_RESIDUE) == 1)))
-    where (G == 1 or (INT8 == 0 and PACK == 0 and MATRIX == 0 and each(W, operands(W) == 0)))
-    where (MATRIX != 1 or (GATHERED == 0 and PLANES == 0 and K % 32 == 0 and each(W, form(W, MATRIX) == 1))) for paired | single
-    where (MATRIX != 2 or (GATHERED == 0 and PLANES == 0 and K % 32 == 0 and each(W, form(W, MATRIX) == 0))) for paired | single
-    where (MATRIX != 1 or (PARTED == 0 and K % 32 == 0 and any(W, N > 0 and form(W, MATRIX) == 1))) for segmented
-    where (MATRIX != 2 or (PLANES == 0 and K % 32 == 0 and (PARTED == 1 or each(W, N == 0 or form(W, MATRIX) == 0)))) for segmented
-    where (MATRIX == 1 or BATCH_PARTS == 2)
-    where (MATRIX != 1 or BATCH_ROWS == 2) for paired | single
+    where (G == 1 or (INT8 == 0 and PACK == 0 and MATRIX_FROM >= 9 and each(W, operands(W) == 0)))
+    where ((GATHERED == 0 and PLANES == 0 and K % 32 == 0) or MATRIX_FROM >= 9)
+    where (QMATRIX == 1 or BATCH_PARTS == 2)
+    where (QMATRIX == 0 or BATCH_ROWS == 1) for paired | single
+    where BATCH_SIMDGROUPS * 32 <= device.max_group_threads
     scratch staged bytes (M * K * 2) when ORDERED_ALL == 1 and PUBLISHED == 0 and M > VERIFY_ROWS for rms
     scratch partials bytes (SPLIT * G * M * N * 4) when ORDERED_ANY == 0 and M > 16 and (M > 64 or SMALL == 0) and SPLIT > 1 and PLANES == 0 for single
     scratch partials bytes (M * P * sum(W, N) * 4) when ORDERED_ANY == 0 and M <= 16 and PARTED == 1 for segmented
@@ -266,15 +269,14 @@ projection dense for metal:
         threadgroups (tiles(W, ceil_div(N, 32)), ceil_div(M, 32), G)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (8192)
-    launch gemv when ORDERED_ANY == 0 and MATRIX == 0 and M < 2:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1)
+    launch gemv when ORDERED_ANY == 0 and M < 2 and M < MATRIX_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default greatest where SIMDGROUPS <= 16 and (SIMDGROUPS == 2 or GATHERED == 1 or P * G * (1 - GATHERED) * tiles(W, ceil_div(N, SIMDGROUPS * 32 / LANES)) >= 2 * device.units), ROWS in [1, 2, 4] default 1)
         threadgroups (P * tiles(W, ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(min(ceil_div(K / P, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448 / (1 + STAGE)) * 64 * (1 + STAGE), TILED * SIMDGROUPS * (128 * SERVED)))
-    launch batch when ORDERED_ANY == 0 and M <= 16 and ((MATRIX > 0 and PLANES == 0) or M > VERIFY_ROWS):
-        params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default 8, BATCH_ROWS in [2, 1, 4] default 2,
+    launch batch when ORDERED_ANY == 0 and M <= 16 and ((M >= MATRIX_FROM and PLANES == 0) or M > VERIFY_ROWS):
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default greatest where BATCH_SIMDGROUPS <= 8 and (BATCH_SIMDGROUPS == 4 or GATHERED == 1 or P * G * (1 - GATHERED) * tiles(W, QMATRIX * ceil_div(ceil_div(N, 8) * 2, BATCH_SIMDGROUPS) + (1 - QMATRIX) * ceil_div(N, BATCH_SIMDGROUPS * 8)) >= 2 * device.units), BATCH_ROWS in [1, 2, 4] default 1,
             arithmetic BATCH_PARTS in [2, 4, 1] default 2)
-        reads (MATRIX)
         threadgroups (P * tiles(W, QMATRIX * ceil_div(ceil_div(N, 8) * BATCH_PARTS, BATCH_SIMDGROUPS)
             + (1 - QMATRIX) * ceil_div(N, BATCH_SIMDGROUPS * BATCH_ROWS * 8)), 1, G)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
@@ -312,14 +314,14 @@ projection dense for metal:
         params (INT8_TILE in [128, 64] default 128)
         threadgroups (ceil_div(M, INT8_TILE), (INT8_TILE / 128) * ceil_div(N, 32) + (1 - INT8_TILE / 128) * ceil_div(N, 64), 1)
         threads_per_threadgroup (128, 1, 1)
-    launch gemv_rows when ORDERED_ANY == 0 and MATRIX == 0 and M >= 3 and M <= VERIFY_ROWS:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2, 4] default 1 for paired | segmented, ROWS in [2, 1, 4] default 2 for single)
+    launch gemv_rows when ORDERED_ANY == 0 and M >= 3 and M <= VERIFY_ROWS and M < MATRIX_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default greatest where SIMDGROUPS <= 8 and (SIMDGROUPS == 2 or GATHERED == 1 or P * G * (1 - GATHERED) * tiles(W, ceil_div(N, SIMDGROUPS * 32 / LANES)) >= 2 * device.units), ROWS in [1, 2, 4] default 1 for paired | segmented, ROWS in [2, 1, 4] default 2 for single)
         alike (gemv)
         threadgroups (P * tiles(W, ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(min(ceil_div(K / P, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448 / (1 + STAGE)) * 64 * (1 + STAGE), TILED * SIMDGROUPS * (128 * SERVED)))
-    launch gemv_pair when ORDERED_ANY == 0 and MATRIX == 0 and M == 2:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2, 4] default 1 for paired | segmented, ROWS in [2, 1, 4] default 2 for single)
+    launch gemv_pair when ORDERED_ANY == 0 and M == 2 and M < MATRIX_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default greatest where SIMDGROUPS <= 8 and (SIMDGROUPS == 2 or GATHERED == 1 or P * G * (1 - GATHERED) * tiles(W, ceil_div(N, SIMDGROUPS * 32 / LANES)) >= 2 * device.units), ROWS in [1, 2, 4] default 1 for paired | segmented, ROWS in [2, 1, 4] default 2 for single)
         alike (gemv)
         threadgroups (P * tiles(W, ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
@@ -458,6 +460,13 @@ const SHARED_ROW_PAIR_BYTES = 5
 # up to that many of its blocks (dense_up and dense_output ran 1, tuned over
 # 1 and 2, and restate it). Launch bounds are (256, 1) where nothing is stated.
 projection dense for cuda:
+    # Swap-AB GEMV serves up to 2 column blocks of 8 rows (`gemv` for 1..8,
+    # `gemv16` for 9..16; `projection::GEMV_ROWS` in `projection.cuh`). Past
+    # GEMV_ROWS, `gemm_small` (BM = 64) and `gemm` (BM = 128) run standard-AB
+    # MMAs whose arithmetic intensity exceeds the bf16 MMA ridge point on
+    # quantized weights, so INT8 activation quantization (`s8` IMMA) applies
+    # strictly to the GEMM band (`M > GEMV_ROWS`).
+    let GEMV_ROWS = 16
     let ORDERED_ANY = min(1, sum(W, ORDERED))
     let ORDERED_ALL = sum(W, ORDERED) / WEIGHTS
     let ORDERED_GEMV_SHARED = 256 + max(2, M) * 1024
@@ -466,7 +475,7 @@ projection dense for cuda:
     let ZSPLIT = 1 + (SPLIT - 1) * min(1, 128 / M) for single
     let ZSPLIT = GEMM_SPLIT for segmented
     let OPERANDS = min(1, sum(W, operands(W)))
-    let HALF_SM_SHARED = device.shared_bytes_per_group / 2
+    let HALF_SM_SHARED = device.shared_bytes_per_unit / 2
     # The shared bytes that bound the int8 GEMM's layout of the weights, the
     # most of any one's (`projection::GemmShape::LAYOUT_BYTES` of the 128-row
     # band, `LargeGemm`: 2 stages, 8 warps of one weight tile each), 0 for a
@@ -482,12 +491,14 @@ projection dense for cuda:
     # group only under direct coefficients without a bias, for each group of
     # the k-block, in whole 16 bytes). Each term is the GEMM's own or more.
     let INT8_LAYOUT = most(W, form(W, INT8) * (2 * (128 * 96 + 8 * 16 * row_bytes(W, codes, 64)) + 2 * 128 * 16 * ceil_div(row_bytes(W, coefficients, 256), 16) + 8 * 16 * 16 * ceil_div(4 * (64 / max(1, min(axis(W, COEFF_GROUP), 64))) * (2 - (2 - axis(W, COEFF)) * (1 - min(1, axis(W, COEFF_BIAS)))), 16)))
-    params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0,
+    params (arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or (ORDERED_ANY == 0 and G == 1 and each(W, form(W, INT8) == 1) and agree(W, form(W, S8_ENTRIES))) reference 0 for paired | single,
+        arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or (ORDERED_ANY == 0 and PARTED == 0 and each(W, N == 0 or form(W, INT8) == 1) and agree(W, form(W, S8_ENTRIES))) reference 0 for segmented,
+        arithmetic OPERAND in [0, 1] default 0,
         arithmetic SPLIT in [2, 1] default 2 for single,
         arithmetic GEMM_SPLIT in [1, 2, 4, 8] default least where (PARTED == 0 and GEMM_SPLIT == 1) or (PARTED == 1 and (GEMM_TILES * 4 * GEMM_SPLIT >= device.units or GEMM_SPLIT * 512 > K or GEMM_SPLIT == 8)) for segmented,
         TPW in [1, 2] default 1 for ordered,
         form STAGING in [0, 1] default 0 for single | segmented, form STAGING in [0] default 0 for paired,
-        arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ALL == 1 and KSPLIT == 1) or (ORDERED_ALL == 0 and KSPLIT != 1 and (4 * P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= 3 * device.units or KSPLIT == (8 - 4 * ORDERED_ANY))))
+        arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ALL == 1 and KSPLIT == 1) or (ORDERED_ALL == 0 and KSPLIT != 1 and (P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= device.units or KSPLIT == (8 - 4 * ORDERED_ANY))))
     where dense_bytes(A) == 2
     where (GEMM_SPLIT == 1 or (PARTED == 1 and K >= GEMM_SPLIT * 256)) for segmented
     where (ORDERED_ANY == 1 or KSPLIT != 1)
@@ -507,11 +518,11 @@ projection dense for cuda:
     scratch staged bytes (M * K * 2) when ORDERED_ANY == 1 and ORDERED_ALL == 0 and M > 1 for rms
     scratch staged bytes (M * K * 2) when ORDERED_ANY == 0 and PUBLISHED == 0 and (M > 1 or PLANES == 1) for rms
     scratch staged bytes (M * K * 2) when ORDERED_ANY == 0 and PUBLISHED == 0 for staged
-    scratch staged bytes (M * K * max(1 + OPERAND, 2 * OPERANDS)) when ORDERED_ANY == 0 and ((M > 1 and (OPERANDS == 1 or INT8 == 1)) or (M > 16 and OPERAND == 1)) for plain
-    scratch groups bytes (M * K / 4) when ORDERED_ANY == 0 and INT8 == 1 and M > 1 and PLANES == 0
-    scratch partials bytes (SPLIT * G * M * N * 4) when ORDERED_ANY == 0 and M > 16 and M <= 128 and SPLIT > 1 and PLANES == 0 for single
-    scratch partials bytes (M * (P * (1 - min(1, M / 17)) + GEMM_SPLIT * min(1, M / 17)) * sum(W, N) * 4) when ORDERED_ANY == 0 and PARTED == 1 and (M <= 16 or GEMM_SPLIT > 1) for segmented
-    scratch arrivals bytes (4) sync when ORDERED_ANY == 0 and M <= 16 and PARTED == 1 for segmented
+    scratch staged bytes (M * K * max(1 + OPERAND, 2 * OPERANDS)) when ORDERED_ANY == 0 and ((M > 1 and OPERANDS == 1) or (M > GEMV_ROWS and (INT8 == 1 or OPERAND == 1))) for plain
+    scratch groups bytes (M * K / 4) when ORDERED_ANY == 0 and INT8 == 1 and M > GEMV_ROWS and PLANES == 0
+    scratch partials bytes (SPLIT * G * M * N * 4) when ORDERED_ANY == 0 and M > GEMV_ROWS and M <= 128 and SPLIT > 1 and PLANES == 0 for single
+    scratch partials bytes (M * (P * (1 - min(1, M / (GEMV_ROWS + 1))) + GEMM_SPLIT * min(1, M / (GEMV_ROWS + 1))) * sum(W, N) * 4) when ORDERED_ANY == 0 and PARTED == 1 and (M <= GEMV_ROWS or GEMM_SPLIT > 1) for segmented
+    scratch arrivals bytes (4) sync when ORDERED_ANY == 0 and M <= GEMV_ROWS and PARTED == 1 for segmented
     launch ordered_stage for rms when ORDERED_ALL == 1 and M > VERIFY_ROWS:
         staging
         threadgroups (M, 1, 1)
@@ -545,23 +556,23 @@ projection dense for cuda:
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch stage for plain when ORDERED_ANY == 0 and ((M > 1 and (OPERANDS == 1 or INT8 == 1)) or (M > 16 and OPERAND == 1)):
+    launch stage for plain when ORDERED_ANY == 0 and ((M > 1 and OPERANDS == 1) or (M > GEMV_ROWS and (INT8 == 1 or OPERAND == 1))):
         reads (INT8, OPERAND)
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch gemv when ORDERED_ANY == 0 and M <= 8 and PLANES == 0:
-        params (RESIDENCY in [0, 1, 2] default 0 for paired | single)
+        params (RESIDENCY in [0, 1, 2] default greatest where RESIDENCY == 0 or (RESIDENCY == 2 and each(W, form(W, GEMV_RECORDS) == 0)) for paired | single)
         reads (INT8, STAGING)
         threadgroups (P * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)), 1, G)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, M - 1)) * (K / P) * SHARED_ROW_PAIR_BYTES / 2)
-    launch gemv16 when ORDERED_ANY == 0 and M > 8 and M <= 16 and PLANES == 0:
+    launch gemv16 when ORDERED_ANY == 0 and M > 8 and M <= GEMV_ROWS and PLANES == 0:
         reads (INT8, STAGING)
         alike (gemv)
         threadgroups (P * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)), 1, G)
         threads_per_threadgroup (256, 1, 1)
-    launch gemm_small when ORDERED_ANY == 0 and M > 16 and M <= 64 and PLANES == 0:
+    launch gemm_small when ORDERED_ANY == 0 and M > GEMV_ROWS and M <= 64 and PLANES == 0:
         reads (INT8, OPERAND)
         threadgroups (tiles(W, ceil_div(ceil_div(N, 16), 8)), 1, ZSPLIT * G)
         threads_per_threadgroup (256, 1, 1)
@@ -572,11 +583,11 @@ projection dense for cuda:
         threadgroups (tiles(W, ceil_div(ceil_div(N, 16), 8)), ceil_div(M, 128), ZSPLIT * G)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((2 - BLOCKS) * (2 * (128 * 144 + SERVED * 10240) + SERVED * 2048) + (BLOCKS - 1) * INT8_LAYOUT)
-    launch finalize for single when ORDERED_ANY == 0 and M > 16 and M <= 128 and SPLIT > 1 and PLANES == 0:
+    launch finalize for single when ORDERED_ANY == 0 and M > GEMV_ROWS and M <= 128 and SPLIT > 1 and PLANES == 0:
         reads (SPLIT)
         threadgroups (ceil_div(M * N, 256), 1, G)
         threads_per_threadgroup (256, 1, 1)
-    launch finalize for segmented when ORDERED_ANY == 0 and M > 16 and PARTED == 1 and GEMM_SPLIT > 1 and PLANES == 0:
+    launch finalize for segmented when ORDERED_ANY == 0 and M > GEMV_ROWS and PARTED == 1 and GEMM_SPLIT > 1 and PLANES == 0:
         reads (GEMM_SPLIT)
         threadgroups (ceil_div(M * sum(W, N), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -646,22 +657,22 @@ projection dense for vulkan:
     let TABLE_SUM = sum(W, form(W, TABLE))
     let TABLE_REGION = min(1, TABLE_SUM) * (8 * ceil_div(TABLE_SUM, 8) + 4)
     let GEMV_REGION = 8 * ceil_div(GEMV_SHARED, 8)
-    let GEMV_ROOM = max(FLOOR_SHARED_BYTES, GEMV_HEAD + TABLE_REGION + 16) - GEMV_HEAD - TABLE_REGION - 16
+    let GEMV_ROOM = max(device.shared_bytes_per_group, GEMV_HEAD + TABLE_REGION + 16) - GEMV_HEAD - TABLE_REGION - 16
     let GEMV_FIT = min(GEMV_STAGING, GEMV_PACKET * (GEMV_ROOM / GEMV_PACKET))
     let GEMV_FITS = min(1, TABLE_SUM) * min(1, GEMV_FIT / min(GEMV_STAGING, 8 * LANES * GEMV_PACKET))
     let GEMV_HELD = GEMV_FITS * (8 * ceil_div(GEMV_HEAD + GEMV_FIT, 8) + TABLE_REGION) + (1 - GEMV_FITS) * GEMV_REGION
     let GEMM_REGION = (TILE_M + TILE_N) * 80
-    let GEMM_HELD = GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMM_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let GEMM_HELD = GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMM_REGION + TABLE_REGION, 16) / (device.shared_bytes_per_group + 1)))
     let ORDERED_GEMV_REGION = 8448
-    let ORDERED_GEMV_HELD = ORDERED_GEMV_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(ORDERED_GEMV_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let ORDERED_GEMV_HELD = ORDERED_GEMV_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(ORDERED_GEMV_REGION + TABLE_REGION, 16) / (device.shared_bytes_per_group + 1)))
     let ORDERED_GEMM_REGION = 9216
-    let ORDERED_GEMM_HELD = ORDERED_GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(ORDERED_GEMM_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let ORDERED_GEMM_HELD = ORDERED_GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(ORDERED_GEMM_REGION + TABLE_REGION, 16) / (device.shared_bytes_per_group + 1)))
     let MIXED_GEMV1_REGION = 8 * ceil_div(max(2304, GEMV_SHARED), 8)
-    let MIXED_GEMV1_HELD = MIXED_GEMV1_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(MIXED_GEMV1_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let MIXED_GEMV1_HELD = MIXED_GEMV1_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(MIXED_GEMV1_REGION + TABLE_REGION, 16) / (device.shared_bytes_per_group + 1)))
     let MIXED_GEMV4_REGION = 8 * ceil_div(max(4352, GEMV_SHARED), 8)
-    let MIXED_GEMV4_HELD = MIXED_GEMV4_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(MIXED_GEMV4_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let MIXED_GEMV4_HELD = MIXED_GEMV4_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(MIXED_GEMV4_REGION + TABLE_REGION, 16) / (device.shared_bytes_per_group + 1)))
     let MIXED_GEMV8_REGION = 8 * ceil_div(max(8448, GEMV_SHARED), 8)
-    let MIXED_GEMV8_HELD = MIXED_GEMV8_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(MIXED_GEMV8_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let MIXED_GEMV8_HELD = MIXED_GEMV8_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(MIXED_GEMV8_REGION + TABLE_REGION, 16) / (device.shared_bytes_per_group + 1)))
     let SPLITS = 1 for paired | segmented
     let SPLITS = SPLIT for single
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default (16 - 8 * ORDERED_ANY), ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default (16 + 16 * ORDERED_ANY * (1 - ORDERED_ALL)),
@@ -675,9 +686,11 @@ projection dense for vulkan:
     where (ORDERED_ANY == 0 or SPLIT == 1) for single
     where (ORDERED_ALL == 0 or (ROWS == 1 and LANES == 16))
     where SUB_M <= TILE_M and SUB_N <= TILE_N
-    # Every workgroup holds whole 64-lane hardware subgroups: a GEMM tile of
-    # one sub-tile (32 x 64 of 32 x 64) would launch 32 invocations.
+    where SIMDGROUPS * 32 <= device.max_group_threads
+    # Every workgroup holds whole 64-lane hardware subgroups (Vulkan contract)
+    # and fits the device group limit.
     where TILE_M * TILE_N >= 2 * SUB_M * SUB_N
+    where TILE_M * TILE_N * 32 / (SUB_M * SUB_N) <= device.max_group_threads
     where (G == 1 or OPERANDS == 0)
     where each(W, form(W, DECODED) == 1)
     scratch partials bytes (SPLIT * G * M * N * 4) when ORDERED_ANY == 0 and M > VERIFY_ROWS and SPLIT > 1 for single
@@ -847,7 +860,7 @@ projection quantized for cpu:
     let FORM_WIDTH = most(W, (1 - EMITTED) * K) for tiled | rows
     let SHARED = sum(W, 1 - OWN) for tiled | rows
     let RECIPES = sum(W, (1 - OWN) * operands(W)) for tiled | rows
-    params (ROWS in [8, 16, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0 for tiled | rows)
+    params (ROWS in [8, 16, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default greatest where INT8 == 0 or any(W, form(W, INT8) == 1) reference 0 for tiled | rows)
     where (INT8 == 0 or any(W, form(W, INT8) == 1)) for tiled | rows
     where (ROWS < 16 or (INT8 == 1 and any(W, form(W, INT8_AMX) == 1))) for tiled | rows
     scratch quantized bytes (G * ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(K, Q8_VALUES) * Q8_BYTES) operand when (G * M == 1) formed (INT8 == 1) for tiled
@@ -899,8 +912,8 @@ native project_rows for metal from "metal/project_rows.metal":
     static (G, K, N, WS, WB)
     where WS <= 1
     project dense single (weight) groups G
-    scratch staged bytes (M * K * 2) when M > VERIFY_ROWS and operands(W) == 1
-    launch project_rows_stage before batch when M > VERIFY_ROWS and operands(W) == 1:
+    scratch staged bytes (M * K * 2) when (M > VERIFY_ROWS or M >= MATRIX_FROM) and operands(W) == 1
+    launch project_rows_stage before batch when (M > VERIFY_ROWS or M >= MATRIX_FROM) and operands(W) == 1:
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)

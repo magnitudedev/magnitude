@@ -730,6 +730,7 @@ impl PreparedTargetReadoutGraphs {
         geometry: &Decoder,
         limits: ResourceLimits,
     ) -> Result<Self, String> {
+        let _sizing = super::sizing::SizingScope::enter_with_device(Some(*device.properties()));
         let norm = target_readout_norm(load, geometry)?;
         let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
         let (regimes, qualified) = load_readout_regimes::<NativeGraphLayout>(device.backend(), load, geometry, norm, head, limits).map_err(error)?;

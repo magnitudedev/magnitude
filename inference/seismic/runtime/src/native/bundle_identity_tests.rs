@@ -25,17 +25,20 @@ use seismic_lang::registry::{self, BackendName, Layout};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-const VULKAN: VulkanFeatures = VulkanFeatures {
-    subgroup_lanes: 32,
-    float16: true,
-    matrix: true,
-    matrix_hardware: true,
-    wide_accumulators: true,
-    mixed_dot: true,
-    f32_atomic_add: true,
-    shared_int64_atomics: false,
-    maximal_reconvergence: false,
-};
+fn vulkan_features() -> VulkanFeatures {
+    VulkanFeatures {
+        subgroup_lanes: 32,
+        float16: true,
+        matrix: true,
+        matrix_hardware: true,
+        wide_accumulators: true,
+        mixed_dot: true,
+        f32_atomic_add: true,
+        shared_int64_atomics: false,
+        maximal_reconvergence: false,
+        device: seismic_lang::device::UniversalGpuProperties::floor(BackendName::Vulkan),
+    }
+}
 
 /// At most this many element bindings per entry.
 const BINDINGS_PER_ENTRY: usize = 24;
@@ -173,10 +176,10 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
     let dialects = [
         (
             BackendName::Metal,
-            Dialect::Metal(MetalFeatures { tensor_ops: true }),
+            Dialect::Metal(MetalFeatures::unopened(true)),
         ),
-        (BackendName::Cuda, Dialect::Cuda(CudaFeatures::UNOPENED)),
-        (BackendName::Vulkan, Dialect::Vulkan(VULKAN)),
+        (BackendName::Cuda, Dialect::Cuda(CudaFeatures::unopened())),
+        (BackendName::Vulkan, Dialect::Vulkan(vulkan_features())),
     ];
     let mut compared = 0;
     let mut native_entries = 0;
@@ -328,10 +331,10 @@ fn kernel_sources_render_their_named_constants_in_one_pass() {
     let dialects = [
         (
             BackendName::Metal,
-            Dialect::Metal(MetalFeatures { tensor_ops: true }),
+            Dialect::Metal(MetalFeatures::unopened(true)),
         ),
-        (BackendName::Cuda, Dialect::Cuda(CudaFeatures::UNOPENED)),
-        (BackendName::Vulkan, Dialect::Vulkan(VULKAN)),
+        (BackendName::Cuda, Dialect::Cuda(CudaFeatures::unopened())),
+        (BackendName::Vulkan, Dialect::Vulkan(vulkan_features())),
     ];
     // The constant block of every asset, either way, and what each took.
     let mut blocks = BTreeMap::new();

@@ -57,8 +57,10 @@ constexpr bool EXPAND_NVFP4 =
 #define DOWN_ENTRIES (projection::gemm_s8_entries<GROUPED_S8, packets::W2>())
 
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_GRIDS
+template <unsigned BM>
 __global__ void routed_experts_grids(SEISMIC_KERNEL_PARAMS) {
-    routed::expert_grids(SEISMIC_PTR(SEISMIC_BUFFER_ROWS), SEISMIC_PTR(SEISMIC_BUFFER_USED),
+    routed::expert_grids<BM>(
+                         SEISMIC_PTR(SEISMIC_BUFFER_ROWS), SEISMIC_PTR(SEISMIC_BUFFER_USED),
                          reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS)), SEISMIC_BLOCKS_STRIDE_0,
                          reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ORDER)), SEISMIC_ORDER_STRIDE_0,
                          SEISMIC_ORDER_STRIDE_1, SEISMIC_DIM_T, projection::gemm_columns(SEISMIC_DIM_F),
@@ -98,7 +100,7 @@ __device__ void routed_experts_stage_block(SEISMIC_KERNEL_PARAMS) {
     (reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ORDER)) + (block) * SEISMIC_ORDER_STRIDE_0)
 
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_EXPAND
-template <unsigned INT8, unsigned OPERAND>
+template <unsigned INT8, unsigned OPERAND, unsigned BM>
 __device__ void routed_experts_expand_block(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = GROUPED_S8;
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1>;
@@ -106,7 +108,7 @@ __device__ void routed_experts_expand_block(SEISMIC_KERNEL_PARAMS) {
     const uint2 tile = reinterpret_cast<const uint2 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_TILES))[blockIdx.z];
     const projection::u64 block = tile.x;
     const projection::u32 live = tile.y;
-    if ((projection::u64)blockIdx.y * routed::TILE_M >= live)
+    if ((projection::u64)blockIdx.y * BM >= live)
         return;
     const int expert = ROUTED_BLOCK_EXPERT(block);
     const int *order = ROUTED_BLOCK_ORDER(block);
@@ -129,7 +131,7 @@ __device__ void routed_experts_expand_block(SEISMIC_KERNEL_PARAMS) {
                                     STAGED ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0,
                                     SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS), SEISMIC_DIM_H),
         order, SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1, (projection::u32)SEISMIC_DIM_T);
-    routed::routed_gemm<S8, Operands>(
+    routed::routed_gemm<BM, S8, Operands>(
         reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_H, blockIdx.x, SEISMIC_DIM_F,
         PACKETS_MATRIX(KERNEL_W0, (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_GATE),
                                                     SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE)}
@@ -165,7 +167,7 @@ __device__ void routed_experts_quantize_block(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_DOWN
-template <unsigned INT8, unsigned OPERAND>
+template <unsigned INT8, unsigned OPERAND, unsigned BM>
 __device__ void routed_experts_down_block(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = GROUPED_S8;
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W2>;
@@ -173,7 +175,7 @@ __device__ void routed_experts_down_block(SEISMIC_KERNEL_PARAMS) {
     const uint2 tile = reinterpret_cast<const uint2 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_TILES))[blockIdx.z];
     const projection::u64 block = tile.x;
     const projection::u32 live = tile.y;
-    if ((projection::u64)blockIdx.y * routed::TILE_M >= live)
+    if ((projection::u64)blockIdx.y * BM >= live)
         return;
     const int expert = ROUTED_BLOCK_EXPERT(block);
     const int slot = EXPERT_SLOT(expert);
@@ -189,7 +191,7 @@ __device__ void routed_experts_down_block(SEISMIC_KERNEL_PARAMS) {
            : SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
         SEISMIC_DIM_F, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_GROUPS) + rows * (SEISMIC_DIM_F / 32) * 8,
         SEISMIC_DIM_F);
-    routed::routed_gemm<S8, Operands>(
+    routed::routed_gemm<BM, S8, Operands>(
         reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_F, blockIdx.x, SEISMIC_DIM_H,
         PACKETS_MATRIX(KERNEL_W2, (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_DOWN),
                                                     SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN)}

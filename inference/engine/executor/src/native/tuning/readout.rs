@@ -20,6 +20,30 @@ use magnitude_kernels::{
 };
 use seismic::{BuildError, Element, Tensor};
 
+/// Deterministic sparse constraint mask (~6.25% of vocabulary bits set per row,
+/// stride 16, offset by `row % 16`, with at least token 0 allowed for tiny
+/// vocabularies) so constrained rows exercise realistic grammar sparsity
+/// instead of a 100%-dense `u32::MAX` mask.
+fn sparse_constraint_mask(rows: u64, vocabulary: u64) -> Vec<u32> {
+    let words = vocabulary.div_ceil(32) as usize;
+    let mut mask = vec![0u32; rows as usize * words];
+    for row in 0..rows as usize {
+        let base = row * words;
+        let offset = row % 16;
+        let mut set = false;
+        let mut token = offset as u64;
+        while token < vocabulary {
+            mask[base + (token / 32) as usize] |= 1u32 << (token % 32);
+            set = true;
+            token += 16;
+        }
+        if !set && words > 0 {
+            mask[base] |= 1u32;
+        }
+    }
+    mask
+}
+
 /// Candidate tokens of a `readout_selected_rows` tuning point.
 const SELECTED_TOKENS: u64 = 256;
 
@@ -574,7 +598,7 @@ impl EntryTuning for ShapeRowsTuning {
             logits: inputs.state(logits(inputs, rows, vocabulary, 1)?, 0..rows)?,
             // Every other row constrained: both the masked and the free
             // path are measured.
-            mask: inputs.u32s(&[rows, words], &vec![u32::MAX; (rows * words) as usize])?,
+            mask: inputs.u32s(&[rows, words], &sparse_constraint_mask(rows, vocabulary))?,
             constrained: inputs.i32s(
                 &[rows],
                 &(0..rows).map(|row| (row % 2) as i32).collect::<Vec<_>>(),
@@ -650,7 +674,7 @@ impl EntryTuning for SampleRowsTuning {
         let result = inputs.scratch(Element::i32(), &[rows, 2])?;
         Ok(vec![SampleRowsCase {
             logits: logits(inputs, rows, self.vocabulary, 2)?,
-            mask: inputs.u32s(&[rows, words], &vec![u32::MAX; (rows * words) as usize])?,
+            mask: inputs.u32s(&[rows, words], &sparse_constraint_mask(rows, self.vocabulary))?,
             // Every other row constrained: both the masked and the free
             // path are measured.
             constrained: inputs.i32s(

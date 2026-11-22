@@ -1599,10 +1599,12 @@ fn check_native(
             .iter_mut()
             .chain(declaration.launches.iter_mut().flat_map(|launch| &mut launch.params))
         {
-            match &mut param.default {
-                ast::NativeDefaultDecl::Value(expr)
-                | ast::NativeDefaultDecl::Least(expr)
-                | ast::NativeDefaultDecl::Greatest(expr) => expand(expr),
+            for decl in std::iter::once(&mut param.default).chain(param.reference.iter_mut()) {
+                match decl {
+                    ast::NativeDefaultDecl::Value(expr)
+                    | ast::NativeDefaultDecl::Least(expr)
+                    | ast::NativeDefaultDecl::Greatest(expr) => expand(expr),
+                }
             }
         }
         for scratch in &mut declaration.scratch {
@@ -1653,18 +1655,20 @@ fn check_native(
         &folded
     };
 
-    // Every default reads only the device, the static dimensions, the
-    // bound elements, and earlier already-declared parameters in scope (plus
-    // the parameter itself for `least`/`greatest`); a default that reads no
-    // dimension and no element is checked here on every device of the backend.
-    let lowered_default = |param: &ast::NativeParamDecl,
-                           values: &[u64],
-                           prior_params: &[(&str, &[u64])],
-                           errors: &mut Vec<(Span, String)>|
+    // Every default (and optional reference on an `arithmetic` parameter) reads
+    // only the device, the static dimensions, the bound elements, and earlier
+    // already-declared parameters in scope (plus the parameter itself for
+    // `least`/`greatest`); one that reads no dimension and no element is
+    // checked here on every device of the backend.
+    let lowered_choice = |kind: &str,
+                          decl: &ast::NativeDefaultDecl,
+                          name: &str,
+                          values: &[u64],
+                          prior_params: &[(&str, &[u64])],
+                          errors: &mut Vec<(Span, String)>|
      -> Option<crate::checked::NativeDefault> {
-        let name = &param.name.name;
         let prior_names: Vec<String> = prior_params.iter().map(|(n, _)| (*n).to_owned()).collect();
-        let (expr, lowered) = match &param.default {
+        let (expr, lowered) = match decl {
             ast::NativeDefaultDecl::Value(expr) => (
                 expr,
                 native_nat_expr(expr, &entry.dimensions, &prior_names, native_reads)
@@ -1672,13 +1676,13 @@ fn check_native(
                     .map_err(|message| (expr.span, message)),
             ),
             ast::NativeDefaultDecl::Least(expr) | ast::NativeDefaultDecl::Greatest(expr) => {
-                let least = matches!(param.default, ast::NativeDefaultDecl::Least(_));
+                let least = matches!(decl, ast::NativeDefaultDecl::Least(_));
                 let mut allowed = prior_names;
-                allowed.push(name.clone());
+                allowed.push(name.to_owned());
                 (
                     expr,
                     native_condition(
-                        "default",
+                        kind,
                         expr,
                         &entry.dimensions,
                         &allowed,
@@ -1691,9 +1695,9 @@ fn check_native(
                 )
             }
         };
-        let default = lowered.map_err(|error| errors.push(error)).ok()?;
+        let choice = lowered.map_err(|error| errors.push(error)).ok()?;
         let mut dimensions = Vec::new();
-        let element = match &default {
+        let element = match &choice {
             crate::checked::NativeDefault::Value(value) => {
                 value.dimensions(&mut dimensions);
                 value.element_read().is_some()
@@ -1705,16 +1709,37 @@ fn check_native(
             }
         };
         if let Some(dynamic) = dimensions.iter().find(|dimension| !statics.contains(dimension)) {
-            errors.push((expr.span, format!("the default of `{name}` reads dimension `{dynamic}`, which is not static; a default reads only the device, the static dimensions and the bound elements")));
+            errors.push((expr.span, format!("the {kind} of `{name}` reads dimension `{dynamic}`, which is not static; a {kind} reads only the device, the static dimensions and the bound elements")));
             return None;
         }
         if dimensions.is_empty() && !element {
-            if let Err(error) = default.on_every_device(name, values, backend, prior_params) {
+            if let Err(error) = choice.on_every_device(name, values, backend, prior_params) {
                 errors.push((expr.span, error.to_string()));
                 return None;
             }
         }
-        Some(default)
+        Some(choice)
+    };
+    let lowered_reference = |param: &ast::NativeParamDecl,
+                             values: &[u64],
+                             prior_params: &[(&str, &[u64])],
+                             errors: &mut Vec<(Span, String)>|
+     -> Option<Option<crate::checked::NativeDefault>> {
+        let Some(ref_decl) = &param.reference else {
+            return Some(None);
+        };
+        if !param.arithmetic {
+            errors.push((
+                param.span,
+                format!(
+                    "`{}` states a `reference`, which is only permitted on `arithmetic` parameters",
+                    param.name.name
+                ),
+            ));
+            return None;
+        }
+        lowered_choice("reference", ref_decl, &param.name.name, values, prior_params, errors)
+            .map(Some)
     };
     let mut params = Vec::with_capacity(declared.len());
     for (name, values) in declared {
@@ -1727,7 +1752,10 @@ fn check_native(
             .iter()
             .map(|p: &NativeParameter| (p.name.as_str(), p.values.as_slice()))
             .collect();
-        let Some(default) = lowered_default(param, &values, &prior, &mut errors) else {
+        let Some(default) = lowered_choice("default", &param.default, &name, &values, &prior, &mut errors) else {
+            continue;
+        };
+        let Some(reference) = lowered_reference(param, &values, &prior, &mut errors) else {
             continue;
         };
         params.push(NativeParameter {
@@ -1739,6 +1767,7 @@ fn check_native(
             form: param.form,
             values,
             default,
+            reference,
             role: crate::checked::NativeParameterRole::Declared,
         });
     }
@@ -2025,7 +2054,10 @@ fn check_native(
                 .chain(&launch_params)
                 .map(|p| (p.name.as_str(), p.values.as_slice()))
                 .collect();
-            let Some(default) = lowered_default(param, &values, &prior, &mut errors) else {
+            let Some(default) = lowered_choice("default", &param.default, name, &values, &prior, &mut errors) else {
+                continue;
+            };
+            let Some(reference) = lowered_reference(param, &values, &prior, &mut errors) else {
                 continue;
             };
             launch_params.push(NativeParameter {
@@ -2037,6 +2069,7 @@ fn check_native(
                 form: param.form,
                 values,
                 default,
+                reference,
                 role: crate::checked::NativeParameterRole::Declared,
             });
         }

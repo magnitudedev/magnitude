@@ -129,7 +129,7 @@ __global__ void routed_combine_stage(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_COMBINE_EXPAND
-template <unsigned INT8, unsigned OPERAND>
+template <unsigned INT8, unsigned OPERAND, unsigned BM>
 __global__ void routed_combine_expand(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = GROUPED_S8;
     constexpr bool STAGED = S8 || OPERAND == 1;
@@ -162,7 +162,7 @@ __global__ void routed_combine_quantize(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_COMBINE_DOWN
-template <unsigned INT8, unsigned OPERAND>
+template <unsigned INT8, unsigned OPERAND, unsigned BM>
 __global__ void routed_combine_down(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = GROUPED_S8;
     using Operands = typename projection::GemmOperands<OPERAND>::type;

@@ -230,22 +230,48 @@ impl<'a> Declared<'a> {
         })
     }
 
-    /// What `row` rows can run: each launch, then each scratch buffer, by
-    /// whether its condition can hold there. The parameters a range's
-    /// search has to choose follow from it: those its launches read.
+    /// Canonical launch ordinal for `ordinal`: when `launch` is `alike(target)`
+    /// and both launches declare identical parameter sets (same names and value
+    /// domains, independent of order), collapse to `target` so `alike`
+    /// row-bound variants (such as Vulkan `gemv1..8` / `choice..8` and Metal
+    /// `gemv_pair` / `gemv_rows`) share one tuning unit rather than splitting
+    /// per row count.
+    fn canonical_launch(&self, ordinal: usize) -> usize {
+        let launch = &self.implementation.launches[ordinal];
+        let Some(target) = launch.alike else {
+            return ordinal;
+        };
+        let other = &self.implementation.launches[target];
+        let same_params = launch.params.len() == other.params.len()
+            && launch.params.iter().zip(&other.params).all(|(a, b)| {
+                if a.name != b.name || a.values.len() != b.values.len() {
+                    return false;
+                }
+                let mut av = a.values.clone();
+                let mut bv = b.values.clone();
+                av.sort_unstable();
+                bv.sort_unstable();
+                av == bv
+            });
+        if same_params { target } else { ordinal }
+    }
+
+    /// What `row` rows can run: each canonical launch, then each scratch
+    /// buffer, by whether its condition can hold there. The parameters a
+    /// range's search has to choose follow from it: those its launches read.
     fn reach(&self, row: u64) -> Vec<bool> {
-        let launches = self
-            .implementation
-            .launches
-            .iter()
-            .enumerate()
-            .map(|(ordinal, launch)| self.can_hold(launch.when.as_ref(), Some(ordinal), row));
+        let mut launches = vec![false; self.implementation.launches.len()];
+        for (ordinal, launch) in self.implementation.launches.iter().enumerate() {
+            if self.can_hold(launch.when.as_ref(), Some(ordinal), row) {
+                launches[self.canonical_launch(ordinal)] = true;
+            }
+        }
         let scratch = self
             .implementation
             .scratch
             .iter()
             .map(|scratch| self.can_hold(scratch.when.as_ref(), None, row));
-        launches.chain(scratch).collect()
+        launches.into_iter().chain(scratch).collect()
     }
 
     /// The tuning parameters launch `launch`'s grid axis `axis` reads, with

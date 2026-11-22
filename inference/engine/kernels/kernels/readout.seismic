@@ -85,8 +85,8 @@ native readout_head_rows for metal from "metal/readout_head_rows.metal":
     static (V, D, PT, NM, WS)
     where WS <= 1
     project dense single (weight)
-    scratch normalized bytes (O * D * 2) when O > VERIFY_ROWS or MATRIX > 0
-    launch readout_head_rows_stage before batch when O > VERIFY_ROWS or MATRIX > 0:
+    scratch normalized bytes (O * D * 2) when O > VERIFY_ROWS or O >= MATRIX_FROM
+    launch readout_head_rows_stage before batch when O > VERIFY_ROWS or O >= MATRIX_FROM:
         staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -104,7 +104,7 @@ native readout_head_rows for cuda from "cuda/readout_head_rows.cu":
 # vocabulary GEMV grid must stay within the 65535-group floor.
 native readout_head_rows for vulkan from "vulkan/readout_head_rows.comp":
     static (V, D, PT, NM, WS)
-    where ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES) <= 65535 and WS <= 1
+    where ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES) <= device.max_grid_x and WS <= 1
     project dense single (weight) rows rms
 
 # CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). The
@@ -476,7 +476,7 @@ native readout_refine_rows for metal from "metal/readout_refine_rows.metal":
         params (SIMDGROUPS in [8, 4, 16] default 8)
         threadgroups (ceil_div(V, SIMDGROUPS * 32), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(O * D * 2, 16384))
+        shared_bytes (min(O * D * 2, device.shared_bytes_per_group / 2))
 
 # Metal, O <= VERIFY_ROWS: as `readout_refine_rows`, over every plane of the survivors.
 native readout_exact_rows for metal from "metal/readout_exact_rows.metal":
@@ -485,7 +485,7 @@ native readout_exact_rows for metal from "metal/readout_exact_rows.metal":
         params (SIMDGROUPS in [8, 4, 16] default 8)
         threadgroups (ceil_div(V, SIMDGROUPS * 32), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(O * D * 2, 16384))
+        shared_bytes (min(O * D * 2, device.shared_bytes_per_group / 2))
 
 # Metal: the `dense` projection (`dense.seismic`), single, over the packets
 # of the exact view: at the GEMV's rows the exact view's recipe, which the
@@ -530,7 +530,7 @@ native readout_refine_rows for cuda from "cuda/readout_refine_rows.cu":
         params (WARPS in [8, 4, 2] default 8)
         threadgroups (ceil_div(V, WARPS * 32), 1, 1)
         threads_per_threadgroup (WARPS * 32, 1, 1)
-        shared_bytes (min(O * D * 2, 16384))
+        shared_bytes (min(O * D * 2, device.shared_bytes_per_group / 2))
 
 native readout_exact_rows for cuda from "cuda/readout_exact_rows.cu":
     static (V, D, P)
@@ -538,7 +538,7 @@ native readout_exact_rows for cuda from "cuda/readout_exact_rows.cu":
         params (WARPS in [8, 4, 2] default 8)
         threadgroups (ceil_div(V, WARPS * 32), 1, 1)
         threads_per_threadgroup (WARPS * 32, 1, 1)
-        shared_bytes (min(O * D * 2, 16384))
+        shared_bytes (min(O * D * 2, device.shared_bytes_per_group / 2))
 
 # CUDA: the `dense` projection's `planes` form (`dense.seismic`), single,
 # onto the exact codes, by the routine the exact level's gather shares.

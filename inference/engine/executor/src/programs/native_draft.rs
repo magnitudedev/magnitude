@@ -3725,6 +3725,9 @@ impl PreparedDraftGraphs {
         geometry: &DraftGeometry<'_>,
         classes: impl IntoIterator<Item = DraftGraphClass>,
     ) -> Result<Self, SubmitError> {
+        let _sizing = super::graph::sizing::SizingScope::enter_with_device(Some(
+            *target_device.properties(),
+        ));
         let classes = classes.into_iter().collect::<Vec<_>>();
         let split = DraftSplit::of(target_device.backend(), load, plan, geometry)
             .map_err(|error| invalid(error.to_string()))?;

@@ -581,8 +581,9 @@ pub struct NativeRepeatDecl {
     pub span: Span,
 }
 
-/// One tuning parameter, its finite domain and its default:
-/// `[arithmetic] [form] NAME in [V, ..] default DEFAULT`.
+/// One tuning parameter, its finite domain, its default, and optional
+/// reference oracle value (permitted only on `arithmetic` parameters):
+/// `[arithmetic] [form] NAME in [V, ..] default DEFAULT [reference DEFAULT]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeParamDecl {
     pub name: Ident,
@@ -592,6 +593,9 @@ pub struct NativeParamDecl {
     pub form: bool,
     pub values: Vec<u64>,
     pub default: NativeDefaultDecl,
+    /// Optional numerical-validation oracle value; when `None`, `default` is
+    /// also the validation reference.
+    pub reference: Option<NativeDefaultDecl>,
     pub span: Span,
 }
 

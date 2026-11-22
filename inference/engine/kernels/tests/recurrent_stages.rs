@@ -2526,7 +2526,7 @@ fn gemv_mappings(
     specialization
         .with_param("LANES", mapping.lanes)
         .with_param("TILED", 0)
-        .with_param("MATRIX", 0)
+        .with_param("MATRIX_FROM", 9)
         .with_launch_param(launch("batch"), "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
         .with_launch_param(launch("batch"), "BATCH_ROWS", mapping.batch_rows)
         .with_launch_param(launch("batch"), "BATCH_PARTS", 2)

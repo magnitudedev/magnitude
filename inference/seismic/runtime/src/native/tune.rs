@@ -604,6 +604,12 @@ pub enum TuningDisposition {
     CanonicalFallback {
         artifact: String,
     },
+    /// The declaration's numerical validation reference oracle is served when a
+    /// distinct hardware-optimal default failed numerical admission under the
+    /// caller's policy (e.g., F16 activations or strict alpha).
+    ReferenceFallback {
+        artifact: String,
+    },
 }
 
 /// The complete, serializable outcome of tuning one implementation.
@@ -1493,7 +1499,9 @@ impl Grounding<'_> {
         }
     }
 
-    /// Form the canonical program, to the end.
+    /// Form the canonical default program, to the end. Any distinct
+    /// numerical validation reference is formed lazily only if this unit
+    /// enters discovery and its served shapes exercise different work.
     pub fn run(self) -> Grounded {
         let began = Instant::now();
         let kernel = NativePrepared::prepare_implementation(
@@ -2646,9 +2654,16 @@ fn place<'a>(
             .collect::<Result<Vec<_>, _>>()?;
         for (point, timing) in points.iter().zip(&mut timings) {
             if !qualify {
-                point.price_before(timing, deadline)?;
-                // The defaults' first run is retained as the reference here.
-                point.retain_default(timing, deadline)?;
+                if point.is_reference(timing.prepared()) {
+                    point.price_before(timing, deadline)?;
+                    // The reference's first run is retained as the reference here.
+                    point.retain_default(timing, deadline)?;
+                } else {
+                    // Default differs from the validation reference: validate
+                    // default against the reference oracle on its first pass.
+                    let kernel = timing.prepared().clone();
+                    point.admit_before(Some(timing), &kernel, &keyed, deadline)?;
+                }
                 continue;
             }
             let kernel = timing.prepared().clone();
@@ -3437,11 +3452,60 @@ pub struct UnitRequest<'r, 'm> {
     pub validation: NumericalRequirement,
 }
 
-/// The defaults formed, and the validator of every point against the
-/// reference.
+/// The defaults formed, the numerical validation reference (identical to
+/// `kernel` unless an `arithmetic` parameter declares a distinct `reference`
+/// whose work differs on this unit's served shapes, in which case it is
+/// prepared lazily on first discovery), and the validator of every point
+/// against that reference.
 struct Ground {
     kernel: Arc<NativePrepared>,
+    reference: Option<Arc<NativePrepared>>,
     validator: Validator,
+}
+
+/// Whether `default` and `reference` activate the exact same launches with
+/// the exact same read parameter values on every served shape of the unit.
+fn same_work_on_served(
+    implementation: &NativeImplementation,
+    default: &NativeSpecialization,
+    reference: &NativeSpecialization,
+    served: &[BTreeMap<String, u64>],
+) -> bool {
+    if default == reference {
+        return true;
+    }
+    if served.is_empty() {
+        return false;
+    }
+    let keying = Keying::of(implementation);
+    served.iter().all(|shape| {
+        let active = |spec: &NativeSpecialization| -> Option<Vec<usize>> {
+            let mut launches = Vec::new();
+            for (ordinal, launch) in implementation.launches.iter().enumerate() {
+                let holds = match &launch.when {
+                    None => true,
+                    Some(condition) => condition
+                        .holds(
+                            &|name| shape.get(name).copied().or_else(|| spec.static_value(name)),
+                            &|name| spec.launch_param(ordinal, name).or_else(|| spec.param(name)),
+                        )
+                        .ok()?,
+                };
+                if holds {
+                    launches.push(ordinal);
+                }
+            }
+            Some(launches)
+        };
+        let (Some(def_launches), Some(ref_launches)) = (active(default), active(reference)) else {
+            return false;
+        };
+        if def_launches != ref_launches {
+            return false;
+        }
+        keying.key(implementation, def_launches, default)
+            == keying.key(implementation, ref_launches, reference)
+    })
 }
 
 /// A point discovered: built, and the defaults measured there.
@@ -3668,6 +3732,10 @@ pub struct UnitSearch<'m, 'a> {
     logical: Arc<LogicalEntry>,
     mutable: Vec<(usize, String)>,
     default: NativeSpecialization,
+    reference: NativeSpecialization,
+    /// True once `discover_point` fell back from a distinct hardware-optimal
+    /// default to `reference` after `Exclusion::Validation`.
+    fell_back_to_reference: bool,
     unit: Unit,
     /// The unit's points and their per-point observed classes, once a step
     /// was given their source.
@@ -3765,6 +3833,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let default = implementation
             .default_specialization(&statics)
             .map_err(|error| TuneError::Declaration(error.to_string()))?;
+        let reference = implementation
+            .reference_specialization(&statics)
+            .map_err(|error| TuneError::Declaration(error.to_string()))?;
         let launch_scoped = implementation.launch_scoped();
         let clock = shared_clock(device);
         Ok(Self {
@@ -3788,6 +3859,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             logical,
             mutable,
             default,
+            reference,
+            fell_back_to_reference: false,
             points: Vec::new(),
             served: Vec::new(),
             programs: Programs::of(launch_scoped),
@@ -3882,6 +3955,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// serving: the end of the unit's mandatory work.
     pub fn grounded(&mut self, grounded: Grounded) -> Result<(), TuneError> {
         let kernel = grounded.kernel?;
+        let identical_reference = same_work_on_served(
+            self.implementation.implementation(),
+            &self.default,
+            &self.reference,
+            &self.served,
+        );
         let validator = Validator::new(
             &self.logical,
             &self.mutable,
@@ -3911,7 +3990,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         );
         let slots = self.points.iter().map(|_| None).collect();
         self.progress = Progress::Grounded {
-            ground: Ground { kernel, validator },
+            ground: Ground {
+                reference: identical_reference.then(|| kernel.clone()),
+                kernel,
+                validator,
+            },
             expired: false,
             phase: SearchPhase::Discovering {
                 plan,
@@ -4715,6 +4798,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 implementation,
                 logical,
                 default,
+                reference,
+                fell_back_to_reference,
                 points,
                 served,
                 programs,
@@ -4737,6 +4822,28 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     surveyor,
                     slots,
                 } => {
+                    if ground.reference.is_none() {
+                        let forming_ref = Instant::now();
+                        let ref_kernel = NativePrepared::prepare_implementation(
+                            charges.device(),
+                            module,
+                            *entry,
+                            logical,
+                            bindings.clone(),
+                            reference.clone(),
+                            *cpu,
+                            implementation.implementation().clone(),
+                        )
+                        .map_err(|error| {
+                            TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error)))
+                        })
+                        .and_then(|ref_kernel| {
+                            serving(ref_kernel, served).map_err(TuneError::DefaultUnusable)
+                        })?;
+                        time.forming_seconds += forming_ref.elapsed().as_secs_f64();
+                        ground.validator.set_reference(&ref_kernel);
+                        ground.reference = Some(ref_kernel);
+                    }
                     let restored_footprint = ProcessMemory::footprint_now();
                     host = host.max(restored_footprint);
                     resident = held_with(charges, Some(ground));
@@ -4749,6 +4856,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                         implementation,
                         logical,
                         default,
+                        reference,
+                        fell_back_to_reference,
+                        programs,
                         points,
                         ground,
                         plan,
@@ -4965,6 +5075,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 return Ok(self.unit.census(
                     point_records(&self.points),
                     &self.default,
+                    self.fell_back_to_reference,
                     ground,
                     slots
                         .iter()
@@ -5006,13 +5117,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             time,
             ground.kernel.launch_programs(),
         );
-        // The native default is the reference: serving it qualifies nothing.
+        // The native default (or reference fallback) qualifies nothing.
         let default = &ground.kernel.artifact().0;
         let promoted = incumbent.artifact != *default;
         if !promoted {
-            result.disposition = TuningDisposition::CanonicalFallback {
-                artifact: default.clone(),
-            };
+            result.disposition = fallback_disposition(self.fell_back_to_reference, default.clone());
         }
         result.coverage = (promoted || ledger.failed > 0).then(|| CoverageCheck {
             outcome: if promoted {
@@ -5254,11 +5363,14 @@ fn restore_points<'a>(
 #[allow(clippy::too_many_arguments)]
 fn discover_point<'a>(
     charges: &Charges,
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
     logical: &LogicalEntry,
-    default: &NativeSpecialization,
+    default: &mut NativeSpecialization,
+    reference: &NativeSpecialization,
+    fell_back_to_reference: &mut bool,
+    programs: &mut Programs,
     points: &mut [PointState],
-    ground: &Ground,
+    ground: &mut Ground,
     plan: &UnitPlan,
     surveyor: &mut PointSurveyor,
     slots: &mut [Option<Timed<'a>>],
@@ -5340,6 +5452,55 @@ fn discover_point<'a>(
             point.release();
             source.release(index);
             return Ok(None);
+        }
+        Err(WorkError::Failed(Exclusion::Validation { .. })) if *default != *reference => {
+            // Hardware-optimal default failed numerical admission under this
+            // caller's policy (e.g., F16 activations or strict alpha): fall
+            // back cleanly to the validation reference oracle as the baseline.
+            let ref_kernel = ground
+                .reference
+                .as_ref()
+                .expect("reference prepared before discovery")
+                .clone();
+            ref_kernel
+                .hand_off()
+                .map_err(|error| TuneError::Handoff(error.to_string()))?;
+            ground.kernel = ref_kernel;
+            *default = reference.clone();
+            *fell_back_to_reference = true;
+            programs.grounded(implementation, default, &ground.kernel);
+            match surveyor.measure(
+                implementation,
+                &ground.kernel,
+                std::slice::from_ref(&point),
+                default,
+                &options,
+                &plan.settings,
+                None,
+                deadline,
+            ) {
+                Ok(mut defaults) => defaults.remove(0),
+                Err(WorkError::Expired) => {
+                    point.release();
+                    source.release(index);
+                    return Err(WorkError::Expired);
+                }
+                Err(WorkError::Failed(Exclusion::Refused {
+                    required,
+                    available,
+                })) => {
+                    let taken = before.saturating_sub(available);
+                    points[index]
+                        .resident_bytes
+                        .observe(taken.saturating_add(required) as f64);
+                    point.release();
+                    source.release(index);
+                    return Ok(None);
+                }
+                Err(WorkError::Failed(exclusion)) => {
+                    return Err(TuneError::DefaultUnusable(exclusion).into());
+                }
+            }
         }
         Err(WorkError::Failed(exclusion)) => {
             return Err(TuneError::DefaultUnusable(exclusion).into());
@@ -5746,7 +5907,7 @@ fn promote_leader<'a>(
         indices: untimed,
         validator: &ground.validator,
         covered,
-        default: &ground.kernel.artifact().0,
+        default: &ground.reference.as_ref().unwrap_or(&ground.kernel).artifact().0,
         key: &key,
         building_seconds: 0.,
         validating_seconds: 0.,
@@ -5830,6 +5991,7 @@ impl Unit {
         &self,
         records: Vec<PointRecord>,
         default: &NativeSpecialization,
+        fell_back_to_reference: bool,
         ground: &Ground,
         defaults: Vec<PointMeasurement>,
         time: TuningTime,
@@ -5865,10 +6027,17 @@ impl Unit {
             time,
             launches,
         );
-        result.disposition = TuningDisposition::CanonicalFallback {
-            artifact: kernel.artifact().0.clone(),
-        };
+        result.disposition =
+            fallback_disposition(fell_back_to_reference, kernel.artifact().0.clone());
         result
+    }
+}
+
+fn fallback_disposition(fell_back_to_reference: bool, artifact: String) -> TuningDisposition {
+    if fell_back_to_reference {
+        TuningDisposition::ReferenceFallback { artifact }
+    } else {
+        TuningDisposition::CanonicalFallback { artifact }
     }
 }
 
@@ -7790,9 +7959,9 @@ pub fn kernel_digest(
             digest.update(kernels.digest.as_bytes());
             None
         }
-        BackendName::Metal => Some(super::abi::Dialect::Metal(super::abi::MetalFeatures {
-            tensor_ops: metal_tensor_ops,
-        })),
+        BackendName::Metal => Some(super::abi::Dialect::Metal(
+            super::abi::MetalFeatures::unopened(metal_tensor_ops),
+        )),
         BackendName::Cuda => {
             // NVRTC is loaded from a directory of its own and can change
             // without the driver: its release and this build's options
@@ -7801,7 +7970,7 @@ pub fn kernel_digest(
                 .map_err(|error| declaration(format!("NVRTC is unavailable: {error}")))?;
             digest.update(format!("nvrtc {major}.{minor};").as_bytes());
             digest.update(seismic_cuda::nvrtc::COMPILE_OPTIONS.join(" ").as_bytes());
-            Some(super::abi::Dialect::Cuda(super::abi::CudaFeatures::UNOPENED))
+            Some(super::abi::Dialect::Cuda(super::abi::CudaFeatures::unopened()))
         }
         // The lane count is a value the prefix states, not a feature: any
         // one renders the same source otherwise.
@@ -7819,6 +7988,9 @@ pub fn kernel_digest(
                     f32_atomic_add: false,
                     shared_int64_atomics: false,
                     maximal_reconvergence: false,
+                    device: seismic_lang::device::UniversalGpuProperties::floor(
+                        BackendName::Vulkan,
+                    ),
                 },
             ))
         }
@@ -9867,7 +10039,19 @@ mod tests {
             .with_static("F", 4096)
             .with_static("DS", 0)
             .with_static("DB", 0);
-        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
+        let implementation = implementation
+            .at_device(&seismic_lang::device::BackendFloor(implementation.backend));
+        assert_eq!(
+            implementation
+                .default_specialization(&statics)
+                .unwrap()
+                .param("PACK"),
+            Some(1),
+            "Metal dense_output defaults to PACK = 1 when tensor_ops == 0"
+        );
+        // Start from the reference specialization (PACK = 0) so GroupSearch's
+        // first structural piece reaches the packing form (PACK = 1).
+        let seed = implementation.reference_specialization(&statics).unwrap();
         let rows = [1u64, 8, 128];
         let shapes = rows
             .iter()
@@ -9876,8 +10060,6 @@ mod tests {
                 dimensions: BTreeMap::from([("M".into(), *rows), ("O".into(), *rows)]),
             })
             .collect::<Vec<_>>();
-        let implementation = implementation
-            .at_device(&seismic_lang::device::BackendFloor(implementation.backend));
         let partition = Rc::new(plan::partition(&implementation, &statics, &shapes).unwrap());
         // The launches a configuration runs at a point, and a time there
         // that only the packing form improves, at prefill rows.
@@ -9941,10 +10123,10 @@ mod tests {
             panic!("the first piece is whole configurations");
         };
         assert!(run.structural, "the first piece is the other forms'");
-        // Forms: TALL, INT8, PACK, RESIDUE, MATRIX, SMALL, STAGE, and TILED
-        // (two non-default values), each at its other values that the
-        // declaration's restrictions admit.
-        assert!(first.len() <= 9, "{}", first.len());
+        // Forms: TALL, INT8, PACK, RESIDUE, MATRIX_FROM (three non-default
+        // values), SMALL, STAGE, and TILED (two non-default values), each at
+        // its other values that the declaration's restrictions admit.
+        assert!(first.len() <= 10, "{}", first.len());
         let packing = first
             .iter()
             .find(|form| form.param("PACK") == Some(1))
@@ -9952,7 +10134,7 @@ mod tests {
         // Each differs from the defaults in its form, and in what that
         // form's restrictions couple to it alone.
         assert!(first.iter().all(|form| {
-            ["TALL", "INT8", "PACK", "RESIDUE", "MATRIX", "SMALL", "STAGE", "TILED"]
+            ["TALL", "INT8", "PACK", "RESIDUE", "MATRIX_FROM", "SMALL", "STAGE", "TILED"]
                 .iter()
                 .filter(|name| form.param(name) != seed.param(name))
                 .count()

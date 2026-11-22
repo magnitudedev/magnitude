@@ -681,7 +681,7 @@ __device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, flo
 #define PROJECTION_GEMV(NB, KSPLIT, STAGING, GRID, RESIDENCY)                                                      \
     do {                                                                                                           \
         const unsigned group_ = PROJECTION_GROUP(blockIdx.z);                                                      \
-        projection::op::gemv<NB, KSPLIT, STAGING, GRID, RESIDENCY, PROJECTION_K, PROJECTION_S8>(                   \
+        projection::op::gemv<NB, KSPLIT, STAGING, GRID, RESIDENCY, PROJECTION_K, false>(                           \
             PROJECTION_ROWS(group_), PROJECTION_STAGING, PROJECTION_GROUPS, (unsigned)PROJECTION_M, PROJECTION_N,  \
             PROJECTION_WEIGHTS(group_), PROJECTION_EPILOGUE(group_));                                              \
     } while (0)
@@ -724,7 +724,7 @@ __device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, flo
 // A segmented projection's launches (`PROJECTION_SEGMENTS`: its `Segments`;
 // `PROJECTION_ZERO`: nonzero where segments 0 and 1 are zeros for the call).
 #define PROJECTION_SEGMENTED_GEMV(NB, KSPLIT, STAGING)                                                             \
-    projection::op::gemv_segmented<NB, KSPLIT, STAGING, PROJECTION_K, PROJECTION_S8, PROJECTION_WEIGHT_TYPES>(     \
+    projection::op::gemv_segmented<NB, KSPLIT, STAGING, PROJECTION_K, false, PROJECTION_WEIGHT_TYPES>(             \
         PROJECTION_ROWS(0u), PROJECTION_STAGING, PROJECTION_GROUPS, (unsigned)PROJECTION_M, PROJECTION_SEGMENTS,   \
         (unsigned)PROJECTION_ZERO)
 #define PROJECTION_SEGMENTED_GEMM(SHAPE, OPERANDS_)                                                                \

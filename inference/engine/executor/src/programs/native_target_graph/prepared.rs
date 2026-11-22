@@ -1150,6 +1150,9 @@ impl PreparedTargetGraphs {
                 },
             ));
         }
+        let _sizing = crate::programs::graph::sizing::SizingScope::enter_with_device(Some(
+            *device.properties(),
+        ));
         let certificate =
             certify_target_family::<seismic::NativeGraphLayout>(
                 device.backend(),
