@@ -262,6 +262,36 @@ __device__ __forceinline__ void gemm(GemmShared &shared, const u8 *x, u64 x_stri
         }
 }
 
+// Vectorized loads for dense operands with scalar fallback when unaligned.
+__device__ __forceinline__ float4 load_f32_4(const float *base, bool aligned16) {
+    if (aligned16)
+        return *reinterpret_cast<const float4 *>(base);
+    return make_float4(base[0], base[1], base[2], base[3]);
+}
+
+template <class E>
+__device__ __forceinline__ float2 load2(const u8 *base, u64 index) {
+    const u8 *address = base + index * E::bytes;
+    if ((reinterpret_cast<u64>(address) & (2 * E::bytes - 1)) == 0) {
+        if constexpr (E::bytes == 4)
+            return *reinterpret_cast<const float2 *>(address);
+        else
+            return E::unpack2(*reinterpret_cast<const u32 *>(address));
+    }
+    return make_float2(element::at<E>(base, index), element::at<E>(base, index + 1));
+}
+
+template <class E>
+__device__ __forceinline__ float4 load4(const u8 *base, u64 index, bool aligned) {
+    if (aligned) {
+        float values[4];
+        element::span<E, 4, true>(base, index, values);
+        return make_float4(values[0], values[1], values[2], values[3]);
+    }
+    return make_float4(element::at<E>(base, index), element::at<E>(base, index + 1),
+                       element::at<E>(base, index + 2), element::at<E>(base, index + 3));
+}
+
 // ---------------------------------------------------------------------------
 // The `vision_linear` epilogue: the projection is acc, plus bias[n] when
 // BIAS, clamped to [minimum, maximum] when CLAMP. With `activation` nonzero
@@ -279,22 +309,30 @@ template <class A, class B, class Y, bool BIAS, bool RESIDUAL, bool GATE, bool C
     float minimum;
     float maximum;
     int activation;
-    __device__ __forceinline__ float value(u32 m, u32 n, float acc) const {
-        float projected = acc;
-        if constexpr (BIAS)
-            projected = acc + element::at<B>(bias, n);
-        if constexpr (CLAMP)
-            projected = fminf(fmaxf(projected, minimum), maximum);
-        if (activation != 0)
-            return activate(activation, projected);
-        if constexpr (GATE)
-            return projected * element::at<A>(gate, (u64)m * gate_stride + n);
-        if constexpr (RESIDUAL)
-            return residual[(u64)m * residual_stride + n] + projected;
-        return projected;
-    }
     __device__ __forceinline__ void operator()(u32 m, u32 n, float first, float second) const {
-        y.put2((u64)m * stride + n, value(m, n, first), value(m, n + 1, second));
+        float2 projected = make_float2(first, second);
+        if constexpr (BIAS) {
+            const float2 b = load2<B>(bias, n);
+            projected.x += b.x;
+            projected.y += b.y;
+        }
+        if constexpr (CLAMP) {
+            projected.x = fminf(fmaxf(projected.x, minimum), maximum);
+            projected.y = fminf(fmaxf(projected.y, minimum), maximum);
+        }
+        if (activation != 0) {
+            projected.x = activate(activation, projected.x);
+            projected.y = activate(activation, projected.y);
+        } else if constexpr (GATE) {
+            const float2 g = load2<A>(gate, (u64)m * gate_stride + n);
+            projected.x *= g.x;
+            projected.y *= g.y;
+        } else if constexpr (RESIDUAL) {
+            const float2 r = load2<element::F32>(reinterpret_cast<const u8 *>(residual), (u64)m * residual_stride + n);
+            projected.x = r.x + projected.x;
+            projected.y = r.y + projected.y;
+        }
+        y.put2((u64)m * stride + n, projected.x, projected.y);
     }
 };
 
@@ -308,58 +346,103 @@ template <class A, class B, class Y, bool BIAS, bool RESIDUAL, bool GATE, bool C
 template <class Y, class WN, class BN, bool WEIGHT, bool BIAS>
 __device__ __forceinline__ void norm(const float *row, const element::Out<Y> &out, u64 stride, const u8 *weight, const u8 *bias,
                                      u32 width, bool centered, float epsilon, int activation, float *partials) {
-    constexpr u32 CACHE = 8;
-    float cached[CACHE];
+    constexpr u32 CACHE_VECS = 2;
+    const u32 vec_count = width / 4;
+    const u32 tail_start = vec_count * 4;
+    const bool row_aligned = (reinterpret_cast<u64>(row) & 15u) == 0;
+    const bool out_vec = stride == 1 && (reinterpret_cast<u64>(out.stored(0)) & (4 * Y::bytes - 1)) == 0;
+    float4 cached[CACHE_VECS];
     float mean = 0.0f;
-    float squares = 0.0f;
+    float4 sq4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (centered) {
-        float sum = 0.0f;
+        float4 sum4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 #pragma unroll
-        for (u32 slot = 0; slot < CACHE; ++slot) {
-            const u32 i = threadIdx.x + slot * blockDim.x;
-            if (i < width) {
-                const float x = row[i];
+        for (u32 slot = 0; slot < CACHE_VECS; ++slot) {
+            const u32 v = threadIdx.x + slot * blockDim.x;
+            if (v < vec_count) {
+                const float4 x = load_f32_4(row + v * 4, row_aligned);
                 cached[slot] = x;
-                sum += x;
+                sum4.x += x.x;
+                sum4.y += x.y;
+                sum4.z += x.z;
+                sum4.w += x.w;
             }
         }
-        for (u32 i = threadIdx.x + CACHE * blockDim.x; i < width; i += blockDim.x)
-            sum += row[i];
+        for (u32 v = threadIdx.x + CACHE_VECS * blockDim.x; v < vec_count; v += blockDim.x) {
+            const float4 x = load_f32_4(row + v * 4, row_aligned);
+            sum4.x += x.x;
+            sum4.y += x.y;
+            sum4.z += x.z;
+            sum4.w += x.w;
+        }
+        float sum = row_norm::sum4(sum4);
+        if (tail_start + threadIdx.x < width)
+            sum += row[tail_start + threadIdx.x];
         mean = row_norm::mean(reduce::group_sum(sum, partials), width);
 #pragma unroll
-        for (u32 slot = 0; slot < CACHE; ++slot) {
-            const u32 i = threadIdx.x + slot * blockDim.x;
-            if (i < width)
-                squares = row_norm::square(cached[slot] - mean, squares);
+        for (u32 slot = 0; slot < CACHE_VECS; ++slot) {
+            const u32 v = threadIdx.x + slot * blockDim.x;
+            if (v < vec_count) {
+                const float4 x = cached[slot];
+                sq4 = row_norm::square4(make_float4(x.x - mean, x.y - mean, x.z - mean, x.w - mean), sq4);
+            }
         }
     } else {
 #pragma unroll
-        for (u32 slot = 0; slot < CACHE; ++slot) {
-            const u32 i = threadIdx.x + slot * blockDim.x;
-            if (i < width) {
-                const float x = row[i];
+        for (u32 slot = 0; slot < CACHE_VECS; ++slot) {
+            const u32 v = threadIdx.x + slot * blockDim.x;
+            if (v < vec_count) {
+                const float4 x = load_f32_4(row + v * 4, row_aligned);
                 cached[slot] = x;
-                squares = row_norm::square(x, squares);
+                sq4 = row_norm::square4(x, sq4);
             }
         }
     }
-    for (u32 i = threadIdx.x + CACHE * blockDim.x; i < width; i += blockDim.x)
-        squares = row_norm::square(row[i] - mean, squares);
+    for (u32 v = threadIdx.x + CACHE_VECS * blockDim.x; v < vec_count; v += blockDim.x) {
+        const float4 x = load_f32_4(row + v * 4, row_aligned);
+        sq4 = row_norm::square4(make_float4(x.x - mean, x.y - mean, x.z - mean, x.w - mean), sq4);
+    }
+    float squares = row_norm::sum4(sq4);
+    if (tail_start + threadIdx.x < width)
+        squares = row_norm::square(row[tail_start + threadIdx.x] - mean, squares);
     const float inverse = row_norm::inverse(reduce::group_sum(squares, partials), width, epsilon);
-    const auto publish = [&](u32 i, float x) {
-        const float w = WEIGHT ? element::at<WN>(weight, i) : 0.0f;
-        const float b = BIAS ? element::at<BN>(bias, i) : 0.0f;
-        const float normalized = row_norm::apply<WEIGHT, BIAS>(x - mean, inverse, w, b);
-        out.put((u64)i * stride, activation != 0 ? activate(activation, normalized) : normalized);
+    const auto publish4 = [&](u32 base, float4 x) {
+        float4 w = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if constexpr (WEIGHT)
+            w = load4<WN>(weight, base, (reinterpret_cast<u64>(weight) & (4 * WN::bytes - 1)) == 0);
+        float4 b = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if constexpr (BIAS)
+            b = load4<BN>(bias, base, (reinterpret_cast<u64>(bias) & (4 * BN::bytes - 1)) == 0);
+        float4 out4 = row_norm::apply4<WEIGHT, BIAS>(
+            make_float4(x.x - mean, x.y - mean, x.z - mean, x.w - mean), inverse, w, b);
+        if (activation != 0)
+            out4 = make_float4(activate(activation, out4.x), activate(activation, out4.y),
+                               activate(activation, out4.z), activate(activation, out4.w));
+        if (out_vec) {
+            const float values[4] = {out4.x, out4.y, out4.z, out4.w};
+            out.template put_span<4>(base, values);
+        } else {
+            out.put((u64)(base + 0) * stride, out4.x);
+            out.put((u64)(base + 1) * stride, out4.y);
+            out.put((u64)(base + 2) * stride, out4.z);
+            out.put((u64)(base + 3) * stride, out4.w);
+        }
     };
 #pragma unroll
-    for (u32 slot = 0; slot < CACHE; ++slot) {
-        const u32 i = threadIdx.x + slot * blockDim.x;
-        if (i < width)
-            publish(i, cached[slot]);
+    for (u32 slot = 0; slot < CACHE_VECS; ++slot) {
+        const u32 v = threadIdx.x + slot * blockDim.x;
+        if (v < vec_count)
+            publish4(v * 4, cached[slot]);
     }
-    for (u32 i = threadIdx.x + CACHE * blockDim.x; i < width; i += blockDim.x)
-        publish(i, row[i]);
+    for (u32 v = threadIdx.x + CACHE_VECS * blockDim.x; v < vec_count; v += blockDim.x)
+        publish4(v * 4, load_f32_4(row + v * 4, row_aligned));
+    if (tail_start + threadIdx.x < width) {
+        const u32 i = tail_start + threadIdx.x;
+        const float w = WEIGHT ? element::at<WN>(weight, i) : 0.0f;
+        const float b = BIAS ? element::at<BN>(bias, i) : 0.0f;
+        const float normalized = row_norm::apply<WEIGHT, BIAS>(row[i] - mean, inverse, w, b);
+        out.put((u64)i * stride, activation != 0 ? activate(activation, normalized) : normalized);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -431,7 +514,7 @@ template <u32 WP> struct AttendShared {
     u16 q[ATTEND_ROWS * PITCH];
     u16 k[2][KEYS * PITCH];
     u16 v[2][KEYS * PITCH];
-    u32 bounds[2];
+    u32 bounds[2][ATTEND_THREADS / 32];
 };
 
 // Rows [first, first + count) of the operand part at element column
@@ -472,24 +555,29 @@ __device__ __forceinline__ void attend(AttendShared<WP> &shared, const u8 *qkv, 
     u32 row_first[2] = {0, 0}, row_end[2] = {rows, rows};
     u32 walk_first = 0, walk_end = rows;
     if (spans) {
+        u32 low = rows, high = 0;
 #pragma unroll
         for (u32 h = 0; h < 2; ++h) {
-            const u32 row = min(first_row + warp * 16 + g + 8 * h, rows - 1);
+            const u32 r = first_row + warp * 16 + g + 8 * h;
+            const u32 row = min(r, rows - 1);
             row_first[h] = (u32)spans[row * 2];
             row_end[h] = (u32)spans[row * 2 + 1];
-        }
-        if (threadIdx.x == 0) {
-            u32 low = rows, high = 0;
-            for (u32 r = first_row; r < min(first_row + ATTEND_ROWS, rows); ++r) {
-                low = min(low, (u32)spans[r * 2]);
-                high = max(high, (u32)spans[r * 2 + 1]);
+            if (r < rows) {
+                low = min(low, row_first[h]);
+                high = max(high, row_end[h]);
             }
-            shared.bounds[0] = low;
-            shared.bounds[1] = high;
+        }
+        low = seismic_redux_min_u32(low);
+        high = seismic_redux_max_u32(high);
+        if (lane == 0) {
+            shared.bounds[0][warp] = low;
+            shared.bounds[1][warp] = high;
         }
         __syncthreads();
-        walk_first = shared.bounds[0];
-        walk_end = shared.bounds[1];
+        walk_first = min(min(shared.bounds[0][0], shared.bounds[0][1]),
+                         min(shared.bounds[0][2], shared.bounds[0][3]));
+        walk_end = max(max(shared.bounds[1][0], shared.bounds[1][1]),
+                       max(shared.bounds[1][2], shared.bounds[1][3]));
     }
 
     attend_stage<WP>(shared.q, qkv, row_stride, (u64)head * WP, first_row, ATTEND_ROWS, rows);

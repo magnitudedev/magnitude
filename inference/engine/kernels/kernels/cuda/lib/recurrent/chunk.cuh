@@ -167,6 +167,124 @@ __device__ __forceinline__ void store_row8(u8 *base, u64 index, const float (&va
     }
 }
 
+// Stores `N` contiguous f16 values rounded from F32 into `dst`, using the
+// widest aligned vector store (`uint4`, `uint2`, `u32`), falling back to
+// scalar stores when unaligned.
+template <int N>
+__device__ __forceinline__ void store_f16_span(u16 *dst, const float (&values)[N]) {
+    if constexpr (N % 8 == 0) {
+        if ((reinterpret_cast<u64>(dst) & 15u) == 0) {
+            uint4 *out = reinterpret_cast<uint4 *>(dst);
+#pragma unroll
+            for (int k = 0; k < N / 8; ++k) {
+                out[k] = make_uint4(pack(values[8 * k + 0], values[8 * k + 1]),
+                                    pack(values[8 * k + 2], values[8 * k + 3]),
+                                    pack(values[8 * k + 4], values[8 * k + 5]),
+                                    pack(values[8 * k + 6], values[8 * k + 7]));
+            }
+            return;
+        }
+    }
+    if constexpr (N % 4 == 0) {
+        if ((reinterpret_cast<u64>(dst) & 7u) == 0) {
+            uint2 *out = reinterpret_cast<uint2 *>(dst);
+#pragma unroll
+            for (int k = 0; k < N / 4; ++k) {
+                out[k] = make_uint2(pack(values[4 * k + 0], values[4 * k + 1]),
+                                    pack(values[4 * k + 2], values[4 * k + 3]));
+            }
+            return;
+        }
+    }
+    if constexpr (N % 2 == 0) {
+        if ((reinterpret_cast<u64>(dst) & 3u) == 0) {
+            u32 *out = reinterpret_cast<u32 *>(dst);
+#pragma unroll
+            for (int k = 0; k < N / 2; ++k) out[k] = pack(values[2 * k], values[2 * k + 1]);
+            return;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < N; ++i) dst[i] = seismic_f32_to_f16(values[i]);
+}
+
+// Stores `N` contiguous F32 values as split high + low f16 spans into `dst_high`
+// and `dst_low`, using the widest aligned vector stores (`uint4`, `uint2`, `u32`).
+template <int N>
+__device__ __forceinline__ void store_f16_split_span(u16 *dst_high, u16 *dst_low, const float (&values)[N]) {
+    if constexpr (N % 8 == 0) {
+        if (((reinterpret_cast<u64>(dst_high) | reinterpret_cast<u64>(dst_low)) & 15u) == 0) {
+            uint4 *out_high = reinterpret_cast<uint4 *>(dst_high);
+            uint4 *out_low = reinterpret_cast<uint4 *>(dst_low);
+#pragma unroll
+            for (int k = 0; k < N / 8; ++k) {
+                const Split s0 = split(values[8 * k + 0], values[8 * k + 1]);
+                const Split s1 = split(values[8 * k + 2], values[8 * k + 3]);
+                const Split s2 = split(values[8 * k + 4], values[8 * k + 5]);
+                const Split s3 = split(values[8 * k + 6], values[8 * k + 7]);
+                out_high[k] = make_uint4(s0.high, s1.high, s2.high, s3.high);
+                out_low[k] = make_uint4(s0.low, s1.low, s2.low, s3.low);
+            }
+            return;
+        }
+    }
+    if constexpr (N % 4 == 0) {
+        if (((reinterpret_cast<u64>(dst_high) | reinterpret_cast<u64>(dst_low)) & 7u) == 0) {
+            uint2 *out_high = reinterpret_cast<uint2 *>(dst_high);
+            uint2 *out_low = reinterpret_cast<uint2 *>(dst_low);
+#pragma unroll
+            for (int k = 0; k < N / 4; ++k) {
+                const Split s0 = split(values[4 * k + 0], values[4 * k + 1]);
+                const Split s1 = split(values[4 * k + 2], values[4 * k + 3]);
+                out_high[k] = make_uint2(s0.high, s1.high);
+                out_low[k] = make_uint2(s0.low, s1.low);
+            }
+            return;
+        }
+    }
+    if constexpr (N % 2 == 0) {
+        if (((reinterpret_cast<u64>(dst_high) | reinterpret_cast<u64>(dst_low)) & 3u) == 0) {
+            u32 *out_high = reinterpret_cast<u32 *>(dst_high);
+            u32 *out_low = reinterpret_cast<u32 *>(dst_low);
+#pragma unroll
+            for (int k = 0; k < N / 2; ++k) {
+                const Split s = split(values[2 * k], values[2 * k + 1]);
+                out_high[k] = s.high;
+                out_low[k] = s.low;
+            }
+            return;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        const u16 high = seismic_f32_to_f16(values[i]);
+        dst_high[i] = high;
+        dst_low[i] = seismic_f32_to_f16(values[i] - seismic_f16_to_f32(high));
+    }
+}
+
+// Stores `N` contiguous F32 values into `dst`, using the widest aligned vector
+// store (`float4`, `float2`), falling back to scalar stores when unaligned.
+template <int N>
+__device__ __forceinline__ void store_f32_span(float *dst, const float (&values)[N]) {
+    if constexpr (N % 4 == 0) {
+        if ((reinterpret_cast<u64>(dst) & 15u) == 0) {
+            element::f32_span_store<N>(dst, values);
+            return;
+        }
+    }
+    if constexpr (N % 2 == 0) {
+        if ((reinterpret_cast<u64>(dst) & 7u) == 0) {
+            float2 *out = reinterpret_cast<float2 *>(dst);
+#pragma unroll
+            for (int k = 0; k < N / 2; ++k) out[k] = make_float2(values[2 * k], values[2 * k + 1]);
+            return;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < N; ++i) dst[i] = values[i];
+}
+
 // How a rule's decay enters the chunked form. One decay per value head
 // (DECAYS == 1) factors out of the products: the key head's f16 q | k | k_low
 // rows lead each piece, K K^T and Q K^T are formed once per key head, and a
@@ -202,13 +320,15 @@ struct Decay<Rule, 1> {
         return pieces + static_cast<u64>(piece) * PIECE_BYTES +
                static_cast<u64>(key_head) * PIECE * OPERAND_WIDTH * 2;
     }
-    // A normalized q (part 0) or k (part 1) element of row t, as the key
-    // head's f16 operand (keys as high + low pairs).
-    __device__ static void store_operand(u16 *rows, int t, int part, int column, float value) {
-        const u16 high = seismic_f32_to_f16(value);
-        rows[t * OPERAND_WIDTH + part * W + column] = high;
-        if (part == 1)
-            rows[t * OPERAND_WIDTH + 2 * W + column] = seismic_f32_to_f16(value - seismic_f16_to_f32(high));
+    // Normalized q (part 0) or k (part 1) channels [column, column + CPL) of
+    // row t, as the key head's f16 operands (keys as high + low pairs).
+    __device__ static void store_operand(u16 *rows, int t, int part, int column, const float (&values)[CPL]) {
+        u16 *dst = rows + t * OPERAND_WIDTH + part * W + column;
+        if (part == 0) {
+            store_f16_span<CPL>(dst, values);
+        } else {
+            store_f16_split_span<CPL>(dst, rows + t * OPERAND_WIDTH + 2 * W + column, values);
+        }
     }
 
     // From the piece's normalized q and k rows: beta, A (in `system`), D and
@@ -320,7 +440,7 @@ struct Decay<Rule, W> {
         return record(pieces, piece, head) + RECORD_ROWS;
     }
     // The decayed operands are formed per value head in `products`.
-    __device__ static void store_operand(u16 *, int, int, int, float) {}
+    __device__ static void store_operand(u16 *, int, int, int, const float (&)[CPL]) {}
 
     // From the piece's normalized q and k rows: beta, then one member value
     // head at a time its per-channel cumulative log decays G [16][W] (zero on
@@ -349,11 +469,24 @@ struct Decay<Rule, W> {
 
         const int t = threadIdx.x / PIECE;
         const int s = threadIdx.x % PIECE;
+        const int warp = threadIdx.x / 32;
+        const int lane = threadIdx.x % 32;
+        const int col0 = lane * CPL;
         for (int member = 0; member < GROUP; ++member) {
             const int head = member_head(base, key_head, member);
-            for (int item = threadIdx.x; item < PIECE * W; item += PREPARE_THREADS) {
-                const int row = item / W;
-                decays[row][item % W] = row < n ? Rule::log_decay(in, piece.first + row, head, item % W) : 0.0f;
+            const float rate = Rule::rate(in, head);
+            float bias[CPL];
+            Rule::load_time_bias(in, head, col0, bias);
+            for (int row = warp; row < PIECE; row += PREPARE_WARPS) {
+                float row_decays[CPL];
+                if (row < n) {
+                    Rule::log_decay_span(in, piece.first + row, head, col0, rate, bias, row_decays);
+                } else {
+#pragma unroll
+                    for (int c = 0; c < CPL; ++c) row_decays[c] = 0.0f;
+                }
+#pragma unroll
+                for (int c = 0; c < CPL; ++c) decays[row][col0 + c] = row_decays[c];
             }
             __syncthreads();
             for (int c = threadIdx.x; c < W; c += PREPARE_THREADS) {
@@ -381,21 +514,30 @@ struct Decay<Rule, W> {
             reinterpret_cast<u16 *>(out + RECORD_D)[t * PIECE + s] =
                 seismic_f32_to_f16(t < n ? qk_dot[0] + qk_dot[1] : 0.0f);
             u16 *rows = reinterpret_cast<u16 *>(out + RECORD_ROWS);
-            for (int item = threadIdx.x; item < PIECE * W; item += PREPARE_THREADS) {
-                const int row = item / W, c = item % W;
-                const float last = decays[PIECE - 1][c];
-                const float gamma = expf(decays[row][c]);
-                const float key = keys[row][c];
-                const float decayed[3] = {queries[row][c] * gamma, key * gamma, key * expf(last - decays[row][c])};
-                u16 *operand = rows + row * OPERAND_WIDTH + c;
-                operand[0] = seismic_f32_to_f16(decayed[0]);
+            float last[CPL];
 #pragma unroll
-                for (int k = 1; k < 3; ++k) {
-                    const u16 high = seismic_f32_to_f16(decayed[k]);
-                    operand[(2 * k - 1) * W] = high;
-                    operand[2 * k * W] = seismic_f32_to_f16(decayed[k] - seismic_f16_to_f32(high));
+            for (int c = 0; c < CPL; ++c) last[c] = decays[PIECE - 1][col0 + c];
+            if (warp == 0) {
+                float gate_vals[CPL];
+#pragma unroll
+                for (int c = 0; c < CPL; ++c) gate_vals[c] = expf(last[c]);
+                store_f32_span<CPL>(reinterpret_cast<float *>(out + RECORD_GATES) + col0, gate_vals);
+            }
+            for (int row = warp; row < PIECE; row += PREPARE_WARPS) {
+                float q_dec[CPL], k_dec[CPL], u_dec[CPL];
+#pragma unroll
+                for (int c = 0; c < CPL; ++c) {
+                    const float g = decays[row][col0 + c];
+                    const float gamma = expf(g);
+                    const float key = keys[row][col0 + c];
+                    q_dec[c] = queries[row][col0 + c] * gamma;
+                    k_dec[c] = key * gamma;
+                    u_dec[c] = key * expf(last[c] - g);
                 }
-                if (row == 0) reinterpret_cast<float *>(out + RECORD_GATES)[c] = expf(last);
+                u16 *operand = rows + row * OPERAND_WIDTH + col0;
+                store_f16_span<CPL>(operand + QUERIES, q_dec);
+                store_f16_split_span<CPL>(operand + KEYS, operand + KEYS_LOW, k_dec);
+                store_f16_split_span<CPL>(operand + UPDATE_KEYS, operand + UPDATE_KEYS_LOW, u_dec);
             }
             // The next member restages the decays.
             __syncthreads();
@@ -519,11 +661,10 @@ __device__ __forceinline__ void prepare(const typename Rule::Inputs &in, u8 *pie
                 for (int c = 0; c < CPL; ++c) {
                     values[c] *= inverse;
                     rows[t][column + c] = values[c];
-                    Form::store_operand(operands, t, part, column + c, values[c]);
                 }
+                Form::store_operand(operands, t, part, column, values);
             } else {
-#pragma unroll
-                for (int c = 0; c < CPL; ++c) v[t * W + column + c] = seismic_f32_to_f16(values[c]);
+                store_f16_span<CPL>(v + t * W + column, values);
             }
         }
     }

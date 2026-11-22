@@ -762,14 +762,50 @@ __device__ __forceinline__ void ordered_gemv_block_rows(u8 *shared_raw, const Pr
         acc[r] = 0.0f;
     for (u64 k0 = 0; k0 < K; k0 += 256) {
         const u32 chunk = (u32)min(256ull, K - k0);
-        for (u32 idx = tid; idx < M * chunk; idx += blockDim.x) {
-            const u32 r = chunk == 256u ? (idx >> 8u) : (idx / chunk);
-            const u32 c = chunk == 256u ? (idx & 255u) : (idx % chunk);
-            const float val = pro.ordered_at(r, k0 + c, smem_inv[r]);
-            smem_x[r * 256u + c] = val;
-            if constexpr (PUBLISH) {
-                if (publish_rows)
-                    pub_out.put((u64)r * pub_s0 + (k0 + c) * pub_s1, val);
+        const u32 chunk4 = chunk >> 2u;
+        const u32 tail0 = chunk4 << 2u;
+        const u32 row_step = blockDim.x >> 6u;
+        const u32 r0 = tid >> 6u;
+        const u32 c4 = tid & 63u;
+        for (u32 r = r0; r < M; r += row_step) {
+            const float inv = smem_inv[r];
+            float *dst_row = smem_x + r * 256u;
+            if (pro.can_vec4(r)) {
+                if (c4 < chunk4) {
+                    const u32 c = c4 << 2u;
+                    float vals[4];
+                    pro.ordered_at4(r, k0 + c, inv, vals);
+                    reinterpret_cast<float4 *>(dst_row)[c4] = make_float4(vals[0], vals[1], vals[2], vals[3]);
+                    if constexpr (PUBLISH) {
+                        if (publish_rows) {
+                            if (pub_s1 == 1ull) {
+                                pub_out.template put_span<4>((u64)r * pub_s0 + k0 + c, vals);
+                            } else {
+#pragma unroll
+                                for (u32 j = 0u; j < 4u; ++j)
+                                    pub_out.put((u64)r * pub_s0 + (k0 + c + j) * pub_s1, vals[j]);
+                            }
+                        }
+                    }
+                }
+                if (c4 < chunk - tail0) {
+                    const u32 c = tail0 + c4;
+                    const float val = pro.ordered_at(r, k0 + c, inv);
+                    dst_row[c] = val;
+                    if constexpr (PUBLISH) {
+                        if (publish_rows)
+                            pub_out.put((u64)r * pub_s0 + (k0 + c) * pub_s1, val);
+                    }
+                }
+            } else {
+                for (u32 c = c4; c < chunk; c += 64u) {
+                    const float val = pro.ordered_at(r, k0 + c, inv);
+                    dst_row[c] = val;
+                    if constexpr (PUBLISH) {
+                        if (publish_rows)
+                            pub_out.put((u64)r * pub_s0 + (k0 + c) * pub_s1, val);
+                    }
+                }
             }
         }
         __syncthreads();

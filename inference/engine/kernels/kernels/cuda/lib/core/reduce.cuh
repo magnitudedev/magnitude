@@ -224,13 +224,10 @@ __device__ __forceinline__ unsigned group_exclusive_add(unsigned value, unsigned
     if (lane == 31)
         partials[warp] = inclusive;
     __syncthreads();
-    unsigned before = 0, sum = 0;
-    for (unsigned w = 0; w < warps; ++w) {
-        const unsigned partial = partials[w];
-        before += w < warp ? partial : 0u;
-        sum += partial;
-    }
-    total = sum;
+    const unsigned warp_sum = static_cast<unsigned>(lane) < warps ? partials[lane] : 0u;
+    const unsigned warp_inc = lanes_inclusive_add(warp_sum, lane);
+    total = __shfl_sync(0xffffffffu, warp_inc, 31);
+    const unsigned before = __shfl_sync(0xffffffffu, warp_inc - warp_sum, static_cast<int>(warp));
     return before + inclusive - value;
 }
 

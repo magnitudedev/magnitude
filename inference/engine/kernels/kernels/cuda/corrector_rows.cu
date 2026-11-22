@@ -8,6 +8,8 @@
 extern "C" __global__ void corrector_rows(SEISMIC_KERNEL_PARAMS) {
     typedef unsigned long long u64;
     using ResultElem = ELEMENT_OF(SEISMIC_RESULT_0);
+    constexpr u64 ROWS_THREADS = 256ull;
+    constexpr u64 CACHE_MAX_N = 4096ull;
     __shared__ float partials[32];
     const float *values = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_VALUES));
     const float *bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BIAS));
@@ -22,9 +24,76 @@ extern "C" __global__ void corrector_rows(SEISMIC_KERNEL_PARAMS) {
 
     const bool bias_vec = SEISMIC_VALUES_STRIDE_1 == 1ull && SEISMIC_BIAS_STRIDE_0 == 1ull &&
                           ((reinterpret_cast<u64>(v_row) | reinterpret_cast<u64>(bias)) & 15ull) == 0ull;
+    const bool out_vec =
+        bias_vec && SEISMIC_RESULT_0_STRIDE_1 == 1ull &&
+        (reinterpret_cast<u64>(result_row.stored(0)) & (4ull * ResultElem::bytes - 1ull)) == 0ull &&
+        (SEISMIC_DIM_R == 0 || (SEISMIC_RESIDUAL_STRIDE_2 == 1ull && (reinterpret_cast<u64>(r_row) & 15ull) == 0ull));
 
-    // Form 2's length, max(sqrt(sum of squares), epsilon).
-    float length = 1.0f;
+    // Form 2 single-read register-cached path when the entire row fits in <= 4
+    // float4s per thread (N <= 4096) on the unit-strided aligned layout.
+    if constexpr (SEISMIC_DIM_N <= CACHE_MAX_N) {
+        if (form == 2 && out_vec) {
+            constexpr u64 STEP4 = ROWS_THREADS * 4ull;
+            constexpr u64 WIDTH4 = static_cast<u64>(SEISMIC_DIM_N) & ~3ull;
+            constexpr unsigned CACHE_VECS =
+                WIDTH4 > 0ull ? static_cast<unsigned>((WIDTH4 + STEP4 - 1ull) / STEP4) : 1u;
+            float4 cached[CACHE_VECS];
+            float tail_val = 0.0f;
+            float squares = 0.0f;
+#pragma unroll
+            for (unsigned slot = 0; slot < CACHE_VECS; ++slot) {
+                const u64 column = static_cast<u64>(threadIdx.x) * 4ull + static_cast<u64>(slot) * STEP4;
+                if (column < width4) {
+                    const float4 vv = *reinterpret_cast<const float4 *>(v_row + column);
+                    const float4 bv = *reinterpret_cast<const float4 *>(bias + column);
+                    const float4 b = make_float4(vv.x + bv.x, vv.y + bv.y, vv.z + bv.z, vv.w + bv.w);
+                    cached[slot] = b;
+                    squares = seismic_fma_rn(b.x, b.x, squares);
+                    squares = seismic_fma_rn(b.y, b.y, squares);
+                    squares = seismic_fma_rn(b.z, b.z, squares);
+                    squares = seismic_fma_rn(b.w, b.w, squares);
+                }
+            }
+            const u64 tail_col = width4 + threadIdx.x;
+            if (tail_col < width) {
+                tail_val = v_row[tail_col] + bias[tail_col];
+                squares = seismic_fma_rn(tail_val, tail_val, squares);
+            }
+            const float length =
+                fmaxf(sqrtf(reduce::group_sum(squares, partials)), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON));
+            const float inv = 1.0f / length;
+#pragma unroll
+            for (unsigned slot = 0; slot < CACHE_VECS; ++slot) {
+                const u64 column = static_cast<u64>(threadIdx.x) * 4ull + static_cast<u64>(slot) * STEP4;
+                if (column < width4) {
+                    const float4 b = cached[slot];
+                    float out[4];
+                    out[0] = b.x * inv;
+                    out[1] = b.y * inv;
+                    out[2] = b.z * inv;
+                    out[3] = b.w * inv;
+                    if (SEISMIC_DIM_R == 1) {
+                        const float4 rv = *reinterpret_cast<const float4 *>(r_row + column);
+                        out[0] += rv.x;
+                        out[1] += rv.y;
+                        out[2] += rv.z;
+                        out[3] += rv.w;
+                    }
+                    result_row.put_span<4>(column, out);
+                }
+            }
+            if (tail_col < width) {
+                float value = tail_val * inv;
+                if (SEISMIC_DIM_R == 1)
+                    value += r_row[tail_col];
+                result_row.put(tail_col, value);
+            }
+            return;
+        }
+    }
+
+    // Form 2's inverse length, 1 / max(sqrt(sum of squares), epsilon).
+    float inv = 1.0f;
     if (form == 2) {
         float squares = 0.0f;
         if (bias_vec) {
@@ -52,13 +121,10 @@ extern "C" __global__ void corrector_rows(SEISMIC_KERNEL_PARAMS) {
                 squares = seismic_fma_rn(value, value, squares);
             }
         }
-        length = fmaxf(sqrtf(reduce::group_sum(squares, partials)), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON));
+        const float length =
+            fmaxf(sqrtf(reduce::group_sum(squares, partials)), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON));
+        inv = 1.0f / length;
     }
-
-    const bool out_vec =
-        bias_vec && SEISMIC_RESULT_0_STRIDE_1 == 1ull &&
-        (reinterpret_cast<u64>(result_row.stored(0)) & (4ull * ResultElem::bytes - 1ull)) == 0ull &&
-        (SEISMIC_DIM_R == 0 || (SEISMIC_RESIDUAL_STRIDE_2 == 1ull && (reinterpret_cast<u64>(r_row) & 15ull) == 0ull));
 
     if (out_vec) {
         const u64 step4 = static_cast<u64>(blockDim.x) * 4ull;
@@ -76,10 +142,10 @@ extern "C" __global__ void corrector_rows(SEISMIC_KERNEL_PARAMS) {
                 out[2] = out[2] / (1.0f + expf(-out[2]));
                 out[3] = out[3] / (1.0f + expf(-out[3]));
             } else if (form == 2) {
-                out[0] = out[0] / length;
-                out[1] = out[1] / length;
-                out[2] = out[2] / length;
-                out[3] = out[3] / length;
+                out[0] = out[0] * inv;
+                out[1] = out[1] * inv;
+                out[2] = out[2] * inv;
+                out[3] = out[3] * inv;
             }
             if (SEISMIC_DIM_R == 1) {
                 const float4 rv = *reinterpret_cast<const float4 *>(r_row + column);
@@ -95,7 +161,7 @@ extern "C" __global__ void corrector_rows(SEISMIC_KERNEL_PARAMS) {
             if (form == 1)
                 value = value / (1.0f + expf(-value));
             else if (form == 2)
-                value = value / length;
+                value = value * inv;
             if (SEISMIC_DIM_R == 1)
                 value += r_row[column];
             result_row.put(column, value);
@@ -106,7 +172,7 @@ extern "C" __global__ void corrector_rows(SEISMIC_KERNEL_PARAMS) {
             if (form == 1)
                 value = value / (1.0f + expf(-value));
             else if (form == 2)
-                value = value / length;
+                value = value * inv;
             if (SEISMIC_DIM_R == 1)
                 value += r_row[column * SEISMIC_RESIDUAL_STRIDE_2];
             result_row.put(column * SEISMIC_RESULT_0_STRIDE_1, value);

@@ -39,7 +39,7 @@ constexpr int W4 = W / 4;
 constexpr int E = W / 32;
 constexpr int H = SEISMIC_DIM_H;
 constexpr int Q_STRIDE = W + 4;
-constexpr int SMEM_BUDGET_FLOATS = 49152 / 4;
+constexpr int SMEM_BUDGET_FLOATS = SEISMIC_DEVICE_SHARED_BYTES_PER_GROUP / 4;
 constexpr bool SINGLE_TILE = (H * Q_STRIDE + 8 * W) <= SMEM_BUDGET_FLOATS;
 
 __host__ __device__ constexpr int select_head_tile() {
@@ -60,7 +60,7 @@ constexpr int LANES_PER_HEAD = SINGLE_TILE ? 1 : 32 / HEAD_TILE;
 static_assert(W % 32 == 0, "indexer head width must be a multiple of 32");
 static_assert(H >= 1 && H <= 64, "indexer head count must be in 1..=64");
 static_assert(HEAD_TILE >= 1 && (HEAD_TILE * Q_STRIDE + 8 * W) <= SMEM_BUDGET_FLOATS,
-              "indexer_score tile must fit in 48 KiB shared memory");
+              "indexer_score tile must fit in device shared memory");
 static_assert(SINGLE_TILE || (32 % HEAD_TILE == 0), "HEAD_TILE must divide warp size");
 
 typedef ROTARY_ENTRY_LAYOUT(W) query_layout;

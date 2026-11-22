@@ -1,7 +1,7 @@
 // pool_rows on CUDA (contract and portable body in pooled.seismic), the
 // Metal launches (`metal/pool_rows.metal`):
 //
-// append:   a warp per row, lane l holding columns l + 32 k; its u
+// append:   a warp per row, lane l holding columns [l E, (l + 1) E); its u
 //           (LayerNorm-ed when TN = 1, then g) and coordinates to the window
 //           planes.
 // complete: a warp per row, lane l holding columns [l E, (l + 1) E); a
@@ -51,86 +51,98 @@ static_assert(RATE >= 2 && RATE <= 16, "a group holds 2 to 16 tokens");
 // A pooled row's rotary pairs: the reading attention's key layout (RA, RT).
 typedef ROTARY_ENTRY_LAYOUT(W) row_layout;
 
+// Loads lane's contiguous columns [col_base, col_base + E) from `base`
+// (stepping by `stride`), using 128-bit float4 loads when stride == 1 and
+// 16-byte aligned, with scalar tail.
+__device__ __forceinline__ void load_f32_lane(float (&out)[E], const float *base, u64 stride, u32 col_base) {
+    if constexpr (E >= 4) {
+        if (stride == 1 && (reinterpret_cast<u64>(base + col_base) & 15u) == 0u) {
+            constexpr int VEC = E & ~3;
+#pragma unroll
+            for (int k = 0; k < VEC; k += 4) {
+                const float4 v = *reinterpret_cast<const float4 *>(base + col_base + static_cast<u32>(k));
+                out[k] = v.x;
+                out[k + 1] = v.y;
+                out[k + 2] = v.z;
+                out[k + 3] = v.w;
+            }
+#pragma unroll
+            for (int k = VEC; k < E; ++k) out[k] = base[col_base + static_cast<u32>(k)];
+            return;
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < E; ++k) out[k] = base[static_cast<u64>(col_base + static_cast<u32>(k)) * stride];
+}
+
+// Stores lane's contiguous columns [col_base, col_base + E) into `out`
+// (stepping by `stride`), using 128-bit float4 stores when stride == 1 and
+// 16-byte aligned, with scalar tail.
+__device__ __forceinline__ void store_f32_lane(const element::Out<element::F32> &out, u32 col_base, u64 stride,
+                                               const float (&values)[E]) {
+    if constexpr (E >= 4) {
+        if (stride == 1 && (reinterpret_cast<u64>(out.stored(col_base)) & 15u) == 0u) {
+            constexpr int VEC = E & ~3;
+#pragma unroll
+            for (int k = 0; k < VEC; k += 4) {
+                const float chunk[4] = {values[k], values[k + 1], values[k + 2], values[k + 3]};
+                out.put_span<4>(col_base + static_cast<u32>(k), chunk);
+            }
+#pragma unroll
+            for (int k = VEC; k < E; ++k) out.put(col_base + static_cast<u32>(k), values[k]);
+            return;
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < E; ++k) out.put(static_cast<u64>(col_base + static_cast<u32>(k)) * stride, values[k]);
+}
+
 // A row's own u (`u` at its row, stepping by `u_stride`), the warp's lane
-// holding contiguous columns [lane * E, (lane + 1) * E) (`CONTIGUOUS`) or
-// strided columns lane + 32 * k, LayerNorm-ed per token with `weight` and
-// `bias` when TN = 1 (`token_norm`): `row_norm`'s arithmetic over the warp's
-// partials (vec4 on contiguous lanes when E % 4 == 0).
-template <bool CONTIGUOUS>
+// holding contiguous columns [lane * E, (lane + 1) * E), LayerNorm-ed per
+// token with `weight` and `bias` when TN = 1 (`token_norm`): `row_norm`'s
+// arithmetic over the warp's partials.
 __device__ __forceinline__ void own_row(float (&x)[E], const float *u, u64 u_stride, const float *weight,
                                         u64 weight_stride, const float *bias, u64 bias_stride, float epsilon,
                                         u32 lane) {
     const u32 base = lane * static_cast<u32>(E);
-    if constexpr (CONTIGUOUS && (E % 4 == 0)) {
-        if (u_stride == 1 && (reinterpret_cast<u64>(u + base) & 15u) == 0u) {
-            element::f32_span<E>(u + base, x);
-        } else {
-#pragma unroll
-            for (int k = 0; k < E; ++k) x[k] = u[static_cast<u64>(base + static_cast<u32>(k)) * u_stride];
-        }
-    } else {
-#pragma unroll
-        for (int k = 0; k < E; ++k) {
-            const u32 col = CONTIGUOUS ? base + static_cast<u32>(k) : lane + 32u * static_cast<u32>(k);
-            x[k] = u[static_cast<u64>(col) * u_stride];
-        }
-    }
+    load_f32_lane(x, u, u_stride, base);
     if constexpr (TOKEN_NORM) {
+        constexpr int VEC = E & ~3;
         float sum = 0.0f;
 #pragma unroll
         for (int k = 0; k < E; ++k) sum += x[k];
         const float mean = row_norm::mean(seismic_warp_sum_f32(sum), W);
-        float squares = 0.0f;
-        if constexpr (CONTIGUOUS && (E % 4 == 0)) {
-            float4 sq4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 sq4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 #pragma unroll
-            for (int k = 0; k < E; k += 4) {
-                x[k] -= mean;
-                x[k + 1] -= mean;
-                x[k + 2] -= mean;
-                x[k + 3] -= mean;
-                sq4 = row_norm::square4(make_float4(x[k], x[k + 1], x[k + 2], x[k + 3]), sq4);
-            }
-            squares = row_norm::sum4(sq4);
-        } else {
+        for (int k = 0; k < VEC; k += 4) {
+            x[k] -= mean;
+            x[k + 1] -= mean;
+            x[k + 2] -= mean;
+            x[k + 3] -= mean;
+            sq4 = row_norm::square4(make_float4(x[k], x[k + 1], x[k + 2], x[k + 3]), sq4);
+        }
+        float squares = row_norm::sum4(sq4);
 #pragma unroll
-            for (int k = 0; k < E; ++k) {
-                x[k] -= mean;
-                squares = row_norm::square(x[k], squares);
-            }
+        for (int k = VEC; k < E; ++k) {
+            x[k] -= mean;
+            squares = row_norm::square(x[k], squares);
         }
         const float inverse = row_norm::inverse(seismic_warp_sum_f32(squares), W, epsilon);
-        if constexpr (CONTIGUOUS && (E % 4 == 0)) {
-            const bool vec_wb = weight_stride == 1 && bias_stride == 1
-                                && ((reinterpret_cast<u64>(weight + base) | reinterpret_cast<u64>(bias + base)) & 15u)
-                                       == 0u;
-            if (vec_wb) {
+        float w[E], b[E];
+        load_f32_lane(w, weight, weight_stride, base);
+        load_f32_lane(b, bias, bias_stride, base);
 #pragma unroll
-                for (int k = 0; k < E; k += 4) {
-                    const float4 w4 = *reinterpret_cast<const float4 *>(weight + base + k);
-                    const float4 b4 = *reinterpret_cast<const float4 *>(bias + base + k);
-                    const float4 y4 =
-                        row_norm::apply4<true, true>(make_float4(x[k], x[k + 1], x[k + 2], x[k + 3]), inverse, w4, b4);
-                    x[k] = y4.x;
-                    x[k + 1] = y4.y;
-                    x[k + 2] = y4.z;
-                    x[k + 3] = y4.w;
-                }
-            } else {
-#pragma unroll
-                for (int k = 0; k < E; ++k) {
-                    const u64 c = static_cast<u64>(base + static_cast<u32>(k));
-                    x[k] = row_norm::apply<true, true>(x[k], inverse, weight[c * weight_stride], bias[c * bias_stride]);
-                }
-            }
-        } else {
-#pragma unroll
-            for (int k = 0; k < E; ++k) {
-                const u64 c = static_cast<u64>(CONTIGUOUS ? base + static_cast<u32>(k)
-                                                          : lane + 32u * static_cast<u32>(k));
-                x[k] = row_norm::apply<true, true>(x[k], inverse, weight[c * weight_stride], bias[c * bias_stride]);
-            }
+        for (int k = 0; k < VEC; k += 4) {
+            const float4 y4 = row_norm::apply4<true, true>(make_float4(x[k], x[k + 1], x[k + 2], x[k + 3]), inverse,
+                                                           make_float4(w[k], w[k + 1], w[k + 2], w[k + 3]),
+                                                           make_float4(b[k], b[k + 1], b[k + 2], b[k + 3]));
+            x[k] = y4.x;
+            x[k + 1] = y4.y;
+            x[k + 2] = y4.z;
+            x[k + 3] = y4.w;
         }
+#pragma unroll
+        for (int k = VEC; k < E; ++k) x[k] = row_norm::apply<true, true>(x[k], inverse, w[k], b[k]);
     }
 }
 
@@ -146,17 +158,18 @@ extern "C" __global__ void pool_rows_append(SEISMIC_KERNEL_PARAMS) {
     const u64 slab_rows = SEISMIC_PARAM_WINDOW_SLAB_ROWS;
     const element::Out<element::F32> target =
         SEISMIC_OUT_WINDOW_ROWS.row(static_cast<u64>(destination), slab_rows, WIDTH);
+    const u32 lane_base = lane * static_cast<u32>(E);
     float x[E];
-    own_row<false>(x, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_U)) + row * SEISMIC_U_STRIDE_0,
-                   SEISMIC_U_STRIDE_1, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_NORM)),
-                   SEISMIC_NORM_STRIDE_1, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BIAS)),
-                   SEISMIC_BIAS_STRIDE_1, element::word_f32(SEISMIC_PARAM_EPSILON), lane);
-#pragma unroll
-    for (int k = 0; k < E; ++k) target.put(lane + 32u * static_cast<u32>(k), x[k]);
+    own_row(x, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_U)) + row * SEISMIC_U_STRIDE_0,
+            SEISMIC_U_STRIDE_1, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_NORM)),
+            SEISMIC_NORM_STRIDE_1, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BIAS)),
+            SEISMIC_BIAS_STRIDE_1, element::word_f32(SEISMIC_PARAM_EPSILON), lane);
+    store_f32_lane(target, lane_base, 1, x);
     if constexpr (GATED) {
         const float *g_row = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_G)) + row * SEISMIC_G_STRIDE_0;
-        for (u32 column = lane; column < static_cast<u32>(W); column += 32u)
-            target.put(static_cast<u32>(W) + column, g_row[static_cast<u64>(column) * SEISMIC_G_STRIDE_1]);
+        float g_vals[E];
+        load_f32_lane(g_vals, g_row, SEISMIC_G_STRIDE_1, lane_base);
+        store_f32_lane(target, static_cast<u32>(W) + lane_base, 1, g_vals);
     }
     if (lane < 4u) {
         const int *coordinates = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES));
@@ -179,22 +192,10 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
     int *latent_coordinates =
         reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER)) + row * SEISMIC_RESULT_2_STRIDE_0;
     if (destination < 0) {
-        if constexpr (E % 4 == 0) {
-            if (SEISMIC_RESULT_0_STRIDE_1 == 1 && (reinterpret_cast<u64>(published.stored(lane_base)) & 15u) == 0u) {
-                float zeros[E];
+        float zeros[E];
 #pragma unroll
-                for (int i = 0; i < E; ++i) zeros[i] = 0.0f;
-                published.put_span<E>(lane_base, zeros);
-            } else {
-#pragma unroll
-                for (int i = 0; i < E; ++i)
-                    published.put(static_cast<u64>(lane_base + static_cast<u32>(i)) * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
-            }
-        } else {
-#pragma unroll
-            for (int i = 0; i < E; ++i)
-                published.put(static_cast<u64>(lane_base + static_cast<u32>(i)) * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
-        }
+        for (int i = 0; i < E; ++i) zeros[i] = 0.0f;
+        store_f32_lane(published, lane_base, SEISMIC_RESULT_0_STRIDE_1, zeros);
         if (lane == 0u) latent_rows[row * SEISMIC_RESULT_1_STRIDE_0] = -1;
         if (lane < 4u) latent_coordinates[static_cast<u64>(lane) * SEISMIC_RESULT_2_STRIDE_1] = 0;
         return;
@@ -222,10 +223,10 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
     const float *g_row = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_G)) + row * SEISMIC_G_STRIDE_0;
     const float *position = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_POSITION));
     float own[E];
-    own_row<true>(own, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_U)) + row * SEISMIC_U_STRIDE_0,
-                  SEISMIC_U_STRIDE_1, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_NORM)),
-                  SEISMIC_NORM_STRIDE_1, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BIAS)),
-                  SEISMIC_BIAS_STRIDE_1, element::word_f32(SEISMIC_PARAM_EPSILON), lane);
+    own_row(own, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_U)) + row * SEISMIC_U_STRIDE_0,
+            SEISMIC_U_STRIDE_1, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_NORM)),
+            SEISMIC_NORM_STRIDE_1, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BIAS)),
+            SEISMIC_BIAS_STRIDE_1, element::word_f32(SEISMIC_PARAM_EPSILON), lane);
     const float *members[RATE];
     int first_row = 0;
     u64 span = start.span;
@@ -243,21 +244,8 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
         members[member] = reinterpret_cast<const float *>(
             window_rows.view_row(static_cast<u64>(at), window_slab_rows, WIDTH).bytes());
     }
-    // Lane `lane`'s column i of member `member`.
-    auto value = [&](int member, int i) { return member + 1 < RATE ? members[member][lane_base + i] : own[i]; };
     float x[E];
     if constexpr (GATED) {
-        // Member `member`'s gate logit at lane `lane`'s column i, with its
-        // place's term (PR = RATE; none at PR = 0).
-        auto gate = [&](int member, int i) {
-            const u32 column = lane_base + static_cast<u32>(i);
-            const float logit = member + 1 < RATE ? members[member][static_cast<u32>(W) + column]
-                                                  : g_row[static_cast<u64>(column) * SEISMIC_G_STRIDE_1];
-            return member < PLACES
-                ? logit + position[static_cast<u64>(member) * SEISMIC_POSITION_STRIDE_0
-                                   + static_cast<u64>(column) * SEISMIC_POSITION_STRIDE_1]
-                : logit;
-        };
         float top[E], total[E];
 #pragma unroll
         for (int i = 0; i < E; ++i) {
@@ -265,22 +253,60 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
             total[i] = 0.0f;
             x[i] = 0.0f;
         }
-        for (int member = 0; member < RATE; ++member)
+        float scores[RATE][E];
 #pragma unroll
-            for (int i = 0; i < E; ++i) top[i] = fmaxf(top[i], gate(member, i));
-        for (int member = 0; member < RATE; ++member)
+        for (int member = 0; member < RATE; ++member) {
+            if (member + 1 < RATE) {
+                load_f32_lane(scores[member], members[member] + static_cast<u32>(W), 1, lane_base);
+            } else {
+                load_f32_lane(scores[member], g_row, SEISMIC_G_STRIDE_1, lane_base);
+            }
+            if (member < PLACES) {
+                float place[E];
+                load_f32_lane(place, position + static_cast<u64>(member) * SEISMIC_POSITION_STRIDE_0,
+                              SEISMIC_POSITION_STRIDE_1, lane_base);
 #pragma unroll
-            for (int i = 0; i < E; ++i) total[i] += expf(gate(member, i) - top[i]);
-        for (int member = 0; member < RATE; ++member)
+                for (int i = 0; i < E; ++i) scores[member][i] += place[i];
+            }
 #pragma unroll
-            for (int i = 0; i < E; ++i)
-                x[i] += expf(gate(member, i) - top[i]) / total[i] * value(member, i);
+            for (int i = 0; i < E; ++i) top[i] = fmaxf(top[i], scores[member][i]);
+        }
+#pragma unroll
+        for (int member = 0; member < RATE; ++member) {
+#pragma unroll
+            for (int i = 0; i < E; ++i) {
+                const float w = expf(scores[member][i] - top[i]);
+                scores[member][i] = w;
+                total[i] += w;
+            }
+        }
+#pragma unroll
+        for (int member = 0; member < RATE; ++member) {
+            float val[E];
+            if (member + 1 < RATE) {
+                load_f32_lane(val, members[member], 1, lane_base);
+            } else {
+#pragma unroll
+                for (int i = 0; i < E; ++i) val[i] = own[i];
+            }
+#pragma unroll
+            for (int i = 0; i < E; ++i) x[i] += scores[member][i] / total[i] * val[i];
+        }
     } else {
 #pragma unroll
         for (int i = 0; i < E; ++i) x[i] = 0.0f;
-        for (int member = 0; member < RATE; ++member)
 #pragma unroll
-            for (int i = 0; i < E; ++i) x[i] += value(member, i);
+        for (int member = 0; member < RATE; ++member) {
+            if (member + 1 < RATE) {
+                float val[E];
+                load_f32_lane(val, members[member], 1, lane_base);
+#pragma unroll
+                for (int i = 0; i < E; ++i) x[i] += val[i];
+            } else {
+#pragma unroll
+                for (int i = 0; i < E; ++i) x[i] += own[i];
+            }
+        }
 #pragma unroll
         for (int i = 0; i < E; ++i) x[i] /= static_cast<float>(RATE);
     }
@@ -296,19 +322,7 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
                        element::word_f32(SEISMIC_PARAM_EPSILON), static_cast<int>(lane));
         rounding::hold_lanes<Act>(x, trained);
     }
-    if constexpr (E % 4 == 0) {
-        if (SEISMIC_RESULT_0_STRIDE_1 == 1 && (reinterpret_cast<u64>(published.stored(lane_base)) & 15u) == 0u) {
-            published.put_span<E>(lane_base, x);
-        } else {
-#pragma unroll
-            for (int i = 0; i < E; ++i)
-                published.put(static_cast<u64>(lane_base + static_cast<u32>(i)) * SEISMIC_RESULT_0_STRIDE_1, x[i]);
-        }
-    } else {
-#pragma unroll
-        for (int i = 0; i < E; ++i)
-            published.put(static_cast<u64>(lane_base + static_cast<u32>(i)) * SEISMIC_RESULT_0_STRIDE_1, x[i]);
-    }
+    store_f32_lane(published, lane_base, SEISMIC_RESULT_0_STRIDE_1, x);
     if (lane == 0u) latent_rows[row * SEISMIC_RESULT_1_STRIDE_0] = destination;
     // Rotated at the group's first token, rounded, stored.
     const int *origin = reinterpret_cast<const int *>(

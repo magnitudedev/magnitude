@@ -36,7 +36,7 @@
 // Shared-memory words (uint4) a later level stages its features in, at most:
 // four rows of 2,048 A values. Its launch declares the rows' own bytes,
 // min(O * D * 2, 16 KiB), so a level of fewer rows keeps more blocks resident.
-#define PROGRESSIVE_STAGE_WORDS 1024u
+#define PROGRESSIVE_STAGE_WORDS ((unsigned(SEISMIC_DEVICE_SHARED_BYTES_PER_GROUP) / 2u) / 16u)
 
 namespace progressive {
 

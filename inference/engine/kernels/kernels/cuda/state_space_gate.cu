@@ -75,15 +75,30 @@ extern "C" __global__ void state_space_gate(SEISMIC_KERNEL_PARAMS) {
                               | reinterpret_cast<u64>(projection + proj_base * Act::bytes))
                              & act_align)
                             == 0u);
+    constexpr u32 MAX_CACHE = 4u;
+    const u32 vec_stride = 4u * threads;
+    float4 cached[MAX_CACHE];
+    float cached_tail = 0.0f;
     float squares = 0.0f;
     if (vec_in) {
         float4 sq4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        for (u32 column = 4u * tid; column < vec_width; column += 4u * threads)
+#pragma unroll
+        for (u32 k = 0u; k < MAX_CACHE; ++k) {
+            const u32 column = 4u * tid + k * vec_stride;
+            if (column < vec_width) {
+                const float4 value = gated_value4(mixed, projection, mixed_base, proj_base, column);
+                cached[k] = value;
+                sq4 = row_norm::square4(value, sq4);
+            }
+        }
+        for (u32 column = 4u * tid + MAX_CACHE * vec_stride; column < vec_width; column += vec_stride)
             sq4 = row_norm::square4(gated_value4(mixed, projection, mixed_base, proj_base, column), sq4);
         squares = row_norm::sum4(sq4);
-        for (u32 column = vec_width + tid; column < width; column += threads) {
+        u32 tail_idx = 0u;
+        for (u32 column = vec_width + tid; column < width; column += threads, ++tail_idx) {
             const float value =
                 silu_mul(element::at<Act>(mixed, mixed_base + column), element::at<Act>(projection, proj_base + column));
+            if (tail_idx == 0u) cached_tail = value;
             squares = row_norm::square(value, squares);
         }
     } else {
@@ -103,16 +118,28 @@ extern "C" __global__ void state_space_gate(SEISMIC_KERNEL_PARAMS) {
                          && ((reinterpret_cast<u64>(out_group.stored(0)) & act_align) == 0u);
     if (vec_out) {
         const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        for (u32 column = 4u * tid; column < vec_width; column += 4u * threads) {
+#pragma unroll
+        for (u32 k = 0u; k < MAX_CACHE; ++k) {
+            const u32 column = 4u * tid + k * vec_stride;
+            if (column < vec_width) {
+                const float4 weight = *reinterpret_cast<const float4 *>(norm_group + column);
+                const float4 scaled = row_norm::apply4<true, false>(cached[k], inverse, weight, zero);
+                const float out[4] = {scaled.x, scaled.y, scaled.z, scaled.w};
+                out_group.put_span<4>(column, out);
+            }
+        }
+        for (u32 column = 4u * tid + MAX_CACHE * vec_stride; column < vec_width; column += vec_stride) {
             const float4 weight = *reinterpret_cast<const float4 *>(norm_group + column);
             const float4 value = gated_value4(mixed, projection, mixed_base, proj_base, column);
             const float4 scaled = row_norm::apply4<true, false>(value, inverse, weight, zero);
             const float out[4] = {scaled.x, scaled.y, scaled.z, scaled.w};
             out_group.put_span<4>(column, out);
         }
-        for (u32 column = vec_width + tid; column < width; column += threads) {
-            const float value =
-                silu_mul(element::at<Act>(mixed, mixed_base + column), element::at<Act>(projection, proj_base + column));
+        u32 tail_idx = 0u;
+        for (u32 column = vec_width + tid; column < width; column += threads, ++tail_idx) {
+            const float value = (tail_idx == 0u)
+                ? cached_tail
+                : silu_mul(element::at<Act>(mixed, mixed_base + column), element::at<Act>(projection, proj_base + column));
             out_group.put(column, row_norm::apply<true, false>(value, inverse, norm_group[column], 0.0f));
         }
     } else {

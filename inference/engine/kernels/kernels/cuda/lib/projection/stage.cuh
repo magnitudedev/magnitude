@@ -604,6 +604,34 @@ __device__ __forceinline__ float ordered_combine8(float v) {
     return v;
 }
 
+// Accumulate `sp[u], sp[u + 8], ... < count` in exact 8-lane reference order.
+__device__ __forceinline__ float ordered_accumulate_sram8(const float *sp, u32 count, u32 u, float sum) {
+    u32 c = u;
+    for (; c + 56u < count; c += 64u) {
+        const float v0 = sp[c];
+        const float v1 = sp[c + 8u];
+        const float v2 = sp[c + 16u];
+        const float v3 = sp[c + 24u];
+        const float v4 = sp[c + 32u];
+        const float v5 = sp[c + 40u];
+        const float v6 = sp[c + 48u];
+        const float v7 = sp[c + 56u];
+        sum = seismic_fma_rn(v0, v0, sum);
+        sum = seismic_fma_rn(v1, v1, sum);
+        sum = seismic_fma_rn(v2, v2, sum);
+        sum = seismic_fma_rn(v3, v3, sum);
+        sum = seismic_fma_rn(v4, v4, sum);
+        sum = seismic_fma_rn(v5, v5, sum);
+        sum = seismic_fma_rn(v6, v6, sum);
+        sum = seismic_fma_rn(v7, v7, sum);
+    }
+    for (; c < count; c += 8u) {
+        const float val = sp[c];
+        sum = seismic_fma_rn(val, val, sum);
+    }
+    return sum;
+}
+
 template <class NORM, class Rows> struct OrderedRms {
     const float *x;
     u64 stride;
@@ -616,48 +644,64 @@ template <class NORM, class Rows> struct OrderedRms {
     static constexpr bool STAGED = true;
     static constexpr int FACTORS = 1;
     static constexpr bool VEC4 = true;
+    __device__ __forceinline__ void preload_row_regs(u32 m, u64 c, float4 &r0, float4 &r1) const {
+        const float *row_ptr = x + rows(m) * stride;
+        r0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        r1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (c + 8ull <= width) {
+            if ((reinterpret_cast<u64>(row_ptr) & 15ull) == 0ull) {
+                const float4 *src4 = reinterpret_cast<const float4 *>(row_ptr + c);
+                r0 = src4[0];
+                r1 = src4[1];
+            } else {
+                r0 = make_float4(row_ptr[c], row_ptr[c + 1ull], row_ptr[c + 2ull], row_ptr[c + 3ull]);
+                r1 = make_float4(row_ptr[c + 4ull], row_ptr[c + 5ull], row_ptr[c + 6ull], row_ptr[c + 7ull]);
+            }
+        } else if (c < width) {
+            r0 = make_float4((c + 0ull < width) ? row_ptr[c + 0ull] : 0.0f,
+                             (c + 1ull < width) ? row_ptr[c + 1ull] : 0.0f,
+                             (c + 2ull < width) ? row_ptr[c + 2ull] : 0.0f,
+                             (c + 3ull < width) ? row_ptr[c + 3ull] : 0.0f);
+            r1 = make_float4((c + 4ull < width) ? row_ptr[c + 4ull] : 0.0f,
+                             (c + 5ull < width) ? row_ptr[c + 5ull] : 0.0f,
+                             (c + 6ull < width) ? row_ptr[c + 6ull] : 0.0f,
+                             (c + 7ull < width) ? row_ptr[c + 7ull] : 0.0f);
+        }
+    }
     __device__ __forceinline__ void ordered_inverses(u32 m_rows, float *inverses, u32 first_row = 0u,
                                                      float *scratch = nullptr) const {
         const u32 tid = threadIdx.x, threads = blockDim.x;
         const u32 group_id = tid / 8u, u = tid & 7u, groups = threads / 8u;
         if (scratch != nullptr && col_stride == 1ull && m_rows == 1u) {
             const float *row_ptr = x + rows(first_row) * stride;
+            const bool aligned4 =
+                (reinterpret_cast<u64>(row_ptr) & 15ull) == 0ull && (reinterpret_cast<u64>(scratch) & 15ull) == 0ull;
             float sum = 0.0f;
             for (u64 k0 = 0; k0 < width; k0 += 512ull) {
                 const u32 chunk = (u32)min(512ull, width - k0);
-                for (u32 c = tid; c < chunk; c += threads)
-                    scratch[c] = row_ptr[k0 + c];
-                __syncthreads();
-                if (group_id == 0u) {
-                    u32 c = u;
-                    for (; c + 56u < chunk; c += 64u) {
-                        const float v0 = scratch[c];
-                        const float v1 = scratch[c + 8u];
-                        const float v2 = scratch[c + 16u];
-                        const float v3 = scratch[c + 24u];
-                        const float v4 = scratch[c + 32u];
-                        const float v5 = scratch[c + 40u];
-                        const float v6 = scratch[c + 48u];
-                        const float v7 = scratch[c + 56u];
-                        sum = seismic_fma_rn(v0, v0, sum);
-                        sum = seismic_fma_rn(v1, v1, sum);
-                        sum = seismic_fma_rn(v2, v2, sum);
-                        sum = seismic_fma_rn(v3, v3, sum);
-                        sum = seismic_fma_rn(v4, v4, sum);
-                        sum = seismic_fma_rn(v5, v5, sum);
-                        sum = seismic_fma_rn(v6, v6, sum);
-                        sum = seismic_fma_rn(v7, v7, sum);
-                    }
-                    for (; c < chunk; c += 8u) {
-                        const float v = scratch[c];
-                        sum = seismic_fma_rn(v, v, sum);
-                    }
+                if (aligned4) {
+                    const u32 chunk4 = chunk >> 2u;
+                    const float4 *src4 = reinterpret_cast<const float4 *>(row_ptr + k0);
+                    float4 *dst4 = reinterpret_cast<float4 *>(scratch);
+                    for (u32 c4 = tid; c4 < chunk4; c4 += threads)
+                        dst4[c4] = src4[c4];
+                    const u32 tail = chunk4 << 2u;
+                    for (u32 c = tail + tid; c < chunk; c += threads)
+                        scratch[c] = row_ptr[k0 + c];
+                } else {
+                    for (u32 c = tid; c < chunk; c += threads)
+                        scratch[c] = row_ptr[k0 + c];
                 }
                 __syncthreads();
+                if (group_id == 0u)
+                    sum = ordered_accumulate_sram8(scratch, chunk, u, sum);
+                __syncthreads();
             }
-            const float total_sq = ordered_combine8(sum);
-            if (tid == 0u)
-                inverses[0] = __fdiv_rn(1.0f, sqrtf(__fdiv_rn(total_sq, (float)width) + eps));
+            if (group_id == 0u) {
+                const float total_sq = ordered_combine8(sum);
+                if (tid == 0u)
+                    inverses[0] = __fdiv_rn(1.0f, sqrtf(__fdiv_rn(total_sq, (float)width) + eps));
+            }
             __syncthreads();
             return;
         }
@@ -744,8 +788,8 @@ template <class NORM, class Rows> struct OrderedRms {
         out[7] = Act::round(x1.w * inv * w[7]);
     }
     __device__ __forceinline__ void prepare_row(float *shared, u32 m, float *) const {
-        __shared__ float ordered_sram[512];
-        ordered_inverses(1u, shared, m, ordered_sram);
+        __shared__ float4 ordered_sram4[128];
+        ordered_inverses(1u, shared, m, reinterpret_cast<float *>(ordered_sram4));
     }
     __device__ __forceinline__ float value(const float *factors, u32 m, u64 k) const {
         return ordered_at(m, k, factors[0]);
@@ -833,12 +877,50 @@ template <class NORM, class Rows, u64 PARTS> struct OrderedInputOf<NORM, Rows, 0
 template <class NORM, class Rows, u64 NORM_EXTENT, u64 PARTS>
 using OrderedInput = typename OrderedInputOf<NORM, Rows, NORM_EXTENT, PARTS>::type;
 
+// Reference-order RMS inverse over preloaded register chunks (`CHUNKS * 2048` max width):
+// streams `r0[ch], r1[ch]` through `sram` (`sram_floats` floats, >= 256, 16-byte aligned)
+// so warp 0 lanes 0..7 accumulate `x[u], x[u + 8], ...` in bit-exact reference order.
+template <u32 CHUNKS, class NORM, class Rows>
+__device__ __forceinline__ float ordered_preload_inverse(const OrderedRms<NORM, Rows> &pro, u64 K,
+                                                         const float4 (&r0)[CHUNKS], const float4 (&r1)[CHUNKS],
+                                                         float *sram, u32 sram_floats, float *inv_shared) {
+    const u32 tid = threadIdx.x;
+    const u32 cap_threads = sram_floats >> 3u;
+    const u32 cap_floats = cap_threads << 3u;
+    float4 *sram4 = reinterpret_cast<float4 *>(sram);
+    float sum = 0.0f;
+    for (u32 base_slot = 0u; (u64)base_slot * 8ull < K; base_slot += cap_threads) {
+        if (base_slot > 0u)
+            __syncthreads();
+        if (tid < 256u) {
+#pragma unroll
+            for (u32 ch = 0u; ch < CHUNKS; ++ch) {
+                const u32 slot = ch * 256u + tid;
+                if (slot >= base_slot && slot < base_slot + cap_threads) {
+                    const u32 local_slot = slot - base_slot;
+                    sram4[2u * local_slot] = r0[ch];
+                    sram4[2u * local_slot + 1u] = r1[ch];
+                }
+            }
+        }
+        __syncthreads();
+        if (tid < 8u) {
+            const u32 lim = (u32)min(K - (u64)base_slot * 8ull, (u64)cap_floats);
+            sum = ordered_accumulate_sram8(sram, lim, tid, sum);
+        }
+    }
+    if (tid < 8u) {
+        const float total_sq = ordered_combine8(sum);
+        if (tid == 0u)
+            inv_shared[0] = __fdiv_rn(1.0f, sqrtf(__fdiv_rn(total_sq, (float)K) + pro.eps));
+    }
+    __syncthreads();
+    return inv_shared[0];
+}
+
 template <class Pro, class Out>
-__device__ __forceinline__ float ordered_stage_row(const Pro &pro, u32 m, u64 K, Out out, u64 stride0, u64 stride1) {
-    __shared__ float inv_shared[1];
-    __shared__ float stage_scratch[512];
-    pro.ordered_inverses(1u, inv_shared, m, stage_scratch);
-    const float inv = inv_shared[0];
+__device__ __forceinline__ void ordered_stage_store_row(const Pro &pro, u32 m, u64 K, float inv, Out out, u64 stride0,
+                                                        u64 stride1) {
     const u64 row_base = (u64)m * stride0;
     if (stride1 == 1ull && pro.can_vec8(m) && (reinterpret_cast<u64>(out.stored(row_base)) & 15ull) == 0ull) {
         const u64 k8 = K & ~7ull;
@@ -854,5 +936,72 @@ __device__ __forceinline__ float ordered_stage_row(const Pro &pro, u32 m, u64 K,
         for (u64 c = threadIdx.x; c < K; c += blockDim.x)
             out.put(row_base + c * stride1, pro.ordered_at(m, c, inv));
     }
+}
+
+template <class NORM, class Rows, class Out>
+__device__ __forceinline__ float ordered_stage_row(const OrderedRms<NORM, Rows> &pro, u32 m, u64 K, Out out,
+                                                   u64 stride0, u64 stride1) {
+    __shared__ float inv_shared[1];
+    __shared__ float4 stage_scratch4[512];
+    float *stage_scratch = reinterpret_cast<float *>(stage_scratch4);
+    const u64 row_base = (u64)m * stride0;
+    if (blockDim.x == 256u && K == pro.width && K > 0ull && K <= 8192ull && pro.col_stride == 1ull) {
+        const u32 tid = threadIdx.x;
+        float4 r0[4], r1[4];
+#pragma unroll
+        for (u32 ch = 0u; ch < 4u; ++ch) {
+            r0[ch] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            r1[ch] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const u64 c = (u64)(ch * 256u + tid) * 8ull;
+            if (c < K)
+                pro.preload_row_regs(m, c, r0[ch], r1[ch]);
+        }
+        const float inv = ordered_preload_inverse<4u>(pro, K, r0, r1, stage_scratch, 2048u, inv_shared);
+        const bool fast_put = stride1 == 1ull && pro.norm_stride == 1ull &&
+                              (reinterpret_cast<u64>(pro.norm) & 15ull) == 0ull &&
+                              (reinterpret_cast<u64>(out.stored(row_base)) & 15ull) == 0ull;
+#pragma unroll
+        for (u32 ch = 0u; ch < 4u; ++ch) {
+            const u64 c = (u64)(ch * 256u + tid) * 8ull;
+            if (c < K) {
+                if (fast_put && c + 8ull <= K) {
+                    float w[8];
+                    element::span<NORM, 8, true>(pro.norm, c, w);
+                    float vals[8];
+                    vals[0] = Act::round(r0[ch].x * inv * w[0]);
+                    vals[1] = Act::round(r0[ch].y * inv * w[1]);
+                    vals[2] = Act::round(r0[ch].z * inv * w[2]);
+                    vals[3] = Act::round(r0[ch].w * inv * w[3]);
+                    vals[4] = Act::round(r1[ch].x * inv * w[4]);
+                    vals[5] = Act::round(r1[ch].y * inv * w[5]);
+                    vals[6] = Act::round(r1[ch].z * inv * w[6]);
+                    vals[7] = Act::round(r1[ch].w * inv * w[7]);
+                    out.template put_span<8>(row_base + c, vals);
+                } else {
+                    const float raw_v[8] = {
+                        r0[ch].x, r0[ch].y, r0[ch].z, r0[ch].w, r1[ch].x, r1[ch].y, r1[ch].z, r1[ch].w};
+                    for (u32 j = 0u; j < 8u && c + j < K; ++j) {
+                        const float val = Act::round(
+                            raw_v[j] * inv * element::at<NORM>(pro.norm, (c + j) * pro.norm_stride));
+                        out.put(row_base + (c + j) * stride1, val);
+                    }
+                }
+            }
+        }
+        return inv;
+    }
+    pro.ordered_inverses(1u, inv_shared, m, stage_scratch);
+    const float inv = inv_shared[0];
+    ordered_stage_store_row(pro, m, K, inv, out, stride0, stride1);
+    return inv;
+}
+
+template <class Pro, class Out>
+__device__ __forceinline__ float ordered_stage_row(const Pro &pro, u32 m, u64 K, Out out, u64 stride0, u64 stride1) {
+    __shared__ float inv_shared[1];
+    __shared__ float4 stage_scratch4[128];
+    pro.ordered_inverses(1u, inv_shared, m, reinterpret_cast<float *>(stage_scratch4));
+    const float inv = inv_shared[0];
+    ordered_stage_store_row(pro, m, K, inv, out, stride0, stride1);
     return inv;
 }

@@ -123,9 +123,12 @@ extern "C" __global__ void shape_rows_prepare(SEISMIC_KERNEL_PARAMS) {
     const u32 *bits = reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_MASK)) + row * SEISMIC_MASK_STRIDE_0;
     const bool scale_temp = temperature != 0.0f && temperature != 1.0f;
     const bool write_back = penalized || masked || scale_temp;
+    const u64 row_base = row * SEISMIC_LOGITS_STRIDE_0;
+    const bool vec4 =
+        SEISMIC_LOGITS_STRIDE_1 == 1 && (reinterpret_cast<u64>(logits.stored(row_base)) & 15u) == 0;
     u32 maximum = 0u;
-    for (u64 token = begin + threadIdx.x; token < end; token += blockDim.x) {
-        const u64 slot = row * SEISMIC_LOGITS_STRIDE_0 + token * SEISMIC_LOGITS_STRIDE_1;
+    auto process_scalar = [&](u64 token) {
+        const u64 slot = row_base + token * SEISMIC_LOGITS_STRIDE_1;
         float value = logits.at(slot);
         if (penalized) {
             u32 count = 0u;
@@ -151,6 +154,68 @@ extern "C" __global__ void shape_rows_prepare(SEISMIC_KERNEL_PARAMS) {
             maximum = max(maximum, order::finite_key(value));
         else if (value != -INF)
             maximum = UNSHAPED;
+    };
+    const u64 aligned_begin = (begin + 3ull) & ~3ull;
+    const u64 aligned_end = end & ~3ull;
+    if (vec4 && aligned_begin < aligned_end) {
+        if (begin + threadIdx.x < aligned_begin)
+            process_scalar(begin + threadIdx.x);
+        for (u64 token = aligned_begin + (u64)threadIdx.x * 4; token < aligned_end; token += (u64)blockDim.x * 4) {
+            float v[4];
+            logits.span<4>(row_base + token, v);
+            if (penalized) {
+                u32 c[4] = {0u, 0u, 0u, 0u};
+                if (use_counts) {
+                    const u32 base = (u32)(token - begin);
+                    c[0] = counts[base + 0u];
+                    c[1] = counts[base + 1u];
+                    c[2] = counts[base + 2u];
+                    c[3] = counts[base + 3u];
+                } else {
+                    const int t0 = (int)token;
+                    const int *hist_row = history + row * SEISMIC_HISTORY_STRIDE_0;
+                    for (u64 h = 0; h < SEISMIC_DIM_HN; ++h) {
+                        const u32 d = (u32)(hist_row[h * SEISMIC_HISTORY_STRIDE_1] - t0);
+                        if (d < 4u)
+                            c[d] += 1u;
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    if (c[k] > 0u) {
+                        v[k] = v[k] < 0.0f ? v[k] * repetition : v[k] / repetition;
+                        v[k] = v[k] - presence - frequency * (float)c[k];
+                    }
+                }
+            }
+            if (masked) {
+                const u32 mask_nib = bits[(token >> 5) * SEISMIC_MASK_STRIDE_1] >> (token & 31u);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    if (((mask_nib >> k) & 1u) == 0u && v[k] < INF)
+                        v[k] = -INF;
+                }
+            }
+            if (scale_temp) {
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                    v[k] = v[k] / temperature;
+            }
+            if (write_back)
+                logits.put_span<4>(row_base + token, v);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                if (finite(v[k]))
+                    maximum = max(maximum, order::finite_key(v[k]));
+                else if (v[k] != -INF)
+                    maximum = UNSHAPED;
+            }
+        }
+        if (aligned_end + threadIdx.x < end)
+            process_scalar(aligned_end + threadIdx.x);
+    } else {
+        for (u64 token = begin + threadIdx.x; token < end; token += blockDim.x)
+            process_scalar(token);
     }
     maximum = seismic_redux_max_u32(maximum);
     if (threadIdx.x % 32 == 0)
@@ -165,9 +230,8 @@ extern "C" __global__ void shape_rows_prepare(SEISMIC_KERNEL_PARAMS) {
 }
 
 // ---------------------------------------------------------------------------
-// Selection (one block of SELECT_THREADS per row).
+// Selection (one block of 1024 threads per row).
 
-#define SELECT_THREADS 1024
 #define BINS 2048
 #define COMPACT_CAP 2048u
 
@@ -182,19 +246,18 @@ union SelectScratch {
 struct Survivor {
     element::Stored<element::F32> line;
     u64 stride;
+    bool vec4;
     float maximum;
     u32 top_k_key;
     float min_p;
-    // The finite value at `token` when it survives top-k and min-p.
-    __device__ __forceinline__ bool at(u64 token, float &value, u32 &key) const {
-        value = line.at(token * stride);
+    // Evaluates whether a loaded `value` survives top-k and min-p.
+    __device__ __forceinline__ bool eval(float value, u32 &key) const {
         if (!finite(value))
             return false;
         key = order::finite_key(value);
         return key >= top_k_key && !(min_p > 0.0f && expf(value - maximum) < min_p);
     }
-    __device__ __forceinline__ bool at_mass(u64 token, u32 &key, u64 &mass_out) const {
-        const float value = line.at(token * stride);
+    __device__ __forceinline__ bool eval_mass(float value, u32 &key, u64 &mass_out) const {
         if (!finite(value))
             return false;
         key = order::finite_key(value);
@@ -208,6 +271,49 @@ struct Survivor {
     }
     __device__ __forceinline__ u64 mass(float value) const {
         return (u64)(expf(value - maximum) * 4294967296.0f);
+    }
+    // Block-strided full-vocab scan with 128-bit read-only vector loads when
+    // stride == 1 and 16-byte aligned.
+    template <class F>
+    __device__ __forceinline__ void for_each_vocab(F fn) const {
+        if (vec4) {
+            const u64 vec_end = SEISMIC_DIM_V & ~3ull;
+            for (u64 token = (u64)threadIdx.x * 4; token < vec_end; token += (u64)blockDim.x * 4) {
+                float values[4];
+                line.span<4, true>(token, values);
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                    fn(token + (u64)k, values[k]);
+            }
+            if (vec_end + threadIdx.x < SEISMIC_DIM_V) {
+                const u64 token = vec_end + threadIdx.x;
+                fn(token, line.at(token));
+            }
+        } else {
+            for (u64 token = threadIdx.x; token < SEISMIC_DIM_V; token += blockDim.x)
+                fn(token, line.at(token * stride));
+        }
+    }
+    // Ascending scan over [first, last); when `vec4` is true, `first` is 4-aligned.
+    template <class F>
+    __device__ __forceinline__ void for_each_aligned_range(u64 first, u64 last, F fn) const {
+        if (first >= last)
+            return;
+        if (vec4) {
+            const u64 vec_end = last & ~3ull;
+            for (u64 token = first; token < vec_end; token += 4) {
+                float values[4];
+                line.span<4, true>(token, values);
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                    fn(token + (u64)k, values[k]);
+            }
+            for (u64 token = first > vec_end ? first : vec_end; token < last; ++token)
+                fn(token, line.at(token));
+        } else {
+            for (u64 token = first; token < last; ++token)
+                fn(token, line.at(token * stride));
+        }
     }
 };
 
@@ -375,11 +481,11 @@ __device__ bool select_key_from(const Survivor &survivor, u64 target, int start_
         for (u32 bin = threadIdx.x; bin < bins; bin += blockDim.x)
             histogram[bin] = 0;
         __syncthreads();
-        for (u64 token = threadIdx.x; token < SEISMIC_DIM_V; token += blockDim.x) {
+        survivor.for_each_vocab([&](u64 token, float value) {
+            (void)token;
             if (!MASS) {
-                float value;
                 u32 key;
-                if (survivor.at(token, value, key) && (key & mask) == prefix) {
+                if (survivor.eval(value, key) && (key & mask) == prefix) {
                     const u32 bin = (key >> shifts[level]) & (bins - 1);
                     const u32 active = __activemask();
                     const u32 peers = __match_any_sync(active, bin);
@@ -389,10 +495,10 @@ __device__ bool select_key_from(const Survivor &survivor, u64 target, int start_
             } else {
                 u32 key;
                 u64 w;
-                if (survivor.at_mass(token, key, w) && (key & mask) == prefix)
+                if (survivor.eval_mass(value, key, w) && (key & mask) == prefix)
                     atomicAdd(&histogram[(key >> shifts[level]) & (bins - 1)], w);
             }
-        }
+        });
         __syncthreads();
         const u32 digit = descend(histogram, bins, target, above, lane_totals);
         if (digit == BINS)
@@ -411,7 +517,6 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
     __shared__ SelectScratch smem;
     __shared__ u64 lane_totals[32];
     __shared__ u64 reduce[32];
-    __shared__ u32 chunk_counts[SELECT_THREADS];
     __shared__ u32 cand_count;
     const u64 row = blockIdx.x;
     u32 *scratch = row_scratch(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATE), row);
@@ -428,7 +533,9 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
             selection->maximum = UNSHAPED;
         return;
     }
-    Survivor survivor{logits.view(row * SEISMIC_LOGITS_STRIDE_0), SEISMIC_LOGITS_STRIDE_1, order::value(maximum), 0u, 0.0f};
+    const element::Stored<element::F32> line = logits.view(row * SEISMIC_LOGITS_STRIDE_0);
+    const bool vec4 = SEISMIC_LOGITS_STRIDE_1 == 1 && (reinterpret_cast<u64>(line.bytes(0)) & 15u) == 0;
+    Survivor survivor{line, SEISMIC_LOGITS_STRIDE_1, vec4, order::value(maximum), 0u, 0.0f};
     u32 top_k_key = 0u;
     u64 above = 0;
     bool compacted = false;
@@ -437,8 +544,8 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
         for (u32 bin = threadIdx.x; bin < BINS; bin += blockDim.x)
             smem.histogram[bin] = 0;
         __syncthreads();
-        for (u64 token = threadIdx.x; token < SEISMIC_DIM_V; token += blockDim.x) {
-            const float value = survivor.line.at(token * survivor.stride);
+        survivor.for_each_vocab([&](u64 token, float value) {
+            (void)token;
             if (finite(value)) {
                 const u32 bin = order::finite_key(value) >> 21;
                 const u32 active = __activemask();
@@ -446,7 +553,7 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
                 if (__ffs(peers) - 1 == (int)(threadIdx.x & 31u))
                     atomicAdd(&smem.histogram[bin], (u64)__popc(peers));
             }
-        }
+        });
         __syncthreads();
         const u32 digit0 = descend(smem.histogram, BINS, (u64)top_k, above, lane_totals);
         if (digit0 != BINS) {
@@ -456,8 +563,7 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
                 if (threadIdx.x == 0)
                     cand_count = 0u;
                 __syncthreads();
-                for (u64 token = threadIdx.x; token < SEISMIC_DIM_V; token += blockDim.x) {
-                    const float value = survivor.line.at(token * survivor.stride);
+                survivor.for_each_vocab([&](u64 token, float value) {
                     if (finite(value)) {
                         const u32 key = order::finite_key(value);
                         if ((key >> 21) >= digit0) {
@@ -466,7 +572,7 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
                             smem.compact.tokens[idx] = (u32)token;
                         }
                     }
-                }
+                });
                 __syncthreads();
                 compacted_count = cand_count;
                 bitonic_sort_compact(compacted_count, smem.compact.keys, smem.compact.tokens);
@@ -492,10 +598,10 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
                 cand_count = 0u;
             __syncthreads();
             u64 total = 0;
-            for (u64 token = threadIdx.x; token < SEISMIC_DIM_V; token += blockDim.x) {
+            survivor.for_each_vocab([&](u64 token, float value) {
                 u32 key;
                 u64 w;
-                if (survivor.at_mass(token, key, w)) {
+                if (survivor.eval_mass(value, key, w)) {
                     total += w;
                     if (*(volatile u32 *)&cand_count <= COMPACT_CAP) {
                         const u32 idx = atomicAdd(&cand_count, 1u);
@@ -505,7 +611,7 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
                         }
                     }
                 }
-            }
+            });
             for (int offset = 16; offset > 0; offset >>= 1)
                 total += __shfl_xor_sync(0xFFFFFFFFu, total, offset);
             if (threadIdx.x % 32 == 0)
@@ -532,30 +638,51 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
                 const u64 each = survivor.mass(order::value(key));
                 // above < target <= above + ties * each, so each > 0 and rank < ties.
                 const u64 rank = (target - above + each - 1) / each - 1;
-                const u64 chunk = (SEISMIC_DIM_V + blockDim.x - 1) / blockDim.x;
-                const u64 first = threadIdx.x * chunk;
+                const u64 raw_chunk = (SEISMIC_DIM_V + blockDim.x - 1) / blockDim.x;
+                const u64 chunk = survivor.vec4 ? ((raw_chunk + 3ull) & ~3ull) : raw_chunk;
+                const u64 first = (u64)threadIdx.x * chunk;
+                const u64 last = first + chunk < SEISMIC_DIM_V ? first + chunk : SEISMIC_DIM_V;
                 u32 tie_count = 0;
-                for (u64 token = first; token < first + chunk && token < SEISMIC_DIM_V; ++token) {
-                    float value;
+                survivor.for_each_aligned_range(first, last, [&](u64 token, float value) {
+                    (void)token;
                     u32 candidate;
-                    tie_count += survivor.at(token, value, candidate) && candidate == key ? 1u : 0u;
+                    tie_count += survivor.eval(value, candidate) && candidate == key ? 1u : 0u;
+                });
+                const u32 lane = threadIdx.x & 31u;
+                const u32 warp = threadIdx.x >> 5;
+                u32 warp_inc = tie_count;
+#pragma unroll
+                for (int offset = 1; offset < 32; offset <<= 1) {
+                    const u32 n = __shfl_up_sync(0xFFFFFFFFu, warp_inc, offset);
+                    if (lane >= (u32)offset)
+                        warp_inc += n;
                 }
-                chunk_counts[threadIdx.x] = tie_count;
+                if (lane == 31u)
+                    reduce[warp] = (u64)warp_inc;
                 __syncthreads();
-                u64 before = 0;
-                for (u32 t = 0; t < threadIdx.x; ++t)
-                    before += chunk_counts[t];
+                if (warp == 0u) {
+                    u64 wv = lane < (blockDim.x >> 5) ? reduce[lane] : 0ull;
+#pragma unroll
+                    for (int offset = 1; offset < 32; offset <<= 1) {
+                        const u64 n = __shfl_up_sync(0xFFFFFFFFu, wv, offset);
+                        if (lane >= (u32)offset)
+                            wv += n;
+                    }
+                    reduce[lane] = wv;
+                }
+                __syncthreads();
+                const u64 warp_base = warp > 0u ? reduce[warp - 1u] : 0ull;
+                const u64 before = warp_base + (u64)(warp_inc - tie_count);
                 if (rank >= before && rank < before + tie_count) {
                     u64 seen = before;
-                    for (u64 token = first; token < first + chunk && token < SEISMIC_DIM_V; ++token) {
-                        float value;
+                    survivor.for_each_aligned_range(first, last, [&](u64 token, float value) {
                         u32 candidate;
-                        if (survivor.at(token, value, candidate) && candidate == key) {
+                        if (survivor.eval(value, candidate) && candidate == key) {
                             if (seen == rank)
                                 selection->top_p_token = (u32)token;
                             ++seen;
                         }
-                    }
+                    });
                 }
                 mode = 1u;
                 top_p_key = key;
@@ -586,18 +713,49 @@ extern "C" __global__ void shape_rows_apply(SEISMIC_KERNEL_PARAMS) {
     const float min_p = parameter(params, row, 3);
     if (selection.top_k_key == 0u && !(min_p > 0.0f) && selection.top_p_mode == 0u)
         return;
-    for (u64 token = slice_begin(part) + threadIdx.x; token < slice_end(part); token += blockDim.x) {
-        const u64 slot = row * SEISMIC_LOGITS_STRIDE_0 + token * SEISMIC_LOGITS_STRIDE_1;
-        const float value = logits.at(slot);
+    const u64 begin = slice_begin(part);
+    const u64 end = slice_end(part);
+    const u64 row_base = row * SEISMIC_LOGITS_STRIDE_0;
+    const bool vec4 =
+        SEISMIC_LOGITS_STRIDE_1 == 1 && (reinterpret_cast<u64>(logits.stored(row_base)) & 15u) == 0;
+    auto should_remove = [&](u64 token, float value) -> bool {
         if (!finite(value))
-            continue;
+            return false;
         const u32 key = order::finite_key(value);
-        const bool removed =
-            key < selection.top_k_key || (min_p > 0.0f && expf(value - maximum) < min_p) ||
-            selection.top_p_mode == 2u ||
-            (selection.top_p_mode == 1u &&
-             (key < selection.top_p_key || (key == selection.top_p_key && (u32)token > selection.top_p_token)));
-        if (removed)
+        return key < selection.top_k_key || (min_p > 0.0f && expf(value - maximum) < min_p) ||
+               selection.top_p_mode == 2u ||
+               (selection.top_p_mode == 1u &&
+                (key < selection.top_p_key || (key == selection.top_p_key && (u32)token > selection.top_p_token)));
+    };
+    auto apply_scalar = [&](u64 token) {
+        const u64 slot = row_base + token * SEISMIC_LOGITS_STRIDE_1;
+        const float value = logits.at(slot);
+        if (should_remove(token, value))
             logits.put(slot, -INF);
+    };
+    const u64 aligned_begin = (begin + 3ull) & ~3ull;
+    const u64 aligned_end = end & ~3ull;
+    if (vec4 && aligned_begin < aligned_end) {
+        if (begin + threadIdx.x < aligned_begin)
+            apply_scalar(begin + threadIdx.x);
+        for (u64 token = aligned_begin + (u64)threadIdx.x * 4; token < aligned_end; token += (u64)blockDim.x * 4) {
+            float v[4];
+            logits.span<4>(row_base + token, v);
+            bool changed = false;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                if (should_remove(token + (u64)k, v[k])) {
+                    v[k] = -INF;
+                    changed = true;
+                }
+            }
+            if (changed)
+                logits.put_span<4>(row_base + token, v);
+        }
+        if (aligned_end + threadIdx.x < end)
+            apply_scalar(aligned_end + threadIdx.x);
+    } else {
+        for (u64 token = begin + threadIdx.x; token < end; token += blockDim.x)
+            apply_scalar(token);
     }
 }

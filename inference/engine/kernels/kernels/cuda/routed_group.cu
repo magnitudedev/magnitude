@@ -15,7 +15,7 @@
 namespace {
 
 constexpr unsigned experts = SEISMIC_DIM_E;
-constexpr unsigned parts = 1024 / experts;
+constexpr unsigned parts = SEISMIC_DEVICE_MAX_GROUP_THREADS / experts;
 constexpr unsigned threads = experts * parts;
 constexpr unsigned expert_warps = (experts + 31) / 32;
 constexpr unsigned K = SEISMIC_DIM_K;

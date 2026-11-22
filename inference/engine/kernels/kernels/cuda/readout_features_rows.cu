@@ -25,52 +25,159 @@ extern "C" __global__ void readout_features_rows(SEISMIC_KERNEL_PARAMS) {
                               (reinterpret_cast<u64>(features.stored(0)) & (4ull * Act::bytes - 1ull)) == 0ull;
     if constexpr (SEISMIC_DIM_NM > 0) {
         const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
-        float squares = 0.0f;
-        if (hidden_vec) {
-            for (u64 i = static_cast<u64>(threadIdx.x) * 4ull; i < width4; i += step4) {
-                const float4 v = *reinterpret_cast<const float4 *>(src + i);
-                squares = seismic_fma_rn(v.x, v.x, squares);
-                squares = seismic_fma_rn(v.y, v.y, squares);
-                squares = seismic_fma_rn(v.z, v.z, squares);
-                squares = seismic_fma_rn(v.w, v.w, squares);
-            }
-            for (u64 i = width4 + threadIdx.x; i < width; i += blockDim.x) {
-                const float v = src[i];
-                squares = seismic_fma_rn(v, v, squares);
-            }
-        } else {
-            for (u64 i = threadIdx.x; i < width; i += blockDim.x) {
-                const float v = src[i * SEISMIC_HIDDEN_STRIDE_2];
-                squares = seismic_fma_rn(v, v, squares);
-            }
-        }
-        const float total = reduce::group_sum(squares, partials);
-        const float inverse = rsqrtf(total / (float)width + epsilon);
         const u8 *norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
         const bool store_vec = hidden_vec &&
                                features_vec &&
                                SEISMIC_NORM_STRIDE_0 == 1ull &&
                                (reinterpret_cast<u64>(norm) & (4ull * Norm::bytes - 1ull)) == 0ull;
-        if (store_vec) {
-            for (u64 i = static_cast<u64>(threadIdx.x) * 4ull; i < width4; i += step4) {
-                const float4 v = *reinterpret_cast<const float4 *>(src + i);
-                float nv[4];
-                element::span<Norm, 4, true>(norm, i, nv);
-                float out[4];
-                out[0] = (v.x * inverse) * nv[0];
-                out[1] = (v.y * inverse) * nv[1];
-                out[2] = (v.z * inverse) * nv[2];
-                out[3] = (v.w * inverse) * nv[3];
-                features.put_span<4>(i, out);
+        float squares = 0.0f;
+        if constexpr (SEISMIC_DIM_D <= 8192ull) {
+            constexpr u64 CACHE = 8ull;
+            float4 cached[CACHE];
+            float tail_cached = 0.0f;
+            const bool can_cache = hidden_vec && width <= CACHE * step4;
+            const u64 base = static_cast<u64>(threadIdx.x) * 4ull;
+            const u64 tail = width4 + threadIdx.x;
+            if (can_cache) {
+#pragma unroll
+                for (u64 slot = 0; slot < CACHE; ++slot) {
+                    const u64 i = base + slot * step4;
+                    if (i < width4) {
+                        const float4 v = *reinterpret_cast<const float4 *>(src + i);
+                        cached[slot] = v;
+                        squares = seismic_fma_rn(v.x, v.x, squares);
+                        squares = seismic_fma_rn(v.y, v.y, squares);
+                        squares = seismic_fma_rn(v.z, v.z, squares);
+                        squares = seismic_fma_rn(v.w, v.w, squares);
+                    }
+                }
+                if (tail < width) {
+                    tail_cached = src[tail];
+                    squares = seismic_fma_rn(tail_cached, tail_cached, squares);
+                }
+            } else if (hidden_vec) {
+                for (u64 i = base; i < width4; i += step4) {
+                    const float4 v = *reinterpret_cast<const float4 *>(src + i);
+                    squares = seismic_fma_rn(v.x, v.x, squares);
+                    squares = seismic_fma_rn(v.y, v.y, squares);
+                    squares = seismic_fma_rn(v.z, v.z, squares);
+                    squares = seismic_fma_rn(v.w, v.w, squares);
+                }
+                for (u64 i = tail; i < width; i += blockDim.x) {
+                    const float v = src[i];
+                    squares = seismic_fma_rn(v, v, squares);
+                }
+            } else {
+                for (u64 i = threadIdx.x; i < width; i += blockDim.x) {
+                    const float v = src[i * SEISMIC_HIDDEN_STRIDE_2];
+                    squares = seismic_fma_rn(v, v, squares);
+                }
             }
-            for (u64 i = width4 + threadIdx.x; i < width; i += blockDim.x) {
-                features.put(i, (src[i] * inverse) * element::at<Norm>(norm, i));
+            const float total = reduce::group_sum(squares, partials);
+            const float inverse = rsqrtf(total / (float)width + epsilon);
+            if (can_cache && store_vec) {
+#pragma unroll
+                for (u64 slot = 0; slot < CACHE; ++slot) {
+                    const u64 i = base + slot * step4;
+                    if (i < width4) {
+                        const float4 v = cached[slot];
+                        float nv[4];
+                        element::span<Norm, 4, true>(norm, i, nv);
+                        float out[4];
+                        out[0] = (v.x * inverse) * nv[0];
+                        out[1] = (v.y * inverse) * nv[1];
+                        out[2] = (v.z * inverse) * nv[2];
+                        out[3] = (v.w * inverse) * nv[3];
+                        features.put_span<4>(i, out);
+                    }
+                }
+                if (tail < width) {
+                    features.put(tail, (tail_cached * inverse) * element::at<Norm>(norm, tail));
+                }
+            } else if (can_cache) {
+#pragma unroll
+                for (u64 slot = 0; slot < CACHE; ++slot) {
+                    const u64 i = base + slot * step4;
+                    if (i < width4) {
+                        const float4 v = cached[slot];
+                        features.put((i + 0ull) * SEISMIC_RESULT_0_STRIDE_1,
+                                     (v.x * inverse) * element::at<Norm>(norm, (i + 0ull) * SEISMIC_NORM_STRIDE_0));
+                        features.put((i + 1ull) * SEISMIC_RESULT_0_STRIDE_1,
+                                     (v.y * inverse) * element::at<Norm>(norm, (i + 1ull) * SEISMIC_NORM_STRIDE_0));
+                        features.put((i + 2ull) * SEISMIC_RESULT_0_STRIDE_1,
+                                     (v.z * inverse) * element::at<Norm>(norm, (i + 2ull) * SEISMIC_NORM_STRIDE_0));
+                        features.put((i + 3ull) * SEISMIC_RESULT_0_STRIDE_1,
+                                     (v.w * inverse) * element::at<Norm>(norm, (i + 3ull) * SEISMIC_NORM_STRIDE_0));
+                    }
+                }
+                if (tail < width) {
+                    features.put(tail * SEISMIC_RESULT_0_STRIDE_1,
+                                 (tail_cached * inverse) * element::at<Norm>(norm, tail * SEISMIC_NORM_STRIDE_0));
+                }
+            } else if (store_vec) {
+                for (u64 i = base; i < width4; i += step4) {
+                    const float4 v = *reinterpret_cast<const float4 *>(src + i);
+                    float nv[4];
+                    element::span<Norm, 4, true>(norm, i, nv);
+                    float out[4];
+                    out[0] = (v.x * inverse) * nv[0];
+                    out[1] = (v.y * inverse) * nv[1];
+                    out[2] = (v.z * inverse) * nv[2];
+                    out[3] = (v.w * inverse) * nv[3];
+                    features.put_span<4>(i, out);
+                }
+                for (u64 i = tail; i < width; i += blockDim.x) {
+                    features.put(i, (src[i] * inverse) * element::at<Norm>(norm, i));
+                }
+            } else {
+                for (u64 i = threadIdx.x; i < width; i += blockDim.x) {
+                    features.put(i * SEISMIC_RESULT_0_STRIDE_1,
+                                 (src[i * SEISMIC_HIDDEN_STRIDE_2] * inverse) *
+                                     element::at<Norm>(norm, i * SEISMIC_NORM_STRIDE_0));
+                }
             }
         } else {
-            for (u64 i = threadIdx.x; i < width; i += blockDim.x) {
-                features.put(i * SEISMIC_RESULT_0_STRIDE_1,
-                             (src[i * SEISMIC_HIDDEN_STRIDE_2] * inverse) *
-                                 element::at<Norm>(norm, i * SEISMIC_NORM_STRIDE_0));
+            if (hidden_vec) {
+                for (u64 i = static_cast<u64>(threadIdx.x) * 4ull; i < width4; i += step4) {
+                    const float4 v = *reinterpret_cast<const float4 *>(src + i);
+                    squares = seismic_fma_rn(v.x, v.x, squares);
+                    squares = seismic_fma_rn(v.y, v.y, squares);
+                    squares = seismic_fma_rn(v.z, v.z, squares);
+                    squares = seismic_fma_rn(v.w, v.w, squares);
+                }
+                for (u64 i = width4 + threadIdx.x; i < width; i += blockDim.x) {
+                    const float v = src[i];
+                    squares = seismic_fma_rn(v, v, squares);
+                }
+            } else {
+                for (u64 i = threadIdx.x; i < width; i += blockDim.x) {
+                    const float v = src[i * SEISMIC_HIDDEN_STRIDE_2];
+                    squares = seismic_fma_rn(v, v, squares);
+                }
+            }
+            const float total = reduce::group_sum(squares, partials);
+            const float inverse = rsqrtf(total / (float)width + epsilon);
+            if (store_vec) {
+                for (u64 i = static_cast<u64>(threadIdx.x) * 4ull; i < width4; i += step4) {
+                    const float4 v = *reinterpret_cast<const float4 *>(src + i);
+                    float nv[4];
+                    element::span<Norm, 4, true>(norm, i, nv);
+                    float out[4];
+                    out[0] = (v.x * inverse) * nv[0];
+                    out[1] = (v.y * inverse) * nv[1];
+                    out[2] = (v.z * inverse) * nv[2];
+                    out[3] = (v.w * inverse) * nv[3];
+                    features.put_span<4>(i, out);
+                }
+                for (u64 i = width4 + threadIdx.x; i < width; i += blockDim.x) {
+                    features.put(i, (src[i] * inverse) * element::at<Norm>(norm, i));
+                }
+            } else {
+                for (u64 i = threadIdx.x; i < width; i += blockDim.x) {
+                    features.put(i * SEISMIC_RESULT_0_STRIDE_1,
+                                 (src[i * SEISMIC_HIDDEN_STRIDE_2] * inverse) *
+                                     element::at<Norm>(norm, i * SEISMIC_NORM_STRIDE_0));
+                }
             }
         }
     } else {
