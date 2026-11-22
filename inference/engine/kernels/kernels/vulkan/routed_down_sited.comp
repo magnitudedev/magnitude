@@ -15,15 +15,7 @@
 #include "lib/routed/down_sum.glsl"
 
 void routed_down_sited() {
-    uint64_t q = 0ul;
-    if (gl_LocalInvocationIndex == 0u) {
-        q = streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0);
-        // `seismic_shared_uvec4[0].y` (bytes 4..7) is disjoint from
-        // `seismic_shared_i32[0]` (bytes 0..3), which `routed_site_answered`
-        // uses, and always within the 16-byte minimum shared footprint.
-        seismic_shared_uvec4[0].y = uint(streaming_modulo(q, SEISMIC_DIM_FLIGHT));
-    }
-    streaming_barrier();
-    const uint64_t slot = uint64_t(seismic_shared_uvec4[0].y);
+    const uint64_t q = streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0);
+    const uint64_t slot = streaming_modulo(q, SEISMIC_DIM_FLIGHT);
     routed_down_sum_channel(routed_site_answered(q, slot), slot);
 }
