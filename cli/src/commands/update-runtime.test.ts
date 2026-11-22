@@ -26,6 +26,13 @@ describe("headless application update output", () => {
     expect(renderApplicationUpdate(state({ _tag: "Downloading", version: "2.0.0", completed: 10, total: 100 }))).toContain("magnitude update status")
     expect(renderApplicationUpdate(state({ _tag: "Ready", version: "2.0.0" }))).toContain("magnitude update install")
   })
+  it("recommends `magnitude update install` for available updates on CLI-only installs", () => {
+    expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 100, failed: Option.none() }), "Headless", true))
+      .toBe("Magnitude 2.0.0 is available (100 B).\nInstall: magnitude update install\n")
+    expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 100, failed: Option.some("startup") }), "None", true))
+      .toBe("Magnitude 2.0.0 is available (100 B), but it failed to start on this machine, so it is not downloaded automatically.\n"
+        + "A newer release replaces it when one is published. To try it again anyway: magnitude update install\n")
+  })
   it("tells a container to pull the newer image instead of downloading", () => {
     expect(renderApplicationUpdate(state({ _tag: "ImageAvailable", version: "2.0.0", image: "magnitudedev/magnitude" }), "Headless"))
       .toBe("Magnitude 2.0.0 is available. Pull the new image (docker pull magnitudedev/magnitude) and recreate the container.\n")

@@ -1,10 +1,9 @@
 import { Command, CommandExecutor } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { Data, Effect, Option } from "effect"
-import { NativeHost, resolveInstalledApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
+import { NativeHost } from "@magnitudedev/daemon-management/desktop-native"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
-import { desktopApplication, desktopServiceOrigin } from "../server/application"
-import { isDevelopmentBuild } from "../runtime/environment"
+import { desktopApplication, desktopServiceOrigin, isStandaloneInstallation } from "../server/application"
 import { runCommand } from "./output"
 
 class AppNotServing extends Data.TaggedError("AppNotServing")<{ readonly message: string }> {}
@@ -37,13 +36,9 @@ const openInBrowser = Effect.gen(function* () {
     : `Open ${desktopServiceOrigin} in a browser on this computer. To open it from another computer, see \`magnitude docs remote-access\`.\n`
 }).pipe(Effect.provide(BunContext.layer))
 
-const standalone = isDevelopmentBuild() ? Effect.succeed(false)
-  : resolveInstalledApplicationRuntime(process.execPath, process.platform).pipe(
-    Effect.map(runtime => runtime.layout === "Standalone"), Effect.orElseSucceed(() => false), Effect.provide(BunContext.layer))
-
 const showDesktopWindow = desktopApplication.ensure("ShowWindow").pipe(Effect.as("Opened Magnitude.\n"))
 
 export const openApplication = () => runCommand({
-  effect: standalone.pipe(Effect.flatMap((cliOnly): Effect.Effect<string, unknown> => cliOnly ? openInBrowser : showDesktopWindow)),
+  effect: isStandaloneInstallation.pipe(Effect.flatMap((cliOnly): Effect.Effect<string, unknown> => cliOnly ? openInBrowser : showDesktopWindow)),
   render: message => message,
 })

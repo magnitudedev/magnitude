@@ -1,13 +1,18 @@
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+import { BunContext } from "@effect/platform-bun"
 import { Effect, Option } from "effect"
-import { applicationStateDirectory, makeDesktopApplicationHost } from "@magnitudedev/daemon-management/desktop-native"
+import { applicationStateDirectory, makeDesktopApplicationHost, resolveInstalledApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { isDevelopmentBuild } from "../runtime/environment"
 
 const host = makeDesktopApplicationHost(isDevelopmentBuild()
   ? Option.some(resolve(dirname(fileURLToPath(import.meta.url)), "../../.."))
   : Option.none(), bundledWindowsNative)
+
+export const isStandaloneInstallation = isDevelopmentBuild() ? Effect.succeed(false)
+  : resolveInstalledApplicationRuntime(process.execPath, process.platform).pipe(
+    Effect.map(runtime => runtime.layout === "Standalone"), Effect.orElseSucceed(() => false), Effect.provide(BunContext.layer))
 
 export const {
   desktopIsolatedProfile, desktopDataDirectory, desktopServiceOrigin, desktopApplication, applicationDataDirectory,
