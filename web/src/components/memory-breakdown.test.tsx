@@ -2,13 +2,16 @@ import { renderToStaticMarkup } from "react-dom/server"
 import { expect, it } from "vitest"
 import { Option, Schema } from "effect"
 import { ModelInstanceAllocationSchema } from "@magnitudedev/sdk"
+import { formatMemorySize } from "@magnitudedev/client-common"
 import { servingHardware } from "@magnitudedev/client-common/fixtures/hardware"
 import { streamingStatus } from "@magnitudedev/client-common/fixtures/model"
 import { MemoryFigures } from "./memory-breakdown"
 
 const GiB = 1024 ** 3
-const hardware = Option.some(servingHardware("Discrete"))
-const allocation = Schema.decodeUnknownSync(ModelInstanceAllocationSchema)({
+const discreteHardware = Option.some(servingHardware("Discrete"))
+const unifiedHardware = Option.some(servingHardware("Unified"))
+
+const splitAllocation = Schema.decodeUnknownSync(ModelInstanceAllocationSchema)({
   contextWindowTokens: 4096,
   memoryDomains: [
     { memoryDomainId: "system", modelBytes: GiB, contextBytes: 0, computeBytes: GiB / 4, auxiliaryBytes: GiB / 4 },
@@ -16,45 +19,97 @@ const allocation = Schema.decodeUnknownSync(ModelInstanceAllocationSchema)({
   ],
   promptGroupPlaces: { held: 1, capacity: 8 },
 })
-it("sums the three native allocation categories across memory domains", () => {
-  const html = renderToStaticMarkup(<MemoryFigures allocation={Option.some(allocation)} hardware={hardware} />)
+
+const unifiedAllocation = Schema.decodeUnknownSync(ModelInstanceAllocationSchema)({
+  contextWindowTokens: 4096,
+  memoryDomains: [
+    { memoryDomainId: "system", modelBytes: 3 * GiB, contextBytes: 2 * GiB, computeBytes: GiB / 2, auxiliaryBytes: GiB / 2 },
+  ],
+  promptGroupPlaces: { held: 1, capacity: 8 },
+})
+
+it("renders one full-capacity bar on unified memory with model left, free in the middle, and other apps right", () => {
+  const html = renderToStaticMarkup(<MemoryFigures allocation={Option.some(unifiedAllocation)} hardware={unifiedHardware} />)
+  expect(html.match(/data-memory-domain=/g)).toHaveLength(1)
+  expect(html).toContain('data-memory-domain="system"')
+  expect(html).toContain("Unified memory")
   expect(html).toContain(`data-memory-bytes="${6 * GiB}"`)
-  for (const [label, bytes] of [["Weights", 3.5 * GiB], ["Context", 2 * GiB], ["Overhead", GiB / 2]]) {
+  expect(html).toContain(`model · ${formatMemorySize(16 * GiB)} total`)
+  for (const [label, bytes] of [
+    ["Weights", 3.5 * GiB],
+    ["Context", 2 * GiB],
+    ["Overhead", 0.5 * GiB],
+    ["Free", 8 * GiB],
+    ["Other apps", 2 * GiB],
+  ]) {
     expect(html).toContain(`data-memory-category="${label}" data-bytes="${bytes}"`)
   }
-  expect(html.match(/data-memory-category=/g)).toHaveLength(3)
+  expect(html).toContain('class="settings-memory-segment other"')
+  expect(html).not.toContain("data-streaming-summary")
+  for (const text of ["<details", "Prompt group places", "N-gram table", "Last resize"]) {
+    expect(html).not.toContain(text)
+  }
 })
-it("states how a loaded model serves, and where its bank's experts are only when it has one", () => {
-  const streamed = { ...allocation, streaming: Option.some(streamingStatus(["cuda-0", "system"])) }
-  const html = renderToStaticMarkup(<MemoryFigures allocation={Option.some(streamed)} hardware={hardware} />)
-  expect(html).toContain('aria-label="Serving"')
-  expect(html).toContain('data-model-fact="Prompt group places">1 of 8')
-  expect(html).toContain('data-model-fact="Experts in memory">40%, floor 1%, ceiling 60%')
-  expect(html).toContain('data-model-fact="Experts in Test GPU · GPU 1">300 MB')
-  expect(html).toContain('data-model-fact="Experts in System memory">400 MB')
-  expect(html).toContain('data-model-fact="Cold experts in System memory">210 MB, 50% of its most')
-  expect(html).toContain('data-model-fact="Experts on disk">300 MB')
-  expect(html).toContain('data-model-fact="N-gram table in memory">126 MB, 50% of its most, floor 25%')
-  expect(html).toContain('data-model-fact="Last resize">Experts shrank from 50% to 40% as memory grew short on ')
-  const resident = renderToStaticMarkup(<MemoryFigures allocation={Option.some(allocation)} hardware={hardware} />)
-  expect(resident).toContain('data-model-fact="Prompt group places">1 of 8')
-  expect(resident).not.toContain("Experts in")
+
+it("renders stacked full-capacity bars for GPU memory and system memory on discrete hosts", () => {
+  const html = renderToStaticMarkup(<MemoryFigures allocation={Option.some(splitAllocation)} hardware={discreteHardware} />)
+  expect(html.match(/data-memory-domain=/g)).toHaveLength(2)
+  expect(html.indexOf('data-memory-domain="cuda-0"')).toBeLessThan(html.indexOf('data-memory-domain="system"'))
+  expect(html).toContain("Test GPU · GPU 1")
+  expect(html).toContain("System memory")
+  expect(html).toContain(`data-memory-bytes="${4.5 * GiB}"`)
+  expect(html).toContain(`data-memory-bytes="${1.5 * GiB}"`)
 })
-it("states prompt group places and the bank's share before the hardware is known, naming no memory", () => {
-  const streamed = { ...allocation, streaming: Option.some(streamingStatus(["cuda-0", "system"])) }
-  const html = renderToStaticMarkup(<MemoryFigures allocation={Option.some(streamed)} hardware={Option.none()} />)
-  expect(html).toContain('data-model-fact="Prompt group places">1 of 8')
-  expect(html).toContain('data-model-fact="Experts in memory">40%, floor 1%, ceiling 60%')
-  expect(html).not.toContain("Experts in System memory")
-  expect(html).not.toContain("Cold experts")
+
+it("renders a single compact streaming residency row for streamed models and nothing for resident models", () => {
+  const unifiedStreamed = { ...unifiedAllocation, streaming: Option.some(streamingStatus(["system"])) }
+  const unifiedHtml = renderToStaticMarkup(<MemoryFigures allocation={Option.some(unifiedStreamed)} hardware={unifiedHardware} />)
+  expect(unifiedHtml).toContain("data-streaming-summary")
+  expect(unifiedHtml).toContain("Experts in memory")
+  expect(unifiedHtml).toContain("<strong>40%</strong>")
+  expect(unifiedHtml).toContain("(1%–60%)")
+  expect(unifiedHtml).toContain("300 MB in memory · 300 MB on disk")
+  for (const text of ["<details", "Prompt group places", "N-gram table", "Last resize"]) {
+    expect(unifiedHtml).not.toContain(text)
+  }
+
+  const discreteStreamed = { ...splitAllocation, streaming: Option.some(streamingStatus(["cuda-0"])) }
+  const discreteHtml = renderToStaticMarkup(<MemoryFigures allocation={Option.some(discreteStreamed)} hardware={discreteHardware} />)
+  expect(discreteHtml).toContain("<strong>40% GPU</strong>")
+  expect(discreteHtml).toContain("(1%–60%)")
+  expect(discreteHtml).toContain("· 30% RAM")
+  expect(discreteHtml).toContain("300 MB GPU · 210 MB RAM · 300 MB on disk")
+  for (const text of ["<details", "Prompt group places", "N-gram table", "Last resize"]) {
+    expect(discreteHtml).not.toContain(text)
+  }
 })
+
+it("falls back gracefully when free memory or hardware is unobserved", () => {
+  const missingFreeHardware = Option.some({
+    ...servingHardware("Unified"),
+    memoryDomains: servingHardware("Unified").memoryDomains.map(domain => ({ ...domain, availableBytes: Option.none() })),
+  })
+  const missingFreeHtml = renderToStaticMarkup(<MemoryFigures allocation={Option.some(unifiedAllocation)} hardware={missingFreeHardware} />)
+  expect(missingFreeHtml).toContain(`data-memory-category="Weights" data-bytes="${3.5 * GiB}"`)
+  expect(missingFreeHtml).not.toContain('data-memory-category="Free"')
+  expect(missingFreeHtml).not.toContain('data-memory-category="Other apps"')
+  expect(missingFreeHtml).toContain("Current memory usage is unavailable.")
+
+  const noHardwareHtml = renderToStaticMarkup(<MemoryFigures allocation={Option.some(splitAllocation)} hardware={Option.none()} />)
+  expect(noHardwareHtml).toContain(`data-memory-bytes="${6 * GiB}"`)
+  expect(noHardwareHtml).not.toContain('data-memory-category="Free"')
+})
+
 it("distinguishes no loaded model from memory that is not available yet", () => {
-  const html = renderToStaticMarkup(<MemoryFigures allocation={Option.none()} hardware={hardware} />)
-  expect(html).toContain('data-memory-bytes="0">0 MB</strong>')
-  expect(html.match(/data-bytes="0"/g)).toHaveLength(3)
-  expect(html).not.toContain('NaN')
-  for (const text of ['<details', 'System &amp; apps', 'Model buffers', 'processes', 'How memory']) expect(html).not.toContain(text)
-  const pending = renderToStaticMarkup(<MemoryFigures allocation={null} hardware={hardware} />)
+  const unloaded = renderToStaticMarkup(<MemoryFigures allocation={Option.none()} hardware={unifiedHardware} />)
+  expect(unloaded).toContain('data-memory-bytes="0">0 MB</strong>')
+  expect(unloaded).toContain('data-memory-category="Free"')
+  expect(unloaded).toContain('data-memory-category="Other apps"')
+  expect(unloaded).not.toContain("NaN")
+  expect(unloaded).not.toContain("<details")
+  expect(unloaded).not.toContain("data-streaming-summary")
+
+  const pending = renderToStaticMarkup(<MemoryFigures allocation={null} hardware={unifiedHardware} />)
   expect(pending).toContain("Available once loaded")
   expect(pending).not.toContain("data-memory-bytes")
   expect(pending).not.toContain("data-memory-category")

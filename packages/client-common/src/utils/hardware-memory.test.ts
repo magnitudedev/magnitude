@@ -1,7 +1,7 @@
 import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import { LocalInferenceHardwareSchema, ModelInstanceAllocationSchema } from "@magnitudedev/sdk"
-import { deriveHardwareMemoryView, deriveHardwareRoles } from "./hardware-memory"
+import { deriveHardwareMemoryView, deriveHardwareRoles, memoryDomainBarLayout, participatingMemoryDomains } from "./hardware-memory"
 
 const GiB = 1024 ** 3
 const hardware = (available: number | null = 8 * GiB, discrete = false, bothBackends = false) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
@@ -54,6 +54,57 @@ describe("hardware memory breakdown", () => {
     expect(domain.status).toBe("rounding_adjusted")
     expect(domain.systemAndAppsBytes).toBe(0)
     expect(domain.usedBytes! + domain.freeBytes!).toBe(16 * GiB)
+  })
+})
+
+describe("memory domain bar layout", () => {
+  it("scales left model segments and right other-apps segment to total capacity with free headroom in the middle", () => {
+    const domain = deriveHardwareMemoryView(hardware(), allocation()).domains[0]!
+    const layout = memoryDomainBarLayout(domain)
+    expect(layout.modelBytes).toBe(6 * GiB)
+    expect(layout.leftSegments).toEqual([
+      { key: "weights", label: "Weights", bytes: 3.5 * GiB, widthPercent: (3.5 / 16) * 100 },
+      { key: "cache", label: "Context", bytes: 2 * GiB, widthPercent: (2 / 16) * 100 },
+      { key: "runtime", label: "Overhead", bytes: 0.5 * GiB, widthPercent: (0.5 / 16) * 100 },
+    ])
+    expect(layout.rightSegment).toEqual({
+      key: "other", label: "Other apps", bytes: 2 * GiB, widthPercent: (2 / 16) * 100,
+    })
+    expect(layout.freeBytes).toBe(8 * GiB)
+    const leftPct = layout.leftSegments.reduce((sum, segment) => sum + segment.widthPercent, 0)
+    expect(leftPct + (layout.freeBytes! / domain.totalBytes) * 100 + layout.rightSegment!.widthPercent).toBeCloseTo(100)
+  })
+
+  it("orders discrete device memory ahead of system memory for participating domains", () => {
+    const splitAllocation = Option.some(Schema.decodeUnknownSync(ModelInstanceAllocationSchema)({
+      contextWindowTokens: 4096,
+      memoryDomains: [
+        { memoryDomainId: "system", modelBytes: GiB, contextBytes: 0, computeBytes: 0, auxiliaryBytes: 0 },
+        { memoryDomainId: "gpu", modelBytes: 3 * GiB, contextBytes: 2 * GiB, computeBytes: GiB / 2, auxiliaryBytes: GiB / 2 },
+      ],
+      promptGroupPlaces: { held: 1, capacity: 1 },
+    }))
+    const view = deriveHardwareMemoryView(hardware(8 * GiB, true), splitAllocation)
+    expect(participatingMemoryDomains(view).map(({ id }) => id)).toEqual(["gpu", "system"])
+    const gpuOnlyView = deriveHardwareMemoryView(hardware(8 * GiB, true), allocation("gpu"))
+    expect(participatingMemoryDomains(gpuOnlyView).map(({ id }) => id)).toEqual(["gpu"])
+  })
+
+  it("keeps model segments and omits free/other apps when free memory is unobserved", () => {
+    const domain = deriveHardwareMemoryView(hardware(null), allocation()).domains[0]!
+    const layout = memoryDomainBarLayout(domain)
+    expect(layout.modelBytes).toBe(6 * GiB)
+    expect(layout.leftSegments).toHaveLength(3)
+    expect(layout.rightSegment).toBeNull()
+    expect(layout.freeBytes).toBeNull()
+  })
+
+  it("omits per-category segments when observations are inconsistent", () => {
+    const domain = deriveHardwareMemoryView(hardware(), allocation("system", 12 * GiB)).domains[0]!
+    const layout = memoryDomainBarLayout(domain)
+    expect(layout.modelBytes).toBeNull()
+    expect(layout.leftSegments).toEqual([])
+    expect(layout.rightSegment).toBeNull()
   })
 })
 

@@ -180,3 +180,45 @@ export const localModelExpertFacts = (
 
 /** Whether a model's expert facts name its memory, so its surface needs the hardware to state them. */
 export const localModelNamesMemory = (model: LocalModel): boolean => Option.isSome(localModelExpertBank(model))
+
+export interface StreamingResidencySummary {
+  /** Prominent current share, e.g. "44%" (unified) or "38% GPU" (discrete). */
+  readonly primary: string
+  /** Floor–ceiling range of the primary tier, e.g. "(2%–100%)" or "(2%–62%)". */
+  readonly range: string
+  /** Secondary RAM share on discrete 3-tier setups, e.g. "62% RAM", or null on unified memory. */
+  readonly secondary: string | null
+  /** Byte breakdown across memory tiers and disk, e.g. "15.5 GB in memory · 19 GB on disk". */
+  readonly breakdown: string
+}
+
+/**
+ * Compact plain-English summary of an active expert bank for the Status card: current residency
+ * share with its floor–ceiling range, and byte breakdown across memory tiers and disk.
+ */
+export const streamingResidencySummary = (status: ModelStreamingStatus): StreamingResidencySummary => {
+  const share = (slots: number) => percent(slots / status.experts)
+  const bankBytes = status.tiers.reduce((sum, tier) => sum + tier.bytes, 0)
+  const range = `(${share(status.floorSlots)}–${share(status.ceilingSlots)})`
+  return Option.match(status.host, {
+    onNone: () => ({
+      primary: share(status.slots),
+      range,
+      secondary: null,
+      breakdown: [
+        `${formatMemorySize(bankBytes)} in memory`,
+        ...(status.diskBytes > 0 ? [`${formatMemorySize(status.diskBytes)} on disk`] : []),
+      ].join(" · "),
+    }),
+    onSome: (host) => ({
+      primary: `${share(status.slots)} GPU`,
+      range,
+      secondary: `${share(host.slots)} RAM`,
+      breakdown: [
+        `${formatMemorySize(bankBytes)} GPU`,
+        `${formatMemorySize(host.bytes)} RAM`,
+        ...(status.diskBytes > 0 ? [`${formatMemorySize(status.diskBytes)} on disk`] : []),
+      ].join(" · "),
+    }),
+  })
+}

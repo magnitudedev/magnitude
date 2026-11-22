@@ -33,6 +33,28 @@ export interface HardwareMemoryView {
   readonly compact: { readonly usedBytes: number; readonly totalBytes: number } | null
 }
 
+export type MemoryBarSegmentKey = "weights" | "cache" | "runtime" | "other"
+
+export interface MemoryBarSegment {
+  readonly key: MemoryBarSegmentKey
+  readonly label: string
+  readonly bytes: number
+  /** Percentage of total domain capacity (0..100). */
+  readonly widthPercent: number
+}
+
+export interface MemoryDomainBarLayout {
+  readonly domain: HardwareMemoryDomainView
+  /** Total bytes owned by the loaded model in this domain, or null when observations are inconsistent. */
+  readonly modelBytes: number | null
+  /** Left-anchored model segments (Weights, Context, Overhead), in order. */
+  readonly leftSegments: readonly MemoryBarSegment[]
+  /** Right-anchored segment (Other apps), present when observed. */
+  readonly rightSegment: MemoryBarSegment | null
+  /** Free headroom in the middle, present when observed. */
+  readonly freeBytes: number | null
+}
+
 const MIB = 1024 ** 2
 
 /** The memory domains an accelerator places on: every domain any of its executors places on. */
@@ -223,5 +245,56 @@ export const deriveHardwareMemoryView = (
       usedBytes: participating.reduce((sum, domain) => sum + (domain.usedBytes ?? 0), 0),
       totalBytes: participating.reduce((sum, domain) => sum + domain.totalBytes, 0),
     },
+  }
+}
+
+const capacityPercent = (bytes: number, totalBytes: number): number =>
+  totalBytes > 0 ? (bytes / totalBytes) * 100 : 0
+
+/**
+ * The participating memory domains to display as full-capacity bars, device memory first.
+ * Falls back to all domains when none are marked participating.
+ */
+export const participatingMemoryDomains = (
+  view: HardwareMemoryView,
+): readonly HardwareMemoryDomainView[] => {
+  const active = view.domains.filter((domain) => domain.participatesInModelServing)
+  const domains = active.length > 0 ? active : view.domains
+  return [
+    ...domains.filter((domain) => domain.kind === "PhysicalDevice"),
+    ...domains.filter((domain) => domain.kind !== "PhysicalDevice"),
+  ]
+}
+
+/**
+ * Full-capacity bar layout for one memory domain: model segments anchored left, free headroom in
+ * the middle, and other apps anchored right. Widths are percentages of `domain.totalBytes`.
+ */
+export const memoryDomainBarLayout = (domain: HardwareMemoryDomainView): MemoryDomainBarLayout => {
+  const leftSegments: readonly MemoryBarSegment[] =
+    domain.weightsBytes === null || domain.kvCacheBytes === null || domain.overheadBytes === null
+      ? []
+      : [
+          { key: "weights", label: "Weights", bytes: domain.weightsBytes, widthPercent: capacityPercent(domain.weightsBytes, domain.totalBytes) },
+          { key: "cache", label: "Context", bytes: domain.kvCacheBytes, widthPercent: capacityPercent(domain.kvCacheBytes, domain.totalBytes) },
+          { key: "runtime", label: "Overhead", bytes: domain.overheadBytes, widthPercent: capacityPercent(domain.overheadBytes, domain.totalBytes) },
+        ]
+  const modelBytes = leftSegments.length === 0
+    ? null
+    : leftSegments.reduce((sum, segment) => sum + segment.bytes, 0)
+  const rightSegment: MemoryBarSegment | null = domain.systemAndAppsBytes === null
+    ? null
+    : {
+        key: "other",
+        label: "Other apps",
+        bytes: domain.systemAndAppsBytes,
+        widthPercent: capacityPercent(domain.systemAndAppsBytes, domain.totalBytes),
+      }
+  return {
+    domain,
+    modelBytes,
+    leftSegments,
+    rightSegment,
+    freeBytes: domain.freeBytes,
   }
 }

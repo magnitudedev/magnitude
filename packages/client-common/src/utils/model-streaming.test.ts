@@ -10,6 +10,7 @@ import {
   localModelNamesMemory,
   modelServingFacts,
   residentModelAllocation,
+  streamingResidencySummary,
 } from "./model-streaming"
 
 const allocation = (memoryDomainIds: readonly string[]) =>
@@ -139,5 +140,51 @@ describe("model expert facts", () => {
     expect(labels[0]).toBe("Experts in memory")
     expect(labels).not.toContain("Experts this machine allows")
     expect(new Set(labels).size).toBe(labels.length)
+  })
+})
+
+describe("streaming residency summary", () => {
+  it("formats unified memory residency with range and in-memory/disk bytes", () => {
+    const base = Option.getOrThrow(allocation(["system"]).streaming)
+    const status = {
+      ...base,
+      experts: 100,
+      slots: 44,
+      floorSlots: 2,
+      ceilingSlots: 100,
+      tiers: base.tiers.map((tier) => ({ ...tier, bytes: Math.round(15.5 * 1024 ** 3) })),
+      diskBytes: 19 * 1024 ** 3,
+    }
+    expect(streamingResidencySummary(status)).toEqual({
+      primary: "44%",
+      range: "(2%–100%)",
+      secondary: null,
+      breakdown: `${formatMemorySize(Math.round(15.5 * 1024 ** 3))} in memory · ${formatMemorySize(19 * 1024 ** 3)} on disk`,
+    })
+    expect(streamingResidencySummary({ ...status, diskBytes: 0 }).breakdown)
+      .toBe(`${formatMemorySize(Math.round(15.5 * 1024 ** 3))} in memory`)
+  })
+
+  it("formats discrete 3-tier residency with GPU range, RAM share, and optional disk bytes", () => {
+    const base = Option.getOrThrow(allocation(["cuda-0"]).streaming)
+    const host = Option.getOrThrow(base.host)
+    const status = {
+      ...base,
+      experts: 100,
+      slots: 38,
+      floorSlots: 2,
+      ceilingSlots: 62,
+      tiers: base.tiers.map((tier) => ({ ...tier, bytes: Math.round(12.4 * 1024 ** 3) })),
+      host: Option.some({ ...host, slots: 62, ceilingSlots: 62, bytes: Math.round(20.1 * 1024 ** 3) }),
+      diskBytes: 0,
+    }
+    expect(streamingResidencySummary(status)).toEqual({
+      primary: "38% GPU",
+      range: "(2%–62%)",
+      secondary: "62% RAM",
+      breakdown: `${formatMemorySize(Math.round(12.4 * 1024 ** 3))} GPU · ${formatMemorySize(Math.round(20.1 * 1024 ** 3))} RAM`,
+    })
+    expect(streamingResidencySummary({ ...status, diskBytes: 5 * 1024 ** 3 }).breakdown)
+      .toBe(`${formatMemorySize(Math.round(12.4 * 1024 ** 3))} GPU · ${formatMemorySize(Math.round(20.1 * 1024 ** 3))} RAM · ${formatMemorySize(5 * 1024 ** 3)} on disk`)
   })
 })
