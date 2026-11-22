@@ -316,7 +316,7 @@ fn open_segment(device: &Device) -> Result<vk::CommandBuffer, ExecutionError> {
     if let Err(error) = begun {
         device.retire(Retired {
             value: 0,
-            command: RetiredCommand::Secondary(command),
+            command: Some(RetiredCommand::Secondary(command)),
             queries: None,
             arguments: Vec::new(),
         });
@@ -512,7 +512,7 @@ impl Drop for GraphInner {
         for command in self.commands.drain(..) {
             self.device.retire(Retired {
                 value,
-                command: RetiredCommand::Secondary(command),
+                command: Some(RetiredCommand::Secondary(command)),
                 queries: None,
                 arguments: std::mem::take(&mut arguments),
             });
@@ -1012,6 +1012,9 @@ impl<T: Timing> DirectBatch<T> {
         device: &Device,
         open: impl FnOnce(&Device, &mut Recording) -> Result<T, ExecutionError>,
     ) -> Result<Self, ExecutionError> {
+        // Apply backpressure before allocating driver command buffers when the
+        // host hold behind a shut gate is full.
+        device.wait_held_room()?;
         let mut recording = device.recording()?;
         let command = device.command(&mut recording, vk::CommandBufferLevel::PRIMARY)?;
         let timing = match open(device, &mut recording) {
@@ -1240,11 +1243,19 @@ impl<T: Timing> DirectBatch<T> {
             graph.last_use.fetch_max(value, Ordering::AcqRel);
         }
         self.committed = true;
+        // Retire the primary command buffer and argument chunks immediately at
+        // `value` rather than waiting for `DirectSubmission::drop`: neither is
+        // read after submission, so completed work recycles its command buffer
+        // even while callers retain completion handles.
+        self.device.retire(Retired {
+            value,
+            command: Some(RetiredCommand::Primary(self.command)),
+            queries: None,
+            arguments: std::mem::take(&mut self.arguments.chunks),
+        });
         Ok(DirectSubmission {
             device: self.device.clone(),
             value,
-            command: self.command,
-            arguments: std::mem::take(&mut self.arguments.chunks),
             _graphs: std::mem::take(&mut self.replayed),
             stamps,
             handed,
@@ -1367,7 +1378,7 @@ impl<T: Timing> Drop for DirectBatch<T> {
             // Nothing was submitted: everything is reusable at once.
             self.device.retire(Retired {
                 value: 0,
-                command: RetiredCommand::Primary(self.command),
+                command: Some(RetiredCommand::Primary(self.command)),
                 queries: self.timing.queries(),
                 arguments: std::mem::take(&mut self.arguments.chunks),
             });
@@ -1437,8 +1448,6 @@ fn mask(bits: u32) -> u64 {
 pub struct DirectSubmission<T: Timing = Measured> {
     device: Device,
     value: u64,
-    command: vk::CommandBuffer,
-    arguments: Vec<Range>,
     /// The graphs it replays, alive until it is.
     _graphs: Vec<std::sync::Arc<GraphInner>>,
     stamps: T::Stamps,
@@ -1545,12 +1554,14 @@ impl DirectSubmission<Timed> {
 
 impl<T: Timing> Drop for DirectSubmission<T> {
     fn drop(&mut self) {
-        self.device.retire(Retired {
-            value: self.value,
-            command: RetiredCommand::Primary(self.command),
-            queries: T::stamps_queries(&self.stamps),
-            arguments: std::mem::take(&mut self.arguments),
-        });
+        if let Some(queries) = T::stamps_queries(&self.stamps) {
+            self.device.retire(Retired {
+                value: self.value,
+                command: None,
+                queries: Some(queries),
+                arguments: Vec::new(),
+            });
+        }
     }
 }
 
@@ -1611,10 +1622,13 @@ mod park_tests {
         let held = held.commit().unwrap();
         assert!(arrived.wait(1, BOUND).unwrap(), "the device reaches the park");
 
-        let submissions = returns("queued behind the park", {
-            let (device, chain, chain_arrived) = (device.clone(), chain.clone(), chain_arrived.clone());
-            move || {
-                (0..DEPTH)
+        let queued = Arc::new(AtomicU64::new(0));
+        let (sub_tx, sub_rx) = mpsc::channel();
+        let submitter = {
+            let (device, chain, chain_arrived, queued) =
+                (device.clone(), chain.clone(), chain_arrived.clone(), Arc::clone(&queued));
+            std::thread::spawn(move || {
+                let submissions = (0..DEPTH)
                     .map(|index| {
                         let mut batch = DirectBatch::new(&device).unwrap();
                         if chained {
@@ -1625,11 +1639,23 @@ mod park_tests {
                             }
                             batch.signal_timeline(&chain_arrived, 2 * index + 1);
                         }
-                        batch.commit().unwrap()
+                        let submission = batch.commit().unwrap();
+                        queued.fetch_add(1, Ordering::Release);
+                        submission
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                let _ = sub_tx.send(submissions);
+            })
+        };
+        let fill_deadline = Instant::now() + BOUND;
+        let fill_target = (crate::device::MAX_HELD_SUBMISSIONS as u64).min(DEPTH);
+        while queued.load(Ordering::Acquire) < fill_target {
+            if Instant::now() >= fill_deadline {
+                eprintln!("queued behind the park: BLOCKED past {BOUND:?}");
+                std::process::abort();
             }
-        });
+            std::thread::sleep(Duration::from_millis(1));
+        }
         if device.has_side_queue() {
             let (queue, source, destination) = (
                 TransferQueue::new(device).unwrap(),
@@ -1658,6 +1684,14 @@ mod park_tests {
                 }
             });
         }
+        let submissions = match sub_rx.recv_timeout(BOUND) {
+            Ok(submissions) => submissions,
+            Err(_) => {
+                eprintln!("queued behind the park: BLOCKED past {BOUND:?}");
+                std::process::abort();
+            }
+        };
+        submitter.join().unwrap();
         returns("the work completes", move || {
             held.finish().unwrap();
             for submission in &submissions {

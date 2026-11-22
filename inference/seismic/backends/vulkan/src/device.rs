@@ -181,7 +181,7 @@ const STAGING_BYTES: u64 = 16 << 20;
 /// timeline reaches `value`.
 pub(crate) struct Retired {
     pub(crate) value: u64,
-    pub(crate) command: RetiredCommand,
+    pub(crate) command: Option<RetiredCommand>,
     pub(crate) queries: Option<(vk::QueryPool, u32)>,
     pub(crate) arguments: Vec<Range>,
 }
@@ -235,7 +235,7 @@ impl Drop for Primary<'_> {
     fn drop(&mut self) {
         self.device.retire(Retired {
             value: self.value,
-            command: RetiredCommand::Primary(self.command),
+            command: Some(RetiredCommand::Primary(self.command)),
             queries: None,
             arguments: Vec::new(),
         });
@@ -244,6 +244,13 @@ impl Drop for Primary<'_> {
 
 /// Bytes of one argument chunk.
 pub(crate) const ARGUMENT_CHUNK_BYTES: u64 = 256 << 10;
+
+/// Maximum submissions held on the host behind a shut gate before new batches
+/// wait on `handover` for room. Large enough for an entire multi-layer model
+/// step to enqueue behind its first park, small enough to keep live driver
+/// command buffers (and their kernel IB BOs / mappings) bounded so flooding
+/// behind a park applies backpressure instead of exhausting driver pools.
+pub(crate) const MAX_HELD_SUBMISSIONS: usize = 512;
 
 pub(crate) struct Queue {
     raw: vk::Queue,
@@ -327,6 +334,31 @@ struct Held {
     waits: Vec<(vk::Semaphore, u64)>,
     signals: Vec<(vk::Semaphore, u64)>,
     handed: Handed,
+}
+
+/// Block while `queue.held` is at or above `limit` until a release drains
+/// entries, the queue refuses, or the device is lost.
+fn wait_for_held_room(
+    queue: &Mutex<Queue>,
+    handover: &Condvar,
+    lost: &OnceLock<ExecutionError>,
+    limit: usize,
+) -> Result<(), ExecutionError> {
+    let mut queue = queue.lock().expect("queue lock is never poisoned");
+    loop {
+        if let Some(error) = lost.get() {
+            return Err(error.clone());
+        }
+        if let Some((_, refusal)) = &queue.refused {
+            return Err(refusal.error().clone());
+        }
+        if queue.held.len() < limit {
+            return Ok(());
+        }
+        queue = handover
+            .wait(queue)
+            .expect("queue lock is never poisoned");
+    }
 }
 
 /// Advance `queue`'s waiting and held submissions using the provided gate
@@ -992,25 +1024,28 @@ impl Device {
         let device = &self.inner.device;
         let mut command = Primary::take(self)?;
         let raw = command.command;
-        unsafe {
-            call(
-                device.begin_command_buffer(
+        {
+            let _recording = self.locked();
+            unsafe {
+                call(
+                    device.begin_command_buffer(
+                        raw,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    ),
+                    "vkBeginCommandBuffer",
+                )?;
+                cmd_update_buffer(device, raw, tables.raw(), tables.offset(), bytes);
+                barrier(
+                    device,
                     raw,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                ),
-                "vkBeginCommandBuffer",
-            )?;
-            cmd_update_buffer(device, raw, tables.raw(), tables.offset(), bytes);
-            barrier(
-                device,
-                raw,
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::MEMORY_READ,
-            );
-            call(device.end_command_buffer(raw), "vkEndCommandBuffer")?;
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::MEMORY_READ,
+                );
+                call(device.end_command_buffer(raw), "vkEndCommandBuffer")?;
+            }
         }
         command.value = self.submit(raw)?;
         self.wait(command.value)
@@ -1357,6 +1392,18 @@ impl Device {
 
     fn queue(&self) -> MutexGuard<'_, Queue> {
         self.inner.queue.lock().expect("queue lock is never poisoned")
+    }
+
+    /// Wait while the host hold behind a shut gate is at capacity
+    /// ([`MAX_HELD_SUBMISSIONS`]) before allocating another batch's command
+    /// buffer and query pool.
+    pub(crate) fn wait_held_room(&self) -> Result<(), ExecutionError> {
+        wait_for_held_room(
+            &self.inner.queue,
+            &self.inner.handover,
+            &self.inner.lost,
+            MAX_HELD_SUBMISSIONS,
+        )
     }
 
     /// The recording lock, without retiring what completed submissions
@@ -1893,11 +1940,12 @@ impl Inner {
             if recording.retired[index].0.value <= completed {
                 let (retired, owner) = recording.retired.swap_remove(index);
                 match retired.command {
-                    RetiredCommand::Primary(command) => recording.free_commands.push(command),
-                    RetiredCommand::Secondary(command) => unsafe {
+                    Some(RetiredCommand::Primary(command)) => recording.free_commands.push(command),
+                    Some(RetiredCommand::Secondary(command)) => unsafe {
                         self.device
                             .free_command_buffers(recording.pool, &[command])
                     },
+                    None => {}
                 }
                 recording.free_queries.extend(retired.queries);
                 match owner.upgrade() {
@@ -2498,5 +2546,61 @@ mod reconcile_tests {
         let mut dirty = true;
         assert!(clean_dirty_fence(&mut dirty, || Ok(()), || Ok(())).is_ok());
         assert!(!dirty);
+    }
+
+    #[test]
+    fn wait_for_held_room_blocks_at_limit_and_wakes_on_release_and_loss() {
+        let queue = Arc::new(Mutex::new(test_queue(vec![test_held(1, Vec::new()), test_held(2, Vec::new())])));
+        let handover = Arc::new(Condvar::new());
+        let lost = Arc::new(OnceLock::<ExecutionError>::new());
+
+        // Below limit returns immediately.
+        assert!(wait_for_held_room(&queue, &handover, &lost, 3).is_ok());
+
+        // At limit blocks until an entry is drained and handover is notified.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let (queue, handover, lost) = (Arc::clone(&queue), Arc::clone(&handover), Arc::clone(&lost));
+            std::thread::spawn(move || {
+                let _ = done_tx.send(wait_for_held_room(&queue, &handover, &lost, 2));
+            })
+        };
+        assert!(done_rx.recv_timeout(std::time::Duration::from_millis(20)).is_err());
+        {
+            let mut guard = queue.lock().unwrap();
+            guard.held.pop_front();
+            handover.notify_all();
+        }
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("release must unblock wait_for_held_room")
+                .is_ok()
+        );
+        waiter.join().unwrap();
+
+        // At limit wakes with DeviceLost if the device is lost.
+        {
+            let mut guard = queue.lock().unwrap();
+            guard.held.push_back(test_held(3, Vec::new()));
+        }
+        let (lost_tx, lost_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let (queue, handover, lost) = (Arc::clone(&queue), Arc::clone(&handover), Arc::clone(&lost));
+            std::thread::spawn(move || {
+                let _ = lost_tx.send(wait_for_held_room(&queue, &handover, &lost, 2));
+            })
+        };
+        assert!(lost_rx.recv_timeout(std::time::Duration::from_millis(20)).is_err());
+        {
+            let _guard = queue.lock().unwrap();
+            let _ = lost.set(ExecutionError::DeviceLost("lost".into()));
+            handover.notify_all();
+        }
+        let result = lost_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("device loss must unblock wait_for_held_room");
+        assert!(matches!(result, Err(ExecutionError::DeviceLost(_))));
+        waiter.join().unwrap();
     }
 }
