@@ -42,9 +42,47 @@ void indexer_keys() {
     if (!seismic_steer(live, held && destination >= 0))
         return;
     const uint64_t key = SEISMIC_PTR(SEISMIC_BUFFER_KEY);
+    const uint64_t key_row_offset = row * SEISMIC_KEY_STRIDE_0;
+    const uint64_t key_row = key + key_row_offset * uint64_t(ELEMENT_BYTES(ACTIVATION_A));
     float x[LANE_E];
-    [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-        x[i] = element_at(ACTIVATION_A, key, row * SEISMIC_KEY_STRIDE_0 + uint64_t(lane * LANE_E + i) * SEISMIC_KEY_STRIDE_1);
+    if (LANE_E % 8u == 0u && SEISMIC_KEY_STRIDE_1 == 1ul && (key_row & 15ul) == 0ul) {
+        [[unroll]] for (uint c = 0u; c + 8u <= LANE_E; c += 8u) {
+            vec4 even, odd;
+            element_load8(ACTIVATION_A, key_row, uint64_t(lane * LANE_E + c), even, odd);
+            x[c + 0u] = even.x;
+            x[c + 1u] = odd.x;
+            x[c + 2u] = even.y;
+            x[c + 3u] = odd.y;
+            x[c + 4u] = even.z;
+            x[c + 5u] = odd.z;
+            x[c + 6u] = even.w;
+            x[c + 7u] = odd.w;
+        }
+    } else if (LANE_E % 4u == 0u && SEISMIC_KEY_STRIDE_1 == 1ul
+        && (key_row & (4ul * uint64_t(ELEMENT_BYTES(ACTIVATION_A)) - 1ul)) == 0ul) {
+        if (ACTIVATION_A == ELEMENT_F32) {
+            [[unroll]] for (uint c = 0u; c + 4u <= LANE_E; c += 4u) {
+                const vec4 v = element_vec4_at(key_row + uint64_t(lane * LANE_E + c) * 4ul);
+                x[c + 0u] = v.x;
+                x[c + 1u] = v.y;
+                x[c + 2u] = v.z;
+                x[c + 3u] = v.w;
+            }
+        } else {
+            [[unroll]] for (uint c = 0u; c + 4u <= LANE_E; c += 4u) {
+                const uvec2 w = element_uvec2_at(key_row + uint64_t(lane * LANE_E + c) * 2ul);
+                const vec2 lo = element_unpack2(ACTIVATION_A, w.x);
+                const vec2 hi = element_unpack2(ACTIVATION_A, w.y);
+                x[c + 0u] = lo.x;
+                x[c + 1u] = lo.y;
+                x[c + 2u] = hi.x;
+                x[c + 3u] = hi.y;
+            }
+        }
+    } else {
+        [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
+            x[i] = element_at(ACTIVATION_A, key, key_row_offset + uint64_t(lane * LANE_E + i) * SEISMIC_KEY_STRIDE_1);
+    }
     // A rounded key is rounded from its norm and rotation held in A.
     const rounding_t trained =
         rounding_of(SEISMIC_PARAM_BLOCK, SEISMIC_PARAM_ELEMENT, SEISMIC_PARAM_SCALE, SEISMIC_PARAM_AMAX_FLOOR);
@@ -62,7 +100,20 @@ void indexer_keys() {
     if (live) {
         const Out target = slab_out_row(SEISMIC_OUT_KEYS, uint(destination), uint(SEISMIC_PARAM_SLAB_ROWS),
             uint64_t(KEYS_W));
-        [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-            out_put(target, uint64_t(lane * LANE_E + i), x[i]);
+        if (LANE_E % 8u == 0u && stored_aligned16(out_stored(target, 0ul))) {
+            [[unroll]] for (uint c = 0u; c + 8u <= LANE_E; c += 8u) {
+                out_put8(target, uint64_t(lane * LANE_E + c),
+                    vec4(x[c + 0u], x[c + 2u], x[c + 4u], x[c + 6u]),
+                    vec4(x[c + 1u], x[c + 3u], x[c + 5u], x[c + 7u]));
+            }
+        } else if (LANE_E % 4u == 0u) {
+            [[unroll]] for (uint c = 0u; c + 4u <= LANE_E; c += 4u) {
+                out_put2(target, uint64_t(lane * LANE_E + c), x[c + 0u], x[c + 1u]);
+                out_put2(target, uint64_t(lane * LANE_E + c + 2u), x[c + 2u], x[c + 3u]);
+            }
+        } else {
+            [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
+                out_put(target, uint64_t(lane * LANE_E + i), x[i]);
+        }
     }
 }

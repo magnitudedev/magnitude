@@ -1,6 +1,7 @@
 // draft_convolve_residual: DFlash2's half-1 grouped dynamic causal convolution
 // of a sublayer's F32 output rows within each draft block, plus the residual;
-// one invocation per output element over a grid-stride loop. The Vulkan form
+// 4-wide vectorized over unit-stride aligned spans with `dynamic` hoisted per
+// 4-channel group, falling back to a scalar grid-stride walk. The Vulkan form
 // of `metal/draft_convolve_residual.metal`.
 #include <seismic/element.glsl>
 
@@ -12,6 +13,62 @@ void draft_convolve_residual() {
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t channels = SEISMIC_DIM_C, width = SEISMIC_DIM_G * channels;
     const uint64_t count = SEISMIC_DIM_M * width;
+    if (count == 0ul)
+        return;
+
+    const uint64_t base1 = base + SEISMIC_BASE_STRIDE_0 * 4ul;
+    const uint64_t vec_count = count >> 2;
+    const bool vec_ok = (channels & 3ul) == 0ul
+        && vec_count <= uint64_t(0x7fffffffu)
+        && SEISMIC_RESIDUAL_STRIDE_1 == 1ul
+        && SEISMIC_OUTPUT_STRIDE_1 == 1ul
+        && SEISMIC_BASE_STRIDE_2 == 1ul
+        && SEISMIC_RESULT_0_STRIDE_1 == 1ul
+        && (base1 & 15ul) == 0ul
+        && (SEISMIC_BASE_STRIDE_1 & 3ul) == 0ul
+        && (sublayer & 15ul) == 0ul
+        && (SEISMIC_OUTPUT_STRIDE_0 & 3ul) == 0ul
+        && (residual & 15ul) == 0ul
+        && (SEISMIC_RESIDUAL_STRIDE_0 & 3ul) == 0ul;
+
+    if (vec_ok) {
+        const uint vc32 = uint(vec_count);
+        const uint w4 = uint(width >> 2);
+        const uint c4 = uint(channels >> 2);
+        const uint block = uint(SEISMIC_PARAM_BLOCK);
+        const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+        for (uint idx = gl_GlobalInvocationID.x; idx < vc32; idx += stride) {
+            const uint row32 = idx / w4;
+            const uint col4 = idx - row32 * w4;
+            const uint group32 = col4 / c4;
+            const uint position = row32 % block;
+            const uint64_t row = uint64_t(row32);
+            const uint64_t column = uint64_t(col4) << 2;
+            const uint64_t dyn_rg = dynamic + (row * SEISMIC_DYNAMIC_STRIDE_0 + SEISMIC_DYNAMIC_STRIDE_1
+                + uint64_t(group32) * SEISMIC_DYNAMIC_STRIDE_3) * 4ul;
+            const uint64_t base_col = base1 + column * 4ul;
+            const uint64_t taps = min(SEISMIC_DIM_K, uint64_t(position) + 1ul);
+            vec4 sum = vec4(0.0);
+            for (uint64_t offset = 0ul; offset < taps; ++offset) {
+                const float dyn = element_f32_at(dyn_rg + offset * SEISMIC_DYNAMIC_STRIDE_2 * 4ul);
+                const vec4 b = element_vec4_at(base_col + offset * SEISMIC_BASE_STRIDE_1 * 4ul);
+                const vec4 out_v = element_vec4_at(sublayer + ((row - offset) * SEISMIC_OUTPUT_STRIDE_0 + column) * 4ul);
+                const vec4 coeff = b + dyn;
+                sum = vec4(
+                    seismic_fma_rn(coeff.x, out_v.x, sum.x),
+                    seismic_fma_rn(coeff.y, out_v.y, sum.y),
+                    seismic_fma_rn(coeff.z, out_v.z, sum.z),
+                    seismic_fma_rn(coeff.w, out_v.w, sum.w));
+            }
+            const vec4 res_v = element_vec4_at(residual + (row * SEISMIC_RESIDUAL_STRIDE_0 + column) * 4ul);
+            const vec4 total = res_v + sum;
+            const uint64_t out_idx = row * SEISMIC_RESULT_0_STRIDE_0 + column;
+            out_put2(result, out_idx, total.x, total.y);
+            out_put2(result, out_idx + 2ul, total.z, total.w);
+        }
+        return;
+    }
+
     // Rows in blocks of SEISMIC_PARAM_BLOCK, a row's width in groups of channels.
     for (seismic_walk at = seismic_walk_grid(count, u64vec3(uint64_t(SEISMIC_PARAM_BLOCK), SEISMIC_DIM_G, channels));
             at.index < count; seismic_walk_next(at)) {
@@ -20,8 +77,7 @@ void draft_convolve_residual() {
         float sum = 0.0;
         for (uint64_t offset = 0ul; offset < SEISMIC_DIM_K && offset <= position; ++offset) {
             const float coefficient =
-                element_f32_at(base + (SEISMIC_BASE_STRIDE_0 + offset * SEISMIC_BASE_STRIDE_1
-                    + column * SEISMIC_BASE_STRIDE_2) * 4ul)
+                element_f32_at(base1 + (offset * SEISMIC_BASE_STRIDE_1 + column * SEISMIC_BASE_STRIDE_2) * 4ul)
                 + element_f32_at(dynamic + (row * SEISMIC_DYNAMIC_STRIDE_0 + SEISMIC_DYNAMIC_STRIDE_1
                     + offset * SEISMIC_DYNAMIC_STRIDE_2 + group * SEISMIC_DYNAMIC_STRIDE_3) * 4ul);
             sum = seismic_fma_rn(coefficient,

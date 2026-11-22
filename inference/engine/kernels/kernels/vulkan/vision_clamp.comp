@@ -1,17 +1,44 @@
-// vision_clamp: one invocation per element (grid-stride), A(clamp(x,
-// minimum, maximum)).
+// vision_clamp: four contiguous columns per grid-stride iteration,
+// A(clamp(x, minimum, maximum)).
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
+vec4 vision_clamp_load4(uint64_t base, uint64_t index) {
+    if (ACTIVATION_A == ELEMENT_F32)
+        return element_vec4_at(base + index * 4ul);
+    const uvec2 words = element_uvec2_at(base + index * 2ul);
+    return vec4(element_unpack2(ACTIVATION_A, words.x), element_unpack2(ACTIVATION_A, words.y));
+}
+
 void vision_clamp() {
     const uint64_t columns = SEISMIC_DIM_N;
-    const uint64_t total = SEISMIC_DIM_M * columns;
+    const uint64_t vecs = (columns + 3ul) >> 2;
+    const uint64_t total = SEISMIC_DIM_M * vecs;
     const float minimum = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_MINIMUM));
     const float maximum = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_MAXIMUM));
-    for (seismic_walk at = seismic_walk_grid(total, u64vec3(1ul, 1ul, columns)); at.index < total; seismic_walk_next(at)) {
-        const uint64_t row = at.axes.x, column = at.axes.w;
-        const float value = element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_X), row * SEISMIC_X_STRIDE_0 + column);
-        out_put(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0 + column,
-            min(max(value, minimum), maximum));
+    const uint64_t x_base = SEISMIC_PTR(SEISMIC_BUFFER_X);
+    const Out result = SEISMIC_RESULT_0_OUT;
+    const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ACTIVATION_A));
+    const uint64_t align_mask = act_bytes * 4ul - 1ul;
+    const bool unit_strides = SEISMIC_X_STRIDE_1 == 1ul
+        && SEISMIC_RESULT_0_STRIDE_1 == 1ul
+        && stored_aligned16(out_stored(result, 0ul));
+    for (seismic_walk at = seismic_walk_grid(total, u64vec3(1ul, 1ul, vecs)); at.index < total; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x;
+        const uint64_t col = at.axes.w << 2;
+        const uint64_t x_row = row * SEISMIC_X_STRIDE_0;
+        const uint64_t out_row = row * SEISMIC_RESULT_0_STRIDE_0;
+        if (unit_strides && col + 4ul <= columns && ((x_base + x_row * act_bytes) & align_mask) == 0ul) {
+            const vec4 xv = vision_clamp_load4(x_base, x_row + col);
+            const vec4 out_v = min(max(xv, vec4(minimum)), vec4(maximum));
+            out_put2(result, out_row + col, out_v.x, out_v.y);
+            out_put2(result, out_row + col + 2ul, out_v.z, out_v.w);
+        } else {
+            const uint64_t limit = col + 4ul < columns ? col + 4ul : columns;
+            for (uint64_t c = col; c < limit; ++c) {
+                const float value = element_at(ACTIVATION_A, x_base, x_row + c * SEISMIC_X_STRIDE_1);
+                out_put(result, out_row + c * SEISMIC_RESULT_0_STRIDE_1, min(max(value, minimum), maximum));
+            }
+        }
     }
 }

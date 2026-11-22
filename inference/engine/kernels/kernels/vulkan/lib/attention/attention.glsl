@@ -70,14 +70,28 @@
 
 // E consecutive elements of `source` from element `index` (aligned to E) as F32.
 void attention_load_row(Stored source, uint64_t index, out float x[ATTENTION_E]) {
-    if (ATTENTION_E % 8u == 0u) {
-        [[unroll]] for (uint c = 0u; c < ATTENTION_E; c += 8u) {
+    if (ATTENTION_E % 8u == 0u && stored_aligned16(source) && (index & 7ul) == 0ul) {
+        [[unroll]] for (uint c = 0u; c + 8u <= ATTENTION_E; c += 8u) {
             vec4 even, odd;
             stored_load8(source, index + c, even, odd);
             [[unroll]] for (uint j = 0u; j < 4u; ++j) {
                 x[c + 2u * j] = even[j];
                 x[c + 2u * j + 1u] = odd[j];
             }
+        }
+    } else if (ACTIVATION_A == ELEMENT_F32 && ATTENTION_E % 4u == 0u && stored_aligned16(source) &&
+        (index & 3ul) == 0ul) {
+        [[unroll]] for (uint c = 0u; c + 4u <= ATTENTION_E; c += 4u) {
+            const vec4 four = stored_vec4_at(source, index + c);
+            [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                x[c + j] = four[j];
+        }
+    } else if (ACTIVATION_A != ELEMENT_F32 && ATTENTION_E % 2u == 0u && stored_aligned16(source) &&
+        (index & 1ul) == 0ul) {
+        [[unroll]] for (uint c = 0u; c + 2u <= ATTENTION_E; c += 2u) {
+            const vec2 pair = stored_at2(source, index + c);
+            x[c] = pair.x;
+            x[c + 1u] = pair.y;
         }
     } else {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
@@ -86,7 +100,49 @@ void attention_load_row(Stored source, uint64_t index, out float x[ATTENTION_E])
 }
 
 void attention_load_row(uint64_t base, uint64_t index, out float x[ATTENTION_E]) {
-    attention_load_row(stored_at_buffer(ACTIVATION_A, base), index, x);
+    if (ATTENTION_E % 8u == 0u && (base & 15ul) == 0ul && (index & 7ul) == 0ul) {
+        [[unroll]] for (uint c = 0u; c + 8u <= ATTENTION_E; c += 8u) {
+            vec4 even, odd;
+            element_load8(ACTIVATION_A, base, index + c, even, odd);
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                x[c + 2u * j] = even[j];
+                x[c + 2u * j + 1u] = odd[j];
+            }
+        }
+    } else if (ATTENTION_E % 4u == 0u && (index & 3ul) == 0ul &&
+        (ACTIVATION_A == ELEMENT_F32 ? (base & 15ul) == 0ul : (base & 7ul) == 0ul)) {
+        [[unroll]] for (uint c = 0u; c + 4u <= ATTENTION_E; c += 4u) {
+            if (ACTIVATION_A == ELEMENT_F32) {
+                const vec4 four = element_vec4_at(base + (index + c) * 4ul);
+                [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                    x[c + j] = four[j];
+            } else {
+                const uvec2 pair = element_uvec2_at(base + (index + c) * 2ul);
+                const vec2 lo = element_unpack2(ACTIVATION_A, pair.x);
+                const vec2 hi = element_unpack2(ACTIVATION_A, pair.y);
+                x[c] = lo.x;
+                x[c + 1u] = lo.y;
+                x[c + 2u] = hi.x;
+                x[c + 3u] = hi.y;
+            }
+        }
+    } else if (ATTENTION_E % 2u == 0u && (index & 1ul) == 0ul &&
+        (ACTIVATION_A == ELEMENT_F32 ? (base & 7ul) == 0ul : (base & 3ul) == 0ul)) {
+        [[unroll]] for (uint c = 0u; c + 2u <= ATTENTION_E; c += 2u) {
+            if (ACTIVATION_A == ELEMENT_F32) {
+                const vec2 pair = uintBitsToFloat(element_uvec2_at(base + (index + c) * 4ul));
+                x[c] = pair.x;
+                x[c + 1u] = pair.y;
+            } else {
+                const vec2 pair = element_unpack2(ACTIVATION_A, element_u32_at(base + (index + c) * 2ul));
+                x[c] = pair.x;
+                x[c + 1u] = pair.y;
+            }
+        }
+    } else {
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+            x[i] = element_at(ACTIVATION_A, base, index + i);
+    }
 }
 
 // One value head row at `raw` (A elements) into lane `lane`'s E columns,
@@ -125,10 +181,13 @@ void attention_prepare(uint64_t raw, const bool normed, uint64_t norm, uint64_t 
 // without a destination), rounded to A.
 void attention_append(Out history, int destination, uint kv_head, uint lane, float x[ATTENTION_E]) {
     const uint64_t target = (uint64_t(destination) * ATTENTION_KV + kv_head) * ATTENTION_W + lane * ATTENTION_E;
-    if (ACTIVATION_A != ELEMENT_F32 && ATTENTION_E % 8u == 0u) {
-        [[unroll]] for (uint c = 0u; c < ATTENTION_E; c += 8u)
+    if (ATTENTION_E % 8u == 0u && (target & 7ul) == 0ul) {
+        [[unroll]] for (uint c = 0u; c + 8u <= ATTENTION_E; c += 8u)
             out_put8(history, target + c, vec4(x[c], x[c + 2u], x[c + 4u], x[c + 6u]),
                 vec4(x[c + 1u], x[c + 3u], x[c + 5u], x[c + 7u]));
+    } else if (ACTIVATION_A != ELEMENT_F32 && ATTENTION_E % 2u == 0u && (target & 1ul) == 0ul) {
+        [[unroll]] for (uint c = 0u; c + 2u <= ATTENTION_E; c += 2u)
+            out_put2(history, target + c, x[c], x[c + 1u]);
     } else {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
             out_put(history, target + i, x[i]);
@@ -418,6 +477,96 @@ float attention_attended(float accumulated, float maximum, float denominator, ui
     return seismic_div_rn(accumulated, max(denominator, 1e-30));
 }
 
+// Reciprocal normalizer of `attention_attended` (0 when a sinked head read no
+// key).
+float attention_inv_divisor(float maximum, float denominator, uint64_t head) {
+    if (ATTENTION_SINKS) {
+        if (maximum == -ATTENTION_INF)
+            return 0.0;
+        denominator += exp2(element_f32_at(ATTENTION_SINK_BUFFER + head * 4ul) * ATTENTION_LOG2E - maximum);
+    }
+    return seismic_div_rn(1.0, max(denominator, 1e-30));
+}
+
+// Maximum partition count whose merge weights are hoisted into shared memory:
+// each head holds up to 256 weights plus (maximum, denominator, inv_divisor)
+// in `seismic_shared_f32` (260 floats, 16-byte aligned).
+#define ATTENTION_MERGE_SHARED_MAX 256u
+#define ATTENTION_MERGE_SHARED_STRIDE 260u
+
+// Subgroup-cooperative partition weights for `count` (<= ATTENTION_MERGE_SHARED_MAX)
+// partial states at `statistics`: writes weights[0..count-1] (0 for empty
+// partitions), maximum (+256), denominator (+257), and inv_divisor (+258) at
+// `seismic_shared_f32[shared_base ..]`. Every lane of the calling logical
+// subgroup calls it convergently; only logical subgroups with `publish` write
+// to shared memory.
+void attention_merge_weights(uint64_t statistics, uint64_t first, uint64_t stride, uint count, uint64_t head,
+    uint shared_base, bool publish) {
+    const uint lane = SEISMIC_LANE;
+    float maximum;
+    float denominator;
+    if (count <= 32u) {
+        float m = -ATTENTION_INF;
+        float d = 0.0;
+        if (lane < count) {
+            const uint64_t slot = first + uint64_t(lane) * stride;
+            const uvec2 pair = element_uvec2_at(statistics + slot * 8ul);
+            m = uintBitsToFloat(pair.x);
+            d = uintBitsToFloat(pair.y);
+        }
+        maximum = seismic_subgroup_max_f32(d > 0.0 ? m : -ATTENTION_INF);
+        const float weight = d > 0.0 ? exp2(m - maximum) : 0.0;
+        if (publish && lane < count)
+            seismic_shared_f32[shared_base + lane] = weight;
+        denominator = seismic_subgroup_sum_f32(d > 0.0 ? d * weight : 0.0);
+    } else {
+        float local_max = -ATTENTION_INF;
+        seismic_strided(uint, p, lane, count, 32u) {
+            const uint64_t slot = first + uint64_t(p) * stride;
+            const uvec2 pair = element_uvec2_at(statistics + slot * 8ul);
+            if (uintBitsToFloat(pair.y) > 0.0)
+                local_max = max(local_max, uintBitsToFloat(pair.x));
+        }
+        maximum = seismic_subgroup_max_f32(local_max);
+        float local_denom = 0.0;
+        seismic_strided(uint, p, lane, count, 32u) {
+            const uint64_t slot = first + uint64_t(p) * stride;
+            const uvec2 pair = element_uvec2_at(statistics + slot * 8ul);
+            const float d = uintBitsToFloat(pair.y);
+            float weight = 0.0;
+            if (d > 0.0) {
+                weight = exp2(uintBitsToFloat(pair.x) - maximum);
+                local_denom = seismic_fma_rn(d, weight, local_denom);
+            }
+            if (publish)
+                seismic_shared_f32[shared_base + p] = weight;
+        }
+        denominator = seismic_subgroup_sum_f32(local_denom);
+    }
+    if (publish && lane == 0u) {
+        seismic_shared_f32[shared_base + ATTENTION_MERGE_SHARED_MAX] = maximum;
+        seismic_shared_f32[shared_base + ATTENTION_MERGE_SHARED_MAX + 1u] = denominator;
+        seismic_shared_f32[shared_base + ATTENTION_MERGE_SHARED_MAX + 2u] =
+            attention_inv_divisor(maximum, denominator, head);
+    }
+}
+
+// Accumulates `count` partial states for one `column` using precomputed
+// weights at `seismic_shared_f32[shared_base ..]`, skipping zero-weight
+// partitions.
+float attention_merge_accumulate(uint64_t partials, uint64_t first, uint64_t stride, uint count, uint column,
+    uint shared_base) {
+    float accumulated = 0.0;
+    for (uint p = 0u; p < count; ++p) {
+        const float weight = seismic_shared_f32[shared_base + p];
+        if (weight > 0.0) {
+            const uint64_t slot = first + uint64_t(p) * stride;
+            accumulated = seismic_fma_rn(element_f32_at(partials + (slot * ATTENTION_W + column) * 4ul), weight, accumulated);
+        }
+    }
+    return accumulated;
+}
+
 // The fixed-order merge of `count` partial attention states for one column:
 // state p is slot first + p * stride, with its unnormalized output at
 // partials[slot * W + column] (relative to its maximum) and (maximum,
@@ -428,17 +577,19 @@ vec3 attention_merge_state(uint64_t partials, uint64_t statistics, uint64_t firs
     uint column) {
     float maximum = -ATTENTION_INF;
     for (uint p = 0u; p < count; ++p) {
-        const uint64_t slot = first + p * stride;
-        if (element_f32_at(statistics + (slot * 2ul + 1ul) * 4ul) > 0.0)
-            maximum = max(maximum, element_f32_at(statistics + slot * 8ul));
+        const uint64_t slot = first + uint64_t(p) * stride;
+        const uvec2 pair = element_uvec2_at(statistics + slot * 8ul);
+        if (uintBitsToFloat(pair.y) > 0.0)
+            maximum = max(maximum, uintBitsToFloat(pair.x));
     }
     float denominator = 0.0;
     float accumulated = 0.0;
     for (uint p = 0u; p < count; ++p) {
-        const uint64_t slot = first + p * stride;
-        const float d = element_f32_at(statistics + (slot * 2ul + 1ul) * 4ul);
+        const uint64_t slot = first + uint64_t(p) * stride;
+        const uvec2 pair = element_uvec2_at(statistics + slot * 8ul);
+        const float d = uintBitsToFloat(pair.y);
         if (d > 0.0) {
-            const float weight = exp2(element_f32_at(statistics + slot * 8ul) - maximum);
+            const float weight = exp2(uintBitsToFloat(pair.x) - maximum);
             denominator = seismic_fma_rn(d, weight, denominator);
             accumulated = seismic_fma_rn(element_f32_at(partials + (slot * ATTENTION_W + column) * 4ul), weight, accumulated);
         }
@@ -517,9 +668,9 @@ void attention_publish(float maximum[ATTENTION_HEADS], float denominator[ATTENTI
             const uint64_t slot = first + uint64_t(slice * ATTENTION_HEADS + h) * parts;
             element_f32_put(partials + (slot * ATTENTION_W + column) * 4ul, sum);
         }
-        if (thread < slices) {
-            const uint slice = thread;
-            const float slice_maximum = attention_slice_maximum(states, slice, h);
+        if (lane == 0u && sg < slices) {
+            const uint slice = sg;
+            const float slice_maximum = partition_maximum;
             float total_denominator = 0.0;
             for (uint group = 0u; group < attention_key_groups(); ++group) {
                 const uint at = states + ((group * slices + slice) * ATTENTION_HEADS + h) * 2u;
@@ -528,8 +679,13 @@ void attention_publish(float maximum[ATTENTION_HEADS], float denominator[ATTENTI
                     total_denominator = seismic_fma_rn(d, exp2(seismic_shared_f32[at] - slice_maximum), total_denominator);
             }
             const uint64_t slot = first + uint64_t(slice * ATTENTION_HEADS + h) * parts;
-            element_f32_put(statistics + slot * 8ul, slice_maximum);
-            element_f32_put(statistics + slot * 8ul + 4ul, total_denominator);
+            const uint64_t stat_at = statistics + slot * 8ul;
+            if ((stat_at & 7ul) == 0ul) {
+                element_uvec2_put(stat_at, floatBitsToUint(vec2(slice_maximum, total_denominator)));
+            } else {
+                element_f32_put(stat_at, slice_maximum);
+                element_f32_put(stat_at + 4ul, total_denominator);
+            }
         }
         barrier();
     }
@@ -560,11 +716,45 @@ void attention_store_gated(uint64_t query, uint64_t gate, Out result, uint64_t r
 #define ATTENTION_MERGE_HEADS (1u + (ATTENTION_W / 32u) % 2u)
 
 // The invocation's (query head, column) in a merge workgroup; the column is
-// W, no column, for the pair's second head past the last.
+// W, no column, for the pair's second head past the last. Indexed by
+// `SEISMIC_SUBGROUP` and `SEISMIC_LANE` so `head` is statically uniform across
+// each 32-lane logical subgroup.
 uvec2 attention_merge_place() {
-    const uint head = gl_WorkGroupID.x * ATTENTION_MERGE_HEADS + gl_LocalInvocationIndex / ATTENTION_W;
+    const uint head_subgroups = ATTENTION_W / 32u;
+    const uint head = gl_WorkGroupID.x * ATTENTION_MERGE_HEADS + SEISMIC_SUBGROUP / head_subgroups;
     const bool live = ATTENTION_MERGE_HEADS == 1u || head < ATTENTION_KV * ATTENTION_G;
-    return uvec2(head, live ? gl_LocalInvocationIndex % ATTENTION_W : ATTENTION_W);
+    const uint column = (SEISMIC_SUBGROUP % head_subgroups) * 32u + SEISMIC_LANE;
+    return uvec2(head, live ? column : ATTENTION_W);
+}
+
+// Workgroup-cooperative merge of `count` (uniform across the workgroup)
+// partial states for one (head, column) of a merge workgroup
+// (`attention_merge_place`). Every invocation of the workgroup calls it;
+// inactive invocations (`column >= ATTENTION_W`) participate in barriers and
+// return 0.0. For `count <= ATTENTION_MERGE_SHARED_MAX`, each head's first
+// logical subgroup computes its partition weights and inverse divisor once in
+// shared memory, then every column accumulates only non-zero weights.
+float attention_merge_group(uint64_t partials, uint64_t statistics, uint64_t first, uint64_t stride, uint count,
+    uint column, uint64_t head, uint64_t base_first, uint64_t base_head) {
+    if (count <= ATTENTION_MERGE_SHARED_MAX) {
+        const uint head_subgroups = ATTENTION_W / 32u;
+        const uint local_head = SEISMIC_SUBGROUP / head_subgroups;
+        const uint shared_base = local_head * ATTENTION_MERGE_SHARED_STRIDE;
+        const uint64_t sg_head = base_head + uint64_t(local_head);
+        const bool head_live = ATTENTION_MERGE_HEADS == 1u || sg_head < uint64_t(ATTENTION_KV * ATTENTION_G);
+        bool merging;
+        if (seismic_steer(merging, SEISMIC_SUBGROUP % head_subgroups == 0u && head_live))
+            attention_merge_weights(statistics, head_live ? first : base_first, stride, count,
+                head_live ? sg_head : base_head, shared_base, merging);
+        barrier();
+        if (!head_live)
+            return 0.0;
+        const float accumulated = attention_merge_accumulate(partials, first, stride, count, column, shared_base);
+        return accumulated * seismic_shared_f32[shared_base + ATTENTION_MERGE_SHARED_MAX + 2u];
+    }
+    if (column >= ATTENTION_W)
+        return 0.0;
+    return attention_merge(partials, statistics, first, stride, count, column, head);
 }
 
 // The decode merge of one (query head, row) column over the row's key
@@ -576,12 +766,14 @@ void attention_decode_gate(uint64_t query, uint64_t gate, uint64_t visible, uint
     uint64_t partials, uint64_t statistics, uint64_t spans, uint picks, uint64_t head, uint64_t row, uint column,
     uint span, uint parts) {
     const uint total = attention_visible_total(visible, fresh, row, spans) + picks;
-    if (column >= ATTENTION_W)
-        return;
     const uint span_keys = attention_partition_span(total, span, parts);
     const uint used = (total + span_keys - 1u) / span_keys;
-    const float attended = attention_merge(partials, statistics,
-        (row * ATTENTION_KV * ATTENTION_G + head) * parts, 1ul, used, column, head);
+    const uint64_t base_head = uint64_t(gl_WorkGroupID.x) * ATTENTION_MERGE_HEADS;
+    const float attended = attention_merge_group(partials, statistics,
+        (row * ATTENTION_KV * ATTENTION_G + head) * parts, 1ul, used, column, head,
+        (row * ATTENTION_KV * ATTENTION_G + base_head) * parts, base_head);
+    if (column >= ATTENTION_W)
+        return;
     attention_store_gated(query, gate, result, row, head, column, attended);
 }
 

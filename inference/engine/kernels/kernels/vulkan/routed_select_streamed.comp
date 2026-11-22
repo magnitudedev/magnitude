@@ -37,14 +37,58 @@ projection_epilogue projected_output(uint g) {
         SEISMIC_DIM_E, 1ul, 0ul);
 }
 
+vec4 select_load_norm4(const int kind, uint64_t base, uint col) {
+    if (kind == ELEMENT_F32)
+        return element_vec4_at(base + uint64_t(col) * 4ul);
+    const uvec2 w = element_uvec2_at(base + uint64_t(col) * 2ul);
+    return vec4(element_unpack2(kind, w.x), element_unpack2(kind, w.y));
+}
+
+bool select_norm4_aligned(const int kind, uint64_t base) {
+    return kind == ELEMENT_F32 ? (base & 15ul) == 0ul : (base & 7ul) == 0ul;
+}
+
 void select_publish_decode_rows() {
     const projection_prologue norm_in = select_norm_input();
     const uint m = uint(SEISMIC_DIM_M);
-    for (uint idx = SEISMIC_THREAD; idx < m * SELECT_H; idx += PROJECTION_THREADS) {
-        const uint r = idx / SELECT_H, c = idx % SELECT_H;
-        out_put(SEISMIC_RESULT_0_OUT,
-            uint64_t(r) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(c) * SEISMIC_RESULT_0_STRIDE_1,
-            projection_ordered_at(norm_in, r, c, seismic_shared_f32[r]));
+    const uint h = SELECT_H;
+    const uint h4 = h & ~3u;
+    const bool vec_fast = norm_in.x1 == 1ul
+        && ((norm_in.x0 & 3ul) == 0ul || m == 1u)
+        && stored_aligned16(norm_in.x)
+        && norm_in.norm_stride == 1ul
+        && select_norm4_aligned(norm_in.norm_kind, norm_in.norm)
+        && SEISMIC_RESULT_0_STRIDE_1 == 1ul;
+    if (vec_fast) {
+        const uint vecs = h >> 2u;
+        for (uint idx = SEISMIC_THREAD; idx < m * vecs; idx += PROJECTION_THREADS) {
+            const uint r = m == 1u ? 0u : (idx / vecs);
+            const uint c = (m == 1u ? idx : (idx - r * vecs)) << 2u;
+            const vec4 x = stored_vec4_at(norm_in.x, uint64_t(r) * norm_in.x0 + uint64_t(c));
+            const vec4 nw = select_load_norm4(norm_in.norm_kind, norm_in.norm, c);
+            const vec4 y = (x * seismic_shared_f32[r]) * nw;
+            const uint64_t dst = uint64_t(r) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(c);
+            out_put2(SEISMIC_RESULT_0_OUT, dst, y.x, y.y);
+            out_put2(SEISMIC_RESULT_0_OUT, dst + 2ul, y.z, y.w);
+        }
+        const uint tail = h - h4;
+        if (tail != 0u) {
+            for (uint idx = SEISMIC_THREAD; idx < m * tail; idx += PROJECTION_THREADS) {
+                const uint r = m == 1u ? 0u : (idx / tail);
+                const uint c = h4 + (m == 1u ? idx : (idx - r * tail));
+                out_put(SEISMIC_RESULT_0_OUT,
+                    uint64_t(r) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(c),
+                    projection_ordered_at(norm_in, r, c, seismic_shared_f32[r]));
+            }
+        }
+    } else {
+        for (uint idx = SEISMIC_THREAD; idx < m * h; idx += PROJECTION_THREADS) {
+            const uint r = m == 1u ? 0u : (idx / h);
+            const uint c = m == 1u ? idx : (idx - r * h);
+            out_put(SEISMIC_RESULT_0_OUT,
+                uint64_t(r) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(c) * SEISMIC_RESULT_0_STRIDE_1,
+                projection_ordered_at(norm_in, r, c, seismic_shared_f32[r]));
+        }
     }
 }
 

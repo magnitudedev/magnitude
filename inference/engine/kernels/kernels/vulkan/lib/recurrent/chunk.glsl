@@ -151,14 +151,27 @@ void chunk_inputs() {
         const bool key = channel_head >= RECURRENT_NK;
         const float inverse = key ? inversesqrt(total + in_.epsilon)
                                   : inversesqrt(total + in_.epsilon) * inversesqrt(float(W));
-        const uint64_t destination = chunk_rows_at(inputs, channel_head % RECURRENT_NK, row) + (key ? W : 0u) * 4ul;
-        [[unroll]] for (uint c = 0u; c < CPL; ++c)
-            element_f32_put(destination + uint64_t(lane * CPL + c) * 4ul, values[c] * inverse);
+        const uint64_t at = chunk_rows_at(inputs, channel_head % RECURRENT_NK, row)
+            + (uint64_t(key ? W : 0u) + uint64_t(lane * CPL)) * 4ul;
+        if (CPL % 4u == 0u && (at & 15ul) == 0ul) {
+            [[unroll]] for (uint c = 0u; c + 3u < CPL; c += 4u)
+                element_uvec4_put(at + uint64_t(c) * 4ul,
+                    floatBitsToUint(vec4(values[c], values[c + 1u], values[c + 2u], values[c + 3u]) * inverse));
+        } else {
+            [[unroll]] for (uint c = 0u; c < CPL; ++c)
+                element_f32_put(at + uint64_t(c) * 4ul, values[c] * inverse);
+        }
     } else {
         const uint head = channel_head - 2u * RECURRENT_NK;
-        const uint64_t destination = chunk_values_at(inputs, head, row);
-        [[unroll]] for (uint c = 0u; c < CPL; ++c)
-            element_f32_put(destination + uint64_t(lane * CPL + c) * 4ul, values[c]);
+        const uint64_t at = chunk_values_at(inputs, head, row) + uint64_t(lane * CPL) * 4ul;
+        if (CPL % 4u == 0u && (at & 15ul) == 0ul) {
+            [[unroll]] for (uint c = 0u; c + 3u < CPL; c += 4u)
+                element_uvec4_put(at + uint64_t(c) * 4ul,
+                    floatBitsToUint(vec4(values[c], values[c + 1u], values[c + 2u], values[c + 3u])));
+        } else {
+            [[unroll]] for (uint c = 0u; c < CPL; ++c)
+                element_f32_put(at + uint64_t(c) * 4ul, values[c]);
+        }
         for (uint channel = lane; channel < RECURRENT_DECAYS; channel += 32u) {
             float beta, decay;
             recurrent_row_gates(in_, row, head, channel, beta, decay);

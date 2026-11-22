@@ -207,9 +207,20 @@ uint history_lane_words(const uint b, inout uint w[HISTORY_LANE_WORDS], uint lan
 void history_store(const uint b, uint w[HISTORY_LANE_WORDS], uint words, vec2 sz, uint64_t row, Out coefficients,
     uint lane) {
     const uint first = lane * ATTENTION_E * b / 32u;
-    [[unroll]] for (uint j = 0u; j < HISTORY_LANE_WORDS; ++j)
-        if (j < words)
-            element_u32_put(row + uint64_t(first + j) * 4ul, w[j]);
+    const uint64_t at = row + uint64_t(first) * 4ul;
+    if (words == 4u && (at & 15ul) == 0ul) {
+        uvec4 chunk = uvec4(0u);
+        [[unroll]] for (uint j = 0u; j < HISTORY_LANE_WORDS; ++j)
+            if (j < 4u)
+                chunk[j] = w[j];
+        element_uvec4_put(at, chunk);
+    } else if (words == 2u && (at & 7ul) == 0ul) {
+        element_uvec2_put(at, uvec2(w[0], w[1]));
+    } else {
+        [[unroll]] for (uint j = 0u; j < HISTORY_LANE_WORDS; ++j)
+            if (j < words)
+                element_u32_put(at + uint64_t(j) * 4ul, w[j]);
+    }
     if (lane % HISTORY_PAIR_LANES == 0u)
         out_put2(coefficients, 2ul * uint64_t(lane / HISTORY_PAIR_LANES), sz.x, sz.y);
 }

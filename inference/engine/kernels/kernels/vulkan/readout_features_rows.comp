@@ -3,49 +3,193 @@
 // Vulkan form of `metal/readout_features_rows.metal`.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
-#include "lib/projection/projection.glsl"
+#include "lib/core/reduce.glsl"
 
 #if ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_BF16 && ELEMENT_KIND(SEISMIC_ELEMENT_A) != ELEMENT_F16
 #error "readout_features_rows requires a bf16 or f16 activation"
 #endif
-#define FEATURES_ACT ACTIVATION_A
 #define FEATURES_NORM ELEMENT_OF(SEISMIC_NORM)
+
+void readout_put4(Out features, uint64_t out_row, uint i, vec4 r) {
+    out_put2(features, out_row + uint64_t(i), r.x, r.y);
+    out_put2(features, out_row + uint64_t(i + 2u), r.z, r.w);
+}
+
+#if SEISMIC_STATIC_NM != 0
+vec4 readout_load_norm4(uint64_t norm, uint i) {
+    if (FEATURES_NORM == ELEMENT_F32)
+        return element_vec4_at(norm + uint64_t(i) * 4ul);
+    const uvec2 words = element_uvec2_at(norm + uint64_t(i) * 2ul);
+    return vec4(element_unpack2(FEATURES_NORM, words.x), element_unpack2(FEATURES_NORM, words.y));
+}
+#endif
 
 // Shared: one partial per subgroup (reduce_group_sum at float 0).
 void readout_features_rows() {
     const uint width = uint(SEISMIC_DIM_D);
+    const uint width4 = width & ~3u;
+    const uint step4 = gl_WorkGroupSize.x * 4u;
     const uint row = gl_WorkGroupID.x;
-    const projection_prologue in_ = projection_input(FEATURES_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
-        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0,
-        FEATURES_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), width, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS),
-        uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT));
+    const uint64_t src_row = uint64_t(element_i32_index(
+        SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS), uint64_t(row) * SEISMIC_OUT_ROWS_STRIDE_0));
+    const uint64_t src = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + src_row * SEISMIC_HIDDEN_STRIDE_0 * 4ul;
     const Out features = SEISMIC_RESULT_0_OUT;
+    const uint64_t out_row = uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0;
+    const bool hidden_vec = SEISMIC_HIDDEN_STRIDE_2 == 1ul && (src & 15ul) == 0ul;
+    const bool features_vec = SEISMIC_RESULT_0_STRIDE_1 == 1ul && stored_aligned16(out_stored(features, 0ul));
 #if SEISMIC_STATIC_NM == 0
     // No norm: the sum in part order of the mix site's partials.
-    for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x)
-        out_put(features,
-            uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1,
-            element_round(FEATURES_ACT, projection_summed_at(in_, row, i)));
+    const uint thread = gl_LocalInvocationIndex;
+    const bool sum_vec = hidden_vec && features_vec
+        && (SEISMIC_STATIC_PT == 1 || (SEISMIC_HIDDEN_STRIDE_1 & 3ul) == 0ul);
+    if (sum_vec) {
+        for (uint i = thread * 4u; i < width4; i += step4) {
+            vec4 sum = vec4(0.0);
+            [[unroll]] for (uint part = 0u; part < uint(SEISMIC_STATIC_PT); ++part) {
+                const vec4 v = element_vec4_at(
+                    src + (uint64_t(part) * SEISMIC_HIDDEN_STRIDE_1 + uint64_t(i)) * 4ul);
+                sum = vec4(
+                    seismic_add_rn(sum.x, v.x),
+                    seismic_add_rn(sum.y, v.y),
+                    seismic_add_rn(sum.z, v.z),
+                    seismic_add_rn(sum.w, v.w));
+            }
+            readout_put4(features, out_row, i, sum);
+        }
+        const uint tail = width4 + thread;
+        if (tail < width) {
+            float sum = 0.0;
+            [[unroll]] for (uint part = 0u; part < uint(SEISMIC_STATIC_PT); ++part)
+                sum = seismic_add_rn(sum, element_f32_at(
+                    src + (uint64_t(part) * SEISMIC_HIDDEN_STRIDE_1 + uint64_t(tail)) * 4ul));
+            out_put(features, out_row + uint64_t(tail), sum);
+        }
+    } else {
+        for (uint i = thread; i < width; i += gl_WorkGroupSize.x) {
+            float sum = 0.0;
+            [[unroll]] for (uint part = 0u; part < uint(SEISMIC_STATIC_PT); ++part)
+                sum = seismic_add_rn(sum, element_f32_at(
+                    src + (uint64_t(part) * SEISMIC_HIDDEN_STRIDE_1 + uint64_t(i) * SEISMIC_HIDDEN_STRIDE_2) * 4ul));
+            out_put(features, out_row + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1, sum);
+        }
+    }
 #else
     // Every invocation's rounds, spread by `SEISMIC_THREAD`; one past the row
     // adds nothing.
     const uint thread = SEISMIC_THREAD;
+    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const uint64_t norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
+    const bool norm_vec = SEISMIC_NORM_STRIDE_0 == 1ul
+        && (norm & (4ul * uint64_t(ELEMENT_BYTES(FEATURES_NORM)) - 1ul)) == 0ul;
+    const bool store_vec = hidden_vec && features_vec && norm_vec;
     float squares = 0.0;
-    for (uint base = 0u; base < width; base += gl_WorkGroupSize.x) {
-        const uint i = base + thread;
-        if (i < width) {
-            const float v = projection_norm_input(in_, row, i);
+#if SEISMIC_STATIC_D <= 8192
+    vec4 cached[8];
+    float tail_cached = 0.0;
+    const uint base = thread * 4u;
+    const uint tail = width4 + thread;
+    if (hidden_vec) {
+        [[unroll]] for (uint slot = 0u; slot < 8u; ++slot) {
+            const uint i = base + slot * step4;
+            if (i < width4) {
+                const vec4 v = element_vec4_at(src + uint64_t(i) * 4ul);
+                cached[slot] = v;
+                squares = seismic_fma_rn(v.x, v.x, squares);
+                squares = seismic_fma_rn(v.y, v.y, squares);
+                squares = seismic_fma_rn(v.z, v.z, squares);
+                squares = seismic_fma_rn(v.w, v.w, squares);
+            }
+        }
+        if (tail < width) {
+            tail_cached = element_f32_at(src + uint64_t(tail) * 4ul);
+            squares = seismic_fma_rn(tail_cached, tail_cached, squares);
+        }
+    } else {
+        seismic_strided(uint, i, thread, width, gl_WorkGroupSize.x) {
+            const float v = element_f32_at(src + uint64_t(i) * SEISMIC_HIDDEN_STRIDE_2 * 4ul);
             squares = seismic_fma_rn(v, v, squares);
         }
     }
     squares = reduce_group_sum(squares, 0u);
-    const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + in_.eps);
-    for (uint i = thread; i < width; i += gl_WorkGroupSize.x) {
-        const float value = element_round(FEATURES_ACT,
-            projection_norm_input(in_, row, i) * inverse
-                * element_at(FEATURES_NORM, in_.norm, uint64_t(i) * in_.norm_stride));
-        out_put(features,
-            uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1, value);
+    const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + epsilon);
+    if (store_vec) {
+        [[unroll]] for (uint slot = 0u; slot < 8u; ++slot) {
+            const uint i = base + slot * step4;
+            if (i < width4) {
+                const vec4 r = (cached[slot] * inverse) * readout_load_norm4(norm, i);
+                readout_put4(features, out_row, i, r);
+            }
+        }
+        if (tail < width) {
+            out_put(features, out_row + uint64_t(tail),
+                (tail_cached * inverse) * element_at(FEATURES_NORM, norm, uint64_t(tail)));
+        }
+    } else if (hidden_vec) {
+        [[unroll]] for (uint slot = 0u; slot < 8u; ++slot) {
+            const uint i = base + slot * step4;
+            if (i < width4) {
+                const vec4 v = cached[slot];
+                out_put(features, out_row + uint64_t(i + 0u) * SEISMIC_RESULT_0_STRIDE_1,
+                    (v.x * inverse) * element_at(FEATURES_NORM, norm, uint64_t(i + 0u) * SEISMIC_NORM_STRIDE_0));
+                out_put(features, out_row + uint64_t(i + 1u) * SEISMIC_RESULT_0_STRIDE_1,
+                    (v.y * inverse) * element_at(FEATURES_NORM, norm, uint64_t(i + 1u) * SEISMIC_NORM_STRIDE_0));
+                out_put(features, out_row + uint64_t(i + 2u) * SEISMIC_RESULT_0_STRIDE_1,
+                    (v.z * inverse) * element_at(FEATURES_NORM, norm, uint64_t(i + 2u) * SEISMIC_NORM_STRIDE_0));
+                out_put(features, out_row + uint64_t(i + 3u) * SEISMIC_RESULT_0_STRIDE_1,
+                    (v.w * inverse) * element_at(FEATURES_NORM, norm, uint64_t(i + 3u) * SEISMIC_NORM_STRIDE_0));
+            }
+        }
+        if (tail < width) {
+            out_put(features, out_row + uint64_t(tail) * SEISMIC_RESULT_0_STRIDE_1,
+                (tail_cached * inverse) * element_at(FEATURES_NORM, norm, uint64_t(tail) * SEISMIC_NORM_STRIDE_0));
+        }
+    } else {
+        for (uint i = thread; i < width; i += gl_WorkGroupSize.x) {
+            const float value = element_f32_at(src + uint64_t(i) * SEISMIC_HIDDEN_STRIDE_2 * 4ul) * inverse
+                * element_at(FEATURES_NORM, norm, uint64_t(i) * SEISMIC_NORM_STRIDE_0);
+            out_put(features, out_row + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1, value);
+        }
     }
+#else
+    const uint tail = width4 + thread;
+    if (hidden_vec) {
+        seismic_strided(uint, i, thread * 4u, width4, step4) {
+            const vec4 v = element_vec4_at(src + uint64_t(i) * 4ul);
+            squares = seismic_fma_rn(v.x, v.x, squares);
+            squares = seismic_fma_rn(v.y, v.y, squares);
+            squares = seismic_fma_rn(v.z, v.z, squares);
+            squares = seismic_fma_rn(v.w, v.w, squares);
+        }
+        if (tail < width) {
+            const float v = element_f32_at(src + uint64_t(tail) * 4ul);
+            squares = seismic_fma_rn(v, v, squares);
+        }
+    } else {
+        seismic_strided(uint, i, thread, width, gl_WorkGroupSize.x) {
+            const float v = element_f32_at(src + uint64_t(i) * SEISMIC_HIDDEN_STRIDE_2 * 4ul);
+            squares = seismic_fma_rn(v, v, squares);
+        }
+    }
+    squares = reduce_group_sum(squares, 0u);
+    const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + epsilon);
+    if (store_vec) {
+        for (uint i = thread * 4u; i < width4; i += step4) {
+            const vec4 v = element_vec4_at(src + uint64_t(i) * 4ul);
+            const vec4 r = (v * inverse) * readout_load_norm4(norm, i);
+            readout_put4(features, out_row, i, r);
+        }
+        if (tail < width) {
+            out_put(features, out_row + uint64_t(tail),
+                (element_f32_at(src + uint64_t(tail) * 4ul) * inverse)
+                    * element_at(FEATURES_NORM, norm, uint64_t(tail)));
+        }
+    } else {
+        for (uint i = thread; i < width; i += gl_WorkGroupSize.x) {
+            const float value = element_f32_at(src + uint64_t(i) * SEISMIC_HIDDEN_STRIDE_2 * 4ul) * inverse
+                * element_at(FEATURES_NORM, norm, uint64_t(i) * SEISMIC_NORM_STRIDE_0);
+            out_put(features, out_row + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1, value);
+        }
+    }
+#endif
 #endif
 }

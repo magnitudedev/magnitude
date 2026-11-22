@@ -229,6 +229,28 @@ void out_put(Out handle, uint64_t index, float value) {
 void out_put2(Out handle, uint64_t index, float first, float second) {
     element_put2(handle.seismic_kind, handle.seismic_base, index, first, second);
 }
+// Four consecutive elements from `index`: one 128-bit store for a 16-byte-aligned F32
+// address, one 64-bit store for an 8-byte-aligned 16-bit address, scalar otherwise.
+void out_put4(Out handle, uint64_t index, vec4 v) {
+    if (handle.seismic_kind == ELEMENT_F32) {
+        const uint64_t at = handle.seismic_base + index * 4ul;
+        if ((at & 15ul) == 0ul) {
+            element_uvec4_put(at, floatBitsToUint(v));
+            return;
+        }
+    } else {
+        const uint64_t at = handle.seismic_base + index * 2ul;
+        if ((at & 7ul) == 0ul) {
+            element_uvec2_put(at, uvec2(element_pack2(handle.seismic_kind, v.x, v.y),
+                element_pack2(handle.seismic_kind, v.z, v.w)));
+            return;
+        }
+    }
+    out_put(handle, index, v.x);
+    out_put(handle, index + 1ul, v.y);
+    out_put(handle, index + 2ul, v.z);
+    out_put(handle, index + 3ul, v.w);
+}
 // The view from element `elements` on.
 Out out_offset(Out handle, uint64_t elements) {
     return Out(handle.seismic_base + elements * uint64_t(ELEMENT_BYTES(handle.seismic_kind)), handle.seismic_kind);
@@ -243,28 +265,44 @@ void out_put8(Out handle, uint64_t index, vec4 even, vec4 odd) {
         element_uvec4_put(handle.seismic_base + index * 2ul, element_pack8(handle.seismic_kind, even, odd));
     }
 }
+void element_detail_copy_stored(const int kind, uint64_t dst_base, uint64_t dst_index,
+    uint64_t src_base, uint64_t src_index, uint64_t count) {
+    const uint64_t elem_bytes = uint64_t(ELEMENT_BYTES(kind));
+    const uint64_t vec_elems = kind == ELEMENT_F32 ? 4ul : 8ul;
+    const uint64_t dst = dst_base + dst_index * elem_bytes;
+    const uint64_t src = src_base + src_index * elem_bytes;
+    uint64_t i = 0ul;
+    if (((dst ^ src) & 15ul) == 0ul && count >= vec_elems) {
+        const uint64_t head = ((16ul - (dst & 15ul)) & 15ul) >> (kind == ELEMENT_F32 ? 2ul : 1ul);
+        for (; i < head; ++i) {
+            if (kind == ELEMENT_F32)
+                element_u32_put(dst + i * 4ul, element_u32_at(src + i * 4ul));
+            else
+                element_u16_put(dst + i * 2ul, element_u16_at(src + i * 2ul));
+        }
+        for (; i + vec_elems <= count; i += vec_elems)
+            element_uvec4_put(dst + i * elem_bytes, element_uvec4_at(src + i * elem_bytes));
+    }
+    for (; i < count; ++i) {
+        if (kind == ELEMENT_F32)
+            element_u32_put(dst + i * 4ul, element_u32_at(src + i * 4ul));
+        else
+            element_u16_put(dst + i * 2ul, element_u16_at(src + i * 2ul));
+    }
+}
 // Moves `count` elements of `from`, which the owner stored, to `index` without decoding.
 void out_move_stored(Out to, uint64_t index, Out from, uint64_t from_index, uint64_t count) {
-    for (uint64_t i = 0ul; i < count; ++i) {
-        if (to.seismic_kind == ELEMENT_F32)
-            element_u32_put(to.seismic_base + (index + i) * 4ul,
-                element_u32_at(from.seismic_base + (from_index + i) * 4ul));
-        else
-            element_u16_put(to.seismic_base + (index + i) * 2ul,
-                element_u16_at(from.seismic_base + (from_index + i) * 2ul));
+    if (to.seismic_kind == from.seismic_kind) {
+        element_detail_copy_stored(to.seismic_kind, to.seismic_base, index, from.seismic_base, from_index, count);
+    } else {
+        for (uint64_t i = 0ul; i < count; ++i)
+            out_put(to, index + i, out_at(from, from_index + i));
     }
 }
 // Copies `count` stored elements of `to`'s kind from `source_base` (from element `source_index`) to
 // `index` without decoding, preserving subnormals and NaN payloads bit-for-bit.
 void out_copy_stored(Out to, uint64_t index, uint64_t source_base, uint64_t source_index, uint64_t count) {
-    for (uint64_t i = 0ul; i < count; ++i) {
-        if (to.seismic_kind == ELEMENT_F32)
-            element_u32_put(to.seismic_base + (index + i) * 4ul,
-                element_u32_at(source_base + (source_index + i) * 4ul));
-        else
-            element_u16_put(to.seismic_base + (index + i) * 2ul,
-                element_u16_at(source_base + (source_index + i) * 2ul));
-    }
+    element_detail_copy_stored(to.seismic_kind, to.seismic_base, index, source_base, source_index, count);
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +336,23 @@ vec2 stored_at2(Stored view, uint64_t index) {
     if (view.seismic_kind != ELEMENT_F32 && (index & 1ul) == 0ul)
         return element_unpack2(view.seismic_kind, element_u32_at(view.seismic_base + index * 2ul));
     return vec2(stored_at(view, index), stored_at(view, index + 1ul));
+}
+// Four contiguous elements from `index`: one 128-bit load for a 16-byte-aligned F32
+// address, one 64-bit load for an 8-byte-aligned 16-bit address, scalar otherwise.
+vec4 stored_load4(Stored view, uint64_t index) {
+    if (view.seismic_kind == ELEMENT_F32) {
+        const uint64_t at = view.seismic_base + index * 4ul;
+        if ((at & 15ul) == 0ul)
+            return element_vec4_at(at);
+    } else {
+        const uint64_t at = view.seismic_base + index * 2ul;
+        if ((at & 7ul) == 0ul) {
+            const uvec2 words = element_uvec2_at(at);
+            return vec4(element_unpack2(view.seismic_kind, words.x), element_unpack2(view.seismic_kind, words.y));
+        }
+    }
+    return vec4(stored_at(view, index), stored_at(view, index + 1ul),
+        stored_at(view, index + 2ul), stored_at(view, index + 3ul));
 }
 // Eight contiguous elements from `index`, aligned to eight elements, as (even, odd).
 void stored_load8(Stored view, uint64_t index, out vec4 even, out vec4 odd) {

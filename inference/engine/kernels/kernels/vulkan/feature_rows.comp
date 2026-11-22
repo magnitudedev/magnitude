@@ -1,19 +1,36 @@
-// feature_rows: features[row, column] = A(fused[out_rows[row], column]); one
-// invocation per element over a grid-stride loop (the grid is capped below
-// the 65535-group floor).
+// feature_rows: features[row, column] = A(fused[out_rows[row], column]); four
+// elements per invocation on a (column, row) grid, with the y grid striding
+// rows when O exceeds the 65535-group floor.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
 void feature_rows() {
+    const uint64_t width = SEISMIC_DIM_D;
+    const uint64_t col0 = (uint64_t(gl_WorkGroupID.x) * 256ul + uint64_t(gl_LocalInvocationIndex)) * 4ul;
+    if (col0 >= width)
+        return;
     const uint64_t fused = SEISMIC_PTR(SEISMIC_BUFFER_FUSED);
     const uint64_t out_rows = SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS);
     const Out features = SEISMIC_RESULT_0_OUT;
-    const uint64_t width = SEISMIC_DIM_D;
-    const uint64_t count = SEISMIC_DIM_O * width;
-    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, width)); at.index < count; seismic_walk_next(at)) {
-        const uint64_t row = at.axes.x, column = at.axes.w;
+    const bool unit_stride = col0 + 4ul <= width
+        && SEISMIC_FUSED_STRIDE_1 == 1ul
+        && SEISMIC_RESULT_0_STRIDE_1 == 1ul;
+    const uint64_t limit = (col0 + 4ul < width) ? (col0 + 4ul) : width;
+    for (uint64_t row = uint64_t(gl_WorkGroupID.y); row < SEISMIC_DIM_O; row += uint64_t(gl_NumWorkGroups.y)) {
         const uint64_t source = uint64_t(element_i32_index(out_rows, row * SEISMIC_OUT_ROWS_STRIDE_0));
-        out_put(features, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-            element_f32_at(fused + (source * SEISMIC_FUSED_STRIDE_0 + column * SEISMIC_FUSED_STRIDE_1) * 4ul));
+        const uint64_t src_row = source * SEISMIC_FUSED_STRIDE_0;
+        const uint64_t dst_row = row * SEISMIC_RESULT_0_STRIDE_0;
+        const uint64_t src_addr = fused + (src_row + col0) * 4ul;
+        if (unit_stride && (src_addr & 15ul) == 0ul) {
+            const vec4 values = element_vec4_at(src_addr);
+            const uint64_t dst_index = dst_row + col0;
+            out_put2(features, dst_index, values.x, values.y);
+            out_put2(features, dst_index + 2ul, values.z, values.w);
+        } else {
+            for (uint64_t c = col0; c < limit; ++c) {
+                out_put(features, dst_row + c * SEISMIC_RESULT_0_STRIDE_1,
+                    element_f32_at(fused + (src_row + c * SEISMIC_FUSED_STRIDE_1) * 4ul));
+            }
+        }
     }
 }

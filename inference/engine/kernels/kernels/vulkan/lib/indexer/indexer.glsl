@@ -45,3 +45,45 @@ int indexer_span_row(uint64_t spans, uint64_t count, uint64_t stride, uint64_t b
     }
     return -1;
 }
+
+// The listed rows of a row's `count` spans (`stride` apart, bounds `bound`
+// apart), returned uniformly to each lane of a logical subgroup, and in `row`
+// the key-plane row of the lane's `ordinal` (-1 past them). The lanes take the
+// spans 32 at a time: a logical-subgroup scan of their lengths gives each
+// span's first ordinal, and a lane whose ordinal the chunk holds finds its
+// span as the last whose first ordinal is at most it, by bisection over the
+// lanes (an empty span's first ordinal is the next span's, so it is never the
+// last). Every lane calls it with the same spans, convergent.
+uint indexer_subgroup_span_row(uint64_t spans, uint64_t count, uint64_t stride, uint64_t bound, uint64_t ordinal,
+    uint lane, out int row) {
+    uint listed = 0u;
+    row = -1;
+    for (uint64_t base = 0ul; base < count; base += 32ul) {
+        const uint64_t span = base + uint64_t(lane);
+        const uint64_t at = spans + span * stride * 4ul;
+        const int lo = span < count ? element_i32_at(at) : 0;
+        const uint length = span < count ? indexer_span_length(lo, element_i32_at(at + bound * 4ul)) : 0u;
+        uint inclusive = length;
+        [[unroll]] for (uint delta = 1u; delta < 32u; delta <<= 1) {
+            const uint below = subgroupShuffleUp(inclusive, delta);
+            if (lane >= delta)
+                inclusive += below;
+        }
+        const uint first = listed + (inclusive - length);
+        // Both logical subgroups of a 64-lane hardware subgroup scan the same
+        // spans, so broadcasting from the first keeps `chunk` and `listed`
+        // hardware-subgroup-uniform on 64-lane hardware (and folds away on 32).
+        const uint chunk = seismic_hardware_first(seismic_shuffle(inclusive, 31u));
+        uint holder = 0u;
+        [[unroll]] for (uint step = 16u; step > 0u; step >>= 1) {
+            if (uint64_t(seismic_shuffle(first, holder + step)) <= ordinal)
+                holder += step;
+        }
+        const int holder_lo = seismic_shuffle(lo, holder);
+        const uint holder_first = seismic_shuffle(first, holder);
+        if (ordinal >= uint64_t(listed) && ordinal < uint64_t(listed + chunk))
+            row = holder_lo + int(ordinal - uint64_t(holder_first));
+        listed += chunk;
+    }
+    return listed;
+}

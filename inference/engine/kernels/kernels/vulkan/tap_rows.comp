@@ -1,19 +1,36 @@
-// tap_rows: taps[row, index[0] * D + column] = A(residual[row, column]); one
-// invocation per element over a grid-stride loop (the grid is capped below
-// the 65535-group floor).
+// tap_rows: taps[row, index[0] * D + column] = A(residual[row, column]); four
+// elements per invocation on a (column, row) grid, with the y grid striding
+// rows when M exceeds the 65535-group floor.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
 void tap_rows() {
+    const uint64_t width = SEISMIC_DIM_D;
+    const uint64_t col0 = (uint64_t(gl_WorkGroupID.x) * 256ul + uint64_t(gl_LocalInvocationIndex)) * 4ul;
+    if (col0 >= width)
+        return;
     const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL);
     const Out taps = SEISMIC_OUT_TAPS;
-    const uint64_t width = SEISMIC_DIM_D;
-    const uint64_t count = SEISMIC_DIM_M * width;
     const uint64_t tap = uint64_t(element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_INDEX), 0ul));
-    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, width)); at.index < count; seismic_walk_next(at)) {
-        const uint64_t row = at.axes.x;
-        const uint64_t column = at.axes.w;
-        out_put(taps, row * SEISMIC_TAPS_STRIDE_0 + (tap * width + column) * SEISMIC_TAPS_STRIDE_1,
-            element_f32_at(residual + (row * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1) * 4ul));
+    const uint64_t tap_base = tap * width;
+    const bool unit_stride = col0 + 4ul <= width
+        && SEISMIC_RESIDUAL_STRIDE_1 == 1ul
+        && SEISMIC_TAPS_STRIDE_1 == 1ul;
+    const uint64_t limit = (col0 + 4ul < width) ? (col0 + 4ul) : width;
+    for (uint64_t row = uint64_t(gl_WorkGroupID.y); row < SEISMIC_DIM_M; row += uint64_t(gl_NumWorkGroups.y)) {
+        const uint64_t src_row = row * SEISMIC_RESIDUAL_STRIDE_0;
+        const uint64_t dst_row = row * SEISMIC_TAPS_STRIDE_0;
+        const uint64_t src_addr = residual + (src_row + col0) * 4ul;
+        if (unit_stride && (src_addr & 15ul) == 0ul) {
+            const vec4 values = element_vec4_at(src_addr);
+            const uint64_t dst_index = dst_row + tap_base + col0;
+            out_put2(taps, dst_index, values.x, values.y);
+            out_put2(taps, dst_index + 2ul, values.z, values.w);
+        } else {
+            for (uint64_t c = col0; c < limit; ++c) {
+                out_put(taps, dst_row + (tap_base + c) * SEISMIC_TAPS_STRIDE_1,
+                    element_f32_at(residual + (src_row + c * SEISMIC_RESIDUAL_STRIDE_1) * 4ul));
+            }
+        }
     }
 }

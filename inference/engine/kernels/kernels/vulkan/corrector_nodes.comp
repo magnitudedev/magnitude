@@ -1,7 +1,7 @@
-// corrector_nodes: one invocation per element of the node rows over a
-// grid-stride loop, summing the node's token, pass, feature, slot and rank
-// rows with their biases in the portable body's order. Mirrors
-// `cpu/corrector_nodes.rs`.
+// corrector_nodes: 4 elements per invocation of node (slot s, mask row j,
+// candidate k) on a (column, node, slot) grid: its token, pass, pass bias,
+// feature, feature bias, slot and rank values, then the token bias when
+// TB = 1, summed in the portable body's order. Mirrors `cpu/corrector_nodes.rs`.
 #include <seismic/element.glsl>
 
 void corrector_nodes() {
@@ -14,24 +14,65 @@ void corrector_nodes() {
     const uint64_t slot_rows = SEISMIC_PTR(SEISMIC_BUFFER_SLOT);
     const uint64_t rank_rows = SEISMIC_PTR(SEISMIC_BUFFER_RANK);
     const Out result = SEISMIC_RESULT_0_OUT;
-    const uint64_t rows = SEISMIC_DIM_J, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
-    const uint64_t total = SEISMIC_DIM_S * rows * count * width;
-    for (seismic_walk at = seismic_walk_grid(total, u64vec3(rows, count, width)); at.index < total;
-            seismic_walk_next(at)) {
-        const uint64_t slot = at.axes.x, mask = at.axes.y, candidate = at.axes.z, column = at.axes.w;
-        float value = element_f32_at(token + (slot * SEISMIC_TOKEN_STRIDE_0 + mask * SEISMIC_TOKEN_STRIDE_1
-                + candidate * SEISMIC_TOKEN_STRIDE_2 + column * SEISMIC_TOKEN_STRIDE_3) * 4ul)
-            + element_f32_at(pass + (slot * SEISMIC_PASS_STRIDE_0 + mask * SEISMIC_PASS_STRIDE_1
-                + column * SEISMIC_PASS_STRIDE_2) * 4ul)
-            + element_f32_at(pass_bias + column * SEISMIC_PASS_BIAS_STRIDE_0 * 4ul)
-            + element_f32_at(feature + (slot * SEISMIC_FEATURE_STRIDE_0 + mask * SEISMIC_FEATURE_STRIDE_1
-                + candidate * SEISMIC_FEATURE_STRIDE_2 + column * SEISMIC_FEATURE_STRIDE_3) * 4ul)
-            + element_f32_at(feature_bias + column * SEISMIC_FEATURE_BIAS_STRIDE_0 * 4ul)
-            + element_f32_at(slot_rows + (mask * SEISMIC_SLOT_STRIDE_0 + column * SEISMIC_SLOT_STRIDE_1) * 4ul)
-            + element_f32_at(rank_rows + (candidate * SEISMIC_RANK_STRIDE_0 + column * SEISMIC_RANK_STRIDE_1) * 4ul);
-        if (SEISMIC_DIM_TB == 1ul)
-            value += element_f32_at(token_bias + column * SEISMIC_TOKEN_BIAS_STRIDE_1 * 4ul);
-        out_put(result, slot * SEISMIC_RESULT_0_STRIDE_0 + mask * SEISMIC_RESULT_0_STRIDE_1
-            + candidate * SEISMIC_RESULT_0_STRIDE_2 + column * SEISMIC_RESULT_0_STRIDE_3, value);
+    const uint64_t slots = SEISMIC_DIM_S, rows = SEISMIC_DIM_J, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
+    const uint64_t nodes_per_slot = rows * count;
+    const uint64_t col_stride = uint64_t(gl_NumWorkGroups.x) * uint64_t(gl_WorkGroupSize.x) * 4ul;
+    const bool unit_strides = SEISMIC_TOKEN_STRIDE_3 == 1ul && SEISMIC_PASS_STRIDE_2 == 1ul
+        && SEISMIC_PASS_BIAS_STRIDE_0 == 1ul && SEISMIC_FEATURE_STRIDE_3 == 1ul
+        && SEISMIC_FEATURE_BIAS_STRIDE_0 == 1ul && SEISMIC_SLOT_STRIDE_1 == 1ul
+        && SEISMIC_RANK_STRIDE_1 == 1ul && SEISMIC_RESULT_0_STRIDE_3 == 1ul
+        && (SEISMIC_DIM_TB == 0ul || SEISMIC_TOKEN_BIAS_STRIDE_1 == 1ul);
+
+    for (seismic_walk node = seismic_walk_begin(gl_WorkGroupID.y, gl_NumWorkGroups.y, nodes_per_slot,
+                u64vec3(1ul, 1ul, count));
+            node.index < nodes_per_slot; seismic_walk_next(node)) {
+        const uint64_t mask = node.axes.x, candidate = node.axes.w;
+        const uint64_t s_row = slot_rows + mask * SEISMIC_SLOT_STRIDE_0 * 4ul;
+        const uint64_t r_row = rank_rows + candidate * SEISMIC_RANK_STRIDE_0 * 4ul;
+        for (uint64_t slot = gl_WorkGroupID.z; slot < slots; slot += gl_NumWorkGroups.z) {
+            const uint64_t t_row = token + (slot * SEISMIC_TOKEN_STRIDE_0 + mask * SEISMIC_TOKEN_STRIDE_1
+                + candidate * SEISMIC_TOKEN_STRIDE_2) * 4ul;
+            const uint64_t p_row = pass + (slot * SEISMIC_PASS_STRIDE_0 + mask * SEISMIC_PASS_STRIDE_1) * 4ul;
+            const uint64_t f_row = feature + (slot * SEISMIC_FEATURE_STRIDE_0 + mask * SEISMIC_FEATURE_STRIDE_1
+                + candidate * SEISMIC_FEATURE_STRIDE_2) * 4ul;
+            const uint64_t out_base = slot * SEISMIC_RESULT_0_STRIDE_0 + mask * SEISMIC_RESULT_0_STRIDE_1
+                + candidate * SEISMIC_RESULT_0_STRIDE_2;
+
+            for (uint64_t col = uint64_t(gl_GlobalInvocationID.x) * 4ul; col < width; col += col_stride) {
+                const uint64_t col_bytes = col * 4ul;
+                uint64_t ptr_bits = (t_row + col_bytes) | (p_row + col_bytes) | (pass_bias + col_bytes)
+                    | (f_row + col_bytes) | (feature_bias + col_bytes) | (s_row + col_bytes) | (r_row + col_bytes);
+                if (SEISMIC_DIM_TB == 1ul)
+                    ptr_bits |= (token_bias + col_bytes);
+
+                if (col + 4ul <= width && unit_strides && (ptr_bits & 15ul) == 0ul) {
+                    vec4 o = element_vec4_at(t_row + col_bytes)
+                        + element_vec4_at(p_row + col_bytes)
+                        + element_vec4_at(pass_bias + col_bytes)
+                        + element_vec4_at(f_row + col_bytes)
+                        + element_vec4_at(feature_bias + col_bytes)
+                        + element_vec4_at(s_row + col_bytes)
+                        + element_vec4_at(r_row + col_bytes);
+                    if (SEISMIC_DIM_TB == 1ul)
+                        o += element_vec4_at(token_bias + col_bytes);
+                    out_put2(result, out_base + col, o.x, o.y);
+                    out_put2(result, out_base + col + 2ul, o.z, o.w);
+                } else {
+                    const uint64_t end = min(col + 4ul, width);
+                    for (uint64_t c = col; c < end; ++c) {
+                        float value = element_f32_at(t_row + c * SEISMIC_TOKEN_STRIDE_3 * 4ul)
+                            + element_f32_at(p_row + c * SEISMIC_PASS_STRIDE_2 * 4ul)
+                            + element_f32_at(pass_bias + c * SEISMIC_PASS_BIAS_STRIDE_0 * 4ul)
+                            + element_f32_at(f_row + c * SEISMIC_FEATURE_STRIDE_3 * 4ul)
+                            + element_f32_at(feature_bias + c * SEISMIC_FEATURE_BIAS_STRIDE_0 * 4ul)
+                            + element_f32_at(s_row + c * SEISMIC_SLOT_STRIDE_1 * 4ul)
+                            + element_f32_at(r_row + c * SEISMIC_RANK_STRIDE_1 * 4ul);
+                        if (SEISMIC_DIM_TB == 1ul)
+                            value += element_f32_at(token_bias + c * SEISMIC_TOKEN_BIAS_STRIDE_1 * 4ul);
+                        out_put(result, out_base + c * SEISMIC_RESULT_0_STRIDE_3, value);
+                    }
+                }
+            }
+        }
     }
 }

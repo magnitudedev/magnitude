@@ -1,36 +1,169 @@
 // draft_top_k: one workgroup of 256 invocations per row selects the row's K
-// highest logits in (value descending, token ascending) order. Round r scans
-// the tokens ordered strictly after round r - 1's choice. The Vulkan form of
-// `metal/draft_top_k.metal`.
+// highest logits in (value descending, token ascending) order. For K <= 16,
+// each invocation scans its share of the vocabulary once (vec4-vectorized when
+// unit-strided and 16-byte aligned) keeping its sorted local top-K in
+// registers, then K workgroup reductions merge the register candidates with no
+// global memory re-reads. Larger K falls back to multi-pass selection.
+// The Vulkan form of `metal/draft_top_k.metal`.
 #include <seismic/element.glsl>
 #include "lib/core/reduce.glsl"
 
 #define TOP_K_INF uintBitsToFloat(0x7f800000u)
+#define TOP_K_LOCAL 16u
 
-// Shared: one partial per subgroup (reduce_group_max at float 0).
+void top_k_insert(inout float vals[TOP_K_LOCAL], inout int toks[TOP_K_LOCAL],
+        uint k, float value, int tok) {
+    uint pos = k - 1u;
+    while (pos > 0u) {
+        const float prev_v = vals[pos - 1u];
+        const int prev_t = toks[pos - 1u];
+        if (value > prev_v || (value == prev_v && tok < prev_t)) {
+            vals[pos] = prev_v;
+            toks[pos] = prev_t;
+            pos -= 1u;
+        } else {
+            break;
+        }
+    }
+    vals[pos] = value;
+    toks[pos] = tok;
+}
+
+void top_k_consider(float value, int tok, float previous, int previous_token,
+        inout float best, inout int best_token) {
+    const bool after = value < previous || (value == previous && tok > previous_token);
+    if (after && (value > best || (value == best && tok < best_token))) {
+        best = value;
+        best_token = tok;
+    }
+}
+
+// Shared: one partial per subgroup (reduce_group_max / reduce_group_max_u32 at float 0).
 void draft_top_k() {
+    if (SEISMIC_DIM_K == 0ul)
+        return;
     const uint64_t logits = SEISMIC_PTR(SEISMIC_BUFFER_LOGITS);
     const uint64_t candidates = SEISMIC_PTR(SEISMIC_BUFFER_CANDIDATES);
     const Out unary = SEISMIC_OUT_UNARY;
     const uint64_t row = gl_WorkGroupID.x;
+    const uint64_t row_base = logits + row * SEISMIC_LOGITS_STRIDE_0 * 4ul;
+    const bool vec_ok = SEISMIC_LOGITS_STRIDE_1 == 1ul && (row_base & 15ul) == 0ul;
+    const uint64_t vec_count = SEISMIC_DIM_V >> 2;
+    const uint64_t vec_end = vec_count << 2;
+
+    if (SEISMIC_DIM_K <= uint64_t(TOP_K_LOCAL)) {
+        const uint k = uint(SEISMIC_DIM_K);
+        float local_val[TOP_K_LOCAL];
+        int local_tok[TOP_K_LOCAL];
+        for (uint i = 0u; i < k; ++i) {
+            local_val[i] = -TOP_K_INF;
+            local_tok[i] = 0x7fffffff;
+        }
+        float worst_val = -TOP_K_INF;
+        int worst_tok = 0x7fffffff;
+
+        // Numbered by `SEISMIC_THREAD`: the candidates reach the reductions.
+        if (vec_ok) {
+            seismic_strided(uint64_t, vec_idx, uint64_t(SEISMIC_THREAD), vec_count, gl_WorkGroupSize.x) {
+                const vec4 v = element_vec4_at(row_base + vec_idx * 16ul);
+                const int base_tok = int(vec_idx << 2);
+                if (v.x > worst_val || (v.x == worst_val && base_tok < worst_tok)) {
+                    top_k_insert(local_val, local_tok, k, v.x, base_tok);
+                    worst_val = local_val[k - 1u];
+                    worst_tok = local_tok[k - 1u];
+                }
+                if (v.y > worst_val || (v.y == worst_val && (base_tok + 1) < worst_tok)) {
+                    top_k_insert(local_val, local_tok, k, v.y, base_tok + 1);
+                    worst_val = local_val[k - 1u];
+                    worst_tok = local_tok[k - 1u];
+                }
+                if (v.z > worst_val || (v.z == worst_val && (base_tok + 2) < worst_tok)) {
+                    top_k_insert(local_val, local_tok, k, v.z, base_tok + 2);
+                    worst_val = local_val[k - 1u];
+                    worst_tok = local_tok[k - 1u];
+                }
+                if (v.w > worst_val || (v.w == worst_val && (base_tok + 3) < worst_tok)) {
+                    top_k_insert(local_val, local_tok, k, v.w, base_tok + 3);
+                    worst_val = local_val[k - 1u];
+                    worst_tok = local_tok[k - 1u];
+                }
+            }
+            seismic_strided_from(uint64_t, token, vec_end, uint64_t(SEISMIC_THREAD), SEISMIC_DIM_V, gl_WorkGroupSize.x) {
+                const float value = element_f32_at(row_base + token * 4ul);
+                const int tok = int(token);
+                if (value > worst_val || (value == worst_val && tok < worst_tok)) {
+                    top_k_insert(local_val, local_tok, k, value, tok);
+                    worst_val = local_val[k - 1u];
+                    worst_tok = local_tok[k - 1u];
+                }
+            }
+        } else {
+            seismic_strided(uint64_t, token, uint64_t(SEISMIC_THREAD), SEISMIC_DIM_V, gl_WorkGroupSize.x) {
+                const float value = element_f32_at(row_base + token * SEISMIC_LOGITS_STRIDE_1 * 4ul);
+                const int tok = int(token);
+                if (value > worst_val || (value == worst_val && tok < worst_tok)) {
+                    top_k_insert(local_val, local_tok, k, value, tok);
+                    worst_val = local_val[k - 1u];
+                    worst_tok = local_tok[k - 1u];
+                }
+            }
+        }
+
+        uint cursor = 0u;
+        for (uint rank = 0u; rank < k; ++rank) {
+            const float cand_val = cursor < k ? local_val[cursor] : -TOP_K_INF;
+            const int cand_tok = cursor < k ? local_tok[cursor] : 0x7fffffff;
+            const float chosen = reduce_group_max(cand_val, 0u);
+            const uint inv_tok = (cand_val == chosen && cand_tok != 0x7fffffff)
+                ? (0x7fffffffu - uint(cand_tok))
+                : 0u;
+            const uint best_inv = reduce_group_max_u32(inv_tok, 0u);
+            const int chosen_token = best_inv == 0u ? 0x7fffffff : int(0x7fffffffu - best_inv);
+            if (cursor < k && chosen_token != 0x7fffffff && cand_tok == chosen_token)
+                cursor += 1u;
+            if (gl_LocalInvocationIndex == 0u) {
+                const uint64_t at = row * SEISMIC_DIM_K + uint64_t(rank);
+                element_i32_put(candidates + at * SEISMIC_CANDIDATES_STRIDE_0 * 4ul, chosen_token);
+                element_i32_put(candidates + (at * SEISMIC_CANDIDATES_STRIDE_0 + SEISMIC_CANDIDATES_STRIDE_1) * 4ul, 0);
+                out_put(unary, row * SEISMIC_UNARY_STRIDE_0 + uint64_t(rank) * SEISMIC_UNARY_STRIDE_1, chosen);
+            }
+        }
+        return;
+    }
+
     float previous = TOP_K_INF;
     int previous_token = -1;
     for (uint64_t rank = 0ul; rank < SEISMIC_DIM_K; ++rank) {
         float best = -TOP_K_INF;
         int best_token = 0x7fffffff;
         // Numbered by `SEISMIC_THREAD`: the candidates reach the reductions.
-        seismic_strided(uint64_t, token, uint64_t(SEISMIC_THREAD), SEISMIC_DIM_V, gl_WorkGroupSize.x) {
-            const float value = element_f32_at(logits + (row * SEISMIC_LOGITS_STRIDE_0 + token * SEISMIC_LOGITS_STRIDE_1) * 4ul);
-            const bool after = value < previous || (value == previous && int(token) > previous_token);
-            if (after && (value > best || (value == best && int(token) < best_token))) {
-                best = value;
-                best_token = int(token);
+        if (vec_ok) {
+            seismic_strided(uint64_t, vec_idx, uint64_t(SEISMIC_THREAD), vec_count, gl_WorkGroupSize.x) {
+                const vec4 v = element_vec4_at(row_base + vec_idx * 16ul);
+                const int base_tok = int(vec_idx << 2);
+                top_k_consider(v.x, base_tok, previous, previous_token, best, best_token);
+                top_k_consider(v.y, base_tok + 1, previous, previous_token, best, best_token);
+                top_k_consider(v.z, base_tok + 2, previous, previous_token, best, best_token);
+                top_k_consider(v.w, base_tok + 3, previous, previous_token, best, best_token);
+            }
+            seismic_strided_from(uint64_t, token, vec_end, uint64_t(SEISMIC_THREAD), SEISMIC_DIM_V, gl_WorkGroupSize.x) {
+                top_k_consider(element_f32_at(row_base + token * 4ul), int(token),
+                    previous, previous_token, best, best_token);
+            }
+        } else {
+            seismic_strided(uint64_t, token, uint64_t(SEISMIC_THREAD), SEISMIC_DIM_V, gl_WorkGroupSize.x) {
+                top_k_consider(element_f32_at(row_base + token * SEISMIC_LOGITS_STRIDE_1 * 4ul), int(token),
+                    previous, previous_token, best, best_token);
             }
         }
         const float chosen = reduce_group_max(best, 0u);
-        const float lowest = -reduce_group_max(best == chosen ? -float(best_token) : -TOP_K_INF, 0u);
+        const uint inv_tok = (best == chosen && best_token != 0x7fffffff)
+            ? (0x7fffffffu - uint(best_token))
+            : 0u;
+        const uint best_inv = reduce_group_max_u32(inv_tok, 0u);
+        const int chosen_token = best_inv == 0u ? 0x7fffffff : int(0x7fffffffu - best_inv);
         previous = chosen;
-        previous_token = int(lowest);
+        previous_token = chosen_token;
         if (gl_LocalInvocationIndex == 0u) {
             const uint64_t at = row * SEISMIC_DIM_K + rank;
             element_i32_put(candidates + at * SEISMIC_CANDIDATES_STRIDE_0 * 4ul, previous_token);

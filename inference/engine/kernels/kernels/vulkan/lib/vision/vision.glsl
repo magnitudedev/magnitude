@@ -138,6 +138,49 @@ float vision_activate(int code, float value) {
                      : vision_silu(value);
 }
 
+vec2 vision_load2(const int kind, uint64_t base, uint64_t index) {
+    if (kind == ELEMENT_F32) {
+        const uint64_t address = base + index * 4ul;
+        if ((address & 7ul) == 0ul)
+            return uintBitsToFloat(element_uvec2_at(address));
+    } else {
+        const uint64_t address = base + index * 2ul;
+        if ((address & 3ul) == 0ul)
+            return element_unpack2(kind, element_u32_at(address));
+    }
+    return vec2(element_at(kind, base, index), element_at(kind, base, index + 1ul));
+}
+
+vec4 vision_load4(const int kind, uint64_t base, uint64_t index) {
+    if (kind == ELEMENT_F32) {
+        const uint64_t address = base + index * 4ul;
+        if ((address & 15ul) == 0ul)
+            return element_vec4_at(address);
+    } else {
+        const uint64_t address = base + index * 2ul;
+        if ((address & 7ul) == 0ul) {
+            const uvec2 raw = element_uvec2_at(address);
+            return vec4(element_unpack2(kind, raw.x), element_unpack2(kind, raw.y));
+        }
+    }
+    return vec4(element_at(kind, base, index), element_at(kind, base, index + 1ul),
+        element_at(kind, base, index + 2ul), element_at(kind, base, index + 3ul));
+}
+
+ivec4 vision_load_ivec4(uint64_t address) {
+    if ((address & 15ul) == 0ul)
+        return ivec4(element_uvec4_at(address));
+    return ivec4(element_i32_at(address), element_i32_at(address + 4ul),
+        element_i32_at(address + 8ul), element_i32_at(address + 12ul));
+}
+
+vec4 vision_load_vec4(uint64_t address) {
+    if ((address & 15ul) == 0ul)
+        return element_vec4_at(address);
+    return vec4(element_f32_at(address), element_f32_at(address + 4ul),
+        element_f32_at(address + 8ul), element_f32_at(address + 12ul));
+}
+
 void vision_put(vision_epilogue out_, uint m, uint n, float value) {
     const uint64_t at = uint64_t(m) * out_.y0 + n;
     if (out_.kind == VISION_LINEAR) {
@@ -163,13 +206,50 @@ void vision_put(vision_epilogue out_, uint m, uint n, float value) {
             projected = projected + element_at(out_.bias_kind, out_.bias, n);
         float blended = 0.0;
         if (out_.table != 0ul) {
-            [[unroll]] for (uint i = 0u; i < 4u; ++i) {
-                const int index = element_i32_at(out_.indices + (uint64_t(m) * 4ul + i) * 4ul);
-                blended += element_at(out_.table_kind, out_.table, uint64_t(index) * out_.residual0 + n)
-                    * element_f32_at(out_.coefficients + (uint64_t(m) * 4ul + i) * 4ul);
-            }
+            const ivec4 idx = vision_load_ivec4(out_.indices + uint64_t(m) * 16ul);
+            const vec4 coef = vision_load_vec4(out_.coefficients + uint64_t(m) * 16ul);
+            [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                blended += element_at(out_.table_kind, out_.table, uint64_t(idx[i]) * out_.residual0 + n) * coef[i];
         }
         out_put(out_.y, at, projected + blended);
+    }
+}
+
+void vision_put2(vision_epilogue out_, uint m, uint n, float first, float second) {
+    const uint64_t at = uint64_t(m) * out_.y0 + n;
+    if (out_.kind == VISION_LINEAR) {
+        vec2 projected = vec2(first, second);
+        if (out_.biased)
+            projected = projected + vision_load2(out_.bias_kind, out_.bias, uint64_t(n));
+        if (out_.clamped)
+            projected = min(max(projected, vec2(out_.minimum)), vec2(out_.maximum));
+        vec2 published = projected;
+        if (out_.activation != 0) {
+            published.x = vision_activate(out_.activation, projected.x);
+            published.y = vision_activate(out_.activation, projected.y);
+        } else if (out_.gate != 0ul) {
+            published = projected * vision_load2(out_.act, out_.gate, uint64_t(m) * out_.gate0 + n);
+        } else if (out_.residual != 0ul) {
+            published = vision_load2(ELEMENT_F32, out_.residual, uint64_t(m) * out_.residual0 + n) + projected;
+        }
+        out_put2(out_.y, at, published.x, published.y);
+    } else {
+        vec2 projected = vec2(first, second);
+        if (out_.residual != 0ul)
+            projected = vision_load2(ELEMENT_F32, out_.residual, uint64_t(m) * out_.residual0 + n) + projected;
+        if (out_.biased)
+            projected = projected + vision_load2(out_.bias_kind, out_.bias, uint64_t(n));
+        vec2 blended = vec2(0.0);
+        if (out_.table != 0ul) {
+            const ivec4 idx = vision_load_ivec4(out_.indices + uint64_t(m) * 16ul);
+            const vec4 coef = vision_load_vec4(out_.coefficients + uint64_t(m) * 16ul);
+            [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                const vec2 t = vision_load2(out_.table_kind, out_.table, uint64_t(idx[i]) * out_.residual0 + n);
+                blended.x += t.x * coef[i];
+                blended.y += t.y * coef[i];
+            }
+        }
+        out_put2(out_.y, at, projected.x + blended.x, projected.y + blended.y);
     }
 }
 
@@ -184,10 +264,10 @@ void vision_gemm(const int wk, projection_prologue in_, vision_epilogue out_, pr
         const vec2 c = projection_gemm_pair(q);
         const uint m = tm_index * VISION_TILE_M + projection_gemm_pair_row(q);
         const uint n = first + projection_gemm_pair_column(q);
-        if (m < m_rows && n < rows)
-            vision_put(out_, m, n, c.x);
         if (m < m_rows && n + 1u < rows)
-            vision_put(out_, m, n + 1u, c.y);
+            vision_put2(out_, m, n, c.x, c.y);
+        else if (m < m_rows && n < rows)
+            vision_put(out_, m, n, c.x);
     }
 }
 
@@ -195,6 +275,42 @@ void vision_gemm(const int wk, projection_prologue in_, vision_epilogue out_, pr
 // <seismic/packets.glsl>).
 projection_weights vision_weights(uint64_t base, packets_rows16 rows, uint k) {
     return projection_weights(base, rows, k, 0ul, 1ul, 0u);
+}
+
+void vision_norm_publish4(Out out_, uint64_t stride, const bool weighted, uint64_t weight, const int weight_kind,
+    const bool biased, uint64_t bias, const int bias_kind, uint i, vec4 xv, float mean, float inverse,
+    int activation) {
+    const vec4 wv = weighted ? vision_load4(weight_kind, weight, uint64_t(i)) : vec4(0.0);
+    const vec4 bv = biased ? vision_load4(bias_kind, bias, uint64_t(i)) : vec4(0.0);
+    vec4 yv;
+    yv.x = norm_apply(xv.x - mean, inverse, weighted, wv.x, biased, bv.x);
+    yv.y = norm_apply(xv.y - mean, inverse, weighted, wv.y, biased, bv.y);
+    yv.z = norm_apply(xv.z - mean, inverse, weighted, wv.z, biased, bv.z);
+    yv.w = norm_apply(xv.w - mean, inverse, weighted, wv.w, biased, bv.w);
+    if (activation != 0) {
+        yv.x = vision_activate(activation, yv.x);
+        yv.y = vision_activate(activation, yv.y);
+        yv.z = vision_activate(activation, yv.z);
+        yv.w = vision_activate(activation, yv.w);
+    }
+    if (stride == 1ul) {
+        out_put2(out_, uint64_t(i), yv.x, yv.y);
+        out_put2(out_, uint64_t(i + 2u), yv.z, yv.w);
+    } else {
+        out_put(out_, uint64_t(i) * stride, yv.x);
+        out_put(out_, uint64_t(i + 1u) * stride, yv.y);
+        out_put(out_, uint64_t(i + 2u) * stride, yv.z);
+        out_put(out_, uint64_t(i + 3u) * stride, yv.w);
+    }
+}
+
+void vision_norm_publish1(Out out_, uint64_t stride, const bool weighted, uint64_t weight, const int weight_kind,
+    const bool biased, uint64_t bias, const int bias_kind, uint i, float xv, float mean, float inverse,
+    int activation) {
+    const float w = weighted ? element_at(weight_kind, weight, i) : 0.0;
+    const float b = biased ? element_at(bias_kind, bias, i) : 0.0;
+    const float normalized = norm_apply(xv - mean, inverse, weighted, w, biased, b);
+    out_put(out_, uint64_t(i) * stride, activation != 0 ? vision_activate(activation, normalized) : normalized);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,24 +322,113 @@ projection_weights vision_weights(uint64_t base, packets_rows16 rows, uint k) {
 void vision_row_norm(uint64_t x, Out out_, uint64_t stride, const bool weighted, uint64_t weight,
     const int weight_kind, const bool biased, uint64_t bias, const int bias_kind, uint width, bool centered,
     float epsilon, int activation) {
+    const uint tid = SEISMIC_THREAD;
+    if ((x & 15ul) == 0ul && (width & 3u) == 0u) {
+        const uint vecs = width / 4u;
+        vec4 cached[2];
+        float mean = 0.0;
+        float squares = 0.0;
+        if (centered) {
+            float sum = 0.0;
+            [[unroll]] for (uint slot = 0u; slot < 2u; ++slot) {
+                const uint v = tid + slot * gl_WorkGroupSize.x;
+                if (v < vecs) {
+                    const vec4 xv = element_vec4_at(x + uint64_t(v) * 16ul);
+                    cached[slot] = xv;
+                    sum += (xv.x + xv.y) + (xv.z + xv.w);
+                }
+            }
+            seismic_strided_from(uint, v, 2u * gl_WorkGroupSize.x, tid, vecs, gl_WorkGroupSize.x) {
+                const vec4 xv = element_vec4_at(x + uint64_t(v) * 16ul);
+                sum += (xv.x + xv.y) + (xv.z + xv.w);
+            }
+            mean = norm_mean(reduce_group_sum(sum, 0u), width);
+            [[unroll]] for (uint slot = 0u; slot < 2u; ++slot) {
+                const uint v = tid + slot * gl_WorkGroupSize.x;
+                if (v < vecs) {
+                    const vec4 cv = cached[slot] - mean;
+                    squares = norm_square(cv.x, squares);
+                    squares = norm_square(cv.y, squares);
+                    squares = norm_square(cv.z, squares);
+                    squares = norm_square(cv.w, squares);
+                }
+            }
+        } else {
+            [[unroll]] for (uint slot = 0u; slot < 2u; ++slot) {
+                const uint v = tid + slot * gl_WorkGroupSize.x;
+                if (v < vecs) {
+                    const vec4 xv = element_vec4_at(x + uint64_t(v) * 16ul);
+                    cached[slot] = xv;
+                    squares = norm_square(xv.x, squares);
+                    squares = norm_square(xv.y, squares);
+                    squares = norm_square(xv.z, squares);
+                    squares = norm_square(xv.w, squares);
+                }
+            }
+        }
+        seismic_strided_from(uint, v, 2u * gl_WorkGroupSize.x, tid, vecs, gl_WorkGroupSize.x) {
+            const vec4 cv = element_vec4_at(x + uint64_t(v) * 16ul) - mean;
+            squares = norm_square(cv.x, squares);
+            squares = norm_square(cv.y, squares);
+            squares = norm_square(cv.z, squares);
+            squares = norm_square(cv.w, squares);
+        }
+        const float inverse = norm_inverse(reduce_group_sum(squares, 0u), width, epsilon);
+        [[unroll]] for (uint slot = 0u; slot < 2u; ++slot) {
+            const uint v = tid + slot * gl_WorkGroupSize.x;
+            if (v < vecs)
+                vision_norm_publish4(out_, stride, weighted, weight, weight_kind, biased, bias, bias_kind,
+                    v * 4u, cached[slot], mean, inverse, activation);
+        }
+        for (uint v = tid + 2u * gl_WorkGroupSize.x; v < vecs; v += gl_WorkGroupSize.x)
+            vision_norm_publish4(out_, stride, weighted, weight, weight_kind, biased, bias, bias_kind,
+                v * 4u, element_vec4_at(x + uint64_t(v) * 16ul), mean, inverse, activation);
+        return;
+    }
+
+    float cached[8];
     float mean = 0.0;
+    float squares = 0.0;
     if (centered) {
         float sum = 0.0;
-        seismic_strided(uint, i, SEISMIC_THREAD, width, gl_WorkGroupSize.x)
+        [[unroll]] for (uint slot = 0u; slot < 8u; ++slot) {
+            const uint i = tid + slot * gl_WorkGroupSize.x;
+            if (i < width) {
+                const float xv = element_f32_at(x + uint64_t(i) * 4ul);
+                cached[slot] = xv;
+                sum += xv;
+            }
+        }
+        seismic_strided_from(uint, i, 8u * gl_WorkGroupSize.x, tid, width, gl_WorkGroupSize.x)
             sum += element_f32_at(x + uint64_t(i) * 4ul);
         mean = norm_mean(reduce_group_sum(sum, 0u), width);
+        [[unroll]] for (uint slot = 0u; slot < 8u; ++slot) {
+            const uint i = tid + slot * gl_WorkGroupSize.x;
+            if (i < width)
+                squares = norm_square(cached[slot] - mean, squares);
+        }
+    } else {
+        [[unroll]] for (uint slot = 0u; slot < 8u; ++slot) {
+            const uint i = tid + slot * gl_WorkGroupSize.x;
+            if (i < width) {
+                const float xv = element_f32_at(x + uint64_t(i) * 4ul);
+                cached[slot] = xv;
+                squares = norm_square(xv, squares);
+            }
+        }
     }
-    float squares = 0.0;
-    seismic_strided(uint, i, SEISMIC_THREAD, width, gl_WorkGroupSize.x)
+    seismic_strided_from(uint, i, 8u * gl_WorkGroupSize.x, tid, width, gl_WorkGroupSize.x)
         squares = norm_square(element_f32_at(x + uint64_t(i) * 4ul) - mean, squares);
     const float inverse = norm_inverse(reduce_group_sum(squares, 0u), width, epsilon);
-    for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x) {
-        const float centered = element_f32_at(x + uint64_t(i) * 4ul) - mean;
-        const float w = weighted ? element_at(weight_kind, weight, i) : 0.0;
-        const float b = biased ? element_at(bias_kind, bias, i) : 0.0;
-        const float normalized = norm_apply(centered, inverse, weighted, w, biased, b);
-        out_put(out_, uint64_t(i) * stride, activation != 0 ? vision_activate(activation, normalized) : normalized);
+    [[unroll]] for (uint slot = 0u; slot < 8u; ++slot) {
+        const uint i = tid + slot * gl_WorkGroupSize.x;
+        if (i < width)
+            vision_norm_publish1(out_, stride, weighted, weight, weight_kind, biased, bias, bias_kind,
+                i, cached[slot], mean, inverse, activation);
     }
+    for (uint i = tid + 8u * gl_WorkGroupSize.x; i < width; i += gl_WorkGroupSize.x)
+        vision_norm_publish1(out_, stride, weighted, weight, weight_kind, biased, bias, bias_kind,
+            i, element_f32_at(x + uint64_t(i) * 4ul), mean, inverse, activation);
 }
 
 // ---------------------------------------------------------------------------
@@ -302,17 +507,34 @@ void vision_attend(const int act, uint64_t operands, Out out_, uint rows, uint p
     const uint scratch = (FLASH_KEYS * flash_pitch(wp)) / 2u + SEISMIC_SUBGROUP * FLASH_SCRATCH_FLOATS;
     const float scale = score_scale * 1.4426950408889634;
 
-    // The keys of this lane's row, and the keys the workgroup walks.
+    // The keys of this lane's row, and the keys the workgroup walks. Every
+    // row in [tile * VISION_ATTEND_ROWS, min(tile * VISION_ATTEND_ROWS +
+    // VISION_ATTEND_ROWS, rows)) is held by at least one lane, so reducing
+    // the lanes' own bounds yields the tile's union with zero extra loads.
     uint row_first = 0u, row_end = rows, walk_first = 0u, walk_end = rows;
     if (spans != 0ul) {
         const uint span_row = min(block_row + lane % 16u, rows - 1u);
-        row_first = uint(element_i32_at(spans + uint64_t(span_row) * 8ul));
-        row_end = uint(element_i32_at(spans + uint64_t(span_row) * 8ul + 4ul));
-        walk_first = rows;
-        walk_end = 0u;
-        for (uint r = tile * VISION_ATTEND_ROWS; r < min(tile * VISION_ATTEND_ROWS + VISION_ATTEND_ROWS, rows); ++r) {
-            walk_first = min(walk_first, uint(element_i32_at(spans + uint64_t(r) * 8ul)));
-            walk_end = max(walk_end, uint(element_i32_at(spans + uint64_t(r) * 8ul + 4ul)));
+        const uint64_t span_addr = spans + uint64_t(span_row) * 8ul;
+        if ((span_addr & 7ul) == 0ul) {
+            const uvec2 span = element_uvec2_at(span_addr);
+            row_first = span.x;
+            row_end = span.y;
+        } else {
+            row_first = uint(element_i32_at(span_addr));
+            row_end = uint(element_i32_at(span_addr + 4ul));
+        }
+        const uint sg_first = seismic_redux_min_u32(row_first);
+        const uint sg_end = seismic_redux_max_u32(row_end);
+        if (lane == 0u) {
+            seismic_shared_u32[SEISMIC_SUBGROUP] = sg_first;
+            seismic_shared_u32[SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP] = sg_end;
+        }
+        barrier();
+        walk_first = seismic_shared_u32[0u];
+        walk_end = seismic_shared_u32[SEISMIC_SUBGROUPS];
+        for (uint s = 1u; s < SEISMIC_SUBGROUPS; ++s) {
+            walk_first = min(walk_first, seismic_shared_u32[s]);
+            walk_end = max(walk_end, seismic_shared_u32[SEISMIC_SUBGROUPS + s]);
         }
     }
 

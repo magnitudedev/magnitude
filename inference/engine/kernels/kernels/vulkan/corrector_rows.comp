@@ -1,7 +1,7 @@
-// corrector_rows: one workgroup of 256 invocations per row forms values +
-// bias, then by form the identity, silu or unit length (the length reduced
-// over the workgroup), plus the residual row when R = 1, published to Y.
-// Mirrors `cpu/corrector_rows.rs`.
+// corrector_rows: one workgroup of 256 invocations per row (4 elements per
+// invocation on aligned unit strides): forms values + bias, then by form the
+// identity, silu or unit length (the length reduced over the workgroup), plus
+// the residual row when R = 1, published to Y. Mirrors `cpu/corrector_rows.rs`.
 #include <seismic/element.glsl>
 #include "lib/core/reduce.glsl"
 
@@ -19,26 +19,88 @@ void corrector_rows() {
     const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL);
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t row = gl_WorkGroupID.x;
-    const uint64_t lane = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    const uint64_t width = SEISMIC_DIM_N;
+    const uint64_t width4 = width & ~3ul;
+    const uint64_t vec_count = width >> 2;
+    // Numbered by `SEISMIC_THREAD`: the partials reach the reduction.
+    const uint64_t lane = uint64_t(SEISMIC_THREAD), threads = uint64_t(gl_WorkGroupSize.x);
     const int form = int(SEISMIC_PARAM_FORM);
+    const uint64_t v_row = values + row * SEISMIC_VALUES_STRIDE_0 * 4ul;
+    const uint64_t r_row = residual + row * SEISMIC_RESIDUAL_STRIDE_1 * 4ul;
+    const uint64_t out_row = row * SEISMIC_RESULT_0_STRIDE_0;
+
+    const bool bias_vec = SEISMIC_VALUES_STRIDE_1 == 1ul && SEISMIC_BIAS_STRIDE_0 == 1ul
+        && ((v_row | bias) & 15ul) == 0ul;
+
     float length = 1.0;
     if (form == 2) {
-        // Numbered by `SEISMIC_THREAD`: the partials reach the reduction.
         float partial = 0.0;
-        seismic_strided(uint64_t, column, uint64_t(SEISMIC_THREAD), SEISMIC_DIM_N, threads) {
-            const float value = rows_biased(values, bias, row, column);
-            partial += value * value;
+        if (bias_vec) {
+            seismic_strided(uint64_t, i, lane, vec_count, threads) {
+                const vec4 b = element_vec4_at(v_row + i * 16ul) + element_vec4_at(bias + i * 16ul);
+                partial = seismic_fma_rn(b.x, b.x, partial);
+                partial = seismic_fma_rn(b.y, b.y, partial);
+                partial = seismic_fma_rn(b.z, b.z, partial);
+                partial = seismic_fma_rn(b.w, b.w, partial);
+            }
+            if (width4 + lane < width) {
+                const uint64_t col = width4 + lane;
+                const float value = element_f32_at(v_row + col * 4ul) + element_f32_at(bias + col * 4ul);
+                partial = seismic_fma_rn(value, value, partial);
+            }
+        } else {
+            seismic_strided(uint64_t, column, lane, width, threads) {
+                const float value = rows_biased(values, bias, row, column);
+                partial = seismic_fma_rn(value, value, partial);
+            }
         }
         length = max(seismic_sqrt_rn(reduce_group_sum(partial, 0u)), element_word_f32(SEISMIC_PARAM_EPSILON));
     }
-    for (uint64_t column = lane; column < SEISMIC_DIM_N; column += threads) {
-        float value = rows_biased(values, bias, row, column);
-        if (form == 1)
-            value = seismic_div_rn(value, 1.0 + exp(-value));
-        else if (form == 2)
-            value = seismic_div_rn(value, length);
-        if (SEISMIC_DIM_R == 1ul)
-            value += element_f32_at(residual + (row * SEISMIC_RESIDUAL_STRIDE_1 + column * SEISMIC_RESIDUAL_STRIDE_2) * 4ul);
-        out_put(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, value);
+
+    const bool out_vec = bias_vec && SEISMIC_RESULT_0_STRIDE_1 == 1ul
+        && (SEISMIC_DIM_R == 0ul || (SEISMIC_RESIDUAL_STRIDE_2 == 1ul && (r_row & 15ul) == 0ul));
+
+    if (out_vec) {
+        for (uint64_t i = lane; i < vec_count; i += threads) {
+            const uint64_t col = i << 2;
+            vec4 o = element_vec4_at(v_row + i * 16ul) + element_vec4_at(bias + i * 16ul);
+            if (form == 1) {
+                o.x = seismic_div_rn(o.x, 1.0 + exp(-o.x));
+                o.y = seismic_div_rn(o.y, 1.0 + exp(-o.y));
+                o.z = seismic_div_rn(o.z, 1.0 + exp(-o.z));
+                o.w = seismic_div_rn(o.w, 1.0 + exp(-o.w));
+            } else if (form == 2) {
+                o.x = seismic_div_rn(o.x, length);
+                o.y = seismic_div_rn(o.y, length);
+                o.z = seismic_div_rn(o.z, length);
+                o.w = seismic_div_rn(o.w, length);
+            }
+            if (SEISMIC_DIM_R == 1ul)
+                o += element_vec4_at(r_row + i * 16ul);
+            out_put2(result, out_row + col, o.x, o.y);
+            out_put2(result, out_row + col + 2ul, o.z, o.w);
+        }
+        if (width4 + lane < width) {
+            const uint64_t col = width4 + lane;
+            float value = element_f32_at(v_row + col * 4ul) + element_f32_at(bias + col * 4ul);
+            if (form == 1)
+                value = seismic_div_rn(value, 1.0 + exp(-value));
+            else if (form == 2)
+                value = seismic_div_rn(value, length);
+            if (SEISMIC_DIM_R == 1ul)
+                value += element_f32_at(r_row + col * 4ul);
+            out_put(result, out_row + col, value);
+        }
+    } else {
+        for (uint64_t column = lane; column < width; column += threads) {
+            float value = rows_biased(values, bias, row, column);
+            if (form == 1)
+                value = seismic_div_rn(value, 1.0 + exp(-value));
+            else if (form == 2)
+                value = seismic_div_rn(value, length);
+            if (SEISMIC_DIM_R == 1ul)
+                value += element_f32_at(residual + (row * SEISMIC_RESIDUAL_STRIDE_1 + column * SEISMIC_RESIDUAL_STRIDE_2) * 4ul);
+            out_put(result, out_row + column * SEISMIC_RESULT_0_STRIDE_1, value);
+        }
     }
 }

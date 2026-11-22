@@ -1,16 +1,31 @@
-// conditioning_overlay: out[row, column] = input[row, column] (F32), copied as
-// stored through out's owner; one invocation per element over a grid-stride
-// loop (the grid is capped below the 65535-group floor).
+// conditioning_overlay: out[row, column] = input[row, column] (F32), copied
+// through out's owner; four elements per invocation over a grid-stride walk
+// (the grid is capped below the 65535-group floor).
 #include <seismic/element.glsl>
 
 void conditioning_overlay() {
     // `input` and `output` are reserved words in GLSL.
     const uint64_t source = SEISMIC_PTR(SEISMIC_BUFFER_INPUT);
     const Out destination = SEISMIC_OUT_OUT;
-    const uint64_t count = SEISMIC_DIM_M * SEISMIC_DIM_D;
-    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, SEISMIC_DIM_D)); at.index < count; seismic_walk_next(at)) {
-        const uint64_t row = at.axes.x, column = at.axes.w;
-        out_copy_stored(destination, row * SEISMIC_OUT_STRIDE_0 + column * SEISMIC_OUT_STRIDE_1,
-            source, row * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1, 1ul);
+    const uint64_t width = SEISMIC_DIM_D;
+    const uint64_t quads = (width + 3ul) >> 2;
+    const uint64_t count = SEISMIC_DIM_M * quads;
+    const bool unit_strides = SEISMIC_INPUT_STRIDE_1 == 1ul && SEISMIC_OUT_STRIDE_1 == 1ul;
+    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, quads)); at.index < count; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x, col = at.axes.w * 4ul;
+        const uint64_t src_base = row * SEISMIC_INPUT_STRIDE_0;
+        const uint64_t dst_base = row * SEISMIC_OUT_STRIDE_0;
+        const uint64_t src_addr = source + (src_base + col) * 4ul;
+        if (unit_strides && col + 4ul <= width && (src_addr & 15ul) == 0ul
+                && stored_aligned16(out_stored(destination, dst_base + col))) {
+            const vec4 v = element_vec4_at(src_addr);
+            out_put2(destination, dst_base + col, v.x, v.y);
+            out_put2(destination, dst_base + col + 2ul, v.z, v.w);
+        } else {
+            const uint64_t limit = min(col + 4ul, width);
+            for (uint64_t c = col; c < limit; ++c)
+                out_copy_stored(destination, dst_base + c * SEISMIC_OUT_STRIDE_1,
+                    source, src_base + c * SEISMIC_INPUT_STRIDE_1, 1ul);
+        }
     }
 }

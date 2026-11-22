@@ -1,24 +1,79 @@
 // ngram_add (contract and portable body in ngram.seismic): each stream's
 // gated value row added into its streams. The Vulkan form of
-// `cuda/ngram_add.cu`: an invocation owns one channel, and the y grid visits
-// the rows with a stride.
+// `cuda/ngram_add.cu`: an invocation owns 4 contiguous columns across all S
+// streams so `value` is read once per row, and the y grid visits the rows with
+// a stride.
 #include <seismic/element.glsl>
 
+vec4 ngram_load4_f32(uint64_t base, uint64_t stride) {
+    if (stride == 1ul && (base & 15ul) == 0ul)
+        return element_vec4_at(base);
+    return vec4(
+        element_f32_at(base),
+        element_f32_at(base + stride * 4ul),
+        element_f32_at(base + stride * 8ul),
+        element_f32_at(base + stride * 12ul));
+}
+
+void ngram_store4_f32(Out out_buf, uint64_t index, uint64_t stride, vec4 values) {
+    if (stride == 1ul) {
+        out_put2(out_buf, index, values.x, values.y);
+        out_put2(out_buf, index + 2ul, values.z, values.w);
+    } else {
+        out_put(out_buf, index, values.x);
+        out_put(out_buf, index + stride, values.y);
+        out_put(out_buf, index + stride * 2ul, values.z);
+        out_put(out_buf, index + stride * 3ul, values.w);
+    }
+}
+
 void ngram_add() {
-    const uint64_t channel = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationIndex;
-    if (channel >= SEISMIC_DIM_S * SEISMIC_DIM_H)
+    const uint64_t col0 = (uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationIndex) * 4ul;
+    if (col0 >= SEISMIC_DIM_H)
         return;
-    uint64_t stream, column;
-    seismic_split_group(gl_WorkGroupID.x, gl_WorkGroupSize.x, gl_LocalInvocationIndex, SEISMIC_DIM_H, stream, column);
-    for (uint64_t row = gl_WorkGroupID.y; row < SEISMIC_DIM_M; row += gl_NumWorkGroups.y) {
-        const float gated = seismic_mul_rn(
-            element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCALES)
-                + (row * SEISMIC_SCALES_STRIDE_0 + stream * SEISMIC_SCALES_STRIDE_1) * 4ul),
-            element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_VALUE)
-                + (row * SEISMIC_VALUE_STRIDE_0 + column * SEISMIC_VALUE_STRIDE_1) * 4ul));
-        const float residual = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)
-            + (row * SEISMIC_HIDDEN_STRIDE_0 + channel * SEISMIC_HIDDEN_STRIDE_1) * 4ul);
-        out_put(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1,
-            seismic_add_rn(residual, gated));
+    const bool full4 = (SEISMIC_DIM_H & 3ul) == 0ul || col0 + 4ul <= SEISMIC_DIM_H;
+    const uint64_t hidden_base = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN);
+    const uint64_t scales_base = SEISMIC_PTR(SEISMIC_BUFFER_SCALES);
+    const uint64_t value_base = SEISMIC_PTR(SEISMIC_BUFFER_VALUE);
+    const Out result = SEISMIC_RESULT_0_OUT;
+    for (uint64_t row = uint64_t(gl_WorkGroupID.y); row < SEISMIC_DIM_M; row += uint64_t(gl_NumWorkGroups.y)) {
+        const uint64_t scale_row = scales_base + row * SEISMIC_SCALES_STRIDE_0 * 4ul;
+        const uint64_t hidden_row = row * SEISMIC_HIDDEN_STRIDE_0;
+        const uint64_t result_row = row * SEISMIC_RESULT_0_STRIDE_0;
+        const uint64_t value_row = value_base
+            + (row * SEISMIC_VALUE_STRIDE_0 + col0 * SEISMIC_VALUE_STRIDE_1) * 4ul;
+        if (full4) {
+            const vec4 v = ngram_load4_f32(value_row, SEISMIC_VALUE_STRIDE_1);
+            for (uint64_t stream = 0ul; stream < SEISMIC_DIM_S; ++stream) {
+                const float gate = element_f32_at(scale_row + stream * SEISMIC_SCALES_STRIDE_1 * 4ul);
+                const uint64_t chan0 = stream * SEISMIC_DIM_H + col0;
+                const vec4 h = ngram_load4_f32(
+                    hidden_base + (hidden_row + chan0 * SEISMIC_HIDDEN_STRIDE_1) * 4ul,
+                    SEISMIC_HIDDEN_STRIDE_1);
+                const vec4 out_val = vec4(
+                    seismic_add_rn(h.x, seismic_mul_rn(gate, v.x)),
+                    seismic_add_rn(h.y, seismic_mul_rn(gate, v.y)),
+                    seismic_add_rn(h.z, seismic_mul_rn(gate, v.z)),
+                    seismic_add_rn(h.w, seismic_mul_rn(gate, v.w)));
+                ngram_store4_f32(result, result_row + chan0 * SEISMIC_RESULT_0_STRIDE_1,
+                    SEISMIC_RESULT_0_STRIDE_1, out_val);
+            }
+        } else {
+            const uint count = uint(SEISMIC_DIM_H - col0);
+            float v[3];
+            for (uint i = 0u; i < count; ++i)
+                v[i] = element_f32_at(value_row + uint64_t(i) * SEISMIC_VALUE_STRIDE_1 * 4ul);
+            for (uint64_t stream = 0ul; stream < SEISMIC_DIM_S; ++stream) {
+                const float gate = element_f32_at(scale_row + stream * SEISMIC_SCALES_STRIDE_1 * 4ul);
+                const uint64_t chan0 = stream * SEISMIC_DIM_H + col0;
+                for (uint i = 0u; i < count; ++i) {
+                    const uint64_t chan = chan0 + uint64_t(i);
+                    const float residual = element_f32_at(
+                        hidden_base + (hidden_row + chan * SEISMIC_HIDDEN_STRIDE_1) * 4ul);
+                    out_put(result, result_row + chan * SEISMIC_RESULT_0_STRIDE_1,
+                        seismic_add_rn(residual, seismic_mul_rn(gate, v[i])));
+                }
+            }
+        }
     }
 }

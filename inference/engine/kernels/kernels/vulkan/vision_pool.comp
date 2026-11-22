@@ -1,4 +1,4 @@
-// vision_pool: one invocation per output value (grid-stride): the G member
+// vision_pool: four contiguous columns per grid-stride iteration: the G member
 // rows times `weight`, summed in order, times `scale`, then standardized
 // with the NS rows.
 #include <seismic/element.glsl>
@@ -7,21 +7,82 @@
 
 #define STANDARD_SCALE_KIND ELEMENT_OF(SEISMIC_STANDARD_SCALE)
 
+vec4 vision_pool_load4(const int kind, uint64_t base, uint64_t index) {
+    if (kind == ELEMENT_F32)
+        return element_vec4_at(base + index * 4ul);
+    const uvec2 words = element_uvec2_at(base + index * 2ul);
+    return vec4(element_unpack2(kind, words.x), element_unpack2(kind, words.y));
+}
+
 void vision_pool() {
     const uint64_t columns = SEISMIC_DIM_H;
-    const uint64_t total = SEISMIC_DIM_M * columns;
+    const uint64_t vecs = (columns + 3ul) >> 2;
+    const uint64_t total = SEISMIC_DIM_M * vecs;
     const float weight = element_word_f32(SEISMIC_PARAM_WEIGHT);
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
-    for (seismic_walk at = seismic_walk_grid(total, u64vec3(1ul, 1ul, columns)); at.index < total; seismic_walk_next(at)) {
-        const uint64_t row = at.axes.x, column = at.axes.w;
-        float sum = 0.0;
-        for (uint member = 0u; member < uint(SEISMIC_DIM_G); ++member)
-            sum = sum + element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE)
-                + (row * SEISMIC_SOURCE_STRIDE_0 + uint64_t(member) * SEISMIC_SOURCE_STRIDE_1 + column) * 4ul) * weight;
-        float value = sum * scale;
-        if (SEISMIC_DIM_NS == 1)
-            value = (value - element_at(STANDARD_BIAS_KIND, SEISMIC_PTR(SEISMIC_BUFFER_STANDARD_BIAS), column))
-                * element_at(STANDARD_SCALE_KIND, SEISMIC_PTR(SEISMIC_BUFFER_STANDARD_SCALE), column);
-        out_put(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0 + column, value);
+    const uint64_t source_base = SEISMIC_PTR(SEISMIC_BUFFER_SOURCE);
+    const uint64_t sb_base = SEISMIC_PTR(SEISMIC_BUFFER_STANDARD_BIAS);
+    const uint64_t ss_base = SEISMIC_PTR(SEISMIC_BUFFER_STANDARD_SCALE);
+    const Out result = SEISMIC_RESULT_0_OUT;
+    const uint64_t sb_align_mask = uint64_t(ELEMENT_BYTES(STANDARD_BIAS_KIND)) * 4ul - 1ul;
+    const uint64_t ss_align_mask = uint64_t(ELEMENT_BYTES(STANDARD_SCALE_KIND)) * 4ul - 1ul;
+    const bool sb_vec = SEISMIC_STANDARD_BIAS_STRIDE_1 == 1ul && (sb_base & sb_align_mask) == 0ul;
+    const bool ss_vec = SEISMIC_STANDARD_SCALE_STRIDE_1 == 1ul && (ss_base & ss_align_mask) == 0ul;
+    const bool member_aligned = uint(SEISMIC_DIM_G) <= 1u || (SEISMIC_SOURCE_STRIDE_1 & 3ul) == 0ul;
+    const bool unit_strides = SEISMIC_SOURCE_STRIDE_2 == 1ul
+        && SEISMIC_RESULT_0_STRIDE_1 == 1ul
+        && member_aligned;
+    for (seismic_walk at = seismic_walk_grid(total, u64vec3(1ul, 1ul, vecs)); at.index < total; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x;
+        const uint64_t col = at.axes.w << 2;
+        const uint64_t src_row = row * SEISMIC_SOURCE_STRIDE_0;
+        const uint64_t out_row = row * SEISMIC_RESULT_0_STRIDE_0;
+        if (unit_strides && col + 4ul <= columns && ((source_base + src_row * 4ul) & 15ul) == 0ul) {
+            vec4 sum = vec4(0.0);
+            for (uint member = 0u; member < uint(SEISMIC_DIM_G); ++member) {
+                const vec4 sv = element_vec4_at(source_base
+                    + (src_row + uint64_t(member) * SEISMIC_SOURCE_STRIDE_1 + col) * 4ul);
+                sum = sum + sv * weight;
+            }
+            vec4 value = sum * scale;
+            if (SEISMIC_DIM_NS == 1) {
+                vec4 sb;
+                if (sb_vec) {
+                    sb = vision_pool_load4(STANDARD_BIAS_KIND, sb_base, col);
+                } else {
+                    sb = vec4(
+                        element_at(STANDARD_BIAS_KIND, sb_base, col * SEISMIC_STANDARD_BIAS_STRIDE_1),
+                        element_at(STANDARD_BIAS_KIND, sb_base, (col + 1ul) * SEISMIC_STANDARD_BIAS_STRIDE_1),
+                        element_at(STANDARD_BIAS_KIND, sb_base, (col + 2ul) * SEISMIC_STANDARD_BIAS_STRIDE_1),
+                        element_at(STANDARD_BIAS_KIND, sb_base, (col + 3ul) * SEISMIC_STANDARD_BIAS_STRIDE_1));
+                }
+                vec4 ss;
+                if (ss_vec) {
+                    ss = vision_pool_load4(STANDARD_SCALE_KIND, ss_base, col);
+                } else {
+                    ss = vec4(
+                        element_at(STANDARD_SCALE_KIND, ss_base, col * SEISMIC_STANDARD_SCALE_STRIDE_1),
+                        element_at(STANDARD_SCALE_KIND, ss_base, (col + 1ul) * SEISMIC_STANDARD_SCALE_STRIDE_1),
+                        element_at(STANDARD_SCALE_KIND, ss_base, (col + 2ul) * SEISMIC_STANDARD_SCALE_STRIDE_1),
+                        element_at(STANDARD_SCALE_KIND, ss_base, (col + 3ul) * SEISMIC_STANDARD_SCALE_STRIDE_1));
+                }
+                value = (value - sb) * ss;
+            }
+            out_put2(result, out_row + col, value.x, value.y);
+            out_put2(result, out_row + col + 2ul, value.z, value.w);
+        } else {
+            const uint64_t limit = col + 4ul < columns ? col + 4ul : columns;
+            for (uint64_t c = col; c < limit; ++c) {
+                float sum = 0.0;
+                for (uint member = 0u; member < uint(SEISMIC_DIM_G); ++member)
+                    sum = sum + element_f32_at(source_base
+                        + (src_row + uint64_t(member) * SEISMIC_SOURCE_STRIDE_1 + c * SEISMIC_SOURCE_STRIDE_2) * 4ul) * weight;
+                float value = sum * scale;
+                if (SEISMIC_DIM_NS == 1)
+                    value = (value - element_at(STANDARD_BIAS_KIND, sb_base, c * SEISMIC_STANDARD_BIAS_STRIDE_1))
+                        * element_at(STANDARD_SCALE_KIND, ss_base, c * SEISMIC_STANDARD_SCALE_STRIDE_1);
+                out_put(result, out_row + c * SEISMIC_RESULT_0_STRIDE_1, value);
+            }
+        }
     }
 }

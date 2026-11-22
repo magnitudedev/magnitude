@@ -1,17 +1,60 @@
-// repeat_rows: S scaled copies of each row; one invocation per value over a
-// grid-stride loop (the grid is capped below the 65535-group floor).
+// repeat_rows: S scaled copies of each row, four columns across all S streams
+// per invocation over a grid-stride loop (the grid is capped below the
+// 65535-group floor; loads each source quad once and scales into every stream).
 #include <seismic/element.glsl>
 
 void repeat_rows() {
     const uint64_t rows = SEISMIC_PTR(SEISMIC_BUFFER_ROWS);
     const uint64_t scales = SEISMIC_PTR(SEISMIC_BUFFER_SCALES);
     const Out result = SEISMIC_RESULT_0_OUT;
-    const uint64_t h = SEISMIC_DIM_H, width = SEISMIC_DIM_S * h;
-    const uint64_t count = SEISMIC_DIM_M * width;
-    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, SEISMIC_DIM_S, h)); at.index < count; seismic_walk_next(at)) {
-        const uint64_t row = at.axes.x, stream = at.axes.z, column = at.axes.w;
-        out_put(result, row * SEISMIC_RESULT_0_STRIDE_0 + (stream * h + column) * SEISMIC_RESULT_0_STRIDE_1,
-            element_f32_at(rows + (row * SEISMIC_ROWS_STRIDE_0 + column * SEISMIC_ROWS_STRIDE_1) * 4ul)
-                * element_f32_at(scales + stream * SEISMIC_SCALES_STRIDE_0 * 4ul));
+    const uint64_t h = SEISMIC_DIM_H;
+    const uint64_t streams = SEISMIC_DIM_S;
+    const uint64_t vecs_per_row = (h + 3ul) >> 2;
+    const uint64_t count = SEISMIC_DIM_M * vecs_per_row;
+    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, vecs_per_row)); at.index < count; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x;
+        const uint64_t column = at.axes.w << 2;
+        const uint64_t src_row = rows + row * SEISMIC_ROWS_STRIDE_0 * 4ul;
+        const Out dst_row = out_offset(result, row * SEISMIC_RESULT_0_STRIDE_0);
+        if (column + 4ul <= h) {
+            const uint64_t src_addr = src_row + column * SEISMIC_ROWS_STRIDE_1 * 4ul;
+            vec4 values;
+            if (SEISMIC_ROWS_STRIDE_1 == 1ul && (src_addr & 15ul) == 0ul) {
+                values = element_vec4_at(src_addr);
+            } else {
+                values = vec4(
+                    element_f32_at(src_addr),
+                    element_f32_at(src_addr + SEISMIC_ROWS_STRIDE_1 * 4ul),
+                    element_f32_at(src_addr + SEISMIC_ROWS_STRIDE_1 * 8ul),
+                    element_f32_at(src_addr + SEISMIC_ROWS_STRIDE_1 * 12ul));
+            }
+            if (SEISMIC_RESULT_0_STRIDE_1 == 1ul) {
+                for (uint64_t s = 0ul; s < streams; ++s) {
+                    const float scale = element_f32_at(scales + s * SEISMIC_SCALES_STRIDE_0 * 4ul);
+                    const vec4 scaled = values * scale;
+                    const uint64_t offset = s * h + column;
+                    out_put2(dst_row, offset, scaled.x, scaled.y);
+                    out_put2(dst_row, offset + 2ul, scaled.z, scaled.w);
+                }
+            } else {
+                for (uint64_t s = 0ul; s < streams; ++s) {
+                    const float scale = element_f32_at(scales + s * SEISMIC_SCALES_STRIDE_0 * 4ul);
+                    const vec4 scaled = values * scale;
+                    const uint64_t offset = s * h + column;
+                    out_put(dst_row, offset * SEISMIC_RESULT_0_STRIDE_1, scaled.x);
+                    out_put(dst_row, (offset + 1ul) * SEISMIC_RESULT_0_STRIDE_1, scaled.y);
+                    out_put(dst_row, (offset + 2ul) * SEISMIC_RESULT_0_STRIDE_1, scaled.z);
+                    out_put(dst_row, (offset + 3ul) * SEISMIC_RESULT_0_STRIDE_1, scaled.w);
+                }
+            }
+        } else {
+            for (uint64_t c = column; c < h; ++c) {
+                const float value = element_f32_at(src_row + c * SEISMIC_ROWS_STRIDE_1 * 4ul);
+                for (uint64_t s = 0ul; s < streams; ++s) {
+                    const float scale = element_f32_at(scales + s * SEISMIC_SCALES_STRIDE_0 * 4ul);
+                    out_put(dst_row, (s * h + c) * SEISMIC_RESULT_0_STRIDE_1, value * scale);
+                }
+            }
+        }
     }
 }

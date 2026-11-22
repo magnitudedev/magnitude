@@ -161,11 +161,11 @@ void projection_load8(projection_prologue in_, uint m, uint k, float inverse, ou
         const uint64_t row = uint64_t(projection_row(in_.rows, m)) * in_.x0;
         vec4 xe, xo;
         projection_load8_strided(in_.x, row + uint64_t(k) * in_.x1, in_.x1, valid,
-            in_.x1 == 1ul && (in_.x0 & 3ul) == 0ul, xe, xo);
+            in_.x1 == 1ul && stored_aligned16(stored_offset(in_.x, row)), xe, xo);
         if (valid == 8u) {
             vec4 ne, no;
             projection_load8_strided(in_.norm_kind, in_.norm, uint64_t(k) * in_.norm_stride, in_.norm_stride, 8u,
-                in_.norm_stride == 1ul, ne, no);
+                in_.norm_stride == 1ul && (in_.norm & 15ul) == 0ul, ne, no);
             const vec4 e = xe * inverse * ne, o = xo * inverse * no;
             [[unroll]] for (uint i = 0u; i < 4u; ++i) {
                 even[i] = element_round(in_.act, e[i]);
@@ -266,6 +266,35 @@ float projection_ordered_combine8(float value) {
     return value;
 }
 
+// Accumulate `seismic_shared_f32[scratch_off + u], +8, ... < count` in exact
+// 8-lane reference order.
+float projection_ordered_accumulate_sram8(uint scratch_off, uint count, uint u, float sum) {
+    uint c = u;
+    for (; c + 56u < count; c += 64u) {
+        const float v0 = seismic_shared_f32[scratch_off + c];
+        const float v1 = seismic_shared_f32[scratch_off + c + 8u];
+        const float v2 = seismic_shared_f32[scratch_off + c + 16u];
+        const float v3 = seismic_shared_f32[scratch_off + c + 24u];
+        const float v4 = seismic_shared_f32[scratch_off + c + 32u];
+        const float v5 = seismic_shared_f32[scratch_off + c + 40u];
+        const float v6 = seismic_shared_f32[scratch_off + c + 48u];
+        const float v7 = seismic_shared_f32[scratch_off + c + 56u];
+        sum = seismic_fma_rn(v0, v0, sum);
+        sum = seismic_fma_rn(v1, v1, sum);
+        sum = seismic_fma_rn(v2, v2, sum);
+        sum = seismic_fma_rn(v3, v3, sum);
+        sum = seismic_fma_rn(v4, v4, sum);
+        sum = seismic_fma_rn(v5, v5, sum);
+        sum = seismic_fma_rn(v6, v6, sum);
+        sum = seismic_fma_rn(v7, v7, sum);
+    }
+    for (; c < count; c += 8u) {
+        const float v = seismic_shared_f32[scratch_off + c];
+        sum = seismic_fma_rn(v, v, sum);
+    }
+    return sum;
+}
+
 void projection_ordered_inverses(projection_prologue in_, uint m_rows, uint inv_off, uint inv_stride,
     uint first_row, bool has_scratch, uint scratch_off) {
     const uint tid = SEISMIC_THREAD, threads = SEISMIC_SUBGROUPS * 32u;
@@ -275,41 +304,33 @@ void projection_ordered_inverses(projection_prologue in_, uint m_rows, uint inv_
         barrier();
         return;
     }
-    const uint group_id = tid / 8u, u = tid & 7u, groups = threads / 8u;
+    const uint group_id = tid >> 3u, u = tid & 7u, groups = threads >> 3u;
     if (has_scratch && in_.x1 == 1ul && m_rows == 1u) {
         const uint64_t row = uint64_t(projection_row(in_.rows, first_row)) * in_.x0;
+        const bool aligned = stored_aligned16(stored_offset(in_.x, row));
         float sum = 0.0;
         for (uint k0 = 0u; k0 < in_.columns; k0 += 512u) {
+            if (k0 > 0u)
+                barrier();
             const uint chunk = min(512u, in_.columns - k0);
-            for (uint c = tid; c < chunk; c += threads)
-                seismic_shared_f32[scratch_off + c] = stored_at(in_.x, row + uint64_t(k0 + c));
-            barrier();
-            if (group_id == 0u) {
-                uint c = u;
-                for (; c + 56u < chunk; c += 64u) {
-                    const float v0 = seismic_shared_f32[scratch_off + c];
-                    const float v1 = seismic_shared_f32[scratch_off + c + 8u];
-                    const float v2 = seismic_shared_f32[scratch_off + c + 16u];
-                    const float v3 = seismic_shared_f32[scratch_off + c + 24u];
-                    const float v4 = seismic_shared_f32[scratch_off + c + 32u];
-                    const float v5 = seismic_shared_f32[scratch_off + c + 40u];
-                    const float v6 = seismic_shared_f32[scratch_off + c + 48u];
-                    const float v7 = seismic_shared_f32[scratch_off + c + 56u];
-                    sum = seismic_fma_rn(v0, v0, sum);
-                    sum = seismic_fma_rn(v1, v1, sum);
-                    sum = seismic_fma_rn(v2, v2, sum);
-                    sum = seismic_fma_rn(v3, v3, sum);
-                    sum = seismic_fma_rn(v4, v4, sum);
-                    sum = seismic_fma_rn(v5, v5, sum);
-                    sum = seismic_fma_rn(v6, v6, sum);
-                    sum = seismic_fma_rn(v7, v7, sum);
+            if (aligned) {
+                const uint chunk4 = chunk & ~3u;
+                for (uint c = tid * 4u; c < chunk4; c += threads * 4u) {
+                    const vec4 v = stored_vec4_at(in_.x, row + uint64_t(k0 + c));
+                    seismic_shared_f32[scratch_off + c] = v.x;
+                    seismic_shared_f32[scratch_off + c + 1u] = v.y;
+                    seismic_shared_f32[scratch_off + c + 2u] = v.z;
+                    seismic_shared_f32[scratch_off + c + 3u] = v.w;
                 }
-                for (; c < chunk; c += 8u) {
-                    const float v = seismic_shared_f32[scratch_off + c];
-                    sum = seismic_fma_rn(v, v, sum);
-                }
+                for (uint c = chunk4 + tid; c < chunk; c += threads)
+                    seismic_shared_f32[scratch_off + c] = stored_at(in_.x, row + uint64_t(k0 + c));
+            } else {
+                for (uint c = tid; c < chunk; c += threads)
+                    seismic_shared_f32[scratch_off + c] = stored_at(in_.x, row + uint64_t(k0 + c));
             }
             barrier();
+            if (group_id == 0u)
+                sum = projection_ordered_accumulate_sram8(scratch_off, chunk, u, sum);
         }
         const float total_sq = projection_ordered_combine8(sum);
         if (tid == 0u)

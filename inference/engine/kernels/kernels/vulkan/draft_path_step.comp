@@ -1,13 +1,33 @@
-// draft_path_step: one workgroup of 256 invocations per row reduces each
-// candidate's score unary + (predecessor * hidden) . successor, then selects
-// the first highest-scoring candidate. The Vulkan form of
-// `metal/draft_path_step.metal`.
+// draft_path_step: one workgroup of 256 invocations per row caches
+// joint = predecessor[row, r] * hidden[row, r] once per thread in registers
+// (16 floats/thread covering R <= 4096, streaming beyond that), reduces each
+// candidate's score unary + joint . successor with 4-wide vectorized loads
+// when unit-strided and aligned, and selects the first highest-scoring
+// candidate. The Vulkan form of `metal/draft_path_step.metal`.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 #include "lib/core/reduce.glsl"
 
+#define PATH_STEP_VEC_CAP 4u
+#define PATH_STEP_SCALAR_CAP 16u
+
+bool path_step_aligned4(uint64_t base) {
+    return (base & (ACTIVATION_A == ELEMENT_F32 ? 15ul : 7ul)) == 0ul;
+}
+
+vec4 path_step_load4(uint64_t base, uint64_t index) {
+    if (ACTIVATION_A == ELEMENT_F32) {
+        return element_vec4_at(base + index * 4ul);
+    } else {
+        const uvec2 words = element_uvec2_at(base + index * 2ul);
+        return vec4(element_unpack2(ACTIVATION_A, words.x), element_unpack2(ACTIVATION_A, words.y));
+    }
+}
+
 // Shared: one partial per subgroup (reduce_group_sum at float 0).
 void draft_path_step() {
+    if (SEISMIC_DIM_K == 0ul)
+        return;
     const uint64_t candidates = SEISMIC_PTR(SEISMIC_BUFFER_CANDIDATES);
     const uint64_t unary = SEISMIC_PTR(SEISMIC_BUFFER_UNARY);
     const uint64_t hidden = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN);
@@ -15,27 +35,132 @@ void draft_path_step() {
     const uint64_t successor = SEISMIC_PTR(SEISMIC_BUFFER_SUCCESSOR);
     const uint64_t selection = SEISMIC_PTR(SEISMIC_BUFFER_SELECTION);
     const uint64_t row = gl_WorkGroupID.x;
+    const uint64_t elem_bytes = uint64_t(ELEMENT_BYTES(ACTIVATION_A));
+    const uint64_t pred_row = predecessor + row * SEISMIC_PREDECESSOR_STRIDE_0 * elem_bytes;
+    const uint64_t hid_row = hidden + row * SEISMIC_HIDDEN_STRIDE_0 * elem_bytes;
+    const uint64_t wg_size = uint64_t(gl_WorkGroupSize.x);
+    const uint64_t thread = uint64_t(SEISMIC_THREAD);
+    const bool pred_hid_vec = SEISMIC_PREDECESSOR_STRIDE_1 == 1ul
+        && SEISMIC_HIDDEN_STRIDE_1 == 1ul
+        && path_step_aligned4(pred_row)
+        && path_step_aligned4(hid_row);
+
     float best = -uintBitsToFloat(0x7f800000u);
-    uint64_t chosen = 0ul;
-    for (uint64_t candidate = 0ul; candidate < SEISMIC_DIM_K; ++candidate) {
-        const uint64_t at = row * SEISMIC_DIM_K + candidate;
-        // Numbered by `SEISMIC_THREAD`: the partials reach the reduction.
-        float partial = 0.0;
-        seismic_strided(uint64_t, r, uint64_t(SEISMIC_THREAD), SEISMIC_DIM_R, gl_WorkGroupSize.x) {
-            const float joint =
-                element_at(ACTIVATION_A, predecessor, row * SEISMIC_PREDECESSOR_STRIDE_0 + r * SEISMIC_PREDECESSOR_STRIDE_1)
-                * element_at(ACTIVATION_A, hidden, row * SEISMIC_HIDDEN_STRIDE_0 + r * SEISMIC_HIDDEN_STRIDE_1);
-            partial = seismic_fma_rn(joint,
-                element_at(ACTIVATION_A, successor, at * SEISMIC_SUCCESSOR_STRIDE_0 + r * SEISMIC_SUCCESSOR_STRIDE_1),
-                partial);
+    uint64_t chosen = row * SEISMIC_DIM_K;
+
+    if (pred_hid_vec) {
+        const uint64_t vec_end = SEISMIC_DIM_R & ~3ul;
+        const uint64_t vec_step = wg_size * 4ul;
+        const uint64_t cached_vec_end = min(vec_end, uint64_t(PATH_STEP_VEC_CAP) * vec_step);
+        vec4 joint_vec[PATH_STEP_VEC_CAP];
+        [[unroll]] for (uint i = 0u; i < PATH_STEP_VEC_CAP; ++i) {
+            const uint64_t r = uint64_t(i) * vec_step + thread * 4ul;
+            if (r < cached_vec_end)
+                joint_vec[i] = path_step_load4(pred_row, r) * path_step_load4(hid_row, r);
         }
-        const float score = reduce_group_sum(partial, 0u)
-            + element_f32_at(unary + (row * SEISMIC_UNARY_STRIDE_0 + candidate * SEISMIC_UNARY_STRIDE_1) * 4ul);
-        if (score > best) {
-            best = score;
-            chosen = at;
+        float joint_tail = 0.0;
+        const uint64_t tail_r = vec_end + thread;
+        if (tail_r < SEISMIC_DIM_R)
+            joint_tail = element_at(ACTIVATION_A, pred_row, tail_r) * element_at(ACTIVATION_A, hid_row, tail_r);
+
+        for (uint64_t candidate = 0ul; candidate < SEISMIC_DIM_K; ++candidate) {
+            const uint64_t at = row * SEISMIC_DIM_K + candidate;
+            const uint64_t succ_row = successor + at * SEISMIC_SUCCESSOR_STRIDE_0 * elem_bytes;
+            const bool succ_vec = SEISMIC_SUCCESSOR_STRIDE_1 == 1ul && path_step_aligned4(succ_row);
+            vec4 acc = vec4(0.0);
+            if (succ_vec) {
+                [[unroll]] for (uint i = 0u; i < PATH_STEP_VEC_CAP; ++i) {
+                    const uint64_t r = uint64_t(i) * vec_step + thread * 4ul;
+                    if (r < cached_vec_end) {
+                        const vec4 s = path_step_load4(succ_row, r);
+                        acc = vec4(
+                            seismic_fma_rn(joint_vec[i].x, s.x, acc.x),
+                            seismic_fma_rn(joint_vec[i].y, s.y, acc.y),
+                            seismic_fma_rn(joint_vec[i].z, s.z, acc.z),
+                            seismic_fma_rn(joint_vec[i].w, s.w, acc.w));
+                    }
+                }
+                seismic_strided_from(uint64_t, r, cached_vec_end, thread * 4ul, vec_end, vec_step) {
+                    const vec4 j = path_step_load4(pred_row, r) * path_step_load4(hid_row, r);
+                    const vec4 s = path_step_load4(succ_row, r);
+                    acc = vec4(
+                        seismic_fma_rn(j.x, s.x, acc.x),
+                        seismic_fma_rn(j.y, s.y, acc.y),
+                        seismic_fma_rn(j.z, s.z, acc.z),
+                        seismic_fma_rn(j.w, s.w, acc.w));
+                }
+            } else {
+                [[unroll]] for (uint i = 0u; i < PATH_STEP_VEC_CAP; ++i) {
+                    const uint64_t r = uint64_t(i) * vec_step + thread * 4ul;
+                    if (r < cached_vec_end) {
+                        const uint64_t base_idx = r * SEISMIC_SUCCESSOR_STRIDE_1;
+                        acc.x = seismic_fma_rn(joint_vec[i].x, element_at(ACTIVATION_A, succ_row, base_idx), acc.x);
+                        acc.y = seismic_fma_rn(joint_vec[i].y, element_at(ACTIVATION_A, succ_row, base_idx + SEISMIC_SUCCESSOR_STRIDE_1), acc.y);
+                        acc.z = seismic_fma_rn(joint_vec[i].z, element_at(ACTIVATION_A, succ_row, base_idx + 2ul * SEISMIC_SUCCESSOR_STRIDE_1), acc.z);
+                        acc.w = seismic_fma_rn(joint_vec[i].w, element_at(ACTIVATION_A, succ_row, base_idx + 3ul * SEISMIC_SUCCESSOR_STRIDE_1), acc.w);
+                    }
+                }
+                seismic_strided_from(uint64_t, r, cached_vec_end, thread * 4ul, vec_end, vec_step) {
+                    const vec4 j = path_step_load4(pred_row, r) * path_step_load4(hid_row, r);
+                    const uint64_t base_idx = r * SEISMIC_SUCCESSOR_STRIDE_1;
+                    acc.x = seismic_fma_rn(j.x, element_at(ACTIVATION_A, succ_row, base_idx), acc.x);
+                    acc.y = seismic_fma_rn(j.y, element_at(ACTIVATION_A, succ_row, base_idx + SEISMIC_SUCCESSOR_STRIDE_1), acc.y);
+                    acc.z = seismic_fma_rn(j.z, element_at(ACTIVATION_A, succ_row, base_idx + 2ul * SEISMIC_SUCCESSOR_STRIDE_1), acc.z);
+                    acc.w = seismic_fma_rn(j.w, element_at(ACTIVATION_A, succ_row, base_idx + 3ul * SEISMIC_SUCCESSOR_STRIDE_1), acc.w);
+                }
+            }
+            float partial = (acc.x + acc.y) + (acc.z + acc.w);
+            if (tail_r < SEISMIC_DIM_R) {
+                partial = seismic_fma_rn(joint_tail,
+                    element_at(ACTIVATION_A, succ_row, tail_r * SEISMIC_SUCCESSOR_STRIDE_1), partial);
+            }
+            const float score = reduce_group_sum(partial, 0u)
+                + element_f32_at(unary + (row * SEISMIC_UNARY_STRIDE_0 + candidate * SEISMIC_UNARY_STRIDE_1) * 4ul);
+            if (score > best) {
+                best = score;
+                chosen = at;
+            }
+        }
+    } else {
+        const uint64_t cached_end = min(SEISMIC_DIM_R, uint64_t(PATH_STEP_SCALAR_CAP) * wg_size);
+        float joint_scalar[PATH_STEP_SCALAR_CAP];
+        [[unroll]] for (uint i = 0u; i < PATH_STEP_SCALAR_CAP; ++i) {
+            const uint64_t r = uint64_t(i) * wg_size + thread;
+            if (r < cached_end) {
+                joint_scalar[i] =
+                    element_at(ACTIVATION_A, pred_row, r * SEISMIC_PREDECESSOR_STRIDE_1)
+                    * element_at(ACTIVATION_A, hid_row, r * SEISMIC_HIDDEN_STRIDE_1);
+            }
+        }
+        for (uint64_t candidate = 0ul; candidate < SEISMIC_DIM_K; ++candidate) {
+            const uint64_t at = row * SEISMIC_DIM_K + candidate;
+            const uint64_t succ_row = successor + at * SEISMIC_SUCCESSOR_STRIDE_0 * elem_bytes;
+            float partial = 0.0;
+            [[unroll]] for (uint i = 0u; i < PATH_STEP_SCALAR_CAP; ++i) {
+                const uint64_t r = uint64_t(i) * wg_size + thread;
+                if (r < cached_end) {
+                    partial = seismic_fma_rn(joint_scalar[i],
+                        element_at(ACTIVATION_A, succ_row, r * SEISMIC_SUCCESSOR_STRIDE_1),
+                        partial);
+                }
+            }
+            seismic_strided_from(uint64_t, r, cached_end, thread, SEISMIC_DIM_R, wg_size) {
+                const float joint =
+                    element_at(ACTIVATION_A, pred_row, r * SEISMIC_PREDECESSOR_STRIDE_1)
+                    * element_at(ACTIVATION_A, hid_row, r * SEISMIC_HIDDEN_STRIDE_1);
+                partial = seismic_fma_rn(joint,
+                    element_at(ACTIVATION_A, succ_row, r * SEISMIC_SUCCESSOR_STRIDE_1),
+                    partial);
+            }
+            const float score = reduce_group_sum(partial, 0u)
+                + element_f32_at(unary + (row * SEISMIC_UNARY_STRIDE_0 + candidate * SEISMIC_UNARY_STRIDE_1) * 4ul);
+            if (score > best) {
+                best = score;
+                chosen = at;
+            }
         }
     }
+
     if (gl_LocalInvocationIndex == 0u) {
         element_i32_put(selection + row * SEISMIC_SELECTION_STRIDE_0 * 4ul,
             element_i32_index(candidates, chosen * SEISMIC_CANDIDATES_STRIDE_0));

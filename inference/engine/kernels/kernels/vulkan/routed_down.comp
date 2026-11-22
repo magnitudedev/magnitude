@@ -1,8 +1,9 @@
 // Decode output of the general routed feed-forward (M <= VERIFY_ROWS): the
 // down projections (`lib/routed/down.glsl`) weighted in slot order, then
 // base + selected published in R (`lib/routed/down_sum.glsl`), in one
-// launch. The Vulkan form of `metal/routed_down.metal`. The running selection
-// lives in every lane's registers and one lane stores the channel.
+// launch. The Vulkan form of `metal/routed_down.metal`. Each lane with
+// `SEISMIC_LANE % DOWN_LANES < DOWN_R` accumulates its single channel in one
+// scalar register and stores it after the K-choice loop.
 #define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/routed/down.glsl"
@@ -11,23 +12,23 @@
 void routed_down_summed() {
     const uint tile = gl_WorkGroupID.x;
     const uint64_t m = gl_WorkGroupID.y;
-    const uint hidden = uint(SEISMIC_DIM_H);
-    const uint first = projection_gemv_first_row(DOWN_R, DOWN_LANES, tile);
-    float selected[PROJECTION_GEMV_MAX_R];
-    [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r)
-        selected[r] = 0.0;
+    const uint my_r = SEISMIC_LANE % DOWN_LANES;
+    float selected = 0.0;
     float totals[PROJECTION_GEMV_SUMS];
     // A 32-bit counter: see `streaming/contract.hpp`.
     for (uint k = 0u; k < uint(SEISMIC_DIM_K); ++k) {
         routed_down_choice(m, uint64_t(k), tile, totals);
-        [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r)
-            if (r < DOWN_R)
-                selected[r] = routed_down_term(selected[r], m, uint64_t(k),
-                    element_round(ROUTED_ACT, totals[r * PROJECTION_GEMV_MAX_M]));
+        const float weight = routed_down_weight_subgroup(
+            routed_down_weight_row(m) + uint64_t(k) * SEISMIC_WEIGHTS_STRIDE_1 * 4ul);
+        if (my_r < DOWN_R) {
+            float projected = 0.0;
+            [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r)
+                if (r < DOWN_R && r == my_r)
+                    projected = totals[r * PROJECTION_GEMV_MAX_M];
+            selected = routed_down_term_weighted(selected, weight, element_round(ROUTED_ACT, projected));
+        }
     }
-    [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
-        const uint n = first + r;
-        if (r < DOWN_R && n < hidden && SEISMIC_LANE % DOWN_LANES == r)
-            routed_down_put(m, uint64_t(n), selected[r]);
-    }
+    const uint n = projection_gemv_first_row(DOWN_R, DOWN_LANES, tile) + my_r;
+    if (my_r < DOWN_R && n < uint(SEISMIC_DIM_H))
+        routed_down_put(m, uint64_t(n), selected);
 }

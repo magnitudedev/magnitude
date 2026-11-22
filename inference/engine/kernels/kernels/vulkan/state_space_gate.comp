@@ -2,10 +2,57 @@
 // state-space output rows, y * SiLU(z) RMS-normalized over each group of U
 // heads and scaled by the state norm. The Vulkan form of
 // `cuda/state_space_gate.cu`: a workgroup of 256 invocations per (row,
-// group), strided lane chains, a logical-subgroup reduction, then the
-// subgroup sums in order.
+// group), `vec4` lane chains on canonical aligned strides with register
+// caching across the RMS reduction for widths up to 4096, a logical-subgroup
+// reduction, then the subgroup sums in order.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
+
+// Up to 4 vec4s (16 floats) cached per invocation = 4096 elements at 256 invocations.
+#define SSG_CACHE_VECS 4u
+
+float ssg_silu_mul(float value, float gate) {
+    return seismic_mul_rn(value, seismic_div_rn(gate, 1.0 + exp(-gate)));
+}
+
+vec4 ssg_silu_mul4(vec4 value, vec4 gate) {
+    return vec4(
+        ssg_silu_mul(value.x, gate.x),
+        ssg_silu_mul(value.y, gate.y),
+        ssg_silu_mul(value.z, gate.z),
+        ssg_silu_mul(value.w, gate.w));
+}
+
+vec4 ssg_load4(uint64_t base, uint64_t index) {
+    if (ACTIVATION_A == ELEMENT_F32)
+        return element_vec4_at(base + index * 4ul);
+    const uvec2 raw = element_uvec2_at(base + index * 2ul);
+    return vec4(element_unpack2(ACTIVATION_A, raw.x), element_unpack2(ACTIVATION_A, raw.y));
+}
+
+vec4 ssg_gated_value4(uint64_t mixed_group, uint64_t proj_group, uint64_t column) {
+    return ssg_silu_mul4(ssg_load4(mixed_group, column), ssg_load4(proj_group, column));
+}
+
+vec4 ssg_square4(vec4 value, vec4 sq4) {
+    return vec4(
+        seismic_fma_rn(value.x, value.x, sq4.x),
+        seismic_fma_rn(value.y, value.y, sq4.y),
+        seismic_fma_rn(value.z, value.z, sq4.z),
+        seismic_fma_rn(value.w, value.w, sq4.w));
+}
+
+float ssg_sum4(vec4 sq4) {
+    return seismic_add_rn(seismic_add_rn(sq4.x, sq4.y), seismic_add_rn(sq4.z, sq4.w));
+}
+
+vec4 ssg_apply4(vec4 value, float inverse, vec4 weight) {
+    return vec4(
+        seismic_mul_rn(seismic_mul_rn(value.x, inverse), weight.x),
+        seismic_mul_rn(seismic_mul_rn(value.y, inverse), weight.y),
+        seismic_mul_rn(seismic_mul_rn(value.z, inverse), weight.z),
+        seismic_mul_rn(seismic_mul_rn(value.w, inverse), weight.w));
+}
 
 // The gated value of `channel` (in the row's flat head-major order).
 float ssg_gated_value(uint64_t row, uint64_t head, uint64_t within) {
@@ -14,41 +61,133 @@ float ssg_gated_value(uint64_t row, uint64_t head, uint64_t within) {
         row * SEISMIC_PROJECTION_STRIDE_0 + channel * SEISMIC_PROJECTION_STRIDE_1);
     const float value = element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_MIXED),
         row * SEISMIC_MIXED_STRIDE_0 + head * SEISMIC_MIXED_STRIDE_1 + within * SEISMIC_MIXED_STRIDE_2);
-    return seismic_mul_rn(value, seismic_div_rn(gate, 1.0 + exp(-gate)));
+    return ssg_silu_mul(value, gate);
 }
 
 void state_space_gate() {
     const uint64_t state_norm = SEISMIC_PTR(SEISMIC_BUFFER_STATE_NORM);
     const Out normalized = SEISMIC_RESULT_0_OUT;
-    const uint64_t row = gl_WorkGroupID.x;
-    const uint64_t width = SEISMIC_DIM_U * SEISMIC_DIM_P;
+    const uint64_t row = uint64_t(gl_WorkGroupID.x);
+    const uint64_t group = uint64_t(gl_WorkGroupID.y);
+    const uint64_t width64 = SEISMIC_DIM_U * SEISMIC_DIM_P;
+    const uint width = uint(width64);
+    const uint vec_width = width & ~3u;
+    const uint64_t first = group * width64;
+    const uint tid = SEISMIC_THREAD;
+    const uint threads = gl_WorkGroupSize.x;
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ACTIVATION_A));
+    const uint64_t act_align = uint64_t(4u * ELEMENT_BYTES(ACTIVATION_A) - 1u);
+    const uint64_t mixed_group =
+        SEISMIC_PTR(SEISMIC_BUFFER_MIXED) + (row * SEISMIC_MIXED_STRIDE_0 + first) * act_bytes;
+    const uint64_t proj_group =
+        SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION) + (row * SEISMIC_PROJECTION_STRIDE_0 + first) * act_bytes;
+    const uint64_t norm_group = state_norm + group * SEISMIC_STATE_NORM_STRIDE_0 * 4ul;
+    const Out out_group = out_offset(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + first);
+    const bool vec_in = SEISMIC_PROJECTION_STRIDE_1 == 1ul
+        && SEISMIC_MIXED_STRIDE_1 == SEISMIC_DIM_P && SEISMIC_MIXED_STRIDE_2 == 1ul
+        && (((mixed_group | proj_group) & act_align) == 0ul);
+    const bool vec_out = vec_in
+        && SEISMIC_STATE_NORM_STRIDE_1 == SEISMIC_DIM_P && SEISMIC_STATE_NORM_STRIDE_2 == 1ul
+        && SEISMIC_RESULT_0_STRIDE_1 == SEISMIC_DIM_P && SEISMIC_RESULT_0_STRIDE_2 == 1ul
+        && ((norm_group & 15ul) == 0ul)
+        && stored_aligned16(out_stored(out_group, 0ul));
+    const bool cached_path = vec_out && (vec_width <= SSG_CACHE_VECS * 4u * threads);
+
     // Spread by `SEISMIC_THREAD`, as the subgroup sums need.
+    vec4 cached[SSG_CACHE_VECS];
+    float tail_cached = 0.0;
     float squares = 0.0;
-    seismic_strided(uint64_t, column, SEISMIC_THREAD, width, gl_WorkGroupSize.x) {
-        uint64_t head, within;
-        seismic_split(uint(column), SEISMIC_DIM_P, head, within);
-        const float value = ssg_gated_value(row, uint64_t(gl_WorkGroupID.y) * SEISMIC_DIM_U + head, within);
-        squares = seismic_fma_rn(value, value, squares);
+    if (cached_path) {
+        vec4 sq4 = vec4(0.0);
+        [[unroll]] for (uint k = 0u; k < SSG_CACHE_VECS; ++k) {
+            const uint column = (k * threads + tid) * 4u;
+            if (column < vec_width) {
+                const vec4 value = ssg_gated_value4(mixed_group, proj_group, uint64_t(column));
+                cached[k] = value;
+                sq4 = ssg_square4(value, sq4);
+            }
+        }
+        squares = ssg_sum4(sq4);
+        if (vec_width + tid < width) {
+            tail_cached = ssg_silu_mul(
+                element_at(ACTIVATION_A, mixed_group, uint64_t(vec_width + tid)),
+                element_at(ACTIVATION_A, proj_group, uint64_t(vec_width + tid)));
+            squares = seismic_fma_rn(tail_cached, tail_cached, squares);
+        }
+    } else if (vec_in) {
+        vec4 sq4 = vec4(0.0);
+        seismic_strided(uint, column, 4u * tid, vec_width, 4u * threads) {
+            sq4 = ssg_square4(ssg_gated_value4(mixed_group, proj_group, uint64_t(column)), sq4);
+        }
+        squares = ssg_sum4(sq4);
+        if (vec_width + tid < width) {
+            const float value = ssg_silu_mul(
+                element_at(ACTIVATION_A, mixed_group, uint64_t(vec_width + tid)),
+                element_at(ACTIVATION_A, proj_group, uint64_t(vec_width + tid)));
+            squares = seismic_fma_rn(value, value, squares);
+        }
+    } else {
+        seismic_strided(uint64_t, column, uint64_t(tid), width64, uint64_t(threads)) {
+            uint64_t head, within;
+            seismic_split(uint(column), SEISMIC_DIM_P, head, within);
+            const float value = ssg_gated_value(row, group * SEISMIC_DIM_U + head, within);
+            squares = seismic_fma_rn(value, value, squares);
+        }
     }
+
     const float total = seismic_subgroup_sum_f32(squares);
     if (SEISMIC_LANE == 0u)
         seismic_shared_f32[SEISMIC_SUBGROUP] = total;
     barrier();
     float sum = 0.0;
-    for (uint index = 0u; index < gl_WorkGroupSize.x / 32u; ++index)
+    for (uint index = 0u; index < threads / 32u; ++index)
         sum = seismic_add_rn(sum, seismic_shared_f32[index]);
-    const float inverse = inversesqrt(seismic_div_rn(sum, float(width)) + epsilon);
-    for (uint64_t column = gl_LocalInvocationIndex; column < width; column += gl_WorkGroupSize.x) {
-        uint64_t unit, within;
-        seismic_split(uint(column), SEISMIC_DIM_P, unit, within);
-        const uint64_t head = uint64_t(gl_WorkGroupID.y) * SEISMIC_DIM_U + unit;
-        const float weight = element_f32_at(state_norm + (uint64_t(gl_WorkGroupID.y) * SEISMIC_STATE_NORM_STRIDE_0
-            + unit * SEISMIC_STATE_NORM_STRIDE_1 + within * SEISMIC_STATE_NORM_STRIDE_2) * 4ul);
-        const float value = ssg_gated_value(row, head, within);
-        out_put(normalized,
-            row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
-                + within * SEISMIC_RESULT_0_STRIDE_2,
-            seismic_mul_rn(seismic_mul_rn(value, inverse), weight));
+    const float inverse = inversesqrt(seismic_div_rn(sum, float(width64)) + epsilon);
+
+    if (cached_path) {
+        [[unroll]] for (uint k = 0u; k < SSG_CACHE_VECS; ++k) {
+            const uint column = (k * threads + tid) * 4u;
+            if (column < vec_width) {
+                const vec4 weight = element_vec4_at(norm_group + uint64_t(column) * 4ul);
+                const vec4 scaled = ssg_apply4(cached[k], inverse, weight);
+                out_put2(out_group, uint64_t(column), scaled.x, scaled.y);
+                out_put2(out_group, uint64_t(column) + 2ul, scaled.z, scaled.w);
+            }
+        }
+        if (vec_width + tid < width) {
+            const uint column = vec_width + tid;
+            const float weight = element_f32_at(norm_group + uint64_t(column) * 4ul);
+            out_put(out_group, uint64_t(column), seismic_mul_rn(seismic_mul_rn(tail_cached, inverse), weight));
+        }
+    } else if (vec_out) {
+        for (uint column = 4u * tid; column < vec_width; column += 4u * threads) {
+            const vec4 weight = element_vec4_at(norm_group + uint64_t(column) * 4ul);
+            const vec4 value = ssg_gated_value4(mixed_group, proj_group, uint64_t(column));
+            const vec4 scaled = ssg_apply4(value, inverse, weight);
+            out_put2(out_group, uint64_t(column), scaled.x, scaled.y);
+            out_put2(out_group, uint64_t(column) + 2ul, scaled.z, scaled.w);
+        }
+        if (vec_width + tid < width) {
+            const uint column = vec_width + tid;
+            const float weight = element_f32_at(norm_group + uint64_t(column) * 4ul);
+            const float value = ssg_silu_mul(
+                element_at(ACTIVATION_A, mixed_group, uint64_t(column)),
+                element_at(ACTIVATION_A, proj_group, uint64_t(column)));
+            out_put(out_group, uint64_t(column), seismic_mul_rn(seismic_mul_rn(value, inverse), weight));
+        }
+    } else {
+        for (uint64_t column = uint64_t(tid); column < width64; column += uint64_t(threads)) {
+            uint64_t unit, within;
+            seismic_split(uint(column), SEISMIC_DIM_P, unit, within);
+            const uint64_t head = group * SEISMIC_DIM_U + unit;
+            const float weight = element_f32_at(state_norm + (group * SEISMIC_STATE_NORM_STRIDE_0
+                + unit * SEISMIC_STATE_NORM_STRIDE_1 + within * SEISMIC_STATE_NORM_STRIDE_2) * 4ul);
+            const float value = ssg_gated_value(row, head, within);
+            out_put(normalized,
+                row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
+                    + within * SEISMIC_RESULT_0_STRIDE_2,
+                seismic_mul_rn(seismic_mul_rn(value, inverse), weight));
+        }
     }
 }

@@ -61,10 +61,25 @@ void per_layer_gate_rows() {
         SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, GATE_D, 0ul, 1u), PROJECTION_OPERANDS_NVFP4),
         gl_WorkGroupID.x, PROJECTION_STAGED, GATE_D);
 #else
-    const uint64_t m = gl_WorkGroupID.x;
-    for (uint i = gl_LocalInvocationID.x; i < GATE_D; i += 256u)
-        element_put(GATE_ACT, PROJECTION_STAGED, m * SEISMIC_DIM_D + i, element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)
-            + (m * SEISMIC_HIDDEN_STRIDE_0 + uint64_t(i) * SEISMIC_HIDDEN_STRIDE_1) * 4ul));
+    const uint64_t m = uint64_t(gl_WorkGroupID.x);
+    const uint64_t src_row = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + m * SEISMIC_HIDDEN_STRIDE_0 * 4ul;
+    const uint64_t dst_row = PROJECTION_STAGED + m * SEISMIC_DIM_D * 2ul;
+    if (SEISMIC_HIDDEN_STRIDE_1 == 1ul && (src_row & 15ul) == 0ul && (dst_row & 7ul) == 0ul) {
+        const uint vec_end = GATE_D & ~3u;
+        for (uint i = gl_LocalInvocationID.x * 4u; i < vec_end; i += 1024u) {
+            const vec4 v = element_vec4_at(src_row + uint64_t(i) * 4ul);
+            element_uvec2_put(dst_row + uint64_t(i) * 2ul,
+                uvec2(element_pack2(GATE_ACT, v.x, v.y), element_pack2(GATE_ACT, v.z, v.w)));
+        }
+        const uint tail = vec_end + gl_LocalInvocationID.x;
+        if (tail < GATE_D)
+            element_put(GATE_ACT, PROJECTION_STAGED, m * SEISMIC_DIM_D + uint64_t(tail),
+                element_f32_at(src_row + uint64_t(tail) * 4ul));
+    } else {
+        for (uint i = gl_LocalInvocationID.x; i < GATE_D; i += 256u)
+            element_put(GATE_ACT, PROJECTION_STAGED, m * SEISMIC_DIM_D + uint64_t(i),
+                element_f32_at(src_row + uint64_t(i) * SEISMIC_HIDDEN_STRIDE_1 * 4ul));
+    }
 #endif
 }
 

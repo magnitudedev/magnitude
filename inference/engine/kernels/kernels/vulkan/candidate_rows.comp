@@ -24,10 +24,20 @@
 //   by the piece that opens or closes it. The rest of the row's B + R spans
 //   are [-1, -1].
 //
-// The workgroup scans are `reduce_group_exclusive_add`. Group memory (u32):
-// the scans' 8 subgroup sums, then X and whether unit X is taken [2], then
-// the span offsets [R + 1] (R <= 64 by the contract): every search and
-// advance reads them there, each written once by the scan.
+// The workgroup scans are `reduce_group_exclusive_add`; `valid` and `pooled`
+// fuse into one `seismic_subgroup_add` pair and one barrier. Group memory
+// (u32, 75 words = 8 + 2 + 65):
+// - [0..8):   CANDIDATE_SCAN (8 subgroup sums for `reduce_group_exclusive_add`)
+// - [8..10):  CANDIDATE_FILL (X and whether unit X is taken, live only inside
+//             `if (fill > 0u)` after its scan's barriers)
+// - [8..16):  CANDIDATE_PICK_VALID (8 subgroup sums for `valid`, disjoint from
+//             CANDIDATE_SCAN and finished before CANDIDATE_FILL)
+// - [16..24): CANDIDATE_PICK_POOLED (8 subgroup sums for `pooled`)
+// - [24..75): inline span offsets [R + 1] when 2 <= R <= 50 (published by the
+//             pick-totals barrier); when 51 <= R <= 64, word 24 carries `units`
+//             across that barrier and the span offsets are then published into
+//             [10..10 + R + 1) (R <= 64 by the contract). R == 1 skips the
+//             span scan and offset table completely.
 #include <seismic/element.glsl>
 #include "lib/core/reduce.glsl"
 #include "lib/indexer/indexer.glsl"
@@ -35,30 +45,46 @@
 #define CANDIDATE_THREADS 256u
 #define CANDIDATE_SCAN 0u
 #define CANDIDATE_FILL 8u
-#define CANDIDATE_FIRST 10u
+#define CANDIDATE_PICK_VALID 8u
+#define CANDIDATE_PICK_POOLED 16u
+#define CANDIDATE_UNITS 24u
+#define CANDIDATE_FIRST_INLINE 24u
+#define CANDIDATE_FIRST_DEFERRED 10u
+#define CANDIDATE_INLINE_MAX 50u
 
-// The row's views: its spans, picks and result, and its units.
+// The row's views: its spans, picks and result, its units, and its span
+// offset base in group memory.
 uint64_t candidate_spans;
 uint64_t candidate_picks;
 uint64_t candidate_result;
 uint candidate_units;
+uint candidate_first;
 
 int candidate_pick(uint s) {
     return element_i32_at(candidate_picks + uint64_t(s) * SEISMIC_BLOCKS_STRIDE_1 * 4ul);
 }
 
+// Block p's units [first, end), clipped to the row's.
+uint candidate_block_first(int p) {
+    return min(candidate_units, uint(p) * uint(SEISMIC_DIM_BU));
+}
+
+uint candidate_block_end(int p) {
+    return min(candidate_units, (uint(p) + 1u) * uint(SEISMIC_DIM_BU));
+}
+
 // Pick s's block's units [first, end), clipped to the row's.
 uint candidate_first_unit(uint s) {
-    return min(candidate_units, uint(candidate_pick(s)) * uint(SEISMIC_DIM_BU));
+    return candidate_block_first(candidate_pick(s));
 }
 
 uint candidate_end_unit(uint s) {
-    return min(candidate_units, (uint(candidate_pick(s)) + 1u) * uint(SEISMIC_DIM_BU));
+    return candidate_block_end(candidate_pick(s));
 }
 
 // The units before span `span` (span R: the row's).
 uint candidate_offset(uint span) {
-    return seismic_shared_u32[CANDIDATE_FIRST + span];
+    return seismic_shared_u32[candidate_first + span];
 }
 
 // Each piece of the range [a, e) in unit order, cut where a list span
@@ -70,6 +96,25 @@ uint candidate_offset(uint span) {
 void candidate_pieces(uint a, uint e, bool preceded, bool followed, bool write, inout uint entry) {
     const uint r = uint(SEISMIC_DIM_R);
     const uint capacity = uint(SEISMIC_DIM_B) + r;
+    if (r == 1u) {
+        const bool opens = !preceded;
+        const bool closes = !followed;
+        if (!write) {
+            entry += opens ? 1u : 0u;
+        } else {
+            const int row_lo = element_i32_at(candidate_spans);
+            if (opens) {
+                if (entry < capacity)
+                    element_i32_put(candidate_result + uint64_t(entry) * SEISMIC_RESULT_0_STRIDE_1 * 4ul,
+                        row_lo + int(a));
+                ++entry;
+            }
+            if (closes && entry - 1u < capacity)
+                element_i32_put(candidate_result + (uint64_t(entry - 1u) * SEISMIC_RESULT_0_STRIDE_1
+                    + SEISMIC_RESULT_0_STRIDE_2) * 4ul, row_lo + int(e));
+        }
+        return;
+    }
     // The span holding `a` (a < units): the last whose offset is at most it,
     // which holds units.
     uint span = 0u;
@@ -113,13 +158,14 @@ void candidate_ranges(uint thread, uint lo, uint hi, uint valid, uint x, bool x_
     if (thread == 0u && x > 0u)
         candidate_pieces(0u, x, false, x_followed, write, entry);
     for (uint s = lo; s < hi; ++s) {
-        const uint first = candidate_first_unit(s);
+        const int p = candidate_pick(s);
+        const uint first = candidate_block_first(p);
         const uint a = max(first, x);
-        const uint e = candidate_end_unit(s);
+        const uint e = candidate_block_end(p);
         if (a >= e)
             continue;
-        const bool preceded = (a == x && x > 0u) || (s > 0u && candidate_pick(s - 1u) + 1 == candidate_pick(s));
-        const bool followed = e < candidate_units && s + 1u < valid && candidate_pick(s + 1u) == candidate_pick(s) + 1;
+        const bool preceded = (a == x && x > 0u) || (s > 0u && candidate_pick(s - 1u) + 1 == p);
+        const bool followed = e < candidate_units && s + 1u < valid && candidate_pick(s + 1u) == p + 1;
         candidate_pieces(a, e, preceded, followed, write, entry);
     }
 }
@@ -134,51 +180,83 @@ void candidate_rows() {
     candidate_spans = SEISMIC_PTR(SEISMIC_BUFFER_SPANS) + row * SEISMIC_SPANS_STRIDE_0 * 4ul;
     candidate_picks = SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + row * SEISMIC_BLOCKS_STRIDE_0 * 4ul;
     candidate_result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
-    uint total = 0u;
+    candidate_first = r <= CANDIDATE_INLINE_MAX ? CANDIDATE_FIRST_INLINE : CANDIDATE_FIRST_DEFERRED;
 
     // The span offsets [R + 1]: the units before each span, then the row's.
+    // R == 1 needs no scan or offset table; R <= 64 < CANDIDATE_THREADS by
+    // the contract, so one pass covers every span when R > 1.
     uint units = 0u;
-    for (uint base = 0u; base < r; base += CANDIDATE_THREADS) {
-        const uint span = base + thread;
-        const uint length = span < r
-            ? indexer_span_length_at(candidate_spans, SEISMIC_SPANS_STRIDE_1, SEISMIC_SPANS_STRIDE_2, span)
+    uint span_before = 0u;
+    if (r == 1u) {
+        units = indexer_span_length_at(candidate_spans, SEISMIC_SPANS_STRIDE_1, SEISMIC_SPANS_STRIDE_2, 0ul);
+        candidate_units = units;
+    } else if (r > 1u) {
+        const uint length = thread < r
+            ? indexer_span_length_at(candidate_spans, SEISMIC_SPANS_STRIDE_1, SEISMIC_SPANS_STRIDE_2, uint64_t(thread))
             : 0u;
-        uint chunk;
-        const uint before = reduce_group_exclusive_add(length, CANDIDATE_SCAN, chunk);
-        if (span < r)
-            seismic_shared_u32[CANDIDATE_FIRST + span] = units + before;
-        units += chunk;
-    }
-    candidate_units = units;
-    if (thread == 0u) {
-        seismic_shared_u32[CANDIDATE_FIRST + r] = units;
-        seismic_shared_u32[CANDIDATE_FILL] = 0u;
-        seismic_shared_u32[CANDIDATE_FILL + 1u] = 0u;
+        uint scanned;
+        span_before = reduce_group_exclusive_add(length, CANDIDATE_SCAN, scanned);
+        candidate_units = scanned;
+        if (r <= CANDIDATE_INLINE_MAX) {
+            if (thread < r)
+                seismic_shared_u32[candidate_first + thread] = span_before;
+            if (thread == 0u)
+                seismic_shared_u32[candidate_first + r] = scanned;
+        } else if (thread == 0u) {
+            seismic_shared_u32[CANDIDATE_UNITS] = scanned;
+        }
+    } else {
+        candidate_units = 0u;
     }
 
-    uint valid;
-    uint pooled;
+    uint valid = 0u;
+    uint pooled = 0u;
     {
         uint count = 0u, sum = 0u;
-        seismic_strided(uint, s, thread, b, CANDIDATE_THREADS)
-            if (candidate_pick(s) >= 0) {
+        seismic_strided(uint, s, thread, b, CANDIDATE_THREADS) {
+            const int p = candidate_pick(s);
+            if (p >= 0) {
                 ++count;
-                sum += candidate_end_unit(s) - candidate_first_unit(s);
+                sum += candidate_block_end(p) - candidate_block_first(p);
             }
-        reduce_group_exclusive_add(count, CANDIDATE_SCAN, valid);
-        reduce_group_exclusive_add(sum, CANDIDATE_SCAN, pooled);
+        }
+        const uint sg_valid = seismic_subgroup_add(count);
+        const uint sg_pooled = seismic_subgroup_add(sum);
+        if (SEISMIC_LANE == 0u) {
+            seismic_shared_u32[CANDIDATE_PICK_VALID + SEISMIC_SUBGROUP] = sg_valid;
+            seismic_shared_u32[CANDIDATE_PICK_POOLED + SEISMIC_SUBGROUP] = sg_pooled;
+        }
+        // Also publishes inline span offsets (2 <= R <= 50) or CANDIDATE_UNITS (R > 50).
+        barrier();
+        for (uint s = 0u; s < SEISMIC_SUBGROUPS; ++s) {
+            valid += seismic_shared_u32[CANDIDATE_PICK_VALID + s];
+            pooled += seismic_shared_u32[CANDIDATE_PICK_POOLED + s];
+        }
     }
-    // The offsets' scan reads its total where the offsets' stores follow
-    // before a barrier; read back past the scans' barriers, the row's units
-    // are every invocation's alike.
-    units = seismic_shared_u32[CANDIDATE_FIRST + r];
-    candidate_units = units;
+    if (r > 1u) {
+        // The offsets' scan reads its total where shared stores follow before
+        // a barrier; read back past the pick-totals barrier, the row's units
+        // are every invocation's alike.
+        units = seismic_shared_u32[r <= CANDIDATE_INLINE_MAX ? candidate_first + r : CANDIDATE_UNITS];
+        candidate_units = units;
+    }
     const uint wanted = min(k, units);
     const uint fill = wanted > pooled ? wanted - pooled : 0u;
+    if (r > CANDIDATE_INLINE_MAX) {
+        // Publish span offsets into [10..10 + R] once every invocation has
+        // read the pick totals and CANDIDATE_UNITS from [8..24].
+        barrier();
+        if (thread < r)
+            seismic_shared_u32[candidate_first + thread] = span_before;
+        if (thread == 0u)
+            seismic_shared_u32[candidate_first + r] = units;
+    }
 
     // X: the gap of slot s (s <= valid) is the units between the previous
     // pick's block (or 0) and pick s's block (or, for s == valid, the row's
     // end); the F-th unpicked unit lies in the gap whose scan holds F.
+    uint x = 0u;
+    bool x_followed = false;
     if (fill > 0u) {
         const uint slots = valid + 1u;
         const uint share = (slots + CANDIDATE_THREADS - 1u) / CANDIDATE_THREADS;
@@ -188,21 +266,24 @@ void candidate_rows() {
         for (uint s = lo; s < hi; ++s)
             gaps += (s == valid ? units : candidate_first_unit(s)) - (s == 0u ? 0u : candidate_end_unit(s - 1u));
         seismic_rejoin();
+        uint total;
         uint before = reduce_group_exclusive_add(gaps, CANDIDATE_SCAN, total);
         for (uint s = lo; s < hi; ++s) {
             const uint first = s == 0u ? 0u : candidate_end_unit(s - 1u);
             const uint end = s == valid ? units : candidate_first_unit(s);
             if (before < fill && fill <= before + end - first) {
-                const uint x = first + (fill - before);
-                seismic_shared_u32[CANDIDATE_FILL] = x;
-                seismic_shared_u32[CANDIDATE_FILL + 1u] = x == end && s < valid && x < units ? 1u : 0u;
+                const uint fx = first + (fill - before);
+                seismic_shared_u32[CANDIDATE_FILL] = fx;
+                seismic_shared_u32[CANDIDATE_FILL + 1u] = fx == end && s < valid && fx < units ? 1u : 0u;
             }
             before += end - first;
         }
+        barrier();
+        x = seismic_shared_u32[CANDIDATE_FILL];
+        x_followed = seismic_shared_u32[CANDIDATE_FILL + 1u] != 0u;
+    } else if (r > CANDIDATE_INLINE_MAX) {
+        barrier();
     }
-    barrier();
-    const uint x = seismic_shared_u32[CANDIDATE_FILL];
-    const bool x_followed = seismic_shared_u32[CANDIDATE_FILL + 1u] != 0u;
 
     // This invocation's picks [lo, hi) and their ranges.
     const uint share = (valid + CANDIDATE_THREADS - 1u) / CANDIDATE_THREADS;

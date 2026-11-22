@@ -1,7 +1,7 @@
 // stream_collapse (contract and portable body in streams.seismic): one
 // workgroup per row, each invocation summing its columns' streams in stream
 // order, by the row's pre (P = 1, `streams_collapse`) or at weight 1 and
-// divided by S (P = 0, the mean, `streams_sum`). As CUDA's.
+// divided by S (P = 0, the mean, `streams_mean`). As CUDA's.
 #include <seismic/element.glsl>
 #include "lib/core/streams.glsl"
 
@@ -15,12 +15,7 @@ void stream_collapse() {
             SEISMIC_RESULT_0_STRIDE_1, uint(SEISMIC_DIM_S), uint(SEISMIC_DIM_H), gl_LocalInvocationIndex,
             gl_WorkGroupSize.x);
     } else {
-        streams_sum(hidden, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2, result, SEISMIC_RESULT_0_STRIDE_1,
+        streams_mean(hidden, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2, result, SEISMIC_RESULT_0_STRIDE_1,
             uint(SEISMIC_DIM_S), uint(SEISMIC_DIM_H), gl_LocalInvocationIndex, gl_WorkGroupSize.x);
-        // Each invocation divides the columns it wrote.
-        for (uint column = gl_LocalInvocationIndex; column < uint(SEISMIC_DIM_H); column += gl_WorkGroupSize.x) {
-            const uint64_t at = uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1;
-            out_put(result, at, seismic_div_rn(out_at(result, at), float(SEISMIC_DIM_S)));
-        }
     }
 }

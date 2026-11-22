@@ -1,28 +1,91 @@
-// vision_gated_convolution: one invocation per value (grid-stride), the taps
-// summed in tap order in F32 over the neighbours present, published to A,
-// then times the gate and published again.
+// vision_gated_convolution: four contiguous channels per grid-stride
+// iteration: the taps summed in tap order in F32 over the neighbours present
+// (hoisted once per quad), published to A, then times the gate and published
+// again.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 
 #define WEIGHT_KIND ELEMENT_OF(SEISMIC_WEIGHT)
 
+vec4 vision_gated_conv_load4(uint64_t base, uint64_t index) {
+    if (ACTIVATION_A == ELEMENT_F32)
+        return element_vec4_at(base + index * 4ul);
+    const uvec2 words = element_uvec2_at(base + index * 2ul);
+    return vec4(element_unpack2(ACTIVATION_A, words.x), element_unpack2(ACTIVATION_A, words.y));
+}
+
 void vision_gated_convolution() {
     const uint64_t columns = SEISMIC_DIM_H;
-    const uint64_t total = SEISMIC_DIM_M * columns;
-    for (seismic_walk at = seismic_walk_grid(total, u64vec3(1ul, 1ul, columns)); at.index < total; seismic_walk_next(at)) {
-        const uint64_t row = at.axes.x, channel = at.axes.w;
-        float sum = 0.0;
-        for (uint tap = 0u; tap < uint(SEISMIC_DIM_T); ++tap) {
-            const int source = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_NEIGHBORS)
-                + (row * SEISMIC_NEIGHBORS_STRIDE_0 + tap) * 4ul);
-            if (source >= 0)
-                sum = fma(element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_VALUE),
-                              uint64_t(source) * SEISMIC_VALUE_STRIDE_0 + channel),
-                    element_at(WEIGHT_KIND, SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), channel * SEISMIC_WEIGHT_STRIDE_0 + tap),
-                    sum);
+    const uint64_t vecs = (columns + 3ul) >> 2;
+    const uint64_t total = SEISMIC_DIM_M * vecs;
+    const uint64_t value_base = SEISMIC_PTR(SEISMIC_BUFFER_VALUE);
+    const uint64_t gate_base = SEISMIC_PTR(SEISMIC_BUFFER_GATE);
+    const uint64_t weight_base = SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT);
+    const uint64_t neighbors_base = SEISMIC_PTR(SEISMIC_BUFFER_NEIGHBORS);
+    const Out result = SEISMIC_RESULT_0_OUT;
+    const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ACTIVATION_A));
+    const uint64_t align_mask = act_bytes * 4ul - 1ul;
+    const bool unit_strides = SEISMIC_VALUE_STRIDE_1 == 1ul
+        && (value_base & align_mask) == 0ul
+        && (SEISMIC_VALUE_STRIDE_0 & 3ul) == 0ul
+        && SEISMIC_GATE_STRIDE_1 == 1ul
+        && SEISMIC_RESULT_0_STRIDE_1 == 1ul
+        && stored_aligned16(out_stored(result, 0ul));
+    for (seismic_walk at = seismic_walk_grid(total, u64vec3(1ul, 1ul, vecs)); at.index < total; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x;
+        const uint64_t col = at.axes.w << 2;
+        const uint64_t neighbors_row = row * SEISMIC_NEIGHBORS_STRIDE_0;
+        const uint64_t gate_row = row * SEISMIC_GATE_STRIDE_0;
+        const uint64_t out_row = row * SEISMIC_RESULT_0_STRIDE_0;
+        if (unit_strides && col + 4ul <= columns && ((gate_base + gate_row * act_bytes) & align_mask) == 0ul) {
+            vec4 sum = vec4(0.0);
+            for (uint tap = 0u; tap < uint(SEISMIC_DIM_T); ++tap) {
+                const int source = element_i32_at(neighbors_base
+                    + (neighbors_row + uint64_t(tap) * SEISMIC_NEIGHBORS_STRIDE_1) * 4ul);
+                if (source >= 0) {
+                    const vec4 vv = vision_gated_conv_load4(value_base, uint64_t(source) * SEISMIC_VALUE_STRIDE_0 + col);
+                    const uint64_t tap_offset = uint64_t(tap) * SEISMIC_WEIGHT_STRIDE_1;
+                    const vec4 wv = vec4(
+                        element_at(WEIGHT_KIND, weight_base, col * SEISMIC_WEIGHT_STRIDE_0 + tap_offset),
+                        element_at(WEIGHT_KIND, weight_base, (col + 1ul) * SEISMIC_WEIGHT_STRIDE_0 + tap_offset),
+                        element_at(WEIGHT_KIND, weight_base, (col + 2ul) * SEISMIC_WEIGHT_STRIDE_0 + tap_offset),
+                        element_at(WEIGHT_KIND, weight_base, (col + 3ul) * SEISMIC_WEIGHT_STRIDE_0 + tap_offset));
+                    sum = fma(vv, wv, sum);
+                }
+            }
+            const vec4 gv = vision_gated_conv_load4(gate_base, gate_row + col);
+            const vec4 out_v = vec4(
+                element_round(ACTIVATION_A, sum.x) * gv.x,
+                element_round(ACTIVATION_A, sum.y) * gv.y,
+                element_round(ACTIVATION_A, sum.z) * gv.z,
+                element_round(ACTIVATION_A, sum.w) * gv.w);
+            out_put2(result, out_row + col, out_v.x, out_v.y);
+            out_put2(result, out_row + col + 2ul, out_v.z, out_v.w);
+        } else {
+            const uint64_t limit = col + 4ul < columns ? col + 4ul : columns;
+            const uint count = uint(limit - col);
+            float sum[4] = float[4](0.0, 0.0, 0.0, 0.0);
+            for (uint tap = 0u; tap < uint(SEISMIC_DIM_T); ++tap) {
+                const int source = element_i32_at(neighbors_base
+                    + (neighbors_row + uint64_t(tap) * SEISMIC_NEIGHBORS_STRIDE_1) * 4ul);
+                if (source >= 0) {
+                    const uint64_t val_row = uint64_t(source) * SEISMIC_VALUE_STRIDE_0;
+                    const uint64_t tap_offset = uint64_t(tap) * SEISMIC_WEIGHT_STRIDE_1;
+                    for (uint k = 0u; k < count; ++k) {
+                        const uint64_t ch = col + uint64_t(k);
+                        sum[k] = fma(
+                            element_at(ACTIVATION_A, value_base, val_row + ch * SEISMIC_VALUE_STRIDE_1),
+                            element_at(WEIGHT_KIND, weight_base, ch * SEISMIC_WEIGHT_STRIDE_0 + tap_offset),
+                            sum[k]);
+                    }
+                }
+            }
+            for (uint k = 0u; k < count; ++k) {
+                const uint64_t ch = col + uint64_t(k);
+                const float convolved = element_round(ACTIVATION_A, sum[k]);
+                out_put(result, out_row + ch * SEISMIC_RESULT_0_STRIDE_1,
+                    convolved * element_at(ACTIVATION_A, gate_base, gate_row + ch * SEISMIC_GATE_STRIDE_1));
+            }
         }
-        const float convolved = element_round(ACTIVATION_A, sum);
-        out_put(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0 + channel,
-            convolved * element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_GATE), row * SEISMIC_GATE_STRIDE_0 + channel));
     }
 }

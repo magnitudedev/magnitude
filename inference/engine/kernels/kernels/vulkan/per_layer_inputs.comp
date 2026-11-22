@@ -20,9 +20,12 @@ void per_layer_inputs() {
     const uint64_t row = gl_WorkGroupID.y;
     // The workgroup is P rounded up to 64: where it is wider than the chunk,
     // an invocation past the chunk adds nothing to the square sum and stores
-    // nothing. The column reaches the sum, so it is `SEISMIC_THREAD`.
+    // nothing. The column reaches the sum, so it is `SEISMIC_THREAD`. Since
+    // P is a multiple of 32, every 32-lane logical subgroup is either wholly
+    // inside the chunk or wholly past it, and maps 1-to-1 to one 32-element
+    // packet of the gathered row.
     const uint i = SEISMIC_THREAD;
-    const bool held = gl_WorkGroupSize.x == chunk || i < chunk;
+    const bool held = gl_WorkGroupSize.x == chunk || SEISMIC_SUBGROUP * 32u < chunk;
     const uint column = gl_WorkGroupID.x * chunk + i;
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
     const float gathered_scale = element_word_f32(SEISMIC_PARAM_GATHERED_SCALE);
@@ -33,13 +36,28 @@ void per_layer_inputs() {
             + (row * SEISMIC_PROJECTED_STRIDE_0 + uint64_t(column) * SEISMIC_PROJECTED_STRIDE_1) * 4ul) * projected_scale
         : 0.0;
     const float total = reduce_group_sum(p * p, 0u);
-    if (!held)
+    bool live;
+    if (!seismic_steer(live, held))
         return;
     const float inverse = inversesqrt(seismic_div_rn(total, float(chunk)) + epsilon);
     const packets_rows16 geometry = PACKETS_W0_ROWS;
-    const packets_packet packet = packets_load(PACKETS_W0,
-        packets_row(SEISMIC_PTR(SEISMIC_BUFFER_GATHERED), geometry, row), geometry, column / 32u, width);
-    const float token = packets_value_at(PACKETS_W0, packet, column % 32u);
+    // Cooperatively decode the subgroup's 32-element packet across lanes 0..3
+    // (one 8-element sub-step each) and distribute the 32 values via shuffle.
+    vec4 even = vec4(0.0), odd = vec4(0.0);
+    if (live && SEISMIC_LANE < 4u) {
+        const packets_packet packet = packets_load(PACKETS_W0,
+            packets_row(SEISMIC_PTR(SEISMIC_BUFFER_GATHERED), geometry, row), geometry,
+            gl_WorkGroupID.x * (chunk >> 5u) + SEISMIC_SUBGROUP, width);
+        packets_exact_values(PACKETS_W0, packet, SEISMIC_LANE, even, odd);
+    }
+    const uint src = SEISMIC_LANE >> 3u;
+    const vec4 e = seismic_shuffle(even, src);
+    const vec4 o = seismic_shuffle(odd, src);
+    if (!live)
+        return;
+    const vec4 vec = (SEISMIC_LANE & 1u) != 0u ? o : e;
+    const vec2 lo_hi = (SEISMIC_LANE & 4u) != 0u ? vec.zw : vec.xy;
+    const float token = (SEISMIC_LANE & 2u) != 0u ? lo_hi.y : lo_hi.x;
     const float normalized = p * inverse * element_at(INPUTS_NORM, SEISMIC_PTR(SEISMIC_BUFFER_NORM),
         uint64_t(i) * SEISMIC_NORM_STRIDE_0);
     out_put(SEISMIC_RESULT_0_OUT,

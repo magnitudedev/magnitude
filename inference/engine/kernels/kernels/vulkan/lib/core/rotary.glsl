@@ -93,9 +93,18 @@ rotary_turns rotary_lane_turns(uint64_t coordinates, uint64_t coordinate_stride,
     }
     if (p == 0u || !rotary_rotated(lane * LANE_E, p, first))
         return t;
-    [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-        rotary_turn(coordinates, coordinate_stride, components, component_stride, frequencies, frequency_stride,
-            amplitudes, amplitude_stride, rotary_pair(lane * LANE_E + i, p, first, adjacent), t.cosine[i], t.sine[i]);
+    if (adjacent && LANE_E > 1u && (LANE_E & 1u) == 0u) {
+        [[unroll]] for (uint i = 0u; i + 1u < LANE_E; i += 2u) {
+            rotary_turn(coordinates, coordinate_stride, components, component_stride, frequencies, frequency_stride,
+                amplitudes, amplitude_stride, rotary_pair(lane * LANE_E + i, p, first, true), t.cosine[i], t.sine[i]);
+            t.cosine[i + 1u] = t.cosine[i];
+            t.sine[i + 1u] = t.sine[i];
+        }
+    } else {
+        [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
+            rotary_turn(coordinates, coordinate_stride, components, component_stride, frequencies, frequency_stride,
+                amplitudes, amplitude_stride, rotary_pair(lane * LANE_E + i, p, first, adjacent), t.cosine[i], t.sine[i]);
+    }
     return t;
 }
 
@@ -107,15 +116,23 @@ void rotary_lane_rotate(inout float x[LANE_E], rotary_turns t, rotary_layout pai
     if (p == 0u)
         return;
     const bool turned = rotary_rotated(lane * LANE_E, p, first);
-    float other[LANE_E];
-    if (adjacent && LANE_E > 1u) {
-        [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-            other[i] = x[i ^ 1u];
-    } else {
-        const uint partner_lane = turned ? rotary_partner(lane * LANE_E, p, first, adjacent) / LANE_E : lane;
-        [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-            other[i] = seismic_shuffle(x[i], partner_lane);
+    if (adjacent && LANE_E > 1u && (LANE_E & 1u) == 0u) {
+        if (!turned)
+            return;
+        [[unroll]] for (uint i = 0u; i + 1u < LANE_E; i += 2u) {
+            const float a = x[i];
+            const float b = x[i + 1u];
+            const float c = t.cosine[i];
+            const float s = t.sine[i];
+            x[i] = a * c - b * s;
+            x[i + 1u] = b * c + a * s;
+        }
+        return;
     }
+    float other[LANE_E];
+    const uint partner_lane = turned ? rotary_partner(lane * LANE_E, p, first, adjacent) / LANE_E : lane;
+    [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
+        other[i] = seismic_shuffle(x[i], partner_lane);
     if (!turned)
         return;
     [[unroll]] for (uint i = 0u; i < LANE_E; ++i)

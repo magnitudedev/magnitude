@@ -1,7 +1,7 @@
 // Read directory-selected slots, rows16 rows of the table's resident
-// representation, through the packet decoders, a thread per value, and round
-// once to the activation element. Slot s is row s % P of record s / P, read
-// where its storage holds the record (`records (slots)`).
+// representation, through the packet decoders, a subgroup per 32-value packet,
+// and round once to the activation element. Slot s is row s % P of record
+// s / P, read where its storage holds the record (`records (slots)`).
 #define KERNEL_A SEISMIC_ELEMENT_A
 #define KERNEL_W0 SEISMIC_SLOTS
 #include "lib/core/activation.glsl"
@@ -14,26 +14,40 @@ void stored_rows() {
     const uint64_t tokens = SEISMIC_PTR(SEISMIC_BUFFER_TOKENS);
     const Out rows = SEISMIC_RESULT_0_OUT;
     const uint width = uint(SEISMIC_DIM_W);
-    const uint column = gl_WorkGroupID.y * 256u + gl_LocalInvocationID.x;
-    if (column >= width)
+    const uint packet_idx = gl_WorkGroupID.y * 8u + SEISMIC_SUBGROUP;
+    bool live;
+    if (!seismic_steer(live, packet_idx * 32u < width))
         return;
+    const uint column = gl_WorkGroupID.y * 256u + SEISMIC_THREAD;
     const packets_rows16 geometry = PACKETS_W0_ROWS;
+    const uint64_t per = uint64_t(SEISMIC_DIM_P);
+    const uint src_lane = SEISMIC_LANE >> 3u;
+    const uint lane_slot = (SEISMIC_LANE & 7u) >> 1u;
+    const bool lane_odd = (SEISMIC_LANE & 1u) != 0u;
     for (uint64_t row = gl_WorkGroupID.x; row < SEISMIC_DIM_M; row += gl_NumWorkGroups.x) {
         const int64_t held = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
             SEISMIC_DIM_R, SEISMIC_DIM_F, element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0));
         const uint64_t at = row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1;
-        // A row without a slot reads zeros.
+        // A row without a slot reads zeros (uniform across the workgroup).
         if (held < 0l) {
-            out_put(rows, at, 0.0);
+            if (live && column < width)
+                out_put(rows, at, 0.0);
             continue;
         }
-        const uint64_t per = uint64_t(SEISMIC_DIM_P);
-        // A slot is a nonnegative i32.
-        uint64_t record_at, slot_at;
-        seismic_split(uint(held), per, record_at, slot_at);
-        const uint64_t record = slab_region(slots, record_at);
-        const packets_packet packet = packets_load(PACKETS_W0, packets_row(record, geometry, slot_at),
-            geometry, column / 32u, width);
-        out_put(rows, at, packets_value_at(PACKETS_W0, packet, column % 32u));
+        vec4 even = vec4(0.0);
+        vec4 odd = vec4(0.0);
+        if (live && SEISMIC_LANE < 4u) {
+            // A slot is a nonnegative i32.
+            uint64_t record_at, slot_at;
+            seismic_split(uint(held), per, record_at, slot_at);
+            const uint64_t record = slab_region(slots, record_at);
+            const packets_packet packet = packets_load(PACKETS_W0, packets_row(record, geometry, slot_at),
+                geometry, packet_idx, width);
+            packets_exact_values(PACKETS_W0, packet, SEISMIC_LANE, even, odd);
+        }
+        const vec4 e = seismic_shuffle(even, src_lane);
+        const vec4 o = seismic_shuffle(odd, src_lane);
+        if (live && column < width)
+            out_put(rows, at, lane_odd ? o[lane_slot] : e[lane_slot]);
     }
 }

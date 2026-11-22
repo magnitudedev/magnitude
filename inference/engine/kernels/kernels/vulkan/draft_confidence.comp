@@ -6,6 +6,42 @@
 #include "lib/core/activation.glsl"
 #include "lib/core/reduce.glsl"
 
+// Accumulate weight · act over `count` elements into four independent lanes.
+// Contiguous, aligned slices take 4-element vector loads with an exact scalar
+// tail; strided or unaligned slices fall back to scalar loads.
+void draft_confidence_dot(uint64_t act_base, uint64_t act_stride, uint64_t w_base, uint64_t w_stride,
+    uint64_t count, inout vec4 acc) {
+    const uint64_t act_align_mask = ACTIVATION_A == ELEMENT_F32 ? 15ul : 7ul;
+    const uint64_t step = uint64_t(gl_WorkGroupSize.x);
+    const uint64_t thread = uint64_t(SEISMIC_THREAD);
+    if (act_stride == 1ul && w_stride == 1ul && (act_base & act_align_mask) == 0ul && (w_base & 15ul) == 0ul) {
+        const uint64_t vec_count = count >> 2;
+        const uint64_t tail_start = vec_count << 2;
+        seismic_strided(uint64_t, v, thread, vec_count, step) {
+            const uint64_t elem = v << 2;
+            vec4 a;
+            if (ACTIVATION_A == ELEMENT_F32) {
+                a = element_vec4_at(act_base + elem * 4ul);
+            } else {
+                const uvec2 raw = element_uvec2_at(act_base + elem * 2ul);
+                a = vec4(element_unpack2(ACTIVATION_A, raw.x), element_unpack2(ACTIVATION_A, raw.y));
+            }
+            const vec4 w = element_vec4_at(w_base + elem * 4ul);
+            acc.x = seismic_fma_rn(a.x, w.x, acc.x);
+            acc.y = seismic_fma_rn(a.y, w.y, acc.y);
+            acc.z = seismic_fma_rn(a.z, w.z, acc.z);
+            acc.w = seismic_fma_rn(a.w, w.w, acc.w);
+        }
+        seismic_strided_from(uint64_t, i, tail_start, thread, count, step)
+            acc.x = seismic_fma_rn(element_at(ACTIVATION_A, act_base, i), element_f32_at(w_base + i * 4ul), acc.x);
+    } else {
+        seismic_strided(uint64_t, i, thread, count, step)
+            acc.x = seismic_fma_rn(
+                element_at(ACTIVATION_A, act_base, i * act_stride),
+                element_f32_at(w_base + i * w_stride * 4ul), acc.x);
+    }
+}
+
 // Shared: one partial per subgroup (reduce_group_sum at float 0).
 void draft_confidence() {
     const uint64_t features = SEISMIC_PTR(SEISMIC_BUFFER_FEATURES);
@@ -14,18 +50,16 @@ void draft_confidence() {
     const uint64_t selection = SEISMIC_PTR(SEISMIC_BUFFER_SELECTION);
     const uint64_t row = gl_WorkGroupID.x;
     const uint64_t width = SEISMIC_DIM_D, rank = SEISMIC_DIM_R;
+    const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ACTIVATION_A));
     // Numbered by `SEISMIC_THREAD`: the partials reach the reduction.
-    float partial = 0.0;
-    seismic_strided(uint64_t, i, uint64_t(SEISMIC_THREAD), width, gl_WorkGroupSize.x)
-        partial = seismic_fma_rn(
-            element_at(ACTIVATION_A, features, row * SEISMIC_FEATURES_STRIDE_0 + i * SEISMIC_FEATURES_STRIDE_1),
-            element_f32_at(weight + i * SEISMIC_WEIGHT_STRIDE_0 * 4ul), partial);
-    seismic_strided(uint64_t, i, uint64_t(SEISMIC_THREAD), rank, gl_WorkGroupSize.x)
-        partial = seismic_fma_rn(
-            element_at(ACTIVATION_A, memory, row * SEISMIC_MEMORY_STRIDE_0 + i * SEISMIC_MEMORY_STRIDE_1),
-            element_f32_at(weight + (width + i) * SEISMIC_WEIGHT_STRIDE_0 * 4ul), partial);
+    vec4 acc = vec4(0.0);
+    draft_confidence_dot(features + row * SEISMIC_FEATURES_STRIDE_0 * act_bytes, SEISMIC_FEATURES_STRIDE_1,
+        weight, SEISMIC_WEIGHT_STRIDE_0, width, acc);
+    draft_confidence_dot(memory + row * SEISMIC_MEMORY_STRIDE_0 * act_bytes, SEISMIC_MEMORY_STRIDE_1,
+        weight + width * SEISMIC_WEIGHT_STRIDE_0 * 4ul, SEISMIC_WEIGHT_STRIDE_0, rank, acc);
+    const float partial = (acc.x + acc.y) + (acc.z + acc.w);
     const float score = reduce_group_sum(partial, 0u) + element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_BIAS));
     if (gl_LocalInvocationIndex == 0u
-        && 1.0 / (1.0 + exp(-score)) < element_word_f32(SEISMIC_PARAM_THRESHOLD))
+        && seismic_div_rn(1.0, 1.0 + exp(-score)) < element_word_f32(SEISMIC_PARAM_THRESHOLD))
         element_i32_put(selection + (row * SEISMIC_SELECTION_STRIDE_0 + SEISMIC_SELECTION_STRIDE_1) * 4ul, 3);
 }

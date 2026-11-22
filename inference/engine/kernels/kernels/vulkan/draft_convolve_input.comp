@@ -1,9 +1,23 @@
 // draft_convolve_input: DFlash2's half-0 grouped dynamic causal convolution of
-// a sublayer's normed input rows within each draft block; one invocation per
-// output element over a grid-stride loop, summing its taps in offset order.
-// The Vulkan form of `metal/draft_convolve_input.metal`.
+// a sublayer's normed input rows within each draft block; 4-wide vectorized
+// over unit-stride aligned spans with `dynamic` hoisted per 4-channel group,
+// falling back to a scalar grid-stride walk. The Vulkan form of
+// `metal/draft_convolve_input.metal`.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
+
+bool convolve_input_aligned4(uint64_t base) {
+    return (base & (ACTIVATION_A == ELEMENT_F32 ? 15ul : 7ul)) == 0ul;
+}
+
+vec4 convolve_input_load4(uint64_t base, uint64_t index) {
+    if (ACTIVATION_A == ELEMENT_F32) {
+        return element_vec4_at(base + index * 4ul);
+    } else {
+        const uvec2 words = element_uvec2_at(base + index * 2ul);
+        return vec4(element_unpack2(ACTIVATION_A, words.x), element_unpack2(ACTIVATION_A, words.y));
+    }
+}
 
 void draft_convolve_input() {
     const uint64_t normed = SEISMIC_PTR(SEISMIC_BUFFER_INPUT);
@@ -12,6 +26,56 @@ void draft_convolve_input() {
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t channels = SEISMIC_DIM_C, width = SEISMIC_DIM_G * channels;
     const uint64_t count = SEISMIC_DIM_M * width;
+    if (count == 0ul)
+        return;
+
+    const uint64_t vec_count = count >> 2;
+    const bool vec_ok = (channels & 3ul) == 0ul
+        && vec_count <= uint64_t(0x7fffffffu)
+        && SEISMIC_INPUT_STRIDE_1 == 1ul
+        && SEISMIC_BASE_STRIDE_2 == 1ul
+        && SEISMIC_RESULT_0_STRIDE_1 == 1ul
+        && (base & 15ul) == 0ul
+        && (SEISMIC_BASE_STRIDE_1 & 3ul) == 0ul
+        && convolve_input_aligned4(normed)
+        && (SEISMIC_INPUT_STRIDE_0 & 3ul) == 0ul;
+
+    if (vec_ok) {
+        const uint vc32 = uint(vec_count);
+        const uint w4 = uint(width >> 2);
+        const uint c4 = uint(channels >> 2);
+        const uint block = uint(SEISMIC_PARAM_BLOCK);
+        const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+        for (uint idx = gl_GlobalInvocationID.x; idx < vc32; idx += stride) {
+            const uint row32 = idx / w4;
+            const uint col4 = idx - row32 * w4;
+            const uint group32 = col4 / c4;
+            const uint position = row32 % block;
+            const uint64_t row = uint64_t(row32);
+            const uint64_t column = uint64_t(col4) << 2;
+            const uint64_t dyn_rg = dynamic + (row * SEISMIC_DYNAMIC_STRIDE_0
+                + uint64_t(group32) * SEISMIC_DYNAMIC_STRIDE_3) * 4ul;
+            const uint64_t base_col = base + column * 4ul;
+            const uint64_t taps = min(SEISMIC_DIM_K, uint64_t(position) + 1ul);
+            vec4 sum = vec4(0.0);
+            for (uint64_t offset = 0ul; offset < taps; ++offset) {
+                const float dyn = element_f32_at(dyn_rg + offset * SEISMIC_DYNAMIC_STRIDE_2 * 4ul);
+                const vec4 b = element_vec4_at(base_col + offset * SEISMIC_BASE_STRIDE_1 * 4ul);
+                const vec4 inp = convolve_input_load4(normed, (row - offset) * SEISMIC_INPUT_STRIDE_0 + column);
+                const vec4 coeff = b + dyn;
+                sum = vec4(
+                    seismic_fma_rn(coeff.x, inp.x, sum.x),
+                    seismic_fma_rn(coeff.y, inp.y, sum.y),
+                    seismic_fma_rn(coeff.z, inp.z, sum.z),
+                    seismic_fma_rn(coeff.w, inp.w, sum.w));
+            }
+            const uint64_t out_idx = row * SEISMIC_RESULT_0_STRIDE_0 + column;
+            out_put2(result, out_idx, sum.x, sum.y);
+            out_put2(result, out_idx + 2ul, sum.z, sum.w);
+        }
+        return;
+    }
+
     // Rows in blocks of SEISMIC_PARAM_BLOCK, a row's width in groups of channels.
     for (seismic_walk at = seismic_walk_grid(count, u64vec3(uint64_t(SEISMIC_PARAM_BLOCK), SEISMIC_DIM_G, channels));
             at.index < count; seismic_walk_next(at)) {

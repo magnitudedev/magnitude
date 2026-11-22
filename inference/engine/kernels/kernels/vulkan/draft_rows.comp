@@ -25,17 +25,23 @@
 #define DRAFT_CONDITION ELEMENT_OF(SEISMIC_CONDITIONING)
 #define DRAFT_ROWS_PER_SUBGROUP 4u
 
-// Sum of one value per invocation in a fixed order: subgroup sums, then the
-// subgroup partials (at float `partials`) in index order.
-float draft_sum(float value, uint partials) {
-    value = seismic_subgroup_sum_f32(value);
-    if (SEISMIC_LANE == 0u)
-        seismic_shared_f32[partials + SEISMIC_SUBGROUP] = value;
+// Fixed-order workgroup sums of two values in one barrier: subgroup sums,
+// then the subgroup partials at `partials` and `partials + SEISMIC_SUBGROUPS`
+// in index order.
+void draft_sum2(float a, float b, uint partials, out float total_a, out float total_b) {
+    a = seismic_subgroup_sum_f32(a);
+    b = seismic_subgroup_sum_f32(b);
+    if (SEISMIC_LANE == 0u) {
+        seismic_shared_f32[partials + SEISMIC_SUBGROUP] = a;
+        seismic_shared_f32[partials + SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP] = b;
+    }
     barrier();
-    float total = 0.0;
-    for (uint j = 0u; j < SEISMIC_SUBGROUPS; ++j)
-        total += seismic_shared_f32[partials + j];
-    return total;
+    total_a = 0.0;
+    total_b = 0.0;
+    for (uint j = 0u; j < SEISMIC_SUBGROUPS; ++j) {
+        total_a += seismic_shared_f32[partials + j];
+        total_b += seismic_shared_f32[partials + SEISMIC_SUBGROUPS + j];
+    }
 }
 
 void draft_rows() {
@@ -82,27 +88,43 @@ void draft_rows() {
             }
         }
     }
-    // The conditioning row (already A) and its sum of squares.
+    // The conditioning row and its sum of squares. Where conditioning is
+    // 16-bit, cache the raw words in the upper half of the joined shared row
+    // so the normalization pass does not re-read conditioning from DRAM.
     const uint64_t conditioning = SEISMIC_PTR(SEISMIC_BUFFER_CONDITIONING);
     float hidden_squares = 0.0;
     for (uint base = 0u; base < width; base += threads) {
         const uint column = base + thread;
         if (column < width) {
-            const float value = element_at(DRAFT_CONDITION, conditioning, row * SEISMIC_CONDITIONING_STRIDE_0
-                + (stream * width + column) * SEISMIC_CONDITIONING_STRIDE_1);
+            const uint64_t at = row * SEISMIC_CONDITIONING_STRIDE_0
+                + (stream * width + column) * SEISMIC_CONDITIONING_STRIDE_1;
+#if ELEMENT_KIND(SEISMIC_CONDITIONING) != ELEMENT_F32
+            const uint raw = element_u16_at(conditioning + at * 2ul);
+            seismic_shared_u16[width + column] = uint16_t(raw);
+            const float value = element_load(DRAFT_CONDITION, raw);
+#else
+            const float value = element_at(DRAFT_CONDITION, conditioning, at);
+#endif
             hidden_squares = seismic_fma_rn(value, value, hidden_squares);
         }
     }
-    const float embedding_inverse = inversesqrt(seismic_div_rn(draft_sum(embedding_squares, partials), float(width)) + epsilon);
-    const float hidden_inverse = inversesqrt(seismic_div_rn(draft_sum(hidden_squares, partials + 8u), float(width)) + epsilon);
-    // Both sums' barriers ordered every joined write before these reads.
+    float total_embedding, total_hidden;
+    draft_sum2(embedding_squares, hidden_squares, partials, total_embedding, total_hidden);
+    const float embedding_inverse = inversesqrt(seismic_div_rn(total_embedding, float(width)) + epsilon);
+    const float hidden_inverse = inversesqrt(seismic_div_rn(total_hidden, float(width)) + epsilon);
+    // The fused sum's barrier ordered every shared write before these reads.
     const uint64_t embedding_norm = SEISMIC_PTR(SEISMIC_BUFFER_EMBEDDING_NORM);
     const uint64_t hidden_norm = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN_NORM);
     for (uint column = thread; column < width; column += threads) {
         const float embedded = element_load(DRAFT_ACT, uint(seismic_shared_u16[column])) * embedding_inverse
             * element_at(DRAFT_EMBEDDING_NORM, embedding_norm, uint64_t(column) * SEISMIC_EMBEDDING_NORM_STRIDE_0);
-        const float hidden = element_at(DRAFT_CONDITION, conditioning, row * SEISMIC_CONDITIONING_STRIDE_0
-            + (stream * width + column) * SEISMIC_CONDITIONING_STRIDE_1) * hidden_inverse
+#if ELEMENT_KIND(SEISMIC_CONDITIONING) != ELEMENT_F32
+        const float raw_hidden = element_load(DRAFT_CONDITION, uint(seismic_shared_u16[width + column]));
+#else
+        const float raw_hidden = element_at(DRAFT_CONDITION, conditioning, row * SEISMIC_CONDITIONING_STRIDE_0
+            + (stream * width + column) * SEISMIC_CONDITIONING_STRIDE_1);
+#endif
+        const float hidden = raw_hidden * hidden_inverse
             * element_at(DRAFT_HIDDEN_NORM, hidden_norm, (stream * width + column) * SEISMIC_HIDDEN_NORM_STRIDE_0);
         seismic_shared_u16[column] = uint16_t(element_store(DRAFT_ACT, embedded));
         seismic_shared_u16[width + column] = uint16_t(element_store(DRAFT_ACT, hidden));
@@ -110,41 +132,86 @@ void draft_rows() {
     barrier();
 
     // Four combine rows per subgroup; lanes own packets of the 2D inputs.
+    // Each 8-element shared input step is loaded and unpacked once (128-bit
+    // uvec4 for full steps, 32-bit pairs for a trailing partial step since
+    // `inputs = 2 * width` is always even) and dotted against all 4 combine
+    // rows simultaneously in registers.
     const uint inputs = 2u * width;
     const packets_rows16 combine_geometry = PACKETS_W1_ROWS;
     const uint64_t combine = SEISMIC_PTR(SEISMIC_BUFFER_COMBINE);
     const uint outputs_per_group = SEISMIC_SUBGROUPS * DRAFT_ROWS_PER_SUBGROUP;
     const Out result = SEISMIC_RESULT_0_OUT;
-    // The rows are steered while a logical subgroup holds a feature (two share
-    // a 64-lane hardware subgroup); a logical subgroup past the features
-    // computes nothing. The lanes' packet rounds are every lane's, one past
-    // the inputs adding nothing.
+    // Steer while a logical subgroup holds at least one feature (two share a
+    // 64-lane hardware subgroup); an inactive logical subgroup computes and
+    // stores nothing while still participating in the subgroup reductions.
     const uint first_feature = gl_WorkGroupID.x * outputs_per_group + SEISMIC_SUBGROUP * DRAFT_ROWS_PER_SUBGROUP;
-    bool held_feature;
-    for (uint r = 0u; seismic_steer(held_feature, r < DRAFT_ROWS_PER_SUBGROUP && first_feature + r < width); ++r) {
-        const uint feature = first_feature + r;
-        const uint64_t weight_row = packets_row(combine, combine_geometry, uint64_t(feature));
-        float sum = 0.0;
+    bool held_any;
+    if (seismic_steer(held_any, first_feature < width)) {
+        const uint rows_held = held_any ? min(DRAFT_ROWS_PER_SUBGROUP, width - first_feature) : 0u;
+        uint64_t weight_rows[DRAFT_ROWS_PER_SUBGROUP];
+        float sums[DRAFT_ROWS_PER_SUBGROUP];
+        [[unroll]] for (uint r = 0u; r < DRAFT_ROWS_PER_SUBGROUP; ++r) {
+            weight_rows[r] = packets_row(combine, combine_geometry, uint64_t(first_feature + r));
+            sums[r] = 0.0;
+        }
         for (uint base = 0u; base * 32u < inputs; base += 32u) {
             const uint p = base + SEISMIC_LANE;
-            if (held_feature && p * 32u < inputs) {
-                const packets_packet packet = packets_load(PACKETS_W1, weight_row, combine_geometry, p, inputs);
+            if (held_any && p * 32u < inputs) {
+                packets_packet pkts[DRAFT_ROWS_PER_SUBGROUP];
+                [[unroll]] for (uint r = 0u; r < DRAFT_ROWS_PER_SUBGROUP; ++r) {
+                    if (r < rows_held)
+                        pkts[r] = packets_load(PACKETS_W1, weight_rows[r], combine_geometry, p, inputs);
+                }
                 [[unroll]] for (uint step = 0u; step < 4u; ++step) {
-                    vec4 even, odd;
-                    packets_values(PACKETS_W1, packet, step, even, odd);
-                    [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                        const uint column = 32u * p + 8u * step + i;
-                        if (column < inputs) {
-                            sum = seismic_fma_rn((i & 1u) != 0u ? odd[i >> 1] : even[i >> 1],
-                                element_load(DRAFT_ACT, uint(seismic_shared_u16[column])), sum);
+                    const uint step_base = 32u * p + 8u * step;
+                    if (step_base + 8u <= inputs) {
+                        vec4 x_even, x_odd;
+                        element_split8(DRAFT_ACT, seismic_shared_uvec4[step_base >> 3], x_even, x_odd);
+                        [[unroll]] for (uint r = 0u; r < DRAFT_ROWS_PER_SUBGROUP; ++r) {
+                            if (r < rows_held) {
+                                vec4 w_even, w_odd;
+                                packets_values(PACKETS_W1, pkts[r], step, w_even, w_odd);
+                                sums[r] = seismic_fma_rn(w_even.x, x_even.x, sums[r]);
+                                sums[r] = seismic_fma_rn(w_odd.x, x_odd.x, sums[r]);
+                                sums[r] = seismic_fma_rn(w_even.y, x_even.y, sums[r]);
+                                sums[r] = seismic_fma_rn(w_odd.y, x_odd.y, sums[r]);
+                                sums[r] = seismic_fma_rn(w_even.z, x_even.z, sums[r]);
+                                sums[r] = seismic_fma_rn(w_odd.z, x_odd.z, sums[r]);
+                                sums[r] = seismic_fma_rn(w_even.w, x_even.w, sums[r]);
+                                sums[r] = seismic_fma_rn(w_odd.w, x_odd.w, sums[r]);
+                            }
+                        }
+                    } else if (step_base < inputs) {
+                        vec4 x_even = vec4(0.0), x_odd = vec4(0.0);
+                        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                            const uint column = step_base + 2u * k;
+                            if (column < inputs) {
+                                const vec2 pair = element_unpack2(DRAFT_ACT, seismic_shared_u32[column >> 1]);
+                                x_even[k] = pair.x;
+                                x_odd[k] = pair.y;
+                            }
+                        }
+                        [[unroll]] for (uint r = 0u; r < DRAFT_ROWS_PER_SUBGROUP; ++r) {
+                            if (r < rows_held) {
+                                vec4 w_even, w_odd;
+                                packets_values(PACKETS_W1, pkts[r], step, w_even, w_odd);
+                                [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                                    if (step_base + 2u * k < inputs) {
+                                        sums[r] = seismic_fma_rn(w_even[k], x_even[k], sums[r]);
+                                        sums[r] = seismic_fma_rn(w_odd[k], x_odd[k], sums[r]);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        sum = seismic_subgroup_sum_f32(sum);
-        if (held_feature && SEISMIC_LANE == 0u)
-            out_put(result, row * SEISMIC_RESULT_0_STRIDE_0 + (stream * width + feature) * SEISMIC_RESULT_0_STRIDE_1,
-                sum);
+        [[unroll]] for (uint r = 0u; r < DRAFT_ROWS_PER_SUBGROUP; ++r) {
+            sums[r] = seismic_subgroup_sum_f32(sums[r]);
+            if (r < rows_held && SEISMIC_LANE == 0u)
+                out_put(result, row * SEISMIC_RESULT_0_STRIDE_0
+                    + (stream * width + first_feature + r) * SEISMIC_RESULT_0_STRIDE_1, sums[r]);
+        }
     }
 }

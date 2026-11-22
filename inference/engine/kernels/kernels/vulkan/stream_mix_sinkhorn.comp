@@ -63,11 +63,12 @@ void sinkhorn_slice(const bool tiled) {
     // subgroup sums.
     const uint thread = SEISMIC_THREAD;
     const uint subgroup = SEISMIC_SUBGROUP, lane = SEISMIC_LANE;
-    const uint h = uint(SEISMIC_DIM_H), width = SINKHORN_STREAMS * h, split = uint(SEISMIC_CONST_SINKHORN_SPLIT);
+    const uint h = uint(SEISMIC_DIM_H), width = SINKHORN_STREAMS * h, split = uint(SEISMIC_TUNE_SPLIT);
     const uint rows = uint(SEISMIC_DIM_M), row0 = gl_WorkGroupID.y * tile_rows;
     const uint span = (width + split - 1u) / split;
     const uint first = gl_WorkGroupID.x * span, last = min(first + span, width);
     const uint64_t hidden = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN);
+    const uint64_t func = SEISMIC_PTR(SEISMIC_BUFFER_FUNCTION);
     const uint64_t partials = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS);
     uint64_t x[SINKHORN_PER];
     bool live[SINKHORN_PER];
@@ -80,33 +81,151 @@ void sinkhorn_slice(const bool tiled) {
             sums[r][j] = 0.0;
     }
     if (!tiled) {
-        seismic_strided_from(uint, at, first, thread, last, pass) {
-            const uint stream = at / h, column = at % h;
-            const float v = element_f32_at(x[0] + (uint64_t(stream) * SEISMIC_HIDDEN_STRIDE_1
-                + uint64_t(column) * SEISMIC_HIDDEN_STRIDE_2) * 4ul);
-            sums[0][0] = seismic_fma_rn(v, v, sums[0][0]);
-            [[unroll]] for (uint j = 0u; j < SINKHORN_MIXES; ++j)
-                sums[0][1u + j] = seismic_fma_rn(sinkhorn_function(j, at), v, sums[0][1u + j]);
+        const bool unit_strided = SEISMIC_HIDDEN_STRIDE_2 == 1ul && SEISMIC_FUNCTION_STRIDE_1 == 1ul
+            && (SEISMIC_FUNCTION_STRIDE_0 & 3ul) == 0ul;
+        for (uint s = 0u; s < SINKHORN_STREAMS; ++s) {
+            const uint s_begin = s * h;
+            const uint s_end = s_begin + h;
+            const uint lo = max(first, s_begin);
+            const uint hi = min(last, s_end);
+            if (lo >= hi)
+                continue;
+            const uint col_lo = lo - s_begin;
+            const uint col_hi = hi - s_begin;
+            const uint64_t xs = x[0] + uint64_t(s) * SEISMIC_HIDDEN_STRIDE_1 * 4ul;
+#define SINKHORN_DECODE_SCALAR(COL)                                                                    \
+    {                                                                                                  \
+        const uint at = s_begin + (COL);                                                               \
+        const float v = element_f32_at(xs + uint64_t(COL) * SEISMIC_HIDDEN_STRIDE_2 * 4ul);            \
+        sums[0][0] = seismic_fma_rn(v, v, sums[0][0]);                                                 \
+        [[unroll]] for (uint j = 0u; j < SINKHORN_MIXES; ++j)                                          \
+            sums[0][1u + j] = seismic_fma_rn(sinkhorn_function(j, at), v, sums[0][1u + j]);            \
+    }
+            const uint64_t x_addr = xs + uint64_t(col_lo) * 4ul;
+            const uint64_t f_addr = func + uint64_t(lo) * 4ul;
+            if (unit_strided && ((x_addr & 15ul) == (f_addr & 15ul)) && ((x_addr & 3ul) == 0ul)) {
+                const uint mis = uint((x_addr >> 2ul) & 3ul);
+                const uint head = (4u - mis) & 3u;
+                const uint vec_lo = min(col_lo + head, col_hi);
+                const uint vec_hi = vec_lo + ((col_hi - vec_lo) & ~3u);
+                seismic_strided_from(uint, col, col_lo, thread, vec_lo, pass)
+                    SINKHORN_DECODE_SCALAR(col)
+                seismic_strided_from(uint, col, vec_lo, thread * 4u, vec_hi, pass * 4u) {
+                    const vec4 v = element_vec4_at(xs + uint64_t(col) * 4ul);
+                    sums[0][0] = seismic_fma_rn(v.x, v.x, sums[0][0]);
+                    sums[0][0] = seismic_fma_rn(v.y, v.y, sums[0][0]);
+                    sums[0][0] = seismic_fma_rn(v.z, v.z, sums[0][0]);
+                    sums[0][0] = seismic_fma_rn(v.w, v.w, sums[0][0]);
+                    const uint64_t at_bytes = uint64_t(s_begin + col) * 4ul;
+                    [[unroll]] for (uint j = 0u; j < SINKHORN_MIXES; ++j) {
+                        const vec4 fj = element_vec4_at(func + uint64_t(j) * SEISMIC_FUNCTION_STRIDE_0 * 4ul + at_bytes);
+                        sums[0][1u + j] = seismic_fma_rn(fj.x, v.x, sums[0][1u + j]);
+                        sums[0][1u + j] = seismic_fma_rn(fj.y, v.y, sums[0][1u + j]);
+                        sums[0][1u + j] = seismic_fma_rn(fj.z, v.z, sums[0][1u + j]);
+                        sums[0][1u + j] = seismic_fma_rn(fj.w, v.w, sums[0][1u + j]);
+                    }
+                }
+                seismic_strided_from(uint, col, vec_hi, thread, col_hi, pass)
+                    SINKHORN_DECODE_SCALAR(col)
+            } else {
+                seismic_strided_from(uint, col, col_lo, thread, col_hi, pass)
+                    SINKHORN_DECODE_SCALAR(col)
+            }
+#undef SINKHORN_DECODE_SCALAR
         }
     } else {
+        const bool unit_function = SEISMIC_FUNCTION_STRIDE_1 == 1ul && (SEISMIC_FUNCTION_STRIDE_0 & 3ul) == 0ul;
+        const bool unit_hidden = SEISMIC_HIDDEN_STRIDE_2 == 1ul && (SEISMIC_HIDDEN_STRIDE_0 & 3ul) == 0ul;
         for (uint chunk = first; chunk < last; chunk += SINKHORN_CHUNK) {
             const uint count = min(SINKHORN_CHUNK, last - chunk);
             barrier();
-            for (uint e = thread; e < SINKHORN_MIXES * count; e += SINKHORN_THREADS) {
-                const uint j = e / count, c = e % count;
-                seismic_shared_f32[SINKHORN_STAGED + j * SINKHORN_CHUNK + c] = sinkhorn_function(j, chunk + c);
+            if (unit_function && ((func + uint64_t(chunk) * 4ul) & 15ul) == 0ul) {
+                const uint vec_count = count >> 2u;
+                const uint vec_end = vec_count * 4u;
+                for (uint j = subgroup; j < SINKHORN_MIXES; j += SINKHORN_SUBGROUPS) {
+                    const uint64_t src = func + uint64_t(j) * SEISMIC_FUNCTION_STRIDE_0 * 4ul + uint64_t(chunk) * 4ul;
+                    const uint dst_uvec4 = (SINKHORN_STAGED + j * SINKHORN_CHUNK) >> 2u;
+                    const uint dst_f32 = SINKHORN_STAGED + j * SINKHORN_CHUNK;
+                    for (uint k = lane; k < vec_count; k += 32u)
+                        seismic_shared_uvec4[dst_uvec4 + k] = element_uvec4_at(src + uint64_t(k) * 16ul);
+                    for (uint c = vec_end + lane; c < count; c += 32u)
+                        seismic_shared_f32[dst_f32 + c] = element_f32_at(src + uint64_t(c) * 4ul);
+                }
+            } else {
+                for (uint j = subgroup; j < SINKHORN_MIXES; j += SINKHORN_SUBGROUPS) {
+                    const uint64_t src = func + uint64_t(j) * SEISMIC_FUNCTION_STRIDE_0 * 4ul;
+                    const uint dst_f32 = SINKHORN_STAGED + j * SINKHORN_CHUNK;
+                    for (uint c = lane; c < count; c += 32u)
+                        seismic_shared_f32[dst_f32 + c] = element_f32_at(src + uint64_t(chunk + c) * SEISMIC_FUNCTION_STRIDE_1 * 4ul);
+                }
             }
             barrier();
-            seismic_strided(uint, c, lane, count, pass) {
-                const uint at = chunk + c, stream = at / h, column = at % h;
-                [[unroll]] for (uint r = 0u; r < SINKHORN_PER; ++r) {
-                    const float v = element_f32_at(x[r] + (uint64_t(stream) * SEISMIC_HIDDEN_STRIDE_1
-                        + uint64_t(column) * SEISMIC_HIDDEN_STRIDE_2) * 4ul);
-                    sums[r][0] = seismic_fma_rn(v, v, sums[r][0]);
-                    [[unroll]] for (uint j = 0u; j < SINKHORN_MIXES; ++j)
-                        sums[r][1u + j] = seismic_fma_rn(
-                            seismic_shared_f32[SINKHORN_STAGED + j * SINKHORN_CHUNK + c], v, sums[r][1u + j]);
+            const uint chunk_end = chunk + count;
+            for (uint s = 0u; s < SINKHORN_STREAMS; ++s) {
+                const uint s_begin = s * h;
+                const uint s_end = s_begin + h;
+                const uint lo = max(chunk, s_begin);
+                const uint hi = min(chunk_end, s_end);
+                if (lo >= hi)
+                    continue;
+                const uint len = hi - lo;
+                const uint c_lo = lo - chunk;
+                const uint col_lo = lo - s_begin;
+                uint64_t xs[SINKHORN_PER];
+                [[unroll]] for (uint r = 0u; r < SINKHORN_PER; ++r)
+                    xs[r] = x[r] + uint64_t(s) * SEISMIC_HIDDEN_STRIDE_1 * 4ul;
+#define SINKHORN_TILED_SCALAR(D)                                                                       \
+    {                                                                                                  \
+        const uint col = col_lo + (D);                                                                 \
+        const uint c = c_lo + (D);                                                                     \
+        float v[SINKHORN_PER];                                                                         \
+        [[unroll]] for (uint r = 0u; r < SINKHORN_PER; ++r) {                                          \
+            v[r] = element_f32_at(xs[r] + uint64_t(col) * SEISMIC_HIDDEN_STRIDE_2 * 4ul);              \
+            sums[r][0] = seismic_fma_rn(v[r], v[r], sums[r][0]);                                       \
+        }                                                                                              \
+        [[unroll]] for (uint j = 0u; j < SINKHORN_MIXES; ++j) {                                        \
+            const float fj = seismic_shared_f32[SINKHORN_STAGED + j * SINKHORN_CHUNK + c];             \
+            [[unroll]] for (uint r = 0u; r < SINKHORN_PER; ++r)                                        \
+                sums[r][1u + j] = seismic_fma_rn(fj, v[r], sums[r][1u + j]);                           \
+        }                                                                                              \
+    }
+                const uint64_t x_addr = hidden + (uint64_t(s) * SEISMIC_HIDDEN_STRIDE_1 + uint64_t(col_lo)) * 4ul;
+                if (unit_hidden && ((x_addr & 15ul) == uint64_t((c_lo & 3u) * 4u))) {
+                    const uint mis = c_lo & 3u;
+                    const uint head = (4u - mis) & 3u;
+                    const uint vec_lo = min(head, len);
+                    const uint vec_hi = vec_lo + ((len - vec_lo) & ~3u);
+                    seismic_strided(uint, d, lane, vec_lo, pass)
+                        SINKHORN_TILED_SCALAR(d)
+                    seismic_strided_from(uint, d, vec_lo, lane * 4u, vec_hi, pass * 4u) {
+                        const uint col = col_lo + d;
+                        const uint c_uvec4 = (SINKHORN_STAGED + c_lo + d) >> 2u;
+                        vec4 v[SINKHORN_PER];
+                        [[unroll]] for (uint r = 0u; r < SINKHORN_PER; ++r) {
+                            v[r] = element_vec4_at(xs[r] + uint64_t(col) * 4ul);
+                            sums[r][0] = seismic_fma_rn(v[r].x, v[r].x, sums[r][0]);
+                            sums[r][0] = seismic_fma_rn(v[r].y, v[r].y, sums[r][0]);
+                            sums[r][0] = seismic_fma_rn(v[r].z, v[r].z, sums[r][0]);
+                            sums[r][0] = seismic_fma_rn(v[r].w, v[r].w, sums[r][0]);
+                        }
+                        [[unroll]] for (uint j = 0u; j < SINKHORN_MIXES; ++j) {
+                            const vec4 fj = uintBitsToFloat(
+                                seismic_shared_uvec4[c_uvec4 + j * (SINKHORN_CHUNK >> 2u)]);
+                            [[unroll]] for (uint r = 0u; r < SINKHORN_PER; ++r) {
+                                sums[r][1u + j] = seismic_fma_rn(fj.x, v[r].x, sums[r][1u + j]);
+                                sums[r][1u + j] = seismic_fma_rn(fj.y, v[r].y, sums[r][1u + j]);
+                                sums[r][1u + j] = seismic_fma_rn(fj.z, v[r].z, sums[r][1u + j]);
+                                sums[r][1u + j] = seismic_fma_rn(fj.w, v[r].w, sums[r][1u + j]);
+                            }
+                        }
+                    }
+                    seismic_strided_from(uint, d, vec_hi, lane, len, pass)
+                        SINKHORN_TILED_SCALAR(d)
+                } else {
+                    seismic_strided(uint, d, lane, len, pass)
+                        SINKHORN_TILED_SCALAR(d)
                 }
+#undef SINKHORN_TILED_SCALAR
             }
         }
     }
@@ -155,15 +274,16 @@ void stream_mix_sinkhorn_split() { sinkhorn_slice(false); }
 void stream_mix_sinkhorn_tiles() { sinkhorn_slice(true); }
 
 // Workgroup row: its SINKHORN_SPLIT partials summed in slice order, then pre,
-// post and the Sinkhorn comb, formed by the whole workgroup: invocation
-// e < S * S owns comb element (e / S, e % S) through group memory, each of
-// its sums over its row or column read there in index order, so every
-// element takes the same operations in the same order as one invocation
-// forming them all would.
+// post and the Sinkhorn comb: when S * S <= 32, subgroup 0 runs the entire
+// softmax and Sinkhorn in registers via `seismic_shuffle` with zero workgroup
+// barriers inside the iteration loop; wider S falls back to the whole
+// workgroup through group memory (`comb`), where invocation e < S * S owns
+// comb element (e / S, e % S). Both reduce every row and column in index
+// order, bit-identical to one invocation forming them all.
 void stream_mix_sinkhorn_finish() {
     const uint64_t row = uint64_t(gl_WorkGroupID.x);
-    const uint thread = gl_LocalInvocationIndex;
-    const uint width = SINKHORN_STREAMS * uint(SEISMIC_DIM_H), split = uint(SEISMIC_CONST_SINKHORN_SPLIT);
+    const uint thread = SEISMIC_THREAD;
+    const uint width = SINKHORN_STREAMS * uint(SEISMIC_DIM_H), split = uint(SEISMIC_TUNE_SPLIT);
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
     const float norm_epsilon = element_word_f32(SEISMIC_PARAM_NORM_EPSILON);
     const uint iterations = uint(SEISMIC_PARAM_ITERATIONS);
@@ -182,6 +302,64 @@ void stream_mix_sinkhorn_finish() {
     }
     barrier();
     const float inverse = inversesqrt(seismic_div_rn(seismic_shared_f32[0], float(width)) + norm_epsilon);
+    const Out own = out_offset(SEISMIC_RESULT_1_OUT, row * SEISMIC_RESULT_1_STRIDE_0);
+    const Out joined = out_offset(SEISMIC_RESULT_2_OUT, row * SEISMIC_RESULT_2_STRIDE_0);
+    const uint64_t own_stride = SEISMIC_RESULT_1_STRIDE_1;
+    const uint64_t join_stride = SEISMIC_RESULT_2_STRIDE_1;
+#if SEISMIC_STATIC_S * SEISMIC_STATIC_S <= 32
+    bool running;
+    if (seismic_steer(running, SEISMIC_SUBGROUP == 0u)) {
+        const uint lane = SEISMIC_LANE;
+        const bool owns = lane < SINKHORN_STREAMS * SINKHORN_STREAMS;
+        const uint source = lane / SINKHORN_STREAMS, target = lane % SINKHORN_STREAMS;
+        const uint row_base = owns ? source * SINKHORN_STREAMS : 0u;
+        const uint col_base = owns ? target : 0u;
+        // The element's logit, then its row's softmax.
+        float value = 0.0;
+        if (owns) {
+            const uint at = 2u * SINKHORN_STREAMS + lane;
+            value = seismic_shared_f32[1u + at] * inverse * element_f32_at(scale + 2ul * scale_stride)
+                + element_f32_at(base + uint64_t(at) * base_stride);
+        }
+        float maximum = -uintBitsToFloat(0x7f800000u);
+        [[unroll]] for (uint t = 0u; t < SINKHORN_STREAMS; ++t)
+            maximum = max(maximum, seismic_shuffle(value, row_base + t));
+        value = precise_exp(value - maximum);
+        float total = 0.0;
+        [[unroll]] for (uint t = 0u; t < SINKHORN_STREAMS; ++t)
+            total += seismic_shuffle(value, row_base + t);
+        value = seismic_div_rn(value, total) + epsilon;
+        // The Sinkhorn normalizations: rows (after the first sweep), then
+        // columns.
+        for (uint sweep = 0u; sweep < iterations; ++sweep) {
+            if (sweep > 0u) {
+                float sum = 0.0;
+                [[unroll]] for (uint t = 0u; t < SINKHORN_STREAMS; ++t)
+                    sum += seismic_shuffle(value, row_base + t);
+                value = seismic_div_rn(value, sum + epsilon);
+            }
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0u; s < SINKHORN_STREAMS; ++s)
+                sum += seismic_shuffle(value, s * SINKHORN_STREAMS + col_base);
+            value = seismic_div_rn(value, sum + epsilon);
+        }
+        if (running && owns)
+            out_put(joined, uint64_t(SINKHORN_STREAMS + lane) * join_stride, value);
+        if (running && lane < SINKHORN_STREAMS) {
+            const uint stream = lane;
+            const float pre = sinkhorn_sigmoid(seismic_shared_f32[1u + stream] * inverse * element_f32_at(scale)
+                + element_f32_at(base + uint64_t(stream) * base_stride)) + epsilon;
+            if (SINKHORN_CARRIED)
+                out_put(own, uint64_t(stream) * own_stride, pre);
+            else
+                seismic_shared_f32[comb + stream] = pre;
+            out_put(joined, uint64_t(stream) * join_stride,
+                2.0 * sinkhorn_sigmoid(seismic_shared_f32[1u + SINKHORN_STREAMS + stream] * inverse
+                    * element_f32_at(scale + scale_stride)
+                    + element_f32_at(base + uint64_t(SINKHORN_STREAMS + stream) * base_stride)));
+        }
+    }
+#else
     const uint source = thread / SINKHORN_STREAMS, target = thread % SINKHORN_STREAMS;
     const bool owns = thread < SINKHORN_STREAMS * SINKHORN_STREAMS;
     // The element's logit, then its row's softmax.
@@ -235,10 +413,6 @@ void stream_mix_sinkhorn_finish() {
             value = seismic_div_rn(value, sum + epsilon);
         }
     }
-    const Out own = out_offset(SEISMIC_RESULT_1_OUT, row * SEISMIC_RESULT_1_STRIDE_0);
-    const Out joined = out_offset(SEISMIC_RESULT_2_OUT, row * SEISMIC_RESULT_2_STRIDE_0);
-    const uint64_t own_stride = SEISMIC_RESULT_1_STRIDE_1;
-    const uint64_t join_stride = SEISMIC_RESULT_2_STRIDE_1;
     if (owns)
         out_put(joined, uint64_t(SINKHORN_STREAMS + thread) * join_stride, value);
     // Under P = 0 the pre replaces the comb in group memory once every
@@ -258,6 +432,7 @@ void stream_mix_sinkhorn_finish() {
                 * element_f32_at(scale + scale_stride)
                 + element_f32_at(base + uint64_t(SINKHORN_STREAMS + stream) * base_stride)));
     }
+#endif
     if (!SINKHORN_CARRIED) {
         barrier();
         // The sublayer's input: the streams mixed by this site's pre.

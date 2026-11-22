@@ -2,8 +2,8 @@
 // CUDA's (`cuda/unit_reads.cu`): a workgroup of 256 invocations per row, an
 // invocation per bitmap word finding its word's picks by a binary search of
 // the ascending valid picks (their count found by a binary search for the
-// first -1); invocation 0 writes the units, the picks then the tail unit,
-// then -1.
+// first -1); all 256 invocations write the units in parallel (the picks then
+// the tail unit, then -1).
 #include <seismic/element.glsl>
 
 void unit_reads() {
@@ -25,10 +25,9 @@ void unit_reads() {
             hi = mid;
     }
     const uint count = lo;
-    if (gl_LocalInvocationIndex == 0u)
-        for (uint slot = 0u; slot <= k; ++slot)
-            element_i32_put(units + uint64_t(slot) * SEISMIC_RESULT_1_STRIDE_1 * 4ul,
-                slot < count ? element_i32_at(picks + uint64_t(slot) * pick_stride) : (slot == count ? tail : -1));
+    for (uint slot = gl_LocalInvocationIndex; slot <= k; slot += 256u)
+        element_i32_put(units + uint64_t(slot) * SEISMIC_RESULT_1_STRIDE_1 * 4ul,
+            slot < count ? element_i32_at(picks + uint64_t(slot) * pick_stride) : (slot == count ? tail : -1));
     for (uint word = gl_LocalInvocationIndex; word < b; word += 256u) {
         const int first = int(word * 32u);
         // The first pick at or past the word's first unit.

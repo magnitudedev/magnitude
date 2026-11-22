@@ -1,20 +1,34 @@
-// corrector_path: one workgroup of 256 invocations per slot walks its
-// candidate lattice greedily for P mask rows: each candidate's score
-// incoming · (anchor, or the previous row's selected outgoing row) is reduced
-// over the workgroup in candidate order, and the first highest-scoring
-// candidate is selected. Mirrors `cpu/corrector_path.rs`.
+// corrector_path: one workgroup of 256 invocations (8 logical subgroups) per
+// slot walks its candidate lattice greedily for P mask rows: for each step,
+// each active logical subgroup caches its strided slice of the step's
+// reference row (`anchor` for row 0, the previous selection's `outgoing` row
+// after it) in registers, scores its strided candidates with subgroup-only
+// reductions (zero workgroup barriers per candidate), and one workgroup
+// barrier per step selects the first highest-scoring candidate. Mirrors
+// `cpu/corrector_path.rs`.
 #include <seismic/element.glsl>
-#include "lib/core/reduce.glsl"
 
-// Shared: one partial per subgroup (reduce_group_sum at float 0).
+// Shared (128 bytes = 32 floats, double-buffered across steps):
+//   buf 0: scores in floats 0..7,  candidate indices (as float bits) in floats 8..15
+//   buf 1: scores in floats 16..23, candidate indices (as float bits) in floats 24..31
 void corrector_path() {
+    const uint PATH_OTHER_REG_CAP = 16u;
+    const uint PATH_FULL_CHUNKS = (uint(SEISMIC_DIM_F) + 31u) >> 5;
+    const uint PATH_OTHER_CHUNKS = PATH_FULL_CHUNKS < PATH_OTHER_REG_CAP ? PATH_FULL_CHUNKS : PATH_OTHER_REG_CAP;
+    const uint PATH_OTHER_ARRAY_LEN = PATH_OTHER_CHUNKS > 0u ? PATH_OTHER_CHUNKS : 1u;
+
     const uint64_t candidates = SEISMIC_PTR(SEISMIC_BUFFER_CANDIDATES);
     const uint64_t incoming = SEISMIC_PTR(SEISMIC_BUFFER_INCOMING);
     const uint64_t outgoing = SEISMIC_PTR(SEISMIC_BUFFER_OUTGOING);
     const uint64_t anchor = SEISMIC_PTR(SEISMIC_BUFFER_ANCHOR);
     const uint64_t selection = SEISMIC_PTR(SEISMIC_BUFFER_SELECTION);
+
     const uint64_t slot = gl_WorkGroupID.x;
-    const uint64_t lane = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    const uint count = uint(SEISMIC_DIM_K);
+    const uint64_t factor = SEISMIC_DIM_F;
+    const uint active_subgroups = count < SEISMIC_SUBGROUPS ? count : SEISMIC_SUBGROUPS;
+    const float neg_inf = -uintBitsToFloat(0x7f800000u);
+
     uint64_t previous = 0ul;
     for (uint64_t step = 0ul; step < SEISMIC_DIM_P; ++step) {
         // The other side of every score: the anchor (step 0) or the previous
@@ -24,28 +38,69 @@ void corrector_path() {
             : outgoing + (slot * SEISMIC_OUTGOING_STRIDE_0 + (step - 1ul) * SEISMIC_OUTGOING_STRIDE_1
                 + previous * SEISMIC_OUTGOING_STRIDE_2) * 4ul;
         const uint64_t other_stride = step == 0ul ? SEISMIC_ANCHOR_STRIDE_1 : SEISMIC_OUTGOING_STRIDE_3;
-        float best = -uintBitsToFloat(0x7f800000u);
-        uint64_t chosen = 0ul;
-        // A 32-bit counter: see `streaming/contract.hpp`.
-        for (uint candidate = 0u; candidate < uint(SEISMIC_DIM_K); ++candidate) {
-            const uint64_t row = incoming + (slot * SEISMIC_INCOMING_STRIDE_0 + step * SEISMIC_INCOMING_STRIDE_1
-                + candidate * SEISMIC_INCOMING_STRIDE_2) * 4ul;
-            // Numbered by `SEISMIC_THREAD`: the partials reach the reduction.
-            float partial = 0.0;
-            seismic_strided(uint64_t, f, uint64_t(SEISMIC_THREAD), SEISMIC_DIM_F, threads)
-                partial = seismic_fma_rn(element_f32_at(row + f * SEISMIC_INCOMING_STRIDE_3 * 4ul),
-                    element_f32_at(other + f * other_stride * 4ul), partial);
-            const float score = reduce_group_sum(partial, 0u);
-            if (score > best) {
-                best = score;
-                chosen = candidate;
+
+        float subgroup_best = neg_inf;
+        uint subgroup_chosen = 0u;
+        bool subgroup_active;
+        if (seismic_steer(subgroup_active, SEISMIC_SUBGROUP < active_subgroups)) {
+            float other_reg[PATH_OTHER_ARRAY_LEN];
+            [[unroll]] for (uint t = 0u; t < PATH_OTHER_CHUNKS; ++t) {
+                const uint64_t f = uint64_t(SEISMIC_LANE) + uint64_t(t) * 32ul;
+                other_reg[t] = f < factor ? element_f32_at(other + f * other_stride * 4ul) : 0.0;
+            }
+            const uint64_t step_incoming = incoming + (slot * SEISMIC_INCOMING_STRIDE_0
+                + step * SEISMIC_INCOMING_STRIDE_1) * 4ul;
+            // A 32-bit counter: see `streaming/contract.hpp`.
+            bool held;
+            for (uint candidate = SEISMIC_SUBGROUP; seismic_steer(held, candidate < count);
+                    candidate += SEISMIC_SUBGROUPS) {
+                const uint safe_cand = held ? candidate : count - 1u;
+                const uint64_t row = step_incoming + uint64_t(safe_cand) * SEISMIC_INCOMING_STRIDE_2 * 4ul;
+                float partial = 0.0;
+                [[unroll]] for (uint t = 0u; t < PATH_OTHER_CHUNKS; ++t) {
+                    const uint64_t f = uint64_t(SEISMIC_LANE) + uint64_t(t) * 32ul;
+                    if (f < factor)
+                        partial = seismic_fma_rn(element_f32_at(row + f * SEISMIC_INCOMING_STRIDE_3 * 4ul),
+                            other_reg[t], partial);
+                }
+                if (uint64_t(PATH_OTHER_CHUNKS) * 32ul < factor) {
+                    seismic_strided_from(uint64_t, f, uint64_t(PATH_OTHER_CHUNKS) * 32ul,
+                            uint64_t(SEISMIC_LANE), factor, 32ul) {
+                        partial = seismic_fma_rn(element_f32_at(row + f * SEISMIC_INCOMING_STRIDE_3 * 4ul),
+                            element_f32_at(other + f * other_stride * 4ul), partial);
+                    }
+                }
+                const float score = seismic_subgroup_sum_f32(partial);
+                if (held && score > subgroup_best) {
+                    subgroup_best = score;
+                    subgroup_chosen = candidate;
+                }
+            }
+            if (subgroup_active && SEISMIC_LANE == 0u) {
+                const uint buf_base = (uint(step) & 1u) * 16u;
+                seismic_shared_f32[buf_base + SEISMIC_SUBGROUP] = subgroup_best;
+                seismic_shared_f32[buf_base + 8u + SEISMIC_SUBGROUP] = uintBitsToFloat(subgroup_chosen);
             }
         }
-        previous = chosen;
-        if (lane == 0ul) {
+
+        barrier();
+
+        const uint buf_base = (uint(step) & 1u) * 16u;
+        float best = neg_inf;
+        uint chosen = 0u;
+        for (uint s = 0u; s < active_subgroups; ++s) {
+            const float s_score = seismic_shared_f32[buf_base + s];
+            const uint s_cand = floatBitsToUint(seismic_shared_f32[buf_base + 8u + s]);
+            if (s_score > best || (s_score == best && s_cand < chosen)) {
+                best = s_score;
+                chosen = s_cand;
+            }
+        }
+        previous = uint64_t(chosen);
+        if (SEISMIC_THREAD == 0u) {
             const uint64_t at = (step * SEISMIC_SELECTION_STRIDE_0 + slot * SEISMIC_SELECTION_STRIDE_1) * 4ul;
             element_i32_put(selection + at, element_i32_at(candidates + (slot * SEISMIC_CANDIDATES_STRIDE_0
-                + step * SEISMIC_CANDIDATES_STRIDE_1 + chosen * SEISMIC_CANDIDATES_STRIDE_2) * 4ul));
+                + step * SEISMIC_CANDIDATES_STRIDE_1 + previous * SEISMIC_CANDIDATES_STRIDE_2) * 4ul));
             element_i32_put(selection + at + SEISMIC_SELECTION_STRIDE_2 * 4ul, 0);
         }
     }

@@ -1,81 +1,353 @@
 // short_conv_rows (contract and portable body in short_conv.seismic): the
 // gated causal depthwise convolution of one short-convolution layer. The
-// Vulkan form of `cuda/short_conv_rows.cu`: an invocation owns one channel of
-// one item, item y < M computes row y (zero past the slots), item M + b
-// publishes slot b's successor window, and the y grid visits the items with a
-// stride (it is capped at the 65535-group floor). Each output is the body's
-// tap-ascending F32 FMA chain times the gate, so every row class and backend
-// gives the same bits.
+// Vulkan form of `cuda/short_conv_rows.cu`: an invocation owns 4 contiguous
+// channels across a 16-row tile (item y < ceil_div(M, 16)) or publishes 4
+// contiguous channels of slot b's successor window (item y = ceil_div(M, 16) +
+// b), and the y grid visits items with a stride (capped at the 65535-group
+// floor). Marching across contiguous rows of a slot keeps filter weights and
+// the rolling C - 1 tap history in registers for C <= 4, while preserving the
+// exact tap-ascending F32 FMA chain times the gate. Each tile's slot lookup
+// runs once on invocation 0 and broadcasts through 32 bytes of shared memory
+// under uniform workgroup barriers.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
 #include "lib/recurrent/versions.glsl"
 
-// Publishes channel `channel` of slot `index`'s successor window: the source
-// version's rows move as stored, the projection's rows copy as stored.
-void short_conv_publish(uint64_t index, uint64_t channel) {
+vec4 short_conv_fma4(vec4 a, vec4 b, vec4 c) {
+    return vec4(
+        seismic_fma_rn(a.x, b.x, c.x),
+        seismic_fma_rn(a.y, b.y, c.y),
+        seismic_fma_rn(a.z, b.z, c.z),
+        seismic_fma_rn(a.w, b.w, c.w));
+}
+
+vec4 short_conv_mul4(vec4 a, vec4 b) {
+    return vec4(
+        seismic_mul_rn(a.x, b.x),
+        seismic_mul_rn(a.y, b.y),
+        seismic_mul_rn(a.z, b.z),
+        seismic_mul_rn(a.w, b.w));
+}
+
+// Resolves `row`'s slot index and metadata once on invocation 0 and broadcasts
+// them through `seismic_shared_u32[0..7]` under workgroup-uniform barriers.
+uint64_t short_conv_broadcast_slot(int row, out versions_slot slot) {
+    if (gl_LocalInvocationIndex == 0u) {
+        const uint64_t idx = versions_slot_index_of_row(row);
+        const uvec2 idx_words = unpackUint2x32(idx);
+        seismic_shared_u32[0] = idx_words.x;
+        seismic_shared_u32[1] = idx_words.y;
+        if (idx < SEISMIC_DIM_B) {
+            const versions_slot s = versions_slot_of(idx);
+            seismic_shared_u32[2] = uint(s.lo);
+            seismic_shared_u32[3] = uint(s.hi);
+            seismic_shared_u32[4] = uint(s.stop);
+            seismic_shared_u32[5] = uint(s.source);
+            seismic_shared_u32[6] = uint(s.taped);
+            seismic_shared_u32[7] = uint(s.target);
+        }
+    }
+    barrier();
+    const uint64_t idx = packUint2x32(uvec2(seismic_shared_u32[0], seismic_shared_u32[1]));
+    if (idx < SEISMIC_DIM_B) {
+        slot = versions_slot(
+            int(seismic_shared_u32[2]),
+            int(seismic_shared_u32[3]),
+            int(seismic_shared_u32[4]),
+            int(seismic_shared_u32[5]),
+            int(seismic_shared_u32[6]),
+            int(seismic_shared_u32[7]));
+    } else {
+        slot = versions_slot(0, 0, 0, 0, 0, 0);
+    }
+    barrier();
+    return idx;
+}
+
+// Loads slot `index`'s metadata once on invocation 0 and broadcasts it through
+// `seismic_shared_u32[2..7]` under workgroup-uniform barriers.
+versions_slot short_conv_broadcast_publish_slot(uint64_t index) {
+    if (gl_LocalInvocationIndex == 0u) {
+        const versions_slot s = versions_slot_of(index);
+        seismic_shared_u32[2] = uint(s.lo);
+        seismic_shared_u32[3] = uint(s.hi);
+        seismic_shared_u32[4] = uint(s.stop);
+        seismic_shared_u32[5] = uint(s.source);
+        seismic_shared_u32[6] = uint(s.taped);
+        seismic_shared_u32[7] = uint(s.target);
+    }
+    barrier();
+    const versions_slot slot = versions_slot(
+        int(seismic_shared_u32[2]),
+        int(seismic_shared_u32[3]),
+        int(seismic_shared_u32[4]),
+        int(seismic_shared_u32[5]),
+        int(seismic_shared_u32[6]),
+        int(seismic_shared_u32[7]));
+    barrier();
+    return slot;
+}
+
+vec4 short_conv_load_projection4(uint64_t projection, uint64_t row, uint64_t col, uint64_t lanes) {
+    const uint64_t base = row * SEISMIC_PROJECTION_STRIDE_0 + col * SEISMIC_PROJECTION_STRIDE_1;
+    const uint64_t addr = projection + base * 4ul;
+    if (lanes == 4ul && SEISMIC_PROJECTION_STRIDE_1 == 1ul && ((addr & 15ul) == 0ul))
+        return element_vec4_at(addr);
+    const float x = element_f32_at(addr);
+    const float y = lanes > 1ul ? element_f32_at(projection + (base + SEISMIC_PROJECTION_STRIDE_1) * 4ul) : 0.0;
+    const float z = lanes > 2ul ? element_f32_at(projection + (base + 2ul * SEISMIC_PROJECTION_STRIDE_1) * 4ul) : 0.0;
+    const float w = lanes > 3ul ? element_f32_at(projection + (base + 3ul * SEISMIC_PROJECTION_STRIDE_1) * 4ul) : 0.0;
+    return vec4(x, y, z, w);
+}
+
+vec4 short_conv_load_window4(Out source, uint64_t tap_row, uint64_t channel, uint64_t lanes) {
+    const uint64_t base = tap_row * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2;
+    if (lanes == 4ul && SEISMIC_WINDOW_STRIDE_2 == 1ul) {
+        const Stored view = out_stored(source, base);
+        if (stored_aligned16(view))
+            return stored_vec4_at(view, 0ul);
+    }
+    const float x = out_at(source, base);
+    const float y = lanes > 1ul ? out_at(source, base + SEISMIC_WINDOW_STRIDE_2) : 0.0;
+    const float z = lanes > 2ul ? out_at(source, base + 2ul * SEISMIC_WINDOW_STRIDE_2) : 0.0;
+    const float w = lanes > 3ul ? out_at(source, base + 3ul * SEISMIC_WINDOW_STRIDE_2) : 0.0;
+    return vec4(x, y, z, w);
+}
+
+void short_conv_store_gated4(Out gated, uint64_t row, uint64_t channel, uint64_t lanes, vec4 val) {
+    const uint64_t base = row * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1;
+    if (lanes == 4ul && SEISMIC_RESULT_0_STRIDE_1 == 1ul) {
+        out_put2(gated, base, val.x, val.y);
+        out_put2(gated, base + 2ul, val.z, val.w);
+        return;
+    }
+    out_put(gated, base, val.x);
+    if (lanes > 1ul)
+        out_put(gated, base + SEISMIC_RESULT_0_STRIDE_1, val.y);
+    if (lanes > 2ul)
+        out_put(gated, base + 2ul * SEISMIC_RESULT_0_STRIDE_1, val.z);
+    if (lanes > 3ul)
+        out_put(gated, base + 3ul * SEISMIC_RESULT_0_STRIDE_1, val.w);
+}
+
+vec4 short_conv_load_channel_weights(uint64_t convolution, uint64_t ch, int taps) {
+    const uint64_t base = ch * SEISMIC_CONVOLUTION_STRIDE_0;
+    const uint64_t addr = convolution + base * 4ul;
+    if (taps == 3 && SEISMIC_CONVOLUTION_STRIDE_1 == 1ul && ((addr & 15ul) == 0ul))
+        return element_vec4_at(addr);
+    const float x = element_f32_at(addr);
+    const float y = taps >= 1 ? element_f32_at(convolution + (base + SEISMIC_CONVOLUTION_STRIDE_1) * 4ul) : 0.0;
+    const float z = taps >= 2 ? element_f32_at(convolution + (base + 2ul * SEISMIC_CONVOLUTION_STRIDE_1) * 4ul) : 0.0;
+    const float w = taps >= 3 ? element_f32_at(convolution + (base + 3ul * SEISMIC_CONVOLUTION_STRIDE_1) * 4ul) : 0.0;
+    return vec4(x, y, z, w);
+}
+
+// Publishes channels `channel..channel+lanes` of slot `index`'s successor
+// window: the source version's rows move as stored, the projection's rows copy
+// as stored.
+void short_conv_publish(uint64_t index, uint64_t channel, uint64_t lanes) {
+    const versions_slot slot = short_conv_broadcast_publish_slot(index);
+    if (slot.lo == slot.hi || lanes == 0ul)
+        return;
     const uint64_t projection = SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION);
     const SlabOut window = SEISMIC_OUT_WINDOW;
     const int taps = int(SEISMIC_DIM_C) - 1;
     const uint64_t bank_elements = SEISMIC_WINDOW_STRIDE_0;
-    const versions_slot slot = versions_slot_of(index);
-    if (slot.lo == slot.hi) return;
     const Out source = versions_out_bank(window, slot.source, bank_elements);
     const Out target = versions_out_bank(window, slot.target, bank_elements);
     const int published = taps + versions_tape_rows(slot, int(SEISMIC_DIM_T));
     for (int tap = 0; tap < published; ++tap) {
         const int position = slot.stop + tap - taps;
         const uint64_t to = uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2;
-        if (position < 0)
-            out_move_stored(target, to, source,
-                uint64_t(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2, 1ul);
-        else
-            out_copy_stored(target, to, projection,
-                uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + channel * SEISMIC_PROJECTION_STRIDE_1, 1ul);
+        if (position < 0) {
+            const uint64_t from = uint64_t(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1
+                + channel * SEISMIC_WINDOW_STRIDE_2;
+            if (lanes == 4ul && SEISMIC_WINDOW_STRIDE_2 == 1ul) {
+                out_move_stored(target, to, source, from, 4ul);
+            } else {
+                for (uint64_t k = 0ul; k < lanes; ++k)
+                    out_move_stored(target, to + k * SEISMIC_WINDOW_STRIDE_2,
+                        source, from + k * SEISMIC_WINDOW_STRIDE_2, 1ul);
+            }
+        } else {
+            const uint64_t from = uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0
+                + channel * SEISMIC_PROJECTION_STRIDE_1;
+            if (lanes == 4ul && SEISMIC_WINDOW_STRIDE_2 == 1ul && SEISMIC_PROJECTION_STRIDE_1 == 1ul) {
+                out_copy_stored(target, to, projection, from, 4ul);
+            } else {
+                for (uint64_t k = 0ul; k < lanes; ++k)
+                    out_copy_stored(target, to + k * SEISMIC_WINDOW_STRIDE_2,
+                        projection, from + k * SEISMIC_PROJECTION_STRIDE_1, 1ul);
+            }
+        }
     }
 }
 
-// Channel `channel` of row `row`'s gated convolution.
-void short_conv_convolve(int row, uint64_t channel) {
+// Register-tiled gated convolution for C in 1..4: loads filter weights once
+// per 16-row tile and maintains the rolling C - 1 tap history in registers
+// across each contiguous slot run.
+void short_conv_convolve_tile_small(int tile_lo, int tile_hi, uint64_t channel, uint64_t lanes) {
     const uint64_t projection = SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION);
     const uint64_t convolution = SEISMIC_PTR(SEISMIC_BUFFER_CONVOLUTION);
     const SlabOut window = SEISMIC_OUT_WINDOW;
     const Out gated = SEISMIC_RESULT_0_OUT;
     const int taps = int(SEISMIC_DIM_C) - 1;
-    const uint64_t slot_index = versions_slot_index_of_row(row);
-    const uint64_t element = uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1;
-    if (slot_index == SEISMIC_DIM_B) {
-        out_put(gated, element, 0.0);
-        return;
+
+    vec4 w0 = vec4(0.0);
+    vec4 w1 = vec4(0.0);
+    vec4 w2 = vec4(0.0);
+    vec4 w3 = vec4(0.0);
+    if (lanes > 0ul) {
+        const vec4 c0 = short_conv_load_channel_weights(convolution, channel, taps);
+        const vec4 c1 = lanes > 1ul ? short_conv_load_channel_weights(convolution, channel + 1ul, taps) : vec4(0.0);
+        const vec4 c2 = lanes > 2ul ? short_conv_load_channel_weights(convolution, channel + 2ul, taps) : vec4(0.0);
+        const vec4 c3 = lanes > 3ul ? short_conv_load_channel_weights(convolution, channel + 3ul, taps) : vec4(0.0);
+        w0 = vec4(c0.x, c1.x, c2.x, c3.x);
+        w1 = vec4(c0.y, c1.y, c2.y, c3.y);
+        w2 = vec4(c0.z, c1.z, c2.z, c3.z);
+        w3 = vec4(c0.w, c1.w, c2.w, c3.w);
     }
-    const versions_slot slot = versions_slot_of(slot_index);
-    const Out source = versions_out_bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0);
-    const int local = row - slot.lo;
-    float sum = 0.0;
-    for (int tap = 0; tap <= taps; ++tap) {
-        const int position = local + tap - taps;
-        const float value = position < 0
-            ? out_at(source, uint64_t(slot.taped + taps + position) * SEISMIC_WINDOW_STRIDE_1
-                + channel * SEISMIC_WINDOW_STRIDE_2)
-            : element_f32_at(projection + (uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0
-                + channel * SEISMIC_PROJECTION_STRIDE_1) * 4ul);
-        const float weight = element_f32_at(convolution
-            + (channel * SEISMIC_CONVOLUTION_STRIDE_0 + uint64_t(tap) * SEISMIC_CONVOLUTION_STRIDE_1) * 4ul);
-        sum = seismic_fma_rn(weight, value, sum);
+
+    int row = tile_lo;
+    while (row < tile_hi) {
+        versions_slot slot;
+        const uint64_t slot_index = short_conv_broadcast_slot(row, slot);
+        if (slot_index == SEISMIC_DIM_B) {
+            if (lanes > 0ul) {
+                for (int r = row; r < tile_hi; ++r)
+                    short_conv_store_gated4(gated, uint64_t(r), channel, lanes, vec4(0.0));
+            }
+            return;
+        }
+        const int run_end = min(tile_hi, slot.hi);
+        if (lanes > 0ul) {
+            const Out source = versions_out_bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0);
+            const int local0 = row - slot.lo;
+            vec4 r0 = vec4(0.0);
+            vec4 r1 = vec4(0.0);
+            vec4 r2 = vec4(0.0);
+            if (taps >= 1) {
+                const int pos0 = local0 - taps;
+                r0 = pos0 < 0
+                    ? short_conv_load_window4(source, uint64_t(slot.taped + taps + pos0), channel, lanes)
+                    : short_conv_load_projection4(projection, uint64_t(slot.lo + pos0), channel, lanes);
+            }
+            if (taps >= 2) {
+                const int pos1 = local0 + 1 - taps;
+                r1 = pos1 < 0
+                    ? short_conv_load_window4(source, uint64_t(slot.taped + taps + pos1), channel, lanes)
+                    : short_conv_load_projection4(projection, uint64_t(slot.lo + pos1), channel, lanes);
+            }
+            if (taps >= 3) {
+                const int pos2 = local0 + 2 - taps;
+                r2 = pos2 < 0
+                    ? short_conv_load_window4(source, uint64_t(slot.taped + taps + pos2), channel, lanes)
+                    : short_conv_load_projection4(projection, uint64_t(slot.lo + pos2), channel, lanes);
+            }
+            for (int r = row; r < run_end; ++r) {
+                const vec4 cur_u = short_conv_load_projection4(projection, uint64_t(r), channel, lanes);
+                const vec4 gate = short_conv_load_projection4(projection, uint64_t(r), SEISMIC_DIM_CH + channel, lanes);
+                vec4 sum = vec4(0.0);
+                if (taps == 3) {
+                    sum = short_conv_fma4(w0, r0, sum);
+                    sum = short_conv_fma4(w1, r1, sum);
+                    sum = short_conv_fma4(w2, r2, sum);
+                    sum = short_conv_fma4(w3, cur_u, sum);
+                    r0 = r1;
+                    r1 = r2;
+                    r2 = cur_u;
+                } else if (taps == 2) {
+                    sum = short_conv_fma4(w0, r0, sum);
+                    sum = short_conv_fma4(w1, r1, sum);
+                    sum = short_conv_fma4(w2, cur_u, sum);
+                    r0 = r1;
+                    r1 = cur_u;
+                } else if (taps == 1) {
+                    sum = short_conv_fma4(w0, r0, sum);
+                    sum = short_conv_fma4(w1, cur_u, sum);
+                    r0 = cur_u;
+                } else {
+                    sum = short_conv_fma4(w0, cur_u, sum);
+                }
+                short_conv_store_gated4(gated, uint64_t(r), channel, lanes, short_conv_mul4(gate, sum));
+            }
+        }
+        row = run_end;
     }
-    const float gate = element_f32_at(projection
-        + (uint64_t(row) * SEISMIC_PROJECTION_STRIDE_0 + (SEISMIC_DIM_CH + channel) * SEISMIC_PROJECTION_STRIDE_1) * 4ul);
-    out_put(gated, element, seismic_mul_rn(gate, sum));
+}
+
+// General 4-channel fallback for arbitrary C > 4.
+void short_conv_convolve_tile_general(int tile_lo, int tile_hi, uint64_t channel, uint64_t lanes) {
+    const uint64_t projection = SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION);
+    const uint64_t convolution = SEISMIC_PTR(SEISMIC_BUFFER_CONVOLUTION);
+    const SlabOut window = SEISMIC_OUT_WINDOW;
+    const Out gated = SEISMIC_RESULT_0_OUT;
+    const int taps = int(SEISMIC_DIM_C) - 1;
+    int row = tile_lo;
+    while (row < tile_hi) {
+        versions_slot slot;
+        const uint64_t slot_index = short_conv_broadcast_slot(row, slot);
+        if (slot_index == SEISMIC_DIM_B) {
+            if (lanes > 0ul) {
+                for (int r = row; r < tile_hi; ++r)
+                    short_conv_store_gated4(gated, uint64_t(r), channel, lanes, vec4(0.0));
+            }
+            return;
+        }
+        const int run_end = min(tile_hi, slot.hi);
+        if (lanes > 0ul) {
+            const Out source = versions_out_bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0);
+            for (int r = row; r < run_end; ++r) {
+                const int local = r - slot.lo;
+                vec4 sum = vec4(0.0);
+                for (int tap = 0; tap <= taps; ++tap) {
+                    const int position = local + tap - taps;
+                    const vec4 value = position < 0
+                        ? short_conv_load_window4(source, uint64_t(slot.taped + taps + position), channel, lanes)
+                        : short_conv_load_projection4(projection, uint64_t(slot.lo + position), channel, lanes);
+                    const uint64_t tap_off = uint64_t(tap) * SEISMIC_CONVOLUTION_STRIDE_1;
+                    const float wx = element_f32_at(convolution
+                        + (channel * SEISMIC_CONVOLUTION_STRIDE_0 + tap_off) * 4ul);
+                    const float wy = lanes > 1ul
+                        ? element_f32_at(convolution
+                            + ((channel + 1ul) * SEISMIC_CONVOLUTION_STRIDE_0 + tap_off) * 4ul)
+                        : 0.0;
+                    const float wz = lanes > 2ul
+                        ? element_f32_at(convolution
+                            + ((channel + 2ul) * SEISMIC_CONVOLUTION_STRIDE_0 + tap_off) * 4ul)
+                        : 0.0;
+                    const float ww = lanes > 3ul
+                        ? element_f32_at(convolution
+                            + ((channel + 3ul) * SEISMIC_CONVOLUTION_STRIDE_0 + tap_off) * 4ul)
+                        : 0.0;
+                    sum = short_conv_fma4(vec4(wx, wy, wz, ww), value, sum);
+                }
+                const vec4 gate = short_conv_load_projection4(projection, uint64_t(r), SEISMIC_DIM_CH + channel, lanes);
+                short_conv_store_gated4(gated, uint64_t(r), channel, lanes, short_conv_mul4(gate, sum));
+            }
+        }
+        row = run_end;
+    }
 }
 
 void short_conv_rows() {
-    const uint64_t channel = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationIndex;
-    if (channel >= SEISMIC_DIM_CH)
-        return;
+    const uint64_t channel = (uint64_t(gl_WorkGroupID.x) * uint64_t(gl_WorkGroupSize.x)
+        + uint64_t(gl_LocalInvocationIndex)) * 4ul;
+    const uint64_t lanes = channel < SEISMIC_DIM_CH ? min(SEISMIC_DIM_CH - channel, 4ul) : 0ul;
     const uint64_t rows = SEISMIC_DIM_M;
-    for (uint64_t item = gl_WorkGroupID.y; item < rows + SEISMIC_DIM_B; item += gl_NumWorkGroups.y) {
-        if (item >= rows)
-            short_conv_publish(item - rows, channel);
-        else
-            short_conv_convolve(int(item), channel);
+    const uint64_t row_tiles = (rows + 15ul) >> 4ul;
+    const uint64_t total_items = row_tiles + SEISMIC_DIM_B;
+    for (uint64_t item = uint64_t(gl_WorkGroupID.y); item < total_items; item += uint64_t(gl_NumWorkGroups.y)) {
+        if (item >= row_tiles) {
+            short_conv_publish(item - row_tiles, channel, lanes);
+        } else {
+            const uint64_t tile_start = item << 4ul;
+            const int tile_lo = int(tile_start);
+            const int tile_hi = int(min(tile_start + 16ul, rows));
+            if (SEISMIC_DIM_C >= 1ul && SEISMIC_DIM_C <= 4ul)
+                short_conv_convolve_tile_small(tile_lo, tile_hi, channel, lanes);
+            else
+                short_conv_convolve_tile_general(tile_lo, tile_hi, channel, lanes);
+        }
     }
 }

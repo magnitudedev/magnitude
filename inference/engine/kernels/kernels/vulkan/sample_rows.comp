@@ -15,12 +15,33 @@
 #define SAMPLE_NO_TOKEN 0xffffffffu
 #define SAMPLE_INF uintBitsToFloat(0x7f800000u)
 
-float sample_gumbel_score(float value, uint token, uint64_t draw, uint64_t stride) {
+struct SampleDraw {
+    bool enabled;
+    uint k0;
+    uint k1;
+    uint c1;
+    uint c2;
+    uint c3;
+};
+
+SampleDraw sample_load_draw(uint64_t draw, uint64_t stride) {
     if (element_u32_at(draw) != 1u)
+        return SampleDraw(false, 0u, 0u, 0u, 0u, 0u);
+    const uint64_t step = stride * 4ul;
+    return SampleDraw(
+        true,
+        element_u32_at(draw + step),
+        element_u32_at(draw + 2ul * step),
+        element_u32_at(draw + 3ul * step),
+        element_u32_at(draw + 4ul * step),
+        element_u32_at(draw + 5ul * step));
+}
+
+float sample_gumbel_score(float value, uint token, SampleDraw draw) {
+    if (!draw.enabled)
         return value;
-    uint c0 = token, c1 = element_u32_at(draw + 3ul * stride * 4ul), c2 = element_u32_at(draw + 4ul * stride * 4ul),
-         c3 = element_u32_at(draw + 5ul * stride * 4ul);
-    uint k0 = element_u32_at(draw + stride * 4ul), k1 = element_u32_at(draw + 2ul * stride * 4ul);
+    uint c0 = token, c1 = draw.c1, c2 = draw.c2, c3 = draw.c3;
+    uint k0 = draw.k0, k1 = draw.k1;
     [[unroll]] for (int round = 0; round < 10; ++round) {
         uint hi0, lo0, hi1, lo1;
         umulExtended(3528531795u, c0, hi0, lo0);
@@ -43,6 +64,29 @@ float sample_gumbel_score(float value, uint token, uint64_t draw, uint64_t strid
 bool sample_better(float score, uint token, float best_score, uint best_token) {
     return token != SAMPLE_NO_TOKEN
         && (best_token == SAMPLE_NO_TOKEN || score > best_score || (score == best_score && token < best_token));
+}
+
+bool sample_mask_allowed(bool masked, uint64_t bits, uint64_t mask_stride, uint token) {
+    if (!masked)
+        return true;
+    return ((element_u32_at(bits + uint64_t(token >> 5u) * mask_stride * 4ul) >> (token & 31u)) & 1u) != 0u;
+}
+
+// Evaluates one logit at `token` with pre-evaluated mask admission `allowed`:
+// NaN and +inf always flag `bad`; -inf is valid but never competes; finite
+// allowed tokens compete by Gumbel-perturbed (or raw) score, ties to lower
+// token.
+void sample_consider(
+    float value, uint token, bool allowed, SampleDraw draw,
+    inout float best_score, inout uint best_token, inout uint bad) {
+    bad |= (isnan(value) || value == SAMPLE_INF) ? 1u : 0u;
+    if (allowed && value > -SAMPLE_INF && value < SAMPLE_INF) {
+        const float candidate = sample_gumbel_score(value, token, draw);
+        if (sample_better(candidate, token, best_score, best_token)) {
+            best_score = candidate;
+            best_token = token;
+        }
+    }
 }
 
 // The subgroup's best (score, token) and the union of its nonfinite flags;
@@ -77,6 +121,7 @@ void sample_rows_partition() {
     const uint64_t draw = draws + row * SEISMIC_DRAWS_STRIDE_0 * 4ul;
     // An unconstrained row admits every token; its mask row is never read.
     const bool masked = element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_CONSTRAINED), row * SEISMIC_CONSTRAINED_STRIDE_0) != 0;
+    const SampleDraw draw_state = sample_load_draw(draw, SEISMIC_DRAWS_STRIDE_1);
     float score = -SAMPLE_INF;
     uint token = SAMPLE_NO_TOKEN;
     uint bad = 0u;
@@ -84,17 +129,39 @@ void sample_rows_partition() {
     // `SEISMIC_THREAD` (no subgroup operation lies inside). The draw stays
     // behind the admission test, so a subgroup whose tokens are all rejected
     // skips it.
-    seismic_strided_from(uint, t, begin, SEISMIC_THREAD, end, gl_WorkGroupSize.x) {
-        const float value = element_f32_at(line + uint64_t(t) * SEISMIC_LOGITS_STRIDE_1 * 4ul);
-        bad |= (isnan(value) || value == SAMPLE_INF) ? 1u : 0u;
-        const bool admitted = value > -SAMPLE_INF && value < SAMPLE_INF
-            && (!masked || ((element_u32_at(bits + uint64_t(t / 32u) * SEISMIC_MASK_STRIDE_1 * 4ul) >> (t % 32u)) & 1u) != 0u);
-        if (admitted) {
-            const float candidate = sample_gumbel_score(value, t, draw, SEISMIC_DRAWS_STRIDE_1);
-            if (sample_better(candidate, t, score, token)) {
-                score = candidate;
-                token = t;
-            }
+    if (SEISMIC_LOGITS_STRIDE_1 == 1ul && (line & 15ul) == 0ul) {
+        const uint head_end = min((begin + 3u) & ~3u, end);
+        const uint end4 = max(head_end, end & ~3u);
+        if (SEISMIC_THREAD < head_end - begin) {
+            const uint t = begin + SEISMIC_THREAD;
+            sample_consider(
+                element_f32_at(line + uint64_t(t) * 4ul), t,
+                sample_mask_allowed(masked, bits, SEISMIC_MASK_STRIDE_1, t),
+                draw_state, score, token, bad);
+        }
+        seismic_strided_from(uint, t, head_end, SEISMIC_THREAD * 4u, end4, gl_WorkGroupSize.x * 4u) {
+            const vec4 values = element_vec4_at(line + uint64_t(t) * 4ul);
+            const uint quad_mask = masked
+                ? ((element_u32_at(bits + uint64_t(t >> 5u) * SEISMIC_MASK_STRIDE_1 * 4ul) >> (t & 31u)) & 0xfu)
+                : 0xfu;
+            sample_consider(values.x, t, (quad_mask & 1u) != 0u, draw_state, score, token, bad);
+            sample_consider(values.y, t + 1u, (quad_mask & 2u) != 0u, draw_state, score, token, bad);
+            sample_consider(values.z, t + 2u, (quad_mask & 4u) != 0u, draw_state, score, token, bad);
+            sample_consider(values.w, t + 3u, (quad_mask & 8u) != 0u, draw_state, score, token, bad);
+        }
+        if (SEISMIC_THREAD < end - end4) {
+            const uint t = end4 + SEISMIC_THREAD;
+            sample_consider(
+                element_f32_at(line + uint64_t(t) * 4ul), t,
+                sample_mask_allowed(masked, bits, SEISMIC_MASK_STRIDE_1, t),
+                draw_state, score, token, bad);
+        }
+    } else {
+        seismic_strided_from(uint, t, begin, SEISMIC_THREAD, end, gl_WorkGroupSize.x) {
+            sample_consider(
+                element_f32_at(line + uint64_t(t) * SEISMIC_LOGITS_STRIDE_1 * 4ul), t,
+                sample_mask_allowed(masked, bits, SEISMIC_MASK_STRIDE_1, t),
+                draw_state, score, token, bad);
         }
     }
     sample_subgroup_best(score, token, bad);

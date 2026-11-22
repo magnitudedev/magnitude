@@ -1,10 +1,21 @@
 #include <seismic/element.glsl>
 void place_logits_fill() {
     const Out logits = SEISMIC_OUT_LOGITS;
-    for (seismic_walk at = seismic_walk_grid(SEISMIC_DIM_M * SEISMIC_DIM_V, u64vec3(1ul, 1ul, SEISMIC_DIM_V));
-            at.index < SEISMIC_DIM_M * SEISMIC_DIM_V; seismic_walk_next(at)) {
-        const uint64_t row = at.axes.x, col = at.axes.w;
-        out_put(logits, row * SEISMIC_LOGITS_STRIDE_0 + col * SEISMIC_LOGITS_STRIDE_1, -uintBitsToFloat(0x7f800000u));
+    const uint64_t col = uint64_t(gl_GlobalInvocationID.x) * 4ul;
+    if (col >= SEISMIC_DIM_V)
+        return;
+    const float neg_inf = -uintBitsToFloat(0x7f800000u);
+    const bool full_vec = SEISMIC_LOGITS_STRIDE_1 == 1ul && col + 4ul <= SEISMIC_DIM_V;
+    const uint64_t limit = min(col + 4ul, SEISMIC_DIM_V);
+    for (uint64_t row = uint64_t(gl_WorkGroupID.y); row < SEISMIC_DIM_M; row += uint64_t(gl_NumWorkGroups.y)) {
+        const uint64_t row_base = row * SEISMIC_LOGITS_STRIDE_0;
+        if (full_vec && stored_aligned16(out_stored(logits, row_base + col))) {
+            out_put2(logits, row_base + col, neg_inf, neg_inf);
+            out_put2(logits, row_base + col + 2ul, neg_inf, neg_inf);
+        } else {
+            for (uint64_t c = col; c < limit; ++c)
+                out_put(logits, row_base + c * SEISMIC_LOGITS_STRIDE_1, neg_inf);
+        }
     }
 }
 void place_logits_rows() {

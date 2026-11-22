@@ -19,19 +19,19 @@
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/state_space.glsl"
 
-// Shared floats of a piece: x rows of the workgroup's state rows, the weights
-// (gamma_i / gamma_j) (C_i . B_j), the cumulative log decays, gamma, the tail
-// factors gamma_last / gamma_j, the step sizes. They reuse the sequential
-// advance's region. Weight rows are padded so the lanes reading different
-// rows at one column hit different banks.
+// Shared floats of a piece: x rows of the workgroup's state rows, precomputed
+// u = delta * x rows, the weights (gamma_i / gamma_j) (C_i . B_j), the
+// cumulative log decays, gamma, and the tail factors gamma_last / gamma_j.
+// They reuse the sequential advance's region. Weight rows are padded so the
+// lanes reading different rows at one column hit different banks.
 #define SSC_PIECE uint(STATE_SPACE_PIECE)
 #define SSC_WEIGHT_STRIDE (SSC_PIECE + 1u)
 #define SSC_X 0u
-#define SSC_WEIGHTS (SSC_PIECE * SS_BLOCK_ROWS)
+#define SSC_U (SSC_PIECE * SS_BLOCK_ROWS)
+#define SSC_WEIGHTS (SSC_U + SSC_PIECE * SS_BLOCK_ROWS)
 #define SSC_LOG_GAMMA (SSC_WEIGHTS + SSC_PIECE * SSC_WEIGHT_STRIDE)
 #define SSC_GAMMA (SSC_LOG_GAMMA + SSC_PIECE)
 #define SSC_TAIL (SSC_GAMMA + SSC_PIECE)
-#define SSC_DELTA (SSC_TAIL + SSC_PIECE)
 // Rows of a piece whose S C sums one reduce-scatter finishes.
 #define SSC_GROUP (32u / SS_LANE_ROWS)
 // The products launch: B and C rows staged 32 state columns at a time, and
@@ -44,6 +44,31 @@
 // Byte address of staged input `index` of row `row`.
 uint64_t ssc_staged(uint64_t inputs, int row, uint index) {
     return inputs + (uint64_t(row) * SS_INPUT_WIDTH + index) * 4ul;
+}
+
+// Inverts p = i * (i + 1) / 2 + j (0 <= j <= i) for the lower triangle.
+uint ssc_lower_triangle_row(uint pair) {
+    int i = int((sqrt(float(8u * pair) + 1.25) - 1.0) * 0.5);
+    if ((i + 1) * (i + 2) / 2 <= int(pair)) ++i;
+    if (i * (i + 1) / 2 > int(pair)) --i;
+    return uint(i);
+}
+
+// Loads a lane's SS_COLUMNS contiguous F32 elements using 16-byte aligned
+// vec4 loads when SS_COLUMNS % 4 == 0 and aligned, with exact scalar fallback.
+void ssc_load_columns(uint64_t src, out float dst[SS_COLUMNS]) {
+    if (SS_COLUMNS % 4u == 0u && (src & 15ul) == 0ul) {
+        [[unroll]] for (uint j = 0u; j + 4u <= SS_COLUMNS; j += 4u) {
+            const vec4 v = element_vec4_at(src + uint64_t(j) * 4ul);
+            dst[j + 0u] = v.x;
+            dst[j + 1u] = v.y;
+            dst[j + 2u] = v.z;
+            dst[j + 3u] = v.w;
+        }
+        return;
+    }
+    [[unroll]] for (uint j = 0u; j < SS_COLUMNS; ++j)
+        dst[j] = element_f32_at(src + uint64_t(j) * 4ul);
 }
 
 // One row per workgroup x, 256 of its B and C channels and step sizes per
@@ -87,11 +112,9 @@ void state_space_chunk_products() {
     [[unroll]] for (uint k = 0u; k < SSC_OWNED; ++k) {
         // Pair p = i (i + 1) / 2 + j of the lower triangle.
         const uint pair = thread + 256u * k;
-        uint i = 0u;
-        while ((i + 1u) * (i + 2u) / 2u <= pair)
-            ++i;
-        rows[k] = pair < SSC_PAIRS ? i : SSC_PIECE;
-        columns[k] = pair - i * (i + 1u) / 2u;
+        const uint i = pair < SSC_PAIRS ? ssc_lower_triangle_row(pair) : SSC_PIECE;
+        rows[k] = i;
+        columns[k] = pair < SSC_PAIRS ? pair - i * (i + 1u) / 2u : 0u;
         sums[k] = 0.0;
     }
     for (uint base = 0u; base < SS_N; base += 32u) {
@@ -104,10 +127,15 @@ void state_space_chunk_products() {
         }
         barrier();
         [[unroll]] for (uint k = 0u; k < SSC_OWNED; ++k) {
-            if (rows[k] < count)
-                for (uint n = 0u; n < 32u; ++n)
-                    sums[k] = seismic_fma_rn(seismic_shared_f32[SSC_STAGED_C + rows[k] * 33u + n],
-                        seismic_shared_f32[SSC_STAGED_B + columns[k] * 33u + n], sums[k]);
+            if (rows[k] < count) {
+                const uint c_base = SSC_STAGED_C + rows[k] * 33u;
+                const uint b_base = SSC_STAGED_B + columns[k] * 33u;
+                float sum = sums[k];
+                [[unroll]] for (uint n = 0u; n < 32u; ++n)
+                    sum = seismic_fma_rn(seismic_shared_f32[c_base + n],
+                        seismic_shared_f32[b_base + n], sum);
+                sums[k] = sum;
+            }
         }
         barrier();
     }
@@ -145,11 +173,11 @@ void ssc_advance_piece(uint64_t inputs, uint64_t products, versions_slot slot, i
     const uint count = uint(min(STATE_SPACE_PIECE, slot.stop - local * STATE_SPACE_PIECE));
     for (uint item = thread; item < count * SS_BLOCK_ROWS; item += threads) {
         const uint i = item / SS_BLOCK_ROWS;
-        seismic_shared_f32[SSC_X + item] =
-            ss_convolve(slot, first + int(i) - slot.lo, head * SS_P + block_row0 + item % SS_BLOCK_ROWS);
+        const float value = ss_convolve(slot, first + int(i) - slot.lo, head * SS_P + block_row0 + item % SS_BLOCK_ROWS);
+        seismic_shared_f32[SSC_X + item] = value;
+        seismic_shared_f32[SSC_U + item] =
+            seismic_mul_rn(element_f32_at(ssc_staged(inputs, first + int(i), SS_INPUT_DELTA + head)), value);
     }
-    for (uint i = thread; i < count; i += threads)
-        seismic_shared_f32[SSC_DELTA + i] = element_f32_at(ssc_staged(inputs, first + int(i), SS_INPUT_DELTA + head));
     if (thread == 0u) {
         float sum = 0.0;
         for (uint i = 0u; i < count; ++i) {
@@ -159,13 +187,13 @@ void ssc_advance_piece(uint64_t inputs, uint64_t products, versions_slot slot, i
     }
     barrier();
     const uint64_t piece_products = products + (uint64_t(piece) * SS_G + g) * SSC_PIECE * SSC_PIECE * 4ul;
-    for (uint item = thread; item < count * count; item += threads) {
-        const uint i = item / count;
-        const uint j = item % count;
-        seismic_shared_f32[SSC_WEIGHTS + i * SSC_WEIGHT_STRIDE + j] = j <= i
-            ? seismic_mul_rn(exp(seismic_shared_f32[SSC_LOG_GAMMA + i] - seismic_shared_f32[SSC_LOG_GAMMA + j]),
-                element_f32_at(piece_products + uint64_t(i * SSC_PIECE + j) * 4ul))
-            : 0.0;
+    const uint pairs = count * (count + 1u) / 2u;
+    for (uint pair = thread; pair < pairs; pair += threads) {
+        const uint i = ssc_lower_triangle_row(pair);
+        const uint j = pair - i * (i + 1u) / 2u;
+        seismic_shared_f32[SSC_WEIGHTS + i * SSC_WEIGHT_STRIDE + j] =
+            seismic_mul_rn(exp(seismic_shared_f32[SSC_LOG_GAMMA + i] - seismic_shared_f32[SSC_LOG_GAMMA + j]),
+                element_f32_at(piece_products + uint64_t(i * SSC_PIECE + j) * 4ul));
     }
     for (uint i = thread; i < count; i += threads) {
         seismic_shared_f32[SSC_GAMMA + i] = exp(seismic_shared_f32[SSC_LOG_GAMMA + i]);
@@ -185,8 +213,7 @@ void ssc_advance_piece(uint64_t inputs, uint64_t products, versions_slot slot, i
             const uint i = min(i0 + k, count - 1u);
             const uint64_t c = ssc_staged(inputs, first + int(i), SS_INPUT_C + g * SS_N + lane * SS_COLUMNS);
             float cs[SS_COLUMNS];
-            [[unroll]] for (uint j = 0u; j < SS_COLUMNS; ++j)
-                cs[j] = element_f32_at(c + uint64_t(j) * 4ul);
+            ssc_load_columns(c, cs);
             [[unroll]] for (uint s = 0u; s < SS_LANE_ROWS; ++s) {
                 float sum = 0.0;
                 [[unroll]] for (uint j = 0u; j < SS_COLUMNS; ++j)
@@ -202,9 +229,7 @@ void ssc_advance_piece(uint64_t inputs, uint64_t products, versions_slot slot, i
             // reduce-scatter follows.
             seismic_strided_bounded(uint, j, 0u, 0u, i + 1u, min(i0 + SSC_GROUP, count), 1u)
                 sum = seismic_fma_rn(seismic_shared_f32[SSC_WEIGHTS + i * SSC_WEIGHT_STRIDE + j],
-                    seismic_mul_rn(seismic_shared_f32[SSC_DELTA + j],
-                        seismic_shared_f32[SSC_X + j * SS_BLOCK_ROWS + local_row + r]),
-                    sum);
+                    seismic_shared_f32[SSC_U + j * SS_BLOCK_ROWS + local_row + r], sum);
             const float value = seismic_shared_f32[SSC_X + i * SS_BLOCK_ROWS + local_row + r];
             const float result = seismic_fma_rn(skip, value,
                 seismic_fma_rn(seismic_shared_f32[SSC_GAMMA + i], inter, sum));
@@ -222,11 +247,10 @@ void ssc_advance_piece(uint64_t inputs, uint64_t products, versions_slot slot, i
     for (uint j = 0u; j < count; ++j) {
         const uint64_t b = ssc_staged(inputs, first + int(j), SS_INPUT_B + g * SS_N + lane * SS_COLUMNS);
         float bs[SS_COLUMNS];
-        [[unroll]] for (uint c = 0u; c < SS_COLUMNS; ++c)
-            bs[c] = element_f32_at(b + uint64_t(c) * 4ul);
+        ssc_load_columns(b, bs);
         [[unroll]] for (uint s = 0u; s < SS_LANE_ROWS; ++s) {
             const float coefficient = seismic_mul_rn(seismic_shared_f32[SSC_TAIL + j],
-                seismic_mul_rn(seismic_shared_f32[SSC_DELTA + j], seismic_shared_f32[SSC_X + j * SS_BLOCK_ROWS + local_row + s]));
+                seismic_shared_f32[SSC_U + j * SS_BLOCK_ROWS + local_row + s]);
             [[unroll]] for (uint c = 0u; c < SS_COLUMNS; ++c)
                 rows[s][c] = seismic_fma_rn(coefficient, bs[c], rows[s][c]);
         }

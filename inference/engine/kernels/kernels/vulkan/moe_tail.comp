@@ -2,57 +2,227 @@
 // experts, all F32:
 //   f = rms(dense) * dense_norm + rms(routed) * routed_norm
 //   result = (residual + rms(f) * norm) * scale
-// One workgroup per row; the combined row is formed again by the pass that
-// publishes. The Vulkan form of `metal/moe_tail.metal`.
+// One workgroup per row. On the contiguous 16-byte-aligned fast path, up to
+// `TAIL_CACHE_VECS` vec4 chunks per invocation (D <= 8192 at 256 threads) are
+// register-cached across passes so each input tensor is read once from DRAM;
+// elements beyond the cache window and non-unit-stride layouts fall back to
+// exact recomputation. The Vulkan form of `metal/moe_tail.metal`.
 #include <seismic/element.glsl>
-#include "lib/core/reduce.glsl"
 
 #define TAIL_NORM ELEMENT_OF(SEISMIC_NORM)
+#define TAIL_CACHE_VECS 8u
+
+#if ELEMENT_KIND(SEISMIC_NORM) == ELEMENT_F32
+#define TAIL_NORM_ALIGN 15ul
+#else
+#define TAIL_NORM_ALIGN 7ul
+#endif
+
+vec4 moe_tail_fma4(const vec4 a, const vec4 b, const vec4 c) {
+    return vec4(seismic_fma_rn(a.x, b.x, c.x), seismic_fma_rn(a.y, b.y, c.y),
+        seismic_fma_rn(a.z, b.z, c.z), seismic_fma_rn(a.w, b.w, c.w));
+}
+
+float moe_tail_sum4(const vec4 v) { return (v.x + v.y) + (v.z + v.w); }
+
+// Four contiguous norm elements starting at `i` (4-element aligned).
+vec4 moe_tail_norm4(const uint64_t base, const uint64_t i) {
+#if ELEMENT_KIND(SEISMIC_NORM) == ELEMENT_F32
+    return element_vec4_at(base + i * 4ul);
+#else
+    const uvec2 words = element_uvec2_at(base + i * 2ul);
+    return vec4(element_unpack2(TAIL_NORM, words.x), element_unpack2(TAIL_NORM, words.y));
+#endif
+}
 
 // f[i] of one row: both branches normalized with their inverses and norms.
-float moe_tail_combined(const uint64_t dense, const uint64_t routed, const float dense_inverse,
-    const float routed_inverse, const uint64_t i) {
+float moe_tail_combined(const uint64_t dense, const uint64_t routed, const uint64_t dense_norm,
+    const uint64_t routed_norm, const float dense_inverse, const float routed_inverse, const uint64_t i) {
     const float from_dense = element_f32_at(dense + i * SEISMIC_DENSE_STRIDE_1 * 4ul) * dense_inverse
-        * element_at(TAIL_NORM, SEISMIC_PTR(SEISMIC_BUFFER_DENSE_NORM), i * SEISMIC_DENSE_NORM_STRIDE_0);
+        * element_at(TAIL_NORM, dense_norm, i * SEISMIC_DENSE_NORM_STRIDE_0);
     const float from_routed = element_f32_at(routed + i * SEISMIC_ROUTED_STRIDE_1 * 4ul) * routed_inverse
-        * element_at(TAIL_NORM, SEISMIC_PTR(SEISMIC_BUFFER_ROUTED_NORM), i * SEISMIC_ROUTED_NORM_STRIDE_0);
+        * element_at(TAIL_NORM, routed_norm, i * SEISMIC_ROUTED_NORM_STRIDE_0);
     return from_dense + from_routed;
 }
 
-// Shared: one partial per subgroup (reduce_group_sum at float 0).
+vec4 moe_tail_combine4(const vec4 dv, const vec4 rv, const uint64_t dense_norm, const uint64_t routed_norm,
+    const float dense_inverse, const float routed_inverse, const uint64_t i) {
+    const vec4 from_dense = dv * dense_inverse * moe_tail_norm4(dense_norm, i);
+    const vec4 from_routed = rv * routed_inverse * moe_tail_norm4(routed_norm, i);
+    return from_dense + from_routed;
+}
+
+// Dual workgroup sum over `a` and `b` in one barrier, using
+// `seismic_shared_f32[0 .. 2 * SEISMIC_SUBGROUPS)`.
+void moe_tail_reduce_pair(inout float a, inout float b) {
+    a = seismic_subgroup_sum_f32(a);
+    b = seismic_subgroup_sum_f32(b);
+    if (SEISMIC_LANE == 0u) {
+        seismic_shared_f32[SEISMIC_SUBGROUP] = a;
+        seismic_shared_f32[SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP] = b;
+    }
+    barrier();
+    float total_a = 0.0;
+    float total_b = 0.0;
+    for (uint s = 0u; s < SEISMIC_SUBGROUPS; ++s) {
+        total_a += seismic_shared_f32[s];
+        total_b += seismic_shared_f32[SEISMIC_SUBGROUPS + s];
+    }
+    a = total_a;
+    b = total_b;
+}
+
+// Single workgroup sum in one barrier, writing to a disjoint shared slice
+// `seismic_shared_f32[partials .. partials + SEISMIC_SUBGROUPS)`.
+float moe_tail_reduce_one(float value, const uint partials) {
+    value = seismic_subgroup_sum_f32(value);
+    if (SEISMIC_LANE == 0u)
+        seismic_shared_f32[partials + SEISMIC_SUBGROUP] = value;
+    barrier();
+    float total = 0.0;
+    for (uint s = 0u; s < SEISMIC_SUBGROUPS; ++s)
+        total += seismic_shared_f32[partials + s];
+    return total;
+}
+
+// Shared: 3 * SEISMIC_SUBGROUPS floats (96 bytes at 256 threads <= 128):
+// [0 .. SEISMIC_SUBGROUPS) dense partials, [SEISMIC_SUBGROUPS .. 2*SEISMIC_SUBGROUPS)
+// routed partials, [2*SEISMIC_SUBGROUPS .. 3*SEISMIC_SUBGROUPS) combined partials.
 void moe_tail() {
     const uint64_t width = SEISMIC_DIM_D;
+    const uint64_t vec_count = width >> 2ul;
+    const uint64_t vec_width = vec_count << 2ul;
     const uint64_t row = gl_WorkGroupID.x;
+    const uint thread = SEISMIC_THREAD;
+    const uint64_t threads = uint64_t(gl_WorkGroupSize.x);
+    const uint64_t cached_end = uint64_t(TAIL_CACHE_VECS) * threads;
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     const uint64_t dense = SEISMIC_PTR(SEISMIC_BUFFER_DENSE) + row * SEISMIC_DENSE_STRIDE_0 * 4ul;
     const uint64_t routed = SEISMIC_PTR(SEISMIC_BUFFER_ROUTED) + row * SEISMIC_ROUTED_STRIDE_0 * 4ul;
-    // The squares the reductions combine are spread by `SEISMIC_THREAD`.
-    const uint thread = SEISMIC_THREAD;
+    const uint64_t dense_norm = SEISMIC_PTR(SEISMIC_BUFFER_DENSE_NORM);
+    const uint64_t routed_norm = SEISMIC_PTR(SEISMIC_BUFFER_ROUTED_NORM);
+    const bool unit_dr = SEISMIC_DENSE_STRIDE_1 == 1ul && SEISMIC_ROUTED_STRIDE_1 == 1ul
+        && ((dense | routed) & 15ul) == 0ul;
+
+    vec4 d_cache[TAIL_CACHE_VECS];
+    vec4 r_cache[TAIL_CACHE_VECS];
+
     float dense_squares = 0.0, routed_squares = 0.0;
-    seismic_strided(uint64_t, i, thread, width, gl_WorkGroupSize.x) {
-        const float dv = element_f32_at(dense + i * SEISMIC_DENSE_STRIDE_1 * 4ul);
-        const float rv = element_f32_at(routed + i * SEISMIC_ROUTED_STRIDE_1 * 4ul);
-        dense_squares = seismic_fma_rn(dv, dv, dense_squares);
-        routed_squares = seismic_fma_rn(rv, rv, routed_squares);
+    if (unit_dr) {
+        vec4 dsq4 = vec4(0.0), rsq4 = vec4(0.0);
+        [[unroll]] for (uint c = 0u; c < TAIL_CACHE_VECS; ++c) {
+            const uint64_t v = uint64_t(c) * threads + uint64_t(thread);
+            if (v < vec_count) {
+                const uint64_t off = v * 16ul;
+                const vec4 dv = element_vec4_at(dense + off);
+                const vec4 rv = element_vec4_at(routed + off);
+                d_cache[c] = dv;
+                r_cache[c] = rv;
+                dsq4 = moe_tail_fma4(dv, dv, dsq4);
+                rsq4 = moe_tail_fma4(rv, rv, rsq4);
+            }
+        }
+        seismic_strided_from(uint64_t, v, cached_end, uint64_t(thread), vec_count, threads) {
+            const uint64_t off = v * 16ul;
+            const vec4 dv = element_vec4_at(dense + off);
+            const vec4 rv = element_vec4_at(routed + off);
+            dsq4 = moe_tail_fma4(dv, dv, dsq4);
+            rsq4 = moe_tail_fma4(rv, rv, rsq4);
+        }
+        dense_squares = moe_tail_sum4(dsq4);
+        routed_squares = moe_tail_sum4(rsq4);
+        seismic_strided_from(uint64_t, i, vec_width, uint64_t(thread), width, threads) {
+            const float dv = element_f32_at(dense + i * 4ul);
+            const float rv = element_f32_at(routed + i * 4ul);
+            dense_squares = seismic_fma_rn(dv, dv, dense_squares);
+            routed_squares = seismic_fma_rn(rv, rv, routed_squares);
+        }
+    } else {
+        seismic_strided(uint64_t, i, uint64_t(thread), width, threads) {
+            const float dv = element_f32_at(dense + i * SEISMIC_DENSE_STRIDE_1 * 4ul);
+            const float rv = element_f32_at(routed + i * SEISMIC_ROUTED_STRIDE_1 * 4ul);
+            dense_squares = seismic_fma_rn(dv, dv, dense_squares);
+            routed_squares = seismic_fma_rn(rv, rv, routed_squares);
+        }
     }
-    dense_squares = reduce_group_sum(dense_squares, 0u);
-    routed_squares = reduce_group_sum(routed_squares, 0u);
+    moe_tail_reduce_pair(dense_squares, routed_squares);
     const float dense_inverse = inversesqrt(seismic_div_rn(dense_squares, float(width)) + epsilon);
     const float routed_inverse = inversesqrt(seismic_div_rn(routed_squares, float(width)) + epsilon);
+
+    const bool vec_combined = unit_dr && SEISMIC_DENSE_NORM_STRIDE_0 == 1ul && SEISMIC_ROUTED_NORM_STRIDE_0 == 1ul
+        && ((dense_norm | routed_norm) & TAIL_NORM_ALIGN) == 0ul;
     float squares = 0.0;
-    seismic_strided(uint64_t, i, thread, width, gl_WorkGroupSize.x) {
-        const float f = moe_tail_combined(dense, routed, dense_inverse, routed_inverse, i);
-        squares = seismic_fma_rn(f, f, squares);
+    if (vec_combined) {
+        vec4 sq4 = vec4(0.0);
+        [[unroll]] for (uint c = 0u; c < TAIL_CACHE_VECS; ++c) {
+            const uint64_t v = uint64_t(c) * threads + uint64_t(thread);
+            if (v < vec_count) {
+                const vec4 f = moe_tail_combine4(d_cache[c], r_cache[c], dense_norm, routed_norm,
+                    dense_inverse, routed_inverse, v << 2ul);
+                d_cache[c] = f;
+                sq4 = moe_tail_fma4(f, f, sq4);
+            }
+        }
+        seismic_strided_from(uint64_t, v, cached_end, uint64_t(thread), vec_count, threads) {
+            const uint64_t off = v * 16ul;
+            const vec4 f = moe_tail_combine4(element_vec4_at(dense + off), element_vec4_at(routed + off),
+                dense_norm, routed_norm, dense_inverse, routed_inverse, v << 2ul);
+            sq4 = moe_tail_fma4(f, f, sq4);
+        }
+        squares = moe_tail_sum4(sq4);
+        seismic_strided_from(uint64_t, i, vec_width, uint64_t(thread), width, threads) {
+            const float f = moe_tail_combined(dense, routed, dense_norm, routed_norm, dense_inverse,
+                routed_inverse, i);
+            squares = seismic_fma_rn(f, f, squares);
+        }
+    } else {
+        seismic_strided(uint64_t, i, uint64_t(thread), width, threads) {
+            const float f = moe_tail_combined(dense, routed, dense_norm, routed_norm, dense_inverse,
+                routed_inverse, i);
+            squares = seismic_fma_rn(f, f, squares);
+        }
     }
-    squares = reduce_group_sum(squares, 0u);
+    squares = moe_tail_reduce_one(squares, 2u * SEISMIC_SUBGROUPS);
     const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + epsilon);
+
+    const uint64_t norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
     const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL) + row * SEISMIC_RESIDUAL_STRIDE_0 * 4ul;
     const Out result = out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0);
-    for (uint64_t i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x) {
-        const float normalized = moe_tail_combined(dense, routed, dense_inverse, routed_inverse, i) * inverse
-            * element_at(TAIL_NORM, SEISMIC_PTR(SEISMIC_BUFFER_NORM), i * SEISMIC_NORM_STRIDE_0);
-        out_put(result, i * SEISMIC_RESULT_0_STRIDE_1,
-            (element_f32_at(residual + i * SEISMIC_RESIDUAL_STRIDE_1 * 4ul) + normalized) * scale);
+    const bool vec_publish = vec_combined && SEISMIC_NORM_STRIDE_0 == 1ul && SEISMIC_RESIDUAL_STRIDE_1 == 1ul
+        && SEISMIC_RESULT_0_STRIDE_1 == 1ul && (norm & TAIL_NORM_ALIGN) == 0ul && (residual & 15ul) == 0ul;
+    if (vec_publish) {
+        [[unroll]] for (uint c = 0u; c < TAIL_CACHE_VECS; ++c) {
+            const uint64_t v = uint64_t(c) * threads + uint64_t(thread);
+            if (v < vec_count) {
+                const uint64_t i = v << 2ul;
+                const vec4 normalized = d_cache[c] * inverse * moe_tail_norm4(norm, i);
+                const vec4 out4 = (element_vec4_at(residual + v * 16ul) + normalized) * scale;
+                out_put2(result, i, out4.x, out4.y);
+                out_put2(result, i + 2ul, out4.z, out4.w);
+            }
+        }
+        for (uint64_t v = cached_end + uint64_t(thread); v < vec_count; v += threads) {
+            const uint64_t i = v << 2ul;
+            const uint64_t off = v * 16ul;
+            const vec4 f = moe_tail_combine4(element_vec4_at(dense + off), element_vec4_at(routed + off),
+                dense_norm, routed_norm, dense_inverse, routed_inverse, i);
+            const vec4 normalized = f * inverse * moe_tail_norm4(norm, i);
+            const vec4 out4 = (element_vec4_at(residual + off) + normalized) * scale;
+            out_put2(result, i, out4.x, out4.y);
+            out_put2(result, i + 2ul, out4.z, out4.w);
+        }
+        for (uint64_t i = vec_width + uint64_t(thread); i < width; i += threads) {
+            const float normalized = moe_tail_combined(dense, routed, dense_norm, routed_norm, dense_inverse,
+                routed_inverse, i) * inverse * element_at(TAIL_NORM, norm, i);
+            out_put(result, i, (element_f32_at(residual + i * 4ul) + normalized) * scale);
+        }
+    } else {
+        for (uint64_t i = uint64_t(thread); i < width; i += threads) {
+            const float normalized = moe_tail_combined(dense, routed, dense_norm, routed_norm, dense_inverse,
+                routed_inverse, i) * inverse * element_at(TAIL_NORM, norm, i * SEISMIC_NORM_STRIDE_0);
+            out_put(result, i * SEISMIC_RESULT_0_STRIDE_1,
+                (element_f32_at(residual + i * SEISMIC_RESIDUAL_STRIDE_1 * 4ul) + normalized) * scale);
+        }
     }
 }

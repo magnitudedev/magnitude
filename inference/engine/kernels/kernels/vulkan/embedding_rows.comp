@@ -15,6 +15,17 @@
 #endif
 
 
+void embedding_put8(Out target, uint64_t row_base, uint64_t stride, bool vectorized, uint column, vec4 even, vec4 odd) {
+    if (vectorized) {
+        out_put8(target, row_base + uint64_t(column), even, odd);
+    } else {
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+            out_put(target, row_base + uint64_t(column + 2u * j) * stride, even[j]);
+            out_put(target, row_base + uint64_t(column + 2u * j + 1u) * stride, odd[j]);
+        }
+    }
+}
+
 // With `normalize`, the weightless-RMS inverse of each row's scaled decode
 // (the square sum reduced in a fixed order), stored to the `inverses`
 // scratch. It is a launch of its own: a conditional reduction in the decode
@@ -35,15 +46,34 @@ void embedding_rows_inverse() {
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     // Every invocation's packet rounds, spread by `SEISMIC_THREAD`; one past
     // the row, or a value past it, adds nothing.
+    const uint packets = (width >> 5) + uint((width & 31u) != 0u);
     float squares = 0.0;
-    for (uint base = 0u; base * 32u < width; base += gl_WorkGroupSize.x) {
-        const uint p = base + SEISMIC_THREAD;
-        if (p * 32u < width) {
-            const packets_packet packet = packets_load(PACKETS_W0, table_row, geometry, p, width);
-            for (uint i = 0u; i < 32u; ++i) {
-                if (32u * p + i < width) {
-                    const float value = packets_value_at(PACKETS_W0, packet, i) * scale;
-                    squares = seismic_fma_rn(value, value, squares);
+    seismic_strided(uint, p, SEISMIC_THREAD, packets, gl_WorkGroupSize.x) {
+        const packets_packet packet = packets_load(PACKETS_W0, table_row, geometry, p, width);
+        [[unroll]] for (uint step = 0u; step < 4u; ++step) {
+            const uint column = 32u * p + 8u * step;
+            if (column < width) {
+                vec4 even, odd;
+                packets_exact_values(PACKETS_W0, packet, step, even, odd);
+                if (column + 8u <= width) {
+                    even *= scale;
+                    odd *= scale;
+                    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                        squares = seismic_fma_rn(even[j], even[j], squares);
+                        squares = seismic_fma_rn(odd[j], odd[j], squares);
+                    }
+                } else {
+                    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                        const uint c = column + 2u * j;
+                        if (c < width) {
+                            const float v0 = even[j] * scale;
+                            squares = seismic_fma_rn(v0, v0, squares);
+                        }
+                        if (c + 1u < width) {
+                            const float v1 = odd[j] * scale;
+                            squares = seismic_fma_rn(v1, v1, squares);
+                        }
+                    }
                 }
             }
         }
@@ -61,37 +91,64 @@ void embedding_rows() {
     const Out widened = SEISMIC_RESULT_1_OUT;
     const uint width = uint(SEISMIC_DIM_D);
     const uint64_t row = gl_WorkGroupID.x;
+    const uint64_t row_base0 = row * SEISMIC_RESULT_0_STRIDE_0;
+    const uint64_t row_base1 = row * SEISMIC_RESULT_1_STRIDE_0;
+    const bool vec0 = SEISMIC_RESULT_0_STRIDE_1 == 1ul && stored_aligned16(out_stored(embedded, row_base0));
+    const bool vec1 = SEISMIC_RESULT_1_STRIDE_1 == 1ul && stored_aligned16(out_stored(widened, row_base1));
     const packets_rows16 geometry = PACKETS_W0_ROWS;
     const int64_t held = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
         SEISMIC_DIM_R, SEISMIC_DIM_F, element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0));
     // A row that names no table row reads zeros (the whole workgroup's).
     if (held < 0l) {
-        for (uint column = gl_LocalInvocationID.x; column < width; column += gl_WorkGroupSize.x) {
-            out_put(embedded,
-                row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1, 0.0);
-            out_put(widened,
-                row * SEISMIC_RESULT_1_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_1_STRIDE_1, 0.0);
+        const uint chunks = width >> 3;
+        const vec4 zeros = vec4(0.0);
+        for (uint c = gl_LocalInvocationID.x; c < chunks; c += gl_WorkGroupSize.x) {
+            const uint column = c * 8u;
+            embedding_put8(embedded, row_base0, SEISMIC_RESULT_0_STRIDE_1, vec0, column, zeros, zeros);
+            embedding_put8(widened, row_base1, SEISMIC_RESULT_1_STRIDE_1, vec1, column, zeros, zeros);
+        }
+        for (uint column = (chunks << 3) + gl_LocalInvocationID.x; column < width; column += gl_WorkGroupSize.x) {
+            out_put(embedded, row_base0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1, 0.0);
+            out_put(widened, row_base1 + uint64_t(column) * SEISMIC_RESULT_1_STRIDE_1, 0.0);
         }
         return;
     }
     const uint64_t table_row = packets_row(table, geometry, uint64_t(held));
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
+    const bool normalize = SEISMIC_PARAM_NORMALIZE != 0ul;
+    const float inv = normalize ? element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INVERSES) + row * 4ul) : 1.0;
     for (uint p = gl_LocalInvocationID.x; p * 32u < width; p += gl_WorkGroupSize.x) {
         const packets_packet packet = packets_load(PACKETS_W0, table_row, geometry, p, width);
         [[unroll]] for (uint step = 0u; step < 4u; ++step) {
-            vec4 even, odd;
-            packets_exact_values(PACKETS_W0, packet, step, even, odd);
-            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                const uint column = 32u * p + 8u * step + i;
-                if (column < width) {
-                    const float decoded = ((i & 1u) != 0u ? odd[i >> 1] : even[i >> 1]) * scale;
-                    const float value = element_round(ACTIVATION_A, SEISMIC_PARAM_NORMALIZE != 0ul
-                        ? decoded * element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INVERSES) + row * 4ul)
-                        : decoded);
-                    out_put(embedded,
-                        row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1, value);
-                    out_put(widened,
-                        row * SEISMIC_RESULT_1_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_1_STRIDE_1, value);
+            const uint column = 32u * p + 8u * step;
+            if (column < width) {
+                vec4 even, odd;
+                packets_exact_values(PACKETS_W0, packet, step, even, odd);
+                even *= scale;
+                odd *= scale;
+                if (normalize) {
+                    even *= inv;
+                    odd *= inv;
+                }
+                [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                    even[j] = element_round(ACTIVATION_A, even[j]);
+                    odd[j] = element_round(ACTIVATION_A, odd[j]);
+                }
+                if (column + 8u <= width) {
+                    embedding_put8(embedded, row_base0, SEISMIC_RESULT_0_STRIDE_1, vec0, column, even, odd);
+                    embedding_put8(widened, row_base1, SEISMIC_RESULT_1_STRIDE_1, vec1, column, even, odd);
+                } else {
+                    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                        const uint c = column + 2u * j;
+                        if (c < width) {
+                            out_put(embedded, row_base0 + uint64_t(c) * SEISMIC_RESULT_0_STRIDE_1, even[j]);
+                            out_put(widened, row_base1 + uint64_t(c) * SEISMIC_RESULT_1_STRIDE_1, even[j]);
+                        }
+                        if (c + 1u < width) {
+                            out_put(embedded, row_base0 + uint64_t(c + 1u) * SEISMIC_RESULT_0_STRIDE_1, odd[j]);
+                            out_put(widened, row_base1 + uint64_t(c + 1u) * SEISMIC_RESULT_1_STRIDE_1, odd[j]);
+                        }
+                    }
                 }
             }
         }

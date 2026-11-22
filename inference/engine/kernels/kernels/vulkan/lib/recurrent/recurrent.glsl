@@ -151,10 +151,29 @@ void recurrent_row_gates(recurrent_inputs in_, uint64_t row, uint head, uint cha
 float recurrent_gate_input(recurrent_inputs in_, uint64_t row, uint64_t column) {
     return recurrent_projection(in_, row, column);
 }
+
+void recurrent_gate_input8(recurrent_inputs in_, uint64_t row, uint64_t column, out vec4 even, out vec4 odd) {
+    const uint64_t index = row * SEISMIC_PROJECTION_STRIDE_0 + column;
+    if (((in_.projection + index * uint64_t(ELEMENT_BYTES(ACTIVATION_A))) & 15ul) == 0ul) {
+        element_load8(ACTIVATION_A, in_.projection, index, even, odd);
+    } else {
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+            even[j] = recurrent_projection(in_, row, column + 2ul * j);
+            odd[j] = recurrent_projection(in_, row, column + 2ul * j + 1ul);
+        }
+    }
+}
 #else
 void recurrent_row_gates(recurrent_inputs in_, uint64_t row, uint head, uint channel, out float beta,
     out float decay);
 float recurrent_gate_input(recurrent_inputs in_, uint64_t row, uint64_t column);
+
+void recurrent_gate_input8(recurrent_inputs in_, uint64_t row, uint64_t column, out vec4 even, out vec4 odd) {
+    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+        even[j] = recurrent_gate_input(in_, row, column + 2ul * j);
+        odd[j] = recurrent_gate_input(in_, row, column + 2ul * j + 1ul);
+    }
+}
 #endif
 
 // The decay of state column `column` among a value head's RECURRENT_DECAYS.
@@ -177,27 +196,32 @@ float recurrent_raw_input(recurrent_inputs in_, recurrent_slot slot, int positio
 
 // Publish the slot's successor window: the C - 1 raw rows before the
 // publication row, then the raw rows of its tape. `part` of `parts`
-// cooperating workgroups writes an even share.
+// cooperating workgroups writes an even share in 16-byte chunks.
 void recurrent_publish_window(recurrent_inputs in_, recurrent_slot slot, uint part, uint parts) {
-    const uint total = (RECURRENT_C - 1u + uint(recurrent_tape_rows(slot))) * RECURRENT_CH;
+    const uint vec = 16u / ELEMENT_BYTES(ACTIVATION_A);
+    const uint ch_vecs = RECURRENT_CH / vec;
+    const uint total = (RECURRENT_C - 1u + uint(recurrent_tape_rows(slot))) * ch_vecs;
     const uint per = (total + parts - 1u) / parts;
     const uint first = part * per;
     const uint last = min(total, first + per);
+    const Out source_bank = versions_out_bank(in_.window, slot.source, SEISMIC_WINDOW_STRIDE_0);
+    const Out target_bank = versions_out_bank(in_.window, slot.target, SEISMIC_WINDOW_STRIDE_0);
     // Strided: `chunk_scan` reaches `chunk_sequential_rows`' shuffle through
     // `chunk_scan_rows`, whose piece loop may (as formation sees it) take no
     // trip and so cross no barrier. Spread by `SEISMIC_THREAD`: the state the
     // caller's subgroups reduce is read from the arenas these stores write.
     seismic_strided_from(uint, index, first, SEISMIC_THREAD, last, gl_WorkGroupSize.x) {
-        const int row = int(index / RECURRENT_CH);
-        const uint channel = index % RECURRENT_CH;
+        const int row = int(index / ch_vecs);
+        const uint channel = (index % ch_vecs) * vec;
         const int position = slot.stop + row - (int(RECURRENT_C) - 1);
-        const Out target = recurrent_window_at(in_, slot.target, row, channel);
+        const Out target = out_offset(target_bank, uint64_t(row) * SEISMIC_WINDOW_STRIDE_1 + channel);
         if (position < 0)
             out_move_stored(target, 0ul,
-                recurrent_window_at(in_, slot.source, slot.taped + int(RECURRENT_C) - 1 + position, channel), 0ul, 1ul);
+                out_offset(source_bank, uint64_t(slot.taped + int(RECURRENT_C) - 1 + position) * SEISMIC_WINDOW_STRIDE_1 + channel),
+                0ul, uint64_t(vec));
         else
             out_copy_stored(target, 0ul, in_.projection,
-                uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + channel, 1ul);
+                uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + channel, uint64_t(vec));
     }
 }
 
@@ -208,20 +232,41 @@ void recurrent_publish_window(recurrent_inputs in_, recurrent_slot slot, uint pa
 void recurrent_load_rows(recurrent_inputs in_, const uint rows, int bank, uint head, uint first_row,
     out float state[RECURRENT_MAX_ROWS][RECURRENT_CPL]) {
     const uint lane = SEISMIC_LANE;
-    [[unroll]] for (uint r = 0u; r < RECURRENT_MAX_ROWS; ++r)
-        if (r < rows)
-            [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-                state[r][c] = out_at(recurrent_state_row(in_, bank, head, first_row + r), uint64_t(lane * RECURRENT_CPL + c));
+    [[unroll]] for (uint r = 0u; r < RECURRENT_MAX_ROWS; ++r) {
+        if (r < rows) {
+            const Stored row = out_stored(recurrent_state_row(in_, bank, head, first_row + r), 0ul);
+            if (RECURRENT_CPL % 4u == 0u) {
+                [[unroll]] for (uint c = 0u; c + 3u < RECURRENT_CPL; c += 4u) {
+                    const vec4 v = stored_load4(row, uint64_t(lane * RECURRENT_CPL + c));
+                    state[r][c] = v.x;
+                    state[r][c + 1u] = v.y;
+                    state[r][c + 2u] = v.z;
+                    state[r][c + 3u] = v.w;
+                }
+            } else {
+                [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
+                    state[r][c] = stored_at(row, uint64_t(lane * RECURRENT_CPL + c));
+            }
+        }
+    }
 }
 
 void recurrent_store_rows(recurrent_inputs in_, const uint rows, int bank, uint head, uint first_row,
     float state[RECURRENT_MAX_ROWS][RECURRENT_CPL]) {
     const uint lane = SEISMIC_LANE;
-    [[unroll]] for (uint r = 0u; r < RECURRENT_MAX_ROWS; ++r)
-        if (r < rows)
-            [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-                out_put(recurrent_state_row(in_, bank, head, first_row + r), uint64_t(lane * RECURRENT_CPL + c),
-                    state[r][c]);
+    [[unroll]] for (uint r = 0u; r < RECURRENT_MAX_ROWS; ++r) {
+        if (r < rows) {
+            const Out row = recurrent_state_row(in_, bank, head, first_row + r);
+            if (RECURRENT_CPL % 4u == 0u) {
+                [[unroll]] for (uint c = 0u; c + 3u < RECURRENT_CPL; c += 4u)
+                    out_put4(row, uint64_t(lane * RECURRENT_CPL + c),
+                        vec4(state[r][c], state[r][c + 1u], state[r][c + 2u], state[r][c + 3u]));
+            } else {
+                [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
+                    out_put(row, uint64_t(lane * RECURRENT_CPL + c), state[r][c]);
+            }
+        }
+    }
 }
 
 // A subgroup's `rows` rows of the slot's source version: the bank's state
@@ -233,17 +278,42 @@ void recurrent_load_version(recurrent_inputs in_, recurrent_slot slot, const uin
     const uint lane = SEISMIC_LANE;
     const uint key = recurrent_key_head(in_, head);
     for (int entry = 0; entry < slot.taped; ++entry) {
-        const Out tape = recurrent_tape_row(in_, slot.source, entry);
+        const Stored tape = out_stored(recurrent_tape_row(in_, slot.source, entry), 0ul);
         // One decay per value head is loaded once.
         float k[RECURRENT_CPL], factor[RECURRENT_CPL];
-        [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-            factor[c] = RECURRENT_DECAYS == 1u && c > 0u ? factor[0]
-                : out_at(tape, recurrent_tape_factor(head, lane * RECURRENT_CPL + c));
-        [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-            k[c] = out_at(tape, uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + lane * RECURRENT_CPL + c));
+        if (RECURRENT_DECAYS == 1u) {
+            const float f = stored_at(tape, recurrent_tape_factor(head, 0u));
+            [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
+                factor[c] = f;
+        } else if (RECURRENT_CPL % 4u == 0u) {
+            [[unroll]] for (uint c = 0u; c + 3u < RECURRENT_CPL; c += 4u) {
+                const vec4 v = stored_load4(tape, recurrent_tape_factor(head, lane * RECURRENT_CPL + c));
+                factor[c] = v.x;
+                factor[c + 1u] = v.y;
+                factor[c + 2u] = v.z;
+                factor[c + 3u] = v.w;
+            }
+        } else {
+            [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
+                factor[c] = stored_at(tape, recurrent_tape_factor(head, lane * RECURRENT_CPL + c));
+        }
+        if (RECURRENT_CPL % 4u == 0u) {
+            [[unroll]] for (uint c = 0u; c + 3u < RECURRENT_CPL; c += 4u) {
+                const vec4 v = stored_load4(tape, uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + lane * RECURRENT_CPL + c));
+                k[c] = v.x;
+                k[c + 1u] = v.y;
+                k[c + 2u] = v.z;
+                k[c + 3u] = v.w;
+            }
+        } else {
+            [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
+                k[c] = stored_at(tape, uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + lane * RECURRENT_CPL + c));
+        }
+        const uint64_t u_base = uint64_t(RECURRENT_TAPE_U + head * RECURRENT_W + first_row);
+        const vec4 u_vec = rows == 4u ? stored_load4(tape, u_base) : vec4(0.0);
         [[unroll]] for (uint s = 0u; s < RECURRENT_MAX_ROWS; ++s) {
             if (s < rows) {
-                const float u = out_at(tape, uint64_t(RECURRENT_TAPE_U + head * RECURRENT_W + first_row + s));
+                const float u = rows == 4u ? u_vec[s] : stored_at(tape, u_base + uint64_t(s));
                 [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
                     state[s][c] = seismic_fma_rn(u, k[c], state[s][c] * factor[c]);
             }
@@ -364,11 +434,26 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin
             if (taping)
                 entry = recurrent_tape_row(in_, slot.target, row - publish);
             if (taping && first_row == 0u) {
-                [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c) {
-                    if (records_keys)
-                        out_put(entry, uint64_t(RECURRENT_TAPE_K + key_row * W + lane * CPL + c), k[c]);
-                    if (RECURRENT_DECAYS > 1u || (c == 0u && lane == 0u))
-                        out_put(entry, recurrent_tape_factor(head, lane * CPL + c), factor[c]);
+                if (RECURRENT_CPL % 4u == 0u) {
+                    if (records_keys) {
+                        [[unroll]] for (uint c = 0u; c + 3u < RECURRENT_CPL; c += 4u)
+                            out_put4(entry, uint64_t(RECURRENT_TAPE_K + key_row * W + lane * CPL + c),
+                                vec4(k[c], k[c + 1u], k[c + 2u], k[c + 3u]));
+                    }
+                    if (RECURRENT_DECAYS > 1u) {
+                        [[unroll]] for (uint c = 0u; c + 3u < RECURRENT_CPL; c += 4u)
+                            out_put4(entry, recurrent_tape_factor(head, lane * CPL + c),
+                                vec4(factor[c], factor[c + 1u], factor[c + 2u], factor[c + 3u]));
+                    } else if (lane == 0u) {
+                        out_put(entry, recurrent_tape_factor(head, 0u), factor[0]);
+                    }
+                } else {
+                    [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c) {
+                        if (records_keys)
+                            out_put(entry, uint64_t(RECURRENT_TAPE_K + key_row * W + lane * CPL + c), k[c]);
+                        if (RECURRENT_DECAYS > 1u || (c == 0u && lane == 0u))
+                            out_put(entry, recurrent_tape_factor(head, lane * CPL + c), factor[c]);
+                    }
                 }
             }
             float outputs[RECURRENT_MAX_ROWS];
@@ -443,13 +528,29 @@ recurrent_gated8 recurrent_gated_inputs8(recurrent_inputs in_, uint64_t mixed, i
     const uint64_t z = RECURRENT_GATE_FIRST + uint64_t(head) * RECURRENT_W + i;
     const uint64_t norm = SEISMIC_PTR(SEISMIC_BUFFER_RECURRENT_NORM);
     recurrent_gated8 v;
-    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-        v.me[j] = recurrent_raw(mixed, covered, row, head, i + 2u * j);
-        v.mo[j] = recurrent_raw(mixed, covered, row, head, i + 2u * j + 1u);
-        v.ze[j] = recurrent_gate_input(in_, row, z + 2u * j);
-        v.zo[j] = recurrent_gate_input(in_, row, z + 2u * j + 1u);
-        v.ne[j] = element_at(RECURRENT_NORM, norm, uint64_t(i + 2u * j) * SEISMIC_RECURRENT_NORM_STRIDE_0);
-        v.no[j] = element_at(RECURRENT_NORM, norm, uint64_t(i + 2u * j + 1u) * SEISMIC_RECURRENT_NORM_STRIDE_0);
+    if (row < uint64_t(covered)) {
+        const uint64_t m_idx = recurrent_raw_index(row, head, i);
+        if (((mixed + m_idx * uint64_t(ELEMENT_BYTES(ACTIVATION_A))) & 15ul) == 0ul) {
+            element_load8(ACTIVATION_A, mixed, m_idx, v.me, v.mo);
+        } else {
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                v.me[j] = element_at(ACTIVATION_A, mixed, m_idx + 2ul * j);
+                v.mo[j] = element_at(ACTIVATION_A, mixed, m_idx + 2ul * j + 1ul);
+            }
+        }
+    } else {
+        v.me = vec4(0.0);
+        v.mo = vec4(0.0);
+    }
+    recurrent_gate_input8(in_, row, z, v.ze, v.zo);
+    if (SEISMIC_RECURRENT_NORM_STRIDE_0 == 1ul
+        && ((norm + uint64_t(i) * uint64_t(ELEMENT_BYTES(RECURRENT_NORM))) & 15ul) == 0ul) {
+        element_load8(RECURRENT_NORM, norm, uint64_t(i), v.ne, v.no);
+    } else {
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+            v.ne[j] = element_at(RECURRENT_NORM, norm, uint64_t(i + 2u * j) * SEISMIC_RECURRENT_NORM_STRIDE_0);
+            v.no[j] = element_at(RECURRENT_NORM, norm, uint64_t(i + 2u * j + 1u) * SEISMIC_RECURRENT_NORM_STRIDE_0);
+        }
     }
     return v;
 }
@@ -464,11 +565,18 @@ void recurrent_store_gated8(recurrent_gated8 v, float inverse, uint64_t row, uin
     const Out gated = SEISMIC_RESULT_0_OUT;
     const uint64_t at = row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(head) * SEISMIC_RESULT_0_STRIDE_1;
     const vec4 e = v.me * inverse * v.ne, o = v.mo * inverse * v.no;
+    vec4 ge, go;
     [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-        out_put(gated, at + uint64_t(i + 2u * j) * SEISMIC_RESULT_0_STRIDE_2,
-            element_round(ACTIVATION_A, element_round(ACTIVATION_A, e[j]) * recurrent_gate_rounded(v.ze[j])));
-        out_put(gated, at + uint64_t(i + 2u * j + 1u) * SEISMIC_RESULT_0_STRIDE_2,
-            element_round(ACTIVATION_A, element_round(ACTIVATION_A, o[j]) * recurrent_gate_rounded(v.zo[j])));
+        ge[j] = element_round(ACTIVATION_A, element_round(ACTIVATION_A, e[j]) * recurrent_gate_rounded(v.ze[j]));
+        go[j] = element_round(ACTIVATION_A, element_round(ACTIVATION_A, o[j]) * recurrent_gate_rounded(v.zo[j]));
+    }
+    if (SEISMIC_RESULT_0_STRIDE_2 == 1ul && stored_aligned16(out_stored(gated, at + uint64_t(i)))) {
+        out_put8(gated, at + uint64_t(i), ge, go);
+    } else {
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+            out_put(gated, at + uint64_t(i + 2u * j) * SEISMIC_RESULT_0_STRIDE_2, ge[j]);
+            out_put(gated, at + uint64_t(i + 2u * j + 1u) * SEISMIC_RESULT_0_STRIDE_2, go[j]);
+        }
     }
 }
 

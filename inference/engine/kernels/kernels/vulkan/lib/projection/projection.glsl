@@ -950,10 +950,118 @@ void projection_gemv(const int wk, const int uk, const bool paired, const uint r
 
 float projection_ordered_stage_row(projection_prologue in_, uint m, Out out_, uint64_t stride0, uint64_t stride1) {
     const uint tid = SEISMIC_THREAD, threads = SEISMIC_SUBGROUPS * 32u;
+    const uint64_t out_row = uint64_t(m) * stride0;
+    if (in_.kind == PROJECTION_ORDERED_RMS && in_.columns > 0u && in_.columns <= 8192u && in_.x1 == 1ul
+        && threads == 256u) {
+        const uint64_t row = uint64_t(projection_row(in_.rows, m)) * in_.x0;
+        if (stored_aligned16(stored_offset(in_.x, row))) {
+            vec4 r0[4], r1[4];
+            [[unroll]] for (uint ch = 0u; ch < 4u; ++ch) {
+                r0[ch] = vec4(0.0);
+                r1[ch] = vec4(0.0);
+                const uint c = (ch * 256u + tid) * 8u;
+                if (c + 8u <= in_.columns) {
+                    r0[ch] = stored_vec4_at(in_.x, row + uint64_t(c));
+                    r1[ch] = stored_vec4_at(in_.x, row + uint64_t(c + 4u));
+                } else if (c < in_.columns) {
+                    if (c + 4u <= in_.columns) {
+                        r0[ch] = stored_vec4_at(in_.x, row + uint64_t(c));
+                    } else {
+                        r0[ch] = vec4(
+                            c + 0u < in_.columns ? stored_at(in_.x, row + uint64_t(c + 0u)) : 0.0,
+                            c + 1u < in_.columns ? stored_at(in_.x, row + uint64_t(c + 1u)) : 0.0,
+                            c + 2u < in_.columns ? stored_at(in_.x, row + uint64_t(c + 2u)) : 0.0,
+                            c + 3u < in_.columns ? stored_at(in_.x, row + uint64_t(c + 3u)) : 0.0);
+                    }
+                    r1[ch] = vec4(
+                        c + 4u < in_.columns ? stored_at(in_.x, row + uint64_t(c + 4u)) : 0.0,
+                        c + 5u < in_.columns ? stored_at(in_.x, row + uint64_t(c + 5u)) : 0.0,
+                        c + 6u < in_.columns ? stored_at(in_.x, row + uint64_t(c + 6u)) : 0.0,
+                        c + 7u < in_.columns ? stored_at(in_.x, row + uint64_t(c + 7u)) : 0.0);
+                }
+            }
+            const uint group_id = tid >> 3u, u = tid & 7u;
+            float sum = 0.0;
+            for (uint base_slot = 0u; base_slot * 8u < in_.columns; base_slot += 64u) {
+                if (base_slot > 0u)
+                    barrier();
+                [[unroll]] for (uint ch = 0u; ch < 4u; ++ch) {
+                    const uint slot = ch * 256u + tid;
+                    if (slot >= base_slot && slot < base_slot + 64u) {
+                        const uint off = 4u + (slot - base_slot) * 8u;
+                        seismic_shared_f32[off + 0u] = r0[ch].x;
+                        seismic_shared_f32[off + 1u] = r0[ch].y;
+                        seismic_shared_f32[off + 2u] = r0[ch].z;
+                        seismic_shared_f32[off + 3u] = r0[ch].w;
+                        seismic_shared_f32[off + 4u] = r1[ch].x;
+                        seismic_shared_f32[off + 5u] = r1[ch].y;
+                        seismic_shared_f32[off + 6u] = r1[ch].z;
+                        seismic_shared_f32[off + 7u] = r1[ch].w;
+                    }
+                }
+                barrier();
+                if (group_id == 0u) {
+                    const uint lim = min(in_.columns - base_slot * 8u, 512u);
+                    sum = projection_ordered_accumulate_sram8(4u, lim, u, sum);
+                }
+            }
+            const float total_sq = projection_ordered_combine8(sum);
+            if (tid == 0u)
+                seismic_shared_f32[0] =
+                    seismic_div_rn(1.0, sqrt(seismic_div_rn(total_sq, float(in_.columns)) + in_.eps));
+            barrier();
+            const float inv = seismic_shared_f32[0];
+            const bool fast_put = stride1 == 1ul && stored_aligned16(out_stored(out_, out_row));
+            const bool fast_norm = in_.norm_stride == 1ul && (in_.norm & 15ul) == 0ul;
+            [[unroll]] for (uint ch = 0u; ch < 4u; ++ch) {
+                const uint c = (ch * 256u + tid) * 8u;
+                if (c + 8u <= in_.columns && fast_put) {
+                    vec4 ne, no;
+                    if (fast_norm) {
+                        element_load8(in_.norm_kind, in_.norm, uint64_t(c), ne, no);
+                    } else {
+                        float nw[8];
+                        [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                            nw[j] = element_at(in_.norm_kind, in_.norm, uint64_t(c + j) * in_.norm_stride);
+                        ne = vec4(nw[0], nw[2], nw[4], nw[6]);
+                        no = vec4(nw[1], nw[3], nw[5], nw[7]);
+                    }
+                    const vec4 e = vec4(r0[ch].x, r0[ch].z, r1[ch].x, r1[ch].z) * inv * ne;
+                    const vec4 o = vec4(r0[ch].y, r0[ch].w, r1[ch].y, r1[ch].w) * inv * no;
+                    vec4 even, odd;
+                    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                        even[j] = element_round(in_.act, e[j]);
+                        odd[j] = element_round(in_.act, o[j]);
+                    }
+                    out_put8(out_, out_row + uint64_t(c), even, odd);
+                } else if (c < in_.columns) {
+                    const float raw_v[8] = float[8](
+                        r0[ch].x, r0[ch].y, r0[ch].z, r0[ch].w, r1[ch].x, r1[ch].y, r1[ch].z, r1[ch].w);
+                    for (uint j = 0u; j < 8u && c + j < in_.columns; ++j) {
+                        const float nw = element_at(in_.norm_kind, in_.norm, uint64_t(c + j) * in_.norm_stride);
+                        out_put(out_, out_row + uint64_t(c + j) * stride1,
+                            element_round(in_.act, raw_v[j] * inv * nw));
+                    }
+                }
+            }
+            return inv;
+        }
+    }
     projection_ordered_inverses(in_, 1u, 0u, 1u, m, true, 4u);
     const float inv = seismic_shared_f32[0];
-    for (uint c = tid; c < in_.columns; c += threads)
-        out_put(out_, uint64_t(m) * stride0 + uint64_t(c) * stride1, projection_ordered_at(in_, m, c, inv));
+    if (stride1 == 1ul && stored_aligned16(out_stored(out_, out_row))) {
+        const uint k8 = in_.columns & ~7u;
+        for (uint c = tid * 8u; c < k8; c += threads * 8u) {
+            vec4 even, odd;
+            projection_load8(in_, m, c, inv, even, odd);
+            out_put8(out_, out_row + uint64_t(c), even, odd);
+        }
+        for (uint c = k8 + tid; c < in_.columns; c += threads)
+            out_put(out_, out_row + uint64_t(c), projection_ordered_at(in_, m, c, inv));
+    } else {
+        for (uint c = tid; c < in_.columns; c += threads)
+            out_put(out_, out_row + uint64_t(c) * stride1, projection_ordered_at(in_, m, c, inv));
+    }
     return inv;
 }
 

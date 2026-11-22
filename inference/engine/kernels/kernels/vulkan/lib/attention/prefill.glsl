@@ -1162,19 +1162,48 @@ void prefill_merge(prefill_scratch scratch_planes, prefill_picked picked) {
     const uint64_t heads = uint64_t(ATTENTION_KV * ATTENTION_G);
     const uint tile = gl_WorkGroupID.x;
     const uint64_t head = gl_WorkGroupID.y;
+#if (2 * SEISMIC_STATIC_P + SEISMIC_STATIC_S) >= 64
+    const uint column = SEISMIC_THREAD;
+#else
     const uint column = gl_LocalInvocationIndex;
+#endif
     const uint count = element_u32_at(scratch_planes.counts + uint64_t(tile) * 4ul);
     if (count <= 1u && !PREFILL_PICKS)
         return;
     const uint64_t rows = SEISMIC_DIM_M;
-    for (uint64_t row = uint64_t(tile) * PREFILL_QT; row < min(uint64_t(tile + 1u) * PREFILL_QT, rows); ++row) {
+    const uint64_t partials = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS);
+    const uint64_t statistics = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS);
+    const uint64_t stride = rows * heads;
+    const uint64_t row_end = min(uint64_t(tile + 1u) * PREFILL_QT, rows);
+    for (uint64_t row = uint64_t(tile) * PREFILL_QT; row < row_end; ++row) {
         const uint64_t slot = row * heads + head;
-        vec3 merged = attention_merge_state(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
-            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), slot, rows * heads, count, column);
+        vec3 merged;
+#if (2 * SEISMIC_STATIC_P + SEISMIC_STATIC_S) >= 64
+        if (count <= ATTENTION_MERGE_SHARED_MAX) {
+            barrier();
+            bool merging;
+            if (seismic_steer(merging, SEISMIC_SUBGROUP == 0u))
+                attention_merge_weights(statistics, slot, stride, count, head, 0u, merging);
+            barrier();
+            const float accumulated = attention_merge_accumulate(partials, slot, stride, count, column, 0u);
+            if (!PREFILL_PICKS) {
+                attention_store_gated(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_RESULT_0_OUT, row,
+                    head, column, accumulated * seismic_shared_f32[ATTENTION_MERGE_SHARED_MAX + 2u]);
+                continue;
+            }
+            merged = vec3(seismic_shared_f32[ATTENTION_MERGE_SHARED_MAX],
+                seismic_shared_f32[ATTENTION_MERGE_SHARED_MAX + 1u], accumulated);
+        } else {
+            merged = attention_merge_state(partials, statistics, slot, stride, count, column);
+        }
+#else
+        merged = attention_merge_state(partials, statistics, slot, stride, count, column);
+#endif
         if (PREFILL_PICKS) {
-            const float denominator = element_f32_at(picked.statistics + slot * 8ul + 4ul);
+            const uvec2 picked_stat = element_uvec2_at(picked.statistics + slot * 8ul);
+            const float denominator = uintBitsToFloat(picked_stat.y);
             if (denominator > 0.0) {
-                const float maximum = element_f32_at(picked.statistics + slot * 8ul);
+                const float maximum = uintBitsToFloat(picked_stat.x);
                 const float next = max(merged.x, maximum);
                 const float carry = exp2(merged.x - next);
                 const float weight = exp2(maximum - next);
@@ -1199,11 +1228,13 @@ void prefill_decode_merge() {
     const uvec2 place = attention_merge_place();
     const uint64_t head = place.x, row = gl_WorkGroupID.y;
     const uint column = place.y;
+    const uint64_t base_head = uint64_t(gl_WorkGroupID.x) * ATTENTION_MERGE_HEADS;
+    const float attended = attention_merge_group(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS),
+        (row * ATTENTION_KV * ATTENTION_G + head) * PREFILL_PARTS, 1ul, PREFILL_PARTS, column, head,
+        (row * ATTENTION_KV * ATTENTION_G + base_head) * PREFILL_PARTS, base_head);
     if (column >= ATTENTION_W)
         return;
-    const float attended = attention_merge(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS),
-        (row * ATTENTION_KV * ATTENTION_G + head) * PREFILL_PARTS, 1ul, PREFILL_PARTS, column, head);
     attention_store_gated(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_RESULT_0_OUT, row,
         head, column, attended);
 }

@@ -1,16 +1,53 @@
 // corrector_features: one workgroup of 256 invocations per proposing row
-// reduces the row's softmax normalizer (maximum, then the sum of exp(logit -
-// maximum)), forms its K candidates' five features and their layer norm (one
-// invocation per candidate), then publishes silu(up · normed + up_bias) for
-// every (candidate, column), rounded once to A. Mirrors
+// reduces the row's softmax normalizer in a single vectorized online-softmax
+// pass over V logits, forms its K candidates' five features and their layer
+// norm (one invocation per candidate), then publishes silu(up · normed +
+// up_bias) for every (candidate, column), reusing up weights across candidates
+// and pairing unit-stride stores, rounded once to A. Mirrors
 // `cpu/corrector_features.rs`.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
-#include "lib/core/reduce.glsl"
 
-// Shared: one partial per subgroup (floats 0..32), then the K candidates'
-// five normed features from float 32.
+// Shared: online softmax partials per subgroup (max in 0..7, sum in 8..15;
+// floats 0..31 reserved), then the K candidates' five normed features from
+// float 32.
 #define FEATURES_NORMED 32u
+
+struct OnlineSoftmax {
+    float max_val;
+    float sum;
+};
+
+void online_softmax_add(inout OnlineSoftmax state, float x) {
+    if (x > state.max_val) {
+        state.sum = (state.sum != 0.0 ? state.sum * exp(state.max_val - x) : 0.0) + 1.0;
+        state.max_val = x;
+    } else if (x != -uintBitsToFloat(0x7f800000u)) {
+        state.sum += exp(x - state.max_val);
+    }
+}
+
+OnlineSoftmax reduce_group_online_softmax(OnlineSoftmax state) {
+    const float m = seismic_subgroup_max_f32(state.max_val);
+    const float scaled = state.sum != 0.0 ? state.sum * exp(state.max_val - m) : 0.0;
+    const float s = seismic_subgroup_sum_f32(scaled);
+    barrier();
+    if (SEISMIC_LANE == 0u) {
+        seismic_shared_f32[SEISMIC_SUBGROUP] = m;
+        seismic_shared_f32[8u + SEISMIC_SUBGROUP] = s;
+    }
+    barrier();
+    float maximum = seismic_shared_f32[0u];
+    for (uint g = 1u; g < SEISMIC_SUBGROUPS; ++g)
+        maximum = max(maximum, seismic_shared_f32[g]);
+    float total = 0.0;
+    for (uint g = 0u; g < SEISMIC_SUBGROUPS; ++g) {
+        const float g_sum = seismic_shared_f32[8u + g];
+        if (g_sum != 0.0)
+            total += g_sum * exp(seismic_shared_f32[g] - maximum);
+    }
+    return OnlineSoftmax(maximum, total);
+}
 
 void corrector_features() {
     const uint64_t logits = SEISMIC_PTR(SEISMIC_BUFFER_LOGITS);
@@ -21,59 +58,117 @@ void corrector_features() {
     const uint64_t up_bias = SEISMIC_PTR(SEISMIC_BUFFER_UP_BIAS);
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t row = gl_WorkGroupID.x;
-    const uint64_t count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
-    // Numbered by `SEISMIC_THREAD`: the partials reach the reductions, and
+    const uint64_t vocabulary = SEISMIC_DIM_V, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
+    // Numbered by `SEISMIC_THREAD`: the partials reach the reduction, and
     // the candidates' group memory is read beside theirs.
-    const uint64_t lane = SEISMIC_THREAD, threads = gl_WorkGroupSize.x;
+    const uint64_t lane = uint64_t(SEISMIC_THREAD), threads = uint64_t(gl_WorkGroupSize.x);
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const uint64_t line = logits + row * SEISMIC_LOGITS_STRIDE_0 * 4ul;
 
-    float local = -uintBitsToFloat(0x7f800000u);
-    seismic_strided(uint64_t, v, lane, SEISMIC_DIM_V, threads)
-        local = max(local, element_f32_at(logits + (row * SEISMIC_LOGITS_STRIDE_0 + v * SEISMIC_LOGITS_STRIDE_1) * 4ul));
-    const float maximum = reduce_group_max(local, 0u);
-    float partial = 0.0;
-    seismic_strided(uint64_t, v, lane, SEISMIC_DIM_V, threads)
-        partial += exp(element_f32_at(logits + (row * SEISMIC_LOGITS_STRIDE_0 + v * SEISMIC_LOGITS_STRIDE_1) * 4ul)
-            - maximum);
-    const float normalizer = maximum + log(reduce_group_sum(partial, 0u));
+    OnlineSoftmax state = OnlineSoftmax(-uintBitsToFloat(0x7f800000u), 0.0);
+    if (SEISMIC_LOGITS_STRIDE_1 == 1ul && (line & 3ul) == 0ul) {
+        const uint64_t misalign = (line & 15ul) >> 2;
+        const uint64_t head = misalign == 0ul ? 0ul : min(4ul - misalign, vocabulary);
+        if (lane < head)
+            online_softmax_add(state, element_f32_at(line + lane * 4ul));
+        const uint64_t aligned = line + head * 4ul;
+        const uint64_t vec_count = (vocabulary - head) >> 2;
+        seismic_strided(uint64_t, i, lane, vec_count, threads) {
+            const vec4 v = element_vec4_at(aligned + i * 16ul);
+            online_softmax_add(state, v.x);
+            online_softmax_add(state, v.y);
+            online_softmax_add(state, v.z);
+            online_softmax_add(state, v.w);
+        }
+        const uint64_t tail_start = head + (vec_count << 2);
+        if (tail_start + lane < vocabulary)
+            online_softmax_add(state, element_f32_at(line + (tail_start + lane) * 4ul));
+    } else {
+        seismic_strided(uint64_t, v, lane, vocabulary, threads)
+            online_softmax_add(state, element_f32_at(line + v * SEISMIC_LOGITS_STRIDE_1 * 4ul));
+    }
+    const OnlineSoftmax softmax = reduce_group_online_softmax(state);
+    const float normalizer = softmax.max_val + log(softmax.sum);
 
     const float best = element_f32_at(unary + row * SEISMIC_UNARY_STRIDE_0 * 4ul);
     // A 32-bit counter: see `streaming/contract.hpp`.
     for (uint rank = uint(lane); rank < uint(count); rank += uint(threads)) {
-        const float logit = element_f32_at(unary + (row * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1) * 4ul);
+        const float logit = element_f32_at(unary + (row * SEISMIC_UNARY_STRIDE_0 + uint64_t(rank) * SEISMIC_UNARY_STRIDE_1) * 4ul);
         const float lp = logit - normalizer;
         float features[5];
         features[0] = lp;
         features[1] = exp(lp);
         features[2] = logit - best;
         features[3] = count > 1ul ? seismic_div_rn(float(rank), float(count - 1ul)) : 0.0;
-        features[4] = rank == 0ul ? 1.0 : 0.0;
+        features[4] = rank == 0u ? 1.0 : 0.0;
         float sum = 0.0;
-        for (uint f = 0u; f < 5u; ++f)
+        [[unroll]] for (uint f = 0u; f < 5u; ++f)
             sum += features[f];
         const float mean = seismic_div_rn(sum, 5.0);
         float squares = 0.0;
-        for (uint f = 0u; f < 5u; ++f)
+        [[unroll]] for (uint f = 0u; f < 5u; ++f)
             squares += (features[f] - mean) * (features[f] - mean);
         const float inverse = seismic_div_rn(1.0, seismic_sqrt_rn(seismic_div_rn(squares, 5.0) + epsilon));
-        for (uint f = 0u; f < 5u; ++f)
-            seismic_shared_f32[FEATURES_NORMED + uint(rank) * 5u + f] =
+        [[unroll]] for (uint f = 0u; f < 5u; ++f)
+            seismic_shared_f32[FEATURES_NORMED + rank * 5u + f] =
                 (features[f] - mean) * inverse * element_f32_at(norm_weight + uint64_t(f) * SEISMIC_NORM_WEIGHT_STRIDE_0 * 4ul)
                 + element_f32_at(norm_bias + uint64_t(f) * SEISMIC_NORM_BIAS_STRIDE_0 * 4ul);
     }
     barrier();
 
-    for (seismic_walk at = seismic_walk_begin(uint(lane), gl_WorkGroupSize.x, count * width,
-                u64vec3(1ul, 1ul, width));
-            at.index < count * width; seismic_walk_next(at)) {
-        const uint64_t rank = at.axes.x, column = at.axes.w;
-        float value = element_f32_at(up_bias + column * SEISMIC_UP_BIAS_STRIDE_0 * 4ul);
-        for (uint f = 0u; f < 5u; ++f)
-            value = seismic_fma_rn(
-                element_f32_at(up_weight + (column * SEISMIC_UP_WEIGHT_STRIDE_0 + uint64_t(f) * SEISMIC_UP_WEIGHT_STRIDE_1) * 4ul),
-                seismic_shared_f32[FEATURES_NORMED + uint(rank) * 5u + f], value);
-        out_put(result,
-            (row * count + rank) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-            seismic_div_rn(value, 1.0 + exp(-value)));
+    const uint64_t out_row_base = row * count;
+    if (SEISMIC_RESULT_0_STRIDE_1 == 1ul) {
+        const uint64_t pairs = width >> 1;
+        for (uint64_t p = lane; p < pairs; p += threads) {
+            const uint64_t c0 = p << 1;
+            const uint64_t c1 = c0 + 1ul;
+            const float b0 = element_f32_at(up_bias + c0 * SEISMIC_UP_BIAS_STRIDE_0 * 4ul);
+            const float b1 = element_f32_at(up_bias + c1 * SEISMIC_UP_BIAS_STRIDE_0 * 4ul);
+            float w0[5], w1[5];
+            [[unroll]] for (uint f = 0u; f < 5u; ++f) {
+                w0[f] = element_f32_at(up_weight + (c0 * SEISMIC_UP_WEIGHT_STRIDE_0 + uint64_t(f) * SEISMIC_UP_WEIGHT_STRIDE_1) * 4ul);
+                w1[f] = element_f32_at(up_weight + (c1 * SEISMIC_UP_WEIGHT_STRIDE_0 + uint64_t(f) * SEISMIC_UP_WEIGHT_STRIDE_1) * 4ul);
+            }
+            for (uint rank = 0u; rank < uint(count); ++rank) {
+                float v0 = b0, v1 = b1;
+                [[unroll]] for (uint f = 0u; f < 5u; ++f) {
+                    const float n = seismic_shared_f32[FEATURES_NORMED + rank * 5u + f];
+                    v0 = seismic_fma_rn(w0[f], n, v0);
+                    v1 = seismic_fma_rn(w1[f], n, v1);
+                }
+                v0 = seismic_div_rn(v0, 1.0 + exp(-v0));
+                v1 = seismic_div_rn(v1, 1.0 + exp(-v1));
+                out_put2(result, (out_row_base + uint64_t(rank)) * SEISMIC_RESULT_0_STRIDE_0 + c0, v0, v1);
+            }
+        }
+        if ((width & 1ul) != 0ul && lane == 0ul) {
+            const uint64_t c = width - 1ul;
+            const float b0 = element_f32_at(up_bias + c * SEISMIC_UP_BIAS_STRIDE_0 * 4ul);
+            float w0[5];
+            [[unroll]] for (uint f = 0u; f < 5u; ++f)
+                w0[f] = element_f32_at(up_weight + (c * SEISMIC_UP_WEIGHT_STRIDE_0 + uint64_t(f) * SEISMIC_UP_WEIGHT_STRIDE_1) * 4ul);
+            for (uint rank = 0u; rank < uint(count); ++rank) {
+                float v0 = b0;
+                [[unroll]] for (uint f = 0u; f < 5u; ++f)
+                    v0 = seismic_fma_rn(w0[f], seismic_shared_f32[FEATURES_NORMED + rank * 5u + f], v0);
+                out_put(result, (out_row_base + uint64_t(rank)) * SEISMIC_RESULT_0_STRIDE_0 + c,
+                    seismic_div_rn(v0, 1.0 + exp(-v0)));
+            }
+        }
+    } else {
+        for (uint64_t column = lane; column < width; column += threads) {
+            const float b0 = element_f32_at(up_bias + column * SEISMIC_UP_BIAS_STRIDE_0 * 4ul);
+            float w0[5];
+            [[unroll]] for (uint f = 0u; f < 5u; ++f)
+                w0[f] = element_f32_at(up_weight + (column * SEISMIC_UP_WEIGHT_STRIDE_0 + uint64_t(f) * SEISMIC_UP_WEIGHT_STRIDE_1) * 4ul);
+            for (uint rank = 0u; rank < uint(count); ++rank) {
+                float value = b0;
+                [[unroll]] for (uint f = 0u; f < 5u; ++f)
+                    value = seismic_fma_rn(w0[f], seismic_shared_f32[FEATURES_NORMED + rank * 5u + f], value);
+                out_put(result,
+                    (out_row_base + uint64_t(rank)) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+                    seismic_div_rn(value, 1.0 + exp(-value)));
+            }
+        }
     }
 }

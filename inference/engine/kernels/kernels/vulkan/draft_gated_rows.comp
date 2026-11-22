@@ -1,7 +1,25 @@
-// draft_gated_rows: result = A(silu(gate) * up); one invocation per element
-// over a grid-stride loop. The Vulkan form of `metal/draft_gated_rows.metal`.
+// draft_gated_rows: result = A(silu(gate) * up); 4-wide vectorized over
+// unit-stride aligned spans, falling back to a scalar grid-stride walk.
+// The Vulkan form of `metal/draft_gated_rows.metal`.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
+
+bool gated_rows_aligned4(uint64_t base) {
+    return (base & (ACTIVATION_A == ELEMENT_F32 ? 15ul : 7ul)) == 0ul;
+}
+
+vec4 gated_rows_load4(uint64_t base, uint64_t index) {
+    if (ACTIVATION_A == ELEMENT_F32) {
+        return element_vec4_at(base + index * 4ul);
+    } else {
+        const uvec2 words = element_uvec2_at(base + index * 2ul);
+        return vec4(element_unpack2(ACTIVATION_A, words.x), element_unpack2(ACTIVATION_A, words.y));
+    }
+}
+
+float gated_rows_silu_mul(float a, float b) {
+    return seismic_div_rn(a, 1.0 + exp(-a)) * b;
+}
 
 void draft_gated_rows() {
     const uint64_t gate = SEISMIC_PTR(SEISMIC_BUFFER_GATE);
@@ -9,11 +27,43 @@ void draft_gated_rows() {
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t width = SEISMIC_DIM_F;
     const uint64_t count = SEISMIC_DIM_M * width;
+    if (count == 0ul)
+        return;
+
+    const uint64_t vec_count = count >> 2;
+    const bool vec_ok = (width & 3ul) == 0ul
+        && vec_count <= uint64_t(0x7fffffffu)
+        && SEISMIC_GATE_STRIDE_1 == 1ul
+        && SEISMIC_UP_STRIDE_1 == 1ul
+        && SEISMIC_RESULT_0_STRIDE_1 == 1ul
+        && gated_rows_aligned4(gate)
+        && (SEISMIC_GATE_STRIDE_0 & 3ul) == 0ul
+        && gated_rows_aligned4(up)
+        && (SEISMIC_UP_STRIDE_0 & 3ul) == 0ul;
+
+    if (vec_ok) {
+        const uint vc32 = uint(vec_count);
+        const uint w4 = uint(width >> 2);
+        const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+        for (uint idx = gl_GlobalInvocationID.x; idx < vc32; idx += stride) {
+            const uint row32 = idx / w4;
+            const uint col4 = idx - row32 * w4;
+            const uint64_t row = uint64_t(row32);
+            const uint64_t column = uint64_t(col4) << 2;
+            const vec4 a = gated_rows_load4(gate, row * SEISMIC_GATE_STRIDE_0 + column);
+            const vec4 b = gated_rows_load4(up, row * SEISMIC_UP_STRIDE_0 + column);
+            const uint64_t out_idx = row * SEISMIC_RESULT_0_STRIDE_0 + column;
+            out_put2(result, out_idx, gated_rows_silu_mul(a.x, b.x), gated_rows_silu_mul(a.y, b.y));
+            out_put2(result, out_idx + 2ul, gated_rows_silu_mul(a.z, b.z), gated_rows_silu_mul(a.w, b.w));
+        }
+        return;
+    }
+
     for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, width)); at.index < count; seismic_walk_next(at)) {
         const uint64_t row = at.axes.x, column = at.axes.w;
         const float a = element_at(ACTIVATION_A, gate, row * SEISMIC_GATE_STRIDE_0 + column * SEISMIC_GATE_STRIDE_1);
         const float b = element_at(ACTIVATION_A, up, row * SEISMIC_UP_STRIDE_0 + column * SEISMIC_UP_STRIDE_1);
         out_put(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-            a / (1.0 + exp(-a)) * b);
+            gated_rows_silu_mul(a, b));
     }
 }

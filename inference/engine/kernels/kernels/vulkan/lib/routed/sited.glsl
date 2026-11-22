@@ -32,3 +32,23 @@ float routed_sited(const float selected, const bool answered, const uint64_t slo
     return selected + element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SITE_OUTPUT) + (slot * SEISMIC_SITE_OUTPUT_STRIDE_0
         + m * SEISMIC_SITE_OUTPUT_STRIDE_1 + n * SEISMIC_SITE_OUTPUT_STRIDE_2) * 4ul);
 }
+
+// Four contiguous channels of `routed_sited`, reading `site_output` as one
+// 16-byte vector load when unit-strided and 16-byte aligned.
+vec4 routed_sited4(const vec4 selected, const bool answered, const uint64_t slot, const uint64_t m,
+    const uint64_t n) {
+    if (!answered)
+        return selected;
+    const uint64_t base = SEISMIC_PTR(SEISMIC_BUFFER_SITE_OUTPUT)
+        + (slot * SEISMIC_SITE_OUTPUT_STRIDE_0 + m * SEISMIC_SITE_OUTPUT_STRIDE_1) * 4ul;
+    if (SEISMIC_SITE_OUTPUT_STRIDE_2 == 1ul) {
+        const uint64_t addr = base + n * 4ul;
+        if ((addr & 15ul) == 0ul)
+            return selected + element_vec4_at(addr);
+    }
+    return selected + vec4(
+        element_f32_at(base + n * SEISMIC_SITE_OUTPUT_STRIDE_2 * 4ul),
+        element_f32_at(base + (n + 1ul) * SEISMIC_SITE_OUTPUT_STRIDE_2 * 4ul),
+        element_f32_at(base + (n + 2ul) * SEISMIC_SITE_OUTPUT_STRIDE_2 * 4ul),
+        element_f32_at(base + (n + 3ul) * SEISMIC_SITE_OUTPUT_STRIDE_2 * 4ul));
+}

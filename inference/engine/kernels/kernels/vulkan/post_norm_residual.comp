@@ -7,19 +7,71 @@
 
 #define RESIDUAL_NORM ELEMENT_OF(SEISMIC_NORM)
 
+vec4 post_norm_residual_fma4(vec4 a, vec4 b, vec4 c) {
+    return vec4(seismic_fma_rn(a.x, b.x, c.x), seismic_fma_rn(a.y, b.y, c.y),
+        seismic_fma_rn(a.z, b.z, c.z), seismic_fma_rn(a.w, b.w, c.w));
+}
+
+float post_norm_residual_sum4(vec4 v) {
+    return (v.x + v.y) + (v.z + v.w);
+}
+
 // Shared: one partial per subgroup (reduce_group_sum at float 0).
 void post_norm_residual() {
     const uint64_t width = SEISMIC_DIM_D;
+    const uint64_t width8 = width & ~7ul;
     const uint64_t row = gl_WorkGroupID.x;
-    const uint thread = gl_LocalInvocationIndex;
+    const uint thread = SEISMIC_THREAD;
+    const uint64_t threads = uint64_t(gl_WorkGroupSize.x);
+    const uint64_t step8 = threads * 8ul;
+    const uint64_t base_i = uint64_t(thread) * 8ul;
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     const uint64_t projected = SEISMIC_PTR(SEISMIC_BUFFER_PROJECTED) + row * SEISMIC_PROJECTED_STRIDE_0 * 4ul;
+    const bool p_vec8 = SEISMIC_PROJECTED_STRIDE_1 == 1ul && (projected & 15ul) == 0ul;
+    // Cache up to 4 × 8 = 32 floats per thread (width8 <= 8192 for 256 threads)
+    // in VGPRs so `projected` is read once from DRAM across both passes.
+    const bool cache_p = p_vec8 && width8 <= step8 * 4ul;
+    vec4 p_even[4];
+    vec4 p_odd[4];
     // The squares the reduction combines are spread by `SEISMIC_THREAD`.
     float squares = 0.0;
-    seismic_strided(uint64_t, i, SEISMIC_THREAD, width, gl_WorkGroupSize.x) {
-        const float v = element_f32_at(projected + i * SEISMIC_PROJECTED_STRIDE_1 * 4ul);
-        squares = seismic_fma_rn(v, v, squares);
+    if (cache_p) {
+        vec4 sq4 = vec4(0.0);
+        [[unroll]] for (uint slot = 0u; slot < 4u; ++slot) {
+            const uint64_t i = base_i + uint64_t(slot) * step8;
+            if (i < width8) {
+                vec4 even, odd;
+                element_load8(ELEMENT_F32, projected, i, even, odd);
+                p_even[slot] = even;
+                p_odd[slot] = odd;
+                sq4 = post_norm_residual_fma4(even, even, sq4);
+                sq4 = post_norm_residual_fma4(odd, odd, sq4);
+            }
+        }
+        squares = post_norm_residual_sum4(sq4);
+        seismic_strided_from(uint64_t, i, width8, uint64_t(thread), width, threads) {
+            const float v = element_f32_at(projected + i * 4ul);
+            squares = seismic_fma_rn(v, v, squares);
+        }
+    } else if (p_vec8) {
+        vec4 sq4 = vec4(0.0);
+        seismic_strided(uint64_t, i, base_i, width8, step8) {
+            vec4 even, odd;
+            element_load8(ELEMENT_F32, projected, i, even, odd);
+            sq4 = post_norm_residual_fma4(even, even, sq4);
+            sq4 = post_norm_residual_fma4(odd, odd, sq4);
+        }
+        squares = post_norm_residual_sum4(sq4);
+        seismic_strided_from(uint64_t, i, width8, uint64_t(thread), width, threads) {
+            const float v = element_f32_at(projected + i * 4ul);
+            squares = seismic_fma_rn(v, v, squares);
+        }
+    } else {
+        seismic_strided(uint64_t, i, uint64_t(thread), width, threads) {
+            const float v = element_f32_at(projected + i * SEISMIC_PROJECTED_STRIDE_1 * 4ul);
+            squares = seismic_fma_rn(v, v, squares);
+        }
     }
     squares = reduce_group_sum(squares, 0u);
     const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + epsilon);
@@ -27,10 +79,42 @@ void post_norm_residual() {
     const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL) + source * SEISMIC_RESIDUAL_STRIDE_0 * 4ul;
     const uint64_t norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
     const Out result = out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0);
-    for (uint64_t i = thread; i < width; i += gl_WorkGroupSize.x) {
-        const float normalized = element_f32_at(projected + i * SEISMIC_PROJECTED_STRIDE_1 * 4ul) * inverse
-            * element_at(RESIDUAL_NORM, norm, i * SEISMIC_NORM_STRIDE_0);
-        out_put(result, i * SEISMIC_RESULT_0_STRIDE_1,
-            (element_f32_at(residual + i * SEISMIC_RESIDUAL_STRIDE_1 * 4ul) + normalized) * scale);
+    const bool update_vec8 = p_vec8 && SEISMIC_RESIDUAL_STRIDE_1 == 1ul && SEISMIC_NORM_STRIDE_0 == 1ul
+        && SEISMIC_RESULT_0_STRIDE_1 == 1ul && ((residual | norm) & 15ul) == 0ul
+        && stored_aligned16(out_stored(result, 0ul));
+    if (update_vec8) {
+        if (cache_p) {
+            [[unroll]] for (uint slot = 0u; slot < 4u; ++slot) {
+                const uint64_t i = base_i + uint64_t(slot) * step8;
+                if (i < width8) {
+                    vec4 n_even, n_odd, r_even, r_odd;
+                    element_load8(RESIDUAL_NORM, norm, i, n_even, n_odd);
+                    element_load8(ELEMENT_F32, residual, i, r_even, r_odd);
+                    out_put8(result, i, (r_even + p_even[slot] * inverse * n_even) * scale,
+                        (r_odd + p_odd[slot] * inverse * n_odd) * scale);
+                }
+            }
+        } else {
+            for (uint64_t i = base_i; i < width8; i += step8) {
+                vec4 p_ev, p_od, n_even, n_odd, r_even, r_odd;
+                element_load8(ELEMENT_F32, projected, i, p_ev, p_od);
+                element_load8(RESIDUAL_NORM, norm, i, n_even, n_odd);
+                element_load8(ELEMENT_F32, residual, i, r_even, r_odd);
+                out_put8(result, i, (r_even + p_ev * inverse * n_even) * scale,
+                    (r_odd + p_od * inverse * n_odd) * scale);
+            }
+        }
+        for (uint64_t i = width8 + uint64_t(thread); i < width; i += threads) {
+            const float normalized = element_f32_at(projected + i * 4ul) * inverse
+                * element_at(RESIDUAL_NORM, norm, i);
+            out_put(result, i, (element_f32_at(residual + i * 4ul) + normalized) * scale);
+        }
+    } else {
+        for (uint64_t i = uint64_t(thread); i < width; i += threads) {
+            const float normalized = element_f32_at(projected + i * SEISMIC_PROJECTED_STRIDE_1 * 4ul) * inverse
+                * element_at(RESIDUAL_NORM, norm, i * SEISMIC_NORM_STRIDE_0);
+            out_put(result, i * SEISMIC_RESULT_0_STRIDE_1,
+                (element_f32_at(residual + i * SEISMIC_RESIDUAL_STRIDE_1 * 4ul) + normalized) * scale);
+        }
     }
 }

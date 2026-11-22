@@ -1,5 +1,5 @@
 // widen_rows: widened[row, column] = f32(rows[row, column]); one invocation
-// per element over a grid-stride loop (the grid is capped below the
+// per 8-element chunk over a grid-stride loop (the grid is capped below the
 // 65535-group floor).
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
@@ -8,10 +8,30 @@ void widen_rows() {
     const uint64_t rows = SEISMIC_PTR(SEISMIC_BUFFER_ROWS);
     const Out widened = SEISMIC_RESULT_0_OUT;
     const uint64_t width = SEISMIC_DIM_D;
-    const uint64_t count = SEISMIC_DIM_M * width;
-    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, width)); at.index < count; seismic_walk_next(at)) {
-        const uint64_t row = at.axes.x, column = at.axes.w;
-        out_put(widened, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-            element_at(ACTIVATION_A, rows, row * SEISMIC_ROWS_STRIDE_0 + column * SEISMIC_ROWS_STRIDE_1));
+    const uint64_t chunks = (width + 7ul) >> 3;
+    const uint64_t count = SEISMIC_DIM_M * chunks;
+    const bool unit_stride = SEISMIC_ROWS_STRIDE_1 == 1ul && SEISMIC_RESULT_0_STRIDE_1 == 1ul;
+    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, chunks));
+         at.index < count; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x;
+        const uint64_t column = at.axes.w << 3;
+        const uint64_t src_row = row * SEISMIC_ROWS_STRIDE_0;
+        const uint64_t dst_row = row * SEISMIC_RESULT_0_STRIDE_0;
+        if (unit_stride && column + 8ul <= width) {
+            const uint64_t src = src_row + column;
+            const uint64_t dst = dst_row + column;
+            if (((rows + src * uint64_t(ELEMENT_BYTES(ACTIVATION_A))) & 15ul) == 0ul
+                && stored_aligned16(out_stored(widened, dst))) {
+                vec4 even, odd;
+                element_load8(ACTIVATION_A, rows, src, even, odd);
+                out_put8(widened, dst, even, odd);
+                continue;
+            }
+        }
+        const uint64_t limit = min(column + 8ul, width);
+        for (uint64_t c = column; c < limit; ++c) {
+            out_put(widened, dst_row + c * SEISMIC_RESULT_0_STRIDE_1,
+                element_at(ACTIVATION_A, rows, src_row + c * SEISMIC_ROWS_STRIDE_1));
+        }
     }
 }

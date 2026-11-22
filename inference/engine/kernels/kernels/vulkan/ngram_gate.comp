@@ -4,50 +4,132 @@
 // grid visiting the rows with a stride. Under the stored product (PR = 1)
 // the query weight is one.
 #include <seismic/element.glsl>
-#include "lib/core/reduce.glsl"
 
 #define KEY_NORM ELEMENT_OF(SEISMIC_KEY_NORM)
 #define QUERY_NORM ELEMENT_OF(SEISMIC_QUERY_NORM)
 
-// Shared: one partial per subgroup (reduce_group_sum at float 0).
+// Four contiguous elements from `index` (a multiple of 4), at a `base` aligned
+// to four elements (16 bytes for F32, 8 bytes for F16/BF16).
+vec4 ngram_load4(const int kind, uint64_t base, uint64_t index) {
+    if (kind == ELEMENT_F32)
+        return element_vec4_at(base + index * 4ul);
+    const uvec2 words = element_uvec2_at(base + index * 2ul);
+    return vec4(element_unpack2(kind, words.x), element_unpack2(kind, words.y));
+}
+
+// Shared: four partials per subgroup (keys, queries, dot, values at
+// `SEISMIC_SUBGROUP * 4 + 0..3`; 8 subgroups * 4 floats = 128 bytes).
 void ngram_gate() {
     const uint64_t width = SEISMIC_DIM_H;
+    const uint64_t width4 = width & ~3ul;
     const uint64_t stream = gl_WorkGroupID.x;
-    const uint thread = gl_LocalInvocationIndex;
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
     const uint64_t key_norm = SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM);
     const uint64_t query_norm = SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM);
+    const uint64_t kn_base = key_norm + stream * SEISMIC_KEY_NORM_STRIDE_0 * uint64_t(ELEMENT_BYTES(KEY_NORM));
+    const uint64_t qn_base = query_norm + stream * SEISMIC_QUERY_NORM_STRIDE_0 * uint64_t(ELEMENT_BYTES(QUERY_NORM));
+    const uint64_t kn_align_mask = uint64_t(ELEMENT_BYTES(KEY_NORM)) * 4ul - 1ul;
+    const uint64_t qn_align_mask = uint64_t(ELEMENT_BYTES(QUERY_NORM)) * 4ul - 1ul;
+    const bool norm_vec = SEISMIC_KEY_NORM_STRIDE_1 == 1ul
+        && (kn_base & kn_align_mask) == 0ul
+        && (SEISMIC_DIM_PR == 1
+            || (SEISMIC_QUERY_NORM_STRIDE_1 == 1ul && (qn_base & qn_align_mask) == 0ul));
+    const uint64_t step = uint64_t(gl_WorkGroupSize.x);
+    const uint64_t step4 = step * 4ul;
     for (uint64_t row = gl_WorkGroupID.y; row < SEISMIC_DIM_M; row += gl_NumWorkGroups.y) {
         const uint64_t k = SEISMIC_PTR(SEISMIC_BUFFER_KEY)
             + (row * SEISMIC_KEY_STRIDE_0 + stream * SEISMIC_KEY_STRIDE_1) * 4ul;
         const uint64_t x = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)
             + (row * SEISMIC_HIDDEN_STRIDE_0 + stream * SEISMIC_HIDDEN_STRIDE_1) * 4ul;
         const uint64_t v = SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + row * SEISMIC_VALUE_STRIDE_0 * 4ul;
+        const bool vec_ok = norm_vec
+            && SEISMIC_KEY_STRIDE_2 == 1ul && (k & 15ul) == 0ul
+            && SEISMIC_HIDDEN_STRIDE_2 == 1ul && (x & 15ul) == 0ul
+            && SEISMIC_VALUE_STRIDE_1 == 1ul && (v & 15ul) == 0ul;
         float keys = 0.0;
         float queries = 0.0;
         float dot = 0.0;
         float values = 0.0;
         // Numbered by `SEISMIC_THREAD`: the partials reach the reductions.
-        seismic_strided(uint64_t, i, uint64_t(SEISMIC_THREAD), width, gl_WorkGroupSize.x) {
-            const float kv = element_f32_at(k + i * SEISMIC_KEY_STRIDE_2 * 4ul);
-            const float xv = element_f32_at(x + i * SEISMIC_HIDDEN_STRIDE_2 * 4ul);
-            const float vv = element_f32_at(v + i * SEISMIC_VALUE_STRIDE_1 * 4ul);
-            keys = seismic_fma_rn(kv, kv, keys);
-            queries = seismic_fma_rn(xv, xv, queries);
-            // Under the stored product (PR = 1) the query weight is one,
-            // which leaves each term's bits as the body's.
-            const float qn = SEISMIC_DIM_PR == 1 ? 1.0
-                : element_at(QUERY_NORM, query_norm, stream * SEISMIC_QUERY_NORM_STRIDE_0 + i * SEISMIC_QUERY_NORM_STRIDE_1);
-            dot += seismic_mul_rn(seismic_mul_rn(seismic_mul_rn(kv,
-                       element_at(KEY_NORM, key_norm, stream * SEISMIC_KEY_NORM_STRIDE_0 + i * SEISMIC_KEY_NORM_STRIDE_1)),
-                       xv), qn);
-            values = seismic_fma_rn(vv, vv, values);
+        if (vec_ok) {
+            seismic_strided(uint64_t, i, uint64_t(SEISMIC_THREAD) * 4ul, width4, step4) {
+                const vec4 kv = element_vec4_at(k + i * 4ul);
+                const vec4 xv = element_vec4_at(x + i * 4ul);
+                const vec4 vv = element_vec4_at(v + i * 4ul);
+                const vec4 kn = ngram_load4(KEY_NORM, kn_base, i);
+                // Under the stored product (PR = 1) the query weight is one,
+                // which leaves each term's bits as the body's.
+                const vec4 qn = SEISMIC_DIM_PR == 1 ? vec4(1.0) : ngram_load4(QUERY_NORM, qn_base, i);
+                keys = seismic_fma_rn(kv.x, kv.x, keys);
+                keys = seismic_fma_rn(kv.y, kv.y, keys);
+                keys = seismic_fma_rn(kv.z, kv.z, keys);
+                keys = seismic_fma_rn(kv.w, kv.w, keys);
+                queries = seismic_fma_rn(xv.x, xv.x, queries);
+                queries = seismic_fma_rn(xv.y, xv.y, queries);
+                queries = seismic_fma_rn(xv.z, xv.z, queries);
+                queries = seismic_fma_rn(xv.w, xv.w, queries);
+                dot += seismic_mul_rn(seismic_mul_rn(seismic_mul_rn(kv.x, kn.x), xv.x), qn.x);
+                dot += seismic_mul_rn(seismic_mul_rn(seismic_mul_rn(kv.y, kn.y), xv.y), qn.y);
+                dot += seismic_mul_rn(seismic_mul_rn(seismic_mul_rn(kv.z, kn.z), xv.z), qn.z);
+                dot += seismic_mul_rn(seismic_mul_rn(seismic_mul_rn(kv.w, kn.w), xv.w), qn.w);
+                values = seismic_fma_rn(vv.x, vv.x, values);
+                values = seismic_fma_rn(vv.y, vv.y, values);
+                values = seismic_fma_rn(vv.z, vv.z, values);
+                values = seismic_fma_rn(vv.w, vv.w, values);
+            }
+            seismic_strided_from(uint64_t, i, width4, uint64_t(SEISMIC_THREAD), width, step) {
+                const float kv = element_f32_at(k + i * 4ul);
+                const float xv = element_f32_at(x + i * 4ul);
+                const float vv = element_f32_at(v + i * 4ul);
+                keys = seismic_fma_rn(kv, kv, keys);
+                queries = seismic_fma_rn(xv, xv, queries);
+                const float qn = SEISMIC_DIM_PR == 1 ? 1.0 : element_at(QUERY_NORM, qn_base, i);
+                dot += seismic_mul_rn(seismic_mul_rn(seismic_mul_rn(kv, element_at(KEY_NORM, kn_base, i)), xv), qn);
+                values = seismic_fma_rn(vv, vv, values);
+            }
+        } else {
+            seismic_strided(uint64_t, i, uint64_t(SEISMIC_THREAD), width, step) {
+                const float kv = element_f32_at(k + i * SEISMIC_KEY_STRIDE_2 * 4ul);
+                const float xv = element_f32_at(x + i * SEISMIC_HIDDEN_STRIDE_2 * 4ul);
+                const float vv = element_f32_at(v + i * SEISMIC_VALUE_STRIDE_1 * 4ul);
+                keys = seismic_fma_rn(kv, kv, keys);
+                queries = seismic_fma_rn(xv, xv, queries);
+                // Under the stored product (PR = 1) the query weight is one,
+                // which leaves each term's bits as the body's.
+                const float qn = SEISMIC_DIM_PR == 1 ? 1.0
+                    : element_at(QUERY_NORM, query_norm, stream * SEISMIC_QUERY_NORM_STRIDE_0 + i * SEISMIC_QUERY_NORM_STRIDE_1);
+                dot += seismic_mul_rn(seismic_mul_rn(seismic_mul_rn(kv,
+                           element_at(KEY_NORM, key_norm, stream * SEISMIC_KEY_NORM_STRIDE_0 + i * SEISMIC_KEY_NORM_STRIDE_1)),
+                           xv), qn);
+                values = seismic_fma_rn(vv, vv, values);
+            }
         }
-        keys = reduce_group_sum(keys, 0u);
-        queries = reduce_group_sum(queries, 0u);
-        dot = reduce_group_sum(dot, 0u);
-        values = reduce_group_sum(values, 0u);
-        if (thread == 0u) {
+        keys = seismic_subgroup_sum_f32(keys);
+        queries = seismic_subgroup_sum_f32(queries);
+        dot = seismic_subgroup_sum_f32(dot);
+        values = seismic_subgroup_sum_f32(values);
+        if (row != gl_WorkGroupID.y)
+            barrier();
+        if (SEISMIC_LANE == 0u) {
+            const uint base = SEISMIC_SUBGROUP * 4u;
+            seismic_shared_f32[base] = keys;
+            seismic_shared_f32[base + 1u] = queries;
+            seismic_shared_f32[base + 2u] = dot;
+            seismic_shared_f32[base + 3u] = values;
+        }
+        barrier();
+        if (SEISMIC_THREAD == 0u) {
+            keys = 0.0;
+            queries = 0.0;
+            dot = 0.0;
+            values = 0.0;
+            for (uint s = 0u; s < SEISMIC_SUBGROUPS; ++s) {
+                const uint base = s * 4u;
+                keys += seismic_shared_f32[base];
+                queries += seismic_shared_f32[base + 1u];
+                dot += seismic_shared_f32[base + 2u];
+                values += seismic_shared_f32[base + 3u];
+            }
             const float g = seismic_div_rn(dot * inversesqrt(seismic_div_rn(keys, float(width)) + epsilon)
                 * inversesqrt(seismic_div_rn(queries, float(width)) + epsilon), sqrt(float(width)));
             const float root = sqrt(max(abs(g), 1e-6));

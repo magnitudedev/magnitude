@@ -1,9 +1,15 @@
 // Expert ranking at a router's exact SELECT_P width. Instantiated with
 // SELECT_FN for current selection and next-layer hints.
 // Lane l owns experts l + 32 i; only its `held` entries contribute to
-// softmax's reduction. The excluded tail is ranked (-inf, -1). Sorting
-// and subgroup argmax use descending score, ties to the higher expert
-// index; popping a winner preserves that order for the next rank.
+// softmax's reduction. Excluded and already-chosen slots hold a quiet NaN
+// (`SELECT_EXCLUDED`), which `selection_precedes` never picks. Top-K keeps
+// each lane's best remaining candidate `(head_r, head_s, head_e)` seeded by
+// one linear scan of its SELECT_P slots, then runs SELECT_K subgroup argmax
+// rounds over the 32 lane heads (descending score, ties to the higher expert
+// index); on each round before the last, only the winning lane marks its
+// winning slot `SELECT_EXCLUDED` and re-scans its SELECT_P slots for the next
+// head. Because each slot stays at `lane + 32u * i`, no `expert[SELECT_P]`
+// array is stored.
 // Scores use the bounded-error exponential from precise.glsl. Selection
 // bias affects ranking only; normalization uses unbiased selected scores.
 #define SELECT_SOFTMAX 0
@@ -13,6 +19,7 @@
 #define SELECT_SUM 1
 #define SELECT_SUM_PLUS_EPSILON 2
 #define SELECT_CLAMPED_SUM 3
+#define SELECT_EXCLUDED uintBitsToFloat(0x7fc00000u)
 
 #define SELECT_DEFINE_SCORES \
 void SELECT_FN(select_scores)(const int function, inout float values[SELECT_P], const uint held) { \
@@ -41,33 +48,22 @@ void SELECT_FN(select_scores)(const int function, inout float values[SELECT_P], 
     } \
 }
 
-#define SELECT_DEFINE_SORT \
-void SELECT_FN(select_sort)(inout float ranked[SELECT_P], inout float score[SELECT_P], inout int expert[SELECT_P]) { \
-    [[unroll]] for (uint pass = 0u; pass < SELECT_P; ++pass) { \
-        [[unroll]] for (uint i = pass & 1u; i + 1u < SELECT_P; i += 2u) { \
-            if (selection_precedes(ranked[i + 1u], expert[i + 1u], ranked[i], expert[i])) { \
-                const float r = ranked[i], s = score[i]; \
-                const int e = expert[i]; \
-                ranked[i] = ranked[i + 1u]; \
-                score[i] = score[i + 1u]; \
-                expert[i] = expert[i + 1u]; \
-                ranked[i + 1u] = r; \
-                score[i + 1u] = s; \
-                expert[i + 1u] = e; \
-            } \
+#define SELECT_DEFINE_LANE_MAX \
+void SELECT_FN(select_lane_max)(inout float ranked[SELECT_P], const float score[SELECT_P], \
+    const uint lane, const int erase, out float head_r, out float head_s, out int head_e) { \
+    head_r = -uintBitsToFloat(0x7f800000u); \
+    head_s = 0.0; \
+    head_e = -1; \
+    [[unroll]] for (uint i = 0u; i < SELECT_P; ++i) { \
+        const int e = int(lane + 32u * i); \
+        if (erase >= 0 && e == erase) \
+            ranked[i] = SELECT_EXCLUDED; \
+        else if (selection_precedes(ranked[i], e, head_r, head_e)) { \
+            head_r = ranked[i]; \
+            head_s = score[i]; \
+            head_e = e; \
         } \
     } \
-}
-
-#define SELECT_DEFINE_POP \
-void SELECT_FN(select_pop)(inout float ranked[SELECT_P], inout float score[SELECT_P], inout int expert[SELECT_P]) { \
-    [[unroll]] for (uint i = 0u; i + 1u < SELECT_P; ++i) { \
-        ranked[i] = ranked[i + 1u]; \
-        score[i] = score[i + 1u]; \
-        expert[i] = expert[i + 1u]; \
-    } \
-    ranked[SELECT_P - 1u] = -uintBitsToFloat(0x7f800000u); \
-    expert[SELECT_P - 1u] = -1; \
 }
 
 #define SELECT_DEFINE_NORMALIZED \
@@ -87,28 +83,27 @@ void SELECT_FN(select_rank_at)(uint64_t logits_base, uint64_t bias_base, uint64_
     const uint lane = SEISMIC_LANE; \
     const uint held = selection_candidates(SELECT_E, lane); \
     float score[SELECT_P], ranked[SELECT_P]; \
-    int expert[SELECT_P]; \
-    [[unroll]] for (uint i = 0u; i < SELECT_P; ++i) { \
-        expert[i] = i < held ? int(lane + 32u * i) : -1; \
+    [[unroll]] for (uint i = 0u; i < SELECT_P; ++i) \
         score[i] = i < held \
             ? element_f32_at(logits_base + (row * uint64_t(SELECT_E) + uint64_t(lane + 32u * i)) * 4ul) \
             : 0.0; \
-    } \
     SELECT_FN(select_scores)(score_fn, score, held); \
     [[unroll]] for (uint i = 0u; i < SELECT_P; ++i) \
         ranked[i] = i < held \
-            ? selection_ranked(score[i] + element_f32_at(bias_base + uint64_t(expert[i]) * bias_stride * 4ul)) \
-            : -uintBitsToFloat(0x7f800000u); \
+            ? selection_ranked(score[i] + element_f32_at(bias_base + uint64_t(lane + 32u * i) * bias_stride * 4ul)) \
+            : SELECT_EXCLUDED; \
     [[unroll]] for (uint i = 0u; i < SELECT_P; ++i) \
         if (i < held) \
-            SELECTION_KEY(row, uint(expert[i]), ranked[i]); \
-    SELECT_FN(select_sort)(ranked, score, expert); \
-    for (uint rank = 0u; rank < SELECT_K; ++rank) { \
+            SELECTION_KEY(row, lane + 32u * i, ranked[i]); \
+    float head_r, head_s; \
+    int head_e; \
+    SELECT_FN(select_lane_max)(ranked, score, lane, -1, head_r, head_s, head_e); \
+    [[unroll]] for (uint rank = 0u; rank < SELECT_K; ++rank) { \
         float best; \
-        const int winner = reduce_argmax(ranked[0], expert[0], REDUCE_HIGHER_INDEX, best); \
-        const float winner_score = seismic_shuffle(score[0], uint(winner) % 32u); \
-        if (expert[0] == winner) \
-            SELECT_FN(select_pop)(ranked, score, expert); \
+        const int winner = reduce_argmax(head_r, head_e, REDUCE_HIGHER_INDEX, best); \
+        const float winner_score = seismic_shuffle(head_s, uint(winner) % 32u); \
+        if (rank + 1u < SELECT_K && head_e == winner) \
+            SELECT_FN(select_lane_max)(ranked, score, lane, winner, head_r, head_s, head_e); \
         chosen[SELECT_K - 1u - rank] = winner_score; \
         winners[SELECT_K - 1u - rank] = winner; \
     } \
@@ -116,7 +111,6 @@ void SELECT_FN(select_rank_at)(uint64_t logits_base, uint64_t bias_base, uint64_
 
 #define SELECT_RANKING \
 SELECT_DEFINE_SCORES \
-SELECT_DEFINE_SORT \
-SELECT_DEFINE_POP \
+SELECT_DEFINE_LANE_MAX \
 SELECT_DEFINE_NORMALIZED \
 SELECT_DEFINE_RANK_AT

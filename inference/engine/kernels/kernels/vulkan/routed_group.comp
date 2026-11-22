@@ -1,7 +1,8 @@
 // Groups the choices of the rows[0] rows from row first[0] by expert into T-row tiles,
 // in chunks of GROUP_CHOICES flat choices, one workgroup each. The Vulkan
 // form of `metal/routed_group.metal`: `routed_group_count` counts each
-// chunk's choices per expert (PARTS slices per expert, summed);
+// chunk's choices per expert with a cooperative shared-memory atomic
+// histogram (reading each route once across the workgroup);
 // `routed_group_place` places each chunk's choices after the earlier chunks'
 // of their expert. Invocation (expert, part) owns the choices of `part` (a
 // contiguous slice of the chunk) that route to `expert`; counting and
@@ -10,9 +11,10 @@
 // chunk's workgroup writes the counts, the experts' blocks, their last
 // tiles' padding and `used`.
 //
+// Counting shared u32 words: histogram [E] (within E * PARTS).
 // Placing shared u32 words: per-invocation slice counts [E * PARTS], the
-// experts' tile counts, then first blocks [E], the experts' first positions
-// in this chunk [E].
+// experts' tile counts / scan ping-pong [E], then scan ping-pong / the
+// experts' first positions in this chunk [E].
 #include <seismic/element.glsl>
 
 // The divisors of `seismic_divide` and `seismic_quotient` below.
@@ -27,6 +29,8 @@ void group_split(uint64_t index, out uint64_t row, out uint64_t choice) {
 }
 
 int group_route(uint64_t index) {
+    if (SEISMIC_ROUTES_STRIDE_1 == 1ul && SEISMIC_ROUTES_STRIDE_0 == SEISMIC_DIM_K)
+        return element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES) + index * 4ul);
     uint64_t row, choice;
     group_split(index, row, choice);
     return element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
@@ -70,30 +74,27 @@ uint group_chunk_choices(uint64_t first, uint64_t live) {
     return rest < uint64_t(SEISMIC_CONST_GROUP_CHOICES) ? uint(rest) : uint(SEISMIC_CONST_GROUP_CHOICES);
 }
 
-// Invocation (expert, part) counts its slice of the chunk; part 0 sums them.
+// Cooperative shared-memory atomic histogram of this chunk's choices by expert.
 void routed_group_count() {
-    const uint parts = SEISMIC_TUNE_PARTS;
+    const uint experts = uint(SEISMIC_DIM_E);
+    const uint threads = experts * SEISMIC_TUNE_PARTS;
     const uint tid = gl_LocalInvocationIndex;
-    const uint expert = tid / parts;
-    const uint part = tid % parts;
     const uint64_t live = group_live();
     const uint64_t first = uint64_t(gl_WorkGroupID.x) * SEISMIC_CONST_GROUP_CHOICES;
     if (first >= live)
         return;
     const uint choices = group_chunk_choices(first, live);
-    const uint span = (choices + parts - 1u) / parts;
     const uint64_t base = group_base();
-    uint count = 0u;
-    for (uint index = min(part * span, choices); index < min(part * span + span, choices); ++index)
-        count += group_route(base + first + index) == int(expert) ? 1u : 0u;
-    seismic_shared_u32[tid] = count;
+    if (tid < experts)
+        seismic_shared_u32[tid] = 0u;
     barrier();
-    if (part == 0u) {
-        uint total = 0u;
-        for (uint slice = 0u; slice < parts; ++slice)
-            total += seismic_shared_u32[tid + slice];
-        element_i32_put(group_partial(gl_WorkGroupID.x, expert), int(total));
+    for (uint index = tid; index < choices; index += threads) {
+        const int route = group_route(base + first + uint64_t(index));
+        atomicAdd(seismic_shared_u32[uint(route)], 1u);
     }
+    barrier();
+    if (tid < experts)
+        element_i32_put(group_partial(gl_WorkGroupID.x, tid), int(seismic_shared_u32[tid]));
 }
 
 void routed_group_place() {
@@ -120,67 +121,105 @@ void routed_group_place() {
     const uint end = min(part * span + span, choices);
     const uint64_t base = group_base();
 
-    uint count = 0u;
-    for (uint index = begin; index < end; ++index)
-        count += group_route(base + first + index) == int(expert) ? 1u : 0u;
-    seismic_shared_u32[tid] = count;
-    // Expert e's choices in every chunk and in the chunks before this one.
-    uint total = 0u, before = 0u;
+    // Expert e's choices in every chunk, in the chunks before this one, and in
+    // this chunk (already counted by `routed_group_count`).
+    uint total = 0u, before = 0u, chunk_count = 0u;
     if (part == 0u) {
         for (uint other = 0u; other < chunks; ++other) {
             const uint value = uint(element_i32_at(group_partial(other, expert)));
             total += value;
             before += other < chunk ? value : 0u;
+            if (other == chunk)
+                chunk_count = value;
         }
-        seismic_shared_u32[tiles_at + expert] = uint(group_tiles(total, tile));
+    } else if (chunk < chunks) {
+        chunk_count = uint(element_i32_at(group_partial(chunk, expert)));
     }
-    barrier();
 
-    // The experts' first blocks: an exclusive scan of their tile counts.
-    if (tid == 0u) {
-        uint block = 0u;
-        for (uint index = 0u; index < experts; ++index) {
-            const uint tiles = seismic_shared_u32[tiles_at + index];
-            seismic_shared_u32[tiles_at + index] = block;
-            block += tiles;
+    uint count = chunk_count;
+    if (parts > 1u) {
+        count = 0u;
+        if (chunk_count != 0u) {
+            for (uint index = begin; index < end; ++index) {
+                count += group_route(base + first + uint64_t(index)) == int(expert) ? 1u : 0u;
+                if (count == chunk_count)
+                    break;
+            }
         }
-        if (chunk == 0u)
-            element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_USED), int(block));
+        seismic_shared_u32[tid] = count;
     }
+
+    // Parallel workgroup inclusive scan of the experts' tile counts in O(log E)
+    // steps, double-buffered between `tiles_at` and `bases` (no subgroup ops,
+    // since E * PARTS is not required to be a multiple of 64).
+    const uint tiles = part == 0u ? uint(group_tiles(total, tile)) : 0u;
+    uint inclusive = tiles;
+    if (part == 0u)
+        seismic_shared_u32[tiles_at + expert] = inclusive;
     barrier();
-    const uint64_t start = uint64_t(seismic_shared_u32[tiles_at + expert]);
+    uint src = tiles_at;
+    uint dst = bases;
+    for (uint offset = 1u; offset < experts; offset <<= 1u) {
+        if (part == 0u) {
+            if (expert >= offset)
+                inclusive += seismic_shared_u32[src + expert - offset];
+            seismic_shared_u32[dst + expert] = inclusive;
+        }
+        barrier();
+        const uint swap = src;
+        src = dst;
+        dst = swap;
+    }
+
     if (part == 0u) {
+        const uint64_t start = uint64_t(inclusive - tiles);
         seismic_shared_u32[bases + expert] = uint(start * tile) + before;
         if (chunk == 0u) {
             element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_COUNTS) + uint64_t(expert) * SEISMIC_COUNTS_STRIDE_0 * 4ul,
                 int(total));
-            const uint64_t tiles = group_tiles(total, tile);
-            for (uint64_t padding = start * tile + total; padding < (start + tiles) * tile; ++padding) {
-                // Positions are 32-bit: the expert-ordered rows' count.
-                uint64_t pad_block, pad_lane;
-                seismic_split(uint(padding), tile, pad_block, pad_lane);
-                group_order_put(pad_block, pad_lane, -1);
+            if (tiles != 0u) {
+                const uint64_t last_block = uint64_t(inclusive - 1u);
+                uint64_t full_blocks, last_count;
+                seismic_split(total, tile, full_blocks, last_count);
+                if (last_count != 0ul) {
+                    for (uint64_t pad_lane = last_count; pad_lane < tile; ++pad_lane)
+                        group_order_put(last_block, pad_lane, -1);
+                }
             }
-            for (uint64_t block = start; block < start + tiles; ++block)
+            for (uint64_t block = start; block < start + uint64_t(tiles); ++block)
                 element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + block * SEISMIC_BLOCKS_STRIDE_0 * 4ul, int(expert));
+            if (expert == experts - 1u)
+                element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_USED), int(inclusive));
         }
     }
     barrier();
 
+    if (count == 0u)
+        return;
     uint64_t position = uint64_t(seismic_shared_u32[bases + expert]);
-    for (uint slice = 0u; slice < part; ++slice)
-        position += seismic_shared_u32[expert * parts + slice];
+    if (parts > 1u) {
+        for (uint slice = 0u; slice < part; ++slice)
+            position += uint64_t(seismic_shared_u32[expert * parts + slice]);
+    }
+    uint64_t place_block, place_lane;
+    seismic_split(uint(position), tile, place_block, place_lane);
+    uint remaining = count;
     for (uint index = begin; index < end; ++index) {
-        const uint64_t flat_index = base + first + index;
+        const uint64_t flat_index = base + first + uint64_t(index);
         if (group_route(flat_index) != int(expert))
             continue;
-        uint64_t row, choice, place_block, place_lane;
+        uint64_t row, choice;
         group_split(flat_index, row, choice);
-        seismic_split(uint(position), tile, place_block, place_lane);
         group_order_put(place_block, place_lane, int(row));
         element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_INVERSE)
                 + (row * SEISMIC_INVERSE_STRIDE_0 + choice * SEISMIC_INVERSE_STRIDE_1) * 4ul,
             int(position));
         ++position;
+        ++place_lane;
+        const bool wrap = place_lane == tile;
+        place_lane = wrap ? 0ul : place_lane;
+        place_block += wrap ? 1ul : 0ul;
+        if (--remaining == 0u)
+            break;
     }
 }

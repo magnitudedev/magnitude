@@ -1,26 +1,58 @@
-// corrector_factors: one invocation per element of a node row over a
-// grid-stride loop, which publishes x, the block's anchor a and x · a (each
-// rounded once to A) into the node's three joined rows. Mirrors
-// `cpu/corrector_factors.rs`.
+// corrector_factors: 4 elements per invocation of a node's row x and its
+// block's anchor a on a (column, node, block) grid, writing the joined row
+// [x ; a ; x · a], each rounded once to A. Mirrors `cpu/corrector_factors.rs`.
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/core/activation.glsl"
+
+vec4 factors_load4(uint64_t base, uint64_t index) {
+    if (ACTIVATION_A == ELEMENT_F32)
+        return element_vec4_at(base + index * 4ul);
+    const uvec2 words = element_uvec2_at(base + index * 2ul);
+    return vec4(element_unpack2(ACTIVATION_A, words.x), element_unpack2(ACTIVATION_A, words.y));
+}
 
 void corrector_factors() {
     const uint64_t nodes = SEISMIC_PTR(SEISMIC_BUFFER_NODES);
     const uint64_t anchor = SEISMIC_PTR(SEISMIC_BUFFER_ANCHOR);
     const Out result = SEISMIC_RESULT_0_OUT;
-    const uint64_t count = SEISMIC_DIM_N, width = SEISMIC_DIM_H;
-    const uint64_t total = SEISMIC_DIM_S * count * width;
-    for (seismic_walk walk = seismic_walk_grid(total, u64vec3(1ul, count, width)); walk.index < total;
-            seismic_walk_next(walk)) {
-        const uint64_t column = walk.axes.w, node = walk.axes.z, block = walk.axes.x;
-        const float x = element_at(ACTIVATION_A, nodes,
-            block * SEISMIC_NODES_STRIDE_0 + node * SEISMIC_NODES_STRIDE_1 + column * SEISMIC_NODES_STRIDE_2);
-        const float a = element_at(ACTIVATION_A, anchor, block * SEISMIC_ANCHOR_STRIDE_0 + column * SEISMIC_ANCHOR_STRIDE_1);
-        const uint64_t at = block * SEISMIC_RESULT_0_STRIDE_0 + node * SEISMIC_RESULT_0_STRIDE_1
-            + column * SEISMIC_RESULT_0_STRIDE_3;
-        out_put(result, at, x);
-        out_put(result, at + SEISMIC_RESULT_0_STRIDE_2, a);
-        out_put(result, at + 2ul * SEISMIC_RESULT_0_STRIDE_2, x * a);
+    const uint64_t blocks = SEISMIC_DIM_S, count = SEISMIC_DIM_N, width = SEISMIC_DIM_H;
+    const uint64_t out_stride2 = SEISMIC_RESULT_0_STRIDE_2;
+    const uint64_t col_stride = uint64_t(gl_NumWorkGroups.x) * uint64_t(gl_WorkGroupSize.x) * 4ul;
+    const bool unit_strides = SEISMIC_NODES_STRIDE_2 == 1ul && SEISMIC_ANCHOR_STRIDE_1 == 1ul
+        && SEISMIC_RESULT_0_STRIDE_3 == 1ul;
+    const uint64_t elem_bytes = uint64_t(ELEMENT_BYTES(ACTIVATION_A));
+    const uint64_t align_mask = ACTIVATION_A == ELEMENT_F32 ? 15ul : 7ul;
+
+    for (uint64_t col = uint64_t(gl_GlobalInvocationID.x) * 4ul; col < width; col += col_stride) {
+        const uint64_t end = min(col + 4ul, width);
+        for (uint64_t block = gl_WorkGroupID.z; block < blocks; block += gl_NumWorkGroups.z) {
+            const uint64_t anchor_base = block * SEISMIC_ANCHOR_STRIDE_0;
+            for (uint64_t node = gl_WorkGroupID.y; node < count; node += gl_NumWorkGroups.y) {
+                const uint64_t nodes_base = block * SEISMIC_NODES_STRIDE_0 + node * SEISMIC_NODES_STRIDE_1;
+                const uint64_t out_base = block * SEISMIC_RESULT_0_STRIDE_0 + node * SEISMIC_RESULT_0_STRIDE_1;
+                const bool aligned = (((nodes + (nodes_base + col) * elem_bytes)
+                    | (anchor + (anchor_base + col) * elem_bytes)) & align_mask) == 0ul;
+                if (col + 4ul <= width && unit_strides && aligned) {
+                    const vec4 x = factors_load4(nodes, nodes_base + col);
+                    const vec4 a = factors_load4(anchor, anchor_base + col);
+                    const vec4 xa = x * a;
+                    out_put2(result, out_base + col, x.x, x.y);
+                    out_put2(result, out_base + col + 2ul, x.z, x.w);
+                    out_put2(result, out_base + out_stride2 + col, a.x, a.y);
+                    out_put2(result, out_base + out_stride2 + col + 2ul, a.z, a.w);
+                    out_put2(result, out_base + 2ul * out_stride2 + col, xa.x, xa.y);
+                    out_put2(result, out_base + 2ul * out_stride2 + col + 2ul, xa.z, xa.w);
+                } else {
+                    for (uint64_t c = col; c < end; ++c) {
+                        const float x = element_at(ACTIVATION_A, nodes, nodes_base + c * SEISMIC_NODES_STRIDE_2);
+                        const float a = element_at(ACTIVATION_A, anchor, anchor_base + c * SEISMIC_ANCHOR_STRIDE_1);
+                        const uint64_t at = out_base + c * SEISMIC_RESULT_0_STRIDE_3;
+                        out_put(result, at, x);
+                        out_put(result, at + out_stride2, a);
+                        out_put(result, at + 2ul * out_stride2, x * a);
+                    }
+                }
+            }
+        }
     }
 }

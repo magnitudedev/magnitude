@@ -40,14 +40,24 @@ void routed_scatter() {
             selected_odd[i] = seismic_fma_rn(weight, odd[i], selected_odd[i]);
         }
     }
-    [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-        if (i < valid) {
-            const uint64_t column = uint64_t(n + i);
-            const float selected = (i & 1u) != 0u ? selected_odd[i >> 1] : selected_even[i >> 1];
-            out_put(SEISMIC_RESULT_0_OUT,
-                m * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-                element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_BASE)
-                    + (m * SEISMIC_BASE_STRIDE_0 + column * SEISMIC_BASE_STRIDE_1) * 4ul) + selected);
+    const uint64_t base_idx = m * SEISMIC_BASE_STRIDE_0 + uint64_t(n);
+    const uint64_t out_idx = m * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(n);
+    if (valid == 8u && SEISMIC_BASE_STRIDE_1 == 1ul && SEISMIC_RESULT_0_STRIDE_1 == 1ul
+        && ((SEISMIC_PTR(SEISMIC_BUFFER_BASE) + base_idx * 4ul) & 15ul) == 0ul
+        && stored_aligned16(out_stored(SEISMIC_RESULT_0_OUT, out_idx))) {
+        vec4 base_even, base_odd;
+        element_load8(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_BASE), base_idx, base_even, base_odd);
+        out_put8(SEISMIC_RESULT_0_OUT, out_idx, base_even + selected_even, base_odd + selected_odd);
+    } else {
+        [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+            if (i < valid) {
+                const uint64_t column = uint64_t(n + i);
+                const float selected = (i & 1u) != 0u ? selected_odd[i >> 1] : selected_even[i >> 1];
+                out_put(SEISMIC_RESULT_0_OUT,
+                    m * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+                    element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_BASE)
+                        + (m * SEISMIC_BASE_STRIDE_0 + column * SEISMIC_BASE_STRIDE_1) * 4ul) + selected);
+            }
         }
     }
 }

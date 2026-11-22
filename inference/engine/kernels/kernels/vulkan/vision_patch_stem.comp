@@ -21,6 +21,37 @@
 #define STEM_K (uint(SEISMIC_DIM_C) * STEM_AREA)
 #define STEM_KP ((STEM_K + 7u) / 8u * 8u)
 
+vec4 stem_load4(uint64_t row_pixels, uint frame, uint col, inout uint channel, inout uint within) {
+    if (col >= STEM_K)
+        return vec4(0.0);
+    if (within + 4u <= STEM_AREA) {
+        const uint64_t src = row_pixels
+            + ((uint64_t(channel) * STEM_FRAMES + frame) * STEM_AREA + within) * 4ul;
+        within += 4u;
+        if (within == STEM_AREA) {
+            within = 0u;
+            ++channel;
+        }
+        if ((src & 15ul) == 0ul)
+            return element_vec4_at(src);
+        return vec4(element_f32_at(src), element_f32_at(src + 4ul),
+            element_f32_at(src + 8ul), element_f32_at(src + 12ul));
+    }
+    float v[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    const uint count = min(4u, STEM_K - col);
+    [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+        if (i < count) {
+            v[i] = element_f32_at(row_pixels
+                + ((uint64_t(channel) * STEM_FRAMES + frame) * STEM_AREA + within) * 4ul);
+            if (++within == STEM_AREA) {
+                within = 0u;
+                ++channel;
+            }
+        }
+    }
+    return vec4(v[0], v[1], v[2], v[3]);
+}
+
 // L1: grid-stride over pieces of 8 converted values.
 void vision_patch_stem_convert() {
     const uint64_t pixels = SEISMIC_PTR(SEISMIC_BUFFER_PIXELS);
@@ -33,15 +64,16 @@ void vision_patch_stem_convert() {
         const uint64_t row = at.axes.x;
         const uint frame = uint(at.axes.z);
         const uint k = uint(at.axes.w) * 8u;
-        float v[8];
-        [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-            const uint channel = (k + i) / STEM_AREA, within = (k + i) % STEM_AREA;
-            v[i] = k + i < STEM_K ? element_f32_at(pixels
-                + (row * SEISMIC_PIXELS_STRIDE_0 + (uint64_t(channel) * STEM_FRAMES + frame) * STEM_AREA + within) * 4ul)
-                : 0.0;
+        vec4 lo = vec4(0.0), hi = vec4(0.0);
+        if (k < STEM_K) {
+            const uint64_t row_pixels = pixels + row * SEISMIC_PIXELS_STRIDE_0 * 4ul;
+            uint channel = k / STEM_AREA;
+            uint within = k % STEM_AREA;
+            lo = stem_load4(row_pixels, frame, k, channel, within);
+            hi = stem_load4(row_pixels, frame, k + 4u, channel, within);
         }
         element_uvec4_put(converted + index * 2ul,
-            element_pack8(ELEMENT_F16, vec4(v[0], v[2], v[4], v[6]), vec4(v[1], v[3], v[5], v[7])));
+            element_pack8(ELEMENT_F16, vec4(lo.x, lo.z, hi.x, hi.z), vec4(lo.y, lo.w, hi.y, hi.w)));
     }
 }
 
